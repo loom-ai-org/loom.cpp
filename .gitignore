@@ -1,0 +1,13 @@
+build/
+build-*/
+build_*/
+compile_commands.json
+.cache/
+*.o
+*.obj
+__pycache__/
+*.pyc
+*.gguf
+!tests/fixtures/*.gguf.md
+.idea/
+.vscode/
