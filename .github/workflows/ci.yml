@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The toy-model fixtures test_*.cpp regenerates at ctest time only need gguf/numpy -- the
+      # heavier deps (torch, librosa, sentencepiece) belong to tools/convert_nemo/, which only the
+      # real-model tests touch, and those skip cleanly (SKIP_RETURN_CODE) without a converted
+      # checkpoint present, so they aren't installed here.
+      - name: Install Python dependencies
+        run: pip install gguf numpy
+
+      - name: Install ccache
+        run: sudo apt-get update && sudo apt-get install -y ccache
+
+      # ggml/nlohmann_json are fetched fresh via CMake FetchContent (see cmake/Dependencies.cmake) on
+      # every configure; only compiled-object reuse is cached here, not the fetched sources themselves.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-
+            ccache-${{ runner.os }}-
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
