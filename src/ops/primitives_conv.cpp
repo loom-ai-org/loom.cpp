@@ -1,0 +1,147 @@
+#include "loom/loom_errors.h"
+#include "loom/ops/primitive_registry.h"
+
+#include <nlohmann/json.hpp>
+
+namespace loom {
+namespace {
+
+using Json = nlohmann::json;
+using Inputs = std::vector<ggml_tensor*>;
+using Outputs = std::vector<ggml_tensor*>;
+
+void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
+    if (in.size() != n) {
+        throw SchemaError(std::string(op) + " expects " + std::to_string(n) + " input(s), got " + std::to_string(in.size()));
+    }
+}
+
+// ggml_conv_1d/ggml_conv_2d force their internal im2col through F16 (unless the kernel is BF16),
+// even for plain F32 inputs -- fine for inference speed, but it fights this engine's Milestone-1
+// precedent of exact fp32 verification against a numpy reference (the same reason ATTENTION uses the
+// composite path over ggml_flash_attn_ext). ggml_compute_forward_im2col fully supports GGML_TYPE_F32 on
+// CPU, so these primitives replicate ggml_conv_1d/2d's own im2col->reshape->mul_mat(->permute->cont)
+// recipe with an F32 im2col instead of calling the convenience wrappers directly.
+
+Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CONV_1D", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, GGML_TYPE_F32); // [IC*K, OL, N]
+    ggml_tensor* result = ggml_mul_mat(pc.ctx,
+        ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),       // [IC*K, N*OL]
+        ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));       // [IC*K, OC]
+    result = ggml_reshape_3d(pc.ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);    // [OL, OC, N]
+    return {result};
+}
+
+Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CONV_2D", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int s1 = static_cast<int>(resolve_attr_int(attrs, "s1", pc.symbols));
+    const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    const int p1 = static_cast<int>(resolve_attr_int(attrs, "p1", pc.symbols));
+    const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+    const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
+
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, GGML_TYPE_F32); // [IC*KH*KW, OW, OH, N]
+    ggml_tensor* result = ggml_mul_mat(pc.ctx,
+        ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),          // [IC*KH*KW, N*OH*OW]
+        ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));         // [IC*KH*KW, OC]
+    result = ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], kernel->ne[3]);       // [OW, OH, N, OC]
+    result = ggml_cont(pc.ctx, ggml_permute(pc.ctx, result, 0, 1, 3, 2));                                        // [OW, OH, OC, N]
+    return {result};
+}
+
+// Unlike ggml_conv_1d/2d, ggml_conv_transpose_1d/2d_p0 are native ops that dispatch purely on the
+// kernel's own dtype (ggml_compute_forward_conv_transpose_1d/2d: F32 kernel -> full F32 compute, no
+// forced F16 cast) -- so these call the ggml convenience functions directly, no precision workaround
+// needed. Both force padding=0 (ggml asserts it); ggml_conv_transpose_1d additionally forces
+// dilation=1 and requires a batch-less 2D `data` tensor (ne=[IL,IC]) -- neither is read as an attr here
+// since ggml doesn't accept any other value.
+
+Outputs op_conv_transpose_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CONV_TRANSPOSE_1D", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    return {ggml_conv_transpose_1d(pc.ctx, kernel, data, s0, /*p0=*/0, /*d0=*/1)};
+}
+
+Outputs op_conv_transpose_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CONV_TRANSPOSE_2D", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+    const int stride = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    return {ggml_conv_transpose_2d_p0(pc.ctx, kernel, data, stride)};
+}
+
+// Depthwise conv1d (one filter per channel, groups == channels): kernel ne=[K,1,channels], data
+// ne=[IL,channels,N]. Mirrors ggml_conv_1d_dw's own recipe (reshape data to insert a dummy dim so
+// im2col treats each channel as an independent "batch" slice, then a batched mul_mat pairs each
+// channel's im2col slice with that SAME channel's kernel slice via ggml_mul_mat's per-index batching
+// over ne[2], not a cross product) -- but with an F32 im2col instead of ggml_conv_1d_dw's forced F16
+// cast, same rationale as CONV_1D/CONV_2D above. ggml's own header flags ggml_conv_1d_dw as "very
+// likely wrong for some cases, needs more testing"; this reimplementation is verified independently via
+// a hand-computed case in tests/test_primitive_registry.cpp rather than trusted on the header comment
+// (or lack thereof) alone.
+Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CONV_1D_DW", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+
+    ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, data->ne[0], 1, data->ne[1], data->ne[2]);
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, GGML_TYPE_F32);
+    ggml_tensor* result = ggml_mul_mat(pc.ctx, im2col, kernel);
+    result = ggml_reshape_3d(pc.ctx, result, result->ne[0], result->ne[2], 1);
+    return {result};
+}
+
+ggml_op_pool parse_pool_op(const Json& attrs) {
+    const std::string op = attrs.at("op").get<std::string>();
+    if (op == "max") return GGML_OP_POOL_MAX;
+    if (op == "avg") return GGML_OP_POOL_AVG;
+    throw SchemaError("POOL: unsupported pool 'op' \"" + op + "\" (expected \"max\" or \"avg\")");
+}
+
+Outputs op_pool_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("POOL_1D", in, 1);
+    const ggml_op_pool op = parse_pool_op(attrs);
+    const int k0 = static_cast<int>(resolve_attr_int(attrs, "k0", pc.symbols));
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    return {ggml_pool_1d(pc.ctx, in[0], op, k0, s0, p0)};
+}
+
+Outputs op_pool_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("POOL_2D", in, 1);
+    const ggml_op_pool op = parse_pool_op(attrs);
+    const int k0 = static_cast<int>(resolve_attr_int(attrs, "k0", pc.symbols));
+    const int k1 = static_cast<int>(resolve_attr_int(attrs, "k1", pc.symbols));
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int s1 = static_cast<int>(resolve_attr_int(attrs, "s1", pc.symbols));
+    const float p0 = static_cast<float>(resolve_attr_number(attrs, "p0", pc.symbols));
+    const float p1 = static_cast<float>(resolve_attr_number(attrs, "p1", pc.symbols));
+    return {ggml_pool_2d(pc.ctx, in[0], op, k0, k1, s0, s1, p0, p1)};
+}
+
+} // namespace
+
+LOOM_REGISTER_OP(CONV_1D, op_conv_1d)
+LOOM_REGISTER_OP(CONV_2D, op_conv_2d)
+LOOM_REGISTER_OP(CONV_TRANSPOSE_1D, op_conv_transpose_1d)
+LOOM_REGISTER_OP(CONV_TRANSPOSE_2D, op_conv_transpose_2d)
+LOOM_REGISTER_OP(CONV_1D_DW, op_conv_1d_dw)
+LOOM_REGISTER_OP(POOL_1D, op_pool_1d)
+LOOM_REGISTER_OP(POOL_2D, op_pool_2d)
+
+} // namespace loom
