@@ -137,6 +137,21 @@ void test_unrefreshed_input_gets_silently_aliased(ggml_backend_t backend) {
 // CONV_1D) built once, with ALL THREE declared inputs (latent/timestep/conditioning) rewritten before
 // every compute -- including "conditioning", which never logically changes between steps. Must match an
 // independent fresh rebuild given the same inputs.
+//
+// kernel1/kernel2 (standing in for real model weights) deliberately live in their OWN persistent
+// ggml_context + ggml_backend_alloc_ctx_tensors buffer, set once and never touched again -- mirroring how
+// GgufModel::load() (gguf_model.cpp) and KvCache's constructor (kv_cache.cpp) actually allocate weights
+// and KV storage, entirely outside the ephemeral no_alloc scratch context GraphBuilder/gallocr manages
+// per build() call. An earlier version of this test instead created kernel1/kernel2 in the SAME
+// GgmlScratch context as latent/timestep/conditioning and marked them ggml_set_input() like a real
+// per-step input, but never rewrote them before the second compute() -- exactly the unsafe pattern
+// test_unrefreshed_input_gets_silently_aliased() documents above. gallocr aliased kernel1's buffer with
+// an intermediate tensor's output during the first compute, silently corrupting it (confirmed via direct
+// diagnostic: kernel1's readback differed from its original data, kernel2's didn't -- consistent with
+// gallocr's aliasing being real but not guaranteed for every input) before the second compute ran,
+// producing NaNs that tripped ggml_compute_forward_gelu_erf_f32's assertion. That was a bug in the TEST's
+// own setup, not a production regression: real weights are never gallocr-managed or ggml_set_input()'d in
+// the first place, so this exact failure mode cannot happen to them.
 void test_full_topology_reuse_with_full_refresh_matches_fresh_rebuild(ggml_backend_t backend) {
     constexpr int64_t T = 8, C = 8, HID = 16, K = 3, P0 = 1;
 
@@ -165,9 +180,20 @@ void test_full_topology_reuse_with_full_refresh_matches_fresh_rebuild(ggml_backe
     for (size_t i = 0; i < k2_data.size(); ++i) k2_data[i] = 0.01f * static_cast<float>((i % 11) - 5);
     const std::vector<float> t0(C, 0.0f), t1(C, 0.125f);
 
+    // Persistent "weight" buffer for kernel1/kernel2 -- separate ggml_context, separate backend buffer,
+    // never marked ggml_set_input(), set once and never rewritten. See the comment above for why.
+    ggml_context_ptr weights_ctx(ggml_init(ggml_init_params{2 * ggml_tensor_overhead() + 4096, nullptr, /*no_alloc=*/true}));
+    ggml_tensor* kernel1 = ggml_new_tensor_3d(weights_ctx.get(), GGML_TYPE_F32, K, C, HID);
+    ggml_tensor* kernel2 = ggml_new_tensor_3d(weights_ctx.get(), GGML_TYPE_F32, K, HID, C);
+    ggml_backend_buffer_ptr weights_buf(ggml_backend_alloc_ctx_tensors(weights_ctx.get(), backend));
+    LOOM_CHECK(weights_buf != nullptr);
+    set_f32(kernel1, k1_data);
+    set_f32(kernel2, k2_data);
+
     // The reused graph: two compute() calls, step 1 at t=0 then step 2 at t=0.125, refreshing latent,
     // timestep, AND conditioning both times (conditioning's value never actually changes -- that's the
-    // point being tested).
+    // point being tested). kernel1/kernel2 are NOT part of this refresh -- they're weights, not per-step
+    // inputs, and live outside gallocr's allocation pool entirely (see above).
     loom_test::GgmlScratch s(backend);
     ggml_tensor* latent = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, T, C);
     ggml_set_input(latent);
@@ -175,16 +201,10 @@ void test_full_topology_reuse_with_full_refresh_matches_fresh_rebuild(ggml_backe
     ggml_set_input(timestep);
     ggml_tensor* conditioning = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 1, C);
     ggml_set_input(conditioning);
-    ggml_tensor* kernel1 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, K, C, HID);
-    ggml_set_input(kernel1);
-    ggml_tensor* kernel2 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, K, HID, C);
-    ggml_set_input(kernel2);
     ggml_tensor* velocity = build_vector_field(s.ctx.get(), latent, timestep, conditioning, kernel1, kernel2);
     ggml_set_output(velocity);
     ggml_cgraph* gf = s.expand(velocity);
 
-    set_f32(kernel1, k1_data);
-    set_f32(kernel2, k2_data);
     set_f32(latent, latent_data);
     set_f32(timestep, t0);
     set_f32(conditioning, conditioning_data);

@@ -2,10 +2,10 @@
 //
 // Without --prompt/--wav, just loads a .gguf model and reports what GgufModel parsed out of it. With
 // --prompt, additionally runs greedy autoregressive generation via Generator and prints the sampled
-// token ids -- there's no tokenizer wired into the LLM path yet, so the prompt is given as
-// whitespace-separated integer token ids rather than text (loom::Vocab now exists and could take real
-// text here, but nothing has converted an LLM checkpoint with a vocab yet -- see BACKLOG.md). With
-// --wav, runs a real audio-to-text Conformer-CTC demo: loads a 16kHz PCM16 WAV file of ANY length
+// tokens. If the model has a "tokenizer.ggml.model"="gpt2" vocab (e.g. a real Qwen3 conversion --
+// see tools/convert_qwen3/), --prompt is real text, encoded/decoded via loom::BpeVocab; otherwise it
+// falls back to the original whitespace-separated integer token ids (the only option for a model with no
+// tokenizer at all, e.g. the Milestone-1 toy LLM). With --wav, runs a real audio-to-text Conformer-CTC demo: loads a 16kHz PCM16 WAV file of ANY length
 // (sequence length is genuinely dynamic -- see SPECIFICATION.md §4), runs the full
 // waveform -> mel-frontend -> encoder -> CTC-decoder graph sized exactly to that length,
 // greedy-CTC-decodes the logits, and detokenizes with the model's real SentencePiece vocab.
@@ -26,7 +26,7 @@ namespace {
 
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
-                  "usage: %s --model <path.gguf> [--prompt \"<token id> <token id> ...\"] [--n-predict N]\n"
+                  "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <conformer_ctc.gguf> --wav <path.wav>\n",
                   argv0, argv0);
 }
@@ -162,7 +162,13 @@ int main(int argc, char** argv) {
         std::printf("  weights: %zu tensors\n", model->weights().size());
 
         if (has_prompt) {
-            const std::vector<int32_t> prompt_tokens = parse_token_ids(prompt_text);
+            std::unique_ptr<loom::BpeVocab> bpe_vocab;
+            if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "gpt2") {
+                bpe_vocab = loom::BpeVocab::load(*model);
+            }
+
+            const std::vector<int32_t> prompt_tokens =
+                bpe_vocab ? bpe_vocab->encode(prompt_text) : parse_token_ids(prompt_text);
             if (prompt_tokens.empty()) {
                 std::fprintf(stderr, "error: --prompt produced no token ids\n");
                 return 1;
@@ -176,9 +182,14 @@ int main(int argc, char** argv) {
             loom::Generator generator(*model, topo, cfg, backend.get());
             const std::vector<int32_t> generated = generator.generate(prompt_tokens);
 
-            std::printf("generated %zu tokens:", generated.size());
-            for (int32_t tok : generated) std::printf(" %d", tok);
-            std::printf("\n");
+            if (bpe_vocab) {
+                std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
+                            bpe_vocab->decode(generated).c_str());
+            } else {
+                std::printf("generated %zu tokens:", generated.size());
+                for (int32_t tok : generated) std::printf(" %d", tok);
+                std::printf("\n");
+            }
         }
 
         if (has_wav) {

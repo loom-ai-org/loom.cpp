@@ -23,6 +23,8 @@ add_library(loom_engine
     src/core/generation.cpp
     src/core/ode_stepper.cpp
     src/core/vocab.cpp
+    src/core/unicode.cpp
+    src/core/bpe_vocab.cpp
     src/core/ctc_decode.cpp
     src/ops/primitive_registry.cpp
     src/ops/primitives_basic.cpp

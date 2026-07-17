@@ -93,6 +93,20 @@ target_compile_definitions(test_e2e_toy_llm PRIVATE
 add_test(NAME test_e2e_toy_llm COMMAND test_e2e_toy_llm)
 set_tests_properties(test_e2e_toy_llm PROPERTIES FIXTURES_REQUIRED "toy_llm_gguf_fixture;toy_llm_reference_fixture")
 
+# --- Generic-converter proof of concept: same weights/reference as test_e2e_toy_llm above, but the
+#     topology JSON is auto-derived from a real torch.export() ATen graph (tools/convert_generic/), not
+#     hand-written. Needs a torch environment to produce its GGUF, so -- like the real-model tests below
+#     -- it's not wired into the default fixture-generation flow; it looks for LOOM_TOY_LLM_GENERIC_DIR
+#     and skips cleanly (SKIP_RETURN_CODE) if that GGUF hasn't been prepared. Reuses toy_llm_reference_fixture
+#     (same weights => same expected logits) rather than generating a second reference.
+add_executable(test_e2e_toy_llm_generic test_e2e_toy_llm_generic.cpp)
+target_link_libraries(test_e2e_toy_llm_generic PRIVATE loom::engine)
+target_compile_definitions(test_e2e_toy_llm_generic PRIVATE LOOM_TEST_REF_DIR="${LOOM_E2E_REF_DIR}")
+add_test(NAME test_e2e_toy_llm_generic COMMAND test_e2e_toy_llm_generic)
+set_tests_properties(test_e2e_toy_llm_generic PROPERTIES
+    SKIP_RETURN_CODE 77
+    FIXTURES_REQUIRED toy_llm_reference_fixture)
+
 # --- Milestone 2: toy vision encoder end-to-end test ---
 
 set(LOOM_E2E_VISION_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_vision_ref)
@@ -233,3 +247,64 @@ set_tests_properties(test_vocab PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_ctc_decode test_ctc_decode.cpp)
 target_link_libraries(test_ctc_decode PRIVATE loom::engine)
 add_test(NAME test_ctc_decode COMMAND test_ctc_decode)
+
+# --- Qwen3 roadmap item: Unicode subsystem (NFC normalize, \p{L}/\p{N} classification) backing BpeVocab ---
+add_executable(test_unicode test_unicode.cpp)
+target_link_libraries(test_unicode PRIVATE loom::engine)
+add_test(NAME test_unicode COMMAND test_unicode)
+
+# --- Qwen3 roadmap item: BpeVocab (byte-level BPE, llama.cpp "gpt2" GGUF schema) against a small
+#     synthetic fixture with hand-traceable merges (see tests/fixtures/make_bpe_vocab_gguf.py) ---
+add_test(
+    NAME gen_bpe_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bpe_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/bpe_vocab_test.gguf
+)
+set_tests_properties(gen_bpe_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_gguf_fixture)
+
+add_executable(test_bpe_vocab test_bpe_vocab.cpp)
+target_link_libraries(test_bpe_vocab PRIVATE loom::engine)
+target_compile_definitions(test_bpe_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_bpe_vocab COMMAND test_bpe_vocab)
+set_tests_properties(test_bpe_vocab PROPERTIES FIXTURES_REQUIRED bpe_vocab_gguf_fixture)
+
+# --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
+#     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---
+set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)
+
+add_test(
+    NAME gen_gqa_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_gqa_test_gguf.py
+            ${LOOM_FIXTURE_DIR}/gqa_test.gguf
+)
+set_tests_properties(gen_gqa_gguf_fixture PROPERTIES FIXTURES_SETUP gqa_gguf_fixture)
+
+add_test(
+    NAME gen_gqa_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward_gqa.py
+            ${LOOM_E2E_GQA_REF_DIR} --prompt 1 2 3 --n-new 4
+)
+set_tests_properties(gen_gqa_reference PROPERTIES FIXTURES_SETUP gqa_reference_fixture)
+
+add_executable(test_e2e_gqa test_e2e_gqa.cpp)
+target_link_libraries(test_e2e_gqa PRIVATE loom::engine)
+target_compile_definitions(test_e2e_gqa PRIVATE
+    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
+    LOOM_TEST_REF_DIR="${LOOM_E2E_GQA_REF_DIR}"
+)
+add_test(NAME test_e2e_gqa COMMAND test_e2e_gqa)
+set_tests_properties(test_e2e_gqa PROPERTIES FIXTURES_REQUIRED "gqa_gguf_fixture;gqa_reference_fixture")
+
+# --- Real-model test: Qwen3-0.6B-Base, converted via tools/convert_qwen3/. Same "not regenerated at
+#     ctest time, skip cleanly if the real checkpoint isn't prepared" pattern as test_e2e_conformer_ctc ---
+add_executable(test_e2e_qwen3 test_e2e_qwen3.cpp)
+target_link_libraries(test_e2e_qwen3 PRIVATE loom::engine)
+add_test(NAME test_e2e_qwen3 COMMAND test_e2e_qwen3)
+set_tests_properties(test_e2e_qwen3 PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Generic-converter proof of concept, round 2: real Qwen3-0.6B-Base through the same, unmodified
+#     converter/op-mapping table the toy LLM used (tools/convert_generic/) -- see BACKLOG.md ---
+add_executable(test_e2e_qwen3_generic test_e2e_qwen3_generic.cpp)
+target_link_libraries(test_e2e_qwen3_generic PRIVATE loom::engine)
+add_test(NAME test_e2e_qwen3_generic COMMAND test_e2e_qwen3_generic)
+set_tests_properties(test_e2e_qwen3_generic PROPERTIES SKIP_RETURN_CODE 77)

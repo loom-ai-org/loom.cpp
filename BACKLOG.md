@@ -76,6 +76,35 @@ under the same discipline.
 implemented or verified there yet (a different topology/primitive set, and llama.cpp's own bucketing
 scheme has more moving parts than `OdeStepper`'s fixed-shape loop).
 
+#### Corollary bug found later: `test_full_topology_reuse_with_full_refresh_matches_fresh_rebuild` itself violated its own discipline
+
+Discovered 2026-07-17 while investigating a consistent (not flaky) `gelu_erf` `NaN`/`Inf` assertion
+failure in this same test. The test's `kernel1`/`kernel2` tensors (standing in for real model weights)
+were created in the *same* `GgmlScratch` no_alloc context as the true per-step inputs
+(`latent`/`timestep`/`conditioning`) and marked `ggml_set_input()` like them — but, matching what a real
+model's *weights* should behave like, were only ever written **once**, before the first `compute()`, never
+rewritten before the second. That's exactly the unsafe pattern `test_unrefreshed_input_gets_silently_aliased`
+demonstrates two tests above it: a diagnostic readback confirmed `gallocr` had aliased `kernel1`'s buffer
+with an intermediate tensor's output during the first `compute()` call, silently corrupting it before the
+second call ran and producing the `NaN`s that tripped the assertion (`kernel2` happened not to get
+aliased, consistent with `gallocr`'s aliasing being real but not guaranteed for every input).
+
+This was a bug in the *test's own setup*, not a production regression: real weights (`GgufModel::load()`,
+`gguf_model.cpp`) and `KvCache`'s persistent K/V storage (`kv_cache.cpp`) both live in their own
+`ggml_backend_alloc_ctx_tensors`-backed buffer, entirely separate from the ephemeral no_alloc context
+`GraphBuilder`/`gallocr` manages per `build()` call, and are never marked `ggml_set_input()` — so they
+were never actually at risk of this aliasing in real usage, only in this test's flawed approximation of
+"a weight that doesn't change." **Fixed by giving `kernel1`/`kernel2` their own persistent
+context+buffer**, mirroring `KvCache`'s exact allocation pattern, matching how the test already claimed to
+model real weight behavior. Verified stable across 5 repeated runs after the fix (was 100% reproducible
+before it).
+
+**Lesson, in the same spirit as the length-dependent-constant lesson below**: a test that *simulates* a
+production invariant (here: "weights are immune to the reused-graph aliasing risk") must actually
+reproduce the mechanism that makes the invariant true (a separate allocation buffer), not just approximate
+the *symptom* (an input that happens not to get rewritten) — the two aren't equivalent once the underlying
+allocator is involved, and only the real mechanism is guaranteed safe.
+
 ## Resolved in Milestone 4 (real model: NVIDIA `stt_en_conformer_ctc_small` Conformer-CTC)
 
 First test against an actual published checkpoint rather than a toy fixture. Converted via
@@ -337,6 +366,107 @@ audit by inspecting `"inputs"` alone.
 - Everything else from Milestone 6's "still out of scope" list (vocab types beyond UGM, no LLM
   checkpoint with a vocab yet) is unchanged.
 
+## Resolved in Milestone 8 (real model: `Qwen/Qwen3-0.6B-Base`, byte-level BPE tokenizer)
+
+Closes the "Qwen3-0.6B (base LLM)" roadmap item below — a real, published 0.6B-parameter checkpoint now
+runs end to end through loom-engine's *generic* topology-interpretation path, with no bespoke C++ needed
+for this architecture. Verified against an independent numpy/PyTorch reference
+(`tools/convert_qwen3/reference_forward_qwen3.py`) and manually smoke-tested via `loom_cli --prompt "The
+capital of France is"`, which produced the coherent, semantically correct continuation `" Paris. The
+capital of Germany is Berlin. The capital of"`.
+
+**Every piece composes existing primitives — nothing new was added to `PrimitiveRegistry`:**
+
+- **QK-norm**: an existing `RMS_NORM` node on `q`/`k` (reshaped to per-head `[head_dim, n_head(_kv),
+  n_tokens]`) inserted before `ROPE`, weight shape `[head_dim]` applied via the existing `MUL` broadcast
+  pattern. Confirmed directly against the real checkpoint's safetensors header before converting anything:
+  `self_attn.q_norm.weight`/`k_norm.weight` are genuinely `[128]` (== `head_dim`, not `[n_head*head_dim]`),
+  exactly the per-head design assumed.
+- **GQA**: `ATTENTION`'s existing `ggml_mul_mat(kp, qp)` broadcast (`n_head_kv -> n_head`, requires
+  `n_head % n_head_kv == 0`) needed no changes — but per this project's "verify before trusting an
+  existing mechanism in a new configuration" discipline, it had never actually been exercised with
+  `n_head_kv < n_head` before this milestone (the Milestone-1 toy LLM uses `n_head == n_head_kv == 2`).
+  **New regression test `tests/test_e2e_gqa.cpp`** (fixture: `tools/fixture_gen/gqa_test_common.py`, 4
+  query / 2 KV heads) proves GQA *and* QK-norm's two-extra-broadcast-dim `MUL` together, against a numpy
+  reference, *before* the real 16-query/8-KV-head checkpoint depended on either — this caught nothing
+  wrong (both worked first try), but was written and run before conversion, not after, per that
+  discipline.
+- **Tied input/output embeddings**: needed no engine change at all, confirmed by directly inspecting the
+  checkpoint (`tie_word_embeddings: true` in `config.json`, and indeed no separate `lm_head.weight` tensor
+  in `model.safetensors`) — `convert_qwen3.py`'s topology just references `"token_embd.weight"` by name
+  from both the initial `GET_ROWS` and the final logits `MUL_MAT`; `GraphBuilder`'s symbol table already
+  resolves a name to the same tensor wherever referenced.
+- **`head_dim` is an independent hparam, not `n_embd/n_head`**: confirmed from the real safetensors shapes
+  before writing any conversion code (per the plan's explicit first step) — `q_proj.weight` is
+  `[2048, 1024]` (16 heads × 128 `head_dim`, projecting *up* from `hidden_size=1024`), `k_proj`/`v_proj`
+  are `[1024, 1024]` (8 KV heads × 128), `o_proj` is `[1024, 2048]` (projecting back down). Already fully
+  expressible by the existing topology grammar (every `RESHAPE`/`ROPE` dimension is a named symbol, never
+  assumed derived from `n_embd`/`n_head`), so this needed no engine change either — just correct hparam
+  KVs (`n_embd_head_k`/`n_embd_head_v` = 128, distinct from `n_embd` = 1024).
+
+**A real byte-level BPE tokenizer, with full Unicode fidelity (per explicit user decision, not an
+ASCII-only approximation)** — the one genuine new engine subsystem this milestone added, closing the gap
+tracked since Milestone 6 ("Only the UGM... vocab type is implemented") and finally letting `loom_cli
+--prompt` take real text for an LLM instead of raw token ids:
+
+- **`tools/codegen/gen_unicode_tables.py`** (one-off, NOT part of the CMake build, output checked in as
+  `include/loom/core/unicode_data.h`): derives `\p{L}`/`\p{N}` category range tables, a canonical
+  decomposition map, a combining-class table, and a composition-exclusion set from Python's stdlib
+  `unicodedata` (Unicode 14.0.0) plus the Unicode Character Database's own `CompositionExclusions.txt`
+  (fetched once — NOT derivable from `unicodedata` alone, and skipping it would make NFC composition
+  silently *wrong*, not just incomplete, for the characters it lists). The C++ engine itself has no
+  runtime Python dependency; only this generator does, and it's never invoked at build or convert time.
+- **`include/loom/core/unicode.{h,cpp}`**: hand-implements the UAX #15 NFC algorithm (canonical
+  decomposition — including Hangul, which is deliberately *absent* from the generated table since
+  UnicodeData.txt specifies it algorithmically instead of listing ~11172 mappings — canonical ordering,
+  then canonical composition against the generated tables) plus `is_letter`/`is_number`. Unit-tested in
+  isolation (`tests/test_unicode.cpp`) against known recomposition cases before `BpeVocab` ever depended
+  on it.
+- **`include/loom/core/bpe_vocab.{h,cpp}`**: new `BpeVocab` class (the sibling `vocab.h`'s doc comment
+  already reserved: "BPE's byte-to-'Ġ' convention... decode/encode differently"), reading llama.cpp's own
+  real `tokenizer.ggml.model="gpt2"` GGUF schema (confirmed against the installed `gguf` package's
+  `GGUFWriter` methods, not assumed). `encode()` NFC-normalizes, then runs a **hand-written scanner**
+  reproducing the real Qwen2/Qwen3 tokenizer.json's fixed pretokenizer regex exactly (confirmed by
+  fetching the actual `tokenizer.json` and reading its `pre_tokenizer` field, not assumed from general
+  GPT2 knowledge) — same "hardcode the one known fixed pattern as a manual scanner" approach llama.cpp
+  itself uses for GPT2-family regexes, since `\p{L}`/`\p{N}` aren't expressible via `std::regex`. Then
+  GPT2's standard byte↔unicode-codepoint mapping, then greedy BPE merge per pretokenizer chunk.
+  `tests/test_bpe_vocab.cpp` hand-traces exact expected token ids for plain-ASCII cases (a word fully
+  reduced by merges, digit-by-digit number splitting — `\p{N}` has no quantifier in the real regex, so
+  `"12"` never merges into one piece even though nothing else prevents it, a deliberate easy-to-get-wrong
+  detail) against a small synthetic fixture, plus round-trip checks for CJK and NFC-recomposition cases
+  the tiny fixture can't hand-trace ids for.
+- **Deliberately narrower than full tiktoken/HF-tokenizers generality**: this pretokenizer scanner only
+  implements the *specific* fixed regex Qwen2/Qwen3's `tokenizer.json` declares — it is not a general BPE
+  pretokenizer-configuration interpreter. The `\s` whitespace class used by the scanner is ASCII whitespace
+  only (space/tab/CR/LF/VT/FF), not the full Unicode `White_Space` property some rare Unicode space
+  characters have — a narrower scope than the `\p{L}`/`\p{N}`/NFC fidelity elsewhere in this subsystem,
+  chosen pragmatically since it only affects extremely uncommon input.
+
+**Conversion tooling** (`tools/convert_qwen3/`, mirrors `tools/convert_nemo/`'s established layout):
+`convert_qwen3.py` reads `config.json` + `model.safetensors` + `tokenizer.json` directly — deliberately
+avoiding the `transformers` library entirely (same precedent as `tools/convert_nemo/`, which hand-parses a
+`.nemo` archive instead of depending on the NeMo toolkit), using the `safetensors` package's own torch
+loader only to cast BF16 → F32 (numpy has no native bfloat16). `qwen3_tokenizer.py` parses
+`tokenizer.json`'s `model.vocab`/`model.merges` directly via plain `json` (no `tokenizers` library
+needed) — confirmed the real vocab (151643 entries, ids contiguous 0..151642) plus 22 `added_tokens`
+(151643..151664, no overlap) don't fill the checkpoint's full `vocab_size` (151936); the remaining ids are
+unused/reserved embedding-matrix rows, padded with empty-string placeholders so `BpeVocab::id_to_piece`
+never throws for the full valid id range.
+
+**Target is specifically Qwen3-0.6B-**Base** (not the instruct/reasoning checkpoint)** — no chat template
+(ChatML/Jinja) rendering and no `<think>` reasoning-block special-token handling were needed or attempted;
+`loom_cli --prompt` is plain raw-text continuation, matching the Milestone-1 toy LLM's demo shape exactly.
+Picking up the instruct/reasoning variant is separate, not-yet-started future work.
+
+### Still out of scope after Milestone 8
+
+- Everything the "Deliberately narrower..." bullet above already covers (ASCII-only `\s`, this specific
+  fixed pretokenizer regex only).
+- The instruct/reasoning Qwen3-0.6B checkpoint (chat template, `<think>` handling) — see above.
+- Qwen3-ASR-0.6B and Qwen3-TTS-0.6B (12Hz-Base) remain fully unstarted roadmap items — see below. Nothing
+  about this milestone's audio/TTS-integration gaps changed; this milestone only touched the base LLM.
+
 ## Performance optimizations designed but not implemented
 
 - **Bucketed KV-cache graph-reuse.** `GraphBuilder::build()` always does a full rebuild + no_alloc pass
@@ -419,3 +549,594 @@ Same "generic, not faithful" precedent as Milestone 2:
   throws `std::out_of_range` rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr
   could in principle trigger this uncaught-by-`catch (loom::Error&)` path; low risk today since the layer
   index always comes from `repeat_for`'s own loop bound, not arbitrary user input.
+
+## Roadmap: small TTS models (VITS, StyleTTS2, Kokoro, FastConformer-CTC/RNN-T, Parakeet)
+
+Not started — captured here per an explicit request to record what enabling this model family would
+need, cross-checked against what this engine *already* has (Milestones 1-7) rather than assumed from
+general `ggml` knowledge. Two things are already true that change the shape of this work: (1) the
+Conformer-CTC work already validated a real, published encoder family — FastConformer's encoder is the
+same subsampled-Conformer shape with a lighter depthwise-separable subsampling front-end, not a new
+architecture class — and (2) `SPECIFICATION.md` §4 ("The TTS Catch") already prescribes the exact
+pattern needed for autoregressive decoding: JSON defines the static sub-graph, C++ drives the loop and
+feeds state back in between calls. `OdeStepper` (Milestone 3) and `Generator` (Milestone 1) are both
+already real instances of that pattern — a Transducer decoder is a third, not a new paradigm.
+
+### Already covered by existing primitives (verified against the actual registry, not assumed)
+
+- **ConvNeXt-style blocks** (used in StyleTTS2's decoder and elsewhere): depthwise conv + layer norm +
+  pointwise MLP + GELU is fully expressible today with `CONV_1D_DW` + `LAYER_NORM` + `MUL_MAT` + `GELU`
+  — no new primitive needed.
+- **Dilated convolution stacks** (WaveNet-style, used throughout HiFi-GAN/VITS's MRF residual blocks):
+  `CONV_1D`/`CONV_1D_DW` already take a `"d0"` dilation attr (confirmed in
+  `src/ops/primitives_conv.cpp` — added for the Conformer depthwise conv, dilation was already plumbed
+  through generically). No gap here despite this being flagged as a blocker in general — it's a solved
+  problem *in this codebase specifically*.
+- **Transposed-convolution upsampling** (VITS/HiFi-GAN's decoder): `CONV_TRANSPOSE_1D` already exists
+  (Milestone 3) and calls `ggml_conv_transpose_1d` directly — not `ggml_conv_1d`'s forced-F16-im2col
+  path, so the earlier F16-precision concern that motivated re-deriving `CONV_1D`/`CONV_1D_DW` from
+  scratch doesn't apply here. The real gap: `ggml_conv_transpose_1d` itself only accepts `stride`
+  (forces `padding=0, dilation=1` — a `ggml` API limit, not a choice made in this engine), so achieving
+  HiFi-GAN's typical exact-upsampling-ratio output length may need a post-hoc `VIEW`-based crop node in
+  the topology (already expressible with the existing `VIEW` primitive) rather than a new primitive.
+  Needs a real hand-verified test against a real HiFi-GAN-shaped block before trusting this, same
+  discipline as every other primitive here — not yet attempted at anything beyond the Milestone-3 toy
+  VAE's minimal usage.
+- **`LeakyReLU`** (HiFi-GAN's standard activation, distinct from `RELU`) and **`tanh`** (needed below for
+  LSTM gates) are both already native `ggml` ops (`ggml_leaky_relu`, `ggml_tanh`) — trivial one-line
+  wraps in the existing `SIGMOID`/`RELU` style, not yet registered.
+
+### Gap 1: the Transducer problem (RNN-T/TDT — Parakeet, FastConformer-RNN-T)
+
+Confirmed real: CTC's greedy argmax (`ctc_greedy_decode`) is a pure per-frame reduction with no
+recurrence, but a Transducer's prediction network (LSTM, stateful across predicted tokens) and joint
+network (encoder-frame × prediction-state → per-step token/duration distribution) form a genuine
+autoregressive lattice search — not expressible as a single static DAG.
+
+- **No LSTM/GRU primitive exists.** Would need either a monolithic `LSTM_STEP` primitive (one gate
+  computation per call: 4 gate matmuls + `SIGMOID`/`tanh`/elementwise `MUL`/`ADD`, all already-available
+  ops composed into one primitive for convenience) or expressing the gates as plain composite JSON nodes
+  (`MUL_MAT`+`ADD`+`SIGMOID`+`tanh`+`MUL`, no new primitive at all, matching this project's general
+  preference for composing existing ops over adding monolithic ones — e.g. `ATTENTION`/
+  `REL_POS_ATTENTION` are composites, not opaque black boxes). Needs `ggml_concat` (also unused today,
+  also native) if the gate weights expect `[h, x]` concatenated rather than two separate matmuls summed
+  — the latter is mathematically equivalent and avoids needing `CONCAT` at all, same "avoid a new
+  primitive when an existing composition works" precedent as everywhere else in this backlog.
+- **The decode loop itself** would be a new C++ driver analogous to `Generator`/`OdeStepper`: build the
+  encoder sub-graph once (a real, faithful FastConformer encoder, extending the already-verified
+  Conformer-CTC work), then step token-by-token maintaining the LSTM hidden/cell state and the current
+  encoder-frame pointer host-side, rewriting every declared input before every reused-graph compute call
+  (the graph-reuse discipline from Milestone 3's root-caused `ggml_gallocr` finding applies identically
+  here — this is exactly the kind of new control-flow driver that finding was written to protect against
+  getting wrong again).
+- **TDT specifically** (Parakeet's variant) predicts a token *and* a frame-advancement duration jointly
+  per step, changing the loop's frame-pointer update rule from "always advance by 1" to "advance by the
+  predicted duration" — a host-side loop-condition change, not an engine primitive change.
+
+### Gap 2: the vocoder blockers (VITS/StyleTTS2's HiFi-GAN decoder, Kokoro's ISTFTNet)
+
+- **HiFi-GAN (VITS/StyleTTS2)**: per the "already covered" section above, this is graph-expressible with
+  existing primitives (dilated `CONV_1D` MRF blocks, `CONV_TRANSPOSE_1D` upsampling, `LeakyReLU`) plus
+  the two small additions noted (crop `VIEW`, `LeakyReLU`/`tanh` registration) — no fundamentally new
+  capability needed, "just" a real conversion + reference-verification effort at real HiFi-GAN scale.
+- **ISTFTNet (Kokoro)**: genuinely the hardest gap — `ggml` has no complex-number type or FFT. Two paths,
+  in order of preference (verify the first before reaching for the second, same "prefer composing
+  existing primitives" precedent as everywhere else in this file):
+  1. **Invert the same STFT-via-convolution trick already verified in Milestone 5.** Forward STFT was
+     expressed as cross-correlating framed audio against precomputed cos/sin DFT-basis kernels (verified
+     bit-exact against real `torch.stft`, see `mel_common.py`/`BACKLOG.md`'s Milestone 5 section). The
+     inverse DFT is likewise a fixed linear transform of each frame's spectral values (expressible as one
+     `MUL_MAT` against a precomputed inverse-DFT basis matrix), and overlap-adding the resulting
+     per-frame time-domain segments back into a single waveform is mathematically exactly what a
+     transposed convolution computes (`CONV_TRANSPOSE_1D`, already implemented) — a windowed
+     overlap-add is a transposed conv with the window folded into the kernel. **This is a promising,
+     currently unverified hypothesis, not a confirmed plan** — it needs the same hand-computed
+     small-example verification (and then a real-`numpy`-iSTFT cross-check) that every other primitive
+     in this project got before being trusted, particularly around whether `CONV_TRANSPOSE_1D`'s exact
+     accumulation semantics match true overlap-add without an off-by-one at frame boundaries. If it
+     checks out, ISTFTNet needs zero new engine capability beyond what dynamic-length Conformer-CTC
+     already has (`MUL_MAT` + `CONV_TRANSPOSE_1D` + the `floor()`-based dynamic-shape symbol-expression
+     pattern from Milestone 7, since iSTFT's output length is itself a function of the frame count).
+  2. **Fall back to a real FFT implementation** (a vendored lightweight C++ iFFT, or a `fftw3`
+     dependency) only if (1) doesn't hold up under verification — this is explicitly the fallback, not
+     the first move, to avoid taking on a new C/C++ dependency (this project currently has none beyond
+     `ggml`/`nlohmann_json`, both fetched via `FetchContent`) before confirming it's actually necessary.
+  Either way, the `ggml` graph's declared `"output"` stops at the magnitude/phase (or real/imag)
+  spectrogram — the iSTFT reconstruction step runs host-side after `ggml_backend_graph_compute`, same
+  "host logic, not a graph primitive" precedent as `ctc_greedy_decode`/`Vocab::decode`.
+
+### Why Kokoro specifically is worth prioritizing if this roadmap is picked up
+
+82M parameters (~350MB unquantized, meaningfully smaller quantized), fully feed-forward (no diffusion
+steps, no autoregressive Transducer loop — sidesteps Gap 1 entirely), so it's reachable with *only* Gap
+2 solved. If the iSTFT-via-existing-primitives hypothesis above holds, Kokoro would need no new ggml
+primitives at all beyond the two trivial activation registrations — making it the cheapest, highest-payoff
+next real-model target in this family, notably cheaper than VITS/StyleTTS2 (also need Gap 2, but are
+larger/more architecturally involved) or Parakeet (needs both gaps).
+
+**Candidate reference checkpoint**: <https://github.com/femelo/kokoro-deutsch> — a German fine-tune of
+Kokoro-82M (PyTorch `.pth` checkpoints, trained via "a patched StyleTTS2 submodule", `misaki` phonemizer)
+confirmed via its README, not assumed. Same base architecture/vocoder as upstream Kokoro-82M, so it's a
+valid conversion target and a real checkpoint to verify the iSTFT hypothesis against — just note the
+phonemizer (`misaki`, German-language-specific) is its own separate preprocessing stage upstream of the
+graph, same "host-side, out of scope for the graph itself" boundary as mel-spectrogram extraction was
+before Milestone 5 brought it in-graph (text→phoneme is a linguistic/lexicon problem, not a tensor op —
+unlike mel extraction, unlikely to ever move into the `ggml` graph itself).
+
+## Roadmap: Qwen3 family (Qwen3-0.6B, Qwen3-ASR-0.6B, Qwen3-TTS-0.6B)
+
+Captured per an explicit request. **Qwen3-0.6B (base LLM) is now DONE — see "Resolved in Milestone 8"
+above** — the other two remain not started. The user's own forks are the intended reference
+implementations for the remaining ASR/TTS work — **not** the upstream repos they're forked from — since
+they contain fixes/optimizations the user prefers:
+
+- Qwen3-0.6B (base LLM): DONE (Milestone 8). No single reference repo was used — `llama.cpp` itself
+  supports Qwen3 and was a legitimate reference for the plain architecture, but the real facts (attention
+  shapes, QK-norm weight shapes, tokenizer regex/schema) were all confirmed directly against the real
+  `Qwen/Qwen3-0.6B-Base` checkpoint and its `tokenizer.json`, not assumed from `llama.cpp`'s source.
+- Qwen3-ASR-0.6B: <https://github.com/femelo/qwen3-asr.cpp> (the user's fork of `predict-woo/qwen3-asr.cpp`).
+- Qwen3-TTS-0.6B (specifically "Qwen3-TTS-12Hz-0.6B-Base" per the fork's README): <https://github.com/femelo/qwen3-tts.cpp>
+  (the user's fork of the same `predict-woo` lineage).
+
+Per the user's framing, the strategic point of this item is broader than any single model: **because the
+graph topology is data embedded in the GGUF rather than hardcoded C++, loom-engine could run models
+`llama.cpp` doesn't officially support without needing a bespoke standalone engine per model** (the
+situation `qwen3-asr.cpp`/`qwen3-tts.cpp` are themselves examples of — each is its own dedicated C++
+program). The facts below were confirmed by fetching each fork's actual README (not assumed from general
+knowledge of the Qwen3 family, since ASR/TTS variants are recent and their exact architectures aren't
+something to guess at) — deeper source-level verification is still needed before conversion work starts,
+same rigor as every other model in this backlog.
+
+### Qwen3-0.6B (base LLM) — DONE, see "Resolved in Milestone 8" above
+
+Was flagged here as likely the cheapest item in this entire backlog, since Milestone 1's toy LLM already
+built the whole core stack it needed (RMSNorm, RoPE, KV-cached self-attention, SwiGLU FFN, autoregressive
+greedy decoding). That held up — QK-norm, GQA, and tied embeddings all composed from existing primitives
+with no engine changes, verified via new regression tests before touching the real checkpoint. The one
+genuine gap (a real BPE tokenizer, since Qwen3 uses byte-level BPE, not SentencePiece unigram) is now
+closed too, with full Unicode fidelity per explicit user decision. Full writeup, including what's
+deliberately still narrower in scope (ASCII-only `\s`, Base not instruct/reasoning), is in "Resolved in
+Milestone 8" above.
+
+### Qwen3-ASR-0.6B
+
+Per `qwen3-asr.cpp`'s README: an audio encoder feeds into the LLM via "audio-text embedding injection"
+(module named `audio_injection.cpp/h` in that repo), then the LLM decodes **fully autoregressively** —
+no CTC, no Transducer. That last point matters: this is architecturally simpler to integrate than
+Parakeet's RNN-T (Gap 1 above) specifically *because* it reuses the existing `Generator`/`KvCache`
+autoregressive pattern directly for the decode side — the genuinely new piece is the audio-encoder →
+embedding-injection integration, not a new decode loop:
+
+- **Audio encoder architecture is not yet confirmed** — the README doesn't state whether it's
+  Whisper-style, Conformer-style, or something else specific to Qwen-Audio's lineage; needs real
+  source-level (or weights-shape) inspection before assuming it maps onto the existing Conformer-CTC
+  encoder work, same "confirm from the actual source, don't assume" discipline as every other model here.
+- **Embedding injection is a new integration pattern**, distinct from both Gap 1 (Transducer) and the
+  mel-frontend's "declared input" pattern: audio-encoder output embeddings need to be spliced into
+  specific positions of the LLM's token-embedding sequence (replacing placeholder token embeddings)
+  before the transformer stack runs — closer to a LLaVA-style vision-token-injection pattern than
+  anything built so far. Likely needs a small amount of new host-side splicing logic (not a new ggml
+  primitive — token embedding lookup + audio embedding are both just tensors, and overwriting a slice of
+  one with the other is an existing `VIEW`/`ggml_set`-style operation), but the exact mechanism needs
+  designing against the real architecture, not guessed at here.
+
+### Qwen3-TTS-0.6B (12Hz-Base) — the most architecturally novel item in this whole roadmap
+
+Per `qwen3-tts.cpp`'s README, this is a **neural-codec TTS**, not mel+vocoder like VITS/Kokoro: BPE text
+tokenizer → ECAPA-TDNN speaker/x-vector encoder (from optional reference audio) → a **two-level**
+autoregressive generator (a 28-layer "talker" producing codebook-0 per frame, plus a 5-layer "code
+predictor" that then sequentially generates codebooks 1-15 *within* that same frame) → WavTokenizer
+vocoder decoding the multi-codebook codes to a 24kHz waveform.
+
+- **ECAPA-TDNN speaker encoder**: likely largely reachable already — TDNN layers are dilated `CONV_1D`
+  (already supported), and x-vector extraction's statistics pooling (mean+std over time) is the same
+  shape of reduction the mel-frontend's CMVN normalize already does (`SUM_ROWS`-based). SE-Res2Net's
+  specific squeeze-excite gating would need confirming against the real architecture, not assumed solved
+  by analogy alone.
+- **Nested/hierarchical autoregressive generation is the real new gap here** — more involved than
+  Parakeet's single RNN-T loop (Gap 1) or Qwen3-ASR's single LLM decode loop: an *outer* per-frame loop
+  (the talker, itself a standard KV-cached autoregressive transformer — reuses the `Generator` pattern)
+  with an *inner* per-codebook loop (the code predictor generating 15 more tokens *per outer step*,
+  presumably its own smaller causal/KV-cached structure). This would need a new C++ driver nesting two
+  reused-graph loops, doubling down on the graph-reuse discipline from Milestone 3's `ggml_gallocr`
+  finding at two different loop granularities simultaneously — the most complex new control-flow driver
+  proposed anywhere in this backlog, worth prototyping carefully rather than assuming it falls out of the
+  existing `Generator`/`OdeStepper` patterns unchanged.
+- **WavTokenizer's vocoder decoder is reportedly ConvNeXt-based** (consistent with WavTokenizer's
+  published architecture, not yet confirmed against this specific fork's weights) — ties directly back
+  to the "ConvNeXt-style blocks... fully expressible today" finding earlier in this file, another point
+  in favor of the vocoder side of this model being cheaper than the nested-decode-loop side.
+
+## Roadmap: investigate `executorch-ggml` for reusable ops-mapping concepts
+
+Not started — captured per an explicit request to verify and possibly adopt reusable concepts from
+<https://github.com/larryliu0820/executorch-ggml> (local clone: `/home/flavio/Dev/executorch-ggml`), an
+ExecuTorch backend that lowers `torch.export`-produced ATen graphs to ggml compute graphs. Facts below
+were confirmed by reading the actual repo (`README.md`, `PROGRESS.md`/`GRAPH_REBUILD.md`,
+`schema/ggml_ir.fbs`, `docs/gguf-integration.md`, and representative files under
+`python/executorch_ggml/ops/`, `runtime/ops/`), not assumed — it's a real, actively-benchmarked project
+(claims beating `llama.cpp` itself on Qwen3-0.6B decode: 411 vs 377 tok/s on an A100, 331 vs 299 tok/s on
+an Apple M4 Max, both Q8_0; and 122% of `llama.cpp`'s decode throughput on Qwen3.5-35B-A3B MoE).
+
+**Where it's conceptually adjacent to loom-engine, not identical**: both projects interpret a
+data-described graph at runtime instead of hardcoding architectures in C++, but the *source* of that graph
+differs — `executorch-ggml` derives its IR automatically from `torch.export`'s ATen dialect (any model
+that exports cleanly gets ggml coverage for free, gated by an op allow-list, with unsupported ops falling
+back to ExecuTorch's own CPU executor), while loom-engine's JSON topology is hand-authored per architecture
+by a conversion script. `executorch-ggml`'s IR is a FlatBuffer-serialized `OpCode` enum
+(`schema/ggml_ir.fbs`, ~50 ops) embedded in a `.pte` file, playing a role similar to loom's JSON `"op"`
+strings + `PrimitiveRegistry` — but the two extension models differ in a way worth noting as a point of
+comparison rather than a gap: adding a new op to `executorch-ggml` needs edits in 5 places (FlatBuffer
+enum, Python partitioner allow-list, Python ATen→IR mapping, C++ runtime builder call, regenerated
+FlatBuffer headers, per its own README's "Extending to More Ops" section), vs. loom's single
+self-registering `LOOM_REGISTER_OP(NAME, fn)` macro with no central switch statement — loom's approach is
+simpler here specifically because it never needs to match an *externally-defined* op vocabulary (ATen's),
+so this isn't something to change, just a confirmed point in favor of the existing design.
+
+### The real prize: a generic `torch.export` → loom-topology converter, not just borrowed op-mapping ideas
+
+Per explicit user direction: the actual value of `executorch-ggml` isn't its specific op-mapping choices
+(above) — it's the *shape* of its conversion pipeline. Today, every model loom-engine has converted
+(`convert_conformer_ctc.py`, `convert_qwen3.py`) is a **bespoke, hand-authored Python script per
+architecture**: the topology JSON is written by hand, node by node, and every weight name is mapped by
+hand. This doesn't scale to the rest of the roadmap in this file (VITS, StyleTTS2, Kokoro, Qwen3-ASR,
+Qwen3-TTS, Parakeet, ...) — it's exactly the kind of duplicated bespoke-per-architecture work loom's whole
+design is meant to avoid on the *runtime* side (a generic `GraphBuilder` + `PrimitiveRegistry` interpreting
+data instead of hardcoded `llm_build_*`-style C++), but that avoidance currently stops at the conversion
+boundary.
+
+**The proposed shape, mirroring `executorch-ggml`'s pipeline but targeting loom's JSON topology instead of
+its FlatBuffer IR**: `torch.export(model, args)` → a stable ATen FX graph → walk the graph nodes, mapping
+each ATen op to one (or a short, fixed composition of a few) loom `PrimitiveRegistry` op(s), automatically
+emitting both the topology JSON *and* a weight-name mapping (`state_dict` key → loom tensor name) — instead
+of a human doing that translation by hand for every new model. Extending coverage to a new architecture
+then means adding a handler for whichever *ATen ops* it uses that aren't mapped yet (write once, reused by
+every future model that also uses that op), not writing an entirely new conversion script.
+
+**The user's own caveat is the important part, and it's already anticipated elsewhere in this file**: not
+every model exports as one clean functional graph. **VITS is the concrete example** — its stochastic
+duration predictor involves sampling/control-flow, and its flow-based decoder and HiFi-GAN vocoder are
+architecturally distinct stages, not one straight-through function `torch.export` can trace as a single
+graph. This is *exactly* the same shape of problem already identified and scoped for two other models in
+this backlog: **Gap 1** (the Transducer problem — RNN-T/TDT needs isolated Encoder/Prediction-Network/
+Joint-Network sub-graphs with a custom C++ decode loop between them) and **Gap 2** (Qwen3-TTS's nested
+two-level autoregressive generation — a talker sub-graph and a code-predictor sub-graph, driven by nested
+C++ loops), both of which already establish the pattern `SPECIFICATION.md` §4 ("The TTS Catch") prescribes:
+JSON describes each *static* sub-graph, C++ drives whatever loop/control-flow/sampling connects them. A
+generic converter needs the *same* answer at the tooling level: call `torch.export()` **separately per
+sub-module** (e.g. VITS's `TextEncoder`, `StochasticDurationPredictor`, `Flow`, `Generator`), producing
+multiple topology JSON blobs in one GGUF, stitched together by a C++ driver — not a single monolithic
+export attempt that breaks on the first piece of real control flow.
+
+**Real tradeoffs to weigh before committing engineering time to this** (not yet prototyped):
+
+- **The bespoke-per-model work doesn't disappear, it moves.** Any checkpoint that isn't already a clean,
+  export-ready `torch.nn.Module` (most real checkpoints loaded from raw HF `state_dict`s, as both
+  conversions so far have been) still needs *someone* to write a plain-PyTorch `nn.Module` reimplementing
+  the architecture before it can be exported at all — arguably comparable effort to writing today's
+  `reference_forward_*.py` scripts, just in `nn.Module` form instead of functional numpy. **The real payoff
+  compounds over the number of models attempted**, not the first one: the op-mapping layer is write-once,
+  reused-forever, unlike today's 100%-bespoke-every-time topology scripts.
+- **Verification actually gets stronger, not weaker.** An auto-generated topology can be checked against
+  the *original* PyTorch model's real forward pass directly (no possibility of a human mis-transcribing the
+  op sequence by hand) — only the shared op-mapping layer itself needs to be correct, and it's verified once
+  and reused, same "verify before trusting an existing mechanism in a new configuration" discipline as
+  everything else in this backlog, just applied at the mapping-layer level instead of per-model.
+- **This is a genuinely new, substantial subsystem** — an ATen-graph walker, an op-mapping table, and
+  weight-name-mapping automation — not a quick add on top of existing conversion scripts.
+- **Recommended first step if this gets picked up**: a minimal proof-of-concept against a model
+  *already* hand-converted and verified — e.g. re-derive the Milestone-1 toy LLM's or Milestone 8's
+  Qwen3-0.6B-Base's topology JSON via the generic converter and check it against the *same* existing
+  reference/test harness those already have. That validates the whole approach cheaply, against a known-
+  correct answer, before ever pointing it at a genuinely new, unconverted architecture like VITS.
+
+#### POC done, 2026-07-17: the toy LLM, converter passes against the existing reference harness
+
+Built the recommended POC above (`tools/convert_generic/`), targeting the Milestone-1 toy LLM (simplest
+architecture available, already has an independent numpy reference). Result: **12/12 checks pass** in a new
+`tests/test_e2e_toy_llm_generic.cpp`, comparing the auto-derived topology's generated tokens and per-step
+logits against the exact same `reference_forward.py` fixture `test_e2e_toy_llm.cpp` already checks against
+(both topologies share the same weights/seed, so this is a direct apples-to-apples check of the *converter*,
+not a new numerical claim). Full `ctest` suite stays green (38/38, same skip count as before — this new test
+follows the same `SKIP_RETURN_CODE 77` pattern as the real-model tests, since it needs a `torch` environment
+to produce its GGUF; see `tests/test_e2e_toy_llm_generic.cpp`'s header comment for how to run it for real).
+
+**What was built:**
+- `tools/convert_generic/toy_llm_module.py` — a plain `torch.nn.Module` (`ToyLLM`) reproducing
+  `reference_forward.py`'s forward pass op-for-op (verified eagerly against it first, `max abs diff ≈
+  5.6e-9`, before ever exporting it), loading weights directly from `toy_llm_common.generate_weights()`.
+- `tools/convert_generic/aten_to_loom.py` — the converter: walks `torch.export()`'s `ep.graph.nodes`,
+  maps each node 1:1 via a small fixed table, resolves weight names via `graph_signature.inputs_to_parameters`
+  plus one small qualname→GGUF-key rule, and emits the topology JSON.
+- `tools/convert_generic/make_toy_llm_gguf_generic.py` — ties it together into a GGUF using the *same*
+  `toy_llm_common` weights/hparams as the hand-written fixture.
+
+**The concrete op-mapping table that came out of this** (`OP_MAP` in `aten_to_loom.py`):
+`aten.embedding.default → GET_ROWS`, `aten.rms_norm.default → RMS_NORM` (asserts `weight is None` — this
+POC always keeps the affine as a separate node), `aten.mul.Tensor → MUL`, `aten.add.Tensor → ADD`,
+`aten.linear.default → MUL_MAT` (args reordered weight-first, per `ggml_mul_mat`'s convention),
+`aten.view.default`/`aten.reshape.default → RESHAPE`, `aten.silu.default → SILU`, plus two **custom ops**
+(`torch.library.custom_op`, so they survive export as single opaque nodes) for the two things with no ATen
+equivalent: `loom::rope_neox → ROPE` and `loom::attention → ATTENTION`.
+
+**Two real bugs found and fixed while getting this to actually run** (both concrete, worth remembering for
+whoever picks this up next):
+1. **`RESHAPE`'s `shape` attr needed reversing.** ATen's `view()`/`reshape()` args are plain numpy/PyTorch
+   order (slowest-varying dim first); loom's `RESHAPE` feeds its `shape` attr straight into
+   `ggml_reshape_*`, which is `ne`-order (fastest-varying first) — confirmed by reading
+   `src/ops/primitives_basic.cpp:147-174` and cross-checking against `toy_llm_common.py`'s own
+   hand-written topology, which already reverses this by construction. Missing this reversal didn't error
+   at conversion time — it silently produced a topology that failed a `ggml_rope_ext` shape assertion
+   (`a->ne[2] == b->ne[0]`) three build layers downstream, at `GraphBuilder::reserve()` time. **A real,
+   generalizable lesson**: any op-mapping table translating between a numpy/PyTorch-convention IR (ATen,
+   ONNX) and ggml's reversed-`ne` convention needs this reversal applied consistently at every
+   shape-bearing attr, not just tensor axis order — easy to get right once, easy to silently get wrong
+   per-op if each mapping is written independently.
+2. **`ATTENTION`'s KV-cache side effects have no ATen equivalent, regardless of whether the source model
+   uses `scaled_dot_product_attention`.** Confirmed empirically that `torch.export()`'s default output
+   *does* keep `F.scaled_dot_product_attention` as a single `aten.scaled_dot_product_attention.default`
+   node (not decomposed) — but even so, mapping it to `ATTENTION` would still need the converter to inject
+   `kv_cache: true` / `layer: i`, information that exists nowhere in the ATen graph. This POC sidestepped
+   the *separate* wrinkle of SDPA's `(batch, heads, seq, dim)` calling convention not matching loom's
+   native head-minor layout (which would need its own transpose-wrapper unwrapping logic) by using a
+   `loom::attention` custom op instead — a deliberate scoping choice, not a claim that SDPA-shaped graphs
+   can't eventually be mapped directly.
+
+**How the layer index gets recovered**: `node.meta["nn_module_stack"]` (confirmed to survive per-node even
+on the fully-flattened Core ATen graph — see the empirical checks earlier in this section) is regex-matched
+for `layers\.(\d+)` to fill in `ATTENTION`'s `layer` attr — this generalizes to any real model built from a
+`nn.ModuleList` of per-layer submodules, not just this toy one.
+
+**Still exactly as scoped, not attempted**: dynamic shapes (this POC's `n_tokens` substitution is a
+literal-value special case, not real `torch.export.Dim` dynamic-shape export), op/subgraph fusion pattern
+-matching, anything multi-graph (VITS). The weight-name mapping is still one small explicit per-model-family
+rule (`_qualname_to_gguf_name`), not auto-derived — expected and already called out above, not a regression.
+
+#### Round 2, same day: pointed the *same, unmodified* converter at real Qwen3-0.6B-Base — the op-mapping table held
+
+Per the suggested next step above: reused `tools/convert_generic/aten_to_loom.py` completely unchanged
+against `tools/convert_generic/qwen3_module.py`'s `Qwen3LLM` — a from-scratch `nn.Module` loading the real
+checkpoint's BF16 weights directly (no `transformers`, same precedent as `convert_qwen3.py`), with genuine
+GQA (16 query / 8 KV heads), per-head QK-norm, and tied embeddings. Verified eagerly against the real
+reference first (`max abs diff ≈ 2.7e-5` against `expected_logits_step0.bin`, argmax match) before ever
+exporting it — same discipline as the toy LLM.
+
+**Result: `tests/test_e2e_qwen3_generic.cpp` passes 14/14 checks** against the exact same real-model
+reference fixture `test_e2e_qwen3.cpp` already uses (same weights ⇒ byte-identical expected logits,
+regardless of which conversion pipeline built the GGUF) — real 28-layer generation, correct GQA broadcast,
+correct QK-norm, correct tied-embedding weight reuse, correct token sequence. Full `ctest` suite: 39/39,
+same skip pattern.
+
+**The actual signal this was testing: zero new op-mapping entries needed.** `torch.export()`'s distinct ATen
+targets on the real Qwen3 graph are *exactly* the same 9 the toy LLM already had mapped —
+`aten.embedding.default`, `aten.rms_norm.default`, `aten.mul.Tensor`, `aten.add.Tensor`,
+`aten.linear.default`, `aten.view.default`, `aten.silu.default`, plus the two custom ops
+(`loom.rope_neox.default`, `loom.attention.default`) — imported from `toy_llm_module.py`, not
+redefined. Concretely, for free from the unmodified table:
+- **QK-norm** decomposes to the exact same `rms_norm(weight=None)` + `mul` pair already used for
+  `attn_norm`/`ffn_norm`, just applied to `q`/`k` instead of `cur` — the op-mapping table has no idea it's
+  looking at "QK-norm" specifically, it's just RMS_NORM+MUL again.
+- **GQA** needed no special-casing in the converter at all — `q`/`k`/`v` just arrive at `loom::attention`
+  with different head counts (16 vs 8), and loom's real C++ `ATTENTION` primitive's existing
+  `ggml_mul_mat` broadcast handles it, exactly as `tests/test_e2e_gqa.cpp` already proved for the hand
+  -written topology. (The custom op's own *eager* reference body did need one fix completely unrelated to
+  the converter — `F.scaled_dot_product_attention` needs `enable_gqa=True` when q/k head counts differ —
+  but that's PyTorch-eager-execution plumbing, not a converter or op-mapping change.)
+- **Tied embeddings** needed no special-casing either — `Qwen3LLM.token_embd` is one `nn.Parameter`
+  referenced from two call sites (`F.embedding` and the final `F.linear`), so `torch.export` naturally
+  emits one placeholder referenced by both consumer nodes, and the converter's existing
+  `node_symbol`/`inputs_to_parameters` resolution just resolves both to the same `"token_embd.weight"`
+  loom symbol without any tied-embedding-specific logic.
+- **The `_qualname_to_gguf_name` weight-naming rule carried over unchanged too** — `Qwen3Layer`'s attribute
+  names (`attn_q_norm`, `attn_k_norm`, etc.) were deliberately chosen to match the same
+  `layers.N.xxx`/`.weight`-suffix convention the toy LLM used, so the one rule written for the toy model
+  produced correct GGUF key names (`blk.0.attn_q_norm.weight`, ...) for the real one too.
+
+This is real evidence for the backlog's central claim — the op-mapping layer, once written, is genuinely
+write-once/reused, at least across two models sharing an attention-transformer shape. The next real test of
+that claim is a model that *isn't* shaped like a decoder transformer at all (VITS, per the roadmap above) —
+that's where new op-mapping entries and the actual multi-graph-linking question should first bite for real.
+
+#### Open discussion, to continue later: how to "link" multiple sub-graph exports together
+
+Raised by the user, explicitly deferred for a later session — captured here as an open question with two
+candidate directions, not a decision:
+
+Once a model is split into N separate `torch.export()` calls (one per sub-module, per the VITS/Gap-1/Gap-2
+pattern above), two things still need figuring out systematically: **(a) where to cut** — how to discover
+the sub-module boundaries automatically rather than a human deciding them by hand every time — and **(b)
+how to wire the pieces back together** — matching each sub-graph's output tensors to the next one's named
+inputs, and identifying exactly where non-tensor control flow (sampling, iteration, discrete branching)
+has to live in the C++ driver between them, analogous to how loom's own topology JSON already has a
+`"inputs"`/`"output"` naming convention per graph.
+
+**Confirmed 2026-07-17 by reading Netron's real source** (`lutzroeder/netron`, `source/pytorch.js` — fetched
+directly, not assumed from memory, since the user asked specifically how Netron manages to visualize models
+`torch.export` can't handle cleanly): Netron actually has **three tiers**, tried in order, and only the
+first two produce a real op-level graph —
+
+1. **`torch.export.ExportedProgram`** (when export succeeds): Netron walks `exported_program.graph.nodes`
+   directly, resolving weights via `graph_signature.inputs_to_parameters`/`inputs_to_buffers` — the exact
+   same FX/ATen graph `executorch-ggml` already targets. Nothing new relative to the generic-converter
+   discussion above.
+2. **TorchScript** (`torch.jit._script.RecursiveScriptModule`, from `.script()`/`.trace()` + `.save()`):
+   confirmed as a genuinely different, more permissive IR, not just an older export path. TorchScript's
+   graph has `prim::GetAttr` (submodule/attribute access) and `prim::CallMethod` (literally "call this
+   method on this submodule") as first-class node kinds — meaning sub-module boundaries can exist as real
+   graph nodes *without* being inlined, unlike ATen/FX which is always flat. Netron does apply an inlining
+   pass (`torch._C._jit_pass_inline`) for some of its own format handlers, but that's a deliberate,
+   optional pass over the IR, not an inherent limitation — the structure is there if you don't run it. This
+   is the concrete mechanism behind the "TorchScript could do that" the user recalled, now verified rather
+   than assumed — `prim::CallMethod` boundaries are exactly the kind of natural cut point the "where to
+   cut" half of this problem needs, and TorchScript separately supports real control flow (`prim::If`,
+   `prim::Loop`) that `torch.export` rejects outright, which is *why* something VITS-shaped breaks export
+   in the first place. Real caveat, unchanged from before verification: TorchScript is a legacy PyTorch
+   feature being superseded by `torch.export`/ExecuTorch (even `executorch-ggml` itself uses `torch.export`,
+   not TorchScript), and `torch.jit.script` has notoriously incomplete coverage of real Python model code —
+   needs validation against an actual model, not assumed to work just because the IR supports it in theory.
+3. **Plain pickle / eager `nn.Module`** (neither export nor script succeeded): confirmed as a real fallback
+   tier in Netron's source (`pytorch.Utility.weights(module)` walking `module._modules`) — but it produces
+   **no op-level dataflow graph at all**, just a tree of named tensors/submodules. This is *how* Netron
+   manages to always show something, but it's not actually a solution to the linking problem — a module
+   tree with no operation sequence isn't sufficient for loom's topology JSON, which needs real op-level
+   dataflow to execute. Worth remembering as a floor, not a lead.
+
+**ONNX export, checked 2026-07-17 against a real file, not just theorized:** piper already ships a working
+export (`pipertts_en-GB_miro/miro_en-GB.onnx`, produced by its own `export_onnx.py`, trace-based, opset 15),
+so rather than reasoning about `torch.onnx.export`'s mechanism in the abstract, loaded it with `onnx.load()`
+and inspected the real node graph directly. Findings:
+
+- **Node names do preserve the full PyTorch module hierarchy, for free, as a slash-delimited path** — e.g.
+  `/enc_p/encoder/attn_layers.0/conv_q/Conv`, `/dp/convs/norms_1.0/ReduceMean`, `/dp/post_flows.2/...` —
+  down to individual `ModuleList` instance indices. Grouping the graph's 6183 nodes by top-level scope
+  prefix cleanly recovers all four submodules from this discussion: `enc_p` (2469 nodes), `dp` (2769 — by
+  far the largest single piece, consistent with the stochastic duration predictor being the most complex
+  sub-graph), `flow` (308), `dec` (70). This *is* real, usable, zero-effort boundary information — no
+  TorchScript required to get it.
+- **The catch: only code that lives inside a named `nn.Module.forward()` gets a scope prefix.** A
+  non-trivial number of nodes (mask construction, `commons.generate_path`/`sequence_mask`, the
+  prior-expansion `matmul`s, the `torch.randn_like` noise injection, the reverse-flow iteration control —
+  i.e. everything written directly in `SynthesizerTrn.infer()` itself rather than inside a submodule) come
+  out with bare auto-incremented names (`Constant_47`, `Gather_3`, ...) and no scope prefix at all. This
+  confirms, concretely rather than abstractly, the shape of the "how to wire the pieces back together" half
+  of the open problem: naming-based slicing gets you the four *sub-module* graphs almost for free, but the
+  *glue* between them — exactly the control flow this whole discussion already expects a C++ driver to
+  own — has no module boundary to key off of, because it was never inside a module in the first place.
+- Not yet checked: `onnx.utils.extract_model` (would mechanically confirm these name-prefix boundaries are
+  actually cut-able into standalone sub-graph files) and `onnx.FunctionProto`. Also deliberately not chased
+  yet, per the user's own framing of that as a separate later conversation: exactly how the exporter's
+  trace-based path lowered `piecewise_rational_quadratic_transform`'s boolean-mask indexing (the function
+  the user expects TorchScript `.script()` to break on) into concrete ops — the `Where`/`NonZero`/
+  `ScatterND`/`GatherElements` ops visible in the graph's op histogram are almost certainly where that
+  shows up, when that conversation resumes.
+
+**Still to verify, raised 2026-07-17, not checked against real source yet:** `torch.export`'s
+`preserve_module_call_signature` parameter. `ExportedProgram.graph_module` is itself an `fx.Graph` — the
+"ATen graph" and "FX graph" aren't two different sources, just two points on the same decompose/inline
+dial, and `torch.export` normally dials all the way to fully-decomposed-and-inlined (which is why it never
+has module boundaries, unlike classic `torch.fx.symbolic_trace`'s `call_module` nodes). From memory (not
+yet read against source, unlike the ONNX/Netron findings above), `preserve_module_call_signature` is
+supposed to let you name specific submodules whose call boundary survives export instead of being inlined,
+recorded as `module_call_graph` metadata on the `ExportedProgram` — which would give ATen-core ops (the
+small, closed, tractable-to-map vocabulary executorch-ggml deliberately targets) *and* real module
+boundaries for cutting, from a single export call, rather than choosing between clean ops (ATen/export) and
+real boundaries (classic FX, TorchScript, or ONNX's name-prefix hack). Worth confirming this actually works
+this way before leaning on it for the multi-graph-linking design.
+
+**Empirical check 2026-07-17: tried `torch.jit.script` (not `.trace`) against the real `piper`/VITS
+checkpoint** (`femelo/piper` fork, `pipertts_en-GB_miro`), to see whether the TorchScript path above is
+actually reachable for the concrete model this whole discussion is about, not just reachable in theory.
+Piper's own `export_torchscript.py` only ever calls `torch.jit.trace` — nobody has tried `.script()` on
+this codebase before. Loaded `SynthesizerTrn` directly from the checkpoint's raw `state_dict` (bypassing
+`VitsModel`/PyTorch Lightning entirely — the venv hit the exact same broken `huggingface-hub` pin that
+blocked `transformers` in Milestone 8, and Lightning isn't needed for inference anyway).
+
+Baseline (piper's source completely unmodified): `model_g.enc_p` (the `TextEncoder` — embedding +
+self-attention stack) **scripts cleanly with zero changes**. `model_g.dp` (`StochasticDurationPredictor`),
+`model_g.flow` (`ResidualCouplingBlock`), and `model_g.dec` (`Generator`, the HiFi-GAN vocoder) **all fail**.
+Root-caused four distinct, genuinely fixable TorchScript incompatibilities (not vague "scripting is hard" —
+specific lines, specific fixes), all in `piper_train/vits/modules.py` / `models.py`:
+
+1. **Variadic `**kwargs`/`*args` forward signatures.** `Log`, `Flip`, `ElementwiseAffine`, `WN.forward` all
+   accept `**kwargs` (and `Flip` also `*args`) purely as plumbing so a heterogeneous `nn.ModuleList` of flow
+   steps can all be called uniformly as `flow(z, x_mask, g=x, reverse=reverse)`. TorchScript flatly rejects
+   variadic signatures. Fix is mechanical: replace `**kwargs` with an explicit `g: Optional[Tensor] = None`
+   parameter on each — confirmed by patching all four and re-scripting.
+2. **Conditionally-registered submodules referenced unconditionally in `forward`.** `Generator.cond` and
+   `WN.cond_layer` are only ever assigned when `gin_channels != 0` (i.e. multi-speaker models); this
+   checkpoint is single-speaker (`gin_channels=0`), so the attribute never exists. `forward` still contains
+   `if g is not None: x = x + self.cond(g)` unconditionally. Unlike tracing, `torch.jit.script` compiles
+   *every* static branch regardless of whether it's dead at runtime, so it fails resolving `self.cond`
+   before ever executing anything. Fix pattern: always construct the submodule (or a dummy placeholder) and
+   guard on an explicit boolean instead of attribute presence.
+3. **Dynamic-index `ModuleList` access.** `DDSConv.forward` (used inside `dp`'s `convs`/`post_convs`) does
+   `self.convs_sep[i](...)` where `i` is a `for i in range(self.n_layers)` loop variable. TorchScript only
+   supports `ModuleList` indexing with integer *literals* or `enumerate()`/`zip()`-style iteration, not an
+   arbitrary variable — a well-documented, common TorchScript limitation. Fix: rewrite the loop to
+   `for i, (conv_sep, ...) in enumerate(zip(self.convs_sep, ...))`.
+4. **Legacy `torch.nn.utils.weight_norm` breaks TorchScript's hook machinery, silently, only for `.script`.**
+   `flow`'s `WN.in_layers`/`res_skip_layers` are still weight-normed (piper's own export scripts only ever
+   call `model_g.dec.remove_weight_norm()`, never on `flow`/`dp`'s conv layers, because `.trace()` doesn't
+   care). `torch.jit.script` walks registered forward-pre-hooks during compilation and expects each hook
+   object to expose `__name__`; the legacy `WeightNorm` hook class doesn't define one, so scripting *any*
+   still-weight-normed submodule throws `AttributeError: 'WeightNorm' object has no attribute '__name__'`.
+   This is a real, non-obvious asymmetry worth remembering generally: **tracing silently tolerates leftover
+   weight-norm hooks; scripting does not.** Fix is either calling `remove_weight_norm()` everywhere before
+   scripting (not just on the vocoder), or migrating to the newer `torch.nn.utils.parametrizations.weight_norm`
+   (already the suggested replacement per today's `FutureWarning`, and implemented via the modern
+   parametrization system rather than a bare unnamed hook — plausibly TorchScript-safe by construction,
+   not independently confirmed here).
+
+After patching all four (monkeypatched in a throwaway script only — **not applied to the actual `piper`
+fork**, since this was exploratory and the fixes weren't validated for numerical correctness against the
+original eager model): `enc_p` still clean, and `dp`/`flow` got past their original failures into deeper
+compilation stages. `dec` hit a fifth, not-yet-root-caused error (`RuntimeError: Unsupported value kind:
+Tensor`, no user-code file/line in the trace — likely something in `ResBlock2`/`ConvTranspose1d` post-
+`remove_weight_norm()`, or the plain-tensor `self.attn = torch.zeros(1)` debug attribute in
+`attentions.py:186`) — not chased further given the exploratory framing of this thread.
+
+**Bottom line for the "linking" discussion:** the TorchScript path isn't just theoretically available (per
+the Netron source above) — it's *empirically close* for a real, currently-unmodified third-party VITS
+implementation, with the blockers found so far being small, mechanical, well-understood fixes rather than
+fundamental incompatibilities. It is not yet a clean "just run `.script()`" story, and full correctness
+(scripted-vs-eager numerical parity) was not checked before this thread paused. If this gets picked back up:
+finish root-causing the `dec` failure, verify numerical parity of the patched flows against eager mode, and
+only then decide whether these fixes are worth upstreaming into the `piper` fork for real.
+
+**Concrete things worth cross-checking or considering, not yet verified against loom's own code:**
+
+- **Flash-attention + native GQA as an optional `ATTENTION` fast path.** `executorch-ggml` maps
+  `aten.scaled_dot_product_attention` to `ggml_flash_attn_ext` with ggml's *native* GQA support
+  (`gqa_ratio = Q.ne[2] / K.ne[2]`, confirmed in `runtime/ops/ops_special.h`), and its README credits this
+  (plus fused RoPE/RMSNorm-fold/SwiGLU) for the above-`llama.cpp` throughput numbers. loom's own
+  `ATTENTION` primitive (`src/ops/primitives_attention.cpp`) is deliberately the *composite* (non-flash)
+  path — chosen in Milestone 1 for exact fp32 reproducibility against a numpy/PyTorch reference, not for
+  speed — and already gets GQA correctness "for free" via `ggml_mul_mat`'s own broadcast rule (verified in
+  Milestone 8's `tests/test_e2e_gqa.cpp`). Worth prototyping an *optional* `ggml_flash_attn_ext`-backed
+  variant (a new `attrs` flag on `ATTENTION`, analogous to the existing `"kv_cache"` flag) for a real
+  throughput comparison on the now-converted Qwen3-0.6B-Base checkpoint — but only after confirming
+  numerical tolerance against the existing composite path stays acceptable, same rigor as everything else
+  in this backlog.
+- **The build-time-vs-execute-time bug class, cross-referenced against loom's own graph-reuse discipline.**
+  `PROGRESS.md`/`GRAPH_REBUILD.md` documents several real bugs from this exact family: M9 ("eager ops
+  compute data during `build_graph()` by reading source tensor `->data`... data is uninitialized at build
+  time"), M15 (eager `I32->I64` casts during graph build freezing pre-execution garbage values, breaking
+  gather/scatter), M16 (a catastrophic KV-cache step-2 corruption, `~1e35` values, from the same root
+  cause, fixed by moving the scatter into a runtime custom op instead of a build-time-eager one). This is
+  the same general pitfall category as loom's own root-caused finding above (`ggml_gallocr` aliasing a
+  reused graph's declared-input buffer with a previous pass's output) and the CMVN
+  length-dependent-constant bug (Milestone 7) — three independent instances, across two different
+  projects, of "a value computed once at graph-construction time silently going stale across reuse."
+  Nothing to fix here (loom hasn't hit this specific variant), but worth keeping in mind as the same
+  *class* of risk if loom ever adds an op whose semantics read tensor *data* (not just shape) at build
+  time rather than purely describing a compute-graph node.
+- **`sym_dim_ids` (dynamic-shape symbol resolution) as a precedent for `SymbolEnv`'s own design.**
+  `executorch-ggml`'s dynamic-shape handling went through several iterations (`GRAPH_REBUILD.md` M8/M18):
+  an early `dynamic_size_map` keyed by trace-time dimension *value* caused real collisions when two
+  unrelated dimensions shared the same numeric value (e.g. `max_cache_len - 1 == 31` colliding with
+  `trace_seq_len == 31`), fixed by switching to `sym_dim_ids` — each symbolic variable gets a stable
+  integer *identity* at export time, resolved to a concrete value from input tensors at runtime, instead of
+  being matched by value. loom's `SymbolEnv` (`src/core/symbol_env.cpp`) doesn't have this problem today
+  (every symbol is a named hparam or an explicit `$n_tokens`-derived expression, resolved by *name*, never
+  matched by coincidental value) — but this is a concrete cautionary precedent if `SymbolEnv` ever grows
+  toward inferring/matching symbols from tensor shapes rather than always being told their names
+  explicitly by the conversion script.
+- **`ggml_backend_sched` for mixed CPU/GPU execution with pinned custom ops.** loom has deliberately
+  deferred `ggml_backend_sched` (documented in "Deliberate simplifications": "CPU-only, no multi-backend
+  need yet"). `executorch-ggml`'s M14 (`GRAPH_REBUILD.md`) is a concrete real use case for exactly this:
+  pinning specific ops (comparison/logical custom ops) to CPU while the rest of the graph runs on
+  Metal/CUDA, via `ggml_backend_sched_set_tensor_backend`. Worth revisiting when/if loom picks GPU backend
+  support back up — not urgent now.
+- **NOT recommended for adoption, but worth being aware of as a deliberately different design point**:
+  `executorch-ggml`'s GGUF integration (`docs/gguf-integration.md`) exports a *weight-less* `.pte` (graph
+  structure only, ~200KB) and loads weights from a separate GGUF file at runtime (`GGUFModule`), with
+  benchmarked zero overhead vs. embedding weights directly (762MB in-file vs. 213KB external, same
+  tok/s). This is the opposite of loom's own design, where topology JSON and weights deliberately live
+  together in ONE self-contained GGUF (`model.graph_topology` KV + weight tensors, same file) — that's the
+  whole point of loom's data-driven approach (a single artifact fully describes and contains a runnable
+  model), so splitting them the way `executorch-ggml` does would work against that goal, not toward it.
+
+License is BSD (confirmed from the repo's own `README.md`/`LICENSE`), so adopting genuinely novel
+*concepts* (not verbatim code) from it is not a licensing concern — but nothing above has been implemented
+or even prototyped yet; this section is purely the result of reading the repo, not a commitment to any of
+it.
