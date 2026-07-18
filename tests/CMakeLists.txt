@@ -394,3 +394,44 @@ add_executable(test_e2e_parakeet_tdt test_e2e_parakeet_tdt.cpp)
 target_link_libraries(test_e2e_parakeet_tdt PRIVATE loom::engine)
 add_test(NAME test_e2e_parakeet_tdt COMMAND test_e2e_parakeet_tdt)
 set_tests_properties(test_e2e_parakeet_tdt PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Real-model structural smoke test: VITS (piper en-GB "miro"), converted via
+#     tools/convert_piper_vits/convert_vits.py. Builds every declared topology with dummy inputs and
+#     checks for finite output -- NOT yet a numerical-correctness check (that's still to come once the
+#     host driver exists). Same skip-cleanly-if-not-prepared pattern as the other real-model tests. ---
+add_executable(test_e2e_vits_smoke test_e2e_vits_smoke.cpp)
+target_link_libraries(test_e2e_vits_smoke PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_smoke COMMAND test_e2e_vits_smoke)
+set_tests_properties(test_e2e_vits_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Real-model test: loom::VitsDriver end-to-end (TextEncoder -> StochasticDurationPredictor ->
+#     host-side generate_path -> coupling flow -> HiFi-GAN vocoder), one level up from the structural
+#     smoke test above -- exercises the full two-phase driver, not just each topology in isolation. ---
+add_executable(test_e2e_vits_driver test_e2e_vits_driver.cpp)
+target_link_libraries(test_e2e_vits_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_driver COMMAND test_e2e_vits_driver)
+set_tests_properties(test_e2e_vits_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: the deterministic `stats` (TextEncoder) topology against a real
+#     PyTorch forward pass of piper's own models.TextEncoder, using REAL phonemized text (T=62, real
+#     emb_rel_k/v pad branch exercised) -- see test_e2e_vits_stats_reference.cpp's own header comment. ---
+add_executable(test_e2e_vits_stats_reference test_e2e_vits_stats_reference.cpp)
+target_link_libraries(test_e2e_vits_stats_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_stats_reference COMMAND test_e2e_vits_stats_reference)
+set_tests_properties(test_e2e_vits_stats_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: the flow+vocoder topology against a real PyTorch forward pass, with a
+#     FIXED (non-random) z_p -- isolates the coupling-flow+vocoder wiring from any RNG-related
+#     uncertainty in the full stochastic pipeline. See test_e2e_vits_flow_vocoder_reference.cpp. ---
+add_executable(test_e2e_vits_flow_vocoder_reference test_e2e_vits_flow_vocoder_reference.cpp)
+target_link_libraries(test_e2e_vits_flow_vocoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_flow_vocoder_reference COMMAND test_e2e_vits_flow_vocoder_reference)
+set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: the logw (TextEncoder+SDP reverse) topology against a real PyTorch
+#     forward pass, with FIXED (externally-injected) SDP noise -- isolates the real spline-flow assembly
+#     from RNG-related uncertainty. See test_e2e_vits_logw_reference.cpp. ---
+add_executable(test_e2e_vits_logw_reference test_e2e_vits_logw_reference.cpp)
+target_link_libraries(test_e2e_vits_logw_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_logw_reference COMMAND test_e2e_vits_logw_reference)
+set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77)
