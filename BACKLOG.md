@@ -651,8 +651,11 @@ autoregressive lattice search — not expressible as a single static DAG.
 steps, no autoregressive Transducer loop — sidesteps Gap 1 entirely), so it's reachable with *only* Gap
 2 solved. If the iSTFT-via-existing-primitives hypothesis above holds, Kokoro would need no new ggml
 primitives at all beyond the two trivial activation registrations — making it the cheapest, highest-payoff
-next real-model target in this family, notably cheaper than VITS/StyleTTS2 (also need Gap 2, but are
-larger/more architecturally involved) or Parakeet (needs both gaps).
+next real-model target in this family, notably cheaper than VITS/StyleTTS2 (also need Gap 2, and are
+larger/more architecturally involved). **Correction, 2026-07-18**: Parakeet does *not* need "both gaps" as
+originally written here — it's ASR (audio-to-text), with no waveform synthesis stage at all, so Gap 2
+(vocoder blockers) simply doesn't apply to it; Parakeet is gated on Gap 1 only (the Transducer/LSTM decode
+loop).
 
 **Candidate reference checkpoint**: <https://github.com/femelo/kokoro-deutsch> — a German fine-tune of
 Kokoro-82M (PyTorch `.pth` checkpoints, trained via "a patched StyleTTS2 submodule", `misaki` phonemizer)
@@ -937,6 +940,94 @@ write-once/reused, at least across two models sharing an attention-transformer s
 that claim is a model that *isn't* shaped like a decoder transformer at all (VITS, per the roadmap above) —
 that's where new op-mapping entries and the actual multi-graph-linking question should first bite for real.
 
+**Gating criterion, added 2026-07-18, before promoting this converter to the default path**: per explicit
+user direction, the bespoke per-model scripts (`convert_qwen3.py`, `convert_nemo/...`) should *not* be
+retired or de-emphasized yet, even though this result is a genuine, real win. The evidence so far only
+covers two models sharing the exact same decoder-transformer shape — it doesn't yet say anything about
+whether the op-mapping table (or the converter's design generally) holds up on something structurally
+different. Two real costs also haven't gone away, and shouldn't be glossed over when comparing the two
+approaches: **the per-model authoring effort hasn't been eliminated, it's moved** (from hand-writing
+topology JSON to hand-writing an export-friendly `nn.Module` + registering `torch.library.custom_op`s for
+anything with no ATen equivalent), and **the converter's own output is currently worse on one axis** — it
+emits a fully flat, unrolled topology (704 nodes for Qwen3's 28 layers) with no `repeat_for` compaction,
+where the hand-written scripts produce a compact, more readable one. Before treating the generic converter
+as the default and retiring any bespoke script: (1) prove it on a model that *isn't* decoder-transformer
+shaped — an encoder-only, non-autoregressive, conv-heavy architecture is the real test, not another LLM;
+(2) either add `repeat_for`-compaction to the converter's own JSON emission, or explicitly accept the
+flat-topology size/readability cost as a permanent tradeoff, not an oversight to fix later.
+
+#### Gating criterion PASSED, 2026-07-18: generic converter proven against the real Conformer-CTC encoder
+
+Point 1 of the gating criterion above is now satisfied: the *same* converter architecture (op-mapping
+table + custom-op pattern) was pointed at the real `stt_en_conformer_ctc_small` checkpoint (Milestone 4/7)
+— a genuinely non-decoder-transformer shape (encoder-only, non-autoregressive, subsampling `Conv2d`,
+`LayerNorm` instead of `RMS_NORM`, depthwise `Conv1d`, `GLU`, relative-position self-attention with no
+KV-cache). Scope deliberately narrower than the full model: the export-friendly `nn.Module`
+(`tools/convert_generic/conformer_ctc_module.py`) takes `mel_input` as its declared input (skipping the
+mel frontend, which exercises no new ops relative to the toy-LLM/Qwen3 POCs already done), loading the
+same real checkpoint weights via the existing `tools/convert_nemo/nemo_common.load_nemo()`.
+
+**Result: `tests/test_e2e_conformer_ctc_generic.cpp` passes 7/7 checks** against the real checkpoint,
+reusing `test_e2e_conformer_ctc.cpp`'s own reference fixture (same weights/waveform seed ⇒ byte-identical
+expected logits). Full `ctest` suite: 41/41, zero regressions.
+
+**Unlike Round 2 (Qwen3), this genuinely DID need new op-mapping entries** — direct evidence for exactly
+the question the gating criterion was designed to answer:
+- `aten.layer_norm.default → LAYER_NORM` (+ separate `MUL`/`ADD` for the affine, same "weight=None asserted,
+  affine kept external" pattern `RMS_NORM` already used).
+- `aten.conv2d.default → CONV_2D`, `aten.conv1d.default → CONV_1D`/`CONV_1D_DW` (branches on the node's
+  `groups` arg) — both needed real handling of ATen's variable-arity args (`stride`/`padding`/`dilation`/
+  `groups` are silently omitted from `node.args` when they match the schema's own defaults — confirmed
+  empirically via a standalone trace before trusting it, not assumed from the toy LLM's fixed-arity
+  `aten.rms_norm.default` handling, which has a different default and never hits this).
+- `aten.glu.default → GLU` (a real ATen op, convenient), `aten.relu.default → RELU`,
+  `aten.squeeze.dim`/`aten.unsqueeze.default → RESHAPE` (no explicit target-shape arg like view/reshape —
+  read the shape `torch.export` itself already computed via `node.meta["val"]`).
+- **`aten.permute.default → PERMUTE`, the trickiest one**: `ggml_permute` and ATen's `permute` use
+  genuinely different, inverse conventions — ggml's is a *destination*-encoding in reversed (ne-order) axis
+  numbering (confirmed by reading `ggml_permute`'s C source directly), ATen's is a *source*-encoding in
+  normal torch axis order. Derived the translation formula
+  (`axes[k] = ndim-1 - dims.index(ndim-1-k)`, padded with identity beyond the input's real rank) and
+  verified it numerically against several independent permutations (including non-involution 3- and
+  4-cycles, both padded-from-3D and genuine full-4D cases) via a standalone numpy repro *before* trusting
+  it in the converter — same rigor as the RESHAPE shape-order bug caught earlier in this file.
+- A new `loom::rel_pos_attention` custom op (`tools/convert_generic/conformer_ops.py`) for
+  `REL_POS_ATTENTION` — no ATen equivalent at all, same treatment `loom::attention`/`loom::rope_neox`
+  already got.
+- `_qualname_to_gguf_name` needed a small generalization: Conformer-CTC is the first model in this POC with
+  biased `Linear`s, and the old rule (append `.weight` to anything not already ending in `.weight`) was
+  silently mangling `*.bias` qualnames into `*.bias.weight`.
+
+**Two real, general bugs found and fixed while building this — not model-specific workarounds**:
+1. **A sentinel-collision bug in `_shape_attr`'s `n_tokens` substitution.** Converting a model with no real
+   `n_tokens` dimension used `example_n_tokens=-1` as an "inert, never matches" sentinel — but `-1` is
+   *also* PyTorch's own reshape/view "infer this dimension" sentinel value, so the substitution fired on
+   every legitimate ATen `-1` entry, silently replacing it with the string `"n_tokens"` and defeating
+   `RESHAPE`'s own `-1`-inference logic in `op_reshape`. Manifested as a 0-sized reshape target deep inside
+   `ggml_reshape_2d`'s own assertion, nowhere near the actual bug — only found by adding a temporary debug
+   trace to `GraphBuilder::build_node` (reverted after) and a Python shape-propagation simulator that
+   cross-checked the topology JSON's own bookkeeping node-by-node. Fixed by excluding `-1` from the
+   substitution unconditionally, regardless of what `example_n_tokens` is set to.
+2. **`aten.reshape.default`/`aten.squeeze.dim`/`aten.unsqueeze.default` all need an unconditional `CONT`
+   first, `aten.view.default` doesn't.** ATen's `.view()` is guaranteed to never copy (raises instead on
+   non-contiguous input), matching `ggml_reshape_*`'s own hard contiguity requirement directly — but
+   `.reshape()`/`.squeeze()`/`.unsqueeze()` are all copy-capable in ATen (they silently insert a copy for
+   non-contiguous input rather than raising, with *no* separate `aten.contiguous.default` node appearing to
+   signal it, unlike an explicit `.permute().contiguous()` call). Hit this for real twice — a
+   `permute().reshape()` chain and a `permute().unsqueeze()` chain — both crashing inside
+   `ggml_reshape_*`'s `GGML_ASSERT(ggml_is_contiguous(a))`. Fixed by always emitting an explicit `CONT`
+   before `RESHAPE` for these three ATen targets specifically, matching the same unconditional-`CONT`-
+   after-`PERMUTE` precedent the hand-written `convert_conformer_ctc.py` topology already uses throughout.
+
+**Eager sanity check, run before ever exporting**: the new `ConformerCTC` nn.Module matched an independent
+reference (`reference_forward_conformer.py`) to `max abs diff ≈ 2.2e-5` on the first try — real confirmation
+that the subsampling/flatten/rel-pos-attention conventions (ground-truthed against NeMo's actual source,
+`nemo/collections/asr/parts/submodules/subsampling.py`, not just comments-about-NeMo in the existing
+hand-written converter) were derived correctly before any of the bugs above were even reachable.
+
+**Point 2 of the gating criterion (`repeat_for` compaction) is still open** — this POC's output remains a
+fully flat, unrolled topology (1137 nodes for a 16-layer encoder), same accepted tradeoff as Qwen3's Round 2.
+
 #### Open discussion, to continue later: how to "link" multiple sub-graph exports together
 
 Raised by the user, explicitly deferred for a later session — captured here as an open question with two
@@ -1140,3 +1231,160 @@ License is BSD (confirmed from the repo's own `README.md`/`LICENSE`), so adoptin
 *concepts* (not verbatim code) from it is not a licensing concern — but nothing above has been implemented
 or even prototyped yet; this section is purely the result of reading the repo, not a commitment to any of
 it.
+
+## Roadmap: quantized weight support (Q8_0 matmul, candidate for Milestone 9)
+
+Not started — captured after the `executorch-ggml` comparison above surfaced its "optimized inference"
+README claim ("ggml's hand-tuned kernels — quantized matmul, fused softmax, etc. — replace generic ATen
+implementations"). That specific framing doesn't transfer to loom-engine (loom never goes through ATen at
+runtime — every primitive already calls ggml directly), but it prompted checking whether loom could still
+benefit from ggml's own quantized-matmul kernels directly, independent of executorch-ggml. It can — and the
+gap turned out to be much smaller than expected, verified against the actual vendored ggml source
+(`build/_deps/ggml-src`) and the real installed `gguf` Python package, not assumed:
+
+**The C++ runtime side appears to need zero changes** (a real, previously-unverified claim now checked
+against source, not assumed by analogy to llama.cpp):
+
+- **`GgufModel::load`** (`src/core/gguf_model.cpp:9-70`) is already fully type-agnostic on the read path:
+  `ggml_get_tensor` inherits whatever `ggml_type` `gguf_init_from_file` parsed straight from each tensor's
+  own on-disk metadata, and the raw on-disk bytes are copied verbatim via `ggml_backend_tensor_set` — no
+  F32 assumption anywhere, and `ggml_nbytes(t)` (used both for the staging-buffer size and by
+  `ggml_backend_alloc_ctx_tensors`'s own buffer sizing) is already block-size-aware for quantized types. A
+  GGUF containing genuine `Q8_0`-quantized tensors would load correctly today, unchanged.
+- **`op_mul_mat`** (`src/ops/primitives_basic.cpp:24-26`) is a bare `ggml_mul_mat(ctx, in[0], in[1])` wrap.
+  `ggml_mul_mat` itself (`ggml.c:3258`) only asserts shape compatibility (`ggml_can_mul_mat`) — no type
+  assertion. Confirmed in the vendored `ggml-cpu.c` (`build/_deps/ggml-src/src/ggml-cpu/ggml-cpu.c:230`+)
+  that `Q8_0`'s own type-traits entry sets `vec_dot_type = GGML_TYPE_Q8_0`: ggml's CPU backend already
+  knows how to on-the-fly-quantize an F32 `b` (activations) operand and run a quantized×quantized dot
+  product against a `Q8_0` `a` (weights) operand — the exact standard llama.cpp
+  weights-quantized/activations-F32 pattern, already fully implemented in the vendored ggml, simply unused
+  because nothing in loom's conversion tooling has ever written a non-F32 tensor.
+- **`op_get_rows`** (`ggml_get_rows`, `ggml.c:3871`) has the same story: no type restriction on its `a`
+  (table) operand, dequantizes internally, output stays F32 unless `a` is `I32` — a quantized
+  `token_embd.weight` table would work through the existing `GET_ROWS` primitive unchanged too.
+
+**The real gap is entirely on the conversion-tooling side, and it's small:**
+
+- The `gguf` Python package (already a dependency of every `tools/convert_*/make_*_gguf*.py` script) ships
+  a real, working pure-numpy `gguf.quantize(np_array, gguf.GGMLQuantizationType.Q8_0)` (confirmed by
+  reading its source directly, not its docs) covering `Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_0`/the `_K` family/
+  etc., and `GGUFWriter.add_tensor(name, data, raw_dtype=...)` already accepts exactly the override needed
+  to write pre-quantized bytes under a non-F32 GGUF tensor type. No new Python dependency required.
+- **Only matmul weight tensors should be quantized** — `attn_q/k/v/output`, `ffn_gate/up/down`,
+  `token_embd`/`output` — this is standard ggml/llama.cpp convention, called out explicitly here rather
+  than assumed: norm weights (`RMS_NORM`'s per-channel scale), biases, and RoPE-related scalars are tiny
+  and not the multiply-heavy tensors, so quantizing them has negligible size benefit and a real,
+  needless precision cost.
+- **KV-cache quantization is a separate, already-flagged, explicitly out-of-scope item** — "Scope
+  limitations... KV cache storage is always F32" above. `KvCache` (`src/core/kv_cache.cpp:20-24`) always
+  allocates `GGML_TYPE_F32` tensors regardless of weight type; weight quantization and KV-cache
+  quantization are independent axes and shouldn't be conflated into one milestone.
+
+### Reference reviewed 2026-07-18: `femelo/qwen3-asr.cpp`'s `src/quantize.cpp`
+
+The user pointed at a real, working C++ quantizer from their own `qwen3-asr.cpp` fork (input: an
+F16-quantized `llama.cpp`-converted GGUF; reportedly run successfully against 3-4 real models) as a
+reference for this milestone. Read directly, not summarized from memory — one real logic bug found, plus a
+design-level lesson worth carrying into loom's own version rather than copying the same approach:
+
+- **Bug: the name-based exclusion list (`should_quantize`, skips `bias`/`norm`/`token_embd`/`ln_post`) only
+  actually protects tensors that are already F32.** The control flow is: `if (should_quantize(...) &&
+  (F32||F16)) { quantize to target_type }`, `else if (tensor->type == F16) { /* "smart fallback": Q8_0 if
+  block-aligned, else F32 */ }`, `else { keep as-is }`. The fallback branch's condition never re-checks
+  `should_quantize` — it only checks the tensor's stored dtype. So a name-excluded tensor that happens to be
+  stored as **F16** on input skips the first branch (since `should_quantize` is false) and falls straight
+  into the fallback branch, which quantizes it to Q8_0 anyway if its row length is block-aligned —
+  completely defeating the exclusion for that tensor. `token_embd.weight` is the tensor most exposed to
+  this: it's genuinely 2D (not a norm/bias vector `llama.cpp` conventionally keeps in F32 regardless of
+  `--outtype`), commonly *does* get cast to F16 by `llama.cpp`'s own F16 conversion path, and its row length
+  (`n_embd`, e.g. 1024) is almost always Q8_0-block-aligned. On a tied-embeddings model (Qwen3, per
+  Milestone 8) the same tensor also serves as the final logits `MUL_MAT`, so this one gap would silently
+  degrade both roles at once. It plausibly hasn't surfaced across the 3-4 models tested if their
+  norm/embedding tensors happened to already be F32 on input — worth confirming against one of those
+  GGUF's actual per-tensor dtypes before trusting it more broadly, not assumed safe here. Fix, if this file
+  is patched: check `!should_quantize(...)` in the fallback branch too, and upcast excluded-but-F16 tensors
+  to F32 rather than routing them through the Q8_0 fallback.
+- **Smaller gaps, same file**: input tensors already stored as `BF16` match neither the quantize branch nor
+  the F16-fallback branch, so they pass through completely unquantized with no log message (probably
+  harmless for this script's actual inputs, but silent). A 1D tensor like `rope_freqs.weight` (present on
+  models using explicit NTK/YaRN-style per-dimension RoPE frequency overrides — not universal, but real)
+  wouldn't match any of the four name substrings and could pass the block-alignment check by coincidence,
+  quantizing positional-encoding scale factors directly — a more damaging error class than quantizing a
+  norm weight, since RoPE error compounds through every subsequent attention step rather than applying once.
+- **The design lesson for loom's own quantizer, not a fix to this file**: `should_quantize`'s exclusion is a
+  *name-substring deny-list*, tuned to the naming conventions of whichever architectures it's been run
+  against so far — it doesn't generalize automatically to a new architecture whose norm/embedding tensors
+  happen to be named differently (e.g. `ln1`/`ln_f` instead of containing `norm`), which matters a lot given
+  this backlog's roadmap spans several architecturally distinct model families (VITS, Kokoro, Parakeet,
+  Qwen3-ASR/TTS). Loom doesn't need to guess from names at all: the topology JSON already declares exactly
+  which tensor feeds which op, so "should this tensor be quantized" can be answered definitively as "is this
+  tensor referenced as a `MUL_MAT` weight input, and only that" — an **allow-list keyed off real graph
+  structure** (walk the topology JSON's own `MUL_MAT` node inputs) instead of a deny-list keyed off tensor
+  naming convention. Strictly more robust, and the concrete design choice to carry into step 1 of the
+  "suggested next step" below: select which tensors to quantize by scanning the topology JSON for `MUL_MAT`
+  input references, not by pattern-matching tensor names.
+
+### POC done, 2026-07-18: Q8_0 quantization proven against the real Qwen3-0.6B-Base checkpoint
+
+**The toy LLM turned out to be a dead end for this POC, caught before writing any test around it**:
+`tools/fixture_gen/toy_llm_common.py` has `N_EMBD=8`, `N_FF=16`, `N_VOCAB=16` — every one of its matmul
+weight tensors has a row length under Q8_0's 32-element block size, so *none* of them are quantizable at
+all. Proving Q8_0 on the toy LLM would only exercise the "leave everything untouched" fallback path, not
+real quantized inference. Pivoted straight to the real `Qwen3-0.6B-Base` checkpoint instead (already
+converted and reference-verified earlier this session) — its `n_embd=1024`/`n_ff=3072` are comfortably
+block-aligned, and it's the smallest real, already-in-hand model that can actually exercise this.
+
+**`tools/quantize/quantize_gguf_q8_0.py`** (new): implements the topology-driven design from the
+`quantize.cpp` review above — `collect_mul_mat_weight_names()` recursively walks the GGUF's own embedded
+topology JSON (expanding `repeat_for` blocks via the GGUF's own `loom.n_layer` KV) and collects every
+`MUL_MAT` node's first input (the weight-first argument, per loom's convention) as the exact set of
+tensors to quantize; everything else (KVs and non-matmul tensors) is copied through byte-identical via a
+generic `GGUFReader`-field walk (`copy_kv`), not re-derived per architecture. Ran against the real
+checkpoint:
+
+```
+wrote qwen3_q8_0.gguf: 197 tensors -> Q8_0, 0 MUL_MAT weights left F32 (not block-aligned), 113 other tensors left F32
+```
+
+197 = 28 layers × 7 matmul weights (`attn_q/k/v/output`, `ffn_gate/up/down`) + 1 (confirms the
+self-adapting design claim for real: `token_embd.weight` *is* picked up here, since Qwen3 has tied
+embeddings and the same tensor is also the final logits `MUL_MAT` input — no special-casing needed for
+that, unlike a name-based rule which would need an explicit tied-embeddings carve-out). 113 = 28×4 norm
+weights (`attn_norm`/`ffn_norm`/`attn_q_norm`/`attn_k_norm`) + `output_norm`, correctly left F32. File size
+went from 2.39 GB to 639 MB (~3.74×, matching Q8_0's 32×F32→34-byte packing ratio exactly).
+
+**One real bug caught and fixed while writing the script, before it ever touched real data**: initially
+passed `raw_shape=<the pre-quantization logical F32 shape>` to `GGUFWriter.add_tensor()`, assuming that's
+what "raw shape" meant. Checked `add_tensor_info`'s actual source first — `raw_shape` (when given) is fed
+straight into `quant_shape_from_byte_shape`, which expects a **byte**-shape (last dim = packed row size in
+bytes), not the logical element-shape; passing the logical shape there would have silently computed a
+wrong element count. Confirmed the fix (omit `raw_shape` entirely, let it default to the quantized array's
+own byte-shape, which `add_tensor_info` then correctly converts back internally) against a standalone
+`(151936, 1024)` repro before trusting it in the real script.
+
+**`tests/test_e2e_qwen3_q8_0.cpp`** (new, mirrors `test_e2e_qwen3.cpp`'s structure, `SKIP_RETURN_CODE 77`
+pattern, reuses its reference fixture since quantization happens after conversion — same expected
+pre-quantization logits): loads the Q8_0 GGUF, generates against the same prompt, compares against the
+existing F32 reference. Real measured result, not guessed: **max abs logit diff ranged 0.45–0.79 across
+the 4 generation steps**, comfortably under the `1.5` tolerance set from that measurement (roughly 2× the
+observed max) — and, notably, **the argmax-token sequence matched the F32 reference exactly at every
+step** despite the lossy quantization, though the test deliberately doesn't hard-assert that (logged
+instead), since token-level agreement isn't guaranteed by tolerance-bounded logit closeness in general.
+**13/13 checks passed.** Full `ctest` suite: **40/40 passing**, new test skips cleanly by default
+(`SKIP_RETURN_CODE 77`) and passes for real with `LOOM_QWEN3_Q8_0_DIR`/`LOOM_QWEN3_DIR` set — zero
+regressions, and critically, **zero C++ engine changes were needed anywhere**, confirming the "no engine
+change required" claim from the verified-facts section above empirically rather than just by source
+inspection.
+
+**One incidental, not rigorously benchmarked observation**: the same 4-step generation ran in 1.92s
+(Q8_0) vs. 7.31s (F32, `test_e2e_qwen3`) in this one run — a real ~3.8× difference, consistent with the
+expected memory-bandwidth benefit of a 3.74×-smaller weight set, but a single anecdotal timing on a shared
+dev machine, not a controlled benchmark (no repeated runs, no warmup control, no isolation from other
+load) — worth a real benchmark pass before quoting this number anywhere else.
+
+**Still out of scope after this POC**: KV-cache quantization (separate, already-flagged item above);
+non-Q8_0 quant types (`Q4_K` etc. — the same script's `quantize()` call would need `GGML_TYPE_Q4_K` swapped
+in and a real accuracy check, since K-quants trade more compression for more error); wiring quantization
+into the actual conversion scripts (`convert_qwen3.py`) as a `--quantize` flag rather than a separate
+post-conversion pass; and a real benchmark (not the anecdotal timing above) to quantify the actual
+throughput benefit before treating it as a settled win.
