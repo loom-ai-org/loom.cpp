@@ -7,6 +7,7 @@ A .nemo file is just a gzipped tar archive (NeMo's own `save_to()` format) conta
 state dict (`model_weights.ckpt`) and a YAML config (`model_config.yaml`) -- no `nemo_toolkit` import is
 needed to read either.
 """
+import os
 import tarfile
 import tempfile
 from pathlib import Path
@@ -20,8 +21,15 @@ def load_nemo(nemo_path: str):
     tokenizer_model_bytes is the raw SentencePiece `.model` protobuf pointed to by
     config["tokenizer"]["model_path"] (an "nemo:<filename>" reference into this same archive), or None if
     the config has no tokenizer block."""
-    with tempfile.TemporaryDirectory() as tmp:
-        with tarfile.open(nemo_path, "r:gz") as tar:
+    # Extract next to the input file, not into the system default temp dir (tempfile.gettempdir(), usually
+    # /tmp) -- hit a real "No space left on device" extracting a real ~2.5GB checkpoint (parakeet-tdt-
+    # 0.6b-v3.nemo) into a small /tmp partition. The directory holding a multi-GB .nemo file the caller
+    # already placed somewhere is a much safer bet for having enough room than assuming /tmp does.
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(nemo_path))) as tmp:
+        # "r:*" auto-detects compression rather than assuming gzip -- confirmed for real against
+        # nvidia/parakeet-tdt-0.6b-v3's .nemo file, which (unlike stt_en_conformer_ctc_small's) is a
+        # plain uncompressed POSIX tar archive, not gzipped. NeMo's own save format apparently varies.
+        with tarfile.open(nemo_path, "r:*") as tar:
             tar.extractall(tmp)  # noqa: S202 -- trusted local file the user explicitly asked to convert
         tmp_path = Path(tmp)
         config = yaml.safe_load((tmp_path / "model_config.yaml").read_text())

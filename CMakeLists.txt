@@ -21,6 +21,7 @@ add_library(loom_engine
     src/core/graph_builder.cpp
     src/core/kv_cache.cpp
     src/core/generation.cpp
+    src/core/tdt_decoder.cpp
     src/core/ode_stepper.cpp
     src/core/vocab.cpp
     src/core/unicode.cpp
@@ -31,6 +32,8 @@ add_library(loom_engine
     src/ops/primitives_rope.cpp
     src/ops/primitives_attention.cpp
     src/ops/primitives_conv.cpp
+    src/ops/primitives_spline.cpp
+    src/ops/primitives_flow.cpp
 )
 add_library(loom::engine ALIAS loom_engine)
 

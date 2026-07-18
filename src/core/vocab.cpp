@@ -34,12 +34,14 @@ std::unique_ptr<Vocab> Vocab::load(const GgufModel& model) {
         return nullptr;
     }
     const std::string model_type = model.kv_str("tokenizer.ggml.model");
-    if (model_type != "t5") {
+    if (model_type != "t5" && model_type != "llama") {
         throw LoadError("Vocab::load: unsupported tokenizer.ggml.model '" + model_type +
-                         "' -- only \"t5\" (SentencePiece unigram/UGM) is implemented");
+                         "' -- only \"t5\" (SentencePiece unigram/UGM) and \"llama\" (SentencePiece BPE) "
+                         "are implemented");
     }
 
     auto vocab = std::unique_ptr<Vocab>(new Vocab());
+    vocab->is_bpe_ = (model_type == "llama");
     vocab->tokens_ = model.kv_arr_str("tokenizer.ggml.tokens");
     vocab->scores_ = model.kv_arr_f32("tokenizer.ggml.scores");
     vocab->token_type_ = model.kv_arr_i32("tokenizer.ggml.token_type");
@@ -85,6 +87,18 @@ void Vocab::trie_insert(const std::string& key, int32_t value) {
     }
     node->has_value = true;
     node->value = value;
+}
+
+bool Vocab::trie_find(const std::string& key, int32_t* id) const {
+    const TrieNode* node = &token_trie_;
+    for (char c : key) {
+        auto it = node->children.find(c);
+        if (it == node->children.end()) return false;
+        node = &it->second;
+    }
+    if (!node->has_value) return false;
+    *id = node->value;
+    return true;
 }
 
 uint32_t Vocab::xcda_node(size_t index) const {
@@ -202,8 +216,49 @@ std::string Vocab::normalize(const std::string& text) const {
     return normalized;
 }
 
+std::vector<int32_t> Vocab::encode_bpe(const std::string& normalized) const {
+    // Split into per-UTF-8-codepoint initial symbols (character-level BPE, not GPT2's byte-level --
+    // that convention lives in loom::BpeVocab instead).
+    std::vector<std::string> symbols;
+    size_t offset = 0;
+    while (offset < normalized.size()) {
+        const size_t cp_len = utf8_codepoint_len(static_cast<unsigned char>(normalized[offset]));
+        const size_t consumed = std::min(cp_len > 0 ? cp_len : size_t{1}, normalized.size() - offset);
+        symbols.push_back(normalized.substr(offset, consumed));
+        offset += consumed;
+    }
+
+    // Repeatedly merge the single highest-scoring adjacent pair whose concatenation is a real vocab
+    // piece, leftmost wins ties (only replace best_j on strictly-greater score) -- until no pair merges.
+    while (symbols.size() > 1) {
+        int32_t best_j = -1;
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (size_t j = 0; j + 1 < symbols.size(); ++j) {
+            int32_t id = 0;
+            if (trie_find(symbols[j] + symbols[j + 1], &id) && scores_[static_cast<size_t>(id)] > best_score) {
+                best_score = scores_[static_cast<size_t>(id)];
+                best_j = static_cast<int32_t>(j);
+            }
+        }
+        if (best_j < 0) break;
+        symbols[static_cast<size_t>(best_j)] += symbols[static_cast<size_t>(best_j) + 1];
+        symbols.erase(symbols.begin() + best_j + 1);
+    }
+
+    std::vector<int32_t> ids;
+    ids.reserve(symbols.size());
+    for (const std::string& s : symbols) {
+        int32_t id = 0;
+        ids.push_back(trie_find(s, &id) ? id : unk_id_);
+    }
+    return ids;
+}
+
 std::vector<int32_t> Vocab::encode(const std::string& text) const {
     const std::string normalized = normalize(text);
+    if (is_bpe_) {
+        return encode_bpe(normalized);
+    }
     const size_t n = normalized.size();
 
     struct BestTok {

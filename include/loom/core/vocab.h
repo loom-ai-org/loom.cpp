@@ -10,25 +10,35 @@ namespace loom {
 
 class GgufModel;
 
-// A SentencePiece-unigram vocabulary loaded from a GGUF's "tokenizer.ggml.*" KVs (llama.cpp's own
-// schema -- see gguf-py's Keys.Tokenizer and include/llama.h's llama_vocab_type/llama_token_type).
-// Mirrors llama.cpp's llm_tokenizer_ugm/llm_tokenizer_ugm_session design closely, per the project's
-// decision to match llama.cpp's approach where applicable: same XCDA-based precompiled_charsmap
-// normalizer, same naive_trie-style token matcher, same Viterbi best-path segmentation for encode.
+// A SentencePiece vocabulary loaded from a GGUF's "tokenizer.ggml.*" KVs (llama.cpp's own schema --
+// see gguf-py's Keys.Tokenizer and include/llama.h's llama_vocab_type/llama_token_type). Mirrors
+// llama.cpp's own tokenizer designs closely, per the project's decision to match llama.cpp's approach
+// where applicable: same XCDA-based precompiled_charsmap normalizer, same naive_trie-style token
+// matcher, for BOTH vocab types below (the normalizer/trie/decode side is identical between them --
+// confirmed by inspecting a real SentencePiece BPE model's ModelProto directly, not assumed -- only the
+// encode *algorithm* differs).
 //
-// Only the UGM (unigram) vocab type is implemented -- SPM's byte-level-BPE-with-scores, BPE's
-// byte-to-"Ġ" convention, and WPM's "##"-continuation convention all decode/encode differently and
-// aren't needed by any model this engine has converted so far (see BACKLOG.md).
+// Two SentencePiece vocab types are implemented, selected by "tokenizer.ggml.model":
+//   - "t5" -- UGM (unigram): Viterbi best-path segmentation using each piece's score directly as a
+//     log-probability (see encode()).
+//   - "llama" -- real SentencePiece BPE (llama.cpp's own tag for this -- the original LLaMA/Mistral
+//     tokenizers are themselves SentencePiece BPE models, confirmed via gguf-py's own
+//     SentencePieceVocab class, which writes this exact tag): greedy merge-by-score (see encode_bpe()).
+//
+// Still not implemented: GPT2-style byte-level BPE's byte-to-"Ġ" convention (that's loom::BpeVocab,
+// a wholly separate class/schema tag -- "gpt2", used by Qwen3) and WPM's "##"-continuation convention
+// (not needed by any model this engine has converted so far, see BACKLOG.md).
 class Vocab {
 public:
     // Returns nullptr if `model` has no "tokenizer.ggml.model" KV (no vocab present). Throws
-    // loom::LoadError if the KV is present but not "t5" (UGM), or if required array KVs are missing/
-    // malformed.
+    // loom::LoadError if the KV is present but neither "t5" (UGM) nor "llama" (SentencePiece BPE), or if
+    // required array KVs are missing/malformed.
     static std::unique_ptr<Vocab> load(const GgufModel& model);
 
-    // Unigram Viterbi tokenization: normalizes `text` (via the XCDA-based charsmap walk, matching
-    // SentencePiece's own normalizer), then finds the highest-total-score segmentation into vocab
-    // pieces. Falls back to unk_id() for any single codepoint no vocab piece covers.
+    // Normalizes `text` (via the XCDA-based charsmap walk, matching SentencePiece's own normalizer),
+    // then segments it into vocab piece ids -- via Viterbi best-path search (UGM) or greedy
+    // merge-by-score (SentencePiece BPE), selected by which "tokenizer.ggml.model" this Vocab was
+    // loaded from. Falls back to unk_id() for any codepoint no vocab piece covers.
     std::vector<int32_t> encode(const std::string& text) const;
 
     // Joins each id's piece text, unescapes the SentencePiece word-boundary marker (U+2581 "▁") back
@@ -71,12 +81,28 @@ private:
     PrefixMatch normalize_prefix(const std::string& input, size_t offset) const;
     std::string normalize(const std::string& text) const;
 
+    // Exact-match lookup of `key` in token_trie_ (not a prefix walk) -- used by encode_bpe() to test
+    // whether merging two adjacent symbols would form a real vocab piece. Returns false if absent.
+    bool trie_find(const std::string& key, int32_t* id) const;
+
+    // Real SentencePiece BPE: split `normalized` into per-codepoint initial symbols, then repeatedly
+    // merge the single highest-scoring adjacent pair whose concatenation is a real vocab piece (ties
+    // broken leftmost, matching SentencePiece's own convention) until no more merges apply. Naive
+    // O(n^2)-per-merge scan rather than SentencePiece's real priority-queue implementation -- correctness
+    // over performance, same tradeoff as everywhere else in this engine; produces the identical result
+    // since both are "always merge the single current-highest-priority valid pair" (verified against the
+    // real `sentencepiece` library's own output before trusting this, not assumed equivalent on paper
+    // alone). No byte-fallback (this engine hasn't needed a model with byte_fallback=true yet, see
+    // BACKLOG.md) -- a symbol with no matching piece and no further merge falls back to unk_id().
+    std::vector<int32_t> encode_bpe(const std::string& normalized) const;
+
     std::vector<std::string> tokens_;
     std::vector<float> scores_;
     std::vector<int32_t> token_type_; // llama_token_type values, 1:1 with SentencePiece's own enum
     int32_t unk_id_ = 0;
     bool add_space_prefix_ = true;
     bool remove_extra_whitespaces_ = true;
+    bool is_bpe_ = false; // true for "llama" (SentencePiece BPE); false for "t5" (UGM)
     TrieNode token_trie_;
 
     // Raw precompiled_charsmap: first 4 bytes = byte length of the XCDA blob (array of uint32_t

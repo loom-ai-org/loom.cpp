@@ -613,6 +613,216 @@ autoregressive lattice search — not expressible as a single static DAG.
   per step, changing the loop's frame-pointer update rule from "always advance by 1" to "advance by the
   predicted duration" — a host-side loop-condition change, not an engine primitive change.
 
+#### Gap 1 progress, 2026-07-18: LSTM composite + joint network + the new `TdtDecoder` driver, proven on a synthetic fixture
+
+Real NeMo source read directly first (`nemo/collections/asr/modules/rnnt.py`, `rnnt_greedy_decoding.py`/
+`tdt_label_looping.py`), not assumed: the prediction network is a plain `nn.LSTM` fed the previous emitted
+token's embedding; the joint network is `Linear(encoder_frame) + Linear(decoder_step)` summed, `RELU`,
+one final `Linear` whose output is a *single* combined vector — the first `n_vocab+1` entries are token+
+blank logits, the **last `n_durations` entries are the duration head** (argmax over a small fixed discrete
+set like `[0,1,2,3,4]`, not a regression); TDT reuses plain `RNNTJoint`/`RNNTDecoder` unchanged, just with
+a wider final linear — there is no separate `TDTJoint` class. Real greedy decode is a double loop: outer
+over encoder frames, inner (bounded by `max_symbols_per_step`) repeatedly running one LSTM+joint step;
+non-blank → emit and advance LSTM state; blank is *forced* to duration ≥ 1 so decoding can't spin forever;
+the frame pointer advances by the argmax'd duration (0 means "stay and loop again").
+
+**Built and verified, in order, each against its own known-good reference before moving on:**
+
+1. **`TANH`** — trivial, `ggml_tanh` already native, one-line `LOOM_REGISTER_OP` same as `SIGMOID`/`SILU`.
+   Unit-tested in `tests/test_primitive_registry.cpp` alongside the existing `SIGMOID`/`RELU` checks.
+2. **LSTM step as a composite JSON pattern, not a monolithic primitive** — confirmed the preferred design
+   from this section's own earlier analysis: `MUL_MAT(W_ih,embed)+MUL_MAT(W_hh,h)+b_ih+b_hh`, sliced via
+   existing `VIEW` (byte offsets) into `i/f/g/o`, `SIGMOID`/`TANH`, combined via existing `MUL`/`ADD`.
+   `tools/fixture_gen/lstm_step_common.py` + `tests/test_lstm_step.cpp`: verified bit-exact
+   (`<=1e-5`) against an independent numpy reference on a tiny synthetic fixture, matching real
+   `torch.nn.LSTM`'s per-step convention (gates packed `i,f,g,o`, separate `bias_ih`/`bias_hh`) — passed
+   on the first try.
+3. **The joint network needed zero new primitives** — `MUL_MAT`+`ADD` (the two linears), broadcast-`ADD`
+   (the sum), `RELU` — all already proven elsewhere in this project.
+4. **The new `TdtDecoder` C++ driver** (`include/loom/core/tdt_decoder.h`, `src/core/tdt_decoder.cpp`,
+   analogous to `Generator`/`OdeStepper`): implements the exact double loop above. Needs **three**
+   `GraphTopology` objects, not one — confirmed `GraphTopology`/`GraphBuilder` only support a single
+   declared output per topology (`src/core/graph_topology.cpp`), so a schema extension for multiple named
+   outputs was considered and **deliberately deferred**: this driver's correctness-first version just
+   calls `GraphBuilder::build()` three times per inner-loop step (`lstm_h`, `lstm_c`, `joint` topologies,
+   identical weights) — the exact same "just rebuild every step, don't bother caching" simplicity
+   `Generator` itself already uses as its baseline (confirmed by reading `generation.cpp`: it does a full
+   `builder_.build()` on *every* decode step already, not a graph-reuse optimization — that's a separate,
+   still-unimplemented item under "Performance optimizations" above). The multi-output schema question is
+   now a real, concrete follow-up (3× redundant rebuilds per step is a genuine inefficiency at real
+   decode-loop scale, unlike a one-off unit test), not solved here.
+5. **Verified on a small, hand-picked synthetic fixture** (`tools/fixture_gen/tdt_step_common.py`,
+   `tests/test_tdt_decoder.cpp`) *before* any real checkpoint was involved, same "prove it small first"
+   discipline as everything else in this project. The weights/encoder-output seed was searched (out of
+   several hundred candidates) specifically so the decode naturally exercises a **blank-driven 2-frame
+   skip** (`duration=2`) followed by a **non-blank emission also with `duration=2`** — genuine TDT
+   dynamics, not just the trivial always-advance-by-1 case, and without ever relying on the driver's own
+   defensive `max_symbols_per_step` safety net. **Result: bit-exact match, 5/5 checks passed.**
+
+**One real bug found and fixed while building the reference itself**: the first version of the numpy
+greedy-decode reference (and, before it was caught, the first version of `TdtDecoder::decode_greedy`)
+hung indefinitely on this fixture's own randomly-generated weights — the inner loop can emit non-blank
+tokens with `duration=0` indefinitely without ever advancing the frame pointer, and NeMo's own real
+algorithm apparently relies on blank-forcing alone to guarantee termination (per this session's own
+reading of `rnnt_greedy_decoding.py`), which doesn't cover this case. Fixed by adding an explicit
+defensive fallback in both the numpy reference and the C++ driver: if `max_symbols_per_step` is exhausted
+without the frame pointer ever advancing, force-advance by 1 frame anyway — not part of the textbook TDT
+algorithm, but a real robustness requirement for production code (a pathological or undertrained model
+should never be able to hang the decode loop).
+
+Full `ctest` suite at that point: 47/47, zero regressions — proved the decode loop and its new
+primitives/driver correct on synthetic data, not yet that they work on a real model. That gap is now
+closed too, same day — see "Gap 1 CLOSED" below.
+
+#### Gap 1 CLOSED, 2026-07-18: the real nvidia/parakeet-tdt-0.6b-v3 checkpoint runs end to end
+
+Real checkpoint downloaded (`hf_hub_download`, `nvidia/parakeet-tdt-0.6b-v3`, ~2.34GB `.nemo` file) and
+converted/verified for real, closing this gap completely — the first genuinely new model *family*
+(Transducer/TDT, not another CTC or decoder-transformer) this engine runs.
+
+**Two real, general bugs found and fixed before any of this could work, neither specific to this model:**
+
+1. **`nemo_common.load_nemo()` assumed every `.nemo` file is gzipped** (`tarfile.open(path, "r:gz")`) — true
+   for `stt_en_conformer_ctc_small.nemo`, but `parakeet-tdt-0.6b-v3.nemo` is a *plain, uncompressed* POSIX
+   tar archive (confirmed via `file`/`tarfile.is_tarfile`) — NeMo's own save format apparently varies.
+   Fixed by switching to `"r:*"` (auto-detect), re-verified the existing Conformer-CTC checkpoint still
+   loads correctly afterward (shared code path).
+2. **Extracting a real multi-GB `.nemo` archive into the system default temp dir (`/tmp`) hit a genuine
+   "No space left on device"** — `/tmp` here is a small partition (28GB, 95% full, ~1.3GB free) entirely
+   independent of `/home`'s large one, confirmed via `df -h`. Fixed by extracting next to the input file
+   itself (`tempfile.TemporaryDirectory(dir=os.path.dirname(...))`) instead of trusting
+   `tempfile.gettempdir()`'s default.
+
+**A genuinely new engine primitive was needed, found by reading the real checkpoint's actual architecture
+(not assumed from the earlier Conformer-CTC-small work):** the real FastConformer encoder's subsampling is
+`dw_striding` (3 stages: one plain `Conv2d`, then two grouped/depthwise `Conv2d` + pointwise `Conv2d`
+pairs) — genuinely different from Conformer-CTC-small's simpler 2-stage plain-`Conv2d` subsampling, and
+loom had no depthwise-Conv2d primitive at all (`CONV_1D_DW` existed, `CONV_2D_DW` didn't). Added
+**`CONV_2D_DW`** (`src/ops/primitives_conv.cpp`) — ggml already has a native `ggml_conv_2d_dw`, but (like
+`ggml_conv_1d`/`ggml_conv_2d`, and unlike ggml's own `ggml_conv_2d` which already respects the kernel's own
+dtype) it hardcodes `GGML_TYPE_F16` for its internal `im2col` regardless of the kernel's actual dtype
+(confirmed by reading its source directly) — the same precision concern `CONV_1D`/`CONV_2D` were already
+written to avoid. `CONV_2D_DW` is a faithful transcription of `ggml_conv_2d_dw`'s exact recipe with F32
+substituted for that one hardcoded F16, not an independent re-derivation. Verified with a hand-computed
+2-channel example (each channel convolved independently with its *own* kernel, checking both the math and
+that channels don't cross-mix) in `tests/test_primitive_registry.cpp` before using it for anything real —
+passed on the first try.
+
+**Other real, checkpoint-specific facts confirmed directly against the real `model_config.yaml`/state dict
+(not assumed from the config.json HF also publishes, nor from HF's own `modeling_parakeet.py` port, which
+turned out to diverge from the real checkpoint on one point — see below):**
+- `xscaling: false` — no `sqrt(d_model)` scaling anywhere (unlike Conformer-CTC-small).
+- `use_bias: false` genuinely means **no bias anywhere in the encoder**: not just the self-attention/
+  positional projections (expected, matches HF's own port), but **also the conv module's 3 convolutions**
+  (`pointwise_conv1`/`depthwise_conv`/`pointwise_conv2`) — confirmed by checking the real state dict has no
+  such bias tensors at all, contradicting HF `transformers`' `modeling_parakeet.py`, which hardcodes
+  `bias=True` for those regardless of config. Trusted the raw checkpoint over the (possibly-diverged, or
+  differently-configured) secondary library port.
+- Real prediction network: `nn.LSTM(num_layers=2)` (not 1 — confirmed via `weight_ih_l0`/`weight_ih_l1`
+  both present), `pred_hidden=640`. This required generalizing the just-built `TdtDecoder`/topology pattern
+  from a single LSTM layer to a **stack of N layers** (layer 0 embeds the last token; layer i>0 takes
+  layer i-1's `h_new` directly) — re-verified against the synthetic fixture at `N=2` (matching this real
+  checkpoint's real depth, not simplified back to 1) before touching any real weights.
+- Joint: `joint_hidden=640`, `num_classes=8192` (real tokens) + 1 (blank) + 5 (`durations=[0,1,2,3,4]`) =
+  8198-wide final linear — exactly matching the design already proven on the synthetic fixture.
+- Both `transformers`' local `ParakeetForTDT` (the class this checkpoint's own `config.json` names) and
+  `nemo_toolkit`'s `ASRModel.from_pretrained()` path are unusable in this venv (a
+  `huggingface_hub`/`transformers` version pin conflict breaks both imports) — confirmed before choosing to
+  hand-roll `reference_forward_parakeet_tdt.py` directly from the raw state dict, not assumed necessary.
+
+**One conversion-tooling bug, caught before it ever reached the C++ engine**: `TdtDecoder` shares *one*
+`GgufModel` across every one of its internal `GraphBuilder`s (lstm-per-layer + joint) — the real conversion
+script initially split decoder/joint weights across separate, non-overlapping small GGUFs (to avoid
+duplicating them), which doesn't satisfy that assumption. Hit a real
+`"unresolved input 'joint.enc.weight'"` `SchemaError` immediately, fixed by writing the *full* decoder+
+joint weight set into every one of the small GGUFs, exactly matching the synthetic fixture's own
+`write_one()` convention (a few tens of MB duplicated 5x, negligible next to the ~2.4GB encoder itself).
+
+**Result**: `tests/test_e2e_parakeet_tdt.cpp` — the real FastConformer encoder's output is **bit-exact**
+against the independent hand-rolled PyTorch reference (max abs diff `0.000000`, not just within tolerance)
+on the very first full run after the bugs above were fixed, and the new `TdtDecoder`'s greedy decode over
+that real encoder output produces the **exact same token sequence and frame indices** as the reference
+(`[7618, 1815, 7883]` at frames `[3, 4, 10]`, on a random-noise test waveform — semantically meaningless
+input, but structurally exactly what a real decode looks like). **11/11 checks passed.** Full `ctest`
+suite: 48/48, zero regressions; the new test skips cleanly by default and passes for real with
+`LOOM_PARAKEET_TDT_DIR` set.
+
+**Explicitly out of scope, not attempted here**: detokenization to human-readable text. Verification above
+is entirely at the token-id level, same as how the synthetic TDT fixture was checked — sufficient to prove
+the decode-loop mechanics and the encoder are correct, but not sufficient for a human-readable transcript.
+See the new roadmap item directly below for the real gap this leaves open and what it would take to close.
+
+### DONE, 2026-07-18: SentencePiece **BPE** tokenizer support (`Vocab` gap surfaced by Parakeet-TDT)
+
+Closed the same day it was raised — confirmed the "genuine hybrid of parts already built" hypothesis below
+exactly, needing no new algorithm and no new GGUF schema. `Vocab` was extended in place (not a new class):
+a `is_bpe_` flag set from `tokenizer.ggml.model` (`"t5"` → existing Viterbi path, `"llama"` → new
+`encode_bpe()`), reusing `normalize()`/`normalize_prefix()`/the XCDA charsmap walk/`token_trie_`/`decode()`
+completely unchanged. `encode_bpe()` is the standard "repeatedly merge the single highest-scoring adjacent
+pair whose concatenation is a real vocab piece, leftmost wins ties" algorithm — a naive O(n²)-per-merge
+scan (not SentencePiece's real priority-queue implementation) traded for simplicity, verified to produce
+identical output. `tools/convert_nemo/tokenizer_common.py`'s `write_sentencepiece_vocab` now reads the real
+`.model` protobuf's own `trainer_spec.model_type` (`UNIGRAM`/`BPE`) to pick `"t5"` vs `"llama"`
+automatically instead of hardcoding `"t5"`, and `convert_parakeet_tdt.py` now writes the real tokenizer
+into the encoder GGUF.
+
+**Result: `tests/test_vocab_spm_bpe.cpp` — 17/17 checks pass**, exact id-sequence match (encode) and
+exact-text match (decode round-trip) against the real `sentencepiece` Python library on the real
+8192-piece Parakeet-TDT vocabulary, across plain text, an accented/non-ASCII character (genuinely
+exercises the charsmap walk), and a multiple-consecutive-spaces case that only works because this
+specific checkpoint's real `remove_extra_whitespaces` is `false` (unlike Conformer-CTC-small's `true`) —
+`Vocab` already read this per-model from its own KV, so no bug there, just confirmation the existing code
+was already correctly generic. All passed on the first real run, no debugging needed. Also updated
+`tests/test_e2e_parakeet_tdt.cpp` to detokenize its real decoded token sequence end to end
+(encoder → `TdtDecoder` → `Vocab::decode`) — produces `'Yeah.'`, a real, well-formed English fragment
+(meaningless as a transcription, since the input is random test noise, not real speech, but structurally
+exactly what a genuine transcription pipeline produces). Full `ctest` suite: 49/49, zero regressions.
+
+**Original gap analysis, confirmed accurate in every particular once implemented:**
+
+Confirmed by inspecting the real checkpoint's `tokenizer.model` directly (`pip install sentencepiece`'s own
+real checkpoint's `tokenizer.model` directly (`pip install sentencepiece`'s own
+`sentencepiece_model_pb2.ModelProto`, not assumed from the `config.json` field alone):
+`m.trainer_spec.model_type == 2`, which the library's own `TrainerSpec.ModelType` enum
+(`['UNIGRAM', 'BPE', 'WORD', 'CHAR']`) confirms is real SentencePiece **BPE** — genuinely different from
+both tokenizer classes this engine already has: `loom::Vocab` implements only SentencePiece **UGM**
+(unigram, GGUF `tokenizer.ggml.model == "t5"`, used by Conformer-CTC's Viterbi-scored segmentation) and
+`loom::BpeVocab` implements GPT2-style **byte-level** BPE (GGUF `tokenizer.ggml.model == "gpt2"`, used by
+Qwen3 — byte-to-`"Ġ"` remapping + a hand-written pretokenizer regex, no relation to SentencePiece's own
+normalizer at all).
+
+**The real gap is narrower than "write a third tokenizer from scratch" — it's a genuine hybrid of parts
+already built**, confirmed by inspecting the real `ModelProto` directly:
+- **The normalizer is identical to what `Vocab` (UGM) already implements**: `normalizer_spec.name ==
+  "nmt_nfkc"`, a real, non-empty `precompiled_charsmap` (237561 bytes) present, `add_dummy_prefix == true`
+  — the exact same XCDA-based charsmap walk + space-prefix convention `Vocab::normalize`/
+  `normalize_prefix` already implement bit-for-bit, confirmed by inspecting the real bytes rather than
+  assuming BPE-mode SentencePiece normalizes differently.
+- **The encode algorithm is structurally the same *shape* `BpeVocab` already implements (greedy
+  merge-by-rank), just rank-encoded differently.** Every piece's `.score` field is populated with
+  monotonically-decreasing negative values by merge priority (confirmed real: the last 10 of 8192 pieces
+  have scores `-7908.0` down to `-7917.0`, strictly decreasing) — i.e. merge rank is encoded as a score
+  rather than `BpeVocab`'s explicit ordered `merges` array, but the actual algorithm ("repeatedly merge the
+  highest-priority adjacent pair until none apply") is the same one already implemented, just keyed off
+  `score` (higher/less-negative = higher priority) instead of an explicit rank list — reusing
+  `BpeVocab::merge_rank_`'s whole approach, adapted to a different rank source, not a new algorithm.
+- **The decode side is already exactly what `Vocab::decode` does** (join pieces, un-escape `▁` U+2581 back
+  to a literal space) — no new logic needed there at all.
+- **The GGUF schema tag is already a known, real llama.cpp convention, not something to invent**: the
+  installed `gguf` Python package's own `SentencePieceVocab` class (`gguf/vocab.py`) — used by llama.cpp's
+  own conversion tooling for exactly this case (the original LLaMA/Mistral tokenizers are *themselves* real
+  SentencePiece BPE models, confirmed via this same class) — writes `tokenizer_model = "llama"` (not
+  `"t5"` or `"gpt2"`) as the `tokenizer.ggml.model` KV value. `loom::Vocab::load` currently only recognizes
+  `"t5"` and throws for anything else, so a `"llama"`-tagged GGUF would currently fail to load at all.
+
+**What it actually took, confirming the plan above exactly**: extended `loom::Vocab` in place (the first
+option considered, and it did fit better) — see the "DONE" summary at the top of this section for the real
+result. No hand-traced synthetic fixture ended up being necessary before trusting it against the real
+8192-piece vocabulary: `test_vocab_spm_bpe.cpp` compares directly against the real `sentencepiece` library
+loaded against the same real `.model` file, the same "no meaningful toy substitute" reasoning
+`test_vocab.cpp`'s own UGM test already used — correctness here is entirely about faithfully reproducing
+one specific real model's behavior, which a synthetic vocab can't stand in for anyway.
+
 ### Gap 2: the vocoder blockers (VITS/StyleTTS2's HiFi-GAN decoder, Kokoro's ISTFTNet)
 
 - **HiFi-GAN (VITS/StyleTTS2)**: per the "already covered" section above, this is graph-expressible with
@@ -1388,3 +1598,221 @@ in and a real accuracy check, since K-quants trade more compression for more err
 into the actual conversion scripts (`convert_qwen3.py`) as a `--quantize` flag rather than a separate
 post-conversion pass; and a real benchmark (not the anecdotal timing above) to quantify the actual
 throughput benefit before treating it as a settled win.
+
+## VITS conversion, in progress, 2026-07-18: `WN`/`ResidualCouplingLayer`/`Flip` (flow's coupling blocks)
+
+Real checkpoint (`pipertts_en-GB_miro/epoch=9772-step=1494014.ckpt`) confirmed via `models.py`'s
+`SynthesizerTrn.__init__` (`self.flow = ResidualCouplingBlock(inter_channels=192, hidden_channels=192,
+kernel_size=5, dilation_rate=1, n_layers=4, gin_channels=0)`, `n_flows=4` default): single-speaker
+(`gin_channels=0`, so `WN`'s conditioning input `g` is always `None`) and every `ResidualCouplingLayer`
+built with `mean_only=True` (confirmed in `ResidualCouplingBlock.__init__`, not assumed).
+
+**`src/ops/primitives_flow.cpp`** (new): two new composed primitives, each looping internally in C++
+over a statically-known layer count (same "bundle a repeated substructure into one primitive with a
+variadic `Inputs` list" precedent as `REL_POS_ATTENTION_SHAW`, rather than expanding into dozens of JSON
+graph nodes per layer):
+- **`WN`**: WaveNet-style dilated gated conv1d stack (`modules.py`'s `WN.forward`). Since this engine
+  only ever runs a single, unpadded utterance, the real code's `x_mask` (all-ones here) and the `g`
+  conditioning path (unused, `gin_channels=0`) both drop out entirely — `fused_add_tanh_sigmoid_multiply`
+  collapses to a plain `tanh(first_half)*sigmoid(second_half)` gate with no added bias term. Conv weights
+  are taken as already-plain (weight-norm-folded) kernel tensors — folding `weight_g`/`weight_v` into a
+  plain kernel is a conversion-time concern (task #78), not this primitive's.
+- **`RESIDUAL_COUPLING_LAYER_REVERSE`**: `modules.py`'s `ResidualCouplingLayer.forward(reverse=True)`,
+  specialized to `mean_only=True` (this checkpoint's only configuration) — `logs` is always the zero
+  tensor so `exp(-logs)=1` and the affine reverse collapses to a plain `x1' = x1 - m`; `x0` passes through
+  unmodified. Internally calls the same `WN` C++ logic (factored as a local helper, not a cross-file
+  registry lookup) between its `pre`/`post` 1x1 convs.
+
+**`Flip` needed no new primitive at all** — `torch.flip(x,[1])` (reversing the whole channel axis) is
+exactly what `GET_ROWS` already does when given a conversion-time-baked reversed-index constant
+(`[C-1, C-2, ..., 0]`, I32): `GET_ROWS(x, reversed_idx)` selects channel-rows in reverse order. Simpler
+than the original plan's "bake an anti-diagonal permutation matrix and use `MUL_MAT`" idea (which would
+also have needed a transpose in and out, since `MUL_MAT` contracts over `ne[0]` and channels live in
+`ne[1]` under this engine's `[T, C]` flow-tensor convention) — caught while implementing, before writing
+any of the `MUL_MAT` version.
+
+Both new primitives verified against real execution of piper's own `modules.WN`/`ResidualCouplingLayer`/
+`Flip` classes (small hand-picked dims: `hidden_channels=4`, `kernel_size=3`, `dilation_rate=2`,
+`n_layers=2`, `T=5`; random-but-seeded weights, expected outputs obtained by literally running the real
+modules, not hand-derived) in `tests/test_primitive_registry.cpp` (`test_wn`,
+`test_residual_coupling_layer_reverse`, `test_flip_via_get_rows`) — all passing on the first C++ attempt
+after the usual numpy/PyTorch pre-verification discipline. Full suite: **49/49 passing**, zero
+regressions.
+
+## VITS conversion, in progress, 2026-07-18: `DDSConv`/`ElementwiseAffine`/`ConvFlow` assembly, and a real `ggml_clamp` aliasing bug
+
+**Real bug found and fixed, not just a new-feature addition**: `ggml_clamp`'s result is a **view aliasing
+its source's own buffer** (confirmed directly in `ggml.c`: `ggml_clamp` calls `ggml_view_tensor(ctx, a)`,
+not `ggml_dup_tensor` — unlike `ggml_cont`, which always allocates a genuine new tensor). This means
+`ggml_clamp(ctx, a, lo, hi)` clamps **in place**: once that op executes, `a`'s own buffer is overwritten
+with the clamped values, so *any other node that also reads `a`* — regardless of where it sits in the
+JSON topology or C++ call order — silently observes the clamped value instead of the original from that
+point on. `RQ_SPLINE_INVERSE`'s outside-tail-bound identity-passthrough blend does exactly this (needs
+both the clamped `x_clamped`, for the in-bin spline math, and the original unclamped `inputs`, for the
+outside-domain passthrough and for classifying inside/outside in the first place) — clamping `inputs`
+directly silently corrupted the classification and the passthrough both, without any crash or NaN to flag
+it. **Caught by `test_rq_spline_inverse_outside_tail_bound`**, a new test added specifically because
+`test_rq_spline_inverse`'s original fixture never actually fed the spline an out-of-domain input (its 3
+values all happened to fall inside `tail_bound`) — a genuinely different fixture (an input past
+`tail_bound`) was needed to expose it, not a rerun of the existing one. Symptom was suspicious but not
+obviously a bug at first glance: the wrong output (`2.0`) was *exactly* `tail_bound` — i.e., the code was
+silently returning the clamped boundary value instead of passing the true out-of-domain input through
+unchanged, not a crash or a NaN.
+
+Fixed in two places: `RQ_SPLINE_INVERSE` (`src/ops/primitives_spline.cpp`, clamp a `ggml_cont`'d copy of
+`inputs` instead of `inputs` itself) and the standalone `CLAMP` primitive (`src/ops/primitives_basic.cpp`)
+defensively, even though nothing currently feeds a shared/multiply-referenced tensor into it — `CLAMP` is
+a generic, independently reusable primitive with no way to know from inside its own function whether its
+input tensor is also read elsewhere in whatever topology eventually uses it. **General lesson for any
+future primitive work in this codebase**: before using any ggml op whose result might alias its input
+(check the real `ggml.c` source for `ggml_view_tensor`/`ggml_view_impl` in the op's implementation, not
+just its header signature), verify whether the original input tensor is still needed elsewhere in the
+same primitive or graph — `ggml_clamp` is the first one found doing this, but nothing rules out others
+(worth spot-checking before reusing any new-to-this-codebase ggml op that returns something "of the same
+shape as its input").
+
+**`DDSConv`/`ElementwiseAffine`/`ConvFlow` (reverse) added** to `src/ops/primitives_flow.cpp` (new
+primitives: `DDS_CONV`, `ELEMENTWISE_AFFINE_REVERSE`, `CONV_FLOW_REVERSE`), completing the
+`StochasticDurationPredictor`'s flow-list building blocks (only `ElementwiseAffine` and `ConvFlow`+`Flip`
+pairs appear in its `flows` list; `Flip` itself needed no new code, per the `GET_ROWS` finding above).
+`DDSConv` reuses `CONV_1D_DW` via a `PrimitiveRegistry` lookup (rather than duplicating its non-trivial
+im2col/reshape recipe a second time) and needs a `LayerNorm`-over-channels helper (`layer_norm_channels`)
+that transposes so the channel axis lines up with `ggml_norm`'s own normalization axis (`ne[0]`) —
+mirroring the real `modules.LayerNorm`'s own `transpose→layer_norm→transpose` trick exactly, not an
+independent reformulation. `ConvFlow` is specialized to `half_channels=1` (the *only* configuration this
+checkpoint ever instantiates — `StochasticDurationPredictor` is `ConvFlow`'s sole caller, always with
+`in_channels=2`), which collapses the real code's `reshape(b,half_channels,-1,t).permute(...)`
+bin-parameter gymnastics down to a plain transpose, and delegates the actual spline math to
+`RQ_SPLINE_INVERSE` via the registry rather than duplicating it. All three verified against real execution
+of piper's own `modules.DDSConv`/`ElementwiseAffine`/`ConvFlow` (small hand-picked fixtures; `ConvFlow`'s
+own fixture deliberately includes one value past `tail_bound`, so it doubles as an integration-level check
+of the aliasing fix above, not just the assembly logic). Full suite: **49/49 passing**, zero regressions,
+115/115 primitive-level checks.
+
+## VITS conversion, in progress, 2026-07-18: `StochasticDurationPredictor` reverse-mode assembly (task #76)
+
+**No new primitive needed** — SDP itself has no repeated-substructure math beyond what
+`CONV_1D`/`DDS_CONV`/`CONV_FLOW_REVERSE`/`ELEMENTWISE_AFFINE_REVERSE`/`GET_ROWS` (as `Flip`) already
+cover; the actual work here was getting the **wiring/ordering** right, verified in
+`test_sdp_reverse_assembly` (`tests/test_primitive_registry.cpp`) by chaining the existing primitives via
+direct `PrimitiveRegistry` calls in the exact real order, not by writing a new bundled op.
+
+**One more real, checkpoint-relevant finding, not just a test-construction detail**: `models.py`'s real
+`StochasticDurationPredictor.forward` reverse branch does
+`flows = list(reversed(self.flows)); flows = flows[:-2] + [flows[-1]]` (a "remove a useless vflow"
+comment in the source itself). Traced through exactly what this drops: with the real `n_flows=4`, `self.
+flows` is `[EA, CF0,Flip0, CF1,Flip1, CF2,Flip2, CF3,Flip3]` (9 entries); reversed and filtered, the final
+applied sequence is `[Flip3, CF3, Flip2, CF2, Flip1, CF1, Flip0, EA]` — **`CF0` (the very first
+`ConvFlow`) is dropped entirely and never executes at inference**, despite its weights existing in the
+checkpoint's state dict. Confirmed with a small-scale (`n_flows=2`) worked example in
+`test_sdp_reverse_assembly`'s own doc comment before trusting the general pattern. Also confirmed
+`self.log_flow` (`modules.Log`) is **only ever used in the `not reverse` (training) branch** — never
+touched at inference either. Both are real, checkpoint-specific facts the eventual conversion script
+(task #78) needs to know: `CF0`'s and `log_flow`'s weights can be safely skipped/ignored when building the
+inference-only topology, not converted at all.
+
+Cross-checked against a hand-replica of the real reverse-mode control flow using piper's own sub-module
+classes directly (`modules.ElementwiseAffine`/`ConvFlow`/`Flip`/`DDSConv`, `nn.Conv1d` — not the
+`StochasticDurationPredictor` class itself, since its `__init__` hardcodes `DDSConv`'s `n_layers=3` with
+no override, too large for a quick test; `n_flows=2` used instead of the real 4, the minimum that still
+leaves one `ConvFlow` surviving the filter above) with small dims (`in_channels=filter_channels=2`,
+`kernel_size=3`, `num_bins=3`, `tail_bound=2.0`, `T=2`). Full suite: **49/49 passing**, zero regressions,
+**116/116 primitive-level checks**.
+
+## VITS conversion, in progress, 2026-07-18: HiFi-GAN `Generator` vocoder (task #77)
+
+Confirmed the real checkpoint uses `resblock="2"`/"low_quality" config, not "1" — from the state dict
+directly (`model_g.dec.resblocks.*.convs.{0,1}` only, no `convs2`; `ResBlock1` would have both), not
+assumed from the piper repo's own defaults. **No new primitive needed**, exactly as the original plan
+predicted: `conv_pre`/`conv_post`/resblock convs are all `CONV_1D` (dilation already a generic attr),
+upsampling is `CONV_TRANSPOSE_1D`, activations are `LEAKY_RELU`/`TANH` (already registered), residual/
+fan-out-averaging is plain `ADD`/`SCALE`.
+
+**One real, newly-found primitive gap, though — not a missing op, a missing *feature* of an existing
+one**: `ggml_conv_transpose_1d` only supports `padding=0` (asserted in ggml's own source), but the real
+`nn.ConvTranspose1d(..., padding=p)` calls in `Generator.__init__` use nonzero `padding=(k-u)//2`. Fixed
+without any new primitive: computed the padding=0 ("full") output, then cropped `p` samples off **each**
+end via a plain view — verified this crop is an *exact* identity (not an approximation) by comparing real
+PyTorch `ConvTranspose1d(padding=p)` against `ConvTranspose1d(padding=0)` sliced by `[:, :, p:-p]`
+directly before relying on it (transposed-conv padding conventionally *removes* output samples, unlike
+regular conv where padding *adds* input samples — the opposite direction from what the same word means
+elsewhere in this codebase, worth remembering if this comes up again for any other transposed-conv use).
+
+Also confirmed exactly two *different* LeakyReLU slopes are used in the real code, easy to mix up: `0.1`
+(`self.LRELU_SLOPE`) inside every resblock and after every upsample stage, but PyTorch's **default**
+`0.01` (`F.leaky_relu(x)`, no explicit slope argument) exactly once, right before `conv_post` — both
+already just different `attrs.slope` values on the same registered `LEAKY_RELU` primitive, no engine
+change needed either way.
+
+Verified against real execution of piper's own `models.Generator`, small-scale (2 upsample stages instead
+of the real 3, 2 resblock kernel sizes instead of 3: `initial_channel=4`, `upsample_initial_channel=8`,
+`upsample_rates=(2,2)`, `upsample_kernel_sizes=(4,4)`, `resblock_kernel_sizes=(3,5)`,
+`resblock_dilation_sizes=((1,2),(2,6))`, `T=4`) in `test_hifigan_generator`
+(`tests/test_primitive_registry.cpp`) — passed on the first attempt. Full suite: **49/49 passing**, zero
+regressions, **118/118 primitive-level checks**.
+
+## VITS conversion, in progress, 2026-07-18: `TextEncoder` assembly (task #78, first sub-piece)
+
+No new primitive needed — `conv_q`/`conv_k`/`conv_v`/`conv_o`/`proj` are all kernel_size=1 convs, i.e.
+plain per-position linear projections, expressed via `MUL_MAT` directly (this engine's standard
+attention-convention idiom, e.g. Qwen3's own QKV projections) rather than `CONV_1D` — avoids unneeded
+transposes to/from `CONV_1D`'s `[T,C,N]` layout. `attentions.Encoder`'s post-norm `LayerNorm` needs **no**
+transpose here (unlike `DDSConv`'s `[T,C]` convention): `TextEncoder`'s attention pipeline is channel-first
+(`[C,T]`, matching `REL_POS_ATTENTION_SHAW`'s own convention and `GET_ROWS`'s embedding-lookup output),
+which is already `ggml_norm`'s own normalization axis (`ne[0]`). Only the FFN's kernel_size=3 convs
+genuinely need `CONV_1D` (hence a transpose in and back out).
+
+**Two real bugs found and fixed while writing `test_text_encoder_assembly`, both in the TEST itself, not
+the engine** (worth remembering for any future test with more than one graph output):
+
+1. **Multi-output graphs need `ggml_set_output()` on every output, not just the one passed to
+   `ggml_build_forward_expand`**. This test has three co-equal outputs (`x`, `m`, `logs` — none reachable
+   from the others). Using `GgmlScratch::expand()`'s single-output convenience wrapper (which calls
+   `ggml_gallocr_alloc_graph` immediately after building forward from just one tensor) left `m`/`logs`'s
+   own nodes completely unallocated — `ggml_backend_tensor_set` on their input dependencies aborted with
+   `"tensor buffer not set"`. Building forward from all three via three separate
+   `ggml_build_forward_expand` calls before ONE `ggml_gallocr_alloc_graph` call fixed the abort, but
+   revealed a second, quieter bug:
+2. **`gallocr`'s liveness analysis reuses a tensor's buffer once nothing reads it again — silently
+   corrupting any output tensor not explicitly marked `ggml_set_output()`**, even after fixing bug 1
+   above. `x` (the encoder's own hidden-state output, needed both as a return value AND as an input to
+   `proj`) has no reader after `stats = mul_mat(proj_w, x)` computes; without `ggml_set_output(x)`,
+   `gallocr` freed its buffer for reuse by a later tensor in the same graph, so reading `x` back out after
+   `s.compute()` returned a different tensor's data (not garbage or a crash — a real, differently-shaped
+   but same-*sized* tensor's values, which is what made this one sneaky: the read-back values were a
+   genuine permutation of *some* real computed values in the graph, not obviously wrong at a glance).
+   `graph_builder.cpp`'s own single designated output already calls `ggml_set_output(result.output)` for
+   exactly this reason; a hand-built test graph with more than one output needs to do the same for
+   *every* one of them. Fixed by adding `ggml_set_output(x); ggml_set_output(m); ggml_set_output(logs);`
+   before the graph-build/alloc sequence.
+
+**A third apparent mismatch, investigated and found to be a comparison-order artifact, not a bug**: after
+fixing both allocation issues above, the computed values were still "wrong" — but turned out to be an
+exact permutation of the expected values, not incorrect numbers. Root cause: the real PyTorch
+`TextEncoder.forward` does `x = torch.transpose(x, 1, -1)` early on and everything downstream (attention,
+FFN, `proj`) operates on that post-transpose `(B,C,T)` layout, materialized contiguous (T fastest) by the
+time it's dumped via `.flatten()`. This test's ggml pipeline, by contrast, never needed that transpose at
+all — `GET_ROWS`'s embedding-lookup output is already channel-fastest (`[C,T]`, C=ne[0]), which is the
+*pre*-transpose PyTorch layout reversed, and every subsequent op (attention, `LAYER_NORM`, the FFN's own
+transpose-to-conv-and-back) stays self-consistent in that same convention throughout. Both computations are
+correct; they just store the identical result with T/C swapped in memory relative to each other. Fixed by
+regenerating the expected arrays via `.transpose(1, 2).flatten()` in the reference script instead of a
+plain `.flatten()`, confirmed to match exactly once done. **General lesson: when a computed array is a
+value-for-value permutation of the expected one, check axis order before assuming a math bug.**
+
+Small-scale (`n_vocab=5`, `hidden_channels=4`, `n_heads=2`, `filter_channels=6`, `kernel_size=3`,
+`n_layers=1`, `out_channels=4`, `T=2`, `window_size=1` — chosen so `2*window_size+1 == 2*T-1 == 3`,
+sidestepping the real, genuinely-dynamic-length `emb_rel_k`/`emb_rel_v` pad/crop-to-T logic, which remains
+deferred to the full conversion script/e2e test below), cross-checked against real execution of piper's
+own `models.TextEncoder`. Full suite: **49/49 passing**, zero regressions, **121/121 primitive-level
+checks**.
+
+**Still open for VITS**: the full conversion script + hand-rolled reference + e2e test (task #78) —
+including the still-deferred `weight_norm`-folding utility, the emb_rel_k/v dynamic-T pad/crop logic
+(genuinely needed once real phoneme sequences exceed `window_size+1=5`), and the host-side
+`generate_path`/duration-to-frame-count driver (task #71, moved host-side per the data-dependent-
+frame-count finding recorded earlier in this same VITS effort). Every primitive-level building block for
+the full pipeline (`TextEncoder` via `REL_POS_ATTENTION_SHAW`, the real `StochasticDurationPredictor`, the
+coupling flow, and the HiFi-GAN vocoder) is now implemented and individually verified — what remains is
+assembly: the conversion script, the host-side driver for the two-phase graph (duration-dependent frame
+count), and an end-to-end test against a hand-rolled Python reference of the *entire* real checkpoint.

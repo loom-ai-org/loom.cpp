@@ -1,11 +1,15 @@
 """Extracts SentencePiece vocab data from a `.model` protobuf and writes it into a GGUF file using
-llama.cpp's own "tokenizer.ggml.*" KV schema (confirmed directly against gguf-py's `GGUFWriter` and
-llama.cpp's `include/llama.h` / `src/llama-vocab.cpp`): `tokenizer.ggml.model = "t5"` (llama.cpp's
-string for a genuine SentencePiece *unigram* model -- distinct from `"llama"`, which is llama.cpp's own
-byte-level-BPE-with-scores SPM variant), `.tokens`/`.scores`/`.token_type` arrays, `unknown_token_id`,
-`add_space_prefix`, `remove_extra_whitespaces`, and the raw `precompiled_charsmap` blob (needed for
-Unicode normalization during encode -- see `Vocab` in the C++ engine, which mirrors llama.cpp's
-XCDA-based normalizer exactly).
+llama.cpp's own "tokenizer.ggml.*" KV schema (confirmed directly against gguf-py's `GGUFWriter`,
+gguf-py's own `SentencePieceVocab` class in `gguf/vocab.py`, and llama.cpp's `include/llama.h`):
+`tokenizer.ggml.model` is `"t5"` for a genuine SentencePiece *unigram* model, or `"llama"` for real
+SentencePiece **BPE** (llama.cpp's own tag -- the original LLaMA/Mistral tokenizers are themselves
+SentencePiece BPE models, confirmed via `gguf-py`'s `SentencePieceVocab` writing this exact tag) --
+selected automatically here from the real `.model` protobuf's own `trainer_spec.model_type`
+(`UNIGRAM=1`, `BPE=2`; `WORD`/`CHAR` are not implemented on the C++ side, see `loom::Vocab`), not
+assumed or hardcoded. `.tokens`/`.scores`/`.token_type` arrays, `unknown_token_id`, `add_space_prefix`,
+`remove_extra_whitespaces`, and the raw `precompiled_charsmap` blob (needed for Unicode normalization
+during encode -- see `Vocab` in the C++ engine, which mirrors llama.cpp's XCDA-based normalizer
+exactly) are identical between both types, confirmed by inspecting a real BPE model's protobuf directly.
 
 SentencePiece's own per-piece `Type` enum (`NORMAL=1, UNKNOWN=2, CONTROL=3, USER_DEFINED=4, UNUSED=5,
 BYTE=6`, confirmed via direct protobuf inspection) is numerically identical to llama.cpp's
@@ -31,7 +35,16 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes) 
     types = [int(p.type) for p in m.pieces]
     unk_id = next((i for i, p in enumerate(m.pieces) if p.type == p.UNKNOWN), 0)
 
-    writer.add_tokenizer_model("t5")
+    model_type = m.trainer_spec.model_type
+    if model_type == m.trainer_spec.UNIGRAM:
+        tokenizer_model = "t5"
+    elif model_type == m.trainer_spec.BPE:
+        tokenizer_model = "llama"
+    else:
+        raise NotImplementedError(f"SentencePiece model_type {model_type} (WORD/CHAR) is not implemented "
+                                   "on the C++ side (loom::Vocab only supports UNIGRAM and BPE)")
+
+    writer.add_tokenizer_model(tokenizer_model)
     writer.add_token_list(pieces)
     writer.add_token_scores(scores)
     writer.add_token_types(types)
