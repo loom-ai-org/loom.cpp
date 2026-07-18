@@ -251,6 +251,12 @@ target_link_libraries(test_vocab PRIVATE loom::engine)
 add_test(NAME test_vocab COMMAND test_vocab)
 set_tests_properties(test_vocab PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Vocab's new SentencePiece BPE path ("llama" tag), against the real Parakeet-TDT tokenizer ---
+add_executable(test_vocab_spm_bpe test_vocab_spm_bpe.cpp)
+target_link_libraries(test_vocab_spm_bpe PRIVATE loom::engine)
+add_test(NAME test_vocab_spm_bpe COMMAND test_vocab_spm_bpe)
+set_tests_properties(test_vocab_spm_bpe PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_ctc_decode test_ctc_decode.cpp)
 target_link_libraries(test_ctc_decode PRIVATE loom::engine)
 add_test(NAME test_ctc_decode COMMAND test_ctc_decode)
@@ -323,3 +329,68 @@ add_executable(test_e2e_qwen3_q8_0 test_e2e_qwen3_q8_0.cpp)
 target_link_libraries(test_e2e_qwen3_q8_0 PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3_q8_0 COMMAND test_e2e_qwen3_q8_0)
 set_tests_properties(test_e2e_qwen3_q8_0 PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Parakeet-TDT roadmap, step 1: the LSTM-step composite-topology pattern (MUL_MAT/ADD/VIEW/SIGMOID/
+#     TANH/MUL -- no monolithic LSTM primitive), verified bit-exact against an independent numpy reference
+#     on a tiny synthetic fixture before it's trusted inside the real TdtDecoder driver. Fully synthetic,
+#     procedurally generated at ctest time like the other toy fixtures -- not skip-if-missing. ---
+set(LOOM_LSTM_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/lstm_step_ref)
+
+add_test(
+    NAME gen_lstm_step_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_lstm_step_gguf.py
+            ${LOOM_FIXTURE_DIR}/lstm_step_h.gguf ${LOOM_FIXTURE_DIR}/lstm_step_c.gguf
+)
+set_tests_properties(gen_lstm_step_gguf_fixture PROPERTIES FIXTURES_SETUP lstm_step_gguf_fixture)
+
+add_test(
+    NAME gen_lstm_step_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_lstm_step.py
+            ${LOOM_LSTM_STEP_REF_DIR}
+)
+set_tests_properties(gen_lstm_step_reference PROPERTIES FIXTURES_SETUP lstm_step_reference_fixture)
+
+add_executable(test_lstm_step test_lstm_step.cpp)
+target_link_libraries(test_lstm_step PRIVATE loom::engine)
+target_compile_definitions(test_lstm_step PRIVATE
+    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
+    LOOM_TEST_REF_DIR="${LOOM_LSTM_STEP_REF_DIR}"
+)
+add_test(NAME test_lstm_step COMMAND test_lstm_step)
+set_tests_properties(test_lstm_step PROPERTIES FIXTURES_REQUIRED "lstm_step_gguf_fixture;lstm_step_reference_fixture")
+
+# --- Parakeet-TDT roadmap, step 2: the full greedy-TDT decode loop (new TdtDecoder driver), verified
+#     against an independent numpy reference on a tiny synthetic fixture -- see BACKLOG.md. ---
+set(LOOM_TDT_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/tdt_step_ref)
+
+add_test(
+    NAME gen_tdt_step_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_tdt_step_gguf.py
+            ${LOOM_FIXTURE_DIR}/tdt_step_test
+)
+set_tests_properties(gen_tdt_step_gguf_fixture PROPERTIES FIXTURES_SETUP tdt_step_gguf_fixture)
+
+add_test(
+    NAME gen_tdt_step_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_tdt_step.py
+            ${LOOM_TDT_STEP_REF_DIR}
+)
+set_tests_properties(gen_tdt_step_reference PROPERTIES FIXTURES_SETUP tdt_step_reference_fixture)
+
+add_executable(test_tdt_decoder test_tdt_decoder.cpp)
+target_link_libraries(test_tdt_decoder PRIVATE loom::engine)
+target_compile_definitions(test_tdt_decoder PRIVATE
+    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}/tdt_step_test"
+    LOOM_TEST_REF_DIR="${LOOM_TDT_STEP_REF_DIR}"
+)
+add_test(NAME test_tdt_decoder COMMAND test_tdt_decoder)
+set_tests_properties(test_tdt_decoder PROPERTIES FIXTURES_REQUIRED "tdt_step_gguf_fixture;tdt_step_reference_fixture")
+
+# --- Real-model test: nvidia/parakeet-tdt-0.6b-v3, converted via tools/convert_nemo/convert_parakeet_tdt.py
+#     -- the real FastConformer encoder (dw_striding subsampling, no bias, no xscale) + the new TdtDecoder
+#     driver's greedy decode over it. Same "not regenerated at ctest time, skip cleanly if the real
+#     checkpoint isn't prepared" pattern as the other real-model tests above. ---
+add_executable(test_e2e_parakeet_tdt test_e2e_parakeet_tdt.cpp)
+target_link_libraries(test_e2e_parakeet_tdt PRIVATE loom::engine)
+add_test(NAME test_e2e_parakeet_tdt COMMAND test_e2e_parakeet_tdt)
+set_tests_properties(test_e2e_parakeet_tdt PROPERTIES SKIP_RETURN_CODE 77)

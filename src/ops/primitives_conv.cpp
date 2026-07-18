@@ -59,6 +59,40 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {result};
 }
 
+// Depthwise conv2d (one filter per channel, groups == channels) -- needed for FastConformer's real
+// dw_striding subsampling (subsampling stages 2+ use a grouped Conv2d, unlike Conformer-CTC-small's
+// plain/ungrouped 2-stage subsampling). ggml's own convenience wrapper (ggml_conv_2d_dw, ggml.c) hardcodes
+// GGML_TYPE_F16 for its internal im2col regardless of the kernel's actual dtype (confirmed by reading its
+// source directly -- unlike ggml_conv_2d, which already respects the kernel's own type) -- same precision
+// concern op_conv_1d/op_conv_2d above were already written to avoid, so this is a faithful transcription of
+// ggml_conv_2d_dw's exact recipe with F32 substituted for that one hardcoded F16, not an independent
+// re-derivation.
+Outputs op_conv_2d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CONV_2D_DW", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+    const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
+    const int s1 = static_cast<int>(resolve_attr_int(attrs, "s1", pc.symbols));
+    const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    const int p1 = static_cast<int>(resolve_attr_int(attrs, "p1", pc.symbols));
+    const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+    const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
+
+    ggml_tensor* new_kernel = ggml_reshape_4d(pc.ctx, kernel, kernel->ne[0], kernel->ne[1], 1,
+                                               kernel->ne[2] * kernel->ne[3]);
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, new_kernel,
+        ggml_reshape_4d(pc.ctx, data, data->ne[0], data->ne[1], 1, data->ne[2] * data->ne[3]),
+        s0, s1, p0, p1, d0, d1, /*is_2D=*/true, GGML_TYPE_F32);
+    ggml_tensor* new_data = ggml_reshape_4d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1],
+                                             data->ne[2], data->ne[3]);
+
+    new_kernel = ggml_reshape_4d(pc.ctx, new_kernel, new_kernel->ne[0] * new_kernel->ne[1], new_kernel->ne[2],
+                                  new_kernel->ne[3], 1);
+    ggml_tensor* result = ggml_mul_mat(pc.ctx, new_kernel, new_data);
+    result = ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], data->ne[2], data->ne[3]);
+    return {result};
+}
+
 // Unlike ggml_conv_1d/2d, ggml_conv_transpose_1d/2d_p0 are native ops that dispatch purely on the
 // kernel's own dtype (ggml_compute_forward_conv_transpose_1d/2d: F32 kernel -> full F32 compute, no
 // forced F16 cast) -- so these call the ggml convenience functions directly, no precision workaround
@@ -138,6 +172,7 @@ Outputs op_pool_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
 
 LOOM_REGISTER_OP(CONV_1D, op_conv_1d)
 LOOM_REGISTER_OP(CONV_2D, op_conv_2d)
+LOOM_REGISTER_OP(CONV_2D_DW, op_conv_2d_dw)
 LOOM_REGISTER_OP(CONV_TRANSPOSE_1D, op_conv_transpose_1d)
 LOOM_REGISTER_OP(CONV_TRANSPOSE_2D, op_conv_transpose_2d)
 LOOM_REGISTER_OP(CONV_1D_DW, op_conv_1d_dw)

@@ -93,6 +93,50 @@ Outputs op_relu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_relu(pc.ctx, in[0])};
 }
 
+Outputs op_leaky_relu(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("LEAKY_RELU", in, 1);
+    const double slope = resolve_attr_number(attrs, "slope", pc.symbols);
+    return {ggml_leaky_relu(pc.ctx, in[0], static_cast<float>(slope), /*inplace=*/false)};
+}
+
+Outputs op_step(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // Heaviside step: 1.0 where input > 0, else 0.0 -- composed with a preceding SUB to build a general
+    // "a >= b" comparison mask (STEP(SUB(a,b))), needed by VITS's generate_path/rational-quadratic-spline
+    // bucketize, neither of which has any other loom precedent to reuse.
+    expect_n_inputs("STEP", in, 1);
+    return {ggml_step(pc.ctx, in[0])};
+}
+
+Outputs op_cumsum(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("CUMSUM", in, 1);
+    return {ggml_cumsum(pc.ctx, in[0])};
+}
+
+Outputs op_softmax(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("SOFTMAX", in, 1);
+    return {ggml_soft_max(pc.ctx, in[0])};
+}
+
+Outputs op_softplus(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("SOFTPLUS", in, 1);
+    return {ggml_softplus(pc.ctx, in[0])};
+}
+
+Outputs op_clamp(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CLAMP", in, 1);
+    const double lo = resolve_attr_number(attrs, "min", pc.symbols);
+    const double hi = resolve_attr_number(attrs, "max", pc.symbols);
+    // ggml_clamp's result is a VIEW aliasing its source's buffer (ggml.c calls ggml_view_tensor, not
+    // ggml_dup_tensor), i.e. it clamps in place -- if `in[0]` is also read elsewhere in the topology
+    // (e.g. by another node besides this CLAMP), that other read would silently observe the clamped
+    // value instead of the original once this op runs, regardless of the two nodes' relative order in
+    // the JSON topology. Clamping a ggml_cont'd copy instead (a genuine, separately-allocated tensor)
+    // keeps `in[0]`'s own buffer untouched for any other consumer. Found via a real instance of this
+    // exact hazard in RQ_SPLINE_INVERSE (see primitives_spline.cpp) -- fixed here too since CLAMP is a
+    // generic, independently reusable primitive with no way to know its input won't be shared.
+    return {ggml_clamp(pc.ctx, ggml_cont(pc.ctx, in[0]), static_cast<float>(lo), static_cast<float>(hi))};
+}
+
 Outputs op_gelu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("GELU", in, 1);
     // ggml_gelu_erf computes the exact 0.5*x*(1+erf(x/sqrt(2))) formula (no lookup table), unlike
@@ -124,6 +168,11 @@ Outputs op_layer_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
 Outputs op_sigmoid(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SIGMOID", in, 1);
     return {ggml_sigmoid(pc.ctx, in[0])};
+}
+
+Outputs op_tanh(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("TANH", in, 1);
+    return {ggml_tanh(pc.ctx, in[0])};
 }
 
 Outputs op_glu(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -241,10 +290,17 @@ LOOM_REGISTER_OP(SUM_ROWS, op_sum_rows)
 LOOM_REGISTER_OP(PAD_1D, op_pad_1d)
 LOOM_REGISTER_OP(SILU, op_silu)
 LOOM_REGISTER_OP(RELU, op_relu)
+LOOM_REGISTER_OP(LEAKY_RELU, op_leaky_relu)
+LOOM_REGISTER_OP(STEP, op_step)
+LOOM_REGISTER_OP(CUMSUM, op_cumsum)
+LOOM_REGISTER_OP(SOFTMAX, op_softmax)
+LOOM_REGISTER_OP(SOFTPLUS, op_softplus)
+LOOM_REGISTER_OP(CLAMP, op_clamp)
 LOOM_REGISTER_OP(SWIGLU, op_swiglu)
 LOOM_REGISTER_OP(RMS_NORM, op_rms_norm)
 LOOM_REGISTER_OP(LAYER_NORM, op_layer_norm)
 LOOM_REGISTER_OP(SIGMOID, op_sigmoid)
+LOOM_REGISTER_OP(TANH, op_tanh)
 LOOM_REGISTER_OP(GLU, op_glu)
 LOOM_REGISTER_OP(RESHAPE, op_reshape)
 LOOM_REGISTER_OP(VIEW, op_view)
