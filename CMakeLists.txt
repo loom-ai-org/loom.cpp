@@ -22,6 +22,7 @@ add_library(loom_engine
     src/core/kv_cache.cpp
     src/core/generation.cpp
     src/core/tdt_decoder.cpp
+    src/core/vits_driver.cpp
     src/core/ode_stepper.cpp
     src/core/vocab.cpp
     src/core/unicode.cpp

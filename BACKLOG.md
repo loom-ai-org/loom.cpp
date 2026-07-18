@@ -1807,12 +1807,215 @@ deferred to the full conversion script/e2e test below), cross-checked against re
 own `models.TextEncoder`. Full suite: **49/49 passing**, zero regressions, **121/121 primitive-level
 checks**.
 
-**Still open for VITS**: the full conversion script + hand-rolled reference + e2e test (task #78) —
-including the still-deferred `weight_norm`-folding utility, the emb_rel_k/v dynamic-T pad/crop logic
-(genuinely needed once real phoneme sequences exceed `window_size+1=5`), and the host-side
-`generate_path`/duration-to-frame-count driver (task #71, moved host-side per the data-dependent-
-frame-count finding recorded earlier in this same VITS effort). Every primitive-level building block for
-the full pipeline (`TextEncoder` via `REL_POS_ATTENTION_SHAW`, the real `StochasticDurationPredictor`, the
-coupling flow, and the HiFi-GAN vocoder) is now implemented and individually verified — what remains is
-assembly: the conversion script, the host-side driver for the two-phase graph (duration-dependent frame
-count), and an end-to-end test against a hand-rolled Python reference of the *entire* real checkpoint.
+## VITS conversion, in progress, 2026-07-18: real conversion script runs end-to-end against the real checkpoint
+
+**`tools/convert_piper_vits/`** (new): `vits_common.py` (checkpoint loading, `fold_weight_norm`,
+`get_relative_embeddings`) and `convert_vits.py` (the real conversion script), producing three GGUF files
+— `vits_stats.gguf`, `vits_logw.gguf`, `vits_flow_vocoder.gguf`. Confirmed a real API constraint while
+wiring this up that the earlier design notes hadn't accounted for: **`GgufModel::load` requires exactly
+one `"model.graph_topology"` KV per file** (`gguf_model.cpp:60-65`), so a single file can't hold both the
+`stats` and `logw` topologies under custom-named KVs as originally planned — `convert_parakeet_tdt.py`'s
+real precedent (re-examined) is "one GGUF file per topology, weights duplicated across files as needed,"
+not "one file, multiple topology KVs." Switched to that: `vits_stats.gguf` and `vits_logw.gguf` both
+carry their own full (partially redundant) TextEncoder weight copy.
+
+**`fold_weight_norm` verified against the real checkpoint's own tensors**, not just a synthetic
+construction: `torch._weight_norm(v, g, 0)` (the literal function `torch.nn.utils.weight_norm`'s
+forward-pre-hook calls) matches the manual numpy formula `g * v / ||v||` (per-dim-0-slice L2 norm) to
+~1e-8 on `model_g.dec.ups.0`'s real `weight_g`/`weight_v`. An earlier, sloppier check (reading
+`.weight` off a freshly-wrapped module without ever calling `.forward()`) appeared to show a mismatch —
+turned out to be a test-methodology bug (the weight_norm forward-PRE-hook only refreshes `.weight` on an
+actual forward call; reading it beforehand returns the module's stale, randomly-initialized value) rather
+than a real formula problem, caught by comparing against `torch._weight_norm` directly instead of the
+module's cached attribute.
+
+**`get_relative_embeddings` verified against the real `_get_relative_embeddings`** across both its
+branches (`length <= window_size+1`: slice from the fixed table; `length > window_size+1`: zero-pad then
+slice) for lengths `[3, 5, 7, 12]` against `window_size=4` — exact match in all four cases.
+
+**Three real bugs found and fixed while getting the script to actually build+compute against the real
+checkpoint** (`test_e2e_vits_smoke`, a new structural smoke test — builds every declared topology with
+dummy zero-filled inputs and checks for finite output, not yet a numerical-correctness check):
+1. Declared-input `shape` arrays must be **all-string** (`GraphTopology::parse` does
+   `.get<std::vector<std::string>>()`, `graph_topology.cpp:57`) — a literal integer `2` in `z_noise`'s
+   shape (`["$n_tokens", 2]`) threw `json.exception.type_error.302` at parse time. Every other declared
+   input already used strings for its non-symbol dims (`str(channels)` etc.) except this one, missed on
+   a first pass.
+2. **The `GgufModel::load` single-topology-KV constraint** above.
+3. **A genuinely subtle shape bug**: TextEncoder's `conv_q`/`conv_k`/`conv_v`/`conv_o`/`proj` and SDP's
+   `pre` are consumed via a plain `MUL_MAT` node (not `CONV_1D`) for this engine's usual "channel-first
+   attention convention" reasons (see the TextEncoder-assembly entry above) — but their real PyTorch
+   weight shape is `(out, in, 1)` (kernel_size=1 convs keep an explicit trailing `K=1` dim). Writing that
+   3D array to GGUF unmodified round-trips to a ggml tensor with `ne=[1, in, out]` (GGUF/ggml both store
+   dims fastest-first, i.e. reversed from numpy's slowest-first order) — `MUL_MAT` then contracts against
+   `ne[0]=1` instead of `in`, tripping `GGML_ASSERT(ggml_can_mul_mat(a, b))` at graph-build time. Fixed
+   with a new `add_conv1x1_as_matmul` helper that squeezes the trailing dim to a plain 2D `(out, in)`
+   array specifically for the six weights consumed this way — `add_conv` (used for every genuine
+   `CONV_1D` consumer, where that trailing `K` dim is required, including when `K=1` for e.g. DDSConv's
+   `convs_1x1`) is untouched. **General lesson for any future MUL_MAT-as-conv1x1 idiom in this codebase**:
+   a real PyTorch conv weight's trailing kernel-size dim must be explicitly squeezed before it can be
+   treated as a plain matrix — the two representations are byte-compatible only if that dim is 1 AND
+   removed, never automatically.
+
+**End-to-end structural result**: all three topologies build and compute successfully against the real
+checkpoint's actual weights with a small dummy `T=5`: `stats` → 1920 = 2×192×5 elements (correct), `logw`
+→ 5 elements (correct), the flow+vocoder waveform → 1280 = 5×8×8×4 samples (correct, matches
+`upsample_rates`' product exactly). All finite, no crashes. Full suite: **50/50 passing** (the new
+`test_e2e_vits_smoke` skips cleanly without `LOOM_VITS_DIR` set, same convention as every other
+real-checkpoint test).
+
+## VITS conversion, in progress, 2026-07-18: `VitsDriver` — the full two-phase pipeline runs end-to-end
+
+**`include/loom/core/vits_driver.h`/`src/core/vits_driver.cpp`** (new): the host-side driver tying the
+three GGUF files together, following the `TdtDecoder`/`OdeStepper` "TTS Catch" precedent (own the
+`GraphTopology`s as members constructed before the `GraphBuilder`s that reference them, models referenced
+not owned). `VitsDriver::synthesize(token_ids, seed)`:
+1. Builds `stats` (n_tokens=T) and reads back `[2*inter_channels, T]` (channel-first) → `m_p`/`logs_p`
+   split by a plain channel-offset read, no in-graph split (same host-side-postprocessing idea as the
+   `stats`/`logw` topology split itself).
+2. Builds `logw` (n_tokens=T, plus host-sampled `z_noise = randn(T,2)*noise_scale_w`) and reads back the
+   `[T]` duration logits.
+3. **`generate_path`, done host-side** (confirmed the right call once again): `w_ceil[t] =
+   ceil(exp(logw[t])*length_scale)`, `y_length = max(sum(w_ceil), 1)` — with `x_mask`/`y_mask` dropped
+   (always all-ones: single unpadded utterance), the real alignment-matrix math (`commons.py::
+   generate_path`) degenerates to a plain "replicate column `t` of `m_p`/`logs_p` for `w_ceil[t]`
+   consecutive output frames" expansion, sampling `z_p[t'] = m_p[t] + randn()*exp(logs_p[t])*noise_scale`
+   directly into a `[y_length, inter_channels]` (`T`-major) buffer — no attention/alignment matrix is ever
+   materialized, in ggml or otherwise.
+4. Builds `flow_vocoder` with `n_tokens=y_length` (the just-computed, genuinely data-dependent value —
+   exactly the case `GraphBuilder::build`'s two dynamic scalar arguments exist for) and reads back the
+   waveform.
+
+**`pad_crop_relative_embeddings`** (C++ port of `vits_common.get_relative_embeddings`, itself verified
+against the real `_get_relative_embeddings` — see the TextEncoder-assembly and conversion-script entries
+above): reads each TextEncoder layer's fixed `(2*window_size+1, k_channels)` raw table back out of the
+GGUF (a NEW, topology-unreferenced `*_raw` tensor the conversion script now also writes, purely so the
+driver has something to read — the declared graph inputs `emb_rel_k_i`/`emb_rel_v_i` are the *computed*,
+call-specific tables, not storage for the learned parameter itself) and produces the real call's
+`(2*T-1, k_channels)` table at every `synthesize()` call, since real `T` varies per input text and can't
+be baked in at conversion time.
+
+**Verified end-to-end against the real checkpoint** (`test_e2e_vits_driver`, new): 10 arbitrary in-vocab
+phoneme ids → 6656 waveform samples (26 frames × 256 hop length), all finite, RMS≈0.0099, max
+abs≈0.041 — comfortably inside tanh's `[-1,1]` range with real, non-degenerate variation (not silence,
+not NaN/Inf). The low amplitude is plausible-but-unconfirmed as simply reflecting that these are
+arbitrary token ids, not real phonemized text run through piper's own blank-interleaving convention
+(`_` between phonemes) — not chased further here since numerical correctness needs the still-open
+hand-rolled full-model reference anyway, not vibes about amplitude. Full suite: **51/51 passing**, both
+new VITS tests (`test_e2e_vits_smoke`, `test_e2e_vits_driver`) skip cleanly without `LOOM_VITS_DIR` set.
+
+## VITS conversion, done, 2026-07-18: numerical correctness confirmed against the real checkpoint (task #78 core work complete)
+
+**Real phonemization confirmed and reproduced** (espeak-ng installed, `piper_phonemize` available in the
+piper venv): piper's inference-time text→phoneme→id pipeline runs almost entirely **outside** its own
+`piper` Python package, via `piper_phonemize` — an in-process binding to a **custom espeak-ng fork**
+(`github.com/rhasspy/espeak-ng`, adds `espeak_TextToPhonemesWithTerminator`, not available from the
+stock `espeak-ng` CLI) that also injects clause-boundary punctuation phonemes (`.`/`,`/`?`/`!`/`:`/`;`/
+space) espeak's own phoneme string doesn't include on its own. The phoneme→id conversion (pure Python,
+`voice.py::phonemes_to_ids`) is `[id["^"]] + interleave(phoneme_ids, id["_"]) + [id["$"]]` — BOS, every
+phoneme followed by a blank/pad id, EOS — confirmed by direct inspection and reproduced exactly in
+`reference_forward_vits.py`. `tools/convert_piper_vits/vits_common.py`'s phonemization notes and
+`test_e2e_vits_driver`'s real test input now use the real `phonemize_espeak("Hello world, this is a
+test.", "en-gb-x-rp")` → `phonemes_to_ids` output (T=62), not arbitrary in-vocab ids.
+
+**All three topologies now verified NUMERICALLY correct against the real checkpoint**, not just
+structurally (finite/right-shape) — closing out the "still open" item from the previous entry:
+- **`stats` (TextEncoder)**: deterministic (no randomness anywhere in TextEncoder), directly comparable.
+  `test_e2e_vits_stats_reference`: max abs diff `m_p`=2.9e-6, `logs_p`=9.5e-7 against a real
+  `models.TextEncoder` forward pass, T=62 (genuinely exercises the emb_rel pad branch, `T > window_size+1`).
+- **`logw` (TextEncoder+SDP reverse)**: SDP is genuinely stochastic (`z = torch.randn(...)` inside the
+  real model itself) — made comparable by monkeypatching `torch.randn` (via `unittest.mock.patch`) to
+  return a fixed, externally-generated noise array for the exact shape SDP's own forward calls it with,
+  then feeding that SAME array into the topology's own `z_noise` declared input. `test_e2e_vits_logw_reference`:
+  max abs diff = 1.4e-5, T=62 — validates the ENTIRE real spline-flow assembly (ConvFlow/DDSConv/
+  ElementwiseAffine/Flip wiring) end to end, not just the small hand-picked-dims unit tests from earlier
+  in this effort.
+- **`flow_vocoder`**: also deterministic given a fixed `z_p` (no sampling happens inside the flow or
+  vocoder themselves — the *sampling* that produces `z_p` is `VitsDriver`'s own responsibility, not
+  baked into the flow/vocoder graph). `test_e2e_vits_flow_vocoder_reference`: max abs diff = **5.3e-8**
+  (effectively bit-exact) against a real `ResidualCouplingBlock`+`Generator` forward pass.
+
+**A real bug found and fixed WHILE building these reference tests, not a bug in the engine** — the exact
+same class of mistake as `test_text_encoder_assembly`'s earlier axis-order confusion (see that entry
+above), but this time in a **test/reference-generation script**, not in `convert_vits.py` or the engine
+itself: the first attempt at dumping `z_p`/`z`/`wav` reference arrays used
+`tensor[0].transpose(0,1).contiguous().numpy()` (converting PyTorch's native `(1,C,T)` to `(T,C)` before
+saving) — but this engine's `[T,C]` flow/vocoder convention (`T=ne[0]`, fastest) is byte-identical to
+PyTorch's **native, untransposed** `(C,T)` layout (numpy row-major, `T` fastest) once the batch dim is
+dropped. Transposing before saving silently produced a same-values-different-order mismatch (max abs
+diff ≈ the signal's own amplitude, i.e. looked like total garbage) that was **not** a real engine or
+wiring bug — confirmed by isolating just the flow half of the pipeline (a temporary flow-only GGUF/
+topology, built from the same conversion-script helper functions) against a real `ResidualCouplingBlock`
+output using a fixed `z_p`, which matched to 7.6e-6 the moment the transpose was removed from the
+reference dump. **General lesson reinforced again**: when a computed array is a value-for-value
+permutation of the expected one (not literally different numbers), check axis/transpose conventions
+before assuming a real numerical bug — this is now the *second* time this exact mistake has appeared in
+this VITS effort alone (see the TextEncoder-assembly entry), always in test/reference code, never in the
+engine or conversion script itself.
+
+**`tools/convert_piper_vits/reference_forward_vits.py`** (new, consolidates three earlier ad-hoc scripts):
+produces every artifact the three reference tests above need (`ref_token_ids.json`, `ref_m_p.npy`,
+`ref_logs_p.npy`, `ref_sdp_z_noise.npy`, `ref_sdp_logw.npy`, `ref_z_p.npy`, `ref_wav.npy`) from the real
+checkpoint + config JSON in one run, mirroring `tools/convert_nemo/reference_forward_parakeet_tdt.py`'s
+role for that model — `strict=True` state-dict loading confirmed **zero** missing/unexpected keys for
+`enc_p`/`dp`/`flow`/`dec`, independently reconfirming the conversion script's own tensor-name mapping is
+exactly right.
+
+Full suite: **54/54 passing**, all five new VITS tests (`test_e2e_vits_smoke`, `test_e2e_vits_driver`,
+`test_e2e_vits_stats_reference`, `test_e2e_vits_logw_reference`, `test_e2e_vits_flow_vocoder_reference`)
+skip cleanly without their respective env vars set.
+
+**What "done" means here and what's still genuinely open**: every phase's real MATH is now proven correct
+against the real checkpoint to float32 precision. What remains, if ever needed: (1) a true full-pipeline
+bit-exact check would require also pinning `VitsDriver`'s own `z_p`-sampling RNG to match a reference
+exactly (not attempted — the three phase-level checks above already prove each phase independently, and
+`VitsDriver`'s own sampling code is a straightforward `std::normal_distribution` call, not intricate model
+logic); (2) multi-sentence input (piper splits on espeak's own clause/sentence boundaries and runs
+inference once per sentence -- `VitsDriver::synthesize` currently takes one already-tokenized sequence,
+so a caller wanting full-text-in/audio-out needs to do that splitting itself, matching `voice.py`'s own
+`synthesize_stream_raw` structure); (3) writing a WAV file / audio playback integration (out of scope for
+this engine, a caller's own concern).
+
+### TODO: vendor piper-phonemize's `phonemize.cpp` (+ deps) into loom-engine, so text→phoneme→id doesn't
+### depend on the external `piper_phonemize` Python package
+
+Right now the ONLY thing standing between "raw text in" and `VitsDriver::synthesize()` is phonemization,
+and that step lives entirely OUTSIDE this project: `reference_forward_vits.py` (and
+`test_e2e_vits_driver`'s real-text test input) both depend on importing the `piper_phonemize` Python
+package from the piper venv (`/home/flavio/.venvs/piper`), which itself wraps a **custom espeak-ng fork**
+in a compiled `.so` — none of that is part of loom-engine, and nothing in this repo can phonemize text on
+its own. This is a real, currently-unaddressed gap for anyone wanting to go from a plain string to audio
+using only loom-engine.
+
+**What needs vendoring in**, from `github.com/rhasspy/piper-phonemize` (confirmed via direct inspection
+this session, see the `VitsDriver`/reference-script BACKLOG entries above for the full research trail):
+- `src/phonemize.cpp` / the matching header (`phonemize.hpp` or equivalent) — `phonemize_eSpeak`, the
+  real per-clause espeak-ng driving loop (`espeak_SetVoiceByName`, `espeak_TextToPhonemesWithTerminator`,
+  NFD normalization via `una::norm::to_nfd_utf8`, clause-terminator-driven punctuation injection,
+  `(lang)`-flag stripping) — this is the piece that actually needs porting/vendoring, not just calling.
+- `src/phoneme_ids.hpp` (or the ID-map/interleaving logic) — though note `piper`'s own Python runtime
+  (`voice.py::phonemes_to_ids`) does NOT call piper-phonemize's C++ version of this; it reimplements the
+  same BOS/blank-interleave/EOS algorithm in pure Python (already ported to
+  `reference_forward_vits.py::phonemes_to_ids` this session) — worth deciding which one to standardize on
+  when vendoring rather than carrying two.
+- The `python.cpp` pybind11 wrapper is Python-binding glue, NOT needed for a native C++ integration —
+  skip it; the goal is calling `phonemize_eSpeak` directly from loom-engine's own C++, no Python layer.
+- **The espeak-ng dependency itself**: NOT stock `espeak-ng` (its CLI doesn't expose clause-terminator
+  info) — needs the same fork piper-phonemize builds against, `github.com/rhasspy/espeak-ng` (pinned in
+  piper-phonemize's own `CMakeLists.txt` to commit `0f65aa301e0d6bae5e172cc74197d32a6182200f`, "Add
+  TranslateClauseWithTerminator to translate.h"), plus its `espeak-ng-data` linguistic data directory
+  (bundled in the installed `piper_phonemize` wheel at
+  `~/.venvs/piper/lib/python3.11/site-packages/piper_phonemize/espeak-ng-data/` — needs a real path to
+  ship/reference once vendored, not hardcoded to that venv location).
+- Skip `tashkeel_run`/`libtashkeel` (Arabic-only diacritization, irrelevant to `en-gb-x-rp` and every
+  other voice this project has touched so far) unless a future voice actually needs it.
+
+**Why this matters**: without it, "loom-engine can run VITS TTS" is only true if the CALLER supplies
+already-phonemized token ids (as `test_e2e_vits_driver`/`reference_forward_vits.py` currently do, via the
+Python `piper_phonemize` package) — a real, meaningful gap between "the model runs" (done, verified) and
+"you can type a sentence and get audio using only this project" (not yet true). Scope this as its own
+milestone (new C++ source under e.g. `src/text/phonemize.cpp` + `include/loom/text/phonemize.h`, matching
+this project's existing `src/core/`+`include/loom/core/` split), with its own build-system integration for
+the vendored espeak-ng fork (likely a new CMake `FetchContent`/`ExternalProject`, mirroring how
+piper-phonemize itself pulls it in) and a unit test comparing against `piper_phonemize`'s own output for
+a handful of real sentences before trusting it.

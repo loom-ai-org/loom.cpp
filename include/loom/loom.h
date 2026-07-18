@@ -11,6 +11,7 @@
 #include "loom/core/kv_cache.h"
 #include "loom/core/generation.h"
 #include "loom/core/tdt_decoder.h"
+#include "loom/core/vits_driver.h"
 #include "loom/core/ctc_decode.h"
 #include "loom/core/ode_stepper.h"
 #include "loom/core/vocab.h"
