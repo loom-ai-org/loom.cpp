@@ -238,6 +238,13 @@ target_link_libraries(test_e2e_conformer_ctc_dynamic_length PRIVATE loom::engine
 add_test(NAME test_e2e_conformer_ctc_dynamic_length COMMAND test_e2e_conformer_ctc_dynamic_length)
 set_tests_properties(test_e2e_conformer_ctc_dynamic_length PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Gating-criterion proof of concept: generic converter (tools/convert_generic/) against the real
+#     Conformer-CTC encoder -- a genuinely non-decoder-transformer shape. See BACKLOG.md. ---
+add_executable(test_e2e_conformer_ctc_generic test_e2e_conformer_ctc_generic.cpp)
+target_link_libraries(test_e2e_conformer_ctc_generic PRIVATE loom::engine)
+add_test(NAME test_e2e_conformer_ctc_generic COMMAND test_e2e_conformer_ctc_generic)
+set_tests_properties(test_e2e_conformer_ctc_generic PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Tokenizer: Vocab (SentencePiece unigram, llama.cpp GGUF schema) against the real converted model ---
 add_executable(test_vocab test_vocab.cpp)
 target_link_libraries(test_vocab PRIVATE loom::engine)
@@ -308,3 +315,11 @@ add_executable(test_e2e_qwen3_generic test_e2e_qwen3_generic.cpp)
 target_link_libraries(test_e2e_qwen3_generic PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3_generic COMMAND test_e2e_qwen3_generic)
 set_tests_properties(test_e2e_qwen3_generic PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Quantized-weight proof of concept: same real Qwen3-0.6B-Base checkpoint, matmul weights quantized
+#     to Q8_0 by tools/quantize/quantize_gguf_q8_0.py -- see BACKLOG.md's "quantized weight support"
+#     milestone. Same skip-cleanly-if-not-prepared pattern as the other real-model tests above.
+add_executable(test_e2e_qwen3_q8_0 test_e2e_qwen3_q8_0.cpp)
+target_link_libraries(test_e2e_qwen3_q8_0 PRIVATE loom::engine)
+add_test(NAME test_e2e_qwen3_q8_0 COMMAND test_e2e_qwen3_q8_0)
+set_tests_properties(test_e2e_qwen3_q8_0 PROPERTIES SKIP_RETURN_CODE 77)

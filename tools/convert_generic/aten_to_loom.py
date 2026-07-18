@@ -19,9 +19,11 @@ def _qualname_to_gguf_name(qualname: str) -> str:
     """ToyLLM-specific rule: 'layers.N.xxx' -> 'blk.N.xxx', and every weight ends in '.weight' whether or
     not the nn.Module attribute itself was a bare nn.Parameter (attn_norm/ffn_norm/token_embd/output_norm)
     or a Linear's .weight. This one small rule is the "still needs an explicit weight-name mapping" half
-    of the design documented in BACKLOG.md -- not auto-derived from the graph."""
+    of the design documented in BACKLOG.md -- not auto-derived from the graph. Extended for Conformer-CTC
+    (first model in this POC with biased Linears): a qualname already ending in '.bias' (or '.weight')
+    is left alone -- only bare-Parameter names (no suffix at all) get '.weight' appended."""
     name = qualname.replace("layers.", "blk.", 1) if qualname.startswith("layers.") else qualname
-    if not name.endswith(".weight"):
+    if not (name.endswith(".weight") or name.endswith(".bias")):
         name += ".weight"
     return name
 
@@ -47,15 +49,44 @@ class Converter:
     def __init__(self, example_n_tokens: int):
         self.example_n_tokens = example_n_tokens
 
+    def _permute_axes(self, dims):
+        """Translates ATen's aten.permute.default `dims` arg (source-encoding: output torch-axis i comes
+        from input torch-axis dims[i], normal torch axis numbering) into ggml_permute's own convention
+        (destination-encoding: ne_out[axes[k]] = ne_in[k], REVERSED/ne-order axis numbering) --
+        confirmed these are genuinely different conventions by reading ggml_permute's C source directly
+        (ggml.c), then derived axes[k] = ndim-1 - dims.index(ndim-1-k) and verified it numerically against
+        3 independent permutations (including a non-involution 3-cycle) via a standalone numpy repro
+        before trusting it here -- same rigor as the RESHAPE shape-order bug this project already caught
+        once. PERMUTE always needs exactly 4 entries (ggml's ne is always 4D); axes beyond len(dims) are
+        forced to be identity (axes[k] = k) since the derived sub-permutation only ever produces values in
+        0..ndim-1 for those, and a valid 4-permutation must place the leftover indices somewhere."""
+        ndim = len(dims)
+        axes = [0, 1, 2, 3]
+        for k in range(ndim):
+            src_torch_axis = ndim - 1 - k
+            out_torch_axis = dims.index(src_torch_axis)
+            axes[k] = ndim - 1 - out_torch_axis
+        return axes
+
     def _shape_attr(self, shape_list):
         """RESHAPE's "shape" attr is fed straight into ggml_reshape_* (src/ops/primitives_basic.cpp:147-
         174), i.e. ggml's `ne` convention: fastest-varying dim first -- the REVERSE of ATen's view()/
         reshape() arg, which is plain numpy/PyTorch order (slowest-varying/outermost first). Also
         substitutes the literal that equals the traced example's n_tokens with the symbol "n_tokens" --
         required for GraphBuilder::build(n_tokens, n_past) to rebuild the graph fresh at a different
-        length on every generation step (see src/core/graph_builder.cpp:109-112)."""
+        length on every generation step (see src/core/graph_builder.cpp:109-112).
+
+        Real bug caught here (Conformer-CTC POC, 2026-07-18): a model with no genuine n_tokens dimension
+        was converted with example_n_tokens=-1 (meant as an inert "never matches" sentinel) -- but -1 is
+        ALSO PyTorch's own reshape()/view() "infer this dimension" sentinel, so `d == self.example_n_tokens`
+        fired on every legitimate ATen -1 entry, replacing it with the string "n_tokens" and silently
+        defeating RESHAPE's own -1-inference logic (op_reshape's infer-branch never triggered since the
+        entry was no longer the literal -1 by the time it got there) -- corrupted the reshape into a
+        0-sized target and crashed deep inside ggml_reshape_2d's own nelements assertion, not at any
+        obviously-related call site. -1 is excluded here unconditionally: it must never be treated as a
+        substitutable literal regardless of what example_n_tokens is set to, since ATen itself reserves it."""
         reversed_shape = list(reversed(shape_list))
-        return [("n_tokens" if d == self.example_n_tokens else d) for d in reversed_shape]
+        return [("n_tokens" if (d == self.example_n_tokens and d != -1) else d) for d in reversed_shape]
 
     def convert(self, ep: torch.export.ExportedProgram, input_specs: dict) -> dict:
         node_symbol = {}  # fx node name -> loom topology symbol name
@@ -98,14 +129,107 @@ class Converter:
                 inp = _arg_ref(n.args[0], node_symbol)
                 weight = _arg_ref(n.args[1], node_symbol)
                 # ggml_mul_mat(A, B) convention: weight first (src/ops/primitives_basic.cpp:24-27).
-                nodes.append({"op": "MUL_MAT", "inputs": [weight, inp], "outputs": [out_symbol]})
                 if len(n.args) > 2 and n.args[2] is not None:
-                    raise NotImplementedError("bias not needed/handled by this POC's toy LLM")
+                    mm_symbol = out_symbol + "_mm"
+                    nodes.append({"op": "MUL_MAT", "inputs": [weight, inp], "outputs": [mm_symbol]})
+                    bias = _arg_ref(n.args[2], node_symbol)
+                    nodes.append({"op": "ADD", "inputs": [mm_symbol, bias], "outputs": [out_symbol]})
+                else:
+                    nodes.append({"op": "MUL_MAT", "inputs": [weight, inp], "outputs": [out_symbol]})
 
-            elif target in ("aten.view.default", "aten.reshape.default"):
+            elif target == "aten.view.default":
+                # .view() is ATen-guaranteed to never copy (raises instead if the input's strides don't
+                # support a pure reinterpretation) -- always already contiguous-compatible, matching
+                # ggml_reshape_*'s own hard requirement directly, no CONT needed.
                 inp = _arg_ref(n.args[0], node_symbol)
                 shape = self._shape_attr(list(n.args[1]))
                 nodes.append({"op": "RESHAPE", "inputs": [inp], "outputs": [out_symbol], "attrs": {"shape": shape}})
+
+            elif target == "aten.reshape.default":
+                # Unlike .view(), .reshape() is copy-capable -- it silently inserts a copy for
+                # non-contiguous input instead of raising (confirmed the hard way: a real
+                # permute().reshape() chain hit ggml_reshape_3d's GGML_ASSERT(ggml_is_contiguous(a)) at
+                # runtime, since no separate aten.contiguous.default node exists for reshape() to signal
+                # this the way it does for an explicit .permute().contiguous() call). Always emit an
+                # explicit CONT first to match reshape()'s real (copy-if-needed) semantics -- same
+                # unconditional-CONT-after-PERMUTE precedent convert_conformer_ctc.py's own hand-written
+                # topology already uses.
+                inp = _arg_ref(n.args[0], node_symbol)
+                cont_symbol = out_symbol + "_cont"
+                nodes.append({"op": "CONT", "inputs": [inp], "outputs": [cont_symbol]})
+                shape = self._shape_attr(list(n.args[1]))
+                nodes.append({"op": "RESHAPE", "inputs": [cont_symbol], "outputs": [out_symbol], "attrs": {"shape": shape}})
+
+            elif target in ("aten.squeeze.dim", "aten.unsqueeze.default"):
+                # No explicit target shape arg (unlike view/reshape) -- read the concrete shape torch.export
+                # itself already computed for this node (FakeTensor propagation), reversed into ggml's
+                # ne-order same as every other RESHAPE-family conversion. Same CONT-first treatment as
+                # aten.reshape.default and for the same real reason: squeeze/unsqueeze only ever touch a
+                # size-1 dim so ATen never needs to copy for them, but ggml_reshape_* still requires full
+                # contiguity regardless -- hit this for real when unsqueeze followed a PERMUTE output.
+                inp = _arg_ref(n.args[0], node_symbol)
+                cont_symbol = out_symbol + "_cont"
+                nodes.append({"op": "CONT", "inputs": [inp], "outputs": [cont_symbol]})
+                shape = list(reversed(list(n.meta["val"].shape)))
+                nodes.append({"op": "RESHAPE", "inputs": [cont_symbol], "outputs": [out_symbol], "attrs": {"shape": shape}})
+
+            elif target == "aten.permute.default":
+                inp = _arg_ref(n.args[0], node_symbol)
+                axes = self._permute_axes(list(n.args[1]))
+                nodes.append({"op": "PERMUTE", "inputs": [inp], "outputs": [out_symbol], "attrs": {"axes": axes}})
+
+            elif target == "aten.layer_norm.default":
+                # Variable-arity: torch.export omits trailing args that match the ATen schema's own
+                # defaults (weight=None, bias=None, eps=1e-05) -- confirmed empirically, not assumed, since
+                # this differs from aten.rms_norm.default's default (eps=None), which never gets omitted
+                # for this project's own eps values.
+                inp = _arg_ref(n.args[0], node_symbol)
+                weight = n.args[2] if len(n.args) > 2 else None
+                bias = n.args[3] if len(n.args) > 3 else None
+                eps = n.args[4] if len(n.args) > 4 else 1e-05
+                assert weight is None and bias is None, "this POC always keeps the affine as separate MUL/ADD"
+                nodes.append({"op": "LAYER_NORM", "inputs": [inp], "outputs": [out_symbol], "attrs": {"eps": float(eps)}})
+
+            elif target == "aten.glu.default":
+                inp = _arg_ref(n.args[0], node_symbol)
+                dim = n.args[1] if len(n.args) > 1 else -1
+                assert dim == 1, "loom's GLU primitive always splits on ne[1] (channels-first convention)"
+                nodes.append({"op": "GLU", "inputs": [inp], "outputs": [out_symbol]})
+
+            elif target == "aten.relu.default":
+                nodes.append({"op": "RELU", "inputs": [_arg_ref(n.args[0], node_symbol)], "outputs": [out_symbol]})
+
+            elif target in ("aten.conv1d.default", "aten.conv2d.default"):
+                is_2d = target == "aten.conv2d.default"
+                inp, weight = _arg_ref(n.args[0], node_symbol), _arg_ref(n.args[1], node_symbol)
+                bias = _arg_ref(n.args[2], node_symbol) if len(n.args) > 2 and n.args[2] is not None else None
+                stride = list(n.args[3]) if len(n.args) > 3 else ([1, 1] if is_2d else [1])
+                padding = list(n.args[4]) if len(n.args) > 4 else ([0, 0] if is_2d else [0])
+                dilation = list(n.args[5]) if len(n.args) > 5 else ([1, 1] if is_2d else [1])
+                groups = n.args[6] if len(n.args) > 6 else 1
+
+                conv_symbol = out_symbol + "_conv" if bias is not None else out_symbol
+                if is_2d:
+                    nodes.append({"op": "CONV_2D", "inputs": [weight, inp], "outputs": [conv_symbol], "attrs": {
+                        "s0": stride[0], "s1": stride[1], "p0": padding[0], "p1": padding[1],
+                        "d0": dilation[0], "d1": dilation[1]}})
+                    # CONV_2D output ne=[OW,OH,OC,N] -> bias broadcasts on ne[2] (matches
+                    # convert_conformer_ctc.py's broadcast_bias_reshape_2d, same reasoning: op_conv_2d's
+                    # final PERMUTE lands channels at ne[2], not ne[1] like CONV_1D).
+                    bias_shape = [1, 1, -1, 1]
+                else:
+                    op = "CONV_1D_DW" if groups != 1 else "CONV_1D"
+                    nodes.append({"op": op, "inputs": [weight, inp], "outputs": [conv_symbol], "attrs": {
+                        "s0": stride[0], "p0": padding[0], "d0": dilation[0]}})
+                    # CONV_1D output ne=[T,OC,N] -> bias broadcasts on ne[1] (matches broadcast_bias_reshape).
+                    bias_shape = [1, -1, 1]
+
+                if bias is not None:
+                    bias_reshaped = out_symbol + "_bias_r"
+                    channels = int(n.meta["val"].shape[1])  # channel axis is always torch-dim 1 (NCHW/NCL)
+                    shape = [c if c != -1 else channels for c in bias_shape]
+                    nodes.append({"op": "RESHAPE", "inputs": [bias], "outputs": [bias_reshaped], "attrs": {"shape": shape}})
+                    nodes.append({"op": "ADD", "inputs": [conv_symbol, bias_reshaped], "outputs": [out_symbol]})
 
             elif target == "loom.rope_neox.default":
                 x, positions, n_dims, freq_base, freq_scale = n.args
@@ -130,6 +254,12 @@ class Converter:
 
             elif target == "aten.silu.default":
                 nodes.append({"op": "SILU", "inputs": [_arg_ref(n.args[0], node_symbol)], "outputs": [out_symbol]})
+
+            elif target == "loom.rel_pos_attention.default":
+                q, k, v, p, pos_bias_u, pos_bias_v, mask, scale = n.args
+                nodes.append({"op": "REL_POS_ATTENTION",
+                              "inputs": [_arg_ref(x, node_symbol) for x in (q, k, v, p, pos_bias_u, pos_bias_v, mask)],
+                              "outputs": [out_symbol], "attrs": {"scale": float(scale)}})
 
             else:
                 raise NotImplementedError(f"no op-mapping registered for ATen target '{target}'")
