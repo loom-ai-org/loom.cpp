@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@600;800&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; background: oklch(96% 0.014 75); }
+  .weave-strand { transition: transform .25s ease; }
+</style>
+</helmet>
+
+<div style="max-width:1200px;width:100%;margin:0 auto;padding:64px 48px 96px;font-family:'IBM Plex Sans',sans-serif;color:oklch(28% 0.02 60);box-sizing:border-box;">
+
+  <div style="margin-bottom:56px;">
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;letter-spacing:0.14em;text-transform:uppercase;color:oklch(55% 0.03 60);margin-bottom:8px;">logo suite</div>
+    <div style="font-size:28px;font-weight:600;">loom.cpp</div>
+  </div>
+
+  <!-- Primary lockup -->
+  <div style="background:oklch(98% 0.01 75);border:1px solid oklch(88% 0.02 70);border-radius:4px;padding:72px 56px;display:flex;align-items:center;justify-content:center;gap:28px;margin-bottom:24px;">
+    {{ iconSvg }}
+    <div style="display:flex;flex-direction:column;justify-content:center;">
+      <div style="font-family:'JetBrains Mono',monospace;font-weight:800;font-size:56px;line-height:1;color:oklch(28% 0.03 55);letter-spacing:-0.01em;">
+        loom<span style="color:oklch(58% 0.14 35);">.</span><span style="color:oklch(52% 0.12 75);">cpp</span>
+      </div>
+      <div style="font-family:'IBM Plex Sans',sans-serif;font-size:14px;letter-spacing:0.08em;color:oklch(55% 0.03 60);margin-top:8px;text-transform:uppercase;">data-driven ggml engine</div>
+    </div>
+  </div>
+
+  <!-- Row: icon alone / stacked / monochrome / dark -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:24px;">
+
+    <div style="background:oklch(98% 0.01 75);border:1px solid oklch(88% 0.02 70);border-radius:4px;padding:32px;display:flex;flex-direction:column;align-items:center;gap:16px;">
+      <div style="transform:scale(0.9);">{{ iconSvg }}</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:oklch(55% 0.03 60);letter-spacing:0.1em;text-transform:uppercase;">icon mark</div>
+    </div>
+
+    <div style="background:oklch(98% 0.01 75);border:1px solid oklch(88% 0.02 70);border-radius:4px;padding:32px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;">
+      <div style="transform:scale(0.72);">{{ iconSvg }}</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-weight:800;font-size:24px;color:oklch(28% 0.03 55);">
+        loom<span style="color:oklch(58% 0.14 35);">.</span><span style="color:oklch(52% 0.12 75);">cpp</span>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:oklch(55% 0.03 60);letter-spacing:0.1em;text-transform:uppercase;">stacked</div>
+    </div>
+
+    <div style="background:oklch(98% 0.01 75);border:1px solid oklch(88% 0.02 70);border-radius:4px;padding:32px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;">
+      {{ iconMonoSvgLight }}
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:oklch(55% 0.03 60);letter-spacing:0.1em;text-transform:uppercase;">monochrome</div>
+    </div>
+
+    <div style="background:oklch(22% 0.02 60);border-radius:4px;padding:32px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;">
+      {{ iconMonoSvgDark }}
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:oklch(70% 0.02 70);letter-spacing:0.1em;text-transform:uppercase;">on dark</div>
+    </div>
+
+  </div>
+
+  <!-- README preview -->
+  <div style="margin-top:24px;background:oklch(22% 0.02 60);border-radius:4px;padding:48px 56px;display:flex;align-items:center;gap:20px;">
+    <div style="transform:scale(0.65);">{{ iconMonoSvgDark }}</div>
+    <div>
+      <div style="font-family:'JetBrains Mono',monospace;font-weight:800;font-size:38px;color:oklch(96% 0.01 70);">
+        loom<span style="color:oklch(68% 0.14 35);">.</span><span style="color:oklch(72% 0.12 75);">cpp</span>
+      </div>
+      <div style="font-family:'IBM Plex Sans',sans-serif;font-size:13px;color:oklch(72% 0.02 70);margin-top:6px;">data-driven ggml engine</div>
+    </div>
+  </div>
+
+  <div style="margin-top:16px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:oklch(58% 0.03 60);letter-spacing:0.06em;">github header / dark-mode readme</div>
+
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  weaveSvg(rust, ochre, indigo, cream, stroke) {
+    const s = React.createElement;
+    // symmetric vertical warp threads, evenly spaced
+    const vColors = [rust, ochre, indigo];
+    const strip = 15, gap = 8, start = 12;
+    const span = strip * 3 + gap * 2;
+    const pos = [start, start + strip + gap, start + 2 * (strip + gap)];
+    const kids = pos.map((x, c) =>
+      s('rect', { key: 'v'+c, x, y: start, width: strip, height: span, rx: 3, fill: vColors[c], stroke, strokeWidth: 1.25 })
+    );
+    return s('svg', { width: 84, height: 84, viewBox: '0 0 84 84', xmlns: 'http://www.w3.org/2000/svg' },
+      s('rect', { x: 2, y: 2, width: 80, height: 80, rx: 16, fill: cream, stroke, strokeWidth: 2 }),
+      ...kids
+    );
+  }
+  renderVals() {
+    const rust = 'oklch(58% 0.15 35)';
+    const ochre = 'oklch(70% 0.13 75)';
+    const indigo = 'oklch(45% 0.09 265)';
+    const cream = 'oklch(97% 0.012 75)';
+    const stroke = 'oklch(30% 0.02 60)';
+    const ink = 'oklch(30% 0.02 60)';
+    const white = 'oklch(99% 0 0)';
+    return {
+      iconSvg: this.weaveSvg(rust, ochre, indigo, cream, stroke),
+      iconMonoSvgLight: this.weaveSvg(ink, ink, ink, 'oklch(99% 0.005 75)', ink),
+      iconMonoSvgDark: this.weaveSvg(white, white, white, 'oklch(22% 0.02 60)', 'transparent')
+    };
+  }
+}
+
+</script>
+</body>
+</html>

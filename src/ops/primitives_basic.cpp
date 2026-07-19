@@ -202,6 +202,20 @@ Outputs op_layer_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     return {ggml_norm(pc.ctx, in[0], static_cast<float>(eps))};
 }
 
+Outputs op_group_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("GROUP_NORM", in, 1);
+    // ggml_group_norm groups over ne[2] ("channels") and reduces jointly over ne[0]*ne[1] ("spatial")
+    // within each channel-group (confirmed directly against ggml-cpu/ops.cpp's
+    // ggml_compute_forward_group_norm_f32) -- this project's own Layout A [T,C] convention (T=ne[0],
+    // C=ne[1]) must be RESHAPE'd to [T,1,C,1] before calling this and RESHAPE'd back afterward, same
+    // "reshape into the convention a native op expects" precedent as CONV_1D_DW's internal 4D reshape.
+    // Like RMS_NORM/LAYER_NORM, the learned per-channel affine (weight/bias) is left to separate
+    // MUL/ADD nodes rather than folded in here.
+    const int n_groups = static_cast<int>(resolve_attr_int(attrs, "n_groups", pc.symbols));
+    const double eps = resolve_attr_number(attrs, "eps", pc.symbols);
+    return {ggml_group_norm(pc.ctx, in[0], n_groups, static_cast<float>(eps))};
+}
+
 Outputs op_sigmoid(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SIGMOID", in, 1);
     return {ggml_sigmoid(pc.ctx, in[0])};
@@ -321,6 +335,34 @@ Outputs op_reshape(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     }
 }
 
+Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    // Wraps ggml_repeat_4d (broadcasts `a` up to an explicit target shape, no template tensor needed --
+    // unlike ggml's own 2-tensor ggml_repeat, which would force fabricating an otherwise-unused tensor
+    // just to carry a shape). Needed for StyleTTS2's diffusion-net Transformer1d: a single per-batch
+    // style vector [channels] must be broadcast to [channels, T] (T dynamic, a "$n_tokens"-style symbol)
+    // before CONCAT-ing with the per-position BERT context embedding -- CONCAT itself requires matching
+    // shape on every non-concat axis, so the broadcast has to happen as its own explicit step first.
+    // `shape`'s entries follow RESHAPE's own convention (string symbols evaluated via SymbolEnv, or
+    // plain numbers) but with NO -1 inference (repeat's target must always be fully explicit -- ggml
+    // itself requires each target dim to be an exact multiple of `a`'s own, checked by ggml_repeat_4d's
+    // own assertion).
+    expect_n_inputs("REPEAT", in, 1);
+    if (!attrs.contains("shape") || !attrs.at("shape").is_array()) {
+        throw SchemaError("REPEAT: 'shape' attribute must be an array");
+    }
+    const Json& shape_json = attrs.at("shape");
+    if (shape_json.size() < 1 || shape_json.size() > 4) {
+        throw SchemaError("REPEAT 'shape' attribute must have 1-4 entries, got " + std::to_string(shape_json.size()));
+    }
+    int64_t ne[4] = {1, 1, 1, 1};
+    for (size_t i = 0; i < shape_json.size(); ++i) {
+        const Json& v = shape_json[i];
+        ne[i] = v.is_string() ? static_cast<int64_t>(std::llround(pc.symbols.eval(v.get<std::string>())))
+                               : static_cast<int64_t>(std::llround(v.get<double>()));
+    }
+    return {ggml_repeat_4d(pc.ctx, in[0], ne[0], ne[1], ne[2], ne[3])};
+}
+
 Outputs op_view(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("VIEW", in, 1);
     const std::vector<int64_t> shape = resolve_attr_int_array(attrs, "shape", pc.symbols);
@@ -386,6 +428,7 @@ LOOM_REGISTER_OP(CLAMP, op_clamp)
 LOOM_REGISTER_OP(SWIGLU, op_swiglu)
 LOOM_REGISTER_OP(RMS_NORM, op_rms_norm)
 LOOM_REGISTER_OP(LAYER_NORM, op_layer_norm)
+LOOM_REGISTER_OP(GROUP_NORM, op_group_norm)
 LOOM_REGISTER_OP(SIGMOID, op_sigmoid)
 LOOM_REGISTER_OP(TANH, op_tanh)
 LOOM_REGISTER_OP(EXP, op_exp)
@@ -395,6 +438,7 @@ LOOM_REGISTER_OP(INTERPOLATE_1D, op_interpolate_1d)
 LOOM_REGISTER_OP(FLOOR, op_floor)
 LOOM_REGISTER_OP(GLU, op_glu)
 LOOM_REGISTER_OP(RESHAPE, op_reshape)
+LOOM_REGISTER_OP(REPEAT, op_repeat)
 LOOM_REGISTER_OP(VIEW, op_view)
 LOOM_REGISTER_OP(PERMUTE, op_permute)
 LOOM_REGISTER_OP(CONT, op_cont)
