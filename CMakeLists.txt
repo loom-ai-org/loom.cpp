@@ -23,6 +23,10 @@ add_library(loom_engine
     src/core/generation.cpp
     src/core/tdt_decoder.cpp
     src/core/vits_driver.cpp
+    src/core/whisper_driver.cpp
+    src/core/kokoro_driver.cpp
+    src/core/bilstm_stepper.cpp
+    src/core/duration_aligner.cpp
     src/core/ode_stepper.cpp
     src/core/vocab.cpp
     src/core/unicode.cpp

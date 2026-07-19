@@ -3,6 +3,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cmath>
+
 namespace loom {
 namespace {
 
@@ -67,6 +70,29 @@ Outputs op_log(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_log(pc.ctx, in[0])};
 }
 
+// ggml has no native atan2 (nor even single-arg atan) -- needed for Kokoro's Generator, which computes
+// the real phase of its harmonic-source STFT (torch.angle == atan2(imag,real)) as an auxiliary input to
+// noise_convs, a genuine trained-weight dependency with no reformulation that avoids the transcendental
+// function entirely (unlike RQ_SPLINE_INVERSE's gather-avoidance trick elsewhere in this file). Added via
+// ggml_map_custom2, the same "no native op, no viable composition" escape hatch ggml itself provides for
+// exactly this case -- CPU-only, but this whole engine is CPU-only today (see BACKLOG.md).
+void atan2_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, int ith, int nth, void*) {
+    const int64_t ne = ggml_nelements(dst);
+    const auto* pa = static_cast<const float*>(a->data);
+    const auto* pb = static_cast<const float*>(b->data);
+    auto* pd = static_cast<float*>(dst->data);
+    const int64_t per_thread = (ne + nth - 1) / nth;
+    const int64_t start = std::min(static_cast<int64_t>(ith) * per_thread, ne);
+    const int64_t end = std::min(start + per_thread, ne);
+    for (int64_t i = start; i < end; ++i) pd[i] = std::atan2(pa[i], pb[i]);
+}
+
+Outputs op_atan2(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // atan2(y=in[0], x=in[1]) -- same argument order as std::atan2/torch.atan2 (y first).
+    expect_n_inputs("ATAN2", in, 2);
+    return {ggml_map_custom2(pc.ctx, in[0], in[1], atan2_custom_op, GGML_N_TASKS_MAX, nullptr)};
+}
+
 Outputs op_sum_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SUM_ROWS", in, 1);
     // Sums along ne[0] ("rows" in ggml's terms): input [a,b,c,d] -> output [1,b,c,d]. Callers that need a
@@ -97,6 +123,17 @@ Outputs op_leaky_relu(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     expect_n_inputs("LEAKY_RELU", in, 1);
     const double slope = resolve_attr_number(attrs, "slope", pc.symbols);
     return {ggml_leaky_relu(pc.ctx, in[0], static_cast<float>(slope), /*inplace=*/false)};
+}
+
+Outputs op_concat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    // Real in-graph channel concatenation (ggml_concat is 2-input; chain multiple CONCAT nodes for 3+
+    // tensors, e.g. Kokoro's Decoder torch.cat([asr, F0, N], axis=1)). "dim" is a plain ggml `ne[]` axis
+    // index (0 = fastest), NOT a PyTorch axis -- e.g. this project's [T,C] convention (T=ne[0], C=ne[1])
+    // wants "dim": 1 to concatenate along channels, matching torch.cat(..., axis=1) on a (C,T)-native
+    // tensor once the ggml<->numpy axis-reversal convention is accounted for.
+    expect_n_inputs("CONCAT", in, 2);
+    const int dim = static_cast<int>(resolve_attr_int(attrs, "dim", pc.symbols));
+    return {ggml_concat(pc.ctx, in[0], in[1], dim)};
 }
 
 Outputs op_step(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -173,6 +210,54 @@ Outputs op_sigmoid(PrimitiveContext& pc, const Inputs& in, const Json&) {
 Outputs op_tanh(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("TANH", in, 1);
     return {ggml_tanh(pc.ctx, in[0])};
+}
+
+// 1D resize along ne[0] only (ne[1..3] held fixed at the input's own size) -- added for Kokoro TTS's
+// several 1D up/downsample spots (SineGen's phase pre/post-filtering, UpSample1d's 2x nearest upsample,
+// the F0 curve's huge nearest upsample to full waveform rate). Wraps ggml's own native
+// ggml_interpolate(...) directly rather than hand-composing (same "use ggml's op when one exists"
+// principle as ggml_clamp/ggml_leaky_relu/POOL_1D elsewhere in this project).
+//
+// "linear" maps to GGML_SCALE_MODE_BILINEAR, NOT a dedicated 1D-linear ggml mode (none exists) -- but
+// with ne[1] held at the input's own value, ggml_compute_forward_interpolate's bilinear branch
+// (ops.cpp) degenerates to an EXACT 1D linear interpolation: its own `dy` blend factor is always
+// exactly 0 whenever sf1==1.0 (ne1==ne01), so the ne[1]-axis contributes nothing and only the ne[0]-axis
+// formula (half-pixel-center, matching PyTorch's own F.interpolate(mode='linear', align_corners=False)
+// convention) applies -- confirmed by reading ops.cpp's actual computation directly, then verified
+// numerically against real torch.nn.functional.interpolate (see test_interpolate_1d).
+Outputs op_interpolate_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("INTERPOLATE_1D", in, 1);
+    const int64_t ne0 = resolve_attr_int(attrs, "ne0", pc.symbols);
+    const std::string mode = attrs.value("mode", "nearest");
+    ggml_scale_mode scale_mode;
+    if (mode == "nearest") scale_mode = GGML_SCALE_MODE_NEAREST;
+    else if (mode == "linear") scale_mode = GGML_SCALE_MODE_BILINEAR;
+    else throw SchemaError("INTERPOLATE_1D: unsupported 'mode' \"" + mode + "\" (expected \"nearest\" or \"linear\")");
+    ggml_tensor* a = in[0];
+    return {ggml_interpolate(pc.ctx, a, ne0, a->ne[1], a->ne[2], a->ne[3], static_cast<uint32_t>(scale_mode))};
+}
+
+Outputs op_exp(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // Needed for Kokoro Generator's final spec/phase split (`spec = exp(x[:n_freq])`).
+    expect_n_inputs("EXP", in, 1);
+    return {ggml_exp(pc.ctx, in[0])};
+}
+
+Outputs op_sin(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("SIN", in, 1);
+    return {ggml_sin(pc.ctx, in[0])};
+}
+
+Outputs op_cos(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("COS", in, 1);
+    return {ggml_cos(pc.ctx, in[0])};
+}
+
+Outputs op_floor(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // Needed for Kokoro's SineGen (`(f0/sampling_rate) % 1`, expressed as `x - floor(x)` since ggml has
+    // no native modulo op and every operand here is non-negative, so this is an exact match to `%`).
+    expect_n_inputs("FLOOR", in, 1);
+    return {ggml_floor(pc.ctx, in[0])};
 }
 
 Outputs op_glu(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -286,12 +371,14 @@ LOOM_REGISTER_OP(SCALE, op_scale)
 LOOM_REGISTER_OP(SQR, op_sqr)
 LOOM_REGISTER_OP(SQRT, op_sqrt)
 LOOM_REGISTER_OP(LOG, op_log)
+LOOM_REGISTER_OP(ATAN2, op_atan2)
 LOOM_REGISTER_OP(SUM_ROWS, op_sum_rows)
 LOOM_REGISTER_OP(PAD_1D, op_pad_1d)
 LOOM_REGISTER_OP(SILU, op_silu)
 LOOM_REGISTER_OP(RELU, op_relu)
 LOOM_REGISTER_OP(LEAKY_RELU, op_leaky_relu)
 LOOM_REGISTER_OP(STEP, op_step)
+LOOM_REGISTER_OP(CONCAT, op_concat)
 LOOM_REGISTER_OP(CUMSUM, op_cumsum)
 LOOM_REGISTER_OP(SOFTMAX, op_softmax)
 LOOM_REGISTER_OP(SOFTPLUS, op_softplus)
@@ -301,6 +388,11 @@ LOOM_REGISTER_OP(RMS_NORM, op_rms_norm)
 LOOM_REGISTER_OP(LAYER_NORM, op_layer_norm)
 LOOM_REGISTER_OP(SIGMOID, op_sigmoid)
 LOOM_REGISTER_OP(TANH, op_tanh)
+LOOM_REGISTER_OP(EXP, op_exp)
+LOOM_REGISTER_OP(SIN, op_sin)
+LOOM_REGISTER_OP(COS, op_cos)
+LOOM_REGISTER_OP(INTERPOLATE_1D, op_interpolate_1d)
+LOOM_REGISTER_OP(FLOOR, op_floor)
 LOOM_REGISTER_OP(GLU, op_glu)
 LOOM_REGISTER_OP(RESHAPE, op_reshape)
 LOOM_REGISTER_OP(VIEW, op_view)

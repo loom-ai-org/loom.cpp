@@ -35,9 +35,7 @@ TdtDecoder::TdtDecoder(GgufModel& model, std::vector<GraphTopology> lstm_h_topos
     if (cfg_.blank_id < 0) {
         throw Error("TdtDecoder: blank_id must be set (non-negative)");
     }
-    if (cfg_.durations.empty()) {
-        throw Error("TdtDecoder: durations must be non-empty");
-    }
+    // durations may be EMPTY: that's plain RNN-T mode (see TdtDecoderConfig's own comment), not an error.
     if (num_layers_ == 0 || lstm_c_topos_.size() != num_layers_) {
         throw Error("TdtDecoder: lstm_h_topos and lstm_c_topos must be the same non-zero size");
     }
@@ -116,8 +114,15 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
             ggml_backend_tensor_get(j_res.output, combined.data(), 0, combined.size() * sizeof(float));
 
             const int32_t k = argmax(combined.data(), n_token_classes);
-            const uint32_t d_idx = static_cast<uint32_t>(argmax(combined.data() + n_token_classes, n_durations));
-            uint32_t skip = cfg_.durations[d_idx];
+            // Plain RNN-T (n_durations==0): no duration head at all -- every blank advances exactly one
+            // frame (standard RNN-T greedy decoding), never a predicted duration. Guarded explicitly
+            // rather than falling through to the TDT duration-argmax path below, which would read past
+            // `combined`'s own end (n_durations==0) and index an empty `cfg_.durations`.
+            uint32_t skip = 1;
+            if (n_durations > 0) {
+                const uint32_t d_idx = static_cast<uint32_t>(argmax(combined.data() + n_token_classes, n_durations));
+                skip = cfg_.durations[d_idx];
+            }
 
             if (k != cfg_.blank_id) {
                 result.tokens.push_back(k);
@@ -125,6 +130,7 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
                 h = h_new;
                 c = c_new;
                 last_label = k;
+                if (n_durations == 0) skip = 0; // plain RNN-T: stay on this frame after a non-blank emission
             } else if (skip == 0) {
                 skip = 1; // blank is forced to advance at least one frame -- otherwise decoding could spin forever
             }
