@@ -3666,3 +3666,207 @@ See [[loom_engine_procedural_generalization_roadmap]] memory (already tracked LO
 as the user's own Lua-embedding design, previously deferred until model-porting finished — that
 "finished" condition is now considered satisfied enough to start, six of seven models done, per this
 explicit pivot).
+
+## 2026-07-19: LuaJIT embedded + procedural-generalization architecture proven against WhisperDriver
+
+C++-side half of the pivot landed (the Python MIL compiler in `LOOM_MIL_CONVERSION.md` remains
+deliberately out of scope, deferred until this runtime side was proven). User chose LuaJIT (not PUC-Rio
+Lua 5.4, despite the non-CMake build risk) and `WhisperDriver` as the port target specifically because
+its autoregressive while-loop + persistent `KvCache` + argmax sampling is the hardest case this
+architecture needs to solve, not the easy "just chain some subgraphs" case.
+
+**LuaJIT vendoring** (`cmake/Dependencies.cmake`): `FetchContent_Populate` (source only -- LuaJIT has no
+upstream CMakeLists) + a custom command driving LuaJIT's own `Makefile` (`BUILDMODE=static
+XCFLAGS=-fPIC`), wrapped as an `IMPORTED STATIC` target `luajit::luajit`. Two real build snags found and
+fixed by actually running the build rather than assuming: (1) the primary GitHub-clone approach worked
+cleanly on the first try (confirmed by manually cloning+building outside CMake before writing any glue,
+per the plan's own risk-first ordering) -- the documented `LOOM_USE_SYSTEM_LUAJIT` fallback was never
+needed; (2) the static lib link failed against `libloom_engine.so` with `relocation R_X86_64_TPOFF32 ...
+can not be used when making a shared object` until `XCFLAGS=-fPIC` was added to the `make` invocation --
+LuaJIT's own default build isn't position-independent, and `loom_engine` is a shared library.
+
+**`LoomLuaBridge`** (`include/loom/core/lua_bridge.h`/`src/core/lua_bridge.cpp`): owns one `lua_State*` +
+a name→module registry (`GgufModel&`/`GraphTopology`/optional `KvCache*`, non-owning references, same
+convention as `GraphBuilder` itself). Bindings: `loom.run_subgraph(module_name, n_tokens, n_past,
+inputs_table)` (dispatches F32/I32 marshalling by inspecting the REAL declared input tensor's own
+`->type` after `build()` -- no per-input type annotation needed in Lua, the topology is the single
+source of truth; returns the flat output array PLUS its ggml shape `[ne0,ne1,ne2,ne3]` as a second
+return value, added specifically so a driver script can read `n_vocab` off logits output without
+hardcoding it), `loom.range`, `loom.causal_mask` (ported verbatim from `WhisperDriver::
+fill_decoder_inputs`'s own formula), `loom.zero_mask`, `loom.argmax_row` (ported from `WhisperDriver::
+argmax`, row-index parameterized so a script can select "last prompt token" during prefill vs "the only
+row" during incremental decode, matching `transcribe()`'s own two call sites). A `Value =
+std::variant<double, std::vector<double>>` covers everything a driver script's `call()` args/return need
+(one deliberate simplification from the approved plan's own `double/vector<float>/vector<int32_t>/
+string` sketch -- Lua 5.1/LuaJIT has exactly one numeric type, a double, so a separate float/int
+distinction added nothing; the string case was never needed by Whisper's own script and was dropped).
+
+**A real, load-bearing correctness discipline, not just an implementation detail**: LuaJIT (like PUC Lua
+5.1, whose C API it implements) reports its own internal errors via `longjmp`, which does NOT run C++
+destructors -- letting a C++ exception unwind through a `lua_CFunction` reached via `lua_pcall` is
+undefined behavior on this build (LuaJIT's default, non-"external unwind" configuration). Every binding
+trampoline in `lua_bridge.cpp` therefore wraps its entire body in try/catch and converts any
+`loom::Error`/`std::exception` into `luaL_error(...)` -- itself Lua's own longjmp-based error path, which
+`lua_pcall` at the call site safely catches. Never remove this when adding new bindings.
+
+**`tools/convert_whisper/whisper_driver.lua`**: a direct line-for-line port of `WhisperDriver::
+transcribe()` (encoder pass, then prefill via one `run_subgraph` call, then a `while` loop doing
+incremental decode steps, checking `eot_token`). Embedded into the EXISTING `whisper_decoder.gguf` via
+one added `w.add_string("model.driver_script", ...)` call in `convert_whisper_decoder.py` -- confirmed
+during planning (and now confirmed working) that this needed ZERO `GgufModel`/GGUF-reading engine
+changes at all, since `GgufModel::kv_str(full_key)` was already a fully generic string-KV accessor
+(`include/loom/core/gguf_model.h`). The Task 1 "namespaced multiple topologies in one GGUF file" idea
+from `LOOM_PROCEDURAL_GENERALIZATION.md` was NOT needed either -- Whisper's existing two-separate-GGUF-
+files convention (encoder/decoder) was reused as-is, with the bridge just registering each as its own
+named module.
+
+**Validation, `tests/test_e2e_whisper_lua_driver.cpp`**: runs the SAME real `tiny.en` Whisper checkpoint's
+`transcribe()` through both the existing hand-written `loom::WhisperDriver` (C++ control flow) and the
+new `LoomLuaBridge`-driven `whisper_driver.lua`, on identical inputs, and asserts an EXACT generated-
+token-sequence match (both are deterministic greedy argmax decoding, so no floating-point tolerance
+question). **Matched exactly on the FIRST real run**: `[357, 7050, 2491, 8, 50256]` from both paths. Also
+added `tests/test_lua_bridge.cpp`, a fast dependency-free unit test of the four host-math bindings in
+isolation (hand-computed expected values, same discipline as `test_primitive_registry.cpp`) -- also
+passed on the first run. 98/98 tests passing project-wide.
+
+**What's proven, and what's explicitly still deferred**: this proves the RUNTIME mechanism end-to-end on
+the hardest existing case (autoregressive loop + persistent KV-cache state threaded through Lua-driven
+control flow, exactly matching bit-for-bit what hand-written C++ already did). Still deferred, per the
+approved plan: the Python MIL compiler (`LOOM_MIL_CONVERSION.md` in full -- `whisper_driver.lua` was
+HAND-written, not machine-transpiled from a real PyTorch model via `coremltools`), packing multiple named
+topologies into one GGUF file, porting any of the other five drivers (VITS/Kokoro/StyleTTS2/
+SupertonicTTS/Matcha-TTS) to Lua, and removing/deprecating `WhisperDriver` itself (it stays as both the
+correctness oracle this path is checked against and a fallback). F5-TTS also remains deferred from the
+earlier pivot.
+
+## 2026-07-19: Whisper's encoder + decoder packed into ONE GGUF file (named multi-topology `GgufModel`)
+
+Immediate user follow-up to the LuaJIT milestone above: "all modules... added to the same gguf file" is
+the actual end-state `LOOM_PROCEDURAL_GENERALIZATION.md`/`LOOM_MIL_CONVERSION.md` are aiming for (one
+GGUF = one deployable model artifact), so the deferred "multiple namespaced topologies in one GGUF file"
+part of Task 1 was picked back up rather than left parked.
+
+**`GgufModel` extended, additively** (`include/loom/core/gguf_model.h`/`src/core/gguf_model.cpp`):
+`load()` used to hard-require exactly one bare `model.graph_topology` string KV; it now scans every KV
+(reusing `hparam_env()`'s own "loop `gguf_get_n_kv`/`gguf_get_key`, check a prefix" pattern) for the bare
+key (stored under `""`) AND any `model.graph_topology.<name>` keys (stored under `"<name>"`), throwing
+the SAME `LoadError` as before only if NEITHER is found. `topology_json()` (no args) is completely
+unchanged in behavior -- confirmed via `grep` to be called at **60+ sites** across nearly every test in
+the project, so this had to be strictly backward compatible, not just "probably fine." New
+`topology_json(name)`/`has_topology(name)` overloads. Directly unit-tested by extending the existing
+minimal-fixture test (`tests/fixtures/make_minimal_gguf.py` + `tests/test_gguf_model_load.cpp`) with a
+second, named topology KV alongside the bare one.
+
+**Real fact confirmed before merging any weights** (not assumed): Whisper's real checkpoint already
+names its encoder/decoder weights with the real PyTorch module's own hierarchical prefixes
+(`encoder.blocks.{i}...`, `decoder.blocks.{i}...`, `decoder.token_embedding...`, `mel.*`) -- zero
+collisions merging both weight dicts into one flat GGUF tensor namespace. This generalizes: every
+converter in this whole project already mirrors the real checkpoint's own module names, so no
+collision-avoidance machinery (auto-namespacing, prefix enforcement) was added -- would only be worth
+building if a future model actually collides.
+
+**New `tools/convert_whisper/convert_whisper_all.py`**: reuses `build_encoder`/`build_decoder`
+UNCHANGED (imported from the existing per-module scripts, mirroring the `convert_X_all.py`-assembles-
+already-validated-pieces precedent from Kokoro/SupertonicTTS), builds each into its own `TopologyBuilder`,
+merges the weight dicts, and writes ONE `whisper.gguf` with `model.graph_topology.encoder`,
+`model.graph_topology.decoder`, `model.driver_script` (moved here from the old
+`convert_whisper_decoder.py` writer -- the script orchestrates BOTH modules, so it belongs on the
+combined file, not tucked inside just one half), and every merged tensor. The OLD two-separate-file
+scripts (`convert_whisper_encoder.py`/`convert_whisper_decoder.py`) are UNCHANGED (`model.driver_script`
+just removed from the decoder writer) and still back the per-module isolation reference tests
+(`test_e2e_whisper_{encoder,decoder}_reference.cpp`), which don't need the combined file at all.
+
+**`test_e2e_whisper_driver.cpp`/`test_e2e_whisper_lua_driver.cpp`** updated to load ONE `GgufModel` from
+`whisper.gguf` and read `topology_json("encoder")`/`topology_json("decoder")` off it -- neither
+`WhisperDriver`'s constructor nor `LoomLuaBridge::register_module` needed ANY signature change, since
+both already accepted independent `GgufModel&`/topology pairs; both call sites just pass the SAME loaded
+model twice now. Re-verified end-to-end: identical `[357, 7050, 2491, 8, 50256]` token sequence from both
+the C++ and Lua paths against the new single-file `whisper.gguf`, exactly as before the consolidation.
+98/98 tests passing project-wide (including the untouched per-module reference tests, confirming the
+`convert_whisper_decoder.py` edit didn't regress them).
+
+**Still explicitly out of scope**: retrofitting VITS/Kokoro/StyleTTS2/SupertonicTTS/Matcha-TTS to the
+same one-GGUF-file convention (five more conversion-script consolidations, real future work, not
+attempted here) and the Python MIL compiler.
+
+## 2026-07-20: SupertonicTTS + Matcha-TTS + VITS retrofitted to embedded Lua + one-GGUF-file (Kokoro/StyleTTS2 still deferred)
+
+Direct follow-up to the two entries above: "implement the retrofit of the other models' drivers to
+embedded lua to the one-file gguf." Re-read every driver's real header/impl before committing to scope
+(not from memory) — confirmed a real ~5x complexity spread across the five remaining drivers (see the
+approved plan for the full breakdown) and did the three tractable ones with full verification rigor
+(SupertonicTTS → Matcha-TTS → VITS, ascending complexity), leaving Kokoro/StyleTTS2 (StyleTTS2 alone owns
+~20 separate `GgufModel`/`GraphTopology` pairs plus the ADPM2 diffusion sampler's own 2-network-
+evaluation-per-step math) as an explicitly-scoped next pass rather than rushing an under-tested
+consolidation.
+
+**`LoomLuaBridge` grew five new bindings**, all thin wrappers around already-existing, already-verified
+host C++ (no new algorithms):
+- `loom.seed_rng(seed)`/`loom.gaussian_array(n)` — a `std::mt19937`+`std::normal_distribution<float>(0,1)`
+  owned by the bridge itself, persisting across calls within one script invocation (same "persistent
+  state" shape as a registered `KvCache`). Using the EXACT SAME engine/distribution shape every
+  hand-written driver's own RNG already uses is what kept exact-match testing possible.
+- `loom.expand_by_duration(rows_flat,T,C,durations)` — wraps `loom::expand_by_duration`
+  (`duration_aligner.h`), already proven by Matcha-TTS's own C++ driver.
+- `loom.pad_crop_relative_embeddings(raw,window_size,k_channels,length)` — wraps VITS's own
+  `pad_crop_relative_embeddings`, MOVED out of `vits_driver.cpp` into a new shared
+  `include/loom/core/relative_position.h` (SupertonicTTS's own `MultiHeadRelativeAttention` uses the same
+  Shaw-et-al. mechanism and may want this too).
+- `loom.get_weight(module_name, weight_name)` — a genuinely NEW capability not anticipated in the
+  approved plan's own binding list, discovered while actually writing VITS's Lua script: the real driver
+  reads its relative-position tables directly off the GGUF weight table (`GgufModel::weight()`), not
+  through any topology's declared inputs/outputs — `loom.run_subgraph` alone couldn't express that, so a
+  direct raw-weight-introspection binding was added.
+
+All four covered by `tests/test_lua_bridge.cpp`'s own hand-computed-expectation unit tests (including
+cross-checking `loom.gaussian_array` against an INDEPENDENT `std::mt19937`/`std::normal_distribution`
+instance constructed directly in the test, not hand-transcribed magic numbers) before use in any real
+model, same discipline as every primitive this whole project has added.
+
+**A real, useful discovery while merging weights into one file**: Matcha-TTS's own `mu`/`logw`
+topologies (and VITS's own `stats`/`logw`) each independently rebuild their shared TextEncoder from
+scratch in separate `TopologyBuilder`s (an established precedent from when they were separate files —
+`GraphTopology` supports only one declared output each). Naively merging their weight dicts hits a
+same-name pseudo-"collision" for every duplicated TextEncoder weight — NOT a real bug (same underlying
+checkpoint tensor, redundantly registered twice with byte-identical values). Both `convert_matcha_lua_all.py`
+and `convert_vits_lua_all.py`'s own `merge()` helper is content-aware: identical-name+identical-value is a
+silent dedup, identical-name+DIFFERENT-value is a hard `assert` failure — confirmed the real files hit
+only the harmless case (VITS: 469 tensors across 3 files → 358 after dedup, exactly matching hand
+arithmetic; Matcha-TTS: 577 tensors across 4 files → 466 after dedup).
+
+Each model's own new `<model>_driver.lua` is a direct line-for-line translation of its existing C++
+driver's `synthesize()`, reusing the SAME "two Euler-ODE-loop drivers, one relative-position-table
+driver" complexity gradient identified in the plan:
+- **SupertonicTTS** (`tools/convert_supertonic/convert_supertonic_lua_all.py`/`supertonic_driver.lua`):
+  merges only the FOUR topologies the driver actually uses (`dp`/`ttl_text`/`vfe`/`decoder` — the two
+  style-encoder topologies are never called by `synthesize()`, matching the existing "precomputed style
+  embeddings" scope decision, so they're correctly excluded from the merge). Euler loop is a trivial
+  `for step=0,n_steps-1 do local v = loom.run_subgraph("vfe",...); z[i]=z[i]+v[i]*dt end`. Matched the
+  real C++ driver to **1.4e-6** on the first real run (real checkpoint, F1 voice style).
+- **Matcha-TTS** (`tools/convert_matcha/convert_matcha_lua_all.py`/`matcha_driver.lua`): real per-token
+  duration expansion via `loom.expand_by_duration` — TextEncoder's own channel-first `mu_x` output flat
+  layout turned out to ALREADY be `expand_by_duration`'s own expected "T rows of C contiguous floats"
+  convention with zero transformation needed (channel-first `[C,T]`'s own flat index `c+t*C` IS row-major
+  T-slow/C-fast), though the EXPANDED result then needs an explicit Lua-side transpose into the Decoder's
+  own `[T,C]` (T-fastest) input convention — same "know which convention you're in" discipline the
+  `[T,C]`-vs-`[C,T]` debugging lesson from the original Matcha-TTS port established. Matched to **2.7e-6**
+  on the first real run.
+- **VITS** (`tools/convert_piper_vits/convert_vits_lua_all.py`/`vits_driver.lua`): the hardest of the
+  three — `loom.get_weight`+`loom.pad_crop_relative_embeddings` called per text-encoder layer (6 layers ×
+  2 tables), PLUS Gaussian-noise-interleaved duration expansion (`z_p` construction combines `stats`'s
+  own `m_p`/`logs_p` with a per-frame-per-channel noise draw and an `exp()`-scaled affine, not a plain
+  row-repeat). Verified the RNG DRAW ORDER concern explicitly before trusting it: `loom.gaussian_array`
+  bulk-drawing `y_length*inter_channels` values upfront, then indexing sequentially in the exact same
+  (frame-major, channel-minor) nested-loop order the C++ driver's own INTERLEAVED per-element
+  `normal(rng)` calls use, produces the IDENTICAL sequence (a `std::normal_distribution`'s only state is
+  the engine + its own internal cache, both advanced identically either way) — reasoned through before
+  writing the code, not discovered by trial and error. Matched the real T=62-token piper checkpoint
+  (`en-GB miro`) to **5.8e-7** on the first real run — the hardest port of the three, correct on the
+  first try.
+
+101/101 tests passing project-wide. **Kokoro and StyleTTS2 remain the explicitly deferred next pass**
+(their own real complexity: StyleTTS2 alone owns on the order of twenty separate GGUF files/topologies
+and the ADPM2 diffusion sampler's own per-step math needs careful decomposition into Lua-callable pieces
+— re-confirmed `BiLstmStepper` itself needs NO new binding, since it already ports directly to a Lua loop
+calling the existing `loom.run_subgraph` four times per timestep per direction). The Python MIL compiler
+remains deferred from the original pivot.

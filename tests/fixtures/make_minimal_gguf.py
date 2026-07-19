@@ -15,6 +15,9 @@ from gguf import GGUFWriter
 
 # Kept in sync with the C++ test's expectation of the raw topology string (tests/test_gguf_model_load.cpp).
 TOPOLOGY_JSON = '{"version": 1, "nodes": []}'
+# A second, NAMED topology alongside the bare one -- exercises GgufModel's multi-topology support
+# (LOOM_PROCEDURAL_GENERALIZATION.md) in the SAME file as the ordinary single-topology case.
+OTHER_TOPOLOGY_JSON = '{"version": 1, "nodes": [], "note": "other"}'
 
 
 def main() -> None:
@@ -26,6 +29,7 @@ def main() -> None:
     w.add_uint32("loom.n_layer", 2)
     w.add_float32("loom.scale", 0.5)
     w.add_string("model.graph_topology", TOPOLOGY_JSON)
+    w.add_string("model.graph_topology.other", OTHER_TOPOLOGY_JSON)
 
     # Array/bool KVs, purely to exercise GgufModel's generic kv_*/kv_arr_*() accessors (added for the
     # tokenizer.ggml.* vocab schema) -- not otherwise meaningful test data.

@@ -57,17 +57,55 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, ggml_backend
         model->symbols_[name] = t;
     }
 
-    const int64_t topo_kv = gguf_find_key(model->gguf_ctx_.get(), "model.graph_topology");
-    if (topo_kv < 0) {
-        throw LoadError("GgufModel::load: '" + path + "' is missing the required 'model.graph_topology' KV");
+    // Scans every KV for the bare "model.graph_topology" key (stored under "") and any
+    // "model.graph_topology.<name>" keys (stored under "<name>") -- same "loop gguf_get_n_kv/
+    // gguf_get_key, check a prefix" pattern as hparam_env() below. Supports both the single-topology
+    // convention every model before Whisper's own multi-topology GGUF uses, and the new named-topology
+    // convention (LOOM_PROCEDURAL_GENERALIZATION.md) in the SAME file.
+    static const std::string kBareKey = "model.graph_topology";
+    static const std::string kNamedPrefix = "model.graph_topology.";
+    const int64_t n_kv = gguf_get_n_kv(model->gguf_ctx_.get());
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const std::string key(gguf_get_key(model->gguf_ctx_.get(), i));
+        std::string dest_name;
+        if (key == kBareKey) {
+            dest_name = "";
+        } else if (key.rfind(kNamedPrefix, 0) == 0) {
+            dest_name = key.substr(kNamedPrefix.size());
+        } else {
+            continue;
+        }
+        if (gguf_get_kv_type(model->gguf_ctx_.get(), i) != GGUF_TYPE_STRING) {
+            throw LoadError("GgufModel::load: '" + key + "' KV in '" + path + "' is not a string");
+        }
+        model->topologies_[dest_name] = gguf_get_val_str(model->gguf_ctx_.get(), i);
     }
-    if (gguf_get_kv_type(model->gguf_ctx_.get(), topo_kv) != GGUF_TYPE_STRING) {
-        throw LoadError("GgufModel::load: 'model.graph_topology' KV in '" + path + "' is not a string");
+    if (model->topologies_.empty()) {
+        throw LoadError("GgufModel::load: '" + path + "' is missing the required 'model.graph_topology' "
+                         "(or any 'model.graph_topology.<name>') KV");
     }
-    model->topology_json_ = gguf_get_val_str(model->gguf_ctx_.get(), topo_kv);
 
     return model;
 }
+
+const std::string& GgufModel::topology_json() const {
+    auto it = topologies_.find("");
+    if (it == topologies_.end()) {
+        throw LoadError("GgufModel::topology_json: this file has no bare 'model.graph_topology' KV (it may "
+                         "be a multi-topology file -- use topology_json(name) instead)");
+    }
+    return it->second;
+}
+
+const std::string& GgufModel::topology_json(const std::string& name) const {
+    auto it = topologies_.find(name);
+    if (it == topologies_.end()) {
+        throw LoadError("GgufModel::topology_json: no 'model.graph_topology." + name + "' KV in this file");
+    }
+    return it->second;
+}
+
+bool GgufModel::has_topology(const std::string& name) const { return topologies_.find(name) != topologies_.end(); }
 
 ggml_tensor* GgufModel::weight(const std::string& name) const {
     auto it = symbols_.find(name);
