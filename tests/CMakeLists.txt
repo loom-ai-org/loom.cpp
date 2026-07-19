@@ -795,3 +795,47 @@ add_executable(test_e2e_matcha_driver test_e2e_matcha_driver.cpp)
 target_link_libraries(test_e2e_matcha_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_driver COMMAND test_e2e_matcha_driver)
 set_tests_properties(test_e2e_matcha_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: LoomLuaBridge's host-math bindings (loom.range/causal_mask/zero_mask/
+#     argmax_row) and load_script()/call() plumbing, in isolation (no GGUF needed). See
+#     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
+add_executable(test_lua_bridge test_lua_bridge.cpp)
+target_link_libraries(test_lua_bridge PRIVATE loom::engine)
+add_test(NAME test_lua_bridge COMMAND test_lua_bridge)
+
+# --- Procedural generalization validation: runs the real Whisper checkpoint's transcribe() through BOTH
+#     the existing hand-written loom::WhisperDriver AND a LoomLuaBridge running the hand-ported
+#     tools/convert_whisper/whisper_driver.lua, asserting an EXACT generated-token-sequence match. See
+#     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
+add_executable(test_e2e_whisper_lua_driver test_e2e_whisper_lua_driver.cpp)
+target_link_libraries(test_e2e_whisper_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_whisper_lua_driver COMMAND test_e2e_whisper_lua_driver)
+set_tests_properties(test_e2e_whisper_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: SupertonicTTS's deterministic Euler-ODE (CFM) sampling loop, ported to
+#     Lua (tools/convert_supertonic/supertonic_driver.lua) and compared against the existing
+#     loom::SupertonicDriver on the real checkpoint. See LOOM_PROCEDURAL_GENERALIZATION.md /
+#     LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
+add_executable(test_e2e_supertonic_lua_driver test_e2e_supertonic_lua_driver.cpp)
+target_link_libraries(test_e2e_supertonic_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_lua_driver COMMAND test_e2e_supertonic_lua_driver)
+set_tests_properties(test_e2e_supertonic_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: Matcha-TTS's deterministic Euler-ODE (CFM) sampling loop + real
+#     per-token duration expansion, ported to Lua (tools/convert_matcha/matcha_driver.lua) and compared
+#     against the existing loom::MatchaDriver on the real checkpoint. See
+#     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
+add_executable(test_e2e_matcha_lua_driver test_e2e_matcha_lua_driver.cpp)
+target_link_libraries(test_e2e_matcha_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_lua_driver COMMAND test_e2e_matcha_lua_driver)
+set_tests_properties(test_e2e_matcha_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: VITS's dynamic-length relative-position table cropping (loom.get_weight
+#     + loom.pad_crop_relative_embeddings) + Gaussian-noise-interleaved duration expansion, ported to Lua
+#     (tools/convert_piper_vits/vits_driver.lua) and compared against the existing loom::VitsDriver on
+#     the real checkpoint. See LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and
+#     BACKLOG.md's dated entry. ---
+add_executable(test_e2e_vits_lua_driver test_e2e_vits_lua_driver.cpp)
+target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
+set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)

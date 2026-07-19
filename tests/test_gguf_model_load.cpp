@@ -13,6 +13,7 @@
 namespace {
 // Kept in sync with tests/fixtures/make_minimal_gguf.py.
 const std::string kExpectedTopologyJson = R"({"version": 1, "nodes": []})";
+const std::string kExpectedOtherTopologyJson = R"({"version": 1, "nodes": [], "note": "other"})";
 } // namespace
 
 int main() {
@@ -52,6 +53,14 @@ int main() {
 
     // -- topology --
     LOOM_CHECK(model->topology_json() == kExpectedTopologyJson);
+
+    // -- named (multi-topology) support, added for Whisper's own single-GGUF-file convention (see
+    //    LOOM_PROCEDURAL_GENERALIZATION.md) -- the bare topology_json() above is unaffected by a named
+    //    topology also being present in the same file. --
+    LOOM_CHECK(model->has_topology("other"));
+    LOOM_CHECK(!model->has_topology("does_not_exist"));
+    LOOM_CHECK(model->topology_json("other") == kExpectedOtherTopologyJson);
+    LOOM_CHECK_THROWS(model->topology_json("does_not_exist"), loom::LoadError);
 
     // -- hparam_env() --
     loom::SymbolEnv env = model->hparam_env();

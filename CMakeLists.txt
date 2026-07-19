@@ -28,10 +28,12 @@ add_library(loom_engine
     src/core/styletts2_driver.cpp
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp
+    src/core/relative_position.cpp
     src/core/style_diffusion_sampler.cpp
     src/core/cfm_euler_sampler.cpp
     src/core/supertonic_driver.cpp
     src/core/matcha_driver.cpp
+    src/core/lua_bridge.cpp
     src/core/ode_stepper.cpp
     src/core/vocab.cpp
     src/core/unicode.cpp
@@ -50,7 +52,7 @@ add_library(loom::engine ALIAS loom_engine)
 target_include_directories(loom_engine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(loom_engine PUBLIC ggml nlohmann_json::nlohmann_json)
+target_link_libraries(loom_engine PUBLIC ggml nlohmann_json::nlohmann_json luajit::luajit)
 
 if(LOOM_BUILD_TOOLS)
     add_subdirectory(tools/loom_cli)

@@ -136,6 +136,9 @@ def main():
 
     writer = GGUFWriter(str(out_dir / "whisper_decoder.gguf"), "loom-whisper-decoder")
     writer.add_string("model.graph_topology", json.dumps(topo))
+    # NOTE: no "model.driver_script" KV here any more -- it orchestrates BOTH modules, so it now lives
+    # only on the combined whisper.gguf that convert_whisper_all.py writes. This two-separate-file
+    # output is used solely by the per-module isolation reference tests, which don't need it.
     # hparams needed by loom::WhisperDriver to size its KvCache (same convention Generator/GgufModel::
     # hparam_u32 already use for Qwen3/toy_llm's own decode loop).
     writer.add_uint32("loom.n_layer", dims["n_text_layer"])

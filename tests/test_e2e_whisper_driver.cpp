@@ -86,9 +86,9 @@ int main() {
     const char* dir_env = std::getenv("LOOM_WHISPER_DIR");
     const char* ref_dir_env = std::getenv("LOOM_WHISPER_DRIVER_REF_DIR");
     if (dir_env == nullptr || ref_dir_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_WHISPER_DIR (whisper_encoder.gguf/whisper_decoder.gguf) "
-                              "and LOOM_WHISPER_DRIVER_REF_DIR (ref_driver_*.npy, produced by "
-                              "reference_forward_whisper_driver.py) to run this check\n");
+        std::fprintf(stderr, "skipping: set LOOM_WHISPER_DIR (whisper.gguf, produced by "
+                              "convert_whisper_all.py) and LOOM_WHISPER_DRIVER_REF_DIR (ref_driver_*.npy, "
+                              "produced by reference_forward_whisper_driver.py) to run this check\n");
         return 77;
     }
     const std::string dir = dir_env;
@@ -101,12 +101,14 @@ int main() {
 
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
-    auto encoder_model = loom::GgufModel::load(dir + "/whisper_encoder.gguf", backend.get());
-    auto decoder_model = loom::GgufModel::load(dir + "/whisper_decoder.gguf", backend.get());
-    LOOM_CHECK(encoder_model != nullptr);
-    LOOM_CHECK(decoder_model != nullptr);
-    loom::GraphTopology encoder_topo = loom::GraphTopology::parse(encoder_model->topology_json());
-    loom::GraphTopology decoder_topo = loom::GraphTopology::parse(decoder_model->topology_json());
+    // Both the encoder and decoder topologies now live in ONE GGUF file (see
+    // LOOM_PROCEDURAL_GENERALIZATION.md / BACKLOG.md's dated entry) -- WhisperDriver's own constructor
+    // needs no change, it already takes two independent GgufModel& references; both just point at the
+    // same loaded model here.
+    auto model = loom::GgufModel::load(dir + "/whisper.gguf", backend.get());
+    LOOM_CHECK(model != nullptr);
+    loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+    loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
 
     loom::WhisperConfig cfg;
     cfg.n_audio_state = 384;
@@ -117,8 +119,7 @@ int main() {
     cfg.n_text_ctx = 448;
     cfg.eot_token = 50256;
 
-    loom::WhisperDriver driver(*encoder_model, std::move(encoder_topo), *decoder_model, std::move(decoder_topo),
-                                cfg, backend.get());
+    loom::WhisperDriver driver(*model, std::move(encoder_topo), *model, std::move(decoder_topo), cfg, backend.get());
     std::vector<int32_t> generated = driver.transcribe(waveform, prompt, /*max_new_tokens=*/16);
 
     std::fprintf(stderr, "generated %zu tokens: ", generated.size());

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace loom {
@@ -31,8 +32,17 @@ public:
     // Read-only view of every loaded weight, for seeding a per-call SymbolTable in GraphBuilder.
     const SymbolTable& weights() const { return symbols_; }
 
-    // The raw JSON text stored under the "model.graph_topology" GGUF string KV.
-    const std::string& topology_json() const { return topology_json_; }
+    // The raw JSON text stored under the bare "model.graph_topology" GGUF string KV -- the common case
+    // for single-topology files (every model before Whisper's own multi-topology GGUF, see
+    // LOOM_PROCEDURAL_GENERALIZATION.md). Throws loom::LoadError if this file has no BARE topology (e.g.
+    // it only has named "model.graph_topology.<name>" KVs -- use topology_json(name) instead).
+    const std::string& topology_json() const;
+
+    // A NAMED topology from a multi-topology file: reads "model.graph_topology.<name>" (e.g. "encoder",
+    // "decoder" -- LoomLuaBridge::register_module registers each against the SAME GgufModel instance).
+    // Throws loom::LoadError if absent.
+    const std::string& topology_json(const std::string& name) const;
+    bool has_topology(const std::string& name) const;
 
     // Scalar hyperparameters are stored as typed GGUF KVs under a "loom." namespace (e.g.
     // "loom.n_layer", "loom.rms_norm_eps") -- mirrors how llama.cpp stores its own "llama.*" hparams as
@@ -74,7 +84,10 @@ private:
     ggml_backend_buffer_ptr weights_buf_; // real backing storage for all weight tensors
     ggml_backend_t backend_ = nullptr;    // not owned by GgufModel
     SymbolTable symbols_;
-    std::string topology_json_;
+    // Bare "model.graph_topology" is stored under the key "" ; named "model.graph_topology.<name>" KVs
+    // are stored under "<name>". A file always has at least one entry after a successful load() (empty
+    // would have thrown LoadError instead).
+    std::unordered_map<std::string, std::string> topologies_;
 };
 
 } // namespace loom
