@@ -622,3 +622,176 @@ add_executable(test_e2e_whisper_driver test_e2e_whisper_driver.cpp)
 target_link_libraries(test_e2e_whisper_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_whisper_driver COMMAND test_e2e_whisper_driver)
 set_tests_properties(test_e2e_whisper_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- StyleTTS2 roadmap: loom::karras_schedule/adpm2_sample (the style-diffusion sampling loop's own
+#     discretization math), verified against an independent numpy reference using a TOY affine denoiser
+#     and REPLAYED (not freshly sampled) ancestral noise -- pure host arithmetic, no GGUF/ggml graph
+#     involved, fully synthetic, not skip-if-missing. ---
+set(LOOM_STYLE_DIFFUSION_SAMPLER_REF_DIR ${LOOM_FIXTURE_DIR}/style_diffusion_sampler_ref)
+
+add_test(
+    NAME gen_style_diffusion_sampler_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_style_diffusion_sampler.py
+            ${LOOM_STYLE_DIFFUSION_SAMPLER_REF_DIR}
+)
+set_tests_properties(gen_style_diffusion_sampler_reference PROPERTIES FIXTURES_SETUP style_diffusion_sampler_reference_fixture)
+
+add_executable(test_style_diffusion_sampler test_style_diffusion_sampler.cpp)
+target_link_libraries(test_style_diffusion_sampler PRIVATE loom::engine)
+target_compile_definitions(test_style_diffusion_sampler PRIVATE
+    LOOM_TEST_REF_DIR="${LOOM_STYLE_DIFFUSION_SAMPLER_REF_DIR}"
+)
+add_test(NAME test_style_diffusion_sampler COMMAND test_style_diffusion_sampler)
+set_tests_properties(test_style_diffusion_sampler PROPERTIES FIXTURES_REQUIRED "style_diffusion_sampler_reference_fixture")
+
+# --- Real-checkpoint test: StyleTTS2's style-diffusion denoiser network (Transformer1d) against a
+#     hand-rolled PyTorch reference, real weights + synthetic driving embedding. See
+#     tools/convert_styletts2/convert_styletts2_diffusion.py. Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_styletts2_diffusion_net test_e2e_styletts2_diffusion_net.cpp)
+target_link_libraries(test_e2e_styletts2_diffusion_net PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_diffusion_net COMMAND test_e2e_styletts2_diffusion_net)
+set_tests_properties(test_e2e_styletts2_diffusion_net PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Real-checkpoint test: the FULL style-diffusion sampling loop (KarrasSchedule + ADPM2Sampler +
+#     KDiffusion preconditioning wrapping the real Transformer1d network) against a hand-rolled PyTorch
+#     reference combining the same independently-verified pieces. See
+#     tools/convert_styletts2/reference_forward_styletts2_diffusion_sampler.py. Skips cleanly if env vars
+#     aren't set. ---
+add_executable(test_e2e_styletts2_diffusion_sampler test_e2e_styletts2_diffusion_sampler.cpp)
+target_link_libraries(test_e2e_styletts2_diffusion_sampler PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_diffusion_sampler COMMAND test_e2e_styletts2_diffusion_sampler)
+set_tests_properties(test_e2e_styletts2_diffusion_sampler PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: loom::StyleTTS2Driver's full synthesize() call (CustomAlbert -> style-diffusion
+#     sampler -> bert_encoder -> DurationEncoder -> duration prediction/frame-expansion -> F0Ntrain ->
+#     Decoder core -> SineGen -> forward STFT -> Generator core) against the real
+#     yl4579/StyleTTS2-LJSpeech checkpoint -- finite/non-trivial output, same scope as
+#     test_e2e_kokoro_driver.cpp. Skips cleanly if LOOM_STYLETTS2_DIR isn't set. ---
+add_executable(test_e2e_styletts2_driver test_e2e_styletts2_driver.cpp)
+target_link_libraries(test_e2e_styletts2_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_driver COMMAND test_e2e_styletts2_driver)
+set_tests_properties(test_e2e_styletts2_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: ConvNextBlock (replicate-pad composition), verified against the REAL
+#     nn.Module's own forward pass (real package importable in this venv). See
+#     tools/convert_supertonic/convert_supertonic_convnext.py. Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_supertonic_convnext test_e2e_supertonic_convnext.cpp)
+target_link_libraries(test_e2e_supertonic_convnext PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_convnext COMMAND test_e2e_supertonic_convnext)
+set_tests_properties(test_e2e_supertonic_convnext PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: VFTimeEncoder (sinusoidal time embedding + Mish MLP), verified against
+#     the real vector_estimator.pt's own time_encoder. See convert_supertonic_vftime.py. ---
+add_executable(test_e2e_supertonic_vftime test_e2e_supertonic_vftime.cpp)
+target_link_libraries(test_e2e_supertonic_vftime PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_vftime COMMAND test_e2e_supertonic_vftime)
+set_tests_properties(test_e2e_supertonic_vftime PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: StyleEncoderCrossAttention (style-token-pooling cross-attention),
+#     verified against the real dp-style-encoder.pt's own style_token_layer. See
+#     convert_supertonic_style_attn.py. ---
+add_executable(test_e2e_supertonic_style_attn test_e2e_supertonic_style_attn.cpp)
+target_link_libraries(test_e2e_supertonic_style_attn PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_style_attn COMMAND test_e2e_supertonic_style_attn)
+set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: confirms VITS's own REL_POS_ATTENTION_SHAW primitive family is directly
+#     reusable for SupertonicTTS's MultiHeadRelativeAttention (same Shaw et al. mechanism, different
+#     window_size/channels). See convert_supertonic_relpos_attn.py. ---
+add_executable(test_e2e_supertonic_relpos_attn test_e2e_supertonic_relpos_attn.cpp)
+target_link_libraries(test_e2e_supertonic_relpos_attn PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_relpos_attn COMMAND test_e2e_supertonic_relpos_attn)
+set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: full DurationPredictor sub-model (DPTextEncoder + MLP head), the FIRST
+#     complete coherent sub-model in this effort, verified against the real duration_predictor.pt. See
+#     convert_supertonic_dp.py. ---
+add_executable(test_e2e_supertonic_dp test_e2e_supertonic_dp.cpp)
+target_link_libraries(test_e2e_supertonic_dp PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_dp COMMAND test_e2e_supertonic_dp)
+set_tests_properties(test_e2e_supertonic_dp PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: TTLStyleEncoder + TTLTextEncoder (exercises SpeechPromptedCrossAttention
+#     for the first time), verified against the real ttl-style-encoder.pt/text_encoder.pt. See
+#     convert_supertonic_ttl_text.py. ---
+add_executable(test_e2e_supertonic_ttl_text test_e2e_supertonic_ttl_text.cpp)
+target_link_libraries(test_e2e_supertonic_ttl_text PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_ttl_text COMMAND test_e2e_supertonic_ttl_text)
+set_tests_properties(test_e2e_supertonic_ttl_text PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: VFTextCrossAttention (fractional RoPE) + VFStyleCrossAttention, verified
+#     against the real vector_estimator.pt's own text_attn[0]/style_attn[0]. See
+#     convert_supertonic_vf_attn.py. ---
+add_executable(test_e2e_supertonic_vf_attn test_e2e_supertonic_vf_attn.cpp)
+target_link_libraries(test_e2e_supertonic_vf_attn PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_vf_attn COMMAND test_e2e_supertonic_vf_attn)
+set_tests_properties(test_e2e_supertonic_vf_attn PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: the FULL VectorFieldEstimator (biggest single assembly in this effort),
+#     verified against the real vector_estimator.pt, ONE compute_velocity call. See
+#     convert_supertonic_vfe.py. ---
+add_executable(test_e2e_supertonic_vfe test_e2e_supertonic_vfe.cpp)
+target_link_libraries(test_e2e_supertonic_vfe PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_vfe COMMAND test_e2e_supertonic_vfe)
+set_tests_properties(test_e2e_supertonic_vfe PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: the FULL CFM Euler sampling loop (loom::cfm_euler_sample + the real
+#     VectorFieldEstimator), verified against a hand-rolled Python port calling the real
+#     vector_estimator.pt's own .solve() in a loop. See
+#     reference_forward_supertonic_cfm_sampler.py. ---
+add_executable(test_e2e_supertonic_cfm_sampler test_e2e_supertonic_cfm_sampler.cpp)
+target_link_libraries(test_e2e_supertonic_cfm_sampler PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_cfm_sampler COMMAND test_e2e_supertonic_cfm_sampler)
+set_tests_properties(test_e2e_supertonic_cfm_sampler PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- SupertonicTTS v2 roadmap: SpeechDecoder (folded BatchNorm, causal ConvNeXt, direct waveform
+#     emission, the FINAL pipeline stage), verified against the real vocoder.pt. See
+#     convert_supertonic_decoder.py. ---
+add_executable(test_e2e_supertonic_decoder test_e2e_supertonic_decoder.cpp)
+target_link_libraries(test_e2e_supertonic_decoder PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_decoder COMMAND test_e2e_supertonic_decoder)
+set_tests_properties(test_e2e_supertonic_decoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: loom::SupertonicDriver's full synthesize() call (DurationPredictor ->
+#     get_latent_mask -> TTLTextEncoder -> Euler CFM sampling loop -> SpeechDecoder) against the real
+#     femelo/supertonic-tts checkpoint -- finite/non-trivial output, same scope as
+#     test_e2e_kokoro_driver.cpp/test_e2e_styletts2_driver.cpp. Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_supertonic_driver test_e2e_supertonic_driver.cpp)
+target_link_libraries(test_e2e_supertonic_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_driver COMMAND test_e2e_supertonic_driver)
+set_tests_properties(test_e2e_supertonic_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Matcha-TTS roadmap: TextEncoder (ConvReluNorm prenet, partial-rotary NeoX RoPE self-attention,
+#     per-token DurationPredictor) against the real matcha.models.components.text_encoder.TextEncoder
+#     module run directly. See tools/convert_matcha/convert_matcha_text_encoder.py. ---
+add_executable(test_e2e_matcha_text_encoder test_e2e_matcha_text_encoder.cpp)
+target_link_libraries(test_e2e_matcha_text_encoder PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_text_encoder COMMAND test_e2e_matcha_text_encoder)
+set_tests_properties(test_e2e_matcha_text_encoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Matcha-TTS roadmap: Decoder U-Net (the CFM estimator -- GROUP_NORM, one real downsample/upsample,
+#     skip connections, SnakeBeta-FeedForward BasicTransformerBlocks) against the real
+#     matcha.models.components.decoder.Decoder module run directly. See
+#     tools/convert_matcha/convert_matcha_decoder.py. ---
+add_executable(test_e2e_matcha_decoder test_e2e_matcha_decoder.cpp)
+target_link_libraries(test_e2e_matcha_decoder PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_decoder COMMAND test_e2e_matcha_decoder)
+set_tests_properties(test_e2e_matcha_decoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Matcha-TTS roadmap: the real HiFi-GAN v1 vocoder (resblock="1", 4 upsample stages -- a different
+#     topology shape from VITS's own resblock="2"/3-stage HiFi-GAN) against the real
+#     matcha.hifigan.models.Generator module run directly. See
+#     tools/convert_matcha/convert_matcha_vocoder.py. ---
+add_executable(test_e2e_matcha_vocoder test_e2e_matcha_vocoder.cpp)
+target_link_libraries(test_e2e_matcha_vocoder PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_vocoder COMMAND test_e2e_matcha_vocoder)
+set_tests_properties(test_e2e_matcha_vocoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: loom::MatchaDriver's full synthesize() call (TextEncoder -> duration expansion
+#     -> Euler CFM sampling loop over the Decoder U-Net -> denormalize -> HiFi-GAN v1 vocoder) against
+#     the real matcha_ljspeech.ckpt + generator_v1 checkpoints -- finite/non-trivial output, same scope
+#     as test_e2e_supertonic_driver.cpp/test_e2e_kokoro_driver.cpp. Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_matcha_driver test_e2e_matcha_driver.cpp)
+target_link_libraries(test_e2e_matcha_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_driver COMMAND test_e2e_matcha_driver)
+set_tests_properties(test_e2e_matcha_driver PROPERTIES SKIP_RETURN_CODE 77)

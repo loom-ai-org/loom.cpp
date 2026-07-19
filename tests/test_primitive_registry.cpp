@@ -347,6 +347,43 @@ void test_step() {
     LOOM_CHECK((get_f32(out) == std::vector<float>{0.0f, 0.0f, 1.0f, 1.0f}));
 }
 
+void test_group_norm() {
+    GgmlScratch s;
+    // 4 channels (ne[2]), 2 groups, spatial ne[0]=2 x ne[1]=1 -- matches the [T,1,C,1] reshape convention
+    // this project's own Layout A [T,C] tensors need before calling ggml_group_norm (confirmed to group
+    // over ne[2] and reduce over ne[0]*ne[1] directly against ggml-cpu/ops.cpp's
+    // ggml_compute_forward_group_norm_f32). No learned affine here -- GROUP_NORM itself never applies one,
+    // same as RMS_NORM/LAYER_NORM.
+    ggml_tensor* a = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, 2, 1, 4, 1);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("GROUP_NORM")(pc, {a}, {{"n_groups", 2}, {"eps", 1e-5}})[0];
+
+    ggml_cgraph* gf = s.expand(out);
+    // channel0={1,2} channel1={3,4} channel2={10,20} channel3={30,40}
+    set_f32(a, {1, 2, 3, 4, 10, 20, 30, 40});
+    s.compute(gf);
+
+    const auto result = get_f32(out);
+    // group0 (channels 0,1): mean=2.5, var=1.25 -> std=sqrt(1.25+eps)
+    // group1 (channels 2,3): mean=25, var=125 -> std=sqrt(125+eps)
+    const double std0 = std::sqrt(1.25 + 1e-5);
+    const double std1 = std::sqrt(125.0 + 1e-5);
+    const std::vector<float> expected = {
+        static_cast<float>((1 - 2.5) / std0), static_cast<float>((2 - 2.5) / std0),
+        static_cast<float>((3 - 2.5) / std0), static_cast<float>((4 - 2.5) / std0),
+        static_cast<float>((10 - 25.0) / std1), static_cast<float>((20 - 25.0) / std1),
+        static_cast<float>((30 - 25.0) / std1), static_cast<float>((40 - 25.0) / std1),
+    };
+    bool ok = true;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (std::fabs(result[i] - expected[i]) > 1e-4f) ok = false;
+    }
+    LOOM_CHECK(ok);
+}
+
 void test_cumsum() {
     GgmlScratch s;
     // ne=[4,2]: two independent rows, cumsum along ne[0] (confirmed against ggml-cpu's real
@@ -1203,6 +1240,41 @@ void test_concat() {
     set_f32(d, {10, 20, 30, /*row1*/ 40, 50, 60});
     s2.compute(gf2);
     LOOM_CHECK((get_f32(out_dim0) == std::vector<float>{1, 2, 10, 20, 30, /*row1*/ 3, 4, 40, 50, 60}));
+}
+
+void test_repeat() {
+    // ggml_repeat_4d wrapper (StyleTTS2's diffusion Transformer1d needs to broadcast a single per-batch
+    // style vector [channels] up to [channels, T] before CONCAT-ing with a per-position context
+    // embedding -- CONCAT itself requires matching shape on every non-concat axis). ne=[3,1] "a"
+    // repeated to ne=[3,4] (a plain numeric "shape" attr here; a "$"-symbol string entry follows the
+    // same SymbolEnv::eval() path already exercised by RESHAPE/VIEW elsewhere in this file).
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 3, 1);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("REPEAT")(pc, {a}, {{"shape", {3, 4}}})[0];
+    LOOM_CHECK(out->ne[0] == 3 && out->ne[1] == 4);
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(a, {1, 2, 3});
+    s.compute(gf);
+    LOOM_CHECK((get_f32(out) == std::vector<float>{1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3}));
+
+    // Symbol-resolved target shape ("$n_tokens", matching RESHAPE's own string-symbol convention).
+    loom::SymbolEnv env2;
+    env2.set("n_tokens", 5.0);
+    GgmlScratch s2;
+    ggml_tensor* b = ggml_new_tensor_1d(s2.ctx.get(), GGML_TYPE_F32, 1);
+    ggml_set_input(b);
+    loom::PrimitiveContext pc2{s2.ctx.get(), env2, nullptr};
+    ggml_tensor* out2 = op("REPEAT")(pc2, {b}, {{"shape", {"1", "$n_tokens"}}})[0];
+    LOOM_CHECK(out2->ne[0] == 1 && out2->ne[1] == 5);
+    ggml_cgraph* gf2 = s2.expand(out2);
+    set_f32(b, {7.0f});
+    s2.compute(gf2);
+    LOOM_CHECK((get_f32(out2) == std::vector<float>{7, 7, 7, 7, 7}));
 }
 
 void test_interpolate_1d() {
@@ -2114,6 +2186,7 @@ int main() {
     test_relu();
     test_leaky_relu();
     test_step();
+    test_group_norm();
     test_cumsum();
     test_glu();
     test_conv_1d_dw();
@@ -2145,6 +2218,7 @@ int main() {
     test_sum_rows();
     test_pad_1d();
     test_concat();
+    test_repeat();
     test_interpolate_1d();
     test_rq_spline_inverse();
     test_rq_spline_inverse_outside_tail_bound();

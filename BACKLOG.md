@@ -3239,3 +3239,386 @@ remaining Kokoro-specific gaps: a full hand-rolled pipeline numerical reference 
 sub-piece already independently verified) and a permissively-licensed phonemizer (task #79, shared need
 with VITS). Moving on to StyleTTS2 next (likely shares most of this architecture directly), then
 SupertonicTTS, F5-TTS, Matcha-TTS.
+
+---
+
+### 2026-07-19: StyleTTS2 (real yl4579/StyleTTS2-LJSpeech checkpoint) — fully driveable end-to-end
+
+Confirmed `/home/flavio/Dev/styletts2` is the real upstream `yl4579/StyleTTS2` repo (remote
+`github.com/yl4579/StyleTTS2`, commit `5cedc71`, clean tree) after the user questioned whether the local
+copy was legitimate — it is. Downloaded the real pretrained checkpoint from HF
+(`yl4579/StyleTTS2-LJSpeech`, MIT, 750MB) plus used the real bundled `Utils/PLBERT/step_1000000.t7`.
+Ground truth for the real inference call order: `Demo/Inference_LJSpeech.ipynb`'s own `inference()`
+function (a real working demo notebook, extracted via `jupyter nbconvert`) — a stronger source of truth
+than Kokoro's own `KModel.forward_with_tokens` was.
+
+**Huge scope reduction discovered before writing any code**: `config.yml` confirmed StyleTTS2's
+`hidden_dim/style_dim/n_layer/max_dur/decoder.{upsample_rates,gen_istft_n_fft,...}` are BYTE-IDENTICAL to
+Kokoro's own checkpoint (Kokoro is a fork of this exact architecture) — CustomAlbert/PL-BERT,
+`bert_encoder`, `TextEncoder`, `DurationEncoder`, F0Ntrain (`AdainResBlk1d` family), Decoder core, and
+Generator (istftnet, including SineGen/real-STFT) are ALL reusable VERBATIM against the new checkpoint —
+confirmed every real state-dict key matches exactly what the existing `convert_kokoro_*.py` builders
+already expect (all under a single uniform `module.` prefix, simpler than Kokoro's own mixed
+`""`/`"module"`/`"module.generator"` situation). Wrote `tools/convert_styletts2/convert_styletts2_reused.py`,
+which imports Kokoro's conversion scripts directly (via `sys.path`) and re-packs the checkpoint's
+`{"net": {...}}` wrapper into a temp bare-dict file matching Kokoro's own convention — ZERO changes needed
+to any already-verified Kokoro file. Ran cleanly against the real checkpoint on the first try.
+
+**The one genuinely new piece: the diffusion-based style sampler.** `config.yml`'s `multispeaker: false`
+confirmed the LJSpeech checkpoint uses `Transformer1d` (NOT `StyleTransformer1d`) as `KDiffusion`'s
+`net` — and critically, `AudioDiffusionConditional`'s own default DEEP MULTI-SCALE U-NET is fully
+overridden (`diffusion.unet = transformer` in `build_model`), confirmed directly against the real
+checkpoint's state dict (no U-Net-shaped keys at all, only `unet.blocks.{0,1,2}.*`/`to_time`/
+`to_mapping`/`to_out`/`fixed_embedding`) — a plain 3-layer transformer, NOT the U-Net the whole
+`audio-diffusion-pytorch` machinery suggested at first read. This turned what looked like the biggest
+undertaking of the whole model into a modest, well-scoped piece.
+
+Built bottom-up, each piece verified before the next depended on it:
+- `loom::karras_schedule`/`loom::adpm2_step`/`loom::adpm2_sample` (`include/loom/core/
+  style_diffusion_sampler.h`/`.cpp`) — the Karras-schedule + ancestral-DPM-2 sampling loop, host-driven
+  (same "iterative loop calling a graph via callback" shape as `ode_stepper.cpp`'s existing VITS
+  precedent), verified against a hand-rolled numpy reference using a TOY affine denoiser with REPLAYED
+  (not freshly sampled) noise — decouples "is the discretization math right" from "do two
+  independently-implemented RNGs agree" (they never will, by design). Exact match.
+- New **`REPEAT`** primitive (`ggml_repeat_4d` wrapper, explicit symbolic target shape, no dummy template
+  tensor needed) — required because the diffusion Transformer1d must broadcast a single per-utterance
+  256-dim noisy style vector to `[256,T]` before `CONCAT`-ing with the per-position BERT context
+  embedding (`CONCAT` itself requires matching shape on every non-concat axis, so the broadcast has to be
+  materialized first). Verified in `test_primitive_registry.cpp` (140/140 passing after).
+- `Transformer1d` denoiser topology (`tools/convert_styletts2/convert_styletts2_diffusion.py`) +
+  `KDiffusion` preconditioning — KDiffusion's own `c_skip`/`c_out`/`c_in`/`c_noise` are DELIBERATELY host
+  scalars (sigma is always a plain host-known float per ADPM2 step), not graph nodes — same "host does
+  small scalar math" precedent as VITS's SDP/Kokoro's SineGen. A real per-block quirk confirmed from
+  source, not simplified away: `Attention`'s Q is normed via `.norm`, K/V via a SEPARATELY-learned
+  `.norm_context` applied to the SAME input (no real cross-attention context exists in this
+  non-multispeaker config). Verified against REAL checkpoint weights + a hand-rolled PyTorch reference
+  (synthetic driving embedding): mean_diff=5.2e-7, max_diff=2.9e-6.
+- Combined sampler-loop + real network into the full style-diffusion sample, verified against a
+  hand-rolled Python port combining the SAME two independently-verified pieces (fixed seeds, replayed
+  noise): mean_diff=1.4e-7, max_diff=6.6e-7.
+- `StyleTTS2Driver` (`include/loom/core/styletts2_driver.h`/`.cpp`) — wires CustomAlbert (raw
+  `bert_dur`) → style-diffusion sampler (conditioned on RAW `bert_dur`, NOT `bert_encoder`'s projection,
+  confirmed from the real demo source) → split `s_pred` into `ref`(decoder style)/`s`(predictor style) →
+  `bert_encoder` → `DurationEncoder` → `predictor.lstm`+`duration_proj` → `predict_durations` (with a
+  real StyleTTS2-specific quirk confirmed from the demo source: `pred_dur[-1] += 5`, no division by
+  `speed` at all unlike Kokoro's own forward) → `expand_by_duration` (both `d` and a separately-computed
+  `t_en`) → F0Ntrain → Decoder core → SineGen → forward STFT → Generator core → waveform. Real StyleTTS2
+  token convention is a SINGLE LEADING 0 (`tokens.insert(0,0)`), NOT Kokoro's leading+trailing `[0,...,0]`
+  — a real, confirmed difference, not an oversight.
+
+Verified end-to-end (`test_e2e_styletts2_driver.cpp`, same finite/non-trivial-output scope as
+`test_e2e_kokoro_driver.cpp`) against the real checkpoint on the FIRST real run: `waveform_len=22200`,
+all finite, non-silent. Full suite: 100% passing (81/81 executed, rest skip cleanly on missing env vars).
+
+**StyleTTS2 is now fully driveable end-to-end from the real checkpoint.** Remaining gaps (same shape as
+Kokoro's own): a full hand-rolled pipeline numerical reference (optional, every sub-piece independently
+verified already) and the real phonemizer (task #79, shared with Kokoro/VITS). `style_encoder`/
+`predictor_encoder` (reference-audio-driven style, real checkpoint pieces that exist but are never
+called by the real demo's own basic-synthesis `inference()`) deliberately deferred, same "basic path
+first" precedent as everywhere else. Next per the user's own priority order: SupertonicTTS, F5-TTS,
+Matcha-TTS.
+
+---
+
+### 2026-07-19: SupertonicTTS v2 (real femelo/supertonic-tts checkpoint) — foundational pieces + first full sub-model
+
+Started model 5/7 (task #80). Real source read in full at `/home/flavio/Dev/supertonic-tts` (confirmed a
+legitimate clone of `github.com/femelo/supertonic-tts`, treated STRICTLY READ-ONLY per explicit user
+instruction -- no fetch/pull/push). A genuinely NEW architecture family for this project: conditional
+flow-matching (CFM) latent TTS, not descended from the StyleTTS2/Kokoro lineage. Real checkpoint: `.pt`
+files under `assets/pt/` (full pickled `nn.Module`s with real weights, not state dicts) -- and critically,
+the `supertonic-tts` package is ALREADY `pip install -e`'d in `/home/flavio/.venvs/piper`, so
+`torch.load(..., weights_only=False)` gives back REAL modules usable via their own `.forward()` directly
+(same "import the real package" precedent as Whisper's own `openai-whisper` use) -- a stronger reference
+than hand-copied formulas everywhere this was used.
+
+**Key scope findings** (see `tools/convert_supertonic/PLAN.md` for the full writeup): `DurationPredictor`
+predicts a single SCALAR total duration (seconds), not per-token durations -- no CUMSUM/generate_path
+needed anywhere in this model, genuinely simpler than every prior TTS model here. The real CFM sampler
+(`TextToLatentWrapper.predict`) is a DETERMINISTIC Euler ODE integration (no noise injection per step,
+unlike StyleTTS2's ADPM2 sampler). `SpeechDecoder` emits the waveform as a direct flattened sample
+sequence from a causal ConvNeXt stack -- no ISTFT/ConvTranspose/SineGen/GAN-upsampling at all, structurally
+simpler than every istftnet-family decoder built so far. Precomputed voice styles already exist as JSON
+assets (`assets/voice_styles/*.json`), so `SpeechEncoder` (reference-audio style extraction) is out of
+scope, same precedent as Kokoro/StyleTTS2's own style/predictor encoders. The real tokenizer
+(`TextVectorizer`) is a trivial license-free unicode lookup table -- sidesteps the phonemizer problem
+(task #79) entirely for this model family.
+
+**New primitive**: `REPEAT` (`ggml_repeat_4d` wrapper, explicit symbolic target shape) was actually added
+during StyleTTS2's own diffusion-sampler work, but turned out to be exactly what SupertonicTTS's
+replicate-pad composition needed too -- confirms that generalization was the right call.
+
+**Reused directly, no changes needed**: VITS's own `REL_POS_ATTENTION_SHAW`/`get_relative_embeddings`
+primitive family, confirmed the SAME Shaw et al. lookup-table + rel_to_abs/abs_to_rel skew mechanism as
+SupertonicTTS's own `MultiHeadRelativeAttention` (different window_size/channels, same algorithm) --
+verified via a real numerical cross-check against `duration_predictor.pt`'s own attention layer.
+
+**Foundational pieces built and verified against real weights** (`tools/convert_supertonic/`):
+- `ConvNextBlock` (replicate/"edge" padding via VIEW+REPEAT+CONCAT, since ggml has no native replicate-pad
+  op) -- both causal and non-causal(symmetric) variants.
+- Mish activation (`x*tanh(softplus(x))`, plain composition) + `VFTimeEncoder` (sinusoidal time embedding).
+- `StyleCrossAttention`/`StyleEncoderCrossAttention` (style-token-pooling cross-attention: a learnable-query
+  first stage, a 2nd stage refining against the same original input -- real quirk: `scale=sqrt(dim)`, the
+  KV feature width, NOT `sqrt(head_dim)`).
+- Full `DurationPredictor` sub-model (`DPTextEncoder`: ConvNeXt stack + Shaw-et-al. attention +
+  sentence-token pooling; MLP head w/ PReLU composed as `relu(x) - weight*relu(-x)`) -- the FIRST complete
+  coherent sub-model in this effort, verified end-to-end: exact match (diff=2.4e-7) against the real
+  `duration_predictor.pt` + `dp-style-encoder.pt`.
+
+**Two real bugs caught by numerical mismatches, not by inspection** (same discipline as every other
+milestone):
+1. `MultiHeadRelativeAttention`'s own `x` input axis convention: an earlier version of
+   `convert_supertonic_relpos_attn.py` declared `x` directly as Layout B [channels,T] -- WRONG, since the
+   real module operates on native PyTorch (B,C,T) channel-first input directly (no internal transpose,
+   unlike `StyleCrossAttention`'s own `kv` which DOES need Layout B because ITS real module transposes
+   internally first). Fixed by declaring `x` as Layout A [T,channels] (matching the real memory layout
+   byte-for-byte) and crossing to Layout B explicitly via PERMUTE+CONT before the Linear ops, crossing
+   back afterward.
+2. `add_replicate_pad`'s right-pad ("last row") VIEW offset formula: computed as `(T-1)*channels*4` bytes
+   -- WRONG (struck a completely different element than intended, a real corruption caught via a genuine
+   numerical mismatch on the SYMMETRIC/non-causal padding path specifically -- the causal path never
+   exercises `rp>0` at all, which is why it passed cleanly earlier and this bug went unnoticed until the
+   first non-causal ConvNeXt use, inside the full `DurationPredictor` assembly). Since `x` has `ne=[T,
+   channels]` (T=ne[0], the FASTEST axis), the correct byte offset for the `t=T-1` column is just
+   `(T-1)*4` (four bytes per float, no channel multiplication) -- the same default-`nb1`-reuse trick as
+   the `t=0` ("first row") case, just at a different flat starting offset along the SAME fastest axis.
+   Debugged via small standalone numpy/ggml cross-checks (a 5x3 synthetic example) rather than staring at
+   the full DurationPredictor's own 0.13 duration-value mismatch directly -- isolating the smallest
+   reproducing piece was much faster than debugging the whole assembly at once.
+
+Next: `SpeechPromptedCrossAttention`/`TTLTextEncoder`/`TTLStyleEncoder`, then the hardest single piece --
+`VectorFieldEstimator`'s fractional RoPE cross-attention -- then the Euler CFM sampler, `SpeechDecoder`,
+and the final `SupertonicDriver`.
+
+---
+
+### 2026-07-19: SupertonicTTS v2 -- SpeechPromptedCrossAttention/TTLTextEncoder, fractional RoPE, full VectorFieldEstimator
+
+Continued the SupertonicTTS v2 effort (task #80, model 5/7). Built and verified against the real
+checkpoint, in order:
+
+- `SpeechPromptedCrossAttention`/`SpeechPromptedTextEncoder` + `TTLTextPreEncoder`/`TTLTextEncoder` +
+  `TTLStyleEncoder` (reusing `build_style_encoder`, generalized from the DP-only version once it became
+  clear DP/TTL style encoders are structurally identical, only dims differ) -- verified end-to-end
+  against real `ttl-style-encoder.pt`/`text_encoder.pt`: mean_diff=4.2e-7.
+- `VFTextCrossAttention` (**fractional RoPE** -- `position = index/actual_length`, not integer positions,
+  the single most novel piece in this whole model) + `VFStyleCrossAttention`, verified against real
+  `vector_estimator.pt`'s own `text_attn[0]`/`style_attn[0]`: both matched to float32 precision
+  (mean_diff ~1-6e-8) on the FIRST real numerical test -- the RoPE outer-product-via-MUL_MAT composition
+  (generalizing StyleTTS2's own scalar-time trick to a full position VECTOR) worked correctly first try.
+- The FULL `VectorFieldEstimator` (4 groups x (4 dilated ConvNeXt + time-conditioning + ConvNeXt +
+  text cross-attn + ConvNeXt + style cross-attn) + final ConvNeXt stack, ~355 weight tensors) -- the
+  biggest single assembly in this whole project's SupertonicTTS effort, verified against real
+  `vector_estimator.pt.compute_velocity()`: mean_diff=5.9e-7 across the entire 24-block chain.
+
+**Three real bugs caught by numerical mismatches** (same discipline as every other milestone):
+1. Wrong hyperparameter in MY OWN conversion script: `STYLE_INTERM_DIM` was set to 256 (copy-paste
+   confusion with `STYLE_EMBED_DIM`) when the real `ttl-style-encoder.pt` uses 1024 -- caused a
+   `ggml_reshape_2d` nelements-mismatch crash. Root-caused by bisecting the crash down to a single
+   `ConvNextBlock(dim=256, interm=256)` call and comparing its ACTUAL pwconv1 output shape (`[50,1024,1]`)
+   against what was expected -- not a primitive bug at all, a plain wrong constant.
+2. `VFStyleCrossAttention`'s learned `key` PARAMETER was erroneously PERMUTE+CONT'd a second time after
+   already being registered in the correct Layout B `ne=[stl_dim,n_style]` orientation (a weight
+   constant's ggml layout is simply whatever numpy shape it's registered with -- unlike a REAL input
+   tensor dumped from a native PyTorch buffer, there is no "native memory layout" to cross away from).
+   Caught via `ggml_can_mul_mat` failing immediately (a loud, fast-failing bug, not a silent numerical
+   drift).
+3. `txt_emb`'s axis convention in the FULL `VectorFieldEstimator` assembly: declared as pre-crossed
+   Layout B, but `VFTextCrossAttention.forward` (unlike `VFStyleCrossAttention.forward`, which never
+   transposes `stl_emb`) DOES transpose `txt_emb` internally (`txt_seq = txt_emb.transpose(1,2)`) --
+   i.e. `txt_emb`'s own real convention is native Layout A, same as `z_t`/`latent`, genuinely DIFFERENT
+   from `stl_emb`'s convention despite both being "the other cross-attention operand" superficially.
+   Caught via a real 0.2 mean-diff mismatch on the full 24-block assembly; root-caused by bisecting
+   layer-by-layer (proj_in -> big_convnext group0 -> time-cond add -> small_convnext1, all matching
+   exactly) until the divergence was isolated to exactly the text cross-attention boundary.
+
+Next: the deterministic Euler CFM sampling loop (much simpler than StyleTTS2's own ADPM2 sampler -- no
+noise injection at each step, `z_{i+1} = z_i + v(z_i,t_i)*dt` for `n_steps` uniform steps), then
+`SpeechDecoder`, then the final `SupertonicDriver`.
+
+---
+
+### 2026-07-19: SupertonicTTS v2 -- Euler CFM sampler, SpeechDecoder, and SupertonicDriver -- COMPLETE
+
+Completed the SupertonicTTS v2 effort (task #80, model 5/7). Final pieces:
+
+- **Euler CFM sampling loop** (`include/loom/core/cfm_euler_sampler.h`/`.cpp`, `loom::cfm_euler_sample`)
+  -- deterministic forward-Euler ODE integration (`z += v(z,t)*dt`, no ancestral noise injection at any
+  step, much simpler than StyleTTS2's own ADPM2 sampler). Verified against a hand-rolled Python port
+  calling the real `vector_estimator.pt`'s own `.solve()` in a loop: exact match on the first try
+  (mean_diff=3.4e-7).
+- **SpeechDecoder** (folded eval-mode BatchNorm -> per-channel affine, codebook-decompress
+  reshape/permute/reshape, causal ConvNeXt stack, direct-waveform-emission head) -- verified against the
+  real `vocoder.pt`: mean_diff=1e-7. One real bug caught: `bn_scale`/`bn_shift` were registered as
+  DIRECTLY-reshaped 2D numpy weights (subject to GGUFWriter's own axis-reversal convention, giving
+  `ne=[hidden_dim,1]` -- backwards from what broadcasting needs), instead of registered 1D and
+  RESHAPE'd IN-GRAPH like `lat_std`/`lat_mean` just above it in the same function -- caught via a
+  `ggml_can_repeat` assertion, the SAME class of mistake (and fix) already seen for
+  `VFStyleCrossAttention`'s own `key` parameter earlier this effort.
+- **`SupertonicDriver`** (`include/loom/core/supertonic_driver.h`/`.cpp`) wiring DurationPredictor ->
+  `get_latent_mask` (host) -> TTLTextEncoder -> the Euler CFM loop -> SpeechDecoder, using REAL
+  precomputed voice-style JSON assets (`assets/voice_styles/F1.json`'s own `style_ttl`/`style_dp`
+  fields) -- verified end-to-end against the real checkpoint on the FIRST real run: 70656-sample
+  waveform (~1.6s), finite, non-silent.
+
+**A real, confirmed engine architecture limitation surfaced** (exactly what task #80 exists to find):
+`loom::GraphBuilder::build(n_tokens, n_past)` resolves EVERY declared graph input's shape via a SINGLE
+dynamic-length symbol ("$n_tokens") -- there is no mechanism for a topology to declare a SECOND
+independently-sized dynamic input in the same graph. SupertonicTTS's `VectorFieldEstimator` genuinely
+needs TWO such lengths (the CFM-iterated latent-frame count, and the input utterance's own phoneme
+count, needed simultaneously by `VFTextCrossAttention`) -- the FIRST model in this whole project with
+that requirement. Worked around for this milestone by fixing the text length at conversion time
+(`T_TEXT=10`, `convert_supertonic_all.py`'s own documented scope choice, consistent with this project's
+established "one representative input length, not full dynamic-shape generality" driver-smoke-test
+precedent -- Kokoro's/StyleTTS2's own driver tests also use one fixed demo token sequence). A real
+production driver would need either a new multi-symbol-per-graph engine mechanism, or per-utterance
+topology-JSON templating (a placeholder token substituted via plain string replace before
+`GraphTopology::parse`, avoiding any change to `GraphBuilder`'s core symbol resolution) -- not solved
+here, flagged for later (relevant to task #81's own "generalize the exporting tool" scope, or a new
+tracked task if picked up independently).
+
+**SupertonicTTS v2 is now fully driveable end-to-end from the real checkpoint** (with the above fixed-
+text-length limitation, clearly documented). 92/92 tests passing project-wide. Summary of the whole
+effort: a genuinely NEW architecture family (conditional flow-matching latent TTS, not descended from
+the StyleTTS2/Kokoro lineage) -- reused VITS's own Shaw-et-al. relative-position attention and the
+just-added `REPEAT` primitive (from StyleTTS2's own diffusion-sampler work) directly; new composable
+pieces: `ConvNextBlock` (w/ a replicate-pad composition, since ggml has no native replicate-pad op),
+Mish activation, two DISTINCT style-cross-attention mechanisms (`StyleCrossAttention`/
+`SpeechPromptedCrossAttention`, easy to conflate but genuinely different: one pools a KV sequence into
+style tokens via a learnable QUERY, the other has TEXT as the query attending over a learnable KEY), and
+**fractional RoPE** (`position = index/actual_length`, not integer positions) -- the single most novel
+piece, which worked correctly on the FIRST real numerical test. Zero new ggml primitives needed beyond
+`REPEAT` (already added for StyleTTS2) -- every other piece was a composition of already-registered
+primitives, a first for this project's model-porting roadmap.
+
+Per the user's own priority order: F5-TTS next, then Matcha-TTS (SupertonicTTS was #5 of 7). Overridden
+by explicit user direction ("Start Matcha-TTS first") -- Matcha-TTS is now #6, F5-TTS deferred.
+
+## 2026-07-19: Matcha-TTS -- TextEncoder + Decoder U-Net (CFM estimator) verified against real weights
+
+Real source cloned fresh (`github.com/shivammehta25/Matcha-TTS`, commit `bd4d90d`), read in full before
+building anything. Real checkpoints (`matcha_ljspeech.ckpt`, LJSpeech single-speaker so no speaker
+embedding table exists, and the paired real HiFi-GAN v1 vocoder `generator_v1`) downloaded from
+`shivammehta25/Matcha-TTS-checkpoints` GitHub Releases (no HF Hub repo exists for this model). New
+dedicated venv `/home/flavio/.venvs/matcha` (CPU torch, `diffusers==0.25.0` pinned against
+`huggingface_hub==0.20.3` to dodge the same `cached_download` import conflict already documented for
+`transformers`).
+
+**New primitive**: `GROUP_NORM`, wrapping native `ggml_group_norm` (confirmed by direct source read of
+`ggml_compute_forward_group_norm_f32`: groups over ne[2], reduces over ne[0]*ne[1]) -- callers reshape
+`[T,C]` to `[T,1,C,1]` first (a pure memory reinterpret, no data movement, verified by hand) and back
+after; the learned per-channel affine is a separate MUL/ADD, same as every other norm in this project.
+Verified via a hand-computed 2-group/4-channel unit test before use.
+
+**TextEncoder** (`ConvReluNorm` prenet + 6-layer self-attention `Encoder` + per-token `DurationPredictor`)
+matches the real `matcha.models.components.text_encoder.TextEncoder` module to ~4e-6 on the FIRST real
+numerical test. The interesting piece: Matcha's own partial-rotary RoPE (`RotaryPositionalEmbeddings`,
+real integer positions, "rotate-half"/NeoX convention, rotating only `int(k_channels*0.5)=48` of the 96
+k_channels, the rest passed through unrotated) turned out to be EXACTLY what the existing native `ROPE`
+primitive (`mode=2`/NEOX, `n_dims=48`, already used for Qwen3) computes -- confirmed by reading
+`ggml_compute_forward_rope_flt`'s own `rotate_pairs`/`theta_scale` code directly (pairs `(ic, ic+n_dims/2)`
+for `ic` in `[0,n_dims/2)`, `theta_scale=freq_base^(-2/n_dims)`) before trusting the reuse, rather than
+assuming similarity from the name alone. No new RoPE composition needed at all, unlike SupertonicTTS's
+own fractional-position RoPE (which DID need a hand-built SIN/COS/MUL composition since ggml's native
+`ROPE` only supports integer positions).
+
+**`generate_path`** (Matcha's own duration→alignment construction) confirmed, via direct numerical
+comparison against the real `torch` function on a small 4-token example, to degenerate to the exact same
+host-side "repeat row t of mu_x, duration[t] times" operation as VITS's own `generate_path` for
+single-utterance (unpadded) inference -- `loom::expand_by_duration` (already built) is directly reusable,
+no new host code needed.
+
+**Decoder U-Net** (the CFM `estimator`, `matcha/models/components/decoder.py`): real config
+`channels=(256,256)` gives a SHALLOW U-Net -- confirmed directly against the real 305-tensor state dict
+that only `down_blocks[0]`/`up_blocks[0]` are real stride-2 conv/stride-2-ConvTranspose1d
+downsample/upsample; `down_blocks[1]`/`up_blocks[1]` are `is_last`, plain same-resolution convs, despite
+each `nn.ModuleList` nominally having 2 entries. Scope decision (mirrors SupertonicTTS's own `T_TEXT`
+choice): the driver always sizes mel-frame count to an exact multiple of 4 (real `fix_len_compatibility`'s
+own default), so `$n_tokens/2` (SymbolEnv supports division/floor in expressions, confirmed by reading
+`symbol_env.cpp`) is always exact and all padding-mask handling drops out (mask is always all-ones for a
+single, unpadded utterance). `BasicTransformerBlock` (imported from `diffusers` upstream, real config has
+`cross_attention_dim=None` so `attn2`/`norm2` don't exist) reduces to: standard multi-head self-attention
+(bias-free q/k/v, matching `diffusers.Attention`'s own default) + a `SnakeBeta`-activated FeedForward
+(`x + (1/exp(beta))*sin(x*exp(alpha))^2`, log-scale learned alpha/beta) -- no cross-attention at all. Both
+reused directly: `ATTENTION` (`kv_cache:false`, same pattern as Kokoro's own ALBERT encoder) and a small
+new SnakeBeta composition (EXP/SIN/SQR/DIV/ADD, no new primitive).
+
+**Two real bugs found via numerical mismatch, not inspection** (both worth remembering for the NEXT
+model that mixes `[T,C]`/`[C,T]`-convention tensors):
+1. `SnakeBeta`'s `alpha`/`beta` (raw shape `(inner_dim,)`) were incorrectly `RESHAPE`'d to `[1,inner_dim]`
+   -- correct only for `[T,C]`-convention broadcasts (bias-adds against `ne[1]=C`); `SnakeBeta` operates
+   on a CHANNEL-FIRST `[C,T]` tensor (`C=ne[0]`), where the raw un-reshaped weight already has the right
+   `ne[0]=C` alignment (same as every other channel-first norm/bias in this project) -- the reshape was
+   simply wrong, caught immediately by ggml's own `ggml_can_repeat` assertion (a crash, not silent
+   corruption).
+2. **The real "gotcha" of this whole milestone**: a `[T,C]`-convention tensor's ggml flat layout
+   (`idx = t + c*T`, `T=ne[0]` fastest) and a numpy `(C,T)`-shaped row-major reference array's own flat
+   layout (`idx = c*T + t`) are the SAME FORMULA (addition commutes) -- meaning `[T,C]`-convention tensors
+   need NO reindexing at all when compared against/fed from a `(C,T)`-shaped `.npy` reference, unlike
+   `[C,T]`-convention (channel-first) tensors, which DO need reindexing (different formula,
+   `idx=c+t*C` vs `idx=c*T+t`). A test written by copy-pasting the channel-first reindexing pattern onto a
+   `[T,C]`-convention tensor (both the INPUT-feeding side and, separately, the OUTPUT-comparison side)
+   introduced two compensating-looking-but-wrong permutations that produced a large, confusing numerical
+   mismatch (`max_abs_diff≈3.8`) despite the underlying ggml graph being 100% correct end-to-end --
+   isolated via a from-scratch numpy reimplementation of the whole topology (matched the real reference to
+   ~1e-5 immediately) plus a per-stage checkpoint-dumping harness (confirmed every intermediate ggml
+   tensor correct), which together proved the bug had to be in the C++ test's own data marshalling, not
+   the conversion script. Lesson: for `[T,C]`-convention tensors specifically, prefer a raw flat-buffer
+   copy/compare over any explicit reindexing loop -- the reindexing is not just unnecessary, it's wrong.
+
+Both `TextEncoder` (`matcha_encoder_mu.gguf`/`matcha_encoder_logw.gguf`) and the `Decoder` U-Net
+(`matcha_decoder.gguf`) verified against real checkpoint weights.
+
+## 2026-07-19: Matcha-TTS COMPLETE -- HiFi-GAN v1 vocoder + MatchaDriver, 96/96 tests passing
+
+Finished the same day. The real HiFi-GAN v1 vocoder (`generator_v1`, paired via `matcha/cli.py`'s
+`VOCODER_URLS`) converted and verified against `matcha.hifigan.models.Generator` run directly, matching
+to ~4e-5 on the FIRST real numerical test (no debugging needed -- the `[T,C]`-convention flat-buffer
+lesson from the Decoder milestone was applied correctly from the start this time). Real config
+(`resblock="1"`, `upsample_rates=[8,8,2,2]`, `upsample_kernel_sizes=[16,16,4,4]`,
+`upsample_initial_channel=512`, `resblock_kernel_sizes=[3,7,11]` w/ dilations `(1,3,5)` for `convs1`
+only -- `convs2` always dilation=1) confirmed against both `matcha/hifigan/config.py`'s `v1` dict and the
+real 104-tensor state dict -- genuinely different topology shape from VITS-piper's own `resblock="2"`/
+3-stage HiFi-GAN (single `convs` list, no `convs2`), but needed zero new primitives (`CONV_1D`/
+`CONV_TRANSPOSE_1D`/`LEAKY_RELU`/`TANH`/`ADD`, all already proven). One easy-to-miss real detail caught by
+re-reading the source rather than assuming: `Generator.forward`'s FINAL `leaky_relu` (right before
+`conv_post`) calls `F.leaky_relu(x)` with NO explicit slope, i.e. PyTorch's default `negative_slope=0.01`,
+NOT the `0.1` used everywhere else in the same function -- VITS's own converter already had this right,
+carried over deliberately rather than re-derived from scratch.
+
+`loom::MatchaDriver` (`include/loom/core/matcha_driver.h`/`src/core/matcha_driver.cpp`) assembles the full
+real call order (`MatchaTTS.synthesise()`): TextEncoder (`mu_x`,`logw`) -> per-token durations
+(`ceil(exp(logw))`, real `length_scale=1.0`) -> row-repeat duration expansion (`loom::expand_by_duration`,
+confirmed degenerate `generate_path`) -> `loom::cfm_euler_sample` (built for SupertonicTTS, reused
+VERBATIM -- `solve_euler`'s own loop, `x=x+dt*dphi_dt` with uniform `dt`, is structurally identical) over
+the new Decoder U-Net estimator -> denormalize (`mel_mean=-5.536622`,`mel_std=2.116101`, both confirmed
+directly from the checkpoint's own 0-d `mel_mean`/`mel_std` tensors, agreeing with
+`hyper_parameters['data_statistics']`) -> HiFi-GAN v1 vocoder -> waveform. Real, documented scope choice
+(mirrors SupertonicTTS's `T_TEXT` precedent): since the Decoder topology drops ALL padding-mask handling
+(valid only when every mel frame is genuinely non-padding), `synthesize()` EXTENDS the last token's own
+predicted duration until the total mel-frame count is an exact multiple of 4 (real
+`fix_len_compatibility`'s own default requirement) -- a principled choice (every frame stays a genuine
+attended `mu_y` row, nothing is ever contaminated padding) rather than reimplementing real masking.
+`MatchaDriver::synthesize()` verified end-to-end on the FIRST real run: 10240-sample waveform (~0.46s at
+22050Hz) from an 8-token demo input, finite and non-silent.
+
+**Matcha-TTS is now fully driveable end-to-end from the real checkpoint.** 96/96 tests passing
+project-wide. Summary of the whole effort: a genuinely different architecture family within the
+Grad-TTS/GlowTTS lineage (conditional-flow-matching mel-spectrogram TTS + separate vocoder, vs VITS's own
+normalizing-flow latent + integrated vocoder) -- reused VITS's own glow-tts-derived custom LayerNorm
+composition, the native `ROPE` primitive (already built for Qwen3, turned out to reproduce Matcha's own
+partial-rotary integer-position RoPE exactly once verified against `ggml`'s own `rotate_pairs`/
+`theta_scale` code), `ATTENTION` with `kv_cache:false` (Kokoro's ALBERT precedent), `loom::
+expand_by_duration` (VITS/Kokoro/StyleTTS2's own degenerate-`generate_path` precedent), and
+`loom::cfm_euler_sample` (SupertonicTTS's own CFM sampler, reused verbatim). One new primitive
+(`GROUP_NORM`, wrapping native `ggml_group_norm`) and one new composition (`SnakeBeta`, log-scale
+learned-frequency activation). The real lesson of this whole milestone, worth carrying into every future
+model: `[T,C]`-convention (`T=ne[0]`) ggml tensors need NO reindexing when fed from/compared against a
+`(C,T)`-shaped row-major `.npy` reference (the flat-index formulas are identical since addition commutes)
+-- unlike `[C,T]`-convention (channel-first) tensors, which DO. A test written by reflexively copying the
+channel-first reindexing pattern onto a `[T,C]`-convention tensor cost real debugging time despite the
+underlying conversion script being correct from the start.
+
+Per the user's own priority order (as last revised): F5-TTS is next and is the final model in the
+originally-specified list (Whisper v3 → FastConformer RNN-T → Kokoro → StyleTTS2 → SupertonicTTS →
+Matcha-TTS → F5-TTS).
