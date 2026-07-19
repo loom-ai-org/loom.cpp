@@ -3622,3 +3622,47 @@ underlying conversion script being correct from the start.
 Per the user's own priority order (as last revised): F5-TTS is next and is the final model in the
 originally-specified list (Whisper v3 → FastConformer RNN-T → Kokoro → StyleTTS2 → SupertonicTTS →
 Matcha-TTS → F5-TTS).
+
+## 2026-07-19: PAUSED — pivoting to procedural generalization (embedded Lua + MIL-based compiler)
+
+Explicit user direction: stop the model-porting roadmap and every other open task tracker item, and
+tackle a foundational architecture problem first. Two design docs now govern the next phase of work:
+`LOOM_PROCEDURAL_GENERALIZATION.md` (top-level rationale: replace bespoke C++ drivers with an embedded
+LuaJIT orchestration layer + an offline PyTorch-to-Loom compiler) and `LOOM_MIL_CONVERSION.md` (detailed
+spec: use `coremltools`'s MIL IR as the offline compiler frontend, translate MIL `main`-function control
+flow to a transpiled Lua driver script embedded in the GGUF, and lower heavy submodule functions to
+static `graph_topology` JSON + block-quantized weights, mirroring Apple's own PyTorch→MIL→ANE pipeline).
+Core idea: every model family ported so far (Whisper, VITS, Kokoro, StyleTTS2, SupertonicTTS, Matcha-TTS)
+needed a bespoke hand-written C++ driver (`*_driver.cpp`) to handle multi-subgraph orchestration,
+autoregressive/ODE control flow, and host-side math (mask generation, duration expansion, Euler
+sampling, etc.) — this doesn't scale, and the goal now is to make that orchestration layer
+data-driven/scriptable instead of requiring new C++ per model.
+
+The following task-tracker items were **unqueued** (removed from active tracking) and are deferred here
+until the foundational work lands; none are abandoned, just paused:
+
+- **VITS: integrate a permissively-licensed phonemizer.** Real `espeak-ng` vendoring was already
+  rejected (GPL-3, see [[loom_engine_licensing_phonemizer]] memory) — plan was `phoonnx` for VITS's
+  phonemizer instead. Also relevant to Kokoro/StyleTTS2/Matcha-TTS's own text-frontend gaps (none of
+  these drivers do real phonemization yet, all use raw token-id demo inputs).
+- **Add new model families to force out missing primitives** (task #80, was in_progress). Whisper v3,
+  FastConformer RNN-T, Kokoro, StyleTTS2, SupertonicTTS, and Matcha-TTS are all COMPLETE (each with a
+  hand-written C++ driver, per the very problem this pivot addresses). **F5-TTS** was next and is now
+  deferred — the last model in the original 7-model priority list. Once the Lua/MIL architecture lands,
+  F5-TTS (and potentially the completed models too) should be portable through the NEW pipeline instead
+  of getting yet another hand-written driver, which would help validate the new architecture end-to-end.
+- **Evaluate generalizing `aten_to_loom.py` into a real exporting tool.** Directly superseded in spirit
+  by `LOOM_MIL_CONVERSION.md`'s own compiler spec (`tools/codegen/compile_pytorch_to_loom.py` /
+  `LoomGGUFExporter`) — worth revisiting `aten_to_loom.py`'s existing op-mapping code as a reference/
+  starting point when building the new MIL-based exporter, rather than starting from zero.
+- **Make quantization a general process/tool, including KV-cache quantization.** Still relevant
+  independent of the Lua/MIL pivot — the new compiler's own "block-quantized weights" step
+  (`LOOM_MIL_CONVERSION.md` §2, `self.weights` → GGUF) will need this either way.
+- **Add primitives for modern attention variants, prioritizing flash attention** (`ggml_flash_attn_ext`).
+  Still relevant independent of the pivot — a primitive-level improvement, orthogonal to the
+  orchestration-layer rewrite.
+
+See [[loom_engine_procedural_generalization_roadmap]] memory (already tracked LOOM_PROCEDURAL_GENERALIZATION.md
+as the user's own Lua-embedding design, previously deferred until model-porting finished — that
+"finished" condition is now considered satisfied enough to start, six of seven models done, per this
+explicit pivot).
