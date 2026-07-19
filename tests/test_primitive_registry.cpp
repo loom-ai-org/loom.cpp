@@ -247,6 +247,49 @@ void test_tanh() {
     LOOM_CHECK(ok);
 }
 
+void test_sin_cos() {
+    // Added for Kokoro TTS (StyleTTS2-family): the NSF harmonic source's SineGen and the Generator's
+    // "Snake1D" activation (x + sin(a*x)^2/a) both need raw sin/cos -- ggml already has ggml_sin/
+    // ggml_cos natively (confirmed by reading ggml.h directly), so this is a thin wrapper, same pattern
+    // as every other one-line primitive in this file. Two independent scratch graphs (rather than one
+    // multi-output graph) since GgmlScratch::expand only supports a single declared output.
+    const std::vector<float> a_data = {0.0f, 0.5f, 1.5707963f, 3.1415926f};
+    {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
+        ggml_set_input(a);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("SIN")(pc, {a}, {})[0];
+        ggml_cgraph* gf = s.expand(out);
+        set_f32(a, a_data);
+        s.compute(gf);
+        auto result = get_f32(out);
+        bool ok = true;
+        for (size_t i = 0; i < a_data.size(); ++i) {
+            if (std::fabs(result[i] - std::sin(static_cast<double>(a_data[i]))) > 1e-5) ok = false;
+        }
+        LOOM_CHECK(ok);
+    }
+    {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
+        ggml_set_input(a);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("COS")(pc, {a}, {})[0];
+        ggml_cgraph* gf = s.expand(out);
+        set_f32(a, a_data);
+        s.compute(gf);
+        auto result = get_f32(out);
+        bool ok = true;
+        for (size_t i = 0; i < a_data.size(); ++i) {
+            if (std::fabs(result[i] - std::cos(static_cast<double>(a_data[i]))) > 1e-5) ok = false;
+        }
+        LOOM_CHECK(ok);
+    }
+}
+
 void test_relu() {
     GgmlScratch s;
     ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
@@ -367,6 +410,66 @@ void test_conv_1d_dw() {
     // ch0 (sum filter over [0,1,2,3,4,0] padded): [3,6,9,7]
     // ch1 (edge filter over [0,5,6,7,8,0] padded): [-6,-2,-2,7]
     LOOM_CHECK((get_f32(out) == std::vector<float>{3, 6, 9, 7, -6, -2, -2, 7}));
+}
+
+void test_depthwise_conv_transpose_1d_via_composition() {
+    // Kokoro's AdainResBlk1d "pool" (a weight-normed, DEPTHWISE ConvTranspose1d, kernel=3, stride=2,
+    // padding=1, output_padding=1 -- real shapes confirmed against the checkpoint's own
+    // `predictor.F0.1.pool.weight_v` (512,1,3)) has no direct ggml primitive (ggml_conv_transpose_1d
+    // is non-grouped only, and this project has no CONV_TRANSPOSE_1D_DW). Composes entirely from
+    // EXISTING primitives instead: zero-stuff the input (RESHAPE to insert a dummy fastest axis +
+    // PAD_1D by stride-1 on it + RESHAPE flattens back, giving a length-L_in*stride "overstuffed"
+    // signal with a trailing (stride-1) extra zeros vs. the textbook zero-stuffing scheme) -> VIEW+CONT
+    // truncates to the textbook (L_in-1)*stride+1 length -> PAD_1D by (kernel-1-padding) each side plus
+    // output_padding on the right -> CONV_1D_DW with the kernel REVERSED along its own length axis (a
+    // conversion-time transform of the real weight, not a runtime op -- transposed convolution is
+    // cross-correlation with a flipped kernel). Verified against real
+    // torch.nn.functional.conv_transpose1d(groups=channels) on a small hand-picked example (C=2,L_in=4)
+    // BEFORE trusting this composition for anything real, matching this project's usual discipline for
+    // novel compositions (INTERPOLATE_1D's bilinear-degenerates-to-1D-linear trick, the ISTFT-via-
+    // CONV_TRANSPOSE_1D derivation, etc.).
+    constexpr int64_t kC = 2, kLIn = 4, kStride = 2, kKernel = 3, kPadding = 1, kOutputPadding = 1;
+    GgmlScratch s;
+    ggml_tensor* data = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kLIn, kC);
+    ggml_set_input(data);
+    ggml_tensor* kernel_flipped = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, kKernel, 1, kC);
+    ggml_set_input(kernel_flipped);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+
+    ggml_tensor* d3 = op("RESHAPE")(pc, {data}, {{"shape", {1, kLIn, kC}}})[0];
+    ggml_tensor* stuffed3 = op("PAD_1D")(pc, {d3}, {{"lp0", 0}, {"rp0", kStride - 1}})[0]; // [stride,L_in,C]
+    ggml_tensor* overstuffed = op("RESHAPE")(pc, {stuffed3}, {{"shape", {kLIn * kStride, kC}}})[0];
+    constexpr int64_t kStdLen = (kLIn - 1) * kStride + 1;
+    ggml_tensor* truncated_view = op("VIEW")(pc, {overstuffed}, {{"shape", {kStdLen, kC}}})[0];
+    ggml_tensor* truncated = op("CONT")(pc, {truncated_view}, {})[0];
+    constexpr int64_t kPadEach = kKernel - 1 - kPadding;
+    ggml_tensor* padded = op("PAD_1D")(pc, {truncated}, {{"lp0", kPadEach}, {"rp0", kPadEach + kOutputPadding}})[0];
+    ggml_tensor* out = op("CONV_1D_DW")(pc, {kernel_flipped, padded}, {{"s0", 1}, {"p0", 0}, {"d0", 1}})[0];
+
+    LOOM_CHECK(out->ne[0] == 8);
+    LOOM_CHECK(out->ne[1] == kC);
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(data, {1.5409960746765137f, -0.293428897857666f, -2.1787893772125244f, 0.5684312582015991f,
+                   -1.0845223665237427f, -1.3985954523086548f, 0.40334683656692505f, 0.8380263447761536f});
+    // kernel, PRE-FLIPPED along its own length axis (conversion-time transform, not a runtime op):
+    // real w = [[-0.7192576,-0.4033435,-0.5966353],[0.1820365,-0.8566746,1.1006042]] -> reversed per row.
+    set_f32(kernel_flipped, {-0.5966353416442871f, -0.40334352850914f, -0.7192575931549072f,
+                             1.1006041765213013f, -0.8566746115684509f, 0.18203648924827576f});
+    s.compute(gf);
+
+    const std::vector<float> expected = {
+        -0.6215507984161377f, -0.7083617448806763f, 0.11835264414548874f, 1.7421808242797852f,
+        0.8788005709648132f, 0.8910942673683167f, -0.22927306592464447f, -0.3391461670398712f,
+        0.9290827512741089f, -1.4482252597808838f, 1.1981412172317505f, -1.4658761024475098f,
+        -0.345537006855011f, 0.5964765548706055f, -0.7179158926010132f, 0.9223352670669556f,
+    };
+    auto result = get_f32(out);
+    bool ok = true;
+    for (size_t i = 0; i < expected.size(); ++i) if (std::fabs(result[i] - expected[i]) > 1e-5f) ok = false;
+    LOOM_CHECK(ok);
 }
 
 void test_reshape_permute_cont() {
@@ -961,6 +1064,72 @@ void test_sqr_sqrt_log() {
     LOOM_CHECK(log_ok);
 }
 
+void test_atan2() {
+    // ATAN2(y,x) via ggml_map_custom2 -- no native ggml op, needed for Kokoro's Generator (real STFT
+    // phase = atan2(imag,real)). Covers all 4 quadrants plus the x=0 edge cases against std::atan2.
+    GgmlScratch s;
+    ggml_tensor* y = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 6);
+    ggml_tensor* x = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 6);
+    ggml_set_input(y);
+    ggml_set_input(x);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("ATAN2")(pc, {y, x}, {})[0];
+
+    ggml_cgraph* gf = s.expand(out);
+    const std::vector<float> y_data = {1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f};
+    const std::vector<float> x_data = {1.0f, -1.0f, -1.0f, 1.0f, 0.0f, -1.0f};
+    set_f32(y, y_data);
+    set_f32(x, x_data);
+    s.compute(gf);
+
+    const auto result = get_f32(out);
+    bool ok = true;
+    for (size_t i = 0; i < y_data.size(); ++i) {
+        if (std::fabs(result[i] - std::atan2(y_data[i], x_data[i])) > 1e-6f) ok = false;
+    }
+    LOOM_CHECK(ok);
+}
+
+void test_exp() {
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("EXP")(pc, {a}, {})[0];
+
+    ggml_cgraph* gf = s.expand(out);
+    const std::vector<float> a_data = {0.0f, 1.0f, -1.0f, 2.0f};
+    set_f32(a, a_data);
+    s.compute(gf);
+
+    const auto result = get_f32(out);
+    bool ok = true;
+    for (size_t i = 0; i < a_data.size(); ++i) {
+        if (std::fabs(result[i] - std::exp(a_data[i])) > 1e-5f) ok = false;
+    }
+    LOOM_CHECK(ok);
+}
+
+void test_floor() {
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 5);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("FLOOR")(pc, {a}, {})[0];
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(a, {1.9f, -1.1f, 2.0f, 0.0f, -0.5f});
+    s.compute(gf);
+
+    LOOM_CHECK((get_f32(out) == std::vector<float>{1.0f, -2.0f, 2.0f, 0.0f, -1.0f}));
+}
+
 void test_sum_rows() {
     GgmlScratch s;
     // ne=[3,2]: row0=[1,2,3], row1=[4,5,6] (ggml "rows" are along ne[0]).
@@ -996,6 +1165,101 @@ void test_pad_1d() {
     s.compute(gf);
 
     LOOM_CHECK((get_f32(out) == std::vector<float>{0, 5, 6, 7, 0, 0}));
+}
+
+void test_concat() {
+    // ggml_concat(a,b,dim) -- real in-graph channel concatenation needed by Kokoro's Decoder (torch.cat
+    // sites whose operands are themselves graph-computed, unlike the host-side style-concatenation used
+    // for TextEncoder/DurationEncoder). ne=[T=2,C=3] "a" concatenated with ne=[T=2,C=2] "b" along dim=1
+    // (channels) -> ne=[2,5]; separately verifies dim=0 (T-axis) concatenation too.
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 2, 3);
+    ggml_tensor* b = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 2, 2);
+    ggml_set_input(a);
+    ggml_set_input(b);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out_dim1 = op("CONCAT")(pc, {a, b}, {{"dim", 1}})[0];
+    LOOM_CHECK(out_dim1->ne[0] == 2 && out_dim1->ne[1] == 5);
+
+    ggml_cgraph* gf = s.expand(out_dim1);
+    set_f32(a, {1, 2, 3, 4, 5, 6});     // ne=[2,3]: rows (t=0,1) x (c=0,1,2)
+    set_f32(b, {10, 20, 30, 40});       // ne=[2,2]
+    s.compute(gf);
+    LOOM_CHECK((get_f32(out_dim1) == std::vector<float>{1, 2, 3, 4, 5, 6, 10, 20, 30, 40}));
+
+    // dim=0 (T-axis) concatenation: ne=[2,2] "c" ++ ne=[3,2] "d" (same channel count) -> ne=[5,2].
+    GgmlScratch s2;
+    ggml_tensor* c = ggml_new_tensor_2d(s2.ctx.get(), GGML_TYPE_F32, 2, 2);
+    ggml_tensor* d = ggml_new_tensor_2d(s2.ctx.get(), GGML_TYPE_F32, 3, 2);
+    ggml_set_input(c);
+    ggml_set_input(d);
+    loom::PrimitiveContext pc2{s2.ctx.get(), env, nullptr};
+    ggml_tensor* out_dim0 = op("CONCAT")(pc2, {c, d}, {{"dim", 0}})[0];
+    LOOM_CHECK(out_dim0->ne[0] == 5 && out_dim0->ne[1] == 2);
+    ggml_cgraph* gf2 = s2.expand(out_dim0);
+    set_f32(c, {1, 2, /*row1*/ 3, 4});
+    set_f32(d, {10, 20, 30, /*row1*/ 40, 50, 60});
+    s2.compute(gf2);
+    LOOM_CHECK((get_f32(out_dim0) == std::vector<float>{1, 2, 10, 20, 30, /*row1*/ 3, 4, 40, 50, 60}));
+}
+
+void test_interpolate_1d() {
+    // Cross-checked against real torch.nn.functional.interpolate on the exact same input (input {1,2,3,4},
+    // ne=[4,1]) before trusting the "bilinear-with-ne1-held-fixed degenerates to 1D linear" claim
+    // documented in op_interpolate_1d's own comment:
+    //   F.interpolate(x, scale_factor=2, mode='linear', align_corners=False)
+    //     -> [1.0, 1.25, 1.75, 2.25, 2.75, 3.25, 3.75, 4.0]
+    //   F.interpolate(x, scale_factor=0.5, mode='linear', align_corners=False) -> [1.5, 3.5]
+    //   F.interpolate(x, scale_factor=2, mode='nearest') -> [1, 1, 2, 2, 3, 3, 4, 4]
+    const std::vector<float> a_data = {1, 2, 3, 4};
+
+    {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 4, 1);
+        ggml_set_input(a);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("INTERPOLATE_1D")(pc, {a}, {{"ne0", 8}, {"mode", "linear"}})[0];
+        ggml_cgraph* gf = s.expand(out);
+        set_f32(a, a_data);
+        s.compute(gf);
+        const std::vector<float> expected = {1.0f, 1.25f, 1.75f, 2.25f, 2.75f, 3.25f, 3.75f, 4.0f};
+        auto result = get_f32(out);
+        bool ok = true;
+        for (size_t i = 0; i < expected.size(); ++i) if (std::fabs(result[i] - expected[i]) > 1e-5) ok = false;
+        LOOM_CHECK(ok);
+    }
+    {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 4, 1);
+        ggml_set_input(a);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("INTERPOLATE_1D")(pc, {a}, {{"ne0", 2}, {"mode", "linear"}})[0];
+        ggml_cgraph* gf = s.expand(out);
+        set_f32(a, a_data);
+        s.compute(gf);
+        const std::vector<float> expected = {1.5f, 3.5f};
+        auto result = get_f32(out);
+        bool ok = true;
+        for (size_t i = 0; i < expected.size(); ++i) if (std::fabs(result[i] - expected[i]) > 1e-5) ok = false;
+        LOOM_CHECK(ok);
+    }
+    {
+        GgmlScratch s;
+        ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 4, 1);
+        ggml_set_input(a);
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* out = op("INTERPOLATE_1D")(pc, {a}, {{"ne0", 8}, {"mode", "nearest"}})[0];
+        ggml_cgraph* gf = s.expand(out);
+        set_f32(a, a_data);
+        s.compute(gf);
+        const std::vector<float> expected = {1, 1, 2, 2, 3, 3, 4, 4};
+        LOOM_CHECK((get_f32(out) == expected));
+    }
 }
 
 void test_rq_spline_inverse() {
@@ -1846,12 +2110,14 @@ int main() {
     test_layer_norm();
     test_sigmoid();
     test_tanh();
+    test_sin_cos();
     test_relu();
     test_leaky_relu();
     test_step();
     test_cumsum();
     test_glu();
     test_conv_1d_dw();
+    test_depthwise_conv_transpose_1d_via_composition();
     test_reshape_permute_cont();
     test_reshape_infers_minus_one_dim();
     test_view();
@@ -1873,8 +2139,13 @@ int main() {
     test_rel_pos_attention();
     test_sub_div_scale();
     test_sqr_sqrt_log();
+    test_atan2();
+    test_exp();
+    test_floor();
     test_sum_rows();
     test_pad_1d();
+    test_concat();
+    test_interpolate_1d();
     test_rq_spline_inverse();
     test_rq_spline_inverse_outside_tail_bound();
     test_wn();

@@ -2013,9 +2013,1229 @@ this session, see the `VitsDriver`/reference-script BACKLOG entries above for th
 **Why this matters**: without it, "loom-engine can run VITS TTS" is only true if the CALLER supplies
 already-phonemized token ids (as `test_e2e_vits_driver`/`reference_forward_vits.py` currently do, via the
 Python `piper_phonemize` package) — a real, meaningful gap between "the model runs" (done, verified) and
-"you can type a sentence and get audio using only this project" (not yet true). Scope this as its own
-milestone (new C++ source under e.g. `src/text/phonemize.cpp` + `include/loom/text/phonemize.h`, matching
-this project's existing `src/core/`+`include/loom/core/` split), with its own build-system integration for
-the vendored espeak-ng fork (likely a new CMake `FetchContent`/`ExternalProject`, mirroring how
-piper-phonemize itself pulls it in) and a unit test comparing against `piper_phonemize`'s own output for
-a handful of real sentences before trusting it.
+"you can type a sentence and get audio using only this project" (not yet true).
+
+**DEFERRED — licensing conflict, do not vendor espeak-ng into this repo.** loom-engine is licensed
+MIT (repo's own `LICENSE` file) and is meant to stay permissive (MIT/Apache-2.0 class); espeak-ng
+(stock AND the piper-phonemize fork) is **GPL-3**. Vendoring `phonemize.cpp` + the espeak-ng fork's
+source directly into this repo, as originally scoped above, would pull GPL-3-licensed code into a
+permissively-licensed project — not acceptable as-is (linking against a separately-distributed GPL-3
+`.so`/binary at the user's own discretion is a different, less entangling story than vendoring source,
+but that's a decision for whoever picks this up, not assumed here). Do not implement the
+vendoring-into-this-repo plan above without resolving the licensing question first.
+
+Current plan: skip espeak-ng-based phonemization entirely and instead integrate a differently-licensed
+phonemizer — candidate: **phoonnx** (a friend-of-the-user's project) — once its license and API are
+confirmed compatible. Re-scope this task around whatever that integration turns out to need (likely
+still a `src/text/phonemize.cpp` + `include/loom/text/phonemize.h` split, matching this project's
+existing `src/core/`+`include/loom/core/` convention, but the build-system/vendoring shape depends
+entirely on how phoonnx is packaged and licensed — not yet investigated).
+
+**Linking vs. subprocess note** (in case espeak-ng ever comes back as a fallback): GPL-3 has no
+LGPL-style linking exception, and there's no applicable "system library" carve-out for a bundled/fetched
+dependency, so statically OR dynamically linking espeak-ng into loom-engine's own distributed binary
+would make that binary a GPL-3 combined work — not compatible with staying permissive. Driving a
+separately-installed `espeak-ng` as an out-of-process subprocess/CLI (or an optional, clearly-labeled
+GPL build variant, e.g. a `-DLOOM_WITH_ESPEAK=ON` flag) would NOT entangle the core project's license.
+Not a lawyer's opinion — re-verify before actually shipping anything that touches espeak-ng.
+
+---
+
+### TODO: add new model families to force out new/missing primitives
+
+Every model added so far (toy LLM/ASR/vision/TTS, real Conformer-CTC, real Qwen3-0.6B-Base, real VITS)
+has earned its keep by exposing at least one genuine engine gap before being fully wired up — that's the
+project's core validation method (real checkpoint + hand-computed primitive verification, not "looks
+plausible"). Candidates identified as worth tackling next, roughly for the NEW primitive/architecture
+gap each is expected to expose (not yet confirmed by reading each one's real source the way VITS's
+source was read in full before planning — that reading is the first step whenever one of these is
+picked up, same discipline as every previous model):
+
+- **Whisper (v3)** — encoder-decoder with cross-attention; likely close to what Qwen3/Conformer already
+  cover (`ATTENTION`, layer norm, conv frontend) but cross-attention (separate K/V source from Q's
+  sequence) and the sinusoidal (non-learned, non-RoPE) positional embedding may be genuinely new wiring,
+  not just a new checkpoint on existing primitives — needs confirming against real source before assuming.
+- **FastConformer RNN-T** — this project already has real Conformer-CTC (NeMo) and a `TdtDecoder`
+  (transducer decoding) precedent from earlier NeMo work; FastConformer's depthwise-separable
+  subsampling and the RNN-T joint network (as opposed to TDT's duration-augmented joint) are the likely
+  new surface — may turn out to be mostly composition of existing primitives plus a new joint-network
+  topology, needs checking against NeMo's real FastConformer-RNNT source, not assumed similar to TDT.
+- **Kokoro TTS** — StyleTTS2-family architecture (see below); check whether Kokoro's specific decoder
+  (reportedly ISTFT-based rather than HiFi-GAN) needs a new vocoder primitive beyond what VITS's
+  HiFi-GAN `Generator` already covers.
+- **StyleTTS2** — style-diffusion-based TTS (adaptive instance norm conditioning, a diffusion sampler for
+  the style vector) — likely the first genuinely diffusion-flavored model in this project (iterative
+  denoising sampling loop, not a single reverse-flow pass like VITS's SDP/coupling flow), which may need
+  new host-driver looping patterns (`VitsDriver`'s two-phase pattern may generalize, or may not).
+- **SupertonicTTS** — unfamiliar to this project; needs a from-scratch read of its real source/paper
+  before any primitive-gap claim can be made.
+- **F5-TTS** — flow-matching-based (ODE-solver sampling, conceptually related to the `OdeStepper` host
+  driver already built for an earlier milestone) — likely close to existing patterns but needs
+  confirming its specific conditioning mechanism (audio+text in-context conditioning) against real source.
+- **Matcha-TTS** — another flow-matching TTS (also `OdeStepper`-adjacent); likely shares more with
+  existing patterns than the others in this list, worth checking whether it's redundant with F5-TTS's
+  gap coverage before investing in both.
+
+**How to apply**: pick ONE at a time, read its real source in full before planning (same discipline as
+every prior model in this project — VITS's plan explicitly started from reading
+`piper_train/vits/{models,modules,attentions,transforms,commons}.py` end-to-end before scoping anything),
+confirm which primitives are genuinely new vs. already covered, and follow the same
+convert-script + hand-rolled-Python-reference + hand-computed-primitive-unit-test + numerical e2e-test
+discipline established for Conformer-CTC/Qwen3/VITS. Don't assume gaps from the list above without
+re-confirming against that model's actual real source and a real checkpoint.
+
+---
+
+### TODO: evaluate generalizing `aten_to_loom.py` into a real exporting tool
+
+`tools/convert_generic/aten_to_loom.py` (currently a proof-of-concept, per its own module docstring)
+walks a `torch.export()` ATen graph node-by-node through a small fixed `OP_MAP` table, with NO
+pattern-matching/subgraph fusion, NO dynamic-shape support, and only a single hardcoded
+qualname→GGUF-key rule (`_qualname_to_gguf_name`, ToyLLM/Conformer-specific: `layers.N` → `blk.N`, bare
+`nn.Parameter`s get `.weight` appended). Every model converted so far in this project
+(`convert_qwen3`, `convert_nemo`, `convert_piper_vits`) instead uses its own bespoke, hand-written
+conversion script reading the real checkpoint's state dict directly — NOT this generic exporter.
+
+**What "general" would need to mean, concretely** (not yet scoped in detail):
+- A pluggable weight-naming strategy per model family, replacing the single hardcoded
+  `_qualname_to_gguf_name` rule — likely a small per-family config/callback rather than one fixed
+  function, since each model so far has needed a different (if small) renaming rule.
+- Handling models whose real `torch.export()` graph is "broken" for this purpose — e.g. custom ops that
+  don't survive export cleanly, in-place mutation, data-dependent control flow (already known to be a
+  hard blocker for anything using boolean-mask indexing or per-sample branching) — needs a concrete list
+  of which real models actually break and how, not a hypothetical list.
+- Deciding whether fusion/pattern-matching (e.g. recognizing `scaled_dot_product_attention`'s decomposed
+  ATen ops and re-fusing into loom's single `ATTENTION` primitive, rather than requiring the source
+  `nn.Module` to call a custom op as today) is in scope — today's design deliberately punts this onto the
+  source model (see the module docstring: "the source nn.Module is expected to have called a custom op").
+  Generalizing away from that requirement is a materially bigger undertaking than the rest of this list.
+- Whether this is worth doing generally at all, vs. continuing to accept one bespoke script per model
+  family (the current, working approach) — this needs an honest cost/benefit pass once 2-3 more real
+  models have been converted by hand (see the model-families TODO above), so the generalization is
+  informed by real, repeated pain points rather than speculative design.
+
+**How to apply**: don't start broad rearchitecture of `aten_to_loom.py` speculatively. Revisit once a
+few more real conversion scripts exist (from the model-families TODO above) and look for what actually
+repeated across them vs. what was genuinely bespoke each time — generalize only the parts that
+demonstrably repeated.
+
+---
+
+### TODO: make quantization a general process/tool (including KV-cache quantization)
+
+`tools/quantize/quantize_gguf_q8_0.py` currently exists as a single fixed-scheme (Q8_0) script,
+presumably written for one specific model's GGUF output rather than as a general, model-agnostic
+quantization pass. Not yet re-read in full this session to confirm its exact current scope/limitations —
+that's the first step before scoping this properly, same as every other TODO here.
+
+**What "general" likely needs to cover** (provisional, needs confirming against the real script and
+against ggml's actual supported quant types before treating as fixed scope):
+- Multiple quantization schemes beyond Q8_0 (ggml supports a family of k-quants/legacy quants — which
+  ones are worth exposing needs checking against real ggml support, not assumed).
+- Per-tensor-role policy (e.g. skip quantizing norm weights/biases, embedding tables, or other
+  known-sensitive tensors — a common convention in llama.cpp-family quantizers) rather than a uniform
+  blanket quantization of every tensor in the GGUF.
+- **KV-cache quantization** specifically — this is a runtime/inference-time concern (quantizing the
+  attention KV cache during generation, not the static weights at conversion time), which is a
+  genuinely different mechanism from weight quantization and likely needs its own engine-side support
+  (checking how the KV cache is currently allocated/typed in this engine's attention primitives is the
+  first step, not assumed to be a trivial extension of the weight-quantization script).
+- A single general entry point/tool (as opposed to a per-model bespoke invocation) that can be pointed at
+  any of this project's GGUF outputs.
+
+**How to apply**: re-read `quantize_gguf_q8_0.py` in full first to establish what actually exists today
+before assuming any of the above is missing. Treat weight quantization and KV-cache quantization as two
+separate sub-efforts (different mechanism, different point in the inference pipeline) rather than one
+undifferentiated "quantization" task.
+
+---
+
+### TODO: add primitives for the range of attention variants used in modern models (incl. flash attention)
+
+This project currently has three attention primitives (`ATTENTION`, `REL_POS_ATTENTION` for
+Transformer-XL-style Conformer relative position, `REL_POS_ATTENTION_SHAW` for VITS's Shaw et al.
+lookup-table relative position — confirmed via `src/ops/primitives_attention.cpp`), each added because a
+real model genuinely needed it, not spec'd out ahead of need. The model-families TODO above will likely
+force out more variants naturally (Whisper's cross-attention being the most immediately likely), but
+worth tracking as its own cross-cutting concern since attention-kernel choice affects performance, not
+just correctness:
+
+- **Flash attention** — llama.cpp/ggml has a fused `ggml_flash_attn_ext` kernel (memory-efficient,
+  fused softmax(QK^T/sqrt(d))V without materializing the full attention matrix) — this project should
+  benefit directly from whatever ggml itself already provides as a primitive/kernel, rather than
+  reimplementing the fusion independently. First step when this is picked up: check the exact vendored
+  ggml version's real `ggml_flash_attn_ext` signature/constraints (head-dim restrictions, mask-shape
+  requirements, causal-flag support, F16-vs-F32 KV-cache requirements are all known real constraints in
+  upstream llama.cpp — needs re-confirming against this project's actual vendored ggml, not assumed from
+  general knowledge) before wiring a new `ATTENTION`-family primitive around it.
+- **General principle for this whole area**: whenever llama.cpp/ggml has already solved an
+  attention-kernel-shaped problem as a primitive or specialized kernel (flash attention being the
+  concrete example in hand, but likely not the only one), loom-engine should wire a thin primitive
+  directly onto ggml's own op rather than reimplementing the fusion from scratch in terms of more basic
+  ops — mirrors this project's existing practice of using ggml's native ops wherever one exists (e.g.
+  `ggml_clamp`, `ggml_leaky_relu`) instead of hand-composing.
+- Cross-attention (Q from one sequence, K/V from another — needed by Whisper's decoder, likely also
+  F5-TTS/Matcha-TTS's conditioning) is a plausible additional gap, but whether it needs a genuinely new
+  primitive or is just `ATTENTION` called with differently-shaped/sourced inputs needs checking against
+  the current `op_attention` implementation before assuming new engine code is required.
+
+**How to apply**: don't speculatively add attention primitives ahead of a real model needing them — this
+list exists to flag flash attention specifically as a known, concrete, ggml-native opportunity (re-use,
+not reinvention) worth prioritizing early since it's a performance win applicable to every existing
+model, not just new ones, once verified compatible with this project's existing `ATTENTION` call sites.
+
+---
+
+### 2026-07-19: Whisper v3 (`tiny.en`) — AudioEncoder converted and numerically verified
+
+First model tackled from the model-families TODO above (user-specified priority order: Whisper v3
+first). Read `whisper/model.py`/`audio.py` (the real, installed `openai-whisper` package — `pip install
+openai-whisper tiktoken` into the piper venv, plus a real `tiny.en` checkpoint via
+`whisper.load_model("tiny.en", download_root=...)`) in full before planning, same discipline as VITS.
+
+**Primitive gap turned out to be far smaller than the backlog entry above guessed, on both counts it
+flagged as "likely new":**
+- **Cross-attention needs NO new primitive at all.** `ATTENTION` (`primitives_attention.cpp`) already
+  takes independent q/k/v tensors with no assumption they share a source — confirmed by reading
+  `op_attention` directly, not assumed. Whisper's decoder cross-attention (Q from the decoder's own
+  hidden state, K/V from the encoder output `xa`) is just an ordinary `ATTENTION` call with `kv_cache:
+  false` and K/V projected from a different input than Q — still unexercised end-to-end (decoder not
+  built yet, see below), but the primitive-level claim is settled.
+- **The mel frontend's global dynamic-range clamp needs NO new primitive either.** `POOL_1D`
+  (`primitives_conv.cpp`) already supports `{"op":"max", ...}`, wrapping `ggml_pool_1d(GGML_OP_POOL_MAX,
+  ...)` directly. `log_spec.max()` (a true GLOBAL max over the whole `[n_mels,n_frames]` spectrogram, not
+  a per-row reduction) is computed by reshaping to a single length-`n_mels*n_frames` row first, then
+  pooling with `k0=s0=` that same length → a single-element output; `max(log_spec, gmax-8)` is then
+  `RELU(log_spec - (gmax-8)) + (gmax-8)`, composed from existing ADD/SUB/RELU — no new engine code
+  anywhere in the whole mel frontend. (Briefly, mistakenly, added a redundant `MAX_POOL_1D` primitive
+  before noticing `POOL_1D` already covered this — reverted before committing.)
+
+**Real, confirmed formula differences from `tools/convert_nemo/mel_common.py`'s existing STFT-via-conv
+precedent** (new module `tools/convert_whisper/whisper_common.py`, NOT a shared one — see its own header
+comment for the full list): no preemphasis; window is `torch.hann_window(400, periodic=True)`, a
+genuinely different formula from NeMo's `periodic=False` convention (denominator `N` vs `N-1` —
+confirmed numerically, not a rounding artifact: `hann(8,periodic=True)[1]=0.1464466` vs
+`hann(8,periodic=False)[1]=0.1882551`); `torch.stft(center=True)`'s padding is **reflect**, not
+zero/constant — `ggml_conv_1d`'s own padding is zero-only, so reflect-padding is done **host-side**
+(`whisper_common.pad_reflect`) before the (always-fixed-30s-length) waveform ever enters the graph, not a
+new primitive (Whisper's fixed 480000-sample window makes this a fixed-shape host precompute, same
+"host computes, feeds in as a declared input" precedent as VITS's noise injection); Whisper drops the
+LAST STFT time-frame (`stft[...,:-1]`, handled via a VIEW+CONT slicing off the last position); log10 (not
+natural log, `LOG` + `SCALE(1/ln 10)`); no per-feature CMVN. All confirmed by a standalone numpy-vs-real
+`whisper.audio.log_mel_spectrogram` check (`verify_whisper_mel.py`, scratch, not committed) before
+writing any GGUF/ggml code, matching to 3.7e-6.
+
+**Real, confirmed axis-convention finding**: `CONV_1D`'s data input is `[IL, IC, N]` (T=`ne[0]`, channels
+`ne[1]`) — confirmed by re-reading `convert_parakeet_tdt.py`'s own declared `"waveform"` input shape
+(`["n_tokens","1","1"]`), not assumed. The mel filterbank's `MUL_MAT` output is channel-first
+(`[n_mels,n_frames]`, C=`ne[0]`, matching this project's own attention convention) — the OPPOSITE of
+`CONV_1D`'s convention — so a `PERMUTE`+`CONT` is needed crossing INTO `conv1` and crossing back OUT after
+`conv2` before the positional-embedding add, same "cross the boundary with `PERMUTE`+`CONT`" pattern
+VITS's own header comment documents for its channel-first-attention/T-first-`CONV_1D` boundary. `CONV_1D`
+chained directly to another `CONV_1D` (conv1 → conv2) needs NO transpose in between (both consume/produce
+the same `[T,C,N]` convention) — a real mistake caught before running anything: an unnecessary
+`PERMUTE`+`CONT` was initially inserted between conv1 and conv2, removed once traced through carefully.
+
+**Whisper's encoder is the first model in this project with an entirely FIXED shape** (always exactly a
+30s/480000-sample window, `n_audio_ctx=1500` positions) — no `"$n_tokens"`-style dynamic-length symbol
+anywhere in this topology at all, unlike every prior model (Conformer/Qwen3/VITS all have genuinely
+dynamic per-utterance lengths). Simpler in this one specific respect than everything before it.
+
+**Verification**: `reference_forward_whisper_encoder.py` calls the REAL installed `openai-whisper`
+package's own `AudioEncoder` directly (no hand-reimplementation needed, unlike VITS which had to
+reconstruct piper's modules from scratch) on synthetic 30s noise. Deterministic end-to-end (no sampling
+anywhere in the encoder) — no fixed-noise-injection machinery needed, unlike VITS's SDP/flow.
+`test_e2e_whisper_encoder_reference.cpp` (env vars `LOOM_WHISPER_DIR`, `LOOM_WHISPER_ENCODER_REF_DIR`,
+same `SKIP_RETURN_CODE 77` pattern as every other real-checkpoint test) initially failed at
+`max_abs_diff=0.00515` against a naive `< 1e-3` threshold. Root-caused via a staged scratch-diagnostic
+bisection (NOT assumed to be a bug and patched blindly) — built successively larger prefixes of the
+topology as their own tiny GGUFs (mel-only, mel+conv1+conv2+pos-emb, +block0, +blocks0-1, +blocks0-2,
++all 4 blocks+ln_post) via the REAL `build_encoder()` function itself (dims`["n_audio_layer"]`
+monkeypatched down, not a hand-copied duplicate — confirms the production code path itself, not a
+lookalike), each checked against a matching real-model intermediate captured via a `torch`
+`register_forward_hook`/`register_forward_pre_hook`. Every stage through all 3 layers matched to
+~7e-5 max_abs_diff; only the FULL 4-layer+`ln_post` output showed the 0.005 outlier, and even then only
+at 11 of 576000 elements (all <2% relative error, no sign flips) with `mean_abs_diff` still ~2.4e-6 —
+ordinary chaotic amplification of upstream ULP-level fp noise through 4 layers of GELU/softmax
+nonlinearities, not a wiring bug. Fixed by checking `mean_abs_diff` tightly (`<1e-4`) AND `max_abs_diff`
+loosely (`<1e-2`) instead of a single strict bound (which is what every *shallower* reference test in
+this project uses safely) — a real, worth-remembering calibration lesson for any future *deep*
+(many-layer) non-stochastic reference test: a single tight max-diff bound doesn't generalize to depth.
+
+**Still TODO for Whisper** (tracked under Task #80, not yet started): the `TextDecoder` (causal
+self-attention with `KvCache` + cross-attention against the encoder's `xa` + tied output projection,
+`x @ token_embedding.weight^T`, reusing `GET_ROWS`'s own embedding weight transposed via `MUL_MAT`, no
+new primitive expected there either) and a new host driver (`WhisperDriver`, mirroring `Generator`'s
+autoregressive decode-loop pattern but extended to run the encoder once up front and feed `xa` as a
+per-step cross-attention input) — `Generator` as it stands assumes a fixed `tokens`/`positions`/`kq_mask`
+self-attention-only topology and doesn't carry an auxiliary encoder-output input through the loop.
+
+---
+
+### 2026-07-19: Whisper v3 (`tiny.en`) — TextDecoder + `WhisperDriver` done, full pipeline verified
+
+Completes the Whisper v3 milestone above: `tools/convert_whisper/convert_whisper_decoder.py` (causal
+self-attention + cross-attention + tied output projection), `include/loom/core/whisper_driver.h` /
+`src/core/whisper_driver.cpp` (`WhisperDriver`, the encoder-once + prefill-then-decode host driver), and
+three new tests (`test_e2e_whisper_decoder_reference`, `test_e2e_whisper_driver`).
+
+**Confirmed, no new primitive gap at all for the decoder** (both things the original backlog entry
+flagged as "likely new" turned out to already be covered): causal self-attention reuses `ATTENTION`
+`kv_cache:true` exactly as Qwen3/toy_llm already do (same `KvCache`, same "tokens"/"positions"/"kq_mask"
+convention — "positions" here feeds a `GET_ROWS` lookup into Whisper's LEARNED absolute positional
+table, not a RoPE angle, but the input plumbing is identical); cross-attention is `ATTENTION`
+`kv_cache:false` with Q from the decoder's own hidden state and K/V projected fresh from a per-step `xa`
+input (fixed `n_audio_ctx=1500`, a compile-time literal, not a `$`-symbol) — confirmed exactly as
+predicted in the encoder entry above, no new engine code. Tied output projection
+(`x @ token_embedding.weight.T`) is a single `MUL_MAT` reusing the SAME weight tensor already registered
+for the input `GET_ROWS` embedding lookup (`MUL_MAT(tok_emb[n_state,n_vocab], x[n_state,n_tokens])`
+contracts over `n_state`, giving `[n_vocab,n_tokens]` — exactly the real math, no transpose needed since
+GGUFWriter's own axis reversal already puts the weight in the right ggml orientation for both uses).
+
+**`WhisperDriver`** (mirrors `VitsDriver`'s two-model/two-topology structure, simpler in one respect:
+Whisper's encoder runs exactly ONCE per call with no downstream-shape question at all, unlike VITS's
+`generate_path`, whose real duration output determines the vocoder's frame count at runtime). Owns a
+`KvCache` sized from `WhisperConfig` (`n_text_layer`/`n_text_state`/`n_text_ctx`) plus two `GraphBuilder`s
+(encoder: no `KvCache`; decoder: wired to it) — same reference-member-ordering constraint as every prior
+driver (`GraphTopology` members constructed before the `GraphBuilder`s that reference them).
+`transcribe()`: one encoder pass → `xa`; then `Generator::generate`'s own prefill-then-decode-one-at-a-
+time loop, extended to feed `xa` (unchanged) + an all-zero `xa_mask` alongside `tokens`/`positions`/
+`kq_mask` at every step. Cross-attention K/V are recomputed from `xa` on EVERY decode step rather than
+cached once (the real PyTorch model's own `install_kv_cache_hooks` optimization) — correct, just not
+maximally efficient; left as a documented, not-yet-implemented follow-up in the driver's own header
+comment, not attempted here.
+
+**Verification, three levels, each building on the last (same discipline as VITS's staged
+TextEncoder→SDP→flow/vocoder verification)**:
+1. `test_e2e_whisper_decoder_reference`: ONE-SHOT teacher-forced decoder forward (`n_past=0`,
+   `n_tokens=T` covers the whole causal triangle in a single call, exactly matching the real model's own
+   `kv_cache=None` path) against 8 arbitrary-but-valid token ids — matched to `mean_abs_diff=9.5e-6`,
+   `max_abs_diff=3.3e-5`, and every one of the 8 greedy-argmax positions matched exactly.
+2. `test_e2e_whisper_driver`: the FULL `WhisperDriver::transcribe` loop (real `KvCache`-based incremental
+   decode, not a one-shot teacher-forced call) against a real, PLAIN greedy-argmax reference loop built
+   directly from `model.encoder`/`model.decoder` (`reference_forward_whisper_driver.py` — deliberately
+   NOT `model.decode()`, which layers on suppress-tokens/timestamp-constraint/temperature-fallback logic
+   this driver doesn't implement) — on synthetic noise audio (the same input the encoder/decoder
+   reference scripts already use), the real model itself emits EOT after only 5 generated tokens
+   (`[357, 7050, 2491, 8, 50256]`); `WhisperDriver` reproduced this EXACT sequence, token-for-token,
+   first try — the strongest possible confirmation available for a greedy/deterministic pipeline this
+   deep (encoder → prefill → 4 incremental cross-+self-attention decode steps, all through the real
+   `KvCache` growth path, not a single shot).
+
+Both matched essentially on the first real attempt once the encoder's own axis conventions and
+`op_attention`'s existing generality were already nailed down by the encoder milestone — a good sign the
+"read the real source in full, confirm gaps against the actual primitive code, don't assume" discipline
+from earlier in this project pays down real risk before writing any topology JSON, not just after.
+
+**Whisper v3 is now a complete, end-to-end-verified milestone** (mel frontend → encoder → decoder →
+greedy autoregressive driver, all against a real checkpoint). Per Task #80's priority order, next up:
+FastConformer RNN-T.
+
+---
+
+### 2026-07-19: FastConformer RNN-T (`nvidia/parakeet-rnnt-0.6b`) — done, near-zero new engine code
+
+Second model from Task #80's priority list. Real checkpoint downloaded (`hf_hub_download`,
+`nvidia/parakeet-rnnt-0.6b`, ~2.47GB `.nemo`, same family/size as the already-converted
+`parakeet-tdt-0.6b-v3` sibling) and its real `model_config.yaml`/state dict inspected directly before
+writing anything — confirmed several REAL, checkpoint-specific differences from its TDT sibling rather
+than assuming the two share every convention just because they're siblings:
+- `feat_in=80` (NOT TDT's 128) — this checkpoint's mel frontend matches Conformer-CTC-small's own
+  80-mel convention instead.
+- `xscaling=True` (the OPPOSITE of TDT's `xscaling=false`) — needs the `sqrt(d_model)` xscale fold into
+  `pre_encode.out`'s weight/bias at conversion time (Conformer-CTC-small's own technique), which TDT's
+  script deliberately omits.
+- Biased throughout (`use_bias` unset in config but every relevant tensor — `feed_forward{1,2}`'s
+  `linear{1,2}`, `self_attn`'s `linear_{q,k,v,out}` (NOT `linear_pos`, which never has a bias in NeMo's
+  `RelPositionMultiHeadAttention` regardless — confirmed absent from the real state dict either way),
+  the conv module's `pointwise_conv{1,2}`/`depthwise_conv` — confirmed present in the real state dict),
+  unlike TDT's confirmed-unbiased convention. So this checkpoint is a genuine hybrid: TDT's `dw_striding`
+  (3-stage depthwise+pointwise) subsampling structure + Conformer-CTC-small's bias/xscale conventions —
+  a real finding, not assumed from either existing sibling script alone.
+- The joint has **NO duration head at all**: `config["joint"]["jointnet"]` has no `"durations"` key
+  whatsoever (TDT's does), and the real `joint.joint_net.2.weight` shape is `(1025, 640)` ==
+  `num_classes(1024)+1(blank)` exactly, no extra columns.
+- Decoder (`RNNTDecoder`, 2-layer LSTM, `pred_hidden=640`) and the joint's own tensor names are
+  IDENTICAL to TDT's (`decoder.prediction.*`, `joint.enc.*`, `joint.pred.*`, `joint.joint_net.2.*`) —
+  confirmed real, so `build_lstm_topology`/`build_joint_topology` are imported and reused **verbatim**
+  from `convert_parakeet_tdt.py`, not reimplemented (the topology JSON never encodes the joint's output
+  width at all — that comes from the GGUF tensor's own shape).
+
+**The only genuinely new engine-level work was generalizing `TdtDecoder`** to support plain RNN-T
+(`TdtDecoderConfig.durations` left EMPTY): no duration head/argmax at all, every blank advances exactly
+one frame (standard Graves-2012/NeMo `RNNTGreedyDecoder` control flow), non-blank never advances. The
+class was already named/doc-commented generically ("Transducer/TDT models") with plain RNN-T in mind
+conceptually, just never implemented — a small, targeted change (guard the duration-argmax computation
+behind `n_durations > 0`, default `skip=1` for blank / `skip=0` for non-blank when `n_durations==0`)
+rather than a new class, avoiding ~150 lines of near-duplicate decode-loop code. A REAL bug caught while
+writing this: naively falling through to the existing duration-argmax code path with `n_durations==0`
+would read one element past `combined`'s own end and index an empty `cfg_.durations` vector (both UB) —
+guarded explicitly instead of relying on the existing `n_combined <= n_durations` check (which is
+vacuously satisfied whenever `n_combined >= 1`, i.e. always, so it silently doesn't catch this case).
+
+**Verification, same staged discipline as every other model in this project**: first a NEW synthetic
+fixture (`tools/fixture_gen/rnnt_step_common.py`/`make_rnnt_step_gguf.py`/`reference_rnnt_step.py`,
+mirroring `tdt_step_common.py`'s own role, deliberately duplicated rather than shared) with a
+hand-picked seed (searched over several thousand candidates) producing three genuinely different
+per-frame cases — one single emission, one two-emission-then-blank frame (exercising "stay on this
+frame" more than once), one immediate blank — verified via `test_rnnt_decoder.cpp` BEFORE touching the
+real 2.47GB checkpoint, exactly the "verify the generalization in isolation first" discipline this
+project has followed for every primitive change. Then the real checkpoint: `convert_parakeet_rnnt.py` +
+`reference_forward_parakeet_rnnt.py` (hand-rolled plain-PyTorch reference, `nemo_toolkit`/`transformers`
+still broken in this venv per the TDT work's own finding) + `test_e2e_parakeet_rnnt.cpp` — encoder
+matched to `2e-6` max abs diff (tighter than TDT's own `5e-2` tolerance, though not a fair
+apples-to-apples comparison — shorter/different input), and the decode loop matched exactly
+(`tokens=[]`, `frame_indices=[]` both sides — this checkpoint decodes synthetic noise to all-blank,
+confirmed via the reference script itself, not a bug; still a fully meaningful end-to-end check since
+`TdtDecoder`'s new branch has to reproduce whatever the real model actually does, blank or not).
+
+**Environment note, unrelated to the model itself but worth recording**: mid-conversion, writing the
+~2.3GB all-F32 encoder GGUF into this session's `/tmp`-backed scratchpad (on the 28GB root partition,
+already at ~91% from OS/package baseline) drove the ROOT filesystem to 100% full, breaking the harness's
+own command-output capture (not just this task's disk use) until cleaned up. Moved all large
+conversion-output scratch directories to `/home` (429GB, plenty of headroom) instead — the existing
+"use /home not /tmp for large downloads" guidance turns out to apply equally to large **generated**
+files (GGUF conversion output can be comparable in size to the source checkpoint once stored as
+uncompressed F32), not just downloads.
+
+Per Task #80's priority order, next up: Kokoro TTS.
+
+---
+
+### 2026-07-19: Kokoro TTS — real source read in full, primitive-level groundwork verified (in progress)
+
+Third model from Task #80's priority list. Read the real `kokoro` PyPI package (`model.py`, `modules.py`,
+`istftnet.py`) in full before planning, plus confirmed licensing first (per the earlier VITS/espeak-ng
+licensing lesson): `hexgrad/Kokoro-82M` model, the `kokoro` pip package, and `misaki` (its G2P library)
+are all **Apache-2.0** — no GPL concerns like VITS's espeak-ng, confirmed via `HfApi.model_info` and
+PyPI metadata directly, not assumed. Real checkpoint (`kokoro-v1_0.pth`, small, ~82M params) and config
+downloaded to `/home/flavio/.claude/tmp/kokoro_model/`.
+
+**Real architecture is genuinely larger/more novel than anything tackled so far** — StyleTTS2-family:
+`CustomAlbert` (a real HF `AlbertModel` — PL-BERT phoneme-conditioning transformer) → `ProsodyPredictor`
+(a `DurationEncoder` of stacked BiLSTM+`AdaLayerNorm` blocks, a duration head via **sigmoid-sum
+regression** over `max_dur` buckets rather than VITS's `exp/ceil` approach, then F0/energy prediction
+via `AdainResBlk1d` stacks) + a separate CNN+BiLSTM `TextEncoder` → `Decoder` (`istftnet.py`'s
+`Generator`, a HiFi-GAN-NSF hybrid: a harmonic-plus-noise source module driven by the predicted F0
+curve, `AdaINResBlock1`'s "Snake1D" activation, and an **ISTFT-based** final reconstruction instead of
+HiFi-GAN's pure `ConvTranspose1d` upsampling — this is the "ISTFTNet" the package name references).
+AdaIN (`AdaIN1d`/`AdaLayerNorm`) conditioning is threaded pervasively through both the prosody predictor
+and the vocoder, not a one-off.
+
+User confirmed via `AskUserQuestion`: attempt the full continuous build (same choice as VITS), not a
+scoped-down vocoder-only pass or deferring to a different model.
+
+**Primitive-level groundwork done so far, each verified before relying on it (same discipline as every
+primitive added this project)**:
+- **`SIN`/`COS`** (`primitives_basic.cpp`) — thin wrappers around `ggml_sin`/`ggml_cos`, which are
+  already native in the vendored ggml (confirmed by reading `ggml.h` directly, not assumed missing).
+  Needed for the NSF source's sine generation and the vocoder's Snake activation
+  (`x + sin(a*x)^2/a`, itself just a composition of `SIN`/`SQR`/`MUL`/`ADD` — no dedicated Snake
+  primitive needed at all). Verified against `std::sin`/`std::cos` directly.
+- **`INTERPOLATE_1D`** (`primitives_basic.cpp`) — wraps `ggml_interpolate` directly (native in ggml,
+  confirmed via `ggml.h`), for the several 1D up/downsample spots (`SineGen`'s phase pre/post-filtering,
+  `UpSample1d`'s 2x nearest upsample, the F0 curve's huge nearest upsample to full waveform rate). A
+  real, non-obvious finding confirmed by reading `ggml`'s own `ggml_compute_forward_interpolate` C++
+  source directly (not assumed from the header alone): ggml has no dedicated "1D linear" mode, but its
+  `GGML_SCALE_MODE_BILINEAR` mode, called with the target's `ne[1]` held EQUAL to the input's own `ne[1]`
+  (i.e. not actually resizing that axis), makes that axis's blend factor `dy` always exactly 0 — so the
+  2D bilinear formula degenerates to an exact 1D linear interpolation along `ne[0]` alone, using the same
+  half-pixel-center convention as PyTorch's own `F.interpolate(mode='linear', align_corners=False)`.
+  Verified numerically against real `torch.nn.functional.interpolate` for both `linear` (up ×2, down
+  ×0.5) and `nearest` (up ×2) on the same small example, matching to 1e-5 (`test_interpolate_1d`).
+- **`AdaIN1d`/`AdaLayerNorm` need NO new primitive at all.** Confirmed via the real checkpoint's own
+  state dict: `nn.InstanceNorm1d(affine=True)` is used, but ONLY the style-conditioning `fc.weight`/
+  `fc.bias` tensors are ever saved — `InstanceNorm1d`'s own internal affine weight/bias are never
+  trained/persisted, so at inference they sit at PyTorch's default init (`weight=1, bias=0`), i.e. a
+  mathematical no-op (confirmed both by grepping the real state dict for any `.norm1.`/`.norm2.` key
+  other than `.fc.*`, finding none, AND by numerically comparing real
+  `nn.InstanceNorm1d(affine=True)` on random untrained weights against a plain per-channel-over-time
+  mean/var normalize — matched to 1.2e-7). So `AdaIN1d`'s real computation is just: plain per-channel
+  instance-norm, then `(1+gamma)*normed + beta` from the style projection. And the per-channel-over-time
+  reduction is EXACTLY what `LAYER_NORM`'s existing `ggml_norm` (reduces over `ne[0]`) already computes,
+  provided the tensor is in this project's `[T,C]` (`CONV_1D`-native) layout at that point rather than
+  the `[C,T]` channel-first attention convention — no transpose-then-normalize-then-transpose-back
+  needed, unlike `AdaLayerNorm`'s own PyTorch implementation (which transposes explicitly because
+  `F.layer_norm` there normalizes over the LAST/channel dim, not time). A real, worth-remembering
+  reuse: the SAME `LAYER_NORM` primitive, called on a differently-conventioned tensor, computes a
+  completely different normalization (instance vs. layer) — the primitive itself doesn't know or care,
+  it's purely an axis-convention fact about what's fed in.
+- **Inverse STFT needs NO new primitive at all either** — the single biggest open risk in this whole
+  model, resolved by direct derivation + numerical verification (scratch script, not committed) against
+  real `torch.istft` before writing anything: the standard real-IFFT-via-Hermitian-symmetry formula
+  reduces to a per-output-sample weighted cos/sin sum over the `n_freq` rfft bins, which (folding the
+  window and the `1/n_fft`-and-doubling normalization factor into the basis itself, exactly mirroring
+  how the FORWARD STFT's DFT basis is baked into `CONV_1D`'s kernel elsewhere in this project) becomes a
+  plain `CONV_TRANSPOSE_1D` call: kernel `ne=[n_fft, 1, 2*n_freq]` (the windowed cos/sin bases,
+  concatenated along the input-channel axis), data `ne=[n_frames, 2*n_freq]` (the predicted
+  `mag*cos(phase)`/`mag*sin(phase)` parts, transposed into `CONV_TRANSPOSE_1D`'s own `[T,C]` convention),
+  stride=hop — this IS overlap-add, natively, no manual loop. Verified in three stages: (1) a manual
+  Python overlap-add loop against real `torch.istft` on a small example, matching to 3.4e-8; (2) the
+  planned `CONV_TRANSPOSE_1D` reformulation against that SAME manual loop, matching to 1.1e-16 (machine
+  epsilon) — confirms the reformulation is exact, not approximate. Still need: the window-squared-
+  overlap-add normalization denominator is a function of the (genuinely dynamic, per-utterance) frame
+  count, so it must be computed IN-GRAPH via the same `CONV_TRANSPOSE_1D` mechanism (a fixed `window^2`
+  "kernel" against a dynamically-shaped all-ones "data" tensor) rather than baked as a Python constant —
+  not yet wired into any topology, tracked as the next concrete step.
+
+**Still TODO, not yet started**: the NSF harmonic-plus-noise source module (`SineGen`/
+`SourceModuleHnNSF` — per-sample F0-driven sine generation with harmonics, voiced/unvoiced gating via
+`STEP`, phase accumulation via the already-existing `CUMSUM`, host-vs-in-graph decision for the
+`torch.randn` noise injection not yet made); the ALBERT text-conditioning encoder's specific wiring
+(embedding factorization, cross-layer parameter sharing — real config not yet inspected in detail);
+`DurationEncoder`/`ProsodyPredictor`/`TextEncoder`/`Decoder` assembly; the conversion script, hand-rolled
+reference, and e2e tests. This is a multi-step remaining effort, continuing in the same session.
+
+**Update — the NSF harmonic-source module (`SineGen`) ALSO needs no new primitive.** Verified by
+inlining `istftnet.py`'s real `SineGen` class directly (importing the actual `kokoro` package hits the
+same broken transformers/huggingface-hub version pin already noted for NeMo's own toolkit — `SineGen`
+itself has no such dependency, so its source, copied verbatim, was run directly rather than fighting the
+import chain) against a from-scratch numpy re-derivation, with the two genuinely random components
+(`rand_ini`'s per-harmonic initial phase offset, the additive Gaussian noise) pinned to fixed
+`torch.rand`/`torch.randn_like` monkeypatches — same "host computes/fixes the noise, feeds it in"
+precedent as VITS. Matched to 2.9e-7 across a 240-sample signal spanning both voiced and unvoiced
+regions (not a vacuous all-zero check). The whole module — F0→harmonic radians, the
+downsample→cumsum→upsample phase-smoothing trick (now expressible via the just-added
+`INTERPOLATE_1D` + the pre-existing `CUMSUM`), `sin`, and the voiced/unvoiced gate (a plain `f0 >
+threshold` comparison, using the existing `STEP`-adjacent composition already established elsewhere) —
+reduces entirely to primitives that now already exist in this engine.
+
+**Summary: every genuinely novel DSP piece in Kokoro's vocoder is now de-risked** — `SIN`/`COS` and
+`INTERPOLATE_1D` added and verified against real PyTorch; `AdaIN1d`/instance-norm, inverse STFT, and the
+NSF harmonic source all confirmed to need ZERO further new engine primitives, only correct wiring. What
+remains is now primarily volume (assembling the full topology across `CustomAlbert`/`ProsodyPredictor`/
+`TextEncoder`/`Decoder`, writing the conversion script, hand-rolled reference, and e2e tests) rather than
+open technical risk — a materially different, lower-risk position than where this entry started.
+
+**Update — `CustomAlbert` (PL-BERT) architecture confirmed against the real checkpoint + HF source
+directly** (reading `transformers/models/albert/configuration_albert.py`/`modeling_albert.py` source
+files directly off disk works even though actually IMPORTING `transformers` is blocked by the same
+broken huggingface-hub version pin already noted for NeMo — confirmed AlbertConfig's real defaults this
+way rather than assuming):
+- Embedding factorization: 128-dim word/position/token-type embeddings + their own `LayerNorm`, then
+  `embedding_hidden_mapping_in` (a plain Linear) projects up to `hidden_size=768` before the transformer
+  layers run.
+- **Cross-layer parameter sharing confirmed real** (`num_hidden_groups=1`, HF's own default, not
+  overridden in this checkpoint's config): the real state dict has exactly ONE
+  `encoder.albert_layer_groups.0.albert_layers.0.*`, applied 12 times (`num_hidden_layers=12`) — this
+  project's existing `repeat_for` topology mechanism already supports referencing a weight name that does
+  NOT contain `{i}` inside a repeated block (it simply stays constant across iterations, no special
+  handling needed), so this needs no new topology-schema feature, just using that mechanism as-is.
+- **Activation is `"gelu_new"` (HF's default `hidden_act`), NOT the erf-based GELU this project's
+  existing `GELU` primitive computes** — a real, easy-to-miss mismatch (both are "GELU" by name, but
+  materially different functions). Worse, ggml's plain `ggml_gelu` (the tanh-approximation one, which
+  WOULD algebraically match "gelu_new") unconditionally routes through an F16 lookup table on CPU
+  (`GGML_GELU_FP16` is hardcoded `#define`'d in `vec.h`, confirmed by reading it directly) — the same
+  kind of forced-F16 precision loss this project already worked around for `CONV_1D`'s im2col and chose
+  `GELU_ERF` over plain `GELU` to avoid for Whisper. Confirmed "gelu_new"'s formula
+  (`0.5x(1+tanh(sqrt(2/pi)(x+0.044715x³)))`) is algebraically IDENTICAL to `ggml_gelu_f32`'s own C
+  formula (0.0 diff on a hand-checked vector) — so the fix is composing it directly from existing exact-
+  F32 primitives (`TANH`/`SQR`/`MUL`/`ADD`/`SCALE`) in the topology JSON, same as Snake1D, rather than
+  reusing either existing `GELU`-family primitive.
+- `layer_norm_eps=1e-12` (HF's ALBERT default) — NOT this project's usual `1e-5`, needs to be threaded
+  through explicitly, not assumed.
+
+**Update — `TextEncoder`'s and the prosody predictor's LSTMs are BIDIRECTIONAL** (confirmed via the real
+state dict: `text_encoder.lstm.weight_hh_l0` AND `weight_hh_l0_reverse` both present, likewise
+throughout `ProsodyPredictor`/`DurationEncoder`) — genuinely new relative to every LSTM in this project
+so far (Parakeet-TDT/RNNT's prediction-network LSTMs are plain unidirectional, autoregressive). These
+sequences are short, FULLY KNOWN-LENGTH, non-autoregressive phoneme sequences (unlike TDT's
+token-by-token feedback loop) — considered unrolling forward+backward entirely IN-GRAPH via `repeat_for`
+(cheaper, no host round-trip per step), but that needs a growing per-timestep OUTPUT collected across
+iterations into one sequence tensor (not just a single running accumulator like Conformer's own "cur",
+which `repeat_for` already handles fine) — this engine has no scatter-into-a-preallocated-tensor-at-a-
+dynamic-offset primitive yet, so an in-graph per-timestep-output loop isn't a clean fit today. Decision:
+reuse `TdtDecoder`'s ALREADY-PROVEN pattern instead — a small single-step LSTM-cell topology, stepped
+host-side in C++ (`GraphBuilder::build()` once per timestep, h/c carried in a plain `std::vector<float>`
+between calls, exactly like `TdtDecoder`'s own prediction-network stepping, just without the
+autoregressive joint-network feedback) — run once forward, once backward (feeding the sequence in
+reverse order through the SAME per-step topology but the `_reverse`-suffixed weights), concatenate the
+two directions' outputs host-side. Lower risk than inventing new in-graph scatter machinery for this
+milestone; a genuine architectural choice, not a default, and reusing proven code rather than new engine
+surface.
+
+Next concrete step: write the conversion script (`tools/convert_kokoro/`), starting with `CustomAlbert`
+(the deterministic, no-conditioning-dependency piece) verified in isolation before assembling the
+prosody predictor and decoder around it.
+
+---
+
+### 2026-07-19: Kokoro TTS — `CustomAlbert` converted and numerically verified (first assembled piece)
+
+`tools/convert_kokoro/convert_kokoro_albert.py` (topology) + `reference_forward_kokoro_albert.py`
+(hand-rolled pure-PyTorch reference, `transformers` unimportable in this venv per the already-documented
+broken huggingface-hub pin, but its `.py` source files are readable directly off disk and were used to
+confirm every formula) + `test_e2e_kokoro_albert.cpp`. Matched the real checkpoint's weights to
+`max_abs_diff=5.7e-6` across 12 shared-weight transformer layers — first real assembled/verified piece
+of Kokoro.
+
+**A real, generalizable bug caught while wiring the cross-layer weight sharing**: this project's
+`repeat_for` topology construct (used by Conformer-CTC/Parakeet-TDT/RNNT's own per-layer loops, always
+via a bare node-closure that takes EXPLICIT literal output names) has NO per-iteration symbol-table
+scoping at all — confirmed by reading `graph_builder.cpp` directly: a single flat `symtab` is simply
+overwritten each iteration, so any tensor that must carry state across the loop boundary (ALBERT's
+"cur", the same physical layer reapplied 12 times) needs the EXACT SAME literal output name emitted both
+before the loop and at the end of each iteration. `convert_kokoro_albert.py`'s own `TopologyBuilder`
+(adapted from `convert_whisper_encoder.py`'s) auto-freshens every output name via a monotonic counter
+(`f"{hint}_{counter}"`) — great for avoiding accidental collisions in a linear, non-looped script, but
+it silently produces a DIFFERENT string each call, so the two "cur"-producing call sites never actually
+matched, crashing with a real, confusing-if-you-don't-know-the-cause error: `GraphBuilder: node 'MUL_MAT'
+references unresolved input 'cur'`. Fixed by adding an optional `name=` parameter to `TopologyBuilder
+.node()` (and threading it through `apply_layer_norm`) that emits a literal, non-freshened output name
+when given — needed only at `repeat_for` loop-carry boundaries, ordinary intra-iteration temporaries stay
+auto-freshened (safe, since the SAME literal name is naturally reused every iteration by the C++ side
+regardless, and that's fine for anything not read across the boundary). Worth remembering for
+`DurationEncoder`/`ProsodyPredictor`/`Decoder`'s own repeat_for use, if any turns out to need it — this
+`TopologyBuilder` convention (auto-freshened intermediates) is genuinely different from every prior
+`repeat_for`-using conversion script in this project, which never had auto-freshening at all.
+
+Not yet wired to `bert_encoder`'s downstream `Linear(768,512)` or anything else in `KModel` — that's the
+next integration point once `DurationEncoder`/`ProsodyPredictor` need this output.
+
+---
+
+### 2026-07-19: Kokoro TTS — `TextEncoder` converted and numerically verified; new `BiLstmStepper`
+
+Second assembled Kokoro piece: `tools/convert_kokoro/convert_kokoro_text_encoder.py` (a genuinely
+separate, simpler, style-independent module from `CustomAlbert` — embedding -> 3x [weight-normed
+Conv1d -> LayerNorm -> LeakyReLU(0.2)] -> bidirectional LSTM) + `reference_forward_kokoro_text_encoder
+.py` + `test_e2e_kokoro_text_encoder.cpp`. Matched to `max_abs_diff=1.8e-6`.
+
+**New reusable host driver: `loom::BiLstmStepper`** (`include/loom/core/bilstm_stepper.h` / `src/core/
+bilstm_stepper.cpp`) — implements the bidirectional-LSTM-over-a-known-length-sequence host-stepping
+design decided in this milestone's earlier entry (reusing `TdtDecoder`'s proven per-step-topology
+pattern, just without the autoregressive feedback, run once forward and once backward, concatenating
+per-position). Takes ONE shared `GgufModel&` for all four per-direction/per-gate topologies — this
+requires the conversion script to write the FULL weight set (both directions) into every one of the 4
+small GGUFs it produces, matching `TdtDecoder`'s own established "every small GGUF carries the full
+weight set" convention exactly (confirmed necessary the hard way: the first version of
+`convert_kokoro_text_encoder.py` wrote only each file's own direction's tensors, which would have forced
+either 4 separate `GgufModel`s or a redesigned constructor — fixed by writing the shared set instead,
+keeping `BiLstmStepper`'s single-model interface as originally designed). This class is meant to be
+reused as-is for `DurationEncoder`'s 3 layers and `ProsodyPredictor`'s own `lstm`/`shared` — same shape
+of problem, different weight sets/dimensions.
+
+**Two real bugs caught and fixed during verification** (both in test/conversion code, not the engine
+itself):
+1. Used a `"$input_dim"` runtime symbol for the LSTM-cell topology's `"layer_input"` declared-input
+   shape — but `GraphBuilder` only ever auto-registers `n_tokens`/`n_past`/`n_kv` (confirmed by reading
+   `graph_builder.cpp` directly, not assumed). `TextEncoder`'s own LSTM has a DIFFERENT input width
+   (512, the CNN output) than its hidden width (256 per direction) — unlike `TdtDecoder`'s own
+   layer-input convention, where layer>0's input width always equals the hidden width, so this had never
+   come up before. Fixed by making `input_dim` a plain literal number (known at conversion time), not a
+   symbol.
+2. A real axis-order bug in the C++ test itself: `CONV_1D`'s output has ggml `ne=[n_tokens, channels]` —
+   `n_tokens` is the FASTEST axis, so the flat buffer is channel-major (all positions for channel 0,
+   then channel 1, ...), not token-major. Extracting each token's own feature vector as a contiguous
+   slice (`flat.begin() + t*channels`) silently reads the WRONG data (a mix of unrelated channel/token
+   values) without crashing — caught by first isolating the CNN topology alone via a scratch C++
+   diagnostic (matched the real reference to 5.5e-6 in isolation, proving the bug was downstream, in how
+   the test fed the CNN's output into `BiLstmStepper`, not in the CNN topology or the LSTM cell itself)
+   before assuming the bug was in either primitive. Fixed with a proper strided extraction.
+
+Next: `ProsodyPredictor`'s duration-prediction half (`DurationEncoder`'s interleaved BiLSTM+
+`AdaLayerNorm` blocks, the top `lstm`, `duration_proj`'s sigmoid-sum regression) — `F0Ntrain` and the
+duration-based frame-expansion (needs host-computed rounding/clamping, same "generate_path" precedent as
+VITS) are deferred to the following continuation, since they depend on this piece's actual sampled
+durations.
+
+---
+
+### 2026-07-19: Kokoro TTS — `ProsodyPredictor`'s duration-prediction half converted and verified
+
+Third assembled Kokoro piece: `tools/convert_kokoro/convert_kokoro_duration_predictor.py` +
+`reference_forward_kokoro_duration_predictor.py` + `test_e2e_kokoro_duration_predictor.cpp`. Covers
+`DurationEncoder` (3x interleaved bidirectional-LSTM + `AdaLayerNorm`, each followed by re-concatenating
+the (broadcast) style vector onto the channel axis — confirmed real from source, including after the
+LAST `AdaLayerNorm`, giving `DurationEncoder`'s own output a real `d_model+style_dim=640`-channel width)
+→ `ProsodyPredictor.lstm` (another bidirectional LSTM) → `duration_proj` (a plain Linear to
+`max_dur=50` raw logits; the `sigmoid().sum(-1)` regression that turns those into an actual duration
+value happens in `KModel`, not `ProsodyPredictor`, confirmed from source — done host-side here too, a
+tiny scalar post-process). Matched to `max_abs_diff=3.0e-5` across the whole interleaved pipeline.
+
+**Verified before wiring in**: `AdaLayerNorm`'s real `forward` has TWO PAIRS of transposes that
+algebraically cancel out entirely (checked numerically against a from-scratch "plain per-position
+LayerNorm over channels + style affine" reimplementation, 0.0 diff) — so despite superficially
+resembling the Decoder's own `AdaIN1d` (a genuinely different mechanism — real `InstanceNorm`,
+transposed to normalize over TIME per-channel), `AdaLayerNorm` is architecturally just this project's
+ordinary channel-first `LAYER_NORM` (reduces over `ne[0]`) plus a style-derived `(1+gamma)*x+beta`
+affine. Two different "Ada*Norm" mechanisms in the same model family, worth not conflating when the
+Decoder is converted.
+
+Style/channel concatenation (both the initial concat before each BiLSTM layer and the re-concat after
+each `AdaLayerNorm`) is done in plain host C++ vector splicing, not an in-graph `CONCAT` node — there's
+no temporal recurrence in it, so it doesn't need to be graph-resident, and this project has no
+concatenate-along-a-non-batch-axis primitive yet (not needed here, given the host round-trip for BiLSTM
+stepping happens regardless).
+
+**Two real, generalizable axis-order bugs caught during verification, both in test/conversion code, not
+the engine** (a genuinely useful pair — the SAME underlying mistake surfacing on both a write path and a
+read path):
+1. `BiLstmStepper::run`'s own host output (`std::vector<std::vector<float>>`, T-major, plain C++) was
+   flattened into a ggml-bound `[channels,T]` buffer using index formula `c*T+t` — backwards. `ggml
+   ne=[channels,T]` has `channels` as the FASTEST axis (flat index `t*channels+c`), byte-identical to a
+   numpy/host array of NATIVE shape `(T,channels)` (the "`ggml ne=[a,b]` ↔ numpy `(b,a)`" rule already
+   documented repeatedly this project, e.g. VITS's `z_p`/Whisper's `xa`) — meaning `lstm_out` (already
+   T-major) needed a plain flatten with NO reordering at all, and the manual `c*T+t` transpose was
+   actively wrong, not merely superfluous.
+2. The SAME wrong formula was used again on the READ side, extracting `AdaLayerNorm`'s own `ggml`-layout
+   output back into a host vector-of-vectors.
+   Both caught the same way as every other numerical bug this project has hit: isolate one stage at a
+   time via a scratch C++ diagnostic (built a small standalone program dumping `AdaLayerNorm`'s own
+   internal `gamma`/`beta`/`normed`/`out` nodes individually, by re-pointing the SAME topology JSON's
+   `"output"` field at each internal node name in turn) before assuming the bug was in a primitive
+   rather than the surrounding harness — `gamma`/`beta` (the style-derived affine parameters) matched
+   the reference EXACTLY, `normed` did not, which correctly narrowed the search to "how is `x` actually
+   being fed into `LAYER_NORM`" rather than anything inside the primitive itself.
+
+Next: `F0Ntrain` (the F0/energy prediction half — `AdainResBlk1d` stacks, reusing `istftnet.py`'s own
+`AdaIN1d` mechanism, the FIRST real use of it outside the Decoder/vocoder itself) and the duration-based
+frame-expansion (host-computed round/clamp/frame-count, VITS's `generate_path` precedent) that produces
+its actual input.
+
+---
+
+### 2026-07-19: Kokoro TTS — depthwise `ConvTranspose1d` ("pool") composes from existing primitives
+
+Real, important architecture clarification confirmed while starting `F0Ntrain`/`AdainResBlk1d`: the
+"upsample" `AdainResBlk1d` instances (`predictor.F0.1`/`predictor.N.1`, used in `F0Ntrain`, and also in
+the Decoder's own `decode` stack) have a `pool` submodule that is a weight-normed, **DEPTHWISE**
+(`groups=in_channels`) `ConvTranspose1d` (kernel=3, stride=2, padding=1, output_padding=1 — confirmed
+real from the checkpoint's `predictor.F0.1.pool.weight_v` shape `(512,1,3)`, `groups=512`). This has no
+direct ggml primitive: `ggml_conv_transpose_1d` is non-grouped only (its own `GGML_ASSERT(a->ne[2] ==
+b->ne[1])` forces a single shared kernel across all input channels, confirmed by reading `ggml.c`
+directly), and this project has no `CONV_TRANSPOSE_1D_DW`.
+
+**Composes entirely from EXISTING primitives instead** — verified in three stages before trusting it,
+same discipline as the ISTFT-via-`CONV_TRANSPOSE_1D` derivation earlier in this milestone:
+1. Raw math: zero-stuff the input (insert `stride-1` zeros between samples) + pad `(kernel-1-padding)`
+   each side plus `output_padding` on the right + a REGULAR (non-transposed) depthwise correlation with
+   the kernel REVERSED along its own length axis — matched real
+   `torch.nn.functional.conv_transpose1d(groups=channels)` to `1.2e-7` on a hand-picked example.
+2. The planned ggml PRIMITIVE composition (`RESHAPE` to insert a dummy fastest axis + `PAD_1D` by
+   `stride-1` on it + `RESHAPE` flattens back — this "overstuffs" a trailing `stride-1` extra zeros past
+   the textbook zero-stuffed length, since it pads even the LAST sample; a `VIEW`+`CONT` then truncates
+   to the textbook `(L_in-1)*stride+1` length — then a second `PAD_1D` for the edge/output padding, then
+   `CONV_1D_DW` with the pre-flipped kernel) matched the SAME numpy simulation to `5.9e-8`.
+3. `test_depthwise_conv_transpose_1d_via_composition` (`test_primitive_registry.cpp`) — the actual ggml
+   composition, run through the real engine, matched the same reference values to `<1e-5`. 129/129
+   primitive-registry checks pass.
+
+The kernel-reversal is a conversion-time weight transform (a plain `numpy` flip along the kernel axis,
+alongside the existing weight-norm fold), not a new runtime op — matches this project's established
+"fold transformations into weights at conversion time" precedent (weight-norm, xscale, BatchNorm
+folding, etc.).
+
+Next: assemble `AdainResBlk1d` fully (this "pool" composition + `AdaIN1d` (already verified, reused from
+the Decoder's own earlier verification work) + `LeakyReLU` + weight-normed `conv1`/`conv2` + the
+learned-shortcut `conv1x1` + the residual combine), then `F0Ntrain` (shared `BiLstmStepper` + two 3-block
+`AdainResBlk1d` stacks + `F0_proj`/`N_proj`), then the duration-based frame-expansion that produces
+`F0Ntrain`'s real input.
+
+---
+
+### 2026-07-19: Kokoro TTS — `AdaIN1d`/`AdainResBlk1d` (simplest instance) converted and verified
+
+`tools/convert_kokoro/convert_kokoro_f0n.py` (+ `reference_forward_kokoro_f0_block0.py` +
+`test_e2e_kokoro_f0_block0.cpp`) — `predictor.F0.0`, the simplest real `AdainResBlk1d` instance
+(`dim_in==dim_out=512`, no learned shortcut, no upsample). Matched to `max_abs_diff=6.0e-6`.
+
+Confirmed `AdaIN1d`'s "plain per-channel-over-time InstanceNorm + style-derived `(1+gamma)*x+beta`"
+composition (same no-op-affine finding as `AdaLayerNorm`, but the OPPOSITE axis convention — `AdaIN1d`
+needs this project's `[T,C]` (`CONV_1D`-native) layout, normalizing over `ne[0]`=time per channel, real
+`InstanceNorm`, vs. `AdaLayerNorm`'s channel-first `[C,T]`, ordinary `LayerNorm`) reduces to the same
+`LAYER_NORM` primitive and matches real weights directly — verified stage-by-stage (`norm1`→`act1`→
+`conv1`→`norm2`→`act2`→`conv2`→residual-sum→final-scale, each isolated via a scratch diagnostic
+re-pointing the topology's own `"output"` field at each internal node name in turn) before trusting the
+full block.
+
+Also caught a real bug in `AdainResBlk1d`'s own `_shortcut`/`_residual` split while writing the
+conversion code (not from running anything — caught by re-reading `istftnet.py`'s real source carefully
+a second time): `_shortcut` upsamples via `self.upsample` (plain nearest-neighbor `UpSample1d`, i.e.
+`INTERPOLATE_1D` mode=nearest), while `_residual` upsamples via `self.pool` (the LEARNED depthwise
+`ConvTranspose1d` verified earlier this milestone) — genuinely TWO DIFFERENT upsampling mechanisms on
+the two branches of the same block, not the same "pool" reused on both. An earlier draft of
+`add_adain_resblk1d` used the depthwise-conv-transpose composition on the shortcut path too; fixed before
+it was ever tested against a real upsampling instance.
+
+**A real, generalizable bug, previously LATENT across this entire project**: the numerical mismatch
+first showed as a large, confusing discrepancy (`mean_abs_diff≈1.1`, `max≈6.6`) even though a scratch
+diagnostic proved every internal stage of the topology matched the reference exactly. Root cause: the
+Python reference's final `out` tensor ends its computation with a `.T` transpose (`conv1d(...)[0].T`)
+and is never explicitly re-contiguated before `np.save` — PyTorch preserved the resulting
+non-contiguous, Fortran-ordered memory layout straight through the final add/scale ops, and `np.save`
+faithfully wrote `'fortran_order': True` into the `.npy` header. This project's hand-written minimal
+`.npy` reader — duplicated across essentially every e2e test's C++ side this whole project — **never
+checks `fortran_order` at all** and unconditionally assumes C-order, so it silently misread a genuinely
+transposed array as if it weren't transposed, with no error or crash. Confirmed by directly inspecting
+the `.npy` header bytes. Every PRIOR reference script in this project happened to save already-
+C-contiguous arrays (by luck, or because their own final op didn't leave a transposed view), so this
+had never surfaced before despite the reader gap existing the whole time. Fixed AT THE SOURCE (the
+Python reference script now calls `np.ascontiguousarray(...)` before every `np.save`), not by teaching
+the C++ reader about `fortran_order` — cheaper and the right place to guarantee it, but the READER gap
+itself is now a known, documented risk: **any future reference script whose final tensor comes out of a
+`.T`/`.transpose()`/`.permute()` chain without an explicit `.contiguous()` needs this same
+`np.ascontiguousarray()` guard, or it will silently produce a wrong (transposed) comparison with no
+error at all.**
+
+Next: the upsampling `AdainResBlk1d` variant (`F0.1`, exercises the depthwise-conv-transpose "pool" +
+learned `conv1x1` shortcut together, both individually verified but not yet together in a real block),
+then `F0Ntrain`'s full assembly.
+
+---
+
+### 2026-07-19: Kokoro TTS — upsampling `AdainResBlk1d` (`F0.1`) converted and verified
+
+`convert_kokoro_f0n.py` extended + `reference_forward_kokoro_f0_block1.py` +
+`test_e2e_kokoro_f0_block1.cpp` — `predictor.F0.1` (`dim_in=512→dim_out=256`, WITH the learned
+`conv1x1` shortcut AND `upsample=True`, doubling `T`). First real exercise of the depthwise-
+`ConvTranspose1d` "pool" composition and the learned shortcut TOGETHER (each individually verified
+earlier this milestone). Matched to `max_abs_diff=3.3e-6` — passed on the first real run, no new bugs
+found here (the earlier `_shortcut`-vs-`_residual` upsample-mechanism mixup was caught and fixed
+*before* this test, while writing the conversion code, not by this test failing).
+
+Confirms: the "pool"'s output length is exactly `2*n_tokens` as derived (`T=6→T_out=12`), and the
+`SymbolEnv` arithmetic expression `"2*$n_tokens"` threads correctly through every downstream `RESHAPE`
+in the block (`conv1`/`conv2`/the shortcut's own `conv1x1`).
+
+With both `AdainResBlk1d` variants now verified, `F0Ntrain`'s remaining new surface is just assembly:
+the shared `BiLstmStepper` (already proven for `TextEncoder`/`DurationEncoder`) feeding two independent
+3-block `AdainResBlk1d` stacks (`F0`: 512→512→256→256, `N`: same shape) + `F0_proj`/`N_proj` (plain
+`Conv1d(256,1,1)`). Next: assemble `F0Ntrain` fully, then the duration-based frame-expansion that
+produces its real input (`en`, from `DurationEncoder`'s own 640-channel output — NOT the top `lstm`'s
+512-channel output, confirmed from `KModel.forward_with_tokens`'s real call order directly).
+
+---
+
+### 2026-07-19: Kokoro TTS — `F0Ntrain` full assembly converted and verified
+
+`convert_kokoro_f0n.py` extended (`write_bilstm_ggufs` reused for the new `shared` BiLSTM instance,
+640→512; `write_stack` writes the 3-block `AdainResBlk1d` GGUFs for both the `F0` and `N` stacks;
+`write_proj1x1` writes `F0_proj`/`N_proj` as a direct `CONV_1D` on the stack's own `[T,C]`-convention
+output — no `MUL_MAT`-as-matmul transpose needed here, unlike VITS's channel-first conv1x1 sites,
+since the real weight shape `(1,256,1)` numpy already matches `CONV_1D`'s `[K,IC,OC]` kernel
+convention directly) + `reference_forward_kokoro_f0ntrain.py` + `tests/test_e2e_kokoro_f0n.cpp`.
+Verified `mean_abs_diff=1.3e-5, max_abs_diff=6.1e-5` (24/24 checks), `T=5→T_out=10`.
+
+Two things caught while writing the reference, before any test ran:
+- The existing `reference_forward_kokoro_f0_block1.py`'s `adain_resblk1d` hardcodes shortcut+upsample
+  together (built only to match `F0.1`'s own specific instance) and has no `conv1x1` fallback for the
+  `dim_in==dim_out` case — raised a real `KeyError` on `F0.0`/`F0.2`/`N.0`/`N.2` (no `conv1x1.*` keys
+  exist for those). Fixed by writing a single general `adain_resblk1d_general` in the new reference
+  script that treats `learned_sc = dim_in != dim_out` and `upsample` as the two independent real flags
+  they are (confirmed in `istftnet.py` directly), rather than patching two mismatched hardcoded
+  helpers to cover the 3rd combination.
+  worth noting for any FUTURE model port that reuses per-instance reference helpers across multiple
+  differently-shaped instances of the same module class: don't assume an earlier single-instance
+  reference generalizes; check its shortcut/branch assumptions against every instance's real shape
+  first.
+- Confirmed (again) that chaining `AdainResBlk1d` blocks together on the C++ side needs **no host-side
+  transpose between blocks at all** — each block's raw ggml output buffer (`ne=[T,C]`, `T` fastest) is
+  already in exactly the layout the next block's `"x"` input wants, so `run_stack`'s C++ loop just
+  passes the raw `ggml_backend_tensor_get` buffer straight through. The only real transposes needed are
+  at the true boundaries: `en`'s `(640,T)` numpy layout (channel-outer, T-inner — coincidentally already
+  ggml-shaped) converted to `BiLstmStepper`'s T-major vector-of-vectors convention, and that stepper's
+  T-major output converted back to ggml's channel-outer flat layout before it's fed to the first block.
+
+`F0Ntrain` is now complete and fully verified. Remaining Kokoro work: the duration-based
+frame-expansion that produces `F0Ntrain`'s real input (`en`, `DurationEncoder`'s own 640-channel
+output aligned to frame rate via `commons`-style duration expansion — VITS's own
+`generate_path`/`CUMSUM` precedent, see the VITS plan, is the relevant model here too), then the full
+`Decoder`/`Generator` (Snake activation, NSF harmonic source, ISTFT reconstruction — individually
+verified earlier this milestone but not yet assembled into a real topology), the overall Kokoro
+conversion script tying every piece together, and a `KokoroDriver`-style host class.
+
+---
+
+### 2026-07-19: Kokoro/StyleTTS2 — duration-based frame-expansion (`loom::predict_durations`/
+### `loom::expand_by_duration`), host-side, no new primitive
+
+Read the real inference path directly (`kokoro/model.py`'s `KModel.forward_with_tokens`, from the
+`kokoro` pip package actually installed in the piper venv — much clearer than re-deriving from
+`modules.py` alone) to confirm exactly what produces `F0Ntrain`'s real `en` input:
+
+```python
+duration = sigmoid(self.predictor.duration_proj(x)).sum(-1) / speed
+pred_dur = round(duration).clamp(min=1).long()
+indices = repeat_interleave(arange(T_text), pred_dur)
+pred_aln_trg[indices, arange(T_frames)] = 1          # one-hot alignment matrix
+en = d.transpose(-1, -2) @ pred_aln_trg              # d: DurationEncoder's own 640-ch output (WITH
+                                                      # style already concatenated on its last iteration
+                                                      # — confirmed directly in modules.py's
+                                                      # DurationEncoder.forward, matches this project's
+                                                      # existing duration_predictor test's own "x" exactly)
+asr = t_en @ pred_aln_trg                            # same expansion, reused for TextEncoder's 512-ch output
+```
+
+This is a genuinely SIMPLER operation than the roadmap originally assumed by analogy to VITS's
+`generate_path` (`commons.py`, cumsum + broadcast-compare + shift/pad + mask-multiply — built to
+support a smoother/monotonic-but-not-strictly-one-hot alignment in general). Kokoro's `pred_aln_trg`
+is *always* an exact one-hot matrix (each output frame maps to exactly one input token), so
+`seq^T @ pred_aln_trg` collapses to nothing more than "repeat row `t` of `seq`, `pred_dur[t]`
+consecutive times" — nowhere close to needing a `CUMSUM` primitive or any ggml graph node at all. (This
+also matches what VITS's OWN `generate_path` already degenerates to in `vits_driver.cpp` once its
+per-utterance mask is dropped — confirmed by reading that code: both models' real alignment mechanisms
+collapse to the identical "replicate a column N times" host operation once batching/masking is out of
+the picture, they just arrive at it from different starting formulas.)
+
+Implemented as two new free functions (not a class — no state carried between calls, unlike
+`BiLstmStepper`/`TdtDecoder`'s per-step recurrence): `loom::predict_durations` (sigmoid+sum/round/clamp)
+and `loom::expand_by_duration` (the repeat), in `include/loom/core/duration_aligner.h` /
+`src/core/duration_aligner.cpp`. Deliberately used `std::nearbyint` (ambient-rounding-mode, defaults to
+round-half-to-even) rather than `std::lround` (round-half-away-from-zero) to match `torch.round`'s real
+semantics exactly, even though float32 sigmoid-sum outputs essentially never land on an exact tie in
+practice — same "verify against the real formula, not an approximation of it" discipline as everywhere
+else in this project.
+
+Verified against a hand-rolled numpy reference (`tools/fixture_gen/reference_duration_aligner.py`,
+`tests/test_duration_aligner.cpp`) — pure host arithmetic with no GGUF/ggml graph involved at all, so
+this fixture is procedurally generated at ctest time (numpy-only, no torch needed) rather than
+skip-if-missing like the real-checkpoint tests, matching `test_lstm_step.cpp`'s own convention for
+synthetic composite-logic verification. Exact bit-for-bit integer match on `pred_dur` and exact
+float match on the expanded output (6 tokens → 111 frames in the fixture).
+
+With this piece done, Kokoro's remaining work is: assembling `F0Ntrain`'s real input end-to-end (run
+the already-verified `DurationEncoder`+top-`lstm`+`duration_proj` → `predict_durations` →
+`expand_by_duration` on both `d` and `t_en` → feed into the already-verified `F0Ntrain`), then the full
+`Decoder`/`Generator` (Snake activation, NSF harmonic source, ISTFT reconstruction — individually
+verified earlier this milestone but not yet assembled into a real topology), the overall Kokoro
+conversion script tying every piece together, and a `KokoroDriver`-style host class.
+
+---
+
+### 2026-07-19: Kokoro Generator — two new primitives (`CONCAT`, `ATAN2`), forward/inverse STFT verified
+
+Started on `istftnet.py`'s `Decoder`/`Generator` (the HiFi-GAN-NSF vocoder, Kokoro's last major
+unbuilt piece). Read the real source in full (`Generator`, `AdaINResBlock1`, `SineGen`,
+`SourceModuleHnNSF`, `TorchSTFT`, `Decoder`, `AdainResBlk1d`) and the real checkpoint's `config.json`
+(`upsample_rates=[10,6]`, `upsample_kernel_sizes=[20,12]`, `upsample_initial_channel=512`,
+`resblock_kernel_sizes=[3,7,11]`, `resblock_dilation_sizes=[[1,3,5]]*3`, `gen_istft_n_fft=20`,
+`gen_istft_hop_size=5`) before designing anything. Broke the remaining work into 6 tracked tasks
+(#84-#90); this entry covers the first three (#84-#86).
+
+**`CONCAT` primitive** (`src/ops/primitives_basic.cpp`): wraps ggml's native `ggml_concat(a,b,dim)`
+(2-input; chain for 3+ tensors). Needed because Kokoro's `Decoder.forward` concatenates
+graph-computed tensors (`torch.cat([asr,F0,N],axis=1)`, `torch.cat([har_spec,har_phase],dim=1)`,
+`torch.cat([x,asr_res,F0,N],axis=1)`) — genuinely different from every EARLIER Kokoro concatenation
+(style-with-features), which was always host-precomputable before entering the graph at all. Verified
+both `dim=0` and `dim=1` against hand-computed small examples in `test_primitive_registry.cpp`.
+
+**`ATAN2` primitive**: ggml has no native `atan2` (nor even single-arg `atan`). Needed because
+`Generator`'s noise path uses the REAL phase (`torch.angle` == `atan2(imag,real)`) of the harmonic
+source's own STFT as a trained-weight-dependent auxiliary input — unlike `RQ_SPLINE_INVERSE` elsewhere
+in this project, there's no algebraic reformulation that avoids the transcendental function entirely.
+Added via `ggml_map_custom2` (ggml's own escape hatch for exactly this case — no native op, no viable
+composition), verified against `std::atan2` across all 4 quadrants plus x=0 edge cases.
+
+**Forward/inverse STFT** (`tools/convert_kokoro/kokoro_stft_common.py`,
+`convert_kokoro_stft.py`, `reference_forward_kokoro_stft.py`, `tests/test_e2e_kokoro_stft.cpp`):
+reused Whisper's mel-frontend DFT-via-`CONV_1D` trick (`build_dft_kernels`/`periodic_hann`,
+`tools/convert_whisper/whisper_common.py`) for the forward transform, PLUS the real phase this time
+(Whisper only ever needed magnitude). Two real findings, both caught by verifying the composition in
+plain Python/numpy against real `torch.stft`/`torch.istft` BEFORE writing any GGUF/C++ code (same
+discipline as every other primitive/composition this project has added):
+
+- **DC/Nyquist bin sign-of-zero bug**: a real signal's imaginary STFT component is mathematically
+  exactly zero at `k=0` and `k=n_fft/2` (n_fft even) — but computing it as `-(sin_kernel @ frame)`
+  produces IEEE754 **negative** zero (since `sin(0)=0.0` exactly, and `-(+0.0)` is `-0.0`), while real
+  `torch.stft` always returns **positive** zero there (confirmed across 200 random seeds). This flips
+  `atan2`'s branch (`atan2(-0,neg)=-π` vs `atan2(+0,neg)=+π`), a spurious ~2π error at exactly those 2
+  bins every time. Fixed via a `boundary_mask` (1.0 at the two affected bins) and the identity
+  `x - x*mask`: exactly `+0.0` for any finite `x` when `mask=1` (subtracting a value from itself is
+  always positive zero in IEEE754, regardless of `x`'s sign), and exactly `x` when `mask=0` — robust in
+  a way `x*(1-mask)` is not.
+- **Phase comparison is inherently unstable at the ±π branch cut**: even with the fix above, two
+  independently-computed float32 pipelines can land on opposite sides of a genuine discontinuity from
+  ~1e-7-level rounding noise alone (confirmed: 1 element out of 143 differed by ~2π in one seed, at a
+  point where both `re<0` and `im≈0` from real signal noise, not from any bug). Comparing raw phase
+  differences will show spurious ~2π "errors" that aren't real errors. Fixed by using a **circular**
+  distance (`((a-b+π) mod 2π) - π`, absolute value) in the test instead of a plain difference —
+  documented in `kokoro_stft_common.py`'s module docstring as a standing rule for comparing ANY
+  angle-valued quantity in this project, not just here.
+- Inverse STFT reduces to two `CONV_TRANSPOSE_1D` calls (real-part and imag-part contributions, window
+  baked into the synthesis kernel) summed, divided by the overlap-added squared-window normalization
+  (`wsum`) — verified bit-for-bit (~2e-8) against real `torch.istft` on independently-random
+  (non-self-consistent) magnitude/phase, matching how `Generator` actually uses it (`spec=exp(...)`,
+  `phase=sin(...)`, never a true forward-transform's own output). `wsum` depends only on `n_frames`
+  (not on any graph value), so it's computed **host-side** (a trivial loop) and fed in as a declared
+  input, rather than adding a third `CONV_TRANSPOSE_1D` call over a constant all-ones signal just to
+  keep it in-graph.
+- **`ggml_conv_transpose_1d`'s kernel channel convention is the OPPOSITE of `CONV_1D`'s**: confirmed
+  directly against ggml's real assertion (`a->ne[2] == b->ne[1]`, i.e. kernel `ne[2]` = data's channel
+  count) — `CONV_1D` kernels are `[K,IC,OC]` (`ne[1]`=IC), `CONV_TRANSPOSE_1D` kernels are `[K,OC,IC]`
+  (`ne[1]`=OC), matching real PyTorch's own `Conv1d` vs `ConvTranspose1d` weight-layout difference
+  ((OC,IC,K) vs (IC,OC,K) natively). Numerically invisible in this specific case since OC=1 for both
+  synthesis kernels here, but documented since it will matter the moment a real multi-output-channel
+  `ConvTranspose1d` shows up (the Generator's actual upsampling convs, next).
+- **`SymbolEnv`'s int-attribute resolution rounds-to-nearest (`std::llround`), not floor/truncate**:
+  a real bug caught immediately when the forward topology's `n_frames` shape expression
+  `"($n_tokens-20)/5+1"` evaluated to `13.8` for a real `n_tokens=84` (ordinary floating-point division,
+  since `SymbolEnv::eval` operates on `double`s throughout) and `llround(13.8)=14`, not the correct `13`
+  — a `ggml_reshape` element-count mismatch abort. Fixed by using the grammar's already-supported
+  `floor()` function explicitly (`"floor(($n_tokens-20)/5)+1"`), landing exactly on `13.0` before
+  rounding. **Any future topology attribute expression involving `/` on dynamic symbols needs an
+  explicit `floor()` wrap if floor-division semantics are intended** — plain `/` alone is not safe.
+
+Verified: forward STFT max_mag_diff=9.5e-7, max_phase_circular_diff=8.2e-7 (13 frames); inverse STFT
+max_diff=3.0e-8 (40-sample output). Full suite still 70/70.
+
+Next: `SineGen`/`SourceModuleHnNSF` (the NSF harmonic source feeding this forward STFT), then
+`AdaINResBlock1` (Snake activation + dilated resblocks, distinct from `predictor.F0/N`'s
+`AdainResBlk1d`), then assembling the full `Generator` and `Decoder`.
+
+---
+
+### 2026-07-19: Kokoro Generator — `SineGen`/`SourceModuleHnNSF` (NSF harmonic source) converted and verified
+
+One new primitive (**`FLOOR`**, trivial `ggml_floor` wrapper — needed for `(f0/sampling_rate) % 1`,
+expressed as `x - floor(x)` since ggml has no native modulo and every operand here is non-negative).
+
+Read `istftnet.py`'s real `SineGen`/`SourceModuleHnNSF` in full. Confirmed `Generator.forward` only
+ever uses `SourceModuleHnNSF`'s FIRST return value (`har_source`) — `noise`/`uv` are computed and
+returned but never used afterward — so this converts/verifies only `har_source`, not the full module
+surface. Real hyperparameters pulled from `Generator.__init__`: `sampling_rate=24000`,
+`upsample_scale=math.prod(upsample_rates)*gen_istft_hop_size=10*6*5=300`, `harmonic_num=8` (dim=9),
+`voiced_threshod=10`, plus `SineGen`'s own defaults `sine_amp=0.1`/`noise_std=0.003`.
+
+**Algorithm** (nearest-upsample F0 by 300x → per-harmonic phase accumulation via a
+downsample(1/300,linear)+cumsum+upsample(300,linear) dance → sin → voiced/unvoiced-gated noise mix →
+`Linear(9,1)`+tanh) verified TWICE before writing any GGUF/C++: first a standalone numpy
+reimplementation cross-checked directly against a hand-copied, unmodified real `SineGen`/
+`SourceModuleHnNSF.forward` (matched real torch to 3.0e-8, with matching injected `rand_ini`/`noise`
+draws), then the actual loom composition verified against an independently-written second PyTorch
+reference (mean_diff=7.8e-8, max_diff=2.9e-6, `T_frames=4→L=1200`).
+
+Two host-drawn random inputs (`rand_ini`, the harmonic phase's random initial-offset draw — index 0
+always exactly 0 per `SineGen`'s own `rand_ini[:,0]=0`; and `noise`, the per-sample additive Gaussian
+term) — same "host draws via `<random>`, feeds in as a declared input" precedent as VITS's `z_p`
+sampling, not a new mechanism.
+
+No outer-product/broadcast-repeat primitive needed for building the 9 harmonic channels
+(`fn[:,h]=f0_up*(h+1)`) — `dim=9` is small and conversion-time-fixed, so this unrolls 9
+`SCALE`+`RESHAPE`+`CONCAT` calls instead (same "unroll a small fixed-size loop at conversion time"
+precedent as Whisper's per-head loops).
+
+**Real bug caught by ggml's own `ggml_can_repeat` assertion** (not by a silent wrong-answer — a hard
+abort): `ggml_add(a,b)`/`ggml_mul(a,b)` require `b` to broadcast INTO `a`'s shape — `a` (the first
+argument) determines the OUTPUT shape, so `a` must always be the "bigger" (or equal) tensor. Had
+`noise_amp = ADD(base_w[1,1], uv_delta[L,1])` backwards (the constant `[1,1]` first, the `[L,1]`
+per-frame tensor second) — `[L,1]` cannot broadcast into `[1,1]`, so this aborted immediately at graph
+build time rather than producing a silently wrong answer. Fixed by swapping the argument order
+(`ADD(uv_delta, base_w)`). **General rule now confirmed for future composition work**: when one operand
+is a per-position/per-channel computed tensor and the other is a small conversion-time constant, the
+computed tensor must be listed FIRST.
+
+Confirmed (again) ggml's `ggml_conv_transpose_1d`-style axis-convention-crossing pattern shows up here
+too, in a different form: `CUMSUM`/`INTERPOLATE_1D` need TIME on `ne[0]` (this project's usual `[T,C]`
+convention), but the final `Linear(9,1)` projection needs the CONTRACTED (channel) axis on `ne[0]` for
+`MUL_MAT` — crossed via `PERMUTE`(axes=[1,0,2,3])+`CONT`, the same boundary-crossing precedent used
+everywhere else a genuine axis-convention change is needed (never assumed away).
+
+Next: `AdaINResBlock1` (Snake activation + dilated resblocks, the OTHER "AdaIN*"-family block —
+distinct from `predictor.F0/N`'s `AdainResBlk1d`, used by `Generator.resblocks`/`noise_res`), then
+assembling the full `Generator` and `Decoder`.
+
+---
+
+### 2026-07-19: Kokoro Generator — `AdaINResBlock1` (Snake-activation dilated resblock) converted and verified
+
+No new primitive needed. `tools/convert_kokoro/kokoro_generator_common.py` (new, shared module for the
+rest of the Generator/Decoder assembly): `add_adain_resblock1` + `add_snake`, reusing
+`add_adain1d`/`fold_weight_norm`/`to_f32` from `convert_kokoro_f0n.py` directly rather than
+re-deriving them — confirmed against the real checkpoint's state dict
+(`decoder.generator.{resblocks,noise_res}.*`) that this `AdaIN1d` instance has the SAME
+never-trained-affine-params property as every other one this whole milestone (no `.norm.weight`/
+`.norm.bias` keys anywhere).
+
+Real structural difference from `predictor.F0/N`'s `AdainResBlk1d`: `AdaINResBlock1` has NO
+shortcut/upsample path at all (`dim_in` always equals `dim_out`, sequence length never changes) and
+uses 3 (dilation=1,3,5) `(AdaIN1d→Snake→dilated conv1)→(AdaIN1d→Snake→conv2,dilation=1)→residual-add`
+stages instead of `AdainResBlk1d`'s single norm/act/conv pair — reused via a NEW builder function, not
+a variant flag on the existing one (genuinely different control flow, not a parameterization of the
+same shape).
+
+**Snake activation** (`x + (1/a)*sin(a*x)^2`) needed a per-channel LEARNED `a` (real weight shape
+`(1,channels,1)`) — unlike VITS's own HiFi-GAN `Generator` (`test_hifigan_generator`), which has no
+such activation at all. Folded the reciprocal `1/a` at CONVERSION time (plain numpy division, same
+"fold at conversion time" precedent as weight-norm) rather than adding a `DIV` node in-graph, and
+reshaped the squeezed `(channels,)` constant to `[1,channels]` in-graph for broadcasting against this
+project's `[T,C]` convention.
+
+Verified against a hand-rolled PyTorch reference on a small SYNTHETIC instance (channels=4,
+style_dim=8, kernel=3, dilations=(1,3,5), random weights) — checkpoint-independent structural
+verification, same precedent as VITS's own `test_hifigan_generator` (verify the WIRING first, wire in
+real checkpoint weights when the full `Generator` is assembled). Passed on the first real run:
+mean_abs_diff=6.9e-7, max_abs_diff=1.9e-6.
+
+All 3 of the Generator's genuinely new pieces (STFT, `SineGen`, `AdaINResBlock1`) are now done and
+individually verified. Remaining: assemble the full `Generator` (upsample stack via
+`CONV_TRANSPOSE_1D`, wiring the noise path through `noise_convs`/`noise_res`, resblock fan-out-then-
+average, final `conv_post`→spec/phase split→inverse STFT — reusing VITS's own
+`ConvTranspose1d(padding>0)`-via-crop trick from `test_hifigan_generator` for the upsampling convs) and
+the `Decoder` (F0_conv/N_conv downsampling, `CONCAT`-based channel joining, `encode`/`decode`
+`AdainResBlk1d` stack reusing `convert_kokoro_f0n.py`'s existing builder verbatim with new dims, then
+the `Generator`), against the real checkpoint.
+
+---
+
+### 2026-07-19: Kokoro Generator — full assembly (upsample stack + noise path + resblocks + inverse STFT) verified
+
+One new primitive (**`EXP`**, trivial `ggml_exp` wrapper — needed for the final `spec=exp(x[:n_freq])`
+split). `tools/convert_kokoro/convert_kokoro_generator.py` assembles the whole `Generator.forward`
+(minus `SineGen`/forward-STFT, which stay separate topologies the host driver runs first and feeds in
+as a ready-made `har` input — same "compose already-verified pieces via the host driver" pattern as
+`BiLstmStepper`).
+
+Confirmed real channel/kernel shapes directly against the checkpoint's
+`decoder.generator.{ups,noise_convs,conv_post}.*` state dict before writing anything (`ups.0`:
+512→256 k=20, `ups.1`: 256→128 k=12; `noise_convs.0`: 22→256 k=12 s=6, `noise_convs.1`: 22→128 k=1;
+`conv_post`: 128→22 k=7 — every shape matched the derivation on the first check, not adjusted after).
+
+**Length bookkeeping, verified algebraically before writing any GGUF/C++ code** (letting `T0` = the
+topology's own input length): both real `upsample_rates` (`[10,6]`) use `kernel_size=2*stride`,
+`padding=(kernel_size-stride)//2=stride//2` — the "integer-exact upsample" ConvTranspose1d config, so
+`ggml_conv_transpose_1d`'s p0=0-only limitation + crop (VITS's own `test_hifigan_generator` precedent)
+resolves CLEANLY to `T0*10` then `T0*60`, no `floor()`-guarded fractional expression needed anywhere in
+the main path. The harmonic source's own STFT frame count (`T_har=T0*60+1`, one more than the main
+path) reconciles with the main path exactly at each `noise_convs[i]` (proven by direct algebraic
+substitution, not just spot-checked numerically): stage 0's strided conv (`K=12,S=6,P=3`) maps
+`T_har→T0*10` exactly (`floor((T0*60+1+6-12)/6)+1` simplifies to `floor(T0*10-5/6)+1=T0*10`, since
+`T0*10` is always an integer); stage 1's 1×1 conv leaves `T_har` unchanged, matching the main path's own
+`T0*60+1` after its reflection-pad. **A real, tuned architecture where these must and do align exactly**
+— not a coincidence, confirmed by carrying the algebra through symbolically rather than trusting a
+single numeric spot-check.
+
+**Real bug caught immediately on the first end-to-end run, before ever seeing a numerical mismatch**: a
+`ggml_reshape_3d` nelements-mismatch abort from passing the WRONG length expression to
+`add_adain_resblock1` for the noise path's `x_source` — used `har`'s own length (`T_har`, the length
+BEFORE the strided `noise_conv`) instead of `x_source`'s REAL post-conv length (`T0*10` for stage 0,
+`T0*60+1` for stage 1 — the length it must actually have to be added to the main path `x`). Fixed by
+computing `x_source_len_expr` explicitly per stage instead of reusing `t_har_expr`. This is exactly the
+class of bug `add_adain_resblock1`'s new `seq_len_expr` parameter (added earlier this entry, replacing
+its old hardcoded `"$n_tokens"` default) exists to prevent — confirms that generalization was the right
+call, not premature.
+
+**One-sample `ReflectionPad1d((1,0))`** (applied only after the LAST upsample stage): confirmed directly
+against real `torch.nn.ReflectionPad1d((1,0))` that it degenerates to "prepend a copy of the element at
+index 1" (verified: `pad([1,2,3,4])=[2,1,2,3,4]`) — a `VIEW`(1-sample slice at index 1, using `VIEW`'s
+own default `nb1`-omitted behavior)+`CONT`+`CONCAT` composition, not a general reflection-pad primitive
+(unneeded for a width-1 pad specifically).
+
+Verified against a hand-rolled PyTorch reference on a small SYNTHETIC instance (real checkpoint's exact
+channel/kernel shapes, random weights, `T0=2→T_har=121→waveform_len=600=T0*300`) — checkpoint-independent
+structural verification, same precedent as VITS's `test_hifigan_generator`. Passed after the one length
+bug above was fixed: mean_diff=2.0e-4, max_diff=9.8e-3 (looser than earlier single-block Kokoro pieces,
+expected given this chains many more layers — same floating-point-chaos-amplification calibration
+already established for Whisper's own multi-layer encoder).
+
+The full Generator is now done and verified. Remaining: the `Decoder` (F0_conv/N_conv downsampling,
+`CONCAT`-based channel joining, `encode`/`decode` `AdainResBlk1d` stack reusing `convert_kokoro_f0n.py`'s
+existing builder verbatim with new dims, then this Generator), against the real checkpoint — the last
+piece before a `KokoroDriver` and the overall conversion script tying every verified piece together.
+
+---
+
+### 2026-07-19: Kokoro `Decoder` "core" (F0_conv/N_conv + encode/decode stack) converted and verified —
+
+### Generator/Decoder assembly COMPLETE
+
+No new primitive needed — `convert_kokoro_decoder_core.py` reuses `convert_kokoro_f0n.py`'s
+`add_adain_resblk1d` VERBATIM (the exact same `AdainResBlk1d` class is used for both
+`predictor.F0/N` and `Decoder.encode`/`decode` — confirmed directly, not assumed) plus `CONCAT`.
+
+Confirmed real channel shapes directly against the checkpoint's `decoder.{encode,decode,F0_conv,N_conv,
+asr_res}.*` state dict before writing anything: `Decoder.__init__`'s `dim_in` argument is
+`config['hidden_dim']=512` (NOT `config['dim_in']=64`, an unrelated hyperparameter used elsewhere —
+confirmed directly in `model.py`'s `KModel.__init__`, a real one-line misreading risk caught before it
+became a bug). `encode`: `514→1024` (`asr`(512)+`F0`(1)+`N`(1)); `decode[0..2]`: `1090→1024`
+(`x`(1024)+`asr_res`(64)+`F0`(1)+`N`(1)), each re-concatenating every iteration until the first
+`upsample=True` block; `decode[3]`: `1090→512`, upsamples.
+
+**Length bookkeeping, verified algebraically** (letting `T_frames` = this topology's own `$n_tokens`,
+the original text/duration-alignment frame count matching `asr`'s own length): `F0_conv`/`N_conv`
+(weight-normed `Conv1d(1,1,k=3,s=2,p=1)`) downsample F0Ntrain's own upsampled output (`2*T_frames`)
+back to exactly `T_frames` (`floor((2T-1)/2)=T-1` for any integer `T≥1`, so `floor((2T+2-3)/2)+1=T`
+exactly) — a clean, algebraically-confirmed match, not a numeric coincidence. Since this topology's own
+primary `$n_tokens` symbol IS `T_frames` itself, `add_adain_resblk1d`'s existing hardcoded
+`"$n_tokens"`/`"2*$n_tokens"` length expressions apply UNCHANGED here (unlike the Generator's
+`resblocks`, which needed the new `seq_len_expr` parameter because they operate at lengths other than
+their topology's own primary symbol) — confirms that parameter was added for exactly the right reason
+and no more.
+
+Verified against a hand-rolled PyTorch reference on a small SYNTHETIC instance (real checkpoint's exact
+channel shapes, random weights, `T=3→x shape=(6,512)`, matching the Generator's own expected 512-channel
+input exactly) — passed on the first real run: mean_abs_diff=2.0e-5, max_abs_diff=1.3e-4.
+
+**This completes Kokoro's entire TTS synthesis math** (`CustomAlbert` → `TextEncoder` →
+`ProsodyPredictor` (`DurationEncoder`+duration/F0/energy prediction) → the host-side duration-based
+frame-expansion → `Decoder` (`encode`/`decode` → `Generator` → real STFT/ISTFT) — every real
+architectural piece individually verified against either the real checkpoint or a hand-rolled PyTorch
+reference of the real formula, 74/74 tests passing). New primitives added across the whole Kokoro
+effort: `SIN`, `COS`, `INTERPOLATE_1D`, `LEAKY_RELU`, `CUMSUM`, `CONCAT`, `ATAN2`, `FLOOR`, `EXP` — none
+needed for attention/matmul-heavy work, all for genuinely new elementwise/structural operations this
+model family exercises that no prior model in this project's roadmap needed.
+
+Remaining before Kokoro is fully "driveable": a `KokoroDriver`-style host class wiring every verified
+topology together in the real call order (`CustomAlbert`→`TextEncoder`(DurationEncoder half)→
+`predict_durations`/`expand_by_duration`→`F0Ntrain`→`SineGen`/forward-STFT→`Decoder`→`Generator`), the
+overall conversion script pulling every piece's real weights from the ONE real checkpoint into a
+coherent set of GGUF files, and (separately, lower priority) a permissively-licensed phonemizer for
+text→phoneme conversion (already tracked, task #79, deferred pending a licensing check — VITS needs the
+exact same piece). Then on to StyleTTS2 (likely shares most of this architecture directly), SupertonicTTS,
+F5-TTS, Matcha-TTS.
+
+---
+
+### 2026-07-19: KokoroDriver + master conversion script — Kokoro is now fully driveable end-to-end
+
+**`bert_encoder`** (`Linear(768,512)`, `tools/convert_kokoro/convert_kokoro_bert_encoder.py`): the one
+remaining unconverted real-checkpoint piece. Forced a careful re-derivation of this project's TWO
+distinct `[T,C]`-family axis conventions, since getting this wrong would have silently fed the whole
+downstream pipeline transposed data:
+- **Layout A** (`ne=[T,channels]`, `T=ne[0]` fastest, flat index `c*T+t`) = native PyTorch `(C,T)`
+  channel-first, reversed. Used throughout `CONV_1D`/`AdainResBlk1d`/`AdaINResBlock1`/`Decoder`/
+  `Generator` — everything convolutional.
+- **Layout B** (`ne=[channels,T]`, `channels=ne[0]` fastest, flat index `t*channels+c`) = native
+  PyTorch `(T,channels)` time-major, reversed — the ordinary transformer/RNN layout. Used by
+  `CustomAlbert`'s own raw output (confirmed directly against `test_e2e_kokoro_albert.cpp`'s own
+  comment: `ne=[hidden_size,T]`) and `AdaLayerNorm`'s own `x` input (confirmed against
+  `build_adaln_topology`'s declared `["channels","$n_tokens"]` shape) — and it's ALSO exactly what a
+  host T-major vector-of-vectors (e.g. `BiLstmStepper`'s own output) flattens into with NO reordering.
+
+  `bert_encoder`'s real forward (`Linear` then `.transpose(-1,-2)`) is thus: input Layout B (`ne=
+  [768,T]`, matching Albert's raw output byte-for-byte) → `MUL_MAT` naturally produces Layout B again
+  (`ne=[512,T]`, since the weight's own output dim always lands on `ne[0]`) → the real
+  `.transpose(-1,-2)` is an EXPLICIT `PERMUTE`+`CONT` converting Layout B → Layout A (`ne=[T,512]`),
+  matching `DurationEncoder`'s own expected `d_en` convention. Verified against the real checkpoint's
+  own weights: mean_diff=1.7e-7.
+
+**`convert_kokoro_all.py`** (master conversion script): discovered every earlier per-piece script's
+`main()` ALREADY used the real checkpoint's real weights (not synthetic) except the three pieces built
+for pure structural verification this milestone (`AdaINResBlock1` standalone, `Generator`, `Decoder`
+core) — so this just orchestrates each existing script's real-weight logic in one place, adding real
+`sd_prefix` wiring (`convert_kokoro_generator.py`'s `build_generator`/`convert_kokoro_decoder_core.py`'s
+`build_decoder_core` already accepted an `sd_prefix` parameter for exactly this) for the 3 pieces that
+needed it. Runs cleanly against the real checkpoint, producing the full ~44-file GGUF set.
+
+**`KokoroDriver`** (`include/loom/core/kokoro_driver.h`/`src/core/kokoro_driver.cpp`): the real
+`KModel.forward_with_tokens` call order end-to-end, owning every loaded `GgufModel` directly (unlike
+`VitsDriver`'s reference-only convention — Kokoro's real pipeline spans ~40 small GGUF files, too many
+to reasonably hand to callers to construct themselves). Real bug caught by a segfault (not a silent
+wrong answer) on the FIRST real run, isolated via manual `fprintf` bisection (no `gdb`/`lldb` available
+in this environment): a helper returned an output tensor via a raw `ggml_tensor*` out-param, but the
+tensor's owning `GraphBuilder`/`ggml_context` was a LOCAL variable destroyed when the helper returned —
+a genuine use-after-free the very next line (`out_t->ne[0]`) dereferenced. Fixed by reading `ne[0]`/
+`ne[1]` into plain `uint32_t` out-params BEFORE the helper returns, never handing back a pointer into a
+soon-to-be-destroyed context.
+
+Verified (same scope as VITS's own `test_e2e_vits_driver.cpp` precedent — finite/non-trivial output, not
+yet a full hand-rolled pipeline reference, a separately-scoped and much larger undertaking spanning ~8
+sub-model references) against the real checkpoint: a 10-token input produces a 22200-sample finite,
+non-silent waveform, exercising every real stage in order (`T_text=10→T_frames=37→T_f0=74→T_har=4441`,
+matching the algebraic `T_har=T_f0*60+1` derivation exactly).
+
+**Kokoro TTS is now fully driveable end-to-end from the real checkpoint** — 76/76 tests passing. Only
+remaining Kokoro-specific gaps: a full hand-rolled pipeline numerical reference (optional; every
+sub-piece already independently verified) and a permissively-licensed phonemizer (task #79, shared need
+with VITS). Moving on to StyleTTS2 next (likely shares most of this architecture directly), then
+SupertonicTTS, F5-TTS, Matcha-TTS.

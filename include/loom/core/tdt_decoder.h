@@ -12,7 +12,12 @@ namespace loom {
 
 struct TdtDecoderConfig {
     int32_t blank_id = -1;
-    std::vector<uint32_t> durations;    // e.g. {0,1,2,3,4}; index into this via the joint's duration argmax
+    // e.g. {0,1,2,3,4}; index into this via the joint's duration argmax. Leave EMPTY for a plain
+    // (non-TDT) RNN-T model: the joint then has no duration head at all (output width is exactly
+    // n_token_classes, not n_token_classes + n_durations), and every blank advances exactly one frame
+    // (standard RNN-T greedy decoding) instead of a predicted duration -- see decode_greedy's own
+    // comment for the exact branch.
+    std::vector<uint32_t> durations;
     uint32_t max_symbols_per_step = 10; // bounds the inner per-frame loop
 };
 
@@ -33,7 +38,8 @@ struct TdtDecoderConfig {
 //     differing only in declared output ("h_new"/"c_new").
 //   - joint_topo: inputs "encoder_frame" (f32 [n_embd]) and "decoder_out" (f32 [pred_hidden] -- the top
 //     LSTM layer's h_new) -> declared output a single combined [n_token_classes + n_durations] vector
-//     (first n_token_classes are token+blank logits, last n_durations are the duration head).
+//     (first n_token_classes are token+blank logits, last n_durations are the duration head) -- or, for
+//     plain RNN-T (cfg.durations empty), just [n_token_classes] with no duration head at all.
 //
 // This driver does NOT run the encoder itself -- `encoder_output` is whatever an ordinary, separate,
 // non-autoregressive GraphBuilder::build() call already produced (the FastConformer encoder is its own

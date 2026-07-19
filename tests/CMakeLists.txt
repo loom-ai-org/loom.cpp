@@ -359,6 +359,27 @@ target_compile_definitions(test_lstm_step PRIVATE
 add_test(NAME test_lstm_step COMMAND test_lstm_step)
 set_tests_properties(test_lstm_step PROPERTIES FIXTURES_REQUIRED "lstm_step_gguf_fixture;lstm_step_reference_fixture")
 
+# --- Kokoro/StyleTTS2 roadmap: the host-side duration-based frame-expansion (loom::predict_durations/
+#     loom::expand_by_duration -- KModel.forward_with_tokens's sigmoid+sum/round/clamp/repeat_interleave
+#     formula), verified against an independent numpy reference on a tiny synthetic fixture. Pure host
+#     arithmetic, no GGUF/ggml graph involved at all -- fully synthetic, not skip-if-missing. ---
+set(LOOM_DURATION_ALIGNER_REF_DIR ${LOOM_FIXTURE_DIR}/duration_aligner_ref)
+
+add_test(
+    NAME gen_duration_aligner_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_duration_aligner.py
+            ${LOOM_DURATION_ALIGNER_REF_DIR}
+)
+set_tests_properties(gen_duration_aligner_reference PROPERTIES FIXTURES_SETUP duration_aligner_reference_fixture)
+
+add_executable(test_duration_aligner test_duration_aligner.cpp)
+target_link_libraries(test_duration_aligner PRIVATE loom::engine)
+target_compile_definitions(test_duration_aligner PRIVATE
+    LOOM_TEST_REF_DIR="${LOOM_DURATION_ALIGNER_REF_DIR}"
+)
+add_test(NAME test_duration_aligner COMMAND test_duration_aligner)
+set_tests_properties(test_duration_aligner PROPERTIES FIXTURES_REQUIRED "duration_aligner_reference_fixture")
+
 # --- Parakeet-TDT roadmap, step 2: the full greedy-TDT decode loop (new TdtDecoder driver), verified
 #     against an independent numpy reference on a tiny synthetic fixture -- see BACKLOG.md. ---
 set(LOOM_TDT_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/tdt_step_ref)
@@ -386,6 +407,35 @@ target_compile_definitions(test_tdt_decoder PRIVATE
 add_test(NAME test_tdt_decoder COMMAND test_tdt_decoder)
 set_tests_properties(test_tdt_decoder PROPERTIES FIXTURES_REQUIRED "tdt_step_gguf_fixture;tdt_step_reference_fixture")
 
+# --- FastConformer RNN-T roadmap, step 1: loom::TdtDecoder's new plain-RNN-T mode (empty `durations`),
+#     verified against an independent numpy reference of standard RNN-T greedy decoding on a tiny
+#     synthetic fixture -- see BACKLOG.md. Same pattern as the TDT fixture above, deliberately
+#     duplicated rather than shared (this project's usual per-fixture convention). ---
+set(LOOM_RNNT_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/rnnt_step_ref)
+
+add_test(
+    NAME gen_rnnt_step_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_rnnt_step_gguf.py
+            ${LOOM_FIXTURE_DIR}/rnnt_step_test
+)
+set_tests_properties(gen_rnnt_step_gguf_fixture PROPERTIES FIXTURES_SETUP rnnt_step_gguf_fixture)
+
+add_test(
+    NAME gen_rnnt_step_reference
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_rnnt_step.py
+            ${LOOM_RNNT_STEP_REF_DIR}
+)
+set_tests_properties(gen_rnnt_step_reference PROPERTIES FIXTURES_SETUP rnnt_step_reference_fixture)
+
+add_executable(test_rnnt_decoder test_rnnt_decoder.cpp)
+target_link_libraries(test_rnnt_decoder PRIVATE loom::engine)
+target_compile_definitions(test_rnnt_decoder PRIVATE
+    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}/rnnt_step_test"
+    LOOM_TEST_REF_DIR="${LOOM_RNNT_STEP_REF_DIR}"
+)
+add_test(NAME test_rnnt_decoder COMMAND test_rnnt_decoder)
+set_tests_properties(test_rnnt_decoder PROPERTIES FIXTURES_REQUIRED "rnnt_step_gguf_fixture;rnnt_step_reference_fixture")
+
 # --- Real-model test: nvidia/parakeet-tdt-0.6b-v3, converted via tools/convert_nemo/convert_parakeet_tdt.py
 #     -- the real FastConformer encoder (dw_striding subsampling, no bias, no xscale) + the new TdtDecoder
 #     driver's greedy decode over it. Same "not regenerated at ctest time, skip cleanly if the real
@@ -394,6 +444,118 @@ add_executable(test_e2e_parakeet_tdt test_e2e_parakeet_tdt.cpp)
 target_link_libraries(test_e2e_parakeet_tdt PRIVATE loom::engine)
 add_test(NAME test_e2e_parakeet_tdt COMMAND test_e2e_parakeet_tdt)
 set_tests_properties(test_e2e_parakeet_tdt PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Real-model end-to-end test: nvidia/parakeet-rnnt-0.6b (converted by
+#     tools/convert_nemo/convert_parakeet_rnnt.py) -- same FastConformer encoder architecture family as
+#     parakeet-tdt (dw_striding subsampling) but biased/xscaled differently (confirmed real, see that
+#     script's own docstring), decoded via TdtDecoder's new plain-RNN-T mode (empty `durations`). ---
+add_executable(test_e2e_parakeet_rnnt test_e2e_parakeet_rnnt.cpp)
+target_link_libraries(test_e2e_parakeet_rnnt PRIVATE loom::engine)
+add_test(NAME test_e2e_parakeet_rnnt COMMAND test_e2e_parakeet_rnnt)
+set_tests_properties(test_e2e_parakeet_rnnt PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro's CustomAlbert (PL-BERT) topology (tools/convert_kokoro/
+#     convert_kokoro_albert.py) against a hand-rolled pure-PyTorch reference -- the first, isolated
+#     verification step of Kokoro's full-continuous-build effort (see BACKLOG.md). ---
+add_executable(test_e2e_kokoro_albert test_e2e_kokoro_albert.cpp)
+target_link_libraries(test_e2e_kokoro_albert PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_albert COMMAND test_e2e_kokoro_albert)
+set_tests_properties(test_e2e_kokoro_albert PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro's TextEncoder (CNN topology + the new loom::BiLstmStepper
+#     host driver for its trailing bidirectional LSTM) against a hand-rolled pure-PyTorch reference. ---
+add_executable(test_e2e_kokoro_text_encoder test_e2e_kokoro_text_encoder.cpp)
+target_link_libraries(test_e2e_kokoro_text_encoder PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_text_encoder COMMAND test_e2e_kokoro_text_encoder)
+set_tests_properties(test_e2e_kokoro_text_encoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro's ProsodyPredictor duration-prediction half (DurationEncoder's
+#     interleaved BiLSTM+AdaLayerNorm blocks -> top lstm -> duration_proj) against a hand-rolled
+#     pure-PyTorch reference. ---
+add_executable(test_e2e_kokoro_duration_predictor test_e2e_kokoro_duration_predictor.cpp)
+target_link_libraries(test_e2e_kokoro_duration_predictor PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_duration_predictor COMMAND test_e2e_kokoro_duration_predictor)
+set_tests_properties(test_e2e_kokoro_duration_predictor PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: a single AdainResBlk1d instance (predictor.F0.0, the simplest case --
+#     no learned shortcut, no upsample) against a hand-rolled pure-PyTorch reference -- first isolated
+#     verification step for Kokoro's F0Ntrain assembly. ---
+add_executable(test_e2e_kokoro_f0_block0 test_e2e_kokoro_f0_block0.cpp)
+target_link_libraries(test_e2e_kokoro_f0_block0 PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_f0_block0 COMMAND test_e2e_kokoro_f0_block0)
+set_tests_properties(test_e2e_kokoro_f0_block0 PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: predictor.F0.1, the UPSAMPLING AdainResBlk1d instance (dim_in=512,
+#     dim_out=256, learned conv1x1 shortcut + upsample=True) -- exercises the depthwise-ConvTranspose1d
+#     "pool" composition and the learned shortcut together for the first time. ---
+add_executable(test_e2e_kokoro_f0_block1 test_e2e_kokoro_f0_block1.cpp)
+target_link_libraries(test_e2e_kokoro_f0_block1 PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_f0_block1 COMMAND test_e2e_kokoro_f0_block1)
+set_tests_properties(test_e2e_kokoro_f0_block1 PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: the FULL ProsodyPredictor.F0Ntrain assembly (shared BiLSTM 640->512 +
+#     two independent 3-block AdainResBlk1d stacks + F0_proj/N_proj) against a hand-rolled pure-PyTorch
+#     reference -- ties together every Kokoro F0Ntrain piece verified so far. ---
+add_executable(test_e2e_kokoro_f0n test_e2e_kokoro_f0n.cpp)
+target_link_libraries(test_e2e_kokoro_f0n PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_f0n COMMAND test_e2e_kokoro_f0n)
+set_tests_properties(test_e2e_kokoro_f0n PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro Generator's forward/inverse STFT (istftnet.py's TorchSTFT),
+#     against real torch.stft/torch.istft -- no real checkpoint weights involved (constant DFT/window
+#     kernels only), but still gated on GGUF/reference files (needs real torch to generate). ---
+add_executable(test_e2e_kokoro_stft test_e2e_kokoro_stft.cpp)
+target_link_libraries(test_e2e_kokoro_stft PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_stft COMMAND test_e2e_kokoro_stft)
+set_tests_properties(test_e2e_kokoro_stft PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro Generator's NSF harmonic source (istftnet.py's SineGen +
+#     SourceModuleHnNSF), against a hand-rolled real-PyTorch reference. No real checkpoint weights
+#     involved (l_linear is a fixed synthetic draw shared between conversion+reference scripts). ---
+add_executable(test_e2e_kokoro_sinegen test_e2e_kokoro_sinegen.cpp)
+target_link_libraries(test_e2e_kokoro_sinegen PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_sinegen COMMAND test_e2e_kokoro_sinegen)
+set_tests_properties(test_e2e_kokoro_sinegen PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro Generator's AdaINResBlock1 (Snake-activation dilated resblock,
+#     distinct from predictor.F0/N's AdainResBlk1d), against a hand-rolled PyTorch reference on a small
+#     synthetic (checkpoint-independent) instance -- same precedent as VITS's test_hifigan_generator. ---
+add_executable(test_e2e_kokoro_adainresblock1 test_e2e_kokoro_adainresblock1.cpp)
+target_link_libraries(test_e2e_kokoro_adainresblock1 PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_adainresblock1 COMMAND test_e2e_kokoro_adainresblock1)
+set_tests_properties(test_e2e_kokoro_adainresblock1 PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro's full Generator "core" (upsample stack + noise path +
+#     resblocks + conv_post + inverse STFT), against a hand-rolled PyTorch reference on a small synthetic
+#     (real checkpoint shapes, random weights) instance. ---
+add_executable(test_e2e_kokoro_generator test_e2e_kokoro_generator.cpp)
+target_link_libraries(test_e2e_kokoro_generator PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_generator COMMAND test_e2e_kokoro_generator)
+set_tests_properties(test_e2e_kokoro_generator PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro's Decoder "core" (F0_conv/N_conv + encode/decode AdainResBlk1d
+#     stack, everything except the final Generator call), against a hand-rolled PyTorch reference on a
+#     small synthetic (real checkpoint shapes, random weights) instance. ---
+add_executable(test_e2e_kokoro_decoder_core test_e2e_kokoro_decoder_core.cpp)
+target_link_libraries(test_e2e_kokoro_decoder_core PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_decoder_core COMMAND test_e2e_kokoro_decoder_core)
+set_tests_properties(test_e2e_kokoro_decoder_core PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Kokoro's bert_encoder (Linear(768,512) + transpose), against the real
+#     checkpoint's own weights -- exercises the CustomAlbert-output (time-major) -> DurationEncoder-input
+#     (channel-first) axis-convention crossing. ---
+add_executable(test_e2e_kokoro_bert_encoder test_e2e_kokoro_bert_encoder.cpp)
+target_link_libraries(test_e2e_kokoro_bert_encoder PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_bert_encoder COMMAND test_e2e_kokoro_bert_encoder)
+set_tests_properties(test_e2e_kokoro_bert_encoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end test of loom::KokoroDriver against the real checkpoint's full GGUF set -- exercises the
+#     whole pipeline together for the first time. Finite/non-trivial output check only (same scope as
+#     VITS's own test_e2e_vits_driver.cpp), not yet a full-pipeline numerical reference. ---
+add_executable(test_e2e_kokoro_driver test_e2e_kokoro_driver.cpp)
+target_link_libraries(test_e2e_kokoro_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_driver COMMAND test_e2e_kokoro_driver)
+set_tests_properties(test_e2e_kokoro_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Real-model structural smoke test: VITS (piper en-GB "miro"), converted via
 #     tools/convert_piper_vits/convert_vits.py. Builds every declared topology with dummy inputs and
@@ -435,3 +597,28 @@ add_executable(test_e2e_vits_logw_reference test_e2e_vits_logw_reference.cpp)
 target_link_libraries(test_e2e_vits_logw_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_logw_reference COMMAND test_e2e_vits_logw_reference)
 set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Whisper's AudioEncoder topology (tools/convert_whisper/
+#     convert_whisper_encoder.py) against a real forward pass of OpenAI Whisper's own AudioEncoder --
+#     fully deterministic (no sampling anywhere in the encoder), unlike VITS's noise-injection tests. ---
+add_executable(test_e2e_whisper_encoder_reference test_e2e_whisper_encoder_reference.cpp)
+target_link_libraries(test_e2e_whisper_encoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_whisper_encoder_reference COMMAND test_e2e_whisper_encoder_reference)
+set_tests_properties(test_e2e_whisper_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check: Whisper's TextDecoder topology (tools/convert_whisper/
+#     convert_whisper_decoder.py) against a real ONE-SHOT teacher-forced forward pass (kv_cache=None,
+#     n_past=0/n_tokens=T covers the whole causal triangle) -- exercises causal self-attention w/
+#     persistent KvCache, cross-attention against a fixed `xa`, and the tied output projection. ---
+add_executable(test_e2e_whisper_decoder_reference test_e2e_whisper_decoder_reference.cpp)
+target_link_libraries(test_e2e_whisper_decoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_whisper_decoder_reference COMMAND test_e2e_whisper_decoder_reference)
+set_tests_properties(test_e2e_whisper_decoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: loom::WhisperDriver's full two-phase decode loop (encoder once, then
+#     prefill+incremental decode with a persistent KvCache and a fixed cross-attention `xa`) against a
+#     real plain-greedy-argmax reference sequence built directly from Whisper's own forward passes. ---
+add_executable(test_e2e_whisper_driver test_e2e_whisper_driver.cpp)
+target_link_libraries(test_e2e_whisper_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_whisper_driver COMMAND test_e2e_whisper_driver)
+set_tests_properties(test_e2e_whisper_driver PROPERTIES SKIP_RETURN_CODE 77)
