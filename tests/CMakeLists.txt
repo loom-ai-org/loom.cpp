@@ -839,3 +839,23 @@ add_executable(test_e2e_vits_lua_driver test_e2e_vits_lua_driver.cpp)
 target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
 set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: Kokoro-82M, the largest driver ported so far (43 topologies, 6 BiLSTM
+#     instances host-stepped via loom.run_subgraph Lua for-loops, the new loom.uniform_array binding for
+#     SineGen's rand_ini draws), ported to Lua (tools/convert_kokoro/kokoro_driver.lua) and compared
+#     against the existing loom::KokoroDriver on the real checkpoint. See
+#     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
+add_executable(test_e2e_kokoro_lua_driver test_e2e_kokoro_lua_driver.cpp)
+target_link_libraries(test_e2e_kokoro_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_lua_driver COMMAND test_e2e_kokoro_lua_driver)
+set_tests_properties(test_e2e_kokoro_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: StyleTTS2, the most complex driver ported so far (44 topologies, 6
+#     BiLSTM instances, and the genuinely new style-diffusion sampler -- ADPM2 over the real
+#     Transformer1d denoiser, ported to Lua as plain host arithmetic + loom.run_subgraph calls), compared
+#     against the existing loom::StyleTTS2Driver on the real checkpoint. See
+#     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
+add_executable(test_e2e_styletts2_lua_driver test_e2e_styletts2_lua_driver.cpp)
+target_link_libraries(test_e2e_styletts2_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_lua_driver COMMAND test_e2e_styletts2_lua_driver)
+set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)

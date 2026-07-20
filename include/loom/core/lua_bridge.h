@@ -72,13 +72,17 @@ private:
     ggml_backend_t backend_;
     std::unordered_map<std::string, Module> modules_;
 
-    // Backs loom.seed_rng/loom.gaussian_array -- the SAME engine/distribution shape
-    // (std::mt19937 + std::normal_distribution<float>(0,1)) every existing hand-written driver already
-    // uses, so an exact-match test against a C++ driver stays possible (matches loom.argmax_row's own
-    // "mirror the real function verbatim" reasoning). Persists across calls within one script
-    // invocation until re-seeded, same "persistent state" shape as a registered KvCache.
+    // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes
+    // (std::mt19937 + std::normal_distribution<float>(0,1) + std::uniform_real_distribution<float>(0,1))
+    // every existing hand-written driver already uses, so an exact-match test against a C++ driver stays
+    // possible (matches loom.argmax_row's own "mirror the real function verbatim" reasoning). Both
+    // distributions share the ONE rng_ stream, same as e.g. KokoroDriver/StyleTTS2Driver's own single
+    // rng_ feeding both a normal and a uniform01 distribution object -- draw ORDER against that shared
+    // stream matters for an exact match. Persists across calls within one script invocation until
+    // re-seeded, same "persistent state" shape as a registered KvCache.
     std::mt19937 rng_;
     std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
+    std::uniform_real_distribution<float> uniform_dist_{0.0f, 1.0f};
 
     // Trampolines registered into the Lua state; each retrieves `this` via its closure's upvalue. See
     // lua_bridge.cpp's own top comment for why every one of these MUST convert C++ exceptions to
@@ -90,6 +94,7 @@ private:
     static int l_argmax_row(lua_State* L);
     static int l_seed_rng(lua_State* L);
     static int l_gaussian_array(lua_State* L);
+    static int l_uniform_array(lua_State* L);
     static int l_expand_by_duration(lua_State* L);
     static int l_pad_crop_relative_embeddings(lua_State* L);
     static int l_get_weight(lua_State* L);

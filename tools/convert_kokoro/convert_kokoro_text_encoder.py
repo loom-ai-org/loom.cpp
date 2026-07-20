@@ -31,6 +31,8 @@ import numpy as np
 import torch
 from gguf import GGUFWriter
 
+from convert_kokoro_duration_predictor import build_bilstm, write_bilstm_ggufs
+
 HP = {
     "channels": 512,
     "kernel_size": 5,
@@ -119,47 +121,14 @@ def build_cnn_topology(tb, sd, hp):
     return x
 
 
-def build_lstm_cell_topology(output_name, hidden_dim, input_dim, weight_prefix):
-    """Same structure as convert_parakeet_tdt.py's build_lstm_topology's layer>0 branch (no embedding
-    lookup -- every input here is already a continuous feature vector), just parametrized by an
-    arbitrary weight-name prefix (so the same builder covers both the forward ("lstm.") and backward
-    ("lstm." with "_reverse" suffixed weight names) directions). `input_dim` is a plain literal (known
-    at conversion time, e.g. 512 for TextEncoder's own CNN-output width) -- NOT a "$"-prefixed runtime
-    symbol like "$n_tokens": GraphBuilder only ever auto-registers n_tokens/n_past/n_kv (confirmed by
-    reading graph_builder.cpp directly), so anything else needs to be a literal number string instead."""
-    assert output_name in ("h_new", "c_new")
-    h = hidden_dim
-    f32 = 4
-    inputs = [
-        {"name": "layer_input", "dtype": "f32", "shape": [str(input_dim)]},
-        {"name": "h_prev", "dtype": "f32", "shape": [str(h)]},
-        {"name": "c_prev", "dtype": "f32", "shape": [str(h)]},
-    ]
-    return {
-        "version": 1,
-        "inputs": inputs,
-        "output": output_name,
-        "nodes": [
-            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_ih", "layer_input"], "outputs": ["gates_x"]},
-            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_hh", "h_prev"], "outputs": ["gates_h"]},
-            {"op": "ADD", "inputs": ["gates_x", "gates_h"], "outputs": ["gates_sum"]},
-            {"op": "ADD", "inputs": ["gates_sum", f"{weight_prefix}bias_ih"], "outputs": ["gates_b1"]},
-            {"op": "ADD", "inputs": ["gates_b1", f"{weight_prefix}bias_hh"], "outputs": ["gates"]},
-            {"op": "VIEW", "inputs": ["gates"], "outputs": ["i_pre"], "attrs": {"shape": [h], "offset": 0 * h * f32}},
-            {"op": "VIEW", "inputs": ["gates"], "outputs": ["f_pre"], "attrs": {"shape": [h], "offset": 1 * h * f32}},
-            {"op": "VIEW", "inputs": ["gates"], "outputs": ["g_pre"], "attrs": {"shape": [h], "offset": 2 * h * f32}},
-            {"op": "VIEW", "inputs": ["gates"], "outputs": ["o_pre"], "attrs": {"shape": [h], "offset": 3 * h * f32}},
-            {"op": "SIGMOID", "inputs": ["i_pre"], "outputs": ["i"]},
-            {"op": "SIGMOID", "inputs": ["f_pre"], "outputs": ["f"]},
-            {"op": "TANH", "inputs": ["g_pre"], "outputs": ["g"]},
-            {"op": "SIGMOID", "inputs": ["o_pre"], "outputs": ["o"]},
-            {"op": "MUL", "inputs": ["f", "c_prev"], "outputs": ["fc"]},
-            {"op": "MUL", "inputs": ["i", "g"], "outputs": ["ig"]},
-            {"op": "ADD", "inputs": ["fc", "ig"], "outputs": ["c_new"]},
-            {"op": "TANH", "inputs": ["c_new"], "outputs": ["tanh_c"]},
-            {"op": "MUL", "inputs": ["o", "tanh_c"], "outputs": ["h_new"]},
-        ],
-    }
+def build_cnn(sd, hp):
+    """Topology + weights for the CNN front-end alone (embedding -> 3x [Conv1d -> LayerNorm ->
+    LeakyReLU]), returned rather than written to disk -- lets a one-GGUF-file consolidator harvest this
+    piece directly instead of round-tripping through a standalone file."""
+    tb = TopologyBuilder()
+    out = build_cnn_topology(tb, sd, hp)
+    inputs = [{"name": "tokens", "dtype": "i32", "shape": ["$n_tokens"]}]
+    return tb.topology(inputs, out), tb.weights
 
 
 def main():
@@ -172,42 +141,22 @@ def main():
     sd_all = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sd = sd_all["text_encoder"]
 
-    tb = TopologyBuilder()
-    out = build_cnn_topology(tb, sd, HP)
-    inputs = [{"name": "tokens", "dtype": "i32", "shape": ["$n_tokens"]}]
-    topo = tb.topology(inputs, out)
-
+    topo, weights = build_cnn(sd, HP)
     w = GGUFWriter(str(out_dir / "kokoro_text_encoder_cnn.gguf"), "loom-kokoro-text-encoder-cnn")
     w.add_string("model.graph_topology", json.dumps(topo))
-    for name, arr in tb.weights.items():
+    for name, arr in weights.items():
         w.add_tensor(name, arr.astype(np.float32))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    print(f"wrote {out_dir / 'kokoro_text_encoder_cnn.gguf'}, {len(tb.weights)} weights")
+    print(f"wrote {out_dir / 'kokoro_text_encoder_cnn.gguf'}, {len(weights)} weights")
 
     # Every small GGUF carries the FULL weight set (both directions), matching TdtDecoder's own
     # "every small GGUF carries the full weight set" convention -- required so a single shared
     # GgufModel (loaded from ANY one of these 4 files) can resolve every one of the 4 topologies'
     # weight references, which is exactly what loom::BiLstmStepper's single-model constructor assumes.
-    def write_lstm(path, output_name, prefix):
-        topo = build_lstm_cell_topology(output_name, HP["hidden_per_dir"], HP["channels"], prefix)
-        ww = GGUFWriter(str(path), "loom-kokoro-text-encoder-lstm")
-        ww.add_string("model.graph_topology", json.dumps(topo))
-        for direction_prefix, suffix in (("lstm.", ""), ("lstm.reverse.", "_reverse")):
-            for kind in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
-                arr = to_f32(sd[f"module.lstm.{kind}_l0{suffix}"])
-                ww.add_tensor(f"{direction_prefix}{kind}", arr)
-        ww.write_header_to_file()
-        ww.write_kv_data_to_file()
-        ww.write_tensors_to_file()
-        ww.close()
-
-    write_lstm(out_dir / "kokoro_text_encoder_lstm_h_fwd.gguf", "h_new", "lstm.")
-    write_lstm(out_dir / "kokoro_text_encoder_lstm_c_fwd.gguf", "c_new", "lstm.")
-    write_lstm(out_dir / "kokoro_text_encoder_lstm_h_bwd.gguf", "h_new", "lstm.reverse.")
-    write_lstm(out_dir / "kokoro_text_encoder_lstm_c_bwd.gguf", "c_new", "lstm.reverse.")
+    write_bilstm_ggufs(out_dir, "kokoro_text_encoder_lstm", "module.lstm", sd, HP["hidden_per_dir"], HP["channels"])
     print(f"wrote 4 LSTM-cell GGUFs to {out_dir}")
 
 

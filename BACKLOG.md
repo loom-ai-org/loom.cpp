@@ -3870,3 +3870,86 @@ and the ADPM2 diffusion sampler's own per-step math needs careful decomposition 
 — re-confirmed `BiLstmStepper` itself needs NO new binding, since it already ports directly to a Lua loop
 calling the existing `loom.run_subgraph` four times per timestep per direction). The Python MIL compiler
 remains deferred from the original pivot.
+
+## 2026-07-20: Kokoro + StyleTTS2 retrofitted to embedded Lua + one-GGUF-file — ALL SIX real models now
+ported; only the Python MIL compiler remains
+
+The deferred pass landed. Both drivers re-read directly from source (not memory) before starting, per
+this project's own "verify against real behavior, not guesses" discipline — Kokoro turned out to own 31
+`GraphTopology` instances / ~28 GGUF files (6 BiLSTM instances × 4 + 15 single-shot modules + 3 AdaLN
+blocks), StyleTTS2 owns 45 graphs / 27 kept `GgufModel`s (the same BiLSTM shape, plus the style-diffusion
+sampler) — both larger than the earlier "~20" estimate, but NOT architecturally harder than what VITS/
+Matcha-TTS already proved: comparing each driver's full control flow against `LoomLuaBridge`'s existing
+binding set showed exactly **one** new binding was needed for both models combined —
+`loom.uniform_array(n)` (a `std::uniform_real_distribution<float>` sharing the bridge's existing `rng_`
+stream with `gaussian_array`, needed by SineGen's `rand_ini`, which both drivers draw as
+uniform-then-gaussian from the SAME shared stream). Even the ADPM2 diffusion sampler and the 6 BiLSTM
+instances' per-timestep host-carried h/c stepping — the two pieces flagged as hardest in the original
+scoping — turned out to be expressible with `loom.run_subgraph` in a Lua loop plus plain arithmetic, no
+new binding required.
+
+**Real non-Lua-bridge work found while building Kokoro's consolidator**: Kokoro's shared conversion
+helpers (`write_bilstm_ggufs` in `tools/convert_kokoro/convert_kokoro_duration_predictor.py`, the
+AdaLayerNorm writer, `write_proj1x1` in `convert_kokoro_f0n.py`) all historically wrote GENERIC,
+non-namespaced weight names (`lstm.weight_ih`, `adaln.fc.weight`, `proj.weight`) — harmless when every
+instance lived in its own isolated GGUF file, but a real collision once merged into one file, since 6
+distinct BiLSTM instances / 3 AdaLN blocks / 2 proj heads share these names while holding GENUINELY
+DIFFERENT real weight values (unlike Matcha/VITS's own TextEncoder-dedup collisions, which were the SAME
+values redundantly registered twice). Fixed by adding an optional `weight_namespace`/`weight_prefix`
+parameter to each builder (`build_bilstm`, `build_adaln`, `build_proj1x1`, `build_duration_proj`,
+`build_stack`, `build_cnn`), defaulting to the old hardcoded names so every existing separate-file
+conversion script and its tests are completely unaffected — purely additive. Re-ran the OLD conversion
+scripts (`convert_kokoro_all.py`, `convert_styletts2_reused.py`) against the real checkpoints after this
+refactor and confirmed zero regressions: `test_e2e_kokoro_text_encoder`/`_duration_predictor`/`_f0n`
+(numeric reference tests) and `test_e2e_kokoro_driver`/`test_e2e_styletts2_driver` all still pass.
+
+`tools/convert_kokoro/convert_kokoro_lua_all.py`/`kokoro_driver.lua`: 43 topologies (30 unique names
+after the BiLSTM 4-per-instance/AdaLN/proj expansion), skips `kokoro_stft_inverse` (confirmed dead —
+loaded by the C++ constructor, never called in `synthesize()`). `predict_durations`'s round-half-to-even
+needed a hand-written Lua helper (no native banker's-rounding builtin) — `duration_aligner.cpp`'s own
+comment notes real float32 sums essentially never land on an exact `.5` tie, so this was implemented
+correctly rather than assumed away, not exercised by the real checkpoint either. Matched
+`loom::KokoroDriver` to **1.9e-6** on the first real run (real `kokoro-v1_0.pth`, synthetic `ref_s`,
+`speed=1.0`, `seed=42`) — the largest port so far, correct on the first try. 102/102 tests passing after
+landing.
+
+`tools/convert_styletts2/convert_styletts2_lua_all.py`/`styletts2_driver.lua`: 44 topologies, reuses the
+now-namespace-capable Kokoro builders the same way `convert_styletts2_reused.py` already does (same
+import pattern, StyleTTS2's own real checkpoint weights) plus `convert_styletts2_diffusion.py`'s
+`build_diffusion_net` (the one genuinely new piece — no Kokoro equivalent). The ADPM2 sampler
+(`karras_schedule`/`adpm2_step`/`adpm2_sample`) and KDiffusion preconditioning (`c_skip`/`c_out`/`c_in`/
+`c_noise`) are plain Lua arithmetic mirroring `style_diffusion_sampler.cpp` line-for-line, with
+`loom.gaussian_array` supplying every noise draw (initial `noise0` + one ancestral draw per ADPM2 step)
+from the SAME shared `rng_` stream `loom.uniform_array` later draws SineGen's `rand_ini` from — same
+ordering discipline as VITS's own interleaved-draw reasoning. Also carries the real
+`pred_dur[-1] += 5` quirk (`Demo/Inference_LJSpeech.ipynb`'s own `inference()`, no `/speed` division at
+all, unlike Kokoro's own `forward_with_tokens`).
+
+**This one didn't match to ~1e-6 like every other port, and that was chased down rather than shrugged
+off**: the full waveform only matched to `max_abs_diff≈3.1e-3`. Spent real effort isolating why before
+accepting it, in order: (1) `albert` alone — exact, 0.0 diff; (2) the diffusion sampler ALONE, given the
+identical `bert_out`/seed — matched to `~7e-7`/`~1.6e-6` at 5 and 2 steps respectively; (3) `pred_dur`
+(all 9 integer values) and `s_predictor` (float) from a faithful partial reimplementation stopping right
+after duration prediction — exact/near-exact match; (4) `text_encoder_cnn`, `decoder_core`, `sinegen`,
+`generator` — each EXACTLY 0.0 diff given identical synthetic inputs; (5) every weight tensor in every
+GGUF file (`decoder_core`: 63, `generator`: 348, `sinegen`: 5, plus text_encoder/f0n_shared/f0n block/proj
+BiLSTM+AdaLN weights) — byte-identical between the old and new conversion paths, confirmed via direct
+`np.array_equal` comparison, not spot-checked. Even tried explicitly truncating the diffusion sampler's
+own host math to float32 at every intermediate step via LuaJIT's FFI (mirroring `style_diffusion_sampler
+.cpp`'s `float` semantics line-for-line) — this did NOT close the gap (0.00312568 → 0.00334246, i.e. no
+real change), which rules out "fixable Lua-double-vs-C++-float host-math imprecision" as the cause and
+was reverted (added real complexity for zero measured benefit). Conclusion: StyleTTS2 is the only ported
+driver whose style vector comes out of an ITERATIVE numerical process (5 ADPM2 steps, each feeding its
+own output back into the next network call) rather than a passthrough (Kokoro's `ref_s`) or a single
+affine combination (VITS's `z_p`) — an independently-reproduced ~1e-6/1e-7 difference in that vector then
+conditions ~50+ sequential AdaIN/conv layers ending in an adversarially-trained (GAN-style) istftnet
+vocoder, a network class well known to amplify small input perturbations. Not a logic bug — a genuine,
+inherent property of this specific pipeline shape that none of the other five ported models have. Set
+`test_e2e_styletts2_lua_driver`'s tolerance to `5e-3` (real margin above the observed `~3.1e-3`) with a
+comment in both the test and `styletts2_driver.lua`'s own header explaining why, rather than silently
+loosening it without a trace. 103/103 tests passing after landing.
+
+**Status**: all six of the originally-planned models (Whisper, SupertonicTTS, Matcha-TTS, VITS, Kokoro,
+StyleTTS2) are now on the embedded-Lua + one-GGUF-file architecture. Only the Python MIL compiler
+(`LOOM_MIL_CONVERSION.md`'s `LoomGGUFExporter`/`coremltools`-based frontend) remains deferred from the
+original pivot.

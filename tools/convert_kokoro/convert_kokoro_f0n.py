@@ -125,6 +125,44 @@ def add_depthwise_conv_transpose_upsample(tb, x, prefix, sd, sd_prefix, channels
     return tb.node("ADD", [conv, bias_r], None, out_hint)
 
 
+def build_proj1x1(sd, sd_name, prefix="proj"):
+    """F0_proj/N_proj: plain Conv1d(256,1,kernel_size=1) -- applied directly via CONV_1D on the
+    AdainResBlk1d stack's own [T,C] output convention (T=ne[0]), NOT a MUL_MAT-as-matmul trick (which
+    would need a [C,T] channel-first transpose first, unlike VITS's own conv1x1-as-matmul sites, which
+    were channel-first ALREADY for attention reasons) -- the real weight shape (1,256,1) numpy -> ggml
+    ne=[1,256,1] = [K,IC,OC] already matches CONV_1D's own kernel convention directly, no squeeze needed
+    at all. `prefix` namespaces the weight names (default "proj", matching this module's historical
+    hardcoded name) -- F0_proj and N_proj are two distinct instances with genuinely different weight
+    values, a real collision once consolidated into one combined GGUF file."""
+    tb = TopologyBuilder()
+    w = tb.weight(f"{prefix}.weight", to_f32(sd[f"{sd_name}.weight"]))
+    b = tb.weight(f"{prefix}.bias", to_f32(sd[f"{sd_name}.bias"]))
+    x3 = tb.node("RESHAPE", ["x"], {"shape": ["$n_tokens", 256, 1]}, "x3")
+    conv = tb.node("CONV_1D", [w, x3], {"s0": 1, "p0": 0, "d0": 1}, "conv")
+    conv = tb.node("ADD", [conv, tb.node("RESHAPE", [b], {"shape": [1, 1, 1]}, "bias_r")], None, "conv_biased")
+    out = tb.node("RESHAPE", [conv], {"shape": ["$n_tokens"]}, "out")
+    inputs = [{"name": "x", "dtype": "f32", "shape": ["$n_tokens", "256"]}]
+    return tb.topology(inputs, out), tb.weights
+
+
+def build_stack(sd, name_prefix, sd_names, dims, hp):
+    """Returns {i: (topo, weights)} for i=0,1,2 -- same per-block prefixing (`{name_prefix}_{i}`, already
+    collision-free since add_adain_resblk1d takes an explicit `prefix` per block) as write_stack's own
+    file-per-block convention, just returned in memory instead of written to disk."""
+    result = {}
+    for i, (sd_name, (dim_in, dim_out, upsample)) in enumerate(zip(sd_names, dims)):
+        tb = TopologyBuilder()
+        out = add_adain_resblk1d(tb, "x", "style", f"{name_prefix}_{i}", sd, sd_name, dim_in, dim_out,
+                                  hp["style_dim"], hp["ln_eps"], hp["leaky_slope"], upsample=upsample,
+                                  out_hint="out")
+        inputs = [
+            {"name": "x", "dtype": "f32", "shape": ["$n_tokens", str(dim_in)]},
+            {"name": "style", "dtype": "f32", "shape": [str(hp["style_dim"])]},
+        ]
+        result[i] = (tb.topology(inputs, out), tb.weights)
+    return result
+
+
 def add_adain_resblk1d(tb, x, style_name, prefix, sd, sd_prefix, dim_in, dim_out, style_dim, eps,
                         leaky_slope, upsample, out_hint):
     """x: [T,dim_in]. Returns [T,dim_out]. `upsample`: bool. `dim_in != dim_out` implies a learned 1x1
@@ -237,42 +275,18 @@ def main():
     #     `shared` BiLSTM needs `loom::BiLstmStepper`'s host-stepping. ---
     write_bilstm_ggufs(out_dir, "kokoro_f0n_shared_lstm", "module.shared", sd, 256, 512 + hp["style_dim"])
 
-    def write_stack(name_prefix, sd_names, dims):
-        """dims: list of (dim_in, dim_out, upsample) for each of the 3 blocks."""
-        for i, (sd_name, (dim_in, dim_out, upsample)) in enumerate(zip(sd_names, dims)):
-            tb = TopologyBuilder()
-            out = add_adain_resblk1d(tb, "x", "style", f"{name_prefix}_{i}", sd, sd_name, dim_in, dim_out,
-                                      hp["style_dim"], hp["ln_eps"], hp["leaky_slope"], upsample=upsample,
-                                      out_hint="out")
-            inputs = [
-                {"name": "x", "dtype": "f32", "shape": ["$n_tokens", str(dim_in)]},
-                {"name": "style", "dtype": "f32", "shape": [str(hp["style_dim"])]},
-            ]
-            write_gguf(out_dir / f"{name_prefix}_block{i}.gguf", tb.topology(inputs, out), tb.weights)
-
     block_dims = [(512, 512, False), (512, 256, True), (256, 256, False)]
-    write_stack("kokoro_f0n_f0", ["module.F0.0", "module.F0.1", "module.F0.2"], block_dims)
-    write_stack("kokoro_f0n_n", ["module.N.0", "module.N.1", "module.N.2"], block_dims)
+    for i, (topo, weights) in build_stack(sd, "kokoro_f0n_f0", ["module.F0.0", "module.F0.1", "module.F0.2"],
+                                           block_dims, hp).items():
+        write_gguf(out_dir / f"kokoro_f0n_f0_block{i}.gguf", topo, weights)
+    for i, (topo, weights) in build_stack(sd, "kokoro_f0n_n", ["module.N.0", "module.N.1", "module.N.2"],
+                                           block_dims, hp).items():
+        write_gguf(out_dir / f"kokoro_f0n_n_block{i}.gguf", topo, weights)
 
-    def write_proj1x1(path, sd_name):
-        # F0_proj/N_proj: plain Conv1d(256,1,kernel_size=1) -- applied directly via CONV_1D on the
-        # AdainResBlk1d stack's own [T,C] output convention (T=ne[0]), NOT a MUL_MAT-as-matmul trick
-        # (which would need a [C,T] channel-first transpose first, unlike VITS's own conv1x1-as-matmul
-        # sites, which were channel-first ALREADY for attention reasons) -- the real weight shape
-        # (1,256,1) numpy -> ggml ne=[1,256,1] = [K,IC,OC] already matches CONV_1D's own kernel
-        # convention directly, no squeeze needed at all.
-        tb = TopologyBuilder()
-        w = tb.weight("proj.weight", to_f32(sd[f"{sd_name}.weight"]))
-        b = tb.weight("proj.bias", to_f32(sd[f"{sd_name}.bias"]))
-        x3 = tb.node("RESHAPE", ["x"], {"shape": ["$n_tokens", 256, 1]}, "x3")
-        conv = tb.node("CONV_1D", [w, x3], {"s0": 1, "p0": 0, "d0": 1}, "conv")
-        conv = tb.node("ADD", [conv, tb.node("RESHAPE", [b], {"shape": [1, 1, 1]}, "bias_r")], None, "conv_biased")
-        out = tb.node("RESHAPE", [conv], {"shape": ["$n_tokens"]}, "out")
-        inputs = [{"name": "x", "dtype": "f32", "shape": ["$n_tokens", "256"]}]
-        write_gguf(path, tb.topology(inputs, out), tb.weights)
-
-    write_proj1x1(out_dir / "kokoro_f0n_f0_proj.gguf", "module.F0_proj")
-    write_proj1x1(out_dir / "kokoro_f0n_n_proj.gguf", "module.N_proj")
+    topo, weights = build_proj1x1(sd, "module.F0_proj")
+    write_gguf(out_dir / "kokoro_f0n_f0_proj.gguf", topo, weights)
+    topo, weights = build_proj1x1(sd, "module.N_proj")
+    write_gguf(out_dir / "kokoro_f0n_n_proj.gguf", topo, weights)
 
 
 if __name__ == "__main__":
