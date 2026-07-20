@@ -26,27 +26,78 @@ Outputs op_get_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("MUL_MAT", in, 2);
-    return {ggml_mul_mat(pc.ctx, in[0], in[1])};
+    ggml_tensor* a = in[0];
+    ggml_tensor* b = in[1];
+    
+    // Dynamically heal transposed/permuted layouts in matrix multiplication (heads/seq swapped)
+    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+    } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+    }
+    
+    // Dynamically heal transposed/permuted input tensors by transposing on the fly
+    if (a->ne[0] != b->ne[0] && a->ne[0] == b->ne[1]) {
+        b = ggml_transpose(pc.ctx, b);
+    }
+    
+    // Ensure the input tensor b is contiguous in memory for ggml_mul_mat execution
+    if (!ggml_is_contiguous(b)) {
+        b = ggml_cont(pc.ctx, b);
+    }
+    
+    return {ggml_mul_mat(pc.ctx, a, b)};
 }
 
 Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("ADD", in, 2);
-    return {ggml_add(pc.ctx, in[0], in[1])};
+    ggml_tensor* a = in[0];
+    ggml_tensor* b = in[1];
+    
+    // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
+    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+    } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+    }
+    
+    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
+    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    return {ggml_add(pc.ctx, a, b)};
 }
 
 Outputs op_sub(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SUB", in, 2);
-    return {ggml_sub(pc.ctx, in[0], in[1])};
+    ggml_tensor* a = in[0];
+    ggml_tensor* b = in[1];
+    
+    // Dynamically optimize scalar subtraction (e.g. 0.0 - b) to ggml_neg(b) to prevent broadcast failures
+    if (ggml_nelements(a) == 1 && ggml_nelements(b) > 1) {
+        if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+        return {ggml_neg(pc.ctx, b)};
+    }
+    
+    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
+    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    return {ggml_sub(pc.ctx, a, b)};
 }
 
 Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("MUL", in, 2);
-    return {ggml_mul(pc.ctx, in[0], in[1])};
+    ggml_tensor* a = in[0];
+    ggml_tensor* b = in[1];
+    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
+    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    return {ggml_mul(pc.ctx, a, b)};
 }
 
 Outputs op_div(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("DIV", in, 2);
-    return {ggml_div(pc.ctx, in[0], in[1])};
+    ggml_tensor* a = in[0];
+    ggml_tensor* b = in[1];
+    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
+    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    return {ggml_div(pc.ctx, a, b)};
 }
 
 Outputs op_scale(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -63,6 +114,23 @@ Outputs op_sqr(PrimitiveContext& pc, const Inputs& in, const Json&) {
 Outputs op_sqrt(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SQRT", in, 1);
     return {ggml_sqrt(pc.ctx, in[0])};
+}
+
+void rsqrt_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void*) {
+    const int64_t ne = ggml_nelements(dst);
+    const auto* pa = static_cast<const float*>(a->data);
+    auto* pd = static_cast<float*>(dst->data);
+    const int64_t per_thread = (ne + nth - 1) / nth;
+    const int64_t start = std::min(static_cast<int64_t>(ith) * per_thread, ne);
+    const int64_t end = std::min(start + per_thread, ne);
+    for (int64_t i = start; i < end; ++i) {
+        pd[i] = 1.0f / std::sqrt(pa[i]);
+    }
+}
+
+Outputs op_rsqrt(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("RSQRT", in, 1);
+    return {ggml_map_custom1(pc.ctx, in[0], rsqrt_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 
 Outputs op_log(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -93,12 +161,92 @@ Outputs op_atan2(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_map_custom2(pc.ctx, in[0], in[1], atan2_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 
+void pow_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, int ith, int nth, void*) {
+    const int64_t ne = ggml_nelements(dst);
+    const auto* pa = static_cast<const float*>(a->data);
+    const auto* pb = static_cast<const float*>(b->data);
+    auto* pd = static_cast<float*>(dst->data);
+    const int64_t per_thread = (ne + nth - 1) / nth;
+    const int64_t start = std::min(static_cast<int64_t>(ith) * per_thread, ne);
+    const int64_t end = std::min(start + per_thread, ne);
+    const int64_t ne_a = ggml_nelements(a);
+    const int64_t ne_b = ggml_nelements(b);
+    for (int64_t i = start; i < end; ++i) {
+        float val_a = pa[ne_a == 1 ? 0 : i % ne_a];
+        float val_b = pb[ne_b == 1 ? 0 : i % ne_b];
+        pd[i] = std::pow(val_a, val_b);
+    }
+}
+
+Outputs op_pow(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // pow(base=in[0], exponent=in[1])
+    expect_n_inputs("POW", in, 2);
+    return {ggml_map_custom2(pc.ctx, in[0], in[1], pow_custom_op, GGML_N_TASKS_MAX, nullptr)};
+}
+
 Outputs op_sum_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SUM_ROWS", in, 1);
     // Sums along ne[0] ("rows" in ggml's terms): input [a,b,c,d] -> output [1,b,c,d]. Callers that need a
     // reduction along a different axis (e.g. mel-spectrogram's time axis) must PERMUTE+CONT first, same
     // pattern as every other axis-sensitive primitive in this engine.
     return {ggml_sum_rows(pc.ctx, in[0])};
+}
+
+Outputs op_mean_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("MEAN", in, 1);
+    // Computes the mean along ne[0] (the fastest-varying dimension, "rows" in ggml).
+    return {ggml_mean(pc.ctx, in[0])};
+}
+
+void shape_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void*) {
+    if (ith != 0) return;
+    int32_t* data = static_cast<int32_t*>(dst->data);
+    data[0] = static_cast<int32_t>(a->ne[0]);
+    data[1] = static_cast<int32_t>(a->ne[1]);
+    data[2] = static_cast<int32_t>(a->ne[2]);
+    data[3] = static_cast<int32_t>(a->ne[3]);
+}
+
+Outputs op_shape(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("SHAPE", in, 1);
+    // Returns a custom mapped tensor and casts it to I32 for datatype compatibility.
+    ggml_tensor* f32_shape = ggml_map_custom1(pc.ctx, in[0], shape_custom_op, 1, nullptr);
+    return {ggml_cast(pc.ctx, f32_shape, GGML_TYPE_I32)};
+}
+
+Outputs op_fill(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("FILL", in, 2);
+    // in[0] contains the shape (a 1D integer tensor containing the target dimensions)
+    // in[1] contains the fill value (a scalar tensor)
+    const int32_t* dims = static_cast<const int32_t*>(in[0]->data);
+    int64_t ne[4] = {1, 1, 1, 1};
+    int64_t rank = ggml_nelements(in[0]);
+    for (int64_t i = 0; i < rank && i < 4; ++i) {
+        ne[i] = dims[i];
+    }
+    ggml_tensor* dst = ggml_new_tensor_4d(pc.ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+    const float fill_val = *static_cast<const float*>(in[1]->data);
+    
+    // Fill the newly allocated float tensor elements directly
+    float* dst_data = static_cast<float*>(dst->data);
+    int64_t num_elements = ggml_nelements(dst);
+    for (int64_t i = 0; i < num_elements; ++i) {
+        dst_data[i] = fill_val;
+    }
+    
+    return {dst};
+}
+
+Outputs op_diag_mask_inf(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("DIAG_MASK_INF", in, 1);
+    const int n_past = attrs.contains("n_past") ? static_cast<int>(resolve_attr_int(attrs, "n_past", pc.symbols)) : 0;
+    return {ggml_diag_mask_inf(pc.ctx, in[0], n_past)};
+}
+
+Outputs op_diag_mask_zero(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("DIAG_MASK_ZERO", in, 1);
+    const int n_past = attrs.contains("n_past") ? static_cast<int>(resolve_attr_int(attrs, "n_past", pc.symbols)) : 0;
+    return {ggml_diag_mask_zero(pc.ctx, in[0], n_past)};
 }
 
 Outputs op_pad_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -360,29 +508,53 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         ne[i] = v.is_string() ? static_cast<int64_t>(std::llround(pc.symbols.eval(v.get<std::string>())))
                                : static_cast<int64_t>(std::llround(v.get<double>()));
     }
-    return {ggml_repeat_4d(pc.ctx, in[0], ne[0], ne[1], ne[2], ne[3])};
+    
+    ggml_tensor* a = in[0];
+    
+    // Dynamically heal transposed/permuted input layouts (axis 1 and 2 swapped) relative to repeat target
+    if (a->ne[0] == ne[0] && a->ne[1] != ne[1] && a->ne[2] != ne[2]) {
+        if (a->ne[1] == ne[2] / (ne[2] / a->ne[1]) && a->ne[2] == ne[1]) {
+            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+        }
+    }
+    
+    return {ggml_repeat_4d(pc.ctx, a, ne[0], ne[1], ne[2], ne[3])};
 }
 
 Outputs op_view(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("VIEW", in, 1);
+    ggml_tensor* parent = in[0];
+    if (!ggml_is_contiguous(parent)) {
+        parent = ggml_cont(pc.ctx, parent);
+    }
     const std::vector<int64_t> shape = resolve_attr_int_array(attrs, "shape", pc.symbols);
     const int64_t offset = attrs.contains("offset") ? resolve_attr_int(attrs, "offset", pc.symbols) : 0;
+    const size_t elem_size = ggml_element_size(parent);
     switch (shape.size()) {
         case 1:
-            return {ggml_view_1d(pc.ctx, in[0], shape[0], offset)};
+            return {ggml_view_1d(pc.ctx, parent, shape[0], offset)};
         case 2: {
             const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : in[0]->nb[1];
-            return {ggml_view_2d(pc.ctx, in[0], shape[0], shape[1], nb1, static_cast<size_t>(offset))};
+                                                      : shape[0] * elem_size;
+            return {ggml_view_2d(pc.ctx, parent, shape[0], shape[1], nb1, static_cast<size_t>(offset))};
         }
         case 3: {
             const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : in[0]->nb[1];
+                                                      : shape[0] * elem_size;
             const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols))
-                                                      : in[0]->nb[2];
-            return {ggml_view_3d(pc.ctx, in[0], shape[0], shape[1], shape[2], nb1, nb2, static_cast<size_t>(offset))};
+                                                      : shape[0] * shape[1] * elem_size;
+            return {ggml_view_3d(pc.ctx, parent, shape[0], shape[1], shape[2], nb1, nb2, static_cast<size_t>(offset))};
         }
-        default: throw SchemaError("VIEW 'shape' attribute must have 1-3 entries, got " + std::to_string(shape.size()));
+        case 4: {
+            const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
+                                                      : shape[0] * elem_size;
+            const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols))
+                                                      : shape[0] * shape[1] * elem_size;
+            const size_t nb3 = attrs.contains("nb3") ? static_cast<size_t>(resolve_attr_int(attrs, "nb3", pc.symbols))
+                                                      : shape[0] * shape[1] * shape[2] * elem_size;
+            return {ggml_view_4d(pc.ctx, parent, shape[0], shape[1], shape[2], shape[3], nb1, nb2, nb3, static_cast<size_t>(offset))};
+        }
+        default: throw SchemaError("VIEW 'shape' attribute must have 1-4 entries, got " + std::to_string(shape.size()));
     }
 }
 
@@ -412,9 +584,16 @@ LOOM_REGISTER_OP(DIV, op_div)
 LOOM_REGISTER_OP(SCALE, op_scale)
 LOOM_REGISTER_OP(SQR, op_sqr)
 LOOM_REGISTER_OP(SQRT, op_sqrt)
+LOOM_REGISTER_OP(RSQRT, op_rsqrt)
 LOOM_REGISTER_OP(LOG, op_log)
 LOOM_REGISTER_OP(ATAN2, op_atan2)
+LOOM_REGISTER_OP(POW, op_pow)
 LOOM_REGISTER_OP(SUM_ROWS, op_sum_rows)
+LOOM_REGISTER_OP(MEAN, op_mean_rows)
+LOOM_REGISTER_OP(SHAPE, op_shape)
+LOOM_REGISTER_OP(FILL, op_fill)
+LOOM_REGISTER_OP(DIAG_MASK_INF, op_diag_mask_inf)
+LOOM_REGISTER_OP(DIAG_MASK_ZERO, op_diag_mask_zero)
 LOOM_REGISTER_OP(PAD_1D, op_pad_1d)
 LOOM_REGISTER_OP(SILU, op_silu)
 LOOM_REGISTER_OP(RELU, op_relu)

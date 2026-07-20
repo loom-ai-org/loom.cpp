@@ -58,6 +58,10 @@ void build_node(const TopologyNode& node, PrimitiveContext& pc, SymbolTable& sym
             throw SchemaError("GraphBuilder: node '" + (node.name.empty() ? node.op : node.name) +
                                "' references unresolved input '" + name + "'");
         }
+        if (it->second == nullptr) {
+            throw SchemaError("GraphBuilder: node '" + (node.name.empty() ? node.op : node.name) +
+                               "' input '" + name + "' is nullptr (missing weight from GGUF?)");
+        }
         inputs.push_back(it->second);
     }
 
