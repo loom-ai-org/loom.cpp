@@ -63,6 +63,11 @@ std::vector<double> read_number_array(lua_State* L, int idx) {
 // truth, same principle the design doc's own binding sketch relies on).
 void set_tensor_from_lua_array(lua_State* L, int value_idx, ggml_tensor* tensor) {
     const std::vector<double> vals = read_number_array(L, value_idx);
+    const size_t expected_size = ggml_nelements(tensor);
+    if (vals.size() != expected_size) {
+        luaL_error(L, "loom.run_subgraph: input tensor '%s' size mismatch. Expected %zu elements, got %zu elements from Lua",
+                    ggml_get_name(tensor), expected_size, vals.size());
+    }
     if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> f(vals.begin(), vals.end());
         ggml_backend_tensor_set(tensor, f.data(), 0, f.size() * sizeof(float));

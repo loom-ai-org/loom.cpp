@@ -859,3 +859,10 @@ add_executable(test_e2e_styletts2_lua_driver test_e2e_styletts2_lua_driver.cpp)
 target_link_libraries(test_e2e_styletts2_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_lua_driver COMMAND test_e2e_styletts2_lua_driver)
 set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: LFM2-350M fully dynamic multi-topology model compiled via coremltools
+#     and Loom MIL compiler backend, executing dynamically via embedded LuaVM and GraphBuilder ---
+add_executable(test_e2e_lfm2_lua_driver test_e2e_lfm2_lua_driver.cpp)
+target_link_libraries(test_e2e_lfm2_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_lfm2_lua_driver COMMAND test_e2e_lfm2_lua_driver)
+set_tests_properties(test_e2e_lfm2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
