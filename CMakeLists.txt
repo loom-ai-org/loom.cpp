@@ -41,6 +41,7 @@ add_library(loom_engine
     src/core/ctc_decode.cpp
     src/ops/primitive_registry.cpp
     src/ops/primitives_basic.cpp
+    src/ops/primitives_mil.cpp
     src/ops/primitives_rope.cpp
     src/ops/primitives_attention.cpp
     src/ops/primitives_conv.cpp
