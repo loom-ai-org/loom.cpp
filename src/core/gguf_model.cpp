@@ -107,6 +107,16 @@ const std::string& GgufModel::topology_json(const std::string& name) const {
 
 bool GgufModel::has_topology(const std::string& name) const { return topologies_.find(name) != topologies_.end(); }
 
+std::vector<std::string> GgufModel::topology_names() const {
+    std::vector<std::string> names;
+    for (const auto& pair : topologies_) {
+        if (!pair.first.empty()) {
+            names.push_back(pair.first);
+        }
+    }
+    return names;
+}
+
 ggml_tensor* GgufModel::weight(const std::string& name) const {
     auto it = symbols_.find(name);
     if (it == symbols_.end()) {

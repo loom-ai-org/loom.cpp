@@ -158,7 +158,14 @@ int main(int argc, char** argv) {
         auto model = loom::GgufModel::load(model_path, backend.get());
         std::printf("loaded '%s'\n", model_path.c_str());
         std::printf("  architecture: %s\n", model->architecture().c_str());
-        std::printf("  graph_topology: %zu bytes of JSON\n", model->topology_json().size());
+
+        bool is_multi_topology = model->has_kv("model.driver_script");
+        if (is_multi_topology) {
+            std::printf("  graph_topology: Multi-topology file (Lua driven), %zu sub-modules\n", 
+                        model->topology_names().size());
+        } else {
+            std::printf("  graph_topology: %zu bytes of JSON\n", model->topology_json().size());
+        }
         std::printf("  weights: %zu tensors\n", model->weights().size());
 
         if (has_prompt) {
@@ -174,21 +181,65 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
-            loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
-            loom::GenerationConfig cfg;
-            cfg.max_new_tokens = n_predict;
-            cfg.n_ctx_max = static_cast<uint32_t>(prompt_tokens.size()) + n_predict;
-
-            loom::Generator generator(*model, topo, cfg, backend.get());
-            const std::vector<int32_t> generated = generator.generate(prompt_tokens);
-
-            if (bpe_vocab) {
-                std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
-                            bpe_vocab->decode(generated).c_str());
+            if (is_multi_topology) {
+                // Initialize the Lua JIT dynamic driver bridge
+                loom::LoomLuaBridge bridge(backend.get());
+                
+                // Dynamically discover and register all sub-graph modules present in GGUF
+                const std::vector<std::string> sub_modules = model->topology_names();
+                for (const std::string& mod_name : sub_modules) {
+                    bridge.register_module(mod_name, *model, loom::GraphTopology::parse(model->topology_json(mod_name)), nullptr);
+                }
+                
+                // Load the master driver script
+                bridge.load_script(model->kv_str("model.driver_script"));
+                
+                // Set up autoregressive prompt and loop
+                std::vector<double> current_prompt;
+                current_prompt.reserve(prompt_tokens.size() + n_predict);
+                for (int32_t tok : prompt_tokens) {
+                    current_prompt.push_back(static_cast<double>(tok));
+                }
+                
+                std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
+                std::vector<int32_t> generated;
+                generated.reserve(n_predict);
+                
+                for (uint32_t step = 0; step < n_predict; ++step) {
+                    loom::LoomLuaBridge::Value result = bridge.call("main", {
+                        {"tokens", current_prompt}
+                    });
+                    double next_tok_val = std::get<double>(result);
+                    int32_t next_tok = static_cast<int32_t>(next_tok_val);
+                    generated.push_back(next_tok);
+                    current_prompt.push_back(next_tok_val);
+                }
+                
+                if (bpe_vocab) {
+                    std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
+                                bpe_vocab->decode(generated).c_str());
+                } else {
+                    std::printf("generated %zu tokens:", generated.size());
+                    for (int32_t tok : generated) std::printf(" %d", tok);
+                    std::printf("\n");
+                }
             } else {
-                std::printf("generated %zu tokens:", generated.size());
-                for (int32_t tok : generated) std::printf(" %d", tok);
-                std::printf("\n");
+                loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
+                loom::GenerationConfig cfg;
+                cfg.max_new_tokens = n_predict;
+                cfg.n_ctx_max = static_cast<uint32_t>(prompt_tokens.size()) + n_predict;
+
+                loom::Generator generator(*model, topo, cfg, backend.get());
+                const std::vector<int32_t> generated = generator.generate(prompt_tokens);
+
+                if (bpe_vocab) {
+                    std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
+                                bpe_vocab->decode(generated).c_str());
+                } else {
+                    std::printf("generated %zu tokens:", generated.size());
+                    for (int32_t tok : generated) std::printf(" %d", tok);
+                    std::printf("\n");
+                }
             }
         }
 

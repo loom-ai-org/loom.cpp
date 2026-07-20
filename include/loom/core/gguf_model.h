@@ -44,6 +44,9 @@ public:
     const std::string& topology_json(const std::string& name) const;
     bool has_topology(const std::string& name) const;
 
+    // Returns a list of all named sub-graph topologies present in this GGUF file.
+    std::vector<std::string> topology_names() const;
+
     // Scalar hyperparameters are stored as typed GGUF KVs under a "loom." namespace (e.g.
     // "loom.n_layer", "loom.rms_norm_eps") -- mirrors how llama.cpp stores its own "llama.*" hparams as
     // first-class KVs rather than burying them in the topology JSON. Throws loom::LoadError if `key`
