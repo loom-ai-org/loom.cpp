@@ -232,6 +232,7 @@ int LoomLuaBridge::l_seed_rng(lua_State* L) {
         const auto seed = static_cast<uint32_t>(luaL_checknumber(L, 1));
         self->rng_.seed(seed);
         self->normal_dist_.reset();
+        self->uniform_dist_.reset();
         return 0;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.seed_rng: %s", e.what());
@@ -249,6 +250,26 @@ int LoomLuaBridge::l_gaussian_array(lua_State* L) {
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.gaussian_array: %s", e.what());
+    }
+}
+
+// Uniform(0,1) counterpart to loom.gaussian_array, sharing the SAME rng_ stream (KokoroDriver's and
+// StyleTTS2Driver's own synthesize() each construct ONE std::mt19937 rng_ and draw from both a
+// std::normal_distribution AND a std::uniform_real_distribution against it -- e.g. SineGen's own
+// rand_ini[1..dim-1] uses uniform01(rng_), drawn BEFORE its noise_tc gaussian draws -- so a script must
+// call loom.uniform_array/loom.gaussian_array in the SAME order the C++ driver draws them to stay
+// bit-exact).
+int LoomLuaBridge::l_uniform_array(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const auto n = static_cast<int64_t>(luaL_checknumber(L, 1));
+        if (n < 0) return luaL_error(L, "loom.uniform_array: n must be >= 0");
+        std::vector<double> out(static_cast<size_t>(n));
+        for (double& v : out) v = static_cast<double>(self->uniform_dist_(self->rng_));
+        push_number_array(L, out);
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.uniform_array: %s", e.what());
     }
 }
 
@@ -349,6 +370,7 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
+        {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
         {"pad_crop_relative_embeddings", &LoomLuaBridge::l_pad_crop_relative_embeddings},
         {"get_weight", &LoomLuaBridge::l_get_weight},

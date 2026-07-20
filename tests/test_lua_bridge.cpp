@@ -1,5 +1,6 @@
 // Exercises LoomLuaBridge's host-math bindings (loom.range/causal_mask/zero_mask/argmax_row/seed_rng/
-// gaussian_array/expand_by_duration/pad_crop_relative_embeddings) and the load_script()/call() plumbing
+// gaussian_array/uniform_array/expand_by_duration/pad_crop_relative_embeddings) and the
+// load_script()/call() plumbing
 // in isolation, bypassing loom.run_subgraph entirely (no GGUF/GraphBuilder needed) -- same "bypass the
 // full pipeline, test each piece against a hand-computed expectation" discipline as
 // test_primitive_registry.cpp. loom.run_subgraph itself is exercised for real only by each model's own
@@ -45,6 +46,21 @@ int main() {
         function test_gaussian(inputs)
             loom.seed_rng(inputs.seed)
             return loom.gaussian_array(inputs.n)
+        end
+
+        function test_uniform(inputs)
+            loom.seed_rng(inputs.seed)
+            return loom.uniform_array(inputs.n)
+        end
+
+        function test_uniform_then_gaussian(inputs)
+            loom.seed_rng(inputs.seed)
+            local u = loom.uniform_array(inputs.n_u)
+            local g = loom.gaussian_array(inputs.n_g)
+            local out = {}
+            for i = 1, #u do out[#out + 1] = u[i] end
+            for i = 1, #g do out[#out + 1] = g[i] end
+            return out
         end
 
         function test_expand_by_duration(inputs)
@@ -113,6 +129,48 @@ int main() {
         // Re-seeding with the SAME seed reproduces the SAME sequence (persistent-until-reseeded state).
         auto result2 = bridge.call("test_gaussian", {{"seed", 42.0}, {"n", 5.0}});
         LOOM_CHECK(std::get<std::vector<double>>(result2) == arr);
+    }
+
+    // --- loom.uniform_array: same std::mt19937+std::uniform_real_distribution<float>(0,1) engine as
+    //     KokoroDriver/StyleTTS2Driver's own uniform01(rng_) draws -- compare against an independent
+    //     instance of that exact engine/distribution. ---
+    {
+        auto result = bridge.call("test_uniform", {{"seed", 7.0}, {"n", 5.0}});
+        const auto& arr = std::get<std::vector<double>>(result);
+        LOOM_CHECK(arr.size() == 5);
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+        bool all_match = true;
+        for (double v : arr) {
+            if (std::fabs(v - static_cast<double>(uniform(rng))) > 1e-9) all_match = false;
+            if (v < 0.0 || v >= 1.0) all_match = false;
+        }
+        LOOM_CHECK(all_match);
+
+        // Re-seeding with the SAME seed reproduces the SAME sequence.
+        auto result2 = bridge.call("test_uniform", {{"seed", 7.0}, {"n", 5.0}});
+        LOOM_CHECK(std::get<std::vector<double>>(result2) == arr);
+    }
+
+    // --- loom.uniform_array THEN loom.gaussian_array against the SAME seeded rng_ stream, matching
+    //     KokoroDriver/StyleTTS2Driver's own draw order (uniform01 first, then normal) -- both
+    //     distributions must share the one engine so this reproduces bit-exactly against an independent
+    //     pair of distribution objects drawing from one shared std::mt19937 in the same order. ---
+    {
+        auto result = bridge.call("test_uniform_then_gaussian", {{"seed", 99.0}, {"n_u", 3.0}, {"n_g", 3.0}});
+        const auto& arr = std::get<std::vector<double>>(result);
+        LOOM_CHECK(arr.size() == 6);
+        std::mt19937 rng(99);
+        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        std::vector<double> expected;
+        for (int i = 0; i < 3; ++i) expected.push_back(static_cast<double>(uniform(rng)));
+        for (int i = 0; i < 3; ++i) expected.push_back(static_cast<double>(normal(rng)));
+        bool all_match = true;
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (std::fabs(arr[i] - expected[i]) > 1e-9) all_match = false;
+        }
+        LOOM_CHECK(all_match);
     }
 
     // --- loom.expand_by_duration: rows=[[1,2],[3,4]] (T=2,C=2), durations=[2,1] ->

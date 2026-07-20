@@ -76,12 +76,16 @@ def write_gguf(path, topology, weights, architecture="loom-kokoro-duration-predi
     w.close()
 
 
-def build_adaln_topology(channels, style_dim, eps):
+def build_adaln_topology(channels, style_dim, eps, weight_prefix="adaln"):
     """`{"x": [channels, T], "style": [style_dim]} -> [channels, T]` -- plain channel-first LAYER_NORM
     (reduces over ne[0]) + a style-derived `(1+gamma)*x+beta` affine (see module docstring for why this
     is algebraically what AdaLayerNorm's real, transpose-heavy forward reduces to). `style_dim` is a
     plain literal (128, known at conversion time) -- GraphBuilder only ever auto-registers
-    n_tokens/n_past/n_kv (see convert_kokoro_text_encoder.py's own note on this same gotcha)."""
+    n_tokens/n_past/n_kv (see convert_kokoro_text_encoder.py's own note on this same gotcha).
+    `weight_prefix` namespaces the weight tensor names (default "adaln", matching this module's
+    historical hardcoded names) -- needed because DurationEncoder has THREE AdaLayerNorm instances with
+    genuinely different weight values that would otherwise collide under one combined GGUF file (see
+    build_adaln's own docstring)."""
     return {
         "version": 1,
         "inputs": [
@@ -91,17 +95,30 @@ def build_adaln_topology(channels, style_dim, eps):
         "output": "out",
         "nodes": [
             {"op": "LAYER_NORM", "inputs": ["x"], "outputs": ["normed"], "attrs": {"eps": eps}},
-            {"op": "MUL_MAT", "inputs": ["adaln.fc.weight", "style"], "outputs": ["h_mm"]},
-            {"op": "ADD", "inputs": ["h_mm", "adaln.fc.bias"], "outputs": ["h"]},
+            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}.fc.weight", "style"], "outputs": ["h_mm"]},
+            {"op": "ADD", "inputs": ["h_mm", f"{weight_prefix}.fc.bias"], "outputs": ["h"]},
             {"op": "VIEW", "inputs": ["h"], "outputs": ["gamma"], "attrs": {"shape": [channels], "offset": 0}},
             {"op": "VIEW", "inputs": ["h"], "outputs": ["beta"], "attrs": {"shape": [channels], "offset": channels * 4}},
             {"op": "RESHAPE", "inputs": ["gamma"], "outputs": ["gamma_r"], "attrs": {"shape": [channels, 1]}},
             {"op": "RESHAPE", "inputs": ["beta"], "outputs": ["beta_r"], "attrs": {"shape": [channels, 1]}},
-            {"op": "ADD", "inputs": ["gamma_r", "adaln.one"], "outputs": ["gamma_p1"]},
+            {"op": "ADD", "inputs": ["gamma_r", f"{weight_prefix}.one"], "outputs": ["gamma_p1"]},
             {"op": "MUL", "inputs": ["normed", "gamma_p1"], "outputs": ["scaled"]},
             {"op": "ADD", "inputs": ["scaled", "beta_r"], "outputs": ["out"]},
         ],
     }
+
+
+def build_adaln(sd, lstm_idx, hp, weight_prefix="adaln"):
+    """Topology + weights for one AdaLayerNorm instance (`text_encoder.lstms.{lstm_idx}`), namespaced
+    under `weight_prefix` so multiple instances can coexist in one combined GGUF without a weight-name
+    collision (each instance's real fc.weight/fc.bias values genuinely differ)."""
+    topo = build_adaln_topology(hp["d_model"], hp["style_dim"], hp["ada_ln_eps"], weight_prefix)
+    weights = {
+        f"{weight_prefix}.fc.weight": to_f32(sd[f"module.text_encoder.lstms.{lstm_idx}.fc.weight"]),
+        f"{weight_prefix}.fc.bias": to_f32(sd[f"module.text_encoder.lstms.{lstm_idx}.fc.bias"]),
+        f"{weight_prefix}.one": np.array([1.0], dtype=np.float32),
+    }
+    return topo, weights
 
 
 def build_lstm_cell_topology(output_name, hidden_dim, input_dim, weight_prefix):
@@ -142,21 +159,54 @@ def build_lstm_cell_topology(output_name, hidden_dim, input_dim, weight_prefix):
     }
 
 
-def write_bilstm_ggufs(out_dir, name_prefix, sd_prefix, sd, hidden_dim, input_dim):
-    """Writes the 4 small (h/c x fwd/bwd) GGUFs for one BiLSTM instance, each carrying the FULL weight
-    set (both directions) -- matching TdtDecoder's/convert_kokoro_text_encoder.py's own established
-    convention, required for loom::BiLstmStepper's single-shared-model constructor."""
+def build_bilstm(sd_prefix, sd, hidden_dim, input_dim, weight_namespace="lstm"):
+    """Returns {"h_fwd": (topo, weights), "c_fwd": ..., "h_bwd": ..., "c_bwd": ...} for one BiLSTM
+    instance. `weight_namespace` (default "lstm", matching this module's historical hardcoded prefix)
+    namespaces the weight tensor names -- Kokoro has SIX distinct BiLSTM instances (this module's own 3
+    DurationEncoder layers + top_lstm, plus TextEncoder's and F0Ntrain's own, each in their own script)
+    that would otherwise all write identically-named-but-different-valued `lstm.weight_ih` etc. tensors,
+    a real collision once consolidated into one combined GGUF file."""
+    result = {}
     for output_name, direction, fname_suffix in (
         ("h_new", "", "h_fwd"), ("c_new", "", "c_fwd"),
         ("h_new", "reverse.", "h_bwd"), ("c_new", "reverse.", "c_bwd"),
     ):
-        weight_prefix = f"lstm.{direction}" if direction else "lstm."
+        weight_prefix = f"{weight_namespace}.{direction}" if direction else f"{weight_namespace}."
         topo = build_lstm_cell_topology(output_name, hidden_dim, input_dim, weight_prefix)
         weights = {}
-        for dp, suffix in (("lstm.", ""), ("lstm.reverse.", "_reverse")):
+        for dp, suffix in ((f"{weight_namespace}.", ""), (f"{weight_namespace}.reverse.", "_reverse")):
             for kind in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
                 weights[f"{dp}{kind}"] = to_f32(sd[f"{sd_prefix}.{kind}_l0{suffix}"])
+        result[fname_suffix] = (topo, weights)
+    return result
+
+
+def write_bilstm_ggufs(out_dir, name_prefix, sd_prefix, sd, hidden_dim, input_dim, weight_namespace="lstm"):
+    """Writes the 4 small (h/c x fwd/bwd) GGUFs for one BiLSTM instance, each carrying the FULL weight
+    set (both directions) -- matching TdtDecoder's/convert_kokoro_text_encoder.py's own established
+    convention, required for loom::BiLstmStepper's single-shared-model constructor."""
+    for fname_suffix, (topo, weights) in build_bilstm(sd_prefix, sd, hidden_dim, input_dim, weight_namespace).items():
         write_gguf(out_dir / f"{name_prefix}_{fname_suffix}.gguf", topo, weights)
+
+
+def build_duration_proj(sd, hp, weight_prefix="duration_proj"):
+    """Plain Linear(512, max_dur=50), namespaced under `weight_prefix` (default matches the historical
+    hardcoded name -- only one instance of this exists, so no collision risk today, but kept consistent
+    with the other build_* helpers here)."""
+    topo = {
+        "version": 1,
+        "inputs": [{"name": "x", "dtype": "f32", "shape": [str(hp["d_model"])]}],
+        "output": "out",
+        "nodes": [
+            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}.weight", "x"], "outputs": ["mm"]},
+            {"op": "ADD", "inputs": ["mm", f"{weight_prefix}.bias"], "outputs": ["out"]},
+        ],
+    }
+    weights = {
+        f"{weight_prefix}.weight": to_f32(sd["module.duration_proj.linear_layer.weight"]),
+        f"{weight_prefix}.bias": to_f32(sd["module.duration_proj.linear_layer.bias"]),
+    }
+    return topo, weights
 
 
 def main():
@@ -172,12 +222,7 @@ def main():
 
     # --- 3x AdaLayerNorm (lstms.1, lstms.3, lstms.5) ---
     for i, lstm_idx in enumerate((1, 3, 5)):
-        topo = build_adaln_topology(hp["d_model"], hp["style_dim"], hp["ada_ln_eps"])
-        weights = {
-            "adaln.fc.weight": to_f32(sd[f"module.text_encoder.lstms.{lstm_idx}.fc.weight"]),
-            "adaln.fc.bias": to_f32(sd[f"module.text_encoder.lstms.{lstm_idx}.fc.bias"]),
-            "adaln.one": np.array([1.0], dtype=np.float32),
-        }
+        topo, weights = build_adaln(sd, lstm_idx, hp)
         write_gguf(out_dir / f"kokoro_duration_adaln_{i}.gguf", topo, weights)
     print(f"wrote 3 AdaLayerNorm GGUFs to {out_dir}")
 
@@ -193,19 +238,7 @@ def main():
     print(f"wrote 4 top-lstm GGUFs to {out_dir}")
 
     # --- duration_proj: plain Linear(512, max_dur=50) ---
-    proj_topo = {
-        "version": 1,
-        "inputs": [{"name": "x", "dtype": "f32", "shape": [str(hp["d_model"])]}],
-        "output": "out",
-        "nodes": [
-            {"op": "MUL_MAT", "inputs": ["duration_proj.weight", "x"], "outputs": ["mm"]},
-            {"op": "ADD", "inputs": ["mm", "duration_proj.bias"], "outputs": ["out"]},
-        ],
-    }
-    proj_weights = {
-        "duration_proj.weight": to_f32(sd["module.duration_proj.linear_layer.weight"]),
-        "duration_proj.bias": to_f32(sd["module.duration_proj.linear_layer.bias"]),
-    }
+    proj_topo, proj_weights = build_duration_proj(sd, hp)
     write_gguf(out_dir / "kokoro_duration_proj.gguf", proj_topo, proj_weights)
     print(f"wrote kokoro_duration_proj.gguf")
 
