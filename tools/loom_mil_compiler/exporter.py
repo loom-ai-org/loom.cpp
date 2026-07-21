@@ -54,6 +54,7 @@ class LoomGGUFExporter:
         self.weights = {}
         self.topologies = {}
         self.lua_lines = []
+        self.profile = kwargs.get("profile", None)
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
 
     def safe_name(self, name: str) -> str:
@@ -101,12 +102,26 @@ class LoomGGUFExporter:
           - Other functions represent heavy submodules and become static topologies.
           - Weights and assets are serialized to GGUF.
         """
-        # 1. Traversal and Segmentation
-        for func_name, func in self.program.functions.items():
-            if func_name == "main":
-                self.transpile_to_lua(func, name="main")
+        is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
+        
+        if is_bespoke and self.profile is None:
+            # 1. Advanced / Bespoke Exporting Workflow
+            print("Exporting via Advanced/Bespoke workflow...")
+            for func_name, func in self.program.functions.items():
+                if func_name == "main":
+                    self.transpile_to_lua(func, name="main")
+                else:
+                    self.topologies[func_name] = self.generate_graph_topology(func, func_name)
+        else:
+            profile = self.profile or "monolithic"
+            if profile == "atomic":
+                try:
+                    self.apply_atomic_export()
+                except Exception as e:
+                    print(f"Warning: Automated atomic partitioning failed: {e}. Falling back to monolithic profile.")
+                    self.apply_monolithic_export()
             else:
-                self.topologies[func_name] = self.generate_graph_topology(func, func_name)
+                self.apply_monolithic_export()
 
         # 2. Transpiled Script Consolidation
         driver_script = "\n".join(self.lua_lines)
@@ -114,6 +129,183 @@ class LoomGGUFExporter:
         # 3. Serialization Phase
         self.write_gguf(driver_script)
         return self.output_path
+
+    def apply_monolithic_export(self):
+        print("Exporting via Automatic Monolithic path...")
+        main_func = self.program.functions["main"]
+        self.topologies["main_topo"] = self.generate_graph_topology(main_func, "main_topo")
+        
+        self.lua_lines.append("function main(inputs)")
+        
+        first_input = "tokens"
+        feature_scale = 1
+        if main_func.inputs:
+            first_input_var = list(main_func.inputs.values())[0]
+            first_input = self.safe_name(list(main_func.inputs.keys())[0])
+            if hasattr(first_input_var, "shape") and len(first_input_var.shape) == 3:
+                # For 3D shapes [batch, seq, feature], scale tokens by the last dimension (feature size)
+                try:
+                    feature_scale = int(first_input_var.shape[2])
+                except:
+                    pass
+            
+        for name in main_func.inputs.keys():
+            safe_inp = self.safe_name(name)
+            self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
+            
+        inputs_tbl = ", ".join([f"{self.safe_name(k)} = {self.safe_name(k)}" for k in main_func.inputs.keys()])
+        outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
+        
+        n_tokens_expr = f"#{first_input}"
+        if feature_scale > 1:
+            n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
+            
+        self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('main_topo', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+        self.lua_lines.append(f"    return {outputs_str}")
+        self.lua_lines.append("end")
+
+    def apply_atomic_export(self):
+        print("Exporting via Automatic Atomic path...")
+        import re
+        main_func = self.program.functions["main"]
+        operations = list(main_func.operations)
+        
+        # 1. Scope-Based Partitioning
+        # Scan forward to find the default starting scope if the first ops are const/cast
+        first_scope = "layer_0"
+        for op in operations:
+            if op.op_type not in ["const", "cast"]:
+                op_name = op.outputs[0].name if op.outputs else op.name
+                match = re.search(r'(layers?|blk|blocks?|modules?|linear|dense|fc|conv)_(\d+)', op_name, re.IGNORECASE)
+                if match:
+                    first_scope = f"layer_{match.group(2)}"
+                    break
+                elif any(x in op_name.lower() for x in ["embed", "emb", "wte"]):
+                    first_scope = "embedding"
+                    break
+                else:
+                    first_scope = "output_head"
+                    break
+
+        slices = [] # list of tuples: (slice_name, ops_list)
+        current_slice_name = first_scope
+        current_ops = []
+        
+        for op in operations:
+            op_name = op.outputs[0].name if op.outputs else op.name
+            op_type = op.op_type
+            
+            # Switch scope ONLY if we explicitly match a new named scope index
+            match = re.search(r'(layers?|blk|blocks?|modules?|linear|dense|fc|conv)_(\d+)', op_name, re.IGNORECASE)
+            if match:
+                scope = f"layer_{match.group(2)}"
+            elif any(x in op_name.lower() for x in ["embed", "emb", "wte"]):
+                scope = "embedding"
+            elif any(x in op_name.lower() for x in ["lm_head", "output_head", "logits", "pred", "output"]):
+                scope = "output_head"
+            else:
+                scope = current_slice_name
+                
+            if scope != current_slice_name:
+                if current_ops:
+                    slices.append((current_slice_name, current_ops))
+                current_ops = []
+                current_slice_name = scope
+                
+            current_ops.append(op)
+            
+        if current_ops:
+            slices.append((current_slice_name, current_ops))
+            
+        if len(slices) <= 1:
+            raise ValueError("No distinct scope-based layer boundaries could be identified in the graph.")
+            
+        # 2. Extract inputs/outputs interfaces for each sliced topology
+        # Replicate consumed constants locally in each slice to decouple them,
+        # then extract only non-constant variable inputs.
+        for idx, (name, ops) in enumerate(slices):
+            local_ops = list(ops)
+            consumed_consts = []
+            for op in ops:
+                for k, v in op.inputs.items():
+                    from coremltools.converters.mil.mil import Var
+                    if isinstance(v, Var) and v.op and v.op.op_type == "const" and v not in op.outputs:
+                        if v.op not in local_ops and v.op not in consumed_consts:
+                            consumed_consts.append(v.op)
+            if consumed_consts:
+                local_ops = consumed_consts + local_ops
+            slices[idx] = (name, local_ops)
+
+        defined_vars = set(main_func.inputs.values())
+        slice_inputs = {}
+        
+        for name, ops in slices:
+            slice_in = {}
+            for op in ops:
+                for k, v in op.inputs.items():
+                    from coremltools.converters.mil.mil import Var
+                    if isinstance(v, Var) and v not in op.outputs and v in defined_vars:
+                        if v.op and v.op.op_type == "const":
+                            continue
+                        slice_in[self.safe_name(v.name)] = v
+                for out_var in op.outputs:
+                    defined_vars.add(out_var)
+            slice_inputs[name] = slice_in
+            
+        # 3. Generate topologies for all sliced sub-graphs
+        for name, ops in slices:
+            inputs_dict = slice_inputs[name]
+            self.topologies[name] = self.generate_graph_topology(None, name, ops_list=ops, inputs_dict=inputs_dict)
+            
+        # 4. Synthesize the automatic looping Lua driver script
+        self.lua_lines.append("function main(inputs)")
+        
+        first_input = "tokens"
+        feature_scale = 1
+        if main_func.inputs:
+            first_input_var = list(main_func.inputs.values())[0]
+            first_input = self.safe_name(list(main_func.inputs.keys())[0])
+            if hasattr(first_input_var, "shape") and len(first_input_var.shape) == 3:
+                try:
+                    feature_scale = int(first_input_var.shape[2])
+                except:
+                    pass
+            
+        for name in main_func.inputs.keys():
+            safe_inp = self.safe_name(name)
+            self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
+            
+        # Execute each sliced topology sequentially
+        for name, ops in slices:
+            inputs_dict = slice_inputs[name]
+            
+            # Map input keys, standardizing the first input name to "hidden_states" for decoder layers
+            inputs_tbl_items = []
+            is_layer = name.startswith("layer_")
+            first_key = list(inputs_dict.keys())[0] if inputs_dict else None
+            
+            for k in inputs_dict.keys():
+                safe_k = self.safe_name(k)
+                if is_layer and k == first_key:
+                    inputs_tbl_items.append(f"hidden_states = {safe_k}")
+                else:
+                    inputs_tbl_items.append(f"{safe_k} = {safe_k}")
+                    
+            inputs_tbl = ", ".join(inputs_tbl_items)
+            
+            last_op = ops[-1]
+            outputs_str = ", ".join([self.safe_name(v.name) for v in last_op.outputs])
+            
+            n_tokens_expr = f"#{first_input}"
+            if feature_scale > 1:
+                n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
+                
+            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('{name}', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+            
+        final_last_op = slices[-1][1][-1]
+        final_outputs_str = ", ".join([self.safe_name(v.name) for v in final_last_op.outputs])
+        self.lua_lines.append(f"    return {final_outputs_str}")
+        self.lua_lines.append("end")
 
     def transpile_to_lua(self, func: Function, name="main"):
         """
@@ -241,7 +433,7 @@ class LoomGGUFExporter:
             return "{" + ", ".join(map(str, val.flatten())) + "}"
         return "nil"
 
-    def generate_graph_topology(self, func: Function, func_name: str) -> dict:
+    def generate_graph_topology(self, func: Function, func_name: str, ops_list=None, inputs_dict=None) -> dict:
         """
         Walks a heavy submodule MIL graph and serializes it to a static graph topology.
         """
@@ -249,6 +441,9 @@ class LoomGGUFExporter:
         topo_inputs = []
         aliases = {}
         
+        inputs = inputs_dict if inputs_dict is not None else (func.inputs if func else {})
+        operations = ops_list if ops_list is not None else (func.operations if func else [])
+
         def resolve(name):
             while name in aliases:
                 name = aliases[name]
@@ -256,7 +451,7 @@ class LoomGGUFExporter:
         
         # Track inputs to the submodule and standardize the first input name to "hidden_states" for decoder layers
         first_input_var = None
-        for name, var in func.inputs.items():
+        for name, var in inputs.items():
             if first_input_var is None:
                 first_input_var = var
                 
@@ -271,14 +466,14 @@ class LoomGGUFExporter:
             else:
                 topo_inputs.append(self.get_var_info(first_input_var))
             
-            for name, var in func.inputs.items():
+            for name, var in inputs.items():
                 if var != first_input_var:
                     topo_inputs.append(self.get_var_info(var))
         else:
-            for name, var in func.inputs.items():
+            for name, var in inputs.items():
                 topo_inputs.append(self.get_var_info(var))
 
-        for op in func.operations:
+        for op in operations:
             op_type = op.op_type
             if op_type == "const":
                 val = op.val.val
@@ -773,7 +968,8 @@ class LoomGGUFExporter:
                     node["attrs"] = serializable_attrs
             nodes.append(node)
 
-        output_symbol = resolve(self.safe_name(func.outputs[0].name)) if func.outputs else "output"
+        func_outputs = func.outputs if func else (ops_list[-1].outputs if ops_list else [])
+        output_symbol = resolve(self.safe_name(func_outputs[0].name)) if func_outputs else "output"
 
         return {
             "version": 1,

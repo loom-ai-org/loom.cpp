@@ -160,5 +160,76 @@ class TestLoomMILCompiler(unittest.TestCase):
         self.assertTrue(any(node["op"] == "MUL_MAT" for node in topo["nodes"]))
         self.assertTrue(any(node["op"] == "ADD" for node in topo["nodes"]))
 
+    def test_monolithic_profile_auto_generation(self):
+        """
+        Verify that using profile="monolithic" automatically serializes the entire
+        main function into 'main_topo' and generates a wrapper Lua driver script.
+        """
+        prog = Program()
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4), dtype=types.fp32)])
+        def main_func(x):
+            y = mb.add(x=x, y=1.0, name="add_node")
+            return mb.add(x=y, y=2.0, name="add_node2")
+
+        prog.functions["main"] = main_func.functions["main"]
+        
+        backend = loom_mil_compiler.LoomGGUFBackend()
+        backend(prog, output_path=self.output_path, profile="monolithic", architecture="mono_test")
+        
+        self.assertTrue(os.path.exists(self.output_path))
+        reader = GGUFReader(self.output_path)
+        
+        self.assertIn("model.graph_topology.main_topo", reader.fields)
+        self.assertIn("model.driver_script", reader.fields)
+        
+        driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
+        self.assertIn("loom.run_subgraph('main_topo'", driver_script)
+
+    def test_atomic_profile_auto_generation_and_fallback(self):
+        """
+        Verify that using profile="atomic" segments the model based on scope markers,
+        and gracefully falls back to monolithic if no distinct scopes exist.
+        """
+        # A. Case 1: Dynamic fallback when no scope markers exist
+        prog_mono = Program()
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4), dtype=types.fp32)])
+        def main_mono(x):
+            return mb.add(x=x, y=1.0, name="flat_node")
+            
+        prog_mono.functions["main"] = main_mono.functions["main"]
+        backend = loom_mil_compiler.LoomGGUFBackend()
+        
+        # This should trigger the fallback to monolithic and compile cleanly!
+        backend(prog_mono, output_path=self.output_path, profile="atomic", architecture="fallback_test")
+        self.assertTrue(os.path.exists(self.output_path))
+        reader = GGUFReader(self.output_path)
+        self.assertIn("model.graph_topology.main_topo", reader.fields)
+        
+        # Clean up for next case
+        os.remove(self.output_path)
+        
+        # B. Case 2: Successful Scope-based partitioning into atomic topologies
+        prog_atomic = Program()
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4), dtype=types.fp32)])
+        def main_atomic(x):
+            # Nodes matching "layer_0" and "layer_1" scopes
+            layer0_out = mb.add(x=x, y=1.0, name="layer_0_node")
+            layer1_out = mb.add(x=layer0_out, y=2.0, name="layer_1_node")
+            return layer1_out
+            
+        prog_atomic.functions["main"] = main_atomic.functions["main"]
+        backend(prog_atomic, output_path=self.output_path, profile="atomic", architecture="atomic_test")
+        
+        self.assertTrue(os.path.exists(self.output_path))
+        reader_atomic = GGUFReader(self.output_path)
+        
+        # Verify both sub-topologies are serialized separately
+        self.assertIn("model.graph_topology.layer_0", reader_atomic.fields)
+        self.assertIn("model.graph_topology.layer_1", reader_atomic.fields)
+        
+        driver_script = reader_atomic.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
+        self.assertIn("loom.run_subgraph('layer_0'", driver_script)
+        self.assertIn("loom.run_subgraph('layer_1'", driver_script)
+
 if __name__ == "__main__":
     unittest.main()

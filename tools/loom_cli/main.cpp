@@ -209,7 +209,15 @@ int main(int argc, char** argv) {
                     loom::LoomLuaBridge::Value result = bridge.call("main", {
                         {"tokens", current_prompt}
                     });
-                    double next_tok_val = std::get<double>(result);
+                    double next_tok_val = 0.0;
+                    if (std::holds_alternative<double>(result)) {
+                        next_tok_val = std::get<double>(result);
+                    } else if (std::holds_alternative<std::vector<double>>(result)) {
+                        const auto& vec = std::get<std::vector<double>>(result);
+                        if (!vec.empty()) {
+                            next_tok_val = vec[0];
+                        }
+                    }
                     int32_t next_tok = static_cast<int32_t>(next_tok_val);
                     generated.push_back(next_tok);
                     current_prompt.push_back(next_tok_val);
