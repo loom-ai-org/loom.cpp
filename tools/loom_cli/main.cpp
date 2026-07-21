@@ -219,8 +219,11 @@ int main(int argc, char** argv) {
                         }
                     }
                     int32_t next_tok = static_cast<int32_t>(next_tok_val);
+                    if (next_tok < 0 || next_tok >= 65536) {
+                        next_tok = 0; // Guard out-of-range token predictions
+                    }
                     generated.push_back(next_tok);
-                    current_prompt.push_back(next_tok_val);
+                    current_prompt.push_back(static_cast<double>(next_tok));
                 }
                 
                 if (bpe_vocab) {

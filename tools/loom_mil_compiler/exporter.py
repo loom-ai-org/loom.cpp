@@ -19,6 +19,8 @@ class LoomGGUFExporter:
         "sub": "SUB",
         "mul": "MUL",
         "div": "DIV",
+        "real_div": "DIV",
+        "floor_div": "DIV",
         "matmul": "MUL_MAT",
         "relu": "RELU",
         "gelu": "GELU",
@@ -41,6 +43,16 @@ class LoomGGUFExporter:
         "pow": "POW",
         "rsqrt": "RSQRT",
         "shape": "SHAPE",
+        "range_1d": "RANGE_1D",
+        "expand_dims": "RESHAPE",
+        "squeeze": "RESHAPE",
+        "less_equal": "LESS_EQUAL",
+        "greater_equal": "GREATER_EQUAL",
+        "less": "LESS",
+        "greater": "GREATER",
+        "equal": "EQUAL",
+        "not_equal": "NOT_EQUAL",
+        "select": "SELECT",
         # Specialized Loom dialect ops:
         "loom_fused_attention": "ATTENTION",
         "loom_spline": "RQ_SPLINE_INVERSE",
@@ -54,7 +66,7 @@ class LoomGGUFExporter:
         self.weights = {}
         self.topologies = {}
         self.lua_lines = []
-        self.profile = kwargs.get("profile", None)
+        self.profile = kwargs.get("profile") or os.environ.get("LOOM_PROFILE", None)
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
 
     def safe_name(self, name: str) -> str:
@@ -135,13 +147,22 @@ class LoomGGUFExporter:
         main_func = self.program.functions["main"]
         self.topologies["main_topo"] = self.generate_graph_topology(main_func, "main_topo")
         
-        self.lua_lines.append("function main(inputs)")
-        
         first_input = "tokens"
         feature_scale = 1
+        static_seq_len = None
+        
         if main_func.inputs:
             first_input_var = list(main_func.inputs.values())[0]
             first_input = self.safe_name(list(main_func.inputs.keys())[0])
+            
+            # Check for static sequence length (dimension at index 1)
+            if hasattr(first_input_var, "shape") and len(first_input_var.shape) >= 2:
+                seq_dim = first_input_var.shape[1]
+                try:
+                    static_seq_len = int(seq_dim)
+                except (ValueError, TypeError):
+                    pass
+                    
             if hasattr(first_input_var, "shape") and len(first_input_var.shape) == 3:
                 # For 3D shapes [batch, seq, feature], scale tokens by the last dimension (feature size)
                 try:
@@ -149,20 +170,54 @@ class LoomGGUFExporter:
                 except:
                     pass
             
-        for name in main_func.inputs.keys():
-            safe_inp = self.safe_name(name)
-            self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
+        if static_seq_len is not None:
+            print(f"Detected static sequence length S={static_seq_len} in monolithic profile. Auto-synthesizing padded/sliced Lua driver...")
+            self.lua_lines.append("function main(inputs)")
+            self.lua_lines.append("    local x = inputs.x or inputs.tokens")
+            self.lua_lines.append("    local original_len = #x")
             
-        inputs_tbl = ", ".join([f"{self.safe_name(k)} = {self.safe_name(k)}" for k in main_func.inputs.keys()])
-        outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
-        
-        n_tokens_expr = f"#{first_input}"
-        if feature_scale > 1:
-            n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
+            # 1. Pad input array with trailing 0s up to static size S
+            self.lua_lines.append("    local padded_x = {}")
+            self.lua_lines.append("    for i=1,original_len do padded_x[i] = x[i] end")
+            self.lua_lines.append(f"    for i=original_len+1,{static_seq_len} do padded_x[i] = 0 end")
             
-        self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('main_topo', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
-        self.lua_lines.append(f"    return {outputs_str}")
-        self.lua_lines.append("end")
+            # 2. Map input dispatches, mapping only the sequence variable x to padded_x
+            inputs_tbl_items = []
+            for k in main_func.inputs.keys():
+                safe_k = self.safe_name(k)
+                if k == first_input:
+                    inputs_tbl_items.append(f"{safe_k} = padded_x")
+                else:
+                    inputs_tbl_items.append(f"{safe_k} = {safe_k}")
+            inputs_tbl = ", ".join(inputs_tbl_items)
+            
+            outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
+            
+            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('main_topo', {static_seq_len}, 0, {{{inputs_tbl}}})")
+            
+            # 3. Slice and return the prediction for the active token (index original_len)
+            self.lua_lines.append(f"    if type({outputs_str}) == 'table' then")
+            self.lua_lines.append(f"        return {outputs_str}[original_len]")
+            self.lua_lines.append("    else")
+            self.lua_lines.append(f"        return {outputs_str}")
+            self.lua_lines.append("    end")
+            self.lua_lines.append("end")
+        else:
+            self.lua_lines.append("function main(inputs)")
+            for name in main_func.inputs.keys():
+                safe_inp = self.safe_name(name)
+                self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
+                
+            inputs_tbl = ", ".join([f"{self.safe_name(k)} = {self.safe_name(k)}" for k in main_func.inputs.keys()])
+            outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
+            
+            n_tokens_expr = f"#{first_input}"
+            if feature_scale > 1:
+                n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
+                
+            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('main_topo', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+            self.lua_lines.append(f"    return {outputs_str}")
+            self.lua_lines.append("end")
 
     def apply_atomic_export(self):
         print("Exporting via Automatic Atomic path...")
@@ -478,9 +533,22 @@ class LoomGGUFExporter:
             if op_type == "const":
                 val = op.val.val
                 weight_name = self.safe_name(op.outputs[0].name)
-                namespaced_name = f"{func_name}.{weight_name}"
+                
+                # For monolithic profiles, skip namespace prefixing
+                if func_name == "main_topo" or self.profile == "monolithic":
+                    namespaced_name = weight_name
+                else:
+                    namespaced_name = f"{func_name}.{weight_name}"
+                    
+                # Safe compaction to satisfy GGUF's GGML_MAX_NAME (64 chars) limit
+                if len(namespaced_name) >= 64:
+                    import hashlib
+                    h = hashlib.md5(namespaced_name.encode("utf-8")).hexdigest()[:6]
+                    namespaced_name = f"{namespaced_name[:30]}_{h}_{namespaced_name[-20:]}"
+                    
                 self.weights[namespaced_name] = np.array(val)
-                aliases[weight_name] = namespaced_name
+                if weight_name != namespaced_name:
+                    aliases[weight_name] = namespaced_name
                 continue
 
             if op_type == "cast":
@@ -738,12 +806,20 @@ class LoomGGUFExporter:
                     mil_axis = rank - 1 - i
                     dim_size = ne_shape[i]
                     rep_factor = reps_list[mil_axis]
+                    if rep_factor is None:
+                        rep_factor = 1
                     
                     try:
                         dim_int = int(dim_size)
                         target_shape.append(str(dim_int * rep_factor))
-                    except ValueError:
+                    except (ValueError, TypeError):
                         target_shape.append(f"({dim_size} * {rep_factor})")
+                        
+                # Limit target shape strictly to 4D to satisfy GGML's maximum dimension limits
+                while len(target_shape) > 4 and target_shape[-1] == "1":
+                    target_shape.pop()
+                if len(target_shape) > 4:
+                    target_shape = target_shape[:4]
                         
                 nodes.append({
                     "op": "REPEAT",
@@ -753,11 +829,8 @@ class LoomGGUFExporter:
                 })
                 continue
 
-            if "reshape" in op_type:
-                print("FOUND RESHAPE NODE IN EXPORTER! op_type is:", op_type)
-
-            if op_type == "reshape":
-                # Map reshape to RESHAPE with 1 input and static/dynamic shape attribute
+            if op_type in ["reshape", "expand_dims", "squeeze"]:
+                # Map reshape/expand_dims/squeeze to RESHAPE with 1 input and static/dynamic shape attribute
                 x_var_obj = op.inputs.get("x") or op.inputs.get("data")
                 x_var = self.safe_name(x_var_obj.name)
                 
@@ -787,6 +860,12 @@ class LoomGGUFExporter:
                     # For LFM2 attention reshape, it is always ["1024", "n_tokens", "1"]
                     if input_prod == 4096:
                         target_shape = ["1024", "n_tokens", "1"]
+                
+                # Limit target shape strictly to 4D to satisfy GGML's maximum dimension limits
+                while len(target_shape) > 4 and target_shape[-1] == "1":
+                    target_shape.pop()
+                if len(target_shape) > 4:
+                    target_shape = target_shape[:4]
                 
                 nodes.append({
                     "op": "RESHAPE",
@@ -908,7 +987,7 @@ class LoomGGUFExporter:
                 y_val_obj = op.inputs.get("y")
                 if x_val_obj and y_val_obj:
                     inputs = [resolve(self.safe_name(x_val_obj.name)), resolve(self.safe_name(y_val_obj.name))]
-            elif mapped_op in ("MEAN", "PERMUTE", "SOFTMAX", "CLAMP", "RSQRT"):
+            elif mapped_op in ("MEAN", "PERMUTE", "SOFTMAX", "CLAMP", "RSQRT", "RESHAPE", "VIEW"):
                 # Unary reduction/metadata operations in Loom C++ strictly expect exactly 1 input tensor
                 x_val_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
                 if x_val_obj:

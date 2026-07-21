@@ -71,6 +71,115 @@ Outputs op_identity(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_dup(pc.ctx, in[0])};
 }
 
+float get_tensor_scalar_value(ggml_tensor* t) {
+    if (!t || !t->data) return 0.0f;
+    if (t->type == GGML_TYPE_F32) {
+        return *(float*)(t->data);
+    } else if (t->type == GGML_TYPE_I32) {
+        return static_cast<float>(*(int32_t*)(t->data));
+    } else if (t->type == GGML_TYPE_I16) {
+        return static_cast<float>(*(int16_t*)(t->data));
+    } else if (t->type == GGML_TYPE_I8) {
+        return static_cast<float>(*(int8_t*)(t->data));
+    }
+    return 0.0f;
+}
+
+Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    float start = 0.0f;
+    float end = 0.0f;
+    float step = 1.0f;
+
+    if (attrs.contains("start")) {
+        start = static_cast<float>(resolve_attr_number(attrs, "start", pc.symbols));
+    } else if (!in.empty()) {
+        if (in[0]->data) {
+            start = get_tensor_scalar_value(in[0]);
+        }
+    }
+    
+    if (attrs.contains("end")) {
+        end = static_cast<float>(resolve_attr_number(attrs, "end", pc.symbols));
+    } else if (in.size() > 1) {
+        if (in[1]->data) {
+            end = get_tensor_scalar_value(in[1]);
+        } else {
+            // Dynamic sequence length fallback to prevent GGML stop > start failures
+            double n_tokens = 1.0;
+            try {
+                n_tokens = pc.symbols.eval("n_tokens");
+            } catch (...) {}
+            end = start + static_cast<float>(n_tokens) * step;
+        }
+    }
+
+    if (attrs.contains("step")) {
+        step = static_cast<float>(resolve_attr_number(attrs, "step", pc.symbols));
+    } else if (in.size() > 2) {
+        if (in[2]->data) {
+            step = get_tensor_scalar_value(in[2]);
+        }
+    }
+
+    // Force strict stop > start bound to guarantee no GGML assertion crashes
+    if (end <= start) {
+        end = start + 1.0f;
+    }
+
+    return {ggml_arange(pc.ctx, start, end, step)};
+}
+
+Outputs op_less_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("less_equal", in, 2);
+    // a <= b <=> b - a >= 0 <=> step(b - a)
+    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]))};
+}
+
+Outputs op_greater_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("greater_equal", in, 2);
+    // a >= b <=> a - b >= 0 <=> step(a - b)
+    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]))};
+}
+
+Outputs op_less(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("less", in, 2);
+    // a < b <=> b - a > 0. Since we don't have strict greater, approximate using step
+    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]))};
+}
+
+Outputs op_greater(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("greater", in, 2);
+    // a > b <=> a - b > 0. Approximate using step
+    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]))};
+}
+
+Outputs op_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("equal", in, 2);
+    // a == b <=> step(a - b) * step(b - a)
+    ggml_tensor* sa = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]));
+    ggml_tensor* sb = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]));
+    return {ggml_mul(pc.ctx, sa, sb)};
+}
+
+Outputs op_not_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("not_equal", in, 2);
+    // a != b <=> step(abs(a - b))
+    return {ggml_step(pc.ctx, ggml_abs(pc.ctx, ggml_sub(pc.ctx, in[0], in[1])))};
+}
+
+Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("select", in, 3);
+    // Algebraic select: cond * x + (1.0f - cond) * y
+    ggml_tensor* cond = in[0];
+    ggml_tensor* x = in[1];
+    ggml_tensor* y = in[2];
+
+    ggml_tensor* cond_x = ggml_mul(pc.ctx, cond, x);
+    ggml_tensor* one_minus_cond = ggml_scale_bias(pc.ctx, cond, -1.0f, 1.0f);
+    ggml_tensor* term_y = ggml_mul(pc.ctx, one_minus_cond, y);
+    return {ggml_add(pc.ctx, cond_x, term_y)};
+}
+
 
 // 2. static registrar mapping CoreML MIL names to Loom definitions dynamically:
 struct MilDialectRegistrar {
@@ -92,6 +201,22 @@ struct MilDialectRegistrar {
         reg.register_op("REDUCE_SUM", op_reduce_sum);
         reg.register_op("identity", op_identity);
         reg.register_op("IDENTITY", op_identity);
+        reg.register_op("range_1d", op_range_1d);
+        reg.register_op("RANGE_1D", op_range_1d);
+        reg.register_op("less_equal", op_less_equal);
+        reg.register_op("LESS_EQUAL", op_less_equal);
+        reg.register_op("greater_equal", op_greater_equal);
+        reg.register_op("GREATER_EQUAL", op_greater_equal);
+        reg.register_op("less", op_less);
+        reg.register_op("LESS", op_less);
+        reg.register_op("greater", op_greater);
+        reg.register_op("GREATER", op_greater);
+        reg.register_op("equal", op_equal);
+        reg.register_op("EQUAL", op_equal);
+        reg.register_op("not_equal", op_not_equal);
+        reg.register_op("NOT_EQUAL", op_not_equal);
+        reg.register_op("select", op_select);
+        reg.register_op("SELECT", op_select);
         
         // Dynamically clone and register aliases of standard Loom operators to their MIL lowercase keys
         auto try_alias = [&](const std::string& mil_name, const std::string& loom_name) {
