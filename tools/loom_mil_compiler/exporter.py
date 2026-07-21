@@ -193,13 +193,15 @@ class LoomGGUFExporter:
             
             outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
             
-            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('main_topo', {static_seq_len}, 0, {{{inputs_tbl}}})")
-            
-            # 3. Slice and return the prediction for the active token (index original_len)
-            self.lua_lines.append(f"    if type({outputs_str}) == 'table' then")
-            self.lua_lines.append(f"        return {outputs_str}[original_len]")
+            self.lua_lines.append(f"    local _mono_out, _mono_shape = loom.run_subgraph('main_topo', {static_seq_len}, 0, {{{inputs_tbl}}})")
+
+            # 3. Argmax the logits row for the active token (index original_len - 1) rather than
+            # returning a single raw logit value -- _mono_shape[1] is the output's ne0 (vocab size),
+            # the same convention transpile_operation's own "argmax" case relies on.
+            self.lua_lines.append("    if type(_mono_out) == 'table' then")
+            self.lua_lines.append("        return loom.argmax_row(_mono_out, _mono_shape[1], original_len - 1)")
             self.lua_lines.append("    else")
-            self.lua_lines.append(f"        return {outputs_str}")
+            self.lua_lines.append("        return _mono_out")
             self.lua_lines.append("    end")
             self.lua_lines.append("end")
         else:
@@ -225,56 +227,113 @@ class LoomGGUFExporter:
         main_func = self.program.functions["main"]
         operations = list(main_func.operations)
         
-        # 1. Scope-Based Partitioning
-        # Scan forward to find the default starting scope if the first ops are const/cast
-        first_scope = "layer_0"
-        for op in operations:
-            if op.op_type not in ["const", "cast"]:
-                op_name = op.outputs[0].name if op.outputs else op.name
-                match = re.search(r'(layers?|blk|blocks?|modules?|linear|dense|fc|conv)_(\d+)', op_name, re.IGNORECASE)
-                if match:
-                    first_scope = f"layer_{match.group(2)}"
-                    break
-                elif any(x in op_name.lower() for x in ["embed", "emb", "wte"]):
-                    first_scope = "embedding"
-                    break
-                else:
-                    first_scope = "output_head"
-                    break
+        # 1. Scope-Based Partitioning.
+        #
+        # Preferred signal: coremltools attaches the ORIGINAL PyTorch module hierarchy to every op
+        # converted from a traced/exported model, under ScopeSource.TORCHSCRIPT_MODULE_NAME (e.g.
+        # ('model', 'model', '5', 'self_attn') for `model.model.layers[5].self_attn`). A digit segment
+        # that is NOT the tuple's last element marks indexing into a repeated submodule
+        # (nn.ModuleList/Sequential) -- exactly the atomic layer boundary we want. Trailing digits are
+        # NOT a boundary signal: they are just auto-generated per-op SSA name suffixes coremltools
+        # invents when the original PyTorch value had no better name (e.g. a bare intermediate named
+        # "1823"), and treating those as boundaries mis-partitions the graph into one slice per op
+        # instead of one slice per real decoder layer.
+        #
+        # Fallback signal: hand-built MIL programs (e.g. this module's own unit tests) have no torch
+        # scope metadata at all, so we fall back to the previous heuristic of regex-matching the op's
+        # own output name for "layer_N"/"embed"/"output_head"-shaped names.
+        try:
+            from coremltools.converters.mil.mil.scope import ScopeSource
+        except ImportError:
+            ScopeSource = None
 
-        slices = [] # list of tuples: (slice_name, ops_list)
-        current_slice_name = first_scope
-        current_ops = []
-        
-        for op in operations:
+        def torch_scope_key(op):
+            if ScopeSource is None or not hasattr(op, "scopes"):
+                return None
+            mn = op.scopes.get(ScopeSource.TORCHSCRIPT_MODULE_NAME, ())
+            if not mn:
+                return None
+            for i in range(len(mn) - 1):
+                if mn[i].isdigit():
+                    return tuple(mn[:i + 1])
+            return tuple(mn[:-1]) if len(mn) > 1 else tuple(mn)
+
+        def name_regex_key(op):
             op_name = op.outputs[0].name if op.outputs else op.name
-            op_type = op.op_type
-            
-            # Switch scope ONLY if we explicitly match a new named scope index
             match = re.search(r'(layers?|blk|blocks?|modules?|linear|dense|fc|conv)_(\d+)', op_name, re.IGNORECASE)
             if match:
-                scope = f"layer_{match.group(2)}"
-            elif any(x in op_name.lower() for x in ["embed", "emb", "wte"]):
-                scope = "embedding"
-            elif any(x in op_name.lower() for x in ["lm_head", "output_head", "logits", "pred", "output"]):
-                scope = "output_head"
-            else:
-                scope = current_slice_name
-                
-            if scope != current_slice_name:
-                if current_ops:
-                    slices.append((current_slice_name, current_ops))
-                current_ops = []
-                current_slice_name = scope
-                
-            current_ops.append(op)
-            
-        if current_ops:
-            slices.append((current_slice_name, current_ops))
-            
+                return f"layer_{match.group(2)}"
+            if any(x in op_name.lower() for x in ("embed", "emb", "wte")):
+                return "embedding"
+            if any(x in op_name.lower() for x in ("lm_head", "output_head", "logits", "pred", "output")):
+                return "output_head"
+            return None
+
+        def boundary_key(op):
+            return torch_scope_key(op) or name_regex_key(op)
+
+        def label_for(key):
+            if isinstance(key, str):
+                return key
+            if key[-1].isdigit():
+                return f"layer_{key[-1]}"
+            # Match on the LEAF scope segment only (the immediate submodule attribute name), and
+            # exactly rather than by substring: a broad "'embed' in ..." match on the whole path
+            # also matches LFM2's final-output RMSNorm, which the model confusingly calls
+            # "embedding_norm" despite having nothing to do with the token-embedding lookup --
+            # colliding both onto the same "embedding" label and silently discarding one topology.
+            leaf = key[-1].lower()
+            if leaf in ("embed_tokens", "embedding", "wte", "tok_embeddings"):
+                return "embedding"
+            if leaf in ("lm_head", "output_head", "logits"):
+                return "output_head"
+            return self.safe_name("_".join(key))
+
+        # Seed the initial slice with the first identifiable boundary (ops before it, e.g. leading
+        # const/cast setup with no scope opinion of their own, join that first slice).
+        initial_key = None
+        for op in operations:
+            k = boundary_key(op)
+            if k is not None:
+                initial_key = k
+                break
+
+        slices = [] # list of tuples: (slice_name, ops_list)
+        if initial_key is not None:
+            current_key = initial_key
+            current_ops = []
+            for op in operations:
+                k = boundary_key(op)
+                if k is not None and k != current_key:
+                    if current_ops:
+                        slices.append((current_key, current_ops))
+                    current_ops = []
+                    current_key = k
+                current_ops.append(op)
+            if current_ops:
+                slices.append((current_key, current_ops))
+
+            # Fold metadata-only slices (e.g. precomputed rotary-embedding tables, which show up as
+            # their own scope but are pure const/cast) forward into the next slice that actually
+            # consumes them -- they have no compute/output of their own to serve as a standalone topology.
+            merged = []
+            pending = []
+            for key, ops in slices:
+                if all(op.op_type in ("const", "cast") for op in ops):
+                    pending.extend(ops)
+                    continue
+                merged.append((key, pending + ops))
+                pending = []
+            if pending:
+                if merged:
+                    merged[-1] = (merged[-1][0], merged[-1][1] + pending)
+                else:
+                    merged = []
+            slices = [(label_for(key), ops) for key, ops in merged]
+
         if len(slices) <= 1:
             raise ValueError("No distinct scope-based layer boundaries could be identified in the graph.")
-            
+
         # 2. Extract inputs/outputs interfaces for each sliced topology
         # Replicate consumed constants locally in each slice to decouple them,
         # then extract only non-constant variable inputs.
@@ -291,20 +350,25 @@ class LoomGGUFExporter:
                 local_ops = consumed_consts + local_ops
             slices[idx] = (name, local_ops)
 
-        defined_vars = set(main_func.inputs.values())
         slice_inputs = {}
-        
+
         for name, ops in slices:
+            # A var is an external input of THIS slice iff the op that produced it is not itself
+            # part of this slice's own op list -- i.e. it's either a top-level function input (its
+            # producing op is a placeholder, not in `ops`) or another slice's output. Checking
+            # membership against a running "seen so far" set (as a previous version of this code did)
+            # is wrong: it also catches purely-internal intermediates produced earlier in the SAME
+            # slice, misclassifying them as external inputs (observed on LFM2: 30-60 bogus "inputs"
+            # per layer, some with >4 MIL dims, crashing ggml_new_tensor at runtime).
+            ops_set = set(ops)
             slice_in = {}
             for op in ops:
                 for k, v in op.inputs.items():
                     from coremltools.converters.mil.mil import Var
-                    if isinstance(v, Var) and v not in op.outputs and v in defined_vars:
+                    if isinstance(v, Var) and v not in op.outputs and v.op not in ops_set:
                         if v.op and v.op.op_type == "const":
                             continue
                         slice_in[self.safe_name(v.name)] = v
-                for out_var in op.outputs:
-                    defined_vars.add(out_var)
             slice_inputs[name] = slice_in
             
         # 3. Generate topologies for all sliced sub-graphs
@@ -314,9 +378,10 @@ class LoomGGUFExporter:
             
         # 4. Synthesize the automatic looping Lua driver script
         self.lua_lines.append("function main(inputs)")
-        
+
         first_input = "tokens"
         feature_scale = 1
+        static_seq_len = None
         if main_func.inputs:
             first_input_var = list(main_func.inputs.values())[0]
             first_input = self.safe_name(list(main_func.inputs.keys())[0])
@@ -325,41 +390,77 @@ class LoomGGUFExporter:
                     feature_scale = int(first_input_var.shape[2])
                 except:
                     pass
-            
+            # If the model was traced with a fixed sequence length (no dynamic RangeDim), every
+            # slice's declared shapes bake in that same constant -- the driver MUST always request
+            # exactly that many tokens from every run_subgraph call (padding shorter prompts), the
+            # same static/padded convention apply_monolithic_export uses, rather than the real prompt
+            # length (which would runtime-mismatch every topology's fixed input shape).
+            if hasattr(first_input_var, "shape") and len(first_input_var.shape) >= 2:
+                try:
+                    static_seq_len = int(first_input_var.shape[1])
+                except (ValueError, TypeError):
+                    pass
+
         for name in main_func.inputs.keys():
             safe_inp = self.safe_name(name)
             self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
-            
+
+        if static_seq_len is not None:
+            self.lua_lines.append(f"    local original_len = #{first_input}")
+            self.lua_lines.append("    local padded_x = {}")
+            self.lua_lines.append(f"    for i=1,original_len do padded_x[i] = {first_input}[i] end")
+            self.lua_lines.append(f"    for i=original_len+1,{static_seq_len} do padded_x[i] = 0 end")
+            self.lua_lines.append(f"    {first_input} = padded_x")
+
         # Execute each sliced topology sequentially
-        for name, ops in slices:
+        if static_seq_len is not None:
+            n_tokens_expr = str(static_seq_len)
+        else:
+            n_tokens_expr = f"#{first_input}"
+            if feature_scale > 1:
+                n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
+
+        for idx, (name, ops) in enumerate(slices):
             inputs_dict = slice_inputs[name]
-            
+
             # Map input keys, standardizing the first input name to "hidden_states" for decoder layers
             inputs_tbl_items = []
             is_layer = name.startswith("layer_")
             first_key = list(inputs_dict.keys())[0] if inputs_dict else None
-            
+
             for k in inputs_dict.keys():
                 safe_k = self.safe_name(k)
                 if is_layer and k == first_key:
                     inputs_tbl_items.append(f"hidden_states = {safe_k}")
                 else:
                     inputs_tbl_items.append(f"{safe_k} = {safe_k}")
-                    
+
             inputs_tbl = ", ".join(inputs_tbl_items)
-            
+
             last_op = ops[-1]
             outputs_str = ", ".join([self.safe_name(v.name) for v in last_op.outputs])
-            
-            n_tokens_expr = f"#{first_input}"
-            if feature_scale > 1:
-                n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
-                
-            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('{name}', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
-            
+
+            if idx == len(slices) - 1:
+                # Final slice: also capture the output shape so the driver can argmax the last
+                # sequence position's logits row instead of returning a raw output value (matching
+                # the "argmax" convention transpile_operation's bespoke path and
+                # apply_monolithic_export both use for causal-LM next-token generation).
+                self.lua_lines.append(
+                    f"    local {outputs_str}, _atomic_final_shape = loom.run_subgraph('{name}', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+            else:
+                self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('{name}', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+
         final_last_op = slices[-1][1][-1]
         final_outputs_str = ", ".join([self.safe_name(v.name) for v in final_last_op.outputs])
-        self.lua_lines.append(f"    return {final_outputs_str}")
+        # The row to argmax is the LAST real (non-padded) token's position: with a static/padded
+        # sequence that's original_len - 1, otherwise (genuinely dynamic length) it's n_tokens - 1.
+        row_expr = "original_len - 1" if static_seq_len is not None else f"{n_tokens_expr} - 1"
+        self.lua_lines.append(f"    if type({final_outputs_str}) == 'table' then")
+        self.lua_lines.append(
+            f"        return loom.argmax_row({final_outputs_str}, _atomic_final_shape[1], {row_expr})")
+        self.lua_lines.append("    else")
+        self.lua_lines.append(f"        return {final_outputs_str}")
+        self.lua_lines.append("    end")
         self.lua_lines.append("end")
 
     def transpile_to_lua(self, func: Function, name="main"):
@@ -740,9 +841,15 @@ class LoomGGUFExporter:
                     continue
 
             if op_type == "band_part":
-                # Map band_part (with num_lower=-1, num_upper=0) to DIAG_MASK_ZERO
-                num_lower = op.inputs["num_lower"].val if "num_lower" in op.inputs and hasattr(op.inputs["num_lower"], "val") else -1
-                num_upper = op.inputs["num_upper"].val if "num_upper" in op.inputs and hasattr(op.inputs["num_upper"], "val") else 0
+                # Map band_part (with lower=-1, upper=0) to DIAG_MASK_ZERO. MIL's actual input keys
+                # are "lower"/"upper" (see tensor_operation.py's band_part InputSpec) -- NOT
+                # "num_lower"/"num_upper", which never matched, so this always silently used the
+                # (coincidentally causal-shaped) -1/0 defaults regardless of the op's real attrs. Same
+                # bug class as the transpose/"perm" mismatch above; not currently exercised by LFM2
+                # (its causal mask gets constant-folded at trace time rather than computed via a live
+                # band_part op), but a real latent bug for any model that reaches this path.
+                num_lower = op.inputs["lower"].val if "lower" in op.inputs and hasattr(op.inputs["lower"], "val") else -1
+                num_upper = op.inputs["upper"].val if "upper" in op.inputs and hasattr(op.inputs["upper"], "val") else 0
                 
                 x_var = self.safe_name(op.inputs["x"].name)
                 output_var = self.safe_name(op.outputs[0].name)
@@ -768,11 +875,33 @@ class LoomGGUFExporter:
                 x_info = self.get_var_info(op.inputs["x"])
                 rank = len(x_info["shape"])
                 
-                axes = op.inputs["axes"].val if "axes" in op.inputs and hasattr(op.inputs["axes"], "val") else list(range(rank))
-                axes_list = list(axes)
-                
-                # Reverse standard axes relative to ne-dimensions
-                ne_axes = [rank - 1 - axes_list[rank - 1 - i] for i in range(rank)]
+                # MIL's transpose op names its (required) permutation input "perm", not "axes" --
+                # checking for "axes" here always missed, silently falling back to an identity
+                # permutation for EVERY transpose in the model (confirmed on LFM2: every single
+                # PERMUTE node in both the ShortConv and attention layers was emitted as a no-op
+                # [0,1,2,3], which is what caused the numerical mismatch against the real model).
+                perm_var = op.inputs.get("perm") or op.inputs.get("axes")
+                if perm_var is None or not hasattr(perm_var, "val"):
+                    raise ValueError(f"transpose op '{op.name}' has no resolvable 'perm' constant")
+                # perm entries may be negative (confirmed on LFM2: e.g. [0, -1, -2] for .transpose(-1,-2)).
+                raw_perm = [int(p) for p in perm_var.val]
+                norm_perm = [(p + rank) if p < 0 else p for p in raw_perm]
+
+                # MIL's semantics: output.shape[i] = input.shape[norm_perm[i]] -- destination axis i
+                # PULLS FROM source axis norm_perm[i]. ggml_permute's signature is the opposite
+                # direction: ggml_permute(x, axis0..axis3) means "source ne[k] MOVES TO dest ne[axis_k]"
+                # (see ggml.c: result->ne[axis_k] = a->ne[k]). Converting one to the other needs the
+                # INVERSE permutation, not a direct pass-through -- on top of the usual ne-order axis
+                # reversal (MIL axis a <-> ne-axis rank-1-a). Passing norm_perm straight through
+                # (reversed only) silently permuted every transpose in the model incorrectly.
+                inv_perm = [0] * rank
+                for i, p in enumerate(norm_perm):
+                    inv_perm[p] = i
+                ne_axes = []
+                for k in range(rank):
+                    a = rank - 1 - k       # MIL input axis feeding ggml source axis k
+                    b = inv_perm[a]        # MIL output axis that input axis a lands at
+                    ne_axes.append(rank - 1 - b)
                 while len(ne_axes) < 4:
                     ne_axes.append(len(ne_axes))
                     
@@ -926,9 +1055,6 @@ class LoomGGUFExporter:
                         })
                         continue
                 continue
-
-            if "conv" in op_type:
-                print("FOUND CONV NODE IN EXPORTER! op_type is:", op_type)
 
             if op_type == "conv":
                 # Map conv to CONV_1D or CONV_2D and extract static attributes

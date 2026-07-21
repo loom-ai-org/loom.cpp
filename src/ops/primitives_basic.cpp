@@ -497,6 +497,13 @@ Outputs op_reshape(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     if (!attrs.contains("shape") || !attrs.at("shape").is_array()) {
         throw SchemaError("RESHAPE: 'shape' attribute must be an array");
     }
+    // ggml_reshape_*d requires a contiguous source (it reinterprets the flat buffer in place) -- a
+    // real (non-identity) PERMUTE immediately before a RESHAPE, as attention head-splitting produces,
+    // yields a non-contiguous view and would otherwise hit ggml_reshape's own assertion.
+    ggml_tensor* src = in[0];
+    if (!ggml_is_contiguous(src)) {
+        src = ggml_cont(pc.ctx, src);
+    }
     // Same convention as numpy/PyTorch reshape: at most one entry may be the literal -1, meaning "infer
     // this dimension from the input's total element count" -- needed when a dimension (e.g. a
     // subsampled frame count) isn't known as a named symbol at topology-authoring time, only as
@@ -521,16 +528,16 @@ Outputs op_reshape(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         }
     }
     if (infer_idx != -1) {
-        if (known_product == 0 || ggml_nelements(in[0]) % known_product != 0) {
+        if (known_product == 0 || ggml_nelements(src) % known_product != 0) {
             throw SchemaError("RESHAPE: input element count is not evenly divisible by the known 'shape' dimensions");
         }
-        shape[infer_idx] = ggml_nelements(in[0]) / known_product;
+        shape[infer_idx] = ggml_nelements(src) / known_product;
     }
     switch (shape.size()) {
-        case 1: return {ggml_reshape_1d(pc.ctx, in[0], shape[0])};
-        case 2: return {ggml_reshape_2d(pc.ctx, in[0], shape[0], shape[1])};
-        case 3: return {ggml_reshape_3d(pc.ctx, in[0], shape[0], shape[1], shape[2])};
-        case 4: return {ggml_reshape_4d(pc.ctx, in[0], shape[0], shape[1], shape[2], shape[3])};
+        case 1: return {ggml_reshape_1d(pc.ctx, src, shape[0])};
+        case 2: return {ggml_reshape_2d(pc.ctx, src, shape[0], shape[1])};
+        case 3: return {ggml_reshape_3d(pc.ctx, src, shape[0], shape[1], shape[2])};
+        case 4: return {ggml_reshape_4d(pc.ctx, src, shape[0], shape[1], shape[2], shape[3])};
         default: throw SchemaError("RESHAPE 'shape' attribute must have 1-4 entries, got " + std::to_string(shape.size()));
     }
 }
@@ -590,29 +597,38 @@ Outputs op_view(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     }
     const std::vector<int64_t> shape = resolve_attr_int_array(attrs, "shape", pc.symbols);
     const int64_t offset = attrs.contains("offset") ? resolve_attr_int(attrs, "offset", pc.symbols) : 0;
-    const size_t elem_size = ggml_element_size(parent);
     switch (shape.size()) {
         case 1:
             return {ggml_view_1d(pc.ctx, parent, shape[0], offset)};
         case 2: {
+            // Default nb1/nb2/nb3 MUST come from the PARENT's own existing strides, not be
+            // recomputed from the new (target) shape -- recomputing from the target shape is only
+            // correct when the sliced axis's size is unchanged from the parent. When the view
+            // shrinks ne0 itself (e.g. truncating a causal conv's output from 130 back down to 128
+            // real timesteps, keeping ne1=channels), the parent's true row stride is still based on
+            // its ORIGINAL (larger) ne0, so `shape[0]*elem_size` silently underestimates every
+            // row's stride -- row 0 still starts at the right place (offset 0 either way), but every
+            // subsequent row/channel reads from the wrong location. Confirmed on LFM2's ShortConv
+            // layers: channel 0 of the truncated conv output matched the reference model exactly,
+            // every other channel didn't -- exactly this failure signature.
             const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : shape[0] * elem_size;
+                                                      : parent->nb[1];
             return {ggml_view_2d(pc.ctx, parent, shape[0], shape[1], nb1, static_cast<size_t>(offset))};
         }
         case 3: {
             const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : shape[0] * elem_size;
+                                                      : parent->nb[1];
             const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols))
-                                                      : shape[0] * shape[1] * elem_size;
+                                                      : parent->nb[2];
             return {ggml_view_3d(pc.ctx, parent, shape[0], shape[1], shape[2], nb1, nb2, static_cast<size_t>(offset))};
         }
         case 4: {
             const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : shape[0] * elem_size;
+                                                      : parent->nb[1];
             const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols))
-                                                      : shape[0] * shape[1] * elem_size;
+                                                      : parent->nb[2];
             const size_t nb3 = attrs.contains("nb3") ? static_cast<size_t>(resolve_attr_int(attrs, "nb3", pc.symbols))
-                                                      : shape[0] * shape[1] * shape[2] * elem_size;
+                                                      : parent->nb[3];
             return {ggml_view_4d(pc.ctx, parent, shape[0], shape[1], shape[2], shape[3], nb1, nb2, nb3, static_cast<size_t>(offset))};
         }
         default: throw SchemaError("VIEW 'shape' attribute must have 1-4 entries, got " + std::to_string(shape.size()));
