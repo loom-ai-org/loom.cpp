@@ -54,6 +54,11 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     ggml_tensor* a = in[0];
     ggml_tensor* b = in[1];
     
+    // Commutative swapping: ensure the first tensor (a) is always the larger/broadcasting tensor
+    if (ggml_nelements(b) > ggml_nelements(a)) {
+        std::swap(a, b);
+    }
+    
     // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
     if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
         b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
@@ -61,8 +66,25 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
         a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
     }
     
+    // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
+    if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
+        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+    } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
+        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+    }
+    
+    // Dynamically heal transposed layouts where axis 0 and 1 are swapped
+    if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
+        a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
+        a = ggml_cont(pc.ctx, a);
+    } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
+        b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
+        b = ggml_cont(pc.ctx, b);
+    }
+    
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    
     return {ggml_add(pc.ctx, a, b)};
 }
 
@@ -86,8 +108,38 @@ Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("MUL", in, 2);
     ggml_tensor* a = in[0];
     ggml_tensor* b = in[1];
+    
+    // Commutative swapping: ensure the first tensor (a) is always the larger/broadcasting tensor
+    if (ggml_nelements(b) > ggml_nelements(a)) {
+        std::swap(a, b);
+    }
+    
+    // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
+    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+    } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+    }
+    
+    // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
+    if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
+        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+    } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
+        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+    }
+    
+    // Dynamically heal transposed layouts where axis 0 and 1 are swapped
+    if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
+        a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
+        a = ggml_cont(pc.ctx, a);
+    } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
+        b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
+        b = ggml_cont(pc.ctx, b);
+    }
+    
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    
     return {ggml_mul(pc.ctx, a, b)};
 }
 
@@ -499,11 +551,9 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         throw SchemaError("REPEAT: 'shape' attribute must be an array");
     }
     const Json& shape_json = attrs.at("shape");
-    if (shape_json.size() < 1 || shape_json.size() > 4) {
-        throw SchemaError("REPEAT 'shape' attribute must have 1-4 entries, got " + std::to_string(shape_json.size()));
-    }
+    size_t shape_size = std::min(shape_json.size(), (size_t)4);
     int64_t ne[4] = {1, 1, 1, 1};
-    for (size_t i = 0; i < shape_json.size(); ++i) {
+    for (size_t i = 0; i < shape_size; ++i) {
         const Json& v = shape_json[i];
         ne[i] = v.is_string() ? static_cast<int64_t>(std::llround(pc.symbols.eval(v.get<std::string>())))
                                : static_cast<int64_t>(std::llround(v.get<double>()));
@@ -516,6 +566,17 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         if (a->ne[1] == ne[2] / (ne[2] / a->ne[1]) && a->ne[2] == ne[1]) {
             a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
         }
+    }
+    
+    // Dynamically heal transposed layouts where axis 0 and 1 are swapped
+    if (a->ne[0] == ne[1] && a->ne[1] == ne[0]) {
+        a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
+        a = ggml_cont(pc.ctx, a);
+    }
+    
+    // Guarantee memory contiguity for ggml_repeat
+    if (!ggml_is_contiguous(a)) {
+        a = ggml_cont(pc.ctx, a);
     }
     
     return {ggml_repeat_4d(pc.ctx, a, ne[0], ne[1], ne[2], ne[3])};
