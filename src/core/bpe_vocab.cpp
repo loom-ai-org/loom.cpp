@@ -112,6 +112,18 @@ bool match_punct_run(const std::vector<char32_t>& cps, size_t pos, size_t& end) 
     return true;
 }
 
+// `\p{N}` (max_run==1, Qwen2/Qwen3's own regex -- no quantifier, so digits never group) or `\p{N}{1,3}`
+// (max_run==3, LFM2's own regex, shared with llama.cpp's "llama3" pretokenizer type) -- greedily consumes
+// up to `max_run` consecutive digit codepoints starting at `pos`.
+bool match_number_run(const std::vector<char32_t>& cps, size_t pos, size_t max_run, size_t& end) {
+    if (!is_number(cps[pos])) return false;
+    const size_t n = cps.size();
+    size_t p = pos;
+    while (p < n && (p - pos) < max_run && is_number(cps[p])) ++p;
+    end = p;
+    return true;
+}
+
 // `\s*[\r\n]+` -- see bpe_vocab.h's module-level design note (unicode.h doc comments) / BACKLOG.md for
 // the backtracking trace justifying this closed-form reduction: succeeds iff the maximal whitespace run
 // starting at `pos` contains at least one \r or \n, consuming up to and including the LAST one.
@@ -165,6 +177,9 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
     }
 
     auto vocab = std::unique_ptr<BpeVocab>(new BpeVocab());
+    const std::string pre_type = model.has_kv("tokenizer.ggml.pre") ? model.kv_str("tokenizer.ggml.pre") : "qwen2";
+    vocab->max_number_run_ = (pre_type == "llama3") ? 3 : 1;
+    vocab->add_bos_token_ = model.kv_bool("tokenizer.ggml.add_bos_token", false);
     vocab->tokens_ = model.kv_arr_str("tokenizer.ggml.tokens");
     vocab->token_to_id_.reserve(vocab->tokens_.size());
     for (size_t i = 0; i < vocab->tokens_.size(); ++i) {
@@ -195,7 +210,7 @@ std::vector<std::string> BpeVocab::pretokenize(const std::string& nfc_text) cons
     while (pos < n) {
         size_t end;
         if (match_contraction(cps, pos, end) || match_letter_run(cps, pos, end) ||
-            (is_number(cps[pos]) && (end = pos + 1, true)) || match_punct_run(cps, pos, end) ||
+            match_number_run(cps, pos, max_number_run_, end) || match_punct_run(cps, pos, end) ||
             match_ws_then_newline(cps, pos, end) || match_ws_not_followed_by_nonspace(cps, pos, end) ||
             match_ws_fallback(cps, pos, end)) {
             chunks.push_back(slice_utf8(cps, pos, end));
@@ -234,6 +249,9 @@ std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
     const auto& enc = byte_encoder();
 
     std::vector<int32_t> ids;
+    if (add_bos_token_ && bos_id_ >= 0) {
+        ids.push_back(bos_id_);
+    }
     for (const std::string& chunk : chunks) {
         std::vector<std::string> pieces;
         pieces.reserve(chunk.size());

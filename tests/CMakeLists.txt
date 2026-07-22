@@ -874,6 +874,13 @@ target_link_libraries(test_e2e_lfm2_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_mil_export COMMAND test_e2e_lfm2_mil_export)
 set_tests_properties(test_e2e_lfm2_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Same LFM2-350M monolithic export's new tokenizer.ggml.* KVs (EXPORT-BACKLOG.md item 4) --
+#     loom::BpeVocab::encode/decode checked against the real HF AutoTokenizer on the same checkpoint ---
+add_executable(test_e2e_lfm2_tokenizer test_e2e_lfm2_tokenizer.cpp)
+target_link_libraries(test_e2e_lfm2_tokenizer PRIVATE loom::engine)
+add_test(NAME test_e2e_lfm2_tokenizer COMMAND test_e2e_lfm2_tokenizer)
+set_tests_properties(test_e2e_lfm2_tokenizer PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Same LFM2-350M monolithic export, quantized to Q8_0 via the exporter's `quantize=` kwarg
 #     (EXPORT-BACKLOG.md item 6) -- verifies real per-logit closeness against the F32 reference above ---
 add_executable(test_e2e_lfm2_q8_0 test_e2e_lfm2_q8_0.cpp)

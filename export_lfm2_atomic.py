@@ -134,7 +134,9 @@ def main():
         mil_prog,
         output_path=out_path,
         architecture="lfm2",
-        profile="atomic"
+        profile="atomic",
+        tokenizer_dir=model_dir,
+        tokenizer_pre="llama3",
     )
     print(f"SUCCESS! Atomic model exported cleanly to: {out_path}")
 

@@ -13,20 +13,26 @@ class GgufModel;
 // Byte-level BPE vocabulary loaded from a GGUF's "tokenizer.ggml.*" KVs, llama.cpp's own "gpt2" schema
 // (distinct from Vocab's SentencePiece-unigram "t5" schema -- see vocab.h's doc comment, which already
 // reserves this exact split: "BPE's byte-to-'Ġ' convention... decode/encode differently"). Targets the
-// specific, fixed Qwen2/Qwen3 tokenizer.json pretokenizer convention (NFC normalize -> a fixed
+// specific, fixed Qwen2/Qwen3/LFM2-family tokenizer.json pretokenizer convention (NFC normalize -> a fixed
 // Unicode-category-aware regex split -> GPT2 byte-level mapping -> greedy BPE merge), confirmed directly
 // against the real tokenizer.json's `pre_tokenizer`/`normalizer`/`model` fields -- not a general BPE
-// framework for arbitrary tokenizer.json pretokenizer configurations.
+// framework for arbitrary tokenizer.json pretokenizer configurations. The regex is shared verbatim by both
+// families except for one alternative's number-run length, which is why `tokenizer.ggml.pre` is read and
+// dispatched on (llama.cpp's own convention for exactly this kind of per-model pretokenizer variant):
+// "qwen2" matches single digits only (`\p{N}`, no quantifier); "llama3" (LFM2's tokenizer.json uses this
+// exact same regex, confirmed directly) groups up to 3 consecutive digits (`\p{N}{1,3}`).
 class BpeVocab {
 public:
     // Returns nullptr if `model` has no "tokenizer.ggml.model" KV, or if it's present but not "gpt2"
     // (i.e. this model uses Vocab's SentencePiece-unigram schema instead -- callers should try both).
     static std::unique_ptr<BpeVocab> load(const GgufModel& model);
 
-    // NFC-normalizes `text` (loom::nfc_normalize), splits it via the fixed Qwen2-style pretokenizer
+    // NFC-normalizes `text` (loom::nfc_normalize), splits it via the fixed Qwen2/llama3-style pretokenizer
     // regex (hand-scanned against loom::is_letter/is_number -- see bpe_vocab.cpp), GPT2 byte-level-maps
     // each chunk's raw UTF-8 bytes, and greedily BPE-merges each chunk independently (merges never cross
-    // a pretokenizer chunk boundary, matching the reference tokenizer exactly).
+    // a pretokenizer chunk boundary, matching the reference tokenizer exactly). Prepends `bos_id_` first
+    // when the GGUF's "tokenizer.ggml.add_bos_token" KV is true (mirrors llama.cpp's own convention;
+    // absent this KV, defaults to false -- unchanged behavior for existing GGUFs that never wrote it).
     std::vector<int32_t> encode(const std::string& text) const;
 
     // Joins each id's piece text and reverses the GPT2 byte-level mapping back to raw UTF-8 bytes.
@@ -51,6 +57,8 @@ private:
     std::unordered_map<std::string, int32_t> merge_rank_; // key: piece_a + '\x01' + piece_b
     int32_t bos_id_ = -1;
     int32_t eos_id_ = -1;
+    bool add_bos_token_ = false;
+    size_t max_number_run_ = 1; // 1 for "qwen2" (default), 3 for "llama3" (LFM2's own pre-tokenizer type)
 };
 
 } // namespace loom

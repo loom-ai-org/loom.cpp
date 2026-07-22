@@ -15,7 +15,7 @@ Quick-reference for what's actually done vs. still open, before diving into each
 | 1. Numerical correctness (attention) | **RESOLVED**, now verified at genuinely dynamic length too (see item 3's latest update — a real GQA head-tiling bug, found and fixed) |
 | 2. Driver IR/codegen | **DONE** — `driver_ir.py` landed, all exporters rewired, 2 real bugs caught & fixed |
 | 3. Dynamic shapes | **DONE** — mechanism hardened, crash fixed (missing int->float CAST, found via `gdb`), numerical mismatch fixed (GQA repeat_kv fusion bug); `test_e2e_lfm2_mil_export` passes 10/10 |
-| 4. Tokenization | Not started (unchanged from original plan below) |
+| 4. Tokenization | **DONE** — native `BpeVocab` extended for LFM2 (grouped-digit "llama3" pretokenizer + BOS auto-prepend); exporter now writes `tokenizer.ggml.*` KVs; verified byte-for-byte against real HF `AutoTokenizer` |
 | 5. MIL primitive review | **Concrete bullets DONE** (incl. a real `op_equal` algebra bug found this round); broader heuristic audit deliberately deferred |
 | 6. Export-time quantization | **DONE** — LFM2-specific Q8_0 export verified numerically against the real F32 model; `test_e2e_lfm2_q8_0.cpp` committed as a regression test |
 
@@ -25,12 +25,15 @@ Quick-reference for what's actually done vs. still open, before diving into each
    deliberately not started, since these heuristics are shared by every model using these primitives
    (Whisper, Conformer-CTC, VITS, Matcha-TTS, SupertonicTTS, Kokoro), not just LFM2's MIL export path, so
    removing one needs per-model verification.
-2. **Item 4 (tokenization)**: not started at all — still just the recommendation/plan below, no code written.
+2. Item 2's own leftover atomic-partitioning mis-attribution bug (see item 2's writeup) — still not fixed,
+   still safely caught by `validate()`'s atomic→monolithic fallback. The only other previously-open item
+   (item 4, tokenization) is now done — see below.
 
 `tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for items 1+3 — it now
 passes 10/10 (both GGUF profiles, both tested prompt lengths, exact top-1 match against real HF).
 `tests/test_e2e_lfm2_q8_0.cpp` (already committed) is the regression test for item 6 — see that item's own
-section for detail.
+section for detail. `tests/test_e2e_lfm2_tokenizer.cpp` (already committed) is the regression test for item
+4 — see that item's own section for detail.
 
 ---
 
@@ -455,27 +458,68 @@ done is catalogued there. Not repeated here to avoid the two going stale indepen
 
 ---
 
-## 4. Tokenization
+## 4. Tokenization — DONE for LFM2 (GPT2-byte-level-BPE family); other families still future work
 
-**Decision (recommended, from prior discussion):** native C++ tokenizers, selected at load time via a
-GGUF KV (mirroring llama.cpp's own `tokenizer.ggml.model` convention, which `loom::BpeVocab`/`loom::Vocab`
-already partially implements for GPT2-BPE and SentencePiece). **Not** a Lua tokenization script as the
-default path — tokenization's core (ranked BPE merges, regex pre-tokenization) is a tight,
-performance-sensitive loop with almost no per-architecture branching, unlike model orchestration where
-Lua earns its keep. Doing it in Lua would mean inventing a whole new category of string/byte host bindings
-(regex split, merge-rank tables, UTF-8 handling) that still has to be implemented in C++ underneath, with
-no genericity payoff.
+**Status:** implemented for LFM2-350M specifically, using the existing `loom::BpeVocab` (GPT2-style
+byte-level BPE) family rather than a new one — confirmed LFM2's real `tokenizer.json` (`model.type ==
+"BPE"`, byte-level pretokenizer) is the *same* family Qwen3 already uses, just with a different
+pretokenizer regex variant and BOS-prepending behavior. No new tokenizer family (WordPiece, SentencePiece
+Unigram beyond what `loom::Vocab` already had, tiktoken-style) was needed for this model; those remain
+open for whenever a model that actually needs one is retrofitted (see this item's original plan, preserved
+below, for that future work).
 
-**Plan:**
-- Extend the export tooling to detect the source HF tokenizer's class (`tokenizer_config.json`'s
-  `tokenizer_class`, or `type(AutoTokenizer.from_pretrained(...))`) and serialize its vocab/merges/config
-  into the existing GGUF KV convention.
-- Extend `loom::Vocab`/add sibling classes to cover the remaining common tokenizer **families** (there are
-  only a handful in practice): WordPiece, SentencePiece Unigram (currently only BPE-style SentencePiece is
-  covered), tiktoken-style regex-BPE. This is a bounded, one-time cost per family, not per-model.
-- Reserve a Lua-driven tokenization path only as an escape hatch for genuinely exotic/custom tokenizers
-  that don't fit any known family — not the default, and not worth building out generically until a real
-  model actually needs it.
+**Two real gaps found in the existing `BpeVocab` class, both fixed (`include/loom/core/bpe_vocab.h`,
+`src/core/bpe_vocab.cpp`):**
+- **Pretokenizer regex was hardcoded to Qwen2/Qwen3's single-digit number-run alternative** (`\p{N}`, no
+  quantifier — confirmed by `test_bpe_vocab.cpp`'s own "12" case, which deliberately expects digit-by-digit
+  splitting). LFM2's real `tokenizer.json` pretokenizer regex groups up to 3 consecutive digits instead
+  (`\p{N}{1,3}`) — the exact same alternative llama.cpp's own "llama3" pretokenizer type uses (confirmed by
+  comparing the regex strings directly, not guessed). **Fix:** `BpeVocab::load` now reads the
+  already-written-but-previously-ignored `tokenizer.ggml.pre` KV and dispatches a `max_number_run_` (1 for
+  "qwen2"/default, 3 for "llama3") into a generalized `match_number_run` alternative, instead of the
+  hardcoded single-digit inline check.
+- **No BOS-token auto-prepending.** Qwen3 doesn't need one, so `BpeVocab::encode` never grew this behavior;
+  LFM2's `tokenizer_config.json` sets `add_bos_token: true` (its `TemplateProcessing` post-processor
+  prepends `<|startoftext|>`, id 1, to every sequence). **Fix:** added `add_bos_token_` (read from a new
+  `tokenizer.ggml.add_bos_token` KV, default `false` — matches llama.cpp's own KV name and preserves
+  existing behavior for every GGUF that never wrote it) and `BpeVocab::encode` now prepends `bos_id_` first
+  when set.
+
+**Exporter side (`tools/loom_mil_compiler/`):** new module `bpe_tokenizer_export.py`'s
+`write_bpe_vocab(writer, tokenizer_dir, pre_type="qwen2")` reads a real HF tokenizer directory's
+`tokenizer.json`/`tokenizer_config.json` directly (no `AutoTokenizer`/`tokenizers` dependency, same
+no-extra-dependency convention as `tools/convert_qwen3/qwen3_tokenizer.py`) and writes the
+`tokenizer.ggml.*` KVs — generalizing the existing (Qwen3-only) `write_bpe_vocab` in two ways this model's
+own tokenizer.json needed: (1) `model.merges` schema variance — LFM2's is a list of `[a, b]` pairs, not
+Qwen3's pre-joined `"a b"` strings, both now normalized to the latter; (2) an explicit `pre_type` param
+(not auto-detected from the regex — per this item's own original plan, tokenizer variant selection is a
+bounded, one-time per-model/family choice, not a generic regex-sniffing framework) and
+`tokenizer_config.json`'s `add_bos_token`, threaded through to `add_add_bos_token`/`add_bos_token_id`.
+`LoomGGUFExporter.write_gguf` (`exporter.py`) now calls this whenever a `tokenizer_dir=`/`LOOM_TOKENIZER_DIR`
+kwarg is supplied (no-op otherwise, so every other model's export is unaffected).
+`export_lfm2_atomic.py`/`export_lfm2_monolithic.py` now pass `tokenizer_dir=model_dir,
+tokenizer_pre="llama3"` to the backend call.
+
+**Verified:** re-ran `export_lfm2_monolithic.py` against the real checkpoint — the regenerated GGUF's KVs
+read back correctly (`tokenizer.ggml.model="gpt2"`, `.pre="llama3"`, 64400 tokens, 63683 merges,
+`bos_token_id=1`, `eos_token_id=7`, `add_bos_token=true`). `loom::BpeVocab::load` + `encode()` against this
+real GGUF produces **byte-for-byte identical token ids** to `AutoTokenizer.from_pretrained(...).encode(...)`
+on the same checkpoint for plain text, grouped-digit numbers ("2024"/"365"), a contraction ("don't"), and
+CJK — including the auto-prepended BOS token in every case. Committed as
+`tests/test_e2e_lfm2_tokenizer.cpp` (skips cleanly via `SKIP_RETURN_CODE 77` if the fixture isn't present,
+same convention as `test_e2e_lfm2_mil_export.cpp`), 13/13 checks pass. Full `ctest`: same single
+pre-existing unrelated failure as baseline (`test_e2e_lfm2_lua_driver`), zero new regressions.
+
+**Explicitly out of scope, still (unchanged from the original plan):** WordPiece, SentencePiece Unigram
+beyond `loom::Vocab`'s existing coverage, and tiktoken-style regex-BPE remain unimplemented — bounded,
+one-time work per family, to be done when a real model needs one. A Lua-driven tokenization escape hatch
+for genuinely exotic/custom tokenizers also remains unbuilt, on the same "not worth it until a model
+actually needs it" reasoning.
+
+*(Original plan, preserved for the still-open future-family work described above: extend the export
+tooling to detect the source HF tokenizer's class and serialize its vocab/merges/config into the GGUF KV
+convention; extend `loom::Vocab`/add sibling classes to cover WordPiece/Unigram/tiktoken-BPE, one bounded
+cost per family, not per-model; reserve a Lua-driven path only as an escape hatch for exotic tokenizers.)*
 
 ---
 
