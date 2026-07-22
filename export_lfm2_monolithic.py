@@ -134,7 +134,9 @@ def main():
         mil_prog,
         output_path=out_path,
         architecture="lfm2",
-        profile="monolithic"
+        profile="monolithic",
+        tokenizer_dir=model_dir,
+        tokenizer_pre="llama3",
     )
     print(f"SUCCESS! Monolithic model exported cleanly to: {out_path}")
 

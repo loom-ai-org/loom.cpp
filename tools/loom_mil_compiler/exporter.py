@@ -1556,6 +1556,11 @@ class LoomGGUFExporter:
         w = GGUFWriter(self.output_path, f"loom-{arch}")
         w.add_string("loom.architecture", arch)
 
+        tokenizer_dir = self.kwargs.get("tokenizer_dir") or os.environ.get("LOOM_TOKENIZER_DIR")
+        if tokenizer_dir:
+            from .bpe_tokenizer_export import write_bpe_vocab
+            write_bpe_vocab(w, tokenizer_dir, pre_type=self.kwargs.get("tokenizer_pre", "qwen2"))
+
         # Embed the Lua driver orchestration script
         w.add_string("model.driver_script", driver_script)
 
