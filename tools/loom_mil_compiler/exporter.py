@@ -687,6 +687,70 @@ class LoomGGUFExporter:
                     })
                 continue
 
+            if op_type == "matmul":
+                # MIL's matmul(x, y, transpose_x, transpose_y) computes X @ Y where X = x^T if
+                # transpose_x else x, Y = y^T if transpose_y else y (batched over leading dims). This is
+                # NOT the same op as ggml_mul_mat(A, B), which always contracts over ne0 of both operands
+                # and returns ne=[A.ne1, B.ne1, ...] -- i.e. it computes B_mat @ A_mat^T, not A_mat @
+                # B_mat. Forwarding MIL's x/y straight through as ggml_mul_mat(x, y) silently produces a
+                # transposed-but-same-shape (for square attention scores) or outright wrong-axis result,
+                # exactly the numerical-correctness bug tracked in EXPORT-BACKLOG.md item 1 -- confirmed
+                # by bisecting the real attention-score matmul (transpose_y=True) and the
+                # scores@value matmul (transpose_x=transpose_y=False) against HF's own SDPA inputs.
+                #
+                # Both combinations used by scaled_dot_product_attention's decomposition are handled
+                # explicitly below (derived from ggml_mul_mat's result.ne=[A.ne1,B.ne1,B.ne2,B.ne3]
+                # formula); any other combination is intentionally unsupported rather than silently wrong.
+                x_var_obj = op.inputs["x"]
+                y_var_obj = op.inputs["y"]
+                x_var = self.safe_name(x_var_obj.name)
+                y_var = self.safe_name(y_var_obj.name)
+                output_var = self.safe_name(op.outputs[0].name)
+
+                tx_var = op.inputs.get("transpose_x")
+                ty_var = op.inputs.get("transpose_y")
+                tx = bool(tx_var.val) if tx_var is not None and hasattr(tx_var, "val") else False
+                ty = bool(ty_var.val) if ty_var is not None and hasattr(ty_var, "val") else False
+
+                if not tx and ty:
+                    # X @ Y^T: both operands already share ne0 (the contracted/embedding axis) in their
+                    # natural layout, so this is a straight ggml_mul_mat(y, x) -- key-first, matching the
+                    # llama.cpp attention-score convention.
+                    nodes.append({
+                        "op": "MUL_MAT",
+                        "inputs": [resolve(y_var), resolve(x_var)],
+                        "outputs": [output_var]
+                    })
+                elif not tx and not ty:
+                    # X @ Y: Y needs its leading two ne axes swapped (and made contiguous) before it can
+                    # be used as ggml_mul_mat's first ("A") operand -- see the derivation in the comment
+                    # above. Composed as PERMUTE + CONT so the C++ side never has to guess this from
+                    # shapes alone.
+                    perm_var = output_var + "_mm_y_perm"
+                    cont_var = output_var + "_mm_y_cont"
+                    nodes.append({
+                        "op": "PERMUTE",
+                        "inputs": [resolve(y_var)],
+                        "outputs": [perm_var],
+                        "attrs": {"axes": [1, 0, 2, 3]}
+                    })
+                    nodes.append({
+                        "op": "CONT",
+                        "inputs": [perm_var],
+                        "outputs": [cont_var]
+                    })
+                    nodes.append({
+                        "op": "MUL_MAT",
+                        "inputs": [cont_var, resolve(x_var)],
+                        "outputs": [output_var]
+                    })
+                else:
+                    raise NotImplementedError(
+                        f"matmul op '{op.name}' has transpose_x={tx}, transpose_y={ty}, which no "
+                        "exporter composition handles yet (only transpose_x=False has been needed so far)."
+                    )
+                continue
+
             if op_type == "split":
                 # Compose split as multiple zero-copy VIEW slices
                 x_var = self.safe_name(op.inputs["x"].name)

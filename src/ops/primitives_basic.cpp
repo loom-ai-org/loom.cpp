@@ -73,18 +73,19 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
         a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
     }
     
-    // Dynamically heal transposed layouts where axis 0 and 1 are swapped
-    if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
-        a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
-        a = ggml_cont(pc.ctx, a);
-    } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
-        b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
-        b = ggml_cont(pc.ctx, b);
-    }
-    
+    // NOTE: an earlier revision of this function also had an "axis 0 and 1 swapped" healing branch here
+    // (permute+cont whichever operand looked transposed relative to the other, by ne[0]==other.ne[1] &&
+    // ne[1]==other.ne[0]). It was a band-aid for the attention-score MUL_MAT operand-order bug (see
+    // EXPORT-BACKLOG.md item 1): since ADD's operands here are the same fixed size in the common
+    // square-attention-mask case (n_tokens == n_tokens), that shape check can't actually distinguish
+    // "needs a swap" from "already correct", so once the exporter started emitting the correct MUL_MAT
+    // operand order/transposes directly (tools/loom_mil_compiler/exporter.py's "matmul" op_type
+    // handling), this heuristic started re-corrupting already-correct tensors instead of fixing broken
+    // ones. Removed rather than made smarter -- the real fix belongs at the exporter, which now knows
+    // the true layout instead of guessing from ambiguous shapes.
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
-    
+
     return {ggml_add(pc.ctx, a, b)};
 }
 

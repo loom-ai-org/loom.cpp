@@ -6,9 +6,75 @@ item's own recommendation.
 
 ---
 
-## 1. Finish the numerical-correctness investigation (attention scores)
+## 1. Numerical-correctness investigation (attention scores) — RESOLVED
 
-**Status:** narrowed to a specific, small span of ops. Not yet root-caused.
+**Status:** root-caused and fixed. Both atomic and monolithic LFM2-350M exports now match a real HF
+forward pass exactly (top-10 tokens identical at every checked position; max abs logit diff ~0.003 across
+all 65536 vocab entries at seq position 2, consistent with fp16 intermediate rounding, not a correctness
+bug).
+
+**Root cause:** `tools/loom_mil_compiler/exporter.py`'s generic `MUL_MAT` handling forwarded MIL's own
+`matmul(x, y, transpose_x, transpose_y)` operand order straight into `ggml_mul_mat(x, y)`, silently
+ignoring the `transpose_x`/`transpose_y` attributes entirely. `ggml_mul_mat(A, B)` has different semantics
+from MIL's `X @ Y` (it always contracts over `ne0` of both operands and returns `ne=[A.ne1, B.ne1, ...]`,
+i.e. computes `B_mat @ A_mat^T`, not `A_mat @ B_mat`), so getting the right numerical result requires
+choosing the correct operand order — and sometimes an explicit transpose — based on `transpose_x`/
+`transpose_y`, not just passing `x, y` through unchanged. Confirmed directly by monkeypatching
+`coremltools`'s own `_decompose_scaled_dot_product_attention` to inspect the actual MIL ops: LFM2's SDPA
+decomposition emits `matmul(x=query, y=key, transpose_y=True)` for the attention-score matmul and
+`matmul(x=softmax, y=value)` (no transpose) for the score×value matmul — both of which the old code-path
+mishandled.
+
+**Fix (`tools/loom_mil_compiler/exporter.py`):** added a dedicated `op_type == "matmul"` composition
+(alongside the existing dedicated `"linear"`/`"transpose"`/etc. handling) that explicitly derives the
+correct `ggml_mul_mat` call from `transpose_x`/`transpose_y`:
+- `transpose_x=False, transpose_y=True` (attention scores): emit `MUL_MAT(y, x)` — key-first, matching
+  the standard llama.cpp attention convention. Both operands already share `ne0` in their natural layout,
+  so no extra transpose node is needed.
+- `transpose_x=False, transpose_y=False` (score×value): `y` needs its leading two `ne` axes swapped and
+  made contiguous before it can be `ggml_mul_mat`'s first operand — composed as explicit `PERMUTE(axes=
+  [1,0,2,3])` + `CONT` nodes ahead of the `MUL_MAT`, rather than relying on C++-side shape guessing.
+- Any other `transpose_x`/`transpose_y` combination raises `NotImplementedError` rather than silently
+  doing the wrong thing (neither combination occurs in LFM2's SDPA decomposition today).
+
+**Second bug uncovered by the fix (`src/ops/primitives_basic.cpp`, `op_add`):** removed an "axis 0 and 1
+swapped" layout-healing heuristic (permute+cont whichever ADD operand looked transposed relative to the
+other, judged by `a.ne[0]==b.ne[1] && a.ne[1]==b.ne[0]`). It had been added as a band-aid for this exact
+bug in a prior commit. Because the attention-score tensor and the causal-mask constant are both `128×128`
+in the common case, that shape check can't distinguish "needs a swap" from "already correct" — so once the
+exporter started emitting the right `MUL_MAT` layout directly, this heuristic started **re-corrupting an
+already-correct tensor** instead of fixing a broken one (confirmed: removing it was necessary for
+`add_0`/`softmax_0` to read correctly after the exporter fix). Left the analogous heuristics in `op_mul`
+and `op_repeat` untouched — neither is exercised by the fixed code path, and removing them wasn't
+empirically justified the way `op_add`'s was.
+
+**Verification method (reusable for future bisection):** built a throwaway C++ harness (not committed)
+using `loom::GraphBuilder` directly against the exported GGUF — no Lua involved — that (a) truncates a
+copy of `layer_2`'s topology JSON at a chosen intermediate node name and reads back the raw output tensor,
+and (b) chains `embedding` → `layer_0..15` → `model_model_embedding_norm` → `output_head` (atomic profile)
+or runs the single monolithic topology directly, comparing final logits against a real HF forward pass.
+HF-side ground truth was captured by monkeypatching `transformers.integrations.sdpa_attention
+.sdpa_attention_forward` to snapshot its raw `query`/`key`/`value` inputs (pre-GQA-tile, pre-causal-mask),
+then recomputing `scale·Q @ Kᵀ + causal_mask` and `softmax(...) @ V` by hand in numpy — necessary because
+LFM2's HF path applies causal masking via SDPA's `is_causal=True` flag rather than an explicit additive
+mask tensor, so a naive "capture the mask argument" approach silently sees `mask=None`. Key pitfall hit
+along the way: `GraphBuilder` owns the `ggml_gallocr` backing the output tensor's data, so the builder
+must stay alive (or the output must be copied out) before it goes out of scope — a locally-scoped
+`GraphBuilder` returning `BuildResult` by value leaves `result.output` dangling.
+
+**Still open / not addressed by this fix:**
+- **Item 5's "broader ask"** (audit the remaining `primitives_basic.cpp` layout-healing heuristics in
+  `MUL_MAT`/`MUL`/`REPEAT`) is now more clearly warranted — this investigation directly confirmed that at
+  least one such heuristic (in `ADD`) was actively harmful once the exporter emitted correct layouts, not
+  just unnecessary. The `MUL_MAT` primitive's own three heuristics (in `op_mul_mat` itself) were not
+  re-examined here since the `matmul` fix routes correctly-shaped operands into it directly for the
+  attention path; whether they're still load-bearing for other ops/models is unverified.
+- Only LFM2-350M's specific SDPA decomposition shape was exercised. A model whose traced graph produces a
+  `matmul` with `transpose_x=True` (either alone or combined with `transpose_y=True`) will hit the new
+  `NotImplementedError` rather than silently miscompute — by design, but it means that combination still
+  needs a real derivation + test case when it's first encountered.
+
+---
 
 Verified against the real HF PyTorch model (`/home/flavio/Dev/models/lfm2-350m`, prompt tokens `[1,2,3]`
 padded to 128, comparing at sequence position 2) by bisecting layer-by-layer and then op-by-op inside a
