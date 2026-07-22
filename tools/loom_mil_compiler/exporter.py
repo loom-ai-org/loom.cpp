@@ -1,4 +1,5 @@
 import json
+import re
 import numpy as np
 from coremltools.converters.mil.mil import Block, Function, Operation, Var
 
@@ -17,6 +18,11 @@ _POSITION_INPUT_NAMES = {"cache_position", "position_ids"}
 # additive mask, the same "pass it explicitly so the traced model skips computing it internally" fix as
 # _POSITION_INPUT_NAMES -- see export_lfm2_*.py's own _causal_mask() comment).
 _CAUSAL_MASK_INPUT_NAMES = {"attention_mask"}
+
+# CoreML's own naming convention for a symbolic (dynamic) shape dimension -- always "is" followed by
+# digits (e.g. "is0", "is936"). Matched with \b so it only substitutes whole symbol tokens, never a
+# coincidental "is" substring inside a longer identifier.
+_DYNAMIC_SYMBOL_RE = re.compile(r"\bis\d+\b")
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -138,9 +144,19 @@ class LoomGGUFExporter:
                 # input-count-based heuristic tried here produced false positives on real, correct atomic
                 # slices. If a future model genuinely needs a second independent dynamic axis, that would
                 # surface as a numerical mismatch against the reference model, not a syntactic error here.
+                #
+                # Substituting each symbol OCCURRENCE (not the whole dim string) matters: a dim isn't
+                # always bare "is936" -- coremltools' own shape inference can report a full ARITHMETIC
+                # EXPRESSION over several such symbols, e.g. a reshape's "-1"-inferred axis surfacing as
+                # "is936*is937*is938*is939*is940/1024" (confirmed on LFM2's GQA key/value reshape, which
+                # crashed ggml_reshape_4d's element-count assertion once this was collapsed to the bare
+                # string "n_tokens", discarding the "/1024" entirely). SymbolEnv's own expression evaluator
+                # (src/core/symbol_env.cpp) supports `+ - * / ()`, so substituting every symbol occurrence
+                # with "n_tokens" and keeping the surrounding arithmetic intact lets GraphBuilder evaluate
+                # the whole expression correctly at build time instead.
                 dim_str = str(dim)
-                if "is" in dim_str:
-                    shape.append("n_tokens")
+                if _DYNAMIC_SYMBOL_RE.search(dim_str):
+                    shape.append(_DYNAMIC_SYMBOL_RE.sub("n_tokens", dim_str))
                 else:
                     shape.append(dim_str)
         
@@ -612,6 +628,60 @@ class LoomGGUFExporter:
             return "{" + ", ".join(map(str, val.flatten())) + "}"
         return "nil"
 
+    def _try_fuse_gqa_repeat_kv(self, tile_op, reshape_op, resolve):
+        """
+        Detects whether `tile_op` (whose consumer is `reshape_op`) matches HF's standard `repeat_kv()`
+        idiom -- a tile of a size-1 axis immediately merged back into an adjacent axis by a reshape --
+        and if so returns a composed REPEAT node dict fusing the pair. Returns None if the shapes don't
+        match this specific pattern (caller falls back to the generic per-op handling).
+
+        Derivation, per axis: prefer `reshape_op`'s own declared output dim IF it's "reliable" (doesn't
+        reference more than one distinct dynamic symbol -- see `_DYNAMIC_SYMBOL_RE`); this correctly
+        picks up the one axis that actually changes (the merged head count, always a clean static int).
+        Every OTHER axis -- confirmed empirically to be unreliable too, not just the merged one, once
+        `reps` isn't a compile-time constant (coremltools' shape algebra loses track of the seq-length
+        axis here as well, reporting it as an unresolvable multi-symbol product) -- falls back to
+        `tile_op`'s own pre-expand input shape instead, which is unaffected by any of this and reliable by
+        construction (repeat_kv()'s reshape never actually touches seq/head_dim/batch numerically).
+        """
+        pre_tile_x = tile_op.inputs.get("x")
+        if pre_tile_x is None:
+            return None
+        # `tile_op`'s own "x" is itself the output of the preceding unsqueeze (HF's repeat_kv() inserts
+        # the new axis via `[:, :, None, :, :]`, which traces as a MIL "expand_dims"), NOT the genuine
+        # pre-expand tensor -- walk back through it to find the tensor whose rank actually matches the
+        # reshape's own (merged) output rank.
+        producer = getattr(pre_tile_x, "op", None)
+        if producer is not None and producer.op_type == "expand_dims":
+            inner_x = producer.inputs.get("x") or producer.inputs.get("data")
+            if inner_x is not None:
+                pre_tile_x = inner_x
+        if not hasattr(pre_tile_x, "shape") or pre_tile_x.shape is None:
+            return None
+        pre_rank = len(pre_tile_x.shape)
+
+        out_var = reshape_op.outputs[0]
+        if not hasattr(out_var, "shape") or out_var.shape is None or len(out_var.shape) != pre_rank:
+            return None
+        out_shape = self.get_var_info(out_var)["shape"]
+        raw_out_dims = list(reversed(out_var.shape))
+        pre_shape = self.get_var_info(pre_tile_x)["shape"]
+
+        target_shape = []
+        for i in range(pre_rank):
+            raw_str = str(raw_out_dims[i])
+            if len(set(_DYNAMIC_SYMBOL_RE.findall(raw_str))) > 1:
+                target_shape.append(pre_shape[i])
+            else:
+                target_shape.append(out_shape[i])
+
+        return {
+            "op": "REPEAT",
+            "inputs": [resolve(self.safe_name(pre_tile_x.name))],
+            "outputs": [self.safe_name(out_var.name)],
+            "attrs": {"shape": target_shape},
+        }
+
     def generate_graph_topology(self, func: Function, func_name: str, ops_list=None, inputs_dict=None) -> dict:
         """
         Walks a heavy submodule MIL graph and serializes it to a static graph topology.
@@ -651,6 +721,11 @@ class LoomGGUFExporter:
         else:
             for name, var in inputs.items():
                 topo_inputs.append(self.get_var_info(var))
+
+        # Populated by the "tile" branch below when it fuses a tile+reshape GQA repeat_kv() pair into a
+        # single REPEAT node -- the "reshape"/"expand_dims"/"squeeze" branch checks this to skip
+        # re-emitting a (redundant, incorrect) node for a reshape op already handled that way.
+        fused_reshape_op_ids = set()
 
         for op in operations:
             op_type = op.op_type
@@ -1001,6 +1076,26 @@ class LoomGGUFExporter:
                 continue
 
             if op_type == "tile":
+                # GQA repeat_kv() fusion: HF's standard `repeat_kv()` idiom (used to tile K/V from
+                # num_key_value_heads up to num_attention_heads) traces as
+                # unsqueeze(new_axis) -> tile(new_axis, n_rep) -> reshape(merge new_axis into the
+                # adjacent one). When this tile's own `reps` isn't a compile-time constant (confirmed:
+                # coremltools reports `reps.val is None` here, because n_rep -- architecturally a FIXED
+                # hyperparameter -- gets computed via a runtime shape query during tracing anyway), the
+                # generic "tile" handling below silently treats every unreliable axis as rep_factor=1
+                # (a no-op), and the tile's own OUTPUT shape is symbolic in every axis too. Detect the
+                # fusable pattern up front (via the tile's single consumer) and compose a single native
+                # REPEAT directly from RELIABLE information -- the tile's own pre-expand input shape for
+                # every unchanged axis, and the downstream reshape's own reliably-inferred output shape
+                # for the one axis that actually changes -- entirely bypassing the poisoned intermediate.
+                child_ops = list(op.outputs[0].child_ops) if op.outputs else []
+                if len(child_ops) == 1 and child_ops[0].op_type == "reshape":
+                    fused_node = self._try_fuse_gqa_repeat_kv(op, child_ops[0], resolve)
+                    if fused_node is not None:
+                        nodes.append(fused_node)
+                        fused_reshape_op_ids.add(id(child_ops[0]))
+                        continue
+
                 # Map tile to REPEAT by calculating the target shape
                 x_var = self.safe_name(op.inputs["x"].name)
                 reps = op.inputs["reps"].val if "reps" in op.inputs and hasattr(op.inputs["reps"], "val") else [1]
@@ -1046,47 +1141,79 @@ class LoomGGUFExporter:
                 continue
 
             if op_type in ["reshape", "expand_dims", "squeeze"]:
-                # Map reshape/expand_dims/squeeze to RESHAPE with 1 input and static/dynamic shape attribute
+                if id(op) in fused_reshape_op_ids:
+                    # Already emitted as a single fused REPEAT by its producing "tile" op above.
+                    continue
+
+                # Map reshape/expand_dims/squeeze to RESHAPE with 1 input and a shape attribute derived
+                # from the op's own declared output shape.
                 x_var_obj = op.inputs.get("x") or op.inputs.get("data")
                 x_var = self.safe_name(x_var_obj.name)
-                
-                out_info = self.get_var_info(op.outputs[0])
-                target_shape = out_info["shape"]
-                
-                # Check for coremltools shape propagation bug (where product of target_shape doesn't match input elements)
-                x_info = self.get_var_info(x_var_obj)
-                target_prod = 1
-                for d in target_shape:
-                    try:
-                        d_val = 4 if d == "n_tokens" else int(d)
-                        target_prod *= d_val
-                    except ValueError:
-                        pass
-                
-                input_prod = 1
-                for d in x_info["shape"]:
-                    try:
-                        d_val = 4 if d == "n_tokens" else int(d)
-                        input_prod *= d_val
-                    except ValueError:
-                        pass
-                        
-                if target_prod != input_prod:
-                    # Override to safe shape based on input dimensions!
-                    # For LFM2 attention reshape, it is always ["1024", "n_tokens", "1"]
-                    if input_prod == 4096:
-                        target_shape = ["1024", "n_tokens", "1"]
-                
+
+                out_var = op.outputs[0]
+                out_info = self.get_var_info(out_var)
+                # Same ne-order reversal get_var_info applies, kept aligned 1:1 with out_info["shape"] so
+                # raw_dims[i] is the exact MIL-side (pre-substitution) source of out_info["shape"][i].
+                raw_dims = list(reversed(out_var.shape)) if hasattr(out_var, "shape") and out_var.shape is not None else []
+
+                x_info = self.get_var_info(x_var_obj) if hasattr(x_var_obj, "shape") and x_var_obj.shape is not None else None
+                out_rank = len(out_info["shape"])
+                in_rank = len(x_info["shape"]) if x_info is not None else -1
+
+                if x_info is not None and in_rank > out_rank:
+                    # A rank-REDUCING reshape (merging several trailing MIL axes -- i.e. several LEADING
+                    # ne-order axes -- into one). Coremltools' own output-shape inference for the merged
+                    # axis is fundamentally untrustworthy here: it isn't just that a single symbol might
+                    # be a genuinely-different static quantity reported symbolically (confirmed on LFM2's
+                    # attention-output reshape merging (heads=16, head_dim=64) into hidden_size=1024,
+                    # reported as a lone symbol that is NOT n_tokens); coremltools also renumbers even
+                    # perfectly-unchanged pass-through axes (confirmed: this reshape's own INPUT seq axis
+                    # and OUTPUT seq axis are two DIFFERENT symbol objects, despite being the identical
+                    # unchanged quantity) -- so there is no symbol-identity check that can tell "reliable"
+                    # apart from "unreliable" here, from the output's own shape alone. Instead, derive the
+                    # target POSITIONALLY from the input's OWN (reliable) shape: every ne-order axis
+                    # except the merged one is a direct, unchanged carry-over from the input at the
+                    # corresponding position; the merged axis (always ne-order axis 0, since merging
+                    # collapses the trailing MIL axes = leading ne-order axes) is a literal -1, delegating
+                    # to op_reshape's own numpy/PyTorch-style inference (src/ops/primitives_basic.cpp) --
+                    # correct by construction from the input's real total element count at build time.
+                    merge_count = in_rank - out_rank + 1
+                    target_shape = [-1] + list(x_info["shape"][merge_count:])
+                    inferred_count = 1
+                else:
+                    # Rank-preserving (or rank-increasing/split) reshape: a BARE pass-through symbol
+                    # (exactly one distinct symbol occupying the whole dim, no arithmetic) has
+                    # consistently been the genuine n_tokens quantity in every such case seen so far
+                    # (position_ids/cache_position reshapes, RoPE cos/sin, Q/K/V head-splits, etc.) --
+                    # unlike the rank-REDUCING merge case above, a split/pass-through doesn't fabricate a
+                    # NEW computed quantity the way a merge does, so there's no reason to distrust it.
+                    # Only a genuine multi-symbol ARITHMETIC EXPRESSION (2+ distinct symbols) is treated
+                    # as unreliable here, exactly as originally established.
+                    target_shape = []
+                    inferred_count = 0
+                    for i, d in enumerate(out_info["shape"]):
+                        raw_str = str(raw_dims[i]) if i < len(raw_dims) else d
+                        if len(set(_DYNAMIC_SYMBOL_RE.findall(raw_str))) > 1:
+                            target_shape.append(-1)
+                            inferred_count += 1
+                        else:
+                            target_shape.append(d)
+                if inferred_count > 1:
+                    raise NotImplementedError(
+                        f"reshape op '{op.name}' needs more than one inferred (multi-symbol) dimension "
+                        f"in target shape {out_info['shape']!r} -- RESHAPE only supports a single -1 entry."
+                    )
+
                 # Limit target shape strictly to 4D to satisfy GGML's maximum dimension limits
                 while len(target_shape) > 4 and target_shape[-1] == "1":
                     target_shape.pop()
                 if len(target_shape) > 4:
                     target_shape = target_shape[:4]
-                
+
                 nodes.append({
                     "op": "RESHAPE",
                     "inputs": [resolve(x_var)],
-                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "outputs": [self.safe_name(out_var.name)],
                     "attrs": {"shape": target_shape}
                 })
                 continue
@@ -1267,8 +1394,29 @@ class LoomGGUFExporter:
             "version": 1,
             "inputs": topo_inputs,
             "output": output_symbol,
-            "nodes": nodes
+            "nodes": self._prune_dead_nodes(nodes, output_symbol)
         }
+
+    def _prune_dead_nodes(self, nodes: list, output_symbol: str) -> list:
+        """
+        Removes topology nodes whose output is never consumed, directly or transitively, by the
+        topology's own declared output. GraphBuilder builds and COMPUTES every node unconditionally
+        regardless of whether anything uses its result -- so a subgraph orphaned by a fused/bypassed
+        composition (e.g. the GQA repeat_kv() fusion above, which computes the correct REPEAT directly
+        from reliable inputs and leaves the original tile's own "reps"-computation subgraph --
+        gather/concat/equal/select/div, all now unused -- entirely orphaned) isn't just wasted compute:
+        it can still crash. Confirmed empirically: that exact orphaned chain segfaulted during
+        ggml_backend_graph_compute despite having zero real consumers, because nothing ever validates an
+        unused node's own shapes/values are sane. Keeps only nodes reachable backward from the output.
+        """
+        needed = {output_symbol}
+        live = []
+        for node in reversed(nodes):
+            if any(o in needed for o in node["outputs"]):
+                live.append(node)
+                needed.update(node["inputs"])
+        live.reverse()
+        return live
 
     def _collect_mul_mat_weight_names(self) -> set:
         """Every MUL_MAT node's *first* input, across all topologies -- the weight-first argument per
@@ -1284,9 +1432,36 @@ class LoomGGUFExporter:
                     names.add(node["inputs"][0])
         return names
 
+    def _prune_dead_weights(self) -> None:
+        """
+        Drops any `self.weights` entry never referenced as an input by any surviving topology node.
+        `generate_graph_topology`'s "const" handling unconditionally serializes EVERY MIL const op
+        (below the >100-element inline threshold) as a GGUF weight tensor -- including incidental
+        attribute-only constants (e.g. a "matmul" op's own `transpose_x`/`transpose_y` boolean flags,
+        already consumed directly via `.val` in Python by the dedicated "matmul" composition and never
+        emitted as a node input reference) that are not real model weights at all and have no consumer
+        anywhere in the topology. Confirmed one such orphan (`_80_transpose_x_0`, GGUF-declared with an
+        empty `shape=[]`, i.e. a genuine zero-rank scalar tensor) sitting immediately before a real,
+        actually-used weight (`const_2_to_fp16`, LFM2's RoPE inverse-frequency table) in tensor-declaration
+        order -- and a real, reproducible crash computing a MUL_MAT against that exact real weight,
+        consistent with a degenerate zero-byte allocation for the dead scalar corrupting the next
+        tensor's backing memory. Pruning these (same principle as `_prune_dead_nodes`) is correct
+        regardless of whether it's this crash's full root cause: a weight nothing reads should never be
+        written to the GGUF at all.
+        """
+        referenced = set()
+        for topo in self.topologies.values():
+            for node in topo.get("nodes", []):
+                referenced.update(node.get("inputs", []))
+        dead = [name for name in self.weights if name not in referenced]
+        for name in dead:
+            del self.weights[name]
+
     def write_gguf(self, driver_script: str):
         from gguf import GGUFWriter
         import os
+
+        self._prune_dead_weights()
 
         arch = self.kwargs.get("architecture") or os.environ.get("LOOM_ARCH", "mil_model")
         w = GGUFWriter(self.output_path, f"loom-{arch}")

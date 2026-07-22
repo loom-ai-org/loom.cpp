@@ -129,6 +129,21 @@ Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {ggml_arange(pc.ctx, start, end, step)};
 }
 
+// ggml_sub(x, y) requires x's shape to be the OUTPUT/target shape, with y merely repeated into it (see
+// ggml.c's own ggml_sub_impl: `GGML_ASSERT(ggml_can_repeat(b, a))`, i.e. b must be repeatable INTO a, never
+// the reverse). MIL's comparison ops place no such constraint on which operand is x vs y, so computing the
+// difference in the "wrong" direction (smaller operand first) crashes outright the moment the two operands
+// genuinely differ in size -- confirmed as a real, reproducible crash (EXPORT-BACKLOG.md item 3: LFM2's
+// dynamic-shape export hits an `EQUAL` comparing a small per-axis concat against a scalar constant).
+// Returns `x - y`, correctly broadcast regardless of which operand is larger, mirroring the same
+// "commutative swap to the larger operand" convention op_add/op_mul already use in primitives_basic.cpp.
+ggml_tensor* sub_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
+    if (ggml_nelements(y) > ggml_nelements(x)) {
+        return ggml_neg(ctx, ggml_sub(ctx, y, x));
+    }
+    return ggml_sub(ctx, x, y);
+}
+
 // ggml's own CPU kernel for STEP is a STRICT inequality (ggml-cpu/unary-ops.cpp: `op_step(x) = (x > 0.f)
 // ? 1.f : 0.f`, i.e. step(0) = 0), not `x >= 0`. So `step(b-a)` alone computes strict "a < b" (correct for
 // LESS, but wrong for LESS_EQUAL: at a==b it must be true, but step(0)=0 gives false). less_equal/
@@ -137,41 +152,45 @@ Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
 Outputs op_less_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("less_equal", in, 2);
     // a <= b <=> NOT(a > b) <=> 1 - step(a - b)
-    ggml_tensor* gt = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]));
+    ggml_tensor* gt = ggml_step(pc.ctx, sub_broadcast(pc.ctx, in[0], in[1]));
     return {ggml_scale_bias(pc.ctx, gt, -1.0f, 1.0f)};
 }
 
 Outputs op_greater_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("greater_equal", in, 2);
     // a >= b <=> NOT(b > a) <=> 1 - step(b - a)
-    ggml_tensor* lt = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]));
+    ggml_tensor* lt = ggml_step(pc.ctx, sub_broadcast(pc.ctx, in[1], in[0]));
     return {ggml_scale_bias(pc.ctx, lt, -1.0f, 1.0f)};
 }
 
 Outputs op_less(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("less", in, 2);
     // a < b <=> b - a > 0 <=> step(b - a)
-    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]))};
+    return {ggml_step(pc.ctx, sub_broadcast(pc.ctx, in[1], in[0]))};
 }
 
 Outputs op_greater(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("greater", in, 2);
     // a > b <=> a - b > 0 <=> step(a - b)
-    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]))};
+    return {ggml_step(pc.ctx, sub_broadcast(pc.ctx, in[0], in[1]))};
 }
 
 Outputs op_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("equal", in, 2);
-    // a == b <=> step(a - b) * step(b - a)
-    ggml_tensor* sa = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]));
-    ggml_tensor* sb = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]));
-    return {ggml_mul(pc.ctx, sa, sb)};
+    // a == b <=> NOT(a > b) AND NOT(a < b) <=> (1 - step(d)) * (1 - step(-d)), where d = a - b.
+    // NOTE: the previous formula (step(a-b) * step(b-a)) was simply wrong, independent of any
+    // broadcasting concern: step(x) * step(-x) requires x>0 AND -x>0 simultaneously, which is never
+    // true, so it evaluated to 0 (false) for EVERY input, including a==b.
+    ggml_tensor* d = sub_broadcast(pc.ctx, in[0], in[1]);
+    ggml_tensor* not_gt = ggml_scale_bias(pc.ctx, ggml_step(pc.ctx, d), -1.0f, 1.0f);
+    ggml_tensor* not_lt = ggml_scale_bias(pc.ctx, ggml_step(pc.ctx, ggml_neg(pc.ctx, d)), -1.0f, 1.0f);
+    return {ggml_mul(pc.ctx, not_gt, not_lt)};
 }
 
 Outputs op_not_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("not_equal", in, 2);
     // a != b <=> step(abs(a - b))
-    return {ggml_step(pc.ctx, ggml_abs(pc.ctx, ggml_sub(pc.ctx, in[0], in[1])))};
+    return {ggml_step(pc.ctx, ggml_abs(pc.ctx, sub_broadcast(pc.ctx, in[0], in[1])))};
 }
 
 Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
