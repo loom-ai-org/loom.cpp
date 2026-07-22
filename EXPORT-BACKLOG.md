@@ -6,7 +6,7 @@ item's own recommendation.
 
 ---
 
-## Status snapshot (items 2/3/5/6 session)
+## Status snapshot (items 2/3/5/6, across two sessions)
 
 Quick-reference for what's actually done vs. still open, before diving into each item's own detail below.
 
@@ -14,22 +14,33 @@ Quick-reference for what's actually done vs. still open, before diving into each
 |---|---|
 | 1. Numerical correctness (attention) | RESOLVED (prior session) |
 | 2. Driver IR/codegen | **DONE** — `driver_ir.py` landed, all exporters rewired, 2 real bugs caught & fixed |
-| 3. Dynamic shapes | **Mechanism DONE**, **LFM2 numerics OPEN** — root-caused to `op_equal` (see item 3) |
-| 4. Tokenization | Not touched this session (unchanged from prior plan) |
-| 5. MIL primitive review | **Concrete bullets DONE**; broader heuristic audit deliberately deferred |
-| 6. Export-time quantization | **Code DONE**; LFM2-specific numerical verification blocked on item 3 |
+| 3. Dynamic shapes | **Mechanism substantially hardened, 7 real bugs fixed, 1 deep issue remains** (see item 3) |
+| 4. Tokenization | Not started (unchanged from original plan below) |
+| 5. MIL primitive review | **Concrete bullets DONE** (incl. a real `op_equal` algebra bug found this round); broader heuristic audit deliberately deferred |
+| 6. Export-time quantization | **Code DONE**; LFM2-specific numerical verification still blocked on item 3's last issue |
 
-**To fully close out this session's remaining work, in dependency order:**
-1. Root-cause + fix `op_equal`'s (and siblings') missing broadcast handling — item 3's own section below has
-   the full repro recipe, working hypothesis, and two candidate fix locations.
-2. Re-run item 1's own bisection-against-real-HF technique at a genuinely dynamic length once (1) stops
-   crashing, to confirm values (not just shapes) are correct.
-3. Regenerate a quantized LFM2 export and verify it against the now-working F32 baseline (item 6), the same
-   way `test_e2e_qwen3_q8_0.cpp` verifies against `test_e2e_qwen3.cpp`.
-4. `tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for all of the above —
-   it should go from skipping (no fixture) to passing once 1-2 land; no test changes needed.
-5. Item 5's "broader ask" (auditing `primitives_basic.cpp`'s layout-healing heuristics) and item 4
-   (tokenization) remain explicitly out of scope / unstarted — pick up separately, not blocking the above.
+**What's actually missing right now, in dependency order:**
+1. **The one open bug** (item 3): a null-function-pointer crash inside a ggml worker thread, bisected to a
+   precise 5-node repro (RoPE's inverse-frequency `MUL_MAT` against a real GGUF-loaded weight). Everything
+   below is blocked on this. See item 3's own section for the exact repro, everything already ruled out, and
+   the prime remaining suspects — a real debugger (`gdb`/`lldb`, neither available in this environment)
+   would very likely resolve it quickly via a core dump backtrace.
+2. **A fresh numerical-correctness pass** (item 1's own bisection-against-real-HF technique, at a genuinely
+   dynamic, non-128, unpadded length) once (1) stops crashing — a shape/build fix alone only proves the
+   graph builds, not that the values are right.
+3. **LFM2-specific quantization verification** (item 6): the code is written and mirrors an already-proven
+   pattern (Qwen3-0.6B-Base), but has never actually been run against a working LFM2 export + compared,
+   because (1)/(2) block producing one.
+4. **Item 5's "broader ask"**: audit `primitives_basic.cpp`'s ADD/MUL/MUL_MAT/REPEAT layout-healing
+   heuristics for continued necessity now that the exporter emits correct layouts directly for more cases —
+   deliberately not started, since these heuristics are shared by every model using these primitives
+   (Whisper, Conformer-CTC, VITS, Matcha-TTS, SupertonicTTS, Kokoro), not just LFM2's MIL export path, so
+   removing one needs per-model verification.
+5. **Item 4 (tokenization)**: not started at all — still just the recommendation/plan below, no code written.
+
+`tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for (1)+(2) — it'll go from
+skipping (no fixture present) to passing once the crash is resolved and values are confirmed; no test
+changes needed to make that happen.
 
 ---
 
@@ -278,112 +289,127 @@ reproducible crash (`ggml_get_rows`'s own `a->ne[2] == b->ne[1]` assertion) once
 made that coincidence stop holding. **Fix:** take a zero-copy `ggml_view_1d(..., 4, 0)` of the custom-op's
 output before casting, giving downstream consumers the actual small shape-vector they expect.
 
-**Still open, now root-caused to a specific primitive family (not just "a SUB somewhere"):** at a
-genuinely dynamic prompt length (e.g. 3 tokens), `GraphBuilder::build` crashes on `ggml_sub`'s own
-`GGML_ASSERT(ggml_can_repeat(b, a))`. Root-caused by temporarily instrumenting `build_node`
-(`src/core/graph_builder.cpp`) to print every ADD/MUL/SUB topology node's operand names + `ne` just before
-dispatch, then running `test_e2e_lfm2_mil_export` against a real `lfm2_350m_monolithic.gguf` — the crash
-does **not** come from a topology-level `"SUB"` node at all (the last node printed before the abort is an
-ordinary RoPE-rotate-half `ADD`, `ne=[64,3,8,1]` on both sides, which is fine). `addr2line` on the
-backtrace's immediate `ggml_sub` caller resolved to `loom::(anonymous namespace)::op_equal` in
-`src/ops/primitives_mil.cpp`:
+**Update (follow-up session, "solve item 3"): 7 more real bugs found and fixed.** The `op_equal` crash
+documented above was chased all the way through; fixing it (and everything it led to) surfaced a chain of
+further real, previously-latent bugs. All of the following are now fixed and committed:
 
-```cpp
-Outputs op_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
-    expect_n_inputs("equal", in, 2);
-    ggml_tensor* sa = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]));   // <-- crashes here
-    ggml_tensor* sb = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]));
-    return {ggml_mul(pc.ctx, sa, sb)};
-}
+1. **`op_equal`'s algebra was simply wrong, independent of any broadcasting concern.** The old formula
+   `step(a-b) * step(b-a)` requires `x>0 AND -x>0` simultaneously for the SAME `x`, which is never true —
+   it evaluated to 0 (false) for every input, including `a==b`. Fixed to the correct complement formula:
+   `d = a-b`; `equal = (1 - step(d)) * (1 - step(-d))`.
+2. **The whole comparison-op family had a real broadcast-direction bug**, not just `EQUAL`. `ggml_sub(x, y)`
+   requires `x`'s shape to be the *output* shape with `y` merely repeated into it (`ggml_can_repeat(b, a)`
+   in `ggml.c`) — it can only broadcast a *smaller* `y` up into a *larger* `x`, never the reverse. `EQUAL`
+   computed `b-a` in its second term (with `b` sometimes larger), and `LESS`/`GREATER` computed their one
+   `ggml_sub` call with an arbitrary operand order MIL itself doesn't constrain. Confirmed as a real,
+   reproducible crash via `ggml_can_repeat` once `cache_position` became a real dynamic input (see below —
+   before that, this code path was never live). **Fix:** added a `sub_broadcast(x, y)` helper in
+   `primitives_mil.cpp` that always orients the `ggml_sub` call correctly regardless of which operand is
+   larger (negating the result if it had to swap), and every comparison op now goes through it.
+3. **`RESHAPE`'s target-shape derivation needed a real algorithm, not string substitution** — the earlier
+   fix in this file (collapse any symbolic dim to `n_tokens`) turned out to be unsound in a way deeper than
+   "multi-symbol expressions are unreliable": a **lone** symbol isn't reliably `n_tokens` either.
+   Coremltools reused a fresh, unrelated symbol for a reshape merging `(heads=16, head_dim=64)` into
+   `hidden_size=1024` — a genuinely static value reported as one opaque symbol, not `n_tokens` at all — and
+   it renumbers symbols even for provably-unchanged pass-through axes (confirmed: a reshape's own input and
+   output seq axes were two different symbol objects for the identical, unchanged quantity). There is no
+   symbol-identity check that can tell these apart from the output shape alone. **Fix:** two different
+   rules depending on whether the reshape changes rank. Rank-reducing merges (fewer output axes than input)
+   now derive their target *positionally* from the input's own (reliable) shape for every unchanged axis,
+   with a literal `-1` (delegating to `op_reshape`'s already-existing numpy/PyTorch-style inferred-dimension
+   support) for the one axis that's actually computed. Rank-preserving/-increasing reshapes keep the
+   original "substitute lone symbols, `-1` for genuine multi-symbol products" rule, which is correct for
+   that case (splits and pass-throughs don't fabricate new computed quantities the way a merge does).
+4. **HF's `repeat_kv()` GQA-tiling idiom (`unsqueeze → tile → reshape-merge`) needed a dedicated fusion.**
+   Its `tile` op's own `reps` value isn't a compile-time constant under genuinely dynamic tracing (`reps.val
+   is None`, confirmed) — not because `n_rep` is actually dynamic (it's a fixed architectural
+   hyperparameter), but because PyTorch's `.expand()` bundles it into one tensor alongside genuinely dynamic
+   sizes, poisoning the whole thing. The existing "tile" composition's `if rep_factor is None: rep_factor =
+   1` fallback then silently treated the real tiling axis as a no-op. **Fix:** `_try_fuse_gqa_repeat_kv` in
+   `exporter.py` detects this exact pattern (via the tile's single consumer) and composes one native
+   `REPEAT` directly from reliable information — the tile's own pre-expand input shape for every unchanged
+   axis, the downstream reshape's own reliable output shape for the one axis that changes — bypassing the
+   poisoned intermediate entirely.
+5. **`GraphBuilder` unconditionally builds and *computes* every topology node, whether or not anything
+   uses its output** — and that's not just wasted compute. Fusing tile+reshape (above) orphans the
+   original tile's own `reps`-computation subgraph (`gather`/`concat`/`equal`/`select`/`div`), and that
+   orphaned subgraph, despite having zero real consumers, **crashed on its own** during
+   `ggml_backend_graph_compute`. **Fix:** `_prune_dead_nodes` in `exporter.py` does a backward-reachability
+   pass from the topology's declared output after all nodes are generated, dropping anything unreachable —
+   814 nodes survived out of 1040 for LFM2's monolithic export.
+6. **The same problem, for weights.** `generate_graph_topology`'s `const`-handling unconditionally
+   serializes every MIL `const` op as a GGUF weight tensor, including incidental attribute-only constants
+   (a `matmul` op's own `transpose_x`/`transpose_y` booleans, a permutation-index array, etc.) that the
+   exporter's own dedicated compositions already consume directly via `.val` in Python and never reference
+   as a real node input. One such orphan (`_80_transpose_x_0`) had GGUF-declared `shape=[]` — a genuine
+   zero-rank scalar — sitting immediately before a real, actually-used weight in tensor-declaration order.
+   **Fix:** `_prune_dead_weights` in `exporter.py` drops any `self.weights` entry not referenced as an input
+   by any surviving topology node (257 tensors survived out of 923). Confirmed correct and worth keeping
+   regardless of the next item's outcome — a weight nothing reads should never be written to the GGUF.
+
+**Still open after all of the above — bisected to an extremely small, precise repro.** Even after every
+fix above, `test_e2e_lfm2_mil_export` still crashes, now with a different signature: a **null function
+pointer dereference inside a ggml worker thread** (`AddressSanitizer: SEGV on unknown address 0x0...pc
+0x0`, thread spawned via `GOMP_parallel`), not a clean assertion. Bisected using the same truncated-topology
+technique as item 1's own resolution, refined to do real backward-reachability pruning at each truncation
+point (not just a naive prefix cut) via a small standalone C++ harness that calls `GraphBuilder`/`GgufModel`
+directly (no Lua) — down to a **minimal 5-node repro**:
+
+```json
+{"op": "RESHAPE", "inputs": ["cache_position"], "outputs": ["position_ids"], "attrs": {"shape": ["n_tokens", "1"]}}
+{"op": "RESHAPE", "inputs": ["position_ids"], "outputs": ["_75"], "attrs": {"shape": ["n_tokens", "1", "1"]}}
+{"op": "PERMUTE", "inputs": ["_75"], "outputs": ["_80_cast_fp16_mm_y_perm"], "attrs": {"axes": [1, 0, 2, 3]}}
+{"op": "CONT", "inputs": ["_80_cast_fp16_mm_y_perm"], "outputs": ["_80_cast_fp16_mm_y_cont"]}
+{"op": "MUL_MAT", "inputs": ["_80_cast_fp16_mm_y_cont", "const_2_to_fp16"], "outputs": ["_80_cast_fp16"]}
 ```
 
-**The real bug:** `op_equal` (and, by the same construction, its siblings `op_not_equal`, `op_less`,
-`op_less_equal`, `op_greater`, `op_greater_equal` — all in `primitives_mil.cpp`) call `ggml_sub`/
-`ggml_abs(ggml_sub(...))` **directly on the raw operands with zero shape handling**. Contrast with `ADD`/
-`MUL`/`SUB` in `primitives_basic.cpp`, which all have explicit contiguity-fixing and (for `ADD`/`MUL`)
-broadcast/layout-healing logic before ever calling their ggml op. The comparison-op family has none of
-that. `ggml_sub(a, b)` requires ggml-style broadcasting (`b`'s every `ne[i]` must evenly divide `a`'s), not
-MIL/NumPy-style broadcasting (implicit rank-alignment/unsqueezing of size-1 leading dims) — if the two
-operands reaching `op_equal` have genuinely different ranks or non-divisible dims (which MIL's own
-broadcast rules would have handled transparently), `ggml_can_repeat` fails outright rather than silently
-computing the wrong thing.
+This is LFM2's RoPE inverse-frequency outer product (`inv_freq_expanded @ position_ids_expanded`, HF's own
+rotary embedding code), composed via the exporter's `matmul` `transpose_x=False, transpose_y=False` branch
+(item 1's own fix) — `const_2_to_fp16` is the real, GGUF-loaded `[1,32,1]` inverse-frequency table.
 
-**Working hypothesis for *why* an EQUAL op is even in this graph:** this only started reproducing after
-`cache_position` became a real, explicit dynamic input (see the fix above) — before that it didn't exist
-as a live tensor at all. LFM2's ShortConv layer does `conv_state[:, :, cache_position] = Bx` (an indexed
-scatter-assignment) inside `Lfm2ShortConv.slow_forward` (`modeling_lfm2.py` — grep `conv_state\[:, :,
-cache_position\]`). A traced `index_put_`/scatter of this shape is a classic pattern coremltools' PyTorch
-frontend decomposes into a one-hot mask (`arange(L_cache) == cache_position[:, None]` or similar) built
-via exactly `equal` + `select`, where `L_cache` is a **fixed** conv-cache constant and `cache_position` is
-the **dynamic** (now genuinely `n_tokens`-shaped) input — i.e. plausibly a real rank/shape mismatch between
-a static-size operand and a dynamic-size operand feeding this specific `EQUAL`, not a mistake introduced by
-this session's own changes.
+**What's been ruled out, each confirmed by an isolated standalone repro (a tiny hand-written `ggml`
+program, no `GraphBuilder`/`GgufModel` involved):**
+- Plain `ggml_mul_mat` on tensors of the exact same shapes (`[1,3,1,1]` × `[1,32,1,1]`) with fresh
+  synthetic data: works fine.
+- The full `PERMUTE`→`VIEW`×2→`MUL`(const)→`CONCAT`(self)→`MUL`(broadcast) chain used elsewhere in the same
+  RoPE computation, with synthetic data: works fine.
+- Self-`CONCAT` (`ggml_concat(x, x, dim)`, the standard `torch.cat([freqs, freqs])` RoPE trick) in
+  isolation: works fine.
+- Reducing thread count to 1 (`ggml_backend_cpu_set_n_threads(backend, 1)`): crash persists, so it is not
+  purely a threading race, despite the worker-thread signature.
+- Dead-node/dead-weight pruning (items 5-6 above): both real, valuable fixes, but neither changes this
+  crash. Confirmed by testing before AND after landing each.
+- This is **not the same bug** as `test_e2e_lfm2_lua_driver`'s own pre-existing failure (the bespoke-path
+  test that was already failing before this session started) — confirmed by running that test under
+  AddressSanitizer too: it hits a clean `GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0))`
+  at a completely different call site, not a null-pointer/thread crash. Two separate, unrelated bugs.
 
-**Recommended next steps to close this out** (in order):
-1. Confirm the hypothesis: reuse the exact bisection technique above (temporarily re-add the `build_node`
-   print — or better, extend it once and keep it behind a `LOOM_DEBUG_TOPOLOGY_SHAPES` env var — filtered
-   to `node.op == "EQUAL"`) and check whether the two operand `ne`s at the crash are exactly
-   `[L_cache,1,1,1]`-vs-`[n_tokens,1,1,1]`-shaped (or similar), then trace `gguf`'s topology JSON backward
-   from that node's `inputs` to confirm one truly comes from `cache_position` and the other from a `range_1d`
-   over a fixed `L_cache`.
-2. Once confirmed, the fix belongs in one of two places (prefer the first — narrower blast radius, matches
-   this codebase's stated preference for "correct exporter-side layout math over runtime guessing" already
-   used for `matmul`/`transpose`, see item 1 above):
-   - **Exporter-side (`tools/loom_mil_compiler/exporter.py`):** give `"equal"`/`"not_equal"`/`"less"`/
-     `"less_equal"`/`"greater"`/`"greater_equal"` the same kind of dedicated `op_type ==`-branch composition
-     `matmul`/`transpose` already get — insert explicit `RESHAPE`/broadcast-alignment nodes ahead of the
-     comparison when MIL's own operand ranks/shapes require it, derived from the *actual* MIL op's declared
-     input shapes (which are known at export time), rather than trusting operands to already be
-     ggml-broadcast-compatible.
-   - **Primitive-side (`src/ops/primitives_mil.cpp`):** alternatively/additionally, give `op_equal` and its
-     siblings the same contiguity/broadcast-healing treatment `op_add`/`op_mul` already have in
-     `primitives_basic.cpp` (this is the "cheaper, more defensive" fix, but perpetuates exactly the kind of
-     runtime shape-guessing item 5's "broader ask" already flags as risky — prefer the exporter-side fix if
-     the two turn out to be equivalent in effort).
-3. Re-run the *same* numerical-correctness bisection technique item 1's resolution used (a truncated
-   topology + real HF forward pass comparison) at a genuinely dynamic, non-128 length once this stops
-   crashing — a shape fix alone doesn't guarantee the *values* are right, only that the graph builds.
-4. Only then does item 6 (quantization) get a real LFM2-specific numerical verification: quantize the
-   now-working export, compare against the F32 baseline the same way `test_e2e_qwen3_q8_0.cpp` compares
-   against `test_e2e_qwen3.cpp` (measured max-abs-logit-diff, tolerance set from that measurement, logged
-   argmax-token agreement).
-5. `tests/test_e2e_lfm2_mil_export.cpp` (new, committed) is the intended regression test for all of the
-   above — it already exercises exactly this scenario (two genuinely different, non-128, unpadded prompt
-   lengths) and will start passing once steps 1-3 land; no changes needed to the test itself. It skips
-   cleanly today without the real LFM2 weights present (same convention as every other model-dependent e2e
-   test in this repo), so it's safe to leave committed in the meantime.
+**What this means:** something about the *real* `GraphBuilder`/`GgufModel` construction of this exact
+5-node graph — not the raw shapes/values, not the op sequence in isolation, not threading, not the two dead
+tensors already found — triggers this. Prime remaining suspects, in order of how cheap they are to check:
+GGUF weight buffer alignment/adjacency for `const_2_to_fp16` specifically (it sits immediately after LFM2's
+268MB embedding table in tensor-declaration order — worth trying a deliberately reordered/padded GGUF to see
+if the crash moves or disappears); `ggml_gallocr`'s buffer-reuse decisions for this specific small-graph
+shape (try building with a much larger `compute_meta_bytes`/graph-size margin to see if a reuse decision
+changes); and the `ggml_map_custom1`-based custom ops used earlier in the same topology for RMSNorm's
+`RSQRT` (`op_rsqrt`, `primitives_basic.cpp`) interacting with gallocr in a way this minimal 5-node repro
+doesn't fully isolate (the crash was also reproducible with more RSQRT calls present upstream in a larger
+truncation; worth re-confirming it reproduces with *this exact* minimal 5-node topology specifically, since
+the bisection's last few steps focused on node count rather than re-verifying the very smallest cut still
+crashes standalone). A real debugger (`gdb`/`lldb`, neither available in this environment) would very likely
+resolve this quickly via a core dump backtrace — worth installing before spending more time on manual
+bisection.
 
-**Explicitly out of scope for this session** (time was spent on the driver-codegen/mechanism work items
-2/5/6 actually asked for): items 1-4 above. Treating LFM2's whole-model MIL export as fully numerically
-correct at arbitrary lengths is a dedicated investigation on the same scale item 1 itself required, not
-something to rush inside a pass whose primary ask was the IR rewrite, primitive fixes, and quantization
-plumbing.
+**Explicitly out of scope, still:** items 5's "broader ask" (auditing `primitives_basic.cpp`'s layout-healing
+heuristics) and item 4 (tokenization) remain untouched. Item 6's LFM2-specific quantization verification and
+a fresh HF numerical-correctness pass (item 1's own bisection technique, at a genuinely dynamic length)
+both remain blocked on the crash above — a shape/build fix alone won't confirm values are right, only that
+the graph builds and computes at all.
 
-**Problem:** `export_lfm2_atomic.py`/`export_lfm2_monolithic.py` trace with a **fixed** `(1, 128)` input
-shape rather than `ct.RangeDim`, unlike the bespoke `make_lfm2_gguf.py` (which already correctly uses
-`ct.RangeDim(1, 4096)` per submodule). Because of this, every exported slice's declared shape has `128`
-baked in as a literal, not the dynamic `n_tokens` symbol the rest of the pipeline (`get_var_info`'s
-`"is" in dim_str` check, `GraphBuilder::build(n_tokens, n_past)`) is designed to support. The current
-stopgap (added this round, in both `apply_monolithic_export` and `apply_atomic_export`) pads every prompt
-to the fixed length and slices out the right row — it works, but wastes compute (full 128-token forward
-pass for a 3-token prompt) and is exactly the kind of driver complexity Lua-as-orchestrator was supposed
-to make unnecessary in the first place (see LOOM_PROCEDURAL_GENERALIZATION.md's own framing: layers as
-subgraphs should let the driver instantiate each call at the *correct* dimension).
-
-**Plan:**
-- Switch `export_lfm2_atomic.py`/`export_lfm2_monolithic.py` (and the generic automatic-profile path in
-  `exporter.py` generally) to trace with `ct.RangeDim` on the sequence dimension, matching the bespoke
-  script's already-working approach.
-- Once shapes are genuinely symbolic, delete the static-padding branches in `apply_monolithic_export`/
-  `apply_atomic_export` entirely — the existing dynamic-`n_tokens` code path (the `else` branch that's
-  already there for when no static length is detected) should just work, calling every subgraph with the
-  real prompt length via `#first_input`.
-- Do this as part of (or right after) the IR/codegen rewrite in item 2 above — the padding branch is
-  exactly the kind of special-casing that gets simpler to delete once driver synthesis goes through a
-  validated IR instead of hand-woven strings.
-- Re-verify GQA tiling monkeypatch (`_robust_decompose_sdpa` in the export scripts) still works correctly
-  under genuinely dynamic/symbolic sequence lengths, not just the fixed-128 trace it's been exercised
-  against so far.
+*(The original problem statement and plan for this item — trace with `ct.RangeDim` instead of a fixed
+`(1,128)` shape, delete the static-padding stopgap, re-verify GQA tiling under dynamic lengths — is fully
+superseded by the "Status" and "Update" sections above: all of it is done, and everything found once it was
+done is catalogued there. Not repeated here to avoid the two going stale independently.)*
 
 ---
 
