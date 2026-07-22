@@ -17,21 +17,20 @@ Quick-reference for what's actually done vs. still open, before diving into each
 | 3. Dynamic shapes | **DONE** — mechanism hardened, crash fixed (missing int->float CAST, found via `gdb`), numerical mismatch fixed (GQA repeat_kv fusion bug); `test_e2e_lfm2_mil_export` passes 10/10 |
 | 4. Tokenization | Not started (unchanged from original plan below) |
 | 5. MIL primitive review | **Concrete bullets DONE** (incl. a real `op_equal` algebra bug found this round); broader heuristic audit deliberately deferred |
-| 6. Export-time quantization | **Code DONE**; LFM2-specific numerical verification now unblocked (item 3's fix landed) but not yet run |
+| 6. Export-time quantization | **DONE** — LFM2-specific Q8_0 export verified numerically against the real F32 model; `test_e2e_lfm2_q8_0.cpp` committed as a regression test |
 
 **What's actually missing right now, in dependency order:**
-1. **LFM2-specific quantization verification** (item 6): the code is written and mirrors an already-proven
-   pattern (Qwen3-0.6B-Base), and a working, numerically-correct LFM2 export now exists to verify it
-   against (items 1/3 are fully resolved) — just hasn't been run yet.
-2. **Item 5's "broader ask"**: audit `primitives_basic.cpp`'s ADD/MUL/MUL_MAT/REPEAT layout-healing
+1. **Item 5's "broader ask"**: audit `primitives_basic.cpp`'s ADD/MUL/MUL_MAT/REPEAT layout-healing
    heuristics for continued necessity now that the exporter emits correct layouts directly for more cases —
    deliberately not started, since these heuristics are shared by every model using these primitives
    (Whisper, Conformer-CTC, VITS, Matcha-TTS, SupertonicTTS, Kokoro), not just LFM2's MIL export path, so
    removing one needs per-model verification.
-3. **Item 4 (tokenization)**: not started at all — still just the recommendation/plan below, no code written.
+2. **Item 4 (tokenization)**: not started at all — still just the recommendation/plan below, no code written.
 
 `tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for items 1+3 — it now
 passes 10/10 (both GGUF profiles, both tested prompt lengths, exact top-1 match against real HF).
+`tests/test_e2e_lfm2_q8_0.cpp` (already committed) is the regression test for item 6 — see that item's own
+section for detail.
 
 ---
 
@@ -510,7 +509,53 @@ deliberately **not** touched — see its own note.
 
 ---
 
-## 6. Export-time quantization — IMPLEMENTED, LFM2 NUMERICAL VERIFICATION BLOCKED ON ITEM 3
+## 6. Export-time quantization — DONE, LFM2 NUMERICALLY VERIFIED
+
+**Update (follow-up session, "continue with item 6"): LFM2-specific numerical verification is complete.**
+With items 1/3 fully resolved (a working, numerically-correct F32 LFM2 export to compare against), ran a
+real `quantize="Q8_0"` monolithic export (`export_lfm2_monolithic.py`'s `backend(...)` call with
+`quantize="Q8_0"` added and a different `output_path`) — 93 of the model's matmul-weight tensors were
+quantized (every `MUL_MAT` node's weight operand, per `_collect_mul_mat_weight_names`), file size dropped
+from 1.42 GiB (F32) to 377 MiB (Q8_0). Loaded and ran cleanly — no crash, no NaN/Inf anywhere in the output
+— at both prompt lengths `test_e2e_lfm2_mil_export.cpp` uses:
+
+- **3-token prompt:** max abs logit diff (vs. the F32 reference, full ~65536-entry vocab, last sequence
+  position) = **1.52**. Top-1 flips (3523 → 5795) — expected, not a bug: this prompt's own F32 top-1/top-2
+  margin is only 0.135 logit units (see `test_e2e_lfm2_mil_export.cpp`'s own comment), far smaller than
+  Q8_0's quantization noise at this scale.
+- **7-token prompt:** max abs logit diff = **2.68**. Top-1 survives (both give token 2) — this prompt's F32
+  margin (2.873) is just barely larger than the measured diff.
+- Both diffs are a real, measured quantity — set as this backlog item's own test tolerance (below), not
+  guessed upfront, same discipline `test_e2e_qwen3_q8_0.cpp` used for its own (looser, 0.45–0.79) tolerance.
+  LFM2's larger diff is plausible: proportionally more of its ~350M parameters are matmul weights getting
+  quantized relative to Qwen3-0.6B's ratio, and its ShortConv+GQA architecture compounds error differently
+  across only 16 layers vs. Qwen3's 28 (fewer layers to "average out" per-layer quantization noise, though
+  this wasn't independently isolated — the diff is well within a bounded, sane range either way).
+- The atomic profile's own quantized export was also produced and checked (`export_lfm2_atomic.py` +
+  `quantize="Q8_0"`) — for LFM2 specifically it falls back to the monolithic path during export (the
+  pre-existing, already-documented atomic-partitioning heuristic bug from item 2's own writeup, unrelated to
+  quantization), so its results are identical to the monolithic case above; confirmed via
+  `test_e2e_lfm2_mil_export`'s own atomic/monolithic dual-profile harness pointed at both quantized files (8
+  of its 10 hard top-1 checks intentionally "fail" here — expected, since that test's tolerance is
+  zero-margin exact-match against F32 and was never meant to survive real quantization noise; it's a
+  correctness bar for the F32 path, not a quantization test).
+
+**Committed regression test: `tests/test_e2e_lfm2_q8_0.cpp`.** Mirrors `test_e2e_qwen3_q8_0.cpp`'s shape
+(skip cleanly via `SKIP_RETURN_CODE 77` if fixtures aren't present; measure real max-abs-logit-diff against
+an empirically-set tolerance; log-not-hard-assert argmax agreement, since Q8_0 is real lossy compression).
+Bypasses the driver's own `main(inputs)` entry point (which only returns an already-argmax'd token id) via
+a small ad-hoc Lua script — identical prologue to the real exported driver, but returns the raw logits
+tensor (with vocab size appended as its last element, since `LoomLuaBridge::call` only returns one flat
+array) instead of calling `loom.argmax_row` — letting the comparison happen on real per-logit values in
+C++. Registered in `tests/CMakeLists.txt` right after `test_e2e_lfm2_mil_export`. Tolerance set to `4.0`
+(comfortably above the measured 1.52/2.68 max, same "~1.5–2x observed max, tight enough to catch a genuine
+regression, not just 'doesn't crash'" reasoning as `test_e2e_qwen3_q8_0.cpp`'s own `1.5f`).
+
+**Verified:** `test_e2e_lfm2_q8_0` passes (22/22 checks: finite-value + per-prompt tolerance checks) with
+both fixtures present; skips cleanly (`77`) with neither present. Full `ctest`: same single pre-existing
+unrelated failure as baseline (`test_e2e_lfm2_lua_driver`), zero new regressions.
+
+---
 
 **Status:** implemented essentially as planned, porting the design already proven by
 `tools/quantize/quantize_gguf_q8_0.py` + `tests/test_e2e_qwen3_q8_0.cpp` (see `BACKLOG.md`'s "quantized
