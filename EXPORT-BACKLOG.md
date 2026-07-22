@@ -6,15 +6,15 @@ item's own recommendation.
 
 ---
 
-## Status snapshot (items 2/3/5/6, across three sessions)
+## Status snapshot (items 2/3/5/6, across four sessions)
 
 Quick-reference for what's actually done vs. still open, before diving into each item's own detail below.
 
 | Item | Status |
 |---|---|
 | 1. Numerical correctness (attention) | **RESOLVED**, now verified at genuinely dynamic length too (see item 3's latest update — a real GQA head-tiling bug, found and fixed) |
-| 2. Driver IR/codegen | **DONE** — `driver_ir.py` landed, all exporters rewired, 2 real bugs caught & fixed |
-| 3. Dynamic shapes | **DONE** — mechanism hardened, crash fixed (missing int->float CAST, found via `gdb`), numerical mismatch fixed (GQA repeat_kv fusion bug); `test_e2e_lfm2_mil_export` passes 10/10 |
+| 2. Driver IR/codegen | **DONE** — `driver_ir.py` landed, all exporters rewired, 2 real bugs caught & fixed; its own leftover atomic-partitioning mis-attribution bug (below) is now fixed too, so the atomic profile actually produces a real 21-topology export instead of silently falling back to monolithic |
+| 3. Dynamic shapes | **DONE** — mechanism hardened, crash fixed (missing int->float CAST, found via `gdb`), numerical mismatch fixed (GQA repeat_kv fusion bug); `test_e2e_lfm2_mil_export` passes for both profiles |
 | 4. Tokenization | **DONE** — native `BpeVocab` extended for LFM2 (grouped-digit "llama3" pretokenizer + BOS auto-prepend); exporter now writes `tokenizer.ggml.*` KVs; verified byte-for-byte against real HF `AutoTokenizer` |
 | 5. MIL primitive review | **Concrete bullets DONE** (incl. a real `op_equal` algebra bug found this round); broader heuristic audit deliberately deferred |
 | 6. Export-time quantization | **DONE** — LFM2-specific Q8_0 export verified numerically against the real F32 model; `test_e2e_lfm2_q8_0.cpp` committed as a regression test |
@@ -25,15 +25,17 @@ Quick-reference for what's actually done vs. still open, before diving into each
    deliberately not started, since these heuristics are shared by every model using these primitives
    (Whisper, Conformer-CTC, VITS, Matcha-TTS, SupertonicTTS, Kokoro), not just LFM2's MIL export path, so
    removing one needs per-model verification.
-2. Item 2's own leftover atomic-partitioning mis-attribution bug (see item 2's writeup) — still not fixed,
-   still safely caught by `validate()`'s atomic→monolithic fallback. The only other previously-open item
-   (item 4, tokenization) is now done — see below.
 
-`tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for items 1+3 — it now
-passes 10/10 (both GGUF profiles, both tested prompt lengths, exact top-1 match against real HF).
-`tests/test_e2e_lfm2_q8_0.cpp` (already committed) is the regression test for item 6 — see that item's own
-section for detail. `tests/test_e2e_lfm2_tokenizer.cpp` (already committed) is the regression test for item
-4 — see that item's own section for detail.
+Item 2's own leftover atomic-partitioning mis-attribution bug is now **fixed** (see item 2's writeup for the
+two-bug root cause and fix). Every previously-open item (2, 4) is now done — the only remaining work is
+item 5's broader ask above.
+
+`tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for items 1+2+3 — it now
+registers every topology the GGUF actually declares (not a hardcoded single `"main_topo"` name), so it
+exercises a genuinely-partitioned atomic export as well as the monolithic one, both matching real HF top-1
+tokens at both tested prompt lengths. `tests/test_e2e_lfm2_q8_0.cpp` (already committed) is the regression
+test for item 6 — see that item's own section for detail. `tests/test_e2e_lfm2_tokenizer.cpp` (already
+committed) is the regression test for item 4 — see that item's own section for detail.
 
 ---
 
@@ -178,14 +180,61 @@ have produced a runtime crash or silently wrong Lua, never something visible at 
 - `apply_atomic_export`'s scope-based slice partitioning (item 1's own heuristic) mis-attributes an
   ungoverned op (here, one producing `position_ids`) to whichever slice happens to be "current" in
   iteration order, rather than the slice that actually needs it — surfaces as a `SubgraphCall` reading an
-  input no earlier statement ever defined. Not fixed (it's a partitioning-heuristic bug, out of scope for
-  this pass) — now caught by `validate()` and safely triggers the existing atomic→monolithic fallback
-  instead of producing broken Lua.
+  input no earlier statement ever defined. Not fixed at the time (it's a partitioning-heuristic bug, out of
+  scope for this pass) — caught by `validate()` and safely triggered the existing atomic→monolithic
+  fallback instead of producing broken Lua. **Now fixed — see "Update: item 2's own leftover
+  atomic-partitioning bug is FIXED" below.**
 - `transpile_operation`'s `cond` (MIL conditional) handling never bound the op's own output(s) to a Lua
   local at all — each branch only ever defined its own internal names, so any later use of the `cond`
   op's result read an undeclared Lua global (`nil`) at runtime. Fixed: the result name is now declared
   *before* the `if`/`else` via `LocalDecl` and plain-assigned (`Assign`, no `local`) from inside each arm,
   since Lua's block scoping means a `local` declared inside an `if`/`else` branch doesn't survive past it.
+
+**Update (follow-up session, "kill the bug of partitioning mentioned in item 2"): the leftover
+atomic-partitioning mis-attribution bug is FIXED.** Root cause turned out to be TWO compounding bugs in
+`apply_atomic_export` (`tools/loom_mil_compiler/exporter.py`), both in the "extract inputs/outputs
+interfaces for each sliced topology" step:
+
+1. **The mis-attribution itself.** A `SubgraphCall` only ever exposes ONE slice's output as
+   `last_op.outputs` (the single-output-per-topology convention the driver/engine actually supports). So a
+   var is only reachable by a LATER slice via legitimate `SubgraphCall` input-wiring if its producer op is
+   the designated LAST op of whichever slice originally owns it. Any op that is NOT its own slice's last op
+   — whether genuinely ungoverned (no torch scope at all) or a real-but-non-final interior op of a shared
+   multi-output slice — can never be read this way. Confirmed concretely on LFM2: RoPE's `cos`/`sin` are
+   both computed once, under one shared scope (`model.model.pos_emb`), with `sin` landing as that slice's
+   last op (correctly threaded to every attention layer as a real external input) but `cos` an interior op
+   of the *same* slice — every attention layer needing `cos` saw it as an external input nothing upstream
+   ever provided. **Fix:** for any producer op that is NOT its own slice's legitimate exposed output,
+   recursively pull it (and its own transitive dependencies, stopping at consts or another op that IS its
+   slice's legitimate output) into local copies inside EVERY slice that consumes it, instead of leaving it
+   live only in the one slice that happened to inherit it during partitioning. Safe to duplicate freely:
+   every such op is a pure function of consts/already-available inputs, so recomputing it per consuming
+   slice is redundant compute, never a correctness change — any resulting now-unused copy left in the
+   original "accidental host" slice is harmless, since item 3's `_prune_dead_nodes` already drops anything
+   unreachable from that topology's own declared output.
+2. **A second, real bug the first fix's own verification surfaced.** The replication/closure-walking code
+   only checked `isinstance(v, Var)` on each of an op's `inputs.values()` — but MIL ops like `concat`/`stack`
+   pass a LIST of Vars under one input key (e.g. `values`), not one Var per key. Confirmed concretely: the
+   `cos`→`concat`(`emb`)→`permute`(`freqs`) replication chain pulled in `concat` (reached via `cos`'s own
+   bare-Var `x` input) but never `concat`'s own `freqs` producer (only reachable through its list-valued
+   `values` input) — a real, reproducible runtime crash (`GraphBuilder: node 'CONCAT' references unresolved
+   input 'freqs_cast_fp16'`) once the first fix was in place and an actual atomic export was attempted.
+   **Fix:** a shared `_iter_input_vars(op)` helper that flattens list/tuple-valued inputs (mirroring
+   `generate_graph_topology`'s own already-existing `elif isinstance(v, (list, tuple))` handling), used
+   consistently by both the replication/closure code and the slice-external-input extraction loop.
+
+**Verified:** `~/.venvs/piper/bin/python3 export_lfm2_atomic.py` now succeeds with a genuine 21-topology
+atomic export (`embedding`, `model_model`, `model_model_pos_emb`, `layer_0`..`layer_15`,
+`model_model_embedding_norm`, `output_head`) — no `Warning: Automated atomic partitioning failed` fallback
+message at all, unlike every prior session. `test_e2e_lfm2_mil_export.cpp` itself needed a matching fix
+(`tests/test_e2e_lfm2_mil_export.cpp`): its harness registered a single hardcoded `"main_topo"` module name,
+which only ever existed because the atomic GGUF used to BE a silently-monolithic file (the same shape as
+the monolithic export) due to this exact bug. Updated to register every topology name the file actually
+declares (`model->topology_names()`, the same generic pattern `tools/loom_cli/main.cpp` already uses)
+instead of assuming one name — this is what a genuinely-partitioned atomic file requires. With that test fix,
+`test_e2e_lfm2_mil_export` passes for both the atomic and monolithic GGUFs (exact top-1 token match against
+real HF, both tested prompt lengths). Full `ctest`: same single pre-existing unrelated failure as baseline
+(`test_e2e_lfm2_lua_driver`), zero new regressions.
 
 **Bonus (scoped down from "a Python interpreter"):** implemented as `check_subgraph_calls()` above — a
 structural cross-check against the target topology's declared inputs, not a full IR-semantics interpreter
@@ -514,7 +563,17 @@ pre-existing unrelated failure as baseline (`test_e2e_lfm2_lua_driver`), zero ne
 beyond `loom::Vocab`'s existing coverage, and tiktoken-style regex-BPE remain unimplemented — bounded,
 one-time work per family, to be done when a real model needs one. A Lua-driven tokenization escape hatch
 for genuinely exotic/custom tokenizers also remains unbuilt, on the same "not worth it until a model
-actually needs it" reasoning.
+actually needs it" reasoning. Example models that would require each:
+- **WordPiece:** BERT and its close family (DistilBERT, MobileBERT, Electra) — BERT's original tokenizer
+  scheme, distinct from both SentencePiece and GPT2-BPE.
+- **SentencePiece Unigram, beyond `loom::Vocab`'s "t5" variant:** ALBERT or XLNet — same Unigram model
+  type, but different special-token/preprocessing conventions than T5's (mT5 would already work today,
+  same family `loom::Vocab` covers).
+- **tiktoken-style regex-BPE:** GPT-3.5/GPT-4 (`cl100k_base`/`o200k_base`) — OpenAI's `tiktoken` library
+  uses a different pretokenizer regex (PCRE-style with lookaheads, not the Unicode-category regex GPT2-BPE
+  uses) and a different merge-rank encoding than HF `tokenizers`' GPT2-BPE format. Among open-weight
+  models, the original Qwen (1st gen, before Qwen2/3 switched to HF `tokenizers`) also used `tiktoken`
+  directly.
 
 *(Original plan, preserved for the still-open future-family work described above: extend the export
 tooling to detect the source HF tokenizer's class and serialize its vocab/merges/config into the GGUF KV
