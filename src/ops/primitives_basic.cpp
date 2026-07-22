@@ -262,9 +262,18 @@ void shape_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, v
 
 Outputs op_shape(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SHAPE", in, 1);
-    // Returns a custom mapped tensor and casts it to I32 for datatype compatibility.
+    // ggml_map_custom1's dst is always dup-shaped from `a` (ggml_dup_tensor internally -- there's no
+    // variant that lets a custom op request a different output shape), but shape_custom_op only ever
+    // writes the first 4 int32 slots (a's ne[0..3]) regardless of dst's declared size. Downstream
+    // consumers (e.g. GET_ROWS extracting one dim via a gather) need a genuine small 4-element
+    // shape-vector, not something dup-shaped from the original input -- confirmed by a real crash
+    // otherwise (ggml_get_rows's own `a->ne[2] == b->ne[1]` assertion, since the un-viewed tensor's
+    // ne[2] equalled the ORIGINAL input's ne[2] rather than 1, whenever that happened to differ from the
+    // index tensor's own ne[1]). A zero-copy 1D view of just those first 4 elements is both correct and
+    // gives it the shape those consumers actually expect.
     ggml_tensor* f32_shape = ggml_map_custom1(pc.ctx, in[0], shape_custom_op, 1, nullptr);
-    return {ggml_cast(pc.ctx, f32_shape, GGML_TYPE_I32)};
+    ggml_tensor* f32_shape_vec = ggml_view_1d(pc.ctx, f32_shape, 4, 0);
+    return {ggml_cast(pc.ctx, f32_shape_vec, GGML_TYPE_I32)};
 }
 
 Outputs op_fill(PrimitiveContext& pc, const Inputs& in, const Json&) {
