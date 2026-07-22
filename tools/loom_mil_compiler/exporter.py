@@ -390,17 +390,91 @@ class LoomGGUFExporter:
         # 2. Extract inputs/outputs interfaces for each sliced topology
         # Replicate consumed constants locally in each slice to decouple them,
         # then extract only non-constant variable inputs.
+        #
+        # A SubgraphCall only ever exposes ONE slice's output(s) as `last_op.outputs` (see
+        # `output_names = ... last_op.outputs` below) -- the single-output-per-topology convention
+        # the driver/engine actually supports. So a var is only reachable by a LATER slice via
+        # legitimate SubgraphCall input-wiring if its producer op is the designated LAST op of
+        # whichever slice originally owns it (e.g. layer_(N-1)'s final hidden_states, threaded into
+        # layer_N). Any op that is NOT its own slice's last op -- whether because it's genuinely
+        # ungoverned (boundary_key is None, swept into whichever slice happened to be "current" in
+        # iteration order purely by happenstance) or because it's a real but non-final interior op
+        # of a shared multi-output slice (e.g. a RoPE cos/sin precompute under its own
+        # "model_model_pos_emb" scope, where only ONE of the two sibling cos/sin ops can ever be the
+        # slice's single exposed output) -- can NEVER be read this way. Any later slice that
+        # references such a var's name directly sees it as an "external input" nothing upstream ever
+        # actually provides: the mis-attribution bug, previously only caught (not fixed) by
+        # validate()'s atomic->monolithic fallback, surfacing as a SubgraphCall reading an input no
+        # earlier statement ever defined.
+        #
+        # Fix: recursively pull each such not-properly-exposed producer (and its own transitive
+        # dependencies, stopping at consts or at another op that IS its slice's legitimate exposed
+        # output) into EVERY slice that consumes it, instead of leaving it live in only the one slice
+        # that happened to inherit it. This is safe to duplicate freely: every such op is a pure
+        # function of consts/already-available inputs (that's exactly why it carries no real
+        # cross-slice state of its own), so recomputing it per consuming slice is redundant compute,
+        # never a correctness change. Any resulting now-unused copy left behind in the original
+        # "accidental host" slice is harmless: item 3's `_prune_dead_nodes` already drops any node
+        # unreachable from that topology's own declared output.
+        exposed_ops = {ops[-1] for _, ops in slices if ops}
+
+        def _is_legitimate_external_ref(op):
+            return op in exposed_ops
+
+        # Some MIL ops (e.g. "concat"/"stack") take a LIST of Vars under one input key (e.g.
+        # `values`) rather than one Var per key -- generate_graph_topology's own input-extraction
+        # already knows to flatten these (see its "elif isinstance(v, (list, tuple))" branch further
+        # below); this partitioning code must walk the exact same shape or it silently never visits
+        # a list-valued input's real producer op at all. Confirmed as a second, real bug this round:
+        # without this, replicating the pos_emb cos/sin closure for an attention layer pulled in the
+        # `concat((freqs, freqs))` node (reached via `cos`'s own bare-Var "x" input) but never its
+        # OWN `freqs` producer (only reachable through `concat`'s list-valued `values` input), leaving
+        # a node referencing a never-defined `freqs` var in the emitted topology.
+        def _iter_input_vars(op):
+            for v in op.inputs.values():
+                if isinstance(v, Var):
+                    yield v
+                elif isinstance(v, (list, tuple)):
+                    for item in v:
+                        if isinstance(item, Var):
+                            yield item
+
+        def _collect_replica_closure(op, ops_set, acc, visited):
+            if op in ops_set or op in visited:
+                return
+            visited.add(op)
+            for v in _iter_input_vars(op):
+                if v.op is None or v in op.outputs:
+                    continue
+                producer = v.op
+                if producer in ops_set or producer in visited:
+                    continue
+                if producer.op_type == "const":
+                    if producer not in acc:
+                        acc.append(producer)
+                elif not _is_legitimate_external_ref(producer):
+                    _collect_replica_closure(producer, ops_set, acc, visited)
+                    if producer not in acc:
+                        acc.append(producer)
+
         for idx, (name, ops) in enumerate(slices):
-            local_ops = list(ops)
-            consumed_consts = []
+            ops_set = set(ops)
+            extra = []
+            visited = set()
             for op in ops:
-                for k, v in op.inputs.items():
-                    from coremltools.converters.mil.mil import Var
-                    if isinstance(v, Var) and v.op and v.op.op_type == "const" and v not in op.outputs:
-                        if v.op not in local_ops and v.op not in consumed_consts:
-                            consumed_consts.append(v.op)
-            if consumed_consts:
-                local_ops = consumed_consts + local_ops
+                for v in _iter_input_vars(op):
+                    if v.op and v not in op.outputs:
+                        producer = v.op
+                        if producer in ops_set:
+                            continue
+                        if producer.op_type == "const":
+                            if producer not in extra:
+                                extra.append(producer)
+                        elif not _is_legitimate_external_ref(producer):
+                            _collect_replica_closure(producer, ops_set, extra, visited)
+                            if producer not in extra:
+                                extra.append(producer)
+            local_ops = (extra + list(ops)) if extra else list(ops)
             slices[idx] = (name, local_ops)
 
         slice_inputs = {}
@@ -416,9 +490,8 @@ class LoomGGUFExporter:
             ops_set = set(ops)
             slice_in = {}
             for op in ops:
-                for k, v in op.inputs.items():
-                    from coremltools.converters.mil.mil import Var
-                    if isinstance(v, Var) and v not in op.outputs and v.op not in ops_set:
+                for v in _iter_input_vars(op):
+                    if v not in op.outputs and v.op not in ops_set:
                         if v.op and v.op.op_type == "const":
                             continue
                         slice_in[self.safe_name(v.name)] = v

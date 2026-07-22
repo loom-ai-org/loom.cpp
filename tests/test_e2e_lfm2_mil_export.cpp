@@ -58,8 +58,13 @@ bool run_gguf_case(const std::string& gguf_path) {
     LOOM_CHECK(!driver_script.empty());
 
     loom::LoomLuaBridge bridge(backend.get());
-    LOOM_CHECK(model->has_topology("main_topo"));
-    bridge.register_module("main_topo", *model, loom::GraphTopology::parse(model->topology_json("main_topo")), nullptr);
+    // Monolithic exports have exactly one topology (named "main_topo"); atomic exports have many
+    // (one per scope-partitioned slice -- "embedding", "layer_0".."layer_15", "output_head", etc.),
+    // none of them named "main_topo". Register whatever topologies the file actually declares
+    // instead of assuming a single hardcoded name, so this works for both profiles.
+    for (const std::string& mod_name : model->topology_names()) {
+        bridge.register_module(mod_name, *model, loom::GraphTopology::parse(model->topology_json(mod_name)), nullptr);
+    }
     bridge.load_script(driver_script);
 
     bool all_ok = true;
