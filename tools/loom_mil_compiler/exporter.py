@@ -2,6 +2,22 @@ import json
 import numpy as np
 from coremltools.converters.mil.mil import Block, Function, Operation, Var
 
+from .driver_ir import (
+    Argmax, Assign, BinOp, Break, Call, FieldAccess, If, Index, Len, Lit, Local, LocalDecl,
+    LuaCodegen, RawBlock, RawExpr, Return, SubgraphCall, UnaryOp, Var as IRVar, While, check_subgraph_calls,
+    validate,
+)
+from .driver_ir import Function as IRFunction
+
+# Traced-model input names auto-computed by the driver (via loom.range) rather than unpacked from the
+# caller's `inputs` table -- see apply_monolithic_export/apply_atomic_export's own comment.
+_POSITION_INPUT_NAMES = {"cache_position", "position_ids"}
+
+# Traced-model input names auto-computed by the driver via loom.causal_mask (an already-prepared 4D
+# additive mask, the same "pass it explicitly so the traced model skips computing it internally" fix as
+# _POSITION_INPUT_NAMES -- see export_lfm2_*.py's own _causal_mask() comment).
+_CAUSAL_MASK_INPUT_NAMES = {"attention_mask"}
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (np.integer, np.int32, np.int64)):
@@ -53,6 +69,13 @@ class LoomGGUFExporter:
         "equal": "EQUAL",
         "not_equal": "NOT_EQUAL",
         "select": "SELECT",
+        "abs": "ABS",
+        "neg": "NEG",
+        "sign": "SIGN",
+        "minimum": "MINIMUM",
+        "maximum": "MAXIMUM",
+        "reduce_sum": "REDUCE_SUM",
+        "identity": "IDENTITY",
         # Specialized Loom dialect ops:
         "loom_fused_attention": "ATTENTION",
         "loom_spline": "RQ_SPLINE_INVERSE",
@@ -65,9 +88,10 @@ class LoomGGUFExporter:
         self.kwargs = kwargs
         self.weights = {}
         self.topologies = {}
-        self.lua_lines = []
+        self.ir_function = None
         self.profile = kwargs.get("profile") or os.environ.get("LOOM_PROFILE", None)
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
+        self.quantize = kwargs.get("quantize") or os.environ.get("LOOM_QUANTIZE", None)
 
     def safe_name(self, name: str) -> str:
         """
@@ -96,7 +120,24 @@ class LoomGGUFExporter:
         shape = []
         if hasattr(var, "shape") and var.shape is not None:
             for dim in var.shape:
-                # All shape entries in Loom topologies must be serialized as string expressions for C++ parsing
+                # All shape entries in Loom topologies must be serialized as string expressions for C++
+                # parsing. Every symbolic dim (CoreML stringifies these as "isN") collapses to the single
+                # "n_tokens" symbol GraphBuilder/SymbolEnv resolve at build time -- the engine's
+                # dynamic-shape support is genuinely single-axis (EXPORT-BACKLOG.md item 3), so this
+                # exporter only ever targets models with exactly one true dynamic quantity (sequence
+                # length), matching every model on the current roadmap (batch/hidden/heads are always
+                # architecturally static). A topology routinely contains SEVERAL distinct "isN" names for
+                # that one same quantity, not just one: CoreML's shape algebra mints a fresh opaque symbol
+                # at any derivation step it can't simplify back to the original input symbol (confirmed
+                # empirically -- an LFM2 ShortConv layer's causal pad+conv+slice, which provably preserves
+                # sequence length, produces 4 distinct "isN" names downstream of its one "is0" input; the
+                # atomic-export path's own inter-slice boundaries surface even more of these as separate
+                # declared inputs of a single slice). There is no cheap, reliable way to tell "several
+                # names, one true quantity" apart from "two genuinely independent dynamic axes" from the
+                # dim strings alone -- CoreML doesn't expose symbol-equality at this level, and an
+                # input-count-based heuristic tried here produced false positives on real, correct atomic
+                # slices. If a future model genuinely needs a second independent dynamic axis, that would
+                # surface as a numerical mismatch against the reference model, not a syntactic error here.
                 dim_str = str(dim)
                 if "is" in dim_str:
                     shape.append("n_tokens")
@@ -115,7 +156,7 @@ class LoomGGUFExporter:
           - Weights and assets are serialized to GGUF.
         """
         is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
-        
+
         if is_bespoke and self.profile is None:
             # 1. Advanced / Bespoke Exporting Workflow
             print("Exporting via Advanced/Bespoke workflow...")
@@ -124,102 +165,98 @@ class LoomGGUFExporter:
                     self.transpile_to_lua(func, name="main")
                 else:
                     self.topologies[func_name] = self.generate_graph_topology(func, func_name)
+            driver_script = self._finalize_driver()
         else:
             profile = self.profile or "monolithic"
             if profile == "atomic":
                 try:
+                    # Validation/codegen must run INSIDE this try block, not after it: atomic
+                    # partitioning is a best-effort heuristic (scope-boundary guessing), and an IR that
+                    # fails validation (e.g. a spurious/undefined subgraph input the heuristic
+                    # mis-attributed to the wrong slice) is exactly the same class of "atomic partitioning
+                    # didn't actually work" failure as an exception raised during partitioning itself --
+                    # both should fall back to the monolithic profile rather than crashing the export.
                     self.apply_atomic_export()
+                    driver_script = self._finalize_driver()
                 except Exception as e:
                     print(f"Warning: Automated atomic partitioning failed: {e}. Falling back to monolithic profile.")
+                    self.topologies = {}
+                    self.ir_function = None
                     self.apply_monolithic_export()
+                    driver_script = self._finalize_driver()
             else:
                 self.apply_monolithic_export()
-
-        # 2. Transpiled Script Consolidation
-        driver_script = "\n".join(self.lua_lines)
+                driver_script = self._finalize_driver()
 
         # 3. Serialization Phase
         self.write_gguf(driver_script)
         return self.output_path
 
+    def _finalize_driver(self) -> str:
+        """Validates the built driver IR and codegens it to Lua source text."""
+        validate(self.ir_function)
+        check_subgraph_calls(self.ir_function, self.topologies)
+        return "\n".join(LuaCodegen().emit_function(self.ir_function))
+
     def apply_monolithic_export(self):
         print("Exporting via Automatic Monolithic path...")
         main_func = self.program.functions["main"]
         self.topologies["main_topo"] = self.generate_graph_topology(main_func, "main_topo")
-        
+
         first_input = "tokens"
         feature_scale = 1
-        static_seq_len = None
-        
         if main_func.inputs:
             first_input_var = list(main_func.inputs.values())[0]
             first_input = self.safe_name(list(main_func.inputs.keys())[0])
-            
-            # Check for static sequence length (dimension at index 1)
-            if hasattr(first_input_var, "shape") and len(first_input_var.shape) >= 2:
-                seq_dim = first_input_var.shape[1]
-                try:
-                    static_seq_len = int(seq_dim)
-                except (ValueError, TypeError):
-                    pass
-                    
             if hasattr(first_input_var, "shape") and len(first_input_var.shape) == 3:
                 # For 3D shapes [batch, seq, feature], scale tokens by the last dimension (feature size)
                 try:
                     feature_scale = int(first_input_var.shape[2])
-                except:
+                except (ValueError, TypeError):
                     pass
-            
-        if static_seq_len is not None:
-            print(f"Detected static sequence length S={static_seq_len} in monolithic profile. Auto-synthesizing padded/sliced Lua driver...")
-            self.lua_lines.append("function main(inputs)")
-            self.lua_lines.append("    local x = inputs.x or inputs.tokens")
-            self.lua_lines.append("    local original_len = #x")
-            
-            # 1. Pad input array with trailing 0s up to static size S
-            self.lua_lines.append("    local padded_x = {}")
-            self.lua_lines.append("    for i=1,original_len do padded_x[i] = x[i] end")
-            self.lua_lines.append(f"    for i=original_len+1,{static_seq_len} do padded_x[i] = 0 end")
-            
-            # 2. Map input dispatches, mapping only the sequence variable x to padded_x
-            inputs_tbl_items = []
-            for k in main_func.inputs.keys():
-                safe_k = self.safe_name(k)
-                if k == first_input:
-                    inputs_tbl_items.append(f"{safe_k} = padded_x")
-                else:
-                    inputs_tbl_items.append(f"{safe_k} = {safe_k}")
-            inputs_tbl = ", ".join(inputs_tbl_items)
-            
-            outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
-            
-            self.lua_lines.append(f"    local _mono_out, _mono_shape = loom.run_subgraph('main_topo', {static_seq_len}, 0, {{{inputs_tbl}}})")
 
-            # 3. Argmax the logits row for the active token (index original_len - 1) rather than
-            # returning a single raw logit value -- _mono_shape[1] is the output's ne0 (vocab size),
-            # the same convention transpile_operation's own "argmax" case relies on.
-            self.lua_lines.append("    if type(_mono_out) == 'table' then")
-            self.lua_lines.append("        return loom.argmax_row(_mono_out, _mono_shape[1], original_len - 1)")
-            self.lua_lines.append("    else")
-            self.lua_lines.append("        return _mono_out")
-            self.lua_lines.append("    end")
-            self.lua_lines.append("end")
-        else:
-            self.lua_lines.append("function main(inputs)")
-            for name in main_func.inputs.keys():
-                safe_inp = self.safe_name(name)
-                self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
-                
-            inputs_tbl = ", ".join([f"{self.safe_name(k)} = {self.safe_name(k)}" for k in main_func.inputs.keys()])
-            outputs_str = ", ".join([self.safe_name(v.name) for v in main_func.outputs])
-            
-            n_tokens_expr = f"#{first_input}"
-            if feature_scale > 1:
-                n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
-                
-            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('main_topo', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
-            self.lua_lines.append(f"    return {outputs_str}")
-            self.lua_lines.append("end")
+        n_tokens_expr = Len(first_input)
+        if feature_scale > 1:
+            n_tokens_expr = BinOp("floordiv", Len(first_input), Lit(feature_scale))
+
+        body = []
+        for name in main_func.inputs.keys():
+            safe_inp = self.safe_name(name)
+            if name in _POSITION_INPUT_NAMES:
+                # A traced model's own "cache_position"/"position_ids" input (see export_lfm2_*.py's own
+                # comment: passing this explicitly rather than letting the model derive it internally
+                # from a Python-level `.shape[1]` query is what keeps it genuinely dynamic under
+                # torch.jit.trace) is host-computed here, not unpacked from the caller's `inputs` table --
+                # the driver already knows n_tokens/n_past, and callers shouldn't need to know this is an
+                # LFM2-specific implementation detail of the traced graph.
+                body.append(Local(safe_inp, Call("loom.range", [Lit(0), n_tokens_expr])))
+            elif name in _CAUSAL_MASK_INPUT_NAMES:
+                body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
+            else:
+                body.append(Local(safe_inp, BinOp("or", FieldAccess("inputs", safe_inp), FieldAccess("inputs", "tokens"))))
+
+        inputs_tbl = {self.safe_name(k): IRVar(self.safe_name(k)) for k in main_func.inputs.keys()}
+
+        body.append(SubgraphCall(
+            outputs=["_mono_out"],
+            extra_outputs=["_mono_shape"],
+            module="main_topo",
+            n_tokens=n_tokens_expr,
+            n_past=Lit(0),
+            inputs=inputs_tbl,
+        ))
+
+        # Argmax the logits row for the active (last real) token rather than returning the raw output
+        # array -- _mono_shape[1] is the output's ne0 (vocab size), the same convention
+        # transpile_operation's own "argmax" case and apply_atomic_export's final slice rely on.
+        row_expr = BinOp("-", n_tokens_expr, Lit(1))
+        body.append(If(
+            cond=BinOp("==", Call("type", [IRVar("_mono_out")]), Lit("table")),
+            then=[Return([Call("loom.argmax_row", [IRVar("_mono_out"), Index(IRVar("_mono_shape"), 1), row_expr])])],
+            else_=[Return([IRVar("_mono_out")])],
+        ))
+
+        self.ir_function = IRFunction("main", ["inputs"], body)
 
     def apply_atomic_export(self):
         print("Exporting via Automatic Atomic path...")
@@ -376,124 +413,110 @@ class LoomGGUFExporter:
             inputs_dict = slice_inputs[name]
             self.topologies[name] = self.generate_graph_topology(None, name, ops_list=ops, inputs_dict=inputs_dict)
             
-        # 4. Synthesize the automatic looping Lua driver script
-        self.lua_lines.append("function main(inputs)")
-
+        # 4. Synthesize the automatic looping driver IR
         first_input = "tokens"
         feature_scale = 1
-        static_seq_len = None
         if main_func.inputs:
             first_input_var = list(main_func.inputs.values())[0]
             first_input = self.safe_name(list(main_func.inputs.keys())[0])
             if hasattr(first_input_var, "shape") and len(first_input_var.shape) == 3:
                 try:
                     feature_scale = int(first_input_var.shape[2])
-                except:
-                    pass
-            # If the model was traced with a fixed sequence length (no dynamic RangeDim), every
-            # slice's declared shapes bake in that same constant -- the driver MUST always request
-            # exactly that many tokens from every run_subgraph call (padding shorter prompts), the
-            # same static/padded convention apply_monolithic_export uses, rather than the real prompt
-            # length (which would runtime-mismatch every topology's fixed input shape).
-            if hasattr(first_input_var, "shape") and len(first_input_var.shape) >= 2:
-                try:
-                    static_seq_len = int(first_input_var.shape[1])
                 except (ValueError, TypeError):
                     pass
 
+        n_tokens_expr = Len(first_input)
+        if feature_scale > 1:
+            n_tokens_expr = BinOp("floordiv", Len(first_input), Lit(feature_scale))
+
+        body = []
         for name in main_func.inputs.keys():
             safe_inp = self.safe_name(name)
-            self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp} or inputs.tokens")
-
-        if static_seq_len is not None:
-            self.lua_lines.append(f"    local original_len = #{first_input}")
-            self.lua_lines.append("    local padded_x = {}")
-            self.lua_lines.append(f"    for i=1,original_len do padded_x[i] = {first_input}[i] end")
-            self.lua_lines.append(f"    for i=original_len+1,{static_seq_len} do padded_x[i] = 0 end")
-            self.lua_lines.append(f"    {first_input} = padded_x")
-
-        # Execute each sliced topology sequentially
-        if static_seq_len is not None:
-            n_tokens_expr = str(static_seq_len)
-        else:
-            n_tokens_expr = f"#{first_input}"
-            if feature_scale > 1:
-                n_tokens_expr = f"math.floor(#{first_input} / {feature_scale})"
+            if name in _POSITION_INPUT_NAMES:
+                # See apply_monolithic_export's identical case: host-computed, not caller-supplied.
+                body.append(Local(safe_inp, Call("loom.range", [Lit(0), n_tokens_expr])))
+            elif name in _CAUSAL_MASK_INPUT_NAMES:
+                body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
+            else:
+                body.append(Local(safe_inp, BinOp("or", FieldAccess("inputs", safe_inp), FieldAccess("inputs", "tokens"))))
 
         for idx, (name, ops) in enumerate(slices):
             inputs_dict = slice_inputs[name]
 
             # Map input keys, standardizing the first input name to "hidden_states" for decoder layers
-            inputs_tbl_items = []
             is_layer = name.startswith("layer_")
             first_key = list(inputs_dict.keys())[0] if inputs_dict else None
 
+            slice_inputs_tbl = {}
             for k in inputs_dict.keys():
                 safe_k = self.safe_name(k)
                 if is_layer and k == first_key:
-                    inputs_tbl_items.append(f"hidden_states = {safe_k}")
+                    slice_inputs_tbl["hidden_states"] = IRVar(safe_k)
                 else:
-                    inputs_tbl_items.append(f"{safe_k} = {safe_k}")
-
-            inputs_tbl = ", ".join(inputs_tbl_items)
+                    slice_inputs_tbl[safe_k] = IRVar(safe_k)
 
             last_op = ops[-1]
-            outputs_str = ", ".join([self.safe_name(v.name) for v in last_op.outputs])
+            output_names = [self.safe_name(v.name) for v in last_op.outputs]
 
             if idx == len(slices) - 1:
                 # Final slice: also capture the output shape so the driver can argmax the last
                 # sequence position's logits row instead of returning a raw output value (matching
                 # the "argmax" convention transpile_operation's bespoke path and
                 # apply_monolithic_export both use for causal-LM next-token generation).
-                self.lua_lines.append(
-                    f"    local {outputs_str}, _atomic_final_shape = loom.run_subgraph('{name}', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+                body.append(SubgraphCall(
+                    outputs=output_names, extra_outputs=["_atomic_final_shape"],
+                    module=name, n_tokens=n_tokens_expr, n_past=Lit(0), inputs=slice_inputs_tbl,
+                ))
             else:
-                self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('{name}', {n_tokens_expr}, 0, {{{inputs_tbl}}})")
+                body.append(SubgraphCall(
+                    outputs=output_names, module=name, n_tokens=n_tokens_expr, n_past=Lit(0), inputs=slice_inputs_tbl,
+                ))
 
         final_last_op = slices[-1][1][-1]
-        final_outputs_str = ", ".join([self.safe_name(v.name) for v in final_last_op.outputs])
-        # The row to argmax is the LAST real (non-padded) token's position: with a static/padded
-        # sequence that's original_len - 1, otherwise (genuinely dynamic length) it's n_tokens - 1.
-        row_expr = "original_len - 1" if static_seq_len is not None else f"{n_tokens_expr} - 1"
-        self.lua_lines.append(f"    if type({final_outputs_str}) == 'table' then")
-        self.lua_lines.append(
-            f"        return loom.argmax_row({final_outputs_str}, _atomic_final_shape[1], {row_expr})")
-        self.lua_lines.append("    else")
-        self.lua_lines.append(f"        return {final_outputs_str}")
-        self.lua_lines.append("    end")
-        self.lua_lines.append("end")
+        final_output_names = [self.safe_name(v.name) for v in final_last_op.outputs]
+        final_out = final_output_names[0]
+        row_expr = BinOp("-", n_tokens_expr, Lit(1))
+        body.append(If(
+            cond=BinOp("==", Call("type", [IRVar(final_out)]), Lit("table")),
+            then=[Return([Call("loom.argmax_row", [IRVar(final_out), Index(IRVar("_atomic_final_shape"), 1), row_expr])])],
+            else_=[Return([IRVar(final_out)])],
+        ))
+
+        self.ir_function = IRFunction("main", ["inputs"], body)
 
     def transpile_to_lua(self, func: Function, name="main"):
         """
         Transpiles the main MIL orchestration function to a Lua JIT driver script.
         """
-        self.lua_lines.append(f"function {name}(inputs)")
-        
         # Track the first input variable name to dynamically derive n_tokens
         self.first_input = "tokens"
         if func.inputs:
             self.first_input = self.safe_name(list(func.inputs.keys())[0])
-        
+
+        body = []
         # Unpack incoming inputs
-        for name in func.inputs.keys():
-            safe_inp = self.safe_name(name)
-            self.lua_lines.append(f"    local {safe_inp} = inputs.{safe_inp}")
-            
+        for inp_name in func.inputs.keys():
+            safe_inp = self.safe_name(inp_name)
+            body.append(Local(safe_inp, FieldAccess("inputs", safe_inp)))
+
         # Transpile operations inside function block
-        self.transpile_block(func)
-        
+        body.extend(self.transpile_block(func))
+
         # Unpack and return outputs
-        outputs_str = ", ".join([self.safe_name(v.name) for v in func.outputs])
-        self.lua_lines.append(f"    return {outputs_str}")
-        self.lua_lines.append("end")
+        output_names = [self.safe_name(v.name) for v in func.outputs]
+        body.append(Return([IRVar(n) for n in output_names]))
 
-    def transpile_block(self, block: Block):
+        self.ir_function = IRFunction(name, ["inputs"], body)
+
+    def transpile_block(self, block: Block) -> list:
+        stmts = []
         for op in block.operations:
-            self.transpile_operation(op)
+            stmts.extend(self.transpile_operation(op))
+        return stmts
 
-    def transpile_operation(self, op: Operation):
+    def transpile_operation(self, op: Operation) -> list:
         op_type = op.op_type
-        outputs_str = ", ".join([self.safe_name(v.name) for v in op.outputs])
+        output_names = [self.safe_name(v.name) for v in op.outputs]
 
         # A. Constant Serialization
         if op_type == "const":
@@ -501,84 +524,84 @@ class LoomGGUFExporter:
             if isinstance(val, np.ndarray) and val.size > 100:
                 weight_name = self.safe_name(op.outputs[0].name)
                 self.weights[weight_name] = val
-                self.lua_lines.append(f"    -- Weight {weight_name} packaged in GGUF")
-            else:
-                self.lua_lines.append(f"    local {outputs_str} = {self.format_lua_val(val)}")
+                return [RawBlock([f"-- Weight {weight_name} packaged in GGUF"])]
+            return [Local(output_names[0], RawExpr(self.format_lua_val(val)))]
 
         # B. Autoregressive / Loop Control Flow
-        elif op_type == "while_loop":
+        if op_type == "while_loop":
             cond_block = op.blocks[0]
             body_block = op.blocks[1]
 
-            self.lua_lines.append("    while true do")
-            
-            # Inline condition evaluation block
-            self.transpile_block(cond_block)
+            cond_stmts = self.transpile_block(cond_block)
             cond_var = self.safe_name(cond_block.outputs[0].name)
-            self.lua_lines.append(f"        if not {cond_var} then break end")
-            
-            # Inline body execution block
-            self.transpile_block(body_block)
-            self.lua_lines.append("    end")
+            body_stmts = self.transpile_block(body_block)
+            loop_body = cond_stmts + [If(UnaryOp("not", IRVar(cond_var)), [Break()])] + body_stmts
+            return [While(Lit(True), loop_body)]
 
         # C. Conditional Branches
-        elif op_type == "cond":
+        if op_type == "cond":
             true_block = op.blocks[0]
             false_block = op.blocks[1]
             pred_var = self.safe_name(op.inputs["pred"].name)
-            
-            self.lua_lines.append(f"    if {pred_var} then")
-            self.transpile_block(true_block)
-            self.lua_lines.append("    else")
-            self.transpile_block(false_block)
-            self.lua_lines.append("    end")
+
+            true_stmts = self.transpile_block(true_block)
+            false_stmts = self.transpile_block(false_block)
+
+            # `cond`'s own output(s) are each block's own returned var (true_block.outputs[i] /
+            # false_block.outputs[i] map positionally to op.outputs[i]) -- neither branch's own `local`
+            # declarations survive past the if/else in Lua (block-scoped), so the result name is declared
+            # OUTSIDE the if/else via LocalDecl and plain-assigned (Assign, no `local`) from inside each
+            # arm. Previously this case didn't bind op.outputs at all, silently leaving any use of the
+            # cond's result reading an undeclared global (nil) -- caught by validate() once the IR
+            # rewrite made "read before defined" a mechanical, export-time check instead of a runtime bug.
+            decls = []
+            for i, out_var in enumerate(op.outputs):
+                out_name = self.safe_name(out_var.name)
+                decls.append(LocalDecl(out_name))
+                true_stmts = true_stmts + [Assign(out_name, IRVar(self.safe_name(true_block.outputs[i].name)))]
+                false_stmts = false_stmts + [Assign(out_name, IRVar(self.safe_name(false_block.outputs[i].name)))]
+
+            return decls + [If(IRVar(pred_var), true_stmts, false_stmts)]
 
         # D. Submodule Dispatch
-        elif op_type in self.program.functions:
-            inputs_tbl = ", ".join([f"{k} = {self.safe_name(v.name)}" for k, v in op.inputs.items() if hasattr(v, "name")])
-            n_tokens = f"#{self.first_input}"
-            n_past = "0"
+        if op_type in self.program.functions:
+            inputs_tbl = {k: IRVar(self.safe_name(v.name)) for k, v in op.inputs.items() if hasattr(v, "name")}
+            n_tokens_expr = Len(self.first_input)
+            n_past_expr = Lit(0)
             if "n_tokens" in op.inputs:
-                n_tokens = self.safe_name(op.inputs["n_tokens"].name)
+                n_tokens_expr = IRVar(self.safe_name(op.inputs["n_tokens"].name))
             if "n_past" in op.inputs:
-                n_past = self.safe_name(op.inputs["n_past"].name)
-            self.lua_lines.append(f"    local {outputs_str} = loom.run_subgraph('{op_type}', {n_tokens}, {n_past}, {{{inputs_tbl}}})")
+                n_past_expr = IRVar(self.safe_name(op.inputs["n_past"].name))
+            return [SubgraphCall(outputs=output_names, module=op_type, n_tokens=n_tokens_expr, n_past=n_past_expr,
+                                  inputs=inputs_tbl)]
 
         # E. Fast Host Math Mapping
-        elif op_type == "argmax":
+        if op_type == "argmax":
             x_name = self.safe_name(op.inputs["x"].name)
             # Retrieve shape to get vocabulary size (ne0 dimension)
             x_info = self.get_var_info(op.inputs["x"])
             n_vocab = int(x_info["shape"][0])
-            
             # Row index is the last row (seq_len - 1), which is #first_input - 1
-            row_index = f"#{self.first_input} - 1"
-            self.lua_lines.append(f"    local {outputs_str} = loom.argmax_row({x_name}, {n_vocab}, {row_index})")
+            row_expr = BinOp("-", Len(self.first_input), Lit(1))
+            return [Argmax(output_names[0], x_name, Lit(n_vocab), row_expr)]
 
-        elif op_type == "range":
+        if op_type == "range":
             start = self.safe_name(op.inputs["start"].name)
             end = self.safe_name(op.inputs["end"].name)
-            self.lua_lines.append(f"    local {outputs_str} = loom.range({start}, {end})")
+            return [Local(output_names[0], Call("loom.range", [IRVar(start), IRVar(end)]))]
 
-        elif op_type == "causal_mask":
+        if op_type == "causal_mask":
             n_tokens = self.safe_name(op.inputs["n_tokens"].name)
             n_past = self.safe_name(op.inputs["n_past"].name)
-            self.lua_lines.append(f"    local {outputs_str} = loom.causal_mask({n_tokens}, {n_past})")
+            return [Local(output_names[0], Call("loom.causal_mask", [IRVar(n_tokens), IRVar(n_past)]))]
 
         # F. Fallback for generic SSA arithmetic
-        else:
-            inputs = []
-            for k, v in op.inputs.items():
-                if hasattr(v, "name"):
-                    inputs.append(self.safe_name(v.name))
-            if len(inputs) == 2:
-                op_symbol = {"add": "+", "sub": "-", "mul": "*", "div": "/"}.get(op_type)
-                if op_symbol:
-                    self.lua_lines.append(f"    local {outputs_str} = {inputs[0]} {op_symbol} {inputs[1]}")
-                else:
-                    self.lua_lines.append(f"    -- Fallback: host math implementation for {op_type}")
-            else:
-                self.lua_lines.append(f"    -- Fallback: host math implementation for {op_type}")
+        inputs = [self.safe_name(v.name) for k, v in op.inputs.items() if hasattr(v, "name")]
+        if len(inputs) == 2:
+            op_symbol = {"add": "+", "sub": "-", "mul": "*", "div": "/"}.get(op_type)
+            if op_symbol:
+                return [Local(output_names[0], BinOp(op_symbol, IRVar(inputs[0]), IRVar(inputs[1])))]
+        return [RawBlock([f"-- Fallback: host math implementation for {op_type}"])]
 
     def format_lua_val(self, val):
         if isinstance(val, (int, float, bool)):
@@ -1247,21 +1270,45 @@ class LoomGGUFExporter:
             "nodes": nodes
         }
 
+    def _collect_mul_mat_weight_names(self) -> set:
+        """Every MUL_MAT node's *first* input, across all topologies -- the weight-first argument per
+        loom's convention (src/ops/primitives_basic.cpp's op_mul_mat is a bare ggml_mul_mat(a, b) wrap
+        with `a` as the weight). Mirrors tools/quantize/quantize_gguf_q8_0.py's topology-driven tensor
+        selection (proven end-to-end against a real quantized model, see BACKLOG.md's "quantized weight
+        support" milestone) rather than tensor-name pattern matching -- this exporter never emits
+        "repeat_for" blocks (unlike that script's GGUF-KV-driven input), so no expansion pass is needed."""
+        names = set()
+        for topo in self.topologies.values():
+            for node in topo.get("nodes", []):
+                if node.get("op") == "MUL_MAT" and node.get("inputs"):
+                    names.add(node["inputs"][0])
+        return names
+
     def write_gguf(self, driver_script: str):
         from gguf import GGUFWriter
         import os
-        
+
         arch = self.kwargs.get("architecture") or os.environ.get("LOOM_ARCH", "mil_model")
         w = GGUFWriter(self.output_path, f"loom-{arch}")
         w.add_string("loom.architecture", arch)
-        
+
         # Embed the Lua driver orchestration script
         w.add_string("model.driver_script", driver_script)
-        
+
         # Embed each static submodule topology JSON string
         for submodule_name, topo in self.topologies.items():
             w.add_string(f"model.graph_topology.{submodule_name}", json.dumps(topo, cls=NumpyEncoder))
-            
+
+        qtype = None
+        quantizable = set()
+        block_size = 1
+        if self.quantize:
+            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+            qtype = GGMLQuantizationType[self.quantize]
+            block_size, _ = GGML_QUANT_SIZES[qtype]
+            quantizable = self._collect_mul_mat_weight_names()
+        n_quantized = 0
+
         # Quantize & write weights / tensors
         for name, array in self.weights.items():
             if array.dtype == bool or array.dtype == np.bool_:
@@ -1272,12 +1319,27 @@ class LoomGGUFExporter:
                 array = array.astype(np.int32)
             elif not np.issubdtype(array.dtype, np.number):
                 continue
-                
-            w.add_tensor(name, array)
-            
+
+            # Only MUL_MAT weight tensors are quantized (matching llama.cpp's own convention: norm/bias
+            # 1D tensors have negligible size benefit and real accuracy cost). Tensors whose last
+            # (fastest-varying) dimension isn't block-aligned are left F32 rather than erroring, same
+            # graceful behavior as the standalone quantize_gguf_q8_0.py POC.
+            if (qtype is not None and name in quantizable and array.ndim >= 2 and array.dtype == np.float32
+                    and array.shape[-1] % block_size == 0):
+                from gguf import quants
+                q = quants.quantize(np.ascontiguousarray(array), qtype)
+                # No `raw_shape` -- add_tensor's raw_shape (when given) is a *byte*-shape fed straight
+                # into quant_shape_from_byte_shape, not the pre-quantization logical shape; omitting it
+                # lets it default to the quantized array's own (correct) byte-shape.
+                w.add_tensor(name, q, raw_dtype=qtype)
+                n_quantized += 1
+            else:
+                w.add_tensor(name, array)
+
         w.write_header_to_file()
         w.write_kv_data_to_file()
         w.write_tensors_to_file()
         w.close()
-        
-        print(f"wrote GGUF with driver_script and {len(self.topologies)} topologies to {self.output_path}")
+
+        suffix = f", {n_quantized} tensor(s) quantized to {self.quantize}" if self.quantize else ""
+        print(f"wrote GGUF with driver_script and {len(self.topologies)} topologies to {self.output_path}{suffix}")

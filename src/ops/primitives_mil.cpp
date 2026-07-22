@@ -129,27 +129,34 @@ Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {ggml_arange(pc.ctx, start, end, step)};
 }
 
+// ggml's own CPU kernel for STEP is a STRICT inequality (ggml-cpu/unary-ops.cpp: `op_step(x) = (x > 0.f)
+// ? 1.f : 0.f`, i.e. step(0) = 0), not `x >= 0`. So `step(b-a)` alone computes strict "a < b" (correct for
+// LESS, but wrong for LESS_EQUAL: at a==b it must be true, but step(0)=0 gives false). less_equal/
+// greater_equal need an explicit complement of the STRICT comparison, not the same formula less/greater
+// already use correctly.
 Outputs op_less_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("less_equal", in, 2);
-    // a <= b <=> b - a >= 0 <=> step(b - a)
-    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]))};
+    // a <= b <=> NOT(a > b) <=> 1 - step(a - b)
+    ggml_tensor* gt = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]));
+    return {ggml_scale_bias(pc.ctx, gt, -1.0f, 1.0f)};
 }
 
 Outputs op_greater_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("greater_equal", in, 2);
-    // a >= b <=> a - b >= 0 <=> step(a - b)
-    return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]))};
+    // a >= b <=> NOT(b > a) <=> 1 - step(b - a)
+    ggml_tensor* lt = ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]));
+    return {ggml_scale_bias(pc.ctx, lt, -1.0f, 1.0f)};
 }
 
 Outputs op_less(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("less", in, 2);
-    // a < b <=> b - a > 0. Since we don't have strict greater, approximate using step
+    // a < b <=> b - a > 0 <=> step(b - a)
     return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[1], in[0]))};
 }
 
 Outputs op_greater(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("greater", in, 2);
-    // a > b <=> a - b > 0. Approximate using step
+    // a > b <=> a - b > 0 <=> step(a - b)
     return {ggml_step(pc.ctx, ggml_sub(pc.ctx, in[0], in[1]))};
 }
 
@@ -181,86 +188,35 @@ Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
 }
 
 
-// 2. static registrar mapping CoreML MIL names to Loom definitions dynamically:
+// 2. static registrar mapping CoreML MIL names to Loom definitions:
+//
+// Only uppercase names are registered here. tools/loom_mil_compiler/exporter.py's OP_MAP always
+// normalizes every MIL op to its uppercase Loom name before ever writing topology JSON, so the C++
+// primitive registry never sees a lowercase op string from that exporter's output -- confirmed by
+// reading generate_graph_topology, whose emitted `node["op"]` is always OP_MAP's uppercase value. A
+// prior revision of this registrar also registered every op (and aliased ADD/SUB/MUL/... to their MIL
+// lowercase names via a `try_alias` helper) under its lowercase MIL name too; that half was dead code by
+// the same argument and has been removed (EXPORT-BACKLOG.md item 5).
 struct MilDialectRegistrar {
     MilDialectRegistrar() {
         PrimitiveRegistry& reg = PrimitiveRegistry::instance();
-        
+
         // Register new C++ custom CoreML MIL operators
-        reg.register_op("abs", op_abs);
         reg.register_op("ABS", op_abs);
-        reg.register_op("neg", op_neg);
         reg.register_op("NEG", op_neg);
-        reg.register_op("sign", op_sign);
         reg.register_op("SIGN", op_sign);
-        reg.register_op("minimum", op_minimum);
         reg.register_op("MINIMUM", op_minimum);
-        reg.register_op("maximum", op_maximum);
         reg.register_op("MAXIMUM", op_maximum);
-        reg.register_op("reduce_sum", op_reduce_sum);
         reg.register_op("REDUCE_SUM", op_reduce_sum);
-        reg.register_op("identity", op_identity);
         reg.register_op("IDENTITY", op_identity);
-        reg.register_op("range_1d", op_range_1d);
         reg.register_op("RANGE_1D", op_range_1d);
-        reg.register_op("less_equal", op_less_equal);
         reg.register_op("LESS_EQUAL", op_less_equal);
-        reg.register_op("greater_equal", op_greater_equal);
         reg.register_op("GREATER_EQUAL", op_greater_equal);
-        reg.register_op("less", op_less);
         reg.register_op("LESS", op_less);
-        reg.register_op("greater", op_greater);
         reg.register_op("GREATER", op_greater);
-        reg.register_op("equal", op_equal);
         reg.register_op("EQUAL", op_equal);
-        reg.register_op("not_equal", op_not_equal);
         reg.register_op("NOT_EQUAL", op_not_equal);
-        reg.register_op("select", op_select);
         reg.register_op("SELECT", op_select);
-        
-        // Dynamically clone and register aliases of standard Loom operators to their MIL lowercase keys
-        auto try_alias = [&](const std::string& mil_name, const std::string& loom_name) {
-            if (reg.has(loom_name)) {
-                reg.register_op(mil_name, reg.get(loom_name));
-            }
-        };
-        
-        try_alias("add", "ADD");
-        try_alias("sub", "SUB");
-        try_alias("mul", "MUL");
-        try_alias("div", "DIV");
-        try_alias("real_div", "DIV");
-        try_alias("floor_div", "DIV");
-        try_alias("pow", "POW");
-        try_alias("reduce_mean", "MEAN");
-        try_alias("rsqrt", "RSQRT");
-        try_alias("sqrt", "SQRT");
-        try_alias("square", "SQUARE");
-        try_alias("relu", "RELU");
-        try_alias("relu6", "RELU6");
-        try_alias("leaky_relu", "LEAKY_RELU");
-        try_alias("gelu", "GELU");
-        try_alias("sigmoid", "SIGMOID");
-        try_alias("tanh", "TANH");
-        try_alias("silu", "SILU");
-        try_alias("softmax", "SOFTMAX");
-        try_alias("softplus", "SOFTPLUS");
-        try_alias("matmul", "MUL_MAT");
-        try_alias("gather", "GET_ROWS");
-        try_alias("transpose", "PERMUTE");
-        try_alias("reshape", "RESHAPE");
-        try_alias("concat", "CONCAT");
-        try_alias("split", "VIEW");
-        try_alias("slice_by_index", "VIEW");
-        try_alias("tile", "REPEAT");
-        try_alias("band_part", "DIAG_MASK_ZERO");
-        try_alias("conv", "CONV_1D"); // Automatically heals/routes standard and depthwise shapes
-        try_alias("layer_norm", "LAYER_NORM");
-        try_alias("rms_norm", "RMS_NORM");
-        try_alias("clipping", "CLAMP");
-        try_alias("clip", "CLAMP");
-        try_alias("fill", "FILL");
-        try_alias("shape", "SHAPE");
     }
 };
 
