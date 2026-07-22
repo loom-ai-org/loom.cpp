@@ -6,41 +6,32 @@ item's own recommendation.
 
 ---
 
-## Status snapshot (items 2/3/5/6, across two sessions)
+## Status snapshot (items 2/3/5/6, across three sessions)
 
 Quick-reference for what's actually done vs. still open, before diving into each item's own detail below.
 
 | Item | Status |
 |---|---|
-| 1. Numerical correctness (attention) | RESOLVED (prior session) |
+| 1. Numerical correctness (attention) | **RESOLVED**, now verified at genuinely dynamic length too (see item 3's latest update — a real GQA head-tiling bug, found and fixed) |
 | 2. Driver IR/codegen | **DONE** — `driver_ir.py` landed, all exporters rewired, 2 real bugs caught & fixed |
-| 3. Dynamic shapes | **Mechanism substantially hardened, 7 real bugs fixed, 1 deep issue remains** (see item 3) |
+| 3. Dynamic shapes | **DONE** — mechanism hardened, crash fixed (missing int->float CAST, found via `gdb`), numerical mismatch fixed (GQA repeat_kv fusion bug); `test_e2e_lfm2_mil_export` passes 10/10 |
 | 4. Tokenization | Not started (unchanged from original plan below) |
 | 5. MIL primitive review | **Concrete bullets DONE** (incl. a real `op_equal` algebra bug found this round); broader heuristic audit deliberately deferred |
-| 6. Export-time quantization | **Code DONE**; LFM2-specific numerical verification still blocked on item 3's last issue |
+| 6. Export-time quantization | **Code DONE**; LFM2-specific numerical verification now unblocked (item 3's fix landed) but not yet run |
 
 **What's actually missing right now, in dependency order:**
-1. **The one open bug** (item 3): a null-function-pointer crash inside a ggml worker thread, bisected to a
-   precise 5-node repro (RoPE's inverse-frequency `MUL_MAT` against a real GGUF-loaded weight). Everything
-   below is blocked on this. See item 3's own section for the exact repro, everything already ruled out, and
-   the prime remaining suspects — a real debugger (`gdb`/`lldb`, neither available in this environment)
-   would very likely resolve it quickly via a core dump backtrace.
-2. **A fresh numerical-correctness pass** (item 1's own bisection-against-real-HF technique, at a genuinely
-   dynamic, non-128, unpadded length) once (1) stops crashing — a shape/build fix alone only proves the
-   graph builds, not that the values are right.
-3. **LFM2-specific quantization verification** (item 6): the code is written and mirrors an already-proven
-   pattern (Qwen3-0.6B-Base), but has never actually been run against a working LFM2 export + compared,
-   because (1)/(2) block producing one.
-4. **Item 5's "broader ask"**: audit `primitives_basic.cpp`'s ADD/MUL/MUL_MAT/REPEAT layout-healing
+1. **LFM2-specific quantization verification** (item 6): the code is written and mirrors an already-proven
+   pattern (Qwen3-0.6B-Base), and a working, numerically-correct LFM2 export now exists to verify it
+   against (items 1/3 are fully resolved) — just hasn't been run yet.
+2. **Item 5's "broader ask"**: audit `primitives_basic.cpp`'s ADD/MUL/MUL_MAT/REPEAT layout-healing
    heuristics for continued necessity now that the exporter emits correct layouts directly for more cases —
    deliberately not started, since these heuristics are shared by every model using these primitives
    (Whisper, Conformer-CTC, VITS, Matcha-TTS, SupertonicTTS, Kokoro), not just LFM2's MIL export path, so
    removing one needs per-model verification.
-5. **Item 4 (tokenization)**: not started at all — still just the recommendation/plan below, no code written.
+3. **Item 4 (tokenization)**: not started at all — still just the recommendation/plan below, no code written.
 
-`tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for (1)+(2) — it'll go from
-skipping (no fixture present) to passing once the crash is resolved and values are confirmed; no test
-changes needed to make that happen.
+`tests/test_e2e_lfm2_mil_export.cpp` (already committed) is the regression test for items 1+3 — it now
+passes 10/10 (both GGUF profiles, both tested prompt lengths, exact top-1 match against real HF).
 
 ---
 
@@ -347,64 +338,116 @@ further real, previously-latent bugs. All of the following are now fixed and com
    by any surviving topology node (257 tensors survived out of 923). Confirmed correct and worth keeping
    regardless of the next item's outcome — a weight nothing reads should never be written to the GGUF.
 
-**Still open after all of the above — bisected to an extremely small, precise repro.** Even after every
-fix above, `test_e2e_lfm2_mil_export` still crashes, now with a different signature: a **null function
-pointer dereference inside a ggml worker thread** (`AddressSanitizer: SEGV on unknown address 0x0...pc
-0x0`, thread spawned via `GOMP_parallel`), not a clean assertion. Bisected using the same truncated-topology
-technique as item 1's own resolution, refined to do real backward-reachability pruning at each truncation
-point (not just a naive prefix cut) via a small standalone C++ harness that calls `GraphBuilder`/`GgufModel`
-directly (no Lua) — down to a **minimal 5-node repro**:
+**Update (follow-up session, "continue the bug investigation"): the null-pointer crash is FIXED — root
+cause was a missing dtype cast, not a ggml/gallocr/threading bug.** With `gdb` installed, the minimal
+5-node repro above got a real backtrace instead of guessing from ASan's `pc=0x0` alone:
 
-```json
-{"op": "RESHAPE", "inputs": ["cache_position"], "outputs": ["position_ids"], "attrs": {"shape": ["n_tokens", "1"]}}
-{"op": "RESHAPE", "inputs": ["position_ids"], "outputs": ["_75"], "attrs": {"shape": ["n_tokens", "1", "1"]}}
-{"op": "PERMUTE", "inputs": ["_75"], "outputs": ["_80_cast_fp16_mm_y_perm"], "attrs": {"axes": [1, 0, 2, 3]}}
-{"op": "CONT", "inputs": ["_80_cast_fp16_mm_y_perm"], "outputs": ["_80_cast_fp16_mm_y_cont"]}
-{"op": "MUL_MAT", "inputs": ["_80_cast_fp16_mm_y_cont", "const_2_to_fp16"], "outputs": ["_80_cast_fp16"]}
+```
+#0 0x0 in ?? ()
+#1 ggml_compute_forward_mul_mat_one_chunk (ggml-cpu.c) -- crashes at `call *%r13`, i.e. an indirect call
+   through a null function pointer
 ```
 
-This is LFM2's RoPE inverse-frequency outer product (`inv_freq_expanded @ position_ids_expanded`, HF's own
-rotary embedding code), composed via the exporter's `matmul` `transpose_x=False, transpose_y=False` branch
-(item 1's own fix) — `const_2_to_fp16` is the real, GGUF-loaded `[1,32,1]` inverse-frequency table.
+`ggml_compute_forward_mul_mat_one_chunk` reads `vec_dot = type_traits_cpu[src0->type].vec_dot` and calls it
+unconditionally — `type_traits_cpu[GGML_TYPE_I32].vec_dot` is a null pointer (ggml has no integer matmul
+kernel; `MUL_MAT` is a float/quantized-only op). `src0` (the first operand of `ggml_mul_mat(a, b)`, i.e.
+`a`) was `_80_cast_fp16_mm_y_cont` — the `CONT`/`PERMUTE`/`RESHAPE`/`RESHAPE` chain built directly from
+`cache_position`, whose declared GraphBuilder input dtype is `i32`. **None of the ops in that chain change
+dtype**, so the tensor reaching `MUL_MAT` was still genuinely `i32` — the assertions on `ne`/`nb` all
+passed (shapes lined up fine), but the *type* was wrong, and nothing checks that before dispatching to
+`vec_dot`.
 
-**What's been ruled out, each confirmed by an isolated standalone repro (a tiny hand-written `ggml`
-program, no `GraphBuilder`/`GgufModel` involved):**
-- Plain `ggml_mul_mat` on tensors of the exact same shapes (`[1,3,1,1]` × `[1,32,1,1]`) with fresh
-  synthetic data: works fine.
-- The full `PERMUTE`→`VIEW`×2→`MUL`(const)→`CONCAT`(self)→`MUL`(broadcast) chain used elsewhere in the same
-  RoPE computation, with synthetic data: works fine.
-- Self-`CONCAT` (`ggml_concat(x, x, dim)`, the standard `torch.cat([freqs, freqs])` RoPE trick) in
-  isolation: works fine.
-- Reducing thread count to 1 (`ggml_backend_cpu_set_n_threads(backend, 1)`): crash persists, so it is not
-  purely a threading race, despite the worker-thread signature.
-- Dead-node/dead-weight pruning (items 5-6 above): both real, valuable fixes, but neither changes this
-  crash. Confirmed by testing before AND after landing each.
-- This is **not the same bug** as `test_e2e_lfm2_lua_driver`'s own pre-existing failure (the bespoke-path
-  test that was already failing before this session started) — confirmed by running that test under
-  AddressSanitizer too: it hits a clean `GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0))`
-  at a completely different call site, not a null-pointer/thread crash. Two separate, unrelated bugs.
+**Root cause, traced back to the exporter:** HF's rotary-embedding code does
+`position_ids_expanded = position_ids[:, None, :].float()` before the inv-freq matmul — this is a genuine
+int32→fp32 numeric conversion, which MIL represents as a `cast(x=position_ids, dtype="fp32")` op.
+`exporter.py`'s `op_type == "cast"` handling (`tools/loom_mil_compiler/exporter.py`, ~line 753) treated
+*every* `cast` op as a pure alias (`aliases[output_name] = resolve(input_name)`, no node emitted) — correct
+for MIL's much more common fp16↔fp32 storage-precision casts (this engine always computes in f32
+internally regardless of a GGUF weight's declared storage dtype, so those really are no-ops), but silently
+wrong for this one int→float cast, the only one anywhere in LFM2's ~815-node graph.
 
-**What this means:** something about the *real* `GraphBuilder`/`GgufModel` construction of this exact
-5-node graph — not the raw shapes/values, not the op sequence in isolation, not threading, not the two dead
-tensors already found — triggers this. Prime remaining suspects, in order of how cheap they are to check:
-GGUF weight buffer alignment/adjacency for `const_2_to_fp16` specifically (it sits immediately after LFM2's
-268MB embedding table in tensor-declaration order — worth trying a deliberately reordered/padded GGUF to see
-if the crash moves or disappears); `ggml_gallocr`'s buffer-reuse decisions for this specific small-graph
-shape (try building with a much larger `compute_meta_bytes`/graph-size margin to see if a reuse decision
-changes); and the `ggml_map_custom1`-based custom ops used earlier in the same topology for RMSNorm's
-`RSQRT` (`op_rsqrt`, `primitives_basic.cpp`) interacting with gallocr in a way this minimal 5-node repro
-doesn't fully isolate (the crash was also reproducible with more RSQRT calls present upstream in a larger
-truncation; worth re-confirming it reproduces with *this exact* minimal 5-node topology specifically, since
-the bisection's last few steps focused on node count rather than re-verifying the very smallest cut still
-crashes standalone). A real debugger (`gdb`/`lldb`, neither available in this environment) would very likely
-resolve this quickly via a core dump backtrace — worth installing before spending more time on manual
-bisection.
+**Fix (two sides):**
+- `src/ops/primitives_basic.cpp`: added a real `CAST` primitive (`op_cast`, registered as `LOOM_REGISTER_OP(CAST, op_cast)`)
+  that calls `ggml_cast(ctx, x, type)` for a `dtype` attr of `"f32"`/`"f16"`/`"i32"` — ggml's own
+  `ggml_compute_forward_dup` already has a real `GGML_TYPE_I32 -> GGML_TYPE_F32` conversion path
+  (`ggml-cpu/ops.cpp`), it just was never reachable from this exporter.
+- `tools/loom_mil_compiler/exporter.py`: the `cast` handling now compares `get_var_info(...)["dtype"]`
+  (already-existing "i32"/"f32" classification) between input and output; if they differ, it emits a real
+  `CAST` node instead of aliasing. If they match (the common fp16↔fp32 case), behavior is unchanged
+  (alias, no node).
 
-**Explicitly out of scope, still:** items 5's "broader ask" (auditing `primitives_basic.cpp`'s layout-healing
-heuristics) and item 4 (tokenization) remain untouched. Item 6's LFM2-specific quantization verification and
-a fresh HF numerical-correctness pass (item 1's own bisection technique, at a genuinely dynamic length)
-both remain blocked on the crash above — a shape/build fix alone won't confirm values are right, only that
-the graph builds and computes at all.
+**Verified:**
+- Re-exporting LFM2 (both atomic and monolithic) now emits exactly one `CAST` node in the whole graph, at
+  precisely the position_ids→float boundary predicted above (`{"op": "CAST", "inputs": ["_75"], "outputs":
+  ["_75_to_fp16"], "attrs": {"dtype": "f32"}}`), confirming this really was the only int→float boundary in
+  LFM2's traced graph.
+- The exact minimal 5(+1)-node repro, re-bisected from the fixed export, now builds and computes cleanly
+  (`compute status = 0`, correct output shape `[3,32,1,1]` for a 3-token prompt) under the same `gdb`-built
+  harness that used to crash it.
+- Full `ctest`: same single pre-existing unrelated failure as baseline (`test_e2e_lfm2_lua_driver`, the
+  bespoke non-MIL path, root-caused in a prior session as a different bug — a clean
+  `GGML_ASSERT(ggml_is_contiguous(...))`, not this one). Zero new regressions across every other model
+  (Whisper, Conformer-CTC, Qwen3, VITS, Matcha-TTS, SupertonicTTS, Kokoro, StyleTTS2).
+- `test_e2e_lfm2_mil_export` (the regression test for this exact issue) now runs to completion instead of
+  crashing — 6/10 argmax checks currently fail (see below), but that is `test_e2e_lfm2_mil_export`
+  reporting via `LOOM_CHECK`/log-don't-hard-assert rather than crashing, i.e. exactly the intended behavior
+  once the graph actually computes.
+
+**Update (same follow-up session): the numerical mismatch is FIXED too — root cause was HF's `repeat_kv()`
+GQA head-tiling idiom, fused to the wrong ggml primitive semantics, unrelated to sequence-length shape at
+all.** Bisected by capturing real HF intermediates via forward hooks (not `.forward()`-reassignment
+monkeypatches, which turned out to silently produce wrong captures for a `@deprecate_kwarg`-decorated
+method — see pitfall below) at every layer boundary for the exact 3-token prompt, then comparing against
+`GraphBuilder`-computed checkpoints from the same truncated-topology technique used for the crash above.
+Embedding, both ShortConv layers, RoPE cos/sin, the RMSNorm feeding attention, Q/K post-RoPE, raw attention
+scores, the causal-masked scores, and the softmax all matched HF to fp16-rounding precision (~1e-4) —
+**the divergence appears only in the softmax×V output**, isolated to specific `(head, head_dim)` positions
+that lined up exactly with `head % num_key_value_heads` (ggml's actual tiling) vs. `head //
+num_key_value_groups` (HF's actual tiling) disagreeing.
+
+**Root cause:** `_try_fuse_gqa_repeat_kv` (`tools/loom_mil_compiler/exporter.py`, added in this same
+session's earlier "7 more real bugs" pass, item 3 above) fused HF's `repeat_kv()` idiom
+(unsqueeze→tile→reshape-merge) into a single native `REPEAT` node — but `ggml_repeat` **block-tiles** an
+axis (`dst[i] = src[i % ne_src]`, i.e. `kv0,kv1,...,kv7,kv0,kv1,...,kv7` — confirmed by reading
+`ggml_compute_forward_repeat_f32` in `ggml-cpu/ops.cpp` directly), while `repeat_kv()` produces an
+**interleaved** repeat (`dst[i] = src[i // n_rep]`, i.e. `kv0,kv0,kv1,kv1,...,kv7,kv7` — the standard GQA
+head-group convention). These only agree when `n_rep == 1`; LFM2 has `n_rep = 2` (16 query heads / 8 KV
+heads), so 14 of 16 query heads attended to the wrong KV head. This is a pure head-tiling bug, orthogonal
+to sequence length or padding — it would have misfired identically at the old fixed-128-padded shape too;
+item 1's original "RESOLVED" verification evidently didn't happen to catch it (its own writeup only says
+Q/K/V "match to fp32 rounding precision," without stating which specific heads were spot-checked).
+
+**Fix (`tools/loom_mil_compiler/exporter.py`, `_try_fuse_gqa_repeat_kv`):** compose the correct interleaved
+semantics from three primitives instead of one, mirroring what HF's own ops actually do bit-for-bit: (1)
+`RESHAPE` the pre-tile tensor to insert a genuine size-1 axis right where HF's `unsqueeze` put it — a pure
+relabeling, moves no data, since the axis it displaces into (batch) is already size 1; (2) `REPEAT` that
+size-1 axis up to the GQA ratio — always safe regardless of block-tile-vs-interleave semantics, since
+repeating a *single* source element by any tiling scheme gives the same result; (3) `RESHAPE` again to
+merge the now-ratio-sized axis into the adjacent kv-heads axis, with the ratio as the faster-varying
+component of the pair — a plain contiguous axis-merge that exactly reproduces `dst[i] = src[i // ratio]`.
+Confirmed in the re-exported topology: `RESHAPE([64,n_tokens,8,1]->[64,n_tokens,1,8])` →
+`REPEAT(->[64,n_tokens,2,8])` → `RESHAPE(->[64,n_tokens,16,1])`, exactly as derived.
+
+**Pitfall hit while bisecting (worth recording since it cost real time):** an initial HF-side capture
+script reassigned `type(attn_module).forward = patched_fn` to snapshot `Lfm2Attention.forward`'s
+`hidden_states` argument — this silently captured the WRONG tensor (a completely different value, not just
+subtly off), because `Lfm2Attention.forward` is wrapped by `@deprecate_kwarg`, and calling the captured
+"original" through a reassigned patch didn't preserve the decorator's own argument-normalization behavior.
+This produced a *convincing* false lead (a large, real-looking diff at exactly the RMSNorm boundary) that
+would have sent the investigation into "is `op_rms_norm` broken" instead of the real bug. Fixed by using
+`register_forward_hook`/`register_forward_pre_hook` on the actual `nn.Module` instances (`operator_norm`,
+`self_attn`) instead — hooks compose with decorators correctly since they run through the normal
+`Module.__call__` machinery rather than replacing the method object. **Lesson for next time:** prefer
+`register_forward_hook`/`register_forward_pre_hook` over reassigning `type(module).forward` when
+capturing HF internals for comparison, especially for any method wrapped by a decorator
+(`@deprecate_kwarg`, `@can_return_tuple`, etc. are common in current `transformers`).
+
+**Verified:** `test_e2e_lfm2_mil_export` now passes **10/10** checks (both atomic and monolithic GGUFs, both
+tested prompt lengths, exact top-1 token match against real HF — not just close logits). Full `ctest`: same
+single pre-existing unrelated failure as baseline (`test_e2e_lfm2_lua_driver`), zero new regressions.
+
+**Explicitly out of scope, still:** item 5's "broader ask" (auditing `primitives_basic.cpp`'s layout-healing
+heuristics) and item 4 (tokenization) remain untouched.
 
 *(The original problem statement and plan for this item — trace with `ct.RangeDim` instead of a fixed
 `(1,128)` shape, delete the static-padding stopgap, re-verify GQA tiling under dynamic lengths — is fully
