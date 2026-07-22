@@ -660,9 +660,30 @@ Outputs op_cont(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_cont(pc.ctx, in[0])};
 }
 
+// Genuine dtype conversions (e.g. MIL's `cast(x, dtype="fp32")` on an integer tensor, as HF's rotary
+// embedding code does to `position_ids` before the inv-freq matmul) -- NOT to be confused with the
+// exporter's own fp16<->fp32 "cast" ops, which it aliases away as no-ops since this engine always
+// computes in f32 internally regardless of a GGUF weight's storage dtype. A real int<->float
+// reinterpretation must go through ggml_cast, or a downstream op (e.g. MUL_MAT) that assumes float data
+// will read garbage / crash calling a null vec_dot for an integer src0 type.
+Outputs op_cast(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("CAST", in, 1);
+    if (!attrs.contains("dtype") || !attrs.at("dtype").is_string()) {
+        throw SchemaError("CAST requires a string 'dtype' attribute");
+    }
+    const std::string dtype = attrs.at("dtype").get<std::string>();
+    ggml_type type;
+    if (dtype == "f32") type = GGML_TYPE_F32;
+    else if (dtype == "f16") type = GGML_TYPE_F16;
+    else if (dtype == "i32") type = GGML_TYPE_I32;
+    else throw SchemaError("CAST: unsupported target dtype '" + dtype + "'");
+    return {ggml_cast(pc.ctx, in[0], type)};
+}
+
 } // namespace
 
 LOOM_REGISTER_OP(GET_ROWS, op_get_rows)
+LOOM_REGISTER_OP(CAST, op_cast)
 LOOM_REGISTER_OP(MUL_MAT, op_mul_mat)
 LOOM_REGISTER_OP(ADD, op_add)
 LOOM_REGISTER_OP(SUB, op_sub)
