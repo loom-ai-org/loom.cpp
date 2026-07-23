@@ -1921,6 +1921,38 @@ class LoomGGUFExporter:
         for name in dead:
             del self.weights[name]
 
+    def _write_tokenizer(self, w, tokenizer_dir: str):
+        """Dispatches to the right vocab writer for `tokenizer_dir`'s real HF tokenizer family, auto-
+        detecting both the family ("bpe"/"wordpiece"/"sentencepiece_proto") and, for "bpe", the
+        pretokenizer regex shape (`tokenizer.ggml.pre`) unless explicitly overridden via
+        `tokenizer_family`/`tokenizer_pre` kwargs -- see tokenizer_detect.py's own module docstring for
+        the detection recipes."""
+        from .tokenizer_detect import detect_vocab_family, detect_loom_pre_type
+
+        family = self.kwargs.get("tokenizer_family") or detect_vocab_family(tokenizer_dir)
+
+        if family == "bpe":
+            from .bpe_tokenizer_export import write_bpe_vocab
+            pre_type = self.kwargs.get("tokenizer_pre")
+            if pre_type is None:
+                from transformers import AutoTokenizer
+                pre_type = detect_loom_pre_type(AutoTokenizer.from_pretrained(tokenizer_dir))
+            write_bpe_vocab(w, tokenizer_dir, pre_type=pre_type)
+        elif family == "wordpiece":
+            from .wordpiece_tokenizer_export import write_wordpiece_vocab
+            write_wordpiece_vocab(w, tokenizer_dir)
+        elif family == "sentencepiece_proto":
+            from pathlib import Path
+            # Every entry point that imports loom_mil_compiler (export_hf_causal_lm.py,
+            # export_lfm2_*.py) inserts tools/ itself (not its parent) onto sys.path, so convert_nemo/ is
+            # importable as a top-level package the same way loom_mil_compiler is -- not "tools.convert_nemo".
+            from convert_nemo.tokenizer_common import write_sentencepiece_vocab
+            proto_path = next(p for p in (Path(tokenizer_dir) / "tokenizer.model",
+                                           Path(tokenizer_dir) / "spiece.model") if p.exists())
+            write_sentencepiece_vocab(w, proto_path.read_bytes())
+        else:
+            raise NotImplementedError(f"_write_tokenizer: no vocab writer for tokenizer family {family!r}")
+
     def write_gguf(self, driver_script: str):
         from gguf import GGUFWriter
         import os
@@ -1933,8 +1965,7 @@ class LoomGGUFExporter:
 
         tokenizer_dir = self.kwargs.get("tokenizer_dir") or os.environ.get("LOOM_TOKENIZER_DIR")
         if tokenizer_dir:
-            from .bpe_tokenizer_export import write_bpe_vocab
-            write_bpe_vocab(w, tokenizer_dir, pre_type=self.kwargs.get("tokenizer_pre", "qwen2"))
+            self._write_tokenizer(w, tokenizer_dir)
 
         # Embed the Lua driver orchestration script
         w.add_string("model.driver_script", driver_script)

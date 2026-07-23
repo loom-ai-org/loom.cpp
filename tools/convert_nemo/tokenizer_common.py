@@ -20,13 +20,20 @@ Uses the `sentencepiece` package's bundled protobuf definitions directly (`sente
 not the `SentencePieceProcessor` wrapper -- the wrapper doesn't expose `precompiled_charsmap` or the
 normalizer flags needed here.
 
+Optional `bos_token_id`/`eos_token_id`/`add_bos_token`/`add_eos_token` kwargs close the gap that
+otherwise blocks ALBERT/XLNet-style Unigram models (which wrap sequences via SentencePiece's own BOS/EOS
+convention rather than a separate CLS/SEP concept, unlike T5's own tokenizer) -- default to today's no-op
+(nothing written), so every existing NeMo T5/BPE call site is byte-for-byte unaffected.
+
 Requires: pip install sentencepiece gguf
 """
 from gguf import GGUFWriter
 from sentencepiece import sentencepiece_model_pb2 as spm_pb2
 
 
-def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes) -> None:
+def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes, *,
+                               bos_token_id: int | None = None, eos_token_id: int | None = None,
+                               add_bos_token: bool = False, add_eos_token: bool = False) -> None:
     m = spm_pb2.ModelProto()
     m.ParseFromString(tokenizer_model_bytes)
 
@@ -53,3 +60,14 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes) 
     writer.add_remove_extra_whitespaces(bool(m.normalizer_spec.remove_extra_whitespaces))
     if m.normalizer_spec.precompiled_charsmap:
         writer.add_precompiled_charsmap(m.normalizer_spec.precompiled_charsmap)
+
+    if bos_token_id is not None:
+        writer.add_bos_token_id(bos_token_id)
+    if eos_token_id is not None:
+        writer.add_eos_token_id(eos_token_id)
+    # Only written when true -- matches the C++ side's own "absent KV defaults to false" convention, so
+    # every existing call site that never passes these kwargs writes byte-for-byte the same GGUF as before.
+    if add_bos_token:
+        writer.add_add_bos_token(True)
+    if add_eos_token:
+        writer.add_add_eos_token(True)

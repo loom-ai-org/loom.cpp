@@ -5,6 +5,7 @@
 
 #include <array>
 #include <climits>
+#include <unordered_map>
 
 namespace loom {
 namespace {
@@ -51,16 +52,21 @@ const std::unordered_map<char32_t, uint8_t>& byte_decoder() {
 
 bool is_ws(char32_t c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
 
-// [^\s\p{L}\p{N}] -- "punctuation-ish": not whitespace, not a letter, not a number.
-bool is_punct(char32_t c) { return !is_ws(c) && !is_letter(c) && !is_number(c); }
+// [^\s\p{L}\p{N}] -- "punctuation-ish": not whitespace, not a letter, not a number. `include_marks`
+// additionally excludes \p{M} (qwen35's own regex moves marks into the letter-run alternative instead,
+// see match_letter_run's own `include_marks` param).
+bool is_punct(char32_t c, bool include_marks = false) {
+    return !is_ws(c) && !is_letter(c) && !is_number(c) && !(include_marks && is_mark(c));
+}
 
 std::string slice_utf8(const std::vector<char32_t>& cps, size_t begin, size_t end) {
     return utf8_encode(std::vector<char32_t>(cps.begin() + static_cast<long>(begin),
                                               cps.begin() + static_cast<long>(end)));
 }
 
-// (?i:'s|'t|'re|'ve|'m|'ll|'d) -- the fixed set of English contraction suffixes the real Qwen2/Qwen3
-// tokenizer.json pretokenizer regex special-cases ahead of the general letter-run alternative.
+// (?i:'s|'t|'re|'ve|'m|'ll|'d) -- the fixed set of English contraction suffixes the real Qwen2/Qwen3/
+// llama3-family tokenizer.json pretokenizer regex special-cases ahead of the general letter-run
+// alternative (kQwenLlama3 shape -- ASCII-only case-insensitive match).
 bool match_contraction(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
     if (cps[pos] != U'\'') return false;
     static const char* const kSuffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
@@ -78,48 +84,175 @@ bool match_contraction(const std::vector<char32_t>& cps, size_t pos, size_t& end
     return false;
 }
 
-// [^\r\n\p{L}\p{N}]?\p{L}+
-bool match_letter_run(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
+// 's|'t|'re|'ve|'m|'ll|'d -- kGpt2Classic shape's contraction alternative: unlike kQwenLlama3's, this is
+// case-SENSITIVE literal text (no (?i:) in the real GPT-2/starcoder-family regex), so "'S"/"'T"/etc. do
+// NOT match here and fall through to the punctuation-run alternative instead.
+bool match_contraction_cs(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
+    if (cps[pos] != U'\'') return false;
+    static const char* const kSuffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+    for (const char* suf : kSuffixes) {
+        const size_t len = std::char_traits<char>::length(suf);
+        if (pos + 1 + len > cps.size()) continue;
+        bool match = true;
+        for (size_t k = 0; k < len; ++k) {
+            if (cps[pos + 1 + k] != static_cast<char32_t>(suf[k])) { match = false; break; }
+        }
+        if (match) { end = pos + 1 + len; return true; }
+    }
+    return false;
+}
+
+// [^\r\n\p{L}\p{N}]?\p{L}+ (kQwenLlama3 shape) -- `include_marks` widens the run (but NOT the leading
+// prefix-exclusion class) to `[\p{L}\p{M}]+`, qwen35's own variant (marks attach to the letter run rather
+// than falling into the punctuation-run alternative).
+bool match_letter_run(const std::vector<char32_t>& cps, size_t pos, size_t& end, bool include_marks = false) {
     const size_t n = cps.size();
+    auto is_run_char = [&](char32_t c) { return is_letter(c) || (include_marks && is_mark(c)); };
     size_t letters_begin = pos;
-    if (!(cps[pos] == U'\r' || cps[pos] == U'\n' || is_letter(cps[pos]) || is_number(cps[pos]))) {
-        if (pos + 1 < n && is_letter(cps[pos + 1])) letters_begin = pos + 1;
-        else return false; // lone prefix char with no following letter -- not this alternative's match
-    } else if (!is_letter(cps[pos])) {
+    if (!(cps[pos] == U'\r' || cps[pos] == U'\n' || is_run_char(cps[pos]) || is_number(cps[pos]))) {
+        if (pos + 1 < n && is_run_char(cps[pos + 1])) letters_begin = pos + 1;
+        else return false; // lone prefix char with no following run char -- not this alternative's match
+    } else if (!is_run_char(cps[pos])) {
         return false;
     }
+    size_t p = letters_begin;
+    while (p < n && is_run_char(cps[p])) ++p;
+    end = p;
+    return true;
+}
+
+// ` ?[^\s\p{L}\p{N}]+[\r\n]*` (kQwenLlama3 shape) -- `include_marks` also excludes `\p{M}` from the run
+// (qwen35's own variant, see match_letter_run).
+bool match_punct_run(const std::vector<char32_t>& cps, size_t pos, size_t& end, bool include_marks = false) {
+    const size_t n = cps.size();
+    size_t punct_begin;
+    if (cps[pos] == U' ' && pos + 1 < n && is_punct(cps[pos + 1], include_marks)) {
+        punct_begin = pos + 1;
+    } else if (is_punct(cps[pos], include_marks)) {
+        punct_begin = pos;
+    } else {
+        return false;
+    }
+    size_t p = punct_begin;
+    while (p < n && is_punct(cps[p], include_marks)) ++p;
+    while (p < n && (cps[p] == U'\r' || cps[p] == U'\n')) ++p;
+    end = p;
+    return true;
+}
+
+// `\p{N}` (max_run==1, e.g. Qwen2/Qwen3's own regex -- no quantifier, so digits never group; also used,
+// with no leading space, for kGpt2Classic's "isolated single digit" families -- see
+// match_number_run_gpt2_unbounded for that shape's OTHER digit-run variant) or `\p{N}{1,3}` (max_run==3,
+// LFM2's own regex, shared with llama.cpp's "llama3" pretokenizer type) -- greedily consumes up to
+// `max_run` consecutive digit codepoints starting at `pos`.
+bool match_number_run(const std::vector<char32_t>& cps, size_t pos, size_t max_run, size_t& end) {
+    if (!is_number(cps[pos])) return false;
+    const size_t n = cps.size();
+    size_t p = pos;
+    while (p < n && (p - pos) < max_run && is_number(cps[p])) ++p;
+    end = p;
+    return true;
+}
+
+// ` ?\p{L}+` (kGpt2Classic shape) -- unlike kQwenLlama3's match_letter_run, the optional prefix is
+// SPECIFICALLY a single space (not "any non-letter/non-number/non-newline character").
+bool match_letter_run_gpt2(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
+    const size_t n = cps.size();
+    size_t letters_begin;
+    if (cps[pos] == U' ' && pos + 1 < n && is_letter(cps[pos + 1])) letters_begin = pos + 1;
+    else if (is_letter(cps[pos])) letters_begin = pos;
+    else return false;
     size_t p = letters_begin;
     while (p < n && is_letter(cps[p])) ++p;
     end = p;
     return true;
 }
 
-// ` ?[^\s\p{L}\p{N}]+[\r\n]*`
-bool match_punct_run(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
+// ` ?\p{N}+` (kGpt2Classic shape's GPT-2/MPT/OLMO/JAIS/TRILLION/GRANITE_DOCLING variant -- inline,
+// unbounded digit run with an optional leading space, distinct from the STARCODER-family variant, which
+// isolates single digits via a separate leading pass with NO leading space -- already exactly
+// match_number_run(pos, 1, end)).
+bool match_number_run_gpt2_unbounded(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
     const size_t n = cps.size();
-    size_t punct_begin;
-    if (cps[pos] == U' ' && pos + 1 < n && is_punct(cps[pos + 1])) {
-        punct_begin = pos + 1;
-    } else if (is_punct(cps[pos])) {
-        punct_begin = pos;
-    } else {
-        return false;
-    }
-    size_t p = punct_begin;
-    while (p < n && is_punct(cps[p])) ++p;
-    while (p < n && (cps[p] == U'\r' || cps[p] == U'\n')) ++p;
+    size_t digits_begin;
+    if (cps[pos] == U' ' && pos + 1 < n && is_number(cps[pos + 1])) digits_begin = pos + 1;
+    else if (is_number(cps[pos])) digits_begin = pos;
+    else return false;
+    size_t p = digits_begin;
+    while (p < n && is_number(cps[p])) ++p;
     end = p;
     return true;
 }
 
-// `\p{N}` (max_run==1, Qwen2/Qwen3's own regex -- no quantifier, so digits never group) or `\p{N}{1,3}`
-// (max_run==3, LFM2's own regex, shared with llama.cpp's "llama3" pretokenizer type) -- greedily consumes
-// up to `max_run` consecutive digit codepoints starting at `pos`.
-bool match_number_run(const std::vector<char32_t>& cps, size_t pos, size_t max_run, size_t& end) {
-    if (!is_number(cps[pos])) return false;
+// ` ?[^\s\p{L}\p{N}]+` (kGpt2Classic shape) -- same punctuation-ish complement as match_punct_run, but
+// no trailing `[\r\n]*` absorption.
+bool match_punct_run_gpt2(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
     const size_t n = cps.size();
+    size_t punct_begin;
+    if (cps[pos] == U' ' && pos + 1 < n && is_punct(cps[pos + 1])) punct_begin = pos + 1;
+    else if (is_punct(cps[pos])) punct_begin = pos;
+    else return false;
+    size_t p = punct_begin;
+    while (p < n && is_punct(cps[p])) ++p;
+    end = p;
+    return true;
+}
+
+// " ?[^(\s|.,!?…。，、।۔،)]+" (kWhitespacePunctExclude shape -- poro-chat/bloom/gpt3-finnish/viking).
+// The parenthesized contents are LITERAL characters inside the `[...]` character class, not regex
+// metacharacters -- this excludes whitespace plus a fixed, small punctuation set (ASCII + CJK/Devanagari/
+// Arabic sentence punctuation), not general \p{P}. `exclude_digits` (viking only, whose own regex_exprs
+// runs an extra bare `\p{N}` pass ahead of this pattern, isolating single digits everywhere -- including
+// mid-run) additionally stops/excludes the run at digit codepoints, so they're picked up separately by
+// match_number_run(pos, 1, end) at the outer dispatch's higher priority instead.
+bool is_viking_excluded_punct(char32_t c) {
+    switch (c) {
+        case U'(': case U')': case U'|': case U'.': case U',': case U'!': case U'?':
+        case 0x2026: // … HORIZONTAL ELLIPSIS
+        case 0x3002: // 。 IDEOGRAPHIC FULL STOP
+        case 0xFF0C: // ， FULLWIDTH COMMA
+        case 0x3001: // 、 IDEOGRAPHIC COMMA
+        case 0x0964: // । DEVANAGARI DANDA
+        case 0x06D4: // ۔ ARABIC FULL STOP
+        case 0x060C: // ، ARABIC COMMA
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool match_ws_excl_punct(const std::vector<char32_t>& cps, size_t pos, size_t& end, bool exclude_digits) {
+    const size_t n = cps.size();
+    auto is_run_char = [&](char32_t c) {
+        return !is_ws(c) && !is_viking_excluded_punct(c) && !(exclude_digits && is_number(c));
+    };
+    size_t begin;
+    if (cps[pos] == U' ' && pos + 1 < n && is_run_char(cps[pos + 1])) begin = pos + 1;
+    else if (is_run_char(cps[pos])) begin = pos;
+    else return false;
+    size_t p = begin;
+    while (p < n && is_run_char(cps[p])) ++p;
+    end = p;
+    return true;
+}
+
+// The single alternative above is not regex-complete over whitespace/excluded-punctuation codepoints --
+// llama.cpp's own real implementation runs this pattern through std::regex (no custom scanner exists for
+// this shape), and std::regex_iterator's contract makes the ENTIRE unmatched span between two consecutive
+// matches its own chunk (not one codepoint at a time -- confirmed directly against
+// unicode_regex_split_stl's `match.position() - start_idx` gap-emission). E.g. "abc,def" splits into
+// ["abc", ",", "def"], and "abc  def" (two spaces) into ["abc", "  ", "def"]. `exclude_digits` (viking)
+// stops the gap at a digit too, since that's picked off by the separate, higher-priority
+// match_number_run(pos, 1, end) check in the outer dispatch instead.
+bool match_ws_excl_punct_gap(const std::vector<char32_t>& cps, size_t pos, size_t& end, bool exclude_digits) {
+    const size_t n = cps.size();
+    auto is_gap_char = [&](char32_t c) {
+        if (exclude_digits && is_number(c)) return false;
+        return is_ws(c) || is_viking_excluded_punct(c);
+    };
+    if (!is_gap_char(cps[pos])) return false;
     size_t p = pos;
-    while (p < n && (p - pos) < max_run && is_number(cps[p])) ++p;
+    while (p < n && is_gap_char(cps[p])) ++p;
     end = p;
     return true;
 }
@@ -141,9 +274,12 @@ bool match_ws_then_newline(const std::vector<char32_t>& cps, size_t pos, size_t&
     return false;
 }
 
-// `\s+(?!\S)` -- only reached once match_ws_then_newline has already failed, so the run at `pos` is
-// guaranteed newline-free. Matches the whole run if it reaches end-of-string; otherwise the lookahead
-// forces giving back exactly the run's last character (still whitespace, so `(?!\S)` is satisfied).
+// `\s+(?!\S)` -- shared by kQwenLlama3 (reached once match_ws_then_newline has already failed, so the
+// run at `pos` is guaranteed newline-free there) and kGpt2Classic (reached directly, no newline-splitting
+// alternative exists in that shape). Matches the whole run if it reaches end-of-string; otherwise the
+// lookahead forces giving back exactly the run's last character (still whitespace, so `(?!\S)` is
+// satisfied) -- a lone whitespace char immediately followed by non-whitespace fails here and falls
+// through to match_ws_fallback instead, same as llama.cpp's own custom scanners for both shapes do.
 bool match_ws_not_followed_by_nonspace(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
     if (!is_ws(cps[pos])) return false;
     const size_t n = cps.size();
@@ -165,6 +301,94 @@ bool match_ws_fallback(const std::vector<char32_t>& cps, size_t pos, size_t& end
     return true;
 }
 
+struct PreSpec {
+    BpeShape shape;
+    size_t max_number_run; // meaning is per-shape -- see BpeShape's own doc comment
+    bool include_marks = false;
+};
+
+// `tokenizer.ggml.pre` name -> {shape, params}, verified directly against llama.cpp's real
+// `llm_tokenizer_bpe` constructor switch (src/llama-vocab.cpp) and its string->enum table
+// (llama_vocab::impl::load) -- not guessed/recalled, every entry below was cross-checked against that
+// source. Names present in llama.cpp but absent here are real pretokenizer families this project doesn't
+// implement yet (CJK-script splitters, case-transition/camelCase shapes, cascading-whitespace shapes, and
+// the "byte_encode=false" SPM-style-BPE family, which all need more than a new regex -- they need a
+// different symbol-initialization step in BpeVocab::encode() itself) -- BpeVocab::load() throws a named
+// LoadError for any of those rather than silently mis-tokenizing.
+const std::unordered_map<std::string, PreSpec>& pre_spec_table() {
+    static const std::unordered_map<std::string, PreSpec> table = {
+        // kQwenLlama3, single-digit \p{N} (STABLELM2/QWEN2/HUNYUAN/SOLAR_OPEN/GROK_2 share one
+        // regex_exprs array; deepseek-r1-qwen/kormo/f2llmv2/megrez are QWEN2 string aliases).
+        {"qwen2", {BpeShape::kQwenLlama3, 1}},
+        {"deepseek-r1-qwen", {BpeShape::kQwenLlama3, 1}},
+        {"kormo", {BpeShape::kQwenLlama3, 1}},
+        {"f2llmv2", {BpeShape::kQwenLlama3, 1}},
+        {"megrez", {BpeShape::kQwenLlama3, 1}},
+        {"stablelm2", {BpeShape::kQwenLlama3, 1}},
+        {"hunyuan", {BpeShape::kQwenLlama3, 1}},
+        {"solar-open", {BpeShape::kQwenLlama3, 1}},
+        {"grok-2", {BpeShape::kQwenLlama3, 1}},
+        // kQwenLlama3 + \p{M} attaches to the letter run instead of the punct run (QWEN35's own variant).
+        {"qwen35", {BpeShape::kQwenLlama3, 1, /*include_marks=*/true}},
+        // kQwenLlama3, grouped-digit \p{N}{1,3} (LLAMA3/DBRX/SMAUG/CHATGLM4 share one regex_exprs array;
+        // llama-v3/llama-bpe/falcon3/falcon-h1/pixtral/midm-2.0/lfm2/jina-v5-nano are LLAMA3 string
+        // aliases; chatglm-bpe is a CHATGLM4 string alias).
+        {"llama3", {BpeShape::kQwenLlama3, 3}},
+        {"llama-v3", {BpeShape::kQwenLlama3, 3}},
+        {"llama-bpe", {BpeShape::kQwenLlama3, 3}},
+        {"falcon3", {BpeShape::kQwenLlama3, 3}},
+        {"falcon-h1", {BpeShape::kQwenLlama3, 3}},
+        {"pixtral", {BpeShape::kQwenLlama3, 3}},
+        {"midm-2.0", {BpeShape::kQwenLlama3, 3}},
+        {"lfm2", {BpeShape::kQwenLlama3, 3}},
+        {"jina-v5-nano", {BpeShape::kQwenLlama3, 3}},
+        {"dbrx", {BpeShape::kQwenLlama3, 3}},
+        {"smaug-bpe", {BpeShape::kQwenLlama3, 3}},
+        {"glm4", {BpeShape::kQwenLlama3, 3}},
+        {"chatglm-bpe", {BpeShape::kQwenLlama3, 3}},
+        // kGpt2Classic, unbounded \p{N}+ (GPT2/MPT/OLMO/JAIS/TRILLION/GRANITE_DOCLING share one
+        // regex_exprs array; phi-2/gigachat/jina-v2-es/jina-v2-de/a.x-4.0/mellum/modern-bert are GPT2
+        // string aliases, as is exaone4; jina-v1-en/jina-v2-code/roberta-bpe are also GPT2 string aliases
+        // that additionally default add_sep=true in llama.cpp -- loom reads add_sep_token from its own
+        // GGUF KV instead of hardcoding per pre-type, same convention as add_bos_token).
+        {"gpt-2", {BpeShape::kGpt2Classic, 0}},
+        {"phi-2", {BpeShape::kGpt2Classic, 0}},
+        {"jina-v2-es", {BpeShape::kGpt2Classic, 0}},
+        {"jina-v2-de", {BpeShape::kGpt2Classic, 0}},
+        {"gigachat", {BpeShape::kGpt2Classic, 0}},
+        {"a.x-4.0", {BpeShape::kGpt2Classic, 0}},
+        {"mellum", {BpeShape::kGpt2Classic, 0}},
+        {"modern-bert", {BpeShape::kGpt2Classic, 0}},
+        {"exaone4", {BpeShape::kGpt2Classic, 0}},
+        {"mpt", {BpeShape::kGpt2Classic, 0}},
+        {"olmo", {BpeShape::kGpt2Classic, 0}},
+        {"jais", {BpeShape::kGpt2Classic, 0}},
+        {"trillion", {BpeShape::kGpt2Classic, 0}},
+        {"granite-docling", {BpeShape::kGpt2Classic, 0}},
+        {"roberta-bpe", {BpeShape::kGpt2Classic, 0}},
+        {"jina-v1-en", {BpeShape::kGpt2Classic, 0}},
+        {"jina-v2-code", {BpeShape::kGpt2Classic, 0}},
+        // kGpt2Classic, single-digit (STARCODER/REFACT/COMMAND_R/SMOLLM/CODESHELL/EXAONE/MINERVA/
+        // MELLUM2 share one regex_exprs array: a separate bare `\p{N}` pass ahead of the main pattern,
+        // which isolates every digit to length 1 -- equivalent to max_number_run=1).
+        {"starcoder", {BpeShape::kGpt2Classic, 1}},
+        {"refact", {BpeShape::kGpt2Classic, 1}},
+        {"command-r", {BpeShape::kGpt2Classic, 1}},
+        {"smollm", {BpeShape::kGpt2Classic, 1}},
+        {"codeshell", {BpeShape::kGpt2Classic, 1}},
+        {"exaone", {BpeShape::kGpt2Classic, 1}},
+        {"minerva-7b", {BpeShape::kGpt2Classic, 1}},
+        {"mellum2", {BpeShape::kGpt2Classic, 1}},
+        // kWhitespacePunctExclude (PORO/BLOOM/GPT3_FINNISH share one single-alternative regex_exprs
+        // array; VIKING's own array adds a second `\p{N}` pass isolating single digits).
+        {"poro-chat", {BpeShape::kWhitespacePunctExclude, 0}},
+        {"bloom", {BpeShape::kWhitespacePunctExclude, 0}},
+        {"gpt3-finnish", {BpeShape::kWhitespacePunctExclude, 0}},
+        {"viking", {BpeShape::kWhitespacePunctExclude, 1}},
+    };
+    return table;
+}
+
 } // namespace
 
 std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
@@ -178,8 +402,18 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
 
     auto vocab = std::unique_ptr<BpeVocab>(new BpeVocab());
     const std::string pre_type = model.has_kv("tokenizer.ggml.pre") ? model.kv_str("tokenizer.ggml.pre") : "qwen2";
-    vocab->max_number_run_ = (pre_type == "llama3") ? 3 : 1;
+    const auto& table = pre_spec_table();
+    const auto spec_it = table.find(pre_type);
+    if (spec_it == table.end()) {
+        throw LoadError("BpeVocab::load: unimplemented pretokenizer family '" + pre_type + "' -- either "
+                         "pass a supported --tokenizer-pre value, or extend bpe_vocab.cpp's "
+                         "pre_spec_table() for this family (see EXPORT-BACKLOG.md item 4)");
+    }
+    vocab->shape_ = spec_it->second.shape;
+    vocab->max_number_run_ = spec_it->second.max_number_run;
+    vocab->include_marks_ = spec_it->second.include_marks;
     vocab->add_bos_token_ = model.kv_bool("tokenizer.ggml.add_bos_token", false);
+    vocab->add_sep_token_ = model.kv_bool("tokenizer.ggml.add_sep_token", false);
     vocab->tokens_ = model.kv_arr_str("tokenizer.ggml.tokens");
     vocab->token_to_id_.reserve(vocab->tokens_.size());
     for (size_t i = 0; i < vocab->tokens_.size(); ++i) {
@@ -199,6 +433,7 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
 
     vocab->bos_id_ = model.kv_i32("tokenizer.ggml.bos_token_id", -1);
     vocab->eos_id_ = model.kv_i32("tokenizer.ggml.eos_token_id", -1);
+    vocab->sep_id_ = model.kv_i32("tokenizer.ggml.seperator_token_id", -1); // llama.cpp's own (misspelled) KV name, kept verbatim
     return vocab;
 }
 
@@ -209,16 +444,42 @@ std::vector<std::string> BpeVocab::pretokenize(const std::string& nfc_text) cons
     const size_t n = cps.size();
     while (pos < n) {
         size_t end;
-        if (match_contraction(cps, pos, end) || match_letter_run(cps, pos, end) ||
-            match_number_run(cps, pos, max_number_run_, end) || match_punct_run(cps, pos, end) ||
-            match_ws_then_newline(cps, pos, end) || match_ws_not_followed_by_nonspace(cps, pos, end) ||
-            match_ws_fallback(cps, pos, end)) {
+        bool matched;
+        switch (shape_) {
+            case BpeShape::kQwenLlama3:
+                matched = match_contraction(cps, pos, end) ||
+                          match_letter_run(cps, pos, end, include_marks_) ||
+                          match_number_run(cps, pos, max_number_run_, end) ||
+                          match_punct_run(cps, pos, end, include_marks_) ||
+                          match_ws_then_newline(cps, pos, end) ||
+                          match_ws_not_followed_by_nonspace(cps, pos, end) ||
+                          match_ws_fallback(cps, pos, end);
+                break;
+            case BpeShape::kGpt2Classic:
+                matched = match_contraction_cs(cps, pos, end) ||
+                          match_letter_run_gpt2(cps, pos, end) ||
+                          (max_number_run_ == 0 ? match_number_run_gpt2_unbounded(cps, pos, end)
+                                                 : match_number_run(cps, pos, max_number_run_, end)) ||
+                          match_punct_run_gpt2(cps, pos, end) ||
+                          match_ws_not_followed_by_nonspace(cps, pos, end) ||
+                          match_ws_fallback(cps, pos, end);
+                break;
+            case BpeShape::kWhitespacePunctExclude:
+                matched = (max_number_run_ >= 1 && match_number_run(cps, pos, 1, end)) ||
+                          match_ws_excl_punct(cps, pos, end, /*exclude_digits=*/max_number_run_ >= 1) ||
+                          match_ws_excl_punct_gap(cps, pos, end, /*exclude_digits=*/max_number_run_ >= 1);
+                break;
+            default:
+                matched = false;
+                break;
+        }
+        if (matched) {
             chunks.push_back(slice_utf8(cps, pos, end));
             pos = end;
         } else {
-            // Every codepoint is whitespace, a letter, a number, or "other" (punct) -- the 7 alternatives
-            // above are exhaustive over those classes, so this should be unreachable; fail closed rather
-            // than infinite-loop if some future Unicode edge case proves otherwise.
+            // Every codepoint is whitespace, a letter, a number, or "other" (punct) -- the alternatives
+            // for this shape are exhaustive over those classes, so this should be unreachable; fail closed
+            // rather than infinite-loop if some future Unicode edge case proves otherwise.
             throw LoadError("BpeVocab::pretokenize: no pretokenizer alternative matched at codepoint U+" +
                              std::to_string(static_cast<uint32_t>(cps[pos])));
         }
@@ -267,6 +528,9 @@ std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
             }
             ids.push_back(it->second);
         }
+    }
+    if (add_sep_token_ && sep_id_ >= 0) {
+        ids.push_back(sep_id_);
     }
     return ids;
 }

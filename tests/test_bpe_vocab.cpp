@@ -22,7 +22,7 @@ int main() {
 
     auto vocab = loom::BpeVocab::load(*model);
     LOOM_CHECK(vocab != nullptr);
-    LOOM_CHECK(vocab->size() == 260); // 256 base byte tokens + "ll","he","hell","hello"
+    LOOM_CHECK(vocab->size() == 261); // 256 base byte tokens + "ll","he","hell","hello","12"
     LOOM_CHECK(vocab->bos_id() == 0);
     LOOM_CHECK(vocab->eos_id() == 1);
 
@@ -82,6 +82,60 @@ int main() {
         const auto ids = vocab->encode(decomposed);
         LOOM_CHECK(vocab->decode(ids) == precomposed);
         LOOM_CHECK(loom::nfc_normalize(decomposed) == precomposed);
+    }
+
+    // --- kGpt2Classic shape ("gpt-2" pre, unbounded digit run + case-sensitive contraction) ---
+    {
+        const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/bpe_vocab_gpt2_test.gguf";
+        auto gpt2_model = loom::GgufModel::load(path, backend.get());
+        LOOM_CHECK(gpt2_model != nullptr);
+        auto gpt2_vocab = loom::BpeVocab::load(*gpt2_model);
+        LOOM_CHECK(gpt2_vocab != nullptr);
+
+        // "12": unbounded `\p{N}+` groups both digits into ONE pretokenizer chunk (unlike qwen2's
+        // digit-by-digit chunking above), so the "1 2" merge -- unreachable under qwen2 -- now applies,
+        // reducing to the single "12" token (id 260, the 5th extra token after ll/he/hell/hello).
+        {
+            const auto ids = gpt2_vocab->encode("12");
+            LOOM_CHECK((ids == std::vector<int32_t>{260}));
+            LOOM_CHECK(gpt2_vocab->decode(ids) == "12");
+        }
+        // "don'T": kGpt2Classic's contraction alternative is case-SENSITIVE literal text ('t, not (?i:'t))
+        // -- the uppercase "'T" does NOT match it (unlike qwen2/llama3's case-insensitive contraction),
+        // so it falls through to a lone "'" punctuation chunk, then a separate single-letter "T" chunk,
+        // rather than qwen2's single "'T" contraction chunk. No merges apply either way, so this is a
+        // round-trip check (chunk boundaries don't cross real vocab merges here) rather than a
+        // hand-traced-id difference.
+        {
+            const auto ids = gpt2_vocab->encode("don'T");
+            LOOM_CHECK(gpt2_vocab->decode(ids) == "don'T");
+        }
+    }
+
+    // --- kWhitespacePunctExclude shape ("poro-chat" pre, excludes a fixed literal punctuation set) ---
+    {
+        const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/bpe_vocab_poro_test.gguf";
+        auto poro_model = loom::GgufModel::load(path, backend.get());
+        LOOM_CHECK(poro_model != nullptr);
+        auto poro_vocab = loom::BpeVocab::load(*poro_model);
+        LOOM_CHECK(poro_vocab != nullptr);
+
+        // "abc,def": ',' is in the shape's literal excluded-punctuation set (unlike qwen2's general
+        // \p{L}/\p{N}/\p{P} classification), so it becomes its own single-character chunk between two
+        // word chunks -- byte ids for ',' (44) sit standalone between "abc" and "def"'s raw byte ids.
+        {
+            const auto ids = poro_vocab->encode("abc,def");
+            const std::vector<int32_t> expected = {97, 98, 99, 44, 100, 101, 102};
+            LOOM_CHECK(ids == expected);
+            LOOM_CHECK(poro_vocab->decode(ids) == "abc,def");
+        }
+        // "hello world": unaffected by the shape difference (no excluded punctuation), still fully
+        // reduces "hello" via the same 4 merges -- confirms the vocab/merges are shape-independent.
+        {
+            const auto ids = poro_vocab->encode("hello world");
+            LOOM_CHECK(ids.front() == 259); // "hello" -> single token, same id as the qwen2 fixture
+            LOOM_CHECK(poro_vocab->decode(ids) == "hello world");
+        }
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

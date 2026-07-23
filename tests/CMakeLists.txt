@@ -257,6 +257,21 @@ target_link_libraries(test_vocab_spm_bpe PRIVATE loom::engine)
 add_test(NAME test_vocab_spm_bpe COMMAND test_vocab_spm_bpe)
 set_tests_properties(test_vocab_spm_bpe PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- EXPORT-BACKLOG.md item 4: Vocab's bos_token_id/eos_token_id/add_bos_token/add_eos_token support
+#     (ALBERT/XLNet-style Unigram gap), synthetic fixture with a hand-traceable Viterbi segmentation ---
+add_test(
+    NAME gen_vocab_ugm_bos_eos_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_vocab_ugm_bos_eos_gguf.py
+            ${LOOM_FIXTURE_DIR}/vocab_ugm_bos_eos_test.gguf
+)
+set_tests_properties(gen_vocab_ugm_bos_eos_gguf_fixture PROPERTIES FIXTURES_SETUP vocab_ugm_bos_eos_gguf_fixture)
+
+add_executable(test_vocab_ugm_bos_eos test_vocab_ugm_bos_eos.cpp)
+target_link_libraries(test_vocab_ugm_bos_eos PRIVATE loom::engine)
+target_compile_definitions(test_vocab_ugm_bos_eos PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_vocab_ugm_bos_eos COMMAND test_vocab_ugm_bos_eos)
+set_tests_properties(test_vocab_ugm_bos_eos PROPERTIES FIXTURES_REQUIRED vocab_ugm_bos_eos_gguf_fixture)
+
 add_executable(test_ctc_decode test_ctc_decode.cpp)
 target_link_libraries(test_ctc_decode PRIVATE loom::engine)
 add_test(NAME test_ctc_decode COMMAND test_ctc_decode)
@@ -275,11 +290,43 @@ add_test(
 )
 set_tests_properties(gen_bpe_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_gguf_fixture)
 
+# Same tiny vocab/merges, different `tokenizer.ggml.pre` shapes -- exercises kGpt2Classic (item 4's
+# BPE-pretokenizer-family generalization) and kWhitespacePunctExclude.
+add_test(
+    NAME gen_bpe_vocab_gpt2_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bpe_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/bpe_vocab_gpt2_test.gguf --pre gpt-2
+)
+set_tests_properties(gen_bpe_vocab_gpt2_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_gpt2_gguf_fixture)
+
+add_test(
+    NAME gen_bpe_vocab_poro_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bpe_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/bpe_vocab_poro_test.gguf --pre poro-chat
+)
+set_tests_properties(gen_bpe_vocab_poro_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_poro_gguf_fixture)
+
 add_executable(test_bpe_vocab test_bpe_vocab.cpp)
 target_link_libraries(test_bpe_vocab PRIVATE loom::engine)
 target_compile_definitions(test_bpe_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_bpe_vocab COMMAND test_bpe_vocab)
-set_tests_properties(test_bpe_vocab PROPERTIES FIXTURES_REQUIRED bpe_vocab_gguf_fixture)
+set_tests_properties(test_bpe_vocab PROPERTIES
+    FIXTURES_REQUIRED "bpe_vocab_gguf_fixture;bpe_vocab_gpt2_gguf_fixture;bpe_vocab_poro_gguf_fixture")
+
+# --- EXPORT-BACKLOG.md item 4: WordPieceVocab (BERT-family), synthetic fixture with hand-traceable
+#     "##"-continuation split, punctuation isolation, [UNK] fallback, accents, CLS/SEP wrap ---
+add_test(
+    NAME gen_wordpiece_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_wordpiece_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/wordpiece_vocab_test.gguf
+)
+set_tests_properties(gen_wordpiece_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP wordpiece_vocab_gguf_fixture)
+
+add_executable(test_wordpiece_vocab test_wordpiece_vocab.cpp)
+target_link_libraries(test_wordpiece_vocab PRIVATE loom::engine)
+target_compile_definitions(test_wordpiece_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_wordpiece_vocab COMMAND test_wordpiece_vocab)
+set_tests_properties(test_wordpiece_vocab PROPERTIES FIXTURES_REQUIRED wordpiece_vocab_gguf_fixture)
 
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
 #     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---

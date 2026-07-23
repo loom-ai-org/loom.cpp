@@ -34,9 +34,30 @@ bool is_number(char32_t cp);
 // (and similar negated-class) alternatives need.
 bool is_letter_or_number(char32_t cp);
 
+// True if `cp`'s Unicode general category is a Punctuation (P*) major category -- `\p{P}`. Needed by
+// WordPieceVocab's word-splitting (isolates punctuation into single-character words) and by BPE
+// pretokenizer shapes that exclude punctuation explicitly.
+bool is_punctuation(char32_t cp);
+
+// True if `cp`'s Unicode general category is a Mark (M*) major category -- `\p{M}` (combining marks).
+// Needed by WordPieceVocab's accent-stripping and by the qwen35-family BPE pretokenizer shape, whose
+// regex attaches marks to the preceding letter run (`[\p{L}\p{M}]+`) rather than splitting on them.
+bool is_mark(char32_t cp);
+
+// Single-codepoint lowercase mapping (loom::unicode_data::kLowercaseMap), identity if `cp` has no
+// mapping or its lowercase form isn't a single codepoint. Mirrors llama.cpp's own `unicode_tolower`
+// scope -- a table lookup, not a general case-folding algorithm.
+char32_t to_lower(char32_t cp);
+
 // Unicode Normalization Form C (canonical decomposition followed by canonical composition, UAX #15).
 // Operates on a full UTF-8 string end to end (decode -> decompose -> canonically order -> compose ->
 // encode); a no-op for already-NFC input, which is the overwhelming majority of real-world UTF-8 text.
 std::string nfc_normalize(const std::string& text);
+
+// Unicode Normalization Form D (canonical decomposition + canonical ordering, no recomposition step) --
+// the same first two passes nfc_normalize() already performs, exposed standalone since WordPieceVocab's
+// accent-stripping needs the decomposed form (base letter + separate combining marks) so it can drop the
+// marks, not the recomposed one.
+std::string nfd_normalize(const std::string& text);
 
 } // namespace loom
