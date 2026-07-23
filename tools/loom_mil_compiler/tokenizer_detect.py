@@ -13,7 +13,9 @@ Two independent responsibilities:
    class to hang that dispatch off of; sniffing the tokenizer's own declared type directly is the natural
    generic-exporter equivalent. "Unigram" only resolves to "sentencepiece_proto" if a sibling
    tokenizer.model/spiece.model SentencePiece protobuf exists -- loom's Vocab (C++) needs the real
-   protobuf for precompiled_charsmap, a tokenizer.json-only Unigram model isn't supported yet.
+   protobuf for precompiled_charsmap, a tokenizer.json-only Unigram model isn't supported yet. ByT5-family
+   tokenizers ("byte") have no tokenizer.json/tokenizer.model at all (no Rust "fast" backend exists for
+   them) -- detected instead via tokenizer_config.json's own `tokenizer_class=="ByT5Tokenizer"` field.
 
 2. `detect_loom_pre_type()` -- for the "bpe" family, ports llama.cpp's own auto-detection recipe from
    `conversion/base.py`'s `get_vocab_base_pre` verbatim: encode a fixed test string (`_CHKTXT`, byte-for-
@@ -215,7 +217,7 @@ def detect_loom_pre_type(tokenizer, *, fallback: str = "qwen2") -> str:
 
 
 def detect_vocab_family(tokenizer_dir: str) -> str:
-    """Returns "bpe" / "wordpiece" / "sentencepiece_proto". See module docstring."""
+    """Returns "bpe" / "wordpiece" / "sentencepiece_proto" / "byte". See module docstring."""
     tok_dir = Path(tokenizer_dir)
     tokenizer_json_path = tok_dir / "tokenizer.json"
     if tokenizer_json_path.exists():
@@ -235,5 +237,13 @@ def detect_vocab_family(tokenizer_dir: str) -> str:
         raise NotImplementedError(f"tokenizer.json model.type={model_type!r} has no loom vocab-writer yet")
     if any((tok_dir / n).exists() for n in ("tokenizer.model", "spiece.model")):
         return "sentencepiece_proto"
-    raise NotImplementedError(f"no recognized tokenizer file (tokenizer.json/tokenizer.model/spiece.model) "
-                               f"found in {tokenizer_dir}")
+    # ByT5-family tokenizers (e.g. google/byt5-small) have NO tokenizer.json/tokenizer.model at all --
+    # ByT5Tokenizer has no Rust "fast" backend, so no fast-tokenizer file is ever distributed for it. The
+    # only on-disk marker is tokenizer_config.json's own tokenizer_class field.
+    config_path = tok_dir / "tokenizer_config.json"
+    if config_path.exists():
+        tokenizer_class = json.loads(config_path.read_text()).get("tokenizer_class")
+        if tokenizer_class == "ByT5Tokenizer":
+            return "byte"
+    raise NotImplementedError(f"no recognized tokenizer file (tokenizer.json/tokenizer.model/spiece.model/"
+                               f"a ByT5Tokenizer tokenizer_config.json) found in {tokenizer_dir}")

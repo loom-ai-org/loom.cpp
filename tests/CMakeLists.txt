@@ -328,6 +328,20 @@ target_compile_definitions(test_wordpiece_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="$
 add_test(NAME test_wordpiece_vocab COMMAND test_wordpiece_vocab)
 set_tests_properties(test_wordpiece_vocab PROPERTIES FIXTURES_REQUIRED wordpiece_vocab_gguf_fixture)
 
+# --- ByT5-family byte-level tokenizer (ByteVocab), synthetic fixture with a small extra_ids count ---
+add_test(
+    NAME gen_byte_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_byte_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/byte_vocab_test.gguf
+)
+set_tests_properties(gen_byte_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP byte_vocab_gguf_fixture)
+
+add_executable(test_byte_vocab test_byte_vocab.cpp)
+target_link_libraries(test_byte_vocab PRIVATE loom::engine)
+target_compile_definitions(test_byte_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_byte_vocab COMMAND test_byte_vocab)
+set_tests_properties(test_byte_vocab PROPERTIES FIXTURES_REQUIRED byte_vocab_gguf_fixture)
+
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
 #     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---
 set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)
