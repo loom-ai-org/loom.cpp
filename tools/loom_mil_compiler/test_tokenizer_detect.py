@@ -103,6 +103,11 @@ class TestTokenizerDetect(unittest.TestCase):
             (Path(d) / "tokenizer.model").write_bytes(b"")
             self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
 
+    def test_detect_vocab_family_byt5(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "tokenizer_config.json").write_text(json.dumps({"tokenizer_class": "ByT5Tokenizer"}))
+            self.assertEqual(td.detect_vocab_family(d), "byte")
+
     def test_detect_vocab_family_nothing_found_raises(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(NotImplementedError):

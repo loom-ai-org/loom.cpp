@@ -552,7 +552,24 @@ files):**
   and existing hand-rolled scanner style, per an explicit decision to avoid a second, parallel Unicode
   classification system. Only llama.cpp's *data* (the chktxt/hash table, the literal regex pattern text,
   the name-to-shape groupings) was reused, transcribed directly from source, not vendored as code.
-- Full `ctest`: 113/114 pass (same single pre-existing unrelated failure, `test_e2e_lfm2_lua_driver`,
+- **ByT5-family byte-level tokenizers** (`google/byt5-*` and fine-tunes, e.g. a real downloaded
+  `pos-tagger-byt5-romance-languages` checkpoint used to verify the exporter directly): new
+  `loom::ByteVocab` (`include/loom/core/byte_vocab.h`, `src/core/byte_vocab.cpp`), `tokenizer.ggml.model`
+  = `"byt5"`. No merges, trie, or regex at all — each raw UTF-8 byte maps to a fixed id `byte + 3`, plus
+  T5-style `<extra_id_N>` sentinels appended sequentially right after the byte range. Detected specially in
+  `tokenizer_detect.py`'s `detect_vocab_family()` since ByT5 ships no `tokenizer.json`/`tokenizer.model` at
+  all (no Rust "fast" tokenizer backend exists for it) — the only on-disk marker is
+  `tokenizer_config.json`'s own `tokenizer_class=="ByT5Tokenizer"` field. New
+  `tools/loom_mil_compiler/byt5_tokenizer_export.py` reads that same config's `added_tokens_decoder`
+  directly (not the top-level `extra_ids` field, which every real `ByT5Tokenizer.__init__` hardcodes to 0
+  regardless of the real sentinel count — verified by instantiating a real tokenizer and inspecting its
+  actual saved config, not assumed from its docstring, which also turned out to describe a different,
+  non-matching sentinel-ordering scheme than the real implementation's). Verified against a synthetic
+  fixture (`tests/test_byte_vocab.cpp`) with exact ids cross-checked against a real
+  `transformers.ByT5Tokenizer()` instance, and end to end against the real downloaded checkpoint above
+  (`detect_vocab_family` + `write_byt5_vocab` both run successfully against its real
+  `tokenizer_config.json`).
+- Full `ctest`: 115/116 pass (same single pre-existing unrelated failure, `test_e2e_lfm2_lua_driver`,
   missing checkpoint fixture — zero regressions). `test_e2e_lfm2_tokenizer`/`test_e2e_lfm2_mil_export`
   (the real-checkpoint byte-for-byte regression guards) both still pass unchanged.
 

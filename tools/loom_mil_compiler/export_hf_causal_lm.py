@@ -138,7 +138,8 @@ def main():
     parser.add_argument("--profile", choices=["monolithic", "atomic"], default="monolithic")
     parser.add_argument("--architecture", default=None, help="Defaults to model.config.model_type")
     parser.add_argument("--tokenizer-dir", default=None, help="Defaults to model_dir")
-    parser.add_argument("--tokenizer-family", default=None, choices=["bpe", "wordpiece", "sentencepiece_proto"],
+    parser.add_argument("--tokenizer-family", default=None,
+                         choices=["bpe", "wordpiece", "sentencepiece_proto", "byte"],
                          help="Overrides auto-detection (see tokenizer_detect.detect_vocab_family)")
     parser.add_argument("--tokenizer-pre", default=None,
                          help="Overrides auto-detection for the 'bpe' family (see tokenizer_detect.detect_loom_pre_type)")

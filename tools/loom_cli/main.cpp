@@ -182,6 +182,20 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "byt5") {
+            // ByT5-family byte-level models: inspection-only, same reasoning as the "bert" branch above --
+            // no generation loop is wired up for this model shape here.
+            auto byte_vocab = loom::ByteVocab::load(*model);
+            std::printf("  tokenizer: byte-level (byt5), %zu tokens\n", byte_vocab->size());
+            if (has_prompt) {
+                const auto ids = byte_vocab->encode(prompt_text);
+                std::printf("  encode(\"%s\") -> [", prompt_text.c_str());
+                for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? ", " : "", ids[i]);
+                std::printf("]\n");
+            }
+            return 0;
+        }
+
         if (has_prompt) {
             std::unique_ptr<loom::BpeVocab> bpe_vocab;
             if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "gpt2") {
