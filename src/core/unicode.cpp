@@ -247,6 +247,15 @@ bool in_ranges(char32_t cp, const CpRange* ranges, size_t count) {
 bool is_letter(char32_t cp) { return in_ranges(cp, kLetterRanges, kLetterRangesCount); }
 bool is_number(char32_t cp) { return in_ranges(cp, kNumberRanges, kNumberRangesCount); }
 bool is_letter_or_number(char32_t cp) { return is_letter(cp) || is_number(cp); }
+bool is_punctuation(char32_t cp) { return in_ranges(cp, kPunctuationRanges, kPunctuationRangesCount); }
+bool is_mark(char32_t cp) { return in_ranges(cp, kMarkRanges, kMarkRangesCount); }
+
+char32_t to_lower(char32_t cp) {
+    const auto it = std::lower_bound(std::begin(kLowercaseMap), std::end(kLowercaseMap), cp,
+                                      [](const CpMapEntry& e, char32_t c) { return e.cp < c; });
+    if (it != std::end(kLowercaseMap) && it->cp == cp) return it->value;
+    return cp;
+}
 
 std::string nfc_normalize(const std::string& text) {
     const std::vector<char32_t> input = utf8_decode(text);
@@ -256,6 +265,15 @@ std::string nfc_normalize(const std::string& text) {
     canonical_order(decomposed);
     const std::vector<char32_t> composed = canonical_compose(decomposed);
     return utf8_encode(composed);
+}
+
+std::string nfd_normalize(const std::string& text) {
+    const std::vector<char32_t> input = utf8_decode(text);
+    std::vector<char32_t> decomposed;
+    decomposed.reserve(input.size() * 2);
+    for (char32_t cp : input) decompose_recursive(cp, decomposed);
+    canonical_order(decomposed);
+    return utf8_encode(decomposed);
 }
 
 } // namespace loom

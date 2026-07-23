@@ -5,7 +5,7 @@ turn Python's stdlib `unicodedata` module (backed by the Unicode Character Datab
 own published CompositionExclusions.txt into a checked-in, static C++ header, exactly once. Re-run only
 if intentionally bumping the target Unicode version.
 
-Emits four tables, all `loom::unicode` has no other way to obtain (Python's unicodedata doesn't expose
+Emits seven tables, all `loom::unicode` has no other way to obtain (Python's unicodedata doesn't expose
 the exclusion set at all, and doesn't list algorithmic Hangul decompositions -- see below):
 
 1. `kLetterRanges`/`kNumberRanges`: sorted, merged [lo, hi] codepoint ranges whose general category is
@@ -26,6 +26,15 @@ the exclusion set at all, and doesn't list algorithmic Hangul decompositions -- 
    from the UCD's own normative CompositionExclusions.txt. Skipping this table would make composition
    silently WRONG for the characters it lists (e.g. it would wrongly recompose some sequences NFC must
    leave decomposed), not just incomplete.
+5. `kPunctuationRanges`/`kMarkRanges`: same range-compression as kLetterRanges/kNumberRanges but for
+   general categories P*/M* -- needed by WordPieceVocab's word-splitting (`\\p{P}` isolation) and by the
+   qwen35-family BPE pretokenizer shape (`[\\p{L}\\p{M}]+`, marks attach to letters rather than splitting
+   the letter run).
+6. `kLowercaseMap`: sparse codepoint -> single-codepoint lowercase mapping, non-identity entries only.
+   Needed by WordPieceVocab's `do_lower_case` normalization step. Multi-codepoint expansions (a handful of
+   `str.lower()` special-casings, e.g. some ligatures) are deliberately skipped -- WordPiece's own
+   lowercasing (mirroring llama.cpp's `unicode_tolower`) is a single-codepoint substitution, not a general
+   case-folding algorithm.
 
 Usage: python3 gen_unicode_tables.py > include/loom/core/unicode_data.h
 """
@@ -51,10 +60,11 @@ def fetch_composition_exclusions() -> list[int]:
 
 
 def compute_category_ranges(major_category: str) -> list[tuple[int, int]]:
-    """Range-compresses every codepoint whose general category starts with `major_category` ("L" or
-    "N") -- kept as two separate tables (not one combined L-or-N table) because the pretokenizer regex
-    uses \\p{L} and \\p{N} in distinct positions (e.g. `\\p{N}` alone, without `+`, must NOT match a
-    letter) as well as together (`[^\\r\\n\\p{L}\\p{N}]`, matched via is_letter(c) || is_number(c))."""
+    """Range-compresses every codepoint whose general category starts with `major_category` ("L", "N",
+    "P", or "M") -- kept as separate tables per major category (not combined) because the pretokenizer
+    regex and WordPiece's word-splitting use \\p{L}/\\p{N}/\\p{P}/\\p{M} in distinct positions (e.g.
+    `\\p{N}` alone, without `+`, must NOT match a letter) as well as together (`[^\\r\\n\\p{L}\\p{N}]`,
+    matched via is_letter(c) || is_number(c))."""
     ranges: list[tuple[int, int]] = []
     run_start = None
     for cp in range(MAX_CODEPOINT):
@@ -94,7 +104,20 @@ def compute_combining_class() -> dict[int, int]:
     return cls
 
 
-def emit_header(letter_ranges, number_ranges, canonical_decomp, combining_class, exclusions) -> str:
+def compute_lowercase_map() -> dict[int, int]:
+    """cp -> single-codepoint lowercase mapping, non-identity entries only. Multi-codepoint expansions
+    (e.g. a few str.lower() special-casings) are skipped -- see module docstring, WordPiece's own
+    lowercasing only needs a single-codepoint substitution, same scope as llama.cpp's unicode_tolower."""
+    m: dict[int, int] = {}
+    for cp in range(MAX_CODEPOINT):
+        lower = chr(cp).lower()
+        if len(lower) == 1 and ord(lower) != cp:
+            m[cp] = ord(lower)
+    return m
+
+
+def emit_header(letter_ranges, number_ranges, canonical_decomp, combining_class, exclusions,
+                 punctuation_ranges, mark_ranges, lowercase_map) -> str:
     lines = []
     lines.append("// GENERATED FILE -- do not hand-edit. Produced by tools/codegen/gen_unicode_tables.py")
     lines.append(f"// against Python's stdlib `unicodedata` (Unicode Character Database version {UNICODE_VERSION})")
@@ -171,6 +194,32 @@ def emit_header(letter_ranges, number_ranges, canonical_decomp, combining_class,
     lines.append("};")
     lines.append(f"inline constexpr size_t kCompositionExclusionsCount = {len(exclusions)};")
     lines.append("")
+
+    # 5. Punctuation ranges and Mark ranges (same compute_category_ranges() mechanism as Letter/Number)
+    lines.append(f"// {len(punctuation_ranges)} ranges, general category P* (\\p{{P}}).")
+    lines.append("inline constexpr CpRange kPunctuationRanges[] = {")
+    for lo, hi in punctuation_ranges:
+        lines.append(f"    {{0x{lo:06X}, 0x{hi:06X}}},")
+    lines.append("};")
+    lines.append(f"inline constexpr size_t kPunctuationRangesCount = {len(punctuation_ranges)};")
+    lines.append("")
+    lines.append(f"// {len(mark_ranges)} ranges, general category M* (\\p{{M}}).")
+    lines.append("inline constexpr CpRange kMarkRanges[] = {")
+    for lo, hi in mark_ranges:
+        lines.append(f"    {{0x{lo:06X}, 0x{hi:06X}}},")
+    lines.append("};")
+    lines.append(f"inline constexpr size_t kMarkRangesCount = {len(mark_ranges)};")
+    lines.append("")
+
+    # 6. Lowercase map (sparse, non-identity entries only)
+    lines.append(f"// {len(lowercase_map)} codepoints with a single-codepoint lowercase mapping.")
+    lines.append("struct CpMapEntry { char32_t cp; char32_t value; };")
+    lines.append("inline constexpr CpMapEntry kLowercaseMap[] = {")
+    for cp in sorted(lowercase_map.keys()):
+        lines.append(f"    {{0x{cp:06X}, 0x{lowercase_map[cp]:06X}}},")
+    lines.append("};")
+    lines.append(f"inline constexpr size_t kLowercaseMapCount = {len(lowercase_map)};")
+    lines.append("")
     lines.append("} // namespace unicode_data")
     lines.append("} // namespace loom")
     lines.append("")
@@ -194,7 +243,17 @@ def main() -> None:
     sys.stderr.write("Computing combining classes...\n")
     comb = compute_combining_class()
     sys.stderr.write(f"  {len(comb)} entries\n")
-    sys.stdout.write(emit_header(letter_ranges, number_ranges, decomp, comb, exclusions))
+    sys.stderr.write("Computing punctuation ranges...\n")
+    punctuation_ranges = compute_category_ranges("P")
+    sys.stderr.write(f"  {len(punctuation_ranges)} ranges\n")
+    sys.stderr.write("Computing mark ranges...\n")
+    mark_ranges = compute_category_ranges("M")
+    sys.stderr.write(f"  {len(mark_ranges)} ranges\n")
+    sys.stderr.write("Computing lowercase map...\n")
+    lowercase_map = compute_lowercase_map()
+    sys.stderr.write(f"  {len(lowercase_map)} entries\n")
+    sys.stdout.write(emit_header(letter_ranges, number_ranges, decomp, comb, exclusions,
+                                  punctuation_ranges, mark_ranges, lowercase_map))
 
 
 if __name__ == "__main__":

@@ -49,6 +49,10 @@ std::unique_ptr<Vocab> Vocab::load(const GgufModel& model) {
         throw LoadError("Vocab::load: tokenizer.ggml.{scores,token_type} size mismatch with .tokens");
     }
     vocab->unk_id_ = model.kv_i32("tokenizer.ggml.unknown_token_id", 0);
+    vocab->bos_id_ = model.kv_i32("tokenizer.ggml.bos_token_id", -1);
+    vocab->eos_id_ = model.kv_i32("tokenizer.ggml.eos_token_id", -1);
+    vocab->add_bos_token_ = model.kv_bool("tokenizer.ggml.add_bos_token", false);
+    vocab->add_eos_token_ = model.kv_bool("tokenizer.ggml.add_eos_token", false);
     vocab->add_space_prefix_ = model.kv_bool("tokenizer.ggml.add_space_prefix", true);
     vocab->remove_extra_whitespaces_ = model.kv_bool("tokenizer.ggml.remove_extra_whitespaces", true);
 
@@ -255,6 +259,17 @@ std::vector<int32_t> Vocab::encode_bpe(const std::string& normalized) const {
 }
 
 std::vector<int32_t> Vocab::encode(const std::string& text) const {
+    std::vector<int32_t> ids = encode_impl(text);
+    if (add_bos_token_ && bos_id_ >= 0) {
+        ids.insert(ids.begin(), bos_id_);
+    }
+    if (add_eos_token_ && eos_id_ >= 0) {
+        ids.push_back(eos_id_);
+    }
+    return ids;
+}
+
+std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
     const std::string normalized = normalize(text);
     if (is_bpe_) {
         return encode_bpe(normalized);

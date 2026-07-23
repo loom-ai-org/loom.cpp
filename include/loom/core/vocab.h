@@ -38,7 +38,11 @@ public:
     // Normalizes `text` (via the XCDA-based charsmap walk, matching SentencePiece's own normalizer),
     // then segments it into vocab piece ids -- via Viterbi best-path search (UGM) or greedy
     // merge-by-score (SentencePiece BPE), selected by which "tokenizer.ggml.model" this Vocab was
-    // loaded from. Falls back to unk_id() for any codepoint no vocab piece covers.
+    // loaded from. Falls back to unk_id() for any codepoint no vocab piece covers. Prepends `bos_id_`
+    // first when "tokenizer.ggml.add_bos_token" is true, appends `eos_id_` last when
+    // "tokenizer.ggml.add_eos_token" is true (mirrors BpeVocab's identical convention; absent, both
+    // default to false) -- closes the gap that otherwise blocks ALBERT/XLNet-style Unigram models, which
+    // wrap sequences via SentencePiece's own BOS/EOS convention rather than a separate CLS/SEP concept.
     std::vector<int32_t> encode(const std::string& text) const;
 
     // Joins each id's piece text, unescapes the SentencePiece word-boundary marker (U+2581 "▁") back
@@ -47,6 +51,8 @@ public:
 
     const std::string& id_to_piece(int32_t id) const;
     int32_t unk_id() const { return unk_id_; }
+    int32_t bos_id() const { return bos_id_; }
+    int32_t eos_id() const { return eos_id_; }
     size_t size() const { return tokens_.size(); }
 
     Vocab(const Vocab&) = delete;
@@ -96,10 +102,19 @@ private:
     // BACKLOG.md) -- a symbol with no matching piece and no further merge falls back to unk_id().
     std::vector<int32_t> encode_bpe(const std::string& normalized) const;
 
+    // The Viterbi/BPE segmentation itself, before encode()'s bos/eos prepend/append.
+    std::vector<int32_t> encode_impl(const std::string& text) const;
+
     std::vector<std::string> tokens_;
     std::vector<float> scores_;
     std::vector<int32_t> token_type_; // llama_token_type values, 1:1 with SentencePiece's own enum
     int32_t unk_id_ = 0;
+    int32_t bos_id_ = -1;
+    int32_t eos_id_ = -1;
+    bool add_bos_token_ = false; // default false -- unchanged behavior for existing GGUFs without this KV
+    bool add_eos_token_ = false; // default false -- ditto (llama.cpp's own UGM *implicit* default with no
+                                  // KV at all is true; loom follows its own "explicit KV, safe default"
+                                  // convention instead, same as BpeVocab::add_bos_token_'s precedent)
     bool add_space_prefix_ = true;
     bool remove_extra_whitespaces_ = true;
     bool is_bpe_ = false; // true for "llama" (SentencePiece BPE); false for "t5" (UGM)

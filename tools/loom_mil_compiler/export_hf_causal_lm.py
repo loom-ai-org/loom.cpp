@@ -7,7 +7,16 @@ needing bespoke submodule wiring (e.g. a hand-built multi-Function Program) stil
 but the ordinary "one traced forward pass, one attention-mask/cache_position dynamic seq-len axis" shape
 covers most causal LMs including LFM2 -- see EXPORT-IMPROVEMENT-BACKLOG.md item 1.
 
+The tokenizer family ("bpe"/"wordpiece"/"sentencepiece_proto") and, for "bpe", the pretokenizer regex
+shape (`tokenizer.ggml.pre`) are auto-detected from the real HF tokenizer directory by default (see
+tokenizer_detect.py) -- `--tokenizer-family`/`--tokenizer-pre` are optional overrides, only needed if
+auto-detection raises (an unrecognized tokenizer hash, or a recognized-but-not-yet-implemented family).
+
 Usage:
+  ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.export_hf_causal_lm \\
+      /path/to/hf/model --profile atomic --architecture lfm2 --output model.gguf
+
+  # Override auto-detection explicitly (e.g. if the tokenizer predates tokenizer_detect.py's hash table):
   ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.export_hf_causal_lm \\
       /path/to/hf/model --profile atomic --tokenizer-pre llama3 --architecture lfm2 \\
       --output model.gguf
@@ -65,7 +74,8 @@ def export_causal_lm(
     profile: str = "monolithic",
     architecture: str = None,
     tokenizer_dir: str = None,
-    tokenizer_pre: str = "qwen2",
+    tokenizer_family: str = None,
+    tokenizer_pre: str = None,
     quantize: str = None,
     seq_len: int = 128,
     max_seq_len: int = 4096,
@@ -113,6 +123,7 @@ def export_causal_lm(
         architecture=architecture,
         profile=profile,
         tokenizer_dir=tokenizer_dir or model_dir,
+        tokenizer_family=tokenizer_family,
         tokenizer_pre=tokenizer_pre,
         quantize=quantize,
     )
@@ -127,7 +138,10 @@ def main():
     parser.add_argument("--profile", choices=["monolithic", "atomic"], default="monolithic")
     parser.add_argument("--architecture", default=None, help="Defaults to model.config.model_type")
     parser.add_argument("--tokenizer-dir", default=None, help="Defaults to model_dir")
-    parser.add_argument("--tokenizer-pre", default="qwen2")
+    parser.add_argument("--tokenizer-family", default=None, choices=["bpe", "wordpiece", "sentencepiece_proto"],
+                         help="Overrides auto-detection (see tokenizer_detect.detect_vocab_family)")
+    parser.add_argument("--tokenizer-pre", default=None,
+                         help="Overrides auto-detection for the 'bpe' family (see tokenizer_detect.detect_loom_pre_type)")
     parser.add_argument("--quantize", default=None)
     parser.add_argument("--seq-len", type=int, default=128, help="Dummy trace sequence length")
     parser.add_argument("--max-seq-len", type=int, default=4096, help="Upper bound for the dynamic seq-len RangeDim")
@@ -139,6 +153,7 @@ def main():
         profile=args.profile,
         architecture=args.architecture,
         tokenizer_dir=args.tokenizer_dir,
+        tokenizer_family=args.tokenizer_family,
         tokenizer_pre=args.tokenizer_pre,
         quantize=args.quantize,
         seq_len=args.seq_len,

@@ -27,5 +27,6 @@
 #include "loom/core/ode_stepper.h"
 #include "loom/core/vocab.h"
 #include "loom/core/bpe_vocab.h"
+#include "loom/core/wordpiece_vocab.h"
 #include "loom/core/unicode.h"
 #include "loom/ops/primitive_registry.h"

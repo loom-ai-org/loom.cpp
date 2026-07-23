@@ -55,5 +55,40 @@ int main() {
         LOOM_CHECK(loom::utf8_encode(cps) == s);
     }
 
+    // --- is_punctuation/is_mark (backing WordPieceVocab's word-splitting + qwen35's BPE shape) ---
+    LOOM_CHECK(loom::is_punctuation(U'.'));
+    LOOM_CHECK(loom::is_punctuation(U'!'));
+    LOOM_CHECK(loom::is_punctuation(U'('));
+    LOOM_CHECK(!loom::is_punctuation(U'A'));
+    LOOM_CHECK(!loom::is_punctuation(U' '));
+    LOOM_CHECK(loom::is_mark(0x0301)); // combining acute accent
+    LOOM_CHECK(!loom::is_mark(U'A'));
+    LOOM_CHECK(!loom::is_mark(U'5'));
+
+    // --- to_lower ---
+    LOOM_CHECK(loom::to_lower(U'A') == U'a');
+    LOOM_CHECK(loom::to_lower(U'z') == U'z'); // already lowercase -- identity
+    LOOM_CHECK(loom::to_lower(0x00C9) == 0x00E9); // É -> é
+    LOOM_CHECK(loom::to_lower(U'5') == U'5'); // no mapping -- identity
+
+    // --- nfd_normalize: precomposed "é" decomposes to "e" + combining acute (opposite of nfc_normalize) ---
+    {
+        const std::string precomposed = "\xC3\xA9"; // U+00E9 "é"
+        const std::string decomposed = "e\xCC\x81";  // U+0065 U+0301
+        LOOM_CHECK(loom::nfd_normalize(precomposed) == decomposed);
+    }
+    // --- nfd_normalize: already-decomposed input is a no-op ---
+    {
+        const std::string decomposed = "e\xCC\x81";
+        LOOM_CHECK(loom::nfd_normalize(decomposed) == decomposed);
+    }
+    // --- nfd_normalize: Hangul decomposes algorithmically to jamo (unlike NFC, which stays precomposed) ---
+    {
+        const std::string hangul = "\xEA\xB0\x80"; // U+AC00 "가"
+        const std::string jamo = loom::nfd_normalize(hangul);
+        LOOM_CHECK(jamo != hangul);
+        LOOM_CHECK(loom::utf8_decode(jamo).size() == 2); // L+V, no trailing consonant
+    }
+
     LOOM_TEST_REPORT_AND_RETURN();
 }

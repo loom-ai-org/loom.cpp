@@ -507,15 +507,61 @@ done is catalogued there. Not repeated here to avoid the two going stale indepen
 
 ---
 
-## 4. Tokenization — DONE for LFM2 (GPT2-byte-level-BPE family); other families still future work
+## 4. Tokenization — DONE for LFM2; broadened to auto-detection + WordPiece + Unigram-beyond-T5
 
 **Status:** implemented for LFM2-350M specifically, using the existing `loom::BpeVocab` (GPT2-style
 byte-level BPE) family rather than a new one — confirmed LFM2's real `tokenizer.json` (`model.type ==
 "BPE"`, byte-level pretokenizer) is the *same* family Qwen3 already uses, just with a different
-pretokenizer regex variant and BOS-prepending behavior. No new tokenizer family (WordPiece, SentencePiece
-Unigram beyond what `loom::Vocab` already had, tiktoken-style) was needed for this model; those remain
-open for whenever a model that actually needs one is retrofitted (see this item's original plan, preserved
-below, for that future work).
+pretokenizer regex variant and BOS-prepending behavior.
+
+**Update (broadened per user request, reusing llama.cpp's data/algorithms without vendoring its source
+files):**
+- **Auto-detection**, replacing the manual `--tokenizer-pre` requirement: new
+  `tools/loom_mil_compiler/tokenizer_detect.py` ports llama.cpp's own `chktxt`+sha256 hash-detection
+  recipe (`conversion/base.py`'s `get_vocab_base_pre`) verbatim as data, mapping the result onto loom's
+  actually-implemented shape keys; `detect_vocab_family()` reads `tokenizer.json`'s own `model.type`
+  directly (simpler than porting llama.cpp's per-architecture dispatch, since this exporter has no
+  per-arch classes to hang that off of). Verified end to end against the real LFM2-350M checkpoint with no
+  `--tokenizer-pre` flag at all: auto-detects `tokenizer.ggml.pre="llama3"`, byte-identical to the
+  previously-manual export's KVs (bos=1, eos=7, add_bos_token=true).
+- **BPE pretokenizer-family generalization**: `include/loom/core/bpe_vocab.h`/`.cpp`'s single
+  `max_number_run_` ternary is now a `BpeShape` enum (`kQwenLlama3`, `kGpt2Classic`,
+  `kWhitespacePunctExclude`) + a `pre_spec_table()` covering ~40 of llama.cpp's ~74 named pretokenizer
+  families (verified name-by-name against `llm_tokenizer_bpe`'s real `regex_exprs` switch in
+  `src/llama-vocab.cpp`, not guessed) — CJK-script splitters, case-transition/camelCase shapes, cascading
+  whitespace, and `byte_encode=false` SPM-style-BPE families (gemma4/sarvam-moe/whitespace) remain
+  unimplemented and raise a named `LoadError`/`NotImplementedError` rather than silently mis-tokenizing.
+  An unrecognized-but-present `tokenizer.ggml.pre` now fails loudly (deliberate behavior change from the
+  old silent qwen2 fallback); absent-KV still defaults to qwen2 unchanged.
+- **WordPiece (BERT-family)**: new `loom::WordPieceVocab` (`include/loom/core/wordpiece_vocab.h`,
+  `src/core/wordpiece_vocab.cpp`), ported natively from llama.cpp's `llm_tokenizer_wpm_session`, new
+  `tokenizer.ggml.model="bert"` tag, new `tools/loom_mil_compiler/wordpiece_tokenizer_export.py` writer
+  (applies the same `phantom()` "##"-to-▁ transform as llama.cpp's own `conversion/bert.py`). Tokenizer
+  layer only — no BERT/masked-LM model-graph export driver (out of scope, BERT isn't a causal LM).
+  Verified against a synthetic fixture (`tests/test_wordpiece_vocab.cpp`): continuation-piece splits,
+  punctuation isolation, `[UNK]` fallback, accent-stripping, CLS/SEP auto-wrap.
+- **Unigram beyond T5**: `loom::Vocab` gained `bos_id_`/`eos_id_`/`add_bos_token_`/`add_eos_token_` (it had
+  none at all before — the real, concrete gap blocking ALBERT/XLNet-style models, which wrap sequences via
+  SentencePiece's own BOS/EOS convention). `tools/convert_nemo/tokenizer_common.py`'s
+  `write_sentencepiece_vocab` gained matching optional kwargs, defaulting to today's no-op so every
+  existing NeMo call site is unaffected. Verified via a synthetic fixture
+  (`tests/test_vocab_ugm_bos_eos.cpp`).
+- Deliberately NOT vendored: llama.cpp's `unicode.cpp`/`unicode-data.cpp`/`llama-vocab.cpp` files
+  themselves — every new C++ primitive above is hand-reimplemented against loom's own generated Unicode
+  tables (`tools/codegen/gen_unicode_tables.py`, extended with punctuation/mark ranges + a lowercase map)
+  and existing hand-rolled scanner style, per an explicit decision to avoid a second, parallel Unicode
+  classification system. Only llama.cpp's *data* (the chktxt/hash table, the literal regex pattern text,
+  the name-to-shape groupings) was reused, transcribed directly from source, not vendored as code.
+- Full `ctest`: 113/114 pass (same single pre-existing unrelated failure, `test_e2e_lfm2_lua_driver`,
+  missing checkpoint fixture — zero regressions). `test_e2e_lfm2_tokenizer`/`test_e2e_lfm2_mil_export`
+  (the real-checkpoint byte-for-byte regression guards) both still pass unchanged.
+
+No new tokenizer family (tiktoken-style) was needed beyond the above: confirmed llama.cpp itself routes
+GPT-4o/cl100k-style tokenizers through the same plain GPT2-style BPE path (no separate tiktoken vocab
+format exists there), already covered by the BPE-family work above. Remaining open families are listed
+directly in `bpe_vocab.cpp`'s own `pre_spec_table()` comment and `tokenizer_detect.py`'s
+`_LLAMA_PRE_TO_LOOM_PRE_TYPE` (see this item's original plan, preserved below, for that continuing future
+work).
 
 **Two real gaps found in the existing `BpeVocab` class, both fixed (`include/loom/core/bpe_vocab.h`,
 `src/core/bpe_vocab.cpp`):**

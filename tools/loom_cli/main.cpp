@@ -168,6 +168,20 @@ int main(int argc, char** argv) {
         }
         std::printf("  weights: %zu tensors\n", model->weights().size());
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "bert") {
+            // WordPiece (BERT-family) models aren't causal LMs -- no generation loop applies, this is
+            // inspection-only so loom_cli doesn't dead-end on a "bert" GGUF (see EXPORT-BACKLOG.md item 4).
+            auto wp_vocab = loom::WordPieceVocab::load(*model);
+            std::printf("  tokenizer: WordPiece (bert), %zu tokens\n", wp_vocab->size());
+            if (has_prompt) {
+                const auto ids = wp_vocab->encode(prompt_text);
+                std::printf("  encode(\"%s\") -> [", prompt_text.c_str());
+                for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? ", " : "", ids[i]);
+                std::printf("]\n");
+            }
+            return 0;
+        }
+
         if (has_prompt) {
             std::unique_ptr<loom::BpeVocab> bpe_vocab;
             if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "gpt2") {
