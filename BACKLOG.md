@@ -60,6 +60,28 @@ decomposition). Any other combination (`transpose_x=True`, alone or with `transp
 `NotImplementedError` by design rather than silently miscomputing. Not yet hit by any converted model; a
 real derivation + test case is needed the first time one does.
 
+### Retrofit the bespoke `tools/convert_*` scripts onto the MIL exporter
+
+None of the ~10 hand-written conversion scripts (Qwen3, NeMo Conformer-CTC/Parakeet, VITS, Kokoro,
+StyleTTS2, Matcha-TTS, SupertonicTTS, Whisper) use `ct.convert`/coremltools at all — they predate the MIL
+pivot and hand-build `GraphTopology` JSON directly from each checkpoint's state dict. Untried, not ruled
+out: whether they could go through the generic MIL→ggml pipeline instead.
+
+**Take:** Qwen3 and the NeMo Conformer-CTC/Parakeet models are the near-free win — they're
+single-forward-pass, HF/NeMo-module-shaped like LFM2, so they'd likely trace through the existing
+`export_hf_causal_lm.py` driver (or a NeMo analogue of it) with little new code. VITS/Kokoro/Matcha-TTS/
+SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
+exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
+reverse-steps, Euler CFM, RNG-fed sampling) are fixed-depth, so should trace as one static graph with noise
+supplied as an input tensor. StyleTTS2 is the one likely to stay bespoke — its diffusion sampler's ~3e-3
+residual mismatch persisted even with hand-matched float32 host math, and an auto-traced version gives less
+control to chase that kind of thing down.
+
+The real tradeoff: doing this would replace ~10 hand-verified conversion scripts with one generic path, but
+trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it
+for showcasing generality, riskier for correctness confidence on the trickiest models. Prototype on Qwen3
+first (cheapest test, closest to LFM2) before deciding whether to chase the TTS models.
+
 ### Submodule-export blueprint: promote to default, prove generality, dedup weights
 
 The submodule-export blueprint (`tools/loom_mil_compiler/submodule_discovery.py`/`submodule_export.py`,
