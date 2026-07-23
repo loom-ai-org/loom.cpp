@@ -182,6 +182,14 @@ class LoomGGUFExporter:
                 else:
                     self.topologies[func_name] = self.generate_graph_topology(func, func_name)
             driver_script = self._finalize_driver()
+        elif self.kwargs.get("submodule_layout") is not None:
+            # Submodule-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): `self.program` here is
+            # NOT a single flattened trace -- it has no "main" function at all, just one Function per
+            # independently-traced submodule (prefix/aux/layer_i/suffix_i) -- so there is no monolithic
+            # fallback to degrade to on failure the way "atomic" has; a bug here should fail loudly, not
+            # silently produce a working-looking but wrong export.
+            self.apply_submodule_export()
+            driver_script = self._finalize_driver()
         else:
             profile = self.profile or "monolithic"
             if profile == "atomic":
@@ -573,6 +581,146 @@ class LoomGGUFExporter:
 
         self.ir_function = IRFunction("main", ["inputs"], body)
 
+    def apply_submodule_export(self):
+        """
+        Synthesizes the driver for a submodule-export blueprint (`kwargs["submodule_layout"]`, a
+        `SubmoduleExportResult` from submodule_export.py): one real, independently-traced Function per
+        prefix/aux/layer_i/suffix_i submodule. Every function is self-contained by construction (no
+        cross-slice variable leakage to detect, unlike apply_atomic_export's scope-partitioned single
+        trace), so this only has to generate each function's topology directly
+        (`generate_graph_topology(func, name)`, no ops_list/inputs_dict reconstruction) and chain
+        SubgraphCalls prefix -> [aux] -> layer_0..N-1 -> suffix_0..M-1 -> argmax.
+        """
+        print("Exporting via Submodule-Blueprint path...")
+        layout = self.kwargs["submodule_layout"]
+        functions = self.program.functions
+        special_names = set(_POSITION_INPUT_NAMES) | set(_CAUSAL_MASK_INPUT_NAMES)
+
+        def is_aux_input(name):
+            return layout.aux_kwarg and (name == layout.aux_kwarg or name.startswith(layout.aux_kwarg + "_"))
+
+        has_aux = layout.aux_output_names is not None
+        stage_names = ["prefix"] + (["aux"] if has_aux else []) \
+            + [f"layer_{i}" for i in range(layout.num_layers)] + layout.suffix_names
+
+        # 1. Generate topologies for every submodule function. generate_graph_topology drops any
+        # declared input no node actually reads (post dead-node-pruning) -- e.g. LFM2's conv-type
+        # layers never touch `position_embeddings`, only its attention-type layers do, so which inputs
+        # survive can differ PER LAYER even though they were traced with an identical call signature.
+        # Wiring below must therefore consult each stage's own post-filter declared inputs, never a
+        # single shared name list.
+        for name in stage_names:
+            self.topologies[name] = self.generate_graph_topology(functions[name], name)
+
+        def declared_inputs(name):
+            return [inp["name"] for inp in self.topologies[name]["inputs"]]
+
+        prefix_input_names = declared_inputs("prefix")
+        chain_in_names = [n for n in prefix_input_names if n not in special_names]
+        if len(chain_in_names) != 1:
+            raise ValueError(f"prefix submodule must declare exactly one non-special input, got {prefix_input_names}")
+        first_input = self.safe_name(chain_in_names[0])
+        n_tokens_expr = Len(first_input)
+
+        # 2. `first_input` (the caller-supplied token-ids input) must be defined before anything below
+        # reads n_tokens_expr, mirroring apply_monolithic_export/apply_atomic_export's own ordering.
+        body = [Local(first_input, BinOp("or", FieldAccess("inputs", first_input), FieldAccess("inputs", "tokens")))]
+
+        special_needed = set()
+        for name in stage_names:
+            special_needed.update(n for n in declared_inputs(name) if n in special_names)
+        for name in sorted(special_needed):
+            safe_inp = self.safe_name(name)
+            if name in _POSITION_INPUT_NAMES:
+                body.append(Local(safe_inp, Call("loom.range", [Lit(0), n_tokens_expr])))
+            else:
+                body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
+
+        # 3. Prefix.
+        chain_var = "_sub_chain_0"
+        body.append(SubgraphCall(
+            outputs=[chain_var], module="prefix", n_tokens=n_tokens_expr, n_past=Lit(0),
+            inputs={self.safe_name(n): IRVar(self.safe_name(n)) for n in prefix_input_names},
+        ))
+
+        # 4. Auxiliary submodule (computed once, shared across every repeated-block call below) -- e.g.
+        # LFM2's rotary-embedding table, computed once in Lfm2Model.forward and threaded into every
+        # decoder layer as `position_embeddings=(cos, sin)`.
+        aux_out_vars = None
+        if has_aux:
+            aux_input_names = declared_inputs("aux")
+            aux_chain_names = [n for n in aux_input_names if n not in special_names]
+            if len(aux_chain_names) > 1:
+                raise ValueError(f"aux submodule must declare at most one non-special input, got {aux_input_names}")
+            aux_inputs_tbl = {}
+            for n in aux_input_names:
+                safe_n = self.safe_name(n)
+                # The aux submodule's own non-special input (if it has one -- it may not, e.g. LFM2's
+                # pos_emb is called with the real hidden_states value purely for its dtype/device, which
+                # the traced graph never ends up actually depending on) plays the same "current chain
+                # tensor" role a repeated-block call's primary input does -- feed it the same value.
+                aux_inputs_tbl[safe_n] = IRVar(chain_var) if n in aux_chain_names else IRVar(safe_n)
+            aux_out_vars = [f"_sub_aux_{i}" for i in range(len(layout.aux_output_names))]
+            body.append(SubgraphCall(
+                outputs=aux_out_vars, module="aux", n_tokens=n_tokens_expr, n_past=Lit(0), inputs=aux_inputs_tbl,
+            ))
+
+        # 5. Repeated block, threading `chain_var` (hidden_states) from one layer's output into the
+        # next's input, exactly like apply_atomic_export's own layer chain. Each layer's OWN declared
+        # inputs are consulted independently (see the comment on step 1).
+        for i in range(layout.num_layers):
+            layer_name = f"layer_{i}"
+            layer_inputs = declared_inputs(layer_name)
+            chain_names_i = [n for n in layer_inputs if n not in special_names and not is_aux_input(n)]
+            if len(chain_names_i) != 1:
+                raise ValueError(f"repeated block must declare exactly one non-special, non-aux input, got {layer_inputs}")
+            chain_name_i = chain_names_i[0]
+
+            inputs_tbl = {}
+            for n in layer_inputs:
+                safe_n = self.safe_name(n)
+                if n == chain_name_i:
+                    inputs_tbl[safe_n] = IRVar(chain_var)
+                elif is_aux_input(n):
+                    idx = 0 if n == layout.aux_kwarg else int(n[len(layout.aux_kwarg) + 1:])
+                    inputs_tbl[safe_n] = IRVar(aux_out_vars[idx])
+                else:
+                    inputs_tbl[safe_n] = IRVar(safe_n)
+
+            next_chain_var = f"_sub_chain_{i + 1}"
+            body.append(SubgraphCall(
+                outputs=[next_chain_var], module=layer_name, n_tokens=n_tokens_expr, n_past=Lit(0),
+                inputs=inputs_tbl,
+            ))
+            chain_var = next_chain_var
+
+        # 6. Suffix chain (e.g. final norm + lm_head).
+        for idx, name in enumerate(layout.suffix_names):
+            in_names = declared_inputs(name)
+            if len(in_names) != 1:
+                raise ValueError(f"suffix submodule '{name}' must declare exactly one input, got {in_names}")
+            is_last = idx == len(layout.suffix_names) - 1
+            next_chain_var = f"_sub_suffix_{idx}"
+            call_kwargs = dict(
+                outputs=[next_chain_var], module=name, n_tokens=n_tokens_expr, n_past=Lit(0),
+                inputs={self.safe_name(in_names[0]): IRVar(chain_var)},
+            )
+            if is_last:
+                call_kwargs["extra_outputs"] = ["_submodule_final_shape"]
+            body.append(SubgraphCall(**call_kwargs))
+            chain_var = next_chain_var
+
+        # 7. Argmax the logits row for the active (last real) token -- same convention
+        # apply_monolithic_export/apply_atomic_export use for causal-LM next-token generation.
+        row_expr = BinOp("-", n_tokens_expr, Lit(1))
+        body.append(If(
+            cond=BinOp("==", Call("type", [IRVar(chain_var)]), Lit("table")),
+            then=[Return([Call("loom.argmax_row", [IRVar(chain_var), Index(IRVar("_submodule_final_shape"), 1), row_expr])])],
+            else_=[Return([IRVar(chain_var)])],
+        ))
+
+        self.ir_function = IRFunction("main", ["inputs"], body)
+
     def transpile_to_lua(self, func: Function, name="main"):
         """
         Transpiles the main MIL orchestration function to a Lua JIT driver script.
@@ -838,7 +986,9 @@ class LoomGGUFExporter:
         operations = ops_list if ops_list is not None else (func.operations if func else [])
 
         def resolve(name):
-            while name in aliases:
+            seen = set()
+            while name in aliases and name not in seen:
+                seen.add(name)
                 name = aliases[name]
             return name
         
@@ -852,7 +1002,12 @@ class LoomGGUFExporter:
             orig_name = self.safe_name(first_input_var.name)
             
             if func_name.startswith("layer_"):
-                aliases[orig_name] = "hidden_states"
+                # A submodule traced standalone with its real parameter name already literally
+                # "hidden_states" (e.g. the submodule-export blueprint, EXPORT-IMPROVEMENT-BACKLOG.md
+                # item 2) would otherwise alias it to itself here -- `resolve()` walks `aliases` in a
+                # `while name in aliases` loop, so a self-referential entry spins forever.
+                if orig_name != "hidden_states":
+                    aliases[orig_name] = "hidden_states"
                 var_info = self.get_var_info(first_input_var)
                 var_info["name"] = "hidden_states"
                 topo_inputs.append(var_info)
@@ -1552,11 +1707,27 @@ class LoomGGUFExporter:
         func_outputs = func.outputs if func else (ops_list[-1].outputs if ops_list else [])
         output_symbol = resolve(self.safe_name(func_outputs[0].name)) if func_outputs else "output"
 
+        pruned_nodes = self._prune_dead_nodes(nodes, output_symbol)
+
+        # A declared input with no node (post-pruning) that actually reads it is unreachable from this
+        # topology's own output -- GraphBuilder's ggml_gallocr_alloc_graph only allocates a backend
+        # buffer for tensors reachable from the declared output, so an orphan input tensor is created
+        # but never given a buffer. If the driver ever supplied a value for it anyway (e.g. a
+        # submodule-export blueprint's per-layer function still nominally "declaring" a
+        # cache_position/position_ids input that its own real call never ends up depending on once
+        # past_key_values is forced to None -- see submodule_export.py's _CACHE_KWARG_NAMES comment),
+        # setting data into that unallocated tensor is a ggml hard-crash ("tensor buffer not set"), not
+        # a graceful error. Dropping it from the declared list here means check_subgraph_calls treats
+        # the driver still supplying it as an undeclared-input validation error instead -- catching the
+        # mismatch at export time rather than as a runtime crash.
+        referenced = {name for node in pruned_nodes for name in node["inputs"]}
+        topo_inputs = [inp for inp in topo_inputs if inp["name"] in referenced]
+
         return {
             "version": 1,
             "inputs": topo_inputs,
             "output": output_symbol,
-            "nodes": self._prune_dead_nodes(nodes, output_symbol)
+            "nodes": pruned_nodes
         }
 
     def _prune_dead_nodes(self, nodes: list, output_symbol: str) -> list:
