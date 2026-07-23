@@ -74,26 +74,70 @@ SupertonicTTS, StyleTTS2.
   pattern as the `cast` branch). Verified: 8/8 greedy-token match against real HF `generate()` for both
   profiles ("The capital of France is" → " Paris. The capital of Germany is Berlin"). Full `ctest`: zero
   regressions.
-- **NeMo Conformer-CTC-small — EXPORTS, runtime numerics still wrong.** `export_conformer_ctc_mil.py`
-  traces the REAL `nemo.collections.asr.models.EncDecCTCModelBPE` (preprocessor + `ConformerEncoder` +
-  `ConvASRDecoder`) directly — no hand-reimplemented plain-PyTorch module needed (unlike
-  `tools/convert_generic/conformer_ctc_module.py`'s older `aten_to_loom`-oriented POC, which needed a
-  custom `loom::rel_pos_attention` torch op; the MIL path has no such requirement, it walks whatever real
-  ops the relative-position attention decomposes into under tracing — turned out to be ordinary
-  matmul/pad/reshape/gather, no new attention primitive needed at all). Getting the export to complete at
-  all found and fixed six real, general exporter/engine gaps: a missing `logical_not` primitive (new `NOT`
-  op, `1 - x`, mirrors the existing comparison-op complement pattern); a missing `stack` translation (MIL's
-  stack-along-a-new-axis, hit by the mel frontend's hand-rolled conv-based STFT stacking real/imag parts —
-  composed from existing RESHAPE+CONCAT, no new primitive); two OP_MAP gaps (`sqrt`/`log` — the ggml
-  primitives already existed, just weren't wired up); and a real memory-safety bug in dynamic `fill`
-  handling (`torch.full` sized off a non-constant shape pre-allocated `[4096]*rank` — 256 GiB at rank 3 —
-  instead of composing a scalar-constant + REPEAT-broadcast, which works at any rank). `RESHAPE` also
-  gained a real, informative error message (shape-mismatch details) in place of a raw uncatchable
-  `GGML_ASSERT` abort. The export now completes and produces a plausible-looking topology, but a real
-  **runtime** bug remains open: a `RANGE_1D` op (from NeMo's `torch.arange(...)`-based length-to-mask
-  logic) produces a 1-element result where a genuine `n_tokens`-length range is expected, traced back to
-  its `gather` input (likely picking the wrong element out of a lengths/shape tensor) — not yet
-  root-caused. Full `ctest`: zero regressions from any of the above.
+- **NeMo Conformer-CTC-small — exports and runs deep into the real model, one open data-flow bug left.**
+  `export_conformer_ctc_mil.py` traces the REAL `nemo.collections.asr.models.EncDecCTCModelBPE`
+  (preprocessor + `ConformerEncoder` + `ConvASRDecoder`) directly — no hand-reimplemented plain-PyTorch
+  module needed (unlike `tools/convert_generic/conformer_ctc_module.py`'s older `aten_to_loom`-oriented
+  POC, which needed a custom `loom::rel_pos_attention` torch op; the MIL path has no such requirement, it
+  walks whatever real ops the relative-position attention decomposes into under tracing — turned out to be
+  ordinary matmul/pad/reshape/gather, no new attention primitive needed at all).
+
+  Getting this far found and fixed a long run of real, general exporter/engine gaps (all committed except
+  where noted, full `ctest` clean after every one — zero regressions, `Qwen3` re-verified byte-for-byte
+  identical throughout):
+  - Missing `logical_not` primitive (new `NOT` op, `1 - x`, mirrors the existing comparison-op complement
+    pattern).
+  - Missing `stack` translation (MIL's stack-along-a-new-axis, hit by the mel frontend's hand-rolled
+    conv-based STFT stacking real/imag parts — composed from existing RESHAPE+CONCAT, no new primitive).
+  - Two OP_MAP gaps (`sqrt`/`log` — the ggml primitives already existed, just weren't wired up).
+  - A real memory-safety bug in dynamic `fill` handling (`torch.full` sized off a non-constant shape
+    pre-allocated `[4096]*rank` — 256 GiB at rank 3 — instead of composing a scalar-constant +
+    REPEAT-broadcast, which works at any rank).
+  - `slice_by_index` never honored `begin_mask`/`end_mask` (MIL's "ignore this bound, use the full extent"
+    convention for e.g. `x[1:]`/`x[:-1]`) and never normalized a negative begin/end against a *symbolic*
+    dim size (only the concrete-int case was handled) — silently produced literal negative shapes like
+    `-1` instead of `n_tokens - 1` for the mel frontend's pre-emphasis filter.
+  - `reduce_sum` always fully-reduced to one scalar (`ggml_sum`), when MIL's own `reduce_sum` here always
+    reduces over exactly one real axis (STFT magnitude, CMVN mean/variance) — replaced with a real
+    per-axis reduction (permute target axis to `ne[0]`, `ggml_sum_rows`, permute back, reshape away if
+    `keep_dims=False`), driven by a new dedicated exporter translation that reads MIL's `axes`/`keep_dims`
+    inputs directly instead of dropping them.
+  - `RESHAPE`/`VIEW`/`MUL_MAT` all gained real, informative error messages (shape/element-count mismatch
+    details) in place of raw uncatchable `GGML_ASSERT` aborts — made every one of the above findable at
+    all instead of a bare crash with no context.
+  - **The deepest one**: `get_var_info`'s long-standing "collapse every symbolic MIL shape dim to the bare
+    string `n_tokens`" heuristic (documented, deliberate, and correct for every model up to LFM2/Qwen3 —
+    see EXPORT-BACKLOG's own history) is genuinely wrong here, because Conformer-CTC's mel-frontend
+    introduces a **second, derived** dynamic quantity (STFT frame count, `floor(n_tokens/160)+1 ≈ 101` for
+    a 1s clip, vs. `n_tokens = 16000` raw samples) that also happens to present as a bare opaque symbol.
+    Fixed with a new `_infer_dynamic_dim_expr` — a bounded backward walk from a symbolic dim through its
+    producer chain, deriving the real expression instead of guessing, with safe bare-substitution fallback
+    for anything it doesn't specifically understand (never regresses a case it used to get right). Handles,
+    in order added as each was needed: `cast`/unary shape-preserving ops (`log`/`exp`/`sqrt`/etc.) as pure
+    passthrough; `conv` (real stride/pad/kernel formula); `matmul` (per-operand axis correspondence,
+    honoring `transpose_x`/`transpose_y`); `tile` (no-op passthrough when `reps==1`, or "resolves to a
+    literal 1" when `reps` itself is unreadable — poisoned the same way GQA `repeat_kv`'s `reps` is — but
+    the input axis is already a static 1, matching this whole exporter's "batch is always 1" design);
+    elementwise binary broadcast ops (comparisons/add/sub/mul/etc. — the real axis comes from whichever
+    operand isn't just a size-1 broadcast target); `expand_dims`/`squeeze` (axis-shifted passthrough).
+
+  **Still open**: even with all of the above, one real data-flow bug remains, found via bisection (not
+  yet root-caused to a specific fix). The length-validity mask's `RANGE_1D` bound (`gather_7`, read from
+  `shape(real_div(...log(...matmul(mel_filterbank, power_spectrum)...)...))` — i.e. the real, correctly
+  *shaped* log-mel feature tensor) evaluates to `16000` (raw sample count) instead of the expected `~101`
+  (frame count) at actual runtime, despite every op in that chain now having correct shape-string
+  derivation and the upstream STFT `CONV_1D`'s own real ggml-computed output already being correctly
+  101-sized (confirmed via a truncated-topology bisection). The remaining gap is somewhere in either (a)
+  how `SHAPE`/`GATHER` read back a real tensor's dimensions at this specific point in the graph, or (b) a
+  node between the STFT conv and this `gather` that's silently producing a wrongly-sized tensor despite
+  correct shape *attributes* elsewhere (the C++ ops here don't all need declared JSON shapes — ADD/SUB/DIV/
+  LOG/MATMUL derive their output shape automatically from real operand tensors at build time, so a
+  shape-string fix doesn't necessarily touch them). Needs a fresh bisection session picking up from
+  `/tmp/truncated_conv0.json`'s technique (register a topology truncated to `nodes[:N]` with a chosen
+  intermediate as `"output"`, read back via `run_subgraph`'s shape return) — confirm the STFT conv's real
+  output is 101-framed (done), then walk forward node-by-node through the `real_div`/`log`/`matmul`/
+  `shape`/`gather` chain checking each one's real computed `ne` shape until the exact node that turns 101
+  into 16000 is found.
 - **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
   SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
   exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow

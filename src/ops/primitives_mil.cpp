@@ -61,9 +61,54 @@ Outputs op_maximum(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_scale(pc.ctx, add_diff, 0.5f)};
 }
 
-Outputs op_reduce_sum(PrimitiveContext& pc, const Inputs& in, const Json&) {
+Outputs op_reduce_sum(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    // Real per-axis reduction, driven by an explicit "axis" (ne-order) + "keep_dims" attr the exporter
+    // now writes (tools/loom_mil_compiler/exporter.py's dedicated "reduce_sum" translation) -- MIL's
+    // `reduce_sum` almost always reduces over ONE specific axis (e.g. Conformer-CTC's mel-frontend
+    // magnitude computation, `sum(x**2, axis=-1)` over a stacked real/imag pair; CMVN's per-channel
+    // mean/variance, summed over time), never every element -- the old always-`ggml_sum`-to-a-scalar
+    // behavior silently produced a degenerate 1-element result for every one of these, discovered via a
+    // downstream MUL_MAT shape-mismatch crash while exporting Conformer-CTC.
     expect_n_inputs("reduce_sum", in, 1);
-    return {ggml_sum(pc.ctx, in[0])};
+    ggml_tensor* x = in[0];
+    if (!attrs.contains("axis")) {
+        // No axis info reached this primitive (e.g. an older/hand-written topology never updated to
+        // pass one) -- fall back to the previous full-reduction behavior rather than failing outright.
+        return {ggml_sum(pc.ctx, x)};
+    }
+    const int axis = static_cast<int>(resolve_attr_number(attrs, "axis", pc.symbols));
+    const bool keep_dims = attrs.value("keep_dims", false);
+    if (axis < 0 || axis > 3) {
+        throw SchemaError("REDUCE_SUM: 'axis' must resolve to 0-3 (ne-order), got " + std::to_string(axis));
+    }
+
+    // ggml_sum_rows only ever sums ne[0] -- permute the target axis into position 0, sum, then permute
+    // back. A single-swap permutation is its own inverse, so the same `perm` array undoes it.
+    int perm[4] = {0, 1, 2, 3};
+    perm[0] = axis;
+    perm[axis] = 0;
+    ggml_tensor* permuted = ggml_cont(pc.ctx, ggml_permute(pc.ctx, x, perm[0], perm[1], perm[2], perm[3]));
+    ggml_tensor* summed = ggml_sum_rows(pc.ctx, permuted);
+    ggml_tensor* result = ggml_cont(pc.ctx, ggml_permute(pc.ctx, summed, perm[0], perm[1], perm[2], perm[3]));
+
+    if (keep_dims) {
+        return {result};
+    }
+    // Genuinely drop the now-size-1 axis (not just leave it in place) -- downstream ops expecting the
+    // MIL-declared reduced rank need the real element layout a RESHAPE gives, not merely a size-1 ne
+    // entry sitting between faster-varying axes.
+    int64_t new_ne[3];
+    int j = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (i == axis) continue;
+        new_ne[j++] = result->ne[i];
+    }
+    switch (j) {
+        case 1: return {ggml_reshape_1d(pc.ctx, result, new_ne[0])};
+        case 2: return {ggml_reshape_2d(pc.ctx, result, new_ne[0], new_ne[1])};
+        case 3: return {ggml_reshape_3d(pc.ctx, result, new_ne[0], new_ne[1], new_ne[2])};
+        default: return {result};
+    }
 }
 
 Outputs op_identity(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -199,6 +244,27 @@ Outputs op_not(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_scale_bias(pc.ctx, in[0], -1.0f, 1.0f)};
 }
 
+ggml_tensor* mul_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
+    // ggml_mul(a, b) requires `a` to be the OUTPUT/target shape with `b` merely repeated into it (same
+    // constraint ggml_sub has -- see sub_broadcast above), but MIL's `select`/elementwise ops place no
+    // such constraint on operand order. Orient correctly regardless of which operand is larger, same
+    // "commutative swap" convention op_add/op_mul (primitives_basic.cpp) already use.
+    ggml_tensor* a = x;
+    ggml_tensor* b = y;
+    if (ggml_nelements(y) > ggml_nelements(x)) {
+        a = y;
+        b = x;
+    }
+    if (!ggml_can_repeat(b, a)) {
+        auto ne_str = [](ggml_tensor* t) {
+            return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                   std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+        };
+        throw SchemaError("MUL: incompatible shapes a=" + ne_str(a) + " b=" + ne_str(b));
+    }
+    return ggml_mul(ctx, a, b);
+}
+
 Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("select", in, 3);
     // Algebraic select: cond * x + (1.0f - cond) * y
@@ -206,9 +272,9 @@ Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
     ggml_tensor* x = in[1];
     ggml_tensor* y = in[2];
 
-    ggml_tensor* cond_x = ggml_mul(pc.ctx, cond, x);
+    ggml_tensor* cond_x = mul_broadcast(pc.ctx, cond, x);
     ggml_tensor* one_minus_cond = ggml_scale_bias(pc.ctx, cond, -1.0f, 1.0f);
-    ggml_tensor* term_y = ggml_mul(pc.ctx, one_minus_cond, y);
+    ggml_tensor* term_y = mul_broadcast(pc.ctx, one_minus_cond, y);
     return {ggml_add(pc.ctx, cond_x, term_y)};
 }
 

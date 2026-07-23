@@ -45,7 +45,16 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
     if (!ggml_is_contiguous(b)) {
         b = ggml_cont(pc.ctx, b);
     }
-    
+
+    // Mirrors ggml.c's own (internal, not exported) ggml_can_mul_mat check.
+    const bool can_mul_mat = a->ne[0] == b->ne[0] && b->ne[2] % a->ne[2] == 0 && b->ne[3] % a->ne[3] == 0;
+    if (!can_mul_mat) {
+        throw SchemaError("MUL_MAT: incompatible shapes a=[" + std::to_string(a->ne[0]) + "," +
+                           std::to_string(a->ne[1]) + "," + std::to_string(a->ne[2]) + "," +
+                           std::to_string(a->ne[3]) + "] b=[" + std::to_string(b->ne[0]) + "," +
+                           std::to_string(b->ne[1]) + "," + std::to_string(b->ne[2]) + "," +
+                           std::to_string(b->ne[3]) + "]");
+    }
     return {ggml_mul_mat(pc.ctx, a, b)};
 }
 
@@ -627,6 +636,16 @@ Outputs op_view(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     }
     const std::vector<int64_t> shape = resolve_attr_int_array(attrs, "shape", pc.symbols);
     const int64_t offset = attrs.contains("offset") ? resolve_attr_int(attrs, "offset", pc.symbols) : 0;
+    for (int64_t d : shape) {
+        if (d <= 0) {
+            std::string shape_str;
+            for (auto s : shape) shape_str += std::to_string(s) + ",";
+            throw SchemaError("VIEW: non-positive dimension in resolved shape [" + shape_str +
+                               "], offset=" + std::to_string(offset) + ", parent ne=[" +
+                               std::to_string(parent->ne[0]) + "," + std::to_string(parent->ne[1]) + "," +
+                               std::to_string(parent->ne[2]) + "," + std::to_string(parent->ne[3]) + "]");
+        }
+    }
     switch (shape.size()) {
         case 1:
             return {ggml_view_1d(pc.ctx, parent, shape[0], offset)};
