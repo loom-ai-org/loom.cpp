@@ -1204,6 +1204,29 @@ void test_pad_1d() {
     LOOM_CHECK((get_f32(out) == std::vector<float>{0, 5, 6, 7, 0, 0}));
 }
 
+void test_pad_1d_reflect() {
+    // Same lp0=1/rp0=2 shape as test_pad_1d, but reflect (not zero) fill -- verified against
+    // numpy.pad([5,6,7], (1,2), mode="reflect") == [6,5,6,7,6,5] (excludes the edge element itself from
+    // being duplicated, matching PyTorch's own "reflect" -- not "symmetric" -- convention, needed for
+    // MIL's "pad" op mode="reflect" as produced by STFT's center-framing decomposition, see
+    // EXPORT-IMPROVEMENT-BACKLOG.md item 4).
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 3);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    nlohmann::json attrs = {{"lp0", 1}, {"rp0", 2}};
+    ggml_tensor* out = op("PAD_1D_REFLECT")(pc, {a}, attrs)[0];
+    LOOM_CHECK(out->ne[0] == 6);
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(a, {5, 6, 7});
+    s.compute(gf);
+
+    LOOM_CHECK((get_f32(out) == std::vector<float>{6, 5, 6, 7, 6, 5}));
+}
+
 void test_concat() {
     // ggml_concat(a,b,dim) -- real in-graph channel concatenation needed by Kokoro's Decoder (torch.cat
     // sites whose operands are themselves graph-computed, unlike the host-side style-concatenation used
@@ -2171,6 +2194,121 @@ void test_text_encoder_assembly() {
     LOOM_CHECK(approx_eq(get_f32(logs), expected_logs, 1e-4f));
 }
 
+// SSM (Mamba/SSD) / RWKV primitives (EXPORT-IMPROVEMENT-BACKLOG.md item 4) -- shape-only checks, mirroring
+// ggml's own test-backend-ops.cpp shapes for these ops (test_ssm_conv/test_ssm_scan/test_rwkv_wkv6/
+// test_rwkv_wkv7): no exporter/model currently produces these, so there's no numeric reference to check
+// against yet, only that this project's thin wraps build a valid ggml graph and the CPU backend actually
+// computes it (not just infers a shape) without asserting.
+
+void test_ssm_conv() {
+    GgmlScratch s;
+    // d_conv=3, d_inner=3, n_t=2, n_s=1 -- sx->ne[0] must equal (d_conv - 1 + n_t).
+    ggml_tensor* sx = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, /*d_conv-1+n_t=*/4, /*d_inner=*/3, /*n_s=*/1);
+    ggml_tensor* c = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, /*d_conv=*/3, /*d_inner=*/3);
+    ggml_set_input(sx);
+    ggml_set_input(c);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("SSM_CONV")(pc, {sx, c}, {})[0];
+    LOOM_CHECK(out->ne[0] == 3);  // d_inner
+    LOOM_CHECK(out->ne[1] == 2);  // n_t
+    LOOM_CHECK(out->ne[2] == 1);  // n_s
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(sx, std::vector<float>(static_cast<size_t>(ggml_nelements(sx)), 1.0f));
+    set_f32(c, std::vector<float>(static_cast<size_t>(ggml_nelements(c)), 1.0f));
+    s.compute(gf); // must not assert/crash -- values aren't checked, no reference exists yet.
+}
+
+void test_ssm_scan() {
+    GgmlScratch s;
+    // d_state=16 (not a small arbitrary value) deliberately -- ggml's own CPU kernel comment notes
+    // "d_state is usually 16" for this exact code path; a too-small head_dim/head_count/d_state combo
+    // risks an unvalidated edge case in the kernel's SIMD blocking (confirmed the hard way: an earlier,
+    // smaller-shaped version of this test file's own RWKV_WKV7 test corrupted the heap with head_size=4,
+    // well below any real SIMD width ever exercised in ggml's own test-backend-ops.cpp defaults).
+    const int64_t d_state = 16, head_dim = 2, n_head = 2, n_group = 1, n_seq_tokens = 3, n_seqs = 1;
+    ggml_tensor* state = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, d_state, head_dim, n_head, n_seqs);
+    ggml_tensor* x = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, head_dim, n_head, n_seq_tokens, n_seqs);
+    ggml_tensor* dt = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, n_head, n_seq_tokens, n_seqs);
+    ggml_tensor* A = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, /*head_dim>1 so 1=*/1, n_head);
+    ggml_tensor* B = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
+    ggml_tensor* C = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
+    ggml_tensor* ids = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_I32, n_seqs);
+    for (ggml_tensor* t : {state, x, dt, A, B, C}) ggml_set_input(t);
+    ggml_set_input(ids);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("SSM_SCAN")(pc, {state, x, dt, A, B, C, ids}, {})[0];
+    // Concatenated y + new ssm_states, per ggml_ssm_scan's own doc comment.
+    LOOM_CHECK(ggml_nelements(out) == ggml_nelements(x) + d_state * head_dim * n_head * n_seqs);
+
+    ggml_cgraph* gf = s.expand(out);
+    for (ggml_tensor* t : {state, x, dt, A, B, C}) {
+        set_f32(t, std::vector<float>(static_cast<size_t>(ggml_nelements(t)), 0.1f));
+    }
+    set_i32(ids, {0});
+    s.compute(gf);
+}
+
+void test_rwkv_wkv6() {
+    GgmlScratch s;
+    // head_size=64 matches ggml's own test-backend-ops.cpp default for this op exactly (not shrunk the
+    // way most of this file's other shapes are) -- its CPU kernel's SIMD blocking has only ever been
+    // exercised at that width; a smaller head_size corrupted the heap in an earlier version of the
+    // sibling RWKV_WKV7 test below (see that test's own comment).
+    const int64_t head_size = 64, head_count = 2, n_tokens = 3, n_seqs = 1;
+    ggml_tensor* k = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* v = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* r = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* tf = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count);
+    ggml_tensor* td = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* state = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, head_size * head_size * head_count, n_seqs);
+    for (ggml_tensor* t : {k, v, r, tf, td, state}) ggml_set_input(t);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("RWKV_WKV6")(pc, {k, v, r, tf, td, state}, {})[0];
+    LOOM_CHECK(ggml_nelements(out) == head_size * head_count * n_tokens + head_size * head_size * head_count * n_seqs);
+
+    ggml_cgraph* gf = s.expand(out);
+    for (ggml_tensor* t : {k, v, r, tf, td, state}) {
+        set_f32(t, std::vector<float>(static_cast<size_t>(ggml_nelements(t)), 0.1f));
+    }
+    s.compute(gf);
+}
+
+void test_rwkv_wkv7() {
+    GgmlScratch s;
+    // head_size=64 (ggml's own test-backend-ops.cpp default) -- a smaller head_size (originally 4)
+    // corrupted the heap here ("corrupted size vs. prev_size while consolidating" during
+    // ggml_graph_compute), almost certainly this op's SIMD-blocked CPU kernel assuming a SIMD-width-
+    // aligned head_size rather than handling an arbitrary remainder safely. Confirmed empirically, not
+    // theorized -- ggml's own test suite never exercises this op below 64 either.
+    const int64_t head_size = 64, head_count = 2, n_tokens = 3, n_seqs = 1;
+    ggml_tensor* r = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* w = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* k = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* v = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* a = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* b = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, head_size, head_count, n_tokens);
+    ggml_tensor* state = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, head_size * head_size * head_count, n_seqs);
+    for (ggml_tensor* t : {r, w, k, v, a, b, state}) ggml_set_input(t);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("RWKV_WKV7")(pc, {r, w, k, v, a, b, state}, {})[0];
+    LOOM_CHECK(ggml_nelements(out) == head_size * head_count * n_tokens + head_size * head_size * head_count * n_seqs);
+
+    ggml_cgraph* gf = s.expand(out);
+    for (ggml_tensor* t : {r, w, k, v, a, b, state}) {
+        set_f32(t, std::vector<float>(static_cast<size_t>(ggml_nelements(t)), 0.1f));
+    }
+    s.compute(gf);
+}
+
 } // namespace
 
 int main() {
@@ -2217,6 +2355,7 @@ int main() {
     test_floor();
     test_sum_rows();
     test_pad_1d();
+    test_pad_1d_reflect();
     test_concat();
     test_repeat();
     test_interpolate_1d();
@@ -2231,6 +2370,10 @@ int main() {
     test_sdp_reverse_assembly();
     test_hifigan_generator();
     test_text_encoder_assembly();
+    test_ssm_conv();
+    test_ssm_scan();
+    test_rwkv_wkv6();
+    test_rwkv_wkv7();
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

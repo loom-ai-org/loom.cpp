@@ -874,6 +874,13 @@ target_link_libraries(test_e2e_lfm2_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_mil_export COMMAND test_e2e_lfm2_mil_export)
 set_tests_properties(test_e2e_lfm2_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- LSTM export via recurrent.py's build_lstm_cell_topologies + LoomLuaBridge::l_run_recurrent
+#     (EXPORT-IMPROVEMENT-BACKLOG.md item 4), verified against a real bidirectional torch.nn.LSTM ---
+add_executable(test_e2e_lstm_recurrent test_e2e_lstm_recurrent.cpp)
+target_link_libraries(test_e2e_lstm_recurrent PRIVATE loom::engine)
+add_test(NAME test_e2e_lstm_recurrent COMMAND test_e2e_lstm_recurrent)
+set_tests_properties(test_e2e_lstm_recurrent PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Same LFM2-350M monolithic export's new tokenizer.ggml.* KVs (EXPORT-BACKLOG.md item 4) --
 #     loom::BpeVocab::encode/decode checked against the real HF AutoTokenizer on the same checkpoint ---
 add_executable(test_e2e_lfm2_tokenizer test_e2e_lfm2_tokenizer.cpp)

@@ -88,6 +88,20 @@ private:
     // lua_bridge.cpp's own top comment for why every one of these MUST convert C++ exceptions to
     // `luaL_error` internally rather than let them unwind through the Lua C API.
     static int l_run_subgraph(lua_State* L);
+    // `loom.run_recurrent(h_module, c_module, sequence_flat, seq_len, input_dim, hidden_dim, reverse)`:
+    // steps an LSTM cell over `sequence_flat` (a flat, row-major (seq_len, input_dim) array) one
+    // timestep at a time, threading hidden/cell state between GraphBuilder rebuilds exactly like
+    // BiLstmStepper's own lstm_cell_step (src/core/bilstm_stepper.cpp) does -- generalized to run off
+    // topology NAMES already registered via register_module, the same lookup l_run_subgraph itself uses,
+    // instead of BiLstmStepper's own hardcoded 4-GGUF constructor. `h_module`/`c_module` must be the
+    // per-timestep cell topologies tools/loom_mil_compiler/recurrent.py's build_lstm_cell_topologies()
+    // produces (declaring "layer_input"/"h_prev"/"c_prev" inputs and an "h_new"/"c_new" output
+    // respectively). `reverse=true` walks timesteps backward (seq_len-1 down to 0), writing each result
+    // to its own real time index in the (still forward-ordered) output -- the same convention
+    // BiLstmStepper::run uses for its own backward pass. Returns (output_flat, shape) where output_flat
+    // is a flat (seq_len, hidden_dim) array and shape is [hidden_dim, seq_len, 1, 1] (ggml ne[] order,
+    // matching loom.run_subgraph's own second return value).
+    static int l_run_recurrent(lua_State* L);
     static int l_range(lua_State* L);
     static int l_causal_mask(lua_State* L);
     static int l_zero_mask(lua_State* L);
