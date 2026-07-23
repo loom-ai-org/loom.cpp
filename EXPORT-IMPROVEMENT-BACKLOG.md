@@ -10,16 +10,30 @@ model.**
 Four threads came out of that comparison. Ordered by dependency (each rationale below is the precise
 reasoning already worked out in conversation, kept intact rather than re-derived):
 
-| # | Thread | Why this order |
-|---|---|---|
-| 1 | Consolidate torch-frontend patches + generic export driver | Foundational plumbing every other thread's export scripts sit on top of |
-| 2 | Replace scope-based atomic partitioning with a submodule-export blueprint | Biggest complexity/fragility reduction; independent of #3; directly requested |
-| 3 | Extract graph rewrites (GQA fusion, linear-bias compose) into real MIL passes | Cleans up the translation step once #2 has changed what that step receives |
-| 4 | Document the MIL op-coverage boundary (opaque-kernel ops, STFT/FFT lowering) | Reference material for the *next* model's op gaps, not a code change to the current exporter |
+| # | Thread | Why this order | Status |
+|---|---|---|---|
+| 1 | Consolidate torch-frontend patches + generic export driver | Foundational plumbing every other thread's export scripts sit on top of | **Done** (2026-07-23) |
+| 2 | Replace scope-based atomic partitioning with a submodule-export blueprint | Biggest complexity/fragility reduction; independent of #3; directly requested | **Done**, first iteration (2026-07-23) |
+| 3 | Extract graph rewrites (GQA fusion, linear-bias compose) into real MIL passes | Cleans up the translation step once #2 has changed what that step receives | Not started |
+| 4 | Document the MIL op-coverage boundary (opaque-kernel ops, STFT/FFT lowering) | Reference material for the *next* model's op gaps, not a code change to the current exporter | Not started |
 
 ---
 
 ## 1. Consolidate torch-frontend patches; add a generic HF export driver
+
+**Status: done (2026-07-23).** Implemented as planned, with the plan's own "byte-for-byte-identical
+GGUF before/after" bar as the acceptance test:
+- `tools/loom_mil_compiler/torch_patches.py` (new) — `apply_torch_frontend_patches()`, idempotent,
+  called from `loom_mil_compiler/__init__.py` at import time.
+- `tools/loom_mil_compiler/export_hf_causal_lm.py` (new) — the generic `export_causal_lm()` driver /
+  CLI: load → trace → `ct.convert` → `LoomGGUFExporter`, with `architecture` auto-inferred from
+  `model.config.model_type` when not given.
+- `export_lfm2_monolithic.py` / `export_lfm2_atomic.py` shrunk from ~145 lines each to ~20-line thin
+  wrappers calling `export_causal_lm(...)` with LFM2's own model_dir/tokenizer_pre/architecture.
+  `tools/convert_lfm/make_lfm2_gguf.py`'s duplicated patch block removed, relies on the import-time
+  patch instead.
+- Verified: re-ran both LFM2 scripts, `cmp`'d output against pre-refactor GGUFs — byte-identical.
+  `test_e2e_lfm2_mil_export` (8/8) and `test_e2e_lfm2_tokenizer` (13/13) pass unchanged.
 
 **Rationale.** `_robust_cast`/`_robust_decompose_sdpa` and their `mil_ops._cast = ...` /
 `mil_frontend_utils._decompose_scaled_dot_product_attention = ...` monkeypatches are byte-identical across
@@ -58,6 +72,78 @@ before/after is the acceptance bar.
 ---
 
 ## 2. Replace scope-based atomic partitioning with a submodule-export blueprint
+
+**Status: first iteration done (2026-07-23), landed as a new opt-in path alongside the existing
+`apply_atomic_export` (not yet a replacement — see "kept as a separate path" below).**
+
+- `tools/loom_mil_compiler/submodule_discovery.py` (new) — `find_repeated_blocks()` (structural
+  `nn.ModuleList`/`Sequential` discovery, exactly as planned) and `capture_calls()` (forward-hook
+  capture of a submodule's real call over one eager pass — the "no shape ever guessed" replacement for
+  `make_lfm2_gguf.py`'s hand-fabricated dummy tensors).
+- `tools/loom_mil_compiler/submodule_export.py` (new) — `SubmoduleExportSpec` (Phase 1's declarative
+  `prefix_attr`/`repeated_attr`/`suffix_attrs`, plus one addition the plan didn't anticipate: an
+  optional `aux_attr`/`aux_kwarg` — see "found during implementation" below) and `export_submodules()`,
+  which traces each submodule standalone via a generic `_ReplayWrapper` (replays a captured
+  `(args, kwargs)` call as a flat `forward(*tensors)`) and assembles a multi-`Function` MIL `Program`.
+- `export_lfm2_submodule.py` (new) — driver script producing `lfm2_350m_submodule.gguf`, mirroring
+  `export_lfm2_atomic.py`'s shape.
+- `apply_submodule_export` (new method in `exporter.py`) — consumes the real standalone `Function`s
+  directly via `generate_graph_topology(func, name)`, exactly as the plan's "driver-synthesis needs no
+  new code" section predicted; no ops_list/inputs_dict reconstruction.
+
+**Found during implementation, not anticipated by the original plan text:**
+1. **A shared once-computed tensor problem.** LFM2's rotary-embedding table (`model.pos_emb`) is
+   computed ONCE in `Lfm2Model.forward` and passed identically to every decoder layer as
+   `position_embeddings=(cos, sin)` — a case the plan's prefix/repeated/suffix boundary doesn't cover
+   (it's neither prefix nor per-layer). Fixed by adding a 4th declarative piece, `aux_attr`/`aux_kwarg`:
+   a submodule traced once, whose output is threaded into every repeated-block call.
+2. **The engine supports exactly one output tensor per subgraph call** (`loom.run_subgraph` always
+   returns exactly `(data, shape)`, never more). A submodule that itself returns a tuple (aux's
+   `(cos, sin)`) or consumes a tuple-valued kwarg can't be wired as multiple named outputs/inputs the
+   way a first attempt assumed. Fixed generically in `submodule_export.py`: any tuple/list-valued
+   kwarg or return value made of tensors is concatenated along its last axis into ONE tensor at the
+   trace boundary (recording split sizes to reconstruct the tuple inside the wrapper before calling the
+   real module) — not LFM2-specific, applies to any future model with the same shape of problem.
+3. **Two real bugs in the pre-existing `generate_graph_topology`, both now fixed (and covered by
+   regression tests) since they affect the atomic path too, just never triggered by it:**
+   - `resolve()` infinite-looped on a self-referential alias, which only happens when a submodule's own
+     input is already literally named `"hidden_states"` (true for every independently-traced decoder
+     layer here; never true for atomic's SSA-derived slice names).
+   - A declared input with no real consumer (e.g. `cache_position`/`position_ids`, dead once
+     `past_key_values` is forced to `None` for a stateless standalone trace) got a ggml tensor created
+     but never allocated a backend buffer (`ggml_gallocr_alloc_graph` only allocates tensors reachable
+     from the declared output) — setting data into it crashed with `GGML_ASSERT ... tensor buffer not
+     set`. Fixed by dropping post-pruning-unreferenced inputs from the topology's declared list, so a
+     driver that still supplies one now gets a clean `check_subgraph_calls` export-time error instead of
+     a runtime crash. Also fixed a related latent bug this crash's error message ran into:
+     `src/core/lua_bridge.cpp`'s size-mismatch error used `%zu`, a directive Lua's own `pushfstring`
+     (not libc printf) doesn't understand, silently truncating the message before the real numbers ever
+     printed — changed to `%d`.
+   - Also discovered: which inputs survive pruning can differ **per layer**, not just per model — LFM2's
+     conv-type layers never touch `position_embeddings` (only its attention-type layers do), so
+     `apply_submodule_export`'s wiring consults each layer's own post-filter declared inputs rather than
+     a single shared name list.
+
+**Verification performed:** `test_e2e_lfm2_mil_export` passes against `lfm2_350m_submodule.gguf` — same
+expected top-1 tokens (3523 / 2) as atomic/monolithic. Re-ran atomic/monolithic exports after the
+`generate_graph_topology`/`lua_bridge.cpp` fixes and confirmed byte-identical output to before (the
+fixes are no-ops for those paths). GGUF size: submodule (1.69GB) ≈ atomic (1.69GB) > monolithic
+(1.42GB) — reproducing this doc's own predicted tied-embedding duplication cost (one 65536×1024 fp32
+matrix, ~268MB), not a new regression.
+
+**Not yet done (still open, deferred out of this iteration):**
+- **Kept as a separate opt-in path, not a replacement.** `apply_atomic_export`/`export_lfm2_atomic.py`
+  are untouched and still the default "atomic" profile, per this doc's own step 5 ("keep the existing
+  fallback available until the new path is verified numerically"). Promoting the submodule blueprint to
+  the default (and deleting the scope-partitioning code path) is a follow-up decision, not yet made.
+- **A second model in the regression suite.** Everything above was validated on LFM2 alone; the
+  generality claim (structurally different attribute names, a non-hybrid homogeneous-layer model) is
+  still unproven per this doc's own verification checklist.
+- **The content-hash weight dedup** for cross-submodule duplication (rationale part C's "known cost")
+  — not attempted; the GGUF-size measurement above is the input to that future decision, not the fix
+  itself.
+- Phase 2 (fully automatic prefix/suffix boundary discovery via early-exit hooks) — not attempted;
+  Phase 1's declarative spec (now 4 fields: prefix/repeated/suffix/aux) was sufficient for LFM2.
 
 **Rationale, part A — the current partitioner is not as heuristic as it looked at first, but its
 reconstruction step is.** `apply_atomic_export`'s `torch_scope_key` (`exporter.py:303-312`) reads
