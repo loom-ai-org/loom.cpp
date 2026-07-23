@@ -822,6 +822,14 @@ target_link_libraries(test_e2e_supertonic_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_driver COMMAND test_e2e_supertonic_driver)
 set_tests_properties(test_e2e_supertonic_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- SupertonicTTS's real TextVectorizer (unicode codepoint-map tokenizer), against the real
+#     unicode_indexer.json asset -- see tools/convert_supertonic/convert_supertonic_text_vectorizer.py.
+#     Skips cleanly if LOOM_SUPERTONIC_TEXT_VECTORIZER_GGUF isn't set. ---
+add_executable(test_supertonic_text_vectorizer test_supertonic_text_vectorizer.cpp)
+target_link_libraries(test_supertonic_text_vectorizer PRIVATE loom::engine)
+add_test(NAME test_supertonic_text_vectorizer COMMAND test_supertonic_text_vectorizer)
+set_tests_properties(test_supertonic_text_vectorizer PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Matcha-TTS roadmap: TextEncoder (ConvReluNorm prenet, partial-rotary NeoX RoPE self-attention,
 #     per-token DurationPredictor) against the real matcha.models.components.text_encoder.TextEncoder
 #     module run directly. See tools/convert_matcha/convert_matcha_text_encoder.py. ---
