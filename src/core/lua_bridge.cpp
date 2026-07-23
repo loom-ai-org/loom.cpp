@@ -152,6 +152,90 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
     }
 }
 
+int LoomLuaBridge::l_run_recurrent(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* h_module_name = luaL_checkstring(L, 1);
+        const char* c_module_name = luaL_checkstring(L, 2);
+        const std::vector<double> sequence = read_number_array(L, 3);
+        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 4));
+        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
+        const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 6));
+        const bool reverse = lua_toboolean(L, 7) != 0;
+
+        if (sequence.size() != static_cast<size_t>(seq_len) * input_dim) {
+            return luaL_error(L, "loom.run_recurrent: sequence has %d elements, expected seq_len*input_dim=%d",
+                               static_cast<int>(sequence.size()), static_cast<int>(seq_len * input_dim));
+        }
+
+        const auto h_it = self->modules_.find(h_module_name);
+        if (h_it == self->modules_.end()) {
+            return luaL_error(L, "loom.run_recurrent: unregistered module '%s'", h_module_name);
+        }
+        const auto c_it = self->modules_.find(c_module_name);
+        if (c_it == self->modules_.end()) {
+            return luaL_error(L, "loom.run_recurrent: unregistered module '%s'", c_module_name);
+        }
+        Module& h_mod = h_it->second;
+        Module& c_mod = c_it->second;
+
+        // A fresh GraphBuilder per direction (not per timestep) -- same "build once, rebuild per call"
+        // shape BiLstmStepper's own constructor uses; GraphBuilder::build() itself is still called once
+        // per timestep below (a step's h/c depend on the PREVIOUS step's real output values, so each
+        // timestep genuinely needs its own compute, unlike loom.run_subgraph's single one-shot call).
+        GraphBuilder h_builder(h_mod.topo, *h_mod.model, h_mod.backend, h_mod.kv_cache);
+        GraphBuilder c_builder(c_mod.topo, *c_mod.model, c_mod.backend, c_mod.kv_cache);
+
+        std::vector<float> h(hidden_dim, 0.0f);
+        std::vector<float> c(hidden_dim, 0.0f);
+        std::vector<double> out(static_cast<size_t>(seq_len) * hidden_dim);
+
+        for (uint32_t step = 0; step < seq_len; ++step) {
+            // `reverse` walks timesteps backward through the SAME (forward-ordered) `sequence` input,
+            // writing each result to its own real time index `t` -- mirroring BiLstmStepper::run's own
+            // backward pass (src/core/bilstm_stepper.cpp) exactly, so a reverse-direction MIL `lstm` op
+            // (see recurrent.py's own "direction" handling) doesn't need its caller to pre-reverse
+            // anything itself.
+            const uint32_t t = reverse ? (seq_len - 1 - step) : step;
+            std::vector<float> layer_input(input_dim);
+            for (uint32_t k = 0; k < input_dim; ++k) {
+                layer_input[k] = static_cast<float>(sequence[static_cast<size_t>(t) * input_dim + k]);
+            }
+
+            GraphBuilder::BuildResult hr = h_builder.build(/*n_tokens=*/0, /*n_past=*/0);
+            ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0,
+                                     layer_input.size() * sizeof(float));
+            ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
+            ggml_backend_tensor_set(hr.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
+            ggml_backend_graph_compute(h_mod.backend, hr.graph);
+            std::vector<float> h_new(hidden_dim);
+            ggml_backend_tensor_get(hr.output, h_new.data(), 0, h_new.size() * sizeof(float));
+
+            GraphBuilder::BuildResult cr = c_builder.build(/*n_tokens=*/0, /*n_past=*/0);
+            ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0,
+                                     layer_input.size() * sizeof(float));
+            ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
+            ggml_backend_tensor_set(cr.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
+            ggml_backend_graph_compute(c_mod.backend, cr.graph);
+            std::vector<float> c_new(hidden_dim);
+            ggml_backend_tensor_get(cr.output, c_new.data(), 0, c_new.size() * sizeof(float));
+
+            h = h_new;
+            c = c_new;
+            for (uint32_t k = 0; k < hidden_dim; ++k) {
+                out[static_cast<size_t>(t) * hidden_dim + k] = h[k];
+            }
+        }
+
+        push_number_array(L, out);
+        const std::vector<double> shape = {static_cast<double>(hidden_dim), static_cast<double>(seq_len), 1.0, 1.0};
+        push_number_array(L, shape);
+        return 2;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.run_recurrent: %s", e.what());
+    }
+}
+
 int LoomLuaBridge::l_range(lua_State* L) {
     try {
         const auto start = static_cast<int64_t>(luaL_checknumber(L, 1));
@@ -374,7 +458,8 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
         const char* name;
         lua_CFunction fn;
     } bindings[] = {
-        {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"range", &LoomLuaBridge::l_range},
+        {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
+        {"range", &LoomLuaBridge::l_range},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},

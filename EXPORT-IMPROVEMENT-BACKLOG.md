@@ -15,7 +15,7 @@ reasoning already worked out in conversation, kept intact rather than re-derived
 | 1 | Consolidate torch-frontend patches + generic export driver | Foundational plumbing every other thread's export scripts sit on top of | **Done** (2026-07-23) |
 | 2 | Replace scope-based atomic partitioning with a submodule-export blueprint | Biggest complexity/fragility reduction; independent of #3; directly requested | **Done**, first iteration (2026-07-23) |
 | 3 | Extract graph rewrites (GQA fusion, linear-bias compose) into real MIL passes | Cleans up the translation step once #2 has changed what that step receives | **Done** (2026-07-23) |
-| 4 | Document the MIL op-coverage boundary (opaque-kernel ops, STFT/FFT lowering) | Reference material for the *next* model's op gaps, not a code change to the current exporter | Not started |
+| 4 | Document the MIL op-coverage boundary (opaque-kernel ops, STFT/FFT lowering) | Reference material for the *next* model's op gaps, not a code change to the current exporter | **Done**, scope expanded to real implementation (2026-07-23) |
 
 ---
 
@@ -435,6 +435,111 @@ behavior change) — same regression tests as thread 1.
 ---
 
 ## 4. Document the MIL op-coverage boundary (reference, not a code change)
+
+**Status: done (2026-07-23), scope expanded beyond "documentation only" by explicit request.** The
+original plan below was documentation-only, deferring all four op-coverage gaps (complex-dialect/STFT,
+recurrent, random, image) until a concrete model hit them. Asked to go further — implement what's
+actually feasible, not just catalog the gaps — this iteration:
+
+- **STFT: made it actually export, not just documented that it might.** Ran the "cheap experiment" the
+  original plan only speculated about (see Rationale below) for real: traced a small `torch.stft` module
+  through the standard `ct.convert(...)` pipeline and confirmed it decomposes into
+  `const/cast/reshape/conv/expand_dims/pad` via coremltools' own `common::lower_complex_dialect_ops` pass,
+  exactly as hoped. Every one of those op types was already handled **except `pad`** — added (C++:
+  `PAD_1D_REFLECT` wrapping ggml's existing `ggml_pad_reflect_1d`; Python: a new `"pad"` branch in
+  `generate_graph_topology`, dispatching on `mode`). Getting a full round trip working also surfaced a
+  second, unplanned gap — `conv_transpose` (needed by the new ISTFT module below) had no translation
+  either, despite Loom's C++ side already having `CONV_TRANSPOSE_1D`/`CONV_TRANSPOSE_2D` registered (used
+  today by Kokoro's hand-built driver) — added that translation too. `torch.istft` itself has no
+  coremltools torch-frontend handler at all (confirmed: tracing it fails immediately, no MIL op is ever
+  produced), so no pass can fix it; instead added `tools/loom_mil_compiler/istft.py`, a pure-torch
+  reimplementation (two `conv_transpose1d` calls + one more for the window-sum normalization) that traces
+  cleanly through the ops above, verified to ~1e-7 max diff against real `torch.istft` on random,
+  non-self-consistent input. A full `torch.stft` → `ISTFT` round trip now exports end-to-end through the
+  standard pipeline with zero bespoke ops (`tools/loom_mil_compiler/test_stft.py`).
+- **Recurrent: LSTM, for real, with a new C++ engine primitive.** ggml has no native LSTM/GRU op, but this
+  engine already had a full, tested hand-written LSTM (`BiLstmStepper`,
+  `src/core/bilstm_stepper.cpp` + `tools/convert_kokoro/convert_kokoro_duration_predictor.py`'s
+  `build_lstm_cell_topology`) used by StyleTTS2/Kokoro's still-hand-written drivers — never reachable from
+  the generic Lua-driven pipeline. Generalized it: `tools/loom_mil_compiler/recurrent.py`'s
+  `build_lstm_cell_topologies()` builds the same per-timestep cell topology from a **real traced MIL
+  `lstm` op's own weights** (two subtleties only found by tracing real modules, not from the docstring
+  alone — see "found during implementation" below); a new `LoomLuaBridge::l_run_recurrent` C++ binding
+  (`src/core/lua_bridge.cpp`) generalizes `BiLstmStepper`'s per-timestep loop to run off topology *names*
+  looked up the same way `loom.run_subgraph` already does. Verified twice, independently: a numpy-level
+  interpreter test executing the generated topology JSON directly against real `nn.LSTM`
+  (`tools/loom_mil_compiler/test_recurrent.py`, uni- and bi-directional), and a full C++ e2e test
+  (`tests/test_e2e_lstm_recurrent.cpp`) loading a real exported GGUF and driving it through
+  `loom.run_recurrent` from Lua — max diff 5e-8 against real bidirectional `torch.nn.LSTM` over 108 values.
+  **GRU was investigated and dropped** — see below, it doesn't trace the way LSTM does, so there's nothing
+  to generalize yet.
+- **SSM (Mamba/SSD) / RWKV: primitives registered, no auto-detection.** Per explicit direction: added
+  `SSM_CONV`/`SSM_SCAN`/`RWKV_WKV6`/`RWKV_WKV7` (new `src/ops/primitives_recurrent.cpp`) wrapping ggml's
+  own native kernels, with shape-only C++ unit tests. No exporter-side MIL-graph detection was attempted —
+  see Rationale below for why that's not just deferred effort but a real, current impossibility (no opaque
+  MIL op exists for these to detect).
+- **Random ops: no ggml-level fix is possible, so none was attempted — the fix is exporter-level
+  guidance.** ggml has no RNG-capable op at all. `generate_graph_topology` now fails loudly and
+  specifically for `random_normal`/`random_uniform`/`random_bernoulli`/`random_categorical` (pointing at
+  the real fix: hoist the sampling outside the trace boundary, feed pre-sampled noise in as an input,
+  sampled via the already-existing `loom.gaussian_array`/`loom.uniform_array`/`loom.seed_rng` host
+  functions every hand-written driver already uses) instead of the generic "missing a ggml mapping"
+  message. `transpile_operation` (the bespoke workflow, which — unlike a static topology — genuinely can
+  call host functions mid-driver) gained real `random_normal`/`random_uniform` → `loom.gaussian_array`/
+  `loom.uniform_array` cases for the standard N(0,1)/U(0,1) case. Both paths have test coverage in
+  `test_compiler.py`.
+
+**Found during implementation, not anticipated by the original plan text:**
+1. **GRU does not trace to an opaque MIL op the way LSTM does — confirmed empirically, not assumed.** The
+   plan (and MIL's own `gru` op schema, which genuinely exists) assumed `torch.nn.GRU` would trace to it
+   exactly like `torch.nn.LSTM` traces to `lstm`. Tracing a real `nn.GRU` (uni-directional, with and
+   without an explicit initial hidden state) through this pipeline's actual `torch.jit.trace` +
+   `ct.convert(...)` path shows it decomposes into `while_loop` + `slice_by_index` + consts instead —
+   coremltools' `gru` frontend handler is simply never reached this way in this environment/torch version.
+   That makes GRU a fundamentally different, harder problem than LSTM (no opaque op to swap for a stepper
+   call, only a real recurrent Python loop already unrolled into MIL control flow — closer to
+   `transpile_operation`'s existing `while_loop` handling than to "detect one opaque op"). Dropped
+   entirely rather than shipped half-verified; `recurrent.py`'s own module docstring documents this in
+   detail as the reason.
+2. **MIL's `lstm` op packs gates in `[i, f, o, z]` order — NOT `torch.nn.LSTM`'s own native `[i, f, g, o]`
+   state-dict packing.** coremltools' torch frontend permutes gate blocks when building the op, so reading
+   `op.inputs["weight_ih"].val` gives data already in MIL's order — `recurrent.py`'s `VIEW` offsets had to
+   match MIL's order, not the pre-existing `convert_kokoro_duration_predictor.py` reference's offsets
+   (which slice a raw, still-`ifgo`-ordered PyTorch state dict). Caught by a hand-built numpy simulation
+   against a real traced op's weights *before* writing any topology-generation code, not by trial and
+   error against the C++ engine.
+3. **MIL's `lstm.bias` is a single pre-summed `4*H` tensor** (`bias_ih + bias_hh`, combined by the torch
+   frontend), not two separate `4*H` halves the way `nn.LSTM`'s own state dict keeps them — simpler than
+   the reference script's two-step bias-add, not harder; also confirmed empirically, not just from the
+   (slightly ambiguous) docstring prose.
+4. **A `bidirectional=True` `nn.LSTM` traces as ONE `lstm` op with `direction="bidirectional"`**, packing
+   both directions' weights into that one op (`weight_ih_back`/`weight_hh_back`/`bias_back` alongside the
+   forward set) — not two separate `lstm` ops the way a naive reading of "bidirectional LSTMs are just two
+   independent passes" might suggest. `build_lstm_cell_topologies` handles this directly; the C++ side
+   still runs two independent stepper passes (matching `BiLstmStepper`'s own shape), driven by one Python
+   dict.
+5. **The `pad`/`conv_transpose` translations needed extra validation the "just map the op" framing
+   undersold.** `conv_transpose`'s traced form always carries an explicit `output_shape` (confirmed
+   directly) even for the ordinary unconstrained case — initially rejected outright as unsupported, then
+   fixed to verify it's merely *redundant* with the `pad_type='valid'` formula (which it always was in
+   every case observed) rather than blindly trusting or blindly rejecting it.
+6. **Two of the new SSM/RWKV primitive unit tests corrupted the heap at small (non-SIMD-aligned) test
+   shapes.** `RWKV_WKV7`'s (and, transitively in the same binary, `SSM_SCAN`'s) CPU kernel has SIMD-blocked
+   code paths that appear to assume a SIMD-width-aligned `head_size`/`d_state`; a `head_size=4` test shape
+   produced `corrupted size vs. prev_size while consolidating` during `ggml_graph_compute`. Fixed by
+   matching ggml's own `test-backend-ops.cpp` default shapes (`head_size=64`, `d_state=16`) instead of
+   hand-picking small ones — a real, reproducible finding about these ops' CPU kernels, not a bug in this
+   project's own wrapper code (`expect_n_inputs` + a direct `ggml_*` call, nothing more).
+
+**Verification performed:** `python3 -m pytest tools/loom_mil_compiler/{test_compiler,test_stft,test_recurrent}.py`
+(11/11). `ctest` full suite: `test_primitive_registry` (149/149 checks, including new `PAD_1D_REFLECT`/
+`SSM_CONV`/`SSM_SCAN`/`RWKV_WKV6`/`RWKV_WKV7` tests), new `test_e2e_lstm_recurrent` (max diff 5e-8 against
+real bidirectional `nn.LSTM`), and the full existing suite otherwise unchanged (only the same pre-existing,
+unrelated `test_e2e_lfm2_lua_driver` fixture-missing failure this session's earlier work already confirmed
+predates any of these changes). Re-ran `export_lfm2_monolithic.py`/`export_lfm2_atomic.py` after all
+`exporter.py` edits and confirmed byte-identical output to before this thread (`bb5ba992...`/`06983624...`)
+— every change here is additive (new op-type branches, new op detection) with no path through the existing
+LFM2 translation.
 
 **Rationale.** Whether "ggml compositions can cover all MIL ops" turned out to be mostly true but not
 universally: `OP_MAP` (73 entries) plus the special-cased compositions already cover essentially all of

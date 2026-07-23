@@ -319,6 +319,19 @@ Outputs op_pad_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {ggml_pad_ext(pc.ctx, in[0], lp0, rp0, 0, 0, 0, 0, 0, 0)};
 }
 
+Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    // Reflect-pads ne[0] only (lp0 left, rp0 right) via ggml_pad_reflect_1d: [a,b,c,d] -> [b,a,b,c,d,c]
+    // (excludes the edge element itself, matching numpy/torch's "reflect" -- not "symmetric" -- padding
+    // convention). Needed for MIL's "pad" op with mode="reflect", the shape STFT's center-framing
+    // (torch.stft(..., center=True)) traces as once decomposed via coremltools' own
+    // common::lower_complex_dialect_ops pass (EXPORT-IMPROVEMENT-BACKLOG.md item 4) -- unlike PAD_1D's
+    // zero-fill, this is numerically required for a correct STFT export, not just a shape formality.
+    expect_n_inputs("PAD_1D_REFLECT", in, 1);
+    const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
+    const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
+    return {ggml_pad_reflect_1d(pc.ctx, in[0], lp0, rp0)};
+}
+
 Outputs op_silu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SILU", in, 1);
     return {ggml_silu(pc.ctx, in[0])};
@@ -703,6 +716,7 @@ LOOM_REGISTER_OP(FILL, op_fill)
 LOOM_REGISTER_OP(DIAG_MASK_INF, op_diag_mask_inf)
 LOOM_REGISTER_OP(DIAG_MASK_ZERO, op_diag_mask_zero)
 LOOM_REGISTER_OP(PAD_1D, op_pad_1d)
+LOOM_REGISTER_OP(PAD_1D_REFLECT, op_pad_1d_reflect)
 LOOM_REGISTER_OP(SILU, op_silu)
 LOOM_REGISTER_OP(RELU, op_relu)
 LOOM_REGISTER_OP(LEAKY_RELU, op_leaky_relu)

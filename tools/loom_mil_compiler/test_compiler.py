@@ -231,5 +231,51 @@ class TestLoomMILCompiler(unittest.TestCase):
         self.assertIn("loom.run_subgraph('layer_0'", driver_script)
         self.assertIn("loom.run_subgraph('layer_1'", driver_script)
 
+    def test_random_normal_in_bespoke_driver_maps_to_gaussian_array(self):
+        """EXPORT-IMPROVEMENT-BACKLOG.md item 4: a random_normal op in the driver-level 'main' function
+        (the bespoke workflow, which -- unlike a static submodule topology -- genuinely can call host
+        functions mid-script) should translate to loom.gaussian_array, the same host RNG hand-written
+        drivers already use, not raise or silently mishandle."""
+        prog = Program()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 4), dtype=types.fp32)])
+        def dense_layer(x):
+            w = mb.const(val=np.ones((4, 4), dtype=np.float32), name="w")
+            return mb.matmul(x=x, y=w, name="matmul_node")
+
+        prog.functions["dense_layer"] = dense_layer.functions["main"]
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1,), dtype=types.fp32)])
+        def main_func(x):
+            noise = mb.random_normal(shape=np.array([4], dtype=np.int32), mean=0.0, stddev=1.0, name="noise")
+            return mb.add(x=noise, y=x, name="out")
+
+        prog.functions["main"] = main_func.functions["main"]
+
+        backend = loom_mil_compiler.LoomGGUFBackend()
+        backend(prog, output_path=self.output_path, architecture="random_test")
+
+        reader = GGUFReader(self.output_path)
+        driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
+        self.assertIn("loom.gaussian_array(4)", driver_script)
+
+    def test_random_normal_in_static_topology_raises_actionable_error(self):
+        """The SAME op inside a monolithic profile's static topology (main_topo, generated via
+        generate_graph_topology) must fail loudly and specifically -- ggml has no RNG-capable compute op,
+        so this can never be satisfied there, unlike the bespoke-driver case above."""
+        prog = Program()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1,), dtype=types.fp32)])
+        def main_func(x):
+            noise = mb.random_normal(shape=np.array([4], dtype=np.int32), name="noise")
+            return mb.add(x=noise, y=x, name="out")
+
+        prog.functions["main"] = main_func.functions["main"]
+
+        backend = loom_mil_compiler.LoomGGUFBackend()
+        with self.assertRaises(NotImplementedError) as ctx:
+            backend(prog, output_path=self.output_path, profile="monolithic", architecture="random_test")
+        self.assertIn("ggml has no RNG-capable compute op", str(ctx.exception))
+
 if __name__ == "__main__":
     unittest.main()

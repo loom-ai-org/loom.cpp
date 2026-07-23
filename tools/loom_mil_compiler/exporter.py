@@ -846,6 +846,46 @@ class LoomGGUFExporter:
             n_past = self.safe_name(op.inputs["n_past"].name)
             return [Local(output_names[0], Call("loom.causal_mask", [IRVar(n_tokens), IRVar(n_past)]))]
 
+        if op_type in ("random_normal", "random_uniform"):
+            # Unlike generate_graph_topology's own static-topology walk (which can NEVER satisfy a
+            # random op -- see that function's own comment), this driver-level walk CAN: `main`'s body
+            # is genuine Lua, already calling host functions mid-script (range/causal_mask above), so a
+            # random op here maps directly onto the existing loom.gaussian_array/loom.uniform_array host
+            # RNG functions (src/core/lua_bridge.cpp) real hand-written drivers already use.
+            shape_var = op.inputs.get("shape")
+            if shape_var is None or not hasattr(shape_var, "val") or shape_var.val is None:
+                raise NotImplementedError(
+                    f"{op_type} op '{op.name}' has a non-constant 'shape' input, which this exporter "
+                    "doesn't support (the sample count passed to loom.gaussian_array/uniform_array must "
+                    "be a compile-time constant)."
+                )
+            n = 1
+            for d in shape_var.val:
+                n *= int(d)
+
+            if op_type == "random_normal":
+                mean_var, stddev_var = op.inputs.get("mean"), op.inputs.get("stddev")
+                mean = float(mean_var.val) if mean_var is not None and hasattr(mean_var, "val") and mean_var.val is not None else 0.0
+                stddev = float(stddev_var.val) if stddev_var is not None and hasattr(stddev_var, "val") and stddev_var.val is not None else 1.0
+                if mean != 0.0 or stddev != 1.0:
+                    raise NotImplementedError(
+                        f"random_normal op '{op.name}' has mean={mean}/stddev={stddev} -- this exporter "
+                        "only supports the standard N(0,1) case loom.gaussian_array itself draws "
+                        "(compose an explicit MUL/ADD after it for any other mean/stddev)."
+                    )
+                return [Local(output_names[0], Call("loom.gaussian_array", [Lit(n)]))]
+
+            low_var, high_var = op.inputs.get("low"), op.inputs.get("high")
+            low = float(low_var.val) if low_var is not None and hasattr(low_var, "val") and low_var.val is not None else 0.0
+            high = float(high_var.val) if high_var is not None and hasattr(high_var, "val") and high_var.val is not None else 1.0
+            if low != 0.0 or high != 1.0:
+                raise NotImplementedError(
+                    f"random_uniform op '{op.name}' has low={low}/high={high} -- this exporter only "
+                    "supports the standard U(0,1) case loom.uniform_array itself draws (compose an "
+                    "explicit MUL/ADD after it for any other range)."
+                )
+            return [Local(output_names[0], Call("loom.uniform_array", [Lit(n)]))]
+
         # F. Fallback for generic SSA arithmetic
         inputs = [self.safe_name(v.name) for k, v in op.inputs.items() if hasattr(v, "name")]
         if len(inputs) == 2:
@@ -873,6 +913,32 @@ class LoomGGUFExporter:
         
         inputs = inputs_dict if inputs_dict is not None else (func.inputs if func else {})
         operations = ops_list if ops_list is not None else (func.operations if func else [])
+
+        # EXPORT-IMPROVEMENT-BACKLOG.md item 4: an "lstm" op can't be translated into ordinary static
+        # topology nodes the way every other op_type below is -- ggml has no native LSTM/GRU op, and
+        # unlike e.g. `linear`/`matmul`, correct recurrence needs a genuine host-side per-timestep loop
+        # (see recurrent.py's own module docstring and tools/loom_mil_compiler/test_recurrent.py's
+        # verified topology-generation logic), not a fixed sequence of graph nodes. `generate_graph_topology`
+        # only ever returns ONE static topology for the whole `operations` list it's given; splitting a
+        # function at an "lstm" op boundary into "pre-LSTM topology -> recurrent stepper call ->
+        # post-LSTM topology" driver segments -- the way apply_atomic_export splits at torch-scope
+        # boundaries -- is real, unimplemented follow-up work, not something this call can do safely.
+        # Fail loudly and specifically here rather than either silently mistranslating (there's no OP_MAP
+        # entry for "lstm" so it would otherwise hit the generic "missing a ggml mapping" message, which
+        # doesn't explain why or point at the real fix) or leaving a caller to guess.
+        if any(op.op_type in ("lstm", "gru") for op in operations):
+            raise NotImplementedError(
+                f"generate_graph_topology('{func_name}'): contains an '{next(op.op_type for op in operations if op.op_type in ('lstm', 'gru'))}' "
+                "op. ggml has no native LSTM/GRU op -- correct recurrence needs a real per-timestep "
+                "stepper (see tools/loom_mil_compiler/recurrent.py and the new "
+                "LoomLuaBridge::l_run_recurrent C++ binding, which generalizes the existing "
+                "BiLstmStepper), not a static topology. Auto-wiring this into the generic export "
+                "profiles (monolithic/atomic/submodule-blueprint driver synthesis) is unimplemented "
+                "follow-up work -- for now, build the per-timestep topologies directly via "
+                "recurrent.build_lstm_cell_topologies() and drive them with loom.run_recurrent() in a "
+                "hand-written driver script, the same way tools/convert_kokoro/kokoro_driver.lua does "
+                "today via BiLstmStepper."
+            )
 
         def resolve(name):
             seen = set()
@@ -1202,6 +1268,84 @@ class LoomGGUFExporter:
                     })
                     continue
 
+            if op_type == "pad":
+                # EXPORT-IMPROVEMENT-BACKLOG.md item 4: the one op type STFT's own center-framing
+                # (torch.stft(..., center=True)) decomposes into, via coremltools' own
+                # common::lower_complex_dialect_ops pass, that this exporter didn't already handle --
+                # confirmed by directly tracing a small torch.stft module through the standard
+                # ct.convert(..., convert_to="milinternal") pipeline (with thread 1's
+                # apply_torch_frontend_patches() active) and inspecting the resulting MIL ops: the whole
+                # decomposition is const/cast/reshape/conv/expand_dims/pad, every one of which this
+                # exporter already covers except this. Only PAD_1D/PAD_1D_REFLECT (ne[0]-only, i.e. MIL's
+                # LAST axis) exist in C++ -- anything padding a different axis, or a non-zero constant
+                # fill, or a mode other than constant/reflect, has no ggml-side implementation yet.
+                x_var_obj = op.inputs.get("x") or op.inputs.get("data")
+                x_var = self.safe_name(x_var_obj.name)
+                output_var = self.safe_name(op.outputs[0].name)
+
+                pad_var = op.inputs.get("pad")
+                if pad_var is None or not hasattr(pad_var, "val") or pad_var.val is None:
+                    raise NotImplementedError(
+                        f"pad op '{op.name}' has a non-constant 'pad' input, which this exporter doesn't support."
+                    )
+                pad_vals = [int(v) for v in pad_var.val]
+                if len(pad_vals) % 2 != 0:
+                    raise NotImplementedError(f"pad op '{op.name}' has an odd-length 'pad' array {pad_vals!r}.")
+                n_padded = len(pad_vals) // 2
+
+                if not hasattr(x_var_obj, "shape") or x_var_obj.shape is None:
+                    raise NotImplementedError(f"pad op '{op.name}' has an input with no known rank.")
+                rank = len(x_var_obj.shape)
+
+                mode_var = op.inputs.get("mode")
+                mode = (mode_var.val if mode_var is not None and hasattr(mode_var, "val")
+                        and mode_var.val is not None else "constant")
+
+                # MIL's "pad" only pads the LAST n_padded dims of x: pad[2*i]/pad[2*i+1] apply to MIL
+                # axis (rank - n_padded + i). Only a non-zero pad on the FASTEST-varying axis (ne[0],
+                # i.e. MIL's last axis) is supported -- exactly what PAD_1D/PAD_1D_REFLECT's ggml kernels
+                # (and every real case seen so far, STFT included) operate on.
+                lp0 = rp0 = 0
+                for i in range(n_padded):
+                    mil_axis = rank - n_padded + i
+                    lp, rp = pad_vals[2 * i], pad_vals[2 * i + 1]
+                    if lp == 0 and rp == 0:
+                        continue
+                    if mil_axis != rank - 1:
+                        raise NotImplementedError(
+                            f"pad op '{op.name}' pads MIL axis {mil_axis} (non-zero {lp}/{rp}), but this "
+                            "exporter only supports padding the fastest-varying axis (ne[0]/MIL's last "
+                            "axis) -- padding any other axis needs a new C++ primitive first."
+                        )
+                    lp0, rp0 = lp, rp
+
+                if mode == "constant":
+                    constant_val_var = op.inputs.get("constant_val")
+                    constant_val = (float(constant_val_var.val)
+                                     if constant_val_var is not None and hasattr(constant_val_var, "val")
+                                     and constant_val_var.val is not None else 0.0)
+                    if constant_val != 0.0:
+                        raise NotImplementedError(
+                            f"pad op '{op.name}' has mode='constant' with a non-zero constant_val="
+                            f"{constant_val} -- PAD_1D only supports zero-fill."
+                        )
+                    mapped_op = "PAD_1D"
+                elif mode == "reflect":
+                    mapped_op = "PAD_1D_REFLECT"
+                else:
+                    raise NotImplementedError(
+                        f"pad op '{op.name}' has mode='{mode}', which this exporter doesn't support "
+                        "(only 'constant' and 'reflect' are)."
+                    )
+
+                nodes.append({
+                    "op": mapped_op,
+                    "inputs": [resolve(x_var)],
+                    "outputs": [output_var],
+                    "attrs": {"lp0": lp0, "rp0": rp0},
+                })
+                continue
+
             if op_type == "band_part":
                 # Map band_part (with lower=-1, upper=0) to DIAG_MASK_ZERO. MIL's actual input keys
                 # are "lower"/"upper" (see tensor_operation.py's band_part InputSpec) -- NOT
@@ -1500,6 +1644,108 @@ class LoomGGUFExporter:
                     }
                 })
                 continue
+
+            if op_type == "conv_transpose":
+                # Map conv_transpose to CONV_TRANSPOSE_1D/2D. Loom's C++ primitives
+                # (src/ops/primitives_conv.cpp's op_conv_transpose_1d/2d, backing ggml_conv_transpose_1d /
+                # ggml_conv_transpose_2d_p0) only ever support stride + zero padding + no dilation + no
+                # grouping -- the plain "valid, groups=1" case every real use so far needs (this exporter's
+                # own ISTFT module, tools/loom_mil_compiler/istft.py, and Kokoro's hand-built ISTFT/Generator
+                # upsampling both only ever call it this way). Anything else raises rather than silently
+                # dropping the extra configuration, matching this file's own "conv"/"matmul" convention.
+                strides = op.inputs["strides"].val if "strides" in op.inputs and hasattr(op.inputs["strides"], "val") else [1]
+                pad = op.inputs["pad"].val if "pad" in op.inputs and hasattr(op.inputs["pad"], "val") else [0]
+                dilations = op.inputs["dilations"].val if "dilations" in op.inputs and hasattr(op.inputs["dilations"], "val") else [1]
+                groups = op.inputs["groups"].val if "groups" in op.inputs and hasattr(op.inputs["groups"], "val") else 1
+                output_shape = op.inputs.get("output_shape")
+                bias_var = op.inputs.get("bias")
+                pad_type_var = op.inputs.get("pad_type")
+                pad_type = (pad_type_var.val if pad_type_var is not None and hasattr(pad_type_var, "val")
+                            and pad_type_var.val is not None else "valid")
+
+                if bias_var is not None and getattr(bias_var, "val", None) is not None and np.any(bias_var.val):
+                    raise NotImplementedError(
+                        f"conv_transpose op '{op.name}' has a non-zero 'bias', which this exporter "
+                        "doesn't support (no bias-add exists in ggml_conv_transpose_1d/2d) -- compose an "
+                        "explicit ADD node after CONV_TRANSPOSE instead."
+                    )
+                if pad_type != "valid":
+                    raise NotImplementedError(
+                        f"conv_transpose op '{op.name}' has pad_type='{pad_type}', which this exporter "
+                        "doesn't support (ggml_conv_transpose_1d/2d only implement 'valid'-style padding)."
+                    )
+                # Torch-traced conv_transpose always carries an explicit 'output_shape' even for the
+                # ordinary case (confirmed directly) -- it's redundant with pad_type='valid''s own formula
+                # (Dout = (D_in-1)*stride + K), not a real extra constraint, so it's fine to ignore rather
+                # than reject; just sanity-check it agrees rather than trusting it blindly.
+                if output_shape is not None and getattr(output_shape, "val", None) is not None:
+                    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+                    weight_var_obj = op.inputs["weight"]
+                    strides_list = list(strides) if isinstance(strides, (list, tuple, np.ndarray)) else [strides]
+                    n_spatial = len(strides_list)
+                    in_spatial = list(x_var_obj.shape[-n_spatial:])
+                    kernel_spatial = list(weight_var_obj.shape[-n_spatial:])
+                    expected = [(int(d) - 1) * int(s) + int(k) for d, s, k in zip(in_spatial, strides_list, kernel_spatial)]
+                    actual = [int(v) for v in output_shape.val[-n_spatial:]]
+                    if expected != actual:
+                        raise NotImplementedError(
+                            f"conv_transpose op '{op.name}' declares output_shape={list(output_shape.val)!r}, "
+                            f"which doesn't match the 'valid'-padding formula's own {expected!r} -- this "
+                            "combination isn't supported."
+                        )
+                if any(int(p) != 0 for p in (pad if isinstance(pad, (list, tuple, np.ndarray)) else [pad])):
+                    raise NotImplementedError(
+                        f"conv_transpose op '{op.name}' has non-zero 'pad' {pad!r}, which this exporter "
+                        "doesn't support (ggml_conv_transpose_1d/2d are zero-padding only)."
+                    )
+                if any(int(d) != 1 for d in (dilations if isinstance(dilations, (list, tuple, np.ndarray)) else [dilations])):
+                    raise NotImplementedError(
+                        f"conv_transpose op '{op.name}' has non-unit 'dilations' {dilations!r}, which "
+                        "this exporter doesn't support."
+                    )
+                g_val = int(groups[0]) if isinstance(groups, (list, tuple, np.ndarray)) else int(groups)
+                if g_val != 1:
+                    raise NotImplementedError(
+                        f"conv_transpose op '{op.name}' has groups={g_val}, which this exporter doesn't "
+                        "support (no depthwise/grouped CONV_TRANSPOSE primitive exists)."
+                    )
+
+                s0 = int(strides[0]) if isinstance(strides, (list, tuple, np.ndarray)) else int(strides)
+                mapped_op = "CONV_TRANSPOSE_2D" if isinstance(strides, (list, tuple, np.ndarray)) and len(strides) == 2 else "CONV_TRANSPOSE_1D"
+
+                x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+                x_var = self.safe_name(x_var_obj.name)
+                weight_var = self.safe_name(op.inputs["weight"].name)
+
+                nodes.append({
+                    "op": mapped_op,
+                    "inputs": [resolve(weight_var), resolve(x_var)],
+                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "attrs": {"s0": s0}
+                })
+                continue
+
+            if op_type in ("random_normal", "random_uniform", "random_bernoulli", "random_categorical"):
+                # EXPORT-IMPROVEMENT-BACKLOG.md item 4: ggml has no RNG-capable compute op at all (no
+                # ggml_rand* of any kind exists) -- this isn't a missing-ggml-mapping gap the way most
+                # other NotImplementedError cases in this file are, it's a hard architectural boundary:
+                # a static per-submodule topology (what this function produces) is a pure, deterministic
+                # dataflow graph GraphBuilder builds once and reuses; there is no way to make one of its
+                # nodes produce fresh randomness on each call. Fail with a message pointing at the actual
+                # fix (already-existing infrastructure, not something new to build) rather than the
+                # generic "missing a ggml mapping" message below, which would suggest this is just an
+                # unimplemented translation rather than something this function can never do.
+                raise NotImplementedError(
+                    f"MIL op '{op_type}' (from '{op.name}') can't be translated into a static topology "
+                    "node -- ggml has no RNG-capable compute op. The fix is to hoist whatever "
+                    "torch.randn()/torch.rand()-style call produced this op OUTSIDE this submodule's own "
+                    "trace boundary (e.g. via a 'prefix'/'aux' split in a SubmoduleExportSpec, see "
+                    "submodule_export.py) and feed the pre-sampled noise in as an explicit input instead "
+                    "-- sampled at runtime via the existing loom.gaussian_array/loom.uniform_array/"
+                    "loom.seed_rng Lua host functions (src/core/lua_bridge.cpp), the same host-side-RNG "
+                    "pattern every hand-written driver (VitsDriver/SupertonicDriver/MatchaDriver/...) "
+                    "already uses."
+                )
 
             mapped_op = self.OP_MAP.get(op_type)
             if mapped_op is None:
