@@ -1,25 +1,28 @@
 # Backlog
 
-Everything previously tracked here as resolved (Milestones 1-8, the small-TTS-model roadmap covering
-VITS/StyleTTS2/Kokoro/Parakeet/FastConformer-RNN-T, the `executorch-ggml` investigation, quantized-weight
-POC, and all six TTS/ASR/LLM model ports through the Lua+MIL-compiler pivot) has been removed from this
-file. That history lives in git log/commit messages, not here. Only genuinely open work remains below.
+Consolidated from `BACKLOG.md` + `EXPORT-BACKLOG.md` + `EXPORT-IMPROVEMENT-BACKLOG.md` (all three tracked
+overlapping/superseding history from different phases of the project — model milestones, the small-TTS-model
+roadmap, and the MIL-compiler pivot — and are now merged into this single file). Everything previously
+tracked as resolved anywhere in that history has been removed; it lives in git log/commit messages, not
+here. Only genuinely open work remains below, grouped by area.
 
 ---
 
-## Roadmap: Qwen3-ASR-0.6B / Qwen3-TTS-0.6B
+## Models
+
+### Roadmap: Qwen3-ASR-0.6B / Qwen3-TTS-0.6B
 
 Not started. Qwen3-0.6B-Base (the base LLM) is done. The ASR and TTS (12Hz-Base) variants of the Qwen3
 family remain fully unstarted — no conversion script, no source-level architecture read yet. Qwen3-TTS is
 expected to be the most architecturally novel item in this family (needs its own source-level
 investigation before scoping).
 
-## F5-TTS
+### F5-TTS
 
 Deferred by explicit user direction (flow-matching TTS, `OdeStepper`-adjacent — likely shares primitives
 with Matcha-TTS, which is done). Last of the originally-considered 7-model TTS list still untouched.
 
-## Task #79: permissively-licensed phonemizer
+### Task #79: permissively-licensed phonemizer
 
 VITS, Kokoro, StyleTTS2, and Matcha-TTS drivers all still take raw token-id/demo text input — none of them
 do real text→phoneme conversion. Real `espeak-ng`-based phonemization was confirmed to work numerically
@@ -31,7 +34,67 @@ project) instead, once its license/API are confirmed — not yet investigated. A
 intended shape. SupertonicTTS is the one model in this family that's already fully closed — its
 `TextVectorizer` is a license-free unicode codepoint lookup table, no phonemizer needed at all.
 
-## Performance optimizations designed but not implemented
+---
+
+## Exporter / MIL compiler
+
+### MIL primitive review — broader ask still open
+
+The concrete, bounded bugs originally tracked under this item (`LESS_EQUAL`/`GREATER_EQUAL` boundary bug,
+dead lowercase `MilDialectRegistrar` aliases, missing `OP_MAP` entries) are fixed. Not done, deliberately
+deferred:
+
+**Audit `primitives_basic.cpp`'s ADD/MUL/MUL_MAT/REPEAT "dynamically heal transposed/permuted layouts"
+heuristics for continued necessity**, now that the exporter emits correct layouts directly for more cases.
+One such heuristic (in `op_add`) was already found to be actively harmful once the exporter started
+emitting correct `MUL_MAT` layouts itself, and was removed — the other two (in `op_mul` and `op_repeat`)
+are untouched and unverified. These heuristics are shared by every model using these primitives (Whisper,
+Conformer-CTC, VITS, Matcha-TTS, SupertonicTTS, Kokoro), not just LFM2's MIL export path, so removing one
+needs per-model verification, not just LFM2's.
+
+### Known gap: `matmul` composition only handles `transpose_x=False`
+
+`tools/loom_mil_compiler/exporter.py`'s dedicated `op_type == "matmul"` composition only derives correct
+`ggml_mul_mat` semantics for `transpose_x=False` (either `transpose_y` value — both occur in LFM2's SDPA
+decomposition). Any other combination (`transpose_x=True`, alone or with `transpose_y=True`) raises
+`NotImplementedError` by design rather than silently miscomputing. Not yet hit by any converted model; a
+real derivation + test case is needed the first time one does.
+
+### Submodule-export blueprint: promote to default, prove generality, dedup weights
+
+The submodule-export blueprint (`tools/loom_mil_compiler/submodule_discovery.py`/`submodule_export.py`,
+`apply_submodule_export` in `exporter.py`, `export_lfm2_submodule.py`) landed as a working first iteration,
+proven on LFM2 (`test_e2e_lfm2_mil_export` passes against `lfm2_350m_submodule.gguf`, same top-1 tokens as
+atomic/monolithic). Four things from that iteration's own plan are still open:
+
+- **Not yet promoted to the default atomic path.** `apply_atomic_export`/`export_lfm2_atomic.py` (the
+  older scope-based partitioner) are untouched and still what the "atomic" profile actually uses. Whether
+  to make the submodule blueprint the default (and delete the scope-partitioning code path) is a follow-up
+  decision, not yet made.
+- **Unproven generality — only ever validated on LFM2.** The whole point of this thread was generality
+  (no `ModuleList`-naming-convention assumption, structural rather than by-name discovery), but that claim
+  is still resting on a single model. Needs a second, structurally different HF model (different attribute
+  names, ideally non-hybrid/homogeneous-layer to start) added to the regression suite.
+- **Cross-submodule weight duplication is unfixed.** Each submodule is traced independently
+  (`ct.convert()` per submodule), so any tensor referenced from more than one submodule — the most likely
+  case being HF's tied embedding/`lm_head` weight — gets serialized twice under two different namespaced
+  names (confirmed: submodule GGUF is 1.69GB vs. monolithic's 1.42GB on LFM2, consistent with one full
+  extra copy of the ~268MB vocab embedding). Planned fix: hash each candidate weight's bytes+shape+dtype at
+  `write_gguf` time and alias a repeat hash to the first-written name instead of writing it again — not yet
+  implemented. A narrower, cheaper alternative worth considering first: when `tie_word_embeddings` is set,
+  just skip re-exporting `lm_head`'s weight and alias it to the embedding's own name directly.
+- **Phase 2 (fully automatic prefix/suffix boundary discovery) not attempted.** Today's `SubmoduleExportSpec`
+  needs a ~3-line declarative boundary per model (`prefix_attr`/`repeated_attr`/`suffix_attrs`/`aux_attr`).
+  The stretch-goal alternative — an early-exit-hook technique mirroring HF `accelerate`'s device-map
+  splitting, deriving prefix/suffix without any per-model spec at all — was deliberately not attempted since
+  Phase 1's spec was sufficient for LFM2. Worth doing only if Phase 1 starts feeling like real friction
+  across 2-3 more models, not speculatively.
+
+---
+
+## Engine
+
+### Performance optimizations designed but not implemented
 
 - **Bucketed KV-cache graph-reuse.** `GraphBuilder::build()` always does a full rebuild + no_alloc pass
   per call. Plan: round `n_kv` up to a bucket boundary (e.g. 32) and skip the rebuild when the bucket
@@ -48,7 +111,7 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
   that fights exact fp32 verification. A `FLASH_ATTENTION` primitive can be added later as a purely
   additive alternative once a GPU backend makes the perf/precision tradeoff worth it.
 
-## Scope limitations (still true)
+### Scope limitations (still true)
 
 - **`KvCache` is single-sequence.** Contiguous append only — no ring buffer, no multi-stream/multi-sequence
   support, no `ggml_set_rows` index-tensor indirection like llama.cpp's `llama_kv_cache`.
@@ -78,7 +141,7 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 - **Attention-variant primitives beyond `ATTENTION`/`REL_POS_ATTENTION`/`REL_POS_ATTENTION_SHAW`** (e.g.
   a dedicated flash-attention op) — add only when a real model needs one, not speculatively.
 
-## Minor cleanups
+### Minor cleanups
 
 - `KvCache::write_k/write_v/read_k/read_v` use `std::vector::at()` for layer-index bounds checking, which
   throws `std::out_of_range` rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr
