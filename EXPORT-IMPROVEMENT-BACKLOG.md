@@ -14,7 +14,7 @@ reasoning already worked out in conversation, kept intact rather than re-derived
 |---|---|---|---|
 | 1 | Consolidate torch-frontend patches + generic export driver | Foundational plumbing every other thread's export scripts sit on top of | **Done** (2026-07-23) |
 | 2 | Replace scope-based atomic partitioning with a submodule-export blueprint | Biggest complexity/fragility reduction; independent of #3; directly requested | **Done**, first iteration (2026-07-23) |
-| 3 | Extract graph rewrites (GQA fusion, linear-bias compose) into real MIL passes | Cleans up the translation step once #2 has changed what that step receives | Not started |
+| 3 | Extract graph rewrites (GQA fusion, linear-bias compose) into real MIL passes | Cleans up the translation step once #2 has changed what that step receives | **Done** (2026-07-23) |
 | 4 | Document the MIL op-coverage boundary (opaque-kernel ops, STFT/FFT lowering) | Reference material for the *next* model's op gaps, not a code change to the current exporter | Not started |
 
 ---
@@ -300,6 +300,88 @@ to the embedding's own weight name directly) is enough on its own.
 ---
 
 ## 3. Extract graph rewrites into real MIL passes
+
+**Status: done (2026-07-23).** Implemented as planned, with one deliberate scope narrowing (linear-bias
+compose was never moved -- the plan's own Rationale already says it shouldn't be, see below) and one
+finding not anticipated by the plan text:
+
+- `tools/loom_mil_compiler/passes.py` (new) -- `fuse_gqa_repeat_kv`, a real `AbstractGraphPass` (namespace
+  `"loom"`) that pattern-matches the `tile -> reshape` half of HF's `repeat_kv()` idiom directly on the
+  pymil graph and replaces it with real `mb.reshape`/`mb.tile`/`mb.reshape` ops, plus
+  `apply_loom_mil_passes(prog)` which runs it followed by `common::dead_code_elimination`.
+- `exporter.py`'s `export()` calls `apply_loom_mil_passes(self.program)` once, before any of the
+  monolithic/atomic/submodule-blueprint workflows walk the program -- **except** the hand-built "bespoke"
+  workflow (see "found during implementation" below).
+- Deleted from `exporter.py`: `_try_fuse_gqa_repeat_kv` (the old JSON-node-building version), the
+  `fused_reshape_op_ids` bookkeeping set, and the inline fusion-detection call from the `"tile"`
+  translation branch's body (the branch itself stays -- it's still the generic tile->REPEAT translation,
+  now also the thing that mechanically translates the fusion pass's own output).
+- `_prune_dead_nodes` was **kept**, not deleted -- see "found during implementation" below.
+- `linear`->`MUL_MAT`+`ADD` composition and the `matmul`-transpose composition were **not** touched, exactly
+  per the plan's own Rationale ("these are 1:1 schema differences... and correctly stay in the translation
+  step") -- the thread-3 table row's "linear-bias compose" phrasing was never meant literally as a
+  to-be-extracted item; the detailed plan text already excluded it.
+
+**Found during implementation, not anticipated by the original plan text:**
+1. **The plan's own suggestion to delete `_prune_dead_nodes` "once the pass-based equivalents are verified
+   to produce identical output" doesn't hold.** `_prune_dead_nodes` was never *only* cleaning up the GQA
+   fusion's orphaned dependency chain -- `apply_atomic_export`'s own `_collect_replica_closure` comment
+   (exporter.py, "Any resulting now-unused copy left behind in the original 'accidental host' slice is
+   harmless: item 3's `_prune_dead_nodes` already drops any node unreachable from that topology's own
+   declared output") documents a second, independent, still-live dependency: replicating a producer op into
+   every slice that consumes it deliberately leaves an unused copy behind in whichever slice happened to
+   host it first. That's a Python-level list-slicing artifact of partitioning one flattened trace after the
+   fact -- no MIL-level pass over the pre-partitioned `main` function could ever see or clean it up, since
+   the partitioning itself hasn't happened yet at that point. Kept `_prune_dead_nodes`, updated its
+   docstring to name both the (now largely moot, MIL-pass-handled) GQA case and the (still load-bearing)
+   atomic-partitioning case explicitly.
+2. **Scope propagation onto newly-created ops needed to be explicit, not left to coremltools' automatic
+   copy-on-replace.** `AbstractGraphPass`'s scope-copy mechanism (`Block._copy_scope_info`, triggered via
+   `try_replace_uses_of_var_after_op`) only propagates the replaced op's `TORCHSCRIPT_MODULE_NAME` scope
+   onto the *last* new op (the one whose var directly substitutes for the removed op's var) -- the two
+   intermediate ops (the inserted-axis reshape and the tile) would otherwise carry only the
+   `COREMLTOOLS_GRAPH_PASS` scope from the pass-execution context, not the decoder-layer scope
+   `apply_atomic_export`'s scope-based partitioning needs to attribute them to the right layer. Relying on
+   them landing in the correct slice purely through positional adjacency (they're inserted exactly where
+   the removed `tile`/`reshape` ops sat) would have been exactly the kind of fragile mis-attribution risk
+   this backlog's item 2 already documents two real bugs from. Fixed by explicitly wrapping all three new
+   ops' construction in `mb.scope(ScopeInfo(source=TORCHSCRIPT_MODULE_NAME, data=...))`, copied from the
+   original `tile` op, rather than relying on the automatic mechanism at all.
+3. **The pass had to be skipped for the "bespoke" hand-built-Program workflow.** `common::dead_code_elimination`
+   run over `test_compiler.py`'s `MockOperation`-based test fixture raised `ValueError: Cannot delete op...
+   with active output... used by ops [...]` -- that fixture builds its multi-function `Program` by directly
+   splicing Python lists (`main_func.functions["main"].operations = main_operations`) rather than through
+   MIL's own block-mutation API, leaving stale `child_ops` edges DCE's post-removal consistency check
+   correctly flags. This was never a real regression (nothing exercised `prog.validate()`-adjacent
+   machinery on this deliberately-synthetic fixture before), but it meant `apply_loom_mil_passes` needed to
+   be scoped to skip exactly the `is_bespoke and self.profile is None` branch -- the one workflow that
+   accepts graphs never traced through `ct.convert()` at all, and the only one containing synthetic
+   duck-typed ops (like `MockOperation`) a real MIL pass was never meant to see. Also switched
+   `apply_loom_mil_passes` to invoke `PASS_REGISTRY[name](prog)` directly rather than going through
+   `PassPipelineManager.apply_pipeline` (which additionally calls `prog.validate()` before/after every pass)
+   -- narrower and sufficient for what this thread needed, and avoids a second, independent reason the same
+   fixture would have failed even after the `is_bespoke` gate above.
+4. **One genuine (if cosmetic) output difference surfaced and was fixed as a small, generally-applicable
+   fix, not a special case.** The new pass's `mb.tile` call has `reps=1` on every axis except the newly
+   inserted one; the *existing*, unmodified generic `"tile"` translation branch's shape derivation
+   (`exporter.py`) unconditionally wrapped every axis in a `"(dim * rep_factor)"` expression string even
+   when `rep_factor == 1`, producing `"(n_tokens * 1)"` instead of the old hand-crafted composition's bare
+   `"n_tokens"` for the unchanged sequence-length axis -- a latent inefficiency in pre-existing code that
+   the old JSON-level GQA composition never happened to exercise (it wrote its shape strings directly,
+   bypassing this branch entirely) but any future `tile` op with `reps=1` on a dynamic axis would have hit.
+   Fixed generically (skip the multiplication wrapper whenever `rep_factor == 1`, regardless of `dim_size`'s
+   type), not GQA-specific.
+
+**Verification performed:** `python3 -m pytest test_compiler.py` (4/4). Re-ran all three LFM2 export
+scripts (`export_lfm2_monolithic.py`, `export_lfm2_atomic.py`, `export_lfm2_submodule.py`) against the same
+`/home/flavio/Dev/models/lfm2-350m` checkpoint used before this thread's changes and `md5sum`'d the output
+against the exact pre-change GGUFs: **all three byte-for-byte identical**
+(`lfm2_350m_monolithic.gguf`=`bb5ba992...`, `lfm2_350m_atomic.gguf`=`06983624...`,
+`lfm2_350m_submodule.gguf`=`92f57be9...`, matching before and after). `ctest -R
+"test_e2e_lfm2_mil_export|test_e2e_lfm2_tokenizer"` (the two tests this thread's own Verification section
+names, mirroring thread 1's bar) both pass. (`test_e2e_lfm2_lua_driver`/`test_e2e_lfm2_q8_0` were not part
+of this check -- they require differently-named fixture files, `lfm2_350m.gguf` and
+`lfm2_350m_monolithic_q8_0.gguf`, that neither this thread nor thread 1/2 ever generates.)
 
 **Rationale.** Coremltools' own backend never mixes graph rewriting with serialization: rewrites run as
 `PassPipeline` stages over the pymil graph *before* backend translation, keeping the translator itself

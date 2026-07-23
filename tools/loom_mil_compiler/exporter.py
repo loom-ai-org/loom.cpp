@@ -9,6 +9,7 @@ from .driver_ir import (
     validate,
 )
 from .driver_ir import Function as IRFunction
+from .passes import apply_loom_mil_passes
 
 # Traced-model input names auto-computed by the driver (via loom.range) rather than unpacked from the
 # caller's `inputs` table -- see apply_monolithic_export/apply_atomic_export's own comment.
@@ -172,6 +173,19 @@ class LoomGGUFExporter:
           - Weights and assets are serialized to GGUF.
         """
         is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
+
+        if not (is_bespoke and self.profile is None):
+            # EXPORT-IMPROVEMENT-BACKLOG.md item 3: graph rewrites (currently just GQA repeat_kv()
+            # fusion) run as real MIL->MIL passes over the pymil graph here, before any of the workflows
+            # below ever walk it -- not interleaved into generate_graph_topology's own translation walk.
+            # Skipped for the bespoke/advanced workflow below: that path exists specifically to accept
+            # hand-built Programs (see test_compiler.py's MockOperation) that were never traced through
+            # ct.convert()'s standard pipeline and may contain synthetic ops standing in for ones MIL
+            # itself doesn't have -- a real MIL pass (dead_code_elimination in particular, which insists
+            # on internally-consistent var/op child-tracking) isn't meaningful there and isn't safe to run
+            # over a graph that was assembled by directly splicing Python op lists rather than through
+            # MIL's own block-mutation API.
+            apply_loom_mil_passes(self.program)
 
         if is_bespoke and self.profile is None:
             # 1. Advanced / Bespoke Exporting Workflow
@@ -849,131 +863,6 @@ class LoomGGUFExporter:
             return "{" + ", ".join(map(str, val.flatten())) + "}"
         return "nil"
 
-    def _try_fuse_gqa_repeat_kv(self, tile_op, reshape_op, resolve):
-        """
-        Detects whether `tile_op` (whose consumer is `reshape_op`) matches HF's standard `repeat_kv()`
-        idiom -- a tile of a size-1 axis immediately merged back into an adjacent axis by a reshape --
-        and if so returns a list of composed node dicts fusing the pair. Returns None if the shapes
-        don't match this specific pattern (caller falls back to the generic per-op handling).
-
-        Derivation, per axis: prefer `reshape_op`'s own declared output dim IF it's "reliable" (doesn't
-        reference more than one distinct dynamic symbol -- see `_DYNAMIC_SYMBOL_RE`); this correctly
-        picks up the one axis that actually changes (the merged head count, always a clean static int).
-        Every OTHER axis -- confirmed empirically to be unreliable too, not just the merged one, once
-        `reps` isn't a compile-time constant (coremltools' shape algebra loses track of the seq-length
-        axis here as well, reporting it as an unresolvable multi-symbol product) -- falls back to
-        `tile_op`'s own pre-expand input shape instead, which is unaffected by any of this and reliable by
-        construction (repeat_kv()'s reshape never actually touches seq/head_dim/batch numerically).
-
-        IMPORTANT correctness note (found the hard way -- see EXPORT-BACKLOG.md item 3): a single native
-        REPEAT (`ggml_repeat`) is NOT equivalent to HF's `repeat_kv()`. `ggml_repeat` block-tiles an axis
-        (`dst[i] = src[i % ne_src]`, i.e. concatenating whole copies: kv0,kv1,...,kv7,kv0,kv1,...,kv7),
-        while `repeat_kv()`'s unsqueeze->expand->reshape-merge idiom produces an *interleaved* repeat
-        (`dst[i] = src[i // n_rep]`, i.e. kv0,kv0,kv1,kv1,...,kv7,kv7) -- the standard GQA head-group
-        convention every model on this roadmap uses. These only agree when n_rep==1. The fix composes
-        three primitives that reproduce the interleaved semantics exactly, mirroring what HF's own ops
-        actually do: (1) RESHAPE the pre-tile tensor to insert a genuine size-1 axis in the position the
-        real (un-collapsed) unsqueeze put it -- a pure relabeling, moves no data since the axis being
-        vacated is already size 1 (batch); (2) REPEAT that size-1 axis up to `n_rep` -- always safe
-        regardless of block-tile-vs-interleave semantics, since repeating a *single* source element by
-        any tiling scheme yields the same output; (3) RESHAPE again to merge the now-`n_rep`-sized axis
-        into the adjacent kv-heads axis, with `n_rep` as the faster-varying component of the pair --
-        exactly reproducing `dst[i] = src[i // n_rep]` via a plain contiguous axis-merge.
-        """
-        pre_tile_x = tile_op.inputs.get("x")
-        if pre_tile_x is None:
-            return None
-        # `tile_op`'s own "x" is itself the output of the preceding unsqueeze (HF's repeat_kv() inserts
-        # the new axis via `[:, :, None, :, :]`, which traces as a MIL "expand_dims"), NOT the genuine
-        # pre-expand tensor -- walk back through it to find the tensor whose rank actually matches the
-        # reshape's own (merged) output rank.
-        producer = getattr(pre_tile_x, "op", None)
-        if producer is not None and producer.op_type == "expand_dims":
-            inner_x = producer.inputs.get("x") or producer.inputs.get("data")
-            if inner_x is not None:
-                pre_tile_x = inner_x
-        if not hasattr(pre_tile_x, "shape") or pre_tile_x.shape is None:
-            return None
-        pre_rank = len(pre_tile_x.shape)
-
-        out_var = reshape_op.outputs[0]
-        if not hasattr(out_var, "shape") or out_var.shape is None or len(out_var.shape) != pre_rank:
-            return None
-        out_shape = self.get_var_info(out_var)["shape"]
-        raw_out_dims = list(reversed(out_var.shape))
-        pre_shape = self.get_var_info(pre_tile_x)["shape"]
-
-        target_shape = []
-        changed_axis = None
-        for i in range(pre_rank):
-            raw_str = str(raw_out_dims[i])
-            if len(set(_DYNAMIC_SYMBOL_RE.findall(raw_str))) > 1:
-                target_shape.append(pre_shape[i])
-            else:
-                target_shape.append(out_shape[i])
-                if str(out_shape[i]) != str(pre_shape[i]):
-                    changed_axis = i
-
-        # This fusion only knows how to handle the exact repeat_kv() shape (one axis grows by an integer
-        # ratio, the rest unchanged) -- anything else falls back to the generic per-op handling.
-        if changed_axis is None or changed_axis == 0:
-            return None
-        try:
-            kv_count = int(pre_shape[changed_axis])
-            out_count = int(target_shape[changed_axis])
-        except (TypeError, ValueError):
-            return None
-        if kv_count <= 0 or out_count % kv_count != 0:
-            return None
-        ratio = out_count // kv_count
-        if ratio == 1:
-            return None
-
-        # ggml caps tensors at 4 dims -- making room for a genuine new axis at `changed_axis` (shifting
-        # kv-heads outward by one slot) only works if the outermost axis it displaces into is free, i.e.
-        # size 1. That's always batch here (every model on this roadmap runs batch=1), but verify rather
-        # than assume: this fusion doesn't apply otherwise.
-        if pre_rank != 4 or str(pre_shape[-1]) != "1":
-            return None
-
-        pre_name = resolve(self.safe_name(pre_tile_x.name))
-        out_name = self.safe_name(out_var.name)
-        reshape1_name = out_name + "_gqa_unsqueeze"
-        repeat_name = out_name + "_gqa_repeat"
-
-        # (1) insert a genuine size-1 axis at `changed_axis`, pushing kv-heads out one slot into the
-        # (always size-1) batch axis -- a pure relabeling of the same flat data, since the axis being
-        # vacated contributes nothing to the strides.
-        reshape1_shape = pre_shape[:changed_axis] + ["1", pre_shape[changed_axis]]
-        # (2) grow that new size-1 axis to `ratio` -- always safe (repeating a single source element by
-        # any tiling scheme gives the same result regardless of block-tile-vs-interleave semantics).
-        repeat_shape = pre_shape[:changed_axis] + [str(ratio), pre_shape[changed_axis]]
-        # (3) merge (ratio, kv_count) back into one axis of size `ratio*kv_count`, with `ratio` as the
-        # faster-varying component of the pair -- a plain contiguous axis-merge that reproduces
-        # `dst[i] = src[i // ratio]` exactly, matching HF's own reshape-after-expand.
-        final_shape = list(target_shape)
-
-        return [
-            {
-                "op": "RESHAPE",
-                "inputs": [pre_name],
-                "outputs": [reshape1_name],
-                "attrs": {"shape": reshape1_shape},
-            },
-            {
-                "op": "REPEAT",
-                "inputs": [reshape1_name],
-                "outputs": [repeat_name],
-                "attrs": {"shape": repeat_shape},
-            },
-            {
-                "op": "RESHAPE",
-                "inputs": [repeat_name],
-                "outputs": [out_name],
-                "attrs": {"shape": final_shape},
-            },
-        ]
-
     def generate_graph_topology(self, func: Function, func_name: str, ops_list=None, inputs_dict=None) -> dict:
         """
         Walks a heavy submodule MIL graph and serializes it to a static graph topology.
@@ -1020,11 +909,6 @@ class LoomGGUFExporter:
         else:
             for name, var in inputs.items():
                 topo_inputs.append(self.get_var_info(var))
-
-        # Populated by the "tile" branch below when it fuses a tile+reshape GQA repeat_kv() pair into a
-        # single REPEAT node -- the "reshape"/"expand_dims"/"squeeze" branch checks this to skip
-        # re-emitting a (redundant, incorrect) node for a reshape op already handled that way.
-        fused_reshape_op_ids = set()
 
         for op in operations:
             op_type = op.op_type
@@ -1392,27 +1276,14 @@ class LoomGGUFExporter:
                 continue
 
             if op_type == "tile":
-                # GQA repeat_kv() fusion: HF's standard `repeat_kv()` idiom (used to tile K/V from
-                # num_key_value_heads up to num_attention_heads) traces as
-                # unsqueeze(new_axis) -> tile(new_axis, n_rep) -> reshape(merge new_axis into the
-                # adjacent one). When this tile's own `reps` isn't a compile-time constant (confirmed:
-                # coremltools reports `reps.val is None` here, because n_rep -- architecturally a FIXED
-                # hyperparameter -- gets computed via a runtime shape query during tracing anyway), the
-                # generic "tile" handling below silently treats every unreliable axis as rep_factor=1
-                # (a no-op), and the tile's own OUTPUT shape is symbolic in every axis too. Detect the
-                # fusable pattern up front (via the tile's single consumer) and compose the interleaved
-                # RESHAPE->REPEAT->RESHAPE sequence directly from RELIABLE information -- the tile's own
-                # pre-expand input shape for every unchanged axis, and the downstream reshape's own
-                # reliably-inferred output shape for the one axis that actually changes -- entirely
-                # bypassing the poisoned intermediate.
-                child_ops = list(op.outputs[0].child_ops) if op.outputs else []
-                if len(child_ops) == 1 and child_ops[0].op_type == "reshape":
-                    fused_nodes = self._try_fuse_gqa_repeat_kv(op, child_ops[0], resolve)
-                    if fused_nodes is not None:
-                        nodes.extend(fused_nodes)
-                        fused_reshape_op_ids.add(id(child_ops[0]))
-                        continue
-
+                # GQA repeat_kv() fusion (the case where this "tile"'s own `reps` isn't a compile-time
+                # constant, which otherwise poisons this node's -- and the following reshape's -- shape
+                # inference) is now handled as a real MIL->MIL pass in passes.py, run once over the whole
+                # program before this walk ever starts (EXPORT-IMPROVEMENT-BACKLOG.md item 3). By the time
+                # a "tile" op reaches this generic per-op handling, either it was never part of that
+                # pattern, or it already got rewritten into a plain reshape(shape, 1)->tile(ratio)->reshape
+                # sequence with fully reliable (concrete-int-or-single-dynamic-symbol) shapes -- so no
+                # special-casing is needed here anymore.
                 # Map tile to REPEAT by calculating the target shape
                 x_var = self.safe_name(op.inputs["x"].name)
                 reps = op.inputs["reps"].val if "reps" in op.inputs and hasattr(op.inputs["reps"], "val") else [1]
@@ -1437,6 +1308,15 @@ class LoomGGUFExporter:
                     if rep_factor is None:
                         rep_factor = 1
                     
+                    if rep_factor == 1:
+                        # A rep factor of 1 is a no-op regardless of dim_size's type -- skip the
+                        # multiplication wrapper entirely rather than emitting a redundant "(dim * 1)"
+                        # expression string for a dynamic dim_size (harmless once evaluated by
+                        # SymbolEnv, but needlessly opaque, and the GQA repeat_kv() fusion pass in
+                        # passes.py routinely produces exactly this shape -- reps=1 on every
+                        # unchanged axis, ratio only on the newly-inserted one).
+                        target_shape.append(dim_size)
+                        continue
                     try:
                         dim_int = int(dim_size)
                         target_shape.append(str(dim_int * rep_factor))
@@ -1458,10 +1338,6 @@ class LoomGGUFExporter:
                 continue
 
             if op_type in ["reshape", "expand_dims", "squeeze"]:
-                if id(op) in fused_reshape_op_ids:
-                    # Already emitted as a single fused REPEAT by its producing "tile" op above.
-                    continue
-
                 # Map reshape/expand_dims/squeeze to RESHAPE with 1 input and a shape attribute derived
                 # from the op's own declared output shape.
                 x_var_obj = op.inputs.get("x") or op.inputs.get("data")
@@ -1734,13 +1610,22 @@ class LoomGGUFExporter:
         """
         Removes topology nodes whose output is never consumed, directly or transitively, by the
         topology's own declared output. GraphBuilder builds and COMPUTES every node unconditionally
-        regardless of whether anything uses its result -- so a subgraph orphaned by a fused/bypassed
-        composition (e.g. the GQA repeat_kv() fusion above, which computes the correct REPEAT directly
-        from reliable inputs and leaves the original tile's own "reps"-computation subgraph --
-        gather/concat/equal/select/div, all now unused -- entirely orphaned) isn't just wasted compute:
-        it can still crash. Confirmed empirically: that exact orphaned chain segfaulted during
+        regardless of whether anything uses its result -- so an orphaned subgraph isn't just wasted
+        compute, it can still crash (confirmed empirically on an orphaned chain that segfaulted during
         ggml_backend_graph_compute despite having zero real consumers, because nothing ever validates an
-        unused node's own shapes/values are sane. Keeps only nodes reachable backward from the output.
+        unused node's own shapes/values are sane). Keeps only nodes reachable backward from the output.
+
+        The GQA repeat_kv() fusion's own orphaned dependency chain (the original tile's now-unused
+        "reps"-computation subgraph -- gather/concat/equal/select/div) no longer needs this: that fusion
+        now runs as a real MIL->MIL pass (passes.py) with `common::dead_code_elimination` run right after
+        it, so the orphan never survives into this walk at all (EXPORT-IMPROVEMENT-BACKLOG.md item 3).
+        What this still exists for: `apply_atomic_export`'s own `_collect_replica_closure` deliberately
+        replicates a producer op (and its transitive dependencies) into EVERY slice that consumes it,
+        which leaves a now-unused copy behind in whichever slice originally "accidentally hosted" it --
+        see that method's own comment. That's a Python-level list-slicing artifact of partitioning a
+        single flattened trace after the fact, not something any MIL-level pass over the pre-partitioned
+        `main` function could see or clean up, so this backward-reachability walk is still required for
+        the atomic profile specifically.
         """
         needed = {output_symbol}
         live = []
