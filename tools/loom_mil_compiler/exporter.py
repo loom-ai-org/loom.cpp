@@ -1605,6 +1605,18 @@ class LoomGGUFExporter:
                             "attrs": {"dim": ne_axis}
                         })
                         continue
+                    elif len(inputs) == 1:
+                        # A single real operand -- e.g. HF's KV-cache update
+                        # (`torch.cat([past_key_states, key_states], dim=-2)`) traced with an empty/
+                        # zero-length `past_key_states` (no real cache passed in): MIL's own default
+                        # pipeline already folds the empty operand away before this walk ever sees it, so
+                        # `values` legitimately has only one Var left. Concatenating one tensor with
+                        # nothing is an identity, not a dead op -- alias it away (same pattern as the
+                        # `cast` branch above) instead of silently dropping it, which previously left
+                        # every real consumer (found via Qwen3's GQA repeat_kv fusion input) referencing
+                        # an unresolved, never-produced name.
+                        aliases[self.safe_name(op.outputs[0].name)] = inputs[0]
+                        continue
                 continue
 
             if op_type == "conv":
