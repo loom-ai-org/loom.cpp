@@ -115,6 +115,212 @@ class LoomGGUFExporter:
             name = "_" + name
         return name
 
+    def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+        """
+        Best-effort derivation of the REAL SymbolEnv expression for one symbolic MIL shape dimension, by
+        walking `var`'s own producer chain backward through ops that are known to either preserve or
+        transform that dimension via a real formula -- rather than `get_var_info`'s default of collapsing
+        every symbolic dim straight to the bare string "n_tokens".
+
+        That default is correct when the symbol is a pure pass-through of the topology's one true dynamic
+        input (the common case, and the only one exercised before this), but wrong when a real
+        *derived* quantity is involved -- confirmed on Conformer-CTC's STFT-via-CONV_1D mel frontend:
+        `torch.stft`'s conv-based framing turns the raw sample count ("n_tokens") into a frame count via
+        `floor((n_tokens + 2*pad - kernel) / stride) + 1`, a materially different number
+        (101 vs. 16000 for a 1-second clip) that a bare substitution silently gets wrong -- not a syntax
+        error, a wrong shape fed straight into a RESHAPE/CONV_1D_DW/etc. downstream.
+
+        Deliberately narrow and safe to fail out of: only handles `cast` (pure alias, recurse unchanged)
+        and `conv` (real 1D/2D stride/pad/kernel formula, recursing into the same spatial axis of its own
+        `x` input) -- any other producer, or a producer this walk can't fully explain, falls back to
+        `get_var_info`'s original bare-substitution behavior, so every case this doesn't specifically
+        understand is byte-identical to before this method existed.
+        """
+        if _seen is None:
+            _seen = set()
+        if id(var) in _seen:
+            return None  # cycle guard, should be unreachable in a real SSA graph
+        _seen.add(id(var))
+
+        if var.shape is None or torch_axis >= len(var.shape):
+            return None
+        dim = var.shape[torch_axis]
+        if not _DYNAMIC_SYMBOL_RE.search(str(dim)):
+            return str(dim)
+
+        op = var.op
+        if op is None:
+            # A genuine (sub)function input with no producer -- this is the actual dynamic quantity
+            # "n_tokens" ultimately derives from (e.g. "waveform" itself).
+            return "n_tokens"
+
+        _UNARY_PASSTHROUGH_OPS = {
+            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp",
+            "tanh", "sigmoid", "relu", "gelu", "softplus", "identity",
+        }
+        if op.op_type in _UNARY_PASSTHROUGH_OPS:
+            # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
+            # input's already is. Needed for the SAME reason the elementwise-broadcast case is: a chain
+            # like log(x+eps) sitting between the true dynamic source and a "shape" op that reads this
+            # var's real (built) tensor dimensions back out (confirmed on Conformer-CTC's mel-frontend
+            # length tracking -- `gather(shape(real_div(...(log(...(matmul with the STFT conv's own
+            # output)...)))))` -- every one of those intermediate unary ops needed to be walked through,
+            # not just the ones this file happened to hit first).
+            inner = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+            if inner is not None:
+                return self._infer_dynamic_dim_expr(inner, torch_axis, _seen)
+            return None
+
+        if op.op_type == "conv":
+            x_var = op.inputs.get("x")
+            weight_var = op.inputs.get("weight")
+            strides = op.inputs.get("strides").val if "strides" in op.inputs and hasattr(op.inputs["strides"], "val") else None
+            pad = op.inputs.get("pad").val if "pad" in op.inputs and hasattr(op.inputs["pad"], "val") else None
+            dilations = op.inputs.get("dilations").val if "dilations" in op.inputs and hasattr(op.inputs["dilations"], "val") else None
+            if x_var is None or weight_var is None or strides is None or pad is None or x_var.shape is None:
+                return None
+            rank = len(var.shape)
+            # MIL conv is NC(D...) -- axis 0 is batch, axis 1 is out-channels (from the weight, not
+            # derived from `x`), the remaining `rank - 2` axes are the real spatial ones this formula
+            # applies to, in the same order for `x` and its output (conv never permutes spatial axes).
+            if torch_axis < 2:
+                return None
+            spatial_idx = torch_axis - 2
+            n_spatial = rank - 2
+            if n_spatial not in (1, 2) or spatial_idx >= n_spatial:
+                return None
+            stride = int(strides[spatial_idx]) if spatial_idx < len(strides) else 1
+            dilation = int(dilations[spatial_idx]) if dilations is not None and spatial_idx < len(dilations) else 1
+            kernel = int(weight_var.shape[2 + spatial_idx])
+            eff_kernel = dilation * (kernel - 1) + 1
+            # `pad` is [before, after] per spatial axis, flattened (2D conv: [top, bottom, left, right]).
+            pad_before = int(pad[2 * spatial_idx]) if 2 * spatial_idx < len(pad) else 0
+            pad_after = int(pad[2 * spatial_idx + 1]) if 2 * spatial_idx + 1 < len(pad) else 0
+            in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+            if in_expr is None:
+                return None
+            return f"(floor((({in_expr}) + {pad_before + pad_after} - {eff_kernel}) / {stride}) + 1)"
+
+        if op.op_type == "matmul":
+            # `matmul(x, y, transpose_x, transpose_y)`'s output rank-2 axes: the last axis comes from
+            # `y`'s own last axis (or second-to-last if transpose_y), the second-to-last comes from `x`'s
+            # own second-to-last axis (or last if transpose_x); any earlier (batch) axes broadcast from
+            # whichever operand is symbolic there, same as the elementwise case below. Needed for
+            # Conformer-CTC's mel-filterbank projection (`mel_spec = filterbank_const @ power_spectrum`,
+            # a real matmul with one static and one dynamic operand) sitting in the middle of the same
+            # length-tracking chain the unary-passthrough case above documents.
+            x_var = op.inputs.get("x")
+            y_var = op.inputs.get("y")
+            tx_var = op.inputs.get("transpose_x")
+            ty_var = op.inputs.get("transpose_y")
+            transpose_x = bool(tx_var.val) if tx_var is not None and hasattr(tx_var, "val") and tx_var.val is not None else False
+            transpose_y = bool(ty_var.val) if ty_var is not None and hasattr(ty_var, "val") and ty_var.val is not None else False
+            rank = len(var.shape)
+            if x_var is not None and y_var is not None and torch_axis == rank - 1:
+                y_axis = len(y_var.shape) - 2 if transpose_y else len(y_var.shape) - 1
+                return self._infer_dynamic_dim_expr(y_var, y_axis, _seen)
+            if x_var is not None and y_var is not None and torch_axis == rank - 2:
+                x_axis = len(x_var.shape) - 1 if transpose_x else len(x_var.shape) - 2
+                return self._infer_dynamic_dim_expr(x_var, x_axis, _seen)
+
+        if op.op_type == "tile":
+            # A real, constant `reps` (unlike the GQA repeat_kv case passes.py's fuse_gqa_repeat_kv
+            # already handles, where `reps.val` is poisoned to None under tracing) needs the SAME
+            # care as conv: `reps[axis] == 1` is a no-op for that axis (the value is unchanged, so the
+            # correct expression is the INPUT's own, not a fresh "n_tokens" collapse) -- confirmed on
+            # Conformer-CTC's `torch.arange(T).unsqueeze(0).tile(B, 1)` batch-broadcast: this engine's
+            # "batch is always 1" design means axis 0's `reps` is always 1, but MIL's own shape algebra
+            # still mints a genuine opaque symbol for that axis instead of simplifying it to the
+            # literal 1 -- get_var_info's bare-substitution default would otherwise collapse THAT
+            # symbol to "n_tokens" too, indistinguishable from the genuine time axis, corrupting any
+            # downstream RESHAPE that (correctly) expects this axis to stay whatever it started as.
+            reps_var = op.inputs.get("reps")
+            x_var = op.inputs.get("x")
+            reps_val = reps_var.val if reps_var is not None and hasattr(reps_var, "val") else None
+            if reps_val is not None and x_var is not None and torch_axis < len(reps_val):
+                rep = int(reps_val[torch_axis])
+                in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                if in_expr is not None:
+                    return in_expr if rep == 1 else f"({in_expr} * {rep})"
+            elif (
+                x_var is not None and x_var.shape is not None and torch_axis < len(x_var.shape)
+                and x_var.shape[torch_axis] == 1
+            ):
+                # `reps` itself is unavailable (poisoned by the same "computed via a runtime shape
+                # query" tracing artifact as the GQA case), so the real multiplier can't be read -- but
+                # the INPUT axis being a literal, static 1 is exactly the shape a batch-broadcast tile
+                # has, and this exporter's whole design never targets real multi-batch inference (every
+                # declared model input's own batch axis is a literal 1). Resolving to "1" here is a
+                # bounded, documented assumption specific to that "reps unknown but starts from a static
+                # 1" shape, not a general claim about unknown tile multipliers.
+                return "1"
+
+        if op.op_type in ("expand_dims", "squeeze"):
+            # Both insert/remove only genuine size-1 axes at known positions -- every OTHER axis has a
+            # direct 1:1 correspondence to the input, just shifted by the inserted/removed position(s).
+            # Needed alongside the elementwise-broadcast case above: `expand_dims`'s own declared output
+            # shape is what generate_graph_topology's "reshape" branch actually queries (via
+            # `get_var_info(out_var)`, not the input), so a symbol on an expand_dims/squeeze output needs
+            # its OWN producer-chain walk here too, one level removed from wherever the real value comes
+            # from (confirmed on Conformer-CTC's `valid_mask.unsqueeze(1)`).
+            x_var = op.inputs.get("x") or op.inputs.get("data")
+            axes_var = op.inputs.get("axes") or op.inputs.get("axis")
+            axes_val = axes_var.val if axes_var is not None and hasattr(axes_var, "val") else None
+            if x_var is not None and axes_val is not None and x_var.shape is not None:
+                out_rank = len(var.shape)
+                in_rank = len(x_var.shape)
+                norm_axes = sorted((int(a) + out_rank if a < 0 else int(a)) for a in axes_val) if op.op_type == "expand_dims" else \
+                            sorted((int(a) + in_rank if a < 0 else int(a)) for a in axes_val)
+                if op.op_type == "expand_dims":
+                    if torch_axis in norm_axes:
+                        return "1"
+                    shift = sum(1 for a in norm_axes if a < torch_axis)
+                    in_axis = torch_axis - shift
+                    if 0 <= in_axis < in_rank:
+                        return self._infer_dynamic_dim_expr(x_var, in_axis, _seen)
+                else:  # squeeze: output axis maps back to input by re-inserting the removed positions
+                    in_axis = torch_axis
+                    for a in norm_axes:
+                        if a <= in_axis:
+                            in_axis += 1
+                    if 0 <= in_axis < in_rank:
+                        return self._infer_dynamic_dim_expr(x_var, in_axis, _seen)
+
+        _ELEMENTWISE_BROADCAST_OPS = {
+            "less", "greater", "less_equal", "greater_equal", "equal", "not_equal",
+            "add", "sub", "mul", "real_div", "floor_div", "logical_and", "logical_or",
+            "maximum", "minimum",
+        }
+        if op.op_type in _ELEMENTWISE_BROADCAST_OPS:
+            # Elementwise binary ops preserve per-axis correspondence between operands and output (only
+            # ever broadcasting a size-1 operand up, never reshuffling axes) -- the real expression for a
+            # symbolic output axis is whichever operand ISN'T just a static/size-1 broadcast target there.
+            # Needed because get_var_info's blind substitution has no way to tell "this symbol is the
+            # genuine dynamic axis, inherited from one real operand" apart from "this symbol is an
+            # unrelated one CoreML happened to mint for a different (e.g. always-1 batch) axis" --
+            # confirmed on Conformer-CTC's length-validity mask (`torch.arange(T) < length`, broadcast
+            # across an always-1 batch axis via an upstream `tile`): both axes of the `less` op's own
+            # output are bare symbols, but only one of them is genuinely `n_tokens`.
+            for operand_key in ("x", "y"):
+                operand = op.inputs.get(operand_key)
+                if operand is None or not isinstance(operand, Var) or operand.shape is None or torch_axis >= len(operand.shape):
+                    continue
+                if not _DYNAMIC_SYMBOL_RE.search(str(operand.shape[torch_axis])):
+                    continue
+                inferred = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
+                if inferred is not None:
+                    return inferred
+
+        # Any other producer (pad/expand_dims/squeeze/etc.): not a transform this walk understands, but
+        # also not necessarily wrong to keep walking from -- fall back to a bare symbol substitution
+        # (identical to get_var_info's own long-standing default) rather than giving up outright. This
+        # matters for e.g. a reflect-pad immediately upstream of a conv (confirmed on Conformer-CTC's
+        # STFT: the pre-conv `expand_dims` var's own shape is the COMPOSITE expression "is1639 + 512",
+        # not a bare symbol) -- substituting the base symbol there ("n_tokens + 512") and letting the
+        # conv branch above apply its own formula on top gives the right answer without this walk needing
+        # to specifically understand every intermediate op type between the true input and the first conv.
+        return _DYNAMIC_SYMBOL_RE.sub("n_tokens", str(dim))
+
     def get_var_info(self, var):
         """
         Extracts dtype ('f32' or 'i32') and shape in fastest-varying (ne-order) reversed list.
@@ -161,7 +367,16 @@ class LoomGGUFExporter:
                 # the whole expression correctly at build time instead.
                 dim_str = str(dim)
                 if _DYNAMIC_SYMBOL_RE.search(dim_str):
-                    shape.append(_DYNAMIC_SYMBOL_RE.sub("n_tokens", dim_str))
+                    # Try the real conv/cast-aware derivation first (see _infer_dynamic_dim_expr's own
+                    # docstring for why the bare substitution below isn't always correct); only attempted
+                    # for a BARE lone symbol (the shape it's shaped to handle) -- an already-composite
+                    # expression (e.g. "is936*is937.../1024") is left to the substitution path exactly as
+                    # before, unchanged.
+                    inferred = None
+                    if _DYNAMIC_SYMBOL_RE.fullmatch(dim_str):
+                        torch_axis = list(var.shape).index(dim)
+                        inferred = self._infer_dynamic_dim_expr(var, torch_axis)
+                    shape.append(inferred if inferred is not None else _DYNAMIC_SYMBOL_RE.sub("n_tokens", dim_str))
                 else:
                     shape.append(dim_str)
         
@@ -1171,40 +1386,66 @@ class LoomGGUFExporter:
                 # Compose slice_by_index as an optimized zero-copy VIEW node
                 x_var = self.safe_name(op.inputs["x"].name)
                 output_var = self.safe_name(op.outputs[0].name)
-                
+
                 begin = op.inputs["begin"].val if "begin" in op.inputs and hasattr(op.inputs["begin"], "val") else [0]
                 end = op.inputs["end"].val if "end" in op.inputs and hasattr(op.inputs["end"], "val") else [1]
-                
+                begin_mask = op.inputs["begin_mask"].val if "begin_mask" in op.inputs and hasattr(op.inputs["begin_mask"], "val") else None
+                end_mask = op.inputs["end_mask"].val if "end_mask" in op.inputs and hasattr(op.inputs["end_mask"], "val") else None
+
                 x_info = self.get_var_info(op.inputs["x"])
                 ne_shape = x_info["shape"]
                 rank = len(ne_shape)
-                
+
                 begin_list = list(begin) if isinstance(begin, (list, tuple, np.ndarray)) else [begin]
                 end_list = list(end) if isinstance(end, (list, tuple, np.ndarray)) else [end]
-                
+                begin_mask_list = list(begin_mask) if isinstance(begin_mask, (list, tuple, np.ndarray)) else None
+                end_mask_list = list(end_mask) if isinstance(end_mask, (list, tuple, np.ndarray)) else None
+
                 while len(begin_list) < rank:
                     begin_list.append(0)
                 while len(end_list) < rank:
                     end_list.append(ne_shape[rank - 1 - len(end_list)])
-                    
+
+                # Resolve each MIL-order axis's real (begin, end), honoring begin_mask/end_mask ("ignore
+                # this value, use the full extent on this side" -- MIL's own convention for e.g.
+                # `x[1:]`/`x[:-1]`; confirmed via a real op: `end=[1, 0], end_mask=[True, True]` for
+                # `waveform[:, 1:]`, where the literal `end=0` is a meaningless placeholder the old code
+                # used verbatim) and normalizing genuine negative (Python-style) indices for BOTH the
+                # concrete-int and symbolic (dynamic-length) dim_size cases. The previous version only
+                # normalized a negative `end` when `dim_size` was a concrete int, silently ignored
+                # begin_mask/end_mask entirely, and never normalized a negative `begin` at all -- a real
+                # bug, confirmed via Conformer-CTC's pre-emphasis filter
+                # (`waveform[:, 1:] - coeff * waveform[:, :-1]`), whose two negative-index slices on the
+                # dynamic time axis produced a literal shape of `-1` instead of `n_tokens - 1`.
+                resolved_begin = [None] * rank
+                resolved_end = [None] * rank
+                for mil_axis in range(rank):
+                    ne_axis = rank - 1 - mil_axis
+                    dim_size = ne_shape[ne_axis]
+                    b_val = begin_list[mil_axis]
+                    e_val = end_list[mil_axis]
+                    if (begin_mask_list is not None and begin_mask_list[mil_axis]) or b_val is None:
+                        b_val = 0
+                    elif isinstance(b_val, (int, np.integer)) and b_val < 0:
+                        b_val = (dim_size + int(b_val)) if isinstance(dim_size, int) else f"({dim_size} + ({int(b_val)}))"
+                    if (end_mask_list is not None and end_mask_list[mil_axis]) or e_val is None:
+                        e_val = dim_size
+                    elif isinstance(e_val, (int, np.integer)) and e_val < 0:
+                        e_val = (dim_size + int(e_val)) if isinstance(dim_size, int) else f"({dim_size} + ({int(e_val)}))"
+                    resolved_begin[mil_axis] = b_val
+                    resolved_end[mil_axis] = e_val
+
                 slice_shape = []
                 for i in range(rank):
                     mil_axis = rank - 1 - i
                     dim_size = ne_shape[i]
-                    b_val = begin_list[mil_axis]
-                    e_val = end_list[mil_axis]
-                    
-                    if b_val is None:
-                        b_val = 0
-                    if e_val is None:
-                        e_val = dim_size
-                    
+                    b_val = resolved_begin[mil_axis]
+                    e_val = resolved_end[mil_axis]
+
                     # For axis 0 (the head dimension being split), compute slice size.
                     # For all other dimensions, preserve the parent's shape exactly to avoid layout swaps!
                     if i == 0:
-                        if isinstance(dim_size, int):
-                            if e_val < 0:
-                                e_val = dim_size + e_val
+                        if isinstance(dim_size, int) and isinstance(b_val, int) and isinstance(e_val, int):
                             b_val = max(0, min(dim_size, b_val))
                             e_val = max(0, min(dim_size, e_val))
                             slice_shape.append(e_val - b_val)
@@ -1212,18 +1453,22 @@ class LoomGGUFExporter:
                             slice_shape.append(f"({e_val} - {b_val})")
                     else:
                         slice_shape.append(dim_size)
-                        
-                # Calculate byte offset in C-major MIL layout mapping to ne_shape strides:
+
+                # Calculate byte offset in C-major MIL layout mapping to ne_shape strides. Uses
+                # `resolved_begin` (mask-aware, negative-index-normalized) rather than the raw
+                # `begin_list` for the same reason the shape derivation above needs it: an
+                # ignored/negative begin must contribute its real (0 or normalized) value, not its raw
+                # MIL-op placeholder.
                 offset_elements = "0"
                 for i in range(rank):
-                    b_val = begin_list[i]
-                    if b_val != 0:
+                    b_val = resolved_begin[i]
+                    if not (isinstance(b_val, int) and b_val == 0):
                         stride_product = "1"
                         ne_limit = rank - 1 - i
                         for prev_ax in range(ne_limit):
                             stride_product = f"({stride_product} * {ne_shape[prev_ax]})"
                         offset_elements = f"({offset_elements} + ({b_val} * {stride_product}))"
-                        
+
                 offset_bytes = f"({offset_elements} * 4)"
                 
                 nodes.append({
@@ -1687,6 +1932,40 @@ class LoomGGUFExporter:
                 })
                 continue
 
+            if op_type == "reduce_sum":
+                # Dedicated branch (not the generic single-input OP_MAP path): op_reduce_sum
+                # (src/ops/primitives_mil.cpp) needs a real "axis" (ne-order) + "keep_dims" attr to do a
+                # genuine per-axis reduction -- MIL's own "axes"/"keep_dims" inputs are Vars (constants),
+                # which the generic attrs-collection loop below only ever captures for non-Var inputs, so
+                # they'd otherwise be silently dropped and this would always full-reduce to one scalar
+                # (wrong for every real use seen so far: STFT magnitude, CMVN mean/variance -- all reduce
+                # over exactly one axis, never every element).
+                x_var_obj = op.inputs.get("x")
+                axes_obj = op.inputs.get("axes")
+                keep_dims_obj = op.inputs.get("keep_dims")
+                if x_var_obj is None:
+                    continue
+                out_rank = len(self.get_var_info(op.outputs[0])["shape"])
+                in_rank = len(self.get_var_info(x_var_obj)["shape"])
+                axes_val = axes_obj.val if axes_obj is not None and hasattr(axes_obj, "val") else None
+                if axes_val is None or len(axes_val) != 1:
+                    raise NotImplementedError(
+                        f"reduce_sum op '{op.name}': only a single reduction axis is supported "
+                        f"(got axes={axes_val!r}); multi-axis reduction needs its own composition."
+                    )
+                axis = int(axes_val[0])
+                if axis < 0:
+                    axis += in_rank
+                ne_axis = in_rank - 1 - axis
+                keep_dims_val = bool(keep_dims_obj.val) if keep_dims_obj is not None and hasattr(keep_dims_obj, "val") else False
+                nodes.append({
+                    "op": "REDUCE_SUM",
+                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "attrs": {"axis": ne_axis, "keep_dims": keep_dims_val}
+                })
+                continue
+
             if op_type == "conv":
                 # Map conv to CONV_1D or CONV_2D and extract static attributes
                 strides = op.inputs["strides"].val if "strides" in op.inputs and hasattr(op.inputs["strides"], "val") else [1]
@@ -1846,7 +2125,7 @@ class LoomGGUFExporter:
                 y_val_obj = op.inputs.get("y")
                 if x_val_obj and y_val_obj:
                     inputs = [resolve(self.safe_name(x_val_obj.name)), resolve(self.safe_name(y_val_obj.name))]
-            elif mapped_op in ("MEAN", "PERMUTE", "SOFTMAX", "CLAMP", "RSQRT", "RESHAPE", "VIEW"):
+            elif mapped_op in ("MEAN", "PERMUTE", "SOFTMAX", "CLAMP", "RSQRT", "RESHAPE", "VIEW", "LOG", "SQRT"):
                 # Unary reduction/metadata operations in Loom C++ strictly expect exactly 1 input tensor
                 x_val_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
                 if x_val_obj:
@@ -1858,6 +2137,26 @@ class LoomGGUFExporter:
                 weight_val_obj = op.inputs.get("weight")
                 if x_val_obj and weight_val_obj:
                     inputs = [resolve(self.safe_name(x_val_obj.name)), resolve(self.safe_name(weight_val_obj.name))]
+            elif mapped_op == "RANGE_1D":
+                # op_range_1d (src/ops/primitives_mil.cpp) strictly expects POSITIONAL
+                # [start, end, step] -- it reads in[0]/in[1]/in[2] by index, not by name, so the
+                # generic fallback below (which just walks `op.inputs.items()` in whatever order MIL's
+                # own dict happens to hold) is unsafe here: confirmed empirically that MIL's `range_1d`
+                # op stores its inputs dict as {"end", "start", "step"} (matching however
+                # coremltools' torch frontend builds an `aten::arange` call, "end" first since that's
+                # `torch.arange(end)`'s single-required-arg form), NOT schema-declaration order -- the
+                # generic fallback silently emitted [end, start, step], swapping a genuinely dynamic
+                # "end" (e.g. a real sequence length) into the "start" position. Since op_range_1d
+                # forces `end = start + 1` whenever `end <= start` (its own "no GGML stop>start crash"
+                # safety net), a swap like this doesn't crash -- it silently produces a 1-element range
+                # instead of an n_tokens-length one, discovered via a real downstream RESHAPE shape
+                # mismatch while exporting Conformer-CTC's length-to-mask logic.
+                start_obj = op.inputs.get("start")
+                end_obj = op.inputs.get("end")
+                step_obj = op.inputs.get("step")
+                for v in (start_obj, end_obj, step_obj):
+                    if v is not None and isinstance(v, Var):
+                        inputs.append(resolve(self.safe_name(v.name)))
             elif op_type in ("add", "mul"):
                 # Swap commutative inputs to ensure the larger/dynamic tensor is first,
                 # preventing GGML broadcast repetition failures.
