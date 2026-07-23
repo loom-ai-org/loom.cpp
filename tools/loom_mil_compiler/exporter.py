@@ -65,6 +65,9 @@ class LoomGGUFExporter:
         "clamp": "CLAMP",
         "pow": "POW",
         "rsqrt": "RSQRT",
+        "sqrt": "SQRT",
+        "log": "LOG",
+        "logical_and": "MUL",
         "shape": "SHAPE",
         "range_1d": "RANGE_1D",
         "expand_dims": "RESHAPE",
@@ -75,6 +78,7 @@ class LoomGGUFExporter:
         "greater": "GREATER",
         "equal": "EQUAL",
         "not_equal": "NOT_EQUAL",
+        "logical_not": "NOT",
         "select": "SELECT",
         "abs": "ABS",
         "neg": "NEG",
@@ -1247,24 +1251,35 @@ class LoomGGUFExporter:
                     self.weights[weight_name] = array
                     continue
                 else:
-                    # Dynamic fill: pre-allocate a safe max-size static constant weight and slice via VIEW
-                    rank = len(self.get_var_info(op.outputs[0])["shape"])
-                    prealloc_shape = [4096] * rank
-                    
-                    val_weight_name = self.safe_name(op.outputs[0].name) + "_prealloc"
-                    namespaced_val_name = f"{func_name}.{val_weight_name}"
-                    self.weights[namespaced_val_name] = np.full(prealloc_shape, value_val, dtype=np.float32)
-                    
-                    # Sliced shape is dynamic "n_tokens" along the dynamic dimensions
-                    slice_shape = ["n_tokens"] * rank
+                    # Dynamic fill (`shape` isn't compile-time-constant, e.g. `torch.full` sized off a
+                    # dynamic-length tensor): compose from a REPEAT-broadcast of a genuinely scalar (all
+                    # axes size 1) constant, the same mechanism this exporter already uses for every
+                    # other dynamically-shaped REPEAT target (see the "tile" op_type branch above) --
+                    # `get_var_info`'s own per-axis shape already mixes literal ints with symbolic
+                    # expressions ("n_tokens" and derivatives) correctly, one entry per axis.
+                    #
+                    # The previous approach here (pre-allocate a `[4096]*rank` constant buffer and VIEW-
+                    # slice into it, assuming EVERY axis was independently exactly "n_tokens") was only
+                    # ever exercised at rank<=1 (a 4096-element 1D buffer, 16 KiB): at rank>=2 it
+                    # allocates `4096**rank` elements outright (256 GiB at rank 3), and even where it
+                    # doesn't blow up, blindly slicing every axis to "n_tokens" is wrong for any fill
+                    # whose shape has a mix of static and dynamic axes.
+                    out_info = self.get_var_info(op.outputs[0])
+                    target_shape = list(out_info["shape"])
+                    rank = len(target_shape)
+
+                    weight_name = self.safe_name(op.outputs[0].name) + "_fill_scalar"
+                    if func_name == "main_topo" or self.profile == "monolithic":
+                        namespaced_name = weight_name
+                    else:
+                        namespaced_name = f"{func_name}.{weight_name}"
+                    self.weights[namespaced_name] = np.full([1] * rank, value_val, dtype=np.float32)
+
                     nodes.append({
-                        "op": "VIEW",
-                        "inputs": [namespaced_val_name],
+                        "op": "REPEAT",
+                        "inputs": [namespaced_name],
                         "outputs": [self.safe_name(op.outputs[0].name)],
-                        "attrs": {
-                            "shape": slice_shape,
-                            "offset": 0
-                        }
+                        "attrs": {"shape": target_shape}
                     })
                     continue
 
@@ -1617,6 +1632,59 @@ class LoomGGUFExporter:
                         # an unresolved, never-produced name.
                         aliases[self.safe_name(op.outputs[0].name)] = inputs[0]
                         continue
+                continue
+
+            if op_type == "stack":
+                # MIL `stack(values, axis)` joins N same-shape tensors along a genuinely NEW axis
+                # (unlike `concat`, which joins along an EXISTING one) -- e.g. a hand-rolled
+                # conv-based STFT's real/imag parts, `torch.stack([real, imag], dim=-1)`, seen when a
+                # model computes its DFT via CONV_1D kernels directly rather than `torch.stft` (which
+                # decomposes differently, via coremltools' own `lower_complex_dialect_ops`). No new
+                # ggml primitive needed: compose as RESHAPE (insert a size-1 axis) on each operand, then
+                # the same CONCAT-along-that-axis this file already emits for `concat`.
+                values_obj = op.inputs.get("values")
+                axis_val = int(op.inputs["axis"].val) if "axis" in op.inputs and hasattr(op.inputs["axis"], "val") else 0
+                out_var = op.outputs[0]
+                out_rank = len(self.get_var_info(out_var)["shape"])
+                axis = axis_val + out_rank if axis_val < 0 else axis_val
+                ne_axis = out_rank - 1 - axis
+
+                reshaped = []
+                for i, item in enumerate(values_obj):
+                    if not isinstance(item, Var):
+                        continue
+                    v_name = resolve(self.safe_name(item.name))
+                    v_shape = list(self.get_var_info(item)["shape"])
+                    new_shape = v_shape[:ne_axis] + ["1"] + v_shape[ne_axis:]
+                    unsq_name = f"{self.safe_name(out_var.name)}_stack_unsq_{i}"
+                    nodes.append({
+                        "op": "RESHAPE",
+                        "inputs": [v_name],
+                        "outputs": [unsq_name],
+                        "attrs": {"shape": new_shape}
+                    })
+                    reshaped.append(unsq_name)
+
+                if len(reshaped) < 2:
+                    if reshaped:
+                        aliases[self.safe_name(out_var.name)] = reshaped[0]
+                    continue
+                prev_output = reshaped[0]
+                for i in range(1, len(reshaped) - 1):
+                    inter_output = f"{self.safe_name(out_var.name)}_stack_temp_{i}"
+                    nodes.append({
+                        "op": "CONCAT",
+                        "inputs": [prev_output, reshaped[i]],
+                        "outputs": [inter_output],
+                        "attrs": {"dim": ne_axis}
+                    })
+                    prev_output = inter_output
+                nodes.append({
+                    "op": "CONCAT",
+                    "inputs": [prev_output, reshaped[-1]],
+                    "outputs": [self.safe_name(out_var.name)],
+                    "attrs": {"dim": ne_axis}
+                })
                 continue
 
             if op_type == "conv":

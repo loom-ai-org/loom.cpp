@@ -555,6 +555,13 @@ Outputs op_reshape(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
             throw SchemaError("RESHAPE: input element count is not evenly divisible by the known 'shape' dimensions");
         }
         shape[infer_idx] = ggml_nelements(src) / known_product;
+    } else if (known_product != ggml_nelements(src)) {
+        std::string shape_str;
+        for (auto d : shape) shape_str += std::to_string(d) + ",";
+        throw SchemaError("RESHAPE: target shape [" + shape_str + "] has " + std::to_string(known_product) +
+                           " elements but input has " + std::to_string(ggml_nelements(src)) +
+                           " (src ne=[" + std::to_string(src->ne[0]) + "," + std::to_string(src->ne[1]) + "," +
+                           std::to_string(src->ne[2]) + "," + std::to_string(src->ne[3]) + "])");
     }
     switch (shape.size()) {
         case 1: return {ggml_reshape_1d(pc.ctx, src, shape[0])};

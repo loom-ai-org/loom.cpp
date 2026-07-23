@@ -193,6 +193,12 @@ Outputs op_not_equal(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_step(pc.ctx, ggml_abs(pc.ctx, sub_broadcast(pc.ctx, in[0], in[1])))};
 }
 
+Outputs op_not(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("logical_not", in, 1);
+    // NOT(x) <=> 1 - x, for the boolean-as-0/1-float convention every comparison op above already uses.
+    return {ggml_scale_bias(pc.ctx, in[0], -1.0f, 1.0f)};
+}
+
 Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("select", in, 3);
     // Algebraic select: cond * x + (1.0f - cond) * y
@@ -235,6 +241,7 @@ struct MilDialectRegistrar {
         reg.register_op("GREATER", op_greater);
         reg.register_op("EQUAL", op_equal);
         reg.register_op("NOT_EQUAL", op_not_equal);
+        reg.register_op("NOT", op_not);
         reg.register_op("SELECT", op_select);
     }
 };
