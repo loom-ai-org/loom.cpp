@@ -24,54 +24,9 @@ from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Program, types as mil_types
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# 1.1 Monkey patch coremltools' PyTorch frontend cast operator to support 1-element numpy array conversion
-from coremltools.converters.mil.frontend.torch import ops as mil_ops
-_original_cast = mil_ops._cast
-
-def _robust_cast(context, node, dtype, dtype_name):
-    inputs = mil_ops._get_inputs(context, node, expected=1)
-    x = inputs[0]
-    if x.can_be_folded_to_const() and isinstance(x.val, np.ndarray):
-        if x.val.size == 1:
-            scalar_val = dtype(x.val.item())
-            res = mb.const(val=scalar_val, name=node.name)
-            context.add(res, node.name)
-            return
-    _original_cast(context, node, dtype, dtype_name)
-
-mil_ops._cast = _robust_cast
-
-# 1.2 Monkey patch coremltools' SDPA decomposition to support GQA (Grouped Query Attention) tiling
-from coremltools.converters.mil.frontend import _utils as mil_frontend_utils
-_original_decompose_sdpa = mil_frontend_utils._decompose_scaled_dot_product_attention
-
-def _robust_decompose_sdpa(q, k, v, mask, name, scale=None, before_op=None):
-    q_shape = list(q.shape)
-    k_shape = list(k.shape)
-    rank = len(q_shape)
-    
-    if rank == 4:
-        q_heads = q_shape[1]
-        k_heads = k_shape[1]
-        if isinstance(q_heads, int) and isinstance(k_heads, int) and q_heads != k_heads:
-            ratio = q_heads // k_heads
-            if ratio > 1:
-                k = mb.tile(x=k, reps=[1, ratio, 1, 1], before_op=before_op)
-                v = mb.tile(x=v, reps=[1, ratio, 1, 1], before_op=before_op)
-    elif rank == 3:
-        q_heads = q_shape[0]
-        k_heads = k_shape[0]
-        if isinstance(q_heads, int) and isinstance(k_heads, int) and q_heads != k_heads:
-            ratio = q_heads // k_heads
-            if ratio > 1:
-                k = mb.tile(x=k, reps=[ratio, 1, 1], before_op=before_op)
-                v = mb.tile(x=v, reps=[ratio, 1, 1], before_op=before_op)
-                
-    return _original_decompose_sdpa(q, k, v, mask, name, scale, before_op)
-
-mil_frontend_utils._decompose_scaled_dot_product_attention = _robust_decompose_sdpa
-
-# Insert loom_mil_compiler into search path
+# Insert loom_mil_compiler into search path. Importing it applies the coremltools torch-frontend
+# patches (robust cast + GQA-aware SDPA decomposition) as an import-time side effect -- see
+# tools/loom_mil_compiler/torch_patches.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import loom_mil_compiler
 

@@ -65,8 +65,11 @@ void set_tensor_from_lua_array(lua_State* L, int value_idx, ggml_tensor* tensor)
     const std::vector<double> vals = read_number_array(L, value_idx);
     const size_t expected_size = ggml_nelements(tensor);
     if (vals.size() != expected_size) {
-        luaL_error(L, "loom.run_subgraph: input tensor '%s' size mismatch. Expected %zu elements, got %zu elements from Lua",
-                    ggml_get_name(tensor), expected_size, vals.size());
+        // Lua's own pushfstring (which luaL_error routes through) doesn't understand the C99 "%zu"
+        // length modifier -- it silently mis-consumes the varargs, truncating the message before the
+        // actual numbers ever print. "%d" is one of the directives Lua's formatter does support.
+        luaL_error(L, "loom.run_subgraph: input tensor '%s' size mismatch. Expected %d elements, got %d elements from Lua",
+                    ggml_get_name(tensor), static_cast<int>(expected_size), static_cast<int>(vals.size()));
     }
     if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> f(vals.begin(), vals.end());
