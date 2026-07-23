@@ -62,25 +62,49 @@ real derivation + test case is needed the first time one does.
 
 ### Retrofit the bespoke `tools/convert_*` scripts onto the MIL exporter
 
-None of the ~10 hand-written conversion scripts (Qwen3, NeMo Conformer-CTC/Parakeet, VITS, Kokoro,
-StyleTTS2, Matcha-TTS, SupertonicTTS, Whisper) use `ct.convert`/coremltools at all — they predate the MIL
-pivot and hand-build `GraphTopology` JSON directly from each checkpoint's state dict. Untried, not ruled
-out: whether they could go through the generic MIL→ggml pipeline instead.
+Order being worked (per explicit user direction): Qwen3, Conformer-CTC, Parakeet, VITS, Kokoro, Matcha-TTS,
+SupertonicTTS, StyleTTS2.
 
-**Take:** Qwen3 and the NeMo Conformer-CTC/Parakeet models are the near-free win — they're
-single-forward-pass, HF/NeMo-module-shaped like LFM2, so they'd likely trace through the existing
-`export_hf_causal_lm.py` driver (or a NeMo analogue of it) with little new code. VITS/Kokoro/Matcha-TTS/
-SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
-exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
-reverse-steps, Euler CFM, RNG-fed sampling) are fixed-depth, so should trace as one static graph with noise
-supplied as an input tensor. StyleTTS2 is the one likely to stay bespoke — its diffusion sampler's ~3e-3
-residual mismatch persisted even with hand-matched float32 host math, and an auto-traced version gives less
-control to chase that kind of thing down.
+- **Qwen3-0.6B-Base — DONE.** `export_qwen3_mil.py`, both monolithic and atomic profiles. Needed zero
+  bespoke wrapper code (the existing `export_hf_causal_lm.py` driver handled it as-is) plus one real,
+  general exporter bug fix: the `concat` translation branch silently dropped an op (no node, no alias)
+  when MIL's default pipeline had already folded a concat down to exactly 1 real operand — the shape HF's
+  KV-cache update (`torch.cat([past_key_states, key_states], ...)`) takes when traced with an empty/unused
+  cache, which every plain-forward-pass export hits. Fixed by aliasing the single operand through (same
+  pattern as the `cast` branch). Verified: 8/8 greedy-token match against real HF `generate()` for both
+  profiles ("The capital of France is" → " Paris. The capital of Germany is Berlin"). Full `ctest`: zero
+  regressions.
+- **NeMo Conformer-CTC-small — EXPORTS, runtime numerics still wrong.** `export_conformer_ctc_mil.py`
+  traces the REAL `nemo.collections.asr.models.EncDecCTCModelBPE` (preprocessor + `ConformerEncoder` +
+  `ConvASRDecoder`) directly — no hand-reimplemented plain-PyTorch module needed (unlike
+  `tools/convert_generic/conformer_ctc_module.py`'s older `aten_to_loom`-oriented POC, which needed a
+  custom `loom::rel_pos_attention` torch op; the MIL path has no such requirement, it walks whatever real
+  ops the relative-position attention decomposes into under tracing — turned out to be ordinary
+  matmul/pad/reshape/gather, no new attention primitive needed at all). Getting the export to complete at
+  all found and fixed six real, general exporter/engine gaps: a missing `logical_not` primitive (new `NOT`
+  op, `1 - x`, mirrors the existing comparison-op complement pattern); a missing `stack` translation (MIL's
+  stack-along-a-new-axis, hit by the mel frontend's hand-rolled conv-based STFT stacking real/imag parts —
+  composed from existing RESHAPE+CONCAT, no new primitive); two OP_MAP gaps (`sqrt`/`log` — the ggml
+  primitives already existed, just weren't wired up); and a real memory-safety bug in dynamic `fill`
+  handling (`torch.full` sized off a non-constant shape pre-allocated `[4096]*rank` — 256 GiB at rank 3 —
+  instead of composing a scalar-constant + REPEAT-broadcast, which works at any rank). `RESHAPE` also
+  gained a real, informative error message (shape-mismatch details) in place of a raw uncatchable
+  `GGML_ASSERT` abort. The export now completes and produces a plausible-looking topology, but a real
+  **runtime** bug remains open: a `RANGE_1D` op (from NeMo's `torch.arange(...)`-based length-to-mask
+  logic) produces a 1-element result where a genuine `n_tokens`-length range is expected, traced back to
+  its `gather` input (likely picking the wrong element out of a lengths/shape tensor) — not yet
+  root-caused. Full `ctest`: zero regressions from any of the above.
+- **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
+  SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
+  exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
+  reverse-steps, Euler CFM, RNG-fed sampling) are fixed-depth, so should trace as one static graph with
+  noise supplied as an input tensor. StyleTTS2 is the one likely to stay bespoke — its diffusion sampler's
+  ~3e-3 residual mismatch persisted even with hand-matched float32 host math, and an auto-traced version
+  gives less control to chase that kind of thing down.
 
 The real tradeoff: doing this would replace ~10 hand-verified conversion scripts with one generic path, but
 trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it
-for showcasing generality, riskier for correctness confidence on the trickiest models. Prototype on Qwen3
-first (cheapest test, closest to LFM2) before deciding whether to chase the TTS models.
+for showcasing generality, riskier for correctness confidence on the trickiest models.
 
 ### Submodule-export blueprint: promote to default, prove generality, dedup weights
 
