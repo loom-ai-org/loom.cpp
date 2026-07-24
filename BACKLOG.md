@@ -121,23 +121,53 @@ SupertonicTTS, StyleTTS2.
     elementwise binary broadcast ops (comparisons/add/sub/mul/etc. — the real axis comes from whichever
     operand isn't just a size-1 broadcast target); `expand_dims`/`squeeze` (axis-shifted passthrough).
 
-  **Still open**: even with all of the above, one real data-flow bug remains, found via bisection (not
-  yet root-caused to a specific fix). The length-validity mask's `RANGE_1D` bound (`gather_7`, read from
-  `shape(real_div(...log(...matmul(mel_filterbank, power_spectrum)...)...))` — i.e. the real, correctly
-  *shaped* log-mel feature tensor) evaluates to `16000` (raw sample count) instead of the expected `~101`
-  (frame count) at actual runtime, despite every op in that chain now having correct shape-string
-  derivation and the upstream STFT `CONV_1D`'s own real ggml-computed output already being correctly
-  101-sized (confirmed via a truncated-topology bisection). The remaining gap is somewhere in either (a)
-  how `SHAPE`/`GATHER` read back a real tensor's dimensions at this specific point in the graph, or (b) a
-  node between the STFT conv and this `gather` that's silently producing a wrongly-sized tensor despite
-  correct shape *attributes* elsewhere (the C++ ops here don't all need declared JSON shapes — ADD/SUB/DIV/
-  LOG/MATMUL derive their output shape automatically from real operand tensors at build time, so a
-  shape-string fix doesn't necessarily touch them). Needs a fresh bisection session picking up from
-  `/tmp/truncated_conv0.json`'s technique (register a topology truncated to `nodes[:N]` with a chosen
-  intermediate as `"output"`, read back via `run_subgraph`'s shape return) — confirm the STFT conv's real
-  output is 101-framed (done), then walk forward node-by-node through the `real_div`/`log`/`matmul`/
-  `shape`/`gather` chain checking each one's real computed `ne` shape until the exact node that turns 101
-  into 16000 is found.
+  **The `gather_7`/length-tracking bug above is root-caused and fixed.** The true cause was architectural,
+  not a shape-string bug: `op_range_1d` (src/ops/primitives_mil.cpp) can only read a dynamic "end"/"start"
+  bound from a Var's own already-computed `.data`, but a `gather(shape(x), axis)` chain's value only
+  exists *after* `ggml_backend_graph_compute()` runs — strictly after `GraphBuilder::build()` (which is
+  when `op_range_1d` itself executes) finishes. So `in[1]->data` was architecturally always null for this
+  exact pattern, silently tripping `op_range_1d`'s own "dynamic sequence length" fallback (a hardcoded
+  `n_tokens`) no matter what any shape-string fix did upstream. Fixed with a new
+  `_try_derive_gather_shape_value` (detects the `gather(shape(x), axis)` pattern specifically and derives
+  its real value via `_infer_dynamic_dim_expr`, correctly flipping a torch-order axis index into the
+  shape-vector's own ne-order storage) plus a dedicated `range_1d` translation that emits `start`/`end`/
+  `step` as real symbolic **attrs** (which `op_range_1d` already natively supported, evaluated via
+  SymbolEnv) instead of data-dependent graph inputs, whenever all three can be resolved this way.
+
+  Chasing this all the way through also found and fixed a real, previously-silent negative-index bug: a
+  constant used as `gather`'s own "indices" input can hold genuine Python-style negative indices (MIL's
+  own convention, e.g. `x.shape[-1]`), but `GET_ROWS`/`ggml_get_rows` has no such convention — it read
+  garbage/wrapped memory instead of raising. Fixed by normalizing at const-bake time, with the ne-order
+  reversal a `shape()`-vector gather specifically needs (torch axis `-1` is ne-order index `0`, not `3`).
+
+  `_infer_dynamic_dim_expr` also gained several more cases needed to reach `gather_7`'s real producer
+  chain at all: `pow` (added to the elementwise-broadcast set — squaring in the STFT magnitude
+  computation), `reduce_sum` (output-axis-to-input-axis remapping when `keep_dims=False` drops an axis,
+  mirroring the existing `squeeze` case), `stack` (mirrors `expand_dims` — one new axis from N identically-
+  shaped operands), and a `range_1d` pass-through (a range's own output length, reusing the same
+  attrs-resolution logic as its node-emission branch) — plus a broadened `tile` heuristic: when `reps` is
+  unreadable (poisoned the same way GQA `repeat_kv`'s is) AND the input axis is *already* dynamic (not a
+  static 1), treat `reps` as 1 and pass through, reasoning that a genuine multiplicative tile of an
+  already-dynamic axis would have been intercepted by `passes.py`'s dedicated `fuse_gqa_repeat_kv` pass
+  already, so a bare `tile` op surviving to this point is overwhelmingly unlikely to be that case.
+
+  Also fixed along the way: `op_select` (src/ops/primitives_mil.cpp) called `ggml_mul` directly on
+  operands in MIL's own order, but `ggml_mul(a, b)` requires `a` to be the larger/target shape — added a
+  `mul_broadcast` helper (mirrors the existing `sub_broadcast`) plus a real error message in place of a
+  raw `GGML_ASSERT` abort.
+
+  **Still open, one more data-flow bug found while verifying the above (not yet root-caused):** a
+  `RESHAPE` broadcasting `x_std` (a per-mel-channel standard-deviation tensor from CMVN normalization,
+  produced by a plain `ADD`) from what the crash shows as a genuine 80-element tensor up to
+  `[1, 80, n_tokens]` (1,280,000 elements) — an element-count-changing target no ordinary `RESHAPE` can
+  legally produce, suggesting either a real pre-existing exporter bug in how this specific broadcast is
+  translated (not a `_infer_dynamic_dim_expr` gap — `x_std`'s producer is a plain `ADD`, no symbolic-shape
+  derivation issue possible there) or a misidentified node needing the same live re-tracing this whole
+  investigation has needed throughout (var names are NOT stable across separate `torch.jit.trace` runs of
+  the same script — every debugging step in this investigation that assumed otherwise produced a false
+  lead; always re-derive from the SAME export invocation, e.g. via temporary prints inside the exporter
+  itself, never a separate standalone script). Full `ctest` and Qwen3 re-verified clean throughout all of
+  the above.
 - **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
   SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
   exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
