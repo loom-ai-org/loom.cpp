@@ -68,6 +68,17 @@ def t_mel_expr(hp: dict) -> str:
     return f"floor($n_tokens/{hp['hop_length']}) + 1"
 
 
+def valid_frames_expr(hp: dict) -> str:
+    """Real NeMo's own CMVN-valid frame count (see mel_common.py's "Real-NeMo gotcha" docstring note):
+    NeMo's `get_seq_len` computes floor($n_tokens/hop_length), exactly t_mel_expr(hp) - 1 -- ALWAYS one
+    less than the real STFT frame count, even for a full-length utterance with no true padding. CMVN
+    mean/variance must reduce over only this many leading frames, and the final normalized frame at index
+    t_mel-1 must be zeroed, or the output silently diverges from real NeMo (confirmed against the actual
+    checkpoint's nemo_asr preprocessor output -- this is a distinct bug from the encoder's own
+    calc_length/all_paddings masking, which genuinely is a no-op here)."""
+    return f"floor($n_tokens/{hp['hop_length']})"
+
+
 def n_subsampled_expr(hp: dict) -> str:
     """Post-subsampling encoder frame count as a function of $n_tokens: the mel-frame count above, run
     through the Conformer's own two stride-2/pad-1/kernel-3 subsampling convs (time axis)."""
@@ -140,25 +151,38 @@ def build_topology(hp: dict) -> dict:
     log_mel = node("LOG", [guarded], ["log_mel"])
 
     # per-feature (per-mel-bin) CMVN over the time axis: unbiased variance, epsilon-guarded std.
+    # Real NeMo treats the LAST STFT frame as invalid -- excluded from mean/var, zeroed in the final
+    # output (see valid_frames_expr()'s own docstring). "valid" below means "the first T_mel-1 frames".
     node("PERMUTE", [log_mel], ["logmel_p"], {"axes": [1, 0, 2, 3]})
     node("CONT", ["logmel_p"], ["logmel_t"])  # [T_mel, n_mels, 1]
-    node("SUM_ROWS", ["logmel_t"], ["sum_t"])
-    # T_mel is a function of the runtime $n_tokens (see t_mel_expr), NOT the conversion-time default --
-    # this scale factor must be a symbol expression, not hp["t_mel"] baked in as a fixed Python number,
-    # or CMVN normalize silently divides by the wrong T_mel for every length but the default one.
-    node("SCALE", ["sum_t"], ["mean_t"], {"s": f"1/({t_mel_expr(hp)})"})
+    node("VIEW", ["logmel_t"], ["logmel_valid_t"], {"shape": [valid_frames_expr(hp), hp["n_mels"], 1]})
+    node("SUM_ROWS", ["logmel_valid_t"], ["sum_t"])
+    # T_mel/valid-frame-count are functions of the runtime $n_tokens (see t_mel_expr/valid_frames_expr),
+    # NOT the conversion-time default -- these scale factors must be symbol expressions, not fixed Python
+    # numbers baked in, or CMVN normalize silently divides by the wrong count for every length but the
+    # default one.
+    node("SCALE", ["sum_t"], ["mean_t"], {"s": f"1/({valid_frames_expr(hp)})"})
     node("RESHAPE", ["mean_t"], ["mean"], {"shape": [hp["n_mels"], 1, 1]})
     node("SUB", [log_mel, "mean"], ["centered"])  # [n_mels, T_mel, 1]
     node("PERMUTE", ["centered"], ["centered_p"], {"axes": [1, 0, 2, 3]})
     node("CONT", ["centered_p"], ["centered_t"])  # [T_mel, n_mels, 1]
-    node("SQR", ["centered_t"], ["centered_sq_t"])
+    node("VIEW", ["centered_t"], ["centered_valid_t"], {"shape": [valid_frames_expr(hp), hp["n_mels"], 1]})
+    node("SQR", ["centered_valid_t"], ["centered_sq_t"])
     node("SUM_ROWS", ["centered_sq_t"], ["sumsq_t"])
-    node("SCALE", ["sumsq_t"], ["var_t"], {"s": f"1/(({t_mel_expr(hp)}) - 1)"})
+    node("SCALE", ["sumsq_t"], ["var_t"], {"s": f"1/(({valid_frames_expr(hp)}) - 1)"})
     node("SQRT", ["var_t"], ["std_t"])
     node("ADD", ["std_t", "mel.norm_eps"], ["std_t_guarded"])
     node("RESHAPE", ["std_t_guarded"], ["std"], {"shape": [hp["n_mels"], 1, 1]})
     node("DIV", ["centered", "std"], ["normalized"])  # [n_mels, T_mel, 1]
-    node("RESHAPE", ["normalized"], ["mel_input"], {"shape": [hp["n_mels"], -1, 1, 1]})
+    # Zero the last (structurally-always-invalid, see above) frame: permute T_mel back to ne[0], drop it,
+    # zero-pad it back with PAD_1D, permute back.
+    node("PERMUTE", ["normalized"], ["normalized_p"], {"axes": [1, 0, 2, 3]})
+    node("CONT", ["normalized_p"], ["normalized_t"])  # [T_mel, n_mels, 1]
+    node("VIEW", ["normalized_t"], ["normalized_valid_t"], {"shape": [valid_frames_expr(hp), hp["n_mels"], 1]})
+    node("PAD_1D", ["normalized_valid_t"], ["normalized_padded_t"], {"lp0": 0, "rp0": 1})  # [T_mel, n_mels, 1]
+    node("PERMUTE", ["normalized_padded_t"], ["normalized_final_p"], {"axes": [1, 0, 2, 3]})
+    node("CONT", ["normalized_final_p"], ["normalized_final"])  # [n_mels, T_mel, 1]
+    node("RESHAPE", ["normalized_final"], ["mel_input"], {"shape": [hp["n_mels"], -1, 1, 1]})
 
     # ---- Subsampling front-end (CONV_2D x2 + ReLU, "same"-ish striding subsampling) ----
     node("CONV_2D", ["pre_encode.conv0.weight", "mel_input"], ["sub0_raw"],

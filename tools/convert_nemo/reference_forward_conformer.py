@@ -47,11 +47,17 @@ def compute_mel_features(waveform: np.ndarray, hp: dict) -> np.ndarray:
     mel = torch.matmul(fb.unsqueeze(0), power)  # (1, n_mels, t_mel)
     log_mel = torch.log(mel + hp["log_guard"])
 
-    # per_feature normalize: single full utterance, no padding, so valid_mask is all-True.
-    mean = log_mel.mean(dim=2, keepdim=True)
-    var = ((log_mel - mean) ** 2).sum(dim=2, keepdim=True) / (log_mel.shape[2] - 1)  # unbiased (N-1)
+    # per_feature normalize: real NeMo's own `get_seq_len`/`normalize_batch` (see mel_common.py's own
+    # "Real-NeMo gotcha" docstring note) always treats the LAST STFT frame as invalid, even for a
+    # full-length, un-padded utterance -- mean/var are taken over only the first t_mel-1 frames, and that
+    # last frame is zeroed in the final output.
+    t_mel = log_mel.shape[2]
+    valid = log_mel[:, :, : t_mel - 1]
+    mean = valid.mean(dim=2, keepdim=True)
+    var = ((valid - mean) ** 2).sum(dim=2, keepdim=True) / (valid.shape[2] - 1)  # unbiased (N-1)
     std = torch.sqrt(var) + hp["norm_eps"]
     normalized = (log_mel - mean) / std
+    normalized[:, :, t_mel - 1:] = 0.0
 
     return normalized.squeeze(0).transpose(0, 1).to(torch.float32).numpy()  # (t_mel, n_mels)
 

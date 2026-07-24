@@ -264,14 +264,28 @@ SupertonicTTS, StyleTTS2.
   `less` ops in Conformer-CTC's topology matched and were replaced (`grep`: zero raw `LESS` ops remain in
   the exported topology). Full `ctest` clean, Qwen3 re-verified byte-exact.
 
-  **A separate, previously-masked numerical bug is now visible.** With the masking fix in place, the
-  model's logits move meaningfully closer to `reference_forward_conformer.py`'s output but still don't
-  match (bisected past the masking layer down to the raw log-mel CMVN-normalized features themselves --
-  `x_17_cast_fp16` -- which already differ from an independently-computed `compute_mel_features()`
-  reference, e.g. `-0.27` vs. `-1.52` at index 1). This is NOT the same bug: masking is now provably a
-  no-op (matches the single-utterance/no-padding invariant exactly), so this is a genuine, distinct
-  mismatch somewhere in the STFT-via-CONV_1D / mel-filterbank / CMVN-normalize chain itself, not yet
-  investigated.
+  **The separate, previously-masked numerical bug (raw log-mel CMVN-normalized features not matching an
+  independently-computed `compute_mel_features()` reference) is now root-caused and fixed.** Confirmed
+  by calling the REAL checkpoint's `nemo_asr` preprocessor module directly (bypassing MIL/coremltools
+  entirely) and diffing its output against `compute_mel_features()`: real NeMo's own
+  `AudioToMelSpectrogramPreprocessor.get_seq_len()` computes `floor(length/hop_length)` valid frames --
+  exactly ONE LESS than the true STFT frame count `floor(length/hop_length)+1` its own center-padded STFT
+  produces -- even when `length` is the waveform's true full sample count with no real padding at all.
+  NeMo's `normalize_batch()` therefore always excludes the LAST STFT frame from CMVN mean/variance (N-1
+  denominator, N = valid frames, one fewer than total) and zeroes it outright in the final output. This is
+  a genuinely distinct bug from the encoder's own `calc_length`/`all_paddings` masking fixed above (that
+  one really is a no-op here) -- it's a separate structural off-by-one specific to the mel frontend's own
+  frame-validity convention, present regardless of whether any real padding occurs. Fixed in
+  `mel_common.py` (documented), `reference_forward_conformer.py`'s `compute_mel_features()`, and
+  `convert_conformer_ctc.py`'s CMVN section (new `valid_frames_expr()` = `t_mel_expr() - 1`; a `VIEW` slices
+  off the last frame before both `SUM_ROWS` reductions, and the final normalized output has its last frame
+  zeroed via slice+`PAD_1D`). The identical copy-pasted bug was also fixed in `convert_parakeet_rnnt.py`/
+  `convert_parakeet_tdt.py` and their reference scripts (same mel frontend, verbatim copy) -- unverified
+  against a real checkpoint (none available locally; their e2e tests skip for that reason), but mechanically
+  identical to the Conformer-CTC fix, which IS verified: `test_e2e_conformer_ctc`/
+  `test_e2e_conformer_ctc_dynamic_length` both pass end-to-end (max logit abs diff <= 1e-3) against
+  regenerated fixtures, and the fixed mel features were independently confirmed to match the real
+  `nemo_asr` preprocessor's actual output to ~1e-6 (float32 rounding only).
 - **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
   SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
   exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
