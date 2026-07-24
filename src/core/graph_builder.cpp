@@ -66,7 +66,16 @@ void build_node(const TopologyNode& node, PrimitiveContext& pc, SymbolTable& sym
     }
 
     const PrimitiveFn& fn = PrimitiveRegistry::instance().get(node.op);
-    std::vector<ggml_tensor*> outputs = fn(pc, inputs, node.attrs);
+    std::vector<ggml_tensor*> outputs;
+    try {
+        outputs = fn(pc, inputs, node.attrs);
+    } catch (const Error& e) {
+        std::string ins;
+        for (const auto& in : node.inputs) ins += in + ",";
+        throw SchemaError("node '" + (node.name.empty() ? node.op : node.name) + "' (op=" + node.op +
+                           ", inputs=[" + ins + "], outputs=[" +
+                           (node.outputs.empty() ? "" : node.outputs[0]) + "]): " + e.what());
+    }
 
     if (outputs.size() != node.outputs.size()) {
         throw SchemaError("GraphBuilder: op '" + node.op + "' produced " + std::to_string(outputs.size()) +

@@ -31,6 +31,11 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
 
+    // ggml_compute_forward_im2col asserts its `data` operand's fastest-varying axis is densely packed
+    // (nb[0] == sizeof(float)) -- true for most producers, but not for a channel-split VIEW feeding
+    // straight into a pointwise/depthwise conv (confirmed on Conformer-CTC's GLU-split conv module: the
+    // first half of a channel-split tensor is a genuinely strided view, not a fresh contiguous buffer).
+    if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, GGML_TYPE_F32); // [IC*K, OL, N]
     ggml_tensor* result = ggml_mul_mat(pc.ctx,
         ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),       // [IC*K, N*OL]
@@ -50,6 +55,7 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
     const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
 
+    if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, GGML_TYPE_F32); // [IC*KH*KW, OW, OH, N]
     ggml_tensor* result = ggml_mul_mat(pc.ctx,
         ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),          // [IC*KH*KW, N*OH*OW]
@@ -78,6 +84,7 @@ Outputs op_conv_2d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
     const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
 
+    if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
     ggml_tensor* new_kernel = ggml_reshape_4d(pc.ctx, kernel, kernel->ne[0], kernel->ne[1], 1,
                                                kernel->ne[2] * kernel->ne[3]);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, new_kernel,
@@ -133,6 +140,7 @@ Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
 
+    if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
     ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, data->ne[0], 1, data->ne[1], data->ne[2]);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, GGML_TYPE_F32);
     ggml_tensor* result = ggml_mul_mat(pc.ctx, im2col, kernel);

@@ -19,6 +19,19 @@ void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
     }
 }
 
+// ggml's own elementwise-arithmetic kernels (ADD/SUB/MUL/DIV, ggml-cpu/binary-ops.cpp and ops.cpp) only
+// ever support same-family FLOAT type combos (F32/F16/BF16) -- there is no integer-arithmetic path at
+// all, not even I32-with-I32 (confirmed by reading ggml_compute_forward_add's own type switch: I32 isn't
+// one of the listed cases, so it falls to the generic "fatal error" abort). MIL, in contrast, freely does
+// real int32 arithmetic wherever a model computes on the "length" input directly (e.g. Conformer-CTC's
+// `current_lengths = (length - kernel) // stride + 1`-style subsampled-length formula). Casting any I32
+// operand up to F32 before it reaches one of these ops keeps the VALUE correct (this exporter's target
+// models only ever do exact, small-integer arithmetic here, well within F32's exact-integer range) while
+// staying inside what ggml's kernels can actually execute.
+ggml_tensor* promote_i32_to_f32(ggml_context* ctx, ggml_tensor* t) {
+    return t->type == GGML_TYPE_I32 ? ggml_cast(ctx, t, GGML_TYPE_F32) : t;
+}
+
 Outputs op_get_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("GET_ROWS", in, 2);
     return {ggml_get_rows(pc.ctx, in[0], in[1])};
@@ -60,9 +73,9 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("ADD", in, 2);
-    ggml_tensor* a = in[0];
-    ggml_tensor* b = in[1];
-    
+    ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
+    ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
+
     // Commutative swapping: ensure the first tensor (a) is always the larger/broadcasting tensor
     if (ggml_nelements(b) > ggml_nelements(a)) {
         std::swap(a, b);
@@ -95,20 +108,27 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
 
+    if (!ggml_can_repeat(b, a)) {
+        auto ne_str = [](ggml_tensor* t) {
+            return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                   std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+        };
+        throw SchemaError("ADD: incompatible shapes a=" + ne_str(a) + " b=" + ne_str(b));
+    }
     return {ggml_add(pc.ctx, a, b)};
 }
 
 Outputs op_sub(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SUB", in, 2);
-    ggml_tensor* a = in[0];
-    ggml_tensor* b = in[1];
-    
+    ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
+    ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
+
     // Dynamically optimize scalar subtraction (e.g. 0.0 - b) to ggml_neg(b) to prevent broadcast failures
     if (ggml_nelements(a) == 1 && ggml_nelements(b) > 1) {
         if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
         return {ggml_neg(pc.ctx, b)};
     }
-    
+
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
     return {ggml_sub(pc.ctx, a, b)};
@@ -116,9 +136,9 @@ Outputs op_sub(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("MUL", in, 2);
-    ggml_tensor* a = in[0];
-    ggml_tensor* b = in[1];
-    
+    ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
+    ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
+
     // Commutative swapping: ensure the first tensor (a) is always the larger/broadcasting tensor
     if (ggml_nelements(b) > ggml_nelements(a)) {
         std::swap(a, b);
@@ -149,17 +169,44 @@ Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
     
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
-    
+
+    if (!ggml_can_repeat(b, a)) {
+        auto ne_str = [](ggml_tensor* t) {
+            return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                   std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+        };
+        throw SchemaError("MUL: incompatible shapes a=" + ne_str(a) + " b=" + ne_str(b));
+    }
     return {ggml_mul(pc.ctx, a, b)};
 }
 
 Outputs op_div(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("DIV", in, 2);
-    ggml_tensor* a = in[0];
-    ggml_tensor* b = in[1];
+    ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
+    ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
     if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
     if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
     return {ggml_div(pc.ctx, a, b)};
+}
+
+// MIL's `floor_div` (PyTorch `//`) is genuinely NOT the same op as `real_div` -- it floors the quotient,
+// same as Python's own integer-division semantics. Needed as its own primitive (not just DIV) because
+// this project's own MIL exporter previously mapped both "real_div" and "floor_div" MIL op types to the
+// SAME plain "DIV" JSON op, silently dropping the floor -- confirmed as a real, load-bearing bug on
+// Conformer-CTC's NeMo-style `calc_length()` subsampled-length formula (`torch.div(lengths+pad-kernel,
+// stride) + 1` then floored): coremltools' own tracing had ALSO already eliminated the standalone
+// `torch.floor()` MIL op entirely (constant-folded away as a no-op for the specific dummy trace length
+// used, an unrelated coremltools quirk), so the `floor_div` op itself is the ONLY place this exporter
+// can still recover the real floor semantics for a length computed from user-supplied "length" input
+// values the trace never saw. Composed as DIV+FLOOR rather than a native ggml integer-divide (ggml has
+// none).
+Outputs op_floor_div(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("FLOOR_DIV", in, 2);
+    ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
+    ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
+    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
+    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    return {ggml_floor(pc.ctx, ggml_div(pc.ctx, a, b))};
 }
 
 Outputs op_scale(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -383,7 +430,9 @@ Outputs op_cumsum(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_softmax(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SOFTMAX", in, 1);
-    return {ggml_soft_max(pc.ctx, in[0])};
+    ggml_tensor* x = in[0];
+    if (!ggml_is_contiguous(x)) x = ggml_cont(pc.ctx, x);
+    return {ggml_soft_max(pc.ctx, x)};
 }
 
 Outputs op_softplus(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -604,7 +653,6 @@ Outputs op_repeat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         ne[i] = v.is_string() ? static_cast<int64_t>(std::llround(pc.symbols.eval(v.get<std::string>())))
                                : static_cast<int64_t>(std::llround(v.get<double>()));
     }
-    
     ggml_tensor* a = in[0];
     
     // Dynamically heal transposed/permuted input layouts (axis 1 and 2 swapped) relative to repeat target
@@ -646,40 +694,52 @@ Outputs op_view(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
                                std::to_string(parent->ne[2]) + "," + std::to_string(parent->ne[3]) + "]");
         }
     }
+    // Default nb1/nb2/nb3 MUST come from the PARENT's own existing strides, not be recomputed from the
+    // new (target) shape -- recomputing from the target shape is only correct when the sliced axis's
+    // size is unchanged from the parent. When the view shrinks ne0 itself (e.g. truncating a causal
+    // conv's output from 130 back down to 128 real timesteps, keeping ne1=channels), the parent's true
+    // row stride is still based on its ORIGINAL (larger) ne0, so `shape[0]*elem_size` silently
+    // underestimates every row's stride -- row 0 still starts at the right place (offset 0 either way),
+    // but every subsequent row/channel reads from the wrong location. Confirmed on LFM2's ShortConv
+    // layers: channel 0 of the truncated conv output matched the reference model exactly, every other
+    // channel didn't -- exactly this failure signature.
+    const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols)) : parent->nb[1];
+    const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols)) : parent->nb[2];
+    const size_t nb3 = attrs.contains("nb3") ? static_cast<size_t>(resolve_attr_int(attrs, "nb3", pc.symbols)) : parent->nb[3];
+    const size_t nb[4] = {parent->nb[0], nb1, nb2, nb3};
+
+    // A strided view's highest byte it can ever touch is `offset + sum((shape[i]-1) * nb[i]) + elemsize`
+    // -- checked explicitly here (rather than leaving it to ggml_view_Nd's own internal GGML_ASSERT,
+    // which aborts the process outright with no context) so an out-of-bounds VIEW -- e.g. a mis-derived
+    // dynamic shape/offset expression evaluating to something the parent tensor was never sized for --
+    // surfaces as a normal SchemaError with the offending node's name (via GraphBuilder's own wrapping),
+    // the same diagnostic upgrade every other primitives_basic.cpp bounds check already got.
+    size_t last_byte = static_cast<size_t>(offset);
+    for (size_t i = 0; i < shape.size(); ++i) {
+        last_byte += static_cast<size_t>(shape[i] - 1) * nb[i];
+    }
+    last_byte += parent->nb[0];
+    if (last_byte > ggml_nbytes(parent)) {
+        std::string shape_str;
+        for (auto s : shape) shape_str += std::to_string(s) + ",";
+        throw SchemaError("VIEW: resolved shape [" + shape_str + "] at offset " + std::to_string(offset) +
+                           " (nb=[" + std::to_string(nb[0]) + "," + std::to_string(nb[1]) + "," +
+                           std::to_string(nb[2]) + "," + std::to_string(nb[3]) + "]) needs " +
+                           std::to_string(last_byte) + " bytes but parent has " +
+                           std::to_string(ggml_nbytes(parent)) + " (parent ne=[" +
+                           std::to_string(parent->ne[0]) + "," + std::to_string(parent->ne[1]) + "," +
+                           std::to_string(parent->ne[2]) + "," + std::to_string(parent->ne[3]) + "])");
+    }
+
     switch (shape.size()) {
         case 1:
             return {ggml_view_1d(pc.ctx, parent, shape[0], offset)};
-        case 2: {
-            // Default nb1/nb2/nb3 MUST come from the PARENT's own existing strides, not be
-            // recomputed from the new (target) shape -- recomputing from the target shape is only
-            // correct when the sliced axis's size is unchanged from the parent. When the view
-            // shrinks ne0 itself (e.g. truncating a causal conv's output from 130 back down to 128
-            // real timesteps, keeping ne1=channels), the parent's true row stride is still based on
-            // its ORIGINAL (larger) ne0, so `shape[0]*elem_size` silently underestimates every
-            // row's stride -- row 0 still starts at the right place (offset 0 either way), but every
-            // subsequent row/channel reads from the wrong location. Confirmed on LFM2's ShortConv
-            // layers: channel 0 of the truncated conv output matched the reference model exactly,
-            // every other channel didn't -- exactly this failure signature.
-            const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : parent->nb[1];
+        case 2:
             return {ggml_view_2d(pc.ctx, parent, shape[0], shape[1], nb1, static_cast<size_t>(offset))};
-        }
-        case 3: {
-            const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : parent->nb[1];
-            const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols))
-                                                      : parent->nb[2];
+        case 3:
             return {ggml_view_3d(pc.ctx, parent, shape[0], shape[1], shape[2], nb1, nb2, static_cast<size_t>(offset))};
-        }
-        case 4: {
-            const size_t nb1 = attrs.contains("nb1") ? static_cast<size_t>(resolve_attr_int(attrs, "nb1", pc.symbols))
-                                                      : parent->nb[1];
-            const size_t nb2 = attrs.contains("nb2") ? static_cast<size_t>(resolve_attr_int(attrs, "nb2", pc.symbols))
-                                                      : parent->nb[2];
-            const size_t nb3 = attrs.contains("nb3") ? static_cast<size_t>(resolve_attr_int(attrs, "nb3", pc.symbols))
-                                                      : parent->nb[3];
+        case 4:
             return {ggml_view_4d(pc.ctx, parent, shape[0], shape[1], shape[2], shape[3], nb1, nb2, nb3, static_cast<size_t>(offset))};
-        }
         default: throw SchemaError("VIEW 'shape' attribute must have 1-4 entries, got " + std::to_string(shape.size()));
     }
 }
@@ -728,6 +788,7 @@ LOOM_REGISTER_OP(ADD, op_add)
 LOOM_REGISTER_OP(SUB, op_sub)
 LOOM_REGISTER_OP(MUL, op_mul)
 LOOM_REGISTER_OP(DIV, op_div)
+LOOM_REGISTER_OP(FLOOR_DIV, op_floor_div)
 LOOM_REGISTER_OP(SCALE, op_scale)
 LOOM_REGISTER_OP(SQR, op_sqr)
 LOOM_REGISTER_OP(SQRT, op_sqrt)
