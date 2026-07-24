@@ -101,14 +101,12 @@ int main() {
     }
     std::fprintf(stderr, "MIL-exported encoder max abs diff vs. reference_forward_parakeet_rnnt.py = %f\n",
                  static_cast<double>(max_abs_diff));
-    // Same STFT-precision root cause as test_e2e_parakeet_tdt_mil_export.cpp's own tolerance (see that
-    // file's comment for the full derivation: coremltools' `complex_stft` MIL lowering computes its DFT
-    // phase matrix in fp32 throughout) -- isolated the same way here (a preprocessor-only debug export)
-    // to ~0.01-0.05 per-frame log-mel noise, with the last frame still correctly zeroed. The much larger
-    // observed diff here (vs. Parakeet-TDT's ~0.09) is consistent with this checkpoint's real xscale=32.0
-    // (Parakeet-TDT has none, xscale=False) amplifying that same upstream noise well before any per-layer
-    // LayerNorm can renormalize it.
-    LOOM_CHECK(max_abs_diff <= 1.3f);
+    // Same tolerance as test_e2e_parakeet_tdt_mil_export.cpp's own -- an earlier version of this test used
+    // a much looser 1.3, attributed to xscale=32.0 amplifying coremltools' own STFT fp32-precision noise.
+    // That theory was wrong: the real cause was two general exporter bugs (silent FP16-rounding of every
+    // constant weight, and a completely dropped conv bias -- see BACKLOG.md), not amplified STFT noise.
+    // Once both were fixed this diff dropped from ~1.14 to ~1e-5.
+    LOOM_CHECK(max_abs_diff <= 5e-2f);
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

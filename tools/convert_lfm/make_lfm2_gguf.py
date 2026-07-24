@@ -81,7 +81,8 @@ def main():
     emb_mil = ct.convert(
         traced_emb,
         inputs=[ct.TensorType(shape=(1, ct.RangeDim(1, 4096)), dtype=np.int32)],
-        convert_to="milinternal"
+        convert_to="milinternal",
+        compute_precision=ct.precision.FLOAT32,
     )
     master_prog.functions["embedding"] = emb_mil.functions["main"]
     
@@ -98,7 +99,8 @@ def main():
         layer_mil = ct.convert(
             traced_layer,
             inputs=[ct.TensorType(shape=(1, ct.RangeDim(1, 4096), 1024), dtype=np.float32)],
-            convert_to="milinternal"
+            convert_to="milinternal",
+            compute_precision=ct.precision.FLOAT32,
         )
         master_prog.functions[f"layer_{i}"] = layer_mil.functions["main"]
         
@@ -110,7 +112,8 @@ def main():
     head_mil = ct.convert(
         traced_head,
         inputs=[ct.TensorType(shape=(1, ct.RangeDim(1, 4096), 1024), dtype=np.float32)],
-        convert_to="milinternal"
+        convert_to="milinternal",
+        compute_precision=ct.precision.FLOAT32,
     )
     master_prog.functions["output_head"] = head_mil.functions["main"]
     

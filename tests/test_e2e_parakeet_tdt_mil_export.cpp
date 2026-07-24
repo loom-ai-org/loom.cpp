@@ -104,22 +104,16 @@ int main() {
     }
     std::fprintf(stderr, "MIL-exported encoder max abs diff vs. reference_forward_parakeet_tdt.py = %f\n",
                  static_cast<double>(max_abs_diff));
-    // Looser than test_e2e_parakeet_tdt.cpp's bespoke-conversion 5e-2: THIS path's STFT comes from
-    // coremltools' own `complex_stft` MIL lowering (lower_complex_dialect_ops.py's `_calculate_dft_matrix`),
-    // not this project's own mel_common.py DFT-basis kernels -- it computes the DFT phase matrix
-    // `cos/sin(2*pi*i*j/n_fft)` in fp32 arithmetic THROUGHOUT (cast to fp32 before the matmul building the
-    // phase angles), with angles up to ~2*pi*(n_fft-1)^2/n_fft (~3200 radians for n_fft=512) -- fp32 has
-    // only ~7 significant decimal digits, so cos/sin of an angle that large loses meaningfully more
-    // precision than mel_common.py's own kernels (built once in float64 by numpy, rounded to fp32 only at
-    // the final GGUF weight write). Isolated by diffing this export's raw preprocessor-only output
-    // (export_parakeet_preprocessor_debug_mil.py) against reference_forward_parakeet_tdt.py's
-    // compute_mel_features() directly: ~0.01-0.02 per-frame log-mel noise (with the last-frame-zeroing
-    // convention matching exactly, confirming the masking itself -- not this precision difference -- was
-    // the thing worth being strict about), which a 24-layer encoder can plausibly amplify to the ~0.09
-    // observed here. An external (coremltools-side), not loom-engine-side, precision characteristic --
-    // same "real, architecture/toolchain-driven precision ceiling" reasoning as StyleTTS2's own widened
-    // tolerance (see BACKLOG.md).
-    LOOM_CHECK(max_abs_diff <= 0.12f);
+    // Same tolerance as test_e2e_parakeet_tdt.cpp's own bespoke-conversion check. An earlier version of
+    // this test used a much looser 0.12, attributed to coremltools' own `complex_stft` fp32 DFT-phase-
+    // matrix precision -- that theory was WRONG (or at best a negligible contributor): the real cause was
+    // two exporter bugs affecting every constant/conv in the graph, not just the STFT (see BACKLOG.md):
+    // ct.convert()'s default silently FP16-rounding every constant weight even under convert_to=
+    // "milinternal", and the "conv" translation completely dropping every conv2d/conv1d bias. Once BOTH
+    // were fixed (compute_precision=ct.precision.FLOAT32 in export_parakeet_tdt_mil.py, plus the exporter's
+    // conv-bias fix), this diff dropped from ~0.09 to ~5e-6 -- genuine fp32 rounding noise, not an
+    // unavoidable toolchain precision ceiling.
+    LOOM_CHECK(max_abs_diff <= 5e-2f);
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

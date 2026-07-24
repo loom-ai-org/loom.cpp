@@ -50,7 +50,8 @@ def main():
     mil_prog = ct.convert(
         traced_model,
         inputs=[ct.TensorType(shape=(1, ct.RangeDim(1, 4096), 4), dtype=np.float32)],
-        convert_to="milinternal"
+        convert_to="milinternal",
+        compute_precision=ct.precision.FLOAT32,
     )
     
     # 1. Export Monolithic Profile

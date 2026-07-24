@@ -77,6 +77,10 @@ def main():
             ct.TensorType(name="length", shape=(1,), dtype=np.int32),
         ],
         convert_to="milinternal",
+        # ct.convert()'s default (compute_precision=None) FP16-casts every constant weight even for
+        # convert_to="milinternal" -- see export_conformer_ctc_mil.py's own comment (and BACKLOG.md) for
+        # the full root-cause; this is a general exporter precision fix, not Conformer-CTC-specific.
+        compute_precision=ct.precision.FLOAT32,
     )
 
     backend = loom_mil_compiler.LoomGGUFBackend()

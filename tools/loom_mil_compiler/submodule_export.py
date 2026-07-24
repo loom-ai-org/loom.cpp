@@ -170,7 +170,11 @@ def _trace_module(name: str, module: nn.Module, args: tuple, kwargs: dict, seq_l
         dtype = np.int32 if val.dtype in (torch.int64, torch.int32, torch.long) else np.float32
         tensor_inputs.append(ct.TensorType(name=path.name, shape=tuple(shape), dtype=dtype))
 
-    mil_prog = ct.convert(traced, inputs=tensor_inputs, convert_to="milinternal")
+    # compute_precision=ct.precision.FLOAT32: ct.convert()'s own default (None) FP16-casts every constant
+    # weight even under convert_to="milinternal" -- see export_hf_causal_lm.py's own comment / BACKLOG.md
+    # for the full root-cause (found via Conformer-CTC's CONV_2D subsampling stage, but applies here too).
+    mil_prog = ct.convert(traced, inputs=tensor_inputs, convert_to="milinternal",
+                          compute_precision=ct.precision.FLOAT32)
     return mil_prog.functions["main"]
 
 

@@ -74,7 +74,11 @@ SupertonicTTS, StyleTTS2.
   pattern as the `cast` branch). Verified: 8/8 greedy-token match against real HF `generate()` for both
   profiles ("The capital of France is" → " Paris. The capital of Germany is Berlin"). Full `ctest`: zero
   regressions.
-- **NeMo Conformer-CTC-small — exports and runs deep into the real model, one open data-flow bug left.**
+- **NeMo Conformer-CTC-small — DONE, fully numerically verified as of 2026-07-24** (see the dedicated
+  "CONV_2D bug — ROOT-CAUSED AND FIXED" entry further down this same section for the final two bugs that
+  got it there: a silently FP16-rounded constant weight, and a completely dropped conv bias). The
+  historical narrative below (data-flow/masking bugs found and fixed getting the model to trace and run at
+  all) is kept for the reasoning trail, not because anything in it is still open.
   `export_conformer_ctc_mil.py` traces the REAL `nemo.collections.asr.models.EncDecCTCModelBPE`
   (preprocessor + `ConformerEncoder` + `ConvASRDecoder`) directly — no hand-reimplemented plain-PyTorch
   module needed (unlike `tools/convert_generic/conformer_ctc_module.py`'s older `aten_to_loom`-oriented
@@ -327,64 +331,87 @@ SupertonicTTS, StyleTTS2.
   only rounded to fp32 at the final GGUF weight write). Full `ctest` clean, zero regressions (LFM2's own
   MIL export re-verified byte-exact).
 
-  **Known follow-up, NOT yet fixed, and NOT a masking-bypass issue (that hypothesis was investigated and
-  DISPROVEN — see below) — found by re-testing Conformer-CTC-small's own MIL export with this same fix
-  (previously never numerically verified at all, since no test compared its output against a reference):**
-  a real, separate bug in the SECOND `CONV_2D` subsampling stage (the plain, non-depthwise, 176→176-channel,
-  `kernel=3`/`stride=2` conv — NOT present in Parakeet-TDT's own `dw_striding` subsampling, whose second/
-  third stages are depthwise `CONV_2D_DW` + 1×1 pointwise `CONV_2D`, both already proven correct). Isolated
-  by exporting progressively smaller debug wrappers (`preprocessor`-only, then `preprocessor+pre_encode`,
-  then just the two raw `conv[0..3]` Sequential layers, bypassing `pre_encode`'s own linear projection) and
-  diffing against real NeMo's own eager (non-traced) intermediate activations (captured via
-  `register_forward_hook` on `pre_encode.conv[0]`/`conv[2]`, confirming the exact `unsqueeze(1)`/reshape
-  NeMo applies before the first `Conv2d` — this ruled out a mistake in the hand reference, not just the
-  export). The corruption is present immediately after the second `conv[2]`+ReLU (`(176,17,20)` tensor,
-  BEFORE `pre_encode.out`'s linear/xscale): only 23 of 176 output channels match exactly (diff `< 1e-5`),
-  the rest differ substantially (up to ~30, with no obvious channel-index pattern — not every-Nth, not a
-  clean group/offset relationship) — a real correctness bug in `CONV_2D`'s translation or the underlying
-  `ggml` primitive specifically for a MULTI-CHANNEL (`in_channels>1`), non-1×1-kernel, strided conv (the one
-  conv-shape combination this project's tests hadn't previously exercised: every other real model's
-  multi-channel convs are either depthwise or 1×1 pointwise). Root cause not yet found — the two hypotheses
-  ruled out (masking-bypass classification: disproven by forcing every "less" op to bypass and re-testing,
-  which changed the observed diff by <10%, not the ~2 orders of magnitude a masking fix would imply; a
-  stale reference fixture: also ruled out, `ref/` was regenerated fresh and the divergence persists
-  unchanged) leave the conv/primitive translation itself as the remaining suspect. Reproduce via a debug
-  wrapper calling `pre_encode.conv[0](processed_signal.transpose(1,2).unsqueeze(1))` through `conv[3]`
-  (skip `pre_encode.out`/`pos_enc`/the 16 conformer layers entirely) exported through this same MIL path,
-  diffed against real NeMo's own eager forward (via forward hooks, not a hand reimplementation) at the same
-  stage.
+  **CONV_2D bug — ROOT-CAUSED AND FIXED (two real, general exporter bugs, both applying to every model
+  this exporter has ever produced, not just Conformer-CTC).** Re-testing Conformer-CTC-small's own MIL
+  export with the masking fix above (previously never numerically verified at all, since no test compared
+  its output against a reference) found its logits diverging from `reference_forward_conformer.py` by ~19.
+  Isolated via progressively smaller debug wrappers (`preprocessor`-only, `preprocessor+pre_encode`, then
+  just the raw `conv[0..3]` Sequential layers) diffed against real NeMo's own EAGER (non-traced) intermediate
+  activations (captured via `register_forward_hook`, confirming the exact `unsqueeze(1)`/reshape NeMo
+  applies before the first `Conv2d` — ruling out a mistake in the hand reference, not just the export) down
+  to the SECOND subsampling `conv[2]`+ReLU stage, where only 23/176 output channels matched exactly.
 
-  **The masking-bypass hypothesis was investigated in real depth before being disproven — worth recording
-  so it isn't re-investigated from scratch.** NeMo's real `ConvSubsampling.__init__` sets
-  `subsampling_conv_chunking_factor=1` by default (not `-1`) and always builds `self.conv =
-  MaskedConvSequential(*layers)` (`nemo/collections/asr/parts/submodules/subsampling.py`), which — for a
-  small, unchunked trace — DOES apply real per-stage masking (`_create_mask`/`apply_channel_mask` after each
-  strided conv layer). Deriving the exact symbolic formulas for these masks (via `_infer_dynamic_dim_expr`/
-  `_resolve_scalar_expr`) and evaluating them at several concrete probe lengths showed the per-stage
-  comparison is *usually* (but not always — it depends on parity, since it's propagating the mel frontend's
-  own "true frame count minus one" length one level deeper through an integer-halving conv) off by exactly
-  1 from the tensor's own true shape — structurally the SAME kind of "T vs T-1" relationship as the CMVN
-  case this session's actual fix correctly preserves, not the encoder's OWN separate, provably-always-a-
-  tracing-artifact `calc_length`/`all_paddings` bug. This made a real case for NOT bypassing these either —
-  but forcibly bypassing them anyway (as an experiment) barely moved the numeric result, conclusively
-  proving they are NOT the source of this bug and don't need their own special-cased treatment right now.
+  1. **`ct.convert()`'s own default (`compute_precision=None`) silently FP16-rounds every constant weight,
+     even under `convert_to="milinternal"`.** Confirmed directly: coremltools' own `_converters_entry.py`
+     `_need_fp16_cast_pass(None, "milinternal")` returns `True` (`"milinternal" != "neuralnetwork"` is the
+     entire condition — only `compute_precision=precision.FLOAT32` explicitly disables it). The exported
+     GGUF's own `conv.2.weight` tensor (visible in its MIL var name, literally suffixed `_to_fp16`) matched
+     `real_weight.astype(np.float16).astype(np.float32)` bit-for-bit. Harmless for a small kernel (few taps
+     to accumulate rounding error over) but this stage sums 176×3×3=1584 taps per output channel, turning
+     ~1e-2 per-weight relative rounding error into a real, visible output error. Fixed by adding
+     `compute_precision=ct.precision.FLOAT32` to every `ct.convert()` call in the project (all of
+     `export_conformer_ctc_mil.py`/`export_parakeet_{tdt,rnnt}_mil.py`/`export_hf_causal_lm.py`
+     [Qwen3 + LFM2's own monolithic/atomic exports go through this one] /`submodule_export.py`/
+     `tools/convert_lfm/{make_lfm2_gguf,export_profiles_demo}.py`).
+  2. **The exporter's `conv` translation (`exporter.py`'s `op_type == "conv"` branch) never read MIL's
+     OPTIONAL `"bias"` input at all — every biased conv1d/conv2d in every model this exporter has ever
+     produced silently lost its bias term.** Unlike its sibling `conv_transpose` translation just below
+     (which explicitly REJECTS a non-zero bias rather than silently dropping it), this branch had no bias
+     handling whatsoever — confirmed directly by reading the emitted topology JSON: `CONV_2D` fed straight
+     into `RELU` with no `ADD` node in between. This was present even for the FIRST (1-channel) subsampling
+     stage (isolated separately, ~3.0 max diff on its own) — the "23/176 channels" signature was really
+     "some channels have small enough real biases that dropping them barely shows," not a channel-count-
+     specific bug at all. Fixed by composing `CONV_2D`/`CONV_1D` + `RESHAPE`(bias to `[1,1,OC,1]` or
+     `[1,OC,1]`, matching this project's own established `convert_conformer_ctc.py` convention) + `ADD`,
+     the same pattern the existing `linear` translation already used for ITS OWN optional bias.
+
+  A standalone multi-channel `CONV_2D` unit test (`op("CONV_2D")` directly, IC=4/OC=3/kernel=3×3/stride=2,
+  against `F.conv2d`) confirmed the ggml PRIMITIVE itself was correct throughout (diff ~2e-6) — this was
+  never a `ggml`/primitive bug, purely an exporter translation gap.
+
+  **Result after both fixes**: Conformer-CTC-small's encoder output matches the reference to ~5e-5 (was
+  ~2-30 before), and the full CTC logits match to ~1.6e-4 (was ~19) — tightened
+  `test_e2e_conformer_ctc_mil_export.cpp`'s tolerance to `1e-3`, matching the bespoke conversion's own.
+  Parakeet-TDT/RNNT's own "STFT fp32 precision ceiling" tolerances from earlier in this session turned out
+  to be measuring these SAME two bugs, not real STFT precision noise: re-exporting both with the fix
+  dropped their diffs from ~0.09/~1.14 to ~5e-6/~1e-5 — tightened both tests' tolerances to `5e-2` (matching
+  their own bespoke-conversion counterparts) accordingly. **Lesson for next time a "toolchain precision
+  ceiling" tolerance gets written: verify it's real by fixing the cheap, structural possibilities (a
+  disabled precision flag, a dropped bias/scale term) FIRST** — a plausible-sounding "coremltools does fp32
+  trig at large angles" story turned out to be almost entirely beside the point.
+
+  **The masking-bypass refinement needed ONE more correction after this fix, not before.** The original
+  "does the range/length formula match AS A STRING" identity check (this session's earlier fix) was
+  actually too CONSERVATIVE for Conformer-CTC-small specifically: `MaskedConvSequential`'s own per-stage
+  masks (`_create_mask`/`apply_channel_mask`, applied after each strided subsampling conv) get fed a
+  "length" that already passes through the mel frontend's own `get_seq_len` (T−1) convention, so their OWN
+  "range vs. bound" formulas come out structurally unequal too — string-identical to the CMVN case's own
+  shape, but NOT the same thing to leave un-bypassed (confirmed by a controlled experiment: force-bypassing
+  every "less" match, CMVN included, dropped Conformer-CTC's own encoder diff from 2.09 to 0.13 once the
+  fp16/bias bugs above were ALSO fixed — leaving these encoder-level comparisons real was making things
+  WORSE). Replaced the string-equality check with a NUMERIC one: evaluate both sides at 8 different concrete
+  `n_tokens` probes (a tiny sandboxed `eval()` with only `floor` exposed) and only refuse to bypass when
+  `range == length + 1` at EVERY probe (CMVN's actual, provable relationship) — default to bypass otherwise,
+  including the encoder-level case (which is off by 1 only some of the time, depending on integer-halving
+  parity, and empirically wrong to preserve). Final result: 0.00005 max diff on the encoder, better than
+  either the pure-string-check (2.09) or the force-bypass-everything experiment (0.13) alone.
 
   **Also found and fixed in the process (unrelated, general project hygiene, not an exporter bug):** the
   `ref/` fixtures under `/home/flavio/.claude/tmp/{conformer_ctc,parakeet_tdt}_model/` were stale, generated
   2026-07-18 — BEFORE the 2026-07-24 mel-frontend CMVN off-by-one fix (commit `482a559`) — so comparing a
   freshly-exported model against them was comparing against outdated expected values. Regenerate via
-  `tools/convert_nemo/reference_forward_{conformer,parakeet_tdt}.py` any time a mel-frontend/preprocessing
-  fix lands, not just once at fixture-creation time.
+  `tools/convert_nemo/reference_forward_{conformer,parakeet_tdt,parakeet_rnnt}.py` any time a mel-frontend/
+  preprocessing fix lands, not just once at fixture-creation time.
 
-- **Parakeet-RNNT (`nvidia/parakeet-rnnt-0.6b`, encoder only) — DONE and numerically verified**, confirming
-  the CONV_2D bug above is genuinely scoped to Conformer-CTC-small's plain "striding" subsampling only:
+- **Parakeet-RNNT (`nvidia/parakeet-rnnt-0.6b`, encoder only) — DONE and numerically verified.**
   `export_parakeet_rnnt_mil.py` (near-identical to `export_parakeet_tdt_mil.py`) exported and verified
-  cleanly on the first real run, no new exporter issues. `test_e2e_parakeet_rnnt_mil_export.cpp`: max abs
-  diff 1.135 (tolerance 1.3) against `reference_forward_parakeet_rnnt.py` — isolated (same preprocessor-
-  only debug-export technique as Parakeet-TDT's own tolerance derivation) to the same ~0.01–0.05 STFT
-  fp32-precision noise, amplified considerably more than Parakeet-TDT's own ~0.09 by this checkpoint's real
-  `xscale=32.0` (Parakeet-TDT has none) before any per-layer LayerNorm can renormalize it. Full `ctest`
-  clean, zero regressions.
+  cleanly on the first real run, no new exporter issues, and confirms the CONV_2D bug above never applied
+  to either Parakeet checkpoint (both use `dw_striding` — depthwise + 1×1-pointwise subsampling stages
+  only, no plain multi-channel conv). `test_e2e_parakeet_rnnt_mil_export.cpp`: max abs diff ~1e-5 (tolerance
+  5e-2, matching its own bespoke-conversion counterpart) against `reference_forward_parakeet_rnnt.py` —
+  down from ~1.14 before the fp16/bias fixes above (see that section for why the original ~1.14 was
+  wrongly attributed to STFT precision amplified by this checkpoint's `xscale=32.0`). Full `ctest` clean,
+  zero regressions.
 - **VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started, unaffected by any of the above** (none
   of them touch NeMo's ASR preprocessing/masking/subsampling machinery at all). Plausible but unproven —
   their two historical showstoppers (STFT/ISTFT, and LSTM) were exactly what got generalized into the MIL
