@@ -156,18 +156,100 @@ SupertonicTTS, StyleTTS2.
   `mul_broadcast` helper (mirrors the existing `sub_broadcast`) plus a real error message in place of a
   raw `GGML_ASSERT` abort.
 
-  **Still open, one more data-flow bug found while verifying the above (not yet root-caused):** a
-  `RESHAPE` broadcasting `x_std` (a per-mel-channel standard-deviation tensor from CMVN normalization,
-  produced by a plain `ADD`) from what the crash shows as a genuine 80-element tensor up to
-  `[1, 80, n_tokens]` (1,280,000 elements) — an element-count-changing target no ordinary `RESHAPE` can
-  legally produce, suggesting either a real pre-existing exporter bug in how this specific broadcast is
-  translated (not a `_infer_dynamic_dim_expr` gap — `x_std`'s producer is a plain `ADD`, no symbolic-shape
-  derivation issue possible there) or a misidentified node needing the same live re-tracing this whole
-  investigation has needed throughout (var names are NOT stable across separate `torch.jit.trace` runs of
-  the same script — every debugging step in this investigation that assumed otherwise produced a false
-  lead; always re-derive from the SAME export invocation, e.g. via temporary prints inside the exporter
-  itself, never a separate standalone script). Full `ctest` and Qwen3 re-verified clean throughout all of
-  the above.
+  **The model now traces, exports, and runs the complete forward pass with zero crashes** — the
+  `x_std` CMVN broadcast bug mentioned above, and every other shape/data-flow crash found chasing it, are
+  fixed. What follows is everything found and fixed getting from "still open, one more data-flow bug" to
+  "runs end-to-end" (all committed, full `ctest` clean and Qwen3 re-verified byte-exact after every one):
+
+  - **The `x_std` bug itself**: `_infer_dynamic_dim_expr`'s `expand_dims`/`squeeze` case correctly derived
+    a per-axis formula from the input, but the bottom-of-function fallback (for any axis no specific case
+    understood) always substituted a bare `"n_tokens"` regardless of which axis was being asked about —
+    wrong whenever that axis is genuinely the always-1 batch axis (axis 0), which `x_std`'s own tangled
+    select/sub/pow/tile chain (CMVN's masked-mean/variance computation) bottoms out on. Fixed with a new
+    final fallback: `torch_axis == 0` on a rank≥2 var resolves to literal `"1"`, matching this exporter's
+    standing "batch is always 1" assumption (already used by several other cases) rather than a fresh
+    "n_tokens" guess. Also had to fix the SAME assumption inside the existing `conv` case, which had a
+    bare `if torch_axis < 2: return None` that returned from the *whole function* (a `return` inside an
+    `if` block returns from the enclosing method, not just that branch) — bypassing the new fallback
+    entirely for any conv-produced tensor's batch axis.
+  - **`RESHAPE`'s own `"shape"` INPUT is now resolved directly** (new `_try_resolve_reshape_shape_input`),
+    not just its OUTPUT var's declared shape — needed because a `reshape` (unlike `expand_dims`/`squeeze`)
+    has no per-axis correspondence formula to its input at all (elements get freely redistributed), so the
+    output var's own symbolic dims are the only place `get_var_info` had to look, and MIL mints a
+    *fresh, unrelated* opaque symbol per axis there — collapsing two genuinely different axes (e.g. batch
+    and time in a Q/K/V head-split) to the same blind `"n_tokens"`. Resolves via the same `concat`-of-
+    gathers pattern `RANGE_1D`'s own start/end resolution already uses, handles a literal constant `.val`
+    array directly, and a literal `-1` (PyTorch's own "infer this axis" marker) via the general
+    `total_elements(input) / product(other resolved axes)` formula (NOT a same-position guess — confirmed
+    wrong on `rel_shift`'s `x.view(b,h,-1,qlen)`, which swaps which physical input axis the `-1` position
+    ends up representing).
+  - **`slice_by_index`'s own VIEW-composition** (the "real" translation, not just shape-inference) had the
+    identical `"n_tokens"`-substitution-only view of the world: it only ever read a literal `.val`
+    begin/end array, discarding the WHOLE array (not just the missing axis) whenever begin/end was instead
+    a dynamic `concat`, silently turning a real crop into a no-op on every axis. Fixed with a shared
+    `_resolve_slice_axis_value` used by both the shape-inference case and the real VIEW-shape/offset
+    computation. Also found: the VIEW-shape composition only ever treated ne-axis 0 as "the axis being
+    sliced" (copying every other axis straight from the parent) — wrong whenever the real slice lands on a
+    non-fastest axis (confirmed on `rel_shift`'s `x[:, :, 1:]`), silently keeping the parent's FULL
+    (unsliced) size there; generalized to compute `end - begin` on every axis uniformly.
+  - **New op-type cases added to `_infer_dynamic_dim_expr`** while chasing the above through more of the
+    encoder than any earlier fix reached: `layer_norm`/`linear` (shape-preserving passthrough on every
+    axis but the last), `transpose` (real per-axis correspondence via `perm`, not blind substitution),
+    `pad` (passthrough plus the padded axis's real `+lp+rp` formula), `split` (passthrough on every axis
+    but the split one), a broadened `matmul` batch-axis case (leading axes beyond the trailing 2 "real"
+    matmul axes), and `select`/`softmax`/`logical_not`/`silu` added to the existing unary/elementwise
+    passthrough sets.
+  - **A genuine off-by-something bug in `_ELEMENTWISE_BROADCAST_OPS`'s operand-selection**: when BOTH
+    operands of e.g. a `mul` report a dynamic symbol at the same axis (MIL can't always prove one side is
+    a literal 1, even when it genuinely broadcasts from one), the walk picked whichever operand it checked
+    *first*, not whichever was actually informative — confirmed wrong on `att_mask = pad_mask_for_att_mask
+    * att_mask_3`, where the first operand's own axis resolved to `"1"` (a real broadcast-from-1, MIL just
+    couldn't prove it statically) while the second operand held the real formula. Fixed to prefer any
+    operand that resolves to something other than literal `"1"`, falling back to `"1"` only if every
+    operand bottoms out there.
+  - **`op_mul`/`op_add` (`src/ops/primitives_basic.cpp`) gained the same informative-`SchemaError`
+    treatment `op_reshape`/`op_view`/`op_mul_mat` already had** in place of raw uncatchable
+    `GGML_ASSERT(ggml_can_repeat(...))` aborts.
+  - **`op_softmax` and every conv primitive (`CONV_1D`/`CONV_1D_DW`/`CONV_2D`/`CONV_2D_DW`) now `ggml_cont`
+    their input if non-contiguous** — needed once a real strided VIEW (a GLU channel-split) started
+    feeding straight into `ggml_im2col`/`ggml_soft_max`, both of which assert dense strides internally
+    with no context on failure.
+  - **Real int32↔float type-mismatch bug across every elementwise arithmetic primitive**: ggml's own
+    ADD/SUB/MUL/DIV kernels only support same-family FLOAT type combos (F32/F16/BF16) — there is no
+    integer-arithmetic path at all, not even I32-with-I32 (confirmed by reading `ggml_compute_forward_add`
+    itself: I32 isn't one of its listed cases). MIL, in contrast, does real int32 arithmetic wherever a
+    model computes on the "length" input directly. New shared `promote_i32_to_f32` helper (duplicated
+    per-TU, matching this file's own convention) casts any I32 operand up before it reaches
+    `op_add`/`op_sub`/`op_mul`/`op_div`/`sub_broadcast`/`mul_broadcast`/`add_broadcast` — this project's
+    target models only ever do small, exact-integer arithmetic here, well within F32's exact range.
+  - **`floor_div` (PyTorch `//`) was silently mapped to the same plain `"DIV"` primitive as `real_div`**,
+    dropping the floor entirely. New dedicated `FLOOR_DIV` primitive (`op_floor_div`, composed as
+    `ggml_floor(ggml_div(...))`) plus an OP_MAP fix. This one is load-bearing, not cosmetic: it's how the
+    exporter can still recover NeMo's own `calc_length()` formula's real floor semantics for a length
+    computed from the *user-supplied* "length" input, given coremltools' own tracing had ALSO already
+    eliminated the standalone `torch.floor()` MIL op as a no-op for the specific dummy trace length used —
+    confirmed via `grep`, there are zero `FLOOR` ops anywhere in the exported topology.
+  - **`GraphBuilder::build_node` now wraps a primitive's own exception in a `SchemaError` naming the
+    failing node** (`src/core/graph_builder.cpp`) — every one of the shape-mismatch bugs above was found
+    by reading THIS wrapped message rather than a bare, nodeless `GGML_ASSERT` abort.
+
+  **Still open: one numerical (not shape/crash) bug, root-caused but not yet fixed.** The model runs
+  end-to-end and produces logits of the right shape, but they don't match
+  `reference_forward_conformer.py`'s output (max abs diff ~22 on a ±15 range; CTC blank-class argmax
+  happens to still win at every frame, masking the divergence in a naive greedy-decode smoke test).
+  Root cause, found by bisecting layer-by-layer against `expected_encoder_output.bin` (even the very
+  first CNN-subsampling stage's output already diverges): NeMo's own traced `calc_length()` computation
+  (used to build the CNN-subsampling padding/validity mask) has the wrong constant baked in for
+  `all_paddings` — the traced graph computes with `all_paddings=1`, but the real value (2×the conv's own
+  `padding=1`) is `2`. This makes the computed "valid length" one frame short at the FIRST subsampling
+  stage (32 instead of 33, confirmed directly by reading back the real computed value via a bisected
+  sub-topology), which wrongly zeros out the last valid frame's features through the padding mask — even
+  though this specific test input has no real padding at all (length exactly matches the raw sample
+  count) — corrupting the entire encoder output from the first conv stage onward. This lives in NeMo's
+  own traced arithmetic (confirmed via the constants `_41`/`_43`/`_219`/`_221` read directly from the
+  exported GGUF weights, reconstructing the exact formula being computed), not a generic MIL-translation
+  gap, so the right fix is narrow and Conformer-CTC-specific rather than a broad exporter improvement.
+  Not yet attempted.
 - **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
   SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
   exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow

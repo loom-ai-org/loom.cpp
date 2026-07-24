@@ -24,6 +24,14 @@ void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
     }
 }
 
+// ggml's own elementwise-arithmetic kernels (ADD/SUB/MUL/DIV) only support same-family FLOAT type combos
+// (F32/F16/BF16), never I32 -- see primitives_basic.cpp's own identical helper for the full explanation
+// (duplicated here rather than shared via a header, matching this file's existing per-TU-helper
+// convention, e.g. `expect_n_inputs` just above).
+ggml_tensor* promote_i32_to_f32(ggml_context* ctx, ggml_tensor* t) {
+    return t->type == GGML_TYPE_I32 ? ggml_cast(ctx, t, GGML_TYPE_F32) : t;
+}
+
 // 1. Implementation of brand new CoreML MIL primitives using GGML:
 
 Outputs op_abs(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -183,6 +191,16 @@ Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
 // Returns `x - y`, correctly broadcast regardless of which operand is larger, mirroring the same
 // "commutative swap to the larger operand" convention op_add/op_mul already use in primitives_basic.cpp.
 ggml_tensor* sub_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
+    // MIL freely mixes an int32 "length" input straight into arithmetic/comparisons against an
+    // f32-typed tensor (e.g. `torch.arange(T) < length`, RANGE_1D's own output is always F32), matching
+    // PyTorch's own implicit int->float promotion -- but ggml's SUB kernel has no I32 support at all
+    // (see `promote_i32_to_f32`'s own docstring). Confirmed as the real, previously-undiagnosed root
+    // cause of a "binary_op: unsupported types" COMPUTE-time abort on Conformer-CTC's length-validity
+    // mask (`valid_mask`/`pad_mask`/`time_mask`, all comparisons against the real "length" graph input),
+    // reached only once every upstream shape/attention bug was fixed -- earlier attempts crashed before
+    // ever exercising this code path.
+    x = promote_i32_to_f32(ctx, x);
+    y = promote_i32_to_f32(ctx, y);
     if (ggml_nelements(y) > ggml_nelements(x)) {
         return ggml_neg(ctx, ggml_sub(ctx, y, x));
     }
@@ -249,6 +267,8 @@ ggml_tensor* mul_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
     // constraint ggml_sub has -- see sub_broadcast above), but MIL's `select`/elementwise ops place no
     // such constraint on operand order. Orient correctly regardless of which operand is larger, same
     // "commutative swap" convention op_add/op_mul (primitives_basic.cpp) already use.
+    x = promote_i32_to_f32(ctx, x);
+    y = promote_i32_to_f32(ctx, y);
     ggml_tensor* a = x;
     ggml_tensor* b = y;
     if (ggml_nelements(y) > ggml_nelements(x)) {
@@ -265,6 +285,31 @@ ggml_tensor* mul_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
     return ggml_mul(ctx, a, b);
 }
 
+ggml_tensor* add_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
+    // Same "commutative swap to the larger operand" convention as sub_broadcast/mul_broadcast above --
+    // needed because op_select's two mul_broadcast products (cond*x and (1-cond)*y) are each
+    // independently oriented to THEIR OWN larger operand, so the smaller product can end up first
+    // (e.g. cond broadcasts a scalar `x` while `y` is the full-size operand: cond_x stays cond-sized,
+    // term_y grows to y's full size) -- a plain ggml_add(cond_x, term_y) then has its target/repeat
+    // operands backwards.
+    x = promote_i32_to_f32(ctx, x);
+    y = promote_i32_to_f32(ctx, y);
+    ggml_tensor* a = x;
+    ggml_tensor* b = y;
+    if (ggml_nelements(y) > ggml_nelements(x)) {
+        a = y;
+        b = x;
+    }
+    if (!ggml_can_repeat(b, a)) {
+        auto ne_str = [](ggml_tensor* t) {
+            return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                   std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+        };
+        throw SchemaError("ADD: incompatible shapes a=" + ne_str(a) + " b=" + ne_str(b));
+    }
+    return ggml_add(ctx, a, b);
+}
+
 Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("select", in, 3);
     // Algebraic select: cond * x + (1.0f - cond) * y
@@ -275,7 +320,7 @@ Outputs op_select(PrimitiveContext& pc, const Inputs& in, const Json&) {
     ggml_tensor* cond_x = mul_broadcast(pc.ctx, cond, x);
     ggml_tensor* one_minus_cond = ggml_scale_bias(pc.ctx, cond, -1.0f, 1.0f);
     ggml_tensor* term_y = mul_broadcast(pc.ctx, one_minus_cond, y);
-    return {ggml_add(pc.ctx, cond_x, term_y)};
+    return {add_broadcast(pc.ctx, cond_x, term_y)};
 }
 
 
