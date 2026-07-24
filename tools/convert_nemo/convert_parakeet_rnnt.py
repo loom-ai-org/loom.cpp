@@ -123,22 +123,34 @@ def build_encoder_topology(hp: dict) -> dict:
     guarded = node("ADD", ["mel_raw", "mel.log_guard"], ["mel_guarded"])
     log_mel = node("LOG", [guarded], ["log_mel"])
 
+    # Real NeMo treats the LAST STFT frame as invalid -- excluded from mean/var, zeroed in the final
+    # output (see valid_frames_expr()'s own docstring). "valid" below means "the first T_mel-1 frames".
     node("PERMUTE", [log_mel], ["logmel_p"], {"axes": [1, 0, 2, 3]})
     node("CONT", ["logmel_p"], ["logmel_t"])
-    node("SUM_ROWS", ["logmel_t"], ["sum_t"])
-    node("SCALE", ["sum_t"], ["mean_t"], {"s": f"1/({mel_common_t_mel_expr(hp)})"})
+    node("VIEW", ["logmel_t"], ["logmel_valid_t"], {"shape": [valid_frames_expr(hp), hp["n_mels"], 1]})
+    node("SUM_ROWS", ["logmel_valid_t"], ["sum_t"])
+    node("SCALE", ["sum_t"], ["mean_t"], {"s": f"1/({valid_frames_expr(hp)})"})
     node("RESHAPE", ["mean_t"], ["mean"], {"shape": [hp["n_mels"], 1, 1]})
     node("SUB", [log_mel, "mean"], ["centered"])
     node("PERMUTE", ["centered"], ["centered_p"], {"axes": [1, 0, 2, 3]})
     node("CONT", ["centered_p"], ["centered_t"])
-    node("SQR", ["centered_t"], ["centered_sq_t"])
+    node("VIEW", ["centered_t"], ["centered_valid_t"], {"shape": [valid_frames_expr(hp), hp["n_mels"], 1]})
+    node("SQR", ["centered_valid_t"], ["centered_sq_t"])
     node("SUM_ROWS", ["centered_sq_t"], ["sumsq_t"])
-    node("SCALE", ["sumsq_t"], ["var_t"], {"s": f"1/(({mel_common_t_mel_expr(hp)}) - 1)"})
+    node("SCALE", ["sumsq_t"], ["var_t"], {"s": f"1/(({valid_frames_expr(hp)}) - 1)"})
     node("SQRT", ["var_t"], ["std_t"])
     node("ADD", ["std_t", "mel.norm_eps"], ["std_t_guarded"])
     node("RESHAPE", ["std_t_guarded"], ["std"], {"shape": [hp["n_mels"], 1, 1]})
     node("DIV", ["centered", "std"], ["normalized"])
-    node("RESHAPE", ["normalized"], ["mel_input"], {"shape": [hp["n_mels"], -1, 1, 1]})
+    # Zero the last (structurally-always-invalid) frame: permute T_mel back to ne[0], drop it, zero-pad
+    # it back with PAD_1D, permute back.
+    node("PERMUTE", ["normalized"], ["normalized_p"], {"axes": [1, 0, 2, 3]})
+    node("CONT", ["normalized_p"], ["normalized_t"])
+    node("VIEW", ["normalized_t"], ["normalized_valid_t"], {"shape": [valid_frames_expr(hp), hp["n_mels"], 1]})
+    node("PAD_1D", ["normalized_valid_t"], ["normalized_padded_t"], {"lp0": 0, "rp0": 1})
+    node("PERMUTE", ["normalized_padded_t"], ["normalized_final_p"], {"axes": [1, 0, 2, 3]})
+    node("CONT", ["normalized_final_p"], ["normalized_final"])
+    node("RESHAPE", ["normalized_final"], ["mel_input"], {"shape": [hp["n_mels"], -1, 1, 1]})
 
     # ---- Real dw_striding subsampling front-end (3 stages: plain Conv2d, then 2x [depthwise Conv2d +
     #      pointwise Conv2d]), same structure as parakeet-tdt's -- confirmed against this checkpoint's
@@ -237,6 +249,12 @@ def conv_stride_out_expr(in_expr: str, pad: int, kernel: int, stride: int) -> st
 
 def mel_common_t_mel_expr(hp: dict) -> str:
     return f"floor($n_tokens/{hp['hop_length']}) + 1"
+
+
+def valid_frames_expr(hp: dict) -> str:
+    """Real NeMo's own CMVN-valid frame count -- see convert_conformer_ctc.py's identically-named helper
+    for the full explanation (this file's mel frontend is a verbatim copy of that one's)."""
+    return f"floor($n_tokens/{hp['hop_length']})"
 
 
 def n_subsampled_expr(hp: dict) -> str:

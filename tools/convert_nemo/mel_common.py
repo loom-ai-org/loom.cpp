@@ -19,7 +19,18 @@ Algorithm confirmed verbatim against NeMo's GitHub source (see BACKLOG.md for th
   4. mel filterbank: librosa.filters.mel(sr, n_fft, n_mels, fmin=0, fmax=sr/2, norm='slaney').
   5. log(power_mel + 2**-24) (log_zero_guard_type='add', log_zero_guard_value=2**-24).
   6. per-feature (per-mel-bin) CMVN over the time axis: unbiased variance (N-1 denominator), epsilon 1e-5
-     added to std before dividing (no length masking needed here -- single full utterance, no padding).
+     added to std before dividing.
+
+Real-NeMo gotcha (confirmed by reading `AudioToMelSpectrogramPreprocessor.get_seq_len`/`normalize_batch` in
+NeMo's own `features.py`): NeMo's own "how many STFT frames are valid" formula --
+`floor((length + n_fft - n_fft) / hop_length)` = `floor(length / hop_length)` -- is exactly ONE LESS than the
+real STFT frame count `floor(length / hop_length) + 1` this module's `stft_pad`/center-padding produces, even
+when `length` is the waveform's own true full sample count (no real padding at all). NeMo therefore always
+treats the LAST STFT frame as invalid: excluded from both the CMVN mean/variance (denominator is
+`t_mel - 1`, not `t_mel`) AND zeroed outright in the final output. This is NOT the encoder's own
+padding-mask (that one genuinely is a no-op for a single full-length utterance) -- it's a distinct,
+structural off-by-one in the mel frontend itself that every consumer of these frame counts (CMVN
+mean/variance, and the final per-frame zeroing) must replicate to match real NeMo output.
 """
 import librosa
 import numpy as np
