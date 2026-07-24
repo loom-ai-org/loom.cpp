@@ -233,23 +233,45 @@ SupertonicTTS, StyleTTS2.
     failing node** (`src/core/graph_builder.cpp`) — every one of the shape-mismatch bugs above was found
     by reading THIS wrapped message rather than a bare, nodeless `GGML_ASSERT` abort.
 
-  **Still open: one numerical (not shape/crash) bug, root-caused but not yet fixed.** The model runs
-  end-to-end and produces logits of the right shape, but they don't match
-  `reference_forward_conformer.py`'s output (max abs diff ~22 on a ±15 range; CTC blank-class argmax
-  happens to still win at every frame, masking the divergence in a naive greedy-decode smoke test).
-  Root cause, found by bisecting layer-by-layer against `expected_encoder_output.bin` (even the very
-  first CNN-subsampling stage's output already diverges): NeMo's own traced `calc_length()` computation
-  (used to build the CNN-subsampling padding/validity mask) has the wrong constant baked in for
-  `all_paddings` — the traced graph computes with `all_paddings=1`, but the real value (2×the conv's own
-  `padding=1`) is `2`. This makes the computed "valid length" one frame short at the FIRST subsampling
-  stage (32 instead of 33, confirmed directly by reading back the real computed value via a bisected
-  sub-topology), which wrongly zeros out the last valid frame's features through the padding mask — even
-  though this specific test input has no real padding at all (length exactly matches the raw sample
-  count) — corrupting the entire encoder output from the first conv stage onward. This lives in NeMo's
-  own traced arithmetic (confirmed via the constants `_41`/`_43`/`_219`/`_221` read directly from the
-  exported GGUF weights, reconstructing the exact formula being computed), not a generic MIL-translation
-  gap, so the right fix is narrow and Conformer-CTC-specific rather than a broad exporter improvement.
-  Not yet attempted.
+  **The `calc_length`/`all_paddings` bug above is fixed** (Root cause recap: NeMo's own traced
+  `calc_length()` computation, used to build the CNN-subsampling padding/validity mask, has the wrong
+  constant baked in for `all_paddings` — the traced graph computed `all_paddings=1` instead of the real
+  `2` (2×the conv's own `padding=1`), and coremltools' own optimizer had ALSO already eliminated every
+  standalone `torch.floor()` call in this chain as a provable no-op for the specific dummy trace length
+  used (confirmed via `grep`, zero raw `FLOOR` ops anywhere in the exported topology) — so this isn't a
+  dropped-floor bug fixable by recovering a MIL node, the arithmetic MIL actually traced is wrong).
+
+  Rather than reverse-engineer coremltools' own pass pipeline to find and patch whichever pass causes
+  this (considered and rejected — `ct.PassPipeline.EMPTY` confirms passes ARE responsible, since it
+  changes the result, but a fully empty pipeline breaks essential decompositions like
+  `lower_complex_dialect_ops`/STFT, and surgically removing just the offending pass isn't tractable
+  without a much deeper coremltools-internals investigation than this narrow bug warrants — `const_
+  elimination` alone runs ten separate times in the default pipeline and is load-bearing for legitimate
+  simplifications everywhere else, so a mistargeted removal risks silently breaking Qwen3 or other
+  Conformer-CTC paths that currently work), the fix exploits an invariant this WHOLE exporter already
+  assumes everywhere else: every model it targets runs with `length` set to the exact real length of
+  `waveform` (no actual padding, ever — the same "batch is always 1" guarantee used throughout). Under
+  that guarantee, `torch.arange(T) < length`-style length-validity masks (the ONLY thing `calc_length`'s
+  buggy value ever feeds) are true for every position by construction, regardless of what NeMo's own
+  traced arithmetic computes for the bound.
+
+  New `_traces_to_range_1d`/`_traces_to_length_input` (backward producer-chain walks, mirroring this
+  file's other `_traces_*`/`_try_resolve_*` helpers) recognize this exact `arange(T) < length`-derived
+  pattern on the MIL `less` op specifically (the only comparison op actually seen doing this — narrow by
+  design, matching this file's "not implemented since nothing here has needed it yet" convention) and
+  replace its result with a constant all-1.0 tensor of the correct (already-correctly-derived) output
+  shape, bypassing the buggy traced arithmetic entirely rather than trying to repair it. Confirmed: all 6
+  `less` ops in Conformer-CTC's topology matched and were replaced (`grep`: zero raw `LESS` ops remain in
+  the exported topology). Full `ctest` clean, Qwen3 re-verified byte-exact.
+
+  **A separate, previously-masked numerical bug is now visible.** With the masking fix in place, the
+  model's logits move meaningfully closer to `reference_forward_conformer.py`'s output but still don't
+  match (bisected past the masking layer down to the raw log-mel CMVN-normalized features themselves --
+  `x_17_cast_fp16` -- which already differ from an independently-computed `compute_mel_features()`
+  reference, e.g. `-0.27` vs. `-1.52` at index 1). This is NOT the same bug: masking is now provably a
+  no-op (matches the single-utterance/no-padding invariant exactly), so this is a genuine, distinct
+  mismatch somewhere in the STFT-via-CONV_1D / mel-filterbank / CMVN-normalize chain itself, not yet
+  investigated.
 - **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
   SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
   exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
