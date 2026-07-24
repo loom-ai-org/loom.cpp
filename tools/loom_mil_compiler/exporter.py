@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import os
 import sys
@@ -2797,12 +2798,56 @@ class LoomGGUFExporter:
                     attrs["p1"] = int(pad[2]) if len(pad) > 2 else p0
                     attrs["d1"] = int(dilations[1]) if len(dilations) > 1 else d0
 
-                nodes.append({
-                    "op": mapped_op,
-                    "inputs": [resolve(weight_var), resolve(x_var)],
-                    "outputs": [self.safe_name(op.outputs[0].name)],
-                    "attrs": attrs
-                })
+                # MIL's "conv" has an OPTIONAL per-output-channel "bias" input (torch Conv1d/2d's own
+                # `bias=True`) -- unlike this file's own "conv_transpose" translation just below (which
+                # explicitly rejects a non-zero bias rather than silently dropping it), this branch used
+                # to never even look at "bias" at all, silently omitting it entirely. Confirmed as a real,
+                # general correctness bug (not Conformer-CTC-specific -- every model this exporter has
+                # produced with a biased conv loses that bias) via Conformer-CTC-small's own subsampling
+                # `pre_encode.conv.{0,2}` (real, non-tiny biases, mean ~0.4) -- see BACKLOG.md for the full
+                # diagnostic trail (a standalone multi-channel CONV_2D unit test first ruled out the ggml
+                # primitive itself, then diffing the exported topology's own JSON directly against the
+                # bespoke conversion's hand-built one showed the missing ADD node). Composed the same way
+                # the "linear" case above does (MUL_MAT + ADD), reshaped to broadcast against the conv
+                # output's real ne-order channel axis (ne[2] for CONV_2D's [OW,OH,OC,N], ne[1] for
+                # CONV_1D's [OL,OC,N] -- matches convert_conformer_ctc.py's own established
+                # RESHAPE-to-[1,1,C,1]-then-ADD convention for the exact same bias).
+                bias_var_obj = op.inputs.get("bias")
+                output_var = self.safe_name(op.outputs[0].name)
+                if bias_var_obj is not None and getattr(bias_var_obj, "val", None) is not None and np.any(bias_var_obj.val):
+                    bias_var = self.safe_name(bias_var_obj.name)
+                    # Read the MIL var's own RAW (torch-order) shape directly -- NOT get_var_info's
+                    # ne-order-reversed one -- a conv's output is torch-shaped [N, OC, ...spatial...], so
+                    # OC is plain axis 1. OC is always statically known (never a symbolic dynamic dim) for
+                    # every real conv this exporter targets.
+                    oc = int(op.outputs[0].shape[1])
+                    bias_shape = [1, 1, oc, 1] if is_2d else [1, oc, 1]
+                    conv_out_var = output_var + "_conv_raw"
+                    bias_reshaped_var = output_var + "_bias_r"
+                    nodes.append({
+                        "op": mapped_op,
+                        "inputs": [resolve(weight_var), resolve(x_var)],
+                        "outputs": [conv_out_var],
+                        "attrs": attrs
+                    })
+                    nodes.append({
+                        "op": "RESHAPE",
+                        "inputs": [resolve(bias_var)],
+                        "outputs": [bias_reshaped_var],
+                        "attrs": {"shape": bias_shape}
+                    })
+                    nodes.append({
+                        "op": "ADD",
+                        "inputs": [conv_out_var, bias_reshaped_var],
+                        "outputs": [output_var]
+                    })
+                else:
+                    nodes.append({
+                        "op": mapped_op,
+                        "inputs": [resolve(weight_var), resolve(x_var)],
+                        "outputs": [output_var],
+                        "attrs": attrs
+                    })
                 continue
 
             if op_type == "conv_transpose":
@@ -2935,8 +2980,39 @@ class LoomGGUFExporter:
                 # instead -- every primitive it needs (FLOOR_DIV, promote_i32_to_f32, op_select's
                 # mul_broadcast) already exists, proven by Conformer-CTC's OWN encoder needing them for
                 # other parts of its graph.
+                # A pure STRING-equality check here (an earlier version of this fix) turned out to be
+                # too CONSERVATIVE, not too permissive: Conformer-CTC-small's own encoder/subsampling-
+                # level masks (MaskedConvSequential's per-stage `_create_mask`, and the encoder's own
+                # top-level `_create_masks`) are fed a "length" that ALREADY passes through the mel-
+                # frontend's own `get_seq_len` (T-1) convention, so their OWN "T vs. bound" formulas
+                # come out structurally unequal too (propagated through further conv-shape arithmetic,
+                # off by exactly 1 at SOME lengths and by 0 at others depending on integer-halving
+                # parity) -- structurally indistinguishable from CMVN's own case by pure string
+                # comparison, but NOT the same thing to force-bypass or not: confirmed empirically (via
+                # a real, controlled experiment: force-bypassing EVERY "less" match here, including this
+                # one, dropped Conformer-CTC-small's own encoder-output max abs diff from 2.09 to 0.13 --
+                # i.e. leaving these encoder-level comparisons real, un-bypassed, was making things WORSE,
+                # not more faithful, presumably because they still route through NeMo's own separately-
+                # documented `calc_length`/`all_paddings` tracing bug). Only CMVN's own comparison is
+                # reliably, structurally DIFFERENT in a way worth preserving: unlike the encoder-level
+                # case, it's off by EXACTLY 1 at every possible length, never 0, because it's the raw
+                # "T vs T-1" relationship itself, not something derived further from it. Distinguish via a
+                # numeric probe (several concrete `n_tokens` values, not just one, so a coincidental match
+                # at a single probe can't fool this) rather than a syntactic one: only refuse to bypass
+                # when range == length + 1 at EVERY probe; default to bypass otherwise (matching the
+                # empirically-correct, more permissive behavior for everything else, including the
+                # structurally-similar-looking but NOT-off-by-exactly-1-always encoder-level case).
                 def _norm_expr(e):
                     return re.sub(r"\s+", "", str(e)) if e is not None else None
+
+                def _eval_expr(expr, n_tokens_value):
+                    if expr is None:
+                        return None
+                    try:
+                        return float(eval(expr.replace("n_tokens", str(n_tokens_value)),
+                                           {"__builtins__": {}}, {"floor": math.floor}))
+                    except Exception:
+                        return None
 
                 x_var = op.inputs.get("x")
                 y_var = op.inputs.get("y")
@@ -2954,7 +3030,17 @@ class LoomGGUFExporter:
                 if range_var is not None and length_side_var is not None:
                     range_expr = _norm_expr(self._infer_dynamic_dim_expr(range_var, 0))
                     length_expr = _norm_expr(self._resolve_scalar_expr(length_side_var))
-                    bypass_ok = range_expr is not None and range_expr == length_expr
+                    bypass_ok = True
+                    if range_expr is not None and length_expr is not None:
+                        always_off_by_exactly_one = True
+                        for probe in (1600, 8000, 10240, 16000, 16001, 20000, 31999, 320000):
+                            r = _eval_expr(range_expr, probe)
+                            l = _eval_expr(length_expr, probe)
+                            if r is None or l is None or r != l + 1:
+                                always_off_by_exactly_one = False
+                                break
+                        if always_off_by_exactly_one:
+                            bypass_ok = False
                 if bypass_ok:
                     out_info = self.get_var_info(op.outputs[0])
                     target_shape = list(out_info["shape"])

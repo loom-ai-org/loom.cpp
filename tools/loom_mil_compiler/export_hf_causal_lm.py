@@ -114,6 +114,12 @@ def export_causal_lm(
             ct.TensorType(name="attention_mask", shape=(1, 1, seq_len_dim, seq_len_dim), dtype=np.float32),
         ],
         convert_to="milinternal",
+        # ct.convert()'s default (compute_precision=None) FP16-casts every constant weight even for
+        # convert_to="milinternal" (confirmed: coremltools' own `_need_fp16_cast_pass(None, "milinternal")`
+        # returns True) -- root-caused as a real, meaningful precision bug via Conformer-CTC's own
+        # multi-channel CONV_2D subsampling stage (see BACKLOG.md), but it silently applies to every model
+        # this exporter has ever produced, weights included. Not specific to that one model/op.
+        compute_precision=ct.precision.FLOAT32,
     )
 
     backend = loom_mil_compiler.LoomGGUFBackend()

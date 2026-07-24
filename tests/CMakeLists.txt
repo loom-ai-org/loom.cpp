@@ -231,6 +231,13 @@ target_link_libraries(test_e2e_conformer_ctc PRIVATE loom::engine)
 add_test(NAME test_e2e_conformer_ctc COMMAND test_e2e_conformer_ctc)
 set_tests_properties(test_e2e_conformer_ctc PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Conformer-CTC-small exported via the generic MIL compiler (export_conformer_ctc_mil.py), verified
+#     against the SAME reference_forward_conformer.py fixture as the bespoke-conversion test above ---
+add_executable(test_e2e_conformer_ctc_mil_export test_e2e_conformer_ctc_mil_export.cpp)
+target_link_libraries(test_e2e_conformer_ctc_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_conformer_ctc_mil_export COMMAND test_e2e_conformer_ctc_mil_export)
+set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
 # Proves the same converted GGUF supports a second, different waveform length dynamically (see
 # SPECIFICATION.md §4 and BACKLOG.md) -- no reconversion, just a different build() call.
 add_executable(test_e2e_conformer_ctc_dynamic_length test_e2e_conformer_ctc_dynamic_length.cpp)

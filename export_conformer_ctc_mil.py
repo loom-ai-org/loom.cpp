@@ -68,6 +68,15 @@ def main():
             ct.TensorType(name="length", shape=(1,), dtype=np.int32),
         ],
         convert_to="milinternal",
+        # ct.convert()'s own default (compute_precision=None) applies an FP16 cast to every constant
+        # weight EVEN for convert_to="milinternal" (confirmed: `_need_fp16_cast_pass(None, "milinternal")`
+        # returns True in coremltools' own _converters_entry.py -- "milinternal" only skips this when
+        # explicitly told to). Root-caused as the actual cause of the ~4-30 magnitude divergence in this
+        # model's second (176-channel) CONV_2D subsampling stage: that stage sums over 176*3*3=1584 taps,
+        # so per-weight fp16 rounding error (~1e-2 relative) accumulates into a real, visible output error
+        # -- confirmed directly by reading the exported GGUF's OWN stored weight bytes and finding they
+        # exactly equal `real_weight.astype(np.float16).astype(np.float32)`, bit-for-bit. See BACKLOG.md.
+        compute_precision=ct.precision.FLOAT32,
     )
 
     backend = loom_mil_compiler.LoomGGUFBackend()
