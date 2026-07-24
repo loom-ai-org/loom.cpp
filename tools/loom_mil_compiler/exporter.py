@@ -1,5 +1,6 @@
 import json
 import re
+import os
 import sys
 import numpy as np
 from coremltools.converters.mil.mil import Block, Function, Operation, Var
@@ -659,30 +660,40 @@ class LoomGGUFExporter:
         # to specifically understand every intermediate op type between the true input and the first conv.
         return _DYNAMIC_SYMBOL_RE.sub("n_tokens", str(dim))
 
-    def _traces_to_range_1d(self, var, depth=0, _seen=None):
+    def _find_range_1d_var(self, var, depth=0, _seen=None):
         """
-        Backward-walks `var`'s producer chain through shape-preserving passthrough ops, returning True
-        iff it reaches a real `range_1d` op -- i.e. `var` is (an alias/broadcast of) a bare
-        `torch.arange(N)`-style index vector. Used alongside `_traces_to_length_input` to recognize the
-        `torch.arange(T) < length`-style length-validity comparison pattern (see the "less" op_type
-        translation below) -- deliberately walks a SMALL, conservative set of ops (never arithmetic),
-        since anything beyond a pure alias/broadcast would mean this var is no longer just "the position
-        index," which is the one thing this check needs to be sure of.
+        Backward-walks `var`'s producer chain through shape-preserving passthrough ops, returning the
+        `range_1d` Var itself iff `var` is (an alias/broadcast of) a bare `torch.arange(N)`-style index
+        vector, else None. Shares its walk set with (and is the basis of) `_traces_to_range_1d` --
+        deliberately a SMALL, conservative set of ops (never arithmetic), since anything beyond a pure
+        alias/broadcast would mean this var is no longer just "the position index," which is the one
+        thing this check needs to be sure of.
         """
         if _seen is None:
             _seen = set()
         if depth > 8 or var is None or not isinstance(var, Var) or id(var) in _seen:
-            return False
+            return None
         _seen.add(id(var))
         if var.op is None:
-            return False
+            return None
         if var.op.op_type == "range_1d":
-            return True
+            return var
         if var.op.op_type in ("cast", "reshape", "expand_dims", "squeeze", "identity", "tile"):
             for v in var.op.inputs.values():
-                if isinstance(v, Var) and self._traces_to_range_1d(v, depth + 1, _seen):
-                    return True
-        return False
+                if isinstance(v, Var):
+                    found = self._find_range_1d_var(v, depth + 1, _seen)
+                    if found is not None:
+                        return found
+        return None
+
+    def _traces_to_range_1d(self, var, depth=0, _seen=None):
+        """
+        Returns True iff `var` (an alias/broadcast of) a bare `torch.arange(N)`-style index vector --
+        see `_find_range_1d_var` (which this wraps) for the walk itself. Used alongside
+        `_traces_to_length_input` to recognize the `torch.arange(T) < length`-style length-validity
+        comparison pattern (see the "less" op_type translation below).
+        """
+        return self._find_range_1d_var(var, depth, _seen) is not None
 
     def _traces_to_length_input(self, var, depth=0, _seen=None):
         """
@@ -793,11 +804,23 @@ class LoomGGUFExporter:
                 return int(f) if f.is_integer() else f
             return None
         if v.op is None:
-            return None
+            # A genuine function input with no producer -- the only one this whole exporter ever feeds a
+            # real per-utterance length into is "length" itself (see the "less"/CMVN-identity-check use
+            # of this function below, which needs to resolve all the way down to the base symbol, not
+            # just gather-derived shape values `_try_derive_gather_shape_value` already handles).
+            return "n_tokens" if v.name == "length" else None
         op = v.op
         if op.op_type in ("cast", "squeeze", "identity", "expand_dims"):
             inner = op.inputs.get("x") or op.inputs.get("data")
             return self._resolve_scalar_expr(inner, _seen)
+        if op.op_type == "select":
+            # `torch.where(cond, a, b)` -- NeMo's own `get_seq_len` uses exactly this shape for its
+            # "fix for seq_len = 0 for streaming" guard (`torch.where(seq_len == 0, zeros, seq_len_
+            # unfixed)`). This exporter's target use (a real, single, non-empty utterance) never hits the
+            # degenerate `cond` branch, so -- mirroring the "batch is always 1" style invariant used
+            # throughout this file -- always take the "b" (false/else) branch rather than trying to
+            # resolve `cond` itself.
+            return self._resolve_scalar_expr(op.inputs.get("b"), _seen)
         if op.op_type == "gather":
             derived = self._try_derive_gather_shape_value(v)
             return derived
@@ -2889,13 +2912,50 @@ class LoomGGUFExporter:
                 # this exact idiom) rather than every comparison type, matching this file's own
                 # "not implemented since nothing here has needed it yet" convention -- extend if/when a
                 # different comparison op is found doing the same thing.
+                # NOT every `arange(T) < f(length)` this narrow structural pattern matches is actually
+                # this bug: NeMo's real mel-frontend (`FilterbankFeatures.forward`/`normalize_batch`,
+                # traced for real here -- unlike Conformer-CTC-small's own MIL export, which never had a
+                # test comparing its numeric output against a reference and so never caught this) uses
+                # the IDENTICAL `arange(T) < f(length)` shape for a DELIBERATELY different comparison:
+                # `get_seq_len()`'s `floor((length + pad_amount - n_fft) / hop_length)` is genuinely ONE
+                # LESS than the real STFT frame count (`T`, the same "last frame is always invalid"
+                # off-by-one already root-caused and hand-replicated in convert_conformer_ctc.py/
+                # convert_parakeet_tdt.py's own CMVN section -- see valid_frames_expr() there) -- NOT a
+                # tracing artifact, a real, intentional NeMo convention that must NOT be forced to
+                # all-true. Structurally this looks IDENTICAL to the genuine calc_length tracing bug
+                # (both are "arange(T) < floor((length + C1 - C2) / C3)"), so telling them apart needs an
+                # actual identity check: derive T's own real formula (`_find_range_1d_var` + the
+                # `range_1d` case of `_infer_dynamic_dim_expr`, the SAME resolution RANGE_1D's own node
+                # emission uses) and the comparison bound's real formula (`_resolve_scalar_expr`, walking
+                # through the exact `select`/arithmetic chain `get_seq_len` traces to) and compare them AS
+                # STRINGS -- only bypass when they're the identical expression (proving T and the bound
+                # are the SAME quantity, so any real length must make the comparison true by construction
+                # -- the calc_length case). When they differ (the CMVN case: T is the raw STFT frame
+                # count, the bound is deliberately T-1), leave the real comparison/select chain in place
+                # instead -- every primitive it needs (FLOOR_DIV, promote_i32_to_f32, op_select's
+                # mul_broadcast) already exists, proven by Conformer-CTC's OWN encoder needing them for
+                # other parts of its graph.
+                def _norm_expr(e):
+                    return re.sub(r"\s+", "", str(e)) if e is not None else None
+
                 x_var = op.inputs.get("x")
                 y_var = op.inputs.get("y")
-                x_is_range = isinstance(x_var, Var) and self._traces_to_range_1d(x_var)
-                y_is_range = isinstance(y_var, Var) and self._traces_to_range_1d(y_var)
                 x_is_length = isinstance(x_var, Var) and self._traces_to_length_input(x_var)
                 y_is_length = isinstance(y_var, Var) and self._traces_to_length_input(y_var)
-                if (x_is_range and y_is_length) or (y_is_range and x_is_length):
+                range_var = None
+                length_side_var = None
+                if isinstance(x_var, Var) and y_is_length:
+                    range_var = self._find_range_1d_var(x_var)
+                    length_side_var = y_var
+                elif isinstance(y_var, Var) and x_is_length:
+                    range_var = self._find_range_1d_var(y_var)
+                    length_side_var = x_var
+                bypass_ok = False
+                if range_var is not None and length_side_var is not None:
+                    range_expr = _norm_expr(self._infer_dynamic_dim_expr(range_var, 0))
+                    length_expr = _norm_expr(self._resolve_scalar_expr(length_side_var))
+                    bypass_ok = range_expr is not None and range_expr == length_expr
+                if bypass_ok:
                     out_info = self.get_var_info(op.outputs[0])
                     target_shape = list(out_info["shape"])
                     rank = len(target_shape)

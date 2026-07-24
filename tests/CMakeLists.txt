@@ -506,6 +506,20 @@ target_link_libraries(test_e2e_parakeet_tdt PRIVATE loom::engine)
 add_test(NAME test_e2e_parakeet_tdt COMMAND test_e2e_parakeet_tdt)
 set_tests_properties(test_e2e_parakeet_tdt PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Parakeet-TDT encoder exported via the generic MIL compiler (export_parakeet_tdt_mil.py), verified
+#     against the SAME reference_forward_parakeet_tdt.py fixture as the bespoke-conversion test above ---
+add_executable(test_e2e_parakeet_tdt_mil_export test_e2e_parakeet_tdt_mil_export.cpp)
+target_link_libraries(test_e2e_parakeet_tdt_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_parakeet_tdt_mil_export COMMAND test_e2e_parakeet_tdt_mil_export)
+set_tests_properties(test_e2e_parakeet_tdt_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Parakeet-RNNT encoder exported via the generic MIL compiler (export_parakeet_rnnt_mil.py), verified
+#     against the SAME reference_forward_parakeet_rnnt.py fixture as the bespoke-conversion test above ---
+add_executable(test_e2e_parakeet_rnnt_mil_export test_e2e_parakeet_rnnt_mil_export.cpp)
+target_link_libraries(test_e2e_parakeet_rnnt_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_parakeet_rnnt_mil_export COMMAND test_e2e_parakeet_rnnt_mil_export)
+set_tests_properties(test_e2e_parakeet_rnnt_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Real-model end-to-end test: nvidia/parakeet-rnnt-0.6b (converted by
 #     tools/convert_nemo/convert_parakeet_rnnt.py) -- same FastConformer encoder architecture family as
 #     parakeet-tdt (dw_striding subsampling) but biased/xscaled differently (confirmed real, see that
