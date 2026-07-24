@@ -659,6 +659,63 @@ class LoomGGUFExporter:
         # to specifically understand every intermediate op type between the true input and the first conv.
         return _DYNAMIC_SYMBOL_RE.sub("n_tokens", str(dim))
 
+    def _traces_to_range_1d(self, var, depth=0, _seen=None):
+        """
+        Backward-walks `var`'s producer chain through shape-preserving passthrough ops, returning True
+        iff it reaches a real `range_1d` op -- i.e. `var` is (an alias/broadcast of) a bare
+        `torch.arange(N)`-style index vector. Used alongside `_traces_to_length_input` to recognize the
+        `torch.arange(T) < length`-style length-validity comparison pattern (see the "less" op_type
+        translation below) -- deliberately walks a SMALL, conservative set of ops (never arithmetic),
+        since anything beyond a pure alias/broadcast would mean this var is no longer just "the position
+        index," which is the one thing this check needs to be sure of.
+        """
+        if _seen is None:
+            _seen = set()
+        if depth > 8 or var is None or not isinstance(var, Var) or id(var) in _seen:
+            return False
+        _seen.add(id(var))
+        if var.op is None:
+            return False
+        if var.op.op_type == "range_1d":
+            return True
+        if var.op.op_type in ("cast", "reshape", "expand_dims", "squeeze", "identity", "tile"):
+            for v in var.op.inputs.values():
+                if isinstance(v, Var) and self._traces_to_range_1d(v, depth + 1, _seen):
+                    return True
+        return False
+
+    def _traces_to_length_input(self, var, depth=0, _seen=None):
+        """
+        Backward-walks `var`'s producer chain through arithmetic/passthrough ops, returning True iff it
+        reaches the graph's own declared "length" INPUT directly (a genuine function input with no
+        producer, named "length"). Used alongside `_traces_to_range_1d` to recognize the
+        `torch.arange(T) < length`-style length-validity comparison pattern -- see the "less" op_type
+        translation below for why this pattern's result is always-true for this exporter's target use
+        case (single-utterance, no real padding), regardless of whatever arithmetic chain computed the
+        comparison's actual bound. Walks a broader op set than `_traces_to_range_1d` (real arithmetic is
+        expected here -- NeMo's own `calc_length()`-style formula), checking every Var-typed input of a
+        walkable op rather than specific named inputs, so it doesn't need to special-case `select`'s
+        `cond`/`a`/`b` vs. a binary op's `x`/`y`.
+        """
+        if _seen is None:
+            _seen = set()
+        if depth > 16 or var is None or not isinstance(var, Var) or id(var) in _seen:
+            return False
+        _seen.add(id(var))
+        if var.op is None:
+            return var.name == "length"
+        _WALKABLE = {
+            "cast", "reshape", "expand_dims", "squeeze", "identity", "select",
+            "add", "sub", "mul", "real_div", "floor_div", "equal", "not_equal",
+            "less", "greater", "less_equal", "greater_equal",
+        }
+        if var.op.op_type not in _WALKABLE:
+            return False
+        for v in var.op.inputs.values():
+            if isinstance(v, Var) and self._traces_to_length_input(v, depth + 1, _seen):
+                return True
+        return False
+
     def _try_derive_gather_shape_value(self, var):
         """
         If `var` is exactly `gather(shape(real_tensor), index)` with a constant `index`, derive its
@@ -2804,6 +2861,55 @@ class LoomGGUFExporter:
                     "attrs": {"s0": s0}
                 })
                 continue
+
+            if op_type == "less":
+                # Recognize NeMo-style length-validity masking (`torch.arange(T) < length`, comparing a
+                # bare position index against a value derived from the graph's own "length" input) and
+                # bake its result as a constant all-true (1.0) tensor instead of translating the real
+                # comparison -- rather than a shape-derivation fix, this sidesteps a genuine, deeply
+                # rooted correctness bug in the traced MIL graph itself: NeMo's own `calc_length()`
+                # formula (used to compute the comparison's RHS bound) traces with a wrong constant baked
+                # in for `all_paddings` (confirmed directly by reading the exported GGUF's own stored
+                # weight values and reconstructing the exact arithmetic: `all_paddings - kernel_size`
+                # computes as `1 - 3` instead of the real `2 - 3`, since coremltools' own optimizer had
+                # ALSO already eliminated every standalone `torch.floor()` call in this chain as a
+                # provable no-op for the specific dummy trace length used -- confirmed via `grep`, there
+                # are zero raw `FLOOR` ops anywhere in the exported topology -- so the wrong constant
+                # can't be fixed by recovering a dropped floor, the arithmetic itself is wrong). See
+                # BACKLOG.md for the full derivation.
+                #
+                # Rather than reverse-engineer and re-derive NeMo's exact (buggy-under-tracing) formula,
+                # this exploits an invariant this WHOLE exporter already assumes everywhere else (the
+                # always-1 batch axis, the "single utterance" driver-script shape): every model this
+                # exporter targets is run with `length` set to the REAL, exact length of `waveform` --
+                # there is never any actual padding. Under that guarantee, `torch.arange(T) < length` is
+                # true for every position BY CONSTRUCTION (T is itself derived from that same real
+                # length), regardless of what value NeMo's own traced arithmetic computes for the
+                # comparison's RHS. Scoped narrowly (only "less", the one comparison op actually seen in
+                # this exact idiom) rather than every comparison type, matching this file's own
+                # "not implemented since nothing here has needed it yet" convention -- extend if/when a
+                # different comparison op is found doing the same thing.
+                x_var = op.inputs.get("x")
+                y_var = op.inputs.get("y")
+                x_is_range = isinstance(x_var, Var) and self._traces_to_range_1d(x_var)
+                y_is_range = isinstance(y_var, Var) and self._traces_to_range_1d(y_var)
+                x_is_length = isinstance(x_var, Var) and self._traces_to_length_input(x_var)
+                y_is_length = isinstance(y_var, Var) and self._traces_to_length_input(y_var)
+                if (x_is_range and y_is_length) or (y_is_range and x_is_length):
+                    out_info = self.get_var_info(op.outputs[0])
+                    target_shape = list(out_info["shape"])
+                    rank = len(target_shape)
+                    weight_name = self.safe_name(op.outputs[0].name) + "_always_valid_scalar"
+                    namespaced_name = (weight_name if (func_name == "main_topo" or self.profile == "monolithic")
+                                        else f"{func_name}.{weight_name}")
+                    self.weights[namespaced_name] = np.full([1] * rank, 1.0, dtype=np.float32)
+                    nodes.append({
+                        "op": "REPEAT",
+                        "inputs": [namespaced_name],
+                        "outputs": [self.safe_name(op.outputs[0].name)],
+                        "attrs": {"shape": target_shape}
+                    })
+                    continue
 
             if op_type in ("random_normal", "random_uniform", "random_bernoulli", "random_categorical"):
                 # EXPORT-IMPROVEMENT-BACKLOG.md item 4: ggml has no RNG-capable compute op at all (no
