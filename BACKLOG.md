@@ -286,13 +286,113 @@ SupertonicTTS, StyleTTS2.
   `test_e2e_conformer_ctc_dynamic_length` both pass end-to-end (max logit abs diff <= 1e-3) against
   regenerated fixtures, and the fixed mel features were independently confirmed to match the real
   `nemo_asr` preprocessor's actual output to ~1e-6 (float32 rounding only).
-- **Parakeet, VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS/Kokoro/Matcha-TTS/
-  SupertonicTTS are plausible but unproven — their two historical showstoppers (STFT/ISTFT, and LSTM) were
-  exactly what got generalized into the MIL exporter as follow-up work, and their iterative bits (flow
-  reverse-steps, Euler CFM, RNG-fed sampling) are fixed-depth, so should trace as one static graph with
-  noise supplied as an input tensor. StyleTTS2 is the one likely to stay bespoke — its diffusion sampler's
-  ~3e-3 residual mismatch persisted even with hand-matched float32 host math, and an auto-traced version
-  gives less control to chase that kind of thing down.
+- **Parakeet-TDT (encoder only) — DONE and numerically verified.** `export_parakeet_tdt_mil.py` traces
+  the REAL `nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel`'s preprocessor + FastConformer
+  `ConformerEncoder` directly (the same MIL-tracing approach as Conformer-CTC-small; the LSTM prediction
+  network + joint network + greedy TDT search loop stay as the existing hand-derived small topologies /
+  `TdtDecoder` C++ driver — autoregressive host-side control flow, not something a static traced graph can
+  express, same split as every other ASR/LLM model in this project). Verified against
+  `tools/convert_nemo/reference_forward_parakeet_tdt.py`'s independent hand-rolled reference at the real
+  `nvidia/parakeet-tdt-0.6b-v3` checkpoint (`test_e2e_parakeet_tdt_mil_export.cpp`, max abs diff 0.092 at
+  the encoder output, tolerance 0.12 — see that test's own tolerance comment for the STFT-precision
+  reasoning below). `CONV_2D_DW` (already existed for Conformer-CTC's own depthwise pointwise convs) needed
+  zero changes to support FastConformer's real `dw_striding` subsampling; the exporter's existing
+  groups>1-detection in its generic `conv` translation already mapped it correctly.
+
+  Finding this real, working end-to-end took one genuine, general exporter bug fix (in
+  `tools/loom_mil_compiler/exporter.py`, applies to every model using this exporter, not just Parakeet):
+
+  **The `less`-bypass heuristic (originally added for Conformer-CTC-small's `calc_length`/`all_paddings`
+  tracing bug, see above) was too aggressive and silently corrupted a DIFFERENT, semantically-real NeMo
+  masking pattern that happens to share the exact same `arange(T) < f(length)` shape.** Real NeMo's mel
+  frontend (`nemo/collections/asr/parts/preprocessing/features.py`'s `FilterbankFeatures.forward`/
+  `normalize_batch`, traced for REAL here — unlike Conformer-CTC-small's own MIL export, which was never
+  numerically verified until this session and so never caught this) deliberately treats the LAST STFT frame
+  as invalid (the same "last frame always invalid" convention already root-caused and hand-replicated in
+  `convert_conformer_ctc.py`/`convert_parakeet_tdt.py`'s own `valid_frames_expr()`) — this is NOT a tracing
+  artifact, it's intentional, and the old bypass logic forced it to always-valid anyway because it couldn't
+  tell "these two sides are the same quantity, safe to force-equal" (the genuine `calc_length` tracing bug)
+  apart from "these two sides are DELIBERATELY different quantities" (CMVN's `T` vs. `T-1`). Fixed by adding
+  a real identity check before bypassing: derive BOTH sides' real symbolic formulas (the range's own length
+  via the existing `range_1d` case of `_infer_dynamic_dim_expr`; the length-side's real formula via a new,
+  more general `_resolve_scalar_expr` extension — added `select`/`where` handling, taking the "b"/false
+  branch per this exporter's own "real audio is never the degenerate edge case" convention, plus a base
+  case resolving the bare `"length"` input itself to `"n_tokens"`) and compare them AS STRINGS; only bypass
+  when they're identical. Verified end to end: the mel-frontend's own last-frame zeroing is now correctly
+  preserved (confirmed via a standalone preprocessor-only debug export: last frame exactly `0.0`, matching
+  `compute_mel_features()`; per-frame diff elsewhere ~0.01–0.02, attributed to coremltools' OWN
+  `complex_stft` MIL lowering computing the DFT phase matrix in fp32 arithmetic throughout — see
+  `lower_complex_dialect_ops.py`'s `_calculate_dft_matrix`, `cos(2*pi*i*j/n_fft)` computed at fp32 with
+  angles up to ~3200 radians for `n_fft=512` — vs. `mel_common.py`'s own kernels, built once in float64 and
+  only rounded to fp32 at the final GGUF weight write). Full `ctest` clean, zero regressions (LFM2's own
+  MIL export re-verified byte-exact).
+
+  **Known follow-up, NOT yet fixed, and NOT a masking-bypass issue (that hypothesis was investigated and
+  DISPROVEN — see below) — found by re-testing Conformer-CTC-small's own MIL export with this same fix
+  (previously never numerically verified at all, since no test compared its output against a reference):**
+  a real, separate bug in the SECOND `CONV_2D` subsampling stage (the plain, non-depthwise, 176→176-channel,
+  `kernel=3`/`stride=2` conv — NOT present in Parakeet-TDT's own `dw_striding` subsampling, whose second/
+  third stages are depthwise `CONV_2D_DW` + 1×1 pointwise `CONV_2D`, both already proven correct). Isolated
+  by exporting progressively smaller debug wrappers (`preprocessor`-only, then `preprocessor+pre_encode`,
+  then just the two raw `conv[0..3]` Sequential layers, bypassing `pre_encode`'s own linear projection) and
+  diffing against real NeMo's own eager (non-traced) intermediate activations (captured via
+  `register_forward_hook` on `pre_encode.conv[0]`/`conv[2]`, confirming the exact `unsqueeze(1)`/reshape
+  NeMo applies before the first `Conv2d` — this ruled out a mistake in the hand reference, not just the
+  export). The corruption is present immediately after the second `conv[2]`+ReLU (`(176,17,20)` tensor,
+  BEFORE `pre_encode.out`'s linear/xscale): only 23 of 176 output channels match exactly (diff `< 1e-5`),
+  the rest differ substantially (up to ~30, with no obvious channel-index pattern — not every-Nth, not a
+  clean group/offset relationship) — a real correctness bug in `CONV_2D`'s translation or the underlying
+  `ggml` primitive specifically for a MULTI-CHANNEL (`in_channels>1`), non-1×1-kernel, strided conv (the one
+  conv-shape combination this project's tests hadn't previously exercised: every other real model's
+  multi-channel convs are either depthwise or 1×1 pointwise). Root cause not yet found — the two hypotheses
+  ruled out (masking-bypass classification: disproven by forcing every "less" op to bypass and re-testing,
+  which changed the observed diff by <10%, not the ~2 orders of magnitude a masking fix would imply; a
+  stale reference fixture: also ruled out, `ref/` was regenerated fresh and the divergence persists
+  unchanged) leave the conv/primitive translation itself as the remaining suspect. Reproduce via a debug
+  wrapper calling `pre_encode.conv[0](processed_signal.transpose(1,2).unsqueeze(1))` through `conv[3]`
+  (skip `pre_encode.out`/`pos_enc`/the 16 conformer layers entirely) exported through this same MIL path,
+  diffed against real NeMo's own eager forward (via forward hooks, not a hand reimplementation) at the same
+  stage.
+
+  **The masking-bypass hypothesis was investigated in real depth before being disproven — worth recording
+  so it isn't re-investigated from scratch.** NeMo's real `ConvSubsampling.__init__` sets
+  `subsampling_conv_chunking_factor=1` by default (not `-1`) and always builds `self.conv =
+  MaskedConvSequential(*layers)` (`nemo/collections/asr/parts/submodules/subsampling.py`), which — for a
+  small, unchunked trace — DOES apply real per-stage masking (`_create_mask`/`apply_channel_mask` after each
+  strided conv layer). Deriving the exact symbolic formulas for these masks (via `_infer_dynamic_dim_expr`/
+  `_resolve_scalar_expr`) and evaluating them at several concrete probe lengths showed the per-stage
+  comparison is *usually* (but not always — it depends on parity, since it's propagating the mel frontend's
+  own "true frame count minus one" length one level deeper through an integer-halving conv) off by exactly
+  1 from the tensor's own true shape — structurally the SAME kind of "T vs T-1" relationship as the CMVN
+  case this session's actual fix correctly preserves, not the encoder's OWN separate, provably-always-a-
+  tracing-artifact `calc_length`/`all_paddings` bug. This made a real case for NOT bypassing these either —
+  but forcibly bypassing them anyway (as an experiment) barely moved the numeric result, conclusively
+  proving they are NOT the source of this bug and don't need their own special-cased treatment right now.
+
+  **Also found and fixed in the process (unrelated, general project hygiene, not an exporter bug):** the
+  `ref/` fixtures under `/home/flavio/.claude/tmp/{conformer_ctc,parakeet_tdt}_model/` were stale, generated
+  2026-07-18 — BEFORE the 2026-07-24 mel-frontend CMVN off-by-one fix (commit `482a559`) — so comparing a
+  freshly-exported model against them was comparing against outdated expected values. Regenerate via
+  `tools/convert_nemo/reference_forward_{conformer,parakeet_tdt}.py` any time a mel-frontend/preprocessing
+  fix lands, not just once at fixture-creation time.
+
+- **Parakeet-RNNT (`nvidia/parakeet-rnnt-0.6b`, encoder only) — DONE and numerically verified**, confirming
+  the CONV_2D bug above is genuinely scoped to Conformer-CTC-small's plain "striding" subsampling only:
+  `export_parakeet_rnnt_mil.py` (near-identical to `export_parakeet_tdt_mil.py`) exported and verified
+  cleanly on the first real run, no new exporter issues. `test_e2e_parakeet_rnnt_mil_export.cpp`: max abs
+  diff 1.135 (tolerance 1.3) against `reference_forward_parakeet_rnnt.py` — isolated (same preprocessor-
+  only debug-export technique as Parakeet-TDT's own tolerance derivation) to the same ~0.01–0.05 STFT
+  fp32-precision noise, amplified considerably more than Parakeet-TDT's own ~0.09 by this checkpoint's real
+  `xscale=32.0` (Parakeet-TDT has none) before any per-layer LayerNorm can renormalize it. Full `ctest`
+  clean, zero regressions.
+- **VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started, unaffected by any of the above** (none
+  of them touch NeMo's ASR preprocessing/masking/subsampling machinery at all). Plausible but unproven —
+  their two historical showstoppers (STFT/ISTFT, and LSTM) were exactly what got generalized into the MIL
+  exporter as follow-up work, and their iterative bits (flow reverse-steps, Euler CFM, RNG-fed sampling) are
+  fixed-depth, so should trace as one static graph with noise supplied as an input tensor. StyleTTS2 is the
+  one likely to stay bespoke — its diffusion sampler's ~3e-3 residual mismatch persisted even with
+  hand-matched float32 host math, and an auto-traced version gives less control to chase that kind of thing
+  down.
 
 The real tradeoff: doing this would replace ~10 hand-verified conversion scripts with one generic path, but
 trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it
