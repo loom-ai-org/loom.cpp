@@ -957,6 +957,36 @@ target_link_libraries(test_e2e_supertonic_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_lua_driver COMMAND test_e2e_supertonic_lua_driver)
 set_tests_properties(test_e2e_supertonic_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Numerical-correctness checks for the MIL-traced SupertonicTTS topologies (export_supertonic_mil.py,
+#     part of supertonic_mil.gguf) against real-module reference fixtures. Skips cleanly if env vars
+#     aren't set. ---
+add_executable(test_e2e_supertonic_mil_dp test_e2e_supertonic_mil_dp.cpp)
+target_link_libraries(test_e2e_supertonic_mil_dp PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_dp COMMAND test_e2e_supertonic_mil_dp)
+set_tests_properties(test_e2e_supertonic_mil_dp PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_supertonic_mil_ttl_text test_e2e_supertonic_mil_ttl_text.cpp)
+target_link_libraries(test_e2e_supertonic_mil_ttl_text PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_ttl_text COMMAND test_e2e_supertonic_mil_ttl_text)
+set_tests_properties(test_e2e_supertonic_mil_ttl_text PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_supertonic_mil_vfe test_e2e_supertonic_mil_vfe.cpp)
+target_link_libraries(test_e2e_supertonic_mil_vfe PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_vfe COMMAND test_e2e_supertonic_mil_vfe)
+set_tests_properties(test_e2e_supertonic_mil_vfe PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_supertonic_mil_decoder test_e2e_supertonic_mil_decoder.cpp)
+target_link_libraries(test_e2e_supertonic_mil_decoder PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_decoder COMMAND test_e2e_supertonic_mil_decoder)
+set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Full end-to-end check: the MIL-traced topologies wired via supertonic_driver_mil.lua, compared
+#     against the existing bespoke loom::SupertonicDriver oracle. Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_supertonic_mil_lua_driver test_e2e_supertonic_mil_lua_driver.cpp)
+target_link_libraries(test_e2e_supertonic_mil_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_lua_driver COMMAND test_e2e_supertonic_mil_lua_driver)
+set_tests_properties(test_e2e_supertonic_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Procedural generalization: Matcha-TTS's deterministic Euler-ODE (CFM) sampling loop + real
 #     per-token duration expansion, ported to Lua (tools/convert_matcha/matcha_driver.lua) and compared
 #     against the existing loom::MatchaDriver on the real checkpoint. See
