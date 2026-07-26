@@ -1,3 +1,4 @@
+from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.operation import Operation
 from coremltools.converters.mil.mil.input_type import InputSpec, TensorInputType
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
@@ -10,11 +11,15 @@ class loom_fused_attention(Operation):
     Specialized Loom dynamic attention primitive.
     """
     input_spec = InputSpec(
-        q=TensorInputType(),
-        k=TensorInputType(),
-        v=TensorInputType(),
-        mask=TensorInputType(optional=True)
+        q=TensorInputType(type_domain="T"),
+        k=TensorInputType(type_domain="T"),
+        v=TensorInputType(type_domain="T"),
+        mask=TensorInputType(optional=True, type_domain="T"),
     )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+    }
 
     def type_inference(self):
         return self.q.sym_type
@@ -22,14 +27,19 @@ class loom_fused_attention(Operation):
 @register_op(namespace="loom")
 class loom_spline(Operation):
     """
-    Specialized Loom rational-quadratic spline inverse.
+    Specialized Loom rational-quadratic spline inverse (VITS's StochasticDurationPredictor/ConvFlow).
+    See tools/loom_mil_compiler/vits_spline_op.py for the torch-level custom op bridged into this.
     """
     input_spec = InputSpec(
-        x=TensorInputType(),
-        w=TensorInputType(),
-        h=TensorInputType(),
-        d=TensorInputType()
+        x=TensorInputType(type_domain="T"),
+        w=TensorInputType(type_domain="T"),
+        h=TensorInputType(type_domain="T"),
+        d=TensorInputType(type_domain="T"),
     )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+    }
 
     def type_inference(self):
         return self.x.sym_type
@@ -40,9 +50,14 @@ class loom_rope(Operation):
     Specialized Loom Rotary Position Embedding (RoPE) operation.
     """
     input_spec = InputSpec(
-        x=TensorInputType(),
-        pos=TensorInputType()
+        x=TensorInputType(type_domain="T"),
+        pos=TensorInputType(type_domain="U"),
     )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+        "U": (types.int32, types.fp32),
+    }
 
     def type_inference(self):
         return self.x.sym_type
