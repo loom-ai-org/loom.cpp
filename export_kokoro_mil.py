@@ -1,22 +1,41 @@
 #!/usr/bin/env python3
 """
-WORK IN PROGRESS -- exports ONLY the "decoder_vocoder" phase so far (Decoder.encode/decode +
-SineGen + STFT + Generator, the single riskiest/most error-prone chunk of Kokoro, per
-tools/convert_kokoro/convert_kokoro_{decoder_core,sinegen,stft,generator}.py's own bespoke
-counterparts -- this MIL trace replaces all four of those in one combined topology). Traces the REAL
-kokoro.istftnet.Decoder module directly. Structurally verified end-to-end: builds AND computes a
-finite waveform for a real, tiny dummy T (see tests/test_e2e_kokoro_mil_decoder_vocoder_smoke.cpp) --
-NOT yet numerically verified against a real reference (none exists for this phase yet). NOT yet done:
-CustomAlbert+bert_encoder MIL phase, duration_predictor/text_encoder/f0n LSTM-bound pieces (reuse the
-existing bespoke GGUFs -- LSTM has no ggml-native op, see tools/loom_mil_compiler/recurrent.py), a
-combined kokoro_driver_mil.lua, and that numerical verification. See BACKLOG.md for the full status
-and the many real, general exporter/primitive bugs this phase surfaced (instance_norm, depthwise
-CONV_TRANSPOSE composition, ATAN, INTERPOLATE_1D/upsample dynamic-dim tracking, CUMSUM, scalar-weight
-GGUF serialization, get_var_info's gating overhaul, the `symbol_overrides` mechanism for topologies
-with more than one independently-varying dynamic input, and -- the one that took longest to root-cause
--- `ggml_is_contiguous()` vacuously passing a permuted tensor with `ne[0]==1`, silently corrupting
-every elementwise binary/unary primitive's own contiguity guard until replaced with a stricter
-`ensure_packed()` check across primitives_basic.cpp/primitives_mil.cpp).
+Exports Kokoro-82M's two LSTM-free phases through the generic MIL exporter, into ONE combined
+kokoro_mil.gguf alongside the embedded kokoro_driver_mil.lua orchestration script:
+  - "albert_bert_encoder": CustomAlbert (a real transformers.AlbertModel) + bert_encoder (Linear(768,512))
+    -- replaces convert_kokoro_albert.py + convert_kokoro_bert_encoder.py's two hand-built topologies.
+  - "decoder_vocoder": Decoder.encode/decode + SineGen + STFT + Generator -- replaces FOUR bespoke
+    scripts, convert_kokoro_{decoder_core,sinegen,stft,generator}.py, in one combined trace.
+Kokoro leans heavily on `torch.nn.LSTM` elsewhere (TextEncoder, DurationEncoder, predictor.lstm,
+F0Ntrain's shared LSTM) -- ggml has no native LSTM op, so those pieces are a deliberate scoping
+exclusion: kokoro_driver_mil.lua wires these two MIL-traced topologies together with the EXISTING
+bespoke, hand-built LSTM-bound topologies (tools/convert_kokoro/convert_kokoro_lua_all.py's own
+kokoro.gguf), not a full re-trace of the whole model.
+
+Both phases numerically verified against real-checkpoint references
+(tools/convert_kokoro/reference_forward_kokoro_{albert_bert_encoder_mil,decoder_vocoder_mil}.py):
+albert_bert_encoder to ~1.8e-6 mean/~1.5e-5 max abs diff; decoder_vocoder to ~5.1e-4 mean/~2.5e-2 max abs
+diff (see test_e2e_kokoro_mil_decoder_vocoder_reference.cpp's own comments for why the looser max bound
+-- a real, bounded, HiFi-GAN-vocoder amplification ceiling, same category as StyleTTS2's own documented
+one, not a further-fixable bug). Getting both phases to trace/build/compute at all surfaced the usual
+long tail of general (not Kokoro-specific) exporter/primitive bugs -- see BACKLOG.md for the full trail
+-- but TWO were only caught by this numerical-verification pass specifically (structural verification
+alone, i.e. "builds and produces a finite waveform," did not, and would not, catch either):
+  - `op_sub`'s scalar-broadcast shortcut (`SUB(a,b)` with `nelements(a)==1 < nelements(b)`) computed
+    `ggml_neg(b)` unconditionally -- correct ONLY for the `(0.0 - b)` idiom it was named after, silently
+    WRONG (dropping `a` entirely) for any other nonzero scalar `a`. First hit by HF's ubiquitous
+    `1.0 - mask` attention-masking idiom (CustomAlbert's own `get_extended_attention_mask`). Fixed
+    generally in src/ops/primitives_basic.cpp: explicitly REPEAT the smaller operand before subtracting,
+    valid for any value.
+  - coremltools' own `torch.atan2(y,x)` decomposition (NOT MIL's fused `atan2` op -- for this model it
+    traces to a plain `atan(y/x)` op plus a manually-composed quadrant correction) has a real gap: it
+    covers the x<0 case's y>0/y<0 STRICT branches but not the y==0,x<0 boundary (real
+    `atan2(0.0,-1)==+pi`; the decomposition silently returns 0). `VerifiedSTFT.transform`'s own
+    `im = im_raw - im_raw*boundary_mask` (zeroing the imaginary part at DC/Nyquist bins, matching real
+    torch.stft) produces exactly this trigger condition at ~5.9% of all phase elements in one real trace
+    -- fixed by nudging to a tiny positive epsilon instead of an exact 0.0 (see `boundary_eps`'s own
+    comment below for the full reasoning and confirmation that `im` is always +0.0-derived here, never
+    -0.0).
 
 Usage:
   ~/.venvs/piper/bin/python3 export_kokoro_mil.py
@@ -137,7 +156,29 @@ class VerifiedSTFT(torch.nn.Module):
         x = waveform.unsqueeze(1)
         re = F.conv1d(x, self.cos_k, bias=None, stride=self.hop, padding=0)
         im_raw = F.conv1d(x, self.neg_sin_k, bias=None, stride=self.hop, padding=0)
-        im = im_raw - im_raw * self.boundary_mask  # exact +0.0 at DC/Nyquist bins, matching real torch.stft
+        # +boundary_eps (not exact +0.0) at DC/Nyquist bins, PLUS a uniform tiny positive nudge
+        # everywhere else -- still matches real torch.stft's own convention (a purely-real DC/Nyquist
+        # bin, im "=0") to float32 precision, but sidesteps a genuine coremltools bug: torch.atan2(y,x)
+        # traces (for THIS model) not to MIL's fused `atan2` op but to `atan(y/x)` plus a manually-
+        # composed quadrant correction (GREATER/LESS-based additive +-pi/+-pi/2 terms) that only covers
+        # the y>0/y<0 STRICT branches for the x<0 case -- omitting the y==0, x<0 boundary entirely (real
+        # atan2(0.0,-1)=+pi; this decomposition silently returns 0 instead, confirmed via a standalone
+        # MIL-op-level probe). `im_raw - im_raw*mask` at the boundary bins produces an EXACT 0.0 im (any
+        # real x satisfies x-x=+0.0 under round-to-nearest) -- the FIRST, most reliably reproduced trigger
+        # (confirmed: ~5.9% of all phase elements in one real trace) -- but real (non-boundary) `im_raw`
+        # can ALSO land on exactly 0.0 by coincidence for sufficiently periodic/structured content (first
+        # caught end-to-end, not by the boundary-only fix above: a real predicted F0/asr fixture produced
+        # a short but violent ~40-sample resonance burst, up to ~17x the signal's own typical amplitude,
+        # traced to exactly this same atan2 gap firing at a NON-boundary bin). Nudging `im` uniformly (not
+        # just at the boundary positions) closes both cases -- the epsilon is physically negligible
+        # (float32-representable, ~1e-20 against real STFT magnitudes of ~1e-3 to 10) and only changes
+        # the OUTCOME for values already at or below float32's own precision floor, matching real atan2's
+        # "+0.0 treated as the positive side" convention (confirmed: torch.atan2(0.0,-1.0)=+pi,
+        # torch.atan2(-0.0,-1.0)=-pi -- this project's im is always +0.0-derived, never -0.0, at the
+        # boundary bins; genuinely negative real im near zero elsewhere is far larger in magnitude than
+        # this epsilon and keeps its own true sign).
+        boundary_eps = 1e-20
+        im = im_raw - im_raw * self.boundary_mask + self.boundary_mask * boundary_eps + boundary_eps
         mag = torch.sqrt(re ** 2 + im ** 2)
         phase = torch.atan2(im, re)
         return mag, phase
@@ -168,9 +209,17 @@ def _f02sine_traceable(self, f0_values, rand_ini):
     eager-mode rank is always 4) -- a real, narrow coremltools shape-propagation gap, not a rank bug in
     this code. Verified bit-level equivalent to the original (dim=1 cumsum on a rank-3 tensor) up to
     cumsum's own floating-point reduction-order noise (~6e-5 abs, from summing along a different axis
-    -- non-associativity of float addition, not a logic difference).
+    -- non-associativity of float addition, not a logic difference). (4) `% 1` replaced with the
+    algebraically identical `x - floor(x)` -- a genuine coremltools frontend bug, not this project's
+    exporter: `torch.remainder(x, 1)` (`x % 1` on a tensor with divisor Python-int 1) traces to a raw
+    MIL `sub(x, x)` (always exactly 0!), confirmed by reading the raw traced MIL ops directly -- looks
+    like coremltools' own `remainder` lowering computes `x - floor_divide(x,y)*y` but short-circuits
+    `floor_divide(x,1)` to plain `x` (a valid `real_div`-by-1 optimization, invalid for `floor_divide`,
+    which must still floor). First caught by this exact line collapsing SineGen's entire phase signal to
+    a constant, verified via a standalone MIL-op-level probe before writing this workaround.
     """
-    rad_values = (f0_values / self.sampling_rate) % 1
+    rad_values = (f0_values / self.sampling_rate)
+    rad_values = rad_values - torch.floor(rad_values)
     rand_ini_full = torch.cat([torch.zeros_like(rand_ini[:, :1]), rand_ini[:, 1:]], dim=1)
     rad0 = rad_values[:, 0, :] + rand_ini_full
     rad_values = torch.cat([rad0.unsqueeze(1), rad_values[:, 1:, :]], dim=1)  # (B,L,dim)
@@ -274,6 +323,69 @@ def _decoder_forward_traceable(self, asr, F0_curve, N, s, rand_ini, noise_in, ws
 Decoder.forward = _decoder_forward_traceable
 
 
+class AlbertBertEncoderWrapper(torch.nn.Module):
+    """Traces CustomAlbert (KModel.bert, a real transformers.AlbertModel returning last_hidden_state)
+    + bert_encoder (plain Linear(768,512)) as ONE combined topology, replacing
+    convert_kokoro_albert.py + convert_kokoro_bert_encoder.py's two hand-built graphs. Real call site
+    (model.py's forward_with_tokens): `bert_dur = self.bert(input_ids, attention_mask=(~text_mask)
+    .int()); d_en = self.bert_encoder(bert_dur).transpose(-1,-2)`. `attention_mask` is always all-ones
+    here (real usage is always a single, unpadded utterance -- same "no real masking" convention
+    convert_kokoro_albert.py's own docstring already established for the bespoke topology), so it's
+    synthesized in-graph from input_ids' own dynamic shape rather than declared as a separate input.
+
+    Deliberately does NOT apply the real code's own final `.transpose(-1,-2)`: a bare permute as a
+    traced graph's own declared OUTPUT is a live, non-contiguous view that this exporter's raw
+    contiguous byte copy would silently read in PRE-permute order (the exact bug export_vits_mil.py's
+    own StatsWrapper docstring found and worked around for VITS's `stats` output). Returns the natural
+    (T,512) time-major layout instead (ggml ne=[512,T], flat[t*512+c] -- kokoro_driver.lua's own
+    "row_major" convention) -- kokoro_driver_mil.lua converts to per-timestep rows via
+    `from_row_major`, no transpose needed on the Lua side either.
+    """
+
+    def __init__(self, bert, bert_encoder):
+        super().__init__()
+        self.bert = bert
+        self.bert_encoder = bert_encoder
+
+    def forward(self, input_ids):
+        attention_mask = torch.ones_like(input_ids)
+        # Explicit all-zeros token_type_ids, matching the real code's own default -- but passed
+        # explicitly rather than left None. When None, AlbertEmbeddings.forward derives it from a
+        # REGISTERED BUFFER via `self.token_type_ids[:, :seq_length].expand(input_shape[0], seq_length)`,
+        # which MIL traces as a `slice_by_index` feeding a `tile` op whose `reps` is itself a runtime-
+        # computed ratio (not a compile-time constant) -- a real exporter bug (a SECOND `get_var_info`
+        # lookup of that slice's own output resolves its dynamic axis to the WRONG symbol, observed
+        # concretely producing a bogus target shape of 512 -- bert_encoder's hidden_dim, from a totally
+        # unrelated later op -- instead of n_tokens) not worth root-causing here since the real
+        # `AlbertEmbeddings.forward` already supports this exact bypass as a first-class argument.
+        token_type_ids = torch.zeros_like(input_ids)
+        bert_dur = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        d_en = self.bert_encoder(bert_dur)  # (1,T,512) -- NOT .transpose(-1,-2), see class docstring
+        return d_en.reshape(d_en.shape[1], d_en.shape[2])  # (T,512)
+
+
+def build_albert_bert_encoder_topology(bert, bert_encoder, dummy_t=7, vocab_size=178):
+    """Traces AlbertBertEncoderWrapper and runs it through the exporter, mirroring
+    build_decoder_vocoder_topology's own shape."""
+    wrapper = AlbertBertEncoderWrapper(bert, bert_encoder).eval()
+
+    dummy_input_ids = torch.randint(0, vocab_size, (1, dummy_t), dtype=torch.long)
+    with torch.no_grad():
+        wrapper(dummy_input_ids)  # eager sanity check before tracing
+
+    traced = torch.jit.trace(wrapper, (dummy_input_ids,))
+    seq = ct.RangeDim(1, 2000)
+    mil_inputs = [ct.TensorType(name="tokens", shape=(1, seq), dtype=np.int32)]
+    prog = ct.convert(traced, inputs=mil_inputs, convert_to="milinternal",
+                       compute_precision=ct.precision.FLOAT32)
+    main_func = prog.functions["main"]
+
+    exporter = LoomGGUFExporter(prog)
+    topo = exporter.generate_graph_topology(main_func, "albert_bert_encoder")
+    print(f"  albert_bert_encoder: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
+    return topo, exporter.weights
+
+
 class DecoderVocoderWrapper(torch.nn.Module):
     def __init__(self, decoder):
         super().__init__()
@@ -360,14 +472,31 @@ def main():
     model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=CKPT_PATH, disable_complex=True)
     model.eval()
 
-    print("Tracing decoder_vocoder phase...")
-    topo, weights = build_decoder_vocoder_topology(model.decoder)
+    print("Tracing albert_bert_encoder phase...")
+    albert_topo, albert_weights = build_albert_bert_encoder_topology(model.bert, model.bert_encoder)
 
-    out_exporter = LoomGGUFExporter(None, output_path="kokoro_decoder_vocoder_mil.gguf",
-                                     architecture="loom-kokoro-decoder-vocoder-mil")
-    out_exporter.topologies = {"decoder_vocoder": topo}
-    out_exporter.weights = weights
-    out_exporter.write_gguf("")  # no driver script yet -- see module docstring for remaining work
+    print("Tracing decoder_vocoder phase...")
+    dv_topo, dv_weights = build_decoder_vocoder_topology(model.decoder)
+
+    # Weight names are namespaced per-phase by each build_* function's own module prefixes (e.g.
+    # "bert.*" vs. the Decoder/Generator's own real state-dict-derived names) -- no collision expected,
+    # but merge with the same content-aware dedup-on-match/hard-fail-on-mismatch safety net
+    # convert_kokoro_lua_all.py's own `merge` already uses, rather than assuming it.
+    merged_weights = dict(albert_weights)
+    for k, v in dv_weights.items():
+        if k in merged_weights:
+            assert np.array_equal(merged_weights[k], v), \
+                f"real weight name collision merging decoder_vocoder weights: {k!r} has DIFFERENT values"
+            continue
+        merged_weights[k] = v
+
+    driver_script_path = Path(__file__).resolve().parent / "tools" / "convert_kokoro" / "kokoro_driver_mil.lua"
+
+    out_exporter = LoomGGUFExporter(None, output_path="kokoro_mil.gguf",
+                                     architecture="loom-kokoro-mil")
+    out_exporter.topologies = {"albert_bert_encoder": albert_topo, "decoder_vocoder": dv_topo}
+    out_exporter.weights = merged_weights
+    out_exporter.write_gguf(driver_script_path.read_text())
 
 
 if __name__ == "__main__":

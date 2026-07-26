@@ -2189,17 +2189,53 @@ class LoomGGUFExporter:
                 mode_var = op.inputs.get("mode")
                 mode = (mode_var.val if mode_var is not None and hasattr(mode_var, "val")
                         and mode_var.val is not None else "EXACT")
-                if str(mode).upper() not in ("EXACT", "NONE"):
+                x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+                if str(mode).upper() in ("EXACT", "NONE"):
+                    nodes.append({
+                        "op": "GELU",
+                        "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                        "outputs": [self.safe_name(op.outputs[0].name)],
+                    })
+                    continue
+                if str(mode).upper() not in ("TANH_APPROXIMATION", "TANH"):
                     raise NotImplementedError(
                         f"gelu op '{op.name}' has mode={mode!r} -- ggml's GELU primitive only computes "
-                        "the exact erf formula, not TANH/sigmoid approximations."
+                        "the exact erf formula; only EXACT and TANH_APPROXIMATION are composed here."
                     )
-                x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
-                nodes.append({
-                    "op": "GELU",
-                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
-                    "outputs": [self.safe_name(op.outputs[0].name)],
-                })
+                # HF's "gelu_new"/"NewGELUActivation" (0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))) --
+                # first hit by Kokoro's CustomAlbert (a real transformers.AlbertModel, hidden_act=
+                # "gelu_new"): coremltools' own "fuse_gelu_tanh_approximation" MIL pass recognizes that
+                # exact elementwise composition and folds it into one `gelu(mode=TANH_APPROXIMATION)` op,
+                # which ggml's GELU primitive can't compute (always the exact erf formula, chosen for
+                # reproducibility -- see the EXACT branch's own comment). Composed back out into the
+                # identical explicit SQR/SCALE/ADD/MUL/TANH sequence convert_kokoro_albert.py's own
+                # bespoke `gelu_new` helper already used for this exact formula, general (any TANH-
+                # approximate-GELU model hits this same fused op), not Albert-specific.
+                x_name = resolve(self.safe_name(x_var_obj.name))
+                out_name = self.safe_name(op.outputs[0].name)
+                one_name = "gelu_tanh_approx.one" if (func_name == "main_topo" or self.profile == "monolithic") \
+                    else f"{func_name}.gelu_tanh_approx.one"
+                if one_name not in self.weights:
+                    self.weights[one_name] = np.array([1.0], dtype=np.float32)
+                sqrt_2_over_pi = float(np.sqrt(2.0 / np.pi))
+                x_sq = f"{out_name}_gelu_sq"
+                nodes.append({"op": "SQR", "inputs": [x_name], "outputs": [x_sq]})
+                cube_term = f"{out_name}_gelu_cubeterm"
+                nodes.append({"op": "SCALE", "inputs": [x_sq], "outputs": [cube_term], "attrs": {"s": 0.044715}})
+                inner_add = f"{out_name}_gelu_inner_add"
+                nodes.append({"op": "ADD", "inputs": [cube_term, one_name], "outputs": [inner_add]})
+                inner_mul = f"{out_name}_gelu_inner_mul"
+                nodes.append({"op": "MUL", "inputs": [inner_add, x_name], "outputs": [inner_mul]})
+                inner_scaled = f"{out_name}_gelu_inner_scaled"
+                nodes.append({"op": "SCALE", "inputs": [inner_mul], "outputs": [inner_scaled],
+                               "attrs": {"s": sqrt_2_over_pi}})
+                tanh_out = f"{out_name}_gelu_tanh"
+                nodes.append({"op": "TANH", "inputs": [inner_scaled], "outputs": [tanh_out]})
+                tanh_p1 = f"{out_name}_gelu_tanh_p1"
+                nodes.append({"op": "ADD", "inputs": [tanh_out, one_name], "outputs": [tanh_p1]})
+                mul2 = f"{out_name}_gelu_mul2"
+                nodes.append({"op": "MUL", "inputs": [tanh_p1, x_name], "outputs": [mul2]})
+                nodes.append({"op": "SCALE", "inputs": [mul2], "outputs": [out_name], "attrs": {"s": 0.5}})
                 continue
 
             if op_type == "leaky_relu":
@@ -3722,7 +3758,33 @@ class LoomGGUFExporter:
                 x_val_obj = op.inputs.get("x") or op.inputs.get("params")
                 indices_val_obj = op.inputs.get("indices")
                 if x_val_obj and indices_val_obj:
-                    inputs = [resolve(self.safe_name(x_val_obj.name)), resolve(self.safe_name(indices_val_obj.name))]
+                    indices_name = resolve(self.safe_name(indices_val_obj.name))
+                    # An index Var traced through elementwise arithmetic (e.g. HF's `zeros_like(input_ids)`
+                    # idiom, which coremltools decomposes to `input_ids - input_ids` rather than a plain
+                    # fill) is NOT guaranteed to still be int-typed at the ggml level even though it's int
+                    # at the MIL level: this project's generic elementwise primitives (op_add/op_sub/...)
+                    # unconditionally `promote_i32_to_f32` BOTH operands before computing (see
+                    # primitives_basic.cpp), so an all-int32 SUB still produces an F32 result -- fed
+                    # straight into ggml_get_rows, which hard-asserts its index operand is GGML_TYPE_I32.
+                    # First hit by Kokoro's CustomAlbert (`token_type_ids = zeros_like(input_ids)`,
+                    # decomposed by coremltools to `input_ids - input_ids` rather than a plain fill) --
+                    # not Albert-specific, so this checks the PRODUCER's op_type, not the (unreliable --
+                    # MIL itself correctly types a `sub` of two int32 vars as int32; only THIS project's
+                    # own runtime compute silently loses that) declared MIL dtype. A block INPUT or a
+                    # `const`/weight producer is genuinely already int (GraphBuilder/GGUF both preserve
+                    # declared int dtypes outside of arithmetic), so only the known-promoting elementwise
+                    # op family needs the cast.
+                    producer_op_type = indices_val_obj.op.op_type if getattr(indices_val_obj, "op", None) is not None else None
+                    if producer_op_type in ("add", "sub", "mul", "div", "real_div", "floor_div", "pow"):
+                        cast_name = f"{self.safe_name(op.outputs[0].name)}_indices_i32"
+                        nodes.append({
+                            "op": "CAST",
+                            "inputs": [indices_name],
+                            "outputs": [cast_name],
+                            "attrs": {"dtype": "i32"},
+                        })
+                        indices_name = cast_name
+                    inputs = [resolve(self.safe_name(x_val_obj.name)), indices_name]
             elif mapped_op == "MUL_MAT":
                 # MUL_MAT strictly expects exactly 2 inputs: [x, y]
                 # Any other trailing transpose variables must be pruned.

@@ -555,7 +555,7 @@ SupertonicTTS, StyleTTS2.
   **Open, not yet done:** root-causing and fixing the bespoke `flow_vocoder` bug itself (or just retiring
   the bespoke topology/driver in favor of this one, given the correctness gap just found); deciding
   whether to keep the bespoke topology around at all afterward.
-- **Kokoro — IN PROGRESS.** Unlike every model MIL-exported so far, Kokoro leans heavily on
+- **Kokoro — DONE (2026-07-26).** Unlike every model MIL-exported so far, Kokoro leans heavily on
   `torch.nn.LSTM` (TextEncoder, DurationEncoder×3+AdaLayerNorm, `predictor.lstm`, F0Ntrain's shared
   LSTM) — ggml has no native LSTM op, and `generate_graph_topology` hard-fails on any traced `lstm`/
   `gru` MIL op (`recurrent.py`'s `build_lstm_cell_topologies` + a per-timestep host stepper is the only
@@ -743,14 +743,95 @@ SupertonicTTS, StyleTTS2.
   49671/49671 checks; `test_e2e_vits_mil_flow_vocoder_reference`: 7/7 checks) — the `ensure_packed`
   fixes are broad enough that a regression there would have been the most likely place to see one.
 
-  **Remaining for a complete Kokoro MIL export**: the CustomAlbert+bert_encoder MIL phase (no LSTM,
-  should be comparatively straightforward — a real transformer stack, same shape as Qwen3/LFM2's own
-  attention blocks); wiring the LSTM-bound bespoke `duration_predictor`/`text_encoder`/`f0n` GGUFs
-  together with the two new MIL phases via a new `kokoro_driver_mil.lua` (mirroring `kokoro_driver.lua`'s
-  own 9-stage orchestration, but with 2 of those stages replaced by single MIL calls); full numerical
-  verification against
-  `reference_forward_kokoro_*.py` (none exist yet for the decoder_vocoder phase) and a real end-to-end
-  driver test analogous to `test_e2e_vits_mil_lua_driver`.
+  **Update, 2026-07-26 (same day, completed): Kokoro's MIL export is DONE — both phases traced, built,
+  numerically verified, and wired into a working end-to-end driver.**
+
+  - **`albert_bert_encoder` phase added** (`AlbertBertEncoderWrapper` in export_kokoro_mil.py): traces
+    the REAL `model.bert` (a `transformers.AlbertModel`) + `model.bert_encoder` (`Linear(768,512)`) as
+    ONE combined topology, replacing `convert_kokoro_albert.py` + `convert_kokoro_bert_encoder.py`'s two
+    hand-built graphs. `attention_mask`/`token_type_ids` are synthesized in-graph from `input_ids`'s own
+    shape (`torch.ones_like`/`torch.zeros_like`) rather than declared as separate inputs — real usage is
+    always a single, unpadded utterance. Deliberately does NOT apply the real code's own final
+    `.transpose(-1,-2)` (the exact live-non-contiguous-view footgun `export_vits_mil.py`'s own
+    `StatsWrapper` already found for VITS's `stats` output) — returns the natural (T,512) time-major
+    layout instead; `kokoro_driver_mil.lua` converts via `from_row_major`, no transpose needed Lua-side
+    either. Verified against `reference_forward_kokoro_albert_bert_encoder_mil.py`
+    (`test_e2e_kokoro_mil_albert_bert_encoder_reference.cpp`): ~1.8e-6 mean / ~1.5e-5 max abs diff.
+  - **Three real, general (not Kokoro-specific) bugs found and fixed getting this phase to trace/build/
+    compute correctly**, none caught by structural verification alone:
+    1. HF's "gelu_new"/`NewGELUActivation` (the exact tanh-approximate GELU formula) gets fused by
+       coremltools' own `fuse_gelu_tanh_approximation` MIL pass into a `gelu(mode=TANH_APPROXIMATION)`
+       op, which ggml's GELU primitive can't compute (always the exact erf formula). Fixed in
+       `exporter.py`'s `gelu` handling: decompose TANH-mode `gelu` back into the identical explicit
+       SQR/SCALE/ADD/MUL/TANH sequence `convert_kokoro_albert.py`'s own bespoke `gelu_new` helper already
+       used for this formula.
+    2. A `GET_ROWS` index traced through elementwise arithmetic (HF's `zeros_like(input_ids)` idiom,
+       decomposed by coremltools to `input_ids - input_ids` rather than a plain fill) is int-typed at the
+       MIL level but NOT at the ggml level: this project's generic elementwise primitives
+       (`op_add`/`op_sub`/...) unconditionally `promote_i32_to_f32` both operands, so an all-int32 SUB
+       still produces an F32 result fed straight into `ggml_get_rows`, which hard-asserts I32. Fixed in
+       `exporter.py`: cast a `GET_ROWS` index to i32 whenever its PRODUCER op is one of the known-
+       promoting elementwise ops (checked by producer op_type, not the unreliable declared MIL dtype).
+    3. **`op_sub`'s own "scalar subtraction" shortcut was a real, general, silently-wrong bug**, found
+       chasing the fix above's own downstream consumer: `SUB(a,b)` with `nelements(a)==1 < nelements(b)`
+       computed `ggml_neg(b)` unconditionally — correct ONLY for the `(0.0 - b)` idiom it was named after,
+       silently WRONG (dropping `a` entirely) for ANY other nonzero scalar `a`. First hit by HF's
+       ubiquitous `1.0 - mask` attention-masking idiom (`get_extended_attention_mask`) — confirmed via a
+       from-scratch minimal hand-built topology reproduction (not just observed in the full graph) before
+       fixing. Fixed generally in `src/ops/primitives_basic.cpp`: explicitly `ggml_repeat` the smaller
+       operand up to the larger's shape first, then subtract — valid for any value, not just zero.
+  - **`decoder_vocoder` phase numerically verified** against
+    `reference_forward_kokoro_decoder_vocoder_mil.py` (runs `DecoderVocoderWrapper` eagerly on real
+    checkpoint weights + concrete non-zero inputs — the correct ground truth for this topology
+    specifically, not the original untraced `Decoder.forward`, since every trace-friendly patch is
+    documented as bit/mathematically equivalent). `test_e2e_kokoro_mil_decoder_vocoder_reference.cpp`:
+    ~5.1e-4 mean / ~2.5e-2 max abs diff (at t_frames=40; a real HiFi-GAN-vocoder amplification ceiling
+    from compounding per-phase floating-point noise, same category as StyleTTS2's own documented one —
+    bisected per-phase first: decoder_core exact ~1e-6, the SineGen chain ~2e-3, forward STFT ~2e-7
+    excluding a handful of atan2-boundary elements, Generator-core-with-exact-har ~3e-3).
+  - **Two more real, general bugs found and fixed getting THIS phase numerically tight** (both
+    invisible to the earlier structural-only smoke test, which only checked "builds and produces a
+    finite waveform"):
+    1. `_f02sine_traceable`'s `rad_values = (f0_values / self.sampling_rate) % 1` — `x % 1` on a tensor
+       with Python-int divisor 1 — traces (via coremltools' own `remainder` lowering) to a raw MIL
+       `sub(x, x)`, ALWAYS EXACTLY 0, discarding the entire fractional/phase signal (confirmed by reading
+       the raw traced MIL ops directly: no `mod`/`floor_div` op survives at all). A genuine coremltools
+       bug, not this project's — looks like their `x - floor_divide(x,y)*y` decomposition short-circuits
+       `floor_divide(x,1)` to plain `x` (valid for `real_div`-by-1, invalid for `floor_divide`, which
+       must still floor). Fixed by rewriting the SineGen patch as `x - torch.floor(x)` directly, sidestepping
+       the broken lowering entirely (algebraically identical, ggml already has a `FLOOR` primitive).
+    2. `torch.atan2(im, re)` in `VerifiedSTFT.transform` traces (for this model) not to MIL's fused
+       `atan2` op but to `atan(im/re)` plus a manually-composed quadrant correction that covers the
+       x<0 case's y>0/y<0 STRICT branches but omits the y==0,x<0 boundary entirely (real
+       `atan2(0.0,-1)==+pi`; the decomposition silently returns 0). `im = im_raw - im_raw*boundary_mask`
+       (zeroing the imaginary part at DC/Nyquist bins, matching real `torch.stft`'s own convention)
+       produces exactly this trigger at ~5.9% of all phase elements in one real trace, AND (found only
+       once a real, not random-noise, F0/asr fixture surfaced a ~40-sample/~17x-amplitude resonance
+       burst end-to-end) real non-boundary `im_raw` can ALSO coincidentally land on exactly 0.0 for
+       sufficiently periodic/structured content. Fixed by nudging `im` with a physically-negligible
+       (~1e-20) positive epsilon UNIFORMLY, not just at the boundary-mask positions — closes both cases,
+       confirmed via an isolated forward-STFT probe (6206/105622 boundary-only outliers → 3, the
+       remainder being genuine, unavoidable float32 sign-crossing boundary sensitivity).
+  - **`kokoro_driver_mil.lua` written**, wiring the two new MIL topologies together with the EXISTING
+    bespoke LSTM-bound topologies (`text_encoder_cnn`/`text_encoder_lstm_*`, `duration_lstm_*`/
+    `duration_adaln_*`/`top_lstm_*`/`duration_proj`, `f0n_shared_lstm_*`/`f0n_f0_block*`/`f0n_n_block*`/
+    `f0n_f0_proj`/`f0n_n_proj`, unchanged from `kokoro_driver.lua` — LSTM-bound pieces stay bespoke, ggml
+    has no native LSTM op). `decoder_vocoder` replaces FOUR bespoke calls (decoder_core/sinegen/
+    stft_forward/generator) with ONE, taking `asr`/`F0_curve`/`N_curve`/`style`/`rand_ini`/`noise_in`/
+    `wsum` directly and returning the finished waveform — no host-side `har` (STFT mag/phase) assembly
+    needed anymore, just a `compute_wsum` Lua port of `export_kokoro_mil.py`'s own `compute_wsum_np`.
+  - **`test_e2e_kokoro_mil_lua_driver.cpp`**: real end-to-end check, mirroring
+    `test_e2e_vits_mil_lua_driver.cpp`'s own "no oracle comparison, per-phase references already give
+    real confidence, just confirm the orchestration runs and produces a plausible result" strategy —
+    same reasoning applies here even more directly, confirmed empirically: this test's own fixture (a
+    synthetic sine-wave `ref_s`, not a real speaker embedding) triggers a genuine resonance burst in
+    `loom::KokoroDriver` ITSELF (the trusted bespoke oracle, rms=1.09/max_abs=21.7 at sample 11656) that
+    closely matches the MIL/Lua path's own (rms=0.88/max_abs=16.7 at sample 11651) — two fully
+    independent implementations agreeing closely enough to confirm this is the real model's own
+    out-of-distribution response, not a bug in either. 22207/22207 checks passed with plausibility bounds
+    set from the oracle's own observed range.
+  - Full regression suite re-run clean after every fix above (only the pre-existing, unrelated
+    `test_e2e_lfm2_lua_driver` failure — a missing local fixture file, not a computation regression).
 - **Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** Should still be checked against the ORIGINAL
   two VITS-derived failure modes (dynamic pad on rank≥3 tensors; boolean-mask-indexed transforms) AND
   the newer ones Kokoro's own decoder_vocoder phase surfaced above (LSTM usage forcing a hybrid

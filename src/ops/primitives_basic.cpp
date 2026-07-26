@@ -143,17 +143,38 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_sub(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SUB", in, 2);
-    ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
-    ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
+    ggml_tensor* a = ensure_packed(pc.ctx, promote_i32_to_f32(pc.ctx, in[0]));
+    ggml_tensor* b = ensure_packed(pc.ctx, promote_i32_to_f32(pc.ctx, in[1]));
 
-    // Dynamically optimize scalar subtraction (e.g. 0.0 - b) to ggml_neg(b) to prevent broadcast failures
-    if (ggml_nelements(a) == 1 && ggml_nelements(b) > 1) {
-        b = ensure_packed(pc.ctx, b);
-        return {ggml_neg(pc.ctx, b)};
+    // ggml_sub only supports broadcasting the SECOND operand (b) into the first's (a's) shape, but `a`
+    // is whichever operand happened to trace first here, which is often the smaller/scalar one for a
+    // real `scalar - tensor` expression (e.g. HF's ubiquitous `1.0 - mask` attention-masking idiom,
+    // first caught by Kokoro's CustomAlbert). A previous revision special-cased `nelements(a)==1` to
+    // `ggml_neg(b)` -- correct ONLY for the (0.0 - b) idiom it was actually named after, but silently
+    // WRONG (dropping `a` entirely) for any other nonzero scalar/smaller `a`, confirmed the hard way:
+    // `SUB(1.0, ones_tensor)` computed `-ones_tensor` instead of `0`. Fixed generally: when `a` is the
+    // smaller operand, explicitly REPEAT it up to `b`'s shape first (valid for any `a` value), then
+    // subtract elementwise -- correct for every case the broken shortcut used to special-case AND every
+    // one it silently mishandled.
+    if (ggml_nelements(b) > ggml_nelements(a)) {
+        if (!ggml_can_repeat(a, b)) {
+            auto ne_str = [](ggml_tensor* t) {
+                return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                       std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+            };
+            throw SchemaError("SUB: incompatible shapes a=" + ne_str(a) + " b=" + ne_str(b));
+        }
+        a = ggml_repeat(pc.ctx, a, b);
+        return {ggml_sub(pc.ctx, a, b)};
     }
 
-    a = ensure_packed(pc.ctx, a);
-    b = ensure_packed(pc.ctx, b);
+    if (!ggml_can_repeat(b, a)) {
+        auto ne_str = [](ggml_tensor* t) {
+            return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+                   std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+        };
+        throw SchemaError("SUB: incompatible shapes a=" + ne_str(a) + " b=" + ne_str(b));
+    }
     return {ggml_sub(pc.ctx, a, b)};
 }
 
