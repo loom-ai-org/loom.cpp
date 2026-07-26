@@ -45,6 +45,26 @@ class loom_spline(Operation):
         return self.x.sym_type
 
 @register_op(namespace="loom")
+class loom_group_norm(Operation):
+    """
+    Specialized Loom GroupNorm (normalization only, no affine) -- see group_norm_op.py for why this is a
+    custom op bridge rather than a generic decomposition-based translation.
+    """
+    input_spec = InputSpec(
+        x=TensorInputType(type_domain="T"),
+        n_groups=TensorInputType(type_domain="U"),
+        eps=TensorInputType(type_domain="T"),
+    )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+        "U": (types.int32, types.fp32),
+    }
+
+    def type_inference(self):
+        return self.x.sym_type
+
+@register_op(namespace="loom")
 class loom_rope(Operation):
     """
     Specialized Loom Rotary Position Embedding (RoPE) operation.
