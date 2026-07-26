@@ -74,6 +74,8 @@ class LoomGGUFExporter:
         "exp": "EXP",
         "sin": "SIN",
         "cos": "COS",
+        "atan": "ATAN",
+        "atan2": "ATAN2",
         "floor": "FLOOR",
         "clamp": "CLAMP",
         "pow": "POW",
@@ -116,6 +118,26 @@ class LoomGGUFExporter:
         self.profile = kwargs.get("profile") or os.environ.get("LOOM_PROFILE", None)
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
         self.quantize = kwargs.get("quantize") or os.environ.get("LOOM_QUANTIZE", None)
+        # {raw MIL symbol string (e.g. "is531") -> replacement expression (e.g. "2*n_tokens")}. The
+        # engine's own dynamic-shape support is genuinely single-axis (see get_var_info's own docstring):
+        # every symbolic dim ordinarily collapses to the bare "n_tokens" SymbolEnv resolves at build
+        # time, which is correct whenever several distinct "isN" names all really mean the SAME one true
+        # dynamic quantity (the common case) but wrong the one time a topology genuinely has more than
+        # one independently-varying dynamic axis (first hit by Kokoro's "decoder_vocoder" phase: asr's
+        # own frame count vs. f0_curve/n_curve's fixed-2x/noise_in's fixed-600x/wsum's fixed-600x+20
+        # lengths -- none of these are op-derived from asr, they're independently-traced LEAF inputs, so
+        # there's no data-flow path this exporter could use to infer the ratio on its own). This dict
+        # lets a caller who DOES know the real ratio (because it's inherent to how their own wrapper
+        # module's forward() signature is shaped, not something recoverable from the graph) override
+        # specific symbols by their raw name -- populated from the real traced MIL Vars' own shape
+        # symbols, not guessed from string patterns.
+        self.symbol_overrides = kwargs.get("symbol_overrides") or {}
+
+    def _sub_symbol(self, s: str) -> str:
+        """Replaces every occurrence of a symbolic MIL dim (e.g. "is531") in `s` with its
+        `self.symbol_overrides` entry if the caller registered one for that exact raw symbol, else the
+        usual bare "n_tokens" fallback. See `symbol_overrides`' own docstring in __init__."""
+        return _DYNAMIC_SYMBOL_RE.sub(lambda m: self.symbol_overrides.get(m.group(0), "n_tokens"), s)
 
     def safe_name(self, name: str) -> str:
         """
@@ -149,12 +171,15 @@ class LoomGGUFExporter:
         `get_var_info`'s original bare-substitution behavior, so every case this doesn't specifically
         understand is byte-identical to before this method existed.
         """
-        if _seen is None:
-            _seen = set()
-        if id(var) in _seen:
-            return None  # cycle guard, should be unreachable in a real SSA graph
-        _seen.add(id(var))
-
+        # No cycle guard: MIL/SSA graphs are acyclic by construction (an op's inputs always name EARLIER-
+        # defined vars, never itself), so a genuine infinite loop here isn't possible. A guard keyed on
+        # `id(var)` alone WAS added once, then found to actively corrupt correct answers instead -- the
+        # "concat" case just above is the first branching walk in this function (recursing into multiple
+        # operands from one call), and two operands legitimately sharing a common upstream ancestor (a
+        # real DAG diamond, not a cycle -- confirmed on Kokoro's SineGen: `rad0.unsqueeze(1)` and
+        # `rad_values[:,1:,:]` both trace back to the SAME `rad_values` var) would hit a per-walk `_seen`
+        # set's SECOND visit and silently return None, exactly the bug already root-caused and fixed the
+        # identical way in `_resolve_scalar_expr`'s own cycle guard for VITS (see BACKLOG.md).
         if var.shape is None or torch_axis >= len(var.shape):
             return None
         dim = var.shape[torch_axis]
@@ -163,14 +188,17 @@ class LoomGGUFExporter:
 
         op = var.op
         if op is None:
-            # A genuine (sub)function input with no producer -- this is the actual dynamic quantity
-            # "n_tokens" ultimately derives from (e.g. "waveform" itself).
-            return "n_tokens"
+            # A genuine (sub)function input with no producer -- ordinarily this IS the actual dynamic
+            # quantity "n_tokens" derives from (e.g. "waveform" itself), but not always: a topology with
+            # more than one independently-traced dynamic LEAF input (Kokoro's "decoder_vocoder" -- see
+            # symbol_overrides' own docstring) has NO data-flow path here to tell that apart from the
+            # ordinary case, so an explicit caller-registered override always wins when present.
+            return self._sub_symbol(str(dim))
 
         _UNARY_PASSTHROUGH_OPS = {
             "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
-            "leaky_relu",
+            "leaky_relu", "cumsum", "atan", "sin", "cos",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -185,7 +213,7 @@ class LoomGGUFExporter:
                 return self._infer_dynamic_dim_expr(inner, torch_axis, _seen)
             return None
 
-        if op.op_type == "layer_norm":
+        if op.op_type in ("layer_norm", "instance_norm"):
             # Shape-preserving over EVERY axis (normalizes in place, never changes rank or size) -- the
             # real expression for any symbolic output axis is just its input's own, unchanged. Needed
             # for the same reason the elementwise-broadcast case is: `layer_norm`'s own composed
@@ -193,6 +221,14 @@ class LoomGGUFExporter:
             # upstream of every Q/K/V linear projection's reshape in Conformer-CTC's encoder, and a
             # `gather(shape(...), 0)` reading the (always-1) batch axis back out needs to walk straight
             # through it rather than giving up and falling back to a bare "n_tokens" substitution.
+            # `instance_norm` (added alongside `layer_norm` here, not as its own separate case -- same
+            # formula, no per-axis distinction needed since NEITHER changes any dim) is Kokoro's own
+            # `AdaIN1d`/`AdainResBlk1d` normalization, used inside every Generator resblock/noise_res
+            # call -- without this, a length several conv_transpose/upsample hops downstream of an
+            # instance_norm output fell through to bare substitution, silently corrupting the SECOND
+            # (i=1) Generator upsample stage's own input length (confirmed: produced literal "31"
+            # instead of the real "20*n_tokens"-derived 601, a `x = x + x_source` shape mismatch two
+            # ops later at `ups[1]`'s own conv_transpose).
             inner = op.inputs.get("x")
             if inner is not None:
                 return self._infer_dynamic_dim_expr(inner, torch_axis, _seen)
@@ -296,6 +332,35 @@ class LoomGGUFExporter:
             if in_expr is None:
                 return None
             return f"(floor((({in_expr}) + {pad_before + pad_after} - {eff_kernel}) / {stride}) + 1)"
+
+        if op.op_type in ("upsample_nearest_neighbor", "upsample_bilinear"):
+            # MIL's `upsample_nearest_neighbor`/`upsample_bilinear` (core ops, see the matching op_type
+            # branch in `export()`'s main loop for the node-emission side of this) always operate on the
+            # LAST TWO axes (height=-2, width=-1), scaling each independently by its own constant
+            # scale_factor_height/scale_factor_width -- floor(H1*sfh)/floor(W1*sfw). Without this case,
+            # get_var_info's default fallback for this op's OWN output var collapsed to a bare "n_tokens"
+            # substitution regardless of the real scale, silently corrupting every consumer downstream
+            # (confirmed on Kokoro's f0_upsamp: a real "600*n_tokens" length read back as literal
+            # "n_tokens", a 600x error that produced a genuinely zero-length tensor a few ops later once
+            # SineGen's own 1/300 downsample floor()'d it back down).
+            x_var = op.inputs.get("x")
+            if x_var is None or x_var.shape is None:
+                return None
+            rank = len(var.shape)
+            if torch_axis not in (rank - 2, rank - 1):
+                # Any other axis passes straight through unscaled.
+                return self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+            sfh_obj = op.inputs.get("scale_factor_height")
+            sfw_obj = op.inputs.get("scale_factor_width")
+            sfh = float(sfh_obj.val) if sfh_obj is not None and hasattr(sfh_obj, "val") and sfh_obj.val is not None else 1.0
+            sfw = float(sfw_obj.val) if sfw_obj is not None and hasattr(sfw_obj, "val") and sfw_obj.val is not None else 1.0
+            scale = sfh if torch_axis == rank - 2 else sfw
+            in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+            if in_expr is None:
+                return None
+            if scale == 1.0:
+                return in_expr
+            return f"(floor(({in_expr})*{scale}))"
 
         if op.op_type == "conv_transpose":
             # Mirrors the "conv" case just above, using ConvTranspose1d/2d's own inverse length
@@ -583,6 +648,34 @@ class LoomGGUFExporter:
                 if torch_axis != split_axis:
                     return self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
 
+        if op.op_type == "concat":
+            # Any axis OTHER than the concat axis has a direct 1:1 correspondence to ANY ONE of the
+            # operands (they must all agree there by construction); the concat axis itself is the SUM of
+            # every operand's own real expression, not any single operand's. Needed for Kokoro's SineGen:
+            # `torch.cat([rad0.unsqueeze(1), rad_values[:,1:,:]], dim=1)` rebuilds the SAME total length
+            # (a 1-element slice + an (L-1)-element slice) by replacing just the first row -- without this
+            # case the walk gave up at "concat" and fell back to a bare "n_tokens" substitution for what
+            # is actually a 600x-derived length, corrupting SineGen's own downsample factor.
+            values = op.inputs.get("values")
+            axis_var = op.inputs.get("axis")
+            axis_val = axis_var.val if axis_var is not None and hasattr(axis_var, "val") else None
+            if values is not None and axis_val is not None and len(values) > 0:
+                first = values[0]
+                if isinstance(first, Var) and first.shape is not None:
+                    out_rank = len(var.shape)
+                    cat_axis = int(axis_val) + out_rank if axis_val < 0 else int(axis_val)
+                    if torch_axis != cat_axis:
+                        return self._infer_dynamic_dim_expr(first, torch_axis, _seen)
+                    parts = []
+                    for operand in values:
+                        if not (isinstance(operand, Var) and operand.shape is not None and torch_axis < len(operand.shape)):
+                            return None
+                        part_expr = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
+                        if part_expr is None:
+                            return None
+                        parts.append(f"({part_expr})")
+                    return "(" + "+".join(parts) + ")"
+
         if op.op_type == "transpose":
             # `output.shape[i] = input.shape[perm[i]]` (MIL's own semantics, same as the "transpose"
             # translation branch above uses) -- a symbolic output axis's real expression is just its
@@ -627,7 +720,7 @@ class LoomGGUFExporter:
 
         _ELEMENTWISE_BROADCAST_OPS = {
             "less", "greater", "less_equal", "greater_equal", "equal", "not_equal",
-            "add", "sub", "mul", "real_div", "floor_div", "logical_and", "logical_or",
+            "add", "sub", "mul", "real_div", "floor_div", "mod", "logical_and", "logical_or",
             "maximum", "minimum", "pow",
         }
         if op.op_type in _ELEMENTWISE_BROADCAST_OPS or op.op_type == "select":
@@ -696,7 +789,7 @@ class LoomGGUFExporter:
         # not a bare symbol) -- substituting the base symbol there ("n_tokens + 512") and letting the
         # conv branch above apply its own formula on top gives the right answer without this walk needing
         # to specifically understand every intermediate op type between the true input and the first conv.
-        return _DYNAMIC_SYMBOL_RE.sub("n_tokens", str(dim))
+        return self._sub_symbol(str(dim))
 
     def _find_range_1d_var(self, var, depth=0, _seen=None):
         """
@@ -1054,32 +1147,26 @@ class LoomGGUFExporter:
                 # the whole expression correctly at build time instead.
                 dim_str = str(dim)
                 if _DYNAMIC_SYMBOL_RE.search(dim_str):
-                    # Try the real conv/cast-aware derivation first (see _infer_dynamic_dim_expr's own
-                    # docstring for why the bare substitution below isn't always correct); normally only
-                    # attempted for a BARE lone symbol (an already-composite expression, e.g.
-                    # "is936*is937.../1024", is left to the substitution path unchanged) -- EXCEPT for a
-                    # `reshape`/`fill`/`conv_transpose` producer, where blind substitution is provably
-                    # wrong rather than just untrustworthy: `reshape`/`fill`'s own case ignores the
-                    # textual shape entirely (re-derives straight from the op's "shape" INPUT via
-                    # `_try_resolve_reshape_shape_input`). `conv_transpose` is different but equally
-                    # unsafe to blind-substitute -- MIL's OWN type inference for it already reports a
-                    # composite formula over the INPUT's symbol (e.g. "8*is50" for a stride-8 upsample),
-                    # and that symbol does NOT represent "n_tokens" itself whenever the input is already a
-                    # DERIVED length (chained upsample stages, e.g. HiFi-GAN's 3-stage Generator) --
-                    # blindly substituting "is50"->"n_tokens" produced "8*n_tokens" for a stage whose real
-                    # length was "64*n_tokens" (is50 itself already meant "8*n_tokens"), confirmed on
-                    # VITS: stage 2 of 3 silently read only 64 elements of stage 1's real 512-element
-                    # output, corrupting the whole rest of the vocoder. Needed for Conformer-CTC's
-                    # `rel_shift`: `x_31`'s `-1`-inferred axis (see the "reshape" case's own literal-`-1`
-                    # handling) gets reported by MIL's OWN type inference as a genuinely COMPOSITE
-                    # expression ("isN + 1", from the pad immediately upstream) once propagated through
-                    # this reshape, not a bare symbol -- blind substitution alone silently turned that
-                    # into "n_tokens + 1" instead of the real subsampled-frame-count formula.
-                    inferred = None
-                    if _DYNAMIC_SYMBOL_RE.fullmatch(dim_str) or (var.op is not None and var.op.op_type in ("reshape", "fill", "conv_transpose")):
-                        torch_axis = list(var.shape).index(dim)
-                        inferred = self._infer_dynamic_dim_expr(var, torch_axis)
-                    shape.append(inferred if inferred is not None else _DYNAMIC_SYMBOL_RE.sub("n_tokens", dim_str))
+                    # Always try the real conv/cast/pad/concat/upsample-aware derivation first (see
+                    # _infer_dynamic_dim_expr's own docstring for why blind substitution isn't always
+                    # correct) -- this used to be gated behind "only for a BARE lone symbol, or an
+                    # explicit per-op-type allowlist" on the theory that an already-composite MIL shape
+                    # expression (e.g. "is936*is937.../1024") was safer left to plain substitution. That
+                    # theory doesn't hold: `_infer_dynamic_dim_expr` ITSELF falls back to the exact same
+                    # `self._sub_symbol(str(dim))` substitution for any op type (or any axis) it doesn't
+                    # specifically understand -- so calling it unconditionally can never produce a WORSE
+                    # answer than the gated version did, only occasionally a better one. The gate was
+                    # real, growing technical debt in practice: every one of "pad"/"concat"/
+                    # "upsample_nearest_neighbor"/"upsample_bilinear" needed adding to it by hand after
+                    # each one's OWN correct `_infer_dynamic_dim_expr` case was silently unreachable from
+                    # here (confirmed on Kokoro's STFT reflect-pad: `_infer_dynamic_dim_expr`'s "pad" case
+                    # already computed the right answer, but this function's gate never called it, since
+                    # MIL's own composite "isN + 20" string for a pad output isn't a bare fullmatch and
+                    # "pad" wasn't yet on the allowlist -- blind-substituting just the embedded symbol gave
+                    # "n_tokens + 20" instead of the real "600*n_tokens + 20").
+                    torch_axis = list(var.shape).index(dim)
+                    inferred = self._infer_dynamic_dim_expr(var, torch_axis)
+                    shape.append(inferred if inferred is not None else self._sub_symbol(dim_str))
                 else:
                     shape.append(dim_str)
         
@@ -1959,7 +2046,17 @@ class LoomGGUFExporter:
                     h = hashlib.md5(namespaced_name.encode("utf-8")).hexdigest()[:6]
                     namespaced_name = f"{namespaced_name[:30]}_{h}_{namespaced_name[-20:]}"
 
-                self.weights[namespaced_name] = np.array(val)
+                arr_val = np.array(val)
+                if arr_val.ndim == 0:
+                    # A genuine 0-D (scalar) constant -- confirmed as a real bug, not just a formality:
+                    # GGUF/ggml has no 0-D tensor representation, and writing one silently round-trips as
+                    # a tensor with a ZERO-length dimension (ne[0]=0) instead of a proper length-1 scalar,
+                    # which then fails every downstream shape check that consumes it (first hit by
+                    # Kokoro's SineGen phase computation baking a literal `2 * torch.pi` scalar multiply
+                    # as its own weight). Reshape to a proper 1-element 1-D array, matching ggml's own
+                    # "scalar = shape [1]" convention used everywhere else in this project.
+                    arr_val = arr_val.reshape(1)
+                self.weights[namespaced_name] = arr_val
                 if weight_name != namespaced_name:
                     aliases[weight_name] = namespaced_name
                 continue
@@ -2915,6 +3012,43 @@ class LoomGGUFExporter:
                 })
                 continue
 
+            if op_type == "cumsum":
+                # MIL's `cumsum(x, axis, exclusive, reverse)` -> ggml's existing native CUMSUM primitive
+                # (op_cumsum, wraps ggml_cumsum -- always along ne[0], already used by the RQ spline
+                # primitive). Only the plain inclusive/forward case (exclusive=False, reverse=False) is
+                # composed here -- Kokoro's SineGen phase accumulation is the only real user so far and
+                # needs exactly that; ggml_cumsum itself has no exclusive/reverse variant to fall back on.
+                x_var_obj = op.inputs.get("x")
+                axis_obj = op.inputs.get("axis")
+                excl_obj = op.inputs.get("exclusive")
+                rev_obj = op.inputs.get("reverse")
+                if x_var_obj is None:
+                    continue
+                in_rank = len(self.get_var_info(x_var_obj)["shape"])
+                axis_val = int(axis_obj.val) if axis_obj is not None and hasattr(axis_obj, "val") and axis_obj.val is not None else 0
+                if axis_val < 0:
+                    axis_val += in_rank
+                if axis_val != in_rank - 1:
+                    raise NotImplementedError(
+                        f"cumsum op '{op.name}': only cumulative sum over the trailing (ne[0]) axis is "
+                        f"supported (got axis={axis_val!r} for rank {in_rank}) -- ggml_cumsum only ever "
+                        "sums over ne[0]."
+                    )
+                excl_val = bool(excl_obj.val) if excl_obj is not None and hasattr(excl_obj, "val") and excl_obj.val is not None else False
+                rev_val = bool(rev_obj.val) if rev_obj is not None and hasattr(rev_obj, "val") and rev_obj.val is not None else False
+                if excl_val or rev_val:
+                    raise NotImplementedError(
+                        f"cumsum op '{op.name}' has exclusive={excl_val}/reverse={rev_val} -- ggml_cumsum "
+                        "only implements the plain inclusive/forward case."
+                    )
+                nodes.append({
+                    "op": "CUMSUM",
+                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "attrs": {}
+                })
+                continue
+
             if op_type == "layer_norm":
                 # Dedicated branch (not the generic single-input OP_MAP path): MIL's `layer_norm(x, axes,
                 # gamma, beta, epsilon)` bundles the learned affine into the op itself, but ggml_norm
@@ -2968,6 +3102,126 @@ class LoomGGUFExporter:
                         "outputs": [out_name],
                         "attrs": {}
                     })
+                continue
+
+            if op_type == "instance_norm":
+                # Dedicated branch, same shape as "layer_norm" just above: MIL's `instance_norm(x, gamma,
+                # beta, epsilon)` (rank 3-4, normalizes over every axis AFTER the channel axis -- for the
+                # rank-3 case this exporter has actually seen so far, Kokoro's AdaIN1d on a (B,C,T)
+                # channel-first tensor, that's exactly the trailing torch axis == ne[0] in this project's
+                # T-fast convention) bundles the learned affine into the op itself; ggml_norm
+                # (op_layer_norm) only does the mean/variance normalization over ne[0] and leaves
+                # gamma/beta to separate MUL/ADD nodes. Unlike layer_norm, instance_norm has no `axes`
+                # input to validate at all -- its spatial-dims-only normalization is exactly ne[0] by
+                # construction for rank 3, so no separate axis check is needed (rank 4 -- 2 spatial dims
+                # -- would need a real multi-axis ggml_norm and isn't supported here, same "not yet hit"
+                # bound as this exporter's other narrow-by-design branches).
+                x_var_obj = op.inputs.get("x")
+                gamma_obj = op.inputs.get("gamma")
+                beta_obj = op.inputs.get("beta")
+                eps_obj = op.inputs.get("epsilon")
+                if x_var_obj is None:
+                    continue
+                in_rank = len(self.get_var_info(x_var_obj)["shape"])
+                if in_rank != 3:
+                    raise NotImplementedError(
+                        f"instance_norm op '{op.name}': only rank-3 (B,C,T) input is supported (got "
+                        f"rank {in_rank}) -- rank 4 (2 spatial dims) needs a real multi-axis ggml_norm, "
+                        "not yet needed by any model this exporter has targeted."
+                    )
+                eps_val = float(eps_obj.val) if eps_obj is not None and hasattr(eps_obj, "val") and eps_obj.val is not None else 1e-5
+                # Unlike layer_norm's own gamma/beta (which index ne[0], the SAME axis being normalized),
+                # instance_norm's gamma/beta index the CHANNEL axis -- ne[1] here, a DIFFERENT axis than
+                # the one ggml_norm just normalized (ne[0]=T) -- so each needs an explicit RESHAPE to
+                # [1,C,1] before the MUL/ADD to broadcast against the right axis (confirmed the hard way:
+                # a raw [C]-shaped MUL against a [T,C,1] tensor raises ggml's own incompatible-shapes
+                # error, since a bare [C] naturally broadcasts against ne[0], not ne[1]). Mirrors the
+                # "conv" branch's own established bias RESHAPE-to-[1,oc,1] convention just above.
+                channels = int(op.outputs[0].shape[1])
+
+                out_name = self.safe_name(op.outputs[0].name)
+                cur = out_name if gamma_obj is None and beta_obj is None else f"{out_name}_in_raw"
+                nodes.append({
+                    "op": "LAYER_NORM",
+                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                    "outputs": [cur],
+                    "attrs": {"eps": eps_val}
+                })
+                if gamma_obj is not None:
+                    gamma_r = f"{out_name}_in_gamma_r"
+                    nodes.append({
+                        "op": "RESHAPE",
+                        "inputs": [resolve(self.safe_name(gamma_obj.name))],
+                        "outputs": [gamma_r],
+                        "attrs": {"shape": [1, channels, 1]}
+                    })
+                    nxt = out_name if beta_obj is None else f"{out_name}_in_scaled"
+                    nodes.append({
+                        "op": "MUL",
+                        "inputs": [cur, gamma_r],
+                        "outputs": [nxt],
+                        "attrs": {}
+                    })
+                    cur = nxt
+                if beta_obj is not None:
+                    beta_r = f"{out_name}_in_beta_r"
+                    nodes.append({
+                        "op": "RESHAPE",
+                        "inputs": [resolve(self.safe_name(beta_obj.name))],
+                        "outputs": [beta_r],
+                        "attrs": {"shape": [1, channels, 1]}
+                    })
+                    nodes.append({
+                        "op": "ADD",
+                        "inputs": [cur, beta_r],
+                        "outputs": [out_name],
+                        "attrs": {}
+                    })
+                continue
+
+            if op_type in ("upsample_nearest_neighbor", "upsample_bilinear"):
+                # MIL's `upsample_nearest_neighbor`/`upsample_bilinear` (core ops -- NOT the "torch_"
+                # dialect ops of the same name, which the "torch_upsample_to_core_upsample" SSA pass
+                # already rewrites into these before this exporter ever sees the graph) always operate on
+                # the LAST TWO axes ("height"=axis -2, "width"=axis -1). Every real usage this exporter
+                # has hit so far (Kokoro's `nn.Upsample`/f0_upsamp on a genuine rank-3 (B,1,T) tensor, and
+                # this project's own "unsqueeze a dummy axis, F.interpolate(mode='linear'), squeeze it back
+                # off" rank-4 trick for coremltools' separate 1D-linear-needs-rank-4 restriction) puts the
+                # tensor's REAL dynamic axis at torch axis -1 == this project's ne[0] (T-fast) convention,
+                # with axis -2 always a static, unscaled size (either a real channel axis or the trick's
+                # own dummy axis) -- so only `scale_factor_width` is expected to ever be non-1, mapped
+                # directly to ggml's existing INTERPOLATE_1D primitive (which already resizes ne[0] only,
+                # added for exactly this Kokoro use case per its own primitives_basic.cpp comment).
+                sfh_obj = op.inputs.get("scale_factor_height")
+                sfw_obj = op.inputs.get("scale_factor_width")
+                sfh = float(sfh_obj.val) if sfh_obj is not None and hasattr(sfh_obj, "val") and sfh_obj.val is not None else 1.0
+                sfw = float(sfw_obj.val) if sfw_obj is not None and hasattr(sfw_obj, "val") and sfw_obj.val is not None else 1.0
+                if sfh != 1.0 and sfw != 1.0:
+                    raise NotImplementedError(
+                        f"{op_type} op '{op.name}' has non-1.0 scale factors on BOTH axes "
+                        f"(height={sfh}, width={sfw}) -- a genuine 2D resize, which this exporter's "
+                        "INTERPOLATE_1D composition (ne[0]-only) can't represent."
+                    )
+                # Whichever of {height, width} is actually non-1.0 is the axis this exporter cares about
+                # (T, this project's ne[0]) -- torch's own promotion of a genuinely rank-3 (B,C,T) 1D
+                # interpolate call onto this rank>=3-only 2D op is NOT consistent about which of the two
+                # trailing axes ends up "height" vs "width" (confirmed empirically: Kokoro's f0_upsamp
+                # puts T at width/axis-1, but `UpSample1d`'s plain `F.interpolate(scale_factor=2,
+                # mode='nearest')` puts it at height/axis-2 instead) -- so this picks by VALUE, not by a
+                # fixed axis position.
+                sfw = sfh if sfh != 1.0 else sfw
+                x_var_obj = op.inputs.get("x")
+                t_expr = self.get_var_info(x_var_obj)["shape"][0]
+                out_name = self.safe_name(op.outputs[0].name)
+                nodes.append({
+                    "op": "INTERPOLATE_1D",
+                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                    "outputs": [out_name],
+                    "attrs": {
+                        "ne0": f"floor(({t_expr})*{sfw})",
+                        "mode": "nearest" if op_type == "upsample_nearest_neighbor" else "linear",
+                    }
+                })
                 continue
 
             if op_type == "range_1d":
@@ -3155,13 +3409,102 @@ class LoomGGUFExporter:
                         "this exporter doesn't support."
                     )
                 g_val = int(groups[0]) if isinstance(groups, (list, tuple, np.ndarray)) else int(groups)
-                if g_val != 1:
-                    raise NotImplementedError(
-                        f"conv_transpose op '{op.name}' has groups={g_val}, which this exporter doesn't "
-                        "support (no depthwise/grouped CONV_TRANSPOSE primitive exists)."
-                    )
-
                 s0 = int(strides[0]) if isinstance(strides, (list, tuple, np.ndarray)) else int(strides)
+                if g_val != 1:
+                    # Depthwise conv_transpose (Kokoro's AdainResBlk1d upsample "pool":
+                    # ConvTranspose1d(kernel=3, stride=2, groups=dim_in, padding=1, output_padding=1)) --
+                    # ggml has no native grouped CONV_TRANSPOSE primitive at all, so this composes the
+                    # standard "zero-stuff the input, then an ordinary (stride=1) depthwise conv with a
+                    # kernel-reversed weight" identity instead (real ConvTranspose1d IS mathematically a
+                    # correlation with a flipped kernel over a zero-stuffed signal). Confirmed (empirically,
+                    # via get_var_info dumps on this exact op) that MIL ALWAYS traces a grouped
+                    # conv_transpose with pad=[0,0] regardless of the real PyTorch padding/output_padding
+                    # -- it computes the "valid" (unpadded) result and defers any real crop to a SEPARATE
+                    # downstream slice_by_index op, which the generic per-op-type loop already handles on
+                    # its own turn -- so this composition only ever needs to reproduce the "valid" formula
+                    # `(L_in-1)*stride + kernel_size` (symmetric `kernel_size-1` padding both sides of the
+                    # zero-stuffed signal, i.e. padding=0/output_padding=0 in the general formula), never a
+                    # real nonzero pad itself. Reuses the exact node sequence already verified in
+                    # tools/convert_kokoro/convert_kokoro_f0n.py's `add_depthwise_conv_transpose_upsample`
+                    # (itself checked against test_primitive_registry.cpp's
+                    # test_depthwise_conv_transpose_1d_via_composition before ever being used there),
+                    # generalized to a real traced op's own stride/kernel_size/channel count and a REAL
+                    # dynamic-length expression (via get_var_info) instead of that script's own hardcoded
+                    # "$n_tokens".
+                    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+                    weight_var_obj = op.inputs["weight"]
+                    in_channels = int(x_var_obj.shape[1])
+                    out_per_group = int(weight_var_obj.shape[1])
+                    kernel_size = int(weight_var_obj.shape[-1])
+                    if is_2d or g_val != in_channels or out_per_group != 1:
+                        raise NotImplementedError(
+                            f"conv_transpose op '{op.name}' has groups={g_val} (in_channels={in_channels}, "
+                            f"out_channels/group={out_per_group}) -- only a true 1D depthwise case "
+                            "(groups == in_channels == out_channels) is composed; anything else has no "
+                            "ggml-side implementation yet."
+                        )
+                    if any(int(p) != 0 for p in pad_list):
+                        raise NotImplementedError(
+                            f"conv_transpose op '{op.name}' is depthwise with non-zero pad={pad_list!r} -- "
+                            "every depthwise conv_transpose this exporter has seen traces with pad=[0,0] "
+                            "(deferring any real crop to a separate downstream slice_by_index op); this "
+                            "composition doesn't know how to fold a non-zero pad in directly."
+                        )
+                    weight_val = weight_var_obj.val
+                    if weight_val is None:
+                        raise NotImplementedError(
+                            f"conv_transpose op '{op.name}' is depthwise but its weight isn't a resolved "
+                            "constant -- this composition needs to flip the kernel at export time."
+                        )
+                    flipped = np.ascontiguousarray(np.asarray(weight_val)[:, :, ::-1])
+                    flipped_name = self.safe_name(op.inputs["weight"].name) + "_dwt_flip"
+                    if func_name == "main_topo" or self.profile == "monolithic":
+                        namespaced_flipped = flipped_name
+                    else:
+                        namespaced_flipped = f"{func_name}.{flipped_name}"
+                    if len(namespaced_flipped) >= 64:
+                        import hashlib
+                        h = hashlib.md5(namespaced_flipped.encode("utf-8")).hexdigest()[:6]
+                        namespaced_flipped = f"{namespaced_flipped[:30]}_{h}_{namespaced_flipped[-20:]}"
+                    self.weights[namespaced_flipped] = flipped
+
+                    x_var = self.safe_name(x_var_obj.name)
+                    output_var = self.safe_name(op.outputs[0].name)
+                    t_expr = self.get_var_info(x_var_obj)["shape"][0]
+                    channels = in_channels
+
+                    d3 = f"{output_var}_dwt_d3"
+                    nodes.append({"op": "RESHAPE", "inputs": [resolve(x_var)], "outputs": [d3],
+                                  "attrs": {"shape": [1, t_expr, channels]}})
+                    stuffed3 = f"{output_var}_dwt_stuffed3"
+                    nodes.append({"op": "PAD_1D", "inputs": [d3], "outputs": [stuffed3],
+                                  "attrs": {"lp0": 0, "rp0": s0 - 1}})
+                    overstuffed = f"{output_var}_dwt_overstuffed"
+                    nodes.append({"op": "RESHAPE", "inputs": [stuffed3], "outputs": [overstuffed],
+                                  "attrs": {"shape": [f"({t_expr})*{s0}", channels]}})
+                    std_len = f"(({t_expr})-1)*{s0}+1"
+                    trunc_v = f"{output_var}_dwt_trunc_v"
+                    nodes.append({"op": "VIEW", "inputs": [overstuffed], "outputs": [trunc_v],
+                                  "attrs": {"shape": [std_len, channels]}})
+                    trunc = f"{output_var}_dwt_trunc"
+                    nodes.append({"op": "CONT", "inputs": [trunc_v], "outputs": [trunc]})
+                    pad_each = kernel_size - 1
+                    padded = f"{output_var}_dwt_padded"
+                    nodes.append({"op": "PAD_1D", "inputs": [trunc], "outputs": [padded],
+                                  "attrs": {"lp0": pad_each, "rp0": pad_each}})
+
+                    has_bias = bias_var is not None and getattr(bias_var, "val", None) is not None and np.any(bias_var.val)
+                    raw_var = (output_var + "_dwt_raw") if has_bias else output_var
+                    nodes.append({"op": "CONV_1D_DW", "inputs": [namespaced_flipped, padded], "outputs": [raw_var],
+                                  "attrs": {"s0": 1, "p0": 0, "d0": 1}})
+                    if has_bias:
+                        bias_var_name = self.safe_name(bias_var.name)
+                        bias_reshaped = output_var + "_dwt_bias_r"
+                        nodes.append({"op": "RESHAPE", "inputs": [resolve(bias_var_name)], "outputs": [bias_reshaped],
+                                      "attrs": {"shape": [1, channels, 1]}})
+                        nodes.append({"op": "ADD", "inputs": [raw_var, bias_reshaped], "outputs": [output_var]})
+                    continue
+
                 mapped_op = "CONV_TRANSPOSE_2D" if is_2d else "CONV_TRANSPOSE_1D"
 
                 x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")

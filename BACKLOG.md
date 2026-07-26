@@ -555,14 +555,207 @@ SupertonicTTS, StyleTTS2.
   **Open, not yet done:** root-causing and fixing the bespoke `flow_vocoder` bug itself (or just retiring
   the bespoke topology/driver in favor of this one, given the correctness gap just found); deciding
   whether to keep the bespoke topology around at all afterward.
-- **Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS's own experience revises the
-  earlier optimistic prediction here: "should trace as one static graph with noise supplied as an input
-  tensor" undersold the real risk — TWO of piper's real modules needed genuinely new infrastructure
-  (a coremltools *runtime* pad limitation, not just a missing translation; a custom op bridge for
-  boolean-mask-indexed math no rewrite can avoid), not simply "new ops to wire up". Kokoro/Matcha-TTS/
-  SupertonicTTS should still be checked against the SAME two failure modes specifically (dynamic pad on
-  rank≥3 tensors anywhere in their own attention/positional machinery; boolean-mask-indexed transforms
-  anywhere in their own flow/sampling code) before assuming they'll trace cleanly. StyleTTS2 is still the
+- **Kokoro — IN PROGRESS.** Unlike every model MIL-exported so far, Kokoro leans heavily on
+  `torch.nn.LSTM` (TextEncoder, DurationEncoder×3+AdaLayerNorm, `predictor.lstm`, F0Ntrain's shared
+  LSTM) — ggml has no native LSTM op, and `generate_graph_topology` hard-fails on any traced `lstm`/
+  `gru` MIL op (`recurrent.py`'s `build_lstm_cell_topologies` + a per-timestep host stepper is the only
+  path, same as the bespoke pipeline's own `BiLstmStepper` already uses) — so full end-to-end MIL
+  tracing of those pieces would mean auto-splitting a single traced module into alternating static/
+  recurrent segments, real unimplemented infrastructure (`generate_graph_topology`'s own comment calls
+  this out explicitly), not attempted here. Deliberate scoping decision instead: MIL-trace only the
+  LSTM-free parts (CustomAlbert+bert_encoder — not yet started; the `istftnet.py` decoder/vocoder back
+  end — done, see below), and reuse the existing bespoke `duration_predictor`/`text_encoder`/`f0n` GGUFs
+  unchanged for the LSTM-bound pieces once a driver exists to wire them together. Revisit "is
+  auto-splitting worth building" only if a future model makes LSTM-avoidance infeasible.
+
+  **`decoder_vocoder` phase (Decoder.encode/decode + SineGen + STFT + Generator — replaces FOUR bespoke
+  scripts, `convert_kokoro_{decoder_core,sinegen,stft,generator}.py`, with one combined MIL trace) —
+  traces, exports, and mostly builds; one open shape-consistency bug remains.** `export_kokoro_mil.py`
+  traces the REAL `kokoro.istftnet.Decoder` (`disable_complex=True` checkpoint construction, needed for
+  a conv-based rather than complex-dtype STFT — see the STFT rewrite below for why even that path isn't
+  used as-is). No LSTM anywhere in this subgraph, confirmed the highest-value MIL-tracing target per the
+  prior "check the same two VITS failure modes" prediction — which undersold the REAL scope again: this
+  phase hit a long tail of genuinely new infrastructure, none of it a dynamic-pad-rank≥3 or
+  boolean-mask-index case at all:
+
+  - **`torch.rsqrt(torch.tensor(2))`** (`AdainResBlk1d.forward`'s own `1/sqrt(2)` residual scale) traces
+    the constant as int64, which MIL's `rsqrt` op rejects outright (`dtype[int32]` not in `fp16/fp32`).
+    Replaced with the equivalent plain float constant, matching how the bespoke `convert_kokoro_f0n.py`
+    already reduces this exact expression to a constant.
+  - **`torch.multiply`/broadcast-along-two-different-axes-at-once** (`SineGen`'s
+    `f0 * torch.arange(1,dim+1).view(1,1,-1)`, f0 broadcasting on axis 1 while the arange broadcasts on
+    axis 2): `torch.multiply` itself isn't implemented by coremltools' torch frontend at all (use `*`);
+    once fixed, the resulting MIL `mul` still can't compose to a single `ggml_mul` call regardless of
+    operand order — ggml's broadcast model requires ONE operand's shape to be a per-axis divisor of the
+    other's, uniformly, and this shape needs axis 1 from one operand and axis 2 from the other
+    simultaneously. Composed instead via `dim` (9, static) unrolled per-harmonic SCALE+CONCAT calls —
+    the exact fix `convert_kokoro_sinegen.py`'s own bespoke topology already needed for this identical
+    shape ("no generic outer-product/broadcast-repeat primitive existed").
+  - **`F.interpolate(mode='linear')` on a rank-3 tensor** (SineGen's own phase pre-/post-filtering
+    downsample-then-upsample-by-300, and separately `UpSample1d`'s plain 2x nearest shortcut) hard-fails
+    coremltools' frontend ("input to torch_upsample_bilinear must have rank 4" — 1D linear/2D bilinear
+    share one dialect op requiring rank 4 always). Fixed via an `unsqueeze(2)→interpolate→squeeze`-back
+    trick — but chaining two such calls (downsample then upsample) with a squeeze/re-unsqueeze in
+    between the two loses the SECOND call's static rank in coremltools' own MIL type inference (a real,
+    narrow, reproduced-in-isolation-first coremltools bug, not a rank bug in this code) — fixed by
+    keeping the intermediate `cumsum` at rank 4 throughout (dim=3, not transposing back to rank 3
+    between the two interpolate calls), verified bit-level equivalent to the original modulo cumsum's
+    own floating-point reduction-order noise (~6e-5 abs).
+  - **A genuine numpy/coremltools version bug**: `int(np.array([1.0]))` — the exact shape coremltools'
+    OWN `_cast` op converter produces internally for a dynamic-size `F.interpolate(recompute_scale_
+    factor=True)` call's degenerate (scale=1) axis — raises on numpy>=1.25 (silently worked pre-1.25;
+    `_cast`'s own shape check already claims to allow "a length-1 tensor", just never squeezes it before
+    calling `int()`/`float()`). Self-contained monkeypatch in `export_kokoro_mil.py` (mirrors the
+    existing `transformers`-version-pin stub convention already used for `CustomAlbert`), not a
+    site-packages edit.
+  - **Instance normalization (`nn.InstanceNorm1d(affine=True)`, `AdaIN1d`'s own norm)** had no ggml
+    mapping (`instance_norm` MIL op). New dedicated exporter translation, same LAYER_NORM+MUL+ADD
+    composition `layer_norm` already uses — but with gamma/beta's own affine axis (channel, ne[1])
+    correctly reshaped to `[1,C,1]` before the MUL/ADD, unlike layer_norm's own gamma/beta (which index
+    ne[0], the SAME axis being normalized) — a raw `[C]`-shaped MUL against `[T,C,1]` broadcasts against
+    the WRONG axis otherwise (confirmed via a real `ggml_mul` shape-mismatch error before the fix).
+  - **Depthwise/grouped `ConvTranspose1d`** (`AdainResBlk1d`'s learned upsample "pool":
+    `kernel=3,stride=2,groups=dim_in,padding=1,output_padding=1`) — ggml has no grouped CONV_TRANSPOSE
+    primitive at all. New composition in the exporter's `conv_transpose` translation: zero-stuff the
+    input (insert `stride-1` zeros after each real sample via a PAD_1D+RESHAPE dummy-axis trick),
+    symmetric `kernel_size-1` padding both sides, then an ordinary depthwise CONV_1D_DW with the KERNEL
+    FLIPPED (baked as a new namespaced weight at export time, numpy `[:, :, ::-1]`) — the standard
+    "conv_transpose = correlation with a flipped kernel over a zero-stuffed signal" identity. Confirmed
+    (via `get_var_info` dumps) that MIL always traces a GROUPED conv_transpose with `pad=[0,0]`
+    regardless of the real PyTorch padding/output_padding, deferring the real crop to a separate,
+    already-independently-handled downstream `slice_by_index` — so this composition only ever needs the
+    "valid" formula `(L_in-1)*stride+kernel_size`, never a real nonzero pad. Reuses the exact node
+    sequence already verified in `convert_kokoro_f0n.py`'s own `add_depthwise_conv_transpose_upsample`
+    (itself checked against `test_primitive_registry.cpp`'s
+    `test_depthwise_conv_transpose_1d_via_composition`), generalized to a real traced op's own
+    stride/kernel/channel-count and a REAL dynamic-length expression instead of that script's own
+    hardcoded `$n_tokens`.
+  - **New `ATAN` ggml primitive** (`src/ops/primitives_spline.cpp` sibling to the existing `ATAN2`):
+    `torch.atan2`'s own MIL lowering doesn't always stay one opaque `atan2` op — for the STFT phase
+    computation it decomposes to a plain `atan` op plus quadrant-correction (select/sign/etc., already
+    supported), which had no ggml mapping at all. `ggml_map_custom1` wrapping `std::atan`, same "no
+    native op, no viable composition" precedent `ATAN2` itself already established.
+  - **New `INTERPOLATE_1D`/`upsample_nearest_neighbor`/`upsample_bilinear` exporter wiring**: the ggml
+    primitive itself (`op_interpolate_1d`) already existed (added in anticipation of exactly this model,
+    per its own comment), but had no exporter translation. MIL's `upsample_nearest_neighbor`/
+    `upsample_bilinear` (core ops, post the "torch_upsample_to_core_upsample" SSA pass) always scale the
+    LAST TWO axes (height=-2, width=-1) independently — but which of the two ends up holding the REAL
+    (non-1.0) scale factor for a promoted-from-rank-3 1D call is NOT consistent (confirmed: Kokoro's
+    `f0_upsamp` puts it at width, `UpSample1d`'s own plain call puts it at height) — the new translation
+    picks by VALUE (whichever of height/width is actually non-1.0), not by fixed axis position.
+  - **New `CUMSUM` OP_MAP entry**: the ggml primitive (`ggml_cumsum`, already used internally by
+    `RQ_SPLINE_INVERSE`) had no exporter-level MIL `cumsum` mapping at all. Direct translation (axis
+    must be the trailing/ne[0] one, `exclusive`/`reverse` must be false — the only case
+    `ggml_cumsum` implements and the only one this model needs).
+  - **A genuine 0-D (scalar) constant serialization bug, general, not Kokoro-specific**: any traced MIL
+    constant that folds down to a true scalar (first hit here: SineGen's own `2 * torch.pi` literal
+    multiply, baked as its own GGUF weight rather than an inline attr) got written as a shape-`()` numpy
+    array — GGUF/ggml has no 0-D tensor representation, and round-trips this as a tensor with a ZERO-
+    length dimension (`ne[0]=0`) instead of a proper length-1 scalar, silently failing every downstream
+    shape check that consumes it. Fixed in the `const` handling shared by every model this exporter
+    produces: reshape to `[1]` before writing, matching ggml's own "scalar = shape `[1]`" convention.
+  - **`get_var_info`'s dynamic-dim-derivation gating was itself a real, general bug, not just
+    Kokoro-specific missing cases.** The gate ("only call the real `_infer_dynamic_dim_expr` derivation
+    for a BARE symbol, or an explicit narrow per-op-type allowlist — reshape/fill/conv_transpose") was
+    based on a theory that turned out false: `_infer_dynamic_dim_expr` ITSELF falls back to the exact
+    same blind-substitution behavior for any op type/axis it doesn't specifically understand, so calling
+    it unconditionally can never produce a worse answer, only sometimes a better one. The gate was real
+    technical debt: `pad`, `concat`, and the new `upsample_*` cases each had a correct
+    `_infer_dynamic_dim_expr` case that was silently unreachable from `get_var_info` whenever MIL's own
+    type inference reported a COMPOSITE formula (not a bare symbol) for that op's output — confirmed on
+    the STFT reflect-pad, which needs its own real length (`600*n_tokens`-derived) plus a constant 20,
+    but without this fix silently substituted the wrong base quantity, computing `n_tokens + 20` instead
+    — a ~600x error that produced a zero-length tensor two ops later. **Simplified: `get_var_info` now
+    always attempts real derivation first**, removing the allowlist entirely (confirmed safe: VITS
+    re-exported and both its own MIL numerical-reference tests still pass bit-identically after this
+    change).
+  - **New `_infer_dynamic_dim_expr` cases**: `concat` (any non-concat axis passes through from any one
+    operand; the concat axis itself is the SUM of every operand's own real expression, not any single
+    operand's — the first BRANCHING case in this function, which also exposed and fixed the same
+    "shared `_seen` cycle guard wrongly rejects a legitimate DAG diamond" bug already root-caused once
+    for VITS's `_resolve_scalar_expr` — removed here too, for the identical reason: MIL/SSA graphs are
+    acyclic by construction); `upsample_nearest_neighbor`/`upsample_bilinear` (scale the matching
+    height/width axis by its own real constant factor, passing every other axis through unscaled);
+    `cumsum`/`atan`/`sin`/`cos` added to the shape-preserving unary-passthrough set; `mod` added to the
+    elementwise-broadcast set (needed for `SineGen`'s own `rad_values % 1`).
+  - **`ggml_pad_ext`/`ggml_pad_reflect_1d` (`PAD_1D`/`PAD_1D_REFLECT`) now `ggml_cont` their input if
+    non-contiguous**, the same fix `op_softmax`/every conv primitive already needed once a real strided
+    VIEW started feeding straight into them — first hit here by the STFT reflect-pad receiving a
+    non-contiguous reshape/transpose chain from SineGen's own output.
+  - **New `LoomGGUFExporter.symbol_overrides` mechanism**: this topology is the first with more than one
+    genuinely INDEPENDENT dynamic axis — `asr` (this phase's own `$n_tokens` root) plus `f0_curve`/
+    `n_curve` (2x), `noise_in` (600x), `wsum` (600x+20), none derivable from `asr` by any op (they're
+    separately-traced LEAF inputs, fixed multiples only by this wrapper's OWN architecture, not
+    recoverable from the graph at all — `get_var_info`'s own docstring already flagged this exact
+    "engine's dynamic-shape support is genuinely single-axis" limitation as unaddressed). New
+    `symbol_overrides` dict (raw MIL symbol string, e.g. `"is531"` → replacement expression, e.g.
+    `"2*n_tokens"`) lets a caller who knows the real ratio (because it's inherent to their own wrapper's
+    `forward()` signature) override it — populated in `export_kokoro_mil.py` from the REAL traced
+    symbol names (`main_func.inputs[name].shape[axis]`), not guessed.
+
+  **The shape-mismatch bug above IS ROOT-CAUSED AND FIXED — two real, general (not Kokoro-specific)
+  bugs, both fixed the same session.** The original symptom (`x = x + x_source` hitting `a=[601,...]`
+  vs `b=[31,...]`) was a red herring for what turned out to be TWO layered issues:
+
+  1. **`_infer_dynamic_dim_expr` had no case for MIL's `instance_norm` op** (only `layer_norm` was
+     handled). `AdaIN1d`'s own `nn.InstanceNorm1d` sits inside every `AdainResBlk1d` call in Generator's
+     `resblocks`/`noise_res` — any length several conv_transpose/upsample hops downstream of an
+     instance_norm output fell through to bare-symbol substitution, corrupting the SECOND (`i=1`)
+     Generator upsample stage's own input length. Fixed by folding `instance_norm` into the existing
+     `layer_norm` case (identical shape-preserving-over-every-axis formula, no new logic needed).
+  2. **The deeper bug, only exposed once #1 stopped masking it: `ggml_is_contiguous()` is not a
+     sufficient guard before ggml-cpu's own elementwise binary/unary compute kernels.** Reading
+     `ggml_is_contiguous_n`'s real implementation (`ggml.c`) directly: it treats `ne[0]==1` as
+     VACUOUSLY satisfying the "`nb[0]` == element size" check, regardless of the tensor's actual
+     declared stride there — correct for most of ggml's own ne[0]-agnostic consumers, but
+     `ggml-cpu/binary-ops.cpp`'s own vectorized compute loop asserts `nb00 == sizeof(src0_t)`
+     unconditionally, with no such carve-out (confirmed by direct binary-level GDB inspection of the
+     crashing tensor once source-level debugging hit a dead end — no debug symbols in the ggml shared
+     libs — computing `ggml_tensor` field offsets from `ggml.h` by hand and reading `dst`/`src[0]`/
+     `src[1]` straight out of registers/memory at the exact `ggml_compute_forward_{mul,sub,sin,...}`
+     call site). First hit by SineGen's `f0 * float(k)` (this project's own trace-friendly rewrite of a
+     real broadcast multiply): `f0` is fresh off a real `.transpose(1,2)` call, producing a genuinely
+     PERMUTED tensor with `ne[0]=1` (the trailing torch axis) and a non-unit `nb[0]`.
+     `ggml_is_contiguous()` reports it contiguous, every existing guard built on exactly that call let
+     it straight through, and the compute-time `GGML_ASSERT` aborted with NO informative message at all
+     — a raw crash predating every other informative-error convention this project already established
+     for shape mismatches, not even a `SchemaError`. Once `op_mul` was fixed the identical crash
+     resurfaced one at a time in `op_sub`/`ggml_compute_forward_sin` and finally in
+     `primitives_mil.cpp`'s own `sub_broadcast`/`mul_broadcast`/`add_broadcast` helpers (used by
+     `op_greater`/`op_less`/`op_select`/etc. — `_f02uv`'s `f0 > self.voiced_threshold` hits
+     `sub_broadcast` directly, which had NO contiguity guard at all, unlike `op_sub`). Fixed with a new
+     shared `ensure_packed(ctx, t)` helper (duplicated per-TU, matching this project's own established
+     convention — see `promote_i32_to_f32`) that checks `nb[0] == ggml_type_size(t->type)` explicitly,
+     not just `ggml_is_contiguous()`, applied broadly across EVERY elementwise unary/binary primitive in
+     `primitives_basic.cpp` (add/sub/mul/div/floor_div/sqr/sqrt/rsqrt/log/atan/atan2/pow/sigmoid/tanh/
+     exp/sin/cos/floor/silu/relu/leaky_relu/cumsum/softmax/softplus/gelu/swiglu/rms_norm/layer_norm/
+     interpolate_1d/pad_1d/pad_1d_reflect) and `primitives_mil.cpp`'s three broadcast helpers plus
+     abs/neg/sign — not just the one call site that happened to crash first, since every one of these
+     shared the identical latent vulnerability whenever fed a real permuted tensor with a size-1 leading
+     axis (the ones with `ggml_map_custom1/2`-based implementations — `rsqrt`/`atan`/`atan2`/`pow` — had
+     an even sharper version of this bug: no crash at all, just SILENTLY WRONG values, since their own
+     manual flat-index loops assume full packing without any check whatsoever).
+
+  **Numerically NOT yet verified** (no reference exists for this phase), but now confirmed
+  STRUCTURALLY correct end-to-end: `tests/test_e2e_kokoro_mil_decoder_vocoder_smoke.cpp` builds AND
+  COMPUTES the full topology (not just builds it), producing a finite waveform. VITS's own MIL export
+  re-verified bit-identical after every fix in this whole section (`test_e2e_vits_mil_lua_driver`:
+  49671/49671 checks; `test_e2e_vits_mil_flow_vocoder_reference`: 7/7 checks) — the `ensure_packed`
+  fixes are broad enough that a regression there would have been the most likely place to see one.
+
+  **Remaining for a complete Kokoro MIL export**: the CustomAlbert+bert_encoder MIL phase (no LSTM,
+  should be comparatively straightforward — a real transformer stack, same shape as Qwen3/LFM2's own
+  attention blocks); wiring the LSTM-bound bespoke `duration_predictor`/`text_encoder`/`f0n` GGUFs
+  together with the two new MIL phases via a new `kokoro_driver_mil.lua` (mirroring `kokoro_driver.lua`'s
+  own 9-stage orchestration, but with 2 of those stages replaced by single MIL calls); full numerical
+  verification against
+  `reference_forward_kokoro_*.py` (none exist yet for the decoder_vocoder phase) and a real end-to-end
+  driver test analogous to `test_e2e_vits_mil_lua_driver`.
+- **Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** Should still be checked against the ORIGINAL
+  two VITS-derived failure modes (dynamic pad on rank≥3 tensors; boolean-mask-indexed transforms) AND
+  the newer ones Kokoro's own decoder_vocoder phase surfaced above (LSTM usage forcing a hybrid
+  MIL/bespoke split; `F.interpolate` rank-4 requirements; grouped/depthwise `conv_transpose`; scalar-
+  constant GGUF serialization) before assuming any of them will trace cleanly. StyleTTS2 is still the
   one likely to stay bespoke regardless — its diffusion sampler's ~3e-3 residual mismatch persisted even
   with hand-matched float32 host math, and an auto-traced version gives less control to chase that kind
   of thing down.
