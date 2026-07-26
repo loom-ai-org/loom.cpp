@@ -412,14 +412,160 @@ SupertonicTTS, StyleTTS2.
   down from ~1.14 before the fp16/bias fixes above (see that section for why the original ~1.14 was
   wrongly attributed to STFT precision amplified by this checkpoint's `xscale=32.0`). Full `ctest` clean,
   zero regressions.
-- **VITS, Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started, unaffected by any of the above** (none
-  of them touch NeMo's ASR preprocessing/masking/subsampling machinery at all). Plausible but unproven —
-  their two historical showstoppers (STFT/ISTFT, and LSTM) were exactly what got generalized into the MIL
-  exporter as follow-up work, and their iterative bits (flow reverse-steps, Euler CFM, RNG-fed sampling) are
-  fixed-depth, so should trace as one static graph with noise supplied as an input tensor. StyleTTS2 is the
-  one likely to stay bespoke — its diffusion sampler's ~3e-3 residual mismatch persisted even with
-  hand-matched float32 host math, and an auto-traced version gives less control to chase that kind of thing
-  down.
+- **VITS (piper) — DONE and numerically verified, `export_vits_mil.py`.** Traces the REAL
+  `piper_train.vits.models.SynthesizerTrn` submodules directly (TextEncoder, StochasticDurationPredictor,
+  ResidualCouplingBlock, HiFi-GAN Generator) via three wrapper modules mirroring
+  `tools/convert_piper_vits/convert_vits.py`'s own phase split (`stats`/`logw`/`flow_vocoder` —
+  GraphTopology supports one declared output per topology, and the duration predictor's own output
+  determines the total frame count, a genuinely data-dependent value the host must compute between
+  phases 1 and 2). Unlike every MIL export before it, this one needed real NEW infrastructure, not just
+  new op translations, because two of piper's real modules use patterns plain `torch.jit.trace` cannot
+  correctly capture at all (not just "not yet translated" — genuinely mis-traces):
+
+  - **`MultiHeadAttention`'s relative-position shift trick (`_get_relative_embeddings`/
+    `_relative_position_to_absolute_position`/`_absolute_position_to_relative_position`) uses `F.pad`
+    with a DYNAMIC pad amount on a rank≥3 tensor.** coremltools' own `pad` converter hard-rejects this
+    at the frontend level — confirmed via its own source comment: `mb.pad`'s dynamic-padding support is a
+    genuine CoreML **runtime** limitation (rank-1 tensors only), not a converter gap. Fixed with two
+    per-call-site tricks, both verified bit-identical to the real piper code (across lengths both above
+    and below `window_size+1`, i.e. both of the real code's own branches) via a standalone pure-eager
+    equivalence check before ever tracing anything: (1) `_get_relative_embeddings` pads its FIXED-size
+    learned table by a generous STATIC bound unconditionally, then dynamically SLICES out the real
+    window (only dynamic pad *amounts* are the problem; dynamic slicing is already well-supported) — the
+    real code's window in the table's own pre-pad coordinates is provably the same formula regardless of
+    which of its two branches would have fired, so this is exact, not an approximation; (2) the two
+    "shift trick" helpers instead pad via CONCAT (no rank restriction), building the zero block from a
+    same-dynamically-sized SLICE of the tensor itself multiplied by 0 rather than constructing a raw
+    dynamic-shape `torch.zeros(...)` argument list (whose own frontend conversion has a different,
+    unrelated bug: `.narrow` with a dynamic length fails outright; `x[..., :right]` slicing doesn't).
+  - **`StochasticDurationPredictor`'s `ConvFlow` uses a boolean-mask-indexed rational-quadratic spline
+    transform (`transforms.py::piecewise_rational_quadratic_transform`) — genuinely data-dependent output
+    shape, not something any pad/slice rewrite can fix.** Bridged via a new custom op,
+    `torch.ops.loom.spline_inverse` (`tools/loom_mil_compiler/vits_spline_op.py`, registered via
+    `torch.library.custom_op` — same pattern as the older `aten_to_loom` pipeline's
+    `loom::rope_neox`/`loom::attention`, applied here to coremltools' MIL frontend instead via a new
+    `@register_torch_op` hook), into MIL's `loom_spline` op. That MIL op turned out to already exist as
+    unwired scaffolding in `dialect.py` from an early, abandoned prototype (never imported anywhere,
+    and broken against the current coremltools version — `TensorInputType` now requires `type_domain`,
+    fixed as part of this work) — composed by a new `exporter.py` translation down to the
+    already-independently-verified `RQ_SPLINE_INVERSE` ggml primitive
+    (`src/ops/primitives_spline.cpp`, itself already using an elementwise inside/outside-mask blend
+    instead of boolean indexing, precisely because it hits the identical problem in C++ terms). Verified
+    standalone (a tiny isolated `ConvFlow`-shaped trace, `RQ_SPLINE_INVERSE`'s own C++ output vs. the
+    real `piecewise_rational_quadratic_transform`, max abs diff ~1.5e-6 including out-of-tail-bound
+    inputs) before integrating into the full model.
+
+  Two real, general (not VITS-specific) exporter bugs found and fixed getting the full model to build
+  and run correctly at a real T (62, "Hello world, this is a test.") rather than just at the dummy trace
+  T (both previously masked because every earlier MIL model's own dummy/real trace lengths happened not
+  to expose them):
+  - **`_resolve_scalar_expr`'s cycle guard (`id(v) in _seen`) treated any DAG DIAMOND as a false cycle.**
+    Unlike `_infer_dynamic_dim_expr`'s single-input producer-chain walk (where a "cycle" really would be
+    unreachable), this function recurses into TWO operands per arithmetic op, so the SAME upstream scalar
+    legitimately gets reached via two different paths in an ordinary expression tree — confirmed on
+    `end = start + 2*length - 1`, where `start` and the `2*length` term both independently reference the
+    same `length`-derived `gather` var. The second reference hit the guard and silently returned `None`,
+    so `slice_by_index`'s "end" bound fell back to the axis's full unsliced extent while "begin" (whose
+    own resolution never revisits the var a second time) looked completely fine — the sliced
+    relative-position table came out ~34x too long at T=62, one axis short of crashing GraphBuilder's own
+    RESHAPE element-count check downstream. MIL/SSA graphs are acyclic by construction (an op's inputs
+    always name EARLIER-defined vars, never itself), so the guard was simply removed rather than scoped
+    more narrowly.
+  - **`_infer_dynamic_dim_expr` didn't walk through `leaky_relu` or `conv_transpose`.** HiFi-GAN's 3-stage
+    upsample chain interleaves `conv_transpose` (real, biased, `pad_type="custom"` — the FIRST biased
+    conv_transpose and the first non-"valid"-padding conv_transpose this exporter has ever hit; composed
+    as a full/valid conv_transpose + bias-ADD + crop-VIEW, needing a new `conv_transpose` case in
+    `_infer_dynamic_dim_expr` itself for the crop's own dynamic length — real formula `(L_in-1)*stride -
+    (pad_before+pad_after) + kernel`) with `leaky_relu` activations between stages. Missing `leaky_relu`
+    from the unary-passthrough set broke the recursive dynamic-length derivation exactly at that boundary
+    — stage 2 of 3 silently read only stage 1's first 1/8th (64 of 512 real elements), corrupting the
+    rest of the vocoder's output. `conv_transpose` also needed adding to `get_var_info`'s own
+    "always re-derive, don't blind-substitute" producer set (alongside the existing `reshape`/`fill`
+    cases) — MIL's own type inference already reports a COMPOSITE formula for a conv_transpose's output
+    (e.g. `"8*is50"` for a stride-8 upsample), and blind per-symbol substitution is provably wrong
+    whenever the input is itself an already-derived length (chained upsample stages): `is50` doesn't mean
+    "n_tokens", it means "8*n_tokens" one stage up.
+  - Also fixed along the way (smaller, mechanical): `torch.flip` (VITS's `Flip` module) had no MIL
+    translation at all — composed via the same `GET_ROWS`-with-baked-reversed-index trick
+    `convert_vits.py`'s own hand-built `add_flip` already used, restricted to ne_axis==1 (GET_ROWS' own
+    native reversal axis) since that's the only pattern needed so far. `leaky_relu` and `F.gelu` (DDSConv)
+    had no translation/had a latent bug respectively (`gelu`'s MIL op carries an extra "mode" string
+    input the generic OP_MAP fallback would otherwise add as a bogus second ggml node input — rejected
+    outright, rather than silently mismatched, if a future model traces gelu's TANH-approximate variant
+    instead of the EXACT/erf one ggml's own `GELU` primitive always computes). `op_gelu`
+    (`src/ops/primitives_basic.cpp`) gained the same "cont a non-contiguous input first" fix `op_softmax`/
+    every conv primitive already had, needed once DDSConv started feeding a real strided intermediate
+    straight into it.
+
+  **Numerically verified end-to-end against `reference_forward_vits.py`'s real-checkpoint reference at
+  T=62**: `stats` max abs diff ~3.3e-6 (`m_p`) / ~9.5e-7 (`logs_p`), `logw` max abs diff ~7.9e-6,
+  `flow_vocoder` waveform max abs diff ~5.4e-8 (small-scale Tp=8 case) / ~5.7e-7 (realistic-scale T=194
+  case, see below). Full `ctest` clean throughout (zero regressions).
+
+  **Packaged and wired up the same way every other Lua-ported model is** — NOT into `loom::VitsDriver`
+  (`src/core/vits_driver.cpp`, the pre-procedural-generalization C++ driver, now legacy/oracle-only, kept
+  only as the reference the bespoke topology's own `vits_driver.lua` was checked against when that
+  architecture landed). `export_vits_mil.py` packs all three topologies (`stats`/`logw`/`flow_vocoder`)
+  plus a new hand-written orchestration script, `tools/convert_piper_vits/vits_driver_mil.lua`, into one
+  combined `vits_mil.gguf` (mirroring `convert_vits_lua_all.py`'s own packing for the bespoke topology).
+  The cross-phase host logic (duration-based frame expansion, RNG sampling) is genuine host control flow
+  no amount of MIL tracing can produce either way — it was always hand-written, in Lua, regardless of
+  whether the topologies underneath are hand-built or machine-traced; `vits_driver_mil.lua`'s own math is
+  IDENTICAL to `vits_driver.lua`'s, differing only in the new topologies' own conventions (no host-side
+  `emb_rel_k`/`emb_rel_v`/`attn_mask` plumbing needed at all — computed in-graph now; `stats`/`z_p` are
+  T-fast, not channel-fast — see the script's own comments for why). One real exporter-side bug surfaced
+  building this: each independently-traced phase's own topology serializes small internal constants under
+  auto-generated, per-program-local SSA names (e.g. `"_235"`) that trivially collide by coincidence across
+  three SEPARATELY traced programs without meaning the same thing — fixed by giving each phase's own
+  `generate_graph_topology` call a real per-phase `func_name` (namespacing every weight as
+  `f"{phase}.{weight_name}"`) instead of the `"main_topo"`/`profile="monolithic"` combo every other
+  single-topology `export_*_mil.py` script uses (which deliberately disables namespacing, correct for "one
+  file per topology" but wrong for "three phases sharing one file").
+
+  **Found and root-caused a real, previously-uncaught correctness bug in the BESPOKE topology while
+  building the end-to-end driver test — not a bug in the new MIL pipeline.** A first version of
+  `test_e2e_vits_mil_lua_driver.cpp` compared the new pipeline's full-synthesis waveform against
+  `loom::VitsDriver`'s own (the bespoke topology's oracle) and found a large, real divergence (~0.22
+  absolute, against a ~0.01-0.02 rms signal) — NOT the expected ~1e-6-level match. Isolating it (dumping
+  the real end-to-end `z_p` from both pipelines — confirmed numerically IDENTICAL to ~5e-6, ruling out the
+  new pipeline's own `stats`/`logw`/generate_path/RNG math — then feeding that same real `z_p` into (a)
+  the new MIL `flow_vocoder` topology, (b) the bespoke `flow_vocoder` topology, and (c) a real PyTorch
+  `ResidualCouplingBlock`+`Generator` forward pass, all three independently) found: **(a) matches (c) to
+  ~1.2e-6; (b) diverges from (c) by ~0.22 — the same magnitude as the original end-to-end mismatch.** The
+  bespoke topology (`convert_vits.py`'s hand-built `RESIDUAL_COUPLING_LAYER_REVERSE`/HiFi-GAN composition)
+  is the one that's wrong, not the new one. Root cause of why this was never caught: the bespoke path's
+  own numerical verification (`reference_forward_vits.py`/`test_e2e_vits_flow_vocoder_reference.cpp`) has
+  ONLY ever used a small-scale synthetic `z_p` (`torch.randn(1,192,8)*0.5`, so values roughly in
+  [-1.9, 2.0]) — real end-to-end `z_p` (duration-expanded, T=194 for this test's real input) has values up
+  to ±24 (confirmed: re-verified the new MIL topology against i.i.d. random `z_p` at that SAME wide range,
+  still matched to ~5.7e-7 — magnitude alone isn't what triggers it, something about the bespoke
+  primitives specifically mishandles it). The exact mechanism inside `primitives_flow.cpp`'s
+  `RESIDUAL_COUPLING_LAYER_REVERSE`/the hand-composed HiFi-GAN ops was NOT further chased down (out of
+  scope for finishing the MIL export) — this is a known, reproducible, but not-yet-root-caused bug in
+  the bespoke path specifically, left as-is since the MIL-traced path is intended to supersede it. A new
+  fixture (`reference_forward_vits_widerange.py`, T=194, `z_p` up to ±24) plus
+  `test_e2e_vits_mil_flow_vocoder_reference.cpp` (green) captures this as a proper regression test for the
+  new topology; the existing small-scale bespoke fixture/test are left untouched (still green, but now
+  known not to be a reliable correctness signal at realistic scale).
+  `test_e2e_vits_mil_lua_driver.cpp` was rewritten accordingly — it no longer compares against the
+  (known-unreliable-at-scale) bespoke oracle, only checks the full Lua-orchestrated synthesis runs
+  end-to-end and produces a finite, plausible waveform; the real numerical confidence comes from the
+  per-phase reference tests instead.
+
+  **Open, not yet done:** root-causing and fixing the bespoke `flow_vocoder` bug itself (or just retiring
+  the bespoke topology/driver in favor of this one, given the correctness gap just found); deciding
+  whether to keep the bespoke topology around at all afterward.
+- **Kokoro, Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** VITS's own experience revises the
+  earlier optimistic prediction here: "should trace as one static graph with noise supplied as an input
+  tensor" undersold the real risk — TWO of piper's real modules needed genuinely new infrastructure
+  (a coremltools *runtime* pad limitation, not just a missing translation; a custom op bridge for
+  boolean-mask-indexed math no rewrite can avoid), not simply "new ops to wire up". Kokoro/Matcha-TTS/
+  SupertonicTTS should still be checked against the SAME two failure modes specifically (dynamic pad on
+  rank≥3 tensors anywhere in their own attention/positional machinery; boolean-mask-indexed transforms
+  anywhere in their own flow/sampling code) before assuming they'll trace cleanly. StyleTTS2 is still the
+  one likely to stay bespoke regardless — its diffusion sampler's ~3e-3 residual mismatch persisted even
+  with hand-matched float32 host math, and an auto-traced version gives less control to chase that kind
+  of thing down.
 
 The real tradeoff: doing this would replace ~10 hand-verified conversion scripts with one generic path, but
 trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it

@@ -930,6 +930,22 @@ target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
 set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- MIL exporter: VITS retraced via export_vits_mil.py (real SynthesizerTrn submodules, not the
+#     hand-built bespoke topology above) + tools/convert_piper_vits/vits_driver_mil.lua. See
+#     BACKLOG.md's VITS MIL-export entry. ---
+add_executable(test_e2e_vits_mil_lua_driver test_e2e_vits_mil_lua_driver.cpp)
+target_link_libraries(test_e2e_vits_mil_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_mil_lua_driver COMMAND test_e2e_vits_mil_lua_driver)
+set_tests_properties(test_e2e_vits_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- MIL exporter: flow+vocoder topology vs. a REALISTIC-scale real-PyTorch reference (T=194, z_p up
+#     to +-24) -- the fixture that caught a real bug in the bespoke topology (see the test's own
+#     docstring and BACKLOG.md). ---
+add_executable(test_e2e_vits_mil_flow_vocoder_reference test_e2e_vits_mil_flow_vocoder_reference.cpp)
+target_link_libraries(test_e2e_vits_mil_flow_vocoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_vits_mil_flow_vocoder_reference COMMAND test_e2e_vits_mil_flow_vocoder_reference)
+set_tests_properties(test_e2e_vits_mil_flow_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Procedural generalization: Kokoro-82M, the largest driver ported so far (43 topologies, 6 BiLSTM
 #     instances host-stepped via loom.run_subgraph Lua for-loops, the new loom.uniform_array binding for
 #     SineGen's rand_ini draws), ported to Lua (tools/convert_kokoro/kokoro_driver.lua) and compared

@@ -460,7 +460,12 @@ Outputs op_gelu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // ggml_gelu_erf computes the exact 0.5*x*(1+erf(x/sqrt(2))) formula (no lookup table), unlike
     // ggml_gelu/ggml_gelu_quick which are tanh/sigmoid approximations -- chosen for exact reproducibility
     // against a numpy reference, same rationale as ATTENTION's composite (non-flash) path.
-    return {ggml_gelu_erf(pc.ctx, in[0])};
+    // ggml_unary (which ggml_gelu_erf composes to) asserts contiguous rows -- needed once VITS's DDSConv
+    // started feeding a real strided VIEW/CONT-less intermediate straight into GELU, same "cont before
+    // unary/softmax/conv ops that assert dense strides internally" fix already applied to op_softmax and
+    // every conv primitive.
+    ggml_tensor* x = ggml_is_contiguous(in[0]) ? in[0] : ggml_cont(pc.ctx, in[0]);
+    return {ggml_gelu_erf(pc.ctx, x)};
 }
 
 Outputs op_swiglu(PrimitiveContext& pc, const Inputs& in, const Json&) {

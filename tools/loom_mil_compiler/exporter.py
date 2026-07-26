@@ -170,6 +170,7 @@ class LoomGGUFExporter:
         _UNARY_PASSTHROUGH_OPS = {
             "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
+            "leaky_relu",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -295,6 +296,42 @@ class LoomGGUFExporter:
             if in_expr is None:
                 return None
             return f"(floor((({in_expr}) + {pad_before + pad_after} - {eff_kernel}) / {stride}) + 1)"
+
+        if op.op_type == "conv_transpose":
+            # Mirrors the "conv" case just above, using ConvTranspose1d/2d's own inverse length
+            # formula: L_out = (L_in-1)*stride - (pad_before+pad_after) + eff_kernel (dilation=1,
+            # output_padding=0 always -- this exporter's own conv_transpose translation already rejects
+            # anything else). First needed by HiFi-GAN's upsample stages (VITS): stage 0's real output
+            # length is "(n_tokens-1)*8 - 8 + 16" = "n_tokens*8", NOT a bare "n_tokens" substitution --
+            # confirmed wrong via the same class of bug this whole method exists to avoid. `weight`'s
+            # layout for conv_transpose is [in_channels, out_channels/groups, *kernel] -- kernel starts
+            # at axis 2, same offset as "conv"'s own weight layout.
+            x_var = op.inputs.get("x")
+            weight_var = op.inputs.get("weight")
+            strides = op.inputs.get("strides").val if "strides" in op.inputs and hasattr(op.inputs["strides"], "val") else None
+            pad = op.inputs.get("pad").val if "pad" in op.inputs and hasattr(op.inputs["pad"], "val") else None
+            dilations = op.inputs.get("dilations").val if "dilations" in op.inputs and hasattr(op.inputs["dilations"], "val") else None
+            if x_var is None or weight_var is None or strides is None or x_var.shape is None:
+                return None
+            rank = len(var.shape)
+            if torch_axis == 0:
+                return "1"
+            if torch_axis == 1:
+                return None
+            spatial_idx = torch_axis - 2
+            n_spatial = rank - 2
+            if n_spatial not in (1, 2) or spatial_idx >= n_spatial:
+                return None
+            stride = int(strides[spatial_idx]) if spatial_idx < len(strides) else 1
+            dilation = int(dilations[spatial_idx]) if dilations is not None and spatial_idx < len(dilations) else 1
+            kernel = int(weight_var.shape[2 + spatial_idx])
+            eff_kernel = dilation * (kernel - 1) + 1
+            pad_before = int(pad[2 * spatial_idx]) if pad is not None and 2 * spatial_idx < len(pad) else 0
+            pad_after = int(pad[2 * spatial_idx + 1]) if pad is not None and 2 * spatial_idx + 1 < len(pad) else 0
+            in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+            if in_expr is None:
+                return None
+            return f"((({in_expr}) - 1) * {stride} - {pad_before + pad_after} + {eff_kernel})"
 
         if op.op_type == "matmul":
             # `matmul(x, y, transpose_x, transpose_y)`'s output rank-2 axes: the last axis comes from
@@ -795,9 +832,22 @@ class LoomGGUFExporter:
         """
         if _seen is None:
             _seen = set()
-        if v is None or not isinstance(v, Var) or id(v) in _seen:
+        if v is None or not isinstance(v, Var):
             return None
-        _seen.add(id(v))
+        # NOT a linear-chain cycle guard (this function recurses into TWO operands per arithmetic op,
+        # unlike `_infer_dynamic_dim_expr`'s single-input producer-chain walk) -- MIL/SSA graphs are
+        # acyclic by construction (an op's inputs always name EARLIER-defined vars, never itself), so a
+        # genuine infinite loop here is architecturally impossible. Treating "already visited" as a
+        # failure was a real bug, not just defensive-and-harmless: a DIAMOND dependency (the same
+        # upstream var reached via two different operand paths) is completely ordinary in an arithmetic
+        # expression tree -- confirmed on VITS's `end = start + 2*length - 1`, where `start` and the
+        # `2*length` term both independently reference the same `length`-derived `gather` var. The
+        # SECOND reference used to hit `id(v) in _seen` and silently return None, even though nothing
+        # about it was actually unresolvable -- `slice_by_index`'s "end" bound came back `None` and fell
+        # back to the axis's full (unsliced) extent, corrupting the sliced relative-position table
+        # (silently ~34x too long at a real T=62) while `begin` (whose OWN resolution never revisits
+        # `gather_0` a second time) looked completely fine. `_seen` is kept (threaded through, unused)
+        # rather than dropped from the signature, to keep every call site below unchanged.
         if getattr(v, "val", None) is not None:
             arr = np.asarray(v.val).reshape(-1)
             if arr.size == 1:
@@ -805,11 +855,21 @@ class LoomGGUFExporter:
                 return int(f) if f.is_integer() else f
             return None
         if v.op is None:
-            # A genuine function input with no producer -- the only one this whole exporter ever feeds a
-            # real per-utterance length into is "length" itself (see the "less"/CMVN-identity-check use
-            # of this function below, which needs to resolve all the way down to the base symbol, not
-            # just gather-derived shape values `_try_derive_gather_shape_value` already handles).
-            return "n_tokens" if v.name == "length" else None
+            # A genuine (sub)function input with no producer -- the same "this IS the topology's one
+            # true dynamic quantity" case `_infer_dynamic_dim_expr` treats unconditionally as "n_tokens"
+            # (see its own docstring). Originally gated to `v.name == "length"` only (NeMo's Conformer-
+            # CTC always feeds a real per-utterance length in under that exact name) -- too narrow for
+            # VITS's `MultiHeadAttention._get_relative_embeddings`, whose own dynamic `length` scalar
+            # traces back to `key.size(2)` (a plain shape query on an ACTIVATION, not a declared
+            # "length" input) and bottoms out at some other producer-less var entirely -- confirmed this
+            # was exactly why `padded[:, start:end]`'s `start` (`pad + (window_size+1) - length`)
+            # resolved to `None` and silently fell back to the slice's full extent (a real element-count
+            # bug: the sliced relative-position table came out ~34x too long at T=62, one axis short of
+            # crashing GraphBuilder's own RESHAPE element-count check downstream). Every producer-less
+            # scalar this whole exporter's single-true-dynamic-axis design ever reaches IS that quantity,
+            # matching `_infer_dynamic_dim_expr`'s own unconditional treatment -- not just ones spelled
+            # "length".
+            return "n_tokens"
         op = v.op
         if op.op_type in ("cast", "squeeze", "identity", "expand_dims"):
             inner = op.inputs.get("x") or op.inputs.get("data")
@@ -998,17 +1058,25 @@ class LoomGGUFExporter:
                     # docstring for why the bare substitution below isn't always correct); normally only
                     # attempted for a BARE lone symbol (an already-composite expression, e.g.
                     # "is936*is937.../1024", is left to the substitution path unchanged) -- EXCEPT for a
-                    # `reshape`/`fill` producer, where `_infer_dynamic_dim_expr`'s own case ignores the
-                    # textual shape entirely (it re-derives straight from the op's "shape" INPUT via
-                    # `_try_resolve_reshape_shape_input`), so it's just as trustworthy on a composite
-                    # string as a bare one. Needed for Conformer-CTC's `rel_shift`: `x_31`'s `-1`-inferred
-                    # axis (see the "reshape" case's own literal-`-1` handling) gets reported by MIL's
-                    # OWN type inference as a genuinely COMPOSITE expression ("isN + 1", from the pad
-                    # immediately upstream) once propagated through this reshape, not a bare symbol --
-                    # blind substitution alone silently turned that into "n_tokens + 1" instead of the
-                    # real subsampled-frame-count formula.
+                    # `reshape`/`fill`/`conv_transpose` producer, where blind substitution is provably
+                    # wrong rather than just untrustworthy: `reshape`/`fill`'s own case ignores the
+                    # textual shape entirely (re-derives straight from the op's "shape" INPUT via
+                    # `_try_resolve_reshape_shape_input`). `conv_transpose` is different but equally
+                    # unsafe to blind-substitute -- MIL's OWN type inference for it already reports a
+                    # composite formula over the INPUT's symbol (e.g. "8*is50" for a stride-8 upsample),
+                    # and that symbol does NOT represent "n_tokens" itself whenever the input is already a
+                    # DERIVED length (chained upsample stages, e.g. HiFi-GAN's 3-stage Generator) --
+                    # blindly substituting "is50"->"n_tokens" produced "8*n_tokens" for a stage whose real
+                    # length was "64*n_tokens" (is50 itself already meant "8*n_tokens"), confirmed on
+                    # VITS: stage 2 of 3 silently read only 64 elements of stage 1's real 512-element
+                    # output, corrupting the whole rest of the vocoder. Needed for Conformer-CTC's
+                    # `rel_shift`: `x_31`'s `-1`-inferred axis (see the "reshape" case's own literal-`-1`
+                    # handling) gets reported by MIL's OWN type inference as a genuinely COMPOSITE
+                    # expression ("isN + 1", from the pad immediately upstream) once propagated through
+                    # this reshape, not a bare symbol -- blind substitution alone silently turned that
+                    # into "n_tokens + 1" instead of the real subsampled-frame-count formula.
                     inferred = None
-                    if _DYNAMIC_SYMBOL_RE.fullmatch(dim_str) or (var.op is not None and var.op.op_type in ("reshape", "fill")):
+                    if _DYNAMIC_SYMBOL_RE.fullmatch(dim_str) or (var.op is not None and var.op.op_type in ("reshape", "fill", "conv_transpose")):
                         torch_axis = list(var.shape).index(dim)
                         inferred = self._infer_dynamic_dim_expr(var, torch_axis)
                     shape.append(inferred if inferred is not None else _DYNAMIC_SYMBOL_RE.sub("n_tokens", dim_str))
@@ -2012,6 +2080,180 @@ class LoomGGUFExporter:
                     )
                 continue
 
+            if op_type == "gelu":
+                # MIL's `gelu` carries an extra "mode" string input (PyTorch's `approximate=` arg,
+                # "EXACT" or "TANH") the generic OP_MAP fallback below would otherwise add as a second
+                # (bogus, string-typed) ggml node input -- first hit by VITS's DDSConv (`F.gelu(y)`, no
+                # `approximate=` -> PyTorch's own default "none"/exact). ggml's own GELU primitive
+                # (op_gelu, src/ops/primitives_basic.cpp) always computes the EXACT erf formula
+                # (`ggml_gelu_erf`, chosen there for reproducibility over the tanh/sigmoid lookup-table
+                # approximations) -- correct for this case, but reject rather than silently mismatch if a
+                # future model traces the "TANH" approximate variant instead.
+                mode_var = op.inputs.get("mode")
+                mode = (mode_var.val if mode_var is not None and hasattr(mode_var, "val")
+                        and mode_var.val is not None else "EXACT")
+                if str(mode).upper() not in ("EXACT", "NONE"):
+                    raise NotImplementedError(
+                        f"gelu op '{op.name}' has mode={mode!r} -- ggml's GELU primitive only computes "
+                        "the exact erf formula, not TANH/sigmoid approximations."
+                    )
+                x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+                nodes.append({
+                    "op": "GELU",
+                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                    "outputs": [self.safe_name(op.outputs[0].name)],
+                })
+                continue
+
+            if op_type == "leaky_relu":
+                # HiFi-GAN vocoder's own activation (Generator/ResBlock2, real slope=0.1/0.01) -- ggml's
+                # LEAKY_RELU primitive already exists (src/ops/primitives_basic.cpp) and just needed
+                # wiring: MIL's `leaky_relu` op names its slope input "alpha", but op_leaky_relu reads
+                # the JSON attr key "slope" specifically.
+                x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+                alpha_var = op.inputs.get("alpha")
+                slope = (float(alpha_var.val) if alpha_var is not None and hasattr(alpha_var, "val")
+                         and alpha_var.val is not None else 0.01)
+                nodes.append({
+                    "op": "LEAKY_RELU",
+                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
+                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "attrs": {"slope": slope},
+                })
+                continue
+
+            if op_type == "reverse":
+                # VITS's `Flip` (modules.py: `torch.flip(x, [1])`, the coupling-flow/SDP-flow chains'
+                # own channel-axis reversal) -- no native ggml "reverse along an axis" primitive exists,
+                # so this composes the same trick tools/convert_piper_vits/convert_vits.py's own
+                # `add_flip` already uses: `ggml_get_rows(x, indices)` selects along ne[1] (its "rows"
+                # axis, same convention as embedding lookup), so a compile-time-baked REVERSED index
+                # array of that axis's own (always-static -- Flip only ever flips VITS's small,
+                # architecture-constant channel count, 2 or `inter_channels`) size reverses it exactly.
+                # Restricted to a single static ne_axis==1 flip since that's the only pattern any model
+                # on this exporter's roadmap has needed; a different axis would need a PERMUTE bridge
+                # first (same "cross conventions via PERMUTE+CONT" pattern used throughout this file).
+                x_var = self.safe_name(op.inputs["x"].name)
+                output_var = self.safe_name(op.outputs[0].name)
+                axes_var = op.inputs.get("axes")
+                axes_val = (list(axes_var.val) if axes_var is not None and hasattr(axes_var, "val")
+                            and axes_var.val is not None else None)
+                if axes_val is None or len(axes_val) != 1:
+                    raise NotImplementedError(
+                        f"reverse op '{op.name}' needs exactly one static axis -- multi-axis or "
+                        "dynamic-axis flip isn't needed by any model on this exporter's roadmap yet."
+                    )
+                x_info = self.get_var_info(op.inputs["x"])
+                ne_shape = x_info["shape"]
+                rank = len(ne_shape)
+                mil_axis = int(axes_val[0])
+                if mil_axis < 0:
+                    mil_axis += rank
+                ne_axis = rank - 1 - mil_axis
+                if ne_axis != 1:
+                    raise NotImplementedError(
+                        f"reverse op '{op.name}' flips ne_axis={ne_axis}, but only ne_axis==1 "
+                        "(ggml_get_rows' own reversal axis) is composed here yet."
+                    )
+                axis_size_raw = ne_shape[ne_axis]
+                if not str(axis_size_raw).lstrip("-").isdigit():
+                    raise NotImplementedError(
+                        f"reverse op '{op.name}' flips a non-static axis ({axis_size_raw!r}) -- "
+                        "GET_ROWS-based reversal needs a compile-time-constant index array."
+                    )
+                axis_size = int(axis_size_raw)
+
+                idx_name = output_var + "_reverse_idx"
+                if func_name == "main_topo" or self.profile == "monolithic":
+                    idx_full = idx_name
+                else:
+                    idx_full = f"{func_name}.{idx_name}"
+                self.weights[idx_full] = np.arange(axis_size - 1, -1, -1, dtype=np.int32)
+
+                nodes.append({
+                    "op": "GET_ROWS",
+                    "inputs": [resolve(x_var), idx_full],
+                    "outputs": [output_var],
+                })
+                continue
+
+            if op_type == "loom_spline":
+                # VITS's rational-quadratic spline inverse (StochasticDurationPredictor's ConvFlow) --
+                # see tools/loom_mil_compiler/vits_spline_op.py's module docstring for why this is a
+                # custom torch/MIL op at all (the real implementation's boolean-mask tensor indexing
+                # can't be traced correctly). Composes down to the already-verified RQ_SPLINE_INVERSE
+                # ggml primitive (src/ops/primitives_spline.cpp), which expects `inputs` [n_tokens],
+                # `unnormalized_widths`/`unnormalized_heights` [num_bins, n_tokens],
+                # `unnormalized_derivatives` [num_bins-1, n_tokens] -- x1/uw/uh/ud's leading torch dims
+                # are always [batch=1, half_channels=1, ...] in this project's single-utterance/
+                # mean-only convention, so ggml's own reversed-shape convention already puts num_bins
+                # (or num_bins-1) at ne0 and n_tokens at ne1 with no permute needed, just a squeeze via
+                # RESHAPE. `boundary_deriv_const`/`eps_bump` are conversion-time-baked constants
+                # (depend only on num_bins/min_derivative), matching
+                # tools/convert_piper_vits/convert_vits.py's own add_conv_flow_reverse construction 1:1.
+                from .vits_spline_op import TAIL_BOUND, MIN_BIN_WIDTH, MIN_BIN_HEIGHT, MIN_DERIVATIVE
+
+                x_var = self.safe_name(op.inputs["x"].name)
+                w_var = self.safe_name(op.inputs["w"].name)
+                h_var = self.safe_name(op.inputs["h"].name)
+                d_var = self.safe_name(op.inputs["d"].name)
+                output_var = self.safe_name(op.outputs[0].name)
+
+                w_info = self.get_var_info(op.inputs["w"])
+                num_bins_raw = w_info["shape"][0]  # get_var_info stringifies every shape entry
+                if not str(num_bins_raw).lstrip("-").isdigit():
+                    raise NotImplementedError(
+                        f"loom_spline op '{op.name}' has a non-static num_bins ({num_bins_raw!r}) -- "
+                        "this is always an architecture constant (ConvFlow's own num_bins=10), never "
+                        "a real dynamic quantity."
+                    )
+                num_bins = int(num_bins_raw)
+
+                x_flat = output_var + "_spl_x"
+                nodes.append({"op": "RESHAPE", "inputs": [resolve(x_var)], "outputs": [x_flat],
+                              "attrs": {"shape": ["$n_tokens"]}})
+                w_flat = output_var + "_spl_w"
+                nodes.append({"op": "RESHAPE", "inputs": [resolve(w_var)], "outputs": [w_flat],
+                              "attrs": {"shape": [num_bins, "$n_tokens"]}})
+                h_flat = output_var + "_spl_h"
+                nodes.append({"op": "RESHAPE", "inputs": [resolve(h_var)], "outputs": [h_flat],
+                              "attrs": {"shape": [num_bins, "$n_tokens"]}})
+                d_flat = output_var + "_spl_d"
+                nodes.append({"op": "RESHAPE", "inputs": [resolve(d_var)], "outputs": [d_flat],
+                              "attrs": {"shape": [num_bins - 1, "$n_tokens"]}})
+
+                boundary_const = float(np.log(np.exp(1 - MIN_DERIVATIVE) - 1))
+                boundary_deriv_const = np.zeros(num_bins + 1, dtype=np.float32)
+                boundary_deriv_const[0] = boundary_const
+                boundary_deriv_const[-1] = boundary_const
+                eps_bump = np.zeros(num_bins, dtype=np.float32)
+                eps_bump[-1] = 1e-6
+
+                bdc_name = output_var + "_boundary_deriv_const"
+                eps_name = output_var + "_eps_bump"
+                if func_name == "main_topo" or self.profile == "monolithic":
+                    bdc_full, eps_full = bdc_name, eps_name
+                else:
+                    bdc_full, eps_full = f"{func_name}.{bdc_name}", f"{func_name}.{eps_name}"
+                self.weights[bdc_full] = boundary_deriv_const
+                self.weights[eps_full] = eps_bump
+
+                spline_out = output_var + "_spl_out"
+                nodes.append({
+                    "op": "RQ_SPLINE_INVERSE",
+                    "inputs": [x_flat, w_flat, h_flat, d_flat, bdc_full, eps_full],
+                    "outputs": [spline_out],
+                    "attrs": {
+                        "tail_bound": TAIL_BOUND, "min_bin_width": MIN_BIN_WIDTH,
+                        "min_bin_height": MIN_BIN_HEIGHT, "min_derivative": MIN_DERIVATIVE,
+                    },
+                })
+
+                out_info = self.get_var_info(op.outputs[0])
+                nodes.append({"op": "RESHAPE", "inputs": [spline_out], "outputs": [output_var],
+                              "attrs": {"shape": list(out_info["shape"])}})
+                continue
+
             if op_type == "split":
                 # Compose split as multiple zero-copy VIEW slices
                 x_var = self.safe_name(op.inputs["x"].name)
@@ -2853,11 +3095,16 @@ class LoomGGUFExporter:
             if op_type == "conv_transpose":
                 # Map conv_transpose to CONV_TRANSPOSE_1D/2D. Loom's C++ primitives
                 # (src/ops/primitives_conv.cpp's op_conv_transpose_1d/2d, backing ggml_conv_transpose_1d /
-                # ggml_conv_transpose_2d_p0) only ever support stride + zero padding + no dilation + no
-                # grouping -- the plain "valid, groups=1" case every real use so far needs (this exporter's
-                # own ISTFT module, tools/loom_mil_compiler/istft.py, and Kokoro's hand-built ISTFT/Generator
-                # upsampling both only ever call it this way). Anything else raises rather than silently
-                # dropping the extra configuration, matching this file's own "conv"/"matmul" convention.
+                # ggml_conv_transpose_2d_p0) only ever compute the UNPADDED ("valid") result -- no
+                # padding, no dilation, no grouping. `pad_type="valid"` (this exporter's own ISTFT
+                # module, Kokoro's hand-built Generator upsampling) needs nothing more. `pad_type=
+                # "custom"` with a real non-zero symmetric-or-not `pad` -- first hit by HiFi-GAN's own
+                # upsample stages (VITS's `dec.ups.*`, real `nn.ConvTranspose1d(..., padding=(kernel-
+                # stride)//2)`) -- is composed instead as the mathematically equivalent "valid conv_
+                # transpose, then crop `pad_before`/`pad_after` off each end of the spatial axis"
+                # (real ConvTranspose1d padding semantics: `L_out = (L_in-1)*stride - 2*pad + kernel`,
+                # exactly "valid"'s own `(L_in-1)*stride + kernel` minus the crop). Anything else (2D,
+                # non-unit dilation, grouped) still raises rather than silently dropping configuration.
                 strides = op.inputs["strides"].val if "strides" in op.inputs and hasattr(op.inputs["strides"], "val") else [1]
                 pad = op.inputs["pad"].val if "pad" in op.inputs and hasattr(op.inputs["pad"], "val") else [0]
                 dilations = op.inputs["dilations"].val if "dilations" in op.inputs and hasattr(op.inputs["dilations"], "val") else [1]
@@ -2868,21 +3115,24 @@ class LoomGGUFExporter:
                 pad_type = (pad_type_var.val if pad_type_var is not None and hasattr(pad_type_var, "val")
                             and pad_type_var.val is not None else "valid")
 
-                if bias_var is not None and getattr(bias_var, "val", None) is not None and np.any(bias_var.val):
-                    raise NotImplementedError(
-                        f"conv_transpose op '{op.name}' has a non-zero 'bias', which this exporter "
-                        "doesn't support (no bias-add exists in ggml_conv_transpose_1d/2d) -- compose an "
-                        "explicit ADD node after CONV_TRANSPOSE instead."
-                    )
-                if pad_type != "valid":
+                if pad_type not in ("valid", "custom"):
                     raise NotImplementedError(
                         f"conv_transpose op '{op.name}' has pad_type='{pad_type}', which this exporter "
-                        "doesn't support (ggml_conv_transpose_1d/2d only implement 'valid'-style padding)."
+                        "doesn't support (only 'valid' and a 'custom' symmetric-crop composition exist)."
                     )
-                # Torch-traced conv_transpose always carries an explicit 'output_shape' even for the
-                # ordinary case (confirmed directly) -- it's redundant with pad_type='valid''s own formula
-                # (Dout = (D_in-1)*stride + K), not a real extra constraint, so it's fine to ignore rather
-                # than reject; just sanity-check it agrees rather than trusting it blindly.
+                pad_list = list(pad) if isinstance(pad, (list, tuple, np.ndarray)) else [pad]
+                is_2d = isinstance(strides, (list, tuple, np.ndarray)) and len(strides) == 2
+                if is_2d and pad_type == "custom":
+                    raise NotImplementedError(
+                        f"conv_transpose op '{op.name}' is 2D with pad_type='custom' -- only the 1D "
+                        "crop composition has been needed/written so far."
+                    )
+                pad_before = int(pad_list[0]) if pad_type == "custom" and len(pad_list) > 0 else 0
+                pad_after = int(pad_list[1]) if pad_type == "custom" and len(pad_list) > 1 else 0
+                # Torch-traced conv_transpose always carries an explicit 'output_shape' -- it's
+                # redundant with the real formula above (valid, or valid-minus-crop for custom), not a
+                # genuine extra constraint, so it's fine to ignore rather than reject; just sanity-check
+                # it agrees rather than trusting it blindly.
                 if output_shape is not None and getattr(output_shape, "val", None) is not None:
                     x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
                     weight_var_obj = op.inputs["weight"]
@@ -2890,19 +3140,15 @@ class LoomGGUFExporter:
                     n_spatial = len(strides_list)
                     in_spatial = list(x_var_obj.shape[-n_spatial:])
                     kernel_spatial = list(weight_var_obj.shape[-n_spatial:])
-                    expected = [(int(d) - 1) * int(s) + int(k) for d, s, k in zip(in_spatial, strides_list, kernel_spatial)]
+                    expected = [(int(d) - 1) * int(s) + int(k) - pad_before - pad_after
+                                for d, s, k in zip(in_spatial, strides_list, kernel_spatial)]
                     actual = [int(v) for v in output_shape.val[-n_spatial:]]
                     if expected != actual:
                         raise NotImplementedError(
                             f"conv_transpose op '{op.name}' declares output_shape={list(output_shape.val)!r}, "
-                            f"which doesn't match the 'valid'-padding formula's own {expected!r} -- this "
-                            "combination isn't supported."
+                            f"which doesn't match this composition's own {expected!r} -- this combination "
+                            "isn't supported."
                         )
-                if any(int(p) != 0 for p in (pad if isinstance(pad, (list, tuple, np.ndarray)) else [pad])):
-                    raise NotImplementedError(
-                        f"conv_transpose op '{op.name}' has non-zero 'pad' {pad!r}, which this exporter "
-                        "doesn't support (ggml_conv_transpose_1d/2d are zero-padding only)."
-                    )
                 if any(int(d) != 1 for d in (dilations if isinstance(dilations, (list, tuple, np.ndarray)) else [dilations])):
                     raise NotImplementedError(
                         f"conv_transpose op '{op.name}' has non-unit 'dilations' {dilations!r}, which "
@@ -2916,18 +3162,61 @@ class LoomGGUFExporter:
                     )
 
                 s0 = int(strides[0]) if isinstance(strides, (list, tuple, np.ndarray)) else int(strides)
-                mapped_op = "CONV_TRANSPOSE_2D" if isinstance(strides, (list, tuple, np.ndarray)) and len(strides) == 2 else "CONV_TRANSPOSE_1D"
+                mapped_op = "CONV_TRANSPOSE_2D" if is_2d else "CONV_TRANSPOSE_1D"
 
                 x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
                 x_var = self.safe_name(x_var_obj.name)
                 weight_var = self.safe_name(op.inputs["weight"].name)
+                output_var = self.safe_name(op.outputs[0].name)
+                has_bias = bias_var is not None and getattr(bias_var, "val", None) is not None and np.any(bias_var.val)
+                needs_crop = pad_before != 0 or pad_after != 0
 
+                # Bias-add composition (mirrors the "conv" branch's own established RESHAPE-then-ADD
+                # pattern just above): ggml_conv_transpose_1d/2d have no bias-add of their own -- first
+                # hit here since HiFi-GAN's upsample ("dec.ups.{stage}") transposed convs are the first
+                # model on this exporter's roadmap to use a BIASED conv_transpose at all (this exporter's
+                # only prior conv_transpose consumers -- its own ISTFT module, Kokoro's hand-built
+                # Generator upsampling -- are both bias-free).
+                raw_var = (output_var + "_convt_raw") if (has_bias or needs_crop) else output_var
                 nodes.append({
                     "op": mapped_op,
                     "inputs": [resolve(weight_var), resolve(x_var)],
-                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "outputs": [raw_var],
                     "attrs": {"s0": s0}
                 })
+                biased_var = raw_var
+                if has_bias:
+                    bias_var_name = self.safe_name(bias_var.name)
+                    oc = int(op.outputs[0].shape[1])
+                    bias_shape = [1, 1, oc, 1] if mapped_op == "CONV_TRANSPOSE_2D" else [1, oc, 1]
+                    bias_reshaped_var = output_var + "_bias_r"
+                    biased_var = (output_var + "_convt_biased") if needs_crop else output_var
+                    nodes.append({
+                        "op": "RESHAPE",
+                        "inputs": [resolve(bias_var_name)],
+                        "outputs": [bias_reshaped_var],
+                        "attrs": {"shape": bias_shape}
+                    })
+                    nodes.append({
+                        "op": "ADD",
+                        "inputs": [raw_var, bias_reshaped_var],
+                        "outputs": [biased_var]
+                    })
+                if needs_crop:
+                    # Crop `pad_before`/`pad_after` elements off ne[0] (the spatial axis, fastest-
+                    # varying -- CONV_TRANSPOSE_1D's own convention, matching CONV_1D's) via a zero-copy
+                    # VIEW. Target shape's ne0 comes from `op.outputs[0]`'s own real (already-cropped)
+                    # MIL-inferred size -- resolved through the new "conv_transpose" case in
+                    # `_infer_dynamic_dim_expr` above rather than re-derived here, so this stays correct
+                    # even chained across multiple upsample stages.
+                    out_info = self.get_var_info(op.outputs[0])
+                    crop_shape = list(out_info["shape"])
+                    nodes.append({
+                        "op": "VIEW",
+                        "inputs": [biased_var],
+                        "outputs": [output_var],
+                        "attrs": {"shape": crop_shape, "offset": pad_before * 4}
+                    })
                 continue
 
             if op_type == "less":
