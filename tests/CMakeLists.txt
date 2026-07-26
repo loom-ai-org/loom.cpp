@@ -966,6 +966,34 @@ target_link_libraries(test_e2e_matcha_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_lua_driver COMMAND test_e2e_matcha_lua_driver)
 set_tests_properties(test_e2e_matcha_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Numerical-correctness checks for the MIL-traced Matcha-TTS topologies (export_matcha_mil.py, part
+#     of matcha_mil.gguf) against the SAME real-module reference fixtures the bespoke conversion's own
+#     per-module tests already use -- see each test's own docstring for why those fixtures are valid
+#     ground truth for the MIL wrappers too. ---
+add_executable(test_e2e_matcha_mil_text_encoder test_e2e_matcha_mil_text_encoder.cpp)
+target_link_libraries(test_e2e_matcha_mil_text_encoder PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_mil_text_encoder COMMAND test_e2e_matcha_mil_text_encoder)
+set_tests_properties(test_e2e_matcha_mil_text_encoder PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_matcha_mil_decoder test_e2e_matcha_mil_decoder.cpp)
+target_link_libraries(test_e2e_matcha_mil_decoder PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_mil_decoder COMMAND test_e2e_matcha_mil_decoder)
+set_tests_properties(test_e2e_matcha_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_matcha_mil_vocoder test_e2e_matcha_mil_vocoder.cpp)
+target_link_libraries(test_e2e_matcha_mil_vocoder PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_mil_vocoder COMMAND test_e2e_matcha_mil_vocoder)
+set_tests_properties(test_e2e_matcha_mil_vocoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Procedural generalization: the SAME Euler-ODE (CFM) sampling loop + per-token duration expansion
+#     as test_e2e_matcha_lua_driver above, but wired to the MIL-traced topologies
+#     (tools/convert_matcha/matcha_driver_mil.lua) instead of the bespoke hand-built ones -- compared
+#     against the existing loom::MatchaDriver on the real checkpoint. ---
+add_executable(test_e2e_matcha_mil_lua_driver test_e2e_matcha_mil_lua_driver.cpp)
+target_link_libraries(test_e2e_matcha_mil_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_matcha_mil_lua_driver COMMAND test_e2e_matcha_mil_lua_driver)
+set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Procedural generalization: VITS's dynamic-length relative-position table cropping (loom.get_weight
 #     + loom.pad_crop_relative_embeddings) + Gaussian-noise-interleaved duration expansion, ported to Lua
 #     (tools/convert_piper_vits/vits_driver.lua) and compared against the existing loom::VitsDriver on

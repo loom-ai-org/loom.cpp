@@ -907,7 +907,89 @@ SupertonicTTS, StyleTTS2.
     residual compound through the rest of the bespoke pipeline before ever producing a waveform, so a tight
     diff against the bespoke C++ oracle isn't a meaningful target). 22207/22207 checks passed
     (rms=0.0715, max_abs=0.391 — real speech-scale, bounded).
-- **Matcha-TTS, SupertonicTTS — not started.** Should still be checked against the ORIGINAL two
+- **Matcha-TTS — DONE, numerically verified (2026-07-26)**. `export_matcha_mil.py` traces the REAL
+  `matcha.models.components.{text_encoder,decoder}`/`matcha.hifigan.models` submodules directly (no
+  `ConformerWrapper`/LSTM path involved at all — real config uses `down_block_type="transformer"`
+  throughout, so unlike Kokoro/StyleTTS2 this model needed ZERO hybrid MIL/bespoke split) into one
+  combined `matcha_mil.gguf` (`encoder_mu`/`encoder_logw`/`decoder`/`vocoder`, wired together by a new
+  `tools/convert_matcha/matcha_driver_mil.lua`, mirroring `matcha_driver.lua`'s own Euler-CFM-sampling +
+  duration-expansion control flow). Verified against the SAME real-module reference fixtures the bespoke
+  conversion's own per-module tests already use (`reference_forward_matcha_{text_encoder,decoder,vocoder}
+  .py` — the "eager wrapper vs. real module" simplifications made here are mathematically exact for this
+  project's standing single-utterance convention, confirmed via a direct 0.0-diff eager-mode check before
+  ever tracing anything): text encoder `mu`/`logw` ~1.2e-4/~6.3e-5 max abs diff, decoder (single Euler
+  step) ~4.5e-4, vocoder ~4.2e-5. Full pipeline (MIL Lua driver vs. the existing bespoke `loom::MatchaDriver`
+  oracle, `test_e2e_matcha_mil_lua_driver.cpp`) ~0.0104 max abs diff on a 10-Euler-step/10240-sample
+  waveform — expected compounding of two independently-derived computation graphs through a nonlinear
+  HiFi-GAN vocoder, same category as Kokoro's/StyleTTS2's own documented MIL-vs-bespoke residuals, not a
+  bug (each phase already validates tight against real-module ground truth on its own).
+
+  Two real trace-friendliness patches (module-local, not general exporter fixes): (1) `sequence_mask`/
+  mask-tensor construction replaced throughout with either a direct arithmetic no-op
+  (`x[:,:1,:]*0.0+1.0`) or — once THAT was also found to trip a real exporter bug (below) inside the
+  Decoder's own multi-stage U-Net — no mask construction at all (`ResnetBlock1D`/`Block1D` reimplemented
+  mask-free, since every mask multiply is an exact no-op under this project's single-utterance
+  convention); (2) `RotaryPositionalEmbeddings`'s real mutable `cos_cached`/`sin_cached` state (a
+  `torch.jit.trace`-hostile "already built for a long enough sequence, skip" fast path) replaced with an
+  unconditional rebuild, PLUS deriving `seq_len` from the pre-rearrange tensor's own `t` axis (torch axis
+  2) rather than the post-rearrange ("t b h d") tensor's axis 0 — see below for why axis 0 specifically
+  was wrong.
+
+  Five real, general exporter/engine gaps found and fixed getting here (full `ctest` clean after every
+  one, only the pre-existing unrelated `test_e2e_lfm2_lua_driver` missing-fixture failure):
+  - Two missing OP_MAP entries (`square`→SQR, `softplus`→SOFTPLUS — both already-existing ggml
+    primitives, just never wired up; needed by `Block1D`'s Mish activation and `FeedForward`'s SnakeBeta).
+  - **`reduce_mean` always reduced ne[0] only** (`ggml_mean`'s own hard limitation, silently wrong
+    whenever the real axis isn't ne[0]) — first hit by Matcha's own hand-rolled `text_encoder.py::
+    LayerNorm` (glow-tts-derived, NOT `nn.LayerNorm`), which reduces the CHANNEL axis (torch axis 1) on a
+    (B,C,T) tensor, landing on ne[1] under this exporter's axis-reversal convention. Fixed with a
+    dedicated single-axis `reduce_mean` translation (composed as REDUCE_SUM — already a real, axis-aware
+    primitive — + SCALE by 1/N), a strict generalization of every previously-working reduce_mean usage
+    (which all happened to reduce ne[0]), confirmed via an isolated standalone LayerNorm trace/compare
+    (~3.6e-7 max abs diff) before ever touching the full model.
+  - **`nn.GroupNorm` (`Block1D`) traces to a genuine two-axis `reduce_mean(axes=[2,3])`** (per-group
+    channel count AND the dynamic time axis, jointly) — a real capability gap, not a translation bug: this
+    exporter's per-axis reduction machinery (reduce_sum/the new reduce_mean above) only ever handles ONE
+    axis, and here one of the two is genuinely dynamic (needing a runtime-computed divisor, not a static
+    SCALE). Rather than build that generality, bridged to the ALREADY-independently-verified native
+    `GROUP_NORM` ggml primitive (the exact one `convert_matcha_decoder.py`'s own bespoke topology already
+    uses) via a new custom torch/MIL op (`tools/loom_mil_compiler/group_norm_op.py`, mirroring
+    `vits_spline_op.py`'s own custom-op-bridge precedent) — `nn.GroupNorm.forward` patched globally to
+    call it. Needed its own dynamic-dim-tracking fix too: `_infer_dynamic_dim_expr` had no case for this
+    new `loom_group_norm` op type, so the backward walk used to derive a `conv_transpose` crop target (or
+    any other downstream dynamic-length consumer) stopped dead at every GroupNorm — added alongside
+    `layer_norm`/`instance_norm`'s own existing "shape-preserving over every axis" case (same formula,
+    zero per-axis distinction needed).
+  - **`conv_transpose`'s translation never inserted a CONT before a non-contiguous (PERMUTE'd) input** —
+    `ggml_conv_transpose_1d` (like plain conv's im2col) requires a contiguous source and has no assert to
+    catch a wrong stride, just aborts with `nb10 == sizeof(float)`. First hit by `Upsample1D`: the real
+    `rearrange(x, "b t c -> b c t")` immediately preceding every real `ConvTranspose1d` call is exactly a
+    `transpose` op. Fixed the same way MEAN's own identical danger was fixed for StyleTTS2 (insert an
+    always-safe CONT whenever the input is transpose-produced).
+  - **`RotaryPositionalEmbeddings`'s own `x.shape[0]` (read AFTER a `rearrange(x,"b h t d -> t b h d")`,
+    so axis 0 now means sequence length, not batch) silently resolved to the literal constant `1`** via
+    `_try_derive_gather_shape_value`'s existing "torch axis 0 of a rank≥2 tensor is always batch=1"
+    shortcut — correct for every other model (where axis 0 genuinely never means anything else) but wrong
+    here specifically because of the rearrange. Not a general exporter fix (the "axis 0 = batch" shortcut
+    stays valid everywhere else) — worked around at the wrapper level by deriving `seq_len` from the
+    ORIGINAL (pre-rearrange) tensor's own `t` axis (torch axis 2) instead, which hits the general
+    (correct) dynamic-dim backward walk. Root-caused via a standalone isolated `MultiHeadAttention`
+    trace/compare (found a real ~0.32 max abs diff, traced to a `RANGE_1D` node with `end` baked to the
+    literal string `'1'` instead of `'n_tokens'` in the raw exported JSON) — the single most subtle bug
+    of this whole conversion, silently correct-shaped but numerically wrong (no crash) since a length-1
+    position-index range still produces a plausible-looking, just wrong, rotation for every token after
+    the first.
+
+  `tools/convert_matcha/matcha_driver_mil.lua`'s own layout differs from the bespoke `matcha_driver.lua`:
+  the MIL-traced `encoder_mu`'s own `mu` output preserves the real module's native torch (1,n_feats,T)
+  layout untouched (T-fast, matching the Decoder's/vocoder's own convention directly) rather than the
+  bespoke topology's C-fast "rows_flat" one — deliberately NOT correcting this with a wrapper-level
+  `.transpose()` (a bare transpose as a topology's own final output is a live non-contiguous GGML PERMUTE
+  view, silently wrong once compiled — same danger already documented for VITS's own `StatsWrapper`).
+  Net effect: no transpose needed bridging TextEncoder→Decoder here (simpler than the bespoke driver),
+  but the per-token duration-expansion step is a direct nested-loop repeat in T-fast layout instead of
+  reusing `loom.expand_by_duration` (which wants the opposite, C-fast convention).
+- **SupertonicTTS — not started.** Should still be checked against the ORIGINAL two
   VITS-derived failure modes (dynamic pad on rank≥3 tensors; boolean-mask-indexed transforms) AND the
   newer ones Kokoro's/StyleTTS2's own MIL exports surfaced above (LSTM usage forcing a hybrid MIL/bespoke
   split; `F.interpolate` rank-4 requirements; grouped/depthwise `conv_transpose`; scalar-constant GGUF
