@@ -778,6 +778,28 @@ target_link_libraries(test_e2e_styletts2_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_driver COMMAND test_e2e_styletts2_driver)
 set_tests_properties(test_e2e_styletts2_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- MIL-traced StyleTTS2 export (export_styletts2_mil.py, styletts2_mil.gguf) numerical checks: "albert"
+#     (CustomAlbert alone) against tools/convert_kokoro's own already-verified albert_forward run against
+#     StyleTTS2's own checkpoint weights; "decoder_vocoder" against a direct reuse of export_kokoro_mil
+#     .py's own DecoderVocoderWrapper (same istftnet classes, StyleTTS2's own weights); "diffusion" (a real
+#     trace of Modules/diffusion/modules.py's Transformer1d.run(), superseding
+#     convert_styletts2_diffusion.py's own hand-derived topology) against the SAME reference fixtures
+#     test_e2e_styletts2_diffusion_net.cpp already uses. Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_styletts2_mil_albert_reference test_e2e_styletts2_mil_albert_reference.cpp)
+target_link_libraries(test_e2e_styletts2_mil_albert_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_mil_albert_reference COMMAND test_e2e_styletts2_mil_albert_reference)
+set_tests_properties(test_e2e_styletts2_mil_albert_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_styletts2_mil_decoder_vocoder_reference test_e2e_styletts2_mil_decoder_vocoder_reference.cpp)
+target_link_libraries(test_e2e_styletts2_mil_decoder_vocoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_mil_decoder_vocoder_reference COMMAND test_e2e_styletts2_mil_decoder_vocoder_reference)
+set_tests_properties(test_e2e_styletts2_mil_decoder_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_styletts2_mil_diffusion_reference test_e2e_styletts2_mil_diffusion_reference.cpp)
+target_link_libraries(test_e2e_styletts2_mil_diffusion_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_mil_diffusion_reference COMMAND test_e2e_styletts2_mil_diffusion_reference)
+set_tests_properties(test_e2e_styletts2_mil_diffusion_reference PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- SupertonicTTS v2 roadmap: ConvNextBlock (replicate-pad composition), verified against the REAL
 #     nn.Module's own forward pass (real package importable in this venv). See
 #     tools/convert_supertonic/convert_supertonic_convnext.py. Skips cleanly if env vars aren't set. ---
@@ -997,6 +1019,15 @@ add_executable(test_e2e_styletts2_lua_driver test_e2e_styletts2_lua_driver.cpp)
 target_link_libraries(test_e2e_styletts2_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_lua_driver COMMAND test_e2e_styletts2_lua_driver)
 set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Real-model test: the MIL-traced StyleTTS2 export (export_styletts2_mil.py) end-to-end, via
+#     styletts2_driver_mil.lua -- mirrors test_e2e_kokoro_mil_lua_driver.cpp's own "no oracle, orchestration
+#     sanity" scope (see that test's own docstring, and this one's, for why a tight full-pipeline diff
+#     against the bespoke C++ oracle isn't a meaningful target here). Skips cleanly if env vars aren't set. ---
+add_executable(test_e2e_styletts2_mil_lua_driver test_e2e_styletts2_mil_lua_driver.cpp)
+target_link_libraries(test_e2e_styletts2_mil_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_styletts2_mil_lua_driver COMMAND test_e2e_styletts2_mil_lua_driver)
+set_tests_properties(test_e2e_styletts2_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: LFM2-350M fully dynamic multi-topology model compiled via coremltools
 #     and Loom MIL compiler backend, executing dynamically via embedded LuaVM and GraphBuilder ---
