@@ -656,6 +656,22 @@ target_link_libraries(test_e2e_kokoro_mil_decoder_vocoder_smoke PRIVATE loom::en
 add_test(NAME test_e2e_kokoro_mil_decoder_vocoder_smoke COMMAND test_e2e_kokoro_mil_decoder_vocoder_smoke)
 set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Numerical-correctness check for the same MIL-traced Kokoro "decoder_vocoder" topology, against a
+#     real pure-PyTorch reference (reference_forward_kokoro_decoder_vocoder_mil.py) rather than the smoke
+#     test's zero-filled/structural-only check above. ---
+add_executable(test_e2e_kokoro_mil_decoder_vocoder_reference test_e2e_kokoro_mil_decoder_vocoder_reference.cpp)
+target_link_libraries(test_e2e_kokoro_mil_decoder_vocoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_mil_decoder_vocoder_reference COMMAND test_e2e_kokoro_mil_decoder_vocoder_reference)
+set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Numerical-correctness check for the MIL-traced Kokoro "albert_bert_encoder" combined topology
+#     (CustomAlbert + bert_encoder, export_kokoro_mil.py's AlbertBertEncoderWrapper) against a
+#     hand-rolled pure-PyTorch reference. ---
+add_executable(test_e2e_kokoro_mil_albert_bert_encoder_reference test_e2e_kokoro_mil_albert_bert_encoder_reference.cpp)
+target_link_libraries(test_e2e_kokoro_mil_albert_bert_encoder_reference PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_mil_albert_bert_encoder_reference COMMAND test_e2e_kokoro_mil_albert_bert_encoder_reference)
+set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Real-model test: loom::VitsDriver end-to-end (TextEncoder -> StochasticDurationPredictor ->
 #     host-side generate_path -> coupling flow -> HiFi-GAN vocoder), one level up from the structural
 #     smoke test above -- exercises the full two-phase driver, not just each topology in isolation. ---
@@ -963,6 +979,14 @@ add_executable(test_e2e_kokoro_lua_driver test_e2e_kokoro_lua_driver.cpp)
 target_link_libraries(test_e2e_kokoro_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_lua_driver COMMAND test_e2e_kokoro_lua_driver)
 set_tests_properties(test_e2e_kokoro_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Real-model test: the MIL-traced Kokoro export (export_kokoro_mil.py) end-to-end, via
+#     kokoro_driver_mil.lua -- mixes the two MIL-traced topologies with the LSTM-bound bespoke ones
+#     (kokoro_driver_mil.lua's own module docstring explains why those stay bespoke). ---
+add_executable(test_e2e_kokoro_mil_lua_driver test_e2e_kokoro_mil_lua_driver.cpp)
+target_link_libraries(test_e2e_kokoro_mil_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_mil_lua_driver COMMAND test_e2e_kokoro_mil_lua_driver)
+set_tests_properties(test_e2e_kokoro_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: StyleTTS2, the most complex driver ported so far (44 topologies, 6
 #     BiLSTM instances, and the genuinely new style-diffusion sampler -- ADPM2 over the real
