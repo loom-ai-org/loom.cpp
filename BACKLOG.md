@@ -832,14 +832,87 @@ SupertonicTTS, StyleTTS2.
     set from the oracle's own observed range.
   - Full regression suite re-run clean after every fix above (only the pre-existing, unrelated
     `test_e2e_lfm2_lua_driver` failure — a missing local fixture file, not a computation regression).
-- **Matcha-TTS, SupertonicTTS, StyleTTS2 — not started.** Should still be checked against the ORIGINAL
-  two VITS-derived failure modes (dynamic pad on rank≥3 tensors; boolean-mask-indexed transforms) AND
-  the newer ones Kokoro's own decoder_vocoder phase surfaced above (LSTM usage forcing a hybrid
-  MIL/bespoke split; `F.interpolate` rank-4 requirements; grouped/depthwise `conv_transpose`; scalar-
-  constant GGUF serialization) before assuming any of them will trace cleanly. StyleTTS2 is still the
-  one likely to stay bespoke regardless — its diffusion sampler's ~3e-3 residual mismatch persisted even
-  with hand-matched float32 host math, and an auto-traced version gives less control to chase that kind
-  of thing down.
+- **StyleTTS2 — DONE, numerically verified (2026-07-26)**, done out of the original stated order (ahead
+  of Matcha-TTS/SupertonicTTS) on explicit user direction, precisely BECAUSE it could reuse Kokoro's own
+  lessons so directly: `export_styletts2_mil.py` produces three MIL topologies into one combined
+  `styletts2_mil.gguf` (`styletts2_driver_mil.lua` orchestrates them alongside the EXISTING bespoke
+  LSTM-bound topologies from `convert_styletts2_reused.py` — DurationEncoder/predictor.lstm/duration_proj,
+  F0Ntrain, TextEncoder's BiLSTM — unchanged, ggml has no native LSTM op, same scoping exclusion Kokoro's
+  own MIL export already established):
+  - **"albert"**: CustomAlbert alone (input_ids -> raw bert_dur), NOT fused with bert_encoder the way
+    Kokoro's own combined "albert_bert_encoder" is — StyleTTS2's diffusion sampler needs the raw,
+    unprojected bert_dur as its own conditioning input, a genuine data-flow difference from Kokoro's own
+    pipeline. bert_encoder itself stays on the existing bespoke `kokoro_bert_encoder.gguf` topology (a
+    single Linear, zero-risk to hand-build, nothing a trace would improve). Verified to ~1.3e-5
+    mean/~1.1e-4 max abs against `reference_forward_styletts2_albert_mil.py` (which reuses
+    `tools/convert_kokoro/reference_forward_kokoro_albert.py`'s own already-verified `albert_forward`
+    unmodified — StyleTTS2's PL-BERT state dict uses the identical "module."-prefixed key convention).
+  - **"decoder_vocoder"**: DIRECT reuse of `export_kokoro_mil.py`'s own `DecoderVocoderWrapper`/
+    `build_decoder_vocoder_topology`/`VerifiedSTFT` (including every one of its trace-friendly
+    AdainResBlk1d/SineGen/SourceModuleHnNSF/Generator/Decoder monkeypatches) — the real payoff of "using
+    Kokoro's lessons": Kokoro's own istftnet.py classes ARE StyleTTS2's own (Kokoro is a fork of this
+    exact architecture), so tracing them with StyleTTS2's own checkpoint weights needed zero new code,
+    only a different state dict. Verified to ~7.5e-4 mean/~0.030 max abs against
+    `reference_forward_styletts2_decoder_vocoder_mil.py` — but ONLY once that reference script was driven
+    by a REAL forward pass through the rest of the pipeline (real CustomAlbert -> real style-diffusion
+    sampler -> real predictor/F0Ntrain/TextEncoder) rather than arbitrary synthetic asr/F0_curve/N_curve/
+    style values: even fairly small-magnitude synthetic noise (matching the SAME distribution Kokoro's own
+    reference script safely uses) reliably drove this SPECIFIC checkpoint's Generator into its
+    `torch.exp()`-based magnitude-reconstruction blow-up regime (`spec_logit` reaching ~27, i.e.
+    `exp(27)~5e11`) for every random seed tried — a real, confirmed property of this trained checkpoint
+    (bisected via per-stage std/max instrumentation: encode/decode/upsample stages all stayed bounded,
+    std~1-4; the explosion is specifically `Generator.conv_post`'s raw output feeding `exp`), not a
+    loading or exporter bug. Real, in-distribution values (a real style vector's natural ~0.13-0.32 std)
+    keep the whole pipeline in its trained operating regime, matching Kokoro's own ~2e-3 mean/~0.025 max
+    abs tolerance almost exactly (same architecture, same real HiFi-GAN-vocoder amplification ceiling —
+    see that test's own comments for the full reasoning).
+  - **"diffusion"**: StyleTTS2's own genuinely new piece (no Kokoro equivalent) — a real MIL trace of
+    `Modules/diffusion/modules.py`'s `Transformer1d.run()` (embedding_scale=1.0 only, the real demo's own
+    basic-synthesis default; the classifier-free-guidance branch traces the same network twice and is out
+    of scope, matching `convert_styletts2_diffusion.py`'s own identical scoping decision), superseding that
+    file's own hand-derived topology. Getting this to trace/build/compute correctly found and fixed THREE
+    real, general bugs (all in `export_styletts2_mil.py`'s own monkeypatches except the last, which is a
+    genuine general exporter fix — full `ctest` clean after, only the pre-existing unrelated
+    `test_e2e_lfm2_lua_driver` missing-fixture failure):
+    - `AttentionBase.forward`'s real `torch.einsum` calls hit a genuine coremltools bug (its generic
+      einsum solver's diagonal-einsum pre-pass builds a `perm` sized for the wrong rank, `5 != 4`) —
+      replaced with the algebraically identical batched-matmul formulation (`q @ k.transpose(-2,-1)` /
+      `attn @ v`), sidestepping the einsum solver entirely.
+    - `Transformer1d.run()`'s two `x.expand(-1, embedding.size(1), -1)` calls (broadcasting the noisy-style
+      "pseudo-token" and the per-batch `mapping` vector out to the real dynamic token count) trace to a
+      MIL `tile` whose own `reps` is a runtime shape query, not a compile-time constant. A general fix
+      attempted directly in `exporter.py`'s shared tile-shape-inference heuristic got THIS case right but
+      regressed CustomAlbert's own attention-mask head-broadcast (the identical "static-1 axis, unreadable
+      reps" shape, needing the OPPOSITE resolution there) — reverted in favor of a narrower, single-model
+      fix: replaced `.expand()` with a batched-matmul outer product (`ones_like(embedding[...,:1]) @ x`)
+      instead, which MIL's already-well-tested matmul shape inference handles directly.
+    - **General exporter bug, confirmed via an isolated minimal repro**: `ggml_mean` (the "MEAN" primitive,
+      backing `reduce_mean`/`.mean()`) reduces `ne[0]` assuming a CONTIGUOUS source — fed a `PERMUTE`'s own
+      output (a non-contiguous view) directly, as `x.mean(axis=1)` naturally produces once the reduced axis
+      is transposed to `ne[0]` first, it silently reads with the WRONG stride and produces a
+      plausible-looking but WRONG result (no assert, unlike `CONV_1D`'s im2col lowering, which crashes
+      outright on the same "permute feeds an op needing contiguity" shape). Fixed generally in
+      `exporter.py`: insert an explicit `CONT` node whenever `MEAN`'s input is produced by a `transpose`
+      op — always safe (a `CONT` of an already-contiguous tensor is a harmless no-op), and confirmed
+      dead-code for every other currently-exported model (`.mean(`/`reduce_mean` appears in exactly zero
+      other `export_*.py` scripts, only in unrelated pure-PyTorch `reference_forward_*.py` ground-truth
+      scripts that never go through the MIL exporter at all).
+    Verified to ~5.4e-7 mean/~2.9e-6 max abs against the SAME `diff_*.bin` fixtures
+    `test_e2e_styletts2_diffusion_net.cpp` already uses (`reference_forward_styletts2_diffusion.py`) — no
+    `attn_mask` input needed this time (the real `Transformer1d` has no masking at all; the old bespoke
+    topology only declared one as a loom `ATTENTION`-op API formality).
+  - `test_e2e_styletts2_mil_lua_driver.cpp`: end-to-end orchestration sanity check (mirrors
+    `test_e2e_kokoro_mil_lua_driver.cpp`'s own "no oracle, just confirm it runs and produces a plausible
+    result" scope, for the same reason — decoder_vocoder's own precision ceiling plus diffusion's own small
+    residual compound through the rest of the bespoke pipeline before ever producing a waveform, so a tight
+    diff against the bespoke C++ oracle isn't a meaningful target). 22207/22207 checks passed
+    (rms=0.0715, max_abs=0.391 — real speech-scale, bounded).
+- **Matcha-TTS, SupertonicTTS — not started.** Should still be checked against the ORIGINAL two
+  VITS-derived failure modes (dynamic pad on rank≥3 tensors; boolean-mask-indexed transforms) AND the
+  newer ones Kokoro's/StyleTTS2's own MIL exports surfaced above (LSTM usage forcing a hybrid MIL/bespoke
+  split; `F.interpolate` rank-4 requirements; grouped/depthwise `conv_transpose`; scalar-constant GGUF
+  serialization; ggml's own MEAN/CONV_1D non-contiguous-input gaps) before assuming either will trace
+  cleanly.
 
 The real tradeoff: doing this would replace ~10 hand-verified conversion scripts with one generic path, but
 trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it
