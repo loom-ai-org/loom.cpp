@@ -989,12 +989,93 @@ SupertonicTTS, StyleTTS2.
   Net effect: no transpose needed bridging TextEncoder→Decoder here (simpler than the bespoke driver),
   but the per-token duration-expansion step is a direct nested-loop repeat in T-fast layout instead of
   reusing `loom.expand_by_duration` (which wants the opposite, C-fast convention).
-- **SupertonicTTS — not started.** Should still be checked against the ORIGINAL two
-  VITS-derived failure modes (dynamic pad on rank≥3 tensors; boolean-mask-indexed transforms) AND the
-  newer ones Kokoro's/StyleTTS2's own MIL exports surfaced above (LSTM usage forcing a hybrid MIL/bespoke
-  split; `F.interpolate` rank-4 requirements; grouped/depthwise `conv_transpose`; scalar-constant GGUF
-  serialization; ggml's own MEAN/CONV_1D non-contiguous-input gaps) before assuming either will trace
-  cleanly.
+- **SupertonicTTS — DONE, numerically verified (2026-07-26)**. `export_supertonic_mil.py` traces the REAL
+  `supertonic_tts.models.modules.*` submodules directly (no hand-built bespoke topology involved) into one
+  combined `supertonic_mil.gguf` (`dp`/`ttl_text`/`vfe`/`decoder`, wired together by a new
+  `tools/convert_supertonic/supertonic_driver_mil.lua` mirroring the bespoke `supertonic_driver.lua`'s own
+  control flow) — needed ZERO hand-reimplemented primitives (unlike the bespoke conversion's own
+  `supertonic_common.py`, invaluable here purely as an independently-derived oracle for cross-checking
+  every architectural quirk found while reading source, e.g. `StyleCrossAttention`'s `scale=sqrt(dim)` not
+  `sqrt(head_dim)` quirk, confirmed identical before ever trusting the trace). Every `assets/pt/*.pt`
+  checkpoint is a FULL pickled `nn.Module` (`torch.save(self, path)`), so `torch.load(...,
+  weights_only=False)` hands back an already-built, real-weighted module directly — no hyperparameter
+  reconstruction step at all (simpler than Matcha's own `hyper_parameters`-driven `TextEncoder`/`Decoder`
+  rebuild). Verified against real-module reference fixtures (reusing the bespoke conversion's own
+  `reference_forward_supertonic_{ttl_text,decoder}.py` fixtures directly, T=10 — new
+  `reference_forward_supertonic_mil_extra.py` fixtures for `dp`/`vfe` only, needed because those bespoke
+  fixtures use a different T than this export's own fixed `T_TEXT_FIXED=10`, see below): `dp`
+  ~1.2e-7, `ttl_text` ~2.1e-6, `vfe` ~5.1e-6, `decoder` ~1.0e-6 max abs diff. Full pipeline (MIL Lua driver
+  vs. the existing bespoke `loom::SupertonicDriver` oracle, `test_e2e_supertonic_mil_lua_driver.cpp`)
+  ~6.4e-6 max abs diff on a 10-step/70656-sample waveform — far tighter than every other MIL-vs-bespoke
+  full-pipeline residual in this project (Matcha ~0.01, Kokoro/StyleTTS2 ~2-3e-2), because this model's
+  `SpeechDecoder` is a plain deterministic causal-conv stack (no ISTFT/GAN-upsampling nonlinear blowup
+  regime to compound through) and its CFM sampler needs no explicit per-token duration-expansion step at
+  all (the real `DurationPredictor` outputs one scalar total duration in seconds, not per-token durations
+  — genuinely simpler control flow than every other TTS model in this project).
+
+  Text-length scope limitation (REAL, carried forward from the bespoke conversion's own
+  `SupertonicConfig::txt_len_fixed`, not newly introduced here, and not merely a `GraphBuilder`
+  restriction): `T_TEXT` is fixed at trace/export time (`T_TEXT_FIXED=10`) for every topology touching
+  text. Two INDEPENDENT reasons force this: (1) `vfe` needs TWO independently-sized sequences at once
+  (the CFM-iterated latent-frame count `T_lat` AND the text length `T_TEXT`) — `GraphBuilder::build`
+  resolves only ONE dynamic-length symbol per topology, so `T_lat` gets `$n_tokens` and `T_TEXT` must be
+  static; (2) `dp`/`ttl_text` independently CAN'T be traced with a dynamic `T_TEXT` at all regardless of
+  (1) — confirmed empirically: `MultiHeadRelativeAttention`'s relative-position-table windowing
+  (`components.py`, Shaw et al., reused from VITS) pads by a length-DERIVED amount, which coremltools'
+  own torch frontend explicitly refuses once that length is genuinely dynamic (`NotImplementedError:
+  Dynamic padding for n-dimensional tensors is not supported`) — a real coremltools/MIL limitation, not a
+  gap in this project's own exporter, and the SAME underlying reason the bespoke conversion fixed `T_TEXT`
+  in the first place.
+
+  Five real, general exporter/engine gaps found and fixed getting here (full `ctest` clean after every
+  one — every genuinely `tools/loom_mil_compiler`-touching test across every prior model re-verified,
+  the only failures observed were this session's own mis-typed `LOOM_*` env vars pointing at
+  never-generated bespoke single-file fixtures, not real regressions):
+  - **`nn.functional.pad(..., mode="replicate")` had no translation at all** — SupertonicTTS's
+    `ConvNextBlock` (used by EVERY encoder/decoder in this model) pads this way before its depthwise conv,
+    and ggml has no native replicate/edge-pad kernel (unlike `PAD_1D`/`PAD_1D_REFLECT`, which wrap real
+    `ggml_pad_ext`/`ggml_pad_reflect_1d`). Composed purely from already-existing primitives instead of a
+    new C++ op: `VIEW` out the single boundary column, `REPEAT`-broadcast it to the pad width (the same
+    "materialize the broadcast, then `CONCAT`" idiom `REPEAT` was built for — StyleTTS2's diffusion
+    sampler), `CONCAT` it onto the right side. Only the right-edge `VIEW` needs a dynamic offset (the left
+    edge is always byte 0) — reuses the existing `_infer_dynamic_dim_expr` backward walk, no new
+    shape-inference machinery. Verified standalone (both symmetric and causal-only padding) against real
+    `F.pad`: 0.0 max abs diff, before ever touching the full model.
+  - **`reduce_sum` only ever supported a single reduction axis** — `VFTextCrossAttention`'s fractional-RoPE
+    sequence-length derivation (`mask.sum(dim=[1,2])` on a `(B,1,T)` mask) is a genuine 2-axis reduce, but
+    axis 1 (the mask's own channel dim) is ALWAYS static size 1 — a provable no-op, unlike GroupNorm's own
+    2-axis case (both axes genuinely contribute, one dynamically-sized, bridged to a dedicated
+    `loom_group_norm` custom op instead). Fixed by dropping any reduced axis with static size 1 and
+    falling through to the existing single-axis path — no new primitive, and GroupNorm's own bridge is
+    untouched (a `>1` non-trivial axis still raises the same `NotImplementedError` it always did).
+  - **`squeeze`'s rank-reducing case shared (and misused) `reshape`'s own "merge trailing MIL axes"
+    formula** — that formula (`target_shape = [-1] + x_shape[merge_count:]`) is correct for a real
+    multi-element-axis MERGE (e.g. a multi-head attention output's `heads*head_dim` flatten) but silently
+    WRONG for `squeeze`, which only ever drops an already-size-1 axis, never folds two real-sized axes
+    together. Confirmed on `SpeechPromptedCrossAttention`'s `torch.cat([o0,o1],dim=-1).squeeze(0)` (a
+    `(1,1,T,256)` → `(1,T,256)` squeeze): the shared formula computed `target_shape=[-1,1,1]` (flattening
+    everything into one 2560-element blob) instead of correctly dropping just the last ne-order axis,
+    producing a real downstream `MUL_MAT` shape-mismatch crash. Fixed with a dedicated `squeeze` branch
+    (reads the op's own `axes` input, or defaults to every static size-1 axis) that does an exact
+    positional deletion from the input's own shape — no `-1` inference needed at all, since every
+    squeezed axis is provably size 1 by squeeze's own contract. A real, general bug affecting every prior
+    model's own `squeeze` usage too, not something newly introduced by this conversion — re-verified
+    zero-regression across every other model's own MIL tests.
+  - **`nn.BatchNorm1d` (eval mode) had no translation** — `SpeechDecoder.final_norm`. Folded to a plain
+    per-channel scale+shift at CONVERSION time (`mean`/`variance`/`gamma`/`beta` are all real constant
+    Vars once traced), same "fold at conversion time" precedent as weight-norm/Snake's reciprocal
+    elsewhere in this project — not a new runtime primitive.
+  - **`add`/`mul`'s generic translation assumed ggml's own single-sided broadcast always suffices** — true
+    for every prior model, but `VFTextCrossAttention`'s fractional-RoPE angle computation
+    (`theta[d] * frac_pos[pos]`, `ne=[32,1,1] * ne=[1,L,1] -> ne=[32,L,1]`) is a genuine "outer product":
+    EACH operand is size-1 on a DIFFERENT axis than the other, so neither divides evenly into the other's
+    shape and plain `ggml_mul` can't express it at all (confirmed: a real `MUL: incompatible shapes`
+    crash). The bespoke conversion's own `supertonic_common.py` independently worked around the identical
+    operation via a dedicated `MUL_MAT`-based outer product; fixed here at the general exporter level
+    instead — detect when BOTH operands need broadcasting (on necessarily-different axes) and insert an
+    explicit `REPEAT` for each up to the real output shape first, reusing the already-existing primitive
+    rather than a new one. Only fires for this new "mutual, different-axis" pattern — every prior model's
+    own single-sided broadcast case (the overwhelmingly common one) is untouched.
 
 The real tradeoff: doing this would replace ~10 hand-verified conversion scripts with one generic path, but
 trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it

@@ -2742,10 +2742,66 @@ class LoomGGUFExporter:
                     mapped_op = "PAD_1D"
                 elif mode == "reflect":
                     mapped_op = "PAD_1D_REFLECT"
+                elif mode == "replicate":
+                    # SupertonicTTS's ConvNextBlock (used by EVERY encoder/decoder in that model) pads via
+                    # `nn.functional.pad(x, pad, mode="replicate")` before every depthwise conv -- ggml has
+                    # no native replicate/edge-pad kernel (unlike PAD_1D/PAD_1D_REFLECT, which wrap real
+                    # ggml_pad_ext/ggml_pad_reflect_1d primitives), so this composes it purely from
+                    # already-existing primitives instead of adding a new C++ op: VIEW out the single
+                    # boundary column (ne[0]=1, full ne[1:]), REPEAT-broadcast it to the pad width (both are
+                    # already used together for exactly this "materialize the broadcast, then CONCAT"
+                    # pattern -- see REPEAT's own docstring, built for StyleTTS2's diffusion sampler), then
+                    # CONCAT it onto the appropriate side. lp0/rp0 are always static (kernel_size/dilation
+                    # are architecture constants), so only the VIEW extracting the RIGHT edge needs a
+                    # dynamic offset (the left edge is always byte 0) -- reuses the same
+                    # `_infer_dynamic_dim_expr` backward walk every other dynamic-offset VIEW in this
+                    # exporter already depends on, rather than any new shape-inference machinery.
+                    if lp0 == 0 and rp0 == 0:
+                        aliases[output_var] = resolve(x_var)
+                        continue
+                    x_info = self.get_var_info(x_var_obj)
+                    ne_rest = list(x_info["shape"][1:])
+                    cur = resolve(x_var)
+                    if lp0 > 0:
+                        left_edge = f"{output_var}_replpad_left_edge"
+                        nodes.append({
+                            "op": "VIEW", "inputs": [cur], "outputs": [left_edge],
+                            "attrs": {"shape": [1, *ne_rest], "offset": 0},
+                        })
+                        left_tile = f"{output_var}_replpad_left_tile"
+                        nodes.append({
+                            "op": "REPEAT", "inputs": [left_edge], "outputs": [left_tile],
+                            "attrs": {"shape": [lp0, *ne_rest]},
+                        })
+                        left_cat = f"{output_var}_replpad_left_cat"
+                        nodes.append({
+                            "op": "CONCAT", "inputs": [left_tile, cur], "outputs": [left_cat],
+                            "attrs": {"dim": 0},
+                        })
+                        cur = left_cat
+                    if rp0 > 0:
+                        t_expr = self._infer_dynamic_dim_expr(x_var_obj, rank - 1)
+                        right_edge = f"{output_var}_replpad_right_edge"
+                        nodes.append({
+                            "op": "VIEW", "inputs": [resolve(x_var)], "outputs": [right_edge],
+                            "attrs": {"shape": [1, *ne_rest], "offset": f"(({t_expr} - 1) * 4)"},
+                        })
+                        right_tile = f"{output_var}_replpad_right_tile"
+                        nodes.append({
+                            "op": "REPEAT", "inputs": [right_edge], "outputs": [right_tile],
+                            "attrs": {"shape": [rp0, *ne_rest]},
+                        })
+                        nodes.append({
+                            "op": "CONCAT", "inputs": [cur, right_tile], "outputs": [output_var],
+                            "attrs": {"dim": 0},
+                        })
+                    else:
+                        aliases[output_var] = cur
+                    continue
                 else:
                     raise NotImplementedError(
                         f"pad op '{op.name}' has mode='{mode}', which this exporter doesn't support "
-                        "(only 'constant' and 'reflect' are)."
+                        "(only 'constant', 'reflect', and 'replicate' are)."
                     )
 
                 nodes.append({
@@ -2891,7 +2947,52 @@ class LoomGGUFExporter:
                 })
                 continue
 
-            if op_type in ["reshape", "expand_dims", "squeeze"]:
+            if op_type == "squeeze":
+                # Dedicated branch (NOT the generic "reshape"/"expand_dims"/"squeeze" rank-reducing path
+                # below): that path's rank-REDUCING case assumes a rank reduction always means "merge
+                # several trailing MIL axes (leading ne-order axes) into one" (built for e.g. a multi-head
+                # attention output's heads*head_dim merge) and blindly applies `target_shape = [-1] +
+                # x_info["shape"][merge_count:]` -- WRONG for squeeze, which drops a SPECIFIC, already-
+                # size-1 axis (most commonly ne-order's OWN LAST axis, from squeezing torch axis 0/batch)
+                # rather than folding two real-sized axes together. Confirmed on SupertonicTTS's
+                # SpeechPromptedCrossAttention (`torch.cat([o0,o1],dim=-1).squeeze(0)`, a (1,1,T,256) ->
+                # (1,T,256) squeeze): the generic path's formula computed `target_shape=[-1,1,1]` (merging
+                # ne-order axes 0-1 into one flat 2560-element blob) instead of the correct "just drop the
+                # LAST ne-order axis, keep [256,T,1] unchanged" -- a real MUL_MAT shape-mismatch crash
+                # downstream, not merely cosmetic. Since every squeezed axis is PROVABLY size 1 (squeeze's
+                # own contract), no -1 inference is ever needed here: the target shape is always an exact
+                # positional deletion from the input's own (reliable) shape.
+                x_var_obj = op.inputs.get("x") or op.inputs.get("data")
+                x_var = self.safe_name(x_var_obj.name)
+                x_info = self.get_var_info(x_var_obj)
+                in_rank = len(x_info["shape"])
+
+                axes_var = op.inputs.get("axes")
+                if axes_var is not None and hasattr(axes_var, "val") and axes_var.val is not None:
+                    torch_axes = [int(a) for a in axes_var.val]
+                else:
+                    # No explicit axes -- squeeze every static size-1 axis (mirrors numpy/torch's own
+                    # "squeeze all size-1 dims" default when `dim` is omitted).
+                    torch_axes = [in_rank - 1 - i for i, d in enumerate(x_info["shape"]) if str(d) == "1"]
+                ne_axes_to_drop = set()
+                for a in torch_axes:
+                    if a < 0:
+                        a += in_rank
+                    ne_axes_to_drop.add(in_rank - 1 - a)
+
+                target_shape = [d for i, d in enumerate(x_info["shape"]) if i not in ne_axes_to_drop]
+                if not target_shape:
+                    target_shape = [1]
+
+                nodes.append({
+                    "op": "RESHAPE",
+                    "inputs": [resolve(x_var)],
+                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "attrs": {"shape": target_shape}
+                })
+                continue
+
+            if op_type in ["reshape", "expand_dims"]:
                 # Map reshape/expand_dims/squeeze to RESHAPE with 1 input and a shape attribute derived
                 # from the op's own declared output shape.
                 x_var_obj = op.inputs.get("x") or op.inputs.get("data")
@@ -3164,6 +3265,40 @@ class LoomGGUFExporter:
                 out_rank = len(self.get_var_info(op.outputs[0])["shape"])
                 in_rank = len(self.get_var_info(x_var_obj)["shape"])
                 axes_val = axes_obj.val if axes_obj is not None and hasattr(axes_obj, "val") else None
+                keep_dims_val = bool(keep_dims_obj.val) if keep_dims_obj is not None and hasattr(keep_dims_obj, "val") else False
+                output_var = self.safe_name(op.outputs[0].name)
+                x_name = resolve(self.safe_name(x_var_obj.name))
+                if axes_val is not None and len(axes_val) > 1:
+                    # SupertonicTTS's VFTextCrossAttention derives its fractional-RoPE sequence lengths via
+                    # `mask.sum(dim=[1,2])` on a (B,1,T) mask -- a genuine 2-axis reduce_sum, but axis 1
+                    # (the mask's own channel dim) is ALWAYS static size 1, i.e. summing over it is a
+                    # provable no-op, not a real reduction. Unlike GroupNorm's own 2-axis case (both axes
+                    # genuinely contribute, one of them dynamically-sized -- bridged to a dedicated
+                    # `loom_group_norm` custom op instead, see group_norm_op.py), this only ever needs
+                    # dropping the trivial size-1 axes and falling through to the existing single-axis
+                    # REDUCE_SUM path below -- no new primitive.
+                    x_shape = self.get_var_info(x_var_obj)["shape"]
+                    real_axes = []
+                    for a in axes_val:
+                        a = int(a)
+                        if a < 0:
+                            a += in_rank
+                        ne_a = in_rank - 1 - a
+                        size = x_shape[ne_a]
+                        if str(size) == "1":
+                            continue
+                        real_axes.append(a)
+                    if len(real_axes) == 0:
+                        # Every reduced axis was static size 1 -- sum is the identity.
+                        aliases[output_var] = x_name
+                        continue
+                    if len(real_axes) > 1:
+                        raise NotImplementedError(
+                            f"reduce_sum op '{op.name}': multi-axis reduction with more than one "
+                            f"non-trivial (size>1) axis (got axes={axes_val!r} on shape {x_shape!r}) needs "
+                            "its own composition (see GroupNorm's loom_group_norm custom-op bridge)."
+                        )
+                    axes_val = [real_axes[0]]
                 if axes_val is None or len(axes_val) != 1:
                     raise NotImplementedError(
                         f"reduce_sum op '{op.name}': only a single reduction axis is supported "
@@ -3173,11 +3308,10 @@ class LoomGGUFExporter:
                 if axis < 0:
                     axis += in_rank
                 ne_axis = in_rank - 1 - axis
-                keep_dims_val = bool(keep_dims_obj.val) if keep_dims_obj is not None and hasattr(keep_dims_obj, "val") else False
                 nodes.append({
                     "op": "REDUCE_SUM",
-                    "inputs": [resolve(self.safe_name(x_var_obj.name))],
-                    "outputs": [self.safe_name(op.outputs[0].name)],
+                    "inputs": [x_name],
+                    "outputs": [output_var],
                     "attrs": {"axis": ne_axis, "keep_dims": keep_dims_val}
                 })
                 continue
@@ -3874,6 +4008,58 @@ class LoomGGUFExporter:
                     })
                     continue
 
+            if op_type == "batch_norm":
+                # SupertonicTTS's SpeechDecoder.final_norm (nn.BatchNorm1d, always eval mode -- this
+                # project never traces training-mode graphs). `mean`/`variance`/`gamma`/`beta` are all
+                # real CONSTANT Vars once traced (baked from the module's own running-stats buffers and
+                # learned affine params), so this folds to a plain per-channel scale+shift at CONVERSION
+                # time -- same "fold at conversion time" precedent as weight-norm/Snake's reciprocal
+                # elsewhere in this project, not a new runtime primitive.
+                x_var_obj = op.inputs["x"]
+                mean_var = op.inputs.get("mean")
+                var_var = op.inputs.get("variance")
+                gamma_var = op.inputs.get("gamma")
+                beta_var = op.inputs.get("beta")
+                eps_var = op.inputs.get("epsilon")
+                if any(v is None or not hasattr(v, "val") or v.val is None for v in (mean_var, var_var)):
+                    raise NotImplementedError(
+                        f"batch_norm op '{op.name}' has a non-constant mean/variance -- only eval-mode "
+                        "(real running-stats buffers) BatchNorm is supported."
+                    )
+                mean_np = np.asarray(mean_var.val, dtype=np.float32)
+                var_np = np.asarray(var_var.val, dtype=np.float32)
+                gamma_np = (np.asarray(gamma_var.val, dtype=np.float32)
+                            if gamma_var is not None and hasattr(gamma_var, "val") and gamma_var.val is not None
+                            else np.ones_like(mean_np))
+                beta_np = (np.asarray(beta_var.val, dtype=np.float32)
+                           if beta_var is not None and hasattr(beta_var, "val") and beta_var.val is not None
+                           else np.zeros_like(mean_np))
+                eps = (float(eps_var.val) if eps_var is not None and hasattr(eps_var, "val")
+                       and eps_var.val is not None else 1e-5)
+
+                scale_np = gamma_np / np.sqrt(var_np + eps)
+                shift_np = beta_np - mean_np * scale_np
+
+                in_rank = len(self.get_var_info(x_var_obj)["shape"])
+                channel_ne_axis = in_rank - 1 - 1  # MIL's channel axis is always torch axis 1
+                bcast_shape = [1] * in_rank
+                bcast_shape[channel_ne_axis] = scale_np.shape[0]
+
+                x_name = resolve(self.safe_name(x_var_obj.name))
+                output_var = self.safe_name(op.outputs[0].name)
+                weight_base = f"{self.safe_name(op.name)}_bn"
+                if func_name == "main_topo" or self.profile == "monolithic":
+                    scale_name, shift_name = f"{weight_base}_scale", f"{weight_base}_shift"
+                else:
+                    scale_name, shift_name = f"{func_name}.{weight_base}_scale", f"{func_name}.{weight_base}_shift"
+                self.weights[scale_name] = scale_np.reshape(bcast_shape)
+                self.weights[shift_name] = shift_np.reshape(bcast_shape)
+
+                scaled = f"{output_var}_bn_scaled"
+                nodes.append({"op": "MUL", "inputs": [x_name, scale_name], "outputs": [scaled]})
+                nodes.append({"op": "ADD", "inputs": [scaled, shift_name], "outputs": [output_var]})
+                continue
+
             if op_type in ("random_normal", "random_uniform", "random_bernoulli", "random_categorical"):
                 # EXPORT-IMPROVEMENT-BACKLOG.md item 4: ggml has no RNG-capable compute op at all (no
                 # ggml_rand* of any kind exists) -- this isn't a missing-ggml-mapping gap the way most
@@ -3977,8 +4163,43 @@ class LoomGGUFExporter:
             elif op_type in ("add", "mul"):
                 # Swap commutative inputs to ensure the larger/dynamic tensor is first,
                 # preventing GGML broadcast repetition failures.
-                inp1 = resolve(self.safe_name(op.inputs.get("x").name)) if "x" in op.inputs and hasattr(op.inputs["x"], "name") else None
-                inp2 = resolve(self.safe_name(op.inputs.get("y").name)) if "y" in op.inputs and hasattr(op.inputs["y"], "name") else None
+                x_var_obj = op.inputs.get("x")
+                y_var_obj = op.inputs.get("y")
+                inp1 = resolve(self.safe_name(x_var_obj.name)) if x_var_obj is not None and hasattr(x_var_obj, "name") else None
+                inp2 = resolve(self.safe_name(y_var_obj.name)) if y_var_obj is not None and hasattr(y_var_obj, "name") else None
+
+                # Mutual (different-axis) broadcast: ggml_mul/ggml_add only ever let ONE operand
+                # broadcast INTO the other's ALREADY-correct shape -- a genuine "outer product" case
+                # (each operand is size-1 on a DIFFERENT axis than the other, so BOTH need widening to
+                # reach the real output shape) isn't representable that way at all. Confirmed on
+                # SupertonicTTS's VFTextCrossAttention fractional-RoPE angle computation (`theta[d] *
+                # frac_pos[pos]`, ne=[32,1,1] * ne=[1,L,1] -> ne=[32,L,1] -- neither operand's shape
+                # divides evenly into the other's) -- the bespoke conversion's own supertonic_common.py
+                # independently worked around the identical operation via a dedicated MUL_MAT-based outer
+                # product; this is the general exporter-level fix instead, reusing the already-existing
+                # REPEAT primitive (built for StyleTTS2's own broadcast needs) rather than a new op.
+                if (x_var_obj is not None and y_var_obj is not None
+                        and getattr(x_var_obj, "shape", None) is not None
+                        and getattr(y_var_obj, "shape", None) is not None):
+                    out_shape = self.get_var_info(op.outputs[0])["shape"]
+
+                    def _needs_repeat(var_obj):
+                        shape = self.get_var_info(var_obj)["shape"]
+                        return len(shape) == len(out_shape) and any(
+                            str(s) == "1" and str(t) != "1" for s, t in zip(shape, out_shape)
+                        )
+
+                    if _needs_repeat(x_var_obj) and _needs_repeat(y_var_obj):
+                        node_tag = self.safe_name(op.name)
+                        x_rep = f"{node_tag}_bcast_x"
+                        nodes.append({"op": "REPEAT", "inputs": [inp1], "outputs": [x_rep],
+                                      "attrs": {"shape": out_shape}})
+                        inp1 = x_rep
+                        y_rep = f"{node_tag}_bcast_y"
+                        nodes.append({"op": "REPEAT", "inputs": [inp2], "outputs": [y_rep],
+                                      "attrs": {"shape": out_shape}})
+                        inp2 = y_rep
+
                 if inp1 and inp2:
                     if inp1 in self.weights and inp2 not in self.weights:
                         inputs = [inp2, inp1]
