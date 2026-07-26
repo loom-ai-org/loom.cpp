@@ -32,21 +32,38 @@ ggml_tensor* promote_i32_to_f32(ggml_context* ctx, ggml_tensor* t) {
     return t->type == GGML_TYPE_I32 ? ggml_cast(ctx, t, GGML_TYPE_F32) : t;
 }
 
+// `ggml_is_contiguous()` is NOT a sufficient guard before feeding a tensor into ggml-cpu's own
+// elementwise binary kernels (ggml-cpu/binary-ops.cpp) -- see primitives_basic.cpp's own identical
+// helper for the full explanation (duplicated here rather than shared via a header, matching this
+// file's existing per-TU-helper convention -- e.g. `promote_i32_to_f32` just above). Confirmed the hard
+// way on Kokoro's SineGen: `f0 > self.voiced_threshold` (`_f02uv`) traces to `op_greater` ->
+// `sub_broadcast(f0, 10.0)`, and `f0` itself is a genuinely PERMUTED tensor (fresh off a real
+// `.transpose(1,2)` call) with `ne[0]=1` -- `ggml_is_contiguous()` reports it contiguous regardless of
+// its actual non-unit `nb[0]`, and `sub_broadcast`'s own raw `ggml_sub` call (unlike primitives_basic.
+// cpp's `op_sub`, which already had -- and has since been upgraded to this same stricter check --
+// its own guard) had no contiguity guard AT ALL, so this was the first of these helpers to crash.
+ggml_tensor* ensure_packed(ggml_context* ctx, ggml_tensor* t) {
+    if (!ggml_is_contiguous(t) || t->nb[0] != ggml_type_size(t->type)) {
+        return ggml_cont(ctx, t);
+    }
+    return t;
+}
+
 // 1. Implementation of brand new CoreML MIL primitives using GGML:
 
 Outputs op_abs(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("abs", in, 1);
-    return {ggml_abs(pc.ctx, in[0])};
+    return {ggml_abs(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_neg(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("neg", in, 1);
-    return {ggml_neg(pc.ctx, in[0])};
+    return {ggml_neg(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_sign(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("sign", in, 1);
-    return {ggml_sgn(pc.ctx, in[0])};
+    return {ggml_sgn(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_minimum(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -199,8 +216,8 @@ ggml_tensor* sub_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
     // mask (`valid_mask`/`pad_mask`/`time_mask`, all comparisons against the real "length" graph input),
     // reached only once every upstream shape/attention bug was fixed -- earlier attempts crashed before
     // ever exercising this code path.
-    x = promote_i32_to_f32(ctx, x);
-    y = promote_i32_to_f32(ctx, y);
+    x = ensure_packed(ctx, promote_i32_to_f32(ctx, x));
+    y = ensure_packed(ctx, promote_i32_to_f32(ctx, y));
     if (ggml_nelements(y) > ggml_nelements(x)) {
         return ggml_neg(ctx, ggml_sub(ctx, y, x));
     }
@@ -267,8 +284,8 @@ ggml_tensor* mul_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
     // constraint ggml_sub has -- see sub_broadcast above), but MIL's `select`/elementwise ops place no
     // such constraint on operand order. Orient correctly regardless of which operand is larger, same
     // "commutative swap" convention op_add/op_mul (primitives_basic.cpp) already use.
-    x = promote_i32_to_f32(ctx, x);
-    y = promote_i32_to_f32(ctx, y);
+    x = ensure_packed(ctx, promote_i32_to_f32(ctx, x));
+    y = ensure_packed(ctx, promote_i32_to_f32(ctx, y));
     ggml_tensor* a = x;
     ggml_tensor* b = y;
     if (ggml_nelements(y) > ggml_nelements(x)) {
@@ -292,8 +309,8 @@ ggml_tensor* add_broadcast(ggml_context* ctx, ggml_tensor* x, ggml_tensor* y) {
     // (e.g. cond broadcasts a scalar `x` while `y` is the full-size operand: cond_x stays cond-sized,
     // term_y grows to y's full size) -- a plain ggml_add(cond_x, term_y) then has its target/repeat
     // operands backwards.
-    x = promote_i32_to_f32(ctx, x);
-    y = promote_i32_to_f32(ctx, y);
+    x = ensure_packed(ctx, promote_i32_to_f32(ctx, x));
+    y = ensure_packed(ctx, promote_i32_to_f32(ctx, y));
     ggml_tensor* a = x;
     ggml_tensor* b = y;
     if (ggml_nelements(y) > ggml_nelements(x)) {

@@ -32,6 +32,29 @@ ggml_tensor* promote_i32_to_f32(ggml_context* ctx, ggml_tensor* t) {
     return t->type == GGML_TYPE_I32 ? ggml_cast(ctx, t, GGML_TYPE_F32) : t;
 }
 
+// `ggml_is_contiguous()` is NOT a sufficient guard before feeding a tensor into ggml-cpu's own
+// elementwise binary kernels (ggml-cpu/binary-ops.cpp, backing ADD/SUB/MUL/DIV): reading
+// `ggml_is_contiguous_n`'s own real implementation directly (ggml.c) shows it treats `ne[0]==1` as
+// VACUOUSLY satisfying the "nb[0] == element size" check regardless of the tensor's actual declared
+// stride there (`tensor->ne[0] != ggml_blck_size(tensor->type)` is false whenever `ne[0]==1` for any
+// unquantized type, short-circuiting the whole AND before `nb[0]` is even looked at) -- correct for most
+// of ggml's own ne[0]-agnostic consumers, but binary-ops.cpp's own vectorized compute loop asserts
+// `nb00 == sizeof(src0_t)` unconditionally, with no such carve-out. Confirmed the hard way on Kokoro's
+// SineGen: `f0 * float(k)` (this project's own trace-friendly rewrite of a real broadcast multiply,
+// see BACKLOG.md) operates on `f0` fresh off a real `.transpose(1,2)` call, producing a genuinely
+// PERMUTED tensor with `ne[0]=1` (the trailing torch axis) and a non-unit `nb[0]` -- `ggml_is_
+// contiguous()` reports this tensor as contiguous, `op_mul`'s own existing guard (built on exactly that
+// call) let it straight through, and the compute-time `GGML_ASSERT(nb00 == sizeof(src0_t))` aborted
+// with no informative message at all (a raw crash, not a catchable SchemaError -- this bug predates
+// every other informative-error convention this project already established for shape mismatches).
+// This helper is the one, general fix: explicitly check `nb[0]` too, not just `ggml_is_contiguous()`.
+ggml_tensor* ensure_packed(ggml_context* ctx, ggml_tensor* t) {
+    if (!ggml_is_contiguous(t) || t->nb[0] != ggml_type_size(t->type)) {
+        return ggml_cont(ctx, t);
+    }
+    return t;
+}
+
 Outputs op_get_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("GET_ROWS", in, 2);
     return {ggml_get_rows(pc.ctx, in[0], in[1])};
@@ -105,8 +128,8 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // handling), this heuristic started re-corrupting already-correct tensors instead of fixing broken
     // ones. Removed rather than made smarter -- the real fix belongs at the exporter, which now knows
     // the true layout instead of guessing from ambiguous shapes.
-    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
-    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    a = ensure_packed(pc.ctx, a);
+    b = ensure_packed(pc.ctx, b);
 
     if (!ggml_can_repeat(b, a)) {
         auto ne_str = [](ggml_tensor* t) {
@@ -125,12 +148,12 @@ Outputs op_sub(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
     // Dynamically optimize scalar subtraction (e.g. 0.0 - b) to ggml_neg(b) to prevent broadcast failures
     if (ggml_nelements(a) == 1 && ggml_nelements(b) > 1) {
-        if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+        b = ensure_packed(pc.ctx, b);
         return {ggml_neg(pc.ctx, b)};
     }
 
-    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
-    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    a = ensure_packed(pc.ctx, a);
+    b = ensure_packed(pc.ctx, b);
     return {ggml_sub(pc.ctx, a, b)};
 }
 
@@ -167,8 +190,8 @@ Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
         b = ggml_cont(pc.ctx, b);
     }
     
-    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
-    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    a = ensure_packed(pc.ctx, a);
+    b = ensure_packed(pc.ctx, b);
 
     if (!ggml_can_repeat(b, a)) {
         auto ne_str = [](ggml_tensor* t) {
@@ -184,8 +207,8 @@ Outputs op_div(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("DIV", in, 2);
     ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
     ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
-    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
-    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    a = ensure_packed(pc.ctx, a);
+    b = ensure_packed(pc.ctx, b);
     return {ggml_div(pc.ctx, a, b)};
 }
 
@@ -204,8 +227,8 @@ Outputs op_floor_div(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("FLOOR_DIV", in, 2);
     ggml_tensor* a = promote_i32_to_f32(pc.ctx, in[0]);
     ggml_tensor* b = promote_i32_to_f32(pc.ctx, in[1]);
-    if (!ggml_is_contiguous(a)) a = ggml_cont(pc.ctx, a);
-    if (!ggml_is_contiguous(b)) b = ggml_cont(pc.ctx, b);
+    a = ensure_packed(pc.ctx, a);
+    b = ensure_packed(pc.ctx, b);
     return {ggml_floor(pc.ctx, ggml_div(pc.ctx, a, b))};
 }
 
@@ -217,12 +240,12 @@ Outputs op_scale(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
 
 Outputs op_sqr(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SQR", in, 1);
-    return {ggml_sqr(pc.ctx, in[0])};
+    return {ggml_sqr(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_sqrt(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SQRT", in, 1);
-    return {ggml_sqrt(pc.ctx, in[0])};
+    return {ggml_sqrt(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 void rsqrt_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void*) {
@@ -239,12 +262,12 @@ void rsqrt_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, v
 
 Outputs op_rsqrt(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("RSQRT", in, 1);
-    return {ggml_map_custom1(pc.ctx, in[0], rsqrt_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    return {ggml_map_custom1(pc.ctx, ensure_packed(pc.ctx, in[0]), rsqrt_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 
 Outputs op_log(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("LOG", in, 1);
-    return {ggml_log(pc.ctx, in[0])};
+    return {ggml_log(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 // ggml has no native atan2 (nor even single-arg atan) -- needed for Kokoro's Generator, which computes
@@ -264,10 +287,30 @@ void atan2_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* 
     for (int64_t i = start; i < end; ++i) pd[i] = std::atan2(pa[i], pb[i]);
 }
 
+// A single-argument ggml_map_custom1 companion to atan2_custom_op above -- needed because MIL's own
+// default pipeline doesn't always keep a traced `torch.atan2` call as one opaque `atan2` op: for Kokoro's
+// own STFT phase computation it gets lowered to a plain `atan` op plus separate quadrant-correction
+// ops (select/sign/etc., all otherwise-already-supported) instead, confirmed by reading the exported
+// topology directly -- not a case this exporter's own "atan2" translation ever gets to run.
+void atan_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void*) {
+    const int64_t ne = ggml_nelements(dst);
+    const auto* pa = static_cast<const float*>(a->data);
+    auto* pd = static_cast<float*>(dst->data);
+    const int64_t per_thread = (ne + nth - 1) / nth;
+    const int64_t start = std::min(static_cast<int64_t>(ith) * per_thread, ne);
+    const int64_t end = std::min(start + per_thread, ne);
+    for (int64_t i = start; i < end; ++i) pd[i] = std::atan(pa[i]);
+}
+
+Outputs op_atan(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("ATAN", in, 1);
+    return {ggml_map_custom1(pc.ctx, ensure_packed(pc.ctx, in[0]), atan_custom_op, GGML_N_TASKS_MAX, nullptr)};
+}
+
 Outputs op_atan2(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // atan2(y=in[0], x=in[1]) -- same argument order as std::atan2/torch.atan2 (y first).
     expect_n_inputs("ATAN2", in, 2);
-    return {ggml_map_custom2(pc.ctx, in[0], in[1], atan2_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    return {ggml_map_custom2(pc.ctx, ensure_packed(pc.ctx, in[0]), ensure_packed(pc.ctx, in[1]), atan2_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 
 void pow_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, int ith, int nth, void*) {
@@ -290,7 +333,7 @@ void pow_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b,
 Outputs op_pow(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // pow(base=in[0], exponent=in[1])
     expect_n_inputs("POW", in, 2);
-    return {ggml_map_custom2(pc.ctx, in[0], in[1], pow_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    return {ggml_map_custom2(pc.ctx, ensure_packed(pc.ctx, in[0]), ensure_packed(pc.ctx, in[1]), pow_custom_op, GGML_N_TASKS_MAX, nullptr)};
 }
 
 Outputs op_sum_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -372,7 +415,8 @@ Outputs op_pad_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // Zero-pads ne[0] only (lp0 left, rp0 right) via ggml_pad_ext with every other dimension's pad at 0.
     const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
     const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
-    return {ggml_pad_ext(pc.ctx, in[0], lp0, rp0, 0, 0, 0, 0, 0, 0)};
+    ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
+    return {ggml_pad_ext(pc.ctx, a, lp0, rp0, 0, 0, 0, 0, 0, 0)};
 }
 
 Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -385,23 +429,24 @@ Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& at
     expect_n_inputs("PAD_1D_REFLECT", in, 1);
     const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
     const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
-    return {ggml_pad_reflect_1d(pc.ctx, in[0], lp0, rp0)};
+    ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
+    return {ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
 }
 
 Outputs op_silu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SILU", in, 1);
-    return {ggml_silu(pc.ctx, in[0])};
+    return {ggml_silu(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_relu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("RELU", in, 1);
-    return {ggml_relu(pc.ctx, in[0])};
+    return {ggml_relu(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_leaky_relu(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("LEAKY_RELU", in, 1);
     const double slope = resolve_attr_number(attrs, "slope", pc.symbols);
-    return {ggml_leaky_relu(pc.ctx, in[0], static_cast<float>(slope), /*inplace=*/false)};
+    return {ggml_leaky_relu(pc.ctx, ensure_packed(pc.ctx, in[0]), static_cast<float>(slope), /*inplace=*/false)};
 }
 
 Outputs op_concat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -425,19 +470,17 @@ Outputs op_step(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_cumsum(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("CUMSUM", in, 1);
-    return {ggml_cumsum(pc.ctx, in[0])};
+    return {ggml_cumsum(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_softmax(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SOFTMAX", in, 1);
-    ggml_tensor* x = in[0];
-    if (!ggml_is_contiguous(x)) x = ggml_cont(pc.ctx, x);
-    return {ggml_soft_max(pc.ctx, x)};
+    return {ggml_soft_max(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_softplus(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SOFTPLUS", in, 1);
-    return {ggml_softplus(pc.ctx, in[0])};
+    return {ggml_softplus(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_clamp(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -464,19 +507,19 @@ Outputs op_gelu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // started feeding a real strided VIEW/CONT-less intermediate straight into GELU, same "cont before
     // unary/softmax/conv ops that assert dense strides internally" fix already applied to op_softmax and
     // every conv primitive.
-    ggml_tensor* x = ggml_is_contiguous(in[0]) ? in[0] : ggml_cont(pc.ctx, in[0]);
+    ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
     return {ggml_gelu_erf(pc.ctx, x)};
 }
 
 Outputs op_swiglu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SWIGLU", in, 2);
-    return {ggml_swiglu_split(pc.ctx, in[0], in[1])};
+    return {ggml_swiglu_split(pc.ctx, ensure_packed(pc.ctx, in[0]), ensure_packed(pc.ctx, in[1]))};
 }
 
 Outputs op_rms_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("RMS_NORM", in, 1);
     const double eps = resolve_attr_number(attrs, "eps", pc.symbols);
-    return {ggml_rms_norm(pc.ctx, in[0], static_cast<float>(eps))};
+    return {ggml_rms_norm(pc.ctx, ensure_packed(pc.ctx, in[0]), static_cast<float>(eps))};
 }
 
 Outputs op_layer_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -484,8 +527,9 @@ Outputs op_layer_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     // ggml_norm is the full mean+variance normalization (unlike RMS_NORM, which skips mean-centering);
     // like RMS_NORM, it leaves the learned affine (weight/bias) to separate MUL/ADD nodes in the
     // topology rather than folding them in here.
+    ggml_tensor* x0 = ensure_packed(pc.ctx, in[0]);
     const double eps = resolve_attr_number(attrs, "eps", pc.symbols);
-    return {ggml_norm(pc.ctx, in[0], static_cast<float>(eps))};
+    return {ggml_norm(pc.ctx, x0, static_cast<float>(eps))};
 }
 
 Outputs op_group_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -504,12 +548,12 @@ Outputs op_group_norm(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
 
 Outputs op_sigmoid(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SIGMOID", in, 1);
-    return {ggml_sigmoid(pc.ctx, in[0])};
+    return {ggml_sigmoid(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_tanh(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("TANH", in, 1);
-    return {ggml_tanh(pc.ctx, in[0])};
+    return {ggml_tanh(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 // 1D resize along ne[0] only (ne[1..3] held fixed at the input's own size) -- added for Kokoro TTS's
@@ -533,31 +577,31 @@ Outputs op_interpolate_1d(PrimitiveContext& pc, const Inputs& in, const Json& at
     if (mode == "nearest") scale_mode = GGML_SCALE_MODE_NEAREST;
     else if (mode == "linear") scale_mode = GGML_SCALE_MODE_BILINEAR;
     else throw SchemaError("INTERPOLATE_1D: unsupported 'mode' \"" + mode + "\" (expected \"nearest\" or \"linear\")");
-    ggml_tensor* a = in[0];
+    ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
     return {ggml_interpolate(pc.ctx, a, ne0, a->ne[1], a->ne[2], a->ne[3], static_cast<uint32_t>(scale_mode))};
 }
 
 Outputs op_exp(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // Needed for Kokoro Generator's final spec/phase split (`spec = exp(x[:n_freq])`).
     expect_n_inputs("EXP", in, 1);
-    return {ggml_exp(pc.ctx, in[0])};
+    return {ggml_exp(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_sin(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SIN", in, 1);
-    return {ggml_sin(pc.ctx, in[0])};
+    return {ggml_sin(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_cos(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("COS", in, 1);
-    return {ggml_cos(pc.ctx, in[0])};
+    return {ggml_cos(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_floor(PrimitiveContext& pc, const Inputs& in, const Json&) {
     // Needed for Kokoro's SineGen (`(f0/sampling_rate) % 1`, expressed as `x - floor(x)` since ggml has
     // no native modulo op and every operand here is non-negative, so this is an exact match to `%`).
     expect_n_inputs("FLOOR", in, 1);
-    return {ggml_floor(pc.ctx, in[0])};
+    return {ggml_floor(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
 Outputs op_glu(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -799,6 +843,7 @@ LOOM_REGISTER_OP(SQR, op_sqr)
 LOOM_REGISTER_OP(SQRT, op_sqrt)
 LOOM_REGISTER_OP(RSQRT, op_rsqrt)
 LOOM_REGISTER_OP(LOG, op_log)
+LOOM_REGISTER_OP(ATAN, op_atan)
 LOOM_REGISTER_OP(ATAN2, op_atan2)
 LOOM_REGISTER_OP(POW, op_pow)
 LOOM_REGISTER_OP(SUM_ROWS, op_sum_rows)

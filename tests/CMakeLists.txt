@@ -648,6 +648,14 @@ target_link_libraries(test_e2e_vits_smoke PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_smoke COMMAND test_e2e_vits_smoke)
 set_tests_properties(test_e2e_vits_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Same structural-smoke role as test_e2e_vits_smoke above, for the (in-progress, see BACKLOG.md)
+#     MIL-traced Kokoro "decoder_vocoder" phase (Decoder core + SineGen + STFT + Generator, the single
+#     riskiest chunk of the model). ---
+add_executable(test_e2e_kokoro_mil_decoder_vocoder_smoke test_e2e_kokoro_mil_decoder_vocoder_smoke.cpp)
+target_link_libraries(test_e2e_kokoro_mil_decoder_vocoder_smoke PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_mil_decoder_vocoder_smoke COMMAND test_e2e_kokoro_mil_decoder_vocoder_smoke)
+set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Real-model test: loom::VitsDriver end-to-end (TextEncoder -> StochasticDurationPredictor ->
 #     host-side generate_path -> coupling flow -> HiFi-GAN vocoder), one level up from the structural
 #     smoke test above -- exercises the full two-phase driver, not just each topology in isolation. ---
