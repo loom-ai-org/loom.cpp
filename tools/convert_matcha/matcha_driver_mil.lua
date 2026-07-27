@@ -28,6 +28,9 @@
 -- real model constants n_feats, mel_mean, mel_std (MatchaConfig's own real defaults).
 --
 -- Returns: the raw waveform (flat f32 array), same convention as MatchaDriver::synthesize's own return.
+
+--@loom:samplers
+
 function synthesize(inputs)
     loom.seed_rng(inputs.seed)
 
@@ -74,19 +77,11 @@ function synthesize(inputs)
         end
     end
 
-    -- --- Deterministic Euler CFM sampling loop over the Decoder U-Net estimator. z0 is fresh Gaussian
+    -- --- Deterministic Euler CFM sampling loop over the Decoder U-Net estimator -- see sample_decoder
+    --     above, generated from export_matcha_mil.py's own IterativeRefinementSpec. z0 is fresh Gaussian
     --     noise with no inherent structure, so loom.gaussian_array's own sequential flat fill is usable
     --     directly as the Decoder's T-fast `z` input with no reindexing needed. ---
-    local z = loom.gaussian_array(t_mel * n_feats)
-
-    local dt = 1.0 / inputs.n_steps
-    for step = 0, inputs.n_steps - 1 do
-        local t = step / inputs.n_steps
-        local v = loom.run_subgraph("decoder", t_mel, 0, { z = z, mu = mu_y, t = { t } })
-        for i = 1, #z do
-            z[i] = z[i] + v[i] * dt
-        end
-    end
+    local z = sample_decoder(t_mel, t_mel * n_feats, inputs.n_steps, { mu = mu_y })
 
     -- --- Denormalize (real denormalize(decoder_outputs, mel_mean, mel_std)) ---
     local mel = z

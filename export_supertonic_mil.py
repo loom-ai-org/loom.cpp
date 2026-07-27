@@ -71,6 +71,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
 from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
+from loom_mil_compiler.iterative_export import IterativeRefinementSpec, render_driver  # noqa: E402
 
 import coremltools as ct  # noqa: E402
 
@@ -229,7 +230,21 @@ def main():
     out_exporter = LoomGGUFExporter(None, output_path="supertonic_mil.gguf", architecture="supertonic_mil")
     out_exporter.topologies = {"dp": dp_topo, "ttl_text": ttl_topo, "vfe": vfe_topo, "decoder": decoder_topo}
     out_exporter.weights = merged_weights
-    out_exporter.write_gguf(driver_script_path.read_text())
+
+    # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the estimator,
+    # the loop-carried input's name, and the per-step-constant inputs differ.
+    cfm_sampler = IterativeRefinementSpec(
+        func_name="sample_vfe",
+        estimator="vfe",
+        carried_input="z_t",
+        time_input="t",
+        fixed_inputs=["txt_emb", "stl_emb"],
+        note="Deterministic Euler CFM sampling over SupertonicTTS's VectorFieldEstimator:\n"
+              "z <- z + v(z, txt_emb, stl_emb, t) * dt, uniform dt = 1/n_steps.",
+    )
+    driver_source = render_driver(driver_script_path.read_text(), [cfm_sampler],
+                                   topologies=out_exporter.topologies)
+    out_exporter.write_gguf(driver_source)
     print("wrote supertonic_mil.gguf")
 
 

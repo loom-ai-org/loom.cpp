@@ -19,6 +19,9 @@
 -- compression_factor.
 --
 -- Returns: the raw waveform (flat f32 array).
+
+--@loom:samplers
+
 function synthesize(inputs)
     loom.seed_rng(inputs.seed)
 
@@ -41,23 +44,10 @@ function synthesize(inputs)
     --     bridging, since "vfe" was traced expecting exactly this same layout for its own txt_emb input). ---
     local txt_emb = loom.run_subgraph("ttl_text", t_text, 0, { txt_ids = inputs.txt_ids, stl_emb = inputs.style_ttl })
 
-    -- --- Deterministic Euler CFM sampling loop over VectorFieldEstimator (z += v(z,t)*dt, uniform
-    --     dt=1/n_steps -- the ODE integration itself stays host-side, matching the bespoke driver). ---
-    local z = loom.gaussian_array(t_lat * lat_dim)
-
-    local dt = 1.0 / inputs.n_steps
-    for step = 0, inputs.n_steps - 1 do
-        local t = step / inputs.n_steps
-        local v = loom.run_subgraph("vfe", t_lat, 0, {
-            z_t = z,
-            txt_emb = txt_emb,
-            stl_emb = inputs.style_ttl,
-            t = { t },
-        })
-        for i = 1, #z do
-            z[i] = z[i] + v[i] * dt
-        end
-    end
+    -- --- Deterministic Euler CFM sampling loop over VectorFieldEstimator -- see sample_vfe above,
+    --     generated from export_supertonic_mil.py's own IterativeRefinementSpec. ---
+    local z = sample_vfe(t_lat, t_lat * lat_dim, inputs.n_steps,
+                          { txt_emb = txt_emb, stl_emb = inputs.style_ttl })
 
     -- --- SpeechDecoder: z (ne=[t_lat,lat_dim]) -> raw waveform ---
     local waveform = loom.run_subgraph("decoder", t_lat, 0, { latent = z })

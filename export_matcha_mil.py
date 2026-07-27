@@ -89,6 +89,7 @@ sys.path.insert(0, "/home/flavio/Dev/Matcha-TTS")
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
 from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
+from loom_mil_compiler.iterative_export import IterativeRefinementSpec, render_driver  # noqa: E402
 from loom_mil_compiler import group_norm_op  # noqa: E402,F401  patches nn.GroupNorm.forward globally
 
 import coremltools as ct  # noqa: E402
@@ -424,7 +425,22 @@ def main():
         "encoder_mu": mu_topo, "encoder_logw": logw_topo, "decoder": decoder_topo, "vocoder": vocoder_topo,
     }
     out_exporter.weights = merged_weights
-    out_exporter.write_gguf(driver_script_path.read_text())
+
+    # The Euler CFM sampling loop is the shared "N-step refinement over loop-carried state" family
+    # (EXPORT-IMPROVEMENT.md item 4), so the driver declares it rather than hand-writing it -- and gets
+    # the spec cross-checked against "decoder"'s real declared inputs at export time.
+    cfm_sampler = IterativeRefinementSpec(
+        func_name="sample_decoder",
+        estimator="decoder",
+        carried_input="z",
+        time_input="t",
+        fixed_inputs=["mu"],
+        note="Deterministic Euler CFM sampling over the Matcha-TTS Decoder U-Net vector-field\n"
+              "estimator: z <- z + v(z, mu, t) * dt, uniform dt = 1/n_steps.",
+    )
+    driver_source = render_driver(driver_script_path.read_text(), [cfm_sampler],
+                                   topologies=out_exporter.topologies)
+    out_exporter.write_gguf(driver_source)
     print("wrote matcha_mil.gguf")
 
 
