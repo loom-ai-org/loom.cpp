@@ -61,6 +61,7 @@ from kokoro.istftnet import Decoder  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools" / "loom_mil_compiler" / ".."))
 import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
 from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
+from loom_mil_compiler.iterative_export import EstimatorSpec, render_driver  # noqa: E402
 
 # import_kokoro_mil applies its own trace-friendly monkeypatches (AdainResBlk1d/SineGen/
 # SourceModuleHnNSF/Generator/Decoder) globally as an import side effect -- needed before tracing
@@ -333,7 +334,16 @@ def main():
                                      architecture="loom-styletts2-mil")
     out_exporter.topologies = {"albert": albert_topo, "decoder_vocoder": dv_topo, "diffusion": diff_topo}
     out_exporter.weights = merged_weights
-    out_exporter.write_gguf(driver_script_path.read_text())
+
+    # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
+    # true one-offs, and this one is a second-order sampler with two network evaluations and real
+    # preconditioning math per step -- see styletts2_driver_mil.lua). But its per-step `run_subgraph`
+    # call has the same failure mode as every generated one, so it is declared here and cross-checked
+    # against the real traced "diffusion" topology at export time rather than at run time.
+    diffusion_call = EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "embedding"])
+    driver_source = render_driver(driver_script_path.read_text(), topologies=out_exporter.topologies,
+                                   estimators=[diffusion_call])
+    out_exporter.write_gguf(driver_source)
 
 
 if __name__ == "__main__":
