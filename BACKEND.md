@@ -15,10 +15,12 @@ Item 5 (empirically prototype StableHLO) is deliberately not started — the pro
 | 4 — iterative-refinement template | done for the Euler-CFM family (Matcha + Supertonic); StyleTTS2 gets the validation half | `iterative_export.py`, `test_iterative_export.py`; three drivers + export scripts |
 | 5 — StableHLO prototype | not started (per the proposal) | — |
 | — StyleTTS2 regression (found here) | fixed and numerically re-verified | `topology_ops.py` `reduce_mean` guards |
+| — Conformer/Parakeet export blow-up (found here) | bisected to `a29ffe5`, fixed; >2 h (never finished) → 40 s | `value_facts.py` `dim_expr` memo |
 
-Two bugs surfaced along the way and both are fixed: StyleTTS2's export was already broken at `HEAD`
-before any of this work (bisected below), and one this refactor itself introduced, which the golden diff
-caught (see the last section).
+Three bugs surfaced along the way and all are fixed. Two pre-dated this work: StyleTTS2's export was
+already broken at `HEAD`, and the Conformer-CTC/Parakeet exports had regressed into an exponential
+blow-up that made them effectively unrunnable — both bisected to the commit that introduced them. The
+third this refactor introduced itself, and the golden diff caught it (last section).
 
 ---
 
@@ -170,50 +172,104 @@ snapshot-diffed (all metadata KVs, every topology JSON, the embedded driver Lua,
 | `matcha_mil` | topologies + tensors byte-identical; `driver_script` differs by item 4 only |
 | `supertonic_mil` | topologies + tensors byte-identical; `driver_script` differs by item 4 only |
 | `styletts2_mil` | baseline could not export at all (regression above); now exports and passes every reference test |
-| Conformer-CTC (2-layer encoder) | byte-identical — see the NeMo note below |
-| Parakeet-TDT (2-layer encoder) | byte-identical — see the NeMo note below |
+| `conformer_ctc_small_mil_monolithic` | baseline could not export in any bounded time (see below); now exports in 40 s, `max abs diff = 1.6e-04` vs the reference forward |
+| `parakeet_tdt_encoder_mil_monolithic` | same; now exports in 92 s, `max abs diff = 5e-06` |
+| `parakeet_rnnt_encoder_mil_monolithic` | same; now exports in 86 s, `max abs diff = 1.0e-05` |
 
-*Note on the NeMo models.* A **full** Conformer-CTC export does not finish in any reasonable time on this
-machine (>2 h, still running, see the performance finding below), which makes it useless as a refactor
-gate. Depth is what drives that cost, so both were re-exported with the encoder truncated to 2 conformer
-blocks (`scratchpad/export_{conformer,parakeet}_trunc.py`) and diffed baseline-vs-refactored on that.
-This is not the shipping artifact, but it is a valid equivalence check: any handler-level divergence
-shows up in it identically, and the truncated graph does route through the paths that matter. Confirmed
-by inspecting the emitted topology rather than assumed — Conformer's 306-node graph contains **both**
-`less` routes, 2 real `LESS` nodes (the fall-through the extraction bug broke) *and* 4
-`_always_valid_scalar` weights (the guarded bypass), plus `CONV_2D`/`CONV_1D_DW`/`SELECT`/`RANGE_1D`/
-`REDUCE_SUM`/`PAD_1D`. Parakeet-RNNT is not separately checked: `export_parakeet_rnnt_mil.py` differs
-from the TDT one only in which checkpoint it loads, same encoder architecture and same exporter path.
+---
 
-**Finding — the Conformer-CTC export's slowness is pre-existing, super-linear in encoder depth, and is
-not in coremltools.** Worth recording, since it is easy to misattribute. Both runs were sampled after
-~40 and ~70 minutes (and both were still running, unfinished, past the 2 h and 1.5 h marks):
+## The Conformer-CTC exporter blow-up (found and fixed)
 
-* both had already reached `Running MIL default pipeline: 100%` — coremltools is *done*; the time is
-  being spent in `generate_graph_topology` afterwards;
-* both sat at ~96% CPU and ~1.9 GB RSS, essentially identical to each other, so the refactor neither
-  caused nor cured it — the unmodified `HEAD` baseline is just as slow;
-* `gdb` stack samples showed a consistently *shallow* Python stack inside `PyObject_Str` and attribute
-  lookup, i.e. time going into string building rather than deep recursion.
+Not part of `EXPORT-IMPROVEMENT.md`. It surfaced because the three NeMo exports would not finish, which
+blocked items 1/2 verification — and it turned out to be the same bug class as item 2, in the one walk
+item 2 hadn't covered.
 
-Truncating the encoder from 16 conformer blocks to 2 drops the same export to well under a minute, which
-pins the cost to **depth**, not to trace length or model size.
+**Symptom.** A full Conformer-CTC export never completed: >2 h at 96% CPU and 1.9 GB RSS, with both the
+pristine `HEAD` baseline and the refactored tree equally stuck, so the refactor neither caused nor cured
+it. Both were long past `Running MIL default pipeline: 100%` — coremltools was *done*; the time was all
+in `generate_graph_topology`. `gdb` samples showed a shallow Python stack inside `PyObject_Str`.
 
-All of that points at the symbolic shape expressions: `_infer_dynamic_dim_expr` composes nested strings
-like `(floor(((1) * ((floor(((1) * ...` — visible six levels deep in the StyleTTS2 error above, after
-only a handful of reshape chains — and each additional encoder block nests them again. On 16 blocks
-those become enormous, which the 1.9 GB RSS and the time-in-`PyObject_Str` are both consistent with.
+**Measurement.** Truncating the encoder to N conformer blocks (`scratchpad/export_conformer_trunc.py`)
+and timing the exporter phase alone gives the shape of it directly:
 
-Note this is *not* what item 2's memoization addresses: memoizing a call does not help when the cost is
-in the size of the value it returns. The fix would be to normalize/simplify these expressions (they are
-algebraically trivial — the StyleTTS2 one reduces to `n_tokens`), or to intern them. Not attempted here:
-it is a performance question rather than a correctness one, and changing how shape strings are rendered
-would change exporter output, so it needs its own golden run. It is the obvious next thread if
-Conformer/Parakeet export time matters.
+| encoder blocks | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| exporter, at `c64cbbb` | 0.6 s | 1.0 s | 1.4 s | 1.8 s | 2.3 s |
+| exporter, at `e03bbac` | 0.2 s | 0.5 s | 1.3 s | 4.7 s | 84.8 s |
+
+Linear (+0.4 s/block) versus roughly **3× per block**. Extrapolated to the real 16-block encoder that is
+on the order of 10⁶ seconds — it was never going to finish.
+
+**Bisect.** Timing every commit that touched `exporter.py` after the last Conformer commit, at 5 blocks:
+
+| commit | subject | exporter |
+|---|---|---|
+| `c64cbbb` | Fix Conformer-CTC-small MIL export | 2.3 s |
+| `319c029` | Export VITS via MIL compiler | 2.3 s |
+| **`a29ffe5`** | **Add MIL-based export of Kokoro** | **84.8 s** |
+| `24cb6a5` / `67a54a9` / `166be64` | Kokoro finish / StyleTTS2 / Matcha | ~87 s |
+
+**Root cause.** `a29ffe5` made two changes to `_infer_dynamic_dim_expr` that are individually reasonable
+and together quadratic-to-exponential:
+
+1. it **removed the `id(var)` cycle guard** — correctly, and for a documented reason: the graph is an
+   acyclic DAG and the guard was silently returning `None` on ordinary *diamonds* (Kokoro's SineGen
+   reaches the same `rad_values` down two paths); and
+2. in the same commit it **added a `concat` case that recurses into every operand**, making this the
+   first branching walk in the function.
+
+A branching walk over a DAG with no revisit-suppression re-derives every shared ancestor once per path.
+That is exactly the failure the same commit message describes fixing in `_resolve_scalar_expr` for
+VITS — the guard was removed there too. The difference is that `scalar_expr` got memoized during item 2
+and this walk did not, because item 2 read the proposal's "const resolution" framing literally and
+covered the *value* half while leaving the *shape* half alone.
+
+**Fix.** `_infer_dynamic_dim_expr` is now a thin wrapper over
+`_infer_dynamic_dim_expr_uncached`, memoized by `ValueFacts.dim_expr` on `(id(var), torch_axis)` —
+the same treatment, and the same justification, as `scalar_expr`. Safe because the walk is pure in
+`(var, torch_axis)`: its `_seen` parameter is still threaded through every recursive call site but has
+not been *read* since `a29ffe5` deleted the guard. Caching is the correct form of what that guard was
+reaching for — it suppresses the redundant revisit without ever turning a legitimate second visit into a
+wrong answer.
+
+**Result.** Exporter time is linear in depth again, and the full models export for the first time:
+
+| encoder blocks | 2 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|
+| exporter, memoized | 0.1 s | 0.2 s | 0.3 s | 0.4 s | 0.5 s |
+
+Full Conformer-CTC: **>2 h (never finished) → 40 s end-to-end**, of which 0.5 s is the exporter.
+
+**Verification.** Output-preserving, and now checked against the real references rather than only
+against another export:
+
+| check | result |
+|---|---|
+| 2-block Conformer, memoized vs. pre-memo | **byte-identical** |
+| the other 9 models re-exported | unchanged (6 byte-identical, matcha/supertonic `driver_script`-only, StyleTTS2 as above) |
+| `test_e2e_conformer_ctc_mil_export` | 6/6, `max abs diff = 0.000164` vs `reference_forward_conformer.py` |
+| `test_e2e_parakeet_tdt_mil_export` | 6/6, `max abs diff = 0.000005` |
+| `test_e2e_parakeet_rnnt_mil_export` | 6/6, `max abs diff = 0.000010` |
+| every StyleTTS2 / Matcha / Supertonic reference + driver test | unchanged, all passing |
+
+**Worth noting for whoever reads this next:** an earlier version of this document concluded, from the
+`PyObject_Str` stack samples and the 1.9 GB RSS, that the cost was in the *size* of the shape expression
+strings and that memoization therefore could not help. That was wrong — the strings are large because
+the same subexpressions are rebuilt over and over, so suppressing the rebuild fixes both. The stack
+sample was real evidence pointing at string construction; the inference from it to "not a memoization
+problem" was the error. The remaining idea from that paragraph still stands on its own merits though:
+these expressions are algebraically trivial (the StyleTTS2 one reduces to `n_tokens`) and normalizing
+them would shrink the emitted shape strings, which memoization does not do.
 
 Beyond the golden diff, the Python suite (`test_topology_rules`, `test_value_facts`,
 `test_iterative_export`, `test_scripted_loop`, plus the pre-existing `test_compiler`, `test_recurrent`,
 `test_stft`, `test_tokenizer_detect`) runs 56 tests, all passing.
+
+*(The three NeMo rows in the table above were originally verified against a 2-block-truncated encoder,
+because the full exports would not complete. That workaround is no longer needed — see the blow-up
+section immediately below — and the full models are now exported and checked against their real
+reference forwards. `scratchpad/export_{conformer,parakeet}_trunc.py` is kept as the depth-scaling
+probe.)*
 
 ## Item 3 — explicit control-flow capture before tracing
 

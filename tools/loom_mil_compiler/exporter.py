@@ -157,6 +157,12 @@ class LoomGGUFExporter:
         return name
 
     def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+        """Memoizing entry point for the shape-expression walk below -- see `ValueFacts.dim_expr` for
+        why the memo is load-bearing rather than an optimization. `_seen` is accepted and ignored (every
+        recursive call site still threads it; the walk itself has had no cycle guard since a29ffe5)."""
+        return self.facts.dim_expr(var, torch_axis)
+
+    def _infer_dynamic_dim_expr_uncached(self, var, torch_axis, _seen=None):
         """
         Best-effort derivation of the REAL SymbolEnv expression for one symbolic MIL shape dimension, by
         walking `var`'s own producer chain backward through ops that are known to either preserve or
