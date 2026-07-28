@@ -266,7 +266,14 @@ the same subexpressions are rebuilt over and over, so suppressing the rebuild fi
 sample was real evidence pointing at string construction; the inference from it to "not a memoization
 problem" was the error. The remaining idea from that paragraph still stands on its own merits though:
 these expressions are algebraically trivial (the StyleTTS2 one reduces to `n_tokens`) and normalizing
-them would shrink the emitted shape strings, which memoization does not do.
+them would shrink the emitted shape strings, which memoization does not do. The promising route for that
+is to carry **sympy expressions** rather than strings — MIL's own `Symbol` already subclasses
+`sympy.Symbol` and sympy is a declared coremltools dependency, so the exporter is currently stringifying
+algebra it was handed and then rebuilding it worse by f-string concatenation. See BACKLOG.md for the
+full write-up, including the two findings that bound it: MIL propagates compound expressions through
+`reshape` but mints a fresh opaque symbol per `conv` (so the walk stays necessary), and
+`src/core/symbol_env.cpp` parses only `+ - * /`, parentheses, `floor` and `sqrt` (so emission needs a
+restricted printer, not `str(expr)`).
 
 Beyond the golden diff, the Python suite (`test_topology_rules`, `test_value_facts`,
 `test_iterative_export`, `test_scripted_loop`, plus the pre-existing `test_compiler`, `test_recurrent`,
