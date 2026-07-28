@@ -98,11 +98,37 @@ machine — set `TMPDIR` somewhere under `/home` or the export dies with `OSErro
 
 All three are recorded in full in BACKEND.md; this is the index.
 
-- **Normalize the symbolic shape expressions.** `_infer_dynamic_dim_expr` composes deeply nested strings
-  (`(floor(((1) * ((floor(((1) * …`) that are algebraically trivial — the StyleTTS2 one reduces to plain
-  `n_tokens`. Memoizing the walk fixed the *time* blow-up, but the emitted strings are still large.
-  Normalizing or interning them would shrink them. Performance/legibility only, no known correctness
-  impact, and it would change emitted shape attrs so it needs its own snapshot run.
+- **Normalize the symbolic shape expressions — carry sympy objects instead of strings.**
+  `_infer_dynamic_dim_expr` composes deeply nested strings (`(floor(((1) * ((floor(((1) * …`) that are
+  algebraically trivial: the StyleTTS2 one reduces to plain `n_tokens`. Memoizing the walk fixed the
+  *time* blow-up (see the Conformer entry), but the emitted strings are still large and unreadable.
+
+  The promising route (user's suggestion, checked against the actual libraries):
+
+  - **sympy is already there, and MIL already speaks it.** `coremltools…mil.program.Symbol` *subclasses*
+    `sympy.core.symbol.Symbol`, and sympy is a declared dependency of coremltools — so this adds no new
+    dependency. Today the exporter is handed sympy expressions, stringifies them, and then rebuilds
+    expressions by f-string concatenation, which is strictly worse algebra than it started with.
+  - **MIL propagates real algebra where it can.** Probed on a conv stack: a `reshape` output comes back
+    as `shape=(1, 4*is2)` — a genuine compound sympy expression, not an opaque symbol. Seeding from
+    those rather than re-deriving them is free accuracy.
+  - **But the walk is still needed.** `conv` does *not* propagate: MIL mints a fresh opaque symbol per
+    conv (`is0` → `is1` → `is2`), discarding the length relation. So the hand-written conv/pool formulas
+    stay; the change is that they should compose sympy expressions rather than strings, and simplify at
+    the end.
+
+  **Hard constraint on emission.** The C++ consumer (`src/core/symbol_env.cpp`) is a small recursive-descent
+  parser supporting exactly `+ - * /`, unary minus, parentheses, identifiers, numbers, and the two
+  functions `floor(...)` and `sqrt(...)`. Sympy's default printer will happily emit `**`, `ceiling`,
+  `Min`/`Max`, `Piecewise`, `Rational` — none of which parse. So emit through a *restricted printer* that
+  maps onto that grammar and raises on anything outside it, rather than `str(expr)`. Extending
+  `symbol_env.cpp` (e.g. `ceiling`, `**`) is an alternative, but the printer should still assert rather
+  than emit silently-unparseable text.
+
+  Changes emitted shape attrs, so it needs its own snapshot run
+  (`tools/loom_mil_compiler/snapshot_gguf.py`) — expect diffs that are *shorter but equivalent*
+  expressions, which means the diff has to be read rather than required to be empty. Verify numerically
+  via the per-model reference tests, not just by export success.
 - **Multi-output topologies in `GraphBuilder`/`run_subgraph`.** The engine's one-output-tensor-per-topology
   convention is the single thing standing between the current state and inferring an
   `IterativeRefinementSpec` directly from a scripted-loop trace (a MIL loop body has one output per
