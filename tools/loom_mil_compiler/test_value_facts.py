@@ -10,10 +10,16 @@ changed:
   subexpression once and every call site gets the same answer. The un-memoized version re-walked shared
   subtrees, and an earlier "already visited -> give up" guard turned a perfectly ordinary diamond into a
   silent `None` (see `scalar_expr`'s own docstring for the VITS case that caught it).
+
+`dim_expr`'s memo gets the most attention here, because that one is not a nicety: without it the
+branching shape walk is exponential in encoder depth, which is what made the Conformer-CTC and Parakeet
+exports stop finishing at all. Its tests assert the visit *bound* directly rather than just that a cache
+exists.
 """
 import unittest
 
 import numpy as np
+from coremltools.converters.mil.mil import Var
 
 import sys
 from pathlib import Path
@@ -119,6 +125,55 @@ class TestMemoization(unittest.TestCase):
         self.facts.scalar_expr(self._find("add").outputs[0])
         self.assertIn(id(base), self.facts._scalar_expr,
                       "the diamond's shared operand should be cached by the enclosing walk")
+
+    def test_dim_expr_visits_each_var_once_per_axis_however_many_paths_reach_it(self):
+        """The Conformer-CTC blow-up, in miniature.
+
+        `_infer_dynamic_dim_expr` has had no cycle guard since a29ffe5 (removed deliberately -- it was
+        corrupting ordinary DAG diamonds), and that same commit made the walk *branch* by adding a
+        `concat` case that recurses into every operand. Branching + no revisit-suppression re-derives
+        every shared ancestor once per path, which took the real 16-block encoder from ~2 s to
+        not-finishing-in-two-hours. The memo is what bounds it, so this asserts the bound directly:
+        a diamond must cost one visit per (var, axis), not one per path.
+        """
+        calls = []
+
+        class _CountingExporter:
+            def _infer_dynamic_dim_expr_uncached(self, var, torch_axis, _seen=None):
+                calls.append((id(var), torch_axis))
+                # Recurse into every operand, the way the real `concat`/elementwise cases do.
+                if var.op is not None:
+                    for v in var.op.inputs.values():
+                        if isinstance(v, Var):
+                            facts.dim_expr(v, torch_axis)
+                return "n_tokens"
+
+        facts = ValueFacts(exporter=_CountingExporter())
+        total = self._find("add").outputs[0]
+        facts.dim_expr(total, 0)
+
+        self.assertEqual(len(calls), len(set(calls)),
+                          "a var+axis was re-derived; the memo is not suppressing revisits")
+        base = self._find("gather").outputs[0]
+        self.assertEqual(sum(1 for c in calls if c[0] == id(base)), 1,
+                          "the diamond's shared operand must be derived exactly once")
+
+    def test_dim_expr_keys_on_the_axis_not_just_the_var(self):
+        """The same Var resolves different axes to different expressions, so the axis is part of the
+        cache identity -- keying on the Var alone would return one axis's answer for another's."""
+        seen = []
+
+        class _AxisExporter:
+            def _infer_dynamic_dim_expr_uncached(self, var, torch_axis, _seen=None):
+                seen.append(torch_axis)
+                return f"axis{torch_axis}"
+
+        facts = ValueFacts(exporter=_AxisExporter())
+        var = self._find("add").outputs[0]
+        self.assertEqual(facts.dim_expr(var, 0), "axis0")
+        self.assertEqual(facts.dim_expr(var, 1), "axis1")
+        self.assertEqual(facts.dim_expr(var, 0), "axis0")
+        self.assertEqual(seen, [0, 1], "axis 0 should have been served from the cache the second time")
 
     def test_cache_keeps_its_var_alive_so_ids_cannot_be_recycled(self):
         total = self._find("add").outputs[0]

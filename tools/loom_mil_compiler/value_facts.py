@@ -84,6 +84,7 @@ class ValueFacts:
         self._range_scalar = {}
         self._slice_axis = {}
         self._reshape_shape = {}
+        self._dim_expr = {}
 
     # -- literal statics ---------------------------------------------------------------------------
     # Bound as methods too, so a handler holding only `self.facts` still reaches them; the real
@@ -158,6 +159,35 @@ class ValueFacts:
             # would surface as a numerical mismatch against the reference model, not a syntax error here.
             return "1"
         return self.exporter._infer_dynamic_dim_expr(real_var, torch_axis)
+
+    def dim_expr(self, var, torch_axis):
+        """The real SymbolEnv expression for one symbolic MIL shape dimension -- the memoized front end
+        for `exporter._infer_dynamic_dim_expr_uncached`, which walks `var`'s producer chain backward.
+
+        The memo here is a **correctness-adjacent performance fix, not a tidiness one.** That walk used
+        to be a linear producer-chain walk with an `id(var)` cycle guard. Commit a29ffe5 (Kokoro) removed
+        the guard -- correctly: the graph is an acyclic DAG, and the guard was silently returning None on
+        ordinary *diamonds* (Kokoro's SineGen reaches the same `rad_values` down two paths) -- and, in the
+        same commit, added a `concat` case that recurses into *every* operand. Linear walk plus branching
+        recursion plus no revisit-suppression is the textbook exponential blow-up, and it is exactly what
+        happened: Conformer-CTC's export went from linear in encoder depth to roughly 3x per layer,
+        turning a ~2 s export into one that does not finish at all on 16 blocks.
+
+        Caching the answer is the right version of what the deleted guard was reaching for: it suppresses
+        the redundant revisit without ever turning a legitimate second visit into a wrong answer. This is
+        the same fix, and the same reasoning, as `scalar_expr`'s memo below -- that one was applied when
+        its guard was removed for the identical VITS diamond; this walk was simply left behind.
+
+        Keyed on `(id(var), torch_axis)`: the same Var routinely resolves different axes to different
+        expressions, so the axis is part of the identity. The Var is stored alongside the answer to keep
+        it alive, so its `id` can never be recycled onto another object.
+        """
+        key = (id(var), torch_axis)
+        if key in self._dim_expr:
+            return self._dim_expr[key][1]
+        result = self.exporter._infer_dynamic_dim_expr_uncached(var, torch_axis)
+        self._dim_expr[key] = (var, result)
+        return result
 
     def scalar_expr(self, v, _seen=None):
         """
