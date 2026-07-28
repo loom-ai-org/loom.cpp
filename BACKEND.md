@@ -11,8 +11,8 @@ Item 5 (empirically prototype StableHLO) is deliberately not started — the pro
 |---|---|---|
 | 1 — declarative op table | done, output-identical | `topology_ops.py`, `symbols.py`, `test_topology_rules.py`; `exporter.py` 4,440 → 2,121 lines |
 | 2 — centralized value resolution | done, output-identical | `value_facts.py`, `test_value_facts.py` |
-| 3 — explicit control-flow capture | feasibility established + tested; no shipping consumer, by design | `scripted_loop.py`, `test_scripted_loop.py` |
-| 4 — iterative-refinement template | done for the Euler-CFM family (Matcha + Supertonic); StyleTTS2 gets the validation half | `iterative_export.py`, `test_iterative_export.py`; three drivers + export scripts |
+| 3 — explicit control-flow capture | **not done as written** — mechanism built and tested, but deliberately not applied to any of the four named models. The "bake the count, re-open it at conversion" workaround was probed too and gets 2 of 3 prerequisites; see the findings | `scripted_loop.py`, `test_scripted_loop.py` |
+| 4 — iterative-refinement template | done for Matcha + Supertonic; StyleTTS2 gets the validation half; Kokoro untouched. **Its predicted line-count payoff did not materialize** | `iterative_export.py`, `test_iterative_export.py`; three drivers + export scripts |
 | 5 — StableHLO prototype | not started (per the proposal) | — |
 | — StyleTTS2 regression (found here) | fixed and numerically re-verified | `topology_ops.py` `reduce_mean` guards |
 | — Conformer/Parakeet export blow-up (found here) | bisected to `a29ffe5`, fixed; >2 h (never finished) → 40 s | `value_facts.py` `dim_expr` memo |
@@ -314,6 +314,50 @@ principle. `generate_graph_topology` cannot and should not: a static topology is
 loop body would have to become its own topology the driver calls per step, and building that split is
 real unimplemented work — item 4 deliberately did not go that way (see its own findings below).
 
+### Follow-up: baking the trip count for tracing, then re-opening it at conversion time
+
+A reasonable proposal, since constraint 1 above is the whole blocker: fix the step count as a constant
+*only* so the loop survives scripting, then rewrite it back into a runtime argument during MIL → ggml
+conversion. Probed directly (`scratchpad/probe_loop_structure.py`, `probe_loop_extract.py`). The emitted
+MIL is:
+
+```
+while_loop(loop_vars = [state_iter=0 (i32), state (1,8), t=[0.0]])
+  COND:  less(state_iter, y=const 4)   <- the trip count
+  BODY:  linear -> tanh -> mul -> add  [the estimator, NOT unrolled]
+         add(t, dt) ; add(state_iter, 1)
+    => outputs (state_iter+1, state', t')
+```
+
+**Two of the three prerequisites hold.** The trip count is a *single* identifiable const (`less.y`) in
+the cond block, trivially swappable. And the loop-carried vars are explicit and positionally matched to
+the body's outputs — meaning an `IterativeRefinementSpec` could be *inferred* from the trace instead of
+declared, which is exactly the item 3 → item 4 chain the proposal envisioned.
+
+**One hazard, solvable.** `dt = 1.0 / self.n_steps` gets constant-folded into the body as a literal
+(`mul(y=0.25)`, `add(t, 0.25)` for N=4) in more than one place. Swapping only the loop bound would leave
+the integration silently using a step size for the old N, and the folded floats carry no provenance to
+find them by. Fix is source-side and clean: take `dt` as a tensor input so it stays symbolic — verified,
+after which the only float consts remaining in the body are the estimator's real weights.
+
+**The blocker moves to the body block, and it is structural.** Feeding the body's operations to
+`generate_graph_topology` yields a **1-node** topology, not the estimator: a MIL loop body has one output
+*per loop-carried var* (`[state_iter_x0_inc, state.7, t.7]`), while the exporter takes `ops_list[-1]`'s
+output as *the* topology output — here the counter increment — and `_prune_dead_nodes` then correctly
+removes everything unreachable from it, i.e. the whole network. That is not a bug to patch around: the
+engine's convention really is one output tensor per topology (`loom.run_subgraph` returns data + shape,
+see `submodule_export.py`'s `_flatten_call` comment).
+
+Making it work therefore needs either multi-output topologies in `GraphBuilder`/`run_subgraph` (an engine
+change), or a classifier that routes *scalar* loop vars (the counter, `t`) to host Lua and keeps only the
+tensor state as the single topology output — plus driver synthesis from `loop_vars` and per-model
+numerical re-verification. Note where option two lands: driver owns the counter and the time, topology
+computes the one tensor. That is exactly what the hand-written drivers already do, which is the honest
+summary of the whole direction — **its payoff is inferring the spec rather than declaring it, not a
+better runtime shape.** Weighed against replacing a ~13-line declarative spec that already carries
+export-time validation, that is not worth building yet. Revisit if a model turns up whose loop cannot be
+expressed host-side at all.
+
 ## Item 4 — second family template for iterative-refinement models
 
 **Status:** implemented for the Euler-CFM sampler family (Matcha + Supertonic); StyleTTS2's ADPM2
@@ -333,12 +377,35 @@ local z = sample_decoder(t_mel, t_mel * n_feats, inputs.n_steps, { mu = mu_y })
 local z = sample_vfe(t_lat, t_lat * lat_dim, inputs.n_steps, { txt_emb = txt_emb, stl_emb = inputs.style_ttl })
 ```
 
-**The point is not the line count** — it is `validate_against_topology`, which cross-checks the spec
-against the estimator's *real* declared inputs at export time and raises naming the exact mismatch.
-Supplying an input the topology never declared, or omitting one it did, is otherwise only caught deep
-inside the engine at run time with nothing pointing back at the line that got it wrong. That mirrors
-`SubmoduleExportSpec`'s own "a wrong attribute path raises immediately" property, and it is the reason
-this is a spec rather than a shared Lua helper function.
+**The proposal's predicted payoff did not materialize, and that is worth stating plainly.** Item 4
+expected a shared template to "shrink these the same way `SubmoduleExportSpec` shrunk
+`export_qwen3_mil.py` to 28 lines", citing `export_styletts2_mil.py`: 340 lines and
+`export_kokoro_mil.py`: 503 lines. Measured before/after:
+
+| file | before | after |
+|---|---|---|
+| `export_matcha_mil.py` | 432 | 448 |
+| `export_supertonic_mil.py` | 237 | 252 |
+| `export_styletts2_mil.py` | 340 | 350 |
+| `export_kokoro_mil.py` | 503 | 503 (untouched) |
+| `matcha_driver_mil.lua` | 101 | 96 |
+| `supertonic_driver_mil.lua` | 65 | 55 |
+| `styletts2_driver_mil.lua` | 368 | 368 |
+
+Total line count went **up** (+41 in the export scripts, −15 in the drivers). The reason is that the
+340/503 lines the proposal points at are *tracing setup* — wrapper modules, dummy inputs, `RangeDim`
+declarations, per-phase topology assembly — not loop orchestration. A sampler template cannot touch any
+of that. The thing it replaces was ~13 lines of Lua per driver. The `SubmoduleExportSpec` analogy does
+not carry: that one subsumed a whole export script because decoder-LLMs share their *entire* structure,
+whereas these three share one loop inside otherwise unrelated pipelines.
+
+**What was actually delivered** is `validate_against_topology`: the spec is cross-checked against the
+estimator's *real* declared inputs at export time and raises naming the exact mismatch. Supplying an
+input the topology never declared, or omitting one it did, is otherwise only caught deep inside the
+engine at run time with nothing pointing back at the line that got it wrong. That is a genuine
+improvement and it does mirror `SubmoduleExportSpec`'s "a wrong attribute path raises immediately"
+property — but it is a different benefit from the one the item predicted, and it is the reason this is
+a spec rather than a shared Lua helper function.
 
 **Verification.** Unlike items 1 and 2 this *is* meant to change the output — the embedded driver script
 differs. Everything else must not, and the numbers must not move at all:
@@ -426,6 +493,45 @@ handler, so they cannot disagree about which case they are in — the same patte
 any non-static reduction count, so an export that succeeded is proof that every one of its `reduce_mean`
 ops had a static count — and for those, the new guarded rule runs the identical composition on the
 identical plan. The change can only alter models that previously failed to export.
+
+## Conclusion of the thread: family templates, not universal inference
+
+The stated goal behind items 3 and 4 was to infer the orchestration graph from the trace
+"ONNX-exporter-style, for virtually any architecture". That goal does not reach, and the reasons are
+worth stating precisely, because two of the three are not what one would guess up front:
+
+1. **The orchestration usually isn't in the traced module.** For all four models named in item 3, the
+   loop lives in demo/inference code, not in any `forward()`. There is nothing in the trace to infer
+   *from* unless a scriptable wrapper containing the loop is written first — and writing that wrapper
+   costs about what the six-line spec costs. Inference pays off only when the real model's own `forward`
+   already contains the orchestration.
+2. **A captured loop doesn't map onto a topology anyway.** A MIL loop body has one output per
+   loop-carried var; the engine has exactly one output tensor per topology. See the item 3 follow-up
+   above.
+3. **Roles are not always recoverable from shapes, even in principle.** Matcha's `decoder` declares
+   `z` and `mu` with *identical* shapes `[n_tokens, 80, 1]`, and its output has that shape too — so
+   nothing about the topology reveals which input is the loop-carried state. Supertonic's `z_t` is
+   separable only incidentally (it happens to be the one with a dynamic axis). A `while_loop`'s
+   `loop_vars` *does* state it outright, which is the one concrete thing that route buys — worth
+   remembering if inference is ever revisited.
+
+**What does generalize is the per-family template**, and there are now two working examples worth
+copying the shape of rather than inventing a third style:
+
+| | `SubmoduleExportSpec` (decoder-LLMs) | `IterativeRefinementSpec` (Euler-CFM samplers) |
+|---|---|---|
+| declares | prefix / repeated / suffix / aux boundaries | estimator, carried input, time input, fixed inputs |
+| cross-checked against | `find_repeated_blocks()` re-derives the repeated blocks structurally and rejects a spec that claims a non-qualifying attribute | `validate_against_topology()` re-reads the estimator's real declared inputs and rejects any mismatch |
+| concedes | non-causal-LM architectures | ADPM2 / duration-scatter loops (which still declare an `EstimatorSpec` for the check) |
+
+The pattern both share, and the one to reuse for the next family: **declare only what genuinely varies,
+re-derive everything else structurally, and make the spec fail loudly at export time when its claim and
+the real model disagree.** That is what makes a template worth more than the hand-written code it
+replaces — not the line count (see item 4's own measurements, where the count went up).
+
+A candidate next family, when it comes up: NeMo-style ASR encoders (Conformer-CTC, Parakeet-TDT/RNNT)
+already share a preprocessor → encoder → decoder shape and a common length-masking idiom, and are
+currently three near-identical export scripts.
 
 ## Bug found in this work (and fixed)
 
