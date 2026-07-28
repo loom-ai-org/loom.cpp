@@ -31,10 +31,16 @@ used throughout is a **golden structural snapshot diff** over all 12 export scri
 
 1. Re-run every `export_*.py` against the real local checkpoints, from a pristine `git archive HEAD`
    copy of the repo (so the baseline cannot be contaminated by in-progress edits).
-2. Snapshot each resulting `.gguf` into diffable text — every metadata KV, each
-   `model.graph_topology.*` JSON pretty-printed and key-sorted, the embedded `model.driver_script` Lua,
-   and one line per tensor (`name / shape / dtype / sha256-of-data`).
-3. Refactor, re-run, re-snapshot, and require a **zero-line diff**.
+2. Snapshot each resulting `.gguf` into diffable text with
+   **`tools/loom_mil_compiler/snapshot_gguf.py`** — every metadata KV, each `model.graph_topology.*`
+   JSON pretty-printed and key-sorted, the embedded `model.driver_script` Lua, and one line per tensor
+   (`name / shape / dtype / sha256-of-data`).
+3. Refactor, re-run, re-snapshot, and require a **zero-line diff** (`diff -r` over the two snapshot
+   dirs).
+
+That script is in the repo precisely so this is repeatable — its own docstring carries the full recipe.
+It is what caught this refactor's one real bug (three silently dropped `LESS` nodes); no existing test
+covered it, because the emitted model stayed structurally valid, just wrong.
 
 **Finding — the committed `.gguf` files are stale.** The `.gguf` artifacts sitting in the repo tree do
 not match what the current exporter produces (re-running `export_vits_mil.py` alone already differs: the
@@ -189,8 +195,9 @@ pristine `HEAD` baseline and the refactored tree equally stuck, so the refactor 
 it. Both were long past `Running MIL default pipeline: 100%` — coremltools was *done*; the time was all
 in `generate_graph_topology`. `gdb` samples showed a shallow Python stack inside `PyObject_Str`.
 
-**Measurement.** Truncating the encoder to N conformer blocks (`scratchpad/export_conformer_trunc.py`)
-and timing the exporter phase alone gives the shape of it directly:
+**Measurement.** Truncating the encoder to N conformer blocks — a throwaway copy of the export script
+that slices `model.encoder.layers[:N]` — and timing the exporter phase alone gives the shape of it
+directly:
 
 | encoder blocks | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
@@ -268,8 +275,7 @@ Beyond the golden diff, the Python suite (`test_topology_rules`, `test_value_fac
 *(The three NeMo rows in the table above were originally verified against a 2-block-truncated encoder,
 because the full exports would not complete. That workaround is no longer needed — see the blow-up
 section immediately below — and the full models are now exported and checked against their real
-reference forwards. `scratchpad/export_{conformer,parakeet}_trunc.py` is kept as the depth-scaling
-probe.)*
+reference forwards.)*
 
 ## Item 3 — explicit control-flow capture before tracing
 
@@ -286,7 +292,8 @@ user-written Python loop can reach the same place, because a traced Python loop 
 TorchScript `prim::Loop` at all — `torch.jit.trace` unrolls it before coremltools ever sees it.
 
 **Finding — `torch.jit.script` does work, but only with a compile-time-constant trip count.** Probing
-coremltools 9.0 / torch 2.8 with a 4-step loop-carried-state module (`scratchpad/probe_loop*.py`):
+coremltools 9.0 / torch 2.8 with a 4-step loop-carried-state module (throwaway probe; the module is
+`RefinementLoop` in `scripted_loop.py`, converted each way and the MIL op histogram compared):
 
 | formulation | result |
 |---|---|
@@ -318,7 +325,7 @@ real unimplemented work — item 4 deliberately did not go that way (see its own
 
 A reasonable proposal, since constraint 1 above is the whole blocker: fix the step count as a constant
 *only* so the loop survives scripting, then rewrite it back into a runtime argument during MIL → ggml
-conversion. Probed directly (`scratchpad/probe_loop_structure.py`, `probe_loop_extract.py`). The emitted
+conversion. Probed directly (throwaway probes; their full output is reproduced below so they need not be rebuilt). The emitted
 MIL is:
 
 ```
@@ -453,8 +460,9 @@ every rejection path of the validation.
 Not part of `EXPORT-IMPROVEMENT.md`, but done here because the new table made the fix a one-line change
 in shape rather than a rewrite.
 
-**What the op actually is.** Instrumenting the diffusion phase (`scratchpad/probe_styletts2_mean.py`)
-showed exactly one `reduce_mean` in it, and its facts decide everything:
+**What the op actually is.** Instrumenting the diffusion phase — monkeypatching the `reduce_mean` rule
+to print each op's resolved axis before delegating — showed exactly one `reduce_mean` in it, and its
+facts decide everything:
 
 ```
 reduce_mean x_full.9: torch_axis=-1  ne_axis=0  keep_dims=False

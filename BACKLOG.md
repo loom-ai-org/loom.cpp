@@ -38,6 +38,79 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 
 ## Exporter / MIL compiler
 
+> **Read [`BACKEND.md`](BACKEND.md) first if you are touching the exporter.** It is the working record of
+> the `EXPORT-IMPROVEMENT.md` thread (commits `42fc5d5`, `ebafa4e`, `640e49f` on `export-improvement`) and
+> describes the shape the exporter now has, which is materially different from what older entries in this
+> file assume:
+>
+> - `exporter.py` is 4,440 → ~2,120 lines. Per-op lowering moved to a **declarative rule table** in
+>   `topology_ops.py`, keyed on `(mil_op_type, guard_predicate)`. `python3 -m loom_mil_compiler.topology_ops`
+>   prints the whole table. An op that no rule claims falls through to the generic `OP_MAP` path — that
+>   fall-through is a deliberate route for `less` and `reduce_mean`, not an accident.
+> - "What is this Var's compile-time value / shape expression?" is answered in one place,
+>   `value_facts.py`, memoized per Var. The memo is load-bearing, not tidiness: without it the shape walk
+>   is exponential in encoder depth (see the Conformer entry below).
+> - Two family templates now exist — `submodule_export.py` (decoder-LLMs) and `iterative_export.py`
+>   (Euler-CFM samplers) — and BACKEND.md's closing section argues that per-family templates, not
+>   universal orchestration inference, are the direction that actually works, with the evidence for why.
+> - **Any exporter change should be gated on `tools/loom_mil_compiler/snapshot_gguf.py`** — snapshot the
+>   exports before and after and require a zero-line `diff -r`. Its docstring has the recipe. The `.gguf`
+>   files in the tree are `.gitignore`d build outputs and are routinely stale; regenerate the baseline
+>   rather than diffing against them.
+
+### Next family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT)
+
+Not started. The natural third family after `SubmoduleExportSpec` and `IterativeRefinementSpec`, and the
+cleanest remaining candidate: `export_conformer_ctc_mil.py` (93 lines), `export_parakeet_tdt_mil.py` (97),
+and `export_parakeet_rnnt_mil.py` (91) are near-identical, differing in exactly five things:
+
+| | Conformer-CTC | Parakeet-TDT | Parakeet-RNNT |
+|---|---|---|---|
+| checkpoint path | `models/conformer-ctc-small/…` | `parakeet_tdt_model/…` | `parakeet_rnnt_model/…` |
+| restore class | `EncDecCTCModel` | `ASRModel` | `ASRModel` |
+| wrapper returns | `log_probs` (of a 3-tuple) | `encoded.transpose(1, 2)` | `encoded.transpose(1, 2)` |
+| `architecture=` | `conformer-ctc` | `parakeet-tdt-encoder` | `parakeet-rnnt-encoder` |
+| output filename | … | … | … |
+
+Everything else is byte-identical boilerplate: the `transformers.dependency_versions_check` mock (NeMo
+imports transformers transitively via torchmetrics), the `nn.Module` wrapper reducing NeMo's output tuple
+to one tensor, `n_samples = 16000`, `ct.RangeDim(1600, 16000 * 20)`, `compute_precision=FLOAT32` (load
+bearing — see the CONV_2D FP16 entry below), and `profile="monolithic"`.
+
+Follow the shape the other two templates share, which BACKEND.md's closing section spells out: declare
+only what genuinely varies, re-derive everything else structurally, and make the spec fail loudly at
+export time when its claim and the real model disagree (`find_repeated_blocks` and
+`validate_against_topology` are the two existing precedents). Do **not** optimise for line count — item 4
+of the improvement thread measured that going *up*, and the real payoff was export-time validation.
+
+Verification is already in place; these three tests take the exported GGUF plus a reference fixture and
+are the gate:
+
+- `test_e2e_conformer_ctc_mil_export` — `LOOM_CONFORMER_CTC_DIR` (the model dir, containing `ref/`) +
+  `LOOM_CONFORMER_CTC_MIL_GGUF`. Current: 6/6, `max abs diff 1.6e-04`.
+- `test_e2e_parakeet_tdt_mil_export` — `LOOM_PARAKEET_TDT_DIR` + `LOOM_PARAKEET_TDT_MIL_GGUF`. 6/6, `5e-06`.
+- `test_e2e_parakeet_rnnt_mil_export` — `LOOM_PARAKEET_RNNT_DIR` + `LOOM_PARAKEET_RNNT_MIL_GGUF`. 6/6, `1.0e-05`.
+
+Note NeMo's `restore_from()` untars a multi-GB checkpoint into `TMPDIR`, and `/` has ~2 GB free on this
+machine — set `TMPDIR` somewhere under `/home` or the export dies with `OSError: No space left on device`.
+
+### Open follow-ups from the exporter-improvement thread
+
+All three are recorded in full in BACKEND.md; this is the index.
+
+- **Normalize the symbolic shape expressions.** `_infer_dynamic_dim_expr` composes deeply nested strings
+  (`(floor(((1) * ((floor(((1) * …`) that are algebraically trivial — the StyleTTS2 one reduces to plain
+  `n_tokens`. Memoizing the walk fixed the *time* blow-up, but the emitted strings are still large.
+  Normalizing or interning them would shrink them. Performance/legibility only, no known correctness
+  impact, and it would change emitted shape attrs so it needs its own snapshot run.
+- **Multi-output topologies in `GraphBuilder`/`run_subgraph`.** The engine's one-output-tensor-per-topology
+  convention is the single thing standing between the current state and inferring an
+  `IterativeRefinementSpec` directly from a scripted-loop trace (a MIL loop body has one output per
+  loop-carried var). Worth doing only if role inference becomes valuable — BACKEND.md's item 3 follow-up
+  has the full analysis, including the two of three prerequisites that already hold.
+- **Item 5 of `EXPORT-IMPROVEMENT.md` (prototype StableHLO on one solved model)** remains deliberately
+  not started; the proposal itself files it as a validation exercise rather than a fix.
+
 ### MIL primitive review — broader ask still open
 
 The concrete, bounded bugs originally tracked under this item (`LESS_EQUAL`/`GREATER_EQUAL` boundary bug,
