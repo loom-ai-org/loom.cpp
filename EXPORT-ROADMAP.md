@@ -354,7 +354,8 @@ disagree*. Atomic is the one part of the exporter still on the other side of tha
 downgrade is a footgun — it is the same "produces something plausible instead of failing" shape as the
 two shape bugs found this week.
 
-**Recommendation: retire `profile="atomic"` as a user-facing profile**, in three steps:
+**Decision (approved): retire `profile="atomic"`.** Two profiles remain — `monolithic` (default) and
+`submodule` — and `submodule` is the only split mechanism. Steps:
 
 1. dedup the writer (above), so the comparison is honest;
 2. show that `lfm2_350m_submodule` and `lfm2_350m_atomic` have the same *runtime* peak-activation
@@ -369,6 +370,10 @@ two shape bugs found this week.
 That leaves two profiles with a clear rule: **monolithic** when the whole graph fits one topology and
 speed matters; **submodule** when the driver should own activation memory or the model has real
 structural boundaries. Both are declared, neither silently degrades.
+
+Step 2 is a *nice-to-have measurement, not a blocker*: it is worth knowing whether the split profiles
+deliver the memory win they were built for, but the decision to remove atomic does not depend on the
+answer, since submodule provides the same per-layer topologies either way.
 
 ---
 
