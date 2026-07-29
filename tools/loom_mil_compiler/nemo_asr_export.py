@@ -194,7 +194,7 @@ class NeMoASREncoderSpec:
     output_path: str
     # Only "monolithic" has ever been used for this family (there is no submodule boundary to declare:
     # the whole preprocessor+encoder(+CTC decoder) chain is one graph). Declared rather than hardcoded
-    # so an atomic-profile export doesn't need to bypass this template.
+    # for symmetry with the other family templates' own `profile` field.
     profile: str = "monolithic"
 
     def validate_against_model(self, model) -> int:

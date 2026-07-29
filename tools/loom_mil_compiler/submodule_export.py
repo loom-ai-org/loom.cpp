@@ -29,7 +29,7 @@ from .submodule_discovery import find_repeated_blocks, get_by_path, capture_call
 # time the hook fired during the one real forward pass used for capture (e.g. a decoder layer captured
 # mid-way through a 16-layer loop carries every EARLIER layer's cached K/V) -- silently wrong for a
 # submodule that must behave like a fresh, history-free call once traced and invoked standalone (the
-# atomic driver supplies its own KV-cache bookkeeping at the C++ level). Forcing this one kwarg to None
+# submodule driver supplies its own KV-cache bookkeeping at the C++ level). Forcing this one kwarg to None
 # whenever present reproduces the affected model's own documented "no cache" default behavior.
 _CACHE_KWARG_NAMES = {"past_key_values", "past_key_value"}
 

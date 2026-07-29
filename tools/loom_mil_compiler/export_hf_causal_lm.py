@@ -14,11 +14,11 @@ auto-detection raises (an unrecognized tokenizer hash, or a recognized-but-not-y
 
 Usage:
   ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.export_hf_causal_lm \\
-      /path/to/hf/model --profile atomic --architecture lfm2 --output model.gguf
+      /path/to/hf/model --architecture lfm2 --output model.gguf
 
   # Override auto-detection explicitly (e.g. if the tokenizer predates tokenizer_detect.py's hash table):
   ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.export_hf_causal_lm \\
-      /path/to/hf/model --profile atomic --tokenizer-pre llama3 --architecture lfm2 \\
+      /path/to/hf/model --tokenizer-pre llama3 --architecture lfm2 \\
       --output model.gguf
 """
 import argparse
@@ -81,7 +81,7 @@ def export_causal_lm(
     max_seq_len: int = 4096,
 ) -> str:
     """Loads a plain HF causal-LM from `model_dir`, traces it, and exports it to Loom GGUF at
-    `output_path` under the given profile ("monolithic" or "atomic"). Returns `output_path`."""
+    `output_path` under the given profile ("monolithic" or "submodule"). Returns `output_path`."""
     print(f"Loading model from {model_dir}...")
     model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32).eval()
     if architecture is None:
@@ -102,8 +102,8 @@ def export_causal_lm(
 
     # `tokens`/`cache_position`/`attention_mask` share the SAME ct.RangeDim instance so coremltools ties
     # them all to one symbolic length (they must always be called with matching lengths at runtime) --
-    # see apply_monolithic_export/apply_atomic_export's own auto-generation of "cache_position"-named
-    # inputs via loom.range(...) and "attention_mask"-named inputs via loom.causal_mask(...).
+    # see apply_monolithic_export's own auto-generation of "cache_position"-named inputs via
+    # loom.range(...) and "attention_mask"-named inputs via loom.causal_mask(...).
     print(f"Compiling to GGUF ({profile} profile)...")
     seq_len_dim = ct.RangeDim(1, max_seq_len)
     mil_prog = ct.convert(
@@ -141,7 +141,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("model_dir", help="Path to a local HF AutoModelForCausalLM checkpoint directory")
     parser.add_argument("-o", "--output", required=True, help="Output GGUF path")
-    parser.add_argument("--profile", choices=["monolithic", "atomic"], default="monolithic")
+    parser.add_argument("--profile", choices=["monolithic"], default="monolithic")
     parser.add_argument("--architecture", default=None, help="Defaults to model.config.model_type")
     parser.add_argument("--tokenizer-dir", default=None, help="Defaults to model_dir")
     parser.add_argument("--tokenizer-family", default=None,

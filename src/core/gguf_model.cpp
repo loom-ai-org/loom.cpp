@@ -85,6 +85,32 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, ggml_backend
                          "(or any 'model.graph_topology.<name>') KV");
     }
 
+    // Content-addressed weight payloads (BACKLOG.md P0.2): the writer hashes each tensor's on-disk
+    // bytes and, when two declared weight names would be byte-identical, stores the payload once under
+    // whichever name it saw first and records every later name as an alias in these two parallel
+    // arrays instead of writing (and allocating backend storage for) a second copy. Resolving aliases
+    // straight into `symbols_` -- a flat name->tensor map -- means no other code path needs to know
+    // aliasing happened at all: `weight("suffix_1.module_weight")` returns the exact same ggml_tensor*
+    // as `weight("prefix.module_weight")` for LFM2's tied embedding, same as if both had been written
+    // out separately. Absent entirely for every model with no duplicate payloads (add_array() on the
+    // Python side skips writing an empty array), so this is a no-op for the common case.
+    if (model->has_kv("loom.tensor_alias.names")) {
+        const std::vector<std::string> alias_names = model->kv_arr_str("loom.tensor_alias.names");
+        const std::vector<std::string> alias_targets = model->kv_arr_str("loom.tensor_alias.targets");
+        if (alias_names.size() != alias_targets.size()) {
+            throw LoadError("GgufModel::load: '" + path + "' has mismatched 'loom.tensor_alias.names'/"
+                             "'loom.tensor_alias.targets' array lengths");
+        }
+        for (size_t i = 0; i < alias_names.size(); ++i) {
+            const auto target_it = model->symbols_.find(alias_targets[i]);
+            if (target_it == model->symbols_.end()) {
+                throw LoadError("GgufModel::load: '" + path + "' declares alias '" + alias_names[i] +
+                                 "' -> '" + alias_targets[i] + "', but the target tensor doesn't exist");
+            }
+            model->symbols_[alias_names[i]] = target_it->second;
+        }
+    }
+
     return model;
 }
 

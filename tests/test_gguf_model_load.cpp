@@ -44,6 +44,13 @@ int main() {
 
     LOOM_CHECK_THROWS(model->weight("does.not.exist"), loom::LoadError);
 
+    // -- content-addressed weight aliasing (BACKLOG.md P0.2) -- "test.weight_alias" has no tensor_info
+    //    of its own in the fixture, only a "loom.tensor_alias.*" KV pair pointing at "test.weight"; it
+    //    must resolve to the EXACT SAME ggml_tensor* (not merely equal data), proving the alias is
+    //    wired into `symbols_` rather than materializing a second copy. --
+    LOOM_CHECK(model->has_weight("test.weight_alias"));
+    LOOM_CHECK(model->weight("test.weight_alias") == w);
+
     // -- hparams --
     LOOM_CHECK(model->architecture() == "minimal_test");
     LOOM_CHECK(model->hparam_u32("n_layer") == 2);

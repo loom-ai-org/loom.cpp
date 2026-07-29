@@ -1,17 +1,16 @@
-// Validates the MIL-compiler-exported LFM2-350M GGUFs (export_lfm2_atomic.py / export_lfm2_monolithic.py)
-// end to end, at genuinely dynamic (non-fixed, unpadded) prompt lengths -- the concern EXPORT-BACKLOG.md
-// item 3 raised: these scripts used to trace with a FIXED (1, 128) shape and pad every prompt up to it,
-// so nothing ever exercised the exporter's actual dynamic-`n_tokens` codepath at a real, differing prompt
-// length. Now that both scripts trace with `ct.RangeDim`, this compares the compiled model's next-token
-// prediction against a real HF forward pass at two different prompt lengths (3 and 7 tokens) -- neither
-// padded to any fixed size -- so a shape-handling regression from tracing genuinely dynamically would
-// show up as a wrong/crashing token, not just "does it export".
+// Validates the MIL-compiler-exported LFM2-350M GGUF (export_lfm2_monolithic.py) end to end, at genuinely
+// dynamic (non-fixed, unpadded) prompt lengths -- the concern EXPORT-BACKLOG.md item 3 raised: this
+// script used to trace with a FIXED (1, 128) shape and pad every prompt up to it, so nothing ever
+// exercised the exporter's actual dynamic-`n_tokens` codepath at a real, differing prompt length. Now
+// that it traces with `ct.RangeDim`, this compares the compiled model's next-token prediction against a
+// real HF forward pass at two different prompt lengths (3 and 7 tokens) -- neither padded to any fixed
+// size -- so a shape-handling regression from tracing genuinely dynamically would show up as a
+// wrong/crashing token, not just "does it export".
 //
 // Not generated at ctest time (needs the real LFM2-350M checkpoint + coremltools) -- skips cleanly if the
 // fixture isn't present, same convention as test_e2e_qwen3_q8_0.cpp / test_e2e_vits_lua_driver.cpp etc.
-// To (re)generate the fixtures: `~/.venvs/piper/bin/python3 export_lfm2_atomic.py` and
-// `export_lfm2_monolithic.py` from the repo root (writes lfm2_350m_atomic.gguf / lfm2_350m_monolithic.gguf
-// there), or point LOOM_LFM2_ATOMIC_GGUF / LOOM_LFM2_MONOLITHIC_GGUF at existing copies.
+// To (re)generate the fixture: `~/.venvs/piper/bin/python3 export_lfm2_monolithic.py` from the repo root
+// (writes lfm2_350m_monolithic.gguf there), or point LOOM_LFM2_MONOLITHIC_GGUF at an existing copy.
 
 #include "test_util.h"
 
@@ -58,10 +57,9 @@ bool run_gguf_case(const std::string& gguf_path) {
     LOOM_CHECK(!driver_script.empty());
 
     loom::LoomLuaBridge bridge(backend.get());
-    // Monolithic exports have exactly one topology (named "main_topo"); atomic exports have many
-    // (one per scope-partitioned slice -- "embedding", "layer_0".."layer_15", "output_head", etc.),
-    // none of them named "main_topo". Register whatever topologies the file actually declares
-    // instead of assuming a single hardcoded name, so this works for both profiles.
+    // Monolithic exports have exactly one topology (named "main_topo"). Register whatever topologies
+    // the file actually declares instead of assuming a single hardcoded name, so this also works
+    // unmodified against a submodule-profile export (one topology per prefix/layer_i/suffix_i slice).
     for (const std::string& mod_name : model->topology_names()) {
         bridge.register_module(mod_name, *model, loom::GraphTopology::parse(model->topology_json(mod_name)), nullptr);
     }
@@ -82,31 +80,18 @@ bool run_gguf_case(const std::string& gguf_path) {
 } // namespace
 
 int main() {
-    const char* atomic_env = std::getenv("LOOM_LFM2_ATOMIC_GGUF");
     const char* mono_env = std::getenv("LOOM_LFM2_MONOLITHIC_GGUF");
-    const std::string atomic_path = atomic_env != nullptr ? atomic_env : "lfm2_350m_atomic.gguf";
     const std::string mono_path = mono_env != nullptr ? mono_env : "lfm2_350m_monolithic.gguf";
 
-    if (!path_exists(atomic_path) && !path_exists(mono_path)) {
+    if (!path_exists(mono_path)) {
         std::fprintf(stderr,
-                      "skipping: neither '%s' nor '%s' found (set LOOM_LFM2_ATOMIC_GGUF/"
-                      "LOOM_LFM2_MONOLITHIC_GGUF, or run export_lfm2_atomic.py/export_lfm2_monolithic.py "
-                      "from the repo root to produce them)\n",
-                      atomic_path.c_str(), mono_path.c_str());
+                      "skipping: '%s' not found (set LOOM_LFM2_MONOLITHIC_GGUF, or run "
+                      "export_lfm2_monolithic.py from the repo root to produce it)\n",
+                      mono_path.c_str());
         return kSkipReturnCode;
     }
 
-    if (path_exists(atomic_path)) {
-        run_gguf_case(atomic_path);
-    } else {
-        std::fprintf(stderr, "skipping atomic profile: '%s' not found\n", atomic_path.c_str());
-    }
-
-    if (path_exists(mono_path)) {
-        run_gguf_case(mono_path);
-    } else {
-        std::fprintf(stderr, "skipping monolithic profile: '%s' not found\n", mono_path.c_str());
-    }
+    run_gguf_case(mono_path);
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

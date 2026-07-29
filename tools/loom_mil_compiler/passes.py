@@ -166,8 +166,8 @@ class fuse_gqa_repeat_kv(AbstractGraphPass):
 
         # Preserve the torch-module scope of the op being replaced (if any) on all three new ops --
         # `try_replace_uses_of_var_after_op` below only auto-copies scope onto the LAST new op (the one
-        # whose var directly replaces `out_var`), and the atomic-export profile's scope-based partitioning
-        # (`exporter.py`'s `apply_atomic_export`) needs every op it walks to carry the correct
+        # whose var directly replaces `out_var`), and downstream scope-based tooling (debugging, any
+        # future scope-partitioned discovery aid) needs every op it walks to carry the correct
         # TORCHSCRIPT_MODULE_NAME to attribute it to the right decoder layer -- relying on the two
         # intermediate ops merely landing in the right slice by positional adjacency would be exactly the
         # class of fragile mis-attribution EXPORT-IMPROVEMENT-BACKLOG.md item 2 already documents two real

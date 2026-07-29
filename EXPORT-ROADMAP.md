@@ -214,47 +214,88 @@ lesson). The realistic target: flagship families are fully transparent; the long
 
 ## R5 — cover everything CrispASR covers: the grouping study
 
-`/home/flavio/Dev/crispasr/models/` holds **120 `convert-*.py` scripts**. That is not 120 families. A
-first-pass grouping from the README's own architecture column (this is the *hypothesis*; the first
-deliverable of this item is to confirm it against the converters themselves):
+`/home/flavio/Dev/crispasr/models/` holds **120 `convert-*.py` scripts**. That is not 120 families, and —
+as P0.3 found — it is not 120 models either, in *both* directions at once.
 
-| # | family | representative members | count | Loom status |
-|---|---|---|---|---|
-| 1 | **Conformer/FastConformer encoders** + CTC / TDT / RNNT heads | parakeet ×6, reazonspeech, `stt_en_fastconformer_ctc_*`, parakeet-ctc ×3, **GigaAM v3 ×4** | ~16 | **mostly done** — `NeMoASREncoderSpec` (encoder); TDT/RNNT decoder still host-side; GigaAM needs a second loader (below) |
-| 2 | **Whisper-family encoder-decoder** | whisper (all sizes), distil-whisper, moss-diarize | ~6 | bespoke only — **no MIL export at all** |
-| 3 | **Speech-LLM adapters** (audio encoder → projector → causal LM) | voxtral, voxtral4b, qwen3-asr ×3, glm-asr, granite ×4, gemma4 ×2, higgs-stt, mimo-asr, canary-qwen, omniasr-llm, moss-audio, vibevoice ×2, ark-asr, lfm2-audio | ~20 | LM half done (`SubmoduleExportSpec`); encoder+projector half is family 2/1 plus a projector |
-| 4 | **CNN + transformer + CTC** | wav2vec2, data2vec, hubert, omniasr-ctc ×2 | ~5 | not started; closest existing shape is family 1 |
-| 5 | **SANM / FunASR encoders** (+ CIF, + CTC) | funasr ×2, paraformer, sensevoice | ~4 | not started |
-| 6 | **Encoder-decoder text** (translation) | m2m100, wmt21, madlad (T5) | ~3 | not started; shares its decoder loop with family 2 |
-| 7 | **VITS / VITS2** | piper (many voices), melotts | ~2 + voices | **done** (piper) |
-| 8 | **StyleTTS2 / iSTFTNet** | kokoro (+ per-voice packs), styletts2 | ~2 + voices | **done** |
-| 9 | **Flow-matching / diffusion TTS** | matcha, supertonic, f5-tts, cosyvoice3 (DiT), voxcpm2, kugelaudio, chatterbox (S3Gen), tada | ~8 | **2 done** (`IterativeRefinementSpec`); the rest are the same loop with different preconditioning |
-| 10 | **AR LM + neural codec TTS** | orpheus+SNAC, outetts+WavTokenizer, qwen3-tts, moss-tts ×2, miotts, omnivoice, csm, dia, bark, zonos+dac, indextts, parler, pocket-tts, voxtral-tts, vibevoice-tts | ~16 | LM half done; **codec decoders are the missing piece** |
-| 11 | **Neural audio codecs / vocoders** (decode side) | DAC, SNAC, WavTokenizer, MioCodec, dacvae, s3tok, miocodec, AudioVAE | ~8 | HiFi-GAN/iSTFT vocoders done inside 7/8/9; RVQ/FSQ codecs not started |
-| 12 | **BERT-family token classifiers** | fireredpunc, fullstop-punc, punctuate-all, pcs, bert-base | ~5 | not started — smallest possible template, high model count |
-| 13 | **Small classifiers / embedders** | titanet, ecapa-tdnn-lid, silero-vad, marblenet-vad, pyannote-seg, cld3, glotlid, crepe, whisper-vad | ~9 | not started |
-| 14 | **Music / audio analysis CNN-RNNs** | beat-this, btc, tabcnn, piano-transcription, mel-band-roformer, htdemucs | ~6 | not started |
-| — | **genuine one-offs** | audioseal, beatrice, rvc, sidon, fastpitch, speecht5, bananamind, m2m-adjacent oddities | ~15 | — |
+**Status: confirmed (P0.3), with corrections.** The table below replaces the original hypothesis, which
+was read off the README's architecture column alone. Evidence: the module docstring of all 120
+converters (every one of them states its architecture explicitly, several line-by-line against the
+checkpoint) plus CrispASR's own README model tables, which list the *checkpoints* each converter covers.
+Not read: the 120 converter bodies. That is enough to group by architecture and to count models; it is
+not enough to cost a template, which is P4's job per family.
 
-**The shape of the plan this implies.** Coverage is dominated by families 1, 3, 10 — and all three are
-*compositions* of pieces Loom already exports (a conformer/whisper encoder, a causal LM, a codec
-decoder) plus one connector each (a CTC/TDT head, a projector, a codec). That suggests the highest-value
-next template is not another architecture: it is a **composition mechanism** — the ability to declare
-"this model is encoder family X + adapter Y + LM family Z" and get the driver generated. R3's registry
-is the natural place for it, and family 3 (~20 models) is the acceptance test.
+**Four corrections that change the plan:**
 
-Ordering proposal, by coverage-per-effort:
+1. **The file count overstates and understates at the same time.** 12 of the 120 are not model
+   converters at all — 5 voice/reference bakers (`kokoro-voice`, `cosyvoice3-voices`, `kugelaudio-voice`,
+   `vibevoice-voice`, `tada-ref`), 3 non-GGUF format utilities (`whisper-to-coreml`,
+   `whisper-to-openvino`, `h5-to-coreml`), 3 alternate write paths for one model (`vibevoice-large`,
+   `vibevoice-stream-gguf`, `vibevoice-stream-q4k`) and 1 duplicate of another converter's model
+   (`chatterbox-gianni`). Meanwhile one converter routinely covers 2–6 checkpoints (`convert-parakeet`
+   alone backs 6 README rows; `convert-piper` backs every Piper voice). **~108 real converters,
+   ~165 README-listed models.**
+2. **Family 2 is not "Whisper-family".** The shared shape is *audio encoder → AR cross-attention
+   decoder*, and in more than half the members the encoder is a **Conformer**, not Whisper's conv+
+   transformer stem: canary, firered-asr, firered-lid and cohere-asr are all Conformer-encoder AED.
+   That is good news — the encoder half is family 1, already exported. What family 2 actually needs is
+   the *cross-attention decoder loop*, which is also what family 6 needs. They should be one template.
+3. **Family 3 is bigger than estimated: ~19 converters / ~36 models, not ~20.** It is the single
+   largest group by a wide margin and the conclusion below only gets stronger.
+4. **The 9/10 split is not a partition — it is two stages of the same pipeline.** chatterbox,
+   cosyvoice3, tada, voxtral-tts, pocket-tts, kugelaudio and voxcpm2 each have an AR token LM *and* a
+   flow-matching/diffusion acoustic stage, so the hypothesis counted them twice. The axis that actually
+   predicts exporter work is the **acoustic decoder**: flow-matching ODE (9) vs. RVQ/FSQ codec decoder
+   (11) vs. HiFi-GAN/iSTFT vocoder (7/8). The AR-LM half of all of them is `SubmoduleExportSpec`, done.
+   A fourth acoustic decoder appeared that the hypothesis filed under "one-offs": **mel-spectrogram TTS
+   + HiFi-GAN** (fastpitch, speecht5, bananamind-tts), which shares its vocoder with 7/8.
+
+| # | family | representative members | conv. | models | the connector it needs | Loom status |
+|---|---|---|---|---|---|---|
+| 1 | **Conformer/FastConformer encoders** + CTC / TDT / RNNT heads | parakeet ×6, reazonspeech, `stt_*_fastconformer_ctc_*` ×4, canary-ctc, nemotron-streaming, **GigaAM v3 ×4** | 4 | ~13 (+4) | CTC head (done) / TDT / RNNT decode loop (host-side) | **mostly done** — `NeMoASREncoderSpec`; GigaAM needs a second loader (below) |
+| 2 | **Audio encoder + AR cross-attention decoder** (AED) | whisper (all sizes), distil-whisper, tiron, canary, cohere-asr ×2, firered-asr, firered-lid, moonshine ×3, moonshine-streaming, whisper-vad | 8 | ~12 | **cross-attention decoder loop with KV cache** — shared with family 6 | bespoke only — **no MIL export at all** |
+| 3 | **Speech-LLM adapters** (audio encoder → projector → causal LM) | voxtral, voxtral4b, qwen3-asr ×4, glm-asr, granite ×7, gemma4 ×2, higgs-stt, mimo-asr, canary-qwen, omniasr-llm ×2, moss ×3, vibevoice ×2, ark-asr, lfm2-audio ×2, mini-omni2, kyutai-stt ×2, funasr ×2 | 19 | **~36** | **a projector** (linear / 4-frame stack / Q-Former / VQAdaptor / GatedMLP) + embedding-injection driver | LM half done (`SubmoduleExportSpec`); encoder half is family 1 or 2 |
+| 4 | **CNN + transformer + CTC** | wav2vec2, data2vec, hubert, omniasr-ctc ×2, tada-aligner | 3 | ~6 | CTC head (already done for family 1) | not started; family-1-shaped |
+| 5 | **SANM / FunASR encoders** (+ CIF, + CTC) | funasr ×2, paraformer, sensevoice | 3 | ~4 | CIF predictor + NAR decoder (paraformer only) | not started |
+| 6 | **Encoder-decoder text** (translation) | m2m100, wmt21 ×2, madlad (T5) | 2 | ~4 | same decoder loop as family 2 | not started |
+| 7 | **VITS / VITS2** | piper (many voices), melotts (+bert-base cond.), openvoice2 (TCC), rvc | 5 | 4 + voices | — (self-contained) | **done** (piper) |
+| 8 | **StyleTTS2 / iSTFTNet** | kokoro (+ per-voice packs), styletts2 | 2 | 2 + voices | — (self-contained) | **done** |
+| 9 | **Flow-matching / diffusion acoustic stage** | matcha, supertonic, f5-tts, cosyvoice3 (DiT-CFM), voxcpm2 (LocDiT), kugelaudio (DiT), chatterbox (S3Gen), tada, voxtral-tts, pocket-tts (LSD), dots-tts, irodori-tts | 12 | ~12 | the ODE loop (done) + per-model preconditioning | **2 done** (`IterativeRefinementSpec`) |
+| 9b | **Mel-spectrogram TTS + HiFi-GAN** *(new — was "one-offs")* | fastpitch (non-AR), speecht5 (AR), bananamind-tts (Tacotron-lite) | 3 | 3 | duration/pitch predictor or AR mel loop; vocoder already exported inside 7/8 | not started |
+| 10 | **AR LM + neural codec TTS** | orpheus+SNAC, outetts+WavTokenizer, qwen3-tts ×4, moss-tts ×2, miotts, omnivoice, csm, dia, bark, zonos+dac, indextts, parler, vibevoice-tts ×2, lfm2-audio-tts | 16 | ~20 | **the codec decoder (family 11)** + a delay/RQ token-emission driver | LM half done; codec decoders are the missing piece |
+| 11 | **Neural audio codecs / vocoders** (decode side) | DAC, dacvae, SNAC, WavTokenizer, MioCodec, mimo-tokenizer, omnivoice-tokenizer, cosyvoice3-s3tok, qwen3-tts-tokenizer, tada-codec, tada-encoder | 11 | ~11 | — (it *is* the connector for 10) | HiFi-GAN/iSTFT done inside 7/8/9; RVQ/FSQ not started |
+| 12 | **BERT-family token classifiers** | fireredpunc, fullstop-punc, punctuate-all, pcs (4 heads), bert-base | 4 | 5 | — (one linear head) | not started — smallest possible template |
+| 13 | **Small classifiers / embedders / VAD / LID** | titanet, ecapa-tdnn-lid, cosyvoice3-campplus, silero-vad, silero-lid, marblenet-vad, firered-vad (DFSMN), pyannote-seg, whisper-vad, crepe, cld3, glotlid, lstm-truecaser | 13 | ~13 | — (single forward, argmax) | not started — bigger than estimated |
+| 14 | **Music / audio analysis CNN-RNNs** | beat-this, btc, tabcnn, piano-transcription, mel-band-roformer, htdemucs | 6 | ~6 | — | not started |
+| — | **genuine one-offs** | audioseal (watermark), beatrice (VC), sidon (restoration) | 3 | 3 | — | — |
+
+**The shape of the plan this implies — unchanged, and now with a bigger margin.** Coverage is dominated
+by families 1, 3, 10, and all three are *compositions* of pieces Loom already exports (a
+conformer/whisper encoder, a causal LM, a codec decoder) plus one connector each (a CTC/TDT head, a
+projector, a codec). The highest-value next template is not another architecture: it is a **composition
+mechanism** — declare "this model is encoder family X + adapter Y + LM family Z" and get the driver
+generated. R3's registry is the natural place for it, and family 3 (**~36 models**) is the acceptance
+test.
+
+Ordering proposal, by coverage-per-effort (revised by the corrections above):
 
 1. **Whisper** (family 2) — the one flagship with no MIL export, and a prerequisite for ~10 models in
-   family 3. Also the project's own reference model.
+   family 3. Also the project's own reference model. Deliver the **cross-attention decoder loop** as the
+   reusable half: it is also all family 6 needs, and it is the half families 1 and 3 do *not* provide.
 2. **GigaAM v3** (family 1) — cheapest flagship by graph work, most informative by plumbing; see below.
 3. **Composition/adapter template** (family 3), on top of Whisper + the existing `SubmoduleExportSpec`.
+   ~36 models, the single largest lever in the roadmap.
 4. **BERT token classifiers** (family 12) — trivially small, and it proves the registry works for a
    non-audio task.
-5. **Codec decoders** (family 11) — unlocks family 10's back half.
+5. **Codec decoders** (family 11) — unlocks family 10's back half (~20 models), and 11 is itself ~11
+   models, so it pays twice.
 6. **CNN+CTC** (family 4) and **SANM** (family 5) — both are family-1-shaped once the encoder template
-   is generalized past NeMo.
+   is generalized past NeMo. Family 4 needs no new head at all.
 7. The long tail, as `LoomExportConfig` subclasses.
+
+Two ordering notes P0.3 produced that were not in the hypothesis: family 2's decoder loop should be
+built as a *shared* artifact with family 6 rather than a Whisper-specific one, and family 9b
+(mel+HiFi-GAN TTS) is cheap enough to fold in wherever convenient — its vocoder is already exported as
+part of families 7 and 8.
 
 ### GigaAM v3 — a flagship Loom should cover even though CrispASR does not
 

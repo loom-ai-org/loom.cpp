@@ -20,7 +20,7 @@ from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_scalar, static_value
 
 # Traced-model input names auto-computed by the driver (via loom.range) rather than unpacked from the
-# caller's `inputs` table -- see apply_monolithic_export/apply_atomic_export's own comment.
+# caller's `inputs` table -- see apply_monolithic_export's own comment.
 _POSITION_INPUT_NAMES = {"cache_position", "position_ids"}
 
 # Traced-model input names auto-computed by the driver via loom.causal_mask (an already-prepared 4D
@@ -940,12 +940,12 @@ class LoomGGUFExporter:
                 # at any derivation step it can't simplify back to the original input symbol (confirmed
                 # empirically -- an LFM2 ShortConv layer's causal pad+conv+slice, which provably preserves
                 # sequence length, produces 4 distinct "isN" names downstream of its one "is0" input; the
-                # atomic-export path's own inter-slice boundaries surface even more of these as separate
+                # submodule-export path's own inter-slice boundaries surface even more of these as separate
                 # declared inputs of a single slice). There is no cheap, reliable way to tell "several
                 # names, one true quantity" apart from "two genuinely independent dynamic axes" from the
                 # dim strings alone -- CoreML doesn't expose symbol-equality at this level, and an
-                # input-count-based heuristic tried here produced false positives on real, correct atomic
-                # slices. If a future model genuinely needs a second independent dynamic axis, that would
+                # input-count-based heuristic tried here produced false positives on real, correct
+                # submodule slices. If a future model genuinely needs a second independent dynamic axis, that would
                 # surface as a numerical mismatch against the reference model, not a syntactic error here.
                 #
                 # Substituting each symbol OCCURRENCE (not the whole dim string) matters: a dim isn't
@@ -1020,31 +1020,13 @@ class LoomGGUFExporter:
             # Submodule-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): `self.program` here is
             # NOT a single flattened trace -- it has no "main" function at all, just one Function per
             # independently-traced submodule (prefix/aux/layer_i/suffix_i) -- so there is no monolithic
-            # fallback to degrade to on failure the way "atomic" has; a bug here should fail loudly, not
-            # silently produce a working-looking but wrong export.
+            # fallback to degrade to on failure; a bug here should fail loudly, not silently produce a
+            # working-looking but wrong export.
             self.apply_submodule_export()
             driver_script = self._finalize_driver()
         else:
-            profile = self.profile or "monolithic"
-            if profile == "atomic":
-                try:
-                    # Validation/codegen must run INSIDE this try block, not after it: atomic
-                    # partitioning is a best-effort heuristic (scope-boundary guessing), and an IR that
-                    # fails validation (e.g. a spurious/undefined subgraph input the heuristic
-                    # mis-attributed to the wrong slice) is exactly the same class of "atomic partitioning
-                    # didn't actually work" failure as an exception raised during partitioning itself --
-                    # both should fall back to the monolithic profile rather than crashing the export.
-                    self.apply_atomic_export()
-                    driver_script = self._finalize_driver()
-                except Exception as e:
-                    print(f"Warning: Automated atomic partitioning failed: {e}. Falling back to monolithic profile.")
-                    self.topologies = {}
-                    self.ir_function = None
-                    self.apply_monolithic_export()
-                    driver_script = self._finalize_driver()
-            else:
-                self.apply_monolithic_export()
-                driver_script = self._finalize_driver()
+            self.apply_monolithic_export()
+            driver_script = self._finalize_driver()
 
         # 3. Serialization Phase
         self.write_gguf(driver_script)
@@ -1106,7 +1088,7 @@ class LoomGGUFExporter:
 
         # Argmax the logits row for the active (last real) token rather than returning the raw output
         # array -- _mono_shape[1] is the output's ne0 (vocab size), the same convention
-        # transpile_operation's own "argmax" case and apply_atomic_export's final slice rely on.
+        # transpile_operation's own "argmax" case relies on.
         row_expr = BinOp("-", n_tokens_expr, Lit(1))
         body.append(If(
             cond=BinOp("==", Call("type", [IRVar("_mono_out")]), Lit("table")),
@@ -1116,312 +1098,13 @@ class LoomGGUFExporter:
 
         self.ir_function = IRFunction("main", ["inputs"], body)
 
-    def apply_atomic_export(self):
-        print("Exporting via Automatic Atomic path...")
-        import re
-        main_func = self.program.functions["main"]
-        operations = list(main_func.operations)
-        
-        # 1. Scope-Based Partitioning.
-        #
-        # Preferred signal: coremltools attaches the ORIGINAL PyTorch module hierarchy to every op
-        # converted from a traced/exported model, under ScopeSource.TORCHSCRIPT_MODULE_NAME (e.g.
-        # ('model', 'model', '5', 'self_attn') for `model.model.layers[5].self_attn`). A digit segment
-        # that is NOT the tuple's last element marks indexing into a repeated submodule
-        # (nn.ModuleList/Sequential) -- exactly the atomic layer boundary we want. Trailing digits are
-        # NOT a boundary signal: they are just auto-generated per-op SSA name suffixes coremltools
-        # invents when the original PyTorch value had no better name (e.g. a bare intermediate named
-        # "1823"), and treating those as boundaries mis-partitions the graph into one slice per op
-        # instead of one slice per real decoder layer.
-        #
-        # Fallback signal: hand-built MIL programs (e.g. this module's own unit tests) have no torch
-        # scope metadata at all, so we fall back to the previous heuristic of regex-matching the op's
-        # own output name for "layer_N"/"embed"/"output_head"-shaped names.
-        try:
-            from coremltools.converters.mil.mil.scope import ScopeSource
-        except ImportError:
-            ScopeSource = None
-
-        def torch_scope_key(op):
-            if ScopeSource is None or not hasattr(op, "scopes"):
-                return None
-            mn = op.scopes.get(ScopeSource.TORCHSCRIPT_MODULE_NAME, ())
-            if not mn:
-                return None
-            for i in range(len(mn) - 1):
-                if mn[i].isdigit():
-                    return tuple(mn[:i + 1])
-            return tuple(mn[:-1]) if len(mn) > 1 else tuple(mn)
-
-        def name_regex_key(op):
-            op_name = op.outputs[0].name if op.outputs else op.name
-            match = re.search(r'(layers?|blk|blocks?|modules?|linear|dense|fc|conv)_(\d+)', op_name, re.IGNORECASE)
-            if match:
-                return f"layer_{match.group(2)}"
-            if any(x in op_name.lower() for x in ("embed", "emb", "wte")):
-                return "embedding"
-            if any(x in op_name.lower() for x in ("lm_head", "output_head", "logits", "pred", "output")):
-                return "output_head"
-            return None
-
-        def boundary_key(op):
-            return torch_scope_key(op) or name_regex_key(op)
-
-        def label_for(key):
-            if isinstance(key, str):
-                return key
-            if key[-1].isdigit():
-                return f"layer_{key[-1]}"
-            # Match on the LEAF scope segment only (the immediate submodule attribute name), and
-            # exactly rather than by substring: a broad "'embed' in ..." match on the whole path
-            # also matches LFM2's final-output RMSNorm, which the model confusingly calls
-            # "embedding_norm" despite having nothing to do with the token-embedding lookup --
-            # colliding both onto the same "embedding" label and silently discarding one topology.
-            leaf = key[-1].lower()
-            if leaf in ("embed_tokens", "embedding", "wte", "tok_embeddings"):
-                return "embedding"
-            if leaf in ("lm_head", "output_head", "logits"):
-                return "output_head"
-            return self.safe_name("_".join(key))
-
-        # Seed the initial slice with the first identifiable boundary (ops before it, e.g. leading
-        # const/cast setup with no scope opinion of their own, join that first slice).
-        initial_key = None
-        for op in operations:
-            k = boundary_key(op)
-            if k is not None:
-                initial_key = k
-                break
-
-        slices = [] # list of tuples: (slice_name, ops_list)
-        if initial_key is not None:
-            current_key = initial_key
-            current_ops = []
-            for op in operations:
-                k = boundary_key(op)
-                if k is not None and k != current_key:
-                    if current_ops:
-                        slices.append((current_key, current_ops))
-                    current_ops = []
-                    current_key = k
-                current_ops.append(op)
-            if current_ops:
-                slices.append((current_key, current_ops))
-
-            # Fold metadata-only slices (e.g. precomputed rotary-embedding tables, which show up as
-            # their own scope but are pure const/cast) forward into the next slice that actually
-            # consumes them -- they have no compute/output of their own to serve as a standalone topology.
-            merged = []
-            pending = []
-            for key, ops in slices:
-                if all(op.op_type in ("const", "cast") for op in ops):
-                    pending.extend(ops)
-                    continue
-                merged.append((key, pending + ops))
-                pending = []
-            if pending:
-                if merged:
-                    merged[-1] = (merged[-1][0], merged[-1][1] + pending)
-                else:
-                    merged = []
-            slices = [(label_for(key), ops) for key, ops in merged]
-
-        if len(slices) <= 1:
-            raise ValueError("No distinct scope-based layer boundaries could be identified in the graph.")
-
-        # 2. Extract inputs/outputs interfaces for each sliced topology
-        # Replicate consumed constants locally in each slice to decouple them,
-        # then extract only non-constant variable inputs.
-        #
-        # A SubgraphCall only ever exposes ONE slice's output(s) as `last_op.outputs` (see
-        # `output_names = ... last_op.outputs` below) -- the single-output-per-topology convention
-        # the driver/engine actually supports. So a var is only reachable by a LATER slice via
-        # legitimate SubgraphCall input-wiring if its producer op is the designated LAST op of
-        # whichever slice originally owns it (e.g. layer_(N-1)'s final hidden_states, threaded into
-        # layer_N). Any op that is NOT its own slice's last op -- whether because it's genuinely
-        # ungoverned (boundary_key is None, swept into whichever slice happened to be "current" in
-        # iteration order purely by happenstance) or because it's a real but non-final interior op
-        # of a shared multi-output slice (e.g. a RoPE cos/sin precompute under its own
-        # "model_model_pos_emb" scope, where only ONE of the two sibling cos/sin ops can ever be the
-        # slice's single exposed output) -- can NEVER be read this way. Any later slice that
-        # references such a var's name directly sees it as an "external input" nothing upstream ever
-        # actually provides: the mis-attribution bug, previously only caught (not fixed) by
-        # validate()'s atomic->monolithic fallback, surfacing as a SubgraphCall reading an input no
-        # earlier statement ever defined.
-        #
-        # Fix: recursively pull each such not-properly-exposed producer (and its own transitive
-        # dependencies, stopping at consts or at another op that IS its slice's legitimate exposed
-        # output) into EVERY slice that consumes it, instead of leaving it live in only the one slice
-        # that happened to inherit it. This is safe to duplicate freely: every such op is a pure
-        # function of consts/already-available inputs (that's exactly why it carries no real
-        # cross-slice state of its own), so recomputing it per consuming slice is redundant compute,
-        # never a correctness change. Any resulting now-unused copy left behind in the original
-        # "accidental host" slice is harmless: item 3's `_prune_dead_nodes` already drops any node
-        # unreachable from that topology's own declared output.
-        exposed_ops = {ops[-1] for _, ops in slices if ops}
-
-        def _is_legitimate_external_ref(op):
-            return op in exposed_ops
-
-        # Some MIL ops (e.g. "concat"/"stack") take a LIST of Vars under one input key (e.g.
-        # `values`) rather than one Var per key -- generate_graph_topology's own input-extraction
-        # already knows to flatten these (see its "elif isinstance(v, (list, tuple))" branch further
-        # below); this partitioning code must walk the exact same shape or it silently never visits
-        # a list-valued input's real producer op at all. Confirmed as a second, real bug this round:
-        # without this, replicating the pos_emb cos/sin closure for an attention layer pulled in the
-        # `concat((freqs, freqs))` node (reached via `cos`'s own bare-Var "x" input) but never its
-        # OWN `freqs` producer (only reachable through `concat`'s list-valued `values` input), leaving
-        # a node referencing a never-defined `freqs` var in the emitted topology.
-        def _iter_input_vars(op):
-            for v in op.inputs.values():
-                if isinstance(v, Var):
-                    yield v
-                elif isinstance(v, (list, tuple)):
-                    for item in v:
-                        if isinstance(item, Var):
-                            yield item
-
-        def _collect_replica_closure(op, ops_set, acc, visited):
-            if op in ops_set or op in visited:
-                return
-            visited.add(op)
-            for v in _iter_input_vars(op):
-                if v.op is None or v in op.outputs:
-                    continue
-                producer = v.op
-                if producer in ops_set or producer in visited:
-                    continue
-                if producer.op_type == "const":
-                    if producer not in acc:
-                        acc.append(producer)
-                elif not _is_legitimate_external_ref(producer):
-                    _collect_replica_closure(producer, ops_set, acc, visited)
-                    if producer not in acc:
-                        acc.append(producer)
-
-        for idx, (name, ops) in enumerate(slices):
-            ops_set = set(ops)
-            extra = []
-            visited = set()
-            for op in ops:
-                for v in _iter_input_vars(op):
-                    if v.op and v not in op.outputs:
-                        producer = v.op
-                        if producer in ops_set:
-                            continue
-                        if producer.op_type == "const":
-                            if producer not in extra:
-                                extra.append(producer)
-                        elif not _is_legitimate_external_ref(producer):
-                            _collect_replica_closure(producer, ops_set, extra, visited)
-                            if producer not in extra:
-                                extra.append(producer)
-            local_ops = (extra + list(ops)) if extra else list(ops)
-            slices[idx] = (name, local_ops)
-
-        slice_inputs = {}
-
-        for name, ops in slices:
-            # A var is an external input of THIS slice iff the op that produced it is not itself
-            # part of this slice's own op list -- i.e. it's either a top-level function input (its
-            # producing op is a placeholder, not in `ops`) or another slice's output. Checking
-            # membership against a running "seen so far" set (as a previous version of this code did)
-            # is wrong: it also catches purely-internal intermediates produced earlier in the SAME
-            # slice, misclassifying them as external inputs (observed on LFM2: 30-60 bogus "inputs"
-            # per layer, some with >4 MIL dims, crashing ggml_new_tensor at runtime).
-            ops_set = set(ops)
-            slice_in = {}
-            for op in ops:
-                for v in _iter_input_vars(op):
-                    if v not in op.outputs and v.op not in ops_set:
-                        if is_const_producer(v):
-                            continue
-                        slice_in[self.safe_name(v.name)] = v
-            slice_inputs[name] = slice_in
-            
-        # 3. Generate topologies for all sliced sub-graphs
-        for name, ops in slices:
-            inputs_dict = slice_inputs[name]
-            self.topologies[name] = self.generate_graph_topology(None, name, ops_list=ops, inputs_dict=inputs_dict)
-            
-        # 4. Synthesize the automatic looping driver IR
-        first_input = "tokens"
-        feature_scale = 1
-        if main_func.inputs:
-            first_input_var = list(main_func.inputs.values())[0]
-            first_input = self.safe_name(list(main_func.inputs.keys())[0])
-            if hasattr(first_input_var, "shape") and len(first_input_var.shape) == 3:
-                try:
-                    feature_scale = int(first_input_var.shape[2])
-                except (ValueError, TypeError):
-                    pass
-
-        n_tokens_expr = Len(first_input)
-        if feature_scale > 1:
-            n_tokens_expr = BinOp("floordiv", Len(first_input), Lit(feature_scale))
-
-        body = []
-        for name in main_func.inputs.keys():
-            safe_inp = self.safe_name(name)
-            if name in _POSITION_INPUT_NAMES:
-                # See apply_monolithic_export's identical case: host-computed, not caller-supplied.
-                body.append(Local(safe_inp, Call("loom.range", [Lit(0), n_tokens_expr])))
-            elif name in _CAUSAL_MASK_INPUT_NAMES:
-                body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
-            else:
-                body.append(Local(safe_inp, BinOp("or", FieldAccess("inputs", safe_inp), FieldAccess("inputs", "tokens"))))
-
-        for idx, (name, ops) in enumerate(slices):
-            inputs_dict = slice_inputs[name]
-
-            # Map input keys, standardizing the first input name to "hidden_states" for decoder layers
-            is_layer = name.startswith("layer_")
-            first_key = list(inputs_dict.keys())[0] if inputs_dict else None
-
-            slice_inputs_tbl = {}
-            for k in inputs_dict.keys():
-                safe_k = self.safe_name(k)
-                if is_layer and k == first_key:
-                    slice_inputs_tbl["hidden_states"] = IRVar(safe_k)
-                else:
-                    slice_inputs_tbl[safe_k] = IRVar(safe_k)
-
-            last_op = ops[-1]
-            output_names = [self.safe_name(v.name) for v in last_op.outputs]
-
-            if idx == len(slices) - 1:
-                # Final slice: also capture the output shape so the driver can argmax the last
-                # sequence position's logits row instead of returning a raw output value (matching
-                # the "argmax" convention transpile_operation's bespoke path and
-                # apply_monolithic_export both use for causal-LM next-token generation).
-                body.append(SubgraphCall(
-                    outputs=output_names, extra_outputs=["_atomic_final_shape"],
-                    module=name, n_tokens=n_tokens_expr, n_past=Lit(0), inputs=slice_inputs_tbl,
-                ))
-            else:
-                body.append(SubgraphCall(
-                    outputs=output_names, module=name, n_tokens=n_tokens_expr, n_past=Lit(0), inputs=slice_inputs_tbl,
-                ))
-
-        final_last_op = slices[-1][1][-1]
-        final_output_names = [self.safe_name(v.name) for v in final_last_op.outputs]
-        final_out = final_output_names[0]
-        row_expr = BinOp("-", n_tokens_expr, Lit(1))
-        body.append(If(
-            cond=BinOp("==", Call("type", [IRVar(final_out)]), Lit("table")),
-            then=[Return([Call("loom.argmax_row", [IRVar(final_out), Index(IRVar("_atomic_final_shape"), 1), row_expr])])],
-            else_=[Return([IRVar(final_out)])],
-        ))
-
-        self.ir_function = IRFunction("main", ["inputs"], body)
-
     def apply_submodule_export(self):
         """
         Synthesizes the driver for a submodule-export blueprint (`kwargs["submodule_layout"]`, a
         `SubmoduleExportResult` from submodule_export.py): one real, independently-traced Function per
         prefix/aux/layer_i/suffix_i submodule. Every function is self-contained by construction (no
-        cross-slice variable leakage to detect, unlike apply_atomic_export's scope-partitioned single
-        trace), so this only has to generate each function's topology directly
+        cross-slice variable leakage to detect, unlike partitioning a single flattened trace by scope
+        would), so this only has to generate each function's topology directly
         (`generate_graph_topology(func, name)`, no ops_list/inputs_dict reconstruction) and chain
         SubgraphCalls prefix -> [aux] -> layer_0..N-1 -> suffix_0..M-1 -> argmax.
         """
@@ -1457,7 +1140,7 @@ class LoomGGUFExporter:
         n_tokens_expr = Len(first_input)
 
         # 2. `first_input` (the caller-supplied token-ids input) must be defined before anything below
-        # reads n_tokens_expr, mirroring apply_monolithic_export/apply_atomic_export's own ordering.
+        # reads n_tokens_expr, mirroring apply_monolithic_export's own ordering.
         body = [Local(first_input, BinOp("or", FieldAccess("inputs", first_input), FieldAccess("inputs", "tokens")))]
 
         special_needed = set()
@@ -1500,8 +1183,8 @@ class LoomGGUFExporter:
             ))
 
         # 5. Repeated block, threading `chain_var` (hidden_states) from one layer's output into the
-        # next's input, exactly like apply_atomic_export's own layer chain. Each layer's OWN declared
-        # inputs are consulted independently (see the comment on step 1).
+        # next's input. Each layer's OWN declared inputs are consulted independently (see the comment on
+        # step 1).
         for i in range(layout.num_layers):
             layer_name = f"layer_{i}"
             layer_inputs = declared_inputs(layer_name)
@@ -1545,7 +1228,7 @@ class LoomGGUFExporter:
             chain_var = next_chain_var
 
         # 7. Argmax the logits row for the active (last real) token -- same convention
-        # apply_monolithic_export/apply_atomic_export use for causal-LM next-token generation.
+        # apply_monolithic_export uses for causal-LM next-token generation.
         row_expr = BinOp("-", n_tokens_expr, Lit(1))
         body.append(If(
             cond=BinOp("==", Call("type", [IRVar(chain_var)]), Lit("table")),
@@ -1742,8 +1425,8 @@ class LoomGGUFExporter:
         # verified topology-generation logic), not a fixed sequence of graph nodes. `generate_graph_topology`
         # only ever returns ONE static topology for the whole `operations` list it's given; splitting a
         # function at an "lstm" op boundary into "pre-LSTM topology -> recurrent stepper call ->
-        # post-LSTM topology" driver segments -- the way apply_atomic_export splits at torch-scope
-        # boundaries -- is real, unimplemented follow-up work, not something this call can do safely.
+        # post-LSTM topology" driver segments is real, unimplemented follow-up work, not something this
+        # call can do safely.
         # Fail loudly and specifically here rather than either silently mistranslating (there's no OP_MAP
         # entry for "lstm" so it would otherwise hit the generic "missing a ggml mapping" message, which
         # doesn't explain why or point at the real fix) or leaving a caller to guess.
@@ -1754,7 +1437,7 @@ class LoomGGUFExporter:
                 "stepper (see tools/loom_mil_compiler/recurrent.py and the new "
                 "LoomLuaBridge::l_run_recurrent C++ binding, which generalizes the existing "
                 "BiLstmStepper), not a static topology. Auto-wiring this into the generic export "
-                "profiles (monolithic/atomic/submodule-blueprint driver synthesis) is unimplemented "
+                "profiles (monolithic/submodule-blueprint driver synthesis) is unimplemented "
                 "follow-up work -- for now, build the per-timestep topologies directly via "
                 "recurrent.build_lstm_cell_topologies() and drive them with loom.run_recurrent() in a "
                 "hand-written driver script, the same way tools/convert_kokoro/kokoro_driver.lua does "
@@ -2005,13 +1688,9 @@ class LoomGGUFExporter:
         "reps"-computation subgraph -- gather/concat/equal/select/div) no longer needs this: that fusion
         now runs as a real MIL->MIL pass (passes.py) with `common::dead_code_elimination` run right after
         it, so the orphan never survives into this walk at all (EXPORT-IMPROVEMENT-BACKLOG.md item 3).
-        What this still exists for: `apply_atomic_export`'s own `_collect_replica_closure` deliberately
-        replicates a producer op (and its transitive dependencies) into EVERY slice that consumes it,
-        which leaves a now-unused copy behind in whichever slice originally "accidentally hosted" it --
-        see that method's own comment. That's a Python-level list-slicing artifact of partitioning a
-        single flattened trace after the fact, not something any MIL-level pass over the pre-partitioned
-        `main` function could see or clean up, so this backward-reachability walk is still required for
-        the atomic profile specifically.
+        Kept as a general safety net for any topology-generation path that can still leave dead nodes
+        behind (a pre-partitioned submodule slice, an advanced/bespoke hand-built Program) rather than
+        relying on every future caller to prove it never will.
         """
         needed = {output_symbol}
         live = []
@@ -2098,6 +1777,7 @@ class LoomGGUFExporter:
 
     def write_gguf(self, driver_script: str):
         from gguf import GGUFWriter
+        import hashlib
         import os
 
         self._prune_dead_weights()
@@ -2127,6 +1807,23 @@ class LoomGGUFExporter:
             quantizable = self._collect_mul_mat_weight_names()
         n_quantized = 0
 
+        # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
+        # SAME weight under two different names (LFM2's tied embedding is both `prefix.module_weight` and
+        # `suffix_1.module_weight` under the submodule profile), and a single traced model routinely
+        # mints many distinctly-named constants that happen to hold the same value (e.g. a bare `1.0`
+        # scalar reused across unrelated ops). Write the bytes once and alias every later name to the
+        # first, instead of paying for (and storing) a second copy. Hashed on the FINAL on-disk
+        # shape/dtype/bytes (post dtype-cast, post quantization), not just the raw array's bytes: two
+        # names sharing byte content but differing in shape (confirmed empirically -- a rank-1 `[1]`
+        # scalar and a rank-3 `[1, 1, 1]` one holding the identical value) or in quantization eligibility
+        # (`name in quantizable`, e.g. one is a tied embedding used as a MUL_MAT weight in one topology's
+        # slice but only via GET_ROWS in another's) must NOT be merged, or the alias would silently hand
+        # one consumer the other's shape or dtype. A name only ever becomes an alias if the tensor a
+        # consumer would see -- shape, dtype, and data -- is indistinguishable from an earlier name's.
+        payload_hash_to_name = {}
+        alias_names = []
+        alias_targets = []
+
         # Quantize & write weights / tensors
         for name, array in self.weights.items():
             if array.dtype == bool or array.dtype == np.bool_:
@@ -2145,14 +1842,44 @@ class LoomGGUFExporter:
             if (qtype is not None and name in quantizable and array.ndim >= 2 and array.dtype == np.float32
                     and array.shape[-1] % block_size == 0):
                 from gguf import quants
-                q = quants.quantize(np.ascontiguousarray(array), qtype)
-                # No `raw_shape` -- add_tensor's raw_shape (when given) is a *byte*-shape fed straight
-                # into quant_shape_from_byte_shape, not the pre-quantization logical shape; omitting it
-                # lets it default to the quantized array's own (correct) byte-shape.
-                w.add_tensor(name, q, raw_dtype=qtype)
+                array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
+                raw_dtype = qtype
+            else:
+                array_to_write = array
+                raw_dtype = None
+
+            # The dtype+shape tag guards against two same-bytes-different-meaning collisions a pure byte
+            # hash would miss: an all-zero I32 array vs an all-zero F32 array of the same byte length,
+            # and (found empirically, see BACKLOG.md) a rank-1 `[1]` scalar constant vs a rank-3
+            # `[1, 1, 1]` one holding the identical single value -- MIL mints these at different ranks
+            # for different consumers, and aliasing them would silently hand one consumer the other's
+            # shape, not just its bytes. Two names only ever become aliases of each other when the
+            # tensor a consumer would see -- shape, dtype, AND data -- is indistinguishable either way.
+            hasher = hashlib.sha256()
+            hasher.update(str(array_to_write.dtype).encode("ascii"))
+            hasher.update(str(array_to_write.shape).encode("ascii"))
+            hasher.update(np.ascontiguousarray(array_to_write).tobytes())
+            digest = hasher.hexdigest()
+            canonical = payload_hash_to_name.get(digest)
+            if canonical is not None:
+                alias_names.append(name)
+                alias_targets.append(canonical)
+                continue
+            payload_hash_to_name[digest] = name
+
+            # No `raw_shape` -- add_tensor's raw_shape (when given) is a *byte*-shape fed straight
+            # into quant_shape_from_byte_shape, not the pre-quantization logical shape; omitting it
+            # lets it default to the quantized array's own (correct) byte-shape.
+            if raw_dtype is not None:
+                w.add_tensor(name, array_to_write, raw_dtype=raw_dtype)
                 n_quantized += 1
             else:
-                w.add_tensor(name, array)
+                w.add_tensor(name, array_to_write)
+
+        # add_array() is a no-op when given an empty list, so this KV pair is simply absent for every
+        # model with no duplicate payloads -- GgufModel::load treats that as zero aliases, not an error.
+        w.add_array("loom.tensor_alias.names", alias_names)
+        w.add_array("loom.tensor_alias.targets", alias_targets)
 
         w.write_header_to_file()
         w.write_kv_data_to_file()
@@ -2160,4 +1887,6 @@ class LoomGGUFExporter:
         w.close()
 
         suffix = f", {n_quantized} tensor(s) quantized to {self.quantize}" if self.quantize else ""
+        if alias_names:
+            suffix += f", {len(alias_names)} duplicate weight name(s) aliased instead of re-stored"
         print(f"wrote GGUF with driver_script and {len(self.topologies)} topologies to {self.output_path}{suffix}")
