@@ -70,8 +70,132 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > (R1), MIL→MIL lowering passes instead of emission-time guards (R2), a task/architecture registry with
 > `LoomModelFor*` entry points (R3), transparent export with no user-written wrapping (R4), a grouping
 > study of the ~120 models CrispASR covers plus a phased template plan (R5), the retirement policy for the
-> bespoke `tools/convert_*` converters (R6), and a measured recommendation to drop `profile="atomic"`
-> (R7). Items below that predate it are still valid; R2 and R7 in particular subsume several of them.
+> bespoke `tools/convert_*` converters (R6), and the (approved) removal of `profile="atomic"` (R7). Items
+> below that predate it are still valid; R2 and R7 in particular subsume several of them.
+> **The implementation order is fixed — see the next section.**
+
+### Implementation sequence for the roadmap (start here)
+
+The order below is not arbitrary; each phase either shrinks the surface the next one has to preserve, or
+produces something the next one would otherwise have to guess. Two ordering constraints matter more than
+the rest and are the reason this is not simply "R1, R2, R3…":
+
+* **R1 (named axes) must land before R3's config schema.** `LoomExportConfig.inputs` *is* the axis
+  declaration. Writing the schema first means migrating every config that exists by then.
+* **The registry skeleton (P2) must land before any new family (P3).** Whisper and GigaAM written as
+  scripts are two more scripts R4 has to delete; written as registry entries they are the acceptance
+  test for the registry.
+
+Everything is gated the same way as the last thread: `tools/loom_mil_compiler/snapshot_gguf.py` for
+changes that must not alter output, `tools/loom_mil_compiler/compare_snapshots.py` for changes that
+deliberately rewrite shape attributes, and the per-model reference tests for anything numerical.
+
+| # | phase | items | gate | blocked by |
+|---|---|---|---|---|
+| **P0** | clear the ground | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
+| **P1** | exporter internals | R1, R2a, R2b | `compare_snapshots.py` | P0 |
+| **P2** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P1 |
+| **P3** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P2 |
+| **P4** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P3 |
+| **P5** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P3/P4 |
+
+#### P0 — clear the ground (small, independent, no dependencies)
+
+Do these first because everything later has to preserve whatever exists at the time, and each of these
+*removes* something.
+
+- **P0.1 — remove `profile="atomic"` (R7, approved).** `apply_atomic_export` is `exporter.py`
+  lines ~1119–1417 (~300 lines, between `apply_monolithic_export` and `apply_submodule_export`), plus
+  the `if profile == "atomic":` branch and its monolithic fallback at ~1029–1040. Also touches:
+  `export_lfm2_atomic.py` (delete), `tests/test_e2e_lfm2_mil_export.cpp` + `tests/CMakeLists.txt`
+  (`LOOM_LFM2_ATOMIC_GGUF` — the test already skips per-profile, so drop the atomic case),
+  `tools/loom_mil_compiler/export_hf_causal_lm.py` (`--profile atomic` in its usage docs),
+  `tools/convert_lfm/export_profiles_demo.py`, and the profile sections of
+  `LOOM_PROCEDURAL_GENERALIZATION.md`. Keep `_collect_replica_closure` only if `apply_submodule_export`
+  turns out to need it (check — its docstring at ~2008 says it exists *for* the atomic profile).
+  Scope-based partitioning is worth preserving as an opt-in discovery aid for `SubmoduleExportSpec`
+  ("Phase 2: automatic prefix/suffix boundary discovery", tracked further down this file) — move it
+  there or park it in the commit message, don't just delete the idea.
+  **Gate:** the remaining 11 exports byte-identical; `test_e2e_lfm2_mil_export` still passes on the
+  monolithic and submodule GGUFs.
+- **P0.2 — content-address weight payloads in the GGUF writer.** `exporter.py:2099 write_gguf` /
+  `w.add_tensor`. Measured: `lfm2_350m_submodule` stores 1609 MiB for 1353 MiB of unique payloads, and
+  **256 MiB of that is one tensor** — LFM2's tied embedding `[1024, 65536]` written twice, as
+  `prefix.module_weight` and `suffix_1.module_weight`. Hash each payload, emit once, alias the name.
+  Benefits every split export and is a precondition for split profiles being the default.
+  **Gate:** every model's tensor *set* unchanged by sha256 (`tensors.txt` in the snapshot), file sizes
+  down, all reference tests pass. Needs a matching C++ read path check — confirm `GgufModel::load`
+  resolves aliased names.
+- **P0.3 — confirm the R5 family grouping.** The 14-family table in `EXPORT-ROADMAP.md` is a hypothesis
+  derived from CrispASR's README architecture column, not from reading the 120 converters. Confirming it
+  is free (no code) and it reorders P4. Output: the table, corrected, with per-family model counts and
+  the connector each family needs.
+- **P0.4 — adopt the R6 policy** (write it into the contributor docs, delete nothing yet): a bespoke
+  converter may be deleted only in the commit that re-points the last test consuming it.
+
+#### P1 — exporter internals (must precede the API)
+
+- **P1.1 — R1 named axes.** Axis vocabulary + `GraphBuilder::build` overload taking a map (today it is
+  `build(uint32_t n_tokens, uint32_t n_past)`; `SymbolEnv` itself is already a general `name → double`
+  map, so the C++ change is small) + exporter seeding from the declared axis of the function input it
+  bottoms out at + `symbol_overrides` replaced by declared axis relations. Retire the
+  `scalar_expr_is_guess` workaround if named axes make "I don't know" distinguishable by construction.
+  **Gate:** `compare_snapshots.py` extended with an alias map (`n_samples := n_tokens`), since this
+  renames symbols rather than changing values.
+- **P1.2 — R2a canonicalizing passes:** `normalize_matmul` (also closes the known `transpose_x=True`
+  gap tracked below) and `insert_explicit_broadcasts`. Pure rewrites, no new ops, each removes a guard
+  from the `topology_ops.py` rule table — and that table prints itself
+  (`python3 -m loom_mil_compiler.topology_ops`), so the shrinkage is directly observable.
+- **P1.3 — R2b `annotate_dynamic_shapes`:** the pass that writes resolved shape expressions onto Vars
+  instead of re-deriving them per consumer. Depends on P1.1. This is what makes emission mechanical, and
+  it is the precondition for auditing the C++ "heal transposed layouts" heuristics (tracked below).
+
+R2's remaining composite ops (`loom.replicate_pad`, `loom.conv_transpose_dw`, `loom.stack`,
+`loom.mean`) can land any time after P1.2, including interleaved with P3 — they are independent of each
+other and each is individually gated.
+
+#### P2 — the API skeleton (R3 + R4)
+
+- **P2.1 — `LoomExportConfig` base class**, with the three existing templates (`SubmoduleExportSpec`,
+  `IterativeRefinementSpec`, `NeMoASREncoderSpec`) re-expressed as configs. No behaviour change.
+  **Gate:** byte-identical re-export of all current models.
+- **P2.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI.** Registry keyed on HF
+  `config.json` `model_type`/`architectures` and on the `target` class inside a `.nemo` archive. The
+  loader is a *separate* registry entry from the family template — this is what P3.2 (GigaAM) tests.
+  **Acceptance:** `export_conformer_ctc_mil.py`, both Parakeet scripts and `export_qwen3_mil.py` are
+  deleted and replaced by registry entries.
+- **P2.3 — `ModelPatcher` + `DummyInputGenerator`.** Fold the four long TTS scripts' wrapping into
+  declared patchers. **Acceptance:** `export_kokoro_mil.py` (503), `export_matcha_mil.py` (448),
+  `export_vits_mil.py` (382) and `export_styletts2_mil.py` (350) are deleted. Encode the traced-output
+  naming rule here (binding a traced value to a Python local renames the topology's declared output —
+  found the hard way, see BACKEND.md).
+
+#### P3 — flagship coverage
+
+- **P3.1 — Whisper.** The only flagship with no MIL export, the project's own reference model, and a
+  prerequisite for ~10 models in family 3. First family born inside the registry.
+- **P3.2 — GigaAM v3.** Graph is family 1 (already exported); the point is the *second loader*
+  (`gigaam.load_model` / `AutoModel.from_pretrained(..., trust_remote_code=True)` instead of
+  `ASRModel.restore_from`), which is what proves P2.2's loader/template split. Check first whether the
+  remote-code modeling traces cleanly or needs a patcher.
+- **P3.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
+  family 3 (~20 models) and is the single largest coverage lever in the roadmap.
+
+#### P4 — breadth
+
+Ordered by coverage-per-effort, subject to P0.3's corrections: family 12 (BERT token classifiers —
+smallest possible template, proves the registry on a non-audio task) → 11 (codec decoders, unlocks
+family 10's back half) → 4 (CNN+CTC) and 5 (SANM), both family-1-shaped once the encoder template is
+generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small classifiers) → 14 (music).
+
+#### P5 — cleanup
+
+R6 executions (one commit per model: re-point the last test, delete the bespoke converter), then the
+`tools/convert_*` directories themselves (~14,000 lines across 10 directories), then the docs pass.
+
+**If only three things get done:** P0.1 + P0.2 (a smaller, honest baseline), P2.1 + P2.2 (the registry,
+which is what makes every later family cheap), and P3.3 (the composition template, which is where the
+model count actually lives).
 
 ### Third family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT) — DONE
 
