@@ -1,5 +1,5 @@
 """
-Structural discovery for the submodule-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2).
+Structural discovery for the modular-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2).
 
 Replaces `apply_atomic_export`'s scope-based partitioning of one flattened trace -- which has to
 *reconstruct* each slice's inputs/outputs after the fact from op scope metadata, the source of two
@@ -65,6 +65,6 @@ def capture_calls(model: nn.Module, dummy_inputs: dict, targets: dict):
     if missing:
         raise RuntimeError(
             f"submodule(s) {missing} were never invoked during the dummy forward pass -- dummy_inputs "
-            "don't exercise this model's real forward path for the declared SubmoduleExportSpec"
+            "don't exercise this model's real forward path for the declared ModularExportSpec"
         )
     return captured

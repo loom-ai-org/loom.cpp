@@ -1,6 +1,6 @@
 """Generalizes the "N-step iterative refinement over loop-carried tensor state" driver family --
-EXPORT-IMPROVEMENT.md item 4, the second family template alongside `submodule_export.py`'s
-`SubmoduleExportSpec`.
+EXPORT-IMPROVEMENT.md item 4, the second family template alongside `modular_export.py`'s
+`ModularExportSpec`.
 
 Matcha-TTS and SupertonicTTS are not two unrelated problems: both trace a per-step *estimator* network
 into one topology and then integrate it host-side with forward Euler over a loop-carried state tensor,
@@ -23,7 +23,7 @@ The point is not the line count. It is that the spec is **checked against the re
 export time (`validate_against_topology`): naming an input the estimator doesn't declare, or forgetting
 one it does, raises immediately with the actual declared-input list. A hand-written Lua loop with the
 same mistake fails much later, inside the engine, as an undeclared-input or missing-input error with no
-connection back to the line that got it wrong. This mirrors `SubmoduleExportSpec`'s own "a wrong
+connection back to the line that got it wrong. This mirrors `ModularExportSpec`'s own "a wrong
 attribute path raises `AttributeError` immediately, not a silent wrong export" property.
 
 Deliberately NOT generalized here: the *integration rule*. Both current models use plain deterministic
@@ -31,7 +31,7 @@ forward Euler with uniform `dt = 1/n_steps`; StyleTTS2's diffusion sampler is AD
 schedule (second-order, two network evaluations per step, per-step noise injection, and real
 preconditioning math around the call), and Kokoro/VITS's duration loops are a different shape entirely
 (a scatter over predicted durations, not an ODE). Those stay bespoke, the same way
-`submodule_export.py` concedes non-causal-LM architectures.
+`modular_export.py` concedes non-causal-LM architectures.
 
 The *validation*, though, generalizes further than the codegen does -- a hand-written `run_subgraph`
 call fails the same way a generated one would. So `EstimatorSpec` (below) is its own declaration: a

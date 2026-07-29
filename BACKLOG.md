@@ -50,7 +50,7 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > - "What is this Var's compile-time value / shape expression?" is answered in one place,
 >   `value_facts.py`, memoized per Var. The memo is load-bearing, not tidiness: without it the shape walk
 >   is exponential in encoder depth (see the Conformer entry below).
-> - Three family templates now exist — `submodule_export.py` (decoder-LLMs), `iterative_export.py`
+> - Three family templates now exist — `modular_export.py` (decoder-LLMs), `iterative_export.py`
 >   (Euler-CFM samplers) and `nemo_asr_export.py` (NeMo ASR encoders) — and BACKEND.md's closing section
 >   argues that per-family templates, not universal orchestration inference, are the direction that
 >   actually works, with the evidence for why.
@@ -112,9 +112,9 @@ Do these first because everything later has to preserve whatever exists at the t
   `tools/loom_mil_compiler/export_hf_causal_lm.py`'s CLI/docs, `tools/convert_lfm/export_profiles_demo.py`
   (its only purpose was demoing atomic-vs-monolithic; deleted rather than left demoing a profile that no
   longer does anything), and the atomic section of `LOOM_PROCEDURAL_GENERALIZATION.md` (replaced with a
-  `SubmoduleExportSpec` section describing the one split mechanism that remains). `_collect_replica_closure`
-  was nested inside `apply_atomic_export` itself and went with it — confirmed `apply_submodule_export`
-  never called it. Scope-based partitioning as an opt-in `SubmoduleExportSpec` discovery aid is still
+  `ModularExportSpec` section describing the one split mechanism that remains). `_collect_replica_closure`
+  was nested inside `apply_atomic_export` itself and went with it — confirmed `apply_modular_export`
+  never called it. Scope-based partitioning as an opt-in `ModularExportSpec` discovery aid is still
   tracked further down this file, not implemented.
   **Gate — passed:** `diff -r` of all 11 remaining models' snapshots (`snapshot_gguf.py`) against a
   pre-removal baseline is empty; `test_e2e_lfm2_mil_export` passes end-to-end against real HF logits at
@@ -132,7 +132,7 @@ Do these first because everything later has to preserve whatever exists at the t
   slice but only via GET_ROWS in another's) must not be merged either (hashing the POST-quantization
   bytes, not the raw array, makes this automatic). Deduping turned out not to be LFM2-embedding-specific:
   every one of the 11 models had real duplicate constants (mostly small per-layer scalars, not just tied
-  weights) — `lfm2_350m_submodule` dropped from 1611 MiB to 1355 MiB (307 logical tensors, 158 real +
+  weights) — `lfm2_350m_modular` dropped from 1611 MiB to 1355 MiB (307 logical tensors, 158 real +
   149 aliased), and even the monolithic single-topology exports shrank (`lfm2_350m_monolithic` 257→158
   real tensors, `matcha_mil` 723→473, `kokoro_mil` 561→425, etc.).
   **Gate — passed:** for all 11 models, the alias-resolved LOGICAL tensor set (name → shape/dtype/sha256)
@@ -177,7 +177,7 @@ other and each is individually gated.
 #### P2 — enable multi-output topologies
 
 The engine's one-output-tensor-per-topology convention (`loom.run_subgraph` returns data + shape, see
-`submodule_export.py`'s `_flatten_call` comment) is a real, deliberate constraint everywhere it's been
+`modular_export.py`'s `_flatten_call` comment) is a real, deliberate constraint everywhere it's been
 hit so far, not an oversight — but it's the one thing standing between the current state and *inferring*
 an `IterativeRefinementSpec` directly from a scripted-loop trace instead of hand-declaring it (a MIL loop
 body has one output per loop-carried var; see BACKEND.md item 3's follow-up, where two of the three real
@@ -208,7 +208,7 @@ exists, before that template's own shape is locked in.
 
 #### P3 — the API skeleton (R3 + R4)
 
-- **P3.1 — `LoomExportConfig` base class**, with the three existing templates (`SubmoduleExportSpec`,
+- **P3.1 — `LoomExportConfig` base class**, with the three existing templates (`ModularExportSpec`,
   `IterativeRefinementSpec`, `NeMoASREncoderSpec`) re-expressed as configs. No behaviour change.
   **Gate:** byte-identical re-export of all current models.
 - **P3.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI.** Registry keyed on HF
@@ -336,7 +336,7 @@ compiler work) and is orthogonal to the real MIL export path: `export_lfm2_monol
 **Not fixed.** `test_e2e_lfm2_lua_driver` now skips unconditionally (return code 77, matching the
 project's skip convention) with a comment pointing here, rather than attempting a run that would abort
 the whole test binary. Fixing this for real means threading each layer's actual token-position-dependent
-RoPE table through the independently-traced submodules (the same kind of problem `SubmoduleExportSpec`
+RoPE table through the independently-traced submodules (the same kind of problem `ModularExportSpec`
 already solves correctly for the MIL path) — worth doing only if this bespoke script's own coverage still
 matters; the MIL path is otherwise a strict improvement over it.
 
@@ -631,7 +631,7 @@ SupertonicTTS, StyleTTS2.
      ~1e-2 per-weight relative rounding error into a real, visible output error. Fixed by adding
      `compute_precision=ct.precision.FLOAT32` to every `ct.convert()` call in the project (all of
      `export_conformer_ctc_mil.py`/`export_parakeet_{tdt,rnnt}_mil.py`/`export_hf_causal_lm.py`
-     [Qwen3 + LFM2's own monolithic/atomic exports go through this one] /`submodule_export.py`/
+     [Qwen3 + LFM2's own monolithic/atomic exports go through this one] /`modular_export.py`/
      `tools/convert_lfm/{make_lfm2_gguf,export_profiles_demo}.py`).
   2. **The exporter's `conv` translation (`exporter.py`'s `op_type == "conv"` branch) never read MIL's
      OPTIONAL `"bias"` input at all — every biased conv1d/conv2d in every model this exporter has ever
@@ -1361,30 +1361,29 @@ The real tradeoff: doing this would replace ~10 hand-verified conversion scripts
 trades "verified against hand-derived reference, primitive by primitive" for "trust the trace" — worth it
 for showcasing generality, riskier for correctness confidence on the trickiest models.
 
-### Submodule-export blueprint: promote to default, prove generality, dedup weights
+### Modular-export blueprint: promote to default, prove generality, dedup weights
 
-The submodule-export blueprint (`tools/loom_mil_compiler/submodule_discovery.py`/`submodule_export.py`,
-`apply_submodule_export` in `exporter.py`, `export_lfm2_submodule.py`) landed as a working first iteration,
-proven on LFM2 (`test_e2e_lfm2_mil_export` passes against `lfm2_350m_submodule.gguf`, same top-1 tokens as
-atomic/monolithic). Four things from that iteration's own plan are still open:
+The modular-export blueprint (`tools/loom_mil_compiler/modular_discovery.py`/`modular_export.py`,
+`apply_modular_export` in `exporter.py`, `export_lfm2_modular.py`) landed as a working first iteration,
+proven on LFM2 (`test_e2e_lfm2_mil_export` passes against `lfm2_350m_modular.gguf`, same top-1 tokens as
+atomic/monolithic). Four things from that iteration's own plan were originally open; two are now done:
 
-- **Not yet promoted to the default atomic path.** `apply_atomic_export`/`export_lfm2_atomic.py` (the
-  older scope-based partitioner) are untouched and still what the "atomic" profile actually uses. Whether
-  to make the submodule blueprint the default (and delete the scope-partitioning code path) is a follow-up
-  decision, not yet made.
+- **Promoted to the default split mechanism — DONE (P0.1).** `apply_atomic_export`/`export_lfm2_atomic.py`
+  (the older scope-based partitioner) are gone entirely; `profile="atomic"` was retired (R7, approved) and
+  the modular blueprint is now the only split mechanism this exporter has.
 - **Unproven generality — only ever validated on LFM2.** The whole point of this thread was generality
   (no `ModuleList`-naming-convention assumption, structural rather than by-name discovery), but that claim
   is still resting on a single model. Needs a second, structurally different HF model (different attribute
   names, ideally non-hybrid/homogeneous-layer to start) added to the regression suite.
-- **Cross-submodule weight duplication is unfixed.** Each submodule is traced independently
+- **Cross-submodule weight duplication — DONE (P0.2).** Each submodule is traced independently
   (`ct.convert()` per submodule), so any tensor referenced from more than one submodule — the most likely
-  case being HF's tied embedding/`lm_head` weight — gets serialized twice under two different namespaced
-  names (confirmed: submodule GGUF is 1.69GB vs. monolithic's 1.42GB on LFM2, consistent with one full
-  extra copy of the ~268MB vocab embedding). Planned fix: hash each candidate weight's bytes+shape+dtype at
-  `write_gguf` time and alias a repeat hash to the first-written name instead of writing it again — not yet
-  implemented. A narrower, cheaper alternative worth considering first: when `tie_word_embeddings` is set,
-  just skip re-exporting `lm_head`'s weight and alias it to the embedding's own name directly.
-- **Phase 2 (fully automatic prefix/suffix boundary discovery) not attempted.** Today's `SubmoduleExportSpec`
+  case being HF's tied embedding/`lm_head` weight — used to get serialized twice under two different
+  namespaced names (confirmed: modular GGUF was 1.69GB vs. monolithic's 1.42GB on LFM2, consistent with one
+  full extra copy of the ~268MB vocab embedding). Fixed exactly as planned here: `write_gguf` now hashes
+  each candidate weight's bytes+shape+dtype and aliases a repeat hash to the first-written name via a
+  `loom.tensor_alias.*` KV pair, resolved back into `GgufModel::load`'s `symbols_` map at load time — see
+  P0.2 above for the full writeup (`lfm2_350m_modular` dropped from 1611 MiB to 1355 MiB).
+- **Phase 2 (fully automatic prefix/suffix boundary discovery) not attempted.** Today's `ModularExportSpec`
   needs a ~3-line declarative boundary per model (`prefix_attr`/`repeated_attr`/`suffix_attrs`/`aux_attr`).
   The stretch-goal alternative — an early-exit-hook technique mirroring HF `accelerate`'s device-map
   splitting, deriving prefix/suffix without any per-model spec at all — was deliberately not attempted since

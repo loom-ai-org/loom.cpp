@@ -203,7 +203,7 @@ snapshot-diffed (all metadata KVs, every topology JSON, the embedded driver Lua,
 | `qwen3_0.6b_mil_monolithic` | byte-identical |
 | `lfm2_350m_monolithic` | byte-identical |
 | `lfm2_350m_atomic` | byte-identical |
-| `lfm2_350m_submodule` | byte-identical |
+| `lfm2_350m_modular` | byte-identical |
 | `matcha_mil` | topologies + tensors byte-identical; `driver_script` differs by item 4 only |
 | `supertonic_mil` | topologies + tensors byte-identical; `driver_script` differs by item 4 only |
 | `styletts2_mil` | baseline could not export at all (regression above); now exports and passes every reference test |
@@ -389,7 +389,7 @@ after which the only float consts remaining in the body are the estimator's real
 output as *the* topology output — here the counter increment — and `_prune_dead_nodes` then correctly
 removes everything unreachable from it, i.e. the whole network. That is not a bug to patch around: the
 engine's convention really is one output tensor per topology (`loom.run_subgraph` returns data + shape,
-see `submodule_export.py`'s `_flatten_call` comment).
+see `modular_export.py`'s `_flatten_call` comment).
 
 Making it work therefore needs either multi-output topologies in `GraphBuilder`/`run_subgraph` (an engine
 change), or a classifier that routes *scalar* loop vars (the counter, `t`) to host Lua and keeps only the
@@ -407,7 +407,7 @@ expressed host-side at all.
 sampler and the VITS/Kokoro duration loops deliberately left bespoke.
 
 New `tools/loom_mil_compiler/iterative_export.py` provides `IterativeRefinementSpec` +
-`render_driver`, the analogue of `SubmoduleExportSpec`. A spec declares the six things that actually
+`render_driver`, the analogue of `ModularExportSpec`. A spec declares the six things that actually
 differ between the two models — estimator topology, loop-carried input name, scalar-time input name, the
 per-step-constant inputs, and (at the call site) the state's element count and the `n_tokens` to build at
 — and the generated Lua sampler replaces a `--@loom:samplers` marker in the hand-written driver.
@@ -421,7 +421,7 @@ local z = sample_vfe(t_lat, t_lat * lat_dim, inputs.n_steps, { txt_emb = txt_emb
 ```
 
 **The proposal's predicted payoff did not materialize, and that is worth stating plainly.** Item 4
-expected a shared template to "shrink these the same way `SubmoduleExportSpec` shrunk
+expected a shared template to "shrink these the same way `ModularExportSpec` shrunk
 `export_qwen3_mil.py` to 28 lines", citing `export_styletts2_mil.py`: 340 lines and
 `export_kokoro_mil.py`: 503 lines. Measured before/after:
 
@@ -438,7 +438,7 @@ expected a shared template to "shrink these the same way `SubmoduleExportSpec` s
 Total line count went **up** (+41 in the export scripts, −15 in the drivers). The reason is that the
 340/503 lines the proposal points at are *tracing setup* — wrapper modules, dummy inputs, `RangeDim`
 declarations, per-phase topology assembly — not loop orchestration. A sampler template cannot touch any
-of that. The thing it replaces was ~13 lines of Lua per driver. The `SubmoduleExportSpec` analogy does
+of that. The thing it replaces was ~13 lines of Lua per driver. The `ModularExportSpec` analogy does
 not carry: that one subsumed a whole export script because decoder-LLMs share their *entire* structure,
 whereas these three share one loop inside otherwise unrelated pipelines.
 
@@ -446,7 +446,7 @@ whereas these three share one loop inside otherwise unrelated pipelines.
 estimator's *real* declared inputs at export time and raises naming the exact mismatch. Supplying an
 input the topology never declared, or omitting one it did, is otherwise only caught deep inside the
 engine at run time with nothing pointing back at the line that got it wrong. That is a genuine
-improvement and it does mirror `SubmoduleExportSpec`'s "a wrong attribute path raises immediately"
+improvement and it does mirror `ModularExportSpec`'s "a wrong attribute path raises immediately"
 property — but it is a different benefit from the one the item predicted, and it is the reason this is
 a spec rather than a shared Lua helper function.
 
@@ -562,7 +562,7 @@ worth stating precisely, because two of the three are not what one would guess u
 **What does generalize is the per-family template**, and there are now two working examples worth
 copying the shape of rather than inventing a third style:
 
-| | `SubmoduleExportSpec` (decoder-LLMs) | `IterativeRefinementSpec` (Euler-CFM samplers) |
+| | `ModularExportSpec` (decoder-LLMs) | `IterativeRefinementSpec` (Euler-CFM samplers) |
 |---|---|---|
 | declares | prefix / repeated / suffix / aux boundaries | estimator, carried input, time input, fixed inputs |
 | cross-checked against | `find_repeated_blocks()` re-derives the repeated blocks structurally and rejects a spec that claims a non-qualifying attribute | `validate_against_topology()` re-reads the estimator's real declared inputs and rejects any mismatch |
@@ -721,7 +721,7 @@ Final state, all 12 models re-exported from the working tree against the `git ar
 | `conformer_ctc_small_mil_monolithic` | 294 | 0 |
 | `parakeet_tdt_encoder_mil_monolithic` / `..._rnnt_...` | 426 / 426 | 0 / 0 |
 | `qwen3_0.6b_mil_monolithic` | 448 | 0 |
-| `lfm2_350m_monolithic` / `_atomic` / `_submodule` | 176 / 176 / 200 | 0 |
+| `lfm2_350m_monolithic` / `_atomic` / `_modular` | 176 / 176 / 200 | 0 |
 | `vits_mil` | 531 | 0 |
 | `kokoro_mil` | 263 | 0 |
 | `matcha_mil` | 419 | 0 |

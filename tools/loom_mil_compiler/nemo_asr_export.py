@@ -1,5 +1,5 @@
 """Generalizes the "NeMo ASR encoder" export family -- the third family template, alongside
-`submodule_export.py`'s `SubmoduleExportSpec` (decoder-LLMs) and `iterative_export.py`'s
+`modular_export.py`'s `ModularExportSpec` (decoder-LLMs) and `iterative_export.py`'s
 `IterativeRefinementSpec` (Euler-CFM samplers).
 
 `export_conformer_ctc_mil.py` (93 lines), `export_parakeet_tdt_mil.py` (97) and
@@ -192,7 +192,7 @@ class NeMoASREncoderSpec:
     # GGUF `general.architecture` value, and the output .gguf path.
     architecture: str
     output_path: str
-    # Only "monolithic" has ever been used for this family (there is no submodule boundary to declare:
+    # Only "monolithic" has ever been used for this family (there is no modular boundary to declare:
     # the whole preprocessor+encoder(+CTC decoder) chain is one graph). Declared rather than hardcoded
     # for symmetry with the other family templates' own `profile` field.
     profile: str = "monolithic"
