@@ -26,6 +26,33 @@ third this refactor introduced itself, and the golden diff caught it (last secti
 
 ---
 
+## Standing policy: retiring a bespoke `tools/convert_*` converter (R6)
+
+Adopted from `EXPORT-ROADMAP.md`'s R6, ahead of any deletions (`BACKLOG.md`'s P0.4). `tools/convert_*`
+(10 directories, ~14,000 lines) is not dead code today: several C++ reference tests consume fixtures it
+generates, and this document's own verification chain leans on it as a numerical oracle throughout.
+Nothing there may be deleted while it is the only description of a model's numerics — that role belongs
+to `tests/`, not to a parallel converter that happens to also run standalone.
+
+**A bespoke converter may be deleted only in the commit that re-points the last test consuming it.**
+Per model, in order:
+
+1. the MIL export exists and passes the same numeric reference test the bespoke path backs;
+2. the test is re-pointed at the MIL-exported GGUF (several already are — `test_e2e_*_mil_*`);
+3. any fixture-generation the test still needs moves to `tools/fixture_gen/`;
+4. the bespoke converter is deleted in the same commit that re-points the last test consuming it — not
+   before, and not "once the MIL export looks done" without the re-point having actually landed.
+
+The same policy applies to the long `export_*_mil.py` scripts once R4's declarative configs replace
+them: they are deleted when the family config that replaces them passes the same tests, not before.
+
+**What stays documented regardless.** `LOOM_MIL_CONVERSION.md` (the hand-built-`Program`/hand-written-
+driver path) remains supported for extreme cases and keeps its own test coverage (`test_compiler.py`).
+This policy retires the bespoke *converters*, not the advanced manual entry point — what goes away is
+the expectation that a user touches either one for a mainstream model.
+
+---
+
 ## Verification method (items 1 and 2)
 
 Items 1 and 2 are pure refactors: they must not change a single byte of any exported model. The check

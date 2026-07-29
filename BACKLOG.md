@@ -92,46 +92,65 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 
 | # | phase | items | gate | blocked by |
 |---|---|---|---|---|
-| **P0** | clear the ground | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
+| **P0** | clear the ground — DONE | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
 | **P1** | exporter internals | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P1 |
 | **P3** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P2 |
 | **P4** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P3 |
 | **P5** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P3/P4 |
 
-#### P0 — clear the ground (small, independent, no dependencies)
+#### P0 — clear the ground (small, independent, no dependencies) — DONE
 
 Do these first because everything later has to preserve whatever exists at the time, and each of these
 *removes* something.
 
-- **P0.1 — remove `profile="atomic"` (R7, approved).** `apply_atomic_export` is `exporter.py`
-  lines ~1119–1417 (~300 lines, between `apply_monolithic_export` and `apply_submodule_export`), plus
-  the `if profile == "atomic":` branch and its monolithic fallback at ~1029–1040. Also touches:
-  `export_lfm2_atomic.py` (delete), `tests/test_e2e_lfm2_mil_export.cpp` + `tests/CMakeLists.txt`
-  (`LOOM_LFM2_ATOMIC_GGUF` — the test already skips per-profile, so drop the atomic case),
-  `tools/loom_mil_compiler/export_hf_causal_lm.py` (`--profile atomic` in its usage docs),
-  `tools/convert_lfm/export_profiles_demo.py`, and the profile sections of
-  `LOOM_PROCEDURAL_GENERALIZATION.md`. Keep `_collect_replica_closure` only if `apply_submodule_export`
-  turns out to need it (check — its docstring at ~2008 says it exists *for* the atomic profile).
-  Scope-based partitioning is worth preserving as an opt-in discovery aid for `SubmoduleExportSpec`
-  ("Phase 2: automatic prefix/suffix boundary discovery", tracked further down this file) — move it
-  there or park it in the commit message, don't just delete the idea.
-  **Gate:** the remaining 11 exports byte-identical; `test_e2e_lfm2_mil_export` still passes on the
-  monolithic and submodule GGUFs.
-- **P0.2 — content-address weight payloads in the GGUF writer.** `exporter.py:2099 write_gguf` /
-  `w.add_tensor`. Measured: `lfm2_350m_submodule` stores 1609 MiB for 1353 MiB of unique payloads, and
-  **256 MiB of that is one tensor** — LFM2's tied embedding `[1024, 65536]` written twice, as
-  `prefix.module_weight` and `suffix_1.module_weight`. Hash each payload, emit once, alias the name.
-  Benefits every split export and is a precondition for split profiles being the default.
-  **Gate:** every model's tensor *set* unchanged by sha256 (`tensors.txt` in the snapshot), file sizes
-  down, all reference tests pass. Needs a matching C++ read path check — confirm `GgufModel::load`
-  resolves aliased names.
-- **P0.3 — confirm the R5 family grouping.** The 14-family table in `EXPORT-ROADMAP.md` is a hypothesis
-  derived from CrispASR's README architecture column, not from reading the 120 converters. Confirming it
-  is free (no code) and it reorders P4. Output: the table, corrected, with per-family model counts and
-  the connector each family needs.
-- **P0.4 — adopt the R6 policy** (write it into the contributor docs, delete nothing yet): a bespoke
-  converter may be deleted only in the commit that re-points the last test consuming it.
+- **P0.1 — remove `profile="atomic"` (R7, approved) — DONE.** `apply_atomic_export` (was `exporter.py`
+  ~1119–1417) is gone, along with the `if profile == "atomic":` branch and its monolithic fallback.
+  Also removed: `export_lfm2_atomic.py`, the `LOOM_LFM2_ATOMIC_GGUF` case in
+  `tests/test_e2e_lfm2_mil_export.cpp` + `tests/CMakeLists.txt`, `--profile atomic` from
+  `tools/loom_mil_compiler/export_hf_causal_lm.py`'s CLI/docs, `tools/convert_lfm/export_profiles_demo.py`
+  (its only purpose was demoing atomic-vs-monolithic; deleted rather than left demoing a profile that no
+  longer does anything), and the atomic section of `LOOM_PROCEDURAL_GENERALIZATION.md` (replaced with a
+  `SubmoduleExportSpec` section describing the one split mechanism that remains). `_collect_replica_closure`
+  was nested inside `apply_atomic_export` itself and went with it — confirmed `apply_submodule_export`
+  never called it. Scope-based partitioning as an opt-in `SubmoduleExportSpec` discovery aid is still
+  tracked further down this file, not implemented.
+  **Gate — passed:** `diff -r` of all 11 remaining models' snapshots (`snapshot_gguf.py`) against a
+  pre-removal baseline is empty; `test_e2e_lfm2_mil_export` passes end-to-end against real HF logits at
+  two prompt lengths.
+- **P0.2 — content-address weight payloads in the GGUF writer — DONE.** `exporter.py`'s `write_gguf`
+  now hashes each tensor's FINAL on-disk shape+dtype+bytes (post quantization) and, when a later name's
+  hash matches an earlier one, writes only a `loom.tensor_alias.names`/`loom.tensor_alias.targets` KV
+  pair instead of a second copy; `GgufModel::load` (`src/core/gguf_model.cpp`) resolves both arrays
+  straight into `symbols_` after the real tensors load, so `weight()`/`has_weight()` need no special
+  casing anywhere else in the engine. Found empirically and worth keeping in mind for any future touch
+  of this code: a pure byte+dtype hash is NOT enough — a rank-1 `[1]` scalar and a rank-3 `[1, 1, 1]`
+  scalar holding the identical value hash identically on bytes alone but must not be merged (shape is
+  now part of the hash), and two names with byte-identical raw weights but different quantization
+  eligibility (`name in quantizable`, e.g. a tied embedding used as a MUL_MAT operand in one topology's
+  slice but only via GET_ROWS in another's) must not be merged either (hashing the POST-quantization
+  bytes, not the raw array, makes this automatic). Deduping turned out not to be LFM2-embedding-specific:
+  every one of the 11 models had real duplicate constants (mostly small per-layer scalars, not just tied
+  weights) — `lfm2_350m_submodule` dropped from 1611 MiB to 1355 MiB (307 logical tensors, 158 real +
+  149 aliased), and even the monolithic single-topology exports shrank (`lfm2_350m_monolithic` 257→158
+  real tensors, `matcha_mil` 723→473, `kokoro_mil` 561→425, etc.).
+  **Gate — passed:** for all 11 models, the alias-resolved LOGICAL tensor set (name → shape/dtype/sha256)
+  is unchanged from the pre-dedup baseline (verified independently in Python, not just by C++ passing);
+  `test_gguf_model_load` extended with a dedicated alias-only fixture case (a declared alias with NO
+  `tensor_info` of its own, proving the C++ read path resolves it to the exact same `ggml_tensor*`, not
+  just equal data); full `ctest`/`pytest` clean.
+- **P0.3 — confirm the R5 family grouping — DONE.** See `EXPORT-ROADMAP.md`'s R5 section, now marked
+  "confirmed, with corrections" — read all 120 `crispasr/models/convert-*.py` docstrings plus CrispASR's
+  own README model tables (not just the architecture column). Four corrections to the original
+  hypothesis: 12 of the 120 files aren't model converters (voice/reference bakers, non-GGUF format
+  utilities, alternate write paths, one duplicate); family 2 ("Whisper-family") is really "audio encoder
+  + AR cross-attention decoder" and over half its members use a Conformer encoder, not Whisper's; family
+  3 is ~36 models, not ~20, the single largest group; and the 9/10 split conflated two pipeline STAGES
+  (AR token LM vs. acoustic decoder) rather than two disjoint model sets, revealing a 4th acoustic-decoder
+  shape (mel + HiFi-GAN TTS) filed under "one-offs" in the original table.
+- **P0.4 — adopt the R6 policy — DONE.** Written into `BACKEND.md` as a standing section (the doc
+  `BACKLOG.md` already directs exporter contributors to read first): a bespoke converter may be deleted
+  only in the commit that re-points the last test consuming it.
 
 #### P1 — exporter internals (must precede the API)
 

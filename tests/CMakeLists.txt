@@ -1094,8 +1094,8 @@ target_link_libraries(test_e2e_lfm2_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_lua_driver COMMAND test_e2e_lfm2_lua_driver)
 set_tests_properties(test_e2e_lfm2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- LFM2-350M exported via the generic MIL compiler (export_lfm2_atomic.py/export_lfm2_monolithic.py),
-#     verified at genuinely dynamic (non-fixed, unpadded) prompt lengths against real HF logits ---
+# --- LFM2-350M exported via the generic MIL compiler (export_lfm2_monolithic.py), verified at genuinely
+#     dynamic (non-fixed, unpadded) prompt lengths against real HF logits ---
 add_executable(test_e2e_lfm2_mil_export test_e2e_lfm2_mil_export.cpp)
 target_link_libraries(test_e2e_lfm2_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_mil_export COMMAND test_e2e_lfm2_mil_export)

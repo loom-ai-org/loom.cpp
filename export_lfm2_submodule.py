@@ -2,10 +2,10 @@
 """
 Exports LFM2-350M via the submodule-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): each
 submodule (embedding, rotary-embedding table, each decoder layer, final norm, output head) is traced
-independently via its own real captured forward call, instead of scope-partitioning one flattened
-trace the way export_lfm2_atomic.py does. Kept as its own script (separate from export_lfm2_atomic.py)
-until this path is verified numerically, per the backlog's own "keep the existing apply_atomic_export
-available... don't delete the fallback until parity is proven."
+independently via its own real captured forward call, instead of scope-partitioning one flattened trace
+the way the now-retired `profile="atomic"` export used to (EXPORT-ROADMAP.md R7). Declaring the boundary
+and re-deriving the repeated blocks structurally (`find_repeated_blocks`) is the only split mechanism
+this exporter has left; a wrong claim raises immediately instead of silently downgrading.
 
 Usage:
   ~/.venvs/piper/bin/python3 export_lfm2_submodule.py

@@ -11,3 +11,5 @@ __pycache__/
 !tests/fixtures/*.gguf.md
 .idea/
 .vscode/
+_deps/
+CMakeFiles/

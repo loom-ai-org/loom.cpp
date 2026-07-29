@@ -45,6 +45,14 @@ def main() -> None:
     weight = np.arange(12, dtype=np.float32).reshape(3, 4)
     w.add_tensor("test.weight", weight)
 
+    # Content-addressed alias, exercising GgufModel::load's "loom.tensor_alias.*" resolution
+    # (BACKLOG.md P0.2) without needing a real duplicate-payload model: "test.weight_alias" is declared
+    # as an alias of "test.weight" and deliberately has NO tensor_info of its own in this file -- only
+    # weight("test.weight_alias") resolving to the exact same ggml_tensor* as weight("test.weight")
+    # proves the C++ read path, not just that the writer emitted the KV pair.
+    w.add_array("loom.tensor_alias.names", ["test.weight_alias"])
+    w.add_array("loom.tensor_alias.targets", ["test.weight"])
+
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
