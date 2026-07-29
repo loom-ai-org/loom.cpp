@@ -282,6 +282,31 @@ decomposition). Any other combination (`transpose_x=True`, alone or with `transp
 `NotImplementedError` by design rather than silently miscomputing. Not yet hit by any converted model; a
 real derivation + test case is needed the first time one does.
 
+### Known bug: `tools/convert_lfm/make_lfm2_gguf.py`'s per-layer zero-RoPE placeholder produces NaN
+
+`test_e2e_lfm2_lua_driver`'s only previously-recorded failure mode, across every entry in this file that
+mentions it, was a *missing local fixture* (`lfm2_350m.gguf` was never actually present, so the bespoke
+Lua-driver path itself was never really exercised end-to-end). Regenerating the fixture from the bespoke
+converter (`~/.venvs/piper/bin/python3 tools/convert_lfm/make_lfm2_gguf.py /home/flavio/Dev/models/lfm2-350m
+lfm2_350m.gguf`) and actually running the test surfaces a real, separate bug: a NaN reaches a SILU
+activation and trips ggml's own `assert(!isnan(x))` (`ggml-cpu/ops.cpp`) — a hard `SIGABRT` the test
+process cannot catch, unlike a C++ exception.
+
+Root cause (not yet fixed): `make_lfm2_gguf.py`'s `LayerSubmodule.forward` traces each of the 16 decoder
+layers *independently*, each time passing RoPE `position_embeddings` as `torch.zeros(1, 1, 64)` — the
+script's own comment calls these "Placeholders that we will swap", but they never got swapped. This
+predates the exporter-improvement thread entirely (last touched 3 commits before it, unrelated to MIL
+compiler work) and is orthogonal to the real MIL export path: `export_lfm2_monolithic.py`'s
+`lfm2_350m_monolithic.gguf` (real RoPE, traced as one flattened graph) matches real HF logits exactly via
+`test_e2e_lfm2_mil_export`.
+
+**Not fixed.** `test_e2e_lfm2_lua_driver` now skips unconditionally (return code 77, matching the
+project's skip convention) with a comment pointing here, rather than attempting a run that would abort
+the whole test binary. Fixing this for real means threading each layer's actual token-position-dependent
+RoPE table through the independently-traced submodules (the same kind of problem `SubmoduleExportSpec`
+already solves correctly for the MIL path) — worth doing only if this bespoke script's own coverage still
+matters; the MIL path is otherwise a strict improvement over it.
+
 ### Retrofit the bespoke `tools/convert_*` scripts onto the MIL exporter
 
 Order being worked (per explicit user direction): Qwen3, Conformer-CTC, Parakeet, VITS, Kokoro, Matcha-TTS,
