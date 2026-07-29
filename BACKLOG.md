@@ -82,7 +82,7 @@ the rest and are the reason this is not simply "R1, R2, R3…":
 
 * **R1 (named axes) must land before R3's config schema.** `LoomExportConfig.inputs` *is* the axis
   declaration. Writing the schema first means migrating every config that exists by then.
-* **The registry skeleton (P2) must land before any new family (P3).** Whisper and GigaAM written as
+* **The registry skeleton (P3) must land before any new family (P4).** Whisper and GigaAM written as
   scripts are two more scripts R4 has to delete; written as registry entries they are the acceptance
   test for the registry.
 
@@ -94,10 +94,11 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 |---|---|---|---|---|
 | **P0** | clear the ground — DONE | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
 | **P1** | exporter internals | R1, R2a, R2b | `compare_snapshots.py` | P0 |
-| **P2** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P1 |
-| **P3** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P2 |
-| **P4** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P3 |
-| **P5** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P3/P4 |
+| **P2** | enable multi-output topologies | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
+| **P3** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P2 |
+| **P4** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
+| **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
+| **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
 #### P0 — clear the ground (small, independent, no dependencies) — DONE
 
@@ -170,50 +171,82 @@ Do these first because everything later has to preserve whatever exists at the t
   it is the precondition for auditing the C++ "heal transposed layouts" heuristics (tracked below).
 
 R2's remaining composite ops (`loom.replicate_pad`, `loom.conv_transpose_dw`, `loom.stack`,
-`loom.mean`) can land any time after P1.2, including interleaved with P3 — they are independent of each
+`loom.mean`) can land any time after P1.2, including interleaved with P4 — they are independent of each
 other and each is individually gated.
 
-#### P2 — the API skeleton (R3 + R4)
+#### P2 — enable multi-output topologies
 
-- **P2.1 — `LoomExportConfig` base class**, with the three existing templates (`SubmoduleExportSpec`,
+The engine's one-output-tensor-per-topology convention (`loom.run_subgraph` returns data + shape, see
+`submodule_export.py`'s `_flatten_call` comment) is a real, deliberate constraint everywhere it's been
+hit so far, not an oversight — but it's the one thing standing between the current state and *inferring*
+an `IterativeRefinementSpec` directly from a scripted-loop trace instead of hand-declaring it (a MIL loop
+body has one output per loop-carried var; see BACKEND.md item 3's follow-up, where two of the three real
+prerequisites for that already hold). Scheduled here, before P3's config schema settles, so
+`LoomExportConfig`'s iterative-refinement shape doesn't have to assume "always hand-declared" only to be
+revisited once inference becomes possible.
+
+- **P2.1 — multi-output support in `GraphBuilder`/`run_subgraph`.** The engine-level change: a topology
+  can declare more than one output tensor, and `run_subgraph` returns all of them rather than one
+  data+shape pair.
+- **P2.2 — generalize `generate_graph_topology` and `_prune_dead_nodes`.** Today's exporter takes
+  `ops_list[-1]`'s output as *the* topology output and prunes everything unreachable from it (correctly,
+  for one output) — both need to accept a *set* of declared outputs and keep everything reachable from
+  any of them. This is the structural blocker BACKEND.md's follow-up hit directly: feeding a MIL loop
+  body through today's single-output path collapses it to the counter increment alone.
+- **P2.3 — driver-side plumbing.** `transpile_operation`'s `SubgraphCall` lowering and the Lua
+  `loom.run_subgraph` binding both need to consume/return multiple values; `_finalize_driver`'s
+  validation extends accordingly.
+  **Gate:** every existing model's topologies are still single-output and byte-identical
+  (`snapshot_gguf.py`/`compare_snapshots.py` — this must not be a silent behavior change for anything
+  already exported); a new multi-output test topology exercises the full path end-to-end.
+
+Not required to land before P3 for any *technical* reason (the API skeleton doesn't depend on multi-output
+support existing) — ordered here because it changes what a family template's own spec needs to be able to
+declare, and P4.3's composition template in particular is exactly the kind of model (encoder + adapter +
+LM, each producing real intermediate outputs) worth checking against a multi-output topology once one
+exists, before that template's own shape is locked in.
+
+#### P3 — the API skeleton (R3 + R4)
+
+- **P3.1 — `LoomExportConfig` base class**, with the three existing templates (`SubmoduleExportSpec`,
   `IterativeRefinementSpec`, `NeMoASREncoderSpec`) re-expressed as configs. No behaviour change.
   **Gate:** byte-identical re-export of all current models.
-- **P2.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI.** Registry keyed on HF
+- **P3.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI.** Registry keyed on HF
   `config.json` `model_type`/`architectures` and on the `target` class inside a `.nemo` archive. The
-  loader is a *separate* registry entry from the family template — this is what P3.2 (GigaAM) tests.
+  loader is a *separate* registry entry from the family template — this is what P4.2 (GigaAM) tests.
   **Acceptance:** `export_conformer_ctc_mil.py`, both Parakeet scripts and `export_qwen3_mil.py` are
   deleted and replaced by registry entries.
-- **P2.3 — `ModelPatcher` + `DummyInputGenerator`.** Fold the four long TTS scripts' wrapping into
+- **P3.3 — `ModelPatcher` + `DummyInputGenerator`.** Fold the four long TTS scripts' wrapping into
   declared patchers. **Acceptance:** `export_kokoro_mil.py` (503), `export_matcha_mil.py` (448),
   `export_vits_mil.py` (382) and `export_styletts2_mil.py` (350) are deleted. Encode the traced-output
   naming rule here (binding a traced value to a Python local renames the topology's declared output —
   found the hard way, see BACKEND.md).
 
-#### P3 — flagship coverage
+#### P4 — flagship coverage
 
-- **P3.1 — Whisper.** The only flagship with no MIL export, the project's own reference model, and a
+- **P4.1 — Whisper.** The only flagship with no MIL export, the project's own reference model, and a
   prerequisite for ~10 models in family 3. First family born inside the registry.
-- **P3.2 — GigaAM v3.** Graph is family 1 (already exported); the point is the *second loader*
+- **P4.2 — GigaAM v3.** Graph is family 1 (already exported); the point is the *second loader*
   (`gigaam.load_model` / `AutoModel.from_pretrained(..., trust_remote_code=True)` instead of
-  `ASRModel.restore_from`), which is what proves P2.2's loader/template split. Check first whether the
+  `ASRModel.restore_from`), which is what proves P3.2's loader/template split. Check first whether the
   remote-code modeling traces cleanly or needs a patcher.
-- **P3.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
+- **P4.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
   family 3 (~20 models) and is the single largest coverage lever in the roadmap.
 
-#### P4 — breadth
+#### P5 — breadth
 
 Ordered by coverage-per-effort, subject to P0.3's corrections: family 12 (BERT token classifiers —
 smallest possible template, proves the registry on a non-audio task) → 11 (codec decoders, unlocks
 family 10's back half) → 4 (CNN+CTC) and 5 (SANM), both family-1-shaped once the encoder template is
 generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small classifiers) → 14 (music).
 
-#### P5 — cleanup
+#### P6 — cleanup
 
 R6 executions (one commit per model: re-point the last test, delete the bespoke converter), then the
 `tools/convert_*` directories themselves (~14,000 lines across 10 directories), then the docs pass.
 
-**If only three things get done:** P0.1 + P0.2 (a smaller, honest baseline), P2.1 + P2.2 (the registry,
-which is what makes every later family cheap), and P3.3 (the composition template, which is where the
+**If only three things get done:** P0.1 + P0.2 (a smaller, honest baseline), P3.1 + P3.2 (the registry,
+which is what makes every later family cheap), and P4.3 (the composition template, which is where the
 model count actually lives).
 
 ### Third family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT) — DONE
@@ -252,11 +285,11 @@ All are recorded in full in BACKEND.md; this is the index.
     rational coefficients over sums on construction (`floor((n-512)/160)` → `floor(n/160 - 16/5)`), and
     the engine evaluates in `double`, where the distributed form takes three roundings inside a floor
     instead of one.
-- **Multi-output topologies in `GraphBuilder`/`run_subgraph`.** The engine's one-output-tensor-per-topology
-  convention is the single thing standing between the current state and inferring an
-  `IterativeRefinementSpec` directly from a scripted-loop trace (a MIL loop body has one output per
-  loop-carried var). Worth doing only if role inference becomes valuable — BACKEND.md's item 3 follow-up
-  has the full analysis, including the two of three prerequisites that already hold.
+- **Multi-output topologies in `GraphBuilder`/`run_subgraph` — now scheduled as P2** in the
+  implementation sequence above. The engine's one-output-tensor-per-topology convention is the single
+  thing standing between the current state and inferring an `IterativeRefinementSpec` directly from a
+  scripted-loop trace (a MIL loop body has one output per loop-carried var). BACKEND.md's item 3
+  follow-up has the full analysis, including the two of three prerequisites that already hold.
 - **Item 5 of `EXPORT-IMPROVEMENT.md` (prototype StableHLO on one solved model)** remains deliberately
   not started; the proposal itself files it as a validation exercise rather than a fix.
 
