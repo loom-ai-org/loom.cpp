@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
+from loom_mil_compiler.shape_expr import N_TOKENS
 from loom_mil_compiler.value_facts import (
     ValueFacts, is_const_producer, static_array, static_ints, static_scalar, static_value,
 )
@@ -101,7 +102,7 @@ class TestMemoization(unittest.TestCase):
         `ValueFacts`' own walking/caching rather than the exporter's shape inference."""
 
         def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
-            return "n_tokens"
+            return N_TOKENS
 
     def setUp(self):
         self.prog = self._program()
@@ -180,6 +181,61 @@ class TestMemoization(unittest.TestCase):
         self.facts.scalar_expr(total)
         cached_var, _ = self.facts._scalar_expr[id(total)]
         self.assertIs(cached_var, total)
+
+
+class TestGuessProvenance(unittest.TestCase):
+    """A derived `n_tokens` and a guessed `n_tokens` are the same expression and must stay tellable
+    apart -- `slice_by_index`'s derivation treats one as an answer and the other as "the walk ran out
+    of graph". They used to be distinguished by accident, because a derived length happened to come out
+    spelled `floor((n_tokens + 0 - 1)/1) + 1`; normalizing expressions removed that accident and, with
+    it, correct shapes in SupertonicTTS and VITS (see BACKEND.md)."""
+
+    class _StubExporter:
+        def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+            return N_TOKENS
+
+    def _facts_and_main(self):
+        from coremltools.converters.mil.mil import Builder as mb, get_new_symbol
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, get_new_symbol()))])
+        def prog(x):
+            shape = mb.shape(x=x)
+            derived = mb.gather(x=shape, indices=np.array([1], dtype=np.int32), axis=0)
+            return mb.add(x=derived, y=np.array([0], dtype=np.int32))
+
+        return ValueFacts(exporter=self._StubExporter()), prog.functions["main"]
+
+    def test_a_shape_query_is_not_a_guess_even_when_it_answers_n_tokens(self):
+        facts, main = self._facts_and_main()
+        derived = next(op for op in main.operations if op.op_type == "gather").outputs[0]
+        self.assertEqual(facts.scalar_expr(derived), N_TOKENS)
+        self.assertFalse(facts.scalar_expr_is_guess(derived))
+
+    def test_arithmetic_over_a_derived_value_stays_a_derivation(self):
+        facts, main = self._facts_and_main()
+        total = next(op for op in main.operations if op.op_type == "add").outputs[0]
+        self.assertEqual(facts.scalar_expr(total), N_TOKENS)
+        self.assertFalse(facts.scalar_expr_is_guess(total))
+
+    def test_a_producer_less_var_is_a_guess(self):
+        facts, main = self._facts_and_main()
+        self.assertEqual(facts.scalar_expr(main.inputs["x"]), N_TOKENS)
+        self.assertTrue(facts.scalar_expr_is_guess(main.inputs["x"]),
+                        "the producer-less fallback is the one answer that is not derived")
+
+    def test_the_guess_flag_propagates_through_arithmetic(self):
+        from coremltools.converters.mil.mil import Builder as mb, get_new_symbol
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1,))])
+        def prog(x):
+            return mb.add(x=x, y=np.array([3.0], dtype=np.float32))
+
+        facts = ValueFacts(exporter=self._StubExporter())
+        total = next(op for op in prog.functions["main"].operations
+                     if op.op_type == "add").outputs[0]
+        self.assertEqual(facts.scalar_expr(total), N_TOKENS + 3)
+        self.assertTrue(facts.scalar_expr_is_guess(total),
+                        "one guessed operand makes the whole expression a guess")
 
 
 if __name__ == "__main__":
