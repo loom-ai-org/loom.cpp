@@ -61,7 +61,17 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > - **Any exporter change should be gated on `tools/loom_mil_compiler/snapshot_gguf.py`** — snapshot the
 >   exports before and after and require a zero-line `diff -r`. Its docstring has the recipe. The `.gguf`
 >   files in the tree are `.gitignore`d build outputs and are routinely stale; regenerate the baseline
->   rather than diffing against them.
+>   rather than diffing against them. When a change is *meant* to rewrite shape attributes, use
+>   `tools/loom_mil_compiler/compare_snapshots.py` instead — it evaluates both sides of every differing
+>   value at concrete lengths and reports anything not numerically equivalent as structural.
+
+> **The next thread is [`EXPORT-ROADMAP.md`](EXPORT-ROADMAP.md).** Seven items (R1–R7) aimed at making the
+> exporter look like `optimum-onnx` from the outside: named dynamic axes instead of one global `n_tokens`
+> (R1), MIL→MIL lowering passes instead of emission-time guards (R2), a task/architecture registry with
+> `LoomModelFor*` entry points (R3), transparent export with no user-written wrapping (R4), a grouping
+> study of the ~120 models CrispASR covers plus a phased template plan (R5), the retirement policy for the
+> bespoke `tools/convert_*` converters (R6), and a measured recommendation to drop `profile="atomic"`
+> (R7). Items below that predate it are still valid; R2 and R7 in particular subsume several of them.
 
 ### Third family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT) — DONE
 
