@@ -59,7 +59,7 @@ bool run_gguf_case(const std::string& gguf_path) {
     loom::LoomLuaBridge bridge(backend.get());
     // Monolithic exports have exactly one topology (named "main_topo"). Register whatever topologies
     // the file actually declares instead of assuming a single hardcoded name, so this also works
-    // unmodified against a submodule-profile export (one topology per prefix/layer_i/suffix_i slice).
+    // unmodified against a modular-profile export (one topology per prefix/layer_i/suffix_i slice).
     for (const std::string& mod_name : model->topology_names()) {
         bridge.register_module(mod_name, *model, loom::GraphTopology::parse(model->topology_json(mod_name)), nullptr);
     }

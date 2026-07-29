@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Exports LFM2-350M via the submodule-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): each
+Exports LFM2-350M via the modular-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): each
 submodule (embedding, rotary-embedding table, each decoder layer, final norm, output head) is traced
 independently via its own real captured forward call, instead of scope-partitioning one flattened trace
 the way the now-retired `profile="atomic"` export used to (EXPORT-ROADMAP.md R7). Declaring the boundary
@@ -8,7 +8,7 @@ and re-deriving the repeated blocks structurally (`find_repeated_blocks`) is the
 this exporter has left; a wrong claim raises immediately instead of silently downgrading.
 
 Usage:
-  ~/.venvs/piper/bin/python3 export_lfm2_submodule.py
+  ~/.venvs/piper/bin/python3 export_lfm2_modular.py
 """
 import sys
 import types
@@ -23,7 +23,7 @@ from transformers import AutoModelForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 import loom_mil_compiler  # Registers the "loom" backend + applies torch-frontend patches
-from loom_mil_compiler.submodule_export import SubmoduleExportSpec, export_submodules
+from loom_mil_compiler.modular_export import ModularExportSpec, export_modular
 
 
 def _causal_mask(seq_len: int) -> torch.Tensor:
@@ -33,13 +33,13 @@ def _causal_mask(seq_len: int) -> torch.Tensor:
 
 def main():
     model_dir = "/home/flavio/Dev/models/lfm2-350m"
-    out_path = "lfm2_350m_submodule.gguf"
+    out_path = "lfm2_350m_modular.gguf"
 
     print(f"Loading LFM2-350M from {model_dir}...")
     model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32).eval()
 
     # A dummy sequence length deliberately NOT equal to any of the model's own static dims (batch=1,
-    # hidden_size=1024, num_attention_heads=16, head_dim=64, vocab_size=65536) -- export_submodules
+    # hidden_size=1024, num_attention_heads=16, head_dim=64, vocab_size=65536) -- export_modular
     # marks an axis dynamic when its captured size equals this value, so a collision would wrongly
     # mark a static axis dynamic (or vice versa).
     seq_len = 37
@@ -51,7 +51,7 @@ def main():
         attention_mask=_causal_mask(seq_len),
     )
 
-    spec = SubmoduleExportSpec(
+    spec = ModularExportSpec(
         prefix_attr="model.embed_tokens",
         repeated_attr="model.layers",
         suffix_attrs=["model.embedding_norm", "lm_head"],
@@ -60,9 +60,9 @@ def main():
     )
 
     print("Tracing each submodule standalone...")
-    result = export_submodules(model, spec, dummy_inputs, seq_len=seq_len, max_seq_len=4096)
+    result = export_modular(model, spec, dummy_inputs, seq_len=seq_len, max_seq_len=4096)
 
-    print("Compiling to GGUF (submodule-blueprint profile)...")
+    print("Compiling to GGUF (modular-blueprint profile)...")
     backend = loom_mil_compiler.LoomGGUFBackend()
     backend(
         result.program,
@@ -70,9 +70,9 @@ def main():
         architecture="lfm2",
         tokenizer_dir=model_dir,
         tokenizer_pre="llama3",
-        submodule_layout=result,
+        modular_layout=result,
     )
-    print(f"SUCCESS! Submodule-blueprint model exported cleanly to: {out_path}")
+    print(f"SUCCESS! Modular-blueprint model exported cleanly to: {out_path}")
 
 
 if __name__ == "__main__":

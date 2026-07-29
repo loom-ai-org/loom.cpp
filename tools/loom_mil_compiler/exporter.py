@@ -940,12 +940,12 @@ class LoomGGUFExporter:
                 # at any derivation step it can't simplify back to the original input symbol (confirmed
                 # empirically -- an LFM2 ShortConv layer's causal pad+conv+slice, which provably preserves
                 # sequence length, produces 4 distinct "isN" names downstream of its one "is0" input; the
-                # submodule-export path's own inter-slice boundaries surface even more of these as separate
+                # modular-export path's own inter-slice boundaries surface even more of these as separate
                 # declared inputs of a single slice). There is no cheap, reliable way to tell "several
                 # names, one true quantity" apart from "two genuinely independent dynamic axes" from the
                 # dim strings alone -- CoreML doesn't expose symbol-equality at this level, and an
                 # input-count-based heuristic tried here produced false positives on real, correct
-                # submodule slices. If a future model genuinely needs a second independent dynamic axis, that would
+                # modular slices. If a future model genuinely needs a second independent dynamic axis, that would
                 # surface as a numerical mismatch against the reference model, not a syntactic error here.
                 #
                 # Substituting each symbol OCCURRENCE (not the whole dim string) matters: a dim isn't
@@ -1016,13 +1016,13 @@ class LoomGGUFExporter:
                 else:
                     self.topologies[func_name] = self.generate_graph_topology(func, func_name)
             driver_script = self._finalize_driver()
-        elif self.kwargs.get("submodule_layout") is not None:
-            # Submodule-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): `self.program` here is
+        elif self.kwargs.get("modular_layout") is not None:
+            # Modular-export blueprint (EXPORT-IMPROVEMENT-BACKLOG.md item 2): `self.program` here is
             # NOT a single flattened trace -- it has no "main" function at all, just one Function per
             # independently-traced submodule (prefix/aux/layer_i/suffix_i) -- so there is no monolithic
             # fallback to degrade to on failure; a bug here should fail loudly, not silently produce a
             # working-looking but wrong export.
-            self.apply_submodule_export()
+            self.apply_modular_export()
             driver_script = self._finalize_driver()
         else:
             self.apply_monolithic_export()
@@ -1098,18 +1098,18 @@ class LoomGGUFExporter:
 
         self.ir_function = IRFunction("main", ["inputs"], body)
 
-    def apply_submodule_export(self):
+    def apply_modular_export(self):
         """
-        Synthesizes the driver for a submodule-export blueprint (`kwargs["submodule_layout"]`, a
-        `SubmoduleExportResult` from submodule_export.py): one real, independently-traced Function per
+        Synthesizes the driver for a modular-export blueprint (`kwargs["modular_layout"]`, a
+        `ModularExportResult` from modular_export.py): one real, independently-traced Function per
         prefix/aux/layer_i/suffix_i submodule. Every function is self-contained by construction (no
         cross-slice variable leakage to detect, unlike partitioning a single flattened trace by scope
         would), so this only has to generate each function's topology directly
         (`generate_graph_topology(func, name)`, no ops_list/inputs_dict reconstruction) and chain
         SubgraphCalls prefix -> [aux] -> layer_0..N-1 -> suffix_0..M-1 -> argmax.
         """
-        print("Exporting via Submodule-Blueprint path...")
-        layout = self.kwargs["submodule_layout"]
+        print("Exporting via Modular-Blueprint path...")
+        layout = self.kwargs["modular_layout"]
         functions = self.program.functions
         special_names = set(_POSITION_INPUT_NAMES) | set(_CAUSAL_MASK_INPUT_NAMES)
 
@@ -1154,7 +1154,7 @@ class LoomGGUFExporter:
                 body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
 
         # 3. Prefix.
-        chain_var = "_sub_chain_0"
+        chain_var = "_mod_chain_0"
         body.append(SubgraphCall(
             outputs=[chain_var], module="prefix", n_tokens=n_tokens_expr, n_past=Lit(0),
             inputs={self.safe_name(n): IRVar(self.safe_name(n)) for n in prefix_input_names},
@@ -1177,7 +1177,7 @@ class LoomGGUFExporter:
                 # the traced graph never ends up actually depending on) plays the same "current chain
                 # tensor" role a repeated-block call's primary input does -- feed it the same value.
                 aux_inputs_tbl[safe_n] = IRVar(chain_var) if n in aux_chain_names else IRVar(safe_n)
-            aux_out_vars = [f"_sub_aux_{i}" for i in range(len(layout.aux_output_names))]
+            aux_out_vars = [f"_mod_aux_{i}" for i in range(len(layout.aux_output_names))]
             body.append(SubgraphCall(
                 outputs=aux_out_vars, module="aux", n_tokens=n_tokens_expr, n_past=Lit(0), inputs=aux_inputs_tbl,
             ))
@@ -1204,7 +1204,7 @@ class LoomGGUFExporter:
                 else:
                     inputs_tbl[safe_n] = IRVar(safe_n)
 
-            next_chain_var = f"_sub_chain_{i + 1}"
+            next_chain_var = f"_mod_chain_{i + 1}"
             body.append(SubgraphCall(
                 outputs=[next_chain_var], module=layer_name, n_tokens=n_tokens_expr, n_past=Lit(0),
                 inputs=inputs_tbl,
@@ -1217,13 +1217,13 @@ class LoomGGUFExporter:
             if len(in_names) != 1:
                 raise ValueError(f"suffix submodule '{name}' must declare exactly one input, got {in_names}")
             is_last = idx == len(layout.suffix_names) - 1
-            next_chain_var = f"_sub_suffix_{idx}"
+            next_chain_var = f"_mod_suffix_{idx}"
             call_kwargs = dict(
                 outputs=[next_chain_var], module=name, n_tokens=n_tokens_expr, n_past=Lit(0),
                 inputs={self.safe_name(in_names[0]): IRVar(chain_var)},
             )
             if is_last:
-                call_kwargs["extra_outputs"] = ["_submodule_final_shape"]
+                call_kwargs["extra_outputs"] = ["_modular_final_shape"]
             body.append(SubgraphCall(**call_kwargs))
             chain_var = next_chain_var
 
@@ -1232,7 +1232,7 @@ class LoomGGUFExporter:
         row_expr = BinOp("-", n_tokens_expr, Lit(1))
         body.append(If(
             cond=BinOp("==", Call("type", [IRVar(chain_var)]), Lit("table")),
-            then=[Return([Call("loom.argmax_row", [IRVar(chain_var), Index(IRVar("_submodule_final_shape"), 1), row_expr])])],
+            then=[Return([Call("loom.argmax_row", [IRVar(chain_var), Index(IRVar("_modular_final_shape"), 1), row_expr])])],
             else_=[Return([IRVar(chain_var)])],
         ))
 
@@ -1437,7 +1437,7 @@ class LoomGGUFExporter:
                 "stepper (see tools/loom_mil_compiler/recurrent.py and the new "
                 "LoomLuaBridge::l_run_recurrent C++ binding, which generalizes the existing "
                 "BiLstmStepper), not a static topology. Auto-wiring this into the generic export "
-                "profiles (monolithic/submodule-blueprint driver synthesis) is unimplemented "
+                "profiles (monolithic/modular-blueprint driver synthesis) is unimplemented "
                 "follow-up work -- for now, build the per-timestep topologies directly via "
                 "recurrent.build_lstm_cell_topologies() and drive them with loom.run_recurrent() in a "
                 "hand-written driver script, the same way tools/convert_kokoro/kokoro_driver.lua does "
@@ -1457,7 +1457,7 @@ class LoomGGUFExporter:
             
             if func_name.startswith("layer_"):
                 # A submodule traced standalone with its real parameter name already literally
-                # "hidden_states" (e.g. the submodule-export blueprint, EXPORT-IMPROVEMENT-BACKLOG.md
+                # "hidden_states" (e.g. the modular-export blueprint, EXPORT-IMPROVEMENT-BACKLOG.md
                 # item 2) would otherwise alias it to itself here -- `resolve()` walks `aliases` in a
                 # `while name in aliases` loop, so a self-referential entry spins forever.
                 if orig_name != "hidden_states":
@@ -1658,9 +1658,9 @@ class LoomGGUFExporter:
         # topology's own output -- GraphBuilder's ggml_gallocr_alloc_graph only allocates a backend
         # buffer for tensors reachable from the declared output, so an orphan input tensor is created
         # but never given a buffer. If the driver ever supplied a value for it anyway (e.g. a
-        # submodule-export blueprint's per-layer function still nominally "declaring" a
+        # modular-export blueprint's per-layer function still nominally "declaring" a
         # cache_position/position_ids input that its own real call never ends up depending on once
-        # past_key_values is forced to None -- see submodule_export.py's _CACHE_KWARG_NAMES comment),
+        # past_key_values is forced to None -- see modular_export.py's _CACHE_KWARG_NAMES comment),
         # setting data into that unallocated tensor is a ggml hard-crash ("tensor buffer not set"), not
         # a graceful error. Dropping it from the declared list here means check_subgraph_calls treats
         # the driver still supplying it as an undeclared-input validation error instead -- catching the
@@ -1689,7 +1689,7 @@ class LoomGGUFExporter:
         now runs as a real MIL->MIL pass (passes.py) with `common::dead_code_elimination` run right after
         it, so the orphan never survives into this walk at all (EXPORT-IMPROVEMENT-BACKLOG.md item 3).
         Kept as a general safety net for any topology-generation path that can still leave dead nodes
-        behind (a pre-partitioned submodule slice, an advanced/bespoke hand-built Program) rather than
+        behind (a pre-partitioned modular slice, an advanced/bespoke hand-built Program) rather than
         relying on every future caller to prove it never will.
         """
         needed = {output_symbol}
@@ -1809,7 +1809,7 @@ class LoomGGUFExporter:
 
         # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
         # SAME weight under two different names (LFM2's tied embedding is both `prefix.module_weight` and
-        # `suffix_1.module_weight` under the submodule profile), and a single traced model routinely
+        # `suffix_1.module_weight` under the modular profile), and a single traced model routinely
         # mints many distinctly-named constants that happen to hold the same value (e.g. a bare `1.0`
         # scalar reused across unrelated ops). Write the bytes once and alias every later name to the
         # first, instead of paying for (and storing) a second copy. Hashed on the FINAL on-disk

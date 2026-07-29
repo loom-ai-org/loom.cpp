@@ -14,7 +14,7 @@ about the first pain point):
    it (e.g. `_try_resolve_reshape_shape_input`). Each new model architecture tends to add new branches
    and new special cases rather than composing cleanly with what's there.
 2. **The embedded Lua "driver" (orchestration) is derived automatically for exactly one model family**
-   (decoder-only causal LMs, via `submodule_discovery.py`/`submodule_export.py`/`apply_submodule_export`)
+   (decoder-only causal LMs, via `modular_discovery.py`/`modular_export.py`/`apply_modular_export`)
    and hand-written for everything else (`export_styletts2_mil.py`: 340 lines, `export_kokoro_mil.py`:
    503 lines, vs. `export_qwen3_mil.py`: 28 lines for the generalized family). The goal — inferring the
    orchestration graph (what feeds what, where loops live, where outputs emerge) directly from the
@@ -114,8 +114,8 @@ single-step graph).
 
 ### 4. Generalize a second family template for iterative-refinement models
 
-**What**: Alongside `SubmoduleExportSpec` (which generalizes decoder-LLM export to ~3 lines of
-declarative boundary spec per model, per `submodule_export.py`), build an analogous spec/template for
+**What**: Alongside `ModularExportSpec` (which generalizes decoder-LLM export to ~3 lines of
+declarative boundary spec per model, per `modular_export.py`), build an analogous spec/template for
 the "N-step iterative refinement over loop-carried state" family — parameterized by step count,
 loop-carried tensor name(s), and the per-step submodule to call. This depends on item 3 above (the loop
 needs to be capturable as a structural unit first).
@@ -123,13 +123,13 @@ needs to be capturable as a structural unit first).
 **Why**: StyleTTS2, Matcha, and Supertonic aren't three unrelated bespoke problems — they're one
 recognizable pattern with three different implementations. Right now each gets a fully hand-written
 driver (`export_styletts2_mil.py`: 340 lines, `export_kokoro_mil.py`: 503 lines). A shared template
-would shrink these the same way `SubmoduleExportSpec` shrunk `export_qwen3_mil.py` to 28 lines, while
+would shrink these the same way `ModularExportSpec` shrunk `export_qwen3_mil.py` to 28 lines, while
 still conceding true one-offs (custom vocoders, spline ops) as bespoke.
 
-**Evidence**: `tools/loom_mil_compiler/submodule_export.py`'s `SubmoduleExportSpec`
+**Evidence**: `tools/loom_mil_compiler/modular_export.py`'s `ModularExportSpec`
 (`prefix_attr`/`repeated_attr`/`suffix_attrs`/`aux_attr`) is the existing precedent for this pattern.
 This item is also a natural continuation of `BACKLOG.md`'s already-tracked, deliberately-deferred
-"Phase 2 (fully automatic prefix/suffix boundary discovery)" note under "Submodule-export blueprint" —
+"Phase 2 (fully automatic prefix/suffix boundary discovery)" note under "Modular-export blueprint" —
 worth revisiting together with this proposal rather than as a separate effort.
 
 ### 5. (Low priority, optional) Empirically prototype StableHLO on one already-solved model

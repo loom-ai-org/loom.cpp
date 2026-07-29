@@ -1,6 +1,6 @@
 """
 Traces each declared submodule of an HF causal-LM standalone and assembles the results into one
-multi-Function MIL Program -- EXPORT-IMPROVEMENT-BACKLOG.md item 2's "submodule-export blueprint",
+multi-Function MIL Program -- EXPORT-IMPROVEMENT-BACKLOG.md item 2's "modular-export blueprint",
 replacing scope-based partitioning of a single flattened trace.
 
 This is the same assembly pattern tools/convert_lfm/make_lfm2_gguf.py used by hand
@@ -8,7 +8,7 @@ This is the same assembly pattern tools/convert_lfm/make_lfm2_gguf.py used by ha
 hardcoded layer count, no hand-derived dummy shapes, no per-model wrapper subclasses. The one piece
 that genuinely can't be recovered from module structure alone -- where "prefix"/"repeated"/"suffix"
 boundaries fall, and which repeated-block kwarg a once-computed auxiliary tensor (e.g. a shared
-rotary-embedding table) feeds -- is a short declarative `SubmoduleExportSpec`, verified at export time
+rotary-embedding table) feeds -- is a short declarative `ModularExportSpec`, verified at export time
 (a wrong attribute name raises `AttributeError` immediately, not a silent wrong export).
 """
 import inspect
@@ -22,20 +22,20 @@ import torch.nn as nn
 import coremltools as ct
 from coremltools.converters.mil.mil import Program, Function
 
-from .submodule_discovery import find_repeated_blocks, get_by_path, capture_calls
+from .modular_discovery import find_repeated_blocks, get_by_path, capture_calls
 
 # HF's near-universal name for the stateful KV/conv-cache object threaded through every causal-LM
 # submodule call. Replaying a captured call verbatim would bake in whatever cache state existed by the
 # time the hook fired during the one real forward pass used for capture (e.g. a decoder layer captured
 # mid-way through a 16-layer loop carries every EARLIER layer's cached K/V) -- silently wrong for a
 # submodule that must behave like a fresh, history-free call once traced and invoked standalone (the
-# submodule driver supplies its own KV-cache bookkeeping at the C++ level). Forcing this one kwarg to None
+# modular driver supplies its own KV-cache bookkeeping at the C++ level). Forcing this one kwarg to None
 # whenever present reproduces the affected model's own documented "no cache" default behavior.
 _CACHE_KWARG_NAMES = {"past_key_values", "past_key_value"}
 
 
 @dataclass
-class SubmoduleExportSpec:
+class ModularExportSpec:
     """Declares an HF causal-LM's prefix/repeated/suffix boundary -- the one piece of structure that
     isn't recoverable from `named_modules()` alone, since a `forward()` method is imperative Python,
     not a static graph. Attribute paths are dotted (e.g. "model.embed_tokens")."""
@@ -50,7 +50,7 @@ class SubmoduleExportSpec:
 
 
 @dataclass
-class SubmoduleExportResult:
+class ModularExportResult:
     program: Program
     num_layers: int
     layer_input_names: list
@@ -79,7 +79,7 @@ def _flatten_call(module: nn.Module, args: tuple, kwargs: dict):
     -- not one leaf per element -- because the engine's `loom.run_subgraph` supports exactly one
     output tensor per topology (data + its own shape, always exactly two Lua return values), so a
     once-computed shared value (e.g. LFM2's rotary table, traced as its own "aux" submodule in
-    export_submodules) can only ever be threaded into a repeated-block call as a single tensor.
+    export_modular) can only ever be threaded into a repeated-block call as a single tensor.
     Concatenating here and splitting back in `_replay` keeps that single-tensor boundary on both the
     producing and consuming side without the driver ever needing to know the original tuple shape."""
     kwargs = dict(kwargs)
@@ -178,11 +178,11 @@ def _trace_module(name: str, module: nn.Module, args: tuple, kwargs: dict, seq_l
     return mil_prog.functions["main"]
 
 
-def export_submodules(model: nn.Module, spec: SubmoduleExportSpec, dummy_inputs: dict,
-                       seq_len: int, max_seq_len: int = 4096) -> SubmoduleExportResult:
+def export_modular(model: nn.Module, spec: ModularExportSpec, dummy_inputs: dict,
+                    seq_len: int, max_seq_len: int = 4096) -> ModularExportResult:
     """Runs one real eager forward pass of `model` to capture every declared submodule's real call,
     then traces each standalone, assembling the results into one multi-Function Program. Returns the
-    Program alongside the layout metadata `apply_submodule_export` (exporter.py) needs to synthesize
+    Program alongside the layout metadata `apply_modular_export` (exporter.py) needs to synthesize
     the driver: which input name is the repeated block's hidden-states chain input, which input names
     the auxiliary submodule's outputs feed, and how many layers/suffix stages there are."""
     prefix_module = get_by_path(model, spec.prefix_attr)
@@ -234,7 +234,7 @@ def export_submodules(model: nn.Module, spec: SubmoduleExportSpec, dummy_inputs:
         prog.functions[name] = func
         suffix_names.append(name)
 
-    return SubmoduleExportResult(
+    return ModularExportResult(
         program=prog,
         num_layers=len(children),
         layer_input_names=layer_input_names,

@@ -27,7 +27,7 @@ already has a home for.
 | `DummyInputGenerator` | builds trace inputs from the config, no hand-written shapes | hand-written `torch.randn(...)` per script |
 | `ModelPatcher.patch_model_for_export()` | the wrapping, declared once per family | hand-written `nn.Module` wrappers per script |
 | `NormalizedConfig` | pulls `num_layers`/`hidden_size`/… from heterogeneous HF configs | ad hoc attribute reads |
-| submodel decomposition (`encoder_model.onnx`, `decoder_model_merged.onnx`) | family-level decision, not per-model | `SubmoduleExportSpec` (one family), profiles (R7) |
+| submodel decomposition (`encoder_model.onnx`, `decoder_model_merged.onnx`) | family-level decision, not per-model | `ModularExportSpec` (one family), profiles (R7) |
 | `ORTModelForCausalLM` / `ForSpeechSeq2Seq` / `ForCTC` | runtime entry points per task | Lua drivers + C++ backends, no unified surface |
 
 Three of the seven items (R3, R4, R5) are that programme. R1 and R2 are the two pieces of exporter
@@ -166,7 +166,7 @@ loom-export nvidia/parakeet-tdt-0.6b-v3 -o parakeet.gguf
 | `.inputs` / `.outputs` (named axes) | `OnnxConfig.inputs` | R1 |
 | `.generate_dummy_inputs()` | `DummyInputGenerator` | the `torch.randn` blocks in the current scripts |
 | `.patch_model_for_export()` | `ModelPatcher` | the wrapper classes in the current scripts (R4) |
-| `.decomposition` (which submodels, which driver) | `OnnxSeq2SeqConfigWithPast` | `SubmoduleExportSpec`, `IterativeRefinementSpec`, `NeMoASREncoderSpec` |
+| `.decomposition` (which submodels, which driver) | `OnnxSeq2SeqConfigWithPast` | `ModularExportSpec`, `IterativeRefinementSpec`, `NeMoASREncoderSpec` |
 | `TaskRegistry` | `TasksManager` | new; keyed on HF `config.json` `model_type`/`architectures`, and on the `target` class inside a `.nemo` archive |
 | `LoomModelForCTC` / `ForSpeechSeq2Seq` / `ForCausalLM` / `ForTextToSpeech` | `ORTModelFor*` | the Lua drivers + C++ backends behind one Python/C++ surface |
 
@@ -196,7 +196,7 @@ that determines what can be automated:
 | why a wrapper exists | necessary? | can it be declared instead of written? |
 |---|---|---|
 | reduce a multi-value `forward` to one tensor (the engine's one-output-per-topology rule) | yes | **yes** — `NeMoASREncoderSpec`'s `EncoderOutput` already does exactly this, as a validated claim |
-| call a submodule that is not the model's own `forward` (StyleTTS2 phases, Matcha's estimator) | yes | **yes** — an attribute path + a call signature, as `SubmoduleExportSpec` already declares |
+| call a submodule that is not the model's own `forward` (StyleTTS2 phases, Matcha's estimator) | yes | **yes** — an attribute path + a call signature, as `ModularExportSpec` already declares |
 | neutralize trace-hostile source code (`sequence_mask` with a dynamic `torch.full`, `.item()` calls, Python-side sampling loops) | yes | **partly** — these are genuine per-model monkeypatches; they belong in a `ModelPatcher` subclass, versioned with the family, not inline in a script |
 | import-order stubs (`transformers.dependency_versions_check`, `diffusers` version gates) | yes | **yes** — environment preparation is family-wide; `nemo_asr_export.prepare_nemo_environment()` is the pattern |
 | kwarg → positional adaptation for `torch.jit.trace` | yes | **yes** — mechanical, from the config's declared input names |
@@ -245,7 +245,7 @@ not enough to cost a template, which is P4's job per family.
    cosyvoice3, tada, voxtral-tts, pocket-tts, kugelaudio and voxcpm2 each have an AR token LM *and* a
    flow-matching/diffusion acoustic stage, so the hypothesis counted them twice. The axis that actually
    predicts exporter work is the **acoustic decoder**: flow-matching ODE (9) vs. RVQ/FSQ codec decoder
-   (11) vs. HiFi-GAN/iSTFT vocoder (7/8). The AR-LM half of all of them is `SubmoduleExportSpec`, done.
+   (11) vs. HiFi-GAN/iSTFT vocoder (7/8). The AR-LM half of all of them is `ModularExportSpec`, done.
    A fourth acoustic decoder appeared that the hypothesis filed under "one-offs": **mel-spectrogram TTS
    + HiFi-GAN** (fastpitch, speecht5, bananamind-tts), which shares its vocoder with 7/8.
 
@@ -253,7 +253,7 @@ not enough to cost a template, which is P4's job per family.
 |---|---|---|---|---|---|---|
 | 1 | **Conformer/FastConformer encoders** + CTC / TDT / RNNT heads | parakeet ×6, reazonspeech, `stt_*_fastconformer_ctc_*` ×4, canary-ctc, nemotron-streaming, **GigaAM v3 ×4** | 4 | ~13 (+4) | CTC head (done) / TDT / RNNT decode loop (host-side) | **mostly done** — `NeMoASREncoderSpec`; GigaAM needs a second loader (below) |
 | 2 | **Audio encoder + AR cross-attention decoder** (AED) | whisper (all sizes), distil-whisper, tiron, canary, cohere-asr ×2, firered-asr, firered-lid, moonshine ×3, moonshine-streaming, whisper-vad | 8 | ~12 | **cross-attention decoder loop with KV cache** — shared with family 6 | bespoke only — **no MIL export at all** |
-| 3 | **Speech-LLM adapters** (audio encoder → projector → causal LM) | voxtral, voxtral4b, qwen3-asr ×4, glm-asr, granite ×7, gemma4 ×2, higgs-stt, mimo-asr, canary-qwen, omniasr-llm ×2, moss ×3, vibevoice ×2, ark-asr, lfm2-audio ×2, mini-omni2, kyutai-stt ×2, funasr ×2 | 19 | **~36** | **a projector** (linear / 4-frame stack / Q-Former / VQAdaptor / GatedMLP) + embedding-injection driver | LM half done (`SubmoduleExportSpec`); encoder half is family 1 or 2 |
+| 3 | **Speech-LLM adapters** (audio encoder → projector → causal LM) | voxtral, voxtral4b, qwen3-asr ×4, glm-asr, granite ×7, gemma4 ×2, higgs-stt, mimo-asr, canary-qwen, omniasr-llm ×2, moss ×3, vibevoice ×2, ark-asr, lfm2-audio ×2, mini-omni2, kyutai-stt ×2, funasr ×2 | 19 | **~36** | **a projector** (linear / 4-frame stack / Q-Former / VQAdaptor / GatedMLP) + embedding-injection driver | LM half done (`ModularExportSpec`); encoder half is family 1 or 2 |
 | 4 | **CNN + transformer + CTC** | wav2vec2, data2vec, hubert, omniasr-ctc ×2, tada-aligner | 3 | ~6 | CTC head (already done for family 1) | not started; family-1-shaped |
 | 5 | **SANM / FunASR encoders** (+ CIF, + CTC) | funasr ×2, paraformer, sensevoice | 3 | ~4 | CIF predictor + NAR decoder (paraformer only) | not started |
 | 6 | **Encoder-decoder text** (translation) | m2m100, wmt21 ×2, madlad (T5) | 2 | ~4 | same decoder loop as family 2 | not started |
@@ -282,7 +282,7 @@ Ordering proposal, by coverage-per-effort (revised by the corrections above):
    family 3. Also the project's own reference model. Deliver the **cross-attention decoder loop** as the
    reusable half: it is also all family 6 needs, and it is the half families 1 and 3 do *not* provide.
 2. **GigaAM v3** (family 1) — cheapest flagship by graph work, most informative by plumbing; see below.
-3. **Composition/adapter template** (family 3), on top of Whisper + the existing `SubmoduleExportSpec`.
+3. **Composition/adapter template** (family 3), on top of Whisper + the existing `ModularExportSpec`.
    ~36 models, the single largest lever in the roadmap.
 4. **BERT token classifiers** (family 12) — trivially small, and it proves the registry works for a
    non-audio task.
@@ -368,9 +368,9 @@ atomic. Same model, same weights, three profiles:
 |---|---|---|---|---|---|
 | `monolithic` | 257 | 1353 MiB | 1353 MiB | **0** | 1 |
 | `atomic` | 313 | 1609 MiB | 1353 MiB | **256 MiB** | 21 |
-| `submodule` | 307 | 1609 MiB | 1353 MiB | **256 MiB** | 20 |
+| `modular` | 307 | 1609 MiB | 1353 MiB | **256 MiB** | 20 |
 
-Atomic and submodule are the same size to within 12 KB. And the entire 256 MiB is **one tensor**:
+Atomic and modular are the same size to within 12 KB. And the entire 256 MiB is **one tensor**:
 LFM2's tied embedding matrix, `[1024, 65536]`, stored twice — once as `prefix.module_weight` and once as
 `suffix_1.module_weight`. Every other duplicate in the file is a bias vector; they total 0.5 MiB.
 
@@ -385,7 +385,7 @@ it should be done regardless of what happens to atomic.
   `ScopeSource.TORCHSCRIPT_MODULE_NAME` metadata, with a regex fallback for hand-built programs — and if
   partitioning fails for any reason it **downgrades to monolithic with a warning** and produces a
   working-but-different model.
-* `submodule` **declares** the boundary (`SubmoduleExportSpec`), traces each piece independently, and
+* `modular` **declares** the boundary (`ModularExportSpec`), traces each piece independently, and
   re-derives the repeated blocks structurally (`find_repeated_blocks`) so a wrong claim raises
   immediately.
 
@@ -396,25 +396,25 @@ downgrade is a footgun — it is the same "produces something plausible instead 
 two shape bugs found this week.
 
 **Decision (approved): retire `profile="atomic"`.** Two profiles remain — `monolithic` (default) and
-`submodule` — and `submodule` is the only split mechanism. Steps:
+`modular` — and `modular` is the only split mechanism. Steps:
 
 1. dedup the writer (above), so the comparison is honest;
-2. show that `lfm2_350m_submodule` and `lfm2_350m_atomic` have the same *runtime* peak-activation
+2. show that `lfm2_350m_modular` and `lfm2_350m_atomic` have the same *runtime* peak-activation
    profile, not just the same topology count — this is the capability atomic was built for (defer
    intermediate-state memory to the driver instead of pre-allocating), and it is the only thing that
    would justify keeping two mechanisms;
 3. delete the `profile="atomic"` branch and keep scope-based partitioning *only* as an optional,
-   opt-in discovery aid for `SubmoduleExportSpec` (BACKLOG already tracks "Phase 2: fully automatic
+   opt-in discovery aid for `ModularExportSpec` (BACKLOG already tracks "Phase 2: fully automatic
    prefix/suffix boundary discovery" — that is the useful half of atomic, and it belongs there, where a
    wrong guess is checked against a declaration instead of silently exported).
 
 That leaves two profiles with a clear rule: **monolithic** when the whole graph fits one topology and
-speed matters; **submodule** when the driver should own activation memory or the model has real
+speed matters; **modular** when the driver should own activation memory or the model has real
 structural boundaries. Both are declared, neither silently degrades.
 
 Step 2 is a *nice-to-have measurement, not a blocker*: it is worth knowing whether the split profiles
 deliver the memory win they were built for, but the decision to remove atomic does not depend on the
-answer, since submodule provides the same per-layer topologies either way.
+answer, since modular provides the same per-layer topologies either way.
 
 ---
 
@@ -428,7 +428,7 @@ else — and against which R3/R4 are judged:
 | **Whisper** | 2 | bespoke converter only; no MIL export |
 | **NeMo ASR** (Conformer-CTC, Parakeet TDT/RNNT) | 1 | MIL export done, still a script per model |
 | **GigaAM v3** | 1 | never exported; gap in CrispASR too (see R5) |
-| **Qwen3** | causal LM / speech-LLM | `SubmoduleExportSpec` done for the base LM; ASR/TTS variants not started |
+| **Qwen3** | causal LM / speech-LLM | `ModularExportSpec` done for the base LM; ASR/TTS variants not started |
 
 "Covered" for a flagship means: the export script is deleted, the registry entry exists, and the
 numerical reference test runs against a GGUF produced by `loom-export <repo-id>`.
