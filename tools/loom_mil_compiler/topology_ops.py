@@ -20,13 +20,20 @@ carrying the per-topology output state. A handler returns nothing; it appends to
 `ctx.aliases` entries, and/or registers `self.weights` entries.
 """
 import hashlib
-import math
-import re
 import numpy as np
 from coremltools.converters.mil.mil import Var
 
+from .shape_expr import as_expr, render, to_number, N_TOKENS
 from .symbols import DYNAMIC_SYMBOL_RE as _DYNAMIC_SYMBOL_RE
 from .value_facts import static_array, static_ints, static_scalar, static_value
+
+
+def _attr_number_or_expr(value):
+    """One resolved quantity as a JSON attribute: a real number when it is one, else the rendered
+    expression string. Both are accepted by the engine's `resolve_attr_number`/`resolve_attr_int_array`,
+    and keeping the distinction is what makes this refactor a no-op for every already-static attribute."""
+    number = to_number(value)
+    return number if number is not None else render(value)
 
 
 class TopologyContext:
@@ -642,8 +649,10 @@ def _op_split(self, op, ctx):
 
     if isinstance(dim_to_split, int):
         split_dim_size = dim_to_split // num_splits
+        split_expr = as_expr(split_dim_size)
     else:
-        split_dim_size = f"({dim_to_split} / {num_splits})"
+        split_expr = as_expr(dim_to_split) / num_splits
+        split_dim_size = render(split_expr)
 
     # Create a VIEW node for each split output
     for idx, out_var in enumerate(op.outputs):
@@ -653,10 +662,10 @@ def _op_split(self, op, ctx):
         slice_shape[ne_axis] = split_dim_size
 
         # Calculate byte offset rule
-        offset_elements = f"{idx} * {split_dim_size}"
+        offset_elements = idx * split_expr
         for prev_ax in range(ne_axis):
-            offset_elements = f"({offset_elements} * {ne_shape[prev_ax]})"
-        offset_bytes = f"({offset_elements} * 4)" # 4 bytes per float element
+            offset_elements = offset_elements * as_expr(ne_shape[prev_ax])
+        offset_bytes = render(offset_elements * 4)  # 4 bytes per float element
 
         nodes.append({
             "op": "VIEW",
@@ -713,11 +722,14 @@ def _op_slice_by_index(self, op, ctx):
         if b_val is None:
             b_val = 0
         elif isinstance(b_val, (int, np.integer)) and b_val < 0:
-            b_val = (dim_size + int(b_val)) if isinstance(dim_size, int) else f"({dim_size} + ({int(b_val)}))"
+            # A negative (Python-style) index normalizes against the axis extent, which may itself be a
+            # symbolic expression -- composed as algebra rather than as an f-string, so a plain
+            # `x[..., :-1]` on a dynamic axis comes out as `n_tokens - 1` rather than nested parentheses.
+            b_val = (dim_size + int(b_val)) if isinstance(dim_size, int) else as_expr(dim_size) + int(b_val)
         if e_val is None:
             e_val = dim_size
         elif isinstance(e_val, (int, np.integer)) and e_val < 0:
-            e_val = (dim_size + int(e_val)) if isinstance(dim_size, int) else f"({dim_size} + ({int(e_val)}))"
+            e_val = (dim_size + int(e_val)) if isinstance(dim_size, int) else as_expr(dim_size) + int(e_val)
         resolved_begin[mil_axis] = b_val
         resolved_end[mil_axis] = e_val
 
@@ -746,27 +758,30 @@ def _op_slice_by_index(self, op, ctx):
             b_val = max(0, min(dim_size, b_val))
             e_val = max(0, min(dim_size, e_val))
             slice_shape.append(e_val - b_val)
-        elif b_val == 0 and str(e_val) == str(dim_size):
+        elif b_val == 0 and as_expr(e_val) == as_expr(dim_size):
+            # Structural equality on the expressions, not on their printed forms: two spellings of the
+            # same length ("n_tokens" vs "(n_tokens)") used to look like a real slice and emit a
+            # pointless `(end - begin)` string for an axis that is not sliced at all.
             slice_shape.append(dim_size)
         else:
-            slice_shape.append(f"({e_val} - {b_val})")
+            slice_shape.append(render(as_expr(e_val) - as_expr(b_val)))
 
     # Calculate byte offset in C-major MIL layout mapping to ne_shape strides. Uses
     # `resolved_begin` (mask-aware, negative-index-normalized) rather than the raw
     # `begin_list` for the same reason the shape derivation above needs it: an
     # ignored/negative begin must contribute its real (0 or normalized) value, not its raw
     # MIL-op placeholder.
-    offset_elements = "0"
+    offset_elements = as_expr(0)
     for i in range(rank):
         b_val = resolved_begin[i]
         if not (isinstance(b_val, int) and b_val == 0):
-            stride_product = "1"
+            stride_product = as_expr(1)
             ne_limit = rank - 1 - i
             for prev_ax in range(ne_limit):
-                stride_product = f"({stride_product} * {ne_shape[prev_ax]})"
-            offset_elements = f"({offset_elements} + ({b_val} * {stride_product}))"
+                stride_product = stride_product * as_expr(ne_shape[prev_ax])
+            offset_elements = offset_elements + as_expr(b_val) * stride_product
 
-    offset_bytes = f"({offset_elements} * 4)"
+    offset_bytes = render(offset_elements * 4)
 
     nodes.append({
         "op": "VIEW",
@@ -945,7 +960,7 @@ def _op_pad(self, op, ctx):
             right_edge = f"{output_var}_replpad_right_edge"
             nodes.append({
                 "op": "VIEW", "inputs": [resolve(x_var)], "outputs": [right_edge],
-                "attrs": {"shape": [1, *ne_rest], "offset": f"(({t_expr} - 1) * 4)"},
+                "attrs": {"shape": [1, *ne_rest], "offset": render((t_expr - 1) * 4)},
             })
             right_tile = f"{output_var}_replpad_right_tile"
             nodes.append({
@@ -1098,7 +1113,7 @@ def _op_tile(self, op, ctx):
             dim_int = int(dim_size)
             target_shape.append(str(dim_int * rep_factor))
         except (ValueError, TypeError):
-            target_shape.append(f"({dim_size} * {rep_factor})")
+            target_shape.append(render(as_expr(dim_size) * rep_factor))
 
     # Limit target shape strictly to 4D to satisfy GGML's maximum dimension limits
     while len(target_shape) > 4 and target_shape[-1] == "1":
@@ -1787,7 +1802,11 @@ def _op_range_1d(self, op, ctx):
     range_node = {"op": "RANGE_1D", "outputs": [self.safe_name(op.outputs[0].name)]}
     if start_resolved is not None and end_resolved is not None and step_resolved is not None:
         range_node["inputs"] = []
-        range_node["attrs"] = {"start": start_resolved, "end": end_resolved, "step": step_resolved}
+        range_node["attrs"] = {
+            "start": _attr_number_or_expr(start_resolved),
+            "end": _attr_number_or_expr(end_resolved),
+            "step": _attr_number_or_expr(step_resolved),
+        }
     else:
         range_inputs = []
         for v in (start_obj, end_obj, step_obj):
@@ -2022,8 +2041,8 @@ def _op_conv_transpose(self, op, ctx):
                       "attrs": {"lp0": 0, "rp0": s0 - 1}})
         overstuffed = f"{output_var}_dwt_overstuffed"
         nodes.append({"op": "RESHAPE", "inputs": [stuffed3], "outputs": [overstuffed],
-                      "attrs": {"shape": [f"({t_expr})*{s0}", channels]}})
-        std_len = f"(({t_expr})-1)*{s0}+1"
+                      "attrs": {"shape": [render(as_expr(t_expr) * s0), channels]}})
+        std_len = render((as_expr(t_expr) - 1) * s0 + 1)
         trunc_v = f"{output_var}_dwt_trunc_v"
         nodes.append({"op": "VIEW", "inputs": [overstuffed], "outputs": [trunc_v],
                       "attrs": {"shape": [std_len, channels]}})
@@ -2200,16 +2219,17 @@ def _less_is_always_valid_mask(self, op):
     # when range == length + 1 at EVERY probe; default to bypass otherwise (matching the
     # empirically-correct, more permissive behavior for everything else, including the
     # structurally-similar-looking but NOT-off-by-exactly-1-always encoder-level case).
-    def _norm_expr(e):
-        return re.sub(r"\s+", "", str(e)) if e is not None else None
-
     def _eval_expr(expr, n_tokens_value):
+        """`expr` at a concrete sequence length. Substituting into the sympy expression evaluates it
+        exactly, where the previous version round-tripped the expression through a string and `eval`
+        with `/` as float division. The decision this feeds is unchanged on every current model -- the
+        snapshot diff across all 12 shows no LESS node appearing or disappearing -- but there is no
+        re-parsing and no `eval` any more."""
         if expr is None:
             return None
         try:
-            return float(eval(expr.replace("n_tokens", str(n_tokens_value)),
-                               {"__builtins__": {}}, {"floor": math.floor}))
-        except Exception:
+            return float(as_expr(expr).subs(N_TOKENS, n_tokens_value))
+        except (TypeError, ValueError):
             return None
 
     x_var = op.inputs.get("x")
@@ -2226,8 +2246,8 @@ def _less_is_always_valid_mask(self, op):
         length_side_var = x_var
     bypass_ok = False
     if range_var is not None and length_side_var is not None:
-        range_expr = _norm_expr(self._infer_dynamic_dim_expr(range_var, 0))
-        length_expr = _norm_expr(self.facts.scalar_expr(length_side_var))
+        range_expr = self._infer_dynamic_dim_expr(range_var, 0)
+        length_expr = self.facts.scalar_expr(length_side_var)
         bypass_ok = True
         if range_expr is not None and length_expr is not None:
             always_off_by_exactly_one = True

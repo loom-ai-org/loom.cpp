@@ -50,85 +50,55 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > - "What is this Var's compile-time value / shape expression?" is answered in one place,
 >   `value_facts.py`, memoized per Var. The memo is load-bearing, not tidiness: without it the shape walk
 >   is exponential in encoder depth (see the Conformer entry below).
-> - Two family templates now exist — `submodule_export.py` (decoder-LLMs) and `iterative_export.py`
->   (Euler-CFM samplers) — and BACKEND.md's closing section argues that per-family templates, not
->   universal orchestration inference, are the direction that actually works, with the evidence for why.
+> - Three family templates now exist — `submodule_export.py` (decoder-LLMs), `iterative_export.py`
+>   (Euler-CFM samplers) and `nemo_asr_export.py` (NeMo ASR encoders) — and BACKEND.md's closing section
+>   argues that per-family templates, not universal orchestration inference, are the direction that
+>   actually works, with the evidence for why.
+> - Symbolic shape expressions are **sympy objects**, not concatenated strings (`shape_expr.py`).
+>   `render()` is the only thing that turns one into text, and it emits exactly `symbol_env.cpp`'s
+>   grammar or raises. Compose with `as_expr`/`floor_div` and render at the emission site; do not build
+>   a shape attribute with an f-string.
 > - **Any exporter change should be gated on `tools/loom_mil_compiler/snapshot_gguf.py`** — snapshot the
 >   exports before and after and require a zero-line `diff -r`. Its docstring has the recipe. The `.gguf`
 >   files in the tree are `.gitignore`d build outputs and are routinely stale; regenerate the baseline
 >   rather than diffing against them.
 
-### Next family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT)
+### Third family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT) — DONE
 
-Not started. The natural third family after `SubmoduleExportSpec` and `IterativeRefinementSpec`, and the
-cleanest remaining candidate: `export_conformer_ctc_mil.py` (93 lines), `export_parakeet_tdt_mil.py` (97),
-and `export_parakeet_rnnt_mil.py` (91) are near-identical, differing in exactly five things:
+`tools/loom_mil_compiler/nemo_asr_export.py`; the three export scripts are now a docstring plus a
+`NeMoASREncoderSpec`. Two findings worth keeping (both recorded in BACKEND.md with the evidence): only
+**three** of the five differing fields this entry predicted were real (the restore class dissolves —
+`ASRModel.restore_from` dispatches on the checkpoint's own config target and returns the identical
+concrete class), and the wrapper's return value became a validated `EncoderOutput` claim rather than a
+free-form expression. Verified byte-identical against a `git archive HEAD` baseline for all three models.
 
-| | Conformer-CTC | Parakeet-TDT | Parakeet-RNNT |
-|---|---|---|---|
-| checkpoint path | `models/conformer-ctc-small/…` | `parakeet_tdt_model/…` | `parakeet_rnnt_model/…` |
-| restore class | `EncDecCTCModel` | `ASRModel` | `ASRModel` |
-| wrapper returns | `log_probs` (of a 3-tuple) | `encoded.transpose(1, 2)` | `encoded.transpose(1, 2)` |
-| `architecture=` | `conformer-ctc` | `parakeet-tdt-encoder` | `parakeet-rnnt-encoder` |
-| output filename | … | … | … |
-
-Everything else is byte-identical boilerplate: the `transformers.dependency_versions_check` mock (NeMo
-imports transformers transitively via torchmetrics), the `nn.Module` wrapper reducing NeMo's output tuple
-to one tensor, `n_samples = 16000`, `ct.RangeDim(1600, 16000 * 20)`, `compute_precision=FLOAT32` (load
-bearing — see the CONV_2D FP16 entry below), and `profile="monolithic"`.
-
-Follow the shape the other two templates share, which BACKEND.md's closing section spells out: declare
-only what genuinely varies, re-derive everything else structurally, and make the spec fail loudly at
-export time when its claim and the real model disagree (`find_repeated_blocks` and
-`validate_against_topology` are the two existing precedents). Do **not** optimise for line count — item 4
-of the improvement thread measured that going *up*, and the real payoff was export-time validation.
-
-Verification is already in place; these three tests take the exported GGUF plus a reference fixture and
-are the gate:
-
-- `test_e2e_conformer_ctc_mil_export` — `LOOM_CONFORMER_CTC_DIR` (the model dir, containing `ref/`) +
-  `LOOM_CONFORMER_CTC_MIL_GGUF`. Current: 6/6, `max abs diff 1.6e-04`.
-- `test_e2e_parakeet_tdt_mil_export` — `LOOM_PARAKEET_TDT_DIR` + `LOOM_PARAKEET_TDT_MIL_GGUF`. 6/6, `5e-06`.
-- `test_e2e_parakeet_rnnt_mil_export` — `LOOM_PARAKEET_RNNT_DIR` + `LOOM_PARAKEET_RNNT_MIL_GGUF`. 6/6, `1.0e-05`.
-
-Note NeMo's `restore_from()` untars a multi-GB checkpoint into `TMPDIR`, and `/` has ~2 GB free on this
-machine — set `TMPDIR` somewhere under `/home` or the export dies with `OSError: No space left on device`.
+The three end-to-end tests remain the gate for any further change to this family (each takes the
+exported GGUF plus a reference fixture): `test_e2e_conformer_ctc_mil_export`
+(`LOOM_CONFORMER_CTC_DIR` + `LOOM_CONFORMER_CTC_MIL_GGUF`), `test_e2e_parakeet_tdt_mil_export`
+(`LOOM_PARAKEET_TDT_DIR` + `LOOM_PARAKEET_TDT_MIL_GGUF`), `test_e2e_parakeet_rnnt_mil_export`
+(`LOOM_PARAKEET_RNNT_DIR` + `LOOM_PARAKEET_RNNT_MIL_GGUF`).
 
 ### Open follow-ups from the exporter-improvement thread
 
-All three are recorded in full in BACKEND.md; this is the index.
+All are recorded in full in BACKEND.md; this is the index.
 
-- **Normalize the symbolic shape expressions — carry sympy objects instead of strings.**
-  `_infer_dynamic_dim_expr` composes deeply nested strings (`(floor(((1) * ((floor(((1) * …`) that are
-  algebraically trivial: the StyleTTS2 one reduces to plain `n_tokens`. Memoizing the walk fixed the
-  *time* blow-up (see the Conformer entry), but the emitted strings are still large and unreadable.
+- **Symbolic shape expressions carry sympy objects instead of strings — DONE.**
+  `tools/loom_mil_compiler/shape_expr.py` (+ `test_shape_expr.py`). The derivation walk composes algebra
+  and renders once at emission through a printer restricted to `symbol_env.cpp`'s grammar, which raises
+  on anything it cannot express rather than shipping unparseable text. Conformer-CTC's frame count went
+  from `(floor((((floor(((1) * (1) * ((((floor(((1) * (((1)+(((n_tokens) - (1)))))) / ((1) * (1))))) +
+  512))) / ((1))))) + 0 - 512) / 160) + 1)` to `floor(n_tokens/160) + 1`. Diffs were read rather than
+  required empty, via the new `tools/loom_mil_compiler/compare_snapshots.py` (evaluates every changed
+  attribute at 18 concrete lengths and reports anything not numerically equivalent as structural).
 
-  The promising route (user's suggestion, checked against the actual libraries):
-
-  - **sympy is already there, and MIL already speaks it.** `coremltools…mil.program.Symbol` *subclasses*
-    `sympy.core.symbol.Symbol`, and sympy is a declared dependency of coremltools — so this adds no new
-    dependency. Today the exporter is handed sympy expressions, stringifies them, and then rebuilds
-    expressions by f-string concatenation, which is strictly worse algebra than it started with.
-  - **MIL propagates real algebra where it can.** Probed on a conv stack: a `reshape` output comes back
-    as `shape=(1, 4*is2)` — a genuine compound sympy expression, not an opaque symbol. Seeding from
-    those rather than re-deriving them is free accuracy.
-  - **But the walk is still needed.** `conv` does *not* propagate: MIL mints a fresh opaque symbol per
-    conv (`is0` → `is1` → `is2`), discarding the length relation. So the hand-written conv/pool formulas
-    stay; the change is that they should compose sympy expressions rather than strings, and simplify at
-    the end.
-
-  **Hard constraint on emission.** The C++ consumer (`src/core/symbol_env.cpp`) is a small recursive-descent
-  parser supporting exactly `+ - * /`, unary minus, parentheses, identifiers, numbers, and the two
-  functions `floor(...)` and `sqrt(...)`. Sympy's default printer will happily emit `**`, `ceiling`,
-  `Min`/`Max`, `Piecewise`, `Rational` — none of which parse. So emit through a *restricted printer* that
-  maps onto that grammar and raises on anything outside it, rather than `str(expr)`. Extending
-  `symbol_env.cpp` (e.g. `ceiling`, `**`) is an alternative, but the printer should still assert rather
-  than emit silently-unparseable text.
-
-  Changes emitted shape attrs, so it needs its own snapshot run
-  (`tools/loom_mil_compiler/snapshot_gguf.py`) — expect diffs that are *shorter but equivalent*
-  expressions, which means the diff has to be read rather than required to be empty. Verify numerically
-  via the per-model reference tests, not just by export success.
+  Two things a future change here must not lose:
+  - **The assumptions are load-bearing.** Shape symbols are built as positive integers (`shape_expr.symbol`),
+    which is the only reason `floor(512*n_tokens/512)` reduces to `n_tokens` at all. A bare
+    `sympy.Symbol("n_tokens")` compares unequal to the interned one and silently stops cancelling.
+  - **`floor` arguments are recombined with `sympy.together` before printing.** Sympy distributes
+    rational coefficients over sums on construction (`floor((n-512)/160)` → `floor(n/160 - 16/5)`), and
+    the engine evaluates in `double`, where the distributed form takes three roundings inside a floor
+    instead of one.
 - **Multi-output topologies in `GraphBuilder`/`run_subgraph`.** The engine's one-output-tensor-per-topology
   convention is the single thing standing between the current state and inferring an
   `IterativeRefinementSpec` directly from a scripted-loop trace (a MIL loop body has one output per

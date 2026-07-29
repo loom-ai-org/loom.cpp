@@ -1,7 +1,9 @@
 import json
+import math
 import re
 import os
 import numpy as np
+import sympy
 from coremltools.converters.mil.mil import Block, Function, Operation, Var
 
 from .driver_ir import (
@@ -11,7 +13,9 @@ from .driver_ir import (
 )
 from .driver_ir import Function as IRFunction
 from .passes import apply_loom_mil_passes
-from .symbols import DYNAMIC_SYMBOL_RE as _DYNAMIC_SYMBOL_RE
+from .shape_expr import (
+    as_expr, floor_div, has_dynamic_symbol, render, sub_dynamic_symbols, N_TOKENS,
+)
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_scalar, static_value
 
@@ -139,11 +143,15 @@ class LoomGGUFExporter:
         # this class and the op-handler table -- see value_facts.py's own module docstring.
         self.facts = ValueFacts(self)
 
-    def _sub_symbol(self, s: str) -> str:
-        """Replaces every occurrence of a symbolic MIL dim (e.g. "is531") in `s` with its
-        `self.symbol_overrides` entry if the caller registered one for that exact raw symbol, else the
-        usual bare "n_tokens" fallback. See `symbol_overrides`' own docstring in __init__."""
-        return _DYNAMIC_SYMBOL_RE.sub(lambda m: self.symbol_overrides.get(m.group(0), "n_tokens"), s)
+    def _sub_symbol(self, dim):
+        """Replaces every symbolic MIL dim (e.g. "is531") in `dim` with its `self.symbol_overrides`
+        entry if the caller registered one for that exact raw symbol, else the usual bare "n_tokens"
+        fallback. See `symbol_overrides`' own docstring in __init__.
+
+        Substitution happens on the sympy expression MIL itself handed us -- coremltools' own `Symbol`
+        subclasses `sympy.Symbol`, so a compound dim like `4*is2 + 20` keeps its algebra rather than
+        being rebuilt from its printed form (see shape_expr.py's module docstring)."""
+        return sub_dynamic_symbols(dim, self.symbol_overrides)
 
     def safe_name(self, name: str) -> str:
         """
@@ -157,9 +165,11 @@ class LoomGGUFExporter:
         return name
 
     def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
-        """Memoizing entry point for the shape-expression walk below -- see `ValueFacts.dim_expr` for
-        why the memo is load-bearing rather than an optimization. `_seen` is accepted and ignored (every
-        recursive call site still threads it; the walk itself has had no cycle guard since a29ffe5)."""
+        """Memoizing entry point for the shape-expression walk below, returning a **sympy expression**
+        (or None) -- see `ValueFacts.dim_expr` for why the memo is load-bearing rather than an
+        optimization, and shape_expr.py for why the walk composes algebra rather than strings. `_seen`
+        is accepted and ignored (every recursive call site still threads it; the walk itself has had no
+        cycle guard since a29ffe5)."""
         return self.facts.dim_expr(var, torch_axis)
 
     def _infer_dynamic_dim_expr_uncached(self, var, torch_axis, _seen=None):
@@ -182,6 +192,15 @@ class LoomGGUFExporter:
         `x` input) -- any other producer, or a producer this walk can't fully explain, falls back to
         `get_var_info`'s original bare-substitution behavior, so every case this doesn't specifically
         understand is byte-identical to before this method existed.
+
+        Returns a **sympy expression** (see shape_expr.py), not a string: MIL hands this walk sympy
+        objects to begin with (`coremltools...mil.Symbol` subclasses `sympy.Symbol`), and composing the
+        conv/pool/pad formulas below as algebra rather than as f-strings is what lets an expression like
+        `floor(1 * n_tokens * 512 / 512)` collapse back to `n_tokens` instead of accumulating into the
+        unreadable nested-`floor` strings this used to emit. Rendering into the engine's expression
+        language happens once, where a shape attribute is actually emitted (`get_var_info`), so an
+        expression the engine could not parse raises there -- naming the construct -- rather than
+        shipping inside a GGUF and failing at model load.
         """
         # No cycle guard: MIL/SSA graphs are acyclic by construction (an op's inputs always name EARLIER-
         # defined vars, never itself), so a genuine infinite loop here isn't possible. A guard keyed on
@@ -195,8 +214,8 @@ class LoomGGUFExporter:
         if var.shape is None or torch_axis >= len(var.shape):
             return None
         dim = var.shape[torch_axis]
-        if not _DYNAMIC_SYMBOL_RE.search(str(dim)):
-            return str(dim)
+        if not has_dynamic_symbol(dim):
+            return as_expr(dim)
 
         op = var.op
         if op is None:
@@ -205,7 +224,7 @@ class LoomGGUFExporter:
             # more than one independently-traced dynamic LEAF input (Kokoro's "decoder_vocoder" -- see
             # symbol_overrides' own docstring) has NO data-flow path here to tell that apart from the
             # ordinary case, so an explicit caller-registered override always wins when present.
-            return self._sub_symbol(str(dim))
+            return self._sub_symbol(dim)
 
         _UNARY_PASSTHROUGH_OPS = {
             "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp",
@@ -266,10 +285,10 @@ class LoomGGUFExporter:
             # Q/K/V reshape's own output -- without this case, that walk gave up at "reshape" (no case
             # existed for it at all) and fell back to the same "n_tokens" substitution the Q reshape
             # itself needed `facts.reshape_shape` to avoid).
-            resolved = self.facts.reshape_shape(op)
+            resolved = self.facts.reshape_shape_exprs(op)
             if resolved is not None and torch_axis < len(resolved):
                 if resolved[torch_axis] != -1:
-                    return str(resolved[torch_axis])
+                    return resolved[torch_axis]
                 # A literal -1 at this axis is PyTorch's own "infer this dim" marker (real, correctly
                 # left as-is for op_reshape's OWN build-time element-count inference when THIS node's
                 # JSON gets built -- see the "reshape" translation branch above) -- but a caller here
@@ -294,9 +313,13 @@ class LoomGGUFExporter:
                     x_axis_exprs = [self._infer_dynamic_dim_expr(x_var, a) for a in range(len(x_var.shape))]
                     other_exprs = [resolved[a] for a in range(len(resolved)) if a != torch_axis]
                     if all(e is not None for e in x_axis_exprs) and all(e != -1 for e in other_exprs):
-                        total_expr = " * ".join(f"({e})" for e in x_axis_exprs)
-                        other_expr = " * ".join(f"({e})" for e in other_exprs) if other_exprs else "1"
-                        return f"(floor(({total_expr}) / ({other_expr})))"
+                        total_expr = math.prod(x_axis_exprs, start=as_expr(1))
+                        other_expr = math.prod(other_exprs, start=as_expr(1))
+                        # The division is exact whenever the reshape is (it redistributes the same
+                        # elements), so this is where carrying algebra pays for itself most visibly:
+                        # StyleTTS2's diffusion axis, `floor(1 * n_tokens * 512 / 512)`, cancels back
+                        # to plain `n_tokens` instead of nesting another floor() around the last one.
+                        return floor_div(total_expr, other_expr)
 
         if op.op_type == "range_1d" and torch_axis == 0:
             # `range_1d`'s own output LENGTH is a real formula over its start/end/step, using the exact
@@ -309,9 +332,10 @@ class LoomGGUFExporter:
             end_e = self.facts.range_scalar(op.inputs.get("end"))
             step_e = self.facts.range_scalar(op.inputs.get("step"))
             if start_e is not None and end_e is not None and step_e is not None:
-                if start_e in (0, 0.0) and step_e in (1, 1.0):
-                    return str(end_e)
-                return f"(floor((({end_e}) - ({start_e})) / ({step_e})))"
+                start_e, end_e, step_e = as_expr(start_e), as_expr(end_e), as_expr(step_e)
+                if start_e == 0 and step_e == 1:
+                    return end_e
+                return floor_div(end_e - start_e, step_e)
 
         if op.op_type == "conv":
             x_var = op.inputs.get("x")
@@ -332,7 +356,7 @@ class LoomGGUFExporter:
             # unresolvable here), the remaining `rank - 2` axes are the real spatial ones this formula
             # applies to, in the same order for `x` and its output (conv never permutes spatial axes).
             if torch_axis == 0:
-                return "1"
+                return as_expr(1)
             if torch_axis == 1:
                 return None
             spatial_idx = torch_axis - 2
@@ -349,7 +373,7 @@ class LoomGGUFExporter:
             in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
             if in_expr is None:
                 return None
-            return f"(floor((({in_expr}) + {pad_before + pad_after} - {eff_kernel}) / {stride}) + 1)"
+            return floor_div(in_expr + (pad_before + pad_after) - eff_kernel, stride) + 1
 
         if op.op_type in ("upsample_nearest_neighbor", "upsample_bilinear"):
             # MIL's `upsample_nearest_neighbor`/`upsample_bilinear` (core ops, see the matching op_type
@@ -378,7 +402,7 @@ class LoomGGUFExporter:
                 return None
             if scale == 1.0:
                 return in_expr
-            return f"(floor(({in_expr})*{scale}))"
+            return sympy.floor(in_expr * as_expr(scale))
 
         if op.op_type == "conv_transpose":
             # Mirrors the "conv" case just above, using ConvTranspose1d/2d's own inverse length
@@ -398,7 +422,7 @@ class LoomGGUFExporter:
                 return None
             rank = len(var.shape)
             if torch_axis == 0:
-                return "1"
+                return as_expr(1)
             if torch_axis == 1:
                 return None
             spatial_idx = torch_axis - 2
@@ -414,7 +438,7 @@ class LoomGGUFExporter:
             in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
             if in_expr is None:
                 return None
-            return f"((({in_expr}) - 1) * {stride} - {pad_before + pad_after} + {eff_kernel})"
+            return (in_expr - 1) * stride - (pad_before + pad_after) + eff_kernel
 
         if op.op_type == "matmul":
             # `matmul(x, y, transpose_x, transpose_y)`'s output rank-2 axes: the last axis comes from
@@ -481,7 +505,7 @@ class LoomGGUFExporter:
                 rep = int(reps_val[torch_axis])
                 in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
                 if in_expr is not None:
-                    return in_expr if rep == 1 else f"({in_expr} * {rep})"
+                    return in_expr if rep == 1 else in_expr * rep
             elif x_var is not None and x_var.shape is not None and torch_axis < len(x_var.shape):
                 # `reps` itself is unavailable (poisoned by the same "computed via a runtime shape
                 # query" tracing artifact as the GQA case), so the real multiplier can't be read for
@@ -490,7 +514,7 @@ class LoomGGUFExporter:
                     # The input axis is a literal, static 1 -- exactly the shape a batch-broadcast tile
                     # has, and this exporter's whole design never targets real multi-batch inference
                     # (every declared model input's own batch axis is a literal 1) -- resolves to "1".
-                    return "1"
+                    return as_expr(1)
                 # The input axis is ALREADY dynamic (not a static 1) -- a genuine multiplicative tile of
                 # an already-dynamic axis is exactly what passes.py's dedicated `fuse_gqa_repeat_kv` MIL
                 # pass exists to intercept and compose correctly (see EXPORT-BACKLOG.md); any plain
@@ -521,7 +545,7 @@ class LoomGGUFExporter:
                             sorted((int(a) + in_rank if a < 0 else int(a)) for a in axes_val)
                 if op.op_type == "expand_dims":
                     if torch_axis in norm_axes:
-                        return "1"
+                        return as_expr(1)
                     shift = sum(1 for a in norm_axes if a < torch_axis)
                     in_axis = torch_axis - shift
                     if 0 <= in_axis < in_rank:
@@ -581,7 +605,7 @@ class LoomGGUFExporter:
                     lp, rp = int(pad_val[-2]), int(pad_val[-1])
                     in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
                     if in_expr is not None:
-                        return in_expr if lp == 0 and rp == 0 else f"(({in_expr}) + {lp + rp})"
+                        return in_expr if lp == 0 and rp == 0 else in_expr + (lp + rp)
 
         if op.op_type == "slice_by_index":
             # A `pe[:, start:end]`-style dynamic slice: the real length on `torch_axis` is `end - begin`,
@@ -609,46 +633,59 @@ class LoomGGUFExporter:
             # gather(shape(x), 1)`, resolved via `facts.scalar_expr`'s arithmetic-walk) -- both are
             # equally valid as the subtrahend in `end - begin` below, so both are kept, not just ints.
             if is_begin_masked:
-                begin_expr = "0"
+                begin_expr = as_expr(0)
             else:
                 resolved_begin = self.facts.slice_axis_value(begin_var, torch_axis)
                 if isinstance(resolved_begin, int) and resolved_begin >= 0:
-                    begin_expr = str(resolved_begin)
-                elif isinstance(resolved_begin, str):
+                    begin_expr = as_expr(resolved_begin)
+                elif isinstance(resolved_begin, sympy.Basic):
                     begin_expr = resolved_begin
                 else:
                     begin_expr = None
 
             end_expr = None
+            end_is_guess = False
             if x_var is not None and x_var.shape is not None and torch_axis < len(x_var.shape):
                 if is_end_masked:
                     end_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
                 else:
                     resolved_end = self.facts.slice_axis_value(end_var, torch_axis)
                     if resolved_end is not None:
-                        end_expr = str(resolved_end) if isinstance(resolved_end, int) else resolved_end
-                if end_expr is None or end_expr == "n_tokens":
-                    # An unresolved (None) or bare-"n_tokens" `end` is almost certainly this walk
-                    # bottoming out somewhere inside the `end` chain, NOT a genuine answer -- confirmed on
-                    # two distinct real cases: Conformer-CTC's `att_mask = fill[0:current_lengths,
-                    # 0:current_lengths]` (`current_lengths` derived from the REAL "length" graph INPUT's
-                    # own runtime VALUE via ADD/DIV/floor_div, architecturally impossible to resolve into
-                    # a SymbolEnv shape expression at all -- SymbolEnv only ever binds compile-time shape
-                    # quantities like n_tokens, never a tensor's actual data, the same "value only exists
-                    # after graph compute" limit `facts.gather_shape_value`'s docstring documents
-                    # for RANGE_1D) and the positional-encoding table crop (`self.pe[:, start:end]`, whose
-                    # `end` is a real ARITHMETIC EXPRESSION over a gather -- `center + t` -- that
-                    # `facts.range_scalar`'s narrower "exact gather(shape(x), idx)" pattern match can't
-                    # see through at all, returning None outright). But this whole exporter already
-                    # assumes single-utterance, no-padding inference everywhere else (e.g. the always-1
-                    # batch axis) -- under that assumption BOTH values are ALWAYS numerically equal to
-                    # `x`'s own real (allocated) extent, so trusting `x`'s own extent here is correct for
-                    # every case this exporter targets, not just a guess.
+                        end_expr = as_expr(resolved_end)
+                    end_is_guess = self.facts.slice_axis_is_guess(end_var, torch_axis)
+                if end_expr is None or end_is_guess:
+                    # An `end` that resolved to nothing, or only to `facts.scalar_expr`'s producer-less
+                    # fallback, is this walk bottoming out inside the `end` chain rather than a genuine
+                    # answer -- confirmed on two distinct real cases: Conformer-CTC's
+                    # `att_mask = fill[0:current_lengths, 0:current_lengths]` (`current_lengths` derived
+                    # from the REAL "length" graph INPUT's own runtime VALUE via ADD/DIV/floor_div,
+                    # architecturally impossible to resolve into a SymbolEnv shape expression at all --
+                    # SymbolEnv only ever binds compile-time shape quantities like n_tokens, never a
+                    # tensor's actual data, the same "value only exists after graph compute" limit
+                    # `facts.gather_shape_value`'s docstring documents for RANGE_1D) and the
+                    # positional-encoding table crop (`self.pe[:, start:end]`, whose `end` is a real
+                    # ARITHMETIC EXPRESSION over a gather -- `center + t` -- that `facts.range_scalar`'s
+                    # narrower "exact gather(shape(x), idx)" pattern match can't see through at all,
+                    # returning None outright). But this whole exporter already assumes single-utterance,
+                    # no-padding inference everywhere else (e.g. the always-1 batch axis) -- under that
+                    # assumption BOTH values are ALWAYS numerically equal to `x`'s own real (allocated)
+                    # extent, so trusting `x`'s own extent here is correct for every case this exporter
+                    # targets, not just a guess.
+                    #
+                    # The test is `facts.slice_axis_is_guess`, i.e. the *provenance* of the answer, not
+                    # its spelling. It used to be a comparison against the literal string "n_tokens",
+                    # which worked only because a genuinely-derived length happened to come out spelled
+                    # `floor((n_tokens + 0 - 1) / 1) + 1` instead. Normalizing expressions made those
+                    # two identical and broke the accident in two models at once: SupertonicTTS's VFE
+                    # (a const `text_attn.increments` table of declared shape (1, 1000, 1) cropped to
+                    # `[:, :n_tokens]`, which then took the literal 1000) and VITS's relative-position
+                    # reshape (whose `x` extent is `n_tokens + 1`, one too many). Both are real
+                    # derivations off a `gather(shape(...))`, and both must be kept. See BACKEND.md.
                     x_full_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
-                    if x_full_expr is not None and x_full_expr != "n_tokens":
+                    if x_full_expr is not None and x_full_expr != N_TOKENS:
                         end_expr = x_full_expr
             if end_expr is not None and begin_expr is not None:
-                return end_expr if begin_expr == "0" else f"(({end_expr}) - ({begin_expr}))"
+                return end_expr if begin_expr == 0 else end_expr - begin_expr
 
         if op.op_type == "split":
             # `split(x, axis, num_splits/split_sizes)` divides `x` into N outputs along `axis` -- every
@@ -691,8 +728,8 @@ class LoomGGUFExporter:
                         part_expr = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
                         if part_expr is None:
                             return None
-                        parts.append(f"({part_expr})")
-                    return "(" + "+".join(parts) + ")"
+                        parts.append(part_expr)
+                    return sum(parts, as_expr(0))
 
         if op.op_type == "transpose":
             # `output.shape[i] = input.shape[perm[i]]` (MIL's own semantics, same as the "transpose"
@@ -730,7 +767,7 @@ class LoomGGUFExporter:
                     out_rank = len(var.shape)
                     stack_axis = int(axis_val) + out_rank if axis_val < 0 else int(axis_val)
                     if torch_axis == stack_axis:
-                        return str(len(values))
+                        return as_expr(len(values))
                     shift = 1 if stack_axis < torch_axis else 0
                     in_axis = torch_axis - shift
                     if 0 <= in_axis < len(first.shape):
@@ -775,10 +812,10 @@ class LoomGGUFExporter:
                 operand = op.inputs.get(operand_key)
                 if operand is None or not isinstance(operand, Var) or operand.shape is None or torch_axis >= len(operand.shape):
                     continue
-                if not _DYNAMIC_SYMBOL_RE.search(str(operand.shape[torch_axis])):
+                if not has_dynamic_symbol(operand.shape[torch_axis]):
                     continue
                 inferred = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
-                if inferred is not None and inferred != "1":
+                if inferred is not None and inferred != 1:
                     return inferred
                 if first_resolved is None:
                     first_resolved = inferred
@@ -797,7 +834,7 @@ class LoomGGUFExporter:
             # is never genuinely the sequence-length axis for any real input this exporter targets. A
             # model that genuinely needed a non-1 batch axis 0 would surface as a numerical mismatch
             # against the reference model here, not a syntax error.
-            return "1"
+            return as_expr(1)
 
         # Any other producer (pad/expand_dims/squeeze/etc.): not a transform this walk understands, but
         # also not necessarily wrong to keep walking from -- fall back to a bare symbol substitution
@@ -807,7 +844,7 @@ class LoomGGUFExporter:
         # not a bare symbol) -- substituting the base symbol there ("n_tokens + 512") and letting the
         # conv branch above apply its own formula on top gives the right answer without this walk needing
         # to specifically understand every intermediate op type between the true input and the first conv.
-        return self._sub_symbol(str(dim))
+        return self._sub_symbol(dim)
 
     def _find_range_1d_var(self, var, depth=0, _seen=None):
         """
@@ -920,8 +957,7 @@ class LoomGGUFExporter:
                 # (src/core/symbol_env.cpp) supports `+ - * / ()`, so substituting every symbol occurrence
                 # with "n_tokens" and keeping the surrounding arithmetic intact lets GraphBuilder evaluate
                 # the whole expression correctly at build time instead.
-                dim_str = str(dim)
-                if _DYNAMIC_SYMBOL_RE.search(dim_str):
+                if has_dynamic_symbol(dim):
                     # Always try the real conv/cast/pad/concat/upsample-aware derivation first (see
                     # _infer_dynamic_dim_expr's own docstring for why blind substitution isn't always
                     # correct) -- this used to be gated behind "only for a BARE lone symbol, or an
@@ -941,9 +977,9 @@ class LoomGGUFExporter:
                     # "n_tokens + 20" instead of the real "600*n_tokens + 20").
                     torch_axis = list(var.shape).index(dim)
                     inferred = self._infer_dynamic_dim_expr(var, torch_axis)
-                    shape.append(inferred if inferred is not None else self._sub_symbol(dim_str))
+                    shape.append(render(inferred if inferred is not None else self._sub_symbol(dim)))
                 else:
-                    shape.append(dim_str)
+                    shape.append(str(dim))
         
         # Loom expects fast-varying dimension first, so reverse standard shape order
         reversed_shape = list(reversed(shape))

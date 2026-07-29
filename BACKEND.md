@@ -16,6 +16,8 @@ Item 5 (empirically prototype StableHLO) is deliberately not started — the pro
 | 5 — StableHLO prototype | not started (per the proposal) | — |
 | — StyleTTS2 regression (found here) | fixed and numerically re-verified | `topology_ops.py` `reduce_mean` guards |
 | — Conformer/Parakeet export blow-up (found here) | bisected to `a29ffe5`, fixed; >2 h (never finished) → 40 s | `value_facts.py` `dim_expr` memo |
+| — NeMo ASR encoder template (third family) | done, all three exports byte-identical | `nemo_asr_export.py`, `test_nemo_asr_export.py`; the three `export_*_mil.py` scripts |
+| — sympy shape expressions | done; all 4,081 rewritten expressions checked numerically, which found (and got fixed) a pre-existing bug in a heuristic that was keying on an expression's spelling | `shape_expr.py`, `test_shape_expr.py`, `compare_snapshots.py` |
 
 Three bugs surfaced along the way and all are fixed. Two pre-dated this work: StyleTTS2's export was
 already broken at `HEAD`, and the Conformer-CTC/Parakeet exports had regressed into an exponential
@@ -544,9 +546,180 @@ re-derive everything else structurally, and make the spec fail loudly at export 
 the real model disagree.** That is what makes a template worth more than the hand-written code it
 replaces — not the line count (see item 4's own measurements, where the count went up).
 
-A candidate next family, when it comes up: NeMo-style ASR encoders (Conformer-CTC, Parakeet-TDT/RNNT)
-already share a preprocessor → encoder → decoder shape and a common length-masking idiom, and are
-currently three near-identical export scripts.
+That candidate next family — NeMo-style ASR encoders — is now built; see the next section. It is the
+third worked example of the pattern, and the first one where "re-derive everything else structurally"
+*removed* a field the plan had assumed was real.
+
+## Third family template — NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT)
+
+**Status:** implemented; all three exports byte-identical to their pre-template baselines.
+
+`tools/loom_mil_compiler/nemo_asr_export.py` holds `NeMoASREncoderSpec` + `EncoderOutput` +
+`export_nemo_asr_encoder`. The three export scripts are now a docstring, a spec, and a call:
+
+```python
+SPEC = NeMoASREncoderSpec(
+    checkpoint="/home/flavio/Dev/models/conformer-ctc-small/stt_en_conformer_ctc_small.nemo",
+    output=EncoderOutput.CTC_LOG_PROBS,
+    architecture="conformer-ctc",
+    output_path="conformer_ctc_small_mil_monolithic.gguf",
+)
+```
+
+**Finding — only three of the five predicted fields were real.** BACKLOG.md's entry listed five things
+differing between the scripts. Two dissolved on contact:
+
+* **The restore class is not a variable.** `EncDecCTCModel.restore_from` and `ASRModel.restore_from`
+  return the *identical* concrete class for the Conformer-CTC checkpoint —
+  `nemo...ctc_bpe_models.EncDecCTCModelBPE`, with identical state-dict keys (checked directly against
+  the real checkpoint, not assumed). NeMo's `restore_from` dispatches on the config's own `target`, so
+  naming a subclass never selected anything; all three now load through the base `ASRModel`.
+* **The wrapper's return value became a claim to be checked rather than an expression to be declared.**
+  `EncoderOutput` has two members, each naming a *model family* and carrying why that family's graph
+  boundary falls where it does (a CTC decoder is one 1x1 conv and stays in the graph; an RNNT/TDT
+  prediction net is an autoregressive LSTM + joint and stays host-side). Each knows its own `forward`
+  arity, which axis carries channels, and where the expected channel count is read from
+  (`decoder.num_classes_with_blank` vs `cfg.encoder.d_model`), so pointing a `CTC_LOG_PROBS` spec at an
+  RNNT checkpoint raises `NeMoASREncoderSpec declares output=CTC_LOG_PROBS, whose family's forward()
+  returns 3 values, but EncDecRNNTBPEModel.forward() returned 2` — before the encoder is traced.
+
+Everything else moved into the template as family-wide fact rather than per-script boilerplate: the
+sample rate is read from `model.cfg.preprocessor.sample_rate` and the trace length (1 s) and `RangeDim`
+bounds (0.1 s .. 20 s) derived from it instead of three copies of `16000`/`1600`/`320000`; the
+`transformers.dependency_versions_check` stub and the `TMPDIR` routing (NeMo untars a multi-GB
+checkpoint, and `/` has ~2 GB free) are one documented function; and `compute_precision=FLOAT32` is
+stated once, as the load-bearing CONV_2D-precision fix it is, rather than three times as a comment.
+
+**Finding — validation has to run on the model's own output, not on the wrapper's.** The first version
+validated the tensor the wrapper *returns*, which meant binding it to a local (`selected = ...`). That
+alone changed both Parakeet exports: `torch.jit.trace` names a traced value after the Python name it is
+bound to, so the topology's declared output went from `var_4640` to `selected` — otherwise byte-identical.
+The golden diff caught it. Validation now inspects `outputs[0]` in NeMo's own `(B, D, T)` layout (hence
+`channel_axis`), and `select()` is a single expression with no intermediate name.
+
+**Verification.** Re-exported all three from the template — with the exporter itself held at `HEAD`, so
+the diff could only be the template's doing — and snapshot-diffed against a pristine `git archive HEAD`
+baseline: `conformer_ctc_small_mil_monolithic`, `parakeet_tdt_encoder_mil_monolithic` and
+`parakeet_rnnt_encoder_mil_monolithic` are **byte-identical**, every metadata KV, the whole topology JSON
+and every tensor digest. The three reference tests still pass at their existing tolerances
+(`0.000164` / `0.000005` / `0.000010`). `tools/loom_mil_compiler/test_nemo_asr_export.py` (13 tests)
+covers the validation paths without needing NeMo or a checkpoint — a fake model reproduces each mismatch
+shape, including the headline "CTC spec pointed at an RNNT checkpoint" case.
+
+## Symbolic shape expressions carry sympy, not strings
+
+**Status:** implemented (the first of BACKLOG.md's three open follow-ups).
+
+New `tools/loom_mil_compiler/shape_expr.py`. The derivation walk in `_infer_dynamic_dim_expr_uncached`
+and every derived value in `value_facts.py` now compose **sympy expressions**, and `render()` turns one
+into text exactly once, where a JSON attribute is emitted. The size of the improvement is easiest to see
+on Conformer-CTC's STFT frame count, which appears in dozens of shape attributes:
+
+```
+before  (floor((((floor(((1) * (1) * ((((floor(((1) * (((1)+(((n_tokens) - (1)))))) / ((1) * (1)))))
+         + 512))) / ((1))))) + 0 - 512) / 160) + 1)
+after   floor(n_tokens/160) + 1
+```
+
+Three things make it work, and each is load-bearing rather than stylistic:
+
+* **Shape symbols are declared positive integers** (`shape_expr.symbol`, which also interns them).
+  `floor(512*n_tokens/512)` only reduces to `n_tokens` because sympy knows the symbol is an integer; and
+  because assumptions participate in sympy's structural equality, a bare `sympy.Symbol("n_tokens")` built
+  anywhere else would compare unequal and silently stop cancelling.
+* **`render` is a restricted printer, not `str(expr)`.** `src/core/symbol_env.cpp` accepts only
+  `+ - * /`, unary minus, parentheses, identifiers, numbers, `floor()` and `sqrt()`, evaluated in
+  `double`. Sympy's default printer emits `**`, `ceiling`, `Min`/`Max` and `Piecewise` happily, none of
+  which parse — so `render` maps onto that grammar and raises `UnsupportedShapeExpression` naming the
+  construct, rather than shipping text that fails at model load. Integer powers become repeated products;
+  `sqrt` is the only function besides `floor`.
+* **`floor` arguments are recombined with `sympy.together` before printing.** Sympy distributes a
+  rational coefficient over a sum on construction, so `floor((n_tokens - 512)/160)` *becomes*
+  `floor(n_tokens/160 - 16/5)`. Mathematically identical, but the engine evaluates in floating point,
+  where the distributed form takes three roundings inside the floor instead of one — enough to flip it at
+  an exact boundary.
+
+`parse()` implements the same grammar (hand-written, mirroring the C++ evaluator rather than using
+`sympify`), so `parse(render(e))` round-trips by construction. That is what lets a call site holding an
+already-rendered dim string — `slice_by_index`'s `(end - begin)` and byte offsets, `split`'s stride
+products, `tile`'s target shape — lift it back into algebra and keep composing instead of concatenating
+strings. Those offsets collapse too; from the same Conformer-CTC topology:
+
+```
+before  ((0 + (((5000) - ((floor((((floor((((floor((((floor(((1) * (1) * ((((floor(((1) * (((1)+(((n_tokens)
+         - (1)))))) / ((1) * (1))))) + 512))) / ((1))))) + 0 - 512) / 160) + 1)) + 2 - 3) / 2) + 1)) + 2 - 3)
+         / 2) + 1))) * (1 * 176))) * 4)
+after   3519296 - 704*floor(floor(floor(n_tokens/160)/2)/2)
+```
+
+**Finding — a heuristic was keying on an expression's *spelling*, and normalization exposed it.**
+`slice_by_index`'s derivation treats an `end` that comes back as bare `n_tokens` as "the walk bottomed
+out inside the `end` chain, trust `x`'s own extent instead" — correct, and necessary, for the two
+Conformer-CTC cases it was written for (an `end` derived from the length input's runtime *value*, which
+no shape expression can express). The test for "bottomed out" was a comparison against the literal string
+`"n_tokens"`, and it worked only because a *genuinely derived* sequence length happened to come out
+spelled `floor((n_tokens + 0 - 1) / 1) + 1` instead. Simplification made the two spellings identical and
+the accident stopped working — in two models at once, both silently:
+
+| model | `end` (genuinely derived) | `x`'s own extent, wrongly substituted |
+|---|---|---|
+| SupertonicTTS VFE | `n_tokens` — a const `text_attn.increments` table of declared shape `(1, 1000, 1)` cropped to `[:, :n_tokens]` | the literal **1000**, baking the trace-time length into 16 downstream shapes |
+| VITS `logw`/`stats` | `n_tokens` — the relative-position reshape's own axis | **`n_tokens + 1`**, one element longer than the parent it views |
+
+The fix is to test the answer's **provenance** instead of its spelling: `ValueFacts` now records, next to
+each derived scalar, whether it rests on the producer-less-var fallback (the single place a `n_tokens` is
+guessed rather than derived) and propagates that flag through the passthrough/select/arithmetic cases, so
+`facts.slice_axis_is_guess()` answers the question the heuristic was actually asking. A `gather(shape(x))`
+derivation is never a guess, however much its answer looks like one. Both models are back to their
+baseline values, and the Conformer-CTC cases still take the override.
+
+This is a pre-existing bug in the heuristic, not a sympy artifact — normalization only made it reachable.
+It is also the one that justifies the whole verification approach below: nothing about either export
+failed, and both wrong shapes were still *shapes*.
+
+**Verification — the diff is read, not required to be empty.** This change rewrites every symbolic shape
+attribute by design, so `diff -r` cannot be the gate. New `tools/loom_mil_compiler/compare_snapshots.py`
+walks two snapshot trees in parallel and, for every differing value, evaluates **both** sides at 18
+concrete sequence lengths (odd, even, off-by-one neighbours, and the ends of the declared dynamic range)
+using the same grammar the engine uses; anything that is not numerically equivalent at every probe — or
+that is not an expression pair at all (a renamed node, a changed op, a different node count, a moved
+tensor) — is reported as structural. That check is what found both bugs above, in a diff of 4,081
+rewritten expressions across 12 models where reading by eye would not have: 28 wrong values, each one a
+plausible-looking shape string sitting among hundreds of correct ones.
+
+Final state, all 12 models re-exported from the working tree against the `git archive HEAD` baseline:
+
+| model | expressions rewritten | structural differences |
+|---|---|---|
+| `conformer_ctc_small_mil_monolithic` | 294 | 0 |
+| `parakeet_tdt_encoder_mil_monolithic` / `..._rnnt_...` | 426 / 426 | 0 / 0 |
+| `qwen3_0.6b_mil_monolithic` | 448 | 0 |
+| `lfm2_350m_monolithic` / `_atomic` / `_submodule` | 176 / 176 / 200 | 0 |
+| `vits_mil` | 531 | 0 |
+| `kokoro_mil` | 263 | 0 |
+| `matcha_mil` | 419 | 0 |
+| `supertonic_mil` | 443 | 0 |
+| `styletts2_mil` | 279 | 0 |
+
+And numerically, against the real reference fixtures rather than against another export — every MIL
+reference test at the tolerance it already had:
+
+| test | result |
+|---|---|
+| `test_e2e_conformer_ctc_mil_export` | passed, `max abs diff = 0.000164` |
+| `test_e2e_parakeet_tdt_mil_export` / `_rnnt_` | passed, `0.000005` / `0.000010` |
+| `test_e2e_lfm2_mil_export` (atomic + monolithic) | passed, every greedy top-1 token matched |
+| `test_e2e_vits_mil_flow_vocoder_reference` | passed, `max_abs_diff = 5.7e-07` at Tp=194 |
+| `test_e2e_matcha_mil_text_encoder` / `_decoder` / `_vocoder` | passed, `1.2e-04` / `4.5e-04` / `4.2e-05` |
+| `test_e2e_supertonic_mil_dp` / `_vfe` | passed, `v_max_abs_diff = 5.1e-06` |
+| `test_e2e_styletts2_mil_albert_reference` / `_diffusion_` / `_decoder_vocoder_` | passed, `1.1e-04` / — / `2.98e-02` |
+| `test_e2e_kokoro_mil_albert_bert_encoder_reference` / `_decoder_vocoder_` | passed |
+
+Full `ctest`: 139 tests, **138 pass**, 34 of them skipping for fixtures this machine does not have. The
+single failure, `test_e2e_lfm2_lua_driver`, is unrelated and pre-existing: it hardcodes
+`GgufModel::load("lfm2_350m.gguf")` — a *bespoke*-converted artifact (not a MIL export) that is not in
+the tree, with no env var and no skip guard, so it aborts rather than skipping. It does not touch the
+exporter path.
 
 ## Bug found in this work (and fixed)
 

@@ -24,13 +24,30 @@ callsites asking about the same Var can no longer disagree, which is exactly the
 Nothing here mutates the MIL program or the exporter; it is pure derivation over an SSA graph that is
 immutable by the time topology generation runs, so caching on the exporter (rather than per
 `generate_graph_topology` call) is safe and lets the cache survive across a model's several topologies.
+
+**Derived values are sympy expressions** (see shape_expr.py), not strings: these walks compose real
+algebra -- `end - begin`, `total / product(other axes)`, a chain of `add`/`mul`/`floor_div` -- and doing
+that by f-string concatenation, on values MIL itself handed over as sympy objects, was throwing away
+information at every step. The two exceptions are deliberate and documented at their definitions:
+`range_scalar` still returns a plain Python number for a literal operand, and `reshape_shape` still
+returns rendered strings, because both feed JSON attributes directly and their existing number-vs-string
+distinction is part of what the engine reads back.
 """
 import numpy as np
 from coremltools.converters.mil.mil import Var
 
-# MIL arithmetic ops `scalar_expr` can fold or render as a SymbolEnv expression, and the operator each
-# one prints as. `floor_div` shares `real_div`'s slash because it is wrapped in an explicit floor().
-_ARITH_OPS = {"add": "+", "sub": "-", "mul": "*", "real_div": "/", "floor_div": "/"}
+from .shape_expr import as_expr, floor_div, render, to_number, N_TOKENS
+
+# MIL arithmetic ops `scalar_expr` can fold into a real expression, and the sympy operation each maps
+# to. `floor_div` is `real_div` wrapped in an explicit floor(), exactly as the engine's evaluator (which
+# has no integer division) needs it spelled out.
+_ARITH_OPS = {
+    "add": lambda x, y: x + y,
+    "sub": lambda x, y: x - y,
+    "mul": lambda x, y: x * y,
+    "real_div": lambda x, y: x / y,
+    "floor_div": floor_div,
+}
 
 
 def static_value(var, default=None):
@@ -85,6 +102,7 @@ class ValueFacts:
         self._slice_axis = {}
         self._reshape_shape = {}
         self._dim_expr = {}
+        self._reshape_shape_rendered = {}
 
     # -- literal statics ---------------------------------------------------------------------------
     # Bound as methods too, so a handler holding only `self.facts` still reaches them; the real
@@ -157,7 +175,7 @@ class ValueFacts:
             # falls back to the SAME "n_tokens" string a genuine batch=1 axis would never actually be,
             # corrupting whatever RESHAPE/RANGE_1D consumes this value. A genuinely non-1 batch axis
             # would surface as a numerical mismatch against the reference model, not a syntax error here.
-            return "1"
+            return as_expr(1)
         return self.exporter._infer_dynamic_dim_expr(real_var, torch_axis)
 
     def dim_expr(self, var, torch_axis):
@@ -216,22 +234,40 @@ class ValueFacts:
         real T=62) while `begin` (whose OWN resolution never revisits `gather_0` a second time) looked
         completely fine. The memo below is what makes revisiting cheap instead of exponential.
         """
+        return self._scalar_entry(v, _seen)[0]
+
+    def scalar_expr_is_guess(self, v):
+        """True iff `scalar_expr(v)`'s answer rests on the producer-less-var fallback below rather than
+        on a real derivation -- i.e. it says `n_tokens` because the walk ran out of graph, not because
+        it worked out that this value *is* the sequence length.
+
+        Consumers need to tell those two apart and cannot do it by looking at the answer: both are
+        exactly `n_tokens`. `slice_by_index`'s derivation is the one that cares (see its own comment in
+        `exporter.py`), and before expressions were normalized it accidentally distinguished them by
+        *spelling* -- a genuine derivation happened to come out as `floor((n_tokens + 0 - 1)/1) + 1`
+        rather than the bare symbol, so a test for the literal string `"n_tokens"` only ever matched the
+        fallback. Simplification made those spellings identical and the accident stopped working, in two
+        real models at once (see BACKEND.md). This is the same distinction, made on purpose.
+        """
+        return self._scalar_entry(v)[1]
+
+    def _scalar_entry(self, v, _seen=None):
+        """`(expression, is_guess)` for one Var, memoized together so the two can never disagree."""
         if v is None or not isinstance(v, Var):
-            return None
+            return (None, False)
         key = id(v)
         if key in self._scalar_expr:
             return self._scalar_expr[key][1]
-        result = self._scalar_expr_uncached(v, _seen)
-        self._scalar_expr[key] = (v, result)
-        return result
+        entry = self._scalar_expr_uncached(v, _seen)
+        self._scalar_expr[key] = (v, entry)
+        return entry
 
     def _scalar_expr_uncached(self, v, _seen):
         if self.value(v) is not None:
             arr = self.array(v).reshape(-1)
             if arr.size == 1:
-                f = float(arr[0])
-                return int(f) if f.is_integer() else f
-            return None
+                return (as_expr(float(arr[0])), False)
+            return (None, False)
         if v.op is None:
             # A genuine (sub)function input with no producer -- the same "this IS the topology's one
             # true dynamic quantity" case `_infer_dynamic_dim_expr` treats unconditionally as "n_tokens"
@@ -247,11 +283,14 @@ class ValueFacts:
             # scalar this whole exporter's single-true-dynamic-axis design ever reaches IS that quantity,
             # matching `_infer_dynamic_dim_expr`'s own unconditional treatment -- not just ones spelled
             # "length".
-            return "n_tokens"
+            #
+            # This is the ONE place the answer is a guess rather than a derivation, which is what the
+            # `is_guess` half of this entry marks -- see `scalar_expr_is_guess`.
+            return (N_TOKENS, True)
         op = v.op
         if op.op_type in ("cast", "squeeze", "identity", "expand_dims"):
             inner = op.inputs.get("x") or op.inputs.get("data")
-            return self.scalar_expr(inner, _seen)
+            return self._scalar_entry(inner, _seen)
         if op.op_type == "select":
             # `torch.where(cond, a, b)` -- NeMo's own `get_seq_len` uses exactly this shape for its
             # "fix for seq_len = 0 for streaming" guard (`torch.where(seq_len == 0, zeros, seq_len_
@@ -259,27 +298,20 @@ class ValueFacts:
             # degenerate `cond` branch, so -- mirroring the "batch is always 1" style invariant used
             # throughout the exporter -- always take the "b" (false/else) branch rather than trying to
             # resolve `cond` itself.
-            return self.scalar_expr(op.inputs.get("b"), _seen)
+            return self._scalar_entry(op.inputs.get("b"), _seen)
         if op.op_type == "gather":
-            return self.gather_shape_value(v)
+            # A real shape query, not a guess -- even when its answer is exactly `n_tokens`.
+            return (self.gather_shape_value(v), False)
         if op.op_type in _ARITH_OPS:
-            x_e = self.scalar_expr(op.inputs.get("x"), _seen)
-            y_e = self.scalar_expr(op.inputs.get("y"), _seen)
+            x_e, x_guess = self._scalar_entry(op.inputs.get("x"), _seen)
+            y_e, y_guess = self._scalar_entry(op.inputs.get("y"), _seen)
             if x_e is None or y_e is None:
-                return None
-            if isinstance(x_e, (int, float)) and isinstance(y_e, (int, float)):
-                if op.op_type == "add":
-                    return x_e + y_e
-                if op.op_type == "sub":
-                    return x_e - y_e
-                if op.op_type == "mul":
-                    return x_e * y_e
-                if op.op_type == "real_div":
-                    return x_e / y_e
-                return x_e // y_e
-            expr = f"(({x_e}) {_ARITH_OPS[op.op_type]} ({y_e}))"
-            return f"(floor({expr}))" if op.op_type == "floor_div" else expr
-        return None
+                return (None, False)
+            # One code path for literals and symbols alike: sympy folds the all-literal case exactly
+            # (and keeps `floor_div`'s floor()), where this used to need a separate int/float branch
+            # that quietly disagreed with the string branch about integer division.
+            return (_ARITH_OPS[op.op_type](x_e, y_e), x_guess or y_guess)
+        return (None, False)
 
     def range_scalar(self, v):
         """
@@ -288,21 +320,37 @@ class ValueFacts:
         when emitting a RANGE_1D JSON node's own attrs and when inferring the LENGTH of that range's own
         output elsewhere (see the "range_1d" case in `_infer_dynamic_dim_expr`) -- the two need the exact
         same resolution logic.
+
+        Returns a sympy expression, **or a plain Python float when the operand is a literal constant**.
+        That second case is deliberate, not an oversight: RANGE_1D's JSON node emits `start`/`end`/`step`
+        as real JSON numbers when they are known and as expression strings only when they are not (the
+        engine's `resolve_attr_number` accepts either), so erasing the distinction here would churn every
+        RANGE_1D attribute in every exported model to no end. `as_expr` lifts it back into algebra
+        wherever the value is composed with others.
         """
+        return self._range_entry(v)[0]
+
+    def range_scalar_is_guess(self, v):
+        """Whether `range_scalar(v)` rests on `scalar_expr`'s producer-less fallback -- see
+        `scalar_expr_is_guess`. A `gather(shape(...))` derivation and a literal constant are never
+        guesses, however dynamic their answers look."""
+        return self._range_entry(v)[1]
+
+    def _range_entry(self, v):
         if v is None:
-            return None
+            return (None, False)
         key = id(v)
         if key in self._range_scalar:
             return self._range_scalar[key][1]
         derived = self.gather_shape_value(v)
         if derived is not None:
-            result = derived
+            entry = (derived, False)
         elif self.value(v) is not None:
-            result = float(self.array(v).reshape(-1)[0])
+            entry = (float(self.array(v).reshape(-1)[0]), False)
         else:
-            result = self.scalar_expr(v)
-        self._range_scalar[key] = (v, result)
-        return result
+            entry = self._scalar_entry(v)
+        self._range_scalar[key] = (v, entry)
+        return entry
 
     def slice_axis_value(self, idx_var, axis):
         """
@@ -321,27 +369,38 @@ class ValueFacts:
         cosmetic bug, the emitted VIEW's declared shape and its own stride math then genuinely disagreed
         on element count for whichever axis needed the real crop.
         """
+        return self._slice_axis_entry(idx_var, axis)[0]
+
+    def slice_axis_is_guess(self, idx_var, axis):
+        """Whether this bound rests on `scalar_expr`'s producer-less fallback -- see
+        `scalar_expr_is_guess`. `slice_by_index`'s own derivation in `exporter.py` uses this to decide
+        whether an `end` of `n_tokens` is a real answer or the walk having run out of graph."""
+        return self._slice_axis_entry(idx_var, axis)[1]
+
+    def _slice_axis_entry(self, idx_var, axis):
         if idx_var is None:
-            return None
+            return (None, False)
         key = (id(idx_var), axis)
         if key in self._slice_axis:
             return self._slice_axis[key][1]
-        result = self._slice_axis_value_uncached(idx_var, axis)
-        self._slice_axis[key] = (idx_var, result)
-        return result
+        entry = self._slice_axis_value_uncached(idx_var, axis)
+        self._slice_axis[key] = (idx_var, entry)
+        return entry
 
     def _slice_axis_value_uncached(self, idx_var, axis):
         if self.value(idx_var) is not None:
             arr = self.array(idx_var).reshape(-1)
-            return int(arr[axis]) if axis < len(arr) else None
+            return (int(arr[axis]) if axis < len(arr) else None, False)
         if idx_var.op is not None and idx_var.op.op_type in ("concat", "stack"):
             values = idx_var.op.inputs.get("values")
             if values is not None and axis < len(values):
-                resolved = self.range_scalar(values[axis])
-                if isinstance(resolved, (int, float)):
-                    return int(resolved)
-                return resolved
-        return None
+                resolved, is_guess = self._range_entry(values[axis])
+                # A slice bound that resolved to a literal stays a plain int (both callers branch on
+                # that to normalize Python-style negative indices against the axis extent); anything
+                # else stays a sympy expression.
+                number = to_number(resolved)
+                return (int(number) if number is not None else resolved, is_guess)
+        return (None, False)
 
     def reshape_shape(self, op):
         """
@@ -368,7 +427,22 @@ class ValueFacts:
            repeated symbol.
 
         Returns None (falling back to the existing out_info-based path) unless every element resolves.
+        Each resolved axis is a **rendered string** (or the int -1); `reshape_shape_exprs` is the same
+        answer as sympy, for the callers that go on to compute with it rather than emit it.
         """
+        key = id(op)
+        if key in self._reshape_shape_rendered:
+            return self._reshape_shape_rendered[key][1]
+        exprs = self.reshape_shape_exprs(op)
+        result = None if exprs is None else [d if d == -1 else render(d) for d in exprs]
+        self._reshape_shape_rendered[key] = (op, result)
+        return result
+
+    def reshape_shape_exprs(self, op):
+        """`reshape_shape` before rendering: a list of sympy expressions, with the int -1 left as the
+        literal marker it is. Used by `_infer_dynamic_dim_expr`'s own `reshape`/`fill` case, which
+        divides the input's total element count by the other axes and would otherwise have to parse
+        back what this just printed."""
         key = id(op)
         if key in self._reshape_shape:
             return self._reshape_shape[key][1]
@@ -382,7 +456,7 @@ class ValueFacts:
             return None
         if self.value(shape_var) is not None:
             raw = self.array(shape_var).reshape(-1)
-            return [-1 if int(x) == -1 else str(int(x)) for x in raw]
+            return [-1 if int(x) == -1 else as_expr(int(x)) for x in raw]
         if shape_var.op is None or shape_var.op.op_type not in ("concat", "stack"):
             return None
         values = shape_var.op.inputs.get("values")
@@ -395,13 +469,13 @@ class ValueFacts:
             r = self.range_scalar(v)
             if r is None:
                 return None
-            if isinstance(r, (int, float)):
+            number = to_number(r)
+            if number is not None:
                 # A literal -1 is PyTorch's own "infer this dim" marker (`x.view(b, t, -1)`) baked
-                # directly into the trace, not a computed value -- must stay a real JSON int (not the
-                # string "-1") so op_reshape's own infer-idx handling (primitives_basic.cpp) recognizes
-                # it; every other numeric constant is just rendered as a plain digit string, same as the
-                # rest of this exporter's shape-attr convention.
-                resolved.append(-1 if int(r) == -1 else str(int(r)))
+                # directly into the trace, not a computed value -- it must stay a real int (never the
+                # expression -1) all the way to the JSON, so op_reshape's own infer-idx handling
+                # (primitives_basic.cpp) recognizes it.
+                resolved.append(-1 if int(number) == -1 else as_expr(int(number)))
             else:
-                resolved.append(str(r))
+                resolved.append(as_expr(r))
         return resolved
