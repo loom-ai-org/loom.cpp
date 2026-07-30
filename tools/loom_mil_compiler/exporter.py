@@ -14,7 +14,7 @@ from .driver_ir import (
 from .driver_ir import Function as IRFunction
 from .passes import apply_loom_mil_passes
 from .shape_expr import (
-    as_expr, floor_div, has_dynamic_symbol, render, sub_dynamic_symbols, N_TOKENS,
+    as_expr, floor_div, has_dynamic_symbol, render, sub_dynamic_symbols,
 )
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_scalar, static_value
@@ -125,33 +125,62 @@ class LoomGGUFExporter:
         self.profile = kwargs.get("profile") or os.environ.get("LOOM_PROFILE", None)
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
         self.quantize = kwargs.get("quantize") or os.environ.get("LOOM_QUANTIZE", None)
-        # {raw MIL symbol string (e.g. "is531") -> replacement expression (e.g. "2*n_tokens")}. The
-        # engine's own dynamic-shape support is genuinely single-axis (see get_var_info's own docstring):
-        # every symbolic dim ordinarily collapses to the bare "n_tokens" SymbolEnv resolves at build
-        # time, which is correct whenever several distinct "isN" names all really mean the SAME one true
-        # dynamic quantity (the common case) but wrong the one time a topology genuinely has more than
-        # one independently-varying dynamic axis (first hit by Kokoro's "decoder_vocoder" phase: asr's
-        # own frame count vs. f0_curve/n_curve's fixed-2x/noise_in's fixed-600x/wsum's fixed-600x+20
-        # lengths -- none of these are op-derived from asr, they're independently-traced LEAF inputs, so
-        # there's no data-flow path this exporter could use to infer the ratio on its own). This dict
-        # lets a caller who DOES know the real ratio (because it's inherent to how their own wrapper
-        # module's forward() signature is shaped, not something recoverable from the graph) override
-        # specific symbols by their raw name -- populated from the real traced MIL Vars' own shape
-        # symbols, not guessed from string patterns.
-        self.symbol_overrides = kwargs.get("symbol_overrides") or {}
+        # This topology's ONE true dynamic quantity's real name (EXPORT-ROADMAP.md R1, axes.py) --
+        # "n_tokens" unless the caller says otherwise. The engine's own dynamic-shape support is
+        # genuinely single-axis (see get_var_info's own docstring): every symbolic dim ordinarily
+        # collapses to whichever single symbol this names, which SymbolEnv resolves at build time.
+        # Conformer-CTC/Parakeet declare "n_samples" here (raw audio samples, never a token count);
+        # Kokoro's decoder_vocoder phase declares "n_enc_frames" (see `declared_axes` below for why that
+        # phase ALSO needs more than just this one name).
+        self.root_axis = kwargs.get("root_axis") or "n_tokens"
+        # {raw MIL symbol string (e.g. "is531") -> replacement expression (e.g. "2*n_enc_frames")},
+        # resolved from the human-facing `declared_axes` kwarg ({input name: {torch axis: expression}})
+        # against `program`'s own real traced Vars -- see `_resolve_declared_axes`. Needed whenever a
+        # topology has more than one independently-varying dynamic axis (first hit by Kokoro's
+        # "decoder_vocoder" phase: asr's own frame count vs. f0_curve/n_curve's fixed-2x/noise_in's
+        # fixed-600x/wsum's fixed-600x+20 lengths -- none of these are op-derived from asr, they're
+        # independently-traced LEAF inputs, so there's no data-flow path this exporter could use to
+        # infer the ratio on its own). A caller who DOES know the real ratio (because it's inherent to
+        # how their own wrapper module's forward() signature is shaped, not something recoverable from
+        # the graph) declares it per input name and axis position; this exporter looks up the input's
+        # own real MIL symbol so nothing here is guessed from string patterns.
+        self._axis_overrides = self._resolve_declared_axes(program, kwargs.get("declared_axes"))
         # The one place any "what is this Var's compile-time value?" question gets answered, for both
         # this class and the op-handler table -- see value_facts.py's own module docstring.
         self.facts = ValueFacts(self)
 
+    def _resolve_declared_axes(self, program, declared_axes):
+        """`{input name: {torch axis: expression}}` -> `{raw MIL symbol name: expression}`, by reading
+        each named input's own real traced shape out of `program`'s main function. Moves the "read the
+        real symbol off the traced Var" step (`export_kokoro_mil.py`'s own former `root_symbol()`
+        helper) inside the exporter, so a caller declares an axis by input name and position -- a
+        first-class fact about the model, matching R1's design sketch -- rather than by a raw
+        coremltools-internal symbol string it has to extract itself."""
+        if not declared_axes or program is None:
+            return {}
+        main_func = getattr(program, "functions", {}).get("main")
+        if main_func is None:
+            return {}
+        overrides = {}
+        for input_name, per_axis in declared_axes.items():
+            input_var = main_func.inputs.get(input_name)
+            if input_var is None or input_var.shape is None:
+                raise KeyError(
+                    f"declared_axes: no input {input_name!r} in the traced program's main function"
+                )
+            for axis, expr in per_axis.items():
+                overrides[str(input_var.shape[axis])] = expr
+        return overrides
+
     def _sub_symbol(self, dim):
-        """Replaces every symbolic MIL dim (e.g. "is531") in `dim` with its `self.symbol_overrides`
-        entry if the caller registered one for that exact raw symbol, else the usual bare "n_tokens"
-        fallback. See `symbol_overrides`' own docstring in __init__.
+        """Replaces every symbolic MIL dim (e.g. "is531") in `dim` with its `self._axis_overrides`
+        entry if the caller declared one for that exact raw symbol, else this topology's own
+        `self.root_axis`. See `root_axis`/`declared_axes`' own docstrings in __init__.
 
         Substitution happens on the sympy expression MIL itself handed us -- coremltools' own `Symbol`
         subclasses `sympy.Symbol`, so a compound dim like `4*is2 + 20` keeps its algebra rather than
         being rebuilt from its printed form (see shape_expr.py's module docstring)."""
-        return sub_dynamic_symbols(dim, self.symbol_overrides)
+        return sub_dynamic_symbols(dim, self._axis_overrides, default=self.root_axis)
 
     def safe_name(self, name: str) -> str:
         """
@@ -219,11 +248,11 @@ class LoomGGUFExporter:
 
         op = var.op
         if op is None:
-            # A genuine (sub)function input with no producer -- ordinarily this IS the actual dynamic
-            # quantity "n_tokens" derives from (e.g. "waveform" itself), but not always: a topology with
-            # more than one independently-traced dynamic LEAF input (Kokoro's "decoder_vocoder" -- see
-            # symbol_overrides' own docstring) has NO data-flow path here to tell that apart from the
-            # ordinary case, so an explicit caller-registered override always wins when present.
+            # A genuine (sub)function input with no producer -- ordinarily this IS the topology's own
+            # `root_axis` (e.g. "waveform" itself), but not always: a topology with more than one
+            # independently-traced dynamic LEAF input (Kokoro's "decoder_vocoder" -- see
+            # `declared_axes`' own docstring in __init__) has NO data-flow path here to tell that apart
+            # from the ordinary case, so an explicit caller-declared axis always wins when present.
             return self._sub_symbol(dim)
 
         _UNARY_PASSTHROUGH_OPS = {
@@ -682,7 +711,12 @@ class LoomGGUFExporter:
                     # reshape (whose `x` extent is `n_tokens + 1`, one too many). Both are real
                     # derivations off a `gather(shape(...))`, and both must be kept. See BACKEND.md.
                     x_full_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
-                    if x_full_expr is not None and x_full_expr != N_TOKENS:
+                    # Compared against THIS topology's own root axis, not the literal "n_tokens" --
+                    # Conformer-CTC (the CMVN case this whole block's comment is about) now declares
+                    # "n_samples" here (EXPORT-ROADMAP.md R1). A bare re-derivation of the root axis
+                    # itself is exactly as uninformative as it always was; it just isn't spelled
+                    # "n_tokens" for every model any more.
+                    if x_full_expr is not None and x_full_expr != as_expr(self.root_axis):
                         end_expr = x_full_expr
             if end_expr is not None and begin_expr is not None:
                 return end_expr if begin_expr == 0 else end_expr - begin_expr

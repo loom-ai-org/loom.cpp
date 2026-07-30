@@ -447,20 +447,18 @@ def build_decoder_vocoder_topology(decoder, dummy_t_frames=40, dim_in=512):
                        compute_precision=ct.precision.FLOAT32)
     main_func = prog.functions["main"]
 
-    # f0_curve/n_curve/noise_in/wsum are genuinely independent LEAF inputs whose real length is a
-    # fixed multiple of asr's own T (2x/600x/600x+20 respectively) -- not derivable from the graph
-    # (see LoomGGUFExporter.symbol_overrides' own docstring in exporter.py). Built from the REAL
-    # traced symbol names (not guessed) by reading each input Var's own dynamic shape entry directly.
-    def root_symbol(name, axis):
-        return str(main_func.inputs[name].shape[axis])
-
-    symbol_overrides = {
-        root_symbol("f0_curve", 1): "2*n_tokens",
-        root_symbol("n_curve", 1): "2*n_tokens",
-        root_symbol("noise_in", 1): "600*n_tokens",
-        root_symbol("wsum", 0): "600*n_tokens+20",
-    }
-    exporter = LoomGGUFExporter(prog, symbol_overrides=symbol_overrides)
+    # "asr"'s own axis is this phase's one true dynamic quantity -- the post-encoder acoustic/ASR
+    # frame count (EXPORT-ROADMAP.md R1, axes.py's N_ENC_FRAMES), not a token count. f0_curve/n_curve/
+    # noise_in/wsum are genuinely independent LEAF inputs whose real length is a fixed multiple of
+    # that same frame count (2x/600x/600x+20 respectively) -- not derivable from the graph (see
+    # LoomGGUFExporter's `declared_axes` docstring in exporter.py). Declared by input name and axis
+    # position; the exporter reads each input's own real traced symbol itself.
+    exporter = LoomGGUFExporter(prog, root_axis="n_enc_frames", declared_axes={
+        "f0_curve": {1: "2*n_enc_frames"},
+        "n_curve": {1: "2*n_enc_frames"},
+        "noise_in": {1: "600*n_enc_frames"},
+        "wsum": {0: "600*n_enc_frames+20"},
+    })
     topo = exporter.generate_graph_topology(main_func, "decoder_vocoder")
     print(f"  decoder_vocoder: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
     return topo, exporter.weights
