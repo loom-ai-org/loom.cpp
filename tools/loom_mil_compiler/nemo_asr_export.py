@@ -55,6 +55,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .export_config import LoomExportConfig
+
 # Dummy trace length, and the dynamic sample-axis bounds, all in SECONDS -- turned into sample counts
 # against the checkpoint's own declared sample rate. 0.1 s .. 20 s matches NeMo's own
 # min_duration/max_duration convention for these models.
@@ -163,46 +165,43 @@ class EncoderOutput(Enum):
         if not isinstance(outputs, (tuple, list)) or len(outputs) != self.forward_arity:
             n = len(outputs) if isinstance(outputs, (tuple, list)) else 1
             raise ValueError(
-                f"NeMoASREncoderSpec declares output={self.name}, whose family's forward() returns "
+                f"ASRNemoEncoderExportConfig declares output={self.name}, whose family's forward() returns "
                 f"{self.forward_arity} values, but {type(model).__name__}.forward() returned {n}. "
                 f"This checkpoint is not the family the spec claims."
             )
         main = outputs[0]
         if main.dim() != 3:
             raise ValueError(
-                f"NeMoASREncoderSpec declares output={self.name}, expecting a rank-3 tensor from "
+                f"ASRNemoEncoderExportConfig declares output={self.name}, expecting a rank-3 tensor from "
                 f"{type(model).__name__}.forward(), but got rank {main.dim()} ({tuple(main.shape)})."
             )
         expected = self.expected_channels(model)
         if int(main.shape[self.channel_axis]) != expected:
             raise ValueError(
-                f"NeMoASREncoderSpec declares output={self.name}, whose axis {self.channel_axis} must "
+                f"ASRNemoEncoderExportConfig declares output={self.name}, whose axis {self.channel_axis} must "
                 f"be {expected} (the checkpoint's own {self.channel_source}), but "
                 f"{type(model).__name__} produced {tuple(main.shape)}. This checkpoint is not the "
                 f"family the spec claims."
             )
 
 
-@dataclass
-class NeMoASREncoderSpec:
-    """Everything that genuinely differs between the three NeMo ASR encoder exports.
+@dataclass(kw_only=True)
+class ASRNemoEncoderExportConfig(LoomExportConfig):
+    """Everything that genuinely differs between the three NeMo ASR encoder exports (Conformer-CTC,
+    Parakeet-TDT, Parakeet-RNNT) -- the ASR family's `LoomExportConfig` (BACKLOG.md's naming convention:
+    `ASR` domain, `NemoEncoder` function; renamed from `NeMoASREncoderSpec`, same shape).
 
     Every other parameter of the export -- restore class, sample rate, trace length, dynamic-axis
     bounds, compute precision, profile -- is either re-derived from the checkpoint or family-wide, and
-    lives in this module rather than in three copies.
+    lives in this module rather than in three copies. Only "monolithic" has ever been used for this
+    family (there is no modular boundary to declare: the whole preprocessor+encoder(+CTC decoder) chain
+    is one graph) -- `profile` is inherited from `LoomExportConfig` rather than re-declared.
     """
 
     # Path to the .nemo checkpoint.
     checkpoint: str
     # Which tensor the traced wrapper returns; see EncoderOutput.
     output: EncoderOutput
-    # GGUF `general.architecture` value, and the output .gguf path.
-    architecture: str
-    output_path: str
-    # Only "monolithic" has ever been used for this family (there is no modular boundary to declare:
-    # the whole preprocessor+encoder(+CTC decoder) chain is one graph). Declared rather than hardcoded
-    # for symmetry with the other family templates' own `profile` field.
-    profile: str = "monolithic"
 
     def validate_against_model(self, model) -> int:
         """Structural checks that don't need a forward pass, run before the (slow) trace. Returns the
@@ -210,21 +209,42 @@ class NeMoASREncoderSpec:
         missing = [attr for attr in ("preprocessor", "encoder") if not hasattr(model, attr)]
         if missing:
             raise ValueError(
-                f"NeMoASREncoderSpec({self.architecture!r}) restored {type(model).__name__} from "
+                f"ASRNemoEncoderExportConfig({self.architecture!r}) restored {type(model).__name__} from "
                 f"{self.checkpoint!r}, which has no {missing} -- this template targets NeMo ASR models "
                 f"whose forward is preprocessor -> encoder (-> decoder)."
             )
         sample_rate = getattr(getattr(model.cfg, "preprocessor", None), "sample_rate", None)
         if sample_rate is None:
             raise ValueError(
-                f"NeMoASREncoderSpec({self.architecture!r}): {type(model).__name__}'s config declares no "
-                f"preprocessor.sample_rate, so the trace length and dynamic-axis bounds cannot be "
-                f"derived from the checkpoint."
+                f"ASRNemoEncoderExportConfig({self.architecture!r}): {type(model).__name__}'s config "
+                f"declares no preprocessor.sample_rate, so the trace length and dynamic-axis bounds "
+                f"cannot be derived from the checkpoint."
             )
         # Reading this also validates the spec's own family claim as far as it can be validated without
         # running the model; the rest is checked inside the wrapper during tracing (EncoderOutput.validate).
         self.output.expected_channels(model)
         return int(sample_rate)
+
+    def export(self) -> str:
+        """The whole export, from `.nemo` on disk to `.gguf` on disk."""
+        from .register import LoomGGUFBackend
+
+        prepare_nemo_environment()
+        model = load_model(self)
+        sample_rate = self.validate_against_model(model)
+        mil_prog = trace_and_convert(self, model, sample_rate)
+
+        LoomGGUFBackend()(
+            mil_prog,
+            output_path=self.output_path,
+            architecture=self.architecture,
+            profile=self.profile,
+            # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
+            # family-wide for all three models this template covers (axes.py's N_SAMPLES).
+            root_axis="n_samples",
+        )
+        print(f"SUCCESS! Monolithic model exported cleanly to: {self.output_path}")
+        return self.output_path
 
 
 class _NeMoASREncoderWrapper(nn.Module):
@@ -242,7 +262,7 @@ class _NeMoASREncoderWrapper(nn.Module):
         return self.output.select(outputs)
 
 
-def load_model(spec: NeMoASREncoderSpec):
+def load_model(spec: ASRNemoEncoderExportConfig):
     """Restores `spec.checkpoint` through the base `ASRModel`, which dispatches on the checkpoint's own
     config `target` -- verified to return the identical concrete class (and identical state-dict keys)
     as naming the subclass directly, which is why the spec has no restore-class field."""
@@ -254,7 +274,7 @@ def load_model(spec: NeMoASREncoderSpec):
     return model
 
 
-def trace_and_convert(spec: NeMoASREncoderSpec, model, sample_rate: int):
+def trace_and_convert(spec: ASRNemoEncoderExportConfig, model, sample_rate: int):
     """Traces the wrapper on `TRACE_SECONDS` of dummy audio and converts to a MIL program with a
     dynamic sample axis. Kept separate from `export_nemo_asr_encoder` so a caller can inspect or
     post-process the MIL program before it reaches the backend."""
@@ -282,23 +302,7 @@ def trace_and_convert(spec: NeMoASREncoderSpec, model, sample_rate: int):
     )
 
 
-def export_nemo_asr_encoder(spec: NeMoASREncoderSpec):
-    """The whole export, from `.nemo` on disk to `.gguf` on disk."""
-    from .register import LoomGGUFBackend
-
-    prepare_nemo_environment()
-    model = load_model(spec)
-    sample_rate = spec.validate_against_model(model)
-    mil_prog = trace_and_convert(spec, model, sample_rate)
-
-    LoomGGUFBackend()(
-        mil_prog,
-        output_path=spec.output_path,
-        architecture=spec.architecture,
-        profile=spec.profile,
-        # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
-        # family-wide for all three models this template covers (axes.py's N_SAMPLES).
-        root_axis="n_samples",
-    )
-    print(f"SUCCESS! Monolithic model exported cleanly to: {spec.output_path}")
-    return spec.output_path
+def export_nemo_asr_encoder(spec: ASRNemoEncoderExportConfig):
+    """The whole export, from `.nemo` on disk to `.gguf` on disk. Thin shim over
+    `ASRNemoEncoderExportConfig.export()`, kept as a module-level function for existing callers."""
+    return spec.export()

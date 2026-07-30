@@ -21,11 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402  (path setup must precede the import)
     EncoderOutput,
-    NeMoASREncoderSpec,
+    ASRNemoEncoderExportConfig,
     export_nemo_asr_encoder,
 )
 
-SPEC = NeMoASREncoderSpec(
+SPEC = ASRNemoEncoderExportConfig(
     checkpoint="/home/flavio/Dev/models/parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo",
     output=EncoderOutput.ENCODER_BT_D,
     architecture="parakeet-tdt-encoder",

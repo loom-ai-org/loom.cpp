@@ -19,7 +19,7 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
     EncoderOutput,
-    NeMoASREncoderSpec,
+    ASRNemoEncoderExportConfig,
     _NeMoASREncoderWrapper,
 )
 
@@ -62,7 +62,7 @@ class _FakeASRModel(nn.Module):
 
 
 def _spec(output=EncoderOutput.CTC_LOG_PROBS, **kw):
-    return NeMoASREncoderSpec(checkpoint="/nonexistent.nemo", output=output,
+    return ASRNemoEncoderExportConfig(checkpoint="/nonexistent.nemo", output=output,
                               architecture="test-arch", output_path="test.gguf", **kw)
 
 

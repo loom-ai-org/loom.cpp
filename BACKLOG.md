@@ -301,9 +301,43 @@ exists, before that template's own shape is locked in.
 
 #### P3 — the API skeleton (R3 + R4)
 
-- **P3.1 — `LoomExportConfig` base class**, with the three existing templates (`ModularExportSpec`,
-  `IterativeRefinementSpec`, `NeMoASREncoderSpec`) re-expressed as configs. No behaviour change.
-  **Gate:** byte-identical re-export of all current models.
+- **P3.1 — `LoomExportConfig` base class — DONE.** Went further than "re-express the three templates
+  one-for-one," per explicit user direction: harmonized them into a small `{Domain}{Function}ExportConfig`
+  family hierarchy (`Domain` ∈ `Base`/`TTS`/`LM`/`ASR`, `Function` a structural role or a bare model
+  name for a leaf) general enough to plausibly cover the CrispASR families in R5's table later, the way
+  `optimum`'s `ORTModelFor*` names a family by task rather than by the first model that needed it. This
+  phase built the root (`export_config.py`'s `LoomExportConfig`) and the **causal-LM family**
+  (`causal_lm_export.py`): `LMCausalModelExportConfig` (abstract) with two concrete forms,
+  `LMMonolithicCausalModelExportConfig` (one flattened trace — Qwen3's shape, and `export_hf_causal_lm.
+  export_causal_lm()`'s existing body moved in verbatim as this class's `export()`) and
+  `LMModularCausalModelExportConfig` (independently-traced submodules assembled per `ModularExportSpec`
+  — LFM2's shape, `export_lfm2_modular.py`'s `main()` body generalized verbatim). `NeMoASREncoderSpec`
+  (`nemo_asr_export.py`) renamed `ASRNemoEncoderExportConfig` to fit the convention and now inherits
+  `LoomExportConfig` directly (no Monolithic/Modular split needed — Conformer-CTC/Parakeet-TDT/
+  Parakeet-RNNT are parameterized instances, not subclasses). All three classes are `@dataclass(kw_only=
+  True)` throughout the hierarchy (needed once a subclass adds required fields after an inherited
+  defaulted one — e.g. `model_dir` after `profile`).
+
+  **Scope call, confirmed with the user:** Qwen3 is registered as a real `LMMonolithicCausalModelExportConfig`
+  user (`export_hf_causal_lm.py` is now a thin shim over it). LFM2 (`export_lfm2_modular.py`,
+  `export_lfm2_monolithic.py`) is deliberately **not migrated this pass** — the scripts stay exactly as
+  they are, regression-checked rather than replaced, since real LFM2 migration is a later pass. The
+  regression check is `test_causal_lm_export.py`: it runs `export_lfm2_modular.py`'s own `main()`
+  unmodified, builds an `LMModularCausalModelExportConfig` by hand with the identical
+  `ModularExportSpec`/dummy shapes, and snapshot-diffs the two resulting GGUFs byte-for-byte — proof the
+  new class genuinely reproduces the shape the script hand-rolls, not just that it looks plausible (same
+  test does the equivalent check for `LMMonolithicCausalModelExportConfig` against `export_qwen3_mil.py`).
+  `export_lfm2_monolithic.py` needed no such test since it already calls `export_causal_lm()`, which is
+  now the same shim — re-running it directly exercises the new class for real.
+
+  **Gate — passed:** all six affected models re-exported and snapshot-diffed
+  (`tools/loom_mil_compiler/snapshot_gguf.py`) against a pre-P3.1 baseline — zero-byte diff for
+  `qwen3_0.6b_mil_monolithic.gguf`, `conformer_ctc_small_mil_monolithic.gguf`, both Parakeet GGUFs, and
+  both `lfm2_350m_modular.gguf`/`lfm2_350m_monolithic.gguf`. Full `pytest` (143/143, matching the P2
+  count exactly since this phase added 2 new tests to `test_causal_lm_export.py` while touching nothing
+  else) and `ctest` (140/140) green, including real end-to-end numeric verification via
+  `test_e2e_lfm2_mil_export` (both profiles) and `test_e2e_parakeet_{tdt,rnnt}_mil_export` against their
+  real HF/NeMo oracles.
 - **P3.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI.** Registry keyed on HF
   `config.json` `model_type`/`architectures` and on the `target` class inside a `.nemo` archive. The
   loader is a *separate* registry entry from the family template — this is what P4.2 (GigaAM) tests.
