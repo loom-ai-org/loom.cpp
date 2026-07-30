@@ -87,15 +87,35 @@ LoomLuaBridge* bridge_from_upvalue(lua_State* L) {
     return static_cast<LoomLuaBridge*>(lua_touserdata(L, lua_upvalueindex(1)));
 }
 
+// Reads a Lua table of string->number pairs at `idx` into a `DynamicAxes` (EXPORT-ROADMAP.md R1: a
+// topology declares its own axis names, e.g. {n_samples=16000} or {n_tokens=12, n_past=0}, rather than
+// this binding assuming every topology has exactly the same two positional axes).
+DynamicAxes read_axes_table(lua_State* L, int idx) {
+    luaL_checktype(L, idx, LUA_TTABLE);
+    DynamicAxes axes;
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        // key at -2, value at -1
+        if (lua_type(L, -2) != LUA_TSTRING) {
+            luaL_error(L, "loom.run_subgraph: axes table keys must be strings (axis names)");
+        }
+        axes[lua_tostring(L, -2)] = luaL_checknumber(L, -1);
+        lua_pop(L, 1); // pop value, keep key for lua_next
+    }
+    return axes;
+}
+
 } // namespace
 
 int LoomLuaBridge::l_run_subgraph(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
         const char* module_name = luaL_checkstring(L, 1);
-        const auto n_tokens = static_cast<uint32_t>(luaL_checknumber(L, 2));
-        const auto n_past = static_cast<uint32_t>(luaL_checknumber(L, 3));
-        luaL_checktype(L, 4, LUA_TTABLE);
+        // EXPORT-ROADMAP.md R1: axes_table is {axis_name = value, ...} (e.g. {n_tokens=12, n_past=0}
+        // or {n_samples=16000}) -- a topology declares its OWN axis names now, replacing the old
+        // positional (n_tokens, n_past) pair every module was assumed to share.
+        const DynamicAxes axes = read_axes_table(L, 2);
+        luaL_checktype(L, 3, LUA_TTABLE);
 
         const auto it = self->modules_.find(module_name);
         if (it == self->modules_.end()) {
@@ -104,11 +124,11 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         Module& mod = it->second;
 
         GraphBuilder builder(mod.topo, *mod.model, mod.backend, mod.kv_cache);
-        GraphBuilder::BuildResult r = builder.build(n_tokens, n_past);
+        GraphBuilder::BuildResult r = builder.build(axes);
 
         // Iterate the `inputs_table` (string key -> flat number array) and set each declared input.
         lua_pushnil(L);
-        while (lua_next(L, 4) != 0) {
+        while (lua_next(L, 3) != 0) {
             // key at -2, value at -1
             if (lua_type(L, -2) != LUA_TSTRING) {
                 return luaL_error(L, "loom.run_subgraph: inputs table keys must be strings");
@@ -202,7 +222,7 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
                 layer_input[k] = static_cast<float>(sequence[static_cast<size_t>(t) * input_dim + k]);
             }
 
-            GraphBuilder::BuildResult hr = h_builder.build(/*n_tokens=*/0, /*n_past=*/0);
+            GraphBuilder::BuildResult hr = h_builder.build({{"n_tokens", 0}, {"n_past", 0}});
             ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0,
                                      layer_input.size() * sizeof(float));
             ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
@@ -211,7 +231,7 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
             std::vector<float> h_new(hidden_dim);
             ggml_backend_tensor_get(hr.output, h_new.data(), 0, h_new.size() * sizeof(float));
 
-            GraphBuilder::BuildResult cr = c_builder.build(/*n_tokens=*/0, /*n_past=*/0);
+            GraphBuilder::BuildResult cr = c_builder.build({{"n_tokens", 0}, {"n_past", 0}});
             ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0,
                                      layer_input.size() * sizeof(float));
             ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));

@@ -89,7 +89,7 @@ int main() {
     constexpr uint32_t kNEmbd = 1024;
 
     loom::GraphBuilder enc_builder(enc_topo, *enc_model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult enc_result = enc_builder.build(kNSamples, /*n_past=*/0);
+    loom::GraphBuilder::BuildResult enc_result = enc_builder.build({{"n_tokens", kNSamples}, {"n_past", /*n_past=*/0}});
 
     ggml_tensor* waveform_t = enc_result.input_tensors.at("waveform");
     ggml_tensor* pos_emb_raw_t = enc_result.input_tensors.at("pos_emb_raw");

@@ -110,7 +110,7 @@ int main() {
     LOOM_CHECK(cnn_model != nullptr);
     loom::GraphTopology cnn_topo = loom::GraphTopology::parse(cnn_model->topology_json());
     loom::GraphBuilder cnn_builder(cnn_topo, *cnn_model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult cnn_r = cnn_builder.build(n_tokens, /*n_past=*/0);
+    loom::GraphBuilder::BuildResult cnn_r = cnn_builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
     std::vector<int32_t> tokens_copy = tokens;
     ggml_backend_tensor_set(cnn_r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
     ggml_backend_graph_compute(backend.get(), cnn_r.graph);

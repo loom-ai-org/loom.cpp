@@ -78,7 +78,7 @@ void run_conformer_ctc(loom::GgufModel& model, ggml_backend_t backend, const std
 
     loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json());
     loom::GraphBuilder builder(topo, model, backend, /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult result = builder.build(n_samples, /*n_past=*/0);
+    loom::GraphBuilder::BuildResult result = builder.build({{"n_tokens", n_samples}, {"n_past", /*n_past=*/0}});
 
     // n_subsampled/n_pos for THIS specific call are read back from the tensors GraphBuilder just
     // allocated (their shapes were derived from n_samples above), not from the loom.n_subsampled/n_pos

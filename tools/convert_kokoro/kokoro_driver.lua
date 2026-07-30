@@ -78,8 +78,8 @@ local function bilstm_run(namespace_, seq, hidden_dim)
     local h_fwd, c_fwd = {}, {}
     for i = 1, hidden_dim do h_fwd[i], c_fwd[i] = 0.0, 0.0 end
     for t = 1, T do
-        local h_new = loom.run_subgraph(namespace_ .. "_h_fwd", 0, 0, {layer_input = seq[t], h_prev = h_fwd, c_prev = c_fwd})
-        local c_new = loom.run_subgraph(namespace_ .. "_c_fwd", 0, 0, {layer_input = seq[t], h_prev = h_fwd, c_prev = c_fwd})
+        local h_new = loom.run_subgraph(namespace_ .. "_h_fwd", {n_tokens = 0, n_past = 0}, {layer_input = seq[t], h_prev = h_fwd, c_prev = c_fwd})
+        local c_new = loom.run_subgraph(namespace_ .. "_c_fwd", {n_tokens = 0, n_past = 0}, {layer_input = seq[t], h_prev = h_fwd, c_prev = c_fwd})
         h_fwd, c_fwd = h_new, c_new
         for i = 1, hidden_dim do out[t][i] = h_new[i] end
     end
@@ -88,8 +88,8 @@ local function bilstm_run(namespace_, seq, hidden_dim)
     for i = 1, hidden_dim do h_bwd[i], c_bwd[i] = 0.0, 0.0 end
     for i = 0, T - 1 do
         local t = T - i
-        local h_new = loom.run_subgraph(namespace_ .. "_h_bwd", 0, 0, {layer_input = seq[t], h_prev = h_bwd, c_prev = c_bwd})
-        local c_new = loom.run_subgraph(namespace_ .. "_c_bwd", 0, 0, {layer_input = seq[t], h_prev = h_bwd, c_prev = c_bwd})
+        local h_new = loom.run_subgraph(namespace_ .. "_h_bwd", {n_tokens = 0, n_past = 0}, {layer_input = seq[t], h_prev = h_bwd, c_prev = c_bwd})
+        local c_new = loom.run_subgraph(namespace_ .. "_c_bwd", {n_tokens = 0, n_past = 0}, {layer_input = seq[t], h_prev = h_bwd, c_prev = c_bwd})
         h_bwd, c_bwd = h_new, c_new
         for j = 1, hidden_dim do out[t][hidden_dim + j] = h_new[j] end
     end
@@ -103,7 +103,7 @@ local function run_resblk_stack(name_prefix, x_rows, style)
     for i = 0, 2 do
         local T_in = #cur
         local dim_in = #cur[1]
-        local flat, shape = loom.run_subgraph(name_prefix .. "_block" .. i, T_in, 0,
+        local flat, shape = loom.run_subgraph(name_prefix .. "_block" .. i, {n_tokens = T_in, n_past = 0},
                                                {x = to_layout_a(cur, T_in, dim_in), style = style})
         cur = from_layout_a(flat, shape[1], shape[2])
     end
@@ -113,7 +113,7 @@ end
 local function run_proj1x1(name, feat)
     local T = #feat
     local C = #feat[1]
-    return loom.run_subgraph(name, T, 0, {x = to_layout_a(feat, T, C)})
+    return loom.run_subgraph(name, {n_tokens = T, n_past = 0}, {x = to_layout_a(feat, T, C)})
 end
 
 local function sigmoid(v) return 1.0 / (1.0 + math.exp(-v)) end
@@ -157,9 +157,9 @@ function synthesize(inputs)
     -- --- CustomAlbert -> bert_encoder ---
     local positions = loom.range(0, T_text)
     local attn_mask = loom.zero_mask(T_text, T_text)
-    local bert_out = loom.run_subgraph("albert", T_text, 0,
+    local bert_out = loom.run_subgraph("albert", {n_tokens = T_text, n_past = 0},
                                         {tokens = inputs.input_ids, positions = positions, attn_mask = attn_mask})
-    local d_en_flat = loom.run_subgraph("bert_encoder", T_text, 0, {x = bert_out})  -- Layout A [T,512]
+    local d_en_flat = loom.run_subgraph("bert_encoder", {n_tokens = T_text, n_past = 0}, {x = bert_out})  -- Layout A [T,512]
 
     -- --- DurationEncoder: 3x (BiLSTM + AdaLayerNorm), each re-concatenating style ---
     local x = {}
@@ -177,7 +177,7 @@ function synthesize(inputs)
         for t = 0, T_text - 1 do
             for c = 0, d_model - 1 do seq_ct[t * d_model + c + 1] = lstm_out[t + 1][c + 1] end
         end
-        local ada_out = loom.run_subgraph("duration_adaln_" .. i, T_text, 0, {x = seq_ct, style = s_predictor})
+        local ada_out = loom.run_subgraph("duration_adaln_" .. i, {n_tokens = T_text, n_past = 0}, {x = seq_ct, style = s_predictor})
         local new_x = {}
         for t = 0, T_text - 1 do
             local row = {}
@@ -193,7 +193,7 @@ function synthesize(inputs)
     local top_out = bilstm_run("top_lstm", d, hidden_per_dir)  -- T_text x 512
     local duration_logits = {}
     for t = 1, T_text do
-        duration_logits[t] = loom.run_subgraph("duration_proj", 0, 0, {x = top_out[t]})
+        duration_logits[t] = loom.run_subgraph("duration_proj", {n_tokens = 0, n_past = 0}, {x = top_out[t]})
     end
     local pred_dur = predict_durations(duration_logits, inputs.speed)
 
@@ -204,7 +204,7 @@ function synthesize(inputs)
     local en = from_row_major(loom.expand_by_duration(to_row_major(d, d_channels), T_text, d_channels, pred_dur),
                                T_frames, d_channels)
 
-    local cnn_flat, cnn_shape = loom.run_subgraph("text_encoder_cnn", T_text, 0, {tokens = inputs.input_ids})
+    local cnn_flat, cnn_shape = loom.run_subgraph("text_encoder_cnn", {n_tokens = T_text, n_past = 0}, {tokens = inputs.input_ids})
     local te_channels = cnn_shape[2]
     local cnn_rows = from_layout_a(cnn_flat, T_text, te_channels)
     local t_en = bilstm_run("text_encoder_lstm", cnn_rows, hidden_per_dir)  -- T_text x 512
@@ -221,7 +221,7 @@ function synthesize(inputs)
     local N_curve = run_proj1x1("f0n_n_proj", n_feat)
 
     -- --- Decoder core: F0_conv/N_conv + encode/decode AdainResBlk1d stack -> x (512ch, T_f0 long) ---
-    local decoder_x_flat = loom.run_subgraph("decoder_core", T_frames, 0, {
+    local decoder_x_flat = loom.run_subgraph("decoder_core", {n_tokens = T_frames, n_past = 0}, {
         asr = to_layout_a(asr, T_frames, 512),
         f0_curve = F0_curve,
         n_curve = N_curve,
@@ -236,7 +236,7 @@ function synthesize(inputs)
     local u = loom.uniform_array(dim - 1)
     for i = 1, dim - 1 do rand_ini[i + 1] = u[i] end
     local noise = loom.gaussian_array(dim * L)
-    local har_source = loom.run_subgraph("sinegen", T_f0, 0, {f0_curve = F0_curve, rand_ini = rand_ini, noise = noise})
+    local har_source = loom.run_subgraph("sinegen", {n_tokens = T_f0, n_past = 0}, {f0_curve = F0_curve, rand_ini = rand_ini, noise = noise})
 
     -- --- forward STFT: har_source (host reflect-padded) -> har (mag+phase concat) ---
     local n_fft = inputs.gen_istft_n_fft
@@ -246,7 +246,7 @@ function synthesize(inputs)
     for i = 0, pad - 1 do waveform_padded[i + 1] = har_source[pad - i + 1] end
     for i = 0, L - 1 do waveform_padded[pad + i + 1] = har_source[i + 1] end
     for i = 0, pad - 1 do waveform_padded[pad + L + i + 1] = har_source[L - 2 - i + 1] end
-    local har_flat = loom.run_subgraph("stft_forward", #waveform_padded, 0, {waveform_padded = waveform_padded})
+    local har_flat = loom.run_subgraph("stft_forward", {n_tokens = #waveform_padded, n_past = 0}, {waveform_padded = waveform_padded})
     local T_har = (#waveform_padded - n_fft) / hop + 1
 
     -- --- Generator core: x + har + host-precomputed wsum -> waveform ---
@@ -261,7 +261,7 @@ function synthesize(inputs)
             wsum[idx] = wsum[idx] + window[i + 1] * window[i + 1]
         end
     end
-    local waveform = loom.run_subgraph("generator", T_f0, 0,
+    local waveform = loom.run_subgraph("generator", {n_tokens = T_f0, n_past = 0},
                                         {x = decoder_x_flat, style = s_decoder, har = har_flat, wsum = wsum})
     return waveform
 end

@@ -94,7 +94,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("decoder_vocoder"));
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build(t_frames, 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_enc_frames", t_frames}, {"n_past", 0}});
 
     set_input(r, "asr", asr);
     set_input(r, "f0_curve", f0_curve);

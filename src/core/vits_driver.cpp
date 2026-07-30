@@ -62,14 +62,14 @@ std::vector<float> VitsDriver::synthesize(const std::vector<int32_t>& token_ids,
     };
 
     // --- Phase 1a: stats = TextEncoder -> [m_p; logs_p] (channel-first, [2*inter_channels, T]) ---
-    GraphBuilder::BuildResult stats_r = stats_builder_->build(T, 0);
+    GraphBuilder::BuildResult stats_r = stats_builder_->build({{"n_tokens", T}, {"n_past", 0}});
     fill_text_encoder_inputs(stats_model_, stats_r);
     ggml_backend_graph_compute(backend_, stats_r.graph);
     std::vector<float> stats(static_cast<size_t>(ggml_nelements(stats_r.output)));
     ggml_backend_tensor_get(stats_r.output, stats.data(), 0, stats.size() * sizeof(float));
 
     // --- Phase 1b: logw = TextEncoder + StochasticDurationPredictor(reverse) -> [T] duration logits ---
-    GraphBuilder::BuildResult logw_r = logw_builder_->build(T, 0);
+    GraphBuilder::BuildResult logw_r = logw_builder_->build({{"n_tokens", T}, {"n_past", 0}});
     fill_text_encoder_inputs(logw_model_, logw_r);
     std::vector<float> z_noise(static_cast<size_t>(T) * 2);
     for (float& v : z_noise) v = normal(rng) * cfg_.noise_scale_w;
@@ -110,7 +110,7 @@ std::vector<float> VitsDriver::synthesize(const std::vector<int32_t>& token_ids,
     }
 
     // --- Phase 2: coupling flow (reverse) + HiFi-GAN vocoder -> waveform ---
-    GraphBuilder::BuildResult wav_r = flow_vocoder_builder_->build(y_length, 0);
+    GraphBuilder::BuildResult wav_r = flow_vocoder_builder_->build({{"n_tokens", y_length}, {"n_past", 0}});
     ggml_backend_tensor_set(wav_r.input_tensors.at("z_p"), z_p.data(), 0, z_p.size() * sizeof(float));
     ggml_backend_graph_compute(backend_, wav_r.graph);
     std::vector<float> waveform(static_cast<size_t>(ggml_nelements(wav_r.output)));

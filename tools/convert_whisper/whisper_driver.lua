@@ -20,14 +20,14 @@ function transcribe(inputs)
     -- --- Encoder: one fixed-shape pass (n_tokens/n_past are unused by this topology -- every shape is
     --     a compile-time constant, matching WhisperDriver's own `encoder_builder_->build(0, 0)`). ---
     local enc_mask = loom.zero_mask(n_audio_ctx, n_audio_ctx)
-    local xa = loom.run_subgraph("encoder", 0, 0, { waveform = inputs.waveform, enc_attn_mask = enc_mask })
+    local xa = loom.run_subgraph("encoder", {n_tokens = 0, n_past = 0}, { waveform = inputs.waveform, enc_attn_mask = enc_mask })
 
     -- --- Decoder: prefill the prompt in one shot, then greedily decode one token at a time. ---
     local n_past = 0
     local generated = {}
 
     local n_prompt_tokens = #inputs.prompt_tokens
-    local logits, shape = loom.run_subgraph("decoder", n_prompt_tokens, n_past, {
+    local logits, shape = loom.run_subgraph("decoder", {n_tokens = n_prompt_tokens, n_past = n_past}, {
         tokens = inputs.prompt_tokens,
         positions = loom.range(n_past, n_prompt_tokens),
         kq_mask = loom.causal_mask(n_prompt_tokens, n_past),
@@ -44,7 +44,7 @@ function transcribe(inputs)
     end
 
     while #generated < inputs.max_new_tokens do
-        local step_logits, step_shape = loom.run_subgraph("decoder", 1, n_past, {
+        local step_logits, step_shape = loom.run_subgraph("decoder", {n_tokens = 1, n_past = n_past}, {
             tokens = { generated[#generated] },
             positions = loom.range(n_past, 1),
             kq_mask = loom.causal_mask(1, n_past),

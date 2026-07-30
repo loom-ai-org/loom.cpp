@@ -13,7 +13,7 @@ namespace {
 // pass) is genuinely different, even though this one step's mechanics are identical.
 std::vector<float> lstm_cell_step(GraphBuilder& h_builder, GraphBuilder& c_builder, const std::vector<float>& layer_input,
                                    std::vector<float>& h, std::vector<float>& c, ggml_backend_t backend) {
-    GraphBuilder::BuildResult hr = h_builder.build(/*n_tokens=*/0, /*n_past=*/0);
+    GraphBuilder::BuildResult hr = h_builder.build({{"n_tokens", 0}, {"n_past", 0}});
     ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0, layer_input.size() * sizeof(float));
     ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
     ggml_backend_tensor_set(hr.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
@@ -21,7 +21,7 @@ std::vector<float> lstm_cell_step(GraphBuilder& h_builder, GraphBuilder& c_build
     std::vector<float> h_new(h.size());
     ggml_backend_tensor_get(hr.output, h_new.data(), 0, h_new.size() * sizeof(float));
 
-    GraphBuilder::BuildResult cr = c_builder.build(/*n_tokens=*/0, /*n_past=*/0);
+    GraphBuilder::BuildResult cr = c_builder.build({{"n_tokens", 0}, {"n_past", 0}});
     ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0, layer_input.size() * sizeof(float));
     ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
     ggml_backend_tensor_set(cr.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));

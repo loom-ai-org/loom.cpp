@@ -19,7 +19,7 @@ void test_shapes_across_calls(loom::GgufModel& model, ggml_backend_t backend) {
     loom::GraphBuilder builder(topo, model, backend);
 
     for (uint32_t n_tokens : {1u, 3u, 5u}) {
-        auto result = builder.build(n_tokens, /*n_past=*/0);
+        auto result = builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
         LOOM_CHECK(result.graph != nullptr);
         LOOM_CHECK(result.output != nullptr);
         LOOM_CHECK(result.output->ne[0] == kNVocab);
@@ -34,7 +34,7 @@ void test_shapes_across_calls(loom::GgufModel& model, ggml_backend_t backend) {
     // n_past shouldn't affect shapes for this attention-free topology (n_kv isn't referenced by any
     // node), but the build must still succeed -- exercises that n_past/n_kv symbol wiring doesn't break
     // topologies that don't use it.
-    auto result = builder.build(/*n_tokens=*/1, /*n_past=*/7);
+    auto result = builder.build({{"n_tokens", /*n_tokens=*/1}, {"n_past", /*n_past=*/7}});
     LOOM_CHECK(result.output->ne[1] == 1);
 }
 
@@ -49,7 +49,7 @@ void test_unresolved_output_throws(loom::GgufModel& model, ggml_backend_t backen
     })JSON";
     loom::GraphTopology topo = loom::GraphTopology::parse(json);
     loom::GraphBuilder builder(topo, model, backend);
-    LOOM_CHECK_THROWS(builder.build(2, 0), loom::SchemaError);
+    LOOM_CHECK_THROWS(builder.build({{"n_tokens", 2}, {"n_past", 0}}), loom::SchemaError);
 }
 
 void test_unknown_op_throws(loom::GgufModel& model, ggml_backend_t backend) {
@@ -63,7 +63,7 @@ void test_unknown_op_throws(loom::GgufModel& model, ggml_backend_t backend) {
     })JSON";
     loom::GraphTopology topo = loom::GraphTopology::parse(json);
     loom::GraphBuilder builder(topo, model, backend);
-    LOOM_CHECK_THROWS(builder.build(2, 0), loom::UnknownOpError);
+    LOOM_CHECK_THROWS(builder.build({{"n_tokens", 2}, {"n_past", 0}}), loom::UnknownOpError);
 }
 
 void test_unresolved_input_throws(loom::GgufModel& model, ggml_backend_t backend) {
@@ -77,14 +77,14 @@ void test_unresolved_input_throws(loom::GgufModel& model, ggml_backend_t backend
     })JSON";
     loom::GraphTopology topo = loom::GraphTopology::parse(json);
     loom::GraphBuilder builder(topo, model, backend);
-    LOOM_CHECK_THROWS(builder.build(2, 0), loom::SchemaError);
+    LOOM_CHECK_THROWS(builder.build({{"n_tokens", 2}, {"n_past", 0}}), loom::SchemaError);
 }
 
 void test_reserve_does_not_break_subsequent_builds(loom::GgufModel& model, ggml_backend_t backend) {
     loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json());
     loom::GraphBuilder builder(topo, model, backend);
     builder.reserve(16);
-    auto result = builder.build(3, 0);
+    auto result = builder.build({{"n_tokens", 3}, {"n_past", 0}});
     LOOM_CHECK(result.output->ne[1] == 3);
 }
 

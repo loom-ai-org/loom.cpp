@@ -85,7 +85,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build(T, 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     // ggml ne=[T,C] (T fastest) -- real transpose from the reference's (T,C) row-major layout, same rule
     // as every other [T,C]-convention test this whole milestone. f0_curve/n_curve are 1D -- no transpose.

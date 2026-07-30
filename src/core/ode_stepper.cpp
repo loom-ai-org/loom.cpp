@@ -20,7 +20,7 @@ std::vector<float> OdeStepper::integrate(const std::vector<float>& initial_laten
     // compute() call for this to be correct: ggml_gallocr may alias any input tensor's buffer as scratch
     // for some node's output, and an input whose buffer got silently overwritten by a *previous*
     // compute's intermediate result stays corrupted until it's explicitly rewritten again.
-    GraphBuilder::BuildResult result = builder_.build(n_tokens, /*n_past=*/0);
+    GraphBuilder::BuildResult result = builder_.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
     ggml_tensor* latent_t = result.input_tensors.at("latent");
     ggml_tensor* timestep_t = result.input_tensors.at("timestep");
     ggml_tensor* conditioning_t = result.input_tensors.at("conditioning");

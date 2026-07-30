@@ -38,14 +38,14 @@ function synthesize(inputs)
     -- --- Phase 1a: stats = TextEncoder -> [m_p;logs_p] (channel-first [2*inter_channels,T] -- flat
     --     layout is ALREADY "T rows of 2*inter_channels contiguous floats", matching the C++ driver's
     --     own stats[t*2*inter_channels+c] indexing directly, no transpose needed). ---
-    local stats = loom.run_subgraph("stats", T, 0, text_encoder_inputs())
+    local stats = loom.run_subgraph("stats", {n_tokens = T, n_past = 0}, text_encoder_inputs())
 
     -- --- Phase 1b: logw = TextEncoder + StochasticDurationPredictor(reverse) -> [T] duration logits ---
     local z_noise = loom.gaussian_array(T * 2)
     for i = 1, #z_noise do z_noise[i] = z_noise[i] * inputs.noise_scale_w end
     local logw_inputs = text_encoder_inputs()
     logw_inputs.z_noise = z_noise
-    local logw = loom.run_subgraph("logw", T, 0, logw_inputs)
+    local logw = loom.run_subgraph("logw", {n_tokens = T, n_past = 0}, logw_inputs)
 
     -- --- Host generate_path: w_ceil[t]=ceil(exp(logw[t])*length_scale); y_length=max(sum(w_ceil),1).
     --     Degenerates to a plain "replicate column t of m_p/logs_p for w_ceil[t] frames" expansion once
@@ -82,6 +82,6 @@ function synthesize(inputs)
     end
 
     -- --- Phase 2: coupling flow (reverse) + HiFi-GAN vocoder -> waveform ---
-    local waveform = loom.run_subgraph("flow_vocoder", y_length, 0, { z_p = z_p })
+    local waveform = loom.run_subgraph("flow_vocoder", {n_tokens = y_length, n_past = 0}, { z_p = z_p })
     return waveform
 end

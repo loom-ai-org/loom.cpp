@@ -23,11 +23,11 @@ function synthesize(inputs)
     -- --- TextEncoder: mu_x (channel-first [n_feats,T_text] -- flat layout is ALREADY "T_text rows of
     --     n_feats contiguous floats each", exactly loom.expand_by_duration's own rows_flat convention,
     --     no transpose needed here) ---
-    local mu_x_ct = loom.run_subgraph("encoder_mu", t_text, 0, { tokens = inputs.tokens, positions = positions, attn_mask = attn_mask_text })
+    local mu_x_ct = loom.run_subgraph("encoder_mu", {n_tokens = t_text, n_past = 0}, { tokens = inputs.tokens, positions = positions, attn_mask = attn_mask_text })
 
     -- --- TextEncoder: logw (per-token log duration, ne=[1,T_text] -- flat index = t directly, no
     --     reindexing: t+c*T and c*T+t are the same formula when the channel count is 1). ---
-    local logw = loom.run_subgraph("encoder_logw", t_text, 0, { tokens = inputs.tokens, positions = positions, attn_mask = attn_mask_text })
+    local logw = loom.run_subgraph("encoder_logw", {n_tokens = t_text, n_past = 0}, { tokens = inputs.tokens, positions = positions, attn_mask = attn_mask_text })
 
     -- --- Real w_ceil = ceil(exp(logw)) (length_scale=1.0) -- per-token integer durations. ---
     local durations = {}
@@ -68,7 +68,7 @@ function synthesize(inputs)
     local dt = 1.0 / inputs.n_steps
     for step = 0, inputs.n_steps - 1 do
         local t = step / inputs.n_steps
-        local v = loom.run_subgraph("decoder", t_mel, 0, {
+        local v = loom.run_subgraph("decoder", {n_tokens = t_mel, n_past = 0}, {
             z = z,
             mu = mu_y,
             t = { t },
@@ -87,6 +87,6 @@ function synthesize(inputs)
     end
 
     -- --- HiFi-GAN v1 vocoder: mel [T_mel,n_feats] -> waveform ---
-    local waveform = loom.run_subgraph("vocoder", t_mel, 0, { mel = mel })
+    local waveform = loom.run_subgraph("vocoder", {n_tokens = t_mel, n_past = 0}, { mel = mel })
     return waveform
 end

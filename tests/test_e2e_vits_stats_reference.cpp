@@ -128,7 +128,7 @@ int main() {
     constexpr uint32_t kNTextLayers = 6;
 
     loom::GraphBuilder builder(stats_topo, *stats_model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build(T, 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     std::vector<int32_t> tokens_copy = token_ids;
     ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));

@@ -69,7 +69,7 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
             std::vector<float> layer_input; // only populated/used for layers > 0
 
             for (uint32_t layer = 0; layer < num_layers_; ++layer) {
-                GraphBuilder::BuildResult hr = lstm_h_builders_[layer]->build(/*n_tokens=*/0, /*n_past=*/0);
+                GraphBuilder::BuildResult hr = lstm_h_builders_[layer]->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
                 if (layer == 0) {
                     ggml_backend_tensor_set(hr.input_tensors.at("last_label"), &last_label, 0, sizeof(int32_t));
                 } else {
@@ -82,7 +82,7 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
                 h_new[layer].resize(pred_hidden_);
                 ggml_backend_tensor_get(hr.output, h_new[layer].data(), 0, h_new[layer].size() * sizeof(float));
 
-                GraphBuilder::BuildResult cr = lstm_c_builders_[layer]->build(/*n_tokens=*/0, /*n_past=*/0);
+                GraphBuilder::BuildResult cr = lstm_c_builders_[layer]->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
                 if (layer == 0) {
                     ggml_backend_tensor_set(cr.input_tensors.at("last_label"), &last_label, 0, sizeof(int32_t));
                 } else {
@@ -99,7 +99,7 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
             }
             const std::vector<float>& top_h = h_new[num_layers_ - 1];
 
-            GraphBuilder::BuildResult j_res = joint_builder_->build(/*n_tokens=*/0, /*n_past=*/0);
+            GraphBuilder::BuildResult j_res = joint_builder_->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
             ggml_backend_tensor_set(j_res.input_tensors.at("encoder_frame"), frame.data(), 0, frame.size() * sizeof(float));
             ggml_backend_tensor_set(j_res.input_tensors.at("decoder_out"), top_h.data(), 0, top_h.size() * sizeof(float));
             ggml_backend_graph_compute(backend_, j_res.graph);

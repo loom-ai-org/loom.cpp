@@ -121,7 +121,7 @@ int main() {
     loom::KvCache kv_cache(n_layer, n_embd_k, n_embd_v, /*kv_size=*/n_tokens, backend.get());
 
     loom::GraphBuilder builder(topo, *model, backend.get(), &kv_cache);
-    loom::GraphBuilder::BuildResult r = builder.build(n_tokens, /*n_past=*/0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
 
     std::vector<int32_t> tokens_copy = tokens;
     ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
