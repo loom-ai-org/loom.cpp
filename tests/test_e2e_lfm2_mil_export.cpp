@@ -1,16 +1,27 @@
-// Validates the MIL-compiler-exported LFM2-350M GGUF (export_lfm2_monolithic.py) end to end, at genuinely
-// dynamic (non-fixed, unpadded) prompt lengths -- the concern EXPORT-BACKLOG.md item 3 raised: this
-// script used to trace with a FIXED (1, 128) shape and pad every prompt up to it, so nothing ever
-// exercised the exporter's actual dynamic-`n_tokens` codepath at a real, differing prompt length. Now
-// that it traces with `ct.RangeDim`, this compares the compiled model's next-token prediction against a
-// real HF forward pass at two different prompt lengths (3 and 7 tokens) -- neither padded to any fixed
-// size -- so a shape-handling regression from tracing genuinely dynamically would show up as a
-// wrong/crashing token, not just "does it export".
+// Validates the MIL-compiler-exported LFM2-350M GGUF (export_lfm2_monolithic.py AND
+// export_lfm2_modular.py, whichever fixture(s) are present) end to end, at genuinely dynamic
+// (non-fixed, unpadded) prompt lengths -- the concern EXPORT-BACKLOG.md item 3 raised: this script used
+// to trace with a FIXED (1, 128) shape and pad every prompt up to it, so nothing ever exercised the
+// exporter's actual dynamic-`n_tokens` codepath at a real, differing prompt length. Now that it traces
+// with `ct.RangeDim`, this compares the compiled model's next-token prediction against a real HF forward
+// pass at two different prompt lengths (3 and 7 tokens) -- neither padded to any fixed size -- so a
+// shape-handling regression from tracing genuinely dynamically would show up as a wrong/crashing token,
+// not just "does it export".
 //
-// Not generated at ctest time (needs the real LFM2-350M checkpoint + coremltools) -- skips cleanly if the
-// fixture isn't present, same convention as test_e2e_qwen3_q8_0.cpp / test_e2e_vits_lua_driver.cpp etc.
-// To (re)generate the fixture: `~/.venvs/piper/bin/python3 export_lfm2_monolithic.py` from the repo root
-// (writes lfm2_350m_monolithic.gguf there), or point LOOM_LFM2_MONOLITHIC_GGUF at an existing copy.
+// The modular-profile fixture is the numeric regression test for P2's retrofit of `modular_export.py`'s
+// aux submodule (LFM2's rotary-embedding table): pre-P2 it flattened `position_embeddings=(cos, sin)`
+// into one concatenated tensor to cross the old one-output-per-topology `loom.run_subgraph` boundary;
+// post-P2 the aux submodule genuinely declares two real outputs and each decoder layer genuinely
+// declares two real "position_embeddings"/"position_embeddings_1" inputs (see modular_export.py's own
+// `_flatten_call`/`_replay` docstrings). `expected_top1` was captured directly from a real HF forward
+// pass, independent of export profile, so it's an equally valid oracle for either fixture.
+//
+// Not generated at ctest time (needs the real LFM2-350M checkpoint + coremltools) -- skips cleanly if
+// NEITHER fixture is present, same convention as test_e2e_qwen3_q8_0.cpp / test_e2e_vits_lua_driver.cpp
+// etc. To (re)generate: `~/.venvs/piper/bin/python3 export_lfm2_monolithic.py` /
+// `export_lfm2_modular.py` from the repo root (writes lfm2_350m_monolithic.gguf /
+// lfm2_350m_modular.gguf there), or point LOOM_LFM2_MONOLITHIC_GGUF / LOOM_LFM2_MODULAR_GGUF at an
+// existing copy of either.
 
 #include "test_util.h"
 
@@ -82,16 +93,31 @@ bool run_gguf_case(const std::string& gguf_path) {
 int main() {
     const char* mono_env = std::getenv("LOOM_LFM2_MONOLITHIC_GGUF");
     const std::string mono_path = mono_env != nullptr ? mono_env : "lfm2_350m_monolithic.gguf";
+    const char* modular_env = std::getenv("LOOM_LFM2_MODULAR_GGUF");
+    const std::string modular_path = modular_env != nullptr ? modular_env : "lfm2_350m_modular.gguf";
 
-    if (!path_exists(mono_path)) {
+    const bool have_mono = path_exists(mono_path);
+    const bool have_modular = path_exists(modular_path);
+
+    if (!have_mono && !have_modular) {
         std::fprintf(stderr,
-                      "skipping: '%s' not found (set LOOM_LFM2_MONOLITHIC_GGUF, or run "
-                      "export_lfm2_monolithic.py from the repo root to produce it)\n",
-                      mono_path.c_str());
+                      "skipping: neither '%s' nor '%s' found (set LOOM_LFM2_MONOLITHIC_GGUF / "
+                      "LOOM_LFM2_MODULAR_GGUF, or run export_lfm2_monolithic.py / "
+                      "export_lfm2_modular.py from the repo root to produce them)\n",
+                      mono_path.c_str(), modular_path.c_str());
         return kSkipReturnCode;
     }
 
-    run_gguf_case(mono_path);
+    if (have_mono) {
+        run_gguf_case(mono_path);
+    } else {
+        std::fprintf(stderr, "skipping monolithic case: '%s' not found\n", mono_path.c_str());
+    }
+    if (have_modular) {
+        run_gguf_case(modular_path);
+    } else {
+        std::fprintf(stderr, "skipping modular case: '%s' not found\n", modular_path.c_str());
+    }
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

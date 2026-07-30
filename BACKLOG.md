@@ -266,15 +266,32 @@ declaring it, not worth building yet. P2 only had to make the capability exist.)
   accept and reject cases), `test_compiler.py` (a real coremltools-traced two-output submodule's topology
   correctly emits `"outputs"` and survives pruning).
 
-  **Finding worth recording:** the empty diff on `lfm2_350m_modular.gguf` is not a coincidence — no model
-  on the roadmap has ever actually produced a multi-output MIL `Function` yet. `modular_export.py`'s
-  `_flatten_call`/`_replay` already work around the pre-P2 one-output limitation by concatenating a
-  tuple-valued output (e.g. LFM2's rotary-embedding table's real `(cos, sin)`) into a single tensor on
-  both the producing and consuming side, specifically *because* multi-output topologies didn't exist.
-  That workaround is still in place (P2 didn't touch it) and there was no live bug for P2 to fix — P2 is
-  purely enabling infrastructure for `P4.3`'s composition template (an encoder producing more than one
-  real intermediate output) and any future `while_loop`-inference work, not a correctness fix for
-  anything currently exported.
+  **Finding worth recording:** the empty diff on `lfm2_350m_modular.gguf` (at the time P2 itself landed)
+  was not a coincidence — no model on the roadmap had ever actually produced a multi-output MIL
+  `Function`. `modular_export.py`'s `_flatten_call`/`_replay` worked around the pre-P2 one-output
+  limitation by concatenating a tuple-valued output (LFM2's rotary-embedding table's real `(cos, sin)`)
+  into a single tensor on both the producing and consuming side, specifically *because* multi-output
+  topologies didn't exist. P2 itself didn't touch that workaround, so there was no live bug for P2's own
+  gate to catch.
+
+  **P2.4 — retrofit `modular_export.py` off the concat workaround — DONE (follow-up).** Once P2 landed,
+  the workaround became unnecessary rather than merely undesirable, so it was removed in the same
+  session: `_flatten_call` now emits one real leaf per tuple element (named `k`/`k_1`/`k_2`/... —
+  `apply_modular_export`'s own `is_aux_input`/idx-suffix convention already anticipated exactly this
+  naming, unchanged) instead of concatenating, and `_replay` returns a module's own tuple output as-is
+  (`torch.jit.trace`+`ct.convert` turn a tuple-of-tensors return into that many real MIL `Function`
+  outputs directly — confirmed empirically before relying on it). `exporter.py`'s driver-synthesis side
+  needed zero changes — the aux `SubgraphCall`'s `outputs=[f"_mod_aux_{i}" for i in
+  range(len(aux_output_names))]` and each layer's positional `aux_out_vars[idx]` wiring were already
+  written for N outputs; they'd just never had more than one to work with before.
+  **Gate — passed:** re-exported `lfm2_350m_modular.gguf` — `model.graph_topology.aux` now declares
+  `"outputs"` with 2 real entries (was a single concatenated `"output"`), and every attention-type
+  `layer_i` (not the conv-type ones, which never touch `position_embeddings` at all) now declares two
+  real inputs `position_embeddings`/`position_embeddings_1` (was one concatenated tensor). `LOOM_CHECK`'d
+  against real HF top-1 predictions at two prompt lengths via `test_e2e_lfm2_mil_export`'s existing
+  `run_gguf_case` oracle (extended to also exercise `LOOM_LFM2_MODULAR_GGUF`/`lfm2_350m_modular.gguf`
+  alongside the monolithic fixture it already covered) — both prompts match HF exactly, same as the
+  monolithic export. Full `pytest` (143/143) and `ctest` (140/140) green.
 
 Not required to land before P3 for any *technical* reason (the API skeleton doesn't depend on multi-output
 support existing) — ordered here because it changes what a family template's own spec needs to be able to

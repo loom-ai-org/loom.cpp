@@ -62,8 +62,8 @@ class ModularExportResult:
 @dataclass
 class _LeafPath:
     name: str
-    kind: str  # "arg" | "kwarg" | "kwarg_concat"
-    key: object  # int for "arg"; str for "kwarg"; (str, split_sizes) for "kwarg_concat"
+    kind: str  # "arg" | "kwarg" | "kwarg_tuple_item"
+    key: object  # int for "arg"; str for "kwarg"; (str, index) for "kwarg_tuple_item"
 
 
 def _positional_param_names(module: nn.Module, count: int):
@@ -75,13 +75,18 @@ def _positional_param_names(module: nn.Module, count: int):
 def _flatten_call(module: nn.Module, args: tuple, kwargs: dict):
     """Flattens a captured (args, kwargs) call into a name-ordered list of real tensor leaves, forcing
     known stateful-cache kwargs to None (see _CACHE_KWARG_NAMES). A tuple/list-valued kwarg (e.g.
-    `position_embeddings=(cos, sin)`) becomes ONE leaf, the tensors concatenated along their last axis
-    -- not one leaf per element -- because the engine's `loom.run_subgraph` supports exactly one
-    output tensor per topology (data + its own shape, always exactly two Lua return values), so a
-    once-computed shared value (e.g. LFM2's rotary table, traced as its own "aux" submodule in
-    export_modular) can only ever be threaded into a repeated-block call as a single tensor.
-    Concatenating here and splitting back in `_replay` keeps that single-tensor boundary on both the
-    producing and consuming side without the driver ever needing to know the original tuple shape."""
+    `position_embeddings=(cos, sin)`) becomes one leaf PER element, not one concatenated leaf -- P2
+    (EXPORT-ROADMAP.md / BACKLOG.md's implementation sequence) gave `GraphBuilder`/`loom.run_subgraph`
+    real multi-input/multi-output support, so a once-computed shared value (e.g. LFM2's rotary table,
+    traced as its own "aux" submodule in export_modular) no longer has to be flattened into a single
+    tensor to cross the run_subgraph boundary intact.
+
+    Leaf names follow exporter.py's `apply_modular_export`/`is_aux_input` naming convention exactly:
+    element 0 of a tuple-valued kwarg named `k` is named plain `k`; element i>=1 is named `f"{k}_{i}"`.
+    `apply_modular_export` positionally maps the aux submodule's own i-th declared OUTPUT to the i-th
+    such input across every repeated-block call, so both this function and `_replay` below must walk
+    the tuple in the same order every real caller already does (a plain, untouched Python tuple) --
+    neither side ever has to know or re-derive what index a name like "position_embeddings_1" means."""
     kwargs = dict(kwargs)
     for k in _CACHE_KWARG_NAMES:
         kwargs.pop(k, None)
@@ -99,9 +104,10 @@ def _flatten_call(module: nn.Module, args: tuple, kwargs: dict):
             paths.append(_LeafPath(k, "kwarg", k))
             values.append(val)
         elif isinstance(val, (tuple, list)) and len(val) > 0 and all(isinstance(x, torch.Tensor) for x in val):
-            split_sizes = [item.shape[-1] for item in val]
-            paths.append(_LeafPath(k, "kwarg_concat", (k, split_sizes)))
-            values.append(torch.cat(list(val), dim=-1))
+            for i, item in enumerate(val):
+                leaf_name = k if i == 0 else f"{k}_{i}"
+                paths.append(_LeafPath(leaf_name, "kwarg_tuple_item", (k, i)))
+                values.append(item)
 
     return list(args), kwargs, paths, values
 
@@ -109,24 +115,28 @@ def _flatten_call(module: nn.Module, args: tuple, kwargs: dict):
 def _replay(module, args_template, kwargs_template, paths, tensors):
     args = list(args_template)
     kwargs = dict(kwargs_template)
+    tuple_kwargs = {}  # base kwarg name -> {index: tensor}, regrouped after the loop below
     for path, tensor in zip(paths, tensors):
         if path.kind == "arg":
             args[path.key] = tensor
         elif path.kind == "kwarg":
             kwargs[path.key] = tensor
         else:
-            k, split_sizes = path.key
-            kwargs[k] = tuple(torch.split(tensor, split_sizes, dim=-1))
+            k, idx = path.key
+            tuple_kwargs.setdefault(k, {})[idx] = tensor
+    for k, items in tuple_kwargs.items():
+        kwargs[k] = tuple(items[i] for i in range(len(items)))
     result = module(*args, **kwargs)
     if isinstance(result, (tuple, list)):
-        # Mirror the concat done on the way in: the engine can only carry one output tensor per
-        # subgraph, so a module that itself returns a tuple (e.g. LFM2's rotary embedding returning
-        # (cos, sin)) must have its outputs concatenated here too, along the same axis a consumer's
-        # own tuple-valued kwarg was split from.
+        # A module that itself returns a tuple (e.g. LFM2's rotary embedding returning (cos, sin)) is
+        # traced with that tuple returned AS-IS (P2) -- torch.jit.trace + ct.convert turn a
+        # tuple-of-tensors return into that many real MIL Function outputs, no longer squashed into one
+        # concatenated tensor. See this function's own docstring note in `_flatten_call` for how the
+        # ORDER here matches the consuming side's own index-by-position convention.
         if not all(isinstance(r, torch.Tensor) for r in result):
             raise ValueError(f"{type(module).__name__} returned a tuple with non-tensor element(s): "
                               f"{[type(r).__name__ for r in result]}")
-        result = torch.cat(list(result), dim=-1)
+        result = tuple(result)
     return result
 
 
