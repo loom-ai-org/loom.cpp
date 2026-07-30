@@ -159,19 +159,25 @@ def test_ctc_spec_without_a_decoder_raises_before_tracing():
 
 # -- the real specs ----------------------------------------------------------------------------------
 
-def test_the_three_real_export_scripts_declare_distinct_specs():
+def test_the_three_registered_recognizers_declare_distinct_specs():
     """Guards the one mistake a copy-pasted spec makes: two models writing the same output file, or
-    claiming the same architecture string."""
-    import importlib.util
+    claiming the same architecture string. Was `test_the_three_real_export_scripts_declare_distinct_specs`,
+    dynamically loading export_conformer_ctc_mil.py/export_parakeet_{tdt,rnnt}_mil.py -- those scripts
+    are gone (BACKLOG.md P3.2: replaced by registry entries), so this now builds each recognizer's
+    ASRNemoEncoderExportConfig directly via the registry instead, against the same three real checkpoint
+    paths those scripts used to hardcode."""
+    from loom_mil_compiler.registry import default_registry
 
-    repo = Path(__file__).resolve().parents[2]
-    specs = []
-    for name in ("export_conformer_ctc_mil", "export_parakeet_tdt_mil", "export_parakeet_rnnt_mil"):
-        spec_file = repo / f"{name}.py"
-        module_spec = importlib.util.spec_from_file_location(name, spec_file)
-        module = importlib.util.module_from_spec(module_spec)
-        module_spec.loader.exec_module(module)
-        specs.append(module.SPEC)
+    checkpoints = {
+        "conformer-ctc": "/home/flavio/Dev/models/conformer-ctc-small/stt_en_conformer_ctc_small.nemo",
+        "parakeet-tdt": "/home/flavio/Dev/models/parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo",
+        "parakeet-rnnt": "/home/flavio/Dev/models/parakeet_rnnt_model/parakeet-rnnt-0.6b.nemo",
+    }
+    registry = default_registry()
+    specs = [
+        registry.get("nemo-asr-encoder", name).build_config(Path(checkpoint), f"{name}.gguf")
+        for name, checkpoint in checkpoints.items()
+    ]
 
     assert len({s.architecture for s in specs}) == 3
     assert len({s.output_path for s in specs}) == 3

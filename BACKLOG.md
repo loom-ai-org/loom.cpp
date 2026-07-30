@@ -338,11 +338,44 @@ exists, before that template's own shape is locked in.
   else) and `ctest` (140/140) green, including real end-to-end numeric verification via
   `test_e2e_lfm2_mil_export` (both profiles) and `test_e2e_parakeet_{tdt,rnnt}_mil_export` against their
   real HF/NeMo oracles.
-- **P3.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI.** Registry keyed on HF
-  `config.json` `model_type`/`architectures` and on the `target` class inside a `.nemo` archive. The
-  loader is a *separate* registry entry from the family template — this is what P4.2 (GigaAM) tests.
-  **Acceptance:** `export_conformer_ctc_mil.py`, both Parakeet scripts and `export_qwen3_mil.py` are
-  deleted and replaced by registry entries.
+- **P3.2 — `TaskRegistry` + loaders + `main_export()` + `loom-export` CLI — DONE.** Registry key is the
+  **task**, not the model — a correction made during implementation, per explicit user direction: an
+  earlier draft keyed the registry per model (`"qwen3"`, `"kokoro"`, ...), which conflates two axes
+  `optimum` deliberately keeps separate. `task` names the export shape a `LoomExportConfig` family
+  builds (`"causal-lm"`, `"nemo-asr-encoder"`, mirroring `optimum`'s own `"text-generation"`/
+  `"automatic-speech-recognition"` vocabulary); *which* model a checkpoint actually is gets resolved
+  separately, by a `ModelRecognizer` (real `detect()` structural check + `build_config()`) registered
+  under that task. `tools/loom_mil_compiler/registry.py`'s `TaskRegistry`/`TaskRegistryEntry`/
+  `ModelRecognizer` implement this; `main_export()` (`main_export.py`) resolves `(task, model)` from a
+  path via `registry.detect()` when neither is given, `registry.get()` when both are — a lone `--model`
+  without `--task` raises rather than guessing which family to look it up in.
+
+  Two tasks registered this pass, matching P3.1's classes: `causal-lm` (`qwen3`, detected via HF-style
+  `config.json`'s `model_type == "qwen3"`) and `nemo-asr-encoder` (`conformer-ctc`/`parakeet-tdt`/
+  `parakeet-rnnt`, detected by opening the `.nemo` archive's `model_config.yaml` directly via `tarfile`
+  + `yaml.safe_load` — no `ASRModel.restore_from`, no untar-to-tempdir, so detection alone is cheap).
+  **Real finding, confirmed by reading all three checkpoints' own configs**: Parakeet-TDT and
+  Parakeet-RNNT both restore through the identical `EncDecRNNTBPEModel` `target` (matching
+  `nemo_asr_export.py`'s own earlier finding that the restore class never varies for this family), so
+  `target` alone cannot tell them apart — the real secondary discriminator is
+  `model_defaults.tdt_durations` (present only in TDT's config). Conformer-CTC's `target`
+  (`EncDecCTCModelBPE`) is unambiguous on its own.
+
+  `loom-export` (root-level bash launcher, `PYTHONPATH`-based rather than `cd`-based so a relative
+  `-o`/model-path argument still resolves against the caller's own cwd) + `main_export.py`'s CLI
+  (`--task`/`--model` overrides) are the `python3 -m tools.loom_mil_compiler.export_hf_causal_lm`-style
+  entry point BACKLOG.md's own R3 example (`loom-export nvidia/parakeet-tdt-0.6b-v3 -o parakeet.gguf`)
+  described. `export_conformer_ctc_mil.py`, both Parakeet scripts and `export_qwen3_mil.py` are deleted;
+  `test_nemo_asr_export.py`'s own copy-paste-guard test (previously dynamically loading those three
+  scripts) now builds each recognizer's config through the registry instead, against the same three real
+  checkpoint paths. New `test_registry.py` covers the registry/recognizers directly with synthetic
+  fixtures (a fake HF dir, fake `.nemo` archives with synthetic `model_config.yaml` content) — no real
+  checkpoints needed for the detection logic itself.
+
+  **Gate — passed:** `loom-export` (auto-detected, and again with explicit `--task`/`--model`) for all
+  four models, snapshot-diffed against the same pre-P3 baseline — zero-byte diff in every case. Full
+  `pytest` (161/161: 143 from P3.1 + 18 new in `test_registry.py`) and `ctest` (140/140) green, including
+  `test_e2e_parakeet_{tdt,rnnt}_mil_export` run directly against the registry-produced GGUFs.
 - **P3.3 — `ModelPatcher` + `DummyInputGenerator`.** Fold the four long TTS scripts' wrapping into
   declared patchers. **Acceptance:** `export_kokoro_mil.py` (503), `export_matcha_mil.py` (448),
   `export_vits_mil.py` (382) and `export_styletts2_mil.py` (350) are deleted. Encode the traced-output
