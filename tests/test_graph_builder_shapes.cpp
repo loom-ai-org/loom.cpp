@@ -80,6 +80,86 @@ void test_unresolved_input_throws(loom::GgufModel& model, ggml_backend_t backend
     LOOM_CHECK_THROWS(builder.build({{"n_tokens", 2}, {"n_past", 0}}), loom::SchemaError);
 }
 
+// P2 (EXPORT-ROADMAP.md / BACKLOG.md's implementation sequence): a topology can declare more than one
+// co-equal output. "y" and "z" below are computed independently from the same "cur", and two more nodes
+// (same shape as "z") are computed AFTER "z" but don't depend on it at all -- exactly the shape of bug
+// test_primitive_registry.cpp's own hand-built multi-output test guards against: without its own
+// ggml_set_output(), gallocr's liveness analysis would see "z" has no reader once "normed"/"cur" go out
+// of scope and free its buffer for reuse by one of those later same-size tensors, corrupting it before
+// this test ever reads it back. Verified against two known-good SINGLE-output builds of the identical
+// "y"/"z" sub-computations as the oracle, rather than hand-transcribed expected floats.
+void test_multi_output_build(loom::GgufModel& model, ggml_backend_t backend) {
+    const char* multi_json = R"JSON({
+      "version": 1,
+      "inputs": [{"name":"tokens","dtype":"i32","shape":["n_tokens"]}],
+      "outputs": ["y", "z"],
+      "nodes": [
+        {"op": "GET_ROWS", "inputs": ["token_embd.weight", "tokens"], "outputs": ["cur"]},
+        {"op": "MUL_MAT", "inputs": ["output.weight", "cur"], "outputs": ["y"]},
+        {"op": "RMS_NORM", "inputs": ["cur"], "outputs": ["normed"], "attrs": {"eps": "$rms_norm_eps"}},
+        {"op": "MUL", "inputs": ["normed", "blk.0.norm.weight"], "outputs": ["z"]},
+        {"op": "MUL_MAT", "inputs": ["blk.0.ffn.weight", "z"], "outputs": ["ffn_out"]},
+        {"op": "ADD", "inputs": ["ffn_out", "cur"], "outputs": ["dummy_unused"]}
+      ]
+    })JSON";
+    const char* y_only_json = R"JSON({
+      "version": 1,
+      "inputs": [{"name":"tokens","dtype":"i32","shape":["n_tokens"]}],
+      "output": "y",
+      "nodes": [
+        {"op": "GET_ROWS", "inputs": ["token_embd.weight", "tokens"], "outputs": ["cur"]},
+        {"op": "MUL_MAT", "inputs": ["output.weight", "cur"], "outputs": ["y"]}
+      ]
+    })JSON";
+    const char* z_only_json = R"JSON({
+      "version": 1,
+      "inputs": [{"name":"tokens","dtype":"i32","shape":["n_tokens"]}],
+      "output": "z",
+      "nodes": [
+        {"op": "GET_ROWS", "inputs": ["token_embd.weight", "tokens"], "outputs": ["cur"]},
+        {"op": "RMS_NORM", "inputs": ["cur"], "outputs": ["normed"], "attrs": {"eps": "$rms_norm_eps"}},
+        {"op": "MUL", "inputs": ["normed", "blk.0.norm.weight"], "outputs": ["z"]}
+      ]
+    })JSON";
+
+    const std::vector<int32_t> tokens = {1, 3, 4};
+
+    auto run = [&](const char* json) {
+        loom::GraphTopology topo = loom::GraphTopology::parse(json);
+        loom::GraphBuilder builder(topo, model, backend);
+        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", tokens.size()}, {"n_past", 0}});
+        ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens.data(), 0, tokens.size() * sizeof(int32_t));
+        ggml_backend_graph_compute(backend, r.graph);
+        return r;
+    };
+
+    loom::GraphBuilder::BuildResult multi = run(multi_json);
+    LOOM_CHECK(multi.outputs.size() == 2);
+    LOOM_CHECK(multi.output == multi.outputs[0]);
+
+    loom::GraphBuilder::BuildResult y_only = run(y_only_json);
+    loom::GraphBuilder::BuildResult z_only = run(z_only_json);
+
+    LOOM_CHECK(multi.outputs[0]->ne[0] == y_only.output->ne[0]);
+    LOOM_CHECK(multi.outputs[0]->ne[1] == y_only.output->ne[1]);
+    LOOM_CHECK(multi.outputs[1]->ne[0] == z_only.output->ne[0]);
+    LOOM_CHECK(multi.outputs[1]->ne[1] == z_only.output->ne[1]);
+
+    const size_t y_n = static_cast<size_t>(ggml_nelements(multi.outputs[0]));
+    const size_t z_n = static_cast<size_t>(ggml_nelements(multi.outputs[1]));
+    std::vector<float> y_multi(y_n), y_single(y_n), z_multi(z_n), z_single(z_n);
+    ggml_backend_tensor_get(multi.outputs[0], y_multi.data(), 0, y_n * sizeof(float));
+    ggml_backend_tensor_get(y_only.output, y_single.data(), 0, y_n * sizeof(float));
+    ggml_backend_tensor_get(multi.outputs[1], z_multi.data(), 0, z_n * sizeof(float));
+    ggml_backend_tensor_get(z_only.output, z_single.data(), 0, z_n * sizeof(float));
+
+    for (size_t i = 0; i < y_n; ++i) LOOM_CHECK(y_multi[i] == y_single[i]);
+    // "z" is the one whose buffer a pre-P2-style single-set_output build would have left vulnerable to
+    // reuse by "ffn_out"/"dummy_unused" (computed after it, same shape) -- this is the check that would
+    // fail if ggml_set_output()/build_forward_expand were only ever called for the FIRST declared output.
+    for (size_t i = 0; i < z_n; ++i) LOOM_CHECK(z_multi[i] == z_single[i]);
+}
+
 void test_reserve_does_not_break_subsequent_builds(loom::GgufModel& model, ggml_backend_t backend) {
     loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json());
     loom::GraphBuilder builder(topo, model, backend);
@@ -101,6 +181,7 @@ int main() {
     test_unresolved_output_throws(*model, backend.get());
     test_unknown_op_throws(*model, backend.get());
     test_unresolved_input_throws(*model, backend.get());
+    test_multi_output_build(*model, backend.get());
     test_reserve_does_not_break_subsequent_builds(*model, backend.get());
 
     LOOM_TEST_REPORT_AND_RETURN();

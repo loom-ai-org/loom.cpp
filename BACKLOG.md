@@ -94,7 +94,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 |---|---|---|---|---|
 | **P0** | clear the ground — DONE | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
-| **P2** | enable multi-output topologies | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
+| **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P2 |
 | **P4** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
@@ -218,7 +218,7 @@ repeat):
   (SupertonicTTS `vfe`/`dp`, Kokoro/StyleTTS2 `decoder_vocoder`, Matcha `text_encoder`/`decoder`/
   `vocoder`, Conformer-CTC).
 
-#### P2 — enable multi-output topologies
+#### P2 — enable multi-output topologies — DONE
 
 The engine's one-output-tensor-per-topology convention (`loom.run_subgraph` returns data + shape, see
 `modular_export.py`'s `_flatten_call` comment) is a real, deliberate constraint everywhere it's been
@@ -227,22 +227,54 @@ an `IterativeRefinementSpec` directly from a scripted-loop trace instead of hand
 body has one output per loop-carried var; see BACKEND.md item 3's follow-up, where two of the three real
 prerequisites for that already hold). Scheduled here, before P3's config schema settles, so
 `LoomExportConfig`'s iterative-refinement shape doesn't have to assume "always hand-declared" only to be
-revisited once inference becomes possible.
+revisited once inference becomes possible. (The `while_loop`-inference *use* of this capability is still
+deliberately not pursued — BACKEND.md's own finding was that its payoff is inferring the spec rather than
+declaring it, not worth building yet. P2 only had to make the capability exist.)
 
-- **P2.1 — multi-output support in `GraphBuilder`/`run_subgraph`.** The engine-level change: a topology
-  can declare more than one output tensor, and `run_subgraph` returns all of them rather than one
-  data+shape pair.
-- **P2.2 — generalize `generate_graph_topology` and `_prune_dead_nodes`.** Today's exporter takes
-  `ops_list[-1]`'s output as *the* topology output and prunes everything unreachable from it (correctly,
-  for one output) — both need to accept a *set* of declared outputs and keep everything reachable from
-  any of them. This is the structural blocker BACKEND.md's follow-up hit directly: feeding a MIL loop
-  body through today's single-output path collapses it to the counter increment alone.
-- **P2.3 — driver-side plumbing.** `transpile_operation`'s `SubgraphCall` lowering and the Lua
-  `loom.run_subgraph` binding both need to consume/return multiple values; `_finalize_driver`'s
-  validation extends accordingly.
-  **Gate:** every existing model's topologies are still single-output and byte-identical
-  (`snapshot_gguf.py`/`compare_snapshots.py` — this must not be a silent behavior change for anything
-  already exported); a new multi-output test topology exercises the full path end-to-end.
+- **P2.1 — multi-output support in `GraphBuilder`/`run_subgraph` — DONE.** `GraphTopology` gained a
+  `std::vector<std::string> outputs` (JSON's plural `"outputs"` array; singular `"output"` still parses,
+  wrapped into a one-element vector — `outputs.front()` always equals `output`). `GraphBuilder::BuildResult`
+  gained `std::vector<ggml_tensor*> outputs` alongside the existing `output` field (`== outputs.front()`,
+  unchanged for every pre-P2 caller). `build()` now `ggml_set_output()`s and `ggml_build_forward_expand()`s
+  every declared output before the one `ggml_gallocr_alloc_graph()` call, mirroring the "mark every
+  co-equal output before allocating once" pattern `test_primitive_registry.cpp`'s own hand-built
+  multi-output test already documented as load-bearing (an output tensor without its own
+  `ggml_set_output()` can have its buffer reclaimed by gallocr once nothing else reads it).
+- **P2.2 — generalize `generate_graph_topology` and `_prune_dead_nodes` — DONE.** Both now take the full
+  list of a function's declared outputs (`func.outputs`, not just `func.outputs[0]`); `_prune_dead_nodes`
+  keeps everything reachable from *any* declared output. The emitted topology dict still writes singular
+  `"output"` (byte-identical) for the one-output case and only switches to plural `"outputs"` when a
+  function genuinely declares more than one.
+- **P2.3 — driver-side plumbing — DONE.** `lua_bridge.cpp`'s `l_run_subgraph` returns every output's DATA
+  (declared order) followed by every output's SHAPE (same order) — for one output that's exactly the
+  `(data, shape)` pair the binding always returned, so no existing driver script's call site needed to
+  change. `driver_ir.py`'s `check_subgraph_calls` was extended to validate a `SubgraphCall`'s `outputs`
+  count against the target topology's declared output count, and that `extra_outputs` (shape captures)
+  only appear once every data output has been captured first (partial capture then a shape would silently
+  bind a shape-named local to the next output's DATA instead, since `run_subgraph` returns all data
+  before any shape). `transpile_operation`'s existing "D. Submodule Dispatch" case (a nested-Function op
+  binds one Lua local per `op.outputs`) already anticipated N-output calls; it needed no change.
+  **Gate — passed:** two real models re-exported and `snapshot_gguf.py`-diffed against a pristine
+  pre-P2 baseline (`git archive HEAD`) — zero-byte diff for both `lfm2_350m_modular.gguf` (the
+  `apply_modular_export` path, ~20 topologies including the `aux` rotary-embedding submodule) and
+  `supertonic_mil.gguf` (the `IterativeRefinementSpec` template); full `pytest` (143 tests, 9 new) and
+  `ctest` (140 tests, 1 pre-existing unrelated failure confirmed present on the unmodified baseline too)
+  green. New multi-output coverage at every layer: `test_graph_topology_parse.cpp` (JSON parsing),
+  `test_graph_builder_shapes.cpp` (a two-output build verified against two independent single-output
+  oracle builds of the same sub-computations), `test_lua_bridge_run_subgraph.cpp` (the Lua-visible
+  data-then-shapes return convention), `test_driver_ir.py` (`check_subgraph_calls`'s new validation, both
+  accept and reject cases), `test_compiler.py` (a real coremltools-traced two-output submodule's topology
+  correctly emits `"outputs"` and survives pruning).
+
+  **Finding worth recording:** the empty diff on `lfm2_350m_modular.gguf` is not a coincidence — no model
+  on the roadmap has ever actually produced a multi-output MIL `Function` yet. `modular_export.py`'s
+  `_flatten_call`/`_replay` already work around the pre-P2 one-output limitation by concatenating a
+  tuple-valued output (e.g. LFM2's rotary-embedding table's real `(cos, sin)`) into a single tensor on
+  both the producing and consuming side, specifically *because* multi-output topologies didn't exist.
+  That workaround is still in place (P2 didn't touch it) and there was no live bug for P2 to fix — P2 is
+  purely enabling infrastructure for `P4.3`'s composition template (an encoder producing more than one
+  real intermediate output) and any future `while_loop`-inference work, not a correctness fix for
+  anything currently exported.
 
 Not required to land before P3 for any *technical* reason (the API skeleton doesn't depend on multi-output
 support existing) — ordered here because it changes what a family template's own spec needs to be able to
@@ -329,11 +361,11 @@ All are recorded in full in BACKEND.md; this is the index.
     rational coefficients over sums on construction (`floor((n-512)/160)` → `floor(n/160 - 16/5)`), and
     the engine evaluates in `double`, where the distributed form takes three roundings inside a floor
     instead of one.
-- **Multi-output topologies in `GraphBuilder`/`run_subgraph` — now scheduled as P2** in the
-  implementation sequence above. The engine's one-output-tensor-per-topology convention is the single
-  thing standing between the current state and inferring an `IterativeRefinementSpec` directly from a
-  scripted-loop trace (a MIL loop body has one output per loop-carried var). BACKEND.md's item 3
-  follow-up has the full analysis, including the two of three prerequisites that already hold.
+- **Multi-output topologies in `GraphBuilder`/`run_subgraph` — DONE, see P2** in the implementation
+  sequence above. The capability now exists; *using* it to infer an `IterativeRefinementSpec` from a
+  scripted-loop trace (a MIL loop body has one output per loop-carried var) is still deliberately not
+  pursued — BACKEND.md's item 3 follow-up found that inferring the spec isn't worth building yet compared
+  to the ~13-line declarative spec it would replace.
 - **Item 5 of `EXPORT-IMPROVEMENT.md` (prototype StableHLO on one solved model)** remains deliberately
   not started; the proposal itself files it as a validation exercise rather than a fix.
 

@@ -40,6 +40,12 @@ target_compile_definitions(test_graph_builder_shapes PRIVATE LOOM_TEST_FIXTURE_D
 add_test(NAME test_graph_builder_shapes COMMAND test_graph_builder_shapes)
 set_tests_properties(test_graph_builder_shapes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+add_executable(test_lua_bridge_run_subgraph test_lua_bridge_run_subgraph.cpp)
+target_link_libraries(test_lua_bridge_run_subgraph PRIVATE loom::engine)
+target_compile_definitions(test_lua_bridge_run_subgraph PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_lua_bridge_run_subgraph COMMAND test_lua_bridge_run_subgraph)
+set_tests_properties(test_lua_bridge_run_subgraph PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 add_executable(test_gallocr_reserve_reuse test_gallocr_reserve_reuse.cpp)
 target_link_libraries(test_gallocr_reserve_reuse PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_reserve_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")

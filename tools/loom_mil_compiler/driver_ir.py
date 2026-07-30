@@ -347,9 +347,21 @@ def _walk_subgraph_calls(stmts: list):
             yield from _walk_subgraph_calls(stmt.body)
 
 
+def _topology_output_names(topo: dict) -> list:
+    """A topology declares its output(s) as either "outputs" (plural array, P2 multi-output) or "output"
+    (singular string, every model on the roadmap before P2 and every single-output topology since) --
+    see graph_topology.h's own comment on this same distinction. Normalizes both into a plain list."""
+    if "outputs" in topo:
+        return list(topo["outputs"])
+    if "output" in topo:
+        return [topo["output"]]
+    return []
+
+
 def check_subgraph_calls(function: Function, topologies: dict) -> None:
     """For every SubgraphCall, confirms its `inputs` dict keys are all inputs the target topology actually
-    declares. Topologies not present in `topologies` (e.g. synthesized/registered elsewhere) are skipped,
+    declares, and that its `outputs`/`extra_outputs` don't request more than the topology actually
+    produces. Topologies not present in `topologies` (e.g. synthesized/registered elsewhere) are skipped,
     not treated as an error."""
     for call in _walk_subgraph_calls(function.body):
         topo = topologies.get(call.module)
@@ -362,6 +374,27 @@ def check_subgraph_calls(function: Function, topologies: dict) -> None:
             raise DriverIRError(
                 f"driver IR: loom.run_subgraph('{call.module}', ...) passes undeclared input(s) "
                 f"{sorted(extra)}; topology '{call.module}' only declares inputs {sorted(declared)}"
+            )
+
+        # loom.run_subgraph returns every declared output's DATA first (in declared order), THEN every
+        # declared output's SHAPE in that same order (lua_bridge.cpp's l_run_subgraph) -- so `outputs`
+        # (the data locals) can request anywhere from 0 up to N of them (Lua silently discards
+        # uncaptured trailing return values), but `extra_outputs` (shape locals) only line up correctly
+        # if EVERY data output was captured first; a partial `outputs` list would make `extra_outputs`
+        # silently capture data values instead of shapes.
+        declared_outputs = _topology_output_names(topo)
+        n_declared = len(declared_outputs)
+        if len(call.outputs) > n_declared:
+            raise DriverIRError(
+                f"driver IR: loom.run_subgraph('{call.module}', ...) captures {len(call.outputs)} data "
+                f"output(s) but topology '{call.module}' only declares {n_declared}: {declared_outputs}"
+            )
+        if call.extra_outputs and len(call.outputs) != n_declared:
+            raise DriverIRError(
+                f"driver IR: loom.run_subgraph('{call.module}', ...) requests {len(call.extra_outputs)} "
+                f"shape output(s) via extra_outputs but only captures {len(call.outputs)}/{n_declared} "
+                f"data outputs first; capturing a shape requires capturing every data output first "
+                f"(topology '{call.module}' declares {declared_outputs})"
             )
 
 

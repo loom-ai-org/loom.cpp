@@ -58,7 +58,19 @@ GraphTopology GraphTopology::parse(const std::string& json_text) {
             topo.inputs.push_back(std::move(spec));
         }
 
-        topo.output = j.at("output").get<std::string>();
+        // "outputs" (plural, JSON array) declares a multi-output topology (P2); "output" (singular
+        // string) is both the original schema and the byte-identical serialization every single-output
+        // topology still uses -- see graph_topology.h's own comment on the two fields.
+        if (j.contains("outputs")) {
+            topo.outputs = j.at("outputs").get<std::vector<std::string>>();
+            if (topo.outputs.empty()) {
+                throw SchemaError("GraphTopology::parse: 'outputs' array must not be empty");
+            }
+            topo.output = topo.outputs.front();
+        } else {
+            topo.output = j.at("output").get<std::string>();
+            topo.outputs = {topo.output};
+        }
 
         for (const Json& node_json : j.at("nodes")) {
             topo.items.push_back(parse_item(node_json));
