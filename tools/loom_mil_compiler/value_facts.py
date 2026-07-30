@@ -36,7 +36,7 @@ distinction is part of what the engine reads back.
 import numpy as np
 from coremltools.converters.mil.mil import Var
 
-from .shape_expr import as_expr, floor_div, render, to_number
+from .shape_expr import as_expr, floor_div, has_dynamic_symbol, render, to_number
 
 # MIL arithmetic ops `scalar_expr` can fold into a real expression, and the sympy operation each maps
 # to. `floor_div` is `real_div` wrapped in an explicit floor(), exactly as the engine's evaluator (which
@@ -206,6 +206,39 @@ class ValueFacts:
         result = self.exporter._infer_dynamic_dim_expr_uncached(var, torch_axis)
         self._dim_expr[key] = (var, result)
         return result
+
+    def annotate_dynamic_shapes(self, program) -> None:
+        """Eagerly resolves (and memoizes, via `dim_expr`) every dynamic axis of every Var's shape in
+        `program`, once, in one pass over the whole graph -- EXPORT-ROADMAP.md R2b.
+
+        Functionally a no-op: `dim_expr` is already memoized per `(id(var), axis)`, so whichever
+        consumer touches a given Var's shape first gets the exact same answer this produces, and every
+        later touch was already O(1). What changes is *when*: derivation now runs once, in a
+        deterministic walk over the whole (already MIL-pass-canonicalized) graph right after
+        `apply_loom_mil_passes`, rather than being triggered ad hoc by whichever of a model's several
+        topologies (`generate_graph_topology` runs once per submodule/slice) happens to visit a given
+        Var first. That turns this module's memo from an incidental cache into the real "annotate once,
+        up front" pass R2 asks for -- and is the precondition for ever auditing the C++ "heal
+        transposed/permuted layouts" heuristics (BACKLOG.md), which needs every shape already resolved
+        rather than derived lazily by whichever consumer happens to ask first.
+
+        Call once per exporter, before any topology/driver generation walks `program` -- mirroring
+        `apply_loom_mil_passes`'s own "runs once, up front" contract.
+        """
+        for func in program.functions.values():
+            self._annotate_block(func)
+
+    def _annotate_block(self, block) -> None:
+        for op in block.operations:
+            for b in op.blocks:
+                self._annotate_block(b)
+            for var in op.outputs:
+                shape = getattr(var, "shape", None)
+                if shape is None:
+                    continue
+                for axis, dim in enumerate(shape):
+                    if has_dynamic_symbol(dim):
+                        self.dim_expr(var, axis)
 
     def scalar_expr(self, v, _seen=None):
         """

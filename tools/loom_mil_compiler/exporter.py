@@ -148,6 +148,9 @@ class LoomGGUFExporter:
         # The one place any "what is this Var's compile-time value?" question gets answered, for both
         # this class and the op-handler table -- see value_facts.py's own module docstring.
         self.facts = ValueFacts(self)
+        # Set by `_ensure_mil_passes_applied` the first time it runs (or decides not to, for the
+        # bespoke/MockOperation workflow) -- see that method's own docstring.
+        self._mil_passes_applied = False
 
     def _resolve_declared_axes(self, program, declared_axes):
         """`{input name: {torch axis: expression}}` -> `{raw MIL symbol name: expression}`, by reading
@@ -1019,6 +1022,38 @@ class LoomGGUFExporter:
         reversed_shape = list(reversed(shape))
         return {"name": name, "dtype": dtype, "shape": reversed_shape}
 
+    def _ensure_mil_passes_applied(self):
+        """Idempotently runs `apply_loom_mil_passes` (EXPORT-IMPROVEMENT-BACKLOG.md item 3) plus
+        `annotate_dynamic_shapes` (EXPORT-ROADMAP.md R2b) over `self.program`, exactly once.
+
+        `generate_graph_topology` calls this itself, at the top -- so it no longer matters whether a
+        caller reaches it through `export()`'s own monolithic/modular dispatch, or (like every small
+        TTS model's export script: Kokoro/VITS/StyleTTS2/Supertonic/Matcha's own `_build_topology`
+        helpers) constructs a `LoomGGUFExporter` directly and calls `generate_graph_topology` without
+        ever calling `export()` at all. Before this method existed, only the first group actually got
+        the passes: `insert_explicit_broadcasts` (R2a) silently never ran for the second, since nothing
+        there ever called `apply_loom_mil_passes` -- confirmed the hard way, via a snapshot diff against
+        a pre-R2a baseline showing a genuinely dropped mutual-broadcast REPEAT in Matcha's encoder_logw
+        mask computation. Memoized so a caller building several topologies off the same exporter/program
+        only pays for the walk once.
+
+        Skipped for the bespoke/advanced workflow (`export()`'s own comment on why): that path exists
+        specifically to accept hand-built Programs (see test_compiler.py's MockOperation) that were
+        never traced through `ct.convert()`'s standard pipeline and may contain synthetic ops standing
+        in for ones MIL itself doesn't have -- a real MIL pass (`dead_code_elimination` in particular,
+        which insists on internally-consistent var/op child-tracking) isn't meaningful there and isn't
+        safe to run over a graph assembled by directly splicing Python op lists rather than through
+        MIL's own block-mutation API. The same "is this bespoke" test `export()` used to run once at its
+        own top now lives here, so every caller -- not just `export()` -- gets the same skip.
+        """
+        if self._mil_passes_applied or self.program is None:
+            return
+        is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
+        if not (is_bespoke and self.profile is None):
+            apply_loom_mil_passes(self.program)
+            self.facts.annotate_dynamic_shapes(self.program)
+        self._mil_passes_applied = True
+
     def export(self):
         """
         Traverses the MIL program:
@@ -1027,19 +1062,7 @@ class LoomGGUFExporter:
           - Weights and assets are serialized to GGUF.
         """
         is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
-
-        if not (is_bespoke and self.profile is None):
-            # EXPORT-IMPROVEMENT-BACKLOG.md item 3: graph rewrites (currently just GQA repeat_kv()
-            # fusion) run as real MIL->MIL passes over the pymil graph here, before any of the workflows
-            # below ever walk it -- not interleaved into generate_graph_topology's own translation walk.
-            # Skipped for the bespoke/advanced workflow below: that path exists specifically to accept
-            # hand-built Programs (see test_compiler.py's MockOperation) that were never traced through
-            # ct.convert()'s standard pipeline and may contain synthetic ops standing in for ones MIL
-            # itself doesn't have -- a real MIL pass (dead_code_elimination in particular, which insists
-            # on internally-consistent var/op child-tracking) isn't meaningful there and isn't safe to run
-            # over a graph that was assembled by directly splicing Python op lists rather than through
-            # MIL's own block-mutation API.
-            apply_loom_mil_passes(self.program)
+        self._ensure_mil_passes_applied()
 
         if is_bespoke and self.profile is None:
             # 1. Advanced / Bespoke Exporting Workflow
@@ -1450,6 +1473,7 @@ class LoomGGUFExporter:
         """
         Walks a heavy submodule MIL graph and serializes it to a static graph topology.
         """
+        self._ensure_mil_passes_applied()
         ctx = TopologyContext(func_name)
         nodes = ctx.nodes
         topo_inputs = ctx.topo_inputs
@@ -1609,42 +1633,18 @@ class LoomGGUFExporter:
             elif op_type in ("add", "mul"):
                 # Swap commutative inputs to ensure the larger/dynamic tensor is first,
                 # preventing GGML broadcast repetition failures.
+                #
+                # Mutual (different-axis) broadcast -- ggml_mul/ggml_add only ever let ONE operand
+                # broadcast INTO the other's ALREADY-correct shape, so a genuine "outer product" case
+                # (each operand size-1 on a DIFFERENT axis than the other) isn't representable that way
+                # at all -- no longer needs handling here: `passes.py`'s `insert_explicit_broadcasts`
+                # pass (EXPORT-ROADMAP.md R2a) rewrites any such `add`/`mul` before this walk ever runs,
+                # splicing in two explicit `loom_broadcast_to` ops so both operands already match the
+                # output shape by the time this branch sees them.
                 x_var_obj = op.inputs.get("x")
                 y_var_obj = op.inputs.get("y")
                 inp1 = resolve(self.safe_name(x_var_obj.name)) if x_var_obj is not None and hasattr(x_var_obj, "name") else None
                 inp2 = resolve(self.safe_name(y_var_obj.name)) if y_var_obj is not None and hasattr(y_var_obj, "name") else None
-
-                # Mutual (different-axis) broadcast: ggml_mul/ggml_add only ever let ONE operand
-                # broadcast INTO the other's ALREADY-correct shape -- a genuine "outer product" case
-                # (each operand is size-1 on a DIFFERENT axis than the other, so BOTH need widening to
-                # reach the real output shape) isn't representable that way at all. Confirmed on
-                # SupertonicTTS's VFTextCrossAttention fractional-RoPE angle computation (`theta[d] *
-                # frac_pos[pos]`, ne=[32,1,1] * ne=[1,L,1] -> ne=[32,L,1] -- neither operand's shape
-                # divides evenly into the other's) -- the bespoke conversion's own supertonic_common.py
-                # independently worked around the identical operation via a dedicated MUL_MAT-based outer
-                # product; this is the general exporter-level fix instead, reusing the already-existing
-                # REPEAT primitive (built for StyleTTS2's own broadcast needs) rather than a new op.
-                if (x_var_obj is not None and y_var_obj is not None
-                        and getattr(x_var_obj, "shape", None) is not None
-                        and getattr(y_var_obj, "shape", None) is not None):
-                    out_shape = self.get_var_info(op.outputs[0])["shape"]
-
-                    def _needs_repeat(var_obj):
-                        shape = self.get_var_info(var_obj)["shape"]
-                        return len(shape) == len(out_shape) and any(
-                            str(s) == "1" and str(t) != "1" for s, t in zip(shape, out_shape)
-                        )
-
-                    if _needs_repeat(x_var_obj) and _needs_repeat(y_var_obj):
-                        node_tag = self.safe_name(op.name)
-                        x_rep = f"{node_tag}_bcast_x"
-                        nodes.append({"op": "REPEAT", "inputs": [inp1], "outputs": [x_rep],
-                                      "attrs": {"shape": out_shape}})
-                        inp1 = x_rep
-                        y_rep = f"{node_tag}_bcast_y"
-                        nodes.append({"op": "REPEAT", "inputs": [inp2], "outputs": [y_rep],
-                                      "attrs": {"shape": out_shape}})
-                        inp2 = y_rep
 
                 if inp1 and inp2:
                     if inp1 in self.weights and inp2 not in self.weights:

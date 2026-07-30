@@ -93,7 +93,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | # | phase | items | gate | blocked by |
 |---|---|---|---|---|
 | **P0** | clear the ground — DONE | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
-| **P1** | exporter internals | R1, R2a, R2b | `compare_snapshots.py` | P0 |
+| **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P2 |
 | **P4** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
@@ -155,20 +155,37 @@ Do these first because everything later has to preserve whatever exists at the t
 
 #### P1 — exporter internals (must precede the API)
 
-- **P1.1 — R1 named axes.** Axis vocabulary + `GraphBuilder::build` overload taking a map (today it is
-  `build(uint32_t n_tokens, uint32_t n_past)`; `SymbolEnv` itself is already a general `name → double`
-  map, so the C++ change is small) + exporter seeding from the declared axis of the function input it
-  bottoms out at + `symbol_overrides` replaced by declared axis relations. Retire the
-  `scalar_expr_is_guess` workaround if named axes make "I don't know" distinguishable by construction.
-  **Gate:** `compare_snapshots.py` extended with an alias map (`n_samples := n_tokens`), since this
-  renames symbols rather than changing values.
-- **P1.2 — R2a canonicalizing passes:** `normalize_matmul` (also closes the known `transpose_x=True`
-  gap tracked below) and `insert_explicit_broadcasts`. Pure rewrites, no new ops, each removes a guard
-  from the `topology_ops.py` rule table — and that table prints itself
-  (`python3 -m loom_mil_compiler.topology_ops`), so the shrinkage is directly observable.
-- **P1.3 — R2b `annotate_dynamic_shapes`:** the pass that writes resolved shape expressions onto Vars
-  instead of re-deriving them per consumer. Depends on P1.1. This is what makes emission mechanical, and
-  it is the precondition for auditing the C++ "heal transposed layouts" heuristics (tracked below).
+- **P1.1 — R1 named axes — DONE.** Axis vocabulary (`axes.py`: `N_SAMPLES`, `N_ENC_FRAMES`, `N_LATENT`,
+  `N_CODES`, `BATCH` alongside `N_TOKENS`) + `GraphBuilder::build`/`loom.run_subgraph` replaced with a
+  `DynamicAxes` (name → double) map, refactored across ~120 C++ call sites and all 11 hand-written `.lua`
+  drivers + `exporter.py`'s `root_axis`/`declared_axes` replacing `symbol_overrides`. Conformer-CTC and
+  both Parakeet variants renamed to `n_samples`; Kokoro's (and StyleTTS2's, reusing it) `decoder_vocoder`
+  phase renamed to `n_enc_frames`. **Gate:** `compare_snapshots.py` extended with an alias map
+  (`n_samples`/`n_enc_frames` → `n_tokens`) — golden-diff-clean across all 11 models, full `pytest`/
+  `ctest` green.
+- **P1.2 — R2a canonicalizing passes — DONE.** `normalize_matmul` (rewrites `transpose_x=True` into an
+  explicit `transpose` + canonical matmul, closing the gap `topology_ops.py`'s rule table used to reject)
+  and `insert_explicit_broadcasts` (a new `loom_broadcast_to` dialect op, lowered 1:1 to the same
+  `REPEAT` primitive the exporter used to splice in ad hoc at emission time by comparing rendered shape
+  strings). Both are real MIL→MIL passes in `passes.py`, alongside `fuse_gqa_repeat_kv`. No model on the
+  current roadmap needs `transpose_x=True`, so `normalize_matmul` is a no-op everywhere today (verified
+  via a dedicated `test_passes.py`, since no e2e reference model exercises it); `insert_explicit_broadcasts`
+  fires on SupertonicTTS's fractional-RoPE angle computation and Matcha's encoder attention mask,
+  producing byte-identical `REPEAT` nodes to the old ad hoc logic. Surfaced and fixed a real gap in the
+  process: `LoomGGUFExporter.generate_graph_topology` is called directly (bypassing `export()`) by every
+  small TTS model's own `_build_topology` helper (Kokoro/VITS/StyleTTS2/Supertonic/Matcha), which never
+  ran `apply_loom_mil_passes` at all — fixed by moving that invocation into a new idempotent
+  `_ensure_mil_passes_applied`, called from both `export()` and `generate_graph_topology` itself.
+- **P1.3 — R2b `annotate_dynamic_shapes` — DONE.** `ValueFacts.annotate_dynamic_shapes` walks every op's
+  output Vars in the program once, eagerly forcing `dim_expr` to resolve (and memoize) every dynamic
+  axis up front, right after `apply_loom_mil_passes` — turning the existing per-Var memo from an
+  incidental lazy cache into a real "resolve once, up front" pass, with no observable behavior change
+  (`dim_expr` was already memoized; only the *timing* changed). Precondition for ever auditing the C++
+  "heal transposed layouts" heuristics (tracked below) — that audit itself is not part of this item.
+  **Gate (P1.2+P1.3 combined):** re-exported all 11 models, snapshot-diffed against a pristine pre-P1.2
+  baseline — zero-byte diff everywhere; full `pytest` (121 tests) and `ctest` (139 tests, 0 failed) green,
+  including real numeric reference verification for every rewrite site (Conformer-CTC/Parakeet TDT/RNNT,
+  Kokoro decoder_vocoder, VITS, Matcha text_encoder/decoder/vocoder, Supertonic vfe/dp).
 
 R2's remaining composite ops (`loom.replicate_pad`, `loom.conv_transpose_dw`, `loom.stack`,
 `loom.mean`) can land any time after P1.2, including interleaved with P4 — they are independent of each

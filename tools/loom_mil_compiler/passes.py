@@ -25,9 +25,23 @@ from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY, register_pass
 from coremltools.converters.mil.mil.scope import ScopeInfo, ScopeSource
 
+from . import dialect  # noqa: F401  registers "loom_broadcast_to" (mb.loom_broadcast_to)
+from .value_facts import static_value
+
 
 def _is_int(d):
     return isinstance(d, (int, np.integer))
+
+
+def _scope_ctx_like(op):
+    """A `mb.scope(...)` context copying `op`'s own TORCHSCRIPT_MODULE_NAME (if any) onto every op
+    built within it, so a rewrite pass's replacement ops keep attributing to the right decoder
+    layer/submodule instead of relying on positional adjacency for any future scope-based tooling (see
+    EXPORT-IMPROVEMENT-BACKLOG.md item 2's two real mis-attribution bugs)."""
+    scope = op.scopes.get(ScopeSource.TORCHSCRIPT_MODULE_NAME) if op.scopes else None
+    if scope:
+        return mb.scope(ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_NAME, data=list(scope)))
+    return mb.scope()
 
 
 @register_pass(namespace="loom")
@@ -172,13 +186,7 @@ class fuse_gqa_repeat_kv(AbstractGraphPass):
         # intermediate ops merely landing in the right slice by positional adjacency would be exactly the
         # class of fragile mis-attribution EXPORT-IMPROVEMENT-BACKLOG.md item 2 already documents two real
         # bugs from.
-        tile_scope = tile_op.scopes.get(ScopeSource.TORCHSCRIPT_MODULE_NAME) if tile_op.scopes else None
-        scope_ctx = (
-            mb.scope(ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_NAME, data=list(tile_scope)))
-            if tile_scope
-            else mb.scope()
-        )
-        with scope_ctx:
+        with _scope_ctx_like(tile_op):
             r1 = mb.reshape(x=pre_tile_x, shape=reshape1_shape, name=out_name + "_gqa_unsqueeze", before_op=tile_op)
             rep = mb.tile(x=r1, reps=repeat_reps, name=out_name + "_gqa_repeat", before_op=tile_op)
             r2 = mb.reshape(x=rep, shape=final_shape, name=out_name, before_op=tile_op)
@@ -191,15 +199,168 @@ class fuse_gqa_repeat_kv(AbstractGraphPass):
         return True
 
 
-_LOOM_PASS_NAMES = ["loom::fuse_gqa_repeat_kv", "common::dead_code_elimination"]
+@register_pass(namespace="loom")
+class normalize_matmul(AbstractGraphPass):
+    """
+    Rewrites `matmul(x, y, transpose_x=True, transpose_y=ty)` into the equivalent
+    `matmul(transpose(x), y, transpose_x=False, transpose_y=ty)` -- EXPORT-ROADMAP.md R2a.
+
+    `topology_ops.py`'s matmul rule table only ever composed a correct ggml lowering for
+    `transpose_x=False` (see its own comment on `ggml_mul_mat`'s fixed contraction convention): every
+    other combination fell through to `_op_matmul_unsupported`, documented there as "only
+    transpose_x=False has been needed so far" rather than a real ceiling. Running this pass before
+    `generate_graph_topology` ever walks the graph means every matmul it sees already has
+    transpose_x=False, so the table's two existing composed rules -- (False, True) and (False, False)
+    -- cover every matmul in the program, closing that gap without adding a third composition.
+
+    A pure rewrite, not a new op: `transpose` and `matmul` (with transpose_x=False) are both already
+    fully composed by `topology_ops.py`, so this only ever removes a guard, never adds one.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                # Already removed by an earlier rewrite in this same walk.
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type != "matmul":
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        if not bool(static_value(op.inputs.get("transpose_x"), False)):
+            return False
+        x = op.inputs.get("x")
+        y = op.inputs.get("y")
+        if x is None or y is None or x.shape is None:
+            return False
+        rank = len(x.shape)
+        if rank < 2:
+            # matmul's own "promote 1-D x to a matrix" rule (see its docstring) never sets
+            # transpose_x=True for a 1-D operand in practice -- guard rather than assume.
+            return False
+        perm = list(range(rank))
+        perm[-1], perm[-2] = perm[-2], perm[-1]
+        transpose_y = bool(static_value(op.inputs.get("transpose_y"), False))
+        out_name = op.outputs[0].name
+
+        with _scope_ctx_like(op):
+            xt = mb.transpose(x=x, perm=perm, name=f"{out_name}_normalize_matmul_xt", before_op=op)
+            new_out = mb.matmul(x=xt, y=y, transpose_x=False, transpose_y=transpose_y,
+                                 name=out_name, before_op=op)
+
+        if not block.try_replace_uses_of_var_after_op(
+            anchor_op=op, old_var=op.outputs[0], new_var=new_out,
+        ):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+@register_pass(namespace="loom")
+class insert_explicit_broadcasts(AbstractGraphPass):
+    """
+    Rewrites an `add`/`mul` whose two operands need MUTUAL (different-axis) broadcasting -- each
+    operand is size-1 on a DIFFERENT axis than the other, so neither is simply "the other's shape with
+    some 1s" (`ggml_add`/`ggml_mul` only ever let ONE operand broadcast into the other's already-correct
+    shape) -- into two explicit `loom_broadcast_to` ops feeding a plain `add`/`mul` whose operands are
+    already at matching shape. EXPORT-ROADMAP.md R2a.
+
+    This used to be a shape-string comparison the EMITTER itself performed (`exporter.py`'s add/mul
+    case in `transpile_operation`), deciding whether to splice `REPEAT` nodes into the JSON node list
+    by rendering both operands' shapes and checking for "1" vs. not. Running this as a real graph
+    rewrite before `generate_graph_topology` ever walks the program means the emitter never has to look
+    at either operand's shape at all: by the time it sees this op, both operands are already
+    broadcast-compatible.
+
+    First confirmed needed on SupertonicTTS's fractional-RoPE angle computation (`theta[d] *
+    frac_pos[pos]`, ne=[32,1,1] * ne=[1,L,1] -> ne=[32,L,1], L dynamic) -- see `loom_broadcast_to`'s own
+    docstring in `dialect.py` for why lowering to a real graph op (rather than conjuring a `REPEAT` JSON
+    node ad hoc at emission time) is what lets `topology_ops.py`'s already-dynamic-shape-aware `REPEAT`
+    lowering handle it unmodified.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type not in ("add", "mul"):
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _needs_broadcast(shape, out_shape):
+        """True iff some axis of `shape` is a literal 1 while the SAME axis of `out_shape` isn't --
+        the same "1 vs. not-1" test the old string-comparison code ran on rendered shape expressions,
+        but directly on MIL's own shape tuples: a concrete-int axis is unambiguous either way, and a
+        genuinely dynamic (symbolic) axis never renders as the literal string "1", so raw-shape ints
+        and rendered-shape strings agree on every case this ever needs to distinguish."""
+        return any(_is_int(s) and int(s) == 1 and not (_is_int(t) and int(t) == 1)
+                    for s, t in zip(shape, out_shape))
+
+    @classmethod
+    def _try_transform(cls, op, block) -> bool:
+        x = op.inputs.get("x")
+        y = op.inputs.get("y")
+        if x is None or y is None or x.shape is None or y.shape is None:
+            return False
+        out_var = op.outputs[0]
+        if out_var.shape is None:
+            return False
+        out_shape = tuple(out_var.shape)
+        if len(x.shape) != len(out_shape) or len(y.shape) != len(out_shape):
+            return False
+        if not (cls._needs_broadcast(x.shape, out_shape) and cls._needs_broadcast(y.shape, out_shape)):
+            return False
+
+        # `like=` the ORIGINAL other operand, not `out_var` itself -- `out_var` is produced by `op`,
+        # which both new ops are inserted BEFORE, so using it here would be a data-dependency cycle.
+        # `infer_type_with_broadcast(x, y)` gives the identical shape `op`'s own type inference already
+        # computed for `out_var`, so this loses no information.
+        node_tag = op.name
+        with _scope_ctx_like(op):
+            bx = mb.loom_broadcast_to(x=x, like=y, name=f"{node_tag}_bcast_x", before_op=op)
+            by = mb.loom_broadcast_to(x=y, like=x, name=f"{node_tag}_bcast_y", before_op=op)
+            builder_fn = mb.add if op.op_type == "add" else mb.mul
+            new_out = builder_fn(x=bx, y=by, name=out_var.name, before_op=op)
+
+        if not block.try_replace_uses_of_var_after_op(
+            anchor_op=op, old_var=out_var, new_var=new_out,
+        ):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+_LOOM_PASS_NAMES = [
+    "loom::fuse_gqa_repeat_kv",
+    "loom::normalize_matmul",
+    "loom::insert_explicit_broadcasts",
+    "common::dead_code_elimination",
+]
 
 
 def apply_loom_mil_passes(prog) -> None:
     """
-    Runs Loom's own MIL->MIL rewrite passes (currently just GQA `repeat_kv()` fusion) plus
-    `common::dead_code_elimination` over `prog` in place. Must run before any topology/driver generation
-    sees `prog` -- `common::dead_code_elimination` is what actually removes the original tile/reshape
-    idiom's now-orphaned dependency chain that the fusion above leaves behind.
+    Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
+    normalization (R2a), mutual-broadcast insertion (R2a) -- plus `common::dead_code_elimination` over
+    `prog` in place. Must run before any topology/driver generation sees `prog` --
+    `common::dead_code_elimination` is what actually removes each rewrite's now-orphaned dependency
+    chain (the original tile/reshape idiom, a stale `transpose_x` bool operand, etc).
 
     Invokes each registered pass callable directly (`PASS_REGISTRY[name](prog)`) rather than going through
     `PassPipelineManager.apply_pipeline` -- that manager additionally calls `prog.validate()` before/after
