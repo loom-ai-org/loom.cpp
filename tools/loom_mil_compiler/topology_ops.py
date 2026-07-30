@@ -880,7 +880,7 @@ def _op_fill(self, op, ctx):
 
 @topology_rule('pad')
 def _op_pad(self, op, ctx):
-    nodes, aliases, resolve = ctx.nodes, ctx.aliases, ctx.resolve
+    nodes, resolve = ctx.nodes, ctx.resolve
     # EXPORT-IMPROVEMENT-BACKLOG.md item 4: the one op type STFT's own center-framing
     # (torch.stft(..., center=True)) decomposes into, via coremltools' own
     # common::lower_complex_dialect_ops pass, that this exporter didn't already handle --
@@ -942,61 +942,13 @@ def _op_pad(self, op, ctx):
     elif mode == "reflect":
         mapped_op = "PAD_1D_REFLECT"
     elif mode == "replicate":
-        # SupertonicTTS's ConvNextBlock (used by EVERY encoder/decoder in that model) pads via
-        # `nn.functional.pad(x, pad, mode="replicate")` before every depthwise conv -- ggml has
-        # no native replicate/edge-pad kernel (unlike PAD_1D/PAD_1D_REFLECT, which wrap real
-        # ggml_pad_ext/ggml_pad_reflect_1d primitives), so this composes it purely from
-        # already-existing primitives instead of adding a new C++ op: VIEW out the single
-        # boundary column (ne[0]=1, full ne[1:]), REPEAT-broadcast it to the pad width (both are
-        # already used together for exactly this "materialize the broadcast, then CONCAT"
-        # pattern -- see REPEAT's own docstring, built for StyleTTS2's diffusion sampler), then
-        # CONCAT it onto the appropriate side. lp0/rp0 are always static (kernel_size/dilation
-        # are architecture constants), so only the VIEW extracting the RIGHT edge needs a
-        # dynamic offset (the left edge is always byte 0) -- reuses the same
-        # `_infer_dynamic_dim_expr` backward walk every other dynamic-offset VIEW in this
-        # exporter already depends on, rather than any new shape-inference machinery.
-        if lp0 == 0 and rp0 == 0:
-            aliases[output_var] = resolve(x_var)
-            return
-        x_info = self.get_var_info(x_var_obj)
-        ne_rest = list(x_info["shape"][1:])
-        cur = resolve(x_var)
-        if lp0 > 0:
-            left_edge = f"{output_var}_replpad_left_edge"
-            nodes.append({
-                "op": "VIEW", "inputs": [cur], "outputs": [left_edge],
-                "attrs": {"shape": [1, *ne_rest], "offset": 0},
-            })
-            left_tile = f"{output_var}_replpad_left_tile"
-            nodes.append({
-                "op": "REPEAT", "inputs": [left_edge], "outputs": [left_tile],
-                "attrs": {"shape": [lp0, *ne_rest]},
-            })
-            left_cat = f"{output_var}_replpad_left_cat"
-            nodes.append({
-                "op": "CONCAT", "inputs": [left_tile, cur], "outputs": [left_cat],
-                "attrs": {"dim": 0},
-            })
-            cur = left_cat
-        if rp0 > 0:
-            t_expr = self._infer_dynamic_dim_expr(x_var_obj, rank - 1)
-            right_edge = f"{output_var}_replpad_right_edge"
-            nodes.append({
-                "op": "VIEW", "inputs": [resolve(x_var)], "outputs": [right_edge],
-                "attrs": {"shape": [1, *ne_rest], "offset": render((t_expr - 1) * 4)},
-            })
-            right_tile = f"{output_var}_replpad_right_tile"
-            nodes.append({
-                "op": "REPEAT", "inputs": [right_edge], "outputs": [right_tile],
-                "attrs": {"shape": [rp0, *ne_rest]},
-            })
-            nodes.append({
-                "op": "CONCAT", "inputs": [cur, right_tile], "outputs": [output_var],
-                "attrs": {"dim": 0},
-            })
-        else:
-            aliases[output_var] = cur
-        return
+        # `passes.py`'s `canonicalize_replicate_pad` (EXPORT-ROADMAP.md R2) rewrites every
+        # mode="replicate" pad into a `loom_replicate_pad` op before this table ever runs -- see that
+        # pass and the `loom_replicate_pad` rule just below. Reaching here means it didn't run.
+        raise NotImplementedError(
+            f"pad op '{op.name}' has mode='replicate' -- passes.py's canonicalize_replicate_pad should "
+            "have already rewritten this into a loom_replicate_pad op before this table ever ran."
+        )
     else:
         raise NotImplementedError(
             f"pad op '{op.name}' has mode='{mode}', which this exporter doesn't support "
@@ -1009,6 +961,63 @@ def _op_pad(self, op, ctx):
         "outputs": [output_var],
         "attrs": {"lp0": lp0, "rp0": rp0},
     })
+
+
+@topology_rule('loom_replicate_pad')
+def _op_loom_replicate_pad(self, op, ctx):
+    """1:1 port of the exporter's former ad hoc `pad(mode="replicate")` composition (EXPORT-ROADMAP.md
+    R2; see `loom_replicate_pad`'s own docstring in dialect.py and `passes.py`'s
+    `canonicalize_replicate_pad`, which inserts this op): VIEW out the boundary column, REPEAT-broadcast
+    it to the pad width, CONCAT it back on. `lp`/`rp` are always static; only the VIEW extracting the
+    RIGHT edge needs a dynamic byte offset (the left edge is always byte 0), via the same
+    `_infer_dynamic_dim_expr` backward walk every other dynamic-offset VIEW in this exporter depends on.
+    """
+    nodes, resolve = ctx.nodes, ctx.resolve
+    x_var_obj = op.inputs["x"]
+    x_var = self.safe_name(x_var_obj.name)
+    output_var = self.safe_name(op.outputs[0].name)
+    lp0 = int(static_value(op.inputs["lp"]))
+    rp0 = int(static_value(op.inputs["rp"]))
+    rank = len(x_var_obj.shape)
+
+    x_info = self.get_var_info(x_var_obj)
+    ne_rest = list(x_info["shape"][1:])
+    cur = resolve(x_var)
+    if lp0 > 0:
+        left_edge = f"{output_var}_replpad_left_edge"
+        nodes.append({
+            "op": "VIEW", "inputs": [cur], "outputs": [left_edge],
+            "attrs": {"shape": [1, *ne_rest], "offset": 0},
+        })
+        left_tile = f"{output_var}_replpad_left_tile"
+        nodes.append({
+            "op": "REPEAT", "inputs": [left_edge], "outputs": [left_tile],
+            "attrs": {"shape": [lp0, *ne_rest]},
+        })
+        left_cat = f"{output_var}_replpad_left_cat"
+        nodes.append({
+            "op": "CONCAT", "inputs": [left_tile, cur], "outputs": [left_cat],
+            "attrs": {"dim": 0},
+        })
+        cur = left_cat
+    if rp0 > 0:
+        t_expr = self._infer_dynamic_dim_expr(x_var_obj, rank - 1)
+        right_edge = f"{output_var}_replpad_right_edge"
+        nodes.append({
+            "op": "VIEW", "inputs": [resolve(x_var)], "outputs": [right_edge],
+            "attrs": {"shape": [1, *ne_rest], "offset": render((t_expr - 1) * 4)},
+        })
+        right_tile = f"{output_var}_replpad_right_tile"
+        nodes.append({
+            "op": "REPEAT", "inputs": [right_edge], "outputs": [right_tile],
+            "attrs": {"shape": [rp0, *ne_rest]},
+        })
+        nodes.append({
+            "op": "CONCAT", "inputs": [cur, right_tile], "outputs": [output_var],
+            "attrs": {"dim": 0},
+        })
+    else:
+        ctx.aliases[output_var] = cur
 
 
 @topology_rule('band_part')
@@ -1352,161 +1361,74 @@ def _op_concat(self, op, ctx):
 
 @topology_rule('stack')
 def _op_stack(self, op, ctx):
-    nodes, aliases, resolve = ctx.nodes, ctx.aliases, ctx.resolve
-    # MIL `stack(values, axis)` joins N same-shape tensors along a genuinely NEW axis
-    # (unlike `concat`, which joins along an EXISTING one) -- e.g. a hand-rolled
-    # conv-based STFT's real/imag parts, `torch.stack([real, imag], dim=-1)`, seen when a
-    # model computes its DFT via CONV_1D kernels directly rather than `torch.stft` (which
-    # decomposes differently, via coremltools' own `lower_complex_dialect_ops`). No new
-    # ggml primitive needed: compose as RESHAPE (insert a size-1 axis) on each operand, then
-    # the same CONCAT-along-that-axis this file already emits for `concat`.
-    values_obj = op.inputs.get("values")
-    axis_val = int(static_value(op.inputs.get("axis"), 0))
-    out_var = op.outputs[0]
-    out_rank = len(self.get_var_info(out_var)["shape"])
-    axis = axis_val + out_rank if axis_val < 0 else axis_val
-    ne_axis = out_rank - 1 - axis
-
-    reshaped = []
-    for i, item in enumerate(values_obj):
-        if not isinstance(item, Var):
-            continue
-        v_name = resolve(self.safe_name(item.name))
-        v_shape = list(self.get_var_info(item)["shape"])
-        new_shape = v_shape[:ne_axis] + ["1"] + v_shape[ne_axis:]
-        unsq_name = f"{self.safe_name(out_var.name)}_stack_unsq_{i}"
-        nodes.append({
-            "op": "RESHAPE",
-            "inputs": [v_name],
-            "outputs": [unsq_name],
-            "attrs": {"shape": new_shape}
-        })
-        reshaped.append(unsq_name)
-
-    if len(reshaped) < 2:
-        if reshaped:
-            aliases[self.safe_name(out_var.name)] = reshaped[0]
-        return
-    prev_output = reshaped[0]
-    for i in range(1, len(reshaped) - 1):
-        inter_output = f"{self.safe_name(out_var.name)}_stack_temp_{i}"
-        nodes.append({
-            "op": "CONCAT",
-            "inputs": [prev_output, reshaped[i]],
-            "outputs": [inter_output],
-            "attrs": {"dim": ne_axis}
-        })
-        prev_output = inter_output
-    nodes.append({
-        "op": "CONCAT",
-        "inputs": [prev_output, reshaped[-1]],
-        "outputs": [self.safe_name(out_var.name)],
-        "attrs": {"dim": ne_axis}
-    })
-
-
-# `reduce_mean` splits three ways, and which way is not a property of the op alone -- it depends on
-# where the reduced axis lands under this file's ne-order reversal, and on whether that axis's size is
-# known at export time. The generic OP_MAP path maps "reduce_mean" straight to the raw "MEAN" primitive,
-# and `ggml_mean` reduces ne[0] ONLY -- but it divides by ne[0] AT RUN TIME, so for an ne[0] reduction it
-# needs no static count at all. That single fact is what separates the three cases:
-#
-#   ne axis size is static           -> compose REDUCE_SUM + SCALE(1/N)   (works for ANY ne axis)
-#   size dynamic, but the axis IS ne[0] -> fall through to the generic MEAN, which handles it natively
-#   size dynamic and the axis is NOT ne[0] -> genuinely unrepresentable; reject
-#
-# The middle case is the one that matters: it was silently lost when this branch was first added (for
-# Matcha's own LayerNorm, below), taking StyleTTS2's diffusion export with it -- `Transformer1d.run()`'s
-# `x.mean(axis=-1)` reduces ne[0] over a live n_tokens-derived length, which the generic MEAN had always
-# handled (that path's own CONT-before-MEAN fix names this exact op as its motivating case). Expressing
-# the split as guards rather than as raises inside one handler is what makes the fall-through a stated
-# route instead of an accident. See BACKLOG.md / BACKEND.md for the regression this restores.
-
-def _reduce_mean_plan(self, op):
-    """(ne_axis, keep_dims, n) for a single-axis `reduce_mean`, with `n` the reduced axis's static size
-    or None when it is a live symbolic expression. None when the op is not single-axis at all (or has no
-    `x`), i.e. when no composition here applies. Shared by both guards and the handler so they cannot
-    disagree about which case they are in."""
-    x_var_obj = op.inputs.get("x")
-    if x_var_obj is None:
-        return None
-    axes_val = static_value(op.inputs.get("axes"))
-    if axes_val is None or len(axes_val) != 1:
-        return None
-    shape = self.get_var_info(x_var_obj)["shape"]
-    in_rank = len(shape)
-    axis = int(axes_val[0])
-    if axis < 0:
-        axis += in_rank
-    ne_axis = in_rank - 1 - axis
-    n_raw = shape[ne_axis]
-    n = int(n_raw) if str(n_raw).lstrip("-").isdigit() else None
-    return ne_axis, bool(static_value(op.inputs.get("keep_dims"), False)), n
-
-
-def _reduce_mean_has_static_count(self, op):
-    plan = _reduce_mean_plan(self, op)
-    return plan is not None and plan[2] is not None
-
-
-def _reduce_mean_is_unrepresentable(self, op):
-    """Multi-axis (or malformed), or a dynamic reduction count on an axis `ggml_mean` cannot reduce."""
-    plan = _reduce_mean_plan(self, op)
-    if plan is None:
-        return True
-    ne_axis, _, n = plan
-    return n is None and ne_axis != 0
-
-
-@topology_rule('reduce_mean', guard=_reduce_mean_has_static_count,
-               when="the reduced axis has a statically-known size")
-def _op_reduce_mean_scaled_sum(self, op, ctx):
-    # Composed rather than mapped straight to MEAN, because `ggml_mean` reduces ne[0] only and would be
-    # silently wrong on any other axis. First hit by Matcha-TTS's own hand-rolled
-    # `text_encoder.py::LayerNorm` (glow-tts-derived, NOT `nn.LayerNorm`): `torch.mean(x, 1,
-    # keepdim=True)` on a (B,C,T) tensor reduces the CHANNEL axis (torch axis 1), which under this
-    # exporter's axis-reversal convention is ne[1], not ne[0] -- confirmed via a real end-to-end numeric
-    # mismatch (encoder_mu/encoder_logw both wildly wrong, traced back to this exact LayerNorm's own
-    # mean/variance being computed over the wrong axis). REDUCE_SUM is a real, axis-aware ggml primitive
-    # (the same one "reduce_sum" uses below), so SCALE by 1/N after it is correct for ne[0] too -- this
-    # is a strict generalization of every previously-working reduce_mean usage (STFT/CMVN, all of which
-    # happen to reduce ne[0]), not a special case.
-    nodes, resolve = ctx.nodes, ctx.resolve
-    ne_axis, keep_dims_val, n = _reduce_mean_plan(self, op)
-    x_name = resolve(self.safe_name(op.inputs["x"].name))
-    output_var = self.safe_name(op.outputs[0].name)
-    sum_name = output_var + "_rmean_sum"
-    nodes.append({
-        "op": "REDUCE_SUM",
-        "inputs": [x_name],
-        "outputs": [sum_name],
-        "attrs": {"axis": ne_axis, "keep_dims": keep_dims_val}
-    })
-    nodes.append({
-        "op": "SCALE",
-        "inputs": [sum_name],
-        "outputs": [output_var],
-        "attrs": {"s": 1.0 / n}
-    })
-
-
-@topology_rule('reduce_mean', guard=_reduce_mean_is_unrepresentable,
-               when="multi-axis, or a dynamic count on a non-ne[0] axis (rejected)")
-def _op_reduce_mean_unsupported(self, op, ctx):
-    plan = _reduce_mean_plan(self, op)
-    if plan is None:
-        raise NotImplementedError(
-            f"reduce_mean op '{op.name}': only a single reduction axis is supported "
-            f"(got axes={static_value(op.inputs.get('axes'))!r}); a genuine multi-axis case "
-            "(e.g. GroupNorm, see group_norm_op.py) needs its own composition."
-        )
-    ne_axis, _, _ = plan
+    # `passes.py`'s `lower_stack` (EXPORT-ROADMAP.md R2) rewrites every `stack` op into
+    # `expand_dims` + `concat` -- both already-real MIL ops with their own full, general rules just
+    # above/below -- before this table ever runs. Reaching here means it didn't run.
     raise NotImplementedError(
-        f"reduce_mean op '{op.name}': reducing ne axis {ne_axis} over a count that is only known at "
-        "run time has no composition here. REDUCE_SUM + SCALE needs the count at export time, and "
-        "ggml_mean supplies its own count only for ne[0]. A dynamic count on another axis needs its "
-        "own composition (see loom_group_norm's custom-op bridge for that case)."
+        f"stack op '{op.name}' reached the topology rule table directly -- passes.py's lower_stack "
+        "should have already rewritten this into expand_dims + concat before this table ever ran."
     )
+
+
+# `passes.py`'s `lower_reduce_mean` (EXPORT-ROADMAP.md R2) rewrites every single-axis `reduce_mean` into
+# either a `reduce_sum`+`loom_scale` composition (static count) or a `loom_mean` op (dynamic count on
+# ne[0]) before this table ever runs, and raises for anything else (multi-axis, or a dynamic count on any
+# other axis) -- see that pass and the `loom_mean`/`loom_scale` rules below. Reaching here means it
+# didn't run.
+
+@topology_rule('reduce_mean')
+def _op_reduce_mean_unreachable(self, op, ctx):
+    raise NotImplementedError(
+        f"reduce_mean op '{op.name}' reached the topology rule table directly -- passes.py's "
+        "lower_reduce_mean should have already rewritten this into reduce_sum+loom_scale or loom_mean "
+        "(or raised) before this table ever ran."
+    )
+
+
+@topology_rule('loom_mean')
+def _op_loom_mean(self, op, ctx):
+    # `ggml_mean` (src/ops/primitives_mean.cpp) always reduces ne[0] and supplies its own run-time
+    # element count -- no attrs needed, matching exactly what the generic OP_MAP fallback this replaces
+    # used to emit (see loom_mean's own docstring in dialect.py for why that fallback existed at all).
+    x_var_obj = op.inputs["x"]
+    x_name = ctx.resolve(self.safe_name(x_var_obj.name))
+    if getattr(x_var_obj, "op", None) is not None and x_var_obj.op.op_type == "transpose":
+        # ggml_mean (like conv's im2col elsewhere) reduces ne[0] assuming a CONTIGUOUS source -- fed a
+        # PERMUTE's own output (a non-contiguous view) directly, it silently reads with the WRONG
+        # stride and produces a plausible-looking but WRONG result (no assert, unlike conv's im2col;
+        # confirmed via an isolated minimal repro: PERMUTE([4,T]->[T,4])+MEAN gave [10,20,17,14] instead
+        # of the correct per-channel means [1,11,21,31] for a hand-computed input -- adding an explicit
+        # CONT between the two fixed it exactly). First hit by StyleTTS2's diffusion
+        # Transformer1d.run(), whose `x.mean(axis=1)` (reducing over the token axis) traces to exactly
+        # this PERMUTE-straight-into-MEAN shape (torch's own `.mean()` needs the reduced axis
+        # transposed to ne[0] first, matching this project's own "PERMUTE so the target axis lands on
+        # ne[0], THEN reduce" convention for REDUCE_SUM elsewhere). Inserting a CONT here is always
+        # safe regardless of whether the source happens to already be contiguous (a CONT of an
+        # already-contiguous tensor is a harmless, cheap extra copy), so this cannot regress any
+        # existing MEAN usage.
+        cont_name = x_name + "_mean_cont"
+        ctx.nodes.append({"op": "CONT", "inputs": [x_name], "outputs": [cont_name]})
+        x_name = cont_name
+    ctx.nodes.append({
+        "op": "MEAN",
+        "inputs": [x_name],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+    })
+
+
+@topology_rule('loom_scale')
+def _op_loom_scale(self, op, ctx):
+    # `1.0 / n` is computed HERE, in plain Python double precision, rather than carried on the op
+    # pre-divided -- see loom_scale's own docstring in dialect.py for why (MIL casts every float const
+    # to fp32 on construction, which silently rounds a value like 1/192 well before it ever reaches
+    # this rule).
+    n = int(static_value(op.inputs["n"]))
+    ctx.nodes.append({
+        "op": "SCALE",
+        "inputs": [ctx.resolve(self.safe_name(op.inputs["x"].name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"s": 1.0 / n},
+    })
 
 
 @topology_rule('reduce_sum')
@@ -1931,7 +1853,7 @@ def _op_conv(self, op, ctx):
 
 @topology_rule('conv_transpose')
 def _op_conv_transpose(self, op, ctx):
-    nodes, resolve, func_name = ctx.nodes, ctx.resolve, ctx.func_name
+    nodes, resolve = ctx.nodes, ctx.resolve
     # Map conv_transpose to CONV_TRANSPOSE_1D/2D. Loom's C++ primitives
     # (src/ops/primitives_conv.cpp's op_conv_transpose_1d/2d, backing ggml_conv_transpose_1d /
     # ggml_conv_transpose_2d_p0) only ever compute the UNPADDED ("valid") result -- no
@@ -1995,98 +1917,15 @@ def _op_conv_transpose(self, op, ctx):
     g_val = int(groups[0]) if isinstance(groups, (list, tuple, np.ndarray)) else int(groups)
     s0 = int(strides[0]) if isinstance(strides, (list, tuple, np.ndarray)) else int(strides)
     if g_val != 1:
-        # Depthwise conv_transpose (Kokoro's AdainResBlk1d upsample "pool":
-        # ConvTranspose1d(kernel=3, stride=2, groups=dim_in, padding=1, output_padding=1)) --
-        # ggml has no native grouped CONV_TRANSPOSE primitive at all, so this composes the
-        # standard "zero-stuff the input, then an ordinary (stride=1) depthwise conv with a
-        # kernel-reversed weight" identity instead (real ConvTranspose1d IS mathematically a
-        # correlation with a flipped kernel over a zero-stuffed signal). Confirmed (empirically,
-        # via get_var_info dumps on this exact op) that MIL ALWAYS traces a grouped
-        # conv_transpose with pad=[0,0] regardless of the real PyTorch padding/output_padding
-        # -- it computes the "valid" (unpadded) result and defers any real crop to a SEPARATE
-        # downstream slice_by_index op, which the generic per-op-type loop already handles on
-        # its own turn -- so this composition only ever needs to reproduce the "valid" formula
-        # `(L_in-1)*stride + kernel_size` (symmetric `kernel_size-1` padding both sides of the
-        # zero-stuffed signal, i.e. padding=0/output_padding=0 in the general formula), never a
-        # real nonzero pad itself. Reuses the exact node sequence already verified in
-        # tools/convert_kokoro/convert_kokoro_f0n.py's `add_depthwise_conv_transpose_upsample`
-        # (itself checked against test_primitive_registry.cpp's
-        # test_depthwise_conv_transpose_1d_via_composition before ever being used there),
-        # generalized to a real traced op's own stride/kernel_size/channel count and a REAL
-        # dynamic-length expression (via get_var_info) instead of that script's own hardcoded
-        # "$n_tokens".
-        x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
-        weight_var_obj = op.inputs["weight"]
-        in_channels = int(x_var_obj.shape[1])
-        out_per_group = int(weight_var_obj.shape[1])
-        kernel_size = int(weight_var_obj.shape[-1])
-        if is_2d or g_val != in_channels or out_per_group != 1:
-            raise NotImplementedError(
-                f"conv_transpose op '{op.name}' has groups={g_val} (in_channels={in_channels}, "
-                f"out_channels/group={out_per_group}) -- only a true 1D depthwise case "
-                "(groups == in_channels == out_channels) is composed; anything else has no "
-                "ggml-side implementation yet."
-            )
-        if any(int(p) != 0 for p in pad_list):
-            raise NotImplementedError(
-                f"conv_transpose op '{op.name}' is depthwise with non-zero pad={pad_list!r} -- "
-                "every depthwise conv_transpose this exporter has seen traces with pad=[0,0] "
-                "(deferring any real crop to a separate downstream slice_by_index op); this "
-                "composition doesn't know how to fold a non-zero pad in directly."
-            )
-        weight_val = static_value(weight_var_obj)
-        if weight_val is None:
-            raise NotImplementedError(
-                f"conv_transpose op '{op.name}' is depthwise but its weight isn't a resolved "
-                "constant -- this composition needs to flip the kernel at export time."
-            )
-        flipped = np.ascontiguousarray(np.asarray(weight_val)[:, :, ::-1])
-        flipped_name = self.safe_name(op.inputs["weight"].name) + "_dwt_flip"
-        if func_name == "main_topo" or self.profile == "monolithic":
-            namespaced_flipped = flipped_name
-        else:
-            namespaced_flipped = f"{func_name}.{flipped_name}"
-        if len(namespaced_flipped) >= 64:
-            h = hashlib.md5(namespaced_flipped.encode("utf-8")).hexdigest()[:6]
-            namespaced_flipped = f"{namespaced_flipped[:30]}_{h}_{namespaced_flipped[-20:]}"
-        self.weights[namespaced_flipped] = flipped
-
-        x_var = self.safe_name(x_var_obj.name)
-        output_var = self.safe_name(op.outputs[0].name)
-        t_expr = self.get_var_info(x_var_obj)["shape"][0]
-        channels = in_channels
-
-        d3 = f"{output_var}_dwt_d3"
-        nodes.append({"op": "RESHAPE", "inputs": [resolve(x_var)], "outputs": [d3],
-                      "attrs": {"shape": [1, t_expr, channels]}})
-        stuffed3 = f"{output_var}_dwt_stuffed3"
-        nodes.append({"op": "PAD_1D", "inputs": [d3], "outputs": [stuffed3],
-                      "attrs": {"lp0": 0, "rp0": s0 - 1}})
-        overstuffed = f"{output_var}_dwt_overstuffed"
-        nodes.append({"op": "RESHAPE", "inputs": [stuffed3], "outputs": [overstuffed],
-                      "attrs": {"shape": [render(as_expr(t_expr) * s0), channels]}})
-        std_len = render((as_expr(t_expr) - 1) * s0 + 1)
-        trunc_v = f"{output_var}_dwt_trunc_v"
-        nodes.append({"op": "VIEW", "inputs": [overstuffed], "outputs": [trunc_v],
-                      "attrs": {"shape": [std_len, channels]}})
-        trunc = f"{output_var}_dwt_trunc"
-        nodes.append({"op": "CONT", "inputs": [trunc_v], "outputs": [trunc]})
-        pad_each = kernel_size - 1
-        padded = f"{output_var}_dwt_padded"
-        nodes.append({"op": "PAD_1D", "inputs": [trunc], "outputs": [padded],
-                      "attrs": {"lp0": pad_each, "rp0": pad_each}})
-
-        has_bias = static_value(bias_var) is not None and np.any(static_array(bias_var))
-        raw_var = (output_var + "_dwt_raw") if has_bias else output_var
-        nodes.append({"op": "CONV_1D_DW", "inputs": [namespaced_flipped, padded], "outputs": [raw_var],
-                      "attrs": {"s0": 1, "p0": 0, "d0": 1}})
-        if has_bias:
-            bias_var_name = self.safe_name(bias_var.name)
-            bias_reshaped = output_var + "_dwt_bias_r"
-            nodes.append({"op": "RESHAPE", "inputs": [resolve(bias_var_name)], "outputs": [bias_reshaped],
-                          "attrs": {"shape": [1, channels, 1]}})
-            nodes.append({"op": "ADD", "inputs": [raw_var, bias_reshaped], "outputs": [output_var]})
-        return
+        # `passes.py`'s `canonicalize_conv_transpose_dw` (EXPORT-ROADMAP.md R2) rewrites every
+        # depthwise (groups != 1) conv_transpose into a `loom_conv_transpose_dw` op before this table
+        # ever runs -- see that pass and the `loom_conv_transpose_dw` rule just below. Reaching here
+        # means it didn't run.
+        raise NotImplementedError(
+            f"conv_transpose op '{op.name}' has groups={g_val} != 1 -- passes.py's "
+            "canonicalize_conv_transpose_dw should have already rewritten this into a "
+            "loom_conv_transpose_dw op before this table ever ran."
+        )
 
     mapped_op = "CONV_TRANSPOSE_2D" if is_2d else "CONV_TRANSPOSE_1D"
 
@@ -2158,6 +1997,75 @@ def _op_conv_transpose(self, op, ctx):
             "outputs": [output_var],
             "attrs": {"shape": crop_shape, "offset": pad_before * 4}
         })
+
+
+@topology_rule('loom_conv_transpose_dw')
+def _op_loom_conv_transpose_dw(self, op, ctx):
+    """1:1 port of the exporter's former ad hoc depthwise-conv_transpose composition
+    (EXPORT-ROADMAP.md R2; see `loom_conv_transpose_dw`'s own docstring in dialect.py and
+    `passes.py`'s `canonicalize_conv_transpose_dw`, which inserts this op): zero-stuff the input by
+    `stride`, then an ordinary stride=1 depthwise conv with a kernel-reversed weight. Reuses the exact
+    node sequence already verified in tools/convert_kokoro/convert_kokoro_f0n.py's
+    `add_depthwise_conv_transpose_upsample` (itself checked against test_primitive_registry.cpp's
+    test_depthwise_conv_transpose_1d_via_composition before ever being used there), generalized to a
+    real traced op's own stride/kernel_size/channel count and a REAL dynamic-length expression (via
+    get_var_info) instead of that script's own hardcoded "$n_tokens".
+    """
+    nodes, resolve, func_name = ctx.nodes, ctx.resolve, ctx.func_name
+    x_var_obj = op.inputs["x"]
+    weight_var_obj = op.inputs["weight"]
+    bias_var = op.inputs.get("bias")
+    s0 = int(static_value(op.inputs["stride"]))
+    in_channels = int(x_var_obj.shape[1])
+    kernel_size = int(weight_var_obj.shape[-1])
+
+    weight_val = static_value(weight_var_obj)
+    flipped = np.ascontiguousarray(np.asarray(weight_val)[:, :, ::-1])
+    flipped_name = self.safe_name(weight_var_obj.name) + "_dwt_flip"
+    if func_name == "main_topo" or self.profile == "monolithic":
+        namespaced_flipped = flipped_name
+    else:
+        namespaced_flipped = f"{func_name}.{flipped_name}"
+    if len(namespaced_flipped) >= 64:
+        h = hashlib.md5(namespaced_flipped.encode("utf-8")).hexdigest()[:6]
+        namespaced_flipped = f"{namespaced_flipped[:30]}_{h}_{namespaced_flipped[-20:]}"
+    self.weights[namespaced_flipped] = flipped
+
+    x_var = self.safe_name(x_var_obj.name)
+    output_var = self.safe_name(op.outputs[0].name)
+    t_expr = self.get_var_info(x_var_obj)["shape"][0]
+    channels = in_channels
+
+    d3 = f"{output_var}_dwt_d3"
+    nodes.append({"op": "RESHAPE", "inputs": [resolve(x_var)], "outputs": [d3],
+                  "attrs": {"shape": [1, t_expr, channels]}})
+    stuffed3 = f"{output_var}_dwt_stuffed3"
+    nodes.append({"op": "PAD_1D", "inputs": [d3], "outputs": [stuffed3],
+                  "attrs": {"lp0": 0, "rp0": s0 - 1}})
+    overstuffed = f"{output_var}_dwt_overstuffed"
+    nodes.append({"op": "RESHAPE", "inputs": [stuffed3], "outputs": [overstuffed],
+                  "attrs": {"shape": [render(as_expr(t_expr) * s0), channels]}})
+    std_len = render((as_expr(t_expr) - 1) * s0 + 1)
+    trunc_v = f"{output_var}_dwt_trunc_v"
+    nodes.append({"op": "VIEW", "inputs": [overstuffed], "outputs": [trunc_v],
+                  "attrs": {"shape": [std_len, channels]}})
+    trunc = f"{output_var}_dwt_trunc"
+    nodes.append({"op": "CONT", "inputs": [trunc_v], "outputs": [trunc]})
+    pad_each = kernel_size - 1
+    padded = f"{output_var}_dwt_padded"
+    nodes.append({"op": "PAD_1D", "inputs": [trunc], "outputs": [padded],
+                  "attrs": {"lp0": pad_each, "rp0": pad_each}})
+
+    has_bias = bias_var is not None and static_value(bias_var) is not None and np.any(static_array(bias_var))
+    raw_var = (output_var + "_dwt_raw") if has_bias else output_var
+    nodes.append({"op": "CONV_1D_DW", "inputs": [namespaced_flipped, padded], "outputs": [raw_var],
+                  "attrs": {"s0": 1, "p0": 0, "d0": 1}})
+    if has_bias:
+        bias_var_name = self.safe_name(bias_var.name)
+        bias_reshaped = output_var + "_dwt_bias_r"
+        nodes.append({"op": "RESHAPE", "inputs": [resolve(bias_var_name)], "outputs": [bias_reshaped],
+                      "attrs": {"shape": [1, channels, 1]}})
+        nodes.append({"op": "ADD", "inputs": [raw_var, bias_reshaped], "outputs": [output_var]})
 
 
 # `less` is the one op type whose rule is genuinely conditional on a *derivation*, not on a static

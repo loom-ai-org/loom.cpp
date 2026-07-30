@@ -20,13 +20,14 @@ Run via `apply_loom_mil_passes(prog)`, called once by `LoomGGUFExporter.export()
 import numpy as np
 
 from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import Var
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY, register_pass
 from coremltools.converters.mil.mil.scope import ScopeInfo, ScopeSource
 
-from . import dialect  # noqa: F401  registers "loom_broadcast_to" (mb.loom_broadcast_to)
-from .value_facts import static_value
+from . import dialect  # noqa: F401  registers "loom_broadcast_to" etc. (mb.loom_broadcast_to, ...)
+from .value_facts import static_ints, static_value
 
 
 def _is_int(d):
@@ -346,10 +347,345 @@ class insert_explicit_broadcasts(AbstractGraphPass):
         return True
 
 
+@register_pass(namespace="loom")
+class canonicalize_replicate_pad(AbstractGraphPass):
+    """
+    Rewrites a `pad(mode="replicate")` op into a `loom_replicate_pad` op -- EXPORT-ROADMAP.md R2.
+
+    First (and so far only) needed by SupertonicTTS's `ConvNextBlock` (used by every encoder/decoder in
+    that model), which pads via `nn.functional.pad(x, pad, mode="replicate")` before every depthwise
+    conv. `topology_ops.py`'s `pad` rule used to decide, at emission time, whether `mode` was
+    "replicate" and if so compose VIEW/REPEAT/CONCAT inline; this pass makes that decision once, before
+    emission, so the emitter just dispatches on op type like any other.
+
+    Validates the same invariants `topology_ops.py`'s old inline code did -- pad values must be
+    compile-time constants, and only the fastest-varying (last, MIL-order) axis may have a non-zero
+    replicate pad (the only shape ggml's composed-from-primitives approach here can express) -- raising
+    the same errors that code raised, just earlier (right after `ct.convert()`, not mid-emission).
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type != "pad":
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        mode = static_value(op.inputs.get("mode"), "constant")
+        if mode != "replicate":
+            return False
+        x = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+        if x is None or x.shape is None:
+            raise NotImplementedError(
+                f"pad op '{op.name}' has mode='replicate' but an input with no known rank."
+            )
+        pad_vals = static_ints(op.inputs.get("pad"))
+        if pad_vals is None or len(pad_vals) % 2 != 0:
+            raise NotImplementedError(
+                f"pad op '{op.name}' has mode='replicate' with a non-constant or odd-length 'pad' "
+                "input, which this exporter doesn't support."
+            )
+        n_padded = len(pad_vals) // 2
+        rank = len(x.shape)
+        lp0 = rp0 = 0
+        for i in range(n_padded):
+            mil_axis = rank - n_padded + i
+            lp, rp = pad_vals[2 * i], pad_vals[2 * i + 1]
+            if lp == 0 and rp == 0:
+                continue
+            if mil_axis != rank - 1:
+                raise NotImplementedError(
+                    f"pad op '{op.name}' pads MIL axis {mil_axis} (non-zero {lp}/{rp}) with "
+                    "mode='replicate', but this exporter only supports replicate-padding the "
+                    "fastest-varying axis (ne[0]/MIL's last axis) -- padding any other axis needs a "
+                    "new C++ primitive first."
+                )
+            lp0, rp0 = lp, rp
+
+        out_var = op.outputs[0]
+        if lp0 == 0 and rp0 == 0:
+            # A genuine identity pad (every entry zero) -- just alias the op away entirely.
+            if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=out_var, new_var=x):
+                return False
+            block.remove_ops([op])
+            return True
+
+        with _scope_ctx_like(op):
+            new_out = mb.loom_replicate_pad(x=x, lp=lp0, rp=rp0, name=out_var.name, before_op=op)
+        if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=out_var, new_var=new_out):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+def _as_list(v):
+    return list(v) if isinstance(v, (list, tuple, np.ndarray)) else [v]
+
+
+@register_pass(namespace="loom")
+class canonicalize_conv_transpose_dw(AbstractGraphPass):
+    """
+    Rewrites a depthwise (`groups == in_channels == out_channels`) `conv_transpose` into a
+    `loom_conv_transpose_dw` op -- EXPORT-ROADMAP.md R2.
+
+    First (and so far only) needed by Kokoro's `AdainResBlk1d` upsample "pool" (`ConvTranspose1d
+    (kernel=3, stride=2, groups=dim_in, padding=1, output_padding=1)`), also reused by StyleTTS2's
+    driver. `topology_ops.py`'s `conv_transpose` rule used to decide, at emission time, whether `groups`
+    made this depthwise and if so compose the zero-stuff-then-depthwise-conv identity inline; this pass
+    makes that decision once, before emission.
+
+    Validates the same invariants `topology_ops.py`'s old inline code did -- only a true 1D depthwise
+    case (`is_2d=False`, `groups == in_channels`, one output channel per group), zero dilation, zero pad
+    (every depthwise conv_transpose this exporter has seen traces with `pad=[0,0]`, deferring any real
+    crop to a separate downstream `slice_by_index`), and a compile-time-constant weight (needed to flip
+    the kernel) -- raising the same errors that code raised for anything else, just earlier (right after
+    `ct.convert()`, not mid-emission). A non-depthwise (`groups == 1`) `conv_transpose` is untouched,
+    left for `topology_ops.py`'s own `conv_transpose` rule exactly as before.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type != "conv_transpose":
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        groups = static_value(op.inputs.get("groups"), 1)
+        g_val = int(_as_list(groups)[0])
+        if g_val == 1:
+            return False
+
+        pad_type = static_value(op.inputs.get("pad_type"), "valid")
+        if pad_type not in ("valid", "custom"):
+            raise NotImplementedError(
+                f"conv_transpose op '{op.name}' has pad_type='{pad_type}', which this exporter "
+                "doesn't support (only 'valid' and a 'custom' symmetric-crop composition exist)."
+            )
+        strides_list = _as_list(static_value(op.inputs.get("strides"), [1]))
+        is_2d = len(strides_list) == 2
+        if is_2d and pad_type == "custom":
+            raise NotImplementedError(
+                f"conv_transpose op '{op.name}' is 2D with pad_type='custom' -- only the 1D "
+                "crop composition has been needed/written so far."
+            )
+        dilations = _as_list(static_value(op.inputs.get("dilations"), [1]))
+        if any(int(d) != 1 for d in dilations):
+            raise NotImplementedError(
+                f"conv_transpose op '{op.name}' has non-unit 'dilations' {dilations!r}, which "
+                "this exporter doesn't support."
+            )
+
+        x = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+        weight = op.inputs.get("weight")
+        if x is None or x.shape is None or weight is None or weight.shape is None:
+            return False
+        in_channels = int(x.shape[1])
+        out_per_group = int(weight.shape[1])
+        if is_2d or g_val != in_channels or out_per_group != 1:
+            raise NotImplementedError(
+                f"conv_transpose op '{op.name}' has groups={g_val} (in_channels={in_channels}, "
+                f"out_channels/group={out_per_group}) -- only a true 1D depthwise case "
+                "(groups == in_channels == out_channels) is composed; anything else has no "
+                "ggml-side implementation yet."
+            )
+        pad_list = _as_list(static_value(op.inputs.get("pad"), [0]))
+        if any(int(p) != 0 for p in pad_list):
+            raise NotImplementedError(
+                f"conv_transpose op '{op.name}' is depthwise with non-zero pad={pad_list!r} -- "
+                "every depthwise conv_transpose this exporter has seen traces with pad=[0,0] "
+                "(deferring any real crop to a separate downstream slice_by_index op); this "
+                "composition doesn't know how to fold a non-zero pad in directly."
+            )
+        if static_value(weight) is None:
+            raise NotImplementedError(
+                f"conv_transpose op '{op.name}' is depthwise but its weight isn't a resolved "
+                "constant -- this composition needs to flip the kernel at export time."
+            )
+
+        s0 = int(strides_list[0])
+        bias = op.inputs.get("bias")
+        out_name = op.outputs[0].name
+        with _scope_ctx_like(op):
+            new_out = mb.loom_conv_transpose_dw(x=x, weight=weight, bias=bias, stride=s0,
+                                                 name=out_name, before_op=op)
+        if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=new_out):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+@register_pass(namespace="loom")
+class lower_stack(AbstractGraphPass):
+    """
+    Rewrites `stack(values, axis)` into `concat([expand_dims(v, axes=[axis]) for v in values], axis)`
+    -- EXPORT-ROADMAP.md R2. Unlike every other pass in this module, this introduces no new dialect op:
+    `expand_dims` and `concat` are both already-real MIL ops with their own full, general
+    `topology_ops.py` rules (`reshape`/`expand_dims` and `concat`), so this is a pure lowering -- once it
+    runs, `topology_ops.py` no longer needs a dedicated `stack` composition at all, and gets the exact
+    same N-ary CONCAT-chaining logic `concat` already has, instead of a second, parallel copy of it.
+
+    First (and so far only) needed by a hand-rolled conv-based STFT's real/imag parts
+    (`torch.stack([real, imag], dim=-1)`, seen when a model computes its DFT via CONV_1D kernels
+    directly rather than `torch.stft`, which decomposes differently via coremltools' own
+    `lower_complex_dialect_ops`).
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type != "stack":
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        values = op.inputs.get("values")
+        if not values:
+            return False
+        real_values = [v for v in values if isinstance(v, Var)]
+        if not real_values:
+            return False
+        out_var = op.outputs[0]
+        if out_var.shape is None:
+            return False
+        out_rank = len(out_var.shape)
+        axis_val = int(static_value(op.inputs.get("axis"), 0))
+        axis = axis_val + out_rank if axis_val < 0 else axis_val
+
+        with _scope_ctx_like(op):
+            if len(real_values) == 1:
+                # A single real operand -- still a genuine rank-increasing op, not an identity, so
+                # this is the op's own real output name directly rather than an intermediate one.
+                new_out = mb.expand_dims(x=real_values[0], axes=[axis], name=out_var.name, before_op=op)
+            else:
+                expanded = [
+                    mb.expand_dims(x=v, axes=[axis], name=f"{out_var.name}_stack_unsq_{i}", before_op=op)
+                    for i, v in enumerate(real_values)
+                ]
+                new_out = mb.concat(values=expanded, axis=axis, name=out_var.name, before_op=op)
+
+        if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=out_var, new_var=new_out):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+@register_pass(namespace="loom")
+class lower_reduce_mean(AbstractGraphPass):
+    """
+    Rewrites a single-axis `reduce_mean` into whichever of two real ops its reduced axis's countability
+    allows -- EXPORT-ROADMAP.md R2:
+
+    * a statically-known reduction count -> `reduce_sum` (already a real, general MIL op with its own
+      `topology_ops.py` rule) followed by `loom_scale(n)` (dividing by `n`; see that op's own docstring
+      for why it carries `n` rather than the pre-divided `1/n`);
+    * a run-time-only count, but on the fastest-varying (last, MIL-order) axis -> `loom_mean`, which
+      `ggml_mean` can reduce natively (it supplies its own count at run time);
+    * anything else (a run-time-only count on any other axis, or a genuine multi-axis reduction) is
+      unrepresentable and raises -- the same errors `topology_ops.py`'s old two guards raised, just
+      earlier (right after `ct.convert()`, not mid-emission).
+
+    This is what makes all three outcomes explicit and pass-driven, rather than two of them being
+    `topology_ops.py` guards and the third an unstated fall-through to the generic OP_MAP path (which
+    happened to already do the right thing for the ne[0] case, but only because nothing else claimed
+    "reduce_mean" first).
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type != "reduce_mean":
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        x = op.inputs.get("x")
+        axes_val = static_ints(op.inputs.get("axes"))
+        if x is None or x.shape is None or axes_val is None or len(axes_val) != 1:
+            raise NotImplementedError(
+                f"reduce_mean op '{op.name}': only a single reduction axis is supported "
+                f"(got axes={static_value(op.inputs.get('axes'))!r}); a genuine multi-axis case "
+                "(e.g. GroupNorm, see group_norm_op.py) needs its own composition."
+            )
+        rank = len(x.shape)
+        axis = axes_val[0]
+        torch_axis = axis + rank if axis < 0 else axis
+        if not (0 <= torch_axis < rank):
+            return False
+        ne_axis = rank - 1 - torch_axis
+        n_raw = x.shape[torch_axis]
+        keep_dims = bool(static_value(op.inputs.get("keep_dims"), False))
+        out_name = op.outputs[0].name
+
+        if _is_int(n_raw):
+            n = int(n_raw)
+            with _scope_ctx_like(op):
+                summed = mb.reduce_sum(x=x, axes=[axis], keep_dims=keep_dims,
+                                        name=f"{out_name}_rmean_sum", before_op=op)
+                new_out = mb.loom_scale(x=summed, n=n, name=out_name, before_op=op)
+        elif ne_axis == 0:
+            with _scope_ctx_like(op):
+                new_out = mb.loom_mean(x=x, keep_dims=keep_dims, name=out_name, before_op=op)
+        else:
+            raise NotImplementedError(
+                f"reduce_mean op '{op.name}': reducing ne axis {ne_axis} over a count that is only "
+                "known at run time has no composition here. REDUCE_SUM + SCALE needs the count at "
+                "export time, and ggml_mean supplies its own count only for ne[0]. A dynamic count on "
+                "another axis needs its own composition (see loom_group_norm's custom-op bridge for "
+                "that case)."
+            )
+
+        if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=new_out):
+            return False
+        block.remove_ops([op])
+        return True
+
+
 _LOOM_PASS_NAMES = [
     "loom::fuse_gqa_repeat_kv",
     "loom::normalize_matmul",
     "loom::insert_explicit_broadcasts",
+    "loom::canonicalize_replicate_pad",
+    "loom::canonicalize_conv_transpose_dw",
+    "loom::lower_stack",
+    "loom::lower_reduce_mean",
     "common::dead_code_elimination",
 ]
 
@@ -357,8 +693,9 @@ _LOOM_PASS_NAMES = [
 def apply_loom_mil_passes(prog) -> None:
     """
     Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
-    normalization (R2a), mutual-broadcast insertion (R2a) -- plus `common::dead_code_elimination` over
-    `prog` in place. Must run before any topology/driver generation sees `prog` --
+    normalization (R2a), mutual-broadcast insertion (R2a), replicate-pad and depthwise-conv_transpose
+    canonicalization, `stack` and `reduce_mean` lowering (R2) -- plus `common::dead_code_elimination`
+    over `prog` in place. Must run before any topology/driver generation sees `prog` --
     `common::dead_code_elimination` is what actually removes each rewrite's now-orphaned dependency
     chain (the original tile/reshape idiom, a stale `transpose_x` bool operand, etc).
 
