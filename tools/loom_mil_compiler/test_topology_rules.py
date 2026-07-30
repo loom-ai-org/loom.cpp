@@ -88,48 +88,16 @@ class TestTopologyRuleTable(unittest.TestCase):
         # An absent mode input is PyTorch's own default: exact erf.
         self.assertEqual(lookup_topology_rule(None, _FakeOp("gelu")).name, "_op_gelu_exact")
 
-    def test_reduce_mean_routes_by_axis_and_whether_its_count_is_static(self):
-        """The three-way split that the StyleTTS2 regression was hiding in. The middle row is the one
-        that broke: a dynamic count on ne[0] must reach *no* rule, so the generic MEAN lowering runs and
-        supplies its own run-time count."""
-
-        class _Exporter:
-            """Reports whatever ne-order shape the case under test needs."""
-
-            def __init__(self, shape):
-                self.shape = shape
-
-            def get_var_info(self, var):
-                return {"shape": self.shape}
-
-        # ne-order shape, torch axis -> expected rule name (None means "falls through")
-        cases = [
-            # Matcha's hand-rolled LayerNorm: reduces ne[1], statically sized.
-            (["n_tokens", "192", "1"], 1, "_op_reduce_mean_scaled_sum"),
-            # StyleTTS2's diffusion: reduces ne[0] over a live n_tokens-derived length.
-            (["(floor((n_tokens) * (512)))", "1024", "1"], -1, None),
-            # Statically-sized ne[0] (STFT/CMVN): still the composed path.
-            (["512", "n_tokens", "1"], -1, "_op_reduce_mean_scaled_sum"),
-            # Dynamic count on an axis ggml_mean cannot reduce: genuinely unrepresentable.
-            (["512", "n_tokens", "1"], 1, "_op_reduce_mean_unsupported"),
-        ]
-        for shape, torch_axis, expected in cases:
-            op = _FakeOp("reduce_mean", axes=[torch_axis], keep_dims=False)
-            op.inputs["x"] = _FakeVar(None)
-            rule = lookup_topology_rule(_Exporter(shape), op)
-            got = None if rule is None else rule.name
-            self.assertEqual(got, expected, f"shape={shape} torch_axis={torch_axis}")
-
-    def test_multi_axis_reduce_mean_is_rejected_not_silently_dropped(self):
-        class _Exporter:
-            def get_var_info(self, var):
-                return {"shape": ["4", "8", "1"]}
-
-        op = _FakeOp("reduce_mean", axes=[0, 1], keep_dims=False)
-        op.inputs["x"] = _FakeVar(None)
-        rule = lookup_topology_rule(_Exporter(), op)
-        self.assertIsNotNone(rule, "a multi-axis reduce_mean must not fall through to ne[0]-only MEAN")
-        self.assertEqual(rule.name, "_op_reduce_mean_unsupported")
+    def test_reduce_mean_always_reaches_the_unreachable_defensive_rule(self):
+        """`passes.py`'s `lower_reduce_mean` (EXPORT-ROADMAP.md R2) now decides the three-way
+        static-count/dynamic-ne0/unrepresentable split *before* this table ever runs -- see
+        `test_passes.py`'s own `TestLowerReduceMean` for that decision itself. Every `reduce_mean` this
+        table still sees is therefore a bug (the pass didn't run), so there is exactly one, unguarded,
+        always-raising rule left -- this just pins that it stays that way."""
+        self.assertEqual(len(_RULES["reduce_mean"]), 1)
+        self.assertIsNone(_RULES["reduce_mean"][0].guard)
+        with self.assertRaises(NotImplementedError):
+            lookup_topology_rule(None, _FakeOp("reduce_mean")).handler(None, _FakeOp("reduce_mean"), None)
 
     def test_an_ordinary_less_falls_through_to_the_generic_path(self):
         """`less` has exactly one rule, guarded on the length-validity-mask idiom. A comparison that

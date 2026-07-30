@@ -187,9 +187,36 @@ Do these first because everything later has to preserve whatever exists at the t
   including real numeric reference verification for every rewrite site (Conformer-CTC/Parakeet TDT/RNNT,
   Kokoro decoder_vocoder, VITS, Matcha text_encoder/decoder/vocoder, Supertonic vfe/dp).
 
-R2's remaining composite ops (`loom.replicate_pad`, `loom.conv_transpose_dw`, `loom.stack`,
-`loom.mean`) can land any time after P1.2, including interleaved with P4 — they are independent of each
-other and each is individually gated.
+R2's remaining composite ops — DONE (all four landed together rather than interleaved with P4; they
+turned out cheap enough, and the fresh dialect-op-plus-pass pattern from P1.2 made each one quick to
+repeat):
+
+- **`loom.replicate_pad`** — `pad(mode="replicate")`'s VIEW/REPEAT/CONCAT composition (SupertonicTTS's
+  `ConvNextBlock`), moved into `passes.py`'s `canonicalize_replicate_pad` + a new `loom_replicate_pad`
+  dialect op, lowered 1:1 by `topology_ops.py`.
+- **`loom.conv_transpose_dw`** — the depthwise `conv_transpose` zero-stuff-then-conv composition
+  (Kokoro's `AdainResBlk1d` upsample, reused by StyleTTS2), moved into `canonicalize_conv_transpose_dw` +
+  `loom_conv_transpose_dw`.
+- **`stack` lowering** — no new op needed: `lower_stack` rewrites `stack` into `expand_dims` + `concat`,
+  both already-real MIL ops with their own full `topology_ops.py` rules, so `_op_stack`'s own ~50-line
+  composition (a parallel copy of `concat`'s own N-ary chaining) was deleted outright.
+- **`loom.mean`** — `reduce_mean`'s 3-way static/dynamic-ne0/unrepresentable split, moved into
+  `lower_reduce_mean` + two ops: `loom_mean` (ggml's own run-time-counted ne[0] reduction) and
+  `loom_scale` (the `reduce_sum`-then-divide composition). Caught and fixed two real bugs in the
+  process: (1) `loom_scale` originally carried the pre-divided `1/n` as an `fp32` const — MIL casts
+  every float const to fp32 on construction regardless of declared domain, silently rounding
+  `1/192` (`0.005208333333333333` → `0.0052083334885537624`); fixed by carrying the integer `n` instead
+  and dividing in plain Python at emission time, exactly like the old ad hoc code did. (2) the
+  CONT-before-MEAN fix for a non-contiguous (transposed) input — previously keyed on `mapped_op ==
+  "MEAN"` in the generic OP_MAP path, now unreachable since `reduce_mean` never survives to that path —
+  had to move into `loom_mean`'s own `topology_ops.py` rule, or StyleTTS2's diffusion sampler would have
+  silently regressed to the wrong-stride bug that fix originally closed.
+  **Gate:** re-exported all 11 models, snapshot-diffed against the same pre-P1.2 baseline — byte-identical
+  everywhere except SupertonicTTS's `vfe` (a pure `stack`-lowering intermediate-node rename, confirmed
+  numerically equivalent via `compare_snapshots.py`); full `pytest` (134 tests, 21 new) and `ctest` (139
+  tests, 0 failed) green, including real numeric reference verification for every rewrite site
+  (SupertonicTTS `vfe`/`dp`, Kokoro/StyleTTS2 `decoder_vocoder`, Matcha `text_encoder`/`decoder`/
+  `vocoder`, Conformer-CTC).
 
 #### P2 — enable multi-output topologies
 

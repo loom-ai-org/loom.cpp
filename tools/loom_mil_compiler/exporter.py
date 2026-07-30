@@ -1597,32 +1597,16 @@ class LoomGGUFExporter:
                 y_val_obj = op.inputs.get("y")
                 if x_val_obj and y_val_obj:
                     inputs = [resolve(self.safe_name(x_val_obj.name)), resolve(self.safe_name(y_val_obj.name))]
-            elif mapped_op in ("MEAN", "PERMUTE", "SOFTMAX", "CLAMP", "RSQRT", "RESHAPE", "VIEW", "LOG", "SQRT"):
-                # Unary reduction/metadata operations in Loom C++ strictly expect exactly 1 input tensor
+            elif mapped_op in ("PERMUTE", "SOFTMAX", "CLAMP", "RSQRT", "RESHAPE", "VIEW", "LOG", "SQRT"):
+                # Unary reduction/metadata operations in Loom C++ strictly expect exactly 1 input tensor.
+                # ("MEAN" used to be handled here too, via the generic `reduce_mean` -> MEAN OP_MAP entry
+                # -- EXPORT-ROADMAP.md R2's `lower_reduce_mean` pass now rewrites every `reduce_mean` into
+                # a `loom_mean`/`loom_scale`-based composition before this generic path ever runs, so
+                # "MEAN" can no longer appear as `mapped_op` here; its own CONT-before-MEAN fix moved to
+                # `topology_ops.py`'s `loom_mean` rule.)
                 x_val_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
                 if x_val_obj:
-                    x_name = resolve(self.safe_name(x_val_obj.name))
-                    if (mapped_op == "MEAN" and getattr(x_val_obj, "op", None) is not None
-                            and x_val_obj.op.op_type == "transpose"):
-                        # ggml_mean (like conv's im2col elsewhere) reduces ne[0] assuming a CONTIGUOUS
-                        # source -- fed a PERMUTE's own output (a non-contiguous view) directly, it
-                        # silently reads with the WRONG stride and produces a plausible-looking but
-                        # WRONG result (no assert, unlike conv's im2col; confirmed via an isolated
-                        # minimal repro: PERMUTE([4,T]->[T,4])+MEAN gave [10,20,17,14] instead of the
-                        # correct per-channel means [1,11,21,31] for a hand-computed input -- adding an
-                        # explicit CONT between the two fixed it exactly). First hit by StyleTTS2's
-                        # diffusion Transformer1d.run(), whose `x.mean(axis=1)` (reducing over the token
-                        # axis) traces to exactly this PERMUTE-straight-into-MEAN shape (torch's own
-                        # `.mean()` needs the reduced axis transposed to ne[0] first, matching this
-                        # project's own "PERMUTE so the target axis lands on ne[0], THEN reduce"
-                        # convention for REDUCE_SUM elsewhere). Inserting a CONT here is always safe
-                        # regardless of whether the source happens to already be contiguous (a CONT of an
-                        # already-contiguous tensor is a harmless, cheap extra copy), so this cannot
-                        # regress any existing MEAN usage.
-                        cont_name = x_name + "_mean_cont"
-                        nodes.append({"op": "CONT", "inputs": [x_name], "outputs": [cont_name]})
-                        x_name = cont_name
-                    inputs = [x_name]
+                    inputs = [resolve(self.safe_name(x_val_obj.name))]
             elif mapped_op in ("CONV_1D", "CONV_2D"):
                 # Convolutions strictly expect exactly 2 inputs: [x, weight]
                 # Strides, padding, dilation, groups are passed as JSON attributes.
