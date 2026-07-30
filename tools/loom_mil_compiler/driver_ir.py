@@ -209,11 +209,15 @@ class Assign(Stmt):
 
 @dataclasses.dataclass
 class SubgraphCall(Stmt):
-    """`local out1, out2 = loom.run_subgraph(module, n_tokens, n_past, {k = v, ...})`."""
+    """`local out1, out2 = loom.run_subgraph(module, {axis = expr, ...}, {k = v, ...})`.
+
+    `axes` replaces the old fixed `n_tokens`/`n_past` positional pair (EXPORT-ROADMAP.md R1): a
+    topology declares its own axis names now (`axes.py`'s N_SAMPLES/N_ENC_FRAMES/N_TOKENS/...), so the
+    driver call binds whatever that specific topology actually needs -- `{n_tokens=..., n_past=...}`
+    for the ordinary LLM/token-sequence case, `{n_samples=...}` for Conformer-CTC/Parakeet, etc."""
     outputs: list
     module: str
-    n_tokens: Expr
-    n_past: Expr
+    axes: dict  # str (axis name) -> Expr
     inputs: dict  # str -> Expr
     extra_outputs: list = dataclasses.field(default_factory=list)
 
@@ -221,7 +225,9 @@ class SubgraphCall(Stmt):
         return list(self.outputs) + list(self.extra_outputs)
 
     def reads(self) -> list[str]:
-        out = list(self.n_tokens.reads()) + list(self.n_past.reads())
+        out: list[str] = []
+        for e in self.axes.values():
+            out.extend(e.reads())
         for v in self.inputs.values():
             out.extend(v.reads())
         return out
@@ -389,7 +395,8 @@ class LuaCodegen:
             return [f"{pad}{stmt.name} = {stmt.expr.render()}"]
         if isinstance(stmt, SubgraphCall):
             targets = ", ".join(list(stmt.outputs) + list(stmt.extra_outputs))
-            call = Call("loom.run_subgraph", [Lit(stmt.module), stmt.n_tokens, stmt.n_past, TableLit(stmt.inputs)])
+            call = Call("loom.run_subgraph",
+                        [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs)])
             return [f"{pad}local {targets} = {call.render()}"]
         if isinstance(stmt, Argmax):
             call = Call("loom.argmax_row", [Var(stmt.tensor), stmt.n_vocab, stmt.row])

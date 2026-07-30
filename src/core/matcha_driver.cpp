@@ -69,7 +69,7 @@ std::vector<float> MatchaDriver::synthesize(const std::vector<int32_t>& tokens, 
     std::vector<float> mu_x_ct;
     {
         GraphBuilder builder(encoder_mu_topo_, *encoder_mu_model_, backend_);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         std::vector<int32_t> tokens_copy = tokens;
         ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
         ggml_backend_tensor_set(r.input_tensors.at("positions"), positions.data(), 0, positions.size() * sizeof(int32_t));
@@ -84,7 +84,7 @@ std::vector<float> MatchaDriver::synthesize(const std::vector<int32_t>& tokens, 
     std::vector<float> logw;
     {
         GraphBuilder builder(encoder_logw_topo_, *encoder_logw_model_, backend_);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         std::vector<int32_t> tokens_copy = tokens;
         ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
         ggml_backend_tensor_set(r.input_tensors.at("positions"), positions.data(), 0, positions.size() * sizeof(int32_t));
@@ -128,7 +128,7 @@ std::vector<float> MatchaDriver::synthesize(const std::vector<int32_t>& tokens, 
 
     VelocityFn velocity_fn = [&](const std::vector<float>& z, float t) {
         GraphBuilder builder(decoder_topo_, *decoder_model_, backend_);
-        GraphBuilder::BuildResult r = builder.build(T_mel, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_mel}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("z"), z.data(), 0, z.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("mu"), mu_y.data(), 0, mu_y.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("t"), &t, 0, sizeof(float));
@@ -151,7 +151,7 @@ std::vector<float> MatchaDriver::synthesize(const std::vector<int32_t>& tokens, 
     std::vector<float> waveform;
     {
         GraphBuilder builder(vocoder_topo_, *vocoder_model_, backend_);
-        GraphBuilder::BuildResult r = builder.build(T_mel, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_mel}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("mel"), mel.data(), 0, mel.size() * sizeof(float));
         ggml_backend_graph_compute(backend_, r.graph);
         waveform.resize(static_cast<size_t>(ggml_nelements(r.output)));

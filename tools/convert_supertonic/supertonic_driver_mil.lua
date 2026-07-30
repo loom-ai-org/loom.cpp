@@ -29,7 +29,7 @@ function synthesize(inputs)
     local lat_dim = inputs.lat_dim
 
     -- --- DurationPredictor: DPTextEncoder + MLP head -> scalar duration (seconds) ---
-    local dur_arr = loom.run_subgraph("dp", t_text, 0, { txt_ids = inputs.txt_ids, stl_emb = inputs.style_dp })
+    local dur_arr = loom.run_subgraph("dp", {n_tokens = t_text, n_past = 0}, { txt_ids = inputs.txt_ids, stl_emb = inputs.style_dp })
     local duration = dur_arr[1]
 
     -- --- Real get_latent_mask: wav_length=duration*sample_rate; latent_size=base_chunk_size*
@@ -42,7 +42,7 @@ function synthesize(inputs)
     -- --- TTLTextEncoder -> txt_emb, ne=[t_text,txt_dim] (T-fast, the traced module's own native torch
     --     layout -- no host-side layout crossing needed, unlike the bespoke driver's own Layout A/B
     --     bridging, since "vfe" was traced expecting exactly this same layout for its own txt_emb input). ---
-    local txt_emb = loom.run_subgraph("ttl_text", t_text, 0, { txt_ids = inputs.txt_ids, stl_emb = inputs.style_ttl })
+    local txt_emb = loom.run_subgraph("ttl_text", {n_tokens = t_text, n_past = 0}, { txt_ids = inputs.txt_ids, stl_emb = inputs.style_ttl })
 
     -- --- Deterministic Euler CFM sampling loop over VectorFieldEstimator -- see sample_vfe above,
     --     generated from export_supertonic_mil.py's own IterativeRefinementSpec. ---
@@ -50,6 +50,6 @@ function synthesize(inputs)
                           { txt_emb = txt_emb, stl_emb = inputs.style_ttl })
 
     -- --- SpeechDecoder: z (ne=[t_lat,lat_dim]) -> raw waveform ---
-    local waveform = loom.run_subgraph("decoder", t_lat, 0, { latent = z })
+    local waveform = loom.run_subgraph("decoder", {n_tokens = t_lat, n_past = 0}, { latent = z })
     return waveform
 end

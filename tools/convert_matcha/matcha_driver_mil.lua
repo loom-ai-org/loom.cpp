@@ -38,11 +38,11 @@ function synthesize(inputs)
     local t_text = #inputs.tokens
 
     -- --- TextEncoder: mu_x, T-fast (ne=[T_text,n_feats], flat[c*t_text+t]) ---
-    local mu_x = loom.run_subgraph("encoder_mu", t_text, 0, { tokens = inputs.tokens })
+    local mu_x = loom.run_subgraph("encoder_mu", {n_tokens = t_text, n_past = 0}, { tokens = inputs.tokens })
 
     -- --- TextEncoder: logw (per-token log duration; channel count 1 makes T-fast and C-fast layouts
     --     coincide, flat index = t directly) ---
-    local logw = loom.run_subgraph("encoder_logw", t_text, 0, { tokens = inputs.tokens })
+    local logw = loom.run_subgraph("encoder_logw", {n_tokens = t_text, n_past = 0}, { tokens = inputs.tokens })
 
     -- --- Real w_ceil = ceil(exp(logw)) (length_scale=1.0) -- per-token integer durations. ---
     local durations = {}
@@ -91,6 +91,6 @@ function synthesize(inputs)
 
     -- --- HiFi-GAN v1 vocoder: mel (T-fast, matches its own native torch (1,n_feats,T) layout) ->
     --     waveform ---
-    local waveform = loom.run_subgraph("vocoder", t_mel, 0, { mel = mel })
+    local waveform = loom.run_subgraph("vocoder", {n_tokens = t_mel, n_past = 0}, { mel = mel })
     return waveform
 end

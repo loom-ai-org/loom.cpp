@@ -31,14 +31,14 @@ function synthesize(inputs)
     local T = #inputs.token_ids
 
     -- --- Phase 1a: stats = TextEncoder -> [m_p;logs_p], T-fast: stats[c*T+t] (0-based c/t). ---
-    local stats = loom.run_subgraph("stats", T, 0, { tokens = inputs.token_ids })
+    local stats = loom.run_subgraph("stats", {n_tokens = T, n_past = 0}, { tokens = inputs.token_ids })
 
     -- --- Phase 1b: logw = TextEncoder + StochasticDurationPredictor(reverse) -> [T] duration logits.
     --     z_noise is host-sampled and ALREADY scaled by noise_scale_w (matches export_vits_mil.py's own
     --     LogwWrapper convention: the graph itself applies no further noise_scale multiply). ---
     local z_noise = loom.gaussian_array(T * 2)
     for i = 1, #z_noise do z_noise[i] = z_noise[i] * inputs.noise_scale_w end
-    local logw = loom.run_subgraph("logw", T, 0, { tokens = inputs.token_ids, z_noise = z_noise })
+    local logw = loom.run_subgraph("logw", {n_tokens = T, n_past = 0}, { tokens = inputs.token_ids, z_noise = z_noise })
 
     -- --- Host generate_path: w_ceil[t]=ceil(exp(logw[t])*length_scale); y_length=max(sum(w_ceil),1).
     --     Degenerates to a plain "replicate column t of m_p/logs_p for w_ceil[t] frames" expansion once
@@ -74,6 +74,6 @@ function synthesize(inputs)
     end
 
     -- --- Phase 2: coupling flow (reverse) + HiFi-GAN vocoder -> waveform ---
-    local waveform = loom.run_subgraph("flow_vocoder", y_length, 0, { z_p = z_p })
+    local waveform = loom.run_subgraph("flow_vocoder", {n_tokens = y_length, n_past = 0}, { z_p = z_p })
     return waveform
 end

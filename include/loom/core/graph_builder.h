@@ -14,6 +14,13 @@ namespace loom {
 
 class KvCache;
 
+// A topology's own declared axis values for one build() call -- EXPORT-ROADMAP.md R1's named-axes
+// design: every topology declares which axis(es) its dynamic dims are actually named (axes.py's
+// n_samples/n_enc_frames/n_tokens/...), replacing the old assumption that every model has exactly one
+// axis and it's always called "n_tokens". A plain name->value map, mirroring SymbolEnv itself (which
+// is exactly that already) -- there is no extra structure to add beyond naming what goes in it.
+using DynamicAxes = std::unordered_map<std::string, double>;
+
 // Turns a parsed GraphTopology into a real ggml_cgraph for a specific (n_tokens, n_past) shape,
 // implementing SPECIFICATION.md §5's two-pass allocation strategy: build a no_alloc "ghost graph" from
 // the topology, then hand it to ggml_gallocr to assign real memory.
@@ -37,10 +44,18 @@ public:
         std::unordered_map<std::string, ggml_tensor*> input_tensors; // topology's declared inputs, by name
     };
 
-    // Builds and allocates a graph for exactly (n_tokens, n_past). Always correct regardless of what
+    // Builds and allocates a graph for exactly the given axis values. Always correct regardless of what
     // reserve() has (or hasn't) been called with -- ggml_gallocr_alloc_graph reallocates automatically
     // if the requested graph exceeds whatever was previously reserved (see ggml-alloc.h).
-    BuildResult build(uint32_t n_tokens, uint32_t n_past);
+    //
+    // `axes` need only bind whatever names this specific topology's own declared shapes reference
+    // (EXPORT-ROADMAP.md R1) -- SymbolEnv::get throws loom::SchemaError naming the missing symbol if
+    // one is referenced but not bound, rather than silently defaulting it. If `axes` contains both
+    // "n_tokens" and "n_past" and doesn't already declare "n_kv", it is set automatically to their sum
+    // (n_past + n_tokens) -- the one derived axis a primitive itself reads directly from SymbolEnv
+    // (`primitives_attention.cpp`'s ATTENTION op), rather than only ever appearing in a JSON shape
+    // string, so every caller of an attention-bearing topology gets it without having to compute it.
+    BuildResult build(const DynamicAxes& axes);
 
     // Builds worst-case prefill (n_tokens=n_ctx_max, n_past=0) and decode (n_tokens=1,
     // n_past=n_ctx_max-1) shapes and reserves the allocator for the larger of the two, so that ordinary

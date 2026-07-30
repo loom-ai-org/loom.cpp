@@ -37,7 +37,9 @@ public:
     LoomLuaBridge& operator=(const LoomLuaBridge&) = delete;
 
     // Registers a subgraph under `name` so a driver script can invoke it via
-    // `loom.run_subgraph(name, n_tokens, n_past, inputs_table)`. `model`/`kv_cache` are NOT owned by the
+    // `loom.run_subgraph(name, axes_table, inputs_table)`, where `axes_table` is `{axis_name = value,
+    // ...}` (EXPORT-ROADMAP.md R1 -- e.g. `{n_tokens=12, n_past=0}` or `{n_samples=16000}`, whatever
+    // axis names this specific topology declares). `model`/`kv_cache` are NOT owned by the
     // bridge (same non-owning-reference convention as GraphBuilder itself) -- the caller must keep them
     // alive for the bridge's own lifetime. `kv_cache` is null for non-autoregressive modules (e.g.
     // Whisper's encoder); pass one for modules using the ATTENTION primitive's persistent-cache path

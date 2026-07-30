@@ -33,7 +33,7 @@ class TestRenderSampler(unittest.TestCase):
     def test_emits_the_declared_call_with_every_input(self):
         lua = render_sampler(SUPERTONIC)
         self.assertIn("local function sample_vfe(length, n_elems, n_steps, step_inputs)", lua)
-        self.assertIn('loom.run_subgraph("vfe", length, 0, args)', lua)
+        self.assertIn('loom.run_subgraph("vfe", {n_tokens = length, n_past = 0}, args)', lua)
         for line in ("z_t = z,", "txt_emb = step_inputs.txt_emb,",
                      "stl_emb = step_inputs.stl_emb,", "t = { t },"):
             self.assertIn(line, lua)

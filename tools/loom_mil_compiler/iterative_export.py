@@ -10,7 +10,7 @@ and both hand-wrote the identical Lua loop to do it:
     local dt = 1.0 / inputs.n_steps
     for step = 0, inputs.n_steps - 1 do
         local t = step / inputs.n_steps
-        local v = loom.run_subgraph("<estimator>", <length>, 0, { <carried> = z, ...fixed..., t = { t } })
+        local v = loom.run_subgraph("<estimator>", {n_tokens = <length>, n_past = 0}, { <carried> = z, ...fixed..., t = { t } })
         for i = 1, #z do z[i] = z[i] + v[i] * dt end
     end
 
@@ -141,7 +141,7 @@ def render_sampler(spec: IterativeRefinementSpec) -> str:
     lines += [
         f"            {spec.time_input} = {{ t }},",
         "        }",
-        f'        local v = loom.run_subgraph("{spec.estimator}", length, 0, args)',
+        f'        local v = loom.run_subgraph("{spec.estimator}", {{n_tokens = length, n_past = 0}}, args)',
         "        for i = 1, #z do",
         "            z[i] = z[i] + v[i] * dt",
         "        end",

@@ -106,7 +106,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("decoder"));
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build(T, 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     set_input(r, "z", x);
     set_input(r, "mu", mu);

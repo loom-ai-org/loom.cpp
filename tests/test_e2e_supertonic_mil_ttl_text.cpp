@@ -73,7 +73,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("ttl_text"));
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build(static_cast<uint32_t>(txt_ids.size()), 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", static_cast<uint32_t>(txt_ids.size())}, {"n_past", 0}});
 
     std::vector<int32_t> txt_ids_copy = txt_ids;
     std::vector<float> stl_emb_copy = stl_emb;

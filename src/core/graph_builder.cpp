@@ -112,7 +112,7 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_bac
                             KvCache* kv_cache, size_t compute_meta_bytes)
     : topo_(topo), model_(model), backend_(backend), kv_cache_(kv_cache), compute_meta_bytes_(compute_meta_bytes) {}
 
-GraphBuilder::BuildResult GraphBuilder::build(uint32_t n_tokens, uint32_t n_past) {
+GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes) {
     ggml_init_params params{compute_meta_bytes_, nullptr, /*no_alloc=*/true};
     ggml_context_ptr ctx(ggml_init(params));
     if (!ctx) {
@@ -120,9 +120,15 @@ GraphBuilder::BuildResult GraphBuilder::build(uint32_t n_tokens, uint32_t n_past
     }
 
     SymbolEnv env = model_.hparam_env();
-    env.set("n_tokens", static_cast<double>(n_tokens));
-    env.set("n_past", static_cast<double>(n_past));
-    env.set("n_kv", static_cast<double>(n_past) + static_cast<double>(n_tokens));
+    for (const auto& [name, value] : axes) {
+        env.set(name, value);
+    }
+    // n_kv is the one derived axis a primitive itself reads directly from SymbolEnv (see this
+    // function's own header comment) rather than only ever appearing in a JSON shape string -- auto-
+    // derive it so a caller binding "n_tokens"/"n_past" doesn't also have to compute their sum.
+    if (!axes.count("n_kv") && axes.count("n_tokens") && axes.count("n_past")) {
+        env.set("n_kv", axes.at("n_tokens") + axes.at("n_past"));
+    }
 
     SymbolTable symtab = model_.weights();
 
@@ -194,10 +200,15 @@ void GraphBuilder::reserve(uint32_t n_ctx_max) {
     if (n_ctx_max == 0) return;
     // build() always allocates via gallocr internally, so simply building the worst-case prefill and
     // decode shapes once (and discarding the results) is enough to size the allocator's buffer for
-    // every smaller/equal shape a real generation loop will request afterwards.
-    build(n_ctx_max, 0);
+    // every smaller/equal shape a real generation loop will request afterwards. Named "n_tokens"/
+    // "n_past" directly rather than taking a caller-supplied DynamicAxes: this reservation strategy
+    // (worst-case prefill vs. worst-case decode) is inherently an autoregressive-LLM-shaped concept,
+    // and every such topology on this roadmap keeps that exact axis name (EXPORT-ROADMAP.md R1 only
+    // renames the non-token-sequence families -- Conformer-CTC/Parakeet/Kokoro -- none of which call
+    // reserve()).
+    build({{"n_tokens", static_cast<double>(n_ctx_max)}, {"n_past", 0.0}});
     if (n_ctx_max > 1) {
-        build(1, n_ctx_max - 1);
+        build({{"n_tokens", 1.0}, {"n_past", static_cast<double>(n_ctx_max - 1)}});
     }
 }
 

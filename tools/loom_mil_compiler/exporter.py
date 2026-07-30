@@ -1115,8 +1115,10 @@ class LoomGGUFExporter:
             outputs=["_mono_out"],
             extra_outputs=["_mono_shape"],
             module="main_topo",
-            n_tokens=n_tokens_expr,
-            n_past=Lit(0),
+            # This topology's own declared root axis (EXPORT-ROADMAP.md R1) -- "n_tokens" unless the
+            # caller declared otherwise (e.g. Conformer-CTC/Parakeet's "n_samples"); the VALUE is still
+            # the first input's own length regardless of what the axis is named.
+            axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
             inputs=inputs_tbl,
         ))
 
@@ -1190,7 +1192,7 @@ class LoomGGUFExporter:
         # 3. Prefix.
         chain_var = "_mod_chain_0"
         body.append(SubgraphCall(
-            outputs=[chain_var], module="prefix", n_tokens=n_tokens_expr, n_past=Lit(0),
+            outputs=[chain_var], module="prefix", axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
             inputs={self.safe_name(n): IRVar(self.safe_name(n)) for n in prefix_input_names},
         ))
 
@@ -1213,7 +1215,8 @@ class LoomGGUFExporter:
                 aux_inputs_tbl[safe_n] = IRVar(chain_var) if n in aux_chain_names else IRVar(safe_n)
             aux_out_vars = [f"_mod_aux_{i}" for i in range(len(layout.aux_output_names))]
             body.append(SubgraphCall(
-                outputs=aux_out_vars, module="aux", n_tokens=n_tokens_expr, n_past=Lit(0), inputs=aux_inputs_tbl,
+                outputs=aux_out_vars, module="aux",
+                axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)}, inputs=aux_inputs_tbl,
             ))
 
         # 5. Repeated block, threading `chain_var` (hidden_states) from one layer's output into the
@@ -1240,7 +1243,8 @@ class LoomGGUFExporter:
 
             next_chain_var = f"_mod_chain_{i + 1}"
             body.append(SubgraphCall(
-                outputs=[next_chain_var], module=layer_name, n_tokens=n_tokens_expr, n_past=Lit(0),
+                outputs=[next_chain_var], module=layer_name,
+                axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
                 inputs=inputs_tbl,
             ))
             chain_var = next_chain_var
@@ -1253,7 +1257,8 @@ class LoomGGUFExporter:
             is_last = idx == len(layout.suffix_names) - 1
             next_chain_var = f"_mod_suffix_{idx}"
             call_kwargs = dict(
-                outputs=[next_chain_var], module=name, n_tokens=n_tokens_expr, n_past=Lit(0),
+                outputs=[next_chain_var], module=name,
+                axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
                 inputs={self.safe_name(in_names[0]): IRVar(chain_var)},
             )
             if is_last:
@@ -1360,7 +1365,8 @@ class LoomGGUFExporter:
                 n_tokens_expr = IRVar(self.safe_name(op.inputs["n_tokens"].name))
             if "n_past" in op.inputs:
                 n_past_expr = IRVar(self.safe_name(op.inputs["n_past"].name))
-            return [SubgraphCall(outputs=output_names, module=op_type, n_tokens=n_tokens_expr, n_past=n_past_expr,
+            return [SubgraphCall(outputs=output_names, module=op_type,
+                                  axes={self.root_axis: n_tokens_expr, "n_past": n_past_expr},
                                   inputs=inputs_tbl)]
 
         # E. Fast Host Math Mapping

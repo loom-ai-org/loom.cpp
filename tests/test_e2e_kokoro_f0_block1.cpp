@@ -85,7 +85,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build(T, 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     // Same "ggml ne=[T,channels] <-> numpy (channels,T)" transpose as every other Kokoro test here.
     std::vector<float> x_tc(static_cast<size_t>(T) * kDimIn);

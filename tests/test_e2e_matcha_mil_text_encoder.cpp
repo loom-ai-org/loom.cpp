@@ -96,7 +96,7 @@ std::vector<float> run_topology(loom::GgufModel& model, ggml_backend_t backend, 
     loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json(name));
     const auto T = static_cast<uint32_t>(tokens.size());
     loom::GraphBuilder builder(topo, model, backend);
-    loom::GraphBuilder::BuildResult r = builder.build(T, 0);
+    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     std::vector<int32_t> tokens_copy = tokens;
     ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));

@@ -66,7 +66,7 @@ std::vector<float> SupertonicDriver::synthesize(const std::vector<int32_t>& txt_
     float duration = 0.0f;
     {
         GraphBuilder builder(dp_topo_, *dp_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         std::vector<int32_t> tokens_copy = txt_ids;
         ggml_backend_tensor_set(r.input_tensors.at("txt_ids"), tokens_copy.data(), 0,
                                  tokens_copy.size() * sizeof(int32_t));
@@ -82,7 +82,7 @@ std::vector<float> SupertonicDriver::synthesize(const std::vector<int32_t>& txt_
     std::vector<float> txt_emb_cb;
     {
         GraphBuilder builder(ttl_text_topo_, *ttl_text_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         std::vector<int32_t> tokens_copy = txt_ids;
         ggml_backend_tensor_set(r.input_tensors.at("txt_ids"), tokens_copy.data(), 0,
                                  tokens_copy.size() * sizeof(int32_t));
@@ -107,7 +107,7 @@ std::vector<float> SupertonicDriver::synthesize(const std::vector<int32_t>& txt_
 
     VelocityFn velocity_fn = [&](const std::vector<float>& z, float t) {
         GraphBuilder builder(vfe_topo_, *vfe_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_lat, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_lat}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("z_t"), z.data(), 0, z.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("txt_emb_cb"), txt_emb_cb.data(), 0,
                                  txt_emb_cb.size() * sizeof(float));
@@ -128,7 +128,7 @@ std::vector<float> SupertonicDriver::synthesize(const std::vector<int32_t>& txt_
     std::vector<float> waveform;
     {
         GraphBuilder builder(decoder_topo_, *decoder_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_lat, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_lat}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("latent"), z_final.data(), 0, z_final.size() * sizeof(float));
         ggml_backend_graph_compute(backend_, r.graph);
         waveform.resize(static_cast<size_t>(ggml_nelements(r.output)));

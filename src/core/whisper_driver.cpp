@@ -72,7 +72,7 @@ std::vector<int32_t> WhisperDriver::transcribe(const std::vector<float>& wavefor
 
     // --- Encoder: one fixed-shape pass, no dynamic symbol needed (every shape in this topology is a
     //     compile-time constant -- see convert_whisper_encoder.py's own header comment). ---
-    GraphBuilder::BuildResult enc_r = encoder_builder_->build(0, 0);
+    GraphBuilder::BuildResult enc_r = encoder_builder_->build({{"n_tokens", 0}, {"n_past", 0}});
     std::vector<float> waveform_copy = waveform_padded;
     ggml_backend_tensor_set(enc_r.input_tensors.at("waveform"), waveform_copy.data(), 0,
                              waveform_copy.size() * sizeof(float));
@@ -90,7 +90,7 @@ std::vector<int32_t> WhisperDriver::transcribe(const std::vector<float>& wavefor
 
     const auto n_prompt_tokens = static_cast<uint32_t>(prompt_tokens.size());
     {
-        GraphBuilder::BuildResult r = decoder_builder_->build(n_prompt_tokens, n_past);
+        GraphBuilder::BuildResult r = decoder_builder_->build({{"n_tokens", n_prompt_tokens}, {"n_past", n_past}});
         fill_decoder_inputs(r, prompt_tokens, n_past, xa);
         ggml_backend_graph_compute(backend_, r.graph);
         n_past += n_prompt_tokens;
@@ -105,7 +105,7 @@ std::vector<int32_t> WhisperDriver::transcribe(const std::vector<float>& wavefor
     }
 
     while (generated.size() < max_new_tokens) {
-        GraphBuilder::BuildResult r = decoder_builder_->build(1, n_past);
+        GraphBuilder::BuildResult r = decoder_builder_->build({{"n_tokens", 1}, {"n_past", n_past}});
         fill_decoder_inputs(r, {generated.back()}, n_past, xa);
         ggml_backend_graph_compute(backend_, r.graph);
         n_past += 1;

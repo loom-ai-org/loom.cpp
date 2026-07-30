@@ -28,13 +28,13 @@ int main() {
 
     bool grew = false;
     for (uint32_t n_tokens = 1; n_tokens <= kNCtxMax; ++n_tokens) {
-        builder.build(n_tokens, /*n_past=*/0);
+        builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
         if (builder.buffer_size() > reserved_size) grew = true;
     }
     LOOM_CHECK(!grew);
 
     // A decode-shaped call (n_tokens=1 at the far end of the reserved range) shouldn't grow it either.
-    builder.build(1, kNCtxMax - 1);
+    builder.build({{"n_tokens", 1}, {"n_past", kNCtxMax - 1}});
     LOOM_CHECK(builder.buffer_size() <= reserved_size);
 
     LOOM_TEST_REPORT_AND_RETURN();

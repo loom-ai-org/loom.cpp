@@ -19,7 +19,7 @@ std::vector<float> run_block_layout_a(GgufModel& model, GraphTopology& topo, ggm
                                        const std::string& x_name, const std::vector<float>* style,
                                        uint32_t& out_T, uint32_t& out_C) {
     GraphBuilder builder(topo, model, backend, nullptr);
-    GraphBuilder::BuildResult r = builder.build(T, 0);
+    GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
     const uint32_t channels = static_cast<uint32_t>(x_tc.empty() ? 0 : x_tc[0].size());
     std::vector<float> x_flat(static_cast<size_t>(channels) * T);
     for (uint32_t t = 0; t < T; ++t)
@@ -140,7 +140,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<float> bert_out;
     {
         GraphBuilder builder(albert_topo_, *albert_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         std::vector<int32_t> tokens_copy = input_ids;
         ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
         std::vector<int32_t> positions(T_text);
@@ -169,7 +169,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
         for (size_t i = 0; i < x.size(); ++i) x_scaled[i] = x[i] * c_in;
 
         GraphBuilder builder(diffusion_topo_, *diffusion_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("x_in"), x_scaled.data(), 0, x_scaled.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("time"), &c_noise, 0, sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("embedding"), bert_out.data(), 0, bert_out.size() * sizeof(float));
@@ -202,7 +202,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<float> d_en_flat;  // Layout A ([T,512], flat=c*T+t)
     {
         GraphBuilder builder(bert_encoder_topo_, *bert_encoder_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_text, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("x"), bert_out.data(), 0, bert_out.size() * sizeof(float));
         ggml_backend_graph_compute(backend_, r.graph);
         d_en_flat.resize(static_cast<size_t>(ggml_nelements(r.output)));
@@ -227,7 +227,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
             for (uint32_t c = 0; c < kDModel; ++c) seq_ct[static_cast<size_t>(t) * kDModel + c] = lstm_out[t][c];
 
         GraphBuilder ada_builder(blk.adaln_topo, *blk.adaln_model, backend_, nullptr);
-        GraphBuilder::BuildResult ar = ada_builder.build(T_text, 0);
+        GraphBuilder::BuildResult ar = ada_builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         ggml_backend_tensor_set(ar.input_tensors.at("x"), seq_ct.data(), 0, seq_ct.size() * sizeof(float));
         ggml_backend_tensor_set(ar.input_tensors.at("style"), s_predictor.data(), 0, s_predictor.size() * sizeof(float));
         ggml_backend_graph_compute(backend_, ar.graph);
@@ -253,7 +253,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     {
         GraphBuilder proj_builder(duration_proj_topo_, *duration_proj_model_, backend_, nullptr);
         for (uint32_t t = 0; t < T_text; ++t) {
-            GraphBuilder::BuildResult r = proj_builder.build(0, 0);
+            GraphBuilder::BuildResult r = proj_builder.build({{"n_tokens", 0}, {"n_past", 0}});
             ggml_backend_tensor_set(r.input_tensors.at("x"), top_out[t].data(), 0, top_out[t].size() * sizeof(float));
             ggml_backend_graph_compute(backend_, r.graph);
             ggml_backend_tensor_get(r.output, duration_logits[t].data(), 0, cfg_.max_dur * sizeof(float));
@@ -273,7 +273,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<std::vector<float>> t_en;
     {
         GraphBuilder cnn_builder(text_encoder_cnn_topo_, *text_encoder_cnn_model_, backend_, nullptr);
-        GraphBuilder::BuildResult cnn_r = cnn_builder.build(T_text, 0);
+        GraphBuilder::BuildResult cnn_r = cnn_builder.build({{"n_tokens", T_text}, {"n_past", 0}});
         std::vector<int32_t> tokens_copy = input_ids;
         ggml_backend_tensor_set(cnn_r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
         ggml_backend_graph_compute(backend_, cnn_r.graph);
@@ -313,7 +313,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
 
     auto run_proj = [&](GgufModel& model, GraphTopology& topo, const std::vector<std::vector<float>>& feat) {
         GraphBuilder builder(topo, model, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(static_cast<uint32_t>(feat.size()), 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", static_cast<uint32_t>(feat.size())}, {"n_past", 0}});
         const uint32_t channels = static_cast<uint32_t>(feat[0].size());
         std::vector<float> flat(static_cast<size_t>(channels) * feat.size());
         for (size_t t = 0; t < feat.size(); ++t)
@@ -331,7 +331,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<float> decoder_x_flat;
     {
         GraphBuilder builder(decoder_core_topo_, *decoder_core_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_frames, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_frames}, {"n_past", 0}});
         std::vector<float> asr_flat(static_cast<size_t>(512) * T_frames);
         for (uint32_t t = 0; t < T_frames; ++t)
             for (uint32_t c = 0; c < 512; ++c) asr_flat[static_cast<size_t>(c) * T_frames + t] = asr[t][c];
@@ -354,7 +354,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<float> har_source;
     {
         GraphBuilder builder(sinegen_topo_, *sinegen_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_f0, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_f0}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("f0_curve"), F0_curve.data(), 0, F0_curve.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("rand_ini"), rand_ini.data(), 0, rand_ini.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("noise"), noise_tc.data(), 0, noise_tc.size() * sizeof(float));
@@ -374,7 +374,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<float> har_flat;
     {
         GraphBuilder builder(stft_forward_topo_, *stft_forward_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(static_cast<uint32_t>(waveform_padded.size()), 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", static_cast<uint32_t>(waveform_padded.size())}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("waveform_padded"), waveform_padded.data(), 0,
                                  waveform_padded.size() * sizeof(float));
         ggml_backend_graph_compute(backend_, r.graph);
@@ -387,7 +387,7 @@ std::vector<float> StyleTTS2Driver::synthesize(const std::vector<int32_t>& input
     std::vector<float> waveform;
     {
         GraphBuilder builder(generator_topo_, *generator_model_, backend_, nullptr);
-        GraphBuilder::BuildResult r = builder.build(T_f0, 0);
+        GraphBuilder::BuildResult r = builder.build({{"n_tokens", T_f0}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("x"), decoder_x_flat.data(), 0, decoder_x_flat.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("style"), s_decoder.data(), 0, s_decoder.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("har"), har_flat.data(), 0, har_flat.size() * sizeof(float));
