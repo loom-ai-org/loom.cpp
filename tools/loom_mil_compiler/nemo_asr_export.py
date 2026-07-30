@@ -86,8 +86,15 @@ def prepare_nemo_environment(tmpdir: str = DEFAULT_NEMO_TMPDIR):
 
     os.makedirs(tmpdir, exist_ok=True)
     os.environ.setdefault("TMPDIR", tmpdir)
-    if tempfile.tempdir is None:
-        tempfile.tempdir = os.environ["TMPDIR"]
+    # Unconditional, matching the docstring above: TensorFlow (imported transitively by coremltools,
+    # before this function ever runs) already calls tempfile.gettempdir() during its own import,
+    # memoizing tempfile.tempdir to the OS default ("/tmp") -- confirmed directly (`tempfile.tempdir`
+    # is already "/tmp" by the time this line runs, for every one of this family's exports, not just
+    # sometimes). A `None`-guarded assignment therefore never actually overrides it, silently losing
+    # the exact race this function exists to win. Conformer-CTC-small's own checkpoint happens to be
+    # small enough to unpack within `/tmp`'s ~2 GB regardless, which is why this went unnoticed; both
+    # Parakeet checkpoints (~2.4 GB each) do not fit and fail with ENOSPC.
+    tempfile.tempdir = os.environ["TMPDIR"]
 
 
 class EncoderOutput(Enum):

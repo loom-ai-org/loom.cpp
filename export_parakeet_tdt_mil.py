@@ -26,7 +26,7 @@ from loom_mil_compiler.nemo_asr_export import (  # noqa: E402  (path setup must 
 )
 
 SPEC = NeMoASREncoderSpec(
-    checkpoint="/home/flavio/.claude/tmp/parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo",
+    checkpoint="/home/flavio/Dev/models/parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo",
     output=EncoderOutput.ENCODER_BT_D,
     architecture="parakeet-tdt-encoder",
     output_path="parakeet_tdt_encoder_mil_monolithic.gguf",
