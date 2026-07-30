@@ -284,6 +284,11 @@ def _op_linear(self, op, ctx):
 # (from ggml_mul_mat's result.ne=[A.ne1,B.ne1,B.ne2,B.ne3] formula). Both combinations used by
 # scaled_dot_product_attention's decomposition are composed; the unguarded catch-all rejects every other
 # combination rather than silently miscomputing it.
+#
+# `passes.py`'s `normalize_matmul` pass (EXPORT-ROADMAP.md R2a) rewrites every `transpose_x=True` matmul
+# into `matmul(transpose(x), y, transpose_x=False, ...)` before this table ever sees it -- so in
+# practice only (False, True) and (False, False) ever reach here, and the catch-all below exists purely
+# as a defensive backstop, not because transpose_x=True is a real unhandled case anymore.
 
 @topology_rule('matmul', guard=lambda self, op: _matmul_transposes(op) == (False, True),
                when="transpose_x=False, transpose_y=True")
@@ -334,8 +339,10 @@ def _op_matmul_x_y(self, op, ctx):
 def _op_matmul_unsupported(self, op, ctx):
     tx, ty = _matmul_transposes(op)
     raise NotImplementedError(
-        f"matmul op '{op.name}' has transpose_x={tx}, transpose_y={ty}, which no "
-        "exporter composition handles yet (only transpose_x=False has been needed so far)."
+        f"matmul op '{op.name}' has transpose_x={tx}, transpose_y={ty}. `passes.py`'s "
+        "normalize_matmul pass should have already rewritten every transpose_x=True matmul into "
+        "transpose_x=False before this table ever ran -- reaching here with transpose_x still True "
+        "means that pass didn't run, or missed this op."
     )
 
 
@@ -545,6 +552,22 @@ def _op_loom_group_norm(self, op, ctx):
     # constant, safe to reuse verbatim.
     nodes.append({"op": "RESHAPE", "inputs": [normed4], "outputs": [output_var],
                   "attrs": {"shape": [-1] + x_shape[1:]}})
+
+
+@topology_rule('loom_broadcast_to')
+def _op_loom_broadcast_to(self, op, ctx):
+    # 1:1 REPEAT -- the exact node the exporter's former ad hoc mutual-broadcast detection spliced in
+    # by hand at emission time (EXPORT-ROADMAP.md R2a; see `passes.py`'s `insert_explicit_broadcasts`,
+    # which inserts this op, and `loom_broadcast_to`'s own docstring in dialect.py). `op`'s own output
+    # shape (via its `infer_type_with_broadcast` type inference) IS the real broadcast target, so no
+    # special derivation is needed here beyond the same `get_var_info` every other REPEAT-emitting rule
+    # already uses.
+    ctx.nodes.append({
+        "op": "REPEAT",
+        "inputs": [ctx.resolve(self.safe_name(op.inputs["x"].name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"shape": self.get_var_info(op.outputs[0])["shape"]},
+    })
 
 
 @topology_rule('loom_spline')
