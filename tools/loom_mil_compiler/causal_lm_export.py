@@ -12,9 +12,11 @@ own CLI, now a thin wrapper around the class defined here; `export_lfm2_modular.
 scope) -- `test_causal_lm_export.py` instead reproduces LFM2's exports through these classes directly,
 as the regression check that they genuinely generalize the shape.
 """
+import json
 import sys
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 # Bypass the transformers library hf-hub bounds check to import safely -- moved here verbatim from
@@ -199,3 +201,34 @@ class LMModularCausalModelExportConfig(LMCausalModelExportConfig):
         )
         print(f"SUCCESS! Modular-blueprint model exported cleanly to: {self.output_path}")
         return self.output_path
+
+
+def _is_qwen3(path: Path) -> bool:
+    """Real structural check (BACKLOG.md P3.2): an HF-style directory whose own `config.json` declares
+    `model_type == "qwen3"`. LFM2's `model_type` would trivially detect the same way, but no recognizer
+    is registered for it this pass -- confirmed scope, see BACKLOG.md's P3.1/P3.2 entries."""
+    cfg_path = path / "config.json"
+    if not path.is_dir() or not cfg_path.exists():
+        return False
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    return cfg.get("model_type") == "qwen3"
+
+
+def _build_qwen3(path: Path, output_path: str) -> LoomExportConfig:
+    return LMMonolithicCausalModelExportConfig(
+        architecture="qwen3", output_path=output_path, profile="monolithic", model_dir=str(path),
+    )
+
+
+def register(registry) -> None:
+    """Registers this family's `TaskRegistryEntry` (BACKLOG.md P3.2)."""
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="causal-lm",
+        config_class=LMCausalModelExportConfig,
+        recognizers=[ModelRecognizer(name="qwen3", detect=_is_qwen3, build_config=_build_qwen3)],
+    ))

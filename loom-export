@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Single entry point for exporting any model this project knows how to export (BACKLOG.md P3.2).
+# See tools/loom_mil_compiler/main_export.py for the real implementation and usage.
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# PYTHONPATH, not `cd`: a relative -o/model-path argument must stay relative to the CALLER's cwd, not
+# this script's own location.
+PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" exec ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.main_export "$@"

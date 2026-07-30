@@ -46,10 +46,14 @@ output is silently an encoder activation.
 """
 import os
 import sys
+import tarfile
 import tempfile
 import types
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+
+import yaml
 
 import numpy as np
 import torch
@@ -306,3 +310,84 @@ def export_nemo_asr_encoder(spec: ASRNemoEncoderExportConfig):
     """The whole export, from `.nemo` on disk to `.gguf` on disk. Thin shim over
     `ASRNemoEncoderExportConfig.export()`, kept as a module-level function for existing callers."""
     return spec.export()
+
+
+def _read_nemo_model_config(path: Path) -> dict:
+    """Reads a `.nemo` archive's embedded `model_config.yaml` WITHOUT restoring the checkpoint (no
+    `ASRModel.restore_from`, no untar-to-tempdir) -- cheap enough to call once per recognizer during
+    detection."""
+    with tarfile.open(path) as t:
+        f = t.extractfile("./model_config.yaml")
+        return yaml.safe_load(f.read())
+
+
+def _is_nemo_archive(path: Path) -> bool:
+    return path.is_file() and path.suffix == ".nemo"
+
+
+def _is_conformer_ctc(path: Path) -> bool:
+    """Real structural check (BACKLOG.md P3.2): `target` is unambiguous for this family --
+    `EncDecCTCModelBPE`, confirmed against the real checkpoint (see this module's own docstring: the
+    restore class doesn't vary, `ASRModel.restore_from` dispatches on this same field)."""
+    if not _is_nemo_archive(path):
+        return False
+    cfg = _read_nemo_model_config(path)
+    return str(cfg.get("target", "")).endswith("EncDecCTCModelBPE")
+
+
+def _is_parakeet_tdt(path: Path) -> bool:
+    """Parakeet-TDT and Parakeet-RNNT both restore through `EncDecRNNTBPEModel` -- `target` alone can't
+    tell them apart (confirmed against both real checkpoints). The real secondary discriminator, found by
+    reading both checkpoints' own `model_config.yaml`: TDT's `model_defaults` declares `tdt_durations`
+    (and `num_tdt_durations`); plain RNNT's `model_defaults` has neither key at all."""
+    if not _is_nemo_archive(path):
+        return False
+    cfg = _read_nemo_model_config(path)
+    if not str(cfg.get("target", "")).endswith("EncDecRNNTBPEModel"):
+        return False
+    return "tdt_durations" in (cfg.get("model_defaults") or {})
+
+
+def _is_parakeet_rnnt(path: Path) -> bool:
+    if not _is_nemo_archive(path):
+        return False
+    cfg = _read_nemo_model_config(path)
+    if not str(cfg.get("target", "")).endswith("EncDecRNNTBPEModel"):
+        return False
+    return "tdt_durations" not in (cfg.get("model_defaults") or {})
+
+
+def _build_conformer_ctc(path: Path, output_path: str):
+    return ASRNemoEncoderExportConfig(
+        checkpoint=str(path), output=EncoderOutput.CTC_LOG_PROBS,
+        architecture="conformer-ctc", output_path=output_path,
+    )
+
+
+def _build_parakeet_tdt(path: Path, output_path: str):
+    return ASRNemoEncoderExportConfig(
+        checkpoint=str(path), output=EncoderOutput.ENCODER_BT_D,
+        architecture="parakeet-tdt-encoder", output_path=output_path,
+    )
+
+
+def _build_parakeet_rnnt(path: Path, output_path: str):
+    return ASRNemoEncoderExportConfig(
+        checkpoint=str(path), output=EncoderOutput.ENCODER_BT_D,
+        architecture="parakeet-rnnt-encoder", output_path=output_path,
+    )
+
+
+def register(registry) -> None:
+    """Registers this family's `TaskRegistryEntry` (BACKLOG.md P3.2)."""
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="nemo-asr-encoder",
+        config_class=ASRNemoEncoderExportConfig,
+        recognizers=[
+            ModelRecognizer(name="conformer-ctc", detect=_is_conformer_ctc, build_config=_build_conformer_ctc),
+            ModelRecognizer(name="parakeet-tdt", detect=_is_parakeet_tdt, build_config=_build_parakeet_tdt),
+            ModelRecognizer(name="parakeet-rnnt", detect=_is_parakeet_rnnt, build_config=_build_parakeet_rnnt),
+        ],
+    ))
