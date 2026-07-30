@@ -24,11 +24,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402  (path setup must precede the import)
     EncoderOutput,
-    NeMoASREncoderSpec,
+    ASRNemoEncoderExportConfig,
     export_nemo_asr_encoder,
 )
 
-SPEC = NeMoASREncoderSpec(
+SPEC = ASRNemoEncoderExportConfig(
     checkpoint="/home/flavio/Dev/models/conformer-ctc-small/stt_en_conformer_ctc_small.nemo",
     output=EncoderOutput.CTC_LOG_PROBS,
     architecture="conformer-ctc",
