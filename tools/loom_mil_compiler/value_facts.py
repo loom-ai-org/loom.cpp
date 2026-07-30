@@ -36,7 +36,7 @@ distinction is part of what the engine reads back.
 import numpy as np
 from coremltools.converters.mil.mil import Var
 
-from .shape_expr import as_expr, floor_div, render, to_number, N_TOKENS
+from .shape_expr import as_expr, floor_div, render, to_number
 
 # MIL arithmetic ops `scalar_expr` can fold into a real expression, and the sympy operation each maps
 # to. `floor_div` is `real_div` wrapped in an explicit floor(), exactly as the engine's evaluator (which
@@ -270,23 +270,24 @@ class ValueFacts:
             return (None, False)
         if v.op is None:
             # A genuine (sub)function input with no producer -- the same "this IS the topology's one
-            # true dynamic quantity" case `_infer_dynamic_dim_expr` treats unconditionally as "n_tokens"
-            # (see its own docstring). Originally gated to `v.name == "length"` only (NeMo's Conformer-
-            # CTC always feeds a real per-utterance length in under that exact name) -- too narrow for
-            # VITS's `MultiHeadAttention._get_relative_embeddings`, whose own dynamic `length` scalar
-            # traces back to `key.size(2)` (a plain shape query on an ACTIVATION, not a declared
-            # "length" input) and bottoms out at some other producer-less var entirely -- confirmed this
-            # was exactly why `padded[:, start:end]`'s `start` (`pad + (window_size+1) - length`)
-            # resolved to `None` and silently fell back to the slice's full extent (a real element-count
-            # bug: the sliced relative-position table came out ~34x too long at T=62, one axis short of
-            # crashing GraphBuilder's own RESHAPE element-count check downstream). Every producer-less
-            # scalar this whole exporter's single-true-dynamic-axis design ever reaches IS that quantity,
-            # matching `_infer_dynamic_dim_expr`'s own unconditional treatment -- not just ones spelled
-            # "length".
+            # true dynamic quantity" case `_infer_dynamic_dim_expr` treats unconditionally as this
+            # topology's own `root_axis` (see its own docstring in exporter.py -- "n_tokens" unless the
+            # caller declared otherwise, e.g. Conformer-CTC/Parakeet's "n_samples"). Originally gated to
+            # `v.name == "length"` only (NeMo's Conformer-CTC always feeds a real per-utterance length in
+            # under that exact name) -- too narrow for VITS's `MultiHeadAttention._get_relative_embeddings`,
+            # whose own dynamic `length` scalar traces back to `key.size(2)` (a plain shape query on an
+            # ACTIVATION, not a declared "length" input) and bottoms out at some other producer-less var
+            # entirely -- confirmed this was exactly why `padded[:, start:end]`'s `start` (`pad +
+            # (window_size+1) - length`) resolved to `None` and silently fell back to the slice's full
+            # extent (a real element-count bug: the sliced relative-position table came out ~34x too long
+            # at T=62, one axis short of crashing GraphBuilder's own RESHAPE element-count check
+            # downstream). Every producer-less scalar this whole exporter's single-true-dynamic-axis
+            # design ever reaches IS that quantity, matching `_infer_dynamic_dim_expr`'s own unconditional
+            # treatment -- not just ones spelled "length".
             #
             # This is the ONE place the answer is a guess rather than a derivation, which is what the
             # `is_guess` half of this entry marks -- see `scalar_expr_is_guess`.
-            return (N_TOKENS, True)
+            return (as_expr(self.exporter.root_axis), True)
         op = v.op
         if op.op_type in ("cast", "squeeze", "identity", "expand_dims"):
             inner = op.inputs.get("x") or op.inputs.get("data")

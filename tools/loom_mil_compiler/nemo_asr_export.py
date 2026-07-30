@@ -296,6 +296,9 @@ def export_nemo_asr_encoder(spec: NeMoASREncoderSpec):
         output_path=spec.output_path,
         architecture=spec.architecture,
         profile=spec.profile,
+        # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
+        # family-wide for all three models this template covers (axes.py's N_SAMPLES).
+        root_axis="n_samples",
     )
     print(f"SUCCESS! Monolithic model exported cleanly to: {spec.output_path}")
     return spec.output_path

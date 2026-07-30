@@ -23,7 +23,7 @@ import hashlib
 import numpy as np
 from coremltools.converters.mil.mil import Var
 
-from .shape_expr import as_expr, render, to_number, N_TOKENS
+from .shape_expr import as_expr, render, to_number
 from .symbols import DYNAMIC_SYMBOL_RE as _DYNAMIC_SYMBOL_RE
 from .value_facts import static_array, static_ints, static_scalar, static_value
 
@@ -2224,11 +2224,24 @@ def _less_is_always_valid_mask(self, op):
         exactly, where the previous version round-tripped the expression through a string and `eval`
         with `/` as float division. The decision this feeds is unchanged on every current model -- the
         snapshot diff across all 12 shows no LESS node appearing or disappearing -- but there is no
-        re-parsing and no `eval` any more."""
+        re-parsing and no `eval` any more.
+
+        Substitutes EVERY free symbol in `expr` with `n_tokens_value`, not just the literal `N_TOKENS`
+        (as an earlier version of this did) -- needed once a topology's root axis can be named
+        something other than "n_tokens" (EXPORT-ROADMAP.md R1, axes.py): Conformer-CTC/Parakeet, the
+        one family this exact bypass exists for, now declares its root axis "n_samples". Hardcoding
+        `N_TOKENS` here would silently substitute nothing for those models, making every probe evaluate
+        to a still-symbolic (non-numeric) expression -- `float()` would then raise, `_eval_expr` would
+        return None for every probe, and the caller's loop reads that as "not always off by exactly
+        one", flipping this bypass from correctly refused (the CMVN case) to wrongly permitted. Sound
+        for the same reason `compare_snapshots.py`'s own probe substitution is: this whole exporter
+        targets models with exactly one true dynamic quantity per topology, so any free symbol reaching
+        here IS that topology's one true axis, whatever it happens to be named."""
         if expr is None:
             return None
         try:
-            return float(as_expr(expr).subs(N_TOKENS, n_tokens_value))
+            expr = as_expr(expr)
+            return float(expr.subs({s: n_tokens_value for s in expr.free_symbols}))
         except (TypeError, ValueError):
             return None
 

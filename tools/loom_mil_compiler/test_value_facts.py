@@ -101,6 +101,8 @@ class TestMemoization(unittest.TestCase):
         """The one exporter method the derivation calls out to. Stubbed so this test exercises
         `ValueFacts`' own walking/caching rather than the exporter's shape inference."""
 
+        root_axis = "n_tokens"
+
         def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
             return N_TOKENS
 
@@ -191,6 +193,8 @@ class TestGuessProvenance(unittest.TestCase):
     it, correct shapes in SupertonicTTS and VITS (see BACKEND.md)."""
 
     class _StubExporter:
+        root_axis = "n_tokens"
+
         def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
             return N_TOKENS
 

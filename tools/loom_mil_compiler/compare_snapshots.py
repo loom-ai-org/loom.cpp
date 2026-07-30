@@ -24,22 +24,59 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from loom_mil_compiler.shape_expr import N_TOKENS, UnsupportedShapeExpression, parse  # noqa: E402
+from loom_mil_compiler.shape_expr import UnsupportedShapeExpression, parse, symbol  # noqa: E402
 
 # Spread across the dynamic range every current model declares (0.1 s .. 20 s of 16 kHz audio, plus
 # token-count-sized values), including odd and even and off-by-one neighbours, so a pair that agrees
 # only at a convenient multiple cannot pass.
 PROBES = (1, 2, 3, 7, 16, 63, 64, 65, 101, 160, 161, 1600, 3200, 16000, 16001, 31999, 100000, 320000)
 
+# EXPORT-ROADMAP.md's R1: named axes replacing the single "n_tokens" fallback every dynamic dimension
+# used to render as (see tools/loom_mil_compiler/axes.py). {new axis name -> the expression that named
+# the identical quantity before the rename} -- a declared claim ("n_samples IS what n_tokens used to
+# mean for this model"), not something this tool infers. Substituted into a NEW-side expression before
+# evaluating, so a pure rename compares as equivalent instead of structural. A rename not listed here
+# still compares correctly (see `evaluate`'s own uniform-probe substitution below): it just isn't
+# documented as a KNOWN one, the way an entry here is.
+ALIAS_MAP = {
+    "n_samples": "n_tokens",      # Conformer-CTC / Parakeet TDT / Parakeet RNNT -- raw audio samples
+    "n_enc_frames": "n_tokens",   # Kokoro decoder_vocoder -- post-encoder acoustic frame count
+}
 
-def evaluate(value, n_tokens):
-    """`value` (a JSON attribute: number or expression string) at one concrete sequence length."""
+
+def _dealias(expr):
+    """`expr` with every `ALIAS_MAP` entry substituted, so a renamed symbol reads under its pre-R1
+    name. Substitution is on the expression tree (see shape_expr.py's own module docstring for why
+    that matters over string rewriting): a compound expression like `600*n_enc_frames + 20` becomes
+    `600*n_tokens + 20` exactly, not just a bare symbol swap."""
+    subs = {}
+    for new_name, old_expr in ALIAS_MAP.items():
+        sym = symbol(new_name)
+        if sym in expr.free_symbols:
+            subs[sym] = parse(old_expr)
+    return expr.subs(subs) if subs else expr
+
+
+def evaluate(value, probe):
+    """`value` (a JSON attribute: number or expression string) at one concrete axis length.
+
+    Any free symbol remaining after `ALIAS_MAP` substitution -- whether that's the ordinary
+    `n_tokens` an untouched model still uses, or some other axis name this tool has no alias entry
+    for -- is substituted with the SAME `probe` value. That is sound, not just permissive: this whole
+    exporter targets models with exactly one true dynamic quantity per topology (see exporter.py's
+    `get_var_info`), so any two symbol names that both survive to a single comparison are, by
+    construction, two names for the same run's one real quantity, not two independently-varying ones.
+    """
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if not isinstance(value, str):
         return None
     try:
-        return float(parse(value).subs(N_TOKENS, n_tokens))
+        expr = _dealias(parse(value))
+        free = expr.free_symbols
+        if not free:
+            return float(expr)
+        return float(expr.subs({s: probe for s in free}))
     except (UnsupportedShapeExpression, TypeError, ValueError):
         return None
 
