@@ -40,7 +40,12 @@ public:
         ggml_context_ptr ctx;   // owns every tensor/graph struct produced by this build; keep alive
                                 // until you're done reading outputs, then let it drop.
         ggml_cgraph* graph = nullptr;
-        ggml_tensor* output = nullptr; // the topology's declared "output" symbol
+        ggml_tensor* output = nullptr; // the topology's primary declared output (== outputs.front())
+        // Every declared output tensor, in the topology's own declared order -- outputs.front() ==
+        // output. Single-output topologies (every model on the roadmap as of P2) get a one-element
+        // vector; existing callers that only ever read `output` are unaffected. See EXPORT-ROADMAP.md
+        // P2 / BACKLOG.md's implementation sequence.
+        std::vector<ggml_tensor*> outputs;
         std::unordered_map<std::string, ggml_tensor*> input_tensors; // topology's declared inputs, by name
     };
 

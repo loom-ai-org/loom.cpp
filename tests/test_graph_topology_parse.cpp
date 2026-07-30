@@ -56,6 +56,41 @@ void test_valid_parse() {
     LOOM_CHECK(topo.items[2].node.op == "MUL_MAT");
 }
 
+// P2 (EXPORT-ROADMAP.md / BACKLOG.md's implementation sequence): a topology may declare more than one
+// co-equal output via a plural "outputs" JSON array instead of the singular "output" string.
+const char* kMultiOutputTopology = R"JSON({
+  "version": 1,
+  "inputs": [
+    { "name": "x", "dtype": "f32", "shape": ["n_tokens"] }
+  ],
+  "outputs": ["y", "z"],
+  "nodes": [
+    { "op": "MUL_MAT", "inputs": ["w", "x"], "outputs": ["y"] },
+    { "op": "ADD", "inputs": ["x", "b"], "outputs": ["z"] }
+  ]
+})JSON";
+
+void test_multi_output_parse() {
+    loom::GraphTopology topo = loom::GraphTopology::parse(kMultiOutputTopology);
+
+    LOOM_CHECK(topo.version == 1);
+    // `output` (singular) stays populated as the FIRST declared output -- back-compat for any reader
+    // that only ever looked at "the" output.
+    LOOM_CHECK(topo.output == "y");
+    LOOM_CHECK((topo.outputs == std::vector<std::string>{"y", "z"}));
+    LOOM_CHECK(topo.items.size() == 2);
+}
+
+void test_single_output_still_populates_outputs_vector() {
+    loom::GraphTopology topo = loom::GraphTopology::parse(kValidTopology);
+    LOOM_CHECK((topo.outputs == std::vector<std::string>{"logits"}));
+}
+
+void test_empty_outputs_array_throws() {
+    const char* json = R"JSON({"version": 1, "outputs": [], "nodes": []})JSON";
+    LOOM_CHECK_THROWS(loom::GraphTopology::parse(json), loom::SchemaError);
+}
+
 void test_invalid_json_throws() {
     LOOM_CHECK_THROWS(loom::GraphTopology::parse("{ not valid json "), loom::SchemaError);
 }
@@ -87,6 +122,9 @@ void test_repeat_block_missing_index_var_throws() {
 
 int main() {
     test_valid_parse();
+    test_multi_output_parse();
+    test_single_output_still_populates_outputs_vector();
+    test_empty_outputs_array_throws();
     test_invalid_json_throws();
     test_unsupported_version_throws();
     test_missing_output_throws();

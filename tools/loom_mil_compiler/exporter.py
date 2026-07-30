@@ -1674,13 +1674,18 @@ class LoomGGUFExporter:
             nodes.append(node)
 
         func_outputs = func.outputs if func else (ops_list[-1].outputs if ops_list else [])
-        output_symbol = resolve(self.safe_name(func_outputs[0].name)) if func_outputs else "output"
+        # A topology can declare more than one co-equal output symbol now (EXPORT-ROADMAP.md P2 --
+        # BACKLOG.md's implementation sequence): every one of `func`'s own declared outputs, not just
+        # the first, is a real topology output. Single-output functions (every model on the roadmap as
+        # of P2) get a one-element list, so nothing downstream that only ever looked at "the" output
+        # changes behavior.
+        output_symbols = [resolve(self.safe_name(v.name)) for v in func_outputs] if func_outputs else ["output"]
 
-        pruned_nodes = self._prune_dead_nodes(nodes, output_symbol)
+        pruned_nodes = self._prune_dead_nodes(nodes, output_symbols)
 
         # A declared input with no node (post-pruning) that actually reads it is unreachable from this
-        # topology's own output -- GraphBuilder's ggml_gallocr_alloc_graph only allocates a backend
-        # buffer for tensors reachable from the declared output, so an orphan input tensor is created
+        # topology's own output(s) -- GraphBuilder's ggml_gallocr_alloc_graph only allocates a backend
+        # buffer for tensors reachable from a declared output, so an orphan input tensor is created
         # but never given a buffer. If the driver ever supplied a value for it anyway (e.g. a
         # modular-export blueprint's per-layer function still nominally "declaring" a
         # cache_position/position_ids input that its own real call never ends up depending on once
@@ -1692,21 +1697,28 @@ class LoomGGUFExporter:
         referenced = {name for node in pruned_nodes for name in node["inputs"]}
         topo_inputs = [inp for inp in topo_inputs if inp["name"] in referenced]
 
-        return {
-            "version": 1,
-            "inputs": topo_inputs,
-            "output": output_symbol,
-            "nodes": pruned_nodes
-        }
+        # "output" (singular string) is both the original schema and what every single-output topology
+        # still serializes -- byte-identical to pre-P2 output. "outputs" (plural array) is new, used only
+        # when a function genuinely declares more than one output; see graph_topology.h's own comment on
+        # the C++ side of this same distinction.
+        topo = {"version": 1, "inputs": topo_inputs}
+        if len(output_symbols) == 1:
+            topo["output"] = output_symbols[0]
+        else:
+            topo["outputs"] = output_symbols
+        topo["nodes"] = pruned_nodes
+        return topo
 
-    def _prune_dead_nodes(self, nodes: list, output_symbol: str) -> list:
+    def _prune_dead_nodes(self, nodes: list, output_symbols) -> list:
         """
-        Removes topology nodes whose output is never consumed, directly or transitively, by the
-        topology's own declared output. GraphBuilder builds and COMPUTES every node unconditionally
-        regardless of whether anything uses its result -- so an orphaned subgraph isn't just wasted
-        compute, it can still crash (confirmed empirically on an orphaned chain that segfaulted during
-        ggml_backend_graph_compute despite having zero real consumers, because nothing ever validates an
-        unused node's own shapes/values are sane). Keeps only nodes reachable backward from the output.
+        Removes topology nodes whose output is never consumed, directly or transitively, by any of the
+        topology's own declared outputs (`output_symbols`: an iterable of symbol names -- a plain string
+        is also accepted for older direct callers and treated as a single-element set). GraphBuilder
+        builds and COMPUTES every node unconditionally regardless of whether anything uses its result --
+        so an orphaned subgraph isn't just wasted compute, it can still crash (confirmed empirically on
+        an orphaned chain that segfaulted during ggml_backend_graph_compute despite having zero real
+        consumers, because nothing ever validates an unused node's own shapes/values are sane). Keeps
+        only nodes reachable backward from any declared output.
 
         The GQA repeat_kv() fusion's own orphaned dependency chain (the original tile's now-unused
         "reps"-computation subgraph -- gather/concat/equal/select/div) no longer needs this: that fusion
@@ -1716,7 +1728,7 @@ class LoomGGUFExporter:
         behind (a pre-partitioned modular slice, an advanced/bespoke hand-built Program) rather than
         relying on every future caller to prove it never will.
         """
-        needed = {output_symbol}
+        needed = {output_symbols} if isinstance(output_symbols, str) else set(output_symbols)
         live = []
         for node in reversed(nodes):
             if any(o in needed for o in node["outputs"]):

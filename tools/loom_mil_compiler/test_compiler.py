@@ -160,6 +160,78 @@ class TestLoomMILCompiler(unittest.TestCase):
         self.assertTrue(any(node["op"] == "MUL_MAT" for node in topo["nodes"]))
         self.assertTrue(any(node["op"] == "ADD" for node in topo["nodes"]))
 
+    def test_multi_output_submodule_topology(self):
+        """P2 (EXPORT-ROADMAP.md / BACKLOG.md's implementation sequence): a submodule genuinely traced
+        with two real, independent outputs (e.g. LFM2's rotary-embedding table returning (cos, sin) --
+        modular_export.py's own aux_output_names) must serialize BOTH into its topology's "outputs"
+        array, not just the first (the pre-P2 behavior, which would silently drop the second output's
+        entire computation from the topology via dead-node pruning). The driver's own SubgraphCall must
+        capture both Lua locals from the one loom.run_subgraph call."""
+        class MockOperation:
+            def __init__(self, op_type, inputs, outputs):
+                self.op_type = op_type
+                self.inputs = inputs
+                self.outputs = outputs
+                self.blocks = []
+
+        class MockVar:
+            def __init__(self, name):
+                self.name = name
+
+        prog = Program()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 4), dtype=types.fp32)])
+        def splitter(x):
+            w = mb.const(val=np.ones((4, 4), dtype=np.float32) * 2.0, name="w")
+            y = mb.matmul(x=x, y=w, name="matmul_node")
+            z = mb.add(x=x, y=1.0, name="add_node")
+            return y, z
+
+        prog.functions["splitter"] = splitter.functions["main"]
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 4), dtype=types.fp32)])
+        def main_func(x):
+            y = mb.add(x=x, y=1.0, name="placeholder")
+            return mb.add(x=y, y=0.0, name="final")
+
+        main_ops = list(main_func.functions["main"].operations)
+        # main_ops[0] is a "const" (the "placeholder" add's own y=1.0 literal); the "add" op itself
+        # (the one whose "x" input is the real function input, needed by MockOperation below) is
+        # main_ops[1] -- a lone op depending directly on the function's own input placeholder Var
+        # otherwise ends up with an empty `.inputs` dict (a coremltools quirk unrelated to this test).
+        placeholder_op = main_ops[1]
+        # Reuse the placeholder op's OWN output Var for the call's first output (same trick
+        # test_multi_modular_program_transpilation uses): main's own declared final output already
+        # refers to this Var by name, so it resolves correctly without also having to patch
+        # main_func.functions["main"].outputs itself. The second output is a genuinely NEW call-site
+        # local with no other consumer -- exactly the "captured but not read further" shape a real
+        # aux_output_names[1] (e.g. "sin") can have.
+        second_out = MockVar("splitter_out_1")
+        main_ops[1] = MockOperation(op_type="splitter", inputs={"x": placeholder_op.inputs["x"]},
+                                     outputs=[placeholder_op.outputs[0], second_out])
+        main_func.functions["main"].operations = main_ops
+
+        prog.functions["main"] = main_func.functions["main"]
+
+        exporter = loom_mil_compiler.LoomGGUFBackend()
+        exporter(prog, output_path=self.output_path, architecture="multi_output_submodule_test")
+
+        reader = GGUFReader(self.output_path)
+        self.assertIn("model.graph_topology.splitter", reader.fields)
+        import json
+        topo = json.loads(reader.fields["model.graph_topology.splitter"].parts[-1].tobytes().decode("utf-8"))
+
+        # Both outputs declared (plural "outputs", not singular "output") -- P2's own schema choice.
+        self.assertNotIn("output", topo)
+        self.assertEqual(len(topo["outputs"]), 2)
+        self.assertTrue(any(n["op"] == "MUL_MAT" for n in topo["nodes"]))
+        # The SECOND output's own node ("add_node" -> ADD) must survive pruning too -- pre-P2 this
+        # would have been dropped as unreachable from the (only) first declared output.
+        self.assertTrue(any(n["op"] == "ADD" for n in topo["nodes"]))
+
+        driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
+        self.assertIn(f"local placeholder, {second_out.name} = loom.run_subgraph('splitter'", driver_script)
+
     def test_monolithic_profile_auto_generation(self):
         """
         Verify that using profile="monolithic" automatically serializes the entire

@@ -163,22 +163,37 @@ GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes) {
         }
     }
 
-    auto out_it = symtab.find(topo_.output);
-    if (out_it == symtab.end()) {
-        throw SchemaError("GraphBuilder::build: declared output '" + topo_.output + "' was never produced by any node");
+    result.outputs.reserve(topo_.outputs.size());
+    for (const std::string& out_name : topo_.outputs) {
+        auto out_it = symtab.find(out_name);
+        if (out_it == symtab.end()) {
+            throw SchemaError("GraphBuilder::build: declared output '" + out_name + "' was never produced by any node");
+        }
+        // Every declared output needs its own ggml_set_output(), not just the first: without it,
+        // gallocr's liveness analysis sees an "output" tensor with no reader as soon as the last node
+        // that consumes it computes, and frees its buffer for reuse by something later in the same
+        // graph -- silently corrupting it (see test_primitive_registry.cpp's own hand-built
+        // multi-output precedent for this exact failure mode).
+        ggml_set_output(out_it->second);
+        result.outputs.push_back(out_it->second);
     }
-    result.output = out_it->second;
-    ggml_set_output(result.output);
+    result.output = result.outputs.front();
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx.get(), estimate_graph_size(topo_, env), /*grads=*/false);
-    // KV-cache writes (if any) have no data-dependency edge to the declared output, so they must be
-    // expanded into the graph explicitly, and *before* the output -- ggml_cgraph nodes execute strictly
+    // KV-cache writes (if any) have no data-dependency edge to any declared output, so they must be
+    // expanded into the graph explicitly, and *before* the outputs -- ggml_cgraph nodes execute strictly
     // in the array order they were appended in, so this ordering is what guarantees a write lands in the
     // cache before the read that depends on it being there (see PrimitiveContext::side_effects).
     for (ggml_tensor* root : side_effect_roots) {
         ggml_build_forward_expand(gf, root);
     }
-    ggml_build_forward_expand(gf, result.output);
+    // All outputs are expanded before the single ggml_gallocr_alloc_graph call below (same "build
+    // forward from every co-equal output first, allocate once" shape as the hand-built multi-output
+    // test in test_primitive_registry.cpp) -- for a single-output topology this is exactly the one
+    // ggml_build_forward_expand call the pre-P2 code made, so behavior/byte-output is unchanged.
+    for (ggml_tensor* out : result.outputs) {
+        ggml_build_forward_expand(gf, out);
+    }
     result.graph = gf;
 
     if (!galloc_) {

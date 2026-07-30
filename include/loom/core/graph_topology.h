@@ -46,10 +46,18 @@ struct TopologyItem {
 };
 
 // The parsed form of the JSON graph-topology document embedded in a GGUF's "model.graph_topology" KV.
+//
+// `output` is kept as the single primary output symbol (== outputs.front()) so every pre-P2 reader of
+// this struct keeps compiling and behaving identically for the single-output topologies that make up
+// every model on the roadmap today (EXPORT-ROADMAP.md P2 -- BACKLOG.md's implementation sequence).
+// `outputs` is the full declared list; a topology with more than one co-equal output symbol (e.g. an
+// encoder producing both a hidden-state tensor and a mask) declares JSON's plural "outputs" array
+// instead of the singular "output" string -- see GraphTopology::parse.
 struct GraphTopology {
     int version = 0;
     std::vector<TensorSpec> inputs;
     std::string output;
+    std::vector<std::string> outputs;
     std::vector<TopologyItem> items;
 
     // Throws loom::SchemaError on malformed JSON, an unsupported "version", or a structurally invalid

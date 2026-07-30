@@ -83,6 +83,25 @@ void set_tensor_from_lua_array(lua_State* L, int value_idx, ggml_tensor* tensor)
     }
 }
 
+// Reads `tensor`'s data back out as a flat double vector -- the same f32/i32 dispatch
+// l_run_subgraph's single-output path used inline before P2 generalized it to N outputs.
+std::vector<double> read_tensor_as_doubles(lua_State* L, ggml_tensor* tensor) {
+    const auto n = static_cast<size_t>(ggml_nelements(tensor));
+    std::vector<double> out(n);
+    if (tensor->type == GGML_TYPE_F32) {
+        std::vector<float> f(n);
+        ggml_backend_tensor_get(tensor, f.data(), 0, n * sizeof(float));
+        out.assign(f.begin(), f.end());
+    } else if (tensor->type == GGML_TYPE_I32) {
+        std::vector<int32_t> iv(n);
+        ggml_backend_tensor_get(tensor, iv.data(), 0, n * sizeof(int32_t));
+        out.assign(iv.begin(), iv.end());
+    } else {
+        luaL_error(L, "loom.run_subgraph: output tensor has an unsupported ggml type");
+    }
+    return out;
+}
+
 LoomLuaBridge* bridge_from_upvalue(lua_State* L) {
     return static_cast<LoomLuaBridge*>(lua_touserdata(L, lua_upvalueindex(1)));
 }
@@ -145,28 +164,25 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
 
         ggml_backend_graph_compute(mod.backend, r.graph);
 
-        const auto n_out = static_cast<size_t>(ggml_nelements(r.output));
-        std::vector<double> out(n_out);
-        if (r.output->type == GGML_TYPE_F32) {
-            std::vector<float> f(n_out);
-            ggml_backend_tensor_get(r.output, f.data(), 0, n_out * sizeof(float));
-            out.assign(f.begin(), f.end());
-        } else if (r.output->type == GGML_TYPE_I32) {
-            std::vector<int32_t> iv(n_out);
-            ggml_backend_tensor_get(r.output, iv.data(), 0, n_out * sizeof(int32_t));
-            out.assign(iv.begin(), iv.end());
-        } else {
-            return luaL_error(L, "loom.run_subgraph: output tensor has an unsupported ggml type");
+        // Returns every declared output's DATA first (in the topology's own declared order), THEN
+        // every declared output's SHAPE in that same order -- e.g. for two outputs: (data1, data2,
+        // shape1, shape2). For the single-output topology every model on the roadmap still uses as of
+        // P2 (EXPORT-ROADMAP.md), that's exactly (data, shape), byte-for-byte the same two return
+        // values this function always produced -- callers that only ever wrote
+        // `local out, shape = loom.run_subgraph(...)` see no change. A caller only interested in DATA
+        // for an N-output module can write `local out1, out2 = loom.run_subgraph(...)` (Lua discards
+        // the trailing shape values it doesn't capture); one that also wants shapes captures all N data
+        // locals first, then N shape locals (see driver_ir.py's check_subgraph_calls, which enforces
+        // exactly this ordering at export time).
+        for (ggml_tensor* out : r.outputs) {
+            push_number_array(L, read_tensor_as_doubles(L, out));
         }
-        push_number_array(L, out);
-        // Second return value: the output's ggml shape [ne0,ne1,ne2,ne3] -- e.g. a decoder's logits
-        // output has ne0=n_vocab, needed by the script to call loom.argmax_row correctly without
-        // hardcoding the vocab size (the topology stays the single source of truth for shapes, same
-        // principle as the input-type dispatch above).
-        const std::vector<double> shape = {static_cast<double>(r.output->ne[0]), static_cast<double>(r.output->ne[1]),
-                                            static_cast<double>(r.output->ne[2]), static_cast<double>(r.output->ne[3])};
-        push_number_array(L, shape);
-        return 2;
+        for (ggml_tensor* out : r.outputs) {
+            const std::vector<double> shape = {static_cast<double>(out->ne[0]), static_cast<double>(out->ne[1]),
+                                                static_cast<double>(out->ne[2]), static_cast<double>(out->ne[3])};
+            push_number_array(L, shape);
+        }
+        return static_cast<int>(r.outputs.size() * 2);
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.run_subgraph: %s", e.what());
     }
