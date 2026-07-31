@@ -96,7 +96,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
+| **P4** | flagship coverage | P4.0 carry-over from P3, Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -503,12 +503,82 @@ P4, all of them still real:
   `patch_model_for_export()` (class-level monkeypatches stay module-level, deliberately — see P3.3).
   The ordering constraint at the top of this section ("R1 must land before R3's config schema, because
   `LoomExportConfig.inputs` *is* the axis declaration") therefore did not get cashed in: `LoomExportConfig`
-  holds only `architecture`/`output_path`/`profile`, and axis declaration stayed where R1 put it. Whether
-  to hoist it is a real open question for P4.1/P4.3, whose configs are the first written from scratch
-  rather than migrated.
+  holds only `architecture`/`output_path`/`profile`, and axis declaration stayed where R1 put it.
+  **Tracked as P4.0.2 below** — it has to be settled before P4.1/P4.3, whose configs are the first
+  written from scratch rather than migrated.
 
 Also stale: `export_config.py`'s module docstring points at a "Target class hierarchy and naming" section
 of this file that does not exist (the hierarchy is described in P3.1's entry instead).
+
+#### P4.0 — settle these before the first from-scratch family config
+
+Three items that P3 left in a state P4 would otherwise inherit and harden. None is large; all three get
+cheaper now and more expensive after Whisper/GigaAM/composition add three more configs written against
+whatever shape exists at the time. Same gate as everything else: byte-identical re-export of all 11
+models (`snapshot_gguf.py`), since none of these is meant to change any output.
+
+- **P4.0.1 — real `detect()` for the self-describing TTS checkpoints (the cheap one).** P3.3 registered
+  all five TTS families with `detect()` returning `False` unconditionally, so `loom-export <path> -o x.gguf`
+  works for the four causal-LM/NeMo models but requires `--task tts-multi-phase --model kokoro` for the
+  five TTS ones — five of seven registered models don't reach R3's own stated user experience. Three of
+  the five are genuinely self-describing and P3.3 already named the evidence: **Kokoro** ships its own
+  `config.json` (reuse `causal_lm_export._hf_model_type`'s pattern — a shared `_json_field()` helper is
+  the obvious shape once a second family reads a `config.json` for a non-`model_type` key); **Matcha**'s
+  `.ckpt` has Lightning-style `hyper_parameters`/`state_dict` top-level keys; **Supertonic**'s `.pt`
+  files are fully pickled `nn.Module`s, distinctive on the pickle header alone (do NOT `torch.load` to
+  detect — detection must stay cheap and must not execute checkpoint code). VITS and StyleTTS2 stay
+  explicit-only unless a real discriminator turns up; say so in their recognizers rather than leaving
+  `return False` unexplained. Detection is unit-testable against synthetic fixtures exactly like
+  `test_registry.py` already does for the fake HF dir / fake `.nemo` archives — no real checkpoints
+  needed.
+- **P4.0.2 — decide where a family declares its dynamic axes (the real gap).** R3's piece table names
+  `.inputs`/`.outputs` as config members and this file's own ordering rationale says `LoomExportConfig.inputs`
+  *is* the axis declaration — neither exists. Today the same information lives in three unrelated places:
+  `ExportPhase.root_axis`/`declared_axes` (multi-phase), `LoomGGUFExporter(root_axis=..., declared_axes=...)`
+  kwargs threaded through each family's own `export()` (NeMo ASR, causal-LM), and `ct.RangeDim`/`ct.TensorType`
+  lists built inline (everywhere). The decision to make, explicitly, before P4.1: either hoist axis
+  declaration onto `LoomExportConfig` as R3 described (and migrate all 11 models, which is the expensive
+  half and the reason it was skipped), or record that per-phase declaration is the real shape and strike
+  `.inputs`/`.outputs` from R3 so the roadmap stops describing an API that was consciously not built.
+  Deciding it is mandatory; hoisting it is not — but writing three more configs against the current
+  scatter and *then* deciding is the one outcome to avoid.
+- **P4.0.3 — make monolithic/modular an option again, not a class (see the next section).**
+
+### `profile` no longer means anything; decomposition is a class axis it was supposed to modulate
+
+`profile` was introduced as an *option* — the same family, exported one of several ways. That is not
+what it is now, and the drift is worth stating precisely because the fix is not simply "merge two
+classes":
+
+1. **The field is inert.** `LoomGGUFExporter` reads `self.profile` in exactly one place
+   (`exporter.py:1052`/`1067`) and only ever tests it against `None`, to gate the *bespoke hand-built
+   Program* path (`test_compiler.py`'s `MockOperation` graphs) — a concern with nothing to do with
+   decomposition. Monolithic-vs-modular is selected by `kwargs.get("modular_layout") is not None`, never
+   by `profile`. Since P0.1 retired `profile="atomic"`, no code path anywhere distinguishes
+   `"monolithic"` from `"modular"` by value.
+2. **So the class split is not duplicating a working option — it replaced one that was never wired.**
+   `LMModularCausalModelExportConfig` sets `profile: str = "modular"` and then deliberately does not
+   forward it (its own `export()` carries a comment explaining why), while
+   `LMMonolithicCausalModelExportConfig` forwards a value the exporter only null-checks.
+3. **The label already contradicts itself elsewhere.** Every multi-phase TTS family inherits
+   `profile="monolithic"` from `LoomExportConfig`'s default while tracing and assembling N independent
+   topologies — structurally a decomposition, just not the one named `"modular"`.
+
+**R3 already specified the right shape and P3 diverged from it**: R3's piece table has
+`.decomposition` (which submodels, which driver) as a config member, built from `ModularExportSpec` /
+`FlowMatchingSpec` / `NeMoASREncoderSpec`. Rebuilt that way, decomposition becomes a strategy object a
+config *holds* rather than a class it *is* — `Flattened()`, `Modular(spec)`, `MultiPhase(phases)` —
+which is exactly the orthogonality `profile` was meant to have: any family can pick any decomposition,
+and `LMCausalModelExportConfig` collapses back to one class with a `decomposition` field. Note the one
+real objection to a plain `profile` *string* on a single class, which is why the strategy object rather
+than a merged class with a mode flag: the two causal-LM forms need genuinely different fields
+(`modular_spec`/`dummy_seq_len` vs `seq_len`/`quantize`), so a string flag makes invalid states
+representable and pushes validation into `export()`.
+
+Not scheduled as a P4 blocker — P4.1/P4.2 add no new decomposition, and P4.3's composition template
+(encoder + adapter + LM) is the first thing that plausibly wants a fourth one. But `profile` should
+either become real or be renamed to what it actually gates (the bespoke path) before another family
+inherits it and copies the pattern.
 
 #### P4 — flagship coverage
 
