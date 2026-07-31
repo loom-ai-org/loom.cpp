@@ -9,6 +9,9 @@
 
 #include <ggml-cpu.h>
 
+#include <memory>
+#include <vector>
+
 namespace {
 
 constexpr int kNVocab = 6;
@@ -124,10 +127,20 @@ void test_multi_output_build(loom::GgufModel& model, ggml_backend_t backend) {
 
     const std::vector<int32_t> tokens = {1, 3, 4};
 
+    // Both of these must outlive every BuildResult read below, and neither is owned by the result:
+    // `BuildResult::ctx` owns only the tensor STRUCTS, while the DATA they point at lives in the
+    // GraphBuilder's own gallocr, and GraphBuilder holds `topo_` by reference. An earlier version of
+    // this lambda kept both as locals, so all three results dangled the moment `run` returned and the
+    // comparisons below read freed memory -- which passed locally and failed in CI, since whether the
+    // freed arena still happens to hold the old values is pure allocator luck.
+    std::vector<std::unique_ptr<loom::GraphTopology>> topologies;
+    std::vector<std::unique_ptr<loom::GraphBuilder>> builders;
+
     auto run = [&](const char* json) {
-        loom::GraphTopology topo = loom::GraphTopology::parse(json);
-        loom::GraphBuilder builder(topo, model, backend);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", tokens.size()}, {"n_past", 0}});
+        topologies.push_back(std::make_unique<loom::GraphTopology>(loom::GraphTopology::parse(json)));
+        builders.push_back(std::make_unique<loom::GraphBuilder>(*topologies.back(), model, backend));
+        loom::GraphBuilder::BuildResult r =
+            builders.back()->build({{"n_tokens", tokens.size()}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens.data(), 0, tokens.size() * sizeof(int32_t));
         ggml_backend_graph_compute(backend, r.graph);
         return r;

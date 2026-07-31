@@ -261,10 +261,28 @@ declaring it, not worth building yet. P2 only had to make the capability exist.)
   `ctest` (140 tests, 1 pre-existing unrelated failure confirmed present on the unmodified baseline too)
   green. New multi-output coverage at every layer: `test_graph_topology_parse.cpp` (JSON parsing),
   `test_graph_builder_shapes.cpp` (a two-output build verified against two independent single-output
-  oracle builds of the same sub-computations), `test_lua_bridge_run_subgraph.cpp` (the Lua-visible
+  oracle builds of the same sub-computations — **its numeric half was unsound as written and was fixed
+  later; see the correction below**), `test_lua_bridge_run_subgraph.cpp` (the Lua-visible
   data-then-shapes return convention), `test_driver_ir.py` (`check_subgraph_calls`'s new validation, both
   accept and reject cases), `test_compiler.py` (a real coremltools-traced two-output submodule's topology
   correctly emits `"outputs"` and survives pruning).
+
+  **Correction (found via a CI-only failure, after P4.0.3):** P2's own multi-output test compared
+  freed memory. Its `run` lambda built each result from a `GraphTopology` and a `GraphBuilder` that
+  were both locals, and returned the `BuildResult` — but `BuildResult::ctx` owns only the tensor
+  STRUCTS, while the DATA lives in the `GraphBuilder`'s `gallocr` and the builder holds `topo_` by
+  reference. So all three results dangled the moment `run` returned, and the comparisons read whatever
+  the arena happened to still contain. It passed on every local run and failed on GitHub Actions, which
+  is the whole signature of the bug. `MALLOC_PERTURB_=42` reproduces it exactly: the old test scores
+  **51/63**, matching CI's count precisely, and the fixed one 63/63. Fixed by keeping both the
+  topologies and the builders alive until every read is done, and `graph_builder.h`'s `ctx` comment —
+  which said keeping `ctx` alive was enough, and is what invited the mistake — now states both
+  ownership facts. Production code was never affected: every `src/core/*_driver.cpp` copies each output
+  into its own storage inside the builder's scope. Two CI-reproducibility defects were fixed in the same
+  commit, since they are what let this sit undetected and would let the next one do the same: LuaJIT was
+  pinned to `v2.1`, a rolling BRANCH (now pinned to commit `faaf6633`), and CI's `pip install gguf
+  numpy` was unpinned (now `gguf==0.17.1`, `numpy==2.4.6`) even though those two write the fixtures the
+  C++ tests compare against.
 
   **Finding worth recording:** the empty diff on `lfm2_350m_modular.gguf` (at the time P2 itself landed)
   was not a coincidence — no model on the roadmap had ever actually produced a multi-output MIL
