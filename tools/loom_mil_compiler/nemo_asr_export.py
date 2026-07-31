@@ -246,7 +246,7 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
 
     def backend_kwargs(self) -> dict:
         return dict(
-            profile="monolithic",
+            flat_namespace=True,
             # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
             # family-wide for all three models this template covers (axes.py's N_SAMPLES).
             root_axis="n_samples",

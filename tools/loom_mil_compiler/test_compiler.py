@@ -233,9 +233,9 @@ class TestLoomMILCompiler(unittest.TestCase):
         driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
         self.assertIn(f"local placeholder, {second_out.name} = loom.run_subgraph('splitter'", driver_script)
 
-    def test_monolithic_profile_auto_generation(self):
+    def test_single_main_function_auto_generates_main_topo(self):
         """
-        Verify that using profile="monolithic" automatically serializes the entire
+        Verify that a single-"main" Program automatically serializes the entire
         main function into 'main_topo' and generates a wrapper Lua driver script.
         """
         prog = Program()
@@ -247,7 +247,7 @@ class TestLoomMILCompiler(unittest.TestCase):
         prog.functions["main"] = main_func.functions["main"]
         
         backend = loom_mil_compiler.LoomGGUFBackend()
-        backend(prog, output_path=self.output_path, profile="monolithic", architecture="mono_test")
+        backend(prog, output_path=self.output_path, flat_namespace=True, architecture="mono_test")
         
         self.assertTrue(os.path.exists(self.output_path))
         reader = GGUFReader(self.output_path)
@@ -287,7 +287,7 @@ class TestLoomMILCompiler(unittest.TestCase):
         self.assertIn("loom.gaussian_array(4)", driver_script)
 
     def test_random_normal_in_static_topology_raises_actionable_error(self):
-        """The SAME op inside a monolithic profile's static topology (main_topo, generated via
+        """The SAME op inside a static topology (main_topo, generated via
         generate_graph_topology) must fail loudly and specifically -- ggml has no RNG-capable compute op,
         so this can never be satisfied there, unlike the bespoke-driver case above."""
         prog = Program()
@@ -301,7 +301,7 @@ class TestLoomMILCompiler(unittest.TestCase):
 
         backend = loom_mil_compiler.LoomGGUFBackend()
         with self.assertRaises(NotImplementedError) as ctx:
-            backend(prog, output_path=self.output_path, profile="monolithic", architecture="random_test")
+            backend(prog, output_path=self.output_path, flat_namespace=True, architecture="random_test")
         self.assertIn("ggml has no RNG-capable compute op", str(ctx.exception))
 
 
