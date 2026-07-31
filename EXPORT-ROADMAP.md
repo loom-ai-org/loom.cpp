@@ -166,7 +166,7 @@ loom-export nvidia/parakeet-tdt-0.6b-v3 -o parakeet.gguf
 | ~~`.inputs` / `.outputs` (named axes)~~ — **not on the config; see below** | `OnnxConfig.inputs` | R1 |
 | `.generate_dummy_inputs()` | `DummyInputGenerator` | the `torch.randn` blocks in the current scripts |
 | `.patch_model_for_export()` | `ModelPatcher` | the wrapper classes in the current scripts (R4) |
-| `.decomposition` (which submodels, which driver) | `OnnxSeq2SeqConfigWithPast` | `ModularExportSpec`, `FlowMatchingSpec`, `NeMoASREncoderSpec` |
+| `.decomposition` (which submodels, which driver) — **built, see `decomposition.py`** | `OnnxSeq2SeqConfigWithPast` | `ModularExportSpec`, `FlowMatchingSpec`, `NeMoASREncoderSpec` |
 | `TaskRegistry` | `TasksManager` | new; keyed on HF `config.json` `model_type`/`architectures`, and on the `target` class inside a `.nemo` archive |
 | `LoomModelForCTC` / `ForSpeechSeq2Seq` / `ForCausalLM` / `ForTextToSpeech` | `ORTModelFor*` | the Lua drivers + C++ backends behind one Python/C++ surface |
 

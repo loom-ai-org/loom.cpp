@@ -1,16 +1,17 @@
-"""The causal-LM family (BACKLOG.md P3.1/P3.2): `LMCausalModelExportConfig` and its two concrete forms,
-`LMMonolithicCausalModelExportConfig` (one flattened trace -- Qwen3's shape) and
-`LMModularCausalModelExportConfig` (independently-traced submodules assembled per `ModularExportSpec`,
-EXPORT-ROADMAP.md R7's "modular" profile -- LFM2's shape). Qwen3 only ever needs Monolithic; LFM2 is the
-one model on the roadmap that exercises both.
+"""The causal-LM family (BACKLOG.md P3.1/P3.2, restructured in P4.0.3): ONE
+`LMCausalModelExportConfig`, whose `decomposition` field says whether a checkpoint exports as one
+flattened trace (`Flattened()` -- Qwen3, LFM2-monolithic) or as independently-traced submodules
+assembled per a `ModularExportSpec` (`Modular(spec=...)` -- LFM2-modular, EXPORT-ROADMAP.md R7's
+"modular" profile).
 
-This is a straight move of `export_hf_causal_lm.py`'s `export_causal_lm()` body (now
-`LMMonolithicCausalModelExportConfig.export()`) and `export_lfm2_modular.py`'s `main()` body (now
-`LMModularCausalModelExportConfig.export()`) -- no logic changes. `export_hf_causal_lm.py` keeps its
-own CLI, now a thin wrapper around the class defined here; `export_lfm2_modular.py`/
-`export_lfm2_monolithic.py` are NOT migrated to these classes this pass (BACKLOG.md's confirmed P3
-scope) -- `test_causal_lm_export.py` instead reproduces LFM2's exports through these classes directly,
-as the regression check that they genuinely generalize the shape.
+P3.1 built these as two sibling classes, which is what BACKLOG.md P4.0.3 came back to fix: the two forms
+differ in how the program is assembled, not in what a causal-LM config knows, and LFM2 exports BOTH ways
+from the same checkpoint -- a caller decision, so it belongs in a field rather than in a type. What was
+per-class now lives on the decomposition (`Modular.spec`/`dummy_seq_len`) or on the shared config
+(`seq_len`, tokenizer paths, `quantize`), and the mechanics moved to `decomposition.py`; the traced
+graphs and the GGUFs they produce are byte-identical either way.
+
+`export_hf_causal_lm.py` keeps its own CLI as a thin wrapper around this class.
 """
 import json
 import sys
@@ -30,9 +31,9 @@ import torch
 import coremltools as ct
 from transformers import AutoModelForCausalLM
 
+from .decomposition import Flattened, Modular
 from .export_config import LoomExportConfig
-from .modular_export import ModularExportSpec, export_modular
-from .register import LoomGGUFBackend
+from .modular_export import ModularExportSpec
 
 
 def _causal_mask(seq_len: int) -> torch.Tensor:
@@ -64,18 +65,14 @@ class _CausalLMWrapper(torch.nn.Module):
 
 @dataclass(kw_only=True)
 class LMCausalModelExportConfig(LoomExportConfig):
-    """Shared base for the causal-LM family: one flattened trace (`LMMonolithicCausalModelExportConfig`)
-    or independently-traced submodules assembled per `ModularExportSpec`
-    (`LMModularCausalModelExportConfig`, EXPORT-ROADMAP.md R7's 'modular' profile). Qwen3 only ever needs
-    Monolithic; LFM2 is the one model that exercises both."""
+    """Any plain `AutoModelForCausalLM`-shaped HF model -> Loom GGUF. ONE class for both export shapes
+    (BACKLOG.md P4.0.3): which one you get is `decomposition`, not which class you instantiated.
 
-
-@dataclass(kw_only=True)
-class LMMonolithicCausalModelExportConfig(LMCausalModelExportConfig):
-    """Any plain `AutoModelForCausalLM`-shaped HF model -> Loom GGUF via one traced forward pass. See
-    `export_hf_causal_lm.export_causal_lm`'s original module docstring (EXPORT-IMPROVEMENT-BACKLOG.md
-    item 1) -- everything here is architecture-agnostic; a model needing bespoke submodule wiring wants
-    `LMModularCausalModelExportConfig` instead."""
+    `Flattened()` traces the whole forward pass into one topology (Qwen3, LFM2-monolithic);
+    `Modular(spec=...)` traces each submodule standalone and assembles them per a `ModularExportSpec`
+    (LFM2-modular). LFM2 is the one model that genuinely exports either way, which is exactly why this
+    is a field: "monolithic" vs "modular" is a caller decision about the same checkpoint, not a property
+    of it -- see `_is_lfm2`, where both recognizers deliberately detect the same directory."""
 
     # `LoomExportConfig.architecture` is normally required, but this family alone infers it from the
     # checkpoint's own `model.config.model_type` when not given -- matching `export_causal_lm`'s
@@ -86,121 +83,75 @@ class LMMonolithicCausalModelExportConfig(LMCausalModelExportConfig):
     tokenizer_family: Optional[str] = None
     tokenizer_pre: Optional[str] = None
     quantize: Optional[str] = None
+    # Concrete length torch.jit.trace runs at for `Flattened`; the dynamic range is declared separately
+    # via ct.convert's own `inputs=` (EXPORT-BACKLOG.md item 3: a fixed traced shape bakes a literal
+    # length into every exported slice, forcing the driver to pad every prompt to that fixed length).
+    # `Modular` carries its own `dummy_seq_len` instead, for the collision reason documented there.
     seq_len: int = 128
     max_seq_len: int = 4096
+    # Resolved from the checkpoint by `load_model()` when `architecture` was not given.
+    _resolved_architecture: Optional[str] = None
 
-    def export(self) -> str:
+    def load_model(self):
         print(f"Loading model from {self.model_dir}...")
         model = AutoModelForCausalLM.from_pretrained(self.model_dir, torch_dtype=torch.float32).eval()
-        architecture = self.architecture
-        if architecture is None:
-            architecture = getattr(model.config, "model_type", None)
-            if not architecture:
-                raise ValueError(
-                    "architecture could not be inferred from model.config.model_type; pass it explicitly"
-                )
-        wrapper = _CausalLMWrapper(model)
+        self._resolved_architecture = self.architecture or getattr(model.config, "model_type", None)
+        if not self._resolved_architecture:
+            raise ValueError(
+                "architecture could not be inferred from model.config.model_type; pass it explicitly"
+            )
+        return model
 
-        # torch.jit.trace always needs one concrete example shape -- the dynamic range is declared
-        # separately below via ct.convert's own `inputs=` (EXPORT-BACKLOG.md item 3: a fixed traced shape
-        # bakes a literal length into every exported slice, forcing the driver to pad every prompt to that
-        # fixed length instead of using its real length).
+    def export_architecture(self) -> str:
+        return self._resolved_architecture or self.architecture
+
+    def build_trace(self, model):
+        """`Flattened`'s hook: the wrapper, its dummy inputs, and the MIL input declarations.
+
+        `tokens`/`cache_position`/`attention_mask` share the SAME `ct.RangeDim` instance so coremltools
+        ties them to one symbolic length (they must always be called with matching lengths at runtime)
+        -- see `apply_monolithic_export`'s own auto-generation of "cache_position"-named inputs via
+        `loom.range(...)` and "attention_mask"-named inputs via `loom.causal_mask(...)`, and P4.0.2's
+        `_validate_input_axes`, which now enforces that one-symbol rule."""
         print(f"Tracing the complete PyTorch graph (dummy seq_len={self.seq_len})...")
-        dummy_tokens = torch.zeros((1, self.seq_len), dtype=torch.long)
-        dummy_cache_position = torch.arange(self.seq_len, dtype=torch.long)
-        dummy_attention_mask = _causal_mask(self.seq_len)
-        traced_model = torch.jit.trace(wrapper, (dummy_tokens, dummy_cache_position, dummy_attention_mask))
-
-        # `tokens`/`cache_position`/`attention_mask` share the SAME ct.RangeDim instance so coremltools ties
-        # them all to one symbolic length (they must always be called with matching lengths at runtime) --
-        # see apply_monolithic_export's own auto-generation of "cache_position"-named inputs via
-        # loom.range(...) and "attention_mask"-named inputs via loom.causal_mask(...).
-        print(f"Compiling to GGUF ({self.profile} profile)...")
+        dummy_inputs = (
+            torch.zeros((1, self.seq_len), dtype=torch.long),
+            torch.arange(self.seq_len, dtype=torch.long),
+            _causal_mask(self.seq_len),
+        )
         seq_len_dim = ct.RangeDim(1, self.max_seq_len)
-        mil_prog = ct.convert(
-            traced_model,
-            inputs=[
-                ct.TensorType(name="tokens", shape=(1, seq_len_dim), dtype=np.int32),
-                ct.TensorType(name="cache_position", shape=(seq_len_dim,), dtype=np.int32),
-                ct.TensorType(name="attention_mask", shape=(1, 1, seq_len_dim, seq_len_dim), dtype=np.float32),
-            ],
-            convert_to="milinternal",
-            # ct.convert()'s default (compute_precision=None) FP16-casts every constant weight even for
-            # convert_to="milinternal" (confirmed: coremltools' own `_need_fp16_cast_pass(None, "milinternal")`
-            # returns True) -- root-caused as a real, meaningful precision bug via Conformer-CTC's own
-            # multi-channel CONV_2D subsampling stage (see BACKLOG.md), but it silently applies to every model
-            # this exporter has ever produced, weights included. Not specific to that one model/op.
-            compute_precision=ct.precision.FLOAT32,
+        mil_inputs = [
+            ct.TensorType(name="tokens", shape=(1, seq_len_dim), dtype=np.int32),
+            ct.TensorType(name="cache_position", shape=(seq_len_dim,), dtype=np.int32),
+            ct.TensorType(name="attention_mask", shape=(1, 1, seq_len_dim, seq_len_dim), dtype=np.float32),
+        ]
+        return _CausalLMWrapper(model), dummy_inputs, mil_inputs
+
+    def modular_dummy_inputs(self, dummy_seq_len: int) -> dict:
+        """`Modular`'s hook: the same three tensors `build_trace` builds, in the kwarg form
+        `export_modular` replays submodules with."""
+        return dict(
+            input_ids=torch.zeros((1, dummy_seq_len), dtype=torch.long),
+            cache_position=torch.arange(dummy_seq_len, dtype=torch.long),
+            attention_mask=_causal_mask(dummy_seq_len),
         )
 
-        backend = LoomGGUFBackend()
-        backend(
-            mil_prog,
-            output_path=self.output_path,
-            architecture=architecture,
-            profile=self.profile,
-            tokenizer_dir=self.tokenizer_dir or self.model_dir,
-            tokenizer_family=self.tokenizer_family,
-            tokenizer_pre=self.tokenizer_pre,
-            quantize=self.quantize,
-        )
-        print(f"SUCCESS! {self.profile.capitalize()} model exported cleanly to: {self.output_path}")
-        return self.output_path
-
-
-@dataclass(kw_only=True)
-class LMModularCausalModelExportConfig(LMCausalModelExportConfig):
-    """Independently-traced submodules (embedding, rotary-embedding table, each decoder layer, final
-    norm, output head) assembled into one multi-Function Program per `ModularExportSpec`
-    (EXPORT-IMPROVEMENT-BACKLOG.md item 2) -- LFM2's shape. See `modular_export.py`'s own module
-    docstring for why this is the only split mechanism left after `profile="atomic"`'s retirement
-    (EXPORT-ROADMAP.md R7)."""
-
-    profile: str = "modular"
-    model_dir: str
-    modular_spec: ModularExportSpec
-    tokenizer_dir: Optional[str] = None
-    tokenizer_pre: Optional[str] = None
-    # A dummy sequence length deliberately NOT equal to any of the model's own static dims (e.g. LFM2's
-    # batch=1, hidden_size=1024, num_attention_heads=16, head_dim=64, vocab_size=65536) -- export_modular
-    # marks an axis dynamic when its captured size equals this value, so a collision would wrongly mark a
-    # static axis dynamic (or vice versa).
-    dummy_seq_len: int = 37
-    max_seq_len: int = 4096
-
-    def export(self) -> str:
-        print(f"Loading model from {self.model_dir}...")
-        model = AutoModelForCausalLM.from_pretrained(self.model_dir, torch_dtype=torch.float32).eval()
-
-        dummy_tokens = torch.zeros((1, self.dummy_seq_len), dtype=torch.long)
-        dummy_cache_position = torch.arange(self.dummy_seq_len, dtype=torch.long)
-        dummy_inputs = dict(
-            input_ids=dummy_tokens,
-            cache_position=dummy_cache_position,
-            attention_mask=_causal_mask(self.dummy_seq_len),
-        )
-
-        print("Tracing each submodule standalone...")
-        result = export_modular(
-            model, self.modular_spec, dummy_inputs, seq_len=self.dummy_seq_len, max_seq_len=self.max_seq_len
-        )
-
-        print("Compiling to GGUF (modular-blueprint profile)...")
-        backend = LoomGGUFBackend()
-        # `profile` is deliberately NOT forwarded here, matching export_lfm2_modular.py's own original
-        # call exactly: LoomGGUFExporter.export() dispatches on `kwargs.get("modular_layout") is not
-        # None`, not on `self.profile` (exporter.py's own export() -- the modular Program has no "main"
-        # function at all, so the `is_bespoke` branch never applies regardless of profile).
-        backend(
-            result.program,
-            output_path=self.output_path,
-            architecture=self.architecture,
+    def backend_kwargs(self) -> dict:
+        kwargs = dict(
             tokenizer_dir=self.tokenizer_dir or self.model_dir,
             tokenizer_pre=self.tokenizer_pre,
-            modular_layout=result,
         )
-        print(f"SUCCESS! Modular-blueprint model exported cleanly to: {self.output_path}")
-        return self.output_path
+        # Only the flattened form declares these: `profile="monolithic"` is what flattens the weight
+        # namespace (topology_ops.py reads it in 8 places, see BACKLOG.md P4.0.3), and the modular
+        # path's per-submodule functions must keep their `{func_name}.` prefixes. `tokenizer_family` /
+        # `quantize` likewise were never passed by the modular export.
+        if isinstance(self.decomposition, Flattened):
+            kwargs.update(
+                profile="monolithic",
+                tokenizer_family=self.tokenizer_family,
+                quantize=self.quantize,
+            )
+        return kwargs
 
 
 def _hf_model_type(path: Path) -> Optional[str]:
@@ -222,8 +173,8 @@ def _is_qwen3(path: Path) -> bool:
 
 
 def _build_qwen3(path: Path, output_path: str) -> LoomExportConfig:
-    return LMMonolithicCausalModelExportConfig(
-        architecture="qwen3", output_path=output_path, profile="monolithic", model_dir=str(path),
+    return LMCausalModelExportConfig(
+        architecture="qwen3", output_path=output_path, decomposition=Flattened(), model_dir=str(path),
     )
 
 
@@ -240,22 +191,22 @@ def _is_lfm2(path: Path) -> bool:
 
 
 def _build_lfm2_monolithic(path: Path, output_path: str) -> LoomExportConfig:
-    return LMMonolithicCausalModelExportConfig(
-        architecture="lfm2", output_path=output_path, profile="monolithic", model_dir=str(path),
+    return LMCausalModelExportConfig(
+        architecture="lfm2", output_path=output_path, decomposition=Flattened(), model_dir=str(path),
         tokenizer_pre="llama3",
     )
 
 
 def _build_lfm2_modular(path: Path, output_path: str) -> LoomExportConfig:
-    return LMModularCausalModelExportConfig(
+    return LMCausalModelExportConfig(
         architecture="lfm2", output_path=output_path, model_dir=str(path),
-        modular_spec=ModularExportSpec(
+        decomposition=Modular(spec=ModularExportSpec(
             prefix_attr="model.embed_tokens",
             repeated_attr="model.layers",
             suffix_attrs=["model.embedding_norm", "lm_head"],
             aux_attr="model.pos_emb",
             aux_kwarg="position_embeddings",
-        ),
+        )),
         tokenizer_dir=str(path), tokenizer_pre="llama3",
     )
 

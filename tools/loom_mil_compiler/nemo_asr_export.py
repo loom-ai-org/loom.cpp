@@ -49,7 +49,7 @@ import sys
 import tarfile
 import tempfile
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -59,6 +59,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .decomposition import Decomposition, Flattened
 from .export_config import LoomExportConfig
 
 # Dummy trace length, and the dynamic sample-axis bounds, all in SECONDS -- turned into sample counts
@@ -196,16 +197,18 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     `ASR` domain, `NemoEncoder` function; renamed from `NeMoASREncoderSpec`, same shape).
 
     Every other parameter of the export -- restore class, sample rate, trace length, dynamic-axis
-    bounds, compute precision, profile -- is either re-derived from the checkpoint or family-wide, and
-    lives in this module rather than in three copies. Only "monolithic" has ever been used for this
-    family (there is no modular boundary to declare: the whole preprocessor+encoder(+CTC decoder) chain
-    is one graph) -- `profile` is inherited from `LoomExportConfig` rather than re-declared.
+    bounds, compute precision -- is either re-derived from the checkpoint or family-wide, and lives in
+    this module rather than in three copies. `decomposition` is defaulted rather than accepted: there is
+    no modular boundary to declare here (the whole preprocessor+encoder(+CTC decoder) chain is one
+    graph), so unlike the causal-LM family this one has no choice to offer -- see decomposition.py on
+    structural vs. chosen decompositions.
     """
 
     # Path to the .nemo checkpoint.
     checkpoint: str
     # Which tensor the traced wrapper returns; see EncoderOutput.
     output: EncoderOutput
+    decomposition: Decomposition = field(default_factory=Flattened)
 
     def validate_against_model(self, model) -> int:
         """Structural checks that don't need a forward pass, run before the (slow) trace. Returns the
@@ -229,26 +232,25 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
         self.output.expected_channels(model)
         return int(sample_rate)
 
-    def export(self) -> str:
-        """The whole export, from `.nemo` on disk to `.gguf` on disk."""
-        from .register import LoomGGUFBackend
-
+    def prepare_environment(self) -> None:
         prepare_nemo_environment()
-        model = load_model(self)
-        sample_rate = self.validate_against_model(model)
-        mil_prog = trace_and_convert(self, model, sample_rate)
 
-        LoomGGUFBackend()(
-            mil_prog,
-            output_path=self.output_path,
-            architecture=self.architecture,
-            profile=self.profile,
+    def load_model(self):
+        return load_model(self)
+
+    def build_trace(self, model):
+        """`Flattened`'s hook. The structural validation runs here rather than in `load_model` because
+        it also yields the sample rate the trace length and RangeDim bounds are derived from."""
+        sample_rate = self.validate_against_model(model)
+        return build_trace(self, model, sample_rate)
+
+    def backend_kwargs(self) -> dict:
+        return dict(
+            profile="monolithic",
             # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
             # family-wide for all three models this template covers (axes.py's N_SAMPLES).
             root_axis="n_samples",
         )
-        print(f"SUCCESS! Monolithic model exported cleanly to: {self.output_path}")
-        return self.output_path
 
 
 class _NeMoASREncoderWrapper(nn.Module):
@@ -278,32 +280,25 @@ def load_model(spec: ASRNemoEncoderExportConfig):
     return model
 
 
-def trace_and_convert(spec: ASRNemoEncoderExportConfig, model, sample_rate: int):
-    """Traces the wrapper on `TRACE_SECONDS` of dummy audio and converts to a MIL program with a
-    dynamic sample axis. Kept separate from `export_nemo_asr_encoder` so a caller can inspect or
-    post-process the MIL program before it reaches the backend."""
+def build_trace(spec: ASRNemoEncoderExportConfig, model, sample_rate: int):
+    """The wrapper, `TRACE_SECONDS` of dummy audio, and the MIL input declarations with a dynamic sample
+    axis -- `Flattened` does the trace and the `ct.convert` itself (including the load-bearing
+    FLOAT32 compute precision this module's own docstring explains)."""
     import coremltools as ct
 
     n_samples = int(TRACE_SECONDS * sample_rate)
-    dummy_waveform = torch.randn(1, n_samples, dtype=torch.float32)
-    dummy_length = torch.tensor([n_samples], dtype=torch.int64)
-
-    print(f"Tracing the complete PyTorch graph (dummy n_samples={n_samples})...")
-    traced = torch.jit.trace(_NeMoASREncoderWrapper(model, spec.output), (dummy_waveform, dummy_length))
-
-    print(f"Compiling to GGUF ({spec.profile} profile)...")
-    seq_dim = ct.RangeDim(int(MIN_SECONDS * sample_rate), int(MAX_SECONDS * sample_rate))
-    return ct.convert(
-        traced,
-        inputs=[
-            ct.TensorType(name="waveform", shape=(1, seq_dim), dtype=np.float32),
-            ct.TensorType(name="length", shape=(1,), dtype=np.int32),
-        ],
-        convert_to="milinternal",
-        # Load-bearing, and NOT a per-model choice -- see this module's own docstring for the
-        # CONV_2D magnitude-divergence root cause this one line prevents.
-        compute_precision=ct.precision.FLOAT32,
+    dummy_inputs = (
+        torch.randn(1, n_samples, dtype=torch.float32),
+        torch.tensor([n_samples], dtype=torch.int64),
     )
+    print(f"Tracing the complete PyTorch graph (dummy n_samples={n_samples})...")
+
+    seq_dim = ct.RangeDim(int(MIN_SECONDS * sample_rate), int(MAX_SECONDS * sample_rate))
+    mil_inputs = [
+        ct.TensorType(name="waveform", shape=(1, seq_dim), dtype=np.float32),
+        ct.TensorType(name="length", shape=(1,), dtype=np.int32),
+    ]
+    return _NeMoASREncoderWrapper(model, spec.output), dummy_inputs, mil_inputs
 
 
 def export_nemo_asr_encoder(spec: ASRNemoEncoderExportConfig):

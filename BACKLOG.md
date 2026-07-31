@@ -638,43 +638,59 @@ models (`snapshot_gguf.py`), since none of these is meant to change any output.
   The six exports also confirm the validation has no false positives on the two shapes that matter:
   Kokoro's `decoder_vocoder` (five distinct dynamic symbols, four declared, one root) and NeMo's
   non-default `root_axis`.
-- **P4.0.3 — make monolithic/modular an option again, not a class (see the next section).**
+- **P4.0.3 — monolithic/modular is an option again, not a class — DONE (see the next section).**
 
-### `profile` no longer means anything; decomposition is a class axis it was supposed to modulate
+### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
-`profile` was introduced as an *option* — the same family, exported one of several ways. That is not
-what it is now, and the drift is worth stating precisely because the fix is not simply "merge two
-classes":
+**The premise this item was written on was wrong, and the correction is the most useful thing in it.**
+The original entry claimed `profile` was inert, on the evidence that `LoomGGUFExporter` reads
+`self.profile` in one place (`exporter.py`'s bespoke-path dispatch) and only against `None`. That grep
+covered `exporter.py` and `register.py` and missed the real users: **`topology_ops.py` reads
+`self.profile == "monolithic"` in EIGHT places** (`self` inside a topology rule *is* the exporter), each
+gating whether a weight gets a `{func_name}.` namespace prefix — `namespaced_name`,
+`gelu_tanh_approx.one`, and six more. Deleting the field, as this item originally proposed, would have
+renamed weights in every exported GGUF.
 
-1. **The field is inert.** `LoomGGUFExporter` reads `self.profile` in exactly one place
-   (`exporter.py:1052`/`1067`) and only ever tests it against `None`, to gate the *bespoke hand-built
-   Program* path (`test_compiler.py`'s `MockOperation` graphs) — a concern with nothing to do with
-   decomposition. Monolithic-vs-modular is selected by `kwargs.get("modular_layout") is not None`, never
-   by `profile`. Since P0.1 retired `profile="atomic"`, no code path anywhere distinguishes
-   `"monolithic"` from `"modular"` by value.
-2. **So the class split is not duplicating a working option — it replaced one that was never wired.**
-   `LMModularCausalModelExportConfig` sets `profile: str = "modular"` and then deliberately does not
-   forward it (its own `export()` carries a comment explaining why), while
-   `LMMonolithicCausalModelExportConfig` forwards a value the exporter only null-checks.
-3. **The label already contradicts itself elsewhere.** Every multi-phase TTS family inherits
-   `profile="monolithic"` from `LoomExportConfig`'s default while tracing and assembling N independent
-   topologies — structurally a decomposition, just not the one named `"modular"`.
+What survives the correction, verified rather than assumed:
 
-**R3 already specified the right shape and P3 diverged from it**: R3's piece table has
-`.decomposition` (which submodels, which driver) as a config member, built from `ModularExportSpec` /
-`FlowMatchingSpec` / `NeMoASREncoderSpec`. Rebuilt that way, decomposition becomes a strategy object a
-config *holds* rather than a class it *is* — `Flattened()`, `Modular(spec)`, `MultiPhase(phases)` —
-which is exactly the orthogonality `profile` was meant to have: any family can pick any decomposition,
-and `LMCausalModelExportConfig` collapses back to one class with a `decomposition` field. Note the one
-real objection to a plain `profile` *string* on a single class, which is why the strategy object rather
-than a merged class with a mode flag: the two causal-LM forms need genuinely different fields
-(`modular_spec`/`dummy_seq_len` vs `seq_len`/`quantize`), so a string flag makes invalid states
-representable and pushes validation into `export()`.
+1. **The monolithic/modular *dispatch* really is on `modular_layout`**, never on `profile`
+   (`exporter.py`'s `export()`). Since P0.1 retired `profile="atomic"`, no dispatch anywhere
+   distinguishes `"monolithic"` from `"modular"` by value.
+2. **The eight naming reads are all shadowed today.** Every one is `func_name == "main_topo" or
+   self.profile == "monolithic"`, and the monolithic path emits exactly one topology, always named
+   `main_topo` (`exporter.py:1166`). So for every current caller the profile half never decides
+   anything — but it is a live guard, not dead code: a multi-topology export whose exporter was handed
+   `profile="monolithic"` would flatten the namespace, and the modular path's deliberate *omission* of
+   `profile` is what keeps its per-submodule prefixes.
+3. **So `profile` is a real switch wearing the wrong name.** It does not name a profile; it names
+   "flatten the weight namespace", which correlates with monolithic-ness without being it.
 
-Not scheduled as a P4 blocker — P4.1/P4.2 add no new decomposition, and P4.3's composition template
-(encoder + adapter + LM) is the first thing that plausibly wants a fourth one. But `profile` should
-either become real or be renamed to what it actually gates (the bespoke path) before another family
-inherits it and copies the pattern.
+**What was built.** `decomposition.py` — `Decomposition` with `Flattened`, `Modular(spec, dummy_seq_len)`
+and `MultiPhase`, each owning the trace-and-assemble mechanics that used to live in a family's own
+`export()`. `LoomExportConfig` gains a `decomposition` field and a single `export()` that delegates to
+it; no family overrides `export()` any more. The two causal-LM classes collapse into one
+`LMCausalModelExportConfig`, so exporting LFM2 both ways is one type with a field set differently
+instead of two types — the concrete thing this item existed to fix. `profile` is gone from
+`LoomExportConfig` and now appears only where it is meant: inside `Flattened`-shaped families'
+`backend_kwargs()`, with a comment at each site saying it controls weight namespacing.
+
+**Why a strategy object rather than a mode string.** The three forms need genuinely different data
+(`Modular` a spec and a non-colliding dummy length; `Flattened` a trace length and quantize mode;
+`MultiPhase` the phase list). One config carrying every field with a string selecting which subset is
+live makes invalid states representable and pushes checking into `export()`.
+
+**The field is universal; the choice is not.** Only causal-LM currently accepts either decomposition,
+because only LFM2 exports both ways from one checkpoint — a caller decision, which is why both its
+recognizers deliberately `detect()` the same directory. Kokoro cannot be exported flattened and Qwen3
+has no phases: for those families the decomposition is a structural fact, declared once via a
+`default_factory` rather than chosen per run. `decomposition.py`'s module docstring states this, so the
+next family does not read the uniform field as a uniform menu.
+
+**Still open, deliberately:** `profile` itself is not yet renamed to `flatten_weight_namespace` or
+similar. Doing that touches eight `topology_ops.py` rules and is a separate, purely mechanical commit
+whose gate is the same byte-identical re-export; folding it into this one would have mixed a rename
+with a restructure. Worth doing before a family exists that needs a multi-topology export with a flat
+namespace, which is when the shadowing described above stops hiding the confusion.
 
 #### P4 — flagship coverage
 

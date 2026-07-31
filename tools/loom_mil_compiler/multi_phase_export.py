@@ -16,18 +16,17 @@ family follows the same `{Domain}{Function}ExportConfig` naming convention befor
 `BERTTokenClassifierExportConfig` (family 12), or `TTSVocoderExportConfig` if a standalone codec/vocoder
 family (11) ever needs its own abstract tier.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import coremltools as ct
 import numpy as np
-import torch
 import torch.nn as nn
 
+from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
-from .exporter import LoomGGUFExporter
-from .flow_matching_export import EstimatorSpec, FlowMatchingSpec, render_driver
+from .flow_matching_export import EstimatorSpec, FlowMatchingSpec
 
 
 @dataclass
@@ -47,7 +46,7 @@ class ExportPhase:
     declared_axes: Optional[dict] = None
 
 
-def _merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:
+def merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:
     """Content-aware merge across every phase's own weight dict: an identical name with an identical
     real value dedups silently (the common case for names that already carry a per-phase prefix, e.g.
     VITS's `f"{phase}.{weight}"` convention, where no two phases can ever collide in the first place);
@@ -70,14 +69,19 @@ def _merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]])
 
 @dataclass(kw_only=True)
 class BaseMultiPhaseModelExportConfig(LoomExportConfig):
-    """Trace-each-phase / merge-weights-with-collision-check / optionally-render_driver / write_gguf
-    driver. Subclasses implement `phases()`; `samplers()` (`FlowMatchingSpec`s -- codegen a sampler
-    function) and `estimators()` (plain `EstimatorSpec`s -- validate a hand-written sampler call,
-    generate nothing) both default to empty, so calling `render_driver` is always safe: with nothing to
-    check or generate it returns the driver source unchanged, matching a family with no sampler at all
-    (Kokoro, VITS) exactly as if `render_driver` were never called."""
+    """Trace-each-phase / merge-weights-with-collision-check / optionally-render_driver / write_gguf.
+    Subclasses implement `phases()`; `samplers()` (`FlowMatchingSpec`s -- codegen a sampler function)
+    and `estimators()` (plain `EstimatorSpec`s -- validate a hand-written sampler call, generate
+    nothing) both default to empty, so calling `render_driver` is always safe: with nothing to check or
+    generate it returns the driver source unchanged, matching a family with no sampler at all (Kokoro,
+    VITS) exactly as if `render_driver` were never called.
+
+    The mechanics live in `decomposition.MultiPhase` (BACKLOG.md P4.0.3), which is `decomposition`'s
+    default here rather than a caller choice: a phase split exists because the model genuinely cannot be
+    traced as one graph, so unlike the causal-LM family there is no alternative to offer."""
 
     driver_script_path: Path
+    decomposition: Decomposition = field(default_factory=MultiPhase)
 
     def phases(self) -> List[ExportPhase]:
         raise NotImplementedError
@@ -87,36 +91,6 @@ class BaseMultiPhaseModelExportConfig(LoomExportConfig):
 
     def estimators(self) -> List[EstimatorSpec]:
         return []
-
-    def export(self) -> str:
-        phase_topologies = {}
-        named_weights = []
-        for phase in self.phases():
-            traced = torch.jit.trace(phase.wrapper, phase.dummy_inputs)
-            mil_prog = ct.convert(
-                traced, inputs=phase.mil_inputs, convert_to="milinternal",
-                compute_precision=ct.precision.FLOAT32,
-            )
-            exporter = LoomGGUFExporter(mil_prog, root_axis=phase.root_axis, declared_axes=phase.declared_axes)
-            main_func = mil_prog.functions["main"]
-            topo = exporter.generate_graph_topology(main_func, phase.name)
-            print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-            phase_topologies[phase.name] = topo
-            named_weights.append((phase.name, exporter.weights))
-
-        merged_weights = _merge_phase_weights(named_weights)
-
-        out_exporter = LoomGGUFExporter(None, output_path=self.output_path, architecture=self.architecture)
-        out_exporter.topologies = phase_topologies
-        out_exporter.weights = merged_weights
-
-        driver_source = render_driver(
-            self.driver_script_path.read_text(), self.samplers(),
-            topologies=out_exporter.topologies, estimators=self.estimators(),
-        )
-        out_exporter.write_gguf(driver_source)
-        print(f"wrote {self.output_path}")
-        return self.output_path
 
 
 @dataclass(kw_only=True)
