@@ -517,20 +517,73 @@ cheaper now and more expensive after Whisper/GigaAM/composition add three more c
 whatever shape exists at the time. Same gate as everything else: byte-identical re-export of all 11
 models (`snapshot_gguf.py`), since none of these is meant to change any output.
 
-- **P4.0.1 — real `detect()` for the self-describing TTS checkpoints (the cheap one).** P3.3 registered
-  all five TTS families with `detect()` returning `False` unconditionally, so `loom-export <path> -o x.gguf`
-  works for the four causal-LM/NeMo models but requires `--task tts-multi-phase --model kokoro` for the
-  five TTS ones — five of seven registered models don't reach R3's own stated user experience. Three of
-  the five are genuinely self-describing and P3.3 already named the evidence: **Kokoro** ships its own
-  `config.json` (reuse `causal_lm_export._hf_model_type`'s pattern — a shared `_json_field()` helper is
-  the obvious shape once a second family reads a `config.json` for a non-`model_type` key); **Matcha**'s
-  `.ckpt` has Lightning-style `hyper_parameters`/`state_dict` top-level keys; **Supertonic**'s `.pt`
-  files are fully pickled `nn.Module`s, distinctive on the pickle header alone (do NOT `torch.load` to
-  detect — detection must stay cheap and must not execute checkpoint code). VITS and StyleTTS2 stay
-  explicit-only unless a real discriminator turns up; say so in their recognizers rather than leaving
-  `return False` unexplained. Detection is unit-testable against synthetic fixtures exactly like
-  `test_registry.py` already does for the fake HF dir / fake `.nemo` archives — no real checkpoints
-  needed.
+- **P4.0.1 — real `detect()` for the self-describing TTS checkpoints — DONE.** P3.3 registered all five
+  TTS families with `detect()` returning `False` unconditionally, so `loom-export <path> -o x.gguf` worked
+  for the four causal-LM/NeMo models but needed `--task tts-multi-phase --model kokoro` for the five TTS
+  ones. **All five now auto-detect** — this item predicted three (Kokoro, Matcha, Supertonic) and filed
+  VITS/StyleTTS2 as explicit-only "unless a real discriminator turns up"; probing the real checkpoints
+  turned one up for each, so both were implemented too.
+
+  `checkpoint_probe.py` is the shared primitive: `read_json` (a safe sidecar-config read) and
+  `probe_torch_checkpoint`, which opens a `torch.save` archive as a plain zip, reads only its `data.pkl`
+  member, and walks it with `pickletools.genops` — returning the set of `module.Class` references and the
+  set of strings the pickle contains. It **never unpickles**: no `torch.load`, no `weights_only=`
+  question, no checkpoint code executed, and no tensor payload read (8–63 ms per real checkpoint). That
+  is a hard requirement for detection specifically, which by construction runs against unidentified paths
+  — `TaskRegistry.detect()` hands whatever the user typed to every registered recognizer in turn. The
+  probe returns raw structure rather than a decoded object so each family's own discriminating claim
+  stays in its family module, beside the `build_config` whose requirements it mirrors.
+
+  Each recognizer checks what its own `build_config`/`phases()` will actually open, which is what keeps
+  "detected" from ever meaning "detected, then failed to export":
+  - **Kokoro** — a directory holding `kokoro-v1_0.pth` beside a `config.json` with Kokoro's key
+    signature (`istftnet`/`plbert`/`n_token`/`style_dim`/`vocab`). Both halves needed: StyleTTS2 loads
+    that *same* `config.json` (`TTSStyleTTS2ExportConfig.kokoro_config_path` — shared iSTFTNet
+    architecture, shared declaration), so the config alone can't tell a Kokoro checkpoint directory from
+    a StyleTTS2 export environment.
+  - **Matcha** — a directory with `matcha_ljspeech.ckpt` + `generator_v1`, the ckpt carrying
+    `pytorch-lightning_version`/`state_dict`/`mel_mean`.
+  - **VITS** — a Lightning `.ckpt` *file* (not a directory, matching `checkpoint_path`) with
+    `model_g.`-prefixed generator weights.
+  - **StyleTTS2** — a `.pth` file with the `net` wrapper `export()` itself indexes through, plus
+    `diffusion`.
+  - **Supertonic** — the `assets/pt` directory with all four required `.pt` files, one of which names a
+    `supertonic_tts.`-rooted class in its pickle (these are `torch.save(module)` outputs, not state
+    dicts — the strongest signature of the five, and reading the class reference is not honoring it).
+
+  **Two near-collisions found by probing, both of which killed the discriminator this item originally
+  proposed:**
+  1. *A Lightning signature is not Matcha-specific.* `pytorch-lightning_version` + `state_dict` is
+     exactly what piper-VITS's own `.ckpt` declares too (Matcha 2.0.8, VITS 1.9.5). The two are separated
+     by their state-dict key namespaces instead — Matcha's `mel_mean` (stored mel normalization stats,
+     which VITS has no equivalent of) vs. VITS's `model_g.`/`model_d.` generator/discriminator split.
+  2. *Kokoro and StyleTTS2 checkpoints are the same kind of object* — a dict of component name →
+     `OrderedDict`, both leading with identical `bert` → `module.embeddings.word_embeddings.weight`
+     ALBERT keys, no version marker, no config, no class reference beyond `collections.OrderedDict`
+     (Kokoro is a StyleTTS2 derivative; this repo's own Kokoro/StyleTTS2 sharing of
+     `build_decoder_vocoder_phase` is the same fact in code). Every component name in Kokoro's checkpoint
+     is also in StyleTTS2's, so the discriminator had to run the other way — on what Kokoro's
+     inference-only release *strips*: the `net` wrapper and the training-time components under it
+     (`diffusion`, `mpd`, `msd`, `wd`). `diffusion` is the semantically right key to hold, since it is
+     exactly why StyleTTS2 stays a plain `BaseMultiPhaseModelExportConfig` with a hand-written ADPM2
+     sampler rather than a `TTSFlowMatchingModelExportConfig`.
+
+  **Gate — passed:** every registered recognizer run against every real checkpoint on this machine (the
+  five TTS ones, Qwen3, LFM2, Conformer-CTC) — each resolves to exactly one recognizer, except LFM2's
+  two profiles, which is the intended documented ambiguity. Two decoys that must NOT match anything also
+  don't: Kokoro's bare `kokoro-v1_0.pth` and Matcha's `generator_v1` (a raw non-zip pickle), neither of
+  which is a valid `build_config` input. 17 new tests in `test_registry.py` (36 total in that file, full
+  `pytest` 182/182 green), covering the probe directly (protocol-2 GLOBAL and protocol-4 STACK_GLOBAL,
+  missing path / directory / non-zip / zip-without-`data.pkl` / truncated pickle) and every recognizer as
+  a full 5×5 cross-product against synthetic fixtures — `pickle.dumps` of plain dicts inside a hand-built
+  zip, since what the probe reads is the opcode stream, so no torch and no real checkpoints are needed.
+  That includes `test_causal_lm_export.py`'s 3 real-export tests (Qwen3 + both LFM2 profiles, ~5 min,
+  9.8GB of scratch), which pass unchanged.
+
+  **Machine note, cost 20 minutes here:** those export tests write real multi-GB GGUFs into pytest's
+  `tmp_path`, which defaults to `/tmp` — a 28GB partition on this machine that they fill to 0 bytes free,
+  at which point unrelated commands start failing. Run the suite with both `TMPDIR=` and pytest's own
+  `--basetemp=` pointed under `/home/flavio/.claude/tmp/`; `TMPDIR` alone does not move `tmp_path`.
 - **P4.0.2 — decide where a family declares its dynamic axes (the real gap).** R3's piece table names
   `.inputs`/`.outputs` as config members and this file's own ordering rationale says `LoomExportConfig.inputs`
   *is* the axis declaration — neither exists. Today the same information lives in three unrelated places:

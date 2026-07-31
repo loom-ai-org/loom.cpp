@@ -54,6 +54,7 @@ import coremltools as ct
 from coremltools.converters.mil.frontend.torch import ops as _torch_ops
 from coremltools.converters.mil.mil import Builder as _mb
 
+from .checkpoint_probe import read_json
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .patcher import ModelPatcher
 
@@ -493,13 +494,27 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         return [albert_phase, decoder_vocoder_phase]
 
 
+# Kokoro's `config.json` carries no `model_type`-style single field, but its own key set is a real
+# signature: the two nested sub-configs (`istftnet` -- the decoder/vocoder this family exports as its
+# second phase; `plbert` -- the ALBERT encoder it exports as its first) plus the three top-level
+# hyperparameters that shape both. Checked as a subset, so a checkpoint adding keys still matches.
+_KOKORO_CONFIG_KEYS = frozenset({"istftnet", "plbert", "n_token", "style_dim", "vocab"})
+
+
 def _is_kokoro(path: Path) -> bool:
-    """No auto-detection this pass -- requires an explicit `--task tts-multi-phase --model kokoro`
-    (BACKLOG.md P3.3's stated scope limit). Kokoro's own `config.json` doesn't carry a standard
-    `model_type`-style field this recognizer could key on without risking a false-positive match against
-    an unrelated model shipping a `config.json` of its own; worth revisiting if a real distinguishing
-    field is found later."""
-    return False
+    """Real structural check (BACKLOG.md P4.0.1): the model directory `TTSKokoroExportConfig.phases()`
+    itself requires -- `kokoro-v1_0.pth` beside a `config.json` carrying Kokoro's own key signature.
+
+    Both halves are load-bearing. The checkpoint name alone is weak, and the config alone genuinely
+    cannot be trusted: StyleTTS2 loads this *same* `config.json` (`TTSStyleTTS2ExportConfig.
+    kokoro_config_path` -- the two models share the iSTFTNet decoder/vocoder architecture, so they share
+    its declaration too), so a directory recognized on the config alone could just as well be a
+    StyleTTS2 export environment. Requiring the checkpoint file this config's `build_config` will
+    actually open is what makes the answer unambiguous."""
+    if not path.is_dir() or not (path / "kokoro-v1_0.pth").is_file():
+        return False
+    config = read_json(path / "config.json")
+    return config is not None and _KOKORO_CONFIG_KEYS.issubset(config)
 
 
 def _build_kokoro(path: Path, output_path: str) -> TTSKokoroExportConfig:
