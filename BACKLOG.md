@@ -95,7 +95,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P0** | clear the ground — DONE | R7, writer dedup, R5 audit, R6 policy | golden diff (11 models) | — |
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
-| **P3** | the API skeleton | R3, R4 | byte-identical re-export of all current models | P2 |
+| **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
 | **P4** | flagship coverage | Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
@@ -475,6 +475,40 @@ possible for any of them) and one-off duplication.
 **Gate — passed:** `loom-export --task causal-lm --model lfm2-modular`/`--model lfm2-monolithic` against
 the real LFM2-350M checkpoint, snapshot-diffed against the original P3.1 baseline — zero-byte diff for
 both. Full `pytest` (165/165) and `ctest` (140/140) green.
+
+### What P3 deliberately did not build (R3/R4 residue — still open)
+
+P3 is DONE against its own stated gate ("byte-identical re-export of all current models" through the new
+API, all 11 models). Three pieces of R3/R4's original description were not built, none of them blocking
+P4, all of them still real:
+
+- **`LoomModelFor*` runtime entry points** (R3's last table row: `LoomModelForCTC` /
+  `ForSpeechSeq2Seq` / `ForCausalLM` / `ForTextToSpeech` over the Lua drivers + C++ backends). Nothing
+  by that name exists. P3 built the *export* half of the `optimum` analogy (`OnnxConfig` →
+  `LoomExportConfig`, `TasksManager` → `TaskRegistry`); the *inference* half (`ORTModelFor*`) has no
+  counterpart yet. Arguably it should not be built until there is a second consumer besides the tests —
+  a GGUF is already self-contained via its embedded driver, which is exactly why this half is less
+  load-bearing here than in `optimum`.
+- **Driver templates as first-class artifacts.** R3 asked to "generalize [the `--@loom:samplers` marker]
+  into a proper template mechanism rather than string replacement." `flow_matching_export.render_driver`
+  is still marker-based string replacement into a hand-written `.lua` file
+  (`BaseMultiPhaseModelExportConfig.driver_script_path`), now called uniformly for every multi-phase
+  family instead of per script. The uniform call site is the part P3 delivered; the template mechanism
+  itself is untouched, and a family whose driver needs more than one substitution point will be the
+  thing that forces it.
+- **`.inputs` / `.generate_dummy_inputs()` / `.patch_model_for_export()` as named config members.**
+  R3's piece table names all three; none exist under those names. What exists instead: axes are declared
+  per phase (`ExportPhase.root_axis`/`declared_axes`) or per family field, dummy inputs are built inline
+  inside `phases()`, and `ModelPatcher.prepare_environment()` covers only the import-order half of
+  `patch_model_for_export()` (class-level monkeypatches stay module-level, deliberately — see P3.3).
+  The ordering constraint at the top of this section ("R1 must land before R3's config schema, because
+  `LoomExportConfig.inputs` *is* the axis declaration") therefore did not get cashed in: `LoomExportConfig`
+  holds only `architecture`/`output_path`/`profile`, and axis declaration stayed where R1 put it. Whether
+  to hoist it is a real open question for P4.1/P4.3, whose configs are the first written from scratch
+  rather than migrated.
+
+Also stale: `export_config.py`'s module docstring points at a "Target class hierarchy and naming" section
+of this file that does not exist (the hierarchy is described in P3.1's entry instead).
 
 #### P4 — flagship coverage
 
