@@ -57,6 +57,7 @@ import numpy as np
 import torch
 import coremltools as ct
 
+from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import EstimatorSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .patcher import ModelPatcher
@@ -342,9 +343,24 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
 
 
 def _is_styletts2(path: Path) -> bool:
-    """No auto-detection this pass -- requires an explicit `--task tts-multi-phase --model styletts2`
-    (BACKLOG.md P3.3's stated scope limit)."""
-    return False
+    """Real structural check (BACKLOG.md P4.0.1): a `.pth` file holding StyleTTS2's own `net` component
+    dict, including the `diffusion` component this family's sampler is built around.
+
+    Both keys are the answer to a near-collision worth recording. Kokoro is a StyleTTS2 derivative --
+    this module borrows `kokoro_export.build_decoder_vocoder_phase` outright for that reason -- and the
+    two checkpoints are the same kind of object: a dict of component name -> `OrderedDict` state dict,
+    leading with the identical `bert` -> `module.embeddings.word_embeddings.weight` ALBERT keys, with no
+    version marker, no config, and no class reference beyond `collections.OrderedDict`. Probing both
+    real checkpoints (`checkpoint_probe.probe_torch_checkpoint`) found every component name in Kokoro's
+    also present in StyleTTS2's, so the discriminator has to run the other way, on what Kokoro's
+    inference-only release *strips*: the `net` wrapper (which `export()` itself indexes through) and the
+    training-time components under it (`diffusion`, `mpd`, `msd`, `wd`). `diffusion` is the one to key
+    on beyond `net` -- it is exactly why this family stays a plain `BaseMultiPhaseModelExportConfig`
+    with a hand-written ADPM2 sampler rather than a `TTSFlowMatchingModelExportConfig`."""
+    probe = probe_torch_checkpoint(path)
+    if probe is None:
+        return False
+    return {"net", "diffusion", "bert", "decoder"}.issubset(probe.strings)
 
 
 def _build_styletts2(path: Path, output_path: str) -> TTSStyleTTS2ExportConfig:

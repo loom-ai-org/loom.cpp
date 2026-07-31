@@ -1,18 +1,27 @@
-"""Unit tests for `registry.py`'s `TaskRegistry` and the causal-LM/NeMo-ASR family recognizers
-(BACKLOG.md P3.2) -- pure structural detection, no real checkpoints, no torch/coremltools tracing.
-Synthetic fixtures (a fake HF dir with a `config.json`, fake `.nemo` archives with a synthetic
-`model_config.yaml`) reproduce every shape `detect()` has to tell apart, the same "fake module,
-real check" philosophy `test_nemo_asr_export.py` already uses for `EncoderOutput.validate`.
+"""Unit tests for `registry.py`'s `TaskRegistry` and every family's recognizers (BACKLOG.md P3.2, P4.0.1)
+-- pure structural detection, no real checkpoints, no torch/coremltools tracing. Synthetic fixtures (a
+fake HF dir with a `config.json`, fake `.nemo` archives with a synthetic `model_config.yaml`, fake torch
+zip archives holding a real pickle of the shape each TTS checkpoint has) reproduce every shape `detect()`
+has to tell apart, the same "fake module, real check" philosophy `test_nemo_asr_export.py` already uses
+for `EncoderOutput.validate`.
+
+The TTS fixtures are deliberately built from `pickle.dumps` of plain dicts rather than `torch.save` of
+real modules: what `checkpoint_probe` reads is the pickle's own opcode stream, so a plain pickle in a zip
+named `data.pkl` is the same thing to it as a 300MB checkpoint, and the fixture stays readable as a
+statement of what each family's checkpoint structurally IS.
 """
 import json
+import pickle
 import sys
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loom_mil_compiler.registry import ModelRecognizer, TaskRegistry, TaskRegistryEntry  # noqa: E402
+from loom_mil_compiler.checkpoint_probe import probe_torch_checkpoint, read_json  # noqa: E402
 from loom_mil_compiler.causal_lm_export import _is_qwen3  # noqa: E402
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
     _is_conformer_ctc,
@@ -26,6 +35,38 @@ def _make_hf_dir(tmp_path: Path, model_type: str) -> Path:
     d.mkdir()
     (d / "config.json").write_text(json.dumps({"model_type": model_type}))
     return d
+
+
+def _make_torch_zip(path: Path, payload) -> Path:
+    """A minimal stand-in for a `torch.save` output: a zip archive whose only member is `data.pkl`.
+    `payload` is either an object to pickle or raw pickle bytes (for shapes a plain `pickle.dumps`
+    can't produce, e.g. a GLOBAL naming a class whose package isn't installed here)."""
+    raw = payload if isinstance(payload, bytes) else pickle.dumps(payload, protocol=2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", raw)
+    return path
+
+
+# Each family's real checkpoint structure, reduced to the keys `detect()` actually claims -- see the
+# corresponding `_is_*` docstring for what was probed off the real file to arrive at each one.
+def _lightning(state_dict: dict, version: str = "2.0.8") -> dict:
+    return {"epoch": 9, "global_step": 1000, "pytorch-lightning_version": version, "state_dict": state_dict}
+
+
+MATCHA_CKPT = _lightning({"mel_mean": 0.0, "mel_std": 1.0, "encoder.emb.weight": 0.0})
+VITS_CKPT = _lightning({"model_g.enc_p.emb.weight": 0.0, "model_d.convs.0.weight": 0.0}, version="1.9.5")
+# Kokoro and StyleTTS2 both: component name -> state dict, no version marker, no config. StyleTTS2 adds
+# the `net` wrapper and the training-time components Kokoro's inference release strips.
+KOKORO_CKPT = {"bert": {"module.embeddings.word_embeddings.weight": 0.0}, "bert_encoder": {},
+               "predictor": {}, "decoder": {}, "text_encoder": {}}
+STYLETTS2_CKPT = {"net": {**KOKORO_CKPT, "diffusion": {}, "mpd": {}, "msd": {}, "wd": {},
+                          "predictor_encoder": {}, "style_encoder": {}}}
+# A fully-pickled `nn.Module`: the pickle names the class it would reconstruct. Written as raw opcodes
+# (protocol 2 GLOBAL) since the real `supertonic_tts` package isn't importable in a unit test.
+SUPERTONIC_PT_BYTES = (
+    b"\x80\x02csupertonic_tts.models.modules.text_to_latent_encoding.encoders\nTTLTextEncoder\n."
+)
 
 
 def _make_nemo_archive(tmp_path: Path, name: str, config: dict) -> Path:
@@ -102,6 +143,199 @@ def test_nemo_recognizers_reject_non_nemo_paths(tmp_path):
     assert not _is_conformer_ctc(d)
     assert not _is_parakeet_tdt(d)
     assert not _is_parakeet_rnnt(d)
+
+
+# -- checkpoint_probe, the shared primitive under every TTS recognizer (BACKLOG.md P4.0.1) -------------
+
+def test_probe_reads_globals_and_strings_without_unpickling(tmp_path):
+    path = _make_torch_zip(tmp_path / "m.pt", SUPERTONIC_PT_BYTES)
+    probe = probe_torch_checkpoint(path)
+    assert probe is not None
+    assert any(ref.startswith("supertonic_tts.") for ref in probe.globals)
+    assert probe.globals == {
+        "supertonic_tts.models.modules.text_to_latent_encoding.encoders.TTLTextEncoder"
+    }
+
+
+def test_probe_handles_protocol_4_stack_global(tmp_path):
+    """Protocol <= 3 emits one GLOBAL with both names; protocol 4 pushes module and class separately and
+    joins them with STACK_GLOBAL. Both must produce the same `module.Class` string, since which protocol
+    a checkpoint was written with is not something a recognizer should have to know."""
+    import collections
+
+    path = _make_torch_zip(tmp_path / "p4.pt", pickle.dumps(collections.OrderedDict, protocol=4))
+    probe = probe_torch_checkpoint(path)
+    assert probe is not None and "collections.OrderedDict" in probe.globals
+
+
+def test_probe_collects_nested_dict_keys_as_strings(tmp_path):
+    path = _make_torch_zip(tmp_path / "l.ckpt", MATCHA_CKPT)
+    probe = probe_torch_checkpoint(path)
+    # A top-level key and a key one level down inside `state_dict` are both visible -- the recognizers
+    # rely on exactly that (`pytorch-lightning_version` is top level, `mel_mean` is not).
+    assert {"pytorch-lightning_version", "state_dict", "mel_mean"}.issubset(probe.strings)
+
+
+@pytest.mark.parametrize("make", [
+    lambda p: p / "does_not_exist.pt",
+    lambda p: (p / "a_dir").mkdir() or (p / "a_dir"),
+    lambda p: _write(p / "plain.txt", b"not a zip at all"),
+    lambda p: _empty_zip(p / "no_data_pkl.zip"),
+])
+def test_probe_returns_none_for_anything_that_is_not_a_torch_checkpoint(tmp_path, make):
+    """`detect()` runs against whatever the user typed, so the probe answers None rather than raising
+    for a missing path, a directory, a non-zip file, and a zip with no `data.pkl` (what a `.nemo` tar
+    and Matcha's own non-zip `generator_v1` HiFi-GAN checkpoint both look like here)."""
+    assert probe_torch_checkpoint(make(tmp_path)) is None
+
+
+def _write(path: Path, data: bytes) -> Path:
+    path.write_bytes(data)
+    return path
+
+
+def _empty_zip(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/version", "3")
+    return path
+
+
+def test_probe_survives_a_truncated_pickle(tmp_path):
+    """A partial read is still sound: every consumer asks whether something IS present."""
+    path = _make_torch_zip(tmp_path / "cut.pt", SUPERTONIC_PT_BYTES[:-10])
+    probe = probe_torch_checkpoint(path)
+    assert probe is not None
+
+
+def test_read_json_returns_none_rather_than_raising(tmp_path):
+    assert read_json(tmp_path / "missing.json") is None
+    assert read_json(_write(tmp_path / "bad.json", b"{not json")) is None
+    assert read_json(_write(tmp_path / "list.json", b"[1, 2]")) is None
+    assert read_json(_write(tmp_path / "ok.json", b'{"a": 1}')) == {"a": 1}
+
+
+# -- TTS family recognizers (BACKLOG.md P4.0.1) --------------------------------------------------------
+
+def _make_kokoro_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "kokoro_model"
+    d.mkdir()
+    _make_torch_zip(d / "kokoro-v1_0.pth", KOKORO_CKPT)
+    (d / "config.json").write_text(json.dumps({
+        "istftnet": {"upsample_rates": [10, 6]}, "plbert": {"num_hidden_layers": 12},
+        "n_token": 178, "style_dim": 128, "vocab": {"a": 1}, "n_mels": 80,
+    }))
+    return d
+
+
+def _make_matcha_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "matcha_ckpt"
+    d.mkdir()
+    _make_torch_zip(d / "matcha_ljspeech.ckpt", MATCHA_CKPT)
+    (d / "generator_v1").write_bytes(b"\x80\x02}q\x00.")  # real HiFi-GAN file: a raw pickle, not a zip
+    return d
+
+
+def _make_supertonic_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "pt"
+    d.mkdir()
+    for name in ("duration_predictor.pt", "text_encoder.pt", "vector_estimator.pt", "vocoder.pt"):
+        _make_torch_zip(d / name, SUPERTONIC_PT_BYTES)
+    return d
+
+
+def _tts_detectors():
+    from loom_mil_compiler.kokoro_export import _is_kokoro
+    from loom_mil_compiler.matcha_export import _is_matcha
+    from loom_mil_compiler.styletts2_export import _is_styletts2
+    from loom_mil_compiler.supertonic_export import _is_supertonic
+    from loom_mil_compiler.vits_export import _is_vits
+
+    return {"kokoro": _is_kokoro, "matcha": _is_matcha, "styletts2": _is_styletts2,
+            "supertonic": _is_supertonic, "vits": _is_vits}
+
+
+def _all_tts_fixtures(tmp_path: Path) -> dict:
+    return {
+        "kokoro": _make_kokoro_dir(tmp_path),
+        "matcha": _make_matcha_dir(tmp_path),
+        "supertonic": _make_supertonic_dir(tmp_path),
+        "vits": _make_torch_zip(tmp_path / "piper.ckpt", VITS_CKPT),
+        "styletts2": _make_torch_zip(tmp_path / "epoch_2nd_00100.pth", STYLETTS2_CKPT),
+    }
+
+
+def test_every_tts_recognizer_matches_its_own_fixture_and_no_other(tmp_path):
+    """The whole point of P4.0.1: five families, five checkpoints, one match each. Two near-collisions
+    are the reason this is a full cross-product rather than five independent asserts -- Matcha/VITS are
+    both Lightning `.ckpt`s, and Kokoro/StyleTTS2 are both component-dict `.pth`s from the same model
+    lineage."""
+    detectors = _tts_detectors()
+    fixtures = _all_tts_fixtures(tmp_path)
+    for family, detect in detectors.items():
+        matched = {name for name, path in fixtures.items() if detect(path)}
+        assert matched == {family}, f"_is_{family} matched {matched or 'nothing'}"
+
+
+def test_matcha_and_vits_are_told_apart_by_state_dict_keys_not_by_the_lightning_marker(tmp_path):
+    """Recorded because P4.0.1 originally proposed the Lightning signature itself as Matcha's
+    discriminator; probing the real checkpoints showed piper-VITS declares the identical marker."""
+    detectors = _tts_detectors()
+    both = {"pytorch-lightning_version", "state_dict"}
+    for name, payload in (("matcha", MATCHA_CKPT), ("vits", VITS_CKPT)):
+        path = _make_torch_zip(tmp_path / f"{name}.ckpt", payload)
+        assert both.issubset(probe_torch_checkpoint(path).strings)
+    # Same marker, opposite answers.
+    vits_ckpt = _make_torch_zip(tmp_path / "v.ckpt", VITS_CKPT)
+    assert detectors["vits"](vits_ckpt) and not detectors["matcha"](vits_ckpt)
+
+
+def test_kokoro_needs_its_checkpoint_beside_its_config(tmp_path):
+    """The config alone is not enough: StyleTTS2 loads this same `config.json` for the shared iSTFTNet
+    decoder, so a directory holding only it is not a Kokoro export target."""
+    detect = _tts_detectors()["kokoro"]
+    d = _make_kokoro_dir(tmp_path)
+    assert detect(d)
+
+    (d / "kokoro-v1_0.pth").unlink()
+    assert not detect(d)
+
+
+def test_matcha_needs_both_checkpoints(tmp_path):
+    detect = _tts_detectors()["matcha"]
+    d = _make_matcha_dir(tmp_path)
+    assert detect(d)
+
+    (d / "generator_v1").unlink()
+    assert not detect(d), "the HiFi-GAN vocoder half is required by phases(), so it is required here"
+
+
+def test_supertonic_needs_all_four_checkpoints(tmp_path):
+    detect = _tts_detectors()["supertonic"]
+    d = _make_supertonic_dir(tmp_path)
+    assert detect(d)
+
+    (d / "vector_estimator.pt").unlink()
+    assert not detect(d)
+
+
+def test_supertonic_rejects_a_directory_of_plain_state_dicts(tmp_path):
+    """Filenames alone would accept this; the `supertonic_tts.`-rooted class reference is what makes the
+    check structural."""
+    detect = _tts_detectors()["supertonic"]
+    d = tmp_path / "impostor"
+    d.mkdir()
+    for name in ("duration_predictor.pt", "text_encoder.pt", "vector_estimator.pt", "vocoder.pt"):
+        _make_torch_zip(d / name, {"weight": 0.0})
+    assert not detect(d)
+
+
+def test_tts_recognizers_reject_the_other_families_paths(tmp_path):
+    """No TTS recognizer may claim an HF causal-LM directory or a `.nemo` archive -- `TaskRegistry.detect`
+    runs every recognizer against every path, so a false positive here breaks an unrelated family."""
+    others = [_make_hf_dir(tmp_path, "qwen3"), _make_nemo_archive(tmp_path, "ctc", CTC_CONFIG)]
+    for family, detect in _tts_detectors().items():
+        for path in others:
+            assert not detect(path), f"_is_{family} claimed {path.name}"
 
 
 # -- TaskRegistry itself, independent of any real family -----------------------------------------------
@@ -215,3 +449,15 @@ def test_default_registry_detects_synthetic_nemo_archives(tmp_path):
     assert registry.detect(_make_nemo_archive(tmp_path, "ctc", CTC_CONFIG)).name == "conformer-ctc"
     assert registry.detect(_make_nemo_archive(tmp_path, "tdt", TDT_CONFIG)).name == "parakeet-tdt"
     assert registry.detect(_make_nemo_archive(tmp_path, "rnnt", RNNT_CONFIG)).name == "parakeet-rnnt"
+
+
+def test_default_registry_detects_every_tts_family_end_to_end(tmp_path):
+    """P4.0.1's acceptance shape: `loom-export <path> -o out.gguf` with no `--task`/`--model` resolves
+    all five TTS families through the same registry as the causal-LM and NeMo ones -- against the whole
+    registry, not just each family's own recognizer, so an ambiguity introduced by any other family
+    fails here."""
+    from loom_mil_compiler.registry import default_registry
+
+    registry = default_registry()
+    for family, path in _all_tts_fixtures(tmp_path).items():
+        assert registry.detect(path).name == family

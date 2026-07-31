@@ -61,6 +61,7 @@ from typing import List
 import numpy as np
 import torch
 
+from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, TTSFlowMatchingModelExportConfig
 from .patcher import ModelPatcher
@@ -431,12 +432,29 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
 
 
 def _is_matcha(path: Path) -> bool:
-    """No auto-detection this pass -- requires an explicit `--task tts-flow-matching --model matcha`
-    (BACKLOG.md P3.3's stated scope limit). Matcha's own `.ckpt` is a Lightning-style checkpoint
-    (`hyper_parameters`/`state_dict` top-level keys, `load_text_encoder`'s own real structure) that could
-    plausibly be recognized by a cheap partial `torch.load` + key check, worth revisiting once a second
-    Lightning-checkpoint family exists to confirm the signature is actually distinguishing."""
-    return False
+    """Real structural check (BACKLOG.md P4.0.1): the model directory `TTSMatchaExportConfig.phases()`
+    itself requires -- both checkpoints present, and the Matcha one really being Matcha's own Lightning
+    checkpoint.
+
+    **A Lightning signature alone is NOT a discriminator here**, which is the finding that shaped this
+    check: `pytorch-lightning_version` + `state_dict` is exactly what piper-VITS's own `.ckpt` declares
+    too (confirmed by probing both real checkpoints -- Matcha 2.0.8, VITS 1.9.5). The two are told apart
+    by their first state-dict key instead: Matcha's is `mel_mean` (its stored mel normalization
+    statistics, which VITS has no equivalent of), VITS's are `model_g.`-prefixed. `vits_export._is_vits`
+    keys on the other side of that same pair; the two checks are meant to be read together.
+
+    The filename is the LJSpeech release's own (`phases()` hardcodes it, so detecting anything looser
+    would recognize directories this config then fails to export); a differently-named Matcha voice
+    needs both this and `phases()` widened together."""
+    if not path.is_dir():
+        return False
+    ckpt = path / "matcha_ljspeech.ckpt"
+    if not ckpt.is_file() or not (path / "generator_v1").is_file():
+        return False
+    probe = probe_torch_checkpoint(ckpt)
+    if probe is None:
+        return False
+    return {"pytorch-lightning_version", "state_dict", "mel_mean"}.issubset(probe.strings)
 
 
 def _build_matcha(path: Path, output_path: str) -> TTSMatchaExportConfig:

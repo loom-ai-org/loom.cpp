@@ -75,6 +75,7 @@ import numpy as np
 import torch
 import coremltools as ct
 
+from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
 
@@ -240,13 +241,29 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         )]
 
 
+# Exactly the four `_load_pt` calls in `TTSSupertonicExportConfig.phases()` -- the style-encoder `.pt`
+# files that sit beside them in the real `assets/pt` directory are not loaded by this export and are
+# deliberately not required here.
+_SUPERTONIC_REQUIRED_PT = ("duration_predictor.pt", "text_encoder.pt", "vector_estimator.pt", "vocoder.pt")
+
+
 def _is_supertonic(path: Path) -> bool:
-    """No auto-detection this pass -- requires an explicit `--task tts-flow-matching --model supertonic`
-    (BACKLOG.md P3.3's stated scope limit). This checkpoint format (a directory of fully pickled
-    `nn.Module`s, `torch.save(self, path)`) is distinctively unlike every other family's plain state-dict
-    checkpoint -- worth a real `detect()` later (e.g. checking the directory contains the four expected
-    `.pt` filenames), just not implemented this pass."""
-    return False
+    """Real structural check (BACKLOG.md P4.0.1): the `assets/pt` directory `TTSSupertonicExportConfig.
+    phases()` requires -- all four checkpoints present, and one of them really being a pickled
+    SupertonicTTS module.
+
+    The strongest signature of the five TTS families, and the reason is this family's otherwise
+    inconvenient checkpoint format: these are `torch.save(module)` outputs, not state dicts, so the
+    pickle names the real class it will reconstruct (`supertonic_tts.models.modules.
+    text_to_latent_encoding.encoders.TTLTextEncoder`). Reading that reference is not the same as
+    honoring it -- `probe_torch_checkpoint` walks pickle opcodes and never unpickles, so detection needs
+    neither `torch.load` nor the `supertonic_tts` package importable."""
+    if not path.is_dir() or not all((path / name).is_file() for name in _SUPERTONIC_REQUIRED_PT):
+        return False
+    probe = probe_torch_checkpoint(path / "text_encoder.pt")
+    if probe is None:
+        return False
+    return any(ref.startswith("supertonic_tts.") for ref in probe.globals)
 
 
 def _build_supertonic(path: Path, output_path: str) -> TTSSupertonicExportConfig:

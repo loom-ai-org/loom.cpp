@@ -55,6 +55,7 @@ import torch
 import torch.nn.functional as F
 import coremltools as ct
 
+from .checkpoint_probe import probe_torch_checkpoint
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 
 sys.path.insert(0, "/home/flavio/Dev/piper/src/python")
@@ -347,10 +348,24 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
 
 
 def _is_vits(path: Path) -> bool:
-    """No self-describing config for this checkpoint format (a raw piper Lightning `.ckpt`) -- always
-    False, requiring an explicit `--task tts-multi-phase --model vits` (BACKLOG.md P3.3's stated scope
-    limit, same as `optimum` itself needing `--task` for sufficiently custom architectures)."""
-    return False
+    """Real structural check (BACKLOG.md P4.0.1): a Lightning `.ckpt` file whose state dict carries
+    piper-VITS's own `model_g.`-prefixed generator weights.
+
+    P4.0.1 filed VITS as explicit-only ("no self-describing config"), which probing the real checkpoint
+    disproved: the `.ckpt` describes itself perfectly well, just in its state-dict key namespace rather
+    than in a config blob. `model_g.`/`model_d.` is piper's own generator/discriminator split, and the
+    Lightning marker keeps it from matching a bare state dict saved with the same prefixes.
+
+    Both halves are needed because Matcha's checkpoint is *also* a Lightning `.ckpt` -- see
+    `matcha_export._is_matcha` for the other side of that pair. Note the asymmetry with every other
+    recognizer here: this one is handed a FILE (the checkpoint itself), not a model directory, matching
+    `TTSVitsExportConfig.checkpoint_path`."""
+    probe = probe_torch_checkpoint(path)
+    if probe is None:
+        return False
+    if not {"pytorch-lightning_version", "state_dict"}.issubset(probe.strings):
+        return False
+    return any(key.startswith("model_g.") for key in probe.strings)
 
 
 def _build_vits(path: Path, output_path: str) -> TTSVitsExportConfig:
