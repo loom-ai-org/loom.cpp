@@ -119,10 +119,22 @@ def _toy_registry() -> TaskRegistry:
     return registry
 
 
-def test_registering_the_same_task_twice_raises():
+def test_registering_the_same_task_with_a_different_config_class_raises():
+    """Two families sharing one task (the common case -- e.g. `"tts-multi-phase"` for Kokoro/StyleTTS2/
+    VITS) must agree on what LoomExportConfig subclass that task builds; disagreeing is a real bug."""
     registry = _toy_registry()
-    with pytest.raises(ValueError, match="already registered"):
-        registry.register(TaskRegistryEntry(task="toy-task", config_class=object, recognizers=[]))
+    with pytest.raises(ValueError, match="disagree"):
+        registry.register(TaskRegistryEntry(task="toy-task", config_class=str, recognizers=[]))
+
+
+def test_registering_the_same_task_with_the_same_config_class_extends_recognizers():
+    registry = _toy_registry()
+    registry.register(TaskRegistryEntry(
+        task="toy-task", config_class=object,
+        recognizers=[ModelRecognizer(name="c", detect=lambda p: p.name == "c", build_config=lambda p, o: ("c", o))],
+    ))
+    assert {r.name for r in registry._entries["toy-task"].recognizers} == {"a", "b", "c"}
+    assert registry.get("toy-task", "c").name == "c"
 
 
 def test_detect_finds_the_one_real_match(tmp_path):

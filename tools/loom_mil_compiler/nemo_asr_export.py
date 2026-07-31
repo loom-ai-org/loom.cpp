@@ -1,6 +1,6 @@
 """Generalizes the "NeMo ASR encoder" export family -- the third family template, alongside
-`modular_export.py`'s `ModularExportSpec` (decoder-LLMs) and `iterative_export.py`'s
-`IterativeRefinementSpec` (Euler-CFM samplers).
+`modular_export.py`'s `ModularExportSpec` (decoder-LLMs) and `flow_matching_export.py`'s
+`FlowMatchingSpec` (Euler-CFM samplers).
 
 `export_conformer_ctc_mil.py` (93 lines), `export_parakeet_tdt_mil.py` (97) and
 `export_parakeet_rnnt_mil.py` (91) were three near-identical scripts: mock out transformers' version

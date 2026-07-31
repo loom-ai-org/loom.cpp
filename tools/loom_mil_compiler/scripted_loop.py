@@ -28,7 +28,7 @@ list and so cannot contain a loop at all; a `while_loop` is only consumable on t
 (`exporter.transpile_operation` lowers `while_loop` to a Lua `While`/`Break`), which transpiles the loop
 body op-by-op into host Lua -- fine for scalar bookkeeping, not for a tensor estimator network. Making a
 `while_loop` body become its own callable topology is real unimplemented work. Until then the host-side
-loop (`iterative_export.py`) is the better shape anyway: it supports a runtime step count, which
+loop (`flow_matching_export.py`) is the better shape anyway: it supports a runtime step count, which
 constraint 1 above says this path cannot. See BACKEND.md for the full comparison.
 """
 import numpy as np

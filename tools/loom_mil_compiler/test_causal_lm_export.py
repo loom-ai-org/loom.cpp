@@ -1,9 +1,14 @@
 """Regression check for BACKLOG.md P3.1's causal-LM family (`causal_lm_export.py`).
 
 `LMMonolithicCausalModelExportConfig` is exercised for real every time `export_hf_causal_lm.py`'s own
-`export_causal_lm()` runs (it's a thin shim over the class now) -- `export_qwen3_mil.py` and
-`export_lfm2_monolithic.py` both already go through it, so re-running either and snapshot-diffing
-against a pre-P3.1 baseline is real coverage on its own (see BACKLOG.md's P3.1 gate).
+`export_causal_lm()` runs (it's a thin shim over the class now) -- `export_lfm2_monolithic.py` already
+goes through it, so re-running it and snapshot-diffing against a pre-P3.1 baseline is real coverage on
+its own (see BACKLOG.md's P3.1 gate). `export_qwen3_mil.py` was the other original caller, but P3.2
+deleted it (replaced by the `causal-lm`/`qwen3` registry entry) -- `test_qwen3_registry_entry_matches_direct_construction`
+below is what replaced the "diff against the old script" check for Qwen3 specifically, since there's no
+longer an independent old script to diff against; the registry path is now the ONLY path, so the
+regression risk left worth guarding is the registry's own factory silently drifting from a direct
+construction of the same class.
 
 `LMModularCausalModelExportConfig`, on the other hand, has no real caller yet: `export_lfm2_modular.py`
 still calls `modular_export.export_modular` directly and is NOT migrated this pass (confirmed scope --
@@ -92,21 +97,24 @@ def test_modular_causal_model_export_config_matches_export_lfm2_modular(tmp_path
 
 
 @pytest.mark.skipif(not QWEN3_DIR.exists(), reason="Qwen3 checkpoint not available locally")
-def test_monolithic_causal_model_export_config_matches_export_qwen3_mil(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    _run_script_main("export_qwen3_mil")
-    old_gguf = tmp_path / "qwen3_0.6b_mil_monolithic.gguf"
-    assert old_gguf.exists()
+def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
+    """`export_qwen3_mil.py` (the original oracle this test compared against) was deleted in P3.2 --
+    the `causal-lm`/`qwen3` registry entry is now the only path, so there is no independent old script
+    left to diff against. What's still worth guarding: `registry.py`'s own `_build_qwen3` factory
+    silently drifting from constructing `LMMonolithicCausalModelExportConfig` directly with the same
+    parameters (e.g. someone edits one call site and not the other)."""
+    from loom_mil_compiler.registry import default_registry
 
-    new_gguf = tmp_path / "qwen3_0.6b_mil_monolithic_new.gguf"
+    registry = default_registry()
+    via_registry_gguf = tmp_path / "qwen3_via_registry.gguf"
+    registry.get("causal-lm", "qwen3").build_config(QWEN3_DIR, str(via_registry_gguf)).export()
+
+    direct_gguf = tmp_path / "qwen3_direct.gguf"
     LMMonolithicCausalModelExportConfig(
-        architecture="qwen3",
-        output_path=str(new_gguf),
-        profile="monolithic",
-        model_dir=str(QWEN3_DIR),
+        architecture="qwen3", output_path=str(direct_gguf), profile="monolithic", model_dir=str(QWEN3_DIR),
     ).export()
 
     snap_dir = tmp_path / "snap"
-    old_snap = _snapshot_dir(old_gguf, snap_dir)
-    new_snap = _snapshot_dir(new_gguf, snap_dir)
-    _assert_snapshots_match(old_snap, new_snap)
+    via_registry_snap = _snapshot_dir(via_registry_gguf, snap_dir)
+    direct_snap = _snapshot_dir(direct_gguf, snap_dir)
+    _assert_snapshots_match(via_registry_snap, direct_snap)

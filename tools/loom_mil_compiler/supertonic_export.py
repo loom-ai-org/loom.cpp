@@ -1,12 +1,12 @@
-#!/usr/bin/env python3
 """Export the real SupertonicTTS v2 checkpoint (`assets/pt/*.pt`, full pickled `nn.Module`s -- `torch.save
 (self, path)`, so `torch.load(..., weights_only=False)` returns an ALREADY-CONSTRUCTED real module
-directly, no hyperparameter guessing/reconstruction needed, unlike Matcha's checkpoint format) through the
-generic MIL exporter, tracing the REAL `supertonic_tts.models.modules.*` submodules directly -- not the
-hand-built bespoke topology `tools/convert_supertonic/convert_supertonic_*.py` constructs op-by-op via its
-own `TopologyBuilder` DSL (that bespoke conversion's own `supertonic_common.py` was invaluable here as an
-independently-derived oracle for cross-checking every architectural quirk found while reading source, even
-though this script doesn't reuse any of its op-building code).
+directly, no hyperparameter guessing/reconstruction needed, unlike Matcha's checkpoint format) through
+`TTSSupertonicExportConfig` (BACKLOG.md P3.3, migrated from `export_supertonic_mil.py`), tracing the REAL
+`supertonic_tts.models.modules.*` submodules directly -- not the hand-built bespoke topology
+`tools/convert_supertonic/convert_supertonic_*.py` constructs op-by-op via its own `TopologyBuilder` DSL
+(that bespoke conversion's own `supertonic_common.py` was invaluable here as an independently-derived
+oracle for cross-checking every architectural quirk found while reading source, even though this module
+doesn't reuse any of its op-building code).
 
 Four topologies (same names/roles `loom::SupertonicDriver`/`supertonic_driver.lua` already established --
 real `SpeechGenerator.predict()` never calls the two style encoders itself, always taking PRECOMPUTED style
@@ -14,8 +14,9 @@ embeddings, so those are out of scope here too):
   - dp:        real `DurationPredictor.forward(txt_ids, stl_emb, txt_msk)` -> scalar duration (seconds).
   - ttl_text:  real `TTLTextEncoder.forward(txt_ids, stl_emb, txt_msk)` -> txt_emb, ne=[T_TEXT,256].
   - vfe:       real `VectorFieldEstimator.compute_velocity(z_t, txt_emb, stl_emb, lat_msk, txt_msk, t)` --
-               ONE Euler velocity evaluation (the `z += v*dt` update itself stays on the Lua/host side,
-               matching supertonic_driver.lua's existing convention).
+               ONE Euler velocity evaluation (the `z += v*dt` update itself is the Euler sampler
+               `TTSFlowMatchingModelExportConfig` generates, matching `supertonic_driver.lua`'s existing
+               convention).
   - decoder:   real `SpeechDecoder.forward(latent)` -> flat waveform.
 
 Text-length scope limitation (REAL, carried forward from the bespoke conversion, not a new one introduced
@@ -59,24 +60,23 @@ Trace-friendliness patches needed (same category as every prior MIL export in th
     dilation parameter correctly, confirmed by inspection (`src/ops/primitives_conv.cpp`), not newly added
     here.
 
+No import-order stub needed for this checkpoint format -- the four `.pt` files are fully pickled
+`nn.Module`s, and `supertonic_tts` is a plain installed package (no version-pin issue like Kokoro's/
+Matcha's transformers/huggingface_hub dependencies), so there's no `ModelPatcher` subclass here.
+
 Usage:
-  ~/.venvs/piper/bin/python3 export_supertonic_mil.py
+  loom-export /path/to/supertonic/assets/pt -o supertonic_mil.gguf --task tts-flow-matching --model supertonic
 """
-import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
+import coremltools as ct
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
-import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
-from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
-from loom_mil_compiler.iterative_export import IterativeRefinementSpec, render_driver  # noqa: E402
-
-import coremltools as ct  # noqa: E402
-
-SUPERTONIC_ROOT = Path("/home/flavio/Dev/supertonic-tts")
-PT_DIR = SUPERTONIC_ROOT / "assets" / "pt"
+from .flow_matching_export import FlowMatchingSpec
+from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
 
 T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fixed exactly
 
@@ -153,100 +153,111 @@ class DecoderWrapper(torch.nn.Module):
         return wav.reshape(-1)
 
 
-def _build_topology(wrapper, dummy_args, mil_inputs, name):
-    """Mirrors export_matcha_mil.py's own helper of the same name/reasoning: traces `wrapper`, converts to
-    MIL, runs it through the exporter far enough to get back its topology JSON + weight dict WITHOUT
-    writing a file (per-phase `func_name` namespacing avoids cross-phase weight-name collisions)."""
-    traced = torch.jit.trace(wrapper, dummy_args)
-    mil_prog = ct.convert(
-        traced, inputs=mil_inputs, convert_to="milinternal", compute_precision=ct.precision.FLOAT32,
-    )
-    exporter = LoomGGUFExporter(mil_prog)
-    main_func = mil_prog.functions["main"]
-    topo = exporter.generate_graph_topology(main_func, name)
-    print(f"  {name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
-
-
-def load_pt(name):
-    mod = torch.load(PT_DIR / name, weights_only=False, map_location="cpu")
+def _load_pt(pt_dir: Path, name: str):
+    mod = torch.load(pt_dir / name, weights_only=False, map_location="cpu")
     mod.eval()
     return mod
 
 
-def main():
-    print(f"Loading SupertonicTTS checkpoints from {PT_DIR}...")
-    dp = load_pt("duration_predictor.pt")
-    te = load_pt("text_encoder.pt")
-    vfe = load_pt("vector_estimator.pt")
-    dec = load_pt("vocoder.pt")
+@dataclass(kw_only=True)
+class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
+    """SupertonicTTS's own four-phase split (dp/ttl_text/vfe/decoder) plus the Euler CFM sampler over
+    `vfe` -- see module docstring. `model_dir` is the `assets/pt` directory containing all four real
+    checkpoint files."""
 
-    torch.manual_seed(0)
-    dummy_txt_ids = torch.randint(1, 163, (1, T_TEXT_FIXED), dtype=torch.int64)
-    dummy_dp_stl = torch.randn(1, 8, 16)
-    dummy_ttl_stl = torch.randn(1, 50, 256)
+    model_dir: str
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_supertonic" / "supertonic_driver_mil.lua"
 
-    print("Tracing DurationPredictor...")
-    dp_topo, dp_weights = _build_topology(
-        DPWrapper(dp).eval(), (dummy_txt_ids, dummy_dp_stl),
-        [ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
-         ct.TensorType(name="stl_emb", shape=(1, 8, 16), dtype=np.float32)], "dp",
-    )
+    def phases(self) -> List[ExportPhase]:
+        pt_dir = Path(self.model_dir)
+        print(f"Loading SupertonicTTS checkpoints from {pt_dir}...")
+        dp = _load_pt(pt_dir, "duration_predictor.pt")
+        te = _load_pt(pt_dir, "text_encoder.pt")
+        vfe = _load_pt(pt_dir, "vector_estimator.pt")
+        dec = _load_pt(pt_dir, "vocoder.pt")
 
-    print("Tracing TTLTextEncoder...")
-    ttl_topo, ttl_weights = _build_topology(
-        TTLTextWrapper(te).eval(), (dummy_txt_ids, dummy_ttl_stl),
-        [ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
-         ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32)], "ttl_text",
-    )
+        torch.manual_seed(0)
+        dummy_txt_ids = torch.randint(1, 163, (1, T_TEXT_FIXED), dtype=torch.int64)
+        dummy_dp_stl = torch.randn(1, 8, 16)
+        dummy_ttl_stl = torch.randn(1, 50, 256)
 
-    print("Tracing VectorFieldEstimator...")
-    lat_seq_dim = ct.RangeDim(1, 512)
-    dummy_L = 9
-    dummy_z = torch.randn(1, 144, dummy_L)
-    dummy_txt_emb = torch.randn(1, 256, T_TEXT_FIXED)
-    dummy_t = torch.tensor([0.3])
-    vfe_topo, vfe_weights = _build_topology(
-        VFEWrapper(vfe).eval(), (dummy_z, dummy_txt_emb, dummy_ttl_stl, dummy_t),
-        [ct.TensorType(name="z_t", shape=(1, 144, lat_seq_dim), dtype=np.float32),
-         ct.TensorType(name="txt_emb", shape=(1, 256, T_TEXT_FIXED), dtype=np.float32),
-         ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
-         ct.TensorType(name="t", shape=(1,), dtype=np.float32)], "vfe",
-    )
+        print("Tracing DurationPredictor...")
+        dp_phase = ExportPhase(
+            name="dp", wrapper=DPWrapper(dp).eval(), dummy_inputs=(dummy_txt_ids, dummy_dp_stl),
+            mil_inputs=[
+                ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
+                ct.TensorType(name="stl_emb", shape=(1, 8, 16), dtype=np.float32),
+            ],
+        )
 
-    print("Tracing SpeechDecoder...")
-    dec_seq_dim = ct.RangeDim(1, 512)
-    dummy_latent = torch.randn(1, 144, 4)
-    decoder_topo, decoder_weights = _build_topology(
-        DecoderWrapper(dec).eval(), (dummy_latent,),
-        [ct.TensorType(name="latent", shape=(1, 144, dec_seq_dim), dtype=np.float32)], "decoder",
-    )
+        print("Tracing TTLTextEncoder...")
+        ttl_phase = ExportPhase(
+            name="ttl_text", wrapper=TTLTextWrapper(te).eval(), dummy_inputs=(dummy_txt_ids, dummy_ttl_stl),
+            mil_inputs=[
+                ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
+                ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
+            ],
+        )
 
-    merged_weights = {**dp_weights, **ttl_weights, **vfe_weights, **decoder_weights}
-    assert len(merged_weights) == len(dp_weights) + len(ttl_weights) + len(vfe_weights) + len(decoder_weights)
+        print("Tracing VectorFieldEstimator...")
+        lat_seq_dim = ct.RangeDim(1, 512)
+        dummy_L = 9
+        dummy_z = torch.randn(1, 144, dummy_L)
+        dummy_txt_emb = torch.randn(1, 256, T_TEXT_FIXED)
+        dummy_t = torch.tensor([0.3])
+        vfe_phase = ExportPhase(
+            name="vfe", wrapper=VFEWrapper(vfe).eval(),
+            dummy_inputs=(dummy_z, dummy_txt_emb, dummy_ttl_stl, dummy_t),
+            mil_inputs=[
+                ct.TensorType(name="z_t", shape=(1, 144, lat_seq_dim), dtype=np.float32),
+                ct.TensorType(name="txt_emb", shape=(1, 256, T_TEXT_FIXED), dtype=np.float32),
+                ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
+                ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+            ],
+        )
 
-    driver_script_path = Path(__file__).parent / "tools" / "convert_supertonic" / "supertonic_driver_mil.lua"
+        print("Tracing SpeechDecoder...")
+        dec_seq_dim = ct.RangeDim(1, 512)
+        dummy_latent = torch.randn(1, 144, 4)
+        decoder_phase = ExportPhase(
+            name="decoder", wrapper=DecoderWrapper(dec).eval(), dummy_inputs=(dummy_latent,),
+            mil_inputs=[ct.TensorType(name="latent", shape=(1, 144, dec_seq_dim), dtype=np.float32)],
+        )
 
-    out_exporter = LoomGGUFExporter(None, output_path="supertonic_mil.gguf", architecture="supertonic_mil")
-    out_exporter.topologies = {"dp": dp_topo, "ttl_text": ttl_topo, "vfe": vfe_topo, "decoder": decoder_topo}
-    out_exporter.weights = merged_weights
+        return [dp_phase, ttl_phase, vfe_phase, decoder_phase]
 
-    # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the estimator,
-    # the loop-carried input's name, and the per-step-constant inputs differ.
-    cfm_sampler = IterativeRefinementSpec(
-        func_name="sample_vfe",
-        estimator="vfe",
-        carried_input="z_t",
-        time_input="t",
-        fixed_inputs=["txt_emb", "stl_emb"],
-        note="Deterministic Euler CFM sampling over SupertonicTTS's VectorFieldEstimator:\n"
-              "z <- z + v(z, txt_emb, stl_emb, t) * dt, uniform dt = 1/n_steps.",
-    )
-    driver_source = render_driver(driver_script_path.read_text(), [cfm_sampler],
-                                   topologies=out_exporter.topologies)
-    out_exporter.write_gguf(driver_source)
-    print("wrote supertonic_mil.gguf")
+    def samplers(self) -> List[FlowMatchingSpec]:
+        # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the
+        # estimator, the loop-carried input's name, and the per-step-constant inputs differ.
+        return [FlowMatchingSpec(
+            func_name="sample_vfe",
+            estimator="vfe",
+            carried_input="z_t",
+            time_input="t",
+            fixed_inputs=["txt_emb", "stl_emb"],
+            note="Deterministic Euler CFM sampling over SupertonicTTS's VectorFieldEstimator:\n"
+                 "z <- z + v(z, txt_emb, stl_emb, t) * dt, uniform dt = 1/n_steps.",
+        )]
 
 
-if __name__ == "__main__":
-    main()
+def _is_supertonic(path: Path) -> bool:
+    """No auto-detection this pass -- requires an explicit `--task tts-flow-matching --model supertonic`
+    (BACKLOG.md P3.3's stated scope limit). This checkpoint format (a directory of fully pickled
+    `nn.Module`s, `torch.save(self, path)`) is distinctively unlike every other family's plain state-dict
+    checkpoint -- worth a real `detect()` later (e.g. checking the directory contains the four expected
+    `.pt` filenames), just not implemented this pass."""
+    return False
+
+
+def _build_supertonic(path: Path, output_path: str) -> TTSSupertonicExportConfig:
+    return TTSSupertonicExportConfig(architecture="supertonic_mil", output_path=output_path, model_dir=str(path))
+
+
+def register(registry) -> None:
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="tts-flow-matching",
+        config_class=TTSFlowMatchingModelExportConfig,
+        recognizers=[ModelRecognizer(name="supertonic", detect=_is_supertonic, build_config=_build_supertonic)],
+    ))

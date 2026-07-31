@@ -1,6 +1,10 @@
-"""Generalizes the "N-step iterative refinement over loop-carried tensor state" driver family --
-EXPORT-IMPROVEMENT.md item 4, the second family template alongside `modular_export.py`'s
-`ModularExportSpec`.
+"""Generalizes the "Euler integration of a learned vector field over loop-carried tensor state" driver
+family -- EXPORT-IMPROVEMENT.md item 4, the second family template alongside `modular_export.py`'s
+`ModularExportSpec`. Renamed from `IterativeRefinementSpec`/`iterative_export.py` (BACKLOG.md P3.3):
+what this declares is flow matching specifically (Matcha's own code calls its sampler "CFM"/Conditional
+Flow Matching; Supertonic's estimator is literally `VectorFieldEstimator.compute_velocity`), not generic
+"iterative refinement" -- a name that would blur why StyleTTS2's real diffusion sampler (ADPM2, see
+below) is deliberately NOT part of this family.
 
 Matcha-TTS and SupertonicTTS are not two unrelated problems: both trace a per-step *estimator* network
 into one topology and then integrate it host-side with forward Euler over a loop-carried state tensor,
@@ -14,7 +18,7 @@ and both hand-wrote the identical Lua loop to do it:
         for i = 1, #z do z[i] = z[i] + v[i] * dt end
     end
 
-An `IterativeRefinementSpec` declares the six things that actually differ between them -- the estimator
+A `FlowMatchingSpec` declares the six things that actually differ between them -- the estimator
 topology's name, which of its inputs carries the state, which carries the scalar time, which are fixed
 across steps, how many elements the state has, and what `n_tokens` to build the estimator's graph at --
 and `render_sampler` emits that loop as a named Lua function the hand-written driver calls in one line.
@@ -47,7 +51,7 @@ from typing import Optional
 class EstimatorSpec:
     """One traced per-step network a driver calls, plus the exact set of topology inputs it is handed.
 
-    Separate from `IterativeRefinementSpec` because the *validation* generalizes further than the
+    Separate from `FlowMatchingSpec` because the *validation* generalizes further than the
     *codegen* does. StyleTTS2's diffusion sampler is ADPM2 over a Karras sigma schedule -- two network
     evaluations per step, per-step noise injection, and real preconditioning math
     (`c_skip`/`c_out`/`c_in`/`c_noise`) wrapped around the call -- so no template can emit its loop
@@ -76,7 +80,7 @@ class EstimatorSpec:
 
 
 @dataclass
-class IterativeRefinementSpec:
+class FlowMatchingSpec:
     """Declares one "sample by integrating an estimator network N times" driver phase.
 
     `func_name` is the Lua function `render_sampler` emits; the driver calls it as
@@ -109,10 +113,10 @@ class IterativeRefinementSpec:
 
     def validate_against_topology(self, topology: dict):
         self.estimator_spec().validate_against_topology(
-            topology, label=f"IterativeRefinementSpec({self.func_name!r})")
+            topology, label=f"FlowMatchingSpec({self.func_name!r})")
 
 
-def render_sampler(spec: IterativeRefinementSpec) -> str:
+def render_sampler(spec: FlowMatchingSpec) -> str:
     """The Lua source for `spec`'s sampler function.
 
     Emits deterministic forward-Euler integration: `z_{k+1} = z_k + v(z_k, t_k) * dt` with
@@ -125,7 +129,7 @@ def render_sampler(spec: IterativeRefinementSpec) -> str:
         for para in spec.note.strip().splitlines():
             lines.append(f"-- {para.rstrip()}")
     lines += [
-        "-- Generated from IterativeRefinementSpec (tools/loom_mil_compiler/iterative_export.py):",
+        "-- Generated from FlowMatchingSpec (tools/loom_mil_compiler/flow_matching_export.py):",
         f'--   estimator="{spec.estimator}", carried="{spec.carried_input}", '
         f'time="{spec.time_input}", fixed=[{fixed}]',
         f"local function {spec.func_name}(length, n_elems, n_steps, step_inputs)",
@@ -177,7 +181,7 @@ def render_driver(driver_source: str, specs=(), topologies=None, estimators=()) 
     """
     if topologies is not None:
         for spec in specs:
-            _check(spec, spec.estimator, topologies, f"IterativeRefinementSpec({spec.func_name!r})")
+            _check(spec, spec.estimator, topologies, f"FlowMatchingSpec({spec.func_name!r})")
         for spec in estimators:
             _check(spec, spec.topology, topologies, f"EstimatorSpec({spec.topology!r})")
     if not specs:

@@ -1,14 +1,12 @@
-#!/usr/bin/env python3
-"""
-Export a real piper/VITS checkpoint through the generic MIL exporter, tracing the REAL
-piper_train.vits.models.SynthesizerTrn submodules directly (TextEncoder, StochasticDurationPredictor,
-ResidualCouplingBlock, HiFi-GAN Generator) -- not the hand-built bespoke topology
-tools/convert_piper_vits/convert_vits.py constructs op-by-op via its own custom ggml primitives
-(CONV_FLOW_REVERSE, RESIDUAL_COUPLING_LAYER_REVERSE, DDS_CONV, ELEMENTWISE_AFFINE_REVERSE,
-REL_POS_ATTENTION_SHAW). See BACKLOG.md for the full trail of findings this script's own workarounds
-encode.
+"""Exports a real piper/VITS checkpoint through `TTSVitsExportConfig` (BACKLOG.md P3.3, migrated from
+`export_vits_mil.py`), tracing the REAL `piper_train.vits.models.SynthesizerTrn` submodules directly
+(TextEncoder, StochasticDurationPredictor, ResidualCouplingBlock, HiFi-GAN Generator) -- not the
+hand-built bespoke topology `tools/convert_piper_vits/convert_vits.py` constructs op-by-op via its own
+custom ggml primitives (CONV_FLOW_REVERSE, RESIDUAL_COUPLING_LAYER_REVERSE, DDS_CONV,
+ELEMENTWISE_AFFINE_REVERSE, REL_POS_ATTENTION_SHAW). See BACKLOG.md for the full trail of findings this
+module's own workarounds encode.
 
-Three phases, same split as the bespoke script (GraphTopology supports exactly one declared output per
+Three phases, same split as the bespoke script (`GraphTopology` supports exactly one declared output per
 topology, and the duration predictor's own output determines the total output frame count -- a genuinely
 data-dependent value the host must compute BEFORE phase 2 can run):
   - stats:        TextEncoder -> [m_p; logs_p] concatenated, T-fast (ne=[T, 2*inter_channels]).
@@ -30,43 +28,42 @@ all (see BACKLOG.md for the full writeups):
 One new custom op + MIL dialect translation: StochasticDurationPredictor's ConvFlow uses a boolean-mask-
 indexed rational-quadratic spline transform that `torch.jit.trace` cannot correctly capture (genuinely
 data-dependent output shape) -- bridged via `torch.ops.loom.spline_inverse`
-(tools/loom_mil_compiler/vits_spline_op.py) into MIL's `loom_spline` op (dialect.py, previously-unwired
-scaffolding from an earlier prototype) into the already-independently-verified RQ_SPLINE_INVERSE ggml
-primitive (src/ops/primitives_spline.cpp).
+(`vits_spline_op.py`, registered automatically by this package's own `__init__.py`) into MIL's
+`loom_spline` op (`dialect.py`) into the already-independently-verified RQ_SPLINE_INVERSE ggml primitive
+(`src/ops/primitives_spline.cpp`).
 
-Numerically verified against tools/convert_piper_vits/reference_forward_vits.py's real-checkpoint
+Numerically verified against `tools/convert_piper_vits/reference_forward_vits.py`'s real-checkpoint
 reference at T=62 ("Hello world, this is a test."): stats max abs diff ~3.3e-6 (m_p) / ~9.5e-7 (logs_p),
 logw max abs diff ~7.9e-6, flow_vocoder waveform max abs diff ~5.4e-8.
 
-NOT YET wired into loom::VitsDriver (src/core/vits_driver.cpp) -- its host glue currently assumes the
+NOT YET wired into `loom::VitsDriver` (`src/core/vits_driver.cpp`) -- its host glue currently assumes the
 bespoke topology's own tensor conventions (channel-fast `stats`, `logw`'s own emb_rel_k/v-based
-TextEncoder re-derivation), which differ from this script's simpler ones in at least the `stats` layout
+TextEncoder re-derivation), which differ from this module's simpler ones in at least the `stats` layout
 (T-fast here, channel-fast there). See BACKLOG.md for the itemized remaining integration work.
 
 Usage:
-  ~/.venvs/piper/bin/python3 export_vits_mil.py
+  loom-export /path/to/piper.ckpt -o vits_mil.gguf --task tts-multi-phase --model vits
 """
 import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import coremltools as ct
 
+from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+
 sys.path.insert(0, "/home/flavio/Dev/piper/src/python")
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools" / "convert_piper_vits"))
-import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches + spline op
-from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_piper_vits"))
 
 from piper_train.vits.models import SynthesizerTrn  # noqa: E402
 from piper_train.vits import modules as vits_modules  # noqa: E402
 from piper_train.vits.attentions import MultiHeadAttention  # noqa: E402
 from vits_common import load_piper_checkpoint  # noqa: E402
-
-CKPT_PATH = "/home/flavio/Dev/piper/pipertts_en-GB_miro/epoch=9772-step=1494014.ckpt"
 
 HP = dict(
     n_vocab=256, spec_channels=513, segment_size=8192,
@@ -210,8 +207,8 @@ def _text_encoder_forward(enc, tokens):
 def _conv_flow_reverse_traceable(flow, x, x_mask, g):
     """Real ConvFlow.forward's reverse branch, with the boolean-mask-indexed
     piecewise_rational_quadratic_transform call replaced by the loom.spline_inverse custom op (see
-    tools/loom_mil_compiler/vits_spline_op.py) -- everything else (pre/convs/proj, the reshape/permute
-    into per-bin logits) is the real, unmodified computation.
+    `vits_spline_op.py`) -- everything else (pre/convs/proj, the reshape/permute into per-bin logits) is
+    the real, unmodified computation.
     """
     x0, x1 = torch.split(x, [flow.half_channels] * 2, 1)
     h = flow.pre(x0)
@@ -301,82 +298,70 @@ class FlowVocoderWrapper(torch.nn.Module):
         return wav.reshape(-1)
 
 
-def _build_topology(wrapper, dummy_args, mil_inputs, name):
-    """Traces `wrapper`, converts to MIL, and runs it through the exporter far enough to get back its
-    topology JSON + weight dict WITHOUT writing a file -- three of these get merged into one combined
-    `vits_mil.gguf` below, mirroring tools/convert_piper_vits/convert_vits_lua_all.py's own "one file,
-    three named topologies + an embedded Lua driver" packing for the bespoke topology.
-
-    Deliberately does NOT use `apply_monolithic_export`/`profile="monolithic"` (what every other
-    `export_*_mil.py` script in this repo uses) -- that combo disables per-topology weight namespacing
-    (`func_name == "main_topo" or profile == "monolithic"`), correct for "one file per topology" but
-    wrong here: `generate_graph_topology` also serializes small internal constants under AUTO-GENERATED,
-    per-program-local SSA names (e.g. "_235") that trivially collide by coincidence across three
-    INDEPENDENTLY traced programs without meaning the same thing (confirmed: merging un-namespaced
-    weights raised a real "same name, different value" collision on the very first attempt). Passing a
-    real per-phase `func_name` (with `profile` left at its default `None`, so the namespacing condition
-    above is false) namespaces EVERY weight as `f"{name}.{weight_name}"`, avoiding the collision
-    entirely -- at the cost of `stats`/`logw`'s own genuinely-identical `enc_p.*` TextEncoder weights no
-    longer deduplicating across the two phases (both re-derive it from scratch, same "GraphTopology
-    supports one declared output" reasoning as the bespoke topology's own two-file split) the way
-    convert_vits_lua_all.py's own content-aware merge does -- a modest storage cost, not a correctness
-    concern, for a TextEncoder this small (192 hidden, 6 layers).
+@dataclass(kw_only=True)
+class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
+    """VITS's own three-phase split (stats/logw/flow_vocoder) -- see module docstring. `phases()` loads
+    the real checkpoint once per call, mirroring the original script's `main()` (load once, build all
+    three phases off the one loaded model instance).
     """
-    traced = torch.jit.trace(wrapper, dummy_args)
-    mil_prog = ct.convert(
-        traced, inputs=mil_inputs, convert_to="milinternal", compute_precision=ct.precision.FLOAT32,
-    )
-    exporter = LoomGGUFExporter(mil_prog)
-    main_func = mil_prog.functions["main"]
-    topo = exporter.generate_graph_topology(main_func, name)
-    print(f"  {name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
+
+    checkpoint_path: str
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_piper_vits" / "vits_driver_mil.lua"
+    dummy_t: int = 42
+
+    def phases(self) -> List[ExportPhase]:
+        print(f"Loading checkpoint {self.checkpoint_path}...")
+        full_sd = load_piper_checkpoint(self.checkpoint_path)
+        sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
+
+        model = SynthesizerTrn(**HP)
+        missing, unexpected = model.load_state_dict(sd, strict=True)
+        assert not missing and not unexpected, (missing, unexpected)
+        model.eval()
+
+        seq_dim = ct.RangeDim(1, 512)
+        dummy_tokens = torch.randint(1, HP["n_vocab"], (1, self.dummy_t), dtype=torch.long)
+        dummy_z_noise = torch.randn(1, 2, self.dummy_t) * 0.8
+        dummy_zp = torch.randn(1, HP["inter_channels"], 8) * 0.5
+
+        print("Tracing all three phases...")
+        return [
+            ExportPhase(
+                name="stats", wrapper=StatsWrapper(model.enc_p).eval(), dummy_inputs=(dummy_tokens,),
+                mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)],
+            ),
+            ExportPhase(
+                name="logw", wrapper=LogwWrapper(model.enc_p, model.dp).eval(),
+                dummy_inputs=(dummy_tokens, dummy_z_noise),
+                mil_inputs=[
+                    ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32),
+                    ct.TensorType(name="z_noise", shape=(1, 2, seq_dim), dtype=np.float32),
+                ],
+            ),
+            ExportPhase(
+                name="flow_vocoder", wrapper=FlowVocoderWrapper(model.flow, model.dec).eval(),
+                dummy_inputs=(dummy_zp,),
+                mil_inputs=[ct.TensorType(name="z_p", shape=(1, HP["inter_channels"], seq_dim), dtype=np.float32)],
+            ),
+        ]
 
 
-def main():
-    print(f"Loading checkpoint {CKPT_PATH}...")
-    full_sd = load_piper_checkpoint(CKPT_PATH)
-    sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
-
-    model = SynthesizerTrn(**HP)
-    missing, unexpected = model.load_state_dict(sd, strict=True)
-    assert not missing and not unexpected, (missing, unexpected)
-    model.eval()
-
-    dummy_T = 42
-    dummy_tokens = torch.randint(1, HP["n_vocab"], (1, dummy_T), dtype=torch.long)
-    seq_dim = ct.RangeDim(1, 512)
-
-    print("Tracing all three phases...")
-    stats_topo, stats_weights = _build_topology(
-        StatsWrapper(model.enc_p).eval(), (dummy_tokens,),
-        [ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)], "stats",
-    )
-    dummy_z_noise = torch.randn(1, 2, dummy_T) * 0.8
-    logw_topo, logw_weights = _build_topology(
-        LogwWrapper(model.enc_p, model.dp).eval(), (dummy_tokens, dummy_z_noise),
-        [ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32),
-         ct.TensorType(name="z_noise", shape=(1, 2, seq_dim), dtype=np.float32)], "logw",
-    )
-    dummy_zp = torch.randn(1, HP["inter_channels"], 8) * 0.5
-    flow_vocoder_topo, flow_vocoder_weights = _build_topology(
-        FlowVocoderWrapper(model.flow, model.dec).eval(), (dummy_zp,),
-        [ct.TensorType(name="z_p", shape=(1, HP["inter_channels"], seq_dim), dtype=np.float32)],
-        "flow_vocoder",
-    )
-
-    # Every weight is already namespaced per-phase (see _build_topology's own docstring for why) -- a
-    # plain dict union can't collide.
-    merged_weights = {**stats_weights, **logw_weights, **flow_vocoder_weights}
-    assert len(merged_weights) == len(stats_weights) + len(logw_weights) + len(flow_vocoder_weights)
-
-    driver_script_path = Path(__file__).parent / "tools" / "convert_piper_vits" / "vits_driver_mil.lua"
-
-    out_exporter = LoomGGUFExporter(None, output_path="vits_mil.gguf", architecture="vits_mil")
-    out_exporter.topologies = {"stats": stats_topo, "logw": logw_topo, "flow_vocoder": flow_vocoder_topo}
-    out_exporter.weights = merged_weights
-    out_exporter.write_gguf(driver_script_path.read_text())
+def _is_vits(path: Path) -> bool:
+    """No self-describing config for this checkpoint format (a raw piper Lightning `.ckpt`) -- always
+    False, requiring an explicit `--task tts-multi-phase --model vits` (BACKLOG.md P3.3's stated scope
+    limit, same as `optimum` itself needing `--task` for sufficiently custom architectures)."""
+    return False
 
 
-if __name__ == "__main__":
-    main()
+def _build_vits(path: Path, output_path: str) -> TTSVitsExportConfig:
+    return TTSVitsExportConfig(architecture="vits_mil", output_path=output_path, checkpoint_path=str(path))
+
+
+def register(registry) -> None:
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="tts-multi-phase",
+        config_class=BaseMultiPhaseModelExportConfig,
+        recognizers=[ModelRecognizer(name="vits", detect=_is_vits, build_config=_build_vits)],
+    ))

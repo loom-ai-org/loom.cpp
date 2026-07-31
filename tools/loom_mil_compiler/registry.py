@@ -46,9 +46,22 @@ class TaskRegistry:
         self._entries: Dict[str, TaskRegistryEntry] = {}
 
     def register(self, entry: TaskRegistryEntry) -> None:
-        if entry.task in self._entries:
-            raise ValueError(f"task {entry.task!r} is already registered")
-        self._entries[entry.task] = entry
+        """Registers `entry`'s recognizers under its task -- creates the task if new, or extends an
+        existing one's recognizer list if not. Multiple family modules legitimately share one task
+        (e.g. `"tts-multi-phase"`: Kokoro, StyleTTS2, and VITS are all `BaseMultiPhaseModelExportConfig`
+        instances, each contributing its own recognizer), so a second `register()` call for an
+        already-known task is expected, not an error -- unless it disagrees about which config class
+        the task builds, which would mean two families are colliding on one task name by mistake."""
+        existing = self._entries.get(entry.task)
+        if existing is None:
+            self._entries[entry.task] = entry
+            return
+        if existing.config_class is not entry.config_class:
+            raise ValueError(
+                f"task {entry.task!r} already registered with config_class {existing.config_class!r}, "
+                f"got {entry.config_class!r} -- two families disagree on what this task builds"
+            )
+        existing.recognizers.extend(entry.recognizers)
 
     def _candidates(self, task: Optional[str]):
         if task is not None:
@@ -100,7 +113,17 @@ def default_registry() -> TaskRegistry:
     registry = TaskRegistry()
     from . import causal_lm_export
     from . import nemo_asr_export
+    from . import kokoro_export
+    from . import matcha_export
+    from . import styletts2_export
+    from . import supertonic_export
+    from . import vits_export
 
     causal_lm_export.register(registry)
     nemo_asr_export.register(registry)
+    kokoro_export.register(registry)
+    matcha_export.register(registry)
+    styletts2_export.register(registry)
+    supertonic_export.register(registry)
+    vits_export.register(registry)
     return registry
