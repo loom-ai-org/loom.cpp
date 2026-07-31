@@ -53,5 +53,5 @@ class LoomExportConfig:
 
     def backend_kwargs(self) -> dict:
         """Extra keyword arguments for `LoomGGUFBackend.__call__` beyond `output_path`/`architecture`
-        (tokenizer paths, quantization, `root_axis`, `profile`). Empty by default."""
+        (tokenizer paths, quantization, `root_axis`, `flat_namespace`). Empty by default."""
         return {}

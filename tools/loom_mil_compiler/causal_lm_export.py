@@ -2,7 +2,7 @@
 `LMCausalModelExportConfig`, whose `decomposition` field says whether a checkpoint exports as one
 flattened trace (`Flattened()` -- Qwen3, LFM2-monolithic) or as independently-traced submodules
 assembled per a `ModularExportSpec` (`Modular(spec=...)` -- LFM2-modular, EXPORT-ROADMAP.md R7's
-"modular" profile).
+"modular" split).
 
 P3.1 built these as two sibling classes, which is what BACKLOG.md P4.0.3 came back to fix: the two forms
 differ in how the program is assembled, not in what a causal-LM config knows, and LFM2 exports BOTH ways
@@ -141,13 +141,13 @@ class LMCausalModelExportConfig(LoomExportConfig):
             tokenizer_dir=self.tokenizer_dir or self.model_dir,
             tokenizer_pre=self.tokenizer_pre,
         )
-        # Only the flattened form declares these: `profile="monolithic"` is what flattens the weight
-        # namespace (topology_ops.py reads it in 8 places, see BACKLOG.md P4.0.3), and the modular
-        # path's per-submodule functions must keep their `{func_name}.` prefixes. `tokenizer_family` /
+        # Only the flattened form declares these: `flat_namespace` writes every weight under one flat
+        # name, which is right for a single-topology export and wrong for the modular path, whose
+        # per-submodule functions must keep their `{func_name}.` prefixes. `tokenizer_family` /
         # `quantize` likewise were never passed by the modular export.
         if isinstance(self.decomposition, Flattened):
             kwargs.update(
-                profile="monolithic",
+                flat_namespace=True,
                 tokenizer_family=self.tokenizer_family,
                 quantize=self.quantize,
             )

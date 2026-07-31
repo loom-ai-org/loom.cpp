@@ -189,8 +189,8 @@ def _op_const(self, op, ctx):
             break
         val = arr
 
-    # For monolithic profiles, skip namespace prefixing
-    if func_name == "main_topo" or self.profile == "monolithic":
+    # A flat-namespace export (and `main_topo` itself) writes weights unprefixed
+    if func_name == "main_topo" or self.flat_namespace:
         namespaced_name = weight_name
     else:
         namespaced_name = f"{func_name}.{weight_name}"
@@ -381,7 +381,7 @@ def _op_gelu_tanh_approx(self, op, ctx):
     # approximate-GELU model hits this same fused op), not Albert-specific.
     x_name = resolve(self.safe_name(x_var_obj.name))
     out_name = self.safe_name(op.outputs[0].name)
-    one_name = "gelu_tanh_approx.one" if (func_name == "main_topo" or self.profile == "monolithic") \
+    one_name = "gelu_tanh_approx.one" if (func_name == "main_topo" or self.flat_namespace) \
         else f"{func_name}.gelu_tanh_approx.one"
     if one_name not in self.weights:
         self.weights[one_name] = np.array([1.0], dtype=np.float32)
@@ -475,7 +475,7 @@ def _op_reverse(self, op, ctx):
     axis_size = int(axis_size_raw)
 
     idx_name = output_var + "_reverse_idx"
-    if func_name == "main_topo" or self.profile == "monolithic":
+    if func_name == "main_topo" or self.flat_namespace:
         idx_full = idx_name
     else:
         idx_full = f"{func_name}.{idx_name}"
@@ -626,7 +626,7 @@ def _op_loom_spline(self, op, ctx):
 
     bdc_name = output_var + "_boundary_deriv_const"
     eps_name = output_var + "_eps_bump"
-    if func_name == "main_topo" or self.profile == "monolithic":
+    if func_name == "main_topo" or self.flat_namespace:
         bdc_full, eps_full = bdc_name, eps_name
     else:
         bdc_full, eps_full = f"{func_name}.{bdc_name}", f"{func_name}.{eps_name}"
@@ -864,7 +864,7 @@ def _op_fill(self, op, ctx):
         rank = len(target_shape)
 
         weight_name = self.safe_name(op.outputs[0].name) + "_fill_scalar"
-        if func_name == "main_topo" or self.profile == "monolithic":
+        if func_name == "main_topo" or self.flat_namespace:
             namespaced_name = weight_name
         else:
             namespaced_name = f"{func_name}.{weight_name}"
@@ -2022,7 +2022,7 @@ def _op_loom_conv_transpose_dw(self, op, ctx):
     weight_val = static_value(weight_var_obj)
     flipped = np.ascontiguousarray(np.asarray(weight_val)[:, :, ::-1])
     flipped_name = self.safe_name(weight_var_obj.name) + "_dwt_flip"
-    if func_name == "main_topo" or self.profile == "monolithic":
+    if func_name == "main_topo" or self.flat_namespace:
         namespaced_flipped = flipped_name
     else:
         namespaced_flipped = f"{func_name}.{flipped_name}"
@@ -2214,7 +2214,7 @@ def _op_less_always_valid(self, op, ctx):
     target_shape = list(out_info["shape"])
     rank = len(target_shape)
     weight_name = self.safe_name(op.outputs[0].name) + "_always_valid_scalar"
-    namespaced_name = (weight_name if (func_name == "main_topo" or self.profile == "monolithic")
+    namespaced_name = (weight_name if (func_name == "main_topo" or self.flat_namespace)
                         else f"{func_name}.{weight_name}")
     self.weights[namespaced_name] = np.full([1] * rank, 1.0, dtype=np.float32)
     ctx.nodes.append({
@@ -2266,7 +2266,7 @@ def _op_batch_norm(self, op, ctx):
     x_name = resolve(self.safe_name(x_var_obj.name))
     output_var = self.safe_name(op.outputs[0].name)
     weight_base = f"{self.safe_name(op.name)}_bn"
-    if func_name == "main_topo" or self.profile == "monolithic":
+    if func_name == "main_topo" or self.flat_namespace:
         scale_name, shift_name = f"{weight_base}_scale", f"{weight_base}_shift"
     else:
         scale_name, shift_name = f"{func_name}.{weight_base}_scale", f"{func_name}.{weight_base}_shift"

@@ -686,11 +686,17 @@ has no phases: for those families the decomposition is a structural fact, declar
 `default_factory` rather than chosen per run. `decomposition.py`'s module docstring states this, so the
 next family does not read the uniform field as a uniform menu.
 
-**Still open, deliberately:** `profile` itself is not yet renamed to `flatten_weight_namespace` or
-similar. Doing that touches eight `topology_ops.py` rules and is a separate, purely mechanical commit
-whose gate is the same byte-identical re-export; folding it into this one would have mixed a rename
-with a restructure. Worth doing before a family exists that needs a multi-topology export with a flat
-namespace, which is when the shadowing described above stops hiding the confusion.
+**Follow-up, landed separately: `profile` → `flat_namespace`.** Kept out of the restructure commit so a
+rename and a restructure wouldn't share one diff. The flag is now a plain `bool` named for its effect,
+read in the same eight `topology_ops.py` rules as `func_name == "main_topo" or self.flat_namespace`, and
+passed only by the two `Flattened`-shaped families' `backend_kwargs()`. Its second, unrelated meaning is
+gone: the bespoke hand-built-Program path is now decided by `is_bespoke` alone (`len(functions) > 1 and
+"main" in functions`), since no caller ever passed a profile to suppress it — both call sites in
+`export()`/`_ensure_mil_passes_applied` were checked, and the only two tests that passed
+`profile="monolithic"` use single-function programs where `is_bespoke` is already `False`. That is the
+one behavioral difference in the rename: a hypothetical caller handing the exporter a multi-function
+`main` Program *and* a flat-namespace request would now take the bespoke path. None exists.
+`LOOM_PROFILE`, the env override on the old field, had no readers anywhere in the tree and is gone.
 
 #### P4 — flagship coverage
 

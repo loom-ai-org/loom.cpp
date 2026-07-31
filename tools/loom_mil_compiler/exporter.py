@@ -123,7 +123,18 @@ class LoomGGUFExporter:
         self.weights = {}
         self.topologies = {}
         self.ir_function = None
-        self.profile = kwargs.get("profile") or os.environ.get("LOOM_PROFILE", None)
+        # Whether this export writes weights into ONE flat namespace instead of prefixing each with its
+        # own topology's name (`{func_name}.{weight}`). Read by `topology_ops.py` in 8 places, always as
+        # `func_name == "main_topo" or self.flat_namespace`.
+        #
+        # Was `profile` ("monolithic"/None) until BACKLOG.md P4.0.3's rename. That name described the
+        # caller's export shape rather than the switch's effect, and it carried a second, unrelated
+        # meaning: `profile is None` also used to enable the bespoke hand-built-Program path, which is
+        # now decided structurally by `is_bespoke` alone (no caller ever passed a profile to suppress
+        # it -- both are checked in `export()`). The correlation is real but partial: a flattened
+        # single-topology export wants a flat namespace, while a modular or multi-phase export needs its
+        # per-function prefixes, which is why those paths simply leave this False.
+        self.flat_namespace = bool(kwargs.get("flat_namespace"))
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
         self.quantize = kwargs.get("quantize") or os.environ.get("LOOM_QUANTIZE", None)
         # This topology's ONE true dynamic quantity's real name (EXPORT-ROADMAP.md R1, axes.py) --
@@ -1114,7 +1125,7 @@ class LoomGGUFExporter:
         if self._mil_passes_applied or self.program is None:
             return
         is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
-        if not (is_bespoke and self.profile is None):
+        if not is_bespoke:
             apply_loom_mil_passes(self.program)
             self.facts.annotate_dynamic_shapes(self.program)
         self._mil_passes_applied = True
@@ -1129,7 +1140,7 @@ class LoomGGUFExporter:
         is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
         self._ensure_mil_passes_applied()
 
-        if is_bespoke and self.profile is None:
+        if is_bespoke:
             # 1. Advanced / Bespoke Exporting Workflow
             print("Exporting via Advanced/Bespoke workflow...")
             for func_name, func in self.program.functions.items():

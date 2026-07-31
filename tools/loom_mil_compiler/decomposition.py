@@ -86,8 +86,8 @@ class Flattened(Decomposition):
 @dataclass
 class Modular(Decomposition):
     """Independently traced submodules (embedding, rotary table, each decoder layer, final norm, head)
-    assembled into one multi-Function Program per `ModularExportSpec` -- LFM2's modular profile, and the
-    only split mechanism left after `profile="atomic"`'s retirement (EXPORT-ROADMAP.md R7). See
+    assembled into one multi-Function Program per `ModularExportSpec` -- LFM2's modular form, and the
+    only split mechanism left after the `"atomic"` profile's retirement (EXPORT-ROADMAP.md R7). See
     `modular_export.py`'s own module docstring.
 
     Config hooks: `prepare_environment()`, `load_model()`, `modular_dummy_inputs()`, `backend_kwargs()`,
@@ -114,13 +114,11 @@ class Modular(Decomposition):
             seq_len=self.dummy_seq_len, max_seq_len=config.max_seq_len,
         )
 
-        print("Compiling to GGUF (modular-blueprint profile)...")
-        # `profile` is deliberately NOT among backend_kwargs() for this decomposition, and that is
-        # load-bearing rather than an omission: exporter.export() dispatches the modular path on
-        # `modular_layout is not None`, but topology_ops.py ALSO reads `profile == "monolithic"` as a
-        # weight-namespacing switch (`{func_name}.{weight}` unless flattened). A modular Program's
-        # per-submodule functions need those namespaces, so this path must leave profile unset. See
-        # BACKLOG.md P4.0.3 for the full accounting of what that string really controls.
+        print("Compiling to GGUF (modular blueprint)...")
+        # `flat_namespace` is deliberately NOT among backend_kwargs() for this decomposition, and that
+        # is load-bearing rather than an omission: a modular Program's per-submodule functions each need
+        # their own `{func_name}.{weight}` prefix, which is exactly what leaving this False preserves
+        # (topology_ops.py reads it in 8 places). See BACKLOG.md P4.0.3.
         LoomGGUFBackend()(
             result.program,
             output_path=config.output_path,
