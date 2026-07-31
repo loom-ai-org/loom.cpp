@@ -1,27 +1,16 @@
-"""Regression check for BACKLOG.md P3.1's causal-LM family (`causal_lm_export.py`).
+"""Regression check for BACKLOG.md P3.1/P3.2's causal-LM family (`causal_lm_export.py`).
 
-`LMMonolithicCausalModelExportConfig` is exercised for real every time `export_hf_causal_lm.py`'s own
-`export_causal_lm()` runs (it's a thin shim over the class now) -- `export_lfm2_monolithic.py` already
-goes through it, so re-running it and snapshot-diffing against a pre-P3.1 baseline is real coverage on
-its own (see BACKLOG.md's P3.1 gate). `export_qwen3_mil.py` was the other original caller, but P3.2
-deleted it (replaced by the `causal-lm`/`qwen3` registry entry) -- `test_qwen3_registry_entry_matches_direct_construction`
-below is what replaced the "diff against the old script" check for Qwen3 specifically, since there's no
-longer an independent old script to diff against; the registry path is now the ONLY path, so the
-regression risk left worth guarding is the registry's own factory silently drifting from a direct
-construction of the same class.
+Every model in this family (Qwen3 monolithic, LFM2 monolithic, LFM2 modular) is now reachable ONLY
+through the `causal-lm` task's registry entries (`export_qwen3_mil.py`/`export_lfm2_modular.py`/
+`export_lfm2_monolithic.py` are all deleted -- BACKLOG.md's P3.2 and the later LFM2 migration). With no
+independent "old script" left to diff against, what's still worth guarding per model is
+`registry.py`'s own `_build_*` factory silently drifting from constructing the same `LoomExportConfig`
+class directly with the same parameters (e.g. someone edits one call site and not the other) -- so each
+test below builds a model both ways and snapshot-diffs the two resulting GGUFs.
 
-`LMModularCausalModelExportConfig`, on the other hand, has no real caller yet: `export_lfm2_modular.py`
-still calls `modular_export.export_modular` directly and is NOT migrated this pass (confirmed scope --
-LFM2 stays regression-checked, not migrated; real migration is a later pass). So THIS test is the only
-place that exercises it against a real checkpoint: it runs `export_lfm2_modular.py`'s own `main()`
-unmodified, builds an equivalent `LMModularCausalModelExportConfig` by hand with the exact same
-parameters, and snapshot-diffs the two resulting GGUFs -- proof the new class genuinely reproduces the
-shape `export_lfm2_modular.py` hand-rolls, not just that it looks plausible.
-
-Both tests need the real checkpoints and take real trace time; skipped (not failed) when the checkpoint
-directory isn't present, matching this project's existing real-model-test skip convention.
+All three tests need the real checkpoints and take real trace time; skipped (not failed) when the
+checkpoint directory isn't present, matching this project's existing real-model-test skip convention.
 """
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -34,22 +23,11 @@ from loom_mil_compiler.causal_lm_export import (  # noqa: E402
     LMMonolithicCausalModelExportConfig,
 )
 from loom_mil_compiler.modular_export import ModularExportSpec  # noqa: E402
+from loom_mil_compiler.registry import default_registry  # noqa: E402
 from loom_mil_compiler.snapshot_gguf import snapshot  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 LFM2_DIR = Path("/home/flavio/Dev/models/lfm2-350m")
 QWEN3_DIR = Path("/home/flavio/Dev/models/qwen3-0.6b-base")
-
-
-def _run_script_main(name: str):
-    """Executes a repo-root export_*.py's own main() in-process -- same dynamic-load pattern
-    test_nemo_asr_export.py already uses to read a script's declared SPEC, but calling main() here
-    instead, since we need the real GGUF it produces, not just its metadata."""
-    spec_file = REPO_ROOT / f"{name}.py"
-    module_spec = importlib.util.spec_from_file_location(name, spec_file)
-    module = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(module)
-    module.main()
 
 
 def _snapshot_dir(gguf_path: Path, out_dir: Path) -> Path:
@@ -57,64 +35,65 @@ def _snapshot_dir(gguf_path: Path, out_dir: Path) -> Path:
     return out_dir / gguf_path.stem
 
 
-def _assert_snapshots_match(old_dir: Path, new_dir: Path):
-    old_files = {p.name: p.read_bytes() for p in old_dir.iterdir()}
-    new_files = {p.name: p.read_bytes() for p in new_dir.iterdir()}
-    assert set(old_files) == set(new_files), (set(old_files), set(new_files))
-    mismatched = [name for name in old_files if old_files[name] != new_files[name]]
+def _assert_snapshots_match(a_dir: Path, b_dir: Path):
+    a_files = {p.name: p.read_bytes() for p in a_dir.iterdir()}
+    b_files = {p.name: p.read_bytes() for p in b_dir.iterdir()}
+    assert set(a_files) == set(b_files), (set(a_files), set(b_files))
+    mismatched = [name for name in a_files if a_files[name] != b_files[name]]
     assert not mismatched, f"snapshot files differ: {mismatched}"
 
 
-@pytest.mark.skipif(not LFM2_DIR.exists(), reason="LFM2 checkpoint not available locally")
-def test_modular_causal_model_export_config_matches_export_lfm2_modular(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    _run_script_main("export_lfm2_modular")
-    old_gguf = tmp_path / "lfm2_350m_modular.gguf"
-    assert old_gguf.exists()
-
-    # Exact same ModularExportSpec export_lfm2_modular.py's own main() constructs.
-    modular_spec = ModularExportSpec(
-        prefix_attr="model.embed_tokens",
-        repeated_attr="model.layers",
-        suffix_attrs=["model.embedding_norm", "lm_head"],
-        aux_attr="model.pos_emb",
-        aux_kwarg="position_embeddings",
-    )
-    new_gguf = tmp_path / "lfm2_350m_modular_new.gguf"
-    LMModularCausalModelExportConfig(
-        architecture="lfm2",
-        output_path=str(new_gguf),
-        model_dir=str(LFM2_DIR),
-        modular_spec=modular_spec,
-        tokenizer_dir=str(LFM2_DIR),
-        tokenizer_pre="llama3",
-    ).export()
-
-    snap_dir = tmp_path / "snap"
-    old_snap = _snapshot_dir(old_gguf, snap_dir)
-    new_snap = _snapshot_dir(new_gguf, snap_dir)
-    _assert_snapshots_match(old_snap, new_snap)
-
-
-@pytest.mark.skipif(not QWEN3_DIR.exists(), reason="Qwen3 checkpoint not available locally")
-def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
-    """`export_qwen3_mil.py` (the original oracle this test compared against) was deleted in P3.2 --
-    the `causal-lm`/`qwen3` registry entry is now the only path, so there is no independent old script
-    left to diff against. What's still worth guarding: `registry.py`'s own `_build_qwen3` factory
-    silently drifting from constructing `LMMonolithicCausalModelExportConfig` directly with the same
-    parameters (e.g. someone edits one call site and not the other)."""
-    from loom_mil_compiler.registry import default_registry
-
+def _assert_registry_matches_direct(tmp_path, task, model, model_path, build_direct_config):
+    """`build_direct_config` takes the output path and returns a freshly constructed `LoomExportConfig`
+    -- kept lazy (a callable, not a pre-built instance) so each side of the comparison gets its own
+    fresh, correctly-pathed config rather than mutating one instance's `output_path` after the fact."""
     registry = default_registry()
-    via_registry_gguf = tmp_path / "qwen3_via_registry.gguf"
-    registry.get("causal-lm", "qwen3").build_config(QWEN3_DIR, str(via_registry_gguf)).export()
+    via_registry_gguf = tmp_path / f"{model}_via_registry.gguf"
+    registry.get(task, model).build_config(model_path, str(via_registry_gguf)).export()
 
-    direct_gguf = tmp_path / "qwen3_direct.gguf"
-    LMMonolithicCausalModelExportConfig(
-        architecture="qwen3", output_path=str(direct_gguf), profile="monolithic", model_dir=str(QWEN3_DIR),
-    ).export()
+    direct_gguf = tmp_path / f"{model}_direct.gguf"
+    build_direct_config(str(direct_gguf)).export()
 
     snap_dir = tmp_path / "snap"
     via_registry_snap = _snapshot_dir(via_registry_gguf, snap_dir)
     direct_snap = _snapshot_dir(direct_gguf, snap_dir)
     _assert_snapshots_match(via_registry_snap, direct_snap)
+
+
+@pytest.mark.skipif(not QWEN3_DIR.exists(), reason="Qwen3 checkpoint not available locally")
+def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
+    _assert_registry_matches_direct(
+        tmp_path, "causal-lm", "qwen3", QWEN3_DIR,
+        lambda output_path: LMMonolithicCausalModelExportConfig(
+            architecture="qwen3", output_path=output_path, profile="monolithic", model_dir=str(QWEN3_DIR),
+        ),
+    )
+
+
+@pytest.mark.skipif(not LFM2_DIR.exists(), reason="LFM2 checkpoint not available locally")
+def test_lfm2_monolithic_registry_entry_matches_direct_construction(tmp_path):
+    _assert_registry_matches_direct(
+        tmp_path, "causal-lm", "lfm2-monolithic", LFM2_DIR,
+        lambda output_path: LMMonolithicCausalModelExportConfig(
+            architecture="lfm2", output_path=output_path, profile="monolithic", model_dir=str(LFM2_DIR),
+            tokenizer_pre="llama3",
+        ),
+    )
+
+
+@pytest.mark.skipif(not LFM2_DIR.exists(), reason="LFM2 checkpoint not available locally")
+def test_lfm2_modular_registry_entry_matches_direct_construction(tmp_path):
+    _assert_registry_matches_direct(
+        tmp_path, "causal-lm", "lfm2-modular", LFM2_DIR,
+        lambda output_path: LMModularCausalModelExportConfig(
+            architecture="lfm2", output_path=output_path, model_dir=str(LFM2_DIR),
+            modular_spec=ModularExportSpec(
+                prefix_attr="model.embed_tokens",
+                repeated_attr="model.layers",
+                suffix_attrs=["model.embedding_norm", "lm_head"],
+                aux_attr="model.pos_emb",
+                aux_kwarg="position_embeddings",
+            ),
+            tokenizer_dir=str(LFM2_DIR), tokenizer_pre="llama3",
+        ),
+    )

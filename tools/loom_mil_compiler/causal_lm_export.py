@@ -203,18 +203,22 @@ class LMModularCausalModelExportConfig(LMCausalModelExportConfig):
         return self.output_path
 
 
-def _is_qwen3(path: Path) -> bool:
-    """Real structural check (BACKLOG.md P3.2): an HF-style directory whose own `config.json` declares
-    `model_type == "qwen3"`. LFM2's `model_type` would trivially detect the same way, but no recognizer
-    is registered for it this pass -- confirmed scope, see BACKLOG.md's P3.1/P3.2 entries."""
+def _hf_model_type(path: Path) -> Optional[str]:
+    """An HF-style directory's own `config.json`'s `model_type`, or None if `path` isn't one."""
     cfg_path = path / "config.json"
     if not path.is_dir() or not cfg_path.exists():
-        return False
+        return None
     try:
         cfg = json.loads(cfg_path.read_text())
     except (json.JSONDecodeError, OSError):
-        return False
-    return cfg.get("model_type") == "qwen3"
+        return None
+    return cfg.get("model_type")
+
+
+def _is_qwen3(path: Path) -> bool:
+    """Real structural check (BACKLOG.md P3.2): an HF-style directory whose own `config.json` declares
+    `model_type == "qwen3"`."""
+    return _hf_model_type(path) == "qwen3"
 
 
 def _build_qwen3(path: Path, output_path: str) -> LoomExportConfig:
@@ -223,12 +227,49 @@ def _build_qwen3(path: Path, output_path: str) -> LoomExportConfig:
     )
 
 
+def _is_lfm2(path: Path) -> bool:
+    """Real structural check: `model_type == "lfm2"`. Registered under BOTH `lfm2-monolithic` and
+    `lfm2-modular` (BACKLOG.md's migration of LFM2 onto the registry, following P3.1/P3.2/P3.3) -- unlike
+    Parakeet-TDT/-RNNT, which the checkpoint's own config genuinely distinguishes, "monolithic" vs
+    "modular" is a caller CHOICE about how to export the same checkpoint, not a property `detect()` could
+    ever read off it. So both recognizers legitimately match the same real LFM2 directory, and
+    `TaskRegistry.detect()` correctly raises asking for `--model lfm2-monolithic`/`--model lfm2-modular`
+    to disambiguate -- the same honest "can't guess, ask" behavior as any other genuine ambiguity, not a
+    gap."""
+    return _hf_model_type(path) == "lfm2"
+
+
+def _build_lfm2_monolithic(path: Path, output_path: str) -> LoomExportConfig:
+    return LMMonolithicCausalModelExportConfig(
+        architecture="lfm2", output_path=output_path, profile="monolithic", model_dir=str(path),
+        tokenizer_pre="llama3",
+    )
+
+
+def _build_lfm2_modular(path: Path, output_path: str) -> LoomExportConfig:
+    return LMModularCausalModelExportConfig(
+        architecture="lfm2", output_path=output_path, model_dir=str(path),
+        modular_spec=ModularExportSpec(
+            prefix_attr="model.embed_tokens",
+            repeated_attr="model.layers",
+            suffix_attrs=["model.embedding_norm", "lm_head"],
+            aux_attr="model.pos_emb",
+            aux_kwarg="position_embeddings",
+        ),
+        tokenizer_dir=str(path), tokenizer_pre="llama3",
+    )
+
+
 def register(registry) -> None:
-    """Registers this family's `TaskRegistryEntry` (BACKLOG.md P3.2)."""
+    """Registers this family's `TaskRegistryEntry` (BACKLOG.md P3.2, extended with LFM2's two profiles)."""
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
         task="causal-lm",
         config_class=LMCausalModelExportConfig,
-        recognizers=[ModelRecognizer(name="qwen3", detect=_is_qwen3, build_config=_build_qwen3)],
+        recognizers=[
+            ModelRecognizer(name="qwen3", detect=_is_qwen3, build_config=_build_qwen3),
+            ModelRecognizer(name="lfm2-monolithic", detect=_is_lfm2, build_config=_build_lfm2_monolithic),
+            ModelRecognizer(name="lfm2-modular", detect=_is_lfm2, build_config=_build_lfm2_modular),
+        ],
     ))
