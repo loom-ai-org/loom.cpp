@@ -18,9 +18,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
+from loom_mil_compiler.decomposition import Flattened, Modular  # noqa: E402
 from loom_mil_compiler.causal_lm_export import (  # noqa: E402
-    LMModularCausalModelExportConfig,
-    LMMonolithicCausalModelExportConfig,
+    LMCausalModelExportConfig,
 )
 from loom_mil_compiler.modular_export import ModularExportSpec  # noqa: E402
 from loom_mil_compiler.registry import default_registry  # noqa: E402
@@ -64,8 +64,9 @@ def _assert_registry_matches_direct(tmp_path, task, model, model_path, build_dir
 def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
     _assert_registry_matches_direct(
         tmp_path, "causal-lm", "qwen3", QWEN3_DIR,
-        lambda output_path: LMMonolithicCausalModelExportConfig(
-            architecture="qwen3", output_path=output_path, profile="monolithic", model_dir=str(QWEN3_DIR),
+        lambda output_path: LMCausalModelExportConfig(
+            architecture="qwen3", output_path=output_path, decomposition=Flattened(),
+            model_dir=str(QWEN3_DIR),
         ),
     )
 
@@ -74,9 +75,9 @@ def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
 def test_lfm2_monolithic_registry_entry_matches_direct_construction(tmp_path):
     _assert_registry_matches_direct(
         tmp_path, "causal-lm", "lfm2-monolithic", LFM2_DIR,
-        lambda output_path: LMMonolithicCausalModelExportConfig(
-            architecture="lfm2", output_path=output_path, profile="monolithic", model_dir=str(LFM2_DIR),
-            tokenizer_pre="llama3",
+        lambda output_path: LMCausalModelExportConfig(
+            architecture="lfm2", output_path=output_path, decomposition=Flattened(),
+            model_dir=str(LFM2_DIR), tokenizer_pre="llama3",
         ),
     )
 
@@ -85,15 +86,15 @@ def test_lfm2_monolithic_registry_entry_matches_direct_construction(tmp_path):
 def test_lfm2_modular_registry_entry_matches_direct_construction(tmp_path):
     _assert_registry_matches_direct(
         tmp_path, "causal-lm", "lfm2-modular", LFM2_DIR,
-        lambda output_path: LMModularCausalModelExportConfig(
+        lambda output_path: LMCausalModelExportConfig(
             architecture="lfm2", output_path=output_path, model_dir=str(LFM2_DIR),
-            modular_spec=ModularExportSpec(
+            decomposition=Modular(spec=ModularExportSpec(
                 prefix_attr="model.embed_tokens",
                 repeated_attr="model.layers",
                 suffix_attrs=["model.embedding_norm", "lm_head"],
                 aux_attr="model.pos_emb",
                 aux_kwarg="position_embeddings",
-            ),
+            )),
             tokenizer_dir=str(LFM2_DIR), tokenizer_pre="llama3",
         ),
     )

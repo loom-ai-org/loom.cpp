@@ -3,7 +3,8 @@
 Generic export driver: any plain `AutoModelForCausalLM`-shaped HF model -> Loom GGUF.
 
 The actual mechanics (load -> trace -> ct.convert -> LoomGGUFExporter) live in
-`causal_lm_export.LMMonolithicCausalModelExportConfig` now (BACKLOG.md P3.1) -- this module is a thin
+`causal_lm_export.LMCausalModelExportConfig` with a `Flattened()` decomposition (BACKLOG.md
+P3.1/P4.0.3) -- this module is a thin
 CLI/function shim over that class, kept for its existing entry point:
 
   ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.export_hf_causal_lm \\
@@ -16,14 +17,14 @@ auto-detection raises (an unrecognized tokenizer hash, or a recognized-but-not-y
 """
 import argparse
 
-from .causal_lm_export import LMMonolithicCausalModelExportConfig
+from .causal_lm_export import LMCausalModelExportConfig
+from .decomposition import Flattened
 
 
 def export_causal_lm(
     model_dir: str,
     output_path: str,
     *,
-    profile: str = "monolithic",
     architecture: str = None,
     tokenizer_dir: str = None,
     tokenizer_family: str = None,
@@ -33,11 +34,13 @@ def export_causal_lm(
     max_seq_len: int = 4096,
 ) -> str:
     """Loads a plain HF causal-LM from `model_dir`, traces it, and exports it to Loom GGUF at
-    `output_path` under the given profile ("monolithic" or "submodule"). Returns `output_path`."""
-    return LMMonolithicCausalModelExportConfig(
+    `output_path` as one flattened trace. Returns `output_path`. A modular export goes through
+    `LMCausalModelExportConfig(decomposition=Modular(spec=...))` or `loom-export --model lfm2-modular`;
+    this CLI has only ever built the flattened form."""
+    return LMCausalModelExportConfig(
         architecture=architecture,
         output_path=output_path,
-        profile=profile,
+        decomposition=Flattened(),
         model_dir=model_dir,
         tokenizer_dir=tokenizer_dir,
         tokenizer_family=tokenizer_family,
@@ -52,7 +55,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("model_dir", help="Path to a local HF AutoModelForCausalLM checkpoint directory")
     parser.add_argument("-o", "--output", required=True, help="Output GGUF path")
-    parser.add_argument("--profile", choices=["monolithic"], default="monolithic")
     parser.add_argument("--architecture", default=None, help="Defaults to model.config.model_type")
     parser.add_argument("--tokenizer-dir", default=None, help="Defaults to model_dir")
     parser.add_argument("--tokenizer-family", default=None,
@@ -68,7 +70,6 @@ def main():
     export_causal_lm(
         args.model_dir,
         args.output,
-        profile=args.profile,
         architecture=args.architecture,
         tokenizer_dir=args.tokenizer_dir,
         tokenizer_family=args.tokenizer_family,
