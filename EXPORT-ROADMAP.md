@@ -163,12 +163,26 @@ loom-export nvidia/parakeet-tdt-0.6b-v3 -o parakeet.gguf
 | piece | mirrors | built from |
 |---|---|---|
 | `LoomExportConfig` | `OnnxConfig` | the three existing family templates' spec dataclasses |
-| `.inputs` / `.outputs` (named axes) | `OnnxConfig.inputs` | R1 |
+| ~~`.inputs` / `.outputs` (named axes)~~ — **not on the config; see below** | `OnnxConfig.inputs` | R1 |
 | `.generate_dummy_inputs()` | `DummyInputGenerator` | the `torch.randn` blocks in the current scripts |
 | `.patch_model_for_export()` | `ModelPatcher` | the wrapper classes in the current scripts (R4) |
 | `.decomposition` (which submodels, which driver) | `OnnxSeq2SeqConfigWithPast` | `ModularExportSpec`, `FlowMatchingSpec`, `NeMoASREncoderSpec` |
 | `TaskRegistry` | `TasksManager` | new; keyed on HF `config.json` `model_type`/`architectures`, and on the `target` class inside a `.nemo` archive |
 | `LoomModelForCTC` / `ForSpeechSeq2Seq` / `ForCausalLM` / `ForTextToSpeech` | `ORTModelFor*` | the Lua drivers + C++ backends behind one Python/C++ surface |
+
+**Correction: `.inputs` belongs to a phase, not to a config** (decided in BACKLOG.md P4.0.2, after R1
+and P3 had both landed). `OnnxConfig.inputs` works as a config-level property because an `OnnxConfig`
+describes exactly one graph. A `LoomExportConfig` frequently does not: 5 of the 11 models exported today
+are multi-phase (Kokoro 2, VITS 3, Matcha 4, Supertonic 4, StyleTTS2 3), each phase with its own input
+signature, its own dynamic axes, and — for Kokoro — its own `root_axis`. A config-level `.inputs` for
+those is necessarily `{phase: {input: {axis: name}}}`, which is `ExportPhase` with an extra level of
+nesting and no extra information. So the axis declaration stays where R1 put it: on the phase
+(`multi_phase_export.ExportPhase.root_axis`/`declared_axes`), or on the single-graph family's own
+`export()` for the families that trace exactly one topology.
+
+What P4.0.2 did build instead is the check that makes a per-phase declaration safe: `LoomGGUFExporter`
+now validates that every dynamic input axis is accounted for. That closes the actual hole a schema
+would have closed — see BACKLOG.md P4.0.2 for the two silent failure modes.
 
 **The one design decision that is not a port.** In `optimum`, the exported artifact is a graph and the
 *orchestration* lives in the Python runtime class. Here the orchestration is exported too, as the

@@ -584,17 +584,60 @@ models (`snapshot_gguf.py`), since none of these is meant to change any output.
   `tmp_path`, which defaults to `/tmp` — a 28GB partition on this machine that they fill to 0 bytes free,
   at which point unrelated commands start failing. Run the suite with both `TMPDIR=` and pytest's own
   `--basetemp=` pointed under `/home/flavio/.claude/tmp/`; `TMPDIR` alone does not move `tmp_path`.
-- **P4.0.2 — decide where a family declares its dynamic axes (the real gap).** R3's piece table names
-  `.inputs`/`.outputs` as config members and this file's own ordering rationale says `LoomExportConfig.inputs`
-  *is* the axis declaration — neither exists. Today the same information lives in three unrelated places:
-  `ExportPhase.root_axis`/`declared_axes` (multi-phase), `LoomGGUFExporter(root_axis=..., declared_axes=...)`
-  kwargs threaded through each family's own `export()` (NeMo ASR, causal-LM), and `ct.RangeDim`/`ct.TensorType`
-  lists built inline (everywhere). The decision to make, explicitly, before P4.1: either hoist axis
-  declaration onto `LoomExportConfig` as R3 described (and migrate all 11 models, which is the expensive
-  half and the reason it was skipped), or record that per-phase declaration is the real shape and strike
-  `.inputs`/`.outputs` from R3 so the roadmap stops describing an API that was consciously not built.
-  Deciding it is mandatory; hoisting it is not — but writing three more configs against the current
-  scatter and *then* deciding is the one outcome to avoid.
+- **P4.0.2 — where a family declares its dynamic axes — DONE. Decision: per-phase, not on the config;
+  `.inputs`/`.outputs` struck from R3 (`EXPORT-ROADMAP.md`'s piece table now says so).**
+
+  **Why not hoist.** `OnnxConfig.inputs` is a config-level property because an `OnnxConfig` describes
+  exactly one graph. A `LoomExportConfig` frequently does not: 5 of the 11 models are multi-phase
+  (Kokoro 2, VITS 3, Matcha 4, Supertonic 4, StyleTTS2 3), each phase with its own input signature, its
+  own dynamic axes, and — for Kokoro — its own `root_axis`. A config-level `.inputs` covering those is
+  necessarily `{phase: {input: {axis: name}}}`, i.e. `ExportPhase` with one more level of nesting and no
+  more information. R3's row assumed one graph per model, which is true of `optimum`'s ONNX exports and
+  false here for nearly half the models.
+
+  **The "three unrelated places" this item was written about turned out to be one place plus an idiom.**
+  Counting the real declarations rather than the call sites: `declared_axes` is used by exactly ONE
+  phase in the whole tree (Kokoro's `decoder_vocoder`, 4 entries), and a non-default `root_axis` by
+  exactly two places (that phase, and NeMo ASR's `n_samples`). Every other phase of every other model
+  declares its dynamic axis by sharing one `ct.RangeDim` INSTANCE across the inputs that move together —
+  coremltools then gives them one symbol, which the exporter maps to the default `n_tokens`. That idiom
+  is load-bearing and was nowhere written down. A schema hoisted onto the config would have had 9 of 11
+  models restating what the shared `RangeDim` already says.
+
+  **What was actually wrong was that nothing checked it**, which is what got built instead — two silent
+  failure modes, both now export-time errors in `LoomGGUFExporter`:
+  1. *An undeclared second dynamic axis silently collapses onto the root.* `_sub_symbol` rewrites any
+     MIL symbol it has no override for into `root_axis`, so two genuinely independent dynamic quantities
+     both render as e.g. `n_enc_frames` and the emitted shape expressions are wrong — not malformed,
+     just wrong, so neither `snapshot_gguf.py` nor a numeric reference test necessarily catches it.
+     `_validate_input_axes` now raises naming every input and axis position in each group. Had Kokoro's
+     `decoder_vocoder` phase been written without its `declared_axes` table, this is the error it would
+     have gotten instead of four wrong shape attributes.
+  2. *A declaration naming a static axis does nothing at all.* `_resolve_declared_axes` keys overrides
+     on `str(input_var.shape[axis])`; for a static dim that's a literal like `"4000"`, a valid dict key
+     no MIL symbol will ever match. Now raises, telling the caller to either make the axis a
+     `ct.RangeDim` or drop the entry.
+
+  **Known limit, stated rather than papered over:** the modular-blueprint Program has one Function per
+  submodule and no `"main"`, so it gets no axis validation. That is defensible — `apply_modular_export`
+  synthesizes its own leaf inputs and their axes rather than accepting them from a caller — and it is
+  recorded in `_input_axis_symbols`' own docstring. The write-only exporter (`multi_phase_export.export()`
+  constructs one with `program=None` purely to merge already-generated topologies) is skipped for the
+  same structural reason.
+
+  **Gate — passed:** 5 new tests in `test_compiler.py` (`TestInputAxisValidation`), covering the shared-
+  symbol idiom, both raises, the declared-second-axis case that Kokoro really is, and the no-`main`
+  skip. Kokoro/VITS/StyleTTS2/Matcha/Supertonic/Conformer-CTC exported through `loom-export` and
+  compared by sha256 against the same six exported from a `git worktree` at the pre-P4.0.2 commit —
+  **byte-identical, all six** (the check is pass-or-raise and touches no emission path, so this
+  confirms rather than discovers). Qwen3 and both LFM2 profiles are covered by
+  `test_causal_lm_export.py`'s own registry-vs-direct snapshot diff. Parakeet-TDT/-RNNT were not
+  re-exported: they are the same `ASRNemoEncoderExportConfig` code path Conformer-CTC exercises, with
+  the same `root_axis="n_samples"` and the same single dynamic axis. Full `pytest` 187/187 green.
+
+  The six exports also confirm the validation has no false positives on the two shapes that matter:
+  Kokoro's `decoder_vocoder` (five distinct dynamic symbols, four declared, one root) and NeMo's
+  non-default `root_axis`.
 - **P4.0.3 — make monolithic/modular an option again, not a class (see the next section).**
 
 ### `profile` no longer means anything; decomposition is a class axis it was supposed to modulate
