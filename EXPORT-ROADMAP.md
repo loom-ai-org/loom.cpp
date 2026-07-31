@@ -166,7 +166,7 @@ loom-export nvidia/parakeet-tdt-0.6b-v3 -o parakeet.gguf
 | `.inputs` / `.outputs` (named axes) | `OnnxConfig.inputs` | R1 |
 | `.generate_dummy_inputs()` | `DummyInputGenerator` | the `torch.randn` blocks in the current scripts |
 | `.patch_model_for_export()` | `ModelPatcher` | the wrapper classes in the current scripts (R4) |
-| `.decomposition` (which submodels, which driver) | `OnnxSeq2SeqConfigWithPast` | `ModularExportSpec`, `IterativeRefinementSpec`, `NeMoASREncoderSpec` |
+| `.decomposition` (which submodels, which driver) | `OnnxSeq2SeqConfigWithPast` | `ModularExportSpec`, `FlowMatchingSpec`, `NeMoASREncoderSpec` |
 | `TaskRegistry` | `TasksManager` | new; keyed on HF `config.json` `model_type`/`architectures`, and on the `target` class inside a `.nemo` archive |
 | `LoomModelForCTC` / `ForSpeechSeq2Seq` / `ForCausalLM` / `ForTextToSpeech` | `ORTModelFor*` | the Lua drivers + C++ backends behind one Python/C++ surface |
 
@@ -259,7 +259,7 @@ not enough to cost a template, which is P4's job per family.
 | 6 | **Encoder-decoder text** (translation) | m2m100, wmt21 ×2, madlad (T5) | 2 | ~4 | same decoder loop as family 2 | not started |
 | 7 | **VITS / VITS2** | piper (many voices), melotts (+bert-base cond.), openvoice2 (TCC), rvc | 5 | 4 + voices | — (self-contained) | **done** (piper) |
 | 8 | **StyleTTS2 / iSTFTNet** | kokoro (+ per-voice packs), styletts2 | 2 | 2 + voices | — (self-contained) | **done** |
-| 9 | **Flow-matching / diffusion acoustic stage** | matcha, supertonic, f5-tts, cosyvoice3 (DiT-CFM), voxcpm2 (LocDiT), kugelaudio (DiT), chatterbox (S3Gen), tada, voxtral-tts, pocket-tts (LSD), dots-tts, irodori-tts | 12 | ~12 | the ODE loop (done) + per-model preconditioning | **2 done** (`IterativeRefinementSpec`) |
+| 9 | **Flow-matching / diffusion acoustic stage** | matcha, supertonic, f5-tts, cosyvoice3 (DiT-CFM), voxcpm2 (LocDiT), kugelaudio (DiT), chatterbox (S3Gen), tada, voxtral-tts, pocket-tts (LSD), dots-tts, irodori-tts | 12 | ~12 | the ODE loop (done) + per-model preconditioning | **2 done** (`FlowMatchingSpec`) |
 | 9b | **Mel-spectrogram TTS + HiFi-GAN** *(new — was "one-offs")* | fastpitch (non-AR), speecht5 (AR), bananamind-tts (Tacotron-lite) | 3 | 3 | duration/pitch predictor or AR mel loop; vocoder already exported inside 7/8 | not started |
 | 10 | **AR LM + neural codec TTS** | orpheus+SNAC, outetts+WavTokenizer, qwen3-tts ×4, moss-tts ×2, miotts, omnivoice, csm, dia, bark, zonos+dac, indextts, parler, vibevoice-tts ×2, lfm2-audio-tts | 16 | ~20 | **the codec decoder (family 11)** + a delay/RQ token-emission driver | LM half done; codec decoders are the missing piece |
 | 11 | **Neural audio codecs / vocoders** (decode side) | DAC, dacvae, SNAC, WavTokenizer, MioCodec, mimo-tokenizer, omnivoice-tokenizer, cosyvoice3-s3tok, qwen3-tts-tokenizer, tada-codec, tada-encoder | 11 | ~11 | — (it *is* the connector for 10) | HiFi-GAN/iSTFT done inside 7/8/9; RVQ/FSQ not started |

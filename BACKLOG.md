@@ -50,7 +50,7 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > - "What is this Var's compile-time value / shape expression?" is answered in one place,
 >   `value_facts.py`, memoized per Var. The memo is load-bearing, not tidiness: without it the shape walk
 >   is exponential in encoder depth (see the Conformer entry below).
-> - Three family templates now exist — `modular_export.py` (decoder-LLMs), `iterative_export.py`
+> - Three family templates now exist — `modular_export.py` (decoder-LLMs), `flow_matching_export.py`
 >   (Euler-CFM samplers) and `nemo_asr_export.py` (NeMo ASR encoders) — and BACKEND.md's closing section
 >   argues that per-family templates, not universal orchestration inference, are the direction that
 >   actually works, with the evidence for why.
@@ -223,7 +223,7 @@ repeat):
 The engine's one-output-tensor-per-topology convention (`loom.run_subgraph` returns data + shape, see
 `modular_export.py`'s `_flatten_call` comment) is a real, deliberate constraint everywhere it's been
 hit so far, not an oversight — but it's the one thing standing between the current state and *inferring*
-an `IterativeRefinementSpec` directly from a scripted-loop trace instead of hand-declaring it (a MIL loop
+a `FlowMatchingSpec` directly from a scripted-loop trace instead of hand-declaring it (a MIL loop
 body has one output per loop-carried var; see BACKEND.md item 3's follow-up, where two of the three real
 prerequisites for that already hold). Scheduled here, before P3's config schema settles, so
 `LoomExportConfig`'s iterative-refinement shape doesn't have to assume "always hand-declared" only to be
@@ -257,7 +257,7 @@ declaring it, not worth building yet. P2 only had to make the capability exist.)
   **Gate — passed:** two real models re-exported and `snapshot_gguf.py`-diffed against a pristine
   pre-P2 baseline (`git archive HEAD`) — zero-byte diff for both `lfm2_350m_modular.gguf` (the
   `apply_modular_export` path, ~20 topologies including the `aux` rotary-embedding submodule) and
-  `supertonic_mil.gguf` (the `IterativeRefinementSpec` template); full `pytest` (143 tests, 9 new) and
+  `supertonic_mil.gguf` (the `FlowMatchingSpec` template); full `pytest` (143 tests, 9 new) and
   `ctest` (140 tests, 1 pre-existing unrelated failure confirmed present on the unmodified baseline too)
   green. New multi-output coverage at every layer: `test_graph_topology_parse.cpp` (JSON parsing),
   `test_graph_builder_shapes.cpp` (a two-output build verified against two independent single-output
@@ -376,11 +376,77 @@ exists, before that template's own shape is locked in.
   four models, snapshot-diffed against the same pre-P3 baseline — zero-byte diff in every case. Full
   `pytest` (161/161: 143 from P3.1 + 18 new in `test_registry.py`) and `ctest` (140/140) green, including
   `test_e2e_parakeet_{tdt,rnnt}_mil_export` run directly against the registry-produced GGUFs.
-- **P3.3 — `ModelPatcher` + `DummyInputGenerator`.** Fold the four long TTS scripts' wrapping into
-  declared patchers. **Acceptance:** `export_kokoro_mil.py` (503), `export_matcha_mil.py` (448),
-  `export_vits_mil.py` (382) and `export_styletts2_mil.py` (350) are deleted. Encode the traced-output
-  naming rule here (binding a traced value to a Python local renames the topology's declared output —
-  found the hard way, see BACKEND.md).
+- **P3.3 — `ModelPatcher` + `BaseMultiPhaseModelExportConfig`/`TTSFlowMatchingModelExportConfig` — DONE.**
+  Went beyond the literal four-script acceptance list, per explicit user direction: **Supertonic migrated
+  too** (`export_supertonic_mil.py`, not in BACKLOG.md's original P3.3 list), grouped with Matcha under
+  one shared `TTSFlowMatchingModelExportConfig` rather than left a "family of one" — the marginal cost
+  was small once the shared base existed for Matcha anyway. **LFM2 stayed out of scope** (P3.1's own
+  call, unaffected by this phase).
+
+  `multi_phase_export.py`'s `BaseMultiPhaseModelExportConfig` replaces the near-identical
+  `_build_topology`/weight-merge/`write_gguf` tail every TTS script hand-rolled: subclasses declare
+  `phases()` (a list of `ExportPhase` — wrapper, dummy inputs, MIL input declarations, optional
+  `root_axis`/`declared_axes`), and the shared `export()` traces each phase, merges weights with a
+  content-aware dedup-on-match/hard-fail-on-mismatch check (generalizing `export_kokoro_mil.py`'s own
+  two-phase merge to N phases — confirmed safe for VITS/Matcha's own fully-namespaced weights too, since
+  a merge that can never find a real collision behaves identically to a plain dict union), and writes one
+  GGUF. `TTSFlowMatchingModelExportConfig` (Matcha, Supertonic) adds `samplers()` — `FlowMatchingSpec`
+  (renamed from `IterativeRefinementSpec`, `iterative_export.py` renamed `flow_matching_export.py`: what
+  it declares is Euler integration of a vector field, i.e. flow matching specifically, not the vaguer
+  "iterative refinement" — a name that would blur why StyleTTS2's real ADPM2 diffusion sampler is
+  deliberately NOT part of this family). `BaseMultiPhaseModelExportConfig` also gained `estimators()` —
+  plain `EstimatorSpec`s, validated against the real traced topology but generating no codegen — for
+  StyleTTS2's own hand-written sampler.
+
+  `kokoro_export.py`'s `build_decoder_vocoder_phase`/`build_albert_bert_encoder_phase` (renamed from
+  `..._topology`, since they now return a deferred `ExportPhase` instead of eagerly tracing) stay
+  module-level functions rather than methods specifically so `styletts2_export.py` can still call
+  `build_decoder_vocoder_phase` directly — the real cross-model dependency found migrating this
+  (StyleTTS2 and Kokoro share the identical iSTFTNet decoder/vocoder architecture; Kokoro's own trace-
+  friendly monkeypatches apply to the same real `kokoro.istftnet` classes StyleTTS2 traces its own
+  checkpoint through). `ModelPatcher.prepare_environment()` documents each family's own import-order
+  stubs (Kokoro's numpy `_cast`/`transformers.utils.versions` patches, Matcha's
+  `huggingface_hub.cached_download`/`matcha.utils` stand-in, StyleTTS2's `transformers.utils.versions`)
+  as a named hook rather than unexplained top-of-file side effects — same timing as before, since the
+  class-level monkeypatches these families also need (e.g. `vits_modules.WN.forward = ...`) still require
+  the real class already imported, so those stay plain module-level code immediately after the family's
+  own imports, not part of this hook.
+
+  **Real mistake caught by the gate, not by review**: the first `matcha_export.py` draft silently
+  dropped `from loom_mil_compiler import group_norm_op` (patches `nn.GroupNorm.forward` globally) — the
+  export ran and produced a plausible-looking GGUF right up until `apply_loom_mil_passes` raised
+  `NotImplementedError: reduce_mean op ... only a single reduction axis is supported`, deep inside a pass
+  unrelated to GroupNorm on its face. Found immediately by actually re-running the export end-to-end
+  rather than trusting the line-by-line transcription; fixed by restoring the import. A reminder that
+  "moved the code, changed nothing" claims from a migration this size need a real re-run per model, not
+  just a diff read.
+
+  None of the five TTS checkpoints have a config.json`/`.nemo`-style self-describing manifest this pass's
+  recognizers use for detection (`detect()` returns `False` unconditionally, requiring an explicit
+  `--task tts-multi-phase|tts-flow-matching --model <name>`) — a real, stated scope limit (matches
+  `optimum` itself needing `--task` for sufficiently custom architectures), not a silent gap. Worth
+  revisiting per-model later: Kokoro ships its own `config.json`, Matcha's `.ckpt` has recognizable
+  Lightning-style `hyper_parameters`/`state_dict` keys, and Supertonic's `.pt` files are distinctively
+  fully pickled `nn.Module`s.
+
+  **Registry design correction, made during this phase, not before it (see P3.2's own entry for the
+  fuller reasoning)**: `TaskRegistry.register()` originally raised if a task was already registered —
+  broken the moment a second TTS family (`vits_export.py`, then `kokoro_export.py`) tried to register
+  under the same `"tts-multi-phase"` task `export_vits_mil.py`'s migration had just created. Fixed to
+  create-or-extend: a task is created on first registration and extended by every later family that
+  agrees on the same `config_class`, raising only if two families disagree about what a shared task name
+  builds.
+
+  **Gate — passed:** all five models (Kokoro, VITS, Matcha, Supertonic, StyleTTS2) re-exported through
+  their new config classes and snapshot-diffed against a pre-P3.3 baseline (VITS/Kokoro against the
+  pre-existing repo-root `.gguf`s; Supertonic against a freshly-generated baseline from the unmodified
+  script in a throwaway `git worktree`, since no baseline existed yet) — zero-byte diff for
+  `vits_mil.gguf` and `kokoro_mil.gguf`; Matcha/Supertonic/StyleTTS2 diff clean on every tensor and KV
+  except the intentional, expected one (the embedded driver script's own comment naming the renamed
+  `FlowMatchingSpec`/`flow_matching_export.py` in place of `IterativeRefinementSpec`/
+  `iterative_export.py`). Full `pytest` (164/164, including a real registry-vs-direct-construction
+  regression test replacing the "diff against `export_qwen3_mil.py`" check P3.2's deletion of that
+  script made impossible to run as originally written) and `ctest` (140/140) green.
 
 #### P4 — flagship coverage
 
@@ -446,7 +512,7 @@ All are recorded in full in BACKEND.md; this is the index.
     the engine evaluates in `double`, where the distributed form takes three roundings inside a floor
     instead of one.
 - **Multi-output topologies in `GraphBuilder`/`run_subgraph` — DONE, see P2** in the implementation
-  sequence above. The capability now exists; *using* it to infer an `IterativeRefinementSpec` from a
+  sequence above. The capability now exists; *using* it to infer a `FlowMatchingSpec` from a
   scripted-loop trace (a MIL loop body has one output per loop-carried var) is still deliberately not
   pursued — BACKEND.md's item 3 follow-up found that inferring the spec isn't worth building yet compared
   to the ~13-line declarative spec it would replace.

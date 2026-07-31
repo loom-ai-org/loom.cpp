@@ -1,5 +1,5 @@
 """
-Checks `iterative_export.py` (EXPORT-IMPROVEMENT.md item 4). Two things matter here:
+Checks `flow_matching_export.py` (EXPORT-IMPROVEMENT.md item 4). Two things matter here:
 
 * the generated Euler sampler must reproduce, exactly, the loop the Matcha/Supertonic drivers hand-wrote
   -- those two are numerically pinned end-to-end by `test_e2e_{matcha,supertonic}_mil_lua_driver.cpp`,
@@ -14,8 +14,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from loom_mil_compiler.iterative_export import (
-    SAMPLER_MARKER, EstimatorSpec, IterativeRefinementSpec, render_driver, render_sampler,
+from loom_mil_compiler.flow_matching_export import (
+    SAMPLER_MARKER, EstimatorSpec, FlowMatchingSpec, render_driver, render_sampler,
 )
 
 
@@ -23,9 +23,9 @@ def _topology(*input_names):
     return {"inputs": [{"name": n} for n in input_names]}
 
 
-MATCHA = IterativeRefinementSpec(func_name="sample_decoder", estimator="decoder",
+MATCHA = FlowMatchingSpec(func_name="sample_decoder", estimator="decoder",
                                  carried_input="z", fixed_inputs=["mu"])
-SUPERTONIC = IterativeRefinementSpec(func_name="sample_vfe", estimator="vfe", carried_input="z_t",
+SUPERTONIC = FlowMatchingSpec(func_name="sample_vfe", estimator="vfe", carried_input="z_t",
                                      fixed_inputs=["txt_emb", "stl_emb"])
 
 

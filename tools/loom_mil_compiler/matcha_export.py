@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-"""
-Export the real Matcha-TTS checkpoint (`matcha_ljspeech.ckpt` + HiFi-GAN v1 `generator_v1`) through the
-generic MIL exporter, tracing the REAL `matcha.models.components.{text_encoder,decoder}`/
-`matcha.hifigan.models` submodules directly -- not the hand-built bespoke topology
-tools/convert_matcha/convert_matcha_*.py constructs op-by-op via its own custom `TopologyBuilder` DSL.
+"""Export the real Matcha-TTS checkpoint (`matcha_ljspeech.ckpt` + HiFi-GAN v1 `generator_v1`) through
+`TTSMatchaExportConfig` (BACKLOG.md P3.3, migrated from `export_matcha_mil.py`), tracing the REAL
+`matcha.models.components.{text_encoder,decoder}`/`matcha.hifigan.models` submodules directly -- not the
+hand-built bespoke topology `tools/convert_matcha/convert_matcha_*.py` constructs op-by-op via its own
+custom `TopologyBuilder` DSL.
 
 Four phases, same "GraphTopology supports exactly one declared output" split as the bespoke scripts:
   - encoder_mu:    TextEncoder up through proj_m -> mu, ne=[T,n_feats] (T-fast, matches the real
@@ -26,20 +25,20 @@ T-fast layout -- see `matcha_driver_mil.lua`'s own comment for the resulting dir
 `loom.expand_by_duration` reuse) repeat loop. Deliberately did NOT add a `.transpose()` in the wrapper to
 match the bespoke convention instead: a bare transpose as a topology's own final declared output is a
 live, non-contiguous GGML PERMUTE view once compiled (`ggml_backend_tensor_get` does a raw contiguous
-byte copy, silently ignoring it) -- same danger already documented in export_vits_mil.py's own
+byte copy, silently ignoring it) -- same danger already documented in `vits_export.py`'s own
 `StatsWrapper`, sidestepped there (and here) by keeping the trace's natural, untransposed output.
 
 Trace-friendliness patches needed (same category of fix as VITS's/StyleTTS2's own):
   - `TextEncoder`'s real `sequence_mask(x_lengths, T)` (dynamic `T`, "torch.full doesn't accept a
     non-constant size" issue) replaced by a direct all-ones mask, exact same fix/reasoning as
-    export_vits_mil.py's own `_text_encoder_forward` -- valid because this whole project's "single,
+    `vits_export.py`'s own `_text_encoder_forward` -- valid because this whole project's "single,
     unpadded utterance" convention means x_lengths == T always.
   - Real `huggingface-hub`/`transformers`/`diffusers` version-pin import chain workaround (same
-    self-contained stub pattern as export_kokoro_mil.py/export_styletts2_mil.py), needed because
+    self-contained stub pattern as `kokoro_export.py`/`styletts2_export.py`), needed because
     `matcha.models.components.{decoder,transformer}` import `diffusers.models.attention_processor.Attention`
     transitively through `diffusers.models.lora` -> `transformers` -> its own version gate, AND
     `diffusers.utils.dynamic_modules_utils` itself imports a `huggingface_hub.cached_download` symbol
-    removed in the huggingface_hub version installed here (never actually CALLED by anything this script
+    removed in the huggingface_hub version installed here (never actually CALLED by anything this module
     exercises -- stubbed to a no-op).
   - Real `matcha.utils.__init__` pulls in a chain of training-only tooling (hydra/rootutils/gdown/rich)
     that `matcha.models.components.text_encoder` transitively imports (`import matcha.utils as utils`,
@@ -50,57 +49,60 @@ Trace-friendliness patches needed (same category of fix as VITS's/StyleTTS2's ow
     dependency entirely rather than relying on it.)
 
 Usage:
-  ~/.venvs/piper/bin/python3 export_matcha_mil.py
+  loom-export /path/to/matcha/ckpt/dir -o matcha_mil.gguf --task tts-flow-matching --model matcha
 """
+import logging
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
 
-# --- transformers/huggingface-hub version-pin workaround (self-contained, same as export_kokoro_mil.py/
-#     export_styletts2_mil.py) ---
-_stub_versions = types.ModuleType("transformers.utils.versions")
-_stub_versions.require_version = lambda *a, **k: None
-_stub_versions.require_version_core = lambda *a, **k: None
-sys.modules["transformers.utils.versions"] = _stub_versions
-
-import huggingface_hub  # noqa: E402
-huggingface_hub.cached_download = lambda *a, **k: None
-
-# --- matcha.utils stand-in (bypasses the real package's training-tooling-heavy __init__ chain) ---
-_stub_matcha_utils = types.ModuleType("matcha.utils")
-import logging as _logging  # noqa: E402
+from .flow_matching_export import FlowMatchingSpec
+from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, TTSFlowMatchingModelExportConfig
+from .patcher import ModelPatcher
 
 
-def _get_pylogger(name=__name__):
-    return _logging.getLogger(name)
+class MatchaModelPatcher(ModelPatcher):
+    """Import-order stubs needed before Matcha's real package can be imported at all -- BACKLOG.md P3.3's
+    `ModelPatcher` hook. Self-contained (doesn't modify either installed package), same timing as the
+    original script's own top-of-file side effects."""
+
+    @staticmethod
+    def prepare_environment() -> None:
+        stub_versions = types.ModuleType("transformers.utils.versions")
+        stub_versions.require_version = lambda *a, **k: None
+        stub_versions.require_version_core = lambda *a, **k: None
+        sys.modules["transformers.utils.versions"] = stub_versions
+
+        import huggingface_hub
+        huggingface_hub.cached_download = lambda *a, **k: None
+
+        # matcha.utils stand-in (bypasses the real package's training-tooling-heavy __init__ chain).
+        stub_matcha_utils = types.ModuleType("matcha.utils")
+        stub_matcha_utils.get_pylogger = lambda name=__name__: logging.getLogger(name)
+        # Give the stand-in a real `__path__` pointing at the actual package directory so plain submodule
+        # imports (`matcha.utils.model`, which only needs numpy/torch, no heavy training tooling) still
+        # resolve normally through the standard import machinery instead of also needing to be stubbed.
+        stub_matcha_utils.__path__ = ["/home/flavio/Dev/Matcha-TTS/matcha/utils"]
+        sys.modules["matcha.utils"] = stub_matcha_utils
 
 
-_stub_matcha_utils.get_pylogger = _get_pylogger
-# Give the stand-in a real `__path__` pointing at the actual package directory so plain submodule
-# imports (`matcha.utils.model`, which only needs numpy/torch, no heavy training tooling) still resolve
-# normally through the standard import machinery instead of also needing to be stubbed.
-_stub_matcha_utils.__path__ = ["/home/flavio/Dev/Matcha-TTS/matcha/utils"]
-sys.modules["matcha.utils"] = _stub_matcha_utils
+MatchaModelPatcher.prepare_environment()
 
 sys.path.insert(0, "/home/flavio/Dev/Matcha-TTS")
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
-import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
-from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
-from loom_mil_compiler.iterative_export import IterativeRefinementSpec, render_driver  # noqa: E402
-from loom_mil_compiler import group_norm_op  # noqa: E402,F401  patches nn.GroupNorm.forward globally
 
 import coremltools as ct  # noqa: E402
+
+from . import group_norm_op  # noqa: E402,F401  patches nn.GroupNorm.forward globally
 
 from matcha.models.components.text_encoder import TextEncoder, RotaryPositionalEmbeddings  # noqa: E402
 from matcha.models.components.decoder import Decoder  # noqa: E402
 from matcha.hifigan.config import v1 as HIFIGAN_V1  # noqa: E402
 from matcha.hifigan.models import Generator  # noqa: E402
-
-MATCHA_CKPT_PATH = "/home/flavio/.claude/tmp/matcha_model/ckpt/matcha_ljspeech.ckpt"
-HIFIGAN_CKPT_PATH = "/home/flavio/.claude/tmp/matcha_model/ckpt/generator_v1"
 
 
 def _rope_build_cache_traceable(self, seq_len, device):
@@ -203,23 +205,6 @@ class LogwWrapper(torch.nn.Module):
         x_dp = torch.detach(x)
         logw = self.enc.proj_w(x_dp, x_mask)  # (1, 1, T)
         return logw.reshape(-1)  # (T,) -> ggml ne=[T]
-
-
-def _build_topology(wrapper, dummy_args, mil_inputs, name):
-    """Traces `wrapper`, converts to MIL, and runs it through the exporter far enough to get back its
-    topology JSON + weight dict WITHOUT writing a file -- mirrors export_vits_mil.py's own helper of the
-    same name/reasoning (per-phase `func_name` namespacing avoids cross-phase weight-name collisions from
-    independently-traced programs' own auto-generated internal-constant SSA names).
-    """
-    traced = torch.jit.trace(wrapper, dummy_args)
-    mil_prog = ct.convert(
-        traced, inputs=mil_inputs, convert_to="milinternal", compute_precision=ct.precision.FLOAT32,
-    )
-    exporter = LoomGGUFExporter(mil_prog)
-    main_func = mil_prog.functions["main"]
-    topo = exporter.generate_graph_topology(main_func, name)
-    print(f"  {name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
 
 
 def _block1d_forward_nomask(block1d, x):
@@ -331,8 +316,8 @@ class VocoderWrapper(torch.nn.Module):
         return wav.reshape(-1)  # (T*256,)
 
 
-def load_text_encoder():
-    ckpt = torch.load(MATCHA_CKPT_PATH, map_location="cpu", weights_only=False)
+def load_text_encoder(matcha_ckpt_path: str):
+    ckpt = torch.load(matcha_ckpt_path, map_location="cpu", weights_only=False)
     hp = ckpt["hyper_parameters"]
     sd = ckpt["state_dict"]
 
@@ -359,8 +344,8 @@ def load_decoder(hp, sd):
     return dec
 
 
-def load_vocoder():
-    ckpt = torch.load(HIFIGAN_CKPT_PATH, map_location="cpu", weights_only=False)
+def load_vocoder(hifigan_ckpt_path: str):
+    ckpt = torch.load(hifigan_ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["generator"]
     h = AttrDict(dict(HIFIGAN_V1))
     gen = Generator(h)
@@ -370,79 +355,99 @@ def load_vocoder():
     return gen
 
 
-def main():
-    print(f"Loading Matcha checkpoint {MATCHA_CKPT_PATH}...")
-    enc, hp, sd = load_text_encoder()
+@dataclass(kw_only=True)
+class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
+    """Matcha's own four-phase split (encoder_mu/encoder_logw/decoder/vocoder) plus the Euler CFM
+    sampler over `decoder` -- see module docstring. `model_dir` is the directory containing both
+    checkpoints (`matcha_ljspeech.ckpt` and the HiFi-GAN `generator_v1`, the real Matcha-TTS release
+    layout)."""
 
-    dummy_T = 12
-    dummy_tokens = torch.randint(1, hp["n_vocab"], (1, dummy_T), dtype=torch.long)
-    seq_dim = ct.RangeDim(4, 512)
+    model_dir: str
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_matcha" / "matcha_driver_mil.lua"
 
-    print("Tracing TextEncoder (mu, logw)...")
-    mu_topo, mu_weights = _build_topology(
-        MuWrapper(enc).eval(), (dummy_tokens,),
-        [ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)], "encoder_mu",
-    )
-    logw_topo, logw_weights = _build_topology(
-        LogwWrapper(enc).eval(), (dummy_tokens,),
-        [ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)], "encoder_logw",
-    )
+    def phases(self) -> List[ExportPhase]:
+        matcha_ckpt_path = str(Path(self.model_dir) / "matcha_ljspeech.ckpt")
+        hifigan_ckpt_path = str(Path(self.model_dir) / "generator_v1")
 
-    print("Tracing Decoder U-Net...")
-    n_feats = hp["n_feats"]
-    dec = load_decoder(hp, sd)
-    dummy_dec_T = 8  # multiple of 4, matches reference_forward_matcha_decoder.py's own fixture
-    dummy_z = torch.randn(1, n_feats, dummy_dec_T)
-    dummy_mu = torch.randn(1, n_feats, dummy_dec_T)
-    dummy_t = torch.tensor([0.37])
-    dec_seq_dim = ct.RangeDim(4, 2048)
-    decoder_topo, decoder_weights = _build_topology(
-        DecoderWrapper(dec).eval(), (dummy_z, dummy_mu, dummy_t),
-        [ct.TensorType(name="z", shape=(1, n_feats, dec_seq_dim), dtype=np.float32),
-         ct.TensorType(name="mu", shape=(1, n_feats, dec_seq_dim), dtype=np.float32),
-         ct.TensorType(name="t", shape=(1,), dtype=np.float32)], "decoder",
-    )
+        print(f"Loading Matcha checkpoint {matcha_ckpt_path}...")
+        enc, hp, sd = load_text_encoder(matcha_ckpt_path)
 
-    print("Tracing HiFi-GAN vocoder...")
-    gen = load_vocoder()
-    dummy_voc_T = 4
-    dummy_mel = torch.randn(1, n_feats, dummy_voc_T)
-    voc_seq_dim = ct.RangeDim(1, 4096)
-    vocoder_topo, vocoder_weights = _build_topology(
-        VocoderWrapper(gen).eval(), (dummy_mel,),
-        [ct.TensorType(name="mel", shape=(1, n_feats, voc_seq_dim), dtype=np.float32)], "vocoder",
-    )
+        dummy_T = 12
+        dummy_tokens = torch.randint(1, hp["n_vocab"], (1, dummy_T), dtype=torch.long)
+        seq_dim = ct.RangeDim(4, 512)
 
-    # Every weight is already namespaced per-phase (see _build_topology's own docstring) -- a plain dict
-    # union can't collide.
-    merged_weights = {**mu_weights, **logw_weights, **decoder_weights, **vocoder_weights}
-    assert len(merged_weights) == len(mu_weights) + len(logw_weights) + len(decoder_weights) + len(vocoder_weights)
+        print("Tracing TextEncoder (mu, logw)...")
+        mu_phase = ExportPhase(
+            name="encoder_mu", wrapper=MuWrapper(enc).eval(), dummy_inputs=(dummy_tokens,),
+            mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)],
+        )
+        logw_phase = ExportPhase(
+            name="encoder_logw", wrapper=LogwWrapper(enc).eval(), dummy_inputs=(dummy_tokens,),
+            mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)],
+        )
 
-    driver_script_path = Path(__file__).parent / "tools" / "convert_matcha" / "matcha_driver_mil.lua"
+        print("Tracing Decoder U-Net...")
+        n_feats = hp["n_feats"]
+        dec = load_decoder(hp, sd)
+        dummy_dec_T = 8  # multiple of 4, matches reference_forward_matcha_decoder.py's own fixture
+        dummy_z = torch.randn(1, n_feats, dummy_dec_T)
+        dummy_mu = torch.randn(1, n_feats, dummy_dec_T)
+        dummy_t = torch.tensor([0.37])
+        dec_seq_dim = ct.RangeDim(4, 2048)
+        decoder_phase = ExportPhase(
+            name="decoder", wrapper=DecoderWrapper(dec).eval(), dummy_inputs=(dummy_z, dummy_mu, dummy_t),
+            mil_inputs=[
+                ct.TensorType(name="z", shape=(1, n_feats, dec_seq_dim), dtype=np.float32),
+                ct.TensorType(name="mu", shape=(1, n_feats, dec_seq_dim), dtype=np.float32),
+                ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+            ],
+        )
 
-    out_exporter = LoomGGUFExporter(None, output_path="matcha_mil.gguf", architecture="matcha_mil")
-    out_exporter.topologies = {
-        "encoder_mu": mu_topo, "encoder_logw": logw_topo, "decoder": decoder_topo, "vocoder": vocoder_topo,
-    }
-    out_exporter.weights = merged_weights
+        print("Tracing HiFi-GAN vocoder...")
+        gen = load_vocoder(hifigan_ckpt_path)
+        dummy_voc_T = 4
+        dummy_mel = torch.randn(1, n_feats, dummy_voc_T)
+        voc_seq_dim = ct.RangeDim(1, 4096)
+        vocoder_phase = ExportPhase(
+            name="vocoder", wrapper=VocoderWrapper(gen).eval(), dummy_inputs=(dummy_mel,),
+            mil_inputs=[ct.TensorType(name="mel", shape=(1, n_feats, voc_seq_dim), dtype=np.float32)],
+        )
 
-    # The Euler CFM sampling loop is the shared "N-step refinement over loop-carried state" family
-    # (EXPORT-IMPROVEMENT.md item 4), so the driver declares it rather than hand-writing it -- and gets
-    # the spec cross-checked against "decoder"'s real declared inputs at export time.
-    cfm_sampler = IterativeRefinementSpec(
-        func_name="sample_decoder",
-        estimator="decoder",
-        carried_input="z",
-        time_input="t",
-        fixed_inputs=["mu"],
-        note="Deterministic Euler CFM sampling over the Matcha-TTS Decoder U-Net vector-field\n"
-              "estimator: z <- z + v(z, mu, t) * dt, uniform dt = 1/n_steps.",
-    )
-    driver_source = render_driver(driver_script_path.read_text(), [cfm_sampler],
-                                   topologies=out_exporter.topologies)
-    out_exporter.write_gguf(driver_source)
-    print("wrote matcha_mil.gguf")
+        return [mu_phase, logw_phase, decoder_phase, vocoder_phase]
+
+    def samplers(self) -> List[FlowMatchingSpec]:
+        # The Euler CFM sampling loop is the shared "N-step refinement over loop-carried state" family
+        # (EXPORT-IMPROVEMENT.md item 4), so the driver declares it rather than hand-writing it -- and
+        # gets the spec cross-checked against "decoder"'s real declared inputs at export time.
+        return [FlowMatchingSpec(
+            func_name="sample_decoder",
+            estimator="decoder",
+            carried_input="z",
+            time_input="t",
+            fixed_inputs=["mu"],
+            note="Deterministic Euler CFM sampling over the Matcha-TTS Decoder U-Net vector-field\n"
+                 "estimator: z <- z + v(z, mu, t) * dt, uniform dt = 1/n_steps.",
+        )]
 
 
-if __name__ == "__main__":
-    main()
+def _is_matcha(path: Path) -> bool:
+    """No auto-detection this pass -- requires an explicit `--task tts-flow-matching --model matcha`
+    (BACKLOG.md P3.3's stated scope limit). Matcha's own `.ckpt` is a Lightning-style checkpoint
+    (`hyper_parameters`/`state_dict` top-level keys, `load_text_encoder`'s own real structure) that could
+    plausibly be recognized by a cheap partial `torch.load` + key check, worth revisiting once a second
+    Lightning-checkpoint family exists to confirm the signature is actually distinguishing."""
+    return False
+
+
+def _build_matcha(path: Path, output_path: str) -> TTSMatchaExportConfig:
+    return TTSMatchaExportConfig(architecture="matcha_mil", output_path=output_path, model_dir=str(path))
+
+
+def register(registry) -> None:
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="tts-flow-matching",
+        config_class=TTSFlowMatchingModelExportConfig,
+        recognizers=[ModelRecognizer(name="matcha", detect=_is_matcha, build_config=_build_matcha)],
+    ))

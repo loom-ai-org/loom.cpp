@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-"""
-Exports StyleTTS2's (yl4579/StyleTTS2-LJSpeech) MIL-traceable phases into ONE combined
-styletts2_mil.gguf alongside the embedded styletts2_driver_mil.lua orchestration script:
+"""Exports StyleTTS2's (yl4579/StyleTTS2-LJSpeech) MIL-traceable phases into ONE combined
+`styletts2_mil.gguf` (BACKLOG.md P3.3, migrated from `export_styletts2_mil.py`) alongside the embedded
+`styletts2_driver_mil.lua` orchestration script:
   - "albert": CustomAlbert (a real transformers.AlbertModel) alone -- input_ids -> raw bert_dur, (T,768)
-    time-major. UNLIKE export_kokoro_mil.py's own combined "albert_bert_encoder" (which fuses in the
+    time-major. UNLIKE `kokoro_export.py`'s own combined "albert_bert_encoder" (which fuses in the
     bert_encoder Linear too), this phase stops at bert_dur because StyleTTS2's diffusion sampler needs
     the RAW (unprojected) bert_dur as its own conditioning input (real source: `sampler(noise,
     embedding=bert_dur[0].unsqueeze(0), ...)` in Demo/Inference_LJSpeech.ipynb) -- bert_encoder's
@@ -12,9 +11,9 @@ styletts2_mil.gguf alongside the embedded styletts2_driver_mil.lua orchestration
     convert_kokoro_bert_encoder.py) -- a single Linear is zero-risk to hand-build and there's nothing a
     trace would improve about it, so it's out of scope here.
   - "decoder_vocoder": Decoder.encode/decode + SineGen + STFT + Generator -- DIRECT reuse of
-    export_kokoro_mil.py's own DecoderVocoderWrapper/build_decoder_vocoder_topology/VerifiedSTFT
+    `kokoro_export.py`'s own `DecoderVocoderWrapper`/`build_decoder_vocoder_phase`/`VerifiedSTFT`
     (including its trace-friendly AdainResBlk1d/SineGen/SourceModuleHnNSF/Generator/Decoder monkeypatches,
-    applied globally at `import export_kokoro_mil` time) -- the REAL payoff of "using Kokoro's lessons":
+    applied globally at `import .kokoro_export` time) -- the REAL payoff of "using Kokoro's lessons":
     Kokoro's own istftnet.py Decoder/Generator/SineGen classes ARE StyleTTS2's own classes (Kokoro is a
     fork of this exact architecture), so tracing them with StyleTTS2's own checkpoint weights instead of
     Kokoro's needs zero new code, only a different state dict loaded into the same real nn.Module classes.
@@ -32,48 +31,67 @@ Everything else (DurationEncoder/predictor.lstm/duration_proj, F0Ntrain, TextEnc
 the existing bespoke, hand-built LSTM-bound topologies from convert_styletts2_reused.py -- ggml has no
 native LSTM op, same deliberate scoping exclusion Kokoro's own MIL export already established.
 
-Numerically verified against real-checkpoint references (see tools/convert_styletts2/
-reference_forward_styletts2_{albert_mil,diffusion}.py and export_kokoro_mil.py's own already-verified
-decoder_vocoder reference reused as-is): see test_e2e_styletts2_mil_*.cpp for the actual tolerances.
+StyleTTS2's diffusion sampler is ADPM2 over a Karras sigma schedule -- two network evaluations per step,
+per-step noise injection, and real preconditioning math around the call -- so it is NOT a
+`TTSFlowMatchingModelExportConfig` (`flow_matching_export.py`'s own docstring documents why this can't be
+generalized the way Matcha's/Supertonic's plain Euler CFM integration can). This class stays a plain
+`BaseMultiPhaseModelExportConfig` with the ADPM2 loop hand-written in `styletts2_driver_mil.lua` and only
+`EstimatorSpec`-checked via `estimators()`: the sampler's per-step `run_subgraph` call still gets the same
+export-time validation against the real traced "diffusion" topology, generating no codegen.
+
+Numerically verified against real-checkpoint references (see `tools/convert_styletts2/
+reference_forward_styletts2_{albert_mil,diffusion}.py` and `kokoro_export.py`'s own already-verified
+decoder_vocoder reference reused as-is): see `test_e2e_styletts2_mil_*.cpp` for the actual tolerances.
 
 Usage:
-  ~/.venvs/piper/bin/python3 export_styletts2_mil.py
+  loom-export /path/to/styletts2.pth -o styletts2_mil.gguf --task tts-multi-phase --model styletts2
 """
 import json
 import sys
+import types
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
 import coremltools as ct
 
-# --- transformers/huggingface-hub version-pin workaround (self-contained, same as export_kokoro_mil.py) ---
-import types
-_stub = types.ModuleType("transformers.utils.versions")
-_stub.require_version = lambda *a, **k: None
-_stub.require_version_core = lambda *a, **k: None
-sys.modules["transformers.utils.versions"] = _stub
+from .flow_matching_export import EstimatorSpec
+from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+from .patcher import ModelPatcher
+
+
+class StyleTTS2ModelPatcher(ModelPatcher):
+    """Import-order stub needed before `transformers.AlbertModel` (via `kokoro.modules.CustomAlbert`)
+    can be imported at all -- same self-contained pattern as `kokoro_export.py`'s own."""
+
+    @staticmethod
+    def prepare_environment() -> None:
+        stub = types.ModuleType("transformers.utils.versions")
+        stub.require_version = lambda *a, **k: None
+        stub.require_version_core = lambda *a, **k: None
+        sys.modules["transformers.utils.versions"] = stub
+
+
+StyleTTS2ModelPatcher.prepare_environment()
 
 from transformers import AlbertConfig  # noqa: E402
 from kokoro.modules import CustomAlbert  # noqa: E402
 from kokoro.istftnet import Decoder  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools" / "loom_mil_compiler" / ".."))
-import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
-from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
-from loom_mil_compiler.iterative_export import EstimatorSpec, render_driver  # noqa: E402
-
-# import_kokoro_mil applies its own trace-friendly monkeypatches (AdainResBlk1d/SineGen/
+# `kokoro_export`'s own import applies its trace-friendly monkeypatches (AdainResBlk1d/SineGen/
 # SourceModuleHnNSF/Generator/Decoder) globally as an import side effect -- needed before tracing
-# StyleTTS2's OWN Decoder instance below, since it's the exact same class.
-import export_kokoro_mil as ekm  # noqa: E402
+# StyleTTS2's OWN Decoder instance below, since it's the exact same class. `build_decoder_vocoder_phase`
+# is reused directly rather than re-implemented (BACKLOG.md P3.3's "real cross-model dependency" note).
+from . import kokoro_export  # noqa: E402
 
 sys.path.insert(0, "/home/flavio/Dev/styletts2")  # read-only reference clone, see memory: readonly repos
 from Modules.diffusion.modules import Transformer1d, AttentionBase  # noqa: E402
 from einops import rearrange  # noqa: E402
 from einops_exts import rearrange_many  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools" / "convert_styletts2"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_styletts2"))
 from convert_styletts2_diffusion import HP as DIFF_HP  # noqa: E402
 
 
@@ -166,9 +184,6 @@ def _transformer1d_run_traceable(self, x, time, embedding, features):
 
 Transformer1d.run = _transformer1d_run_traceable
 
-KOKORO_CONFIG_PATH = "/home/flavio/.claude/tmp/kokoro_model/config.json"
-STYLETTS2_CKPT_PATH = "/home/flavio/.claude/tmp/styletts2_model/ckpt/Models/LJSpeech/epoch_2nd_00100.pth"
-
 
 def load_submodule(module, state_dict):
     """Same fallback convention as kokoro.model.KModel.__init__'s own checkpoint-loading loop: try the
@@ -183,7 +198,7 @@ def load_submodule(module, state_dict):
 
 class AlbertWrapper(torch.nn.Module):
     """Traces CustomAlbert (KModel.bert, a real transformers.AlbertModel returning last_hidden_state)
-    ALONE -- see this file's own module docstring for why this stops short of export_kokoro_mil.py's
+    ALONE -- see this file's own module docstring for why this stops short of `kokoro_export.py`'s
     combined AlbertBertEncoderWrapper (StyleTTS2's diffusion sampler needs this exact raw tensor as its
     own conditioning input). Same all-ones attention_mask / all-zeros token_type_ids / no-final-transpose
     conventions as AlbertBertEncoderWrapper, for the identical reasons documented there.
@@ -200,23 +215,17 @@ class AlbertWrapper(torch.nn.Module):
         return bert_dur.reshape(bert_dur.shape[1], bert_dur.shape[2])  # (T,768), row-major/time-major
 
 
-def build_albert_topology(bert, dummy_t=7, vocab_size=178):
+def build_albert_phase(bert, dummy_t=7, vocab_size=178) -> ExportPhase:
     wrapper = AlbertWrapper(bert).eval()
     dummy_input_ids = torch.randint(0, vocab_size, (1, dummy_t), dtype=torch.long)
     with torch.no_grad():
         wrapper(dummy_input_ids)  # eager sanity check before tracing
 
-    traced = torch.jit.trace(wrapper, (dummy_input_ids,))
     seq = ct.RangeDim(1, 2000)
-    mil_inputs = [ct.TensorType(name="tokens", shape=(1, seq), dtype=np.int32)]
-    prog = ct.convert(traced, inputs=mil_inputs, convert_to="milinternal",
-                       compute_precision=ct.precision.FLOAT32)
-    main_func = prog.functions["main"]
-
-    exporter = LoomGGUFExporter(prog)
-    topo = exporter.generate_graph_topology(main_func, "albert")
-    print(f"  albert: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
+    return ExportPhase(
+        name="albert", wrapper=wrapper, dummy_inputs=(dummy_input_ids,),
+        mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq), dtype=np.int32)],
+    )
 
 
 class DiffusionNetWrapper(torch.nn.Module):
@@ -255,7 +264,7 @@ class DiffusionNetWrapper(torch.nn.Module):
         return out.reshape(out.shape[-1])
 
 
-def build_diffusion_topology(transformer, dummy_t=6):
+def build_diffusion_phase(transformer, dummy_t=6) -> ExportPhase:
     channels = DIFF_HP["channels"]
     ctx_feat = DIFF_HP["context_embedding_features"]
     wrapper = DiffusionNetWrapper(transformer).eval()
@@ -266,85 +275,89 @@ def build_diffusion_topology(transformer, dummy_t=6):
     with torch.no_grad():
         wrapper(dummy_x, dummy_time, dummy_embedding)  # eager sanity check before tracing
 
-    traced = torch.jit.trace(wrapper, (dummy_x, dummy_time, dummy_embedding))
     seq = ct.RangeDim(1, 2000)
-    mil_inputs = [
-        ct.TensorType(name="x_in", shape=(channels,), dtype=np.float32),
-        ct.TensorType(name="time", shape=(1,), dtype=np.float32),
-        ct.TensorType(name="embedding", shape=(seq, ctx_feat), dtype=np.float32),
-    ]
-    prog = ct.convert(traced, inputs=mil_inputs, convert_to="milinternal",
-                       compute_precision=ct.precision.FLOAT32)
-    main_func = prog.functions["main"]
-
-    exporter = LoomGGUFExporter(prog)
-    topo = exporter.generate_graph_topology(main_func, "diffusion")
-    print(f"  diffusion: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
+    return ExportPhase(
+        name="diffusion", wrapper=wrapper, dummy_inputs=(dummy_x, dummy_time, dummy_embedding),
+        mil_inputs=[
+            ct.TensorType(name="x_in", shape=(channels,), dtype=np.float32),
+            ct.TensorType(name="time", shape=(1,), dtype=np.float32),
+            ct.TensorType(name="embedding", shape=(seq, ctx_feat), dtype=np.float32),
+        ],
+    )
 
 
-def main():
-    print(f"Loading StyleTTS2 checkpoint {STYLETTS2_CKPT_PATH}...")
-    sd_all = torch.load(STYLETTS2_CKPT_PATH, map_location="cpu", weights_only=True)["net"]
+@dataclass(kw_only=True)
+class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
+    """StyleTTS2's own three-phase split (albert/decoder_vocoder/diffusion) -- see module docstring.
+    `kokoro_config_path` supplies the real hyperparameters this checkpoint shares byte-identically with
+    Kokoro's own KokoroConfig (see `styletts2_driver.h`'s own top comment / `tools/convert_styletts2/
+    PLAN.md`) -- a genuinely separate dependency from `checkpoint_path` (StyleTTS2's own weights)."""
 
-    kokoro_cfg = json.load(open(KOKORO_CONFIG_PATH))
-    # Real hyperparameters confirmed byte-identical to Kokoro's own KokoroConfig -- see
-    # styletts2_driver.h's own top comment / tools/convert_styletts2/PLAN.md.
-    bert = CustomAlbert(AlbertConfig(vocab_size=kokoro_cfg["n_token"], **kokoro_cfg["plbert"]))
-    decoder = Decoder(dim_in=kokoro_cfg["hidden_dim"], style_dim=kokoro_cfg["style_dim"],
-                       dim_out=kokoro_cfg["n_mels"], disable_complex=True, **kokoro_cfg["istftnet"])
-    load_submodule(bert, sd_all["bert"])
-    load_submodule(decoder, sd_all["decoder"])
-    bert.eval()
-    decoder.eval()
+    checkpoint_path: str
+    kokoro_config_path: str = "/home/flavio/.claude/tmp/kokoro_model/config.json"
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver_mil.lua"
 
-    transformer = Transformer1d(num_layers=DIFF_HP["num_layers"], channels=DIFF_HP["channels"],
-                                 num_heads=DIFF_HP["num_heads"], head_features=DIFF_HP["head_features"],
-                                 multiplier=DIFF_HP["multiplier"],
-                                 context_embedding_features=DIFF_HP["context_embedding_features"])
-    diff_prefix = "module.unet."
-    diff_sd = {k[len(diff_prefix):]: v for k, v in sd_all["diffusion"].items() if k.startswith(diff_prefix)}
-    transformer.load_state_dict(diff_sd)
-    transformer.eval()
+    def phases(self) -> List[ExportPhase]:
+        print(f"Loading StyleTTS2 checkpoint {self.checkpoint_path}...")
+        sd_all = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)["net"]
 
-    print("Tracing albert phase...")
-    albert_topo, albert_weights = build_albert_topology(bert)
+        kokoro_cfg = json.load(open(self.kokoro_config_path))
+        # Real hyperparameters confirmed byte-identical to Kokoro's own KokoroConfig -- see
+        # styletts2_driver.h's own top comment / tools/convert_styletts2/PLAN.md.
+        bert = CustomAlbert(AlbertConfig(vocab_size=kokoro_cfg["n_token"], **kokoro_cfg["plbert"]))
+        decoder = Decoder(dim_in=kokoro_cfg["hidden_dim"], style_dim=kokoro_cfg["style_dim"],
+                           dim_out=kokoro_cfg["n_mels"], disable_complex=True, **kokoro_cfg["istftnet"])
+        load_submodule(bert, sd_all["bert"])
+        load_submodule(decoder, sd_all["decoder"])
+        bert.eval()
+        decoder.eval()
 
-    print("Tracing decoder_vocoder phase...")
-    dv_topo, dv_weights = ekm.build_decoder_vocoder_topology(decoder)
+        transformer = Transformer1d(num_layers=DIFF_HP["num_layers"], channels=DIFF_HP["channels"],
+                                     num_heads=DIFF_HP["num_heads"], head_features=DIFF_HP["head_features"],
+                                     multiplier=DIFF_HP["multiplier"],
+                                     context_embedding_features=DIFF_HP["context_embedding_features"])
+        diff_prefix = "module.unet."
+        diff_sd = {k[len(diff_prefix):]: v for k, v in sd_all["diffusion"].items() if k.startswith(diff_prefix)}
+        transformer.load_state_dict(diff_sd)
+        transformer.eval()
 
-    print("Tracing diffusion phase...")
-    diff_topo, diff_weights = build_diffusion_topology(transformer)
+        print("Tracing albert phase...")
+        albert_phase = build_albert_phase(bert)
 
-    # Weight names are namespaced per-phase by each wrapper's own module attribute prefix ("bert.*",
-    # "dec.*", "net.*") -- no collision expected, but merge with the same content-aware
-    # dedup-on-match/hard-fail-on-mismatch safety net export_kokoro_mil.py's own main() already uses.
-    merged_weights = dict(albert_weights)
-    for phase_weights in (dv_weights, diff_weights):
-        for k, v in phase_weights.items():
-            if k in merged_weights:
-                assert np.array_equal(merged_weights[k], v), \
-                    f"real weight name collision merging StyleTTS2 MIL weights: {k!r} has DIFFERENT values"
-                continue
-            merged_weights[k] = v
+        print("Tracing decoder_vocoder phase...")
+        dv_phase = kokoro_export.build_decoder_vocoder_phase(decoder)
 
-    driver_script_path = Path(__file__).resolve().parent / "tools" / "convert_styletts2" / "styletts2_driver_mil.lua"
+        print("Tracing diffusion phase...")
+        diffusion_phase = build_diffusion_phase(transformer)
 
-    out_exporter = LoomGGUFExporter(None, output_path="styletts2_mil.gguf",
-                                     architecture="loom-styletts2-mil")
-    out_exporter.topologies = {"albert": albert_topo, "decoder_vocoder": dv_topo, "diffusion": diff_topo}
-    out_exporter.weights = merged_weights
+        return [albert_phase, dv_phase, diffusion_phase]
 
-    # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
-    # true one-offs, and this one is a second-order sampler with two network evaluations and real
-    # preconditioning math per step -- see styletts2_driver_mil.lua). But its per-step `run_subgraph`
-    # call has the same failure mode as every generated one, so it is declared here and cross-checked
-    # against the real traced "diffusion" topology at export time rather than at run time.
-    diffusion_call = EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "embedding"])
-    driver_source = render_driver(driver_script_path.read_text(), topologies=out_exporter.topologies,
-                                   estimators=[diffusion_call])
-    out_exporter.write_gguf(driver_source)
+    def estimators(self) -> List[EstimatorSpec]:
+        # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
+        # true one-offs, and this one is a second-order sampler with two network evaluations and real
+        # preconditioning math per step -- see styletts2_driver_mil.lua). But its per-step `run_subgraph`
+        # call has the same failure mode as every generated one, so it is declared here and cross-checked
+        # against the real traced "diffusion" topology at export time rather than at run time.
+        return [EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "embedding"])]
 
 
-if __name__ == "__main__":
-    main()
+def _is_styletts2(path: Path) -> bool:
+    """No auto-detection this pass -- requires an explicit `--task tts-multi-phase --model styletts2`
+    (BACKLOG.md P3.3's stated scope limit)."""
+    return False
+
+
+def _build_styletts2(path: Path, output_path: str) -> TTSStyleTTS2ExportConfig:
+    return TTSStyleTTS2ExportConfig(
+        architecture="loom-styletts2-mil", output_path=output_path, checkpoint_path=str(path),
+    )
+
+
+def register(registry) -> None:
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="tts-multi-phase",
+        config_class=BaseMultiPhaseModelExportConfig,
+        recognizers=[ModelRecognizer(name="styletts2", detect=_is_styletts2, build_config=_build_styletts2)],
+    ))

@@ -1,21 +1,20 @@
-#!/usr/bin/env python3
-"""
-Exports Kokoro-82M's two LSTM-free phases through the generic MIL exporter, into ONE combined
-kokoro_mil.gguf alongside the embedded kokoro_driver_mil.lua orchestration script:
+"""Exports Kokoro-82M's two LSTM-free phases through `TTSKokoroExportConfig` (BACKLOG.md P3.3, migrated
+from `export_kokoro_mil.py`), into ONE combined `kokoro_mil.gguf` alongside the embedded
+`kokoro_driver_mil.lua` orchestration script:
   - "albert_bert_encoder": CustomAlbert (a real transformers.AlbertModel) + bert_encoder (Linear(768,512))
     -- replaces convert_kokoro_albert.py + convert_kokoro_bert_encoder.py's two hand-built topologies.
   - "decoder_vocoder": Decoder.encode/decode + SineGen + STFT + Generator -- replaces FOUR bespoke
     scripts, convert_kokoro_{decoder_core,sinegen,stft,generator}.py, in one combined trace.
 Kokoro leans heavily on `torch.nn.LSTM` elsewhere (TextEncoder, DurationEncoder, predictor.lstm,
 F0Ntrain's shared LSTM) -- ggml has no native LSTM op, so those pieces are a deliberate scoping
-exclusion: kokoro_driver_mil.lua wires these two MIL-traced topologies together with the EXISTING
-bespoke, hand-built LSTM-bound topologies (tools/convert_kokoro/convert_kokoro_lua_all.py's own
-kokoro.gguf), not a full re-trace of the whole model.
+exclusion: `kokoro_driver_mil.lua` wires these two MIL-traced topologies together with the EXISTING
+bespoke, hand-built LSTM-bound topologies (`tools/convert_kokoro/convert_kokoro_lua_all.py`'s own
+`kokoro.gguf`), not a full re-trace of the whole model.
 
 Both phases numerically verified against real-checkpoint references
-(tools/convert_kokoro/reference_forward_kokoro_{albert_bert_encoder_mil,decoder_vocoder_mil}.py):
+(`tools/convert_kokoro/reference_forward_kokoro_{albert_bert_encoder_mil,decoder_vocoder_mil}.py`):
 albert_bert_encoder to ~1.8e-6 mean/~1.5e-5 max abs diff; decoder_vocoder to ~5.1e-4 mean/~2.5e-2 max abs
-diff (see test_e2e_kokoro_mil_decoder_vocoder_reference.cpp's own comments for why the looser max bound
+diff (see `test_e2e_kokoro_mil_decoder_vocoder_reference.cpp`'s own comments for why the looser max bound
 -- a real, bounded, HiFi-GAN-vocoder amplification ceiling, same category as StyleTTS2's own documented
 one, not a further-fixable bug). Getting both phases to trace/build/compute at all surfaced the usual
 long tail of general (not Kokoro-specific) exporter/primitive bugs -- see BACKLOG.md for the full trail
@@ -38,12 +37,15 @@ alone, i.e. "builds and produces a finite waveform," did not, and would not, cat
     -0.0).
 
 Usage:
-  ~/.venvs/piper/bin/python3 export_kokoro_mil.py
+  loom-export /path/to/kokoro/dir -o kokoro_mil.gguf --task tts-multi-phase --model kokoro
 """
 import json
 import math
 import sys
+import types
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
@@ -52,55 +54,56 @@ import coremltools as ct
 from coremltools.converters.mil.frontend.torch import ops as _torch_ops
 from coremltools.converters.mil.mil import Builder as _mb
 
-# --- coremltools/numpy version-incompatibility workaround (self-contained, doesn't touch the
-# installed package) ---------------------------------------------------------------------------
-# coremltools 9.0's own `_cast` op converter does `dtype(x.val)` unconditionally once it's decided
-# `x` is a compile-time constant "scalar or length-1 tensor" (its own docstring/shape check already
-# allows a genuine (1,1,...,1)-shaped array, not just a true 0-d one) -- but numpy>=1.25 rejects
-# int()/float() on anything but a strictly 0-d array, even a 1-element one. First hit tracing
-# SineGen's dynamic-length F.interpolate calls (their own internal size computation produces exactly
-# this shape). Squeeze to a genuine 0-d value first, matching the intent of the pre-existing check.
-_orig_cast = _torch_ops._cast
+from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+from .patcher import ModelPatcher
 
 
-def _patched_cast(context, node, dtype, dtype_name):
-    inputs = _torch_ops._get_inputs(context, node, expected=1)
-    x = inputs[0]
-    if x.can_be_folded_to_const() and not isinstance(x.val, dtype):
-        val = np.asarray(x.val).reshape(())
-        context.add(_mb.const(val=dtype(val), name=node.name))
-        return
-    return _orig_cast(context, node, dtype, dtype_name)
+class KokoroModelPatcher(ModelPatcher):
+    """Import-order stubs needed before Kokoro's real package (and the `transformers.AlbertModel` it
+    wraps) can be imported at all -- BACKLOG.md P3.3's `ModelPatcher` hook. Both patches are
+    self-contained (don't modify either installed package) and were already applied at plain module-load
+    time in the original script; wrapping them in this named hook doesn't change when they run, only
+    documents what they're for."""
+
+    @staticmethod
+    def prepare_environment() -> None:
+        # coremltools 9.0's own `_cast` op converter does `dtype(x.val)` unconditionally once it's
+        # decided `x` is a compile-time constant "scalar or length-1 tensor" (its own docstring/shape
+        # check already allows a genuine (1,1,...,1)-shaped array, not just a true 0-d one) -- but
+        # numpy>=1.25 rejects int()/float() on anything but a strictly 0-d array, even a 1-element one.
+        # First hit tracing SineGen's dynamic-length F.interpolate calls (their own internal size
+        # computation produces exactly this shape). Squeeze to a genuine 0-d value first, matching the
+        # intent of the pre-existing check.
+        orig_cast = _torch_ops._cast
+
+        def _patched_cast(context, node, dtype, dtype_name):
+            inputs = _torch_ops._get_inputs(context, node, expected=1)
+            x = inputs[0]
+            if x.can_be_folded_to_const() and not isinstance(x.val, dtype):
+                val = np.asarray(x.val).reshape(())
+                context.add(_mb.const(val=dtype(val), name=node.name))
+                return
+            return orig_cast(context, node, dtype, dtype_name)
+
+        _torch_ops._cast = _patched_cast
+
+        # The `kokoro` package's own CustomAlbert needs a real `transformers.AlbertModel`, but this
+        # venv's huggingface_hub is newer than transformers' own `<1.0` advisory pin -- an ImportError at
+        # package-metadata-check time, not a genuine runtime incompatibility (confirmed: AlbertModel
+        # imports and runs fine once the check itself is bypassed).
+        stub = types.ModuleType("transformers.utils.versions")
+        stub.require_version = lambda *a, **k: None
+        stub.require_version_core = lambda *a, **k: None
+        sys.modules["transformers.utils.versions"] = stub
 
 
-_torch_ops._cast = _patched_cast
+KokoroModelPatcher.prepare_environment()
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools" / "convert_kokoro"))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_kokoro"))
 from kokoro_stft_common import build_forward_dft_kernels, build_inverse_synth_kernels  # noqa: E402
-
-# --- transformers/huggingface-hub version-pin workaround (self-contained) ----------------------
-# The `kokoro` package's own CustomAlbert needs a real `transformers.AlbertModel`, but this venv's
-# huggingface_hub (1.24.0, needed for other tools sharing this venv, e.g. NeMo) is newer than
-# transformers 4.57.6's own `<1.0` advisory pin -- an ImportError at package-metadata-check time, not
-# a genuine runtime incompatibility (confirmed: AlbertModel imports and runs fine once the check
-# itself is bypassed). Stubbing out just the version-check submodule (not modifying either installed
-# package) sidesteps it -- same self-contained-monkeypatch convention as the _cast fix above.
-import types  # noqa: E402
-_stub = types.ModuleType("transformers.utils.versions")
-_stub.require_version = lambda *a, **k: None
-_stub.require_version_core = lambda *a, **k: None
-sys.modules["transformers.utils.versions"] = _stub
 
 from kokoro.model import KModel  # noqa: E402
 from kokoro.istftnet import AdainResBlk1d, SineGen, SourceModuleHnNSF, Generator, Decoder  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tools" / "loom_mil_compiler" / ".."))
-import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
-from loom_mil_compiler.exporter import LoomGGUFExporter  # noqa: E402
-
-CKPT_PATH = "/home/flavio/.claude/tmp/kokoro_model/kokoro-v1_0.pth"
-CONFIG_PATH = "/home/flavio/.claude/tmp/kokoro_model/config.json"
 
 _STFT_N_FFT = 20  # gen_istft_n_fft, real checkpoint config
 _STFT_HOP = 5  # gen_istft_hop_size
@@ -364,26 +367,24 @@ class AlbertBertEncoderWrapper(torch.nn.Module):
         return d_en.reshape(d_en.shape[1], d_en.shape[2])  # (T,512)
 
 
-def build_albert_bert_encoder_topology(bert, bert_encoder, dummy_t=7, vocab_size=178):
-    """Traces AlbertBertEncoderWrapper and runs it through the exporter, mirroring
-    build_decoder_vocoder_topology's own shape."""
+def build_albert_bert_encoder_phase(bert, bert_encoder, dummy_t=7, vocab_size=178) -> ExportPhase:
+    """Builds the `albert_bert_encoder` phase's `ExportPhase` (wrapper + dummy inputs + MIL input
+    declarations) -- mirrors `build_decoder_vocoder_phase`'s own shape. Was
+    `build_albert_bert_encoder_topology`, which additionally traced/converted/generated the topology
+    itself; that part is now `BaseMultiPhaseModelExportConfig.export()`'s shared loop, so this function
+    only builds the phase's own inputs -- same eager sanity-check-before-tracing behavior, just with the
+    trace itself deferred to the shared loop."""
     wrapper = AlbertBertEncoderWrapper(bert, bert_encoder).eval()
 
     dummy_input_ids = torch.randint(0, vocab_size, (1, dummy_t), dtype=torch.long)
     with torch.no_grad():
         wrapper(dummy_input_ids)  # eager sanity check before tracing
 
-    traced = torch.jit.trace(wrapper, (dummy_input_ids,))
     seq = ct.RangeDim(1, 2000)
-    mil_inputs = [ct.TensorType(name="tokens", shape=(1, seq), dtype=np.int32)]
-    prog = ct.convert(traced, inputs=mil_inputs, convert_to="milinternal",
-                       compute_precision=ct.precision.FLOAT32)
-    main_func = prog.functions["main"]
-
-    exporter = LoomGGUFExporter(prog)
-    topo = exporter.generate_graph_topology(main_func, "albert_bert_encoder")
-    print(f"  albert_bert_encoder: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
+    return ExportPhase(
+        name="albert_bert_encoder", wrapper=wrapper, dummy_inputs=(dummy_input_ids,),
+        mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq), dtype=np.int32)],
+    )
 
 
 class DecoderVocoderWrapper(torch.nn.Module):
@@ -411,9 +412,15 @@ def compute_wsum_np(t_frames, n_fft=_STFT_N_FFT, hop=_STFT_HOP, upsample_scale=_
     return wsum
 
 
-def build_decoder_vocoder_topology(decoder, dummy_t_frames=40, dim_in=512):
-    """Traces DecoderVocoderWrapper and runs it through the exporter far enough to get back its
-    topology JSON + weight dict, mirroring export_vits_mil.py's own `_build_topology` helper."""
+def build_decoder_vocoder_phase(decoder, dummy_t_frames=40, dim_in=512) -> ExportPhase:
+    """Builds the `decoder_vocoder` phase's `ExportPhase` -- kept as a MODULE-LEVEL function (not a
+    method on `TTSKokoroExportConfig`) so `styletts2_export.py` can still call it directly: StyleTTS2 and
+    Kokoro share the identical iSTFTNet decoder/vocoder architecture (BACKLOG.md P3.3's "real
+    cross-model dependency" note -- was `import export_kokoro_mil as ekm; ekm.build_decoder_vocoder_topology(decoder)`).
+    Was `build_decoder_vocoder_topology`, which additionally traced/converted/generated the topology
+    itself; see `build_albert_bert_encoder_phase`'s own docstring for why that part moved to the shared
+    export loop.
+    """
     decoder.generator.verified_stft = VerifiedSTFT(_STFT_N_FFT, _STFT_HOP)
     wrapper = DecoderVocoderWrapper(decoder).eval()
 
@@ -432,7 +439,6 @@ def build_decoder_vocoder_topology(decoder, dummy_t_frames=40, dim_in=512):
     with torch.no_grad():
         wrapper(*dummy_args)  # eager sanity check before tracing
 
-    traced = torch.jit.trace(wrapper, dummy_args)
     seq = ct.RangeDim(1, 2000)
     mil_inputs = [
         ct.TensorType(name="asr", shape=(1, dim_in, seq), dtype=np.float32),
@@ -443,59 +449,68 @@ def build_decoder_vocoder_topology(decoder, dummy_t_frames=40, dim_in=512):
         ct.TensorType(name="noise_in", shape=(1, ct.RangeDim(1, 600000), dim), dtype=np.float32),
         ct.TensorType(name="wsum", shape=(ct.RangeDim(1, 600000),), dtype=np.float32),
     ]
-    prog = ct.convert(traced, inputs=mil_inputs, convert_to="milinternal",
-                       compute_precision=ct.precision.FLOAT32)
-    main_func = prog.functions["main"]
-
     # "asr"'s own axis is this phase's one true dynamic quantity -- the post-encoder acoustic/ASR
     # frame count (EXPORT-ROADMAP.md R1, axes.py's N_ENC_FRAMES), not a token count. f0_curve/n_curve/
     # noise_in/wsum are genuinely independent LEAF inputs whose real length is a fixed multiple of
     # that same frame count (2x/600x/600x+20 respectively) -- not derivable from the graph (see
     # LoomGGUFExporter's `declared_axes` docstring in exporter.py). Declared by input name and axis
     # position; the exporter reads each input's own real traced symbol itself.
-    exporter = LoomGGUFExporter(prog, root_axis="n_enc_frames", declared_axes={
-        "f0_curve": {1: "2*n_enc_frames"},
-        "n_curve": {1: "2*n_enc_frames"},
-        "noise_in": {1: "600*n_enc_frames"},
-        "wsum": {0: "600*n_enc_frames+20"},
-    })
-    topo = exporter.generate_graph_topology(main_func, "decoder_vocoder")
-    print(f"  decoder_vocoder: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
-    return topo, exporter.weights
+    return ExportPhase(
+        name="decoder_vocoder", wrapper=wrapper, dummy_inputs=dummy_args, mil_inputs=mil_inputs,
+        root_axis="n_enc_frames",
+        declared_axes={
+            "f0_curve": {1: "2*n_enc_frames"},
+            "n_curve": {1: "2*n_enc_frames"},
+            "noise_in": {1: "600*n_enc_frames"},
+            "wsum": {0: "600*n_enc_frames+20"},
+        },
+    )
 
 
-def main():
-    print(f"Loading checkpoint {CKPT_PATH}...")
-    cfg = json.load(open(CONFIG_PATH))
-    model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=CKPT_PATH, disable_complex=True)
-    model.eval()
+@dataclass(kw_only=True)
+class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
+    """Kokoro's own two-phase split (albert_bert_encoder/decoder_vocoder) -- see module docstring.
+    `model_dir` is the directory containing both the real checkpoint (`kokoro-v1_0.pth`) and its
+    `config.json` (the real Kokoro-82M HF repo layout)."""
 
-    print("Tracing albert_bert_encoder phase...")
-    albert_topo, albert_weights = build_albert_bert_encoder_topology(model.bert, model.bert_encoder)
+    model_dir: str
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver_mil.lua"
 
-    print("Tracing decoder_vocoder phase...")
-    dv_topo, dv_weights = build_decoder_vocoder_topology(model.decoder)
+    def phases(self) -> List[ExportPhase]:
+        ckpt_path = Path(self.model_dir) / "kokoro-v1_0.pth"
+        config_path = Path(self.model_dir) / "config.json"
+        print(f"Loading checkpoint {ckpt_path}...")
+        cfg = json.load(open(config_path))
+        model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(ckpt_path), disable_complex=True)
+        model.eval()
 
-    # Weight names are namespaced per-phase by each build_* function's own module prefixes (e.g.
-    # "bert.*" vs. the Decoder/Generator's own real state-dict-derived names) -- no collision expected,
-    # but merge with the same content-aware dedup-on-match/hard-fail-on-mismatch safety net
-    # convert_kokoro_lua_all.py's own `merge` already uses, rather than assuming it.
-    merged_weights = dict(albert_weights)
-    for k, v in dv_weights.items():
-        if k in merged_weights:
-            assert np.array_equal(merged_weights[k], v), \
-                f"real weight name collision merging decoder_vocoder weights: {k!r} has DIFFERENT values"
-            continue
-        merged_weights[k] = v
+        print("Tracing albert_bert_encoder phase...")
+        albert_phase = build_albert_bert_encoder_phase(model.bert, model.bert_encoder)
 
-    driver_script_path = Path(__file__).resolve().parent / "tools" / "convert_kokoro" / "kokoro_driver_mil.lua"
+        print("Tracing decoder_vocoder phase...")
+        decoder_vocoder_phase = build_decoder_vocoder_phase(model.decoder)
 
-    out_exporter = LoomGGUFExporter(None, output_path="kokoro_mil.gguf",
-                                     architecture="loom-kokoro-mil")
-    out_exporter.topologies = {"albert_bert_encoder": albert_topo, "decoder_vocoder": dv_topo}
-    out_exporter.weights = merged_weights
-    out_exporter.write_gguf(driver_script_path.read_text())
+        return [albert_phase, decoder_vocoder_phase]
 
 
-if __name__ == "__main__":
-    main()
+def _is_kokoro(path: Path) -> bool:
+    """No auto-detection this pass -- requires an explicit `--task tts-multi-phase --model kokoro`
+    (BACKLOG.md P3.3's stated scope limit). Kokoro's own `config.json` doesn't carry a standard
+    `model_type`-style field this recognizer could key on without risking a false-positive match against
+    an unrelated model shipping a `config.json` of its own; worth revisiting if a real distinguishing
+    field is found later."""
+    return False
+
+
+def _build_kokoro(path: Path, output_path: str) -> TTSKokoroExportConfig:
+    return TTSKokoroExportConfig(architecture="loom-kokoro-mil", output_path=output_path, model_dir=str(path))
+
+
+def register(registry) -> None:
+    from .registry import ModelRecognizer, TaskRegistryEntry
+
+    registry.register(TaskRegistryEntry(
+        task="tts-multi-phase",
+        config_class=BaseMultiPhaseModelExportConfig,
+        recognizers=[ModelRecognizer(name="kokoro", detect=_is_kokoro, build_config=_build_kokoro)],
+    ))
