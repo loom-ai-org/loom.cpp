@@ -321,7 +321,8 @@ exists, before that template's own shape is locked in.
   **Scope call, confirmed with the user:** Qwen3 is registered as a real `LMMonolithicCausalModelExportConfig`
   user (`export_hf_causal_lm.py` is now a thin shim over it). LFM2 (`export_lfm2_modular.py`,
   `export_lfm2_monolithic.py`) is deliberately **not migrated this pass** — the scripts stay exactly as
-  they are, regression-checked rather than replaced, since real LFM2 migration is a later pass. The
+  they are, regression-checked rather than replaced, since real LFM2 migration is a later pass (done in
+  the "LFM2 migrated onto the causal-LM registry" entry further down, after P3.3). The
   regression check is `test_causal_lm_export.py`: it runs `export_lfm2_modular.py`'s own `main()`
   unmodified, builds an `LMModularCausalModelExportConfig` by hand with the identical
   `ModularExportSpec`/dummy shapes, and snapshot-diffs the two resulting GGUFs byte-for-byte — proof the
@@ -447,6 +448,33 @@ exists, before that template's own shape is locked in.
   `iterative_export.py`). Full `pytest` (164/164, including a real registry-vs-direct-construction
   regression test replacing the "diff against `export_qwen3_mil.py`" check P3.2's deletion of that
   script made impossible to run as originally written) and `ctest` (140/140) green.
+
+### LFM2 migrated onto the causal-LM registry (follow-up to P3.1/P3.2, per explicit user direction)
+
+P3.1 deliberately left LFM2 unmigrated (`export_lfm2_modular.py`/`export_lfm2_monolithic.py` stayed as
+the canonical path, only regression-checked). This follow-up migrates it for real: `causal_lm_export.py`
+registers `lfm2-monolithic` and `lfm2-modular` under the `causal-lm` task, both using the exact same
+`LMMonolithicCausalModelExportConfig`/`LMModularCausalModelExportConfig` classes P3.1 already built and
+proved equivalent, with LFM2's own real parameters (`architecture="lfm2"`, `tokenizer_pre="llama3"`, and
+the modular profile's real `ModularExportSpec`) hardcoded into their `_build_lfm2_*` factories the same
+way `_build_qwen3` already hardcodes Qwen3's.
+
+**Both recognizers detect the same way** (`model_type == "lfm2"` in the checkpoint's own `config.json`,
+via a new shared `_hf_model_type()` helper `_is_qwen3` was refactored to use too) — genuinely, not a
+bug: "monolithic" vs "modular" is a caller CHOICE about how to export the same checkpoint, not a
+property of the checkpoint `detect()` could ever read off it. So `TaskRegistry.detect()` correctly finds
+both matching and raises asking for `--model lfm2-monolithic`/`--model lfm2-modular` to disambiguate —
+the same honest "can't guess, ask" behavior already established for Parakeet-TDT/-RNNT, not a new gap.
+
+`test_causal_lm_export.py` rewritten: with both original scripts now deleted, all three tests in the
+causal-LM family (Qwen3 monolithic, LFM2 monolithic, LFM2 modular) follow the same
+"registry-built vs directly-constructed, snapshot-diffed" shape via one shared `_assert_registry_matches_direct`
+helper, rather than the previous mix of "diff against a dynamically-loaded old script" (no longer
+possible for any of them) and one-off duplication.
+
+**Gate — passed:** `loom-export --task causal-lm --model lfm2-modular`/`--model lfm2-monolithic` against
+the real LFM2-350M checkpoint, snapshot-diffed against the original P3.1 baseline — zero-byte diff for
+both. Full `pytest` (165/165) and `ctest` (140/140) green.
 
 #### P4 — flagship coverage
 
