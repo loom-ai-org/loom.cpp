@@ -31,10 +31,16 @@ FetchContent_MakeAvailable(ggml nlohmann_json)
 # Makefile-based build using its own "minilua"/DynASM bootstrapping), so unlike ggml/nlohmann_json above
 # we FetchContent_Populate (source only, no add_subdirectory) and drive `make` ourselves via a custom
 # command, then wrap the resulting static library as a normal IMPORTED target (`luajit::luajit`).
+#
+# Pinned to a COMMIT, not to `v2.1`. Unlike ggml's `v0.16.0` and nlohmann/json's `v3.11.3`, LuaJIT's
+# "v2.1" is a rolling BRANCH that still receives commits, so fetching it made every configure pull
+# whatever it pointed at that day -- reproducible builds locally (where the fetch is cached) and a
+# moving target in CI, which fetches fresh each run. This commit is v2.1.ROLLING-363; bump it
+# deliberately, and re-run the suite when you do.
 FetchContent_Declare(
     luajit
     GIT_REPOSITORY https://github.com/LuaJIT/LuaJIT.git
-    GIT_TAG        v2.1
+    GIT_TAG        faaf663340347a78b22ed94c63c24fe090bd9784
 )
 FetchContent_GetProperties(luajit)
 if(NOT luajit_POPULATED)

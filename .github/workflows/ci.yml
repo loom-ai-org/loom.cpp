@@ -25,8 +25,11 @@ jobs:
       # heavier deps (torch, librosa, sentencepiece) belong to tools/convert_nemo/, which only the
       # real-model tests touch, and those skip cleanly (SKIP_RETURN_CODE) without a converted
       # checkpoint present, so they aren't installed here.
+      # Pinned exactly: these two write the toy-model fixtures the C++ tests compare against, so an
+      # unpinned resolve makes CI's inputs a moving target and lets a green suite go red with no repo
+      # change. Bump deliberately, and re-run the suite when you do.
       - name: Install Python dependencies
-        run: pip install gguf numpy
+        run: pip install "gguf==0.17.1" "numpy==2.4.6"
 
       - name: Install ccache
         run: sudo apt-get update && sudo apt-get install -y ccache

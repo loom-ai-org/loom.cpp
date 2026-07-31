@@ -37,8 +37,16 @@ public:
                  KvCache* kv_cache = nullptr, size_t compute_meta_bytes = 32 * 1024 * 1024);
 
     struct BuildResult {
-        ggml_context_ptr ctx;   // owns every tensor/graph struct produced by this build; keep alive
-                                // until you're done reading outputs, then let it drop.
+        // Owns every tensor/graph STRUCT produced by this build; keep alive until you're done reading
+        // outputs, then let it drop. NOT sufficient on its own: the tensors' DATA lives in the
+        // GraphBuilder's own gallocr, and the builder also holds `topo_` by reference, so a
+        // BuildResult is only readable while BOTH the GraphBuilder that produced it and that builder's
+        // GraphTopology are still alive. Returning a BuildResult out of the scope holding its builder
+        // leaves it pointing at freed memory -- reads may still appear to work, since whether the
+        // arena has been reused yet is allocator-dependent (this cost a CI-only failure once; see
+        // tests/test_graph_builder_shapes.cpp's multi-output test). Copy what you need into your own
+        // storage before the builder goes out of scope, as every src/core/*_driver.cpp does.
+        ggml_context_ptr ctx;
         ggml_cgraph* graph = nullptr;
         ggml_tensor* output = nullptr; // the topology's primary declared output (== outputs.front())
         // Every declared output tensor, in the topology's own declared order -- outputs.front() ==
