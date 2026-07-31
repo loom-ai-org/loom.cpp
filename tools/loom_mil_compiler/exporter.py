@@ -16,6 +16,7 @@ from .passes import apply_loom_mil_passes
 from .shape_expr import (
     as_expr, floor_div, has_dynamic_symbol, render, sub_dynamic_symbols,
 )
+from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_scalar, static_value
 
@@ -145,6 +146,7 @@ class LoomGGUFExporter:
         # the graph) declares it per input name and axis position; this exporter looks up the input's
         # own real MIL symbol so nothing here is guessed from string patterns.
         self._axis_overrides = self._resolve_declared_axes(program, kwargs.get("declared_axes"))
+        self._validate_input_axes(program)
         # The one place any "what is this Var's compile-time value?" question gets answered, for both
         # this class and the op-handler table -- see value_facts.py's own module docstring.
         self.facts = ValueFacts(self)
@@ -172,8 +174,71 @@ class LoomGGUFExporter:
                     f"declared_axes: no input {input_name!r} in the traced program's main function"
                 )
             for axis, expr in per_axis.items():
-                overrides[str(input_var.shape[axis])] = expr
+                dim = input_var.shape[axis]
+                # A declaration for an axis that isn't actually dynamic is dead code that reads as
+                # live: `str(4000)` is a perfectly good dict key that no MIL symbol will ever match, so
+                # without this the entry would silently do nothing (BACKLOG.md P4.0.2).
+                if not has_dynamic_symbol(dim):
+                    raise ValueError(
+                        f"declared_axes: {input_name!r} axis {axis} is static ({dim}), so declaring it "
+                        f"as {expr!r} would have no effect -- either make that axis a ct.RangeDim in "
+                        f"this phase's mil_inputs, or drop the declaration"
+                    )
+                overrides[str(dim)] = expr
         return overrides
+
+    def _input_axis_symbols(self, program):
+        """`[(input name, axis index, raw MIL symbol name)]` for every dynamic axis of every declared
+        input of `program`'s main function.
+
+        Returns `[]` rather than raising for anything that has no such function to read: no program at
+        all (the write-only exporter `multi_phase_export.export()` builds to merge already-generated
+        topologies), or a modular-blueprint Program, which has one Function per submodule and no "main"
+        (see `export()`). The modular path therefore gets no axis validation -- a real limit of this
+        check, not an oversight: `apply_modular_export` synthesizes its own leaf inputs and their axes
+        rather than taking them from a caller."""
+        main_func = getattr(program, "functions", {}).get("main") if program is not None else None
+        if main_func is None:
+            return []
+        found = []
+        for input_name, input_var in (main_func.inputs or {}).items():
+            shape = getattr(input_var, "shape", None)
+            if shape is None:
+                continue
+            for axis, dim in enumerate(shape):
+                for free in as_expr(dim).free_symbols:
+                    if DYNAMIC_SYMBOL_RE.fullmatch(free.name):
+                        found.append((input_name, axis, free.name))
+        return found
+
+    def _validate_input_axes(self, program):
+        """Every dynamic input axis must be accounted for: either declared via `declared_axes`, or
+        carrying the SAME MIL symbol as every other undeclared one, in which case it is this topology's
+        `root_axis`.
+
+        This is the rule the exporter has always relied on and never checked (BACKLOG.md P4.0.2).
+        `_sub_symbol` rewrites any symbol it wasn't given an override for into `root_axis`, so two
+        genuinely independent dynamic quantities silently collapse into one name and the emitted shape
+        expressions are wrong -- not malformed, just wrong, which no downstream gate catches. The fix
+        callers already use is one of two things, and the error says both: share a single `ct.RangeDim`
+        INSTANCE across inputs that really do move together (coremltools then gives them one symbol, as
+        `causal_lm_export`'s tokens/cache_position/attention_mask do deliberately), or declare the real
+        relationship (as Kokoro's `decoder_vocoder` phase does for f0_curve/n_curve/noise_in/wsum, whose
+        lengths are fixed multiples of `asr`'s and are not derivable from the graph)."""
+        uncovered = {}
+        for input_name, axis, symbol_name in self._input_axis_symbols(program):
+            if symbol_name in self._axis_overrides:
+                continue
+            uncovered.setdefault(symbol_name, []).append(f"{input_name}[{axis}]")
+        if len(uncovered) <= 1:
+            return
+        groups = "; ".join(f"{sym} -> {', '.join(where)}" for sym, where in sorted(uncovered.items()))
+        raise ValueError(
+            f"this topology has {len(uncovered)} independent dynamic input axes, but only one can be "
+            f"the root axis ({self.root_axis!r}); the rest would silently collapse onto it. Found: "
+            f"{groups}. Either share one ct.RangeDim instance across inputs whose lengths always match, "
+            f"or declare the others via declared_axes={{input: {{axis: expression}}}}."
+        )
 
     def _sub_symbol(self, dim):
         """Replaces every symbolic MIL dim (e.g. "is531") in `dim` with its `self._axis_overrides`

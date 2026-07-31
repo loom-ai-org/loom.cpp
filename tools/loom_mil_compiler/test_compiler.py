@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Import the compiler to trigger the backend registration
 import loom_mil_compiler
+from loom_mil_compiler.exporter import LoomGGUFExporter
 
 class TestLoomMILCompiler(unittest.TestCase):
     def setUp(self):
@@ -302,6 +303,91 @@ class TestLoomMILCompiler(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             backend(prog, output_path=self.output_path, profile="monolithic", architecture="random_test")
         self.assertIn("ggml has no RNG-capable compute op", str(ctx.exception))
+
+
+class TestInputAxisValidation(unittest.TestCase):
+    """`LoomGGUFExporter`'s axis-declaration checks (BACKLOG.md P4.0.2). Both of these were silent
+    before: an undeclared second dynamic axis collapsed onto `root_axis`, and a declaration naming a
+    static axis did nothing at all."""
+
+    @staticmethod
+    def _prog2(shape_a, shape_b):
+        """`mb.program` binds input names from the decorated function's own parameter names, so these
+        two builders exist per arity rather than one variadic one."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=shape_a, dtype=types.fp32),
+                                 mb.TensorSpec(shape=shape_b, dtype=types.fp32)])
+        def main_func(root, other):
+            return mb.identity(x=root, name="out")
+
+        return main_func
+
+    @staticmethod
+    def _prog3(shape_a, shape_b, shape_c):
+        @mb.program(input_specs=[mb.TensorSpec(shape=shape_a, dtype=types.fp32),
+                                 mb.TensorSpec(shape=shape_b, dtype=types.fp32),
+                                 mb.TensorSpec(shape=shape_c, dtype=types.fp32)])
+        def main_func(tokens, cache_position, attention_mask):
+            return mb.identity(x=tokens, name="out")
+
+        return main_func
+
+    def test_one_shared_symbol_across_inputs_is_the_root_axis(self):
+        """The idiom every model already uses: one `ct.RangeDim` instance shared by inputs whose lengths
+        always match (causal-LM's tokens/cache_position/attention_mask) gives ONE symbol, so there is
+        nothing to declare."""
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        seq = get_new_symbol()
+        prog = self._prog3((1, seq), (seq,), (1, 1, seq, seq))
+        exporter = LoomGGUFExporter(prog)
+        self.assertEqual(exporter.root_axis, "n_tokens")
+
+    def test_two_independent_dynamic_axes_raise_naming_both(self):
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        a, b = get_new_symbol(), get_new_symbol()
+        prog = self._prog2((1, a), (1, b))
+        with self.assertRaises(ValueError) as ctx:
+            LoomGGUFExporter(prog)
+        message = str(ctx.exception)
+        self.assertIn("2 independent dynamic input axes", message)
+        # Names the real inputs and axis positions, not just a count.
+        self.assertIn("[1]", message)
+        self.assertIn("declared_axes", message)
+
+    def test_declaring_the_second_axis_makes_it_pass(self):
+        """Kokoro's `decoder_vocoder` shape: a second leaf whose length is a fixed multiple of the root
+        axis, not derivable from the graph."""
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        a, b = get_new_symbol(), get_new_symbol()
+        prog = self._prog2((1, a), (1, b))
+        names = list(prog.functions["main"].inputs)
+        exporter = LoomGGUFExporter(
+            prog, root_axis="n_enc_frames", declared_axes={names[1]: {1: "2*n_enc_frames"}},
+        )
+        self.assertEqual(list(exporter._axis_overrides.values()), ["2*n_enc_frames"])
+
+    def test_declaring_a_static_axis_raises_instead_of_doing_nothing(self):
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        seq = get_new_symbol()
+        prog = self._prog2((1, seq), (1, 4000))
+        names = list(prog.functions["main"].inputs)
+        with self.assertRaises(ValueError) as ctx:
+            LoomGGUFExporter(prog, declared_axes={names[1]: {1: "2*n_tokens"}})
+        self.assertIn("is static", str(ctx.exception))
+
+    def test_a_program_with_no_main_function_is_not_validated(self):
+        """The modular-blueprint Program has one Function per submodule and no "main" -- a real limit of
+        this check, stated in `_input_axis_symbols`."""
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        a, b = get_new_symbol(), get_new_symbol()
+        prog = Program()
+        prog.functions["layer_0"] = self._prog2((1, a), (1, b)).functions["main"]
+        LoomGGUFExporter(prog)  # must not raise
+
 
 if __name__ == "__main__":
     unittest.main()
