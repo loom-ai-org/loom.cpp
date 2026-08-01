@@ -434,11 +434,47 @@ Five stages, in the order they must happen. Each numbered step is one commit. "T
 a step can possibly affect, which is its per-commit gate; every stage ends with a full 11-model
 `snapshot_gguf.py` sweep before the next begins.
 
-**Two standing practicalities**, both learned the expensive way and recorded in BACKLOG.md P4.0.1: run
+**Three standing practicalities**, each learned the expensive way; the first two are recorded in
+BACKLOG.md P4.0.1 and the third in P4.0.4's own gate note: run
 the export tests with `TMPDIR=` *and* pytest's `--basetemp=` pointed under `/home/flavio/.claude/tmp/`
 (`TMPDIR` alone does not move `tmp_path`, and the real exports fill `/tmp`'s 28 GB partition); and take
 the pre-change snapshot baseline from a `git worktree` at the current commit rather than trusting the
-`.gguf` files in the tree, which are gitignored build outputs and routinely stale.
+`.gguf` files in the tree, which are gitignored build outputs and routinely stale. Stage A added a
+third: **`cd` into the tree being measured** — `python -m` puts the CWD ahead of `PYTHONPATH` on
+`sys.path`, so invoking a baseline worktree's `loom-export` from the working tree silently imports the
+working tree's modules and compares new against new.
+
+### The negative gate: byte-identity does not prove a check runs
+
+**Added after stage B, which is where the hole showed up.** Every gate below is a *positive* one — the
+output did not move — and for an emission change that is the whole question. For a change that adds or
+relocates a **check**, it is only half of one: a check that never runs also leaves output unchanged.
+Byte-identity and a dead code path are indistinguishable from the snapshot side, which is exactly the
+failure mode `spec_protocol`'s deferred-link reporting exists to prevent, one level up.
+
+So any step that claims a check now runs must also **break the thing being checked and watch a real
+export fail with that check's own message.** Stage B did this by pointing Matcha's `FlowMatchingSpec` at
+a `carried_input` the estimator does not declare, and then at a topology name that was never exported;
+both failed the export naming the offending input and the topologies that do exist. Two probes, one
+model, about four minutes — the cheapest gate in the whole plan and the only one that distinguishes
+"wired in" from "compiles".
+
+Where it applies below, and it is not everywhere:
+
+* **C.1–C.3** — `check_subgraph_calls()` reaching the five TTS drivers for the first time is precisely a
+  "this check now runs" claim, and C.3's own text already predicts it will find real bugs. If it finds
+  none, that is the ambiguous result this gate resolves: either the drivers were correct, or the check
+  is not reaching them. Break one `run_subgraph` argument name per family and confirm the export fails.
+* **C.4–C.8** — byte-identity is *already* abandoned here (the plan says so), so the positive gate is the
+  per-model e2e test. The negative gate still applies to the link checks a peeled component declares.
+* **D.1** — a pure re-homing onto the registry is where a component's `links()` most easily becomes
+  decorative: same output, same tests, nothing calling it. One broken declaration per registered
+  component, or the catalogue in D.3 documents checks nobody has seen fail.
+* **E.1–E.4** — not applicable. Retirement removes code rather than adding checks; `ctest` green with the
+  driver deleted is the whole claim.
+
+Record the probe and its message in the commit, the way the positive gate's `diff -r` result is recorded.
+A gate whose result is not written down has to be re-run by the next reader.
 
 ### Stage 0 — record the plan (1 commit)
 
@@ -563,6 +599,11 @@ inputs. `LuaCodegen` must emit raw-block text verbatim, with no reindentation, o
 cosmetic reason. *Touches: Kokoro, VITS, Matcha, Supertonic, StyleTTS2 — byte-identical driver text
 required.*
 
+**Both gates, and this is the step the negative gate was written for.** Finding no bugs here is
+ambiguous — the drivers may be correct, or `check_subgraph_calls()` may not be reaching them, and
+byte-identical output is equally consistent with both. So per family: break one `run_subgraph` argument
+name and confirm the export fails naming it.
+
 **C.4–C.8 — peel one family per commit**, in order: Matcha (smallest with a real generated sampler) →
 Supertonic (same shape; proves reuse rather than re-derivation) → VITS → Kokoro → StyleTTS2 (ADPM2,
 hardest, and the one most likely to stay partly raw).
@@ -577,13 +618,19 @@ message; (c) every topology, weight and non-driver KV is byte-identical. That is
 checker for Lua.
 
 **C.9 — stage gate.** Full 11-model sweep; all five TTS e2e Lua-driver tests plus the six synthesized
-models' numeric reference tests.
+models' numeric reference tests; and the negative gate's per-family probes, with their messages, in the
+commit — the stage's headline claim is that five drivers gained a check they never had, and that claim
+is not testable from the snapshot side.
 
 ### Stage D — P4.0.7: the component registry
 
 **D.1 — `driver_components/`**: name → component registry, and the six existing components moved onto
 the one calling convention. No new capability. *Touches: all 11 — byte-identical driver text required,
 since this is a pure re-homing.*
+
+A pure re-homing is exactly where a component's `links()` most easily becomes decorative: same output,
+same tests, and nothing actually calling it. Apply the negative gate per registered component, or D.3's
+catalogue documents checks nobody has ever seen fail.
 
 **D.2 — `recurrent.py`'s LSTM/GRU stepping loop becomes a registered component.** It is the one
 inventory item that is ad hoc today rather than merely differently-shaped. *Touches: Kokoro, StyleTTS2.*
@@ -592,7 +639,12 @@ inventory item that is ad hoc today rather than merely differently-shaped. *Touc
 use it. This is the artifact that makes P4.1/P4.3 able to reuse rather than restate, and it is the
 deliverable of this stage more than the code is. *Touches: nothing.*
 
-**D.4 — stage gate.** Full 11-model sweep.
+The links column carries the message each link produces when it fails, taken from the D.1 probe rather
+than from the source. That is what makes the table an account of behaviour rather than a transcription
+of declarations — and it is the whole basis on which P4.1 gets to reuse a component without reading it,
+which is the "trustworthy enough to reuse" requirement §2's standing rule was written for.
+
+**D.4 — stage gate.** Full 11-model sweep, plus the negative-gate probes from D.1/D.2.
 
 ### Stage E — P4.0.8: legacy retirement (trails; nothing in P4 depends on it)
 
