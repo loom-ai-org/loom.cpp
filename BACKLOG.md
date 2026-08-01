@@ -684,7 +684,7 @@ written against nothing; **D** after **C** because a registry of components with
 convention is a directory, not a shelf; **E** last because it is test work and bookkeeping that blocks
 nothing.
 
-- **P4.0.4 — task vocabulary and generic recognition.** The registered task names are `causal-lm`,
+- **P4.0.4 — task vocabulary and generic recognition — DONE.** The registered task names were `causal-lm`,
   `nemo-asr-encoder`, `tts-multi-phase`, `tts-flow-matching`: two name a decomposition and one names a
   loader library. Since P4.0.3 made decomposition its own field, `tts-multi-phase`/`tts-flow-matching`
   are one task whose members differ by a field. Rename to real tasks — `text-generation`,
@@ -698,8 +698,50 @@ nothing.
   only per-model data in `_build_qwen3`/`_build_lfm2_*` is an architecture string, an optional
   `tokenizer_pre` and a decomposition, all with working defaults. Requires `ModelRecognizer.fallback`
   and a specific-beats-fallback `detect`, or every Qwen3/LFM2 detection becomes ambiguous.
-  **Gate:** byte-identical re-export of all 11; `loom-export` resolves the same recognizer for every
-  real checkpoint here as before; plus at least one HF causal LM no recognizer currently claims.
+
+  **What was built,** four commits (`tasks.py` → rename → `fallback` → the generic recognizer):
+
+  1. `tasks.py` — the four canonical names, each with what export shape it covers and the base config
+     class it builds, resolved lazily by `module:QualName` string because every family module imports
+     `registry`, which imports `tasks`. `register()` validates the name and checks `config_class` with
+     `issubclass` against the declared base rather than identity against whichever class the first
+     family to import happened to pass — which is what lets `TTSFlowMatchingModelExportConfig` (a
+     *subclass* of `BaseMultiPhaseModelExportConfig`) share one task with the plain multi-phase families.
+  2. The rename, with no aliases. **The check this step opened with**, per the plan, is that the task
+     string reaches no GGUF KV — it holds two ways: `build_config(path, output_path)` is handed no task
+     at all, and all 11 exported GGUFs contain zero occurrences of the four old names. So the gate stayed
+     a pytest run rather than a snapshot diff. `--task` became an argparse `choices=` list, which then
+     forced a real distinction: a name outside the vocabulary raises "unknown task", while a canonical
+     but unclaimed one (`audio-codec`) raises "declared but no family is registered against it yet".
+  3. `ModelRecognizer.fallback` + tiering in `detect`. Within a tier the rules are unchanged, so LFM2's
+     deliberate two-way ambiguity survives and a fallback can never break a tie between two specifics.
+  4. `hf-causal-lm`. Both halves of its guard are load-bearing: `model_type` alone claims every HF
+     directory on disk, and Whisper, Parakeet and GigaAM all sit beside the causal LMs here — claiming
+     any of them would break three other families, since `detect()` runs every recognizer against every
+     path. `_MODEL_TYPE_OVERRIDES` is **empty, and that is a finding rather than an omission**: the
+     exporter's tokenizer auto-detection resolves LFM2 to `llama3` and Qwen3 to `qwen2`, exactly what the
+     two specific recognizers hardcode (now asserted, not argued).
+
+  **Gate — passed.** All 11 models exported from a `git worktree` at the pre-stage commit and from the
+  working tree, snapshotted and compared: **byte-identical, all 11**, `diff -r` over the two snapshot
+  roots empty. Detection re-run against every real checkpoint on this machine in both trees; the diff is
+  exactly two lines, both intended — LFM2's ambiguity now reported under `text-generation/` instead of
+  `causal-lm/`, and SmolLM2-360M going from "no match" to `hf-causal-lm`. 212 pytest green (24 new).
+
+  **Acceptance — a model that could not be exported before.** SmolLM2-360M-Instruct (`model_type: llama`,
+  `LlamaForCausalLM`) exported end to end through `loom-export` with no recognizer of its own: 1.4G GGUF,
+  299 tensors, one `main_topo` with all three inputs on a dynamic `n_tokens`, the expected prefill+argmax
+  driver. Both inferences landed — `loom.architecture = 'llama'` from `model_type`, and
+  `tokenizer.ggml.pre = 'starcoder'` from the tokenizer's own hash, a pre-type neither Qwen3 nor LFM2
+  uses and which a hardcoded default would have gotten wrong. *Not claimed:* no numeric validation
+  against an HF forward pass — that needs a reference fixture this model does not have.
+
+  **One methodology note worth keeping, cost ~25 minutes here:** the first run of the 11-model sweep was
+  vacuous. `loom-export` sets `PYTHONPATH` and runs `python3 -m tools.loom_mil_compiler.main_export`, but
+  `python -m` puts the *current working directory* ahead of `PYTHONPATH` on `sys.path` — so invoking the
+  baseline worktree's `loom-export` from the working tree silently imported the working tree's modules
+  and compared new against new. It surfaced only because the baseline rejected `--task causal-lm` with
+  the *new* argparse choices. **`cd` into the tree being measured; setting `PYTHONPATH` is not enough.**
 - **P4.0.5 — the spec protocol.** Every spec in the tree earns its existence by being checked against
   the real model, and the checks are predicates over live objects (`EncoderOutput.validate`,
   `EstimatorSpec.validate_against_topology`, `ModularExportSpec`'s attribute paths, `_validate_input_axes`)
