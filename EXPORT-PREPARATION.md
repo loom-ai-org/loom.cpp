@@ -353,12 +353,48 @@ spelled out rather than rediscovered:
   question "should `LoomModelForCausalLM` export any causal LM?" actually asks for is the *export* side,
   which is `loom-export --task text-generation` and therefore P4.0.4.
 * **KV cache in the exported causal-LM graph.** Both synthesized drivers bind `n_past = Lit(0)` and
-  `loom.causal_mask(n_tokens, 0)` (`exporter.py:1220,1289,1294`): prefill-only, argmax the last row.
+  `loom.causal_mask(n_tokens, 0)` (`exporter.py:1225,1238,1307,1312`): prefill-only, argmax the last row.
   The engine has a KV cache and the bespoke drivers use it, but the MIL causal-LM path neither declares
   nor uses one, so "export any causal LM" today means one prefill, not a generation loop. `optimum`
   spends most of `TextDecoderOnnxConfig` on exactly this (`use_past` / `decoder_with_past` / merged
   decoder). **This is a real gap and a real capability item — it belongs in P4/P5, not in preparation**,
   and it is recorded here so it is not mistaken for something P4.0 covers.
+
+  **Where the blocker actually is (measured 2026-08-01, and it is not where this bullet implied).**
+  Binding a real `n_past` is the *last* step, not the first. The engine's cache is reachable through
+  exactly one door — the **`ATTENTION` topology node**. `op_attention` is what reads `n_past`/`n_kv` from
+  `SymbolEnv`, appends this step's K/V at cells `[n_past, n_past+n_tokens)` and reads back `[0, n_kv)`
+  (`src/ops/primitives_attention.cpp:29-80`; `GraphBuilder` derives `n_kv = n_tokens + n_past` at
+  `graph_builder.cpp:129`). There is no other seam: a topology with no `ATTENTION` node cannot touch the
+  cache, and one that declares `kv_cache=true` without a cache raises (`primitives_attention.cpp:51`).
+
+  The bespoke converters have that node because **a human writes it**, layer index and all —
+  `convert_qwen3.py:93`: `{"op": "ATTENTION", "inputs": ["q","k","v","kq_mask"], "attrs": {"layer":
+  "{i}", "scale": "1/sqrt($n_embd_head_k)"}}`. **A MIL-exported causal LM has zero `ATTENTION` nodes.**
+  Qwen3's exported topology is `ADD 450, MUL 450, MUL_MAT 254, RESHAPE 228, PERMUTE 142, VIEW 140,
+  POW/REDUCE_SUM/SCALE/RSQRT 113 each, CONCAT 57, REPEAT 56` — attention arrives fully expanded. The
+  exporter does map `loom_fused_attention` → `ATTENTION` (`exporter.py:131`) and `dialect.py` does
+  register a `FuseLoomAttention` pass — but its `_fuse_blocks` body is `pass`, a documented placeholder
+  (`dialect.py:259`). The op is registered and never produced.
+
+  So the item is four pieces, in order, and only the fourth is what this bullet described:
+  1. **Implement `FuseLoomAttention`** — pattern-match the SDPA subgraph in MIL per layer (post-RoPE
+     q/k/v, mask, softmax, the GQA `REPEAT` that `fuse_gqa_repeat_kv` already normalizes), assign the
+     `layer` index, emit `loom_fused_attention`. Architecture-sensitive: Qwen3 has qk-norm, LFM2
+     interleaves conv layers, Llama is plain GQA. Each needs numeric verification against the expanded
+     path, which is what makes this the expensive piece.
+  2. **Trace with past-KV semantics**, so a decode step computes K/V for the new token only. This is
+     precisely `use_past`/`decoder_with_past`.
+  3. **Change the exported input contract** — `tokens` at `n_tokens=1`, `cache_position` =
+     `range(n_past, n_past+n_tokens)`, mask `[1,1,n_tokens,n_kv]`. That makes `n_kv` a second dynamic
+     axis and lands directly on P4.0.2's `_validate_input_axes`.
+  4. **Synthesize a two-phase driver** (prefill, then a decode loop) instead of one prefill+argmax. The
+     driver-side machinery for this already exists — `transpile_operation` emits
+     `loom.causal_mask(n_tokens, n_past)` with real variables (`exporter.py:1504-1507`), and `driver_ir`
+     has `While`/`Break`; it is step 1 that has no code at all.
+
+  Consequence for decision 2 below: the new decomposition inherits this gap, but it cannot start with
+  it. **Step 1 is a prerequisite, and it is an R2-shaped MIL pass, not driver work.**
 * **A JSON/YAML/TOML spec front-end.** Agreed in principle, deferred by decision (§2, consequence 2)
   until the protocol is stable and families 2/6/10/11 have shown their shapes.
 * **`NormalizedConfig` / `DummyInputGenerator` analogues.** Worth having eventually; neither blocks P4,
@@ -380,7 +416,9 @@ changes something concrete in §3, noted with the answer.
    decomposition rather than owned by the family, so a fourth decomposition can bring its own builder
    without reopening the component API. P4.0.6 therefore adds a `Decomposition.driver_builder(config)`
    hook, and the component API is shaped by the six existing components only — no speculative
-   loop-carried-state design. The KV-cache gap in §4 becomes that decomposition's problem, in P4.1.
+   loop-carried-state design. The KV-cache gap in §4 becomes that decomposition's problem, in P4.1 —
+   **but see §4's measured note: it is blocked on a MIL attention-fusion pass that does not exist yet,
+   and no amount of driver work substitutes for it.**
 3. **The TTS task splits now: `text-to-speech` + `audio-codec`.** **Consequence:** `audio-codec` is a
    *reserved* name with no family registered against it yet, which is only meaningful if the vocabulary
    is a real, checked list — so P4.0.4 grows a `tasks.py` declaring the canonical names (and each task's

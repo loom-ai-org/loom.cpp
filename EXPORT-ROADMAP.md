@@ -112,6 +112,22 @@ already states the principle: *coremltools' own backend never mixes graph rewrit
 The rest of the lowering happens in `topology_ops.py` at emission time, where composites are synthesized
 node-by-node and guards re-derive facts about the graph each time they run.
 
+**One of those three ops is registered but never produced, and it is load-bearing** (measured
+2026-08-01). `loom_fused_attention` has a MIL op class, a lowering to the engine's `ATTENTION` primitive
+(`exporter.py:131`) and a pass to create it, `FuseLoomAttention` — whose `_fuse_blocks` body is `pass`,
+a documented placeholder (`dialect.py:259`). So no MIL export has ever emitted an `ATTENTION` node:
+Qwen3's exported topology is `ADD 450, MUL 450, MUL_MAT 254, RESHAPE 228, PERMUTE 142, VIEW 140, …` —
+attention fully expanded — while the bespoke converter hand-writes the node with its layer index
+(`convert_qwen3.py:93`).
+
+That is not cosmetic, because **`ATTENTION` is the only door to the engine's KV cache**
+(`src/ops/primitives_attention.cpp:29-80`): a topology without that node cannot use one. So this
+missing pass is the prerequisite for KV-cached generation in every MIL-exported causal LM, and
+therefore for R5's family 2/6 cross-attention decoder loop, which the table below lists as needing "a
+cross-attention decoder loop with KV cache". **Implementing `FuseLoomAttention` is the highest-value
+item in R2 by a distance** — every other pass here removes an emitter guard; this one unlocks a
+capability. See `EXPORT-PREPARATION.md` §4 for the full four-step breakdown and BACKLOG.md P4.4.
+
 **What it would remove.** Every one of these is a place the emitter currently has to *decide* something:
 
 | today, at emission | as a pass |
@@ -123,6 +139,7 @@ node-by-node and guards re-derive facts about the graph each time they run.
 | `conv_transpose` depthwise "stuffing" composed inline from PAD/RESHAPE/VIEW/CONT | `loom.conv_transpose_dw` op, expanded by a pass |
 | `pad(mode="replicate")` composed from VIEW/REPEAT/CONCAT with a hand-built dynamic offset | `loom.replicate_pad` op |
 | `stack` composed from RESHAPE+CONCAT | `loom.stack` lowering pass |
+| attention emitted as ~20 raw nodes per layer, with no way to reach the engine's `KvCache` | `FuseLoomAttention` (registered, body is a `pass`) emits `loom_fused_attention` → the `ATTENTION` primitive, which *is* the cache's only entry point — see the note above |
 | shape expressions re-derived by a backward walk at every consumer | `annotate_dynamic_shapes` pass writes the resolved expression onto each Var once (the machinery exists in `value_facts.py`; today it is a cache, not an annotation) |
 
 There is a second, larger prize downstream: `BACKLOG.md` tracks the C++ "dynamically heal

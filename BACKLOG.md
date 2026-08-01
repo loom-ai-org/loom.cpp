@@ -883,6 +883,46 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   remote-code modeling traces cleanly or needs a patcher.
 - **P4.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
   family 3 (~20 models) and is the single largest coverage lever in the roadmap.
+- **P4.4 — KV cache in MIL-exported causal LMs. Blocked on a MIL attention-fusion pass that does not
+  exist; that pass, not the driver, is the item.** Both synthesized drivers bind `n_past = 0` and
+  `loom.causal_mask(n_tokens, 0)` (`exporter.py:1225,1238,1307,1312`), so an exported causal LM does one
+  prefill per step and re-reads the whole prompt every time — generation cost grows quadratically. This
+  was known (`EXPORT-PREPARATION.md` §4); what was **not** known, and was measured on 2026-08-01 while
+  looking at a synthesized driver, is where the blocker sits.
+
+  **The engine's `KvCache` has exactly one entry point: the `ATTENTION` topology node.** `op_attention`
+  is what reads `n_past`/`n_kv` from `SymbolEnv`, appends this step's K/V at cells
+  `[n_past, n_past+n_tokens)` and reads back `[0, n_kv)` (`src/ops/primitives_attention.cpp:29-80`;
+  `GraphBuilder` derives `n_kv = n_tokens + n_past`, `graph_builder.cpp:129`). A topology without that
+  node cannot touch the cache at all, and one declaring `kv_cache=true` without a cache raises
+  (`primitives_attention.cpp:51`).
+
+  The bespoke converters have the node because **a human writes it**, layer index and all
+  (`convert_qwen3.py:93`). **A MIL-exported causal LM has zero `ATTENTION` nodes** — Qwen3's topology is
+  `ADD 450, MUL 450, MUL_MAT 254, RESHAPE 228, PERMUTE 142, VIEW 140, …`, attention fully expanded. The
+  exporter maps `loom_fused_attention` → `ATTENTION` (`exporter.py:131`) and `dialect.py` registers a
+  `FuseLoomAttention` pass whose body is `pass`, a documented placeholder (`dialect.py:259`). The op is
+  registered and never produced.
+
+  Four pieces, in order — and the driver change everyone pictures is the *last* one:
+  1. **Implement `FuseLoomAttention`** (an R2-shaped MIL pass): pattern-match the SDPA subgraph per
+     layer, assign the `layer` index, emit `loom_fused_attention`. Architecture-sensitive — Qwen3 has
+     qk-norm, LFM2 interleaves conv layers, Llama is plain GQA — and each needs numeric verification
+     against the expanded path. This is the expensive piece and the one with no code today.
+  2. **Trace with past-KV semantics** so a decode step computes K/V for the new token only — `optimum`'s
+     `use_past`/`decoder_with_past`.
+  3. **Change the exported input contract**: `tokens` at `n_tokens=1`, `cache_position =
+     range(n_past, …)`, mask `[1,1,n_tokens,n_kv]`. Makes `n_kv` a second dynamic axis, landing on
+     P4.0.2's `_validate_input_axes`.
+  4. **Synthesize a two-phase driver** (prefill + decode loop). The machinery for this half exists:
+     `transpile_operation` already emits `loom.causal_mask(n_tokens, n_past)` with real variables
+     (`exporter.py:1504-1507`) and `driver_ir` has `While`/`Break`.
+
+  **Consequences for the plan as written.** `EXPORT-PREPARATION.md` decision 2 routes this gap to the
+  cross-attention AR decode `Decomposition` in P4.1; that is still the right home, but **that
+  decomposition cannot start here** — step 1 is a prerequisite and belongs to R2, not to the driver
+  builder. It also deliberately breaks byte-identity for Qwen3 and LFM2 (new topology *and* new driver),
+  so it is a `compare_snapshots.py` + per-model numeric item, never a byte-identical one.
 
 #### P5 — breadth
 
