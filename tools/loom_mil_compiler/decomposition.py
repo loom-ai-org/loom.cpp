@@ -103,9 +103,17 @@ class Modular(Decomposition):
     def export(self, config) -> str:
         from .modular_export import export_modular
         from .register import LoomGGUFBackend
+        from .spec_protocol import LinkChecker
 
         config.prepare_environment()
         model = config.load_model()
+        # The config's own links (P4.0.5). `decomposition` is a NestedSpec, so this deliberately does
+        # not walk into `self.spec` -- `export_modular` checks that against the real module itself,
+        # before it traces anything.
+        checker = LinkChecker()
+        checker.check(config)
+        checker.provide(model=model)
+        checker.finish()
         dummy_inputs = config.modular_dummy_inputs(self.dummy_seq_len)
 
         print("Tracing each submodule standalone...")

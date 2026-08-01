@@ -41,6 +41,7 @@ from transformers import AutoModelForCausalLM
 from .decomposition import Flattened, Modular
 from .export_config import LoomExportConfig
 from .modular_export import ModularExportSpec
+from .spec_protocol import Unchecked
 
 
 def _causal_mask(seq_len: int) -> torch.Tensor:
@@ -98,6 +99,49 @@ class LMCausalModelExportConfig(LoomExportConfig):
     max_seq_len: int = 4096
     # Resolved from the checkpoint by `load_model()` when `architecture` was not given.
     _resolved_architecture: Optional[str] = None
+
+    # P4.0.5's standing rule. This family is the one where "unchecked" is the honest answer for almost
+    # every field, and saying so once is worth more than a link that checks a weaker property while
+    # reading as if it checked the real one. `architecture`, `output_path` and `decomposition` are
+    # declared on LoomExportConfig and inherited.
+    __unchecked__ = {
+        "model_dir": Unchecked(
+            "path to the HF directory. The recognizer's detect() already read its config.json (that is "
+            "how the generic *ForCausalLM fallback claims it at all), and AutoModelForCausalLM."
+            "from_pretrained raises on anything it cannot load."
+        ),
+        "tokenizer_dir": Unchecked(
+            "defaults to model_dir; same reasoning. Whether the directory holds a tokenizer the "
+            "exporter recognizes is decided by tokenizer_detect against the real files, not here."
+        ),
+        "tokenizer_family": Unchecked(
+            "an override for the exporter's own auto-detection, which reads the tokenizer's real "
+            "vocab/merges. Nothing to cross-check it against that is not the detection it overrides."
+        ),
+        "tokenizer_pre": Unchecked(
+            "same: an override for the pretokenizer resolved from the tokenizer's own hash. P4.0.4 "
+            "found _MODEL_TYPE_OVERRIDES could be left empty precisely because that detection is "
+            "right for every model here."
+        ),
+        "quantize": Unchecked(
+            "output dtype selection. A property of the requested export, not a claim about the model."
+        ),
+        "seq_len": Unchecked(
+            "the concrete length torch.jit.trace runs at. Bounded by max_seq_len but otherwise free -- "
+            "the dynamic range is declared separately via ct.convert's own inputs=, so this number "
+            "constrains nothing the checkpoint could disagree with."
+        ),
+        "max_seq_len": Unchecked(
+            "the ct.RangeDim upper bound. Deliberately NOT checked against the checkpoint's own "
+            "max_position_embeddings: exporting a shorter range than the model supports is legitimate "
+            "(it is what keeps a modular blueprint small), so a mismatch is not an error."
+        ),
+        "_resolved_architecture": Unchecked(
+            "not a declaration at all -- load_model()'s output, cached on the config so "
+            "export_architecture() can read it back. It exists as a field only because the config is a "
+            "dataclass."
+        ),
+    }
 
     def load_model(self):
         print(f"Loading model from {self.model_dir}...")

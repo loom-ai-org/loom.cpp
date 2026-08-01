@@ -8,8 +8,10 @@ This is the same assembly pattern tools/convert_lfm/make_lfm2_gguf.py used by ha
 hardcoded layer count, no hand-derived dummy shapes, no per-model wrapper subclasses. The one piece
 that genuinely can't be recovered from module structure alone -- where "prefix"/"repeated"/"suffix"
 boundaries fall, and which repeated-block kwarg a once-computed auxiliary tensor (e.g. a shared
-rotary-embedding table) feeds -- is a short declarative `ModularExportSpec`, verified at export time
-(a wrong attribute name raises `AttributeError` immediately, not a silent wrong export).
+rotary-embedding table) feeds -- is a short declarative `ModularExportSpec`, verified against the real
+module before anything is traced (P4.0.5: every field is a `spec_protocol` link, so a wrong attribute
+name raises up front naming the path and the type it failed on, not a silent wrong export and no longer
+a bare `AttributeError` from partway through the traversal).
 """
 import inspect
 import time
@@ -23,6 +25,7 @@ import coremltools as ct
 from coremltools.converters.mil.mil import Program, Function
 
 from .modular_discovery import find_repeated_blocks, get_by_path, capture_calls
+from .spec_protocol import ConfigDerived, EachOf, ModuleAttrPath, WhenSet, check_links
 
 # HF's near-universal name for the stateful KV/conv-cache object threaded through every causal-LM
 # submodule call. Replaying a captured call verbatim would bake in whatever cache state existed by the
@@ -34,11 +37,24 @@ from .modular_discovery import find_repeated_blocks, get_by_path, capture_calls
 _CACHE_KWARG_NAMES = {"past_key_values", "past_key_value"}
 
 
+def _repeated_children(spec, model):
+    """The repeated block's children, by the same structural discovery `export_modular` uses."""
+    return find_repeated_blocks(model).get(spec.repeated_attr) or []
+
+
 @dataclass
 class ModularExportSpec:
     """Declares an HF causal-LM's prefix/repeated/suffix boundary -- the one piece of structure that
     isn't recoverable from `named_modules()` alone, since a `forward()` method is imperative Python,
-    not a static graph. Attribute paths are dotted (e.g. "model.embed_tokens")."""
+    not a static graph. Attribute paths are dotted (e.g. "model.embed_tokens").
+
+    Every field is a `spec_protocol` link as of P4.0.5 (`EXPORT-PREPARATION.md` stage B.3/B.4), checked
+    against the loaded `nn.Module` in `Modular.export` before anything is traced. **This upgrades the
+    behaviour rather than reproducing it**, and the old timing is worth recording because it is what
+    made a typo expensive: `get_by_path` raised a bare `AttributeError` from wherever its traversal
+    happened to reach, which for `suffix_attrs` was after the prefix and the aux submodule had already
+    been traced -- a minute or more of work discarded to report a misspelled attribute name.
+    """
     prefix_attr: str
     repeated_attr: str
     suffix_attrs: list
@@ -47,6 +63,43 @@ class ModularExportSpec:
     # in Lfm2Model.forward and passed to every decoder layer as `position_embeddings=(cos, sin)`.
     aux_attr: Optional[str] = None
     aux_kwarg: Optional[str] = None
+
+    __links__ = {
+        "prefix_attr": ModuleAttrPath(),
+        # NOT a ModuleAttrPath: `find_repeated_blocks` re-derives which attributes are qualifying
+        # repeated blocks independent of this claim, so membership in that set is the stronger property
+        # AND implies the path resolves. Keeping it as the only check on this field is also what
+        # preserves the existing message, which lists the blocks that were discovered -- the thing that
+        # turns "wrong name" into a one-line fix.
+        "repeated_attr": ConfigDerived(
+            claim=lambda spec, ctx: True,
+            measured=lambda spec, ctx: spec.repeated_attr in find_repeated_blocks(ctx.model),
+            detail=lambda spec, ctx: sorted(find_repeated_blocks(ctx.model)),
+            message=(
+                "'{spec.repeated_attr}' is not a qualifying repeated block (an nn.ModuleList/Sequential "
+                "with more than one child); discovered repeated blocks: {detail}"
+            ),
+        ),
+        "suffix_attrs": EachOf(ModuleAttrPath()),
+        "aux_attr": WhenSet(ModuleAttrPath()),
+        # The kwarg name the aux submodule's outputs are threaded into. Checkable, and previously not
+        # checked at all: a misspelling here produces a layout whose aux inputs match no repeated-block
+        # parameter, which surfaces much later as a naming mismatch inside `apply_modular_export` with
+        # nothing pointing back at the spec.
+        "aux_kwarg": WhenSet(ConfigDerived(
+            claim=lambda spec, ctx: True,
+            measured=lambda spec, ctx: spec.aux_kwarg in inspect.signature(
+                _repeated_children(spec, ctx.model)[0].forward).parameters,
+            detail=lambda spec, ctx: [
+                p for p in inspect.signature(_repeated_children(spec, ctx.model)[0].forward).parameters
+                if p != "self"
+            ],
+            message=(
+                "ModularExportSpec declares aux_kwarg='{spec.aux_kwarg}', but "
+                "{spec.repeated_attr}'s blocks take no such parameter; their forward() accepts {detail}."
+            ),
+        )),
+    }
 
 
 @dataclass
@@ -195,18 +248,15 @@ def export_modular(model: nn.Module, spec: ModularExportSpec, dummy_inputs: dict
     Program alongside the layout metadata `apply_modular_export` (exporter.py) needs to synthesize
     the driver: which input name is the repeated block's hidden-states chain input, which input names
     the auxiliary submodule's outputs feed, and how many layers/suffix stages there are."""
+    # Every declared attribute path, the repeated-block claim and the aux kwarg, all checked against
+    # the real module before anything is traced (P4.0.5). This is the whole behavioural upgrade of the
+    # retrofit: the checks themselves are the ones this function used to make inline and by accident,
+    # but a misspelled `suffix_attrs` entry now fails here rather than after the prefix and aux
+    # submodules have already been traced.
+    check_links(spec, model=model)
+
     prefix_module = get_by_path(model, spec.prefix_attr)
-    # find_repeated_blocks structurally re-derives which attributes are qualifying repeated blocks
-    # (an nn.ModuleList/Sequential with >1 child) independent of spec.repeated_attr's own claim --
-    # cross-checking against it here means a typo'd or non-repeated attribute path raises immediately
-    # with a clear error, rather than silently proceeding against whatever get_by_path happened to find.
-    repeated_blocks = find_repeated_blocks(model)
-    if spec.repeated_attr not in repeated_blocks:
-        raise ValueError(
-            f"'{spec.repeated_attr}' is not a qualifying repeated block (an nn.ModuleList/Sequential "
-            f"with more than one child); discovered repeated blocks: {sorted(repeated_blocks)}"
-        )
-    children = repeated_blocks[spec.repeated_attr]
+    children = find_repeated_blocks(model)[spec.repeated_attr]
     suffix_modules = [get_by_path(model, a) for a in spec.suffix_attrs]
 
     targets = {"prefix": prefix_module, "layer": children[0]}
