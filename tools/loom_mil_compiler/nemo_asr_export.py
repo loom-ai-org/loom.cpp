@@ -61,7 +61,9 @@ import torch.nn as nn
 
 from .decomposition import Decomposition, Flattened
 from .export_config import LoomExportConfig
-from .spec_protocol import MODEL, OUTPUTS, ConfigDerived, NestedSpec, Unchecked, check_links
+from .spec_protocol import (
+    MODEL, OUTPUTS, Axis, ConfigDerived, NestedSpec, Unchecked, check_links,
+)
 
 # Dummy trace length, and the dynamic sample-axis bounds, all in SECONDS -- turned into sample counts
 # against the checkpoint's own declared sample rate. 0.1 s .. 20 s matches NeMo's own
@@ -241,8 +243,14 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     # Which tensor the traced wrapper returns; see EncoderOutput.
     output: EncoderOutput
     decomposition: Decomposition = field(default_factory=Flattened)
+    # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
+    # family-wide for all three models this template covers (axes.py's N_SAMPLES). A field rather than
+    # the literal `backend_kwargs()` used to return, so it is a *declaration* the Axis link can check
+    # (P4.0.5, stage B.5); the value and the resulting export are unchanged.
+    root_axis: str = "n_samples"
 
     __links__ = {
+        "root_axis": Axis(),
         "output": NestedSpec(
             where="EncoderOutput.validate, called from _NeMoASREncoderWrapper.forward -- the traced "
                   "forward's real return value exists for one instant during tracing and nowhere else, "
@@ -293,12 +301,7 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
         return build_trace(self, model, sample_rate)
 
     def backend_kwargs(self) -> dict:
-        return dict(
-            flat_namespace=True,
-            # EXPORT-ROADMAP.md R1: "waveform"'s own axis is raw audio samples, never a token count --
-            # family-wide for all three models this template covers (axes.py's N_SAMPLES).
-            root_axis="n_samples",
-        )
+        return dict(flat_namespace=True, root_axis=self.root_axis)
 
 
 class _NeMoASREncoderWrapper(nn.Module):

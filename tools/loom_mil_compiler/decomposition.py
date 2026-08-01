@@ -56,9 +56,17 @@ class Flattened(Decomposition):
         import torch
 
         from .register import LoomGGUFBackend
+        from .spec_protocol import LinkChecker
 
         config.prepare_environment()
         model = config.load_model()
+        # The config's own links (P4.0.5), before the trace. Nothing walks into `config.output`-style
+        # NestedSpec fields: those are checked where their context exists -- for the ASR family, inside
+        # the traced wrapper's forward, which is the only moment the real outputs exist.
+        checker = LinkChecker()
+        checker.check(config)
+        checker.provide(model=model)
+        checker.finish()
         wrapper, dummy_inputs, mil_inputs = config.build_trace(model)
 
         traced = torch.jit.trace(wrapper, dummy_inputs)
@@ -163,9 +171,16 @@ class MultiPhase(Decomposition):
         # deferral ledger, so `finish()` below is a real statement about the export rather than about
         # whichever call site happened to have context in hand.
         checker = LinkChecker()
+        checker.check(config)
         phase_topologies = {}
         named_weights = []
-        for phase in config.phases():
+        phases = config.phases()
+        # Every phase's axis declarations, checked before the first (slow) trace: an axis name outside
+        # axes.py's vocabulary, or a declared_axes entry naming an input this phase does not declare.
+        # Both are answerable from the declaration alone, which is why they run here and not after.
+        for phase in phases:
+            checker.check(phase, f"ExportPhase({phase.name!r})")
+        for phase in phases:
             traced = torch.jit.trace(phase.wrapper, phase.dummy_inputs)
             mil_prog = ct.convert(
                 traced, inputs=phase.mil_inputs, convert_to="milinternal",
