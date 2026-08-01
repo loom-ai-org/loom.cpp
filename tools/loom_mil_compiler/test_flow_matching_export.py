@@ -19,8 +19,12 @@ from loom_mil_compiler.flow_matching_export import (
 )
 
 
-def _topology(*input_names):
-    return {"inputs": [{"name": n} for n in input_names]}
+def _topology(*input_names, outputs=("v",)):
+    """A traced topology as `generate_graph_topology` emits it. The declared output is not decoration:
+    the generated Euler loop indexes `run_subgraph`'s single return value, so `FlowMatchingSpec` now
+    declares a `TopologyOutputArity` link against it (P4.0.5) -- a two-output estimator would bind `v`
+    to the first output's data and integrate the wrong tensor."""
+    return {"inputs": [{"name": n} for n in input_names], "outputs": list(outputs)}
 
 
 MATCHA = FlowMatchingSpec(func_name="sample_decoder", estimator="decoder",
@@ -110,6 +114,94 @@ class TestBespokeEstimator(unittest.TestCase):
         """A refinement spec's own per-step call is an EstimatorSpec, so the two cannot drift apart."""
         self.assertEqual(MATCHA.estimator_spec(),
                          EstimatorSpec(topology="decoder", inputs=["z", "mu", "t"]))
+
+
+class TestSpecProtocolRetrofit(unittest.TestCase):
+    """P4.0.5 stage B.2. Two questions: did the messages survive the move onto `spec_protocol`, and
+    does the protocol catch anything the hand-written validator did not."""
+
+    def test_the_mismatch_message_is_preserved_verbatim(self):
+        # The whole acceptance criterion of the protocol (`EXPORT-PREPARATION.md` §2): a generic checker
+        # that degrades a specific message into "validation failed" is a regression, not a refactor. So
+        # this asserts the exact string, not that *a* ValueError was raised.
+        with self.assertRaises(ValueError) as cm:
+            MATCHA.validate_against_topology(_topology("z", "mu", "t", "cond"))
+        self.assertEqual(
+            str(cm.exception),
+            "FlowMatchingSpec('sample_decoder') does not match topology 'decoder': "
+            "leaves declared input(s) unsupplied: ['cond']; "
+            "topology declares ['z', 'mu', 't', 'cond'], spec supplies ['z', 'mu', 't'].",
+        )
+
+    def test_both_halves_of_the_message_still_appear_together(self):
+        with self.assertRaises(ValueError) as cm:
+            MATCHA.validate_against_topology(_topology("z", "cond", "t"))
+        self.assertEqual(
+            str(cm.exception),
+            "FlowMatchingSpec('sample_decoder') does not match topology 'decoder': "
+            "supplies input(s) it does not declare: ['mu']; "
+            "leaves declared input(s) unsupplied: ['cond']; "
+            "topology declares ['z', 'cond', 't'], spec supplies ['z', 'mu', 't'].",
+        )
+
+    def test_the_unknown_topology_message_is_preserved_verbatim(self):
+        with self.assertRaises(ValueError) as cm:
+            render_driver(SAMPLER_MARKER, [MATCHA], topologies={"vocoder": _topology("mel")})
+        self.assertEqual(
+            str(cm.exception),
+            "FlowMatchingSpec('sample_decoder') names topology 'decoder', which is not among the "
+            "exported topologies ['vocoder'].",
+        )
+
+    def test_a_bespoke_estimator_is_still_named_by_its_topology(self):
+        spec = EstimatorSpec(topology="diffusion", inputs=["x_in"])
+        with self.assertRaises(ValueError) as cm:
+            render_driver("-- driver\n", topologies={"albert": _topology("tokens")}, estimators=[spec])
+        self.assertEqual(
+            str(cm.exception),
+            "EstimatorSpec('diffusion') names topology 'diffusion', which is not among the exported "
+            "topologies ['albert'].",
+        )
+
+    def test_a_multi_output_estimator_is_now_rejected(self):
+        """The check the hand-written validator never made. `render_sampler` emits
+        `local v = loom.run_subgraph(...)` and indexes `v[i]`; against a two-output topology `v` binds
+        the first output's DATA and the loop integrates the wrong tensor -- valid Lua, plausible
+        shapes, wrong audio, and nothing reports it."""
+        with self.assertRaises(ValueError) as cm:
+            render_driver(SAMPLER_MARKER, [MATCHA],
+                          topologies={"decoder": _topology("z", "mu", "t", outputs=("v", "logdet"))})
+        self.assertIn("is built for a topology declaring 1 output(s)", str(cm.exception))
+        self.assertIn("'decoder' declares 2: ['v', 'logdet']", str(cm.exception))
+
+    def test_supplied_inputs_is_what_the_generated_lua_actually_passes(self):
+        """The link's subject is a derived property, so the declaration cannot drift from the emission:
+        every name checked here is a name `render_sampler` writes into the per-step table."""
+        lua = render_sampler(SUPERTONIC)
+        self.assertEqual(SUPERTONIC.supplied_inputs, ["z_t", "txt_emb", "stl_emb", "t"])
+        for name in SUPERTONIC.supplied_inputs:
+            self.assertIn(f"{name} = ", lua)
+
+    def test_every_field_of_both_specs_is_declared(self):
+        """The standing rule, on the first two specs to adopt the protocol: each field is either
+        link-checked, covered by another field's link, or documented as uncheckable."""
+        from loom_mil_compiler.spec_protocol import dangling_coverage, undeclared_fields
+
+        for cls in (EstimatorSpec, FlowMatchingSpec):
+            self.assertEqual(undeclared_fields(cls), [], cls.__name__)
+            self.assertEqual(dangling_coverage(cls), [], cls.__name__)
+
+    def test_a_deferred_link_is_reported_rather_than_skipped(self):
+        """`render_driver(topologies=None)` is the documented "generate, don't validate" path. What
+        must not happen is a caller passing a checker and believing the specs were validated."""
+        from loom_mil_compiler.spec_protocol import LinkChecker, LinkError
+
+        checker = LinkChecker()
+        checker.check(MATCHA)
+        with self.assertRaises(LinkError) as cm:
+            checker.finish()
+        self.assertIn("were never checked", str(cm.exception))
+        self.assertIn("FlowMatchingSpec('sample_decoder').estimator", str(cm.exception))
 
 
 if __name__ == "__main__":
