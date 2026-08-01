@@ -42,6 +42,26 @@ class Decomposition:
     def export(self, config) -> str:
         raise NotImplementedError
 
+    def driver_builder(self, config):
+        """The `driver_builder.DriverBuilder` that assembles this decomposition's driver for `config`,
+        or `None` if this decomposition does not build one.
+
+        **The builder is selected by the decomposition, not owned by the family**
+        (`EXPORT-PREPARATION.md` §5 decision 2, BACKLOG.md P4.0.6). The orchestration shape a driver has
+        is a property of how the model was decomposed -- one traced graph means prefill-then-argmax, a
+        submodule chain means thread the hidden state through it, N phases means whatever that family's
+        phases compose into -- so a fourth decomposition (the cross-attention AR decode shape, families
+        2 + 6) arrives bringing its own builder rather than every family in it declaring one.
+
+        `config` is passed because the *contents* still are family-specific: `MultiPhase` reads which
+        phases and samplers this family declared. What the decomposition fixes is the shape.
+
+        Returning `None` is a real answer, not a stub: `Flattened` covers both the synthesized
+        prefill path and the bespoke hand-built-Program workflow, and the latter transpiles a MIL `main`
+        function op by op rather than assembling components (`LoomGGUFExporter.transpile_to_lua`).
+        """
+        return None
+
 
 @dataclass
 class Flattened(Decomposition):

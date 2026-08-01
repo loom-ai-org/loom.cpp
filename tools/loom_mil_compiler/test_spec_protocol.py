@@ -387,6 +387,13 @@ _NOT_SPECS = {
                                           "against the model they were derived FROM is circular",
     "modular_export._LeafPath": "an internal bookkeeping record for one captured tensor argument, "
                                 "built and consumed inside _flatten_call/_replay",
+    "driver_builder.DriverContext": "the real topologies/axes/weights a component emits against -- the "
+                                    "same category as spec_protocol's own LinkCheckContext. It is what "
+                                    "links are checked AGAINST, so checking it against something else "
+                                    "has no second authority to appeal to",
+    "driver_builder.DriverScript": "a build RESULT (the emitted prelude chunks and entry function), "
+                                   "checked by driver_ir.validate/check_subgraph_calls at the moment "
+                                   "DriverBuilder.build produces it rather than by a declaration",
 }
 
 # Modules the scan is allowed to fail to import. Both are standalone scripts that re-run `dialect.py`'s
