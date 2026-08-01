@@ -25,7 +25,11 @@ from loom_mil_compiler.registry import ModelRecognizer, TaskRegistry, TaskRegist
 from loom_mil_compiler.export_config import LoomExportConfig  # noqa: E402
 from loom_mil_compiler.tasks import known_tasks, task_spec  # noqa: E402
 from loom_mil_compiler.checkpoint_probe import probe_torch_checkpoint, read_json  # noqa: E402
-from loom_mil_compiler.causal_lm_export import _is_qwen3  # noqa: E402
+from loom_mil_compiler.causal_lm_export import (  # noqa: E402
+    _build_hf_causal_lm,
+    _is_hf_causal_lm,
+    _is_qwen3,
+)
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
     _is_conformer_ctc,
     _is_parakeet_rnnt,
@@ -33,10 +37,16 @@ from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
 )
 
 
-def _make_hf_dir(tmp_path: Path, model_type: str) -> Path:
-    d = tmp_path / model_type
+def _make_hf_dir(tmp_path: Path, model_type: str, architectures=None, name: str = None) -> Path:
+    """`architectures` mirrors what a real HF `config.json` carries; omitted by default so the pre-P4.0.4
+    fixtures keep testing exactly what they tested before (a `model_type`-only directory), which is also
+    the shape P4.0.4's generic recognizer must NOT claim."""
+    d = tmp_path / (name or model_type)
     d.mkdir()
-    (d / "config.json").write_text(json.dumps({"model_type": model_type}))
+    config = {"model_type": model_type}
+    if architectures is not None:
+        config["architectures"] = architectures
+    (d / "config.json").write_text(json.dumps(config))
     return d
 
 
@@ -113,6 +123,107 @@ def test_is_qwen3_rejects_a_plain_file(tmp_path):
     f = tmp_path / "not_a_dir"
     f.write_text("x")
     assert not _is_qwen3(f)
+
+
+# -- the generic causal-LM recognizer (BACKLOG.md P4.0.4) ---------------------------------------------
+
+def test_the_generic_recognizer_claims_an_unregistered_causal_lm(tmp_path):
+    """The point of the whole step: a Llama-shaped directory, which no recognizer claimed before."""
+    assert _is_hf_causal_lm(_make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"]))
+
+
+def test_the_generic_recognizer_needs_a_for_causal_lm_architecture(tmp_path):
+    """`model_type` alone would claim every HF directory on disk. These three sit beside the causal LMs
+    on this machine, and claiming any of them would break another family's detection."""
+    assert not _is_hf_causal_lm(_make_hf_dir(tmp_path, "whisper", ["WhisperForConditionalGeneration"]))
+    assert not _is_hf_causal_lm(_make_hf_dir(tmp_path, "parakeet_ctc", ["ParakeetForCTC"]))
+    assert not _is_hf_causal_lm(_make_hf_dir(tmp_path, "gigaam"))  # a real config with no architectures
+
+
+def test_the_generic_recognizer_needs_a_model_type(tmp_path):
+    """`model_type` is what `load_model` turns into `general.architecture`; without one the export would
+    fail after detection rather than during it."""
+    d = tmp_path / "no_model_type"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"]}))
+    assert not _is_hf_causal_lm(d)
+
+
+def test_the_generic_recognizer_survives_a_malformed_config(tmp_path):
+    """`detect()` runs against unidentified paths by construction, so a broken `config.json` must be a
+    "no", not a traceback."""
+    for content, name in ((b"{not json", "broken"), (b"[1, 2]", "not_an_object")):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "config.json").write_bytes(content)
+        assert not _is_hf_causal_lm(d)
+    d = tmp_path / "wrong_arch_type"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"model_type": "x", "architectures": "LlamaForCausalLM"}))
+    assert not _is_hf_causal_lm(d)
+
+
+def test_a_llama_dir_resolves_through_the_registry_to_the_generic_recognizer(tmp_path):
+    from loom_mil_compiler.registry import default_registry
+
+    path = _make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"])
+    rec = default_registry().detect(path)
+    assert rec.name == "hf-causal-lm"
+
+
+def test_qwen3_still_resolves_to_its_own_recognizer_not_the_generic_one(tmp_path):
+    """A real Qwen3 config declares `Qwen3ForCausalLM`, so the generic recognizer matches it too --
+    A.3's specific-beats-fallback tiering is the only reason this still resolves to `qwen3`."""
+    from loom_mil_compiler.registry import default_registry
+
+    path = _make_hf_dir(tmp_path, "qwen3", ["Qwen3ForCausalLM"])
+    assert _is_hf_causal_lm(path), "the fixture must be one the generic recognizer really claims"
+    assert default_registry().detect(path).name == "qwen3"
+
+
+def test_lfm2_still_raises_its_two_way_ambiguity(tmp_path):
+    """Monolithic vs. modular is a caller decision; the generic recognizer must not silently resolve it
+    by becoming a third match."""
+    from loom_mil_compiler.registry import default_registry
+
+    path = _make_hf_dir(tmp_path, "lfm2", ["Lfm2ForCausalLM"])
+    with pytest.raises(ValueError, match="matched more than one recognizer") as excinfo:
+        default_registry().detect(path)
+    assert "lfm2-monolithic" in str(excinfo.value) and "lfm2-modular" in str(excinfo.value)
+    assert "hf-causal-lm" not in str(excinfo.value)
+
+
+def test_the_generic_build_config_infers_everything_it_can(tmp_path):
+    """`architecture`/`tokenizer_pre` left None on purpose -- resolved from the checkpoint's own
+    `model_type` in `load_model` and from the tokenizer's own hash in `_write_tokenizer`. If these ever
+    stop being None, adding a model stops being free again."""
+    from loom_mil_compiler.causal_lm_export import LMCausalModelExportConfig
+    from loom_mil_compiler.decomposition import Flattened
+
+    path = _make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"])
+    config = _build_hf_causal_lm(path, "out.gguf")
+    assert isinstance(config, LMCausalModelExportConfig)
+    assert config.architecture is None and config.tokenizer_pre is None
+    assert config.tokenizer_family is None and config.model_dir == str(path)
+    assert isinstance(config.decomposition, Flattened)
+
+
+def test_a_model_type_override_reaches_the_built_config(tmp_path, monkeypatch):
+    """The table is empty today (see its comment for why that is a finding, not an omission); this is
+    the mechanism working, so the first real exception does not have to prove the wiring too."""
+    from loom_mil_compiler import causal_lm_export
+
+    monkeypatch.setitem(causal_lm_export._MODEL_TYPE_OVERRIDES, "llama", {"tokenizer_pre": "llama3"})
+    path = _make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"])
+    assert _build_hf_causal_lm(path, "out.gguf").tokenizer_pre == "llama3"
+
+
+def test_the_generic_recognizer_does_not_claim_the_other_families_fixtures(tmp_path):
+    """`TaskRegistry.detect` runs every recognizer against every path, so a fallback that over-claims
+    breaks the four other families rather than just itself."""
+    paths = [_make_nemo_archive(tmp_path, "ctc", CTC_CONFIG)] + list(_all_tts_fixtures(tmp_path).values())
+    for path in paths:
+        assert not _is_hf_causal_lm(path), f"the generic causal-LM recognizer claimed {path.name}"
 
 
 # -- NeMo ASR encoder recognizers ---------------------------------------------------------------------

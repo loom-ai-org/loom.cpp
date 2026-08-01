@@ -11,6 +11,13 @@ per-class now lives on the decomposition (`Modular.spec`/`dummy_seq_len`) or on 
 (`seq_len`, tokenizer paths, `quantize`), and the mechanics moved to `decomposition.py`; the traced
 graphs and the GGUFs they produce are byte-identical either way.
 
+Since P4.0.4 this family is reachable two ways: three *specific* recognizers (Qwen3, LFM2 ×2) and one
+generic `hf-causal-lm` fallback that claims any HF directory declaring a `*ForCausalLM` architecture.
+The family was already model-agnostic underneath -- one wrapper over plain `AutoModelForCausalLM`, the
+architecture inferred from `config.model_type`, the tokenizer family and pretokenizer auto-detected in
+the exporter -- so what the fallback removes is the requirement to hand-write an `_is_llama` +
+`_build_llama` pair to reach code that never needed to know it was Llama.
+
 `export_hf_causal_lm.py` keeps its own CLI as a thin wrapper around this class.
 """
 import json
@@ -154,8 +161,10 @@ class LMCausalModelExportConfig(LoomExportConfig):
         return kwargs
 
 
-def _hf_model_type(path: Path) -> Optional[str]:
-    """An HF-style directory's own `config.json`'s `model_type`, or None if `path` isn't one."""
+def _hf_config(path: Path) -> Optional[dict]:
+    """An HF-style directory's own `config.json`, parsed, or None if `path` isn't one. Never raises:
+    `detect()` runs against unidentified paths by construction, so a malformed or unreadable
+    `config.json` is a "no" rather than an error."""
     cfg_path = path / "config.json"
     if not path.is_dir() or not cfg_path.exists():
         return None
@@ -163,7 +172,13 @@ def _hf_model_type(path: Path) -> Optional[str]:
         cfg = json.loads(cfg_path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
-    return cfg.get("model_type")
+    return cfg if isinstance(cfg, dict) else None
+
+
+def _hf_model_type(path: Path) -> Optional[str]:
+    """An HF-style directory's own `config.json`'s `model_type`, or None if `path` isn't one."""
+    cfg = _hf_config(path)
+    return cfg.get("model_type") if cfg is not None else None
 
 
 def _is_qwen3(path: Path) -> bool:
@@ -211,8 +226,64 @@ def _build_lfm2_modular(path: Path, output_path: str) -> LoomExportConfig:
     )
 
 
+# -- the generic recognizer (BACKLOG.md P4.0.4) -------------------------------------------------------
+
+def _is_hf_causal_lm(path: Path) -> bool:
+    """Any HF-style directory that declares a `model_type` AND an `architectures` entry ending in
+    `ForCausalLM`.
+
+    **Both halves are load-bearing.** `model_type` alone is what `load_model` needs (it becomes
+    `general.architecture`), but nearly every HF directory has one -- Whisper, Parakeet and GigaAM all sit
+    beside the causal LMs on this machine, and a `detect()` that claimed them would break three other
+    families' detection, since `TaskRegistry.detect` runs every recognizer against every path. The
+    `architectures` entry is the checkpoint's own statement of which `AutoModelFor*` class it loads
+    through, which is exactly the claim `_CausalLMWrapper` needs to be true: `WhisperForConditionalGeneration`
+    and `ParakeetForCTC` are rejected by it, `Qwen3ForCausalLM` and `Lfm2ForCausalLM` accepted.
+
+    Registered `fallback=True`, so it is consulted only when no specific recognizer matched -- Qwen3 still
+    resolves to `qwen3` and LFM2 still raises its intended two-way ambiguity."""
+    cfg = _hf_config(path)
+    if cfg is None or not cfg.get("model_type"):
+        return False
+    architectures = cfg.get("architectures") or []
+    if not isinstance(architectures, list):
+        return False
+    return any(isinstance(arch, str) and arch.endswith("ForCausalLM") for arch in architectures)
+
+
+# Per-`model_type` exceptions to the generic path's defaults, as `LMCausalModelExportConfig` kwargs.
+#
+# **Empty, and that is the finding rather than an omission.** The two model types with a specific
+# recognizer are the only evidence available on what a generic path would get wrong, and neither needs
+# an entry: the exporter's own tokenizer auto-detection resolves LFM2 to `llama3` and Qwen3 to `qwen2`,
+# which is exactly what `_build_lfm2_*`/`_build_qwen3` hardcode (asserted in `test_causal_lm_export.py`).
+# Both stay specific recognizers anyway, for a reason no table could carry: LFM2's monolithic/modular
+# split is a caller decision, not a checkpoint property. This table is where a real exception goes when
+# a checkpoint turns one up -- a `tokenizer_pre` the hash cascade does not know, an `architecture` whose
+# `model_type` disagrees with what the engine expects.
+_MODEL_TYPE_OVERRIDES: dict[str, dict] = {}
+
+
+def _build_hf_causal_lm(path: Path, output_path: str) -> LoomExportConfig:
+    """The generic build: everything the family can infer, inferred. `architecture=None` is resolved from
+    the checkpoint's own `model.config.model_type` in `load_model`, `tokenizer_pre=None` from the
+    tokenizer's own hash in `_write_tokenizer`, and the decomposition is `Flattened()` -- the only one a
+    checkpoint can be exported with without a caller naming submodule attribute paths."""
+    overrides = _MODEL_TYPE_OVERRIDES.get(_hf_model_type(path) or "", {})
+    return LMCausalModelExportConfig(
+        architecture=None, output_path=output_path, decomposition=Flattened(), model_dir=str(path),
+        **overrides,
+    )
+
+
 def register(registry) -> None:
-    """Registers this family's `TaskRegistryEntry` (BACKLOG.md P3.2, extended with LFM2's two profiles)."""
+    """Registers this family's `TaskRegistryEntry` (BACKLOG.md P3.2, extended with LFM2's two profiles,
+    then with P4.0.4's generic recognizer).
+
+    Qwen3 and both LFM2 profiles stay specific rather than folding into the generic recognizer: LFM2
+    needs two entries for one directory, which is a choice `detect()` cannot read off a checkpoint at
+    all, and Qwen3's stays as the worked example of what a specific recognizer looks like next to the
+    generic one."""
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
@@ -222,5 +293,9 @@ def register(registry) -> None:
             ModelRecognizer(name="qwen3", detect=_is_qwen3, build_config=_build_qwen3),
             ModelRecognizer(name="lfm2-monolithic", detect=_is_lfm2, build_config=_build_lfm2_monolithic),
             ModelRecognizer(name="lfm2-modular", detect=_is_lfm2, build_config=_build_lfm2_modular),
+            ModelRecognizer(
+                name="hf-causal-lm", detect=_is_hf_causal_lm, build_config=_build_hf_causal_lm,
+                fallback=True,
+            ),
         ],
     ))

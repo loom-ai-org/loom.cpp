@@ -98,3 +98,22 @@ def test_lfm2_modular_registry_entry_matches_direct_construction(tmp_path):
             tokenizer_dir=str(LFM2_DIR), tokenizer_pre="llama3",
         ),
     )
+
+
+# -- what makes P4.0.4's `_MODEL_TYPE_OVERRIDES` table legitimately empty ------------------------------
+
+@pytest.mark.parametrize("model_dir,expected_pre", [(LFM2_DIR, "llama3"), (QWEN3_DIR, "qwen2")])
+def test_the_generic_path_infers_the_tokenizer_the_specific_recognizers_hardcode(model_dir, expected_pre):
+    """`_build_hf_causal_lm` passes `tokenizer_pre=None` and lets `_write_tokenizer` auto-detect. The
+    claim that this is safe -- and therefore that the overrides table can be empty -- rests on the
+    auto-detection agreeing with what the two specific recognizers hardcode, which is checkable rather
+    than arguable: LFM2 hardcodes `llama3` and Qwen3 relies on the `qwen2` default.
+
+    Cheap (no trace, no export): reads the tokenizer and hashes one fixed test string."""
+    if not model_dir.exists():
+        pytest.skip(f"{model_dir} not available locally")
+    from transformers import AutoTokenizer
+    from loom_mil_compiler.tokenizer_detect import detect_loom_pre_type, detect_vocab_family
+
+    assert detect_vocab_family(str(model_dir)) == "bpe"
+    assert detect_loom_pre_type(AutoTokenizer.from_pretrained(str(model_dir))) == expected_pre
