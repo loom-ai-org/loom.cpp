@@ -42,7 +42,7 @@ class Decomposition:
     def export(self, config) -> str:
         raise NotImplementedError
 
-    def driver_builder(self, config):
+    def driver_builder(self, config, **context):
         """The `driver_builder.DriverBuilder` that assembles this decomposition's driver for `config`,
         or `None` if this decomposition does not build one.
 
@@ -55,6 +55,11 @@ class Decomposition:
 
         `config` is passed because the *contents* still are family-specific: `MultiPhase` reads which
         phases and samplers this family declared. What the decomposition fixes is the shape.
+
+        `**context` is whatever the specific decomposition documents needing beyond the config, in the
+        same "hooks are a protocol, not a base class" spirit as `export()` itself -- `MultiPhase` takes
+        `source=`, the driver text after its generated samplers have been substituted in, because that
+        text only exists once the phases have been traced.
 
         Returning `None` is a real answer, not a stub: `Flattened` covers both the synthesized
         prefill path and the bespoke hand-built-Program workflow, and the latter transpiles a MIL `main`
@@ -194,10 +199,25 @@ class MultiPhase(Decomposition):
 
     Config hooks: `phases()`, `samplers()`, `estimators()`, `driver_script_path`, `architecture`."""
 
+    def driver_builder(self, config, **context):
+        """A `MultiPhaseDriverBuilder` around this family's hand-written driver (P4.0.6/C.3).
+
+        Takes `source=` -- the driver text *after* `render_driver` has substituted the generated
+        samplers -- because that text does not exist until every phase has been traced, which is also
+        the moment the topologies it will be checked against come into being.
+        """
+        from .driver_components import MultiPhaseDriverBuilder, RawLuaDriver
+
+        return MultiPhaseDriverBuilder(driver=RawLuaDriver(
+            source=context["source"], origin=config.driver_script_path.name,
+            external=config.external_topologies(),
+        ))
+
     def export(self, config) -> str:
         import coremltools as ct
         import torch
 
+        from .driver_builder import DriverContext
         from .exporter import LoomGGUFExporter
         from .flow_matching_export import render_driver
         from .multi_phase_export import merge_phase_weights
@@ -241,6 +261,19 @@ class MultiPhase(Decomposition):
         driver_source = render_driver(
             config.driver_script_path.read_text(), config.samplers(),
             topologies=out_exporter.topologies, estimators=config.estimators(),
+            checker=checker,
+        )
+        # The driver goes through a DriverBuilder as of P4.0.6/C.3, which for now holds one component:
+        # the hand-written source, adopted whole. That is not cosmetic even while the emitted text is
+        # byte-identical -- the adoption parses the driver's own `loom.run_subgraph` call sites and
+        # declares each against the topologies just traced, which is the first time these five drivers
+        # have been cross-checked against the model they ship with at all.
+        driver_source = self.driver_builder(config, source=driver_source).render(
+            DriverContext(
+                topologies=out_exporter.topologies,
+                axes={phase.name: phase.root_axis for phase in phases},
+                weights=out_exporter.weights,
+            ),
             checker=checker,
         )
         # Nothing may be written until every declared link has actually run. A link that deferred and

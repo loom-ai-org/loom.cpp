@@ -51,7 +51,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -298,6 +298,16 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     checkpoint_path: str
     kokoro_config_path: str = "/home/flavio/.claude/tmp/kokoro_model/config.json"
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver_mil.lua"
+
+    def external_topologies(self) -> Dict[str, str]:
+        """StyleTTS2's MIL export is **partial**, the same way Kokoro's is and for the same reason --
+        see `TTSKokoroExportConfig.external_topologies` for the full note. Three heavy stages move to
+        MIL (`albert`, `diffusion`, `decoder_vocoder`); the rest of the driver's calls land on
+        topologies still loaded from the pre-MIL `styletts2.gguf`, which is exactly what
+        `test_e2e_styletts2_mil_lua_driver.cpp` registers alongside this export."""
+        from_bespoke = "the pre-MIL styletts2.gguf, registered alongside this export by the host"
+        return {"bert_encoder": from_bespoke, "text_encoder_cnn": from_bespoke,
+                "duration_proj": from_bespoke}
 
     __unchecked__ = {
         "checkpoint_path": Unchecked(
