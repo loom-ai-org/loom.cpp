@@ -129,8 +129,20 @@ class TestAssembly(unittest.TestCase):
         self.assertEqual([s.name for s in script.entry.body], ["a", "b"])
 
     def test_render_puts_the_prelude_above_the_entry_function(self):
+        """Joined with a single newline: a component owns the blank lines around its own contribution,
+        which is what lets an existing hand-written driver be adopted byte-exactly."""
         text = _Builder([RecordingComponent("a")]).render(_ctx())
-        self.assertEqual(text, "-- prelude of a\n\nfunction main(inputs)\n    local a = 1\nend")
+        self.assertEqual(text, "-- prelude of a\nfunction main(inputs)\n    local a = 1\nend")
+
+    def test_a_postlude_survives_to_the_end_of_the_script(self):
+        """A file ending in a newline after its last `end` is one trailing empty line -- and every
+        hand-written driver in this tree does."""
+        class _Trailing(DriverComponent):
+            def postlude(self, ctx):
+                return [""]
+
+        self.assertEqual(_Builder([RecordingComponent("a"), _Trailing()]).render(_ctx()),
+                         "-- prelude of a\nfunction main(inputs)\n    local a = 1\nend\n")
 
     def test_a_component_with_no_prelude_renders_the_function_alone(self):
         """The synthesized causal-LM/ASR shape: no top-level Lua at all, so `render` must not introduce

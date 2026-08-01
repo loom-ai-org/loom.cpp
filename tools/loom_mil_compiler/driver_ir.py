@@ -285,10 +285,19 @@ class Break(Stmt):
 
 @dataclasses.dataclass
 class RawBlock(Stmt):
-    """Escape hatch for lines that don't (yet) deserve their own node type."""
+    """Escape hatch for lines that don't (yet) deserve their own node type.
+
+    `verbatim` emits the lines with no indentation added at all, which is what adopting an existing
+    hand-written driver requires (P4.0.6/C.3): its lines already carry their own indentation, and
+    re-indenting them would move every line of the embedded `model.driver_script` -- failing the
+    byte-identity gate for a purely cosmetic reason and hiding whatever real change the same commit
+    made. Off by default: a block the exporter itself synthesizes (a `-- Weight ... packaged in GGUF`
+    marker, say) has no indentation of its own and wants the enclosing block's.
+    """
     lines: list
     defines_: list = dataclasses.field(default_factory=list)
     reads_: list = dataclasses.field(default_factory=list)
+    verbatim: bool = False
 
     def defines(self) -> list[str]:
         return self.defines_
@@ -452,5 +461,7 @@ class LuaCodegen:
         if isinstance(stmt, Break):
             return [f"{pad}break"]
         if isinstance(stmt, RawBlock):
+            if stmt.verbatim:
+                return list(stmt.lines)
             return [f"{pad}{line}" for line in stmt.lines]
         raise DriverIRError(f"LuaCodegen: unhandled IR node {stmt!r}")
