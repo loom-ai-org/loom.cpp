@@ -61,6 +61,7 @@ from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import EstimatorSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .patcher import ModelPatcher
+from .spec_protocol import Unchecked
 
 
 class StyleTTS2ModelPatcher(ModelPatcher):
@@ -297,6 +298,22 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     checkpoint_path: str
     kokoro_config_path: str = "/home/flavio/.claude/tmp/kokoro_model/config.json"
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver_mil.lua"
+
+    __unchecked__ = {
+        "checkpoint_path": Unchecked(
+            "path to StyleTTS2's own .pth. The recognizer's detect() already established the structure "
+            "this config depends on, and it is the near-collision with Kokoro that makes that check the "
+            "real one: both checkpoints are dicts of component name -> OrderedDict with no version "
+            "marker, so detect() discriminates on what Kokoro's inference-only release strips. A path "
+            "link would accept the Kokoro checkpoint."
+        ),
+        "kokoro_config_path": Unchecked(
+            "a genuinely separate dependency -- the hyperparameters this checkpoint shares "
+            "byte-identically with Kokoro's own KokoroConfig, which StyleTTS2's own release does not "
+            "ship. phases() reads it as JSON and every field it needs raises by name if absent, which "
+            "is more specific than a path check."
+        ),
+    }
 
     def phases(self) -> List[ExportPhase]:
         print(f"Loading StyleTTS2 checkpoint {self.checkpoint_path}...")

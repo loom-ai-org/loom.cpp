@@ -65,6 +65,7 @@ from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, TTSFlowMatchingModelExportConfig
 from .patcher import ModelPatcher
+from .spec_protocol import Unchecked
 
 
 class MatchaModelPatcher(ModelPatcher):
@@ -364,6 +365,12 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
     layout)."""
 
     model_dir: str
+
+    __unchecked__ = {
+        "model_dir": Unchecked(
+            "the directory holding matcha_ljspeech.ckpt and generator_v1. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
+        ),
+    }
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_matcha" / "matcha_driver_mil.lua"
 
     def phases(self) -> List[ExportPhase]:

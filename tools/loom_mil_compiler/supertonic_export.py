@@ -78,6 +78,7 @@ import coremltools as ct
 from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
+from .spec_protocol import Unchecked
 
 T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fixed exactly
 
@@ -167,6 +168,12 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
     checkpoint files."""
 
     model_dir: str
+
+    __unchecked__ = {
+        "model_dir": Unchecked(
+            "the assets/pt directory holding all four .pt files. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
+        ),
+    }
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_supertonic" / "supertonic_driver_mil.lua"
 
     def phases(self) -> List[ExportPhase]:

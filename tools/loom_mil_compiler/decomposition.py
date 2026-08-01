@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .modular_export import ModularExportSpec
+from .spec_protocol import NestedSpec, Unchecked
 
 
 class Decomposition:
@@ -107,6 +108,22 @@ class Modular(Decomposition):
     # marks an axis dynamic when its captured size equals this value, so a collision would wrongly mark a
     # static axis dynamic (or vice versa).
     dummy_seq_len: int = 37
+
+    __links__ = {
+        "spec": NestedSpec(
+            where="export_modular, which checks every declared attribute path against the real "
+                  "nn.Module before it traces anything"
+        ),
+    }
+    __unchecked__ = {
+        "dummy_seq_len": Unchecked(
+            "a sentinel length, and the one field here where a link would be actively misleading. Its "
+            "correctness condition is a NON-collision with any of the model's own static dims -- "
+            "checkable in principle, but only against the specific checkpoint, and a wrong value does "
+            "not fail: it marks a static axis dynamic (or the reverse) and exports something plausible. "
+            "The real guard is the per-model reference test, not a declaration."
+        ),
+    }
 
     def export(self, config) -> str:
         from .modular_export import export_modular
