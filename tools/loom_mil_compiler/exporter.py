@@ -29,6 +29,24 @@ _POSITION_INPUT_NAMES = {"cache_position", "position_ids"}
 # _POSITION_INPUT_NAMES -- see export_lfm2_*.py's own _causal_mask() comment).
 _CAUSAL_MASK_INPUT_NAMES = {"attention_mask"}
 
+# The generic name a caller may always use for a driver's primary input, whatever the traced graph
+# happens to call it (`input_ids`, `audio_signal`, ...).
+_GENERIC_PRIMARY_INPUT = "tokens"
+
+
+def _caller_input(name: str):
+    """Reads one input from the driver's `inputs` table, with `tokens` accepted as an alias for it.
+
+    The alias is what lets a caller pass the primary input as `inputs.tokens` without knowing the traced
+    graph's own name for it. When that name IS `tokens` there is nothing to alias, and emitting the
+    fallback anyway produced `inputs.tokens or inputs.tokens` -- same expression on both sides of the
+    `or`, which is what the generated Lua read like for every causal LM."""
+    field = FieldAccess("inputs", name)
+    if name == _GENERIC_PRIMARY_INPUT:
+        return field
+    return BinOp("or", field, FieldAccess("inputs", _GENERIC_PRIMARY_INPUT))
+
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (np.integer, np.int32, np.int64)):
@@ -1206,7 +1224,7 @@ class LoomGGUFExporter:
             elif name in _CAUSAL_MASK_INPUT_NAMES:
                 body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
             else:
-                body.append(Local(safe_inp, BinOp("or", FieldAccess("inputs", safe_inp), FieldAccess("inputs", "tokens"))))
+                body.append(Local(safe_inp, _caller_input(safe_inp)))
 
         inputs_tbl = {self.safe_name(k): IRVar(self.safe_name(k)) for k in main_func.inputs.keys()}
 
@@ -1276,7 +1294,7 @@ class LoomGGUFExporter:
 
         # 2. `first_input` (the caller-supplied token-ids input) must be defined before anything below
         # reads n_tokens_expr, mirroring apply_monolithic_export's own ordering.
-        body = [Local(first_input, BinOp("or", FieldAccess("inputs", first_input), FieldAccess("inputs", "tokens")))]
+        body = [Local(first_input, _caller_input(first_input))]
 
         special_needed = set()
         for name in stage_names:
