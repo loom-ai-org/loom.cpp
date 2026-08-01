@@ -74,6 +74,15 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > below that predate it are still valid; R2 and R7 in particular subsume several of them.
 > **The implementation order is fixed — see the next section.**
 
+> **[`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md) is what P4.0 executes.** It reviewed the question
+> "could the exporter emulate `optimum-onnx`, so one entry point exports any causal LM / ASR / TTS
+> model?" and found the export-side port already substantially done — the blocker is **who writes the
+> Lua driver**: seven of eleven models get a hand-written `.lua` with marker substitution and none of
+> `driver_ir`'s checks, while four get a synthesized, validated one. It proposes five items
+> (**P4.0.4–P4.0.8**, listed under P4.0 below), records the decisions taken on 2026-08-01, and carries a
+> five-stage implementation plan at commit granularity. It closes out R3's "driver templates as
+> first-class artifacts" residue by specifying it and promoting it to the P4 critical path.
+
 ### Implementation sequence for the roadmap (start here)
 
 The order below is not arbitrary; each phase either shrinks the surface the next one has to preserve, or
@@ -96,7 +105,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage | P4.0 carry-over from P3, Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
+| **P4** | flagship coverage | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -513,7 +522,9 @@ P4, all of them still real:
   (`BaseMultiPhaseModelExportConfig.driver_script_path`), now called uniformly for every multi-phase
   family instead of per script. The uniform call site is the part P3 delivered; the template mechanism
   itself is untouched, and a family whose driver needs more than one substitution point will be the
-  thing that forces it.
+  thing that forces it. **Now specified and promoted out of residue onto the critical path — P4.0.6
+  below** (`EXPORT-PREPARATION.md` §1.4/§3): the template mechanism is `driver_ir`, which already
+  exists and is under-used.
 - **`.inputs` / `.generate_dummy_inputs()` / `.patch_model_for_export()` as named config members.**
   R3's piece table names all three; none exist under those names. What exists instead: axes are declared
   per phase (`ExportPhase.root_axis`/`declared_axes`) or per family field, dummy inputs are built inline
@@ -530,10 +541,17 @@ of this file that does not exist (the hierarchy is described in P3.1's entry ins
 
 #### P4.0 — settle these before the first from-scratch family config
 
-Three items that P3 left in a state P4 would otherwise inherit and harden. None is large; all three get
-cheaper now and more expensive after Whisper/GigaAM/composition add three more configs written against
-whatever shape exists at the time. Same gate as everything else: byte-identical re-export of all 11
-models (`snapshot_gguf.py`), since none of these is meant to change any output.
+Eight items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
+(P4.0.1–P4.0.3, all DONE), five added by [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md)
+(P4.0.4–P4.0.8). None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
+add three more configs written against whatever shape exists at the time. Same gate as everything else:
+byte-identical re-export of all 11 models (`snapshot_gguf.py`), since none of these is meant to change
+any output — with one stated exception, P4.0.6's per-family peeling commits, where driver text
+legitimately changes and the gate becomes the model's e2e Lua-driver test plus a read diff.
+
+**Verification budget (decision, 2026-08-01):** affected models per commit — each step in
+`EXPORT-PREPARATION.md` §6 names which models it can possibly touch — and a full 11-model sweep per
+completed item.
 
 - **P4.0.1 — real `detect()` for the self-describing TTS checkpoints — DONE.** P3.3 registered all five
   TTS families with `detect()` returning `False` unconditionally, so `loom-export <path> -o x.gguf` worked
@@ -657,6 +675,91 @@ models (`snapshot_gguf.py`), since none of these is meant to change any output.
   Kokoro's `decoder_vocoder` (five distinct dynamic symbols, four declared, one root) and NeMo's
   non-default `root_axis`.
 - **P4.0.3 — monolithic/modular is an option again, not a class — DONE (see the next section).**
+
+The five items below come from [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md), which carries the
+findings, the resolved decisions and the commit-level plan (§6, stages 0/A/B/C/D/E). Ordering rationale
+in one line each: **A** first because it is the only stage that *removes* surface the others would have
+to preserve; **B** before **C** because C's components are the first specs that would otherwise be
+written against nothing; **D** after **C** because a registry of components with no shared calling
+convention is a directory, not a shelf; **E** last because it is test work and bookkeeping that blocks
+nothing.
+
+- **P4.0.4 — task vocabulary and generic recognition.** The registered task names are `causal-lm`,
+  `nemo-asr-encoder`, `tts-multi-phase`, `tts-flow-matching`: two name a decomposition and one names a
+  loader library. Since P4.0.3 made decomposition its own field, `tts-multi-phase`/`tts-flow-matching`
+  are one task whose members differ by a field. Rename to real tasks — `text-generation`,
+  `automatic-speech-recognition`, `text-to-speech` — plus `audio-codec` **reserved** with no family
+  against it until family 11 exists (decision 3), which is only meaningful if the vocabulary is a real
+  checked list: hence `tasks.py`, declaring the canonical names and each task's base config class, with
+  `TaskRegistry.register()` validating against it. No backwards-compatible aliases; the task name is a
+  CLI argument, not a stored artifact. Second half: a **generic causal-LM recognizer** (any HF dir with
+  a `model_type` and a `*ForCausalLM` architecture, `fallback=True`), so adding Llama stops meaning
+  hand-writing `_is_llama` + `_build_llama` — the family is already model-agnostic underneath, and the
+  only per-model data in `_build_qwen3`/`_build_lfm2_*` is an architecture string, an optional
+  `tokenizer_pre` and a decomposition, all with working defaults. Requires `ModelRecognizer.fallback`
+  and a specific-beats-fallback `detect`, or every Qwen3/LFM2 detection becomes ambiguous.
+  **Gate:** byte-identical re-export of all 11; `loom-export` resolves the same recognizer for every
+  real checkpoint here as before; plus at least one HF causal LM no recognizer currently claims.
+- **P4.0.5 — the spec protocol.** Every spec in the tree earns its existence by being checked against
+  the real model, and the checks are predicates over live objects (`EncoderOutput.validate`,
+  `EstimatorSpec.validate_against_topology`, `ModularExportSpec`'s attribute paths, `_validate_input_axes`)
+  — which is why a plain YAML/JSON front-end cannot be the foundation: it carries the field values but
+  not the predicate, re-creating the declaration/validation split P4.0.3 spent a commit undoing.
+  Resolution: the predicate does not have to live in a *per-spec* method. The four bespoke validators
+  check the same handful of relationship kinds, so lift those into a shared vocabulary of `Link` kinds
+  (`TopologyName`, `TopologyInput`, `TopologyOutputArity`, `ModuleAttrPath`, `Axis`, `ConfigDerived`,
+  `WeightName`, `DriverSymbol`), have each spec declare `field → link kind`, and the checking becomes
+  generic machinery while the model-specific content stays data. **The rule this establishes:** every
+  spec field is either checkable against the real model/topology or explicitly documented as unchecked.
+  **Acceptance test, stated up front:** all four existing validators re-expressible with *no loss of
+  error-message quality* — this tree's errors name the offending input, the expected channel count and
+  its config source, and degrading those to "validation failed" is a regression, not a refactor. A link
+  whose context is never populated must be *reported*, not silently skipped, or "validated" quietly comes
+  to mean "validated where convenient".
+  **Gate:** existing messages preserved verbatim (assert on message content); byte-identical re-export
+  of all 11, since no emission path is touched.
+- **P4.0.6 — `DriverBuilder` + `DriverComponent` over `driver_ir`.** The graph side has
+  `Decomposition` (how the model becomes topologies); the driver side has nothing (how those topologies
+  become a driver). `driver_ir.py` is already a real IR with `validate()` and `check_subgraph_calls()`,
+  and its `RawBlock` is what makes migration incremental rather than big-bang: a family moves onto the
+  builder by wrapping its current hand-written `.lua` in one raw block — immediately gaining
+  `check_subgraph_calls()` on everything around it — then peels blocks into real components one at a
+  time. Order: the two synthesized paths first (they already build `IRFunction`s, so the API is proven
+  against working code), then Matcha → Supertonic → VITS → Kokoro → StyleTTS2. Per decision 2 the
+  builder is **selected by the decomposition** (`Decomposition.driver_builder(config)`), not owned by
+  the family, so the cross-attention AR decode shape can arrive as a fourth `Decomposition` bringing its
+  own builder without reopening the component API.
+  **Gate:** byte-identical driver text through the wrap-in-`RawBlock` step. It stops being achievable
+  once a block is emitted from IR instead of pasted — comment placement, spacing, local naming all move
+  — so each peeling commit's gate is instead: the model's existing `test_e2e_*_mil_lua_driver.cpp`
+  passes unchanged, the driver-text diff is read and attached to the commit message, and every topology,
+  weight and non-driver KV is byte-identical.
+- **P4.0.7 — the component registry ("marketplace").** Six components exist (`FlowMatchingSpec`,
+  `EstimatorSpec`, `ModularExportSpec`, the prefill prologue/epilogue, `recurrent.py`'s stepping loop,
+  `ExportPhase`) and are assembled four different ways — marker substitution, direct-to-IR, inline, ad
+  hoc. That heterogeneity, not any missing capability, is what makes adding a family feel bespoke.
+  Extract all six onto the one `DriverComponent` calling convention and register them by name; nothing
+  new is written. The deliverable is as much the **catalogue** — per component, its links, what it emits,
+  which models use it — as the code, since that is what lets P4.1/P4.3 reuse rather than restate.
+  **Gate:** all 11 re-exported byte-identically through registered components.
+- **P4.0.8 — legacy C++ driver retirement policy.** R6's policy covers `tools/convert_*` only; extend it
+  to `src/core/{kokoro,vits,matcha,styletts2,supertonic,whisper}_driver.cpp`, which predate the Lua
+  drivers becoming the orchestration device. Same rule — a driver may be deleted only in the commit that
+  re-points the last test consuming it — plus **the precondition that is not obvious**: the pre-MIL C++
+  oracle tests are the *numeric ground truth* several MIL/Lua tests were validated against, so each Lua
+  test must first carry its own reference fixture. That is the real cost, and the actual reason all six
+  are still alive. `include/loom/loom.h` re-exports all six from the umbrella public header (lines
+  14–24), which is why every test transitively depends on them and a naive grep reports no consumers —
+  split it into the lean runtime surface and a `loom_legacy.h` so the boundary is auditable. VITS,
+  Matcha, Supertonic, Kokoro and StyleTTS2 are retirable now; **Whisper is not** — `whisper_driver.cpp`
+  has no MIL export to replace it and is blocked on P4.1. Per decision 1, `expand_by_duration` and
+  `pad_crop_relative_embeddings` **stay** in the bridge, reclassified as generic host-side tensor ops
+  (neither reads a model config; both exist because the operation has a data-dependent output length,
+  which cannot live in a static topology) — so that bullet is documentation: `lua_bridge.h` gains the
+  criterion a new binding must meet, with both labelled against it.
+  **Gate:** full `ctest` green with five drivers deleted, and the engine binary size recorded before and
+  after — leanness is the stated goal of the architecture, and measuring it is how the goal stops being
+  a slogan. *Trails the others; nothing in P4 depends on it.*
 
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
