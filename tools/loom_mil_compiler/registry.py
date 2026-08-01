@@ -33,6 +33,11 @@ class ModelRecognizer:
     name: str
     detect: Callable[[Path], bool]
     build_config: Callable[[Path, str], LoomExportConfig]
+    # A *generic* recognizer for its task -- one that claims a whole class of checkpoints rather than
+    # one model, e.g. "any HF directory declaring a `*ForCausalLM` architecture" (P4.0.4). Consulted
+    # only when no specific recognizer matched, so adding one cannot make an existing detection
+    # ambiguous; see `TaskRegistry.detect`.
+    fallback: bool = False
 
 
 @dataclass
@@ -109,23 +114,40 @@ class TaskRegistry:
         """Tries every recognizer (all tasks, or only `task`'s if given) against `model_path` and
         returns the one real structural match. Raises naming every candidate tried on no match or more
         than one match -- an ambiguous or unrecognized checkpoint fails loudly with the exact candidates
-        considered, not a guess."""
+        considered, not a guess.
+
+        **Specific beats fallback** (P4.0.4). A `fallback=True` recognizer claims a whole class of
+        checkpoints -- "any HF directory declaring a `*ForCausalLM` architecture" -- and by construction
+        also matches every specific model inside that class. It is therefore consulted only when no
+        specific recognizer matched, so Qwen3 keeps resolving to `qwen3` and LFM2 keeps raising its
+        intended two-way ambiguity. Within a tier the rules are unchanged: exactly one match, or a raise
+        naming them all. Two fallbacks matching is a real ambiguity too -- a checkpoint that is
+        genuinely both a causal LM and something else is a decision for the caller, not for import
+        order."""
         candidates = self._candidates(task)
         matches = [(entry, rec) for entry, rec in candidates if rec.detect(model_path)]
+        specific = [m for m in matches if not m[1].fallback]
+        matches = specific or matches
         if not matches:
-            tried = [f"{entry.task}/{rec.name}" for entry, rec in candidates]
+            tried = [self._label(entry, rec) for entry, rec in candidates]
             raise ValueError(
                 f"no registered recognizer matched {str(model_path)!r} (tried: {tried}); "
                 f"pass --task/--model explicitly"
             )
         if len(matches) > 1:
-            names = [f"{entry.task}/{rec.name}" for entry, rec in matches]
+            names = [self._label(entry, rec) for entry, rec in matches]
             raise ValueError(
                 f"{str(model_path)!r} matched more than one recognizer: {names}; "
                 f"pass --task/--model to disambiguate"
             )
         _entry, rec = matches[0]
         return rec
+
+    @staticmethod
+    def _label(entry: TaskRegistryEntry, rec: ModelRecognizer) -> str:
+        """`task/model` for an error message, marking fallbacks so a caller reading a failure can see
+        which candidates were generic and which claimed the checkpoint specifically."""
+        return f"{entry.task}/{rec.name}" + (" (fallback)" if rec.fallback else "")
 
     def get(self, task: str, model: str) -> ModelRecognizer:
         """Explicit override, naming both axes."""

@@ -354,8 +354,13 @@ class _ToyConfig(LoomExportConfig):
     pass
 
 
-def _toy_recognizer(name: str) -> ModelRecognizer:
-    return ModelRecognizer(name=name, detect=lambda p: p.name == name, build_config=lambda p, o: (name, o))
+def _toy_recognizer(name: str, matches=None, fallback: bool = False) -> ModelRecognizer:
+    """`matches` defaults to "the path is named after me"; pass a predicate for a recognizer that claims
+    a whole class of paths (what a real `fallback=True` recognizer does)."""
+    detect = matches if matches is not None else (lambda p: p.name == name)
+    return ModelRecognizer(
+        name=name, detect=detect, build_config=lambda p, o: (name, o), fallback=fallback,
+    )
 
 
 def _toy_registry() -> TaskRegistry:
@@ -447,6 +452,86 @@ def test_detect_can_be_restricted_to_one_task(tmp_path):
     registry = _toy_registry()
     with pytest.raises(ValueError, match="unknown task"):
         registry.detect(tmp_path / "a", task="not-a-task")
+
+
+# -- specific beats fallback (P4.0.4, A.3) -------------------------------------------------------------
+
+def _registry_with_fallback() -> TaskRegistry:
+    """`a` and `b` claim their own path; `generic` claims everything -- the shape a real generic
+    recognizer has, since "any HF dir with a `*ForCausalLM` architecture" also matches Qwen3's."""
+    registry = _toy_registry()
+    registry.register(TaskRegistryEntry(
+        task=TOY_TASK, config_class=_ToyConfig,
+        recognizers=[_toy_recognizer("generic", matches=lambda p: True, fallback=True)],
+    ))
+    return registry
+
+
+def test_a_specific_match_wins_over_a_fallback(tmp_path):
+    """The whole reason `fallback` exists: without it, A.4's generic causal-LM recognizer would make
+    every Qwen3 and LFM2 detection ambiguous, since it matches them too."""
+    assert _registry_with_fallback().detect(tmp_path / "a").name == "a"
+
+
+def test_a_fallback_resolves_when_nothing_specific_matched(tmp_path):
+    assert _registry_with_fallback().detect(tmp_path / "unclaimed").name == "generic"
+
+
+def test_two_specific_matches_still_raise_even_though_a_fallback_matched_too(tmp_path):
+    """LFM2's deliberate two-way ambiguity (monolithic vs. modular is a caller decision, not a
+    checkpoint property) must survive the tiering -- a fallback must never silently break the tie."""
+    registry = _registry_with_fallback()
+    registry._entries[TOY_TASK].recognizers.append(_toy_recognizer("a2", matches=lambda p: p.name == "a"))
+    with pytest.raises(ValueError, match="matched more than one recognizer") as excinfo:
+        registry.detect(tmp_path / "a")
+    assert "generic" not in str(excinfo.value), "the raise must name the tied specifics, not the fallback"
+
+
+def test_two_matching_fallbacks_are_ambiguous_too(tmp_path):
+    registry = _registry_with_fallback()
+    registry.register(TaskRegistryEntry(
+        task=TOY_TASK, config_class=_ToyConfig,
+        recognizers=[_toy_recognizer("generic2", matches=lambda p: True, fallback=True)],
+    ))
+    with pytest.raises(ValueError, match="matched more than one recognizer"):
+        registry.detect(tmp_path / "unclaimed")
+
+
+def test_no_match_names_fallbacks_as_such(tmp_path):
+    """A failure should show which candidates were generic; a caller reading it otherwise cannot tell
+    why a recognizer that "claims everything" did not claim their checkpoint."""
+    registry = _toy_registry()
+    registry.register(TaskRegistryEntry(
+        task=TOY_TASK, config_class=_ToyConfig,
+        recognizers=[_toy_recognizer("generic", matches=lambda p: False, fallback=True)],
+    ))
+    with pytest.raises(ValueError, match=r"generic \(fallback\)"):
+        registry.detect(tmp_path / "neither")
+
+
+def test_recognizers_are_specific_by_default():
+    """`fallback` defaults to False, so every recognizer written before A.3 keeps its exact semantics
+    and a new family author has to opt in deliberately."""
+    assert not _toy_recognizer("x").fallback
+
+
+def test_every_recognizer_naming_one_concrete_model_is_specific():
+    """A recognizer named after a single model must never be a fallback -- it would stop claiming its
+    own checkpoint the moment anything generic matched too. (A.4 adds one genuinely generic recognizer;
+    this check is what keeps that from spreading.)"""
+    from loom_mil_compiler.registry import default_registry
+
+    per_model = {
+        "qwen3", "lfm2-monolithic", "lfm2-modular", "conformer-ctc", "parakeet-tdt", "parakeet-rnnt",
+        "kokoro", "matcha", "styletts2", "supertonic", "vits",
+    }
+    found = set()
+    for entry in default_registry()._entries.values():
+        for rec in entry.recognizers:
+            if rec.name in per_model:
+                found.add(rec.name)
+                assert not rec.fallback, f"{entry.task}/{rec.name} became a fallback unintentionally"
+    assert found == per_model, f"recognizers missing from the registry: {per_model - found}"
 
 
 # -- the task vocabulary itself (P4.0.4) ---------------------------------------------------------------
