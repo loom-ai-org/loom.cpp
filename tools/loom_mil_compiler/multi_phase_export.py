@@ -27,6 +27,7 @@ import torch.nn as nn
 from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
 from .flow_matching_export import EstimatorSpec, FlowMatchingSpec
+from .spec_protocol import Axis, ConfigDerived, NestedSpec, Unchecked
 
 
 @dataclass
@@ -36,7 +37,12 @@ class ExportPhase:
     `build_albert_bert_encoder_topology`/`build_decoder_vocoder_topology`, VITS/Matcha's `_build_topology`
     helper, ...). `root_axis`/`declared_axes` are `LoomGGUFExporter`'s own kwargs of the same name --
     default to plain `"n_tokens"`/no overrides, matching every phase that doesn't need Kokoro's
-    `decoder_vocoder`-style multi-axis declaration."""
+    `decoder_vocoder`-style multi-axis declaration.
+
+    The axis *declarations* are `spec_protocol` links as of P4.0.5 (`EXPORT-PREPARATION.md` stage B.5).
+    `LoomGGUFExporter`'s own two raises stay exactly where they are -- they operate on the traced
+    program, which no spec can see, and P4.0.2 wrote them for that reason. What moves here is the half
+    that is answerable from the declaration alone, and was not being asked at all."""
 
     name: str
     wrapper: nn.Module
@@ -44,6 +50,56 @@ class ExportPhase:
     mil_inputs: List[ct.TensorType]
     root_axis: str = "n_tokens"
     declared_axes: Optional[dict] = None
+
+    __links__ = {
+        # A typo'd axis name is a perfectly good dict key: `_sub_symbol` substitutes it happily and the
+        # phase emits shape expressions over a symbol nothing else in the model uses. Wrong, not
+        # malformed, and no downstream gate looks at it.
+        "root_axis": Axis(),
+        "declared_axes": [
+            Axis(form="declaration_table"),
+            # Checked here rather than only in `_resolve_declared_axes`, which raises the same class of
+            # error but only after the phase has been traced. The phase already knows its own declared
+            # input names, so this costs nothing and fails before the expensive part.
+            ConfigDerived(
+                claim=lambda spec, ctx: True,
+                measured=lambda spec, ctx: set(spec.declared_axes or ()).issubset(
+                    _mil_input_names(spec)),
+                detail=lambda spec, ctx: sorted(
+                    set(spec.declared_axes or ()) - set(_mil_input_names(spec))),
+                message=(
+                    "ExportPhase '{spec.name}' declares axes for input(s) {detail}, which it does not "
+                    "declare in mil_inputs. Its inputs are {spec.mil_input_names}."
+                ),
+                needs=(),
+            ),
+        ],
+    }
+    __unchecked__ = {
+        "name": Unchecked(
+            "the topology's name in the exported GGUF. It does not refer to anything -- it CREATES the "
+            "reference every driver's run_subgraph call and every TopologyName link resolves against."
+        ),
+        "wrapper": Unchecked(
+            "the nn.Module being traced. It is the model; there is no separate authority to check it "
+            "against, which is what the trace itself and the per-model reference tests are for."
+        ),
+        "dummy_inputs": Unchecked(
+            "the concrete tensors torch.jit.trace runs with. Their correspondence with mil_inputs is "
+            "enforced by ct.convert, which raises on a count or dtype mismatch -- a link here would "
+            "duplicate that while reading as if it checked something ct.convert does not."
+        ),
+        "mil_inputs": Unchecked("same: ct.convert is the authority on these, not this declaration."),
+    }
+
+    @property
+    def mil_input_names(self) -> List[str]:
+        """The names this phase declares to coremltools, for `declared_axes` to be checked against."""
+        return _mil_input_names(self)
+
+
+def _mil_input_names(phase) -> List[str]:
+    return [getattr(t, "name", None) for t in (phase.mil_inputs or [])]
 
 
 def merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:
@@ -82,6 +138,16 @@ class BaseMultiPhaseModelExportConfig(LoomExportConfig):
 
     driver_script_path: Path
     decomposition: Decomposition = field(default_factory=MultiPhase)
+
+    __unchecked__ = {
+        "driver_script_path": Unchecked(
+            "the hand-written Lua the export substitutes generated samplers into. Its *contents* are "
+            "checked -- every declared sampler and estimator is cross-checked against the real traced "
+            "topologies by render_driver -- but the path itself is only a file that must exist, which "
+            "read_text() reports better than a link would. P4.0.6 turns the driver into IR, at which "
+            "point this field stops being a path at all."
+        ),
+    }
 
     def phases(self) -> List[ExportPhase]:
         raise NotImplementedError
