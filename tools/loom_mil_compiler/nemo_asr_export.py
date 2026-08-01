@@ -61,6 +61,7 @@ import torch.nn as nn
 
 from .decomposition import Decomposition, Flattened
 from .export_config import LoomExportConfig
+from .spec_protocol import MODEL, OUTPUTS, ConfigDerived, NestedSpec, Unchecked, check_links
 
 # Dummy trace length, and the dynamic sample-axis bounds, all in SECONDS -- turned into sample counts
 # against the checkpoint's own declared sample rate. 0.1 s .. 20 s matches NeMo's own
@@ -110,6 +111,10 @@ class EncoderOutput(Enum):
     Not a free-form "return this expression" field: each member names a *model family*, carries the
     reason that family's graph boundary falls where it does, and knows how to check that the checkpoint
     it was pointed at really is that family (`validate`).
+
+    Its three checks are `ConfigDerived` links (P4.0.5) -- see `__links__` at the bottom of the class.
+    They look different from each other but are one shape: read a number the declared family implies,
+    measure the same number on what the model actually did, compare.
     """
 
     # EncDecCTCModel(BPE).forward -> (log_probs, encoded_len, greedy_predictions). The CTC decoder is a
@@ -166,28 +171,55 @@ class EncoderOutput(Enum):
         """Cross-checks this claim against what the real model just returned, raising ValueError naming
         the mismatch. Runs inside the wrapper's `forward` -- i.e. exactly once, during tracing -- so it
         costs no extra forward pass and cannot perturb the trace (an out-of-band validation pass would
-        consume RNG that a traced constant could depend on)."""
-        if not isinstance(outputs, (tuple, list)) or len(outputs) != self.forward_arity:
-            n = len(outputs) if isinstance(outputs, (tuple, list)) else 1
-            raise ValueError(
-                f"ASRNemoEncoderExportConfig declares output={self.name}, whose family's forward() returns "
-                f"{self.forward_arity} values, but {type(model).__name__}.forward() returned {n}. "
-                f"This checkpoint is not the family the spec claims."
-            )
-        main = outputs[0]
-        if main.dim() != 3:
-            raise ValueError(
-                f"ASRNemoEncoderExportConfig declares output={self.name}, expecting a rank-3 tensor from "
-                f"{type(model).__name__}.forward(), but got rank {main.dim()} ({tuple(main.shape)})."
-            )
-        expected = self.expected_channels(model)
-        if int(main.shape[self.channel_axis]) != expected:
-            raise ValueError(
-                f"ASRNemoEncoderExportConfig declares output={self.name}, whose axis {self.channel_axis} must "
-                f"be {expected} (the checkpoint's own {self.channel_source}), but "
-                f"{type(model).__name__} produced {tuple(main.shape)}. This checkpoint is not the "
-                f"family the spec claims."
-            )
+        consume RNG that a traced constant could depend on).
+
+        The three checks are `spec_protocol` links as of P4.0.5 (`EXPORT-PREPARATION.md` stage B.3); see
+        `__links__` below. This method stays exactly where it was and keeps its signature, because the
+        *timing* is the load-bearing part: the traced forward's real return value exists for one instant
+        and only here."""
+        check_links(self, model=model, outputs=outputs)
+
+    # Order matters and is the order the hand-written validator ran in: arity first, because a model
+    # returning a bare tensor rather than a tuple makes `outputs[0]` mean something entirely different,
+    # and rank before channels, because indexing `channel_axis` on a rank-2 tensor reports the wrong
+    # number rather than no number.
+    __links__ = {
+        "forward_arity": ConfigDerived(
+            claim=lambda spec, ctx: spec.forward_arity,
+            measured=lambda spec, ctx: (
+                len(ctx.outputs) if isinstance(ctx.outputs, (tuple, list)) else 1
+            ),
+            message=(
+                "ASRNemoEncoderExportConfig declares output={spec.name}, whose family's forward() "
+                "returns {claimed} values, but {model_type}.forward() returned {actual}. "
+                "This checkpoint is not the family the spec claims."
+            ),
+            needs=(MODEL, OUTPUTS),
+        ),
+        "output_rank": ConfigDerived(
+            claim=lambda spec, ctx: 3,
+            measured=lambda spec, ctx: ctx.outputs[0].dim(),
+            detail=lambda spec, ctx: tuple(ctx.outputs[0].shape),
+            message=(
+                "ASRNemoEncoderExportConfig declares output={spec.name}, expecting a rank-{claimed} "
+                "tensor from {model_type}.forward(), but got rank {actual} ({detail})."
+            ),
+            needs=(MODEL, OUTPUTS),
+        ),
+        # The one number that proves the spec named the right family, read off the checkpoint's own
+        # config rather than hardcoded -- which is why the message names the config field it came from.
+        "output_channels": ConfigDerived(
+            claim=lambda spec, ctx: spec.expected_channels(ctx.model),
+            measured=lambda spec, ctx: int(ctx.outputs[0].shape[spec.channel_axis]),
+            detail=lambda spec, ctx: tuple(ctx.outputs[0].shape),
+            message=(
+                "ASRNemoEncoderExportConfig declares output={spec.name}, whose axis {spec.channel_axis} "
+                "must be {claimed} (the checkpoint's own {spec.channel_source}), but {model_type} "
+                "produced {detail}. This checkpoint is not the family the spec claims."
+            ),
+            needs=(MODEL, OUTPUTS),
+        ),
+    }
 
 
 @dataclass(kw_only=True)
@@ -209,6 +241,22 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     # Which tensor the traced wrapper returns; see EncoderOutput.
     output: EncoderOutput
     decomposition: Decomposition = field(default_factory=Flattened)
+
+    __links__ = {
+        "output": NestedSpec(
+            where="EncoderOutput.validate, called from _NeMoASREncoderWrapper.forward -- the traced "
+                  "forward's real return value exists for one instant during tracing and nowhere else, "
+                  "so the checker cannot reach it from here"
+        ),
+    }
+    __unchecked__ = {
+        "checkpoint": Unchecked(
+            "path to the .nemo archive. Already established by the recognizer's own detect(), which "
+            "probes the archive's config rather than trusting the extension, and load_model raises on "
+            "anything it cannot restore. A 'this path exists' link would check the weaker property and "
+            "read as if it checked the stronger one."
+        ),
+    }
 
     def validate_against_model(self, model) -> int:
         """Structural checks that don't need a forward pass, run before the (slow) trace. Returns the

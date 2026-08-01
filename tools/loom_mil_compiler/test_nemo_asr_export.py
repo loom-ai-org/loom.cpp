@@ -185,3 +185,94 @@ def test_the_three_registered_recognizers_declare_distinct_specs():
     assert [s.output for s in specs] == [EncoderOutput.CTC_LOG_PROBS,
                                           EncoderOutput.ENCODER_BT_D,
                                           EncoderOutput.ENCODER_BT_D]
+
+
+# -- the spec protocol retrofit (BACKLOG.md P4.0.5, `EXPORT-PREPARATION.md` stage B.3) ---------------
+#
+# These are the richest messages in the tree -- they name the checkpoint's own d_model AND the config
+# field it was read from -- which is why B.3 is the real test of §2's acceptance criterion. The
+# assertions above use `match=` and would still pass against a generic "validation failed"; these pin
+# the whole string, so a protocol change that degrades a message fails here rather than being noticed
+# by the next person to hit the error.
+
+def _message(model, output):
+    with pytest.raises(ValueError) as exc:
+        _run(model, output)
+    return str(exc.value)
+
+
+def test_arity_message_is_preserved_verbatim():
+    model = _FakeASRModel(arity=2, channels=1024, transposed=True)
+    assert _message(model, EncoderOutput.CTC_LOG_PROBS) == (
+        "ASRNemoEncoderExportConfig declares output=CTC_LOG_PROBS, whose family's forward() returns "
+        "3 values, but _FakeASRModel.forward() returned 2. "
+        "This checkpoint is not the family the spec claims."
+    )
+
+
+def test_rank_message_is_preserved_verbatim():
+    class _Rank2(_FakeASRModel):
+        def forward(self, input_signal, input_signal_length):
+            return (torch.zeros(7, 1025), torch.zeros(1), torch.zeros(1))
+
+    assert _message(_Rank2(), EncoderOutput.CTC_LOG_PROBS) == (
+        "ASRNemoEncoderExportConfig declares output=CTC_LOG_PROBS, expecting a rank-3 tensor from "
+        "_Rank2.forward(), but got rank 2 ((7, 1025))."
+    )
+
+
+def test_channel_message_is_preserved_verbatim_and_names_its_config_source():
+    model = _FakeASRModel(arity=2, channels=512, transposed=True, cfg=_cfg(d_model=1024))
+    assert _message(model, EncoderOutput.ENCODER_BT_D) == (
+        "ASRNemoEncoderExportConfig declares output=ENCODER_BT_D, whose axis 1 must be 1024 "
+        "(the checkpoint's own cfg.encoder.d_model), but _FakeASRModel produced (1, 512, 7). "
+        "This checkpoint is not the family the spec claims."
+    )
+
+
+def test_ctc_channel_message_names_the_other_config_source():
+    """The two members read different config fields, and the message says which -- the thing that
+    tells a reader whether to look at the tokenizer's vocab size or the encoder's width."""
+    model = _FakeASRModel(arity=3, channels=999, decoder=_FakeDecoder(1025))
+    assert _message(model, EncoderOutput.CTC_LOG_PROBS) == (
+        "ASRNemoEncoderExportConfig declares output=CTC_LOG_PROBS, whose axis -1 must be 1025 "
+        "(the checkpoint's own decoder.num_classes_with_blank), but _FakeASRModel produced "
+        "(1, 7, 999). This checkpoint is not the family the spec claims."
+    )
+
+
+def test_a_bare_tensor_return_is_caught_by_arity_before_anything_indexes_it():
+    """Ordering is load-bearing: the rank and channel links index `outputs[0]`, which means something
+    entirely different for a bare tensor than for a tuple. Arity runs first, as it did by hand."""
+    class _BareTensor(_FakeASRModel):
+        def forward(self, input_signal, input_signal_length):
+            return torch.zeros(1, 7, 1025)
+
+    assert "returned 1" in _message(_BareTensor(), EncoderOutput.CTC_LOG_PROBS)
+
+
+def test_every_config_field_is_declared_including_the_inherited_ones():
+    """The standing rule, on the family whose config carries the most inherited surface. `architecture`,
+    `output_path` and `decomposition` come from LoomExportConfig and are declared there once -- if MRO
+    merging broke, this is what would catch it."""
+    from loom_mil_compiler.spec_protocol import dangling_coverage, declared_raw, undeclared_fields
+
+    assert undeclared_fields(ASRNemoEncoderExportConfig) == []
+    assert dangling_coverage(ASRNemoEncoderExportConfig) == []
+    declared = declared_raw(ASRNemoEncoderExportConfig)
+    assert "decomposition" in declared, "inherited from LoomExportConfig, not restated here"
+
+
+def test_the_encoder_output_links_run_where_the_outputs_exist_and_nowhere_else():
+    """EncoderOutput is a NestedSpec on the config: the checker deliberately does not walk into it,
+    because its links need the traced forward's return value. Checking it from the config's own site
+    must therefore report the missing context rather than quietly passing."""
+    from loom_mil_compiler.spec_protocol import LinkChecker, LinkError
+
+    checker = LinkChecker()
+    checker.check(EncoderOutput.CTC_LOG_PROBS)
+    checker.provide(model=_FakeASRModel())
+    with pytest.raises(LinkError) as exc:
+        checker.finish()
+    assert "were never checked" in str(exc.value)
+    assert "needs ['outputs']" in str(exc.value)
