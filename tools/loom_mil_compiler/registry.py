@@ -84,11 +84,23 @@ class TaskRegistry:
             return
         existing.recognizers.extend(entry.recognizers)
 
+    def _entry(self, task: str) -> TaskRegistryEntry:
+        """The registered entry for `task`, or a `ValueError` that distinguishes the two ways a task can
+        be absent: a name outside the vocabulary (a typo, or a pre-P4.0.4 spelling), versus a canonical
+        name that is *declared but unclaimed* -- `audio-codec` until family 11 exists. Both are errors;
+        conflating them sends the caller looking for a typo that isn't there."""
+        entry = self._entries.get(task)
+        if entry is not None:
+            return entry
+        spec = tasks.task_spec(task)  # raises naming the vocabulary if the name isn't canonical at all
+        raise ValueError(
+            f"task {spec.name!r} is declared but no family is registered against it yet; "
+            f"registered tasks: {sorted(self._entries)}"
+        )
+
     def _candidates(self, task: Optional[str]):
         if task is not None:
-            if task not in self._entries:
-                raise ValueError(f"unknown task {task!r}; registered tasks: {sorted(self._entries)}")
-            entries = [self._entries[task]]
+            entries = [self._entry(task)]
         else:
             entries = list(self._entries.values())
         return [(entry, rec) for entry in entries for rec in entry.recognizers]
@@ -117,9 +129,7 @@ class TaskRegistry:
 
     def get(self, task: str, model: str) -> ModelRecognizer:
         """Explicit override, naming both axes."""
-        if task not in self._entries:
-            raise ValueError(f"unknown task {task!r}; registered tasks: {sorted(self._entries)}")
-        entry = self._entries[task]
+        entry = self._entry(task)
         for rec in entry.recognizers:
             if rec.name == model:
                 return rec

@@ -49,7 +49,7 @@ Trace-friendliness patches needed (same category of fix as VITS's/StyleTTS2's ow
     dependency entirely rather than relying on it.)
 
 Usage:
-  loom-export /path/to/matcha/ckpt/dir -o matcha_mil.gguf --task tts-flow-matching --model matcha
+  loom-export /path/to/matcha/ckpt/dir -o matcha_mil.gguf --task text-to-speech --model matcha
 """
 import logging
 import sys
@@ -465,7 +465,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="tts-flow-matching",
+        task="text-to-speech",
         config_class=TTSFlowMatchingModelExportConfig,
         recognizers=[ModelRecognizer(name="matcha", detect=_is_matcha, build_config=_build_matcha)],
     ))

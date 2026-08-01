@@ -378,7 +378,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="nemo-asr-encoder",
+        task="automatic-speech-recognition",
         config_class=ASRNemoEncoderExportConfig,
         recognizers=[
             ModelRecognizer(name="conformer-ctc", detect=_is_conformer_ctc, build_config=_build_conformer_ctc),

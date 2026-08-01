@@ -42,7 +42,7 @@ TextEncoder re-derivation), which differ from this module's simpler ones in at l
 (T-fast here, channel-fast there). See BACKLOG.md for the itemized remaining integration work.
 
 Usage:
-  loom-export /path/to/piper.ckpt -o vits_mil.gguf --task tts-multi-phase --model vits
+  loom-export /path/to/piper.ckpt -o vits_mil.gguf --task text-to-speech --model vits
 """
 import math
 import sys
@@ -376,7 +376,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="tts-multi-phase",
+        task="text-to-speech",
         config_class=BaseMultiPhaseModelExportConfig,
         recognizers=[ModelRecognizer(name="vits", detect=_is_vits, build_config=_build_vits)],
     ))

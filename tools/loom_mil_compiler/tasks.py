@@ -100,20 +100,6 @@ TASKS: Dict[str, TaskSpec] = {
     )
 }
 
-# Deliberately temporary: the four task strings the families register today, mapped onto the canonical
-# name each becomes. This exists only so that declaring the vocabulary (A.1) and renaming the strings
-# (A.2) stay two commits -- `register()` accepts these spellings and the recognizers keep resolving
-# exactly as before, but nothing rewrites them, so no behaviour changes here. **A.2 deletes this table**
-# along with the old spellings; there are no backwards-compatible aliases in the end state, because the
-# task name is a CLI argument, not a stored artifact, and two spellings for one thing is precisely what
-# P4.0.3 spent a commit removing.
-_PRE_P404_SPELLINGS: Dict[str, str] = {
-    "causal-lm": "text-generation",
-    "nemo-asr-encoder": "automatic-speech-recognition",
-    "tts-multi-phase": "text-to-speech",
-    "tts-flow-matching": "text-to-speech",
-}
-
 
 def known_tasks() -> List[str]:
     """The canonical names, for error messages and `--help`."""
@@ -123,11 +109,13 @@ def known_tasks() -> List[str]:
 def task_spec(name: str) -> TaskSpec:
     """The `TaskSpec` for `name`, or `ValueError` naming the whole vocabulary. Unknown-task errors are
     the main thing this module buys a caller, so they list what *is* known rather than only what is
-    not."""
+    not.
+
+    **No aliases for the pre-P4.0.4 spellings** (`causal-lm`, `nemo-asr-encoder`, `tts-multi-phase`,
+    `tts-flow-matching`). A task name is a CLI argument, not something stored in an exported GGUF -- the
+    task never reaches `build_config`, let alone a KV -- so nothing on disk needs the old spelling read
+    back, and carrying two names for one thing is exactly the problem P4.0.3 spent a commit removing."""
     spec = TASKS.get(name)
-    if spec is not None:
-        return spec
-    canonical = _PRE_P404_SPELLINGS.get(name)
-    if canonical is not None:
-        return TASKS[canonical]
-    raise ValueError(f"unknown task {name!r}; known tasks: {known_tasks()}")
+    if spec is None:
+        raise ValueError(f"unknown task {name!r}; known tasks: {known_tasks()}")
+    return spec

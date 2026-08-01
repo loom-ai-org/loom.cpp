@@ -1,7 +1,7 @@
 """Regression check for BACKLOG.md P3.1/P3.2's causal-LM family (`causal_lm_export.py`).
 
 Every model in this family (Qwen3 monolithic, LFM2 monolithic, LFM2 modular) is now reachable ONLY
-through the `causal-lm` task's registry entries (`export_qwen3_mil.py`/`export_lfm2_modular.py`/
+through the `text-generation` task's registry entries (`export_qwen3_mil.py`/`export_lfm2_modular.py`/
 `export_lfm2_monolithic.py` are all deleted -- BACKLOG.md's P3.2 and the later LFM2 migration). With no
 independent "old script" left to diff against, what's still worth guarding per model is
 `registry.py`'s own `_build_*` factory silently drifting from constructing the same `LoomExportConfig`
@@ -63,7 +63,7 @@ def _assert_registry_matches_direct(tmp_path, task, model, model_path, build_dir
 @pytest.mark.skipif(not QWEN3_DIR.exists(), reason="Qwen3 checkpoint not available locally")
 def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
     _assert_registry_matches_direct(
-        tmp_path, "causal-lm", "qwen3", QWEN3_DIR,
+        tmp_path, "text-generation", "qwen3", QWEN3_DIR,
         lambda output_path: LMCausalModelExportConfig(
             architecture="qwen3", output_path=output_path, decomposition=Flattened(),
             model_dir=str(QWEN3_DIR),
@@ -74,7 +74,7 @@ def test_qwen3_registry_entry_matches_direct_construction(tmp_path):
 @pytest.mark.skipif(not LFM2_DIR.exists(), reason="LFM2 checkpoint not available locally")
 def test_lfm2_monolithic_registry_entry_matches_direct_construction(tmp_path):
     _assert_registry_matches_direct(
-        tmp_path, "causal-lm", "lfm2-monolithic", LFM2_DIR,
+        tmp_path, "text-generation", "lfm2-monolithic", LFM2_DIR,
         lambda output_path: LMCausalModelExportConfig(
             architecture="lfm2", output_path=output_path, decomposition=Flattened(),
             model_dir=str(LFM2_DIR), tokenizer_pre="llama3",
@@ -85,7 +85,7 @@ def test_lfm2_monolithic_registry_entry_matches_direct_construction(tmp_path):
 @pytest.mark.skipif(not LFM2_DIR.exists(), reason="LFM2 checkpoint not available locally")
 def test_lfm2_modular_registry_entry_matches_direct_construction(tmp_path):
     _assert_registry_matches_direct(
-        tmp_path, "causal-lm", "lfm2-modular", LFM2_DIR,
+        tmp_path, "text-generation", "lfm2-modular", LFM2_DIR,
         lambda output_path: LMCausalModelExportConfig(
             architecture="lfm2", output_path=output_path, model_dir=str(LFM2_DIR),
             decomposition=Modular(spec=ModularExportSpec(

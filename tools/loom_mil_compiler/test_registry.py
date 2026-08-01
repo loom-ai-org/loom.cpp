@@ -475,20 +475,20 @@ def test_audio_codec_is_reserved_and_unclaimed():
     assert "audio-codec" not in default_registry()._entries
 
 
+def test_a_declared_but_unclaimed_task_says_so_rather_than_unknown():
+    """`--task audio-codec` is a valid argparse choice but has no family, and that is a different error
+    from a typo -- conflating them sends the caller looking for a misspelling that isn't there."""
+    from loom_mil_compiler.registry import default_registry
+
+    registry = default_registry()
+    with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
+        registry.get("audio-codec", "whatever")
+    with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
+        registry.detect(Path("/nonexistent"), task="audio-codec")
+
+
 def test_only_audio_codec_is_reserved():
     assert [n for n in known_tasks() if task_spec(n).reserved] == ["audio-codec"]
-
-
-def test_the_pre_p404_spellings_all_map_onto_canonical_tasks():
-    """Transitional, and deleted by A.2 along with this test: A.1 declares the vocabulary, A.2 renames
-    the strings, and accepting today's four spellings in between is what keeps those two commits
-    separate without changing any behaviour."""
-    from loom_mil_compiler.registry import default_registry
-    from loom_mil_compiler.tasks import _PRE_P404_SPELLINGS
-
-    assert set(default_registry()._entries) == set(_PRE_P404_SPELLINGS)
-    for old, canonical in _PRE_P404_SPELLINGS.items():
-        assert task_spec(old) is task_spec(canonical)
 
 
 def test_get_returns_the_named_recognizer():
@@ -517,14 +517,53 @@ def test_default_registry_registers_the_two_p32_tasks():
     from loom_mil_compiler.nemo_asr_export import ASRNemoEncoderExportConfig
 
     registry = default_registry()
-    causal_lm = registry.get("causal-lm", "qwen3")
+    causal_lm = registry.get("text-generation", "qwen3")
     assert causal_lm.name == "qwen3"
     for model in ("conformer-ctc", "parakeet-tdt", "parakeet-rnnt"):
-        rec = registry.get("nemo-asr-encoder", model)
+        rec = registry.get("automatic-speech-recognition", model)
         assert rec.name == model
     # Sanity: config_class stored per task matches the family's own base class.
-    assert registry._entries["causal-lm"].config_class is LMCausalModelExportConfig
-    assert registry._entries["nemo-asr-encoder"].config_class is ASRNemoEncoderExportConfig
+    assert registry._entries["text-generation"].config_class is LMCausalModelExportConfig
+    assert registry._entries["automatic-speech-recognition"].config_class is ASRNemoEncoderExportConfig
+
+
+def test_every_registered_task_is_canonical():
+    """The whole point of P4.0.4's vocabulary: after A.2 there is no spelling in the registry that
+    `tasks.py` does not declare, and no family left on a name that describes a decomposition or a
+    loader library."""
+    from loom_mil_compiler.registry import default_registry
+
+    registry = default_registry()
+    assert set(registry._entries) <= set(known_tasks())
+    assert sorted(registry._entries) == [
+        "automatic-speech-recognition", "text-generation", "text-to-speech",
+    ]
+
+
+def test_the_five_tts_families_now_share_one_task():
+    """`tts-multi-phase` + `tts-flow-matching` were one task whose members differ by a field, ever since
+    P4.0.3 made decomposition a field. Flow-matching models register their `TTSFlowMatchingModelExportConfig`
+    subclass under the same `text-to-speech` task as the plain multi-phase ones."""
+    from loom_mil_compiler.registry import default_registry
+
+    registry = default_registry()
+    names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
+    assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic"}
+    for model in names:
+        assert registry.get("text-to-speech", model).name == model
+
+
+def test_the_pre_p404_task_spellings_are_gone():
+    """No backwards-compatible aliases (A.2): the old names must fail like any other typo, naming the
+    vocabulary that replaced them."""
+    from loom_mil_compiler.registry import default_registry
+
+    registry = default_registry()
+    for old in ("causal-lm", "nemo-asr-encoder", "tts-multi-phase", "tts-flow-matching"):
+        with pytest.raises(ValueError, match="unknown task"):
+            registry.get(old, "kokoro")
+        with pytest.raises(ValueError, match="unknown task"):
+            task_spec(old)
 
 
 def test_default_registry_detects_a_synthetic_qwen3_dir(tmp_path):
