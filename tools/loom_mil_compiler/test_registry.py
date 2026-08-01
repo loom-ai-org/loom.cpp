@@ -15,12 +15,15 @@ import pickle
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loom_mil_compiler.registry import ModelRecognizer, TaskRegistry, TaskRegistryEntry  # noqa: E402
+from loom_mil_compiler.export_config import LoomExportConfig  # noqa: E402
+from loom_mil_compiler.tasks import known_tasks, task_spec  # noqa: E402
 from loom_mil_compiler.checkpoint_probe import probe_torch_checkpoint, read_json  # noqa: E402
 from loom_mil_compiler.causal_lm_export import _is_qwen3  # noqa: E402
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
@@ -340,35 +343,83 @@ def test_tts_recognizers_reject_the_other_families_paths(tmp_path):
 
 # -- TaskRegistry itself, independent of any real family -----------------------------------------------
 
+# A toy family, registered under the one canonical task no real family claims yet (`audio-codec`, whose
+# base is therefore just `LoomExportConfig`). This keeps these tests independent of any real family while
+# still going through P4.0.4's vocabulary and config-class checks, which is what a real caller does.
+TOY_TASK = "audio-codec"
+
+
+@dataclass(kw_only=True)
+class _ToyConfig(LoomExportConfig):
+    pass
+
+
+def _toy_recognizer(name: str) -> ModelRecognizer:
+    return ModelRecognizer(name=name, detect=lambda p: p.name == name, build_config=lambda p, o: (name, o))
+
+
 def _toy_registry() -> TaskRegistry:
     registry = TaskRegistry()
     registry.register(TaskRegistryEntry(
-        task="toy-task",
-        config_class=object,
-        recognizers=[
-            ModelRecognizer(name="a", detect=lambda p: p.name == "a", build_config=lambda p, o: ("a", o)),
-            ModelRecognizer(name="b", detect=lambda p: p.name == "b", build_config=lambda p, o: ("b", o)),
-        ],
+        task=TOY_TASK,
+        config_class=_ToyConfig,
+        recognizers=[_toy_recognizer("a"), _toy_recognizer("b")],
     ))
     return registry
 
 
-def test_registering_the_same_task_with_a_different_config_class_raises():
-    """Two families sharing one task (the common case -- e.g. `"tts-multi-phase"` for Kokoro/StyleTTS2/
-    VITS) must agree on what LoomExportConfig subclass that task builds; disagreeing is a real bug."""
-    registry = _toy_registry()
-    with pytest.raises(ValueError, match="disagree"):
-        registry.register(TaskRegistryEntry(task="toy-task", config_class=str, recognizers=[]))
+def test_registering_an_unknown_task_raises_naming_the_vocabulary():
+    """P4.0.4: task names are a closed, checked list. Before it, any string registered -- so a typo
+    silently created a task nothing would ever detect against."""
+    registry = TaskRegistry()
+    with pytest.raises(ValueError, match="unknown task 'txt-generation'") as excinfo:
+        registry.register(TaskRegistryEntry(task="txt-generation", config_class=_ToyConfig))
+    for name in known_tasks():
+        assert name in str(excinfo.value), f"the error must name the whole vocabulary, missing {name}"
 
 
-def test_registering_the_same_task_with_the_same_config_class_extends_recognizers():
+def test_registering_a_subclass_of_the_tasks_base_config_is_allowed():
+    """The check is `issubclass`, not identity -- `TTSFlowMatchingModelExportConfig` really is a subclass
+    of the `text-to-speech` base, so Matcha/Supertonic share one task with Kokoro/VITS/StyleTTS2."""
+    class _ToySubConfig(_ToyConfig):
+        pass
+
     registry = _toy_registry()
     registry.register(TaskRegistryEntry(
-        task="toy-task", config_class=object,
-        recognizers=[ModelRecognizer(name="c", detect=lambda p: p.name == "c", build_config=lambda p, o: ("c", o))],
+        task=TOY_TASK, config_class=_ToySubConfig, recognizers=[_toy_recognizer("c")],
     ))
-    assert {r.name for r in registry._entries["toy-task"].recognizers} == {"a", "b", "c"}
-    assert registry.get("toy-task", "c").name == "c"
+    assert registry.get(TOY_TASK, "c").name == "c"
+
+
+def test_registering_an_unrelated_config_class_raises():
+    """A family registered under a task whose export shape it does not build is a real bug, and the one
+    the identity check used to catch."""
+    registry = _toy_registry()
+    with pytest.raises(ValueError, match="does not build"):
+        registry.register(TaskRegistryEntry(task=TOY_TASK, config_class=str))
+
+
+def test_the_real_tts_flow_matching_config_registers_under_the_tts_task():
+    """The concrete case the relaxed check exists for, against the real classes rather than toys: today
+    these are two tasks that A.2 merges, and both halves must pass the same base-class check."""
+    from loom_mil_compiler.multi_phase_export import (
+        BaseMultiPhaseModelExportConfig,
+        TTSFlowMatchingModelExportConfig,
+    )
+
+    registry = TaskRegistry()
+    for config_class in (BaseMultiPhaseModelExportConfig, TTSFlowMatchingModelExportConfig):
+        registry.register(TaskRegistryEntry(task="text-to-speech", config_class=config_class))
+    assert issubclass(TTSFlowMatchingModelExportConfig, task_spec("text-to-speech").base_config_class())
+
+
+def test_registering_the_same_task_twice_extends_recognizers():
+    registry = _toy_registry()
+    registry.register(TaskRegistryEntry(
+        task=TOY_TASK, config_class=_ToyConfig, recognizers=[_toy_recognizer("c")],
+    ))
+    assert {r.name for r in registry._entries[TOY_TASK].recognizers} == {"a", "b", "c"}
+    assert registry.get(TOY_TASK, "c").name == "c"
 
 
 def test_detect_finds_the_one_real_match(tmp_path):
@@ -379,13 +430,13 @@ def test_detect_finds_the_one_real_match(tmp_path):
 
 def test_detect_raises_naming_candidates_on_no_match(tmp_path):
     registry = _toy_registry()
-    with pytest.raises(ValueError, match=r"toy-task/a.*toy-task/b|no registered recognizer matched"):
+    with pytest.raises(ValueError, match=rf"{TOY_TASK}/a.*{TOY_TASK}/b|no registered recognizer matched"):
         registry.detect(tmp_path / "neither")
 
 
 def test_detect_raises_on_ambiguous_match(tmp_path):
     registry = _toy_registry()
-    registry._entries["toy-task"].recognizers.append(
+    registry._entries[TOY_TASK].recognizers.append(
         ModelRecognizer(name="a2", detect=lambda p: p.name == "a", build_config=lambda p, o: ("a2", o))
     )
     with pytest.raises(ValueError, match="matched more than one recognizer"):
@@ -398,16 +449,58 @@ def test_detect_can_be_restricted_to_one_task(tmp_path):
         registry.detect(tmp_path / "a", task="not-a-task")
 
 
+# -- the task vocabulary itself (P4.0.4) ---------------------------------------------------------------
+
+def test_the_vocabulary_is_the_four_canonical_names():
+    assert known_tasks() == [
+        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-speech",
+    ]
+
+
+def test_every_declared_base_config_resolves_and_is_a_loom_export_config():
+    """The base classes are named as import-path strings to avoid an import cycle, so nothing else would
+    catch a typo or a rename in one of them."""
+    for name in known_tasks():
+        base = task_spec(name).base_config_class()
+        assert isinstance(base, type) and issubclass(base, LoomExportConfig), name
+
+
+def test_audio_codec_is_reserved_and_unclaimed():
+    """Decision 3: the name is declared now so family 11 does not invent a competing one, but no family
+    registers against it until it exists."""
+    from loom_mil_compiler.registry import default_registry
+
+    assert task_spec("audio-codec").reserved
+    assert task_spec("audio-codec").base_config_class() is LoomExportConfig
+    assert "audio-codec" not in default_registry()._entries
+
+
+def test_only_audio_codec_is_reserved():
+    assert [n for n in known_tasks() if task_spec(n).reserved] == ["audio-codec"]
+
+
+def test_the_pre_p404_spellings_all_map_onto_canonical_tasks():
+    """Transitional, and deleted by A.2 along with this test: A.1 declares the vocabulary, A.2 renames
+    the strings, and accepting today's four spellings in between is what keeps those two commits
+    separate without changing any behaviour."""
+    from loom_mil_compiler.registry import default_registry
+    from loom_mil_compiler.tasks import _PRE_P404_SPELLINGS
+
+    assert set(default_registry()._entries) == set(_PRE_P404_SPELLINGS)
+    for old, canonical in _PRE_P404_SPELLINGS.items():
+        assert task_spec(old) is task_spec(canonical)
+
+
 def test_get_returns_the_named_recognizer():
     registry = _toy_registry()
-    rec = registry.get("toy-task", "b")
+    rec = registry.get(TOY_TASK, "b")
     assert rec.name == "b"
 
 
 def test_get_raises_on_unknown_model():
     registry = _toy_registry()
     with pytest.raises(ValueError, match="unknown model"):
-        registry.get("toy-task", "nonexistent")
+        registry.get(TOY_TASK, "nonexistent")
 
 
 def test_get_raises_on_unknown_task():
