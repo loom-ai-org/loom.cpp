@@ -754,7 +754,7 @@ nothing.
   baseline worktree's `loom-export` from the working tree silently imported the working tree's modules
   and compared new against new. It surfaced only because the baseline rejected `--task causal-lm` with
   the *new* argparse choices. **`cd` into the tree being measured; setting `PYTHONPATH` is not enough.**
-- **P4.0.5 — the spec protocol.** Every spec in the tree earns its existence by being checked against
+- **P4.0.5 — the spec protocol — DONE.** Every spec in the tree earns its existence by being checked against
   the real model, and the checks are predicates over live objects (`EncoderOutput.validate`,
   `EstimatorSpec.validate_against_topology`, `ModularExportSpec`'s attribute paths, `_validate_input_axes`)
   — which is why a plain YAML/JSON front-end cannot be the foundation: it carries the field values but
@@ -770,8 +770,101 @@ nothing.
   its config source, and degrading those to "validation failed" is a regression, not a refactor. A link
   whose context is never populated must be *reported*, not silently skipped, or "validated" quietly comes
   to mean "validated where convenient".
-  **Gate:** existing messages preserved verbatim (assert on message content); byte-identical re-export
-  of all 11, since no emission path is touched.
+
+  **What was built,** six commits (`spec_protocol.py` → four retrofits → the enforcing test):
+
+  1. `spec_protocol.py` — the eight link kinds, plus `WhenSet`/`EachOf` combinators and `FieldRef` for a
+     link whose subject is a sibling field. **Three of the eight had no call site**
+     (`TopologyOutputArity`, `WeightName`, `DriverSymbol`) and were unit-tested directly rather than
+     through a family: they are the checks P4.0.6/P4.0.7 components need, since a spec that *generates*
+     a `run_subgraph` call knows its arity before any driver text exists, while `driver_ir`'s own checks
+     run on a finished `Function`. `TopologyOutputArity` got a real first user one commit later.
+  2. **Message fidelity shaped the API rather than being checked after it.** `ConfigDerived` takes a
+     `str.format` template with `{spec.<attr>}` access instead of formatting a canned sentence, which is
+     what lets `EncoderOutput`'s three messages survive verbatim; `TopologyInput` reproduces
+     `EstimatorSpec`'s bidirectional missing/unsupplied wording rather than reporting the first offender
+     it finds. Every retrofit's tests assert whole strings, not `match=` fragments.
+  3. **Deferral is the design detail that mattered.** Context arrives at different times — the model
+     after `load_model`, topologies after tracing, weights after the merge, the driver last — so
+     `LinkChecker` retries deferrals as `provide()` brings each slot and `finish()` raises listing
+     whatever never became checkable. All three decompositions now own a checker and call `finish()`
+     before writing. Without it a skipped check and a passing check are indistinguishable from outside.
+  4. Four declaration kinds emerged, not one: a real `Link`, `Unchecked(reason)`, `CoveredBy(field)` and
+     `NestedSpec(where)`. The last two are not bookkeeping. `CoveredBy` exists because
+     `FlowMatchingSpec`'s `carried_input`/`time_input`/`fixed_inputs` only mean anything as the one
+     argument table they compose into — three per-field links would report one offender at a time and
+     lose the half of the message saying what is *missing*. `NestedSpec` deliberately does **not**
+     auto-recurse: `EncoderOutput`'s links need the traced forward's return value, which exists for one
+     instant inside the wrapper's `forward` and nowhere else, so `where` records that site in prose
+     instead of pretending the outer checker covers it. Declarations also merge along the MRO, so
+     `architecture`/`output_path`/`decomposition` are declared once on `LoomExportConfig`.
+
+  **Four checks that did not exist before, all of them silent-wrong-output gaps rather than restatements:**
+
+  * `FlowMatchingSpec` now requires a **single-output estimator**. `render_sampler` emits
+    `local v = loom.run_subgraph(...)` and indexes `v[i]`; against a two-output topology `v` binds the
+    first output's *data* and the loop integrates the wrong tensor — valid Lua, plausible shapes, wrong
+    audio. Both real estimators are single-output, so this is a guard, not a fix.
+  * **A typo'd axis name** is a perfectly good dict key: `_sub_symbol` substitutes it happily and the
+    phase emits shape expressions over a symbol nothing else in the model uses. `declared_axes`
+    expressions additionally go through `shape_expr.parse`, which is exactly `symbol_env.cpp`'s grammar,
+    so a declaration that passes is one the engine can read back.
+  * **`declared_axes` keys** must name inputs the phase declares — the same class of error
+    `_resolve_declared_axes` raises, but before the trace instead of after it.
+  * **`aux_kwarg`** must be a parameter of the repeated block's `forward`. Verified against the real
+    LFM2-350m checkpoint, not only a fake.
+
+  **The behavioural upgrade in `ModularExportSpec` is the timing, and the old failure mode is worth
+  recording:** `get_by_path` raised a bare `AttributeError` from wherever its traversal reached, which
+  for `suffix_attrs` was *after* the prefix and aux submodules had already been traced. A misspelled
+  attribute cost a full trace to discover and reported only the missing attribute, not which declaration
+  named it. `repeated_attr` is deliberately **not** a `ModuleAttrPath`: `find_repeated_blocks` re-derives
+  the qualifying blocks independently, which is both the stronger property and what preserves the
+  existing message listing what was discovered — a path check would also have accepted
+  `model.embedding_norm`.
+
+  **What `_validate_input_axes` kept, and why the split is not arbitrary.** `LoomGGUFExporter`'s two
+  P4.0.2 raises stay where they are: whether two genuinely independent dynamic axes would collapse onto
+  one symbol is only answerable once coremltools has assigned real MIL symbols, and no spec can see
+  that. Only the half answerable from the declaration alone moved — and that half was not being asked at
+  all. `ASRNemoEncoderExportConfig.root_axis` became a field for the same reason: `backend_kwargs()`
+  returned the literal `"n_samples"`, so the family's R1 claim was a string in a method body rather than
+  a declaration anything could check.
+
+  **The standing rule is enforced by discovery, not by a list.** `test_spec_protocol.py` scans every
+  dataclass in the package, so a new spec class in a family module fails until it declares and a new
+  field on an existing one fails the same way (verified by adding a field to `FlowMatchingSpec` and
+  watching it fail). Exemptions are five infrastructure *modules* and two classes, each mapping to prose
+  rather than a bare name — "not a spec" and "nobody got around to it" are different statements. Three
+  guards against passing vacuously: the eleven classes the scan must reach are named, the registry's own
+  `config_class` entries are cross-checked, and an unimportable module fails, since any spec inside one
+  escapes the scan silently.
+
+  Closing the rule found the last seven undeclared classes, and the *reasons* are the deliverable. Each
+  TTS config's path field is already established by the recognizer's `detect()`, which probes pickle
+  opcodes without unpickling rather than trusting a filename — StyleTTS2's is the sharpest case, since a
+  path link would happily accept the Kokoro checkpoint, which is exactly the near-collision `detect()`
+  exists to resolve. `Modular.dummy_seq_len` is the one field where a link would be actively misleading:
+  its correctness condition is a *non-collision* with the model's own static dims, and a wrong value does
+  not fail — it marks a static axis dynamic and exports something plausible. The per-model reference test
+  is the real guard, and saying so is worth more than a check that looks like one.
+
+  **Gate — passed.** All 11 models exported from a `git worktree` at the pre-stage commit (`b9e110c`) and
+  from the working tree, snapshotted and compared: **byte-identical, all 11**, `diff -r` over the two
+  snapshot roots empty — including `model_driver_script.txt`, so the embedded Lua is compared
+  character-for-character, which is the part `render_driver`'s rewrite could most easily have disturbed.
+  284 pytest green, 67 new tests across the six commits, including whole-string assertions on every
+  message the four retrofitted validators produce.
+
+  **One gate the plan did not ask for, and it is the one worth keeping.** Byte-identity cannot show the
+  new checks are *wired in*: a check that never runs also leaves output unchanged, which is exactly the
+  failure mode `finish()` exists to prevent, applied one level up. So two declarations were deliberately
+  broken and Matcha exported for real. Both failed the export with the link's own message —
+  `FlowMatchingSpec('sample_decoder') does not match topology 'decoder': supplies input(s) it does not
+  declare: ['z_wrong']; leaves declared input(s) unsupplied: ['z']; ...` and `... names topology
+  'decodr', which is not among the exported topologies ['decoder', 'encoder_logw', 'encoder_mu',
+  'vocoder'].` The same argument applies to every future retrofit stage: prove the check runs, not only
+  that the output did not move.
 - **P4.0.6 — `DriverBuilder` + `DriverComponent` over `driver_ir`.** The graph side has
   `Decomposition` (how the model becomes topologies); the driver side has nothing (how those topologies
   become a driver). `driver_ir.py` is already a real IR with `validate()` and `check_subgraph_calls()`,
