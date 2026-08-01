@@ -57,6 +57,7 @@ from coremltools.converters.mil.mil import Builder as _mb
 from .checkpoint_probe import read_json
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .patcher import ModelPatcher
+from .spec_protocol import Unchecked
 
 
 class KokoroModelPatcher(ModelPatcher):
@@ -475,6 +476,12 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
     `config.json` (the real Kokoro-82M HF repo layout)."""
 
     model_dir: str
+
+    __unchecked__ = {
+        "model_dir": Unchecked(
+            "the directory holding kokoro-v1_0.pth and its config.json. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
+        ),
+    }
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver_mil.lua"
 
     def phases(self) -> List[ExportPhase]:

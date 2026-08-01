@@ -57,6 +57,7 @@ import coremltools as ct
 
 from .checkpoint_probe import probe_torch_checkpoint
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+from .spec_protocol import Unchecked
 
 sys.path.insert(0, "/home/flavio/Dev/piper/src/python")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_piper_vits"))
@@ -309,6 +310,22 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
     checkpoint_path: str
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_piper_vits" / "vits_driver_mil.lua"
     dummy_t: int = 42
+
+    __unchecked__ = {
+        "checkpoint_path": Unchecked(
+            "path to the Piper Lightning .ckpt. The recognizer's own detect() already established the "
+            "structure this config depends on -- it probes the checkpoint's pickle opcodes without "
+            "unpickling (checkpoint_probe), which is also what tells VITS's .ckpt apart from Matcha's "
+            "-- and phases() load_state_dict's it with strict=True, which is a far stronger check than "
+            "any path link. A 'this path exists' link would check the weaker property while reading as "
+            "if it checked the stronger one."
+        ),
+        "dummy_t": Unchecked(
+            "the phoneme count the three phases are traced at. Every axis over it is declared dynamic "
+            "(ct.RangeDim(1, 512)), so this number picks a concrete trace length and constrains nothing "
+            "the checkpoint could disagree with."
+        ),
+    }
 
     def phases(self) -> List[ExportPhase]:
         print(f"Loading checkpoint {self.checkpoint_path}...")

@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loom_mil_compiler.spec_protocol import (
     Axis, ConfigDerived, DriverSymbol, EachOf, FieldRef, LinkChecker, LinkCheckContext, LinkError,
     ModuleAttrPath, TopologyInput, TopologyName, TopologyOutputArity, Unchecked, WeightName, WhenSet,
-    check_links, declared_links, spec_label, undeclared_fields,
+    check_links, dangling_coverage, declared_links, spec_label, undeclared_fields,
 )
 
 
@@ -351,6 +351,136 @@ class TestStandingRule(unittest.TestCase):
     def test_declared_links_normalizes_a_single_link_to_a_list(self):
         self.assertEqual(list(declared_links(_CallSpec("decoder", []))), ["topology", "inputs"])
         self.assertEqual(len(declared_links(_CallSpec("decoder", []))["topology"]), 1)
+
+
+# -- B.6: the standing rule, enforced across the whole package ---------------------------------------
+#
+# "Every spec field must be either checkable against the real model/topology, or explicitly documented
+# as unchecked." Up to here that is a convention each retrofit happened to follow. What makes it a
+# protocol is this: the rule is enforced by DISCOVERY, not by a list of classes someone remembers to
+# extend. A new spec class in a family module fails until it declares, and a new field on an existing
+# one fails the same way.
+#
+# It is cheap now and expensive later, which is why the plan puts it in stage B rather than after
+# families 2/6/10/11 exist.
+
+# Modules whose dataclasses are infrastructure rather than specs: they describe no model and there is
+# nothing real to check them against. Exempted per module, with the reason, rather than per class --
+# adding an IR node or a link kind should not require touching this test.
+_INFRASTRUCTURE_MODULES = {
+    "driver_ir": "the Lua IR's own expression/statement node types -- a syntax tree, not a declaration "
+                 "about any model",
+    "spec_protocol": "this protocol's own vocabulary (the link kinds, LinkSite, FieldRef, Unchecked, "
+                     "CoveredBy, NestedSpec). Declaring links on the link kinds is not a fixed point "
+                     "worth having",
+    "registry": "ModelRecognizer/TaskRegistryEntry describe how a checkpoint is RECOGNIZED, which is "
+                "checked by detect() running against real checkpoints, not by a link",
+    "tasks": "TaskSpec is the canonical vocabulary itself; TaskRegistry.register validates against it",
+    "checkpoint_probe": "a pickle-opcode probe's result. Read FROM a real checkpoint rather than "
+                        "claimed about one -- the direction a link runs in is the other way",
+}
+
+# Individual classes that are results or internals rather than declarations.
+_NOT_SPECS = {
+    "modular_export.ModularExportResult": "an export RESULT -- what export_modular produced, not what "
+                                          "a caller declared. Its fields are outputs; checking them "
+                                          "against the model they were derived FROM is circular",
+    "modular_export._LeafPath": "an internal bookkeeping record for one captured tensor argument, "
+                                "built and consumed inside _flatten_call/_replay",
+}
+
+# Modules the scan is allowed to fail to import. Both are standalone scripts that re-run `dialect.py`'s
+# op registration at import time, so whether importing them raises "op already registered" depends on
+# what else the process imported first -- they load cleanly under pytest and not from a bare script.
+# The allowance is therefore a subset check, not an equality one: whether these two appear varies, but
+# a THIRD unimportable module must fail, because any spec class inside it escapes the scan entirely.
+_MAY_NOT_IMPORT = {"compare_snapshots", "export_lstm_test_fixture"}
+
+
+def _package_dataclasses():
+    """Every dataclass defined in `loom_mil_compiler`, by `module.ClassName`, plus the modules that
+    could not be imported."""
+    import dataclasses
+    import importlib
+    import inspect
+    import pkgutil
+
+    import loom_mil_compiler as package
+
+    found, unimportable = {}, set()
+    for module_info in pkgutil.iter_modules(package.__path__):
+        if module_info.name.startswith("test_"):
+            continue
+        try:
+            module = importlib.import_module(f"loom_mil_compiler.{module_info.name}")
+        except Exception:
+            unimportable.add(module_info.name)
+            continue
+        for obj in vars(module).values():
+            if (inspect.isclass(obj) and dataclasses.is_dataclass(obj)
+                    and obj.__module__ == module.__name__):
+                found.setdefault(f"{module_info.name}.{obj.__name__}", obj)
+    return found, unimportable
+
+
+class TestStandingRuleAcrossThePackage(unittest.TestCase):
+    def test_every_spec_class_declares_every_field(self):
+        found, _ = _package_dataclasses()
+        offenders = {}
+        for qualname, cls in sorted(found.items()):
+            module_name = qualname.split(".", 1)[0]
+            if module_name in _INFRASTRUCTURE_MODULES or qualname in _NOT_SPECS:
+                continue
+            missing = undeclared_fields(cls)
+            if missing:
+                offenders[qualname] = missing
+        self.assertEqual(offenders, {}, (
+            "these fields are neither link-declared nor explicitly __unchecked__. A field with no "
+            "declaration reads as validated and is not -- add a link, a CoveredBy, or an Unchecked "
+            "with the reason; if the class is not a spec at all, add it to _NOT_SPECS here"
+        ))
+
+    def test_no_coverage_claim_points_at_a_link_that_does_not_exist(self):
+        """`CoveredBy` is the one declaration that can rot silently: deleting the link a field defers
+        to would turn its declaration into an exemption."""
+        found, _ = _package_dataclasses()
+        dangling = {q: dangling_coverage(c) for q, c in found.items() if dangling_coverage(c)}
+        self.assertEqual(dangling, {})
+
+    def test_the_scan_reaches_the_classes_it_is_supposed_to_reach(self):
+        """The rule is only as good as the discovery. If a refactor moved these, the test above would
+        pass vacuously -- so name the ones that must be found."""
+        found, _ = _package_dataclasses()
+        for qualname in ("flow_matching_export.FlowMatchingSpec", "modular_export.ModularExportSpec",
+                         "multi_phase_export.ExportPhase", "nemo_asr_export.ASRNemoEncoderExportConfig",
+                         "causal_lm_export.LMCausalModelExportConfig", "decomposition.Modular",
+                         "kokoro_export.TTSKokoroExportConfig", "vits_export.TTSVitsExportConfig",
+                         "styletts2_export.TTSStyleTTS2ExportConfig",
+                         "matcha_export.TTSMatchaExportConfig",
+                         "supertonic_export.TTSSupertonicExportConfig"):
+            self.assertIn(qualname, found)
+
+    def test_no_unexpected_module_escapes_the_scan_by_failing_to_import(self):
+        _, unimportable = _package_dataclasses()
+        self.assertEqual(unimportable - _MAY_NOT_IMPORT, set(), (
+            "a module the scan could not import -- any spec class in it escapes the standing rule "
+            "silently, which is the one way this test can pass vacuously"
+        ))
+
+    def test_every_registered_config_class_is_covered(self):
+        """The other direction: driven by what is actually registered, so a family that registers a
+        config class the scan somehow missed still fails here."""
+        from loom_mil_compiler.registry import default_registry
+
+        for task, entry in default_registry()._entries.items():
+            self.assertEqual(undeclared_fields(entry.config_class), [], f"{task}/{entry.config_class}")
+
+    def test_an_exemption_reason_is_required_rather_than_a_bare_name(self):
+        """Both exemption tables map to prose, and the prose is the point -- "not a spec" and "nobody
+        got around to it" are different statements and only one should survive review."""
+        for table in (_INFRASTRUCTURE_MODULES, _NOT_SPECS):
+            for name, reason in table.items():
+                self.assertGreater(len(reason), 40, name)
 
 
 if __name__ == "__main__":
