@@ -1,8 +1,10 @@
-"""`TaskRegistry` (BACKLOG.md P3.2): maps a *task* -- an export shape / `LoomExportConfig` family, e.g.
-`"causal-lm"`, `"nemo-asr-encoder"` (mirrors `optimum`'s own task vocabulary, `"text-generation"`/
-`"automatic-speech-recognition"`) -- to the set of concrete models that fit it, each declared as a
-`ModelRecognizer`: a real structural check against a checkpoint (`detect`), and how to build that
-model's own `LoomExportConfig` instance (`build_config`).
+"""`TaskRegistry` (BACKLOG.md P3.2/P4.0.4): maps a *task* -- the I/O contract a family exports against,
+e.g. `"text-generation"`, `"automatic-speech-recognition"` -- to the set of concrete models that fit it,
+each declared as a `ModelRecognizer`: a real structural check against a checkpoint (`detect`), and how to
+build that model's own `LoomExportConfig` instance (`build_config`).
+
+The task names are not free-form: `tasks.py` holds the canonical vocabulary and each task's base config
+class, and `register()` validates against it (P4.0.4).
 
 **Registry key is the task, not the model.** An earlier draft of this registry keyed per model
 (`"qwen3"`, `"kokoro"`, ...), which conflates two axes `optimum` deliberately keeps separate: `task`
@@ -18,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from . import tasks
 from .export_config import LoomExportConfig
 
 
@@ -34,7 +37,13 @@ class ModelRecognizer:
 
 @dataclass
 class TaskRegistryEntry:
-    """One task -- the export shape shared by every recognizer registered under it."""
+    """One family's contribution to a task -- the export shape shared by every recognizer registered
+    under it.
+
+    `task` must be a name from `tasks.py`'s canonical vocabulary. `config_class` is *this family's*
+    config class, which `register()` checks is a subclass of the base that vocabulary declares for the
+    task; the task's authoritative base class lives in `tasks.py`, not here, so it does not depend on
+    which family registered first."""
 
     task: str
     config_class: type
@@ -48,19 +57,31 @@ class TaskRegistry:
     def register(self, entry: TaskRegistryEntry) -> None:
         """Registers `entry`'s recognizers under its task -- creates the task if new, or extends an
         existing one's recognizer list if not. Multiple family modules legitimately share one task
-        (e.g. `"tts-multi-phase"`: Kokoro, StyleTTS2, and VITS are all `BaseMultiPhaseModelExportConfig`
-        instances, each contributing its own recognizer), so a second `register()` call for an
-        already-known task is expected, not an error -- unless it disagrees about which config class
-        the task builds, which would mean two families are colliding on one task name by mistake."""
+        (e.g. Kokoro, StyleTTS2 and VITS are all `BaseMultiPhaseModelExportConfig` instances under
+        `"text-to-speech"`, each contributing its own recognizer), so a second `register()` call for an
+        already-known task is expected, not an error.
+
+        Two things are checked, both against `tasks.py` (BACKLOG.md P4.0.4):
+
+        1. **The task name is in the canonical vocabulary.** Before P4.0.4 any string registered, so a
+           typo silently created a task nothing would ever detect against.
+        2. **`config_class` is a subclass of the base class the vocabulary declares for that task** --
+           not identical to whatever the first family to import happened to pass.
+           `TTSFlowMatchingModelExportConfig` is a *subclass* of `BaseMultiPhaseModelExportConfig`, so
+           identity would reject Matcha and Supertonic sharing one TTS task with Kokoro/VITS/StyleTTS2
+           -- and which of the two the task got pinned to used to depend on import order."""
+        spec = tasks.task_spec(entry.task)
+        base = spec.base_config_class()
+        if not (isinstance(entry.config_class, type) and issubclass(entry.config_class, base)):
+            raise ValueError(
+                f"task {entry.task!r} builds {base.__name__} instances, got config_class "
+                f"{entry.config_class!r} -- a family registered under a task whose export shape it "
+                f"does not build"
+            )
         existing = self._entries.get(entry.task)
         if existing is None:
             self._entries[entry.task] = entry
             return
-        if existing.config_class is not entry.config_class:
-            raise ValueError(
-                f"task {entry.task!r} already registered with config_class {existing.config_class!r}, "
-                f"got {entry.config_class!r} -- two families disagree on what this task builds"
-            )
         existing.recognizers.extend(entry.recognizers)
 
     def _candidates(self, task: Optional[str]):
