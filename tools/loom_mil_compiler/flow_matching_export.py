@@ -44,7 +44,11 @@ check, generating nothing. See BACKEND.md for why the loop itself stays host-sid
 a MIL `while_loop`.
 """
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
+
+from .spec_protocol import (
+    CoveredBy, FieldRef, LinkChecker, TopologyInput, TopologyName, TopologyOutputArity, Unchecked,
+)
 
 
 @dataclass
@@ -58,25 +62,36 @@ class EstimatorSpec:
     without becoming a worse thing to read than the loop. But its `run_subgraph` call has the identical
     failure mode as every other one: a name that does not match the topology's declared inputs is only
     caught deep inside the engine at run time. Declaring the call alone still buys that check.
+
+    Both of its checks are `spec_protocol` links as of P4.0.5 (`EXPORT-PREPARATION.md` stage B.2). The
+    hand-written `validate_against_topology` below is now a thin adapter kept for its callers; the
+    predicate and the message live in `TopologyName`/`TopologyInput`.
     """
 
     topology: str
     # Topology input names the driver supplies, in argument-table order.
     inputs: list
 
+    __links__ = {
+        "topology": TopologyName(),
+        "inputs": TopologyInput(FieldRef("topology"), exact=True),
+    }
+
+    def link_label(self) -> str:
+        """A driver can declare several hand-written estimator calls, so the topology name is what
+        tells a reader which one failed -- matching the label `render_driver` used to pass by hand."""
+        return f"EstimatorSpec({self.topology!r})"
+
     def validate_against_topology(self, topology: dict, label: Optional[str] = None):
         """Cross-checks against the topology's real declared inputs, raising ValueError naming the exact
-        mismatch. This is the whole reason these specs exist rather than a hand-written call."""
-        declared = [inp["name"] for inp in topology.get("inputs", [])]
-        missing = [n for n in self.inputs if n not in declared]
-        unsupplied = [n for n in declared if n not in self.inputs]
-        if missing or unsupplied:
-            raise ValueError(
-                f"{label or 'EstimatorSpec'} does not match topology {self.topology!r}: "
-                + (f"supplies input(s) it does not declare: {missing}; " if missing else "")
-                + (f"leaves declared input(s) unsupplied: {unsupplied}; " if unsupplied else "")
-                + f"topology declares {declared}, spec supplies {self.inputs}."
-            )
+        mismatch. This is the whole reason these specs exist rather than a hand-written call.
+
+        Retained as the single-topology entry point (callers hand it one topology dict, not the whole
+        export's), but the checking is `spec_protocol`'s: `LinkError` subclasses `ValueError`, and the
+        message is byte-identical to the one this method used to build itself."""
+        from .spec_protocol import check_links
+
+        check_links(self, topologies={self.topology: topology}, label=label or "EstimatorSpec")
 
 
 @dataclass
@@ -105,11 +120,50 @@ class FlowMatchingSpec:
     # explains itself to someone reading the GGUF rather than this file.
     note: Optional[str] = None
 
+    __links__ = {
+        "estimator": [
+            TopologyName(),
+            # New in P4.0.5, and a real gap rather than a restatement. `render_sampler` emits
+            # `local v = loom.run_subgraph(...)` and then indexes `v[i]` -- correct only for a
+            # single-output estimator. With two declared outputs `v` silently binds the FIRST output's
+            # data and the loop integrates the wrong tensor, with nothing anywhere reporting it: the
+            # engine is happy, the shapes are plausible and the audio is merely wrong.
+            TopologyOutputArity(FieldRef("estimator"), count=1),
+        ],
+        # The per-step argument table, checked as one set against the estimator's declared inputs so the
+        # message can name both what is supplied-but-undeclared and what is declared-but-unsupplied.
+        "supplied_inputs": TopologyInput(FieldRef("estimator"), exact=True),
+        "carried_input": CoveredBy("supplied_inputs"),
+        "time_input": CoveredBy("supplied_inputs"),
+        "fixed_inputs": CoveredBy("supplied_inputs"),
+    }
+    __unchecked__ = {
+        "func_name": Unchecked(
+            "the name of the Lua function render_sampler emits. Checkable as a DriverSymbol only once "
+            "the driver is IR rather than text -- P4.0.6, which is exactly what makes the driver "
+            "inspectable; today the caller's one-line call site is hand-written Lua."
+        ),
+        "note": Unchecked("cosmetic: rendered as a comment above the generated sampler."),
+    }
+
+    @property
+    def supplied_inputs(self) -> List[str]:
+        """The per-step argument table's keys, in the order `render_sampler` writes them.
+
+        A property rather than a field so the declaration and the emission cannot disagree: this is the
+        list the generated Lua actually passes, and it is also the list the link checks. `__links__`
+        resolves it through plain `getattr`, so a derived value is a first-class link subject."""
+        return [self.carried_input, *self.fixed_inputs, self.time_input]
+
+    def link_label(self) -> str:
+        """A model may declare more than one sampler, so "FlowMatchingSpec" alone does not say which
+        one failed."""
+        return f"FlowMatchingSpec({self.func_name!r})"
+
     def estimator_spec(self) -> EstimatorSpec:
         """This spec's per-step call, as the plain declaration a bespoke sampler would write by hand --
         so both share one validation implementation and cannot drift apart."""
-        return EstimatorSpec(topology=self.estimator,
-                              inputs=[self.carried_input, *self.fixed_inputs, self.time_input])
+        return EstimatorSpec(topology=self.estimator, inputs=self.supplied_inputs)
 
     def validate_against_topology(self, topology: dict):
         self.estimator_spec().validate_against_topology(
@@ -160,16 +214,7 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
 SAMPLER_MARKER = "--@loom:samplers"
 
 
-def _check(spec, topology_name, topologies, label):
-    if topology_name not in topologies:
-        raise ValueError(
-            f"{label} names topology {topology_name!r}, which is not among the exported topologies "
-            f"{sorted(topologies)}."
-        )
-    spec.validate_against_topology(topologies[topology_name])
-
-
-def render_driver(driver_source: str, specs=(), topologies=None, estimators=()) -> str:
+def render_driver(driver_source: str, specs=(), topologies=None, estimators=(), checker=None) -> str:
     """Substitutes `SAMPLER_MARKER` in a hand-written driver with `specs`' generated sampler functions.
 
     When `topologies` is given (the exporter's own `topologies` dict), every spec is validated against
@@ -178,12 +223,21 @@ def render_driver(driver_source: str, specs=(), topologies=None, estimators=()) 
     the driver still writes by hand (StyleTTS2's ADPM2 sampler): they are checked but generate nothing.
 
     With no `specs`, no marker is required -- a driver can opt into the validation alone.
+
+    As of P4.0.5 the checking is `spec_protocol`'s (`EXPORT-PREPARATION.md` stage B.2). `checker` lets
+    the caller pass the export-wide `LinkChecker` -- `MultiPhase.export` does, so a spec declared here
+    and a spec declared anywhere else in the same export share one deferral ledger and one `finish()`.
+    Without one, a local checker is built and finished here, which is the same guarantee for a caller
+    that has nothing else to check.
     """
     if topologies is not None:
-        for spec in specs:
-            _check(spec, spec.estimator, topologies, f"FlowMatchingSpec({spec.func_name!r})")
-        for spec in estimators:
-            _check(spec, spec.topology, topologies, f"EstimatorSpec({spec.topology!r})")
+        owned = checker is None
+        checker = checker or LinkChecker()
+        for spec in list(specs) + list(estimators):
+            checker.check(spec)
+        checker.provide(topologies=topologies)
+        if owned:
+            checker.finish()
     if not specs:
         return driver_source
     if SAMPLER_MARKER not in driver_source:

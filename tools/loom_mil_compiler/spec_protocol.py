@@ -226,7 +226,9 @@ class TopologyInput(Link):
                 f"{sorted(ctx.topologies)}."
             )
         declared = [inp["name"] for inp in topology.get("inputs", [])]
-        supplied = list(value)
+        # A field naming ONE input is the same declaration as a field naming a list of one; iterating a
+        # bare string a character at a time is never what a caller meant.
+        supplied = [value] if isinstance(value, str) else list(value)
         missing = [n for n in supplied if n not in declared]
         unsupplied = [n for n in declared if n not in supplied] if self.exact else []
         if missing or unsupplied:
@@ -552,10 +554,40 @@ class Unchecked:
     reason: str
 
 
+@dataclass(frozen=True)
+class CoveredBy:
+    """"This field IS checked, but as part of another field's link."
+
+    Declared in `__links__` alongside real links, and emits no check of its own. The case that forced it
+    is `FlowMatchingSpec`: `carried_input`, `time_input` and `fixed_inputs` are three fields that only
+    mean anything as the one per-step argument table they compose into, and that table is what the
+    estimator's declared inputs are compared against -- in a single message naming both the inputs
+    supplied-but-undeclared and the inputs declared-but-unsupplied. Splitting that into three per-field
+    links would report one offender at a time and lose the half of the message that says what is
+    *missing*.
+
+    Marking those three `Unchecked` would be false -- they are checked, thoroughly -- and leaving them
+    undeclared would fail the standing rule for the wrong reason. `CoveredBy` says which link does it,
+    and `undeclared_fields` verifies the named field really is link-declared, so a rename cannot quietly
+    turn this into an exemption.
+    """
+
+    by: str
+
+
 def declared_links(spec) -> dict:
-    """`{field or check name: [Link]}` for `spec`'s class, with single links normalized to lists."""
+    """`{field or check name: [Link]}` for `spec`'s class, with single links normalized to lists.
+
+    `CoveredBy` entries are declarations, not checks, so they are filtered out here and only read by
+    `undeclared_fields`."""
     raw = getattr(type(spec), "__links__", {}) or {}
-    return {name: (list(v) if isinstance(v, (list, tuple)) else [v]) for name, v in raw.items()}
+    out = {}
+    for name, value in raw.items():
+        links = [v for v in (value if isinstance(value, (list, tuple)) else [value])
+                 if not isinstance(v, CoveredBy)]
+        if links:
+            out[name] = links
+    return out
 
 
 def declared_unchecked(spec_class) -> dict:
@@ -563,7 +595,8 @@ def declared_unchecked(spec_class) -> dict:
 
 
 def undeclared_fields(spec_class) -> list:
-    """Dataclass fields of `spec_class` that are neither link-declared nor explicitly `__unchecked__`.
+    """Dataclass fields of `spec_class` that are neither link-declared, `CoveredBy` another field, nor
+    explicitly `__unchecked__`.
 
     The standing rule, as a function so the enforcing test is three lines and a new family author can
     run the same check on their own class before opening a review.
@@ -573,6 +606,22 @@ def undeclared_fields(spec_class) -> list:
     links = getattr(spec_class, "__links__", {}) or {}
     unchecked = declared_unchecked(spec_class)
     return [f.name for f in fields(spec_class) if f.name not in links and f.name not in unchecked]
+
+
+def dangling_coverage(spec_class) -> list:
+    """`CoveredBy` entries whose named field is not itself link-declared -- i.e. a claim that some other
+    link does the checking, where no such link exists. Rename-proofing: without this, deleting the link
+    a field defers to silently converts `CoveredBy` into an exemption."""
+    raw = getattr(spec_class, "__links__", {}) or {}
+    real = {name for name, value in raw.items()
+            if any(not isinstance(v, CoveredBy)
+                   for v in (value if isinstance(value, (list, tuple)) else [value]))}
+    dangling = []
+    for name, value in raw.items():
+        for entry in (value if isinstance(value, (list, tuple)) else [value]):
+            if isinstance(entry, CoveredBy) and entry.by not in real:
+                dangling.append(f"{name} -> {entry.by}")
+    return dangling
 
 
 def spec_label(spec) -> str:

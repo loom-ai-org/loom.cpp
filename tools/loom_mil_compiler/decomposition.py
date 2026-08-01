@@ -148,8 +148,13 @@ class MultiPhase(Decomposition):
         from .exporter import LoomGGUFExporter
         from .flow_matching_export import render_driver
         from .multi_phase_export import merge_phase_weights
+        from .spec_protocol import LinkChecker
 
         config.prepare_environment()
+        # One checker for the whole export (P4.0.5): every spec this config declares shares a single
+        # deferral ledger, so `finish()` below is a real statement about the export rather than about
+        # whichever call site happened to have context in hand.
+        checker = LinkChecker()
         phase_topologies = {}
         named_weights = []
         for phase in config.phases():
@@ -176,7 +181,11 @@ class MultiPhase(Decomposition):
         driver_source = render_driver(
             config.driver_script_path.read_text(), config.samplers(),
             topologies=out_exporter.topologies, estimators=config.estimators(),
+            checker=checker,
         )
+        # Nothing may be written until every declared link has actually run. A link that deferred and
+        # never became checkable reads as validated and is not -- see spec_protocol's module docstring.
+        checker.finish()
         out_exporter.write_gguf(driver_source)
         print(f"wrote {config.output_path}")
         return config.output_path
