@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
-    ModularChainBuilder, MonolithicCall, PrefillArgmaxBuilder, caller_input,
+    ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder, PrefillArgmaxBuilder, RawLuaDriver,
+    caller_input, parse_run_subgraph_calls,
 )
 from loom_mil_compiler.driver_ir import BinOp, Len, Lit, LuaCodegen, Var
 from loom_mil_compiler.spec_protocol import LinkError
@@ -193,3 +194,208 @@ class TestTheTwoPathsShareComponents(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- C.3: adopting a hand-written driver -------------------------------------------------------------
+
+
+_DRIVER = """-- a hand-written driver
+local function helper(x)
+    return x + 1
+end
+
+function synthesize(inputs)
+    local a = loom.run_subgraph("encoder", {n_tokens = #inputs.tokens, n_past = 0}, {
+        tokens = inputs.tokens,
+        style = inputs.style,
+    })
+    local b = loom.run_subgraph("vocoder", {n_enc_frames = 4, n_past = 0}, { mel = a })
+    return b
+end
+"""
+
+
+def _adoption_ctx():
+    return DriverContext(
+        topologies={"encoder": _topo(["tokens", "style"]), "vocoder": _topo(["mel"])},
+        axes={"encoder": "n_tokens", "vocoder": "n_enc_frames"},
+    )
+
+
+class TestRawLuaDriverIsByteExact(unittest.TestCase):
+    def test_the_adoption_reproduces_its_own_source(self):
+        """The split-and-rejoin is the one thing this component does that can silently corrupt a
+        working driver, and a whole-file indentation shift is exactly what a reviewer reads past."""
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(source=_DRIVER, origin="d.lua"))
+        self.assertEqual(builder.render(_adoption_ctx()), _DRIVER)
+
+    def test_the_body_keeps_its_own_indentation(self):
+        """`RawBlock` normally takes the enclosing block's indentation; an adopted body already has
+        its own, and re-indenting it would move every line of the embedded driver_script."""
+        script = MultiPhaseDriverBuilder(
+            driver=RawLuaDriver(source=_DRIVER, origin="d.lua")).build(_adoption_ctx())
+        self.assertTrue(script.entry.body[0].verbatim)
+        self.assertIn("    local b = loom.run_subgraph(\"vocoder\", {n_enc_frames = 4, n_past = 0}, "
+                      "{ mel = a })", script.render())
+
+    def test_everything_above_the_entry_function_stays_above_it(self):
+        script = MultiPhaseDriverBuilder(
+            driver=RawLuaDriver(source=_DRIVER, origin="d.lua")).build(_adoption_ctx())
+        self.assertEqual(script.prelude[0], "-- a hand-written driver")
+        self.assertEqual(script.entry.name, "synthesize")
+        self.assertEqual(script.postlude, [""], "the source's trailing newline")
+
+    def test_a_source_with_no_entry_function_is_rejected(self):
+        with self.assertRaises(ValueError) as raised:
+            RawLuaDriver(source="-- nothing here\n", origin="d.lua")
+        self.assertIn("no top-level 'function synthesize(inputs)' line", str(raised.exception))
+
+    def test_a_corrupted_round_trip_is_caught_before_anything_is_written(self):
+        driver = RawLuaDriver(source=_DRIVER, origin="d.lua")
+        driver._body[0] = driver._body[0].lstrip()
+        with self.assertRaises(ValueError) as raised:
+            driver.assert_round_trip()
+        self.assertIn("does not reproduce its own source", str(raised.exception))
+
+
+class TestParsingRunSubgraphCallSites(unittest.TestCase):
+    """The half of C.3 that makes the step more than bookkeeping. Wrapping a driver in a `RawBlock`
+    checks *nothing* on its own -- `check_subgraph_calls` walks `SubgraphCall` nodes and raw text has
+    none -- so the adoption parses its own call sites and declares them."""
+
+    def test_a_multi_line_table_literal_is_read(self):
+        calls, unresolved = parse_run_subgraph_calls(_DRIVER, "d.lua")
+        self.assertEqual(unresolved, [])
+        self.assertEqual([(c.topology, c.inputs, c.line) for c in calls],
+                         [("encoder", ("tokens", "style"), 7), ("vocoder", ("mel",), 11)])
+
+    def test_a_computed_topology_name_is_reported_rather_than_dropped(self):
+        """Every one of these in the real drivers is a BiLSTM/resblock stepping loop -- D.2's
+        component. An adoption that silently ignored them while reporting the rest as checked would be
+        "validated where convenient" one level down."""
+        source = _DRIVER.replace('"vocoder"', 'prefix .. "_vocoder"')
+        calls, unresolved = parse_run_subgraph_calls(source, "d.lua")
+        self.assertEqual([c.topology for c in calls], ["encoder"])
+        self.assertEqual(unresolved, [(11, 'prefix .. "_vocoder"')])
+
+    def test_a_non_literal_argument_table_leaves_the_input_set_unknown(self):
+        """`render_sampler` emits exactly this: a prepared `args` variable. The topology name is still
+        checkable; the input set is not, and `WhenSet` is what says so rather than pretending."""
+        source = _DRIVER.replace("{ mel = a }", "args")
+        calls, _ = parse_run_subgraph_calls(source, "d.lua")
+        self.assertIsNone(calls[1].inputs)
+
+    def test_coverage_reports_the_two_numbers_separately(self):
+        driver = RawLuaDriver(source=_DRIVER.replace("{ mel = a }", "args"), origin="d.lua")
+        self.assertEqual(
+            driver.coverage(),
+            "  d.lua: 2/2 loom.run_subgraph call sites checked against the exported topologies "
+            "(1 with their full input set)")
+
+
+class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
+    def test_a_call_naming_a_topology_the_export_did_not_produce_fails_with_its_line(self):
+        source = _DRIVER.replace('"vocoder"', '"vocodr"')
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(source=source, origin="d.lua"))
+        with self.assertRaises(LinkError) as raised:
+            builder.build(_adoption_ctx())
+        self.assertEqual(
+            str(raised.exception),
+            "d.lua:11 loom.run_subgraph('vocodr') names topology 'vocodr', which is not among the "
+            "exported topologies ['encoder', 'vocoder'].",
+        )
+
+    def test_a_call_supplying_an_input_the_topology_does_not_declare_fails(self):
+        source = _DRIVER.replace("style = inputs.style", "styl = inputs.style")
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(source=source, origin="d.lua"))
+        with self.assertRaises(LinkError) as raised:
+            builder.build(_adoption_ctx())
+        self.assertEqual(
+            str(raised.exception),
+            "d.lua:7 loom.run_subgraph('encoder') does not match topology 'encoder': supplies input(s) "
+            "it does not declare: ['styl']; leaves declared input(s) unsupplied: ['style']; topology "
+            "declares ['tokens', 'style'], spec supplies ['tokens', 'styl'].",
+        )
+
+    def test_the_five_real_drivers_all_round_trip(self):
+        """Not a fixture: the actual shipped `.lua` files, which is the only thing C.3's byte-identity
+        gate is a claim about."""
+        drivers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
+        self.assertEqual(len(drivers), 5, [d.name for d in drivers])
+        for path in drivers:
+            RawLuaDriver(source=path.read_text(), origin=path.name).assert_round_trip()
+
+
+class TestExternalTopologies(unittest.TestCase):
+    """Kokoro and StyleTTS2 are *partial* MIL exports: their drivers call topologies still loaded from
+    the pre-MIL `.gguf` alongside the exported one. C.3's own gate is what surfaced that -- it was
+    recorded only in a C++ test -- and `external_topologies()` is the finding, turned into a
+    declaration that cannot rot in either direction."""
+
+    def _ctx(self):
+        return DriverContext(topologies={"encoder": _topo(["tokens", "style"])},
+                             axes={"encoder": "n_tokens"})
+
+    def test_a_declared_external_call_is_not_reported_as_missing(self):
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(
+            source=_DRIVER, origin="d.lua", external={"vocoder": "the pre-MIL gguf"}))
+        self.assertEqual(builder.render(self._ctx()), _DRIVER)
+
+    def test_an_undeclared_one_still_fails(self):
+        """The reason this is a declaration rather than "skip anything not exported": a typo and a
+        cross-GGUF dependency would otherwise be indistinguishable, which is the whole class of bug
+        the check exists for."""
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(source=_DRIVER, origin="d.lua"))
+        with self.assertRaises(LinkError) as raised:
+            builder.build(self._ctx())
+        self.assertIn("names topology 'vocoder', which is not among the exported topologies",
+                      str(raised.exception))
+
+    def test_a_stale_declaration_fails(self):
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(
+            source=_DRIVER, origin="d.lua",
+            external={"encoder": "wrong -- this export produces it", "vocoder": "the pre-MIL gguf"}))
+        with self.assertRaises(LinkError) as raised:
+            builder.build(self._ctx())
+        self.assertEqual(
+            str(raised.exception),
+            "RawLuaDriver('d.lua') declares topolog(ies) ['encoder'] as coming from outside this "
+            "export, but this export produces them. A stale external declaration silently suppresses "
+            "the very check it was added to make honest -- drop it from external_topologies().",
+        )
+
+    def test_a_dead_declaration_fails(self):
+        builder = MultiPhaseDriverBuilder(driver=RawLuaDriver(
+            source=_DRIVER, origin="d.lua",
+            external={"vocoder": "the pre-MIL gguf", "nobody_calls_this": "nor this"}))
+        with self.assertRaises(LinkError) as raised:
+            builder.build(self._ctx())
+        self.assertEqual(
+            str(raised.exception),
+            "RawLuaDriver('d.lua') declares topolog(ies) ['nobody_calls_this'] as external, but its "
+            "driver never calls them. A dead declaration is worse than none: it reads as an "
+            "accounted-for dependency.",
+        )
+
+    def test_coverage_counts_external_calls_apart_from_checked_ones(self):
+        driver = RawLuaDriver(source=_DRIVER, origin="d.lua", external={"vocoder": "the pre-MIL gguf"})
+        self.assertEqual(
+            driver.coverage(),
+            "  d.lua: 1/2 loom.run_subgraph call sites checked against the exported topologies "
+            "(1 with their full input set); 1 call topolog(ies) this export does not produce and the "
+            "config declares external (vocoder)")
+
+    def test_the_two_partial_families_declare_exactly_what_their_drivers_call(self):
+        """Driven from the real `.lua` files and the real configs, so a driver gaining a call into the
+        bespoke gguf without a matching declaration fails here rather than at export time."""
+        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
+
+        for config_class, exported in ((TTSKokoroExportConfig, {"albert_bert_encoder",
+                                                                "decoder_vocoder"}),
+                                       (TTSStyleTTS2ExportConfig, {"albert", "decoder_vocoder",
+                                                                   "diffusion"})):
+            path = config_class.__dataclass_fields__["driver_script_path"].default
+            external = config_class.external_topologies(config_class)
+            driver = RawLuaDriver(source=path.read_text(), origin=path.name, external=external)
+            self.assertEqual(driver.called_topologies() - exported, set(external), path.name)

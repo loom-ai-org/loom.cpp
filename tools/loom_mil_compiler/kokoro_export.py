@@ -45,7 +45,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -483,6 +483,23 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         ),
     }
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver_mil.lua"
+
+    def external_topologies(self) -> Dict[str, str]:
+        """Kokoro's MIL export is deliberately **partial**, and until P4.0.6/C.3 nothing on the export
+        side said so.
+
+        Only the two heavy traceable stages move to MIL; the driver's remaining `run_subgraph` calls
+        land on topologies still built by the pre-MIL bespoke converter and loaded from `kokoro.gguf`
+        alongside `kokoro_mil.gguf` -- exactly what `test_e2e_kokoro_mil_lua_driver.cpp` does, from two
+        `GgufModel`s. The emitted GGUF is therefore not self-contained for this family, which is a real
+        property of the artifact and was recorded only in a C++ test.
+
+        The BiLSTM/AdaLN stepping topologies (`*_lstm_h_fwd`, `duration_adaln_0`, ...) are not listed
+        here because the driver names them with computed Lua expressions, so no check reaches them
+        either way; they arrive from the same place. D.2's registered stepping component is what turns
+        those into declarations too."""
+        from_bespoke = "the pre-MIL kokoro.gguf, registered alongside this export by the host"
+        return {"text_encoder_cnn": from_bespoke, "duration_proj": from_bespoke}
 
     def phases(self) -> List[ExportPhase]:
         ckpt_path = Path(self.model_dir) / "kokoro-v1_0.pth"

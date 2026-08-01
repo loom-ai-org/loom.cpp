@@ -158,6 +158,24 @@ class BaseMultiPhaseModelExportConfig(LoomExportConfig):
     def estimators(self) -> List[EstimatorSpec]:
         return []
 
+    def external_topologies(self) -> Dict[str, str]:
+        """`{topology name: where it comes from}` for topologies this family's driver calls that this
+        export deliberately does **not** produce.
+
+        Discovered by P4.0.6/C.3's own gate, and this method is the finding. Kokoro and StyleTTS2 are
+        *partial* MIL exports: their drivers run against a mix of the MIL-traced topologies in
+        `*_mil.gguf` and the LSTM-bound ones still loaded from the pre-MIL `*.gguf` alongside it
+        (`test_e2e_{kokoro,styletts2}_mil_lua_driver.cpp` registers both, from two `GgufModel`s). That
+        is a real and load-bearing property of those two exports, and until now it was recorded only in
+        a C++ test -- nothing on the export side said the emitted GGUF is not self-contained.
+
+        Declaring it rather than inferring it is what keeps the check worth having. The alternative --
+        skipping any `run_subgraph` call naming a topology this export did not produce -- makes a typo
+        and a cross-GGUF dependency indistinguishable, which is the whole class of bug the check exists
+        for. Both directions of the declaration are checked: a name here that this export *does*
+        produce is stale, and one no call site references is dead."""
+        return {}
+
 
 @dataclass(kw_only=True)
 class TTSFlowMatchingModelExportConfig(BaseMultiPhaseModelExportConfig):
