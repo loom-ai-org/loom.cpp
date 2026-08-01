@@ -1,16 +1,19 @@
 """Single entry point for exporting any model this project knows how to export -- BACKLOG.md P3.2's
 `main_export()` + `loom-export` CLI, this project's `optimum-cli export onnx --model <id>` equivalent.
 
-    loom-export <model-path> -o <out.gguf>                                        # fully automatic
-    loom-export <model-path> -o <out.gguf> --task nemo-asr-encoder --model parakeet-tdt   # explicit
+    loom-export <model-path> -o <out.gguf>                              # fully automatic
+    loom-export <model-path> -o <out.gguf> \\
+        --task automatic-speech-recognition --model parakeet-tdt        # explicit
 
 See `registry.py` for how a model is recognized (task, then model within it) and BACKLOG.md's P3.2
-entry for why detection is two-axis rather than one flat per-model key.
+entry for why detection is two-axis rather than one flat per-model key; `tasks.py` for the canonical
+task vocabulary `--task` accepts.
 """
 import argparse
 from pathlib import Path
 
 from .registry import default_registry
+from .tasks import known_tasks
 
 
 def main_export(model_path: str, output_path: str, task: str = None, model: str = None) -> str:
@@ -32,7 +35,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("model_path", help="Path to a checkpoint directory or file (HF dir, .nemo archive, ...)")
     parser.add_argument("-o", "--output", required=True, help="Output GGUF path")
-    parser.add_argument("--task", default=None, help="Restrict/override task detection, e.g. 'causal-lm'")
+    parser.add_argument(
+        "--task", default=None, choices=known_tasks(),
+        help="Restrict/override task detection (the canonical vocabulary, see tasks.py)",
+    )
     parser.add_argument("--model", default=None, help="Explicit model override within --task, e.g. 'qwen3'")
     args = parser.parse_args()
 

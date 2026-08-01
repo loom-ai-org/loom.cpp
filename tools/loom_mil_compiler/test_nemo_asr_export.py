@@ -175,7 +175,7 @@ def test_the_three_registered_recognizers_declare_distinct_specs():
     }
     registry = default_registry()
     specs = [
-        registry.get("nemo-asr-encoder", name).build_config(Path(checkpoint), f"{name}.gguf")
+        registry.get("automatic-speech-recognition", name).build_config(Path(checkpoint), f"{name}.gguf")
         for name, checkpoint in checkpoints.items()
     ]
 

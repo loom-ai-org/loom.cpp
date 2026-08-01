@@ -37,7 +37,7 @@ alone, i.e. "builds and produces a finite waveform," did not, and would not, cat
     -0.0).
 
 Usage:
-  loom-export /path/to/kokoro/dir -o kokoro_mil.gguf --task tts-multi-phase --model kokoro
+  loom-export /path/to/kokoro/dir -o kokoro_mil.gguf --task text-to-speech --model kokoro
 """
 import json
 import math
@@ -525,7 +525,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="tts-multi-phase",
+        task="text-to-speech",
         config_class=BaseMultiPhaseModelExportConfig,
         recognizers=[ModelRecognizer(name="kokoro", detect=_is_kokoro, build_config=_build_kokoro)],
     ))

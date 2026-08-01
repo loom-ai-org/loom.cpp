@@ -65,7 +65,7 @@ No import-order stub needed for this checkpoint format -- the four `.pt` files a
 Matcha's transformers/huggingface_hub dependencies), so there's no `ModelPatcher` subclass here.
 
 Usage:
-  loom-export /path/to/supertonic/assets/pt -o supertonic_mil.gguf --task tts-flow-matching --model supertonic
+  loom-export /path/to/supertonic/assets/pt -o supertonic_mil.gguf --task text-to-speech --model supertonic
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -274,7 +274,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="tts-flow-matching",
+        task="text-to-speech",
         config_class=TTSFlowMatchingModelExportConfig,
         recognizers=[ModelRecognizer(name="supertonic", detect=_is_supertonic, build_config=_build_supertonic)],
     ))

@@ -44,7 +44,7 @@ reference_forward_styletts2_{albert_mil,diffusion}.py` and `kokoro_export.py`'s 
 decoder_vocoder reference reused as-is): see `test_e2e_styletts2_mil_*.cpp` for the actual tolerances.
 
 Usage:
-  loom-export /path/to/styletts2.pth -o styletts2_mil.gguf --task tts-multi-phase --model styletts2
+  loom-export /path/to/styletts2.pth -o styletts2_mil.gguf --task text-to-speech --model styletts2
 """
 import json
 import sys
@@ -373,7 +373,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="tts-multi-phase",
+        task="text-to-speech",
         config_class=BaseMultiPhaseModelExportConfig,
         recognizers=[ModelRecognizer(name="styletts2", detect=_is_styletts2, build_config=_build_styletts2)],
     ))

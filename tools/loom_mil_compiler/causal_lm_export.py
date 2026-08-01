@@ -216,7 +216,7 @@ def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
-        task="causal-lm",
+        task="text-generation",
         config_class=LMCausalModelExportConfig,
         recognizers=[
             ModelRecognizer(name="qwen3", detect=_is_qwen3, build_config=_build_qwen3),
