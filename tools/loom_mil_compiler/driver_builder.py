@@ -108,33 +108,58 @@ class DriverComponent:
         declarations."""
         return declared_links(self)
 
+    def sub_specs(self) -> List:
+        """Specs this component owns, registered with the same checker it is.
+
+        `spec_protocol.NestedSpec` deliberately does not auto-recurse, because a nested spec's links
+        are frequently only checkable at a site the outer checker cannot reach. A driver component is
+        the case where they *are*: `ModularChain` holds one `ChainStage` per submodule, each declaring
+        its own topology and input set, and they are all checkable against the same context the chain
+        is. Registering them individually rather than collapsing them into one link is what lets a
+        failure name the stage -- `ChainStage('layer_14')` rather than the chain it was in.
+        """
+        return []
+
     def prelude(self, ctx: DriverContext) -> List[str]:
-        """Top-level Lua lines emitted before the entry function, verbatim."""
+        """Top-level Lua lines emitted before the entry function, verbatim. A component owns the blank
+        lines around its own contribution -- see `DriverScript`."""
         return []
 
     def emit(self, ctx: DriverContext) -> List[Stmt]:
         """Statements appended to the entry function's body, in component order."""
         return []
 
+    def postlude(self, ctx: DriverContext) -> List[str]:
+        """Top-level Lua lines emitted after the entry function."""
+        return []
+
 
 @dataclasses.dataclass
 class DriverScript:
-    """A built driver: top-level chunks, then the entry function.
+    """A built driver: top-level lines, the entry function, then any top-level lines after it.
 
-    Two parts rather than one `Function`, because a real driver is a Lua *module*, not a function --
+    Three parts rather than one `Function`, because a real driver is a Lua *module*, not a function --
     every TTS driver in this tree is a preamble comment plus zero or more generated sampler functions
     plus the entry point the host calls. Modelling that as "one IRFunction" would have forced the
     sampler functions to become nested closures, which is a semantic change (the host resolves
     `synthesize` as a global) dressed up as a refactor.
+
+    **Lines, not chunks, and joined with a single newline.** A component therefore owns the blank lines
+    around its own contribution rather than the script imposing a separator between contributions. That
+    is what makes adopting an existing hand-written driver byte-exact: its spacing is data, not
+    something to be re-derived. `postlude` exists for the same reason -- a file ending in a newline
+    after its last `end` is one trailing empty line, and reconstructing it is not optional when the
+    gate is a byte comparison.
     """
 
     prelude: List[str]
     entry: IRFunction
+    postlude: List[str] = dataclasses.field(default_factory=list)
 
     def render(self) -> str:
-        chunks = [chunk for chunk in self.prelude if chunk]
-        chunks.append("\n".join(LuaCodegen().emit_function(self.entry)))
-        return "\n\n".join(chunks)
+        return "\n".join(
+            list(self.prelude) + LuaCodegen().emit_function(self.entry) + list(self.postlude)
+        )
 
 
 class DriverBuilder:
@@ -174,13 +199,17 @@ class DriverBuilder:
         components = list(self.components())
         for component in components:
             checker.check(component)
+            for sub in component.sub_specs():
+                checker.check(sub)
         checker.provide(**ctx.link_slots())
 
         prelude: List[str] = []
         body: List[Stmt] = []
+        postlude: List[str] = []
         for component in components:
             prelude.extend(component.prelude(ctx))
             body.extend(component.emit(ctx))
+            postlude.extend(component.postlude(ctx))
 
         entry = IRFunction(self.entry_name, list(self.entry_params), body)
         validate(entry)
@@ -189,7 +218,7 @@ class DriverBuilder:
         checker.provide(driver=entry)
         if owned:
             checker.finish()
-        return DriverScript(prelude=prelude, entry=entry)
+        return DriverScript(prelude=prelude, entry=entry, postlude=postlude)
 
     def render(self, ctx: DriverContext, checker: Optional[LinkChecker] = None) -> str:
         """The embedded `model.driver_script` text."""

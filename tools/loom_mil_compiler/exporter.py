@@ -12,6 +12,12 @@ from .driver_ir import (
     validate,
 )
 from .driver_ir import Function as IRFunction
+from .driver_builder import DriverContext, DriverScript
+from .driver_components import (
+    CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
+    POSITION_INPUT_NAMES, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain, ModularChainBuilder,
+    MonolithicCall, PrefillArgmaxBuilder,
+)
 from .passes import apply_loom_mil_passes
 from .shape_expr import (
     as_expr, floor_div, has_dynamic_symbol, render, sub_dynamic_symbols,
@@ -20,31 +26,19 @@ from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_scalar, static_value
 
-# Traced-model input names auto-computed by the driver (via loom.range) rather than unpacked from the
-# caller's `inputs` table -- see apply_monolithic_export's own comment.
-_POSITION_INPUT_NAMES = {"cache_position", "position_ids"}
+def _binding_kind(name: str) -> str:
+    """How the driver obtains one traced-model input: computed host-side, or read from the caller.
 
-# Traced-model input names auto-computed by the driver via loom.causal_mask (an already-prepared 4D
-# additive mask, the same "pass it explicitly so the traced model skips computing it internally" fix as
-# _POSITION_INPUT_NAMES -- see export_lfm2_*.py's own _causal_mask() comment).
-_CAUSAL_MASK_INPUT_NAMES = {"attention_mask"}
-
-# The generic name a caller may always use for a driver's primary input, whatever the traced graph
-# happens to call it (`input_ids`, `audio_signal`, ...).
-_GENERIC_PRIMARY_INPUT = "tokens"
-
-
-def _caller_input(name: str):
-    """Reads one input from the driver's `inputs` table, with `tokens` accepted as an alias for it.
-
-    The alias is what lets a caller pass the primary input as `inputs.tokens` without knowing the traced
-    graph's own name for it. When that name IS `tokens` there is nothing to alias, and emitting the
-    fallback anyway produced `inputs.tokens or inputs.tokens` -- same expression on both sides of the
-    `or`, which is what the generated Lua read like for every causal LM."""
-    field = FieldAccess("inputs", name)
-    if name == _GENERIC_PRIMARY_INPUT:
-        return field
-    return BinOp("or", field, FieldAccess("inputs", _GENERIC_PRIMARY_INPUT))
+    The two host-computed sets live in `driver_components.py` alongside the component that acts on
+    them (P4.0.6/C.2). A traced model's own `cache_position`/`position_ids`/`attention_mask` inputs
+    exist because passing them explicitly is what keeps the sequence length genuinely dynamic under
+    `torch.jit.trace`; the driver knows `n_tokens`/`n_past` and fills them in, so a caller never has to
+    know they are there."""
+    if name in POSITION_INPUT_NAMES:
+        return POSITION
+    if name in CAUSAL_MASK_INPUT_NAMES:
+        return MASK
+    return CALLER
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -140,7 +134,11 @@ class LoomGGUFExporter:
         self.kwargs = kwargs
         self.weights = {}
         self.topologies = {}
-        self.ir_function = None
+        # The built driver (`driver_builder.DriverScript`: top-level prelude chunks + the entry
+        # function), set by whichever of the three paths `export()` dispatches to. Was a bare
+        # `IRFunction` until P4.0.6/C.2 -- a driver is a Lua module, not a function, and the two
+        # synthesized paths now reach it through a `DriverBuilder` rather than building it inline.
+        self.driver_script = None
         # Whether this export writes weights into ONE flat namespace instead of prefixing each with its
         # own topology's name (`{func_name}.{weight}`). Read by `topology_ops.py` in 8 places, always as
         # `func_name == "main_topo" or self.flat_namespace`.
@@ -1184,10 +1182,26 @@ class LoomGGUFExporter:
         return self.output_path
 
     def _finalize_driver(self) -> str:
-        """Validates the built driver IR and codegens it to Lua source text."""
-        validate(self.ir_function)
-        check_subgraph_calls(self.ir_function, self.topologies)
-        return "\n".join(LuaCodegen().emit_function(self.ir_function))
+        """Runs the driver IR's own two checks over whichever path built the script, then codegens it.
+
+        Every path lands here. The two synthesized ones now build their script through a
+        `DriverBuilder`, which has already run both of these -- they are idempotent, and keeping them
+        here is what holds the bespoke transpile path (which has no builder, because it lowers a MIL
+        `main` function op by op rather than assembling components) to exactly the same two checks."""
+        validate(self.driver_script.entry)
+        check_subgraph_calls(self.driver_script.entry, self.topologies)
+        return self.driver_script.render()
+
+    def _driver_context(self, topologies=None) -> DriverContext:
+        """What a `DriverComponent` emits against. Every topology this exporter produces shares one
+        root axis (`self.root_axis`) -- unlike a multi-phase export, where each phase declares its
+        own -- so the map is built by filling that in for each."""
+        names = self.topologies if topologies is None else topologies
+        return DriverContext(
+            topologies=self.topologies,
+            axes={name: self.root_axis for name in names},
+            weights=None,
+        )
 
     def apply_monolithic_export(self):
         print("Exporting via Automatic Monolithic path...")
@@ -1210,46 +1224,21 @@ class LoomGGUFExporter:
         if feature_scale > 1:
             n_tokens_expr = BinOp("floordiv", Len(first_input), Lit(feature_scale))
 
-        body = []
-        for name in main_func.inputs.keys():
-            safe_inp = self.safe_name(name)
-            if name in _POSITION_INPUT_NAMES:
-                # A traced model's own "cache_position"/"position_ids" input (see export_lfm2_*.py's own
-                # comment: passing this explicitly rather than letting the model derive it internally
-                # from a Python-level `.shape[1]` query is what keeps it genuinely dynamic under
-                # torch.jit.trace) is host-computed here, not unpacked from the caller's `inputs` table --
-                # the driver already knows n_tokens/n_past, and callers shouldn't need to know this is an
-                # LFM2-specific implementation detail of the traced graph.
-                body.append(Local(safe_inp, Call("loom.range", [Lit(0), n_tokens_expr])))
-            elif name in _CAUSAL_MASK_INPUT_NAMES:
-                body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
-            else:
-                body.append(Local(safe_inp, _caller_input(safe_inp)))
+        # The traced function's own declared-input order IS the emission order here: the host-computed
+        # bindings read `n_tokens_expr`, which reads the first input, so anything that reordered this
+        # would produce a driver reading a symbol before it is bound -- which `driver_ir.validate`
+        # catches, but only after the fact.
+        bindings = tuple(
+            (self.safe_name(name), _binding_kind(name)) for name in main_func.inputs.keys()
+        )
+        input_names = tuple(name for name, _ in bindings)
 
-        inputs_tbl = {self.safe_name(k): IRVar(self.safe_name(k)) for k in main_func.inputs.keys()}
-
-        body.append(SubgraphCall(
-            outputs=["_mono_out"],
-            extra_outputs=["_mono_shape"],
-            module="main_topo",
-            # This topology's own declared root axis (EXPORT-ROADMAP.md R1) -- "n_tokens" unless the
-            # caller declared otherwise (e.g. Conformer-CTC/Parakeet's "n_samples"); the VALUE is still
-            # the first input's own length regardless of what the axis is named.
-            axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
-            inputs=inputs_tbl,
-        ))
-
-        # Argmax the logits row for the active (last real) token rather than returning the raw output
-        # array -- _mono_shape[1] is the output's ne0 (vocab size), the same convention
-        # transpile_operation's own "argmax" case relies on.
-        row_expr = BinOp("-", n_tokens_expr, Lit(1))
-        body.append(If(
-            cond=BinOp("==", Call("type", [IRVar("_mono_out")]), Lit("table")),
-            then=[Return([Call("loom.argmax_row", [IRVar("_mono_out"), Index(IRVar("_mono_shape"), 1), row_expr])])],
-            else_=[Return([IRVar("_mono_out")])],
-        ))
-
-        self.ir_function = IRFunction("main", ["inputs"], body)
+        self.driver_script = PrefillArgmaxBuilder(
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            call=MonolithicCall(topology="main_topo", inputs=input_names, n_tokens=n_tokens_expr),
+            epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
+                                    n_tokens=n_tokens_expr),
+        ).build(self._driver_context())
 
     def apply_modular_export(self):
         """
@@ -1264,7 +1253,7 @@ class LoomGGUFExporter:
         print("Exporting via Modular-Blueprint path...")
         layout = self.kwargs["modular_layout"]
         functions = self.program.functions
-        special_names = set(_POSITION_INPUT_NAMES) | set(_CAUSAL_MASK_INPUT_NAMES)
+        special_names = set(HOST_COMPUTED_INPUT_NAMES)
 
         def is_aux_input(name):
             return layout.aux_kwarg and (name == layout.aux_kwarg or name.startswith(layout.aux_kwarg + "_"))
@@ -1292,26 +1281,23 @@ class LoomGGUFExporter:
         first_input = self.safe_name(chain_in_names[0])
         n_tokens_expr = Len(first_input)
 
-        # 2. `first_input` (the caller-supplied token-ids input) must be defined before anything below
-        # reads n_tokens_expr, mirroring apply_monolithic_export's own ordering.
-        body = [Local(first_input, _caller_input(first_input))]
-
+        # 2. `first_input` (the caller-supplied token-ids input) must be bound before anything below
+        # reads n_tokens_expr, mirroring apply_monolithic_export's own ordering. The host-computed
+        # names follow it, sorted -- unlike the monolithic path there is no single traced function
+        # whose declared-input order could be used, since each stage declares its own subset.
         special_needed = set()
         for name in stage_names:
             special_needed.update(n for n in declared_inputs(name) if n in special_names)
-        for name in sorted(special_needed):
-            safe_inp = self.safe_name(name)
-            if name in _POSITION_INPUT_NAMES:
-                body.append(Local(safe_inp, Call("loom.range", [Lit(0), n_tokens_expr])))
-            else:
-                body.append(Local(safe_inp, Call("loom.causal_mask", [n_tokens_expr, Lit(0)])))
+        bindings = [(first_input, CALLER)] + [
+            (self.safe_name(name), _binding_kind(name)) for name in sorted(special_needed)
+        ]
 
         # 3. Prefix.
         chain_var = "_mod_chain_0"
-        body.append(SubgraphCall(
-            outputs=[chain_var], module="prefix", axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
+        stages = [ChainStage(
+            topology="prefix", outputs=(chain_var,),
             inputs={self.safe_name(n): IRVar(self.safe_name(n)) for n in prefix_input_names},
-        ))
+        )]
 
         # 4. Auxiliary submodule (computed once, shared across every repeated-block call below) -- e.g.
         # LFM2's rotary-embedding table, computed once in Lfm2Model.forward and threaded into every
@@ -1331,9 +1317,8 @@ class LoomGGUFExporter:
                 # tensor" role a repeated-block call's primary input does -- feed it the same value.
                 aux_inputs_tbl[safe_n] = IRVar(chain_var) if n in aux_chain_names else IRVar(safe_n)
             aux_out_vars = [f"_mod_aux_{i}" for i in range(len(layout.aux_output_names))]
-            body.append(SubgraphCall(
-                outputs=aux_out_vars, module="aux",
-                axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)}, inputs=aux_inputs_tbl,
+            stages.append(ChainStage(
+                topology="aux", outputs=tuple(aux_out_vars), inputs=aux_inputs_tbl,
             ))
 
         # 5. Repeated block, threading `chain_var` (hidden_states) from one layer's output into the
@@ -1359,10 +1344,8 @@ class LoomGGUFExporter:
                     inputs_tbl[safe_n] = IRVar(safe_n)
 
             next_chain_var = f"_mod_chain_{i + 1}"
-            body.append(SubgraphCall(
-                outputs=[next_chain_var], module=layer_name,
-                axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
-                inputs=inputs_tbl,
+            stages.append(ChainStage(
+                topology=layer_name, outputs=(next_chain_var,), inputs=inputs_tbl,
             ))
             chain_var = next_chain_var
 
@@ -1373,26 +1356,24 @@ class LoomGGUFExporter:
                 raise ValueError(f"suffix submodule '{name}' must declare exactly one input, got {in_names}")
             is_last = idx == len(layout.suffix_names) - 1
             next_chain_var = f"_mod_suffix_{idx}"
-            call_kwargs = dict(
-                outputs=[next_chain_var], module=name,
-                axes={self.root_axis: n_tokens_expr, "n_past": Lit(0)},
+            stages.append(ChainStage(
+                topology=name, outputs=(next_chain_var,),
                 inputs={self.safe_name(in_names[0]): IRVar(chain_var)},
-            )
-            if is_last:
-                call_kwargs["extra_outputs"] = ["_modular_final_shape"]
-            body.append(SubgraphCall(**call_kwargs))
+                # Only the last stage's shape is captured: it is the vocab size the epilogue argmaxes
+                # over, and capturing a shape at all requires capturing every data output first
+                # (driver_ir.check_subgraph_calls' own rule).
+                extra_outputs=("_modular_final_shape",) if is_last else (),
+            ))
             chain_var = next_chain_var
 
-        # 7. Argmax the logits row for the active (last real) token -- same convention
-        # apply_monolithic_export uses for causal-LM next-token generation.
-        row_expr = BinOp("-", n_tokens_expr, Lit(1))
-        body.append(If(
-            cond=BinOp("==", Call("type", [IRVar(chain_var)]), Lit("table")),
-            then=[Return([Call("loom.argmax_row", [IRVar(chain_var), Index(IRVar("_modular_final_shape"), 1), row_expr])])],
-            else_=[Return([IRVar(chain_var)])],
-        ))
-
-        self.ir_function = IRFunction("main", ["inputs"], body)
+        # 7. Same argmax epilogue the monolithic path uses -- two of this builder's three components
+        # are shared with it, which is the smallest real instance of P4.0.7's reuse claim.
+        self.driver_script = ModularChainBuilder(
+            inputs=DriverInputs(bindings=tuple(bindings), n_tokens=n_tokens_expr),
+            chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens_expr),
+            epilogue=ArgmaxEpilogue(out_var=chain_var, shape_var="_modular_final_shape",
+                                    n_tokens=n_tokens_expr),
+        ).build(self._driver_context())
 
     def transpile_to_lua(self, func: Function, name="main"):
         """
@@ -1416,7 +1397,10 @@ class LoomGGUFExporter:
         output_names = [self.safe_name(v.name) for v in func.outputs]
         body.append(Return([IRVar(n) for n in output_names]))
 
-        self.ir_function = IRFunction(name, ["inputs"], body)
+        # No builder: this path lowers a hand-built MIL `main` function op by op rather than assembling
+        # components, which is what `Decomposition.driver_builder` returning None records. It still
+        # produces the same artifact, so `_finalize_driver` holds it to the same two checks.
+        self.driver_script = DriverScript(prelude=[], entry=IRFunction(name, ["inputs"], body))
 
     def transpile_block(self, block: Block) -> list:
         stmts = []
