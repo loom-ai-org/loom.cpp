@@ -269,7 +269,8 @@ that put P0 first.*
 
 * Rename tasks to real tasks: `causal-lm` → `text-generation`, `nemo-asr-encoder` →
   `automatic-speech-recognition` (with the loader per recognizer, which is what P4.2/GigaAM forces
-  anyway), `tts-multi-phase` + `tts-flow-matching` → `text-to-speech`.
+  anyway), `tts-multi-phase` + `tts-flow-matching` → `text-to-speech`, plus `audio-codec` reserved
+  (decision 3) — declared in the vocabulary, with no family registered against it until family 11 exists.
 * Add a generic causal-LM recognizer matching any HF directory with a `model_type`, with a per-`model_type`
   override table for the exceptions, replacing the one-literal closures.
 * **Gate:** byte-identical re-export of all 11 models; `loom-export` resolves the same recognizer for
@@ -336,8 +337,9 @@ spelled out rather than rediscovered:
   alive.
 * Split `include/loom/loom.h` into the lean runtime surface and a legacy header, so the boundary is
   auditable and new code stops accreting against the drivers.
-* Decide explicitly whether `expand_by_duration` and `pad_crop_relative_embeddings` stay as task
-  primitives or move exporter-side (§1.3).
+* ~~Decide whether `expand_by_duration` / `pad_crop_relative_embeddings` stay~~ — **decided (§5.1): they
+  stay, reclassified as generic host-side tensor ops.** This bullet becomes a documentation task:
+  `lua_bridge.h` gains the criterion a new binding must meet, with both labelled against it.
 
 *This one trails the others — it is bookkeeping plus test work, and nothing in P4 depends on it.*
 
@@ -362,11 +364,233 @@ spelled out rather than rediscovered:
 * **`NormalizedConfig` / `DummyInputGenerator` analogues.** Worth having eventually; neither blocks P4,
   and for the TTS zoo there is no upstream normalizer to build a `NormalizedConfig` on top of.
 
-## 5. Open questions
+## 5. Decisions (resolved 2026-08-01)
 
-1. Are `expand_by_duration` / `pad_crop_relative_embeddings` task primitives or exporter work? (P4.0.8)
-2. Does the cross-attention AR decode shape want to be a `DriverComponent` or its own `Decomposition`?
-   It is the first shape where the driver contains a genuine data-dependent loop with per-step KV state,
-   which is also where the KV-cache gap above becomes unavoidable.
-3. Should `text-to-speech` stay one task once family 10 (AR LM + neural codec) arrives, or does the
-   codec decoder deserve its own task the way `optimum` splits `feature-extraction` out?
+The three open questions above, plus one on verification budget, were answered by the author. Each
+changes something concrete in §3, noted with the answer.
+
+1. **`expand_by_duration` / `pad_crop_relative_embeddings` stay in the bridge, reclassified as generic
+   host-side tensor ops.** Neither reads a model config; both exist because the operation has a
+   data-dependent output length, which cannot live in a static topology. **Consequence:** P4.0.8's third
+   bullet becomes documentation rather than code — `lua_bridge.h` gains a written criterion that a new
+   binding must be a generic host-side tensor op, not model adaptation, and the two existing ones are
+   labelled against it.
+2. **The cross-attention AR decode shape gets its own `Decomposition`**, not a `DriverComponent`.
+   **Consequence, and it reaches back into P4.0.6:** the driver builder must be *selected by* the
+   decomposition rather than owned by the family, so a fourth decomposition can bring its own builder
+   without reopening the component API. P4.0.6 therefore adds a `Decomposition.driver_builder(config)`
+   hook, and the component API is shaped by the six existing components only — no speculative
+   loop-carried-state design. The KV-cache gap in §4 becomes that decomposition's problem, in P4.1.
+3. **The TTS task splits now: `text-to-speech` + `audio-codec`.** **Consequence:** `audio-codec` is a
+   *reserved* name with no family registered against it yet, which is only meaningful if the vocabulary
+   is a real, checked list — so P4.0.4 grows a `tasks.py` declaring the canonical names (and each task's
+   base config class), with `TaskRegistry.register()` validating against it.
+4. **Verification budget: affected models per commit, full 11-model sweep per completed item.** Each
+   step below states which models it can possibly touch; the item-closing sweep is the cross-family net.
+
+---
+
+## 6. Implementation plan
+
+Five stages, in the order they must happen. Each numbered step is one commit. "Touches" names the models
+a step can possibly affect, which is its per-commit gate; every stage ends with a full 11-model
+`snapshot_gguf.py` sweep before the next begins.
+
+**Two standing practicalities**, both learned the expensive way and recorded in BACKLOG.md P4.0.1: run
+the export tests with `TMPDIR=` *and* pytest's `--basetemp=` pointed under `/home/flavio/.claude/tmp/`
+(`TMPDIR` alone does not move `tmp_path`, and the real exports fill `/tmp`'s 28 GB partition); and take
+the pre-change snapshot baseline from a `git worktree` at the current commit rather than trusting the
+`.gguf` files in the tree, which are gitignored build outputs and routinely stale.
+
+### Stage 0 — record the plan (1 commit)
+
+**0.1** Add the P4.0.4–P4.0.8 rows to BACKLOG.md's P4.0 section and a pointer to this document beside the
+existing `EXPORT-ROADMAP.md` pointer. Docs only. *Touches: nothing.*
+
+### Stage A — P4.0.4: task vocabulary and generic recognition
+
+*First because it is the only stage that removes surface the others would have to preserve.*
+
+**A.1 — `tasks.py`: the canonical vocabulary.** Four names (`text-generation`,
+`automatic-speech-recognition`, `text-to-speech`, `audio-codec`), each with a docstring saying what
+export shape it covers and which base `LoomExportConfig` it builds. `TaskRegistry.register()` validates
+`entry.task` against the list, raising with the known names.
+
+*Design note this forces, and it is a real improvement:* merging `tts-multi-phase` +
+`tts-flow-matching` into one task will trip `register()`'s existing "two families disagree on
+config_class" guard, because `TTSFlowMatchingModelExportConfig` is a *subclass* of
+`BaseMultiPhaseModelExportConfig`, not the same class. Relax the check from identity to
+`issubclass(entry.config_class, task_base_config)` with the base declared in `tasks.py`. That is
+strictly better than what is there now: today the first family to register defines the task's class by
+accident of import order.
+
+Tests: unknown task name raises naming the vocabulary; a subclass registers cleanly; an unrelated class
+still raises. *Touches: nothing (no rename yet).*
+
+**A.2 — rename the four task strings.** `causal-lm` → `text-generation`; `nemo-asr-encoder` →
+`automatic-speech-recognition`; `tts-multi-phase` + `tts-flow-matching` → `text-to-speech`. No
+backwards-compatible aliases: the task name is a CLI argument, not a stored artifact, and carrying two
+spellings would re-create exactly the two-names-for-one-thing problem P4.0.3 removed.
+
+**First action of this step is a check, not an edit:** confirm the task string reaches no GGUF KV. If it
+does, this step's gate becomes a snapshot diff instead of a pytest run. *Touches: nothing if the check
+holds; all 11 if it does not.*
+
+**A.3 — recognizer specificity.** `ModelRecognizer` gains `fallback: bool = False`; `TaskRegistry.detect`
+prefers non-fallback matches and consults fallbacks only when no specific recognizer matched. Without
+this, A.4's generic recognizer would make every Qwen3 and LFM2 detection ambiguous.
+
+Tests: a specific match wins over a fallback; two specific matches still raise (LFM2's deliberate
+ambiguity is preserved); a fallback-only match resolves. *Touches: nothing.*
+
+**A.4 — the generic causal-LM recognizer.** Matches any HF directory whose `config.json` declares a
+`model_type` *and* an `architectures` entry ending in `ForCausalLM` — the architectures check is what
+keeps it from claiming every HF directory on disk, including the ASR and TTS ones. Registered as
+`fallback=True` under `text-generation`, building an `LMCausalModelExportConfig` with
+`architecture=None` (inferred in `load_model`), `tokenizer_pre=None` (auto-detected in the exporter) and
+`Flattened()`. A `_MODEL_TYPE_OVERRIDES` table carries the exceptions; `qwen3` and both `lfm2` entries
+stay as specific recognizers because LFM2's two decompositions genuinely cannot be inferred.
+
+Tests: synthetic HF fixtures — a Llama-shaped dir resolves to the fallback; a Qwen3 dir still resolves
+to `qwen3`; an LFM2 dir still raises the two-way ambiguity; a directory with `model_type` but no
+`ForCausalLM` architecture does not match.
+
+*Touches: Qwen3, LFM2 ×2 (byte-identical re-export required). If a non-Qwen3/LFM2 HF causal LM is
+available locally, export it end-to-end as the real acceptance test — the whole point of this step is a
+model that could not be exported before. If none is available, say so in the commit message rather than
+claiming coverage the synthetic fixtures do not give.*
+
+**A.5 — stage gate.** Full 11-model sweep; `loom-export` auto-detection re-run against every real
+checkpoint on this machine, resolving to the same recognizer as before the stage.
+
+### Stage B — P4.0.5: the spec protocol
+
+*Before the builder, because the builder's components are the first specs that would otherwise be
+written against nothing.*
+
+**B.1 — `spec_protocol.py`.** The eight `Link` kinds from §2, each with a `check(ctx)` and a message
+template lifted from the validator it generalizes. `LinkCheckContext` carries the topologies dict, the
+loaded model, the merged weights and the declared axes — all optional, because they become available at
+different times.
+
+**The one design detail that must not be skipped:** a link whose context is never populated must be
+*reported*, not silently skipped. The checker returns a deferred-links list and the export raises at the
+end if any remain unchecked. Otherwise "validated" quietly comes to mean "validated where convenient",
+which is the failure mode this whole protocol exists to prevent. *Touches: nothing.*
+
+**B.2 — retrofit `EstimatorSpec` / `FlowMatchingSpec`.** Smallest and already declarative; it is the
+shape the other three get compared against. *Touches: Matcha, Supertonic.*
+
+**B.3 — retrofit `EncoderOutput`.** The richest messages in the tree (they name the checkpoint's own
+`d_model` and the config field it came from), so this is the real test of §2's acceptance criterion.
+Tests assert on message *content*, not just that a `ValueError` was raised. *Touches: Conformer-CTC,
+Parakeet ×2.*
+
+**B.4 — retrofit `ModularExportSpec`.** `ModuleAttrPath` links replacing the incidental `AttributeError`.
+Note this upgrades the behaviour: today a wrong path raises whatever Python raises, at whatever point the
+traversal reaches it; a link check raises up front naming the path and the module type. Assert the new
+message, and keep the old failure mode's timing documented. *Touches: LFM2-modular.*
+
+**B.5 — retrofit `_validate_input_axes`.** `Axis` links on `ExportPhase.root_axis`/`declared_axes`. The
+existing checks in `LoomGGUFExporter` stay where they are (they operate on the traced program, not on a
+spec); what moves is the *declaration* side. Keep P4.0.2's two raises and their messages intact.
+*Touches: Kokoro, Conformer-CTC, Parakeet ×2 (the non-default-axis models).*
+
+**B.6 — enforce the standing rule.** A test that walks every registered spec class and fails on any
+field that is neither link-declared nor explicitly marked unchecked. This is what makes it a protocol
+instead of a convention, and it is cheap now and expensive after four more families. *Touches: nothing.*
+
+**B.7 — stage gate.** Full 11-model sweep (no emission path touched, so byte-identical throughout) plus
+the message-content assertions from B.2–B.5.
+
+### Stage C — P4.0.6: `DriverBuilder` + `DriverComponent`
+
+**C.1 — `driver_builder.py`.** `DriverContext`, the `DriverComponent` protocol (`links()` + `emit(ctx)`),
+and `DriverBuilder.build()` = check links → emit → `driver_ir.validate()` → `check_subgraph_calls()` →
+`LuaCodegen`. Plus, per decision 2, a `Decomposition.driver_builder(config)` hook so the builder is
+selected by the decomposition. *Touches: nothing.*
+
+**C.2 — retrofit the two synthesized paths.** `apply_monolithic_export` → a `PrefillArgmaxBuilder`;
+`apply_modular_export` → a `ModularChainBuilder`. Deliberately first: these already build `IRFunction`s,
+so the API is proven against working code before the harder migration, and the gate is unambiguous.
+*Touches: Qwen3, LFM2 ×2, Conformer-CTC, Parakeet ×2 — byte-identical driver text required.*
+
+**C.3 — route `MultiPhase` through the builder with one `RawBlock`.** The existing `.lua` (post
+`render_driver`) becomes a single raw block inside a built `IRFunction`. No semantic change; the five TTS
+drivers gain `check_subgraph_calls()` for the first time.
+
+*Expect this step to find real bugs*, and treat that as success rather than a blocker: five hand-written
+drivers have never had their `run_subgraph` calls cross-checked against their topologies' declared
+inputs. `LuaCodegen` must emit raw-block text verbatim, with no reindentation, or the gate fails for a
+cosmetic reason. *Touches: Kokoro, VITS, Matcha, Supertonic, StyleTTS2 — byte-identical driver text
+required.*
+
+**C.4–C.8 — peel one family per commit**, in order: Matcha (smallest with a real generated sampler) →
+Supertonic (same shape; proves reuse rather than re-derivation) → VITS → Kokoro → StyleTTS2 (ADPM2,
+hardest, and the one most likely to stay partly raw).
+
+**The gate changes here and the plan should not pretend otherwise.** Once a block is emitted from IR
+instead of pasted, the driver text will differ — comment placement, spacing, local naming. Byte-identity
+is achievable for C.3 and not for C.4–C.8. The gate for each peeling commit is therefore: (a) the model's
+existing MIL Lua-driver e2e test passes unchanged — all five have one (`test_e2e_{matcha,supertonic,
+vits,kokoro,styletts2}_mil_lua_driver.cpp`); (b) the driver-text diff is read and attached to the commit
+message; (c) every topology, weight and non-driver KV is byte-identical. That is the same discipline
+`compare_snapshots.py` applies to shape attributes, applied by hand because there is no equivalence
+checker for Lua.
+
+**C.9 — stage gate.** Full 11-model sweep; all five TTS e2e Lua-driver tests plus the six synthesized
+models' numeric reference tests.
+
+### Stage D — P4.0.7: the component registry
+
+**D.1 — `driver_components/`**: name → component registry, and the six existing components moved onto
+the one calling convention. No new capability. *Touches: all 11 — byte-identical driver text required,
+since this is a pure re-homing.*
+
+**D.2 — `recurrent.py`'s LSTM/GRU stepping loop becomes a registered component.** It is the one
+inventory item that is ad hoc today rather than merely differently-shaped. *Touches: Kokoro, StyleTTS2.*
+
+**D.3 — the catalogue.** One documented table: per component, its links, what it emits, and which models
+use it. This is the artifact that makes P4.1/P4.3 able to reuse rather than restate, and it is the
+deliverable of this stage more than the code is. *Touches: nothing.*
+
+**D.4 — stage gate.** Full 11-model sweep.
+
+### Stage E — P4.0.8: legacy retirement (trails; nothing in P4 depends on it)
+
+**E.1 — write the bridge criterion.** Per decision 1: `lua_bridge.h` gains the rule that a binding must
+be a generic host-side tensor op rather than model adaptation, with `expand_by_duration` and
+`pad_crop_relative_embeddings` labelled against it. Docs only. *Touches: nothing.*
+
+**E.2 — split `include/loom/loom.h`** into the lean runtime surface and a `loom_legacy.h`; tests that use
+the legacy drivers include it explicitly. Pure include hygiene, and it is what makes the remaining
+dependencies visible instead of transitive. *Touches: nothing (C++ only, no export path).*
+
+**E.3 — retire one driver per commit**, each following R6's rule: give the model's Lua test a
+self-contained reference fixture first, *then* delete the C++ driver, its oracle test and its
+`loom_legacy.h` entry.
+
+**Order and one blocker:** VITS, Matcha, Supertonic, Kokoro, StyleTTS2 are all retirable now. **Whisper
+is not** — `whisper_driver.cpp` has no MIL export to replace it; it is blocked on P4.1 and must be
+stated as such rather than attempted here.
+
+**E.4 — stage gate.** Full `ctest` green with five drivers deleted, and **record the engine binary size
+before and after in the commit message.** Leanness is the stated goal of the architecture; measuring it
+is how the goal stops being a slogan.
+
+### Sequencing rationale, in one line each
+
+* **Stage 0 before everything** — so the backlog reflects the plan while it is being worked, not after.
+* **A before B** — B's protocol would otherwise have to preserve four task names that are about to
+  change, and A.1's `tasks.py` is where a task's base config class gets declared, which B's link checks
+  read.
+* **B before C** — C's components are the first specs written from scratch; writing them before the
+  protocol exists means retrofitting them immediately afterwards.
+* **C.2 before C.3** — prove the builder API on code that already builds IR before migrating code that
+  does not.
+* **C.3 before C.4–C.8** — one mechanical, byte-identical step establishes the route; the semantic work
+  is then per-family and independently revertable.
+* **D after C** — a registry of components that do not yet share a calling convention is a directory,
+  not a shelf.
+* **E last** — it is test work and bookkeeping, it blocks nothing, and one of its six targets is blocked
+  on P4.1 anyway.
