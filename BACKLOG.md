@@ -728,13 +728,25 @@ nothing.
   exactly two lines, both intended — LFM2's ambiguity now reported under `text-generation/` instead of
   `causal-lm/`, and SmolLM2-360M going from "no match" to `hf-causal-lm`. 212 pytest green (24 new).
 
-  **Acceptance — a model that could not be exported before.** SmolLM2-360M-Instruct (`model_type: llama`,
-  `LlamaForCausalLM`) exported end to end through `loom-export` with no recognizer of its own: 1.4G GGUF,
-  299 tensors, one `main_topo` with all three inputs on a dynamic `n_tokens`, the expected prefill+argmax
-  driver. Both inferences landed — `loom.architecture = 'llama'` from `model_type`, and
-  `tokenizer.ggml.pre = 'starcoder'` from the tokenizer's own hash, a pre-type neither Qwen3 nor LFM2
-  uses and which a hardcoded default would have gotten wrong. *Not claimed:* no numeric validation
-  against an HF forward pass — that needs a reference fixture this model does not have.
+  **Acceptance — two models that could not be exported before, both of which run.** SmolLM2-360M-Instruct
+  and Llama-3.2-1B (`model_type: llama`, `LlamaForCausalLM`) each exported end to end through
+  `loom-export` with no recognizer, no config and no flags, then **generated correct text through
+  `loom_cli`** on the same prompt:
+
+  | model | `tokenizer.ggml.pre` | `"The capital of France is"` → |
+  |---|---|---|
+  | SmolLM2-360M-Instruct | `starcoder` | `" Paris.\n\nParis is the capital"` |
+  | Llama-3.2-1B | `llama3` | `" Paris. The capital of Germany is Berlin"` |
+
+  Every inference the generic path makes landed: `loom.architecture` from `model_type`, and the
+  pretokenizer from the tokenizer's own hash — **two different pre-types, neither of them the `qwen2`
+  default**, which is what a hardcoded value would have gotten wrong. That the sampled text is right is
+  a real end-to-end check of the whole chain (inferred architecture → traced topology → synthesized
+  driver → engine → detokenization), not just of the export completing.
+
+  *Still not claimed:* no numeric comparison against an HF forward pass at the logit level — that needs a
+  reference fixture neither model has, and correct greedy text is weaker evidence than the ~0.003 max
+  abs logit agreement the flagship models are held to.
 
   **One methodology note worth keeping, cost ~25 minutes here:** the first run of the 11-model sweep was
   vacuous. `loom-export` sets `PYTHONPATH` and runs `python3 -m tools.loom_mil_compiler.main_export`, but
