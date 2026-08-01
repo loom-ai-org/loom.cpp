@@ -409,6 +409,9 @@ class ConfigDerived(Link):
     * `{claimed}` / `{actual}` -- the two compared values
     * `{detail}` -- whatever `detail(spec, ctx)` returns, for context neither of those carries (the
       offending tensor's full shape, say)
+    * `{model_type}` -- `type(ctx.model).__name__`, which every message of this shape wants: the point
+      of a config-derived check is that the checkpoint is not what the spec claimed, and naming the
+      class that was actually loaded is how a reader sees that at a glance
     * `{label}` -- `site.label`
     """
 
@@ -432,6 +435,7 @@ class ConfigDerived(Link):
         detail = self.detail(spec, ctx) if self.detail is not None else None
         raise LinkError(self.message.format(
             spec=spec, claimed=claimed, actual=actual, detail=detail, label=site.label,
+            model_type=type(ctx.model).__name__ if ctx.model is not None else None,
         ))
 
     def describe(self):
@@ -575,23 +579,70 @@ class CoveredBy:
     by: str
 
 
+@dataclass(frozen=True)
+class NestedSpec:
+    """"This field holds another spec, which declares and runs its own links."
+
+    The fourth declaration kind, alongside a real `Link`, `Unchecked` and `CoveredBy`, and like
+    `CoveredBy` it emits no check of its own. Configs hold specs -- `ASRNemoEncoderExportConfig.output`
+    is an `EncoderOutput`
+    with three `ConfigDerived` links of its own, `Modular.spec` is a `ModularExportSpec` -- and the
+    standing rule has to say something about those fields. `Unchecked` would be false and a link would
+    be a duplicate.
+
+    **Deliberately not auto-recursing.** The checker does not walk into a nested spec, because the
+    nested spec's links are frequently checkable only at a site the outer checker cannot reach:
+    `EncoderOutput`'s three need the traced forward's real return value, which exists for exactly one
+    instant inside the wrapper's `forward` during tracing and nowhere else (running them out of band
+    would consume RNG a traced constant could depend on). `where` records that site in prose, so a
+    reader of the declaration can find the check rather than assuming it happens here.
+    """
+
+    where: str
+
+
+# Entries that satisfy the standing rule without emitting a check of their own.
+_DECLARATION_ONLY = (CoveredBy, NestedSpec)
+
+
+def _entries(value) -> list:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _merged(spec_class, attr: str) -> dict:
+    """`attr` merged along the MRO, base-first, so a subclass adds to its base's declarations rather
+    than shadowing them.
+
+    Load-bearing rather than a nicety: `architecture`, `output_path` and `decomposition` are
+    `LoomExportConfig`'s fields and belong to every family. Plain attribute lookup would find only the
+    subclass's dict, so each of the five family configs would have to restate all three -- and the
+    standing rule would be enforcing copy-paste."""
+    merged = {}
+    for klass in reversed(getattr(spec_class, "__mro__", [spec_class])):
+        merged.update(getattr(klass, attr, {}) or {})
+    return merged
+
+
+def declared_raw(spec_class) -> dict:
+    """Every `__links__` entry for `spec_class`, declarations included, merged along the MRO."""
+    return _merged(spec_class, "__links__")
+
+
 def declared_links(spec) -> dict:
     """`{field or check name: [Link]}` for `spec`'s class, with single links normalized to lists.
 
-    `CoveredBy` entries are declarations, not checks, so they are filtered out here and only read by
-    `undeclared_fields`."""
-    raw = getattr(type(spec), "__links__", {}) or {}
+    `CoveredBy`/`NestedSpec` entries are declarations, not checks, so they are filtered out here and
+    only read by `undeclared_fields`."""
     out = {}
-    for name, value in raw.items():
-        links = [v for v in (value if isinstance(value, (list, tuple)) else [value])
-                 if not isinstance(v, CoveredBy)]
+    for name, value in declared_raw(type(spec)).items():
+        links = [v for v in _entries(value) if not isinstance(v, _DECLARATION_ONLY)]
         if links:
             out[name] = links
     return out
 
 
 def declared_unchecked(spec_class) -> dict:
-    return dict(getattr(spec_class, "__unchecked__", {}) or {})
+    return _merged(spec_class, "__unchecked__")
 
 
 def undeclared_fields(spec_class) -> list:
@@ -603,7 +654,7 @@ def undeclared_fields(spec_class) -> list:
     """
     if not is_dataclass(spec_class):
         return []
-    links = getattr(spec_class, "__links__", {}) or {}
+    links = declared_raw(spec_class)
     unchecked = declared_unchecked(spec_class)
     return [f.name for f in fields(spec_class) if f.name not in links and f.name not in unchecked]
 
@@ -612,13 +663,12 @@ def dangling_coverage(spec_class) -> list:
     """`CoveredBy` entries whose named field is not itself link-declared -- i.e. a claim that some other
     link does the checking, where no such link exists. Rename-proofing: without this, deleting the link
     a field defers to silently converts `CoveredBy` into an exemption."""
-    raw = getattr(spec_class, "__links__", {}) or {}
+    raw = declared_raw(spec_class)
     real = {name for name, value in raw.items()
-            if any(not isinstance(v, CoveredBy)
-                   for v in (value if isinstance(value, (list, tuple)) else [value]))}
+            if any(not isinstance(v, _DECLARATION_ONLY) for v in _entries(value))}
     dangling = []
     for name, value in raw.items():
-        for entry in (value if isinstance(value, (list, tuple)) else [value]):
+        for entry in _entries(value):
             if isinstance(entry, CoveredBy) and entry.by not in real:
                 dangling.append(f"{name} -> {entry.by}")
     return dangling

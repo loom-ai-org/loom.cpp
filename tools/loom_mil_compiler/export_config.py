@@ -18,6 +18,7 @@ decomposition (only causal-LM) versus a structural one (everyone else).
 from dataclasses import dataclass
 
 from .decomposition import Decomposition
+from .spec_protocol import NestedSpec, Unchecked
 
 
 @dataclass(kw_only=True)
@@ -33,6 +34,28 @@ class LoomExportConfig:
     # merged phases. A family with only one possible answer defaults it; only the causal-LM family
     # currently accepts either (LFM2 exports both ways -- a caller decision, not a checkpoint property).
     decomposition: Decomposition
+
+    # The three fields every family inherits, declared once here rather than restated by each of the
+    # five (P4.0.5's standing rule; `spec_protocol.declared_raw` merges these along the MRO, which is
+    # what makes declaring them once possible at all).
+    __links__ = {
+        "decomposition": NestedSpec(
+            where="Decomposition.export(), which checks the decomposition's own specs -- Modular "
+                  "carries a ModularExportSpec whose ModuleAttrPath links are checked against the "
+                  "loaded model there, MultiPhase checks each ExportPhase's axes"
+        ),
+    }
+    __unchecked__ = {
+        "architecture": Unchecked(
+            "the GGUF `general.architecture` string. Free-form by design -- it names the family to a "
+            "GGUF reader, and the causal-LM family infers it from the checkpoint's own model_type, so "
+            "there is no independent authority to check it against."
+        ),
+        "output_path": Unchecked(
+            "where to write. Nothing real to check it against: the file does not exist yet, and "
+            "whether its directory is writable is the filesystem's error to raise, not a spec claim."
+        ),
+    }
 
     def export(self) -> str:
         """Runs the whole export -- load, trace, compile, write GGUF -- and returns `output_path`."""
