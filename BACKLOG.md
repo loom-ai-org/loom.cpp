@@ -541,9 +541,10 @@ of this file that does not exist (the hierarchy is described in P3.1's entry ins
 
 #### P4.0 — settle these before the first from-scratch family config
 
-Eight items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
+Nine items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
 (P4.0.1–P4.0.3, all DONE), five added by [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md)
-(P4.0.4–P4.0.8). None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
+(P4.0.4–P4.0.8), and one added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
+remaining registry steps at the author's direction). None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
 add three more configs written against whatever shape exists at the time. Same gate as everything else:
 byte-identical re-export of all 11 models (`snapshot_gguf.py`), since none of these is meant to change
 any output — with one stated exception, P4.0.6's per-family peeling commits, where driver text
@@ -1049,6 +1050,22 @@ nothing.
   **Gate:** full `ctest` green with five drivers deleted, and the engine binary size recorded before and
   after — leanness is the stated goal of the architecture, and measuring it is how the goal stops being
   a slogan. *Trails the others; nothing in P4 depends on it.*
+- **P4.0.9 — KV cache on the MIL path.** Specified in [`KV-CACHE.md`](KV-CACHE.md); the one item here
+  that adds a *capability* rather than hardening one, which is why its gate differs. `EXPORT-PREPARATION
+  .md` §4 filed this for P4/P5 and correctly named `FuseLoomAttention` as the blocker — its
+  `_fuse_blocks` body is `pass` (`dialect.py:268`), so `loom_fused_attention → ATTENTION`
+  (`exporter.py:125`) is registered and never produced, and a MIL-exported Qwen3 has **28 `SOFTMAX` and
+  zero `ATTENTION` nodes**. One measured correction shrinks the work: **`use_past` tracing is not
+  needed** — once the SDPA subgraph is an `ATTENTION` node the engine supplies the past itself, so a
+  decode step is a call at `n_tokens=1`, not a second traced graph. Four stages: rename every driver
+  entry point to `infer` and `main_topo` to `main_topology` (N); declare cache geometry as
+  `loom.kv_cache.*` KVs so a host stops needing a per-model C++ struct — `test_e2e_whisper_lua_driver
+  .cpp:141` still hardcodes `WhisperConfig` (1); the fusion pass, opt-in so the five TTS families are
+  untouched (2); `infer_with_past`, a prefill→decode loop owning its own generation, plus the one input
+  that genuinely must be retyped, `attention_mask` → `["n_kv", "n_tokens"]` (3).
+  **Gate:** byte-identity for the seven non-causal-LM models; for the four causal ones the topology
+  changes by construction, so the gate is their numeric reference tests plus `infer_with_past` agreeing
+  token-for-token with iterated `infer`.
 
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
