@@ -712,11 +712,25 @@ class TestPeeledStyleTTS2(unittest.TestCase):
         specs = self._config().estimators()
         self.assertEqual([s.topology for s in specs], ["diffusion"])
 
-    def test_the_adpm2_helpers_stay_hand_written_in_the_header(self):
+    def test_the_adpm2_helpers_stay_hand_written_lua(self):
         """Two network evaluations per step, Karras preconditioning, per-step noise injection. No
-        template emits that without becoming a worse thing to read than the loop."""
-        header = next(c for c in self._config().driver_components()
-                      if isinstance(c, LuaFragment) and c.top_level)
-        text = "\n".join(header.lines)
-        for helper in ("karras_schedule", "adpm2_step", "adpm2_sample"):
-            self.assertIn(f"local function {helper}", text)
+        template emits that without becoming a worse thing to read than the loop.
+
+        They live in `loom_lua` rather than in this family's header -- not because they are shared (only
+        StyleTTS2 calls them) but because the library is where hand-written Lua functions live at all.
+        Being there is what makes "only StyleTTS2 ships them" a checked property instead of a
+        side effect of which file they happened to be pasted into."""
+        from loom_mil_compiler.lua_library import LuaLibrary, resolve
+
+        library = next(c for c in self._config().driver_components() if isinstance(c, LuaLibrary))
+        emitted = {fn.name for fn in resolve(library.uses)}
+        self.assertEqual(emitted & {"karras_schedule", "adpm2_step", "adpm2_sample"},
+                         {"karras_schedule", "adpm2_step", "adpm2_sample"})
+
+    def test_no_other_family_ships_the_adpm2_sampler(self):
+        from loom_mil_compiler.lua_library import LuaLibrary, resolve
+        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+
+        matcha = TTSMatchaExportConfig(model_dir="/u", output_path="/u", architecture="matcha")
+        library = next(c for c in matcha.driver_components() if isinstance(c, LuaLibrary))
+        self.assertEqual({fn.name for fn in resolve(library.uses)} & {"adpm2_step"}, set())

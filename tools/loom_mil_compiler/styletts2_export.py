@@ -316,6 +316,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         evaluations per step, Karras preconditioning, per-step noise injection. No template emits that
         without becoming a worse thing to read than the loop."""
         from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .lua_library import LuaLibrary
         from .driver_ir import Call, FieldAccess, Lit, Var
 
         fragment = self.driver_script_path
@@ -327,6 +328,16 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
 
         return [
             block("00_header.lua", top_level=True),
+            # The shared driver-side library. Every one of these was a byte-identical copy
+            # in this family and the other one until they moved to lua/ -- 11 functions,
+            # 112 lines, shipped twice. Only what is declared here is emitted.
+            LuaLibrary(uses=(
+                "array_slice", "array_sum",
+                "to_row_major", "from_row_major", "to_layout_a",
+                "from_layout_a", "bilstm_run", "run_resblk_stack",
+                "run_proj1x1", "predict_durations", "compute_wsum",
+                "karras_schedule", "adpm2_sample",
+            )),
             block("01_lengths.lua",
                   defines=("T_text", "style_dim", "d_model", "hidden_per_dir")),
             SubgraphCallComponent(

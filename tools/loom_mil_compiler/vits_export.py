@@ -323,6 +323,7 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         pre-scaled noise draw: genuine host control flow over a data-dependent frame count, which is
         what BACKEND.md's conclusion says stays host-side rather than becoming a traced graph."""
         from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .lua_library import LuaLibrary
         from .driver_ir import FieldAccess, Var
 
         fragment = self.driver_script_path
@@ -330,6 +331,7 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         token_ids = FieldAccess("inputs", "token_ids")
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
+            LuaLibrary(uses=("array_affine", "durations_from_logw", "array_sum")),
             LuaFragment(fragment / "01_lengths.lua", defines=("T",)),
             SubgraphCallComponent(
                 topology="stats", outputs=("stats",), inputs={"tokens": token_ids}, length=seq_len,
