@@ -308,7 +308,51 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
     """
 
     checkpoint_path: str
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_piper_vits" / "vits_driver_mil.lua"
+    # A DIRECTORY of `.lua` fragments -- VITS is peeled (P4.0.6/C.6). See `driver_components`.
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_piper_vits" / "vits_driver"
+
+    def driver_components(self) -> List:
+        """VITS's driver, as components (P4.0.6/C.6).
+
+        The first peeled family with **no sampler at all** -- VITS's stochastic duration predictor is
+        traced into the `logw` topology itself, and the only host-side randomness is two
+        `loom.gaussian_array` draws. So this is three `SubgraphCallComponent`s and four `LuaFragment`s,
+        and it needed no component the two flow-matching families had not already introduced.
+
+        The three surviving Lua blocks are the generate_path frame expansion in its two halves plus the
+        pre-scaled noise draw: genuine host control flow over a data-dependent frame count, which is
+        what BACKEND.md's conclusion says stays host-side rather than becoming a traced graph."""
+        from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .driver_ir import FieldAccess, Var
+
+        fragment = self.driver_script_path
+        seq_len, y_length = Var("T"), Var("y_length")
+        token_ids = FieldAccess("inputs", "token_ids")
+        return [
+            LuaFragment(fragment / "00_header.lua", top_level=True),
+            LuaFragment(fragment / "01_lengths.lua", defines=("T",)),
+            SubgraphCallComponent(
+                topology="stats", outputs=("stats",), inputs={"tokens": token_ids}, length=seq_len,
+                note="--- Phase 1a: stats = TextEncoder -> [m_p;logs_p], T-fast: stats[c*T+t]\n"
+                     "    (0-based c/t). ---"),
+            LuaFragment(fragment / "02_z_noise.lua", reads=("T",), defines=("z_noise",)),
+            SubgraphCallComponent(
+                topology="logw", outputs=("logw",), length=seq_len,
+                inputs={"tokens": token_ids, "z_noise": Var("z_noise")},
+                note="--- Phase 1b: logw = TextEncoder + StochasticDurationPredictor(reverse) -> [T]\n"
+                     "    duration logits. z_noise is host-sampled and ALREADY scaled by\n"
+                     "    noise_scale_w (matching LogwWrapper's convention: the graph itself applies\n"
+                     "    no further noise_scale multiply). ---"),
+            LuaFragment(fragment / "03_durations.lua", reads=("logw", "T"),
+                        defines=("w_ceil", "y_length")),
+            LuaFragment(fragment / "04_expand_z_p.lua", reads=("stats", "w_ceil", "y_length", "T"),
+                        defines=("inter_channels", "z_p", "out_frame", "noise_idx", "gaussian_pool")),
+            SubgraphCallComponent(
+                topology="flow_vocoder", outputs=("waveform",), inputs={"z_p": Var("z_p")},
+                length=y_length,
+                note="--- Phase 2: coupling flow (reverse) + HiFi-GAN vocoder -> waveform ---"),
+            DriverReturn(values=("waveform",)),
+        ]
     dummy_t: int = 42
 
     __unchecked__ = {
