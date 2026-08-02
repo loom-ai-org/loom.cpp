@@ -371,7 +371,70 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
             "the directory holding matcha_ljspeech.ckpt and generator_v1. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
         ),
     }
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_matcha" / "matcha_driver_mil.lua"
+    # A DIRECTORY of `.lua` fragments rather than one file: Matcha is peeled (P4.0.6/C.4), so its
+    # driver is assembled from the components below and each surviving hand-written block is its own
+    # fragment. See `driver_components`.
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_matcha" / "matcha_driver"
+
+    def driver_components(self) -> List:
+        """Matcha's driver, as components (P4.0.6/C.4 -- the first family peeled).
+
+        Read top to bottom this is the whole orchestration: seed and measure, run the two encoder
+        halves, turn `logw` into integer durations, expand `mu` by them, integrate the CFM sampler,
+        denormalize, vocode. Four blocks stay hand-written Lua because they are elementwise loops over
+        flat arrays with no engine involvement at all, and there is nothing to gain by expressing them
+        as IR; the four `run_subgraph` calls and the sampler are IR, which is what makes them checkable.
+
+        What this buys over the adopted-whole form: every call is a real `SubgraphCall` (so
+        `check_subgraph_calls` sees its output arity, which a parsed call site cannot), and
+        `FlowMatchingSpec.func_name` is finally a checkable `DriverSymbol` rather than a name matched
+        by a marker -- the gap that spec's own `Unchecked` note predicted P4.0.6 would close.
+        """
+        from .driver_components import (
+            DriverReturn, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
+        )
+        from .driver_ir import BinOp, FieldAccess, Var
+
+        fragment = self.driver_script_path
+        t_text, t_mel, n_feats = Var("t_text"), Var("t_mel"), Var("n_feats")
+        tokens = FieldAccess("inputs", "tokens")
+        sampler, = self.samplers()
+        return [
+            LuaFragment(fragment / "00_header.lua", top_level=True),
+            LuaFragment(fragment / "01_lengths.lua", defines=("n_feats", "t_text")),
+            SubgraphCallComponent(
+                topology="encoder_mu", outputs=("mu_x",), inputs={"tokens": tokens}, length=t_text,
+                note="--- TextEncoder: mu_x, T-fast (ne=[T_text,n_feats], flat[c*t_text+t]) ---"),
+            SubgraphCallComponent(
+                topology="encoder_logw", outputs=("logw",), inputs={"tokens": tokens}, length=t_text,
+                note="--- TextEncoder: logw (per-token log duration; channel count 1 makes T-fast and\n"
+                     "    C-fast layouts coincide, flat index = t directly) ---"),
+            LuaFragment(fragment / "02_durations.lua", reads=("logw", "t_text"),
+                        defines=("durations", "t_mel")),
+            LuaFragment(fragment / "03_expand_mu.lua",
+                        reads=("mu_x", "durations", "n_feats", "t_text", "t_mel"),
+                        defines=("mu_y",)),
+            # Sits at its CALL site, not at the top: a component's `prelude` is collected separately
+            # from its statements, so the generated sampler function still lands above the entry
+            # function while the one line calling it stays in sequence. Placing this component early
+            # to "match" where its function appears is exactly the ordering `driver_ir.validate`
+            # rejects -- it read `t_mel` before `02_durations.lua` binds it.
+            FlowMatchingSampler(
+                spec=sampler, result="z", length=t_mel,
+                n_elems=BinOp("*", t_mel, n_feats), n_steps=FieldAccess("inputs", "n_steps"),
+                step_inputs={"mu": Var("mu_y")},
+                note="--- Deterministic Euler CFM sampling over the Decoder U-Net estimator -- see\n"
+                     "    sample_decoder above. z0 is fresh Gaussian noise with no inherent structure,\n"
+                     "    so loom.gaussian_array's sequential flat fill is usable directly as the\n"
+                     "    Decoder's T-fast `z` input with no reindexing needed. ---",
+            ),
+            LuaFragment(fragment / "04_denormalize.lua", reads=("z",), defines=("mel",)),
+            SubgraphCallComponent(
+                topology="vocoder", outputs=("waveform",), inputs={"mel": Var("mel")}, length=t_mel,
+                note="--- HiFi-GAN v1 vocoder: mel (T-fast, matching its own native torch\n"
+                     "    (1,n_feats,T) layout) -> waveform ---"),
+            DriverReturn(values=("waveform",)),
+        ]
 
     def phases(self) -> List[ExportPhase]:
         matcha_ckpt_path = str(Path(self.model_dir) / "matcha_ljspeech.ckpt")

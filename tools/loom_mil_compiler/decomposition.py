@@ -208,6 +208,13 @@ class MultiPhase(Decomposition):
         """
         from .driver_components import MultiPhaseDriverBuilder, RawLuaDriver
 
+        peeled = config.driver_components()
+        if peeled is not None:
+            # A peeled family (C.4-C.8) builds its driver from components and never reads the whole
+            # `.lua`, so `source` -- and with it `render_driver`'s marker substitution -- is unused:
+            # its sampler is a `FlowMatchingSampler` component that emits both the function and the
+            # line calling it.
+            return MultiPhaseDriverBuilder(peeled=peeled)
         return MultiPhaseDriverBuilder(driver=RawLuaDriver(
             source=context["source"], origin=config.driver_script_path.name,
             external=config.external_topologies(),
@@ -258,7 +265,11 @@ class MultiPhase(Decomposition):
         out_exporter.topologies = phase_topologies
         out_exporter.weights = merge_phase_weights(named_weights)
 
-        driver_source = render_driver(
+        peeled = config.driver_components()
+        # `render_driver`'s marker substitution is the unpeeled path only: a peeled family's sampler is
+        # a `FlowMatchingSampler` component that emits both the generated function and the line calling
+        # it, and its specs are checked through the builder like every other component's.
+        driver_source = None if peeled is not None else render_driver(
             config.driver_script_path.read_text(), config.samplers(),
             topologies=out_exporter.topologies, estimators=config.estimators(),
             checker=checker,

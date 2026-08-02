@@ -394,6 +394,9 @@ _NOT_SPECS = {
     "driver_builder.DriverScript": "a build RESULT (the emitted prelude chunks and entry function), "
                                    "checked by driver_ir.validate/check_subgraph_calls at the moment "
                                    "DriverBuilder.build produces it rather than by a declaration",
+    "flow_matching_export._TextDriver": "a driver that is still text, standing in for a DriverScript "
+                                        "so DriverSymbol can read it. It is what links are checked "
+                                        "AGAINST, in the same category as DriverScript itself",
 }
 
 # Modules the scan is allowed to fail to import. Both are standalone scripts that re-run `dialect.py`'s

@@ -37,10 +37,11 @@ back as an uninitialised tensor rather than as an error.
 """
 import re
 from dataclasses import dataclass, field as dataclass_field
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .driver_ir import (
-    BinOp, Call, FieldAccess, If, Index, Lit, Local, RawBlock, Return, SubgraphCall, Var,
+    BinOp, Call, FieldAccess, If, Index, Lit, Local, RawBlock, Return, SubgraphCall, TableLit, Var,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import DriverBuilder, DriverComponent, DriverContext, DriverScript
@@ -634,27 +635,279 @@ def _split_lua_module(source: str, entry: str):
     raise ValueError(f"driver source's {header!r} is never closed by a column-0 'end'")
 
 
-@dataclass
-class MultiPhaseDriverBuilder(DriverBuilder):
-    """Every multi-phase (TTS) family's driver, for as long as it is still hand-written.
+# -- peeling a driver into components (C.4-C.8) ------------------------------------------------------
+#
+# `RawLuaDriver` adopts a driver whole; these are what its blocks become one at a time. The rule the
+# author set for where the peeled Lua goes is that it stays **Lua, in `.lua` files** -- a family's
+# driver becomes a directory of small fragments plus a component list that orders them and declares
+# what each one reads and defines. The alternative (Lua as Python string literals) puts the
+# hand-written half of every TTS model behind a quoting layer, and the point of the exercise is to make
+# these drivers easier to reason about, not harder to read.
 
-    Holds exactly one component today. That is not a placeholder for a missing design -- it is what a
-    family looks like at the moment it moves onto the builder, and C.4-C.8 add components beside the
-    raw one as they peel blocks out of it. The `entry_name` differs from every other builder's
-    (`synthesize`, not `main`) because these drivers are called by the TTS host, and that is a fact
-    about the family rather than about the decomposition.
+
+_NOTE_IS_COSMETIC = Unchecked(
+    "a comment emitted above this component's statement. Cosmetic to the engine and load-bearing to a "
+    "reader: the embedded driver_script is what someone inspecting a GGUF sees, and a peel that "
+    "dropped every explanatory comment from the hand-written driver would be a real loss even though "
+    "no test could fail for it"
+)
+
+
+def _note_block(note):
+    """A `note` as Lua comment lines, or nothing.
+
+    Led by a blank line, because a peeled driver is read in sections and every hand-written driver in
+    this tree separates them that way. A fragment that wants the same spacing carries it in its own
+    `.lua` file, where it is data rather than a rule this function would have to guess."""
+    if not note:
+        return []
+    return [RawBlock([""] + [f"-- {line}".rstrip() for line in note.strip().split("\n")])]
+
+
+@dataclass
+class LuaFragment(DriverComponent):
+    """One hand-written block of a peeled driver, kept as its own `.lua` file.
+
+    `reads`/`defines` are the declaration that makes a fragment composable: `driver_ir.validate` runs
+    over the assembled function, so a fragment placed before the component that binds what it reads
+    fails at export time rather than inside the engine. That is a check no hand-written driver has ever
+    had, and it is the one that actually matters while blocks are being moved around.
+
+    **What the declaration is and is not.** Both lists are checked for *presence* in the fragment's own
+    text, which catches the rot that actually happens -- renaming a local in the `.lua` and leaving the
+    declaration behind. Neither is derived from a Lua parse, so an *under*-declared `reads` is not
+    caught here: it makes `validate` blind to that one ordering, and the family's e2e test is what
+    covers it. Saying so is the point; a declaration that claimed more than it checks would be worse
+    than none.
     """
 
-    driver: RawLuaDriver
+    path: object  # Path
+    reads: Tuple[str, ...] = ()
+    defines: Tuple[str, ...] = ()
+    # Emit as top-level Lua before the entry function rather than as statements inside it. Every
+    # driver's header comment and its `local function` helpers are this.
+    top_level: bool = False
 
-    __links__ = {"driver": NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)}
+    __links__ = {
+        "defines": ConfigDerived(
+            claim=lambda spec, ctx: (),
+            measured=lambda spec, ctx: tuple(spec.names_missing_from_text(spec.defines)),
+            detail=lambda spec, ctx: list(spec.names_missing_from_text(spec.defines)),
+            message=(
+                "{label} declares that it defines {detail}, but its text never mentions those names. "
+                "A stale defines list makes driver_ir.validate accept an ordering the driver does not "
+                "actually support."
+            ),
+            needs=(),
+        ),
+        "reads": ConfigDerived(
+            claim=lambda spec, ctx: (),
+            measured=lambda spec, ctx: tuple(spec.names_missing_from_text(spec.reads)),
+            detail=lambda spec, ctx: list(spec.names_missing_from_text(spec.reads)),
+            message=(
+                "{label} declares that it reads {detail}, but its text never mentions those names. "
+                "A stale reads list makes driver_ir.validate reject orderings that are in fact fine, "
+                "and hides the ones that are not."
+            ),
+            needs=(),
+        ),
+    }
+    __unchecked__ = {
+        "path": Unchecked(
+            "the fragment file. `read_text()` reports a missing one with the path and the errno, "
+            "which is strictly better than a link saying it does not exist"
+        ),
+        "top_level": Unchecked(
+            "whether this fragment is a Lua statement or a top-level definition. Getting it wrong "
+            "produces Lua that does not load, which the family's e2e test catches immediately -- "
+            "there is no authority to check it against beyond the language itself"
+        ),
+    }
+
+    def __post_init__(self):
+        self.lines = Path(self.path).read_text().rstrip("\n").split("\n")
+
+    def link_label(self) -> str:
+        return f"LuaFragment({Path(self.path).name!r})"
+
+    def names_missing_from_text(self, names) -> list:
+        text = "\n".join(self.lines)
+        return [n for n in names if not re.search(rf"\b{re.escape(n)}\b", text)]
+
+    def prelude(self, ctx):
+        return list(self.lines) + [""] if self.top_level else []
+
+    def emit(self, ctx):
+        if self.top_level:
+            return []
+        return [RawBlock(list(self.lines), verbatim=True,
+                         reads_=list(self.reads), defines_=list(self.defines))]
+
+
+@dataclass
+class SubgraphCallComponent(DriverComponent):
+    """One `loom.run_subgraph` call, as IR rather than as text.
+
+    This is what a peel buys structurally: the call stops being a string that a regex can read and
+    becomes a `SubgraphCall` node, so `driver_ir.check_subgraph_calls` covers it directly and the
+    output arity is checked too -- neither of which a parsed `RunSubgraphCall` can do, since it cannot
+    see how many values the surrounding Lua binds.
+    """
+
+    topology: str
+    outputs: Tuple[str, ...]
+    # {input name -> the IR expression supplying it}.
+    inputs: dict
+    # {axis name -> IR expression}. Defaults to the topology's own root axis bound to `length`, plus
+    # `n_past = 0`, which is what every hand-written TTS call does.
+    length: object = None
+    extra_outputs: Tuple[str, ...] = ()
+    axes: Optional[dict] = None
+    note: Optional[str] = None
+
+    __links__ = {
+        "topology": TopologyName(),
+        "inputs": TopologyInput(FieldRef("topology"), exact=True),
+    }
+    __unchecked__ = {
+        "note": _NOTE_IS_COSMETIC,
+        "outputs": Unchecked("the locals this call binds; reads of them are checked by "
+                             "driver_ir.validate over the assembled function"),
+        "extra_outputs": Unchecked("same, for the shape locals -- and whether capturing them is legal "
+                                   "at all is check_subgraph_calls' question, answered against the "
+                                   "topology's real declared output count"),
+        "length": Unchecked("the driver_ir expression bound to this topology's root axis, over locals "
+                            "earlier components bind; validate() is its authority"),
+        "axes": Unchecked("an explicit axis table for the rare call that needs more than the root "
+                          "axis; the names in it are checked by ExportPhase's own Axis links, which "
+                          "run against the declaration that created them"),
+    }
+
+    def link_label(self) -> str:
+        return f"loom.run_subgraph({self.topology!r})"
+
+    def emit(self, ctx):
+        axes = self.axes
+        if axes is None:
+            axes = {ctx.root_axis(self.topology): self.length, "n_past": Lit(0)}
+        return _note_block(self.note) + [SubgraphCall(
+            outputs=list(self.outputs), extra_outputs=list(self.extra_outputs),
+            module=self.topology, axes=axes, inputs=dict(self.inputs),
+        )]
+
+
+@dataclass
+class FlowMatchingSampler(DriverComponent):
+    """A `FlowMatchingSpec`'s generated sampler function, plus the one line that calls it.
+
+    The spec and its codegen already existed (`flow_matching_export.py`); what this adds is that both
+    ends now go through the builder instead of a marker substitution into hand-written text. That
+    closes the gap `FlowMatchingSpec.func_name`'s own `Unchecked` note predicted: the call site is IR,
+    so the emitted function name is a real `DriverSymbol` rather than a string nobody could check.
+    """
+
+    spec: object  # FlowMatchingSpec
+    result: str
+    # The `(length, n_elems, n_steps)` arguments, as IR expressions, and the fixed-input table.
+    length: object
+    n_elems: object
+    n_steps: object
+    step_inputs: dict
+    note: Optional[str] = None
+
+    __links__ = {
+        "spec": NestedSpec(
+            where="DriverBuilder.build, via sub_specs() -- the spec's own TopologyName/"
+                  "TopologyOutputArity/TopologyInput links run against the export's real topologies"
+        ),
+    }
+    __unchecked__ = {
+        "note": _NOTE_IS_COSMETIC,
+        "result": Unchecked("the local this component binds; reads of it are checked by "
+                            "driver_ir.validate over the assembled function"),
+        "length": Unchecked("the n_tokens the estimator's graph is built at, as an IR expression over "
+                            "locals earlier components bind; validate() is its authority"),
+        "n_elems": Unchecked("same -- the element count of the loop-carried state"),
+        "n_steps": Unchecked("same -- the caller's step count, read off the inputs table"),
+        "step_inputs": Unchecked(
+            "the fixed inputs handed to every step, by name. The NAMES are checked, as part of the "
+            "spec's own TopologyInput link over its supplied_inputs -- what is unchecked is the "
+            "expression each maps to, which is a driver local like any other"
+        ),
+    }
+
+    def link_label(self) -> str:
+        return f"FlowMatchingSampler({self.spec.func_name!r})"
+
+    def sub_specs(self):
+        return [self.spec]
+
+    def prelude(self, ctx):
+        from .flow_matching_export import render_sampler
+
+        return render_sampler(self.spec).split("\n") + [""]
+
+    def emit(self, ctx):
+        return _note_block(self.note) + [Local(self.result, Call(self.spec.func_name, [
+            self.length, self.n_elems, self.n_steps, TableLit(dict(self.step_inputs)),
+        ]))]
+
+
+@dataclass
+class DriverReturn(DriverComponent):
+    """What the entry function hands back to the host."""
+
+    values: Tuple[str, ...]
+
+    __unchecked__ = {
+        "values": Unchecked("locals earlier components bind. driver_ir.validate is the authority that "
+                            "they exist; what the host does with them is the family's contract, and "
+                            "the family's e2e test is what checks it"),
+    }
+
+    def emit(self, ctx):
+        return [Return([Var(name) for name in self.values])]
+
+
+@dataclass
+class MultiPhaseDriverBuilder(DriverBuilder):
+    """Every multi-phase (TTS) family's driver.
+
+    Two shapes, and the second replaces the first one family at a time: `driver` holds a whole
+    hand-written `.lua` adopted unchanged (C.3), or `peeled` holds the component list a family has
+    been broken into (C.4-C.8). The `entry_name` differs from every other builder's (`synthesize`, not
+    `main`) because these drivers are called by the TTS host, which is a fact about the family rather
+    than about the decomposition.
+    """
+
+    driver: Optional[RawLuaDriver] = None
+    peeled: Optional[list] = None
+
+    __links__ = {
+        "driver": NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN),
+        "peeled": NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN),
+    }
 
     entry_name = "synthesize"
 
+    def __post_init__(self):
+        if (self.driver is None) == (self.peeled is None):
+            raise ValueError(
+                "MultiPhaseDriverBuilder takes exactly one of `driver` (a whole hand-written .lua, "
+                "adopted unchanged) or `peeled` (the component list a family has been broken into)"
+            )
+
     def components(self):
-        return [self.driver]
+        return [self.driver] if self.driver is not None else list(self.peeled)
 
     def build(self, ctx, checker=None):
-        self.driver.assert_round_trip()
-        print(self.driver.coverage())
-        return super().build(ctx, checker)
+        if self.driver is not None:
+            self.driver.assert_round_trip()
+            print(self.driver.coverage())
+            return super().build(ctx, checker)
+        script = super().build(ctx, checker)
+        # A peeled driver ends with a newline, the way every hand-written one in this tree does and
+        # every text file should. Not on `DriverScript.render` itself: the two synthesized paths do
+        # not end with one, and changing that would move six models' driver text for no reason.
+        script.postlude = list(script.postlude) + [""]
+        return script
