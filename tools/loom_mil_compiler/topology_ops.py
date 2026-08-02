@@ -554,6 +554,61 @@ def _op_loom_group_norm(self, op, ctx):
                   "attrs": {"shape": [-1] + x_shape[1:]}})
 
 
+@topology_rule('loom_fused_attention')
+def _op_loom_fused_attention(self, op, ctx):
+    # One ATTENTION node -- the engine's own composite SDPA primitive, and the ONLY node type that can
+    # reach a KV cache (KV-CACHE.md stage 2; see `passes.py`'s `fuse_loom_attention`, which produces
+    # this op, and src/ops/primitives_attention.cpp's `op_attention`, which executes it).
+    #
+    # The whole job here is layout. In MIL's forward axis order the traced q/k/v are
+    # [b, heads, seq, head_dim], which is ne=[head_dim, seq, heads, b] on this side -- but op_attention
+    # wants [n_embd_head, n_head, n_tokens], reading n_head_kv and the head widths straight off k/v's
+    # own ne. So each of q/k/v needs its ne1/ne2 swapped, composed as PERMUTE + CONT for exactly the
+    # reason `_op_matmul_x_y` gives: the C++ side never has to infer this from shapes alone, and
+    # op_attention's own internal ggml_permute assumes a contiguous input in that layout.
+    #
+    # The mask needs no transform at all: MIL [b, 1, seq, kv] is ne=[kv, seq, 1, 1], which already IS
+    # the `kq_mask` [n_kv, n_tokens] contract the bespoke converters declare by hand
+    # (convert_qwen3.py's own topology inputs).
+    nodes, resolve = ctx.nodes, ctx.resolve
+    out = self.safe_name(op.outputs[0].name)
+
+    def head_major(var_obj, label):
+        """ne=[head_dim, seq, heads, b] -> [head_dim, heads, seq, b]."""
+        name = resolve(self.safe_name(var_obj.name))
+        permuted = f"{out}_{label}_hm"
+        nodes.append({"op": "PERMUTE", "inputs": [name], "outputs": [permuted],
+                      "attrs": {"axes": [0, 2, 1, 3]}})
+        cont = f"{out}_{label}_hm_cont"
+        nodes.append({"op": "CONT", "inputs": [permuted], "outputs": [cont]})
+        return cont
+
+    q_in = head_major(op.inputs["q"], "q")
+    k_in = head_major(op.inputs["k"], "k")
+    v_in = head_major(op.inputs["v"], "v")
+
+    mask_obj = op.inputs.get("mask")
+    if mask_obj is None:
+        raise NotImplementedError(
+            f"loom_fused_attention op '{op.name}': ATTENTION always takes a kq_mask input, and this op "
+            "was built without one. A causal LM's mask is a declared graph input the driver fills in "
+            "via loom.causal_mask -- see driver_components.CAUSAL_MASK_INPUT_NAMES."
+        )
+    mask_in = resolve(self.safe_name(mask_obj.name))
+
+    scale = float(static_scalar(op.inputs.get("scale"), 1.0))
+    layer = int(static_scalar(op.inputs.get("layer"), 0))
+    nodes.append({
+        "op": "ATTENTION",
+        "inputs": [q_in, k_in, v_in, mask_in],
+        "outputs": [out],
+        # `kv_cache` is stated rather than left to op_attention's default-true, because this is the
+        # single place in the whole exporter that decides a model gets persistent state, and a reader
+        # should not have to know a C++ default to see that.
+        "attrs": {"layer": layer, "scale": scale, "kv_cache": True},
+    })
+
+
 @topology_rule('loom_broadcast_to')
 def _op_loom_broadcast_to(self, op, ctx):
     # 1:1 REPEAT -- the exact node the exporter's former ad hoc mutual-broadcast detection spliced in

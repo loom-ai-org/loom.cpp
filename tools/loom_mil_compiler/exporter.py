@@ -1171,7 +1171,10 @@ class LoomGGUFExporter:
             return
         is_bespoke = len(self.program.functions) > 1 and "main" in self.program.functions
         if not is_bespoke:
-            apply_loom_mil_passes(self.program)
+            # `fuse_attention` is opt-in per export (KV-CACHE.md decision 4): the SDPA pattern is
+            # generic, so running it unconditionally would give the non-autoregressive TTS families an
+            # ATTENTION node -- and a KV cache -- they must never have.
+            apply_loom_mil_passes(self.program, fuse_attention=bool(self.kwargs.get("fuse_attention")))
             self.facts.annotate_dynamic_shapes(self.program)
         self._mil_passes_applied = True
 
