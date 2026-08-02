@@ -174,7 +174,58 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             "the assets/pt directory holding all four .pt files. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
         ),
     }
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_supertonic" / "supertonic_driver_mil.lua"
+    # A DIRECTORY of `.lua` fragments -- Supertonic is peeled (P4.0.6/C.5). See `driver_components`.
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_supertonic" / "supertonic_driver"
+
+    def driver_components(self) -> List:
+        """Supertonic's driver, as components (P4.0.6/C.5).
+
+        Deliberately the second family peeled, and the point is that nothing new was written for it:
+        three `SubgraphCallComponent`s, one `FlowMatchingSampler`, two `LuaFragment`s, one
+        `DriverReturn` -- the same six classes Matcha uses, differing only in data. That is the reuse
+        claim of P4.0.7's "marketplace" tested rather than asserted, and it is why the plan orders
+        Supertonic straight after Matcha instead of after the harder families.
+
+        The one Lua block that survives is the real reason it survives: `get_latent_mask` turns a
+        predicted duration in seconds into a latent frame count, which is arithmetic on scalars the
+        engine never sees."""
+        from .driver_components import (
+            DriverReturn, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
+        )
+        from .driver_ir import BinOp, FieldAccess, Var
+
+        fragment = self.driver_script_path
+        t_text, t_lat, lat_dim = Var("t_text"), Var("t_lat"), Var("lat_dim")
+        txt_ids = FieldAccess("inputs", "txt_ids")
+        sampler, = self.samplers()
+        return [
+            LuaFragment(fragment / "00_header.lua", top_level=True),
+            LuaFragment(fragment / "01_lengths.lua", defines=("t_text", "lat_dim")),
+            SubgraphCallComponent(
+                topology="dp", outputs=("dur_arr",), length=t_text,
+                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_dp")},
+                note="--- DurationPredictor: DPTextEncoder + MLP head -> scalar duration (seconds) ---"),
+            LuaFragment(fragment / "02_latent_length.lua", reads=("dur_arr",),
+                        defines=("duration", "wav_length", "latent_size", "t_lat")),
+            SubgraphCallComponent(
+                topology="ttl_text", outputs=("txt_emb",), length=t_text,
+                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_ttl")},
+                note="--- TTLTextEncoder -> txt_emb, ne=[t_text,txt_dim] (T-fast, the traced module's\n"
+                     "    own native torch layout -- no host-side layout crossing needed, unlike the\n"
+                     "    bespoke driver's Layout A/B bridging, since \"vfe\" was traced expecting\n"
+                     "    exactly this same layout for its own txt_emb input). ---"),
+            FlowMatchingSampler(
+                spec=sampler, result="z", length=t_lat,
+                n_elems=BinOp("*", t_lat, lat_dim), n_steps=FieldAccess("inputs", "n_steps"),
+                step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": FieldAccess("inputs", "style_ttl")},
+                note="--- Deterministic Euler CFM sampling over VectorFieldEstimator -- see\n"
+                     "    sample_vfe above. ---"),
+            SubgraphCallComponent(
+                topology="decoder", outputs=("waveform",), length=t_lat,
+                inputs={"latent": Var("z")},
+                note="--- SpeechDecoder: z (ne=[t_lat,lat_dim]) -> raw waveform ---"),
+            DriverReturn(values=("waveform",)),
+        ]
 
     def phases(self) -> List[ExportPhase]:
         pt_dir = Path(self.model_dir)
