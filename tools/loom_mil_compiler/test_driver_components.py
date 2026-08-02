@@ -322,11 +322,11 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
 
     def test_the_five_real_drivers_all_round_trip(self):
         """Not a fixture: the actual shipped `.lua` files, which is the only thing C.3's byte-identity
-        gate is a claim about. Three, not five: C.4 peeled Matcha and C.5 Supertonic. The count is
-        asserted so that peeling a family without updating this test is noticed rather than silently
-        reducing the coverage of the claim."""
+        gate is a claim about. Two, not five: C.4-C.6 peeled Matcha, Supertonic and VITS. The count
+        is asserted so that peeling a family without updating this test is noticed rather than
+        silently reducing the coverage of the claim."""
         drivers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
-        self.assertEqual(len(drivers), 3, [d.name for d in drivers])
+        self.assertEqual(len(drivers), 2, [d.name for d in drivers])
         for path in drivers:
             RawLuaDriver(source=path.read_text(), origin=path.name).assert_round_trip()
 
@@ -584,3 +584,34 @@ class TestPeeledSupertonic(unittest.TestCase):
         text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(ctx)
         self.assertLess(text.index("local function sample_vfe"), text.index("function synthesize"))
         self.assertTrue(text.endswith("    return waveform\nend\n"))
+
+
+class TestPeeledVits(unittest.TestCase):
+    """The first peeled family with no sampler at all: VITS's stochastic duration predictor is traced
+    into the `logw` topology itself, so the only host-side randomness is two `loom.gaussian_array`
+    draws. Worth its own test because it is the case that could have needed a new component and did
+    not."""
+
+    def _components(self):
+        from loom_mil_compiler.vits_export import TTSVitsExportConfig
+
+        return TTSVitsExportConfig(checkpoint_path="/unused", output_path="/unused",
+                                   architecture="vits").driver_components()
+
+    def test_it_needs_no_sampler_component(self):
+        self.assertEqual([c for c in self._components() if isinstance(c, FlowMatchingSampler)], [])
+
+    def test_it_introduces_no_new_component_class(self):
+        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+
+        matcha = {type(c) for c in TTSMatchaExportConfig(
+            model_dir="/unused", output_path="/unused", architecture="matcha").driver_components()}
+        self.assertEqual({type(c) for c in self._components()} - matcha, set())
+
+    def test_the_frame_expansion_stays_hand_written_and_declares_what_it_touches(self):
+        """Genuine host control flow over a data-dependent frame count -- BACKEND.md's own conclusion
+        about what stays host-side. What the peel adds is that it now says what it reads."""
+        expand = next(c for c in self._components()
+                      if isinstance(c, LuaFragment) and "expand_z_p" in str(c.path))
+        self.assertEqual(set(expand.reads), {"stats", "w_ceil", "y_length", "T"})
+        self.assertIn("z_p", expand.defines)

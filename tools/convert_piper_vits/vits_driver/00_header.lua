@@ -1,0 +1,27 @@
+-- Lua orchestration for the MIL-traced VITS export (export_vits_mil.py), analogous to vits_driver.lua
+-- (the hand-built-topology driver) but for the three MACHINE-TRACED topologies export_vits_mil.py
+-- produces. The cross-phase host logic itself (generate_path frame expansion, Gaussian noise sampling)
+-- is IDENTICAL math to vits_driver.lua -- that part was never something MIL tracing could produce either
+-- way, it's genuine host control flow bridging three independent graphs plus a data-dependent frame
+-- count. What's different, and why this isn't just vits_driver.lua verbatim:
+--   - No `attn_mask`/`emb_rel_k_i`/`emb_rel_v_i` declared inputs at all: the MIL-traced TextEncoder
+--     computes masking (always all-ones, single-utterance convention) and the dynamic relative-position
+--     table (via a static-pad-then-dynamic-slice trick, see export_vits_mil.py's own
+--     `_get_relative_embeddings_traceable`) IN-GRAPH now, not host-side -- `loom.pad_crop_relative_
+--     embeddings`/`loom.get_weight` are gone entirely.
+--   - `stats` is T-fast (`stats[c*T+t]`), not channel-fast (`stats[t*2C+c]`) -- a bare PERMUTE as a
+--     traced graph's own declared OUTPUT is a live, non-contiguous view that a raw contiguous byte copy
+--     silently reads in PRE-permute order, so export_vits_mil.py's StatsWrapper deliberately returns the
+--     untransposed (T-fast) layout rather than fighting that. See its own docstring.
+--   - `z_p` is likewise T-fast (`z_p[c*y_length+out_frame]`), matching the natural (untransposed)
+--     torch (1,inter_channels,T) trace convention FlowVocoderWrapper's real Conv1d-based submodules use.
+--
+-- Expects three modules pre-registered by the host, ALL sharing the SAME underlying GgufModel (one
+-- combined vits_mil.gguf): "stats", "logw", "flow_vocoder" -- none use a KvCache.
+--
+-- inputs: token_ids (int array, TextEncoder's own vocabulary), seed (int, seeds loom.gaussian_array --
+-- SDP's own z_noise AND z_p's own noise, the only two stochastic points in this pipeline), plus the real
+-- model constants inter_channels, noise_scale, noise_scale_w, length_scale (VitsConfig's own real
+-- defaults).
+--
+-- Returns: the raw waveform (flat f32 array), same convention as vits_driver.lua's own return.
