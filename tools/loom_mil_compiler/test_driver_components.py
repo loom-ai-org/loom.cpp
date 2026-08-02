@@ -336,15 +336,28 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
             "declares ['tokens', 'style'], spec supplies ['tokens', 'styl'].",
         )
 
-    def test_the_five_real_drivers_all_round_trip(self):
-        """Not a fixture: the actual shipped `.lua` files, which is the only thing C.3's byte-identity
-        gate is a claim about. One, not five: C.4-C.7 peeled Matcha, Supertonic, VITS and Kokoro. The
-        count is asserted so that peeling a family without updating this test is noticed rather than
-        silently reducing the coverage of the claim."""
-        drivers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
-        self.assertEqual(len(drivers), 1, [d.name for d in drivers])
-        for path in drivers:
-            RawLuaDriver(source=path.read_text(), origin=path.name).assert_round_trip()
+    def test_the_adoption_still_works_on_a_real_peeled_family_s_fragments(self):
+        """All five families are peeled as of C.8, so there is no shipped whole-driver `.lua` left to
+        round-trip. The adoption is not dead code -- it is how the *next* family arrives -- so it is
+        exercised against a real driver reassembled from a peeled family's own fragments, which is the
+        closest thing to the shape it was written for."""
+        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+
+        config = TTSMatchaExportConfig(model_dir="/unused", output_path="/unused",
+                                       architecture="matcha")
+        source = MultiPhaseDriverBuilder(peeled=config.driver_components()).render(
+            DriverContext(
+                topologies={"encoder_mu": _topo(["tokens"]), "encoder_logw": _topo(["tokens"]),
+                            "decoder": _topo(["z", "mu", "t"]), "vocoder": _topo(["mel"])},
+                axes={n: "n_tokens" for n in ("encoder_mu", "encoder_logw", "decoder", "vocoder")},
+            ))
+        RawLuaDriver(source=source, origin="rebuilt.lua").assert_round_trip()
+
+    def test_no_whole_driver_lua_is_still_shipped(self):
+        """C.4-C.8 peeled all five. Asserted rather than assumed, so a family reverting to one file is
+        a deliberate act rather than a silent one."""
+        leftovers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
+        self.assertEqual(leftovers, [])
 
 
 class TestExternalTopologies(unittest.TestCase):
@@ -673,3 +686,37 @@ class TestPeeledKokoro(unittest.TestCase):
         call = next(c for c in self._components()
                     if isinstance(c, SubgraphCallComponent) and c.topology == "decoder_vocoder")
         self.assertTrue(call.multiline)
+
+
+class TestPeeledStyleTTS2(unittest.TestCase):
+    """The last family, and the one the plan predicted would "stay partly raw". It does, and the
+    boundary is exactly where the plan said: the ADPM2 sampler's `diffusion` call lives inside
+    `denoise_fn`, a closure the sampler invokes twice per step, so it cannot be a statement in the
+    entry function at all. That call is what `estimators()`' `EstimatorSpec` is for -- checked without
+    being generated."""
+
+    def _config(self):
+        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
+
+        return TTSStyleTTS2ExportConfig(checkpoint_path="/unused", output_path="/unused",
+                                        architecture="styletts2")
+
+    def test_only_the_two_top_level_mil_calls_became_ir(self):
+        calls = [c for c in self._config().driver_components()
+                 if isinstance(c, SubgraphCallComponent)]
+        self.assertEqual([c.topology for c in calls], ["albert", "decoder_vocoder"])
+
+    def test_the_closure_bound_diffusion_call_is_covered_by_an_estimator_spec(self):
+        """Not by a component and not by a fragment link: `EstimatorSpec` is the declaration that
+        checks a call without generating it, and this family is the reason that split exists."""
+        specs = self._config().estimators()
+        self.assertEqual([s.topology for s in specs], ["diffusion"])
+
+    def test_the_adpm2_helpers_stay_hand_written_in_the_header(self):
+        """Two network evaluations per step, Karras preconditioning, per-step noise injection. No
+        template emits that without becoming a worse thing to read than the loop."""
+        header = next(c for c in self._config().driver_components()
+                      if isinstance(c, LuaFragment) and c.top_level)
+        text = "\n".join(header.lines)
+        for helper in ("karras_schedule", "adpm2_step", "adpm2_sample"):
+            self.assertIn(f"local function {helper}", text)

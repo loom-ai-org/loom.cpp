@@ -297,7 +297,71 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
 
     checkpoint_path: str
     kokoro_config_path: str = "/home/flavio/.claude/tmp/kokoro_model/config.json"
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver_mil.lua"
+    # A DIRECTORY of `.lua` fragments -- StyleTTS2 is peeled (P4.0.6/C.8). See `driver_components`.
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver"
+
+    def driver_components(self) -> List:
+        """StyleTTS2's driver, as components (P4.0.6/C.8 -- the last family, and the one the plan
+        predicted would "stay partly raw").
+
+        It does, and the boundary is exactly where the plan said it would be. Two of thirteen
+        `run_subgraph` calls become IR; seven name their topology with a computed expression, two sit
+        inside Lua `for` loops, one is external, and **one is inside a closure**: `denoise_fn` is a
+        local function the ADPM2 sampler calls twice per step, so its `diffusion` call cannot be a
+        statement in the entry function at all. That call is what `estimators()`' `EstimatorSpec`
+        exists for -- it is checked without being generated, which is the split
+        `flow_matching_export.py`'s own docstring argues for and this family is the reason it exists.
+
+        The ADPM2 sampler itself stays a hand-written helper in `00_header.lua`, unchanged: two network
+        evaluations per step, Karras preconditioning, per-step noise injection. No template emits that
+        without becoming a worse thing to read than the loop."""
+        from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .driver_ir import Call, FieldAccess, Lit, Var
+
+        fragment = self.driver_script_path
+        external = self.external_topologies()
+        t_text, t_frames = Var("T_text"), Var("T_frames")
+
+        def block(name, **kwargs):
+            return LuaFragment(fragment / name, external=external, **kwargs)
+
+        return [
+            block("00_header.lua", top_level=True),
+            block("01_lengths.lua",
+                  defines=("T_text", "style_dim", "d_model", "hidden_per_dir")),
+            SubgraphCallComponent(
+                topology="albert", outputs=("bert_out",), length=t_text,
+                inputs={"tokens": FieldAccess("inputs", "input_ids")},
+                note="--- CustomAlbert, ONE MIL-traced call -> bert_out, time-major (T,768)\n"
+                     "    (== ne=[768,T] Layout B, see module docstring for why this convention,\n"
+                     "    not styletts2_driver.lua's own explicit-transpose one). ---"),
+            block("02_style_diffusion.lua", reads=("bert_out", "T_text", "style_dim"),
+                  defines=("denoise_fn", "style_vec_dim", "noise0", "sigmas", "s_pred",
+                           "s_decoder", "s_predictor")),
+            block("03_duration_encoder.lua",
+                  reads=("bert_out", "T_text", "d_model", "style_dim", "s_predictor",
+                         "hidden_per_dir"),
+                  defines=("d_en_flat", "x", "d", "top_out", "duration_logits", "pred_dur")),
+            block("04_frame_expansion.lua",
+                  reads=("T_text", "pred_dur", "d", "d_model", "style_dim", "hidden_per_dir"),
+                  defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
+                           "cnn_rows", "t_en", "asr")),
+            block("05_f0n.lua", reads=("en", "hidden_per_dir", "s_predictor"),
+                  defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve")),
+            block("06_vocoder_inputs.lua", reads=("T_frames",),
+                  defines=("dim", "T_f0", "L", "rand_ini", "u", "noise_in", "wsum")),
+            SubgraphCallComponent(
+                topology="decoder_vocoder", outputs=("waveform",),
+                axes={"n_enc_frames": t_frames, "n_past": Lit(0)},
+                inputs={
+                    "asr": Call("to_layout_a", [Var("asr"), t_frames, Lit(512)]),
+                    "f0_curve": Var("F0_curve"), "n_curve": Var("N_curve"),
+                    "s": Var("s_decoder"), "rand_ini": Var("rand_ini"),
+                    "noise_in": Var("noise_in"), "wsum": Var("wsum"),
+                },
+                multiline=True),
+            DriverReturn(values=("waveform",)),
+        ]
 
     def external_topologies(self) -> Dict[str, str]:
         """StyleTTS2's MIL export is **partial**, the same way Kokoro's is and for the same reason --
