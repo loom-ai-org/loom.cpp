@@ -523,7 +523,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             LuaLibrary(uses=(
                 "array_slice", "array_sum",
                 "to_row_major", "from_row_major", "to_layout_a",
-                "from_layout_a", "bilstm_run", "run_resblk_stack",
+                "from_layout_a", "run_bi_lstm", "run_resblk_stack",
                 "run_proj1x1", "predict_durations", "compute_wsum",
             )),
             block("01_style.lua",
@@ -593,7 +593,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         # TextEncoder's BiLSTM, exported as its four per-timestep cell topologies rather than left to
         # the pre-MIL kokoro.gguf. ggml has no LSTM op, so this is a `RecurrentPhase` and not an
         # `ExportPhase` -- see its docstring. Its four topology names are exactly the ones
-        # `bilstm_run("text_encoder_lstm", ...)` already resolves, so the driver is untouched.
+        # `run_bi_lstm("text_encoder_lstm", ...)` already resolves, so the driver is untouched.
         return [albert_phase, decoder_vocoder_phase,
                 *build_prosody_phases(model.text_encoder, model.predictor)]
 

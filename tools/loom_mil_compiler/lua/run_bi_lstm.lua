@@ -1,7 +1,7 @@
 -- Host-steps one BiLSTM instance over a T x input_dim sequence, driving the four per-timestep cell
 -- topologies (`<ns>_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`) the exporter's `recurrent.py` generates and
 -- the bespoke converters hand-build. ggml has no LSTM op; the recurrence is genuinely host-side.
-local function bilstm_run(namespace_, seq, hidden_dim)
+local function run_bi_lstm(namespace_, seq, hidden_dim)
     local T = #seq
     local out = {}
     for t = 1, T do out[t] = {} end
