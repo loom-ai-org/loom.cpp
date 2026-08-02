@@ -1,6 +1,6 @@
 
     -- --- decoder_vocoder: ONE MIL-traced call replaces decoder_core+sinegen+stft_forward+generator,
-    --     input-for-input identical to kokoro_driver_mil.lua's own (StyleTTS2's decoder/generator/sinegen
+    --     input-for-input identical to kokoro_driver/'s own (StyleTTS2's decoder/generator/sinegen
     --     ARE Kokoro's own istftnet classes, just this checkpoint's own weights). rand_ini/noise draws in
     --     the SAME order as styletts2_driver.lua (uniform then gaussian, against the ONE shared rng_
     --     stream, AFTER the diffusion sampler's own draws) -- index 0 of rand_ini is a placeholder, zeroed

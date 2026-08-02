@@ -6,13 +6,13 @@
 -- is now a MIL trace of the REAL Transformer1d.run() instead of a hand-derived topology). Everything else
 -- (bert_encoder, DurationEncoder/predictor.lstm/duration_proj, TextEncoder's BiLSTM, F0Ntrain) stays on
 -- the EXISTING bespoke, hand-built LSTM-bound topologies -- ggml has no native LSTM op, same deliberate
--- scoping exclusion Kokoro's own MIL export already established (see kokoro_driver_mil.lua's own header).
+-- scoping exclusion Kokoro's own MIL export already established (see kokoro_driver/'s own header).
 --
 -- What's different from styletts2_driver.lua, and why this isn't just that file with three calls swapped:
 --   - No `positions`/`attn_mask` inputs to "albert" at all: the MIL-traced CustomAlbert computes position
 --     ids (from a registered buffer, sliced dynamically) and the additive attention mask (always
 --     all-zeros -- real usage is always a single, unpadded utterance) IN-GRAPH now, not host-side --
---     identical reasoning to kokoro_driver_mil.lua's own "albert_bert_encoder" phase.
+--     identical reasoning to kokoro_driver/'s own "albert_bert_encoder" phase.
 --   - "albert" returns TIME-MAJOR (T,768) (`flat[t*768+c]`, this file's own "row_major" convention) instead
 --     of styletts2_driver.lua's own Layout-B convention -- a deliberate choice in export_styletts2_mil.py's
 --     own AlbertWrapper to avoid returning a bare `.transpose()`/permute as a traced graph's own output
@@ -31,7 +31,7 @@
 --     WAVEFORM -- no host-side har (STFT mag/phase) assembly or Generator-input wiring needed at all, only
 --     the SAME rand_ini/noise/wsum host-precomputation styletts2_driver.lua's own generator call already
 --     required (F0Ntrain and everything upstream of the decoder is IDENTICAL to styletts2_driver.lua --
---     still bespoke/LSTM-bound, unchanged). Matches kokoro_driver_mil.lua's own identical simplification,
+--     still bespoke/LSTM-bound, unchanged). Matches kokoro_driver/'s own identical simplification,
 --     input-for-input (StyleTTS2's decoder/generator/sinegen ARE Kokoro's own istftnet classes, just
 --     StyleTTS2's own checkpoint weights -- see export_styletts2_mil.py's own module docstring).
 --
@@ -215,7 +215,7 @@ end
 
 -- Matches export_kokoro_mil.py's own `compute_wsum_np` (== tools/convert_kokoro/kokoro_stft_common.py's
 -- `compute_wsum`), driven by T_frames directly -- same "host-precomputed real-valued denominator"
--- convention as kokoro_driver_mil.lua's own copy.
+-- convention as kokoro_driver/'s own copy.
 local function compute_wsum(t_frames, n_fft, hop, upsample_scale)
     local t_f0 = 2 * t_frames
     local length = t_f0 * upsample_scale
