@@ -393,6 +393,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         from .driver_components import (
             DriverReturn, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
         )
+        from .lua_library import LuaLibrary
         from .driver_ir import BinOp, FieldAccess, Var
 
         fragment = self.driver_script_path
@@ -401,6 +402,8 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         sampler, = self.samplers()
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
+            LuaLibrary(uses=("durations_from_logw", "array_sum", "pad_last_to_multiple",
+                             "repeat_by_duration_tfast", "array_affine")),
             LuaFragment(fragment / "01_lengths.lua", defines=("n_feats", "t_text")),
             SubgraphCallComponent(
                 topology="encoder_mu", outputs=("mu_x",), inputs={"tokens": tokens}, length=t_text,

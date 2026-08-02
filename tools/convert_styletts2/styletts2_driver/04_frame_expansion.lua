@@ -1,8 +1,7 @@
 
     -- --- frame expansion: "en" (640ch, from d) and "asr" (512ch, from a SEPARATE plain TextEncoder,
     --     bespoke, unchanged) ---
-    local T_frames = 0
-    for t = 1, T_text do T_frames = T_frames + pred_dur[t] end
+    local T_frames = array_sum(pred_dur)
     local d_channels = d_model + style_dim
     local en = from_row_major(loom.expand_by_duration(to_row_major(d, d_channels), T_text, d_channels, pred_dur),
                                T_frames, d_channels)

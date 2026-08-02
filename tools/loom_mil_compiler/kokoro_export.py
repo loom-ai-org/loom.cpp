@@ -505,6 +505,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         for most of the remaining nine are D.2's registered component, which declares its topologies as
         data and is where those calls stop being computed strings."""
         from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .lua_library import LuaLibrary
         from .driver_ir import Call, FieldAccess, Lit, Var
 
         fragment = self.driver_script_path
@@ -516,6 +517,15 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
 
         return [
             block("00_header.lua", top_level=True),
+            # The shared driver-side library. Every one of these was a byte-identical copy
+            # in this family and the other one until they moved to lua/ -- 11 functions,
+            # 112 lines, shipped twice. Only what is declared here is emitted.
+            LuaLibrary(uses=(
+                "array_slice", "array_sum",
+                "to_row_major", "from_row_major", "to_layout_a",
+                "from_layout_a", "bilstm_run", "run_resblk_stack",
+                "run_proj1x1", "predict_durations", "compute_wsum",
+            )),
             block("01_style.lua",
                   defines=("T_text", "style_dim", "d_model", "hidden_per_dir",
                            "s_decoder", "s_predictor")),

@@ -23,6 +23,5 @@
     local noise0 = loom.gaussian_array(style_vec_dim)
     local sigmas = karras_schedule(inputs.diffusion_steps, inputs.sigma_min, inputs.sigma_max, inputs.rho)
     local s_pred = adpm2_sample(noise0, denoise_fn, sigmas, inputs.diffusion_steps)
-    local s_decoder, s_predictor = {}, {}
-    for i = 1, style_dim do s_decoder[i] = s_pred[i] end
-    for i = 1, style_dim do s_predictor[i] = s_pred[style_dim + i] end
+    local s_decoder = array_slice(s_pred, 1, style_dim)
+    local s_predictor = array_slice(s_pred, style_dim + 1, style_dim)
