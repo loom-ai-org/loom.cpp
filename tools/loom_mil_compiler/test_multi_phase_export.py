@@ -126,3 +126,80 @@ class TestASRRootAxisIsNowADeclaration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecurrentPhase(unittest.TestCase):
+    """`recurrent.build_lstm_cell_topologies` was verified against a real traced nn.LSTM when it was
+    written and then had **no caller** for the whole of P4.0 -- `generate_graph_topology` raised on an
+    `lstm` op and named it as the fix. `RecurrentPhase` is that wiring, so what these check is the
+    wiring: the names it creates, the guards on what it will accept, and that a bidirectional module
+    yields four cells rather than two."""
+
+    def _lstm_phase(self, input_dim=6, hidden=4, bidirectional=True, name="enc_lstm"):
+        import torch
+
+        from loom_mil_compiler.multi_phase_export import RecurrentPhase
+
+        torch.manual_seed(0)
+        lstm = torch.nn.LSTM(input_dim, hidden, batch_first=True, bidirectional=bidirectional)
+        return RecurrentPhase(name=name, module=lstm, input_dim=input_dim)
+
+    def test_a_bidirectional_module_yields_the_four_cells_bilstm_run_drives(self):
+        topologies, weights = self._lstm_phase().topologies()
+        self.assertEqual(sorted(topologies), ["enc_lstm_c_bwd", "enc_lstm_c_fwd",
+                                              "enc_lstm_h_bwd", "enc_lstm_h_fwd"])
+        # Exactly the names `loom_lua`'s bilstm_run composes, so a driver calling
+        # bilstm_run("enc_lstm", ...) needs no change at all.
+        self.assertEqual(sorted(weights), [
+            "enc_lstm.bwd.bias", "enc_lstm.bwd.weight_hh", "enc_lstm.bwd.weight_ih",
+            "enc_lstm.fwd.bias", "enc_lstm.fwd.weight_hh", "enc_lstm.fwd.weight_ih",
+        ])
+
+    def test_a_unidirectional_module_yields_two(self):
+        topologies, _ = self._lstm_phase(bidirectional=False).topologies()
+        self.assertEqual(sorted(topologies), ["enc_lstm_c_fwd", "enc_lstm_h_fwd"])
+
+    def test_input_dim_defaults_to_the_module_s_own(self):
+        """So an nn.LSTM never restates it, and a wrong value is impossible rather than checked."""
+        phase = self._lstm_phase(input_dim=6)
+        phase.input_dim = None
+        topologies, _ = phase.topologies()
+        self.assertEqual(len(topologies), 4)
+
+    def test_a_wrong_explicit_input_dim_is_torch_s_error_not_ours(self):
+        """The trace runs at the declared width, so torch raises first -- naming both numbers, which is
+        better than anything this module would write. A post-trace comparison was written here and then
+        deleted for being unreachable."""
+        phase = self._lstm_phase(input_dim=6)
+        phase.input_dim = 7
+        with self.assertRaises(RuntimeError) as raised:
+            phase.topologies()
+        self.assertIn("input.size(-1) must be equal to input_size", str(raised.exception))
+
+    def test_a_module_with_two_lstms_is_rejected_rather_than_half_exported(self):
+        import torch
+
+        from loom_mil_compiler.multi_phase_export import RecurrentPhase
+
+        class _Two(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.LSTM(6, 4, batch_first=True)
+                self.b = torch.nn.LSTM(4, 4, batch_first=True)
+
+            def forward(self, x):
+                out, _ = self.a(x)
+                out, _ = self.b(out)
+                return out
+
+        with self.assertRaises(ValueError) as raised:
+            RecurrentPhase(name="two", module=_Two(), input_dim=6).topologies()
+        self.assertIn("traced to 2 'lstm' ops, expected exactly one", str(raised.exception))
+
+    def test_the_cell_is_the_mil_formulation_not_the_state_dict_one(self):
+        """One pre-summed `bias`, not `bias_ih`/`bias_hh`. This is why replacing a bespoke BiLSTM
+        topology with a generated one is a NUMERIC gate and not a structural one -- the two are
+        different arrangements of the same arithmetic."""
+        _, weights = self._lstm_phase().topologies()
+        self.assertIn("enc_lstm.fwd.bias", weights)
+        self.assertNotIn("enc_lstm.fwd.bias_ih", weights)

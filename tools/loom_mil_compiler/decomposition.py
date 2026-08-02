@@ -227,7 +227,7 @@ class MultiPhase(Decomposition):
         from .driver_builder import DriverContext
         from .exporter import LoomGGUFExporter
         from .flow_matching_export import render_driver
-        from .multi_phase_export import merge_phase_weights
+        from .multi_phase_export import RecurrentPhase, merge_phase_weights
         from .spec_protocol import LinkChecker
 
         config.prepare_environment()
@@ -243,8 +243,19 @@ class MultiPhase(Decomposition):
         # axes.py's vocabulary, or a declared_axes entry naming an input this phase does not declare.
         # Both are answerable from the declaration alone, which is why they run here and not after.
         for phase in phases:
-            checker.check(phase, f"ExportPhase({phase.name!r})")
+            checker.check(phase, f"{type(phase).__name__}({phase.name!r})")
         for phase in phases:
+            # A RecurrentPhase produces its topologies without a static trace at all: ggml has no LSTM
+            # op, so an nn.LSTM becomes four per-timestep CELL topologies plus a host-side loop. See
+            # multi_phase_export.RecurrentPhase, and LoomGGUFExporter.generate_graph_topology's own
+            # raise, which named this as the missing wiring.
+            if isinstance(phase, RecurrentPhase):
+                cells, weights = phase.topologies()
+                print(f"  {phase.name}: {len(cells)} recurrent cell topolog(ies), "
+                      f"{len(weights)} weights")
+                phase_topologies.update(cells)
+                named_weights.append((phase.name, weights))
+                continue
             traced = torch.jit.trace(phase.wrapper, phase.dummy_inputs)
             mil_prog = ct.convert(
                 traced, inputs=phase.mil_inputs, convert_to="milinternal",
@@ -282,7 +293,10 @@ class MultiPhase(Decomposition):
         driver_source = self.driver_builder(config, source=driver_source).render(
             DriverContext(
                 topologies=out_exporter.topologies,
-                axes={phase.name: phase.root_axis for phase in phases},
+                # A recurrent cell has no root axis -- it is one timestep, with no time
+                # dimension for a symbol to range over.
+                axes={phase.name: phase.root_axis for phase in phases
+                      if not isinstance(phase, RecurrentPhase)},
                 weights=out_exporter.weights,
             ),
             checker=checker,
