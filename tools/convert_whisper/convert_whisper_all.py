@@ -78,11 +78,16 @@ def main():
     writer.add_string("model.graph_topology.encoder", json.dumps(encoder_topo))
     writer.add_string("model.graph_topology.decoder", json.dumps(decoder_topo))
     writer.add_string("model.driver_script", driver_script_path.read_text())
-    # hparams needed by loom::WhisperDriver / LoomLuaBridge's KvCache sizing.
+    # The five geometry facts `loom::make_kv_cache` sizes the decoder's KV cache from (KV-CACHE.md
+    # stage 1). The first four have been written since the Lua port and were never read by anything --
+    # both callers that needed a cache built it from a hardcoded C++ `WhisperConfig` instead, which is
+    # what made this file not actually self-contained. `kv_cache_size` is the capacity in tokens: the
+    # decoder's own context length, which is the most any single decode can consume.
     writer.add_uint32("loom.n_layer", dims["n_text_layer"])
     writer.add_uint32("loom.n_head_kv", dims["n_text_head"])
     writer.add_uint32("loom.n_embd_head_k", n_state // dims["n_text_head"])
     writer.add_uint32("loom.n_embd_head_v", n_state // dims["n_text_head"])
+    writer.add_uint32("loom.kv_cache_size", dims["n_text_ctx"])
     for name, arr in merged_weights.items():
         writer.add_tensor(name, arr.astype(np.float32))
     writer.write_header_to_file()
