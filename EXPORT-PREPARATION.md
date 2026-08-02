@@ -360,6 +360,17 @@ spelled out rather than rediscovered:
   decoder). **This is a real gap and a real capability item — it belongs in P4/P5, not in preparation**,
   and it is recorded here so it is not mistaken for something P4.0 covers.
 
+  > **Superseded 2026-08-02 — promoted to P4.0.9 and scheduled before stage D** (author's direction).
+  > Specified in [`KV-CACHE.md`](KV-CACHE.md), which supersedes the four-step decomposition below on one
+  > measured point: **step 2 is not needed.** Once the SDPA subgraph is an `ATTENTION` node the engine
+  > supplies the past itself, so a decode step is a call at `n_tokens=1` — there is no second trace and
+  > no merged decoder. What survives of step 3 is exactly one input: `attention_mask` must be retyped
+  > `["n_kv", "n_tokens"]`, which is sound only because after fusion nothing else consumes it. Step 1 is
+  > unchanged and is still the expensive piece. A fourth item this bullet did not have turned out to
+  > gate the others: the cache's *geometry* is declared nowhere, so
+  > `test_e2e_whisper_lua_driver.cpp:141` sizes it from a hardcoded C++ `WhisperConfig` — Whisper's
+  > "self-contained GGUF" is not.
+
   **Where the blocker actually is (measured 2026-08-01, and it is not where this bullet implied).**
   Binding a real `n_past` is the *last* step, not the first. The engine's cache is reachable through
   exactly one door — the **`ATTENTION` topology node**. `op_attention` is what reads `n_past`/`n_kv` from
