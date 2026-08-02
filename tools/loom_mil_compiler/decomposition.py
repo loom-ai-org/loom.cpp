@@ -70,7 +70,7 @@ class Decomposition:
 
 @dataclass
 class Flattened(Decomposition):
-    """One traced forward pass -> one `main_topo` topology. Qwen3, LFM2-monolithic, and all three NeMo
+    """One traced forward pass -> one `main_topology` topology. Qwen3, LFM2-monolithic, and all three NeMo
     ASR encoders.
 
     Config hooks: `prepare_environment()` (optional, defaults to a no-op via `LoomExportConfig`),

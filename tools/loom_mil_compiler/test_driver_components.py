@@ -51,18 +51,18 @@ class TestPrefillArgmaxBuilder(unittest.TestCase):
     def _builder(self, bindings, inputs, n_tokens):
         return PrefillArgmaxBuilder(
             inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens),
-            call=MonolithicCall(topology="main_topo", inputs=inputs, n_tokens=n_tokens),
+            call=MonolithicCall(topology="main_topology", inputs=inputs, n_tokens=n_tokens),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape", n_tokens=n_tokens),
         )
 
     def test_the_plain_causal_lm_shape(self):
-        ctx = DriverContext(topologies={"main_topo": _topo(["tokens"])},
-                            axes={"main_topo": "n_tokens"})
+        ctx = DriverContext(topologies={"main_topology": _topo(["tokens"])},
+                            axes={"main_topology": "n_tokens"})
         text = self._builder((("tokens", CALLER),), ("tokens",), Len("tokens")).render(ctx)
         self.assertEqual(text, "\n".join([
-            "function main(inputs)",
+            "function infer(inputs)",
             "    local tokens = inputs.tokens",
-            "    local _mono_out, _mono_shape = loom.run_subgraph('main_topo', "
+            "    local _mono_out, _mono_shape = loom.run_subgraph('main_topology', "
             "{n_tokens = #tokens, n_past = 0}, {tokens = tokens})",
             "    if (type(_mono_out) == 'table') then",
             "        return loom.argmax_row(_mono_out, _mono_shape[1], (#tokens - 1))",
@@ -76,8 +76,8 @@ class TestPrefillArgmaxBuilder(unittest.TestCase):
         """LFM2's traced graph declares `cache_position` and `attention_mask`; the driver fills both in
         rather than making a caller know they exist."""
         ctx = DriverContext(
-            topologies={"main_topo": _topo(["input_ids", "cache_position", "attention_mask"])},
-            axes={"main_topo": "n_tokens"})
+            topologies={"main_topology": _topo(["input_ids", "cache_position", "attention_mask"])},
+            axes={"main_topology": "n_tokens"})
         bindings = (("input_ids", CALLER), ("cache_position", POSITION), ("attention_mask", MASK))
         text = self._builder(bindings, tuple(n for n, _ in bindings), Len("input_ids")).render(ctx)
         self.assertIn("    local input_ids = (inputs.input_ids or inputs.tokens)\n"
@@ -87,8 +87,8 @@ class TestPrefillArgmaxBuilder(unittest.TestCase):
     def test_the_root_axis_is_the_topology_s_own(self):
         """Conformer-CTC/Parakeet declare "n_samples" -- raw audio samples, never a token count. The
         VALUE is still the first input's own length; only the axis it binds differs (R1)."""
-        ctx = DriverContext(topologies={"main_topo": _topo(["audio_signal"])},
-                            axes={"main_topo": "n_samples"})
+        ctx = DriverContext(topologies={"main_topology": _topo(["audio_signal"])},
+                            axes={"main_topology": "n_samples"})
         n_tokens = BinOp("floordiv", Len("audio_signal"), Lit(80))
         text = self._builder((("audio_signal", CALLER),), ("audio_signal",), n_tokens).render(ctx)
         self.assertIn("{n_samples = math.floor(#audio_signal / 80), n_past = 0}", text)
@@ -129,7 +129,7 @@ class TestModularChainBuilder(unittest.TestCase):
     def test_the_chain_threads_one_variable_through_every_stage(self):
         text = self._builder().render(self._ctx())
         self.assertEqual(text, "\n".join([
-            "function main(inputs)",
+            "function infer(inputs)",
             "    local input_ids = (inputs.input_ids or inputs.tokens)",
             "    local _mod_chain_0 = loom.run_subgraph('prefix', {n_tokens = #input_ids, n_past = 0}, "
             "{input_ids = input_ids})",
@@ -207,7 +207,7 @@ local function helper(x)
     return x + 1
 end
 
-function synthesize(inputs)
+function infer(inputs)
     local a = loom.run_subgraph("encoder", {n_tokens = #inputs.tokens, n_past = 0}, {
         tokens = inputs.tokens,
         style = inputs.style,
@@ -261,13 +261,13 @@ class TestRawLuaDriverIsByteExact(unittest.TestCase):
         script = MultiPhaseDriverBuilder(
             driver=RawLuaDriver(source=_DRIVER, origin="d.lua")).build(_adoption_ctx())
         self.assertEqual(script.prelude[0], "-- a hand-written driver")
-        self.assertEqual(script.entry.name, "synthesize")
+        self.assertEqual(script.entry.name, "infer")
         self.assertEqual(script.postlude, [""], "the source's trailing newline")
 
     def test_a_source_with_no_entry_function_is_rejected(self):
         with self.assertRaises(ValueError) as raised:
             RawLuaDriver(source="-- nothing here\n", origin="d.lua")
-        self.assertIn("no top-level 'function synthesize(inputs)' line", str(raised.exception))
+        self.assertIn("no top-level 'function infer(inputs)' line", str(raised.exception))
 
     def test_a_corrupted_round_trip_is_caught_before_anything_is_written(self):
         driver = RawLuaDriver(source=_DRIVER, origin="d.lua")
@@ -527,7 +527,7 @@ class TestPeeledMatcha(unittest.TestCase):
 
     def test_it_assembles_into_a_driver_that_validates(self):
         text = self._render()
-        self.assertIn("function synthesize(inputs)", text)
+        self.assertIn("function infer(inputs)", text)
         self.assertTrue(text.endswith("    return waveform\nend\n"),
                         "a peeled driver ends with a newline, like every hand-written one")
 
@@ -537,8 +537,8 @@ class TestPeeledMatcha(unittest.TestCase):
         `t_mel`. Its prelude is collected separately, so the function still comes out on top."""
         text = self._render()
         self.assertLess(text.index("local function sample_decoder"),
-                        text.index("function synthesize(inputs)"))
-        self.assertLess(text.index("function synthesize(inputs)"),
+                        text.index("function infer(inputs)"))
+        self.assertLess(text.index("function infer(inputs)"),
                         text.index("local z = sample_decoder("))
 
     def test_every_run_subgraph_call_is_ir_rather_than_text(self):
@@ -617,7 +617,7 @@ class TestPeeledSupertonic(unittest.TestCase):
             axes={n: "n_tokens" for n in ("dp", "ttl_text", "vfe", "decoder")},
         )
         text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(ctx)
-        self.assertLess(text.index("local function sample_vfe"), text.index("function synthesize"))
+        self.assertLess(text.index("local function sample_vfe"), text.index("function infer"))
         self.assertTrue(text.endswith("    return waveform\nend\n"))
 
 

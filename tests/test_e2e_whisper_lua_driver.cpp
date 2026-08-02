@@ -147,7 +147,7 @@ int main() {
 
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
         const std::vector<double> prompt_d(prompt.begin(), prompt.end());
-        loom::LoomLuaBridge::Value result = bridge.call("transcribe", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"waveform", waveform_d},
             {"prompt_tokens", prompt_d},
             {"n_audio_ctx", static_cast<double>(cfg.n_audio_ctx)},

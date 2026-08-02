@@ -43,7 +43,7 @@ bool path_exists(const std::string& path) {
 // output convention (and MIL's own lstm op docstring: "[b, :H] and [b, H:] represent forward and
 // reverse direction values respectively").
 const char* kDriverScript = R"lua(
-function main(inputs)
+function infer(inputs)
     local out_fwd = loom.run_recurrent('h_fwd', 'c_fwd', inputs.sequence, inputs.seq_len, inputs.input_dim,
                                         inputs.hidden_dim, false)
     local out_bwd = loom.run_recurrent('h_bwd', 'c_bwd', inputs.sequence, inputs.seq_len, inputs.input_dim,
@@ -103,7 +103,7 @@ int main() {
     }
     bridge.load_script(kDriverScript);
 
-    loom::LoomLuaBridge::Value result = bridge.call("main", {
+    loom::LoomLuaBridge::Value result = bridge.call("infer", {
         {"sequence", sequence},
         {"seq_len", static_cast<double>(seq_len)},
         {"input_dim", static_cast<double>(input_dim)},

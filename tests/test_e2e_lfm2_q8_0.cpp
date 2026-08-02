@@ -50,7 +50,7 @@ function get_logits_and_shape(inputs)
     local tokens = inputs.tokens
     local cache_position = loom.range(0, #tokens)
     local attention_mask = loom.causal_mask(#tokens, 0)
-    local out, shape = loom.run_subgraph('main_topo', #tokens, 0, {tokens = tokens, cache_position = cache_position, attention_mask = attention_mask})
+    local out, shape = loom.run_subgraph('main_topology', #tokens, 0, {tokens = tokens, cache_position = cache_position, attention_mask = attention_mask})
     out[#out + 1] = shape[1]
     return out
 end
@@ -67,10 +67,10 @@ LastRowResult last_row_logits(const std::string& gguf_path, const std::vector<do
     LOOM_CHECK(backend != nullptr);
 
     auto model = loom::GgufModel::load(gguf_path, backend.get());
-    LOOM_CHECK(model->has_topology("main_topo"));
+    LOOM_CHECK(model->has_topology("main_topology"));
 
     loom::LoomLuaBridge bridge(backend.get());
-    bridge.register_module("main_topo", *model, loom::GraphTopology::parse(model->topology_json("main_topo")), nullptr);
+    bridge.register_module("main_topology", *model, loom::GraphTopology::parse(model->topology_json("main_topology")), nullptr);
     bridge.load_script(kGetLogitsScript);
 
     loom::LoomLuaBridge::Value result = bridge.call("get_logits_and_shape", {{"tokens", prompt}});

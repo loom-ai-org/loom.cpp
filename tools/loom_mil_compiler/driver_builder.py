@@ -165,11 +165,15 @@ class DriverScript:
 class DriverBuilder:
     """Assembles one family's (or one orchestration shape's) components into a checked driver.
 
-    `entry_name`/`entry_params` are the function the host calls -- `main(inputs)` for the synthesized
-    causal-LM and ASR paths, `synthesize(inputs)` for every TTS family.
+    `entry_name`/`entry_params` are the function the host calls: `infer(inputs)`, for every family and
+    every path. It was `main(inputs)` for the synthesized causal-LM/ASR paths and `synthesize(inputs)`
+    for the TTS families until KV-CACHE.md's N.1 -- three names for one concept, each describing the
+    model rather than the call, which is why the whole tree now uses the one generic name. A driver may
+    expose additional entries beside it (`infer_with_past`, KV-CACHE.md stage 3); `entry_name` is the
+    one every host can assume.
     """
 
-    entry_name = "main"
+    entry_name = "infer"
     entry_params = ("inputs",)
 
     def components(self) -> List[DriverComponent]:

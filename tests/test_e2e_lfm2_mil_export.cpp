@@ -68,7 +68,7 @@ bool run_gguf_case(const std::string& gguf_path) {
     LOOM_CHECK(!driver_script.empty());
 
     loom::LoomLuaBridge bridge(backend.get());
-    // Monolithic exports have exactly one topology (named "main_topo"). Register whatever topologies
+    // Monolithic exports have exactly one topology (named "main_topology"). Register whatever topologies
     // the file actually declares instead of assuming a single hardcoded name, so this also works
     // unmodified against a modular-profile export (one topology per prefix/layer_i/suffix_i slice).
     for (const std::string& mod_name : model->topology_names()) {
@@ -78,7 +78,7 @@ bool run_gguf_case(const std::string& gguf_path) {
 
     bool all_ok = true;
     for (const Case& c : kCases) {
-        loom::LoomLuaBridge::Value result = bridge.call("main", {{"tokens", c.prompt}});
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {{"tokens", c.prompt}});
         const auto got = static_cast<int32_t>(std::get<double>(result));
         std::fprintf(stderr, "'%s' prompt of %zu tokens: expected top-1 %d, got %d\n", gguf_path.c_str(),
                      c.prompt.size(), c.expected_top1, got);

@@ -139,7 +139,7 @@ class MonolithicCall(DriverComponent):
     vocab size, which is the output's own ne0 and is not otherwise knowable to the driver.
     """
 
-    topology: str = "main_topo"
+    topology: str = "main_topology"
     inputs: Tuple[str, ...] = ()
     n_tokens: object = None
     out_var: str = "_mono_out"
@@ -493,7 +493,7 @@ class RawLuaDriver(DriverComponent):
     """
 
     source: str
-    entry: str = "synthesize"
+    entry: str = "infer"
     origin: str = "driver"
     # `{topology name: where it comes from}` -- see BaseMultiPhaseModelExportConfig.external_topologies.
     external: dict = dataclass_field(default_factory=dict)
@@ -913,7 +913,7 @@ class MultiPhaseDriverBuilder(DriverBuilder):
         "peeled": NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN),
     }
 
-    entry_name = "synthesize"
+    entry_name = "infer"
 
     def __post_init__(self):
         if (self.driver is None) == (self.peeled is None):

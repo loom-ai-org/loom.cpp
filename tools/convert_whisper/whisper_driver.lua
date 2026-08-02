@@ -14,7 +14,7 @@
 --
 -- Returns: a flat array of generated token ids (NOT including the prompt), same convention as
 -- WhisperDriver::transcribe's own return value.
-function transcribe(inputs)
+function infer(inputs)
     local n_audio_ctx = inputs.n_audio_ctx
 
     -- --- Encoder: one fixed-shape pass (n_tokens/n_past are unused by this topology -- every shape is
