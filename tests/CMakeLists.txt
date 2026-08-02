@@ -986,7 +986,7 @@ target_link_libraries(test_e2e_supertonic_mil_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_mil_decoder COMMAND test_e2e_supertonic_mil_decoder)
 set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- Full end-to-end check: the MIL-traced topologies wired via supertonic_driver_mil.lua, compared
+# --- Full end-to-end check: the MIL-traced topologies wired via supertonic_driver/, compared
 #     against the existing bespoke loom::SupertonicDriver oracle. Skips cleanly if env vars aren't set. ---
 add_executable(test_e2e_supertonic_mil_lua_driver test_e2e_supertonic_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_supertonic_mil_lua_driver PRIVATE loom::engine)
@@ -1023,7 +1023,7 @@ set_tests_properties(test_e2e_matcha_mil_vocoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: the SAME Euler-ODE (CFM) sampling loop + per-token duration expansion
 #     as test_e2e_matcha_lua_driver above, but wired to the MIL-traced topologies
-#     (tools/convert_matcha/matcha_driver_mil.lua) instead of the bespoke hand-built ones -- compared
+#     (tools/convert_matcha/matcha_driver/) instead of the bespoke hand-built ones -- compared
 #     against the existing loom::MatchaDriver on the real checkpoint. ---
 add_executable(test_e2e_matcha_mil_lua_driver test_e2e_matcha_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_matcha_mil_lua_driver PRIVATE loom::engine)
@@ -1041,7 +1041,7 @@ add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
 set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL exporter: VITS retraced via export_vits_mil.py (real SynthesizerTrn submodules, not the
-#     hand-built bespoke topology above) + tools/convert_piper_vits/vits_driver_mil.lua. See
+#     hand-built bespoke topology above) + tools/convert_piper_vits/vits_driver/. See
 #     BACKLOG.md's VITS MIL-export entry. ---
 add_executable(test_e2e_vits_mil_lua_driver test_e2e_vits_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_vits_mil_lua_driver PRIVATE loom::engine)
@@ -1067,8 +1067,8 @@ add_test(NAME test_e2e_kokoro_lua_driver COMMAND test_e2e_kokoro_lua_driver)
 set_tests_properties(test_e2e_kokoro_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Real-model test: the MIL-traced Kokoro export (export_kokoro_mil.py) end-to-end, via
-#     kokoro_driver_mil.lua -- mixes the two MIL-traced topologies with the LSTM-bound bespoke ones
-#     (kokoro_driver_mil.lua's own module docstring explains why those stay bespoke). ---
+#     kokoro_driver/ -- mixes the two MIL-traced topologies with the LSTM-bound bespoke ones
+#     (kokoro_driver/'s own module docstring explains why those stay bespoke). ---
 add_executable(test_e2e_kokoro_mil_lua_driver test_e2e_kokoro_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_kokoro_mil_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_lua_driver COMMAND test_e2e_kokoro_mil_lua_driver)
@@ -1085,7 +1085,7 @@ add_test(NAME test_e2e_styletts2_lua_driver COMMAND test_e2e_styletts2_lua_drive
 set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Real-model test: the MIL-traced StyleTTS2 export (export_styletts2_mil.py) end-to-end, via
-#     styletts2_driver_mil.lua -- mirrors test_e2e_kokoro_mil_lua_driver.cpp's own "no oracle, orchestration
+#     styletts2_driver/ -- mirrors test_e2e_kokoro_mil_lua_driver.cpp's own "no oracle, orchestration
 #     sanity" scope (see that test's own docstring, and this one's, for why a tight full-pipeline diff
 #     against the bespoke C++ oracle isn't a meaningful target here). Skips cleanly if env vars aren't set. ---
 add_executable(test_e2e_styletts2_mil_lua_driver test_e2e_styletts2_mil_lua_driver.cpp)

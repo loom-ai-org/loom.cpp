@@ -881,6 +881,71 @@ nothing.
   — so each peeling commit's gate is instead: the model's existing `test_e2e_*_mil_lua_driver.cpp`
   passes unchanged, the driver-text diff is read and attached to the commit message, and every topology,
   weight and non-driver KV is byte-identical.
+
+  **DONE**, eight commits (`driver_builder.py` → the two synthesized paths → adopt the five TTS drivers
+  → peel them one at a time).
+
+  **`DriverScript` is prelude lines + an entry function + postlude, not one `IRFunction`.** A real
+  driver is a Lua *module*: a preamble, zero or more top-level helper functions, and the entry point the
+  host resolves as a global. Modelling that as one function would have made every generated sampler a
+  nested closure — a semantic change dressed as a refactor. Lines rather than chunks, joined by a single
+  newline, so a component owns the blank lines around its own contribution; that is what made adopting
+  an existing driver byte-exact, trailing newline included.
+
+  **The order the checks run in is the content of `build()`**, not an implementation detail: check links
+  → emit → `validate()` → `check_subgraph_calls()` → `provide(driver=…)`. The last step is why
+  `DriverSymbol` was written in stage B with no call site, and it is what let
+  `FlowMatchingSpec.func_name` stop being `Unchecked` — its own note had said "checkable as a
+  DriverSymbol only once the driver is IR rather than text", and it now is for both driver shapes,
+  because the link resolves against the built *script* rather than the entry function alone.
+
+  **Wrapping a driver in a `RawBlock` would, on its own, have checked nothing** — and the plan's claim
+  that the five TTS drivers "gain `check_subgraph_calls()` for the first time" would have been false,
+  since that walks `SubgraphCall` nodes and raw text has none. The adoption therefore *parses* its own
+  `loom.run_subgraph` call sites and declares each through the P4.0.5 protocol, which is also what gets
+  `TopologyInput`'s bidirectional message for free. Coverage is printed per export in **two** numbers,
+  because "checked" covers two amounts: a call passing a table literal has its full input set compared,
+  one passing a prepared variable only has its topology name checked.
+
+  **The gate found a real, undeclared property of two exports.** Kokoro's and StyleTTS2's drivers call
+  topologies their MIL export does not produce — they are *partial* exports whose drivers run against a
+  mix of MIL topologies and pre-MIL ones loaded from the bespoke `.gguf` alongside, which the C++ e2e
+  tests do from two `GgufModel`s and nothing on the export side said. `external_topologies()` is that
+  finding as a declaration, checked in both directions so it cannot rot: a name it lists that this
+  export *does* produce is stale, one no call site references is dead. Declaring beats the alternative
+  (skip any call naming an unexported topology), which would make a typo and a cross-GGUF dependency
+  indistinguishable.
+
+  **Where peeled Lua lives — `.lua` fragments, not Python strings** (author's decision). Each family is
+  a directory of small fragments plus a component list that orders them and declares each one's
+  `reads`/`defines`. The alternative puts the hand-written half of every TTS model behind a quoting
+  layer, and the point of the exercise is to make these drivers easier to reason about. Section spacing
+  lives in the fragments too, as data, rather than as a rule the builder would guess.
+
+  **The peels are honestly uneven, and the boundary is the same one BACKEND.md already drew.** Matcha
+  and Supertonic peel almost completely; Supertonic introduced *no new component class*, which is the
+  reuse claim tested rather than asserted. VITS needed no sampler at all. Kokoro and StyleTTS2 are thin:
+  of eleven and thirteen `run_subgraph` calls, two each become IR, while the rest name their topology
+  with a computed expression, sit inside a Lua `for` loop, or — StyleTTS2's `diffusion` — inside a
+  closure the ADPM2 sampler invokes twice per step. Forcing those into components would mean modelling
+  Lua control flow in the IR. **`LuaFragment` parses its own call sites for exactly this reason: a peel
+  must never *reduce* checking**, and without that, moving a block into a fragment would take its calls
+  out of the parser's reach.
+
+  **Two mistakes the new checks caught, both mine, both worth recording.** A `defines` list copied from
+  Kokoro into StyleTTS2 claimed a local that family never binds — the export refused, naming the field
+  and the fragment, before any tracing. And the first Matcha component list put the sampler at the top
+  to match where its function appears in the output; that reads `t_mel` before the fragment binding it,
+  and `validate()` rejected it. A component's prelude is collected separately from its statements, so a
+  sampler belongs at its *call* site and its function still comes out on top.
+
+  **Gate — passed.** C.2 and C.3: byte-identical for all eleven, `diff -r` empty including
+  `model_driver_script.txt`. C.4–C.8: each family's `test_e2e_*_mil_lua_driver` passing with
+  numerically identical output (Matcha max_abs_diff=0.0104421 unchanged; VITS/Kokoro/StyleTTS2 per-sample
+  against their bespoke oracles, 49671/22207/22207 checks), every topology, weight and non-driver KV
+  byte-identical, and the driver-text diff read and attached to each commit — which is how the
+  Layout A/B slip in one rewritten comment was found, since no test covers a comment. Negative gates on
+  both builders and all five families, each failing a real export with the link's own message.
 - **P4.0.7 — the component registry ("marketplace").** Six components exist (`FlowMatchingSpec`,
   `EstimatorSpec`, `ModularExportSpec`, the prefill prologue/epilogue, `recurrent.py`'s stepping loop,
   `ExportPhase`) and are assembled four different ways — marker substitution, direct-to-IR, inline, ad
@@ -1570,11 +1635,11 @@ SupertonicTTS, StyleTTS2.
   (`src/core/vits_driver.cpp`, the pre-procedural-generalization C++ driver, now legacy/oracle-only, kept
   only as the reference the bespoke topology's own `vits_driver.lua` was checked against when that
   architecture landed). `export_vits_mil.py` packs all three topologies (`stats`/`logw`/`flow_vocoder`)
-  plus a new hand-written orchestration script, `tools/convert_piper_vits/vits_driver_mil.lua`, into one
+  plus a new hand-written orchestration script, `tools/convert_piper_vits/vits_driver/`, into one
   combined `vits_mil.gguf` (mirroring `convert_vits_lua_all.py`'s own packing for the bespoke topology).
   The cross-phase host logic (duration-based frame expansion, RNG sampling) is genuine host control flow
   no amount of MIL tracing can produce either way — it was always hand-written, in Lua, regardless of
-  whether the topologies underneath are hand-built or machine-traced; `vits_driver_mil.lua`'s own math is
+  whether the topologies underneath are hand-built or machine-traced; `vits_driver/`'s own math is
   IDENTICAL to `vits_driver.lua`'s, differing only in the new topologies' own conventions (no host-side
   `emb_rel_k`/`emb_rel_v`/`attn_mask` plumbing needed at all — computed in-graph now; `stats`/`z_p` are
   T-fast, not channel-fast — see the script's own comments for why). One real exporter-side bug surfaced
@@ -1818,7 +1883,7 @@ SupertonicTTS, StyleTTS2.
     always a single, unpadded utterance. Deliberately does NOT apply the real code's own final
     `.transpose(-1,-2)` (the exact live-non-contiguous-view footgun `export_vits_mil.py`'s own
     `StatsWrapper` already found for VITS's `stats` output) — returns the natural (T,512) time-major
-    layout instead; `kokoro_driver_mil.lua` converts via `from_row_major`, no transpose needed Lua-side
+    layout instead; `kokoro_driver/` converts via `from_row_major`, no transpose needed Lua-side
     either. Verified against `reference_forward_kokoro_albert_bert_encoder_mil.py`
     (`test_e2e_kokoro_mil_albert_bert_encoder_reference.cpp`): ~1.8e-6 mean / ~1.5e-5 max abs diff.
   - **Three real, general (not Kokoro-specific) bugs found and fixed getting this phase to trace/build/
@@ -1876,7 +1941,7 @@ SupertonicTTS, StyleTTS2.
        (~1e-20) positive epsilon UNIFORMLY, not just at the boundary-mask positions — closes both cases,
        confirmed via an isolated forward-STFT probe (6206/105622 boundary-only outliers → 3, the
        remainder being genuine, unavoidable float32 sign-crossing boundary sensitivity).
-  - **`kokoro_driver_mil.lua` written**, wiring the two new MIL topologies together with the EXISTING
+  - **`kokoro_driver/` written**, wiring the two new MIL topologies together with the EXISTING
     bespoke LSTM-bound topologies (`text_encoder_cnn`/`text_encoder_lstm_*`, `duration_lstm_*`/
     `duration_adaln_*`/`top_lstm_*`/`duration_proj`, `f0n_shared_lstm_*`/`f0n_f0_block*`/`f0n_n_block*`/
     `f0n_f0_proj`/`f0n_n_proj`, unchanged from `kokoro_driver.lua` — LSTM-bound pieces stay bespoke, ggml
@@ -1899,7 +1964,7 @@ SupertonicTTS, StyleTTS2.
 - **StyleTTS2 — DONE, numerically verified (2026-07-26)**, done out of the original stated order (ahead
   of Matcha-TTS/SupertonicTTS) on explicit user direction, precisely BECAUSE it could reuse Kokoro's own
   lessons so directly: `export_styletts2_mil.py` produces three MIL topologies into one combined
-  `styletts2_mil.gguf` (`styletts2_driver_mil.lua` orchestrates them alongside the EXISTING bespoke
+  `styletts2_mil.gguf` (`styletts2_driver/` orchestrates them alongside the EXISTING bespoke
   LSTM-bound topologies from `convert_styletts2_reused.py` — DurationEncoder/predictor.lstm/duration_proj,
   F0Ntrain, TextEncoder's BiLSTM — unchanged, ggml has no native LSTM op, same scoping exclusion Kokoro's
   own MIL export already established):
@@ -1976,7 +2041,7 @@ SupertonicTTS, StyleTTS2.
   `ConformerWrapper`/LSTM path involved at all — real config uses `down_block_type="transformer"`
   throughout, so unlike Kokoro/StyleTTS2 this model needed ZERO hybrid MIL/bespoke split) into one
   combined `matcha_mil.gguf` (`encoder_mu`/`encoder_logw`/`decoder`/`vocoder`, wired together by a new
-  `tools/convert_matcha/matcha_driver_mil.lua`, mirroring `matcha_driver.lua`'s own Euler-CFM-sampling +
+  `tools/convert_matcha/matcha_driver/`, mirroring `matcha_driver.lua`'s own Euler-CFM-sampling +
   duration-expansion control flow). Verified against the SAME real-module reference fixtures the bespoke
   conversion's own per-module tests already use (`reference_forward_matcha_{text_encoder,decoder,vocoder}
   .py` — the "eager wrapper vs. real module" simplifications made here are mathematically exact for this
@@ -2044,7 +2109,7 @@ SupertonicTTS, StyleTTS2.
     position-index range still produces a plausible-looking, just wrong, rotation for every token after
     the first.
 
-  `tools/convert_matcha/matcha_driver_mil.lua`'s own layout differs from the bespoke `matcha_driver.lua`:
+  `tools/convert_matcha/matcha_driver/`'s own layout differs from the bespoke `matcha_driver.lua`:
   the MIL-traced `encoder_mu`'s own `mu` output preserves the real module's native torch (1,n_feats,T)
   layout untouched (T-fast, matching the Decoder's/vocoder's own convention directly) rather than the
   bespoke topology's C-fast "rows_flat" one — deliberately NOT correcting this with a wrapper-level
@@ -2056,7 +2121,7 @@ SupertonicTTS, StyleTTS2.
 - **SupertonicTTS — DONE, numerically verified (2026-07-26)**. `export_supertonic_mil.py` traces the REAL
   `supertonic_tts.models.modules.*` submodules directly (no hand-built bespoke topology involved) into one
   combined `supertonic_mil.gguf` (`dp`/`ttl_text`/`vfe`/`decoder`, wired together by a new
-  `tools/convert_supertonic/supertonic_driver_mil.lua` mirroring the bespoke `supertonic_driver.lua`'s own
+  `tools/convert_supertonic/supertonic_driver/` mirroring the bespoke `supertonic_driver.lua`'s own
   control flow) — needed ZERO hand-reimplemented primitives (unlike the bespoke conversion's own
   `supertonic_common.py`, invaluable here purely as an independently-derived oracle for cross-checking
   every architectural quirk found while reading source, e.g. `StyleCrossAttention`'s `scale=sqrt(dim)` not

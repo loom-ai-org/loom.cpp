@@ -127,7 +127,7 @@ class TTLTextWrapper(torch.nn.Module):
 
 class VFEWrapper(torch.nn.Module):
     """Real `VectorFieldEstimator.compute_velocity` (assets/pt/vector_estimator.pt) -- ONE Euler velocity
-    evaluation; the `z += v*dt` update itself is a Lua/host-side loop (`supertonic_driver_mil.lua`), same
+    evaluation; the `z += v*dt` update itself is a Lua/host-side loop (`supertonic_driver/`), same
     split as the bespoke `supertonic_driver.lua`. `txt_emb`'s own T axis is FIXED at trace time
     (T_TEXT_FIXED) -- see module docstring for why. `t`: (1,) float fractional step in [0,1).
     """

@@ -593,6 +593,19 @@ so the API is proven against working code before the harder migration, and the g
 `render_driver`) becomes a single raw block inside a built `IRFunction`. No semantic change; the five TTS
 drivers gain `check_subgraph_calls()` for the first time.
 
+> **Correction, written while doing it.** That last sentence is false as stated, and the negative gate is
+> what would have exposed it. `check_subgraph_calls` walks `SubgraphCall` nodes and raw text has none, so
+> wrapping a driver in a `RawBlock` checks *nothing*: the export is byte-identical and the drivers gain
+> exactly what they had before. The step only earns its claim if the adoption **parses** its own
+> `loom.run_subgraph` call sites and declares them — which is better anyway, because routing them through
+> the P4.0.5 protocol rather than a second copy of `check_subgraph_calls` gets `TopologyInput`'s
+> bidirectional "what is also missing" message for free, and lets the label carry the file and line.
+>
+> A second correction the same step forced: **the entry function is `synthesize`, not the whole file.**
+> A driver is a Lua *module* — preamble, top-level helper functions, then the entry point the host
+> resolves as a global — so "the `.lua` becomes a raw block inside an `IRFunction`" would have nested
+> every helper inside `synthesize`. `DriverScript` is prelude lines + entry + postlude for that reason.
+
 *Expect this step to find real bugs*, and treat that as success rather than a blocker: five hand-written
 drivers have never had their `run_subgraph` calls cross-checked against their topologies' declared
 inputs. `LuaCodegen` must emit raw-block text verbatim, with no reindentation, or the gate fails for a
@@ -621,6 +634,30 @@ checker for Lua.
 models' numeric reference tests; and the negative gate's per-family probes, with their messages, in the
 commit — the stage's headline claim is that five drivers gained a check they never had, and that claim
 is not testable from the snapshot side.
+
+### What stage C found that this plan did not predict
+
+* **Two of the eleven exports are not self-contained, and nothing said so.** Kokoro's and StyleTTS2's
+  drivers call topologies their MIL export does not produce: they are *partial* exports whose drivers run
+  against a mix of MIL topologies and pre-MIL ones loaded from the bespoke `.gguf` alongside — which
+  `test_e2e_{kokoro,styletts2}_mil_lua_driver.cpp` does, from two `GgufModel`s, and which the export side
+  never recorded. `BaseMultiPhaseModelExportConfig.external_topologies()` is that finding as a
+  declaration, checked in both directions (a name it lists that this export *does* produce is stale; one
+  no call site references is dead). Declaring beats the obvious alternative — skip any call naming an
+  unexported topology — which would make a typo and a cross-GGUF dependency indistinguishable.
+* **Where peeled Lua lives had to be decided, and it is `.lua` fragments** (author's call): a directory of
+  small files per family, ordered by the component list, each declaring its `reads`/`defines`. There is no
+  half-measure that is not marker substitution again, and Lua as Python string literals would put the
+  hand-written half of every TTS model behind a quoting layer.
+* **A peel can silently *reduce* checking**, and Kokoro is where that would have happened: moving a block
+  out of the adopted driver and into a fragment takes its call sites out of the parser's reach. So
+  `LuaFragment` parses its own. Worth stating as a rule for the families still to come — a migration step
+  that removes a check is not a refactor.
+* **The peels are uneven and that is the honest outcome, not a shortfall.** Matcha and Supertonic peel
+  almost completely; Supertonic introduced no new component class at all. Kokoro and StyleTTS2 convert two
+  calls each out of eleven and thirteen: the rest name their topology with a computed expression, sit
+  inside a Lua `for` loop, or (StyleTTS2's `diffusion`) inside a closure the ADPM2 sampler invokes twice
+  per step. That boundary is the same one BACKEND.md already drew, reached independently.
 
 ### Stage D — P4.0.7: the component registry
 

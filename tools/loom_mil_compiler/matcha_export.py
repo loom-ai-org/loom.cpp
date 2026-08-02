@@ -21,7 +21,7 @@ n_feats contiguous floats each) because it builds `mu` via an explicit MUL_MAT a
 [T,C] CONV_1D-friendly convention, exactly like `z`/`dphi_dt`/`mel` already are). This is actually a
 SIMPLER pipeline than the bespoke one (no channel-first/T-first bridging transpose needed feeding the
 Decoder), at the cost of needing the duration-expansion (per-token repeat) step to operate natively in
-T-fast layout -- see `matcha_driver_mil.lua`'s own comment for the resulting direct (no
+T-fast layout -- see `matcha_driver/`'s own comment for the resulting direct (no
 `loom.expand_by_duration` reuse) repeat loop. Deliberately did NOT add a `.transpose()` in the wrapper to
 match the bespoke convention instead: a bare transpose as a topology's own final declared output is a
 live, non-contiguous GGML PERMUTE view once compiled (`ggml_backend_tensor_get` does a raw contiguous

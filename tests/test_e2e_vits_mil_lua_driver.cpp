@@ -1,6 +1,6 @@
 // Validates the MIL-traced VITS export (export_vits_mil.py) end-to-end: runs the real piper VITS
 // checkpoint through a LoomLuaBridge executing the MIL-traced orchestration
-// (tools/convert_piper_vits/vits_driver_mil.lua, loaded from export_vits_mil.py's single combined
+// (tools/convert_piper_vits/vits_driver/, loaded from export_vits_mil.py's single combined
 // vits_mil.gguf) and checks the result is a well-formed, plausible waveform.
 //
 // This does NOT compare against the existing hand-written loom::VitsDriver (the bespoke topology's own
