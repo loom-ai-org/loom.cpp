@@ -215,10 +215,14 @@ class DriverBuilder:
         validate(entry)
         check_subgraph_calls(entry, ctx.topologies)
 
-        checker.provide(driver=entry)
+        # The whole script, not just the entry function: a driver is a Lua module, and a generated
+        # sampler is a top-level `local function` in the prelude, so a `DriverSymbol` link naming one
+        # is only answerable against the script.
+        script = DriverScript(prelude=prelude, entry=entry, postlude=postlude)
+        checker.provide(driver=script)
         if owned:
             checker.finish()
-        return DriverScript(prelude=prelude, entry=entry, postlude=postlude)
+        return script
 
     def render(self, ctx: DriverContext, checker: Optional[LinkChecker] = None) -> str:
         """The embedded `model.driver_script` text."""

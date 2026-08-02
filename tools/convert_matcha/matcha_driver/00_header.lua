@@ -1,0 +1,30 @@
+-- Lua port of loom::MatchaDriver::synthesize, wired to the MIL-traced topologies of matcha_mil.gguf
+-- (export_matcha_mil.py) instead of the bespoke hand-built ones (convert_matcha_*.py /
+-- convert_matcha_lua_all.py's own matcha_driver.lua). Same control-flow shape (per-token duration
+-- expansion + deterministic Euler CFM sampling loop) and the same host/inputs/outputs contract as
+-- matcha_driver.lua -- only the internal tensor-layout bridging differs, see below.
+--
+-- Layout note (differs from matcha_driver.lua): the bespoke "encoder_mu" topology emits `mu` C-fast
+-- (ne=[n_feats,T], "rows_flat" convention -- T rows of n_feats contiguous floats each) because it's
+-- built via an explicit MUL_MAT against a [C,T]-convention `x`. Tracing the REAL TextEncoder module
+-- instead preserves its own native torch (1,n_feats,T) layout untouched, which is T-FAST (ne=[T,n_feats],
+-- flat[c*T+t]) -- the SAME convention the Decoder's own z/mu/dphi_dt and the vocoder's own mel already
+-- use (see export_matcha_mil.py's own module docstring for why no corrective transpose was added: doing
+-- so would make the topology's declared output a bare GGML PERMUTE, a live non-contiguous view that
+-- silently corrupts the read-out once compiled). Net effect: unlike matcha_driver.lua, NO transpose is
+-- needed bridging TextEncoder's mu into the Decoder's own mu input here -- but the duration-expansion
+-- (per-token repeat) step itself must operate directly in this T-fast layout instead of reusing
+-- loom.expand_by_duration (which expects the opposite, C-fast "rows_flat" convention) -- done with a
+-- direct nested-loop repeat below instead.
+--
+-- Expects four modules pre-registered by the host: "encoder_mu", "encoder_logw", "decoder", "vocoder"
+-- -- none use a KvCache. The MIL-traced "encoder_mu"/"encoder_logw" topologies take ONLY `tokens` (no
+-- separate `positions`/`attn_mask` inputs -- RoPE positions and the all-ones attention mask are both
+-- derived internally from the real traced module, not supplied by the host, unlike the bespoke
+-- topologies' own explicit inputs).
+--
+-- inputs: tokens (int array, real n_vocab=178 Matcha-TTS vocabulary), n_steps (int, Euler sampler step
+-- count), seed (int, seeds loom.gaussian_array -- the ONLY stochastic point in this pipeline), plus the
+-- real model constants n_feats, mel_mean, mel_std (MatchaConfig's own real defaults).
+--
+-- Returns: the raw waveform (flat f32 array), same convention as MatchaDriver::synthesize's own return.

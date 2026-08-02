@@ -158,6 +158,16 @@ class BaseMultiPhaseModelExportConfig(LoomExportConfig):
     def estimators(self) -> List[EstimatorSpec]:
         return []
 
+    def driver_components(self) -> Optional[List]:
+        """The `DriverComponent`s this family's driver is built from, or `None` while it is still one
+        hand-written `.lua` adopted whole (P4.0.6/C.3's `RawLuaDriver`).
+
+        This is the migration seam, and it is deliberately per-family: a family is peeled in its own
+        commit, gated by its own e2e test, and every other family keeps exporting byte-identically
+        while that happens. `driver_script_path` stays meaningful for both -- an unpeeled family reads
+        the whole file, a peeled one reads its fragments from the directory beside it."""
+        return None
+
     def external_topologies(self) -> Dict[str, str]:
         """`{topology name: where it comes from}` for topologies this family's driver calls that this
         export deliberately does **not** produce.

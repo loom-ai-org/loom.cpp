@@ -481,22 +481,45 @@ class DriverSymbol(Link):
     def check(self, spec, value, ctx, site):
         from .driver_ir import Function
 
-        function = ctx.driver
+        driver = ctx.driver
+        # Either the entry function alone, or the whole built script -- a driver is a Lua *module*, so
+        # a top-level `local function` in the prelude (every generated sampler is one) is a symbol the
+        # driver really defines, and a link that could not see those would fail exactly the components
+        # P4.0.6 introduced it for.
+        function = getattr(driver, "entry", driver)
         if not isinstance(function, Function):
             raise LinkError(
-                f"{site.label}.{site.field}: the driver context slot holds {type(function).__name__}, "
+                f"{site.label}.{site.field}: the driver context slot holds {type(driver).__name__}, "
                 f"not a driver_ir.Function."
             )
         names = list(value) if isinstance(value, (list, tuple)) else [value]
         defined = set(function.params)
         for stmt in function.body:
             defined.update(stmt.defines())
+        defined.update(_top_level_function_names(getattr(driver, "prelude", ())))
         unknown = [n for n in names if n not in defined]
         if unknown:
             raise LinkError(
                 f"{site.label}.{site.field} reads driver symbol(s) {unknown}, which the emitted driver "
                 f"'{function.name}' never defines (defines: {sorted(defined)})."
             )
+
+
+_TOP_LEVEL_FUNCTION = None  # compiled on first use; see _top_level_function_names
+
+
+def _top_level_function_names(prelude_lines) -> set:
+    """Names bound by a top-level `function f(...)` / `local function f(...)` in a driver's prelude."""
+    global _TOP_LEVEL_FUNCTION
+    if _TOP_LEVEL_FUNCTION is None:
+        import re
+        _TOP_LEVEL_FUNCTION = re.compile(r"^\s*(?:local\s+)?function\s+([A-Za-z_]\w*)\s*\(")
+    names = set()
+    for line in prelude_lines or ():
+        match = _TOP_LEVEL_FUNCTION.match(line)
+        if match:
+            names.add(match.group(1))
+    return names
 
 
 # -- combinators ------------------------------------------------------------------------------------

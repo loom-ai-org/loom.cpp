@@ -463,5 +463,6 @@ class LuaCodegen:
         if isinstance(stmt, RawBlock):
             if stmt.verbatim:
                 return list(stmt.lines)
-            return [f"{pad}{line}" for line in stmt.lines]
+            # A blank line stays blank rather than becoming the indent's worth of trailing whitespace.
+            return [f"{pad}{line}" if line else "" for line in stmt.lines]
         raise DriverIRError(f"LuaCodegen: unhandled IR node {stmt!r}")

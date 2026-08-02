@@ -47,7 +47,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .spec_protocol import (
-    CoveredBy, FieldRef, LinkChecker, TopologyInput, TopologyName, TopologyOutputArity, Unchecked,
+    CoveredBy, DriverSymbol, FieldRef, LinkChecker, TopologyInput, TopologyName, TopologyOutputArity,
+    Unchecked,
 )
 
 
@@ -136,13 +137,14 @@ class FlowMatchingSpec:
         "carried_input": CoveredBy("supplied_inputs"),
         "time_input": CoveredBy("supplied_inputs"),
         "fixed_inputs": CoveredBy("supplied_inputs"),
+        # Was `Unchecked` until P4.0.6/C.4, with the reason "checkable as a DriverSymbol only once the
+        # driver is IR rather than text". It now is, for both driver shapes, because `DriverSymbol`
+        # resolves against the built *script* rather than the entry function alone: a generated sampler
+        # is a top-level `local function` in the prelude either way -- emitted by `FlowMatchingSampler`
+        # for a peeled family, substituted into the adopted text for one that is not.
+        "func_name": DriverSymbol(),
     }
     __unchecked__ = {
-        "func_name": Unchecked(
-            "the name of the Lua function render_sampler emits. Checkable as a DriverSymbol only once "
-            "the driver is IR rather than text -- P4.0.6, which is exactly what makes the driver "
-            "inspectable; today the caller's one-line call site is hand-written Lua."
-        ),
         "note": Unchecked("cosmetic: rendered as a comment above the generated sampler."),
     }
 
@@ -227,8 +229,12 @@ def render_driver(driver_source: str, specs=(), topologies=None, estimators=(), 
     As of P4.0.5 the checking is `spec_protocol`'s (`EXPORT-PREPARATION.md` stage B.2). `checker` lets
     the caller pass the export-wide `LinkChecker` -- `MultiPhase.export` does, so a spec declared here
     and a spec declared anywhere else in the same export share one deferral ledger and one `finish()`.
-    Without one, a local checker is built and finished here, which is the same guarantee for a caller
-    that has nothing else to check.
+
+    **Without one, a local checker is built and finished here -- and since P4.0.6/C.4 that is no longer
+    the same guarantee.** `FlowMatchingSpec.func_name` is a `DriverSymbol`, answerable only against the
+    built driver, which this function does not have: it produces the text, the builder produces the
+    script. So the local checker is handed the substituted source as the driver, which is exactly what
+    it is -- a Lua module whose top-level `local function` definitions are the symbols in question.
     """
     if topologies is not None:
         owned = checker is None
@@ -237,7 +243,13 @@ def render_driver(driver_source: str, specs=(), topologies=None, estimators=(), 
             checker.check(spec)
         checker.provide(topologies=topologies)
         if owned:
+            rendered = _substitute(driver_source, specs)
+            checker.provide(driver=_TextDriver(rendered.split("\n")))
             checker.finish()
+    return _substitute(driver_source, specs)
+
+
+def _substitute(driver_source: str, specs) -> str:
     if not specs:
         return driver_source
     if SAMPLER_MARKER not in driver_source:
@@ -245,3 +257,20 @@ def render_driver(driver_source: str, specs=(), topologies=None, estimators=(), 
             f"driver source has no {SAMPLER_MARKER!r} line for the generated sampler(s) to replace"
         )
     return driver_source.replace(SAMPLER_MARKER, "\n\n".join(render_sampler(s) for s in specs))
+
+
+@dataclass
+class _TextDriver:
+    """A driver that is still text rather than a built `DriverScript`, for `DriverSymbol` to read.
+
+    Every line is "prelude" because that is what the substituted source is from this function's point
+    of view: a Lua module whose top-level definitions are visible and whose entry function's body is
+    not this function's business."""
+
+    prelude: list
+
+    @property
+    def entry(self):
+        from .driver_ir import Function
+
+        return Function("<text driver>", [], [])

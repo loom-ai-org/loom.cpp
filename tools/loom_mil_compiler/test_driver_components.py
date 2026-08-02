@@ -10,6 +10,7 @@ These run with no coremltools program: the components take IR pieces the exporte
 which is precisely what makes them testable without a traced model, and is why the exporter keeps
 ownership of `safe_name`/the MIL function rather than a component reaching for it.
 """
+import dataclasses
 import sys
 import unittest
 from pathlib import Path
@@ -19,10 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
-    ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder, PrefillArgmaxBuilder, RawLuaDriver,
-    caller_input, parse_run_subgraph_calls,
+    FlowMatchingSampler, LuaFragment, ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder,
+    PrefillArgmaxBuilder, RawLuaDriver, SubgraphCallComponent, caller_input, parse_run_subgraph_calls,
 )
-from loom_mil_compiler.driver_ir import BinOp, Len, Lit, LuaCodegen, Var
+from loom_mil_compiler.driver_ir import (
+    BinOp, DriverIRError, Len, Lit, LuaCodegen, SubgraphCall, Var,
+)
 from loom_mil_compiler.spec_protocol import LinkError
 
 
@@ -319,9 +322,11 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
 
     def test_the_five_real_drivers_all_round_trip(self):
         """Not a fixture: the actual shipped `.lua` files, which is the only thing C.3's byte-identity
-        gate is a claim about."""
+        gate is a claim about. Four, not five, since C.4 peeled Matcha -- and the count is asserted so
+        that peeling a family without updating this test is noticed rather than silently reducing the
+        coverage of the claim."""
         drivers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
-        self.assertEqual(len(drivers), 5, [d.name for d in drivers])
+        self.assertEqual(len(drivers), 4, [d.name for d in drivers])
         for path in drivers:
             RawLuaDriver(source=path.read_text(), origin=path.name).assert_round_trip()
 
@@ -399,3 +404,148 @@ class TestExternalTopologies(unittest.TestCase):
             external = config_class.external_topologies(config_class)
             driver = RawLuaDriver(source=path.read_text(), origin=path.name, external=external)
             self.assertEqual(driver.called_topologies() - exported, set(external), path.name)
+
+
+# -- C.4: peeling a family into components ------------------------------------------------------------
+
+
+def _ctx():
+    """A context with no topologies: a fragment emits Lua text and calls nothing."""
+    return DriverContext(topologies={})
+
+
+class TestLuaFragment(unittest.TestCase):
+    """A fragment's `reads`/`defines` are what make it composable -- `driver_ir.validate` runs over the
+    assembled function, so a fragment placed before what it reads fails at export time. The declaration
+    is therefore worth checking against the fragment's own text, since the rot that actually happens is
+    renaming a local in the `.lua` and leaving the declaration behind."""
+
+    def setUp(self):
+        self.dir = Path(__file__).resolve().parent / "_fragment_fixture"
+        self.dir.mkdir(exist_ok=True)
+        self.path = self.dir / "block.lua"
+        self.path.write_text("    local total = 0\n    for i = 1, #xs do total = total + xs[i] end\n")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_body_fragment_keeps_its_text_verbatim_and_carries_its_declaration(self):
+        block, = LuaFragment(self.path, reads=("xs",), defines=("total",)).emit(_ctx())
+        self.assertTrue(block.verbatim)
+        self.assertEqual(block.reads(), ["xs"])
+        self.assertEqual(block.defines(), ["total"])
+        self.assertEqual(block.lines[0], "    local total = 0")
+
+    def test_a_top_level_fragment_goes_to_the_prelude_instead(self):
+        fragment = LuaFragment(self.path, top_level=True)
+        self.assertEqual(fragment.emit(_ctx()), [])
+        self.assertEqual(fragment.prelude(_ctx())[-1], "", "a blank line separates it from what follows")
+
+    def test_a_stale_defines_declaration_fails(self):
+        fragment = LuaFragment(self.path, reads=("xs",), defines=("tota",))
+        with self.assertRaises(LinkError) as raised:
+            _Peeled([fragment]).build(_ctx())
+        self.assertEqual(
+            str(raised.exception),
+            "LuaFragment('block.lua') declares that it defines ['tota'], but its text never mentions "
+            "those names. A stale defines list makes driver_ir.validate accept an ordering the driver "
+            "does not actually support.",
+        )
+
+    def test_a_stale_reads_declaration_fails(self):
+        fragment = LuaFragment(self.path, reads=("ys",), defines=("total",))
+        with self.assertRaises(LinkError) as raised:
+            _Peeled([fragment]).build(_ctx())
+        self.assertIn("declares that it reads ['ys']", str(raised.exception))
+
+    def test_an_out_of_order_fragment_is_caught_by_validate(self):
+        """The check the peel exists for: a block moved above what it reads is an export-time error
+        rather than a runtime one -- and no hand-written driver has ever had it."""
+        with self.assertRaises(DriverIRError) as raised:
+            _Peeled([LuaFragment(self.path, reads=("xs",), defines=("total",))]).build(_ctx())
+        self.assertIn("symbol 'xs' is read", str(raised.exception))
+
+
+class _Peeled(MultiPhaseDriverBuilder):
+    def __init__(self, components):
+        super().__init__(peeled=list(components))
+
+
+class TestPeeledMatcha(unittest.TestCase):
+    """The first peeled family, driven from the real config and the real `.lua` fragments."""
+
+    def _ctx(self):
+        return DriverContext(
+            topologies={"encoder_mu": _topo(["tokens"]), "encoder_logw": _topo(["tokens"]),
+                        "decoder": _topo(["z", "mu", "t"]), "vocoder": _topo(["mel"])},
+            axes={n: "n_tokens" for n in ("encoder_mu", "encoder_logw", "decoder", "vocoder")},
+        )
+
+    def _config(self):
+        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+
+        return TTSMatchaExportConfig(model_dir="/unused", output_path="/unused", architecture="matcha")
+
+    def _render(self):
+        return MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(self._ctx())
+
+    def test_it_assembles_into_a_driver_that_validates(self):
+        text = self._render()
+        self.assertIn("function synthesize(inputs)", text)
+        self.assertTrue(text.endswith("    return waveform\nend\n"),
+                        "a peeled driver ends with a newline, like every hand-written one")
+
+    def test_the_generated_sampler_lands_above_the_entry_function(self):
+        """`FlowMatchingSampler` sits at its CALL site in the component list -- placing it earlier to
+        match where its function appears is the ordering validate() rejects, since the call reads
+        `t_mel`. Its prelude is collected separately, so the function still comes out on top."""
+        text = self._render()
+        self.assertLess(text.index("local function sample_decoder"),
+                        text.index("function synthesize(inputs)"))
+        self.assertLess(text.index("function synthesize(inputs)"),
+                        text.index("local z = sample_decoder("))
+
+    def test_every_run_subgraph_call_is_ir_rather_than_text(self):
+        """What the peel buys structurally: `check_subgraph_calls` sees these directly, including their
+        output arity, which a call site parsed out of raw text cannot."""
+        script = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).build(self._ctx())
+        calls = [s for s in script.entry.body if isinstance(s, SubgraphCall)]
+        self.assertEqual([c.module for c in calls], ["encoder_mu", "encoder_logw", "vocoder"])
+
+    def test_func_name_is_now_a_real_driver_symbol(self):
+        """The gap FlowMatchingSpec's own Unchecked note predicted P4.0.6 would close: the sampler's
+        name was a string matched by a marker, and is now a symbol the built script either defines or
+        does not.
+
+        Renaming `func_name` would not test it -- one component emits both the definition and the
+        call, so they move together. What the link guards is a driver that *calls* the sampler without
+        the definition being emitted at all, which is precisely what the marker-substitution form could
+        produce silently: a `.lua` calling `sample_decoder` whose marker line was deleted."""
+        class _CallOnly(FlowMatchingSampler):
+            def prelude(self, ctx):
+                return []
+
+        components = []
+        for component in self._config().driver_components():
+            if isinstance(component, FlowMatchingSampler):
+                component = _CallOnly(**{f.name: getattr(component, f.name)
+                                         for f in dataclasses.fields(FlowMatchingSampler)})
+            components.append(component)
+        with self.assertRaises(LinkError) as raised:
+            MultiPhaseDriverBuilder(peeled=components).build(self._ctx())
+        self.assertIn("reads driver symbol(s) ['sample_decoder']", str(raised.exception))
+
+    def test_a_call_whose_inputs_drift_from_the_topology_fails(self):
+        components = self._config().driver_components()
+        call = next(c for c in components
+                    if isinstance(c, SubgraphCallComponent) and c.topology == "vocoder")
+        call.inputs = {"mels": call.inputs["mel"]}
+        with self.assertRaises(LinkError) as raised:
+            MultiPhaseDriverBuilder(peeled=components).build(self._ctx())
+        self.assertEqual(
+            str(raised.exception),
+            "loom.run_subgraph('vocoder') does not match topology 'vocoder': supplies input(s) it does "
+            "not declare: ['mels']; leaves declared input(s) unsupplied: ['mel']; topology declares "
+            "['mel'], spec supplies ['mels'].",
+        )
