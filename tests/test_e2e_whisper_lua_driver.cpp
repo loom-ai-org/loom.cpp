@@ -137,12 +137,19 @@ int main() {
     {
         loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
         loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
-        // Same construction as WhisperDriver's own internal KvCache (src/core/whisper_driver.cpp).
-        loom::KvCache kv_cache(cfg.n_text_layer, cfg.n_text_state, cfg.n_text_state, cfg.n_text_ctx, backend.get());
+
+        // KV-CACHE.md stage 1: NOTHING here reads `cfg`. Which topology needs a cache is the
+        // topology's own answer, and how big to make it is the GGUF's -- so this block is now the same
+        // code for any cached model, which is the whole claim of the stage. It used to be
+        // `KvCache(cfg.n_text_layer, cfg.n_text_state, cfg.n_text_state, cfg.n_text_ctx, ...)`, i.e. a
+        // hardcoded per-model C++ struct standing between a "self-contained" GGUF and running it.
+        LOOM_CHECK(!encoder_topo.uses_kv_cache());
+        LOOM_CHECK(decoder_topo.uses_kv_cache());
+        std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
 
         loom::LoomLuaBridge bridge(backend.get());
         bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
-        bridge.register_module("decoder", *model, std::move(decoder_topo), &kv_cache);
+        bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
         bridge.load_script(driver_script);
 
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
