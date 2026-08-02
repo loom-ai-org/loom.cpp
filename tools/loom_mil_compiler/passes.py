@@ -678,6 +678,180 @@ class lower_reduce_mean(AbstractGraphPass):
         return True
 
 
+@register_pass(namespace="loom")
+class fuse_loom_attention(AbstractGraphPass):
+    """
+    Replaces each traced scaled-dot-product-attention block with one `loom_fused_attention` op, which
+    `topology_ops.py` lowers to the engine's `ATTENTION` primitive -- the only node type that can reach
+    a KV cache (KV-CACHE.md stage 2).
+
+    **Opt-in, and that is a correctness requirement rather than caution.** The pattern below is generic
+    SDPA, so it matches VITS's/Kokoro's/StyleTTS2's self-attention just as well as a causal LM's -- and
+    those are non-autoregressive, so giving them an ATTENTION node (whose `kv_cache` attr defaults to
+    TRUE) would hand them a persistent cache they must never have. Only the causal-LM family sets
+    `fuse_attention=True`; every other model's topology is untouched, which is also what keeps their
+    byte-identity gates meaningful.
+
+    The window, anchored on `softmax` and confirmed against a real trace (a randomly-initialised
+    2-layer Llama and, at full size, Qwen3-0.6B -- both produce it identically):
+
+        mul       (q, 1/sqrt(head_dim))            -- scale folded onto Q by HF, not onto the scores
+        matmul    (q_scaled, k, transpose_y=True)  -- Q @ K^T
+        add       (scores, mask)                   -- mask is a slice_by_index of the graph input
+        softmax   (axis=-1)
+        matmul    (probs, v)
+        transpose (perm=[0, 2, 1, 3])              -- [b, h, s, d] -> [b, s, h, d]
+        reshape                                    -- -> [b, s, h*d]
+
+    Both trailing ops are absorbed, because `op_attention` already returns the flattened
+    `[n_embd, n_tokens]` context; stopping at the second matmul would leave the op's declared MIL type
+    disagreeing with what the engine actually computes.
+
+    **`layer` is assigned in attention-block occurrence order, NOT by torch module index**, and the
+    distinction is load-bearing. The index addresses a cache slot, and the cache has one slot per
+    ATTENTION block -- so for an architecture that interleaves non-attention layers (LFM2's conv
+    blocks), the dense occurrence index is the correct one and the module index would address past the
+    end of the cache. It also means `loom.n_layer` for cache sizing is the count of attention blocks,
+    which for a uniform decoder like Qwen3 is the same number and for LFM2 is not.
+
+    Anything that does not match is left exactly as it was: an unfused block still exports and still
+    runs, just without a cache. A partial match must never half-rewrite.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._next_layer = 0
+            self._fuse_block(f)
+
+    @block_context_manager
+    def _fuse_block(self, block):
+        for op in list(block.operations):
+            # Same guard as fuse_gqa_repeat_kv: `getattr(..., block)` because the bespoke workflow's
+            # duck-typed MockOperations carry no `enclosing_block`, and "attribute missing" must read as
+            # "still present" rather than as "already removed".
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._fuse_block(b)
+            if op.op_type != "softmax":
+                continue
+            if self._try_to_transform(op, block):
+                self._next_layer += 1
+
+    @staticmethod
+    def _binary_operands(op, want_op_type):
+        """`op`'s two operands as (the one produced by `want_op_type`, the other), or None. Written
+        order-agnostically because `add`'s operands are commutative and their traced order is not a
+        promise -- keying on position would make this pass architecture-sensitive for no reason."""
+        x, y = op.inputs.get("x"), op.inputs.get("y")
+        if x is None or y is None:
+            return None
+        if x.op is not None and x.op.op_type == want_op_type:
+            return x, y
+        if y.op is not None and y.op.op_type == want_op_type:
+            return y, x
+        return None
+
+    def _try_to_transform(self, softmax_op, block) -> bool:
+        axis = softmax_op.inputs.get("axis")
+        if axis is None or axis.val is None or int(axis.val) not in (-1, 3):
+            return False
+
+        scores = softmax_op.inputs.get("x")
+        if scores is None or scores.op is None or scores.op.op_type != "add":
+            return False
+        add_op = scores.op
+        operands = self._binary_operands(add_op, "matmul")
+        if operands is None:
+            return False
+        qk_var, mask_var = operands
+        qk_op = qk_var.op
+
+        # Q @ K^T, and K must NOT be pre-transposed by a separate op -- `transpose_y` is how the traced
+        # graph spells it, and a False here means this is some other matmul that happens to feed a
+        # softmax.
+        transpose_y = qk_op.inputs.get("transpose_y")
+        transpose_x = qk_op.inputs.get("transpose_x")
+        if transpose_y is None or transpose_y.val is None or not bool(transpose_y.val):
+            return False
+        if transpose_x is not None and transpose_x.val is not None and bool(transpose_x.val):
+            return False
+
+        q_var = qk_op.inputs.get("x")
+        k_var = qk_op.inputs.get("y")
+        if q_var is None or k_var is None:
+            return False
+
+        # The scale HF folds onto Q. Recovered rather than recomputed from head_dim: a model with a
+        # non-default scale (or none) is then still correct, and `scale=1.0` with the `mul` left in
+        # place is a valid outcome rather than a silent 1/sqrt(d) that was never in the graph.
+        scale = 1.0
+        if q_var.op is not None and q_var.op.op_type == "mul":
+            factors = (q_var.op.inputs.get("x"), q_var.op.inputs.get("y"))
+            const_side = [f for f in factors if f is not None and f.val is not None and f.shape in ((), (1,))]
+            other_side = [f for f in factors if f is not None and f.val is None]
+            if len(const_side) == 1 and len(other_side) == 1:
+                scale = float(np.array(const_side[0].val).ravel()[0])
+                q_var = other_side[0]
+
+        # Down the graph: probs @ V, then the transpose+reshape back to [b, seq, n_embd].
+        probs_children = list(softmax_op.outputs[0].child_ops)
+        if len(probs_children) != 1 or probs_children[0].op_type != "matmul":
+            return False
+        av_op = probs_children[0]
+        if av_op.inputs.get("x") is not softmax_op.outputs[0]:
+            return False
+        v_var = av_op.inputs.get("y")
+        if v_var is None:
+            return False
+        for flag in ("transpose_x", "transpose_y"):
+            f = av_op.inputs.get(flag)
+            if f is not None and f.val is not None and bool(f.val):
+                return False
+
+        av_children = list(av_op.outputs[0].child_ops)
+        if len(av_children) != 1 or av_children[0].op_type != "transpose":
+            return False
+        transpose_op = av_children[0]
+        perm = transpose_op.inputs.get("perm")
+        if perm is None or perm.val is None or list(np.array(perm.val).ravel()) != [0, 2, 1, 3]:
+            return False
+
+        transpose_children = list(transpose_op.outputs[0].child_ops)
+        if len(transpose_children) != 1 or transpose_children[0].op_type != "reshape":
+            return False
+        reshape_op = transpose_children[0]
+        out_var = reshape_op.outputs[0]
+        if out_var.shape is None or len(out_var.shape) != 3:
+            return False
+
+        # Every rank check the op's own type_inference would make, made here first -- a pass that raises
+        # from inside mb.loom_fused_attention leaves the block half-rewritten, whereas bailing here
+        # leaves a graph that still exports.
+        for var in (q_var, k_var, v_var):
+            if var.shape is None or len(var.shape) != 4:
+                return False
+        if not isinstance(q_var.shape[1], int) or not isinstance(v_var.shape[3], int):
+            return False
+
+        with _scope_ctx_like(softmax_op):
+            fused = mb.loom_fused_attention(
+                q=q_var, k=k_var, v=v_var, mask=mask_var,
+                scale=np.float32(scale), layer=np.int32(self._next_layer),
+                name=out_var.name, before_op=qk_op,
+            )
+
+        if not reshape_op.enclosing_block.try_replace_uses_of_var_after_op(
+            anchor_op=reshape_op, old_var=out_var, new_var=fused,
+        ):
+            return False
+        # Only the ops this fusion definitively subsumed. Everything upstream (the q `mul`, the mask's
+        # own slice chain) is left to dead_code_elimination, which is the pass that knows whether some
+        # other consumer still needs it -- this one does not.
+        block.remove_ops([reshape_op, transpose_op, av_op, softmax_op, add_op, qk_op])
+        return True
+
+
 _LOOM_PASS_NAMES = [
     "loom::fuse_gqa_repeat_kv",
     "loom::normalize_matmul",
@@ -689,8 +863,13 @@ _LOOM_PASS_NAMES = [
     "common::dead_code_elimination",
 ]
 
+# Runs only when the caller asks for it (KV-CACHE.md decision 4). Placed after the GQA fusion, which
+# normalizes `repeat_kv()` into a reshape/tile/reshape triple the attention fusion can see past, and
+# before dead_code_elimination, which is what removes the subgraph the fusion orphans.
+_LOOM_ATTENTION_PASS_NAME = "loom::fuse_loom_attention"
 
-def apply_loom_mil_passes(prog) -> None:
+
+def apply_loom_mil_passes(prog, fuse_attention: bool = False) -> None:
     """
     Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
     normalization (R2a), mutual-broadcast insertion (R2a), replicate-pad and depthwise-conv_transpose
@@ -707,4 +886,8 @@ def apply_loom_mil_passes(prog) -> None:
     have (see `test_compiler.py`'s `MockOperation`), which are never meant to pass a real MIL validate().
     """
     for pass_name in _LOOM_PASS_NAMES:
+        if pass_name == "common::dead_code_elimination" and fuse_attention:
+            # Must land between the rewrites and the DCE that cleans up after them, which is why this
+            # is spliced here rather than appended to the list.
+            PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME](prog)
         PASS_REGISTRY[pass_name](prog)

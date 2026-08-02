@@ -3,27 +3,75 @@ from coremltools.converters.mil.mil.operation import Operation
 from coremltools.converters.mil.mil.input_type import InputSpec, TensorInputType
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs._utils import infer_type_with_broadcast
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 @register_op(namespace="loom")
 class loom_fused_attention(Operation):
     """
-    Specialized Loom dynamic attention primitive.
+    Specialized Loom dynamic attention primitive: one whole scaled-dot-product-attention block, standing
+    in for the `mul -> matmul(transpose_y) -> add(mask) -> softmax -> matmul -> transpose -> reshape`
+    subgraph a traced causal LM produces per layer (see `passes.py`'s `fuse_loom_attention`, which
+    inserts it, and `topology_ops.py`'s rule, which lowers it to the engine's own `ATTENTION` primitive).
+
+    This op is **the only door to the engine's KV cache** (KV-CACHE.md §1.1): `op_attention`
+    (src/ops/primitives_attention.cpp) is what reads `n_past`/`n_kv` off SymbolEnv, appends this step's
+    K/V at cells `[n_past, n_past + n_tokens)` and reads back `[0, n_kv)`. A topology with no ATTENTION
+    node cannot touch a cache at all, which is precisely why a MIL-exported causal LM had none: this op
+    was registered and mapped (`exporter.py`'s OP_MAP) from the start, and the pass that was supposed to
+    produce it had `pass` for a body.
+
+    `scale` is carried rather than left folded onto q because the engine's ATTENTION applies it inside
+    `ggml_soft_max_ext`; `layer` indexes the cache and is assigned by the pass in **attention-block
+    occurrence order**, not by torch module index -- see `fuse_loom_attention` for why that distinction
+    is load-bearing for architectures like LFM2 that interleave non-attention layers.
+
+    Shape contract, in MIL's own (forward) axis order:
+        q     [b, n_head,    seq, head_dim_k]
+        k     [b, n_head_kv, seq, head_dim_k]
+        v     [b, n_head_kv, seq, head_dim_v]
+        mask  [b, 1,         seq, kv]
+        out   [b, seq, n_head * head_dim_v]
+
+    The output is the flattened, pre-output-projection context -- i.e. the fusion absorbs the trailing
+    `transpose`+`reshape` too. That is not a convenience: `op_attention` itself returns
+    `[n_embd, n_tokens]`, so declaring anything else here would make the op's MIL type disagree with what
+    the engine actually produces, and every downstream shape would be derived from the wrong one.
     """
     input_spec = InputSpec(
         q=TensorInputType(type_domain="T"),
         k=TensorInputType(type_domain="T"),
         v=TensorInputType(type_domain="T"),
         mask=TensorInputType(optional=True, type_domain="T"),
+        scale=TensorInputType(const=True, optional=True, type_domain="T"),
+        layer=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
 
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
 
+    def default_inputs(self):
+        from coremltools.converters.mil.mil.input_type import DefaultInputs
+        return DefaultInputs(scale=1.0, layer=0)
+
     def type_inference(self):
-        return self.q.sym_type
+        q_shape = list(self.q.shape)
+        v_shape = list(self.v.shape)
+        if len(q_shape) != 4 or len(v_shape) != 4:
+            raise ValueError(
+                f"loom_fused_attention expects rank-4 q/v [b, heads, seq, head_dim], got q={q_shape}, "
+                f"v={v_shape}"
+            )
+        batch, n_head, seq = q_shape[0], q_shape[1], q_shape[2]
+        head_dim_v = v_shape[3]
+        # n_head and head_dim are architecture constants; only `seq` is ever symbolic here. Guarding
+        # rather than assuming, because a symbolic head count would silently produce a symbolic n_embd
+        # that every downstream reshape would then inherit.
+        if not isinstance(n_head, int) or not isinstance(head_dim_v, int):
+            raise ValueError(
+                f"loom_fused_attention needs a static head count and head_dim to compute its flattened "
+                f"output width, got n_head={n_head}, head_dim_v={head_dim_v}"
+            )
+        return types.tensor(self.q.dtype, (batch, seq, n_head * head_dim_v))
 
 @register_op(namespace="loom")
 class loom_spline(Operation):
@@ -255,16 +303,7 @@ class loom_scale(Operation):
         return self.x.sym_type
 
 
-@register_pass(namespace="loom")
-class FuseLoomAttention(AbstractGraphPass):
-    """
-    Custom fusion pass scanning standard MIL blocks and fusing them into
-    the specialized 'loom_fused_attention' primitive.
-    """
-    def apply(self, prog):
-        for f in prog.functions.values():
-            self._fuse_blocks(f)
-
-    def _fuse_blocks(self, block):
-        # Placeholder for future pattern matching & replacement logic
-        pass
+# The fusion pass that produces `loom_fused_attention` lives in `passes.py` (`loom::
+# fuse_loom_attention`), with every other MIL->MIL rewrite this exporter runs. It was a `pass`-bodied
+# `FuseLoomAttention` stub here for the whole of P3/P4.0 -- see KV-CACHE.md §1.3, which measured what
+# that cost: 28 SOFTMAX and zero ATTENTION nodes in a MIL-exported Qwen3, hence no reachable KV cache.

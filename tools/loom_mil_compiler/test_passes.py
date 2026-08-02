@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 from coremltools.converters.mil.mil import Builder as mb, get_new_symbol, types
 
-from loom_mil_compiler.passes import PASS_REGISTRY
+from loom_mil_compiler.passes import PASS_REGISTRY, apply_loom_mil_passes
 
 
 def _ops(prog):
@@ -285,6 +285,139 @@ class TestLowerReduceMean(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as cm:
             PASS_REGISTRY["loom::lower_reduce_mean"](prog)
         self.assertIn("single reduction axis", str(cm.exception))
+
+
+class TestFuseLoomAttention(unittest.TestCase):
+    """`fuse_loom_attention` (KV-CACHE.md stage 2). Unlike the other passes here, a miss is not merely a
+    missed optimization: this op is the only node type that can reach the engine's KV cache, so a
+    silently-unmatched block is a model that cannot generate. The negative cases matter as much -- the
+    pattern is generic SDPA, and it must not fire on graphs that only look like it."""
+
+    N_HEAD, HEAD_DIM, SEQ = 4, 8, 6
+
+    def _sdpa(self, scale=0.35355338, transpose_y=True, trailing=True, n_blocks=1):
+        n_head, head_dim, seq = self.N_HEAD, self.HEAD_DIM, self.SEQ
+        specs = [mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32) for _ in range(3)]
+        specs.append(mb.TensorSpec(shape=(1, 1, seq, seq), dtype=types.fp32))
+
+        @mb.program(input_specs=specs)
+        def prog(q, k, v, mask):
+            out = None
+            for _ in range(n_blocks):
+                qs = q if scale is None else mb.mul(x=q, y=np.float32(scale))
+                scores = mb.matmul(x=qs, y=k, transpose_x=False, transpose_y=transpose_y)
+                scores = mb.add(x=scores, y=mask)
+                probs = mb.softmax(x=scores, axis=-1)
+                ctx = mb.matmul(x=probs, y=v, transpose_x=False, transpose_y=False)
+                if not trailing:
+                    out = ctx
+                    continue
+                ctx = mb.transpose(x=ctx, perm=[0, 2, 1, 3])
+                out = mb.reshape(x=ctx, shape=[1, seq, n_head * head_dim])
+            return out
+
+        return prog
+
+    def _fused(self, prog):
+        return [op for op in prog.functions["main"].operations if op.op_type == "loom_fused_attention"]
+
+    def test_a_whole_sdpa_block_becomes_one_op(self):
+        prog = self._sdpa()
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        fused = self._fused(prog)
+        self.assertEqual(len(fused), 1)
+        self.assertNotIn("softmax", _ops(prog))
+        # The trailing transpose+reshape are absorbed too: op_attention returns the flattened context,
+        # so the op's declared type has to be [b, seq, n_head*head_dim] or it disagrees with the engine.
+        self.assertEqual(tuple(fused[0].outputs[0].shape), (1, self.SEQ, self.N_HEAD * self.HEAD_DIM))
+        self.assertAlmostEqual(float(fused[0].scale.val), 0.35355338, places=6)
+
+    def test_layer_indices_are_assigned_in_occurrence_order(self):
+        # The index addresses a CACHE SLOT, and the cache has one slot per attention block -- so a dense
+        # occurrence index is correct even for an architecture that interleaves non-attention layers,
+        # where the torch module index would address past the end of the cache.
+        prog = self._sdpa(n_blocks=3)
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual([int(op.layer.val) for op in self._fused(prog)], [0, 1, 2])
+
+    def test_an_unscaled_block_fuses_with_scale_1(self):
+        # Recovered from the graph rather than recomputed as 1/sqrt(head_dim): a model with no scale (or
+        # a non-default one) must not silently acquire one that was never traced.
+        prog = self._sdpa(scale=None)
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        fused = self._fused(prog)
+        self.assertEqual(len(fused), 1)
+        self.assertAlmostEqual(float(fused[0].scale.val), 1.0, places=6)
+
+    def test_a_matmul_that_is_not_q_at_k_transposed_is_untouched(self):
+        # Built by hand rather than via _sdpa: with transpose_y=False the two operands genuinely do not
+        # contract, so K has to be pre-transposed for the graph to type-check at all. That IS the shape
+        # this guards -- a softmax fed by an ordinary matmul is not an attention block, and `transpose_y`
+        # is how the traced pattern spells Q @ K^T.
+        n_head, head_dim, seq = self.N_HEAD, self.HEAD_DIM, self.SEQ
+
+        @mb.program(input_specs=[
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_head, head_dim, seq), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, 1, seq, seq), dtype=types.fp32),
+        ])
+        def prog(q, k_t, v, mask):
+            scores = mb.matmul(x=q, y=k_t, transpose_x=False, transpose_y=False)
+            scores = mb.add(x=scores, y=mask)
+            probs = mb.softmax(x=scores, axis=-1)
+            ctx = mb.matmul(x=probs, y=v, transpose_x=False, transpose_y=False)
+            ctx = mb.transpose(x=ctx, perm=[0, 2, 1, 3])
+            return mb.reshape(x=ctx, shape=[1, seq, n_head * head_dim])
+
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(self._fused(prog), [])
+        self.assertIn("softmax", _ops(prog))
+
+    def test_a_block_without_the_trailing_reshape_is_untouched(self):
+        # A partial match must never half-rewrite: what does not match exports and runs as before, just
+        # without a cache.
+        prog = self._sdpa(trailing=False)
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(self._fused(prog), [])
+        self.assertIn("softmax", _ops(prog))
+
+    def test_a_bare_softmax_is_untouched(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3), dtype=types.fp32)])
+        def prog(x):
+            return mb.softmax(x=x, axis=-1)
+
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(self._fused(prog), [])
+        self.assertEqual(_ops(prog), ["softmax"])
+
+
+class TestAttentionFusionIsOptIn(unittest.TestCase):
+    """Decision 4, and it is a correctness requirement rather than caution: the pattern is generic SDPA,
+    so it matches the non-autoregressive TTS families' self-attention too -- and an ATTENTION node's
+    `kv_cache` attr defaults to TRUE, so firing there would hand them persistent state they must never
+    have (and would break their byte-identity gates)."""
+
+    def _prog(self):
+        return TestFuseLoomAttention()._sdpa()
+
+    def test_the_pipeline_does_not_fuse_by_default(self):
+        prog = self._prog()
+        apply_loom_mil_passes(prog)
+        self.assertEqual([op for op in prog.functions["main"].operations
+                          if op.op_type == "loom_fused_attention"], [])
+
+    def test_the_pipeline_fuses_when_asked(self):
+        prog = self._prog()
+        apply_loom_mil_passes(prog, fuse_attention=True)
+        self.assertEqual(len([op for op in prog.functions["main"].operations
+                              if op.op_type == "loom_fused_attention"]), 1)
 
 
 if __name__ == "__main__":
