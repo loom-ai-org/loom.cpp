@@ -1,10 +1,12 @@
-// Validates the MIL-traced Kokoro export (export_kokoro_mil.py) end-to-end: runs the real Kokoro-82M
-// checkpoint through a LoomLuaBridge executing the hybrid orchestration
-// (tools/convert_kokoro/kokoro_driver/, loaded from export_kokoro_mil.py's combined
-// kokoro_mil.gguf), with the two MIL-traced topologies ("albert_bert_encoder", "decoder_vocoder")
-// registered alongside the LSTM-bound topologies still loaded from the EXISTING bespoke kokoro.gguf
-// (convert_kokoro_lua_all.py) -- see kokoro_driver/'s own module docstring for why those pieces
-// stay bespoke (ggml has no native LSTM op).
+// Validates the MIL-traced Kokoro export end-to-end: runs the real Kokoro-82M checkpoint through a
+// LoomLuaBridge executing the orchestration in tools/convert_kokoro/kokoro_driver/, loaded from the
+// combined kokoro_mil.gguf -- with EVERY topology it calls coming from that one file.
+//
+// It used to be a hybrid: two MIL-traced topologies plus 37 LSTM-bound ones from a second GgufModel
+// over the pre-MIL kokoro.gguf, because ggml has no LSTM op and those pieces had never been traced.
+// P4.0.7 closed that -- the six BiLSTMs export as RecurrentPhases (per-timestep cell topologies plus a
+// host-side loop) and the remaining hand-built pieces as ordinary traced phases -- so this test now
+// loads exactly one file, which is what the one-GGUF-per-model convention always meant.
 //
 // This does NOT compare against loom::KokoroDriver/kokoro_driver.lua's own oracle waveform the way
 // test_e2e_kokoro_lua_driver.cpp does for the all-bespoke Lua port -- deliberately, same reasoning
@@ -16,8 +18,9 @@
 // decoder_vocoder means a tight full-pipeline match against the bespoke oracle isn't a meaningful target.
 // The per-phase reference tests (test_e2e_kokoro_mil_albert_bert_encoder_reference.cpp,
 // test_e2e_kokoro_mil_decoder_vocoder_reference.cpp) are where the real numerical confidence comes from;
-// this test's own job is just to confirm the LUA ORCHESTRATION (mixed bespoke+MIL topology registration,
-// cross-phase RNG, frame expansion) runs end-to-end without crashing and produces a sane result.
+// this test's own job is just to confirm the LUA ORCHESTRATION (topology registration, cross-phase RNG,
+// frame expansion) runs end-to-end without crashing and produces a sane result. Numerical equivalence
+// with the bespoke topologies these replaced is test_e2e_kokoro_mil_topology_equivalence.cpp's job.
 
 #include "test_util.h"
 
@@ -33,16 +36,11 @@
 #include <vector>
 
 int main() {
-    const char* dir_lua_env = std::getenv("LOOM_KOKORO_LUA_DIR");
     const char* gguf_mil_env = std::getenv("LOOM_KOKORO_MIL_GGUF");
-    if (dir_lua_env == nullptr || gguf_mil_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_KOKORO_LUA_DIR (a directory with kokoro.gguf, produced "
-                              "by convert_kokoro_lua_all.py, for the LSTM-bound bespoke topologies) and "
-                              "LOOM_KOKORO_MIL_GGUF (kokoro_mil.gguf, produced by export_kokoro_mil.py) "
-                              "to run this check\n");
+    if (gguf_mil_env == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_KOKORO_MIL_GGUF (kokoro_mil.gguf) to run this check\n");
         return 77;
     }
-    const std::string dir_lua = dir_lua_env;
     const std::string gguf_mil_path = gguf_mil_env;
 
     // Same fixture as test_e2e_kokoro_lua_driver.cpp/test_e2e_kokoro_driver.cpp's own oracle test.
@@ -58,8 +56,6 @@ int main() {
     loom::KokoroConfig cfg; // real defaults: style_dim=128, d_model=512, hidden_per_dir=256, etc.
     std::vector<float> lua_wav;
     {
-        auto model_lua = loom::GgufModel::load(dir_lua + "/kokoro.gguf", backend.get());
-        LOOM_CHECK(model_lua != nullptr);
         auto model_mil = loom::GgufModel::load(gguf_mil_path, backend.get());
         LOOM_CHECK(model_mil != nullptr);
         const std::string driver_script = model_mil->kv_str("model.driver_script");
@@ -67,47 +63,22 @@ int main() {
 
         loom::LoomLuaBridge bridge(backend.get());
 
-        // Every topology the driver calls, registered from the MIL GGUF when it has one and from the
-        // pre-MIL kokoro.gguf otherwise. Written this way rather than as two fixed lists because the
-        // MIL export is progressively taking these over -- `text_encoder_lstm_*` moved across when
-        // `RecurrentPhase` landed (P4.0.7) -- and a fixed list would have to be edited in lockstep,
-        // which is exactly the kind of bookkeeping that silently keeps testing the old path.
-        // `mil_topology_count` below then asserts how far that has got, so the transfer cannot happen
-        // by accident either.
-        int mil_topology_count = 0;
-        const auto register_preferring_mil = [&](const char* name) {
-            if (model_mil->has_topology(name)) {
-                bridge.register_module(name, *model_mil,
-                                        loom::GraphTopology::parse(model_mil->topology_json(name)));
-                ++mil_topology_count;
-            } else {
-                bridge.register_module(name, *model_lua,
-                                        loom::GraphTopology::parse(model_lua->topology_json(name)));
-            }
-        };
-
-        const char* bespoke_topo_names[] = {
-            "albert_bert_encoder", "decoder_vocoder",
-            "text_encoder_cnn",
-            "text_encoder_lstm_h_fwd", "text_encoder_lstm_c_fwd", "text_encoder_lstm_h_bwd", "text_encoder_lstm_c_bwd",
-            "duration_lstm_0_h_fwd", "duration_lstm_0_c_fwd", "duration_lstm_0_h_bwd", "duration_lstm_0_c_bwd",
-            "duration_lstm_1_h_fwd", "duration_lstm_1_c_fwd", "duration_lstm_1_h_bwd", "duration_lstm_1_c_bwd",
-            "duration_lstm_2_h_fwd", "duration_lstm_2_c_fwd", "duration_lstm_2_h_bwd", "duration_lstm_2_c_bwd",
-            "duration_adaln_0", "duration_adaln_1", "duration_adaln_2",
-            "top_lstm_h_fwd", "top_lstm_c_fwd", "top_lstm_h_bwd", "top_lstm_c_bwd",
-            "duration_proj",
-            "f0n_shared_lstm_h_fwd", "f0n_shared_lstm_c_fwd", "f0n_shared_lstm_h_bwd", "f0n_shared_lstm_c_bwd",
-            "f0n_f0_block0", "f0n_f0_block1", "f0n_f0_block2",
-            "f0n_n_block0", "f0n_n_block1", "f0n_n_block2",
-            "f0n_f0_proj", "f0n_n_proj",
-        };
-        for (const char* name : bespoke_topo_names) {
-            register_preferring_mil(name);
+        // Every topology the driver calls, all of them from kokoro_mil.gguf. Until P4.0.7 this
+        // registered a mix: the two MIL-traced phases plus 37 LSTM-bound ones loaded from a SECOND
+        // GgufModel over the pre-MIL kokoro.gguf, because the MIL export was partial. It no longer is
+        // -- the six BiLSTMs are RecurrentPhases and the rest are ordinary traced phases -- so the
+        // artifact under test is one self-contained file, which is what the one-GGUF-per-model
+        // convention always meant.
+        //
+        // Numerical equivalence with the topologies these replaced is NOT this test's job and never
+        // was (it has no oracle waveform -- see the header). It is
+        // test_e2e_kokoro_mil_topology_equivalence.cpp's, which feeds identical inputs to both files'
+        // versions of every shared topology.
+        for (const std::string& name : model_mil->topology_names()) {
+            bridge.register_module(name, *model_mil,
+                                    loom::GraphTopology::parse(model_mil->topology_json(name)));
         }
-        // albert_bert_encoder + decoder_vocoder + the four text_encoder_lstm cells. Asserted so that a
-        // regression which quietly stopped exporting one -- and fell back to the bespoke copy -- fails
-        // here rather than passing on the old path.
-        LOOM_CHECK(mil_topology_count == 6);
+        LOOM_CHECK(model_mil->topology_names().size() == 39);
 
         bridge.load_script(driver_script);
 

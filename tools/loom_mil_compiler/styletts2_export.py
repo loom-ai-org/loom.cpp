@@ -79,7 +79,7 @@ class StyleTTS2ModelPatcher(ModelPatcher):
 StyleTTS2ModelPatcher.prepare_environment()
 
 from transformers import AlbertConfig  # noqa: E402
-from kokoro.modules import CustomAlbert  # noqa: E402
+from kokoro.modules import CustomAlbert, ProsodyPredictor, TextEncoder  # noqa: E402
 from kokoro.istftnet import Decoder  # noqa: E402
 
 # `kokoro_export`'s own import applies its trace-friendly monkeypatches (AdainResBlk1d/SineGen/
@@ -375,14 +375,12 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         ]
 
     def external_topologies(self) -> Dict[str, str]:
-        """StyleTTS2's MIL export is **partial**, the same way Kokoro's is and for the same reason --
-        see `TTSKokoroExportConfig.external_topologies` for the full note. Three heavy stages move to
-        MIL (`albert`, `diffusion`, `decoder_vocoder`); the rest of the driver's calls land on
-        topologies still loaded from the pre-MIL `styletts2.gguf`, which is exactly what
-        `test_e2e_styletts2_mil_lua_driver.cpp` registers alongside this export."""
-        from_bespoke = "the pre-MIL styletts2.gguf, registered alongside this export by the host"
-        return {"bert_encoder": from_bespoke, "text_encoder_cnn": from_bespoke,
-                "duration_proj": from_bespoke}
+        """Empty, as of P4.0.7 -- see `TTSKokoroExportConfig.external_topologies` for the full note.
+
+        This listed `bert_encoder`, `text_encoder_cnn` and `duration_proj` while StyleTTS2's MIL export
+        was partial. All three are now traced here, along with the six BiLSTMs and everything else the
+        driver calls, so the emitted GGUF is self-contained."""
+        return {}
 
     __unchecked__ = {
         "checkpoint_path": Unchecked(
@@ -433,7 +431,38 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         print("Tracing diffusion phase...")
         diffusion_phase = build_diffusion_phase(transformer)
 
-        return [albert_phase, dv_phase, diffusion_phase]
+        # bert_encoder: the Linear(768, 512) projecting raw bert_dur for the duration half. Kept out of
+        # the "albert" phase deliberately (the diffusion sampler needs the UNPROJECTED bert_dur -- see
+        # this module's own docstring), and traced here rather than borrowed from the pre-MIL gguf.
+        bert_encoder = torch.nn.Linear(bert.config.hidden_size, kokoro_cfg["hidden_dim"])
+        load_submodule(bert_encoder, sd_all["bert_encoder"])
+        bert_encoder.eval()
+
+        # TextEncoder + ProsodyPredictor: the same classes Kokoro uses, with this checkpoint's weights
+        # (Kokoro is a StyleTTS2 derivative -- the bespoke converters reuse Kokoro's hyperparameter
+        # dicts for StyleTTS2 wholesale), so their 21 phases come from one shared builder rather than a
+        # second copy. Same reuse as `build_decoder_vocoder_phase` just above.
+        text_encoder = TextEncoder(channels=kokoro_cfg["hidden_dim"],
+                                    kernel_size=kokoro_cfg["text_encoder_kernel_size"],
+                                    depth=kokoro_cfg["n_layer"], n_symbols=kokoro_cfg["n_token"])
+        predictor = ProsodyPredictor(style_dim=kokoro_cfg["style_dim"], d_hid=kokoro_cfg["hidden_dim"],
+                                      nlayers=kokoro_cfg["n_layer"], max_dur=kokoro_cfg["max_dur"],
+                                      dropout=kokoro_cfg["dropout"])
+        load_submodule(text_encoder, sd_all["text_encoder"])
+        load_submodule(predictor, sd_all["predictor"])
+        text_encoder.eval()
+        predictor.eval()
+
+        print("Tracing bert_encoder + TextEncoder/ProsodyPredictor phases...")
+        bert_encoder_phase = ExportPhase(
+            name="bert_encoder", wrapper=_BertEncoderWrapper(bert_encoder).eval(),
+            dummy_inputs=(torch.randn(7, bert.config.hidden_size),),
+            mil_inputs=[ct.TensorType(name="x", shape=(ct.RangeDim(1, 2000), bert.config.hidden_size),
+                                      dtype=np.float32)],
+        )
+
+        return [albert_phase, dv_phase, diffusion_phase, bert_encoder_phase,
+                *kokoro_export.build_prosody_phases(text_encoder, predictor)]
 
     def estimators(self) -> List[EstimatorSpec]:
         # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
@@ -479,3 +508,26 @@ def register(registry) -> None:
         config_class=BaseMultiPhaseModelExportConfig,
         recognizers=[ModelRecognizer(name="styletts2", detect=_is_styletts2, build_config=_build_styletts2)],
     ))
+
+
+class _BertEncoderWrapper(torch.nn.Module):
+    """`bert_encoder` -- Linear(768, 512), rows_flat in, **Layout A out**.
+
+    The input side is rows_flat: the bespoke topology declares `x` as `["768", "$n_tokens"]`
+    (ne=[768, T], flat[t*768+c] -- a contiguous torch `(T, 768)`), and the driver hands it `bert_out`
+    straight from the "albert" phase, which is time-major for exactly this reason.
+
+    The OUTPUT side crosses layouts, and this is the one place in the transfer where the two sides
+    genuinely disagreed. The bespoke topology ends in `PERMUTE(axes=[1,0,2,3]) + CONT`, so it returns
+    Layout A -- and the driver reads it that way (`d_en_flat[c * T_text + t + 1]`, with the fragment's
+    own comment saying "Layout A [T,512]"). A wrapper that just returned the Linear's natural `(T, 512)`
+    builds and runs and produces a transposed result: the equivalence test caught it as
+    mean_abs_diff=0.717 against a reference whose values only reach 2.23, which is what a transpose
+    looks like when nothing crashes."""
+
+    def __init__(self, linear):
+        super().__init__()
+        self.linear = linear
+
+    def forward(self, x):  # (T, 768) rows_flat -> (512, T) Layout A
+        return self.linear(x).transpose(0, 1).contiguous()

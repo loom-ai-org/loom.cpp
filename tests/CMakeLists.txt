@@ -1074,6 +1074,14 @@ target_link_libraries(test_e2e_kokoro_mil_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_lua_driver COMMAND test_e2e_kokoro_mil_lua_driver)
 set_tests_properties(test_e2e_kokoro_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- Drop-in equivalence: each MIL-traced topology against the bespoke one it replaces. The real
+#     numerical gate for moving a topology out of kokoro.gguf and into kokoro_mil.gguf, since
+#     test_e2e_kokoro_mil_lua_driver has no oracle waveform by design (see its own header). ---
+add_executable(test_e2e_kokoro_mil_topology_equivalence test_e2e_kokoro_mil_topology_equivalence.cpp)
+target_link_libraries(test_e2e_kokoro_mil_topology_equivalence PRIVATE loom::engine)
+add_test(NAME test_e2e_kokoro_mil_topology_equivalence COMMAND test_e2e_kokoro_mil_topology_equivalence)
+set_tests_properties(test_e2e_kokoro_mil_topology_equivalence PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Procedural generalization: StyleTTS2, the most complex driver ported so far (44 topologies, 6
 #     BiLSTM instances, and the genuinely new style-diffusion sampler -- ADPM2 over the real
 #     Transformer1d denoiser, ported to Lua as plain host arithmetic + loom.run_subgraph calls), compared

@@ -419,23 +419,26 @@ class TestExternalTopologies(unittest.TestCase):
             "(1 with their full input set); 1 call topolog(ies) this export does not produce and the "
             "config declares external (vocoder)")
 
-    def test_the_two_partial_families_declare_exactly_what_their_drivers_call(self):
-        """Driven from the real `.lua` files and the real configs, so a driver gaining a call into the
-        bespoke gguf without a matching declaration fails here rather than at export time."""
+    def test_no_family_is_partial_any_more(self):
+        """Both families that WERE partial now export every topology their driver calls.
+
+        `external_topologies()` existed because Kokoro's and StyleTTS2's MIL exports were incomplete:
+        their drivers ran against a mix of MIL topologies and pre-MIL ones from a second GGUF. P4.0.7
+        closed that -- the six BiLSTMs became `RecurrentPhase`s and the rest ordinary traced phases --
+        so both declare nothing.
+
+        The declaration machinery stays and is still tested above, because the next partial family will
+        need it. What is NOT asserted here is that every driver call resolves: that needs the real
+        checkpoint, and `test_e2e_{kokoro,styletts2}_mil_lua_driver.cpp` are the authority, since they
+        now load exactly one GGUF and a missing topology fails them outright."""
         from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
         from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
 
-        configs = (
-            (TTSKokoroExportConfig(model_dir="/unused", output_path="/unused", architecture="kokoro"),
-             {"albert_bert_encoder", "decoder_vocoder"}),
-            (TTSStyleTTS2ExportConfig(checkpoint_path="/unused", output_path="/unused",
-                                      architecture="styletts2"),
-             {"albert", "decoder_vocoder", "diffusion"}),
-        )
-        for config, exported in configs:
-            external = config.external_topologies()
-            self.assertEqual(_called_topologies(config) - exported, set(external),
-                             type(config).__name__)
+        kokoro = TTSKokoroExportConfig(model_dir="/u", output_path="/u", architecture="kokoro")
+        styletts2 = TTSStyleTTS2ExportConfig(checkpoint_path="/u", output_path="/u",
+                                             architecture="styletts2")
+        self.assertEqual(kokoro.external_topologies(), {})
+        self.assertEqual(styletts2.external_topologies(), {})
 
 
 # -- C.4: peeling a family into components ------------------------------------------------------------
@@ -674,11 +677,15 @@ class TestPeeledKokoro(unittest.TestCase):
         self.assertIn("duration_proj", seen)
         self.assertIn("text_encoder_cnn", seen)
 
-    def test_an_external_call_inside_a_fragment_is_not_reported_as_missing(self):
+    def test_a_fragment_call_is_now_checked_rather_than_declared_external(self):
+        """The other side of the `external_topologies()` story. While the export was partial these two
+        were *excluded* from checking, because the topologies they name were not in the file. Now that
+        the export produces them, the exclusion is gone and the calls are link-checked like any other
+        -- which is strictly better, and is what "self-contained" buys beyond packaging."""
         fragments = [c for c in self._components() if isinstance(c, LuaFragment)]
         declared = {call.topology for f in fragments for call in f.sub_specs()}
-        self.assertNotIn("text_encoder_cnn", declared, "declared external by the config")
-        self.assertNotIn("duration_proj", declared, "declared external by the config")
+        self.assertIn("text_encoder_cnn", declared)
+        self.assertIn("duration_proj", declared)
 
     def test_the_seven_input_call_is_rendered_as_a_block(self):
         """Cosmetic and load-bearing: the embedded driver_script is what someone inspecting a GGUF
