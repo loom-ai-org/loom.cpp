@@ -1,4 +1,6 @@
 #include "loom/core/kv_cache.h"
+
+#include "loom/core/gguf_model.h"
 #include "loom/loom_errors.h"
 
 #include <ggml-alloc.h>
@@ -61,6 +63,38 @@ void KvCache::reset() {
     if (store_buf_) {
         ggml_backend_buffer_clear(store_buf_.get(), 0);
     }
+}
+
+std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, ggml_backend_t backend) {
+    // hparam_u32 already names the missing key, but not why anything wanted it. A host reaching this
+    // has a topology that reports uses_kv_cache() and a file that does not say how big to make one,
+    // and the fix is on the CONVERTER side -- so the message has to carry that, not just the key.
+    const auto read = [&model](const char* key) {
+        try {
+            return model.hparam_u32(key);
+        } catch (const LoadError&) {
+            throw LoadError(std::string("make_kv_cache: this model's topology uses a KV cache, but the "
+                                        "GGUF does not declare 'loom.") + key + "'. Every one of "
+                                        "loom.{n_layer,n_head_kv,n_embd_head_k,n_embd_head_v,"
+                                        "kv_cache_size} must be written by the converter for a cached "
+                                        "model to be loadable without a per-model host struct.");
+        }
+    };
+
+    const uint32_t n_layer  = read("n_layer");
+    const uint32_t n_head_kv = read("n_head_kv");
+    // The KvCache stores the FLATTENED per-token width (llama.cpp's n_embd_k_gqa), and stores K/V for
+    // the un-repeated KV heads -- so this is n_head_kv, never n_head. Getting that wrong is silently
+    // survivable (the cache is merely too large) in one direction and corrupting in the other, which is
+    // why the derivation lives here once rather than at each call site.
+    const uint32_t n_embd_k = n_head_kv * read("n_embd_head_k");
+    const uint32_t n_embd_v = n_head_kv * read("n_embd_head_v");
+    const uint32_t kv_size  = read("kv_cache_size");
+
+    if (kv_size == 0) {
+        throw LoadError("make_kv_cache: 'loom.kv_cache_size' is 0, so no token could ever be cached");
+    }
+    return std::make_unique<KvCache>(n_layer, n_embd_k, n_embd_v, kv_size, backend);
 }
 
 } // namespace loom

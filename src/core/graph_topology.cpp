@@ -84,4 +84,23 @@ GraphTopology GraphTopology::parse(const std::string& json_text) {
     }
 }
 
+bool GraphTopology::uses_kv_cache() const {
+    // `kv_cache` defaults to TRUE when absent, matching op_attention's own default -- every milestone-1
+    // LLM topology relies on that default and never sets the attr, so reading it as false here would
+    // report exactly the models that need a cache as not needing one.
+    const auto node_uses_cache = [](const TopologyNode& node) {
+        return node.op == "ATTENTION" && node.attrs.value("kv_cache", true);
+    };
+    for (const TopologyItem& item : items) {
+        if (item.is_repeat) {
+            for (const TopologyNode& node : item.repeat.nodes) {
+                if (node_uses_cache(node)) return true;
+            }
+        } else if (node_uses_cache(item.node)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace loom

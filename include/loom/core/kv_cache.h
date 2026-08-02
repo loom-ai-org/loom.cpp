@@ -3,6 +3,7 @@
 #include <ggml-cpp.h>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace loom {
@@ -55,5 +56,31 @@ private:
     uint32_t n_embd_v_;
     uint32_t kv_size_;
 };
+
+class GgufModel;
+
+// Builds a KvCache sized entirely from `model`'s own declared hparams, so a host never has to carry a
+// per-model C++ struct just to allocate one (KV-CACHE.md stage 1). Before this, the only two callers
+// that needed a cache -- WhisperDriver and test_e2e_whisper_lua_driver.cpp -- both sized it from a
+// hardcoded `WhisperConfig`, which is what made "the GGUF is self-contained" false for the one model
+// on this roadmap that has a KV cache at all.
+//
+// Reads the five geometry facts from the "loom.*" hparam namespace the converters already write:
+//
+//   loom.n_layer         cache depth
+//   loom.n_head_kv       KV heads (n_head_kv, NOT n_head -- GQA stores the un-repeated K/V)
+//   loom.n_embd_head_k   per-head K width; the flat per-token width is n_head_kv * this
+//   loom.n_embd_head_v   per-head V width, same
+//   loom.kv_cache_size   capacity in tokens
+//
+// The first four already existed (convert_whisper_all.py has written them since the Lua port, with a
+// comment saying they are for "KvCache sizing") and were simply never read; only the capacity is new.
+// Deliberately NOT a second `loom.kv_cache.*` namespace duplicating them: two spellings of n_layer that
+// can disagree is exactly the failure this project keeps removing elsewhere.
+//
+// Throws loom::LoadError naming the missing key if any of the five is absent -- a model whose topology
+// reports `uses_kv_cache()` and whose file does not say how big the cache is cannot be run, and saying
+// which key is missing is the difference between a fixable error and a mystery.
+std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, ggml_backend_t backend);
 
 } // namespace loom
