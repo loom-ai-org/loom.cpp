@@ -218,6 +218,22 @@ end
 """
 
 
+def _called_topologies(config) -> set:
+    """Every topology a family's driver names literally, whether it is still one adopted `.lua` or has
+    been peeled into fragments and components. Written this way so the declaration check survives each
+    peel rather than having to be rewritten by it."""
+    path = config.driver_script_path
+    if path.is_file():
+        return RawLuaDriver(source=path.read_text(), origin=path.name).called_topologies()
+    names = set()
+    for component in config.driver_components():
+        if isinstance(component, SubgraphCallComponent):
+            names.add(component.topology)
+        elif isinstance(component, LuaFragment):
+            names.update(call.topology for call in component._calls)
+    return names
+
+
 def _adoption_ctx():
     return DriverContext(
         topologies={"encoder": _topo(["tokens", "style"]), "vocoder": _topo(["mel"])},
@@ -322,11 +338,11 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
 
     def test_the_five_real_drivers_all_round_trip(self):
         """Not a fixture: the actual shipped `.lua` files, which is the only thing C.3's byte-identity
-        gate is a claim about. Two, not five: C.4-C.6 peeled Matcha, Supertonic and VITS. The count
-        is asserted so that peeling a family without updating this test is noticed rather than
+        gate is a claim about. One, not five: C.4-C.7 peeled Matcha, Supertonic, VITS and Kokoro. The
+        count is asserted so that peeling a family without updating this test is noticed rather than
         silently reducing the coverage of the claim."""
         drivers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
-        self.assertEqual(len(drivers), 2, [d.name for d in drivers])
+        self.assertEqual(len(drivers), 1, [d.name for d in drivers])
         for path in drivers:
             RawLuaDriver(source=path.read_text(), origin=path.name).assert_round_trip()
 
@@ -396,14 +412,17 @@ class TestExternalTopologies(unittest.TestCase):
         from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
         from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
 
-        for config_class, exported in ((TTSKokoroExportConfig, {"albert_bert_encoder",
-                                                                "decoder_vocoder"}),
-                                       (TTSStyleTTS2ExportConfig, {"albert", "decoder_vocoder",
-                                                                   "diffusion"})):
-            path = config_class.__dataclass_fields__["driver_script_path"].default
-            external = config_class.external_topologies(config_class)
-            driver = RawLuaDriver(source=path.read_text(), origin=path.name, external=external)
-            self.assertEqual(driver.called_topologies() - exported, set(external), path.name)
+        configs = (
+            (TTSKokoroExportConfig(model_dir="/unused", output_path="/unused", architecture="kokoro"),
+             {"albert_bert_encoder", "decoder_vocoder"}),
+            (TTSStyleTTS2ExportConfig(checkpoint_path="/unused", output_path="/unused",
+                                      architecture="styletts2"),
+             {"albert", "decoder_vocoder", "diffusion"}),
+        )
+        for config, exported in configs:
+            external = config.external_topologies()
+            self.assertEqual(_called_topologies(config) - exported, set(external),
+                             type(config).__name__)
 
 
 # -- C.4: peeling a family into components ------------------------------------------------------------
@@ -615,3 +634,42 @@ class TestPeeledVits(unittest.TestCase):
                       if isinstance(c, LuaFragment) and "expand_z_p" in str(c.path))
         self.assertEqual(set(expand.reads), {"stats", "w_ceil", "y_length", "T"})
         self.assertIn("z_p", expand.defines)
+
+
+class TestPeeledKokoro(unittest.TestCase):
+    """A deliberately thin peel, and the property worth pinning is that it did not *reduce* checking.
+
+    Kokoro makes eleven run_subgraph calls and only two can become IR: seven name their topology with
+    a computed expression and two sit inside Lua `for` loops. The rest stay in fragments -- which parse
+    their own call sites for exactly this reason."""
+
+    def _components(self):
+        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+
+        return TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
+                                     architecture="kokoro").driver_components()
+
+    def test_the_two_mil_calls_became_ir(self):
+        calls = [c for c in self._components() if isinstance(c, SubgraphCallComponent)]
+        self.assertEqual([c.topology for c in calls], ["albert_bert_encoder", "decoder_vocoder"])
+
+    def test_the_fragments_still_parse_the_calls_that_could_not(self):
+        """A peel must never take a call site out of reach of the parser. `duration_proj` sits inside
+        a Lua loop and `text_encoder_cnn` is external -- both are still seen."""
+        fragments = [c for c in self._components() if isinstance(c, LuaFragment)]
+        seen = {call.topology for f in fragments for call in f._calls}
+        self.assertIn("duration_proj", seen)
+        self.assertIn("text_encoder_cnn", seen)
+
+    def test_an_external_call_inside_a_fragment_is_not_reported_as_missing(self):
+        fragments = [c for c in self._components() if isinstance(c, LuaFragment)]
+        declared = {call.topology for f in fragments for call in f.sub_specs()}
+        self.assertNotIn("text_encoder_cnn", declared, "declared external by the config")
+        self.assertNotIn("duration_proj", declared, "declared external by the config")
+
+    def test_the_seven_input_call_is_rendered_as_a_block(self):
+        """Cosmetic and load-bearing: the embedded driver_script is what someone inspecting a GGUF
+        reads, and seven inputs on one line is a 200-column line."""
+        call = next(c for c in self._components()
+                    if isinstance(c, SubgraphCallComponent) and c.topology == "decoder_vocoder")
+        self.assertTrue(call.multiline)

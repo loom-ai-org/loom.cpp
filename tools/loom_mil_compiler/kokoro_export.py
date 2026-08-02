@@ -482,7 +482,73 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             "the directory holding kokoro-v1_0.pth and its config.json. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
         ),
     }
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver_mil.lua"
+    # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
+    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver"
+
+    def driver_components(self) -> List:
+        """Kokoro's driver, as components (P4.0.6/C.7).
+
+        **A deliberately thin peel, and the reason is worth stating rather than apologising for.**
+        Kokoro's driver makes eleven `run_subgraph` calls and only two can become IR: the two
+        MIL-traced ones. Of the other nine, seven name their topology with a computed expression
+        (`"duration_lstm_" .. i`, `namespace_ .. "_h_fwd"`) and two sit inside Lua `for` loops --
+        neither shape is a `SubgraphCallComponent`, and forcing them to be one would mean modelling
+        Lua's control flow in the IR to buy back a check the fragment already keeps.
+
+        It keeps it because `LuaFragment` parses its own call sites, the same way `RawLuaDriver` does.
+        A peel must never *reduce* checking, and without that it would: moving a block into a fragment
+        would take its calls out of reach of the parser.
+
+        What the peel does buy here: the two MIL calls become real `SubgraphCall` nodes (arity checked,
+        not just names), and five hand-written blocks now declare what they read and define, so the
+        order they run in is checked instead of assumed. The BiLSTM/AdaLN stepping loops that account
+        for most of the remaining nine are D.2's registered component, which declares its topologies as
+        data and is where those calls stop being computed strings."""
+        from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .driver_ir import Call, FieldAccess, Lit, Var
+
+        fragment = self.driver_script_path
+        external = self.external_topologies()
+        t_text, t_frames = Var("T_text"), Var("T_frames")
+
+        def block(name, **kwargs):
+            return LuaFragment(fragment / name, external=external, **kwargs)
+
+        return [
+            block("00_header.lua", top_level=True),
+            block("01_style.lua",
+                  defines=("T_text", "style_dim", "d_model", "hidden_per_dir",
+                           "s_decoder", "s_predictor")),
+            SubgraphCallComponent(
+                topology="albert_bert_encoder", outputs=("d_en_flat",), length=t_text,
+                inputs={"tokens": FieldAccess("inputs", "input_ids")},
+                note="--- CustomAlbert + bert_encoder, ONE MIL-traced call -> d_en, time-major\n"
+                     "    (T,512) (see module docstring for why this convention, not\n"
+                     "    kokoro_driver.lua's own Layout-A one). ---"),
+            block("02_duration_encoder.lua",
+                  reads=("d_en_flat", "T_text", "d_model", "style_dim", "s_predictor",
+                         "hidden_per_dir"),
+                  defines=("d_en_rows", "x", "d", "top_out", "duration_logits", "pred_dur")),
+            block("03_frame_expansion.lua",
+                  reads=("T_text", "pred_dur", "d", "d_model", "style_dim", "hidden_per_dir"),
+                  defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
+                           "cnn_rows", "t_en", "asr")),
+            block("04_f0n.lua", reads=("en", "hidden_per_dir", "s_predictor"),
+                  defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve")),
+            block("05_vocoder_inputs.lua", reads=("T_frames",),
+                  defines=("dim", "T_f0", "L", "rand_ini", "u", "noise_in", "wsum")),
+            SubgraphCallComponent(
+                topology="decoder_vocoder", outputs=("waveform",),
+                axes={"n_enc_frames": t_frames, "n_past": Lit(0)},
+                inputs={
+                    "asr": Call("to_layout_a", [Var("asr"), t_frames, Lit(512)]),
+                    "f0_curve": Var("F0_curve"), "n_curve": Var("N_curve"),
+                    "s": Var("s_decoder"), "rand_ini": Var("rand_ini"),
+                    "noise_in": Var("noise_in"), "wsum": Var("wsum"),
+                },
+                multiline=True),
+            DriverReturn(values=("waveform",)),
+        ]
 
     def external_topologies(self) -> Dict[str, str]:
         """Kokoro's MIL export is deliberately **partial**, and until P4.0.6/C.3 nothing on the export
