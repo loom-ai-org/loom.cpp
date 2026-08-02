@@ -67,7 +67,7 @@ class TestLoomMILCompiler(unittest.TestCase):
         
         self.assertIn("model.driver_script", reader.fields)
         driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
-        self.assertIn("function main(inputs)", driver_script)
+        self.assertIn("function infer(inputs)", driver_script)
 
     def test_multi_modular_program_transpilation(self):
         """
@@ -233,10 +233,10 @@ class TestLoomMILCompiler(unittest.TestCase):
         driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
         self.assertIn(f"local placeholder, {second_out.name} = loom.run_subgraph('splitter'", driver_script)
 
-    def test_single_main_function_auto_generates_main_topo(self):
+    def test_single_main_function_auto_generates_main_topology(self):
         """
         Verify that a single-"main" Program automatically serializes the entire
-        main function into 'main_topo' and generates a wrapper Lua driver script.
+        main function into 'main_topology' and generates a wrapper Lua driver script.
         """
         prog = Program()
         @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4), dtype=types.fp32)])
@@ -252,11 +252,11 @@ class TestLoomMILCompiler(unittest.TestCase):
         self.assertTrue(os.path.exists(self.output_path))
         reader = GGUFReader(self.output_path)
         
-        self.assertIn("model.graph_topology.main_topo", reader.fields)
+        self.assertIn("model.graph_topology.main_topology", reader.fields)
         self.assertIn("model.driver_script", reader.fields)
         
         driver_script = reader.fields["model.driver_script"].parts[-1].tobytes().decode("utf-8")
-        self.assertIn("loom.run_subgraph('main_topo'", driver_script)
+        self.assertIn("loom.run_subgraph('main_topology'", driver_script)
 
     def test_random_normal_in_bespoke_driver_maps_to_gaussian_array(self):
         """EXPORT-IMPROVEMENT-BACKLOG.md item 4: a random_normal op in the driver-level 'main' function
@@ -287,7 +287,7 @@ class TestLoomMILCompiler(unittest.TestCase):
         self.assertIn("loom.gaussian_array(4)", driver_script)
 
     def test_random_normal_in_static_topology_raises_actionable_error(self):
-        """The SAME op inside a static topology (main_topo, generated via
+        """The SAME op inside a static topology (main_topology, generated via
         generate_graph_topology) must fail loudly and specifically -- ggml has no RNG-capable compute op,
         so this can never be satisfied there, unlike the bespoke-driver case above."""
         prog = Program()

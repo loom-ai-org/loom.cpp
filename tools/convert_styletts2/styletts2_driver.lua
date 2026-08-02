@@ -202,7 +202,7 @@ local function adpm2_sample(noise, denoise_fn, sigmas, num_steps)
     return x
 end
 
-function synthesize(inputs)
+function infer(inputs)
     loom.seed_rng(inputs.seed)
 
     local T_text = #inputs.input_ids

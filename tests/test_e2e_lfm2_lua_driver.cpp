@@ -57,7 +57,7 @@ int main() {
     std::printf("Invoking 'main' function inside the embedded Lua script...\n");
     const std::vector<double> prompt_tokens = {10.0, 20.0, 30.0, 40.0};
     
-    loom::LoomLuaBridge::Value result = bridge.call("main", {
+    loom::LoomLuaBridge::Value result = bridge.call("infer", {
         {"tokens", prompt_tokens}
     });
 

@@ -71,7 +71,7 @@ int main() {
         bridge.load_script(driver_script);
 
         const std::vector<double> token_ids_d(token_ids.begin(), token_ids.end());
-        loom::LoomLuaBridge::Value result = bridge.call("synthesize", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"token_ids", token_ids_d},
             {"seed", static_cast<double>(kSeed)},
             {"inter_channels", static_cast<double>(cfg.inter_channels)},

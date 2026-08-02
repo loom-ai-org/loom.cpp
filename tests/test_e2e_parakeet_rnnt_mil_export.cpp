@@ -64,7 +64,7 @@ int main() {
     LOOM_CHECK(backend != nullptr);
 
     auto model = loom::GgufModel::load(gguf_path, backend.get());
-    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("main_topo"));
+    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("main_topology"));
 
     constexpr uint32_t kNSamples = 16000;
     constexpr uint32_t kNSubsampled = 13;

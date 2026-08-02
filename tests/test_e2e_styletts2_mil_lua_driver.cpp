@@ -85,7 +85,7 @@ int main() {
         bridge.load_script(driver_script);
 
         const std::vector<double> input_ids_d(input_ids.begin(), input_ids.end());
-        loom::LoomLuaBridge::Value result = bridge.call("synthesize", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"input_ids", input_ids_d},
             {"diffusion_steps", static_cast<double>(kDiffusionSteps)},
             {"seed", static_cast<double>(kSeed)},

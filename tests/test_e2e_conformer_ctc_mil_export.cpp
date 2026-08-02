@@ -65,7 +65,7 @@ int main() {
     LOOM_CHECK(backend != nullptr);
 
     auto model = loom::GgufModel::load(gguf_path, backend.get());
-    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("main_topo"));
+    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("main_topology"));
 
     // Must match reference_forward_conformer.py's own default trace length (see test_e2e_conformer_ctc.cpp).
     constexpr uint32_t kNSamples = 10240;

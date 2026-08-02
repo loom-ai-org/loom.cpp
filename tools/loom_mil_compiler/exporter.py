@@ -141,7 +141,7 @@ class LoomGGUFExporter:
         self.driver_script = None
         # Whether this export writes weights into ONE flat namespace instead of prefixing each with its
         # own topology's name (`{func_name}.{weight}`). Read by `topology_ops.py` in 8 places, always as
-        # `func_name == "main_topo" or self.flat_namespace`.
+        # `func_name == "main_topology" or self.flat_namespace`.
         #
         # Was `profile` ("monolithic"/None) until BACKLOG.md P4.0.3's rename. That name described the
         # caller's export shape rather than the switch's effect, and it carried a second, unrelated
@@ -1190,7 +1190,9 @@ class LoomGGUFExporter:
             print("Exporting via Advanced/Bespoke workflow...")
             for func_name, func in self.program.functions.items():
                 if func_name == "main":
-                    self.transpile_to_lua(func, name="main")
+                    # MIL's own function name on the left, the emitted Lua entry point's on the right
+                    # -- they were the same string until KV-CACHE.md's N.1 and are unrelated concepts.
+                    self.transpile_to_lua(func, name="infer")
                 else:
                     self.topologies[func_name] = self.generate_graph_topology(func, func_name)
             driver_script = self._finalize_driver()
@@ -1235,7 +1237,7 @@ class LoomGGUFExporter:
     def apply_monolithic_export(self):
         print("Exporting via Automatic Monolithic path...")
         main_func = self.program.functions["main"]
-        self.topologies["main_topo"] = self.generate_graph_topology(main_func, "main_topo")
+        self.topologies["main_topology"] = self.generate_graph_topology(main_func, "main_topology")
 
         first_input = "tokens"
         feature_scale = 1
@@ -1264,7 +1266,7 @@ class LoomGGUFExporter:
 
         self.driver_script = PrefillArgmaxBuilder(
             inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
-            call=MonolithicCall(topology="main_topo", inputs=input_names, n_tokens=n_tokens_expr),
+            call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
                                     n_tokens=n_tokens_expr),
         ).build(self._driver_context())
@@ -1404,9 +1406,11 @@ class LoomGGUFExporter:
                                     n_tokens=n_tokens_expr),
         ).build(self._driver_context())
 
-    def transpile_to_lua(self, func: Function, name="main"):
+    def transpile_to_lua(self, func: Function, name="infer"):
         """
-        Transpiles the main MIL orchestration function to a Lua JIT driver script.
+        Transpiles the main MIL orchestration function to a Lua JIT driver script. `name` is the
+        emitted Lua entry point (`DriverBuilder.entry_name`'s equivalent for the path that has no
+        builder), not the MIL function's own name.
         """
         # Track the first input variable name to dynamically derive n_tokens
         self.first_input = "tokens"

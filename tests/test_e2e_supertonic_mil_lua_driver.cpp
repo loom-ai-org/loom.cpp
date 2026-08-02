@@ -101,7 +101,7 @@ int main() {
         const std::vector<double> txt_ids_d(txt_ids.begin(), txt_ids.end());
         const std::vector<double> style_ttl_d(style_ttl.begin(), style_ttl.end());
         const std::vector<double> style_dp_d(style_dp.begin(), style_dp.end());
-        loom::LoomLuaBridge::Value result = bridge.call("synthesize", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"txt_ids", txt_ids_d},
             {"style_ttl", style_ttl_d},
             {"style_dp", style_dp_d},

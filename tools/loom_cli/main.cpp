@@ -234,7 +234,7 @@ int main(int argc, char** argv) {
                 generated.reserve(n_predict);
                 
                 for (uint32_t step = 0; step < n_predict; ++step) {
-                    loom::LoomLuaBridge::Value result = bridge.call("main", {
+                    loom::LoomLuaBridge::Value result = bridge.call("infer", {
                         {"tokens", current_prompt}
                     });
                     double next_tok_val = 0.0;

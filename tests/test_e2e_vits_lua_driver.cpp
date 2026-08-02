@@ -77,7 +77,7 @@ int main() {
 
         const std::vector<double> token_ids_d(token_ids.begin(), token_ids.end());
         const uint32_t k_channels = cfg.hidden_channels / cfg.n_heads;
-        loom::LoomLuaBridge::Value result = bridge.call("synthesize", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"token_ids", token_ids_d},
             {"seed", static_cast<double>(kSeed)},
             {"n_text_layers", static_cast<double>(cfg.n_text_layers)},

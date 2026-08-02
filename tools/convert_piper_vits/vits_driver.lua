@@ -15,7 +15,7 @@
 -- defaults).
 --
 -- Returns: the raw waveform (flat f32 array), same convention as VitsDriver::synthesize's own return.
-function synthesize(inputs)
+function infer(inputs)
     loom.seed_rng(inputs.seed)
 
     local T = #inputs.token_ids

@@ -17,7 +17,7 @@
 --
 -- Returns: the raw waveform (flat f32 array), same convention as SupertonicDriver::synthesize's own
 -- return value.
-function synthesize(inputs)
+function infer(inputs)
     loom.seed_rng(inputs.seed)
 
     local t_text = inputs.t_text

@@ -110,7 +110,7 @@ class SymbolReadingComponent(DriverComponent):
 
 
 class _Builder(DriverBuilder):
-    def __init__(self, components, entry_name="main"):
+    def __init__(self, components, entry_name="infer"):
         self._components = list(components)
         self.entry_name = entry_name
 
@@ -132,7 +132,7 @@ class TestAssembly(unittest.TestCase):
         """Joined with a single newline: a component owns the blank lines around its own contribution,
         which is what lets an existing hand-written driver be adopted byte-exactly."""
         text = _Builder([RecordingComponent("a")]).render(_ctx())
-        self.assertEqual(text, "-- prelude of a\nfunction main(inputs)\n    local a = 1\nend")
+        self.assertEqual(text, "-- prelude of a\nfunction infer(inputs)\n    local a = 1\nend")
 
     def test_a_postlude_survives_to_the_end_of_the_script(self):
         """A file ending in a newline after its last `end` is one trailing empty line -- and every
@@ -142,17 +142,17 @@ class TestAssembly(unittest.TestCase):
                 return [""]
 
         self.assertEqual(_Builder([RecordingComponent("a"), _Trailing()]).render(_ctx()),
-                         "-- prelude of a\nfunction main(inputs)\n    local a = 1\nend\n")
+                         "-- prelude of a\nfunction infer(inputs)\n    local a = 1\nend\n")
 
     def test_a_component_with_no_prelude_renders_the_function_alone(self):
         """The synthesized causal-LM/ASR shape: no top-level Lua at all, so `render` must not introduce
         a leading blank line -- byte-identity with `"\\n".join(emit_function(...))` is C.2's gate."""
         text = _Builder([CallComponent("encoder")]).render(_ctx())
-        self.assertTrue(text.startswith("function main(inputs)\n"))
+        self.assertTrue(text.startswith("function infer(inputs)\n"))
 
     def test_entry_name_and_params_are_the_builder_s(self):
-        builder = _Builder([RecordingComponent("a")], entry_name="synthesize")
-        self.assertEqual(builder.build(_ctx()).entry.name, "synthesize")
+        builder = _Builder([RecordingComponent("a")], entry_name="infer_with_past")
+        self.assertEqual(builder.build(_ctx()).entry.name, "infer_with_past")
         self.assertEqual(builder.build(_ctx()).entry.params, ["inputs"])
 
 
@@ -211,7 +211,7 @@ class TestDriverSymbolResolvesThroughDeferral(unittest.TestCase):
     def test_a_symbol_nothing_defines_fails_with_the_link_s_message(self):
         with self.assertRaises(LinkError) as raised:
             _Builder([RecordingComponent("a"), SymbolReadingComponent("b")]).build(_ctx())
-        self.assertIn("reads driver symbol(s) ['b'], which the emitted driver 'main' never defines",
+        self.assertIn("reads driver symbol(s) ['b'], which the emitted driver 'infer' never defines",
                       str(raised.exception))
 
 

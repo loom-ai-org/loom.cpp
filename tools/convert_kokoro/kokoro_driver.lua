@@ -142,7 +142,7 @@ local function predict_durations(duration_logits, speed)
     return pred_dur
 end
 
-function synthesize(inputs)
+function infer(inputs)
     loom.seed_rng(inputs.seed)
 
     local T_text = #inputs.input_ids

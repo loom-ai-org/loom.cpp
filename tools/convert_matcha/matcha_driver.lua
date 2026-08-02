@@ -12,7 +12,7 @@
 -- real model constants n_feats, mel_mean, mel_std (MatchaConfig's own real defaults).
 --
 -- Returns: the raw waveform (flat f32 array), same convention as MatchaDriver::synthesize's own return.
-function synthesize(inputs)
+function infer(inputs)
     loom.seed_rng(inputs.seed)
 
     local n_feats = inputs.n_feats

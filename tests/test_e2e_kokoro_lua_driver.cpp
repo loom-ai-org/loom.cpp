@@ -83,7 +83,7 @@ int main() {
 
         const std::vector<double> input_ids_d(input_ids.begin(), input_ids.end());
         const std::vector<double> ref_s_d(ref_s.begin(), ref_s.end());
-        loom::LoomLuaBridge::Value result = bridge.call("synthesize", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"input_ids", input_ids_d},
             {"ref_s", ref_s_d},
             {"speed", static_cast<double>(kSpeed)},

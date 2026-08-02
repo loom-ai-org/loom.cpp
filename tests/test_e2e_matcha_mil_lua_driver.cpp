@@ -68,7 +68,7 @@ int main() {
         bridge.load_script(driver_script);
 
         const std::vector<double> tokens_d(tokens.begin(), tokens.end());
-        loom::LoomLuaBridge::Value result = bridge.call("synthesize", {
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"tokens", tokens_d},
             {"n_steps", static_cast<double>(kNSteps)},
             {"seed", static_cast<double>(kSeed)},
