@@ -1,6 +1,6 @@
 // Validates the MIL-traced Matcha-TTS export (export_matcha_mil.py) end-to-end: runs the real
 // matcha_ljspeech.ckpt + generator_v1 checkpoints through a LoomLuaBridge executing the MIL-traced
-// orchestration (tools/convert_matcha/matcha_driver_mil.lua, loaded from export_matcha_mil.py's single
+// orchestration (tools/convert_matcha/matcha_driver/, loaded from export_matcha_mil.py's single
 // combined matcha_mil.gguf) and checks the result matches the EXISTING hand-written loom::MatchaDriver
 // (the bespoke topology's own oracle) -- mirrors test_e2e_matcha_lua_driver.cpp's own bespoke-Lua-vs-
 // oracle comparison exactly, just against the MIL-traced topologies instead. Unlike
@@ -51,7 +51,7 @@ int main() {
         ref_wav = driver.synthesize(tokens, kNSteps, kSeed);
     }
 
-    // --- New path: LoomLuaBridge running matcha_driver_mil.lua over the MIL-traced topologies ---
+    // --- New path: LoomLuaBridge running matcha_driver/ over the MIL-traced topologies ---
     std::vector<float> lua_wav;
     {
         auto model = loom::GgufModel::load(mil_gguf, backend.get());

@@ -431,9 +431,9 @@ expected a shared template to "shrink these the same way `ModularExportSpec` shr
 | `export_supertonic_mil.py` | 237 | 252 |
 | `export_styletts2_mil.py` | 340 | 350 |
 | `export_kokoro_mil.py` | 503 | 503 (untouched) |
-| `matcha_driver_mil.lua` | 101 | 96 |
-| `supertonic_driver_mil.lua` | 65 | 55 |
-| `styletts2_driver_mil.lua` | 368 | 368 |
+| `matcha_driver/` | 101 | 96 |
+| `supertonic_driver/` | 65 | 55 |
+| `styletts2_driver/` | 368 | 368 |
 
 Total line count went **up** (+41 in the export scripts, −15 in the drivers). The reason is that the
 340/503 lines the proposal points at are *tracing setup* — wrapper modules, dummy inputs, `RangeDim`
@@ -471,7 +471,7 @@ prerequisite.
 
 **Deliberately not generalized: the integration rule.** Both retrofitted models use deterministic
 forward Euler with uniform `dt = 1/n_steps`. StyleTTS2's is ADPM2 over a Karras sigma schedule — read
-directly from `styletts2_driver_mil.lua` rather than assumed: a second-order sampler with **two** network
+directly from `styletts2_driver/` rather than assumed: a second-order sampler with **two** network
 evaluations per step, per-step noise injection at `sigma_up`, and real preconditioning math
 (`c_skip`/`c_out`/`c_in`/`c_noise`) wrapped around the call. VITS/Kokoro's duration loops are a scatter
 over predicted durations, not an ODE at all. Forcing those through one template would produce something

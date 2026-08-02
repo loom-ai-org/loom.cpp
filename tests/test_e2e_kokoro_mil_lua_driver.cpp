@@ -1,9 +1,9 @@
 // Validates the MIL-traced Kokoro export (export_kokoro_mil.py) end-to-end: runs the real Kokoro-82M
 // checkpoint through a LoomLuaBridge executing the hybrid orchestration
-// (tools/convert_kokoro/kokoro_driver_mil.lua, loaded from export_kokoro_mil.py's combined
+// (tools/convert_kokoro/kokoro_driver/, loaded from export_kokoro_mil.py's combined
 // kokoro_mil.gguf), with the two MIL-traced topologies ("albert_bert_encoder", "decoder_vocoder")
 // registered alongside the LSTM-bound topologies still loaded from the EXISTING bespoke kokoro.gguf
-// (convert_kokoro_lua_all.py) -- see kokoro_driver_mil.lua's own module docstring for why those pieces
+// (convert_kokoro_lua_all.py) -- see kokoro_driver/'s own module docstring for why those pieces
 // stay bespoke (ggml has no native LSTM op).
 //
 // This does NOT compare against loom::KokoroDriver/kokoro_driver.lua's own oracle waveform the way

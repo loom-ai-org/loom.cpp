@@ -1,9 +1,9 @@
 // Validates the MIL-traced StyleTTS2 export (export_styletts2_mil.py) end-to-end: runs the real
 // yl4579/StyleTTS2-LJSpeech checkpoint through a LoomLuaBridge executing the hybrid orchestration
-// (tools/convert_styletts2/styletts2_driver_mil.lua, loaded from export_styletts2_mil.py's combined
+// (tools/convert_styletts2/styletts2_driver/, loaded from export_styletts2_mil.py's combined
 // styletts2_mil.gguf), with the three MIL-traced topologies ("albert", "decoder_vocoder", "diffusion")
 // registered alongside the LSTM-bound topologies still loaded from the EXISTING bespoke styletts2.gguf
-// (convert_styletts2_lua_all.py) -- see styletts2_driver_mil.lua's own module docstring for why those
+// (convert_styletts2_lua_all.py) -- see styletts2_driver/'s own module docstring for why those
 // pieces stay bespoke (ggml has no native LSTM op).
 //
 // This does NOT compare against loom::StyleTTS2Driver/styletts2_driver.lua's own oracle waveform the way

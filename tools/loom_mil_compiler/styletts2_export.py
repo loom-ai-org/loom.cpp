@@ -1,6 +1,6 @@
 """Exports StyleTTS2's (yl4579/StyleTTS2-LJSpeech) MIL-traceable phases into ONE combined
 `styletts2_mil.gguf` (BACKLOG.md P3.3, migrated from `export_styletts2_mil.py`) alongside the embedded
-`styletts2_driver_mil.lua` orchestration script:
+`styletts2_driver/` orchestration script:
   - "albert": CustomAlbert (a real transformers.AlbertModel) alone -- input_ids -> raw bert_dur, (T,768)
     time-major. UNLIKE `kokoro_export.py`'s own combined "albert_bert_encoder" (which fuses in the
     bert_encoder Linear too), this phase stops at bert_dur because StyleTTS2's diffusion sampler needs
@@ -35,7 +35,7 @@ StyleTTS2's diffusion sampler is ADPM2 over a Karras sigma schedule -- two netwo
 per-step noise injection, and real preconditioning math around the call -- so it is NOT a
 `TTSFlowMatchingModelExportConfig` (`flow_matching_export.py`'s own docstring documents why this can't be
 generalized the way Matcha's/Supertonic's plain Euler CFM integration can). This class stays a plain
-`BaseMultiPhaseModelExportConfig` with the ADPM2 loop hand-written in `styletts2_driver_mil.lua` and only
+`BaseMultiPhaseModelExportConfig` with the ADPM2 loop hand-written in `styletts2_driver/` and only
 `EstimatorSpec`-checked via `estimators()`: the sampler's per-step `run_subgraph` call still gets the same
 export-time validation against the real traced "diffusion" topology, generating no codegen.
 
@@ -427,7 +427,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     def estimators(self) -> List[EstimatorSpec]:
         # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
         # true one-offs, and this one is a second-order sampler with two network evaluations and real
-        # preconditioning math per step -- see styletts2_driver_mil.lua). But its per-step `run_subgraph`
+        # preconditioning math per step -- see styletts2_driver/). But its per-step `run_subgraph`
         # call has the same failure mode as every generated one, so it is declared here and cross-checked
         # against the real traced "diffusion" topology at export time rather than at run time.
         return [EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "embedding"])]

@@ -1,13 +1,13 @@
 """Exports Kokoro-82M's two LSTM-free phases through `TTSKokoroExportConfig` (BACKLOG.md P3.3, migrated
 from `export_kokoro_mil.py`), into ONE combined `kokoro_mil.gguf` alongside the embedded
-`kokoro_driver_mil.lua` orchestration script:
+`kokoro_driver/` orchestration script:
   - "albert_bert_encoder": CustomAlbert (a real transformers.AlbertModel) + bert_encoder (Linear(768,512))
     -- replaces convert_kokoro_albert.py + convert_kokoro_bert_encoder.py's two hand-built topologies.
   - "decoder_vocoder": Decoder.encode/decode + SineGen + STFT + Generator -- replaces FOUR bespoke
     scripts, convert_kokoro_{decoder_core,sinegen,stft,generator}.py, in one combined trace.
 Kokoro leans heavily on `torch.nn.LSTM` elsewhere (TextEncoder, DurationEncoder, predictor.lstm,
 F0Ntrain's shared LSTM) -- ggml has no native LSTM op, so those pieces are a deliberate scoping
-exclusion: `kokoro_driver_mil.lua` wires these two MIL-traced topologies together with the EXISTING
+exclusion: `kokoro_driver/` wires these two MIL-traced topologies together with the EXISTING
 bespoke, hand-built LSTM-bound topologies (`tools/convert_kokoro/convert_kokoro_lua_all.py`'s own
 `kokoro.gguf`), not a full re-trace of the whole model.
 
@@ -343,7 +343,7 @@ class AlbertBertEncoderWrapper(torch.nn.Module):
     contiguous byte copy would silently read in PRE-permute order (the exact bug export_vits_mil.py's
     own StatsWrapper docstring found and worked around for VITS's `stats` output). Returns the natural
     (T,512) time-major layout instead (ggml ne=[512,T], flat[t*512+c] -- kokoro_driver.lua's own
-    "row_major" convention) -- kokoro_driver_mil.lua converts to per-timestep rows via
+    "row_major" convention) -- kokoro_driver/ converts to per-timestep rows via
     `from_row_major`, no transpose needed on the Lua side either.
     """
 

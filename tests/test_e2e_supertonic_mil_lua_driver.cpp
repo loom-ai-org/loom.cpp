@@ -1,5 +1,5 @@
 // Full end-to-end check for the MIL-traced SupertonicTTS export: runs the real orchestration
-// (tools/convert_supertonic/supertonic_driver_mil.lua, loaded from export_supertonic_mil.py's single
+// (tools/convert_supertonic/supertonic_driver/, loaded from export_supertonic_mil.py's single
 // combined supertonic_mil.gguf) and checks the result matches the EXISTING hand-written
 // loom::SupertonicDriver oracle (loaded from the bespoke convert_supertonic_all.py's own six-file output)
 // -- same "MIL lua driver vs. bespoke C++ driver" comparison as test_e2e_matcha_mil_lua_driver.cpp/
@@ -83,7 +83,7 @@ int main() {
         ref_wav = driver.synthesize(txt_ids, style_ttl, style_dp, kNSteps, kSeed);
     }
 
-    // --- New path: LoomLuaBridge running the MIL-traced supertonic_driver_mil.lua ---
+    // --- New path: LoomLuaBridge running the MIL-traced supertonic_driver/ ---
     std::vector<float> mil_wav;
     {
         auto model = loom::GgufModel::load(mil_gguf_env, backend.get());
