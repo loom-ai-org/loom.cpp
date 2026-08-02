@@ -220,6 +220,10 @@ class SubgraphCall(Stmt):
     axes: dict  # str (axis name) -> Expr
     inputs: dict  # str -> Expr
     extra_outputs: list = dataclasses.field(default_factory=list)
+    # Render the input table one entry per line. Off by default so every existing call's text is
+    # unchanged; a call with seven inputs (Kokoro's decoder_vocoder) is unreadable on one line, and
+    # the embedded driver_script is something people read out of the GGUF.
+    multiline: bool = False
 
     def defines(self) -> list[str]:
         return list(self.outputs) + list(self.extra_outputs)
@@ -437,6 +441,13 @@ class LuaCodegen:
             return [f"{pad}{stmt.name} = {stmt.expr.render()}"]
         if isinstance(stmt, SubgraphCall):
             targets = ", ".join(list(stmt.outputs) + list(stmt.extra_outputs))
+            if stmt.multiline:
+                inner = self.indent * (depth + 1)
+                lines = [f"{pad}local {targets} = loom.run_subgraph({Lit(stmt.module).render()}, "
+                         f"{TableLit(stmt.axes).render()}, {{"]
+                lines.extend(f"{inner}{k} = {v.render()}," for k, v in stmt.inputs.items())
+                lines.append(f"{pad}}})")
+                return lines
             call = Call("loom.run_subgraph",
                         [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs)])
             return [f"{pad}local {targets} = {call.render()}"]

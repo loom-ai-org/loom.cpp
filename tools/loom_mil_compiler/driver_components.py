@@ -687,6 +687,9 @@ class LuaFragment(DriverComponent):
     # Emit as top-level Lua before the entry function rather than as statements inside it. Every
     # driver's header comment and its `local function` helpers are this.
     top_level: bool = False
+    # `{topology name: where it comes from}` for calls inside this fragment that this export does not
+    # produce -- see `BaseMultiPhaseModelExportConfig.external_topologies`.
+    external: dict = dataclass_field(default_factory=dict)
 
     __links__ = {
         "defines": ConfigDerived(
@@ -722,13 +725,30 @@ class LuaFragment(DriverComponent):
             "produces Lua that does not load, which the family's e2e test catches immediately -- "
             "there is no authority to check it against beyond the language itself"
         ),
+        "external": Unchecked(
+            "which of this fragment's calls come from another GGUF, forwarded from the config's "
+            "external_topologies(). Checked there, in both directions, against the whole driver -- "
+            "restating it per fragment would report a name as dead merely because a different "
+            "fragment is the one that calls it"
+        ),
     }
 
     def __post_init__(self):
         self.lines = Path(self.path).read_text().rstrip("\n").split("\n")
+        self._calls, self.unresolved_calls = parse_run_subgraph_calls(
+            "\n".join(self.lines), Path(self.path).name)
 
     def link_label(self) -> str:
         return f"LuaFragment({Path(self.path).name!r})"
+
+    def sub_specs(self):
+        """`run_subgraph` calls still written by hand inside this fragment.
+
+        A peel must never *reduce* checking, and without this it would: `RawLuaDriver` parses the whole
+        adopted driver, so a block moved into a fragment would take its call sites out of reach. The
+        calls that survive a peel are the ones a component cannot express -- a computed topology name,
+        or a call inside a Lua loop -- and they are exactly the ones worth still parsing."""
+        return [call for call in self._calls if call.topology not in self.external]
 
     def names_missing_from_text(self, names) -> list:
         text = "\n".join(self.lines)
@@ -764,6 +784,7 @@ class SubgraphCallComponent(DriverComponent):
     extra_outputs: Tuple[str, ...] = ()
     axes: Optional[dict] = None
     note: Optional[str] = None
+    multiline: bool = False
 
     __links__ = {
         "topology": TopologyName(),
@@ -771,6 +792,10 @@ class SubgraphCallComponent(DriverComponent):
     }
     __unchecked__ = {
         "note": _NOTE_IS_COSMETIC,
+        "multiline": Unchecked("whether to render the input table one entry per line. Cosmetic, and "
+                               "the same category as `note`: what a reader of the embedded driver "
+                               "sees, which for a seven-input call is the difference between a block "
+                               "and a 200-column line"),
         "outputs": Unchecked("the locals this call binds; reads of them are checked by "
                              "driver_ir.validate over the assembled function"),
         "extra_outputs": Unchecked("same, for the shape locals -- and whether capturing them is legal "
@@ -792,7 +817,7 @@ class SubgraphCallComponent(DriverComponent):
             axes = {ctx.root_axis(self.topology): self.length, "n_past": Lit(0)}
         return _note_block(self.note) + [SubgraphCall(
             outputs=list(self.outputs), extra_outputs=list(self.extra_outputs),
-            module=self.topology, axes=axes, inputs=dict(self.inputs),
+            module=self.topology, axes=axes, inputs=dict(self.inputs), multiline=self.multiline,
         )]
 
 
