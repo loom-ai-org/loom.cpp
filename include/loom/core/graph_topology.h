@@ -63,6 +63,15 @@ struct GraphTopology {
     // Throws loom::SchemaError on malformed JSON, an unsupported "version", or a structurally invalid
     // node/repeat_for block.
     static GraphTopology parse(const std::string& json_text);
+
+    // Whether running this topology needs a persistent KvCache -- true iff it contains an ATTENTION
+    // node whose `kv_cache` attr is true (its default; see op_attention). This is DERIVED rather than
+    // declared on purpose (KV-CACHE.md decision 5): the graph is the only authority on whether a cache
+    // is reachable at all, since op_attention is the sole door to one, so a separate declaration could
+    // only ever agree with it or be wrong. The cache's *geometry* is the opposite case -- n_embd_k and
+    // the capacity are model facts no graph states -- and is read from the GGUF's own hparams instead
+    // (see make_kv_cache in kv_cache.h).
+    bool uses_kv_cache() const;
 };
 
 } // namespace loom
