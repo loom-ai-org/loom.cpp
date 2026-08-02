@@ -39,16 +39,12 @@
 #include <vector>
 
 int main() {
-    const char* dir_lua_env = std::getenv("LOOM_STYLETTS2_LUA_DIR");
     const char* gguf_mil_env = std::getenv("LOOM_STYLETTS2_MIL_GGUF");
-    if (dir_lua_env == nullptr || gguf_mil_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_STYLETTS2_LUA_DIR (a directory with styletts2.gguf, "
-                              "produced by convert_styletts2_lua_all.py, for the LSTM-bound bespoke "
-                              "topologies) and LOOM_STYLETTS2_MIL_GGUF (styletts2_mil.gguf, produced by "
-                              "export_styletts2_mil.py) to run this check\n");
+    if (gguf_mil_env == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_STYLETTS2_MIL_GGUF (styletts2_mil.gguf) to run this "
+                              "check\n");
         return 77;
     }
-    const std::string dir_lua = dir_lua_env;
     const std::string gguf_mil_path = gguf_mil_env;
 
     // Same fixture as test_e2e_styletts2_lua_driver.cpp/test_e2e_styletts2_driver.cpp's own oracle test
@@ -64,8 +60,6 @@ int main() {
     loom::StyleTTS2Config cfg; // real defaults: style_dim=128, d_model=512, hidden_per_dir=256, etc.
     std::vector<float> lua_wav;
     {
-        auto model_lua = loom::GgufModel::load(dir_lua + "/styletts2.gguf", backend.get());
-        LOOM_CHECK(model_lua != nullptr);
         auto model_mil = loom::GgufModel::load(gguf_mil_path, backend.get());
         LOOM_CHECK(model_mil != nullptr);
         const std::string driver_script = model_mil->kv_str("model.driver_script");
@@ -73,32 +67,20 @@ int main() {
 
         loom::LoomLuaBridge bridge(backend.get());
 
-        // --- MIL-traced (styletts2_mil.gguf) ---
-        bridge.register_module("albert", *model_mil, loom::GraphTopology::parse(model_mil->topology_json("albert")));
-        bridge.register_module("decoder_vocoder", *model_mil,
-                                loom::GraphTopology::parse(model_mil->topology_json("decoder_vocoder")));
-        bridge.register_module("diffusion", *model_mil,
-                                loom::GraphTopology::parse(model_mil->topology_json("diffusion")));
-
-        // --- Bespoke/LSTM-bound (styletts2.gguf, from convert_styletts2_lua_all.py -- only the subset
-        //     NOT superseded by the MIL topologies above is registered). ---
-        const char* bespoke_topo_names[] = {
-            "bert_encoder", "text_encoder_cnn",
-            "text_encoder_lstm_h_fwd", "text_encoder_lstm_c_fwd", "text_encoder_lstm_h_bwd", "text_encoder_lstm_c_bwd",
-            "duration_lstm_0_h_fwd", "duration_lstm_0_c_fwd", "duration_lstm_0_h_bwd", "duration_lstm_0_c_bwd",
-            "duration_lstm_1_h_fwd", "duration_lstm_1_c_fwd", "duration_lstm_1_h_bwd", "duration_lstm_1_c_bwd",
-            "duration_lstm_2_h_fwd", "duration_lstm_2_c_fwd", "duration_lstm_2_h_bwd", "duration_lstm_2_c_bwd",
-            "duration_adaln_0", "duration_adaln_1", "duration_adaln_2",
-            "top_lstm_h_fwd", "top_lstm_c_fwd", "top_lstm_h_bwd", "top_lstm_c_bwd",
-            "duration_proj",
-            "f0n_shared_lstm_h_fwd", "f0n_shared_lstm_c_fwd", "f0n_shared_lstm_h_bwd", "f0n_shared_lstm_c_bwd",
-            "f0n_f0_block0", "f0n_f0_block1", "f0n_f0_block2",
-            "f0n_n_block0", "f0n_n_block1", "f0n_n_block2",
-            "f0n_f0_proj", "f0n_n_proj",
-        };
-        for (const char* name : bespoke_topo_names) {
-            bridge.register_module(name, *model_lua, loom::GraphTopology::parse(model_lua->topology_json(name)));
+        // Every topology the driver calls, all of them from styletts2_mil.gguf. Until P4.0.7 this
+        // registered a mix: three MIL-traced phases plus 38 more loaded from a SECOND GgufModel over
+        // the pre-MIL styletts2.gguf, because the MIL export was partial. It no longer is -- the six
+        // BiLSTMs are RecurrentPhases and the rest are ordinary traced phases -- so the artifact under
+        // test is one self-contained file.
+        //
+        // Numerical equivalence with the topologies these replaced is
+        // test_e2e_kokoro_mil_topology_equivalence.cpp's job (it covers both families), not this
+        // test's: this one has no oracle waveform, by design -- see the header.
+        for (const std::string& name : model_mil->topology_names()) {
+            bridge.register_module(name, *model_mil,
+                                    loom::GraphTopology::parse(model_mil->topology_json(name)));
         }
+        LOOM_CHECK(model_mil->topology_names().size() == 41);
 
         bridge.load_script(driver_script);
 

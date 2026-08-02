@@ -561,21 +561,20 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         ]
 
     def external_topologies(self) -> Dict[str, str]:
-        """Kokoro's MIL export is deliberately **partial**, and until P4.0.6/C.3 nothing on the export
-        side said so.
+        """Empty, and that is the deliverable.
 
-        Only the two heavy traceable stages move to MIL; the driver's remaining `run_subgraph` calls
-        land on topologies still built by the pre-MIL bespoke converter and loaded from `kokoro.gguf`
-        alongside `kokoro_mil.gguf` -- exactly what `test_e2e_kokoro_mil_lua_driver.cpp` does, from two
-        `GgufModel`s. The emitted GGUF is therefore not self-contained for this family, which is a real
-        property of the artifact and was recorded only in a C++ test.
+        Until P4.0.7 this listed `text_encoder_cnn` and `duration_proj`: Kokoro's MIL export was
+        *partial*, and its driver ran against a mix of MIL topologies and pre-MIL ones loaded from the
+        bespoke `kokoro.gguf` alongside it. That was a real property of the artifact -- the emitted GGUF
+        was not self-contained -- surfaced by P4.0.6/C.3's own gate and recorded here as a declaration,
+        because a declaration is better than silence.
 
-        The BiLSTM/AdaLN stepping topologies (`*_lstm_h_fwd`, `duration_adaln_0`, ...) are not listed
-        here because the driver names them with computed Lua expressions, so no check reaches them
-        either way; they arrive from the same place. D.2's registered stepping component is what turns
-        those into declarations too."""
-        from_bespoke = "the pre-MIL kokoro.gguf, registered alongside this export by the host"
-        return {"text_encoder_cnn": from_bespoke, "duration_proj": from_bespoke}
+        It is now none of them. Every topology the driver calls is traced from the real checkpoint by
+        `phases()`: the six BiLSTMs as `RecurrentPhase`s, and the CNN, three AdaLayerNorms, duration
+        head, two AdainResBlk1d stacks and two 1x1 projections as ordinary traced phases. The method
+        stays, returning nothing, because the next partial family will need it -- and because an empty
+        answer is a stronger statement than a missing one."""
+        return {}
 
     def phases(self) -> List[ExportPhase]:
         ckpt_path = Path(self.model_dir) / "kokoro-v1_0.pth"
@@ -595,10 +594,9 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         # the pre-MIL kokoro.gguf. ggml has no LSTM op, so this is a `RecurrentPhase` and not an
         # `ExportPhase` -- see its docstring. Its four topology names are exactly the ones
         # `bilstm_run("text_encoder_lstm", ...)` already resolves, so the driver is untouched.
-        text_encoder_lstm = RecurrentPhase(
-            name="text_encoder_lstm", module=model.text_encoder.lstm)
+        return [albert_phase, decoder_vocoder_phase,
+                *build_prosody_phases(model.text_encoder, model.predictor)]
 
-        return [albert_phase, decoder_vocoder_phase, text_encoder_lstm]
 
 
 # Kokoro's `config.json` carries no `model_type`-style single field, but its own key set is a real
@@ -636,3 +634,174 @@ def register(registry) -> None:
         config_class=BaseMultiPhaseModelExportConfig,
         recognizers=[ModelRecognizer(name="kokoro", detect=_is_kokoro, build_config=_build_kokoro)],
     ))
+
+
+# ---- The LSTM-bound half: the pieces that used to be borrowed from the pre-MIL kokoro.gguf ----------
+#
+# Everything below traces a real submodule that the bespoke converters hand-built op by op. Each wrapper
+# exists for one reason only: to present the module at the **layout the driver already uses**, since the
+# driver is unchanged and calls these topologies exactly as it always did. Two conventions appear, and
+# both are named in `loom_lua`:
+#
+#   Layout A   ne=[T, C], flat[c*T + t]  -- a contiguous torch (C, T) tensor
+#   rows_flat  ne=[C, T], flat[t*C + c]  -- a contiguous torch (T, C) tensor
+#
+# `LoomGGUFExporter` reverses a traced input's torch shape when it declares the topology's, so the torch
+# shape to trace at is the reverse of the bespoke topology's declared one. Getting that backwards is not
+# a silent error: `test_e2e_kokoro_mil_topology_equivalence` compares the declared inputs of the MIL and
+# bespoke topologies before it compares any numbers.
+
+
+class _DurationProjWrapper(torch.nn.Module):
+    """`predictor.duration_proj` -- Linear(512, 50) applied to ONE timestep.
+
+    No time axis at all: the driver calls this per timestep inside a Lua loop (`duration_logits[t] =
+    run_subgraph("duration_proj", {n_tokens = 0, ...}, {x = top_out[t]})`), which is why the bespoke
+    topology declares a bare `[512]` input."""
+
+    def __init__(self, proj):
+        super().__init__()
+        self.proj = proj
+
+    def forward(self, x):  # (512,) -> (50,)
+        return self.proj(x)
+
+
+class _AdaLayerNormWrapper(torch.nn.Module):
+    """One DurationEncoder `AdaLayerNorm`, presented in rows_flat layout.
+
+    The real forward is written for batched `(B, C, T)` input and `(B, style_dim)` style, and is
+    transpose-heavy -- `convert_kokoro_duration_predictor.build_adaln_topology`'s own docstring records
+    that it reduces algebraically to a channel-first LAYER_NORM plus a style-derived affine. This
+    wrapper does not exploit that: it calls the REAL module and only adapts the layout around it, which
+    is the whole point of tracing rather than re-deriving."""
+
+    def __init__(self, adaln):
+        super().__init__()
+        self.adaln = adaln
+
+    def forward(self, x, style):  # x: (T, C) rows_flat, style: (S,) -> (T, C)
+        # `(B, T, C)`, not `(B, C, T)`: the real forward's first two transposes only make sense that
+        # way round, and its `F.layer_norm(x, (channels,))` normalizes the LAST axis. Passing it
+        # channel-first raises `expected input with shape [*, 512], but got [1, 512, 7]` -- which is how
+        # this was found, and is why the wrapper adapts nothing but the batch dimension.
+        out = self.adaln(x.unsqueeze(0), style.unsqueeze(0))
+        # `.contiguous()` is load-bearing, not cosmetic: the real forward ends in two transposes, and a
+        # bare transpose as a traced graph's declared OUTPUT is a live non-contiguous GGML PERMUTE view
+        # that `ggml_backend_tensor_get`'s raw byte copy silently ignores. Same hazard
+        # `vits_export.StatsWrapper` and `matcha_export`'s module docstring already document.
+        return out.squeeze(0).contiguous()
+
+
+class _AdainResBlkWrapper(torch.nn.Module):
+    """One `AdainResBlk1d` from F0Ntrain's F0/N branch, in Layout A."""
+
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(self, x, style):  # x: (C, T) Layout A, style: (S,) -> (C_out, T_out)
+        out = self.block(x.unsqueeze(0), style.unsqueeze(0))
+        return out.squeeze(0).contiguous()
+
+
+class _Proj1x1Wrapper(torch.nn.Module):
+    """`F0_proj`/`N_proj` -- Conv1d(256, 1, kernel_size=1), in Layout A."""
+
+    def __init__(self, conv):
+        super().__init__()
+        self.conv = conv
+
+    def forward(self, x):  # (256, T) -> (1, T)
+        return self.conv(x.unsqueeze(0)).squeeze(0).contiguous()
+
+
+class _TextEncoderCnnWrapper(torch.nn.Module):
+    """`TextEncoder`'s embedding + its three Conv1d/LayerNorm/LeakyReLU stages, tokens -> Layout A.
+
+    The embedding is inside this topology rather than beside it because the bespoke `build_cnn` declares
+    a `tokens` input, and the driver hands it `inputs.input_ids` directly."""
+
+    def __init__(self, text_encoder):
+        super().__init__()
+        self.embedding = text_encoder.embedding
+        self.cnn = text_encoder.cnn
+
+    def forward(self, tokens):  # (T,) int -> (C, T) Layout A
+        x = self.embedding(tokens).transpose(0, 1).unsqueeze(0)  # (1, C, T)
+        for stage in self.cnn:
+            x = stage(x)
+        return x.squeeze(0).contiguous()
+
+
+def build_prosody_phases(text_encoder, predictor) -> List:
+    """Every phase for the TextEncoder + ProsodyPredictor half of an iSTFTNet-family model.
+
+    Shared by Kokoro and StyleTTS2 rather than written twice, for the same reason
+    `build_decoder_vocoder_phase` already is: these are **the same classes with different weights**
+    (Kokoro is a StyleTTS2 derivative, and the bespoke converters reuse Kokoro's hyperparameter dicts
+    for StyleTTS2 wholesale). Twenty-one topologies: six BiLSTMs as `RecurrentPhase`s, and the CNN,
+    three AdaLayerNorms, the duration head, two AdainResBlk1d stacks and two 1x1 projections traced
+    normally.
+
+    Together with the family's own encoder/decoder phases this is what makes the export
+    self-contained -- before it, a driver call into any of these landed on a topology loaded from the
+    pre-MIL `.gguf` alongside, which `external_topologies()` had to declare.
+    """
+    seq = ct.RangeDim(1, 2000)
+    style_dim = predictor.text_encoder.lstms[1].fc.in_features
+    d_model = predictor.text_encoder.lstms[1].channels
+
+    # DurationEncoder alternates LSTM / AdaLayerNorm, so its three LSTMs are `lstms[0, 2, 4]` and the
+    # AdaLayerNorms between them `lstms[1, 3, 5]`.
+    phases = [
+        RecurrentPhase(name="text_encoder_lstm", module=text_encoder.lstm),
+        RecurrentPhase(name="top_lstm", module=predictor.lstm),
+        RecurrentPhase(name="f0n_shared_lstm", module=predictor.shared),
+    ]
+    phases += [
+        RecurrentPhase(name=f"duration_lstm_{i}", module=predictor.text_encoder.lstms[idx])
+        for i, idx in enumerate((0, 2, 4))
+    ]
+
+    def styled(name, wrapper, mil_x_shape, dummy_x):
+        with torch.no_grad():
+            wrapper(dummy_x, torch.randn(style_dim))  # eager sanity check before tracing
+        return ExportPhase(
+            name=name, wrapper=wrapper, dummy_inputs=(dummy_x, torch.randn(style_dim)),
+            mil_inputs=[ct.TensorType(name="x", shape=mil_x_shape, dtype=np.float32),
+                        ct.TensorType(name="style", shape=(style_dim,), dtype=np.float32)],
+        )
+
+    # TextEncoder's embedding + CNN stack.
+    phases.append(ExportPhase(
+        name="text_encoder_cnn", wrapper=_TextEncoderCnnWrapper(text_encoder).eval(),
+        dummy_inputs=(torch.randint(0, text_encoder.embedding.num_embeddings, (7,), dtype=torch.long),),
+        mil_inputs=[ct.TensorType(name="tokens", shape=(seq,), dtype=np.int32)],
+    ))
+    # DurationEncoder's three AdaLayerNorms, in rows_flat.
+    phases += [
+        styled(f"duration_adaln_{i}", _AdaLayerNormWrapper(predictor.text_encoder.lstms[idx]).eval(),
+               (seq, d_model), torch.randn(7, d_model))
+        for i, idx in enumerate((1, 3, 5))
+    ]
+    # The per-timestep duration head. No time axis: the driver calls it inside a Lua loop.
+    phases.append(ExportPhase(
+        name="duration_proj", wrapper=_DurationProjWrapper(predictor.duration_proj).eval(),
+        dummy_inputs=(torch.randn(d_model),),
+        mil_inputs=[ct.TensorType(name="x", shape=(d_model,), dtype=np.float32)],
+    ))
+    # F0Ntrain's two AdainResBlk1d stacks and their 1x1 projections, in Layout A.
+    for branch, blocks in (("f0", predictor.F0), ("n", predictor.N)):
+        phases += [
+            styled(f"f0n_{branch}_block{i}", _AdainResBlkWrapper(block).eval(),
+                   (block.conv1.in_channels, seq), torch.randn(block.conv1.in_channels, 8))
+            for i, block in enumerate(blocks)
+        ]
+    for branch, conv in (("f0", predictor.F0_proj), ("n", predictor.N_proj)):
+        phases.append(ExportPhase(
+            name=f"f0n_{branch}_proj", wrapper=_Proj1x1Wrapper(conv).eval(),
+            dummy_inputs=(torch.randn(conv.in_channels, 8),),
+            mil_inputs=[ct.TensorType(name="x", shape=(conv.in_channels, seq), dtype=np.float32)],
+        ))
+    return phases

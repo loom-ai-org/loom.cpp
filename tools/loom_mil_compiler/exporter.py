@@ -880,6 +880,35 @@ class LoomGGUFExporter:
                     if 0 <= in_axis < len(x_var.shape):
                         return self._infer_dynamic_dim_expr(x_var, in_axis, _seen)
 
+        if op.op_type in ("gather", "gather_along_axis"):
+            # `gather(x, indices, axis=a)` replaces x's axis `a` with the INDICES' own shape:
+            # `out.shape = x.shape[:a] + indices.shape + x.shape[a+1:]`. So an output axis inside the
+            # indices' block takes its expression from `indices`, and every other one passes through
+            # from `x` at its shifted position.
+            #
+            # The case that needs this is the most ordinary one imaginable and had simply never been
+            # hit: an **embedding lookup at the start of a topology**. `nn.Embedding(vocab, C)` traces
+            # to `gather(weight, tokens, axis=0)`, whose output length IS the token count -- and with no
+            # case here the walk gave up, so the dynamic axis fell out of a downstream RESHAPE target as
+            # a literal, and the topology failed to build with "target shape [1,512,1] has 512 elements
+            # but input has 3584". Found exporting Kokoro's `text_encoder_cnn`; the same shape as the
+            # `leaky_relu`/`conv_transpose` gaps `vits_export.py`'s own docstring records.
+            x_var = op.inputs.get("x")
+            idx_var = op.inputs.get("indices")
+            axis = static_scalar(op.inputs.get("axis"))
+            if x_var is not None and idx_var is not None and x_var.shape is not None \
+                    and idx_var.shape is not None:
+                a = int(axis) if axis is not None else 0
+                if a < 0:
+                    a += len(x_var.shape)
+                idx_rank = len(idx_var.shape)
+                if a <= torch_axis < a + idx_rank:
+                    return self._infer_dynamic_dim_expr(idx_var, torch_axis - a, _seen)
+                src_axis = torch_axis if torch_axis < a else torch_axis - idx_rank + 1
+                if 0 <= src_axis < len(x_var.shape):
+                    return self._infer_dynamic_dim_expr(x_var, src_axis, _seen)
+            return None
+
         if op.op_type == "stack":
             # Inserts one new axis (like expand_dims) but from N same-shaped operands rather than one --
             # any axis OTHER than the new one has a direct 1:1 correspondence to (any one of, they're
@@ -1775,6 +1804,8 @@ class LoomGGUFExporter:
         referenced = {name for node in pruned_nodes for name in node["inputs"]}
         topo_inputs = [inp for inp in topo_inputs if inp["name"] in referenced]
 
+        pruned_nodes, output_symbols = self._materialize_view_outputs(pruned_nodes, output_symbols)
+
         # "output" (singular string) is both the original schema and what every single-output topology
         # still serializes -- byte-identical to pre-P2 output. "outputs" (plural array) is new, used only
         # when a function genuinely declares more than one output; see graph_topology.h's own comment on
@@ -1786,6 +1817,49 @@ class LoomGGUFExporter:
             topo["outputs"] = output_symbols
         topo["nodes"] = pruned_nodes
         return topo
+
+    # Ops whose ggml result is a live VIEW of their input rather than a fresh contiguous buffer.
+    # `ggml_backend_tensor_get` -- how every declared output is read back, by the Lua bridge and by
+    # every reference test -- does a raw contiguous byte copy, so reading one of these back returns the
+    # data in PRE-op order and silently ignores what the op did.
+    _VIEW_PRODUCING_OPS = ("PERMUTE", "TRANSPOSE")
+
+    def _materialize_view_outputs(self, nodes: list, output_symbols):
+        """Appends a `CONT` after any declared output produced by a view op, so a topology's output is
+        always a real contiguous buffer.
+
+        **This is a general correctness fix, not a convenience.** A traced module whose last operation
+        is a transpose emits a bare `PERMUTE` as the topology's declared output; `torch`'s own
+        `.contiguous()` cannot prevent it, because MIL has no notion of contiguity and drops the call
+        entirely. The result builds, runs, and returns the *untransposed* data.
+
+        The hazard was already known and, until now, only ever avoided: `matcha_export.py`'s module
+        docstring and `vits_export.StatsWrapper` both record deliberately NOT returning a transposed
+        output for exactly this reason, and every hand-built converter that needs one writes
+        `PERMUTE + CONT` by hand (`topology_ops.py` does the same internally in several places). What
+        forced the fix rather than another workaround is a topology whose consumer *requires* the
+        transposed layout: StyleTTS2's `bert_encoder`, whose driver reads `d_en_flat[c*T + t]`. Avoiding
+        the transpose there is not an option, so the exporter has to emit the copy the bespoke converter
+        always did.
+
+        Caught by `test_e2e_kokoro_mil_topology_equivalence` as mean_abs_diff=0.717 against a reference
+        whose values only reach 2.23 -- which is what a transpose looks like when nothing crashes.
+        """
+        by_output = {}
+        for node in nodes:
+            for name in node.get("outputs", []):
+                by_output[name] = node
+        out_nodes = list(nodes)
+        new_symbols = []
+        for symbol in output_symbols:
+            producer = by_output.get(symbol)
+            if producer is None or producer["op"] not in self._VIEW_PRODUCING_OPS:
+                new_symbols.append(symbol)
+                continue
+            cont_name = f"{symbol}_cont"
+            out_nodes.append({"op": "CONT", "inputs": [symbol], "outputs": [cont_name]})
+            new_symbols.append(cont_name)
+        return out_nodes, new_symbols
 
     def _prune_dead_nodes(self, nodes: list, output_symbols) -> list:
         """
