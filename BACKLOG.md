@@ -954,6 +954,83 @@ nothing.
   new is written. The deliverable is as much the **catalogue** — per component, its links, what it emits,
   which models use it — as the code, since that is what lets P4.1/P4.3 reuse rather than restate.
   **Gate:** all 11 re-exported byte-identically through registered components.
+
+  **IN PROGRESS — three commits, none of them the registry itself.** The author's review of stage C is
+  what redirected this item, and the critique was correct on both counts: peeling into `.lua` fragments
+  named the blocks but left them heterogeneous, and the export had no business emitting two GGUFs per
+  model. Measured before acting: **11 functions totalling 112 lines were shipped byte-identical in
+  Kokoro's and StyleTTS2's fragments**, with their own comments saying so ("identical to
+  kokoro_driver.lua's own"). The duplication was documented rather than removed.
+
+  1. **`loom_lua` — the driver-side standard library.** Twenty atomic Lua functions in
+     `tools/loom_mil_compiler/lua/`, one per file, with each family declaring what it uses and the
+     builder emitting only the transitive closure (so Matcha's GGUF does not carry StyleTTS2's ADPM2
+     sampler). The 11 duplicates now have one definition each; six array primitives the inventory turned
+     up as repeated inline loops (`array_sum` ×4 families, `array_slice`, `array_affine`,
+     `durations_from_logw`, `pad_last_to_multiple`, `repeat_by_duration_tfast`) joined them. Dependency
+     declarations are checked **both** ways, and that check paid for itself on its first run: one real
+     missing dependency (`predict_durations` calls `sigmoid`) and one false positive from matching
+     comment prose, since `round_half_to_even`'s docstring *names* `predict_durations`, which calls it —
+     believing the comment would have inverted the dependency.
+
+     The boundary this found, rather than assumed: VITS's frame expansion fuses Gaussian
+     reparameterisation into its repeat loop, and Kokoro's/StyleTTS2's duration-encoder loops interleave
+     a subgraph call with per-timestep row surgery. Generalising either means a callback per inner
+     statement — worse to read than the loop, which is the same argument `flow_matching_export.py` makes
+     about ADPM2. **The rule: a library function names one operation; a family's own control flow stays
+     in the family.**
+
+  2. **`RecurrentPhase` — `recurrent.py` finally wired in.** `build_lstm_cell_topologies` had been
+     verified against a real bidirectional `nn.LSTM` to 1e-4 since it was written and had **no caller**;
+     `generate_graph_topology` raised on an `lstm` op and named it as the fix. The maths was never the
+     missing half. It emits `{name}_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd` — exactly what `loom_lua`'s
+     `bilstm_run` composes — so no driver changed.
+
+  3. **Kokoro and StyleTTS2 are now self-contained**: 39 and 41 topologies in one GGUF each, and
+     `external_topologies()` returns `{}` for both. **This is the item that should not have needed
+     doing.** The one-GGUF-per-model convention already existed and the *bespoke* converters already met
+     it — `convert_kokoro_lua_all.py` produces a single 43-topology `kokoro.gguf`. The MIL export was the
+     regression, and stage C's `external_topologies()` documented it rather than fixing it. 21 phases per
+     family from one shared builder (`build_prosody_phases`), reused between them for the same reason
+     `build_decoder_vocoder_phase` already was: Kokoro is a StyleTTS2 derivative, so these are the same
+     classes with different weights.
+
+  **The gate this needed and did not have.** `test_e2e_*_mil_lua_driver` has no oracle waveform by
+  design; its per-sample checks are `isfinite` plus an rms range, so a wrong topology producing a finite,
+  plausibly-loud waveform passes it. `test_e2e_kokoro_mil_topology_equivalence` compares each transferred
+  topology against **the thing it replaces** — same random inputs into both files' versions — with the
+  list *derived* from the intersection, so a phase is covered the moment it is exported. It covers both
+  families: **75 topologies, 234 checks**; the 24 LSTM cells at ~1e-7, `duration_proj`/`adaln`/`proj1x1`/
+  `bert_encoder` at exactly 0. Two names are excluded by an explicit list rather than by "skip any
+  difference" — StyleTTS2's `albert` and `diffusion` deliberately redefined their interface and the
+  driver was rewritten to match; every other declared-input mismatch is a real finding.
+
+  **Two general exporter bugs, both found by that gate, neither family-specific:**
+
+  * `_infer_dynamic_dim_expr` had no `gather` case, so the walk gave up at an **embedding lookup** — the
+    most ordinary way to start a topology and simply never hit before. The dynamic axis fell out of a
+    downstream RESHAPE as a literal and the topology failed to build. Same shape as the
+    `leaky_relu`/`conv_transpose` gaps `vits_export.py` already records.
+  * **A declared output produced by `PERMUTE` was left as a live view.** `ggml_backend_tensor_get` does a
+    raw contiguous byte copy, so reading one back returns pre-transpose data; torch's `.contiguous()`
+    cannot prevent it, because MIL has no notion of contiguity and drops the call. The hazard was known
+    and until now only ever *avoided* — `matcha_export.py`'s docstring and `vits_export.StatsWrapper`
+    both record deliberately not returning a transposed output, and every hand-built converter writes
+    `PERMUTE + CONT` by hand. StyleTTS2's `bert_encoder` forced the fix because its driver *requires* the
+    transposed layout. Caught as mean_abs_diff=0.717 against a reference reaching 2.23 — what a transpose
+    looks like when nothing crashes.
+
+  **Sweep — the general fixes are no-ops where they do not apply.** All eleven exported from a worktree
+  at the previous commit and from the working tree: the nine that need neither fix are byte-identical in
+  topologies, weights, non-driver KV *and* driver text; Kokoro and StyleTTS2 differ by exactly the
+  topologies they gained. 141/141 ctest, 373 pytest.
+
+  **What remains for P4.0.7 proper**, unchanged by the above: D.1's name → component registry, D.3's
+  catalogue, and the half of D.2 that is *registration* rather than wiring. One checking gap is worth
+  carrying into it — `bilstm_run`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the
+  Lua computes (`namespace_ .. "_h_fwd"`), so those call sites still cannot be link-checked. Now that the
+  exporter produces those topologies itself, declaring them as data closes the last unchecked calls in
+  both drivers.
 - **P4.0.8 — legacy C++ driver retirement policy.** R6's policy covers `tools/convert_*` only; extend it
   to `src/core/{kokoro,vits,matcha,styletts2,supertonic,whisper}_driver.cpp`, which predate the Lua
   drivers becoming the orchestration device. Same rule — a driver may be deleted only in the commit that

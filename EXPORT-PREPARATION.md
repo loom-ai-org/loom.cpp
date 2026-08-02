@@ -645,6 +645,14 @@ is not testable from the snapshot side.
   declaration, checked in both directions (a name it lists that this export *does* produce is stale; one
   no call site references is dead). Declaring beats the obvious alternative — skip any call naming an
   unexported topology — which would make a typo and a cross-GGUF dependency indistinguishable.
+
+  > **Superseded during stage D (see BACKLOG.md P4.0.7).** Declaring it was the right *first* move and
+  > the wrong *last* one. The author's review put it plainly: the machinery to put everything in one file
+  > was already there, and the one-GGUF-per-model convention was already met by the bespoke converters —
+  > `convert_kokoro_lua_all.py` emits a single 43-topology `kokoro.gguf`. So the MIL export was the
+  > regression and this bullet documented it rather than fixing it. Both families are now self-contained
+  > (39 and 41 topologies) and `external_topologies()` returns `{}` for both. The method stays, because
+  > the next partial family will need it and an empty answer is a stronger statement than a missing one.
 * **Where peeled Lua lives had to be decided, and it is `.lua` fragments** (author's call): a directory of
   small files per family, ordered by the component list, each declaring its `reads`/`defines`. There is no
   half-measure that is not marker substitution again, and Lua as Python string literals would put the
@@ -661,6 +669,20 @@ is not testable from the snapshot side.
 
 ### Stage D — P4.0.7: the component registry
 
+**Stage D grew two steps this plan did not have, and they came before the registry.** The author's
+review of stage C made two points, both correct and both measured before acting: the `.lua` fragments
+named the blocks but left them heterogeneous (**11 functions, 112 lines, byte-identical in two
+families**, their own comments saying so), and the export had no business emitting two GGUFs per model
+when the machinery to combine them was already present and unwired. Those became **D.0a `loom_lua`** and
+**D.0b self-contained exports**, landed as three commits and written up in BACKLOG.md P4.0.7; the
+registry steps below are unchanged and still outstanding.
+
+The generalisable lesson for D.1/D.3, since it is the same trap one level up: *a name is not a
+mechanism*. Peeling produced named blocks that were still duplicated, exactly as an inventory of
+components can be a directory rather than a shelf. What made `loom_lua` real was that a family
+**declares** what it uses and the declaration is checked in both directions — which is precisely what
+D.1 must do for components, and D.3's catalogue must report rather than transcribe.
+
 **D.1 — `driver_components/`**: name → component registry, and the six existing components moved onto
 the one calling convention. No new capability. *Touches: all 11 — byte-identical driver text required,
 since this is a pure re-homing.*
@@ -671,6 +693,15 @@ catalogue documents checks nobody has ever seen fail.
 
 **D.2 — `recurrent.py`'s LSTM/GRU stepping loop becomes a registered component.** It is the one
 inventory item that is ad hoc today rather than merely differently-shaped. *Touches: Kokoro, StyleTTS2.*
+
+*Half of this landed early, in D.0b.* `RecurrentPhase` wired `build_lstm_cell_topologies` into the
+multi-phase export — it had been verified against a real bidirectional `nn.LSTM` to 1e-4 since it was
+written and had **no caller**, with `generate_graph_topology` raising on an `lstm` op and naming it as
+the fix. What remains is the *registration* half, and it now has a concrete payoff to aim at:
+`bilstm_run`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the Lua computes
+(`namespace_ .. "_h_fwd"`), so those call sites are the last ones in either driver that no link can
+reach. Declaring them as data is what closes that — and it is only possible now, because until D.0b
+those topologies were not in the file at all.
 
 **D.3 — the catalogue.** One documented table: per component, its links, what it emits, and which models
 use it. This is the artifact that makes P4.1/P4.3 able to reuse rather than restate, and it is the
