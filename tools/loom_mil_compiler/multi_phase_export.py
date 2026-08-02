@@ -102,6 +102,102 @@ def _mil_input_names(phase) -> List[str]:
     return [getattr(t, "name", None) for t in (phase.mil_inputs or [])]
 
 
+@dataclass
+class RecurrentPhase:
+    """One `torch.nn.LSTM` exported as its four per-timestep cell topologies instead of one static graph.
+
+    **Why this is a phase type rather than an `ExportPhase` with a different wrapper.** ggml has no LSTM
+    op, so a recurrence cannot be a static topology at all -- it needs a genuine host-side loop over a
+    cell. `LoomGGUFExporter.generate_graph_topology` says exactly that today, by raising on any `lstm`
+    op and pointing at `recurrent.build_lstm_cell_topologies` as the thing a caller should use. That
+    function has been verified against a real traced `nn.LSTM` forward (bidirectional included, to 1e-4)
+    since it was written, and until now had **no caller**: the wiring was the missing half, not the
+    maths.
+
+    It emits `{name}_h_fwd`, `{name}_c_fwd` and -- for a bidirectional module -- `{name}_h_bwd`,
+    `{name}_c_bwd`, which is precisely the four-topology naming `loom_lua`'s `bilstm_run` already
+    drives and the bespoke converters already produce. A driver calling `bilstm_run("text_encoder_lstm",
+    ...)` therefore does not change at all; only where those four topologies come from does.
+
+    The cell formulation is MIL's, not PyTorch's state-dict one: gate order `[i, f, o, z]` and a single
+    pre-summed bias, because that is what coremltools' torch frontend hands over. It is a different
+    arrangement of the same arithmetic than `convert_kokoro_duration_predictor.build_bilstm`'s, which
+    slices a raw state dict in `[i, f, g, o]` order with two separate biases -- so the emitted topology
+    JSON is *not* byte-comparable with the bespoke one, and the gate for replacing one with the other is
+    numeric rather than structural.
+    """
+
+    name: str
+    # The module to trace. Either an `nn.LSTM` or a thin wrapper whose forward is one call to it -- the
+    # trace only has to contain exactly one `lstm` op.
+    module: nn.Module
+    # Defaults to the module's own `input_size`, so an `nn.LSTM` never restates it. Passed explicitly
+    # only for a wrapper that has no such attribute.
+    input_dim: Optional[int] = None
+    # Dummy sequence length for the trace. Irrelevant to the result (a cell topology has no time axis at
+    # all), which is why it is not a `dummy_seq_len`-style sentinel: nothing downstream can collide with
+    # it the way `Modular`'s can.
+    trace_len: int = 8
+
+    __unchecked__ = {
+        "name": Unchecked(
+            "the prefix of the four topology names this phase creates. Like ExportPhase.name it does "
+            "not refer to anything -- it CREATES the reference bilstm_run's own computed name resolves "
+            "against at run time"
+        ),
+        "module": Unchecked(
+            "the nn.LSTM being traced. It is the model; there is no separate authority to check it "
+            "against, and `topologies()` raises if the trace does not contain exactly one lstm op"
+        ),
+        "input_dim": Unchecked(
+            "the module's own input width, defaulted from `module.input_size` and only ever passed "
+            "explicitly for a wrapper that has no such attribute. torch is the authority and needs no "
+            "help: the trace runs at this width, so a wrong value raises `input.size(-1) must be equal "
+            "to input_size. Expected N, got M` before anything here can look at it. A comparison after "
+            "the trace was written first and then deleted -- it could not be reached, which is exactly "
+            "the dead check this protocol exists to prevent"
+        ),
+        "trace_len": Unchecked(
+            "the dummy sequence length. A cell topology has no time axis, so this cannot affect the "
+            "result -- it only has to be long enough for coremltools to build an lstm op at all"
+        ),
+    }
+
+    def topologies(self) -> Tuple[Dict[str, dict], Dict[str, np.ndarray]]:
+        """`({topology name: topology}, weights)` for this LSTM's four (or two) cells."""
+        import coremltools as ct
+        import torch
+
+        from .recurrent import build_lstm_cell_topologies
+
+        # `batch_first` decides which of the first two axes is time. It does not change the weights this
+        # phase extracts -- a cell has no time axis either way -- but tracing with the axes swapped
+        # makes the dummy sequence length read as a batch size, which is a confusing thing to leave in
+        # a trace even when it is harmless.
+        batch_first = bool(getattr(self.module, "batch_first", False))
+        width = self.input_dim if self.input_dim is not None else self.module.input_size
+        shape = ((1, self.trace_len, width) if batch_first else (self.trace_len, 1, width))
+        dummy = torch.zeros(*shape)
+        traced = torch.jit.trace(self.module.eval(), (dummy,))
+        program = ct.convert(
+            traced, inputs=[ct.TensorType(name="x", shape=dummy.shape)],
+            convert_to="milinternal", compute_precision=ct.precision.FLOAT32,
+        )
+        ops = [op for op in program.functions["main"].operations if op.op_type == "lstm"]
+        if len(ops) != 1:
+            raise ValueError(
+                f"RecurrentPhase({self.name!r}) traced to {len(ops)} 'lstm' ops, expected exactly one. "
+                f"Wrap a single nn.LSTM -- a module containing several is several phases."
+            )
+        result = build_lstm_cell_topologies(ops[0], weight_namespace=f"{self.name}.")
+        topologies = {f"{self.name}_h_fwd": result["forward"]["h"],
+                      f"{self.name}_c_fwd": result["forward"]["c"]}
+        if result["backward"] is not None:
+            topologies[f"{self.name}_h_bwd"] = result["backward"]["h"]
+            topologies[f"{self.name}_c_bwd"] = result["backward"]["c"]
+        return topologies, result["weights"]
+
+
 def merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:
     """Content-aware merge across every phase's own weight dict: an identical name with an identical
     real value dedups silently (the common case for names that already carry a per-phase prefix, e.g.

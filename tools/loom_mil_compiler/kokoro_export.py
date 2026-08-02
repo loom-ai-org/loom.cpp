@@ -55,7 +55,7 @@ from coremltools.converters.mil.frontend.torch import ops as _torch_ops
 from coremltools.converters.mil.mil import Builder as _mb
 
 from .checkpoint_probe import read_json
-from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, RecurrentPhase
 from .patcher import ModelPatcher
 from .spec_protocol import Unchecked
 
@@ -591,7 +591,14 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         print("Tracing decoder_vocoder phase...")
         decoder_vocoder_phase = build_decoder_vocoder_phase(model.decoder)
 
-        return [albert_phase, decoder_vocoder_phase]
+        # TextEncoder's BiLSTM, exported as its four per-timestep cell topologies rather than left to
+        # the pre-MIL kokoro.gguf. ggml has no LSTM op, so this is a `RecurrentPhase` and not an
+        # `ExportPhase` -- see its docstring. Its four topology names are exactly the ones
+        # `bilstm_run("text_encoder_lstm", ...)` already resolves, so the driver is untouched.
+        text_encoder_lstm = RecurrentPhase(
+            name="text_encoder_lstm", module=model.text_encoder.lstm)
+
+        return [albert_phase, decoder_vocoder_phase, text_encoder_lstm]
 
 
 # Kokoro's `config.json` carries no `model_type`-style single field, but its own key set is a real

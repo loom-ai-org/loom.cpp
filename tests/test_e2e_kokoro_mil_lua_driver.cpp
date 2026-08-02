@@ -67,14 +67,27 @@ int main() {
 
         loom::LoomLuaBridge bridge(backend.get());
 
-        // --- MIL-traced (kokoro_mil.gguf) ---
-        bridge.register_module("albert_bert_encoder", *model_mil,
-                                loom::GraphTopology::parse(model_mil->topology_json("albert_bert_encoder")));
-        bridge.register_module("decoder_vocoder", *model_mil,
-                                loom::GraphTopology::parse(model_mil->topology_json("decoder_vocoder")));
+        // Every topology the driver calls, registered from the MIL GGUF when it has one and from the
+        // pre-MIL kokoro.gguf otherwise. Written this way rather than as two fixed lists because the
+        // MIL export is progressively taking these over -- `text_encoder_lstm_*` moved across when
+        // `RecurrentPhase` landed (P4.0.7) -- and a fixed list would have to be edited in lockstep,
+        // which is exactly the kind of bookkeeping that silently keeps testing the old path.
+        // `mil_topology_count` below then asserts how far that has got, so the transfer cannot happen
+        // by accident either.
+        int mil_topology_count = 0;
+        const auto register_preferring_mil = [&](const char* name) {
+            if (model_mil->has_topology(name)) {
+                bridge.register_module(name, *model_mil,
+                                        loom::GraphTopology::parse(model_mil->topology_json(name)));
+                ++mil_topology_count;
+            } else {
+                bridge.register_module(name, *model_lua,
+                                        loom::GraphTopology::parse(model_lua->topology_json(name)));
+            }
+        };
 
-        // --- Bespoke/LSTM-bound (kokoro.gguf) ---
         const char* bespoke_topo_names[] = {
+            "albert_bert_encoder", "decoder_vocoder",
             "text_encoder_cnn",
             "text_encoder_lstm_h_fwd", "text_encoder_lstm_c_fwd", "text_encoder_lstm_h_bwd", "text_encoder_lstm_c_bwd",
             "duration_lstm_0_h_fwd", "duration_lstm_0_c_fwd", "duration_lstm_0_h_bwd", "duration_lstm_0_c_bwd",
@@ -89,8 +102,12 @@ int main() {
             "f0n_f0_proj", "f0n_n_proj",
         };
         for (const char* name : bespoke_topo_names) {
-            bridge.register_module(name, *model_lua, loom::GraphTopology::parse(model_lua->topology_json(name)));
+            register_preferring_mil(name);
         }
+        // albert_bert_encoder + decoder_vocoder + the four text_encoder_lstm cells. Asserted so that a
+        // regression which quietly stopped exporting one -- and fell back to the bespoke copy -- fails
+        // here rather than passing on the old path.
+        LOOM_CHECK(mil_topology_count == 6);
 
         bridge.load_script(driver_script);
 
