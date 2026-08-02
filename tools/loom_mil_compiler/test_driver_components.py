@@ -322,11 +322,11 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
 
     def test_the_five_real_drivers_all_round_trip(self):
         """Not a fixture: the actual shipped `.lua` files, which is the only thing C.3's byte-identity
-        gate is a claim about. Four, not five, since C.4 peeled Matcha -- and the count is asserted so
-        that peeling a family without updating this test is noticed rather than silently reducing the
-        coverage of the claim."""
+        gate is a claim about. Three, not five: C.4 peeled Matcha and C.5 Supertonic. The count is
+        asserted so that peeling a family without updating this test is noticed rather than silently
+        reducing the coverage of the claim."""
         drivers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
-        self.assertEqual(len(drivers), 4, [d.name for d in drivers])
+        self.assertEqual(len(drivers), 3, [d.name for d in drivers])
         for path in drivers:
             RawLuaDriver(source=path.read_text(), origin=path.name).assert_round_trip()
 
@@ -549,3 +549,38 @@ class TestPeeledMatcha(unittest.TestCase):
             "not declare: ['mels']; leaves declared input(s) unsupplied: ['mel']; topology declares "
             "['mel'], spec supplies ['mels'].",
         )
+
+
+class TestPeeledSupertonic(unittest.TestCase):
+    """The second peeled family, and the only thing worth asserting about it separately: it is built
+    from the same classes as the first, differing only in data.
+
+    That is P4.0.7's reuse claim tested rather than asserted, and it is why the plan orders Supertonic
+    straight after Matcha instead of after the harder families -- if the second family had needed a new
+    component, the component API would have been shaped by one example."""
+
+    def _config(self):
+        from loom_mil_compiler.supertonic_export import TTSSupertonicExportConfig
+
+        return TTSSupertonicExportConfig(model_dir="/unused", output_path="/unused",
+                                         architecture="supertonic")
+
+    def _matcha_config(self):
+        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+
+        return TTSMatchaExportConfig(model_dir="/unused", output_path="/unused", architecture="matcha")
+
+    def test_it_introduces_no_component_class_matcha_did_not_already_use(self):
+        supertonic = {type(c) for c in self._config().driver_components()}
+        matcha = {type(c) for c in self._matcha_config().driver_components()}
+        self.assertEqual(supertonic - matcha, set())
+
+    def test_it_assembles_into_a_driver_that_validates(self):
+        ctx = DriverContext(
+            topologies={"dp": _topo(["txt_ids", "stl_emb"]), "ttl_text": _topo(["txt_ids", "stl_emb"]),
+                        "vfe": _topo(["z_t", "txt_emb", "stl_emb", "t"]), "decoder": _topo(["latent"])},
+            axes={n: "n_tokens" for n in ("dp", "ttl_text", "vfe", "decoder")},
+        )
+        text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(ctx)
+        self.assertLess(text.index("local function sample_vfe"), text.index("function synthesize"))
+        self.assertTrue(text.endswith("    return waveform\nend\n"))

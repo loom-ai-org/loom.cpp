@@ -1,0 +1,21 @@
+-- Lua orchestration for the MIL-traced SupertonicTTS export (export_supertonic_mil.py), mirroring the
+-- bespoke tools/convert_supertonic/supertonic_driver.lua's own control flow (DurationPredictor ->
+-- get_latent_mask (host) -> TTLTextEncoder -> Euler CFM loop over VectorFieldEstimator -> SpeechDecoder)
+-- with one simplification: the traced "vfe" topology computes VFTextCrossAttention's fractional-RoPE
+-- positions INTERNALLY from real (all-ones) masks (see export_supertonic_mil.py's `_ones_mask_from_*`),
+-- so this driver -- unlike the bespoke one -- never needs to host-compute `lat_frac`/`txt_frac` arrays
+-- itself.
+--
+-- Expects four modules pre-registered by the host: "dp", "ttl_text", "vfe", "decoder" (none use a
+-- KvCache) -- SAME names/roles as the bespoke driver.
+--
+-- Text-length scope note (see export_supertonic_mil.py's own module docstring): "vfe"'s own `txt_emb`
+-- input has a FIXED shape (T_TEXT_FIXED, baked in at export time) -- `inputs.txt_ids` MUST be exactly
+-- that length for this driver to run correctly, same real constraint the bespoke driver already carries.
+--
+-- inputs: txt_ids (int array, length t_text), style_ttl (flat f32 array, n_style_ttl*style_dim_ttl),
+-- style_dp (flat f32 array, n_style_dp*style_dim_dp), n_steps (int), seed (int, seeds
+-- loom.gaussian_array), plus the real model constants t_text, lat_dim, sample_rate, base_chunk_size,
+-- compression_factor.
+--
+-- Returns: the raw waveform (flat f32 array).
