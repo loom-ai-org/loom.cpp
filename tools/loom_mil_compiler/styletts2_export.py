@@ -334,7 +334,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             LuaLibrary(uses=(
                 "array_slice", "array_sum",
                 "to_row_major", "from_row_major", "to_layout_a",
-                "from_layout_a", "bilstm_run", "run_resblk_stack",
+                "from_layout_a", "run_bi_lstm", "run_resblk_stack",
                 "run_proj1x1", "predict_durations", "compute_wsum",
                 "karras_schedule", "adpm2_sample",
             )),

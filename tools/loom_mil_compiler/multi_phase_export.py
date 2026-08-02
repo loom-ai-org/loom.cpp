@@ -115,8 +115,8 @@ class RecurrentPhase:
     maths.
 
     It emits `{name}_h_fwd`, `{name}_c_fwd` and -- for a bidirectional module -- `{name}_h_bwd`,
-    `{name}_c_bwd`, which is precisely the four-topology naming `loom_lua`'s `bilstm_run` already
-    drives and the bespoke converters already produce. A driver calling `bilstm_run("text_encoder_lstm",
+    `{name}_c_bwd`, which is precisely the four-topology naming `loom_lua`'s `run_bi_lstm` already
+    drives and the bespoke converters already produce. A driver calling `run_bi_lstm("text_encoder_lstm",
     ...)` therefore does not change at all; only where those four topologies come from does.
 
     The cell formulation is MIL's, not PyTorch's state-dict one: gate order `[i, f, o, z]` and a single
@@ -142,7 +142,7 @@ class RecurrentPhase:
     __unchecked__ = {
         "name": Unchecked(
             "the prefix of the four topology names this phase creates. Like ExportPhase.name it does "
-            "not refer to anything -- it CREATES the reference bilstm_run's own computed name resolves "
+            "not refer to anything -- it CREATES the reference run_bi_lstm's own computed name resolves "
             "against at run time"
         ),
         "module": Unchecked(

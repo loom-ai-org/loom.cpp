@@ -144,12 +144,12 @@ class TestRecurrentPhase(unittest.TestCase):
         lstm = torch.nn.LSTM(input_dim, hidden, batch_first=True, bidirectional=bidirectional)
         return RecurrentPhase(name=name, module=lstm, input_dim=input_dim)
 
-    def test_a_bidirectional_module_yields_the_four_cells_bilstm_run_drives(self):
+    def test_a_bidirectional_module_yields_the_four_cells_run_bi_lstm_drives(self):
         topologies, weights = self._lstm_phase().topologies()
         self.assertEqual(sorted(topologies), ["enc_lstm_c_bwd", "enc_lstm_c_fwd",
                                               "enc_lstm_h_bwd", "enc_lstm_h_fwd"])
-        # Exactly the names `loom_lua`'s bilstm_run composes, so a driver calling
-        # bilstm_run("enc_lstm", ...) needs no change at all.
+        # Exactly the names `loom_lua`'s run_bi_lstm composes, so a driver calling
+        # run_bi_lstm("enc_lstm", ...) needs no change at all.
         self.assertEqual(sorted(weights), [
             "enc_lstm.bwd.bias", "enc_lstm.bwd.weight_hh", "enc_lstm.bwd.weight_ih",
             "enc_lstm.fwd.bias", "enc_lstm.fwd.weight_hh", "enc_lstm.fwd.weight_ih",

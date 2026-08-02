@@ -83,7 +83,7 @@ class TestADriverCarriesOnlyWhatItUses(unittest.TestCase):
         self.assertIn("local function to_layout_a", text)
         self.assertIn("local function run_proj1x1", text)
         self.assertNotIn("adpm2", text)
-        self.assertNotIn("bilstm_run", text)
+        self.assertNotIn("run_bi_lstm", text)
 
     def test_unreferenced_reports_a_declaration_nothing_calls(self):
         library = LuaLibrary(uses=("array_sum", "compute_wsum"))
@@ -134,7 +134,7 @@ class TestTheRealFamilies(unittest.TestCase):
     def test_the_eleven_duplicated_functions_now_have_exactly_one_definition(self):
         """The measurement this library was built from: 11 functions were byte-identical in Kokoro's and
         StyleTTS2's headers. Their definitions must now exist once, in `lua/`, and nowhere else."""
-        shared = ("bilstm_run", "run_resblk_stack", "run_proj1x1", "to_row_major", "from_row_major",
+        shared = ("run_bi_lstm", "run_resblk_stack", "run_proj1x1", "to_row_major", "from_row_major",
                   "to_layout_a", "from_layout_a", "sigmoid", "round_half_to_even",
                   "predict_durations", "compute_wsum")
         fragments = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver/*.lua"))

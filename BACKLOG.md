@@ -984,7 +984,7 @@ nothing.
      verified against a real bidirectional `nn.LSTM` to 1e-4 since it was written and had **no caller**;
      `generate_graph_topology` raised on an `lstm` op and named it as the fix. The maths was never the
      missing half. It emits `{name}_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd` — exactly what `loom_lua`'s
-     `bilstm_run` composes — so no driver changed.
+     `run_bi_lstm` composes — so no driver changed.
 
   3. **Kokoro and StyleTTS2 are now self-contained**: 39 and 41 topologies in one GGUF each, and
      `external_topologies()` returns `{}` for both. **This is the item that should not have needed
@@ -1027,7 +1027,7 @@ nothing.
 
   **What remains for P4.0.7 proper**, unchanged by the above: D.1's name → component registry, D.3's
   catalogue, and the half of D.2 that is *registration* rather than wiring. One checking gap is worth
-  carrying into it — `bilstm_run`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the
+  carrying into it — `run_bi_lstm`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the
   Lua computes (`namespace_ .. "_h_fwd"`), so those call sites still cannot be link-checked. Now that the
   exporter produces those topologies itself, declaring them as data closes the last unchecked calls in
   both drivers.

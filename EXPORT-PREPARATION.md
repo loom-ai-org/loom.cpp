@@ -698,7 +698,7 @@ inventory item that is ad hoc today rather than merely differently-shaped. *Touc
 multi-phase export — it had been verified against a real bidirectional `nn.LSTM` to 1e-4 since it was
 written and had **no caller**, with `generate_graph_topology` raising on an `lstm` op and naming it as
 the fix. What remains is the *registration* half, and it now has a concrete payoff to aim at:
-`bilstm_run`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the Lua computes
+`run_bi_lstm`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the Lua computes
 (`namespace_ .. "_h_fwd"`), so those call sites are the last ones in either driver that no link can
 reach. Declaring them as data is what closes that — and it is only possible now, because until D.0b
 those topologies were not in the file at all.

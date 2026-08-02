@@ -2,7 +2,7 @@
 
 **Why this exists.** Stage C peeled five hand-written TTS drivers into `.lua` fragments, which named the
 blocks but left them heterogeneous: measured across the five families, **11 functions totalling 112 lines
-were shipped byte-identical in two of them** (`bilstm_run`, `run_resblk_stack`, `run_proj1x1`, the four
+were shipped byte-identical in two of them** (`run_bi_lstm`, `run_resblk_stack`, `run_proj1x1`, the four
 layout converters, `sigmoid`, `round_half_to_even`, `predict_durations`, `compute_wsum`), and their own
 comments said so -- "identical to kokoro_driver.lua's own". The duplication was documented rather than
 removed. Beyond those, the same handful of array operations kept reappearing as inline loops: sum a flat
@@ -111,7 +111,7 @@ _FUNCTIONS = (
     LuaFunction("repeat_by_duration_tfast"),
     LuaFunction("predict_durations", requires=("sigmoid", "round_half_to_even")),
     # -- topology-driving helpers -----------------------------------------------------------------
-    LuaFunction("bilstm_run"),
+    LuaFunction("run_bi_lstm"),
     LuaFunction("run_resblk_stack", requires=("to_layout_a", "from_layout_a")),
     LuaFunction("run_proj1x1", requires=("to_layout_a",)),
     # -- vocoder-side host precomputation ----------------------------------------------------------
