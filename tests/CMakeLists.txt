@@ -26,6 +26,15 @@ add_executable(test_graph_topology_parse test_graph_topology_parse.cpp)
 target_link_libraries(test_graph_topology_parse PRIVATE loom::engine)
 add_test(NAME test_graph_topology_parse COMMAND test_graph_topology_parse)
 
+# Regression: the "heal transposed layouts" heuristics must not fire on already-correct operands when
+# two axes collide (n_tokens == n_head). Reuses the minimal fixture purely as a GgufModel to hand
+# GraphBuilder -- the topologies it runs declare their own inputs and use no weights.
+add_executable(test_broadcast_axis_collision test_broadcast_axis_collision.cpp)
+target_link_libraries(test_broadcast_axis_collision PRIVATE loom::engine)
+target_compile_definitions(test_broadcast_axis_collision PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_broadcast_axis_collision COMMAND test_broadcast_axis_collision)
+set_tests_properties(test_broadcast_axis_collision PROPERTIES FIXTURES_REQUIRED minimal_gguf_fixture)
+
 # Attention-free toy model GGUF shared by test_graph_builder_shapes and test_gallocr_reserve_reuse.
 add_test(
     NAME gen_builder_test_gguf_fixture
