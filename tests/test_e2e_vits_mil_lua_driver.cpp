@@ -24,9 +24,9 @@
 // end-to-end without crashing and produces a sane result.
 
 #include "test_util.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // only for the legacy driver's Config struct: this test runs no C++ oracle
 
 #include <ggml-cpu.h>
 
@@ -37,6 +37,7 @@
 #include <vector>
 
 int main() {
+    namespace cfg = loom_test::tts_inputs::vits;
     const char* dir_mil_env = std::getenv("LOOM_VITS_MIL_DIR");
     if (dir_mil_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_VITS_MIL_DIR (a directory with vits_mil.gguf, produced "
@@ -56,7 +57,6 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    loom::VitsConfig cfg; // real defaults: noise_scale=0.667, noise_scale_w=0.8, length_scale=1.0
     std::vector<float> lua_wav;
     {
         auto model = loom::GgufModel::load(dir_mil + "/vits_mil.gguf", backend.get());
@@ -75,10 +75,10 @@ int main() {
         loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"token_ids", token_ids_d},
             {"seed", static_cast<double>(kSeed)},
-            {"inter_channels", static_cast<double>(cfg.inter_channels)},
-            {"noise_scale", static_cast<double>(cfg.noise_scale)},
-            {"noise_scale_w", static_cast<double>(cfg.noise_scale_w)},
-            {"length_scale", static_cast<double>(cfg.length_scale)},
+            {"inter_channels", static_cast<double>(cfg::inter_channels)},
+            {"noise_scale", static_cast<double>(cfg::noise_scale)},
+            {"noise_scale_w", static_cast<double>(cfg::noise_scale_w)},
+            {"length_scale", static_cast<double>(cfg::length_scale)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

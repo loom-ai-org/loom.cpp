@@ -1,9 +1,14 @@
 // Validates the MIL-traced Matcha-TTS export (export_matcha_mil.py) end-to-end: runs the real
 // matcha_ljspeech.ckpt + generator_v1 checkpoints through a LoomLuaBridge executing the MIL-traced
-// orchestration (tools/convert_matcha/matcha_driver/, loaded from export_matcha_mil.py's single
-// combined matcha_mil.gguf) and checks the result matches the EXISTING hand-written loom::MatchaDriver
-// (the bespoke topology's own oracle) -- mirrors test_e2e_matcha_lua_driver.cpp's own bespoke-Lua-vs-
-// oracle comparison exactly, just against the MIL-traced topologies instead. Unlike
+// orchestration (tools/convert_matcha/matcha_driver/, loaded from the single combined matcha GGUF
+// `loom-export` produces) and checks the result matches the hand-written loom::MatchaDriver (the
+// bespoke topology's own oracle) -- mirrors test_e2e_matcha_lua_driver.cpp's own bespoke-Lua-vs-oracle
+// comparison exactly, just against the MIL-traced topologies instead.
+//
+// That oracle is RETIRED (P4.0.8, E.3) and is no longer constructed here: its output at these exact
+// inputs is frozen in fixtures/legacy_driver_reference/matcha_driver_waveform.npy, at the same 2e-2
+// bound and with the same observed 1.04e-02 / rmse 6.78e-04 as the live comparison. See that
+// directory's README.md for the provenance and for why it cannot be regenerated. Unlike
 // test_e2e_vits_mil_lua_driver.cpp (which deliberately avoids the bespoke oracle after finding a real
 // bug in ITS topology at realistic scale), Matcha's bespoke oracle has no known issues -- per-phase
 // numerical checks against real-module references (test_e2e_matcha_mil_{text_encoder,decoder,vocoder}
@@ -11,9 +16,10 @@
 // right level of rigor, not a false-confidence trap.
 
 #include "test_util.h"
+#include "npy_fixture.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // the pre-MIL C++ driver this test uses as its oracle
 
 #include <ggml-cpu.h>
 
@@ -25,16 +31,13 @@
 #include <vector>
 
 int main() {
-    const char* dir_env = std::getenv("LOOM_MATCHA_DIR");
+    namespace cfg = loom_test::tts_inputs::matcha;
     const char* mil_gguf_env = std::getenv("LOOM_MATCHA_MIL_GGUF");
-    if (dir_env == nullptr || mil_gguf_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_MATCHA_DIR (matcha_encoder_{mu,logw}.gguf/"
-                              "matcha_decoder.gguf/matcha_vocoder.gguf, for the C++ oracle) and "
-                              "LOOM_MATCHA_MIL_GGUF (matcha_mil.gguf, produced by "
-                              "export_matcha_mil.py) to run this check\n");
+    if (mil_gguf_env == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_MATCHA_MIL_GGUF (the matcha GGUF produced by "
+                              "`loom-export`) to run this check\n");
         return 77;
     }
-    const std::string dir = dir_env;
     const std::string mil_gguf = mil_gguf_env;
 
     const std::vector<int32_t> tokens = {5, 42, 7, 88, 13, 100, 3, 61};
@@ -44,13 +47,10 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    // --- Oracle: the existing hand-written C++ driver (bespoke topologies) ---
-    std::vector<float> ref_wav;
-    loom::MatchaConfig cfg;
-    {
-        loom::MatchaDriver driver(dir, cfg, backend.get());
-        ref_wav = driver.synthesize(tokens, kNSteps, kSeed);
-    }
+    // --- Oracle: the retired C++ driver's own output at these exact inputs, frozen (P4.0.8, E.3) ---
+    std::vector<int64_t> ref_shape;
+    const std::vector<float> ref_wav =
+        loom_test::read_npy_f32(std::string(LOOM_LEGACY_REF_DIR) + "/matcha_driver_waveform.npy", ref_shape);
 
     // --- New path: LoomLuaBridge running matcha_driver/ over the MIL-traced topologies ---
     std::vector<float> lua_wav;
@@ -73,9 +73,9 @@ int main() {
             {"tokens", tokens_d},
             {"n_steps", static_cast<double>(kNSteps)},
             {"seed", static_cast<double>(kSeed)},
-            {"n_feats", static_cast<double>(cfg.n_feats)},
-            {"mel_mean", static_cast<double>(cfg.mel_mean)},
-            {"mel_std", static_cast<double>(cfg.mel_std)},
+            {"n_feats", static_cast<double>(cfg::n_feats)},
+            {"mel_mean", static_cast<double>(cfg::mel_mean)},
+            {"mel_std", static_cast<double>(cfg::mel_std)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());
