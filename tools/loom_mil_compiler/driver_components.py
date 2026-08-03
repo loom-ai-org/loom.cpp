@@ -42,10 +42,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .driver_ir import (
-    BinOp, Call, FieldAccess, If, Index, Lit, Local, RawBlock, Return, SubgraphCall, TableLit, Var,
+    ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, Len, Lit, Local,
+    RawBlock, Return, SubgraphCall, TableLit, Var, While,
 )
 from .driver_ir import Function as IRFunction
-from .driver_builder import DriverBuilder, DriverComponent, DriverContext, DriverScript
+from .driver_builder import (
+    DriverBuilder, DriverComponent, DriverContext, DriverEntry, DriverScript,
+)
 from .spec_protocol import (
     TOPOLOGIES, ConfigDerived, CoveredBy, FieldRef, NestedSpec, TopologyInput, TopologyName, Unchecked,
     WhenSet,
@@ -282,6 +285,107 @@ class ArgmaxEpilogue(DriverComponent):
         )]
 
 
+@dataclass
+class PrefillDecodeLoop(DriverComponent):
+    """The generation loop `infer_with_past` is: prefill the prompt, then decode one token at a time
+    against the KV cache, until `max_new_tokens` or `eos_token` (KV-CACHE.md 3.3).
+
+    **One loop, not a prefill followed by a decode loop**, and that is the whole reason this is short.
+    A cached `ATTENTION` node appends this step's K/V at `[n_past, n_past + n_tokens)` and attends over
+    `[0, n_kv)` -- so a prefill *is* the first iteration, at `n_tokens = #prompt, n_past = 0`, and every
+    later iteration is the same call at `n_tokens = 1`. The engine supplies the past; there is no second
+    traced graph and no `decoder_with_past` (KV-CACHE.md §2, which is where that step was measured away).
+
+    **Why the loop lives here rather than in the host** (decision 3): a caller-supplied `n_past` on a
+    single cached step would put generation back in whoever embeds the engine, which is the per-model
+    C++ driver shape this architecture is retiring. `infer` is untouched beside it -- one prefill, argmax
+    the last row, one token -- so a host that only wants logits-shaped behaviour still has it.
+
+    `max_new_tokens` defaults to 16 and `eos_token` to -1, the "negative disables the check" convention
+    `WhisperConfig::eot_token` and `whisper_driver.lua` already use, so `infer_with_past{tokens = ...}`
+    is a complete call.
+    """
+
+    topology: str = "main_topology"
+    # (name, kind) in the traced function's own declared-input order, the same form DriverInputs takes.
+    bindings: Tuple[Tuple[str, str], ...] = ()
+    inputs: Tuple[str, ...] = ()
+    default_max_new_tokens: int = 16
+    # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
+    generated_var: str = "_gen"
+    step_var: str = "_step_tokens"
+    n_past_var: str = "_n_past"
+    n_tokens_var: str = "_n_tokens"
+
+    __links__ = {
+        "topology": TopologyName(),
+        "inputs": TopologyInput(FieldRef("topology"), exact=True),
+    }
+    __unchecked__ = {
+        "bindings": Unchecked(
+            "the traced graph's own declared input names and kinds, READ off the MIL function rather "
+            "than claimed about it -- same as DriverInputs.bindings, and the call site built from them "
+            "is what `inputs` checks."
+        ),
+        "default_max_new_tokens": Unchecked(
+            "a default for a caller-supplied argument, not a claim about the model. Nothing in the "
+            "checkpoint could disagree with it."
+        ),
+        "generated_var": Unchecked("a local this component binds; reads of it are inside its own loop "
+                                   "and are checked by driver_ir.validate over the assembled function"),
+        "step_var": Unchecked("same"),
+        "n_past_var": Unchecked("same"),
+        "n_tokens_var": Unchecked("same"),
+    }
+
+    def _call_inputs(self, ctx: DriverContext):
+        """The `run_subgraph` input table: the step's tokens for the caller-supplied input, and the
+        host-computed pair rebuilt per iteration -- which is the difference from `DriverInputs`, whose
+        `cache_position`/`attention_mask` are built once for one prefill."""
+        out = {}
+        for name, kind in self.bindings:
+            if kind == POSITION:
+                out[name] = Call("loom.range", [Var(self.n_past_var), Var(self.n_tokens_var)])
+            elif kind == MASK:
+                out[name] = Call("loom.causal_mask", [Var(self.n_tokens_var), Var(self.n_past_var)])
+            else:
+                out[name] = Var(self.step_var)
+        return out
+
+    def emit(self, ctx: DriverContext) -> List:
+        out_var, shape_var, next_var = "_dec_out", "_dec_shape", "_next_token"
+        max_new = "_max_new_tokens"
+        eos = "_eos_token"
+        return [
+            Local(self.generated_var, ArrayLit([])),
+            Local(self.step_var, FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
+            Local(self.n_past_var, Lit(0)),
+            Local(self.n_tokens_var, Len(self.step_var)),
+            Local(max_new, BinOp("or", FieldAccess("inputs", "max_new_tokens"),
+                                 Lit(self.default_max_new_tokens))),
+            Local(eos, BinOp("or", FieldAccess("inputs", "eos_token"), Lit(-1))),
+            While(cond=Lit(True), body=[
+                SubgraphCall(
+                    outputs=[out_var], extra_outputs=[shape_var], module=self.topology,
+                    axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
+                          "n_past": Var(self.n_past_var)},
+                    inputs=self._call_inputs(ctx),
+                ),
+                Argmax(result=next_var, tensor=out_var, n_vocab=Index(Var(shape_var), 1),
+                       row=BinOp("-", Var(self.n_tokens_var), Lit(1))),
+                CallStmt(Call("table.insert", [Var(self.generated_var), Var(next_var)])),
+                Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
+                If(cond=BinOp(">=", Len(self.generated_var), Var(max_new)), then=[Break()]),
+                If(cond=BinOp("==", Var(next_var), Var(eos)), then=[Break()]),
+                # Every later step is the same call at n_tokens = 1: the cache holds the past, so the
+                # graph only ever computes K/V for what it is handed.
+                Assign(self.step_var, ArrayLit([Var(next_var)])),
+                Assign(self.n_tokens_var, Lit(1)),
+            ]),
+            Return([Var(self.generated_var)]),
+        ]
+
+
 # -- builders ----------------------------------------------------------------------------------------
 
 # Every field of a builder holds one of its components, and a component declares and runs its own
@@ -297,24 +401,42 @@ _BUILDER_FIELDS_CHECKED_IN = (
 
 @dataclass
 class PrefillArgmaxBuilder(DriverBuilder):
-    """One traced graph, run once over the whole prompt, argmax the last row.
+    """One traced graph, run once over the whole prompt, argmax the last row -- and, when the export is
+    fused, a `infer_with_past` generation loop beside it.
 
-    This is what "export any causal LM" means today, and the limit is worth stating where the builder
-    is rather than only in the roadmap: `n_past` is bound to `Lit(0)` and the mask is built for a fresh
-    sequence, so the exported artifact is a *prefill*, not a generation loop. The engine has a KV cache
-    and the bespoke drivers use it; the MIL path cannot yet, because a MIL-exported causal LM has no
-    `ATTENTION` node to reach it through (`EXPORT-PREPARATION.md` §4).
+    `infer` is the same three components it has always been: `n_past` bound to `Lit(0)`, the mask built
+    for a fresh sequence, one token out. That is a *prefill*, and it stays one -- a host wanting a
+    single forward pass has it unchanged.
+
+    `decode` is set only for a topology whose ATTENTION nodes carry a KV cache (KV-CACHE.md stage 2 is
+    what produces those; before it, a MIL-exported causal LM had none and the loop had nothing to loop
+    over). Its statements land in a second entry function, not in `infer`, so which one a caller reaches
+    for is a call-site decision rather than an export-time one.
     """
 
     inputs: DriverInputs
     call: MonolithicCall
     epilogue: ArgmaxEpilogue
+    decode: Optional[PrefillDecodeLoop] = None
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "call", "epilogue")}
+    __unchecked__ = {
+        "decode": CoveredBy(
+            "the same NestedSpec reasoning as the three fields above -- DriverBuilder.build registers "
+            "it with the export's checker like any other component. It is declared separately only "
+            "because it is optional: a WhenSet wrapper would read as a weaker claim than the one that "
+            "actually runs."
+        ),
+    }
 
     def components(self):
         return [self.inputs, self.call, self.epilogue]
+
+    def extra_entries(self):
+        if self.decode is None:
+            return []
+        return [DriverEntry(name="infer_with_past", params=("inputs",), components=[self.decode])]
 
 
 @dataclass

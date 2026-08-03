@@ -60,6 +60,7 @@ Three builders exist:
 | `driver_inputs` | `DriverInputs` | statements | 0 | 2 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 3 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 6 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, styletts2, supertonic, vits |
@@ -92,6 +93,15 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 *Emits:* statements. *Used by:* lfm2-modular.
 
 * `stages` — holds spec(s) with links of their own, checked in DriverBuilder.build, which registers every ChainStage with the export's own checker (DriverComponent.sub_specs) so a failure names the stage that failed rather than the chain it was in
+
+### `prefill_decode_loop` — `PrefillDecodeLoop`
+
+The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports `infer` alone.
+
+*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+
+* `topology` — TopologyName
+* `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
 
 ### `argmax_epilogue` — `ArgmaxEpilogue`
 

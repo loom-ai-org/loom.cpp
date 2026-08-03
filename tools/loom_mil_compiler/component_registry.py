@@ -33,7 +33,7 @@ cosmetic one, which is the trade this roadmap keeps refusing.
 """
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, get_args
 
 from .driver_builder import DriverComponent
 from .spec_protocol import Unchecked
@@ -128,7 +128,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     registry and the components a cycle."""
     from .driver_components import (
         ArgmaxEpilogue, DriverInputs, DriverReturn, FlowMatchingSampler, LuaFragment, ModularChain,
-        MonolithicCall, RawLuaDriver, SubgraphCallComponent,
+        MonolithicCall, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent,
     )
     from .lua_library import LuaLibrary
 
@@ -149,6 +149,16 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "modular_chain", ModularChain, (STATEMENTS,),
             "Threads one tensor through an independently-traced submodule chain: prefix -> [aux] -> "
             "layer_0..N -> suffix_0..M, each stage carrying its own resolved input map.",
+        ),
+        ComponentEntry(
+            "prefill_decode_loop", PrefillDecodeLoop, (STATEMENTS,),
+            "The `infer_with_past` generation loop: prefill, then decode one token at a time against "
+            "the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a "
+            "decode loop, because a cached ATTENTION node makes the prefill its first iteration. "
+            "**The `used by` column over-states this one**, and it is the only entry where that is "
+            "true: it is a field of every flattened causal-LM builder, but the exporter sets it only "
+            "for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten "
+            "ShortConv layers are not, so it carries the field and exports `infer` alone.",
         ),
         ComponentEntry(
             "argmax_epilogue", ArgmaxEpilogue, (STATEMENTS,),
@@ -333,6 +343,12 @@ def builder_components(builder_class) -> List[str]:
     names = []
     for field in fields(builder_class):
         cls = field.type if isinstance(field.type, type) else None
+        if cls is None:
+            # `Optional[X]` -- an entry function beside the main one is optional by construction
+            # (PrefillArgmaxBuilder.decode, KV-CACHE.md 3.3), and a component that only some models
+            # carry still belongs in the catalogue for the ones that do.
+            cls = next((arg for arg in get_args(field.type)
+                        if isinstance(arg, type) and arg in _BY_CLASS), None)
         if cls is None:
             # A string annotation (`from __future__ import annotations`) or a container; resolved by
             # name against the registry instead of by identity.

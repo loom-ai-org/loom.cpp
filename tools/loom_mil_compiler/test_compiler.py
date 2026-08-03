@@ -375,6 +375,47 @@ class TestFusedMaskRetyping(unittest.TestCase):
         self.assertEqual(topo_inputs[1]["shape"], ["n_tokens", "n_tokens", "1", "1"])
 
 
+class TestIncrementalDecodeIsDerived(unittest.TestCase):
+    """Which topologies get an `infer_with_past` entry (KV-CACHE.md 3.3), read off the emitted graph.
+
+    Found by running it rather than by reasoning about it: LFM2-350M is a hybrid -- 6 attention blocks
+    and 10 ShortConv ones -- and its decode step failed inside the first conv layer, because a causal
+    depthwise convolution is stateful across steps and the KV cache holds K/V and nothing else."""
+
+    @staticmethod
+    def _topo(*ops):
+        return {"nodes": [
+            {"op": op, "inputs": [], "outputs": [], "attrs": {"kv_cache": True} if op == "ATTENTION" else {}}
+            for op in ops
+        ]}
+
+    def test_a_pure_attention_decoder_decodes_incrementally(self):
+        topo = self._topo("MUL_MAT", "ATTENTION", "ADD", "SILU")
+        self.assertTrue(LoomGGUFExporter._topology_uses_kv_cache(topo))
+        self.assertEqual(LoomGGUFExporter._non_cached_sequence_state(topo), [])
+
+    def test_a_conv_layer_blocks_it_and_is_named(self):
+        topo = self._topo("MUL_MAT", "ATTENTION", "CONV_1D_DW", "ADD")
+        self.assertEqual(LoomGGUFExporter._non_cached_sequence_state(topo), ["CONV_1D_DW"])
+
+    def test_ssm_and_rwkv_recurrences_block_it_too(self):
+        # Not exercised by any checkpoint here yet, and declared for the same reason `n_codes` is in the
+        # axis vocabulary: the next hybrid should hit a stated rule rather than a wrong answer.
+        topo = self._topo("ATTENTION", "SSM_SCAN", "RWKV_WKV7")
+        self.assertEqual(LoomGGUFExporter._non_cached_sequence_state(topo), ["RWKV_WKV7", "SSM_SCAN"])
+
+    def test_an_uncached_attention_topology_is_not_a_decode_candidate(self):
+        topo = {"nodes": [{"op": "ATTENTION", "inputs": [], "outputs": [],
+                           "attrs": {"kv_cache": False}}]}
+        self.assertFalse(LoomGGUFExporter._topology_uses_kv_cache(topo))
+
+    def test_a_missing_kv_cache_attr_reads_as_cached(self):
+        """`op_attention`'s own default is TRUE, so reading absent-means-false here would report
+        exactly the models that need a cache as not needing one."""
+        topo = {"nodes": [{"op": "ATTENTION", "inputs": [], "outputs": [], "attrs": {}}]}
+        self.assertTrue(LoomGGUFExporter._topology_uses_kv_cache(topo))
+
+
 class TestInputAxisValidation(unittest.TestCase):
     """`LoomGGUFExporter`'s axis-declaration checks (BACKLOG.md P4.0.2). Both of these were silent
     before: an undeclared second dynamic axis collapsed onto `root_axis`, and a declaration naming a

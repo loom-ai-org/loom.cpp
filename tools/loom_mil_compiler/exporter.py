@@ -17,7 +17,7 @@ from .driver_builder import DriverContext, DriverScript
 from .driver_components import (
     CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
     POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
-    MonolithicCall,
+    MonolithicCall, PrefillDecodeLoop,
 )
 from .passes import apply_loom_mil_passes
 from .shape_expr import (
@@ -1318,12 +1318,67 @@ class LoomGGUFExporter:
 
         # Through `SYNTHESIZED_BUILDERS` rather than by naming the class, so the table P4.0.7's
         # catalogue attributes components to models with is the one the exporter really builds from.
+        # A second entry, `infer_with_past`, only for a topology whose ATTENTION nodes carry a cache
+        # (KV-CACHE.md 3.3). Derived from the emitted graph rather than from `fuse_attention`, for the
+        # same reason `GraphTopology::uses_kv_cache()` is derived on the engine side (decision 5): the
+        # request to fuse and the presence of a fused node are two different facts, and a block the
+        # pattern declined to match would otherwise get a decode loop with nothing to decode against.
+        decode = None
+        if self._topology_uses_kv_cache(self.topologies["main_topology"]):
+            blockers = self._non_cached_sequence_state(self.topologies["main_topology"])
+            if blockers:
+                print(f"  no infer_with_past: {', '.join(blockers)} mixes across the token axis with "
+                      f"state the KV cache does not hold, so a decode step at n_tokens=1 cannot see "
+                      f"its own history. Exporting infer (prefill) only.")
+            else:
+                decode = PrefillDecodeLoop(topology="main_topology", bindings=bindings,
+                                           inputs=input_names)
         self.driver_script = SYNTHESIZED_BUILDERS["Flattened"](
             inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
                                     n_tokens=n_tokens_expr),
+            decode=decode,
         ).build(self._driver_context())
+
+    # Ops that mix along the TOKEN axis and carry their own cross-step state, which the KV cache does
+    # not hold: it stores K/V per attention block and nothing else. A topology containing one of these
+    # cannot be stepped a token at a time, because the op would be handed a length-1 window with no
+    # history -- semantically wrong even where the shapes happen to work out.
+    #
+    # Found by running it: LFM2-350M is a hybrid, 6 attention blocks and 10 ShortConv ones, and its
+    # `infer_with_past` failed inside the first conv layer's own slice ("VIEW: resolved shape
+    # [1,1024,1,] ... needs 16380 bytes but parent has 12288"). The shape error is the symptom; the
+    # cause is that a causal depthwise convolution is stateful across steps and has no cache.
+    #
+    # An allow-list by exclusion rather than by enumeration, because the safe set is the open one:
+    # everything else in a decoder block (MUL_MAT, ADD, the norms, ROPE, SILU, ...) is position-wise or
+    # head-wise and computes the same thing for token t whether or not tokens 0..t-1 are present.
+    _NON_CACHED_SEQUENCE_STATE_OPS = frozenset({
+        "CONV_1D", "CONV_1D_DW", "CONV_2D", "CONV_2D_DW", "CONV_TRANSPOSE_1D", "CONV_TRANSPOSE_2D",
+        "CONV_FLOW_REVERSE", "SSM_CONV", "SSM_SCAN", "RWKV_WKV6", "RWKV_WKV7",
+    })
+
+    @classmethod
+    def _non_cached_sequence_state(cls, topo: dict) -> list:
+        """The op types in `topo` that make a token-at-a-time decode step invalid, sorted."""
+        return sorted({
+            node["op"] for node in topo.get("nodes", [])
+            if node["op"] in cls._NON_CACHED_SEQUENCE_STATE_OPS
+        })
+
+    @staticmethod
+    def _topology_uses_kv_cache(topo: dict) -> bool:
+        """Does this topology contain an `ATTENTION` node with a cache -- the engine-side
+        `GraphTopology::uses_kv_cache()` question, asked on the exporter's own dict.
+
+        `kv_cache` defaults to TRUE in `op_attention`, so reading a missing attr as false would report
+        exactly the models that need a cache as not needing one (the same trap KV-CACHE.md 1.2 records
+        on the C++ side)."""
+        return any(
+            node["op"] == "ATTENTION" and node.get("attrs", {}).get("kv_cache", True)
+            for node in topo.get("nodes", [])
+        )
 
     def apply_modular_export(self):
         """

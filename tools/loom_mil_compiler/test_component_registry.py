@@ -151,7 +151,8 @@ class TestTheBuilderConsultsIt(unittest.TestCase):
 class TestUsageIsDerived(unittest.TestCase):
     def test_the_synthesized_paths_are_read_off_the_builders_own_fields(self):
         self.assertEqual(cr.builder_components(PrefillArgmaxBuilder),
-                         ["driver_inputs", "monolithic_call", "argmax_epilogue"])
+                         ["driver_inputs", "monolithic_call", "argmax_epilogue",
+                          "prefill_decode_loop"])
         self.assertEqual(cr.builder_components(ModularChainBuilder),
                          ["driver_inputs", "modular_chain", "argmax_epilogue"])
 

@@ -3,7 +3,10 @@ pure Python and only reads plain dict topologies, so these exercise it directly 
 SubgraphCall/Function IR rather than tracing a real model."""
 import unittest
 
-from driver_ir import DriverIRError, Function, SubgraphCall, Var, check_subgraph_calls
+from driver_ir import (
+    ArrayLit, Call, CallStmt, DriverIRError, Function, Lit, Local, LuaCodegen, SubgraphCall, Var,
+    check_subgraph_calls, validate,
+)
 
 
 def _topo(inputs=(), outputs=None, output=None):
@@ -76,3 +79,34 @@ class TestCheckSubgraphCalls(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestArrayLitAndCallStmt(unittest.TestCase):
+    """The two nodes the decode loop needed (KV-CACHE.md 3.3). Both exist rather than being spelled
+    with `RawExpr`/`RawBlock` for the same reason: those report no reads, so a symbol referenced inside
+    one is invisible to `validate()` -- and both of these carry symbols an earlier statement bound."""
+
+    def test_an_array_literal_renders_and_reports_its_reads(self):
+        expr = ArrayLit([Var("a"), Lit(1)])
+        self.assertEqual(expr.render(), "{a, 1}")
+        self.assertEqual(expr.reads(), ["a"])
+
+    def test_an_empty_array_literal(self):
+        self.assertEqual(ArrayLit([]).render(), "{}")
+
+    def test_a_call_statement_renders_with_no_binding(self):
+        stmt = CallStmt(Call("table.insert", [Var("t"), Var("v")]))
+        self.assertEqual(LuaCodegen()._emit_stmt(stmt, 1), ["    table.insert(t, v)"])
+        self.assertEqual(stmt.defines(), [])
+
+    def test_validate_sees_through_both(self):
+        """The point of having them as nodes: an undefined symbol inside either is caught."""
+        fn = Function("infer", ["inputs"], [CallStmt(Call("table.insert", [Var("gen"), Var("x")]))])
+        with self.assertRaises(DriverIRError) as raised:
+            validate(fn)
+        self.assertIn("'gen'", str(raised.exception))
+
+        fn = Function("infer", ["inputs"], [Local("gen", ArrayLit([Var("missing")]))])
+        with self.assertRaises(DriverIRError) as raised:
+            validate(fn)
+        self.assertIn("'missing'", str(raised.exception))
