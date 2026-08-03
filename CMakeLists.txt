@@ -23,7 +23,6 @@ add_library(loom_engine
     src/core/generation.cpp
     src/core/tdt_decoder.cpp
     src/core/whisper_driver.cpp
-    src/core/kokoro_driver.cpp
     src/core/styletts2_driver.cpp
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp

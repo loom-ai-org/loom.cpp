@@ -23,5 +23,4 @@
 // Nothing new should be added here. This file only shrinks.
 
 #include "loom/core/whisper_driver.h"
-#include "loom/core/kokoro_driver.h"
 #include "loom/core/styletts2_driver.h"
