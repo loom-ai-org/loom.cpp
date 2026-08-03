@@ -29,12 +29,55 @@ nobody has to guess which is which.
 """
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .driver_builder import DriverComponent
 from .spec_protocol import ConfigDerived, Unchecked
 
 LUA_DIR = Path(__file__).resolve().parent / "lua"
+
+
+@dataclass(frozen=True)
+class DrivenTopologies:
+    """How a library function turns its first argument into `loom.run_subgraph` calls (P4.0.7/D.2).
+
+    Three of these functions -- `run_bi_lstm`, `run_resblk_stack`, `run_proj1x1` -- exist precisely
+    because ggml cannot express what they do (a recurrence, a stack crossing layouts): they *drive*
+    topologies from Lua, computing each name at run time from a namespace the caller passes
+    (`namespace_ .. "_h_fwd"`). That made their call sites unreachable by every check this exporter has:
+    `parse_run_subgraph_calls` can only read a literal, and the call is not even in the family's
+    fragment -- it is inside the library function, one level down.
+
+    This is the missing half of P4.0.7's D.2, and it is a declaration rather than a parse for a reason
+    a parse cannot fix: the namespaces only exist at run time. What *is* static is the shape -- a
+    BiLSTM's four cells, a resblock stack's three blocks, a projection's one topology, and the input
+    table each of those calls supplies -- and that shape belongs beside the function whose body
+    hard-codes it. A family then declares which namespaces it drives (`driver_components.HelperCall`),
+    and the expansion becomes ordinary `RunSubgraphCall`s with the ordinary messages.
+
+    `suffixes` are appended to the namespace; `("",)` for a function whose argument already *is* the
+    topology name.
+    """
+
+    suffixes: Tuple[str, ...]
+    inputs: Tuple[str, ...]
+
+    __unchecked__ = {
+        "suffixes": Unchecked(
+            "checked twice, and neither time per field: against the body that concatenates them "
+            "(`drives_mismatches`, both directions) and against the real exported topologies wherever "
+            "a family names a namespace through this (`HelperCall.expand` -> RunSubgraphCall -> "
+            "TopologyName). A link here would have nothing to compare against -- the topology names "
+            "do not exist until a caller supplies the namespace"
+        ),
+        "inputs": Unchecked(
+            "same: compared against the body's own argument table by `drives_mismatches`, and against "
+            "each expanded topology's declared inputs by the caller's TopologyInput link"
+        ),
+    }
+
+    def topologies(self, namespace: str) -> Tuple[str, ...]:
+        return tuple(f"{namespace}{suffix}" for suffix in self.suffixes)
 
 
 @dataclass(frozen=True)
@@ -48,6 +91,8 @@ class LuaFunction:
 
     name: str
     requires: Tuple[str, ...] = ()
+    # Set only for a function that drives topologies with a computed name. See `DrivenTopologies`.
+    drives: "Optional[DrivenTopologies]" = None
 
     __links__ = {
         "name": ConfigDerived(
@@ -65,6 +110,14 @@ class LuaFunction:
             "`unused_requires` compare every declaration against the body that declares it, in both "
             "directions, and the enforcing test walks all of them. A per-field link would re-read the "
             "same file once per entry and report one offender at a time"
+        ),
+        "drives": Unchecked(
+            "the topology shape this function's body hard-codes, which is checked where it is USED: "
+            "`driver_components.HelperCall` expands it against one family's real namespaces into "
+            "RunSubgraphCalls, so a wrong suffix or input set fails that family's export naming the "
+            "topology. Checked here too, in the direction a declaration can rot on its own -- "
+            "`drives_mismatches()` compares the suffixes and the input table against the body that "
+            "hard-codes them, in both directions"
         ),
     }
 
@@ -111,9 +164,17 @@ _FUNCTIONS = (
     LuaFunction("repeat_by_duration_tfast"),
     LuaFunction("predict_durations", requires=("sigmoid", "round_half_to_even")),
     # -- topology-driving helpers -----------------------------------------------------------------
-    LuaFunction("run_bi_lstm"),
-    LuaFunction("run_resblk_stack", requires=("to_layout_a", "from_layout_a")),
-    LuaFunction("run_proj1x1", requires=("to_layout_a",)),
+    # These three are the only entries with a `drives` declaration, and they are also the only three
+    # whose bodies call `loom.run_subgraph` at all -- the same fact from both sides. Everything else
+    # here is arithmetic over Lua tables.
+    LuaFunction("run_bi_lstm", drives=DrivenTopologies(
+        suffixes=("_h_fwd", "_c_fwd", "_h_bwd", "_c_bwd"),
+        inputs=("layer_input", "h_prev", "c_prev"))),
+    LuaFunction("run_resblk_stack", requires=("to_layout_a", "from_layout_a"),
+                drives=DrivenTopologies(suffixes=("_block0", "_block1", "_block2"),
+                                        inputs=("x", "style"))),
+    LuaFunction("run_proj1x1", requires=("to_layout_a",),
+                drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
     # -- vocoder-side host precomputation ----------------------------------------------------------
     LuaFunction("compute_wsum"),
     # -- StyleTTS2's ADPM2 sampler, whole rather than shared ---------------------------------------
@@ -145,6 +206,78 @@ def resolve(names) -> List[LuaFunction]:
         wanted.add(name)
         frontier.extend(LIBRARY[name].requires)
     return [fn for fn in _FUNCTIONS if fn.name in wanted]
+
+
+def drives_mismatches() -> Dict[str, list]:
+    """`{function: complaints}` where a `drives` declaration and the Lua body disagree (P4.0.7/D.2).
+
+    The declaration's *use* is checked by the family that names namespaces through it -- an expanded
+    topology that does not exist fails that export. What this covers is the direction no family can:
+    the declaration drifting away from the body it describes, which would then be checked faithfully
+    against the wrong thing.
+
+    Two comparisons, both read off the body:
+
+    * **the suffixes**, through the string literals each `loom.run_subgraph` call concatenates onto its
+      namespace. `run_bi_lstm` writes them whole (`namespace_ .. "_h_fwd"`), so the check is exact;
+      `run_resblk_stack` writes a stem and an index (`.. "_block" .. i`), so the rule is prefix-based
+      in both directions -- every declared suffix must start with a literal the body writes, and every
+      literal the body writes must begin a declared suffix.
+    * **the input table**, whose keys are plain literals in every one of these bodies, and which is the
+      half a family's `TopologyInput` link compares against the real topology.
+    """
+    out = {}
+    for fn in _FUNCTIONS:
+        complaints = []
+        sites = _driven_call_sites(fn.source())
+        if fn.drives is None:
+            if sites:
+                complaints.append(
+                    f"calls loom.run_subgraph {len(sites)} time(s) but declares no `drives`, so its "
+                    f"call sites are reachable by no check at all")
+            out.update({fn.name: complaints} if complaints else {})
+            continue
+        if not sites:
+            complaints.append("declares `drives` but its body never calls loom.run_subgraph")
+        literals = sorted({lit for site in sites for lit in site[0]})
+        for suffix in fn.drives.suffixes:
+            if not any(suffix.startswith(lit) for lit in literals) and (literals or suffix):
+                complaints.append(
+                    f"declares suffix {suffix!r}, which no literal its body concatenates begins "
+                    f"({literals})")
+        for lit in literals:
+            if not any(suffix.startswith(lit) for suffix in fn.drives.suffixes):
+                complaints.append(
+                    f"body concatenates {lit!r}, which begins none of the declared suffixes "
+                    f"{list(fn.drives.suffixes)}")
+        for _, keys in sites:
+            if keys is not None and tuple(keys) != tuple(fn.drives.inputs):
+                complaints.append(
+                    f"declares inputs {list(fn.drives.inputs)}, but a call in its body supplies "
+                    f"{list(keys)}")
+        if complaints:
+            out[fn.name] = complaints
+    return out
+
+
+def _driven_call_sites(source: str):
+    """`[(string literals in the topology-name expression, input table keys)]` for every
+    `loom.run_subgraph` in `source`."""
+    import re
+
+    from .driver_components import _balanced_args, _split_top_level, _table_keys
+
+    sites, marker, index = [], "loom.run_subgraph(", 0
+    while True:
+        index = source.find(marker, index)
+        if index == -1:
+            return sites
+        args_text, end = _balanced_args(source, index + len(marker))
+        index = end
+        args = _split_top_level(args_text)
+        if len(args) != 3:
+            continue
+        sites.append((re.findall(r'"([^"]*)"', args[0]), _table_keys(args[2])))
 
 
 def undeclared_calls() -> Dict[str, list]:
