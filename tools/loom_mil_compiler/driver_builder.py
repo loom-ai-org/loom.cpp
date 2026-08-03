@@ -207,13 +207,27 @@ class DriverBuilder:
                 checker.check(sub)
         checker.provide(**ctx.link_slots())
 
+        # Imported here rather than at module scope: the registry names every component class, and each
+        # of those modules imports this one.
+        from .component_registry import PRELUDE, POSTLUDE, STATEMENTS, check_emission
+
         prelude: List[str] = []
         body: List[Stmt] = []
         postlude: List[str] = []
         for component in components:
-            prelude.extend(component.prelude(ctx))
-            body.extend(component.emit(ctx))
-            postlude.extend(component.postlude(ctx))
+            contributions = {
+                PRELUDE: component.prelude(ctx),
+                STATEMENTS: component.emit(ctx),
+                POSTLUDE: component.postlude(ctx),
+            }
+            # P4.0.7/D.1: the component is looked up in the registry as it emits, and what it really
+            # contributed is compared against what its entry claims. A shipped component with no entry
+            # raises here -- a piece of a driver that the catalogue does not account for is exactly the
+            # "inventory, not a shelf" failure the registry exists to prevent.
+            check_emission(component, {slot for slot, value in contributions.items() if value})
+            prelude.extend(contributions[PRELUDE])
+            body.extend(contributions[STATEMENTS])
+            postlude.extend(contributions[POSTLUDE])
 
         entry = IRFunction(self.entry_name, list(self.entry_params), body)
         validate(entry)
