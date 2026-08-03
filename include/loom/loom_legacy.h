@@ -26,4 +26,3 @@
 #include "loom/core/kokoro_driver.h"
 #include "loom/core/styletts2_driver.h"
 #include "loom/core/supertonic_driver.h"
-#include "loom/core/matcha_driver.h"

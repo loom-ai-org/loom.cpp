@@ -935,15 +935,6 @@ target_link_libraries(test_e2e_matcha_vocoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_vocoder COMMAND test_e2e_matcha_vocoder)
 set_tests_properties(test_e2e_matcha_vocoder PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- End-to-end check: loom::MatchaDriver's full synthesize() call (TextEncoder -> duration expansion
-#     -> Euler CFM sampling loop over the Decoder U-Net -> denormalize -> HiFi-GAN v1 vocoder) against
-#     the real matcha_ljspeech.ckpt + generator_v1 checkpoints -- finite/non-trivial output, same scope
-#     as test_e2e_supertonic_driver.cpp/test_e2e_kokoro_driver.cpp. Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_matcha_driver test_e2e_matcha_driver.cpp)
-target_link_libraries(test_e2e_matcha_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_matcha_driver COMMAND test_e2e_matcha_driver)
-set_tests_properties(test_e2e_matcha_driver PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- Procedural generalization: LoomLuaBridge's host-math bindings (loom.range/causal_mask/zero_mask/
 #     argmax_row) and load_script()/call() plumbing, in isolation (no GGUF needed). See
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---

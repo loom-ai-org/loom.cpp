@@ -31,7 +31,6 @@ add_library(loom_engine
     src/core/style_diffusion_sampler.cpp
     src/core/cfm_euler_sampler.cpp
     src/core/supertonic_driver.cpp
-    src/core/matcha_driver.cpp
     src/core/lua_bridge.cpp
     src/core/ode_stepper.cpp
     src/core/vocab.cpp
