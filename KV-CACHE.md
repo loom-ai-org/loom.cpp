@@ -211,16 +211,58 @@ returns, rather than q's shape.
 **2.2 — the topology rule.** Lower `loom_fused_attention` to an `ATTENTION` node, transposing q/k/v into
 the engine's `[head_dim, n_head, n_tokens]` layout (`convert_qwen3.py:76-78` is the reference).
 
+**2.2b — the exporter declares the cache geometry.** *A step this plan did not have, found by doing 2.2:*
+fusing changes a topology's **runtime requirements**, not just its shape. An `ATTENTION` node with
+`kv_cache=true` makes `op_attention` throw unless the host registered a cache, and
+`LoomGGUFExporter.write_gguf` wrote exactly one hparam (`loom.architecture`) — so stage 1 had given the
+*bespoke* converters what they needed and left the MIL exporter unable to produce a loadable cached
+model. `_kv_cache_geometry()` reads the five facts off the fused nodes themselves and `write_gguf` emits
+them; `test_e2e_lfm2_mil_export.cpp` and `tools/loom_cli` allocate from them exactly as the whisper test
+does. Read from the graph rather than the config for the same reason `uses_kv_cache()` is derived: the
+slot count must equal the ATTENTION-block count, and only the graph knows what the fusion produced.
+
+**This is where the occurrence-order decision paid off, measured:** LFM2-350M declares
+`num_hidden_layers: 16` but has only **6 attention blocks** — the other ten are conv. The fusion emits 6
+`ATTENTION` nodes with dense layers 0–5 and a 6-slot cache; torch module indices would have addressed
+past the end of it. The corollary is that `loom.n_layer` here means *attention blocks*, which for Qwen3
+(28/28) coincides with model depth and for LFM2 does not.
+
+**Also found: the modular decomposition cannot use this yet, and it is not a small fix.** The pass numbers
+blocks densely *per traced function*, which is the whole model when flattened — but `Modular` traces one
+function per submodule, so every `layer_i` would restart at 0 and share cache slot 0. Deriving the index
+from the submodule's identity is a real design question (the modular driver would also have to thread
+`n_past` through its chain), so `fuse_attention` is set for `Flattened` only and LFM2-modular keeps
+exporting exactly as before, prefill-only.
+
 **2.3 — strip the GQA repeat.** Walk back through `fuse_gqa_repeat_kv`'s `reshape → tile → reshape`
 triple to reach the true `n_head_kv` K/V, halving the cache for Qwen3 and letting `op_attention`'s own
 `ggml_mul_mat` broadcast do the GQA. Correctness does not depend on this — attending with the repeat
 already present is numerically identical, just twice the cache — so it is its own commit with its own
 numeric check.
 
-*Touches: Qwen3, LFM2 ×2 and the generic HF fallback. **Byte-identity is deliberately abandoned here**
-— the topology changes by construction. The gate is each model's numeric reference test, plus a node
-histogram in the commit message showing 28 `SOFTMAX` become 28 `ATTENTION`. Every other model must be
-byte-identical, which is what decision 4 buys.*
+*Touches: Qwen3, LFM2-monolithic and the generic HF fallback (LFM2-modular is excluded, see 2.2b).
+**Byte-identity is deliberately abandoned here** — the topology changes by construction. Every other
+model must be untouched, which is what decision 4 buys.*
+
+**What the gate actually showed.**
+
+* Qwen3: 28 `SOFTMAX` → 28 `ATTENTION`, dense layers 0–27, `scale = 1/√128`.
+* LFM2-monolithic: 6 `ATTENTION` from 16 declared layers, and `test_e2e_lfm2_mil_export` — which
+  asserts **real HF top-1 tokens** for two prompts — passes 8/8 for both the fused monolithic and the
+  unfused modular export.
+* Qwen3 has no MIL numeric test, so the fused export was compared against the unfused one directly:
+  identical top-1 on six single-forward-pass prompts, and identical 8-token greedy continuations.
+* 2.3 dropped `n_head_kv` from 16 to 8 on both models — the checkpoints' real `num_key_value_heads` —
+  halving Qwen3's cache from 1880 MB to 940 MB at `kv_cache_size=4096`, with every numeric check above
+  still passing.
+
+**One honest negative result.** On a *high-entropy* prompt ("Once upon a time there was a little"), the
+fused and unfused greedy continuations agree for 8 tokens and then diverge. That is expected rather than
+a defect: the composite `ATTENTION` folds scale and mask into `ggml_soft_max_ext` and adds `cont` copies,
+so its rounding differs from the expanded path, and greedy decoding amplifies a near-tie into a different
+token. The evidence that it is rounding and not an error is that every *single-pass* argmax agrees and
+LFM2's HF-derived tokens are exact. Worth stating plainly because a reader running the two models
+side by side will see it.
 
 ### Stage 3 — `infer_with_past`
 
