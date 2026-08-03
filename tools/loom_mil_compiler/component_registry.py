@@ -390,3 +390,125 @@ def usage(model_paths: Optional[Dict[str, str]] = None):
             for name in dict.fromkeys(names):
                 used[name].append(recognizer.name)
     return {name: sorted(models) for name, models in used.items()}, unavailable
+
+
+# -- the catalogue (D.3) -----------------------------------------------------------------------------
+
+
+def _link_summary(entry: ComponentEntry) -> str:
+    """Each declared link as `field -> describe()`, read off the class.
+
+    `describe()` rather than a sentence written here: it is the same string `LinkChecker.finish`
+    prints for a link that never became checkable, so a reader who meets one in a failure can find it
+    in this table by matching the text.
+    """
+    from .spec_protocol import CoveredBy, NestedSpec, declared_raw
+
+    parts = []
+    for field, links in entry.links().items():
+        for link in links:
+            parts.append(f"* `{field}` — {link.describe()}")
+            says = _failure_wording(link)
+            if says:
+                parts.append(f"  <br>*says:* {says}")
+    # Declaration-only entries carry no check of their own and are exactly the ones a reader would
+    # otherwise misread as "unchecked": `ModularChain.stages` and `FlowMatchingSampler.spec` hold the
+    # specs that do the checking. Reporting them as absent is how a catalogue understates coverage.
+    for field, value in declared_raw(entry.cls).items():
+        for item in (value if isinstance(value, (list, tuple)) else [value]):
+            if isinstance(item, NestedSpec):
+                parts.append(f"* `{field}` — holds spec(s) with links of their own, checked in "
+                             f"{item.where}")
+            elif isinstance(item, CoveredBy):
+                parts.append(f"* `{field}` — checked as part of `{item.by}`'s link")
+    return "\n".join(parts) if parts else "* nothing — every field is `__unchecked__`, with its reason"
+
+
+def _failure_wording(link) -> str:
+    """What this link says when it fails, taken from the link itself rather than restated.
+
+    `ConfigDerived` carries a `str.format` template (the field that keeps `EncoderOutput`'s messages
+    verbatim), so the catalogue can quote the real wording; the fixed link kinds phrase their own
+    message inside `check`, and quoting those would mean maintaining a second copy -- which is what
+    the `Probes` section of `DRIVER-COMPONENTS.md` records instead, from real failing exports.
+    """
+    template = getattr(link, "message", None)
+    if not isinstance(template, str):
+        return ""
+    first = template.split(". ")[0].strip()
+    return first if first.endswith(".") else first + "."
+
+
+def catalogue() -> str:
+    """The component catalogue: per component, what it emits, what it declares, and which models use
+    it (BACKLOG.md P4.0.7 / stage D.3).
+
+    Generated from the registry, the classes' own declarations and the families' real component lists,
+    so it cannot drift -- the same property `lua_library.catalogue()` has and the reason both exist.
+    `DRIVER-COMPONENTS.md` carries the output between generated-block markers, and a test regenerates
+    and compares.
+    """
+    used, unavailable = usage()
+    rows = ["| component | class | emits | links | unchecked | used by |", "|---|---|---|---|---|---|"]
+    for name, entry in registry().items():
+        models = used[name] or ["*nobody* (see below)"]
+        rows.append(
+            f"| `{name}` | `{entry.cls.__name__}` | {', '.join(entry.emits)} | "
+            f"{sum(len(links) for links in entry.links().values())} | {len(entry.unchecked())} | "
+            f"{', '.join(models)} |"
+        )
+    lines = ["\n".join(rows), ""]
+    for name, entry in registry().items():
+        lines.append(f"### `{name}` — `{entry.cls.__name__}`")
+        lines.append("")
+        lines.append(entry.summary)
+        lines.append("")
+        lines.append(f"*Emits:* {', '.join(entry.emits)}. *Used by:* "
+                     f"{', '.join(used[name]) or '**no model** — see below'}.")
+        lines.append("")
+        lines.append(_link_summary(entry))
+        if entry.no_user_reason:
+            lines.append("")
+            lines.append(f"> No model uses it today: {entry.no_user_reason}.")
+        lines.append("")
+    if unavailable:
+        lines.append("Recognizers whose config could not be built without a checkpoint, and are "
+                     "therefore not counted in *used by*:")
+        for model, reason in sorted(unavailable.items()):
+            lines.append(f"* `{model}` — {reason}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# The catalogue lives in `DRIVER-COMPONENTS.md` between these markers, and the enforcing test
+# regenerates and compares -- the doc is a rendering of the code, not a second copy of it.
+DOC = Path(__file__).resolve().parents[2] / "DRIVER-COMPONENTS.md"
+_BLOCKS = {"component catalogue": lambda: catalogue()}
+
+
+def _lua_catalogue() -> str:
+    from .lua_library import catalogue as lua
+
+    return lua() + "\n"
+
+
+_BLOCKS["loom_lua catalogue"] = _lua_catalogue
+
+
+def rendered_doc(current: str) -> str:
+    """`current` with every generated block replaced by freshly generated content."""
+    out = current
+    for name, generate in _BLOCKS.items():
+        start = f"<!-- generated: {name} -->"
+        end = "<!-- /generated -->"
+        head, _, rest = out.partition(start)
+        body, _, tail = rest.partition(end)
+        if not body and not tail:
+            raise ValueError(f"{DOC} has no generated block for {name!r}")
+        out = f"{head}{start}\n\n{generate().rstrip()}\n\n{end}{tail}"
+    return out
+
+
+if __name__ == "__main__":  # `python -m loom_mil_compiler.component_registry` regenerates the doc
+    DOC.write_text(rendered_doc(DOC.read_text()))
+    print(f"regenerated the generated blocks of {DOC}")

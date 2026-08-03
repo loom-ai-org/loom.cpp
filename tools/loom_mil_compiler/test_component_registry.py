@@ -187,3 +187,36 @@ class TestUsageIsDerived(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheCatalogueIsGenerated(unittest.TestCase):
+    """D.3. The catalogue is the deliverable of this stage more than the code is, so the property that
+    matters is that it is a *rendering* of the declarations rather than a second copy of them: a
+    component whose links change, or a family that stops using one, moves the document."""
+
+    def test_the_document_matches_what_the_generator_produces(self):
+        current = cr.DOC.read_text()
+        self.assertEqual(cr.rendered_doc(current), current,
+                         "DRIVER-COMPONENTS.md is stale -- run "
+                         "`python -m loom_mil_compiler.component_registry` to regenerate it")
+
+    def test_the_table_carries_what_a_link_says_when_it_fails(self):
+        """Not just the link's type: `ConfigDerived` carries the message template that keeps this
+        tree's errors specific, and quoting it is what makes the catalogue an account of behaviour."""
+        table = cr.catalogue()
+        self.assertIn("that no `drives` declaration covers", table)
+        self.assertIn("TopologyInput(FieldRef(field='topology'), exact=True)", table)
+
+    def test_a_declaration_only_field_is_reported_rather_than_read_as_unchecked(self):
+        """`ModularChain.stages` and `FlowMatchingSampler.spec` hold the specs that do the checking.
+        Reporting them as absent would understate coverage in the one document meant to establish it."""
+        table = cr.catalogue()
+        self.assertIn("`stages` — holds spec(s) with links of their own", table)
+        self.assertIn("`spec` — holds spec(s) with links of their own", table)
+
+    def test_the_usage_column_is_the_derived_one(self):
+        used, _ = cr.usage()
+        table = cr.catalogue()
+        for model in used["flow_matching_sampler"]:
+            self.assertIn(model, table)
+        self.assertIn("*nobody* (see below)", table)

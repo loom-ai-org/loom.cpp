@@ -656,8 +656,18 @@ def declared_links(spec) -> dict:
 
     `CoveredBy`/`NestedSpec` entries are declarations, not checks, so they are filtered out here and
     only read by `undeclared_fields`."""
+    return declared_links_for(type(spec))
+
+
+def declared_links_for(spec_class) -> dict:
+    """`declared_links`, from the class rather than from an instance.
+
+    P4.0.7's catalogue reads declarations off classes it never instantiates, and calling
+    `declared_links` with a class quietly returned nothing -- `type(a_class)` is its metaclass, which
+    declares no links. A separate entry point rather than an isinstance branch: the two callers want
+    genuinely different things, and only one of them has an object to hand."""
     out = {}
-    for name, value in declared_raw(type(spec)).items():
+    for name, value in declared_raw(spec_class).items():
         links = [v for v in _entries(value) if not isinstance(v, _DECLARATION_ONLY)]
         if links:
             out[name] = links
