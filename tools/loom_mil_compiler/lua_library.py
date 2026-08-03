@@ -372,7 +372,7 @@ def catalogue() -> str:
     for driver in sorted(LUA_DIR.parent.parent.glob("convert_*/*_driver")):
         text = "\n".join(p.read_text() for p in sorted(driver.glob("*.lua")))
         families[driver.name.replace("_driver", "")] = text
-    rows = ["| function | requires | called by |", "|---|---|---|"]
+    rows = ["| function | requires | drives | called by |", "|---|---|---|---|"]
     for fn in _FUNCTIONS:
         callers = [fam for fam, text in families.items()
                    if re.search(rf"\b{re.escape(fn.name)}\s*\(", text)]
@@ -382,6 +382,13 @@ def catalogue() -> str:
         via = sorted(other.name for other in _FUNCTIONS if fn.name in other.requires)
         if not callers:
             callers = [f"*{', '.join(f'`{v}`' for v in via)}* only"] if via else ["**nothing** ⚠"]
-        rows.append(f"| `{fn.name}` | {', '.join(f'`{r}`' for r in fn.requires) or '—'} | "
+        # The `drives` column is the D.2 half: which topologies a caller's namespace expands to, and
+        # what each of those calls supplies. A blank one is the ordinary case -- the function is
+        # arithmetic over Lua tables and touches no topology at all.
+        drives = "—"
+        if fn.drives is not None:
+            suffixes = ", ".join(f"`<ns>{s}`" for s in fn.drives.suffixes)
+            drives = f"{suffixes} ← {', '.join(f'`{i}`' for i in fn.drives.inputs)}"
+        rows.append(f"| `{fn.name}` | {', '.join(f'`{r}`' for r in fn.requires) or '—'} | {drives} | "
                     f"{', '.join(callers)} |")
     return "\n".join(rows)
