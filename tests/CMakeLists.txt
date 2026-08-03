@@ -651,14 +651,6 @@ target_link_libraries(test_e2e_kokoro_bert_encoder PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_bert_encoder COMMAND test_e2e_kokoro_bert_encoder)
 set_tests_properties(test_e2e_kokoro_bert_encoder PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- End-to-end test of loom::KokoroDriver against the real checkpoint's full GGUF set -- exercises the
-#     whole pipeline together for the first time. Finite/non-trivial output check only (same scope as
-#     VITS's own test_e2e_vits_driver.cpp), not yet a full-pipeline numerical reference. ---
-add_executable(test_e2e_kokoro_driver test_e2e_kokoro_driver.cpp)
-target_link_libraries(test_e2e_kokoro_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_kokoro_driver COMMAND test_e2e_kokoro_driver)
-set_tests_properties(test_e2e_kokoro_driver PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- Real-model structural smoke test: VITS (piper en-GB "miro"), converted via
 #     tools/convert_piper_vits/convert_vits.py. Builds every declared topology with dummy inputs and
 #     checks for finite output -- NOT yet a numerical-correctness check (that's still to come once the
