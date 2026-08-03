@@ -1896,6 +1896,61 @@ class LoomGGUFExporter:
         live.reverse()
         return live
 
+    def _kv_cache_geometry(self) -> dict:
+        """The five facts `loom::make_kv_cache` needs, read off the fused ATTENTION nodes themselves --
+        or `{}` when this export produced none (KV-CACHE.md 2.2b).
+
+        Fusing changes a topology's RUNTIME REQUIREMENTS, not just its shape: an ATTENTION node with
+        `kv_cache=true` makes `op_attention` throw unless the host registered a KvCache, and until this
+        method existed the exporter wrote exactly one hparam (`loom.architecture`), so a fused model was
+        unloadable. Stage 1 gave the bespoke converters this; the MIL exporter needs it too.
+
+        Read from the graph rather than from the config, for the same reason `uses_kv_cache()` is
+        derived: the number of cache slots must equal the number of ATTENTION blocks, and only the graph
+        knows how many the fusion actually produced. That is NOT the model's layer count in general --
+        LFM2 interleaves conv layers, so its attention-block count is smaller, and `fuse_loom_attention`
+        assigns its `layer` indices densely to match (see that pass on why occurrence order is the
+        correct addressing).
+        """
+        n_head_kv = head_dim_k = head_dim_v = None
+        n_blocks = 0
+        for func in getattr(self.program, "functions", {}).values():
+            for op in func.operations:
+                if op.op_type != "loom_fused_attention":
+                    continue
+                n_blocks += 1
+                k_shape, v_shape = list(op.inputs["k"].shape), list(op.inputs["v"].shape)
+                geom = (int(k_shape[1]), int(k_shape[3]), int(v_shape[3]))
+                if n_head_kv is None:
+                    n_head_kv, head_dim_k, head_dim_v = geom
+                elif geom != (n_head_kv, head_dim_k, head_dim_v):
+                    # One cache is allocated for the whole model with one width per layer, so a model
+                    # whose blocks disagree cannot be served by it. Better to say so than to write the
+                    # first block's geometry and corrupt the rest.
+                    raise NotImplementedError(
+                        f"loom_fused_attention op '{op.name}' has K/V geometry {geom}, but an earlier "
+                        f"block declared {(n_head_kv, head_dim_k, head_dim_v)}. A KvCache is allocated "
+                        "with ONE per-layer width, so per-block variation is unsupported."
+                    )
+        if not n_blocks:
+            return {}
+
+        kv_cache_size = self.kwargs.get("kv_cache_size")
+        if not kv_cache_size:
+            raise ValueError(
+                "this export fused attention into ATTENTION nodes, which need a KV cache at run time, "
+                "but no `kv_cache_size` was passed to the backend -- so the GGUF would declare a cache "
+                "it never sizes and make_kv_cache would reject it. Pass the capacity in tokens (the "
+                "causal-LM family passes its own `max_seq_len`)."
+            )
+        return {
+            "n_layer": n_blocks,
+            "n_head_kv": n_head_kv,
+            "n_embd_head_k": head_dim_k,
+            "n_embd_head_v": head_dim_v,
+            "kv_cache_size": int(kv_cache_size),
+        }
+
     def _collect_mul_mat_weight_names(self) -> set:
         """Every MUL_MAT node's *first* input, across all topologies -- the weight-first argument per
         loom's convention (src/ops/primitives_basic.cpp's op_mul_mat is a bare ggml_mul_mat(a, b) wrap
@@ -1987,6 +2042,13 @@ class LoomGGUFExporter:
 
         # Embed the Lua driver orchestration script
         w.add_string("model.driver_script", driver_script)
+
+        # The KV-cache geometry, when this export produced ATTENTION nodes (KV-CACHE.md 2.2b). Same
+        # five "loom.*" keys the bespoke converters write and `loom::make_kv_cache` reads, so a host
+        # allocates from the file alone rather than from a per-model C++ struct. Absent entirely for
+        # every unfused export, which is every model but the causal LMs.
+        for key, value in self._kv_cache_geometry().items():
+            w.add_uint32(f"loom.{key}", int(value))
 
         # Embed each static submodule topology JSON string
         for submodule_name, topo in self.topologies.items():

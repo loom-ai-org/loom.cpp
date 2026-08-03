@@ -201,6 +201,20 @@ class LMCausalModelExportConfig(LoomExportConfig):
                 flat_namespace=True,
                 tokenizer_family=self.tokenizer_family,
                 quantize=self.quantize,
+                # KV-CACHE.md stage 2: fuse each SDPA block into an ATTENTION node, the only node type
+                # that reaches the engine's KV cache, and declare the cache's capacity so a host can
+                # allocate one from the file alone.
+                #
+                # `Flattened` ONLY, and the reason is the cache's addressing. `fuse_loom_attention`
+                # numbers blocks densely per traced function, which is the whole model here -- but a
+                # `Modular` export traces one function PER SUBMODULE, so every layer_i would restart at
+                # 0 and all of them would share cache slot 0. Making that work means deriving the index
+                # from the submodule's own identity, which is a real design question (the modular
+                # driver would also have to thread n_past through its chain) and is deliberately not
+                # answered by inference here. LFM2-modular therefore keeps exporting exactly as before,
+                # prefill-only, and its e2e test is unaffected.
+                fuse_attention=True,
+                kv_cache_size=self.max_seq_len,
             )
         return kwargs
 
