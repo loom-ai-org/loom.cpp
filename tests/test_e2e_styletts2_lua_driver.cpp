@@ -3,17 +3,21 @@
 // the real Transformer1d denoiser, ported to Lua as plain host arithmetic + loom.run_subgraph calls,
 // with loom.gaussian_array/loom.uniform_array supplying every stochastic draw from the shared rng_
 // stream in the same order the C++ driver uses). Runs the SAME real yl4579/StyleTTS2-LJSpeech checkpoint
-// through TWO independent paths -- the existing hand-written loom::StyleTTS2Driver (C++ control flow,
-// loaded from the OLD multi-file convention produced by convert_styletts2_reused.py +
-// convert_styletts2_diffusion.py) and a LoomLuaBridge running the hand-ported
-// tools/convert_styletts2/styletts2_driver.lua (loaded from the NEW single-file
-// convert_styletts2_lua_all.py output) -- and asserts they produce numerically matching waveforms. Skips
-// cleanly if the required env vars/files aren't present.
+// through TWO independent paths -- the hand-written loom::StyleTTS2Driver, which is RETIRED (P4.0.8,
+// E.3), and a LoomLuaBridge running the hand-ported tools/convert_styletts2/styletts2_driver.lua
+// (loaded from the single-file convert_styletts2_lua_all.py output). The C++ half is no longer run
+// here: its output at these exact inputs is frozen in
+// fixtures/legacy_driver_reference/styletts2_driver_waveform.npy, at the same 5e-3 bound the live
+// comparison used (observed 3.8e-03 -- this family's own "style vector -> HiFi-GAN vocoder"
+// sensitivity, which is why the bound was always looser than the other four). See that directory's
+// README.md for the provenance and for why the fixture cannot be regenerated. Skips cleanly if the
+// required env vars/files aren't present.
 
 #include "test_util.h"
+#include "npy_fixture.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // the pre-MIL C++ driver this test uses as its oracle
 
 #include <ggml-cpu.h>
 
@@ -25,16 +29,13 @@
 #include <vector>
 
 int main() {
-    const char* dir_all_env = std::getenv("LOOM_STYLETTS2_DIR");
+    namespace cfg = loom_test::tts_inputs::styletts2;
     const char* dir_lua_env = std::getenv("LOOM_STYLETTS2_LUA_DIR");
-    if (dir_all_env == nullptr || dir_lua_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_STYLETTS2_DIR (the multi-file set from "
-                              "convert_styletts2_reused.py + convert_styletts2_diffusion.py, for the C++ "
-                              "oracle) and LOOM_STYLETTS2_LUA_DIR (a directory with styletts2.gguf, "
+    if (dir_lua_env == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_STYLETTS2_LUA_DIR (a directory with styletts2.gguf, "
                               "produced by convert_styletts2_lua_all.py) to run this check\n");
         return 77;
     }
-    const std::string dir_all = dir_all_env;
     const std::string dir_lua = dir_lua_env;
 
     // Same fixture as test_e2e_styletts2_driver.cpp's own oracle test.
@@ -45,13 +46,10 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    // --- Oracle: the existing hand-written C++ driver ---
-    std::vector<float> ref_wav;
-    loom::StyleTTS2Config cfg;
-    {
-        loom::StyleTTS2Driver driver(dir_all, cfg, backend.get());
-        ref_wav = driver.synthesize(input_ids, kDiffusionSteps, kSeed);
-    }
+    // --- Oracle: the retired C++ driver's own output at these exact inputs, frozen (P4.0.8, E.3) ---
+    std::vector<int64_t> ref_shape;
+    const std::vector<float> ref_wav =
+        loom_test::read_npy_f32(std::string(LOOM_LEGACY_REF_DIR) + "/styletts2_driver_waveform.npy", ref_shape);
 
     // --- New path: LoomLuaBridge running the hand-ported styletts2_driver.lua ---
     std::vector<float> lua_wav;
@@ -87,17 +85,17 @@ int main() {
             {"input_ids", input_ids_d},
             {"diffusion_steps", static_cast<double>(kDiffusionSteps)},
             {"seed", static_cast<double>(kSeed)},
-            {"style_dim", static_cast<double>(cfg.style_dim)},
-            {"d_model", static_cast<double>(cfg.d_model)},
-            {"hidden_per_dir", static_cast<double>(cfg.hidden_per_dir)},
-            {"harmonic_num", static_cast<double>(cfg.harmonic_num)},
-            {"upsample_scale", static_cast<double>(cfg.upsample_scale)},
-            {"gen_istft_n_fft", static_cast<double>(cfg.gen_istft_n_fft)},
-            {"gen_istft_hop", static_cast<double>(cfg.gen_istft_hop)},
-            {"sigma_min", static_cast<double>(cfg.sigma_min)},
-            {"sigma_max", static_cast<double>(cfg.sigma_max)},
-            {"rho", static_cast<double>(cfg.rho)},
-            {"sigma_data", static_cast<double>(cfg.sigma_data)},
+            {"style_dim", static_cast<double>(cfg::style_dim)},
+            {"d_model", static_cast<double>(cfg::d_model)},
+            {"hidden_per_dir", static_cast<double>(cfg::hidden_per_dir)},
+            {"harmonic_num", static_cast<double>(cfg::harmonic_num)},
+            {"upsample_scale", static_cast<double>(cfg::upsample_scale)},
+            {"gen_istft_n_fft", static_cast<double>(cfg::gen_istft_n_fft)},
+            {"gen_istft_hop", static_cast<double>(cfg::gen_istft_hop)},
+            {"sigma_min", static_cast<double>(cfg::sigma_min)},
+            {"sigma_max", static_cast<double>(cfg::sigma_max)},
+            {"rho", static_cast<double>(cfg::rho)},
+            {"sigma_data", static_cast<double>(cfg::sigma_data)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

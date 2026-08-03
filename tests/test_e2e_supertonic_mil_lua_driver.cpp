@@ -1,9 +1,13 @@
 // Full end-to-end check for the MIL-traced SupertonicTTS export: runs the real orchestration
 // (tools/convert_supertonic/supertonic_driver/, loaded from export_supertonic_mil.py's single
-// combined supertonic_mil.gguf) and checks the result matches the EXISTING hand-written
-// loom::SupertonicDriver oracle (loaded from the bespoke convert_supertonic_all.py's own six-file output)
-// -- same "MIL lua driver vs. bespoke C++ driver" comparison as test_e2e_matcha_mil_lua_driver.cpp/
-// test_e2e_vits_mil_lua_driver.cpp/etc. Per-topology numerical checks against real-module references
+// combined supertonic GGUF `loom-export` produces) and checks the result matches the hand-written
+// loom::SupertonicDriver oracle -- same "MIL lua driver vs. bespoke C++ driver" comparison as
+// test_e2e_matcha_mil_lua_driver.cpp.
+//
+// That oracle is RETIRED (P4.0.8, E.3) and is no longer constructed here: its output at these exact
+// inputs is frozen in fixtures/legacy_driver_reference/supertonic_driver_waveform_<style>.npy, at the
+// same 1e-3 bound and with the same observed 2.08e-06 as the live comparison. The fixture is
+// per-voice-style because the style vectors are an input; see that directory's README.md. Per-topology numerical checks against real-module references
 // (test_e2e_supertonic_mil_{dp,ttl_text,vfe,decoder}.cpp: ~1e-2 or tighter) already validate each phase
 // independently before ever reaching here. Text length is fixed at 10 tokens, matching
 // export_supertonic_mil.py's own T_TEXT_FIXED (see that script's module docstring) -- the SAME real
@@ -12,9 +16,10 @@
 // Skips cleanly if the required env vars/files aren't present.
 
 #include "test_util.h"
+#include "npy_fixture.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // the pre-MIL C++ driver this test uses as its oracle
 
 #include <ggml-cpu.h>
 #include <nlohmann/json.hpp>
@@ -46,18 +51,15 @@ std::vector<float> load_style_field(const nlohmann::json& j, const char* field) 
 } // namespace
 
 int main() {
-    const char* dir_all_env = std::getenv("LOOM_SUPERTONIC_ALL_DIR");
+    namespace cfg = loom_test::tts_inputs::supertonic;
     const char* mil_gguf_env = std::getenv("LOOM_SUPERTONIC_MIL_GGUF");
     const char* style_json_env = std::getenv("LOOM_SUPERTONIC_VOICE_STYLE_JSON");
-    if (dir_all_env == nullptr || mil_gguf_env == nullptr || style_json_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_SUPERTONIC_ALL_DIR (six-file output of "
-                              "convert_supertonic_all.py, for the C++ oracle), LOOM_SUPERTONIC_MIL_GGUF "
-                              "(supertonic_mil.gguf, produced by export_supertonic_mil.py), and "
-                              "LOOM_SUPERTONIC_VOICE_STYLE_JSON (a real assets/voice_styles/*.json) to "
-                              "run this check\n");
+    if (mil_gguf_env == nullptr || style_json_env == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_SUPERTONIC_MIL_GGUF (the supertonic GGUF produced by "
+                              "`loom-export`) and LOOM_SUPERTONIC_VOICE_STYLE_JSON (a real "
+                              "assets/voice_styles/*.json) to run this check\n");
         return 77;
     }
-    const std::string dir_all = dir_all_env;
 
     std::ifstream f(style_json_env);
     LOOM_CHECK(static_cast<bool>(f));
@@ -75,14 +77,31 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    // --- Oracle: the existing hand-written C++ driver ---
-    std::vector<float> ref_wav;
-    {
-        loom::SupertonicConfig cfg;
-        LOOM_CHECK(txt_ids.size() == cfg.txt_len_fixed);
-        loom::SupertonicDriver driver(dir_all, cfg, backend.get());
-        ref_wav = driver.synthesize(txt_ids, style_ttl, style_dp, kNSteps, kSeed);
+    LOOM_CHECK(txt_ids.size() == cfg::txt_len_fixed);
+
+    // --- Oracle: the retired C++ driver's own output at these exact inputs, frozen (P4.0.8, E.3) ---
+    // Keyed by voice style, because the style vectors are an INPUT here and a different one produces a
+    // different waveform: a fixture exists for the style it was frozen with, and pointing
+    // LOOM_SUPERTONIC_VOICE_STYLE_JSON at another one skips rather than silently comparing against the
+    // wrong reference. See fixtures/legacy_driver_reference/README.md for which styles are covered.
+    std::string style_name = style_json_env;
+    if (const size_t slash = style_name.find_last_of('/'); slash != std::string::npos) {
+        style_name = style_name.substr(slash + 1);
     }
+    if (const size_t dot = style_name.find_last_of('.'); dot != std::string::npos) {
+        style_name = style_name.substr(0, dot);
+    }
+    const std::string ref_path = std::string(LOOM_LEGACY_REF_DIR) + "/supertonic_driver_waveform_" +
+                                  style_name + ".npy";
+    if (!std::ifstream(ref_path)) {
+        std::fprintf(stderr, "skipping: no frozen reference waveform for voice style '%s' (%s). The "
+                              "retired C++ oracle that produced these cannot be re-run; only the styles "
+                              "already in fixtures/legacy_driver_reference/ can be checked.\n",
+                      style_name.c_str(), ref_path.c_str());
+        return 77;
+    }
+    std::vector<int64_t> ref_shape;
+    const std::vector<float> ref_wav = loom_test::read_npy_f32(ref_path, ref_shape);
 
     // --- New path: LoomLuaBridge running the MIL-traced supertonic_driver/ ---
     std::vector<float> mil_wav;

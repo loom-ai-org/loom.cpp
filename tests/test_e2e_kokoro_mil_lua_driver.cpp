@@ -23,9 +23,9 @@
 // with the bespoke topologies these replaced is test_e2e_kokoro_mil_topology_equivalence.cpp's job.
 
 #include "test_util.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // only for the legacy driver's Config struct: this test runs no C++ oracle
 
 #include <ggml-cpu.h>
 
@@ -37,6 +37,7 @@
 #include <vector>
 
 int main() {
+    namespace cfg = loom_test::tts_inputs::kokoro;
     const char* gguf_mil_env = std::getenv("LOOM_KOKORO_MIL_GGUF");
     if (gguf_mil_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_KOKORO_MIL_GGUF (kokoro_mil.gguf) to run this check\n");
@@ -54,7 +55,6 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    loom::KokoroConfig cfg; // real defaults: style_dim=128, d_model=512, hidden_per_dir=256, etc.
     std::vector<float> lua_wav;
     {
         auto model_mil = loom::GgufModel::load(gguf_mil_path, backend.get());
@@ -90,13 +90,13 @@ int main() {
             {"ref_s", ref_s_d},
             {"speed", static_cast<double>(kSpeed)},
             {"seed", static_cast<double>(kSeed)},
-            {"style_dim", static_cast<double>(cfg.style_dim)},
-            {"d_model", static_cast<double>(cfg.d_model)},
-            {"hidden_per_dir", static_cast<double>(cfg.hidden_per_dir)},
-            {"harmonic_num", static_cast<double>(cfg.harmonic_num)},
-            {"upsample_scale", static_cast<double>(cfg.upsample_scale)},
-            {"gen_istft_n_fft", static_cast<double>(cfg.gen_istft_n_fft)},
-            {"gen_istft_hop", static_cast<double>(cfg.gen_istft_hop)},
+            {"style_dim", static_cast<double>(cfg::style_dim)},
+            {"d_model", static_cast<double>(cfg::d_model)},
+            {"hidden_per_dir", static_cast<double>(cfg::hidden_per_dir)},
+            {"harmonic_num", static_cast<double>(cfg::harmonic_num)},
+            {"upsample_scale", static_cast<double>(cfg::upsample_scale)},
+            {"gen_istft_n_fft", static_cast<double>(cfg::gen_istft_n_fft)},
+            {"gen_istft_hop", static_cast<double>(cfg::gen_istft_hop)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

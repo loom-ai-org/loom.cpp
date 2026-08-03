@@ -10,6 +10,7 @@
 // (SKIP_RETURN_CODE 77) if LOOM_SUPERTONIC_ALL_DIR isn't set.
 
 #include "test_util.h"
+#include "npy_fixture.h"
 
 #include "loom/loom.h"
 #include "loom/loom_legacy.h" // the pre-MIL C++ driver this test uses as its oracle
@@ -79,6 +80,16 @@ int main() {
     LOOM_CHECK(txt_ids.size() == cfg.txt_len_fixed);
 
     std::vector<float> wav = driver.synthesize(txt_ids, style_ttl, style_dp, /*n_steps=*/10, /*seed=*/42);
+
+    // P4.0.8/E.3: this driver is being retired, and this test -- its own oracle, at these exact inputs
+    // -- is the ONLY thing that can produce the reference waveform its Lua successor compares against
+    // once it is gone. `LOOM_DUMP_REF_NPY=<path>` freezes it into tests/fixtures/legacy_driver_reference/.
+    // Not part of the check; see that directory's README.md for the recipe and for why the fixture
+    // cannot be regenerated after this file is deleted.
+    if (const char* dump_path = std::getenv("LOOM_DUMP_REF_NPY")) {
+        LOOM_CHECK(loom_test::write_npy_f32(dump_path, wav));
+        std::fprintf(stderr, "LOOM_DUMP_REF_NPY: wrote %zu samples to %s\n", wav.size(), dump_path);
+    }
 
     LOOM_CHECK(!wav.empty());
     bool all_finite = true;

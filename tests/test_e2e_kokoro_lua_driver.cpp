@@ -3,15 +3,18 @@
 // matching loom::BiLstmStepper's own per-timestep mechanics exactly) plus the new loom.uniform_array
 // binding (SineGen's rand_ini draws, shared with StyleTTS2Driver's own identical need). Runs the SAME
 // real Kokoro-82M checkpoint through TWO independent paths -- the existing hand-written
-// loom::KokoroDriver (C++ control flow, loaded from the OLD ~28-separate-GGUF-file convention) and a
-// LoomLuaBridge running the hand-ported tools/convert_kokoro/kokoro_driver.lua (loaded from the NEW
-// single-file convert_kokoro_lua_all.py output) -- and asserts they produce numerically matching
-// waveforms. Skips cleanly if the required env vars/files aren't present.
+// loom::KokoroDriver -- which is RETIRED (P4.0.8, E.3) -- and a LoomLuaBridge running the hand-ported
+// tools/convert_kokoro/kokoro_driver.lua (loaded from the single-file convert_kokoro_lua_all.py
+// output). The C++ half is no longer run here: its output at these exact inputs is frozen in
+// fixtures/legacy_driver_reference/kokoro_driver_waveform.npy, at the same 1e-3 bound the live
+// comparison used (observed 1.9e-06). See that directory's README.md for the provenance and for why the
+// fixture cannot be regenerated. Skips cleanly if the required env vars/files aren't present.
 
 #include "test_util.h"
+#include "npy_fixture.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // the pre-MIL C++ driver this test uses as its oracle
 
 #include <ggml-cpu.h>
 
@@ -23,16 +26,13 @@
 #include <vector>
 
 int main() {
-    const char* dir_all_env = std::getenv("LOOM_KOKORO_ALL_DIR");
+    namespace cfg = loom_test::tts_inputs::kokoro;
     const char* dir_lua_env = std::getenv("LOOM_KOKORO_LUA_DIR");
-    if (dir_all_env == nullptr || dir_lua_env == nullptr) {
-        std::fprintf(stderr, "skipping: set LOOM_KOKORO_ALL_DIR (the ~28-file set from "
-                              "convert_kokoro_all.py, for the C++ oracle) and LOOM_KOKORO_LUA_DIR (a "
-                              "directory with kokoro.gguf, produced by convert_kokoro_lua_all.py) to run "
-                              "this check\n");
+    if (dir_lua_env == nullptr) {
+        std::fprintf(stderr, "skipping: set LOOM_KOKORO_LUA_DIR (a directory with kokoro.gguf, produced "
+                              "by convert_kokoro_lua_all.py) to run this check\n");
         return 77;
     }
-    const std::string dir_all = dir_all_env;
     const std::string dir_lua = dir_lua_env;
 
     // Same fixture as test_e2e_kokoro_driver.cpp's own oracle test.
@@ -45,13 +45,10 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    // --- Oracle: the existing hand-written C++ driver ---
-    std::vector<float> ref_wav;
-    loom::KokoroConfig cfg;
-    {
-        loom::KokoroDriver driver(dir_all, cfg, backend.get());
-        ref_wav = driver.synthesize(input_ids, ref_s, kSpeed, kSeed);
-    }
+    // --- Oracle: the retired C++ driver's own output at these exact inputs, frozen (P4.0.8, E.3) ---
+    std::vector<int64_t> ref_shape;
+    const std::vector<float> ref_wav =
+        loom_test::read_npy_f32(std::string(LOOM_LEGACY_REF_DIR) + "/kokoro_driver_waveform.npy", ref_shape);
 
     // --- New path: LoomLuaBridge running the hand-ported kokoro_driver.lua ---
     std::vector<float> lua_wav;
@@ -89,13 +86,13 @@ int main() {
             {"ref_s", ref_s_d},
             {"speed", static_cast<double>(kSpeed)},
             {"seed", static_cast<double>(kSeed)},
-            {"style_dim", static_cast<double>(cfg.style_dim)},
-            {"d_model", static_cast<double>(cfg.d_model)},
-            {"hidden_per_dir", static_cast<double>(cfg.hidden_per_dir)},
-            {"harmonic_num", static_cast<double>(cfg.harmonic_num)},
-            {"upsample_scale", static_cast<double>(cfg.upsample_scale)},
-            {"gen_istft_n_fft", static_cast<double>(cfg.gen_istft_n_fft)},
-            {"gen_istft_hop", static_cast<double>(cfg.gen_istft_hop)},
+            {"style_dim", static_cast<double>(cfg::style_dim)},
+            {"d_model", static_cast<double>(cfg::d_model)},
+            {"hidden_per_dir", static_cast<double>(cfg::hidden_per_dir)},
+            {"harmonic_num", static_cast<double>(cfg::harmonic_num)},
+            {"upsample_scale", static_cast<double>(cfg::upsample_scale)},
+            {"gen_istft_n_fft", static_cast<double>(cfg::gen_istft_n_fft)},
+            {"gen_istft_hop", static_cast<double>(cfg::gen_istft_hop)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

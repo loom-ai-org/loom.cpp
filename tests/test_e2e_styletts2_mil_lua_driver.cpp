@@ -26,9 +26,9 @@
 // crashing and produces a sane result.
 
 #include "test_util.h"
+#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
-#include "loom/loom_legacy.h" // only for the legacy driver's Config struct: this test runs no C++ oracle
 
 #include <ggml-cpu.h>
 
@@ -40,6 +40,7 @@
 #include <vector>
 
 int main() {
+    namespace cfg = loom_test::tts_inputs::styletts2;
     const char* gguf_mil_env = std::getenv("LOOM_STYLETTS2_MIL_GGUF");
     if (gguf_mil_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_STYLETTS2_MIL_GGUF (styletts2_mil.gguf) to run this "
@@ -58,7 +59,6 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    loom::StyleTTS2Config cfg; // real defaults: style_dim=128, d_model=512, hidden_per_dir=256, etc.
     std::vector<float> lua_wav;
     {
         auto model_mil = loom::GgufModel::load(gguf_mil_path, backend.get());
@@ -90,17 +90,17 @@ int main() {
             {"input_ids", input_ids_d},
             {"diffusion_steps", static_cast<double>(kDiffusionSteps)},
             {"seed", static_cast<double>(kSeed)},
-            {"style_dim", static_cast<double>(cfg.style_dim)},
-            {"d_model", static_cast<double>(cfg.d_model)},
-            {"hidden_per_dir", static_cast<double>(cfg.hidden_per_dir)},
-            {"harmonic_num", static_cast<double>(cfg.harmonic_num)},
-            {"upsample_scale", static_cast<double>(cfg.upsample_scale)},
-            {"gen_istft_n_fft", static_cast<double>(cfg.gen_istft_n_fft)},
-            {"gen_istft_hop", static_cast<double>(cfg.gen_istft_hop)},
-            {"sigma_min", static_cast<double>(cfg.sigma_min)},
-            {"sigma_max", static_cast<double>(cfg.sigma_max)},
-            {"rho", static_cast<double>(cfg.rho)},
-            {"sigma_data", static_cast<double>(cfg.sigma_data)},
+            {"style_dim", static_cast<double>(cfg::style_dim)},
+            {"d_model", static_cast<double>(cfg::d_model)},
+            {"hidden_per_dir", static_cast<double>(cfg::hidden_per_dir)},
+            {"harmonic_num", static_cast<double>(cfg::harmonic_num)},
+            {"upsample_scale", static_cast<double>(cfg::upsample_scale)},
+            {"gen_istft_n_fft", static_cast<double>(cfg::gen_istft_n_fft)},
+            {"gen_istft_hop", static_cast<double>(cfg::gen_istft_hop)},
+            {"sigma_min", static_cast<double>(cfg::sigma_min)},
+            {"sigma_max", static_cast<double>(cfg::sigma_max)},
+            {"rho", static_cast<double>(cfg::rho)},
+            {"sigma_data", static_cast<double>(cfg::sigma_data)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

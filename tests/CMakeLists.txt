@@ -2,6 +2,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(LOOM_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixtures)
 
+# The frozen reference waveforms of the retired per-model C++ drivers (P4.0.8, E.3). Unlike
+# LOOM_FIXTURE_DIR these are NOT generated at build time -- the code that produced them is gone -- so
+# they live in the source tree and are read from there. See that directory's README.md.
+set(LOOM_LEGACY_REF_DIR ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/legacy_driver_reference)
+
 # --- Phase 1: minimal ad hoc GGUF fixture, regenerated fresh before test_gguf_model_load runs ---
 add_test(
     NAME gen_minimal_gguf_fixture
@@ -969,6 +974,7 @@ set_tests_properties(test_e2e_whisper_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 #     LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
 add_executable(test_e2e_supertonic_lua_driver test_e2e_supertonic_lua_driver.cpp)
 target_link_libraries(test_e2e_supertonic_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_supertonic_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_supertonic_lua_driver COMMAND test_e2e_supertonic_lua_driver)
 set_tests_properties(test_e2e_supertonic_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -999,6 +1005,7 @@ set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES SKIP_RETURN_CODE
 #     against the existing bespoke loom::SupertonicDriver oracle. Skips cleanly if env vars aren't set. ---
 add_executable(test_e2e_supertonic_mil_lua_driver test_e2e_supertonic_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_supertonic_mil_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_supertonic_mil_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_supertonic_mil_lua_driver COMMAND test_e2e_supertonic_mil_lua_driver)
 set_tests_properties(test_e2e_supertonic_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1008,6 +1015,7 @@ set_tests_properties(test_e2e_supertonic_mil_lua_driver PROPERTIES SKIP_RETURN_C
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
 add_executable(test_e2e_matcha_lua_driver test_e2e_matcha_lua_driver.cpp)
 target_link_libraries(test_e2e_matcha_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_matcha_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_matcha_lua_driver COMMAND test_e2e_matcha_lua_driver)
 set_tests_properties(test_e2e_matcha_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1036,6 +1044,7 @@ set_tests_properties(test_e2e_matcha_mil_vocoder PROPERTIES SKIP_RETURN_CODE 77)
 #     against the existing loom::MatchaDriver on the real checkpoint. ---
 add_executable(test_e2e_matcha_mil_lua_driver test_e2e_matcha_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_matcha_mil_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_matcha_mil_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_matcha_mil_lua_driver COMMAND test_e2e_matcha_mil_lua_driver)
 set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1046,6 +1055,7 @@ set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 
 #     BACKLOG.md's dated entry. ---
 add_executable(test_e2e_vits_lua_driver test_e2e_vits_lua_driver.cpp)
 target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_vits_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
 set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1072,6 +1082,7 @@ set_tests_properties(test_e2e_vits_mil_flow_vocoder_reference PROPERTIES SKIP_RE
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
 add_executable(test_e2e_kokoro_lua_driver test_e2e_kokoro_lua_driver.cpp)
 target_link_libraries(test_e2e_kokoro_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_kokoro_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_kokoro_lua_driver COMMAND test_e2e_kokoro_lua_driver)
 set_tests_properties(test_e2e_kokoro_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1098,6 +1109,7 @@ set_tests_properties(test_e2e_kokoro_mil_topology_equivalence PROPERTIES SKIP_RE
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
 add_executable(test_e2e_styletts2_lua_driver test_e2e_styletts2_lua_driver.cpp)
 target_link_libraries(test_e2e_styletts2_lua_driver PRIVATE loom::engine)
+target_compile_definitions(test_e2e_styletts2_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_styletts2_lua_driver COMMAND test_e2e_styletts2_lua_driver)
 set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
