@@ -287,3 +287,42 @@ the whole claim of this document — the cache is only correct if the two agree.
 Full 11-model sweep. `infer` byte-identical for the seven non-causal-LM models, numerically identical
 for the four causal ones; `infer_with_past` agreeing with iterated `infer`; and the negative-gate probes
 from 1.3, 2.1 and 3.2 recorded with their messages.
+
+### What stage 3 found that this plan did not predict
+
+* **3.1's second half is not implementable as written, and §2 already said why.** "`_validate_input_axes`
+  taught that a second dynamic axis named `n_kv` is legal" cannot happen: two independent `RangeDim`s
+  over one attention block fail coremltools' type inference, so a fused causal LM presents exactly one
+  traced symbol and that check passes for the reason it always did. `n_kv` is applied to the *emitted*
+  topology instead. What 3.1 could genuinely close was a different, silent trap it did not name:
+  `_sub_symbol` substitutes per MIL SYMBOL, and the causal-LM family shares one `ct.RangeDim` across
+  `tokens`/`cache_position`/`attention_mask` — so `declared_axes={"attention_mask": {3: "n_kv"}}`, the
+  obvious way to reach for the axis, would have retyped all three with no error at all. That now raises,
+  naming the inputs that would have moved with it.
+* **§2's soundness argument was false as measured, and the fix is a pass change rather than a caveat.**
+  "After fusion the mask is consumed *only* by the fused node" — measured on a real trace, the mask input
+  fed 32 `slice_by_index` ops which fed the ATTENTION nodes. That is transformers slicing the mask to the
+  current KV length, and it survives fusion because the pass leaves everything upstream to DCE. It is not
+  merely redundant: **its extents are baked at trace time**, so on a decode step it would cut the
+  driver's real `[n_tokens, n_kv]` mask back to the prefill width. `_mask_kv_slice_source` walks back
+  through it, and `_retype_fused_mask_input` then checks the property rather than assuming it.
+* **A hybrid architecture cannot decode incrementally, and this document never contemplated one.**
+  LFM2-350M is 6 attention blocks and **10 ShortConv ones**, and its `infer_with_past` failed inside the
+  first conv layer (`VIEW: resolved shape [1,1024,1,] ... needs 16380 bytes but parent has 12288`). The
+  shape error is the symptom; the cause is that a causal depthwise convolution is stateful across steps
+  and the KV cache holds K/V and nothing else. So eligibility is *derived from the emitted graph* — a
+  cached `ATTENTION` node **and** no op mixing along the token axis with state the cache does not hold
+  (the conv family, `SSM_CONV`/`SSM_SCAN`, `RWKV_WKV6`/`7`) — and the exporter says so when it declines.
+  Decision 4 made *fusion* opt-in for a related reason; this is the same lesson one level up, and the
+  next hybrid (Mamba, RWKV) hits a stated rule instead of a wrong answer.
+* **The retyped mask turned a whole class of cache bug into an immediate, named failure.** Pinning
+  `n_past` to 0 in the loop — the most likely way to get the cache wrong — fails at the first decode
+  step with `input tensor 'attention_mask' size mismatch. Expected 1 elements, got 4 elements from Lua`,
+  because the input is now declared `["n_kv", "n_tokens"]` and the engine sizes it from the axis table.
+  Before 3.2 that declaration could not disagree with anything. A gate acquired as a side effect of a
+  correctness change is worth writing down.
+* **Iterated `infer` is a valid oracle for a narrow reason worth stating.** Each call is a *full prefill*
+  at `n_past = 0`, so it rewrites cells `[0, n_tokens)` and attends over exactly those and never reads a
+  cell an earlier call left behind. That is also why both paths can share one bridge and one cache in the
+  test, which buys the "a prefill after a generation must not read the cells generation left behind"
+  property at no cost.

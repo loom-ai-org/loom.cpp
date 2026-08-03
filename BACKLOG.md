@@ -1248,7 +1248,7 @@ nothing.
 
   **Whisper is the one that remains**, and not because it is harder: `whisper_driver.cpp` has no MIL
   export to replace it. `loom_legacy.h` empties out in P4.1, and its docstring says so.
-- **P4.0.9 — KV cache on the MIL path.** Specified in [`KV-CACHE.md`](KV-CACHE.md); the one item here
+- **P4.0.9 — KV cache on the MIL path — DONE (stages N/1/2/3).** Specified in [`KV-CACHE.md`](KV-CACHE.md); the one item here
   that adds a *capability* rather than hardening one, which is why its gate differs. `EXPORT-PREPARATION
   .md` §4 filed this for P4/P5 and correctly named `FuseLoomAttention` as the blocker — its
   `_fuse_blocks` body is `pass` (`dialect.py:268`), so `loom_fused_attention → ATTENTION`
@@ -1264,6 +1264,31 @@ nothing.
   **Gate:** byte-identity for the seven non-causal-LM models; for the four causal ones the topology
   changes by construction, so the gate is their numeric reference tests plus `infer_with_past` agreeing
   token-for-token with iterated `infer`.
+
+  **Done. Gate passed, twelve models swept** (the eleven plus SmolLM2-360M, which reaches the family
+  through P4.0.4's generic `hf-causal-lm` fallback and is the smallest fused causal LM on this machine).
+  Exported from a worktree at `6170be8` and from the working tree, snapshotted and `diff -r`'d:
+
+  * **nine byte-identical** — conformer-ctc, parakeet-tdt, parakeet-rnnt, kokoro, matcha, vits,
+    styletts2, supertonic, and lfm2-**modular** (unfused, so untouched);
+  * **three differ, all fused causal LMs, and only where they must.** No weight changed in any of them.
+    The topology diff is exactly the retyped mask input plus **one `VIEW` removed per attention block**
+    — Qwen3 2094→2066 nodes (−28), SmolLM2 1942→1910 (−32), LFM2-monolithic 836→830 (−6, its real
+    attention-block count) — and `attention_mask` going `["n_tokens","n_tokens","1","1"]` →
+    `["n_kv","n_tokens"]`, with every other declared input unchanged. Qwen3 and SmolLM2 also gain the
+    `infer_with_past` entry; LFM2-monolithic does not, which is the derived-eligibility rule working.
+
+  Numerically: `test_e2e_lfm2_mil_export` still asserts the real HF top-1 tokens 8/8 for **both** the
+  fused monolithic and the unfused modular export; `infer_with_past` agrees token-for-token with
+  iterated `infer` on Qwen3-0.6B and SmolLM2-360M (22/22 checks each, including `max_new_tokens`,
+  `eos_token` early-stop and a prefill issued after generation). 445 python tests, 138/138 ctest.
+
+  **Three things the plan did not predict**, written up under "What stage 3 found" in `KV-CACHE.md`:
+  3.1's second half was not implementable as written (the axis cannot reach `_validate_input_axes` at
+  all) but a different silent trap in `declared_axes` was, and got closed; §2's soundness argument for
+  retyping the mask was **false as measured** — 32 `slice_by_index` ops sat between the input and the
+  fused nodes, and their extents were baked at trace time; and **a hybrid architecture cannot decode
+  incrementally at all**, which is how LFM2 ended up exporting `infer` alone.
 
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
