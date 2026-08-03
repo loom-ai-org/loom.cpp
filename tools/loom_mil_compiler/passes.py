@@ -781,6 +781,66 @@ class fuse_loom_attention(AbstractGraphPass):
             return None
         return src
 
+    @staticmethod
+    def _mask_kv_slice_source(mask_var):
+        """The tensor behind HF's `mask[..., :kv_len]` slice, or `mask_var` unchanged.
+
+        The traced mask does not reach the attention block directly: transformers slices it to the
+        current KV length on the way in, which comes out of the converter as
+        `slice_by_index(attention_mask, begin=[0,0,0,0], end=[...], end_mask=[T,T,T,False])` -- full
+        extent on every axis but the last, and the last cut to a computed `kv_len`. With no cache in the
+        trace, `kv_len == seq_len`, so it is an identity slice that exists only because the traced model
+        expected to be given a mask wider than it needed.
+
+        A cached step is the case that slice was written for, and the driver now builds the mask at
+        exactly `[n_tokens, n_kv]` (`loom.causal_mask(n_tokens, n_past)`) -- so the slice is not merely
+        redundant, it is *wrong*: its extents were baked at trace time and would cut a decode step's
+        mask back to the prefill width. Bypassing it is what lets the mask input be declared `["n_kv",
+        "n_tokens"]` at all (KV-CACHE.md 3.2), because the retyping is only sound while the input's own
+        consumers are all fused-attention nodes -- and a surviving slice is a consumer that is not.
+
+        Every guard bails to "leave it alone", the same rule the rest of this pass follows: an unmatched
+        shape leaves a graph that still exports, prefill-only, rather than one rewritten halfway.
+        """
+        op = getattr(mask_var, "op", None)
+        if op is None or op.op_type != "slice_by_index":
+            return mask_var
+        src = op.inputs.get("x")
+        if src is None or src.shape is None or mask_var.shape is None:
+            return mask_var
+        rank = len(src.shape)
+        if rank != len(mask_var.shape) or rank < 2:
+            return mask_var
+
+        def mask_bits(name, default):
+            var = op.inputs.get(name)
+            if var is None or var.val is None:
+                return [default] * rank
+            bits = list(np.array(var.val).ravel())
+            return bits if len(bits) == rank else None
+
+        # Nothing may be squeezed away, nothing strided, and every axis but the last must be taken
+        # whole: `begin` at 0 (or ignored via begin_mask) and `end` ignored via end_mask.
+        squeeze = mask_bits("squeeze_mask", False)
+        stride = mask_bits("stride", 1)
+        begin_mask = mask_bits("begin_mask", False)
+        end_mask = mask_bits("end_mask", False)
+        if squeeze is None or stride is None or begin_mask is None or end_mask is None:
+            return mask_var
+        if any(bool(b) for b in squeeze) or any(int(st) != 1 for st in stride):
+            return mask_var
+        begin_var = op.inputs.get("begin")
+        begin = list(np.array(begin_var.val).ravel()) if begin_var is not None and begin_var.val is not None else None
+        for axis in range(rank):
+            if not bool(begin_mask[axis]) and (begin is None or int(begin[axis]) != 0):
+                return mask_var
+            if axis < rank - 1 and not bool(end_mask[axis]):
+                return mask_var
+        # The last axis IS sliced (that is the whole point); if it were not, this is some other slice.
+        if bool(end_mask[rank - 1]):
+            return mask_var
+        return src
+
     def _strip_gqa_repeat(self, k_var, v_var, q_var):
         """`(k, v)` with HF's `repeat_kv()` expansion undone when it is safe to do so, else unchanged.
 
@@ -882,6 +942,11 @@ class fuse_loom_attention(AbstractGraphPass):
         # Undo HF's repeat_kv() where it is safe, so the cache stores the checkpoint's real KV heads
         # rather than the expanded ones (KV-CACHE.md 2.3). Purely a size win; see _strip_gqa_repeat.
         k_var, v_var = self._strip_gqa_repeat(k_var, v_var, q_var)
+
+        # Attend against the mask the driver actually builds, not the trace-width slice of it
+        # (KV-CACHE.md 3.2). Unlike the GQA strip above this one is a correctness requirement for a
+        # cached step, not a size win -- see _mask_kv_slice_source.
+        mask_var = self._mask_kv_slice_source(mask_var)
 
         # Every rank check the op's own type_inference would make, made here first -- a pass that raises
         # from inside mb.loom_fused_attention leaves the block half-rewritten, whereas bailing here

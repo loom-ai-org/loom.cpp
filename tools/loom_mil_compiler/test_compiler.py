@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import coremltools as ct
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Program, types
+from coremltools.converters.mil.mil import Program, get_new_symbol, types
 from gguf import GGUFReader
 
 import sys
@@ -303,6 +303,76 @@ class TestLoomMILCompiler(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             backend(prog, output_path=self.output_path, flat_namespace=True, architecture="random_test")
         self.assertIn("ggml has no RNG-capable compute op", str(ctx.exception))
+
+
+class TestFusedMaskRetyping(unittest.TestCase):
+    """`_retype_fused_mask_input` (KV-CACHE.md 3.2): a cached ATTENTION node's mask spans the whole
+    cache, so the emitted topology declares it `[n_kv, root_axis]` -- an axis the trace cannot carry,
+    because a second independent `ct.RangeDim` over one attention block fails coremltools' type
+    inference.
+
+    Driven directly rather than through a real export: the method's whole job is a property of the
+    *emitted* node list, and both of its raises are about states a real export is supposed to make
+    impossible -- which is exactly why they are worth a test that can produce them."""
+
+    @staticmethod
+    def _exporter():
+        seq = get_new_symbol()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, seq), dtype=types.fp32)])
+        def main_func(tokens):
+            return mb.identity(x=tokens, name="out")
+
+        return LoomGGUFExporter(main_func)
+
+    @staticmethod
+    def _attention(mask="attention_mask", kv_cache=True):
+        return {"op": "ATTENTION", "inputs": ["q", "k", "v", mask], "outputs": ["ctx"],
+                "attrs": {"layer": 0, "scale": 0.5, "kv_cache": kv_cache}}
+
+    def _inputs(self):
+        return [{"name": "tokens", "dtype": "i32", "shape": ["n_tokens", "1"]},
+                {"name": "attention_mask", "dtype": "f32",
+                 "shape": ["n_tokens", "n_tokens", "1", "1"]}]
+
+    def test_the_mask_input_is_declared_over_n_kv(self):
+        topo_inputs = self._inputs()
+        self._exporter()._retype_fused_mask_input(topo_inputs, [self._attention()], "main_topology")
+        self.assertEqual(topo_inputs[1]["shape"], ["n_kv", "n_tokens"])
+        # Only the mask: retyping anything else would move an axis the trace really did carry.
+        self.assertEqual(topo_inputs[0]["shape"], ["n_tokens", "1"])
+
+    def test_an_uncached_attention_node_is_left_alone(self):
+        """Whisper's cross-attention is `kv_cache=false` -- its mask is not over the cache extent."""
+        topo_inputs = self._inputs()
+        self._exporter()._retype_fused_mask_input(
+            topo_inputs, [self._attention(kv_cache=False)], "main_topology")
+        self.assertEqual(topo_inputs[1]["shape"], ["n_tokens", "n_tokens", "1", "1"])
+
+    def test_a_mask_that_is_not_a_declared_input_raises(self):
+        """The state a surviving `mask[..., :kv_len]` slice leaves behind. Byte-identical output and a
+        check that never fires are indistinguishable, so this is a raise rather than a skip."""
+        topo_inputs = self._inputs()
+        with self.assertRaises(ValueError) as ctx:
+            self._exporter()._retype_fused_mask_input(
+                topo_inputs, [self._attention(mask="attention_mask_3")], "main_topology")
+        message = str(ctx.exception)
+        self.assertIn("attention_mask_3", message)
+        self.assertIn("nowhere to be declared", message)
+        self.assertIn("_mask_kv_slice_source", message)
+
+    def test_a_mask_with_another_consumer_raises(self):
+        """Retyping is sound only while nothing else's shape derives from the mask."""
+        topo_inputs = self._inputs()
+        nodes = [self._attention(),
+                 {"op": "CONT", "inputs": ["attention_mask"], "outputs": ["copy"]}]
+        with self.assertRaises(ValueError) as ctx:
+            self._exporter()._retype_fused_mask_input(topo_inputs, nodes, "main_topology")
+        message = str(ctx.exception)
+        self.assertIn("attention_mask", message)
+        self.assertIn("also read by ['CONT']", message)
+        # And it did NOT retype it on the way out.
+        self.assertEqual(topo_inputs[1]["shape"], ["n_tokens", "n_tokens", "1", "1"])
 
 
 class TestInputAxisValidation(unittest.TestCase):
