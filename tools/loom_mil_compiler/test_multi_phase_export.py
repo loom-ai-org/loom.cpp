@@ -71,7 +71,7 @@ class TestAxisDeclarations(unittest.TestCase):
     def test_a_typod_root_axis_is_rejected(self):
         msg = _message(_phase(root_axis="n_enc_frame"))
         self.assertIn("root_axis = 'n_enc_frame'", msg)
-        self.assertIn("['batch', 'n_codes', 'n_enc_frames', 'n_latent', 'n_samples', 'n_tokens']", msg)
+        self.assertIn("['batch', 'n_codes', 'n_enc_frames', 'n_kv', 'n_latent', 'n_samples', 'n_tokens']", msg)
 
     def test_a_typod_symbol_inside_a_declared_expression_is_rejected(self):
         msg = _message(_phase(declared_axes={"f0_curve": {1: "2*n_frames"}}))

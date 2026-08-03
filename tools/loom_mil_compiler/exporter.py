@@ -212,7 +212,48 @@ class LoomGGUFExporter:
                         f"this phase's mil_inputs, or drop the declaration"
                     )
                 overrides[str(dim)] = expr
+        self._reject_shared_symbol_overrides(program, declared_axes, overrides)
         return overrides
+
+    def _reject_shared_symbol_overrides(self, program, declared_axes, overrides):
+        """An override keyed on a symbol that ANOTHER, undeclared input also carries rewrites that input
+        too, silently.
+
+        `_sub_symbol` substitutes per raw MIL symbol, not per input -- so declaring one input's axis
+        moves every input sharing its `ct.RangeDim` instance. For the axes `declared_axes` was written
+        for (Kokoro's f0_curve/n_curve/noise_in/wsum) the question never arises: those are independently
+        traced leaves with their own range dims and their own symbols.
+
+        Where it does arise is the causal-LM family, whose `tokens`/`cache_position`/`attention_mask`
+        share ONE `ct.RangeDim` deliberately (see `causal_lm_export.build_trace`) -- so the obvious way
+        to give the fused mask its own `n_kv` axis is to declare it here, and the obvious way is wrong:
+        it would retype `tokens` and `cache_position` as well. That is why `axes.N_KV` is applied to the
+        emitted topology instead, and why this raises rather than letting the attempt look like it
+        worked."""
+        if not overrides:
+            return
+        declared_sites = {
+            (input_name, axis)
+            for input_name, per_axis in declared_axes.items()
+            for axis in per_axis
+        }
+        collisions = {}
+        for input_name, axis, symbol_name in self._input_axis_symbols(program):
+            if symbol_name in overrides and (input_name, axis) not in declared_sites:
+                collisions.setdefault(symbol_name, []).append(f"{input_name}[{axis}]")
+        if not collisions:
+            return
+        detail = "; ".join(
+            f"{sym} (declared as {overrides[sym]!r}) is also carried by {', '.join(where)}"
+            for sym, where in sorted(collisions.items())
+        )
+        raise ValueError(
+            f"declared_axes: {detail}. Substitution is per MIL symbol, not per input, so this "
+            f"declaration would silently retype those inputs too -- inputs sharing one ct.RangeDim "
+            f"instance cannot be given different axes here. If this is a fused causal LM's mask, its "
+            f"'n_kv' axis is applied to the emitted topology after fusion instead (axes.N_KV); "
+            f"otherwise give the input its own ct.RangeDim in this phase's mil_inputs."
+        )
 
     def _input_axis_symbols(self, program):
         """`[(input name, axis index, raw MIL symbol name)]` for every dynamic axis of every declared
@@ -251,7 +292,14 @@ class LoomGGUFExporter:
         INSTANCE across inputs that really do move together (coremltools then gives them one symbol, as
         `causal_lm_export`'s tokens/cache_position/attention_mask do deliberately), or declare the real
         relationship (as Kokoro's `decoder_vocoder` phase does for f0_curve/n_curve/noise_in/wsum, whose
-        lengths are fixed multiples of `asr`'s and are not derivable from the graph)."""
+        lengths are fixed multiples of `asr`'s and are not derivable from the graph).
+
+        **`axes.N_KV` is deliberately invisible here, and that is not a hole.** A fused causal LM's mask
+        carries `n_kv` in the *emitted topology*, applied after `fuse_loom_attention` by
+        `_retype_fused_mask_input`. It cannot come from the trace at all -- two independent `ct.RangeDim`s
+        over one attention block fail coremltools' type inference (KV-CACHE.md §2) -- so the traced
+        program a fused causal LM presents to this check still has exactly one dynamic symbol, and passes
+        it for the same reason it always did."""
         uncovered = {}
         for input_name, axis, symbol_name in self._input_axis_symbols(program):
             if symbol_name in self._axis_overrides:

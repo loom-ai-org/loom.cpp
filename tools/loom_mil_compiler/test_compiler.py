@@ -368,6 +368,41 @@ class TestInputAxisValidation(unittest.TestCase):
         )
         self.assertEqual(list(exporter._axis_overrides.values()), ["2*n_enc_frames"])
 
+    def test_declaring_one_input_of_a_shared_range_dim_raises(self):
+        """The causal-LM shape: tokens/cache_position/attention_mask share ONE ct.RangeDim on purpose,
+        so declaring an axis for just the mask would substitute per SYMBOL and retype all three.
+
+        This is the trap `axes.N_KV` exists next to: giving the fused mask its own `n_kv` axis through
+        declared_axes looks right and is not, which is why the retyping happens on the emitted topology
+        instead."""
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        seq = get_new_symbol()
+        prog = self._prog3((1, seq), (seq,), (1, 1, seq, seq))
+        names = list(prog.functions["main"].inputs)
+        with self.assertRaises(ValueError) as ctx:
+            LoomGGUFExporter(prog, declared_axes={names[2]: {3: "n_kv"}})
+        message = str(ctx.exception)
+        # Names the inputs that would have been retyped along with it, not just "conflict".
+        self.assertIn(names[0], message)
+        self.assertIn(names[1], message)
+        self.assertIn("n_kv", message)
+        self.assertIn("ct.RangeDim", message)
+
+    def test_declaring_every_input_of_a_shared_symbol_is_still_allowed(self):
+        """The guard is about a PARTIAL declaration. Declaring all of them says the same thing the
+        substitution would do, so there is nothing silent about it."""
+        from coremltools.converters.mil.mil import get_new_symbol
+
+        seq = get_new_symbol()
+        prog = self._prog3((1, seq), (seq,), (1, 1, seq, seq))
+        names = list(prog.functions["main"].inputs)
+        exporter = LoomGGUFExporter(prog, declared_axes={
+            names[0]: {1: "n_enc_frames"}, names[1]: {0: "n_enc_frames"},
+            names[2]: {2: "n_enc_frames", 3: "n_enc_frames"},
+        })
+        self.assertEqual(set(exporter._axis_overrides.values()), {"n_enc_frames"})
+
     def test_declaring_a_static_axis_raises_instead_of_doing_nothing(self):
         from coremltools.converters.mil.mil import get_new_symbol
 

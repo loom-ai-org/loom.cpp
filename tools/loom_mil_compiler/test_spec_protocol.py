@@ -180,7 +180,7 @@ class TestAxis(unittest.TestCase):
             check_links(self.Phase("n_token"))
         msg = str(cm.exception)
         self.assertIn("root_axis = 'n_token'", msg)
-        self.assertIn("['batch', 'n_codes', 'n_enc_frames', 'n_latent', 'n_samples', 'n_tokens']", msg)
+        self.assertIn("['batch', 'n_codes', 'n_enc_frames', 'n_kv', 'n_latent', 'n_samples', 'n_tokens']", msg)
 
     def test_rejects_an_unknown_symbol_inside_a_declared_expression(self):
         with self.assertRaises(LinkError) as cm:
