@@ -15,8 +15,8 @@ from .driver_ir import Function as IRFunction
 from .driver_builder import DriverContext, DriverScript
 from .driver_components import (
     CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
-    POSITION_INPUT_NAMES, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain, ModularChainBuilder,
-    MonolithicCall, PrefillArgmaxBuilder,
+    POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
+    MonolithicCall,
 )
 from .passes import apply_loom_mil_passes
 from .shape_expr import (
@@ -1267,7 +1267,9 @@ class LoomGGUFExporter:
         )
         input_names = tuple(name for name, _ in bindings)
 
-        self.driver_script = PrefillArgmaxBuilder(
+        # Through `SYNTHESIZED_BUILDERS` rather than by naming the class, so the table P4.0.7's
+        # catalogue attributes components to models with is the one the exporter really builds from.
+        self.driver_script = SYNTHESIZED_BUILDERS["Flattened"](
             inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
@@ -1402,7 +1404,7 @@ class LoomGGUFExporter:
 
         # 7. Same argmax epilogue the monolithic path uses -- two of this builder's three components
         # are shared with it, which is the smallest real instance of P4.0.7's reuse claim.
-        self.driver_script = ModularChainBuilder(
+        self.driver_script = SYNTHESIZED_BUILDERS["Modular"](
             inputs=DriverInputs(bindings=tuple(bindings), n_tokens=n_tokens_expr),
             chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens_expr),
             epilogue=ArgmaxEpilogue(out_var=chain_var, shape_var="_modular_final_shape",

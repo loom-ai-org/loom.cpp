@@ -331,6 +331,18 @@ class ModularChainBuilder(DriverBuilder):
         return [self.inputs, self.chain, self.epilogue]
 
 
+# Which builder each decomposition's *synthesized* driver path uses, by decomposition class name.
+# `LoomGGUFExporter.apply_monolithic_export`/`apply_modular_export` construct through this table rather
+# than naming the classes directly, so P4.0.7's catalogue can attribute components to models -- "which
+# models use `argmax_epilogue`" -- without a second, hand-maintained copy of the mapping to drift from.
+# `MultiPhase` is absent by construction: its builder is selected per family by
+# `MultiPhase.driver_builder`, because a peeled family's component list is the family's own.
+SYNTHESIZED_BUILDERS = {
+    "Flattened": PrefillArgmaxBuilder,
+    "Modular": ModularChainBuilder,
+}
+
+
 # -- adopting a hand-written driver (C.3) ------------------------------------------------------------
 #
 # The five multi-phase TTS families ship a hand-written `.lua` that `render_driver` substitutes
