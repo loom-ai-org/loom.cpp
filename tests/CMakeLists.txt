@@ -1092,6 +1092,14 @@ target_link_libraries(test_e2e_lfm2_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_mil_export COMMAND test_e2e_lfm2_mil_export)
 set_tests_properties(test_e2e_lfm2_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- The KV cache's own claim (KV-CACHE.md 3.4): a fused causal LM's `infer_with_past` generates the
+#     same tokens as calling `infer` N times with a growing prompt. Generic over any fused causal-LM
+#     GGUF -- set LOOM_CAUSAL_LM_KV_GGUF; skips if the file has no such entry. ---
+add_executable(test_e2e_causal_lm_infer_with_past test_e2e_causal_lm_infer_with_past.cpp)
+target_link_libraries(test_e2e_causal_lm_infer_with_past PRIVATE loom::engine)
+add_test(NAME test_e2e_causal_lm_infer_with_past COMMAND test_e2e_causal_lm_infer_with_past)
+set_tests_properties(test_e2e_causal_lm_infer_with_past PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- LSTM export via recurrent.py's build_lstm_cell_topologies + LoomLuaBridge::l_run_recurrent
 #     (EXPORT-IMPROVEMENT-BACKLOG.md item 4), verified against a real bidirectional torch.nn.LSTM ---
 add_executable(test_e2e_lstm_recurrent test_e2e_lstm_recurrent.cpp)
