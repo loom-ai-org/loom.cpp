@@ -13,6 +13,7 @@
 #include "test_util.h"
 
 #include "loom/loom.h"
+#include "loom/loom_legacy.h" // the pre-MIL C++ driver this test uses as its oracle
 
 #include <ggml-cpu.h>
 
