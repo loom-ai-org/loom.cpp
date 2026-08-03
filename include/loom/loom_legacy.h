@@ -16,11 +16,18 @@
 //
 // RETIREMENT POLICY (BACKEND.md's R6 rule, extended to these by P4.0.8). A driver may be deleted only
 // in the commit that re-points the last test consuming it. The non-obvious precondition is numerical:
-// several of these drivers are the ground truth their model's MIL/Lua test compares against, so the
-// Lua test must first carry its own reference fixture. That is the real cost, and the actual reason
-// all six were still alive when this header was written.
+// several of these drivers were the ground truth their model's MIL/Lua test compares against, so the
+// Lua test had to first carry its own reference fixture. That was the real cost, and the actual reason
+// all six were alive when this header was written.
+//
+// STATUS. Five are retired -- VitsDriver, MatchaDriver, SupertonicDriver, KokoroDriver and
+// StyleTTS2Driver went in stage E, each in the commit that re-pointed its last consumer onto
+// tests/fixtures/legacy_driver_reference/.
+//
+// WhisperDriver is the one that remains, and NOT because it is harder: it has no MIL export to replace
+// it. Whisper is P4.1's from-scratch family config, so this file empties out there, not here. Until
+// then WhisperDriver is still a real implementation of a real model, not dead code.
 //
 // Nothing new should be added here. This file only shrinks.
 
 #include "loom/core/whisper_driver.h"
-#include "loom/core/styletts2_driver.h"

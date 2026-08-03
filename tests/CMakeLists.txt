@@ -772,16 +772,6 @@ target_link_libraries(test_e2e_styletts2_diffusion_sampler PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_diffusion_sampler COMMAND test_e2e_styletts2_diffusion_sampler)
 set_tests_properties(test_e2e_styletts2_diffusion_sampler PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- End-to-end check: loom::StyleTTS2Driver's full synthesize() call (CustomAlbert -> style-diffusion
-#     sampler -> bert_encoder -> DurationEncoder -> duration prediction/frame-expansion -> F0Ntrain ->
-#     Decoder core -> SineGen -> forward STFT -> Generator core) against the real
-#     yl4579/StyleTTS2-LJSpeech checkpoint -- finite/non-trivial output, same scope as
-#     test_e2e_kokoro_driver.cpp. Skips cleanly if LOOM_STYLETTS2_DIR isn't set. ---
-add_executable(test_e2e_styletts2_driver test_e2e_styletts2_driver.cpp)
-target_link_libraries(test_e2e_styletts2_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_styletts2_driver COMMAND test_e2e_styletts2_driver)
-set_tests_properties(test_e2e_styletts2_driver PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- MIL-traced StyleTTS2 export (export_styletts2_mil.py, styletts2_mil.gguf) numerical checks: "albert"
 #     (CustomAlbert alone) against tools/convert_kokoro's own already-verified albert_forward run against
 #     StyleTTS2's own checkpoint weights; "decoder_vocoder" against a direct reuse of export_kokoro_mil
