@@ -752,6 +752,60 @@ class fuse_loom_attention(AbstractGraphPass):
             return y, x
         return None
 
+    @staticmethod
+    def _pre_gqa_repeat(var):
+        """The un-repeated tensor behind `fuse_gqa_repeat_kv`'s `reshape -> tile -> reshape` triple, or
+        None if `var` is not the output of one.
+
+        Matched structurally rather than by the `_gqa_unsqueeze`/`_gqa_repeat` names that pass gives its
+        ops: a name is a debugging aid, and keying on one would make this silently stop working the day
+        those strings change.
+        """
+        reshape_out = var.op
+        if reshape_out is None or reshape_out.op_type != "reshape":
+            return None
+        tile_var = reshape_out.inputs.get("x")
+        if tile_var is None or tile_var.op is None or tile_var.op.op_type != "tile":
+            return None
+        reps = tile_var.op.inputs.get("reps")
+        if reps is None or reps.val is None:
+            return None
+        # repeat_kv() only ever grows ONE axis (the KV-head one); anything else is a different tile.
+        if sum(1 for r in np.array(reps.val).ravel() if int(r) != 1) != 1:
+            return None
+        inner = tile_var.op.inputs.get("x")
+        if inner is None or inner.op is None or inner.op.op_type != "reshape":
+            return None
+        src = inner.op.inputs.get("x")
+        if src is None or src.shape is None or len(src.shape) != 4:
+            return None
+        return src
+
+    def _strip_gqa_repeat(self, k_var, v_var, q_var):
+        """`(k, v)` with HF's `repeat_kv()` expansion undone when it is safe to do so, else unchanged.
+
+        `op_attention` reads `n_head_kv` straight off K's own shape and lets `ggml_mul_mat`'s broadcast
+        map query head `i` to KV head `i // ratio` -- integer division, i.e. exactly the interleaved
+        correspondence `repeat_kv()` materializes (see `fuse_gqa_repeat_kv`'s docstring on why that is
+        interleaved and not block-tiled). So attending against the un-repeated K/V is the same
+        arithmetic, and it HALVES Qwen3-0.6B's cache: 16 stored heads become the 8 the checkpoint
+        actually has.
+
+        Correctness never depends on this. Keeping the repeat is numerically identical, merely wasteful,
+        which is why every guard below bails to "leave it alone" rather than raising -- and why K and V
+        are stripped only TOGETHER and only to the same head count. Stripping one and not the other
+        would leave the cache's K and V widths disagreeing, which no later check would catch.
+        """
+        k_src, v_src = self._pre_gqa_repeat(k_var), self._pre_gqa_repeat(v_var)
+        if k_src is None or v_src is None:
+            return k_var, v_var
+        n_head, n_head_kv = q_var.shape[1], k_src.shape[1]
+        if not isinstance(n_head, int) or not isinstance(n_head_kv, int):
+            return k_var, v_var
+        if n_head_kv != v_src.shape[1] or n_head_kv <= 0 or n_head % n_head_kv != 0:
+            return k_var, v_var
+        return k_src, v_src
+
     def _try_to_transform(self, softmax_op, block) -> bool:
         axis = softmax_op.inputs.get("axis")
         if axis is None or axis.val is None or int(axis.val) not in (-1, 3):
@@ -824,6 +878,10 @@ class fuse_loom_attention(AbstractGraphPass):
         out_var = reshape_op.outputs[0]
         if out_var.shape is None or len(out_var.shape) != 3:
             return False
+
+        # Undo HF's repeat_kv() where it is safe, so the cache stores the checkpoint's real KV heads
+        # rather than the expanded ones (KV-CACHE.md 2.3). Purely a size win; see _strip_gqa_repeat.
+        k_var, v_var = self._strip_gqa_repeat(k_var, v_var, q_var)
 
         # Every rank check the op's own type_inference would make, made here first -- a pass that raises
         # from inside mb.loom_fused_attention leaves the block half-rewritten, whereas bailing here

@@ -398,6 +398,69 @@ class TestFuseLoomAttention(unittest.TestCase):
         self.assertEqual(_ops(prog), ["softmax"])
 
 
+class TestFuseLoomAttentionStripsGqaRepeat(unittest.TestCase):
+    """KV-CACHE.md 2.3. `op_attention` reads n_head_kv off K's own shape and lets ggml_mul_mat's
+    broadcast map query head i to KV head i // ratio -- the same interleaved correspondence repeat_kv()
+    materializes -- so attending against the UN-repeated K/V is identical arithmetic on half the cache.
+    Correctness never depends on the strip, which is why every guard bails to "leave it alone"."""
+
+    N_HEAD, N_KV, HEAD_DIM, SEQ = 4, 2, 8, 6
+
+    def _prog(self, expand_v=True):
+        n_head, n_kv, head_dim, seq = self.N_HEAD, self.N_KV, self.HEAD_DIM, self.SEQ
+        ratio = n_head // n_kv
+        v_heads = n_kv if expand_v else n_head
+
+        @mb.program(input_specs=[
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_kv, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, v_heads, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, 1, seq, seq), dtype=types.fp32),
+        ])
+        def prog(q, k_kv, v_in, mask):
+            def expand(x):
+                # Exactly what fuse_gqa_repeat_kv leaves behind: reshape -> tile -> reshape.
+                r1 = mb.reshape(x=x, shape=[n_kv, 1, seq, head_dim])
+                rep = mb.tile(x=r1, reps=[1, ratio, 1, 1])
+                return mb.reshape(x=rep, shape=[1, n_head, seq, head_dim])
+            k = expand(k_kv)
+            v = expand(v_in) if expand_v else v_in
+            qs = mb.mul(x=q, y=np.float32(0.35355338))
+            scores = mb.matmul(x=qs, y=k, transpose_x=False, transpose_y=True)
+            scores = mb.add(x=scores, y=mask)
+            probs = mb.softmax(x=scores, axis=-1)
+            ctx = mb.matmul(x=probs, y=v, transpose_x=False, transpose_y=False)
+            ctx = mb.transpose(x=ctx, perm=[0, 2, 1, 3])
+            return mb.reshape(x=ctx, shape=[1, seq, n_head * head_dim])
+
+        return prog
+
+    def test_k_and_v_come_from_before_the_repeat(self):
+        prog = self._prog()
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        fused = [op for op in prog.functions["main"].operations
+                 if op.op_type == "loom_fused_attention"]
+        self.assertEqual(len(fused), 1)
+        # The stored heads are the checkpoint's own, not the expanded ones -- half the cache.
+        self.assertEqual(fused[0].k.shape[1], self.N_KV)
+        self.assertEqual(fused[0].v.shape[1], self.N_KV)
+        self.assertEqual(fused[0].q.shape[1], self.N_HEAD)
+
+    def test_k_is_not_stripped_alone_when_v_has_no_expansion(self):
+        # The rule that matters most here: stripping one and not the other would leave the cache's K and
+        # V widths disagreeing, and nothing downstream would catch it. Fusion still happens; the strip
+        # declines, and both stay expanded.
+        prog = self._prog(expand_v=False)
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        fused = [op for op in prog.functions["main"].operations
+                 if op.op_type == "loom_fused_attention"]
+        self.assertEqual(len(fused), 1)
+        self.assertEqual(fused[0].k.shape[1], self.N_HEAD)
+        self.assertEqual(fused[0].v.shape[1], self.N_HEAD)
+
+
 class TestAttentionFusionIsOptIn(unittest.TestCase):
     """Decision 4, and it is a correctness requirement rather than caution: the pattern is generic SDPA,
     so it matches the non-autoregressive TTS families' self-attention too -- and an ATTENTION node's
