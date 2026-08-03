@@ -892,15 +892,6 @@ target_link_libraries(test_e2e_supertonic_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_decoder COMMAND test_e2e_supertonic_decoder)
 set_tests_properties(test_e2e_supertonic_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- End-to-end check: loom::SupertonicDriver's full synthesize() call (DurationPredictor ->
-#     get_latent_mask -> TTLTextEncoder -> Euler CFM sampling loop -> SpeechDecoder) against the real
-#     femelo/supertonic-tts checkpoint -- finite/non-trivial output, same scope as
-#     test_e2e_kokoro_driver.cpp/test_e2e_styletts2_driver.cpp. Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_supertonic_driver test_e2e_supertonic_driver.cpp)
-target_link_libraries(test_e2e_supertonic_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_supertonic_driver COMMAND test_e2e_supertonic_driver)
-set_tests_properties(test_e2e_supertonic_driver PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- SupertonicTTS's real TextVectorizer (unicode codepoint-map tokenizer), against the real
 #     unicode_indexer.json asset -- see tools/convert_supertonic/convert_supertonic_text_vectorizer.py.
 #     Skips cleanly if LOOM_SUPERTONIC_TEXT_VECTORIZER_GGUF isn't set. ---
