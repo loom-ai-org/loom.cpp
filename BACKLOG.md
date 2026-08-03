@@ -84,6 +84,49 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 > `tools/debug/compare_logits.cpp` is the harness that found it: it drives `GraphBuilder` directly,
 > because the driver's `infer` entry returns an argmax — the resolution at which this bug is invisible.
 
+> ### 🟡 OPEN: who still depends on the layout-"healing" heuristics?
+>
+> Follow-up to the fixed bug above, and the reason it is not fully closed. The guards added in `6c170a1`
+> make the size-guessing *unreachable for graphs that are already correct* — they do not remove the
+> guessing. Any graph that genuinely fails the compatibility check still gets a layout inferred from
+> ambiguous sizes, and **nobody currently knows which models that is**. The heuristics were added
+> empirically, one model at a time, and `op_add`'s own NOTE records the principle they violate: *the real
+> fix belongs at the exporter, which knows the true layout instead of guessing from ambiguous shapes.*
+>
+> **Remaining surface** (`src/ops/primitives_basic.cpp`):
+>
+> | site | state |
+> |---|---|
+> | `op_mul_mat` (2 branches) | guarded by `can_mul_mat` |
+> | `op_add` (2 branches) | guarded by `ggml_can_repeat` |
+> | `op_mul` (3 branches) | guarded by `ggml_can_repeat` |
+> | `op_repeat` (2 branches) | **UNGUARDED** |
+>
+> `op_repeat`'s second branch is the same bug, still live:
+>
+> ```cpp
+> if (a->ne[0] == ne[1] && a->ne[1] == ne[0]) {   // fires on ANY square target, correct or not
+>     a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
+> }
+> ```
+>
+> It transposes an already-correct tensor whenever the repeat target happens to be square in its first
+> two dims — exactly the `n_tokens == n_head` shape of the fixed bug, in a primitive no causal LM
+> exercises heavily. It was left alone in `6c170a1` because the fix there was verified against causal
+> LMs, and `op_repeat`'s documented consumer is StyleTTS2's diffusion `Transformer1d` (broadcasting a
+> style vector `[channels]` to `[channels, T]`) — a path with no elementwise numeric gate to catch a
+> regression. Guarding it needs its own verification, not a copy-paste.
+>
+> **The work, in order.** (1) Instrument each branch with a counter naming the op and the shapes, run all
+> 11 models, and record which branches fire for which model — that converts "some model probably needs
+> these" into a list. (2) For each real firing, fix the layout at the *exporter* so the operands arrive
+> correct. (3) Delete the branch. A branch that fires for nothing can be deleted immediately, which is
+> the cheap half and may well be most of them.
+>
+> **Why this matters beyond tidiness:** every one of these is a silent-wrong-answer generator with no
+> error path, and the fixed bug shows the failure is invisible to argmax-level tests. Until step 1 is
+> done, the honest statement about any of them is "we do not know whether it is load-bearing."
+
 > **Read [`BACKEND.md`](BACKEND.md) first if you are touching the exporter.** It is the working record of
 > the `EXPORT-IMPROVEMENT.md` thread (commits `42fc5d5`, `ebafa4e`, `640e49f` on `export-improvement`) and
 > describes the shape the exporter now has, which is materially different from what older entries in this
