@@ -40,6 +40,32 @@ N_LATENT = symbol("n_latent")
 """A style/latent vector's own length -- StyleTTS2's diffusion sampler, which derives nothing from any
 other axis (EXPORT-ROADMAP.md's R1 table: "what other axes get derived from it: --")."""
 
+N_KV = symbol("n_kv")
+"""The KV-cache extent a cached attention step attends over -- `n_past + n_tokens` (KV-CACHE.md stage 3).
+
+**The one axis here that never comes from a `ct.RangeDim`, and that is a property of the trace rather
+than an omission.** With no cache in the traced graph, HF computes scores of shape `[1, h, s, s]`, and
+declaring a second independent range dim for the mask's last axis fails coremltools' own type inference
+at conversion time -- two independent `RangeDim`s over one attention block cannot be traced at all
+(KV-CACHE.md §2). So this axis arrives on the ONE input that needs it, the fused causal mask, by being
+declared at export time after `fuse_loom_attention` has made it sound: post-fusion the mask var's only
+consumers are `ATTENTION` nodes, so no other node's shape derives from it (see `_retype_fused_mask_input`,
+which checks that property rather than assuming it).
+
+The engine already knows the name: `GraphBuilder` derives `n_kv = n_tokens + n_past` when a driver's axis
+table does not bind it (`graph_builder.cpp:129`), which is exactly how the bespoke converters' hand-written
+`{"name": "kq_mask", "shape": ["n_kv", "n_tokens"]}` has always resolved (`convert_qwen3.py:65`).
+
+Consequences worth stating because they are easy to misread as bugs:
+
+* `_validate_input_axes` never sees this axis. It reads the *traced* program's input symbols, and the
+  retyping happens after the trace, on the emitted topology -- so a fused causal LM still has exactly one
+  traced dynamic symbol and passes that check trivially. The check is not weakened; the case simply does
+  not reach it.
+* It is equally not declarable through `declared_axes`, because the mask shares its traced symbol with
+  `tokens`/`cache_position` by design, and an override keyed on that symbol would rewrite all three.
+  `_resolve_declared_axes` raises on exactly that rather than silently doing it."""
+
 N_CODES = symbol("n_codes")
 """Neural audio codec token count -- not used by any model exported as of this roadmap phase (family
 11 in EXPORT-ROADMAP.md's R5 table is still unimplemented). Declared here so a future codec-decoder
@@ -52,4 +78,4 @@ matching fallback). Declared here for completeness/documentation only: no export
 is ever actually dynamic, so nothing renders this symbol today.
 """
 
-__all__ = ["N_TOKENS", "N_SAMPLES", "N_ENC_FRAMES", "N_LATENT", "N_CODES", "BATCH"]
+__all__ = ["N_TOKENS", "N_SAMPLES", "N_ENC_FRAMES", "N_LATENT", "N_KV", "N_CODES", "BATCH"]
