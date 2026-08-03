@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loom_mil_compiler.driver_builder import (
-    DriverBuilder, DriverComponent, DriverContext, DriverScript,
+    DriverBuilder, DriverComponent, DriverContext, DriverEntry, DriverScript,
 )
 from loom_mil_compiler.driver_ir import (
     DriverIRError, Lit, Local, Return, SubgraphCall, Var,
@@ -110,12 +110,16 @@ class SymbolReadingComponent(DriverComponent):
 
 
 class _Builder(DriverBuilder):
-    def __init__(self, components, entry_name="infer"):
+    def __init__(self, components, entry_name="infer", extra=None):
         self._components = list(components)
         self.entry_name = entry_name
+        self._extra = list(extra or [])
 
     def components(self):
         return self._components
+
+    def extra_entries(self):
+        return self._extra
 
 
 # -- the tests ---------------------------------------------------------------------------------------
@@ -154,6 +158,58 @@ class TestAssembly(unittest.TestCase):
         builder = _Builder([RecordingComponent("a")], entry_name="infer_with_past")
         self.assertEqual(builder.build(_ctx()).entry.name, "infer_with_past")
         self.assertEqual(builder.build(_ctx()).entry.params, ["inputs"])
+
+
+class TestExtraEntries(unittest.TestCase):
+    """A second entry function beside `entry_name` (KV-CACHE.md 3.3). The properties worth pinning are
+    the ones a plausible implementation gets wrong by treating extra entries as a bolt-on: their
+    components must go through the SAME checks, and the main entry's own text must not move."""
+
+    def test_an_extra_entry_renders_after_the_main_one(self):
+        script = _Builder([RecordingComponent("a")],
+                          extra=[DriverEntry("infer_with_past", ("inputs",),
+                                             [RecordingComponent("b")])]).build(_ctx())
+        self.assertEqual([fn.name for fn in script.functions()], ["infer", "infer_with_past"])
+        self.assertEqual(script.render(),
+                         "-- prelude of a\n-- prelude of b\n"
+                         "function infer(inputs)\n    local a = 1\nend\n"
+                         "\nfunction infer_with_past(inputs)\n    local b = 1\nend")
+
+    def test_no_extra_entries_renders_exactly_as_before(self):
+        """The byte-identity property every other model depends on: a builder that returns no extra
+        entries must produce the same text it did before this existed."""
+        self.assertEqual(_Builder([RecordingComponent("a")]).render(_ctx()),
+                         "-- prelude of a\nfunction infer(inputs)\n    local a = 1\nend")
+
+    def test_an_extra_entrys_links_are_checked(self):
+        """Not a second, weaker pipeline: a component in an extra entry names a topology the export did
+        not produce, and it fails with that link's own message just as the main entry's would."""
+        with self.assertRaises(LinkError) as raised:
+            _Builder([RecordingComponent("a")],
+                     extra=[DriverEntry("infer_with_past", ("inputs",),
+                                        [CallComponent("decodr")])]).build(_ctx())
+        self.assertIn("decodr", str(raised.exception))
+
+    def test_an_extra_entry_is_validated_on_its_own(self):
+        """`validate` runs per function, not over a concatenation: a symbol the MAIN entry bound is not
+        in scope in a second top-level function, and reading it there must fail rather than pass
+        because some earlier statement in another function happened to define the name."""
+        class _ReadsA(DriverComponent):
+            def emit(self, ctx):
+                return [Return([Var("a")])]
+
+        with self.assertRaises(DriverIRError) as raised:
+            _Builder([RecordingComponent("a")],
+                     extra=[DriverEntry("infer_with_past", ("inputs",), [_ReadsA()])]).build(_ctx())
+        self.assertIn("'a'", str(raised.exception))
+        self.assertIn("infer_with_past", str(raised.exception))
+
+    def test_an_extra_entrys_subgraph_calls_are_cross_checked(self):
+        with self.assertRaises(DriverIRError) as raised:
+            _Builder([RecordingComponent("a")],
+                     extra=[DriverEntry("infer_with_past", ("inputs",),
+                                        [CallComponent("encoder", inputs=("nope",))])]).build(_ctx())
+        self.assertIn("nope", str(raised.exception))
 
 
 class TestLinksRunBeforeEmit(unittest.TestCase):

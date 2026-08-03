@@ -21,7 +21,8 @@ from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
     FlowMatchingSampler, LuaFragment, ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder,
-    PrefillArgmaxBuilder, RawLuaDriver, SubgraphCallComponent, caller_input, parse_run_subgraph_calls,
+    PrefillArgmaxBuilder, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent, caller_input,
+    parse_run_subgraph_calls,
 )
 from loom_mil_compiler.driver_ir import (
     BinOp, DriverIRError, Len, Lit, LuaCodegen, SubgraphCall, Var,
@@ -92,6 +93,96 @@ class TestPrefillArgmaxBuilder(unittest.TestCase):
         n_tokens = BinOp("floordiv", Len("audio_signal"), Lit(80))
         text = self._builder((("audio_signal", CALLER),), ("audio_signal",), n_tokens).render(ctx)
         self.assertIn("{n_samples = math.floor(#audio_signal / 80), n_past = 0}", text)
+
+
+class TestPrefillDecodeLoop(unittest.TestCase):
+    """`infer_with_past` (KV-CACHE.md 3.3). The properties that matter are the ones a decode loop gets
+    wrong by copying the prefill: the axis table has to carry a real `n_past`, the mask and positions
+    have to be rebuilt per iteration at that offset, and the step's tokens have to become the single
+    token just produced."""
+
+    def _ctx(self):
+        return DriverContext(
+            topologies={"main_topology": _topo(["tokens", "cache_position", "attention_mask"])},
+            axes={"main_topology": "n_tokens"})
+
+    def _builder(self, decode=True):
+        bindings = (("tokens", CALLER), ("cache_position", POSITION), ("attention_mask", MASK))
+        names = tuple(n for n, _ in bindings)
+        return PrefillArgmaxBuilder(
+            inputs=DriverInputs(bindings=bindings, n_tokens=Len("tokens")),
+            call=MonolithicCall(topology="main_topology", inputs=names, n_tokens=Len("tokens")),
+            epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
+                                    n_tokens=Len("tokens")),
+            decode=PrefillDecodeLoop(topology="main_topology", bindings=bindings,
+                                     inputs=names) if decode else None,
+        )
+
+    def test_the_loop_is_a_second_entry_beside_infer(self):
+        script = self._builder().build(self._ctx())
+        self.assertEqual([fn.name for fn in script.functions()], ["infer", "infer_with_past"])
+
+    def test_infer_is_byte_identical_with_and_without_the_loop(self):
+        """The decode loop adds a function; it must not touch the prefill one. This is the property
+        that keeps `infer`'s own behaviour -- and every existing test of it -- unchanged."""
+        ctx = self._ctx()
+        with_loop = LuaCodegen().emit_function(self._builder().build(ctx).entry)
+        without = LuaCodegen().emit_function(self._builder(decode=False).build(ctx).entry)
+        self.assertEqual(with_loop, without)
+
+    def test_the_loop_body(self):
+        script = self._builder().build(self._ctx())
+        text = "\n".join(LuaCodegen().emit_function(script.extra_entries[0]))
+        self.assertEqual(text, "\n".join([
+            "function infer_with_past(inputs)",
+            "    local _gen = {}",
+            "    local _step_tokens = inputs.tokens",
+            "    local _n_past = 0",
+            "    local _n_tokens = #_step_tokens",
+            "    local _max_new_tokens = (inputs.max_new_tokens or 16)",
+            "    local _eos_token = (inputs.eos_token or -1)",
+            "    while true do",
+            "        local _dec_out, _dec_shape = loom.run_subgraph('main_topology', "
+            "{n_tokens = _n_tokens, n_past = _n_past}, {tokens = _step_tokens, "
+            "cache_position = loom.range(_n_past, _n_tokens), "
+            "attention_mask = loom.causal_mask(_n_tokens, _n_past)})",
+            "        local _next_token = loom.argmax_row(_dec_out, _dec_shape[1], (_n_tokens - 1))",
+            "        table.insert(_gen, _next_token)",
+            "        _n_past = (_n_past + _n_tokens)",
+            "        if (#_gen >= _max_new_tokens) then",
+            "            break",
+            "        end",
+            "        if (_next_token == _eos_token) then",
+            "            break",
+            "        end",
+            "        _step_tokens = {_next_token}",
+            "        _n_tokens = 1",
+            "    end",
+            "    return _gen",
+            "end",
+        ]))
+
+    def test_the_root_axis_is_the_topology_s_own(self):
+        ctx = DriverContext(topologies={"main_topology": _topo(["audio_signal"])},
+                            axes={"main_topology": "n_samples"})
+        builder = PrefillArgmaxBuilder(
+            inputs=DriverInputs(bindings=(("audio_signal", CALLER),), n_tokens=Len("audio_signal")),
+            call=MonolithicCall(topology="main_topology", inputs=("audio_signal",),
+                                n_tokens=Len("audio_signal")),
+            epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
+                                    n_tokens=Len("audio_signal")),
+            decode=PrefillDecodeLoop(topology="main_topology",
+                                     bindings=(("audio_signal", CALLER),), inputs=("audio_signal",)),
+        )
+        text = "\n".join(LuaCodegen().emit_function(builder.build(ctx).extra_entries[0]))
+        self.assertIn("{n_samples = _n_tokens, n_past = _n_past}", text)
+
+    def test_a_topology_it_does_not_name_fails_the_link(self):
+        builder = self._builder()
+        builder.decode = dataclasses.replace(builder.decode, topology="decodr")
+        with self.assertRaises(LinkError) as raised:
+            builder.build(self._ctx())
+        self.assertIn("decodr", str(raised.exception))
 
 
 class TestModularChainBuilder(unittest.TestCase):

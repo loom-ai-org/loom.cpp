@@ -146,6 +146,28 @@ class Call(Expr):
 
 
 @dataclasses.dataclass
+class ArrayLit(Expr):
+    """`{a, b, c}` -- a Lua array constructor.
+
+    `TableLit`'s sibling, and separate from it because Lua's `{k = v}` and `{v}` are different
+    constructors, not two spellings of one. Written as a node rather than through `RawExpr` for the
+    reason `RawExpr` states about itself: it reports no reads, so a symbol referenced inside one is
+    invisible to `validate()` -- and the first use of this (the decode loop's `{next_token}`) is
+    precisely a symbol bound by an earlier statement in the same block.
+    """
+    items: list  # list[Expr]
+
+    def reads(self) -> list[str]:
+        out: list[str] = []
+        for v in self.items:
+            out.extend(v.reads())
+        return out
+
+    def render(self) -> str:
+        return "{" + ", ".join(v.render() for v in self.items) + "}"
+
+
+@dataclasses.dataclass
 class TableLit(Expr):
     items: dict  # str -> Expr
 
@@ -250,6 +272,20 @@ class Argmax(Stmt):
 
     def reads(self) -> list[str]:
         return [self.tensor] + self.n_vocab.reads() + self.row.reads()
+
+
+@dataclasses.dataclass
+class CallStmt(Stmt):
+    """A call evaluated for its effect, its result discarded -- `table.insert(generated, next_token)`.
+
+    Every other statement here binds something. This one exists because Lua's own array append is a
+    call, and spelling it as `Assign` to an index would need an index-assignment node whose only user
+    would be the same append.
+    """
+    call: Expr
+
+    def reads(self) -> list[str]:
+        return self.call.reads()
 
 
 @dataclasses.dataclass
@@ -454,6 +490,8 @@ class LuaCodegen:
         if isinstance(stmt, Argmax):
             call = Call("loom.argmax_row", [Var(stmt.tensor), stmt.n_vocab, stmt.row])
             return [f"{pad}local {stmt.result} = {call.render()}"]
+        if isinstance(stmt, CallStmt):
+            return [f"{pad}{stmt.call.render()}"]
         if isinstance(stmt, Return):
             return [f"{pad}return {', '.join(e.render() for e in stmt.exprs)}"]
         if isinstance(stmt, If):

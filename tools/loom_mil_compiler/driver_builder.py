@@ -50,7 +50,7 @@ from typing import Dict, List, Optional
 
 from .driver_ir import Function as IRFunction
 from .driver_ir import LuaCodegen, Stmt, check_subgraph_calls, validate
-from .spec_protocol import LinkChecker, declared_links
+from .spec_protocol import LinkChecker, NestedSpec, Unchecked, declared_links
 
 
 @dataclasses.dataclass
@@ -135,6 +135,43 @@ class DriverComponent:
 
 
 @dataclasses.dataclass
+class DriverEntry:
+    """One entry function beside the builder's own `entry_name`.
+
+    A driver is a Lua module and a host resolves entries as globals, so exposing a second way in is
+    adding a function, not changing one. `infer` keeps its exact behaviour -- one prefill, argmax the
+    last row, one token -- and `infer_with_past` (KV-CACHE.md 3.3) is the generation loop beside it,
+    because a model that can do both should not make the caller pick at export time.
+
+    Its components go through the same `LinkChecker`, the same `validate()` and the same
+    `check_subgraph_calls()` as the main entry's. The entry it belongs to is a property of where the
+    statements land, not of how much they are trusted.
+    """
+
+    name: str
+    params: tuple
+    components: List["DriverComponent"]
+
+    __links__ = {
+        "components": NestedSpec(
+            where="DriverBuilder.build, which registers every entry's components with the export's "
+                  "checker alongside the main entry's -- one ledger, one finish(), no second pipeline"
+        ),
+    }
+    __unchecked__ = {
+        "name": Unchecked(
+            "the global a host resolves this entry as. There is no second authority to check it "
+            "against: the driver script IS the declaration, and `entry_name` (the one every host may "
+            "assume) is the builder's, not this record's."
+        ),
+        "params": Unchecked(
+            "the entry's Lua parameter list. Whether the body reads a name it was not given is "
+            "driver_ir.validate's question, and it runs over the assembled function."
+        ),
+    }
+
+
+@dataclasses.dataclass
 class DriverScript:
     """A built driver: top-level lines, the entry function, then any top-level lines after it.
 
@@ -155,11 +192,24 @@ class DriverScript:
     prelude: List[str]
     entry: IRFunction
     postlude: List[str] = dataclasses.field(default_factory=list)
+    # Additional top-level entry functions, emitted after `entry` (KV-CACHE.md 3.3).
+    extra_entries: List[IRFunction] = dataclasses.field(default_factory=list)
 
     def render(self) -> str:
-        return "\n".join(
-            list(self.prelude) + LuaCodegen().emit_function(self.entry) + list(self.postlude)
-        )
+        lines = list(self.prelude) + LuaCodegen().emit_function(self.entry)
+        for fn in self.extra_entries:
+            # The ONE separator this script imposes rather than leaving to a component, and the reason
+            # is that an entry function is the module's own structure rather than any component's
+            # contribution: two top-level `function`/`end` pairs with no blank line between them are
+            # valid Lua and unreadable, and the embedded driver_script is something people read out of
+            # the GGUF. Nothing that existed before this had extra entries, so no gate moves.
+            lines.append("")
+            lines.extend(LuaCodegen().emit_function(fn))
+        return "\n".join(lines + list(self.postlude))
+
+    def functions(self) -> List[IRFunction]:
+        """Every entry, main first -- what a check that must run over the whole driver iterates."""
+        return [self.entry] + list(self.extra_entries)
 
 
 class DriverBuilder:
@@ -178,6 +228,16 @@ class DriverBuilder:
 
     def components(self) -> List[DriverComponent]:
         raise NotImplementedError
+
+    def extra_entries(self) -> List[DriverEntry]:
+        """Entry functions beside `entry_name`, each with its own component list.
+
+        Empty for every builder but the fused causal LM's, which exposes `infer_with_past` next to
+        `infer` (KV-CACHE.md 3.3). A builder that returns entries here does not get a second, weaker
+        pipeline: every component below is registered with the same checker and every function is
+        validated and cross-checked against the topologies exactly as the main entry is.
+        """
+        return []
 
     def build(self, ctx: DriverContext, checker: Optional[LinkChecker] = None) -> DriverScript:
         """Check every component's links, emit, then run the driver IR's own two checks over the result.
@@ -201,7 +261,8 @@ class DriverBuilder:
         checker = checker if checker is not None else LinkChecker()
 
         components = list(self.components())
-        for component in components:
+        extra = list(self.extra_entries())
+        for component in components + [c for entry in extra for c in entry.components]:
             checker.check(component)
             for sub in component.sub_specs():
                 checker.check(sub)
@@ -212,31 +273,39 @@ class DriverBuilder:
         from .component_registry import PRELUDE, POSTLUDE, STATEMENTS, check_emission
 
         prelude: List[str] = []
-        body: List[Stmt] = []
         postlude: List[str] = []
-        for component in components:
-            contributions = {
-                PRELUDE: component.prelude(ctx),
-                STATEMENTS: component.emit(ctx),
-                POSTLUDE: component.postlude(ctx),
-            }
-            # P4.0.7/D.1: the component is looked up in the registry as it emits, and what it really
-            # contributed is compared against what its entry claims. A shipped component with no entry
-            # raises here -- a piece of a driver that the catalogue does not account for is exactly the
-            # "inventory, not a shelf" failure the registry exists to prevent.
-            check_emission(component, {slot for slot, value in contributions.items() if value})
-            prelude.extend(contributions[PRELUDE])
-            body.extend(contributions[STATEMENTS])
-            postlude.extend(contributions[POSTLUDE])
 
-        entry = IRFunction(self.entry_name, list(self.entry_params), body)
-        validate(entry)
-        check_subgraph_calls(entry, ctx.topologies)
+        def emit_body(group: List[DriverComponent]) -> List[Stmt]:
+            body: List[Stmt] = []
+            for component in group:
+                contributions = {
+                    PRELUDE: component.prelude(ctx),
+                    STATEMENTS: component.emit(ctx),
+                    POSTLUDE: component.postlude(ctx),
+                }
+                # P4.0.7/D.1: the component is looked up in the registry as it emits, and what it
+                # really contributed is compared against what its entry claims. A shipped component
+                # with no entry raises here -- a piece of a driver that the catalogue does not account
+                # for is exactly the "inventory, not a shelf" failure the registry exists to prevent.
+                check_emission(component, {slot for slot, value in contributions.items() if value})
+                prelude.extend(contributions[PRELUDE])
+                body.extend(contributions[STATEMENTS])
+                postlude.extend(contributions[POSTLUDE])
+            return body
+
+        entry = IRFunction(self.entry_name, list(self.entry_params), emit_body(components))
+        extra_functions = [
+            IRFunction(spec.name, list(spec.params), emit_body(spec.components)) for spec in extra
+        ]
+        for function in [entry] + extra_functions:
+            validate(function)
+            check_subgraph_calls(function, ctx.topologies)
 
         # The whole script, not just the entry function: a driver is a Lua module, and a generated
         # sampler is a top-level `local function` in the prelude, so a `DriverSymbol` link naming one
         # is only answerable against the script.
-        script = DriverScript(prelude=prelude, entry=entry, postlude=postlude)
+        script = DriverScript(prelude=prelude, entry=entry, postlude=postlude,
+                              extra_entries=extra_functions)
         checker.provide(driver=script)
         if owned:
             checker.finish()
