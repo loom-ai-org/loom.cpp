@@ -1186,7 +1186,7 @@ nothing.
   D.1, three in D.2), recorded in their commits and in the catalogue's §4. A sixth check fired unasked
   during the first probe — one class registered under two names — which is `registry()`'s duplicate
   guard.
-- **P4.0.8 — legacy C++ driver retirement policy.** R6's policy covers `tools/convert_*` only; extend it
+- **P4.0.8 — legacy C++ driver retirement policy — DONE (8 commits, stage E).** R6's policy covers `tools/convert_*` only; extend it
   to `src/core/{kokoro,vits,matcha,styletts2,supertonic,whisper}_driver.cpp`, which predate the Lua
   drivers becoming the orchestration device. Same rule — a driver may be deleted only in the commit that
   re-points the last test consuming it — plus **the precondition that is not obvious**: the pre-MIL C++
@@ -1204,6 +1204,50 @@ nothing.
   **Gate:** full `ctest` green with five drivers deleted, and the engine binary size recorded before and
   after — leanness is the stated goal of the architecture, and measuring it is how the goal stops being
   a slogan. *Trails the others; nothing in P4 depends on it.*
+
+  **Done (E.1–E.4, eight commits).** `lua_bridge.h` carries the binding criterion — *a generic
+  host-side tensor op, not model adaptation* — with three tests for the first half and two
+  disqualifiers for the second, and both existing bindings labelled against it with the argument rather
+  than the verdict (E.1). `loom.h` split into the lean runtime surface plus `loom_legacy.h`, whose own
+  negative check came for free: the first build after the split failed with `'KokoroConfig' is not a
+  member of 'loom'`, so the boundary is real (E.2). Five drivers retired, one per commit, after a
+  preparatory commit froze their waveforms into `tests/fixtures/legacy_driver_reference/` (E.3).
+  **Gate passed:** 137/137 ctest, 0 failed, **98 actually run** (58 at the stage D gate — every TTS
+  reference and Lua-driver test was given its model this time). Engine size, RelWithDebInfo stripped,
+  same configuration both sides: **1,400,440 → 1,219,952 bytes, −180,488 (−12.9 %)**; `.text`
+  1,379,658 → 1,198,924 (−13.1 %). ~7k lines of hand-written C++ orchestration gone, replaced by
+  nothing, because the exported Lua driver was already doing the job.
+
+  **Three things this item did not predict**, written up at length under stage E in
+  `EXPORT-PREPARATION.md`:
+  * **the drivers' *data* outlived their code.** All nine surviving tests default-constructed a
+    `VitsConfig`/`MatchaConfig`/… purely to read hyperparameters out of it, so deleting the header
+    removed a data structure and not only an implementation. It landed in `tests/tts_driver_inputs.h`
+    — honest, but not where it belongs; see the follow-up below.
+  * **only two of the seven oracle consumers were MIL tests.** VITS, Kokoro and StyleTTS2's MIL tests
+    deliberately do not compare against the bespoke oracle and say why. The bulk of the fixture work
+    was the five *bespoke-Lua* tests, which this item does not mention.
+  * **a frozen fixture narrows what can be checked, and Supertonic shows where.** Its style vectors are
+    a driver *input*, so one waveform is valid for one voice; a different `voice_styles/*.json` now
+    skips rather than compares against the wrong reference, and no new style can ever get a fixture.
+
+  **Two follow-ups this stage opened, neither in scope for it:**
+  * **the driver-input hyperparameters belong in the GGUF.** `tests/tts_driver_inputs.h` is a test
+    holding `n_feats`, `mel_mean`, `style_dim`, `sigma_data`… — properties of the model, which a
+    self-contained GGUF should declare and a host should read. Exactly the argument KV-CACHE.md 1.1/1.3
+    made for cache geometry, where `test_e2e_whisper_lua_driver.cpp` was sizing a cache from a
+    hardcoded C++ struct. It is export-side work and stage E touches no export path, so it was left
+    here rather than smuggled in.
+  * **three components are now C++ with a unit test and no product consumer:** `cfm_euler_sampler.h`,
+    `style_diffusion_sampler.h`, `bilstm_stepper.h` (and arguably `ode_stepper.h`). Each existed to
+    serve a driver; each has a Lua counterpart the MIL path uses instead — `loom.run_recurrent` +
+    `RecurrentPhase`, the `FlowMatchingSampler` component, StyleTTS2's ADPM2 fragment. They were kept
+    in `loom.h` rather than `loom_legacy.h` because their remaining consumers are tests *of the
+    component*, and deleting them is beyond what this item asks. Whether they follow the drivers is a
+    real decision, not an oversight.
+
+  **Whisper is the one that remains**, and not because it is harder: `whisper_driver.cpp` has no MIL
+  export to replace it. `loom_legacy.h` empties out in P4.1, and its docstring says so.
 - **P4.0.9 — KV cache on the MIL path.** Specified in [`KV-CACHE.md`](KV-CACHE.md); the one item here
   that adds a *capability* rather than hardening one, which is why its gate differs. `EXPORT-PREPARATION
   .md` §4 filed this for P4/P5 and correctly named `FuseLoomAttention` as the blocker — its
