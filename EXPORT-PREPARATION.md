@@ -725,6 +725,37 @@ which is the "trustworthy enough to reuse" requirement §2's standing rule was w
 
 **D.4 — stage gate.** Full 11-model sweep, plus the negative-gate probes from D.1/D.2.
 
+### What stage D found that this plan did not predict
+
+* **`driver_components/` would have cost a check.** The plan writes the registry as a directory; it is a
+  module. Not for churn-avoidance: `test_spec_protocol`'s standing-rule scan walks
+  `pkgutil.iter_modules(package.__path__)` and matches `obj.__module__ == module.__name__`, so a spec
+  class in `driver_components/foo.py` is reached by neither the scan nor its unimportable-module report.
+  The `/` was shorthand for the shelf, and the shelf is the registry plus the checks.
+* **D.2 was two gaps, not one, and the second one no parse could ever have closed.** The item was
+  carried in as "`run_bi_lstm`/`run_resblk_stack`/`run_proj1x1` drive topologies whose names the Lua
+  computes". True, but the call sites are not in the family's fragment at all — they are inside the
+  `loom_lua` function, one level below anything a fragment parser sees. Measured: 2 computed
+  `loom.run_subgraph` sites (which the parser did report, as unresolved) and 16 helper sites (which it
+  could not see), together driving 35 of Kokoro's 39 and 35 of StyleTTS2's 41 topologies. That is the
+  answer to "how much of a peeled driver was actually checked", and it was not the number the C.7/C.8
+  commits implied.
+* **The declaration had to split across two owners**, and that is the reusable shape rather than a
+  detail: the library entry declares what its own body hard-codes (suffixes, input table), the family
+  declares the namespaces, which exist only at run time and only the caller knows. Either half alone is
+  unfalsifiable; together they expand into ordinary `RunSubgraphCall`s and inherit every existing
+  message.
+* **A catalogue can misreport its own subject in two directions, and both showed up in the first
+  rendering.** `declared_links` returned nothing when handed a class — `type(cls)` is its metaclass —
+  so every component read as declaring nothing; and a `NestedSpec` field (`ModularChain.stages`) read
+  as unchecked when it is the field that *holds* the checking. A generated document is not
+  automatically an accurate one; what makes it accurate is that a test compares it against the
+  generator and the generator against the declarations.
+* **Every exported topology in all five peeled families is now named by a checked call site.** Nobody
+  planned that; it fell out of closing D.2 and is worth having measured. It is *reported* rather than
+  enforced, because P4.1's Whisper encoder may legitimately be called by the host rather than by the
+  driver, and turning today's coincidence into a rule would prejudge the next family.
+
 ### Stage E — P4.0.8: legacy retirement (trails; nothing in P4 depends on it)
 
 **E.1 — write the bridge criterion.** Per decision 1: `lua_bridge.h` gains the rule that a binding must

@@ -1036,7 +1036,7 @@ nothing.
   byte-identical, and the driver-text diff read and attached to each commit — which is how the
   Layout A/B slip in one rewritten comment was found, since no test covers a comment. Negative gates on
   both builders and all five families, each failing a real export with the link's own message.
-- **P4.0.7 — the component registry ("marketplace").** Six components exist (`FlowMatchingSpec`,
+- **P4.0.7 — the component registry ("marketplace") — DONE (7 commits).** Six components exist (`FlowMatchingSpec`,
   `EstimatorSpec`, `ModularExportSpec`, the prefill prologue/epilogue, `recurrent.py`'s stepping loop,
   `ExportPhase`) and are assembled four different ways — marker substitution, direct-to-IR, inline, ad
   hoc. That heterogeneity, not any missing capability, is what makes adding a family feel bespoke.
@@ -1045,7 +1045,7 @@ nothing.
   which models use it — as the code, since that is what lets P4.1/P4.3 reuse rather than restate.
   **Gate:** all 11 re-exported byte-identically through registered components.
 
-  **IN PROGRESS — three commits, none of them the registry itself.** The author's review of stage C is
+  **The first three commits were none of them the registry itself.** The author's review of stage C is
   what redirected this item, and the critique was correct on both counts: peeling into `.lua` fragments
   named the blocks but left them heterogeneous, and the export had no business emitting two GGUFs per
   model. Measured before acting: **11 functions totalling 112 lines were shipped byte-identical in
@@ -1115,12 +1115,77 @@ nothing.
   topologies, weights, non-driver KV *and* driver text; Kokoro and StyleTTS2 differ by exactly the
   topologies they gained. 141/141 ctest, 373 pytest.
 
-  **What remains for P4.0.7 proper**, unchanged by the above: D.1's name → component registry, D.3's
-  catalogue, and the half of D.2 that is *registration* rather than wiring. One checking gap is worth
-  carrying into it — `run_bi_lstm`, `run_resblk_stack` and `run_proj1x1` drive topologies whose names the
-  Lua computes (`namespace_ .. "_h_fwd"`), so those call sites still cannot be link-checked. Now that the
-  exporter produces those topologies itself, declaring them as data closes the last unchecked calls in
-  both drivers.
+  **What remained for P4.0.7 proper — DONE (D.1–D.4, four commits).** The registry, the computed-name
+  declarations, and the catalogue. The generalisable lesson from the three commits above held for all
+  three: *a name is not a mechanism*, so nothing below is a table someone maintains — every entry is
+  checked from both sides and every rendered document is generated from the declarations it describes.
+
+  1. **D.1 — `component_registry.py`, the shelf.** Ten components, each with what it emits, and three
+     checks that make the entry load-bearing rather than descriptive: a shipped `DriverComponent`
+     subclass with no entry **fails the export** (`DriverBuilder.build` looks each one up as it emits;
+     `unregistered_component_classes()` asks the same statically, by discovery over the package); an
+     entry whose `emits` is narrower than what the component really contributed fails the export, since
+     the catalogue's emission column is generated from it; and an entry no model uses must carry the
+     reason it is still registered — `raw_lua_driver` is the only one, and it is the adoption step's
+     component, which every TTS family passed through and none is on now.
+
+     `usage()` derives which models use what: the TTS half by building each registered family's real
+     `driver_components()` (no checkpoint needed — a peeled family's list is paths and IR expressions),
+     the synthesized half off the two builders' own dataclass fields. What keeps that non-circular is
+     one line in the exporter: `apply_monolithic_export`/`apply_modular_export` construct through
+     `driver_components.SYNTHESIZED_BUILDERS`, the same table the attribution reads.
+
+     **A module, not the `driver_components/` directory the plan wrote.** The `/` was shorthand for the
+     shelf. A package would additionally have weakened the standing rule: `test_spec_protocol`'s scan
+     walks `pkgutil.iter_modules(package.__path__)`, so a dataclass in `driver_components/foo.py` is
+     reached by neither the scan nor its unimportable-module report — a real check traded for a
+     cosmetic one.
+
+  2. **D.2 — the computed-name call sites, declared as data.** This is the gap the paragraph above
+     carried in, and it was bigger than "those call sites cannot be link-checked" suggests: **2
+     computed `loom.run_subgraph` sites and 16 helper call sites**, all in Kokoro and StyleTTS2, driving
+     35 of each family's ~40 topologies. The helper sites were not merely unresolved — they are inside
+     the `loom_lua` function, a level below the fragment, so no fragment parse could ever have seen
+     them.
+
+     The declaration splits along what each side knows. `lua_library.DrivenTopologies` declares the
+     *shape* a library function's body hard-codes (the four BiLSTM cell suffixes, the three block
+     suffixes, and the input table each call supplies); the family declares the *namespaces*, which
+     exist only at run time. `HelperCall`/`ComputedCall` expand the two into ordinary
+     `RunSubgraphCall`s, so these sites now fail with the same `TopologyName`/`TopologyInput` messages
+     a mistyped literal always has. **After D.2 there is no second class of call site with weaker
+     checking.**
+
+     Checked in both directions, three ways: a call site no declaration covers fails the export (the
+     completeness half — without it, declaring nine of ten sites would read as coverage); a declaration
+     whose call site the Lua no longer contains fails the export; and `drives_mismatches()` compares
+     each library declaration against the body that hard-codes it, suffixes and input table alike,
+     including the case that would bring the gap back — a function that calls `loom.run_subgraph` while
+     declaring no `drives`.
+
+     Peeled drivers now print their coverage, and report what is left over rather than only what is
+     covered: Kokoro 2 as IR / 2 parsed literal / 9 computed sites → 35 topologies, StyleTTS2 2 / 4 / 9
+     → 35, the other three 3 as IR and nothing computed. For all five, **every exported topology is
+     named by a call site** — reported, not enforced, since P4.1's Whisper encoder may legitimately be
+     called by the host rather than the driver.
+
+  3. **D.3 — [`DRIVER-COMPONENTS.md`](DRIVER-COMPONENTS.md), generated.** Per component: what it emits,
+     what it declares, what each declaration *says* when it fails, and which models use it — rewritten
+     in place by `python -m loom_mil_compiler.component_registry`, with a test that regenerates and
+     compares. Two renderings had to be got right or the document would misreport its own subject: a
+     declaration-only field (`ModularChain.stages`, `FlowMatchingSampler.spec`) is not an unchecked one
+     and now renders with the `NestedSpec`'s own prose, and `declared_links` silently returned nothing
+     when handed a class (`type(cls)` is its metaclass) — `declared_links_for` is the class-side entry
+     point. §4 carries all five negative-gate probe messages verbatim from real failing exports, which
+     is what the plan meant by taking them from the probe rather than from the source.
+
+  **Gate — passed.** All 11 models exported from a worktree at `32b2271` and from the working tree,
+  snapshotted and `diff -r`'d: **byte-identical, all 11**, `model_driver_script.txt` included — every
+  one of these commits adds checks and declarations, and none of them emits Lua. Five negative-gate
+  probes, each breaking one declaration and failing a real export with that check's own message (two in
+  D.1, three in D.2), recorded in their commits and in the catalogue's §4. A sixth check fired unasked
+  during the first probe — one class registered under two names — which is `registry()`'s duplicate
+  guard.
 - **P4.0.8 — legacy C++ driver retirement policy.** R6's policy covers `tools/convert_*` only; extend it
   to `src/core/{kokoro,vits,matcha,styletts2,supertonic,whisper}_driver.cpp`, which predate the Lua
   drivers becoming the orchestration device. Same rule — a driver may be deleted only in the commit that
