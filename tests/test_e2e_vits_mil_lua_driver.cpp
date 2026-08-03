@@ -26,6 +26,7 @@
 #include "test_util.h"
 
 #include "loom/loom.h"
+#include "loom/loom_legacy.h" // only for the legacy driver's Config struct: this test runs no C++ oracle
 
 #include <ggml-cpu.h>
 
