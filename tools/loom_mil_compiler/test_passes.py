@@ -461,6 +461,124 @@ class TestFuseLoomAttentionStripsGqaRepeat(unittest.TestCase):
         self.assertEqual(fused[0].v.shape[1], self.N_HEAD)
 
 
+class TestFuseLoomAttentionBypassesTheMaskSlice(unittest.TestCase):
+    """KV-CACHE.md 3.2. The traced mask does not reach the attention block directly: transformers slices
+    it to the current KV length, which converts to `slice_by_index(mask, begin=[0,0,0,0],
+    end_mask=[T,T,T,False])`. That slice is what pins the mask to the TRACE's kv width -- on a decode
+    step it would cut the driver's real `[n_tokens, n_kv]` mask back to the prefill width. Removing it is
+    also what lets the mask input be declared `["n_kv", "n_tokens"]` at all, since retyping is only sound
+    while the input's own consumers are all fused-attention nodes.
+
+    The mask inputs below are deliberately WIDER than the scores they end up added to, because that is
+    the real shape of the thing: the slice is the only reason the traced graph type-checks, and the
+    bypass is what hands the fused node the whole mask instead."""
+
+    N_HEAD, HEAD_DIM, SEQ = 4, 8, 6
+
+    def _prog(self, mask_shape=None, **slice_kwargs):
+        n_head, head_dim, seq = self.N_HEAD, self.HEAD_DIM, self.SEQ
+        mask_shape = mask_shape or (1, 1, seq, seq + 2)
+
+        @mb.program(input_specs=[
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=mask_shape, dtype=types.fp32),
+        ])
+        def prog(q, k, v, mask):
+            kwargs = dict(begin=[0, 0, 0, 0], end=[0, 0, 0, seq],
+                          begin_mask=[True, True, True, True],
+                          end_mask=[True, True, True, False])
+            kwargs.update(slice_kwargs)
+            sliced = mb.slice_by_index(x=mask, **kwargs)
+            qs = mb.mul(x=q, y=np.float32(0.35355338))
+            scores = mb.matmul(x=qs, y=k, transpose_x=False, transpose_y=True)
+            scores = mb.add(x=scores, y=sliced)
+            probs = mb.softmax(x=scores, axis=-1)
+            ctx = mb.matmul(x=probs, y=v, transpose_x=False, transpose_y=False)
+            ctx = mb.transpose(x=ctx, perm=[0, 2, 1, 3])
+            return mb.reshape(x=ctx, shape=[1, seq, n_head * head_dim])
+
+        return prog
+
+    def _fused_mask(self, prog):
+        fused = [op for op in prog.functions["main"].operations
+                 if op.op_type == "loom_fused_attention"]
+        self.assertEqual(len(fused), 1)
+        return fused[0].inputs["mask"]
+
+    def test_the_fused_op_reads_the_mask_input_itself(self):
+        prog = self._prog()
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        mask_var = self._fused_mask(prog)
+        self.assertIs(mask_var, prog.functions["main"].inputs["mask"])
+        # The whole mask, not the trace-width slice of it.
+        self.assertEqual(tuple(mask_var.shape), (1, 1, self.SEQ, self.SEQ + 2))
+
+    def test_the_orphaned_slice_leaves_the_graph(self):
+        # The fusion removes only the ops it definitively subsumed and leaves the rest to DCE, which is
+        # the pass that knows whether anything else still reads them -- the same division of labour the
+        # mask's own slice chain already relied on. After the real pipeline's DCE, the mask input's only
+        # consumer is the fused node, which is the property _retype_fused_mask_input then checks.
+        prog = self._prog()
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+        PASS_REGISTRY["common::dead_code_elimination"](prog)
+
+        mask_var = prog.functions["main"].inputs["mask"]
+        self.assertEqual([c.op_type for c in mask_var.child_ops], ["loom_fused_attention"])
+
+    def test_a_slice_that_also_cuts_an_earlier_axis_is_left_alone(self):
+        # Only `mask[..., :kv_len]` is the slice a cached step makes redundant. One that narrows the
+        # query axis too is doing something the driver's own mask would not reproduce.
+        seq = self.SEQ
+        prog = self._prog(mask_shape=(1, 1, seq + 1, seq + 2),
+                          end=[0, 0, seq, seq], end_mask=[True, True, False, False])
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(self._fused_mask(prog).op.op_type, "slice_by_index")
+
+    def test_a_slice_with_a_nonzero_begin_is_left_alone(self):
+        seq = self.SEQ
+        prog = self._prog(begin=[0, 0, 0, 2], end=[0, 0, 0, seq + 2],
+                          begin_mask=[True, True, True, False],
+                          end_mask=[True, True, True, False])
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(self._fused_mask(prog).op.op_type, "slice_by_index")
+
+    def test_a_strided_slice_is_left_alone(self):
+        seq = self.SEQ
+        prog = self._prog(mask_shape=(1, 1, seq, 2 * seq),
+                          end=[0, 0, 0, 2 * seq], stride=[1, 1, 1, 2])
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(self._fused_mask(prog).op.op_type, "slice_by_index")
+
+    def test_a_mask_that_is_not_sliced_at_all_still_fuses(self):
+        # The unsliced shape is what every other test program in this file uses, and it must keep
+        # working: the bypass is "walk back through THIS slice if present", not a requirement.
+        n_head, head_dim, seq = self.N_HEAD, self.HEAD_DIM, self.SEQ
+
+        @mb.program(input_specs=[
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32),
+            mb.TensorSpec(shape=(1, 1, seq, seq), dtype=types.fp32),
+        ])
+        def prog(q, k, v, mask):
+            qs = mb.mul(x=q, y=np.float32(0.35355338))
+            scores = mb.matmul(x=qs, y=k, transpose_x=False, transpose_y=True)
+            scores = mb.add(x=scores, y=mask)
+            probs = mb.softmax(x=scores, axis=-1)
+            ctx = mb.matmul(x=probs, y=v, transpose_x=False, transpose_y=False)
+            ctx = mb.transpose(x=ctx, perm=[0, 2, 1, 3])
+            return mb.reshape(x=ctx, shape=[1, seq, n_head * head_dim])
+
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+        self.assertIs(self._fused_mask(prog), prog.functions["main"].inputs["mask"])
+
+
 class TestAttentionFusionIsOptIn(unittest.TestCase):
     """Decision 4, and it is a correctness requirement rather than caution: the pattern is generic SDPA,
     so it matches the non-autoregressive TTS families' self-attention too -- and an ATTENTION node's

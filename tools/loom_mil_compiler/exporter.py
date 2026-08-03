@@ -6,6 +6,7 @@ import numpy as np
 import sympy
 from coremltools.converters.mil.mil import Block, Function, Operation, Var
 
+from . import axes
 from .driver_ir import (
     Argmax, Assign, BinOp, Break, Call, FieldAccess, If, Index, Len, Lit, Local, LocalDecl,
     LuaCodegen, RawBlock, RawExpr, Return, SubgraphCall, UnaryOp, Var as IRVar, While, check_subgraph_calls,
@@ -1863,6 +1864,8 @@ class LoomGGUFExporter:
 
         pruned_nodes, output_symbols = self._materialize_view_outputs(pruned_nodes, output_symbols)
 
+        self._retype_fused_mask_input(topo_inputs, pruned_nodes, func_name)
+
         # "output" (singular string) is both the original schema and what every single-output topology
         # still serializes -- byte-identical to pre-P2 output. "outputs" (plural array) is new, used only
         # when a function genuinely declares more than one output; see graph_topology.h's own comment on
@@ -1874,6 +1877,63 @@ class LoomGGUFExporter:
             topo["outputs"] = output_symbols
         topo["nodes"] = pruned_nodes
         return topo
+
+    def _retype_fused_mask_input(self, topo_inputs, nodes, func_name):
+        """A cached `ATTENTION` node's mask spans the whole cache, so its declared shape is
+        `[n_kv, n_tokens]` -- not the `[n_tokens, n_tokens]` the trace produced (KV-CACHE.md 3.2).
+
+        The trace cannot say this. HF computes scores of shape `[1, h, s, s]` with no cache, and a
+        second independent `ct.RangeDim` for the mask's key axis fails coremltools' type inference at
+        conversion time (KV-CACHE.md §2), so `attention_mask` shares one symbol with `tokens` and
+        `cache_position` by design. The axis therefore arrives here, on the emitted topology, and the
+        one thing that makes that sound is a property of the fused graph rather than an assumption:
+        **after fusion the mask input's only consumers are cached ATTENTION nodes**, so no other node's
+        shape derives from it. `fuse_loom_attention._mask_kv_slice_source` is what makes it true, by
+        bypassing the trace-width `mask[..., :kv_len]` slice; this checks it.
+
+        At `n_past = 0` the retyping changes nothing numerically -- `n_kv == n_tokens`, and
+        `loom.causal_mask(n_tokens, 0)` already returns exactly that many values -- so a prefill is the
+        same computation before and after. What it buys is a decode step, where the driver passes
+        `n_past > 0` and the engine sizes this input to the real cache extent.
+
+        Silent no-ops are the failure mode here, so both are raises: a topology with cached ATTENTION
+        nodes whose masks are NOT declared inputs means the fusion left something between them (which is
+        exactly the state this step exists to remove), and a mask input with any other consumer means
+        retyping it would move a shape something else derives from.
+        """
+        cached = [
+            node for node in nodes
+            if node["op"] == "ATTENTION" and node.get("attrs", {}).get("kv_cache", True)
+        ]
+        if not cached:
+            return
+        declared = {inp["name"]: inp for inp in topo_inputs}
+        # The ATTENTION rule emits [q, k, v, mask] -- see topology_ops._op_loom_fused_attention.
+        mask_names = [node["inputs"][3] for node in cached if len(node["inputs"]) > 3]
+        retypable = sorted({name for name in mask_names if name in declared})
+        if not retypable:
+            raise ValueError(
+                f"topology '{func_name}': {len(cached)} cached ATTENTION node(s), but none of their "
+                f"masks ({sorted(set(mask_names))}) is a declared input of this topology, so the "
+                f"'n_kv' axis has nowhere to be declared. The mask must reach the fused node directly "
+                f"-- fuse_loom_attention bypasses the traced mask[..., :kv_len] slice for exactly this "
+                f"reason (see _mask_kv_slice_source); something between them survived."
+            )
+        for name in retypable:
+            others = sorted({
+                node["op"] for node in nodes
+                if name in node["inputs"] and not (
+                    node["op"] == "ATTENTION" and len(node["inputs"]) > 3 and node["inputs"][3] == name
+                )
+            })
+            if others:
+                raise ValueError(
+                    f"topology '{func_name}': cannot declare input '{name}' as "
+                    f"['n_kv', '{self.root_axis}'] because it is also read by {others}. Retyping is "
+                    f"only sound while a fused mask's ONLY consumers are cached ATTENTION nodes -- any "
+                    f"other node's shape would be derived from an axis the trace never had."
+                )
+            declared[name]["shape"] = [axes.N_KV.name, self.root_axis]
 
     # Ops whose ggml result is a live VIEW of their input rather than a fresh contiguous buffer.
     # `ggml_backend_tensor_get` -- how every declared output is read back, by the Lua bridge and by
