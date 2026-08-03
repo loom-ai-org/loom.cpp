@@ -692,14 +692,6 @@ target_link_libraries(test_e2e_kokoro_mil_albert_bert_encoder_reference PRIVATE 
 add_test(NAME test_e2e_kokoro_mil_albert_bert_encoder_reference COMMAND test_e2e_kokoro_mil_albert_bert_encoder_reference)
 set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- Real-model test: loom::VitsDriver end-to-end (TextEncoder -> StochasticDurationPredictor ->
-#     host-side generate_path -> coupling flow -> HiFi-GAN vocoder), one level up from the structural
-#     smoke test above -- exercises the full two-phase driver, not just each topology in isolation. ---
-add_executable(test_e2e_vits_driver test_e2e_vits_driver.cpp)
-target_link_libraries(test_e2e_vits_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_vits_driver COMMAND test_e2e_vits_driver)
-set_tests_properties(test_e2e_vits_driver PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- Numerical-correctness check: the deterministic `stats` (TextEncoder) topology against a real
 #     PyTorch forward pass of piper's own models.TextEncoder, using REAL phonemized text (T=62, real
 #     emb_rel_k/v pad branch exercised) -- see test_e2e_vits_stats_reference.cpp's own header comment. ---

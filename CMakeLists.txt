@@ -22,7 +22,6 @@ add_library(loom_engine
     src/core/kv_cache.cpp
     src/core/generation.cpp
     src/core/tdt_decoder.cpp
-    src/core/vits_driver.cpp
     src/core/whisper_driver.cpp
     src/core/kokoro_driver.cpp
     src/core/styletts2_driver.cpp
