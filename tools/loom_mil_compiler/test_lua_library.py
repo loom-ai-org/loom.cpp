@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.lua_library import (
-    LIBRARY, LUA_DIR, LuaLibrary, catalogue, resolve, undeclared_calls, unused_requires,
+    LIBRARY, LUA_DIR, DrivenTopologies, LuaFunction, LuaLibrary, catalogue, drives_mismatches,
+    resolve, undeclared_calls, unused_requires,
 )
 from loom_mil_compiler.spec_protocol import LinkError
 
@@ -144,6 +145,43 @@ class TestTheRealFamilies(unittest.TestCase):
             self.assertNotIn(f"local function {name}", text,
                              f"{name} is defined in a family fragment as well as in lua/")
             self.assertIn(name, LIBRARY)
+
+    def test_every_topology_driving_function_declares_what_it_drives(self):
+        """D.2. The three functions that call `loom.run_subgraph` with a computed name are the only
+        ones whose call sites nothing could reach; `drives` is what a family expands against."""
+        driving = {name for name, fn in LIBRARY.items() if fn.drives is not None}
+        self.assertEqual(driving, {"run_bi_lstm", "run_resblk_stack", "run_proj1x1"})
+
+    def test_no_declaration_disagrees_with_the_body_it_describes(self):
+        """The direction a family cannot check: the declaration drifting from the Lua, after which
+        every family checks its namespaces faithfully against the wrong shape."""
+        self.assertEqual(drives_mismatches(), {})
+
+    def test_a_renamed_suffix_is_caught_in_both_directions(self):
+        import loom_mil_compiler.lua_library as lua_library
+
+        original = lua_library._FUNCTIONS
+        broken = LuaFunction("run_bi_lstm", drives=DrivenTopologies(
+            suffixes=("_h_forward", "_c_fwd", "_h_bwd", "_c_bwd"),
+            inputs=("layer_input", "h_prev", "c_prev")))
+        try:
+            lua_library._FUNCTIONS = (broken,)
+            complaints = drives_mismatches()["run_bi_lstm"]
+        finally:
+            lua_library._FUNCTIONS = original
+        self.assertIn("declares suffix '_h_forward'", complaints[0])
+        self.assertIn("body concatenates '_h_fwd'", complaints[1])
+
+    def test_a_function_that_drives_topologies_without_saying_so_is_reported(self):
+        import loom_mil_compiler.lua_library as lua_library
+
+        original = lua_library._FUNCTIONS
+        try:
+            lua_library._FUNCTIONS = (LuaFunction("run_proj1x1", requires=("to_layout_a",)),)
+            complaints = drives_mismatches()["run_proj1x1"]
+        finally:
+            lua_library._FUNCTIONS = original
+        self.assertIn("declares no `drives`", complaints[0])
 
     def test_the_catalogue_is_generated_rather_than_transcribed(self):
         table = catalogue()

@@ -683,7 +683,9 @@ class TestPeeledKokoro(unittest.TestCase):
         the export produces them, the exclusion is gone and the calls are link-checked like any other
         -- which is strictly better, and is what "self-contained" buys beyond packaging."""
         fragments = [c for c in self._components() if isinstance(c, LuaFragment)]
-        declared = {call.topology for f in fragments for call in f.sub_specs()}
+        # `sub_specs` carries the `drives` declarations themselves (D.2) alongside the calls they
+        # expand into, since a declaration has links of its own; only the calls name a topology.
+        declared = {getattr(call, "topology", None) for f in fragments for call in f.sub_specs()}
         self.assertIn("text_encoder_cnn", declared)
         self.assertIn("duration_proj", declared)
 
@@ -741,3 +743,126 @@ class TestPeeledStyleTTS2(unittest.TestCase):
         matcha = TTSMatchaExportConfig(model_dir="/u", output_path="/u", architecture="matcha")
         library = next(c for c in matcha.driver_components() if isinstance(c, LuaLibrary))
         self.assertEqual({fn.name for fn in resolve(library.uses)} & {"adpm2_step"}, set())
+
+
+class TestComputedCallSitesAreDeclared(unittest.TestCase):
+    """D.2: the call sites whose topology name is built at run time.
+
+    Before this, Kokoro's and StyleTTS2's drivers had two kinds of call site no check could reach --
+    one built in a Lua `for` loop, and one built *inside* a `loom_lua` helper, a level below the
+    fragment entirely. `parse_run_subgraph_calls` reported the first as unresolved and never saw the
+    second at all. What is tested here is that declaring them as data restores the ordinary checks
+    rather than merely recording the gap: the expansion is a `RunSubgraphCall` like any other, so a
+    namespace whose topologies were not exported fails with `TopologyName`'s own message.
+    """
+
+    def _fragments(self, config):
+        return [c for c in config.driver_components() if isinstance(c, LuaFragment)]
+
+    def _kokoro(self):
+        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+
+        return TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
+                                     architecture="kokoro")
+
+    def test_a_bilstm_namespace_expands_to_its_four_cell_topologies(self):
+        fragment = next(f for f in self._fragments(self._kokoro())
+                        if f.path.name == "03_frame_expansion.lua")
+        call, = fragment.drives
+        self.assertEqual([c.topology for c in call.expand()],
+                         ["text_encoder_lstm_h_fwd", "text_encoder_lstm_c_fwd",
+                          "text_encoder_lstm_h_bwd", "text_encoder_lstm_c_bwd"])
+        self.assertEqual(call.expand()[0].inputs, ("layer_input", "h_prev", "c_prev"))
+
+    def test_a_loop_declares_every_namespace_it_iterates(self):
+        fragment = next(f for f in self._fragments(self._kokoro())
+                        if f.path.name == "02_duration_encoder.lua")
+        lstm = next(d for d in fragment.drives if getattr(d, "helper", None) == "run_bi_lstm"
+                    and len(d.names()) == 3)
+        self.assertEqual([c.topology for c in lstm.expand()][:2],
+                         ["duration_lstm_0_h_fwd", "duration_lstm_0_c_fwd"])
+        adaln = next(d for d in fragment.drives if not hasattr(d, "helper"))
+        self.assertEqual([c.topology for c in adaln.expand()],
+                         ["duration_adaln_0", "duration_adaln_1", "duration_adaln_2"])
+
+    def test_every_computed_call_site_in_every_family_is_declared(self):
+        """The completeness direction, over the real fragments: a call site nobody declared is a
+        topology nothing checks, which is exactly the state D.2 ends."""
+        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
+        from loom_mil_compiler.supertonic_export import TTSSupertonicExportConfig
+        from loom_mil_compiler.vits_export import TTSVitsExportConfig
+
+        configs = (
+            self._kokoro(),
+            TTSStyleTTS2ExportConfig(checkpoint_path="/u", output_path="/u", architecture="styletts2"),
+            TTSMatchaExportConfig(model_dir="/u", output_path="/u", architecture="matcha"),
+            TTSVitsExportConfig(checkpoint_path="/u", output_path="/u", architecture="vits"),
+            TTSSupertonicExportConfig(model_dir="/u", output_path="/u", architecture="supertonic"),
+        )
+        for config in configs:
+            for fragment in self._fragments(config):
+                self.assertEqual(fragment.undeclared_call_sites(), [],
+                                 f"{type(config).__name__} {fragment.path.name}")
+                self.assertEqual(fragment.stale_drives_declarations(), [],
+                                 f"{type(config).__name__} {fragment.path.name}")
+
+    def test_a_declaration_whose_call_site_was_renamed_is_reported(self):
+        """The direction that turns a declaration into decoration: the Lua changes, the declaration
+        stays, and it keeps checking a topology nothing runs."""
+        from loom_mil_compiler.driver_components import HelperCall
+
+        fragment = next(f for f in self._fragments(self._kokoro())
+                        if f.path.name == "04_f0n.lua")
+        stale = dataclasses.replace(fragment, drives=fragment.drives + (
+            HelperCall("run_proj1x1", "f0n_gone"),))
+        self.assertEqual(stale.stale_drives_declarations(), ['"f0n_gone"'])
+
+    def test_a_call_site_nobody_declared_is_reported_with_its_line(self):
+        fragment = next(f for f in self._fragments(self._kokoro())
+                        if f.path.name == "04_f0n.lua")
+        thinned = dataclasses.replace(fragment, drives=fragment.drives[:-1])
+        missing = thinned.undeclared_call_sites()
+        self.assertEqual([site[:2] for site in missing], [("run_proj1x1", '"f0n_n_proj"')])
+        self.assertGreater(missing[0][2], 0)
+
+    def test_the_declarations_fail_the_link_check_against_a_topology_set_without_them(self):
+        """End to end through the protocol rather than through `expand()`: this is the message a real
+        export produces, and it is the ordinary `TopologyName` one."""
+        from loom_mil_compiler.spec_protocol import LinkChecker
+
+        fragment = next(f for f in self._fragments(self._kokoro())
+                        if f.path.name == "03_frame_expansion.lua")
+        checker = LinkChecker()
+        for spec in fragment.sub_specs():
+            checker.check(spec)
+        with self.assertRaises(LinkError) as raised:
+            checker.provide(topologies={"text_encoder_cnn": _topo(["tokens"])})
+        message = str(raised.exception)
+        self.assertIn("text_encoder_lstm_h_fwd", message)
+        self.assertIn("via run_bi_lstm", message)
+
+    def test_an_unknown_helper_is_reported_rather_than_expanding_to_nothing(self):
+        from loom_mil_compiler.driver_components import HelperCall
+        from loom_mil_compiler.spec_protocol import check_links
+
+        with self.assertRaises(LinkError) as raised:
+            check_links(HelperCall("array_sum", "whatever"))
+        self.assertIn("declares no `drives`", str(raised.exception))
+
+
+class TestPeeledDriverCoverage(unittest.TestCase):
+    def test_every_exported_topology_is_named_by_a_checked_call_site(self):
+        """Kokoro's own numbers, without an export: 39 topologies, and the driver names all of them
+        once the computed sites are declared. Four before D.2."""
+        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+
+        config = TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
+                                       architecture="kokoro")
+        builder = MultiPhaseDriverBuilder(peeled=config.driver_components())
+        called = builder.called_topologies()
+        self.assertEqual(len(called), 39)
+        for name in ("albert_bert_encoder", "decoder_vocoder", "text_encoder_cnn", "duration_proj",
+                     "duration_adaln_2", "top_lstm_c_bwd", "f0n_f0_block2", "f0n_n_proj"):
+            self.assertIn(name, called)

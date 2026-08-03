@@ -35,6 +35,7 @@ dict of MIL functions. `TopologyInput(exact=True)` also adds the direction `chec
 never checked: an input the topology declares that the driver never supplies, which the engine reads
 back as an uninitialised tensor rather than as an error.
 """
+import dataclasses
 import re
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
@@ -46,7 +47,8 @@ from .driver_ir import (
 from .driver_ir import Function as IRFunction
 from .driver_builder import DriverBuilder, DriverComponent, DriverContext, DriverScript
 from .spec_protocol import (
-    TOPOLOGIES, ConfigDerived, FieldRef, NestedSpec, TopologyInput, TopologyName, Unchecked, WhenSet,
+    TOPOLOGIES, ConfigDerived, CoveredBy, FieldRef, NestedSpec, TopologyInput, TopologyName, Unchecked,
+    WhenSet,
 )
 
 # Traced-model input names auto-computed by the driver (via loom.range) rather than unpacked from the
@@ -677,6 +679,175 @@ def _note_block(note):
 
 
 @dataclass
+class HelperCall:
+    """One call to a `loom_lua` helper that drives topologies whose names the Lua computes (D.2).
+
+    `run_bi_lstm("text_encoder_lstm", ...)` runs four `loom.run_subgraph` calls, one per cell topology,
+    with the name built at run time inside the library function. Nothing could check those: the parser
+    reads literals, and the call sites are not even in this fragment. What the *caller* knows, and only
+    the caller, is the namespace -- so it declares it, and the library's `DrivenTopologies` supplies the
+    shape (`_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`, and the input table each call supplies).
+
+    The expansion is an ordinary `RunSubgraphCall` per topology, so a namespace whose cells the export
+    did not produce fails with `TopologyName`'s own message and the list of names that do exist -- the
+    same failure a mistyped literal gets, which is the point: after D.2 there is no second class of call
+    site with weaker checking.
+
+    `written` is the first argument exactly as the fragment writes it, and is what keeps the declaration
+    from rotting: a namespace renamed in the Lua and not here (or the reverse) is caught by
+    `LuaFragment`'s own both-way check. It defaults to the quoted namespace, which is what a
+    single-namespace call site looks like; a loop passes its expression (`'"duration_lstm_" .. i'`).
+    """
+
+    helper: str
+    # One namespace, or the several a loop passes.
+    namespaces: object
+    written: Optional[str] = None
+    origin: str = "driver"
+    line: int = 0
+
+    __links__ = {
+        "helper": ConfigDerived(
+            claim=lambda spec, ctx: True,
+            measured=lambda spec, ctx: spec.driven() is not None,
+            detail=lambda spec, ctx: spec.helper,
+            message=(
+                "{label} names loom_lua function {detail!r}, which either does not exist or declares "
+                "no `drives`. Only a library function that calls loom.run_subgraph with a computed "
+                "name has topologies to declare -- see lua_library.DrivenTopologies."
+            ),
+            needs=(),
+        ),
+        "namespaces": NestedSpec(
+            where="LuaFragment.sub_specs, which expands each namespace into one RunSubgraphCall per "
+                  "topology the helper drives, so each is checked against the real exported topology "
+                  "and its declared inputs"
+        ),
+    }
+    __unchecked__ = {
+        "written": Unchecked(
+            "the call's first argument as written. Checked, but by the fragment that contains it and "
+            "in both directions -- a declaration whose text is not in the fragment, and a call site in "
+            "the fragment that no declaration covers, are both failures there. Restating it as a link "
+            "here would only see one of those"
+        ),
+        "origin": Unchecked("the fragment file this call was declared in, for the label"),
+        "line": Unchecked("where in that fragment, for the label. Filled in by LuaFragment from the "
+                          "parsed call site rather than declared by hand"),
+    }
+
+    def link_label(self) -> str:
+        where = f"{self.origin}:{self.line} " if self.line else f"{self.origin} "
+        return f"{where}{self.helper}({self.written or self.names()[0]!r})"
+
+    def names(self) -> Tuple[str, ...]:
+        return (self.namespaces,) if isinstance(self.namespaces, str) else tuple(self.namespaces)
+
+    def as_written(self) -> str:
+        if self.written is not None:
+            return self.written
+        return f'"{self.names()[0]}"'
+
+    def driven(self):
+        from .lua_library import LIBRARY
+
+        entry = LIBRARY.get(self.helper)
+        return None if entry is None else entry.drives
+
+    def expand(self) -> List["RunSubgraphCall"]:
+        driven = self.driven()
+        if driven is None:
+            # The `helper` link reports this with the real reason; expanding to nothing here keeps that
+            # message the one a reader sees instead of an AttributeError from underneath it.
+            return []
+        return [
+            RunSubgraphCall(topology=topology, inputs=tuple(driven.inputs),
+                            line=self.line, origin=f"{self.origin} via {self.helper}")
+            for namespace in self.names()
+            for topology in driven.topologies(namespace)
+        ]
+
+
+@dataclass
+class ComputedCall:
+    """One `loom.run_subgraph` whose topology name the fragment itself computes (D.2).
+
+    The same declaration as `HelperCall` for the case with no helper in between: Kokoro's and
+    StyleTTS2's duration encoders call `loom.run_subgraph("duration_adaln_" .. i, ...)` inside a Lua
+    `for`, so the name exists only at run time. The loop is the right way to write that -- three
+    unrolled copies would be worse -- and this is what makes it checkable anyway.
+
+    `inputs` is stated rather than parsed even though the table literal is right there, because the
+    parse is what has already failed: `parse_run_subgraph_calls` reports these sites as unresolved and
+    declares nothing about them. Stating both halves keeps one declaration to compare against the real
+    topology.
+    """
+
+    topologies: Tuple[str, ...]
+    inputs: Tuple[str, ...]
+    written: str
+    origin: str = "driver"
+    line: int = 0
+
+    __links__ = {
+        "topologies": NestedSpec(
+            where="LuaFragment.sub_specs, which declares one RunSubgraphCall per name so each is "
+                  "checked against the real topology and its declared inputs"
+        ),
+    }
+    __unchecked__ = {
+        "inputs": CoveredBy("topologies"),
+        "written": Unchecked(
+            "the topology-name expression as written. Checked by the fragment that contains it, in "
+            "both directions -- see HelperCall.written"
+        ),
+        "origin": Unchecked("the fragment file this call was declared in, for the label"),
+        "line": Unchecked("where in that fragment, for the label"),
+    }
+
+    def link_label(self) -> str:
+        where = f"{self.origin}:{self.line} " if self.line else f"{self.origin} "
+        return f"{where}loom.run_subgraph({self.written})"
+
+    def as_written(self) -> str:
+        return self.written
+
+    def expand(self) -> List["RunSubgraphCall"]:
+        return [
+            RunSubgraphCall(topology=topology, inputs=tuple(self.inputs),
+                            line=self.line, origin=self.origin)
+            for topology in self.topologies
+        ]
+
+
+def _helper_call_sites(text: str):
+    """`[(helper name, first-argument text, line)]` for every call in `text` to a `loom_lua` function
+    that drives topologies.
+
+    Read off the fragment rather than declared, because this is the half that has to find what the
+    declarations *miss*: a helper call nobody declared is a call site with no check on it, which is
+    precisely the state D.2 exists to end."""
+    from .lua_library import LIBRARY
+
+    sites = []
+    for name, entry in LIBRARY.items():
+        if entry.drives is None:
+            continue
+        marker = f"{name}("
+        index = text.find(marker)
+        while index != -1:
+            # A definition is not a call site. `local function run_bi_lstm(` only appears in the
+            # library file itself, but a fragment that inlined one would otherwise read as a caller.
+            prefix = text[:index].rstrip()
+            if not prefix.endswith("function"):
+                args_text, _ = _balanced_args(text, index + len(marker))
+                args = _split_top_level(args_text)
+                sites.append((name, args[0].strip(), text.count("\n", 0, index) + 1))
+            index = text.find(marker, index + len(marker))
+    return sites
+
+
+@dataclass
 class LuaFragment(DriverComponent):
     """One hand-written block of a peeled driver, kept as its own `.lua` file.
 
@@ -702,8 +873,37 @@ class LuaFragment(DriverComponent):
     # `{topology name: where it comes from}` for calls inside this fragment that this export does not
     # produce -- see `BaseMultiPhaseModelExportConfig.external_topologies`.
     external: dict = dataclass_field(default_factory=dict)
+    # `HelperCall`/`ComputedCall` declarations for this fragment's call sites whose topology name is
+    # computed at run time (D.2). Empty for a fragment that names every topology literally.
+    drives: Tuple[object, ...] = ()
 
     __links__ = {
+        "drives": [
+            ConfigDerived(
+                claim=lambda spec, ctx: (),
+                measured=lambda spec, ctx: tuple(spec.undeclared_call_sites()),
+                detail=lambda spec, ctx: [f"line {line}: {text}"
+                                          for _, text, line in spec.undeclared_call_sites()],
+                message=(
+                    "{label} has computed call site(s) {detail} that no `drives` declaration covers, "
+                    "so the topologies they run are checked by nothing. Declare them with a "
+                    "HelperCall (a loom_lua helper that drives topologies) or a ComputedCall (a "
+                    "loom.run_subgraph whose name this fragment computes)."
+                ),
+                needs=(),
+            ),
+            ConfigDerived(
+                claim=lambda spec, ctx: (),
+                measured=lambda spec, ctx: tuple(spec.stale_drives_declarations()),
+                detail=lambda spec, ctx: list(spec.stale_drives_declarations()),
+                message=(
+                    "{label} declares call site(s) {detail} that its text does not contain. A "
+                    "declaration whose call site was renamed or deleted checks a topology nothing "
+                    "runs, which reads as coverage and is not."
+                ),
+                needs=(),
+            ),
+        ],
         "defines": ConfigDerived(
             claim=lambda spec, ctx: (),
             measured=lambda spec, ctx: tuple(spec.names_missing_from_text(spec.defines)),
@@ -747,20 +947,64 @@ class LuaFragment(DriverComponent):
 
     def __post_init__(self):
         self.lines = Path(self.path).read_text().rstrip("\n").split("\n")
-        self._calls, self.unresolved_calls = parse_run_subgraph_calls(
-            "\n".join(self.lines), Path(self.path).name)
+        origin = Path(self.path).name
+        self._calls, self.unresolved_calls = parse_run_subgraph_calls("\n".join(self.lines), origin)
+        # A declaration carries the file and line of the site it covers, so a failure names where to
+        # look -- read off the text rather than written out per declaration, since the fragment is the
+        # thing that knows.
+        self.drives = tuple(
+            dataclasses.replace(declaration, origin=origin,
+                                line=self._line_of(declaration.as_written()))
+            for declaration in self.drives
+        )
+
+    def _line_of(self, written: str) -> int:
+        for number, line in enumerate(self.lines, start=1):
+            if written in line:
+                return number
+        return 0
 
     def link_label(self) -> str:
         return f"LuaFragment({Path(self.path).name!r})"
 
     def sub_specs(self):
-        """`run_subgraph` calls still written by hand inside this fragment.
+        """`run_subgraph` calls still written by hand inside this fragment, literal and computed alike.
 
         A peel must never *reduce* checking, and without this it would: `RawLuaDriver` parses the whole
         adopted driver, so a block moved into a fragment would take its call sites out of reach. The
         calls that survive a peel are the ones a component cannot express -- a computed topology name,
-        or a call inside a Lua loop -- and they are exactly the ones worth still parsing."""
-        return [call for call in self._calls if call.topology not in self.external]
+        or a call inside a Lua loop -- and they are exactly the ones worth still parsing.
+
+        Since D.2 the computed half is here too: a `HelperCall`/`ComputedCall` declaration expands into
+        one `RunSubgraphCall` per topology it really runs, which is what closes the last call sites in
+        Kokoro's and StyleTTS2's drivers that no check could reach.
+        """
+        declared = [call for declaration in self.drives for call in declaration.expand()]
+        return ([call for call in self._calls if call.topology not in self.external]
+                + [call for call in declared if call.topology not in self.external]
+                + list(self.drives))
+
+    def declared_call_sites(self) -> set:
+        """The first-argument text of every call site this fragment's `drives` declarations claim."""
+        return {declaration.as_written() for declaration in self.drives}
+
+    def computed_call_sites(self) -> list:
+        """`[(what, first-argument text, line)]` for every call site in this fragment whose topology
+        name is not a literal: a `loom.run_subgraph` the fragment computes, and a call to a `loom_lua`
+        helper that drives topologies of its own."""
+        text = "\n".join(self.lines)
+        sites = [("loom.run_subgraph", written, line) for line, written in self.unresolved_calls]
+        sites.extend((helper, written, line) for helper, written, line in _helper_call_sites(text))
+        return sites
+
+    def undeclared_call_sites(self) -> list:
+        declared = self.declared_call_sites()
+        return [site for site in self.computed_call_sites() if site[1] not in declared]
+
+    def stale_drives_declarations(self) -> list:
+        found = {written for _, written, _ in self.computed_call_sites()}
+        return [declaration.as_written() for declaration in self.drives
+                if declaration.as_written() not in found]
 
     def names_missing_from_text(self, names) -> list:
         text = "\n".join(self.lines)
@@ -943,8 +1187,46 @@ class MultiPhaseDriverBuilder(DriverBuilder):
             print(self.driver.coverage())
             return super().build(ctx, checker)
         script = super().build(ctx, checker)
+        print(self.coverage(ctx))
         # A peeled driver ends with a newline, the way every hand-written one in this tree does and
         # every text file should. Not on `DriverScript.render` itself: the two synthesized paths do
         # not end with one, and changing that would move six models' driver text for no reason.
         script.postlude = list(script.postlude) + [""]
         return script
+
+    def called_topologies(self) -> set:
+        """Every topology this peeled driver runs, from all three kinds of call site it now has: IR,
+        a literal parsed out of a fragment, and a computed name declared as data (D.2)."""
+        names = set()
+        for component in self.components():
+            if isinstance(component, SubgraphCallComponent):
+                names.add(component.topology)
+            if isinstance(component, FlowMatchingSampler):
+                # The estimator is called from inside the generated sampler function, not from the
+                # entry function -- a fourth kind of call site, and one that has always been checked
+                # (the spec's own TopologyName link), which is why it belongs in the count.
+                names.add(component.spec.estimator)
+            for spec in getattr(component, "sub_specs", list)():
+                names.update(call.topology for call in getattr(spec, "expand", list)())
+                if isinstance(spec, RunSubgraphCall):
+                    names.add(spec.topology)
+        return names
+
+    def coverage(self, ctx) -> str:
+        """One line for the export log: how much of this driver is checked, and what it leaves behind.
+
+        The second half is the part worth printing rather than merely computing. Before D.2 the honest
+        answer for Kokoro and StyleTTS2 was "most of it is not", and a number nobody prints is a number
+        nobody notices moving -- which is how the eleven duplicated `loom_lua` functions survived a
+        whole peeling stage with their own comments admitting it.
+        """
+        ir = sum(1 for c in self.components() if isinstance(c, SubgraphCallComponent))
+        literal = sum(len(getattr(c, "_calls", ())) for c in self.components())
+        declared = [d for c in self.components() for d in getattr(c, "drives", ())]
+        computed = sum(len(d.expand()) for d in declared)
+        called = self.called_topologies()
+        uncalled = sorted(set(ctx.topologies) - called)
+        note = (f"; {len(uncalled)} exported topolog(ies) no call site names: {uncalled}"
+                if uncalled else "; every exported topology is named by one")
+        return (f"  driver: {ir} call(s) as IR, {literal} parsed literal, {len(declared)} computed "
+                f"site(s) declared -> {computed} topolog(ies){note}")

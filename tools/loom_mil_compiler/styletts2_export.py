@@ -315,7 +315,9 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         The ADPM2 sampler itself stays a hand-written helper in `00_header.lua`, unchanged: two network
         evaluations per step, Karras preconditioning, per-step noise injection. No template emits that
         without becoming a worse thing to read than the loop."""
-        from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .driver_components import (
+            ComputedCall, DriverReturn, HelperCall, LuaFragment, SubgraphCallComponent,
+        )
         from .lua_library import LuaLibrary
         from .driver_ir import Call, FieldAccess, Lit, Var
 
@@ -349,16 +351,35 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             block("02_style_diffusion.lua", reads=("bert_out", "T_text", "style_dim"),
                   defines=("denoise_fn", "style_vec_dim", "noise0", "sigmas", "s_pred",
                            "s_decoder", "s_predictor")),
+            # `drives` is D.2, and this family is where it pays most: nine of StyleTTS2's thirteen
+            # call sites name their topology with an expression built at run time, either in a Lua
+            # loop here or inside the loom_lua helper one level down. Declaring the namespaces is what
+            # turns them back into ordinary checked calls -- see driver_components.HelperCall.
             block("03_duration_encoder.lua",
                   reads=("bert_out", "T_text", "d_model", "style_dim", "s_predictor",
                          "hidden_per_dir"),
-                  defines=("d_en_flat", "x", "d", "top_out", "duration_logits", "pred_dur")),
+                  defines=("d_en_flat", "x", "d", "top_out", "duration_logits", "pred_dur"),
+                  drives=(
+                      HelperCall("run_bi_lstm", tuple(f"duration_lstm_{i}" for i in range(3)),
+                                 written='"duration_lstm_" .. i'),
+                      ComputedCall(topologies=tuple(f"duration_adaln_{i}" for i in range(3)),
+                                   inputs=("x", "style"), written='"duration_adaln_" .. i'),
+                      HelperCall("run_bi_lstm", "top_lstm"),
+                  )),
             block("04_frame_expansion.lua",
                   reads=("T_text", "pred_dur", "d", "d_model", "style_dim", "hidden_per_dir"),
                   defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
-                           "cnn_rows", "t_en", "asr")),
+                           "cnn_rows", "t_en", "asr"),
+                  drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
             block("05_f0n.lua", reads=("en", "hidden_per_dir", "s_predictor"),
-                  defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve")),
+                  defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve"),
+                  drives=(
+                      HelperCall("run_bi_lstm", "f0n_shared_lstm"),
+                      HelperCall("run_resblk_stack", "f0n_f0"),
+                      HelperCall("run_resblk_stack", "f0n_n"),
+                      HelperCall("run_proj1x1", "f0n_f0_proj"),
+                      HelperCall("run_proj1x1", "f0n_n_proj"),
+                  )),
             block("06_vocoder_inputs.lua", reads=("T_frames",),
                   defines=("dim", "T_f0", "L", "rand_ini", "u", "noise_in", "wsum")),
             SubgraphCallComponent(

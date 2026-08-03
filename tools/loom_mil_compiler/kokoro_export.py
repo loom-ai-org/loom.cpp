@@ -504,7 +504,9 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         order they run in is checked instead of assumed. The BiLSTM/AdaLN stepping loops that account
         for most of the remaining nine are D.2's registered component, which declares its topologies as
         data and is where those calls stop being computed strings."""
-        from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .driver_components import (
+            ComputedCall, DriverReturn, HelperCall, LuaFragment, SubgraphCallComponent,
+        )
         from .lua_library import LuaLibrary
         from .driver_ir import Call, FieldAccess, Lit, Var
 
@@ -535,16 +537,36 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                 note="--- CustomAlbert + bert_encoder, ONE MIL-traced call -> d_en, time-major\n"
                      "    (T,512) (see module docstring for why this convention, not\n"
                      "    kokoro_driver.lua's own Layout-A one). ---"),
+            # `drives` is D.2: the call sites whose topology name this fragment computes at run time,
+            # declared as data. Until now the six BiLSTMs, the three AdaLayerNorms, the two resblock
+            # stacks and the two projections below were driven by names no check could read -- either
+            # built in a Lua loop or built inside the loom_lua helper itself -- which is nine of this
+            # driver's eleven call sites.
             block("02_duration_encoder.lua",
                   reads=("d_en_flat", "T_text", "d_model", "style_dim", "s_predictor",
                          "hidden_per_dir"),
-                  defines=("d_en_rows", "x", "d", "top_out", "duration_logits", "pred_dur")),
+                  defines=("d_en_rows", "x", "d", "top_out", "duration_logits", "pred_dur"),
+                  drives=(
+                      HelperCall("run_bi_lstm", tuple(f"duration_lstm_{i}" for i in range(3)),
+                                 written='"duration_lstm_" .. i'),
+                      ComputedCall(topologies=tuple(f"duration_adaln_{i}" for i in range(3)),
+                                   inputs=("x", "style"), written='"duration_adaln_" .. i'),
+                      HelperCall("run_bi_lstm", "top_lstm"),
+                  )),
             block("03_frame_expansion.lua",
                   reads=("T_text", "pred_dur", "d", "d_model", "style_dim", "hidden_per_dir"),
                   defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
-                           "cnn_rows", "t_en", "asr")),
+                           "cnn_rows", "t_en", "asr"),
+                  drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
             block("04_f0n.lua", reads=("en", "hidden_per_dir", "s_predictor"),
-                  defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve")),
+                  defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve"),
+                  drives=(
+                      HelperCall("run_bi_lstm", "f0n_shared_lstm"),
+                      HelperCall("run_resblk_stack", "f0n_f0"),
+                      HelperCall("run_resblk_stack", "f0n_n"),
+                      HelperCall("run_proj1x1", "f0n_f0_proj"),
+                      HelperCall("run_proj1x1", "f0n_n_proj"),
+                  )),
             block("05_vocoder_inputs.lua", reads=("T_frames",),
                   defines=("dim", "T_f0", "L", "rand_ini", "u", "noise_in", "wsum")),
             SubgraphCallComponent(
