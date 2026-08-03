@@ -38,6 +38,40 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 
 ## Exporter / MIL compiler
 
+> ### 🔴 OPEN BUG (found 2026-08-03): the MIL causal-LM export is numerically WRONG at some prompt lengths
+>
+> Found while measuring something else — the fused-vs-unfused logit comparison KV-CACHE.md stage 2 asked
+> for. **This predates the KV-cache thread entirely** and is not caused by it: the pre-session
+> `qwen3_0.6b_mil_monolithic.gguf` (built 2026-07-30) is **bit-identical** to a fresh unfused export
+> (`max|Δ| = 0.000e+00` over the whole 151k-token logit vector), and the bug reproduces in both.
+>
+> **Symptom.** Qwen3-0.6B, prefill at `n_past=0`, compared against `AutoModelForCausalLM` on the same
+> tokens. Across `n = 2…32`, every length agrees with HF to `max|Δ| ≈ 2e-5` **except `n = 8` and
+> `n = 16`**, where it is off by **13.7 and 22.9 logits** and the argmax changes. It is length-dependent,
+> not content-dependent: **five different 8-token prompts all give the wrong top-1**. The cleanest
+> demonstration needs no reference at all — `"A B C D E F G H"` (8 tokens) should predict `" I"`
+> (HF: 358); the export predicts 425.
+>
+> **Why no test caught it.** `test_e2e_lfm2_mil_export` is the only numeric gate on this path and its two
+> prompts are **3 and 7 tokens** — both "good" lengths. Nothing in the suite exercises a length that fails.
+>
+> **What is NOT the cause** (each checked, not assumed): the attention fusion (both paths fail
+> identically at `n=8`); the reference (plain HF and the exported `_CausalLMWrapper` agree to 2e-5 at
+> every length, so the wrapper's explicit 4D mask + `cache_position` are not it); nondeterminism (two
+> independent exports are bit-identical); and the harness (its answers match what the Lua driver and
+> `loom_cli` produce for the same prompt).
+>
+> **Where to look next.** Bisect by dumping per-layer hidden states from both loom and HF for an 8-token
+> prompt and finding the first op that diverges. Prime suspects, in order: the `attention_mask`
+> `slice_by_index` → `VIEW` chain (its `end` comes from a runtime `gather` on a shape, and the exporter
+> renders it as a static `n_tokens` expression); and `fuse_gqa_repeat_kv`'s `-1`-inferred reshapes, whose
+> own docstring documents that this pattern's shape inference is poisoned and derived by hand.
+>
+> The harness used is `compare_logits.cpp` (drives `GraphBuilder` directly, since the driver's `infer`
+> entry returns only an argmax) — worth promoting into `tests/` as part of fixing this, since the real
+> lesson is that **this path has no elementwise logit gate at all**, only two argmax assertions at two
+> lengths.
+
 > **Read [`BACKEND.md`](BACKEND.md) first if you are touching the exporter.** It is the working record of
 > the `EXPORT-IMPROVEMENT.md` thread (commits `42fc5d5`, `ebafa4e`, `640e49f` on `export-improvement`) and
 > describes the shape the exporter now has, which is materially different from what older entries in this
