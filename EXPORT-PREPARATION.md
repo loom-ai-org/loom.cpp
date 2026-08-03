@@ -484,6 +484,17 @@ Where it applies below, and it is not everywhere:
 * **E.1–E.4** — not applicable. Retirement removes code rather than adding checks; `ctest` green with the
   driver deleted is the whole claim.
 
+  > **Wrong for half of E.3, and the stage found out by doing it.** Retirement does not only remove
+  > code here: it *relocates a check*. Seven tests compared a Lua driver against a live C++ oracle, and
+  > re-pointing them onto a frozen waveform leaves a test that passes whether it is comparing against
+  > the fixture or against nothing — the same indistinguishability this section was written for, with a
+  > file in place of a declaration. Two probes settled it: perturbing one sample of Matcha's fixture by
+  > +0.5 fails the check (`max_abs_diff=0.5` vs the 1e-3 bound), and pointing Supertonic at an unfrozen
+  > voice style returns 77 naming the missing fixture rather than comparing against the wrong one.
+  > The prediction holds for E.1, E.2 and the five deletion commits, where `ctest` green really is the
+  > whole claim — E.2's boundary even proved itself for free, the first build after the split failing
+  > with `'KokoroConfig' is not a member of 'loom'`.
+
 Record the probe and its message in the commit, the way the positive gate's `diff -r` result is recorded.
 A gate whose result is not written down has to be re-run by the next reader.
 
@@ -777,6 +788,66 @@ stated as such rather than attempted here.
 **E.4 — stage gate.** Full `ctest` green with five drivers deleted, and **record the engine binary size
 before and after in the commit message.** Leanness is the stated goal of the architecture; measuring it
 is how the goal stops being a slogan.
+
+> **Done — eight commits.** E.3 landed as a preparatory commit plus five deletions rather than five
+> commits each doing both halves, and that factoring is worth keeping for the next retirement: the
+> fixture work is where numbers can silently change and the deletions are mechanical, so mixing them
+> would put an unreviewable `diff` inside a commit whose interesting content is a removal. R6's rule is
+> still satisfied — after the preparatory commit the only remaining consumer of each driver was its own
+> oracle test, deleted with it.
+>
+> **Gate:** 137/137 ctest, 0 failed, **98 actually run** against real checkpoints (the stage D gate ran
+> 58). Engine size, RelWithDebInfo stripped, same configuration on both sides: **1,400,440 → 1,219,952
+> bytes, −180,488 (−12.9 %)**, `.text` −13.1 %.
+
+### What stage E found that this plan did not predict
+
+* **The precondition was real but pointed at the wrong tests.** The plan says the pre-MIL C++ oracles
+  are "the numeric ground truth several MIL/Lua tests were validated against". True — but only *two* of
+  them: `test_e2e_{matcha,supertonic}_mil_lua_driver`. VITS, Kokoro and StyleTTS2's MIL tests
+  deliberately do **not** compare against the bespoke oracle, and each says why in its own header
+  (VITS's most sharply: chasing a ~0.22 mismatch traced the bug to the *bespoke* topology, not the MIL
+  one). The bulk of the fixture work was the five **bespoke-Lua** tests — bespoke Lua vs bespoke C++,
+  both sides legacy — which this plan does not mention at all. Seven consumers, not two.
+* **The drivers' *data* outlived their code, and nothing said it would.** Every surviving test
+  default-constructed a `VitsConfig`/`MatchaConfig`/`KokoroConfig`/… purely to read hyperparameters off
+  it — `n_feats`, `mel_mean`, `style_dim`, `sigma_data`, `txt_len_fixed`. Deleting the header therefore
+  removed a *data structure*, not only an implementation, and something had to hold those values. They
+  went to `tests/tts_driver_inputs.h`, one shared header rather than two copies per family, because a
+  family's bespoke and MIL tests must agree on them or they silently stop comparing the same
+  computation. That is honest but not where they belong: these are properties of the model, and a
+  self-contained GGUF should declare them — the same argument KV-CACHE.md 1.1/1.3 already made for
+  cache geometry. Recorded as a follow-up rather than smuggled into a stage that touches no export path.
+* **A frozen fixture narrows what can be checked, and one family makes that concrete rather than
+  theoretical.** Supertonic's style vectors are a driver *input*: one frozen waveform is valid for one
+  voice. The tests derive the fixture name from the style JSON's basename and **skip** when there is
+  none, which is the only honest behaviour — but it means no new voice style can ever be checked
+  against a full-pipeline reference, because the program that would produce one is gone. The other four
+  families got away with a single fixture only because their inputs are literals in the test.
+* **Every GGUF on the machine was stale, and the baseline could not be taken until they were rebuilt.**
+  All five bespoke and all five MIL GGUFs predated KV-CACHE.md's `synthesize` → `infer` rename and
+  failed with `no such Lua function 'infer'`. So "run the test to get the number the fixture must
+  reproduce" first meant regenerating ten model files. This is the plan's own third standing
+  practicality — the `.gguf` files in the tree are gitignored build outputs and routinely stale — one
+  level up: it applies to the *fixture* GGUFs a test consumes, not only to snapshot baselines.
+* **E.2's negative gate came for free; E.3's had to be constructed.** Removing the drivers from
+  `loom.h` failed the very next build with `'KokoroConfig' is not a member of 'loom'` — the boundary
+  proved itself without a probe. E.3 had no such luxury: a test comparing against a fixture and a test
+  not comparing at all look identical from a pass, so it took two deliberate probes (perturb one sample
+  of Matcha's fixture by +0.5 → `max_abs_diff=0.5`, `CHECK FAILED ... < 1e-3`; point Supertonic at
+  `F2.json` → return 77 naming the missing fixture). Same asymmetry the plan already found one level up
+  in stage C, reappearing between two steps of the same stage.
+* **Retiring the drivers orphaned nothing, but it left three components stranded.**
+  `cfm_euler_sampler.h`, `style_diffusion_sampler.h` and `bilstm_stepper.h` each existed to serve a
+  driver and each has a Lua counterpart the MIL path uses instead; all three now have a unit test and
+  no product consumer. They were checked, not assumed — that measurement is what kept them in `loom.h`
+  rather than `loom_legacy.h` — and deleting them is beyond what P4.0.8 asks. It is a real decision for
+  someone to take, filed in BACKLOG.md rather than taken here.
+* **The five bespoke-Lua tests were kept, and that is the load-bearing choice of the stage.** With
+  their C++ oracle gone they could have been deleted as "both sides legacy". They check
+  `tools/convert_*/[a-z]*_driver.lua`, which P6 retires — but P6 has not run, so deleting them now
+  would have removed a live check to make a retirement look tidier. Stage C's own rule applies
+  unchanged: a migration step that removes a check is not a refactor.
 
 ### Sequencing rationale, in one line each
 
