@@ -65,26 +65,38 @@ Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
     ggml_tensor* a = in[0];
     ggml_tensor* b = in[1];
     
-    // Dynamically heal transposed/permuted layouts in matrix multiplication (heads/seq swapped)
-    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
-        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-    } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
-        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+    // Mirrors ggml.c's own (internal, not exported) ggml_can_mul_mat check.
+    const auto can_mul_mat = [](ggml_tensor* x, ggml_tensor* y) {
+        return x->ne[0] == y->ne[0] && y->ne[2] % x->ne[2] == 0 && y->ne[3] % x->ne[3] == 0;
+    };
+
+    // Only guess at a layout when the operands do NOT already multiply -- see op_add's comment. With
+    // q/k both [head_dim, n_tokens, n_head], the first branch's `a->ne[1] == b->ne[2]` is
+    // `n_tokens == n_head`, true only at that collision, and the permute it then applies silently
+    // transposes attention's own operands. Same trap as the RoPE one, in the other half of attention:
+    // it is why the expanded (unfused) path stayed wrong at n_tokens == n_head after op_add/op_mul were
+    // guarded, while the fused ATTENTION path -- which never reaches this code -- came out clean.
+    if (!can_mul_mat(a, b)) {
+        // Dynamically heal transposed/permuted layouts in matrix multiplication (heads/seq swapped)
+        if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+        } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+        }
+
+        // Dynamically heal transposed/permuted input tensors by transposing on the fly
+        if (a->ne[0] != b->ne[0] && a->ne[0] == b->ne[1]) {
+            b = ggml_transpose(pc.ctx, b);
+        }
     }
-    
-    // Dynamically heal transposed/permuted input tensors by transposing on the fly
-    if (a->ne[0] != b->ne[0] && a->ne[0] == b->ne[1]) {
-        b = ggml_transpose(pc.ctx, b);
-    }
-    
-    // Ensure the input tensor b is contiguous in memory for ggml_mul_mat execution
+
+    // Ensure the input tensor b is contiguous in memory for ggml_mul_mat execution. NOT a guess, and so
+    // deliberately outside the guard above: ggml_mul_mat requires it regardless.
     if (!ggml_is_contiguous(b)) {
         b = ggml_cont(pc.ctx, b);
     }
 
-    // Mirrors ggml.c's own (internal, not exported) ggml_can_mul_mat check.
-    const bool can_mul_mat = a->ne[0] == b->ne[0] && b->ne[2] % a->ne[2] == 0 && b->ne[3] % a->ne[3] == 0;
-    if (!can_mul_mat) {
+    if (!can_mul_mat(a, b)) {
         throw SchemaError("MUL_MAT: incompatible shapes a=[" + std::to_string(a->ne[0]) + "," +
                            std::to_string(a->ne[1]) + "," + std::to_string(a->ne[2]) + "," +
                            std::to_string(a->ne[3]) + "] b=[" + std::to_string(b->ne[0]) + "," +
@@ -103,21 +115,31 @@ Outputs op_add(PrimitiveContext& pc, const Inputs& in, const Json&) {
     if (ggml_nelements(b) > ggml_nelements(a)) {
         std::swap(a, b);
     }
-    
-    // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
-    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
-        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-    } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
-        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+
+    // The healing heuristics below guess a layout from ambiguous SIZES, so none of them may run when
+    // the operands are ALREADY broadcast-compatible: at that point there is nothing to fix and a guess
+    // can only corrupt. This is exactly the reasoning the NOTE further down records for the "axis 0/1
+    // swapped" branch that was deleted -- the same trap, one heuristic further along, and it made every
+    // MIL-exported causal LM numerically wrong whenever n_tokens happened to equal n_head (or
+    // n_head_kv). See BACKLOG.md's entry: RoPE's cos [head_dim, n_tokens, 1] against q
+    // [head_dim, n_tokens, n_head] matched `a->ne[2] == b->ne[1]` only at that collision, and the
+    // resulting permute turned per-token rotation into per-head rotation.
+    if (!ggml_can_repeat(b, a)) {
+        // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
+        if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+        } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+        }
+
+        // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
+        if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
+            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+        } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
+            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+        }
     }
-    
-    // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
-    if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
-        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-    } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
-        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-    }
-    
+
     // NOTE: an earlier revision of this function also had an "axis 0 and 1 swapped" healing branch here
     // (permute+cont whichever operand looked transposed relative to the other, by ne[0]==other.ne[1] &&
     // ne[1]==other.ne[0]). It was a band-aid for the attention-score MUL_MAT operand-order bug (see
@@ -188,29 +210,33 @@ Outputs op_mul(PrimitiveContext& pc, const Inputs& in, const Json&) {
         std::swap(a, b);
     }
     
-    // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
-    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
-        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-    } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
-        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+    // Same guard, same reason as op_add's -- see the comment there. A heuristic that reads a layout off
+    // ambiguous sizes must never fire on operands that already broadcast correctly.
+    if (!ggml_can_repeat(b, a)) {
+        // Dynamically heal heads/seq layout transpositions (axis 1 and 2 swapped)
+        if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]) {
+            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+        } else if (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[2] && b->ne[2] == a->ne[1]) {
+            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+        }
+
+        // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
+        if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
+            b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
+        } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
+            a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
+        }
+
+        // Dynamically heal transposed layouts where axis 0 and 1 are swapped
+        if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
+            a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
+            a = ggml_cont(pc.ctx, a);
+        } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
+            b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
+            b = ggml_cont(pc.ctx, b);
+        }
     }
-    
-    // Dynamically heal heads/seq layout transpositions with broadcasting (axis 1 and 2 swapped)
-    if (a->ne[0] == b->ne[0] && a->ne[2] == b->ne[1] && b->ne[2] == 1) {
-        b = ggml_permute(pc.ctx, b, 0, 2, 1, 3);
-    } else if (b->ne[0] == a->ne[0] && b->ne[2] == a->ne[1] && a->ne[2] == 1) {
-        a = ggml_permute(pc.ctx, a, 0, 2, 1, 3);
-    }
-    
-    // Dynamically heal transposed layouts where axis 0 and 1 are swapped
-    if (a->ne[0] == b->ne[1] && a->ne[1] == b->ne[0]) {
-        a = ggml_permute(pc.ctx, a, 1, 0, 2, 3);
-        a = ggml_cont(pc.ctx, a);
-    } else if (b->ne[0] == a->ne[1] && b->ne[1] == a->ne[0]) {
-        b = ggml_permute(pc.ctx, b, 1, 0, 2, 3);
-        b = ggml_cont(pc.ctx, b);
-    }
-    
+
     a = ensure_packed(pc.ctx, a);
     b = ensure_packed(pc.ctx, b);
 

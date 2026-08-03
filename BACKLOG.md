@@ -38,39 +38,51 @@ intended shape. SupertonicTTS is the one model in this family that's already ful
 
 ## Exporter / MIL compiler
 
-> ### 🔴 OPEN BUG (found 2026-08-03): the MIL causal-LM export is numerically WRONG at some prompt lengths
+> ### ✅ FIXED (2026-08-03): causal LMs were wrong whenever `n_tokens == n_head`
 >
 > Found while measuring something else — the fused-vs-unfused logit comparison KV-CACHE.md stage 2 asked
-> for. **This predates the KV-cache thread entirely** and is not caused by it: the pre-session
-> `qwen3_0.6b_mil_monolithic.gguf` (built 2026-07-30) is **bit-identical** to a fresh unfused export
-> (`max|Δ| = 0.000e+00` over the whole 151k-token logit vector), and the bug reproduces in both.
+> for. **It predated the KV-cache thread entirely**: the pre-session `qwen3_0.6b_mil_monolithic.gguf`
+> (2026-07-30) is bit-identical to a fresh unfused export (`max|Δ| = 0.000e+00` over the whole 151k-token
+> logit vector) and failed the same way.
 >
-> **Symptom.** Qwen3-0.6B, prefill at `n_past=0`, compared against `AutoModelForCausalLM` on the same
-> tokens. Across `n = 2…32`, every length agrees with HF to `max|Δ| ≈ 2e-5` **except `n = 8` and
-> `n = 16`**, where it is off by **13.7 and 22.9 logits** and the argmax changes. It is length-dependent,
-> not content-dependent: **five different 8-token prompts all give the wrong top-1**. The cleanest
-> demonstration needs no reference at all — `"A B C D E F G H"` (8 tokens) should predict `" I"`
-> (HF: 358); the export predicts 425.
+> **Symptom.** Qwen3-0.6B agreed with HF to `max|Δ| ≈ 2e-5` at every prompt length from 2 to 32 **except
+> 8 and 16**, where it was off by 13.7 and 22.9 logits and the argmax changed. Length-dependent, not
+> content-dependent — five different 8-token prompts all gave the wrong top-1, and `"A B C D E F G H"`
+> predicted 425 instead of `" I"`.
 >
-> **Why no test caught it.** `test_e2e_lfm2_mil_export` is the only numeric gate on this path and its two
-> prompts are **3 and 7 tokens** — both "good" lengths. Nothing in the suite exercises a length that fails.
+> **Root cause.** `op_add`/`op_mul`/`op_mul_mat` (`src/ops/primitives_basic.cpp`) carry "dynamically heal
+> transposed layouts" heuristics that infer an operand's intended layout **from its sizes**. Those are
+> ambiguous the moment two axes are equal, and a transformer makes that happen for real:
 >
-> **What is NOT the cause** (each checked, not assumed): the attention fusion (both paths fail
-> identically at `n=8`); the reference (plain HF and the exported `_CausalLMWrapper` agree to 2e-5 at
-> every length, so the wrapper's explicit 4D mask + `cache_position` are not it); nondeterminism (two
-> independent exports are bit-identical); and the harness (its answers match what the Lua driver and
-> `loom_cli` produce for the same prompt).
+> * RoPE multiplies `cos [head_dim, n_tokens, 1]` into `q [head_dim, n_tokens, n_head]`. `op_mul`'s
+>   branch `a->ne[2] == b->ne[1] && b->ne[2] == 1` reads `n_head == n_tokens` — true only at the
+>   collision — and permuted `cos` to `[head_dim, 1, n_head]`, turning **per-token rotation into
+>   per-head rotation**.
+> * `op_mul_mat`'s `a->ne[1] == b->ne[2] && a->ne[2] == b->ne[1]` does the same to attention's own
+>   `q`/`k`, both `[head_dim, n_tokens, n_head]`.
 >
-> **Where to look next.** Bisect by dumping per-layer hidden states from both loom and HF for an 8-token
-> prompt and finding the first op that diverges. Prime suspects, in order: the `attention_mask`
-> `slice_by_index` → `VIEW` chain (its `end` comes from a runtime `gather` on a shape, and the exporter
-> renders it as a static `n_tokens` expression); and `fuse_gqa_repeat_kv`'s `-1`-inferred reshapes, whose
-> own docstring documents that this pattern's shape inference is poisoned and derived by hand.
+> A GQA model therefore failed at **two** lengths (`n_head` and `n_head_kv`), because k/v carry the
+> smaller head count. Confirmed by construction: tiny models with `(n_head_kv, n_head)` of (2,4) and
+> (3,6) failed at exactly {2,4} and {3,6}.
 >
-> The harness used is `compare_logits.cpp` (drives `GraphBuilder` directly, since the driver's `infer`
-> entry returns only an argmax) — worth promoting into `tests/` as part of fixing this, since the real
-> lesson is that **this path has no elementwise logit gate at all**, only two argmax assertions at two
-> lengths.
+> **Fix.** None of these heuristics may run when the operands are *already* compatible — at that point
+> there is nothing to fix and a guess can only corrupt. Guarded on `ggml_can_repeat`/`can_mul_mat`
+> respectively. This is the same reasoning the NOTE in `op_add` already recorded for a sibling branch
+> that had been deleted for "re-corrupting already-correct tensors"; the remaining branches had the
+> identical flaw. The standing principle is in that note: *the real fix belongs at the exporter, which
+> knows the true layout instead of guessing from ambiguous shapes* — these guards make the guessing
+> unreachable for correct graphs, but the heuristics themselves are still layout-guessing and should
+> eventually go.
+>
+> **Verification.** Qwen3-0.6B now matches HF at every length 2–32 (`max|Δ| ≈ 2e-5`), fused and unfused;
+> all three tiny models have no failing lengths; LFM2's HF-token gate 8/8; Whisper 13/13; `ctest` 142/142.
+>
+> **Why nothing caught it, and what changed.** `test_e2e_lfm2_mil_export` was the only numeric gate on
+> this path and its prompts are 3 and 7 tokens — both lengths that happen to pass.
+> `tests/test_broadcast_axis_collision.cpp` now sweeps `n_tokens` *across* the head count at the
+> primitive level (no checkpoint, milliseconds), and was confirmed to fail with the guards reverted.
+> `tools/debug/compare_logits.cpp` is the harness that found it: it drives `GraphBuilder` directly,
+> because the driver's `infer` entry returns an argmax — the resolution at which this bug is invisible.
 
 > **Read [`BACKEND.md`](BACKEND.md) first if you are touching the exporter.** It is the working record of
 > the `EXPORT-IMPROVEMENT.md` thread (commits `42fc5d5`, `ebafa4e`, `640e49f` on `export-improvement`) and
