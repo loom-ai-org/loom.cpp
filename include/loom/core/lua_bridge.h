@@ -29,6 +29,43 @@ class KvCache;
 // relative-position-table cropping and loom.get_weight for direct raw-weight introspection outside a
 // graph computation) -- NOT a general-purpose Lua<->C++ serialization framework, just what real driver
 // scripts have needed so far.
+//
+// ---------------------------------------------------------------------------------------------------
+// THE CRITERION A NEW BINDING MUST MEET (EXPORT-PREPARATION.md P4.0.8/decision 1, 2026-08-01)
+// ---------------------------------------------------------------------------------------------------
+// This engine is deliberately lean -- the target is edge devices, and the project's stated selling
+// point is that adding a model family costs Python in the exporter, not C++ here. Every binding added
+// below is a permanent tax on that leanness and on the "four headers are the whole contract" claim
+// (EXPORT-PREPARATION.md 1.3), so the bar is:
+//
+//   A binding must be a GENERIC HOST-SIDE TENSOR OP, not model adaptation.
+//
+// Generic host-side tensor op:
+//   * it reads no model config -- no hyperparameter, no architecture name, no layer count reaches it;
+//     everything it needs arrives as a call argument from the driver script;
+//   * it earns its place in C++ for a structural reason, not a convenience one. In practice that
+//     reason has always been the same: the operation's OUTPUT LENGTH IS DATA-DEPENDENT, so it cannot
+//     live in a static topology, whose shapes are fixed at export time by the declared axes;
+//   * two unrelated families could use it unchanged.
+//
+// Model adaptation -- does NOT belong here, and belongs in the exporter instead:
+//   * anything whose behaviour branches on which model is running;
+//   * anything that encodes a family's orchestration (a sampler, a decode loop, a phase ordering).
+//     These are Lua, and the hard cases already are: the CFM Euler loop, the ADPM2 diffusion sampler
+//     and BiLSTM stepping all run as driver script today. If ADPM2 did not need C++, essentially no
+//     orchestration shape does.
+//
+// The two bindings that look family-specific, labelled against the criterion (both were reviewed and
+// KEPT on 2026-08-01; see their declarations below for the per-binding argument):
+//
+//   loom.expand_by_duration            -- PASSES. Repeat-rows-by-count. Reads no config; output length
+//                                         is sum(durations), known only at run time.
+//   loom.pad_crop_relative_embeddings  -- PASSES. Symmetric pad-or-crop of a relative-position table
+//                                         about its centre. Reads no config; the crop width follows the
+//                                         run-time sequence length.
+//
+// Both name a family in their comments because a family is where they were first needed, which is
+// provenance, not a dependency.
 class LoomLuaBridge {
 public:
     explicit LoomLuaBridge(ggml_backend_t backend);
@@ -111,7 +148,18 @@ private:
     static int l_seed_rng(lua_State* L);
     static int l_gaussian_array(lua_State* L);
     static int l_uniform_array(lua_State* L);
+    // `loom.expand_by_duration(rows_flat, T, C, durations)`: repeats row `t` of a (T, C) row-major array
+    // `durations[t]` times, returning a flat (sum(durations), C) array. MEETS the binding criterion
+    // above: it reads no model config -- T, C and the durations are all call arguments -- and it is in
+    // C++ because `sum(durations)` is only known at run time, so no static topology can declare the
+    // output shape. VITS/Matcha/Kokoro all call it for duration expansion, and it would serve any
+    // family with a length predictor unchanged.
     static int l_expand_by_duration(lua_State* L);
+    // `loom.pad_crop_relative_embeddings(raw, window_size, k_channels, length)`: symmetrically pads or
+    // crops a relative-position table about its centre to cover `length`. MEETS the binding criterion
+    // above for the same two reasons -- every parameter is a call argument, and whether this pads or
+    // crops (and by how much) follows the run-time sequence length, which a static topology cannot
+    // express. First needed by VITS's relative-attention layers; nothing in it is VITS-specific.
     static int l_pad_crop_relative_embeddings(lua_State* L);
     static int l_get_weight(lua_State* L);
 };
