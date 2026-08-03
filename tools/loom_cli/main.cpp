@@ -213,10 +213,19 @@ int main(int argc, char** argv) {
                 // Initialize the Lua JIT dynamic driver bridge
                 loom::LoomLuaBridge bridge(backend.get());
                 
-                // Dynamically discover and register all sub-graph modules present in GGUF
+                // Dynamically discover and register all sub-graph modules present in GGUF. A topology
+                // carrying ATTENTION nodes needs a KV cache to write into (KV-CACHE.md stage 2), sized
+                // from the model's own declared geometry -- the CLI asks the file rather than knowing
+                // anything per-model, which is the point of declaring it there.
+                std::unique_ptr<loom::KvCache> kv_cache;
                 const std::vector<std::string> sub_modules = model->topology_names();
                 for (const std::string& mod_name : sub_modules) {
-                    bridge.register_module(mod_name, *model, loom::GraphTopology::parse(model->topology_json(mod_name)), nullptr);
+                    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(mod_name));
+                    if (topo.uses_kv_cache() && kv_cache == nullptr) {
+                        kv_cache = loom::make_kv_cache(*model, backend.get());
+                    }
+                    loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
+                    bridge.register_module(mod_name, *model, std::move(topo), cache_for_module);
                 }
                 
                 // Load the master driver script

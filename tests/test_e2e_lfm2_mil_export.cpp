@@ -71,8 +71,20 @@ bool run_gguf_case(const std::string& gguf_path) {
     // Monolithic exports have exactly one topology (named "main_topology"). Register whatever topologies
     // the file actually declares instead of assuming a single hardcoded name, so this also works
     // unmodified against a modular-profile export (one topology per prefix/layer_i/suffix_i slice).
+    //
+    // KV-CACHE.md stage 2: a fused export's topology carries ATTENTION nodes, and op_attention throws
+    // if it has no cache to write into -- so the cache is allocated from the GGUF's own declared
+    // geometry, exactly as the whisper Lua test does. Built lazily and shared by every topology that
+    // asks for one, and simply never built for an export that has no ATTENTION node at all (the
+    // modular profile today, whose per-submodule layer indexing is deliberately left unfused).
+    std::unique_ptr<loom::KvCache> kv_cache;
     for (const std::string& mod_name : model->topology_names()) {
-        bridge.register_module(mod_name, *model, loom::GraphTopology::parse(model->topology_json(mod_name)), nullptr);
+        loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(mod_name));
+        if (topo.uses_kv_cache() && kv_cache == nullptr) {
+            kv_cache = loom::make_kv_cache(*model, backend.get());
+        }
+        loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
+        bridge.register_module(mod_name, *model, std::move(topo), cache_for_module);
     }
     bridge.load_script(driver_script);
 
