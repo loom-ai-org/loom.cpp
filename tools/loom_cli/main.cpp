@@ -11,6 +11,7 @@
 // greedy-CTC-decodes the logits, and detokenizes with the model's real SentencePiece vocab.
 
 #include "loom/loom.h"
+#include "loom/core/conv_state_cache.h"
 #include "wav_file.h"
 
 #include <ggml-cpu.h>
@@ -218,6 +219,7 @@ int main(int argc, char** argv) {
                 // from the model's own declared geometry -- the CLI asks the file rather than knowing
                 // anything per-model, which is the point of declaring it there.
                 std::unique_ptr<loom::KvCache> kv_cache;
+                std::unique_ptr<loom::ConvStateCache> conv_state;
                 const std::vector<std::string> sub_modules = model->topology_names();
                 for (const std::string& mod_name : sub_modules) {
                     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(mod_name));
@@ -225,7 +227,14 @@ int main(int argc, char** argv) {
                         kv_cache = loom::make_kv_cache(*model, backend.get());
                     }
                     loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
-                    bridge.register_module(mod_name, *model, std::move(topo), cache_for_module);
+                    // A hybrid's ShortConv blocks carry their own history, which the KV cache does not
+                    // hold -- allocated from the file's own loom.n_conv_* keys, same as above
+                    // (BACKLOG.md P4.0.10).
+                    if (topo.uses_conv_state() && conv_state == nullptr) {
+                        conv_state = loom::make_conv_state_cache(*model, backend.get());
+                    }
+                    loom::ConvStateCache* conv_for_module = topo.uses_conv_state() ? conv_state.get() : nullptr;
+                    bridge.register_module(mod_name, *model, std::move(topo), cache_for_module, conv_for_module);
                 }
                 
                 // Load the master driver script

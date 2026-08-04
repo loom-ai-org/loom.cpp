@@ -554,6 +554,25 @@ def _op_loom_group_norm(self, op, ctx):
                   "attrs": {"shape": [-1] + x_shape[1:]}})
 
 
+@topology_rule('loom_short_conv')
+def _op_loom_short_conv(self, op, ctx):
+    # One SHORT_CONV node -- the engine's stateful causal depthwise convolution, and the ONLY node type
+    # that can reach a ConvStateCache (BACKLOG.md P4.0.10; see `passes.py`'s `fuse_loom_short_conv`,
+    # which produces this op, and src/ops/primitives_conv.cpp's `op_short_conv`, which executes it).
+    #
+    # No layout work here, unlike the ATTENTION rule: MIL's [b, C, seq] is ne=[seq, C, b] on this side,
+    # which already IS the [n_tokens, channels] layout op_short_conv reads, and the depthwise weight's
+    # MIL [C, 1, K] is ne=[K, 1, C], already the [kernel, 1, channels] it expects. The only reordering
+    # is that the engine takes the kernel FIRST, matching CONV_1D_DW's own input order.
+    nodes, resolve = ctx.nodes, ctx.resolve
+    out = self.safe_name(op.outputs[0].name)
+    x_in = resolve(self.safe_name(op.inputs["x"].name))
+    w_in = resolve(self.safe_name(op.inputs["weight"].name))
+    layer = int(static_scalar(op.inputs.get("layer"), 0))
+    nodes.append({"op": "SHORT_CONV", "inputs": [w_in, x_in], "outputs": [out],
+                  "attrs": {"layer": layer}})
+
+
 @topology_rule('loom_fused_attention')
 def _op_loom_fused_attention(self, op, ctx):
     # One ATTENTION node -- the engine's own composite SDPA primitive, and the ONLY node type that can

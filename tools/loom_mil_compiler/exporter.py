@@ -1222,8 +1222,13 @@ class LoomGGUFExporter:
         if not is_bespoke:
             # `fuse_attention` is opt-in per export (KV-CACHE.md decision 4): the SDPA pattern is
             # generic, so running it unconditionally would give the non-autoregressive TTS families an
-            # ATTENTION node -- and a KV cache -- they must never have.
-            apply_loom_mil_passes(self.program, fuse_attention=bool(self.kwargs.get("fuse_attention")))
+            # ATTENTION node -- and a KV cache -- they must never have. `fuse_conv` is opt-in for the
+            # identical reason, one op family over (BACKLOG.md P4.0.10): `conv_state` also defaults to
+            # true, so a non-autoregressive model matching the causal-conv pattern would acquire
+            # persistent state it must never have.
+            apply_loom_mil_passes(self.program,
+                                   fuse_attention=bool(self.kwargs.get("fuse_attention")),
+                                   fuse_conv=bool(self.kwargs.get("fuse_conv")))
             self.facts.annotate_dynamic_shapes(self.program)
         self._mil_passes_applied = True
 
@@ -1354,6 +1359,11 @@ class LoomGGUFExporter:
     # An allow-list by exclusion rather than by enumeration, because the safe set is the open one:
     # everything else in a decoder block (MUL_MAT, ADD, the norms, ROPE, SILU, ...) is position-wise or
     # head-wise and computes the same thing for token t whether or not tokens 0..t-1 are present.
+    # This set SHRINKS -- one entry per op that gains a state slot. `SHORT_CONV` is deliberately absent
+    # rather than listed-and-excepted: it mixes along the token axis AND carries its own history, which
+    # is exactly the property that makes an op safe here, so the rule reads the same for it as for
+    # MUL_MAT. `CONV_1D_DW` stays, because an UNFUSED causal conv is still stateless -- a topology gets
+    # a decode loop only if the fusion actually replaced its convs (BACKLOG.md P4.0.10).
     _NON_CACHED_SEQUENCE_STATE_OPS = frozenset({
         "CONV_1D", "CONV_1D_DW", "CONV_2D", "CONV_2D_DW", "CONV_TRANSPOSE_1D", "CONV_TRANSPOSE_2D",
         "CONV_FLOW_REVERSE", "SSM_CONV", "SSM_SCAN", "RWKV_WKV6", "RWKV_WKV7",
@@ -2116,6 +2126,48 @@ class LoomGGUFExporter:
             "kv_cache_size": int(kv_cache_size),
         }
 
+    def _conv_state_geometry(self) -> dict:
+        """The three facts `loom::make_conv_state_cache` needs, read off the fused SHORT_CONV nodes
+        themselves -- or `{}` when this export produced none (BACKLOG.md P4.0.10).
+
+        Exactly the arrangement `_kv_cache_geometry` uses, and for the same reason: a SHORT_CONV node
+        with `conv_state=true` makes `op_short_conv` throw unless the host registered a store, so fusing
+        changes the topology's runtime requirements and the file has to say so. Read from the graph
+        rather than from the config because the slot count must equal the number of conv blocks the
+        fusion actually produced -- for LFM2-350M that is 10, against a declared `num_hidden_layers` of
+        16, and `fuse_loom_short_conv` numbers its slots densely to match.
+
+        Unlike the KV cache there is no capacity to pass in: a conv slot holds `kernel - 1` columns and
+        nothing else, so its size is a property of the weights and never of the context length.
+        """
+        n_state = n_embd_conv = None
+        n_blocks = 0
+        for func in getattr(self.program, "functions", {}).values():
+            for op in func.operations:
+                if op.op_type != "loom_short_conv":
+                    continue
+                n_blocks += 1
+                # MIL x is [batch, channels, seq]; weight is [channels, 1, kernel].
+                geom = (int(op.inputs["weight"].shape[-1]) - 1, int(op.inputs["x"].shape[1]))
+                if n_state is None:
+                    n_state, n_embd_conv = geom
+                elif geom != (n_state, n_embd_conv):
+                    # One store is allocated for the whole model with one slot shape, so blocks that
+                    # disagree cannot be served by it -- say so rather than write the first block's
+                    # geometry and corrupt the rest.
+                    raise NotImplementedError(
+                        f"loom_short_conv op '{op.name}' has geometry {geom} (kernel-1, channels), but "
+                        f"an earlier block declared {(n_state, n_embd_conv)}. A ConvStateCache is "
+                        "allocated with ONE slot shape, so per-block variation is unsupported."
+                    )
+        if not n_blocks:
+            return {}
+        return {
+            "n_conv_layer": n_blocks,
+            "n_conv_state": n_state,
+            "n_embd_conv": n_embd_conv,
+        }
+
     def _collect_mul_mat_weight_names(self) -> set:
         """Every MUL_MAT node's *first* input, across all topologies -- the weight-first argument per
         loom's convention (src/ops/primitives_basic.cpp's op_mul_mat is a bare ggml_mul_mat(a, b) wrap
@@ -2213,6 +2265,12 @@ class LoomGGUFExporter:
         # allocates from the file alone rather than from a per-model C++ struct. Absent entirely for
         # every unfused export, which is every model but the causal LMs.
         for key, value in self._kv_cache_geometry().items():
+            w.add_uint32(f"loom.{key}", int(value))
+
+        # The conv-state geometry, on exactly the same terms, when this export produced SHORT_CONV
+        # nodes (BACKLOG.md P4.0.10). Absent for every model without stateful convolutions, which today
+        # is everything but a fused LFM2.
+        for key, value in self._conv_state_geometry().items():
             w.add_uint32(f"loom.{key}", int(value))
 
         # Embed each static submodule topology JSON string

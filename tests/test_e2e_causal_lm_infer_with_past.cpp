@@ -15,17 +15,19 @@
 // generation left past `n_tokens`. That is re-checked at the end.
 //
 // Generic over any fused causal-LM GGUF rather than pinned to one checkpoint -- what makes a model
-// eligible is a property of its graph (a cached ATTENTION node, and no conv/SSM/RWKV op carrying
-// cross-step state the cache does not hold; see `LoomGGUFExporter._non_cached_sequence_state`), so the
-// test asks the file whether it has the entry and skips if not. On this machine Qwen3-0.6B and
-// SmolLM2-360M qualify; LFM2-350M deliberately does not -- its ten ShortConv layers are stateful across
-// steps, so it exports `infer` alone.
+// eligible is a property of its graph (a cached ATTENTION node, and no op carrying cross-step state
+// nothing holds; see `LoomGGUFExporter._non_cached_sequence_state`), so the test asks the file whether
+// it has the entry and skips if not. Qwen3-0.6B and SmolLM2-360M qualify, and since P4.0.10 so does
+// LFM2-350M: its ten ShortConv blocks are stateful across steps, but their state now has somewhere to
+// live (`SHORT_CONV` + `ConvStateCache`), so the hybrid is eligible rather than excluded. That case is
+// the whole reason this test allocates a conv-state store below.
 //
 // Set LOOM_CAUSAL_LM_KV_GGUF to any GGUF produced by `loom-export <hf-causal-lm-dir>`.
 
 #include "test_util.h"
 
 #include "loom/loom.h"
+#include "loom/core/conv_state_cache.h"
 
 #include <ggml-cpu.h>
 
@@ -68,8 +70,8 @@ int main() {
 
     if (driver_script.find("function infer_with_past(") == std::string::npos) {
         std::fprintf(stderr, "skipping: '%s' has no infer_with_past entry -- either it was exported "
-                              "before KV-CACHE.md stage 3, or its graph carries cross-step state the KV "
-                              "cache does not hold (LFM2's ShortConv layers are the real case)\n",
+                              "before KV-CACHE.md stage 3, or its graph carries cross-step state no "
+                              "store holds -- an UNFUSED conv/SSM/RWKV op is the real case\n",
                       gguf_env);
         return kSkipReturnCode;
     }
@@ -77,6 +79,7 @@ int main() {
     // Sized from the file's own declared geometry, exactly as the whisper Lua test and loom_cli do --
     // a host needs no per-model struct to allocate it (KV-CACHE.md stage 1).
     std::unique_ptr<loom::KvCache> kv_cache;
+    std::unique_ptr<loom::ConvStateCache> conv_state;
     loom::LoomLuaBridge bridge(backend.get());
     for (const std::string& name : model->topology_names()) {
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(name));
@@ -84,7 +87,14 @@ int main() {
             kv_cache = loom::make_kv_cache(*model, backend.get());
         }
         loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
-        bridge.register_module(name, *model, std::move(topo), cache_for_module);
+        // A hybrid's ShortConv blocks carry their own history, which the KV cache does not
+        // hold -- allocated from the file's own loom.n_conv_* keys, same as above
+        // (BACKLOG.md P4.0.10).
+        if (topo.uses_conv_state() && conv_state == nullptr) {
+            conv_state = loom::make_conv_state_cache(*model, backend.get());
+        }
+        loom::ConvStateCache* conv_for_module = topo.uses_conv_state() ? conv_state.get() : nullptr;
+        bridge.register_module(name, *model, std::move(topo), cache_for_module, conv_for_module);
     }
     LOOM_CHECK(kv_cache != nullptr);
     bridge.load_script(driver_script);
