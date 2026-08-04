@@ -303,6 +303,51 @@ class loom_scale(Operation):
         return self.x.sym_type
 
 
+@register_op(namespace="loom")
+class loom_short_conv(Operation):
+    """
+    One causal depthwise convolution that owns its cross-step history -- lowered by `topology_ops.py` to
+    the engine's `SHORT_CONV` primitive, the only node type that can reach a `ConvStateCache`
+    (BACKLOG.md P4.0.10). Produced by `passes.py`'s `fuse_loom_short_conv`.
+
+    Replaces the traced `conv(pad=[K-1, K-1]) -> slice_by_index(first n_tokens)` pair, which is how
+    transformers writes a causal conv with no cache: pad both sides, then throw the trailing K-1 outputs
+    away. That form is CORRECT for a prefill and unusable for a decode step, because the K-1 columns a
+    length-1 window needs are in the previous call, not in this one. `op_short_conv` keeps them instead.
+
+    `layer` addresses the state slot and is assigned in conv-block OCCURRENCE order, exactly as
+    `loom_fused_attention`'s is and for the same reason: LFM2-350M declares 16 hidden layers and has 10
+    conv blocks, so a torch module index would address past the end of a 10-slot store.
+
+    The declared output is the SLICE's shape, not the padded conv's -- the fusion absorbs the slice, and
+    `op_short_conv` returns exactly n_tokens columns.
+    """
+    input_spec = InputSpec(
+        x=TensorInputType(type_domain="T"),
+        weight=TensorInputType(type_domain="T"),
+        layer=TensorInputType(const=True, optional=True, type_domain=types.int32),
+    )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+    }
+
+    def default_inputs(self):
+        from coremltools.converters.mil.mil.input_type import DefaultInputs
+        return DefaultInputs(layer=0)
+
+    def type_inference(self):
+        x_shape = list(self.x.shape)
+        if len(x_shape) != 3:
+            raise ValueError(
+                f"loom_short_conv expects a rank-3 x [batch, channels, seq], got {x_shape}"
+            )
+        # Same shape in as out: a causal conv consumes n_tokens columns and produces n_tokens columns.
+        # `seq` is the only symbolic entry here, and it passes through untouched, which is what lets the
+        # op sit inside a decode loop with no shape special case.
+        return types.tensor(self.x.dtype, tuple(x_shape))
+
+
 # The fusion pass that produces `loom_fused_attention` lives in `passes.py` (`loom::
 # fuse_loom_attention`), with every other MIL->MIL rewrite this exporter runs. It was a `pass`-bodied
 # `FuseLoomAttention` stub here for the whole of P3/P4.0 -- see KV-CACHE.md §1.3, which measured what

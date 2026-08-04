@@ -26,6 +26,7 @@
 #include "test_util.h"
 
 #include "loom/loom.h"
+#include "loom/core/conv_state_cache.h"
 
 #include <ggml-cpu.h>
 
@@ -78,13 +79,21 @@ bool run_gguf_case(const std::string& gguf_path) {
     // asks for one, and simply never built for an export that has no ATTENTION node at all (the
     // modular profile today, whose per-submodule layer indexing is deliberately left unfused).
     std::unique_ptr<loom::KvCache> kv_cache;
+    std::unique_ptr<loom::ConvStateCache> conv_state;
     for (const std::string& mod_name : model->topology_names()) {
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(mod_name));
         if (topo.uses_kv_cache() && kv_cache == nullptr) {
             kv_cache = loom::make_kv_cache(*model, backend.get());
         }
         loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
-        bridge.register_module(mod_name, *model, std::move(topo), cache_for_module);
+        // A hybrid's ShortConv blocks carry their own history, which the KV cache does not
+        // hold -- allocated from the file's own loom.n_conv_* keys, same as above
+        // (BACKLOG.md P4.0.10).
+        if (topo.uses_conv_state() && conv_state == nullptr) {
+            conv_state = loom::make_conv_state_cache(*model, backend.get());
+        }
+        loom::ConvStateCache* conv_for_module = topo.uses_conv_state() ? conv_state.get() : nullptr;
+        bridge.register_module(mod_name, *model, std::move(topo), cache_for_module, conv_for_module);
     }
     bridge.load_script(driver_script);
 

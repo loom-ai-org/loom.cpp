@@ -214,6 +214,12 @@ class LMCausalModelExportConfig(LoomExportConfig):
                 # answered by inference here. LFM2-modular therefore keeps exporting exactly as before,
                 # prefill-only, and its e2e test is unaffected.
                 fuse_attention=True,
+                # And the conv family's half (BACKLOG.md P4.0.10). Independent of `fuse_attention`
+                # rather than implied by it: they are different op families and a model can genuinely
+                # want one without the other. For a uniform decoder like Qwen3 this matches nothing and
+                # costs one pass over the graph; for LFM2 it is what turns 10 stateless ShortConv blocks
+                # into 10 stateful ones and makes the hybrid eligible for a decode loop at all.
+                fuse_conv=True,
                 kv_cache_size=self.max_seq_len,
             )
         return kwargs

@@ -975,6 +975,152 @@ class fuse_loom_attention(AbstractGraphPass):
         return True
 
 
+@register_pass(namespace="loom")
+class fuse_loom_short_conv(AbstractGraphPass):
+    """
+    Replaces each traced causal depthwise convolution with one `loom_short_conv` op, which
+    `topology_ops.py` lowers to the engine's `SHORT_CONV` primitive -- the only node type that can reach
+    a `ConvStateCache`, and therefore the thing that lets a hybrid architecture decode incrementally
+    (BACKLOG.md P4.0.10).
+
+    **Opt-in, for the same correctness reason `fuse_loom_attention` is.** The pattern is a depthwise
+    conv with symmetric `kernel - 1` padding whose output is sliced back to the input length, and that
+    is not unique to a causal LM -- a non-autoregressive model could produce it too, and giving one a
+    `conv_state` attr (which defaults to TRUE in op_short_conv) would hand it persistent state it must
+    never have. Only the causal-LM family sets `fuse_conv=True`.
+
+    The window, measured on a real LFM2-350M trace rather than assumed:
+
+        conv           (x=[b, C, s], weight=[C, 1, K], groups=C, pad=[K-1, K-1], pad_type='custom')
+        slice_by_index (begin=[0,0,0], end_mask=[True, True, False])   -- back to the first `s` columns
+
+    That pair is how transformers writes a causal conv with no cache: pad both sides, then discard the
+    trailing K-1 outputs. It is correct for a prefill and unusable for a decode step, since the K-1
+    columns a length-1 window needs live in the PREVIOUS call. `op_short_conv` keeps them in a slot
+    instead, which is why the fusion absorbs the slice rather than leaving it to DCE -- a surviving
+    slice would cut a decode step's output using extents chosen at trace time, the same trap
+    `_mask_kv_slice_source` exists for on the attention side (KV-CACHE.md 3.2, second bullet).
+
+    `layer` is assigned in conv-block OCCURRENCE order, not by torch module index, for the reason
+    `fuse_loom_attention`'s is: LFM2-350M declares 16 hidden layers and has 10 conv blocks, so a module
+    index would address past the end of a 10-slot store.
+
+    Anything that does not match is left exactly as it was -- an unfused conv still exports and still
+    runs, just without state. A partial match must never half-rewrite.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._next_layer = 0
+            self._fuse_block(f)
+
+    @block_context_manager
+    def _fuse_block(self, block):
+        for op in list(block.operations):
+            # Same guard as fuse_loom_attention: "attribute missing" must read as "still present".
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._fuse_block(b)
+            if op.op_type != "conv":
+                continue
+            if self._try_to_transform(op, block):
+                self._next_layer += 1
+
+    @staticmethod
+    def _causal_slice(conv_var):
+        """The `slice_by_index` that cuts a symmetrically-padded conv back to its input length, or None.
+
+        Requires the slice to take the FULL extent on every axis but the last (begin 0, end ignored via
+        end_mask) and to start at 0 on the last -- i.e. it keeps a leading prefix and nothing else. A
+        slice doing anything more than that is not the causal-trim idiom and is left alone.
+        """
+        children = list(conv_var.child_ops)
+        if len(children) != 1 or children[0].op_type != "slice_by_index":
+            return None
+        slice_op = children[0]
+        rank = len(conv_var.shape) if conv_var.shape is not None else 0
+        if rank != 3:
+            return None
+
+        def bits(name, default):
+            var = slice_op.inputs.get(name)
+            if var is None or var.val is None:
+                return [default] * rank
+            vals = list(np.array(var.val).ravel())
+            return vals if len(vals) == rank else None
+
+        begin = bits("begin", 0)
+        stride = bits("stride", 1)
+        squeeze = bits("squeeze_mask", False)
+        begin_mask = bits("begin_mask", False)
+        end_mask = bits("end_mask", False)
+        if any(b is None for b in (begin, stride, squeeze, begin_mask, end_mask)):
+            return None
+        if any(bool(sq) for sq in squeeze) or any(int(st) != 1 for st in stride):
+            return None
+        # Every axis starts at 0, whether stated or masked away.
+        if any(not bool(bm) and int(bg) != 0 for bg, bm in zip(begin, begin_mask)):
+            return None
+        # Full extent on all but the last axis; the last is the one being trimmed.
+        if not all(bool(em) for em in end_mask[:-1]) or bool(end_mask[-1]):
+            return None
+        return slice_op
+
+    def _try_to_transform(self, conv_op, block):
+        x_var = conv_op.inputs.get("x")
+        weight_var = conv_op.inputs.get("weight")
+        if x_var is None or weight_var is None or weight_var.shape is None:
+            return False
+        if conv_op.inputs.get("bias") is not None:
+            return False  # op_short_conv takes no bias; LFM2's conv has none.
+        if x_var.shape is None or len(x_var.shape) != 3:
+            return False
+
+        channels = x_var.shape[1]
+        if not isinstance(channels, int):
+            return False
+        groups = conv_op.inputs.get("groups")
+        if groups is None or groups.val is None or int(groups.val) != channels:
+            return False  # depthwise only: one filter per channel, which is what the state layout assumes
+
+        kernel = int(weight_var.shape[-1])
+        if kernel < 2:
+            return False  # width-1 is position-wise and carries no history; op_short_conv rejects it too
+
+        pad = conv_op.inputs.get("pad")
+        strides = conv_op.inputs.get("strides")
+        dilations = conv_op.inputs.get("dilations")
+        for var, want in ((strides, 1), (dilations, 1)):
+            if var is None or var.val is None or any(int(v) != want for v in np.array(var.val).ravel()):
+                return False
+        if pad is None or pad.val is None:
+            return False
+        pad_vals = [int(v) for v in np.array(pad.val).ravel()]
+        # Symmetric kernel-1 padding is what makes the trailing trim a CAUSAL one. Any other padding is
+        # a different convolution and must not silently acquire state.
+        if pad_vals != [kernel - 1, kernel - 1]:
+            return False
+
+        slice_op = self._causal_slice(conv_op.outputs[0])
+        if slice_op is None:
+            return False
+        out_var = slice_op.outputs[0]
+
+        with _scope_ctx_like(conv_op):
+            fused = mb.loom_short_conv(
+                x=x_var, weight=weight_var, layer=np.int32(self._next_layer),
+                name=out_var.name, before_op=conv_op,
+            )
+
+        if not slice_op.enclosing_block.try_replace_uses_of_var_after_op(
+            anchor_op=slice_op, old_var=out_var, new_var=fused,
+        ):
+            return False
+        block.remove_ops([slice_op, conv_op])
+        return True
+
+
 _LOOM_PASS_NAMES = [
     "loom::fuse_gqa_repeat_kv",
     "loom::normalize_matmul",
@@ -991,8 +1137,13 @@ _LOOM_PASS_NAMES = [
 # before dead_code_elimination, which is what removes the subgraph the fusion orphans.
 _LOOM_ATTENTION_PASS_NAME = "loom::fuse_loom_attention"
 
+# Same placement and the same reason: after the rewrites it must see past, before the DCE that clears
+# what it orphans. Independent of the attention flag -- a model can genuinely want one and not the other
+# (a pure causal LM has no convs to fuse; a Mamba-style model would have no attention to fuse).
+_LOOM_SHORT_CONV_PASS_NAME = "loom::fuse_loom_short_conv"
 
-def apply_loom_mil_passes(prog, fuse_attention: bool = False) -> None:
+
+def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = False) -> None:
     """
     Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
     normalization (R2a), mutual-broadcast insertion (R2a), replicate-pad and depthwise-conv_transpose
@@ -1009,8 +1160,11 @@ def apply_loom_mil_passes(prog, fuse_attention: bool = False) -> None:
     have (see `test_compiler.py`'s `MockOperation`), which are never meant to pass a real MIL validate().
     """
     for pass_name in _LOOM_PASS_NAMES:
-        if pass_name == "common::dead_code_elimination" and fuse_attention:
-            # Must land between the rewrites and the DCE that cleans up after them, which is why this
-            # is spliced here rather than appended to the list.
-            PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME](prog)
+        if pass_name == "common::dead_code_elimination":
+            # Must land between the rewrites and the DCE that cleans up after them, which is why these
+            # are spliced here rather than appended to the list.
+            if fuse_attention:
+                PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME](prog)
+            if fuse_conv:
+                PASS_REGISTRY[_LOOM_SHORT_CONV_PASS_NAME](prog)
         PASS_REGISTRY[pass_name](prog)
