@@ -31,6 +31,10 @@ int main() {
             return loom.causal_mask(inputs.n_tokens, inputs.n_past)
         end
 
+        function test_windowed_causal_mask(inputs)
+            return loom.causal_mask(inputs.n_tokens, inputs.n_past, inputs.window)
+        end
+
         function test_zero_mask(inputs)
             return loom.zero_mask(inputs.rows, inputs.cols)
         end
@@ -88,6 +92,41 @@ int main() {
         // row 0 (query_pos=1): j<=1 -> [0,0,-inf]; row 1 (query_pos=2): j<=2 -> [0,0,0]
         LOOM_CHECK(arr[0] == 0.0 && arr[1] == 0.0 && arr[2] == -inf);
         LOOM_CHECK(arr[3] == 0.0 && arr[4] == 0.0 && arr[5] == 0.0);
+    }
+
+    // --- loom.causal_mask, sliding window (BACKLOG.md P4.0.11a) ---
+    // A query at absolute position p sees keys in (p - window, p] rather than [0, p]. The banding is
+    // the whole of what makes a windowed model correct; the cache is untouched and still holds
+    // everything, which is the half of P4.0.11 deliberately left for later.
+    {
+        const double inf = std::numeric_limits<double>::infinity();
+        // n_tokens=2, n_past=1, window=2 -> n_kv=3.
+        // row 0 (query_pos=1): keys 0 and 1 are within 2 of it -> [0, 0, -inf]
+        // row 1 (query_pos=2): key 0 is 2 back, i.e. OUTSIDE (p-window, p] -> [-inf, 0, 0]
+        auto result = bridge.call("test_windowed_causal_mask",
+                                   {{"n_tokens", 2.0}, {"n_past", 1.0}, {"window", 2.0}});
+        const auto& arr = std::get<std::vector<double>>(result);
+        LOOM_CHECK(arr.size() == 6);
+        LOOM_CHECK(arr[0] == 0.0 && arr[1] == 0.0 && arr[2] == -inf);
+        LOOM_CHECK(arr[3] == -inf && arr[4] == 0.0 && arr[5] == 0.0);
+    }
+
+    // A window at least as wide as the whole KV extent must reproduce the full-causal mask exactly --
+    // the property that makes this argument additive rather than a second mask implementation.
+    {
+        auto windowed = bridge.call("test_windowed_causal_mask",
+                                     {{"n_tokens", 3.0}, {"n_past", 2.0}, {"window", 99.0}});
+        auto plain = bridge.call("test_causal_mask", {{"n_tokens", 3.0}, {"n_past", 2.0}});
+        LOOM_CHECK(std::get<std::vector<double>>(windowed) == std::get<std::vector<double>>(plain));
+    }
+
+    // window <= 0 means "no window", which is how every existing two-argument call site keeps its
+    // exact previous behaviour.
+    {
+        auto zero_window = bridge.call("test_windowed_causal_mask",
+                                        {{"n_tokens", 2.0}, {"n_past", 1.0}, {"window", 0.0}});
+        auto plain = bridge.call("test_causal_mask", {{"n_tokens", 2.0}, {"n_past", 1.0}});
+        LOOM_CHECK(std::get<std::vector<double>>(zero_window) == std::get<std::vector<double>>(plain));
     }
 
     // --- loom.zero_mask ---

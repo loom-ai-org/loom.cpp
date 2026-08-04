@@ -291,17 +291,37 @@ int LoomLuaBridge::l_range(lua_State* L) {
 // Matches WhisperDriver::fill_decoder_inputs's exact causal-triangle formula
 // (src/core/whisper_driver.cpp): mask[i*n_kv+j] gates query token i (absolute position n_past+i)
 // attending to self-attention KV cell j -- 0.0 if j <= n_past+i, else -inf. n_kv = n_past+n_tokens.
+// `loom.causal_mask(n_tokens, n_past [, window])`.
+//
+// The optional third argument is sliding-window attention (BACKLOG.md P4.0.11a): a query at absolute
+// position p attends to keys in `(p - window, p]` instead of `[0, p]`. Omitted, zero or negative means
+// no window, which is the full-causal mask every caller before this got and still gets -- so this is
+// additive, and no existing driver's output moves.
+//
+// **The window lives in the MASK, not in the cache.** ggml_soft_max_ext takes an arbitrary
+// [n_kv, n_tokens] mask, so banding it is the whole of what a windowed model needs to be CORRECT; the
+// cache still holds every key and merely spends n_ctx where it could spend `window`. Making it cheap is
+// a separate and much larger item (a ring buffer breaks KvCache's "a plain view over [0, n_kv) suffices
+// for reads" invariant, and per-layer capacity breaks its single kv_size) -- deliberately not attempted
+// here, per P4.0.11's own split.
 int LoomLuaBridge::l_causal_mask(lua_State* L) {
     try {
         const auto n_tokens = static_cast<uint32_t>(luaL_checknumber(L, 1));
         const auto n_past = static_cast<uint32_t>(luaL_checknumber(L, 2));
+        // luaL_optnumber, not luaL_checknumber: every existing call site passes two arguments.
+        const double window_arg = luaL_optnumber(L, 3, 0.0);
+        const bool windowed = window_arg > 0.0;
+        const auto window = static_cast<uint32_t>(window_arg > 0.0 ? window_arg : 0.0);
         const uint32_t n_kv = n_past + n_tokens;
         std::vector<double> mask(static_cast<size_t>(n_kv) * n_tokens);
         for (uint32_t i = 0; i < n_tokens; ++i) {
             const uint32_t query_pos = n_past + i;
             for (uint32_t j = 0; j < n_kv; ++j) {
+                // `query_pos - j < window` on unsigned values is only meaningful once j <= query_pos has
+                // already been established, which the short-circuit guarantees.
+                const bool visible = (j <= query_pos) && (!windowed || (query_pos - j) < window);
                 mask[static_cast<size_t>(i) * n_kv + j] =
-                    (j <= query_pos) ? 0.0 : -std::numeric_limits<double>::infinity();
+                    visible ? 0.0 : -std::numeric_limits<double>::infinity();
             }
         }
         push_number_array(L, mask);
