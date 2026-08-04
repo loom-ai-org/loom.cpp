@@ -1,7 +1,10 @@
+#include "loom/core/conv_state_cache.h"
 #include "loom/loom_errors.h"
 #include "loom/ops/primitive_registry.h"
 
 #include <nlohmann/json.hpp>
+
+#include <cmath>
 
 namespace loom {
 namespace {
@@ -148,6 +151,92 @@ Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     return {result};
 }
 
+// Causal depthwise conv1d that owns its cross-step history -- the conv family's answer to ATTENTION,
+// and what makes a hybrid architecture (LFM2's ShortConv blocks, and Mamba/RWKV after it) able to
+// decode a token at a time (BACKLOG.md P4.0.10).
+//
+// The problem it solves: a causal conv over kernel K needs the K-1 input columns BEFORE this step's
+// first token. A prefill has them (they are in the same call); a decode step at n_tokens = 1 does not,
+// and the KV cache holds K/V and nothing else. So this op keeps them, in a ConvStateCache slot
+// addressed by the `layer` attr, exactly as op_attention keeps K/V.
+//
+// One uniform path, no prefill special case: history is either the layer's slot or the permanently-zero
+// slot when n_past == 0, and everything after the concat is identical. That "n_past == 0 means no
+// history" rule is load-bearing beyond tidiness -- it is what keeps iterated `infer` (which always
+// calls at n_past = 0) a valid oracle for `infer_with_past`, and what makes a prefill issued after a
+// generation correct without the host resetting anything (KV-CACHE.md 3.4).
+//
+// Ordering is free here, unlike ATTENTION's. The state write copies a view of the CONCATENATED buffer,
+// which reads the slot -- so there is a real data-dependency edge from read to write and ggml cannot
+// schedule the clobber first. It still goes through side_effects, because nothing downstream of the
+// declared output references it.
+Outputs op_short_conv(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("SHORT_CONV", in, 2);
+    ggml_tensor* kernel = in[0];
+    ggml_tensor* data = in[1];
+
+    const int64_t kernel_size = kernel->ne[0];
+    const int64_t n_state = kernel_size - 1;
+    if (n_state <= 0) {
+        throw SchemaError("SHORT_CONV: kernel width is " + std::to_string(kernel_size) +
+                          ", so the convolution is position-wise and carries no history -- it should "
+                          "have been emitted as CONV_1D_DW, not SHORT_CONV");
+    }
+
+    if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+
+    const bool use_state = attrs.value("conv_state", true);
+    ggml_tensor* conv_in = data;
+    if (use_state) {
+        if (!pc.conv_state) {
+            throw SchemaError("SHORT_CONV: no ConvStateCache was provided to GraphBuilder, but the "
+                              "topology uses SHORT_CONV with conv_state=true");
+        }
+        const uint32_t layer = static_cast<uint32_t>(resolve_attr_int(attrs, "layer", pc.symbols));
+        const auto n_past = static_cast<uint32_t>(std::llround(pc.symbols.get("n_past")));
+
+        if (n_state != pc.conv_state->n_state()) {
+            throw SchemaError("SHORT_CONV: kernel width implies a history of " + std::to_string(n_state) +
+                              " but the ConvStateCache was allocated for " +
+                              std::to_string(pc.conv_state->n_state()) +
+                              " -- 'loom.n_conv_state' must equal kernel-1");
+        }
+
+        ggml_tensor* history = (n_past == 0) ? pc.conv_state->read_zeros(pc.ctx)
+                                             : pc.conv_state->read(pc.ctx, layer);
+        conv_in = ggml_concat(pc.ctx, history, data, /*dim=*/0); // [n_state + n_tokens, channels]
+
+        // The next step's history is the last n_state columns of what this step convolved over -- which
+        // is why the concat, not `data`, is the source: a prompt shorter than n_state still leaves a
+        // full window, zero-padded on the left, with no length special case.
+        ggml_tensor* tail = ggml_view_2d(pc.ctx, conv_in, n_state, conv_in->ne[1], conv_in->nb[1],
+                                          static_cast<size_t>(conv_in->ne[0] - n_state) * conv_in->nb[0]);
+        ggml_tensor* write = pc.conv_state->write(pc.ctx, ggml_cont(pc.ctx, tail), layer);
+        if (pc.side_effects) {
+            pc.side_effects->push_back(write);
+        }
+    }
+
+    // Same im2col recipe as CONV_1D_DW above, but with the padding carried by the history instead of by
+    // p0: over [n_state + n_tokens] columns an unpadded kernel of width K produces exactly n_tokens
+    // outputs, which is the causal alignment the padded-then-sliced form was expressing.
+    const int p0 = use_state ? 0 : static_cast<int>(n_state);
+    ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, conv_in, conv_in->ne[0], 1, conv_in->ne[1], conv_in->ne[2]);
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, /*s0=*/1, 0, p0, 0, /*d0=*/1, 0,
+                                       /*is_2D=*/false, GGML_TYPE_F32);
+    ggml_tensor* result = ggml_mul_mat(pc.ctx, im2col, kernel);
+    result = ggml_reshape_3d(pc.ctx, result, result->ne[0], result->ne[2], 1);
+
+    if (!use_state) {
+        // The stateless form pads on BOTH sides (n_state + n_tokens + n_state - (K-1) = n_tokens +
+        // n_state outputs) and keeps the causal prefix, matching what the exporter used to emit as
+        // CONV_1D_DW + VIEW.
+        result = ggml_view_2d(pc.ctx, result, result->ne[0] - n_state, result->ne[1], result->nb[1], 0);
+        result = ggml_cont(pc.ctx, result);
+    }
+    return {result};
+}
+
 ggml_op_pool parse_pool_op(const Json& attrs) {
     const std::string op = attrs.at("op").get<std::string>();
     if (op == "max") return GGML_OP_POOL_MAX;
@@ -184,6 +273,7 @@ LOOM_REGISTER_OP(CONV_2D_DW, op_conv_2d_dw)
 LOOM_REGISTER_OP(CONV_TRANSPOSE_1D, op_conv_transpose_1d)
 LOOM_REGISTER_OP(CONV_TRANSPOSE_2D, op_conv_transpose_2d)
 LOOM_REGISTER_OP(CONV_1D_DW, op_conv_1d_dw)
+LOOM_REGISTER_OP(SHORT_CONV, op_short_conv)
 LOOM_REGISTER_OP(POOL_1D, op_pool_1d)
 LOOM_REGISTER_OP(POOL_2D, op_pool_2d)
 

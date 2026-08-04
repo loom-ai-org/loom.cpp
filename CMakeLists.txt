@@ -19,6 +19,7 @@ add_library(loom_engine
     src/core/symbol_env.cpp
     src/core/graph_topology.cpp
     src/core/graph_builder.cpp
+    src/core/conv_state_cache.cpp
     src/core/kv_cache.cpp
     src/core/generation.cpp
     src/core/tdt_decoder.cpp

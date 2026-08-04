@@ -72,6 +72,13 @@ struct GraphTopology {
     // the capacity are model facts no graph states -- and is read from the GGUF's own hparams instead
     // (see make_kv_cache in kv_cache.h).
     bool uses_kv_cache() const;
+
+    // Whether running this topology needs a persistent ConvStateCache -- true iff it contains a
+    // SHORT_CONV node whose `conv_state` attr is true (its default; see op_short_conv). Derived for
+    // exactly the reasons uses_kv_cache() is, and kept as a SECOND predicate rather than folded into a
+    // "needs state" one: a pure causal LM needs only the first, a Mamba-style model only the second,
+    // and a hybrid both, so collapsing them would over-allocate for two of the three.
+    bool uses_conv_state() const;
 };
 
 } // namespace loom

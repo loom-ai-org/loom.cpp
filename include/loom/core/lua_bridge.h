@@ -16,6 +16,7 @@ struct lua_State;
 namespace loom {
 
 class KvCache;
+class ConvStateCache;
 
 // Embeds a LuaJIT VM into the engine (see LOOM_PROCEDURAL_GENERALIZATION.md /
 // LOOM_MIL_CONVERSION.md): the data-driven replacement for bespoke per-model C++ drivers
@@ -76,12 +77,18 @@ public:
     // Registers a subgraph under `name` so a driver script can invoke it via
     // `loom.run_subgraph(name, axes_table, inputs_table)`, where `axes_table` is `{axis_name = value,
     // ...}` (EXPORT-ROADMAP.md R1 -- e.g. `{n_tokens=12, n_past=0}` or `{n_samples=16000}`, whatever
-    // axis names this specific topology declares). `model`/`kv_cache` are NOT owned by the
+    // axis names this specific topology declares). `model`/`kv_cache`/`conv_state` are NOT owned by the
     // bridge (same non-owning-reference convention as GraphBuilder itself) -- the caller must keep them
     // alive for the bridge's own lifetime. `kv_cache` is null for non-autoregressive modules (e.g.
     // Whisper's encoder); pass one for modules using the ATTENTION primitive's persistent-cache path
-    // (e.g. Whisper's decoder).
-    void register_module(const std::string& name, GgufModel& model, GraphTopology topo, KvCache* kv_cache = nullptr);
+    // (e.g. Whisper's decoder). `conv_state` is the same for SHORT_CONV -- null unless the topology has
+    // stateful convolutions, which for the models on this roadmap means an LFM2-style hybrid.
+    //
+    // Binding both HERE rather than passing them per call is what gives a Lua driver persistence with no
+    // address ever crossing the scripting boundary: the script names a module, and the C++ side knows
+    // which stores that module owns.
+    void register_module(const std::string& name, GgufModel& model, GraphTopology topo,
+                         KvCache* kv_cache = nullptr, ConvStateCache* conv_state = nullptr);
 
     // Loads `lua_source` into the VM (defines whatever top-level functions/globals it declares) --
     // throws loom::Error on a syntax error.
@@ -104,6 +111,7 @@ private:
         GgufModel* model;
         GraphTopology topo;
         KvCache* kv_cache;
+        ConvStateCache* conv_state;
         ggml_backend_t backend;
     };
 
