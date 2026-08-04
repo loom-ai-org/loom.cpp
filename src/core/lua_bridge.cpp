@@ -2,6 +2,7 @@
 
 #include "loom/core/duration_aligner.h"
 #include "loom/core/graph_builder.h"
+#include "loom/core/conv_state_cache.h"
 #include "loom/core/kv_cache.h"
 #include "loom/core/relative_position.h"
 #include "loom/loom_errors.h"
@@ -142,7 +143,8 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         }
         Module& mod = it->second;
 
-        GraphBuilder builder(mod.topo, *mod.model, mod.backend, mod.kv_cache);
+        GraphBuilder builder(mod.topo, *mod.model, mod.backend, mod.kv_cache,
+                              /*compute_meta_bytes=*/32 * 1024 * 1024, mod.conv_state);
         GraphBuilder::BuildResult r = builder.build(axes);
 
         // Iterate the `inputs_table` (string key -> flat number array) and set each declared input.
@@ -516,8 +518,9 @@ LoomLuaBridge::~LoomLuaBridge() {
     if (L_ != nullptr) lua_close(L_);
 }
 
-void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo, KvCache* kv_cache) {
-    modules_[name] = Module{&model, std::move(topo), kv_cache, backend_};
+void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo,
+                                     KvCache* kv_cache, ConvStateCache* conv_state) {
+    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backend_};
 }
 
 void LoomLuaBridge::load_script(const std::string& lua_source) {

@@ -1,6 +1,8 @@
 #include "loom/core/graph_topology.h"
 #include "loom/loom_errors.h"
 
+#include <functional>
+
 namespace loom {
 namespace {
 
@@ -84,23 +86,40 @@ GraphTopology GraphTopology::parse(const std::string& json_text) {
     }
 }
 
-bool GraphTopology::uses_kv_cache() const {
-    // `kv_cache` defaults to TRUE when absent, matching op_attention's own default -- every milestone-1
-    // LLM topology relies on that default and never sets the attr, so reading it as false here would
-    // report exactly the models that need a cache as not needing one.
-    const auto node_uses_cache = [](const TopologyNode& node) {
-        return node.op == "ATTENTION" && node.attrs.value("kv_cache", true);
-    };
+namespace {
+
+// Both predicates below ask "does any node, including inside a repeat_for block, satisfy this" -- the
+// traversal is the same and only the test differs.
+bool any_node(const std::vector<TopologyItem>& items, const std::function<bool(const TopologyNode&)>& pred) {
     for (const TopologyItem& item : items) {
         if (item.is_repeat) {
             for (const TopologyNode& node : item.repeat.nodes) {
-                if (node_uses_cache(node)) return true;
+                if (pred(node)) return true;
             }
-        } else if (node_uses_cache(item.node)) {
+        } else if (pred(item.node)) {
             return true;
         }
     }
     return false;
+}
+
+} // namespace
+
+bool GraphTopology::uses_kv_cache() const {
+    // `kv_cache` defaults to TRUE when absent, matching op_attention's own default -- every milestone-1
+    // LLM topology relies on that default and never sets the attr, so reading it as false here would
+    // report exactly the models that need a cache as not needing one.
+    return any_node(items, [](const TopologyNode& node) {
+        return node.op == "ATTENTION" && node.attrs.value("kv_cache", true);
+    });
+}
+
+bool GraphTopology::uses_conv_state() const {
+    // Same absent-means-true rule as above, for the same reason: op_short_conv defaults `conv_state` to
+    // true, so a topology that never writes the attr is one that needs the store.
+    return any_node(items, [](const TopologyNode& node) {
+        return node.op == "SHORT_CONV" && node.attrs.value("conv_state", true);
+    });
 }
 
 } // namespace loom

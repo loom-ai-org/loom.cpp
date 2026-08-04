@@ -109,8 +109,9 @@ size_t estimate_graph_size(const GraphTopology& topo, const SymbolEnv& env) {
 } // namespace
 
 GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_backend_t backend,
-                            KvCache* kv_cache, size_t compute_meta_bytes)
-    : topo_(topo), model_(model), backend_(backend), kv_cache_(kv_cache), compute_meta_bytes_(compute_meta_bytes) {}
+                            KvCache* kv_cache, size_t compute_meta_bytes, ConvStateCache* conv_state)
+    : topo_(topo), model_(model), backend_(backend), kv_cache_(kv_cache), conv_state_(conv_state),
+      compute_meta_bytes_(compute_meta_bytes) {}
 
 GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes) {
     ggml_init_params params{compute_meta_bytes_, nullptr, /*no_alloc=*/true};
@@ -148,7 +149,7 @@ GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes) {
     }
 
     std::vector<ggml_tensor*> side_effect_roots;
-    PrimitiveContext pc{ctx.get(), env, kv_cache_, &side_effect_roots};
+    PrimitiveContext pc{ctx.get(), env, kv_cache_, conv_state_, &side_effect_roots};
     for (const TopologyItem& item : topo_.items) {
         if (!item.is_repeat) {
             build_node(item.node, pc, symtab);

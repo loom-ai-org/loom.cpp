@@ -13,6 +13,7 @@
 namespace loom {
 
 class KvCache;
+class ConvStateCache;
 
 // A topology's own declared axis values for one build() call -- EXPORT-ROADMAP.md R1's named-axes
 // design: every topology declares which axis(es) its dynamic dims are actually named (axes.py's
@@ -33,8 +34,12 @@ class GraphBuilder {
 public:
     // `kv_cache` may be null for topologies that don't use the ATTENTION primitive (e.g. no
     // autoregressive state); passing one wires it into every primitive call via PrimitiveContext.
+    // `conv_state` is the same arrangement for SHORT_CONV, and is last so that every existing
+    // positional call site keeps compiling unchanged -- a topology needs neither, either or both
+    // (GraphTopology::uses_kv_cache / uses_conv_state answer which).
     GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_backend_t backend,
-                 KvCache* kv_cache = nullptr, size_t compute_meta_bytes = 32 * 1024 * 1024);
+                 KvCache* kv_cache = nullptr, size_t compute_meta_bytes = 32 * 1024 * 1024,
+                 ConvStateCache* conv_state = nullptr);
 
     struct BuildResult {
         // Owns every tensor/graph STRUCT produced by this build; keep alive until you're done reading
@@ -86,6 +91,7 @@ private:
     GgufModel& model_;
     ggml_backend_t backend_;
     KvCache* kv_cache_;
+    ConvStateCache* conv_state_;
     size_t compute_meta_bytes_;
     ggml_gallocr_ptr galloc_;
 };

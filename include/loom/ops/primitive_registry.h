@@ -13,17 +13,24 @@
 namespace loom {
 
 class KvCache;
+class ConvStateCache;
 
 // Passed to every primitive function. `ctx` is the ephemeral no_alloc compute context nodes get built
 // in; `symbols` resolves the JSON graph's "$"-prefixed attribute expressions (see symbol_table.h);
 // `kv_cache` is non-null only when the ATTENTION primitive needs to read/write persistent KV storage
-// (every other op ignores it).
+// and `conv_state` only when SHORT_CONV does (every other op ignores both).
+//
+// Two pointers rather than one aggregate because the two stores answer different questions and a
+// topology can genuinely need either alone: a pure causal LM has K/V and no conv state, a Mamba-style
+// model would have the reverse, and a hybrid like LFM2 has both.
 struct PrimitiveContext {
     ggml_context* ctx;
     SymbolEnv& symbols;
     KvCache* kv_cache = nullptr;
+    ConvStateCache* conv_state = nullptr;
 
-    // Side-effecting nodes (currently: ATTENTION's KV-cache write ops) that must be included in the
+    // Side-effecting nodes (ATTENTION's KV-cache writes, SHORT_CONV's state writes) that must be
+    // included in the
     // compute graph even though nothing "downstream" of the topology's declared output references them
     // via ggml src[] pointers -- a plain memory write into the persistent KV cache has no such data
     // dependency to the eventual read of that same memory. GraphBuilder expands each of these via
