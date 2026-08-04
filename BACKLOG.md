@@ -630,14 +630,16 @@ of this file that does not exist (the hierarchy is described in P3.1's entry ins
 
 #### P4.0 — settle these before the first from-scratch family config
 
-Nine items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
+Eleven items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
 (P4.0.1–P4.0.3, all DONE), five added by [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md)
-(P4.0.4–P4.0.8), and one added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
-remaining registry steps at the author's direction). None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
+(P4.0.4–P4.0.8), and three added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
+remaining registry steps at the author's direction, plus P4.0.10/P4.0.11, the two capability gaps stage 3
+measured). None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
 add three more configs written against whatever shape exists at the time. Same gate as everything else:
 byte-identical re-export of all 11 models (`snapshot_gguf.py`), since none of these is meant to change
-any output — with one stated exception, P4.0.6's per-family peeling commits, where driver text
-legitimately changes and the gate becomes the model's e2e Lua-driver test plus a read diff.
+any output — with stated exceptions: P4.0.6's per-family peeling commits, where driver text legitimately
+changes and the gate becomes the model's e2e Lua-driver test plus a read diff, and the three KV items,
+which add a *capability* and therefore change the topology of the models they touch by construction.
 
 **Verification budget (decision, 2026-08-01):** affected models per commit — each step in
 `EXPORT-PREPARATION.md` §6 names which models it can possibly touch — and a full 11-model sweep per
@@ -1290,6 +1292,71 @@ nothing.
   fused nodes, and their extents were baked at trace time; and **a hybrid architecture cannot decode
   incrementally at all**, which is how LFM2 ended up exporting `infer` alone.
 
+- **P4.0.10 — a state cache for the conv/SSM family, so a hybrid can decode incrementally.** Direct
+  follow-up to P4.0.9's third unpredicted finding (`KV-CACHE.md`, "What stage 3 found"). LFM2-350M is 6
+  attention blocks and **10 ShortConv** ones; it fuses, it gets a cache, it prefills — and the exporter
+  then *declines* to emit `infer_with_past` and prints why (`exporter.py:1327-1334`), because a causal
+  depthwise convolution is stateful across steps and the KV cache holds K/V and nothing else. So the one
+  hybrid in the tree generates at prefill cost per token, and Mamba/RWKV would hit the same rule.
+
+  **The blocklist is designed to shrink, and that is the shape of this item.**
+  `_NON_CACHED_SEQUENCE_STATE_OPS` (`exporter.py:1357`) is nine op types by *exclusion* — the safe set is
+  the open one — and the last commit here is deleting entries from it, one per op that gains a slot.
+
+  **This is not another attention primitive.** The seam `op_attention` uses is right and should be reused
+  verbatim: storage in its own `ggml_context` outside the compute graph (`kv_cache.h:15`), addressed by a
+  `layer` attr, writes routed through `PrimitiveContext::side_effects` because they have no
+  data-dependency edge to the read, reads as plain views, bound per registered module so no address
+  crosses the Lua boundary. What is wrong-shaped is the *storage*: `KvCache` holds a growing prefix
+  `[0, n_kv)` indexed by `n_past`, and a causal conv wants a fixed-size rolling window of the last
+  `kernel-1` input columns per layer. Generalize it into a per-layer store with two slot families.
+
+  **The first decision, and it is not obvious.** `ATTENTION` owns its cache internally, but
+  `SSM_CONV`/`SSM_SCAN`/`RWKV_WKV6`/`7` already exist in the engine (`primitives_recurrent.cpp:32-52`)
+  and take their state as an ordinary *graph input* — so either (a) each grows an ATTENTION-style
+  internal slot, which `CONV_1D_DW` needs anyway since it has no state parameter at all, or (b) the
+  engine gains a general "this declared input is backed by a persistent slot across calls" binding, which
+  fits the four recurrent ops as they stand and is the more reusable of the two. Settle it before writing
+  code; (b) is the recommendation.
+
+  Exporter side is small once the engine has the storage: read the geometry off the fused nodes the way
+  `_kv_cache_geometry()` does (`exporter.py:2064`), emit it as `loom.*` hparams, and lower LFM2's
+  ShortConv to the stateful op instead of `CONV_1D_DW`.
+
+  **One requirement worth stating because the oracle depends on it:** a state op must treat `n_past = 0`
+  as "no history", exactly as `op_attention` does. That is what keeps iterated `infer` a valid reference
+  (`KV-CACHE.md` 3.4 — each call is a full recompute that overwrites the prefix it reads) and what lets
+  both paths share one cache in the test. *Touches: LFM2-monolithic only, of the models in the tree.
+  **Gate:** LFM2-monolithic gains `infer_with_past` and agrees token-for-token with iterated `infer`,
+  under the same 22-check harness Qwen3 and SmolLM2 already pass; every other model byte-identical.*
+
+- **P4.0.11 — sliding-window attention. Two items of very different size, and only the small one should
+  be done first.** Not on the roadmap and no checkpoint in the tree needs it, but modern hybrids
+  (Gemma 3-style interleaved local/global, 5:1) are unreachable without it, so it is filed rather than
+  discovered later.
+
+  **(a) Correctness — small.** `ggml_soft_max_ext` already takes an arbitrary `[n_kv, n_tokens]` mask, so
+  a banded mask is a `window` argument on `loom.causal_mask` (`lua_bridge.cpp:292`) plus the driver
+  builders passing it. Interleaving needs two mask inputs with each `ATTENTION` node routed to its own,
+  and **that plumbing already tolerates it**: `_retype_fused_mask_input` (`exporter.py:1936`) iterates the
+  *set* of mask names its cached nodes reference and retypes each independently, checking the
+  only-consumer property per name — and HF's Gemma trace passes both masks as separate inputs. The real
+  work is that the window becomes a per-node fact: the fusion pass must record which mask each block
+  consumed (it already carries `mask_var` per block) and the driver must know each mask's window.
+
+  **(b) The memory win — a real `KvCache` redesign, and out of scope for (a).** The header states the
+  constraint it would break: "single sequence, contiguous append (no ring buffer, no `ggml_set_rows`
+  index-tensor indirection)" (`kv_cache.h:15`). A window cache wants `pos % window` writes, which is
+  exactly what stops "a plain view over `[0, n_kv)` suffices for reads" from holding. It also needs
+  per-layer capacity, where `KvCache` takes one `kv_size` for every layer and `loom.kv_cache_size` is one
+  scalar. This is adjacent to the multi-sequence generalization `SPECIFICATION.md` §8 defers and should
+  be done with it, not before it.
+
+  **Why the split is the whole point:** a windowed model is *correct* with a full cache and merely spends
+  `n_ctx` memory where it could spend `window`. (a) makes such a model run; (b) makes it cheap. *Gate for
+  (a): the first windowed checkpoint's numeric reference test, and a banded-mask unit test at the
+  `loom.causal_mask` level; every model in the tree byte-identical, since none declares a window.*
+
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
 **The premise this item was written on was wrong, and the correction is the most useful thing in it.**
@@ -1358,46 +1425,19 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   remote-code modeling traces cleanly or needs a patcher.
 - **P4.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
   family 3 (~20 models) and is the single largest coverage lever in the roadmap.
-- **P4.4 — KV cache in MIL-exported causal LMs. Blocked on a MIL attention-fusion pass that does not
-  exist; that pass, not the driver, is the item.** Both synthesized drivers bind `n_past = 0` and
-  `loom.causal_mask(n_tokens, 0)` (`exporter.py:1225,1238,1307,1312`), so an exported causal LM does one
-  prefill per step and re-reads the whole prompt every time — generation cost grows quadratically. This
-  was known (`EXPORT-PREPARATION.md` §4); what was **not** known, and was measured on 2026-08-01 while
-  looking at a synthesized driver, is where the blocker sits.
+- **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
+  `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
+  was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's
+  entry, which record what was actually built and where the plan was wrong (step 2, `use_past` tracing,
+  was **not needed**: once the SDPA subgraph is an `ATTENTION` node the engine supplies the past
+  itself). Two remainders are live items of their own, P4.0.10 and P4.0.11.
 
-  **The engine's `KvCache` has exactly one entry point: the `ATTENTION` topology node.** `op_attention`
-  is what reads `n_past`/`n_kv` from `SymbolEnv`, appends this step's K/V at cells
-  `[n_past, n_past+n_tokens)` and reads back `[0, n_kv)` (`src/ops/primitives_attention.cpp:29-80`;
-  `GraphBuilder` derives `n_kv = n_tokens + n_past`, `graph_builder.cpp:129`). A topology without that
-  node cannot touch the cache at all, and one declaring `kv_cache=true` without a cache raises
-  (`primitives_attention.cpp:51`).
-
-  The bespoke converters have the node because **a human writes it**, layer index and all
-  (`convert_qwen3.py:93`). **A MIL-exported causal LM has zero `ATTENTION` nodes** — Qwen3's topology is
-  `ADD 450, MUL 450, MUL_MAT 254, RESHAPE 228, PERMUTE 142, VIEW 140, …`, attention fully expanded. The
-  exporter maps `loom_fused_attention` → `ATTENTION` (`exporter.py:131`) and `dialect.py` registers a
-  `FuseLoomAttention` pass whose body is `pass`, a documented placeholder (`dialect.py:259`). The op is
-  registered and never produced.
-
-  Four pieces, in order — and the driver change everyone pictures is the *last* one:
-  1. **Implement `FuseLoomAttention`** (an R2-shaped MIL pass): pattern-match the SDPA subgraph per
-     layer, assign the `layer` index, emit `loom_fused_attention`. Architecture-sensitive — Qwen3 has
-     qk-norm, LFM2 interleaves conv layers, Llama is plain GQA — and each needs numeric verification
-     against the expanded path. This is the expensive piece and the one with no code today.
-  2. **Trace with past-KV semantics** so a decode step computes K/V for the new token only — `optimum`'s
-     `use_past`/`decoder_with_past`.
-  3. **Change the exported input contract**: `tokens` at `n_tokens=1`, `cache_position =
-     range(n_past, …)`, mask `[1,1,n_tokens,n_kv]`. Makes `n_kv` a second dynamic axis, landing on
-     P4.0.2's `_validate_input_axes`.
-  4. **Synthesize a two-phase driver** (prefill + decode loop). The machinery for this half exists:
-     `transpile_operation` already emits `loom.causal_mask(n_tokens, n_past)` with real variables
-     (`exporter.py:1504-1507`) and `driver_ir` has `While`/`Break`.
-
-  **Consequences for the plan as written.** `EXPORT-PREPARATION.md` decision 2 routes this gap to the
-  cross-attention AR decode `Decomposition` in P4.1; that is still the right home, but **that
-  decomposition cannot start here** — step 1 is a prerequisite and belongs to R2, not to the driver
-  builder. It also deliberately breaks byte-identity for Qwen3 and LFM2 (new topology *and* new driver),
-  so it is a `compare_snapshots.py` + per-model numeric item, never a byte-identical one.
+  **What survives that P4.0.9 does not say.** `EXPORT-PREPARATION.md` decision 2 routes this gap to the
+  cross-attention AR decode `Decomposition` in P4.1, and that is still the right home — but the
+  prerequisite reading has inverted. It was "that decomposition cannot start here, the fusion pass comes
+  first"; the pass now exists, `infer_with_past` exists, and `whisper_driver.lua` has been doing exactly
+  this orchestration by hand since the Lua port (`KV-CACHE.md` §1.2). P4.1's decomposition is now the
+  *reuse* of a solved shape, not a blocked one.
 
 #### P5 — breadth
 
