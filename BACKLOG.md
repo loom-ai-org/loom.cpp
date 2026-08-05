@@ -1412,16 +1412,41 @@ nothing.
   (a): the first windowed checkpoint's numeric reference test, and a banded-mask unit test at the
   `loom.causal_mask` level; every model in the tree byte-identical, since none declares a window.*
 
-  **(a) is PARTLY done: the mask primitive landed, the per-node routing did not.**
+  **(a) is DONE, gated against a real windowed checkpoint (gemma-3-270m-it).**
   `loom.causal_mask(n_tokens, n_past [, window])` bands the mask, with `luaL_optnumber` so every
   existing two-argument call site keeps its exact output — three checks pin the banding, a window wider
-  than `n_kv` reproducing the full-causal mask, and `window <= 0` doing the same. What remains is the
-  routing: `fuse_loom_attention` recording which mask each block consumed (it already carries `mask_var`
-  per block) and the driver builders passing each mask's own window, since the window is a per-node fact
-  and interleaved local/global needs two mask inputs. `_retype_fused_mask_input` already tolerates that
-  — it iterates the *set* of mask names and checks the only-consumer property per name. Left undone
-  deliberately: no checkpoint in the tree declares a window, so the routing has no numeric gate, and
-  building it against zero real models is how it would end up wrong.
+  than `n_kv` reproducing the full-causal mask, and `window <= 0` doing the same.
+
+  The routing is `_route_windowed_masks`, and the design was set by a measurement that contradicts the
+  plan above: **the window is not in the traced graph at all.** Interleaved models build two masks
+  internally only when they build them themselves; this family passes `attention_mask` explicitly (so
+  the length stays dynamic under trace), and transformers then uses that one tensor verbatim for both
+  mask types — all 18 of Gemma's layers slice the same input. So the fusion pass cannot record a
+  per-block window, and `_attention_windows` reads `layer_types`/`sliding_window` off the config
+  instead: the one place this exporter prefers a config fact to a graph fact. The exporter then
+  *synthesizes* a second declared input (no MIL var behind it), one per distinct window, repoints the
+  sliding blocks at it, and the driver fills both in. Keeping the window in the MASK means the engine
+  needs no new primitive, attr or branch.
+
+  **Gate: 49977 == HF's top-1 at position 599, 88 tokens past the window; 236881 with the window forced
+  off.** Getting there needed a forced token-by-token decode, because two things rule out the obvious
+  tests — `infer` cannot prefill past ~512 tokens for this vocab (see the marshalling item below), and
+  greedy generation collapses into a repeating `107, 2717` a wrong window would reproduce.
+
+### Driver logits marshalling caps prefill length for large-vocab models
+
+Found while gating P4.0.11a. `MonolithicCall` returns the topology's whole `[n_vocab, n_tokens]` logits
+tensor across the Lua boundary so `ArgmaxEpilogue` can argmax a row — and LuaJIT's array part tops out
+near 2^27 elements. For Gemma 3's 262144-wide vocab that is **~512 prompt tokens**, past which `infer`
+raises `table overflow`; a 600-token prefill is 157M doubles. Qwen3 (151936) caps near 880, LFM2
+(65536) near 2048, so nothing on the roadmap has hit it before.
+
+The fix is to stop marshalling what the driver only reduces: argmax the row engine-side and return one
+number, or let `run_subgraph` return a view of a single row. Either keeps the Lua boundary a *per-step*
+boundary rather than a per-logit one, which is the same reasoning `KV-CACHE.md` §1.1 gives for not
+driving attention from Lua. Not urgent — it bites only prefill, and only for vocabs above ~130k — but
+it is a hard ceiling rather than a slowdown, and the workaround (feed tokens one at a time) costs a full
+forward pass per token.
 
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
