@@ -176,7 +176,12 @@ _LLAMA_PRE_TO_LOOM_PRE_TYPE: dict[str, Optional[str]] = {
     "jais-2": None, "deepseek-llm": None, "deepseek-coder": None, "deepseek-v3": None, "youtu": None,
     "falcon": None, "hunyuan-dense": None, "joyai-llm": None, "tekken": None, "gpt-4o": None,
     "llama4": None, "kanana2": None, "talkie": None, "minimax-m2": None,
-    "granite-embed-multi-97m": None, "granite-embed-multi-311m": None, "tiny_aya": None,
+    # SentencePiece-style BPE with byte fallback -- implemented as BpeShape::kSpmByteFallback
+    # (bpe_vocab.cpp). Gemma 3 shares this chkhsh, which llama.cpp computes over real tokenizer
+    # output, so the two tokenize identically and the family name is the honest key for both.
+    "granite-embed-multi-97m": "granite-embed-multi-97m",
+    "granite-embed-multi-311m": "granite-embed-multi-311m",
+    "tiny_aya": None,
     "cohere2moe": None, "superbpe": None, "bailingmoe": None, "bailingmoe2": None, "seed-coder": None,
     "kimi-k2": None, "afmoe": None, "exaone-moe": None, "sarvam-moe": None, "minicpm5": None,
     "chameleon": None, "jina-v2-en": None,

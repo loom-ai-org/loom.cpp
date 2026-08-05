@@ -46,6 +46,22 @@ enum class BpeShape {
     // metacharacters). `split_leading_digit_` additionally tries a single-digit alternative first (viking
     // only, whose regex_exprs has an extra bare `\p{N}` entry ahead of this pattern).
     kWhitespacePunctExclude,
+    // SentencePiece-style BPE with byte fallback (Gemma 3, and llama.cpp's
+    // `granite-embed-multi-311m` family, whose chkhsh it shares). Structurally unlike every shape
+    // above, which is why it needed more than a new regex:
+    //
+    //   * **no regex pretokenization at all** -- the whole text is one chunk;
+    //   * **no GPT-2 byte-level mapping** -- the vocabulary holds literal UTF-8, so the initial BPE
+    //     symbols are CHARACTERS, not byte-mapped stand-ins (confirmed on the real vocab: its merges
+    //     contain actual U+2581 and real spaces, never `Ġ`);
+    //   * a normalizer that replaces every space with U+2581 (`▁`), and no dummy prefix -- HF gives
+    //     `"Hello world"` -> `['Hello', '▁world']`, the first word bare;
+    //   * **byte fallback**: a character with no vocab entry becomes its UTF-8 bytes as `<0xNN>`
+    //     tokens, rather than being an error as it is for a byte-level vocab where every byte maps.
+    //
+    // `max_number_run_`/`include_marks_` are unused here; digits come out one per token because the
+    // vocab simply has no multi-digit merges, not because anything splits them.
+    kSpmByteFallback,
 };
 
 // Byte-level BPE vocabulary loaded from a GGUF's "tokenizer.ggml.*" KVs, llama.cpp's own "gpt2" schema

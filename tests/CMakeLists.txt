@@ -32,6 +32,11 @@ target_link_libraries(test_e2e_sliding_window_attention PRIVATE loom::engine)
 add_test(NAME test_e2e_sliding_window_attention COMMAND test_e2e_sliding_window_attention)
 set_tests_properties(test_e2e_sliding_window_attention PROPERTIES SKIP_RETURN_CODE 77)
 
+add_executable(test_e2e_spm_byte_fallback_tokenizer test_e2e_spm_byte_fallback_tokenizer.cpp)
+target_link_libraries(test_e2e_spm_byte_fallback_tokenizer PRIVATE loom::engine)
+add_test(NAME test_e2e_spm_byte_fallback_tokenizer COMMAND test_e2e_spm_byte_fallback_tokenizer)
+set_tests_properties(test_e2e_spm_byte_fallback_tokenizer PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_short_conv_state test_short_conv_state.cpp)
 target_link_libraries(test_short_conv_state PRIVATE loom::engine)
 add_test(NAME test_short_conv_state COMMAND test_short_conv_state)
