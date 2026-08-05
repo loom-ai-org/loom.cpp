@@ -149,9 +149,10 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
     const int64_t index1 = lua_isnil(L, -1) ? 1 : static_cast<int64_t>(std::llround(lua_tonumber(L, -1)));
     lua_pop(L, 1);
 
-    // The generation the producing `loom.run_retained` returned. Optional -- a synthesized driver whose
-    // adjacency the exporter already checked need not carry it (driver_ir.check_subgraph_calls) -- but
-    // it is what makes a stale read an error rather than silently newer data.
+    // The generation the producing `loom.run_subgraph_and_retain` returned. Optional -- a synthesized
+    // driver whose adjacency the exporter already checked need not carry it
+    // (driver_ir.check_subgraph_calls) -- but it is what makes a stale read an error rather than
+    // silently newer data.
     lua_getfield(L, value_idx, "gen");
     const bool pinned = !lua_isnil(L, -1);
     const auto gen = pinned ? static_cast<uint64_t>(std::llround(lua_tonumber(L, -1))) : 0;
@@ -220,11 +221,11 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
     return axes;
 }
 
-// Everything `run_subgraph`, `run_subgraph_argmax` and `run_retained` share: build the graph for
-// `axes`, fill every declared input from the Lua table at `inputs_idx`, compute, and hand the result to
-// `emit` while the builder that owns its memory is still alive. Takes the module's pieces individually
-// rather than the Module struct so it can live here, in the anonymous namespace, next to the code it
-// serves.
+// Everything `run_subgraph`, `run_subgraph_argmax` and `run_subgraph_and_retain` share: build the
+// graph for `axes`, fill every declared input from the Lua table at `inputs_idx`, compute, and hand
+// the result to `emit` while the builder that owns its memory is still alive. Takes the module's
+// pieces individually rather than the Module struct so it can live here, in the anonymous namespace,
+// next to the code it serves.
 //
 // Extracted rather than duplicated because the entry points differ ONLY in what they do with the
 // outputs -- a copy would be free to drift on cache wiring or input validation, which is exactly the
@@ -233,7 +234,7 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
 // which entry point consumes it are independent questions.
 //
 // `out_store` is null for the marshalling entry points and the module's own store for
-// `run_retained` -- see GraphBuilder::build for what it does with it.
+// `run_subgraph_and_retain` -- see GraphBuilder::build for what it does with it.
 int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GgufModel& model,
                       const GraphTopology& topo, ggml_backend_t backend, KvCache* kv_cache,
                       ConvStateCache* conv_state, const DynamicAxes& axes, int inputs_idx,
@@ -330,10 +331,11 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
 // This keeps the Lua boundary a *per-step* boundary rather than a per-logit one, the same reasoning
 // KV-CACHE.md §1.1 gives for not driving attention from Lua.
 //
-// **Retirement policy (BACKLOG.md P4.0.14).** `loom.run_retained` + `loom.argmax_row(module, row)` is
-// the same two facts said separately, and once the modular path uses them this fused spelling goes
-// away: two ways to get a token out of a forward pass that can disagree is the failure this project
-// keeps removing. It stays until then because it is the only one that works on the flattened path.
+// **Retirement policy (BACKLOG.md P4.0.14).** `loom.run_subgraph_and_retain` plus
+// `loom.argmax_row(module, row)` is the same two facts said separately, and once the modular path
+// uses them this fused spelling goes away: two ways to get a token out of a forward pass that can
+// disagree is the failure this project keeps removing. It stays until then because it is the only
+// one that works on the flattened path.
 int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
@@ -361,14 +363,14 @@ int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
     }
 }
 
-// `loom.run_retained(module, axes, inputs)` -- run the module and leave every declared output in the
-// module's own persistent OutputStore instead of marshalling it. Returns one number: the store's
-// generation counter for this run, which a later read may pin itself to.
+// `loom.run_subgraph_and_retain(module, axes, inputs)` -- run the module and leave every declared
+// output in the module's own persistent OutputStore instead of marshalling it. Returns one number:
+// the store's generation counter for this run, which a later read may pin itself to.
 //
 // See lua_bridge.h's declaration for the three ways a retained output is read back, and
 // include/loom/core/output_store.h for why the buffer is module-owned rather than handed out as a
 // handle.
-int LoomLuaBridge::l_run_retained(lua_State* L) {
+int LoomLuaBridge::l_run_subgraph_and_retain(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
         const char* module_name = luaL_checkstring(L, 1);
@@ -377,20 +379,20 @@ int LoomLuaBridge::l_run_retained(lua_State* L) {
 
         const auto it = self->modules_.find(module_name);
         if (it == self->modules_.end()) {
-            return luaL_error(L, "loom.run_retained: unregistered module '%s'", module_name);
+            return luaL_error(L, "loom.run_subgraph_and_retain: unregistered module '%s'", module_name);
         }
         Module& mod = it->second;
         if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backend);
         OutputStore* store = mod.outputs.get();
 
-        return compute_and_emit(L, "loom.run_retained", module_name, *mod.model, mod.topo, mod.backend,
-                                 mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self), store,
+        return compute_and_emit(L, "loom.run_subgraph_and_retain", module_name, *mod.model, mod.topo,
+                                 mod.backend, mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self), store,
                                  [L, store](GraphBuilder::BuildResult&) {
             lua_pushnumber(L, static_cast<lua_Number>(store->generation()));
             return 1;
         });
     } catch (const std::exception& e) {
-        return luaL_error(L, "loom.run_retained: %s", e.what());
+        return luaL_error(L, "loom.run_subgraph_and_retain: %s", e.what());
     }
 }
 
@@ -770,7 +772,7 @@ OutputStore& LoomLuaBridge::retained_store(LoomLuaBridge* self, const std::strin
     }
     if (!it->second.outputs || !it->second.outputs->filled()) {
         throw Error("module '" + module + "' has no retained outputs -- nothing has run it via "
-                     "loom.run_retained, so there is nothing to read by name");
+                     "loom.run_subgraph_and_retain, so there is nothing to read by name");
     }
     return *it->second.outputs;
 }
@@ -791,7 +793,7 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"range", &LoomLuaBridge::l_range},
         {"run_subgraph_argmax", &LoomLuaBridge::l_run_subgraph_argmax},
-        {"run_retained", &LoomLuaBridge::l_run_retained},
+        {"run_subgraph_and_retain", &LoomLuaBridge::l_run_subgraph_and_retain},
         {"get_output", &LoomLuaBridge::l_get_output},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},

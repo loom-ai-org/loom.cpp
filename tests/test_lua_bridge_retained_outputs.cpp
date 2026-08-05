@@ -57,7 +57,7 @@ const char* kScript = R"lua(
     -- The same chain with the intermediate never becoming a Lua value at all.
     function chain_retained(inputs)
         local n = #inputs.tokens
-        loom.run_retained('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
         local logits = loom.run_subgraph('stage_b', {n_tokens = n, n_past = 0},
                                           {hidden = {from = 'stage_a'}})
         return logits
@@ -67,7 +67,8 @@ const char* kScript = R"lua(
     -- guard. Passing it must not change any value.
     function chain_retained_pinned(inputs)
         local n = #inputs.tokens
-        local gen = loom.run_retained('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local gen = loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0},
+                                                  {tokens = inputs.tokens})
         local logits = loom.run_subgraph('stage_b', {n_tokens = n, n_past = 0},
                                           {hidden = {from = 'stage_a', index = 1, gen = gen}})
         return logits
@@ -77,7 +78,7 @@ const char* kScript = R"lua(
     function get_output_roundtrip(inputs)
         local n = #inputs.tokens
         local cur, normed = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
-        loom.run_retained('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
         local got_cur, cur_shape = loom.get_output('stage_a', 1)
         local got_normed = loom.get_output('stage_a', 2)
         local out = {cur_shape[1], cur_shape[2]}
@@ -90,7 +91,7 @@ const char* kScript = R"lua(
     -- the raw embedding has to produce different logits.
     function chain_retained_second_output(inputs)
         local n = #inputs.tokens
-        loom.run_retained('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
         return loom.run_subgraph('stage_b', {n_tokens = n, n_past = 0},
                                   {hidden = {from = 'stage_a', index = 2}})
     end
@@ -105,8 +106,8 @@ const char* kScript = R"lua(
     -- The same token id with nothing tensor-shaped crossing the boundary in either direction.
     function argmax_retained(inputs)
         local n = #inputs.tokens
-        loom.run_retained('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
-        local gen = loom.run_retained('stage_b', {n_tokens = n, n_past = 0},
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local gen = loom.run_subgraph_and_retain('stage_b', {n_tokens = n, n_past = 0},
                                        {hidden = {from = 'stage_a'}})
         return loom.argmax_row('stage_b', -1, gen)
     end
@@ -115,8 +116,8 @@ const char* kScript = R"lua(
     -- reads back the short one. `[n_embd, n_tokens]` changing under a persistent buffer is the case
     -- "whatever the last build produced" would get wrong.
     function reshape_then_read(inputs)
-        loom.run_retained('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
-        loom.run_retained('stage_a', {n_tokens = 1, n_past = 0}, {tokens = {5}})
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = 1, n_past = 0}, {tokens = {5}})
         local got, shape = loom.get_output('stage_a', 1)
         local single = loom.run_subgraph('stage_a', {n_tokens = 1, n_past = 0}, {tokens = {5}})
         local out = {shape[1], shape[2]}
@@ -143,16 +144,17 @@ const char* kScript = R"lua(
                 loom.get_output('stage_never', 1)
             elseif inputs.case == 2 then
                 -- Pin a generation, then re-run the module before reading: the classic stale read.
-                local gen = loom.run_retained('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
-                loom.run_retained('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {2, 2, 2}})
+                local gen = loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0},
+                                                          {tokens = {1, 3, 4}})
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {2, 2, 2}})
                 loom.get_output('stage_a', 1, gen)
             elseif inputs.case == 3 then
                 -- An output index past what the module declares.
-                loom.run_retained('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
                 loom.get_output('stage_a', 3)
             elseif inputs.case == 4 then
                 -- A shape mismatch across an inter-module edge: A retained at 3 tokens, B built for 1.
-                loom.run_retained('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
                 loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0}, {hidden = {from = 'stage_a'}})
             else
                 -- A reference to a module that isn't registered at all.

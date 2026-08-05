@@ -120,8 +120,8 @@ private:
         ConvStateCache* conv_state;
         ggml_backend_t backend;
         // Persistent storage for this module's declared outputs (BACKLOG.md P4.0.12), created on the
-        // module's first `loom.run_retained` and owned for the bridge's lifetime thereafter -- unlike
-        // `kv_cache`/`conv_state`, which the HOST allocates from declared hparams and merely lends. It
+        // module's first `loom.run_subgraph_and_retain` and owned for the bridge's lifetime thereafter
+        // -- unlike `kv_cache`/`conv_state`, which the HOST allocates from declared hparams and lends. It
         // has to be owned rather than lent because an output's geometry is not declared anywhere: it
         // follows the axes of whichever build fills it, so only the run itself can size it.
         //
@@ -160,8 +160,8 @@ private:
     // `luaL_error` internally rather than let them unwind through the Lua C API.
     static int l_run_subgraph(lua_State* L);
     static int l_run_subgraph_argmax(lua_State* L);
-    // `loom.run_retained(module, axes, inputs)`: runs `module` exactly as `loom.run_subgraph` does, but
-    // instead of marshalling its outputs into Lua tables, leaves them in the module's own persistent
+    // `loom.run_subgraph_and_retain(module, axes, inputs)`: runs `module` exactly as `loom.run_subgraph`
+    // does, but instead of marshalling its outputs into Lua tables, leaves them in the module's own persistent
     // OutputStore and returns a single number -- the store's generation counter for this run. Nothing
     // tensor-shaped crosses the boundary. MEETS the binding criterion above: it reads no model config
     // (the module name, its axes and its inputs are all call arguments) and it earns its C++ place
@@ -173,12 +173,12 @@ private:
     // `loom.argmax_row(module, row)` form when only a control decision is (the next token id), and
     // an `{from = "module"}` entry in another module's `inputs` table when it is neither -- an
     // intermediate the driver merely threads onward, which is the case this exists for.
-    static int l_run_retained(lua_State* L);
+    static int l_run_subgraph_and_retain(lua_State* L);
     // `loom.get_output(module [, index [, generation]])` -> (data, shape): marshals declared output
     // `index` (1-based, defaulting to 1) of `module`'s retained outputs, in the same (flat data array,
     // 4-element ne[] array) convention `loom.run_subgraph` returns. The optional `generation` is the
-    // number the producing `loom.run_retained` returned; passing it turns "this module was re-run in
-    // between and I am silently reading newer data" into an error.
+    // number the producing `loom.run_subgraph_and_retain` returned; passing it turns "this module was
+    // re-run in between and I am silently reading newer data" into an error.
     static int l_get_output(lua_State* L);
     // `loom.run_recurrent(h_module, c_module, sequence_flat, seq_len, input_dim, hidden_dim, reverse)`:
     // steps an LSTM cell over `sequence_flat` (a flat, row-major (seq_len, input_dim) array) one

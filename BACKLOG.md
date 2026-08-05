@@ -1485,8 +1485,8 @@ nothing.
   at the prefill→decode transition; retrieval looks the buffer up by name at read time, so it can never
   hold a pointer the store has since replaced.
 
-  Lua surface: `loom.run_retained(module, axes, inputs)` returns only a generation number, and a
-  retained value is read back in exactly one of three ways — which is the "is this genuinely
+  Lua surface: `loom.run_subgraph_and_retain(module, axes, inputs)` returns only a generation number,
+  and a retained value is read back in exactly one of three ways — which is the "is this genuinely
   host-side?" question made syntactic. `loom.get_output(module, index)` for a final result,
   `loom.argmax_row(module, row)` for a control decision, and `{from = 'module'}` as another module's
   input for the case this exists for, an intermediate the driver merely threads onward. The reference
@@ -1533,7 +1533,7 @@ nothing.
   it promised is still all here.** What P4.0.12 made per-module and persistent is the *output store*, on
   `LoomLuaBridge::Module` beside `kv_cache`/`conv_state` — the builder is untouched. `compute_and_emit`
   still constructs a `GraphBuilder` per call and destroys it on return, so `reserve()` is still dead
-  weight on this path and every `run_subgraph`/`run_retained` still pays a full rebuild plus a
+  weight on this path and every `run_subgraph`/`run_subgraph_and_retain` still pays a full rebuild plus a
   compute-buffer allocation it throws away. What P4.0.12 genuinely bought this item is smaller but real:
   it established that per-module persistent state on the bridge is the right home for it (three classes
   now use that seam), and it removed the reason a builder's lifetime was entangled with a value's — an
@@ -1552,8 +1552,8 @@ nothing.
 - **P4.0.14 — the same marshalling ceiling still stands on the modular path, and is fixed by P4.0.12.**
 
   **Status after P4.0.12 (2026-08-05): the mechanism exists and is unused here, which is what this item
-  now is.** `loom.run_retained` + `loom.argmax_row(module, row)` is the fused call said as two facts, and
-  it is shipping and tested. The modular chain adopted the first half — 19 of lfm2-modular's 20 stages
+  now is.** `loom.run_subgraph_and_retain` plus `loom.argmax_row(module, row)` is the fused call said
+  as two facts, and it is shipping and tested. The modular chain adopted the first half — 19 of lfm2-modular's 20 stages
   retain — and deliberately not the second: its last stage still calls `loom.run_subgraph` and hands the
   epilogue a real logits table, so the table below is unchanged and every number in it still holds. What
   remains is to point the last stage at retrieval-by-name too, drop `ArgmaxEpilogue`'s marshalling
@@ -1598,8 +1598,9 @@ stays a *per-step* boundary rather than a per-logit one, the same reasoning `KV-
 not driving attention from Lua.
 
 **Still open on the modular path — P4.0.14**, which is where the numbers and the retirement plan for
-`run_subgraph_argmax` live. P4.0.12 built the mechanism that replaces it (`loom.run_retained` plus
-`loom.argmax_row(module, row)`) and moved every modular chain edge but the last onto it; the last one,
+`run_subgraph_argmax` live. P4.0.12 built the mechanism that replaces it
+(`loom.run_subgraph_and_retain` plus `loom.argmax_row(module, row)`) and moved every modular chain
+edge but the last onto it; the last one,
 which is the one this cap is about, is still marshalled.
 
 Gated on KV-cached topologies only, so the blast radius is the causal LMs: the vocab is what makes the

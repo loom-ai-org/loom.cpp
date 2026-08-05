@@ -97,9 +97,9 @@ The thesis is already demonstrated, not merely intended:
   `duration_aligner.h`, `relative_position.h`. *(Re-measured 2026-08-05. It read "four" until then; the
   two additions are the persistent-state classes P4.0.10 and P4.0.12 added — `conv_state_cache.h` and
   `output_store.h` — which are the same seam as `kv_cache.h`, not a new kind of dependency.)*
-* **The Lua-visible surface is 15 bindings** (`run_subgraph`, `run_subgraph_argmax`, `run_retained`,
-  `run_recurrent`, `get_output`, `get_weight`, `argmax_row`, `causal_mask`, `range`, `zero_mask`,
-  `gaussian_array`, `uniform_array`, `seed_rng`, `expand_by_duration`,
+* **The Lua-visible surface is 15 bindings** (`run_subgraph`, `run_subgraph_argmax`,
+  `run_subgraph_and_retain`, `run_recurrent`, `get_output`, `get_weight`, `argmax_row`, `causal_mask`,
+  `range`, `zero_mask`, `gaussian_array`, `uniform_array`, `seed_rng`, `expand_by_duration`,
   `pad_crop_relative_embeddings`) plus the `n_tokens`/`n_past` axis keys. *(Re-counted 2026-08-05
   against `lua_bridge.cpp`'s own binding table, which is the only authority on it.)*
 * **The cases predicted to be hardest already moved out of C++.** `cfm_euler_sampler.h`,
