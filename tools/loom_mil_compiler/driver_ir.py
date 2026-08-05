@@ -286,8 +286,8 @@ class SubgraphCall(Stmt):
     # part tops out near 2^27 entries, so a 262144-wide vocab overflows at ~512 prompt tokens
     # (BACKLOG.md). See lua_bridge.cpp's l_run_subgraph_argmax.
     argmax_row: object = None
-    # When set, emit `loom.run_retained(module, axes, inputs)`: the module runs exactly the same way,
-    # but its outputs stay in the module's own persistent buffer instead of being marshalled, and are
+    # When set, emit `loom.run_subgraph_and_retain(module, axes, inputs)`: the module runs exactly the
+    # same way, but its outputs stay in the module's own persistent buffer instead of being marshalled, and are
     # reached afterwards BY NAME -- as an `OutputRef` in a later call's inputs, or via
     # `loom.get_output` / `loom.argmax_row(module, row)`. `outputs`/`extra_outputs` are therefore empty:
     # there is nothing to bind, which is the point (BACKLOG.md P4.0.12).
@@ -469,7 +469,7 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
     and whatever it retains does not escape back out -- so a reference whose producer only runs on one
     arm of a branch, or only inside a loop, is rejected rather than assumed. Every synthesized chain
     today is straight-line, and a driver that genuinely needs the conditional shape can pin the
-    generation number `loom.run_retained` returns, which is the runtime half of this same guard.
+    generation number `loom.run_subgraph_and_retain` returns, which is the runtime half of this guard.
     """
     def walk(stmts: list, produced: dict) -> None:
         for stmt in stmts:
@@ -488,8 +488,9 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
                 if expr.module not in produced:
                     raise DriverIRError(
                         f"driver IR: '{stmt.module}' input '{name}' reads the retained output of module "
-                        f"'{expr.module}', but no earlier loom.run_retained('{expr.module}', ...) runs "
-                        f"in the same straight-line block -- a retained output only exists between the "
+                        f"'{expr.module}', but no earlier "
+                        f"loom.run_subgraph_and_retain('{expr.module}', ...) runs in the same "
+                        f"straight-line block -- a retained output only exists between the "
                         f"run that produced it and the next run of that module"
                     )
                 n_declared = produced[expr.module]
@@ -533,7 +534,7 @@ def check_subgraph_calls(function: Function, topologies: dict) -> None:
             # is neither a data local nor a shape local for the pairing rule below to be about.
             if call.outputs or call.extra_outputs:
                 raise DriverIRError(
-                    f"driver IR: loom.run_retained('{call.module}', ...) captures "
+                    f"driver IR: loom.run_subgraph_and_retain('{call.module}', ...) captures "
                     f"{len(call.outputs) + len(call.extra_outputs)} local(s), but it returns only the "
                     "store's generation number -- retained outputs are read back by module name "
                     "(loom.get_output / loom.argmax_row / a {from = ...} input), not bound here."
@@ -593,8 +594,8 @@ class LuaCodegen:
         return lines
 
     def _emit_run(self, stmt, fn: str, prefix: str, depth: int) -> list:
-        """`loom.run_subgraph`/`loom.run_retained` differ only in the name and in whether anything is
-        bound -- `multiline` (an input table one entry per line, for calls whose seven inputs are
+        """`loom.run_subgraph`/`loom.run_subgraph_and_retain` differ only in the name and in whether
+        anything is bound -- `multiline` (an input table one entry per line, for calls whose seven inputs are
         unreadable on one) applies to both, and factoring it here is what keeps that true."""
         pad = self.indent * depth
         if stmt.multiline:
@@ -621,7 +622,7 @@ class LuaCodegen:
                 # the generation number it returns is only worth capturing when the driver means to pin
                 # a read to it -- which a synthesized driver does not, because `check_subgraph_calls`
                 # has already proved the adjacency statically.
-                return self._emit_run(stmt, "loom.run_retained", prefix="", depth=depth)
+                return self._emit_run(stmt, "loom.run_subgraph_and_retain", prefix="", depth=depth)
             if stmt.argmax_row is not None:
                 call = Call("loom.run_subgraph_argmax",
                             [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs),

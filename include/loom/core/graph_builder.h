@@ -80,7 +80,7 @@ public:
     // KV-cache writes use (BACKLOG.md P4.0.12). Those values then outlive this BuildResult -- and the
     // GraphBuilder itself -- because the store owns its own context and backend buffer, which is what
     // makes retrieval-by-module-name possible at all. A per-CALL argument rather than a constructor
-    // one: whether a run retains its outputs is the caller's decision (`loom.run_retained` vs
+    // one: whether a run retains its outputs is the caller's decision (`loom.run_subgraph_and_retain` vs
     // `loom.run_subgraph`), not a property of the module the way its caches are.
     BuildResult build(const DynamicAxes& axes, OutputStore* out_store = nullptr);
 

@@ -60,7 +60,7 @@ const std::vector<ggml_tensor*>& OutputStore::reshape(const std::vector<ggml_ten
 ggml_tensor* OutputStore::get(size_t index) const {
     if (!filled()) {
         throw Error("OutputStore: nothing retained yet -- the module has not been run with its outputs "
-                     "retained (loom.run_retained)");
+                     "retained (loom.run_subgraph_and_retain)");
     }
     if (index >= slots_.size()) {
         throw Error("OutputStore: output index " + std::to_string(index) + " is out of range; the last "

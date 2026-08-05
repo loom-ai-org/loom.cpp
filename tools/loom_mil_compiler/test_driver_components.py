@@ -226,11 +226,11 @@ class TestModularChainBuilder(unittest.TestCase):
         self.assertEqual(text, "\n".join([
             "function infer(inputs)",
             "    local input_ids = (inputs.input_ids or inputs.tokens)",
-            "    loom.run_retained('prefix', {n_tokens = #input_ids, n_past = 0}, "
+            "    loom.run_subgraph_and_retain('prefix', {n_tokens = #input_ids, n_past = 0}, "
             "{input_ids = input_ids})",
-            "    loom.run_retained('layer_0', {n_tokens = #input_ids, n_past = 0}, "
+            "    loom.run_subgraph_and_retain('layer_0', {n_tokens = #input_ids, n_past = 0}, "
             "{hidden_states = {from = 'prefix'}})",
-            "    loom.run_retained('layer_1', {n_tokens = #input_ids, n_past = 0}, "
+            "    loom.run_subgraph_and_retain('layer_1', {n_tokens = #input_ids, n_past = 0}, "
             "{hidden_states = {from = 'layer_0'}})",
             "    local _modular_final_out, _modular_final_shape = loom.run_subgraph('norm', "
             "{n_tokens = #input_ids, n_past = 0}, {hidden_states = {from = 'layer_1'}})",

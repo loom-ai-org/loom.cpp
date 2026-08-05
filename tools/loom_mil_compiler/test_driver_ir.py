@@ -110,7 +110,7 @@ class TestRetainedOutputAdjacency(unittest.TestCase):
         ])
         with self.assertRaises(DriverIRError) as raised:
             check_subgraph_calls(fn, self._topos())
-        self.assertIn("no earlier loom.run_retained('a', ...)", str(raised.exception))
+        self.assertIn("no earlier loom.run_subgraph_and_retain('a', ...)", str(raised.exception))
 
     def test_a_reference_produced_only_inside_a_branch_is_rejected(self):
         """Conservative on purpose: whatever a nested block retains does not escape it, so a producer
@@ -163,7 +163,7 @@ class TestRetainedOutputAdjacency(unittest.TestCase):
         stmt = _retain("prefix", {"x": OutputRef("tok")})
         self.assertEqual(
             LuaCodegen()._emit_stmt(stmt, 1),
-            ["    loom.run_retained('prefix', {}, {x = {from = 'tok'}})"],
+            ["    loom.run_subgraph_and_retain('prefix', {}, {x = {from = 'tok'}})"],
         )
         self.assertEqual(stmt.defines(), [])
 
