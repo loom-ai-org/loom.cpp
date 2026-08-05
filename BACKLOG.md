@@ -630,11 +630,11 @@ of this file that does not exist (the hierarchy is described in P3.1's entry ins
 
 #### P4.0 — settle these before the first from-scratch family config
 
-Eleven items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
+Fourteen items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
 (P4.0.1–P4.0.3, all DONE), five added by [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md)
-(P4.0.4–P4.0.8), and three added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
+(P4.0.4–P4.0.8), three added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
 remaining registry steps at the author's direction, plus P4.0.10/P4.0.11, the two capability gaps stage 3
-measured). None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
+measured), and three (P4.0.12–P4.0.14) from the review that followed P4.0.11a's marshalling fix. None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
 add three more configs written against whatever shape exists at the time. Same gate as everything else:
 byte-identical re-export of all 11 models (`snapshot_gguf.py`), since none of these is meant to change
 any output — with stated exceptions: P4.0.6's per-family peeling commits, where driver text legitimately
@@ -1433,6 +1433,84 @@ nothing.
   tests — `infer` cannot prefill past ~512 tokens for this vocab (see the marshalling item below), and
   greedy generation collapses into a repeating `107, 2717` a wrong window would reproduce.
 
+- **P4.0.12 — module-owned output buffers, and retrieval addressed by module name.** The forward pass and
+  the reduction that follows it are currently fused (`loom.run_subgraph_argmax`), because splitting them
+  appeared to require handing Lua an opaque tensor handle — and `BuildResult` is only readable while the
+  `GraphBuilder` that produced it is alive, so such a handle would dangle the moment the call returned.
+  **The author's framing dissolves that:** the KV cache is already persistent state addressed *by module
+  name*, with no address ever crossing the scripting boundary (`KV-CACHE.md` §1.1), and an output buffer
+  can work exactly the same way. `loom.argmax_row('main_topology', -1)` names a module, which is what
+  every Lua call already does.
+
+  Give each declared output a persistent, module-owned allocation — its own `ggml_context` and backend
+  buffer, precisely `KvCache`'s shape — with the graph ending in a copy into it, routed through
+  `side_effects` the way cache writes already are. The buffer's address is then stable *regardless* of
+  whether the graph was rebuilt, which matters because the output is `[n_vocab, n_tokens]` and
+  `n_tokens` differs between prefill and decode: a buffer holding only what retrieval needs (often the
+  last row) survives every shape change, while "whatever the last build produced" would not.
+
+  **The motivating case is inter-module data flow, NOT the large vocab.** A Lua driver that chains module
+  A into module B today reads A's output into a Lua table and writes it straight back as B's input. On
+  CPU that is two copies of an intermediate nobody looks at; on a GPU backend it is a device→host→device
+  round trip **per edge, per step**. The engine is single-backend CPU today (no `ggml_backend_sched` — see
+  the performance section), so the cost is latent rather than paid, but every multi-module model is
+  already shaped to pay it the moment a second backend lands: Kokoro, StyleTTS2, VITS, Matcha,
+  Supertonic, LFM2-modular's per-layer chain, Parakeet's TDT/RNNT loops.
+
+  **This corrects an earlier reading of the same question, recorded because the correction is the useful
+  part.** The first pass at "who should get a buffer" concluded that whole-output consumers (TTS/ASR)
+  must keep marshalling and only causal LMs could use one. That is backwards. Those models benefit
+  *most*, because their outputs are **intermediates that never need to reach Lua at all**. The rule is
+  not "reduce to a scalar"; it is **marshal only when a value is genuinely host-side** — a final result,
+  a control decision, or host math the driver actually performs.
+
+  Two things to settle rather than discover. **Staleness:** retrieval reads the module's current buffer,
+  so a second run on that module overwrites it and a late read silently returns newer data — wants a
+  generation counter that raises, and ideally a static adjacency rule, for which
+  `driver_ir.check_subgraph_calls` is already the right home. **Memory:** retaining per-module state
+  raises steady-state footprint for many-topology models like Kokoro, though a decode loop *gains*, since
+  today every `run_subgraph` allocates and frees a compute buffer.
+
+  *Gate: byte-identity is not it — driver text changes by construction. Per-model e2e Lua-driver tests
+  plus a read diff, the same exception P4.0.6's peeling commits take.*
+
+- **P4.0.13 — persist the graph itself, after P4.0.12.** The bucketed graph-reuse item already described
+  under "Performance optimizations designed but not implemented", scheduled here and in this order for a
+  reason: once the bridge retains per-module state for P4.0.12, the `GraphBuilder` is already being kept
+  alive, which is the part reuse needs. Today `compute_and_emit` constructs a fresh builder per call and
+  destroys it on return — so **`GraphBuilder::reserve()` is dead weight on this path**, called only by
+  the legacy `Generator` (`src/core/generation.cpp:20`) and never by the Lua bridge, meaning every
+  `run_subgraph` pays a full rebuild plus a compute-buffer allocation it then throws away.
+
+  Keeps the hazard this item has always carried, and it is the one place idea 12 does *not* help: the
+  `ggml_gallocr` input-aliasing bug is root-caused but reuse is only safe while **every declared input is
+  rewritten every decode step**, and it needs its own bit-identical-to-rebuild regression test on the
+  `test_graph_reuse_safety.cpp` pattern. P4.0.12 does not go near this, which is exactly why it should
+  land first.
+
+- **P4.0.14 — the same marshalling ceiling still stands on the modular path, and is fixed by P4.0.12.**
+  `run_subgraph_argmax` is gated on `_topology_uses_kv_cache` in the *flattened* path only;
+  `apply_modular_export` builds `ArgmaxEpilogue` without `already_reduced` and has no `MonolithicCall` at
+  all. Measured on the emitted artifact: lfm2-modular's driver has **zero** uses of `run_subgraph_argmax`
+  and still calls `loom.argmax_row(_mod_suffix_1, ...)`, while qwen3/smollm2/gemma3 have two each.
+
+  That is a consequence rather than an oversight — fusion is `Flattened`-only (`KV-CACHE.md` 2.2b), so
+  lfm2-modular has no cache, no `infer_with_past`, and nothing to reduce for. But the ceiling is real.
+  Against LuaJIT's ~2^27 array limit, each checkpoint's own `vocab_size` gives:
+
+  | model | vocab | prefill ceiling | reduces engine-side today |
+  |---|---|---|---|
+  | gemma-3-270m | 262144 | ~512 tok | yes |
+  | qwen3-0.6b | 151936 | ~883 tok | yes |
+  | smollm2-360m | 49152 | ~2730 tok | yes |
+  | **lfm2-350m modular** | 65536 | **~2048 tok** | **no** |
+
+  Deliberately scheduled after 12/13 rather than patched now: the fix is the same mechanism, and adding a
+  second reducing path to the modular builder would mean two ways to get a token out of a forward pass.
+  **Which is also the retirement plan for `run_subgraph_argmax`** — keep it while it is the only thing
+  that works, retire it once retrieval-by-name is fully functional, and do not leave both. Two spellings
+  that can disagree is the failure this project keeps removing.
+
 ### Driver logits marshalling caps prefill length for large-vocab models — FIXED
 
 Found while gating P4.0.11a. `MonolithicCall` returns the topology's whole `[n_vocab, n_tokens]` logits
@@ -1446,6 +1524,9 @@ returns one number, the argmax of the requested row, read from the tensor with `
 so the other rows are never touched. Nothing crosses the boundary but the answer — the Lua boundary
 stays a *per-step* boundary rather than a per-logit one, the same reasoning `KV-CACHE.md` §1.1 gives for
 not driving attention from Lua.
+
+**Still open on the modular path — P4.0.14**, which is where the numbers and the retirement plan for
+`run_subgraph_argmax` live.
 
 Gated on KV-cached topologies only, so the blast radius is the causal LMs: the vocab is what makes the
 cap reachable and only that family has one, so no ASR/TTS driver text moves. `MonolithicCall.argmax_row`
@@ -2734,8 +2815,8 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 
 ### Performance optimizations designed but not implemented
 
-- **Bucketed KV-cache graph-reuse.** `GraphBuilder::build()` always does a full rebuild + no_alloc pass
-  per call. Plan: round `n_kv` up to a bucket boundary (e.g. 32) and skip the rebuild when the bucket
+- **Bucketed KV-cache graph-reuse — scheduled as P4.0.13, after P4.0.12.** `GraphBuilder::build()` always
+  does a full rebuild + no_alloc pass per call. Plan: round `n_kv` up to a bucket boundary (e.g. 32) and skip the rebuild when the bucket
   hasn't changed, reusing the previous `ggml_cgraph*` and just overwriting input tensor data. Safe to
   attempt now that the graph-reuse aliasing bug (`ggml_gallocr` aliasing an input tensor's buffer) is
   root-caused, as long as every declared input is rewritten every decode step — still needs its own
