@@ -3,6 +3,8 @@
 #include "loom/core/unicode.h"
 #include "loom/loom_errors.h"
 
+#include <cstdio>
+
 #include <array>
 #include <climits>
 #include <unordered_map>
@@ -319,6 +321,11 @@ const std::unordered_map<std::string, PreSpec>& pre_spec_table() {
     static const std::unordered_map<std::string, PreSpec> table = {
         // kQwenLlama3, single-digit \p{N} (STABLELM2/QWEN2/HUNYUAN/SOLAR_OPEN/GROK_2 share one
         // regex_exprs array; deepseek-r1-qwen/kormo/f2llmv2/megrez are QWEN2 string aliases).
+        // SentencePiece-style BPE with byte fallback -- Gemma 3 tokenizes identically to llama.cpp's
+        // `granite-embed-multi-311m` (they share a chkhsh, which is computed over real tokenizer
+        // output, so the collision means the same behaviour rather than a coincidence of names).
+        {"granite-embed-multi-311m", {BpeShape::kSpmByteFallback, 0}},
+        {"granite-embed-multi-97m", {BpeShape::kSpmByteFallback, 0}},
         {"qwen2", {BpeShape::kQwenLlama3, 1}},
         {"deepseek-r1-qwen", {BpeShape::kQwenLlama3, 1}},
         {"kormo", {BpeShape::kQwenLlama3, 1}},
@@ -437,7 +444,30 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
     return vocab;
 }
 
+namespace {
+
+// The SPM family's whole normalizer: every space becomes U+2581. No dummy prefix is added -- HF gives
+// `"Hello world"` -> `['Hello', '\u2581world']`, with the first word bare -- so this really is a
+// character substitution and nothing more.
+std::string spm_normalize(const std::string& text) {
+    static const char* kMarker = "\xe2\x96\x81";
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        if (c == ' ') out += kMarker;
+        else out.push_back(c);
+    }
+    return out;
+}
+
+} // namespace
+
 std::vector<std::string> BpeVocab::pretokenize(const std::string& nfc_text) const {
+    // The SPM-style family has no pretokenizer: merges run over the whole normalized string, so the
+    // one "chunk" is all of it. Returning early keeps the scanner below about regex shapes only.
+    if (shape_ == BpeShape::kSpmByteFallback) {
+        return {nfc_text};
+    }
     const std::vector<char32_t> cps = utf8_decode(nfc_text);
     std::vector<std::string> chunks;
     size_t pos = 0;
@@ -504,8 +534,15 @@ void BpeVocab::bpe_merge(std::vector<std::string>& pieces) const {
     }
 }
 
+// U+2581 LOWER ONE EIGHTH BLOCK, SentencePiece's space marker.
+static const char* kSpmSpace = "\xe2\x96\x81";
+
 std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
-    const std::string normalized = nfc_normalize(text);
+    // NFC is deliberately skipped for the SPM family: its HF normalizer is a bare
+    // Replace(" ", "\u2581") and nothing else, so composing decomposed sequences here would tokenize
+    // differently from the reference model on exactly the inputs where it matters.
+    const std::string normalized = shape_ == BpeShape::kSpmByteFallback ? spm_normalize(text)
+                                                                        : nfc_normalize(text);
     const std::vector<std::string> chunks = pretokenize(normalized);
     const auto& enc = byte_encoder();
 
@@ -515,18 +552,41 @@ std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
     }
     for (const std::string& chunk : chunks) {
         std::vector<std::string> pieces;
-        pieces.reserve(chunk.size());
-        for (unsigned char b : chunk) pieces.push_back(utf8_encode({enc[b]}));
+        if (shape_ == BpeShape::kSpmByteFallback) {
+            // Initial symbols are CHARACTERS, not byte-mapped stand-ins -- this vocabulary stores
+            // literal UTF-8.
+            for (char32_t cp : utf8_decode(chunk)) pieces.push_back(utf8_encode({cp}));
+        } else {
+            pieces.reserve(chunk.size());
+            for (unsigned char b : chunk) pieces.push_back(utf8_encode({enc[b]}));
+        }
 
         bpe_merge(pieces);
 
         for (const std::string& p : pieces) {
             const auto it = token_to_id_.find(p);
-            if (it == token_to_id_.end()) {
-                throw LoadError("BpeVocab::encode: merged piece '" + p + "' is not in the vocabulary "
-                                 "(every single byte-mapped character should be a base vocab entry)");
+            if (it != token_to_id_.end()) {
+                ids.push_back(it->second);
+                continue;
             }
-            ids.push_back(it->second);
+            if (shape_ == BpeShape::kSpmByteFallback) {
+                // Byte fallback: a character the vocabulary has no entry for becomes its raw UTF-8
+                // bytes as `<0xNN>` tokens. A byte-level vocab never needs this (every byte maps to a
+                // base entry); this one does, and without it any unseen character would throw.
+                for (unsigned char b : p) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "<0x%02X>", b);
+                    const auto byte_it = token_to_id_.find(buf);
+                    if (byte_it == token_to_id_.end()) {
+                        throw LoadError(std::string("BpeVocab::encode: piece '") + p + "' is not in the "
+                                         "vocabulary and its byte fallback '" + buf + "' is missing too");
+                    }
+                    ids.push_back(byte_it->second);
+                }
+                continue;
+            }
+            throw LoadError("BpeVocab::encode: merged piece '" + p + "' is not in the vocabulary "
+                             "(every single byte-mapped character should be a base vocab entry)");
         }
     }
     if (add_sep_token_ && sep_id_ >= 0) {
@@ -536,6 +596,30 @@ std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
 }
 
 std::string BpeVocab::decode(const std::vector<int32_t>& ids) const {
+    if (shape_ == BpeShape::kSpmByteFallback) {
+        // The mirror of encode: `<0xNN>` back to a raw byte, U+2581 back to a space, everything else
+        // verbatim -- the vocabulary already holds literal UTF-8, so there is no byte map to undo.
+        std::string out;
+        for (int32_t id : ids) {
+            const std::string& piece = id_to_piece(id);
+            unsigned int byte_value = 0;
+            if (piece.size() == 6 && piece.compare(0, 3, "<0x") == 0 && piece[5] == '>' &&
+                std::sscanf(piece.c_str(), "<0x%02X>", &byte_value) == 1) {
+                out.push_back(static_cast<char>(byte_value));
+                continue;
+            }
+            for (size_t i = 0; i < piece.size();) {
+                if (piece.compare(i, 3, kSpmSpace) == 0) {
+                    out.push_back(' ');
+                    i += 3;
+                } else {
+                    out.push_back(piece[i]);
+                    ++i;
+                }
+            }
+        }
+        return out;
+    }
     const auto& dec = byte_decoder();
     std::string raw;
     for (int32_t id : ids) {
