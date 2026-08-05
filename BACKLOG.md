@@ -1340,16 +1340,21 @@ nothing.
   top-1 reference tokens are unchanged, and Qwen3 is untouched (2066 nodes, 28 `ATTENTION`, 0
   `SHORT_CONV`, no conv keys, 22/22 on its own gate).
 
-  **Sweep — 11 models, 10 byte-identical, 1 differs and only where it must.** Exported from a `git
+  **Sweep — 12 models, 11 byte-identical, 1 differs and only where it must.** Exported from a `git
   worktree` at `4689f79` and from the working tree, snapshotted and `diff -r`'d. Byte-identical:
-  conformer-ctc, parakeet-tdt, parakeet-rnnt, kokoro, matcha, supertonic, vits, lfm2-**modular**
-  (unfused), **qwen3 and smollm2** — the last two matter most, since they take the same `fuse_conv=True`
+  conformer-ctc, parakeet-tdt, parakeet-rnnt, kokoro, matcha, supertonic, vits, styletts2,
+  lfm2-**modular** (unfused), **qwen3 and smollm2** — the last two matter most, since they take the same `fuse_conv=True`
   path and simply match nothing. LFM2-monolithic differs in exactly three files: `CONV_1D_DW` 10 → 0,
   `SHORT_CONV` 0 → 10, `VIEW` 64 → 54 (the ten absorbed trims), 830 → 820 nodes; three added
   `loom.n_conv_*` hparams; and a driver script that gains `infer_with_past`. **Declared inputs
-  unchanged and `tensors.txt` identical — no weight moved.** StyleTTS2 is the twelfth model and did not
-  run: only `config.yml` survives under `styletts2_model/ckpt/Models/LJSpeech`, so its `.pth` is
-  missing — a checkpoint gap, not a code failure.
+  unchanged and `tensors.txt` identical — no weight moved.**
+
+  StyleTTS2 is byte-identical too, and getting there fixed a latent breakage: its config declared
+  `kokoro_config_path` (a genuinely separate dependency from its own weights) as
+  `/home/flavio/.claude/tmp/kokoro_model/config.json`, a path that stopped existing when the
+  checkpoints moved to `/home/flavio/Dev/models`. Now pointed there, matching where every other
+  hardcoded checkpoint path in the tree already points, and re-verified byte-identical against the
+  baseline afterwards.
 
   **The first run of this sweep was a false pass, and the reason is worth keeping.** It reported all 11
   identical, including LFM2-monolithic, which must differ by construction. `loom-export` runs
