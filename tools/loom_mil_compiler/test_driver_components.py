@@ -142,11 +142,12 @@ class TestPrefillDecodeLoop(unittest.TestCase):
             "    local _max_new_tokens = (inputs.max_new_tokens or 16)",
             "    local _eos_token = (inputs.eos_token or -1)",
             "    while true do",
-            "        local _dec_out, _dec_shape = loom.run_subgraph('main_topology', "
+            # The reducing call: the engine argmaxes the row and returns the token id, so no logits
+            # tensor crosses the boundary and there is no shape local (BACKLOG.md's marshalling cap).
+            "        local _next_token = loom.run_subgraph_argmax('main_topology', "
             "{n_tokens = _n_tokens, n_past = _n_past}, {tokens = _step_tokens, "
             "cache_position = loom.range(_n_past, _n_tokens), "
-            "attention_mask = loom.causal_mask(_n_tokens, _n_past)})",
-            "        local _next_token = loom.argmax_row(_dec_out, _dec_shape[1], (_n_tokens - 1))",
+            "attention_mask = loom.causal_mask(_n_tokens, _n_past)}, (_n_tokens - 1))",
             "        table.insert(_gen, _next_token)",
             "        _n_past = (_n_past + _n_tokens)",
             "        if (#_gen >= _max_new_tokens) then",

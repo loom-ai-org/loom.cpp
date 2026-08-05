@@ -1352,9 +1352,17 @@ class LoomGGUFExporter:
         self.driver_script = SYNTHESIZED_BUILDERS["Flattened"](
             inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
                                  mask_windows=self.mask_windows),
-            call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr),
+            # Reduce engine-side for KV-cached topologies -- the causal LMs, whose vocab is what makes
+            # the Lua marshalling cap reachable at all (BACKLOG.md). Every other family keeps returning
+            # its tensor, so no ASR/TTS driver text moves.
+            call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
+                                 argmax_row=(BinOp("-", n_tokens_expr, Lit(1))
+                                             if self._topology_uses_kv_cache(
+                                                 self.topologies["main_topology"]) else None)),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
-                                    n_tokens=n_tokens_expr),
+                                    n_tokens=n_tokens_expr,
+                                    already_reduced=self._topology_uses_kv_cache(
+                                        self.topologies["main_topology"])),
             decode=decode,
         ).build(self._driver_context())
 

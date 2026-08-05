@@ -3,6 +3,8 @@
 #include "loom/core/duration_aligner.h"
 #include "loom/core/graph_builder.h"
 #include "loom/core/conv_state_cache.h"
+
+#include <functional>
 #include "loom/core/kv_cache.h"
 #include "loom/core/relative_position.h"
 #include "loom/loom_errors.h"
@@ -125,6 +127,41 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
     return axes;
 }
 
+// Everything `run_subgraph` and `run_subgraph_argmax` share: build the graph for `axes`, fill every
+// declared input from the Lua table at `inputs_idx`, compute, and hand the result to `emit` while the
+// builder that owns its memory is still alive. Takes the module's pieces individually rather than the
+// Module struct so it can live here, in the anonymous namespace, next to the code it serves.
+//
+// Extracted rather than duplicated because the two entry points differ ONLY in what they do with the
+// outputs -- a copy would be free to drift on cache wiring or input validation, which is exactly the
+// class of difference nothing would catch.
+int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GgufModel& model,
+                      const GraphTopology& topo, ggml_backend_t backend, KvCache* kv_cache,
+                      ConvStateCache* conv_state, const DynamicAxes& axes, int inputs_idx,
+                      const std::function<int(GraphBuilder::BuildResult&)>& emit) {
+    GraphBuilder builder(topo, model, backend, kv_cache, /*compute_meta_bytes=*/32 * 1024 * 1024,
+                          conv_state);
+    GraphBuilder::BuildResult r = builder.build(axes);
+
+    lua_pushnil(L);
+    while (lua_next(L, inputs_idx) != 0) {
+        if (lua_type(L, -2) != LUA_TSTRING) {
+            return luaL_error(L, "%s: inputs table keys must be strings", fname);
+        }
+        const std::string name = lua_tostring(L, -2);
+        const auto input_it = r.input_tensors.find(name);
+        if (input_it == r.input_tensors.end()) {
+            return luaL_error(L, "%s: module '%s' has no declared input '%s'", fname, module_name,
+                               name.c_str());
+        }
+        set_tensor_from_lua_array(L, -1, input_it->second);
+        lua_pop(L, 1);
+    }
+
+    ggml_backend_graph_compute(backend, r.graph);
+    return emit(r);
+}
+
 } // namespace
 
 int LoomLuaBridge::l_run_subgraph(lua_State* L) {
@@ -143,29 +180,9 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         }
         Module& mod = it->second;
 
-        GraphBuilder builder(mod.topo, *mod.model, mod.backend, mod.kv_cache,
-                              /*compute_meta_bytes=*/32 * 1024 * 1024, mod.conv_state);
-        GraphBuilder::BuildResult r = builder.build(axes);
-
-        // Iterate the `inputs_table` (string key -> flat number array) and set each declared input.
-        lua_pushnil(L);
-        while (lua_next(L, 3) != 0) {
-            // key at -2, value at -1
-            if (lua_type(L, -2) != LUA_TSTRING) {
-                return luaL_error(L, "loom.run_subgraph: inputs table keys must be strings");
-            }
-            const std::string name = lua_tostring(L, -2);
-            const auto input_it = r.input_tensors.find(name);
-            if (input_it == r.input_tensors.end()) {
-                return luaL_error(L, "loom.run_subgraph: module '%s' has no declared input '%s'", module_name,
-                                   name.c_str());
-            }
-            set_tensor_from_lua_array(L, -1, input_it->second);
-            lua_pop(L, 1); // pop value, keep key for lua_next
-        }
-
-        ggml_backend_graph_compute(mod.backend, r.graph);
-
+        return compute_and_emit(L, "loom.run_subgraph", module_name, *mod.model, mod.topo, mod.backend,
+                                 mod.kv_cache, mod.conv_state, axes, 3,
+                                 [L](GraphBuilder::BuildResult& r) {
         // Returns every declared output's DATA first (in the topology's own declared order), THEN
         // every declared output's SHAPE in that same order -- e.g. for two outputs: (data1, data2,
         // shape1, shape2). For the single-output topology every model on the roadmap still uses as of
@@ -185,8 +202,66 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
             push_number_array(L, shape);
         }
         return static_cast<int>(r.outputs.size() * 2);
+        });
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.run_subgraph: %s", e.what());
+    }
+}
+
+// `loom.run_subgraph_argmax(module, axes, inputs, row)` -- run the module and return ONE number, the
+// argmax of the requested row of its first output. `row` is 0-based; a negative row means the last.
+//
+// **Why this exists: `run_subgraph` cannot return a large logits tensor at all.** It marshals every
+// output element into a Lua table, and LuaJIT's array part tops out near 2^27 entries -- so a
+// 262144-wide vocab (Gemma 3) overflows at ~512 prompt tokens, and a driver whose only use for those
+// logits is one argmax pays a 157M-element table to compute a single integer. Doing the reduction on
+// the tensor removes both the ceiling and the copy: nothing crosses the boundary but the answer.
+//
+// This keeps the Lua boundary a *per-step* boundary rather than a per-logit one, the same reasoning
+// KV-CACHE.md §1.1 gives for not driving attention from Lua.
+int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const DynamicAxes axes = read_axes_table(L, 2);
+        luaL_checktype(L, 3, LUA_TTABLE);
+        const auto requested_row = static_cast<int64_t>(luaL_checknumber(L, 4));
+
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "loom.run_subgraph_argmax: unregistered module '%s'", module_name);
+        }
+        Module& mod = it->second;
+
+        return compute_and_emit(L, "loom.run_subgraph_argmax", module_name, *mod.model, mod.topo,
+                                 mod.backend, mod.kv_cache, mod.conv_state, axes, 3,
+                                 [L, requested_row](GraphBuilder::BuildResult& r) {
+            ggml_tensor* out = r.outputs.front();
+            if (out->type != GGML_TYPE_F32) {
+                return luaL_error(L, "loom.run_subgraph_argmax: output must be f32");
+            }
+            const int64_t n_vocab = out->ne[0];
+            const int64_t n_rows = out->ne[1];
+            const int64_t row = requested_row < 0 ? n_rows - 1 : requested_row;
+            if (n_vocab <= 0 || row < 0 || row >= n_rows) {
+                return luaL_error(L, "loom.run_subgraph_argmax: row %d out of range for an output with "
+                                      "%d row(s) of width %d", static_cast<int>(requested_row),
+                                  static_cast<int>(n_rows), static_cast<int>(n_vocab));
+            }
+            // One row only -- the whole point. `nb[1]` is the row stride, so this reads n_vocab floats
+            // and never touches the other rows.
+            std::vector<float> logits(static_cast<size_t>(n_vocab));
+            ggml_backend_tensor_get(out, logits.data(), static_cast<size_t>(row) * out->nb[1],
+                                     logits.size() * sizeof(float));
+            int64_t best = 0;
+            for (int64_t i = 1; i < n_vocab; ++i) {
+                if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(best)]) best = i;
+            }
+            lua_pushnumber(L, static_cast<lua_Number>(best));
+            return 1;
+        });
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.run_subgraph_argmax: %s", e.what());
     }
 }
 
@@ -518,6 +593,7 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
     } bindings[] = {
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"range", &LoomLuaBridge::l_range},
+        {"run_subgraph_argmax", &LoomLuaBridge::l_run_subgraph_argmax},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},

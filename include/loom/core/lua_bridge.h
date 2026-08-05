@@ -135,6 +135,7 @@ private:
     // lua_bridge.cpp's own top comment for why every one of these MUST convert C++ exceptions to
     // `luaL_error` internally rather than let them unwind through the Lua C API.
     static int l_run_subgraph(lua_State* L);
+    static int l_run_subgraph_argmax(lua_State* L);
     // `loom.run_recurrent(h_module, c_module, sequence_flat, seq_len, input_dim, hidden_dim, reverse)`:
     // steps an LSTM cell over `sequence_flat` (a flat, row-major (seq_len, input_dim) array) one
     // timestep at a time, threading hidden/cell state between GraphBuilder rebuilds exactly like

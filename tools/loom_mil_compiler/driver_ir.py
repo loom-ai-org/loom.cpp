@@ -246,6 +246,15 @@ class SubgraphCall(Stmt):
     # unchanged; a call with seven inputs (Kokoro's decoder_vocoder) is unreadable on one line, and
     # the embedded driver_script is something people read out of the GGUF.
     multiline: bool = False
+    # When set, emit `loom.run_subgraph_argmax(module, axes, inputs, row)` instead: the module runs
+    # exactly the same way, but the engine reduces the first output's row `argmax_row` to one integer
+    # and only that crosses the Lua boundary. `outputs` is then the single token id and
+    # `extra_outputs` must be empty -- there is no shape to capture, because there is no tensor.
+    #
+    # Exists because marshalling a logits tensor is not merely slow, it has a CEILING: LuaJIT's array
+    # part tops out near 2^27 entries, so a 262144-wide vocab overflows at ~512 prompt tokens
+    # (BACKLOG.md). See lua_bridge.cpp's l_run_subgraph_argmax.
+    argmax_row: object = None
 
     def defines(self) -> list[str]:
         return list(self.outputs) + list(self.extra_outputs)
@@ -256,6 +265,8 @@ class SubgraphCall(Stmt):
             out.extend(e.reads())
         for v in self.inputs.values():
             out.extend(v.reads())
+        if self.argmax_row is not None:
+            out.extend(self.argmax_row.reads())
         return out
 
 
@@ -433,6 +444,16 @@ def check_subgraph_calls(function: Function, topologies: dict) -> None:
         # silently capture data values instead of shapes.
         declared_outputs = _topology_output_names(topo)
         n_declared = len(declared_outputs)
+        if call.argmax_row is not None:
+            # The reducing form returns ONE integer, not tensors -- so the data/shape pairing rule
+            # below does not apply and the only thing to check is that nothing asked for a shape.
+            if call.extra_outputs:
+                raise DriverIRError(
+                    f"driver IR: loom.run_subgraph_argmax('{call.module}', ...) requests "
+                    f"{len(call.extra_outputs)} shape output(s), but it returns a single token id and "
+                    "no tensor -- there is no shape to capture."
+                )
+            continue
         if len(call.outputs) > n_declared:
             raise DriverIRError(
                 f"driver IR: loom.run_subgraph('{call.module}', ...) captures {len(call.outputs)} data "
@@ -477,6 +498,11 @@ class LuaCodegen:
             return [f"{pad}{stmt.name} = {stmt.expr.render()}"]
         if isinstance(stmt, SubgraphCall):
             targets = ", ".join(list(stmt.outputs) + list(stmt.extra_outputs))
+            if stmt.argmax_row is not None:
+                call = Call("loom.run_subgraph_argmax",
+                            [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs),
+                             stmt.argmax_row])
+                return [f"{pad}local {targets} = {call.render()}"]
             if stmt.multiline:
                 inner = self.indent * (depth + 1)
                 lines = [f"{pad}local {targets} = loom.run_subgraph({Lit(stmt.module).render()}, "
