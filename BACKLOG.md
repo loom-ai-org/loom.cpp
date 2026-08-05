@@ -1292,7 +1292,8 @@ nothing.
   fused nodes, and their extents were baked at trace time; and **a hybrid architecture cannot decode
   incrementally at all**, which is how LFM2 ended up exporting `infer` alone.
 
-- **P4.0.10 — a state cache for the conv/SSM family, so a hybrid can decode incrementally.** Direct
+- **P4.0.10 — a state cache for the conv/SSM family, so a hybrid can decode incrementally — DONE
+  (4 commits).** Direct
   follow-up to P4.0.9's third unpredicted finding (`KV-CACHE.md`, "What stage 3 found"). LFM2-350M is 6
   attention blocks and **10 ShortConv** ones; it fuses, it gets a cache, it prefills — and the exporter
   then *declines* to emit `infer_with_past` and prints why (`exporter.py:1327-1334`), because a causal
@@ -1330,6 +1331,36 @@ nothing.
   **Gate:** LFM2-monolithic gains `infer_with_past` and agrees token-for-token with iterated `infer`,
   under the same 22-check harness Qwen3 and SmolLM2 already pass; every other model byte-identical.*
 
+  **Done, gate passed.** `ConvStateCache` + `SHORT_CONV` (engine), `loom_short_conv` +
+  `fuse_loom_short_conv` + the topology rule + `_conv_state_geometry()` (exporter), conv-state
+  allocation in the three hosts that allocate a KvCache, and one bug fix without which none of it ran.
+  Measured on the real checkpoint: **10 `SHORT_CONV`, dense layers 0–9, 0 `CONV_1D_DW`**, 6 `ATTENTION`
+  unchanged, `loom.n_conv_layer=10 / n_conv_state=2 / n_embd_conv=1024`, 830 → 820 nodes (the absorbed
+  trim, one per conv block). **LFM2's `infer_with_past` agrees with iterated `infer` 22/22**, its HF
+  top-1 reference tokens are unchanged, and Qwen3 is untouched (2066 nodes, 28 `ATTENTION`, 0
+  `SHORT_CONV`, no conv keys, 22/22 on its own gate).
+
+  **The design decision this row asked to settle went the OTHER way, and doing it is what settled it.**
+  The recommendation above is (b), a general persistent-slot input binding. `op_attention`'s write path
+  is what changed it: a state write-back must be *ordered* against the read, and only an op owning both
+  ends can guarantee that. `op_short_conv` gets that ordering more strongly than `ATTENTION` does — its
+  write copies a view of the *concatenated* buffer, which reads the slot, so a real data-dependency edge
+  exists and ggml cannot schedule the clobber first. (b) would have needed an input binding, an output
+  binding, and an ordering guarantee between them that nothing in the graph expresses.
+
+  **And the `VIEW` error this thread started from had two causes, not one.** `KV-CACHE.md`'s third
+  stage-3 finding recorded `VIEW: resolved shape [1,1024,1,] ... needs 16380 bytes but parent has 12288`
+  and attributed it to the missing conv state. The conv state was real — and after fixing it that
+  identical error still fired at `n_tokens = 1`, one layer earlier, on the in_proj channel-split.
+  `op_view`'s bounds check spelled "one element" as `parent->nb[0]`, which is only the element size on a
+  densely-packed tensor; LFM2's in_proj output is a `PERMUTE` with `ne=[1,3072]`, `nb=[12288,4]`, and
+  **`ggml_is_contiguous` reports it as contiguous** because its stride test is skipped whenever
+  `ne[0] == blck_size` (`ggml.c:1467`), so the `cont` never fired. The view was always correct; the
+  check was not. Using `ggml_type_size` makes it identical to `ggml_nbytes`' own formula (`ggml.c:1299`)
+  — the quantity it compares against. `ensure_packed` in the same file already existed for that same
+  ggml carve-out, which makes this the third consumer to hit it and worth naming as a recurring trap
+  rather than a one-off.
+
 - **P4.0.11 — sliding-window attention. Two items of very different size, and only the small one should
   be done first.** Not on the roadmap and no checkpoint in the tree needs it, but modern hybrids
   (Gemma 3-style interleaved local/global, 5:1) are unreachable without it, so it is filed rather than
@@ -1356,6 +1387,17 @@ nothing.
   `n_ctx` memory where it could spend `window`. (a) makes such a model run; (b) makes it cheap. *Gate for
   (a): the first windowed checkpoint's numeric reference test, and a banded-mask unit test at the
   `loom.causal_mask` level; every model in the tree byte-identical, since none declares a window.*
+
+  **(a) is PARTLY done: the mask primitive landed, the per-node routing did not.**
+  `loom.causal_mask(n_tokens, n_past [, window])` bands the mask, with `luaL_optnumber` so every
+  existing two-argument call site keeps its exact output — three checks pin the banding, a window wider
+  than `n_kv` reproducing the full-causal mask, and `window <= 0` doing the same. What remains is the
+  routing: `fuse_loom_attention` recording which mask each block consumed (it already carries `mask_var`
+  per block) and the driver builders passing each mask's own window, since the window is a per-node fact
+  and interleaved local/global needs two mask inputs. `_retype_fused_mask_input` already tolerates that
+  — it iterates the *set* of mask names and checks the only-consumer property per name. Left undone
+  deliberately: no checkpoint in the tree declares a window, so the routing has no numeric gate, and
+  building it against zero real models is how it would end up wrong.
 
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
