@@ -25,7 +25,7 @@ from loom_mil_compiler.driver_components import (
     parse_run_subgraph_calls,
 )
 from loom_mil_compiler.driver_ir import (
-    BinOp, DriverIRError, Len, Lit, LuaCodegen, SubgraphCall, Var,
+    BinOp, DriverIRError, Len, Lit, LuaCodegen, OutputRef, SubgraphCall, Var,
 )
 from loom_mil_compiler.spec_protocol import LinkError
 
@@ -201,40 +201,44 @@ class TestModularChainBuilder(unittest.TestCase):
     def _builder(self):
         n_tokens = Len("input_ids")
         stages = [
-            ChainStage(topology="prefix", outputs=("_mod_chain_0",),
+            ChainStage(topology="prefix", outputs=(), retained=True,
                        inputs={"input_ids": Var("input_ids")}),
-            ChainStage(topology="layer_0", outputs=("_mod_chain_1",),
-                       inputs={"hidden_states": Var("_mod_chain_0")}),
-            ChainStage(topology="layer_1", outputs=("_mod_chain_2",),
-                       inputs={"hidden_states": Var("_mod_chain_1")}),
-            ChainStage(topology="norm", outputs=("_mod_suffix_0",),
-                       inputs={"hidden_states": Var("_mod_chain_2")},
+            ChainStage(topology="layer_0", outputs=(), retained=True,
+                       inputs={"hidden_states": OutputRef("prefix")}),
+            ChainStage(topology="layer_1", outputs=(), retained=True,
+                       inputs={"hidden_states": OutputRef("layer_0")}),
+            ChainStage(topology="norm", outputs=("_modular_final_out",),
+                       inputs={"hidden_states": OutputRef("layer_1")},
                        extra_outputs=("_modular_final_shape",)),
         ]
         return ModularChainBuilder(
             inputs=DriverInputs(bindings=(("input_ids", CALLER),), n_tokens=n_tokens),
             chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens),
-            epilogue=ArgmaxEpilogue(out_var="_mod_suffix_0", shape_var="_modular_final_shape",
+            epilogue=ArgmaxEpilogue(out_var="_modular_final_out", shape_var="_modular_final_shape",
                                     n_tokens=n_tokens),
         )
 
-    def test_the_chain_threads_one_variable_through_every_stage(self):
+    def test_the_chain_threads_one_tensor_through_every_stage_without_marshalling_it(self):
+        """Every intermediate stays engine-side (BACKLOG.md P4.0.12): the chain binds no local at all
+        until the last stage, whose output is the logits the epilogue argmaxes -- a genuinely host-side
+        control decision, and the only value here that crosses the boundary."""
         text = self._builder().render(self._ctx())
         self.assertEqual(text, "\n".join([
             "function infer(inputs)",
             "    local input_ids = (inputs.input_ids or inputs.tokens)",
-            "    local _mod_chain_0 = loom.run_subgraph('prefix', {n_tokens = #input_ids, n_past = 0}, "
+            "    loom.run_retained('prefix', {n_tokens = #input_ids, n_past = 0}, "
             "{input_ids = input_ids})",
-            "    local _mod_chain_1 = loom.run_subgraph('layer_0', {n_tokens = #input_ids, n_past = 0}, "
-            "{hidden_states = _mod_chain_0})",
-            "    local _mod_chain_2 = loom.run_subgraph('layer_1', {n_tokens = #input_ids, n_past = 0}, "
-            "{hidden_states = _mod_chain_1})",
-            "    local _mod_suffix_0, _modular_final_shape = loom.run_subgraph('norm', "
-            "{n_tokens = #input_ids, n_past = 0}, {hidden_states = _mod_chain_2})",
-            "    if (type(_mod_suffix_0) == 'table') then",
-            "        return loom.argmax_row(_mod_suffix_0, _modular_final_shape[1], (#input_ids - 1))",
+            "    loom.run_retained('layer_0', {n_tokens = #input_ids, n_past = 0}, "
+            "{hidden_states = {from = 'prefix'}})",
+            "    loom.run_retained('layer_1', {n_tokens = #input_ids, n_past = 0}, "
+            "{hidden_states = {from = 'layer_0'}})",
+            "    local _modular_final_out, _modular_final_shape = loom.run_subgraph('norm', "
+            "{n_tokens = #input_ids, n_past = 0}, {hidden_states = {from = 'layer_1'}})",
+            "    if (type(_modular_final_out) == 'table') then",
+            "        return loom.argmax_row(_modular_final_out, _modular_final_shape[1], "
+            "(#input_ids - 1))",
             "    else",
-            "        return _mod_suffix_0",
+            "        return _modular_final_out",
             "    end",
             "end",
         ]))

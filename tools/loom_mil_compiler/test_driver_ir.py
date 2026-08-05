@@ -4,8 +4,8 @@ SubgraphCall/Function IR rather than tracing a real model."""
 import unittest
 
 from driver_ir import (
-    ArrayLit, Call, CallStmt, DriverIRError, Function, Lit, Local, LuaCodegen, SubgraphCall, Var,
-    check_subgraph_calls, validate,
+    ArrayLit, Call, CallStmt, DriverIRError, Function, If, Lit, Local, LuaCodegen, OutputRef,
+    SubgraphCall, Var, While, check_subgraph_calls, validate,
 )
 
 
@@ -75,6 +75,97 @@ class TestCheckSubgraphCalls(unittest.TestCase):
         call = SubgraphCall(outputs=["a", "b", "c"], module="not_in_dict", axes={}, inputs={})
         fn = Function(name="main", params=["inputs"], body=[call])
         check_subgraph_calls(fn, {})  # must not raise -- topology absent, skipped entirely
+
+
+def _retain(module, inputs=None):
+    return SubgraphCall(outputs=[], module=module, axes={}, inputs=inputs or {}, retain=True)
+
+
+class TestRetainedOutputAdjacency(unittest.TestCase):
+    """The static half of the staleness guard (BACKLOG.md P4.0.12).
+
+    An `OutputRef` names a MODULE, so `validate()` -- which knows only about symbols -- reports nothing
+    about it either way. These are the checks that replace what it cannot do, and the reason they live
+    in `check_subgraph_calls` rather than beside it: only this checker has the topologies.
+    """
+
+    def _topos(self):
+        return {
+            "a": _topo(outputs=["cos", "sin"]),
+            "b": _topo(inputs=["x"], output="y"),
+        }
+
+    def test_a_reference_to_an_earlier_retained_run_is_fine(self):
+        fn = Function("infer", ["inputs"], [
+            _retain("a"),
+            SubgraphCall(outputs=["out"], module="b", axes={}, inputs={"x": OutputRef("a")}),
+        ])
+        check_subgraph_calls(fn, self._topos())  # must not raise
+
+    def test_a_reference_to_a_module_nothing_retained_raises(self):
+        """The failure retention introduces that marshalling could not have: the read succeeds at
+        runtime and returns whatever the module last produced -- or nothing at all."""
+        fn = Function("infer", ["inputs"], [
+            SubgraphCall(outputs=["out"], module="b", axes={}, inputs={"x": OutputRef("a")}),
+        ])
+        with self.assertRaises(DriverIRError) as raised:
+            check_subgraph_calls(fn, self._topos())
+        self.assertIn("no earlier loom.run_retained('a', ...)", str(raised.exception))
+
+    def test_a_reference_produced_only_inside_a_branch_is_rejected(self):
+        """Conservative on purpose: whatever a nested block retains does not escape it, so a producer
+        that only runs on one arm is not assumed to have run. A driver that genuinely needs this pins
+        the generation number at run time instead."""
+        fn = Function("infer", ["inputs"], [
+            If(cond=Lit(True), then=[_retain("a")]),
+            SubgraphCall(outputs=["out"], module="b", axes={}, inputs={"x": OutputRef("a")}),
+        ])
+        with self.assertRaises(DriverIRError) as raised:
+            check_subgraph_calls(fn, self._topos())
+        self.assertIn("straight-line block", str(raised.exception))
+
+    def test_a_reference_inside_a_loop_sees_the_enclosing_producer(self):
+        """The other direction: a retained run BEFORE the loop is visible inside it, which is the shape
+        a decode loop reading a prefill's output would have."""
+        fn = Function("infer", ["inputs"], [
+            _retain("a"),
+            While(cond=Lit(True), body=[
+                SubgraphCall(outputs=["out"], module="b", axes={}, inputs={"x": OutputRef("a")}),
+            ]),
+        ])
+        check_subgraph_calls(fn, self._topos())  # must not raise
+
+    def test_an_index_past_the_declared_outputs_raises(self):
+        fn = Function("infer", ["inputs"], [
+            _retain("a"),
+            SubgraphCall(outputs=["out"], module="b", axes={}, inputs={"x": OutputRef("a", index=3)}),
+        ])
+        with self.assertRaises(DriverIRError) as raised:
+            check_subgraph_calls(fn, self._topos())
+        self.assertIn("which declares 2 output(s)", str(raised.exception))
+
+    def test_a_retaining_call_that_also_binds_a_local_raises(self):
+        """The two halves of one decision -- `retain` here and the consumer's `OutputRef` -- disagreeing
+        would otherwise show up as a local silently bound to the generation number."""
+        fn = Function("infer", ["inputs"], [
+            SubgraphCall(outputs=["oops"], module="a", axes={}, inputs={}, retain=True),
+        ])
+        with self.assertRaises(DriverIRError) as raised:
+            check_subgraph_calls(fn, self._topos())
+        self.assertIn("read back by module name", str(raised.exception))
+
+    def test_an_output_reference_renders_as_a_self_describing_table(self):
+        self.assertEqual(OutputRef("prefix").render(), "{from = 'prefix'}")
+        self.assertEqual(OutputRef("aux", index=2).render(), "{from = 'aux', index = 2}")
+        self.assertEqual(OutputRef("aux").reads(), [])
+
+    def test_a_retaining_call_renders_as_a_statement_binding_nothing(self):
+        stmt = _retain("prefix", {"x": OutputRef("tok")})
+        self.assertEqual(
+            LuaCodegen()._emit_stmt(stmt, 1),
+            ["    loom.run_retained('prefix', {}, {x = {from = 'tok'}})"],
+        )
+        self.assertEqual(stmt.defines(), [])
 
 
 if __name__ == "__main__":

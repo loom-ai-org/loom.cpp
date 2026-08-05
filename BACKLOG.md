@@ -1433,7 +1433,8 @@ nothing.
   tests — `infer` cannot prefill past ~512 tokens for this vocab (see the marshalling item below), and
   greedy generation collapses into a repeating `107, 2717` a wrong window would reproduce.
 
-- **P4.0.12 — module-owned output buffers, and retrieval addressed by module name.** The forward pass and
+- **P4.0.12 — module-owned output buffers, and retrieval addressed by module name — DONE (2026-08-05).**
+  The forward pass and
   the reduction that follows it are currently fused (`loom.run_subgraph_argmax`), because splitting them
   appeared to require handing Lua an opaque tensor handle — and `BuildResult` is only readable while the
   `GraphBuilder` that produced it is alive, so such a handle would dangle the moment the call returned.
@@ -1474,10 +1475,70 @@ nothing.
   *Gate: byte-identity is not it — driver text changes by construction. Per-model e2e Lua-driver tests
   plus a read diff, the same exception P4.0.6's peeling commits take.*
 
+  **What shipped.** `OutputStore` (`include/loom/core/output_store.h`) is the third member of the
+  persistent-state family after `KvCache` and `ConvStateCache`, built to the identical seam: its own
+  `ggml_context` and backend buffer outside the compute graph, the write returned as a `ggml_cpy` the
+  builder routes through `side_effects`, and no address ever crossing the scripting boundary. It is
+  owned by the *bridge* rather than lent by the host, which is the one place it had to differ — a
+  cache's geometry comes from declared hparams, an output's does not, so only the run that fills it can
+  size it. `reshape()` therefore reallocates when the geometry moves, which for a decode loop is once,
+  at the prefill→decode transition; retrieval looks the buffer up by name at read time, so it can never
+  hold a pointer the store has since replaced.
+
+  Lua surface: `loom.run_retained(module, axes, inputs)` returns only a generation number, and a
+  retained value is read back in exactly one of three ways — which is the "is this genuinely
+  host-side?" question made syntactic. `loom.get_output(module, index)` for a final result,
+  `loom.argmax_row(module, row)` for a control decision, and `{from = 'module'}` as another module's
+  input for the case this exists for, an intermediate the driver merely threads onward. The reference
+  form is a table with named fields rather than a new binding: it cannot collide with a data array, it
+  is self-describing where a driver is read, and it costs no leanness. `argmax_row`'s module form is an
+  *overload* rather than a second binding for a related reason — `n_vocab` is only a parameter of the
+  array form because a flat Lua array has lost the shape the tensor still carries.
+
+  **Staleness got both halves.** The runtime one is the generation counter: `check_generation` raises
+  naming the module, and every read (`get_output`, `argmax_row`, an `{from = ..., gen = g}` reference)
+  can pin itself. The static one landed where the item predicted — `driver_ir.check_subgraph_calls`,
+  because an `OutputRef` names a module and `validate()` knows only about symbols, so the ordering
+  question had to move to the checker that knows what a module is. It is conservative on purpose:
+  retention tracked in statement order, nested `If`/`While` bodies inheriting a copy that does not
+  escape, so a producer on one arm of a branch is rejected rather than assumed. Synthesized drivers
+  therefore need no `gen` argument and none is emitted; the runtime counter is what covers hand-written
+  Lua the static rule cannot see.
+
+  **Adopted on the modular chain only, and deliberately not one stage further.** Every edge of
+  lfm2-modular's 20-stage chain is an intermediate — 19 of them now stay engine-side. The *last* stage
+  still marshals, because its output is the logits the epilogue argmaxes, and moving that engine-side
+  is P4.0.14's own item: doing it here would have added a second reducing path to the modular builder
+  while `run_subgraph_argmax` still exists, which is the "two ways to get a token out of a forward
+  pass" this project keeps removing. The marshalling cap on that path is therefore still open, exactly
+  as P4.0.14 states.
+
+  **Gate, measured.** `tests/test_lua_bridge_retained_outputs.cpp` (16 checks) runs every case against
+  a marshalled oracle — the retained chain, the pinned chain, `get_output`, `index = 2`,
+  `argmax_row` by name and a store reshaped between a 3-token and a 1-token run all reproduce what the
+  Lua-table path produces, and the five failure modes each raise an error naming the real problem.
+  Re-exported qwen3 (flattened), matcha (multi-phase) and lfm2-modular from a baseline worktree and
+  from this tree: `diff -r` over `snapshot_gguf.py` output is empty for the first two — every topology
+  JSON and every tensor hash — and lfm2-modular differs in exactly one place, `model.driver_script`
+  (and the `kv.txt` line carrying it). The gate could fail and did, for the one model that must move.
+  `test_e2e_lfm2_mil_export` against the re-exported modular GGUF: HF's own top-1 at both prompt
+  lengths, 3523 at 3 tokens and 2 at 7. Full ctest 142/142, exporter suite 453/453.
+
 - **P4.0.13 — persist the graph itself, after P4.0.12.** The bucketed graph-reuse item already described
   under "Performance optimizations designed but not implemented", scheduled here and in this order for a
   reason: once the bridge retains per-module state for P4.0.12, the `GraphBuilder` is already being kept
-  alive, which is the part reuse needs. Today `compute_and_emit` constructs a fresh builder per call and
+  alive, which is the part reuse needs.
+
+  **Correction, measured after P4.0.12 shipped (2026-08-05): that last sentence was wrong, and the work
+  it promised is still all here.** What P4.0.12 made per-module and persistent is the *output store*, on
+  `LoomLuaBridge::Module` beside `kv_cache`/`conv_state` — the builder is untouched. `compute_and_emit`
+  still constructs a `GraphBuilder` per call and destroys it on return, so `reserve()` is still dead
+  weight on this path and every `run_subgraph`/`run_retained` still pays a full rebuild plus a
+  compute-buffer allocation it throws away. What P4.0.12 genuinely bought this item is smaller but real:
+  it established that per-module persistent state on the bridge is the right home for it (three classes
+  now use that seam), and it removed the reason a builder's lifetime was entangled with a value's — an
+  output no longer has to outlive the builder that produced it, so keeping builders alive can be decided
+  on reuse grounds alone. Today `compute_and_emit` constructs a fresh builder per call and
   destroys it on return — so **`GraphBuilder::reserve()` is dead weight on this path**, called only by
   the legacy `Generator` (`src/core/generation.cpp:20`) and never by the Lua bridge, meaning every
   `run_subgraph` pays a full rebuild plus a compute-buffer allocation it then throws away.
@@ -1489,6 +1550,17 @@ nothing.
   land first.
 
 - **P4.0.14 — the same marshalling ceiling still stands on the modular path, and is fixed by P4.0.12.**
+
+  **Status after P4.0.12 (2026-08-05): the mechanism exists and is unused here, which is what this item
+  now is.** `loom.run_retained` + `loom.argmax_row(module, row)` is the fused call said as two facts, and
+  it is shipping and tested. The modular chain adopted the first half — 19 of lfm2-modular's 20 stages
+  retain — and deliberately not the second: its last stage still calls `loom.run_subgraph` and hands the
+  epilogue a real logits table, so the table below is unchanged and every number in it still holds. What
+  remains is to point the last stage at retrieval-by-name too, drop `ArgmaxEpilogue`'s marshalling
+  branch for this builder, and then delete `run_subgraph_argmax` and its `MonolithicCall.argmax_row` /
+  `already_reduced` pair in the same commit — the retirement below, which is the only reason the two
+  halves were kept apart.
+
   `run_subgraph_argmax` is gated on `_topology_uses_kv_cache` in the *flattened* path only;
   `apply_modular_export` builds `ArgmaxEpilogue` without `already_reduced` and has no `MonolithicCall` at
   all. Measured on the emitted artifact: lfm2-modular's driver has **zero** uses of `run_subgraph_argmax`
@@ -1526,7 +1598,9 @@ stays a *per-step* boundary rather than a per-logit one, the same reasoning `KV-
 not driving attention from Lua.
 
 **Still open on the modular path — P4.0.14**, which is where the numbers and the retirement plan for
-`run_subgraph_argmax` live.
+`run_subgraph_argmax` live. P4.0.12 built the mechanism that replaces it (`loom.run_retained` plus
+`loom.argmax_row(module, row)`) and moved every modular chain edge but the last onto it; the last one,
+which is the one this cap is about, is still marshalled.
 
 Gated on KV-cached topologies only, so the blast radius is the causal LMs: the vocab is what makes the
 cap reachable and only that family has one, so no ASR/TTS driver text moves. `MonolithicCall.argmax_row`
@@ -2824,7 +2898,9 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
   `GraphBuilder::reserve()`/`GraphBuilder::build()` in `src/core/graph_builder.cpp`.
 - **`ggml_backend_sched` / multi-backend.** Not used anywhere — engine talks to a single `ggml_backend_t`
   directly via a plain `ggml_gallocr`. Fine for CPU-only; needed once a second backend (CUDA/Metal) is
-  added and graphs need splitting across devices.
+  added and graphs need splitting across devices. This is what makes P4.0.12's retained outputs a
+  latent win rather than a paid one: a marshalled inter-module edge is two host copies today and a
+  device→host→device round trip per edge per step the moment this lands.
 - **Flash attention.** `ATTENTION` (`src/ops/primitives_attention.cpp`) always uses the composite
   (`MUL_MAT`→`soft_max_ext`→`MUL_MAT`) path — chosen because `ggml_flash_attn_ext` forces an F16 K/V cast
   that fights exact fp32 verification. A `FLASH_ATTENTION` primitive can be added later as a purely

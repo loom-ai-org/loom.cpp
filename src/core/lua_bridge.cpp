@@ -6,6 +6,7 @@
 
 #include <functional>
 #include "loom/core/kv_cache.h"
+#include "loom/core/output_store.h"
 #include "loom/core/relative_position.h"
 #include "loom/loom_errors.h"
 
@@ -109,6 +110,98 @@ LoomLuaBridge* bridge_from_upvalue(lua_State* L) {
     return static_cast<LoomLuaBridge*>(lua_touserdata(L, lua_upvalueindex(1)));
 }
 
+// Resolves a module name to its persistent OutputStore. A callable rather than a direct call because
+// `modules_` is private and the run helper below deliberately lives in this anonymous namespace, taking
+// the module's pieces individually rather than the Module struct.
+using StoreLookup = std::function<OutputStore&(const std::string&)>;
+
+// Is the Lua value at `value_idx` a retained-output reference -- `{from = "module"}`, optionally with
+// `index` and `gen` -- rather than a plain data array?
+//
+// Unambiguous by construction: an input table's ordinary value is a 1-indexed array of numbers, which
+// has no `from` field at all, and a table that HAS one is not something any existing driver passes.
+// Deliberately a table with named fields rather than a bare string or an `{module, index}` pair: it is
+// self-describing where a driver script is read (out of a GGUF, most often), and it cannot collide with
+// a two-element data array.
+bool is_output_ref(lua_State* L, int value_idx) {
+    if (lua_type(L, value_idx) != LUA_TTABLE) return false;
+    lua_getfield(L, value_idx, "from");
+    const bool is_ref = lua_type(L, -1) == LUA_TSTRING;
+    lua_pop(L, 1);
+    return is_ref;
+}
+
+// Fills `dst` from another module's retained output, backend-side: `ggml_backend_tensor_copy` moves the
+// bytes directly, so on a multi-backend build this is a device->device copy and the values never become
+// Lua doubles. This is the whole reason retained outputs exist (BACKLOG.md P4.0.12).
+//
+// Raises loom::Error rather than calling luaL_error: these run inside compute_and_emit, whose caller
+// already converts exceptions at the trampoline, and luaL_error's longjmp would skip the GraphBuilder's
+// destructor on the way out.
+void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, const StoreLookup& lookup,
+                                 const char* fname) {
+    lua_getfield(L, value_idx, "from");
+    const std::string src_module = lua_tostring(L, -1);
+    lua_pop(L, 1);
+
+    // 1-based, like the declared-output list it indexes (and like `loom.get_output`'s own `index`).
+    lua_getfield(L, value_idx, "index");
+    const int64_t index1 = lua_isnil(L, -1) ? 1 : static_cast<int64_t>(std::llround(lua_tonumber(L, -1)));
+    lua_pop(L, 1);
+
+    // The generation the producing `loom.run_retained` returned. Optional -- a synthesized driver whose
+    // adjacency the exporter already checked need not carry it (driver_ir.check_subgraph_calls) -- but
+    // it is what makes a stale read an error rather than silently newer data.
+    lua_getfield(L, value_idx, "gen");
+    const bool pinned = !lua_isnil(L, -1);
+    const auto gen = pinned ? static_cast<uint64_t>(std::llround(lua_tonumber(L, -1))) : 0;
+    lua_pop(L, 1);
+
+    OutputStore& store = lookup(src_module);
+    if (pinned) store.check_generation(gen, src_module);
+    if (index1 < 1) {
+        throw Error(std::string(fname) + ": {from='" + src_module + "', index=" + std::to_string(index1) +
+                     "} -- an output index is 1-based, like the declared-output list it indexes");
+    }
+    ggml_tensor* src = store.get(static_cast<size_t>(index1 - 1));
+
+    if (!ggml_are_same_shape(src, dst) || src->type != dst->type) {
+        throw Error(std::string(fname) + ": module '" + src_module + "' output " + std::to_string(index1) +
+                     " is " + ggml_type_name(src->type) + " [" + std::to_string(src->ne[0]) + "," +
+                     std::to_string(src->ne[1]) + "," + std::to_string(src->ne[2]) + "," +
+                     std::to_string(src->ne[3]) + "], but input '" + ggml_get_name(dst) + "' is " +
+                     ggml_type_name(dst->type) + " [" + std::to_string(dst->ne[0]) + "," +
+                     std::to_string(dst->ne[1]) + "," + std::to_string(dst->ne[2]) + "," +
+                     std::to_string(dst->ne[3]) + "] -- a retained output is copied as-is, so the two "
+                     "must agree exactly (marshalling through Lua only ever compared element counts)");
+    }
+    ggml_backend_tensor_copy(src, dst);
+}
+
+// Argmax over ONE row of a 2D f32 tensor. `requested_row` is 0-based; negative means the last row.
+// `nb[1]` is the row stride, so this reads ne0 floats and never touches the other rows -- which is what
+// removes both the marshalling ceiling and the copy (see l_run_subgraph_argmax's header comment).
+int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname) {
+    if (out->type != GGML_TYPE_F32) {
+        throw Error(std::string(fname) + ": output must be f32");
+    }
+    const int64_t n_vocab = out->ne[0];
+    const int64_t n_rows = out->ne[1];
+    const int64_t row = requested_row < 0 ? n_rows - 1 : requested_row;
+    if (n_vocab <= 0 || row < 0 || row >= n_rows) {
+        throw Error(std::string(fname) + ": row " + std::to_string(requested_row) + " out of range for an "
+                     "output with " + std::to_string(n_rows) + " row(s) of width " + std::to_string(n_vocab));
+    }
+    std::vector<float> logits(static_cast<size_t>(n_vocab));
+    ggml_backend_tensor_get(out, logits.data(), static_cast<size_t>(row) * out->nb[1],
+                             logits.size() * sizeof(float));
+    int64_t best = 0;
+    for (int64_t i = 1; i < n_vocab; ++i) {
+        if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(best)]) best = i;
+    }
+    return best;
+}
+
 // Reads a Lua table of string->number pairs at `idx` into a `DynamicAxes` (EXPORT-ROADMAP.md R1: a
 // topology declares its own axis names, e.g. {n_samples=16000} or {n_tokens=12, n_past=0}, rather than
 // this binding assuming every topology has exactly the same two positional axes).
@@ -127,21 +220,28 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
     return axes;
 }
 
-// Everything `run_subgraph` and `run_subgraph_argmax` share: build the graph for `axes`, fill every
-// declared input from the Lua table at `inputs_idx`, compute, and hand the result to `emit` while the
-// builder that owns its memory is still alive. Takes the module's pieces individually rather than the
-// Module struct so it can live here, in the anonymous namespace, next to the code it serves.
+// Everything `run_subgraph`, `run_subgraph_argmax` and `run_retained` share: build the graph for
+// `axes`, fill every declared input from the Lua table at `inputs_idx`, compute, and hand the result to
+// `emit` while the builder that owns its memory is still alive. Takes the module's pieces individually
+// rather than the Module struct so it can live here, in the anonymous namespace, next to the code it
+// serves.
 //
-// Extracted rather than duplicated because the two entry points differ ONLY in what they do with the
+// Extracted rather than duplicated because the entry points differ ONLY in what they do with the
 // outputs -- a copy would be free to drift on cache wiring or input validation, which is exactly the
-// class of difference nothing would catch.
+// class of difference nothing would catch. That is also why an input may be a retained-output
+// reference on EVERY one of them and not just the retaining one: which module produced a value and
+// which entry point consumes it are independent questions.
+//
+// `out_store` is null for the marshalling entry points and the module's own store for
+// `run_retained` -- see GraphBuilder::build for what it does with it.
 int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GgufModel& model,
                       const GraphTopology& topo, ggml_backend_t backend, KvCache* kv_cache,
                       ConvStateCache* conv_state, const DynamicAxes& axes, int inputs_idx,
+                      const StoreLookup& lookup, OutputStore* out_store,
                       const std::function<int(GraphBuilder::BuildResult&)>& emit) {
     GraphBuilder builder(topo, model, backend, kv_cache, /*compute_meta_bytes=*/32 * 1024 * 1024,
                           conv_state);
-    GraphBuilder::BuildResult r = builder.build(axes);
+    GraphBuilder::BuildResult r = builder.build(axes, out_store);
 
     lua_pushnil(L);
     while (lua_next(L, inputs_idx) != 0) {
@@ -154,11 +254,20 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
             return luaL_error(L, "%s: module '%s' has no declared input '%s'", fname, module_name,
                                name.c_str());
         }
-        set_tensor_from_lua_array(L, -1, input_it->second);
+        // lua_next leaves the value at the top of the stack; take its absolute index so the field reads
+        // an output reference performs (which push and pop) can't shift it underneath us.
+        const int value_idx = lua_gettop(L);
+        if (is_output_ref(L, value_idx)) {
+            set_tensor_from_output_ref(L, value_idx, input_it->second, lookup, fname);
+        } else {
+            set_tensor_from_lua_array(L, value_idx, input_it->second);
+        }
         lua_pop(L, 1);
     }
 
     ggml_backend_graph_compute(backend, r.graph);
+    // After the compute, so a generation number only ever names a run whose values are really there.
+    if (out_store != nullptr) out_store->bump_generation();
     return emit(r);
 }
 
@@ -181,7 +290,8 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         Module& mod = it->second;
 
         return compute_and_emit(L, "loom.run_subgraph", module_name, *mod.model, mod.topo, mod.backend,
-                                 mod.kv_cache, mod.conv_state, axes, 3,
+                                 mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self),
+                                 /*out_store=*/nullptr,
                                  [L](GraphBuilder::BuildResult& r) {
         // Returns every declared output's DATA first (in the topology's own declared order), THEN
         // every declared output's SHAPE in that same order -- e.g. for two outputs: (data1, data2,
@@ -219,6 +329,11 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
 //
 // This keeps the Lua boundary a *per-step* boundary rather than a per-logit one, the same reasoning
 // KV-CACHE.md §1.1 gives for not driving attention from Lua.
+//
+// **Retirement policy (BACKLOG.md P4.0.14).** `loom.run_retained` + `loom.argmax_row(module, row)` is
+// the same two facts said separately, and once the modular path uses them this fused spelling goes
+// away: two ways to get a token out of a forward pass that can disagree is the failure this project
+// keeps removing. It stays until then because it is the only one that works on the flattened path.
 int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
@@ -234,34 +349,77 @@ int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
         Module& mod = it->second;
 
         return compute_and_emit(L, "loom.run_subgraph_argmax", module_name, *mod.model, mod.topo,
-                                 mod.backend, mod.kv_cache, mod.conv_state, axes, 3,
+                                 mod.backend, mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self),
+                                 /*out_store=*/nullptr,
                                  [L, requested_row](GraphBuilder::BuildResult& r) {
-            ggml_tensor* out = r.outputs.front();
-            if (out->type != GGML_TYPE_F32) {
-                return luaL_error(L, "loom.run_subgraph_argmax: output must be f32");
-            }
-            const int64_t n_vocab = out->ne[0];
-            const int64_t n_rows = out->ne[1];
-            const int64_t row = requested_row < 0 ? n_rows - 1 : requested_row;
-            if (n_vocab <= 0 || row < 0 || row >= n_rows) {
-                return luaL_error(L, "loom.run_subgraph_argmax: row %d out of range for an output with "
-                                      "%d row(s) of width %d", static_cast<int>(requested_row),
-                                  static_cast<int>(n_rows), static_cast<int>(n_vocab));
-            }
-            // One row only -- the whole point. `nb[1]` is the row stride, so this reads n_vocab floats
-            // and never touches the other rows.
-            std::vector<float> logits(static_cast<size_t>(n_vocab));
-            ggml_backend_tensor_get(out, logits.data(), static_cast<size_t>(row) * out->nb[1],
-                                     logits.size() * sizeof(float));
-            int64_t best = 0;
-            for (int64_t i = 1; i < n_vocab; ++i) {
-                if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(best)]) best = i;
-            }
-            lua_pushnumber(L, static_cast<lua_Number>(best));
+            lua_pushnumber(L, static_cast<lua_Number>(
+                argmax_tensor_row(r.outputs.front(), requested_row, "loom.run_subgraph_argmax")));
             return 1;
         });
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.run_subgraph_argmax: %s", e.what());
+    }
+}
+
+// `loom.run_retained(module, axes, inputs)` -- run the module and leave every declared output in the
+// module's own persistent OutputStore instead of marshalling it. Returns one number: the store's
+// generation counter for this run, which a later read may pin itself to.
+//
+// See lua_bridge.h's declaration for the three ways a retained output is read back, and
+// include/loom/core/output_store.h for why the buffer is module-owned rather than handed out as a
+// handle.
+int LoomLuaBridge::l_run_retained(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const DynamicAxes axes = read_axes_table(L, 2);
+        luaL_checktype(L, 3, LUA_TTABLE);
+
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "loom.run_retained: unregistered module '%s'", module_name);
+        }
+        Module& mod = it->second;
+        if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backend);
+        OutputStore* store = mod.outputs.get();
+
+        return compute_and_emit(L, "loom.run_retained", module_name, *mod.model, mod.topo, mod.backend,
+                                 mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self), store,
+                                 [L, store](GraphBuilder::BuildResult&) {
+            lua_pushnumber(L, static_cast<lua_Number>(store->generation()));
+            return 1;
+        });
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.run_retained: %s", e.what());
+    }
+}
+
+// `loom.get_output(module [, index [, generation]])` -> (data, shape). The marshalling half of
+// retrieval-by-name, for a value that is genuinely host-side: same (flat data, 4-element ne[]) pair
+// `loom.run_subgraph` returns for one output, read out of the module's store rather than out of a
+// BuildResult that no longer exists.
+int LoomLuaBridge::l_get_output(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string module_name = luaL_checkstring(L, 1);
+        // 1-based, like the declared-output list it indexes.
+        const auto index1 = static_cast<int64_t>(std::llround(luaL_optnumber(L, 2, 1)));
+        if (index1 < 1) {
+            return luaL_error(L, "loom.get_output: index %d is 1-based, like the declared-output list "
+                                  "it indexes", static_cast<int>(index1));
+        }
+        OutputStore& store = retained_store(self, module_name);
+        if (!lua_isnoneornil(L, 3)) {
+            store.check_generation(static_cast<uint64_t>(std::llround(luaL_checknumber(L, 3))), module_name);
+        }
+        ggml_tensor* out = store.get(static_cast<size_t>(index1 - 1));
+        push_number_array(L, read_tensor_as_doubles(L, out));
+        const std::vector<double> shape = {static_cast<double>(out->ne[0]), static_cast<double>(out->ne[1]),
+                                            static_cast<double>(out->ne[2]), static_cast<double>(out->ne[3])};
+        push_number_array(L, shape);
+        return 2;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.get_output: %s", e.what());
     }
 }
 
@@ -418,12 +576,35 @@ int LoomLuaBridge::l_zero_mask(lua_State* L) {
     }
 }
 
+// Two spellings of one operation, distinguished by the first argument's type:
+//
+//   loom.argmax_row(flat, n_vocab, row)          -- a Lua array the driver already holds
+//   loom.argmax_row(module, row [, generation])  -- module `module`'s retained first output
+//
 // Matches WhisperDriver::argmax, but takes the row index explicitly so the driver script can select
 // "last prompt token" during prefill vs "the only row" during incremental decode (mirrors
 // transcribe()'s own two call sites) -- kept as one host call rather than a Lua-side loop over
 // potentially vocab-sized arrays.
+//
+// The module form is the retrieval-by-name half of BACKLOG.md P4.0.12, and is the same operation on the
+// same values -- it just never marshals them, so it has no ceiling and no copy. An OVERLOAD rather than
+// a second binding precisely because it is not a second operation: `n_vocab` is only a parameter of the
+// array form because a flat Lua array has lost the shape the tensor still carries.
 int LoomLuaBridge::l_argmax_row(lua_State* L) {
     try {
+        if (lua_type(L, 1) == LUA_TSTRING) {
+            auto* self = bridge_from_upvalue(L);
+            const std::string module_name = lua_tostring(L, 1);
+            const auto requested_row = static_cast<int64_t>(luaL_checknumber(L, 2));
+            OutputStore& store = retained_store(self, module_name);
+            if (!lua_isnoneornil(L, 3)) {
+                store.check_generation(static_cast<uint64_t>(std::llround(luaL_checknumber(L, 3))),
+                                        module_name);
+            }
+            lua_pushnumber(L, static_cast<lua_Number>(
+                argmax_tensor_row(store.get(0), requested_row, "loom.argmax_row")));
+            return 1;
+        }
         const std::vector<double> flat = read_number_array(L, 1);
         const auto n_vocab = static_cast<uint32_t>(luaL_checknumber(L, 2));
         const auto row_index = static_cast<uint32_t>(luaL_checknumber(L, 3));
@@ -582,6 +763,22 @@ int LoomLuaBridge::l_get_weight(lua_State* L) {
     }
 }
 
+OutputStore& LoomLuaBridge::retained_store(LoomLuaBridge* self, const std::string& module) {
+    const auto it = self->modules_.find(module);
+    if (it == self->modules_.end()) {
+        throw Error("unregistered module '" + module + "'");
+    }
+    if (!it->second.outputs || !it->second.outputs->filled()) {
+        throw Error("module '" + module + "' has no retained outputs -- nothing has run it via "
+                     "loom.run_retained, so there is nothing to read by name");
+    }
+    return *it->second.outputs;
+}
+
+std::function<OutputStore&(const std::string&)> LoomLuaBridge::store_lookup(LoomLuaBridge* self) {
+    return [self](const std::string& module) -> OutputStore& { return retained_store(self, module); };
+}
+
 LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), backend_(backend) {
     if (L_ == nullptr) throw Error("LoomLuaBridge: luaL_newstate() failed (out of memory)");
     luaL_openlibs(L_);
@@ -594,6 +791,8 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"range", &LoomLuaBridge::l_range},
         {"run_subgraph_argmax", &LoomLuaBridge::l_run_subgraph_argmax},
+        {"run_retained", &LoomLuaBridge::l_run_retained},
+        {"get_output", &LoomLuaBridge::l_get_output},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
@@ -616,7 +815,7 @@ LoomLuaBridge::~LoomLuaBridge() {
 
 void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo,
                                      KvCache* kv_cache, ConvStateCache* conv_state) {
-    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backend_};
+    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backend_, nullptr};
 }
 
 void LoomLuaBridge::load_script(const std::string& lua_source) {

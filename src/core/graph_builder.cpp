@@ -1,4 +1,5 @@
 #include "loom/core/graph_builder.h"
+#include "loom/core/output_store.h"
 #include "loom/loom_errors.h"
 #include "loom/ops/primitive_registry.h"
 
@@ -113,7 +114,7 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_bac
     : topo_(topo), model_(model), backend_(backend), kv_cache_(kv_cache), conv_state_(conv_state),
       compute_meta_bytes_(compute_meta_bytes) {}
 
-GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes) {
+GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes, OutputStore* out_store) {
     ggml_init_params params{compute_meta_bytes_, nullptr, /*no_alloc=*/true};
     ggml_context_ptr ctx(ggml_init(params));
     if (!ctx) {
@@ -194,6 +195,17 @@ GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes) {
     // ggml_build_forward_expand call the pre-P2 code made, so behavior/byte-output is unchanged.
     for (ggml_tensor* out : result.outputs) {
         ggml_build_forward_expand(gf, out);
+    }
+    // Retained outputs (BACKLOG.md P4.0.12), expanded LAST and deliberately so: unlike a cache write,
+    // this cpy has a real data dependency on the output it copies, so it must come after -- and
+    // ggml_build_forward_expand appends only the cpy itself, every node it reads already being in the
+    // graph. The destination is the store's own persistent tensor, whose data pointer is set outside
+    // this graph, so gallocr treats it as pre-allocated exactly as it does a KvCache view.
+    if (out_store != nullptr) {
+        const std::vector<ggml_tensor*>& slots = out_store->reshape(result.outputs);
+        for (size_t i = 0; i < slots.size(); ++i) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx.get(), result.outputs[i], slots[i]));
+        }
     }
     result.graph = gf;
 

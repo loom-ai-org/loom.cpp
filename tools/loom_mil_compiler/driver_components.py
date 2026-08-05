@@ -223,6 +223,12 @@ class ChainStage:
     inputs: dict
     outputs: Tuple[str, ...]
     extra_outputs: Tuple[str, ...] = ()
+    # When true, this stage's outputs stay in the engine (BACKLOG.md P4.0.12) and `outputs`/
+    # `extra_outputs` are empty: the next stage reaches them with an `OutputRef` instead of a local.
+    # Per stage rather than per chain because the two ends of a chain are genuinely different -- an
+    # intermediate is threaded onward and should never become a Lua value, while the LAST stage's
+    # output is what the epilogue reduces, and moving that one engine-side is its own item (P4.0.14).
+    retained: bool = False
 
     __links__ = {
         "topology": TopologyName(),
@@ -234,6 +240,12 @@ class ChainStage:
         "extra_outputs": Unchecked("same -- shape locals this stage binds. Whether capturing them is "
                                    "legal at all is driver_ir.check_subgraph_calls' question, and it "
                                    "answers it against the topology's real declared output count"),
+        "retained": Unchecked(
+            "whether this stage's consumer reads it by module name or by local -- one decision the "
+            "exporter makes for both ends of the edge at once, and driver_ir.check_subgraph_calls is "
+            "what catches the two disagreeing: a reference to a module nothing retained is an error "
+            "there, and a retained call that also binds locals is too."
+        ),
     }
 
     def link_label(self) -> str:
@@ -253,6 +265,13 @@ class ModularChain(DriverComponent):
     reads, and LFM2's conv-type layers never touch `position_embeddings` while its attention-type layers
     do -- so which inputs survive differs per layer even though every layer was traced with an identical
     call signature. Each `ChainStage` therefore carries its own resolved input map.
+
+    **This is the case module-owned output buffers exist for** (BACKLOG.md P4.0.12). Every edge here is
+    an intermediate the driver merely threads onward -- a `[n_embd, n_tokens]` hidden state nobody looks
+    at -- and before retention each one was read into a Lua table and written straight back: two copies
+    per edge per step on CPU, and a device->host->device round trip per edge per step the moment a
+    second backend lands. A stage marked `retained` leaves its output in the engine and the next stage
+    names it, so nothing crosses the boundary but the chain's final result.
     """
 
     stages: Tuple[ChainStage, ...] = ()
@@ -281,6 +300,7 @@ class ModularChain(DriverComponent):
                 module=stage.topology,
                 axes={ctx.root_axis(stage.topology): self.n_tokens, "n_past": Lit(0)},
                 inputs=dict(stage.inputs),
+                retain=stage.retained,
             )
             for stage in self.stages
         ]
