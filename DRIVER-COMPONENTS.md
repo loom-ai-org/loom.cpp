@@ -57,10 +57,10 @@ Three builders exist:
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 2 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 3 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 6 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, styletts2, supertonic, vits |
