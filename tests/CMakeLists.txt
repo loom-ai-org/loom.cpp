@@ -27,6 +27,11 @@ add_executable(test_primitive_registry test_primitive_registry.cpp)
 target_link_libraries(test_primitive_registry PRIVATE loom::engine)
 add_test(NAME test_primitive_registry COMMAND test_primitive_registry)
 
+add_executable(test_e2e_sliding_window_attention test_e2e_sliding_window_attention.cpp)
+target_link_libraries(test_e2e_sliding_window_attention PRIVATE loom::engine)
+add_test(NAME test_e2e_sliding_window_attention COMMAND test_e2e_sliding_window_attention)
+set_tests_properties(test_e2e_sliding_window_attention PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_short_conv_state test_short_conv_state.cpp)
 target_link_libraries(test_short_conv_state PRIVATE loom::engine)
 add_test(NAME test_short_conv_state COMMAND test_short_conv_state)

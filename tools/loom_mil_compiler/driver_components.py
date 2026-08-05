@@ -109,8 +109,19 @@ class DriverInputs(DriverComponent):
     # The length expression the host-computed bindings are built at. Reads a name this component binds
     # earlier in the same list, which is why `driver_ir.validate` is the authority on it.
     n_tokens: object
+    # {input name: sliding-window width} for the masks that are banded rather than full-causal
+    # (BACKLOG.md P4.0.11a). Empty for every model that has no windowed attention, which is every model
+    # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
+    # byte-identical to what it was before this field existed.
+    mask_windows: dict = dataclasses.field(default_factory=dict)
 
     __unchecked__ = {
+        "mask_windows": Unchecked(
+            "read off the EMITTED topology by `LoomGGUFExporter._route_windowed_masks`, which "
+            "synthesizes the windowed mask inputs in the first place -- so the exporter is the "
+            "authority and there is no separate claim here for a checkpoint to disagree with."
+        ),
+
         "bindings": Unchecked(
             "the traced graph's own declared input names, READ off the MIL function (and off each "
             "stage's post-pruning topology inputs) rather than claimed about it. A link runs the other "
@@ -130,7 +141,11 @@ class DriverInputs(DriverComponent):
             if kind == POSITION:
                 out.append(Local(name, Call("loom.range", [Lit(0), self.n_tokens])))
             elif kind == MASK:
-                out.append(Local(name, Call("loom.causal_mask", [self.n_tokens, Lit(0)])))
+                args = [self.n_tokens, Lit(0)]
+                window = self.mask_windows.get(name)
+                if window:
+                    args.append(Lit(window))
+                out.append(Local(name, Call("loom.causal_mask", args)))
             else:
                 out.append(Local(name, caller_input(name)))
         return out
@@ -311,6 +326,12 @@ class PrefillDecodeLoop(DriverComponent):
     bindings: Tuple[Tuple[str, str], ...] = ()
     inputs: Tuple[str, ...] = ()
     default_max_new_tokens: int = 16
+    # {input name: sliding-window width} for the masks that are banded rather than full-causal
+    # (BACKLOG.md P4.0.11a). Empty for every model that has no windowed attention, which is every model
+    # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
+    # byte-identical to what it was before this field existed.
+    mask_windows: dict = dataclasses.field(default_factory=dict)
+
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
     step_var: str = "_step_tokens"
@@ -326,6 +347,11 @@ class PrefillDecodeLoop(DriverComponent):
             "the traced graph's own declared input names and kinds, READ off the MIL function rather "
             "than claimed about it -- same as DriverInputs.bindings, and the call site built from them "
             "is what `inputs` checks."
+        ),
+        "mask_windows": Unchecked(
+            "read off the EMITTED topology by `LoomGGUFExporter._route_windowed_masks`, which "
+            "synthesizes the windowed mask inputs in the first place -- so the exporter is the "
+            "authority and there is no separate claim here for a checkpoint to disagree with."
         ),
         "default_max_new_tokens": Unchecked(
             "a default for a caller-supplied argument, not a claim about the model. Nothing in the "
@@ -347,7 +373,11 @@ class PrefillDecodeLoop(DriverComponent):
             if kind == POSITION:
                 out[name] = Call("loom.range", [Var(self.n_past_var), Var(self.n_tokens_var)])
             elif kind == MASK:
-                out[name] = Call("loom.causal_mask", [Var(self.n_tokens_var), Var(self.n_past_var)])
+                args = [Var(self.n_tokens_var), Var(self.n_past_var)]
+                window = self.mask_windows.get(name)
+                if window:
+                    args.append(Lit(window))
+                out[name] = Call("loom.causal_mask", args)
             else:
                 out[name] = Var(self.step_var)
         return out

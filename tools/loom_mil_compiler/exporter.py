@@ -135,6 +135,10 @@ class LoomGGUFExporter:
         self.kwargs = kwargs
         self.weights = {}
         self.topologies = {}
+        # {declared input name: window}, filled by `_route_windowed_masks` as each topology is
+        # generated and read by the driver assembly, which is what turns a synthesized mask input into
+        # a `loom.causal_mask(n_tokens, n_past, window)` call (BACKLOG.md P4.0.11a).
+        self.mask_windows = {}
         # The built driver (`driver_builder.DriverScript`: top-level prelude chunks + the entry
         # function), set by whichever of the three paths `export()` dispatches to. Was a bare
         # `IRFunction` until P4.0.6/C.2 -- a driver is a Lua module, not a function, and the two
@@ -1319,6 +1323,13 @@ class LoomGGUFExporter:
         bindings = tuple(
             (self.safe_name(name), _binding_kind(name)) for name in main_func.inputs.keys()
         )
+        # The synthesized windowed masks have no MIL var, so they are not in `main_func.inputs` -- they
+        # exist only on the emitted topology (`_route_windowed_masks`). Appended rather than merged in
+        # traced order because they are host-computed like every other MASK binding and read only
+        # `n_tokens`/`n_past`, which the traced inputs above have already bound.
+        bindings = bindings + tuple(
+            (name, MASK) for name in sorted(self.mask_windows) if name not in dict(bindings)
+        )
         input_names = tuple(name for name, _ in bindings)
 
         # Through `SYNTHESIZED_BUILDERS` rather than by naming the class, so the table P4.0.7's
@@ -1337,9 +1348,10 @@ class LoomGGUFExporter:
                       f"its own history. Exporting infer (prefill) only.")
             else:
                 decode = PrefillDecodeLoop(topology="main_topology", bindings=bindings,
-                                           inputs=input_names)
+                                           inputs=input_names, mask_windows=self.mask_windows)
         self.driver_script = SYNTHESIZED_BUILDERS["Flattened"](
-            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
+                                 mask_windows=self.mask_windows),
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
                                     n_tokens=n_tokens_expr),
@@ -1930,6 +1942,9 @@ class LoomGGUFExporter:
         pruned_nodes, output_symbols = self._materialize_view_outputs(pruned_nodes, output_symbols)
 
         self._retype_fused_mask_input(topo_inputs, pruned_nodes, func_name)
+        # After the retyping, never before: that check asserts the fused mask's only consumers are
+        # cached ATTENTION nodes, and it has to see the original wiring to mean anything.
+        self.mask_windows.update(self._route_windowed_masks(topo_inputs, pruned_nodes, func_name))
 
         # "output" (singular string) is both the original schema and what every single-output topology
         # still serializes -- byte-identical to pre-P2 output. "outputs" (plural array) is new, used only
@@ -1999,6 +2014,68 @@ class LoomGGUFExporter:
                     f"other node's shape would be derived from an axis the trace never had."
                 )
             declared[name]["shape"] = [axes.N_KV.name, self.root_axis]
+
+    def _route_windowed_masks(self, topo_inputs, nodes, func_name) -> dict:
+        """Give each sliding-window attention block its own mask input, and say which window it wants.
+
+        Interleaved local/global models (Gemma 3) need two different masks over the same keys: the full
+        blocks attend to `[0, p]`, the sliding ones to `(p - window, p]`. The trace cannot express that
+        -- it hands every block the one `attention_mask` input this family passes in (see
+        `LMCausalModelExportConfig._attention_windows`) -- so the second mask is SYNTHESIZED here, as a
+        declared topology input with no MIL var behind it, and the driver fills both in with
+        `loom.causal_mask(n_tokens, n_past, window)`.
+
+        Putting the window in the MASK rather than on the `ATTENTION` node is what keeps the engine out
+        of it: `ggml_soft_max_ext` already takes an arbitrary `[n_kv, n_tokens]` mask, so a banded one
+        needs no new primitive, no new attr and no runtime branch. The cost is one extra host-built
+        array per distinct window per step, which is the same order as the mask already being built.
+
+        One input per DISTINCT window, not per block: Gemma 3's 15 sliding blocks all want 512, so they
+        share one. Returns `{input_name: window}` for the driver.
+        """
+        windows = self.kwargs.get("attention_windows")
+        if not windows:
+            return {}
+        cached = [
+            node for node in nodes
+            if node["op"] == "ATTENTION" and node.get("attrs", {}).get("kv_cache", True)
+            and len(node["inputs"]) > 3
+        ]
+        if not cached:
+            return {}
+        if len(cached) != len(windows):
+            # The list is indexed by the `layer` attr, which `fuse_loom_attention` assigns in
+            # attention-block occurrence order. Those agree for a uniform decoder and would not for a
+            # hybrid whose conv blocks also count in `layer_types` -- better to refuse than to band the
+            # wrong blocks.
+            raise ValueError(
+                f"topology '{func_name}': the checkpoint declares {len(windows)} layer window(s) but "
+                f"the fusion produced {len(cached)} cached ATTENTION block(s). `attention_windows` is "
+                "indexed by the block's own `layer` attr (occurrence order), so the two must agree."
+            )
+
+        declared = {inp["name"]: inp for inp in topo_inputs}
+        routed = {}
+        for node in cached:
+            window = int(windows[int(node["attrs"]["layer"])])
+            if window <= 0:
+                continue
+            base = node["inputs"][3]
+            if base not in declared:
+                raise ValueError(
+                    f"topology '{func_name}': block {node['attrs']['layer']} wants a {window}-token "
+                    f"window but its mask '{base}' is not a declared input, so there is nothing to "
+                    "give it a windowed sibling of. Fusion must leave the mask reaching the node "
+                    "directly (see _retype_fused_mask_input)."
+                )
+            name = f"{base}_sw{window}"
+            if name not in declared:
+                declared[name] = {"name": name, "dtype": declared[base]["dtype"],
+                                   "shape": [axes.N_KV.name, self.root_axis]}
+                topo_inputs.append(declared[name])
+                routed[name] = window
+            node["inputs"][3] = name
+        return routed
 
     # Ops whose ggml result is a live VIEW of their input rather than a fresh contiguous buffer.
     # `ggml_backend_tensor_get` -- how every declared output is read back, by the Lua bridge and by

@@ -187,6 +187,33 @@ class LMCausalModelExportConfig(LoomExportConfig):
             attention_mask=_causal_mask(dummy_seq_len),
         )
 
+    def _attention_windows(self):
+        """Per-layer sliding-window widths from the checkpoint's own config, or None if it declares
+        none. `0` means full attention; a positive value is the window (BACKLOG.md P4.0.11a).
+
+        **This is read from the config because the traced graph does not contain it, which is the one
+        place this exporter reaches for a config fact over a graph fact and is worth justifying.**
+        Interleaved-window models (Gemma 3: `layer_types` alternating `sliding_attention`/
+        `full_attention` 5:1, `sliding_window: 512`) build two masks internally -- but only when they
+        build them THEMSELVES. This family passes `attention_mask` explicitly, exactly so the sequence
+        length stays dynamic under `torch.jit.trace`, and transformers then uses that one tensor
+        verbatim for both mask types. Measured on gemma-3-270m-it: all 18 layers slice the SAME
+        `attention_mask` input, sliding and full alike, so the band is not merely baked at trace time --
+        it is absent. Nothing downstream could recover it from the graph.
+
+        It is also silently harmless at short lengths, which is what makes it worth a check rather than
+        a comment: below the window a banded mask and a causal one are identical, so a model traced at
+        `dummy_seq_len < sliding_window` looks correct and only diverges past it.
+        """
+        cfg = _hf_config(Path(self.model_dir))
+        if not cfg:
+            return None
+        window = cfg.get("sliding_window")
+        layer_types = cfg.get("layer_types")
+        if not window or not isinstance(layer_types, list):
+            return None
+        return [int(window) if t == "sliding_attention" else 0 for t in layer_types]
+
     def backend_kwargs(self) -> dict:
         kwargs = dict(
             tokenizer_dir=self.tokenizer_dir or self.model_dir,
@@ -221,6 +248,10 @@ class LMCausalModelExportConfig(LoomExportConfig):
                 # into 10 stateful ones and makes the hybrid eligible for a decode loop at all.
                 fuse_conv=True,
                 kv_cache_size=self.max_seq_len,
+                # Per-attention-block sliding windows, or None (BACKLOG.md P4.0.11a). A CONFIG fact
+                # rather than a graph one, unlike everything else the exporter derives -- see
+                # `_attention_windows` for why the trace cannot carry it.
+                attention_windows=self._attention_windows(),
             )
         return kwargs
 
