@@ -14,6 +14,7 @@ namespace loom {
 
 class KvCache;
 class ConvStateCache;
+class OutputStore;
 
 // A topology's own declared axis values for one build() call -- EXPORT-ROADMAP.md R1's named-axes
 // design: every topology declares which axis(es) its dynamic dims are actually named (axes.py's
@@ -73,7 +74,15 @@ public:
     // (n_past + n_tokens) -- the one derived axis a primitive itself reads directly from SymbolEnv
     // (`primitives_attention.cpp`'s ATTENTION op), rather than only ever appearing in a JSON shape
     // string, so every caller of an attention-bearing topology gets it without having to compute it.
-    BuildResult build(const DynamicAxes& axes);
+    //
+    // `out_store`, when given, is reshaped to this build's declared-output geometry and the graph ends
+    // in a cpy of every declared output into it, routed through the same `side_effects` mechanism the
+    // KV-cache writes use (BACKLOG.md P4.0.12). Those values then outlive this BuildResult -- and the
+    // GraphBuilder itself -- because the store owns its own context and backend buffer, which is what
+    // makes retrieval-by-module-name possible at all. A per-CALL argument rather than a constructor
+    // one: whether a run retains its outputs is the caller's decision (`loom.run_retained` vs
+    // `loom.run_subgraph`), not a property of the module the way its caches are.
+    BuildResult build(const DynamicAxes& axes, OutputStore* out_store = nullptr);
 
     // Builds worst-case prefill (n_tokens=n_ctx_max, n_past=0) and decode (n_tokens=1,
     // n_past=n_ctx_max-1) shapes and reserves the allocator for the larger of the two, so that ordinary

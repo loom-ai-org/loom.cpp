@@ -19,6 +19,7 @@
 #include "loom/core/graph_builder.h"
 #include "loom/core/symbol_table.h"
 #include "loom/core/kv_cache.h"
+#include "loom/core/output_store.h"
 #include "loom/core/lua_bridge.h"
 #include "loom/ops/primitive_registry.h"
 

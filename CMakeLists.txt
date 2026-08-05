@@ -21,6 +21,7 @@ add_library(loom_engine
     src/core/graph_builder.cpp
     src/core/conv_state_cache.cpp
     src/core/kv_cache.cpp
+    src/core/output_store.cpp
     src/core/generation.cpp
     src/core/tdt_decoder.cpp
     src/core/whisper_driver.cpp

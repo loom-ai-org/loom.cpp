@@ -5,6 +5,8 @@
 
 #include <ggml-cpp.h>
 
+#include <functional>
+#include <memory>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -17,6 +19,7 @@ namespace loom {
 
 class KvCache;
 class ConvStateCache;
+class OutputStore;
 
 // Embeds a LuaJIT VM into the engine (see LOOM_PROCEDURAL_GENERALIZATION.md /
 // LOOM_MIL_CONVERSION.md): the data-driven replacement for bespoke per-model C++ drivers
@@ -86,7 +89,10 @@ public:
     //
     // Binding both HERE rather than passing them per call is what gives a Lua driver persistence with no
     // address ever crossing the scripting boundary: the script names a module, and the C++ side knows
-    // which stores that module owns.
+    // which stores that module owns. A module's retained OUTPUT buffer (BACKLOG.md P4.0.12) is the same
+    // arrangement one step further: it is not a parameter here at all, because unlike the two caches
+    // nothing declares its geometry -- the run that fills it is what sizes it, so the bridge allocates
+    // and owns it on first use.
     void register_module(const std::string& name, GgufModel& model, GraphTopology topo,
                          KvCache* kv_cache = nullptr, ConvStateCache* conv_state = nullptr);
 
@@ -113,6 +119,16 @@ private:
         KvCache* kv_cache;
         ConvStateCache* conv_state;
         ggml_backend_t backend;
+        // Persistent storage for this module's declared outputs (BACKLOG.md P4.0.12), created on the
+        // module's first `loom.run_retained` and owned for the bridge's lifetime thereafter -- unlike
+        // `kv_cache`/`conv_state`, which the HOST allocates from declared hparams and merely lends. It
+        // has to be owned rather than lent because an output's geometry is not declared anywhere: it
+        // follows the axes of whichever build fills it, so only the run itself can size it.
+        //
+        // Lazy so a driver that never retains anything (every hand-written TTS driver today) pays no
+        // steady-state footprint for the mechanism -- which matters most for exactly the many-topology
+        // models retention would otherwise cost the most, like Kokoro's.
+        std::unique_ptr<OutputStore> outputs;
     };
 
     lua_State* L_;
@@ -131,11 +147,39 @@ private:
     std::normal_distribution<float> normal_dist_{0.0f, 1.0f};
     std::uniform_real_distribution<float> uniform_dist_{0.0f, 1.0f};
 
+    // Resolves a module name to that module's retained-output store, throwing a loom::Error naming the
+    // module if it is unregistered or has never been run with retention. A static member rather than a
+    // free function in lua_bridge.cpp only because `modules_` is private; `store_lookup` wraps it as a
+    // callable so the shared run helper can stay in that file's anonymous namespace, taking the
+    // module's pieces individually the way it already does.
+    static OutputStore& retained_store(LoomLuaBridge* self, const std::string& module);
+    static std::function<OutputStore&(const std::string&)> store_lookup(LoomLuaBridge* self);
+
     // Trampolines registered into the Lua state; each retrieves `this` via its closure's upvalue. See
     // lua_bridge.cpp's own top comment for why every one of these MUST convert C++ exceptions to
     // `luaL_error` internally rather than let them unwind through the Lua C API.
     static int l_run_subgraph(lua_State* L);
     static int l_run_subgraph_argmax(lua_State* L);
+    // `loom.run_retained(module, axes, inputs)`: runs `module` exactly as `loom.run_subgraph` does, but
+    // instead of marshalling its outputs into Lua tables, leaves them in the module's own persistent
+    // OutputStore and returns a single number -- the store's generation counter for this run. Nothing
+    // tensor-shaped crosses the boundary. MEETS the binding criterion above: it reads no model config
+    // (the module name, its axes and its inputs are all call arguments) and it earns its C++ place
+    // structurally -- the values it keeps have no Lua representation that isn't a full copy, which is
+    // the whole point.
+    //
+    // A retained output is read back in one of three ways, and which one is right is the question
+    // "is this value genuinely host-side?": `loom.get_output` when it is (a final result), the
+    // `loom.argmax_row(module, row)` form when only a control decision is (the next token id), and
+    // an `{from = "module"}` entry in another module's `inputs` table when it is neither -- an
+    // intermediate the driver merely threads onward, which is the case this exists for.
+    static int l_run_retained(lua_State* L);
+    // `loom.get_output(module [, index [, generation]])` -> (data, shape): marshals declared output
+    // `index` (1-based, defaulting to 1) of `module`'s retained outputs, in the same (flat data array,
+    // 4-element ne[] array) convention `loom.run_subgraph` returns. The optional `generation` is the
+    // number the producing `loom.run_retained` returned; passing it turns "this module was re-run in
+    // between and I am silently reading newer data" into an error.
+    static int l_get_output(lua_State* L);
     // `loom.run_recurrent(h_module, c_module, sequence_flat, seq_len, input_dim, hidden_dim, reverse)`:
     // steps an LSTM cell over `sequence_flat` (a flat, row-major (seq_len, input_dim) array) one
     // timestep at a time, threading hidden/cell state between GraphBuilder rebuilds exactly like
@@ -153,6 +197,9 @@ private:
     static int l_range(lua_State* L);
     static int l_causal_mask(lua_State* L);
     static int l_zero_mask(lua_State* L);
+    // `loom.argmax_row(flat, n_vocab, row)` or `loom.argmax_row(module, row [, generation])` -- one
+    // operation in two spellings, the second reading a retained output by module name instead of a
+    // marshalled array. See the definition for why this is an overload rather than a new binding.
     static int l_argmax_row(lua_State* L);
     static int l_seed_rng(lua_State* L);
     static int l_gaussian_array(lua_State* L);

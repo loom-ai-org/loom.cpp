@@ -6,6 +6,10 @@ defined before it's read, and `check_subgraph_calls()` cross-checks each `loom.r
 declared inputs against the target topology's own declared inputs -- both classes of bug (undefined-symbol
 use, spurious/mismatched subgraph inputs) that previously only surfaced as a runtime crash or silently
 wrong output. `LuaCodegen` is the only place that knows Lua's concrete syntax.
+
+The two checkers divide the work by what a thing IS: `validate()` owns everything addressed by symbol,
+`check_subgraph_calls()` everything addressed by module name -- which is why the retained-output
+adjacency rule (BACKLOG.md P4.0.12) lives in the second and not the first.
 """
 from __future__ import annotations
 
@@ -168,6 +172,33 @@ class ArrayLit(Expr):
 
 
 @dataclasses.dataclass
+class OutputRef(Expr):
+    """`{from = 'prefix'}` -- an input supplied by another module's RETAINED output rather than by a Lua
+    value (BACKLOG.md P4.0.12, `include/loom/core/output_store.h`).
+
+    The engine copies the bytes backend-to-backend, so the intermediate never becomes a Lua table at
+    all: on CPU that removes two copies of a value nobody looks at, and on a second backend it removes a
+    device->host->device round trip per edge per step.
+
+    **`reads()` is empty, and that is the whole reason `check_subgraph_calls` grew an adjacency rule.**
+    This names a MODULE, not a local, so `validate()` -- which only knows about symbols -- has nothing
+    to check and would silently accept a reference to a module that never ran. The ordering question is
+    real either way, so it moved to the checker that knows what a module is.
+    """
+    module: str
+    # 1-based, indexing the target topology's own declared-output list.
+    index: int = 1
+
+    def reads(self) -> list[str]:
+        return []
+
+    def render(self) -> str:
+        if self.index == 1:
+            return f"{{from = '{self.module}'}}"
+        return f"{{from = '{self.module}', index = {self.index}}}"
+
+
+@dataclasses.dataclass
 class TableLit(Expr):
     items: dict  # str -> Expr
 
@@ -255,6 +286,12 @@ class SubgraphCall(Stmt):
     # part tops out near 2^27 entries, so a 262144-wide vocab overflows at ~512 prompt tokens
     # (BACKLOG.md). See lua_bridge.cpp's l_run_subgraph_argmax.
     argmax_row: object = None
+    # When set, emit `loom.run_retained(module, axes, inputs)`: the module runs exactly the same way,
+    # but its outputs stay in the module's own persistent buffer instead of being marshalled, and are
+    # reached afterwards BY NAME -- as an `OutputRef` in a later call's inputs, or via
+    # `loom.get_output` / `loom.argmax_row(module, row)`. `outputs`/`extra_outputs` are therefore empty:
+    # there is nothing to bind, which is the point (BACKLOG.md P4.0.12).
+    retain: bool = False
 
     def defines(self) -> list[str]:
         return list(self.outputs) + list(self.extra_outputs)
@@ -418,11 +455,66 @@ def _topology_output_names(topo: dict) -> list:
     return []
 
 
+def _check_retained_reads(function: Function, topologies: dict) -> None:
+    """The static adjacency rule for retained outputs (BACKLOG.md P4.0.12).
+
+    An `OutputRef` names a module rather than a local, so `validate()` -- which knows only about symbols
+    -- cannot see it at all. What replaces it here is the same question asked about modules: a reference
+    to module M's retained output must sit between the `retain=True` call that produced it and the next
+    one that overwrites it. Getting that wrong is the failure mode retention introduces and marshalling
+    could not have: the read succeeds and quietly returns newer data.
+
+    Deliberately a *conservative* walk rather than a dataflow analysis. Retention is tracked in
+    statement order within a block; a nested `If`/`While` body inherits a copy of the enclosing state,
+    and whatever it retains does not escape back out -- so a reference whose producer only runs on one
+    arm of a branch, or only inside a loop, is rejected rather than assumed. Every synthesized chain
+    today is straight-line, and a driver that genuinely needs the conditional shape can pin the
+    generation number `loom.run_retained` returns, which is the runtime half of this same guard.
+    """
+    def walk(stmts: list, produced: dict) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, If):
+                walk(stmt.then, dict(produced))
+                walk(stmt.else_, dict(produced))
+                continue
+            if isinstance(stmt, While):
+                walk(stmt.body, dict(produced))
+                continue
+            if not isinstance(stmt, SubgraphCall):
+                continue
+            for name, expr in stmt.inputs.items():
+                if not isinstance(expr, OutputRef):
+                    continue
+                if expr.module not in produced:
+                    raise DriverIRError(
+                        f"driver IR: '{stmt.module}' input '{name}' reads the retained output of module "
+                        f"'{expr.module}', but no earlier loom.run_retained('{expr.module}', ...) runs "
+                        f"in the same straight-line block -- a retained output only exists between the "
+                        f"run that produced it and the next run of that module"
+                    )
+                n_declared = produced[expr.module]
+                if n_declared is not None and not 1 <= expr.index <= n_declared:
+                    raise DriverIRError(
+                        f"driver IR: '{stmt.module}' input '{name}' asks for retained output "
+                        f"{expr.index} of module '{expr.module}', which declares {n_declared} output(s) "
+                        f"(the index is 1-based, like the declared-output list it indexes)"
+                    )
+            if stmt.retain:
+                topo = topologies.get(stmt.module)
+                produced[stmt.module] = None if topo is None else len(_topology_output_names(topo))
+
+    walk(function.body, {})
+
+
 def check_subgraph_calls(function: Function, topologies: dict) -> None:
     """For every SubgraphCall, confirms its `inputs` dict keys are all inputs the target topology actually
     declares, and that its `outputs`/`extra_outputs` don't request more than the topology actually
     produces. Topologies not present in `topologies` (e.g. synthesized/registered elsewhere) are skipped,
-    not treated as an error."""
+    not treated as an error.
+
+    Also enforces the retained-output adjacency rule -- see `_check_retained_reads`, which is the only
+    place a `{from = 'module'}` reference is checkable at all."""
+    _check_retained_reads(function, topologies)
     for call in _walk_subgraph_calls(function.body):
         topo = topologies.get(call.module)
         if topo is None:
@@ -435,6 +527,18 @@ def check_subgraph_calls(function: Function, topologies: dict) -> None:
                 f"driver IR: loom.run_subgraph('{call.module}', ...) passes undeclared input(s) "
                 f"{sorted(extra)}; topology '{call.module}' only declares inputs {sorted(declared)}"
             )
+
+        if call.retain:
+            # The retaining form binds nothing: its outputs stay in the module's own buffer, so there
+            # is neither a data local nor a shape local for the pairing rule below to be about.
+            if call.outputs or call.extra_outputs:
+                raise DriverIRError(
+                    f"driver IR: loom.run_retained('{call.module}', ...) captures "
+                    f"{len(call.outputs) + len(call.extra_outputs)} local(s), but it returns only the "
+                    "store's generation number -- retained outputs are read back by module name "
+                    "(loom.get_output / loom.argmax_row / a {from = ...} input), not bound here."
+                )
+            continue
 
         # loom.run_subgraph returns every declared output's DATA first (in declared order), THEN every
         # declared output's SHAPE in that same order (lua_bridge.cpp's l_run_subgraph) -- so `outputs`
@@ -488,6 +592,20 @@ class LuaCodegen:
             lines.extend(self._emit_stmt(stmt, depth))
         return lines
 
+    def _emit_run(self, stmt, fn: str, prefix: str, depth: int) -> list:
+        """`loom.run_subgraph`/`loom.run_retained` differ only in the name and in whether anything is
+        bound -- `multiline` (an input table one entry per line, for calls whose seven inputs are
+        unreadable on one) applies to both, and factoring it here is what keeps that true."""
+        pad = self.indent * depth
+        if stmt.multiline:
+            inner = self.indent * (depth + 1)
+            lines = [f"{pad}{prefix}{fn}({Lit(stmt.module).render()}, {TableLit(stmt.axes).render()}, {{"]
+            lines.extend(f"{inner}{k} = {v.render()}," for k, v in stmt.inputs.items())
+            lines.append(f"{pad}}})")
+            return lines
+        call = Call(fn, [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs)])
+        return [f"{pad}{prefix}{call.render()}"]
+
     def _emit_stmt(self, stmt: Stmt, depth: int) -> list:
         pad = self.indent * depth
         if isinstance(stmt, Local):
@@ -498,21 +616,18 @@ class LuaCodegen:
             return [f"{pad}{stmt.name} = {stmt.expr.render()}"]
         if isinstance(stmt, SubgraphCall):
             targets = ", ".join(list(stmt.outputs) + list(stmt.extra_outputs))
+            if stmt.retain:
+                # A statement, not a binding: the run's result is the module's own retained buffer, and
+                # the generation number it returns is only worth capturing when the driver means to pin
+                # a read to it -- which a synthesized driver does not, because `check_subgraph_calls`
+                # has already proved the adjacency statically.
+                return self._emit_run(stmt, "loom.run_retained", prefix="", depth=depth)
             if stmt.argmax_row is not None:
                 call = Call("loom.run_subgraph_argmax",
                             [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs),
                              stmt.argmax_row])
                 return [f"{pad}local {targets} = {call.render()}"]
-            if stmt.multiline:
-                inner = self.indent * (depth + 1)
-                lines = [f"{pad}local {targets} = loom.run_subgraph({Lit(stmt.module).render()}, "
-                         f"{TableLit(stmt.axes).render()}, {{"]
-                lines.extend(f"{inner}{k} = {v.render()}," for k, v in stmt.inputs.items())
-                lines.append(f"{pad}}})")
-                return lines
-            call = Call("loom.run_subgraph",
-                        [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs)])
-            return [f"{pad}local {targets} = {call.render()}"]
+            return self._emit_run(stmt, "loom.run_subgraph", prefix=f"local {targets} = ", depth=depth)
         if isinstance(stmt, Argmax):
             call = Call("loom.argmax_row", [Var(stmt.tensor), stmt.n_vocab, stmt.row])
             return [f"{pad}local {stmt.result} = {call.render()}"]

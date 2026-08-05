@@ -92,11 +92,16 @@ predate the Lua drivers becoming the orchestration device and are slated for rem
 
 The thesis is already demonstrated, not merely intended:
 
-* **The entire engine contract for a MIL-exported model is four headers.** `src/core/lua_bridge.cpp`
-  includes only `graph_builder.h`, `kv_cache.h`, `duration_aligner.h`, `relative_position.h`.
-* **The Lua-visible surface is ~12 bindings** (`run_subgraph`, `run_recurrent`, `get_weight`,
-  `argmax_row`, `causal_mask`, `range`, `zero_mask`, `gaussian_array`, `uniform_array`, `seed_rng`,
-  `expand_by_duration`, `pad_crop_relative_embeddings`) plus the `n_tokens`/`n_past` axis keys.
+* **The entire engine contract for a MIL-exported model is six headers.** `src/core/lua_bridge.cpp`
+  includes only `graph_builder.h`, `kv_cache.h`, `conv_state_cache.h`, `output_store.h`,
+  `duration_aligner.h`, `relative_position.h`. *(Re-measured 2026-08-05. It read "four" until then; the
+  two additions are the persistent-state classes P4.0.10 and P4.0.12 added — `conv_state_cache.h` and
+  `output_store.h` — which are the same seam as `kv_cache.h`, not a new kind of dependency.)*
+* **The Lua-visible surface is 15 bindings** (`run_subgraph`, `run_subgraph_argmax`, `run_retained`,
+  `run_recurrent`, `get_output`, `get_weight`, `argmax_row`, `causal_mask`, `range`, `zero_mask`,
+  `gaussian_array`, `uniform_array`, `seed_rng`, `expand_by_duration`,
+  `pad_crop_relative_embeddings`) plus the `n_tokens`/`n_past` axis keys. *(Re-counted 2026-08-05
+  against `lua_bridge.cpp`'s own binding table, which is the only authority on it.)*
 * **The cases predicted to be hardest already moved out of C++.** `cfm_euler_sampler.h`,
   `ode_stepper.h`, `style_diffusion_sampler.h`, `bilstm_stepper.h`, `generation.h`, `ctc_decode.h` and
   `tdt_decoder.h` are unreachable from `lua_bridge.cpp`: the CFM Euler loop, the ADPM2 diffusion

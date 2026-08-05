@@ -9,8 +9,8 @@ from coremltools.converters.mil.mil import Block, Function, Operation, Var
 from . import axes
 from .driver_ir import (
     Argmax, Assign, BinOp, Break, Call, FieldAccess, If, Index, Len, Lit, Local, LocalDecl,
-    LuaCodegen, RawBlock, RawExpr, Return, SubgraphCall, UnaryOp, Var as IRVar, While, check_subgraph_calls,
-    validate,
+    LuaCodegen, OutputRef, RawBlock, RawExpr, Return, SubgraphCall, UnaryOp, Var as IRVar, While,
+    check_subgraph_calls, validate,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import DriverContext, DriverScript
@@ -1463,16 +1463,23 @@ class LoomGGUFExporter:
         ]
 
         # 3. Prefix.
-        chain_var = "_mod_chain_0"
+        #
+        # From here to step 7 every stage RETAINS its output (BACKLOG.md P4.0.12): a chain edge is a
+        # `[n_embd, n_tokens]` hidden state the driver only threads onward, and marshalling it made two
+        # copies of a value nobody looks at -- a device->host->device round trip per edge per step once
+        # a second backend exists. Each stage's consumer therefore names the producing MODULE
+        # (`OutputRef`) instead of a Lua local, and `driver_ir.check_subgraph_calls` is what checks that
+        # the two agree, since a module name is invisible to `validate`.
         stages = [ChainStage(
-            topology="prefix", outputs=(chain_var,),
+            topology="prefix", outputs=(), retained=True,
             inputs={self.safe_name(n): IRVar(self.safe_name(n)) for n in prefix_input_names},
         )]
+        chain_src = OutputRef("prefix")
 
         # 4. Auxiliary submodule (computed once, shared across every repeated-block call below) -- e.g.
         # LFM2's rotary-embedding table, computed once in Lfm2Model.forward and threaded into every
         # decoder layer as `position_embeddings=(cos, sin)`.
-        aux_out_vars = None
+        aux_refs = None
         if has_aux:
             aux_input_names = declared_inputs("aux")
             aux_chain_names = [n for n in aux_input_names if n not in special_names]
@@ -1485,10 +1492,12 @@ class LoomGGUFExporter:
                 # pos_emb is called with the real hidden_states value purely for its dtype/device, which
                 # the traced graph never ends up actually depending on) plays the same "current chain
                 # tensor" role a repeated-block call's primary input does -- feed it the same value.
-                aux_inputs_tbl[safe_n] = IRVar(chain_var) if n in aux_chain_names else IRVar(safe_n)
-            aux_out_vars = [f"_mod_aux_{i}" for i in range(len(layout.aux_output_names))]
+                aux_inputs_tbl[safe_n] = chain_src if n in aux_chain_names else IRVar(safe_n)
+            # The aux submodule's i-th declared OUTPUT, addressed positionally exactly as before -- the
+            # index is now the store's 1-based one rather than a local's position in a capture list.
+            aux_refs = [OutputRef("aux", index=i + 1) for i in range(len(layout.aux_output_names))]
             stages.append(ChainStage(
-                topology="aux", outputs=tuple(aux_out_vars), inputs=aux_inputs_tbl,
+                topology="aux", outputs=(), retained=True, inputs=aux_inputs_tbl,
             ))
 
         # 5. Repeated block, threading `chain_var` (hidden_states) from one layer's output into the
@@ -1506,42 +1515,51 @@ class LoomGGUFExporter:
             for n in layer_inputs:
                 safe_n = self.safe_name(n)
                 if n == chain_name_i:
-                    inputs_tbl[safe_n] = IRVar(chain_var)
+                    inputs_tbl[safe_n] = chain_src
                 elif is_aux_input(n):
                     idx = 0 if n == layout.aux_kwarg else int(n[len(layout.aux_kwarg) + 1:])
-                    inputs_tbl[safe_n] = IRVar(aux_out_vars[idx])
+                    inputs_tbl[safe_n] = aux_refs[idx]
                 else:
                     inputs_tbl[safe_n] = IRVar(safe_n)
 
-            next_chain_var = f"_mod_chain_{i + 1}"
             stages.append(ChainStage(
-                topology=layer_name, outputs=(next_chain_var,), inputs=inputs_tbl,
+                topology=layer_name, outputs=(), retained=True, inputs=inputs_tbl,
             ))
-            chain_var = next_chain_var
+            chain_src = OutputRef(layer_name)
 
         # 6. Suffix chain (e.g. final norm + lm_head).
-        for idx, name in enumerate(layout.suffix_names):
+        for name in layout.suffix_names:
             in_names = declared_inputs(name)
             if len(in_names) != 1:
                 raise ValueError(f"suffix submodule '{name}' must declare exactly one input, got {in_names}")
-            is_last = idx == len(layout.suffix_names) - 1
-            next_chain_var = f"_mod_suffix_{idx}"
             stages.append(ChainStage(
-                topology=name, outputs=(next_chain_var,),
-                inputs={self.safe_name(in_names[0]): IRVar(chain_var)},
-                # Only the last stage's shape is captured: it is the vocab size the epilogue argmaxes
-                # over, and capturing a shape at all requires capturing every data output first
-                # (driver_ir.check_subgraph_calls' own rule).
-                extra_outputs=("_modular_final_shape",) if is_last else (),
+                topology=name, outputs=(), retained=True,
+                inputs={self.safe_name(in_names[0]): chain_src},
             ))
-            chain_var = next_chain_var
+            chain_src = OutputRef(name)
 
-        # 7. Same argmax epilogue the monolithic path uses -- two of this builder's three components
+        # 7. The LAST stage is the one exception to step 3's rule, and marshals its output like before.
+        # Its output is not an intermediate: it is the logits the epilogue argmaxes, which is a host-side
+        # control decision. Reading even that engine-side is P4.0.14's own item, deliberately separate
+        # because it is what retires `loom.run_subgraph_argmax` -- adding a second reducing path to this
+        # builder now would leave two ways to get a token out of a forward pass.
+        #
+        # Capturing the shape alongside the data is what it always was: `_modular_final_shape[1]` is the
+        # output's ne0, i.e. the vocab size, and capturing a shape at all requires capturing every data
+        # output first (driver_ir.check_subgraph_calls' own rule).
+        final_out_var = "_modular_final_out"
+        final = stages[-1]
+        stages[-1] = ChainStage(
+            topology=final.topology, inputs=final.inputs,
+            outputs=(final_out_var,), extra_outputs=("_modular_final_shape",),
+        )
+
+        # 8. Same argmax epilogue the monolithic path uses -- two of this builder's three components
         # are shared with it, which is the smallest real instance of P4.0.7's reuse claim.
         self.driver_script = SYNTHESIZED_BUILDERS["Modular"](
             inputs=DriverInputs(bindings=tuple(bindings), n_tokens=n_tokens_expr),
             chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens_expr),
-            epilogue=ArgmaxEpilogue(out_var=chain_var, shape_var="_modular_final_shape",
+            epilogue=ArgmaxEpilogue(out_var=final_out_var, shape_var="_modular_final_shape",
                                     n_tokens=n_tokens_expr),
         ).build(self._driver_context())
 
