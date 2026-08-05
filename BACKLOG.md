@@ -1472,6 +1472,23 @@ verbatim, all encoding exactly and round-tripping. Gemma now exports with no `--
 The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-script splitters,
 case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
 
+### Sweep after the window routing, the marshalling fix and the tokenizer
+
+12 models from a `git worktree` at `abd6b0a` against the working tree, snapshotted and `diff -r`'d.
+**Nine byte-identical** — conformer-ctc, parakeet-tdt, parakeet-rnnt, kokoro, matcha, supertonic, vits,
+styletts2, and lfm2-**modular** (unfused, so it has no cache and takes no reducing call).
+
+**Three differ, all fused causal LMs, and in one file each**: qwen3, smollm2 and lfm2-monolithic each
+show 11 changed driver lines — `run_subgraph`+`argmax_row` collapsing into one `run_subgraph_argmax` in
+both `infer` and `infer_with_past` — plus the `kv.txt` line that records the driver script's own sha.
+**`model_graph_topology_main_topology.json` and `tensors.txt` are identical for all three**, which is
+the claim worth having: reducing engine-side is a driver change and touches no graph and no weight.
+
+Gemma-3-270m-it is new coverage rather than a diff (it could not export at the baseline, whose
+tokenizer support predates the SPM family): 1742 nodes, 18 `ATTENTION`, inputs
+`[tokens, cache_position, attention_mask, attention_mask_sw512]`, `tokenizer.ggml.pre =
+granite-embed-multi-311m` auto-detected.
+
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
 **The premise this item was written on was wrong, and the correction is the most useful thing in it.**
