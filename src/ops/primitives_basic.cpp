@@ -810,11 +810,25 @@ Outputs op_view(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // dynamic shape/offset expression evaluating to something the parent tensor was never sized for --
     // surfaces as a normal SchemaError with the offending node's name (via GraphBuilder's own wrapping),
     // the same diagnostic upgrade every other primitives_basic.cpp bounds check already got.
+    //
+    // The trailing term is one ELEMENT, `ggml_type_size`, and not `parent->nb[0]`. Those coincide for
+    // every densely-packed tensor, which is why the difference stayed invisible -- but they diverge on
+    // a permuted parent whose ne[0] is 1, and `ggml_is_contiguous` lets exactly that case through: its
+    // first test is `ne[0] != blck_size && nb[0] != type_size` (ggml.c:1467), so when ne[0] == 1 the
+    // stride is never validated at all and the `cont` above does not fire -- the SAME ggml carve-out
+    // `ensure_packed` above was written for, now biting a third consumer. LFM2 at n_tokens == 1 is
+    // that case: its in_proj output is a PERMUTE with ne=[1,3072] and nb=[12288,4], so this check
+    // charged a whole 12288-byte row for the final element and reported needing 16380 bytes of a
+    // 12288-byte parent -- while the view itself was correct, since with ne[0] == 1 nb[0] is never
+    // used to address anything.
+    //
+    // Using the element size makes this identical to `ggml_nbytes`' own formula (ggml.c:1299), which is
+    // the quantity being compared against, so the two can no longer disagree about the same tensor.
     size_t last_byte = static_cast<size_t>(offset);
     for (size_t i = 0; i < shape.size(); ++i) {
         last_byte += static_cast<size_t>(shape[i] - 1) * nb[i];
     }
-    last_byte += parent->nb[0];
+    last_byte += ggml_type_size(parent->type);
     if (last_byte > ggml_nbytes(parent)) {
         std::string shape_str;
         for (auto s : shape) shape_str += std::to_string(s) + ",";
