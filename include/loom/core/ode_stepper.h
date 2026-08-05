@@ -25,13 +25,17 @@ struct OdeStepConfig {
 // loop, repeatedly executing the sub-graph while updating the timestep and noisy latent input tensors
 // in-place"). Builds the graph ONCE via GraphBuilder::build() and reuses the same ggml_cgraph for every
 // integration step, only rewriting input tensor data and recomputing -- exactly SPECIFICATION.md's
-// intent, and safe: see BACKLOG.md's "ggml graph-reuse" finding for the full investigation, but the
-// short version is that ggml_gallocr may alias ANY declared input tensor's buffer as scratch storage for
-// some node's output (confirmed empirically, not just for this topology), so EVERY declared input must
-// be rewritten before EVERY compute() call -- including "conditioning", which never logically changes
-// across steps. Skipping that (writing a "constant" input once, outside the loop) is what produced
-// numerically wrong results from the second step onward in an earlier version of this class; writing all
-// three every step, as integrate() does below, was verified bit-identical to a from-scratch rebuild.
+// intent. This class predates GraphBuilder retaining graphs itself (BACKLOG.md P4.0.13), which is now
+// where the same idea lives for every caller: calling build() per step would reuse the graph too.
+//
+// It still rewrites EVERY declared input before EVERY compute(), including "conditioning", which never
+// logically changes across steps. That used to be load-bearing -- see BACKLOG.md's "ggml graph-reuse"
+// finding for the full investigation: ggml_gallocr may alias ANY declared input tensor's buffer as
+// scratch storage for some node's output, and writing a "constant" input once outside the loop is what
+// produced numerically wrong results from the second step onward in an earlier version of this class.
+// P4.0.13 removed the hazard at its source by allocating declared inputs outside the gallocr pool
+// entirely, so this is now simply the clearest way to write the loop rather than the thing keeping it
+// correct. Either way it was verified bit-identical to a from-scratch rebuild.
 //
 // Assumes the topology follows this milestone's fixed input-naming convention: declared graph inputs
 // named "latent" (f32, [n_tokens, n_channels] -- n_tokens is the frame/time dimension, resolved from

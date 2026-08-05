@@ -86,7 +86,7 @@ int main() {
     constexpr uint32_t kNumClasses = 1025;
 
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult result = builder.build({{"n_tokens", kNSamples}, {"n_past", /*n_past=*/0}});
+    const loom::GraphBuilder::BuildResult& result = builder.build({{"n_tokens", kNSamples}, {"n_past", /*n_past=*/0}});
 
     ggml_tensor* waveform_t = result.input_tensors.at("waveform");
     ggml_tensor* pos_emb_raw = result.input_tensors.at("pos_emb_raw");

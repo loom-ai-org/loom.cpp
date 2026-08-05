@@ -82,7 +82,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     // ggml ne=[T,channels] (T fastest) -- real transpose from the reference's (T,channels) row-major
     // layout, same rule as every other AdainResBlk1d-family test this whole milestone.

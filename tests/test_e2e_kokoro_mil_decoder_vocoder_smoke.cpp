@@ -57,7 +57,7 @@ int main() {
     constexpr uint32_t kTFrames = 5; // small dummy frame count, purely structural
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_enc_frames", kTFrames}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_enc_frames", kTFrames}, {"n_past", 0}});
 
     fill_zero(r.input_tensors.at("asr"));
     fill_zero(r.input_tensors.at("f0_curve"));

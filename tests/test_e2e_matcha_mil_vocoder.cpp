@@ -88,7 +88,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("vocoder"));
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     ggml_tensor* mel_t = r.input_tensors.at("mel");
     LOOM_CHECK(static_cast<size_t>(ggml_nelements(mel_t)) == mel.size());

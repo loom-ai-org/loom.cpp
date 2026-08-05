@@ -261,6 +261,14 @@ add_executable(test_graph_reuse_safety test_graph_reuse_safety.cpp)
 target_link_libraries(test_graph_reuse_safety PRIVATE loom::engine)
 add_test(NAME test_graph_reuse_safety COMMAND test_graph_reuse_safety)
 
+# --- The engine-side half of the same finding: GraphBuilder retains and reuses its graph
+#     (BACKLOG.md P4.0.13), so a reused graph must be bit-identical to a from-scratch rebuild ---
+add_executable(test_graph_builder_reuse test_graph_builder_reuse.cpp)
+target_link_libraries(test_graph_builder_reuse PRIVATE loom::engine)
+target_compile_definitions(test_graph_builder_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_graph_builder_reuse COMMAND test_graph_builder_reuse)
+set_tests_properties(test_graph_builder_reuse PROPERTIES FIXTURES_REQUIRED toy_llm_gguf_fixture)
+
 # --- Real-model test: NVIDIA stt_en_conformer_ctc_small, converted via tools/convert_nemo/. Unlike
 #     every toy fixture above, this is NOT regenerated at ctest time (needs the real checkpoint + a
 #     PyTorch environment) -- it looks for LOOM_CONFORMER_CTC_DIR (default /tmp/nemo_model) and skips

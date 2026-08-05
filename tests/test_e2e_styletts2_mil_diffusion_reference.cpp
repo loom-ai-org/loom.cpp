@@ -67,7 +67,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("diffusion"));
     loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     ggml_backend_tensor_set(r.input_tensors.at("x_in"), x_in.data(), 0, x_in.size() * sizeof(float));
     ggml_backend_tensor_set(r.input_tensors.at("time"), time.data(), 0, time.size() * sizeof(float));

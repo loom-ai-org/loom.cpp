@@ -73,7 +73,7 @@ int main() {
 
     loom::VelocityFn velocity_fn = [&](const std::vector<float>& z, float t) {
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("z_t"), z.data(), 0, z.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("txt_emb"), txt_emb.data(), 0, txt_emb.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("stl_emb"), stl_emb.data(), 0, stl_emb.size() * sizeof(float));

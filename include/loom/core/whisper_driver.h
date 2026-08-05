@@ -52,7 +52,7 @@ public:
                                      const std::vector<int32_t>& prompt_tokens, uint32_t max_new_tokens);
 
 private:
-    void fill_decoder_inputs(GraphBuilder::BuildResult& r, const std::vector<int32_t>& step_tokens,
+    void fill_decoder_inputs(const GraphBuilder::BuildResult& r, const std::vector<int32_t>& step_tokens,
                               uint32_t n_past, const std::vector<float>& xa);
     static int32_t argmax(const float* row, uint32_t n);
 

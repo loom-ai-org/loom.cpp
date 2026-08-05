@@ -84,7 +84,7 @@ int main() {
         LOOM_CHECK(model != nullptr);
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("latent"), latent.data(), 0, latent.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("txt_emb"), txt_emb.data(), 0, txt_emb.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("lat_frac"), lat_frac.data(), 0, lat_frac.size() * sizeof(float));
@@ -102,7 +102,7 @@ int main() {
         LOOM_CHECK(model != nullptr);
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("latent"), latent.data(), 0, latent.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("stl_emb"), stl_emb.data(), 0, stl_emb.size() * sizeof(float));
         ggml_backend_graph_compute(backend.get(), r.graph);

@@ -114,7 +114,23 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_bac
     : topo_(topo), model_(model), backend_(backend), kv_cache_(kv_cache), conv_state_(conv_state),
       compute_meta_bytes_(compute_meta_bytes) {}
 
-GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes, OutputStore* out_store) {
+const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, OutputStore* out_store) {
+    // BACKLOG.md P4.0.13. The retained graph is served back verbatim: its gallocr buffer was never
+    // freed, so every tensor in it still points where ggml_gallocr_alloc_graph put it, and its declared
+    // inputs still hold whatever was last written into them. Exactly one graph is retained -- see the
+    // header for why an LRU keyed by shape would not be safe against a reshaped OutputStore.
+    if (has_cached_ && cached_store_ == out_store && cached_axes_ == axes) {
+        ++reuses_;
+        return cached_;
+    }
+    // Drop the retained graph BEFORE anything below can throw, so a failed build leaves the builder
+    // with no graph rather than one whose context has already been replaced underneath it. Order
+    // matters: the compute graph reads the input tensors, so it goes first.
+    has_cached_ = false;
+    cached_ = BuildResult{};
+    inputs_buf_.reset();
+    inputs_ctx_.reset();
+
     ggml_init_params params{compute_meta_bytes_, nullptr, /*no_alloc=*/true};
     ggml_context_ptr ctx(ggml_init(params));
     if (!ctx) {
@@ -136,17 +152,42 @@ GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes, OutputSto
 
     BuildResult result;
 
+    // The declared inputs live in their OWN context and backend buffer, never in the gallocr pool
+    // (BACKLOG.md P4.0.13 -- same seam as KvCache/ConvStateCache/OutputStore). gallocr skips any tensor
+    // whose data is already set, so it can neither place an intermediate on top of an input nor move an
+    // input between builds; that is what makes handing the same graph back on the next call safe rather
+    // than a silent-corruption hazard (tests/test_graph_reuse_safety.cpp documents the raw-ggml
+    // behaviour this sidesteps). They are still ggml_set_input()-flagged: the flag states what the
+    // tensor IS, and nothing about it depends on who allocated it.
+    inputs_ctx_.reset(ggml_init(ggml_init_params{
+        topo_.inputs.size() * ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true}));
+    if (!inputs_ctx_) {
+        throw Error("GraphBuilder::build: ggml_init failed for the declared-input context");
+    }
     for (const TensorSpec& spec : topo_.inputs) {
         std::vector<int64_t> ne;
         ne.reserve(spec.shape.size());
         for (const std::string& dim : spec.shape) {
             ne.push_back(static_cast<int64_t>(std::llround(env.eval(dim))));
         }
-        ggml_tensor* t = ggml_new_tensor(ctx.get(), parse_dtype(spec.dtype), static_cast<int>(ne.size()), ne.data());
+        ggml_tensor* t = ggml_new_tensor(inputs_ctx_.get(), parse_dtype(spec.dtype), static_cast<int>(ne.size()), ne.data());
         ggml_set_name(t, spec.name.c_str());
         ggml_set_input(t);
         symtab[spec.name] = t;
         result.input_tensors[spec.name] = t;
+    }
+    if (!topo_.inputs.empty()) {
+        // A null return means "there was nothing to allocate", which is not an error for a topology
+        // whose declared inputs are all zero-sized at these axes -- so the check is on the tensors
+        // themselves rather than on the return value. Anything still unallocated and non-empty here
+        // would fall through to gallocr, which is precisely what this arrangement exists to prevent.
+        inputs_buf_.reset(ggml_backend_alloc_ctx_tensors(inputs_ctx_.get(), backend_));
+        for (const auto& [name, t] : result.input_tensors) {
+            if (t->data == nullptr && ggml_nbytes(t) > 0) {
+                throw Error("GraphBuilder::build: failed to allocate the backend buffer for declared "
+                            "input '" + name + "'");
+            }
+        }
     }
 
     std::vector<ggml_tensor*> side_effect_roots;
@@ -217,7 +258,13 @@ GraphBuilder::BuildResult GraphBuilder::build(const DynamicAxes& axes, OutputSto
     }
 
     result.ctx = std::move(ctx);
-    return result;
+
+    cached_ = std::move(result);
+    cached_axes_ = axes;
+    cached_store_ = out_store;
+    has_cached_ = true;
+    ++builds_;
+    return cached_;
 }
 
 size_t GraphBuilder::buffer_size() const {
@@ -226,6 +273,10 @@ size_t GraphBuilder::buffer_size() const {
 
 void GraphBuilder::reserve(uint32_t n_ctx_max) {
     if (n_ctx_max == 0) return;
+    // Not dead weight on the Lua path any more (BACKLOG.md P4.0.13's own complaint): the builder that
+    // reserves is now the builder that serves every later call, so the allocator it sizes here is the
+    // one those calls use. The decode build below also leaves its graph retained, so a decode-shaped
+    // first call after reserve() is served straight out of the cache.
     // build() always allocates via gallocr internally, so simply building the worst-case prefill and
     // decode shapes once (and discarding the results) is enough to size the allocator's buffer for
     // every smaller/equal shape a real generation loop will request afterwards. Named "n_tokens"/

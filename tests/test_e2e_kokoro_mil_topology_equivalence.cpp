@@ -92,7 +92,7 @@ std::vector<float> run(loom::GgufModel& model, const loom::GraphTopology& topo,
                        const std::map<std::string, std::vector<float>>& values,
                        ggml_backend_t backend, uint32_t n_tokens) {
     loom::GraphBuilder builder(topo, model, backend, /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", n_tokens}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", n_tokens}, {"n_past", 0}});
     write_inputs(topo, r, values, n_tokens);
     ggml_backend_graph_compute(backend, r.graph);
     std::vector<float> out(static_cast<size_t>(ggml_nelements(r.output)));

@@ -58,7 +58,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
 
     ggml_backend_tensor_set(r.input_tensors.at("x"), x.data(), 0, x.size() * sizeof(float));
     ggml_backend_graph_compute(backend.get(), r.graph);

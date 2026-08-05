@@ -2,9 +2,14 @@
 // after reserving for a worst-case n_ctx_max, ordinary build() calls at smaller shapes don't grow the
 // gallocr-managed compute buffer any further.
 //
-// The Phase-3 bucketed graph-reuse fast path (reused ggml_cgraph* vs. from-scratch rebuild must be
-// bit-identical) is a separate, later addition to this same file once KvCache/ATTENTION land -- this is
-// the baseline half described in the implementation plan.
+// The graph-reuse half of the implementation plan's Phase 3 -- reused ggml_cgraph* vs. from-scratch
+// rebuild must be bit-identical -- shipped as BACKLOG.md P4.0.13 and lives in its own file,
+// tests/test_graph_builder_reuse.cpp, because it needs a KV-cached topology and this one deliberately
+// has no cache at all. What stays here is the baseline: reserve() sizes the allocator once.
+//
+// Note that reserve() is no longer a no-op for anyone but the legacy Generator: since P4.0.13 the
+// builder that reserves is the builder every later call goes through, so the sizes measured below are
+// the sizes a real run uses.
 
 #include "test_util.h"
 

@@ -630,11 +630,12 @@ of this file that does not exist (the hierarchy is described in P3.1's entry ins
 
 #### P4.0 — settle these before the first from-scratch family config
 
-Fourteen items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
+Fifteen items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
 (P4.0.1–P4.0.3, all DONE), five added by [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md)
 (P4.0.4–P4.0.8), three added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
 remaining registry steps at the author's direction, plus P4.0.10/P4.0.11, the two capability gaps stage 3
-measured), and three (P4.0.12–P4.0.14) from the review that followed P4.0.11a's marshalling fix. None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
+measured), three (P4.0.12–P4.0.14) from the review that followed P4.0.11a's marshalling fix, and one
+(P4.0.15) that P4.0.13 discovered it could not finish without. None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
 add three more configs written against whatever shape exists at the time. Same gate as everything else:
 byte-identical re-export of all 11 models (`snapshot_gguf.py`), since none of these is meant to change
 any output — with stated exceptions: P4.0.6's per-family peeling commits, where driver text legitimately
@@ -1524,7 +1525,8 @@ nothing.
   `test_e2e_lfm2_mil_export` against the re-exported modular GGUF: HF's own top-1 at both prompt
   lengths, 3523 at 3 tokens and 2 at 7. Full ctest 142/142, exporter suite 453/453.
 
-- **P4.0.13 — persist the graph itself, after P4.0.12.** The bucketed graph-reuse item already described
+- **P4.0.13 — persist the graph itself, after P4.0.12 — DONE (2026-08-05).** The bucketed graph-reuse
+  item already described
   under "Performance optimizations designed but not implemented", scheduled here and in this order for a
   reason: once the bridge retains per-module state for P4.0.12, the `GraphBuilder` is already being kept
   alive, which is the part reuse needs.
@@ -1548,6 +1550,88 @@ nothing.
   rewritten every decode step**, and it needs its own bit-identical-to-rebuild regression test on the
   `test_graph_reuse_safety.cpp` pattern. P4.0.12 does not go near this, which is exactly why it should
   land first.
+
+  **What shipped.** A `GraphBuilder` retains the last graph it built — its `ggml_context`, its
+  `ggml_cgraph`, its gallocr-assigned compute buffer, its declared-input tensors — and `build()` returns
+  that same graph unchanged when called again with the same axes. The builder is now the unit of "one
+  live graph" rather than a factory producing a new one per call, so `build()` returns
+  `const BuildResult&`: the header already said a result is readable only while its builder is alive, and
+  a reference is what stops that from being merely documented (~100 call sites, all mechanical). On the
+  Lua path the builder moved onto `LoomLuaBridge::Module` beside `kv_cache`/`conv_state`/`outputs` — the
+  fourth member of that seam, exactly where the correction above said it belonged — constructed on first
+  use, so a many-topology model pays a retained compute buffer only for the modules its driver actually
+  runs. That laziness is the answer to the same footprint trade P4.0.12 named, and it lands harder here:
+  a per-call builder held one compute buffer at a time, these hold one per live module.
+
+  **The hazard is gone rather than disciplined, and that is the part worth recording.** The plan was
+  reuse plus a rule — safe only while every declared input is rewritten every step, because
+  `ggml_gallocr` may alias a computed tensor's buffer onto one of the graph's own declared inputs. But
+  that rule is only needed because the inputs sit in gallocr's pool at all. They now get the builder's
+  own `ggml_context` and backend buffer, outside it — the same seam `KvCache`/`ConvStateCache`/
+  `OutputStore` use — and gallocr skips any tensor whose data is already set, exactly as it does a weight
+  or a cache view (`ggml_gallocr_is_allocated`, `ggml-alloc.c`). Nothing gallocr places can land on an
+  input, so a retained graph cannot be corrupted by an input that was not rewritten.
+  `tests/test_graph_reuse_safety.cpp` still holds and still documents the raw-ggml behaviour; what
+  changed is that `GraphBuilder` no longer exposes it. `OdeStepper` keeps rewriting all three inputs
+  every step because it is the clearest way to write the loop, not because it is load-bearing any more.
+
+  **Exactly one graph is retained, deliberately not an LRU keyed by shape.** A retained `OutputStore` is
+  reshaped by the build that fills it, so only the most recent build's `ggml_cpy` destinations are
+  guaranteed to still be the store's current tensors; a shape-keyed cache could hand back a graph whose
+  copies point into a buffer `reshape()` has since replaced. Going back to an earlier shape rebuilds.
+  The key is the axes map plus the `OutputStore*`, because whether a run ends in a copy into a store is
+  a property of the call (`run_subgraph` vs `run_subgraph_and_retain`), not of the module.
+
+  **What this does NOT do — a second correction, to this item's own plan this time.** The *bucketed*
+  variant is still not implemented, and bucketing alone would never have delivered it. `n_past` is baked
+  into the graph independently of `n_kv`: `KvCache::write_k/write_v` build a `ggml_view_2d` at byte
+  offset `n_past * nb[1]`, so two consecutive decode steps have different graphs even at an identical
+  rounded-up `n_kv`. Making a decode loop reuse its graph therefore needs the KV *write destination* to
+  become data — llama.cpp's `ggml_set_rows` index-tensor indirection, which the scope limitations below
+  already list as absent — and that is a change to `KvCache`, to `ATTENTION`, to a synthesized declared
+  input and to every causal-LM driver's text, with all of them needing re-gating. **Filed as P4.0.15**
+  rather than smuggled in here. What P4.0.13 does cover is every loop whose axes *don't* move, which is
+  most of the zoo: `loom.run_recurrent` (one build per direction instead of one per timestep — the
+  StyleTTS2/Kokoro BiLSTMs), the CFM Euler and ADPM2 sampler loops, `TdtDecoder`'s per-layer LSTM and
+  joint calls, and every module in a chain that is called at a fixed shape. Modules called once still
+  build once, as before, but now keep their compute buffer instead of allocating and freeing it per call.
+
+  *Gate: the bit-identical-to-rebuild regression test this item asked for, plus the existing e2e drivers
+  unchanged — driver text does not move, so no model needs re-exporting for this.*
+
+  **Gate, measured.** `tests/test_graph_builder_reuse.cpp` (35 checks) runs the toy LLM — a real
+  topology with a KV cache, a `repeat_for` block, RoPE and an f32 mask input — four ways. A five-step
+  fixed-shape loop through one retained graph is **bit-identical** (`memcmp`, not `==`) to the same five
+  steps through a builder that has only ever built once, at `builds()==1, reuses()==4`; the comparison
+  can fail, since consecutive steps really do produce different logits and the repeated step reproduces
+  the first exactly. A prefill+decode sequence, where `n_past` moves every step and nothing is reused,
+  is bit-identical to the same sequence driven through a builder thrown away between every call — the
+  check that moving the inputs out of the gallocr pool changed no numerics. The single-entry rule is
+  asserted by graph-pointer identity and by eviction. And every declared input is confirmed to carry its
+  own backend buffer and to share an address with no node in its own graph, which is the assertion that
+  fails first if a future ggml changes what made reuse safe. Full ctest 143/143. Re-exported matcha,
+  styletts2, kokoro and lfm2-modular from this tree and ran their Lua-driver e2e tests green (the
+  checked-in root GGUFs are from before the 2026-08-02 `infer` rename and abort for that reason on
+  `main` too, unrelated to this item).
+
+  **And the wall-clock win is small, which is worth writing down because the item implies otherwise.**
+  Measured by toggling only the cache-hit branch in the same binary — everything else, including the
+  inputs' move out of the gallocr pool, held constant — over two runs each of the re-exported drivers:
+
+  | driver | rebuild every call | retained graph |
+  |---|---|---|
+  | kokoro | 26.58s, 21.77s | 19.35s, 19.47s |
+  | matcha | 13.72s, 11.65s | 12.26s, 11.79s |
+  | styletts2 | 21.45s, 21.57s | 20.73s, 21.69s |
+  | lfm2-modular | 4.30s | 4.28s |
+
+  Only Kokoro shows a gain outside the noise, and even there it is ~15%, not a multiple. The reading is
+  that on a single CPU backend the rebuild is simply not what these drivers spend their time on — the
+  compute is — and the same is true of the compute-buffer allocation the old per-call builder threw
+  away. That does not make the item wrong, it locates it: what it removes is per-call *structure*, and
+  the structure it removes is what a second backend would make expensive, exactly as with P4.0.12's
+  retained outputs. Worth knowing before anyone budgets the bucketed decode-loop follow-up on the
+  strength of an expected speedup.
 
 - **P4.0.14 — the same marshalling ceiling still stands on the modular path, and is fixed by P4.0.12.**
 
@@ -1582,6 +1666,36 @@ nothing.
   **Which is also the retirement plan for `run_subgraph_argmax`** — keep it while it is the only thing
   that works, retire it once retrieval-by-name is fully functional, and do not leave both. Two spellings
   that can disagree is the failure this project keeps removing.
+
+- **P4.0.15 — index-tensor KV writes, so a decode loop can reuse its graph. Opened by P4.0.13, which
+  could not finish without it.** P4.0.13 made `GraphBuilder` retain and reuse its graph, and that covers
+  every loop whose axes don't move. It does not cover the one this whole thread started from — an
+  autoregressive decode — and the plan it inherited ("round `n_kv` up to a bucket boundary and skip the
+  rebuild while the bucket holds") would not have covered it either. **`n_past` is baked into the graph
+  independently of `n_kv`:** `KvCache::write_k/write_v` build a `ggml_view_2d` at byte offset
+  `n_past * nb[1]`, so step N and step N+1 have different graphs whatever `n_kv` rounds to. Bucketing is
+  necessary and not sufficient; the write destination has to stop being a build-time constant first.
+
+  **The change.** Replace the append-at-a-baked-offset write with `ggml_set_rows` plus a declared cell-
+  index input, the indirection `kv_cache.h:15` already names as absent and llama.cpp's `llama_kv_cache`
+  already has. Then bucket `n_kv`, pad the mask to the bucket (free — `loom.causal_mask` is a host
+  binding, so no driver learns what a bucket is), and a decode step's graph stops depending on the step.
+  Padded cells contribute exactly zero as long as the mask says `-inf` there, which is worth *verifying*
+  rather than assuming: a zeroed cell reached through a finite mask would not be zero.
+
+  **Why it is its own item and not a rider on 13.** It touches `KvCache`, `ATTENTION`, a synthesized
+  declared input and every causal-LM driver's text, so every cached model needs re-gating — the opposite
+  of P4.0.13, which moved no driver text and needed no re-export. It also unblocks more than reuse: the
+  same indirection is what a ring buffer and multi-sequence support want, both listed under "Scope
+  limitations".
+
+  **Do not schedule it on an expected speedup.** P4.0.13 measured the retained-graph win at ~15% on
+  Kokoro and inside the noise everywhere else on a single CPU backend — the rebuild is not where these
+  drivers spend their time. The case for this item is the same as for P4.0.12's retained outputs: it
+  removes per-call structure that a second backend, not this one, makes expensive. Sequence:
+  index-tensor writes, then buckets, then extend `tests/test_graph_builder_reuse.cpp`'s bit-identity
+  check to a decode loop — that test currently asserts a decode sequence rebuilds every step, which is
+  the assertion this item deliberately inverts.
 
 ### Driver logits marshalling caps prefill length for large-vocab models — FIXED
 
@@ -2890,13 +3004,20 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 
 ### Performance optimizations designed but not implemented
 
-- **Bucketed KV-cache graph-reuse — scheduled as P4.0.13, after P4.0.12.** `GraphBuilder::build()` always
-  does a full rebuild + no_alloc pass per call. Plan: round `n_kv` up to a bucket boundary (e.g. 32) and skip the rebuild when the bucket
-  hasn't changed, reusing the previous `ggml_cgraph*` and just overwriting input tensor data. Safe to
-  attempt now that the graph-reuse aliasing bug (`ggml_gallocr` aliasing an input tensor's buffer) is
-  root-caused, as long as every declared input is rewritten every decode step — still needs its own
-  bit-identical-to-rebuild regression test (same pattern as `test_graph_reuse_safety.cpp`). See
-  `GraphBuilder::reserve()`/`GraphBuilder::build()` in `src/core/graph_builder.cpp`.
+- **Bucketed KV-cache graph-reuse — half done as P4.0.13; the other half is scheduled as P4.0.15, which
+  needs index-tensor KV writes first.** `GraphBuilder::build()` no longer rebuilds per call: it retains the last graph and
+  returns it unchanged when the axes repeat, with the declared inputs moved out of the gallocr pool so
+  the aliasing hazard cannot apply (P4.0.13 above, `tests/test_graph_builder_reuse.cpp`). That covers
+  every fixed-shape loop. It does **not** cover an autoregressive decode, and the original plan here —
+  round `n_kv` up to a bucket boundary (e.g. 32) and skip the rebuild while the bucket holds — would not
+  have either: `n_past` is baked into each layer's `ggml_view_2d` write offset
+  (`KvCache::write_k/write_v`), so consecutive decode steps differ in the graph regardless of what `n_kv`
+  rounds to. Bucketing `n_kv` is necessary and not sufficient; the write destination has to become data
+  (`ggml_set_rows` + an index input, the indirection listed as absent under "Scope limitations" below)
+  before a bucket boundary buys anything. Both halves then also want the mask padded to the bucket, which
+  `loom.causal_mask` can do for free since it is a host binding, and the padded KV cells contribute
+  exactly zero as long as the mask says `-inf` there. Sequence: index-tensor writes, then buckets, then
+  a decode-loop extension to `test_graph_builder_reuse.cpp`'s bit-identity check.
 - **`ggml_backend_sched` / multi-backend.** Not used anywhere — engine talks to a single `ggml_backend_t`
   directly via a plain `ggml_gallocr`. Fine for CPU-only; needed once a second backend (CUDA/Metal) is
   added and graphs need splitting across devices. This is what makes P4.0.12's retained outputs a
@@ -2910,7 +3031,12 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 ### Scope limitations (still true)
 
 - **`KvCache` is single-sequence.** Contiguous append only — no ring buffer, no multi-stream/multi-sequence
-  support, no `ggml_set_rows` index-tensor indirection like llama.cpp's `llama_kv_cache`.
+  support, no `ggml_set_rows` index-tensor indirection like llama.cpp's `llama_kv_cache`. That last
+  absence stopped being purely a multi-sequence concern once P4.0.13 landed: because the write
+  destination is a `ggml_view_2d` at a build-time `n_past * nb[1]` offset, the write is what makes every
+  decode step a different graph, so it is also what stands between a decode loop and graph reuse.
+  **Scheduled as P4.0.15**, which is where the plan and the sequence live; the bucketed graph-reuse item
+  above is what it unblocks.
 - **KV cache storage is always F32.** No quantized cache types (`Q8_0` etc.). Weight quantization is
   handled per-model by the MIL exporter's `quantize=` kwarg (LFM2, Qwen3) — KV-cache quantization is a
   separate, still-untouched runtime concern (different mechanism, different point in the inference

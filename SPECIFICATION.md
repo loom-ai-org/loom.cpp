@@ -41,14 +41,16 @@ The JSON schema should closely mirror `ggml`'s literal operations to minimize co
     }
 
 ## 4. Handling Dynamic Sequence Lengths
-Because `ggml` does not support dynamic tensor dimensions (e.g., shape `[-1, 768]`), dynamic sequence lengths are handled by **rebuilding the compute graph from scratch for every forward pass**.
+Because `ggml` does not support dynamic tensor dimensions (e.g., shape `[-1, 768]`), dynamic sequence lengths are handled by **rebuilding the compute graph from scratch whenever the length changes**.
 
 ### Execution Strategy
 1.  Read the exact length of the incoming sequence (e.g., text tokens).
 2.  Initialize the Compute Context sized specifically for that sequence length.
 3.  Parse the JSON array, injecting the exact dimensions into the input tensors.
 4.  Execute the graph.
-5.  Destroy the graph (free the activations).
+5.  Retain the graph until a *different* length asks for a different one.
+
+Step 5 was originally "destroy the graph (free the activations)", i.e. a rebuild per forward pass rather than per length. A `GraphBuilder` now keeps the last graph it built and returns it unchanged when called again with the same axes, so a loop that re-runs one module at a fixed shape — an ODE solver's steps, an LSTM's timesteps, a chained module in a decode loop — builds once instead of once per iteration (see BACKLOG.md P4.0.13). Nothing about the dynamic-length story changes: a new length is still a new graph.
 
 ### Control Flow (The TTS Catch)
 Standard DAGs are static, but TTS architectures often require autoregressive loops or continuous ODE solver steps. 

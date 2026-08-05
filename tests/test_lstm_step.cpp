@@ -33,7 +33,7 @@ std::vector<float> run_one(const std::string& gguf_path, ggml_backend_t backend,
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
 
     loom::GraphBuilder builder(topo, *model, backend, /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult result = builder.build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
+    const loom::GraphBuilder::BuildResult& result = builder.build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
 
     ggml_backend_tensor_set(result.input_tensors.at("x"), x.data(), 0, x.size() * sizeof(float));
     ggml_backend_tensor_set(result.input_tensors.at("h_prev"), h_prev.data(), 0, h_prev.size() * sizeof(float));

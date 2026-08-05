@@ -36,7 +36,7 @@ std::vector<float> last_row_logits(const std::string& path, const std::vector<in
 
     const auto n_tokens = static_cast<uint32_t>(tokens.size());
     loom::GraphBuilder builder(topo, *model, backend.get(), kv_cache.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", n_tokens}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", n_tokens}, {"n_past", 0}});
 
     // Exactly what DriverInputs emits: cache_position = loom.range(0, n_tokens), attention_mask =
     // loom.causal_mask(n_tokens, 0). Built here rather than read from the driver so both models get

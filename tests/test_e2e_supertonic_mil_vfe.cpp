@@ -70,7 +70,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("vfe"));
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
 
     std::vector<float> z_t_copy = z_t, txt_emb_copy = txt_emb, stl_emb_copy = stl_emb;
     std::vector<float> t_copy = {0.3f};

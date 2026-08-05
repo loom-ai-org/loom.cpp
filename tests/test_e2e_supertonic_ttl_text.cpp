@@ -91,7 +91,7 @@ int main() {
         LOOM_CHECK(model != nullptr);
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kCropLen}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kCropLen}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("lat_crop"), lat_crop.data(), 0, lat_crop.size() * sizeof(float));
         ggml_backend_graph_compute(backend.get(), r.graph);
         LOOM_CHECK(static_cast<size_t>(ggml_nelements(r.output)) == expected_stl.size());
@@ -106,7 +106,7 @@ int main() {
         LOOM_CHECK(model != nullptr);
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("lat_crop"), lat_crop.data(), 0, lat_crop.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("txt_ids"), txt_ids.data(), 0, txt_ids.size() * sizeof(int32_t));
         ggml_backend_graph_compute(backend.get(), r.graph);

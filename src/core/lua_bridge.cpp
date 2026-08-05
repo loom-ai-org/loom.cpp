@@ -223,9 +223,7 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
 
 // Everything `run_subgraph`, `run_subgraph_argmax` and `run_subgraph_and_retain` share: build the
 // graph for `axes`, fill every declared input from the Lua table at `inputs_idx`, compute, and hand
-// the result to `emit` while the builder that owns its memory is still alive. Takes the module's
-// pieces individually rather than the Module struct so it can live here, in the anonymous namespace,
-// next to the code it serves.
+// the result to `emit`.
 //
 // Extracted rather than duplicated because the entry points differ ONLY in what they do with the
 // outputs -- a copy would be free to drift on cache wiring or input validation, which is exactly the
@@ -233,16 +231,20 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
 // reference on EVERY one of them and not just the retaining one: which module produced a value and
 // which entry point consumes it are independent questions.
 //
+// `builder` is the MODULE's own, persistent for the bridge's lifetime (BACKLOG.md P4.0.13) rather than
+// constructed and destroyed per call as it used to be -- so a driver that calls the same module at the
+// same axes twice in a row pays one rebuild, not two, and one compute-buffer allocation, not two. The
+// same call chain otherwise: the builder retains the graph, so `r` stays valid for exactly as long as
+// this function needs it, and P4.0.12's OutputStore is what already removed the reason a retained VALUE
+// had to outlive it.
+//
 // `out_store` is null for the marshalling entry points and the module's own store for
 // `run_subgraph_and_retain` -- see GraphBuilder::build for what it does with it.
-int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GgufModel& model,
-                      const GraphTopology& topo, ggml_backend_t backend, KvCache* kv_cache,
-                      ConvStateCache* conv_state, const DynamicAxes& axes, int inputs_idx,
+int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GraphBuilder& builder,
+                      ggml_backend_t backend, const DynamicAxes& axes, int inputs_idx,
                       const StoreLookup& lookup, OutputStore* out_store,
-                      const std::function<int(GraphBuilder::BuildResult&)>& emit) {
-    GraphBuilder builder(topo, model, backend, kv_cache, /*compute_meta_bytes=*/32 * 1024 * 1024,
-                          conv_state);
-    GraphBuilder::BuildResult r = builder.build(axes, out_store);
+                      const std::function<int(const GraphBuilder::BuildResult&)>& emit) {
+    const GraphBuilder::BuildResult& r = builder.build(axes, out_store);
 
     lua_pushnil(L);
     while (lua_next(L, inputs_idx) != 0) {
@@ -290,10 +292,10 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         }
         Module& mod = it->second;
 
-        return compute_and_emit(L, "loom.run_subgraph", module_name, *mod.model, mod.topo, mod.backend,
-                                 mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self),
+        return compute_and_emit(L, "loom.run_subgraph", module_name, self->module_builder(mod),
+                                 mod.backend, axes, 3, store_lookup(self),
                                  /*out_store=*/nullptr,
-                                 [L](GraphBuilder::BuildResult& r) {
+                                 [L](const GraphBuilder::BuildResult& r) {
         // Returns every declared output's DATA first (in the topology's own declared order), THEN
         // every declared output's SHAPE in that same order -- e.g. for two outputs: (data1, data2,
         // shape1, shape2). For the single-output topology every model on the roadmap still uses as of
@@ -350,10 +352,10 @@ int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
         }
         Module& mod = it->second;
 
-        return compute_and_emit(L, "loom.run_subgraph_argmax", module_name, *mod.model, mod.topo,
-                                 mod.backend, mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self),
+        return compute_and_emit(L, "loom.run_subgraph_argmax", module_name, self->module_builder(mod),
+                                 mod.backend, axes, 3, store_lookup(self),
                                  /*out_store=*/nullptr,
-                                 [L, requested_row](GraphBuilder::BuildResult& r) {
+                                 [L, requested_row](const GraphBuilder::BuildResult& r) {
             lua_pushnumber(L, static_cast<lua_Number>(
                 argmax_tensor_row(r.outputs.front(), requested_row, "loom.run_subgraph_argmax")));
             return 1;
@@ -385,9 +387,9 @@ int LoomLuaBridge::l_run_subgraph_and_retain(lua_State* L) {
         if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backend);
         OutputStore* store = mod.outputs.get();
 
-        return compute_and_emit(L, "loom.run_subgraph_and_retain", module_name, *mod.model, mod.topo,
-                                 mod.backend, mod.kv_cache, mod.conv_state, axes, 3, store_lookup(self), store,
-                                 [L, store](GraphBuilder::BuildResult&) {
+        return compute_and_emit(L, "loom.run_subgraph_and_retain", module_name, self->module_builder(mod),
+                                 mod.backend, axes, 3, store_lookup(self), store,
+                                 [L, store](const GraphBuilder::BuildResult&) {
             lua_pushnumber(L, static_cast<lua_Number>(store->generation()));
             return 1;
         });
@@ -452,12 +454,14 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
         Module& h_mod = h_it->second;
         Module& c_mod = c_it->second;
 
-        // A fresh GraphBuilder per direction (not per timestep) -- same "build once, rebuild per call"
-        // shape BiLstmStepper's own constructor uses; GraphBuilder::build() itself is still called once
-        // per timestep below (a step's h/c depend on the PREVIOUS step's real output values, so each
-        // timestep genuinely needs its own compute, unlike loom.run_subgraph's single one-shot call).
-        GraphBuilder h_builder(h_mod.topo, *h_mod.model, h_mod.backend, h_mod.kv_cache);
-        GraphBuilder c_builder(c_mod.topo, *c_mod.model, c_mod.backend, c_mod.kv_cache);
+        // Each cell module's own persistent builder (BACKLOG.md P4.0.13), the same one every other
+        // binding uses. build() is still called once per timestep below -- a step's h/c depend on the
+        // PREVIOUS step's real output values, so each timestep genuinely needs its own compute -- but
+        // the axes never move across a sequence, so every call after the first is served from the
+        // retained graph. This is the loop that gains the most from that: one rebuild per direction
+        // instead of one per timestep.
+        GraphBuilder& h_builder = self->module_builder(h_mod);
+        GraphBuilder& c_builder = self->module_builder(c_mod);
 
         std::vector<float> h(hidden_dim, 0.0f);
         std::vector<float> c(hidden_dim, 0.0f);
@@ -475,7 +479,7 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
                 layer_input[k] = static_cast<float>(sequence[static_cast<size_t>(t) * input_dim + k]);
             }
 
-            GraphBuilder::BuildResult hr = h_builder.build({{"n_tokens", 0}, {"n_past", 0}});
+            const GraphBuilder::BuildResult& hr = h_builder.build({{"n_tokens", 0}, {"n_past", 0}});
             ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0,
                                      layer_input.size() * sizeof(float));
             ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
@@ -484,7 +488,7 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
             std::vector<float> h_new(hidden_dim);
             ggml_backend_tensor_get(hr.output, h_new.data(), 0, h_new.size() * sizeof(float));
 
-            GraphBuilder::BuildResult cr = c_builder.build({{"n_tokens", 0}, {"n_past", 0}});
+            const GraphBuilder::BuildResult& cr = c_builder.build({{"n_tokens", 0}, {"n_past", 0}});
             ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0,
                                      layer_input.size() * sizeof(float));
             ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
@@ -817,7 +821,20 @@ LoomLuaBridge::~LoomLuaBridge() {
 
 void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo,
                                      KvCache* kv_cache, ConvStateCache* conv_state) {
-    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backend_, nullptr};
+    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backend_, nullptr, nullptr};
+}
+
+GraphBuilder& LoomLuaBridge::module_builder(Module& mod) {
+    // `mod.topo` is held BY REFERENCE by the builder, so this is only safe because a Module lives in a
+    // node-based unordered_map and is never moved once registered. Re-registering a name replaces the
+    // Module wholesale, which destroys the old builder along with the topology it pointed at -- the two
+    // cannot outlive each other by construction.
+    if (!mod.builder) {
+        mod.builder = std::make_unique<GraphBuilder>(mod.topo, *mod.model, mod.backend, mod.kv_cache,
+                                                      /*compute_meta_bytes=*/32 * 1024 * 1024,
+                                                      mod.conv_state);
+    }
+    return *mod.builder;
 }
 
 void LoomLuaBridge::load_script(const std::string& lua_source) {

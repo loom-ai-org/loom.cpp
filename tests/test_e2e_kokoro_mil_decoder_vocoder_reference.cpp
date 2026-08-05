@@ -52,7 +52,7 @@ std::vector<float> read_npy_f32(const std::string& path, std::vector<int64_t>& s
     return data;
 }
 
-void set_input(loom::GraphBuilder::BuildResult& r, const std::string& name, const std::vector<float>& data) {
+void set_input(const loom::GraphBuilder::BuildResult& r, const std::string& name, const std::vector<float>& data) {
     ggml_tensor* t = r.input_tensors.at(name);
     LOOM_CHECK(static_cast<size_t>(ggml_nelements(t)) == data.size());
     std::vector<float> copy = data;
@@ -94,7 +94,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("decoder_vocoder"));
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_enc_frames", t_frames}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_enc_frames", t_frames}, {"n_past", 0}});
 
     set_input(r, "asr", asr);
     set_input(r, "f0_curve", f0_curve);
