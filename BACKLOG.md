@@ -1340,6 +1340,25 @@ nothing.
   top-1 reference tokens are unchanged, and Qwen3 is untouched (2066 nodes, 28 `ATTENTION`, 0
   `SHORT_CONV`, no conv keys, 22/22 on its own gate).
 
+  **Sweep — 11 models, 10 byte-identical, 1 differs and only where it must.** Exported from a `git
+  worktree` at `4689f79` and from the working tree, snapshotted and `diff -r`'d. Byte-identical:
+  conformer-ctc, parakeet-tdt, parakeet-rnnt, kokoro, matcha, supertonic, vits, lfm2-**modular**
+  (unfused), **qwen3 and smollm2** — the last two matter most, since they take the same `fuse_conv=True`
+  path and simply match nothing. LFM2-monolithic differs in exactly three files: `CONV_1D_DW` 10 → 0,
+  `SHORT_CONV` 0 → 10, `VIEW` 64 → 54 (the ten absorbed trims), 830 → 820 nodes; three added
+  `loom.n_conv_*` hparams; and a driver script that gains `infer_with_past`. **Declared inputs
+  unchanged and `tensors.txt` identical — no weight moved.** StyleTTS2 is the twelfth model and did not
+  run: only `config.yml` survives under `styletts2_model/ckpt/Models/LJSpeech`, so its `.pth` is
+  missing — a checkpoint gap, not a code failure.
+
+  **The first run of this sweep was a false pass, and the reason is worth keeping.** It reported all 11
+  identical, including LFM2-monolithic, which must differ by construction. `loom-export` runs
+  `python -m`, and `-m` puts the caller's **cwd** at `sys.path[0]` ahead of the `PYTHONPATH` the script
+  sets to its own repo root — so driving the baseline worktree's `loom-export` from the working tree
+  imported the working tree's exporter and measured it twice. This is exactly what §6's "`cd` into the
+  tree being measured" is for. A byte-identity gate that cannot fail proves nothing, and the only thing
+  that caught it was knowing in advance which model had to differ.
+
   **The design decision this row asked to settle went the OTHER way, and doing it is what settled it.**
   The recommendation above is (b), a general persistent-slot input binding. `op_attention`'s write path
   is what changed it: a state write-back must be *ordered* against the read, and only an op owning both
