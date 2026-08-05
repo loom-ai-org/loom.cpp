@@ -1433,7 +1433,7 @@ nothing.
   tests — `infer` cannot prefill past ~512 tokens for this vocab (see the marshalling item below), and
   greedy generation collapses into a repeating `107, 2717` a wrong window would reproduce.
 
-### Driver logits marshalling caps prefill length for large-vocab models
+### Driver logits marshalling caps prefill length for large-vocab models — FIXED
 
 Found while gating P4.0.11a. `MonolithicCall` returns the topology's whole `[n_vocab, n_tokens]` logits
 tensor across the Lua boundary so `ArgmaxEpilogue` can argmax a row — and LuaJIT's array part tops out
@@ -1441,12 +1441,36 @@ near 2^27 elements. For Gemma 3's 262144-wide vocab that is **~512 prompt tokens
 raises `table overflow`; a 600-token prefill is 157M doubles. Qwen3 (151936) caps near 880, LFM2
 (65536) near 2048, so nothing on the roadmap has hit it before.
 
-The fix is to stop marshalling what the driver only reduces: argmax the row engine-side and return one
-number, or let `run_subgraph` return a view of a single row. Either keeps the Lua boundary a *per-step*
-boundary rather than a per-logit one, which is the same reasoning `KV-CACHE.md` §1.1 gives for not
-driving attention from Lua. Not urgent — it bites only prefill, and only for vocabs above ~130k — but
-it is a hard ceiling rather than a slowdown, and the workaround (feed tokens one at a time) costs a full
-forward pass per token.
+**Fixed** by `loom.run_subgraph_argmax(module, axes, inputs, row)`: the module runs identically and
+returns one number, the argmax of the requested row, read from the tensor with `nb[1]` as the row stride
+so the other rows are never touched. Nothing crosses the boundary but the answer — the Lua boundary
+stays a *per-step* boundary rather than a per-logit one, the same reasoning `KV-CACHE.md` §1.1 gives for
+not driving attention from Lua.
+
+Gated on KV-cached topologies only, so the blast radius is the causal LMs: the vocab is what makes the
+cap reachable and only that family has one, so no ASR/TTS driver text moves. `MonolithicCall.argmax_row`
+and `ArgmaxEpilogue.already_reduced` are one decision in two components and cannot silently disagree —
+the shape local would not exist and `driver_ir.validate` rejects reading a name nothing defines, which
+is exactly how the first attempt failed. Gemma's 600-token prefill, which raised `table overflow`, now
+returns HF's own top-1; Qwen3 and LFM2 still agree with iterated `infer` 22/22 each.
+
+### SentencePiece-style byte-fallback BPE — DONE
+
+`BpeShape::kSpmByteFallback`, added so Gemma 3 tokenizes correctly. `pre_spec_table()`'s own comment had
+already scoped it ("needs a different symbol-initialization step in `BpeVocab::encode()` itself") and
+`tokenizer_detect.py` raised a named `NotImplementedError` rather than mis-tokenizing — which is what
+made this a bounded job instead of a mystery.
+
+Four structural differences from every other shape, each measured against the real tokenizer: no regex
+pretokenization (one chunk); no GPT-2 byte-level mapping, so initial symbols are characters and the
+vocabulary holds literal UTF-8; a space→U+2581 normalizer with no dummy prefix (`"Hello world"` →
+`['Hello', '▁world']`), and no NFC, because the HF normalizer is that substitution and nothing else; and
+`<0xNN>` byte fallback for characters with no entry. `decode` mirrors all of it.
+
+Gated by `test_e2e_spm_byte_fallback_tokenizer` — nine cases, every expectation `AutoTokenizer.encode`
+verbatim, all encoding exactly and round-tripping. Gemma now exports with no `--tokenizer-pre` override.
+The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-script splitters,
+case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
 
 ### `decomposition`: what `profile` was meant to be, and what `profile` actually does
 
