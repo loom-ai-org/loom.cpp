@@ -112,7 +112,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("albert_bert_encoder"));
 
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
 
     ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens.data(), 0, tokens.size() * sizeof(int32_t));
 

@@ -76,7 +76,7 @@ int main() {
     loom::GraphTopology stats_topo = loom::GraphTopology::parse(stats_model->topology_json());
     loom::GraphTopology logw_topo = loom::GraphTopology::parse(logw_model->topology_json());
 
-    auto fill_common_inputs = [&](loom::GraphBuilder::BuildResult& r) {
+    auto fill_common_inputs = [&](const loom::GraphBuilder::BuildResult& r) {
         std::vector<int32_t> tokens(kT, 1);
         ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens.data(), 0, tokens.size() * sizeof(int32_t));
         fill_zero(r.input_tensors.at("attn_mask"));
@@ -88,7 +88,7 @@ int main() {
 
     {
         loom::GraphBuilder builder(stats_topo, *stats_model, backend.get());
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
         fill_common_inputs(r);
         LOOM_CHECK(r.output->ne[0] == 2 * 192); // stats: [2*out_channels, T]
         LOOM_CHECK(r.output->ne[1] == static_cast<int64_t>(kT));
@@ -101,7 +101,7 @@ int main() {
     std::vector<float> logw_result;
     {
         loom::GraphBuilder builder(logw_topo, *logw_model, backend.get());
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
         fill_common_inputs(r);
         fill_zero(r.input_tensors.at("z_noise"));
         LOOM_CHECK(r.output->ne[0] == static_cast<int64_t>(kT));
@@ -118,7 +118,7 @@ int main() {
 
     {
         loom::GraphBuilder builder(fv_topo, *flow_vocoder, backend.get());
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kT}, {"n_past", 0}});
         fill_zero(r.input_tensors.at("z_p"));
         const int64_t expected_wav_len = static_cast<int64_t>(kT) * 8 * 8 * 4; // upsample_rates product
         LOOM_CHECK(r.output->ne[0] == expected_wav_len);

@@ -36,7 +36,7 @@ public:
     std::vector<int32_t> generate(const std::vector<int32_t>& prompt_tokens);
 
 private:
-    void write_inputs(GraphBuilder::BuildResult& result, const std::vector<int32_t>& step_tokens, uint32_t n_past);
+    void write_inputs(const GraphBuilder::BuildResult& result, const std::vector<int32_t>& step_tokens, uint32_t n_past);
     std::vector<float> read_row(ggml_tensor* logits, uint32_t row) const;
     static int32_t argmax(const std::vector<float>& row);
 

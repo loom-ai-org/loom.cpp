@@ -15,12 +15,11 @@ std::vector<float> OdeStepper::integrate(const std::vector<float>& initial_laten
     const uint32_t n_tokens = n_elems / n_channels;
 
     // Built once: the vector field's shape never changes across integration steps, unlike Generator's
-    // autoregressive decode where n_kv grows every token. See the header comment for why every declared
-    // input -- including "conditioning", which never logically changes -- MUST be rewritten before every
-    // compute() call for this to be correct: ggml_gallocr may alias any input tensor's buffer as scratch
-    // for some node's output, and an input whose buffer got silently overwritten by a *previous*
-    // compute's intermediate result stays corrupted until it's explicitly rewritten again.
-    GraphBuilder::BuildResult result = builder_.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
+    // autoregressive decode where n_kv grows every token. (Hoisting it out of the loop is now belt and
+    // braces -- GraphBuilder retains the graph, so building per step would return this same one --
+    // but it still says what this loop means.) See the header comment for why every declared input,
+    // including "conditioning", is rewritten every step.
+    const GraphBuilder::BuildResult& result = builder_.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
     ggml_tensor* latent_t = result.input_tensors.at("latent");
     ggml_tensor* timestep_t = result.input_tensors.at("timestep");
     ggml_tensor* conditioning_t = result.input_tensors.at("conditioning");

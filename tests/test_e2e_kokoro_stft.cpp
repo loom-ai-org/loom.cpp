@@ -96,7 +96,7 @@ int main() {
         LOOM_CHECK(model != nullptr);
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", n_samples_padded}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", n_samples_padded}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("waveform_padded"), waveform_padded.data(), 0,
                                  waveform_padded.size() * sizeof(float));
         ggml_backend_graph_compute(backend.get(), r.graph);
@@ -141,7 +141,7 @@ int main() {
         LOOM_CHECK(model != nullptr);
         loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", n_frames}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", n_frames}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("magnitude"), mag.data(), 0, mag.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("phase"), phase.data(), 0, phase.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("wsum"), wsum.data(), 0, wsum.size() * sizeof(float));

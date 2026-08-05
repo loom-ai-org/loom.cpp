@@ -48,7 +48,7 @@ bool check_mul_broadcasts_over_heads(int head_dim, int n_tokens, int n_head) {
     loom::GraphTopology topo = loom::GraphTopology::parse(mul_topology(head_dim, "n_tokens", n_head));
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", static_cast<double>(n_tokens)}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", static_cast<double>(n_tokens)}});
 
     // x[d,t,h] = 1000*h + 10*t + d, y[d,t] = t + 1 -- every index distinguishable, so a permuted
     // operand cannot coincidentally produce the right answer.

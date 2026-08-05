@@ -88,7 +88,7 @@ int main() {
         for (size_t i = 0; i < x.size(); ++i) x_scaled[i] = x[i] * c_in;
 
         loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-        loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+        const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("x_in"), x_scaled.data(), 0, x_scaled.size() * sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("time"), &c_noise, 0, sizeof(float));
         ggml_backend_tensor_set(r.input_tensors.at("embedding"), embedding.data(), 0, embedding.size() * sizeof(float));

@@ -31,6 +31,33 @@ using DynamicAxes = std::unordered_map<std::string, double>;
 // ggml_backend_graph_compute. The caller (Generator, a test, ...) owns that: it writes whatever data it
 // has into BuildResult::input_tensors, then calls ggml_backend_graph_compute itself. This keeps
 // "construct the graph" and "execute it" independently testable.
+//
+// ---------------------------------------------------------------------------------------------------
+// THE BUILT GRAPH IS PERSISTENT AND REUSED (BACKLOG.md P4.0.13)
+// ---------------------------------------------------------------------------------------------------
+// A builder keeps the LAST graph it built -- its ggml_context, its ggml_cgraph, its gallocr-assigned
+// compute buffer and its declared-input tensors -- and `build()` hands that same graph straight back
+// when it is called again with the same axes. So a builder is now the unit of "one live graph", not a
+// factory that produces a new one per call, and every loop that re-runs one module at a fixed shape
+// (an ODE/diffusion sampler's steps, an LSTM's timesteps, a chained module in a decode loop) stops
+// paying a rebuild and a throwaway compute-buffer allocation per iteration.
+//
+// Two consequences follow, and both are deliberate:
+//
+//   * `build()` returns a REFERENCE into the builder, so a result is valid only until the next build()
+//     on that builder and only while the builder lives. That was already the documented rule (see
+//     BuildResult below); returning a reference is what stops it from being merely documented.
+//   * The cache holds exactly ONE graph, the most recent. Not an LRU keyed by shape -- a retained
+//     OutputStore is reshaped by the build that fills it, so "the last build" is the only entry whose
+//     ggml_cpy destinations are guaranteed to still be the store's current tensors.
+//
+// The declared INPUT tensors get their own persistent ggml_context and backend buffer, outside the
+// gallocr pool entirely -- the same seam KvCache/ConvStateCache/OutputStore use. That is what makes
+// reuse safe rather than merely fast: ggml_gallocr may alias a computed tensor's buffer onto one of the
+// graph's own declared inputs (tests/test_graph_reuse_safety.cpp pins that down as real ggml behaviour),
+// which is why reusing a graph used to require rewriting EVERY declared input before EVERY compute. An
+// input that gallocr never allocated cannot be aliased by anything gallocr placed, so that discipline
+// is no longer load-bearing here; drivers that follow it anyway (OdeStepper) are simply unaffected.
 class GraphBuilder {
 public:
     // `kv_cache` may be null for topologies that don't use the ATTENTION primitive (e.g. no
@@ -43,13 +70,13 @@ public:
                  ConvStateCache* conv_state = nullptr);
 
     struct BuildResult {
-        // Owns every tensor/graph STRUCT produced by this build; keep alive until you're done reading
-        // outputs, then let it drop. NOT sufficient on its own: the tensors' DATA lives in the
-        // GraphBuilder's own gallocr, and the builder also holds `topo_` by reference, so a
-        // BuildResult is only readable while BOTH the GraphBuilder that produced it and that builder's
-        // GraphTopology are still alive. Returning a BuildResult out of the scope holding its builder
-        // leaves it pointing at freed memory -- reads may still appear to work, since whether the
-        // arena has been reused yet is allocator-dependent (this cost a CI-only failure once; see
+        // Owns every tensor/graph STRUCT produced by this build. The builder OWNS the BuildResult (see
+        // the class comment): `build()` hands out a reference to it, valid until the next build() on
+        // that same builder and only while the builder itself lives. The tensors' DATA lives in the
+        // GraphBuilder's own gallocr and declared-input buffer, and the builder also holds `topo_` by
+        // reference, so a copy of anything in here outlives its builder only as a dangling pointer --
+        // reads may still appear to work, since whether the arena has been reused yet is
+        // allocator-dependent (this cost a CI-only failure once; see
         // tests/test_graph_builder_shapes.cpp's multi-output test). Copy what you need into your own
         // storage before the builder goes out of scope, as every src/core/*_driver.cpp does.
         ggml_context_ptr ctx;
@@ -63,9 +90,16 @@ public:
         std::unordered_map<std::string, ggml_tensor*> input_tensors; // topology's declared inputs, by name
     };
 
-    // Builds and allocates a graph for exactly the given axis values. Always correct regardless of what
-    // reserve() has (or hasn't) been called with -- ggml_gallocr_alloc_graph reallocates automatically
-    // if the requested graph exceeds whatever was previously reserved (see ggml-alloc.h).
+    // Builds and allocates a graph for exactly the given axis values, or returns the previously built
+    // one unchanged if `axes` and `out_store` are identical to the last call's. Always correct
+    // regardless of what reserve() has (or hasn't) been called with -- ggml_gallocr_alloc_graph
+    // reallocates automatically if the requested graph exceeds whatever was previously reserved (see
+    // ggml-alloc.h).
+    //
+    // A REUSED graph keeps whatever its declared inputs last held: nothing is cleared between calls,
+    // because the inputs live in the builder's own persistent buffer rather than the gallocr pool (see
+    // the class comment). Rewriting every input every call therefore remains the clearest way to drive
+    // one -- it is just no longer the thing standing between reuse and silent corruption.
     //
     // `axes` need only bind whatever names this specific topology's own declared shapes reference
     // (EXPORT-ROADMAP.md R1) -- SymbolEnv::get throws loom::SchemaError naming the missing symbol if
@@ -82,7 +116,7 @@ public:
     // makes retrieval-by-module-name possible at all. A per-CALL argument rather than a constructor
     // one: whether a run retains its outputs is the caller's decision (`loom.run_subgraph_and_retain` vs
     // `loom.run_subgraph`), not a property of the module the way its caches are.
-    BuildResult build(const DynamicAxes& axes, OutputStore* out_store = nullptr);
+    const BuildResult& build(const DynamicAxes& axes, OutputStore* out_store = nullptr);
 
     // Builds worst-case prefill (n_tokens=n_ctx_max, n_past=0) and decode (n_tokens=1,
     // n_past=n_ctx_max-1) shapes and reserves the allocator for the larger of the two, so that ordinary
@@ -95,6 +129,12 @@ public:
     // ordinary build() calls within those bounds don't grow it further.
     size_t buffer_size() const;
 
+    // How many build() calls actually constructed a graph, and how many were served from the retained
+    // one. Exposed for the same reason buffer_size() is: a test can assert that a fixed-shape loop
+    // rebuilds exactly once, which is the only externally visible difference reuse makes.
+    uint64_t builds() const { return builds_; }
+    uint64_t reuses() const { return reuses_; }
+
 private:
     const GraphTopology& topo_;
     GgufModel& model_;
@@ -103,6 +143,21 @@ private:
     ConvStateCache* conv_state_;
     size_t compute_meta_bytes_;
     ggml_gallocr_ptr galloc_;
+
+    // The declared inputs' own storage, outside the gallocr pool -- see the class comment for why they
+    // are not allowed to share it. Replaced wholesale on every real rebuild, since a rebuild is exactly
+    // the case where their shapes may have moved.
+    ggml_context_ptr inputs_ctx_;
+    ggml_backend_buffer_ptr inputs_buf_;
+
+    // The one retained graph and the call that produced it. `cached_store_` is part of the key because
+    // whether a build ends in a copy into an OutputStore is a property of the call, not of the module.
+    BuildResult cached_;
+    DynamicAxes cached_axes_;
+    const OutputStore* cached_store_ = nullptr;
+    bool has_cached_ = false;
+    uint64_t builds_ = 0;
+    uint64_t reuses_ = 0;
 };
 
 } // namespace loom

@@ -84,7 +84,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     // ref_mel is (80,T) row-major -- same "[T,C]-convention flat layout equals (C,T)-numpy row-major
     // flat layout" identity established for the Decoder (addition commutes: t+c*T == c*T+t) -- direct

@@ -11,6 +11,12 @@
 // single compute() pass, but if the graph is REUSED for a second compute() without rewriting an input
 // whose buffer got aliased as a previous node's output, that input now silently holds stale/corrupted
 // data instead of its last-set value.
+//
+// This file is still about raw ggml, and everything below still holds there. GraphBuilder itself no
+// longer exposes the hazard: since BACKLOG.md P4.0.13 it allocates a topology's declared inputs in
+// their own persistent context and backend buffer, outside the gallocr pool, and gallocr never places
+// anything on top of a tensor whose data is already set. tests/test_graph_builder_reuse.cpp is that
+// half -- it asserts the absence directly, and is what a retained graph's correctness rests on.
 
 #include "ggml_test_helpers.h"
 #include "test_util.h"

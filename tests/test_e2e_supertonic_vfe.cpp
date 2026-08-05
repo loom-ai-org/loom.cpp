@@ -70,7 +70,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend.get(), nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
 
     ggml_backend_tensor_set(r.input_tensors.at("z_t"), z_t.data(), 0, z_t.size() * sizeof(float));
     ggml_backend_tensor_set(r.input_tensors.at("txt_emb"), txt_emb.data(), 0, txt_emb.size() * sizeof(float));

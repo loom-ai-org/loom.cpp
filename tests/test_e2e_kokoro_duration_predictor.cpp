@@ -61,7 +61,7 @@ std::vector<float> run_adaln(loom::GgufModel& model, loom::GraphTopology& topo, 
                               const std::vector<float>& seq_ct, uint32_t channels, uint32_t T,
                               const std::vector<float>& style) {
     loom::GraphBuilder builder(topo, model, backend, nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
     ggml_backend_tensor_set(r.input_tensors.at("x"), seq_ct.data(), 0, seq_ct.size() * sizeof(float));
     ggml_backend_tensor_set(r.input_tensors.at("style"), style.data(), 0, style.size() * sizeof(float));
     ggml_backend_graph_compute(backend, r.graph);
@@ -173,7 +173,7 @@ int main() {
         double max_abs_diff = 0.0;
         double sum_abs_diff = 0.0;
         for (uint32_t t = 0; t < T; ++t) {
-            loom::GraphBuilder::BuildResult r = proj_builder.build({{"n_tokens", 0}, {"n_past", 0}});
+            const loom::GraphBuilder::BuildResult& r = proj_builder.build({{"n_tokens", 0}, {"n_past", 0}});
             ggml_backend_tensor_set(r.input_tensors.at("x"), top_out[t].data(), 0, top_out[t].size() * sizeof(float));
             ggml_backend_graph_compute(backend.get(), r.graph);
             LOOM_CHECK(static_cast<uint32_t>(ggml_nelements(r.output)) == kMaxDur);

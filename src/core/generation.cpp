@@ -20,7 +20,7 @@ Generator::Generator(GgufModel& model, GraphTopology topo, GenerationConfig cfg,
     builder_.reserve(cfg_.n_ctx_max);
 }
 
-void Generator::write_inputs(GraphBuilder::BuildResult& result, const std::vector<int32_t>& step_tokens, uint32_t n_past) {
+void Generator::write_inputs(const GraphBuilder::BuildResult& result, const std::vector<int32_t>& step_tokens, uint32_t n_past) {
     const uint32_t n_tokens = static_cast<uint32_t>(step_tokens.size());
     const uint32_t n_kv = n_past + n_tokens;
 
@@ -78,7 +78,7 @@ std::vector<int32_t> Generator::generate(const std::vector<int32_t>& prompt_toke
     // Prefill: one shot over the whole prompt.
     const auto n_prompt_tokens = static_cast<uint32_t>(prompt_tokens.size());
     {
-        GraphBuilder::BuildResult result = builder_.build({{"n_tokens", n_prompt_tokens}, {"n_past", n_past_}});
+        const GraphBuilder::BuildResult& result = builder_.build({{"n_tokens", n_prompt_tokens}, {"n_past", n_past_}});
         write_inputs(result, prompt_tokens, n_past_);
         ggml_backend_graph_compute(backend_, result.graph);
         n_past_ += n_prompt_tokens;
@@ -92,7 +92,7 @@ std::vector<int32_t> Generator::generate(const std::vector<int32_t>& prompt_toke
 
     // Decode: one token at a time, feeding the previous step's sample back in.
     while (generated.size() < cfg_.max_new_tokens) {
-        GraphBuilder::BuildResult result = builder_.build({{"n_tokens", 1}, {"n_past", n_past_}});
+        const GraphBuilder::BuildResult& result = builder_.build({{"n_tokens", 1}, {"n_past", n_past_}});
         write_inputs(result, {generated.back()}, n_past_);
         ggml_backend_graph_compute(backend_, result.graph);
         n_past_ += 1;

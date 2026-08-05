@@ -42,7 +42,7 @@ int main() {
 
     // No KvCache: this topology's ATTENTION nodes all set "kv_cache": false.
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult result = builder.build({{"n_tokens", kNTokens}, {"n_past", /*n_past=*/0}});
+    const loom::GraphBuilder::BuildResult& result = builder.build({{"n_tokens", kNTokens}, {"n_past", /*n_past=*/0}});
 
     // The input features are baked into the GGUF as a weight ("features.data"); the only runtime input
     // this topology declares is the (all-zero, fully-unmasked) attention mask.

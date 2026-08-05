@@ -37,7 +37,7 @@ void run_one(loom::GgufModel& model, loom::GraphTopology& topo, ggml_backend_t b
     LOOM_CHECK(expected.size() == 64);
 
     loom::GraphBuilder builder(topo, model, backend, nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", 0}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", 0}, {"n_past", 0}});
     ggml_backend_tensor_set(r.input_tensors.at("t"), t.data(), 0, sizeof(float));
     ggml_backend_graph_compute(backend, r.graph);
 

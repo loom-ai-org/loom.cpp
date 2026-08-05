@@ -43,7 +43,7 @@ int main() {
 
     // No declared inputs at all: weights and the fixed latent are all resolved from the Symbol Table.
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult result = builder.build({{"n_tokens", /*n_tokens=*/1}, {"n_past", /*n_past=*/0}});
+    const loom::GraphBuilder::BuildResult& result = builder.build({{"n_tokens", /*n_tokens=*/1}, {"n_past", /*n_past=*/0}});
 
     ggml_backend_graph_compute(backend.get(), result.graph);
 

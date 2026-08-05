@@ -83,7 +83,7 @@ int main() {
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
 
     loom::GraphBuilder builder(topo, *model, backend.get());
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", 0}, {"n_past", 0}}); // every shape in this topology is fixed, no dynamic symbol needed
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", 0}, {"n_past", 0}}); // every shape in this topology is fixed, no dynamic symbol needed
 
     ggml_backend_tensor_set(r.input_tensors.at("waveform"), waveform.data(), 0, waveform.size() * sizeof(float));
     std::vector<float> mask(static_cast<size_t>(n_ctx) * n_ctx, 0.0f); // no masking in the encoder at all

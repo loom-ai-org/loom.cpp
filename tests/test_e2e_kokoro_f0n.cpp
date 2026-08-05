@@ -63,7 +63,7 @@ std::vector<float> run_block(const std::string& gguf_path, ggml_backend_t backen
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend, nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
     ggml_backend_tensor_set(r.input_tensors.at("x"), x_tc.data(), 0, x_tc.size() * sizeof(float));
     ggml_backend_tensor_set(r.input_tensors.at("style"), style.data(), 0, style.size() * sizeof(float));
     ggml_backend_graph_compute(backend, r.graph);
@@ -100,7 +100,7 @@ std::vector<float> run_proj(const std::string& gguf_path, ggml_backend_t backend
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend, nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
     ggml_backend_tensor_set(r.input_tensors.at("x"), x_tc.data(), 0, x_tc.size() * sizeof(float));
     ggml_backend_graph_compute(backend, r.graph);
     LOOM_CHECK(static_cast<uint32_t>(ggml_nelements(r.output)) == T);

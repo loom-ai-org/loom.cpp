@@ -19,6 +19,7 @@ namespace loom {
 
 class KvCache;
 class ConvStateCache;
+class GraphBuilder;
 class OutputStore;
 
 // Embeds a LuaJIT VM into the engine (see LOOM_PROCEDURAL_GENERALIZATION.md /
@@ -129,7 +130,25 @@ private:
         // steady-state footprint for the mechanism -- which matters most for exactly the many-topology
         // models retention would otherwise cost the most, like Kokoro's.
         std::unique_ptr<OutputStore> outputs;
+        // This module's graph, persistent for the same reason and on the same seam (BACKLOG.md
+        // P4.0.13): a GraphBuilder retains the last graph it built and hands it straight back when the
+        // axes repeat, so a per-call builder threw away a full rebuild AND a compute buffer on every
+        // iteration of every fixed-shape loop a driver runs. Held by pointer because GraphBuilder holds
+        // `topo` by reference and is non-copyable.
+        //
+        // Lazy for a sharper reason than `outputs` is. This is the trade P4.0.12 already named for
+        // retained state and it lands harder here: a per-call builder held one compute buffer at a
+        // time, while these hold one per module for the bridge's whole lifetime, which for a
+        // many-topology model like Kokoro is a real rise in steady-state footprint. Constructing them
+        // on first use means a driver pays only for the modules it actually runs, not for every
+        // topology the GGUF happens to carry.
+        std::unique_ptr<GraphBuilder> builder;
     };
+
+    // This module's persistent builder, constructed on first use. Not a `register_module` argument:
+    // everything it needs is already on the Module, and building one eagerly would allocate a compute
+    // buffer for every registered topology of a many-module model whether or not the driver ever runs it.
+    GraphBuilder& module_builder(Module& mod);
 
     lua_State* L_;
     ggml_backend_t backend_;

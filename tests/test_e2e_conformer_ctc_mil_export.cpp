@@ -73,7 +73,7 @@ int main() {
     constexpr uint32_t kNumClasses = 1025;
 
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult result = builder.build({{"n_samples", kNSamples}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& result = builder.build({{"n_samples", kNSamples}, {"n_past", 0}});
 
     ggml_tensor* waveform_t = result.input_tensors.at("waveform");
     ggml_tensor* length_t = result.input_tensors.at("length");

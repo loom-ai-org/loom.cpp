@@ -22,7 +22,7 @@ void test_shapes_across_calls(loom::GgufModel& model, ggml_backend_t backend) {
     loom::GraphBuilder builder(topo, model, backend);
 
     for (uint32_t n_tokens : {1u, 3u, 5u}) {
-        auto result = builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
+        const auto& result = builder.build({{"n_tokens", n_tokens}, {"n_past", /*n_past=*/0}});
         LOOM_CHECK(result.graph != nullptr);
         LOOM_CHECK(result.output != nullptr);
         LOOM_CHECK(result.output->ne[0] == kNVocab);
@@ -37,7 +37,7 @@ void test_shapes_across_calls(loom::GgufModel& model, ggml_backend_t backend) {
     // n_past shouldn't affect shapes for this attention-free topology (n_kv isn't referenced by any
     // node), but the build must still succeed -- exercises that n_past/n_kv symbol wiring doesn't break
     // topologies that don't use it.
-    auto result = builder.build({{"n_tokens", /*n_tokens=*/1}, {"n_past", /*n_past=*/7}});
+    const auto& result = builder.build({{"n_tokens", /*n_tokens=*/1}, {"n_past", /*n_past=*/7}});
     LOOM_CHECK(result.output->ne[1] == 1);
 }
 
@@ -127,31 +127,37 @@ void test_multi_output_build(loom::GgufModel& model, ggml_backend_t backend) {
 
     const std::vector<int32_t> tokens = {1, 3, 4};
 
-    // Both of these must outlive every BuildResult read below, and neither is owned by the result:
-    // `BuildResult::ctx` owns only the tensor STRUCTS, while the DATA they point at lives in the
-    // GraphBuilder's own gallocr, and GraphBuilder holds `topo_` by reference. An earlier version of
-    // this lambda kept both as locals, so all three results dangled the moment `run` returned and the
-    // comparisons below read freed memory -- which passed locally and failed in CI, since whether the
-    // freed arena still happens to hold the old values is pure allocator luck.
+    // Both of these must outlive every BuildResult read below, and neither is owned by the result: a
+    // BuildResult is owned by the GraphBuilder that produced it (BACKLOG.md P4.0.13), the DATA its
+    // tensors point at lives in that builder's gallocr and declared-input buffer, and the builder holds
+    // `topo_` by reference. An earlier version of this lambda kept both as locals, so all three results
+    // dangled the moment `run` returned and the comparisons below read freed memory -- which passed
+    // locally and failed in CI, since whether the freed arena still happens to hold the old values is
+    // pure allocator luck.
+    //
+    // Three separate builders, deliberately: a builder retains exactly ONE graph, so building all three
+    // topologies through one of them would leave the first two results pointing at a context the third
+    // build had already replaced. (Which was true of their DATA before this too -- one gallocr arena
+    // cannot hold three live graphs -- so this is the same rule, now enforced by the type system.)
     std::vector<std::unique_ptr<loom::GraphTopology>> topologies;
     std::vector<std::unique_ptr<loom::GraphBuilder>> builders;
 
-    auto run = [&](const char* json) {
+    auto run = [&](const char* json) -> const loom::GraphBuilder::BuildResult& {
         topologies.push_back(std::make_unique<loom::GraphTopology>(loom::GraphTopology::parse(json)));
         builders.push_back(std::make_unique<loom::GraphBuilder>(*topologies.back(), model, backend));
-        loom::GraphBuilder::BuildResult r =
+        const loom::GraphBuilder::BuildResult& r =
             builders.back()->build({{"n_tokens", tokens.size()}, {"n_past", 0}});
         ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens.data(), 0, tokens.size() * sizeof(int32_t));
         ggml_backend_graph_compute(backend, r.graph);
         return r;
     };
 
-    loom::GraphBuilder::BuildResult multi = run(multi_json);
+    const loom::GraphBuilder::BuildResult& multi = run(multi_json);
     LOOM_CHECK(multi.outputs.size() == 2);
     LOOM_CHECK(multi.output == multi.outputs[0]);
 
-    loom::GraphBuilder::BuildResult y_only = run(y_only_json);
-    loom::GraphBuilder::BuildResult z_only = run(z_only_json);
+    const loom::GraphBuilder::BuildResult& y_only = run(y_only_json);
+    const loom::GraphBuilder::BuildResult& z_only = run(z_only_json);
 
     LOOM_CHECK(multi.outputs[0]->ne[0] == y_only.output->ne[0]);
     LOOM_CHECK(multi.outputs[0]->ne[1] == y_only.output->ne[1]);
@@ -177,7 +183,7 @@ void test_reserve_does_not_break_subsequent_builds(loom::GgufModel& model, ggml_
     loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json());
     loom::GraphBuilder builder(topo, model, backend);
     builder.reserve(16);
-    auto result = builder.build({{"n_tokens", 3}, {"n_past", 0}});
+    const auto& result = builder.build({{"n_tokens", 3}, {"n_past", 0}});
     LOOM_CHECK(result.output->ne[1] == 3);
 }
 

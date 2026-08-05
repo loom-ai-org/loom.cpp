@@ -80,7 +80,7 @@ int main() {
     LOOM_CHECK(model != nullptr);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
     loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
-    loom::GraphBuilder::BuildResult r = builder.build({{"n_tokens", T}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", T}, {"n_past", 0}});
 
     // The topology declares "x" as ne=[$n_tokens, 512] (T=ne[0], FASTEST) -- byte-identical to a numpy
     // array of NATIVE shape (512,T) (T last/fastest). Our reference `x` is saved as (T,512) row-major
