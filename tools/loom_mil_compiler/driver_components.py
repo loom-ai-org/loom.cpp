@@ -164,6 +164,8 @@ class MonolithicCall(DriverComponent):
     n_tokens: object = None
     out_var: str = "_mono_out"
     shape_var: str = "_mono_shape"
+    # When set, the call reduces engine-side and binds `out_var` to a token id instead of a tensor.
+    argmax_row: object = None
 
     __links__ = {
         "topology": TopologyName(),
@@ -176,9 +178,25 @@ class MonolithicCall(DriverComponent):
                              "reads, and that read is checked by driver_ir.validate over the "
                              "assembled function"),
         "shape_var": Unchecked("same: a local this component binds rather than one it refers to"),
+        "argmax_row": Unchecked(
+            "a driver_ir expression for the row to reduce, or None for the ordinary tensor-returning "
+            "call. Set by the exporter for KV-cached topologies only, whose vocab is what makes the "
+            "marshalling cap reachable -- nothing in a checkpoint could disagree with it."
+        ),
     }
 
     def emit(self, ctx: DriverContext) -> List:
+        if self.argmax_row is not None:
+            # Reducing form: the engine argmaxes the row and returns one integer, so there is no logits
+            # table and no shape (BACKLOG.md's marshalling cap). `ArgmaxEpilogue` sees a number rather
+            # than a table and returns it as-is, which is the branch it already had.
+            return [SubgraphCall(
+                outputs=[self.out_var],
+                module=self.topology,
+                axes={ctx.root_axis(self.topology): self.n_tokens, "n_past": Lit(0)},
+                inputs={name: Var(name) for name in self.inputs},
+                argmax_row=self.argmax_row,
+            )]
         return [SubgraphCall(
             outputs=[self.out_var],
             extra_outputs=[self.shape_var],
@@ -281,6 +299,9 @@ class ArgmaxEpilogue(DriverComponent):
     out_var: str
     shape_var: str
     n_tokens: object
+    # True when the calling component already reduced to a token id engine-side (MonolithicCall's
+    # `argmax_row`), so there is no logits table and no shape local to index.
+    already_reduced: bool = False
 
     __unchecked__ = {
         "out_var": Unchecked("a local an earlier component bound. The read is checked by "
@@ -288,9 +309,20 @@ class ArgmaxEpilogue(DriverComponent):
                              "cross-component symbol read is answerable and nowhere else"),
         "shape_var": Unchecked("same -- the shape local the calling component captured"),
         "n_tokens": Unchecked("the driver_ir expression for the active row; see DriverInputs.n_tokens"),
+        "already_reduced": Unchecked(
+            "whether the calling component reduced engine-side. Set by the exporter together with "
+            "MonolithicCall.argmax_row -- the two are one decision, and driver_ir.validate is what "
+            "catches them disagreeing (the shape local simply would not exist)."
+        ),
     }
 
     def emit(self, ctx: DriverContext) -> List:
+        if self.already_reduced:
+            # The call reduced engine-side, so `out_var` is already the token id and there is no shape
+            # local to index. This is the same answer the `type(out) ~= "table"` branch below returns;
+            # it is a separate mode rather than a runtime check because the shape local does not exist
+            # at all, and driver_ir.validate rightly rejects reading a name nothing defines.
+            return [Return([Var(self.out_var)])]
         row = BinOp("-", self.n_tokens, Lit(1))
         return [If(
             cond=BinOp("==", Call("type", [Var(self.out_var)]), Lit("table")),
@@ -395,14 +427,18 @@ class PrefillDecodeLoop(DriverComponent):
                                  Lit(self.default_max_new_tokens))),
             Local(eos, BinOp("or", FieldAccess("inputs", "eos_token"), Lit(-1))),
             While(cond=Lit(True), body=[
+                # Reducing call: the engine argmaxes the last row and returns the token id, so a
+                # decode step ships one integer across the boundary instead of a whole logits tensor.
+                # That is what removes the ~512-token prefill ceiling a 262144-wide vocab hits on the
+                # first iteration (BACKLOG.md's marshalling cap) -- and every later iteration, at
+                # n_tokens = 1, gets the same reduction for free.
                 SubgraphCall(
-                    outputs=[out_var], extra_outputs=[shape_var], module=self.topology,
+                    outputs=[next_var], module=self.topology,
                     axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
                           "n_past": Var(self.n_past_var)},
                     inputs=self._call_inputs(ctx),
+                    argmax_row=BinOp("-", Var(self.n_tokens_var), Lit(1)),
                 ),
-                Argmax(result=next_var, tensor=out_var, n_vocab=Index(Var(shape_var), 1),
-                       row=BinOp("-", Var(self.n_tokens_var), Lit(1))),
                 CallStmt(Call("table.insert", [Var(self.generated_var), Var(next_var)])),
                 Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
                 If(cond=BinOp(">=", Len(self.generated_var), Var(max_new)), then=[Break()]),

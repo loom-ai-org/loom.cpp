@@ -118,6 +118,17 @@ int main() {
                   static_cast<int>(kHfTop1AtPosition599), static_cast<int>(got));
     LOOM_CHECK(got == kHfTop1AtPosition599);
 
+    // The same 600 tokens through the ordinary `infer` PREFILL. This is the call that used to raise
+    // "table overflow": before the driver reduced engine-side, `infer` marshalled the whole
+    // [262144, 600] logits tensor into a Lua table and blew past LuaJIT's array limit, so a windowed
+    // model could not be prefilled past its own window. Both paths must agree with HF and with each
+    // other -- prefill and forced decode are different graphs over the same masks.
+    auto prefill_result = bridge.call("infer", {{"tokens", ids}});
+    const double prefill_got = std::get<double>(prefill_result);
+    std::fprintf(stderr, "600-token PREFILL: expected HF top-1 %d, got %d\n",
+                  static_cast<int>(kHfTop1AtPosition599), static_cast<int>(prefill_got));
+    LOOM_CHECK(prefill_got == kHfTop1AtPosition599);
+
     // A second, SHORTER prompt that stays inside the window, through the ordinary `infer` prefill.
     // It must also match, which is what rules out "the band is applied everywhere, including where it
     // should be a no-op" -- the failure mode opposite to the one above, and equally invisible alone.
