@@ -577,6 +577,62 @@ void test_view() {
     LOOM_CHECK((get_f32(out) == std::vector<float>{4, 5, 6, 7, 8, 9}));
 }
 
+// A VIEW whose parent is a PERMUTE with ne[0] == 1 -- the exact shape LFM2-350M presents at
+// n_tokens == 1, and the one that made its decode step fail with "needs 16380 bytes but parent has
+// 12288" long after the conv state it was blamed on had been fixed (BACKLOG.md P4.0.10).
+//
+// The trap is that `ggml_is_contiguous` REPORTS TRUE here: its stride test is skipped entirely when
+// ne[0] == blck_size (ggml.c:1467), so a permuted tensor with nb=[12288,4] passes, op_view's `cont`
+// does not fire, and the bounds check saw nb[0] = 12288 where it meant one element. The view itself was
+// always correct -- with ne[0] == 1, nb[0] addresses nothing -- so this is a false rejection, and the
+// numbers below prove the data is right as well as the check passing.
+void test_view_of_permuted_parent_with_unit_leading_axis() {
+    GgmlScratch s;
+    // [C=6, T=1] -> PERMUTE -> [T=1, C=6], which is the in_proj output layout at one token.
+    ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 6, 1);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* permuted = op("PERMUTE")(pc, {a}, {{"axes", {1, 0, 2, 3}}})[0];
+    LOOM_CHECK(permuted->ne[0] == 1 && permuted->ne[1] == 6);
+    // The precondition that makes this test meaningful: ggml calls this contiguous even though its
+    // leading stride is not the element size. If ggml ever tightens that, this test still passes.
+    LOOM_CHECK(permuted->nb[0] != ggml_type_size(permuted->type));
+
+    // Split the 6 channels into two halves of 3, exactly as LFM2 splits B/C/x -- the second at a
+    // non-zero offset, which is where a wrong stride would also corrupt the data rather than only
+    // over-count the bounds.
+    const int64_t elem = static_cast<int64_t>(ggml_type_size(permuted->type));
+    ggml_tensor* first = op("CONT")(pc, {op("VIEW")(pc, {permuted},
+        {{"shape", {1, 3}}, {"offset", 0}})[0]}, {})[0];
+    ggml_tensor* second = op("CONT")(pc, {op("VIEW")(pc, {permuted},
+        {{"shape", {1, 3}}, {"offset", 3 * elem}})[0]}, {})[0];
+
+    ggml_cgraph* gf = ggml_new_graph(s.ctx.get());
+    ggml_build_forward_expand(gf, first);
+    ggml_build_forward_expand(gf, second);
+    ggml_gallocr_alloc_graph(s.galloc.get(), gf);
+    set_f32(a, {10, 20, 30, 40, 50, 60});
+    s.compute(gf);
+
+    LOOM_CHECK((get_f32(first) == std::vector<float>{10, 20, 30}));
+    LOOM_CHECK((get_f32(second) == std::vector<float>{40, 50, 60}));
+}
+
+// The bounds check must still REJECT a genuinely out-of-range view -- the fix narrows what counts as
+// out of range by one element's worth of stride, it does not remove the check.
+void test_view_out_of_bounds_still_throws() {
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 3, 4);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    // One row past the end.
+    LOOM_CHECK_THROWS(op("VIEW")(pc, {a}, nlohmann::json{{"shape", {3, 4}},
+                                                          {"offset", static_cast<int64_t>(a->nb[1])}}),
+                       loom::SchemaError);
+}
+
 void test_unknown_op_throws() {
     LOOM_CHECK_THROWS(loom::PrimitiveRegistry::instance().get("NOT_A_REAL_OP"), loom::UnknownOpError);
 }
@@ -2332,6 +2388,8 @@ int main() {
     test_reshape_permute_cont();
     test_reshape_infers_minus_one_dim();
     test_view();
+    test_view_of_permuted_parent_with_unit_leading_axis();
+    test_view_out_of_bounds_still_throws();
     test_unknown_op_throws();
     test_rope_identity_at_position_zero();
     test_conv_1d();
