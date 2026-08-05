@@ -296,7 +296,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     PLAN.md`) -- a genuinely separate dependency from `checkpoint_path` (StyleTTS2's own weights)."""
 
     checkpoint_path: str
-    kokoro_config_path: str = "/home/flavio/.claude/tmp/kokoro_model/config.json"
+    kokoro_config_path: str = "/home/flavio/Dev/models/kokoro_model/config.json"
     # A DIRECTORY of `.lua` fragments -- StyleTTS2 is peeled (P4.0.6/C.8). See `driver_components`.
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver"
 
