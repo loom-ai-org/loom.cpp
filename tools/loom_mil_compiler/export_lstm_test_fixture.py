@@ -60,8 +60,8 @@ def main():
     from gguf import GGUFWriter
     w = GGUFWriter(str(OUTPUT_PATH), "loom-lstm-recurrent-test")
     for name, topo in (
-        ("h_fwd", result["forward"]["h"]), ("c_fwd", result["forward"]["c"]),
-        ("h_bwd", result["backward"]["h"]), ("c_bwd", result["backward"]["c"]),
+        # One cell topology per direction, each declaring both `h_new` and `c_new`.
+        ("fwd", result["forward"]), ("bwd", result["backward"]),
     ):
         w.add_string(f"model.graph_topology.{name}", json.dumps(topo))
     for name, arr in result["weights"].items():

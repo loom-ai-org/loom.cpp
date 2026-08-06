@@ -1834,7 +1834,19 @@ nothing.
   1. **Conformer-CTC** (done — see below). One reduction binding, a CTC epilogue component, and a
      builder the ASR family selects.
   2. **Parakeet TDT/RNNT.** The bigger half: the autoregressive prediction/joint loop moves to Lua and
-     `src/core/tdt_decoder.cpp` (156 lines) retires with it.
+     `src/core/tdt_decoder.cpp` (156 lines) retires with it. **Not started, and it is not the same
+     shape as step 1** — scoping it turned up that the parakeet MIL export is *encoder-only*
+     (`nemo_asr_export.py`'s `ENCODER_BT_D`: the prediction LSTM and joint "are NOT traced ... driven
+     autoregressively by the C++ TdtDecoder"), so there is nothing in the artifact for a driver to
+     orchestrate yet. Getting the loop into Lua means first getting those two into the same GGUF, which
+     is a fork worth deciding rather than defaulting: **trace them** (the prediction net is an
+     `nn.LSTM`, and `multi_phase_export.RecurrentPhase` already converts a traced `lstm` op — parakeet
+     becomes a `MultiPhase` export and `convert_parakeet_tdt.py` retires with it), or **synthesize
+     them** in the exporter as that converter does (smaller, retires `tdt_decoder.cpp` sooner, but
+     copies hand-derived topology construction into the MIL path and entrenches the converter; Kokoro's
+     LSTM-bound pieces set that precedent). The two findings below were extracted from this scoping and
+     landed on their own, so whichever route is taken starts from a decoder that is already correct and
+     already halved.
   3. **Retire the bespoke `tools/convert_nemo/` converters** once all three MIL exports are reachable,
      which also removes the bare-vs-named topology split that keeps `loom_cli --wav` on the old files.
 
@@ -1859,6 +1871,77 @@ nothing.
   made `reserve()` the switch that suppresses the compute-buffer shrink — so retiring Generator deletes
   `reserve()`, `reserved_`, and the shrink's only special case along with it. Worth doing, and not as a
   rider on anything else.
+
+### Every LSTM computed its gate stack twice — FIXED (2026-08-06)
+
+Found while scoping P4.0.17 step 2, and it turned out not to be a parakeet problem at all.
+
+A cell step produces `h_new` and `c_new` from one gate stack. `GraphTopology` allowed a single declared
+output when the pattern was established, so the precedent
+(`convert_kokoro_duration_predictor.py::build_lstm_cell_topology`) was to emit the **identical node
+list twice** and vary only which output it declared — and every caller then ran both. The gate matmuls,
+the four gate VIEWs and the six elementwise ops were computed a second time purely to read the other
+half of the same result. P2 added multi-output topologies; nothing went back to collect this.
+
+It is not marginal, and it is not parakeet's: **Kokoro and StyleTTS2 each drive six BiLSTMs over a whole
+sequence**, forward and backward, one cell call per timestep per direction. All of it was doubled.
+
+`recurrent.py::_lstm_cell_topology` now declares `["h_new", "c_new"]`, and the output ORDER is the
+contract every consumer reads by. Retrofitted across all of them:
+
+* `RecurrentPhase` registers `<phase>_fwd`/`<phase>_bwd` instead of four `_h_*`/`_c_*` names.
+* `loom_lua`'s `run_bi_lstm` captures both from one call per timestep per direction; its
+  `DrivenTopologies` declaration follows, and `lua_library.drives_mismatches` checks the two agree.
+* `loom.run_recurrent` takes ONE module name instead of `(h_module, c_module)`, and reads both outputs
+  off one compute. It also gained an error for a topology that declares fewer than two, since the
+  ordering is now load-bearing.
+* The `export_lstm_test_fixture` GGUF and `test_e2e_lstm_recurrent`'s script.
+
+**Not touched, deliberately:** the bespoke converters (`convert_parakeet_tdt.py`,
+`convert_kokoro_duration_predictor.py`, `tools/fixture_gen/tdt_step_common.py`) and the hand-written
+`kokoro_driver.lua`/`styletts2_driver.lua`, which carry their own copies of the four-topology
+convention. They feed the legacy C++ path (`BiLstmStepper`, `TdtDecoder`) whose GGUFs must stay
+byte-identical for their own tests, and they retire wholesale rather than being modernised.
+
+**Gate.** `test_e2e_lstm_recurrent` still matches a real `torch.nn.LSTM(bidirectional=True)` to
+**5e-8**. Kokoro and StyleTTS2 re-exported and re-run through their MIL Lua drivers: **22207/22207
+checks each**, every waveform sample unchanged. Their topology counts fall exactly as predicted —
+Kokoro 39 → 27, StyleTTS2 41 → 29, which is 6 BiLSTMs x 2 fewer apiece — and the driver still names
+every one of them (`TestPeeledDriverCoverage`). ctest 146/146, exporter suite 466/466.
+
+### The TDT decoder recomputed its prediction network on every blank frame — FIXED (2026-08-06)
+
+The second finding from the same scoping pass, and independent of the Lua migration, so it lands on
+its own.
+
+`TdtDecoder::decode_greedy` ran the whole LSTM stack once per inner iteration. Its output is a pure
+function of `(last_label, h, c)`, and all three change **only when a token is emitted** — on a blank the
+loop discarded `h_new`/`c_new`, advanced the frame, and recomputed bit-identical values from identical
+inputs next time round. Most frames of real audio are blank, so that was the bulk of what the decoder
+did. Caching it is what NeMo's own implementation does; the equivalence argument is that the discarded
+recompute could not have differed.
+
+The state now commits where it is produced rather than on emission, which is the same condition said
+the other way round: reaching the run at all means the state is about to become current.
+
+**Measured on 11s of real speech (`samples/jfk.wav`), parakeet-tdt-0.6b: the prediction stack runs 37
+times instead of ~140** — once per emitted token plus the initial one, against once per frame. Decode
+wall-clock moves less than that ratio suggests, median **~1.25s → ~1.04s over five runs each**, because
+the joint network is the widest matmul in the loop (1024 → 8197) and still runs every frame. This
+machine's run-to-run spread is wide enough that the timing is worth little; the call-count is exact.
+
+**Gate — an A/B on the real models, because the existing tests cannot reach the branch.** The
+`parakeet-rnnt` reference fixture decodes to an *empty* token list, so `test_e2e_parakeet_rnnt` would
+have compared empty against empty and passed either way. Instead, the same binary ran both checkpoints
+over `samples/jfk.wav` before and after the change:
+
+  * parakeet-tdt: 36 tokens, identical ids and identical frame indices.
+  * parakeet-rnnt: 26 tokens, identical — and this is the branch that matters most, since plain RNN-T
+    forces `skip = 0` on emission and therefore re-enters the inner loop, the one path where the cache
+    must invalidate rather than persist.
+
+`test_e2e_parakeet_tdt` also still reproduces `reference_forward_parakeet_tdt.py`'s own tokens and
+frame indices exactly (16/16, "Yeah.").
 
 ### Conformer-CTC now has a Lua entry point — DONE (2026-08-06)
 

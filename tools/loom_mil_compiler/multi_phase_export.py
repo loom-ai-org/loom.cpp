@@ -190,11 +190,12 @@ class RecurrentPhase:
                 f"Wrap a single nn.LSTM -- a module containing several is several phases."
             )
         result = build_lstm_cell_topologies(ops[0], weight_namespace=f"{self.name}.")
-        topologies = {f"{self.name}_h_fwd": result["forward"]["h"],
-                      f"{self.name}_c_fwd": result["forward"]["c"]}
+        # ONE topology per direction, declaring both `h_new` and `c_new` -- see `_lstm_cell_topology`
+        # for why it used to be two and what running both cost. The names lose their `_h`/`_c` half
+        # accordingly: `<phase>_fwd`, `<phase>_bwd`.
+        topologies = {f"{self.name}_fwd": result["forward"]}
         if result["backward"] is not None:
-            topologies[f"{self.name}_h_bwd"] = result["backward"]["h"]
-            topologies[f"{self.name}_c_bwd"] = result["backward"]["c"]
+            topologies[f"{self.name}_bwd"] = result["backward"]
         return topologies, result["weights"]
 
 

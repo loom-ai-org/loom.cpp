@@ -79,7 +79,11 @@ int main() {
             bridge.register_module(name, *model_mil,
                                     loom::GraphTopology::parse(model_mil->topology_json(name)));
         }
-        LOOM_CHECK(model_mil->topology_names().size() == 39);
+        // Six BiLSTMs, one cell topology per direction. It was 39 until the cell topology gained its
+        // second declared output: each BiLSTM was four topologies (`_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`)
+        // whose node lists were identical, so every timestep evaluated the gate stack twice to read
+        // each half of the same step (recurrent.py::_lstm_cell_topology).
+        LOOM_CHECK(model_mil->topology_names().size() == 27);
 
         bridge.load_script(driver_script);
 

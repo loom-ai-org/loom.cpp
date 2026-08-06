@@ -168,7 +168,7 @@ _FUNCTIONS = (
     # whose bodies call `loom.run_subgraph` at all -- the same fact from both sides. Everything else
     # here is arithmetic over Lua tables.
     LuaFunction("run_bi_lstm", drives=DrivenTopologies(
-        suffixes=("_h_fwd", "_c_fwd", "_h_bwd", "_c_bwd"),
+        suffixes=("_fwd", "_bwd"),
         inputs=("layer_input", "h_prev", "c_prev"))),
     LuaFunction("run_resblk_stack", requires=("to_layout_a", "from_layout_a"),
                 drives=DrivenTopologies(suffixes=("_block0", "_block1", "_block2"),

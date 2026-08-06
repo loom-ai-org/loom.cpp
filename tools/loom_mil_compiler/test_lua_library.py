@@ -162,15 +162,15 @@ class TestTheRealFamilies(unittest.TestCase):
 
         original = lua_library._FUNCTIONS
         broken = LuaFunction("run_bi_lstm", drives=DrivenTopologies(
-            suffixes=("_h_forward", "_c_fwd", "_h_bwd", "_c_bwd"),
+            suffixes=("_forward", "_bwd"),
             inputs=("layer_input", "h_prev", "c_prev")))
         try:
             lua_library._FUNCTIONS = (broken,)
             complaints = drives_mismatches()["run_bi_lstm"]
         finally:
             lua_library._FUNCTIONS = original
-        self.assertIn("declares suffix '_h_forward'", complaints[0])
-        self.assertIn("body concatenates '_h_fwd'", complaints[1])
+        self.assertIn("declares suffix '_forward'", complaints[0])
+        self.assertIn("body concatenates '_fwd'", complaints[1])
 
     def test_a_function_that_drives_topologies_without_saying_so_is_reported(self):
         import loom_mil_compiler.lua_library as lua_library
