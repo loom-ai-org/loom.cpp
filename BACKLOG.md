@@ -1888,6 +1888,37 @@ nothing.
   `reserve()`, `reserved_`, and the shrink's only special case along with it. Worth doing, and not as a
   rider on anything else.
 
+- **P4.0.18 — no exporter function should build a driver by interpolating text into a marker. Delete
+  `render_driver`'s substitution.** (Author's direction, 2026-08-06: "No function should be
+  interpolating scripts with marks.")
+
+  **Most of this is already done and was never cleaned up, which is the useful finding.** The
+  replacement exists and ships: `FlowMatchingSampler` is a real `DriverComponent` whose `prelude` calls
+  `render_sampler` and whose call site is IR, and its own docstring states the point — "both ends now go
+  through the builder instead of a marker substitution into hand-written text", closing the gap
+  `FlowMatchingSpec.func_name`'s `Unchecked` note predicted. Measured across the tree today:
+
+  * **No `.lua` anywhere contains `--@loom:samplers`.** The only occurrences of `SAMPLER_MARKER` are its
+    definition in `flow_matching_export.py` and `test_flow_matching_export.py`, which exercises the path
+    nothing else reaches.
+  * **All five multi-phase families are peeled** — kokoro, matcha, supertonic, styletts2 and vits each
+    override `driver_components()` — and `MultiPhase.export` only calls `render_driver` on the
+    *unpeeled* branch (`decomposition.py`: `None if peeled is not None else render_driver(...)`). So the
+    substitution is unreachable in production, and `decomposition.py` already says so in a comment.
+
+  What to delete: `SAMPLER_MARKER`, `_substitute`, and `render_driver` itself once its second job is
+  rehomed — it also runs the spec/estimator link checks, which are real and must not go with it. Move
+  those onto the component path (they are already duplicated there for peeled families, which is worth
+  confirming rather than assuming) and the function has nothing left. **Keep `render_sampler`**: it is
+  the codegen, it is called by `FlowMatchingSampler.prelude`, and it is not the thing objected to.
+
+  Also retire `BaseMultiPhaseModelExportConfig.driver_script_path` if nothing needs it afterwards, and
+  the `driver_components() -> None` default that selects the dead branch — a default that routes a new
+  family into an unreachable path is worse than no default.
+
+  Not urgent and not risky: the gate is that all five families re-export byte-identical, since none of
+  them takes the path being removed.
+
 ### Parakeet's four traced phases — DONE (2026-08-06); the driver is what remains
 
 P4.0.17 step 2, first half. `parakeet_export.ASRParakeetExportConfig` is a `MultiPhase` config that
