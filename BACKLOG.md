@@ -1833,20 +1833,36 @@ nothing.
 
   1. **Conformer-CTC** (done — see below). One reduction binding, a CTC epilogue component, and a
      builder the ASR family selects.
-  2. **Parakeet TDT/RNNT.** The bigger half: the autoregressive prediction/joint loop moves to Lua and
-     `src/core/tdt_decoder.cpp` (156 lines) retires with it. **Not started, and it is not the same
-     shape as step 1** — scoping it turned up that the parakeet MIL export is *encoder-only*
-     (`nemo_asr_export.py`'s `ENCODER_BT_D`: the prediction LSTM and joint "are NOT traced ... driven
-     autoregressively by the C++ TdtDecoder"), so there is nothing in the artifact for a driver to
-     orchestrate yet. Getting the loop into Lua means first getting those two into the same GGUF, which
-     is a fork worth deciding rather than defaulting: **trace them** (the prediction net is an
-     `nn.LSTM`, and `multi_phase_export.RecurrentPhase` already converts a traced `lstm` op — parakeet
-     becomes a `MultiPhase` export and `convert_parakeet_tdt.py` retires with it), or **synthesize
-     them** in the exporter as that converter does (smaller, retires `tdt_decoder.cpp` sooner, but
-     copies hand-derived topology construction into the MIL path and entrenches the converter; Kokoro's
-     LSTM-bound pieces set that precedent). The two findings below were extracted from this scoping and
-     landed on their own, so whichever route is taken starts from a decoder that is already correct and
-     already halved.
+  2. **Parakeet TDT/RNNT — route chosen: TRACE the prediction network and joint, and retire
+     `convert_parakeet_tdt.py` with them** (author's call, 2026-08-06). Not the same shape as step 1:
+     the parakeet MIL export is *encoder-only* (`nemo_asr_export.py`'s `ENCODER_BT_D` says the
+     prediction LSTM and joint "are NOT traced ... driven autoregressively by the C++ TdtDecoder"), so
+     there is nothing in the artifact for a driver to orchestrate yet. The plan, with the checkpoint's
+     real shapes read off `parakeet-tdt-0.6b-v3` rather than assumed:
+
+     * `embed` — `nn.Embedding(8193, 640)`. Its own small traced phase: the driver hands it
+       `last_label` and gets the cell's `layer_input`.
+     * `pred_lstm` — `decoder.prediction.dec_rnn`, an `nn.LSTM(640, 640, num_layers=2)`. **One
+       `RecurrentPhase`** (done below): a stack traces to one `lstm` op per layer, so the phase emits
+       `pred_lstm_l0_fwd`/`pred_lstm_l1_fwd`.
+     * `joint` — `enc` Linear(1024→640), `pred` Linear(640→640), then ReLU and Linear(640→**8198**),
+       which is 8193 token classes plus the 5 TDT durations. Emit the two heads as separate declared
+       outputs so the driver can `argmax_row` the tokens without marshalling them and read only the
+       five duration logits with `get_output` — no new binding needed. Plain RNN-T has no duration head
+       and the second output simply is not there.
+     * `encoder` — the existing trace, moved from `main_topology` into a named phase.
+
+     That makes parakeet a **`MultiPhase`** export, whose driver is a checked hand-written Lua fragment
+     (the shape all five TTS families use) rather than a synthesized builder — the TDT double loop is
+     orchestration, and `MultiPhaseDriverBuilder` is what already exists for orchestration a family
+     owns. The loop itself belongs in `loom_lua` beside `run_bi_lstm`.
+
+     Two things already in hand before it starts: the decoder's redundant per-frame prediction recompute
+     is gone (see below), and the A/B harness for it — both checkpoints decoded over `samples/jfk.wav`,
+     36 and 26 tokens — is the equivalence gate the new driver must reproduce. It matters because the
+     `parakeet-rnnt` *reference fixture decodes to an empty token list*, so the existing e2e test cannot
+     tell a working decoder from a broken one.
+
   3. **Retire the bespoke `tools/convert_nemo/` converters** once all three MIL exports are reachable,
      which also removes the bare-vs-named topology split that keeps `loom_cli --wav` on the old files.
 
@@ -1871,6 +1887,23 @@ nothing.
   made `reserve()` the switch that suppresses the compute-buffer shrink — so retiring Generator deletes
   `reserve()`, `reserved_`, and the shrink's only special case along with it. Worth doing, and not as a
   rider on anything else.
+
+### `RecurrentPhase` handles a stacked LSTM — DONE (2026-08-06)
+
+The first unknown in P4.0.17 step 2's traced route, settled by tracing rather than reasoning: **a
+`num_layers=2` `nn.LSTM` traces to TWO MIL `lstm` ops**, one per layer, each with its own `[4H, I]`
+`weight_ih` — not one op carrying both. `RecurrentPhase` required exactly one and raised otherwise, so
+Parakeet's two-layer prediction network could not have been a phase at all.
+
+A stack is now one phase emitting one cell per layer, `<name>_l0_fwd`, `<name>_l1_fwd`, .... A
+single-layer module keeps its unsuffixed `<name>_fwd`/`_bwd`, so Kokoro's six BiLSTMs and every
+`run_bi_lstm("<phase>", ...)` caller are untouched by stacks existing. One phase rather than N because
+the layers share a module, a checkpoint and a name — splitting them would make the caller reassemble
+what the module already states.
+
+The test that asserted the old rejection is replaced by one asserting the behaviour, including the half
+that would pass silently if the phase emitted two names for one op: each layer carries its own weights,
+and layer 1's `weight_ih` is the hidden width beneath it rather than the module's input width.
 
 ### Every LSTM computed its gate stack twice — FIXED (2026-08-06)
 

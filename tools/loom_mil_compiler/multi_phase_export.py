@@ -104,7 +104,7 @@ def _mil_input_names(phase) -> List[str]:
 
 @dataclass
 class RecurrentPhase:
-    """One `torch.nn.LSTM` exported as its four per-timestep cell topologies instead of one static graph.
+    """One `torch.nn.LSTM` exported as per-timestep cell topologies instead of one static graph.
 
     **Why this is a phase type rather than an `ExportPhase` with a different wrapper.** ggml has no LSTM
     op, so a recurrence cannot be a static topology at all -- it needs a genuine host-side loop over a
@@ -114,10 +114,11 @@ class RecurrentPhase:
     since it was written, and until now had **no caller**: the wiring was the missing half, not the
     maths.
 
-    It emits `{name}_h_fwd`, `{name}_c_fwd` and -- for a bidirectional module -- `{name}_h_bwd`,
-    `{name}_c_bwd`, which is precisely the four-topology naming `loom_lua`'s `run_bi_lstm` already
-    drives and the bespoke converters already produce. A driver calling `run_bi_lstm("text_encoder_lstm",
-    ...)` therefore does not change at all; only where those four topologies come from does.
+    It emits `{name}_fwd` and -- for a bidirectional module -- `{name}_bwd`, which is precisely the
+    naming `loom_lua`'s `run_bi_lstm` composes. A driver calling `run_bi_lstm("text_encoder_lstm", ...)`
+    therefore does not change at all; only where those topologies come from does. A STACKED module
+    (`num_layers > 1`) numbers its layers instead -- `{name}_l0_fwd`, `{name}_l1_fwd`, ... -- because it
+    traces to one `lstm` op per layer; see `topologies()`.
 
     The cell formulation is MIL's, not PyTorch's state-dict one: gate order `[i, f, o, z]` and a single
     pre-summed bias, because that is what coremltools' torch frontend hands over. It is a different
@@ -128,8 +129,8 @@ class RecurrentPhase:
     """
 
     name: str
-    # The module to trace. Either an `nn.LSTM` or a thin wrapper whose forward is one call to it -- the
-    # trace only has to contain exactly one `lstm` op.
+    # The module to trace. Either an `nn.LSTM` or a thin wrapper whose forward is one call to it. A
+    # stack (`num_layers > 1`) is fine and stays one phase: it traces to one `lstm` op per layer.
     module: nn.Module
     # Defaults to the module's own `input_size`, so an `nn.LSTM` never restates it. Passed explicitly
     # only for a wrapper that has no such attribute.
@@ -141,13 +142,13 @@ class RecurrentPhase:
 
     __unchecked__ = {
         "name": Unchecked(
-            "the prefix of the four topology names this phase creates. Like ExportPhase.name it does "
+            "the prefix of the topology names this phase creates. Like ExportPhase.name it does "
             "not refer to anything -- it CREATES the reference run_bi_lstm's own computed name resolves "
             "against at run time"
         ),
         "module": Unchecked(
             "the nn.LSTM being traced. It is the model; there is no separate authority to check it "
-            "against, and `topologies()` raises if the trace does not contain exactly one lstm op"
+            "against, and `topologies()` raises if the trace contains no lstm op at all"
         ),
         "input_dim": Unchecked(
             "the module's own input width, defaulted from `module.input_size` and only ever passed "
@@ -164,7 +165,8 @@ class RecurrentPhase:
     }
 
     def topologies(self) -> Tuple[Dict[str, dict], Dict[str, np.ndarray]]:
-        """`({topology name: topology}, weights)` for this LSTM's four (or two) cells."""
+        """`({topology name: topology}, weights)` for this LSTM's cells -- one per direction per
+        layer."""
         import coremltools as ct
         import torch
 
@@ -184,19 +186,34 @@ class RecurrentPhase:
             convert_to="milinternal", compute_precision=ct.precision.FLOAT32,
         )
         ops = [op for op in program.functions["main"].operations if op.op_type == "lstm"]
-        if len(ops) != 1:
+        if not ops:
             raise ValueError(
-                f"RecurrentPhase({self.name!r}) traced to {len(ops)} 'lstm' ops, expected exactly one. "
-                f"Wrap a single nn.LSTM -- a module containing several is several phases."
+                f"RecurrentPhase({self.name!r}) traced to no 'lstm' op at all. The module must be an "
+                f"nn.LSTM, or a thin wrapper whose forward is one call to one."
             )
-        result = build_lstm_cell_topologies(ops[0], weight_namespace=f"{self.name}.")
-        # ONE topology per direction, declaring both `h_new` and `c_new` -- see `_lstm_cell_topology`
-        # for why it used to be two and what running both cost. The names lose their `_h`/`_c` half
-        # accordingly: `<phase>_fwd`, `<phase>_bwd`.
-        topologies = {f"{self.name}_fwd": result["forward"]}
-        if result["backward"] is not None:
-            topologies[f"{self.name}_bwd"] = result["backward"]
-        return topologies, result["weights"]
+
+        # **A STACK traces to one `lstm` op per layer**, confirmed by tracing a real
+        # `nn.LSTM(num_layers=2)`: coremltools emits two, each with its own `[4H, I]` weight_ih, rather
+        # than one op carrying both layers. So a stacked prediction network (Parakeet's `dec_rnn` is
+        # two layers of 640) is ONE phase producing one cell per layer, not N phases -- the layers share
+        # a module, a checkpoint and a name, and splitting them would make the caller reassemble
+        # something the model already states.
+        topologies: Dict[str, dict] = {}
+        weights: Dict[str, np.ndarray] = {}
+        for layer, op in enumerate(ops):
+            # A single-layer module keeps its original unsuffixed names, so every existing caller --
+            # Kokoro's six BiLSTMs, and `run_bi_lstm("<phase>", ...)` composing `_fwd`/`_bwd` itself --
+            # is untouched by stacks existing. A stack numbers its layers because it has to.
+            stem = self.name if len(ops) == 1 else f"{self.name}_l{layer}"
+            result = build_lstm_cell_topologies(op, weight_namespace=f"{stem}.")
+            # ONE topology per direction, declaring both `h_new` and `c_new` -- see
+            # `_lstm_cell_topology` for why it used to be two and what running both cost. The names lose
+            # their `_h`/`_c` half accordingly: `<stem>_fwd`, `<stem>_bwd`.
+            topologies[f"{stem}_fwd"] = result["forward"]
+            if result["backward"] is not None:
+                topologies[f"{stem}_bwd"] = result["backward"]
+            weights.update(result["weights"])
+        return topologies, weights
 
 
 def merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:

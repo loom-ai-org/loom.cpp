@@ -137,8 +137,9 @@ class TestRecurrentPhase(unittest.TestCase):
     """`recurrent.build_lstm_cell_topologies` was verified against a real traced nn.LSTM when it was
     written and then had **no caller** for the whole of P4.0 -- `generate_graph_topology` raised on an
     `lstm` op and named it as the fix. `RecurrentPhase` is that wiring, so what these check is the
-    wiring: the names it creates, the guards on what it will accept, and that a bidirectional module
-    yields four cells rather than two."""
+    wiring: the names it creates, the guards on what it will accept, and how the two shapes that are
+    easy to conflate come out -- a bidirectional module (two directions, one layer) against a stacked
+    one (one direction, two layers)."""
 
     def _lstm_phase(self, input_dim=6, hidden=4, bidirectional=True, name="enc_lstm"):
         import torch
@@ -184,25 +185,36 @@ class TestRecurrentPhase(unittest.TestCase):
             phase.topologies()
         self.assertIn("input.size(-1) must be equal to input_size", str(raised.exception))
 
-    def test_a_module_with_two_lstms_is_rejected_rather_than_half_exported(self):
+    def test_a_stacked_lstm_is_one_phase_with_one_cell_per_layer(self):
+        """A `num_layers=2` module traces to one `lstm` op PER LAYER -- confirmed against a real trace,
+        not assumed -- so a stack stays one phase and numbers its cells. Parakeet's prediction network
+        is exactly this shape (two layers of 640), and splitting it into two phases would make the
+        caller reassemble something the module already states."""
         import torch
 
         from loom_mil_compiler.multi_phase_export import RecurrentPhase
 
-        class _Two(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.a = torch.nn.LSTM(6, 4, batch_first=True)
-                self.b = torch.nn.LSTM(4, 4, batch_first=True)
+        stacked = torch.nn.LSTM(6, 4, num_layers=2, batch_first=True)
+        topologies, weights = RecurrentPhase(name="pred", module=stacked).topologies()
+        self.assertEqual(sorted(topologies), ["pred_l0_fwd", "pred_l1_fwd"])
+        # Each layer carries its OWN weights, which is the half that would silently pass if the phase
+        # emitted two names for one op.
+        self.assertEqual(sorted(weights), [
+            "pred_l0.fwd.bias", "pred_l0.fwd.weight_hh", "pred_l0.fwd.weight_ih",
+            "pred_l1.fwd.bias", "pred_l1.fwd.weight_hh", "pred_l1.fwd.weight_ih",
+        ])
+        # Layer 0 takes the module's input width; layer 1 takes the hidden width beneath it.
+        self.assertEqual(weights["pred_l0.fwd.weight_ih"].shape, (16, 6))
+        self.assertEqual(weights["pred_l1.fwd.weight_ih"].shape, (16, 4))
 
-            def forward(self, x):
-                out, _ = self.a(x)
-                out, _ = self.b(out)
-                return out
+    def test_a_module_with_no_lstm_at_all_is_rejected(self):
+        import torch
+
+        from loom_mil_compiler.multi_phase_export import RecurrentPhase
 
         with self.assertRaises(ValueError) as raised:
-            RecurrentPhase(name="two", module=_Two(), input_dim=6).topologies()
-        self.assertIn("traced to 2 'lstm' ops, expected exactly one", str(raised.exception))
+            RecurrentPhase(name="none", module=torch.nn.Linear(6, 6), input_dim=6).topologies()
+        self.assertIn("no 'lstm' op at all", str(raised.exception))
 
     def test_the_cell_is_the_mil_formulation_not_the_state_dict_one(self):
         """One pre-summed `bias`, not `bias_ih`/`bias_hh`. This is why replacing a bespoke BiLSTM
