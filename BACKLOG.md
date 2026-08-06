@@ -1946,12 +1946,13 @@ tokens + durations, and `test_parakeet_export.py` pins the whole thing.
 **What remains before the converter can go**, and one of them is a real design question rather than
 typing:
 
-  1. **The driver's constants.** `blank_id`, the duration set, `pred_hidden` and the layer count are
-     read from the checkpoint at export time and the Lua loop needs all four. A hand-written driver
-     adopted whole (`RawLuaDriver`, the C.3 path) cannot carry them — Lua cannot read GGUF hparams — so
-     either the family peels into components and emits a generated constants fragment, or a
-     substitution marker is added to `render_driver`. The peeled route is the one every other
-     multi-phase family already took.
+  1. **The driver's constants — SETTLED, and shipped: `ExportConstants`, with the family peeling**
+     (author's direction). `blank_id`, the duration set, `pred_hidden` and the layer count are read
+     from the checkpoint at export time, and Lua cannot read GGUF hparams. They are bound as ordinary
+     IR `Local`s, so every read goes through `driver_ir.validate`. The marker alternative was a
+     `str.replace` whose injected text is opaque to every checker: a misspelled read is a runtime `nil`,
+     and in Lua `id ~= nil` is quietly true — a TDT decoder emitting every blank as a token, first
+     visible as a garbage transcript. Rejecting that shape generally is P4.0.18.
   2. **The TDT loop itself**, as a checked fragment beside `run_bi_lstm`, with the prediction-output
      cache the C++ decoder now has.
   3. **Registry wiring** so `--model parakeet-tdt` selects this config, and re-basing
