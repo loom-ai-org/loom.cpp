@@ -122,6 +122,11 @@ public:
     // n_past=n_ctx_max-1) shapes and reserves the allocator for the larger of the two, so that ordinary
     // build() calls within those bounds don't trigger a gallocr reallocation. Purely a performance
     // optimization -- build() alone is already correct without ever calling this.
+    //
+    // **Calling this also disables the shrink below, permanently and deliberately.** The two are
+    // opposite policies over the same buffer -- "hold the worst case so nothing ever reallocates" and
+    // "give back what this shape does not need" -- and a builder cannot honour both. reserve() is the
+    // caller stating a worst case, so it wins.
     void reserve(uint32_t n_ctx_max);
 
     // Current size (in bytes) of the gallocr-managed compute buffer, or 0 if build()/reserve() haven't
@@ -134,6 +139,9 @@ public:
     // rebuilds exactly once, which is the only externally visible difference reuse makes.
     uint64_t builds() const { return builds_; }
     uint64_t reuses() const { return reuses_; }
+    // How many builds gave the oversized compute buffer back. A prefill-then-decode generation should
+    // report exactly one, at the transition; a fixed-shape loop, zero.
+    uint64_t shrinks() const { return shrinks_; }
 
 private:
     const GraphTopology& topo_;
@@ -158,6 +166,19 @@ private:
     bool has_cached_ = false;
     uint64_t builds_ = 0;
     uint64_t reuses_ = 0;
+    // Set by reserve(); suppresses the shrink in build() -- see reserve()'s own comment.
+    bool reserved_ = false;
+    // Set by a build that grew the compute buffer, and the only thing that arms the shrink check on the
+    // next one. gallocr only ever grows, so nothing else can make the buffer oversized -- and the check
+    // is a second planning pass, which is far too expensive to run per build (measured in
+    // graph_builder.cpp).
+    bool may_shrink_ = false;
+    uint64_t shrinks_ = 0;
+
+    // Drops the gallocr when this graph needs materially less than the buffer currently holds, so the
+    // next alloc sizes a fresh one. See build()'s own comment for why the allocator will not do this
+    // by itself.
+    void shrink_allocator_if_oversized(ggml_cgraph* gf);
 };
 
 } // namespace loom

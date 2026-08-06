@@ -630,12 +630,13 @@ of this file that does not exist (the hierarchy is described in P3.1's entry ins
 
 #### P4.0 — settle these before the first from-scratch family config
 
-Fifteen items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
+Sixteen items that P3 left in a state P4 would otherwise inherit and harden — three carried over from P3
 (P4.0.1–P4.0.3, all DONE), five added by [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md)
 (P4.0.4–P4.0.8), three added by [`KV-CACHE.md`](KV-CACHE.md) (P4.0.9, scheduled **before** P4.0.7's
 remaining registry steps at the author's direction, plus P4.0.10/P4.0.11, the two capability gaps stage 3
 measured), three (P4.0.12–P4.0.14) from the review that followed P4.0.11a's marshalling fix, and one
-(P4.0.15) that P4.0.13 discovered it could not finish without. None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
+(P4.0.15) that P4.0.13 discovered it could not finish without, plus P4.0.16, which reviewing P4.0.14's
+memory cost turned up in the allocator underneath it. None is large; all get cheaper now and more expensive after Whisper/GigaAM/composition
 add three more configs written against whatever shape exists at the time. Same gate as everything else:
 byte-identical re-export of all 11 models (`snapshot_gguf.py`), since none of these is meant to change
 any output — with stated exceptions: P4.0.6's per-family peeling commits, where driver text legitimately
@@ -1679,6 +1680,10 @@ nothing.
   long-context prefill, and the reason a future item that retains only the row retrieval asks for would
   have something to fix.
 
+  **Read P4.0.16 next, which corrects the proportions here.** Reviewing this paragraph turned up a
+  larger and *permanent* retention underneath it — the gallocr compute buffer, which never shrinks — so
+  the duplicate above is the smaller half of the memory story and the only transient one.
+
   **Gate — measured.** Byte-identity is not the gate; driver text changes by construction, so the gate
   is which models change and which must not. All 13 exported from a `git worktree` at `4bc83a5` and from
   this tree, `snapshot_gguf.py` both, `diff -r`:
@@ -1741,6 +1746,56 @@ nothing.
   index-tensor writes, then buckets, then extend `tests/test_graph_builder_reuse.cpp`'s bit-identity
   check to a decode loop — that test currently asserts a decode sequence rebuilds every step, which is
   the assertion this item deliberately inverts.
+
+- **P4.0.16 — give the compute buffer back when a build stops needing it — DONE (2026-08-06).** Found
+  while reviewing P4.0.14's memory cost at the author's prompting, and it turned out the item I had
+  flagged there was the *smaller* of two retentions.
+
+  **gallocr grows and never shrinks.** `ggml_gallocr_reserve_n_impl` reallocates a chunk only when
+  `new_chunk_size > cur_chunk_size` (ggml-alloc.c) — the right default for a caller who reserves a worst
+  case, the wrong one for a prefill followed by a decode loop. Since P4.0.13 the builder that ran the
+  prefill *is* the builder that serves every decode step, so the prefill's buffer was held for the whole
+  generation. **Measured on gemma-3-270m-it at a 512-token prefill: 513.2 MiB held where 1.0 MiB is
+  needed**, for every step, for the lifetime of the bridge. P4.0.14's `OutputStore` duplicate is the same
+  order of magnitude but genuinely transient — `reshape()` drops it to `[n_vocab, 1]` at the first decode
+  step. This one never came back.
+
+  `GraphBuilder::build` now drops the gallocr when a scratch plan says this graph needs less than half
+  of what the buffer holds, and the next alloc sizes a fresh one. Three things are load-bearing:
+
+  * **The plan runs on a scratch allocator, never the live one.** `ggml_gallocr_reserve_n_size` runs the
+    real planner with `no_alloc=true`, which frees the live buffers in the *growing* case — exactly when
+    they are about to be needed.
+  * **It is armed by a preceding growth, not run per build.** The plan is a second full pass over the
+    graph on top of the one `alloc_graph` already does. Running it unconditionally measured slower on a
+    1742-node graph, and arming it on *any* growth was no better — a cached LM grows `n_kv` by a token
+    per step, so the buffer creeps and re-arms constantly. Arming on a **doubling** separates "a
+    different regime is running" from "n_kv grew by one", and the same factor gates the shrink itself so
+    the two ends cannot disagree. A 100-step generation now reports `shrinks() == 1, builds() == 101`.
+  * **`reserve()` suppresses it entirely.** The two are opposite policies over one buffer — "hold the
+    worst case" vs "give back what this shape does not need" — and a builder cannot honour both. Only
+    the legacy `Generator` reserves; the Lua bridge never does, so every driven model gets the shrink and
+    `test_gallocr_reserve_reuse`'s contract is untouched.
+
+  *On the timing.* Wall-clock deltas on this machine sat inside its own ~1 ms/step run-to-run variance,
+  and repeated A/B runs crossed over — so no speed figure is claimed, and the code comment says so. The
+  design rests on the counted property (one probe per regime change), which is exact, not on a timing.
+
+  **Gate.** `tests/test_gallocr_shrink.cpp`, deliberately written as the sibling of
+  `test_gallocr_reserve_reuse.cpp` and stating the opposite contract, with the `reserve()` case as the
+  thing that keeps the pair consistent: shrink happens, costs exactly one probe over 33 builds, never
+  fires for a fixed-shape loop (which also still reuses its graph 7 times out of 8 calls — P4.0.13
+  undisturbed), and never fires after `reserve()`. On real models: gemma-3-270m-it drops 513.2 → 1.0 MiB
+  at the first decode step, and `test_e2e_causal_lm_infer_with_past` still passes 22/22 on it — the
+  allocator is recreated mid-generation with a live `KvCache`, which is safe for the reason the cache
+  exists outside the pool at all. Full ctest 145/145.
+
+  **What this does not do** is remove the peak. During a prefill the compute buffer and the retained
+  output are both live by construction — that is what the `ggml_cpy` into the store *is*. Removing it
+  means building into the store rather than copying into it: pre-set the declared output's `data` to the
+  store slot so gallocr skips it, exactly as `build()` already does for declared inputs. Needs a fallback
+  for an output that is a view (its `data` is its parent's), and it costs the pool the ability to recycle
+  that tensor. Not attempted here.
 
 ### Driver logits marshalling caps prefill length for large-vocab models — FIXED
 

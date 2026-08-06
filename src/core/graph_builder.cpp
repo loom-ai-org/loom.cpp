@@ -12,6 +12,13 @@
 namespace loom {
 namespace {
 
+// The one factor the compute-buffer shrink is tuned by, used at BOTH ends so they cannot disagree: a
+// growth arms the check only if the buffer more than doubled, and the check gives memory back only if
+// less than half of it is needed. Two is not a tuned optimum -- it is the smallest number that
+// separates "a different regime is running now" from "n_kv grew by one token", which is the only
+// distinction this has to make. See shrink_allocator_if_oversized.
+constexpr size_t kShrinkArmingGrowth = 2;
+
 ggml_type parse_dtype(const std::string& dtype) {
     if (dtype == "f32") return GGML_TYPE_F32;
     if (dtype == "i32") return GGML_TYPE_I32;
@@ -250,11 +257,21 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     }
     result.graph = gf;
 
+    shrink_allocator_if_oversized(gf);
     if (!galloc_) {
         galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
     }
+    const size_t buffer_before = ggml_gallocr_get_buffer_size(galloc_.get(), 0);
     if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
         throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
+    }
+    // Arm the shrink for the NEXT build, and only on a growth big enough to be a change of REGIME
+    // rather than the ordinary creep of a decode loop. A cached causal LM grows `n_kv` by one token per
+    // step, so its buffer grows a little on most steps; arming on any growth at all made the probe run
+    // on roughly every other step and cost +1.3 ms/step on gemma-3-270m-it, which is the measurement
+    // that put this factor here. A prefill->decode transition is 500x, not 1.001x.
+    if (ggml_gallocr_get_buffer_size(galloc_.get(), 0) > buffer_before * kShrinkArmingGrowth) {
+        may_shrink_ = true;
     }
 
     result.ctx = std::move(ctx);
@@ -267,12 +284,58 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     return cached_;
 }
 
+// **gallocr grows and never shrinks**, by design: `ggml_gallocr_reserve_n_impl` reallocates a chunk only
+// when `new_chunk_size > cur_chunk_size` (ggml-alloc.c). That is the right default for a caller who
+// reserves a worst case, and the wrong one for the shape this engine actually runs -- a prefill followed
+// by a decode loop. Measured on gemma-3-270m-it at a 512-token prefill: the compute buffer reaches
+// 513.2 MiB, a decode step needs 1.0 MiB, and before this the builder held all 513.2 MiB for the entire
+// generation. The graph is rebuilt at every decode step anyway (n_past is baked in -- BACKLOG.md
+// P4.0.15), so there is no retained graph to invalidate at the transition and nothing is thrown away
+// that the next call would have reused.
+//
+// The size is measured on a SCRATCH gallocr, never on the live one: `ggml_gallocr_reserve_n_size` runs
+// the real planner with `no_alloc=true`, which frees the live buffers in the *growing* case -- exactly
+// the case where they are about to be needed. A scratch allocator has no buffers to lose.
+//
+// **Armed by a preceding growth (`may_shrink_`), not run on every build.** The scratch plan is a second
+// full pass over the graph on top of the one `ggml_gallocr_alloc_graph` already does, and running it per
+// build measured consistently slower on gemma-3-270m-it's 1742-node graph -- paid on every decode step
+// to reclaim memory exactly once. (The wall-clock deltas on this machine were within its own run-to-run
+// variance of about 1 ms/step, so no figure is quoted here; the argument the design rests on is the
+// counted one, not the timed one.) Since the allocator only ever grows, the buffer can only be
+// oversized if some earlier build inflated it, so arming on growth makes the check run **once per
+// regime change** rather than once per build -- `shrinks()`/`builds()` report 1 and 101 for a
+// 100-step generation, which is the property the test asserts. Clearing the flag even when nothing
+// shrank is what stops a graph that genuinely needs its whole buffer from re-probing forever.
+void GraphBuilder::shrink_allocator_if_oversized(ggml_cgraph* gf) {
+    if (reserved_ || !may_shrink_ || !galloc_) return;
+    may_shrink_ = false;
+    const size_t current = ggml_gallocr_get_buffer_size(galloc_.get(), 0);
+    if (current == 0) return;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
+    ggml_gallocr_ptr probe(ggml_gallocr_new(buft));
+    if (!probe) return;
+    size_t needed = 0;
+    ggml_gallocr_reserve_n_size(probe.get(), gf, nullptr, nullptr, &needed);
+    // And only give it back when there is materially something to give. Shrinking to the exact current
+    // need would hand back a buffer the next step grows straight back -- the same `n_kv` creep the
+    // arming factor is about, seen from the other end.
+    if (needed * kShrinkArmingGrowth > current) return;
+
+    galloc_.reset(ggml_gallocr_new(buft));
+    ++shrinks_;
+}
+
 size_t GraphBuilder::buffer_size() const {
     return galloc_ ? ggml_gallocr_get_buffer_size(galloc_.get(), 0) : 0;
 }
 
 void GraphBuilder::reserve(uint32_t n_ctx_max) {
     if (n_ctx_max == 0) return;
+    // Before the builds below, not after: the decode-shaped one needs less than the prefill-shaped one,
+    // so an un-suppressed shrink would hand back the very buffer this call exists to hold.
+    reserved_ = true;
     // Not dead weight on the Lua path any more (BACKLOG.md P4.0.13's own complaint): the builder that
     // reserves is now the builder that serves every later call, so the allocator it sizes here is the
     // one those calls use. The decode build below also leaves its graph retained, so a decode-shaped
