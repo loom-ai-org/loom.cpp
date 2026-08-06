@@ -180,8 +180,15 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
 }
 
 // Argmax over ONE row of a 2D f32 tensor. `requested_row` is 0-based; negative means the last row.
-// `nb[1]` is the row stride, so this reads ne0 floats and never touches the other rows -- which is what
-// removes both the marshalling ceiling and the copy (see l_run_subgraph_argmax's header comment).
+// `nb[1]` is the row stride, so this reads ne0 floats and never touches the other rows.
+//
+// **This is what removes the marshalling ceiling.** `run_subgraph` marshals every output element into a
+// Lua table, and LuaJIT's array part tops out near 2^27 entries -- so a 262144-wide vocab (Gemma 3)
+// overflows at ~512 prompt tokens, and a driver whose only use for those logits is one argmax pays a
+// 157M-element table to compute a single integer. Reducing on the tensor removes both the ceiling and
+// the copy: nothing crosses the boundary but the answer, which keeps the Lua boundary a *per-step*
+// boundary rather than a per-logit one -- the same reasoning KV-CACHE.md §1.1 gives for not driving
+// attention from Lua.
 int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname) {
     if (out->type != GGML_TYPE_F32) {
         throw Error(std::string(fname) + ": output must be f32");
@@ -221,9 +228,8 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
     return axes;
 }
 
-// Everything `run_subgraph`, `run_subgraph_argmax` and `run_subgraph_and_retain` share: build the
-// graph for `axes`, fill every declared input from the Lua table at `inputs_idx`, compute, and hand
-// the result to `emit`.
+// Everything `run_subgraph` and `run_subgraph_and_retain` share: build the graph for `axes`, fill every
+// declared input from the Lua table at `inputs_idx`, compute, and hand the result to `emit`.
 //
 // Extracted rather than duplicated because the entry points differ ONLY in what they do with the
 // outputs -- a copy would be free to drift on cache wiring or input validation, which is exactly the
@@ -318,50 +324,6 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         });
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.run_subgraph: %s", e.what());
-    }
-}
-
-// `loom.run_subgraph_argmax(module, axes, inputs, row)` -- run the module and return ONE number, the
-// argmax of the requested row of its first output. `row` is 0-based; a negative row means the last.
-//
-// **Why this exists: `run_subgraph` cannot return a large logits tensor at all.** It marshals every
-// output element into a Lua table, and LuaJIT's array part tops out near 2^27 entries -- so a
-// 262144-wide vocab (Gemma 3) overflows at ~512 prompt tokens, and a driver whose only use for those
-// logits is one argmax pays a 157M-element table to compute a single integer. Doing the reduction on
-// the tensor removes both the ceiling and the copy: nothing crosses the boundary but the answer.
-//
-// This keeps the Lua boundary a *per-step* boundary rather than a per-logit one, the same reasoning
-// KV-CACHE.md §1.1 gives for not driving attention from Lua.
-//
-// **Retirement policy (BACKLOG.md P4.0.14).** `loom.run_subgraph_and_retain` plus
-// `loom.argmax_row(module, row)` is the same two facts said separately, and once the modular path
-// uses them this fused spelling goes away: two ways to get a token out of a forward pass that can
-// disagree is the failure this project keeps removing. It stays until then because it is the only
-// one that works on the flattened path.
-int LoomLuaBridge::l_run_subgraph_argmax(lua_State* L) {
-    try {
-        auto* self = bridge_from_upvalue(L);
-        const char* module_name = luaL_checkstring(L, 1);
-        const DynamicAxes axes = read_axes_table(L, 2);
-        luaL_checktype(L, 3, LUA_TTABLE);
-        const auto requested_row = static_cast<int64_t>(luaL_checknumber(L, 4));
-
-        const auto it = self->modules_.find(module_name);
-        if (it == self->modules_.end()) {
-            return luaL_error(L, "loom.run_subgraph_argmax: unregistered module '%s'", module_name);
-        }
-        Module& mod = it->second;
-
-        return compute_and_emit(L, "loom.run_subgraph_argmax", module_name, self->module_builder(mod),
-                                 mod.backend, axes, 3, store_lookup(self),
-                                 /*out_store=*/nullptr,
-                                 [L, requested_row](const GraphBuilder::BuildResult& r) {
-            lua_pushnumber(L, static_cast<lua_Number>(
-                argmax_tensor_row(r.outputs.front(), requested_row, "loom.run_subgraph_argmax")));
-            return 1;
-        });
-    } catch (const std::exception& e) {
-        return luaL_error(L, "loom.run_subgraph_argmax: %s", e.what());
     }
 }
 
@@ -596,6 +558,12 @@ int LoomLuaBridge::l_zero_mask(lua_State* L) {
 // same values -- it just never marshals them, so it has no ceiling and no copy. An OVERLOAD rather than
 // a second binding precisely because it is not a second operation: `n_vocab` is only a parameter of the
 // array form because a flat Lua array has lost the shape the tensor still carries.
+//
+// Since P4.0.14 it is also the ONLY reducing spelling: every synthesized causal-LM driver retains and
+// then calls this, and the fused `loom.run_subgraph_argmax` that used to do both at once is gone. Two
+// ways to get a token out of a forward pass that can disagree is the failure this project keeps
+// removing -- and the fused one composed with nothing, while retention composes with `get_output` and
+// with `{from = ...}` on the same run.
 int LoomLuaBridge::l_argmax_row(lua_State* L) {
     try {
         if (lua_type(L, 1) == LUA_TSTRING) {
@@ -796,7 +764,6 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
     } bindings[] = {
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"range", &LoomLuaBridge::l_range},
-        {"run_subgraph_argmax", &LoomLuaBridge::l_run_subgraph_argmax},
         {"run_subgraph_and_retain", &LoomLuaBridge::l_run_subgraph_and_retain},
         {"get_output", &LoomLuaBridge::l_get_output},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},

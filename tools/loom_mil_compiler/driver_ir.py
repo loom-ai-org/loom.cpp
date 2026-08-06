@@ -199,6 +199,30 @@ class OutputRef(Expr):
 
 
 @dataclasses.dataclass
+class RetainedArgmax(Expr):
+    """`loom.argmax_row('norm', (#input_ids - 1))` -- the argmax of one row of a module's RETAINED first
+    output (BACKLOG.md P4.0.14).
+
+    `OutputRef`'s sibling for the one read of a retained value that is not an edge: a control decision
+    the host genuinely makes. Together they are why nothing tensor-shaped has to cross the boundary at
+    either end of a chain -- an intermediate is threaded onward by name, and the final reduction is
+    asked for by name too.
+
+    **`reads()` reports only the row expression, and that is the whole point.** Like `OutputRef` this
+    names a MODULE, which `validate()` cannot see at all, so the "did anything actually retain that?"
+    question lives in `check_subgraph_calls` alongside the identical question about `OutputRef`.
+    """
+    module: str
+    row: Expr
+
+    def reads(self) -> list[str]:
+        return self.row.reads()
+
+    def render(self) -> str:
+        return f"loom.argmax_row('{self.module}', {self.row.render()})"
+
+
+@dataclasses.dataclass
 class TableLit(Expr):
     items: dict  # str -> Expr
 
@@ -277,20 +301,17 @@ class SubgraphCall(Stmt):
     # unchanged; a call with seven inputs (Kokoro's decoder_vocoder) is unreadable on one line, and
     # the embedded driver_script is something people read out of the GGUF.
     multiline: bool = False
-    # When set, emit `loom.run_subgraph_argmax(module, axes, inputs, row)` instead: the module runs
-    # exactly the same way, but the engine reduces the first output's row `argmax_row` to one integer
-    # and only that crosses the Lua boundary. `outputs` is then the single token id and
-    # `extra_outputs` must be empty -- there is no shape to capture, because there is no tensor.
-    #
-    # Exists because marshalling a logits tensor is not merely slow, it has a CEILING: LuaJIT's array
-    # part tops out near 2^27 entries, so a 262144-wide vocab overflows at ~512 prompt tokens
-    # (BACKLOG.md). See lua_bridge.cpp's l_run_subgraph_argmax.
-    argmax_row: object = None
     # When set, emit `loom.run_subgraph_and_retain(module, axes, inputs)`: the module runs exactly the
     # same way, but its outputs stay in the module's own persistent buffer instead of being marshalled, and are
     # reached afterwards BY NAME -- as an `OutputRef` in a later call's inputs, or via
-    # `loom.get_output` / `loom.argmax_row(module, row)`. `outputs`/`extra_outputs` are therefore empty:
-    # there is nothing to bind, which is the point (BACKLOG.md P4.0.12).
+    # `loom.get_output` / `RetainedArgmax` (`loom.argmax_row(module, row)`). `outputs`/`extra_outputs`
+    # are therefore empty: there is nothing to bind, which is the point (BACKLOG.md P4.0.12).
+    #
+    # This is also how a driver escapes the marshalling CEILING, which is not merely a slowness: a
+    # returned logits table lands in LuaJIT's array part, which tops out near 2^27 entries, so a
+    # 262144-wide vocab overflows at ~512 prompt tokens (BACKLOG.md P4.0.14). Retaining and then
+    # reducing by name says the same two things separately, which is why the fused
+    # `loom.run_subgraph_argmax` that used to say them at once no longer exists.
     retain: bool = False
 
     def defines(self) -> list[str]:
@@ -302,8 +323,6 @@ class SubgraphCall(Stmt):
             out.extend(e.reads())
         for v in self.inputs.values():
             out.extend(v.reads())
-        if self.argmax_row is not None:
-            out.extend(self.argmax_row.reads())
         return out
 
 
@@ -455,14 +474,41 @@ def _topology_output_names(topo: dict) -> list:
     return []
 
 
+def _own_exprs(stmt: Stmt):
+    """Every `Expr` reachable from `stmt`'s own fields, and deliberately NOT the statements of a nested
+    `If`/`While` body -- those are walked by the caller, which is the only place the enclosing retention
+    state is known.
+
+    Generic over dataclass fields rather than a per-node-type dispatch, so an expression node added
+    later is covered the day it is added rather than the day someone remembers this function exists.
+    """
+    def rec(node):
+        if isinstance(node, Stmt):
+            return
+        if isinstance(node, Expr):
+            yield node
+            for f in dataclasses.fields(node):
+                yield from rec(getattr(node, f.name))
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                yield from rec(v)
+        elif isinstance(node, dict):
+            for v in node.values():
+                yield from rec(v)
+
+    for f in dataclasses.fields(stmt):
+        yield from rec(getattr(stmt, f.name))
+
+
 def _check_retained_reads(function: Function, topologies: dict) -> None:
     """The static adjacency rule for retained outputs (BACKLOG.md P4.0.12).
 
-    An `OutputRef` names a module rather than a local, so `validate()` -- which knows only about symbols
-    -- cannot see it at all. What replaces it here is the same question asked about modules: a reference
-    to module M's retained output must sit between the `retain=True` call that produced it and the next
-    one that overwrites it. Getting that wrong is the failure mode retention introduces and marshalling
-    could not have: the read succeeds and quietly returns newer data.
+    An `OutputRef` (another module's input) and a `RetainedArgmax` (the epilogue's reduction) both name a
+    module rather than a local, so `validate()` -- which knows only about symbols -- cannot see either at
+    all. What replaces it here is the same question asked about modules: a reference to module M's
+    retained output must sit between the `retain=True` call that produced it and the next one that
+    overwrites it. Getting that wrong is the failure mode retention introduces and marshalling could not
+    have: the read succeeds and quietly returns newer data.
 
     Deliberately a *conservative* walk rather than a dataflow analysis. Retention is tracked in
     statement order within a block; a nested `If`/`While` body inherits a copy of the enclosing state,
@@ -473,6 +519,17 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
     """
     def walk(stmts: list, produced: dict) -> None:
         for stmt in stmts:
+            # A `RetainedArgmax` can sit anywhere an expression can (a `Return`, a `Local`), so it is
+            # found by scanning the statement rather than by knowing which statement types carry one.
+            for expr in _own_exprs(stmt):
+                if isinstance(expr, RetainedArgmax) and expr.module not in produced:
+                    raise DriverIRError(
+                        f"driver IR: loom.argmax_row('{expr.module}', ...) reduces the retained output "
+                        f"of module '{expr.module}', but no earlier "
+                        f"loom.run_subgraph_and_retain('{expr.module}', ...) runs in the same "
+                        f"straight-line block -- a retained output only exists between the "
+                        f"run that produced it and the next run of that module"
+                    )
             if isinstance(stmt, If):
                 walk(stmt.then, dict(produced))
                 walk(stmt.else_, dict(produced))
@@ -549,16 +606,6 @@ def check_subgraph_calls(function: Function, topologies: dict) -> None:
         # silently capture data values instead of shapes.
         declared_outputs = _topology_output_names(topo)
         n_declared = len(declared_outputs)
-        if call.argmax_row is not None:
-            # The reducing form returns ONE integer, not tensors -- so the data/shape pairing rule
-            # below does not apply and the only thing to check is that nothing asked for a shape.
-            if call.extra_outputs:
-                raise DriverIRError(
-                    f"driver IR: loom.run_subgraph_argmax('{call.module}', ...) requests "
-                    f"{len(call.extra_outputs)} shape output(s), but it returns a single token id and "
-                    "no tensor -- there is no shape to capture."
-                )
-            continue
         if len(call.outputs) > n_declared:
             raise DriverIRError(
                 f"driver IR: loom.run_subgraph('{call.module}', ...) captures {len(call.outputs)} data "
@@ -623,11 +670,6 @@ class LuaCodegen:
                 # a read to it -- which a synthesized driver does not, because `check_subgraph_calls`
                 # has already proved the adjacency statically.
                 return self._emit_run(stmt, "loom.run_subgraph_and_retain", prefix="", depth=depth)
-            if stmt.argmax_row is not None:
-                call = Call("loom.run_subgraph_argmax",
-                            [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs),
-                             stmt.argmax_row])
-                return [f"{pad}local {targets} = {call.render()}"]
             return self._emit_run(stmt, "loom.run_subgraph", prefix=f"local {targets} = ", depth=depth)
         if isinstance(stmt, Argmax):
             call = Call("loom.argmax_row", [Var(stmt.tensor), stmt.n_vocab, stmt.row])

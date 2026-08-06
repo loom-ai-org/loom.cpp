@@ -1339,8 +1339,9 @@ class LoomGGUFExporter:
         # same reason `GraphTopology::uses_kv_cache()` is derived on the engine side (decision 5): the
         # request to fuse and the presence of a fused node are two different facts, and a block the
         # pattern declined to match would otherwise get a decode loop with nothing to decode against.
+        cached = self._topology_uses_kv_cache(self.topologies["main_topology"])
         decode = None
-        if self._topology_uses_kv_cache(self.topologies["main_topology"]):
+        if cached:
             blockers = self._non_cached_sequence_state(self.topologies["main_topology"])
             if blockers:
                 print(f"  no infer_with_past: {', '.join(blockers)} mixes across the token axis with "
@@ -1349,20 +1350,19 @@ class LoomGGUFExporter:
             else:
                 decode = PrefillDecodeLoop(topology="main_topology", bindings=bindings,
                                            inputs=input_names, mask_windows=self.mask_windows)
+        # Retain and reduce by name for KV-cached topologies -- the causal LMs, whose vocab is what
+        # makes the Lua marshalling cap reachable at all (BACKLOG.md P4.0.14). Every other family keeps
+        # returning its tensor, so no ASR/TTS driver text moves. One `cached` for both halves: which
+        # component binds the logits and which one reads them is a single decision, and splitting it
+        # across two independently-computed conditions is how the two ends of an edge drift apart.
         self.driver_script = SYNTHESIZED_BUILDERS["Flattened"](
             inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
                                  mask_windows=self.mask_windows),
-            # Reduce engine-side for KV-cached topologies -- the causal LMs, whose vocab is what makes
-            # the Lua marshalling cap reachable at all (BACKLOG.md). Every other family keeps returning
-            # its tensor, so no ASR/TTS driver text moves.
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
-                                 argmax_row=(BinOp("-", n_tokens_expr, Lit(1))
-                                             if self._topology_uses_kv_cache(
-                                                 self.topologies["main_topology"]) else None)),
+                                 retained=cached),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
                                     n_tokens=n_tokens_expr,
-                                    already_reduced=self._topology_uses_kv_cache(
-                                        self.topologies["main_topology"])),
+                                    retained_module="main_topology" if cached else None),
             decode=decode,
         ).build(self._driver_context())
 
@@ -1464,7 +1464,7 @@ class LoomGGUFExporter:
 
         # 3. Prefix.
         #
-        # From here to step 7 every stage RETAINS its output (BACKLOG.md P4.0.12): a chain edge is a
+        # From here on every stage RETAINS its output (BACKLOG.md P4.0.12): a chain edge is a
         # `[n_embd, n_tokens]` hidden state the driver only threads onward, and marshalling it made two
         # copies of a value nobody looks at -- a device->host->device round trip per edge per step once
         # a second backend exists. Each stage's consumer therefore names the producing MODULE
@@ -1538,29 +1538,25 @@ class LoomGGUFExporter:
             ))
             chain_src = OutputRef(name)
 
-        # 7. The LAST stage is the one exception to step 3's rule, and marshals its output like before.
-        # Its output is not an intermediate: it is the logits the epilogue argmaxes, which is a host-side
-        # control decision. Reading even that engine-side is P4.0.14's own item, deliberately separate
-        # because it is what retires `loom.run_subgraph_argmax` -- adding a second reducing path to this
-        # builder now would leave two ways to get a token out of a forward pass.
+        # 7. The last stage is no exception (BACKLOG.md P4.0.14). Its output is not an intermediate --
+        # it is the logits the epilogue argmaxes, a genuinely host-side control decision -- but the
+        # *decision* is one integer, and marshalling a [n_vocab, n_tokens] table to compute it is what
+        # capped this path at ~2048 prompt tokens on a 65536-wide vocab. The epilogue reduces the
+        # retained output by module name instead, so the only value this chain ever moves across the
+        # boundary is the token id itself.
         #
-        # Capturing the shape alongside the data is what it always was: `_modular_final_shape[1]` is the
-        # output's ne0, i.e. the vocab size, and capturing a shape at all requires capturing every data
-        # output first (driver_ir.check_subgraph_calls' own rule).
-        final_out_var = "_modular_final_out"
-        final = stages[-1]
-        stages[-1] = ChainStage(
-            topology=final.topology, inputs=final.inputs,
-            outputs=(final_out_var,), extra_outputs=("_modular_final_shape",),
-        )
+        # `check_subgraph_calls` is what holds the two halves together: the epilogue names the module
+        # the last stage retained, and a mismatch is an export-time error rather than a read of
+        # something that was never stored.
+        final_module = stages[-1].topology
 
         # 8. Same argmax epilogue the monolithic path uses -- two of this builder's three components
-        # are shared with it, which is the smallest real instance of P4.0.7's reuse claim.
+        # are shared with it, which is the smallest real instance of P4.0.7's reuse claim, and since
+        # P4.0.14 they are shared in the same MODE as well: both paths retain and reduce by name.
         self.driver_script = SYNTHESIZED_BUILDERS["Modular"](
             inputs=DriverInputs(bindings=tuple(bindings), n_tokens=n_tokens_expr),
             chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens_expr),
-            epilogue=ArgmaxEpilogue(out_var=final_out_var, shape_var="_modular_final_shape",
-                                    n_tokens=n_tokens_expr),
+            epilogue=ArgmaxEpilogue(n_tokens=n_tokens_expr, retained_module=final_module),
         ).build(self._driver_context())
 
     def transpile_to_lua(self, func: Function, name="infer"):

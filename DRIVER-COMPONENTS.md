@@ -61,7 +61,7 @@ Three builders exist:
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
-| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 0 | 4 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, styletts2, supertonic, vits |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 6 | kokoro, matcha, styletts2, supertonic, vits |
@@ -79,7 +79,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 ### `monolithic_call` — `MonolithicCall`
 
-The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size.
+The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
 *Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
 
@@ -105,11 +105,11 @@ The `infer_with_past` generation loop: prefill, then decode one token at a time 
 
 ### `argmax_epilogue` — `ArgmaxEpilogue`
 
-Returns the next token rather than the raw logits: argmax over the active row, guarded for a topology whose output is not an array.
+Returns the next token rather than the raw logits: argmax over the active row, read out of the producing module's retained output by name, or -- for a topology that marshalled its tensor -- over the returned table, guarded for an output that is not an array.
 
 *Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
 
-* nothing — every field is `__unchecked__`, with its reason
+* `retained_module` — WhenSet(TopologyName)
 
 ### `raw_lua_driver` — `RawLuaDriver`
 

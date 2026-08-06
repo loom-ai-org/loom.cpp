@@ -178,7 +178,6 @@ private:
     // lua_bridge.cpp's own top comment for why every one of these MUST convert C++ exceptions to
     // `luaL_error` internally rather than let them unwind through the Lua C API.
     static int l_run_subgraph(lua_State* L);
-    static int l_run_subgraph_argmax(lua_State* L);
     // `loom.run_subgraph_and_retain(module, axes, inputs)`: runs `module` exactly as `loom.run_subgraph`
     // does, but instead of marshalling its outputs into Lua tables, leaves them in the module's own persistent
     // OutputStore and returns a single number -- the store's generation counter for this run. Nothing

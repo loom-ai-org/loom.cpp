@@ -143,7 +143,9 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ComponentEntry(
             "monolithic_call", MonolithicCall, (STATEMENTS,),
             "The single `run_subgraph` call a flattened export's driver makes, capturing the output's "
-            "shape alongside its data so the epilogue knows the vocab size.",
+            "shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached "
+            "topology, retaining the output engine-side and binding nothing, so the logits never "
+            "become a Lua table at all.",
         ),
         ComponentEntry(
             "modular_chain", ModularChain, (STATEMENTS,),
@@ -162,8 +164,9 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ),
         ComponentEntry(
             "argmax_epilogue", ArgmaxEpilogue, (STATEMENTS,),
-            "Returns the next token rather than the raw logits: argmax over the active row, guarded "
-            "for a topology whose output is not an array.",
+            "Returns the next token rather than the raw logits: argmax over the active row, read out "
+            "of the producing module's retained output by name, or -- for a topology that marshalled "
+            "its tensor -- over the returned table, guarded for an output that is not an array.",
         ),
         # -- adopting and peeling a hand-written driver (C.3-C.8) ------------------------------------
         ComponentEntry(

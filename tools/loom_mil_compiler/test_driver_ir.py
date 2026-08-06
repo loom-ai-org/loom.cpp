@@ -4,8 +4,8 @@ SubgraphCall/Function IR rather than tracing a real model."""
 import unittest
 
 from driver_ir import (
-    ArrayLit, Call, CallStmt, DriverIRError, Function, If, Lit, Local, LuaCodegen, OutputRef,
-    SubgraphCall, Var, While, check_subgraph_calls, validate,
+    ArrayLit, BinOp, Call, CallStmt, DriverIRError, Function, If, Len, Lit, Local, LuaCodegen,
+    OutputRef, RetainedArgmax, Return, SubgraphCall, Var, While, check_subgraph_calls, validate,
 )
 
 
@@ -166,6 +166,63 @@ class TestRetainedOutputAdjacency(unittest.TestCase):
             ["    loom.run_subgraph_and_retain('prefix', {}, {x = {from = 'tok'}})"],
         )
         self.assertEqual(stmt.defines(), [])
+
+
+class TestRetainedArgmax(unittest.TestCase):
+    """The other reference by module name (BACKLOG.md P4.0.14) -- the epilogue's reduction rather than
+    an inter-module edge. Same blind spot in `validate()`, so the same checker has to cover it."""
+
+    def _topos(self):
+        return {"a": _topo(inputs=["tok"], output="logits")}
+
+    def test_it_renders_as_the_module_form_of_argmax_row(self):
+        expr = RetainedArgmax("a", BinOp("-", Len("tokens"), Lit(1)))
+        self.assertEqual(expr.render(), "loom.argmax_row('a', (#tokens - 1))")
+
+    def test_it_reads_the_row_expression_and_not_the_module(self):
+        """A module is not a symbol: reporting one as read would make `validate()` demand a local of
+        that name, and the row expression is the only thing here an earlier statement really binds."""
+        self.assertEqual(RetainedArgmax("a", Len("tokens")).reads(), ["tokens"])
+
+    def test_reducing_a_module_that_retained_is_fine(self):
+        fn = Function("infer", ["inputs"], [
+            _retain("a", {"tok": Var("inputs")}),
+            Return([RetainedArgmax("a", Lit(0))]),
+        ])
+        check_subgraph_calls(fn, self._topos())  # must not raise
+
+    def test_reducing_a_module_nothing_retained_raises(self):
+        """The half of P4.0.14's decision the exporter could get wrong on its own: an epilogue naming a
+        module whose producing call still marshals. At runtime the bridge raises "has no retained
+        outputs"; this is the same error, at export time."""
+        fn = Function("infer", ["inputs"], [
+            SubgraphCall(outputs=["out"], module="a", axes={}, inputs={"tok": Var("inputs")}),
+            Return([RetainedArgmax("a", Lit(0))]),
+        ])
+        with self.assertRaises(DriverIRError) as raised:
+            check_subgraph_calls(fn, self._topos())
+        self.assertIn("loom.argmax_row('a', ...)", str(raised.exception))
+
+    def test_a_reduction_inside_a_loop_sees_the_producer_in_the_same_body(self):
+        """`infer_with_past`'s exact shape: retain and reduce are two statements in one loop body, and
+        the producer is the statement right before the read on every iteration."""
+        fn = Function("infer", ["inputs"], [
+            While(cond=Lit(True), body=[
+                _retain("a", {"tok": Var("inputs")}),
+                Local("next", RetainedArgmax("a", Lit(0))),
+            ]),
+        ])
+        check_subgraph_calls(fn, self._topos())  # must not raise
+
+    def test_a_producer_only_inside_a_branch_does_not_escape_it(self):
+        """Same conservatism `OutputRef` gets, and for the same reason -- this is one walk, not two."""
+        fn = Function("infer", ["inputs"], [
+            If(cond=Lit(True), then=[_retain("a", {"tok": Var("inputs")})]),
+            Return([RetainedArgmax("a", Lit(0))]),
+        ])
+        with self.assertRaises(DriverIRError) as raised:
+            check_subgraph_calls(fn, self._topos())
+        self.assertIn("straight-line block", str(raised.exception))
 
 
 if __name__ == "__main__":
