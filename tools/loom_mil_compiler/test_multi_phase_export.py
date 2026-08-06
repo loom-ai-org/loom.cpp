@@ -149,10 +149,13 @@ class TestRecurrentPhase(unittest.TestCase):
         lstm = torch.nn.LSTM(input_dim, hidden, batch_first=True, bidirectional=bidirectional)
         return RecurrentPhase(name=name, module=lstm, input_dim=input_dim)
 
-    def test_a_bidirectional_module_yields_the_four_cells_run_bi_lstm_drives(self):
+    def test_a_bidirectional_module_yields_the_two_cells_run_bi_lstm_drives(self):
         topologies, weights = self._lstm_phase().topologies()
-        self.assertEqual(sorted(topologies), ["enc_lstm_c_bwd", "enc_lstm_c_fwd",
-                                              "enc_lstm_h_bwd", "enc_lstm_h_fwd"])
+        self.assertEqual(sorted(topologies), ["enc_lstm_bwd", "enc_lstm_fwd"])
+        # ONE topology per direction, each declaring both `h_new` and `c_new` -- it was four before,
+        # two of which recomputed the other two's node list to read the other half of the same step.
+        self.assertEqual([t["outputs"] for t in topologies.values()],
+                         [["h_new", "c_new"], ["h_new", "c_new"]])
         # Exactly the names `loom_lua`'s run_bi_lstm composes, so a driver calling
         # run_bi_lstm("enc_lstm", ...) needs no change at all.
         self.assertEqual(sorted(weights), [
@@ -160,16 +163,16 @@ class TestRecurrentPhase(unittest.TestCase):
             "enc_lstm.fwd.bias", "enc_lstm.fwd.weight_hh", "enc_lstm.fwd.weight_ih",
         ])
 
-    def test_a_unidirectional_module_yields_two(self):
+    def test_a_unidirectional_module_yields_one(self):
         topologies, _ = self._lstm_phase(bidirectional=False).topologies()
-        self.assertEqual(sorted(topologies), ["enc_lstm_c_fwd", "enc_lstm_h_fwd"])
+        self.assertEqual(sorted(topologies), ["enc_lstm_fwd"])
 
     def test_input_dim_defaults_to_the_module_s_own(self):
         """So an nn.LSTM never restates it, and a wrong value is impossible rather than checked."""
         phase = self._lstm_phase(input_dim=6)
         phase.input_dim = None
         topologies, _ = phase.topologies()
-        self.assertEqual(len(topologies), 4)
+        self.assertEqual(len(topologies), 2)
 
     def test_a_wrong_explicit_input_dim_is_torch_s_error_not_ours(self):
         """The trace runs at the declared width, so torch raises first -- naming both numbers, which is

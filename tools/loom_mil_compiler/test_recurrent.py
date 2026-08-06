@@ -23,9 +23,10 @@ from loom_mil_compiler.recurrent import build_lstm_cell_topologies
 
 
 def _run_topology(topo: dict, weights: dict, inputs: dict) -> np.ndarray:
-    """Minimal interpreter for exactly the node ops a cell topology from recurrent.py uses. Not a
-    general-purpose GraphBuilder replacement -- just enough to execute what build_lstm_cell_topologies
-    actually emits, as a numpy-level stand-in for the real ggml engine."""
+    """Minimal interpreter for exactly the node ops a cell topology from recurrent.py uses, returning
+    `{declared output name: value}`. Not a general-purpose GraphBuilder replacement -- just enough to
+    execute what build_lstm_cell_topologies actually emits, as a numpy-level stand-in for the real ggml
+    engine."""
     values = dict(weights)
     values.update(inputs)
     for node in topo["nodes"]:
@@ -48,7 +49,9 @@ def _run_topology(topo: dict, weights: dict, inputs: dict) -> np.ndarray:
             values[outs[0]] = np.tanh(values[ins[0]])
         else:
             raise NotImplementedError(f"test interpreter doesn't know op '{op}'")
-    return values[topo["output"]]
+    # Every declared output, by name: a cell topology now declares both halves of the step, and the
+    # point of the change is that ONE evaluation of this node list yields both.
+    return {name: values[name] for name in topo["outputs"]}
 
 
 def _trace_lstm_op(hidden_dim, input_dim, seq_len, bidirectional):
@@ -84,15 +87,17 @@ class TestLstmRecurrent(unittest.TestCase):
         self.assertEqual(result["bidirectional"], bidirectional)
         self.assertEqual(result["hidden_dim"], hidden_dim)
 
-        def run_direction(topos, reverse: bool) -> np.ndarray:
+        def run_direction(topo, reverse: bool) -> np.ndarray:
             h = np.zeros(hidden_dim, dtype=np.float32)
             c = np.zeros(hidden_dim, dtype=np.float32)
             out = np.zeros((seq_len, hidden_dim), dtype=np.float32)
             order = range(seq_len - 1, -1, -1) if reverse else range(seq_len)
             for t in order:
                 inputs = {"layer_input": x_np[t], "h_prev": h, "c_prev": c}
-                h_new = _run_topology(topos["h"], result["weights"], inputs)
-                c_new = _run_topology(topos["c"], result["weights"], inputs)
+                # One topology, both outputs -- the interpreter reads each declared name out of the
+                # same evaluated node list, which is exactly what the engine now does per call.
+                values = _run_topology(topo, result["weights"], inputs)
+                h_new, c_new = values["h_new"], values["c_new"]
                 h, c = h_new, c_new
                 out[t] = h
             return out

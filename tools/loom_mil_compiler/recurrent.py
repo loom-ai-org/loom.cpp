@@ -67,13 +67,22 @@ def _require_activation(op, key, expected: str, op_label: str) -> None:
         )
 
 
-def _lstm_cell_topology(output_name: str, hidden_dim: int, input_dim: int, weight_prefix: str) -> dict:
+def _lstm_cell_topology(hidden_dim: int, input_dim: int, weight_prefix: str) -> dict:
     """One LSTM cell step, gate order [i, f, o, z] (MIL's own `lstm` op convention -- see module
-    docstring), single pre-summed `weight_prefix + 'bias'`. `output_name` in {"h_new", "c_new"} selects
-    which of the step's two outputs this particular topology declares -- mirroring
-    convert_kokoro_duration_predictor.py's build_lstm_cell_topology, which builds the identical full node
-    list for both and just varies the declared output (unpruned, matching that established precedent)."""
-    assert output_name in ("h_new", "c_new")
+    docstring), single pre-summed `weight_prefix + 'bias'`.
+
+    **Declares BOTH outputs, which halves the work of every LSTM in this project.** A cell step computes
+    `h_new` and `c_new` from one gate stack, but `GraphTopology` allowed only one declared output when
+    this was written, so the established precedent (convert_kokoro_duration_predictor.py's own
+    `build_lstm_cell_topology`) was to emit the identical node list twice and vary only the declared
+    output -- and every caller then ran both, computing the gates, the four VIEWs and the six
+    elementwise ops a second time to read the other half of the same result. P2 added multi-output
+    topologies; this is that precedent retired. Kokoro and StyleTTS2 each drive six BiLSTMs over a whole
+    sequence, so it is not a marginal saving.
+
+    Output ORDER is the contract: `["h_new", "c_new"]`, which is what `run_bi_lstm`'s two capture
+    variables and `l_run_recurrent`'s two reads both assume, and what `{from = ..., index = 2}` means
+    for a caller threading the cell state onward."""
     h = hidden_dim
     f32 = 4
     return {
@@ -83,7 +92,7 @@ def _lstm_cell_topology(output_name: str, hidden_dim: int, input_dim: int, weigh
             {"name": "h_prev", "dtype": "f32", "shape": [str(h)]},
             {"name": "c_prev", "dtype": "f32", "shape": [str(h)]},
         ],
-        "output": output_name,
+        "outputs": ["h_new", "c_new"],
         "nodes": [
             {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_ih", "layer_input"], "outputs": ["gates_x"]},
             {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_hh", "h_prev"], "outputs": ["gates_h"]},
@@ -112,8 +121,8 @@ def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
     `write_bilstm_ggufs` uses per-instance today). Returns:
         {
             "hidden_dim": H, "input_dim": I, "bidirectional": bool,
-            "forward": {"h": topo_json, "c": topo_json},
-            "backward": {"h": topo_json, "c": topo_json} | None,
+            "forward": topo_json,          # declares BOTH outputs, in the order ["h_new", "c_new"]
+            "backward": topo_json | None,   # same, for the reverse direction of a bidirectional LSTM
             "weights": {namespaced_tensor_name: np.ndarray},
         }
     """
@@ -137,10 +146,7 @@ def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
         weights[f"{prefix}weight_ih"] = np.asarray(ih, dtype=np.float32)
         weights[f"{prefix}weight_hh"] = np.asarray(hh, dtype=np.float32)
         weights[f"{prefix}bias"] = np.asarray(bias, dtype=np.float32)
-        return {
-            "h": _lstm_cell_topology("h_new", hidden_dim, input_dim, prefix),
-            "c": _lstm_cell_topology("c_new", hidden_dim, input_dim, prefix),
-        }
+        return _lstm_cell_topology(hidden_dim, input_dim, prefix)
 
     forward_topos = _register_direction(
         "fwd.", op.inputs["weight_ih"].val, op.inputs["weight_hh"].val,

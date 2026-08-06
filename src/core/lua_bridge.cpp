@@ -427,38 +427,31 @@ int LoomLuaBridge::l_get_output(lua_State* L) {
 int LoomLuaBridge::l_run_recurrent(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
-        const char* h_module_name = luaL_checkstring(L, 1);
-        const char* c_module_name = luaL_checkstring(L, 2);
-        const std::vector<double> sequence = read_number_array(L, 3);
-        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 4));
-        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
-        const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 6));
-        const bool reverse = lua_toboolean(L, 7) != 0;
+        const char* module_name = luaL_checkstring(L, 1);
+        const std::vector<double> sequence = read_number_array(L, 2);
+        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 3));
+        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 4));
+        const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
+        const bool reverse = lua_toboolean(L, 6) != 0;
 
         if (sequence.size() != static_cast<size_t>(seq_len) * input_dim) {
             return luaL_error(L, "loom.run_recurrent: sequence has %d elements, expected seq_len*input_dim=%d",
                                static_cast<int>(sequence.size()), static_cast<int>(seq_len * input_dim));
         }
 
-        const auto h_it = self->modules_.find(h_module_name);
-        if (h_it == self->modules_.end()) {
-            return luaL_error(L, "loom.run_recurrent: unregistered module '%s'", h_module_name);
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "loom.run_recurrent: unregistered module '%s'", module_name);
         }
-        const auto c_it = self->modules_.find(c_module_name);
-        if (c_it == self->modules_.end()) {
-            return luaL_error(L, "loom.run_recurrent: unregistered module '%s'", c_module_name);
-        }
-        Module& h_mod = h_it->second;
-        Module& c_mod = c_it->second;
+        Module& mod = it->second;
 
-        // Each cell module's own persistent builder (BACKLOG.md P4.0.13), the same one every other
+        // The cell module's own persistent builder (BACKLOG.md P4.0.13), the same one every other
         // binding uses. build() is still called once per timestep below -- a step's h/c depend on the
         // PREVIOUS step's real output values, so each timestep genuinely needs its own compute -- but
         // the axes never move across a sequence, so every call after the first is served from the
         // retained graph. This is the loop that gains the most from that: one rebuild per direction
         // instead of one per timestep.
-        GraphBuilder& h_builder = self->module_builder(h_mod);
-        GraphBuilder& c_builder = self->module_builder(c_mod);
+        GraphBuilder& builder = self->module_builder(mod);
 
         std::vector<float> h(hidden_dim, 0.0f);
         std::vector<float> c(hidden_dim, 0.0f);
@@ -476,28 +469,32 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
                 layer_input[k] = static_cast<float>(sequence[static_cast<size_t>(t) * input_dim + k]);
             }
 
-            const GraphBuilder::BuildResult& hr = h_builder.build({{"n_tokens", 0}, {"n_past", 0}});
-            ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0,
+            // ONE build and ONE compute per timestep: the cell topology declares both `h_new` and
+            // `c_new`, so the gate stack is evaluated once and both halves of the step are read off
+            // the same result. It was two of each until the topology gained its second declared
+            // output -- the same node list computed twice per timestep, per direction, per BiLSTM
+            // (see recurrent.py::_lstm_cell_topology).
+            const GraphBuilder::BuildResult& r = builder.build({{"n_tokens", 0}, {"n_past", 0}});
+            ggml_backend_tensor_set(r.input_tensors.at("layer_input"), layer_input.data(), 0,
                                      layer_input.size() * sizeof(float));
-            ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
-            ggml_backend_tensor_set(hr.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
-            ggml_backend_graph_compute(h_mod.backend, hr.graph);
-            std::vector<float> h_new(hidden_dim);
-            ggml_backend_tensor_get(hr.output, h_new.data(), 0, h_new.size() * sizeof(float));
+            ggml_backend_tensor_set(r.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
+            ggml_backend_tensor_set(r.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
+            ggml_backend_graph_compute(mod.backend, r.graph);
 
-            const GraphBuilder::BuildResult& cr = c_builder.build({{"n_tokens", 0}, {"n_past", 0}});
-            ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0,
-                                     layer_input.size() * sizeof(float));
-            ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
-            ggml_backend_tensor_set(cr.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
-            ggml_backend_graph_compute(c_mod.backend, cr.graph);
+            if (r.outputs.size() < 2) {
+                return luaL_error(L, "loom.run_recurrent: module '%s' declares %d output(s); a cell "
+                                      "topology must declare both 'h_new' and 'c_new', in that order",
+                                   module_name, static_cast<int>(r.outputs.size()));
+            }
+            std::vector<float> h_new(hidden_dim);
             std::vector<float> c_new(hidden_dim);
-            ggml_backend_tensor_get(cr.output, c_new.data(), 0, c_new.size() * sizeof(float));
+            ggml_backend_tensor_get(r.outputs[0], h_new.data(), 0, h_new.size() * sizeof(float));
+            ggml_backend_tensor_get(r.outputs[1], c_new.data(), 0, c_new.size() * sizeof(float));
 
             h = h_new;
             c = c_new;
             for (uint32_t k = 0; k < hidden_dim; ++k) {
-                out[static_cast<size_t>(t) * hidden_dim + k] = h[k];
+                out[static_cast<size_t>(t) * hidden_dim + k] = static_cast<double>(h[k]);
             }
         }
 

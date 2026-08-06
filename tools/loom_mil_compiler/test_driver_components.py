@@ -978,13 +978,12 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
         return TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
                                      architecture="kokoro")
 
-    def test_a_bilstm_namespace_expands_to_its_four_cell_topologies(self):
+    def test_a_bilstm_namespace_expands_to_its_two_cell_topologies(self):
         fragment = next(f for f in self._fragments(self._kokoro())
                         if f.path.name == "03_frame_expansion.lua")
         call, = fragment.drives
         self.assertEqual([c.topology for c in call.expand()],
-                         ["text_encoder_lstm_h_fwd", "text_encoder_lstm_c_fwd",
-                          "text_encoder_lstm_h_bwd", "text_encoder_lstm_c_bwd"])
+                         ["text_encoder_lstm_fwd", "text_encoder_lstm_bwd"])
         self.assertEqual(call.expand()[0].inputs, ("layer_input", "h_prev", "c_prev"))
 
     def test_a_loop_declares_every_namespace_it_iterates(self):
@@ -993,7 +992,7 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
         lstm = next(d for d in fragment.drives if getattr(d, "helper", None) == "run_bi_lstm"
                     and len(d.names()) == 3)
         self.assertEqual([c.topology for c in lstm.expand()][:2],
-                         ["duration_lstm_0_h_fwd", "duration_lstm_0_c_fwd"])
+                         ["duration_lstm_0_fwd", "duration_lstm_0_bwd"])
         adaln = next(d for d in fragment.drives if not hasattr(d, "helper"))
         self.assertEqual([c.topology for c in adaln.expand()],
                          ["duration_adaln_0", "duration_adaln_1", "duration_adaln_2"])
@@ -1053,7 +1052,7 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
         with self.assertRaises(LinkError) as raised:
             checker.provide(topologies={"text_encoder_cnn": _topo(["tokens"])})
         message = str(raised.exception)
-        self.assertIn("text_encoder_lstm_h_fwd", message)
+        self.assertIn("text_encoder_lstm_fwd", message)
         self.assertIn("via run_bi_lstm", message)
 
     def test_an_unknown_helper_is_reported_rather_than_expanding_to_nothing(self):
@@ -1067,15 +1066,20 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
 
 class TestPeeledDriverCoverage(unittest.TestCase):
     def test_every_exported_topology_is_named_by_a_checked_call_site(self):
-        """Kokoro's own numbers, without an export: 39 topologies, and the driver names all of them
-        once the computed sites are declared. Four before D.2."""
+        """Kokoro's own numbers, without an export: 27 topologies, and the driver names all of them
+        once the computed sites are declared. Four before D.2.
+
+        It was 39 until the LSTM cell topologies gained their second declared output: Kokoro drives six
+        BiLSTMs, each of which was four topologies (`_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`) and is now two
+        (`_fwd`/`_bwd`) -- 6 x 2 fewer. The halved ones were never a second computation the model
+        needed, only a second declaration of the same one."""
         from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
 
         config = TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
                                        architecture="kokoro")
         builder = MultiPhaseDriverBuilder(peeled=config.driver_components())
         called = builder.called_topologies()
-        self.assertEqual(len(called), 39)
+        self.assertEqual(len(called), 27)
         for name in ("albert_bert_encoder", "decoder_vocoder", "text_encoder_cnn", "duration_proj",
-                     "duration_adaln_2", "top_lstm_c_bwd", "f0n_f0_block2", "f0n_n_proj"):
+                     "duration_adaln_2", "top_lstm_bwd", "f0n_f0_block2", "f0n_n_proj"):
             self.assertIn(name, called)

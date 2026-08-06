@@ -198,15 +198,17 @@ private:
     // number the producing `loom.run_subgraph_and_retain` returned; passing it turns "this module was
     // re-run in between and I am silently reading newer data" into an error.
     static int l_get_output(lua_State* L);
-    // `loom.run_recurrent(h_module, c_module, sequence_flat, seq_len, input_dim, hidden_dim, reverse)`:
+    // `loom.run_recurrent(module, sequence_flat, seq_len, input_dim, hidden_dim, reverse)`:
     // steps an LSTM cell over `sequence_flat` (a flat, row-major (seq_len, input_dim) array) one
     // timestep at a time, threading hidden/cell state between GraphBuilder rebuilds exactly like
-    // BiLstmStepper's own lstm_cell_step (src/core/bilstm_stepper.cpp) does -- generalized to run off
-    // topology NAMES already registered via register_module, the same lookup l_run_subgraph itself uses,
-    // instead of BiLstmStepper's own hardcoded 4-GGUF constructor. `h_module`/`c_module` must be the
-    // per-timestep cell topologies tools/loom_mil_compiler/recurrent.py's build_lstm_cell_topologies()
-    // produces (declaring "layer_input"/"h_prev"/"c_prev" inputs and an "h_new"/"c_new" output
-    // respectively). `reverse=true` walks timesteps backward (seq_len-1 down to 0), writing each result
+    // BiLstmStepper's own lstm_cell_step (src/core/bilstm_stepper.cpp) does -- generalized to run off a
+    // topology NAME already registered via register_module, the same lookup l_run_subgraph itself uses,
+    // instead of BiLstmStepper's own hardcoded 4-GGUF constructor. `module` must be a per-timestep cell
+    // topology as tools/loom_mil_compiler/recurrent.py's build_lstm_cell_topologies() produces:
+    // "layer_input"/"h_prev"/"c_prev" inputs, and BOTH "h_new" and "c_new" as declared outputs, in that
+    // order. It took two module names until the topology gained its second output -- one call for each
+    // half of a step whose node lists were identical, so the gate stack was computed twice per timestep.
+    // `reverse=true` walks timesteps backward (seq_len-1 down to 0), writing each result
     // to its own real time index in the (still forward-ordered) output -- the same convention
     // BiLstmStepper::run uses for its own backward pass. Returns (output_flat, shape) where output_flat
     // is a flat (seq_len, hidden_dim) array and shape is [hidden_dim, seq_len, 1, 1] (ggml ne[] order,

@@ -210,7 +210,7 @@ namespace their caller passes, and that column is the shape a caller's `HelperCa
 | `pad_last_to_multiple` | — | — | matcha |
 | `repeat_by_duration_tfast` | — | — | matcha |
 | `predict_durations` | `sigmoid`, `round_half_to_even` | — | kokoro, styletts2 |
-| `run_bi_lstm` | — | `<ns>_h_fwd`, `<ns>_c_fwd`, `<ns>_h_bwd`, `<ns>_c_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
+| `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
 | `run_resblk_stack` | `to_layout_a`, `from_layout_a` | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
 | `run_proj1x1` | `to_layout_a` | `<ns>` ← `x` | kokoro, styletts2 |
 | `compute_wsum` | — | — | kokoro, styletts2 |

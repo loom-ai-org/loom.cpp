@@ -52,6 +52,18 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
     std::vector<std::vector<float>> c(num_layers_, std::vector<float>(pred_hidden_, 0.0f));
     int32_t last_label = cfg_.blank_id; // NeMo's own SOS sentinel for the very first step
 
+    // **The prediction network runs once per EMITTED TOKEN, not once per frame.** Its output is a pure
+    // function of (last_label, h, c), and all three change only when a token is emitted -- on a blank
+    // the loop below discards `h_new`/`c_new`, advances the frame and recomputes the identical values
+    // from the identical inputs on the next iteration. Most frames of real audio are blank, so that was
+    // the bulk of the work this decoder did. Caching it is what NeMo's own implementation does, and it
+    // is a pure speedup: the equivalence is that the discarded recompute could not have differed.
+    //
+    // `pred_valid` starts false so the first frame computes it, which is also the only time the state
+    // is the zero/SOS one.
+    std::vector<float> top_h;
+    bool pred_valid = false;
+
     const auto n_frames = static_cast<uint32_t>(encoder_output.size());
     const auto n_durations = static_cast<uint32_t>(cfg_.durations.size());
 
@@ -62,42 +74,52 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
         uint32_t symbols_added = 0;
         bool advanced = false;
         while (symbols_added < cfg_.max_symbols_per_step) {
-            // Run the LSTM stack: layer 0 embeds `last_label`; layer i>0 takes layer i-1's h_new as its
-            // own "layer_input" -- no fresh embedding lookup partway up the stack.
-            std::vector<std::vector<float>> h_new(num_layers_);
-            std::vector<std::vector<float>> c_new(num_layers_);
-            std::vector<float> layer_input; // only populated/used for layers > 0
+            if (!pred_valid) {
+                // Run the LSTM stack: layer 0 embeds `last_label`; layer i>0 takes layer i-1's h_new as
+                // its own "layer_input" -- no fresh embedding lookup partway up the stack.
+                //
+                // Committed straight into `h`/`c` rather than into temporaries the caller might discard:
+                // reaching here at all means the state is about to become the current one, which is the
+                // condition the old code expressed the other way round by computing unconditionally and
+                // throwing the result away on a blank.
+                std::vector<std::vector<float>> h_new(num_layers_);
+                std::vector<std::vector<float>> c_new(num_layers_);
+                std::vector<float> layer_input; // only populated/used for layers > 0
 
-            for (uint32_t layer = 0; layer < num_layers_; ++layer) {
-                const GraphBuilder::BuildResult& hr = lstm_h_builders_[layer]->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
-                if (layer == 0) {
-                    ggml_backend_tensor_set(hr.input_tensors.at("last_label"), &last_label, 0, sizeof(int32_t));
-                } else {
-                    ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0,
-                                             layer_input.size() * sizeof(float));
+                for (uint32_t layer = 0; layer < num_layers_; ++layer) {
+                    const GraphBuilder::BuildResult& hr = lstm_h_builders_[layer]->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
+                    if (layer == 0) {
+                        ggml_backend_tensor_set(hr.input_tensors.at("last_label"), &last_label, 0, sizeof(int32_t));
+                    } else {
+                        ggml_backend_tensor_set(hr.input_tensors.at("layer_input"), layer_input.data(), 0,
+                                                 layer_input.size() * sizeof(float));
+                    }
+                    ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h[layer].data(), 0, h[layer].size() * sizeof(float));
+                    ggml_backend_tensor_set(hr.input_tensors.at("c_prev"), c[layer].data(), 0, c[layer].size() * sizeof(float));
+                    ggml_backend_graph_compute(backend_, hr.graph);
+                    h_new[layer].resize(pred_hidden_);
+                    ggml_backend_tensor_get(hr.output, h_new[layer].data(), 0, h_new[layer].size() * sizeof(float));
+
+                    const GraphBuilder::BuildResult& cr = lstm_c_builders_[layer]->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
+                    if (layer == 0) {
+                        ggml_backend_tensor_set(cr.input_tensors.at("last_label"), &last_label, 0, sizeof(int32_t));
+                    } else {
+                        ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0,
+                                                 layer_input.size() * sizeof(float));
+                    }
+                    ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h[layer].data(), 0, h[layer].size() * sizeof(float));
+                    ggml_backend_tensor_set(cr.input_tensors.at("c_prev"), c[layer].data(), 0, c[layer].size() * sizeof(float));
+                    ggml_backend_graph_compute(backend_, cr.graph);
+                    c_new[layer].resize(pred_hidden_);
+                    ggml_backend_tensor_get(cr.output, c_new[layer].data(), 0, c_new[layer].size() * sizeof(float));
+
+                    layer_input = h_new[layer]; // feeds the next layer, if any
                 }
-                ggml_backend_tensor_set(hr.input_tensors.at("h_prev"), h[layer].data(), 0, h[layer].size() * sizeof(float));
-                ggml_backend_tensor_set(hr.input_tensors.at("c_prev"), c[layer].data(), 0, c[layer].size() * sizeof(float));
-                ggml_backend_graph_compute(backend_, hr.graph);
-                h_new[layer].resize(pred_hidden_);
-                ggml_backend_tensor_get(hr.output, h_new[layer].data(), 0, h_new[layer].size() * sizeof(float));
-
-                const GraphBuilder::BuildResult& cr = lstm_c_builders_[layer]->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
-                if (layer == 0) {
-                    ggml_backend_tensor_set(cr.input_tensors.at("last_label"), &last_label, 0, sizeof(int32_t));
-                } else {
-                    ggml_backend_tensor_set(cr.input_tensors.at("layer_input"), layer_input.data(), 0,
-                                             layer_input.size() * sizeof(float));
-                }
-                ggml_backend_tensor_set(cr.input_tensors.at("h_prev"), h[layer].data(), 0, h[layer].size() * sizeof(float));
-                ggml_backend_tensor_set(cr.input_tensors.at("c_prev"), c[layer].data(), 0, c[layer].size() * sizeof(float));
-                ggml_backend_graph_compute(backend_, cr.graph);
-                c_new[layer].resize(pred_hidden_);
-                ggml_backend_tensor_get(cr.output, c_new[layer].data(), 0, c_new[layer].size() * sizeof(float));
-
-                layer_input = h_new[layer]; // feeds the next layer, if any
+                h = std::move(h_new);
+                c = std::move(c_new);
+                top_h = h[num_layers_ - 1];
+                pred_valid = true;
             }
-            const std::vector<float>& top_h = h_new[num_layers_ - 1];
 
             const GraphBuilder::BuildResult& j_res = joint_builder_->build({{"n_tokens", /*n_tokens=*/0}, {"n_past", /*n_past=*/0}});
             ggml_backend_tensor_set(j_res.input_tensors.at("encoder_frame"), frame.data(), 0, frame.size() * sizeof(float));
@@ -127,9 +149,8 @@ TdtDecoder::Result TdtDecoder::decode_greedy(const std::vector<std::vector<float
             if (k != cfg_.blank_id) {
                 result.tokens.push_back(k);
                 result.frame_indices.push_back(time_idx);
-                h = h_new;
-                c = c_new;
                 last_label = k;
+                pred_valid = false; // `last_label` moved, so the cached prediction no longer applies
                 if (n_durations == 0) skip = 0; // plain RNN-T: stay on this frame after a non-blank emission
             } else if (skip == 0) {
                 skip = 1; // blank is forced to advance at least one frame -- otherwise decoding could spin forever
