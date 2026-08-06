@@ -43,7 +43,7 @@ from typing import List, Optional, Tuple
 
 from .driver_ir import (
     ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, Len, Lit, Local,
-    RawBlock, Return, SubgraphCall, TableLit, Var, While,
+    RawBlock, RetainedArgmax, Return, SubgraphCall, TableLit, Var, While,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import (
@@ -156,7 +156,8 @@ class MonolithicCall(DriverComponent):
     """The single `run_subgraph` call a flattened export's driver makes.
 
     Captures the output's shape alongside its data (`extra_outputs`) because `ArgmaxEpilogue` needs the
-    vocab size, which is the output's own ne0 and is not otherwise knowable to the driver.
+    vocab size, which is the output's own ne0 and is not otherwise knowable to the driver -- unless the
+    call `retained`, in which case neither local exists and the epilogue reduces by module name instead.
     """
 
     topology: str = "main_topology"
@@ -164,8 +165,8 @@ class MonolithicCall(DriverComponent):
     n_tokens: object = None
     out_var: str = "_mono_out"
     shape_var: str = "_mono_shape"
-    # When set, the call reduces engine-side and binds `out_var` to a token id instead of a tensor.
-    argmax_row: object = None
+    # When true, the output stays in the module's own buffer and this call binds nothing (P4.0.14).
+    retained: bool = False
 
     __links__ = {
         "topology": TopologyName(),
@@ -178,24 +179,26 @@ class MonolithicCall(DriverComponent):
                              "reads, and that read is checked by driver_ir.validate over the "
                              "assembled function"),
         "shape_var": Unchecked("same: a local this component binds rather than one it refers to"),
-        "argmax_row": Unchecked(
-            "a driver_ir expression for the row to reduce, or None for the ordinary tensor-returning "
-            "call. Set by the exporter for KV-cached topologies only, whose vocab is what makes the "
-            "marshalling cap reachable -- nothing in a checkpoint could disagree with it."
+        "retained": Unchecked(
+            "whether the epilogue reads this output by module name or by local -- one decision the "
+            "exporter makes for both ends at once, exactly as ChainStage.retained is, and "
+            "driver_ir.check_subgraph_calls is what catches the two disagreeing: a reduction naming a "
+            "module nothing retained is an error there, and a retaining call that also binds locals is "
+            "too."
         ),
     }
 
     def emit(self, ctx: DriverContext) -> List:
-        if self.argmax_row is not None:
-            # Reducing form: the engine argmaxes the row and returns one integer, so there is no logits
-            # table and no shape (BACKLOG.md's marshalling cap). `ArgmaxEpilogue` sees a number rather
-            # than a table and returns it as-is, which is the branch it already had.
+        if self.retained:
+            # The logits never become a Lua table: they stay in the module's own OutputStore and
+            # `ArgmaxEpilogue` asks for the row it wants by module name. That is what removes the
+            # ~512-token prefill ceiling a 262144-wide vocab hits (BACKLOG.md P4.0.14).
             return [SubgraphCall(
-                outputs=[self.out_var],
+                outputs=[],
                 module=self.topology,
                 axes={ctx.root_axis(self.topology): self.n_tokens, "n_past": Lit(0)},
                 inputs={name: Var(name) for name in self.inputs},
-                argmax_row=self.argmax_row,
+                retain=True,
             )]
         return [SubgraphCall(
             outputs=[self.out_var],
@@ -225,9 +228,9 @@ class ChainStage:
     extra_outputs: Tuple[str, ...] = ()
     # When true, this stage's outputs stay in the engine (BACKLOG.md P4.0.12) and `outputs`/
     # `extra_outputs` are empty: the next stage reaches them with an `OutputRef` instead of a local.
-    # Per stage rather than per chain because the two ends of a chain are genuinely different -- an
-    # intermediate is threaded onward and should never become a Lua value, while the LAST stage's
-    # output is what the epilogue reduces, and moving that one engine-side is its own item (P4.0.14).
+    # Per stage rather than per chain because a chain need not be uniform, though every synthesized one
+    # now is: since P4.0.14 the LAST stage retains too, and the epilogue reduces its logits by module
+    # name rather than marshalling them to argmax a single row.
     retained: bool = False
 
     __links__ = {
@@ -271,7 +274,8 @@ class ModularChain(DriverComponent):
     at -- and before retention each one was read into a Lua table and written straight back: two copies
     per edge per step on CPU, and a device->host->device round trip per edge per step the moment a
     second backend lands. A stage marked `retained` leaves its output in the engine and the next stage
-    names it, so nothing crosses the boundary but the chain's final result.
+    names it, so nothing tensor-shaped crosses the boundary at all: since P4.0.14 the last stage retains
+    too, and the only value the chain produces host-side is the one integer `ArgmaxEpilogue` returns.
     """
 
     stages: Tuple[ChainStage, ...] = ()
@@ -310,40 +314,46 @@ class ModularChain(DriverComponent):
 class ArgmaxEpilogue(DriverComponent):
     """Returns the next token rather than the raw logits array.
 
-    Argmaxes the logits row for the active (last real) token: `shape_var[1]` is the output's ne0 (vocab
-    size), the same convention `transpile_operation`'s own "argmax" case relies on. The `type(...) ==
-    'table'` guard is what keeps this correct for a topology whose output is not an array -- the engine
-    hands back a scalar there, and argmaxing it is meaningless.
+    Argmaxes the logits row for the active (last real) token, in one of two modes that differ only in
+    where the row is read from:
+
+    * `retained_module` set -- the producing call left its output in that module's own buffer, so the
+      reduction is `loom.argmax_row('<module>', row)` and nothing tensor-shaped crosses the boundary.
+      This is the mode every causal LM uses (BACKLOG.md P4.0.14): a marshalled logits table lands in
+      LuaJIT's array part, which caps a 262144-wide vocab at ~512 prompt tokens.
+    * otherwise -- the producing call marshalled, and `shape_var[1]` is the output's ne0 (vocab size),
+      the same convention `transpile_operation`'s own "argmax" case relies on. The `type(...) ==
+      'table'` guard is what keeps this correct for a topology whose output is not an array -- the
+      engine hands back a scalar there, and argmaxing it is meaningless.
     """
 
-    out_var: str
-    shape_var: str
-    n_tokens: object
-    # True when the calling component already reduced to a token id engine-side (MonolithicCall's
-    # `argmax_row`), so there is no logits table and no shape local to index.
-    already_reduced: bool = False
+    out_var: Optional[str] = None
+    shape_var: Optional[str] = None
+    n_tokens: object = None
+    # When set, the row is read out of this module's retained output rather than out of a Lua table, and
+    # `out_var`/`shape_var` are unused because the producing call bound no locals at all.
+    retained_module: Optional[str] = None
 
+    __links__ = {
+        "retained_module": WhenSet(TopologyName()),
+    }
     __unchecked__ = {
         "out_var": Unchecked("a local an earlier component bound. The read is checked by "
                              "driver_ir.validate over the assembled function, which is where a "
                              "cross-component symbol read is answerable and nowhere else"),
         "shape_var": Unchecked("same -- the shape local the calling component captured"),
         "n_tokens": Unchecked("the driver_ir expression for the active row; see DriverInputs.n_tokens"),
-        "already_reduced": Unchecked(
-            "whether the calling component reduced engine-side. Set by the exporter together with "
-            "MonolithicCall.argmax_row -- the two are one decision, and driver_ir.validate is what "
-            "catches them disagreeing (the shape local simply would not exist)."
-        ),
     }
 
     def emit(self, ctx: DriverContext) -> List:
-        if self.already_reduced:
-            # The call reduced engine-side, so `out_var` is already the token id and there is no shape
-            # local to index. This is the same answer the `type(out) ~= "table"` branch below returns;
-            # it is a separate mode rather than a runtime check because the shape local does not exist
-            # at all, and driver_ir.validate rightly rejects reading a name nothing defines.
-            return [Return([Var(self.out_var)])]
         row = BinOp("-", self.n_tokens, Lit(1))
+        if self.retained_module is not None:
+            # No `type(...) == 'table'` guard, because there is no value here to ask the question of:
+            # the engine reduces the tensor it already holds, and a topology whose output is not
+            # reducible fails in the bridge naming the module rather than silently returning it. That
+            # the module really did retain is checked at export time by
+            # driver_ir.check_subgraph_calls, which is the only checker that knows what a module is.
+            return [Return([RetainedArgmax(self.retained_module, row)])]
         return [If(
             cond=BinOp("==", Call("type", [Var(self.out_var)]), Lit("table")),
             then=[Return([Call("loom.argmax_row",
@@ -435,7 +445,7 @@ class PrefillDecodeLoop(DriverComponent):
         return out
 
     def emit(self, ctx: DriverContext) -> List:
-        out_var, shape_var, next_var = "_dec_out", "_dec_shape", "_next_token"
+        next_var = "_next_token"
         max_new = "_max_new_tokens"
         eos = "_eos_token"
         return [
@@ -447,18 +457,23 @@ class PrefillDecodeLoop(DriverComponent):
                                  Lit(self.default_max_new_tokens))),
             Local(eos, BinOp("or", FieldAccess("inputs", "eos_token"), Lit(-1))),
             While(cond=Lit(True), body=[
-                # Reducing call: the engine argmaxes the last row and returns the token id, so a
-                # decode step ships one integer across the boundary instead of a whole logits tensor.
-                # That is what removes the ~512-token prefill ceiling a 262144-wide vocab hits on the
-                # first iteration (BACKLOG.md's marshalling cap) -- and every later iteration, at
-                # n_tokens = 1, gets the same reduction for free.
+                # Retain, then reduce by name: the logits stay in the module's own buffer and the only
+                # thing a decode step ships across the boundary is the token id. That is what removes
+                # the ~512-token prefill ceiling a 262144-wide vocab hits on the first iteration
+                # (BACKLOG.md P4.0.14) -- and every later iteration, at n_tokens = 1, gets the same
+                # reduction for free. Two statements rather than one fused call because they are two
+                # facts, and `loom.run_subgraph_and_retain` composes with every other way a retained
+                # output is read; a second, fused spelling of the same reduction is what P4.0.14
+                # retired.
                 SubgraphCall(
-                    outputs=[next_var], module=self.topology,
+                    outputs=[], module=self.topology,
                     axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
                           "n_past": Var(self.n_past_var)},
                     inputs=self._call_inputs(ctx),
-                    argmax_row=BinOp("-", Var(self.n_tokens_var), Lit(1)),
+                    retain=True,
                 ),
+                Local(next_var, RetainedArgmax(self.topology,
+                                               BinOp("-", Var(self.n_tokens_var), Lit(1)))),
                 CallStmt(Call("table.insert", [Var(self.generated_var), Var(next_var)])),
                 Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
                 If(cond=BinOp(">=", Len(self.generated_var), Var(max_new)), then=[Break()]),

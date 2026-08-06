@@ -1128,6 +1128,15 @@ target_link_libraries(test_e2e_causal_lm_infer_with_past PRIVATE loom::engine)
 add_test(NAME test_e2e_causal_lm_infer_with_past COMMAND test_e2e_causal_lm_infer_with_past)
 set_tests_properties(test_e2e_causal_lm_infer_with_past PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- The marshalling ceiling's own claim (BACKLOG.md P4.0.14): a prefill whose logits tensor is larger
+#     than LuaJIT's array part can hold now completes, because the logits never become a Lua table.
+#     Generic over any causal-LM GGUF -- the prompt length comes from the file's own vocab size. Set
+#     LOOM_PREFILL_CEILING_GGUF; skips if unset. ---
+add_executable(test_e2e_prefill_past_marshalling_ceiling test_e2e_prefill_past_marshalling_ceiling.cpp)
+target_link_libraries(test_e2e_prefill_past_marshalling_ceiling PRIVATE loom::engine)
+add_test(NAME test_e2e_prefill_past_marshalling_ceiling COMMAND test_e2e_prefill_past_marshalling_ceiling)
+set_tests_properties(test_e2e_prefill_past_marshalling_ceiling PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- LSTM export via recurrent.py's build_lstm_cell_topologies + LoomLuaBridge::l_run_recurrent
 #     (EXPORT-IMPROVEMENT-BACKLOG.md item 4), verified against a real bidirectional torch.nn.LSTM ---
 add_executable(test_e2e_lstm_recurrent test_e2e_lstm_recurrent.cpp)

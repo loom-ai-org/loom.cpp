@@ -73,6 +73,43 @@ class TestPrefillArgmaxBuilder(unittest.TestCase):
             "end",
         ]))
 
+    def test_a_kv_cached_topology_retains_its_logits_instead_of_marshalling_them(self):
+        """What the exporter builds for every cached causal LM (BACKLOG.md P4.0.14). The call binds
+        nothing, so there is no logits table to overflow LuaJIT's array part at ~512 prompt tokens, and
+        no `type(...) == 'table'` guard either -- there is no Lua value here to ask that of."""
+        ctx = DriverContext(topologies={"main_topology": _topo(["tokens"])},
+                            axes={"main_topology": "n_tokens"})
+        text = PrefillArgmaxBuilder(
+            inputs=DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
+            call=MonolithicCall(topology="main_topology", inputs=("tokens",),
+                                n_tokens=Len("tokens"), retained=True),
+            epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
+                                    n_tokens=Len("tokens"), retained_module="main_topology"),
+        ).render(ctx)
+        self.assertEqual(text, "\n".join([
+            "function infer(inputs)",
+            "    local tokens = inputs.tokens",
+            "    loom.run_subgraph_and_retain('main_topology', {n_tokens = #tokens, n_past = 0}, "
+            "{tokens = tokens})",
+            "    return loom.argmax_row('main_topology', (#tokens - 1))",
+            "end",
+        ]))
+
+    def test_an_epilogue_naming_a_topology_the_export_does_not_have_fails_the_link(self):
+        """`retained_module` is link-declared rather than documented unchecked: it names a topology,
+        which is exactly the claim `TopologyName` exists to check."""
+        ctx = DriverContext(topologies={"main_topology": _topo(["tokens"])},
+                            axes={"main_topology": "n_tokens"})
+        builder = PrefillArgmaxBuilder(
+            inputs=DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
+            call=MonolithicCall(topology="main_topology", inputs=("tokens",),
+                                n_tokens=Len("tokens"), retained=True),
+            epilogue=ArgmaxEpilogue(n_tokens=Len("tokens"), retained_module="main_topolgy"),
+        )
+        with self.assertRaises(LinkError) as raised:
+            builder.build(ctx)
+        self.assertIn("main_topolgy", str(raised.exception))
+
     def test_host_computed_position_and_mask_inputs(self):
         """LFM2's traced graph declares `cache_position` and `attention_mask`; the driver fills both in
         rather than making a caller know they exist."""
@@ -142,12 +179,13 @@ class TestPrefillDecodeLoop(unittest.TestCase):
             "    local _max_new_tokens = (inputs.max_new_tokens or 16)",
             "    local _eos_token = (inputs.eos_token or -1)",
             "    while true do",
-            # The reducing call: the engine argmaxes the row and returns the token id, so no logits
-            # tensor crosses the boundary and there is no shape local (BACKLOG.md's marshalling cap).
-            "        local _next_token = loom.run_subgraph_argmax('main_topology', "
+            # Retain, then reduce by name: no logits tensor crosses the boundary and there is no shape
+            # local, which is what removes the marshalling cap (BACKLOG.md P4.0.14).
+            "        loom.run_subgraph_and_retain('main_topology', "
             "{n_tokens = _n_tokens, n_past = _n_past}, {tokens = _step_tokens, "
             "cache_position = loom.range(_n_past, _n_tokens), "
-            "attention_mask = loom.causal_mask(_n_tokens, _n_past)}, (_n_tokens - 1))",
+            "attention_mask = loom.causal_mask(_n_tokens, _n_past)})",
+            "        local _next_token = loom.argmax_row('main_topology', (_n_tokens - 1))",
             "        table.insert(_gen, _next_token)",
             "        _n_past = (_n_past + _n_tokens)",
             "        if (#_gen >= _max_new_tokens) then",
@@ -207,21 +245,20 @@ class TestModularChainBuilder(unittest.TestCase):
                        inputs={"hidden_states": OutputRef("prefix")}),
             ChainStage(topology="layer_1", outputs=(), retained=True,
                        inputs={"hidden_states": OutputRef("layer_0")}),
-            ChainStage(topology="norm", outputs=("_modular_final_out",),
-                       inputs={"hidden_states": OutputRef("layer_1")},
-                       extra_outputs=("_modular_final_shape",)),
+            ChainStage(topology="norm", outputs=(), retained=True,
+                       inputs={"hidden_states": OutputRef("layer_1")}),
         ]
         return ModularChainBuilder(
             inputs=DriverInputs(bindings=(("input_ids", CALLER),), n_tokens=n_tokens),
             chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens),
-            epilogue=ArgmaxEpilogue(out_var="_modular_final_out", shape_var="_modular_final_shape",
-                                    n_tokens=n_tokens),
+            epilogue=ArgmaxEpilogue(n_tokens=n_tokens, retained_module="norm"),
         )
 
     def test_the_chain_threads_one_tensor_through_every_stage_without_marshalling_it(self):
-        """Every intermediate stays engine-side (BACKLOG.md P4.0.12): the chain binds no local at all
-        until the last stage, whose output is the logits the epilogue argmaxes -- a genuinely host-side
-        control decision, and the only value here that crosses the boundary."""
+        """Nothing tensor-shaped crosses the boundary at either end (BACKLOG.md P4.0.12 for the edges,
+        P4.0.14 for the last one): the chain binds no local at all, and the single value this driver
+        produces host-side is the token id -- which is the only genuinely host-side thing here, a
+        control decision."""
         text = self._builder().render(self._ctx())
         self.assertEqual(text, "\n".join([
             "function infer(inputs)",
@@ -232,16 +269,23 @@ class TestModularChainBuilder(unittest.TestCase):
             "{hidden_states = {from = 'prefix'}})",
             "    loom.run_subgraph_and_retain('layer_1', {n_tokens = #input_ids, n_past = 0}, "
             "{hidden_states = {from = 'layer_0'}})",
-            "    local _modular_final_out, _modular_final_shape = loom.run_subgraph('norm', "
-            "{n_tokens = #input_ids, n_past = 0}, {hidden_states = {from = 'layer_1'}})",
-            "    if (type(_modular_final_out) == 'table') then",
-            "        return loom.argmax_row(_modular_final_out, _modular_final_shape[1], "
-            "(#input_ids - 1))",
-            "    else",
-            "        return _modular_final_out",
-            "    end",
+            "    loom.run_subgraph_and_retain('norm', {n_tokens = #input_ids, n_past = 0}, "
+            "{hidden_states = {from = 'layer_1'}})",
+            "    return loom.argmax_row('norm', (#input_ids - 1))",
             "end",
         ]))
+
+    def test_an_epilogue_reducing_a_module_the_chain_never_retained_is_caught(self):
+        """The two halves of P4.0.14's one decision -- the last stage's `retained` and the epilogue's
+        `retained_module` -- disagreeing. Invisible to `validate()`, which knows only about symbols, so
+        `check_subgraph_calls` is what has to catch it (`driver_ir._check_retained_reads`)."""
+        builder = self._builder()
+        builder.chain.stages[-1].retained = False
+        builder.chain.stages[-1].outputs = ("_modular_final_out",)
+        with self.assertRaises(DriverIRError) as raised:
+            builder.build(self._ctx())
+        self.assertIn("loom.argmax_row('norm', ...)", str(raised.exception))
+        self.assertIn("no earlier loom.run_subgraph_and_retain('norm', ...)", str(raised.exception))
 
     def test_a_stage_naming_a_topology_that_was_not_exported_fails_naming_the_stage(self):
         """A chain is 20-plus stages, so the message has to say which one. Before the builder this
@@ -285,6 +329,17 @@ class TestTheTwoPathsShareComponents(unittest.TestCase):
         )
 
     def test_the_epilogue_renders_identically_for_both(self):
+        """And since P4.0.14 in the same MODE for both: a causal LM retains its logits on either path,
+        so the epilogue reduces by module name rather than over a marshalled table."""
+        epilogue = ArgmaxEpilogue(n_tokens=Len("t"), retained_module="m")
+        emitted = epilogue.emit(DriverContext(topologies={}))
+        self.assertEqual(LuaCodegen()._emit_stmt(emitted[0], 0),
+                         ["return loom.argmax_row('m', (#t - 1))"])
+
+    def test_the_marshalling_mode_survives_for_a_topology_that_does_not_retain(self):
+        """The other mode is not dead code: a flattened export with no KV cache (the three NeMo ASR
+        encoders) still returns its tensor, and the `type(...) == 'table'` guard is what keeps the
+        epilogue correct for a topology whose output is not an array at all."""
         epilogue = ArgmaxEpilogue(out_var="x", shape_var="s", n_tokens=Len("t"))
         emitted = epilogue.emit(DriverContext(topologies={}))
         rendered = LuaCodegen()._emit_stmt(emitted[0], 0)

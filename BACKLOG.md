@@ -1512,7 +1512,8 @@ nothing.
   is P4.0.14's own item: doing it here would have added a second reducing path to the modular builder
   while `run_subgraph_argmax` still exists, which is the "two ways to get a token out of a forward
   pass" this project keeps removing. The marshalling cap on that path is therefore still open, exactly
-  as P4.0.14 states.
+  as P4.0.14 states. *(Closed by P4.0.14 on 2026-08-06: the 20th stage retains too, and
+  `run_subgraph_argmax` is gone.)*
 
   **Gate, measured.** `tests/test_lua_bridge_retained_outputs.cpp` (16 checks) runs every case against
   a marshalled oracle — the retained chain, the pinned chain, `get_output`, `index = 2`,
@@ -1633,39 +1634,83 @@ nothing.
   retained outputs. Worth knowing before anyone budgets the bucketed decode-loop follow-up on the
   strength of an expected speedup.
 
-- **P4.0.14 — the same marshalling ceiling still stands on the modular path, and is fixed by P4.0.12.**
+- **P4.0.14 — the same marshalling ceiling still stood on the modular path, and is fixed by P4.0.12's
+  mechanism — DONE (2026-08-06).**
 
-  **Status after P4.0.12 (2026-08-05): the mechanism exists and is unused here, which is what this item
-  now is.** `loom.run_subgraph_and_retain` plus `loom.argmax_row(module, row)` is the fused call said
-  as two facts, and it is shipping and tested. The modular chain adopted the first half — 19 of lfm2-modular's 20 stages
-  retain — and deliberately not the second: its last stage still calls `loom.run_subgraph` and hands the
-  epilogue a real logits table, so the table below is unchanged and every number in it still holds. What
-  remains is to point the last stage at retrieval-by-name too, drop `ArgmaxEpilogue`'s marshalling
-  branch for this builder, and then delete `run_subgraph_argmax` and its `MonolithicCall.argmax_row` /
-  `already_reduced` pair in the same commit — the retirement below, which is the only reason the two
-  halves were kept apart.
+  P4.0.12 shipped `loom.run_subgraph_and_retain` plus `loom.argmax_row(module, row)`: the fused call
+  said as two facts. The modular chain had adopted the first half — 19 of lfm2-modular's 20 stages
+  retained — and deliberately not the second, because its last stage's output is the logits the epilogue
+  argmaxes and adding a second reducing path while `run_subgraph_argmax` still existed would have left
+  two ways to get a token out of a forward pass. This item is the other half, and the retirement.
 
-  `run_subgraph_argmax` is gated on `_topology_uses_kv_cache` in the *flattened* path only;
-  `apply_modular_export` builds `ArgmaxEpilogue` without `already_reduced` and has no `MonolithicCall` at
-  all. Measured on the emitted artifact: lfm2-modular's driver has **zero** uses of `run_subgraph_argmax`
-  and still calls `loom.argmax_row(_mod_suffix_1, ...)`, while qwen3/smollm2/gemma3 have two each.
+  Against LuaJIT's ~2^27 array limit, each checkpoint's own `vocab_size` gave:
 
-  That is a consequence rather than an oversight — fusion is `Flattened`-only (`KV-CACHE.md` 2.2b), so
-  lfm2-modular has no cache, no `infer_with_past`, and nothing to reduce for. But the ceiling is real.
-  Against LuaJIT's ~2^27 array limit, each checkpoint's own `vocab_size` gives:
-
-  | model | vocab | prefill ceiling | reduces engine-side today |
+  | model | vocab | prefill ceiling | reduced engine-side before this item |
   |---|---|---|---|
-  | gemma-3-270m | 262144 | ~512 tok | yes |
-  | qwen3-0.6b | 151936 | ~883 tok | yes |
-  | smollm2-360m | 49152 | ~2730 tok | yes |
+  | gemma-3-270m | 262144 | ~512 tok | yes, via `run_subgraph_argmax` |
+  | qwen3-0.6b | 151936 | ~883 tok | yes, via `run_subgraph_argmax` |
+  | smollm2-360m | 49152 | ~2730 tok | yes, via `run_subgraph_argmax` |
   | **lfm2-350m modular** | 65536 | **~2048 tok** | **no** |
 
-  Deliberately scheduled after 12/13 rather than patched now: the fix is the same mechanism, and adding a
-  second reducing path to the modular builder would mean two ways to get a token out of a forward pass.
-  **Which is also the retirement plan for `run_subgraph_argmax`** — keep it while it is the only thing
-  that works, retire it once retrieval-by-name is fully functional, and do not leave both. Two spellings
-  that can disagree is the failure this project keeps removing.
+  **What shipped.** Both synthesized builders now retain and reduce by name, in the same mode:
+
+  * `ChainStage`'s last stage retains like every other one, and `apply_modular_export` no longer has a
+    step 7 that makes it different. The chain binds no Lua local at all.
+  * `MonolithicCall` grew `retained`, set for a KV-cached topology, replacing `argmax_row`.
+    `PrefillDecodeLoop` emits the retain and the reduction as two statements instead of one fused call.
+  * `ArgmaxEpilogue.already_reduced` (a bool meaning "somebody else already did the argmax") became
+    `retained_module` (a topology name meaning "reduce that module's retained output"), which is a
+    strictly better field: it is **link-declared** — `WhenSet(TopologyName())` — where the bool could
+    only ever be `Unchecked`.
+  * `driver_ir` gained `RetainedArgmax`, `OutputRef`'s sibling for the one read of a retained value that
+    is a control decision rather than an edge, and `check_subgraph_calls` now enforces the same
+    adjacency rule for it. That closes the gap the change would otherwise have opened: an epilogue
+    naming a module whose producing call still marshals is invisible to `validate()`, and would have
+    failed at runtime rather than at export.
+  * `loom.run_subgraph_argmax` is gone — binding, trampoline, declaration, and the IR field and codegen
+    branch behind it. The Lua surface is 14 bindings, not 15.
+
+  **What it costs, which the item did not predict.** Retention copies each declared output into the
+  module's `OutputStore`, so a prefill now holds the logits tensor twice — once in the compute buffer,
+  once retained. At Gemma 3's 262144-wide vocab and a 512-token prompt that is an extra ~512 MB, freed
+  down to `[n_vocab, 1]` at the first decode step (`reshape` reallocates only when the geometry moves).
+  The fused call read the row straight out of the graph result and kept nothing. That is a real trade and
+  it is the same one P4.0.12 named under "Memory" — worth knowing before anyone points this at a
+  long-context prefill, and the reason a future item that retains only the row retrieval asks for would
+  have something to fix.
+
+  **Gate — measured.** Byte-identity is not the gate; driver text changes by construction, so the gate
+  is which models change and which must not. All 13 exported from a `git worktree` at `4bc83a5` and from
+  this tree, `snapshot_gguf.py` both, `diff -r`:
+
+  * **Eight byte-identical** — conformer-ctc, parakeet-tdt, parakeet-rnnt, kokoro, matcha, supertonic,
+    vits, styletts2. No ASR or TTS driver text moved, as intended: those topologies have no KV cache, so
+    `MonolithicCall` still marshals and `ArgmaxEpilogue` keeps its `type(...) == 'table'` branch.
+  * **Five differ, in `model_driver_script` and the `kv.txt` line carrying its sha, and nowhere else** —
+    qwen3, smollm2, gemma-3-270m-it, lfm2-monolithic (4 lines each: `run_subgraph_argmax` becoming
+    retain-plus-reduce in both `infer` and `infer_with_past`) and lfm2-modular (6 lines becoming 2: the
+    final `run_subgraph` and the whole `type(...) == 'table'` guard collapsing into
+    `loom.run_subgraph_and_retain('suffix_1', ...)` + `return loom.argmax_row('suffix_1', ...)`). Every
+    topology JSON and every tensor hash identical for all five.
+
+  Numerically, on re-exported artifacts: `test_e2e_lfm2_mil_export` 8/8 — both LFM2 forms reproduce HF's
+  own top-1 at both prompt lengths (3523 at 3 tokens, 2 at 7). `test_e2e_causal_lm_infer_with_past` 22/22
+  on qwen3 and 22/22 on lfm2-monolithic: the cached decode loop still generates exactly what iterated
+  `infer` does.
+
+  **And the capability itself, which is what the item is actually about:**
+  `tests/test_e2e_prefill_past_marshalling_ceiling.cpp` prefills a prompt whose logits tensor is larger
+  than LuaJIT can hold — the length computed from the file's own vocab — and asserts the call completes
+  with a token id in range. There can be no marshalled oracle for it, which is the point: the marshalled
+  path does not reach the input at all. lfm2-modular at **2064 tokens** (ceiling 2048) returns 61238,
+  lfm2-monolithic the same, qwen3 at **899** (ceiling 883) returns 100.
+
+  **The gate can fail, and does.** The same binary against a **baseline-exported** lfm2-modular reports
+  `prefill of 2064 tokens FAILED: ... table overflow`, naming the 135266304 logits the old driver tried
+  to marshal. That is the check worth having: a capability test that passes on the tree that lacks the
+  capability would prove nothing, and this one does not.
+
+  Full ctest 144/144, exporter suite 463/463.
 
 - **P4.0.15 — index-tensor KV writes, so a decode loop can reuse its graph. Opened by P4.0.13, which
   could not finish without it.** P4.0.13 made `GraphBuilder` retain and reuse its graph, and that covers
@@ -1705,24 +1750,24 @@ near 2^27 elements. For Gemma 3's 262144-wide vocab that is **~512 prompt tokens
 raises `table overflow`; a 600-token prefill is 157M doubles. Qwen3 (151936) caps near 880, LFM2
 (65536) near 2048, so nothing on the roadmap has hit it before.
 
-**Fixed** by `loom.run_subgraph_argmax(module, axes, inputs, row)`: the module runs identically and
-returns one number, the argmax of the requested row, read from the tensor with `nb[1]` as the row stride
-so the other rows are never touched. Nothing crosses the boundary but the answer — the Lua boundary
-stays a *per-step* boundary rather than a per-logit one, the same reasoning `KV-CACHE.md` §1.1 gives for
-not driving attention from Lua.
+**Fixed on the flattened path** by `loom.run_subgraph_argmax(module, axes, inputs, row)`: the module ran
+identically and returned one number, the argmax of the requested row, read from the tensor with `nb[1]`
+as the row stride so the other rows were never touched. Nothing crossed the boundary but the answer —
+the Lua boundary stays a *per-step* boundary rather than a per-logit one, the same reasoning
+`KV-CACHE.md` §1.1 gives for not driving attention from Lua.
 
-**Still open on the modular path — P4.0.14**, which is where the numbers and the retirement plan for
-`run_subgraph_argmax` live. P4.0.12 built the mechanism that replaces it
-(`loom.run_subgraph_and_retain` plus `loom.argmax_row(module, row)`) and moved every modular chain
-edge but the last onto it; the last one,
-which is the one this cap is about, is still marshalled.
+Gated on KV-cached topologies only, so the blast radius was the causal LMs: the vocab is what makes the
+cap reachable and only that family has one, so no ASR/TTS driver text moved. Gemma's 600-token prefill,
+which raised `table overflow`, returned HF's own top-1; Qwen3 and LFM2 agreed with iterated `infer`
+22/22 each.
 
-Gated on KV-cached topologies only, so the blast radius is the causal LMs: the vocab is what makes the
-cap reachable and only that family has one, so no ASR/TTS driver text moves. `MonolithicCall.argmax_row`
-and `ArgmaxEpilogue.already_reduced` are one decision in two components and cannot silently disagree —
-the shape local would not exist and `driver_ir.validate` rejects reading a name nothing defines, which
-is exactly how the first attempt failed. Gemma's 600-token prefill, which raised `table overflow`, now
-returns HF's own top-1; Qwen3 and LFM2 still agree with iterated `infer` 22/22 each.
+**Then fixed on the modular path too, and the fused call retired — P4.0.14 (2026-08-06).** That entry is
+where this ends: the modular chain's last stage retains like every other one, both builders reduce with
+`loom.argmax_row(module, row)`, and `run_subgraph_argmax` no longer exists. The one-decision-in-two-
+components property survives the move in a stronger form — `MonolithicCall.retained` /
+`ArgmaxEpilogue.retained_module` are checked by `driver_ir.check_subgraph_calls`, which knows what a
+module is, rather than by `validate` noticing an absent local. The cap is now gated by a test that
+prefills past it (`test_e2e_prefill_past_marshalling_ceiling`) rather than by a number in this table.
 
 ### SentencePiece-style byte-fallback BPE — DONE
 
