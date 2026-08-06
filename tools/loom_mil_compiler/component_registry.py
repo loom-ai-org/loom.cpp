@@ -127,7 +127,8 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     a module that imports this one's `DriverComponent` -- importing them at module scope would make the
     registry and the components a cycle."""
     from .driver_components import (
-        ArgmaxEpilogue, DriverInputs, DriverReturn, FlowMatchingSampler, LuaFragment, ModularChain,
+        ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, FlowMatchingSampler,
+        LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent,
     )
     from .lua_library import LuaLibrary
@@ -161,6 +162,13 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "true: it is a field of every flattened causal-LM builder, but the exporter sets it only "
             "for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten "
             "ShortConv layers are not, so it carries the field and exports `infer` alone.",
+        ),
+        ComponentEntry(
+            "ctc_greedy_epilogue", CtcGreedyEpilogue, (STATEMENTS,),
+            "Greedy CTC decode: per-frame argmax over the retained logits, then collapse consecutive "
+            "duplicates and drop the blank. `argmax_epilogue`'s ASR counterpart -- the same single "
+            "forward pass, but a reduction over EVERY row returning a sequence, rather than over one "
+            "row returning a token.",
         ),
         ComponentEntry(
             "argmax_epilogue", ArgmaxEpilogue, (STATEMENTS,),
@@ -401,7 +409,14 @@ def usage(model_paths: Optional[Dict[str, str]] = None):
                 if components is not None:
                     names = [entry_for(component).name for component in components]
                 else:
-                    builder = SYNTHESIZED_BUILDERS.get(type(config.decomposition).__name__)
+                    # The family's own answer when it has one, the decomposition's class name
+                    # otherwise. Only the NeMo CTC config overrides this, and the override is the
+                    # point: it is the one family whose orchestration is not implied by how it was
+                    # decomposed (BACKLOG.md P4.0.17), so attributing its components by decomposition
+                    # would credit it with `argmax_epilogue`, which it does not use.
+                    key = getattr(config, "synthesized_builder_key",
+                                   lambda: type(config.decomposition).__name__)()
+                    builder = SYNTHESIZED_BUILDERS.get(key)
                     names = builder_components(builder) if builder is not None else []
             except Exception as exc:
                 unavailable[recognizer.name] = f"{type(exc).__name__}: {exc}"

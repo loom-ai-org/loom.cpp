@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.driver_components import (
-    CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
+    CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, CtcGreedyBuilder, CtcGreedyEpilogue,
+    DriverInputs, ModularChain,
     FlowMatchingSampler, LuaFragment, ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder,
     PrefillArgmaxBuilder, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent, caller_input,
     parse_run_subgraph_calls,
@@ -224,6 +225,67 @@ class TestPrefillDecodeLoop(unittest.TestCase):
         self.assertIn("decodr", str(raised.exception))
 
 
+class TestCtcGreedyBuilder(unittest.TestCase):
+    """The NeMo Conformer-CTC shape (BACKLOG.md P4.0.17).
+
+    The rendered Lua is asserted WHOLE, and here that matters more than usual: no fixture in this tree
+    can make a trained CTC model emit a token on consecutive frames, so the deduplication rule has no
+    behavioural test at all (`test_e2e_conformer_ctc_lua_driver.cpp` says so in its own header). This is
+    where the collapse's three decisions are pinned -- seed `prev` with the blank so a leading real
+    token survives, skip a frame equal to the previous one, skip the blank.
+    """
+
+    def _ctx(self):
+        return DriverContext(
+            topologies={"main_topology": _topo(["waveform", "length"])},
+            axes={"main_topology": "n_samples"})
+
+    def _builder(self):
+        n_tokens = Len("waveform")
+        return CtcGreedyBuilder(
+            inputs=DriverInputs(bindings=(("waveform", CALLER), ("length", CALLER)), n_tokens=n_tokens),
+            call=MonolithicCall(topology="main_topology", inputs=("waveform", "length"),
+                                n_tokens=n_tokens, retained=True),
+            epilogue=CtcGreedyEpilogue(retained_module="main_topology", blank_id=1024),
+        )
+
+    def test_the_ctc_shape(self):
+        self.assertEqual(self._builder().render(self._ctx()), "\n".join([
+            "function infer(inputs)",
+            "    local waveform = (inputs.waveform or inputs.tokens)",
+            "    local length = (inputs.length or inputs.tokens)",
+            "    loom.run_subgraph_and_retain('main_topology', {n_samples = #waveform, n_past = 0}, "
+            "{waveform = waveform, length = length})",
+            "    local _ctc_frames = loom.argmax_rows('main_topology')",
+            "    local _ctc_out = {}",
+            "    local _ctc_prev = 1024",
+            "    for _ctc_i = 1, #_ctc_frames do",
+            "        local _ctc_id = _ctc_frames[_ctc_i]",
+            "        if ((_ctc_id ~= _ctc_prev) and (_ctc_id ~= 1024)) then",
+            "            table.insert(_ctc_out, _ctc_id)",
+            "        end",
+            "        _ctc_prev = _ctc_id",
+            "    end",
+            "    return _ctc_out",
+            "end",
+        ]))
+
+    def test_the_logits_are_never_marshalled(self):
+        """The reason `MonolithicCall` retains here at all. A `[1025, n_frames]` table would be within
+        LuaJIT's limit, so this is not the ceiling -- it is the same rule P4.0.12 states: marshal only
+        what is genuinely host-side, and what is host-side here is the frame ids, not the logits."""
+        text = self._builder().render(self._ctx())
+        self.assertNotIn("loom.run_subgraph(", text)
+        self.assertNotIn("loom.get_output(", text)
+
+    def test_an_epilogue_naming_a_module_the_call_did_not_retain_is_caught(self):
+        builder = self._builder()
+        builder.call = dataclasses.replace(builder.call, retained=False)
+        with self.assertRaises(DriverIRError) as raised:
+            builder.build(self._ctx())
+        self.assertIn("loom.argmax_rows('main_topology')", str(raised.exception))
+
+
 class TestModularChainBuilder(unittest.TestCase):
     def _ctx(self):
         return DriverContext(
@@ -284,7 +346,7 @@ class TestModularChainBuilder(unittest.TestCase):
         builder.chain.stages[-1].outputs = ("_modular_final_out",)
         with self.assertRaises(DriverIRError) as raised:
             builder.build(self._ctx())
-        self.assertIn("loom.argmax_row('norm', ...)", str(raised.exception))
+        self.assertIn("loom.argmax_row('norm', (#input_ids - 1))", str(raised.exception))
         self.assertIn("no earlier loom.run_subgraph_and_retain('norm', ...)", str(raised.exception))
 
     def test_a_stage_naming_a_topology_that_was_not_exported_fails_naming_the_stage(self):

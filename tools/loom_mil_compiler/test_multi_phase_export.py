@@ -116,7 +116,12 @@ class TestASRRootAxisIsNowADeclaration(unittest.TestCase):
     def test_the_default_is_the_axis_the_family_always_used(self):
         config = self._config()
         self.assertEqual(config.root_axis, "n_samples")
-        self.assertEqual(config.backend_kwargs(), {"flat_namespace": True, "root_axis": "n_samples"})
+        # `driver_builder` rides along because this is the CTC family, whose orchestration is not
+        # implied by its decomposition (BACKLOG.md P4.0.17); `ctc_blank_id` does not, because nothing
+        # has traced the checkpoint here and only it knows the class count.
+        self.assertEqual(config.backend_kwargs(),
+                         {"flat_namespace": True, "root_axis": "n_samples",
+                          "driver_builder": "CtcGreedy"})
 
     def test_an_axis_outside_the_vocabulary_is_rejected(self):
         with self.assertRaises(LinkError) as cm:

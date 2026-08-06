@@ -16,7 +16,8 @@ from .driver_ir import Function as IRFunction
 from .driver_builder import DriverContext, DriverScript
 from .driver_components import (
     CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
-    POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, DriverInputs, ModularChain,
+    POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, CtcGreedyEpilogue,
+    DriverInputs, ModularChain,
     MonolithicCall, PrefillDecodeLoop,
 )
 from .passes import apply_loom_mil_passes
@@ -1339,6 +1340,17 @@ class LoomGGUFExporter:
         # same reason `GraphTopology::uses_kv_cache()` is derived on the engine side (decision 5): the
         # request to fuse and the presence of a fused node are two different facts, and a block the
         # pattern declined to match would otherwise get a decode loop with nothing to decode against.
+        # A frame-wise classifier reduces its whole output rather than one row of it, so it gets its own
+        # builder rather than a mode of the causal-LM one (BACKLOG.md P4.0.17). NAMED by the family
+        # through `backend_kwargs()` rather than inferred here, because this is the one case where the
+        # decomposition does not determine the orchestration -- Conformer-CTC is a `Flattened` export
+        # like Qwen3 and shares none of its host-side shape. Naming it is also what keeps P4.0.7's
+        # catalogue honest: `component_registry.usage()` reads the same declaration, so it cannot
+        # attribute `argmax_epilogue` to a model that does not use it.
+        if self.kwargs.get("driver_builder") == "CtcGreedy":
+            self.apply_ctc_greedy_export(bindings, input_names, n_tokens_expr)
+            return
+
         cached = self._topology_uses_kv_cache(self.topologies["main_topology"])
         decode = None
         if cached:
@@ -1364,6 +1376,30 @@ class LoomGGUFExporter:
                                     n_tokens=n_tokens_expr,
                                     retained_module="main_topology" if cached else None),
             decode=decode,
+        ).build(self._driver_context())
+
+    def apply_ctc_greedy_export(self, bindings, input_names, n_tokens_expr):
+        """The NeMo CTC driver: one forward pass over the waveform, then greedy decode (P4.0.17).
+
+        Takes the pieces `apply_monolithic_export` has already computed rather than recomputing them --
+        the declared-input bindings and the root-axis expression are properties of the traced graph, not
+        of what the host does with its output, and the two paths must not be able to disagree about
+        them.
+        """
+        if self.kwargs.get("ctc_blank_id") is None:
+            raise ValueError(
+                "driver_builder='CtcGreedy' was requested without `ctc_blank_id`. The blank is the "
+                "head's last class and only the checkpoint knows how many there are, so the family "
+                "must supply it (ASRNemoEncoderExportConfig reads it during build_trace)."
+            )
+        blank_id = int(self.kwargs["ctc_blank_id"])
+        self.driver_script = SYNTHESIZED_BUILDERS["CtcGreedy"](
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            # Retained for the same reason a large-vocab LM retains: the reduction is engine-side, so
+            # the [n_classes, n_frames] logits never become a Lua table.
+            call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
+                                 retained=True),
+            epilogue=CtcGreedyEpilogue(retained_module="main_topology", blank_id=blank_id),
         ).build(self._driver_context())
 
     # Ops that mix along the TOKEN axis and carry their own cross-step state, which the KV cache does

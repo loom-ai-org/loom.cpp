@@ -43,7 +43,8 @@ from typing import List, Optional, Tuple
 
 from .driver_ir import (
     ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, Len, Lit, Local,
-    RawBlock, RetainedArgmax, Return, SubgraphCall, TableLit, Var, While,
+    NumericFor, RawBlock, RetainedArgmax, RetainedArgmaxRows, Return, SubgraphCall, TableLit, Var,
+    While,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import (
@@ -363,6 +364,80 @@ class ArgmaxEpilogue(DriverComponent):
 
 
 @dataclass
+class CtcGreedyEpilogue(DriverComponent):
+    """Greedy CTC decode: per-frame argmax, then collapse consecutive duplicates and drop the blank.
+
+    The ASR counterpart to `ArgmaxEpilogue`, and the reason the two are different components rather than
+    modes of one: a causal LM reduces ONE row of its output and returns one token, while a CTC model
+    reduces every row and returns a sequence. `ArgmaxEpilogue` applied to a CTC encoder is not merely
+    unhelpful, it raises -- it argmaxes row `n_tokens - 1`, and for these topologies `n_tokens` is the
+    *sample* count while the output has one row per subsampled frame (BACKLOG.md P4.0.17).
+
+    **This is `src/core/ctc_decode.cpp` retired, not relocated.** The reduction is engine-side because
+    the logits are (`loom.argmax_rows`, one call, n_frames numbers back, the tensor never marshalled);
+    the collapse is here because blank-and-duplicate handling is this family's own convention, and a
+    `loom.ctc_greedy_decode` binding would have put family-specific logic in an engine whose whole claim
+    is that a new family costs Python and not C++.
+
+    Returns token ids, not text: detokenization is the caller's, exactly as it is for `whisper_driver`
+    and every causal LM here.
+    """
+
+    retained_module: str = "main_topology"
+    blank_id: object = None
+
+    # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
+    frames_var: str = "_ctc_frames"
+    out_var: str = "_ctc_out"
+    prev_var: str = "_ctc_prev"
+    index_var: str = "_ctc_i"
+    id_var: str = "_ctc_id"
+
+    __links__ = {
+        "retained_module": TopologyName(),
+    }
+    __unchecked__ = {
+        "blank_id": Unchecked(
+            "the blank class index, which for a NeMo CTC head is the LAST class -- derived by the "
+            "exporter from the traced output's own channel count (`decoder.num_classes_with_blank`, "
+            "read off the checkpoint by EncoderOutput.expected_channels) rather than claimed here. "
+            "Nothing else in the artifact states it, so there is no second authority to check against."
+        ),
+        "frames_var": Unchecked("a local this component binds; every read of it is inside this "
+                                "component's own emitted block and is checked by driver_ir.validate "
+                                "over the assembled function"),
+        "out_var": Unchecked("same"),
+        "prev_var": Unchecked("same"),
+        "index_var": Unchecked("same -- the loop variable, scoped to the loop body by NumericFor"),
+        "id_var": Unchecked("same"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        blank = Lit(self.blank_id)
+        return [
+            Local(self.frames_var, RetainedArgmaxRows(self.retained_module)),
+            Local(self.out_var, ArrayLit([])),
+            # Seeded with the blank so a leading real token is not deduplicated away -- the same seed,
+            # for the same reason, as the C++ implementation this replaces.
+            Local(self.prev_var, blank),
+            NumericFor(
+                var=self.index_var, start=Lit(1), stop=Len(self.frames_var),
+                body=[
+                    Local(self.id_var, Index(Var(self.frames_var), Var(self.index_var))),
+                    If(
+                        cond=BinOp("and",
+                                    BinOp("~=", Var(self.id_var), Var(self.prev_var)),
+                                    BinOp("~=", Var(self.id_var), blank)),
+                        then=[CallStmt(Call("table.insert", [Var(self.out_var), Var(self.id_var)]))],
+                    ),
+                    Assign(self.prev_var, Var(self.id_var)),
+                ],
+            ),
+            Return([Var(self.out_var)]),
+        ]
+
+
+@dataclass
 class PrefillDecodeLoop(DriverComponent):
     """The generation loop `infer_with_past` is: prefill the prompt, then decode one token at a time
     against the KV cache, until `max_new_tokens` or `eos_token` (KV-CACHE.md 3.3).
@@ -541,6 +616,31 @@ class PrefillArgmaxBuilder(DriverBuilder):
 
 
 @dataclass
+class CtcGreedyBuilder(DriverBuilder):
+    """One traced graph over the whole waveform, then greedy CTC decode -- the NeMo Conformer-CTC shape
+    (BACKLOG.md P4.0.17).
+
+    Shares `DriverInputs` and `MonolithicCall` with `PrefillArgmaxBuilder` and differs only in the
+    epilogue, which is the honest statement of how these two families relate: the same single forward
+    pass, a different reduction over its output. That the difference is exactly one component is why the
+    ASR encoders needed a builder rather than a special case inside the causal-LM one.
+
+    `MonolithicCall` retains here for the reason it retains for a large-vocab LM: the reduction happens
+    engine-side, so the `[n_classes, n_frames]` logits never become a Lua table.
+    """
+
+    inputs: DriverInputs
+    call: MonolithicCall
+    epilogue: CtcGreedyEpilogue
+
+    __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
+                 for name in ("inputs", "call", "epilogue")}
+
+    def components(self):
+        return [self.inputs, self.call, self.epilogue]
+
+
+@dataclass
 class ModularChainBuilder(DriverBuilder):
     """Independently-traced submodules chained prefix -> [aux] -> layers -> suffix, then the same
     argmax epilogue. Shares two of its three components with `PrefillArgmaxBuilder`."""
@@ -565,6 +665,14 @@ class ModularChainBuilder(DriverBuilder):
 SYNTHESIZED_BUILDERS = {
     "Flattened": PrefillArgmaxBuilder,
     "Modular": ModularChainBuilder,
+    # Keyed by decomposition like the two above, EXCEPT this one, which is keyed by orchestration --
+    # and the exception is the finding P4.0.17 records rather than a shortcut. Conformer-CTC IS a
+    # `Flattened` export; what differs is what its host does with the one output, and
+    # `Decomposition.driver_builder`'s premise ("the orchestration shape a driver has is a property of
+    # how the model was decomposed") simply does not hold for it. The ASR config asks for this by name
+    # through `backend_kwargs()`, so the request travels with the family that has it rather than being
+    # inferred from a topology.
+    "CtcGreedy": CtcGreedyBuilder,
 }
 
 
