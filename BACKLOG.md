@@ -1888,6 +1888,50 @@ nothing.
   `reserve()`, `reserved_`, and the shrink's only special case along with it. Worth doing, and not as a
   rider on anything else.
 
+### Parakeet's four traced phases — DONE (2026-08-06); the driver is what remains
+
+P4.0.17 step 2, first half. `parakeet_export.ASRParakeetExportConfig` is a `MultiPhase` config that
+traces the whole model rather than just its encoder, which is what makes a Lua driver possible at all.
+Verified against the real `parakeet-tdt-0.6b-v3`:
+
+| phase | traced result |
+|---|---|
+| `encoder` | the existing trace, moved into a named phase (`n_samples`) |
+| `embed` | 2 nodes, `last_label` → `[640]` |
+| `pred_lstm` | `pred_lstm_l0_fwd`, `pred_lstm_l1_fwd`, 6 weights |
+| `joint` | 10 nodes, 2 inputs, **2 declared outputs** |
+
+`blank_id` 8192, `pred_hidden` 640, 2 layers — all read off the checkpoint, and 8192 is the same blank
+`test_e2e_parakeet_tdt`'s own `kBlankId` hardcodes.
+
+**A cross-check caught a real error, and it is the reason that check exists.**
+`joint.num_classes_with_blank` reads like the token count and is not: for a TDT joint NeMo sets it to
+`num_classes + 1 + num_extra_outputs`, so it already counts the durations — **8198, not 8193**. Deriving
+the blank from it put it five classes too high and would have split the joint head in the wrong place,
+token logits running into the duration ones. No shape check would have caught that, because the widths
+still add up. The token count now comes off the embedding, the joint's own width is compared against
+tokens + durations, and `test_parakeet_export.py` pins the whole thing.
+
+**What remains before the converter can go**, and one of them is a real design question rather than
+typing:
+
+  1. **The driver's constants.** `blank_id`, the duration set, `pred_hidden` and the layer count are
+     read from the checkpoint at export time and the Lua loop needs all four. A hand-written driver
+     adopted whole (`RawLuaDriver`, the C.3 path) cannot carry them — Lua cannot read GGUF hparams — so
+     either the family peels into components and emits a generated constants fragment, or a
+     substitution marker is added to `render_driver`. The peeled route is the one every other
+     multi-phase family already took.
+  2. **The TDT loop itself**, as a checked fragment beside `run_bi_lstm`, with the prediction-output
+     cache the C++ decoder now has.
+  3. **Registry wiring** so `--model parakeet-tdt` selects this config, and re-basing
+     `test_e2e_parakeet_{tdt,rnnt}` onto the one-GGUF artifact.
+  4. **Deletions**: `convert_parakeet_tdt.py`, `convert_parakeet_rnnt.py`, `tdt_decoder.{h,cpp}` and
+     their fixtures.
+
+The gate for all of it is already established and does not depend on the reference fixtures (the RNN-T
+one decodes to an empty token list): both checkpoints over `samples/jfk.wav` must reproduce **36 tokens
+for TDT and 26 for RNN-T**, ids and frame indices, which is what the current C++ path produces.
+
 ### `RecurrentPhase` handles a stacked LSTM — DONE (2026-08-06)
 
 The first unknown in P4.0.17 step 2's traced route, settled by tracing rather than reasoning: **a
