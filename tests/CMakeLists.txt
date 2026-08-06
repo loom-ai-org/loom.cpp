@@ -80,6 +80,12 @@ target_compile_definitions(test_lua_bridge_retained_outputs PRIVATE LOOM_TEST_FI
 add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_outputs)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+add_executable(test_gallocr_shrink test_gallocr_shrink.cpp)
+target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
+target_compile_definitions(test_gallocr_shrink PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_gallocr_shrink COMMAND test_gallocr_shrink)
+set_tests_properties(test_gallocr_shrink PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 add_executable(test_gallocr_reserve_reuse test_gallocr_reserve_reuse.cpp)
 target_link_libraries(test_gallocr_reserve_reuse PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_reserve_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
