@@ -127,7 +127,8 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     a module that imports this one's `DriverComponent` -- importing them at module scope would make the
     registry and the components a cycle."""
     from .driver_components import (
-        ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, FlowMatchingSampler,
+        ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
+        FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent,
     )
@@ -177,6 +178,17 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "its tensor -- over the returned table, guarded for an output that is not an array.",
         ),
         # -- adopting and peeling a hand-written driver (C.3-C.8) ------------------------------------
+        ComponentEntry(
+            "export_constants", ExportConstants, (STATEMENTS,),
+            "Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as "
+            "ordinary locals so every read of them is checked by driver_ir.validate -- rather than "
+            "interpolated into hand-written Lua through a marker, where a misspelled read is a silent "
+            "nil (BACKLOG.md P4.0.18).",
+            no_user_reason=(
+                "written for Parakeet's peeled TDT driver, which is the half of P4.0.17 step 2 still "
+                "in progress. It ships with no user for exactly as long as that does."
+            ),
+        ),
         ComponentEntry(
             "raw_lua_driver", RawLuaDriver, (PRELUDE, STATEMENTS, POSTLUDE),
             "A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlude -- with "

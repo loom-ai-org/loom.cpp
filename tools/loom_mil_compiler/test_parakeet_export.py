@@ -96,5 +96,41 @@ class TestTheDurationSetIsCrossCheckedAgainstTheJoint(unittest.TestCase):
         self.assertIn("9 token classes and 5 duration(s)", message)
 
 
+class TestExportConstantsAreIRNotInterpolatedText(unittest.TestCase):
+    """The answer to "how do checkpoint-only numbers reach the driver" (BACKLOG.md P4.0.18).
+
+    The property that matters is not the rendered text -- it is that each name is a real `Local`, so a
+    body misspelling one fails `driver_ir.validate` at export time. Interpolated through a marker it
+    would be opaque text, and a misspelled read would be a runtime `nil` that Lua compares as unequal
+    to everything, which for a TDT decoder means emitting every blank as a token.
+    """
+
+    def _emit(self, values):
+        from loom_mil_compiler.driver_builder import DriverContext
+        from loom_mil_compiler.driver_components import ExportConstants
+
+        return ExportConstants(values=values).emit(DriverContext(topologies={}))
+
+    def test_scalars_and_lists_both_become_locals(self):
+        from loom_mil_compiler.driver_ir import LuaCodegen
+
+        emitted = self._emit({"BLANK_ID": 8192, "DURATIONS": [0, 1, 2, 3, 4]})
+        rendered = [LuaCodegen()._emit_stmt(st, 0)[0] for st in emitted]
+        self.assertEqual(rendered, ["local BLANK_ID = 8192", "local DURATIONS = {0, 1, 2, 3, 4}"])
+
+    def test_each_constant_defines_a_symbol_validate_can_see(self):
+        """The whole point: `defines()` is what makes a later misspelled read an export-time error."""
+        emitted = self._emit({"BLANK_ID": 8192, "PRED_HIDDEN": 640})
+        self.assertEqual([st.defines() for st in emitted], [["BLANK_ID"], ["PRED_HIDDEN"]])
+
+    def test_a_misspelled_read_fails_the_export(self):
+        from loom_mil_compiler.driver_ir import DriverIRError, Function, Return, Var, validate
+
+        fn = Function("infer", ["inputs"], self._emit({"BLANK_ID": 8192}) + [Return([Var("BLANK_ID_")])])
+        with self.assertRaises(DriverIRError) as raised:
+            validate(fn)
+        self.assertIn("BLANK_ID_", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

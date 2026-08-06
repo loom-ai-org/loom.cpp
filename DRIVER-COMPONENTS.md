@@ -63,6 +63,7 @@ Three builders exist:
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | *nobody* (see below) |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, styletts2, supertonic, vits |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 6 | kokoro, matcha, styletts2, supertonic, vits |
@@ -119,6 +120,16 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 *Emits:* statements. *Used by:* hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
 
 * `retained_module` — WhenSet(TopologyName)
+
+### `export_constants` — `ExportConstants`
+
+Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
+
+*Emits:* statements. *Used by:* **no model** — see below.
+
+* nothing — every field is `__unchecked__`, with its reason
+
+> No model uses it today: written for Parakeet's peeled TDT driver, which is the half of P4.0.17 step 2 still in progress. It ships with no user for exactly as long as that does..
 
 ### `raw_lua_driver` — `RawLuaDriver`
 
