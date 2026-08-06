@@ -60,8 +60,9 @@ Three builders exist:
 | `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
-| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
+| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, styletts2, supertonic, vits |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 6 | kokoro, matcha, styletts2, supertonic, vits |
@@ -98,16 +99,24 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports `infer` alone.
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+*Emits:* statements. *Used by:* hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+### `ctc_greedy_epilogue` — `CtcGreedyEpilogue`
+
+Greedy CTC decode: per-frame argmax over the retained logits, then collapse consecutive duplicates and drop the blank. `argmax_epilogue`'s ASR counterpart -- the same single forward pass, but a reduction over EVERY row returning a sequence, rather than over one row returning a token.
+
+*Emits:* statements. *Used by:* conformer-ctc.
+
+* `retained_module` — TopologyName
 
 ### `argmax_epilogue` — `ArgmaxEpilogue`
 
 Returns the next token rather than the raw logits: argmax over the active row, read out of the producing module's retained output by name, or -- for a topology that marshalled its tensor -- over the returned table, guarded for an output that is not an array.
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+*Emits:* statements. *Used by:* hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
 
 * `retained_module` — WhenSet(TopologyName)
 

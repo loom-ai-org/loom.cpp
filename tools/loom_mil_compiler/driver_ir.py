@@ -125,13 +125,21 @@ class FieldAccess(Expr):
 @dataclasses.dataclass
 class Index(Expr):
     table: Expr
-    idx: int  # 1-based Lua index
+    # A 1-based Lua index: a plain int for the constant case (`shape[1]`), or an Expr for a computed one
+    # (`frames[i]` inside a loop). Both spellings render the same way; the Expr form is separated only
+    # by `reads()`, which must report the symbols a computed index uses or `validate()` would not see
+    # the loop variable at all.
+    idx: object
 
     def reads(self) -> list[str]:
-        return self.table.reads()
+        out = self.table.reads()
+        if isinstance(self.idx, Expr):
+            out = out + self.idx.reads()
+        return out
 
     def render(self) -> str:
-        return f"{self.table.render()}[{self.idx}]"
+        rendered = self.idx.render() if isinstance(self.idx, Expr) else str(self.idx)
+        return f"{self.table.render()}[{rendered}]"
 
 
 @dataclasses.dataclass
@@ -198,8 +206,19 @@ class OutputRef(Expr):
         return f"{{from = '{self.module}', index = {self.index}}}"
 
 
+class RetainedRead(Expr):
+    """Base for every expression that reads a module's RETAINED output by name.
+
+    Exists so `check_subgraph_calls` can ask one question of all of them -- "did anything actually
+    retain that module?" -- rather than growing an isinstance arm per reduction. Every subclass carries
+    a `module` and reports it nowhere in `reads()`, which is the property that makes the base worth
+    having: a module is not a symbol, so `validate()` cannot see any of them.
+    """
+    module: str
+
+
 @dataclasses.dataclass
-class RetainedArgmax(Expr):
+class RetainedArgmax(RetainedRead):
     """`loom.argmax_row('norm', (#input_ids - 1))` -- the argmax of one row of a module's RETAINED first
     output (BACKLOG.md P4.0.14).
 
@@ -220,6 +239,25 @@ class RetainedArgmax(Expr):
 
     def render(self) -> str:
         return f"loom.argmax_row('{self.module}', {self.row.render()})"
+
+
+@dataclasses.dataclass
+class RetainedArgmaxRows(RetainedRead):
+    """`loom.argmax_rows('main_topology')` -- one class id per ROW of a module's retained first output
+    (BACKLOG.md P4.0.17).
+
+    `RetainedArgmax`'s plural, for the family whose whole output is the reduction's input rather than
+    one interesting row of it: a frame-wise CTC classifier. The result IS a Lua array -- n_frames
+    numbers -- which is the point, since the driver collapses it host-side; what stays engine-side is
+    the `[n_classes, n_frames]` logits tensor it was reduced from.
+    """
+    module: str
+
+    def reads(self) -> list[str]:
+        return []
+
+    def render(self) -> str:
+        return f"loom.argmax_rows('{self.module}')"
 
 
 @dataclasses.dataclass
@@ -386,6 +424,25 @@ class While(Stmt):
 
 
 @dataclasses.dataclass
+class NumericFor(Stmt):
+    """`for v = start, stop do ... end` -- Lua's counted loop.
+
+    `While` plus a hand-rolled counter would emit the same behaviour, and the reason not to is that the
+    driver script is read out of the GGUF: three statements where the language has one is noise in the
+    artifact people actually inspect. `var` is scoped to the BODY, which `validate` handles by seeding
+    the nested block with it rather than the enclosing one -- assigning to it after the loop would be a
+    fresh global, exactly the bug `Assign`'s own read-check exists to catch.
+    """
+    var: str
+    start: Expr
+    stop: Expr
+    body: list  # list[Stmt]
+
+    def reads(self) -> list[str]:
+        return self.start.reads() + self.stop.reads()
+
+
+@dataclasses.dataclass
 class Break(Stmt):
     pass
 
@@ -449,6 +506,8 @@ def _validate_block(stmts: list, defined: set, fn_name: str) -> None:
             _validate_block(stmt.else_, set(defined), fn_name)
         elif isinstance(stmt, While):
             _validate_block(stmt.body, set(defined), fn_name)
+        elif isinstance(stmt, NumericFor):
+            _validate_block(stmt.body, set(defined) | {stmt.var}, fn_name)
         defined.update(stmt.defines())
 
 
@@ -459,7 +518,7 @@ def _walk_subgraph_calls(stmts: list):
         elif isinstance(stmt, If):
             yield from _walk_subgraph_calls(stmt.then)
             yield from _walk_subgraph_calls(stmt.else_)
-        elif isinstance(stmt, While):
+        elif isinstance(stmt, (While, NumericFor)):
             yield from _walk_subgraph_calls(stmt.body)
 
 
@@ -522,9 +581,9 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
             # A `RetainedArgmax` can sit anywhere an expression can (a `Return`, a `Local`), so it is
             # found by scanning the statement rather than by knowing which statement types carry one.
             for expr in _own_exprs(stmt):
-                if isinstance(expr, RetainedArgmax) and expr.module not in produced:
+                if isinstance(expr, RetainedRead) and expr.module not in produced:
                     raise DriverIRError(
-                        f"driver IR: loom.argmax_row('{expr.module}', ...) reduces the retained output "
+                        f"driver IR: {expr.render()} reduces the retained output "
                         f"of module '{expr.module}', but no earlier "
                         f"loom.run_subgraph_and_retain('{expr.module}', ...) runs in the same "
                         f"straight-line block -- a retained output only exists between the "
@@ -534,7 +593,7 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
                 walk(stmt.then, dict(produced))
                 walk(stmt.else_, dict(produced))
                 continue
-            if isinstance(stmt, While):
+            if isinstance(stmt, (While, NumericFor)):
                 walk(stmt.body, dict(produced))
                 continue
             if not isinstance(stmt, SubgraphCall):
@@ -684,6 +743,11 @@ class LuaCodegen:
             if stmt.else_:
                 lines.append(f"{pad}else")
                 lines.extend(self._emit_block(stmt.else_, depth + 1))
+            lines.append(f"{pad}end")
+            return lines
+        if isinstance(stmt, NumericFor):
+            lines = [f"{pad}for {stmt.var} = {stmt.start.render()}, {stmt.stop.render()} do"]
+            lines.extend(self._emit_block(stmt.body, depth + 1))
             lines.append(f"{pad}end")
             return lines
         if isinstance(stmt, While):

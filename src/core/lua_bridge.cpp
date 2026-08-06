@@ -210,6 +210,41 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     return best;
 }
 
+// The same reduction over EVERY row: one id per row, in row order. `argmax_tensor_row`'s plural.
+//
+// Exists because a frame-wise classifier reduces the whole tensor rather than one row of it, and the
+// per-row call cannot express that without first asking how many rows there are -- a question Lua can
+// only answer today by marshalling the tensor it is trying not to marshal (BACKLOG.md P4.0.17). One
+// call returns n_rows numbers and the logits never cross the boundary, which is the same trade
+// `argmax_row` makes, applied to the shape CTC actually has.
+//
+// What it deliberately does NOT do is collapse blanks or duplicates. That is the model family's own
+// convention, it belongs in the driver where the rest of the family's orchestration lives, and putting
+// it here would be `ctc_decode.cpp` behind a binding rather than retired.
+std::vector<double> argmax_tensor_rows(ggml_tensor* out, const char* fname) {
+    if (out->type != GGML_TYPE_F32) {
+        throw Error(std::string(fname) + ": output must be f32");
+    }
+    const int64_t n_classes = out->ne[0];
+    const int64_t n_rows = out->ne[1];
+    if (n_classes <= 0 || n_rows <= 0) {
+        throw Error(std::string(fname) + ": output is " + std::to_string(n_classes) + "x" +
+                     std::to_string(n_rows) + ", which has no rows to reduce");
+    }
+    std::vector<float> row(static_cast<size_t>(n_classes));
+    std::vector<double> ids(static_cast<size_t>(n_rows));
+    for (int64_t r = 0; r < n_rows; ++r) {
+        ggml_backend_tensor_get(out, row.data(), static_cast<size_t>(r) * out->nb[1],
+                                 row.size() * sizeof(float));
+        int64_t best = 0;
+        for (int64_t i = 1; i < n_classes; ++i) {
+            if (row[static_cast<size_t>(i)] > row[static_cast<size_t>(best)]) best = i;
+        }
+        ids[static_cast<size_t>(r)] = static_cast<double>(best);
+    }
+    return ids;
+}
+
 // Reads a Lua table of string->number pairs at `idx` into a `DynamicAxes` (EXPORT-ROADMAP.md R1: a
 // topology declares its own axis names, e.g. {n_samples=16000} or {n_tokens=12, n_past=0}, rather than
 // this binding assuming every topology has exactly the same two positional axes).
@@ -601,6 +636,31 @@ int LoomLuaBridge::l_argmax_row(lua_State* L) {
     }
 }
 
+// `loom.argmax_rows(module [, generation])` -> a flat array of one class id per ROW of `module`'s
+// retained first output, in row order. `loom.argmax_row`'s plural, and module-form only: the array form
+// of the singular exists because a flat Lua array has lost its shape, and a caller who already holds
+// every row in Lua can loop over them itself.
+//
+// This is what lets a frame-wise classifier keep its logits engine-side (BACKLOG.md P4.0.17). A CTC
+// encoder's whole output is the reduction's input -- there is no single interesting row -- so the
+// singular cannot express it without the driver first learning n_frames, which it can only do by
+// marshalling the very tensor it is avoiding.
+int LoomLuaBridge::l_argmax_rows(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string module_name = luaL_checkstring(L, 1);
+        OutputStore& store = retained_store(self, module_name);
+        if (!lua_isnoneornil(L, 2)) {
+            store.check_generation(static_cast<uint64_t>(std::llround(luaL_checknumber(L, 2))),
+                                    module_name);
+        }
+        push_number_array(L, argmax_tensor_rows(store.get(0), "loom.argmax_rows"));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.argmax_rows: %s", e.what());
+    }
+}
+
 // Resets the bridge's own std::mt19937 -- the SAME engine every hand-written driver's own RNG uses
 // (VitsDriver/SupertonicDriver/MatchaDriver all construct `std::mt19937 rng(seed)` directly), so a
 // script that calls loom.seed_rng(seed) then loom.gaussian_array(n) in the SAME order a C++ driver
@@ -767,7 +827,8 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
         {"run_subgraph_and_retain", &LoomLuaBridge::l_run_subgraph_and_retain},
         {"get_output", &LoomLuaBridge::l_get_output},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
-        {"argmax_row", &LoomLuaBridge::l_argmax_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
+        {"argmax_row", &LoomLuaBridge::l_argmax_row},
+        {"argmax_rows", &LoomLuaBridge::l_argmax_rows},   {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},

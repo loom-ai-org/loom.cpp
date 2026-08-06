@@ -1797,6 +1797,119 @@ nothing.
   for an output that is a view (its `data` is its parent's), and it costs the pool the ability to recycle
   that tensor. Not attempted here.
 
+- **P4.0.17 — the NeMo ASR family has no Lua entry point, and needs its own driver builder.**
+
+  Every other family reaches its model through `infer` in the embedded driver. The three NeMo ASR
+  encoders do not, and the gap is wider than "not migrated yet": **their MIL exports are currently
+  unreachable by anything but their own test.**
+
+  * The synthesized `infer` they *do* carry is the causal-LM one and would raise if called. It argmaxes
+    row `#waveform - 1` — one less than the **sample** count — of a `[num_classes, n_frames]` CTC
+    tensor, and `l_argmax_row`'s array form bounds-checks that. Known since the exports landed;
+    `test_e2e_conformer_ctc_mil_export.cpp` says so in its header.
+  * `loom_cli --wav` cannot load them either: it reads the **bare** `model.graph_topology`, which the
+    bespoke `tools/convert_nemo/` converters write and the MIL exporter never does (it always writes
+    named `model.graph_topology.<name>`).
+
+  So three checkpoints are traced, numerically verified against `reference_forward_conformer.py`, and
+  runnable only from `GraphBuilder` in C++. That is the actual defect, not the tidiness of having two
+  paths.
+
+  **Root cause: the builder is selected by the *decomposition*, and for ASR the decomposition is not the
+  orchestration.** `SYNTHESIZED_BUILDERS["Flattened"]` is `PrefillArgmaxBuilder` — prefill, argmax the
+  last row, one token — and the ASR encoders share `Flattened` with the causal LMs while sharing none of
+  their host-side shape. `DriverBuilder`'s own premise ("selected by the decomposition, not owned by the
+  family", `EXPORT-PREPARATION.md` §5 decision 2) holds for every other family and breaks here.
+
+  **Nothing about this needs new engine C++, which is the point.** Greedy CTC decode is a per-frame
+  argmax, then collapse consecutive duplicates and drop the blank (`src/core/ctc_decode.cpp`, 30 lines)
+  — all of it expressible in the existing Lua vocabulary over a retained output. TDT/RNNT is the same
+  answer one level up: per-layer LSTM cell topologies threaded through a Lua loop plus the joint network
+  and duration jumps, which is the shape `whisper_driver.lua` already runs and the conclusion P4.0.6
+  reached about `BiLstmStepper`. Both decoders leave the runtime rather than moving behind a binding —
+  a `loom.ctc_greedy_decode` would be family-specific logic in an engine that is supposed to stay small.
+
+  Sequence, in dependency order:
+
+  1. **Conformer-CTC** (done — see below). One reduction binding, a CTC epilogue component, and a
+     builder the ASR family selects.
+  2. **Parakeet TDT/RNNT.** The bigger half: the autoregressive prediction/joint loop moves to Lua and
+     `src/core/tdt_decoder.cpp` (156 lines) retires with it.
+  3. **Retire the bespoke `tools/convert_nemo/` converters** once all three MIL exports are reachable,
+     which also removes the bare-vs-named topology split that keeps `loom_cli --wav` on the old files.
+
+  Gate is the one those models already have: `reference_forward_conformer.py` and the existing
+  `test_e2e_*_mil_export` fixtures, plus byte-identity for every non-ASR model.
+
+- **Retiring `loom::Generator` — blocked, and on something worth knowing.** It is the pre-Lua host loop
+  (`src/core/generation.cpp`), and the natural companion question to P4.0.17. It cannot go yet:
+
+  * **Its users are pre-MIL GGUFs with no `model.driver_script` at all.** Every `Generator` call site —
+    `test_e2e_toy_llm{,_generic}`, `test_e2e_gqa`, `test_e2e_qwen3{,_generic,_q8_0}`,
+    `test_generation_smoke` — parses the *bare* `model.graph_topology` of a hand-built or bespoke-
+    converted fixture. There is no Lua entry to call instead; retiring Generator means re-basing those
+    fixtures onto MIL exports or deleting the tests.
+  * **`GenerationConfig::on_token` hands back the whole `n_vocab` logits row per step**, and that is
+    what the strongest numerical tests in the tree are built on (`expected_logits_step*.bin` compared
+    against HF at ~1e-6). The Lua path deliberately no longer marshals logits at all — P4.0.14 removed
+    the last way they cross the boundary in a synthesized driver — so those tests would have to be
+    re-expressed through `loom.get_output` first.
+
+  The payoff is real when it comes: `GraphBuilder::reserve()` exists *only* for Generator, and P4.0.16
+  made `reserve()` the switch that suppresses the compute-buffer shrink — so retiring Generator deletes
+  `reserve()`, `reserved_`, and the shrink's only special case along with it. Worth doing, and not as a
+  rider on anything else.
+
+### Conformer-CTC now has a Lua entry point — DONE (2026-08-06)
+
+Step 1 of P4.0.17. `conformer-ctc`'s driver is no longer the causal-LM template applied to a CTC model;
+it is a real `infer` that returns decoded token ids:
+
+```lua
+loom.run_subgraph_and_retain('main_topology', {n_samples = #waveform, n_past = 0}, {...})
+local _ctc_frames = loom.argmax_rows('main_topology')
+... collapse duplicates, drop 1024 ...
+return _ctc_out
+```
+
+**The driver no longer needs `src/core/ctc_decode.cpp`** — which is the shape every remaining ASR step
+takes. The reduction is engine-side because the logits are; the collapse is in the driver because
+blank-and-duplicate handling is this family's convention. A `loom.ctc_greedy_decode` binding would have
+kept the same C++ behind a new name, in an engine whose claim is that a family costs Python.
+
+The file itself is still in the tree, and honestly so: `loom_cli --wav` decodes bespoke-converted GGUFs
+with it, and this step's own gate uses it as the oracle. It becomes deletable at step 3, when the
+bespoke converters go and nothing but the oracle is left.
+
+**One binding, and the argument for it.** `loom.argmax_rows(module)` is `argmax_row`'s plural: one class
+id per row, one crossing, logits never marshalled. The singular cannot express this — a frame-wise
+classifier has no single interesting row, so a driver would first have to learn `n_frames`, which it can
+only do by marshalling the tensor it is avoiding. Passes the P4.0.8 criterion: reads no model config,
+and two unrelated families could use it unchanged.
+
+**The builder is now NAMED by the family, not inferred from the decomposition** — the root cause above,
+fixed rather than worked around. `ASRNemoEncoderExportConfig.synthesized_builder_key()` returns
+`"CtcGreedy"`, and *both* readers take it from there: the exporter (via `backend_kwargs`) and
+`component_registry.usage()`. The first attempt keyed off the presence of a `ctc_blank_id` kwarg
+instead, and P4.0.7's registry caught it immediately — with selection invisible to `usage()`, the
+catalogue still credited conformer-ctc with `argmax_epilogue`, a component it no longer uses. That is
+the registry doing exactly what it was built for, on the first change that could have drifted.
+
+**Gate.** `test_e2e_conformer_ctc_lua_driver.cpp` runs the driver's `infer` against
+`loom::ctc_greedy_decode` over the same model and asserts token-for-token agreement — an equivalence
+against the implementation being replaced, the same shape as P4.0.12's oracle tests. 6/6.
+
+*Honest about the fixtures.* There is no speech recording in this tree, and a trained CTC model decodes
+synthetic audio to blank: the reference waveform yields 0 tokens and the best synthetic signal found (a
+chirp) yields 1. Neither case is vacuous — an empty transcript is a real check of the blank id, since a
+wrong one keeps every frame and returns `n_frames` tokens against the oracle's none — but **the
+deduplication rule has no behavioural test**, because that needs a token spanning consecutive frames.
+It is pinned instead as emitted Lua text in `test_driver_components.py`, the way every component is.
+Closing that properly wants a short speech fixture; worth doing when one exists.
+
+Byte-identity elsewhere: the two Parakeet encoders and every non-ASR model are unchanged (they keep
+`argmax_epilogue`; the RNNT pair is step 2). ctest 146/146, exporter suite 466/466.
+
 ### Driver logits marshalling caps prefill length for large-vocab models — FIXED
 
 Found while gating P4.0.11a. `MonolithicCall` returns the topology's whole `[n_vocab, n_tokens]` logits

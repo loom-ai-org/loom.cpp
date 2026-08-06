@@ -201,7 +201,7 @@ class TestRetainedArgmax(unittest.TestCase):
         ])
         with self.assertRaises(DriverIRError) as raised:
             check_subgraph_calls(fn, self._topos())
-        self.assertIn("loom.argmax_row('a', ...)", str(raised.exception))
+        self.assertIn("loom.argmax_row('a', 0)", str(raised.exception))
 
     def test_a_reduction_inside_a_loop_sees_the_producer_in_the_same_body(self):
         """`infer_with_past`'s exact shape: retain and reduce are two statements in one loop body, and

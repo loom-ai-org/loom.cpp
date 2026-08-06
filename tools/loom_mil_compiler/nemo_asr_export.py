@@ -52,6 +52,7 @@ import types
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -248,6 +249,10 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     # the literal `backend_kwargs()` used to return, so it is a *declaration* the Axis link can check
     # (P4.0.5, stage B.5); the value and the resulting export are unchanged.
     root_axis: str = "n_samples"
+    # The traced output's own channel count, captured during `validate_against_model` (which reads it
+    # off the checkpoint anyway) so `backend_kwargs` can derive the CTC blank id from it. Not an init
+    # argument: it is read from the model, never declared by a caller.
+    num_classes: Optional[int] = field(default=None, init=False, repr=False)
 
     __links__ = {
         "root_axis": Axis(),
@@ -258,6 +263,12 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
         ),
     }
     __unchecked__ = {
+        "num_classes": Unchecked(
+            "READ off the restored checkpoint (`EncoderOutput.expected_channels`) during "
+            "validate_against_model, not declared -- so there is nothing for a checkpoint to disagree "
+            "with. It is a field only because `backend_kwargs()` is handed no model and runs after "
+            "the trace."
+        ),
         "checkpoint": Unchecked(
             "path to the .nemo archive. Already established by the recognizer's own detect(), which "
             "probes the archive's config rather than trusting the extension, and load_model raises on "
@@ -285,7 +296,9 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
             )
         # Reading this also validates the spec's own family claim as far as it can be validated without
         # running the model; the rest is checked inside the wrapper during tracing (EncoderOutput.validate).
-        self.output.expected_channels(model)
+        # Kept rather than discarded: for a CTC head it IS `decoder.num_classes_with_blank`, which is
+        # where the driver's blank id comes from (BACKLOG.md P4.0.17).
+        self.num_classes = int(self.output.expected_channels(model))
         return int(sample_rate)
 
     def prepare_environment(self) -> None:
@@ -300,8 +313,38 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
         sample_rate = self.validate_against_model(model)
         return build_trace(self, model, sample_rate)
 
+    def synthesized_builder_key(self) -> str:
+        """Which `driver_components.SYNTHESIZED_BUILDERS` entry assembles this config's driver.
+
+        **The hook exists because this family is the counterexample to the usual rule** (BACKLOG.md
+        P4.0.17). `Decomposition.driver_builder` holds that "the orchestration shape a driver has is a
+        property of how the model was decomposed", and for a CTC encoder it is not: this is a
+        `Flattened` export exactly like Qwen3, and what differs is entirely what the host does with the
+        one output -- reduce every frame and collapse, rather than reduce one row. So the family says
+        so, and both readers of the answer -- `LoomGGUFExporter` (through `backend_kwargs`) and
+        `component_registry.usage()` (directly) -- take it from here rather than each inferring it.
+
+        The RNNT encoders keep the default: they emit an encoder tensor whose consumer is still the C++
+        TDT loop, which is step 2 of that item and not this one.
+        """
+        if self.output is EncoderOutput.CTC_LOG_PROBS:
+            return "CtcGreedy"
+        return type(self.decomposition).__name__
+
     def backend_kwargs(self) -> dict:
-        return dict(flat_namespace=True, root_axis=self.root_axis)
+        kwargs = dict(flat_namespace=True, root_axis=self.root_axis,
+                      driver_builder=self.synthesized_builder_key())
+        # A CTC head's blank is its LAST class -- NeMo's own convention, and the same index
+        # `loom_cli`'s C++ path passes to `ctc_greedy_decode` (`num_classes - 1`).
+        #
+        # Omitted rather than raised when the class count was never read, because this method is also
+        # called by callers that never trace (`component_registry.usage()` builds every registered
+        # config to attribute components to models). The export path cannot slip through: the exporter
+        # raises when it is asked for the CTC builder without a blank id, which is the moment the
+        # number is actually needed.
+        if self.output is EncoderOutput.CTC_LOG_PROBS and self.num_classes is not None:
+            kwargs["ctc_blank_id"] = self.num_classes - 1
+        return kwargs
 
 
 class _NeMoASREncoderWrapper(nn.Module):

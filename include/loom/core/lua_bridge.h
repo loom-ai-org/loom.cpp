@@ -215,6 +215,12 @@ private:
     static int l_range(lua_State* L);
     static int l_causal_mask(lua_State* L);
     static int l_zero_mask(lua_State* L);
+    // `loom.argmax_rows(module [, generation])` -> one class id per ROW of the module's retained first
+    // output, in row order. `l_argmax_row`'s plural, module-form only, and what lets a frame-wise
+    // classifier (CTC) reduce its whole output without the logits ever becoming a Lua table
+    // (BACKLOG.md P4.0.17). Collapsing blanks/duplicates is deliberately NOT here -- that is the model
+    // family's own convention and belongs in its driver.
+    static int l_argmax_rows(lua_State* L);
     // `loom.argmax_row(flat, n_vocab, row)` or `loom.argmax_row(module, row [, generation])` -- one
     // operation in two spellings, the second reading a retained output by module name instead of a
     // marshalled array. See the definition for why this is an overload rather than a new binding.

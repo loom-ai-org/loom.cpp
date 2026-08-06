@@ -292,6 +292,14 @@ target_link_libraries(test_e2e_conformer_ctc_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_conformer_ctc_mil_export COMMAND test_e2e_conformer_ctc_mil_export)
 set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- The same MIL-exported GGUF reached the way every other family is reached: through the embedded
+#     Lua driver's `infer`. Its greedy CTC decode must agree token-for-token with loom::ctc_greedy_decode,
+#     the C++ implementation it replaces (BACKLOG.md P4.0.17). ---
+add_executable(test_e2e_conformer_ctc_lua_driver test_e2e_conformer_ctc_lua_driver.cpp)
+target_link_libraries(test_e2e_conformer_ctc_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_conformer_ctc_lua_driver COMMAND test_e2e_conformer_ctc_lua_driver)
+set_tests_properties(test_e2e_conformer_ctc_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
 # Proves the same converted GGUF supports a second, different waveform length dynamically (see
 # SPECIFICATION.md §4 and BACKLOG.md) -- no reconversion, just a different build() call.
 add_executable(test_e2e_conformer_ctc_dynamic_length test_e2e_conformer_ctc_dynamic_length.cpp)
