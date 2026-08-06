@@ -1466,6 +1466,49 @@ class FlowMatchingSampler(DriverComponent):
 
 
 @dataclass
+class ExportConstants(DriverComponent):
+    """Values a driver needs that only the CHECKPOINT knows -- bound as ordinary locals at the top of
+    the entry function.
+
+    A driver reads no GGUF metadata: `loom` gives it topologies and host math, not hparams. So a family
+    whose orchestration depends on numbers read off the model at export time (Parakeet's blank id, its
+    TDT duration set, the prediction stack's width and depth) has to have them *written into* the driver.
+
+    **The alternative was interpolating them into hand-written Lua through a marker, and this exists to
+    avoid exactly that** (BACKLOG.md P4.0.18). A marker substitution is a `str.replace`: the injected
+    text is opaque, so a body that misspells one of these reads `nil`, and in Lua `id ~= nil` is quietly
+    true -- a TDT decoder would emit every blank as a token and the first sign would be a garbage
+    transcript. Emitted as IR, each name is a real `Local`, so `driver_ir.validate` fails the export
+    naming the symbol instead.
+
+    Numbers and lists of numbers only: this binds facts, not behaviour. Anything with a branch in it is
+    a component or a `loom_lua` function, not a constant.
+    """
+
+    values: dict = dataclass_field(default_factory=dict)
+
+    __unchecked__ = {
+        "values": Unchecked(
+            "read off the restored checkpoint by the family's own config (Parakeet's blank id is its "
+            "embedding's row count minus one, its durations are `model_defaults.tdt_durations`), so "
+            "there is no second authority here to compare them against -- the config is where a "
+            "cross-check belongs, and ASRParakeetExportConfig.phases does run one. What IS checked here "
+            "is the other half: every read of these names goes through driver_ir.validate, which is the "
+            "whole reason they are IR rather than substituted text."
+        ),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        out = []
+        for name, value in self.values.items():
+            if isinstance(value, (list, tuple)):
+                out.append(Local(name, ArrayLit([Lit(v) for v in value])))
+            else:
+                out.append(Local(name, Lit(value)))
+        return out
+
+
+@dataclass
 class DriverReturn(DriverComponent):
     """What the entry function hands back to the host."""
 
