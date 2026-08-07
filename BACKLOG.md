@@ -1402,9 +1402,11 @@ nothing.
   consumed (it already carries `mask_var` per block) and the driver must know each mask's window.
 
   **(b) The memory win — a real `KvCache` redesign, and out of scope for (a).** The header states the
-  constraint it would break: "single sequence, contiguous append (no ring buffer, no `ggml_set_rows`
-  index-tensor indirection)" (`kv_cache.h:15`). A window cache wants `pos % window` writes, which is
-  exactly what stops "a plain view over `[0, n_kv)` suffices for reads" from holding. It also needs
+  constraint it would break: single sequence, contiguous append, no ring buffer. (It used to name the
+  missing `ggml_set_rows` indirection here too; P4.0.15 added that, so a `pos % window` write is now
+  merely a different `fill_cell_index` rather than a different write path.) A window cache wants
+  `pos % window` writes, which is exactly what stops "a plain view over `[0, n_kv)` suffices for reads"
+  from holding. It also needs
   per-layer capacity, where `KvCache` takes one `kv_size` for every layer and `loom.kv_cache_size` is one
   scalar. This is adjacent to the multi-sequence generalization `SPECIFICATION.md` §8 defers and should
   be done with it, not before it.
@@ -1590,9 +1592,11 @@ nothing.
   offset `n_past * nb[1]`, so two consecutive decode steps have different graphs even at an identical
   rounded-up `n_kv`. Making a decode loop reuse its graph therefore needs the KV *write destination* to
   become data — llama.cpp's `ggml_set_rows` index-tensor indirection, which the scope limitations below
-  already list as absent — and that is a change to `KvCache`, to `ATTENTION`, to a synthesized declared
-  input and to every causal-LM driver's text, with all of them needing re-gating. **Filed as P4.0.15**
-  rather than smuggled in here. What P4.0.13 does cover is every loop whose axes *don't* move, which is
+  already list as absent — and that is a change to `KvCache`, to `ATTENTION`, and to a synthesized
+  input. **Filed as P4.0.15** rather than smuggled in here, and done there on 2026-08-07 — including a
+  correction to this sentence's last clause, which also predicted a change to "every causal-LM driver's
+  text" and re-gating of every cached model: the synthesized input turned out to belong to the engine,
+  and no driver or export moved. What P4.0.13 does cover is every loop whose axes *don't* move, which is
   most of the zoo: `loom.run_recurrent` (one build per direction instead of one per timestep — the
   StyleTTS2/Kokoro BiLSTMs), the CFM Euler and ADPM2 sampler loops, `TdtDecoder`'s per-layer LSTM and
   joint calls, and every module in a chain that is called at a fixed shape. Modules called once still
@@ -1717,35 +1721,85 @@ nothing.
 
   Full ctest 144/144, exporter suite 463/463.
 
-- **P4.0.15 — index-tensor KV writes, so a decode loop can reuse its graph. Opened by P4.0.13, which
-  could not finish without it.** P4.0.13 made `GraphBuilder` retain and reuse its graph, and that covers
-  every loop whose axes don't move. It does not cover the one this whole thread started from — an
-  autoregressive decode — and the plan it inherited ("round `n_kv` up to a bucket boundary and skip the
-  rebuild while the bucket holds") would not have covered it either. **`n_past` is baked into the graph
-  independently of `n_kv`:** `KvCache::write_k/write_v` build a `ggml_view_2d` at byte offset
-  `n_past * nb[1]`, so step N and step N+1 have different graphs whatever `n_kv` rounds to. Bucketing is
-  necessary and not sufficient; the write destination has to stop being a build-time constant first.
+- **P4.0.15 — index-tensor KV writes, so a decode loop can reuse its graph — DONE (2026-08-07).**
+  Opened by P4.0.13, which could not finish without it. P4.0.13 made `GraphBuilder` retain and reuse its
+  graph, and that covers every loop whose axes don't move. It did not cover the one this whole thread
+  started from — an autoregressive decode — and the plan it inherited ("round `n_kv` up to a bucket
+  boundary and skip the rebuild while the bucket holds") would not have covered it either. **`n_past`
+  was baked into the graph independently of `n_kv`:** `KvCache::write_k/write_v` built a `ggml_view_2d`
+  at byte offset `n_past * nb[1]`, so step N and step N+1 had different graphs whatever `n_kv` rounded
+  to. Bucketing is necessary and not sufficient; the write destination had to stop being a build-time
+  constant first.
 
-  **The change.** Replace the append-at-a-baked-offset write with `ggml_set_rows` plus a declared cell-
-  index input, the indirection `kv_cache.h:15` already names as absent and llama.cpp's `llama_kv_cache`
-  already has. Then bucket `n_kv`, pad the mask to the bucket (free — `loom.causal_mask` is a host
-  binding, so no driver learns what a bucket is), and a decode step's graph stops depending on the step.
-  Padded cells contribute exactly zero as long as the mask says `-inf` there, which is worth *verifying*
-  rather than assuming: a zeroed cell reached through a finite mask would not be zero.
+  **What shipped.** `KvCache::write_k/write_v` take a cell-index tensor instead of an `n_past` and
+  scatter through `ggml_set_rows` — the indirection `kv_cache.h`'s own comment used to name as absent
+  and `llama_kv_cache` already has. `GraphBuilder` then rounds `n_kv` up to `kKvBucket` (32, llama.cpp's
+  own non-flash `n_pad`), capped at the cache's capacity, and keys its retained graph on the axes
+  reduced to what the structure actually depends on: `n_past` dropped, `n_kv` replaced by the padded
+  value. A prefill plus a 40-step decode is **three graphs for 41 calls** — the prefill shape, the
+  decode shape in the first bucket, the decode shape in the second.
 
-  **Why it is its own item and not a rider on 13.** It touches `KvCache`, `ATTENTION`, a synthesized
-  declared input and every causal-LM driver's text, so every cached model needs re-gating — the opposite
-  of P4.0.13, which moved no driver text and needed no re-export. It also unblocks more than reuse: the
-  same indirection is what a ring buffer and multi-sequence support want, both listed under "Scope
-  limitations".
+  **The cell-index tensor is engine-synthesized, not topology-declared, and that is a deliberate
+  departure from this entry's own plan.** The plan above said "a declared cell-index input" and "every
+  causal-LM driver's text", which would have meant a fifth input on every `ATTENTION` node, a line in
+  every synthesized driver, and — the part that decided it — **re-exporting every cached GGUF, with
+  every previously exported one becoming unloadable**. Three things argued the other way and won:
 
-  **Do not schedule it on an expected speedup.** P4.0.13 measured the retained-graph win at ~15% on
-  Kokoro and inside the noise everywhere else on a single CPU backend — the rebuild is not where these
-  drivers spend their time. The case for this item is the same as for P4.0.12's retained outputs: it
-  removes per-call structure that a second backend, not this one, makes expensive. Sequence:
-  index-tensor writes, then buckets, then extend `tests/test_graph_builder_reuse.cpp`'s bit-identity
-  check to a decode loop — that test currently asserts a decode sequence rebuilds every step, which is
-  the assertion this item deliberately inverts.
+  * Its value is `[n_past, n_past + n_tokens)`, a pure function of two axes the caller already binds.
+    That is exactly the argument by which `n_kv` is already derived in `GraphBuilder::build` rather than
+    passed — "so every caller of an attention-bearing topology gets it without having to compute it".
+    A driver supplying it could only restate what the engine already knows.
+  * The **bucket is engine policy over the engine's own cache**, and the mask has to be padded to it
+    regardless. Having the driver name the cells while the engine silently decides the mask's width
+    would split one decision across two authorities.
+  * "Fat exporter, lean runtime" is about *per-model* complexity. Nothing here is per-model.
+
+  So `PrimitiveContext` gained a `kv_cells`, `GraphBuilder` allocates it beside the declared inputs
+  (outside the gallocr pool — that seam is now load-bearing for correctness, not just for reuse safety)
+  and rewrites it **on a reuse as well as on a build**. `tools/` is untouched; the exporter suite passes
+  474/474 unchanged, and no model needed re-exporting.
+
+  **Padding the mask, and where that lands.** A bucketed `n_kv` widens the mask input, so somebody has
+  to fill the tail with `-inf`. `loom.causal_mask` cannot: it is not told which module its result feeds,
+  and an unbucketed topology (MIL-exported Qwen3 declares `["n_tokens", "n_tokens"]`) would break if it
+  padded unconditionally. The width is known at the *write*, so that is where it happens —
+  `BuildResult` names the declared inputs whose leading dim is `n_kv` plus the un-padded length, the
+  Lua bridge places a real-width array into the padded tensor, and the two C++ drivers
+  (`Generator`, `WhisperDriver`) simply read the width off the tensor, at which point their existing
+  `j <= query_pos` rule writes the `-inf` tail for free. **No driver script changed**, which is what the
+  entry's "no driver learns what a bucket is" was really asking for.
+
+  **Padded cells contribute exactly zero, verified rather than assumed.**
+  `test_padded_cells_contribute_nothing` primes cells `[n_used, capacity)` with K = 1000 and V = -1000
+  in every layer — through the new index-tensor write, which is the first use of it for something other
+  than an append — and requires the whole prefill+decode sequence to come out bit-identical to the same
+  run against an untouched cache. A zeroed cell reached through a finite mask would also produce zero,
+  so a clean cache could not have told the two apart; this can.
+
+  **Gate.** Full ctest **135/135**, exporter suite **474/474**. `tests/test_graph_builder_reuse.cpp`
+  gained the two tests above and had its decode-sequence assertion inverted — it read
+  `builds() == 4 && reuses() == 0`, the behaviour this item exists to remove, and now reads
+  `builds() == 2 && reuses() == 2`. On real checkpoints, every env-gated cached path:
+  `test_e2e_sliding_window_attention` against **gemma-3-270m-it** (600 tokens past a 512 window, forced
+  decode *and* prefill, both matching HF's own top-1 — the hardest case, with two padded masks and 18
+  cached layers), `test_e2e_causal_lm_infer_with_past` against gemma-3-270m-it and against
+  **LFM2-350M** (a hybrid, so `ConvStateCache` and `KvCache` advance together),
+  `test_e2e_prefill_past_marshalling_ceiling`, `test_e2e_lfm2_mil_export`, and all four whisper tests
+  against whisper-tiny — whisper being the last consumer of the bespoke `["$n_kv", "$n_tokens"]` mask
+  spelling and of the C++ `WhisperDriver`, and so the only place both non-Lua mask writers are
+  exercised at all.
+
+  **No speedup is claimed, and none was measured**, exactly as this entry asked. P4.0.13 measured the
+  retained-graph win at ~15% on Kokoro and inside the noise everywhere else on a single CPU backend; the
+  rebuild is not where these drivers spend their time. The case is P4.0.12's: it removes per-call
+  structure that a second backend, not this one, makes expensive. What it also does is unblock the ring
+  buffer and multi-sequence support listed under "Scope limitations" — both wanted this indirection, and
+  `KvCache::fill_cell_index` is now the single place a second addressing policy would go.
+
+  **What this does not do.** The bucket is a constant, not adaptive: a 4096-token context still rebuilds
+  every 32 steps, and the last bucket of a full cache is ragged (capped at capacity) rather than a
+  boundary. `mentions_symbol("n_past")` is a substring test, so a topology with an `n_past`-derived
+  shape falls back to per-step rebuilds rather than being handled — safe, and no model does it.
 
 - **P4.0.16 — give the compute buffer back when a build stops needing it — DONE (2026-08-06).** Found
   while reviewing P4.0.14's memory cost at the author's prompting, and it turned out the item I had
@@ -3492,20 +3546,17 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 
 ### Performance optimizations designed but not implemented
 
-- **Bucketed KV-cache graph-reuse — half done as P4.0.13; the other half is scheduled as P4.0.15, which
-  needs index-tensor KV writes first.** `GraphBuilder::build()` no longer rebuilds per call: it retains the last graph and
-  returns it unchanged when the axes repeat, with the declared inputs moved out of the gallocr pool so
-  the aliasing hazard cannot apply (P4.0.13 above, `tests/test_graph_builder_reuse.cpp`). That covers
-  every fixed-shape loop. It does **not** cover an autoregressive decode, and the original plan here —
-  round `n_kv` up to a bucket boundary (e.g. 32) and skip the rebuild while the bucket holds — would not
-  have either: `n_past` is baked into each layer's `ggml_view_2d` write offset
-  (`KvCache::write_k/write_v`), so consecutive decode steps differ in the graph regardless of what `n_kv`
-  rounds to. Bucketing `n_kv` is necessary and not sufficient; the write destination has to become data
-  (`ggml_set_rows` + an index input, the indirection listed as absent under "Scope limitations" below)
-  before a bucket boundary buys anything. Both halves then also want the mask padded to the bucket, which
-  `loom.causal_mask` can do for free since it is a host binding, and the padded KV cells contribute
-  exactly zero as long as the mask says `-inf` there. Sequence: index-tensor writes, then buckets, then
-  a decode-loop extension to `test_graph_builder_reuse.cpp`'s bit-identity check.
+- **Bucketed KV-cache graph-reuse — DONE, in two halves: P4.0.13 and P4.0.15.** `GraphBuilder::build()`
+  no longer rebuilds per call: it retains the last graph and returns it unchanged when the axes repeat,
+  with the declared inputs moved out of the gallocr pool so the aliasing hazard cannot apply (P4.0.13,
+  `tests/test_graph_builder_reuse.cpp`). That covered every fixed-shape loop but not an autoregressive
+  decode, and the original plan here — round `n_kv` up to a bucket boundary (e.g. 32) and skip the
+  rebuild while the bucket holds — would not have either: `n_past` was baked into each layer's
+  `ggml_view_2d` write offset (`KvCache::write_k/write_v`), so consecutive decode steps differed in the
+  graph regardless of what `n_kv` rounded to. P4.0.15 made the write destination data (`ggml_set_rows`
+  plus a cell-index tensor, the indirection listed as absent under "Scope limitations" below), bucketed
+  `n_kv` at 32, and padded the mask host-side — a prefill plus 40 decode steps is now three graphs.
+  Read P4.0.15 for where the padding actually happens, which is not where this paragraph guessed.
 - **`ggml_backend_sched` / multi-backend.** Not used anywhere — engine talks to a single `ggml_backend_t`
   directly via a plain `ggml_gallocr`. Fine for CPU-only; needed once a second backend (CUDA/Metal) is
   added and graphs need splitting across devices. This is what makes P4.0.12's retained outputs a
@@ -3518,13 +3569,12 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 
 ### Scope limitations (still true)
 
-- **`KvCache` is single-sequence.** Contiguous append only — no ring buffer, no multi-stream/multi-sequence
-  support, no `ggml_set_rows` index-tensor indirection like llama.cpp's `llama_kv_cache`. That last
-  absence stopped being purely a multi-sequence concern once P4.0.13 landed: because the write
-  destination is a `ggml_view_2d` at a build-time `n_past * nb[1]` offset, the write is what makes every
-  decode step a different graph, so it is also what stands between a decode loop and graph reuse.
-  **Scheduled as P4.0.15**, which is where the plan and the sequence live; the bucketed graph-reuse item
-  above is what it unblocks.
+- **`KvCache` is single-sequence.** No ring buffer, no multi-stream/multi-sequence support. The
+  `ggml_set_rows` index-tensor indirection this entry used to list alongside them **exists since
+  P4.0.15** — writes are addressed by a cell-index tensor, and `KvCache::fill_cell_index` is the single
+  place a second addressing policy would go. What is still missing is a *policy* that uses it: only the
+  contiguous append `[n_past, n_past + n_tokens)` is ever written, reads are still a plain view over
+  `[0, n_kv)`, and there is one `kv_size` for every layer.
 - **KV cache storage is always F32.** No quantized cache types (`Q8_0` etc.). Weight quantization is
   handled per-model by the MIL exporter's `quantize=` kwarg (LFM2, Qwen3) — KV-cache quantization is a
   separate, still-untouched runtime concern (different mechanism, different point in the inference

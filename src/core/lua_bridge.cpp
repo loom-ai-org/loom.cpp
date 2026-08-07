@@ -18,6 +18,7 @@ extern "C" {
 
 #include <ggml-backend.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <new>
@@ -85,6 +86,37 @@ void set_tensor_from_lua_array(lua_State* L, int value_idx, ggml_tensor* tensor)
     } else {
         luaL_error(L, "loom.run_subgraph: input tensor has an unsupported ggml type (only f32/i32 are marshalled)");
     }
+}
+
+// Places a `[n_kv_real, rows]` mask, as a driver's `loom.causal_mask` builds it, into a tensor that was
+// materialized at the BUCKET-PADDED n_kv (BACKLOG.md P4.0.15). Row i's real values go at the tensor's
+// own ne[0] stride and the tail is `-inf`, which is what makes the padded cache cells contribute
+// exactly zero -- they are not zero themselves, so leaving the tail at 0.0 would let a previous
+// generation's K/V into this one's softmax.
+//
+// **This is why no driver script has to learn what a bucket is.** The bucket is the engine's choice
+// about its own cache, made after the driver has already built the only mask it could describe: the one
+// spanning the cells that actually hold this sequence. Padding it is a placement detail of writing that
+// value into a tensor, and this is where the two widths are both known.
+//
+// Returns false when the array is not the real-width shape (a driver that already built the padded
+// width, most obviously), leaving the ordinary exact-size path to handle it.
+bool set_mask_tensor_padded(lua_State* L, int value_idx, ggml_tensor* tensor, int64_t n_kv_real) {
+    if (tensor->type != GGML_TYPE_F32 || n_kv_real <= 0 || tensor->ne[0] <= n_kv_real) return false;
+    const auto rows = static_cast<size_t>(ggml_nelements(tensor) / tensor->ne[0]);
+    const auto n_kv_pad = static_cast<size_t>(tensor->ne[0]);
+    const std::vector<double> vals = read_number_array(L, value_idx);
+    if (vals.size() != static_cast<size_t>(n_kv_real) * rows) return false;
+
+    std::vector<float> padded(static_cast<size_t>(ggml_nelements(tensor)),
+                               -std::numeric_limits<float>::infinity());
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < static_cast<size_t>(n_kv_real); ++c) {
+            padded[r * n_kv_pad + c] = static_cast<float>(vals[r * static_cast<size_t>(n_kv_real) + c]);
+        }
+    }
+    ggml_backend_tensor_set(tensor, padded.data(), 0, padded.size() * sizeof(float));
+    return true;
 }
 
 // Reads `tensor`'s data back out as a flat double vector -- the same f32/i32 dispatch
@@ -304,7 +336,15 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
         if (is_output_ref(L, value_idx)) {
             set_tensor_from_output_ref(L, value_idx, input_it->second, lookup, fname);
         } else {
-            set_tensor_from_lua_array(L, value_idx, input_it->second);
+            // A mask spanning the KV cache is the one input whose declared width is the engine's
+            // business rather than the driver's, because the engine rounds n_kv up to a bucket so a
+            // decode loop can reuse its graph (BACKLOG.md P4.0.15). Everything else goes through the
+            // ordinary exact-size path, and so does this one when there is no padding to do.
+            const bool kv_padded = std::find(r.kv_padded_inputs.begin(), r.kv_padded_inputs.end(), name)
+                                    != r.kv_padded_inputs.end();
+            if (!kv_padded || !set_mask_tensor_padded(L, value_idx, input_it->second, r.n_kv_real)) {
+                set_tensor_from_lua_array(L, value_idx, input_it->second);
+            }
         }
         lua_pop(L, 1);
     }

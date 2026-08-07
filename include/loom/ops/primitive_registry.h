@@ -29,6 +29,15 @@ struct PrimitiveContext {
     KvCache* kv_cache = nullptr;
     ConvStateCache* conv_state = nullptr;
 
+    // The [n_tokens] I64 cell-index tensor a cached ATTENTION writes its K/V through (BACKLOG.md
+    // P4.0.15). Non-null exactly when `kv_cache` is, and synthesized by GraphBuilder rather than
+    // declared by the topology for the same reason `n_kv` is derived rather than passed: its value is a
+    // function of the (n_tokens, n_past) axes the caller already binds, so a driver that had to supply
+    // it could only ever restate what the engine already knows -- and every already-exported cached
+    // model would have to be re-exported to say it. It lives in the builder's persistent input buffer,
+    // outside the gallocr pool, so a REUSED graph's cells can be rewritten between steps.
+    ggml_tensor* kv_cells = nullptr;
+
     // Side-effecting nodes (ATTENTION's KV-cache writes, SHORT_CONV's state writes) that must be
     // included in the
     // compute graph even though nothing "downstream" of the topology's declared output references them

@@ -24,7 +24,6 @@ WhisperDriver::WhisperDriver(GgufModel& encoder_model, GraphTopology encoder_top
 void WhisperDriver::fill_decoder_inputs(const GraphBuilder::BuildResult& r, const std::vector<int32_t>& step_tokens,
                                         uint32_t n_past, const std::vector<float>& xa) {
     const auto n_tokens = static_cast<uint32_t>(step_tokens.size());
-    const uint32_t n_kv = n_past + n_tokens;
 
     std::vector<int32_t> tokens_copy = step_tokens;
     ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, n_tokens * sizeof(int32_t));
@@ -33,8 +32,11 @@ void WhisperDriver::fill_decoder_inputs(const GraphBuilder::BuildResult& r, cons
     for (uint32_t i = 0; i < n_tokens; ++i) positions[i] = static_cast<int32_t>(n_past + i);
     ggml_backend_tensor_set(r.input_tensors.at("positions"), positions.data(), 0, n_tokens * sizeof(int32_t));
 
-    // Same causal-triangle construction as Generator::write_inputs: mask[i*n_kv+j] gates query token i
-    // (absolute position n_past+i) attending to self-attention KV cell j.
+    // Same causal-triangle construction as Generator::write_inputs, including its width: the tensor's
+    // own ne[0], which is the bucket-padded n_kv since BACKLOG.md P4.0.15 and which the `j <= query_pos`
+    // rule already fills with -inf past the end of the sequence.
+    ggml_tensor* mask_t = r.input_tensors.at("kq_mask");
+    const auto n_kv = static_cast<uint32_t>(mask_t->ne[0]);
     std::vector<float> mask(static_cast<size_t>(n_kv) * n_tokens);
     for (uint32_t i = 0; i < n_tokens; ++i) {
         const uint32_t query_pos = n_past + i;
@@ -42,7 +44,7 @@ void WhisperDriver::fill_decoder_inputs(const GraphBuilder::BuildResult& r, cons
             mask[static_cast<size_t>(i) * n_kv + j] = (j <= query_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
         }
     }
-    ggml_backend_tensor_set(r.input_tensors.at("kq_mask"), mask.data(), 0, mask.size() * sizeof(float));
+    ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
 
     ggml_backend_tensor_set(r.input_tensors.at("xa"), xa.data(), 0, xa.size() * sizeof(float));
     // Cross-attention has no causal/padding structure at all -- every query attends to every encoder

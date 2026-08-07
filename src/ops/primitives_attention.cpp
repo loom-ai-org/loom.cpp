@@ -50,28 +50,38 @@ std::vector<ggml_tensor*> op_attention(PrimitiveContext& pc, const std::vector<g
         if (!pc.kv_cache) {
             throw SchemaError("ATTENTION: no KvCache was provided to GraphBuilder, but the topology uses ATTENTION with kv_cache=true");
         }
+        if (!pc.kv_cells) {
+            throw SchemaError("ATTENTION: a KvCache was provided but no cell-index tensor was, which "
+                               "means the axes this graph was built for bind no 'n_past' -- a cached "
+                               "attention has nowhere to write without one");
+        }
         const uint32_t layer = static_cast<uint32_t>(resolve_attr_int(attrs, "layer", pc.symbols));
         const int64_t n_embd_k_gqa = n_embd_head_k * n_head_kv;
         const int64_t n_embd_v_gqa = n_embd_head_v * n_head_kv;
 
         const auto n_tokens = static_cast<uint32_t>(std::llround(pc.symbols.get("n_tokens")));
-        const auto n_past   = static_cast<uint32_t>(std::llround(pc.symbols.get("n_past")));
         const auto n_kv_u32 = static_cast<uint32_t>(std::llround(pc.symbols.get("n_kv")));
 
-        // Append this step's fresh K/V into the persistent cache at cells [n_past, n_past + n_tokens).
+        // Scatter this step's fresh K/V into the persistent cache at the cells `pc.kv_cells` names --
+        // [n_past, n_past + n_tokens) for this single-sequence cache, but as a runtime VALUE rather than
+        // a build-time offset, which is what lets a decode loop reuse one graph (BACKLOG.md P4.0.15).
         // These writes have no data-dependency edge to anything downstream (the cache read below is a
-        // plain memory view, not a consumer of the cpy node), so the caller must route them through
+        // plain memory view, not a consumer of the set_rows node), so the caller must route them through
         // side_effects to guarantee they're included in the graph and executed before the read.
         ggml_tensor* k_flat = ggml_reshape_2d(pc.ctx, k, n_embd_k_gqa, n_tokens);
         ggml_tensor* v_flat = ggml_reshape_2d(pc.ctx, v, n_embd_v_gqa, n_tokens);
-        ggml_tensor* k_write = pc.kv_cache->write_k(pc.ctx, k_flat, layer, n_past, n_tokens);
-        ggml_tensor* v_write = pc.kv_cache->write_v(pc.ctx, v_flat, layer, n_past, n_tokens);
+        ggml_tensor* k_write = pc.kv_cache->write_k(pc.ctx, k_flat, layer, pc.kv_cells);
+        ggml_tensor* v_write = pc.kv_cache->write_v(pc.ctx, v_flat, layer, pc.kv_cells);
         if (pc.side_effects) {
             pc.side_effects->push_back(k_write);
             pc.side_effects->push_back(v_write);
         }
 
         // Read back the whole valid prefix [0, n_kv) -- both prior history and what was just written.
+        // `n_kv` is the BUCKET-PADDED length when GraphBuilder is bucketing (P4.0.15), so this view can
+        // span cells past the real end of the sequence. Those cells contribute exactly zero because the
+        // mask says -inf there and a -inf column's softmax weight is 0 -- never because their contents
+        // are zero, which they are not after a second generation reuses the cache.
         k_cache = ggml_reshape_3d(pc.ctx, pc.kv_cache->read_k(pc.ctx, layer, n_kv_u32), n_embd_head_k, n_head_kv, n_kv_u32);
         v_cache = ggml_reshape_3d(pc.ctx, pc.kv_cache->read_v(pc.ctx, layer, n_kv_u32), n_embd_head_v, n_head_kv, n_kv_u32);
     } else {
