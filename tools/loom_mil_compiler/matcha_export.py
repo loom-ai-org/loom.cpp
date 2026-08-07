@@ -54,9 +54,9 @@ Usage:
 import logging
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -366,10 +366,30 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
 
     model_dir: str
 
+    # Read off the checkpoint in `phases()` and bound into the driver as `ExportConstants`
+    # (P4.0.8's first follow-up). Not constructor arguments: the checkpoint states all three, so a
+    # caller supplying them could only ever be repeating or contradicting it.
+    n_feats: Optional[int] = field(default=None, init=False, repr=False)
+    mel_mean: Optional[float] = field(default=None, init=False, repr=False)
+    mel_std: Optional[float] = field(default=None, init=False, repr=False)
+
     __unchecked__ = {
         "model_dir": Unchecked(
             "the directory holding matcha_ljspeech.ckpt and generator_v1. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
         ),
+        "n_feats": Unchecked(
+            "READ off the restored checkpoint in phases() (`hyper_parameters['n_feats']`), not declared "
+            "against it -- so there is no second authority here to compare it to. It is checked "
+            "indirectly and hard: the same number sizes the Decoder and vocoder phases this config "
+            "traces, so a wrong one fails ct.convert long before any driver runs"
+        ),
+        "mel_mean": Unchecked(
+            "same -- `state_dict['mel_mean']`, the checkpoint's own stored mel normalization "
+            "statistic. Nothing in the graph consumes it (denormalization is host-side arithmetic in "
+            "the driver), so unlike n_feats its only check is numeric: the frozen reference waveform "
+            "in fixtures/legacy_driver_reference/ was produced with these exact values"
+        ),
+        "mel_std": Unchecked("same -- `state_dict['mel_std']`"),
     }
     # A DIRECTORY of `.lua` fragments rather than one file: Matcha is peeled (P4.0.6/C.4), so its
     # driver is assembled from the components below and each surviving hand-written block is its own
@@ -391,20 +411,29 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         by a marker -- the gap that spec's own `Unchecked` note predicted P4.0.6 would close.
         """
         from .driver_components import (
-            DriverReturn, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
+            DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
         from .driver_ir import BinOp, FieldAccess, Var
 
         fragment = self.driver_script_path
-        t_text, t_mel, n_feats = Var("t_text"), Var("t_mel"), Var("n_feats")
+        t_text, t_mel, n_feats = Var("t_text"), Var("t_mel"), Var("N_FEATS")
         tokens = FieldAccess("inputs", "tokens")
         sampler, = self.samplers()
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
             LuaLibrary(uses=("durations_from_logw", "array_sum", "pad_last_to_multiple",
                              "repeat_by_duration_tfast", "array_affine")),
-            LuaFragment(fragment / "01_lengths.lua", defines=("n_feats", "t_text")),
+            # The three numbers only the checkpoint knows, bound as IR locals rather than passed in by
+            # the caller (P4.0.8's first follow-up). They were `infer` arguments, which made every host
+            # -- including tests/tts_driver_inputs.h -- restate the model's own hyperparameters back to
+            # it, and made a wrong one indistinguishable from a deliberate one.
+            ExportConstants(values={
+                "N_FEATS": self.n_feats,
+                "MEL_MEAN": self.mel_mean,
+                "MEL_STD": self.mel_std,
+            }),
+            LuaFragment(fragment / "01_lengths.lua", defines=("t_text",)),
             SubgraphCallComponent(
                 topology="encoder_mu", outputs=("mu_x",), inputs={"tokens": tokens}, length=t_text,
                 note="--- TextEncoder: mu_x, T-fast (ne=[T_text,n_feats], flat[c*t_text+t]) ---"),
@@ -415,7 +444,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
             LuaFragment(fragment / "02_durations.lua", reads=("logw", "t_text"),
                         defines=("durations", "t_mel")),
             LuaFragment(fragment / "03_expand_mu.lua",
-                        reads=("mu_x", "durations", "n_feats", "t_text", "t_mel"),
+                        reads=("mu_x", "durations", "N_FEATS", "t_text", "t_mel"),
                         defines=("mu_y",)),
             # Sits at its CALL site, not at the top: a component's `prelude` is collected separately
             # from its statements, so the generated sampler function still lands above the entry
@@ -431,7 +460,8 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
                      "    so loom.gaussian_array's sequential flat fill is usable directly as the\n"
                      "    Decoder's T-fast `z` input with no reindexing needed. ---",
             ),
-            LuaFragment(fragment / "04_denormalize.lua", reads=("z",), defines=("mel",)),
+            LuaFragment(fragment / "04_denormalize.lua", reads=("z", "MEL_STD", "MEL_MEAN"),
+                        defines=("mel",)),
             SubgraphCallComponent(
                 topology="vocoder", outputs=("waveform",), inputs={"mel": Var("mel")}, length=t_mel,
                 note="--- HiFi-GAN v1 vocoder: mel (T-fast, matching its own native torch\n"
@@ -445,6 +475,14 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
 
         print(f"Loading Matcha checkpoint {matcha_ckpt_path}...")
         enc, hp, sd = load_text_encoder(matcha_ckpt_path)
+
+        # The driver's three constants, read here because this is where the checkpoint is open
+        # (P4.0.8's first follow-up). `mel_mean`/`mel_std` are the checkpoint's own stored mel
+        # normalization statistics -- 0-dim tensors, and the very keys `_is_matcha` uses to tell a
+        # Matcha checkpoint from a piper-VITS one.
+        self.n_feats = int(hp["n_feats"])
+        self.mel_mean = float(sd["mel_mean"].item())
+        self.mel_std = float(sd["mel_std"].item())
 
         dummy_T = 12
         dummy_tokens = torch.randint(1, hp["n_vocab"], (1, dummy_T), dtype=torch.long)
