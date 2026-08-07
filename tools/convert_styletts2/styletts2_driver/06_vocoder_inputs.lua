@@ -6,11 +6,11 @@
     --     stream, AFTER the diffusion sampler's own draws) -- index 0 of rand_ini is a placeholder, zeroed
     --     BY THE GRAPH ITSELF, kept here only to preserve the exact draw-count/order the C++ oracle
     --     established. ---
-    local dim = inputs.harmonic_num + 1
+    local dim = HARMONIC_NUM + 1
     local T_f0 = 2 * T_frames
-    local L = T_f0 * inputs.upsample_scale
+    local L = T_f0 * UPSAMPLE_SCALE
     local rand_ini = {0.0}
     local u = loom.uniform_array(dim - 1)
     for i = 1, dim - 1 do rand_ini[i + 1] = u[i] end
     local noise_in = loom.gaussian_array(dim * L)
-    local wsum = compute_wsum(T_frames, inputs.gen_istft_n_fft, inputs.gen_istft_hop, inputs.upsample_scale)
+    local wsum = compute_wsum(T_frames, GEN_ISTFT_N_FFT, GEN_ISTFT_HOP, UPSAMPLE_SCALE)

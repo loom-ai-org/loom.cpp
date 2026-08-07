@@ -651,24 +651,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(ckpt_path), disable_complex=True)
         model.eval()
 
-        # The istftnet numbers the trace hardcodes, checked against the checkpoint that is supposed to
-        # state them (P4.0.8's first follow-up). Nothing did this before: `_STFT_N_FFT`/`_STFT_HOP`/
-        # `_UPSAMPLE_SCALE` are baked into the traced `decoder_vocoder` graph AND into the driver's
-        # host-side `compute_wsum`, so a checkpoint whose istftnet config differs would export a driver
-        # and a graph that quietly disagree about frame geometry.
-        istftnet = cfg["istftnet"]
-        upsample_scale = math.prod(istftnet["upsample_rates"]) * istftnet["gen_istft_hop_size"]
-        declared = (istftnet["gen_istft_n_fft"], istftnet["gen_istft_hop_size"], upsample_scale)
-        traced = (_STFT_N_FFT, _STFT_HOP, _UPSAMPLE_SCALE)
-        if declared != traced:
-            raise ValueError(
-                f"config.json's istftnet section declares (gen_istft_n_fft, gen_istft_hop_size, "
-                f"prod(upsample_rates)*gen_istft_hop_size) = {declared}, but this export traces "
-                f"{traced} (kokoro_export._STFT_N_FFT/_STFT_HOP/_UPSAMPLE_SCALE). Those numbers are "
-                f"baked into the decoder_vocoder graph and into the driver's own compute_wsum, so they "
-                f"cannot be read off the checkpoint per-export -- a checkpoint that disagrees needs "
-                f"those module constants changed and everything re-traced."
-            )
+        check_istftnet_geometry(cfg)
         self.style_dim, self.d_model, self.hidden_per_dir = (
             prosody_dims(model.text_encoder, model.predictor)[k]
             for k in ("style_dim", "d_model", "hidden_per_dir"))
@@ -821,6 +804,34 @@ class _TextEncoderCnnWrapper(torch.nn.Module):
         for stage in self.cnn:
             x = stage(x)
         return x.squeeze(0).contiguous()
+
+
+def check_istftnet_geometry(cfg) -> None:
+    """Raises unless `cfg`'s istftnet section states the frame geometry this module traces at.
+
+    `_STFT_N_FFT`/`_STFT_HOP`/`_UPSAMPLE_SCALE` are baked into the `decoder_vocoder` graph (through
+    `VerifiedSTFT` and the SineGen upsampling) AND into the driver's own host-side `compute_wsum`, so
+    they cannot be read off a checkpoint per-export the way `prosody_dims` reads its three. What CAN be
+    done is refuse a checkpoint that disagrees, which nothing did before P4.0.8's first follow-up: a
+    config with a different `gen_istft_hop_size` would have exported a graph and a driver that quietly
+    disagree about frame geometry.
+
+    Shared by Kokoro and StyleTTS2 because they share the config file itself -- StyleTTS2's release
+    does not ship these hyperparameters and reads Kokoro's (see `TTSStyleTTS2ExportConfig`).
+    """
+    istftnet = cfg["istftnet"]
+    upsample_scale = math.prod(istftnet["upsample_rates"]) * istftnet["gen_istft_hop_size"]
+    declared = (istftnet["gen_istft_n_fft"], istftnet["gen_istft_hop_size"], upsample_scale)
+    traced = (_STFT_N_FFT, _STFT_HOP, _UPSAMPLE_SCALE)
+    if declared != traced:
+        raise ValueError(
+            f"config.json's istftnet section declares (gen_istft_n_fft, gen_istft_hop_size, "
+            f"prod(upsample_rates)*gen_istft_hop_size) = {declared}, but this export traces "
+            f"{traced} (kokoro_export._STFT_N_FFT/_STFT_HOP/_UPSAMPLE_SCALE). Those numbers are "
+            f"baked into the decoder_vocoder graph and into the driver's own compute_wsum, so they "
+            f"cannot be read off the checkpoint per-export -- a checkpoint that disagrees needs "
+            f"those module constants changed and everything re-traced."
+        )
 
 
 def prosody_dims(text_encoder, predictor) -> Dict[str, int]:
