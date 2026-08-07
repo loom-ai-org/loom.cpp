@@ -17,7 +17,6 @@
 
 #include "test_util.h"
 #include "npy_fixture.h"
-#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
 
@@ -31,7 +30,6 @@
 #include <vector>
 
 int main() {
-    namespace cfg = loom_test::tts_inputs::matcha;
     const char* mil_gguf_env = std::getenv("LOOM_MATCHA_MIL_GGUF");
     if (mil_gguf_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_MATCHA_MIL_GGUF (the matcha GGUF produced by "
@@ -69,13 +67,14 @@ int main() {
         bridge.load_script(driver_script);
 
         const std::vector<double> tokens_d(tokens.begin(), tokens.end());
+        // No n_feats/mel_mean/mel_std: the driver carries them as ExportConstants read off the
+        // checkpoint (P4.0.8's first follow-up). That is also this test's check of them -- the frozen
+        // reference below was produced with the values tts_driver_inputs.h used to supply, so if the
+        // export read anything else off the checkpoint the waveform moves.
         loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"tokens", tokens_d},
             {"n_steps", static_cast<double>(kNSteps)},
             {"seed", static_cast<double>(kSeed)},
-            {"n_feats", static_cast<double>(cfg::n_feats)},
-            {"mel_mean", static_cast<double>(cfg::mel_mean)},
-            {"mel_std", static_cast<double>(cfg::mel_std)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

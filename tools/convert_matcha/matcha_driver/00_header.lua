@@ -24,7 +24,12 @@
 -- topologies' own explicit inputs).
 --
 -- inputs: tokens (int array, real n_vocab=178 Matcha-TTS vocabulary), n_steps (int, Euler sampler step
--- count), seed (int, seeds loom.gaussian_array -- the ONLY stochastic point in this pipeline), plus the
--- real model constants n_feats, mel_mean, mel_std (MatchaConfig's own real defaults).
+-- count), seed (int, seeds loom.gaussian_array -- the ONLY stochastic point in this pipeline).
+--
+-- n_feats, mel_mean and mel_std used to be inputs too. They are N_FEATS/MEL_MEAN/MEL_STD below now,
+-- read off the checkpoint at export time and written into this driver as ordinary locals (P4.0.8's
+-- first follow-up): they are properties of the model, so asking a caller to supply them made every
+-- host restate the checkpoint's own hyperparameters back to it, and made a wrong value
+-- indistinguishable from a deliberate one.
 --
 -- Returns: the raw waveform (flat f32 array), same convention as MatchaDriver::synthesize's own return.
