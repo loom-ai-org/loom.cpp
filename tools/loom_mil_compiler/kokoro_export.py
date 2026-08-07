@@ -43,9 +43,9 @@ import json
 import math
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -477,9 +477,27 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
 
     model_dir: str
 
+    # The three prosody widths, derived from the real modules in `phases()` and bound into the driver
+    # as `ExportConstants` (P4.0.8's first follow-up). See `prosody_dims`, which is also what
+    # `build_prosody_phases` traces against -- one derivation, two readers.
+    style_dim: Optional[int] = field(default=None, init=False, repr=False)
+    d_model: Optional[int] = field(default=None, init=False, repr=False)
+    hidden_per_dir: Optional[int] = field(default=None, init=False, repr=False)
+
     __unchecked__ = {
         "model_dir": Unchecked(
             "the directory holding kokoro-v1_0.pth and its config.json. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
+        ),
+        "style_dim": Unchecked(
+            "DERIVED in phases() by `prosody_dims` from the restored ProsodyPredictor itself, so there "
+            "is no second authority to compare it against. The same value shapes the 21 prosody phases "
+            "this config traces AND the `style` input of each of them, so a wrong one fails the trace"
+        ),
+        "d_model": Unchecked("same -- the DurationEncoder's own LSTM width"),
+        "hidden_per_dir": Unchecked(
+            "same -- `text_encoder.lstm.hidden_size`. Unlike the other two it is not a trace shape but "
+            "a host-loop bound (`run_bi_lstm` slices each direction's output by it), so what checks it "
+            "is numeric: the driver's own e2e test"
         ),
     }
     # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
@@ -505,7 +523,8 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         for most of the remaining nine are D.2's registered component, which declares its topologies as
         data and is where those calls stop being computed strings."""
         from .driver_components import (
-            ComputedCall, DriverReturn, HelperCall, LuaFragment, SubgraphCallComponent,
+            ComputedCall, DriverReturn, ExportConstants, HelperCall, LuaFragment,
+            SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
         from .driver_ir import Call, FieldAccess, Lit, Var
@@ -528,9 +547,20 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                 "from_layout_a", "run_bi_lstm", "run_resblk_stack",
                 "run_proj1x1", "predict_durations", "compute_wsum",
             )),
-            block("01_style.lua",
-                  defines=("T_text", "style_dim", "d_model", "hidden_per_dir",
-                           "s_decoder", "s_predictor")),
+            # The seven numbers the caller used to have to supply (P4.0.8's first follow-up). Three
+            # are read off the real TextEncoder/ProsodyPredictor; four are the istftnet geometry the
+            # decoder_vocoder graph was traced with, cross-checked against config.json in `phases()`.
+            ExportConstants(values={
+                "STYLE_DIM": self.style_dim,
+                "D_MODEL": self.d_model,
+                "HIDDEN_PER_DIR": self.hidden_per_dir,
+                "HARMONIC_NUM": _HARMONIC_NUM,
+                "UPSAMPLE_SCALE": _UPSAMPLE_SCALE,
+                "GEN_ISTFT_N_FFT": _STFT_N_FFT,
+                "GEN_ISTFT_HOP": _STFT_HOP,
+            }),
+            block("01_style.lua", reads=("STYLE_DIM",),
+                  defines=("T_text", "s_decoder", "s_predictor")),
             SubgraphCallComponent(
                 topology="albert_bert_encoder", outputs=("d_en_flat",), length=t_text,
                 inputs={"tokens": FieldAccess("inputs", "input_ids")},
@@ -543,8 +573,8 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             # built in a Lua loop or built inside the loom_lua helper itself -- which is nine of this
             # driver's eleven call sites.
             block("02_duration_encoder.lua",
-                  reads=("d_en_flat", "T_text", "d_model", "style_dim", "s_predictor",
-                         "hidden_per_dir"),
+                  reads=("d_en_flat", "T_text", "D_MODEL", "STYLE_DIM", "s_predictor",
+                         "HIDDEN_PER_DIR"),
                   defines=("d_en_rows", "x", "d", "top_out", "duration_logits", "pred_dur"),
                   drives=(
                       HelperCall("run_bi_lstm", tuple(f"duration_lstm_{i}" for i in range(3)),
@@ -554,11 +584,11 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                       HelperCall("run_bi_lstm", "top_lstm"),
                   )),
             block("03_frame_expansion.lua",
-                  reads=("T_text", "pred_dur", "d", "d_model", "style_dim", "hidden_per_dir"),
+                  reads=("T_text", "pred_dur", "d", "D_MODEL", "STYLE_DIM", "HIDDEN_PER_DIR"),
                   defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
                            "cnn_rows", "t_en", "asr"),
                   drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
-            block("04_f0n.lua", reads=("en", "hidden_per_dir", "s_predictor"),
+            block("04_f0n.lua", reads=("en", "HIDDEN_PER_DIR", "s_predictor"),
                   defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve"),
                   drives=(
                       HelperCall("run_bi_lstm", "f0n_shared_lstm"),
@@ -567,7 +597,9 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                       HelperCall("run_proj1x1", "f0n_f0_proj"),
                       HelperCall("run_proj1x1", "f0n_n_proj"),
                   )),
-            block("05_vocoder_inputs.lua", reads=("T_frames",),
+            block("05_vocoder_inputs.lua",
+                  reads=("T_frames", "HARMONIC_NUM", "UPSAMPLE_SCALE", "GEN_ISTFT_N_FFT",
+                         "GEN_ISTFT_HOP"),
                   defines=("dim", "T_f0", "L", "rand_ini", "u", "noise_in", "wsum")),
             SubgraphCallComponent(
                 topology="decoder_vocoder", outputs=("waveform",),
@@ -581,6 +613,19 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                 multiline=True),
             DriverReturn(values=("waveform",)),
         ]
+
+    def hparams(self) -> dict:
+        """`style_dim`, because a caller cannot build `ref_s` without it.
+
+        `ref_s` is 2*style_dim floats -- the decoder's style half followed by the predictor's -- and a
+        host has to construct it before `infer` can be called at all. Until now the only place that
+        said how long each half is was a literal in tests/tts_driver_inputs.h, which is exactly the
+        "self-contained GGUF" claim being false (P4.0.8's first follow-up).
+
+        The driver ALSO needs it, as `STYLE_DIM` -- Lua cannot read GGUF metadata -- so this is the
+        one number here rendered twice. Not two authorities: both come from `self.style_dim`, which
+        `prosody_dims` derived once from the real module."""
+        return {"style_dim": self.style_dim}
 
     def external_topologies(self) -> Dict[str, str]:
         """Empty, and that is the deliverable.
@@ -605,6 +650,28 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         cfg = json.load(open(config_path))
         model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(ckpt_path), disable_complex=True)
         model.eval()
+
+        # The istftnet numbers the trace hardcodes, checked against the checkpoint that is supposed to
+        # state them (P4.0.8's first follow-up). Nothing did this before: `_STFT_N_FFT`/`_STFT_HOP`/
+        # `_UPSAMPLE_SCALE` are baked into the traced `decoder_vocoder` graph AND into the driver's
+        # host-side `compute_wsum`, so a checkpoint whose istftnet config differs would export a driver
+        # and a graph that quietly disagree about frame geometry.
+        istftnet = cfg["istftnet"]
+        upsample_scale = math.prod(istftnet["upsample_rates"]) * istftnet["gen_istft_hop_size"]
+        declared = (istftnet["gen_istft_n_fft"], istftnet["gen_istft_hop_size"], upsample_scale)
+        traced = (_STFT_N_FFT, _STFT_HOP, _UPSAMPLE_SCALE)
+        if declared != traced:
+            raise ValueError(
+                f"config.json's istftnet section declares (gen_istft_n_fft, gen_istft_hop_size, "
+                f"prod(upsample_rates)*gen_istft_hop_size) = {declared}, but this export traces "
+                f"{traced} (kokoro_export._STFT_N_FFT/_STFT_HOP/_UPSAMPLE_SCALE). Those numbers are "
+                f"baked into the decoder_vocoder graph and into the driver's own compute_wsum, so they "
+                f"cannot be read off the checkpoint per-export -- a checkpoint that disagrees needs "
+                f"those module constants changed and everything re-traced."
+            )
+        self.style_dim, self.d_model, self.hidden_per_dir = (
+            prosody_dims(model.text_encoder, model.predictor)[k]
+            for k in ("style_dim", "d_model", "hidden_per_dir"))
 
         print("Tracing albert_bert_encoder phase...")
         albert_phase = build_albert_bert_encoder_phase(model.bert, model.bert_encoder)
@@ -756,6 +823,27 @@ class _TextEncoderCnnWrapper(torch.nn.Module):
         return x.squeeze(0).contiguous()
 
 
+def prosody_dims(text_encoder, predictor) -> Dict[str, int]:
+    """The three widths both halves of an iSTFTNet-family export need, read off the real modules.
+
+    One derivation with two readers, which is the point: `build_prosody_phases` traces against these,
+    and the family's driver binds them as `ExportConstants` (P4.0.8's first follow-up) so a host stops
+    having to restate them. They cannot disagree, because there is only one of them.
+
+    Shared by Kokoro and StyleTTS2 for the same reason `build_prosody_phases` itself is -- these are
+    the same classes with different weights.
+    """
+    return {
+        # The width of EACH half of `ref_s`: the DurationEncoder's LSTM takes `d_model + style_dim`
+        # channels, and its `fc` is the projection whose input width states the style half.
+        "style_dim": int(predictor.text_encoder.lstms[1].fc.in_features),
+        "d_model": int(predictor.text_encoder.lstms[1].channels),
+        # Per DIRECTION, which is why it is not read off an output width: `run_bi_lstm` slices a
+        # bidirectional cell's concatenated output in half by exactly this.
+        "hidden_per_dir": int(text_encoder.lstm.hidden_size),
+    }
+
+
 def build_prosody_phases(text_encoder, predictor) -> List:
     """Every phase for the TextEncoder + ProsodyPredictor half of an iSTFTNet-family model.
 
@@ -771,8 +859,9 @@ def build_prosody_phases(text_encoder, predictor) -> List:
     pre-MIL `.gguf` alongside, which `external_topologies()` had to declare.
     """
     seq = ct.RangeDim(1, 2000)
-    style_dim = predictor.text_encoder.lstms[1].fc.in_features
-    d_model = predictor.text_encoder.lstms[1].channels
+    dims = prosody_dims(text_encoder, predictor)
+    style_dim = dims["style_dim"]
+    d_model = dims["d_model"]
 
     # DurationEncoder alternates LSTM / AdaLayerNorm, so its three LSTMs are `lstms[0, 2, 4]` and the
     # AdaLayerNorms between them `lstms[1, 3, 5]`.

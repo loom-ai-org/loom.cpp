@@ -23,7 +23,6 @@
 // with the bespoke topologies these replaced is test_e2e_kokoro_mil_topology_equivalence.cpp's job.
 
 #include "test_util.h"
-#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
 
@@ -37,7 +36,6 @@
 #include <vector>
 
 int main() {
-    namespace cfg = loom_test::tts_inputs::kokoro;
     const char* gguf_mil_env = std::getenv("LOOM_KOKORO_MIL_GGUF");
     if (gguf_mil_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_KOKORO_MIL_GGUF (kokoro_mil.gguf) to run this check\n");
@@ -47,8 +45,10 @@ int main() {
 
     // Same fixture as test_e2e_kokoro_lua_driver.cpp/test_e2e_kokoro_driver.cpp's own oracle test.
     const std::vector<int32_t> input_ids = {0, 50, 62, 24, 83, 16, 44, 71, 9, 0};
-    std::vector<float> ref_s(256);
-    for (size_t i = 0; i < ref_s.size(); ++i) ref_s[i] = 0.05f * std::sin(static_cast<float>(i) * 0.37f);
+    // Sized from the file rather than from a C++ literal (P4.0.8's first follow-up): `ref_s` is the
+    // decoder's style half followed by the predictor's, and `loom.style_dim` is how long each is. The
+    // vector itself is filled below, once the model has been opened.
+    std::vector<float> ref_s;
     constexpr float kSpeed = 1.0f;
     constexpr uint32_t kSeed = 42;
 
@@ -61,6 +61,11 @@ int main() {
         LOOM_CHECK(model_mil != nullptr);
         const std::string driver_script = model_mil->kv_str("model.driver_script");
         LOOM_CHECK(!driver_script.empty());
+
+        const uint32_t style_dim = model_mil->hparam_u32("style_dim");
+        ref_s.assign(2 * style_dim, 0.0f);
+        for (size_t i = 0; i < ref_s.size(); ++i) ref_s[i] = 0.05f * std::sin(static_cast<float>(i) * 0.37f);
+        LOOM_CHECK(ref_s.size() == 256);  // the fixture the frozen comparison below was built from
 
         loom::LoomLuaBridge bridge(backend.get());
 
@@ -89,18 +94,14 @@ int main() {
 
         const std::vector<double> input_ids_d(input_ids.begin(), input_ids.end());
         const std::vector<double> ref_s_d(ref_s.begin(), ref_s.end());
+        // None of the seven model constants: the driver carries them as ExportConstants now
+        // (P4.0.8's first follow-up), three derived from the real TextEncoder/ProsodyPredictor and
+        // four from the istftnet geometry the decoder_vocoder graph was traced with.
         loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"input_ids", input_ids_d},
             {"ref_s", ref_s_d},
             {"speed", static_cast<double>(kSpeed)},
             {"seed", static_cast<double>(kSeed)},
-            {"style_dim", static_cast<double>(cfg::style_dim)},
-            {"d_model", static_cast<double>(cfg::d_model)},
-            {"hidden_per_dir", static_cast<double>(cfg::hidden_per_dir)},
-            {"harmonic_num", static_cast<double>(cfg::harmonic_num)},
-            {"upsample_scale", static_cast<double>(cfg::upsample_scale)},
-            {"gen_istft_n_fft", static_cast<double>(cfg::gen_istft_n_fft)},
-            {"gen_istft_hop", static_cast<double>(cfg::gen_istft_hop)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());
