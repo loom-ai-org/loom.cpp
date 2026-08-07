@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, CtcGreedyBuilder, CtcGreedyEpilogue,
-    DriverInputs, ModularChain,
+    DriverInputs, ExportConstants, ModularChain,
     FlowMatchingSampler, LuaFragment, ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder,
     PrefillArgmaxBuilder, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent, caller_input,
     parse_run_subgraph_calls,
@@ -861,8 +861,19 @@ class TestPeeledVits(unittest.TestCase):
         about what stays host-side. What the peel adds is that it now says what it reads."""
         expand = next(c for c in self._components()
                       if isinstance(c, LuaFragment) and "expand_z_p" in str(c.path))
-        self.assertEqual(set(expand.reads), {"stats", "w_ceil", "y_length", "T"})
+        self.assertEqual(set(expand.reads),
+                         {"stats", "w_ceil", "y_length", "T", "INTER_CHANNELS", "NOISE_SCALE"})
         self.assertIn("z_p", expand.defines)
+
+    def test_it_reads_its_two_constants_from_the_export_rather_than_the_caller(self):
+        """P4.0.8's first follow-up. `inter_channels` is the model's own width and `noise_scale` a
+        piper synthesis default; both used to arrive as `infer` arguments, which made every host
+        restate them. The `reads` above is what makes a misspelling here an export-time error rather
+        than a Lua `nil`."""
+        constants = next(c for c in self._components() if isinstance(c, ExportConstants))
+        self.assertEqual(set(constants.values),
+                         {"INTER_CHANNELS", "NOISE_SCALE", "NOISE_SCALE_W", "LENGTH_SCALE"})
+        self.assertEqual(constants.values["INTER_CHANNELS"], 192)
 
 
 class TestPeeledKokoro(unittest.TestCase):

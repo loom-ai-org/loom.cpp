@@ -24,12 +24,12 @@
 // end-to-end without crashing and produces a sane result.
 
 #include "test_util.h"
-#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
 
 #include <ggml-cpu.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -37,7 +37,6 @@
 #include <vector>
 
 int main() {
-    namespace cfg = loom_test::tts_inputs::vits;
     const char* dir_mil_env = std::getenv("LOOM_VITS_MIL_DIR");
     if (dir_mil_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_VITS_MIL_DIR (a directory with vits_mil.gguf, produced "
@@ -72,16 +71,40 @@ int main() {
         bridge.load_script(driver_script);
 
         const std::vector<double> token_ids_d(token_ids.begin(), token_ids.end());
+        // No inter_channels/noise_scale/noise_scale_w/length_scale: the driver carries all four as
+        // ExportConstants now (P4.0.8's first follow-up).
         loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"token_ids", token_ids_d},
             {"seed", static_cast<double>(kSeed)},
-            {"inter_channels", static_cast<double>(cfg::inter_channels)},
-            {"noise_scale", static_cast<double>(cfg::noise_scale)},
-            {"noise_scale_w", static_cast<double>(cfg::noise_scale_w)},
-            {"length_scale", static_cast<double>(cfg::length_scale)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());
+
+        // The three scales stay OVERRIDABLE (`inputs.length_scale or LENGTH_SCALE`), because unlike
+        // every other constant this export binds they are per-utterance knobs -- length_scale is
+        // speaking rate. Passing piper's own defaults explicitly must therefore reproduce the call
+        // above exactly, which checks both halves at once: that the `or` fallback is reached when the
+        // caller says nothing, and that what it falls back to is the value this test used to have to
+        // supply. `infer` re-seeds from `inputs.seed`, so the two calls are directly comparable.
+        loom::LoomLuaBridge::Value explicit_result = bridge.call("infer", {
+            {"token_ids", token_ids_d},
+            {"seed", static_cast<double>(kSeed)},
+            // piper's own published synthesis defaults, as doubles. Deliberately NOT
+            // tts_driver_inputs.h's `float` copies: `static_cast<double>(0.667f)` is
+            // 0.6669999957084656, so comparing against them could only ever be approximate -- and the
+            // whole point of this call is that it is exact.
+            {"noise_scale", 0.667},
+            {"noise_scale_w", 0.8},
+            {"length_scale", 1.0},
+        });
+        const auto& explicit_d = std::get<std::vector<double>>(explicit_result);
+        LOOM_CHECK(explicit_d.size() == wav_d.size());
+        double override_max_diff = 0.0;
+        for (size_t i = 0; i < wav_d.size(); ++i) {
+            override_max_diff = std::max(override_max_diff, std::fabs(explicit_d[i] - wav_d[i]));
+        }
+        std::fprintf(stderr, "defaults-vs-explicit max_abs_diff=%g\n", override_max_diff);
+        LOOM_CHECK(override_max_diff == 0.0);
     }
 
     LOOM_CHECK(!lua_wav.empty());

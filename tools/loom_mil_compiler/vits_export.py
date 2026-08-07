@@ -76,6 +76,22 @@ HP = dict(
     n_speakers=1, gin_channels=0, use_sdp=True,
 )
 
+# Piper's own synthesis defaults, and the one group of numbers in this family that the CHECKPOINT does
+# not state: `epoch=*.ckpt`'s `hyper_parameters` carries the architecture (inter_channels, n_layers,
+# ...) and nothing about inference. These three live in piper's runtime instead --
+# `piper_train/preprocess.py:181` writes `"inference": {"noise_scale": 0.667, "length_scale": 1,
+# "noise_w": 0.8}` into each voice's config JSON, and `piper_train/vits/models.py:686`'s `infer()`
+# defaults agree.
+#
+# They are also the only numbers this export binds that a CALLER may legitimately want to change:
+# length_scale is speaking rate, and the other two are how much variation the sampler is allowed. So
+# unlike every other ExportConstant they are bound as DEFAULTS -- the driver reads
+# `inputs.length_scale or LENGTH_SCALE` -- which keeps the model declaring its own defaults without
+# taking the knob away from the host. Everything else here is structural and has no such reading.
+PIPER_NOISE_SCALE = 0.667
+PIPER_NOISE_SCALE_W = 0.8
+PIPER_LENGTH_SCALE = 1.0
+
 # `spec_channels`/`segment_size` are training-only (PosteriorEncoder's input width / random-slice
 # length) -- irrelevant to inference numerics, `enc_q` is never called in the reverse-mode path any of
 # these three wrappers trace. `spec_channels=513` is real, though (n_fft=1024 -> n_fft/2+1): the
@@ -322,7 +338,9 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         The three surviving Lua blocks are the generate_path frame expansion in its two halves plus the
         pre-scaled noise draw: genuine host control flow over a data-dependent frame count, which is
         what BACKEND.md's conclusion says stays host-side rather than becoming a traced graph."""
-        from .driver_components import DriverReturn, LuaFragment, SubgraphCallComponent
+        from .driver_components import (
+            DriverReturn, ExportConstants, LuaFragment, SubgraphCallComponent,
+        )
         from .lua_library import LuaLibrary
         from .driver_ir import FieldAccess, Var
 
@@ -332,12 +350,24 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
             LuaLibrary(uses=("array_affine", "durations_from_logw", "array_sum")),
+            # The four numbers the caller used to have to supply (P4.0.8's first follow-up).
+            # INTER_CHANNELS is structural -- it is `HP`, the dict this export constructs
+            # `SynthesizerTrn` from and then `load_state_dict(strict=True)`s the real checkpoint into,
+            # so a wrong value cannot survive `phases()`. The three scales are piper's own synthesis
+            # defaults and stay overridable; see PIPER_NOISE_SCALE above.
+            ExportConstants(values={
+                "INTER_CHANNELS": HP["inter_channels"],
+                "NOISE_SCALE": PIPER_NOISE_SCALE,
+                "NOISE_SCALE_W": PIPER_NOISE_SCALE_W,
+                "LENGTH_SCALE": PIPER_LENGTH_SCALE,
+            }),
             LuaFragment(fragment / "01_lengths.lua", defines=("T",)),
             SubgraphCallComponent(
                 topology="stats", outputs=("stats",), inputs={"tokens": token_ids}, length=seq_len,
                 note="--- Phase 1a: stats = TextEncoder -> [m_p;logs_p], T-fast: stats[c*T+t]\n"
                      "    (0-based c/t). ---"),
-            LuaFragment(fragment / "02_z_noise.lua", reads=("T",), defines=("z_noise",)),
+            LuaFragment(fragment / "02_z_noise.lua", reads=("T", "NOISE_SCALE_W"),
+                        defines=("z_noise",)),
             SubgraphCallComponent(
                 topology="logw", outputs=("logw",), length=seq_len,
                 inputs={"tokens": token_ids, "z_noise": Var("z_noise")},
@@ -345,10 +375,11 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
                      "    duration logits. z_noise is host-sampled and ALREADY scaled by\n"
                      "    noise_scale_w (matching LogwWrapper's convention: the graph itself applies\n"
                      "    no further noise_scale multiply). ---"),
-            LuaFragment(fragment / "03_durations.lua", reads=("logw", "T"),
+            LuaFragment(fragment / "03_durations.lua", reads=("logw", "T", "LENGTH_SCALE"),
                         defines=("w_ceil", "y_length")),
-            LuaFragment(fragment / "04_expand_z_p.lua", reads=("stats", "w_ceil", "y_length", "T"),
-                        defines=("inter_channels", "z_p", "out_frame", "noise_idx", "gaussian_pool")),
+            LuaFragment(fragment / "04_expand_z_p.lua",
+                        reads=("stats", "w_ceil", "y_length", "T", "INTER_CHANNELS", "NOISE_SCALE"),
+                        defines=("noise_scale", "z_p", "out_frame", "noise_idx", "gaussian_pool")),
             SubgraphCallComponent(
                 topology="flow_vocoder", outputs=("waveform",), inputs={"z_p": Var("z_p")},
                 length=y_length,
