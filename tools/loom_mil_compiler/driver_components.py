@@ -678,10 +678,11 @@ SYNTHESIZED_BUILDERS = {
 
 # -- adopting a hand-written driver (C.3) ------------------------------------------------------------
 #
-# The five multi-phase TTS families ship a hand-written `.lua` that `render_driver` substitutes
-# generated samplers into. `RawLuaDriver` adopts one whole, unchanged, so the family moves onto the
-# builder in a step whose gate is byte-identity -- and only then gets peeled into real components one
-# at a time (C.4-C.8), each peel independently revertable.
+# The five multi-phase TTS families shipped a hand-written `.lua` apiece. `RawLuaDriver` adopts one
+# whole, unchanged, so the family moves onto the builder in a step whose gate is byte-identity -- and
+# only then gets peeled into real components one at a time (C.4-C.8), each peel independently
+# revertable. All five are peeled, so nothing constructs this today; it is the first step the *next*
+# hand-written driver takes, and its registry entry is where that is argued.
 #
 # **Wrapping the text in a `RawBlock` would, on its own, check nothing.** `check_subgraph_calls` walks
 # `SubgraphCall` nodes, and raw text has none: the export would be byte-identical and the five drivers

@@ -925,8 +925,7 @@ class TestPeeledStyleTTS2(unittest.TestCase):
     """The last family, and the one the plan predicted would "stay partly raw". It does, and the
     boundary is exactly where the plan said: the ADPM2 sampler's `diffusion` call lives inside
     `denoise_fn`, a closure the sampler invokes twice per step, so it cannot be a statement in the
-    entry function at all. That call is what `estimators()`' `EstimatorSpec` is for -- checked without
-    being generated."""
+    entry function at all. It is checked all the same, by the fragment that contains it (P4.0.18)."""
 
     def _config(self):
         from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
@@ -934,16 +933,28 @@ class TestPeeledStyleTTS2(unittest.TestCase):
         return TTSStyleTTS2ExportConfig(checkpoint_path="/unused", output_path="/unused",
                                         architecture="styletts2")
 
+    def _fragments(self):
+        return [c for c in self._config().driver_components() if isinstance(c, LuaFragment)]
+
     def test_only_the_two_top_level_mil_calls_became_ir(self):
         calls = [c for c in self._config().driver_components()
                  if isinstance(c, SubgraphCallComponent)]
         self.assertEqual([c.topology for c in calls], ["albert", "decoder_vocoder"])
 
-    def test_the_closure_bound_diffusion_call_is_covered_by_an_estimator_spec(self):
-        """Not by a component and not by a fragment link: `EstimatorSpec` is the declaration that
-        checks a call without generating it, and this family is the reason that split exists."""
-        specs = self._config().estimators()
-        self.assertEqual([s.topology for s in specs], ["diffusion"])
+    def test_the_closure_bound_diffusion_call_is_covered_by_its_fragments_own_parse(self):
+        """Not by a component: `denoise_fn` is a closure the ADPM2 sampler calls twice per step, so its
+        `diffusion` call cannot be a statement in the entry function at all.
+
+        It is checked anyway, and by the fragment that contains it -- a `RunSubgraphCall` carrying the
+        topology, the exact input set, and the line to open. `estimators()` declared the same two links
+        by hand until P4.0.18; a parse of the real text cannot go stale against it, which is why the
+        declaration went and this did not."""
+        from loom_mil_compiler.driver_components import RunSubgraphCall
+
+        fragment = next(f for f in self._fragments() if f.path.name == "02_style_diffusion.lua")
+        calls = [s for s in fragment.sub_specs() if isinstance(s, RunSubgraphCall)]
+        self.assertEqual([(c.topology, c.inputs) for c in calls],
+                         [("diffusion", ("x_in", "time", "embedding"))])
 
     def test_the_adpm2_helpers_stay_hand_written_lua(self):
         """Two network evaluations per step, Karras preconditioning, per-step noise injection. No

@@ -194,7 +194,10 @@ def _entries() -> Tuple[ComponentEntry, ...]:
                 "the adoption step's component (C.3). All five TTS families passed through it and all "
                 "five are now peeled, so it ships with no user by design -- it is what the *next* "
                 "hand-written driver is adopted by, in a commit whose gate is byte-identity. Deleting "
-                "it would mean the next family's first step has to be written again"
+                "it would mean the next family's first step has to be written again. P4.0.18 removed "
+                "its last CONSTRUCTION site along with the `driver_components() -> None` default that "
+                "selected it: an unused component is fine, a live branch selecting an unused component "
+                "is a route a new family could be taken down by accident"
             ),
         ),
         ComponentEntry(

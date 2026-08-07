@@ -35,9 +35,10 @@ StyleTTS2's diffusion sampler is ADPM2 over a Karras sigma schedule -- two netwo
 per-step noise injection, and real preconditioning math around the call -- so it is NOT a
 `TTSFlowMatchingModelExportConfig` (`flow_matching_export.py`'s own docstring documents why this can't be
 generalized the way Matcha's/Supertonic's plain Euler CFM integration can). This class stays a plain
-`BaseMultiPhaseModelExportConfig` with the ADPM2 loop hand-written in `styletts2_driver/` and only
-`EstimatorSpec`-checked via `estimators()`: the sampler's per-step `run_subgraph` call still gets the same
-export-time validation against the real traced "diffusion" topology, generating no codegen.
+`BaseMultiPhaseModelExportConfig` with the ADPM2 loop hand-written in `styletts2_driver/`. Its per-step
+`run_subgraph` call is checked all the same, by the fragment that contains it: `LuaFragment` parses
+`02_style_diffusion.lua`'s own call site and declares it against the real traced "diffusion" topology,
+generating no codegen and needing no second declaration to keep in sync (BACKLOG.md P4.0.18).
 
 Numerically verified against real-checkpoint references (see `tools/convert_styletts2/
 reference_forward_styletts2_{albert_mil,diffusion}.py` and `kokoro_export.py`'s own already-verified
@@ -58,7 +59,6 @@ import torch
 import coremltools as ct
 
 from .checkpoint_probe import probe_torch_checkpoint
-from .flow_matching_export import EstimatorSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .patcher import ModelPatcher
 from .spec_protocol import Unchecked
@@ -329,9 +329,14 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         `run_subgraph` calls become IR; seven name their topology with a computed expression, two sit
         inside Lua `for` loops, one is external, and **one is inside a closure**: `denoise_fn` is a
         local function the ADPM2 sampler calls twice per step, so its `diffusion` call cannot be a
-        statement in the entry function at all. That call is what `estimators()`' `EstimatorSpec`
-        exists for -- it is checked without being generated, which is the split
-        `flow_matching_export.py`'s own docstring argues for and this family is the reason it exists.
+        statement in the entry function at all. It is checked anyway, and by the fragment rather than
+        by a declaration beside it: `02_style_diffusion.lua`'s `LuaFragment` parses the call out of its
+        own text and hands the checker a `RunSubgraphCall` carrying the file and the line. A closure is
+        no obstacle to that -- the parse reads Lua source, not entry-function structure.
+
+        This is what `estimators()` used to do here, and P4.0.18 removed it as the duplicate it was:
+        the same topology, the same input set, the same two links, and one of the two labels naming a
+        line a reader can open.
 
         The ADPM2 sampler itself stays a hand-written helper in `00_header.lua`, unchanged: two network
         evaluations per step, Karras preconditioning, per-step noise injection. No template emits that
@@ -587,14 +592,6 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                 f"{path} has no model_params.diffusion.dist.sigma_data ({exc}). The driver's "
                 f"KDiffusion preconditioning cannot be written without it."
             ) from exc
-
-    def estimators(self) -> List[EstimatorSpec]:
-        # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
-        # true one-offs, and this one is a second-order sampler with two network evaluations and real
-        # preconditioning math per step -- see styletts2_driver/). But its per-step `run_subgraph`
-        # call has the same failure mode as every generated one, so it is declared here and cross-checked
-        # against the real traced "diffusion" topology at export time rather than at run time.
-        return [EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "embedding"])]
 
 
 def _is_styletts2(path: Path) -> bool:

@@ -21,7 +21,15 @@ and both hand-wrote the identical Lua loop to do it:
 A `FlowMatchingSpec` declares the six things that actually differ between them -- the estimator
 topology's name, which of its inputs carries the state, which carries the scalar time, which are fixed
 across steps, how many elements the state has, and what `n_tokens` to build the estimator's graph at --
-and `render_sampler` emits that loop as a named Lua function the hand-written driver calls in one line.
+and `render_sampler` emits that loop as a named Lua function.
+
+**Where that function lands is `driver_components.FlowMatchingSampler`'s business, not this module's**
+(BACKLOG.md P4.0.18). Until then this module also owned a `render_driver` that substituted the emitted
+text into a hand-written `.lua` at a `--@loom:samplers` marker, and ran the export's link checks on the
+way past. Both halves moved: the component emits the function as its `prelude` and the line calling it
+as IR, and `DriverBuilder.build` runs the checks over every component's specs. What is left here is the
+declaration and the codegen -- `render_sampler` is a pure `FlowMatchingSpec -> str`, with no opinion
+about the file it ends up in.
 
 The point is not the line count. It is that the spec is **checked against the real traced topology** at
 export time (`validate_against_topology`): naming an input the estimator doesn't declare, or forgetting
@@ -39,15 +47,21 @@ preconditioning math around the call), and Kokoro/VITS's duration loops are a di
 
 The *validation*, though, generalizes further than the codegen does -- a hand-written `run_subgraph`
 call fails the same way a generated one would. So `EstimatorSpec` (below) is its own declaration: a
-bespoke sampler can still declare which topology it calls with which inputs and get the export-time
-check, generating nothing. See BACKEND.md for why the loop itself stays host-side rather than becoming
-a MIL `while_loop`.
+topology name plus the exact input set handed to it, checked without generating anything. It is what
+`FlowMatchingSpec.estimator_spec()` reduces to, so the generated and the hand-written call share one
+validation implementation, and it is the shape `driver_components.RunSubgraphCall` copies for a call
+site *found in* hand-written Lua rather than declared about it. StyleTTS2's ADPM2 sampler -- the case
+this split was written for -- is covered by that parse today: `LuaFragment` reads its
+`loom.run_subgraph("diffusion", ...)` out of the fragment and declares it with the file and line, which
+is the same check with a better label and nothing to keep in sync (P4.0.18).
+
+See BACKEND.md for why the loop itself stays host-side rather than becoming a MIL `while_loop`.
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .spec_protocol import (
-    CoveredBy, DriverSymbol, FieldRef, LinkChecker, TopologyInput, TopologyName, TopologyOutputArity,
+    CoveredBy, DriverSymbol, FieldRef, TopologyInput, TopologyName, TopologyOutputArity,
     Unchecked,
 )
 
@@ -80,7 +94,8 @@ class EstimatorSpec:
 
     def link_label(self) -> str:
         """A driver can declare several hand-written estimator calls, so the topology name is what
-        tells a reader which one failed -- matching the label `render_driver` used to pass by hand."""
+        tells a reader which one failed. `RunSubgraphCall` prefixes the same label with the file and
+        line, which is what a call site read out of real Lua can say and a declaration cannot."""
         return f"EstimatorSpec({self.topology!r})"
 
     def validate_against_topology(self, topology: dict, label: Optional[str] = None):
@@ -138,10 +153,10 @@ class FlowMatchingSpec:
         "time_input": CoveredBy("supplied_inputs"),
         "fixed_inputs": CoveredBy("supplied_inputs"),
         # Was `Unchecked` until P4.0.6/C.4, with the reason "checkable as a DriverSymbol only once the
-        # driver is IR rather than text". It now is, for both driver shapes, because `DriverSymbol`
-        # resolves against the built *script* rather than the entry function alone: a generated sampler
-        # is a top-level `local function` in the prelude either way -- emitted by `FlowMatchingSampler`
-        # for a peeled family, substituted into the adopted text for one that is not.
+        # driver is IR rather than text". It now is, because `DriverSymbol` resolves against the built
+        # *script* rather than the entry function alone: `FlowMatchingSampler` emits this function into
+        # the prelude and the line calling it as IR, so the name the call uses and the name the
+        # definition binds are one field checked in one place (P4.0.18).
         "func_name": DriverSymbol(),
     }
     __unchecked__ = {
@@ -210,67 +225,3 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
         "end",
     ]
     return "\n".join(lines)
-
-
-# The marker a hand-written driver puts on its own line where the generated sampler(s) should land.
-SAMPLER_MARKER = "--@loom:samplers"
-
-
-def render_driver(driver_source: str, specs=(), topologies=None, estimators=(), checker=None) -> str:
-    """Substitutes `SAMPLER_MARKER` in a hand-written driver with `specs`' generated sampler functions.
-
-    When `topologies` is given (the exporter's own `topologies` dict), every spec is validated against
-    its estimator's real declared inputs first -- so a mismatch is an export-time error naming the
-    offending input, not a run-time engine error. `estimators` carries plain `EstimatorSpec`s for calls
-    the driver still writes by hand (StyleTTS2's ADPM2 sampler): they are checked but generate nothing.
-
-    With no `specs`, no marker is required -- a driver can opt into the validation alone.
-
-    As of P4.0.5 the checking is `spec_protocol`'s (`EXPORT-PREPARATION.md` stage B.2). `checker` lets
-    the caller pass the export-wide `LinkChecker` -- `MultiPhase.export` does, so a spec declared here
-    and a spec declared anywhere else in the same export share one deferral ledger and one `finish()`.
-
-    **Without one, a local checker is built and finished here -- and since P4.0.6/C.4 that is no longer
-    the same guarantee.** `FlowMatchingSpec.func_name` is a `DriverSymbol`, answerable only against the
-    built driver, which this function does not have: it produces the text, the builder produces the
-    script. So the local checker is handed the substituted source as the driver, which is exactly what
-    it is -- a Lua module whose top-level `local function` definitions are the symbols in question.
-    """
-    if topologies is not None:
-        owned = checker is None
-        checker = checker or LinkChecker()
-        for spec in list(specs) + list(estimators):
-            checker.check(spec)
-        checker.provide(topologies=topologies)
-        if owned:
-            rendered = _substitute(driver_source, specs)
-            checker.provide(driver=_TextDriver(rendered.split("\n")))
-            checker.finish()
-    return _substitute(driver_source, specs)
-
-
-def _substitute(driver_source: str, specs) -> str:
-    if not specs:
-        return driver_source
-    if SAMPLER_MARKER not in driver_source:
-        raise ValueError(
-            f"driver source has no {SAMPLER_MARKER!r} line for the generated sampler(s) to replace"
-        )
-    return driver_source.replace(SAMPLER_MARKER, "\n\n".join(render_sampler(s) for s in specs))
-
-
-@dataclass
-class _TextDriver:
-    """A driver that is still text rather than a built `DriverScript`, for `DriverSymbol` to read.
-
-    Every line is "prelude" because that is what the substituted source is from this function's point
-    of view: a Lua module whose top-level definitions are visible and whose entry function's body is
-    not this function's business."""
-
-    prelude: list
-
-    @property
-    def entry(self):
-        from .driver_ir import Function
-
-        return Function("<text driver>", [], [])

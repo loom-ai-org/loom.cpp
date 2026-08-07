@@ -42,7 +42,7 @@ class Decomposition:
     def export(self, config) -> str:
         raise NotImplementedError
 
-    def driver_builder(self, config, **context):
+    def driver_builder(self, config):
         """The `driver_builder.DriverBuilder` that assembles this decomposition's driver for `config`,
         or `None` if this decomposition does not build one.
 
@@ -54,12 +54,14 @@ class Decomposition:
         2 + 6) arrives bringing its own builder rather than every family in it declaring one.
 
         `config` is passed because the *contents* still are family-specific: `MultiPhase` reads which
-        phases and samplers this family declared. What the decomposition fixes is the shape.
+        phases and components this family declared. What the decomposition fixes is the shape.
 
-        `**context` is whatever the specific decomposition documents needing beyond the config, in the
-        same "hooks are a protocol, not a base class" spirit as `export()` itself -- `MultiPhase` takes
-        `source=`, the driver text after its generated samplers have been substituted in, because that
-        text only exists once the phases have been traced.
+        And `config` is the whole signature, as of P4.0.18. There was a `**context` besides it, in the
+        same "hooks are a protocol, not a base class" spirit as `export()` itself, and exactly one thing
+        was ever passed through it: `MultiPhase`'s `source=`, the driver text after `render_driver` had
+        substituted its generated samplers in. With the substitution gone there is no text to hand over
+        -- a builder is built from the config's own component list -- so the parameter went with it
+        rather than staying as an extension point nobody had asked for twice.
 
         Returning `None` is a real answer, not a stub: `Flattened` covers both the synthesized
         prefill path and the bespoke hand-built-Program workflow, and the latter transpiles a MIL `main`
@@ -197,28 +199,22 @@ class MultiPhase(Decomposition):
     genuinely cannot be traced as one graph (separate checkpoints, a Python-side sampler between stages,
     or a submodule that is not the model's own `forward`). Declared, not chosen.
 
-    Config hooks: `phases()`, `samplers()`, `estimators()`, `driver_script_path`, `architecture`."""
+    Config hooks: `phases()`, `samplers()`, `driver_components()`, `driver_script_path`,
+    `architecture`."""
 
-    def driver_builder(self, config, **context):
-        """A `MultiPhaseDriverBuilder` around this family's hand-written driver (P4.0.6/C.3).
+    def driver_builder(self, config):
+        """A `MultiPhaseDriverBuilder` around this family's component list (P4.0.6/C.4-C.8).
 
-        Takes `source=` -- the driver text *after* `render_driver` has substituted the generated
-        samplers -- because that text does not exist until every phase has been traced, which is also
-        the moment the topologies it will be checked against come into being.
+        One shape, as of P4.0.18. There was a second until then -- `RawLuaDriver` around the whole
+        hand-written `.lua`, selected when `driver_components()` returned `None` -- and it was the
+        adoption step every family passed through on its way to being peeled. All five are peeled, so
+        the branch selected nothing and kept `render_driver`'s marker substitution alive behind it.
+        `RawLuaDriver` itself stays: it is how the *next* hand-written driver is adopted, in a commit
+        whose gate is byte-identity, and its registry entry has said so since D.1.
         """
-        from .driver_components import MultiPhaseDriverBuilder, RawLuaDriver
+        from .driver_components import MultiPhaseDriverBuilder
 
-        peeled = config.driver_components()
-        if peeled is not None:
-            # A peeled family (C.4-C.8) builds its driver from components and never reads the whole
-            # `.lua`, so `source` -- and with it `render_driver`'s marker substitution -- is unused:
-            # its sampler is a `FlowMatchingSampler` component that emits both the function and the
-            # line calling it.
-            return MultiPhaseDriverBuilder(peeled=peeled)
-        return MultiPhaseDriverBuilder(driver=RawLuaDriver(
-            source=context["source"], origin=config.driver_script_path.name,
-            external=config.external_topologies(),
-        ))
+        return MultiPhaseDriverBuilder(peeled=config.driver_components())
 
     def export(self, config) -> str:
         import coremltools as ct
@@ -226,7 +222,6 @@ class MultiPhase(Decomposition):
 
         from .driver_builder import DriverContext
         from .exporter import LoomGGUFExporter
-        from .flow_matching_export import render_driver
         from .multi_phase_export import RecurrentPhase, merge_phase_weights
         from .spec_protocol import LinkChecker
 
@@ -280,21 +275,11 @@ class MultiPhase(Decomposition):
         out_exporter.topologies = phase_topologies
         out_exporter.weights = merge_phase_weights(named_weights)
 
-        peeled = config.driver_components()
-        # `render_driver`'s marker substitution is the unpeeled path only: a peeled family's sampler is
-        # a `FlowMatchingSampler` component that emits both the generated function and the line calling
-        # it, and its specs are checked through the builder like every other component's.
-        driver_source = None if peeled is not None else render_driver(
-            config.driver_script_path.read_text(), config.samplers(),
-            topologies=out_exporter.topologies, estimators=config.estimators(),
-            checker=checker,
-        )
-        # The driver goes through a DriverBuilder as of P4.0.6/C.3, which for now holds one component:
-        # the hand-written source, adopted whole. That is not cosmetic even while the emitted text is
-        # byte-identical -- the adoption parses the driver's own `loom.run_subgraph` call sites and
-        # declares each against the topologies just traced, which is the first time these five drivers
-        # have been cross-checked against the model they ship with at all.
-        driver_source = self.driver_builder(config, source=driver_source).render(
+        # Every check this used to route through `render_driver` now runs inside the builder, over the
+        # same `checker` (P4.0.18): a `FlowMatchingSpec` reaches it as `FlowMatchingSampler.sub_specs`,
+        # and a `run_subgraph` call still written by hand reaches it as the `RunSubgraphCall` its
+        # `LuaFragment` parsed out -- with the fragment's own file and line on the label.
+        driver_source = self.driver_builder(config).render(
             DriverContext(
                 topologies=out_exporter.topologies,
                 # A recurrent cell has no root axis -- it is one timestep, with no time

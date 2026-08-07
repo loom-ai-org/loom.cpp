@@ -7,11 +7,12 @@ The graph side of this exporter already has the shape this module gives the driv
     DriverBuilder : how those topologies become a driver
 
 `decomposition.py` answers the first question for every family. The second had no owner at all: two
-orchestration shapes are synthesized straight into `driver_ir` nodes inside `LoomGGUFExporter`
-(`apply_monolithic_export`, `apply_modular_export`), while the five TTS families ship a hand-written
-`.lua` that `flow_matching_export.render_driver` performs a string substitution into. Same artifact,
-four assembly mechanisms, no common calling convention -- which is what makes adding a family feel
-bespoke even though the pieces to build one already exist (`EXPORT-PREPARATION.md` §1.5).
+orchestration shapes were synthesized straight into `driver_ir` nodes inside `LoomGGUFExporter`
+(`apply_monolithic_export`, `apply_modular_export`), while the five TTS families shipped a hand-written
+`.lua` that `flow_matching_export.render_driver` performed a string substitution into. Same artifact,
+four assembly mechanisms, no common calling convention -- which is what made adding a family feel
+bespoke even though the pieces to build one already existed (`EXPORT-PREPARATION.md` §1.5). Every one
+of those paths is a component list through this module now, and the substitution is gone (P4.0.18).
 
 **What a component is.** One contribution to a driver: some statements in the entry function, some
 top-level Lua before it (a generated sampler function is exactly this), or both. It declares its links
@@ -58,7 +59,7 @@ class DriverContext:
     """The real things a component emits against: the exported topologies, each one's declared root
     axis, and the merged weights.
 
-    Exactly what `MultiPhase.export` already assembles before it calls `render_driver`, and what
+    Exactly what `MultiPhase.export` already assembles before it builds the driver, and what
     `LoomGGUFExporter` already holds by the time it synthesizes a driver -- named once here so a
     component can be handed it rather than being handed the exporter (which would make every component
     depend on the 2000-line class it happens to be called from today).

@@ -1,8 +1,8 @@
 """`BaseMultiPhaseModelExportConfig` + `TTSFlowMatchingModelExportConfig` (BACKLOG.md P3.3): the shared
-"trace N independently-traced topologies, merge their weights, optionally render a flow-matching
-sampler, write one GGUF" driver that replaces the near-identical tail of every TTS `export_*_mil.py`
-script (Kokoro/StyleTTS2/VITS's own `_build_topology` + weight-merge + `write_gguf` boilerplate, and
-Matcha/Supertonic's additional `render_driver`/`FlowMatchingSpec` wiring on top of it).
+"trace N independently-traced topologies, merge their weights, build the driver, write one GGUF"
+driver that replaces the near-identical tail of every TTS `export_*_mil.py` script
+(Kokoro/StyleTTS2/VITS's own `_build_topology` + weight-merge + `write_gguf` boilerplate, and
+Matcha/Supertonic's additional `FlowMatchingSpec` wiring on top of it).
 
 This is domain-agnostic mechanics, not a TTS-specific concept -- any family whose export is "N
 independently-traced topologies assembled into one GGUF" fits `BaseMultiPhaseModelExportConfig`, the
@@ -26,7 +26,7 @@ import torch.nn as nn
 
 from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
-from .flow_matching_export import EstimatorSpec, FlowMatchingSpec
+from .flow_matching_export import FlowMatchingSpec
 from .spec_protocol import Axis, ConfigDerived, NestedSpec, Unchecked
 
 
@@ -239,12 +239,13 @@ def merge_phase_weights(named_weights: List[Tuple[str, Dict[str, np.ndarray]]]) 
 
 @dataclass(kw_only=True)
 class BaseMultiPhaseModelExportConfig(LoomExportConfig):
-    """Trace-each-phase / merge-weights-with-collision-check / optionally-render_driver / write_gguf.
-    Subclasses implement `phases()`; `samplers()` (`FlowMatchingSpec`s -- codegen a sampler function)
-    and `estimators()` (plain `EstimatorSpec`s -- validate a hand-written sampler call, generate
-    nothing) both default to empty, so calling `render_driver` is always safe: with nothing to check or
-    generate it returns the driver source unchanged, matching a family with no sampler at all (Kokoro,
-    VITS) exactly as if `render_driver` were never called.
+    """Trace-each-phase / merge-weights-with-collision-check / build-the-driver / write_gguf.
+
+    Subclasses implement `phases()` and `driver_components()`. `samplers()` (`FlowMatchingSpec`s --
+    what a sampler function is generated from) defaults to empty, for the three families that have no
+    sampler at all; a family that declares one reads it back in `driver_components()` and hands it to
+    the `FlowMatchingSampler` that emits it, which is what keeps the declaration and the emission one
+    object rather than two that must agree.
 
     The mechanics live in `decomposition.MultiPhase` (BACKLOG.md P4.0.3), which is `decomposition`'s
     default here rather than a caller choice: a phase split exists because the model genuinely cannot be
@@ -255,11 +256,12 @@ class BaseMultiPhaseModelExportConfig(LoomExportConfig):
 
     __unchecked__ = {
         "driver_script_path": Unchecked(
-            "the hand-written Lua the export substitutes generated samplers into. Its *contents* are "
-            "checked -- every declared sampler and estimator is cross-checked against the real traced "
-            "topologies by render_driver -- but the path itself is only a file that must exist, which "
-            "read_text() reports better than a link would. P4.0.6 turns the driver into IR, at which "
-            "point this field stops being a path at all."
+            "the DIRECTORY of `.lua` fragments this family's `driver_components()` reads its surviving "
+            "hand-written blocks from. Their *contents* are checked -- `LuaFragment` parses each one's "
+            "`run_subgraph` call sites and declares them against the real traced topologies, and its "
+            "reads/defines are cross-checked against its own text -- but the path itself only has to "
+            "resolve, and a wrong one is a FileNotFoundError naming the fragment `LuaFragment.__post_"
+            "init__` tried to read, which is more specific than a link saying the directory is absent."
         ),
     }
 
@@ -269,18 +271,15 @@ class BaseMultiPhaseModelExportConfig(LoomExportConfig):
     def samplers(self) -> List[FlowMatchingSpec]:
         return []
 
-    def estimators(self) -> List[EstimatorSpec]:
-        return []
+    def driver_components(self) -> List:
+        """The `DriverComponent`s this family's driver is built from (P4.0.6/C.4-C.8).
 
-    def driver_components(self) -> Optional[List]:
-        """The `DriverComponent`s this family's driver is built from, or `None` while it is still one
-        hand-written `.lua` adopted whole (P4.0.6/C.3's `RawLuaDriver`).
-
-        This is the migration seam, and it is deliberately per-family: a family is peeled in its own
-        commit, gated by its own e2e test, and every other family keeps exporting byte-identically
-        while that happens. `driver_script_path` stays meaningful for both -- an unpeeled family reads
-        the whole file, a peeled one reads its fragments from the directory beside it."""
-        return None
+        Required, like `phases()`, as of P4.0.18. It returned `None` by default while the five families
+        were being peeled one commit at a time, and `None` selected `RawLuaDriver` around the whole
+        hand-written `.lua`. Every family is peeled, so that default routed nothing -- and a default
+        that silently routes a *new* family onto a path no shipped family takes is worse than no
+        default at all, which is the argument for making the hook answer rather than assume."""
+        raise NotImplementedError
 
     def external_topologies(self) -> Dict[str, str]:
         """`{topology name: where it comes from}` for topologies this family's driver calls that this
@@ -308,5 +307,5 @@ class TTSFlowMatchingModelExportConfig(BaseMultiPhaseModelExportConfig):
     "CFM"), layered on top of the same multi-phase tracing every TTS family needs. StyleTTS2's ADPM2
     sampler is NOT this class -- `flow_matching_export.py`'s own docstring already documents why it
     can't be generalized (two network evals/step, Karras preconditioning, not flow matching) -- so
-    StyleTTS2 stays a plain `BaseMultiPhaseModelExportConfig` with its sampler hand-written and merely
-    `EstimatorSpec`-checked via `estimators()`."""
+    StyleTTS2 stays a plain `BaseMultiPhaseModelExportConfig` with its sampler hand-written in a
+    `LuaFragment`, whose own parse is what declares the `diffusion` call it makes."""

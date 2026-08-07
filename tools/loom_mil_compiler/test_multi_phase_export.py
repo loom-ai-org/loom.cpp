@@ -100,6 +100,28 @@ class TestStandingRuleOnTheMultiPhaseFamily(unittest.TestCase):
             self.assertEqual(dangling_coverage(cls), [], cls.__name__)
 
 
+class TestTheDriverHookIsRequired(unittest.TestCase):
+    """P4.0.18. `driver_components()` returned `None` by default while the five TTS families were being
+    peeled one commit at a time, and `None` selected `RawLuaDriver` around the whole hand-written
+    `.lua` -- with `render_driver`'s marker substitution feeding it.
+
+    Every family is peeled, so that default routed nothing. What makes removing it worth a test rather
+    than a diff is the failure it prevents: a *new* family that simply does not implement the hook was
+    silently taken down the unpeeled path, where its driver is one opaque text block. Now it stops, the
+    way an unimplemented `phases()` does."""
+
+    def test_a_family_that_does_not_implement_it_raises_rather_than_defaulting(self):
+        config = BaseMultiPhaseModelExportConfig(
+            architecture="unimplemented", output_path="/unused.gguf",
+            driver_script_path=Path("/unused"),
+        )
+        with self.assertRaises(NotImplementedError):
+            config.driver_components()
+        # The same rule `phases()` has always had, and the comparison is the argument for the change.
+        with self.assertRaises(NotImplementedError):
+            config.phases()
+
+
 class TestASRRootAxisIsNowADeclaration(unittest.TestCase):
     """`backend_kwargs()` used to return the literal `"n_samples"`. Making it a field changes no value
     and no export -- it makes the claim checkable, which is the whole of B.5's "what moves is the

@@ -141,7 +141,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
   <br>*says:* {label} declares topolog(ies) {detail} as external, but its driver never calls them.
 * `source` — holds spec(s) with links of their own, checked in DriverBuilder.build, via sub_specs() -- every loom.run_subgraph call site in this text with a literal topology name is parsed out and declared as a RunSubgraphCall, which is what gives the five hand-written drivers their first cross-check against the topologies they are actually shipped with
 
-> No model uses it today: the adoption step's component (C.3). All five TTS families passed through it and all five are now peeled, so it ships with no user by design -- it is what the *next* hand-written driver is adopted by, in a commit whose gate is byte-identity. Deleting it would mean the next family's first step has to be written again.
+> No model uses it today: the adoption step's component (C.3). All five TTS families passed through it and all five are now peeled, so it ships with no user by design -- it is what the *next* hand-written driver is adopted by, in a commit whose gate is byte-identity. Deleting it would mean the next family's first step has to be written again. P4.0.18 removed its last CONSTRUCTION site along with the `driver_components() -> None` default that selected it: an unused component is fine, a live branch selecting an unused component is a route a new family could be taken down by accident.
 
 ### `lua_fragment` — `LuaFragment`
 
