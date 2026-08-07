@@ -35,23 +35,25 @@
 --     input-for-input (StyleTTS2's decoder/generator/sinegen ARE Kokoro's own istftnet classes, just
 --     StyleTTS2's own checkpoint weights -- see export_styletts2_mil.py's own module docstring).
 --
--- Expects topologies pre-registered by the host, from TWO GgufModel instances sharing one bridge:
---   styletts2_mil.gguf: "albert", "decoder_vocoder", "diffusion"
---   the existing bespoke output of convert_styletts2_reused.py (kokoro_bert_encoder.gguf,
---     kokoro_text_encoder_cnn.gguf, kokoro_text_encoder_lstm_{h,c}_{fwd,bwd}.gguf,
---     kokoro_duration_lstm_{0,1,2}_{h,c}_{fwd,bwd}.gguf, kokoro_duration_adaln_{0,1,2}.gguf,
---     kokoro_duration_top_lstm_{h,c}_{fwd,bwd}.gguf, kokoro_duration_proj.gguf,
---     kokoro_f0n_shared_lstm_{h,c}_{fwd,bwd}.gguf, kokoro_f0n_f0_block{0,1,2}.gguf,
---     kokoro_f0n_n_block{0,1,2}.gguf, kokoro_f0n_f0_proj.gguf, kokoro_f0n_n_proj.gguf) -- none use a
---     KvCache. register_module doesn't care which GgufModel a topology's weights live in, only that all
---     of them share one LoomLuaBridge instance.
+-- Expects every topology pre-registered by the host from ONE GgufModel over styletts2_mil.gguf --
+-- none uses a KvCache. It used to take two, because this export was partial and the LSTM-bound half
+-- came from convert_styletts2_reused.py's per-topology GGUFs alongside; P4.0.7 traced those from the
+-- real checkpoint too, so the artifact is self-contained now.
 --
 -- inputs: input_ids (int array, real StyleTTS2 wraps with a SINGLE LEADING 0 token only -- caller's
 -- responsibility), diffusion_steps (int, ADPM2Sampler's own num_steps), seed (int, seeds loom.seed_rng --
 -- BOTH the diffusion sampler's own noise draws AND SineGen's rand_ini/noise draws are drawn from this one
 -- shared stream, in that order, matching styletts2_driver.lua's own draw order EXACTLY so the two drivers
--- stay bit-reproducible against each other given the same seed), plus the real model constants style_dim,
--- d_model, hidden_per_dir, harmonic_num, upsample_scale, gen_istft_n_fft, gen_istft_hop, sigma_min,
--- sigma_max, rho, sigma_data (StyleTTS2Config's own real defaults).
+-- stay bit-reproducible against each other given the same seed).
+--
+-- style_dim, d_model, hidden_per_dir, harmonic_num, upsample_scale, gen_istft_n_fft, gen_istft_hop,
+-- sigma_min, sigma_max, rho and sigma_data used to be inputs too. They are the eleven UPPER_CASE
+-- locals below now (P4.0.8's first follow-up): three read off the real TextEncoder/ProsodyPredictor,
+-- four the istftnet geometry the decoder_vocoder graph was traced with, three StyleTTS2's own
+-- "empirical" Karras schedule, and SIGMA_DATA out of the checkpoint's own config.yml, where
+-- `estimate_sigma_data: True` makes it a per-training-run statistic rather than a constant.
+-- diffusion_steps stays an input, because it is the one the real repo's inference entry point exposes.
+-- The GGUF also declares STYLE_DIM as the `loom.style_dim` hparam, for a host that needs the style
+-- vector's own width.
 --
 -- Returns: the raw waveform (flat f32 array), same convention as styletts2_driver.lua's own return.

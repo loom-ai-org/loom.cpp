@@ -26,7 +26,6 @@
 // crashing and produces a sane result.
 
 #include "test_util.h"
-#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
 
@@ -40,7 +39,6 @@
 #include <vector>
 
 int main() {
-    namespace cfg = loom_test::tts_inputs::styletts2;
     const char* gguf_mil_env = std::getenv("LOOM_STYLETTS2_MIL_GGUF");
     if (gguf_mil_env == nullptr) {
         std::fprintf(stderr, "skipping: set LOOM_STYLETTS2_MIL_GGUF (styletts2_mil.gguf) to run this "
@@ -90,21 +88,19 @@ int main() {
         bridge.load_script(driver_script);
 
         const std::vector<double> input_ids_d(input_ids.begin(), input_ids.end());
+        // None of the eleven model constants: the driver carries them as ExportConstants now
+        // (P4.0.8's first follow-up). `diffusion_steps` stays, because it is the knob the real
+        // StyleTTS2 repo's own inference entry point exposes.
+        //
+        // One consequence worth stating: the waveform is no longer bit-comparable with what this test
+        // produced before. `sigma_data` used to arrive as a `float` (0.45731624995853165f), and the
+        // driver now carries the config.yml value as a double, so the KDiffusion preconditioning
+        // differs in the last bits and the ADPM2 loop compounds that. Same as the VITS case; the
+        // bounds below are what this test always checked.
         loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"input_ids", input_ids_d},
             {"diffusion_steps", static_cast<double>(kDiffusionSteps)},
             {"seed", static_cast<double>(kSeed)},
-            {"style_dim", static_cast<double>(cfg::style_dim)},
-            {"d_model", static_cast<double>(cfg::d_model)},
-            {"hidden_per_dir", static_cast<double>(cfg::hidden_per_dir)},
-            {"harmonic_num", static_cast<double>(cfg::harmonic_num)},
-            {"upsample_scale", static_cast<double>(cfg::upsample_scale)},
-            {"gen_istft_n_fft", static_cast<double>(cfg::gen_istft_n_fft)},
-            {"gen_istft_hop", static_cast<double>(cfg::gen_istft_hop)},
-            {"sigma_min", static_cast<double>(cfg::sigma_min)},
-            {"sigma_max", static_cast<double>(cfg::sigma_max)},
-            {"rho", static_cast<double>(cfg::rho)},
-            {"sigma_data", static_cast<double>(cfg::sigma_data)},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());

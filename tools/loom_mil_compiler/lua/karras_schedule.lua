@@ -1,7 +1,8 @@
--- --- Style-diffusion sampler: matches style_diffusion_sampler.cpp exactly (unchanged from
---     styletts2_driver.lua's own copy -- the ADPM2/Karras host-math orchestration is NOT part of what's
---     MIL-traced here, only the denoiser NETWORK "diffusion" calls into is; see BACKLOG.md's own
---     reasoning for why this sampler loop is expected to stay bespoke regardless). ---
+-- --- Style-diffusion sampler: the ADPM2/Karras host-math orchestration, which is NOT part of what is
+--     MIL-traced -- only the denoiser NETWORK that "diffusion" calls into is. It began as a port of
+--     the C++ `style_diffusion_sampler.cpp`, verified against it; that file is retired (P4.0.8's
+--     follow-up) and this is the only implementation now. See BACKLOG.md for why this loop is
+--     expected to stay hand-written rather than generated. ---
 local function karras_schedule(num_steps, sigma_min, sigma_max, rho)
     local rho_inv = 1.0 / rho
     local smin_r = sigma_min ^ rho_inv

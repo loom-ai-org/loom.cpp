@@ -49,9 +49,9 @@ Usage:
 import json
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -288,6 +288,18 @@ def build_diffusion_phase(transformer, dummy_t=6) -> ExportPhase:
     )
 
 
+# StyleTTS2's own Karras sigma schedule, and the one group of numbers here that is neither in the
+# checkpoint nor in a config file: the repo wires `KarrasSchedule(sigma_min=0.0001, sigma_max=3.0,
+# rho=9.0)` -- its own comment calls them "empirical parameters" -- into the DiffusionSampler at every
+# call site (train_second.py:175, train_finetune.py:174, and the Colab demo). Unlike VITS's three
+# scales they are NOT bound as overridable defaults: the repo's own inference entry point exposes
+# `diffusion_steps` and `embedding_scale` and not these, so treating them as a per-utterance knob would
+# be inventing an interface rather than preserving one. `diffusion_steps` stays an `infer` input.
+SIGMA_MIN = 0.0001
+SIGMA_MAX = 3.0
+RHO = 9.0
+
+
 @dataclass(kw_only=True)
 class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     """StyleTTS2's own three-phase split (albert/decoder_vocoder/diffusion) -- see module docstring.
@@ -297,6 +309,15 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
 
     checkpoint_path: str
     kokoro_config_path: str = "/home/flavio/Dev/models/kokoro_model/config.json"
+    # StyleTTS2's own training config, which is the only place `sigma_data` exists. Defaults to the
+    # `config.yml` the release ships beside the checkpoint; `phases()` raises naming it if absent.
+    styletts2_config_path: Optional[str] = None
+
+    # Read in `phases()` and bound into the driver as `ExportConstants` (P4.0.8's first follow-up).
+    style_dim: Optional[int] = field(default=None, init=False, repr=False)
+    d_model: Optional[int] = field(default=None, init=False, repr=False)
+    hidden_per_dir: Optional[int] = field(default=None, init=False, repr=False)
+    sigma_data: Optional[float] = field(default=None, init=False, repr=False)
     # A DIRECTORY of `.lua` fragments -- StyleTTS2 is peeled (P4.0.6/C.8). See `driver_components`.
     driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver"
 
@@ -316,7 +337,8 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         evaluations per step, Karras preconditioning, per-step noise injection. No template emits that
         without becoming a worse thing to read than the loop."""
         from .driver_components import (
-            ComputedCall, DriverReturn, HelperCall, LuaFragment, SubgraphCallComponent,
+            ComputedCall, DriverReturn, ExportConstants, HelperCall, LuaFragment,
+            SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
         from .driver_ir import Call, FieldAccess, Lit, Var
@@ -340,15 +362,35 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                 "run_proj1x1", "predict_durations", "compute_wsum",
                 "karras_schedule", "adpm2_sample",
             )),
-            block("01_lengths.lua",
-                  defines=("T_text", "style_dim", "d_model", "hidden_per_dir")),
+            # The eleven numbers the caller used to have to supply (P4.0.8's first follow-up).
+            # Three come off the real TextEncoder/ProsodyPredictor, four are the istftnet geometry the
+            # decoder_vocoder graph was traced with, three are StyleTTS2's own Karras schedule, and
+            # SIGMA_DATA is read from the checkpoint's config.yml because it is estimated per training
+            # run. `diffusion_steps` is NOT here -- it stays an input, because it is the one the repo's
+            # own inference entry point exposes.
+            ExportConstants(values={
+                "STYLE_DIM": self.style_dim,
+                "D_MODEL": self.d_model,
+                "HIDDEN_PER_DIR": self.hidden_per_dir,
+                "HARMONIC_NUM": kokoro_export._HARMONIC_NUM,
+                "UPSAMPLE_SCALE": kokoro_export._UPSAMPLE_SCALE,
+                "GEN_ISTFT_N_FFT": kokoro_export._STFT_N_FFT,
+                "GEN_ISTFT_HOP": kokoro_export._STFT_HOP,
+                "SIGMA_MIN": SIGMA_MIN,
+                "SIGMA_MAX": SIGMA_MAX,
+                "RHO": RHO,
+                "SIGMA_DATA": self.sigma_data,
+            }),
+            block("01_lengths.lua", defines=("T_text",)),
             SubgraphCallComponent(
                 topology="albert", outputs=("bert_out",), length=t_text,
                 inputs={"tokens": FieldAccess("inputs", "input_ids")},
                 note="--- CustomAlbert, ONE MIL-traced call -> bert_out, time-major (T,768)\n"
                      "    (== ne=[768,T] Layout B, see module docstring for why this convention,\n"
                      "    not styletts2_driver.lua's own explicit-transpose one). ---"),
-            block("02_style_diffusion.lua", reads=("bert_out", "T_text", "style_dim"),
+            block("02_style_diffusion.lua",
+                  reads=("bert_out", "T_text", "STYLE_DIM", "SIGMA_MIN", "SIGMA_MAX", "RHO",
+                         "SIGMA_DATA"),
                   defines=("denoise_fn", "style_vec_dim", "noise0", "sigmas", "s_pred",
                            "s_decoder", "s_predictor")),
             # `drives` is D.2, and this family is where it pays most: nine of StyleTTS2's thirteen
@@ -356,8 +398,8 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             # loop here or inside the loom_lua helper one level down. Declaring the namespaces is what
             # turns them back into ordinary checked calls -- see driver_components.HelperCall.
             block("03_duration_encoder.lua",
-                  reads=("bert_out", "T_text", "d_model", "style_dim", "s_predictor",
-                         "hidden_per_dir"),
+                  reads=("bert_out", "T_text", "D_MODEL", "STYLE_DIM", "s_predictor",
+                         "HIDDEN_PER_DIR"),
                   defines=("d_en_flat", "x", "d", "top_out", "duration_logits", "pred_dur"),
                   drives=(
                       HelperCall("run_bi_lstm", tuple(f"duration_lstm_{i}" for i in range(3)),
@@ -367,11 +409,11 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                       HelperCall("run_bi_lstm", "top_lstm"),
                   )),
             block("04_frame_expansion.lua",
-                  reads=("T_text", "pred_dur", "d", "d_model", "style_dim", "hidden_per_dir"),
+                  reads=("T_text", "pred_dur", "d", "D_MODEL", "STYLE_DIM", "HIDDEN_PER_DIR"),
                   defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
                            "cnn_rows", "t_en", "asr"),
                   drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
-            block("05_f0n.lua", reads=("en", "hidden_per_dir", "s_predictor"),
+            block("05_f0n.lua", reads=("en", "HIDDEN_PER_DIR", "s_predictor"),
                   defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve"),
                   drives=(
                       HelperCall("run_bi_lstm", "f0n_shared_lstm"),
@@ -380,7 +422,9 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                       HelperCall("run_proj1x1", "f0n_f0_proj"),
                       HelperCall("run_proj1x1", "f0n_n_proj"),
                   )),
-            block("06_vocoder_inputs.lua", reads=("T_frames",),
+            block("06_vocoder_inputs.lua",
+                  reads=("T_frames", "HARMONIC_NUM", "UPSAMPLE_SCALE", "GEN_ISTFT_N_FFT",
+                         "GEN_ISTFT_HOP"),
                   defines=("dim", "T_f0", "L", "rand_ini", "u", "noise_in", "wsum")),
             SubgraphCallComponent(
                 topology="decoder_vocoder", outputs=("waveform",),
@@ -394,6 +438,11 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                 multiline=True),
             DriverReturn(values=("waveform",)),
         ]
+
+    # No `hparams()`, and the absence is deliberate. Kokoro declares `loom.style_dim` because its host
+    # has to BUILD `ref_s`; StyleTTS2 samples its own style vector inside the driver, so a host needs
+    # nothing but `input_ids` to call `infer`. Declaring style_dim here anyway would be a KV nobody
+    # reads -- which is precisely the decorative declaration P4.0.7's own catalogue work warns about.
 
     def external_topologies(self) -> Dict[str, str]:
         """Empty, as of P4.0.7 -- see `TTSKokoroExportConfig.external_topologies` for the full note.
@@ -417,6 +466,27 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             "ship. phases() reads it as JSON and every field it needs raises by name if absent, which "
             "is more specific than a path check."
         ),
+        "styletts2_config_path": Unchecked(
+            "StyleTTS2's own config.yml, defaulted to the one beside the checkpoint. Same argument as "
+            "the two paths above: phases() reads `model_params.diffusion.dist.sigma_data` out of it "
+            "and raises naming the file and the key if either is missing, which says more than a "
+            "'this path exists' link would"
+        ),
+        "style_dim": Unchecked(
+            "DERIVED in phases() by `kokoro_export.prosody_dims` from the restored ProsodyPredictor "
+            "itself -- see TTSKokoroExportConfig for the full note; these are the same classes with "
+            "this checkpoint's weights"
+        ),
+        "d_model": Unchecked("same"),
+        "hidden_per_dir": Unchecked("same"),
+        "sigma_data": Unchecked(
+            "READ off config.yml's `model_params.diffusion.dist.sigma_data`, the ONLY authority on it "
+            "-- the same config declares `estimate_sigma_data: True`, so it is a statistic of the "
+            "training data rather than a constant, and a different checkpoint has a different one. "
+            "Nothing in the graph consumes it (the KDiffusion preconditioning around the diffusion "
+            "call is host-side arithmetic in the driver), so its check is numeric: the frozen "
+            "reference waveform in fixtures/legacy_driver_reference/"
+        ),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -424,6 +494,8 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         sd_all = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)["net"]
 
         kokoro_cfg = json.load(open(self.kokoro_config_path))
+        kokoro_export.check_istftnet_geometry(kokoro_cfg)
+        self.sigma_data = self._read_sigma_data()
         # Real hyperparameters confirmed byte-identical to Kokoro's own KokoroConfig -- see
         # styletts2_driver.h's own top comment / tools/convert_styletts2/PLAN.md.
         bert = CustomAlbert(AlbertConfig(vocab_size=kokoro_cfg["n_token"], **kokoro_cfg["plbert"]))
@@ -482,8 +554,39 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                                       dtype=np.float32)],
         )
 
+        self.style_dim, self.d_model, self.hidden_per_dir = (
+            kokoro_export.prosody_dims(text_encoder, predictor)[k]
+            for k in ("style_dim", "d_model", "hidden_per_dir"))
+
         return [albert_phase, dv_phase, diffusion_phase, bert_encoder_phase,
                 *kokoro_export.build_prosody_phases(text_encoder, predictor)]
+
+    def _read_sigma_data(self) -> float:
+        """`model_params.diffusion.dist.sigma_data` out of StyleTTS2's own config.yml.
+
+        There is no fallback and there should not be one: the same config says
+        `estimate_sigma_data: True`, so this is a statistic of the training data, not a constant of the
+        architecture. Substituting the LJSpeech release's 0.4573... for a checkpoint that does not
+        state it would silently mis-precondition every denoiser call.
+        """
+        import yaml
+
+        path = Path(self.styletts2_config_path or (Path(self.checkpoint_path).parent / "config.yml"))
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"StyleTTS2's own config.yml is required and is not at {path}. It is the only "
+                f"authority on `model_params.diffusion.dist.sigma_data`, which the driver's KDiffusion "
+                f"preconditioning needs and which is estimated per training run "
+                f"(`estimate_sigma_data: True`). Pass styletts2_config_path if it lives elsewhere."
+            )
+        cfg = yaml.safe_load(path.read_text())
+        try:
+            return float(cfg["model_params"]["diffusion"]["dist"]["sigma_data"])
+        except (KeyError, TypeError) as exc:
+            raise KeyError(
+                f"{path} has no model_params.diffusion.dist.sigma_data ({exc}). The driver's "
+                f"KDiffusion preconditioning cannot be written without it."
+            ) from exc
 
     def estimators(self) -> List[EstimatorSpec]:
         # The ADPM2/Karras sampler loop itself stays hand-written (EXPORT-IMPROVEMENT.md item 4 concedes
