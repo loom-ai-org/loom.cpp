@@ -57,7 +57,10 @@ using DynamicAxes = std::unordered_map<std::string, double>;
 // graph's own declared inputs (tests/test_graph_reuse_safety.cpp pins that down as real ggml behaviour),
 // which is why reusing a graph used to require rewriting EVERY declared input before EVERY compute. An
 // input that gallocr never allocated cannot be aliased by anything gallocr placed, so that discipline
-// is no longer load-bearing here; drivers that follow it anyway (OdeStepper) are simply unaffected.
+// is no longer load-bearing here; a caller that rewrites every input anyway is simply unaffected. (The
+// class that made the discipline necessary in the first place, `OdeStepper`, is gone -- retired with
+// P4.0.8's follow-up -- but the ggml behaviour it ran into is not, which is what its regression test
+// still pins.)
 //
 // ---------------------------------------------------------------------------------------------------
 // A DECODE LOOP REUSES ITS GRAPH TOO (BACKLOG.md P4.0.15)

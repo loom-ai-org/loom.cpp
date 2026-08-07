@@ -27,10 +27,7 @@ add_library(loom_engine
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp
     src/core/relative_position.cpp
-    src/core/style_diffusion_sampler.cpp
-    src/core/cfm_euler_sampler.cpp
     src/core/lua_bridge.cpp
-    src/core/ode_stepper.cpp
     src/core/vocab.cpp
     src/core/unicode.cpp
     src/core/bpe_vocab.cpp

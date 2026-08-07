@@ -207,32 +207,11 @@ target_compile_definitions(test_e2e_toy_asr PRIVATE
 add_test(NAME test_e2e_toy_asr COMMAND test_e2e_toy_asr)
 set_tests_properties(test_e2e_toy_asr PROPERTIES FIXTURES_REQUIRED "toy_asr_gguf_fixture;toy_asr_reference_fixture")
 
-# --- Milestone 3: toy ODE-stepper (flow-matching vector field) end-to-end test ---
-
-set(LOOM_E2E_ODE_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_ode_ref)
-
-add_test(
-    NAME gen_toy_ode_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_toy_ode_gguf.py
-            ${LOOM_FIXTURE_DIR}/toy_ode.gguf
-)
-set_tests_properties(gen_toy_ode_gguf_fixture PROPERTIES FIXTURES_SETUP toy_ode_gguf_fixture)
-
-add_test(
-    NAME gen_toy_ode_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward_ode.py
-            ${LOOM_E2E_ODE_REF_DIR} --n-steps 8 --t-start 0.0 --t-end 1.0
-)
-set_tests_properties(gen_toy_ode_reference PROPERTIES FIXTURES_SETUP toy_ode_reference_fixture)
-
-add_executable(test_e2e_toy_ode test_e2e_toy_ode.cpp)
-target_link_libraries(test_e2e_toy_ode PRIVATE loom::engine)
-target_compile_definitions(test_e2e_toy_ode PRIVATE
-    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
-    LOOM_TEST_REF_DIR="${LOOM_E2E_ODE_REF_DIR}"
-)
-add_test(NAME test_e2e_toy_ode COMMAND test_e2e_toy_ode)
-set_tests_properties(test_e2e_toy_ode PROPERTIES FIXTURES_REQUIRED "toy_ode_gguf_fixture;toy_ode_reference_fixture")
+# --- Milestone 3's toy ODE-stepper end-to-end test lived here. Retired with `OdeStepper` itself
+#     (P4.0.8 follow-up): the flow-matching integration loop it drove is a `FlowMatchingSampler`
+#     component emitted into Matcha's and Supertonic's Lua drivers now, and the class had no consumer
+#     left but this test. The graph-reuse discipline it demonstrated is not lost with it --
+#     test_graph_reuse_safety.cpp pins that in plain ggml calls, independently of any driver. ---
 
 # --- Milestone 3: toy VAE decoder end-to-end test ---
 
@@ -694,26 +673,18 @@ target_link_libraries(test_e2e_whisper_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_whisper_driver COMMAND test_e2e_whisper_driver)
 set_tests_properties(test_e2e_whisper_driver PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- StyleTTS2 roadmap: loom::karras_schedule/adpm2_sample (the style-diffusion sampling loop's own
-#     discretization math), verified against an independent numpy reference using a TOY affine denoiser
-#     and REPLAYED (not freshly sampled) ancestral noise -- pure host arithmetic, no GGUF/ggml graph
-#     involved, fully synthetic, not skip-if-missing. ---
-set(LOOM_STYLE_DIFFUSION_SAMPLER_REF_DIR ${LOOM_FIXTURE_DIR}/style_diffusion_sampler_ref)
-
-add_test(
-    NAME gen_style_diffusion_sampler_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_style_diffusion_sampler.py
-            ${LOOM_STYLE_DIFFUSION_SAMPLER_REF_DIR}
-)
-set_tests_properties(gen_style_diffusion_sampler_reference PROPERTIES FIXTURES_SETUP style_diffusion_sampler_reference_fixture)
-
-add_executable(test_style_diffusion_sampler test_style_diffusion_sampler.cpp)
-target_link_libraries(test_style_diffusion_sampler PRIVATE loom::engine)
-target_compile_definitions(test_style_diffusion_sampler PRIVATE
-    LOOM_TEST_REF_DIR="${LOOM_STYLE_DIFFUSION_SAMPLER_REF_DIR}"
-)
-add_test(NAME test_style_diffusion_sampler COMMAND test_style_diffusion_sampler)
-set_tests_properties(test_style_diffusion_sampler PROPERTIES FIXTURES_REQUIRED "style_diffusion_sampler_reference_fixture")
+# --- loom::karras_schedule/adpm2_sample had two tests here -- the discretization math against a numpy
+#     reference with a toy denoiser, and the full loop around the real Transformer1d network. Both went
+#     with `style_diffusion_sampler.{h,cpp}` (P4.0.8 follow-up): StyleTTS2's ADPM2 sampler is
+#     styletts2_driver/02_style_diffusion.lua now, and the C++ class had no consumer but these two.
+#
+#     What that costs, stated rather than glossed: those were EXACT comparisons, and the Lua sampler
+#     cannot have one. They replayed a fixture's ancestral-noise draws through an injectable
+#     `GaussianSampleFn`; the driver draws its noise from `loom.gaussian_array`, which has no such seam,
+#     so nothing bit-compares against a numpy reference. The Lua loop's own ground truth is the frozen
+#     full-pipeline waveform in fixtures/legacy_driver_reference/ (test_e2e_styletts2_mil_lua_driver),
+#     which the retired C++ driver produced THROUGH this sampler -- so the check moved rather than
+#     vanished, at a looser bound and one level up. The denoiser network keeps its own tests below. ---
 
 # --- Real-checkpoint test: StyleTTS2's style-diffusion denoiser network (Transformer1d) against a
 #     hand-rolled PyTorch reference, real weights + synthetic driving embedding. See
@@ -722,16 +693,6 @@ add_executable(test_e2e_styletts2_diffusion_net test_e2e_styletts2_diffusion_net
 target_link_libraries(test_e2e_styletts2_diffusion_net PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_diffusion_net COMMAND test_e2e_styletts2_diffusion_net)
 set_tests_properties(test_e2e_styletts2_diffusion_net PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Real-checkpoint test: the FULL style-diffusion sampling loop (KarrasSchedule + ADPM2Sampler +
-#     KDiffusion preconditioning wrapping the real Transformer1d network) against a hand-rolled PyTorch
-#     reference combining the same independently-verified pieces. See
-#     tools/convert_styletts2/reference_forward_styletts2_diffusion_sampler.py. Skips cleanly if env vars
-#     aren't set. ---
-add_executable(test_e2e_styletts2_diffusion_sampler test_e2e_styletts2_diffusion_sampler.cpp)
-target_link_libraries(test_e2e_styletts2_diffusion_sampler PRIVATE loom::engine)
-add_test(NAME test_e2e_styletts2_diffusion_sampler COMMAND test_e2e_styletts2_diffusion_sampler)
-set_tests_properties(test_e2e_styletts2_diffusion_sampler PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL-traced StyleTTS2 export (export_styletts2_mil.py, styletts2_mil.gguf) numerical checks: "albert"
 #     (CustomAlbert alone) against tools/convert_kokoro's own already-verified albert_forward run against
@@ -818,14 +779,14 @@ target_link_libraries(test_e2e_supertonic_vfe PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_vfe COMMAND test_e2e_supertonic_vfe)
 set_tests_properties(test_e2e_supertonic_vfe PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- SupertonicTTS v2 roadmap: the FULL CFM Euler sampling loop (loom::cfm_euler_sample + the real
-#     VectorFieldEstimator), verified against a hand-rolled Python port calling the real
-#     vector_estimator.pt's own .solve() in a loop. See
-#     reference_forward_supertonic_cfm_sampler.py. ---
-add_executable(test_e2e_supertonic_cfm_sampler test_e2e_supertonic_cfm_sampler.cpp)
-target_link_libraries(test_e2e_supertonic_cfm_sampler PRIVATE loom::engine)
-add_test(NAME test_e2e_supertonic_cfm_sampler COMMAND test_e2e_supertonic_cfm_sampler)
-set_tests_properties(test_e2e_supertonic_cfm_sampler PROPERTIES SKIP_RETURN_CODE 77)
+# --- The FULL CFM Euler sampling loop (loom::cfm_euler_sample + the real VectorFieldEstimator) was
+#     checked here against a Python port calling vector_estimator.pt's own .solve() in a loop. Retired
+#     with `cfm_euler_sampler.{h,cpp}` (P4.0.8 follow-up): the loop is a `FlowMatchingSampler`
+#     component emitted into supertonic_driver/ now, and the C++ function had no consumer but this.
+#     Unlike StyleTTS2's ADPM2 the loop is deterministic given z0, so what replaces it is a genuine
+#     equivalent rather than a looser stand-in: test_e2e_supertonic_mil_lua_driver runs the Lua sampler
+#     over the real vfe topology and compares the whole pipeline against a frozen waveform at 1e-2. The
+#     per-phase check of the estimator itself is unaffected -- test_e2e_supertonic_vfe above. ---
 
 # --- SupertonicTTS v2 roadmap: SpeechDecoder (folded BatchNorm, causal ConvNeXt, direct waveform
 #     emission, the FINAL pipeline stage), verified against the real vocoder.pt. See

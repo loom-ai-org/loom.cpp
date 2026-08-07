@@ -112,7 +112,9 @@ The thesis is already demonstrated, not merely intended:
   `ode_stepper.h`, `style_diffusion_sampler.h`, `bilstm_stepper.h`, `generation.h`, `ctc_decode.h` and
   `tdt_decoder.h` are unreachable from `lua_bridge.cpp`: the CFM Euler loop, the ADPM2 diffusion
   sampler and BiLSTM stepping all run as Lua today. If ADPM2 did not need C++, essentially no
-  orchestration shape will.
+  orchestration shape will. *(Four of those seven are since gone rather than merely unreachable —
+  `tdt_decoder.h` with P4.0.17, and the first three with §7.1. Unreachable from the bridge was the
+  measurement that made deleting them a bookkeeping question rather than a risk.)*
 
 Two qualifications worth keeping honest:
 
@@ -854,6 +856,12 @@ is how the goal stops being a slogan.
   no product consumer. They were checked, not assumed — that measurement is what kept them in `loom.h`
   rather than `loom_legacy.h` — and deleting them is beyond what P4.0.8 asks. It is a real decision for
   someone to take, filed in BACKLOG.md rather than taken here.
+
+  > **Taken 2026-08-07, and the measurement above was right about three of four.** Three are retired
+  > (`cfm_euler_sampler`, `ode_stepper`, `style_diffusion_sampler`, plus the four tests that were their
+  > only consumers). `bilstm_stepper` is not, because "a unit test and no product consumer" is false
+  > for it in both halves: it has no unit test, and three bespoke Kokoro per-topology tests
+  > *construct* one to drive the check they exist for. See §7.
 * **The five bespoke-Lua tests were kept, and that is the load-bearing choice of the stage.** With
   their C++ oracle gone they could have been deleted as "both sides legacy". They check
   `tools/convert_*/[a-z]*_driver.lua`, which P6 retires — but P6 has not run, so deleting them now
@@ -876,3 +884,49 @@ is how the goal stops being a slogan.
   not a shelf.
 * **E last** — it is test work and bookkeeping, it blocks nothing, and one of its six targets is blocked
   on P4.1 anyway.
+
+---
+
+## 7. Stage E's follow-ups (2026-08-07)
+
+Stage E closed with two items it deliberately did not take: the driver-input hyperparameters belonged
+in the GGUF, and four pre-MIL C++ components had outlived the drivers they served. Both are done. They
+are recorded here rather than as a sixth stage because neither is a step in the P4.0.4–P4.0.8 sequence
+— one is export-side work stage E was scoped away from, and the other is a decision that stage was
+explicitly told to file rather than make.
+
+### 7.1 The stranded pre-MIL components
+
+Retired: `cfm_euler_sampler.{h,cpp}`, `ode_stepper.{h,cpp}`, `style_diffusion_sampler.{h,cpp}`, the
+four tests that were their only consumers, and five Python reference/fixture generators. Each was a
+host-driven sampling or integration loop — orchestration, which §1.3 records as the exporter's work —
+and each already had its counterpart on the MIL path (`FlowMatchingSampler` for the first two,
+StyleTTS2's ADPM2 fragment for the third).
+
+**Kept: `bilstm_stepper.h`, and finding out why is the useful part of this item.** The stage-E note
+above filed it with the others as "a unit test and no product consumer". Both halves are false. It has
+no unit test; and `test_e2e_kokoro_{text_encoder,duration_predictor,f0n}.cpp` each *construct* a
+`BiLstmStepper` to drive the bespoke per-topology comparison they exist for. Deleting it would delete
+three real checks — stage C's rule verbatim. Its MIL counterpart has replaced it in every *driver*;
+what keeps it alive is the bespoke conversion path, and it retires with that in P6.
+
+**The general shape, worth carrying into P6 and P4.1.** "No consumer" is two different findings
+wearing one phrase. A component whose only consumers are tests *of itself* is dead code with a
+receipt: deleting it and its test removes coverage of nothing that ships. A component whose consumers
+are tests *of something else* is infrastructure, and the test list looks identical from a `grep`. The
+four here split three-to-one on exactly that line, and nothing but reading each call site tells them
+apart — `grep` for a class name missed one outright (`cfm_euler_sample` is a free function, so the
+component read as consumer-free until the build failed on a test that used it).
+
+**What the deletions cost, and the reason it is not stage C's rule.** Three of the four tests were
+exact numeric comparisons against Python references; two of them cannot be reproduced against the Lua
+counterpart at all, because they replayed fixture noise through an injectable `GaussianSampleFn` and
+the driver draws from `loom.gaussian_array`, which has no such seam. But every one of those checks was
+a check *of the deleted code*. Nothing on the MIL path was ever covered by them, and StyleTTS2's
+frozen full-pipeline waveform was produced by the retired C++ driver *through* `adpm2_sample`, so the
+ground truth survives one level up at a looser bound. That distinction — a check on surviving code
+versus a check on the code being removed — is what separates a deletion from the migration steps
+stage C's rule governs, and it is worth stating because the two look the same in a test count.
+
+**Gate:** `ctest` 128/128, 0 failed (135 before). Engine size, RelWithDebInfo stripped, same
+configuration both sides: 1,248,832 → 1,240,632 bytes, −8,200 (−0.66 %); `.text` −7,740 (−0.63 %).

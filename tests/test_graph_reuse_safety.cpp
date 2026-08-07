@@ -1,9 +1,16 @@
-// Regression test for the ggml graph-reuse finding documented in BACKLOG.md: `OdeStepper` builds its
-// graph once and reuses the same ggml_cgraph across every integration step, which is only safe because
-// EVERY declared input tensor is rewritten before EVERY ggml_backend_graph_compute call -- including
-// ones that never logically change (like OdeStepper's "conditioning"). This file isolates why, entirely
-// outside GraphBuilder/OdeStepper (plain ggml calls only), and pins it down as a real, reproducible
+// Regression test for the ggml graph-reuse finding documented in BACKLOG.md. It was found through
+// `OdeStepper`, which built its graph once and reused the same ggml_cgraph across every integration
+// step, and was only safe because EVERY declared input tensor was rewritten before EVERY
+// ggml_backend_graph_compute call -- including ones that never logically change (its "conditioning").
+// That class is retired (P4.0.8's follow-up; its loop is a `FlowMatchingSampler` component in Lua now),
+// but the ggml property is not, and this file was always the thing that pinned it: it isolates the
+// behaviour entirely outside GraphBuilder (plain ggml calls only) and shows it is a real, reproducible
 // property of ggml_gallocr rather than an artifact of our own primitives.
+//
+// It still matters to a caller that never sees a driver. GraphBuilder no longer needs the
+// rewrite-everything discipline -- its declared inputs live outside the gallocr pool entirely, so
+// nothing gallocr placed can alias them (graph_builder.h) -- and this test is what would catch a ggml
+// upgrade that made that reasoning wrong.
 //
 // Root cause: ggml_gallocr may alias a computed tensor's buffer with one of the graph's OWN declared
 // INPUT tensors (confirmed via pointer comparison below) -- despite ggml_set_input()'s documented
@@ -67,7 +74,8 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 // CONV_1D reused across two computes, refreshing its one true "input" (the CONV_1D data operand) every
-// time -- the same discipline OdeStepper follows. Must match an independent fresh rebuild.
+// time -- the same rewrite-every-input discipline the finding above forced. Must match an
+// independent fresh rebuild.
 void test_conv1d_reuse_with_full_refresh_matches_fresh_rebuild(ggml_backend_t backend) {
     std::vector<float> kernel_data(kK * kIC * kOC);
     for (size_t i = 0; i < kernel_data.size(); ++i) kernel_data[i] = 0.01f * static_cast<float>((i % 13) - 6);
@@ -102,8 +110,8 @@ void test_conv1d_reuse_with_full_refresh_matches_fresh_rebuild(ggml_backend_t ba
 // is marked ggml_set_input(). Reusing the graph for a second compute WITHOUT rewriting `a` (only `b`
 // changes) then silently uses `a`'s previous-pass *output* value instead of its original one. This test
 // exists to catch it if a future ggml upgrade changes this aliasing behavior -- if this assertion starts
-// failing, the "rewrite every declared input every step" discipline in OdeStepper may no longer be
-// necessary (or a different one may be), and BACKLOG.md's finding should be revisited.
+// failing, the "rewrite every declared input every step" discipline may no longer be necessary (or a
+// different one may be), and BACKLOG.md's finding should be revisited.
 void test_unrefreshed_input_gets_silently_aliased(ggml_backend_t backend) {
     loom_test::GgmlScratch s(backend);
     ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 16);
@@ -139,7 +147,7 @@ void test_unrefreshed_input_gets_silently_aliased(ggml_backend_t backend) {
     LOOM_CHECK(!second_call_matches_naive_expectation); // documents that this naive pattern is unsafe
 }
 
-// The actual pattern OdeStepper uses: a full vector-field-shaped topology (ADD, ADD, CONV_1D, GELU,
+// The actual pattern OdeStepper used: a full vector-field-shaped topology (ADD, ADD, CONV_1D, GELU,
 // CONV_1D) built once, with ALL THREE declared inputs (latent/timestep/conditioning) rewritten before
 // every compute -- including "conditioning", which never logically changes between steps. Must match an
 // independent fresh rebuild given the same inputs.
