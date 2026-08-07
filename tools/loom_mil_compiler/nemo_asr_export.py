@@ -334,7 +334,7 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
 
     def backend_kwargs(self) -> dict:
         kwargs = dict(flat_namespace=True, root_axis=self.root_axis,
-                      driver_builder=self.synthesized_builder_key())
+                      driver_builder=self.synthesized_builder_key(), hparams=self.hparams())
         # The checkpoint's own SentencePiece vocab, so the artifact is detokenizable on its own -- the
         # one capability the bespoke converters had that the MIL export did not.
         tokenizer_dir = extract_nemo_tokenizer_dir(self.checkpoint)

@@ -2408,6 +2408,24 @@ class LoomGGUFExporter:
         for key, value in self._conv_state_geometry().items():
             w.add_uint32(f"loom.{key}", int(value))
 
+        # The family's own declared host-facing numbers (`LoomExportConfig.hparams()`), in the same
+        # "loom.*" namespace and for the same reason as the two geometries above: a host that has to
+        # size an input before it can call `infer` reads the file instead of carrying a per-model C++
+        # struct. Unlike those two this is DECLARED by the config rather than derived from the emitted
+        # graph -- the two geometries answer "what did this export produce", these answer "what does a
+        # caller have to know", and only the config knows the second.
+        for key, value in (self.kwargs.get("hparams") or {}).items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"hparams[{key!r}] is {value!r} ({type(value).__name__}). `hparams()` writes GGUF "
+                    f"scalars a host reads back with hparam_u32/hparam_f32, so only int and float are "
+                    f"representable -- anything structured belongs in a topology or in the driver."
+                )
+            if isinstance(value, int):
+                w.add_uint32(f"loom.{key}", value)
+            else:
+                w.add_float32(f"loom.{key}", float(value))
+
         # Embed each static submodule topology JSON string
         for submodule_name, topo in self.topologies.items():
             w.add_string(f"model.graph_topology.{submodule_name}", json.dumps(topo, cls=NumpyEncoder))

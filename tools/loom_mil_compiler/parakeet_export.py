@@ -238,7 +238,7 @@ class ASRParakeetExportConfig(BaseMultiPhaseModelExportConfig):
         return self.architecture
 
     def backend_kwargs(self) -> dict:
-        kwargs = dict(flat_namespace=True, root_axis=self.root_axis)
+        kwargs = dict(flat_namespace=True, root_axis=self.root_axis, hparams=self.hparams())
         from .nemo_asr_export import extract_nemo_tokenizer_dir
 
         tokenizer_dir = extract_nemo_tokenizer_dir(self.checkpoint)

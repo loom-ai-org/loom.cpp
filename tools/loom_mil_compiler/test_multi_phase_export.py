@@ -118,10 +118,12 @@ class TestASRRootAxisIsNowADeclaration(unittest.TestCase):
         self.assertEqual(config.root_axis, "n_samples")
         # `driver_builder` rides along because this is the CTC family, whose orchestration is not
         # implied by its decomposition (BACKLOG.md P4.0.17); `ctc_blank_id` does not, because nothing
-        # has traced the checkpoint here and only it knows the class count.
+        # has traced the checkpoint here and only it knows the class count. `hparams` is empty and
+        # present rather than absent: every family carries the channel (test_export_hparams.py walks
+        # the registry for exactly that), and this family declares nothing into it.
         self.assertEqual(config.backend_kwargs(),
                          {"flat_namespace": True, "root_axis": "n_samples",
-                          "driver_builder": "CtcGreedy"})
+                          "driver_builder": "CtcGreedy", "hparams": {}})
 
     def test_an_axis_outside_the_vocabulary_is_rejected(self):
         with self.assertRaises(LinkError) as cm:
