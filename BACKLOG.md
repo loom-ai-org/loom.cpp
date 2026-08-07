@@ -1250,6 +1250,13 @@ nothing.
     component*, and deleting them is beyond what this item asks. Whether they follow the drivers is a
     real decision, not an oversight.
 
+    > **DONE (2026-08-07) — three of the four retired, and the fourth was misfiled.** See "The
+    > stranded pre-MIL components" below. `cfm_euler_sampler`, `ode_stepper` and
+    > `style_diffusion_sampler` are gone with their four tests; **`bilstm_stepper` stays**, because the
+    > premise above is wrong for it — its consumers are not tests *of* it but three bespoke Kokoro
+    > per-topology tests that construct one to drive the check they exist for. It retires with the
+    > bespoke path in P6.
+
   **Whisper is the one that remains**, and not because it is harder: `whisper_driver.cpp` has no MIL
   export to replace it. `loom_legacy.h` empties out in P4.1, and its docstring says so.
 - **P4.0.9 — KV cache on the MIL path — DONE (stages N/1/2/3).** Specified in [`KV-CACHE.md`](KV-CACHE.md); the one item here
@@ -1972,6 +1979,44 @@ nothing.
 
   Not urgent and not risky: the gate is that all five families re-export byte-identical, since none of
   them takes the path being removed.
+
+### The stranded pre-MIL components — DONE (2026-08-07)
+
+P4.0.8's second follow-up, taken as the decision it was filed as. `cfm_euler_sampler.{h,cpp}`,
+`ode_stepper.{h,cpp}` and `style_diffusion_sampler.{h,cpp}` are gone, with the four tests that were
+their only consumers (`test_e2e_toy_ode`, `test_style_diffusion_sampler`,
+`test_e2e_styletts2_diffusion_sampler`, `test_e2e_supertonic_cfm_sampler`) and the five Python
+reference/fixture generators feeding them. Each was orchestration — a host-driven sampling or
+integration loop — which is exactly the work `EXPORT-PREPARATION.md` §1.3 records as the exporter's,
+and each already had its Lua counterpart on the MIL path.
+
+**The follow-up got one of its four wrong, and the correction is the useful part.** It filed
+`bilstm_stepper.h` alongside the others as "a unit test and no product consumer". It has neither: it
+has **no unit test at all**, and three real construction sites —
+`test_e2e_kokoro_{text_encoder,duration_predictor,f0n}.cpp` build a `BiLstmStepper` to *drive* the
+bespoke per-topology check each of those tests exists for. Deleting it deletes those checks, which is
+stage C's rule verbatim. Its MIL counterpart (`loom.run_recurrent` + `RecurrentPhase`) has replaced it
+in every driver; what keeps it alive is the bespoke conversion path, so it retires with that in P6.
+`loom.h` now says so, with the measurement rather than the verdict.
+
+**What the deletions cost, stated rather than glossed.** Three of the four tests were exact numeric
+comparisons against Python references, and two of those cannot be reproduced against the Lua
+counterpart at all: they replayed fixture noise through an injectable `GaussianSampleFn`, and the
+driver draws from `loom.gaussian_array`, which has no such seam. That is a real loss of resolution —
+but it is a check *of the code being deleted*, not of anything that ships. Nothing on the MIL path was
+covered by them, and StyleTTS2's frozen full-pipeline waveform (`fixtures/legacy_driver_reference/`)
+was produced by the retired C++ driver *through* `adpm2_sample`, so the ground truth those tests
+established survives one level up, at a looser bound. Supertonic's CFM loop is deterministic given
+`z0` and needs no such argument: `test_e2e_supertonic_mil_lua_driver` is a genuine equivalent.
+
+`test_graph_reuse_safety.cpp` is deliberately kept and re-headed. It was written *about* `OdeStepper`,
+but what it pins is a property of `ggml_gallocr`, in plain ggml calls, and it is what would catch a
+ggml upgrade invalidating `GraphBuilder`'s reason for not needing that discipline.
+
+**Gate:** `ctest` **128/128, 0 failed** (135 before; the seven removed are the four tests plus three
+fixture-generator setup steps). Engine size, RelWithDebInfo stripped, same configuration both sides:
+**1,248,832 → 1,240,632 bytes, −8,200 (−0.66 %)**; `.text` 1,224,663 → 1,216,923 (−7,740, −0.63 %).
+Small, and honestly so — these were four short files, unlike E.4's ~7k lines of driver.
 
 ### The bespoke NeMo converters are gone — DONE (2026-08-07)
 

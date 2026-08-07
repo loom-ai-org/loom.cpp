@@ -42,13 +42,15 @@
 #include "loom/core/ctc_decode.h"
 #include "loom/core/generation.h"
 
-// --- Standalone C++ components from the pre-MIL era. Each is model-agnostic and keeps its own unit
-//     test, so none is legacy in the sense loom_legacy.h means; but each also has a Lua counterpart
-//     that the MIL path uses instead (bilstm_stepper -> loom.run_recurrent + RecurrentPhase;
-//     cfm_euler_sampler/ode_stepper -> the FlowMatchingSampler component; style_diffusion_sampler ->
-//     StyleTTS2's ADPM2 driver fragment). They are here rather than in loom_legacy.h because their
-//     remaining consumers are tests of the components themselves, not of any driver. ---
+// --- One standalone C++ component from the pre-MIL era. It was four; P4.0.8's follow-up retired
+//     `cfm_euler_sampler.h`, `ode_stepper.h` and `style_diffusion_sampler.h`, each of which had a Lua
+//     counterpart the MIL path uses instead (the first two -> the `FlowMatchingSampler` component,
+//     the third -> StyleTTS2's ADPM2 driver fragment) and no consumer but its own test.
+//
+//     `bilstm_stepper.h` did NOT follow them, and the reason is a measurement rather than a judgement:
+//     unlike the other three its consumers are not tests OF it. test_e2e_kokoro_{text_encoder,
+//     duration_predictor,f0n}.cpp construct a BiLstmStepper to drive the bespoke per-topology
+//     checks they exist for, so deleting it deletes those checks. Its own MIL counterpart
+//     (loom.run_recurrent + RecurrentPhase) has replaced it in every DRIVER; what keeps it alive is
+//     the bespoke conversion path, and it retires with that in P6. ---
 #include "loom/core/bilstm_stepper.h"
-#include "loom/core/cfm_euler_sampler.h"
-#include "loom/core/ode_stepper.h"
-#include "loom/core/style_diffusion_sampler.h"
