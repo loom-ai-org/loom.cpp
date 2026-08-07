@@ -9,13 +9,18 @@
 -- Expects four modules pre-registered by the host: "dp", "ttl_text", "vfe", "decoder" (none use a
 -- KvCache) -- SAME names/roles as the bespoke driver.
 --
--- Text-length scope note (see export_supertonic_mil.py's own module docstring): "vfe"'s own `txt_emb`
--- input has a FIXED shape (T_TEXT_FIXED, baked in at export time) -- `inputs.txt_ids` MUST be exactly
--- that length for this driver to run correctly, same real constraint the bespoke driver already carries.
+-- Text-length scope note (see supertonic_export.py's own module docstring): "vfe"'s own `txt_emb`
+-- input has a FIXED shape (T_TEXT, baked in at export time) -- `inputs.txt_ids` MUST be exactly that
+-- length for this driver to run correctly, same real constraint the bespoke driver already carries.
+-- The GGUF now says so where a host can read it, as the `loom.txt_len` hparam.
 --
--- inputs: txt_ids (int array, length t_text), style_ttl (flat f32 array, n_style_ttl*style_dim_ttl),
+-- inputs: txt_ids (int array, length T_TEXT), style_ttl (flat f32 array, n_style_ttl*style_dim_ttl),
 -- style_dp (flat f32 array, n_style_dp*style_dim_dp), n_steps (int), seed (int, seeds
--- loom.gaussian_array), plus the real model constants t_text, lat_dim, sample_rate, base_chunk_size,
--- compression_factor.
+-- loom.gaussian_array).
+--
+-- t_text, lat_dim, sample_rate, base_chunk_size and compression_factor used to be inputs too. They are
+-- the T_TEXT/LAT_DIM/SAMPLE_RATE/BASE_CHUNK_SIZE/COMPRESSION_FACTOR locals below now (P4.0.8's first
+-- follow-up): four are read off the real SpeechDecoder or off the trace, and only SAMPLE_RATE is
+-- declared, because the pickled modules genuinely do not carry it.
 --
 -- Returns: the raw waveform (flat f32 array).
