@@ -1,25 +1,32 @@
 #pragma once
 
-// The hyperparameters the five TTS Lua driver tests pass INTO `infer(...)`.
+// The hyperparameters the five BESPOKE TTS Lua driver tests pass INTO `infer(...)`.
 //
 // These used to come from the retired C++ drivers' own `VitsConfig`/`MatchaConfig`/... structs, which
 // each test default-constructed purely to read a handful of fields off it (P4.0.8, E.3). A per-model
 // C++ struct in a shipped public header is exactly what the lean-runtime argument objects to, so it did
-// not survive the driver -- but the VALUES are still real checkpoint hyperparameters, and each family's
-// two tests (bespoke Lua and MIL Lua) must agree on them or they silently stop comparing the same
-// computation. Hence one shared header rather than two copies of the literals.
+// not survive the driver -- but the VALUES are still real checkpoint hyperparameters, so they landed
+// here.
+//
+// **The MIL half is gone, which is what this header was really about.** P4.0.8's first follow-up moved
+// every one of these onto the export side for the MIL drivers: a number the DRIVER needs is an
+// `ExportConstants` IR local read off the checkpoint at export time, and a number the HOST needs is a
+// `loom.*` GGUF hparam (`LoomExportConfig.hparams()`) -- Kokoro's `style_dim`, Supertonic's `txt_len`.
+// So `test_e2e_*_mil_lua_driver.cpp` include none of this any more; the five files below do, and they
+// drive `tools/convert_*/[a-z]*_driver.lua`, the hand-written pre-MIL drivers that P6 retires. This
+// header goes with them.
+//
+// It is worth being precise about what that means for these five: a bespoke driver still takes these
+// as arguments, so a value here that drifted from the checkpoint would silently change what the
+// bespoke test computes and nothing would say so. That was true before too. What changed is that it no
+// longer also affects the MIL tests, so the two halves of a family are no longer kept in step by this
+// file -- they are kept in step by the frozen reference waveforms in
+// fixtures/legacy_driver_reference/, which both halves compare against.
 //
 // Values are carried over verbatim from the structs they replace, comments included; each was confirmed
 // against the real checkpoint when the driver was written (see tools/convert_*/PLAN.md and BACKLOG.md's
-// dated entries for the derivations).
-//
-// **Where this should eventually live.** These are properties of the model, so a self-contained GGUF
-// should declare them and the host should read them -- the same argument KV-CACHE.md 1.1/1.3 made for
-// the KV cache's geometry, where `test_e2e_whisper_lua_driver.cpp` was sizing a cache from a hardcoded
-// C++ `WhisperConfig`. That is export-side work (it changes what the GGUF carries), so it is out of
-// scope for a stage that deliberately touches no export path; it is recorded in BACKLOG.md instead of
-// being smuggled in here. Until then, a test declaring its own inputs is honest, and the header at
-// least keeps the two tests of a family from drifting apart.
+// dated entries for the derivations). Where the export now derives the same number from the real
+// module, the two agree -- that agreement is what each family's MIL commit gated on.
 
 #include <cstdint>
 
