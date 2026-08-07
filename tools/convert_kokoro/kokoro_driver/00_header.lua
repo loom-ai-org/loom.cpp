@@ -3,12 +3,11 @@
 -- topologies export_kokoro_mil.py produces ("albert_bert_encoder", "decoder_vocoder") in place of FOUR
 -- of kokoro_driver.lua's own bespoke topology calls each ("albert"+"bert_encoder", and
 -- "decoder_core"+"sinegen"+"stft_forward"+"generator" respectively). Kokoro leans heavily on
--- `torch.nn.LSTM` (ggml has no native LSTM op) -- deliberate scoping decision (see BACKLOG.md): the
--- LSTM-bound pieces (TextEncoder's BiLSTM, DurationEncoder, predictor.lstm, F0Ntrain's shared LSTM)
--- REMAIN the existing bespoke, hand-built topologies (unchanged from kokoro_driver.lua), loaded from the
--- separate bespoke kokoro.gguf (tools/convert_kokoro/convert_kokoro_lua_all.py) alongside this driver's
--- own kokoro_mil.gguf -- register_module doesn't care which GgufModel a topology's weights live in, only
--- that all of them share one LoomLuaBridge instance.
+-- `torch.nn.LSTM` (ggml has no native LSTM op), which is why the LSTM-bound pieces (TextEncoder's
+-- BiLSTM, DurationEncoder, predictor.lstm, F0Ntrain's shared LSTM) are per-timestep CELL topologies
+-- driven by a host loop rather than one graph -- `RecurrentPhase` traces them from the real
+-- checkpoint, so they live in this same file (P4.0.7). They were borrowed from the pre-MIL
+-- kokoro.gguf until then.
 --
 -- What's different from kokoro_driver.lua, and why this isn't just that file with two calls swapped:
 --   - No `positions`/`attn_mask` inputs to "albert_bert_encoder" at all: the MIL-traced CustomAlbert
@@ -30,19 +29,25 @@
 --     already required (F0Ntrain and everything upstream of the decoder is IDENTICAL to kokoro_driver.lua
 --     -- still bespoke/LSTM-bound, unchanged).
 --
--- Expects topologies pre-registered by the host, from TWO GgufModel instances sharing one bridge:
---   kokoro_mil.gguf: "albert_bert_encoder", "decoder_vocoder"
---   kokoro.gguf (bespoke): "text_encoder_cnn", "text_encoder_lstm_{h,c}_{fwd,bwd}",
---     "duration_lstm_{0,1,2}_{h,c}_{fwd,bwd}", "duration_adaln_{0,1,2}", "top_lstm_{h,c}_{fwd,bwd}",
---     "duration_proj", "f0n_shared_lstm_{h,c}_{fwd,bwd}", "f0n_f0_block{0,1,2}", "f0n_n_block{0,1,2}",
---     "f0n_f0_proj", "f0n_n_proj" -- none use a KvCache.
+-- Expects every topology pre-registered by the host from ONE GgufModel over kokoro_mil.gguf -- none
+-- uses a KvCache. It used to take two, because this export was partial and the LSTM-bound half was
+-- borrowed from the pre-MIL kokoro.gguf alongside; P4.0.7 traced those from the real checkpoint too
+-- (the six BiLSTMs as RecurrentPhases, the CNN/AdaLayerNorms/duration head/resblock stacks/1x1
+-- projections as ordinary phases), so the artifact is self-contained now.
 --
 -- inputs: input_ids (int array, CustomAlbert's own vocabulary, caller wraps with leading/trailing 0 per
--- real KModel.forward's own convention), ref_s (256 floats: [1..style_dim]=decoder style,
--- [style_dim+1..2*style_dim]=predictor style), speed (float), seed (int, seeds loom.seed_rng --
--- SineGen's rand_ini/noise draws are the only stochastic step in this whole pipeline, SAME draw order as
--- kokoro_driver.lua: uniform first then gaussian, against the ONE shared rng_ stream), plus the real
--- model constants style_dim, d_model, hidden_per_dir, harmonic_num, upsample_scale, gen_istft_n_fft,
--- gen_istft_hop (KokoroConfig's own real defaults).
+-- real KModel.forward's own convention), ref_s (2*STYLE_DIM floats: [1..STYLE_DIM]=decoder style,
+-- [STYLE_DIM+1..2*STYLE_DIM]=predictor style -- the GGUF declares STYLE_DIM as the `loom.style_dim`
+-- hparam, which is how a host knows how long to make it), speed (float), seed (int, seeds
+-- loom.seed_rng -- SineGen's rand_ini/noise draws are the only stochastic step in this whole pipeline,
+-- SAME draw order as kokoro_driver.lua: uniform first then gaussian, against the ONE shared rng_
+-- stream).
+--
+-- style_dim, d_model, hidden_per_dir, harmonic_num, upsample_scale, gen_istft_n_fft and gen_istft_hop
+-- used to be inputs too. They are the STYLE_DIM/D_MODEL/HIDDEN_PER_DIR/HARMONIC_NUM/UPSAMPLE_SCALE/
+-- GEN_ISTFT_N_FFT/GEN_ISTFT_HOP locals below now (P4.0.8's first follow-up): the first three are read
+-- off the real TextEncoder/ProsodyPredictor, and the last four are the istftnet geometry the
+-- decoder_vocoder graph itself was traced with -- which the export now cross-checks against
+-- config.json rather than assuming.
 --
 -- Returns: the raw waveform (flat f32 array), same convention as kokoro_driver.lua's own return.
