@@ -79,6 +79,14 @@ struct GraphTopology {
     // "needs state" one: a pure causal LM needs only the first, a Mamba-style model only the second,
     // and a hybrid both, so collapsing them would over-allocate for two of the three.
     bool uses_conv_state() const;
+
+    // Does any part of this topology's own text name `symbol` -- a declared input's shape expression, a
+    // repeat_for count, or any string inside a node's attrs? Conservative by construction: it is a
+    // substring test, so "n_past_offset" counts as a mention of "n_past". That direction is the safe
+    // one, because the single caller (GraphBuilder, deciding whether `n_past` may be dropped from the
+    // key its retained graph is cached under -- BACKLOG.md P4.0.15) turns a "yes" into "rebuild every
+    // step", which is merely the behaviour that predates the item.
+    bool mentions_symbol(const std::string& symbol) const;
 };
 
 } // namespace loom

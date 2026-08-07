@@ -76,7 +76,7 @@ std::vector<float> short_conv_step(ggml_backend_t backend, loom::ConvStateCache*
     env.set("n_tokens", static_cast<double>(n_tokens));
     env.set("n_past", static_cast<double>(n_past));
     std::vector<ggml_tensor*> side_effects;
-    loom::PrimitiveContext pc{s.ctx.get(), env, /*kv_cache=*/nullptr, cache, &side_effects};
+    loom::PrimitiveContext pc{s.ctx.get(), env, /*kv_cache=*/nullptr, cache, /*kv_cells=*/nullptr, &side_effects};
 
     nlohmann::json attrs = {{"layer", static_cast<int>(layer)}};
     if (cache == nullptr) attrs["conv_state"] = false;

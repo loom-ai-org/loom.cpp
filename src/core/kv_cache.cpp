@@ -37,16 +37,29 @@ KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_
     reset();
 }
 
-ggml_tensor* KvCache::write_k(ggml_context* ctx, ggml_tensor* k_cur, uint32_t layer, uint32_t n_past, uint32_t n_tokens) {
-    ggml_tensor* base = k_layers_.at(layer);
-    ggml_tensor* dst = ggml_view_2d(ctx, base, n_embd_k_, n_tokens, base->nb[1], static_cast<size_t>(n_past) * base->nb[1]);
-    return ggml_cpy(ctx, k_cur, dst);
+ggml_tensor* KvCache::write_k(ggml_context* ctx, ggml_tensor* k_cur, uint32_t layer, ggml_tensor* cells) {
+    return ggml_set_rows(ctx, k_layers_.at(layer), k_cur, cells);
 }
 
-ggml_tensor* KvCache::write_v(ggml_context* ctx, ggml_tensor* v_cur, uint32_t layer, uint32_t n_past, uint32_t n_tokens) {
-    ggml_tensor* base = v_layers_.at(layer);
-    ggml_tensor* dst = ggml_view_2d(ctx, base, n_embd_v_, n_tokens, base->nb[1], static_cast<size_t>(n_past) * base->nb[1]);
-    return ggml_cpy(ctx, v_cur, dst);
+ggml_tensor* KvCache::write_v(ggml_context* ctx, ggml_tensor* v_cur, uint32_t layer, ggml_tensor* cells) {
+    return ggml_set_rows(ctx, v_layers_.at(layer), v_cur, cells);
+}
+
+ggml_tensor* KvCache::new_cell_index(ggml_context* ctx, uint32_t n_tokens) {
+    // I64 rather than I32: ggml_set_rows accepts either, and llama_kv_cache's own index tensors are
+    // I64, so matching it costs 4 bytes per token and removes a difference that would otherwise have to
+    // be re-derived by anyone reading the two side by side.
+    ggml_tensor* cells = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_name(cells, "kv_cells");
+    ggml_set_input(cells);
+    return cells;
+}
+
+void KvCache::fill_cell_index(ggml_tensor* cells, uint32_t n_past) {
+    const auto n_tokens = static_cast<size_t>(cells->ne[0]);
+    std::vector<int64_t> idx(n_tokens);
+    for (size_t i = 0; i < n_tokens; ++i) idx[i] = static_cast<int64_t>(n_past) + static_cast<int64_t>(i);
+    ggml_backend_tensor_set(cells, idx.data(), 0, idx.size() * sizeof(int64_t));
 }
 
 ggml_tensor* KvCache::read_k(ggml_context* ctx, uint32_t layer, uint32_t n_kv) const {

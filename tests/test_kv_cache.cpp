@@ -4,8 +4,12 @@
 //
 // Reads use KvCache::read_k/v()'s views directly via ggml_backend_tensor_get with no graph compute step
 // -- a ggml view's `data` pointer is valid the instant it's created (plain pointer arithmetic off its
-// already-allocated base tensor), unlike write_k/v()'s ggml_cpy node, which is a real compute op and
-// must be run through an actual graph for the copy to happen.
+// already-allocated base tensor), unlike write_k/v()'s ggml_set_rows node, which is a real compute op
+// and must be run through an actual graph for the write to happen.
+//
+// Since BACKLOG.md P4.0.15 a write is addressed by a CELL-INDEX TENSOR rather than an n_past offset, so
+// each helper below builds one -- and the "append" the tests are named for is now one particular
+// filling of that tensor rather than the only thing the cache can do.
 
 #include "ggml_test_helpers.h"
 #include "test_util.h"
@@ -25,9 +29,11 @@ void do_write_k(loom::KvCache& cache, ggml_backend_t backend, uint32_t layer, ui
     GgmlScratch s(backend);
     ggml_tensor* k_cur = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, n_embd_k, n_tokens);
     ggml_set_input(k_cur);
-    ggml_tensor* write_node = cache.write_k(s.ctx.get(), k_cur, layer, n_past, n_tokens);
+    ggml_tensor* cells = loom::KvCache::new_cell_index(s.ctx.get(), n_tokens);
+    ggml_tensor* write_node = cache.write_k(s.ctx.get(), k_cur, layer, cells);
     ggml_cgraph* gf = s.expand(write_node);
     set_f32(k_cur, data);
+    loom::KvCache::fill_cell_index(cells, n_past);
     s.compute(gf);
 }
 
@@ -37,9 +43,11 @@ void do_write_v(loom::KvCache& cache, ggml_backend_t backend, uint32_t layer, ui
     GgmlScratch s(backend);
     ggml_tensor* v_cur = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, n_embd_v, n_tokens);
     ggml_set_input(v_cur);
-    ggml_tensor* write_node = cache.write_v(s.ctx.get(), v_cur, layer, n_past, n_tokens);
+    ggml_tensor* cells = loom::KvCache::new_cell_index(s.ctx.get(), n_tokens);
+    ggml_tensor* write_node = cache.write_v(s.ctx.get(), v_cur, layer, cells);
     ggml_cgraph* gf = s.expand(write_node);
     set_f32(v_cur, data);
+    loom::KvCache::fill_cell_index(cells, n_past);
     s.compute(gf);
 }
 

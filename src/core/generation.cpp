@@ -22,7 +22,6 @@ Generator::Generator(GgufModel& model, GraphTopology topo, GenerationConfig cfg,
 
 void Generator::write_inputs(const GraphBuilder::BuildResult& result, const std::vector<int32_t>& step_tokens, uint32_t n_past) {
     const uint32_t n_tokens = static_cast<uint32_t>(step_tokens.size());
-    const uint32_t n_kv = n_past + n_tokens;
 
     ggml_tensor* tokens_t = result.input_tensors.at("tokens");
     ggml_backend_tensor_set(tokens_t, step_tokens.data(), 0, n_tokens * sizeof(int32_t));
@@ -35,6 +34,13 @@ void Generator::write_inputs(const GraphBuilder::BuildResult& result, const std:
     // mask[i * n_kv + j] gates query token i (absolute position n_past+i) attending to KV cell j: 0.0 if
     // attendable (j <= n_past+i), -inf otherwise. Covers prefill's causal triangle and decode's
     // attend-to-everything-so-far single row uniformly -- no separate prefill/decode mask logic needed.
+    //
+    // The width is the TENSOR's, not `n_past + n_tokens`: since BACKLOG.md P4.0.15 the builder rounds
+    // n_kv up to a bucket so a decode step can reuse its graph, and the cells past the sequence must be
+    // masked off. The same `j <= query_pos` rule already writes -inf there, so reading the width off
+    // `mask_t` is the whole of the change -- there is no separate padding pass.
+    ggml_tensor* mask_t = result.input_tensors.at("kq_mask");
+    const auto n_kv = static_cast<uint32_t>(mask_t->ne[0]);
     std::vector<float> mask(static_cast<size_t>(n_kv) * n_tokens);
     for (uint32_t i = 0; i < n_tokens; ++i) {
         const uint32_t query_pos = n_past + i;
@@ -42,7 +48,6 @@ void Generator::write_inputs(const GraphBuilder::BuildResult& result, const std:
             mask[static_cast<size_t>(i) * n_kv + j] = (j <= query_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
         }
     }
-    ggml_tensor* mask_t = result.input_tensors.at("kq_mask");
     ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
 }
 

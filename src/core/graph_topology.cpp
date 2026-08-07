@@ -122,4 +122,39 @@ bool GraphTopology::uses_conv_state() const {
     });
 }
 
+namespace {
+
+bool json_mentions(const Json& j, const std::string& symbol) {
+    if (j.is_string()) {
+        return j.get_ref<const std::string&>().find(symbol) != std::string::npos;
+    }
+    if (j.is_array() || j.is_object()) {
+        for (const Json& child : j) {
+            if (json_mentions(child, symbol)) return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+bool GraphTopology::mentions_symbol(const std::string& symbol) const {
+    for (const TensorSpec& spec : inputs) {
+        for (const std::string& dim : spec.shape) {
+            if (dim.find(symbol) != std::string::npos) return true;
+        }
+    }
+    for (const TopologyItem& item : items) {
+        if (item.is_repeat) {
+            if (item.repeat.count_symbol.find(symbol) != std::string::npos) return true;
+            for (const TopologyNode& node : item.repeat.nodes) {
+                if (json_mentions(node.attrs, symbol)) return true;
+            }
+        } else if (json_mentions(item.node.attrs, symbol)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace loom
