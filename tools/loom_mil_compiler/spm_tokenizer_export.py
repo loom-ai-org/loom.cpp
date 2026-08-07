@@ -26,6 +26,13 @@ convention rather than a separate CLS/SEP concept, unlike T5's own tokenizer) --
 (nothing written), so every existing NeMo T5/BPE call site is byte-for-byte unaffected.
 
 Requires: pip install sentencepiece gguf
+
+
+Moved here from `tools/convert_nemo/tokenizer_common.py` when the bespoke NeMo converters retired
+(BACKLOG.md P4.0.17 step 3). It sits beside `bpe_tokenizer_export` and `byt5_tokenizer_export`, which is
+where the other vocab writers already were -- and it removes a cross-package import: `exporter.py` used
+to reach into `convert_nemo`, which only resolved when `tools/` happened to be on `sys.path` as a
+package root.
 """
 from gguf import GGUFWriter
 from sentencepiece import sentencepiece_model_pb2 as spm_pb2

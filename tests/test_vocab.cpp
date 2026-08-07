@@ -36,14 +36,17 @@ bool path_exists(const std::string& path) {
 } // namespace
 
 int main() {
-    const char* dir_env = std::getenv("LOOM_CONFORMER_CTC_DIR");
-    const std::string dir = dir_env != nullptr ? dir_env : "/tmp/nemo_model";
-    const std::string gguf_path = dir + "/conformer_ctc.gguf";
+    // The MIL-exported artifact, which embeds the checkpoint's own SentencePiece vocab since the
+    // bespoke converter retired (BACKLOG.md P4.0.17 step 3) -- the same `tokenizer.ggml.*` KVs written
+    // by the same writer, which now lives at `loom_mil_compiler/spm_tokenizer_export.py`.
+    const char* gguf_env = std::getenv("LOOM_CONFORMER_CTC_MIL_GGUF");
+    const std::string gguf_path = gguf_env != nullptr ? gguf_env : "conformer_ctc_mil.gguf";
     if (!path_exists(gguf_path)) {
         std::fprintf(stderr,
-                      "skipping: real Conformer-CTC fixture not found at '%s' (set LOOM_CONFORMER_CTC_DIR "
-                      "or see tools/convert_nemo/ to produce one)\n",
-                      dir.c_str());
+                      "skipping: MIL-exported Conformer-CTC GGUF not found at '%s' (set "
+                      "LOOM_CONFORMER_CTC_MIL_GGUF, or run `loom-export <checkpoint> --task "
+                      "automatic-speech-recognition --model conformer-ctc`)\n",
+                      gguf_path.c_str());
         return kSkipReturnCode;
     }
 

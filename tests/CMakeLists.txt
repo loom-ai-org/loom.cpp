@@ -280,10 +280,6 @@ set_tests_properties(test_graph_builder_reuse PROPERTIES FIXTURES_REQUIRED toy_l
 #     PyTorch environment) -- it looks for LOOM_CONFORMER_CTC_DIR (default /tmp/nemo_model) and skips
 #     cleanly via ctest's SKIP_RETURN_CODE if that directory hasn't been prepared. See
 #     tools/convert_nemo/convert_conformer_ctc.py and reference_forward_conformer.py for how to build it.
-add_executable(test_e2e_conformer_ctc test_e2e_conformer_ctc.cpp)
-target_link_libraries(test_e2e_conformer_ctc PRIVATE loom::engine)
-add_test(NAME test_e2e_conformer_ctc COMMAND test_e2e_conformer_ctc)
-set_tests_properties(test_e2e_conformer_ctc PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Conformer-CTC-small exported via the generic MIL compiler (export_conformer_ctc_mil.py), verified
 #     against the SAME reference_forward_conformer.py fixture as the bespoke-conversion test above ---
@@ -302,10 +298,6 @@ set_tests_properties(test_e2e_conformer_ctc_lua_driver PROPERTIES SKIP_RETURN_CO
 
 # Proves the same converted GGUF supports a second, different waveform length dynamically (see
 # SPECIFICATION.md §4 and BACKLOG.md) -- no reconversion, just a different build() call.
-add_executable(test_e2e_conformer_ctc_dynamic_length test_e2e_conformer_ctc_dynamic_length.cpp)
-target_link_libraries(test_e2e_conformer_ctc_dynamic_length PRIVATE loom::engine)
-add_test(NAME test_e2e_conformer_ctc_dynamic_length COMMAND test_e2e_conformer_ctc_dynamic_length)
-set_tests_properties(test_e2e_conformer_ctc_dynamic_length PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Gating-criterion proof of concept: generic converter (tools/convert_generic/) against the real
 #     Conformer-CTC encoder -- a genuinely non-decoder-transformer shape. See BACKLOG.md. ---

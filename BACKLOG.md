@@ -1919,6 +1919,47 @@ nothing.
   Not urgent and not risky: the gate is that all five families re-export byte-identical, since none of
   them takes the path being removed.
 
+### The bespoke NeMo converters are gone — DONE (2026-08-07)
+
+P4.0.17 step 3, and the end of `tools/convert_nemo/` as a converter directory: only `mel_common.py`,
+`nemo_common.py` (both still imported by `convert_generic`/`convert_whisper`) and
+`reference_forward_conformer.py` (a real numerical oracle for the MIL encoder) remain.
+
+**A prerequisite surfaced that the plan had not named: the MIL artifact carried no tokenizer.** The
+bespoke converters wrote the checkpoint's SentencePiece vocab into their GGUF; the MIL export did not,
+so its artifact could not be detokenized. That — not the decode loop — was the last thing keeping the
+old converters alive. `extract_nemo_tokenizer_dir` unpacks the archive's `<hash>_tokenizer.model` into
+a temp dir and hands it to the exporter's existing `sentencepiece_proto` family, so there is no new
+writer and no second vocab schema. Conformer now embeds 1024 tokens, Parakeet 8192, and
+`loom_cli --model parakeet-tdt.gguf --wav samples/jfk.wav` prints *"And so, my fellow Americans, ask
+not what your country can do for you, ask what you can do for your country."* from one file.
+
+Two things had to move for that:
+
+  * **`MultiPhase.export` never forwarded `backend_kwargs()` to the output exporter**, only to the
+    per-phase ones — so a multi-phase family had no way to say anything about its own GGUF. It does now,
+    which is what lets Parakeet carry a vocab at all.
+  * **`tokenizer_common.py` moved to `loom_mil_compiler/spm_tokenizer_export.py`**, beside the other
+    vocab writers. `exporter.py` had been importing it as `convert_nemo.tokenizer_common`, which only
+    resolved when `tools/` happened to be on `sys.path` as a package root — it failed the moment the
+    export actually tried to use it.
+
+**`loom_cli --wav` is now model-agnostic.** It read the *bare* `model.graph_topology`, computed the
+relative-position table host-side and called `loom::ctc_greedy_decode` — all three properties of the
+bespoke artifact. It now registers whatever topologies the file declares, calls the driver the file
+ships, and detokenizes with the vocab the file embeds. One path for Conformer-CTC, Parakeet-TDT and
+Parakeet-RNN-T; `compute_pos_emb` went with it.
+
+**Retired:** `convert_conformer_ctc.py`, `test_e2e_conformer_ctc` and
+`test_e2e_conformer_ctc_dynamic_length`. The dynamic-length property they proved is not lost — it moved
+to `test_e2e_conformer_ctc_lua_driver`, which already runs 10240, 32000 and 176000-sample inputs through
+one artifact, which is the same claim on a wider spread. `test_vocab` is re-based onto the MIL GGUF and
+still asserts the same 1024-token vocab, unk id and round trips.
+
+`ctc_decode.{h,cpp}` STAYS, and deliberately: it is not a converter and not a per-model driver, it has
+its own unit test, and it is the independent oracle `test_e2e_conformer_ctc_lua_driver` compares the
+driver's Lua decode against. Deleting it would remove a check, not dead code.
+
 ### Parakeet decodes in Lua, and the C++ transducer decoder is gone — DONE (2026-08-07)
 
 P4.0.17 step 2, complete. `parakeet-tdt` and `parakeet-rnnt` now export as one GGUF holding five

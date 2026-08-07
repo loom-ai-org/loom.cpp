@@ -40,79 +40,42 @@ std::vector<int32_t> parse_token_ids(const std::string& text) {
     return tokens;
 }
 
-// Host-side sinusoidal relative-positional embedding, matching NeMo's RelPositionalEncoding exactly
-// (verbatim algorithm confirmed from NeMo's source during the Conformer-CTC conversion work): for
-// n_subsampled encoder frames, builds n_pos = 2*n_subsampled-1 position vectors, descending from
-// +(n_subsampled-1) to -(n_subsampled-1). Returned flat, n_embd-fastest (ne=[n_embd, n_pos] layout).
-std::vector<float> compute_pos_emb(uint32_t n_subsampled, uint32_t n_embd) {
-    const int64_t length = n_subsampled;
-    const int64_t n_pos = 2 * length - 1;
-    std::vector<double> div_term(n_embd / 2);
-    for (uint32_t k = 0; k < n_embd / 2; ++k) {
-        div_term[k] = std::exp(static_cast<double>(2 * k) * -(std::log(10000.0) / n_embd));
-    }
-    std::vector<float> pe(static_cast<size_t>(n_pos) * n_embd);
-    for (int64_t p = 0; p < n_pos; ++p) {
-        const double position = static_cast<double>(length - 1 - p);
-        for (uint32_t k = 0; k < n_embd / 2; ++k) {
-            pe[static_cast<size_t>(p) * n_embd + 2 * k] = static_cast<float>(std::sin(position * div_term[k]));
-            pe[static_cast<size_t>(p) * n_embd + 2 * k + 1] = static_cast<float>(std::cos(position * div_term[k]));
-        }
-    }
-    return pe;
-}
 
-void run_conformer_ctc(loom::GgufModel& model, ggml_backend_t backend, const std::string& wav_path) {
-    const uint32_t n_embd = model.hparam_u32("n_embd");
-    const uint32_t num_classes = model.hparam_u32("num_classes");
-
+void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& wav_path) {
+    // Model-agnostic: register whatever topologies the file declares, call the driver it ships, and
+    // detokenize with the vocab it embeds. Conformer-CTC, Parakeet-TDT and Parakeet-RNN-T all work
+    // through this one path -- the driver is the thing that differs between them, and it travels with
+    // the model (BACKLOG.md P4.0.17).
+    //
+    // It replaces a Conformer-specific routine that read the BARE `model.graph_topology`, computed the
+    // relative-position table host-side and drove `loom::ctc_greedy_decode` from C++. All three of
+    // those were properties of the bespoke converter's artifact: the MIL export names its topologies,
+    // traces the mel frontend and rel-pos attention, and carries its own decode.
     auto vocab = loom::Vocab::load(model);
     if (!vocab) {
         throw loom::LoadError("--wav: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
     }
+    if (!model.has_kv("model.driver_script")) {
+        throw loom::LoadError("--wav: model carries no driver_script; re-export it with `loom-export "
+                              "<checkpoint> --task automatic-speech-recognition`");
+    }
 
-    // Sequence length is genuinely dynamic (see SPECIFICATION.md §4 and BACKLOG.md): the topology's
-    // pos_emb_raw/kq_mask shapes are $n_tokens expressions, evaluated fresh for whatever length is
-    // actually passed to build() below -- no padding/truncation to a fixed length needed anymore.
     const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
-    const uint32_t n_samples = static_cast<uint32_t>(waveform.size());
 
-    loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json());
-    loom::GraphBuilder builder(topo, model, backend, /*kv_cache=*/nullptr);
-    const loom::GraphBuilder::BuildResult& result = builder.build({{"n_tokens", n_samples}, {"n_past", /*n_past=*/0}});
-
-    // n_subsampled/n_pos for THIS specific call are read back from the tensors GraphBuilder just
-    // allocated (their shapes were derived from n_samples above), not from the loom.n_subsampled/n_pos
-    // hparams -- those only describe the conversion-time reference/default length.
-    ggml_tensor* kq_mask_t = result.input_tensors.at("kq_mask");
-    ggml_tensor* pos_emb_raw_t = result.input_tensors.at("pos_emb_raw");
-    const int64_t n_subsampled = kq_mask_t->ne[0];
-    const int64_t n_pos = pos_emb_raw_t->ne[1];
-    if (n_subsampled < 1) {
-        throw loom::LoadError("--wav: '" + wav_path + "' (" + std::to_string(n_samples) +
-                               " samples) is too short to produce even one encoder frame");
+    loom::LoomLuaBridge bridge(backend);
+    for (const std::string& name : model.topology_names()) {
+        bridge.register_module(name, model, loom::GraphTopology::parse(model.topology_json(name)));
     }
+    bridge.load_script(model.kv_str("model.driver_script"));
 
-    ggml_backend_tensor_set(result.input_tensors.at("waveform"), waveform.data(), 0,
-                             waveform.size() * sizeof(float));
+    const std::vector<double> waveform_d(waveform.begin(), waveform.end());
+    const std::vector<double> length_d{static_cast<double>(waveform.size())};
+    const auto ids_d = std::get<std::vector<double>>(bridge.call(
+        "infer", {{"waveform", waveform_d}, {"length", length_d}}));
 
-    const std::vector<float> pos_emb = compute_pos_emb(static_cast<uint32_t>(n_subsampled), n_embd);
-    if (static_cast<int64_t>(pos_emb.size()) != static_cast<int64_t>(n_embd) * n_pos) {
-        throw loom::LoadError("--wav: internal error, computed pos_emb size doesn't match the declared "
-                               "pos_emb_raw tensor shape");
-    }
-    ggml_backend_tensor_set(pos_emb_raw_t, pos_emb.data(), 0, pos_emb.size() * sizeof(float));
-
-    const std::vector<float> zero_mask(static_cast<size_t>(n_subsampled) * static_cast<size_t>(n_subsampled), 0.0f);
-    ggml_backend_tensor_set(kq_mask_t, zero_mask.data(), 0, zero_mask.size() * sizeof(float));
-
-    ggml_backend_graph_compute(backend, result.graph);
-
-    std::vector<float> logits(static_cast<size_t>(num_classes) * static_cast<size_t>(n_subsampled));
-    ggml_backend_tensor_get(result.output, logits.data(), 0, logits.size() * sizeof(float));
-
-    const auto token_ids = loom::ctc_greedy_decode(logits.data(), n_subsampled, num_classes,
-                                                    /*blank_id=*/static_cast<int32_t>(num_classes) - 1);
+    std::vector<int32_t> token_ids;
+    token_ids.reserve(ids_d.size());
+    for (double id : ids_d) token_ids.push_back(static_cast<int32_t>(id));
     std::printf("transcript: %s\n", vocab->decode(token_ids).c_str());
 }
 
@@ -301,7 +264,7 @@ int main(int argc, char** argv) {
         }
 
         if (has_wav) {
-            run_conformer_ctc(*model, backend.get(), wav_path);
+            run_asr(*model, backend.get(), wav_path);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
