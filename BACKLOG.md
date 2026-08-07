@@ -1957,35 +1957,73 @@ nothing.
   rider on anything else.
 
 - **P4.0.18 — no exporter function should build a driver by interpolating text into a marker. Delete
-  `render_driver`'s substitution.** (Author's direction, 2026-08-06: "No function should be
-  interpolating scripts with marks.")
+  `render_driver`'s substitution — DONE (2026-08-07).** (Author's direction, 2026-08-06: "No function
+  should be interpolating scripts with marks.")
 
-  **Most of this is already done and was never cleaned up, which is the useful finding.** The
-  replacement exists and ships: `FlowMatchingSampler` is a real `DriverComponent` whose `prelude` calls
-  `render_sampler` and whose call site is IR, and its own docstring states the point — "both ends now go
-  through the builder instead of a marker substitution into hand-written text", closing the gap
-  `FlowMatchingSpec.func_name`'s `Unchecked` note predicted. Measured across the tree today:
+  `SAMPLER_MARKER`, `_substitute`, `render_driver` and `_TextDriver` are gone from
+  `flow_matching_export.py`, which is now the declaration (`FlowMatchingSpec`, `EstimatorSpec`) and the
+  codegen (`render_sampler`) and nothing else — a pure `spec -> str` with no opinion about the file its
+  output lands in. Where it lands is `driver_components.FlowMatchingSampler`'s business: the function as
+  its `prelude`, the line calling it as IR.
 
-  * **No `.lua` anywhere contains `--@loom:samplers`.** The only occurrences of `SAMPLER_MARKER` are its
-    definition in `flow_matching_export.py` and `test_flow_matching_export.py`, which exercises the path
-    nothing else reaches.
-  * **All five multi-phase families are peeled** — kokoro, matcha, supertonic, styletts2 and vits each
-    override `driver_components()` — and `MultiPhase.export` only calls `render_driver` on the
-    *unpeeled* branch (`decomposition.py`: `None if peeled is not None else render_driver(...)`). So the
-    substitution is unreachable in production, and `decomposition.py` already says so in a comment.
+  **The item's own prediction was right about the samplers and wrong about the estimators, and the
+  correction is the finding.** It said the link checks `render_driver` also ran "are already duplicated
+  [on the component path] for peeled families, which is worth confirming rather than assuming".
+  Confirmed for `samplers()`: Matcha's and Supertonic's `driver_components()` read `self.samplers()` and
+  hand the spec to `FlowMatchingSampler`, whose `sub_specs()` registers that same object with the
+  export's checker. One spec, two readers, no copy.
 
-  What to delete: `SAMPLER_MARKER`, `_substitute`, and `render_driver` itself once its second job is
-  rehomed — it also runs the spec/estimator link checks, which are real and must not go with it. Move
-  those onto the component path (they are already duplicated there for peeled families, which is worth
-  confirming rather than assuming) and the function has nothing left. **Keep `render_sampler`**: it is
-  the codegen, it is called by `FlowMatchingSampler.prelude`, and it is not the thing objected to.
+  `estimators()` was **not** duplicated — and had not been checked at all since StyleTTS2 was peeled.
+  It was the peeled path that skipped it: `render_driver` ran only on the unpeeled branch, and StyleTTS2
+  is the only family that ever implemented `estimators()`. What covers that call today is something
+  better than a rehomed declaration, which is why nothing was rehomed: **`LuaFragment` parses it out of
+  the fragment's own text.** `02_style_diffusion.lua` contains a literal
+  `loom.run_subgraph("diffusion", ..., {x_in = ..., time = ..., embedding = ...})`, so its fragment's
+  `sub_specs()` yields a `RunSubgraphCall` with the same topology, the same input set and the same two
+  links (`TopologyName`, `TopologyInput(exact=True)`) — plus the file and the line on the label. A
+  closure is no obstacle to it: the parse reads Lua source, not entry-function structure. So
+  `estimators()` is deleted from both the base config and StyleTTS2 rather than moved, on the standing
+  argument that a declaration nobody reads is worse than none — here it was a *second* copy of a check
+  that a parse of the real text cannot go stale against.
 
-  Also retire `BaseMultiPhaseModelExportConfig.driver_script_path` if nothing needs it afterwards, and
-  the `driver_components() -> None` default that selects the dead branch — a default that routes a new
-  family into an unreachable path is worse than no default.
+  `driver_script_path` is **kept and re-documented**. The item allowed retiring it "if nothing needs it
+  afterwards"; every peeled family needs it, as the *directory* its `.lua` fragments are read from. Its
+  `Unchecked` note said it was "the hand-written Lua the export substitutes generated samplers into",
+  which stopped being true at C.4 and was never corrected.
 
-  Not urgent and not risky: the gate is that all five families re-export byte-identical, since none of
-  them takes the path being removed.
+  `driver_components()` no longer defaults to `None`; it raises `NotImplementedError` like `phases()`.
+  That default was the switch that selected `RawLuaDriver` around a whole hand-written `.lua`, which is
+  what kept the substitution reachable at all. `RawLuaDriver` itself **stays** — its registry entry has
+  argued since D.1 that it is how the *next* hand-written driver is adopted, in a commit whose gate is
+  byte-identity — but it now has no construction site, which is the honest state: an unused component is
+  fine, a live branch selecting an unused component is a route a new family gets taken down by accident.
+
+  One piece of residue the item did not name went with it: `Decomposition.driver_builder(config,
+  **context)`. The `**context` was documented as "whatever the specific decomposition needs beyond the
+  config", and in the whole tree exactly one thing was ever passed through it — `MultiPhase`'s
+  `source=`, the post-substitution driver text. With no text to hand over, the parameter is an
+  extension point nobody had asked for twice, so the hook is now `driver_builder(config)`.
+
+  **Gates.** All five TTS families re-exported from a baseline worktree and from the working tree,
+  `snapshot_gguf.py` both, `diff -r`: **empty** — every KV, every topology JSON, every tensor hash and
+  all five `model.driver_script` texts (1,087 lines) identical. That gate cannot fail by construction
+  here, which is exactly the trap `BACKLOG.md` §6 warns about, so the real evidence is the negative one:
+  breaking `02_style_diffusion.lua`'s call (`embedding` → `attn_mask`) makes the StyleTTS2 export
+  **refuse**, with
+
+      02_style_diffusion.lua:13 loom.run_subgraph('diffusion') does not match topology 'diffusion':
+      supplies input(s) it does not declare: ['attn_mask']; leaves declared input(s) unsupplied:
+      ['embedding']; topology declares ['x_in', 'time', 'embedding'], spec supplies ['x_in', 'time',
+      'attn_mask'].
+
+  — which is the check `estimators()` claimed to provide, still running after `estimators()` is gone,
+  naming a line rather than a spec. The removed default is pinned by
+  `test_multi_phase_export.TestTheDriverHookIsRequired`. Exporter suite **479/479, 0 failed** (480
+  before: −2 for `render_driver`'s two marker-substitution tests, which tested a function that no longer
+  exists, +1 for the hook test — every *validation* test `render_driver` hosted was rewritten onto
+  `spec_protocol.check_links` and kept, including the four that assert an error message verbatim).
+  `DRIVER-COMPONENTS.md` regenerated: one line moves, `raw_lua_driver`'s "no model uses it" note, and no
+  component's *used by* column changes — which is itself a check that no family's component list moved.
 
 ### TTS driver constants moved to the export side — DONE (2026-08-07)
 

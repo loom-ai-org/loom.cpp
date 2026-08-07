@@ -14,9 +14,18 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from loom_mil_compiler.flow_matching_export import (
-    SAMPLER_MARKER, EstimatorSpec, FlowMatchingSpec, render_driver, render_sampler,
-)
+from loom_mil_compiler.flow_matching_export import EstimatorSpec, FlowMatchingSpec, render_sampler
+from loom_mil_compiler.spec_protocol import check_links
+
+
+def _check(spec, **topologies):
+    """`spec`'s links against a fake export's topologies, the way `DriverBuilder.build` runs them.
+
+    `strict=False` because `FlowMatchingSpec.func_name` is a `DriverSymbol`: it defers until the built
+    driver exists, which is the builder's business and not this module's. What is being exercised here
+    is the half answerable from the topologies alone -- and that the deferral is *reported* rather than
+    skipped is `test_a_deferred_link_is_reported_rather_than_skipped` below."""
+    return check_links(spec, topologies=topologies, strict=False)
 
 
 def _topology(*input_names, outputs=("v",)):
@@ -74,39 +83,29 @@ class TestValidation(unittest.TestCase):
             MATCHA.validate_against_topology(_topology("z", "mu", "t", "cond"))
         self.assertIn("'cond'", str(cm.exception))
 
-    def test_render_driver_rejects_an_unknown_estimator(self):
+    def test_rejects_an_estimator_the_export_never_produced(self):
         with self.assertRaises(ValueError) as cm:
-            render_driver(SAMPLER_MARKER, [MATCHA], topologies={"vocoder": _topology("mel")})
+            _check(MATCHA, vocoder=_topology("mel"))
         self.assertIn("decoder", str(cm.exception))
-
-    def test_render_driver_requires_a_marker_when_it_has_something_to_emit(self):
-        with self.assertRaises(ValueError):
-            render_driver("-- no marker here\n", [MATCHA])
-
-    def test_render_driver_substitutes_the_marker(self):
-        out = render_driver(f"-- head\n{SAMPLER_MARKER}\n-- tail\n", [MATCHA],
-                            topologies={"decoder": _topology("z", "mu", "t")})
-        self.assertNotIn(SAMPLER_MARKER, out)
-        self.assertIn("local function sample_decoder", out)
-        self.assertTrue(out.startswith("-- head\n") and out.endswith("-- tail\n"))
 
 
 class TestBespokeEstimator(unittest.TestCase):
-    """StyleTTS2's ADPM2 sampler generates nothing but is still checked -- the codegen and the
-    validation generalize to different extents, which is why EstimatorSpec exists separately."""
+    """A hand-written sampler generates nothing but is still checked -- the codegen and the validation
+    generalize to different extents, which is why EstimatorSpec exists separately.
 
-    def test_a_bare_estimator_declaration_validates_without_a_marker(self):
-        source = "-- hand-written ADPM2 driver, nothing generated\n"
+    StyleTTS2 is the family this was written for, and since P4.0.18 it reaches the same two links
+    through `LuaFragment`'s parse of its own `.lua` rather than through a declaration beside it -- see
+    `test_driver_components.TestPeeledStyleTTS2`. What is exercised here is the spec itself, which
+    is what `FlowMatchingSpec.estimator_spec()` still reduces to."""
+
+    def test_a_bare_estimator_declaration_checks_clean(self):
         spec = EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "embedding"])
-        out = render_driver(source, topologies={"diffusion": _topology("x_in", "time", "embedding")},
-                            estimators=[spec])
-        self.assertEqual(out, source)
+        self.assertEqual(_check(spec, diffusion=_topology("x_in", "time", "embedding")), [])
 
     def test_a_mismatched_bespoke_call_is_still_caught(self):
         spec = EstimatorSpec(topology="diffusion", inputs=["x_in", "time", "attn_mask"])
         with self.assertRaises(ValueError) as cm:
-            render_driver("-- driver\n", topologies={"diffusion": _topology("x_in", "time", "embedding")},
-                          estimators=[spec])
+            _check(spec, diffusion=_topology("x_in", "time", "embedding"))
         self.assertIn("attn_mask", str(cm.exception))
         self.assertIn("embedding", str(cm.exception))
 
@@ -146,7 +145,7 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
 
     def test_the_unknown_topology_message_is_preserved_verbatim(self):
         with self.assertRaises(ValueError) as cm:
-            render_driver(SAMPLER_MARKER, [MATCHA], topologies={"vocoder": _topology("mel")})
+            _check(MATCHA, vocoder=_topology("mel"))
         self.assertEqual(
             str(cm.exception),
             "FlowMatchingSpec('sample_decoder') names topology 'decoder', which is not among the "
@@ -156,7 +155,7 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
     def test_a_bespoke_estimator_is_still_named_by_its_topology(self):
         spec = EstimatorSpec(topology="diffusion", inputs=["x_in"])
         with self.assertRaises(ValueError) as cm:
-            render_driver("-- driver\n", topologies={"albert": _topology("tokens")}, estimators=[spec])
+            _check(spec, albert=_topology("tokens"))
         self.assertEqual(
             str(cm.exception),
             "EstimatorSpec('diffusion') names topology 'diffusion', which is not among the exported "
@@ -169,8 +168,7 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
         the first output's DATA and the loop integrates the wrong tensor -- valid Lua, plausible
         shapes, wrong audio, and nothing reports it."""
         with self.assertRaises(ValueError) as cm:
-            render_driver(SAMPLER_MARKER, [MATCHA],
-                          topologies={"decoder": _topology("z", "mu", "t", outputs=("v", "logdet"))})
+            _check(MATCHA, decoder=_topology("z", "mu", "t", outputs=("v", "logdet")))
         self.assertIn("is built for a topology declaring 1 output(s)", str(cm.exception))
         self.assertIn("'decoder' declares 2: ['v', 'logdet']", str(cm.exception))
 
@@ -192,8 +190,8 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
             self.assertEqual(dangling_coverage(cls), [], cls.__name__)
 
     def test_a_deferred_link_is_reported_rather_than_skipped(self):
-        """`render_driver(topologies=None)` is the documented "generate, don't validate" path. What
-        must not happen is a caller passing a checker and believing the specs were validated."""
+        """A spec registered with a checker that never gets the topologies must be REPORTED, not
+        silently skipped. What must not happen is a caller believing the spec was validated."""
         from loom_mil_compiler.spec_protocol import LinkChecker, LinkError
 
         checker = LinkChecker()
