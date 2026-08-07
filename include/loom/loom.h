@@ -40,7 +40,6 @@
 #include "loom/core/unicode.h"
 #include "loom/core/supertonic_text_vectorizer.h"
 #include "loom/core/ctc_decode.h"
-#include "loom/core/tdt_decoder.h"
 #include "loom/core/generation.h"
 
 // --- Standalone C++ components from the pre-MIL era. Each is model-agnostic and keeps its own unit

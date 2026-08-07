@@ -79,15 +79,22 @@ class TestTheDurationSetIsCrossCheckedAgainstTheJoint(unittest.TestCase):
     def test_a_duration_set_that_disagrees_with_the_joint_is_rejected(self):
         from loom_mil_compiler.parakeet_export import ASRParakeetExportConfig
 
+        class _Cfg:
+            # What the checkpoint claims: five durations. The joint below emits 11 = 9 tokens + 2, so
+            # the two disagree -- which is the whole point of the check.
+            model_defaults = {"tdt_durations": [0, 1, 2, 3, 4]}
+
         class _Model:
+            cfg = _Cfg()
+
             class decoder:
                 class prediction:
                     embed = nn.Embedding(9, 6)
                     class dec_rnn:
                         lstm = nn.LSTM(6, 6, num_layers=2)
-            joint = _FakeJoint(n_out=11)   # 9 tokens + 2 durations, not 5
+            joint = _FakeJoint(n_out=11)
 
-        cfg = ASRParakeetExportConfig(checkpoint="/unused.nemo", durations=(0, 1, 2, 3, 4))
+        cfg = ASRParakeetExportConfig(checkpoint="/unused.nemo")
         cfg.load_model = lambda: _Model()
         with self.assertRaises(ValueError) as raised:
             cfg.phases()

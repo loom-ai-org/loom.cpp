@@ -454,16 +454,21 @@ def _build_conformer_ctc(path: Path, output_path: str):
 
 
 def _build_parakeet_tdt(path: Path, output_path: str):
-    return ASRNemoEncoderExportConfig(
-        checkpoint=str(path), output=EncoderOutput.ENCODER_BT_D,
-        architecture="parakeet-tdt-encoder", output_path=output_path,
+    # The WHOLE model, not just the encoder (BACKLOG.md P4.0.17 step 2): encoder + embedding +
+    # prediction LSTM + joint, in one GGUF with a driver that decodes. The encoder-only
+    # `ASRNemoEncoderExportConfig` this used to build produced an artifact nothing could run.
+    from .parakeet_export import ASRParakeetExportConfig
+
+    return ASRParakeetExportConfig(
+        checkpoint=str(path), architecture="parakeet-tdt", output_path=output_path,
     )
 
 
 def _build_parakeet_rnnt(path: Path, output_path: str):
-    return ASRNemoEncoderExportConfig(
-        checkpoint=str(path), output=EncoderOutput.ENCODER_BT_D,
-        architecture="parakeet-rnnt-encoder", output_path=output_path,
+    from .parakeet_export import ASRParakeetExportConfig
+
+    return ASRParakeetExportConfig(
+        checkpoint=str(path), architecture="parakeet-rnnt", output_path=output_path,
     )
 
 

@@ -726,7 +726,14 @@ class RunSubgraphCall:
 
 
 # The Lua fragment every call site starts with.
-_RUN_SUBGRAPH = "loom.run_subgraph("
+# Both spellings that run a registered module from hand-written Lua. `run_subgraph_and_retain` was
+# invisible to this parser until Parakeet's decode fragment used it -- the fragment's `joint` call site
+# simply was not seen, and the coverage check reported the topology as named by nobody. A blind spot in
+# the checker reads exactly like a driver that does not call something, which is the failure mode this
+# whole parse exists to prevent (BACKLOG.md P4.0.12 added the retaining form; nothing taught D.2's
+# machinery about it).
+_RUN_SUBGRAPH_FORMS = ("loom.run_subgraph(", "loom.run_subgraph_and_retain(")
+_RUN_SUBGRAPH = _RUN_SUBGRAPH_FORMS[0]
 # A table-literal entry's key: `name =`, but not `name ==`.
 _TABLE_KEY = re.compile(r"^\s*([A-Za-z_]\w*)\s*=(?!=)")
 _STRING_LITERAL = re.compile(r"""^(?:"([^"]*)"|'([^']*)')$""")
@@ -783,11 +790,17 @@ def parse_run_subgraph_calls(source: str, origin: str = "driver"):
     into a registered component, which declares its topologies as data.
     """
     checkable, unresolved = [], []
-    index = source.find(_RUN_SUBGRAPH)
-    while index != -1:
+    sites = []
+    for form in _RUN_SUBGRAPH_FORMS:
+        index = source.find(form)
+        while index != -1:
+            args_text, end = _balanced_args(source, index + len(form))
+            sites.append((index, args_text))
+            index = source.find(form, end)
+    # `run_subgraph(` is a prefix of nothing else here, but `run_subgraph_and_retain(` is NOT found by
+    # the plain form, so the two scans are independent and their results interleave by position.
+    for index, args_text in sorted(sites):
         line = source.count("\n", 0, index) + 1
-        args_text, end = _balanced_args(source, index + len(_RUN_SUBGRAPH))
-        index = source.find(_RUN_SUBGRAPH, end)
         args = _split_top_level(args_text)
         if len(args) != 3:
             unresolved.append((line, args_text.strip().splitlines()[0]))

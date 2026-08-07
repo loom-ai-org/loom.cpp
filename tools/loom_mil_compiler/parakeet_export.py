@@ -96,17 +96,22 @@ class ASRParakeetExportConfig(BaseMultiPhaseModelExportConfig):
     output: EncoderOutput = EncoderOutput.ENCODER_BT_D
     architecture: str = "parakeet_tdt"
     output_path: str = "parakeet.gguf"
-    # TDT's own duration set, read off the checkpoint's `model_defaults.tdt_durations`. EMPTY for plain
-    # RNN-T, which has no duration head at all -- the same distinction `TdtDecoderConfig::durations`
-    # draws, and the one that decides both the joint's output count and which branch the driver takes.
-    durations: tuple = ()
+    # Bounds the inner per-frame symbol loop -- the same defensive cap `TdtDecoderConfig` carried, and
+    # not part of the TDT algorithm itself.
+    max_symbols_per_step: int = 10
     # The traced encoder's own dynamic axis: raw audio samples, never a token count (EXPORT-ROADMAP R1).
     root_axis: str = "n_samples"
-    driver_script_path: Path = Path(__file__).resolve().parent / "lua" / "parakeet_driver.lua"
+    driver_script_path: Path = Path(__file__).resolve().parent / "parakeet_driver"
     decomposition: Decomposition = field(default_factory=lambda: MultiPhase())
 
     # Filled during `phases()`, which is the only moment the restored checkpoint is in hand. See the
     # `__unchecked__` note: these are READ off the model, never declared.
+    # TDT's own duration set, EMPTY for plain RNN-T (no duration head at all) -- the distinction
+    # `TdtDecoderConfig::durations` drew, deciding both the joint's output count and the driver's
+    # branch. Derived, not declared: read off the RESTORED model in `phases()` rather than by
+    # re-opening the archive in `build_config`, so a config can be built (and its components counted by
+    # `component_registry.usage`) without a checkpoint on disk.
+    durations: tuple = field(default=(), init=False, repr=False)
     blank_id: Optional[int] = field(default=None, init=False, repr=False)
     pred_hidden: Optional[int] = field(default=None, init=False, repr=False)
     num_pred_layers: Optional[int] = field(default=None, init=False, repr=False)
@@ -127,9 +132,13 @@ class ASRParakeetExportConfig(BaseMultiPhaseModelExportConfig):
                                   "is no second authority to compare it against"),
         "output_path": Unchecked("where to write. A caller's choice, not a claim about the model."),
         "durations": Unchecked(
-            "READ off the checkpoint's `model_defaults.tdt_durations` by the recognizer, not declared "
-            "here -- and cross-checked against the traced joint's own width in `phases()`, which is "
-            "the only place both numbers exist at once."
+            "READ off the restored model's `cfg.model_defaults.tdt_durations` in phases(), not declared "
+            "-- and cross-checked there against the traced joint's own width, which is the only place "
+            "both numbers exist at once."
+        ),
+        "max_symbols_per_step": Unchecked(
+            "a defensive bound on the inner loop, not a property of the checkpoint -- nothing in the "
+            "model could disagree with it"
         ),
         "root_axis": Unchecked("checked by the encoder ExportPhase's own Axis link, which is where the "
                                "value is actually used"),
@@ -152,6 +161,11 @@ class ASRParakeetExportConfig(BaseMultiPhaseModelExportConfig):
 
     def phases(self) -> List[ExportPhase]:
         model = self.load_model()
+        # The checkpoint is the authority on its own duration set: `model_defaults.tdt_durations` for
+        # TDT, absent entirely for plain RNN-T.
+        defaults = getattr(model.cfg, "model_defaults", None) or {}
+        self.durations = tuple(defaults.get("tdt_durations") or ())
+
         pred = model.decoder.prediction
         lstm = pred.dec_rnn.lstm
         self.pred_hidden = int(lstm.hidden_size)
@@ -225,3 +239,57 @@ class ASRParakeetExportConfig(BaseMultiPhaseModelExportConfig):
 
     def backend_kwargs(self) -> dict:
         return dict(flat_namespace=True, root_axis=self.root_axis)
+
+    def driver_components(self) -> List:
+        """Parakeet's driver, as components.
+
+        Three of the four topologies are called from the hand-written decode fragment rather than as
+        `SubgraphCallComponent`s, and that is the honest split rather than a shortcut: they are called
+        from inside a double loop whose trip counts depend on what the joint just emitted, so their call
+        sites are *statements inside control flow*, which is precisely what a `LuaFragment` is for. The
+        encoder is not -- it runs exactly once, before any of it -- so it stays IR and gets its output
+        arity checked. The fragment's own `loom.run_subgraph` call sites are parsed and declared against
+        the traced topologies regardless (`parse_run_subgraph_calls`), and the computed per-layer name is
+        covered by the `drives` declaration below.
+        """
+        from .driver_components import (
+            ComputedCall, DriverReturn, ExportConstants, LuaFragment, SubgraphCallComponent,
+        )
+        from .driver_ir import FieldAccess, Len, Var
+
+        fragment = self.driver_script_path
+        return [
+            LuaFragment(fragment / "00_header.lua", top_level=True),
+            ExportConstants(values={
+                "BLANK_ID": self.blank_id,
+                "N_DURATIONS": len(self.durations),
+                "DURATIONS": list(self.durations),
+                "PRED_HIDDEN": self.pred_hidden,
+                "N_PRED_LAYERS": self.num_pred_layers,
+                "MAX_SYMBOLS_PER_STEP": self.max_symbols_per_step,
+            }),
+            # `_waveform` first: the encoder's own root axis is its length, so it has to be a local
+            # before the call that reads `#_waveform`.
+            LuaFragment(fragment / "01_inputs.lua", defines=("_waveform",)),
+            SubgraphCallComponent(
+                topology="encoder", outputs=("_enc",), extra_outputs=("_enc_shape",),
+                inputs={"waveform": Var("_waveform"),
+                        "length": FieldAccess("inputs", "length")},
+                length=Len("_waveform"),
+            ),
+            LuaFragment(
+                fragment / "02_decode.lua",
+                reads=("_enc", "_enc_shape", "BLANK_ID", "N_DURATIONS", "DURATIONS", "PRED_HIDDEN",
+                       "N_PRED_LAYERS", "MAX_SYMBOLS_PER_STEP"),
+                defines=("tokens",),
+                drives=(
+                    # The per-layer cell name is computed (`'pred_lstm_l' .. (l - 1) .. '_fwd'`), so the
+                    # parser cannot resolve it and the declaration says which topologies it reaches.
+                    ComputedCall(topologies=tuple(f"pred_lstm_l{i}_fwd"
+                                                   for i in range(self.num_pred_layers or 0)),
+                                 inputs=("layer_input", "h_prev", "c_prev"),
+                                 written="'pred_lstm_l' .. (l - 1) .. '_fwd'"),
+                ),
+            ),
+            LuaFragment(fragment / "03_return.lua", reads=("tokens",)),
+        ]
