@@ -76,5 +76,38 @@ class LoomExportConfig:
 
     def backend_kwargs(self) -> dict:
         """Extra keyword arguments for `LoomGGUFBackend.__call__` beyond `output_path`/`architecture`
-        (tokenizer paths, quantization, `root_axis`, `flat_namespace`). Empty by default."""
+        (tokenizer paths, quantization, `root_axis`, `flat_namespace`). Empty by default.
+
+        **An override must carry `hparams=self.hparams()` through.** Every override here builds its own
+        dict rather than updating `super()`'s, which is fine for kwargs a family opts into and wrong
+        for one every family has -- so the four that exist each pass it explicitly, and
+        `test_export_hparams.py` walks the registry to check they still do. A hook honoured by one path
+        out of four is worse than no hook: it reads as available and silently does nothing."""
+        return {"hparams": self.hparams()}
+
+    def hparams(self) -> dict:
+        """`{key: number}` a **host** needs in order to call this model's driver at all -- written into
+        the GGUF as `loom.<key>` KVs, the same namespace `loom::make_kv_cache` already reads its five
+        geometry facts from.
+
+        This is one half of a split, and which half a number belongs in is decided by who reads it:
+
+        * a number the **driver** needs is an `ExportConstants` value (`driver_components.py`), bound as
+          an IR local, because Lua cannot read GGUF metadata at all;
+        * a number the **host** needs -- to size an input it must build, or to interpret an output --
+          belongs here, because the driver cannot hand it over before being called.
+
+        Kokoro's `style_dim` is the clearest case of the second: a caller cannot construct `ref_s`
+        without knowing how long each of its two halves is, and until this existed the answer lived in
+        `tests/tts_driver_inputs.h` -- a C++ test header, which is exactly the "self-contained GGUF"
+        claim being false (P4.0.8's first follow-up; KV-CACHE.md 1.1/1.3 made the same argument for
+        cache geometry).
+
+        A number both sides need is declared once *here in the config* and rendered twice, which is not
+        the "two spellings that can disagree" `kv_cache.h` warns about: both readings come from one
+        attribute set in `phases()`, so there is no second authority. Supertonic's fixed text length is
+        that case -- the host needs it to build `txt_ids`, the driver needs it to reject a wrong-length
+        one.
+
+        Empty by default; `int` values are written as u32 and `float` as f32."""
         return {}

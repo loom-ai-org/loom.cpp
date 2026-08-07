@@ -218,6 +218,7 @@ class LMCausalModelExportConfig(LoomExportConfig):
         kwargs = dict(
             tokenizer_dir=self.tokenizer_dir or self.model_dir,
             tokenizer_pre=self.tokenizer_pre,
+            hparams=self.hparams(),
         )
         # Only the flattened form declares these: `flat_namespace` writes every weight under one flat
         # name, which is right for a single-topology export and wrong for the modular path, whose
