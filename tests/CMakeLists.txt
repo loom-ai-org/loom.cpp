@@ -510,93 +510,20 @@ target_compile_definitions(test_duration_aligner PRIVATE
 add_test(NAME test_duration_aligner COMMAND test_duration_aligner)
 set_tests_properties(test_duration_aligner PROPERTIES FIXTURES_REQUIRED "duration_aligner_reference_fixture")
 
-# --- Parakeet-TDT roadmap, step 2: the full greedy-TDT decode loop (new TdtDecoder driver), verified
-#     against an independent numpy reference on a tiny synthetic fixture -- see BACKLOG.md. ---
-set(LOOM_TDT_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/tdt_step_ref)
-
-add_test(
-    NAME gen_tdt_step_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_tdt_step_gguf.py
-            ${LOOM_FIXTURE_DIR}/tdt_step_test
-)
-set_tests_properties(gen_tdt_step_gguf_fixture PROPERTIES FIXTURES_SETUP tdt_step_gguf_fixture)
-
-add_test(
-    NAME gen_tdt_step_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_tdt_step.py
-            ${LOOM_TDT_STEP_REF_DIR}
-)
-set_tests_properties(gen_tdt_step_reference PROPERTIES FIXTURES_SETUP tdt_step_reference_fixture)
-
-add_executable(test_tdt_decoder test_tdt_decoder.cpp)
-target_link_libraries(test_tdt_decoder PRIVATE loom::engine)
-target_compile_definitions(test_tdt_decoder PRIVATE
-    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}/tdt_step_test"
-    LOOM_TEST_REF_DIR="${LOOM_TDT_STEP_REF_DIR}"
-)
-add_test(NAME test_tdt_decoder COMMAND test_tdt_decoder)
-set_tests_properties(test_tdt_decoder PROPERTIES FIXTURES_REQUIRED "tdt_step_gguf_fixture;tdt_step_reference_fixture")
-
-# --- FastConformer RNN-T roadmap, step 1: loom::TdtDecoder's new plain-RNN-T mode (empty `durations`),
-#     verified against an independent numpy reference of standard RNN-T greedy decoding on a tiny
-#     synthetic fixture -- see BACKLOG.md. Same pattern as the TDT fixture above, deliberately
-#     duplicated rather than shared (this project's usual per-fixture convention). ---
-set(LOOM_RNNT_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/rnnt_step_ref)
-
-add_test(
-    NAME gen_rnnt_step_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_rnnt_step_gguf.py
-            ${LOOM_FIXTURE_DIR}/rnnt_step_test
-)
-set_tests_properties(gen_rnnt_step_gguf_fixture PROPERTIES FIXTURES_SETUP rnnt_step_gguf_fixture)
-
-add_test(
-    NAME gen_rnnt_step_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_rnnt_step.py
-            ${LOOM_RNNT_STEP_REF_DIR}
-)
-set_tests_properties(gen_rnnt_step_reference PROPERTIES FIXTURES_SETUP rnnt_step_reference_fixture)
-
-add_executable(test_rnnt_decoder test_rnnt_decoder.cpp)
-target_link_libraries(test_rnnt_decoder PRIVATE loom::engine)
-target_compile_definitions(test_rnnt_decoder PRIVATE
-    LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}/rnnt_step_test"
-    LOOM_TEST_REF_DIR="${LOOM_RNNT_STEP_REF_DIR}"
-)
-add_test(NAME test_rnnt_decoder COMMAND test_rnnt_decoder)
-set_tests_properties(test_rnnt_decoder PROPERTIES FIXTURES_REQUIRED "rnnt_step_gguf_fixture;rnnt_step_reference_fixture")
-
-# --- Real-model test: nvidia/parakeet-tdt-0.6b-v3, converted via tools/convert_nemo/convert_parakeet_tdt.py
-#     -- the real FastConformer encoder (dw_striding subsampling, no bias, no xscale) + the new TdtDecoder
-#     driver's greedy decode over it. Same "not regenerated at ctest time, skip cleanly if the real
-#     checkpoint isn't prepared" pattern as the other real-model tests above. ---
-add_executable(test_e2e_parakeet_tdt test_e2e_parakeet_tdt.cpp)
-target_link_libraries(test_e2e_parakeet_tdt PRIVATE loom::engine)
-add_test(NAME test_e2e_parakeet_tdt COMMAND test_e2e_parakeet_tdt)
-set_tests_properties(test_e2e_parakeet_tdt PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Parakeet-TDT encoder exported via the generic MIL compiler (export_parakeet_tdt_mil.py), verified
-#     against the SAME reference_forward_parakeet_tdt.py fixture as the bespoke-conversion test above ---
-add_executable(test_e2e_parakeet_tdt_mil_export test_e2e_parakeet_tdt_mil_export.cpp)
-target_link_libraries(test_e2e_parakeet_tdt_mil_export PRIVATE loom::engine)
-add_test(NAME test_e2e_parakeet_tdt_mil_export COMMAND test_e2e_parakeet_tdt_mil_export)
-set_tests_properties(test_e2e_parakeet_tdt_mil_export PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Parakeet-RNNT encoder exported via the generic MIL compiler (export_parakeet_rnnt_mil.py), verified
-#     against the SAME reference_forward_parakeet_rnnt.py fixture as the bespoke-conversion test above ---
-add_executable(test_e2e_parakeet_rnnt_mil_export test_e2e_parakeet_rnnt_mil_export.cpp)
-target_link_libraries(test_e2e_parakeet_rnnt_mil_export PRIVATE loom::engine)
-add_test(NAME test_e2e_parakeet_rnnt_mil_export COMMAND test_e2e_parakeet_rnnt_mil_export)
-set_tests_properties(test_e2e_parakeet_rnnt_mil_export PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Real-model end-to-end test: nvidia/parakeet-rnnt-0.6b (converted by
-#     tools/convert_nemo/convert_parakeet_rnnt.py) -- same FastConformer encoder architecture family as
-#     parakeet-tdt (dw_striding subsampling) but biased/xscaled differently (confirmed real, see that
-#     script's own docstring), decoded via TdtDecoder's new plain-RNN-T mode (empty `durations`). ---
-add_executable(test_e2e_parakeet_rnnt test_e2e_parakeet_rnnt.cpp)
-target_link_libraries(test_e2e_parakeet_rnnt PRIVATE loom::engine)
-add_test(NAME test_e2e_parakeet_rnnt COMMAND test_e2e_parakeet_rnnt)
-set_tests_properties(test_e2e_parakeet_rnnt PROPERTIES SKIP_RETURN_CODE 77)
+# --- Parakeet TDT and RNN-T, decoded by their own embedded Lua driver and compared against NeMo's own
+#     `model.transcribe()` output for samples/jfk.wav (BACKLOG.md P4.0.17 step 2).
+#
+#     This one test replaces six: test_{tdt,rnnt}_decoder (loom::TdtDecoder against numpy references on
+#     synthetic fixtures), test_e2e_parakeet_{tdt,rnnt} (the same decoder over six bespoke GGUFs) and
+#     test_e2e_parakeet_{tdt,rnnt}_mil_export (the encoder-only MIL artifact, whose `main_topology` no
+#     longer exists). None of them can be kept: the C++ decoder they exercise is gone, and the artifact
+#     is now one GGUF whose driver decodes. The oracle is stronger for it -- NeMo itself on real speech,
+#     rather than a hand-rolled reimplementation on a synthetic waveform that, for RNN-T, decoded to an
+#     empty token list. ---
+add_executable(test_e2e_parakeet_lua_driver test_e2e_parakeet_lua_driver.cpp)
+target_link_libraries(test_e2e_parakeet_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_parakeet_lua_driver COMMAND test_e2e_parakeet_lua_driver)
+set_tests_properties(test_e2e_parakeet_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's CustomAlbert (PL-BERT) topology (tools/convert_kokoro/
 #     convert_kokoro_albert.py) against a hand-rolled pure-PyTorch reference -- the first, isolated

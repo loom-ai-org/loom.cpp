@@ -1919,6 +1919,48 @@ nothing.
   Not urgent and not risky: the gate is that all five families re-export byte-identical, since none of
   them takes the path being removed.
 
+### Parakeet decodes in Lua, and the C++ transducer decoder is gone — DONE (2026-08-07)
+
+P4.0.17 step 2, complete. `parakeet-tdt` and `parakeet-rnnt` now export as one GGUF holding five
+topologies (encoder, embed, two prediction cells, joint) plus a driver that decodes. The TDT double
+loop — encoder-frame pointer × symbols-per-frame — is a checked Lua fragment, and
+`src/core/tdt_decoder.cpp` no longer exists.
+
+**The oracle changed, and that is what makes this more than a port.** The retired path was gated
+against `reference_forward_parakeet_*.py`, a hand-rolled PyTorch reimplementation run on a synthetic
+waveform — and for RNN-T that fixture decodes to an *empty token list*, so the test could not tell a
+working decoder from a broken one. The new gate is NeMo's own `model.transcribe()` on 11 seconds of
+real speech.
+
+**That found a defect in the code being deleted.** On `samples/jfk.wav` the C++ decoder emitted **36**
+tokens; NeMo emits **38**. It was dropping two `7877`s — the commas in *"And so, my fellow
+Americans,"*. The Lua driver reproduces all 38, and RNN-T's 26, exactly. The migration plan in this
+very entry originally said the gate was "36 tokens for TDT" — matching the path being removed would
+have preserved the bug and called it a pass.
+
+  | | tokens | matches NeMo |
+  |---|---|---|
+  | retired C++ decoder | 36 | no — two dropped |
+  | Lua driver | **38** | **yes, id for id** |
+  | Lua driver (RNN-T) | **26** | **yes, id for id** |
+
+The traced phases were confirmed against the independent PyTorch reference first (`[7618, 1815, 7883]`
+on the reference waveform, exactly), which is what isolated the jfk difference to the decoder rather
+than to the new traces.
+
+**Retired:** `tdt_decoder.{h,cpp}`, `convert_parakeet_tdt.py`, `convert_parakeet_rnnt.py`,
+`reference_forward_parakeet_{tdt,rnnt}.py`, the four `{tdt,rnnt}_step` fixture generators, and six
+tests — `test_{tdt,rnnt}_decoder`, `test_e2e_parakeet_{tdt,rnnt}`,
+`test_e2e_parakeet_{tdt,rnnt}_mil_export` — replaced by one `test_e2e_parakeet_lua_driver`. ctest drops
+from 146 to 137 tests while covering strictly more.
+
+**A checker blind spot fell out of this.** `parse_run_subgraph_calls` scanned only for
+`loom.run_subgraph(`, so a fragment using `run_subgraph_and_retain` had that call site *invisible* —
+the coverage report said the `joint` topology was named by nobody. A blind spot in the checker reads
+exactly like a driver that does not call something, which is the failure this parse exists to prevent.
+It has scanned both forms since. P4.0.12 added the retaining form and nothing taught D.2's machinery
+about it.
+
 ### Parakeet's four traced phases — DONE (2026-08-06); the driver is what remains
 
 P4.0.17 step 2, first half. `parakeet_export.ASRParakeetExportConfig` is a `MultiPhase` config that

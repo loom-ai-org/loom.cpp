@@ -57,16 +57,16 @@ Three builders exist:
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 7 | hf-causal-lm, lfm2-monolithic, qwen3 |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
-| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | *nobody* (see below) |
+| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | parakeet-rnnt, parakeet-tdt |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, styletts2, supertonic, vits |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 6 | kokoro, matcha, styletts2, supertonic, vits |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 6 | kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 6 | matcha, supertonic |
 | `driver_return` | `DriverReturn` | statements | 0 | 1 | kokoro, matcha, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
@@ -75,7 +75,7 @@ Three builders exist:
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -83,7 +83,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -100,7 +100,7 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports `infer` alone.
 
-*Emits:* statements. *Used by:* hf-causal-lm, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+*Emits:* statements. *Used by:* hf-causal-lm, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -117,7 +117,7 @@ Greedy CTC decode: per-frame argmax over the retained logits, then collapse cons
 
 Returns the next token rather than the raw logits: argmax over the active row, read out of the producing module's retained output by name, or -- for a topology that marshalled its tensor -- over the returned table, guarded for an output that is not an array.
 
-*Emits:* statements. *Used by:* hf-causal-lm, lfm2-modular, lfm2-monolithic, parakeet-rnnt, parakeet-tdt, qwen3.
+*Emits:* statements. *Used by:* hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3.
 
 * `retained_module` — WhenSet(TopologyName)
 
@@ -125,11 +125,9 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* **no model** — see below.
+*Emits:* statements. *Used by:* parakeet-rnnt, parakeet-tdt.
 
 * nothing — every field is `__unchecked__`, with its reason
-
-> No model uses it today: written for Parakeet's peeled TDT driver, which is the half of P4.0.17 step 2 still in progress. It ships with no user for exactly as long as that does..
 
 ### `raw_lua_driver` — `RawLuaDriver`
 
@@ -149,7 +147,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* kokoro, matcha, styletts2, supertonic, vits.
+*Emits:* prelude, statements. *Used by:* kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -164,7 +162,7 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* kokoro, matcha, styletts2, supertonic, vits.
+*Emits:* statements. *Used by:* kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)

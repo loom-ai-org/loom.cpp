@@ -184,10 +184,6 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "ordinary locals so every read of them is checked by driver_ir.validate -- rather than "
             "interpolated into hand-written Lua through a marker, where a misspelled read is a silent "
             "nil (BACKLOG.md P4.0.18).",
-            no_user_reason=(
-                "written for Parakeet's peeled TDT driver, which is the half of P4.0.17 step 2 still "
-                "in progress. It ships with no user for exactly as long as that does."
-            ),
         ),
         ComponentEntry(
             "raw_lua_driver", RawLuaDriver, (PRELUDE, STATEMENTS, POSTLUDE),
