@@ -20,8 +20,14 @@
 -- combined vits_mil.gguf): "stats", "logw", "flow_vocoder" -- none use a KvCache.
 --
 -- inputs: token_ids (int array, TextEncoder's own vocabulary), seed (int, seeds loom.gaussian_array --
--- SDP's own z_noise AND z_p's own noise, the only two stochastic points in this pipeline), plus the real
--- model constants inter_channels, noise_scale, noise_scale_w, length_scale (VitsConfig's own real
--- defaults).
+-- SDP's own z_noise AND z_p's own noise, the only two stochastic points in this pipeline), and
+-- OPTIONALLY noise_scale / noise_scale_w / length_scale.
+--
+-- Those three used to be required, along with inter_channels. INTER_CHANNELS is a constant below now
+-- (P4.0.8's first follow-up) -- it is the model's own width, so asking a caller for it only invited a
+-- wrong answer. The three scales are constants too, but read as DEFAULTS (`inputs.length_scale or
+-- LENGTH_SCALE`), because unlike everything else here they are genuine per-utterance knobs: they are
+-- piper's own synthesis defaults (`"inference": {"noise_scale": 0.667, "length_scale": 1, "noise_w":
+-- 0.8}`), so the model declares them and the caller may still override. length_scale is speaking rate.
 --
 -- Returns: the raw waveform (flat f32 array), same convention as vits_driver.lua's own return.
