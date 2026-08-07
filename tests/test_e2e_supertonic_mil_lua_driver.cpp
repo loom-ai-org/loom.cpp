@@ -17,7 +17,6 @@
 
 #include "test_util.h"
 #include "npy_fixture.h"
-#include "tts_driver_inputs.h"
 
 #include "loom/loom.h"
 
@@ -51,7 +50,6 @@ std::vector<float> load_style_field(const nlohmann::json& j, const char* field) 
 } // namespace
 
 int main() {
-    namespace cfg = loom_test::tts_inputs::supertonic;
     const char* mil_gguf_env = std::getenv("LOOM_SUPERTONIC_MIL_GGUF");
     const char* style_json_env = std::getenv("LOOM_SUPERTONIC_VOICE_STYLE_JSON");
     if (mil_gguf_env == nullptr || style_json_env == nullptr) {
@@ -77,7 +75,6 @@ int main() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
 
-    LOOM_CHECK(txt_ids.size() == cfg::txt_len_fixed);
 
     // --- Oracle: the retired C++ driver's own output at these exact inputs, frozen (P4.0.8, E.3) ---
     // Keyed by voice style, because the style vectors are an INPUT here and a different one produces a
@@ -111,6 +108,12 @@ int main() {
         const std::string driver_script = model->kv_str("model.driver_script");
         LOOM_CHECK(!driver_script.empty());
 
+        // How many txt_ids this export accepts, read from the file rather than from a C++ constant
+        // (P4.0.8's first follow-up). Every text-touching topology here was traced at a FIXED text
+        // length, so this is not advice -- a caller that sends any other count is calling a model that
+        // cannot run, and until now the only thing that said so was a literal in tts_driver_inputs.h.
+        LOOM_CHECK(txt_ids.size() == model->hparam_u32("txt_len"));
+
         loom::LoomLuaBridge bridge(backend.get());
         bridge.register_module("dp", *model, loom::GraphTopology::parse(model->topology_json("dp")));
         bridge.register_module("ttl_text", *model, loom::GraphTopology::parse(model->topology_json("ttl_text")));
@@ -121,17 +124,16 @@ int main() {
         const std::vector<double> txt_ids_d(txt_ids.begin(), txt_ids.end());
         const std::vector<double> style_ttl_d(style_ttl.begin(), style_ttl.end());
         const std::vector<double> style_dp_d(style_dp.begin(), style_dp.end());
+        // None of t_text/lat_dim/sample_rate/base_chunk_size/compression_factor: the driver carries
+        // them as ExportConstants now (P4.0.8's first follow-up), four of them derived from the real
+        // SpeechDecoder. The frozen reference below was produced with the literals that used to be
+        // here, so it is what checks the export derived the same numbers.
         loom::LoomLuaBridge::Value result = bridge.call("infer", {
             {"txt_ids", txt_ids_d},
             {"style_ttl", style_ttl_d},
             {"style_dp", style_dp_d},
             {"n_steps", static_cast<double>(kNSteps)},
             {"seed", static_cast<double>(kSeed)},
-            {"t_text", 10.0},
-            {"lat_dim", 144.0},
-            {"sample_rate", 44100.0},
-            {"base_chunk_size", 512.0},
-            {"compression_factor", 6.0},
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         mil_wav.assign(wav_d.begin(), wav_d.end());

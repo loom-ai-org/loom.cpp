@@ -67,9 +67,9 @@ Matcha's transformers/huggingface_hub dependencies), so there's no `ModelPatcher
 Usage:
   loom-export /path/to/supertonic/assets/pt -o supertonic_mil.gguf --task text-to-speech --model supertonic
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -81,6 +81,14 @@ from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
 from .spec_protocol import Unchecked
 
 T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fixed exactly
+
+# The output sample rate of the SupertonicTTS v2 release. Unlike every other number this export binds
+# into the driver, this one genuinely is NOT in the checkpoint: the four `.pt` files are pickled
+# `nn.Module`s and none of them carries it -- it lives in `supertonic_tts.lightning`'s own
+# `dec_sample_rate: int = 44100` default, i.e. in the training config, which is not shipped. So it is
+# declared here rather than read, and it is declared HERE rather than restated by every host, which is
+# the whole point of P4.0.8's first follow-up. A release at a different rate needs this line changed.
+DEC_SAMPLE_RATE = 44100.0
 
 
 def _ones_mask_from_ids(txt_ids):
@@ -169,9 +177,31 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
 
     model_dir: str
 
+    # Derived from the real SpeechDecoder in `phases()` and bound into the driver as `ExportConstants`
+    # (P4.0.8's first follow-up). Not constructor arguments: the module states them.
+    lat_dim: Optional[int] = field(default=None, init=False, repr=False)
+    compression_factor: Optional[int] = field(default=None, init=False, repr=False)
+    base_chunk_size: Optional[int] = field(default=None, init=False, repr=False)
+
     __unchecked__ = {
         "model_dir": Unchecked(
             "the assets/pt directory holding all four .pt files. path to the real checkpoint(s). The recognizer's own detect() already established the structure this config depends on -- it probes the checkpoint's pickle opcodes without unpickling (checkpoint_probe) rather than trusting the filename -- and phases() raises on anything it cannot load. A 'this path exists' link would check the weaker property while reading as if it checked the stronger one."
+        ),
+        "lat_dim": Unchecked(
+            "DERIVED in phases() from the restored SpeechDecoder's own `lat_channels * n_codebooks` "
+            "(24 * 6), so there is no second authority to compare it against -- it IS the authority. "
+            "It is checked hard and immediately anyway: the same number shapes the `vfe` and `decoder` "
+            "phases this config traces, so a wrong one fails the trace"
+        ),
+        "compression_factor": Unchecked(
+            "same -- the decoder's own `n_codebooks`, which is exactly the factor its forward "
+            "interleaves codebooks into time by ((B,144,T) -> (B,24,T*6))"
+        ),
+        "base_chunk_size": Unchecked(
+            "same -- the decoder head's own output width (`head_layer2.out_channels`), the samples each "
+            "of those T*6 steps expands to. Nothing else in the tree states it, which is why it is "
+            "read off the module rather than restated: `latent_size = base_chunk_size * "
+            "compression_factor` is what turns a duration in seconds into a latent frame count"
         ),
     }
     # A DIRECTORY of `.lua` fragments -- Supertonic is peeled (P4.0.6/C.5). See `driver_components`.
@@ -190,22 +220,34 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         predicted duration in seconds into a latent frame count, which is arithmetic on scalars the
         engine never sees."""
         from .driver_components import (
-            DriverReturn, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
+            DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
         )
         from .driver_ir import BinOp, FieldAccess, Var
 
         fragment = self.driver_script_path
-        t_text, t_lat, lat_dim = Var("t_text"), Var("t_lat"), Var("lat_dim")
+        t_text, t_lat, lat_dim = Var("T_TEXT"), Var("t_lat"), Var("LAT_DIM")
         txt_ids = FieldAccess("inputs", "txt_ids")
         sampler, = self.samplers()
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
-            LuaFragment(fragment / "01_lengths.lua", defines=("t_text", "lat_dim")),
+            # The five numbers the caller used to have to supply (P4.0.8's first follow-up). Four are
+            # the model's -- the fixed text length every text-touching topology was traced at, and the
+            # three the SpeechDecoder states about itself -- and the fifth is the release's sample
+            # rate, which is genuinely not in the checkpoint (see DEC_SAMPLE_RATE).
+            ExportConstants(values={
+                "T_TEXT": T_TEXT_FIXED,
+                "LAT_DIM": self.lat_dim,
+                "SAMPLE_RATE": DEC_SAMPLE_RATE,
+                "BASE_CHUNK_SIZE": self.base_chunk_size,
+                "COMPRESSION_FACTOR": self.compression_factor,
+            }),
+            LuaFragment(fragment / "01_lengths.lua"),
             SubgraphCallComponent(
                 topology="dp", outputs=("dur_arr",), length=t_text,
                 inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_dp")},
                 note="--- DurationPredictor: DPTextEncoder + MLP head -> scalar duration (seconds) ---"),
-            LuaFragment(fragment / "02_latent_length.lua", reads=("dur_arr",),
+            LuaFragment(fragment / "02_latent_length.lua",
+                        reads=("dur_arr", "SAMPLE_RATE", "BASE_CHUNK_SIZE", "COMPRESSION_FACTOR"),
                         defines=("duration", "wav_length", "latent_size", "t_lat")),
             SubgraphCallComponent(
                 topology="ttl_text", outputs=("txt_emb",), length=t_text,
@@ -234,6 +276,15 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         te = _load_pt(pt_dir, "text_encoder.pt")
         vfe = _load_pt(pt_dir, "vector_estimator.pt")
         dec = _load_pt(pt_dir, "vocoder.pt")
+
+        # The driver's constants, taken off the decoder rather than restated (P4.0.8's first
+        # follow-up). Its forward is the authority on all three: it reshapes (B, lat_channels *
+        # n_codebooks, T) into (B, lat_channels, T * n_codebooks) and its head then expands each of
+        # those steps to `output_dim` samples -- so the latent width, the compression factor and the
+        # chunk size are the module's own attributes, not numbers a host should be asked for.
+        self.lat_dim = int(dec.lat_channels) * int(dec.n_codebooks)
+        self.compression_factor = int(dec.n_codebooks)
+        self.base_chunk_size = int(dec.head_layer2.out_channels)
 
         torch.manual_seed(0)
         dummy_txt_ids = torch.randint(1, 163, (1, T_TEXT_FIXED), dtype=torch.int64)
@@ -284,6 +335,16 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         )
 
         return [dp_phase, ttl_phase, vfe_phase, decoder_phase]
+
+    def hparams(self) -> dict:
+        """The one number a HOST cannot proceed without: how many `txt_ids` this export accepts.
+
+        Every text-touching topology here was traced at a FIXED text length (see the module
+        docstring's two independent reasons), so a caller that sends any other count is calling a model
+        that cannot run -- and until now the only place that said so was a comment in the driver and a
+        literal in a C++ test header. Declaring it in the file is what makes the constraint checkable
+        by whoever is actually building the input."""
+        return {"txt_len": T_TEXT_FIXED}
 
     def samplers(self) -> List[FlowMatchingSpec]:
         # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the
