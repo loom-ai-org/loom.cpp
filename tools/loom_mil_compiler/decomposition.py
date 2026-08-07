@@ -270,8 +270,12 @@ class MultiPhase(Decomposition):
             phase_topologies[phase.name] = topo
             named_weights.append((phase.name, exporter.weights))
 
+        # `backend_kwargs()` reaches the OUTPUT exporter, not just the per-phase ones -- which is where
+        # anything about the artifact as a whole belongs (the tokenizer vocab, notably). It was dropped
+        # entirely before, so a multi-phase family had no way to say anything about its own GGUF.
         out_exporter = LoomGGUFExporter(
             None, output_path=config.output_path, architecture=config.architecture,
+            **config.backend_kwargs(),
         )
         out_exporter.topologies = phase_topologies
         out_exporter.weights = merge_phase_weights(named_weights)

@@ -48,6 +48,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import tempfile
 import types
 from dataclasses import dataclass, field
 from enum import Enum
@@ -334,6 +335,12 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     def backend_kwargs(self) -> dict:
         kwargs = dict(flat_namespace=True, root_axis=self.root_axis,
                       driver_builder=self.synthesized_builder_key())
+        # The checkpoint's own SentencePiece vocab, so the artifact is detokenizable on its own -- the
+        # one capability the bespoke converters had that the MIL export did not.
+        tokenizer_dir = extract_nemo_tokenizer_dir(self.checkpoint)
+        if tokenizer_dir is not None:
+            kwargs["tokenizer_dir"] = tokenizer_dir
+            kwargs["tokenizer_family"] = "sentencepiece_proto"
         # A CTC head's blank is its LAST class -- NeMo's own convention, and the same index
         # `loom_cli`'s C++ path passes to `ctc_greedy_decode` (`num_classes - 1`).
         #
@@ -399,6 +406,37 @@ def export_nemo_asr_encoder(spec: ASRNemoEncoderExportConfig):
     """The whole export, from `.nemo` on disk to `.gguf` on disk. Thin shim over
     `ASRNemoEncoderExportConfig.export()`, kept as a module-level function for existing callers."""
     return spec.export()
+
+
+def extract_nemo_tokenizer_dir(checkpoint: str) -> Optional[str]:
+    """Unpacks the `.nemo` archive's SentencePiece model into a temp dir and returns it, or `None` for a
+    checkpoint that carries no tokenizer.
+
+    **Why a directory for one file.** `LoomGGUFExporter._write_tokenizer` already has a
+    `sentencepiece_proto` family that reads `tokenizer.model` out of a `tokenizer_dir` and calls the same
+    `write_sentencepiece_vocab` the bespoke NeMo converters called. NeMo just keeps that file inside the
+    archive under a content-hashed name (`<hash>_tokenizer.model`), so this is purely the adapter
+    between the two -- no new writer, no second vocab schema.
+
+    Without it a MIL-exported ASR GGUF carries no vocab at all, which is what kept the bespoke
+    converters alive: their artifact could be detokenized and this one could not (BACKLOG.md P4.0.17
+    step 3).
+    """
+    # A config can be built and introspected without a checkpoint on disk -- `component_registry.usage()`
+    # does exactly that for every registered recognizer, and `backend_kwargs()` is on that path. "No
+    # archive here" is therefore a normal answer; "archive present but its tokenizer will not extract"
+    # is not, and still raises.
+    if not Path(checkpoint).is_file():
+        return None
+    with tarfile.open(checkpoint) as archive:
+        names = [n for n in archive.getnames() if n.endswith("_tokenizer.model") or
+                 n.endswith("/tokenizer.model")]
+        if not names:
+            return None
+        out = Path(tempfile.mkdtemp(prefix="loom_nemo_tokenizer_"))
+        member = archive.extractfile(names[0])
+        (out / "tokenizer.model").write_bytes(member.read())
+    return str(out)
 
 
 def _read_nemo_model_config(path: Path) -> dict:

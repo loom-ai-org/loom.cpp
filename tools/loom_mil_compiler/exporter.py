@@ -2367,7 +2367,7 @@ class LoomGGUFExporter:
             # Every entry point that imports loom_mil_compiler (export_hf_causal_lm.py,
             # export_lfm2_*.py) inserts tools/ itself (not its parent) onto sys.path, so convert_nemo/ is
             # importable as a top-level package the same way loom_mil_compiler is -- not "tools.convert_nemo".
-            from convert_nemo.tokenizer_common import write_sentencepiece_vocab
+            from .spm_tokenizer_export import write_sentencepiece_vocab
             proto_path = next(p for p in (Path(tokenizer_dir) / "tokenizer.model",
                                            Path(tokenizer_dir) / "spiece.model") if p.exists())
             write_sentencepiece_vocab(w, proto_path.read_bytes())

@@ -238,7 +238,14 @@ class ASRParakeetExportConfig(BaseMultiPhaseModelExportConfig):
         return self.architecture
 
     def backend_kwargs(self) -> dict:
-        return dict(flat_namespace=True, root_axis=self.root_axis)
+        kwargs = dict(flat_namespace=True, root_axis=self.root_axis)
+        from .nemo_asr_export import extract_nemo_tokenizer_dir
+
+        tokenizer_dir = extract_nemo_tokenizer_dir(self.checkpoint)
+        if tokenizer_dir is not None:
+            kwargs["tokenizer_dir"] = tokenizer_dir
+            kwargs["tokenizer_family"] = "sentencepiece_proto"
+        return kwargs
 
     def driver_components(self) -> List:
         """Parakeet's driver, as components.
