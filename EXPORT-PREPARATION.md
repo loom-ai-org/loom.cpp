@@ -930,3 +930,65 @@ stage C's rule governs, and it is worth stating because the two look the same in
 
 **Gate:** `ctest` 128/128, 0 failed (135 before). Engine size, RelWithDebInfo stripped, same
 configuration both sides: 1,248,832 → 1,240,632 bytes, −8,200 (−0.66 %); `.text` −7,740 (−0.63 %).
+
+### 7.2 The driver-input hyperparameters
+
+`tests/tts_driver_inputs.h` held thirty numbers that the five TTS Lua-driver tests passed into
+`infer` — `n_feats`, `mel_mean`, `style_dim`, `sigma_data`, a fixed text length. Stage E's note called
+them "properties of the model, which a self-contained GGUF should declare and a host should read".
+That is right, and doing it turned up that "declare" means two different things.
+
+**The split, which is the reusable part.** A driver reads no GGUF metadata — `loom` gives it
+topologies and host math, not hparams. So a number the *driver* needs has to be written **into** the
+driver, which is what `ExportConstants` (P4.0.17) already did for Parakeet: an IR local, so every read
+goes through `driver_ir.validate`. A number the *host* needs cannot go there at all, because the host
+must act before the driver runs — it needs a KV. `LoomExportConfig.hparams()` is that half, writing
+`loom.<key>` into the same namespace `make_kv_cache` already reads.
+
+Which half a number belongs in is decided by **who reads it**, and the answer is usually "only the
+driver": of thirty, two are host-facing. Kokoro's `style_dim`, because a caller cannot build `ref_s`
+without knowing how long each half is; Supertonic's `txt_len`, because every text-touching topology
+was traced at a fixed length and any other count is a model that cannot run. StyleTTS2 declares
+nothing, and that is the useful case: it samples its style vector inside the driver, so a `style_dim`
+KV there would be a declaration nobody reads — the same decorative-declaration failure stage D's
+catalogue work already found one level up.
+
+**Four kinds of number, not one.** The follow-up said "read them off the checkpoint". Only some are:
+
+1. *On the module* — Supertonic's latent width, compression factor and chunk size are the
+   `SpeechDecoder`'s own attributes, which is what its `forward` uses them as. Kokoro's and
+   StyleTTS2's three prosody widths are one `prosody_dims()` shared with `build_prosody_phases`, so
+   the trace and the driver cannot disagree.
+2. *In a config file* — Matcha's `n_feats` and the state dict's own `mel_mean`/`mel_std`; StyleTTS2's
+   `sigma_data`.
+3. *Baked into the trace* — the istftnet frame geometry, Supertonic's fixed text length, VITS's
+   `inter_channels`. These cannot be read per-export because the graph was built with them; what can
+   be done is **refuse a checkpoint that disagrees**, which is what `check_istftnet_geometry()` now
+   does and nothing did before.
+4. *Not in the checkpoint at all* — Supertonic's 44100 Hz sits in a training default the release does
+   not ship; piper's three synthesis scales; StyleTTS2's "empirical" Karras parameters. These are
+   declared in the exporter with that written down, which is still better than every host restating
+   them.
+
+**The finding worth carrying forward: some of these are knobs.** VITS's `length_scale` is speaking
+rate. Binding it hard would have declared it correctly and made the driver strictly less capable than
+before — so it and its two siblings became *defaults the caller may override*
+(`inputs.length_scale or LENGTH_SCALE`). StyleTTS2's Karras parameters got the opposite answer on the
+same test: its repo's inference entry point exposes `diffusion_steps` and not those, so making them
+overridable would be inventing an interface rather than preserving one. "Is this a property or a
+choice?" is a question the next family will have to answer too, and the test is what the real model's
+own callers are given.
+
+**And one that constrains the export rather than freeing it.** `sigma_data` is in neither checkpoint
+nor Kokoro's shared `config.json`; it is in StyleTTS2's `config.yml`, which also says
+`estimate_sigma_data: True` — a statistic of the training data. So this family's export now *requires*
+a file it did not before, and raises naming it. Moving a number into the artifact sometimes means
+admitting the export needs a source it was previously papering over with a literal.
+
+**Gates.** Each family: the emitted constants compared value-for-value against the literals the test
+used to supply (the exact claim), plus a re-export run through the family's MIL Lua-driver test with
+nothing passed. Matcha reproduced its frozen waveform to the digit; VITS's defaults-vs-explicit calls
+are bit-identical; Supertonic 2.08e-06. Negative gates broke one thing per family and watched a real
+export or test fail. Kokoro's and StyleTTS2's tests have deliberately loose bounds, so for those two
+the constant comparison *is* the gate and the commits say so rather than implying a numeric one.
+`ctest` 128/128 with all five MIL GGUFs wired in; exporter suite 480/480.
