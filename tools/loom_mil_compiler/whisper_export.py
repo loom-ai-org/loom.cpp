@@ -139,7 +139,8 @@ def causal_mask(seq_len: int) -> torch.Tensor:
     return mask.view(1, 1, seq_len, seq_len)
 
 
-def decoder_prompt_constants(generation_config, n_audio_ctx: int, vocab_size: int) -> dict:
+def decoder_prompt_constants(generation_config, n_audio_ctx: int, vocab_size: int,
+                              n_text_ctx: int) -> dict:
     """The token ids a Whisper decode prompt is built from, read off the checkpoint's own generation
     config -- for the DRIVER to build the prompt with, not for a host to hardcode.
 
@@ -193,6 +194,11 @@ def decoder_prompt_constants(generation_config, n_audio_ctx: int, vocab_size: in
                 f"(one per frame boundary). The bounds come from `no_timestamps_token_id` + 1 and "
                 f"`vocab_size`, so one of those is not what this family assumes."
             )
+    # `<|startofprev|>` and how much of the previous window's text may follow it. Whisper spends at most
+    # HALF its text context on that carried-over context, leaving the other half for what this window is
+    # about to say -- one token of the half goes to `<|startofprev|>` itself. Absent on a checkpoint with
+    # no such token, which the driver reads as "cannot condition".
+    prev_sot = int(getattr(generation_config, "prev_sot_token_id", None) or 0)
     return {
         "SOT": int(generation_config.decoder_start_token_id),
         "LANG_LO": lang_lo,
@@ -202,6 +208,8 @@ def decoder_prompt_constants(generation_config, n_audio_ctx: int, vocab_size: in
         "NO_TIMESTAMPS": no_timestamps,
         "TS_LO": ts_lo,
         "TS_HI": ts_hi,
+        "PREV_SOT": prev_sot,
+        "MAX_PREV": (n_text_ctx // 2 - 1) if prev_sot else 0,
     }
 
 
@@ -318,7 +326,8 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         self.n_audio_ctx = int(cfg.max_source_positions)
         self.d_model = int(cfg.d_model)
         self.max_target_positions = int(cfg.max_target_positions)
-        self.prompt_constants = decoder_prompt_constants(model.generation_config, self.n_audio_ctx, cfg.vocab_size)
+        self.prompt_constants = decoder_prompt_constants(
+            model.generation_config, self.n_audio_ctx, cfg.vocab_size, self.max_target_positions)
 
         mel = WhisperMelFrontend(extractor.n_fft, extractor.hop_length, np.array(extractor.mel_filters))
 
@@ -441,8 +450,9 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             LuaFragment(
                 self.driver_script_path / "01_prompt.lua",
-                reads=("SOT", "LANG_LO", "LANG_HI", "TRANSCRIBE", "NO_TIMESTAMPS", "TS_LO", "TS_HI"),
-                defines=("_prompt", "_language", "_gen0"),
+                reads=("SOT", "LANG_LO", "LANG_HI", "TRANSCRIBE", "NO_TIMESTAMPS", "TS_LO", "TS_HI",
+                       "PREV_SOT", "MAX_PREV"),
+                defines=("_prompt", "_language", "_gen0", "_eos"),
             ),
             PrefillDecodeLoop(
                 topology="decoder",

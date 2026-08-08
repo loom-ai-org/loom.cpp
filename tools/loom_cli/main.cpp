@@ -30,7 +30,8 @@ void print_usage(const char* argv0) {
     std::fprintf(stderr,
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
-                  "[--task transcribe|translate] [--timestamps]\n",
+                  "[--task transcribe|translate] [--timestamps] "
+                  "[--no-condition-on-previous]\n",
                   argv0, argv0);
 }
 
@@ -112,12 +113,16 @@ void split_into_segments(const std::vector<int32_t>& ids, int32_t ts_base, doubl
 // only place that knows whether detection is possible at all.
 std::vector<int32_t> run_driver(loom::LoomLuaBridge& bridge, const std::vector<double>& waveform,
                                  int32_t language, int32_t task, bool timestamps,
+                                 const std::vector<double>& prev_tokens,
                                  uint32_t max_new_tokens, int32_t eos_token) {
     std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
         {"waveform", waveform},
         {"max_new_tokens", static_cast<double>(max_new_tokens)},
         {"eos_token", static_cast<double>(eos_token)},
     };
+    // The previous window's tokens, raw: which of them count as TEXT is the driver's question, since
+    // the ids that do not (timestamps, <|notimestamps|>, eos) are the ones it has constants for.
+    if (!prev_tokens.empty()) args["prev_tokens"] = prev_tokens;
     // Each optional argument is OMITTED rather than defaulted when the caller did not name it, which is
     // what lets the driver apply its own resolution order -- detect, or fall back to what this
     // checkpoint can actually do.
@@ -138,7 +143,8 @@ std::vector<int32_t> run_driver(loom::LoomLuaBridge& bridge, const std::vector<d
 }
 
 void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& wav_path,
-             const std::string& language_name, const std::string& task_name, bool timestamps) {
+             const std::string& language_name, const std::string& task_name, bool timestamps,
+             bool condition_on_previous) {
     // Model-agnostic: register whatever topologies the file declares, call the driver it ships, and
     // detokenize with the vocab it embeds. Conformer-CTC, Parakeet-TDT and Parakeet-RNN-T all work
     // through this one path -- the driver is the thing that differs between them, and it travels with
@@ -280,6 +286,13 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
                      n_clips, static_cast<double>(clip) / (sample_rate ? sample_rate : 16000));
     }
 
+    // Everything generated so far, carried into the next window as context (`<|startofprev|>`). The
+    // driver takes the tail it has room for and filters it down to text; this just has to not grow
+    // without bound, so it is capped at the text context the file declares -- comfortably more than the
+    // half of it the driver will use.
+    const size_t prev_cap = model.has_kv("loom.n_text_ctx") ? model.hparam_u32("n_text_ctx") : 448;
+    std::vector<double> prev_tokens;
+
     std::vector<Segment> segments;
     size_t seek = 0;
     while (seek < waveform.size()) {
@@ -288,7 +301,8 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
         for (size_t i = 0; i < avail; ++i) window[i] = waveform[seek + i];
 
         const std::vector<int32_t> ids =
-            run_driver(bridge, window, language, task, want_timestamps, kMaxNewTokensPerClip, eos_id);
+            run_driver(bridge, window, language, task, want_timestamps, prev_tokens,
+                       kMaxNewTokensPerClip, eos_id);
         const double window_start = static_cast<double>(seek) / (sample_rate ? sample_rate : 16000);
 
         // How far into THIS window the model actually got. `last_complete_end` is the end of the last
@@ -338,6 +352,16 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
                          window_start, ids.size(), segments.size() - before,
                          static_cast<double>(advance) / rate);
         }
+        // Carry this window's output forward. Off (`--no-condition-on-previous`) it stays empty, which
+        // is how the driver is told not to condition -- the same "omit the argument" convention the
+        // optional inputs use everywhere else here.
+        if (condition_on_previous) {
+            for (int32_t id : ids) prev_tokens.push_back(static_cast<double>(id));
+            if (prev_tokens.size() > prev_cap) {
+                prev_tokens.erase(prev_tokens.begin(),
+                                   prev_tokens.end() - static_cast<std::ptrdiff_t>(prev_cap));
+            }
+        }
         seek += advance;
     }
 
@@ -362,6 +386,7 @@ int main(int argc, char** argv) {
     std::string language_name;
     std::string task_name;
     bool timestamps = false;
+    bool condition_on_previous = true;
     bool has_prompt = false;
     bool has_wav = false;
     uint32_t n_predict = 16;
@@ -384,6 +409,12 @@ int main(int argc, char** argv) {
             task_name = argv[++i];
         } else if (arg == "--timestamps") {
             timestamps = true;
+        } else if (arg == "--no-condition-on-previous") {
+            // On by default, as in Whisper's own CLI, and switchable for the same reason it is there:
+            // carried context is what makes a sentence survive a window boundary, and it is also what
+            // lets a repetition loop persist across one. With greedy decoding and no temperature
+            // fallback to break out of such a loop, an off switch is the only recovery.
+            condition_on_previous = false;
         } else if (arg == "--n-predict" && i + 1 < argc) {
             n_predict = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "-h" || arg == "--help") {
@@ -549,7 +580,8 @@ int main(int argc, char** argv) {
         }
 
         if (has_wav) {
-            run_asr(*model, backend.get(), wav_path, language_name, task_name, timestamps);
+            run_asr(*model, backend.get(), wav_path, language_name, task_name, timestamps,
+                    condition_on_previous);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
