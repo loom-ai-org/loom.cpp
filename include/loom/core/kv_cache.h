@@ -79,9 +79,9 @@ class GgufModel;
 
 // Builds a KvCache sized entirely from `model`'s own declared hparams, so a host never has to carry a
 // per-model C++ struct just to allocate one (KV-CACHE.md stage 1). Before this, the only two callers
-// that needed a cache -- WhisperDriver and test_e2e_whisper_lua_driver.cpp -- both sized it from a
+// that needed a cache -- the since-retired WhisperDriver and its Lua test -- both sized it from a
 // hardcoded `WhisperConfig`, which is what made "the GGUF is self-contained" false for the one model
-// on this roadmap that has a KV cache at all.
+// on this roadmap that had a KV cache at all.
 //
 // Reads the five geometry facts from the "loom.*" hparam namespace the converters already write:
 //
@@ -91,8 +91,9 @@ class GgufModel;
 //   loom.n_embd_head_v   per-head V width, same
 //   loom.kv_cache_size   capacity in tokens
 //
-// The first four already existed (convert_whisper_all.py has written them since the Lua port, with a
-// comment saying they are for "KvCache sizing") and were simply never read; only the capacity is new.
+// The first four already existed (the bespoke Whisper converter wrote them from the Lua port onwards,
+// with a comment saying they are for "KvCache sizing") and were simply never read; only the capacity
+// was new. Both are now written by the exporter itself, off the fused ATTENTION nodes.
 // Deliberately NOT a second `loom.kv_cache.*` namespace duplicating them: two spellings of n_layer that
 // can disagree is exactly the failure this project keeps removing elsewhere.
 //

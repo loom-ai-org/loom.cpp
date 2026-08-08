@@ -1,7 +1,8 @@
 """Constant (checkpoint-independent) tensors for Kokoro's Generator STFT/ISTFT (istftnet.py's
 TorchSTFT, real config: gen_istft_n_fft=20, gen_istft_hop_size=5, window='hann' with torch.hann_window's
 own default `periodic=True` -- SAME window convention as Whisper's mel frontend
-(tools/convert_whisper/whisper_common.py), deliberately duplicated here rather than cross-imported
+(the bespoke Whisper converter's whisper_common.py, retired in P4.1), deliberately duplicated
+here rather than cross-imported
 (this project's usual per-fixture convention) since the two frontends serve genuinely different models.
 
 Two things Whisper's own STFT never needed, both real, both verified numerically against real

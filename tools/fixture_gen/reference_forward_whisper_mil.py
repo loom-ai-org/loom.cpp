@@ -11,6 +11,9 @@ decoder over a deterministic synthetic waveform, and writes the three arrays the
                                                  localized to a half instead of only reported
     ref_mil_language.npy    ()           i32  -- the detected language token id, or -1 on an
                                                  English-only checkpoint that has none
+    ref_mil_decoder.npy     (n_prompt, V) f32 -- HF's decoder logits for the prompt, teacher-forced in
+                                                 one pass, so the decoder half can be checked in
+                                                 isolation from the loop that drives it
 
 **Why a synthetic waveform rather than real speech.** The check is that two implementations of the same
 arithmetic agree, and agreement on noise is a strictly harder test than agreement on speech: a real clip
@@ -109,6 +112,14 @@ def main():
         language = detect_language(model, encoder_out, model.generation_config)
         prompt = decoder_prompt(model.generation_config, language)
 
+        # The prompt's own logits, every row, from ONE teacher-forced pass at n_past=0 -- the whole
+        # causal triangle in a single call. This is what lets the decoder be checked on its own
+        # numbers rather than only through the tokens the loop happens to pick, which is the property
+        # the retired `test_e2e_whisper_decoder_reference` had and the driver comparison does not.
+        decoder_logits = model(
+            decoder_input_ids=torch.tensor([prompt], dtype=torch.long), encoder_outputs=(encoder_out,),
+        ).logits[0]
+
         tokens = torch.tensor([prompt], dtype=torch.long)
         generated = []
         for _ in range(n_new):
@@ -127,6 +138,7 @@ def main():
     np.save(out_dir / "ref_mil_encoder.npy", encoder_out[0].numpy().astype(np.float32))
     np.save(out_dir / "ref_mil_language.npy",
             np.array([-1 if language is None else language], dtype=np.int32))
+    np.save(out_dir / "ref_mil_decoder.npy", decoder_logits.numpy().astype(np.float32))
     print(f"wrote {out_dir}: waveform {waveform.shape}, language {language}, prompt {prompt}, "
           f"generated {generated}, encoder {tuple(encoder_out.shape)}")
 

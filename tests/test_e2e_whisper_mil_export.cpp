@@ -1,14 +1,24 @@
 // Validates the MIL-compiler-exported Whisper GGUF (tools/loom_mil_compiler/whisper_export.py,
 // BACKLOG.md P4.1) against HF's own `WhisperForConditionalGeneration` -- the library, not this repo's
-// bespoke converter. Two checks, in the order that localizes a failure:
+// bespoke converter.
 //
-//   1. the `encoder` topology's hidden states, against the same tensor HF's encoder produced. This half
-//      contains the mel frontend, which the exported graph computes from a raw waveform and HF computes
-//      in `WhisperFeatureExtractor` -- so it is the half where an inaccuracy would be arithmetic rather
-//      than orchestration.
-//   2. the whole embedded Lua driver -- encoder once, then the KV-cached cross-attention decode loop --
-//      against HF's greedy token sequence. Integer equality, no tolerance: both are deterministic
-//      argmax, which is the same gate `test_e2e_whisper_lua_driver` uses against the C++ driver.
+// **This is the whole Whisper gate.** It replaced four tests built on the bespoke converter
+// (`test_e2e_whisper_{encoder,decoder}_reference`, `test_e2e_whisper_driver`,
+// `test_e2e_whisper_lua_driver`), which went with `tools/convert_whisper/` and
+// `src/core/whisper_driver.cpp` under R6. Their coverage is carried here deliberately, check for check,
+// which is why the halves are tested separately rather than only end to end -- and against a stronger
+// oracle: those tests compared this engine's two implementations with each other, while every check
+// below compares it with HuggingFace.
+//
+//   1.  the `encoder` topology's hidden states, against the same tensor HF's encoder produced. This half
+//       contains the mel frontend, which the exported graph computes from a raw waveform and HF computes
+//       in `WhisperFeatureExtractor` -- so it is the half where an inaccuracy would be arithmetic rather
+//       than orchestration.
+//   1b. the `decoder` topology teacher-forced over the whole prompt in one pass, logits and per-row
+//       argmax -- what `test_e2e_whisper_decoder_reference` checked.
+//   2.  the whole embedded Lua driver -- encoder once, the prompt it builds for itself, then the
+//       KV-cached cross-attention decode loop -- against HF's greedy token sequence, with the language
+//       both pinned and auto-detected. Integer equality, no tolerance: both are deterministic argmax.
 //
 // **Nothing here names a per-model C++ struct**, unlike its bespoke sibling: which topology needs a
 // cache is `GraphTopology::uses_kv_cache()`'s answer, how big to make it is `make_kv_cache(*model)`'s,
@@ -104,6 +114,8 @@ int main() {
     const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_mil_generated.npy", gen_shape);
     const std::vector<float> expected_encoder = read_npy<float>(ref_dir + "/ref_mil_encoder.npy", enc_shape);
     const std::vector<int32_t> language_ref = read_npy<int32_t>(ref_dir + "/ref_mil_language.npy", lang_shape);
+    std::vector<int64_t> dec_shape;
+    const std::vector<float> expected_decoder = read_npy<float>(ref_dir + "/ref_mil_decoder.npy", dec_shape);
 
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
@@ -156,6 +168,66 @@ int main() {
         // that localizes a real divergence to this half. The whole-driver check below is exact.
         LOOM_CHECK(max_abs_diff < 1e-3f * ref_absmax);
         LOOM_CHECK(mean_abs_diff < 1e-3);
+    }
+
+    // --- 1b. the decoder half, teacher-forced on the prompt in one pass ---
+    //
+    // Inherited from the retired `test_e2e_whisper_decoder_reference` (BACKLOG.md P4.1): n_past=0 with
+    // n_tokens=T covers the whole causal triangle in a single call, so the decoder's own numbers are
+    // checked rather than only the tokens the loop picks from them. Run through a hand-written script
+    // rather than a bare GraphBuilder so the mask and positions come from `loom.causal_mask`/`loom.range`
+    // -- the same host math a driver uses, instead of a second implementation living in a test.
+    {
+        loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
+        std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
+        loom::LoomLuaBridge bridge(backend.get());
+        bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
+        bridge.load_script(R"lua(
+            function decoder_logits(inputs)
+                loom.run_subgraph_and_retain('encoder', {n_samples = inputs.n_samples, n_past = 0},
+                                              {waveform = inputs.waveform})
+                local n = #inputs.tokens
+                return loom.run_subgraph('decoder', {n_tokens = n, n_past = 0}, {
+                    tokens = inputs.tokens, position_ids = loom.range(0, n),
+                    attention_mask = loom.causal_mask(n, 0), xa = {from = 'encoder'},
+                })
+            end
+        )lua");
+
+        const std::vector<double> waveform_d(waveform.begin(), waveform.end());
+        const std::vector<double> prompt_d(prompt.begin(), prompt.end());
+        const loom::LoomLuaBridge::Value value = bridge.call("decoder_logits", {
+            {"waveform", waveform_d}, {"tokens", prompt_d},
+            {"n_samples", static_cast<double>(n_samples)},
+        });
+        const auto& logits = std::get<std::vector<double>>(value);
+        LOOM_CHECK(logits.size() == expected_decoder.size());
+
+        const size_t n_tokens = prompt.size();
+        const size_t n_vocab = logits.size() / n_tokens;
+        double max_abs_diff = 0.0, sum_abs_diff = 0.0;
+        for (size_t i = 0; i < logits.size(); ++i) {
+            const double d = std::fabs(logits[i] - static_cast<double>(expected_decoder[i]));
+            max_abs_diff = std::max(max_abs_diff, d);
+            sum_abs_diff += d;
+        }
+        std::fprintf(stderr, "decoder vs HF: n_tokens=%zu n_vocab=%zu mean_abs_diff=%g max_abs_diff=%g\n",
+                     n_tokens, n_vocab, sum_abs_diff / static_cast<double>(logits.size()), max_abs_diff);
+        LOOM_CHECK(sum_abs_diff / static_cast<double>(logits.size()) < 1e-2);
+        LOOM_CHECK(max_abs_diff < 5.0);
+
+        // And the per-row argmax, which is what the loop actually consumes: a logits tensor can be
+        // within tolerance everywhere and still pick a different token at a near-tie.
+        for (size_t t = 0; t < n_tokens; ++t) {
+            size_t best = 0, ref_best = 0;
+            for (size_t v = 1; v < n_vocab; ++v) {
+                if (logits[t * n_vocab + v] > logits[t * n_vocab + best]) best = v;
+                if (expected_decoder[t * n_vocab + v] > expected_decoder[t * n_vocab + ref_best]) ref_best = v;
+            }
+            LOOM_CHECK(best == ref_best);
+        }
     }
 
     // --- 2. the whole driver, both ways round the language: pinned, and auto-detected ---

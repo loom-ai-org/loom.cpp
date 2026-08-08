@@ -648,30 +648,8 @@ target_link_libraries(test_e2e_vits_logw_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_logw_reference COMMAND test_e2e_vits_logw_reference)
 set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- Numerical-correctness check: Whisper's AudioEncoder topology (tools/convert_whisper/
-#     convert_whisper_encoder.py) against a real forward pass of OpenAI Whisper's own AudioEncoder --
-#     fully deterministic (no sampling anywhere in the encoder), unlike VITS's noise-injection tests. ---
-add_executable(test_e2e_whisper_encoder_reference test_e2e_whisper_encoder_reference.cpp)
-target_link_libraries(test_e2e_whisper_encoder_reference PRIVATE loom::engine)
-add_test(NAME test_e2e_whisper_encoder_reference COMMAND test_e2e_whisper_encoder_reference)
-set_tests_properties(test_e2e_whisper_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- Numerical-correctness check: Whisper's TextDecoder topology (tools/convert_whisper/
-#     convert_whisper_decoder.py) against a real ONE-SHOT teacher-forced forward pass (kv_cache=None,
-#     n_past=0/n_tokens=T covers the whole causal triangle) -- exercises causal self-attention w/
-#     persistent KvCache, cross-attention against a fixed `xa`, and the tied output projection. ---
-add_executable(test_e2e_whisper_decoder_reference test_e2e_whisper_decoder_reference.cpp)
-target_link_libraries(test_e2e_whisper_decoder_reference PRIVATE loom::engine)
-add_test(NAME test_e2e_whisper_decoder_reference COMMAND test_e2e_whisper_decoder_reference)
-set_tests_properties(test_e2e_whisper_decoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- End-to-end check: loom::WhisperDriver's full two-phase decode loop (encoder once, then
-#     prefill+incremental decode with a persistent KvCache and a fixed cross-attention `xa`) against a
-#     real plain-greedy-argmax reference sequence built directly from Whisper's own forward passes. ---
-add_executable(test_e2e_whisper_driver test_e2e_whisper_driver.cpp)
-target_link_libraries(test_e2e_whisper_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_whisper_driver COMMAND test_e2e_whisper_driver)
-set_tests_properties(test_e2e_whisper_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- loom::karras_schedule/adpm2_sample had two tests here -- the discretization math against a numpy
 #     reference with a toy denoiser, and the full loop around the real Transformer1d network. Both went
@@ -837,14 +815,6 @@ add_executable(test_lua_bridge test_lua_bridge.cpp)
 target_link_libraries(test_lua_bridge PRIVATE loom::engine)
 add_test(NAME test_lua_bridge COMMAND test_lua_bridge)
 
-# --- Procedural generalization validation: runs the real Whisper checkpoint's transcribe() through BOTH
-#     the existing hand-written loom::WhisperDriver AND a LoomLuaBridge running the hand-ported
-#     tools/convert_whisper/whisper_driver.lua, asserting an EXACT generated-token-sequence match. See
-#     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
-add_executable(test_e2e_whisper_lua_driver test_e2e_whisper_lua_driver.cpp)
-target_link_libraries(test_e2e_whisper_lua_driver PRIVATE loom::engine)
-add_test(NAME test_e2e_whisper_lua_driver COMMAND test_e2e_whisper_lua_driver)
-set_tests_properties(test_e2e_whisper_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: SupertonicTTS's deterministic Euler-ODE (CFM) sampling loop, ported to
 #     Lua (tools/convert_supertonic/supertonic_driver.lua) and compared against the existing

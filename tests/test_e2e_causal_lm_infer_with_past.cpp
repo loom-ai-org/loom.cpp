@@ -142,7 +142,7 @@ int main() {
     }
 
     // --- eos_token stops the loop, and stops it AFTER emitting the token that matched (the same
-    //     convention whisper_driver.lua uses for eot_token, where a negative value disables it) ---
+    //     convention Whisper's own driver uses for its eot token, where a negative value disables it) ---
     {
         loom::LoomLuaBridge::Value result = bridge.call("infer_with_past", {
             {"tokens", kPrompt},

@@ -23,7 +23,6 @@ add_library(loom_engine
     src/core/kv_cache.cpp
     src/core/output_store.cpp
     src/core/generation.cpp
-    src/core/whisper_driver.cpp
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp
     src/core/relative_position.cpp
