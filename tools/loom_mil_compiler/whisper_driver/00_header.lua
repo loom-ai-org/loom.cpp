@@ -5,8 +5,12 @@
 -- called at n_tokens = #prompt for the prefill and at n_tokens = 1 for every token after it.
 --
 -- inputs: waveform (flat f32 array of exactly `loom.n_samples` samples, host-padded/trimmed to 30 s),
--- tokens (the prompt: the forced-decoder-ids prefix), max_new_tokens, eos_token (negative disables the
--- early stop). Returns the generated token ids, not including the prompt.
+-- and four optional ones -- language (a language token id; omitted means DETECT it, or none at all on an
+-- English-only checkpoint), task (a task token id; omitted means transcribe), timestamps (truthy to let
+-- the model emit <|0.00|>-style tokens), max_new_tokens, eos_token (negative disables the early stop).
+--
+-- The prompt is built here, not passed in: which tokens it needs is a property of the checkpoint. See
+-- 01_prompt.lua. Returns the generated token ids, not including the prompt.
 --
 -- src/core/whisper_driver.cpp's transcribe() is exactly the loop below, in C++. Retiring it is R6 work
 -- and is not done: its tests are fixtured on an OpenAI-format whisper-tiny, which this family does not

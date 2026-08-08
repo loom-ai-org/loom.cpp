@@ -227,6 +227,12 @@ private:
     // operation in two spellings, the second reading a retained output by module name instead of a
     // marshalled array. See the definition for why this is an overload rather than a new binding.
     static int l_argmax_row(lua_State* L);
+    // `loom.argmax_row_range(module, row, lo, hi [, generation])` -> the best id in the half-open window
+    // `[lo, hi)`, absolute. `l_argmax_row`'s module form restricted to a sub-range of the same
+    // vocabulary, for a classification whose classes are a contiguous block inside it -- Whisper's
+    // language detection, whose 98 language tokens sit inside the transcript vocabulary, so an
+    // unrestricted argmax would answer with a word (BACKLOG.md P4.1 follow-up).
+    static int l_argmax_row_range(lua_State* L);
     static int l_seed_rng(lua_State* L);
     static int l_gaussian_array(lua_State* L);
     static int l_uniform_array(lua_State* L);

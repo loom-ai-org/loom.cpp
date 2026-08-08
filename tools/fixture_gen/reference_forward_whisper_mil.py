@@ -5,10 +5,12 @@ Runs HF's own `WhisperForConditionalGeneration` -- the library, not this repo's 
 decoder over a deterministic synthetic waveform, and writes the three arrays the C++ test needs:
 
     ref_mil_waveform.npy    (n_samples,) f32  -- exactly 30 s at the checkpoint's own sample rate
-    ref_mil_prompt.npy      (n_prompt,)  i32  -- the forced decoder prefix HF itself would start from
+    ref_mil_prompt.npy      (n_prompt,)  i32  -- the decoder prefix, with the language HF DETECTED
     ref_mil_generated.npy   (n_new,)     i32  -- the token ids HF greedily generates after it
     ref_mil_encoder.npy     (n_ctx, d)   f32  -- the encoder's own hidden states, so a failure can be
                                                  localized to a half instead of only reported
+    ref_mil_language.npy    ()           i32  -- the detected language token id, or -1 on an
+                                                 English-only checkpoint that has none
 
 **Why a synthetic waveform rather than real speech.** The check is that two implementations of the same
 arithmetic agree, and agreement on noise is a strictly harder test than agreement on speech: a real clip
@@ -41,23 +43,43 @@ SEED = 0
 AMPLITUDE = 0.05
 
 
-def decoder_prompt(generation_config):
-    """The token prefix a decode starts from, read off the checkpoint's own generation config.
+def detect_language(model, encoder_out, generation_config):
+    """The language token id HF's own arithmetic picks for this audio, or None if the checkpoint has no
+    language tokens (`whisper-*.en`).
+
+    Written out rather than calling `model.detect_language`, and deliberately: it must be the *same*
+    computation the exported driver performs -- one decoder step from `<|startoftranscript|>` alone, then
+    an argmax over the language block ONLY. If the oracle used a different route (a helper that, say,
+    also applied `forced_decoder_ids`) the comparison would stop being about this engine's arithmetic.
+    """
+    lang_to_id = getattr(generation_config, "lang_to_id", None) or {}
+    if not lang_to_id:
+        return None
+    lang_ids = sorted(int(v) for v in lang_to_id.values())
+    sot = torch.tensor([[int(generation_config.decoder_start_token_id)]], dtype=torch.long)
+    logits = model(decoder_input_ids=sot, encoder_outputs=(encoder_out,)).logits[0, -1]
+    # Restricted to the language block: unrestricted, the argmax is whichever ordinary word scores
+    # highest, which is what the driver's `argmax_row_range` exists to avoid.
+    best = max(lang_ids, key=lambda i: float(logits[i]))
+    return int(best)
+
+
+def decoder_prompt(generation_config, language):
+    """The token prefix a decode starts from: start-of-transcript, the detected language and the
+    transcribe task when this checkpoint has them, then no-timestamps.
 
     Not `forced_decoder_ids`, and that is a real trap rather than a stylistic choice: a multilingual
     checkpoint leaves the language slot `None` there (`[[1, None], [2, 50359]]` for whisper-small),
-    because HF fills it in from language *detection* at generation time. Copying that list verbatim
-    yields a prompt with a `None` in it. English is pinned explicitly instead, so the fixture is a
-    property of this script rather than of a detection pass -- and an English-only checkpoint, which has
-    no language or task tokens at all, correctly gets the short prefix.
+    because HF fills it in from language *detection* at generation time -- which is why `language` is a
+    parameter here. An English-only checkpoint has no language or task tokens at all and correctly gets
+    the short prefix.
     """
     prompt = [generation_config.decoder_start_token_id]
-    lang_to_id = getattr(generation_config, "lang_to_id", None) or {}
     task_to_id = getattr(generation_config, "task_to_id", None) or {}
-    if "<|en|>" in lang_to_id:
-        prompt.append(lang_to_id["<|en|>"])
-    if "transcribe" in task_to_id:
-        prompt.append(task_to_id["transcribe"])
+    if language is not None:
+        prompt.append(language)
+        if "transcribe" in task_to_id:
+            prompt.append(task_to_id["transcribe"])
     no_timestamps = getattr(generation_config, "no_timestamps_token_id", None)
     if no_timestamps is not None:
         prompt.append(no_timestamps)
@@ -84,7 +106,8 @@ def main():
     with torch.no_grad():
         encoder_out = model.model.encoder(features).last_hidden_state
 
-        prompt = decoder_prompt(model.generation_config)
+        language = detect_language(model, encoder_out, model.generation_config)
+        prompt = decoder_prompt(model.generation_config, language)
 
         tokens = torch.tensor([prompt], dtype=torch.long)
         generated = []
@@ -102,8 +125,10 @@ def main():
     np.save(out_dir / "ref_mil_prompt.npy", np.array(prompt, dtype=np.int32))
     np.save(out_dir / "ref_mil_generated.npy", np.array(generated, dtype=np.int32))
     np.save(out_dir / "ref_mil_encoder.npy", encoder_out[0].numpy().astype(np.float32))
-    print(f"wrote {out_dir}: waveform {waveform.shape}, prompt {prompt}, generated {generated}, "
-          f"encoder {tuple(encoder_out.shape)}")
+    np.save(out_dir / "ref_mil_language.npy",
+            np.array([-1 if language is None else language], dtype=np.int32))
+    print(f"wrote {out_dir}: waveform {waveform.shape}, language {language}, prompt {prompt}, "
+          f"generated {generated}, encoder {tuple(encoder_out.shape)}")
 
 
 if __name__ == "__main__":

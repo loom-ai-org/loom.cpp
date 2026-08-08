@@ -221,7 +221,19 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
 // the copy: nothing crosses the boundary but the answer, which keeps the Lua boundary a *per-step*
 // boundary rather than a per-logit one -- the same reasoning KV-CACHE.md §1.1 gives for not driving
 // attention from Lua.
-int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname) {
+// `lo`/`hi` restrict the reduction to the half-open id window `[lo, hi)`, and `hi < 0` means "to the end
+// of the row" -- i.e. the whole row, which is every caller but one. The returned id is ABSOLUTE, not
+// relative to `lo`: a restricted argmax exists to answer "which of THESE classes", and a caller that had
+// to add `lo` back would be one addition away from a wrong token id.
+//
+// The window is what a classification over a *subset* of a shared vocabulary needs. Whisper's language
+// detection is the case that asked for it (BACKLOG.md P4.1 follow-up): its 98 language tokens occupy one
+// contiguous id block inside the same 51865-wide vocabulary the transcript is decoded from, so detecting
+// a language is one decode step whose argmax must ignore every ordinary text token -- otherwise the
+// answer is whatever word the model would have emitted. Only the window is copied off the backend, so
+// asking about 99 ids does not read 51865 floats.
+int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname,
+                           int64_t lo = 0, int64_t hi = -1) {
     if (out->type != GGML_TYPE_F32) {
         throw Error(std::string(fname) + ": output must be f32");
     }
@@ -232,14 +244,22 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
         throw Error(std::string(fname) + ": row " + std::to_string(requested_row) + " out of range for an "
                      "output with " + std::to_string(n_rows) + " row(s) of width " + std::to_string(n_vocab));
     }
-    std::vector<float> logits(static_cast<size_t>(n_vocab));
-    ggml_backend_tensor_get(out, logits.data(), static_cast<size_t>(row) * out->nb[1],
+    if (hi < 0) hi = n_vocab;
+    if (lo < 0 || lo >= hi || hi > n_vocab) {
+        throw Error(std::string(fname) + ": id window [" + std::to_string(lo) + ", " + std::to_string(hi) +
+                     ") is not a non-empty sub-range of this output's " + std::to_string(n_vocab) +
+                     " class(es)");
+    }
+    const int64_t width = hi - lo;
+    std::vector<float> logits(static_cast<size_t>(width));
+    ggml_backend_tensor_get(out, logits.data(),
+                             static_cast<size_t>(row) * out->nb[1] + static_cast<size_t>(lo) * sizeof(float),
                              logits.size() * sizeof(float));
     int64_t best = 0;
-    for (int64_t i = 1; i < n_vocab; ++i) {
+    for (int64_t i = 1; i < width; ++i) {
         if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(best)]) best = i;
     }
-    return best;
+    return lo + best;
 }
 
 // The same reduction over EVERY row: one id per row, in row order. `argmax_tensor_row`'s plural.
@@ -673,6 +693,39 @@ int LoomLuaBridge::l_argmax_row(lua_State* L) {
     }
 }
 
+// `loom.argmax_row_range(module, row, lo, hi [, generation])` -> the highest-scoring id in the half-open
+// window `[lo, hi)` of `module`'s retained first output, as an ABSOLUTE id.
+//
+// The same reduction as `argmax_row` -- literally the same function, with a window -- so the two cannot
+// disagree about how a maximum is found. A separate BINDING rather than an overload, which is the
+// opposite of the choice `argmax_row` itself documents, for a mechanical reason: its module form already
+// takes an optional trailing `generation`, so `(module, row, lo, hi)` and `(module, row, generation)`
+// cannot be told apart by arity or type. A name is clearer than a rule about which trailing numbers mean
+// what.
+//
+// Module-form only. The array form of `argmax_row` exists because a flat Lua array has lost its shape,
+// and a driver already holding the row in Lua can slice it itself -- while the whole point here is not to
+// marshal it.
+int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string module_name = luaL_checkstring(L, 1);
+        const auto requested_row = static_cast<int64_t>(luaL_checknumber(L, 2));
+        const auto lo = static_cast<int64_t>(luaL_checknumber(L, 3));
+        const auto hi = static_cast<int64_t>(luaL_checknumber(L, 4));
+        OutputStore& store = retained_store(self, module_name);
+        if (!lua_isnoneornil(L, 5)) {
+            store.check_generation(static_cast<uint64_t>(std::llround(luaL_checknumber(L, 5))),
+                                    module_name);
+        }
+        lua_pushnumber(L, static_cast<lua_Number>(argmax_tensor_row(
+            store.get(0), requested_row, "loom.argmax_row_range", lo, hi)));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.argmax_row_range: %s", e.what());
+    }
+}
+
 // `loom.argmax_rows(module [, generation])` -> a flat array of one class id per ROW of `module`'s
 // retained first output, in row order. `loom.argmax_row`'s plural, and module-form only: the array form
 // of the singular exists because a flat Lua array has lost its shape, and a caller who already holds
@@ -865,6 +918,7 @@ LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), back
         {"get_output", &LoomLuaBridge::l_get_output},
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},
+        {"argmax_row_range", &LoomLuaBridge::l_argmax_row_range},
         {"argmax_rows", &LoomLuaBridge::l_argmax_rows},   {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},

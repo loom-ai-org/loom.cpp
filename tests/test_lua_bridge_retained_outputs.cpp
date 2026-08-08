@@ -112,6 +112,30 @@ const char* kScript = R"lua(
         return loom.argmax_row('stage_b', -1, gen)
     end
 
+    -- A restricted argmax, against a Lua-side slice of the same marshalled row as its oracle. The
+    -- window matters here rather than being decoration: the fixture's unrestricted argmax lands
+    -- outside [lo, hi), so a binding that ignored the window would return that instead.
+    function argmax_range_marshalled(inputs)
+        local n = #inputs.tokens
+        local cur = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local logits, shape = loom.run_subgraph('stage_b', {n_tokens = n, n_past = 0}, {hidden = cur})
+        local n_vocab = shape[1]
+        local base = (n - 1) * n_vocab
+        local best = inputs.lo
+        for id = inputs.lo, inputs.hi - 1 do
+            if logits[base + id + 1] > logits[base + best + 1] then best = id end
+        end
+        return best
+    end
+
+    function argmax_range_retained(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local gen = loom.run_subgraph_and_retain('stage_b', {n_tokens = n, n_past = 0},
+                                                  {hidden = {from = 'stage_a'}})
+        return loom.argmax_row_range('stage_b', -1, inputs.lo, inputs.hi, gen)
+    end
+
     -- Runs the SAME module at two different lengths, so the store has to reshape between them, then
     -- reads back the short one. `[n_embd, n_tokens]` changing under a persistent buffer is the case
     -- "whatever the last build produced" would get wrong.
@@ -135,6 +159,8 @@ const char* kScript = R"lua(
         'out of range',
         'must agree exactly',
         "unregistered module 'nope'",
+        'is not a non-empty sub-range',
+        'is not a non-empty sub-range',
     }
 
     function expect_error(inputs)
@@ -156,9 +182,22 @@ const char* kScript = R"lua(
                 -- A shape mismatch across an inter-module edge: A retained at 3 tokens, B built for 1.
                 loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
                 loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0}, {hidden = {from = 'stage_a'}})
-            else
+            elseif inputs.case == 5 then
                 -- A reference to a module that isn't registered at all.
                 loom.run_subgraph('stage_b', {n_tokens = 3, n_past = 0}, {hidden = {from = 'nope'}})
+            elseif inputs.case == 6 then
+                -- An id window running past the end of the row. Silently clamping it would turn a
+                -- wrong constant in an export into a plausible answer over the wrong classes.
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph_and_retain('stage_b', {n_tokens = 3, n_past = 0},
+                                              {hidden = {from = 'stage_a'}})
+                loom.argmax_row_range('stage_b', -1, 2, 99)
+            else
+                -- An empty window (lo == hi). There is no best of nothing.
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph_and_retain('stage_b', {n_tokens = 3, n_past = 0},
+                                              {hidden = {from = 'stage_a'}})
+                loom.argmax_row_range('stage_b', -1, 3, 3)
             end
         end)
         if ok then return -1 end
@@ -237,6 +276,26 @@ int main() {
     std::fprintf(stderr, "argmax: marshalled %g, retained-by-name %g\n", argmax_ref, argmax_got);
     LOOM_CHECK(argmax_ref == argmax_got);
 
+    // --- 4b. The same reduction restricted to an id window, against a Lua-side slice of the same row.
+    // The window is chosen to EXCLUDE the unrestricted winner, so a binding that ignored `lo`/`hi`
+    // would agree with check 4 above and disagree here. ---
+    {
+        const double unrestricted = argmax_got;
+        // N_VOCAB is 6 in this fixture; take the half that does not contain the winner.
+        const double lo = unrestricted < 3 ? 3 : 0;
+        const double hi = unrestricted < 3 ? 6 : 3;
+        const std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+            {"tokens", tokens}, {"lo", lo}, {"hi", hi},
+        };
+        const auto ref = std::get<double>(bridge.call("argmax_range_marshalled", args));
+        const auto got = std::get<double>(bridge.call("argmax_range_retained", args));
+        std::fprintf(stderr, "argmax_row_range over [%g, %g): marshalled %g, retained %g "
+                              "(unrestricted was %g)\n", lo, hi, ref, got, unrestricted);
+        LOOM_CHECK(ref == got);
+        LOOM_CHECK(got >= lo && got < hi);
+        LOOM_CHECK(got != unrestricted);
+    }
+
     // --- 5. A store survives its geometry changing under it, which prefill->decode does every time. ---
     const std::vector<double> reshaped = as_array(bridge.call("reshape_then_read", {{"tokens", tokens}}));
     LOOM_CHECK(reshaped[0] == 4.0 && reshaped[1] == 1.0);
@@ -246,7 +305,7 @@ int main() {
     // --- 6. The failure modes are errors that name the real problem, not silence or a crash.
     // The script returns the case index when the message matched, 0 when it raised something else
     // (printing it), and -1 when nothing was raised at all -- the case that would matter most. ---
-    for (double case_id = 1; case_id <= 5; ++case_id) {
+    for (double case_id = 1; case_id <= 7; ++case_id) {
         const auto verdict = std::get<double>(bridge.call("expect_error", {{"case", case_id}}));
         std::fprintf(stderr, "error case %d: verdict %g\n", static_cast<int>(case_id), verdict);
         LOOM_CHECK(verdict == case_id);
