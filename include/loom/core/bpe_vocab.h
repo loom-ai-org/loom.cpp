@@ -94,6 +94,14 @@ public:
     std::string decode(const std::vector<int32_t>& ids) const;
 
     const std::string& id_to_piece(int32_t id) const;
+    // `id_to_piece`'s inverse: the id of the token whose piece text is exactly `piece`, or -1 when this
+    // vocab has no such token.
+    //
+    // Exists so a host can name a SPECIAL token by its text instead of hardcoding a number -- Whisper's
+    // `<|de|>` is id 50261 in one checkpoint and absent from an English-only one, and a CLI that carried
+    // the number would be carrying a per-model constant, which is the thing this project keeps removing
+    // from hosts. Exact match, no normalization: a special token's spelling is its identity.
+    int32_t piece_to_id(const std::string& piece) const;
     size_t size() const { return tokens_.size(); }
     int32_t bos_id() const { return bos_id_; }
     int32_t eos_id() const { return eos_id_; }

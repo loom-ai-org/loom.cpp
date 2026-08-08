@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -97,11 +98,12 @@ int main() {
         return kSkipReturnCode;
     }
 
-    std::vector<int64_t> wav_shape, prompt_shape, gen_shape, enc_shape;
+    std::vector<int64_t> wav_shape, prompt_shape, gen_shape, enc_shape, lang_shape;
     const std::vector<float> waveform = read_npy<float>(ref_dir + "/ref_mil_waveform.npy", wav_shape);
     const std::vector<int32_t> prompt = read_npy<int32_t>(ref_dir + "/ref_mil_prompt.npy", prompt_shape);
     const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_mil_generated.npy", gen_shape);
     const std::vector<float> expected_encoder = read_npy<float>(ref_dir + "/ref_mil_encoder.npy", enc_shape);
+    const std::vector<int32_t> language_ref = read_npy<int32_t>(ref_dir + "/ref_mil_language.npy", lang_shape);
 
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
@@ -156,7 +158,7 @@ int main() {
         LOOM_CHECK(mean_abs_diff < 1e-3);
     }
 
-    // --- 2. the whole driver ---
+    // --- 2. the whole driver, both ways round the language: pinned, and auto-detected ---
     {
         loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
         loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
@@ -169,30 +171,62 @@ int main() {
         bridge.load_script(model->kv_str("model.driver_script"));
 
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
-        const std::vector<double> prompt_d(prompt.begin(), prompt.end());
-        loom::LoomLuaBridge::Value result = bridge.call("infer", {
-            {"waveform", waveform_d},
-            {"tokens", prompt_d},
-            {"max_new_tokens", static_cast<double>(expected.size())},
-            // The artifact's own eos, from the vocab KVs the export embedded -- not a constant this
-            // test carries, which is the same "read it from the file" point as `n_samples` above.
-            {"eos_token", static_cast<double>(model->kv_i32("tokenizer.ggml.eos_token_id", -1))},
-        });
+        // The artifact's own eos, from the vocab KVs the export embedded -- not a constant this test
+        // carries, which is the same "read it from the file" point as `n_samples` above.
+        const double eos = static_cast<double>(model->kv_i32("tokenizer.ggml.eos_token_id", -1));
+        const int32_t ref_language = language_ref.empty() ? -1 : language_ref[0];
 
-        const auto& generated_d = std::get<std::vector<double>>(result);
-        std::vector<int32_t> generated;
-        generated.reserve(generated_d.size());
-        for (double v : generated_d) generated.push_back(static_cast<int32_t>(v));
+        // **The test passes no token prefix at all.** The driver builds it: start-of-transcript, the
+        // language, the task, no-timestamps -- from ids `whisper_export` read off the checkpoint. That
+        // is the whole point of the constants living in the driver, so a host needs to know nothing
+        // about Whisper's prompt convention.
+        auto run = [&](bool pin_language) {
+            std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+                {"waveform", waveform_d},
+                {"max_new_tokens", static_cast<double>(expected.size())},
+                {"eos_token", eos},
+            };
+            // Omitting `language` entirely is what asks the driver to detect it -- the resolution order
+            // the whole feature is about. Pinning it is the override.
+            if (pin_language && ref_language >= 0) {
+                args["language"] = static_cast<double>(ref_language);
+            }
+            // The Value is held in a named local before it is unpacked, deliberately: `call` returns by
+            // value, so binding a reference straight into `std::get<...>(call(...))` reads the vector
+            // after the temporary variant holding it has been destroyed. It fails in exactly the way
+            // that is hardest to read -- the first elements come back as freed-heap garbage while the
+            // later ones still look right, so the driver appears to compute a wrong prefix.
+            const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
+            const auto& out = std::get<std::vector<double>>(result);
+            std::vector<int32_t> ids;
+            ids.reserve(out.size());
+            for (double v : out) ids.push_back(static_cast<int32_t>(v));
+            return ids;
+        };
 
-        std::fprintf(stderr, "HF  generated %zu tokens: ", expected.size());
+        std::fprintf(stderr, "HF language %d, HF generated %zu tokens: ", ref_language, expected.size());
         for (int32_t t : expected) std::fprintf(stderr, "%d ", t);
-        std::fprintf(stderr, "\nMIL generated %zu tokens: ", generated.size());
-        for (int32_t t : generated) std::fprintf(stderr, "%d ", t);
         std::fprintf(stderr, "\n");
 
-        LOOM_CHECK(generated.size() == expected.size());
-        for (size_t i = 0; i < generated.size(); ++i) {
-            LOOM_CHECK(generated[i] == expected[i]);
+        for (bool pin : {true, false}) {
+            const std::vector<int32_t> generated = run(pin);
+            std::fprintf(stderr, "MIL (%s) generated %zu tokens: ",
+                         pin ? "language pinned" : "language auto-detected", generated.size());
+            for (int32_t t : generated) std::fprintf(stderr, "%d ", t);
+            std::fprintf(stderr, "\n");
+            LOOM_CHECK(generated.size() == expected.size());
+            for (size_t i = 0; i < generated.size(); ++i) {
+                LOOM_CHECK(generated[i] == expected[i]);
+            }
+        }
+
+        // Auto-detection agreeing with HF is implied by the token sequences above matching -- a
+        // different language would change the prompt and therefore the very first generated token --
+        // but the prompt the fixture recorded is checked directly too, so a failure says which half
+        // went wrong rather than only that something did.
+        if (ref_language >= 0) {
+            LOOM_CHECK(prompt.size() >= 2);
+            LOOM_CHECK(prompt[1] == ref_language);
         }
     }
 

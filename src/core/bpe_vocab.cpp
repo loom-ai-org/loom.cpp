@@ -639,4 +639,12 @@ const std::string& BpeVocab::id_to_piece(int32_t id) const {
     return tokens_[static_cast<size_t>(id)];
 }
 
+int32_t BpeVocab::piece_to_id(const std::string& piece) const {
+    // -1 rather than a throw: "does this vocabulary have this token" is a legitimate question with a
+    // legitimate negative answer -- an English-only Whisper genuinely has no `<|de|>`, and the caller's
+    // response to that is a message about the checkpoint, not an exception.
+    const auto it = token_to_id_.find(piece);
+    return it == token_to_id_.end() ? -1 : it->second;
+}
+
 } // namespace loom

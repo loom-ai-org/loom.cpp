@@ -2619,13 +2619,49 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   | qwen3-0.6b-base, lfm2-350m-monolithic re-exported after the `fuse_loom_attention` fix | byte-identical by snapshot diff |
   | the Python suite | 481 passed |
 
-  **Also not done: `loom-cli --wav` on Whisper.** `run_asr` was model-agnostic and now registers a KV
-  cache for any cached phase (it did not, so a cached ASR model could not run through that path at all —
-  a plain bug this item found). What still stops Whisper is the call itself: its driver takes `waveform`
-  at exactly `loom.n_samples` plus `tokens`, the forced decoder prefix, where `run_asr` passes
-  `waveform`/`length`. Both halves are host *decisions* rather than missing capability — pad-or-trim to
-  the file's own `loom.n_samples`, and choose a prefix, which is a language and timestamp choice a CLI
-  should expose rather than guess.
+  **Follow-up, done 2026-08-08: the driver owns its prompt, and `loom-cli --wav` runs Whisper.** The two
+  open host decisions were put to the author, who answered with a rule rather than a case: *an explicit
+  argument wins; absent it, autodetect if the model can; otherwise a documented default* — and that this
+  should hold for anything a model can infer about its own input, not just Whisper's language. That
+  answer decides **where** the logic goes, which is the more important half: whether detection is
+  possible at all is a checkpoint fact, so it belongs in the driver, not the host.
+
+  * **`whisper_export.decoder_prompt_constants`** reads five ids off the checkpoint's own generation
+    config (`SOT`, the `LANG_LO`/`LANG_HI` window, `TRANSCRIBE`/`TRANSLATE`, `NO_TIMESTAMPS`) and binds
+    them as `ExportConstants`. Which of them *exist* is the capability statement: an English-only
+    checkpoint has no language or task tokens, so it gets `0`s and the driver correctly builds the short
+    prefix and never tries to detect. Read off the config rather than `forced_decoder_ids`, which leaves
+    its language slot `None` on a multilingual checkpoint because HF fills it in from detection.
+  * **`whisper_driver/01_prompt.lua`** builds the prompt: given language wins, else one decoder step from
+    `SOT` alone with the argmax restricted to the language block, else nothing. It costs no extra encoder
+    pass (`xa` is already retained) and writes only KV cell 0, which the prefill then overwrites with the
+    identical K/V. So `PrefillDecodeLoop` gained `prompt`, an expression for the loop to start from
+    instead of `inputs.tokens` — the third and last field this family added to it.
+  * **`loom.argmax_row_range(module, row, lo, hi)`** is the new engine binding it needs. The 99 language
+    tokens sit *inside* the 51865-wide transcript vocabulary, so an unrestricted argmax answers with a
+    word. It is the same `argmax_tensor_row` with an id window (so the two cannot disagree about how a
+    maximum is found) and reads only the window off the backend. A separate binding rather than an
+    overload, which is the opposite of `argmax_row`'s own documented choice, for a mechanical reason:
+    `argmax_row`'s module form already ends in an optional `generation`, so `(module, row, lo, hi)` and
+    `(module, row, generation)` cannot be told apart.
+  * **`loom-cli`** grew `--language` (resolved to the model's own `<|xx|>` id by TEXT via the new
+    `BpeVocab::piece_to_id`, so the CLI carries no per-checkpoint number) and 30 s chunking. The author
+    chose sequential windows over rejecting long audio; the seam is real and documented at the loop —
+    each window is decoded independently, where Whisper's own long-form algorithm conditions each on the
+    previous window's text and cuts at emitted timestamps.
+
+  Three real bugs surfaced doing it: `Vocab::load` **throws** on a `gpt2` schema while `BpeVocab::load`
+  politely returns nullptr, so the SentencePiece loader has to be asked second or it kills the run; the
+  driver returns the eos token it stopped on, which decodes literally as `<|endoftext|>` in a
+  transcript; and — in the test, not the engine — binding `const auto&` into
+  `std::get<...>(bridge.call(...))` reads the vector after the returned variant is destroyed. That last
+  one is worth remembering because of how it *presents*: the first one or two elements come back as
+  freed-heap garbage and the rest are correct, so it reads exactly like a driver computing a wrong
+  prompt. It cost a full bisect to find, and the thing that found it was making the driver print each
+  token it computed — which were all correct.
+
+  The driver already accepts `task` and `timestamps` on the same terms; only `--language` is exposed on
+  the CLI, since that is the one the author decided.
 
   **What is NOT done, and its exact blocker.** R6 retirement of `tools/convert_whisper/` and
   `src/core/whisper_driver.cpp` (P4.0.8 listed Whisper as the one family blocked on this item). The

@@ -477,6 +477,11 @@ class PrefillDecodeLoop(DriverComponent):
     # cached call at `n_tokens = 1`, with `xa` bound to the encoder phase's single run. Empty for a
     # plain causal LM, whose only input that is not host-computed IS the step's tokens.
     bound: dict = dataclasses.field(default_factory=dict)
+    # The IR expression the loop's first iteration starts from, defaulting to the caller's own
+    # `inputs.tokens`. An earlier component may instead have BUILT the prompt -- Whisper's is a
+    # checkpoint-dependent prefix, with a language the driver may have had to detect -- in which case
+    # this names that local and the caller never sees a token prefix at all (BACKLOG.md P4.1 follow-up).
+    prompt: object = None
 
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
@@ -504,6 +509,11 @@ class PrefillDecodeLoop(DriverComponent):
             "SubgraphCallComponent.length -- validate() over the assembled function is their authority. "
             "The input NAMES they are keyed by are checked, by this component's own `inputs` link, "
             "which is exact against the topology's real declared inputs."
+        ),
+        "prompt": Unchecked(
+            "same: a driver_ir expression over a local an earlier component bound, whose reads "
+            "driver_ir.validate resolves over the assembled function -- a name nothing binds fails the "
+            "export rather than reading nil at run time."
         ),
         "default_max_new_tokens": Unchecked(
             "a default for a caller-supplied argument, not a claim about the model. Nothing in the "
@@ -545,7 +555,9 @@ class PrefillDecodeLoop(DriverComponent):
         eos = "_eos_token"
         return [
             Local(self.generated_var, ArrayLit([])),
-            Local(self.step_var, FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
+            Local(self.step_var,
+                  self.prompt if self.prompt is not None
+                  else FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
             Local(self.n_past_var, Lit(0)),
             Local(self.n_tokens_var, Len(self.step_var)),
             Local(max_new, BinOp("or", FieldAccess("inputs", "max_new_tokens"),

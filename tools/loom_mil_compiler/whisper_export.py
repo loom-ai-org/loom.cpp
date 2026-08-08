@@ -139,6 +139,49 @@ def causal_mask(seq_len: int) -> torch.Tensor:
     return mask.view(1, 1, seq_len, seq_len)
 
 
+def decoder_prompt_constants(generation_config) -> dict:
+    """The token ids a Whisper decode prompt is built from, read off the checkpoint's own generation
+    config -- for the DRIVER to build the prompt with, not for a host to hardcode.
+
+    Five numbers, and which of them exist is itself the capability statement this family needs:
+
+    * `SOT` -- `decoder_start_token_id`. Always present; a prompt is at minimum this one token.
+    * `LANG_LO` / `LANG_HI` -- the half-open id window the 98 language tokens occupy. Present only on a
+      **multilingual** checkpoint. `0`/`0` on an English-only one (`whisper-*.en` has no language tokens
+      at all), which is how the driver knows it must neither ask for a language nor try to detect one.
+      Derived as `min..max+1` over `lang_to_id`'s own values rather than assumed contiguous -- and
+      cross-checked below, because a non-contiguous block would make a restricted argmax able to return
+      something that is not a language.
+    * `TRANSCRIBE` / `TRANSLATE` -- `task_to_id`, likewise absent (`0`) on an English-only checkpoint.
+    * `NO_TIMESTAMPS` -- `no_timestamps_token_id`, `0` if this checkpoint has no such token.
+
+    **Not `forced_decoder_ids`**, which is the obvious-looking source and is wrong: a multilingual
+    checkpoint leaves its language slot `None` there (`[[1, None], [2, 50359]]` on whisper-small) because
+    HF fills it in from detection at generation time. Copying that list yields a prompt with a hole in it.
+    """
+    lang_to_id = getattr(generation_config, "lang_to_id", None) or {}
+    task_to_id = getattr(generation_config, "task_to_id", None) or {}
+    lang_ids = sorted(int(v) for v in lang_to_id.values())
+    lang_lo, lang_hi = (lang_ids[0], lang_ids[-1] + 1) if lang_ids else (0, 0)
+    if lang_ids and len(lang_ids) != lang_hi - lang_lo:
+        # The driver detects a language with ONE restricted argmax over [LANG_LO, LANG_HI). A gap in the
+        # block means some id in that window is not a language token, so detection could return it --
+        # silently, as a plausible-looking prompt token. Say so at export time instead.
+        raise ValueError(
+            f"this checkpoint's {len(lang_ids)} language tokens do not occupy a contiguous id block: "
+            f"{lang_lo}..{lang_hi - 1} spans {lang_hi - lang_lo} ids. Language detection is a single "
+            f"argmax restricted to that window, which is only sound while every id in it is a language."
+        )
+    return {
+        "SOT": int(generation_config.decoder_start_token_id),
+        "LANG_LO": lang_lo,
+        "LANG_HI": lang_hi,
+        "TRANSCRIBE": int(task_to_id.get("transcribe", 0)),
+        "TRANSLATE": int(task_to_id.get("translate", 0)),
+        "NO_TIMESTAMPS": int(getattr(generation_config, "no_timestamps_token_id", None) or 0),
+    }
+
+
 def load_feature_extractor(model_dir: str):
     """The checkpoint's own `WhisperFeatureExtractor`.
 
@@ -184,6 +227,7 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
     d_model: Optional[int] = field(default=None, init=False, repr=False)
     max_target_positions: Optional[int] = field(default=None, init=False, repr=False)
     decoder_bindings: tuple = field(default=(), init=False, repr=False)
+    prompt_constants: dict = field(default_factory=dict, init=False, repr=False)
 
     __unchecked__ = {
         "model_dir": Unchecked(
@@ -214,6 +258,12 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
             "cannot drift from the causal-LM one about which names the driver fills in. "
             "PrefillDecodeLoop's own `inputs` link re-checks them against the emitted topology anyway."
         ),
+        "prompt_constants": Unchecked(
+            "READ off the checkpoint's own generation config in phases() (`decoder_start_token_id`, "
+            "`lang_to_id`, `task_to_id`, `no_timestamps_token_id`), never declared -- see "
+            "`decoder_prompt_constants`, which DOES cross-check the one property a restricted argmax "
+            "depends on: that the language tokens form a contiguous id block."
+        ),
     }
 
     def prepare_environment(self) -> None:
@@ -242,6 +292,7 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         self.n_audio_ctx = int(cfg.max_source_positions)
         self.d_model = int(cfg.d_model)
         self.max_target_positions = int(cfg.max_target_positions)
+        self.prompt_constants = decoder_prompt_constants(model.generation_config)
 
         mel = WhisperMelFrontend(extractor.n_fft, extractor.hop_length, np.array(extractor.mel_filters))
 
@@ -310,22 +361,34 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         }
 
     def backend_kwargs(self) -> dict:
-        # The tokenizer travels with the model: Whisper's is GPT-2 BPE, which the exporter's own
-        # detection resolves from the directory's vocab/merges without this family naming a family.
-        return dict(tokenizer_dir=self.model_dir, hparams=self.hparams())
+        # The tokenizer travels with the model. `tokenizer_pre` is named rather than left to the hash
+        # cascade because Whisper's tokenizer.json is not in llama.cpp's chkhsh table, so detection warns
+        # and falls back to "qwen2" -- a pretokenizer whose digit and letter runs differ from the
+        # byte-level GPT-2 one Whisper actually uses. Nothing in this family's own decode path notices
+        # (ASR only ever maps ids BACK to text), which is exactly why a wrong value here would sit
+        # unnoticed until something encoded text with it.
+        return dict(tokenizer_dir=self.model_dir, tokenizer_pre="gpt-2", hparams=self.hparams())
 
     def driver_components(self) -> List:
         """Encoder once, then the decode loop -- two components and a header.
 
-        Both are IR rather than a hand-written fragment, which is what lets every call site be checked
-        against the real traced topologies: the encoder's input names and output arity by
-        `SubgraphCallComponent`, the decoder's by `PrefillDecodeLoop`'s own exact `inputs` link.
+        The two calls are IR rather than text, which is what lets each be checked against the real
+        traced topologies: the encoder's input names and output arity by `SubgraphCallComponent`, the
+        decoder's by `PrefillDecodeLoop`'s own exact `inputs` link.
+
+        The prompt is the exception, and it earns it: choosing a language is branching control flow
+        (given / detect / neither), which is exactly what a `LuaFragment` is for -- the same split
+        Parakeet's decode loop takes. Its own `run_subgraph_and_retain('decoder', ...)` detection call is
+        parsed out of the text and declared against the traced topology regardless.
         """
-        from .driver_components import LuaFragment, PrefillDecodeLoop, SubgraphCallComponent
-        from .driver_ir import FieldAccess, Lit, OutputRef
+        from .driver_components import (
+            ExportConstants, LuaFragment, PrefillDecodeLoop, SubgraphCallComponent,
+        )
+        from .driver_ir import FieldAccess, Lit, OutputRef, Var
 
         return [
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
+            ExportConstants(values=dict(self.prompt_constants)),
             SubgraphCallComponent(
                 topology="encoder",
                 # Retained, not bound to a local. The encoder emits `n_audio_ctx * d_model` floats --
@@ -343,6 +406,11 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 note="Encoder: one fixed-shape pass over 30 s of audio -- mel frontend, conv stem, "
                      "transformer stack.",
             ),
+            LuaFragment(
+                self.driver_script_path / "01_prompt.lua",
+                reads=("SOT", "LANG_LO", "LANG_HI", "TRANSCRIBE", "NO_TIMESTAMPS"),
+                defines=("_prompt", "_language"),
+            ),
             PrefillDecodeLoop(
                 topology="decoder",
                 bindings=self.decoder_bindings,
@@ -351,6 +419,9 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 # it already computes: tokens from the previous step, positions and the causal mask from
                 # n_tokens/n_past.
                 bound={"xa": OutputRef("encoder")},
+                # The prefix the fragment above built, not `inputs.tokens`: this driver owns its own
+                # prompt, so a caller passes audio and at most a language.
+                prompt=Var("_prompt"),
             ),
         ]
 
