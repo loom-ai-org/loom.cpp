@@ -1574,6 +1574,86 @@ def _op_reduce_sum(self, op, ctx):
     })
 
 
+@topology_rule('clip')
+def _op_clip(self, op, ctx):
+    # MIL's `clip` is what `torch.clamp(x, min=..., max=...)` becomes, and it carries its two bounds as
+    # `alpha`/`beta` INPUT Vars rather than as attributes -- so the generic OP_MAP path would hand
+    # op_clamp three inputs and no `min`/`max` attrs at all. (`OP_MAP`'s own "clamp" entry names an op
+    # coremltools never emits from the torch frontend; this is the spelling that reaches the table.)
+    # Whisper's mel frontend is the first user: `torch.clamp(mel_spec, min=1e-10)` before the log.
+    x_var = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+    lo = static_scalar(op.inputs.get("alpha"), None)
+    hi = static_scalar(op.inputs.get("beta"), None)
+    if x_var is None or lo is None or hi is None:
+        raise NotImplementedError(
+            f"clip op '{op.name}' has non-constant bounds (alpha={lo!r}, beta={hi!r}); op_clamp reads "
+            "both as numbers off the node's attrs, so a data-dependent bound needs its own composition."
+        )
+    ctx.nodes.append({
+        "op": "CLAMP",
+        "inputs": [ctx.resolve(self.safe_name(x_var.name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"min": float(lo), "max": float(hi)},
+    })
+
+
+def _reduce_max_total(self, op):
+    """The element count a `reduce_max` collapses, or None when it does not reduce *every* axis or any
+    axis is dynamic. Shared by the guard and the handler so they cannot disagree about which case they
+    are in -- the same arrangement `_matmul_transposes` and `_reduce_mean_plan` use."""
+    x_var = op.inputs.get("x")
+    if x_var is None:
+        return None
+    shape = self.get_var_info(x_var)["shape"]
+    axes = static_ints(op.inputs.get("axes"))
+    rank = len(shape)
+    # `axes=None` is MIL's own spelling of "every axis"; an explicit list has to name them all.
+    if axes is not None and {a % rank for a in axes} != set(range(rank)):
+        return None
+    total = 1
+    for size in shape:
+        if not str(size).isdigit():
+            return None
+        total *= int(size)
+    return total
+
+
+@topology_rule('reduce_max', guard=lambda self, op: _reduce_max_total(self, op) is not None,
+               when="it reduces every axis and all of them are static")
+def _op_reduce_max_global(self, op, ctx):
+    # ggml has no reduce-max primitive, but POOL_1D already does max-pooling natively -- so a *global*
+    # maximum is one pool whose kernel spans the whole flattened tensor, which is exactly the reduction
+    # `tools/convert_whisper/convert_whisper_encoder.py` hand-wrote for this same operation. The mel
+    # frontend's `log_spec.max()` is what needs it: Whisper floors every bin at 8 dB below the loudest
+    # bin in the entire 30 s clip, so this single scalar reaches every output element.
+    total = _reduce_max_total(self, op)
+    out_name = self.safe_name(op.outputs[0].name)
+    flat_name = f"{out_name}_reduce_max_flat"
+    ctx.nodes.append({
+        "op": "RESHAPE",
+        "inputs": [ctx.resolve(self.safe_name(op.inputs["x"].name))],
+        "outputs": [flat_name],
+        "attrs": {"shape": [total]},
+    })
+    ctx.nodes.append({
+        "op": "POOL_1D",
+        "inputs": [flat_name],
+        "outputs": [out_name],
+        "attrs": {"op": "max", "k0": total, "s0": total, "p0": 0},
+    })
+
+
+@topology_rule('reduce_max', when="it reduces only some axes, or a dynamic one (rejected)")
+def _op_reduce_max_unsupported(self, op, ctx):
+    raise NotImplementedError(
+        f"reduce_max op '{op.name}' does not reduce every axis of a statically-shaped tensor "
+        f"(shape={self.get_var_info(op.inputs['x'])['shape']!r}, "
+        f"axes={static_ints(op.inputs.get('axes'))!r}). Only the global maximum is composed here, as a "
+        "POOL_1D spanning the flattened tensor; a per-axis maximum needs a real ggml reduction that "
+        "does not exist yet."
+    )
+
+
 @topology_rule('cumsum')
 def _op_cumsum(self, op, ctx):
     nodes, resolve = ctx.nodes, ctx.resolve
