@@ -19,6 +19,8 @@
 //   2.  the whole embedded Lua driver -- encoder once, the prompt it builds for itself, then the
 //       KV-cached cross-attention decode loop -- against HF's greedy token sequence, with the language
 //       both pinned and auto-detected. Integer equality, no tolerance: both are deterministic argmax.
+//   3.  the same, with a `<|startofprev|>` context in front of the prompt -- long-form conditioning,
+//       checked against an HF run that saw the same context.
 //
 // **Nothing here names a per-model C++ struct**, unlike its bespoke sibling: which topology needs a
 // cache is `GraphTopology::uses_kv_cache()`'s answer, how big to make it is `make_kv_cache(*model)`'s,
@@ -114,8 +116,16 @@ int main() {
     const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_mil_generated.npy", gen_shape);
     const std::vector<float> expected_encoder = read_npy<float>(ref_dir + "/ref_mil_encoder.npy", enc_shape);
     const std::vector<int32_t> language_ref = read_npy<int32_t>(ref_dir + "/ref_mil_language.npy", lang_shape);
-    std::vector<int64_t> dec_shape;
+    std::vector<int64_t> dec_shape, cond_shape, prev_shape;
     const std::vector<float> expected_decoder = read_npy<float>(ref_dir + "/ref_mil_decoder.npy", dec_shape);
+    // Added with the long-form conditioning check; absent on a fixture generated before it, which is a
+    // skip of that one check rather than a failure.
+    const std::vector<int32_t> conditioned_ref =
+        path_exists(ref_dir + "/ref_mil_conditioned.npy")
+            ? read_npy<int32_t>(ref_dir + "/ref_mil_conditioned.npy", cond_shape) : std::vector<int32_t>{};
+    const std::vector<int32_t> prev_raw =
+        path_exists(ref_dir + "/ref_mil_prev_raw.npy")
+            ? read_npy<int32_t>(ref_dir + "/ref_mil_prev_raw.npy", prev_shape) : std::vector<int32_t>{};
 
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
@@ -299,6 +309,45 @@ int main() {
         if (ref_language >= 0) {
             LOOM_CHECK(prompt.size() >= 2);
             LOOM_CHECK(prompt[1] == ref_language);
+        }
+
+        // --- 3. the same audio decoded with a `<|startofprev|>` context in front of the prompt ---
+        //
+        // Two properties in one comparison, and the fixture is built so that failing either one shows:
+        //
+        //   * the context REACHES the model. HF's conditioned output differs completely from its
+        //     unconditioned one (the fixture uses a real sentence for exactly this reason -- carrying
+        //     this run's own output forward changes nothing, so it would pass even if `prev_tokens`
+        //     were ignored). A driver that dropped the argument would produce check 2's tokens here.
+        //   * the context is FILTERED. What the driver is handed includes a timestamp,
+        //     `<|notimestamps|>` and eos appended to the sentence; HF's oracle saw the sentence alone.
+        //     A driver that fed those through would condition on three tokens HF never saw.
+        if (!prev_raw.empty()) {
+            LOOM_CHECK(conditioned_ref != expected); // the fixture itself must be able to fail
+            std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+                {"waveform", waveform_d},
+                {"max_new_tokens", static_cast<double>(conditioned_ref.size())},
+                {"eos_token", eos},
+                {"prev_tokens", std::vector<double>(prev_raw.begin(), prev_raw.end())},
+            };
+            if (ref_language >= 0) args["language"] = static_cast<double>(ref_language);
+
+            const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
+            const auto& out = std::get<std::vector<double>>(result);
+            std::vector<int32_t> generated;
+            generated.reserve(out.size());
+            for (double v : out) generated.push_back(static_cast<int32_t>(v));
+
+            std::fprintf(stderr, "HF  conditioned %zu tokens: ", conditioned_ref.size());
+            for (int32_t t : conditioned_ref) std::fprintf(stderr, "%d ", t);
+            std::fprintf(stderr, "\nMIL conditioned %zu tokens: ", generated.size());
+            for (int32_t t : generated) std::fprintf(stderr, "%d ", t);
+            std::fprintf(stderr, "\n");
+
+            LOOM_CHECK(generated.size() == conditioned_ref.size());
+            for (size_t i = 0; i < generated.size(); ++i) {
+                LOOM_CHECK(generated[i] == conditioned_ref[i]);
+            }
         }
     }
 

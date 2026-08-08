@@ -14,6 +14,11 @@ decoder over a deterministic synthetic waveform, and writes the three arrays the
     ref_mil_decoder.npy     (n_prompt, V) f32 -- HF's decoder logits for the prompt, teacher-forced in
                                                  one pass, so the decoder half can be checked in
                                                  isolation from the loop that drives it
+    ref_mil_conditioned.npy (n_new,)     i32  -- what HF generates when the SAME audio is decoded with a
+                                                 `<|startofprev|>` context in front of the prompt
+    ref_mil_prev_raw.npy    (n_prev,)    i32  -- that context as the DRIVER is handed it: the sentence
+                                                 plus a timestamp, `<|notimestamps|>` and eos, which it
+                                                 must strip before use
 
 **Why a synthetic waveform rather than real speech.** The check is that two implementations of the same
 arithmetic agree, and agreement on noise is a strictly harder test than agreement on speech: a real clip
@@ -44,6 +49,11 @@ from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneratio
 # script alone, on a machine that has the checkpoint and nothing else.
 SEED = 0
 AMPLITUDE = 0.05
+
+# The carried-over context for the conditioning case. An ordinary sentence, chosen only for
+# being ordinary: it has to be something the model would plausibly have transcribed a moment
+# earlier, and it has to move the output when prepended, which any real sentence does on noise.
+CONTEXT_TEXT = " The weather today is cold and rainy in the north."
 
 
 def detect_language(model, encoder_out, generation_config):
@@ -139,8 +149,53 @@ def main():
     np.save(out_dir / "ref_mil_language.npy",
             np.array([-1 if language is None else language], dtype=np.int32))
     np.save(out_dir / "ref_mil_decoder.npy", decoder_logits.numpy().astype(np.float32))
+
+    # The long-form conditioning case: decode the same audio again, this time with the previous
+    # window's text carried in front of the prompt as `<|startofprev|> ...`. Using this run's OWN
+    # output as that context is exactly what the CLI does window to window, and it needs no second
+    # audio source.
+    #
+    # The context is filtered to TEXT here for the same reason the driver filters it: timestamps,
+    # `<|notimestamps|>` and eos are the model's decisions about the previous window, not words it
+    # said. `generated` ends with eos, so a comparison against an unfiltered context would pass only
+    # if BOTH sides made the same mistake.
+    conditioned, prev_raw = [], []
+    prev_sot = getattr(model.generation_config, "prev_sot_token_id", None)
+    if prev_sot is not None:
+        from transformers import WhisperTokenizer
+
+        tokenizer = WhisperTokenizer.from_pretrained(model_dir)
+        context = tokenizer.encode(CONTEXT_TEXT, add_special_tokens=False)
+
+        # **The context is a sentence, not this run's own output, and that is what makes the check able
+        # to fail.** Conditioning on the unconditioned output changes nothing -- the greedy path is
+        # already consistent with it -- so a driver that ignored `prev_tokens` entirely would still
+        # match. A real sentence moves the output completely (on noise the model all but continues it),
+        # so the comparison distinguishes "conditioning works" from "conditioning is absent".
+        no_ts = getattr(model.generation_config, "no_timestamps_token_id", None)
+        eos = int(model.generation_config.eos_token_id)
+        ts_lo = (no_ts + 1) if no_ts is not None else None
+        # What the C++ test HANDS the driver: the context plus the three kinds of token a driver must
+        # strip before using it -- a timestamp, `<|notimestamps|>` and eos. The oracle below is built
+        # from the context ALONE, so a driver that forgets to filter cannot match it.
+        prev_raw = list(context)
+        if ts_lo is not None:
+            prev_raw += [ts_lo + 50, int(no_ts)]
+        prev_raw.append(eos)
+
+        with torch.no_grad():
+            tokens = torch.tensor([[int(prev_sot)] + context + prompt], dtype=torch.long)
+            for _ in range(n_new):
+                logits = model(decoder_input_ids=tokens, encoder_outputs=(encoder_out,)).logits
+                next_token = int(logits[0, -1].argmax())
+                conditioned.append(next_token)
+                if next_token == eos:
+                    break
+                tokens = torch.cat([tokens, torch.tensor([[next_token]], dtype=torch.long)], dim=1)
+    np.save(out_dir / "ref_mil_conditioned.npy", np.array(conditioned, dtype=np.int32))
+    np.save(out_dir / "ref_mil_prev_raw.npy", np.array(prev_raw, dtype=np.int32))
     print(f"wrote {out_dir}: waveform {waveform.shape}, language {language}, prompt {prompt}, "
-          f"generated {generated}, encoder {tuple(encoder_out.shape)}")
+          f"generated {generated}, conditioned {conditioned}, encoder {tuple(encoder_out.shape)}")
 
 
 if __name__ == "__main__":

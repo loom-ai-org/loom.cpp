@@ -6,10 +6,38 @@
     -- Resolution order for the language, and it is the general rule for anything a model can infer
     -- about its own input: an explicit argument wins; absent, detect if this model can; otherwise fall
     -- back to the default, which here is "no language token", the only correct answer for `.en`.
-    local _prompt = { SOT }
     -- What the model has already produced before the decode loop starts. Empty unless the
     -- forced opening timestamp below fills it in.
     local _gen0 = {}
+    local _eos = inputs.eos_token or -1
+
+    -- The previous window's text, conditioning this one -- the last piece of Whisper's long-form
+    -- algorithm. Timestamps decided WHERE a window is cut; this is what gives the model context
+    -- ACROSS the cut, so a sentence spanning a boundary continues instead of restarting cold.
+    --
+    -- It goes BEFORE <|startoftranscript|>, which is what makes it context rather than output: the
+    -- model reads it, and then the real prompt begins. At most MAX_PREV tokens of it (half the text
+    -- context, minus the marker itself), keeping the MOST RECENT -- the words just before this window
+    -- are the ones that predict its first.
+    local _prompt = {}
+    if PREV_SOT > 0 and inputs.prev_tokens ~= nil then
+        -- Text only. A timestamp, a <|notimestamps|> or an eos in the carried context would be the
+        -- model reading back its own decisions about the PREVIOUS window as if they were words.
+        local _text = {}
+        for i = 1, #inputs.prev_tokens do
+            local t = inputs.prev_tokens[i]
+            if (TS_LO == 0 or t < TS_LO) and t ~= NO_TIMESTAMPS and t ~= _eos then
+                table.insert(_text, t)
+            end
+        end
+        if #_text > 0 then
+            table.insert(_prompt, PREV_SOT)
+            local _first = 1
+            if #_text > MAX_PREV then _first = #_text - MAX_PREV + 1 end
+            for i = _first, #_text do table.insert(_prompt, _text[i]) end
+        end
+    end
+    table.insert(_prompt, SOT)
     local _language = inputs.language
     if LANG_HI > 0 then
         if _language == nil then

@@ -2736,9 +2736,30 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
      (`20 → 23 → 26 → 45`) and the transcript covers the whole file contiguously. What replaces it is a
      one-second floor on the advance, which is a progress guarantee rather than a tuning knob.
 
-  Still not done, and now the only piece of Whisper's long-form algorithm missing: **conditioning each
-  window on the previous window's text** (`<|startofprev|>`). Timestamps fixed *where* windows are cut;
-  this is what would give the model context across a cut.
+  **Context conditioning across window cuts — DONE (2026-08-08), completing the long-form algorithm.**
+  Timestamps fixed *where* a window is cut; this is what gives the model context *across* the cut. The
+  previous window's text goes in front of `<|startoftranscript|>` behind a `<|startofprev|>` marker, so
+  the model reads it as context and then starts its real prompt — at most `MAX_PREV` tokens of it
+  (`n_text_ctx // 2 - 1`, half the context minus the marker, Whisper's own budget), keeping the most
+  recent, since the words just before a window are the ones that predict its first.
+
+  Two constants (`PREV_SOT`, `MAX_PREV`) and one driver branch; the host accumulates what each window
+  generated and hands it over **raw**. Which of those ids count as *text* is the driver's question, not
+  the host's, because the driver is what has the constants — it drops timestamps, `<|notimestamps|>` and
+  eos, all of which are the model's decisions about the previous window rather than words it said.
+  `--no-condition-on-previous` turns it off, on by default as in Whisper's own CLI and switchable for
+  the same reason it is there: carried context is what makes a sentence survive a boundary, and it is
+  also what lets a repetition loop persist across one, with no temperature fallback here to break out.
+
+  **The check nearly could not fail, and fixing that is the interesting part.** The obvious fixture is
+  "condition on this run's own output" — which is what the CLI actually does window to window, so it
+  looked right. It changes nothing: the greedy path is already consistent with its own output, so HF's
+  conditioned and unconditioned runs were **token for token identical**, and a driver that ignored
+  `prev_tokens` entirely would have passed. The fixture now uses an ordinary sentence instead, which
+  moves the output completely (` (sad music)` → ` The weather is cold and rainy in the north.`), and the
+  test asserts up front that the two references differ. The context handed to the driver also has a
+  timestamp, a `<|notimestamps|>` and an eos appended that HF's oracle never saw, so forgetting to
+  filter fails too. Both halves verified: 52/52.
 
   **The CLI's remaining two flags landed here too**, on the same terms as `--language`:
   `--task transcribe|translate` (resolved by text, so a bogus one names the two Whisper has and says an
