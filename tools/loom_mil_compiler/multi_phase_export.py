@@ -50,6 +50,16 @@ class ExportPhase:
     mil_inputs: List[ct.TensorType]
     root_axis: str = "n_tokens"
     declared_axes: Optional[dict] = None
+    # Fuse this phase's SDPA blocks into cached `ATTENTION` nodes (KV-CACHE.md stage 2). Per PHASE
+    # rather than per export, and that is the whole reason the field exists: Whisper's decoder is an
+    # autoregressive stack that must have a cache, and its encoder -- traced in the same GGUF, from the
+    # same checkpoint -- is a single full-sequence pass that must not. `fuse_attention` reaches the
+    # backend once per export everywhere else (`causal_lm_export.backend_kwargs`), which cannot express
+    # that. Defaults False, so no existing phase changes.
+    fuse_attention: bool = False
+    # The cache capacity in tokens, required when `fuse_attention` is set and meaningless otherwise --
+    # `LoomGGUFExporter._kv_cache_geometry` raises naming it if a fused export does not supply one.
+    kv_cache_size: Optional[int] = None
 
     __links__ = {
         # A typo'd axis name is a perfectly good dict key: `_sub_symbol` substitutes it happily and the
@@ -90,6 +100,19 @@ class ExportPhase:
             "duplicate that while reading as if it checked something ct.convert does not."
         ),
         "mil_inputs": Unchecked("same: ct.convert is the authority on these, not this declaration."),
+        "fuse_attention": Unchecked(
+            "a request, not a claim about the model -- and deliberately not checked against whether the "
+            "pattern then matched. `fuse_loom_attention` leaves anything it does not recognise exactly "
+            "as it was, and the presence of a fused node is read back off the emitted graph where it "
+            "matters (`_kv_cache_geometry`, `_topology_uses_kv_cache`), which is the same "
+            "request-versus-result split KV-CACHE.md decision 5 draws on the engine side."
+        ),
+        "kv_cache_size": Unchecked(
+            "the capacity to declare, in tokens. Bounded by nothing the checkpoint states -- exporting "
+            "a shorter context than the architecture allows is legitimate, the same argument "
+            "LMCausalModelExportConfig.max_seq_len records. A fused phase that omits it entirely does "
+            "raise, but from the backend, which is where the fused nodes exist to be counted."
+        ),
     }
 
     @property
