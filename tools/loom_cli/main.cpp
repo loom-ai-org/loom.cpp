@@ -43,6 +43,66 @@ std::vector<int32_t> parse_token_ids(const std::string& text) {
 }
 
 
+// One timestamped span of transcript. `closed` records whether the model ended it with a timestamp of
+// its own or whether it simply ran out of window -- the distinction the seek below depends on.
+struct Segment {
+    double start = 0.0;
+    double end = 0.0;
+    std::string text;
+    bool closed = false;
+};
+
+std::string format_time(double seconds) {
+    if (seconds < 0.0) seconds = 0.0;
+    const auto total_ms = static_cast<long long>(seconds * 1000.0 + 0.5);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld.%03lld", total_ms / 3600000,
+                  (total_ms / 60000) % 60, (total_ms / 1000) % 60, total_ms % 1000);
+    return buf;
+}
+
+// Splits one window's token ids into timestamped segments, appending them to `out`.
+//
+// Whisper emits `<|t0|> text <|t1|> <|t1|> more text <|t2|> ...`: every timestamp token both closes the
+// span before it and opens the one after, which is why this is a two-state walk rather than a scan for
+// pairs. Anything after the final timestamp is text the model had not finished when the window ran out
+// -- kept (it is real transcript) but marked `closed = false`, because it must not be trusted as a seek
+// boundary: its end time is the window edge, not something the model chose.
+//
+// `last_complete_end` returns the end of the last CLOSED segment, in whole-file seconds, or stays
+// negative when the model closed none.
+template <typename Detokenize>
+void split_into_segments(const std::vector<int32_t>& ids, int32_t ts_base, double ts_step,
+                          double window_start, double window_end, const Detokenize& detokenize,
+                          std::vector<Segment>& out, double& last_complete_end) {
+    std::vector<int32_t> pending;
+    bool open = false;
+    double start = window_start;
+
+    const auto flush = [&](double end, bool closed) {
+        if (pending.empty()) return;
+        std::string text = detokenize(pending);
+        pending.clear();
+        // A segment whose text is only the special tokens we drop is not a segment.
+        if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
+        out.push_back({start, end, std::move(text), closed});
+        if (closed) last_complete_end = end;
+    };
+
+    for (int32_t id : ids) {
+        if (id >= ts_base) {
+            const double t = window_start + static_cast<double>(id - ts_base) * ts_step;
+            if (open) flush(t, /*closed=*/true);
+            start = t;
+            open = true;
+            continue;
+        }
+        pending.push_back(id);
+    }
+    // Whatever is left ran past the window: end it at the window edge and mark it unclosed.
+    flush(window_end, /*closed=*/false);
+}
+
 // A decode of one clip's worth of audio: the driver's own `infer`, with whatever optional arguments the
 // caller supplied. Returns the token ids it generated.
 //
@@ -197,31 +257,99 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
         return;
     }
 
-    // Fixed-clip models: walk the file in back-to-back windows of exactly `clip` samples, zero-padding
-    // the last one, and concatenate what each window transcribes.
-    //
-    // **Naive on purpose, and the seam is real.** Each window is decoded independently, so a word
-    // straddling a boundary is split and no window sees the previous one's text. Whisper's own long-form
-    // algorithm avoids that by conditioning each window on the previous window's tokens and ending
-    // windows at emitted timestamps rather than at a fixed 30 s -- a substantially larger feature than
-    // this, and one that needs the timestamp tokens this CLI currently suppresses.
-    const size_t n_windows = (waveform.size() + clip - 1) / clip;
-    std::string transcript;
-    for (size_t w = 0; w < n_windows; ++w) {
-        const size_t begin = w * clip;
-        const size_t avail = std::min(static_cast<size_t>(clip), waveform.size() - begin);
-        std::vector<double> window(clip, 0.0); // zero-padded: Whisper's own pad_or_trim convention
-        for (size_t i = 0; i < avail; ++i) window[i] = waveform[begin + i];
+    // Fixed-clip models walk the file one `clip`-sample window at a time. WHERE the next window starts
+    // is the whole question, and the answer is the model's own timestamps -- see the loop below.
+    const uint32_t sample_rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
+    const uint32_t n_audio_ctx = model.has_kv("loom.n_audio_ctx") ? model.hparam_u32("n_audio_ctx") : 0;
+    const int32_t ts_base = bpe_vocab ? bpe_vocab->piece_to_id("<|0.00|>") : -1;
+    // Seconds per timestamp token: one encoder frame, i.e. the clip's duration over the number of frames
+    // it becomes. Derived from the file's own three numbers rather than hardcoded as Whisper's 0.02.
+    const double ts_step = (ts_base >= 0 && sample_rate > 0 && n_audio_ctx > 0)
+        ? (static_cast<double>(clip) / sample_rate) / n_audio_ctx : 0.0;
+    const bool can_timestamp = ts_step > 0.0;
+    const size_t n_clips = (waveform.size() + clip - 1) / clip;
 
-        const std::vector<int32_t> ids = run_driver(bridge, window, language, task, timestamps, kMaxNewTokensPerClip, eos_id);
-        const std::string piece = detokenize(ids);
-        if (n_windows > 1) {
-            std::fprintf(stderr, "  window %zu/%zu [%.1fs..%.1fs]: %zu tokens\n", w + 1, n_windows,
-                         static_cast<double>(begin) / 16000.0,
-                         static_cast<double>(begin + avail) / 16000.0, ids.size());
-        }
-        transcript += piece;
+    // Timestamps are REQUESTED whenever they are usable and there is more than one window, even if the
+    // caller did not ask to see them: they are what the seek below advances on. A single-window file
+    // without `--timestamps` keeps decoding in no-timestamps mode, so short audio behaves exactly as it
+    // did -- forcing them would change its transcript for no benefit, since there is nothing to seek to.
+    const bool want_timestamps = timestamps || (can_timestamp && n_clips > 1);
+    if (n_clips > 1 && !can_timestamp) {
+        std::fprintf(stderr, "note: this model exposes no timestamp tokens, so the %zu windows are cut "
+                              "at a fixed %.0f s and each is decoded independently\n",
+                     n_clips, static_cast<double>(clip) / (sample_rate ? sample_rate : 16000));
     }
+
+    std::vector<Segment> segments;
+    size_t seek = 0;
+    while (seek < waveform.size()) {
+        const size_t avail = std::min(static_cast<size_t>(clip), waveform.size() - seek);
+        std::vector<double> window(clip, 0.0); // zero-padded: Whisper's own pad_or_trim convention
+        for (size_t i = 0; i < avail; ++i) window[i] = waveform[seek + i];
+
+        const std::vector<int32_t> ids =
+            run_driver(bridge, window, language, task, want_timestamps, kMaxNewTokensPerClip, eos_id);
+        const double window_start = static_cast<double>(seek) / (sample_rate ? sample_rate : 16000);
+
+        // How far into THIS window the model actually got. `last_complete_end` is the end of the last
+        // segment it closed with a timestamp; text after that has no closing timestamp, which is the
+        // model saying "this segment runs past the window edge".
+        double last_complete_end = -1.0;
+        const size_t before = segments.size();
+        const double rate = sample_rate ? sample_rate : 16000;
+        const double window_end = window_start + static_cast<double>(avail) / rate;
+        if (can_timestamp && want_timestamps) {
+            split_into_segments(ids, ts_base, ts_step, window_start, window_end, detokenize, segments,
+                                 last_complete_end);
+        } else {
+            segments.push_back({window_start, window_end, detokenize(ids), /*closed=*/false});
+        }
+
+        // **This is the timestamp-aware part.** Advance to where the last complete segment ended rather
+        // than by a fixed `clip`, so the next window begins on a boundary the model itself chose -- an
+        // utterance cut in half by the window edge is re-decoded whole instead of being transcribed as
+        // two fragments. Whisper's own long-form loop does exactly this.
+        //
+        // The fallback is the window edge, for the case where the model closed no segment at all -- then
+        // there is no boundary it chose and a full stride is the only honest guess.
+        //
+        // **The final window is NOT special-cased, and an earlier version of this got that wrong.** It
+        // looked reasonable to advance by the full stride once `avail < clip`, on the grounds that the
+        // rest is padding -- but `avail < clip` only means the window is not FULL, and the audio inside
+        // it is real. A model that closes at 23 s of a 20..45 s window has transcribed three seconds and
+        // stopped; seeking to 23 gives the remaining twenty-two another decode, which is exactly what
+        // re-seeking is for. Ending the loop there instead silently dropped them.
+        size_t advance = clip;
+        if (last_complete_end > window_start) {
+            // Relative to THIS window: `last_complete_end` is a whole-file time, the seek is a sample
+            // offset from the window's own start.
+            //
+            // Floored at one second, which is a guarantee of progress rather than a tuning knob: a model
+            // that closes a zero-length or 0.02 s segment on a mostly-silent window would otherwise take
+            // ~1500 iterations to cross it. Real segments are seconds long, so the floor is unreachable
+            // in the case it is not protecting against.
+            auto candidate = static_cast<size_t>((last_complete_end - window_start) * rate);
+            candidate = std::max(candidate, static_cast<size_t>(rate));
+            if (candidate <= clip) advance = candidate;
+        }
+
+        if (n_clips > 1) {
+            std::fprintf(stderr, "  window at %.2fs: %zu tokens, %zu segment(s), advancing %.2fs\n",
+                         window_start, ids.size(), segments.size() - before,
+                         static_cast<double>(advance) / rate);
+        }
+        seek += advance;
+    }
+
+    if (timestamps) {
+        for (const Segment& s : segments) {
+            std::printf("[%s --> %s] %s\n", format_time(s.start).c_str(), format_time(s.end).c_str(),
+                         s.text.c_str());
+        }
+        return;
+    }
+    std::string transcript;
+    for (const Segment& s : segments) transcript += s.text;
     std::printf("transcript: %s\n", transcript.c_str());
 }
 

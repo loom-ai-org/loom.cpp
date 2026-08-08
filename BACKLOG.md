@@ -2703,6 +2703,43 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   12,846,600 → 12,529,328 bytes, −309 KB, with `whisper_driver.cpp` the only translation unit removed.
   8 Python files, 4 C++ tests and 2 headers went with it.
 
+  **Timestamps: interpreted, and driving the chunking (2026-08-08).** `--timestamps` now prints
+  `[hh:mm:ss.mmm --> hh:mm:ss.mmm] text` segments, and the long-form loop advances by the model's own
+  segment boundaries instead of a fixed 30 s stride — the seam the naive version documented is closed.
+
+  **The finding that made it work at all: omitting `<|notimestamps|>` from the prompt does not get you
+  timestamps.** Left to itself the model *emits* that token as its first output — it outscores every
+  alternative on most audio — and then produces none. Confirmed against HF directly, which is also where
+  the fix came from: Whisper's rule is that the token after the task **must** be a timestamp, enforced in
+  HF by a logits processor. The driver does the same thing with machinery it already had — one prefill,
+  then `loom.argmax_row_range` over the timestamp block, which cannot answer with `<|notimestamps|>` or
+  with a word. On the same clip that produced no timestamps at all, it then produces
+  `<|0.00|> [Motor] <|10.00|>`, and the model has correctly noticed the real audio ends at 10 s.
+
+  That token is fed back in *and* returned, which is why `PrefillDecodeLoop` grew a third field,
+  `generated_prefix`: the model chose it, so it belongs in the loop's output even though it is also part
+  of the prompt. The host needs no per-model constants for any of this — `<|0.00|>`'s id comes from
+  `piece_to_id`, and seconds-per-timestamp is `(n_samples / sample_rate) / n_audio_ctx` off the file's
+  own KVs, which is what `sample_rate` was added to `hparams()` for.
+
+  **Two bugs worth recording, both of the same shape — a check that could not fail.**
+
+  1. `TS_HI` shipped as **0**, because `vocab_size` lives on the model config and I read it from the
+     *generation* config. The export-time cross-check that should have caught it was written as
+     `if ts_lo and ts_hi and ...`, so a zero bound skipped its own verification and the driver silently
+     stopped forcing timestamps. It is unconditional now: once a checkpoint has a `<|notimestamps|>` at
+     all, the block's width is verified against the encoder's frame count or the export fails.
+  2. The chunking loop special-cased the final window — advance a full stride once `avail < clip`,
+     "because the rest is padding". But `avail < clip` only means the window is not *full*; the audio in
+     it is real. A model that closes at 23 s of a 20..45 s window has transcribed three seconds and
+     stopped, and the guard threw the other twenty-two away. Removing it turns one window into three
+     (`20 → 23 → 26 → 45`) and the transcript covers the whole file contiguously. What replaces it is a
+     one-second floor on the advance, which is a progress guarantee rather than a tuning knob.
+
+  Still not done, and now the only piece of Whisper's long-form algorithm missing: **conditioning each
+  window on the previous window's text** (`<|startofprev|>`). Timestamps fixed *where* windows are cut;
+  this is what would give the model context across a cut.
+
   **The CLI's remaining two flags landed here too**, on the same terms as `--language`:
   `--task transcribe|translate` (resolved by text, so a bogus one names the two Whisper has and says an
   English-only checkpoint has neither) and `--timestamps`, which omits `<|notimestamps|>` from the
