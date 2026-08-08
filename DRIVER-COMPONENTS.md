@@ -60,7 +60,7 @@ Three builders exist:
 | `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 9 | hf-causal-lm, lfm2-monolithic, qwen3, whisper |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 10 | hf-causal-lm, lfm2-monolithic, qwen3, whisper |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
 | `export_constants` | `ExportConstants` | statements | 0 | 1 | kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |

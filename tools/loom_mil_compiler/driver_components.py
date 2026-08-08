@@ -482,6 +482,12 @@ class PrefillDecodeLoop(DriverComponent):
     # checkpoint-dependent prefix, with a language the driver may have had to detect -- in which case
     # this names that local and the caller never sees a token prefix at all (BACKLOG.md P4.1 follow-up).
     prompt: object = None
+    # Tokens an earlier component already obtained from the model, which the loop's output starts from
+    # rather than an empty array. Whisper's is the case: when timestamps are asked for, the token after
+    # the task must be a timestamp, so the driver picks that one itself with a restricted argmax --
+    # the model produced it, so it belongs in what the loop returns, even though it is also fed back in
+    # as part of the prompt (BACKLOG.md P4.1).
+    generated_prefix: object = None
 
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
@@ -515,6 +521,8 @@ class PrefillDecodeLoop(DriverComponent):
             "driver_ir.validate resolves over the assembled function -- a name nothing binds fails the "
             "export rather than reading nil at run time."
         ),
+        "generated_prefix": Unchecked("same -- an expression over an earlier component's local, "
+                                       "resolved by driver_ir.validate"),
         "default_max_new_tokens": Unchecked(
             "a default for a caller-supplied argument, not a claim about the model. Nothing in the "
             "checkpoint could disagree with it."
@@ -554,7 +562,8 @@ class PrefillDecodeLoop(DriverComponent):
         max_new = "_max_new_tokens"
         eos = "_eos_token"
         return [
-            Local(self.generated_var, ArrayLit([])),
+            Local(self.generated_var,
+                  self.generated_prefix if self.generated_prefix is not None else ArrayLit([])),
             Local(self.step_var,
                   self.prompt if self.prompt is not None
                   else FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),

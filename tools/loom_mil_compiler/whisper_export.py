@@ -139,7 +139,7 @@ def causal_mask(seq_len: int) -> torch.Tensor:
     return mask.view(1, 1, seq_len, seq_len)
 
 
-def decoder_prompt_constants(generation_config) -> dict:
+def decoder_prompt_constants(generation_config, n_audio_ctx: int, vocab_size: int) -> dict:
     """The token ids a Whisper decode prompt is built from, read off the checkpoint's own generation
     config -- for the DRIVER to build the prompt with, not for a host to hardcode.
 
@@ -172,13 +172,36 @@ def decoder_prompt_constants(generation_config) -> dict:
             f"{lang_lo}..{lang_hi - 1} spans {lang_hi - lang_lo} ids. Language detection is a single "
             f"argmax restricted to that window, which is only sound while every id in it is a language."
         )
+    # The timestamp block: Whisper lays it out immediately above `<|notimestamps|>` and runs it to the
+    # end of the vocabulary, one token per encoder frame plus one for the closing edge (`<|0.00|>` ..
+    # `<|30.00|>` in 0.02 s steps = n_audio_ctx + 1 of them). Derived from that layout rather than by
+    # looking tokens up by name, and then CHECKED against the model's own frame count -- a driver takes a
+    # timestamp-restricted argmax over this window, so a wrong bound would silently return a word.
+    no_timestamps = int(getattr(generation_config, "no_timestamps_token_id", None) or 0)
+    ts_lo = ts_hi = 0
+    if no_timestamps:
+        ts_lo, ts_hi = no_timestamps + 1, int(vocab_size)
+        # Unconditional once the checkpoint has a `<|notimestamps|>` at all -- a guarded version of this
+        # check is what let `TS_HI = 0` ship once: `vocab_size` is on the model config, not the
+        # generation config, so reading it from the wrong object produced a zero, the guard skipped
+        # itself, and the driver silently stopped forcing timestamps. A bound this arithmetic depends on
+        # gets verified or the export fails; it does not get defaulted.
+        if ts_hi - ts_lo != n_audio_ctx + 1:
+            raise ValueError(
+                f"this checkpoint's timestamp block is {ts_hi - ts_lo} tokens ({ts_lo}..{ts_hi - 1}), but "
+                f"its encoder emits {n_audio_ctx} frames, which should give {n_audio_ctx + 1} timestamps "
+                f"(one per frame boundary). The bounds come from `no_timestamps_token_id` + 1 and "
+                f"`vocab_size`, so one of those is not what this family assumes."
+            )
     return {
         "SOT": int(generation_config.decoder_start_token_id),
         "LANG_LO": lang_lo,
         "LANG_HI": lang_hi,
         "TRANSCRIBE": int(task_to_id.get("transcribe", 0)),
         "TRANSLATE": int(task_to_id.get("translate", 0)),
-        "NO_TIMESTAMPS": int(getattr(generation_config, "no_timestamps_token_id", None) or 0),
+        "NO_TIMESTAMPS": no_timestamps,
+        "TS_LO": ts_lo,
+        "TS_HI": ts_hi,
     }
 
 
@@ -223,6 +246,7 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
     # extractor are both in hand. Declared as fields rather than recomputed because the driver
     # components and `hparams()` need them after the trace.
     n_samples: Optional[int] = field(default=None, init=False, repr=False)
+    sample_rate: Optional[int] = field(default=None, init=False, repr=False)
     n_audio_ctx: Optional[int] = field(default=None, init=False, repr=False)
     d_model: Optional[int] = field(default=None, init=False, repr=False)
     max_target_positions: Optional[int] = field(default=None, init=False, repr=False)
@@ -246,6 +270,7 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                                    "shape did not need a fourth one"),
         "n_samples": Unchecked("READ off the checkpoint's own feature extractor in phases() "
                                "(`chunk_length * sampling_rate`), not declared"),
+        "sample_rate": Unchecked("same -- the feature extractor's own `sampling_rate`"),
         "n_audio_ctx": Unchecked("same -- `config.max_source_positions`"),
         "d_model": Unchecked("same -- `config.d_model`"),
         "max_target_positions": Unchecked("same -- `config.max_target_positions`, which is the KV "
@@ -289,10 +314,11 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         extractor = load_feature_extractor(self.model_dir)
         cfg = model.config
         self.n_samples = int(extractor.n_samples)
+        self.sample_rate = int(extractor.sampling_rate)
         self.n_audio_ctx = int(cfg.max_source_positions)
         self.d_model = int(cfg.d_model)
         self.max_target_positions = int(cfg.max_target_positions)
-        self.prompt_constants = decoder_prompt_constants(model.generation_config)
+        self.prompt_constants = decoder_prompt_constants(model.generation_config, self.n_audio_ctx, cfg.vocab_size)
 
         mel = WhisperMelFrontend(extractor.n_fft, extractor.hop_length, np.array(extractor.mel_filters))
 
@@ -353,11 +379,18 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         existed for the bespoke path, that number lived in a C++ test header
         (`test_e2e_whisper_lua_driver.cpp` sizes its input from a hardcoded `WhisperConfig`), which is
         precisely the "self-contained GGUF" claim being false (P4.0.8's first follow-up).
+
+        `sample_rate` is here for two host jobs, both of which are otherwise a guess: the audio has to be
+        resampled to it before `waveform` means anything, and a **timestamp token** has to be turned into
+        a time. Whisper's timestamp tokens step by one encoder frame, so that step is
+        `(n_samples / sample_rate) / n_audio_ctx` -- 0.02 s -- and a host that had to hardcode either
+        number would be carrying a per-model constant, which is what these KVs exist to stop.
         """
         return {
             "n_samples": self.n_samples,
             "n_audio_ctx": self.n_audio_ctx,
             "n_text_ctx": self.max_target_positions,
+            "sample_rate": self.sample_rate,
         }
 
     def backend_kwargs(self) -> dict:
@@ -408,8 +441,8 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             LuaFragment(
                 self.driver_script_path / "01_prompt.lua",
-                reads=("SOT", "LANG_LO", "LANG_HI", "TRANSCRIBE", "NO_TIMESTAMPS"),
-                defines=("_prompt", "_language"),
+                reads=("SOT", "LANG_LO", "LANG_HI", "TRANSCRIBE", "NO_TIMESTAMPS", "TS_LO", "TS_HI"),
+                defines=("_prompt", "_language", "_gen0"),
             ),
             PrefillDecodeLoop(
                 topology="decoder",
@@ -422,6 +455,9 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 # The prefix the fragment above built, not `inputs.tokens`: this driver owns its own
                 # prompt, so a caller passes audio and at most a language.
                 prompt=Var("_prompt"),
+                # The forced opening timestamp, when there is one: the model chose it, so
+                # it is part of what this call generated even though it is fed back in.
+                generated_prefix=Var("_gen0"),
             ),
         ]
 
