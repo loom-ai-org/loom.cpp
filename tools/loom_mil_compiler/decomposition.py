@@ -233,6 +233,7 @@ class MultiPhase(Decomposition):
         checker.check(config)
         phase_topologies = {}
         named_weights = []
+        traced_programs = []
         phases = config.phases()
         # Every phase's axis declarations, checked before the first (slow) trace: an axis name outside
         # axes.py's vocabulary, or a declared_axes entry naming an input this phase does not declare.
@@ -258,22 +259,44 @@ class MultiPhase(Decomposition):
             )
             exporter = LoomGGUFExporter(
                 mil_prog, root_axis=phase.root_axis, declared_axes=phase.declared_axes,
+                # Per-phase, not per-export: an encoder-decoder model caches its decoder's attention
+                # and must not cache its encoder's. See ExportPhase.fuse_attention.
+                fuse_attention=phase.fuse_attention, kv_cache_size=phase.kv_cache_size,
             )
             main_func = mil_prog.functions["main"]
             topo = exporter.generate_graph_topology(main_func, phase.name)
             print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
             phase_topologies[phase.name] = topo
             named_weights.append((phase.name, exporter.weights))
+            # The converted program, so the output exporter can read this phase's fused nodes back --
+            # its own `program` is None, and the cache geometry lives only in the graph. Kept for every
+            # phase rather than only the fused ones: `_fused_ops` asks the question, and a list that
+            # depends on the answer would have to be rebuilt the day a second geometry is added.
+            traced_programs.append(mil_prog)
 
+        # A cached phase's capacity reaches the writer from the phase that declared it, not from a
+        # second `backend_kwargs()` entry a family would have to keep in step: `_kv_cache_geometry`
+        # counts the fused nodes and needs the capacity beside them, and `ExportPhase.kv_cache_size` is
+        # already the one place it is stated.
+        capacities = {phase.kv_cache_size for phase in phases
+                      if getattr(phase, "fuse_attention", False) and phase.kv_cache_size is not None}
+        if len(capacities) > 1:
+            raise ValueError(
+                f"phases declare different kv_cache_size values ({sorted(capacities)}). One KvCache is "
+                "allocated for the whole model, so the phases that share it must agree on its capacity."
+            )
         # `backend_kwargs()` reaches the OUTPUT exporter, not just the per-phase ones -- which is where
         # anything about the artifact as a whole belongs (the tokenizer vocab, notably). It was dropped
         # entirely before, so a multi-phase family had no way to say anything about its own GGUF.
+        out_kwargs = dict(config.backend_kwargs())
+        if capacities:
+            out_kwargs["kv_cache_size"] = capacities.pop()
         out_exporter = LoomGGUFExporter(
-            None, output_path=config.output_path, architecture=config.architecture,
-            **config.backend_kwargs(),
+            None, output_path=config.output_path, architecture=config.architecture, **out_kwargs,
         )
         out_exporter.topologies = phase_topologies
         out_exporter.weights = merge_phase_weights(named_weights)
+        out_exporter.phase_programs = traced_programs
 
         # Every check this used to route through `render_driver` now runs inside the builder, over the
         # same `checker` (P4.0.18): a `FlowMatchingSpec` reaches it as `FlowMatchingSampler.sub_specs`,

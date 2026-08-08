@@ -136,6 +136,11 @@ class LoomGGUFExporter:
         self.kwargs = kwargs
         self.weights = {}
         self.topologies = {}
+        # The traced programs behind `topologies` when this exporter has no `program` of its own -- the
+        # multi-phase case, where each phase was converted by its own exporter and only the finished
+        # topologies were handed over. Set by `decomposition.MultiPhase`; read by `_fused_ops`, which is
+        # how a KV-cached phase's cache geometry still reaches the GGUF. Empty for every other path.
+        self.phase_programs = []
         # {declared input name: window}, filled by `_route_windowed_masks` as each topology is
         # generated and read by the driver assembly, which is what turns a synthesized mask input into
         # a `loom.causal_mask(n_tokens, n_past, window)` call (BACKLOG.md P4.0.11a).
@@ -2206,6 +2211,23 @@ class LoomGGUFExporter:
         live.reverse()
         return live
 
+    def _fused_ops(self, op_type: str):
+        """Every op of `op_type` in the program(s) this GGUF is being written from.
+
+        Usually that is `self.program` -- one traced graph, whether flattened or bespoke. A
+        **multi-phase** export has no program of its own (`MultiPhase` builds each phase's topology with
+        its own exporter and hands this one the finished topologies), so it sets `phase_programs`
+        instead, and both geometries below then read the fused nodes from the phases that produced them.
+        Without that, a multi-phase export with a KV-cached phase writes no cache geometry at all and the
+        artifact is unloadable -- which is exactly what the first Whisper export did (BACKLOG.md P4.1).
+        """
+        programs = [self.program] if self.program is not None else list(self.phase_programs)
+        for program in programs:
+            for func in getattr(program, "functions", {}).values():
+                for op in func.operations:
+                    if op.op_type == op_type:
+                        yield op
+
     def _kv_cache_geometry(self) -> dict:
         """The five facts `loom::make_kv_cache` needs, read off the fused ATTENTION nodes themselves --
         or `{}` when this export produced none (KV-CACHE.md 2.2b).
@@ -2224,24 +2246,21 @@ class LoomGGUFExporter:
         """
         n_head_kv = head_dim_k = head_dim_v = None
         n_blocks = 0
-        for func in getattr(self.program, "functions", {}).values():
-            for op in func.operations:
-                if op.op_type != "loom_fused_attention":
-                    continue
-                n_blocks += 1
-                k_shape, v_shape = list(op.inputs["k"].shape), list(op.inputs["v"].shape)
-                geom = (int(k_shape[1]), int(k_shape[3]), int(v_shape[3]))
-                if n_head_kv is None:
-                    n_head_kv, head_dim_k, head_dim_v = geom
-                elif geom != (n_head_kv, head_dim_k, head_dim_v):
-                    # One cache is allocated for the whole model with one width per layer, so a model
-                    # whose blocks disagree cannot be served by it. Better to say so than to write the
-                    # first block's geometry and corrupt the rest.
-                    raise NotImplementedError(
-                        f"loom_fused_attention op '{op.name}' has K/V geometry {geom}, but an earlier "
-                        f"block declared {(n_head_kv, head_dim_k, head_dim_v)}. A KvCache is allocated "
-                        "with ONE per-layer width, so per-block variation is unsupported."
-                    )
+        for op in self._fused_ops("loom_fused_attention"):
+            n_blocks += 1
+            k_shape, v_shape = list(op.inputs["k"].shape), list(op.inputs["v"].shape)
+            geom = (int(k_shape[1]), int(k_shape[3]), int(v_shape[3]))
+            if n_head_kv is None:
+                n_head_kv, head_dim_k, head_dim_v = geom
+            elif geom != (n_head_kv, head_dim_k, head_dim_v):
+                # One cache is allocated for the whole model with one width per layer, so a model
+                # whose blocks disagree cannot be served by it. Better to say so than to write the
+                # first block's geometry and corrupt the rest.
+                raise NotImplementedError(
+                    f"loom_fused_attention op '{op.name}' has K/V geometry {geom}, but an earlier "
+                    f"block declared {(n_head_kv, head_dim_k, head_dim_v)}. A KvCache is allocated "
+                    "with ONE per-layer width, so per-block variation is unsupported."
+                )
         if not n_blocks:
             return {}
 
@@ -2277,24 +2296,21 @@ class LoomGGUFExporter:
         """
         n_state = n_embd_conv = None
         n_blocks = 0
-        for func in getattr(self.program, "functions", {}).values():
-            for op in func.operations:
-                if op.op_type != "loom_short_conv":
-                    continue
-                n_blocks += 1
-                # MIL x is [batch, channels, seq]; weight is [channels, 1, kernel].
-                geom = (int(op.inputs["weight"].shape[-1]) - 1, int(op.inputs["x"].shape[1]))
-                if n_state is None:
-                    n_state, n_embd_conv = geom
-                elif geom != (n_state, n_embd_conv):
-                    # One store is allocated for the whole model with one slot shape, so blocks that
-                    # disagree cannot be served by it -- say so rather than write the first block's
-                    # geometry and corrupt the rest.
-                    raise NotImplementedError(
-                        f"loom_short_conv op '{op.name}' has geometry {geom} (kernel-1, channels), but "
-                        f"an earlier block declared {(n_state, n_embd_conv)}. A ConvStateCache is "
-                        "allocated with ONE slot shape, so per-block variation is unsupported."
-                    )
+        for op in self._fused_ops("loom_short_conv"):
+            n_blocks += 1
+            # MIL x is [batch, channels, seq]; weight is [channels, 1, kernel].
+            geom = (int(op.inputs["weight"].shape[-1]) - 1, int(op.inputs["x"].shape[1]))
+            if n_state is None:
+                n_state, n_embd_conv = geom
+            elif geom != (n_state, n_embd_conv):
+                # One store is allocated for the whole model with one slot shape, so blocks that
+                # disagree cannot be served by it -- say so rather than write the first block's
+                # geometry and corrupt the rest.
+                raise NotImplementedError(
+                    f"loom_short_conv op '{op.name}' has geometry {geom} (kernel-1, channels), but "
+                    f"an earlier block declared {(n_state, n_embd_conv)}. A ConvStateCache is "
+                    "allocated with ONE slot shape, so per-block variation is unsupported."
+                )
         if not n_blocks:
             return {}
         return {

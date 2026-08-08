@@ -208,6 +208,17 @@ order) and `scale` (the constant folded onto q, else 1.0). Absorb the trailing `
 the op's declared output is `[batch, seq, n_head*head_dim]` — matching what `op_attention` actually
 returns, rather than q's shape.
 
+**2.1b — where the fused node is inserted, found much later (BACKLOG.md P4.1, 2026-08-08).** The
+implementation anchored it at the QK matmul, the first op being subsumed, which silently assumes V is
+projected *before* Q@K^T. True of every trace this pass was written against (Qwen3, LFM2, a 2-layer
+Llama) and **false of HF's Whisper decoder**, where `value_states` is traced four ops after the matmul.
+The op then reads a var defined later — an SSA violation `mb` does not reject and
+`try_replace_uses_of_var_after_op` does not notice — surfacing one pass later as
+`dead_code_elimination` judging the V transpose dead and raising `Cannot delete op ... with active
+output`. `_insertion_anchor` now takes the earliest position in the subsumed chain that already follows
+every operand's definition, which is the old anchor wherever the old anchor was sound: qwen3 and
+LFM2-monolithic re-export byte-identically.
+
 **2.2 — the topology rule.** Lower `loom_fused_attention` to an `ATTENTION` node, transposing q/k/v into
 the engine's `[head_dim, n_head, n_tokens]` layout (`convert_qwen3.py:76-78` is the reference).
 
@@ -220,6 +231,12 @@ model. `_kv_cache_geometry()` reads the five facts off the fused nodes themselve
 them; `test_e2e_lfm2_mil_export.cpp` and `tools/loom_cli` allocate from them exactly as the whisper test
 does. Read from the graph rather than the config for the same reason `uses_kv_cache()` is derived: the
 slot count must equal the ATTENTION-block count, and only the graph knows what the fusion produced.
+
+*The same gap existed one decomposition over, and stayed open until P4.1: it read `self.program`, which a
+`MultiPhase` export does not have — each phase is converted by its own exporter and only the finished
+topologies reach the writer — so a multi-phase GGUF with a cached phase declared no geometry at all and
+was unloadable for exactly the reason above. `phase_programs` + `_fused_ops()` is now the one
+enumeration both this and `_conv_state_geometry` read from.*
 
 **This is where the occurrence-order decision paid off, measured:** LFM2-350M declares
 `num_hidden_layers: 16` but has only **6 attention blocks** — the other ten are conv. The fusion emits 6
