@@ -159,10 +159,13 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "The `infer_with_past` generation loop: prefill, then decode one token at a time against "
             "the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a "
             "decode loop, because a cached ATTENTION node makes the prefill its first iteration. "
-            "**The `used by` column over-states this one**, and it is the only entry where that is "
-            "true: it is a field of every flattened causal-LM builder, but the exporter sets it only "
-            "for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten "
-            "ShortConv layers are not, so it carries the field and exports `infer` alone.",
+            "**The `used by` column over-states this one for the causal LMs**, and it is the only "
+            "entry where that is true: it is a field of every flattened causal-LM builder, but the "
+            "exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. "
+            "LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports "
+            "`infer` alone. Whisper is not in that caveat: its family declares this component "
+            "outright, with `bound` supplying the encoder's output to every step, which is what makes "
+            "the same loop a cross-attention decode loop (BACKLOG.md P4.1).",
         ),
         ComponentEntry(
             "ctc_greedy_epilogue", CtcGreedyEpilogue, (STATEMENTS,),

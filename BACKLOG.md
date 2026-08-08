@@ -2524,8 +2524,117 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
 
 #### P4 — flagship coverage
 
-- **P4.1 — Whisper.** The only flagship with no MIL export, the project's own reference model, and a
-  prerequisite for ~10 models in family 3. First family born inside the registry.
+- **P4.1 — Whisper — DONE (2026-08-08).** The only flagship with no MIL export, the project's own
+  reference model, and a prerequisite for ~10 models in family 3. First family born inside the registry.
+
+  `tools/loom_mil_compiler/whisper_export.py` + `whisper_driver/00_header.lua`. Two phases —
+  `encoder` (457 nodes) and `decoder` (740 nodes, 12 cached `ATTENTION` blocks) — one GGUF, and a
+  generated driver that is the encoder once followed by `PrefillDecodeLoop`. Registered as
+  `automatic-speech-recognition/whisper` against a real `model_type == "whisper"` check, so
+  `loom-export <dir> -o whisper_mil.gguf` needs no `--task`/`--model`.
+
+  **The reusable half, which is what the roadmap actually asked for** (`EXPORT-ROADMAP.md`: "deliver the
+  cross-attention decoder loop as the reusable half: it is also all family 6 needs"). It is
+  `PrefillDecodeLoop.bound` — `{input name: IR expression}` for a step input that is neither
+  host-computed from `n_tokens`/`n_past` nor the step's own tokens. That single field is the whole
+  difference between a causal-LM decode loop and a cross-attention one, because nothing else about the
+  loop changes: a Whisper step is the same cached call at `n_tokens = 1`, with `xa` bound to the
+  encoder's single run. A family-6 text encoder-decoder needs the same field and no new component.
+
+  **Finding — decision 2's fourth `Decomposition` is not needed, and building it is what showed why.**
+  `EXPORT-PREPARATION.md` §5 decision 2 reserved a `Decomposition` of its own for this shape, reasoning
+  that a new orchestration needs a driver builder the family cannot supply. The orchestration turned out
+  to be the one `MultiPhase` already has: N independently traced phases, a component list, and
+  `MultiPhaseDriverBuilder`. What genuinely differs is **two facts**, and each is now a field on the
+  piece that owns it — `ExportPhase.fuse_attention` (per PHASE, because this decoder must be cached and
+  this encoder, from the same checkpoint in the same GGUF, must not) and `PrefillDecodeLoop.bound`. A
+  `Decomposition` subclass would have restated `MultiPhase.export` verbatim around those two, which is
+  the "declare only what genuinely varies" rule the other three templates are built on.
+
+  **Finding — cross-attention is deliberately NOT fused, and that is correct rather than a miss.**
+  `fuse_loom_attention` anchors on the `add(scores, mask)` only a masked block has, and Whisper's
+  cross-attention has no mask at all. So the pass fuses exactly the 12 self-attention blocks and leaves
+  12 `SOFTMAX`-shaped cross-attention blocks expanded. Fusing them would be wrong twice over: the K/V
+  would be the encoder's, identical at every step, and `layer` indices are assigned in dense occurrence
+  order, so cached cross-attention blocks would consume the slots the self-attention blocks address.
+  What it costs is that cross-attention K/V are recomputed per step — the same thing
+  `convert_whisper_decoder.py` did with `kv_cache=false`, so this is parity and not a regression.
+  A `cross_kv_cache` that projects once from `xa` is the real optimization, and it needs an engine-side
+  cache kind that is filled once rather than appended per step; filed under Engine, not done here.
+
+  **Four holes this item found and closed, each one a place a multi-phase export could not say
+  something a single-graph export could:**
+
+  1. **A multi-phase GGUF wrote no KV-cache geometry at all.** `_kv_cache_geometry` walks
+     `self.program`, and `MultiPhase`'s output exporter has none — each phase was converted by its own
+     exporter and only the finished topologies were handed over. The artifact was therefore unloadable:
+     `ATTENTION` nodes with `kv_cache=true` and no `loom.n_layer`/`n_head_kv`/`kv_cache_size` for
+     `make_kv_cache` to read. `LoomGGUFExporter.phase_programs` + `_fused_ops()` is one enumeration both
+     geometries (KV and conv-state) now read from, and the capacity travels from the phase that declared
+     it rather than from a second `backend_kwargs()` entry that could disagree.
+  2. **`MultiPhaseDriverBuilder.called_topologies` was keyed on `isinstance`**, so a `PrefillDecodeLoop`
+     — which declares `topology` as a `TopologyName` exactly like `SubgraphCallComponent` — was invisible
+     to it, and the export log reported Whisper's decoder as "a topology no call site names". It now
+     reads the components' own declared links, so a new component is counted the day it declares one.
+  3. **The encoder output would have crossed the Lua boundary.** 1.15M floats for whisper-small, read
+     once per generated token. `SubgraphCallComponent.retain` + an `OutputRef` binding makes it a
+     backend-side tensor copy, which is exactly what P4.0.12 built `OutputStore` for; the driver now
+     marshals nothing but token ids.
+  4. **Two MIL ops had no ggml mapping**, both from the mel frontend: `clip` (MIL's spelling of
+     `torch.clamp`, whose bounds are `alpha`/`beta` INPUTS, so the generic path would have dropped them
+     — `OP_MAP`'s existing `"clamp"` entry names an op the torch frontend never emits) and `reduce_max`.
+     The latter is composed as `RESHAPE` to one row + `POOL_1D(max)` spanning it, the same reduction
+     `convert_whisper_encoder.py` hand-wrote, and only for a *global* maximum over statically-sized axes
+     — a per-axis maximum is rejected by name rather than approximated.
+
+  **The mel frontend is in the exported graph.** HF's `WhisperEncoder` starts at `input_features`;
+  `WhisperMelFrontend` reimplements `WhisperFeatureExtractor._torch_extract_fbank_features` as a
+  traceable module (bit-identical to the extractor — `max abs diff 0.0` — with the checkpoint's own
+  `mel_filters`), so the exported model takes a **waveform**. Two things a change here must not lose:
+  the input is `(1, n_samples)` because a 1-D one makes `torch.stft` trace an `aten::size`/`aten::Int`
+  chain, and the magnitude is taken **before** the final-frame slice, because coremltools' complex
+  dialect has no `slice_by_index` over a complex tensor.
+
+  **Finding — this task's declared base config class was already false, for Parakeet, and nothing could
+  tell.** `tasks.py` declared `automatic-speech-recognition` as building
+  `ASRNemoEncoderExportConfig`, but `_build_parakeet_tdt`/`_build_parakeet_rnnt` have returned
+  `ASRParakeetExportConfig` (a `BaseMultiPhaseModelExportConfig`) since P4.0.17 step 2. `register()`
+  checks the *entry's* `config_class` and nothing checks what a recognizer's `build_config` actually
+  returns, so the declaration was never contradicted. Whisper is a third shape again, so the task's base
+  is now `LoomExportConfig` — the honest answer for an I/O-contract task whose families genuinely do not
+  share an export shape. **Making the check bite again means moving `config_class` onto the
+  `ModelRecognizer`**, where the build happens; not done here, because it touches every family and is
+  not Whisper's job.
+
+  **Verification.** `tests/test_e2e_whisper_mil_export.cpp` against HF's own
+  `WhisperForConditionalGeneration` (`tools/fixture_gen/reference_forward_whisper_mil.py`), on 30 s of
+  deterministic noise — harder than speech, which collapses greedy decoding onto a few high-confidence
+  tokens where a wrong logit rarely moves the argmax:
+
+  | check | result |
+  |---|---|
+  | `encoder` topology (mel frontend included) vs HF's encoder | `max_abs_diff = 0.0132` against a reference whose own absmax is 29.86 — 4.4e-4 relative; `mean_abs_diff = 9.3e-06` |
+  | the whole driver — encoder, prefill, cached decode loop, greedy argmax — vs HF | **exact**: `522 8002 45981 8 50257`, including stopping on eos |
+  | nothing in the test names a per-model C++ struct | `uses_kv_cache()`, `make_kv_cache(*model)` and `loom.n_samples` are all read from the artifact |
+  | qwen3-0.6b-base, lfm2-350m-monolithic re-exported after the `fuse_loom_attention` fix | byte-identical by snapshot diff |
+  | the Python suite | 481 passed |
+
+  **Also not done: `loom-cli --wav` on Whisper.** `run_asr` was model-agnostic and now registers a KV
+  cache for any cached phase (it did not, so a cached ASR model could not run through that path at all —
+  a plain bug this item found). What still stops Whisper is the call itself: its driver takes `waveform`
+  at exactly `loom.n_samples` plus `tokens`, the forced decoder prefix, where `run_asr` passes
+  `waveform`/`length`. Both halves are host *decisions* rather than missing capability — pad-or-trim to
+  the file's own `loom.n_samples`, and choose a prefix, which is a language and timestamp choice a CLI
+  should expose rather than guess.
+
+  **What is NOT done, and its exact blocker.** R6 retirement of `tools/convert_whisper/` and
+  `src/core/whisper_driver.cpp` (P4.0.8 listed Whisper as the one family blocked on this item). The
+  policy is that a bespoke converter dies in the commit that re-points the last test consuming it, and
+  the four `test_e2e_whisper_*` tests are all fixtured on `whisper-tiny`, which on this machine is an
+  **OpenAI `.pt`** (`tiny.en.pt`, a `{"dims", "model_state_dict"}` dict) while this family loads an HF
+  directory. Re-pointing them therefore needs either an OpenAI-checkpoint loader on the recognizer (P4.2's
+  question, one model early) or whisper-tiny in HF form. The MIL export exists and is verified against a
+  *different* checkpoint, which is what unblocks the retirement, not what performs it.
 - **P4.2 — GigaAM v3.** Graph is family 1 (already exported); the point is the *second loader*
   (`gigaam.load_model` / `AutoModel.from_pretrained(..., trust_remote_code=True)` instead of
   `ASRModel.restore_from`), which is what proves P3.2's loader/template split. Check first whether the

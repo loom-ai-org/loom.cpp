@@ -1051,3 +1051,12 @@ add_executable(test_e2e_lfm2_q8_0 test_e2e_lfm2_q8_0.cpp)
 target_link_libraries(test_e2e_lfm2_q8_0 PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_q8_0 COMMAND test_e2e_lfm2_q8_0)
 set_tests_properties(test_e2e_lfm2_q8_0 PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: the MIL-compiler-exported Whisper (tools/loom_mil_compiler/whisper_export.py,
+#     BACKLOG.md P4.1) against HF's own WhisperForConditionalGeneration -- the encoder half (which
+#     includes the in-graph mel frontend) numerically, and the generated Lua driver's whole
+#     encoder-then-cached-decode-loop as an exact token sequence. See test_e2e_whisper_mil_export.cpp. ---
+add_executable(test_e2e_whisper_mil_export test_e2e_whisper_mil_export.cpp)
+target_link_libraries(test_e2e_whisper_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_whisper_mil_export COMMAND test_e2e_whisper_mil_export)
+set_tests_properties(test_e2e_whisper_mil_export PROPERTIES SKIP_RETURN_CODE 77)

@@ -443,6 +443,17 @@ changes something concrete in §3, noted with the answer.
    loop-carried-state design. The KV-cache gap in §4 becomes that decomposition's problem, in P4.1 —
    **but see §4's measured note: it is blocked on a MIL attention-fusion pass that does not exist yet,
    and no amount of driver work substitutes for it.**
+
+   **Outcome (2026-08-08, BACKLOG.md P4.1): the blocker cleared and the decomposition was not needed.**
+   `fuse_loom_attention` exists (KV-CACHE.md stage 2), so the prerequisite this decision was written
+   around is gone. Building the shape on Whisper then found that the orchestration is `MultiPhase`'s
+   already — N traced phases, a component list, `MultiPhaseDriverBuilder` — and that exactly two facts
+   differ, each now a field on the piece that owns it: `ExportPhase.fuse_attention` (per phase, because
+   an encoder-decoder caches one half and must not cache the other) and `PrefillDecodeLoop.bound` (the
+   step input supplied by an earlier phase rather than by the caller). The `Decomposition.driver_builder`
+   hook this decision added to P4.0.6 is still right and still used; what did not materialize is a
+   fourth `Decomposition` to hang off it, which would have restated `MultiPhase.export` around two
+   fields.
 3. **The TTS task splits now: `text-to-speech` + `audio-codec`.** **Consequence:** `audio-codec` is a
    *reserved* name with no family registered against it yet, which is only meaningful if the vocabulary
    is a real, checked list — so P4.0.4 grows a `tasks.py` declaring the canonical names (and each task's

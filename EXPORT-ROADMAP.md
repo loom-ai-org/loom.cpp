@@ -283,7 +283,7 @@ not enough to cost a template, which is P4's job per family.
 | # | family | representative members | conv. | models | the connector it needs | Loom status |
 |---|---|---|---|---|---|---|
 | 1 | **Conformer/FastConformer encoders** + CTC / TDT / RNNT heads | parakeet ×6, reazonspeech, `stt_*_fastconformer_ctc_*` ×4, canary-ctc, nemotron-streaming, **GigaAM v3 ×4** | 4 | ~13 (+4) | CTC head (done) / TDT / RNNT decode loop (host-side) | **mostly done** — `NeMoASREncoderSpec`; GigaAM needs a second loader (below) |
-| 2 | **Audio encoder + AR cross-attention decoder** (AED) | whisper (all sizes), distil-whisper, tiron, canary, cohere-asr ×2, firered-asr, firered-lid, moonshine ×3, moonshine-streaming, whisper-vad | 8 | ~12 | **cross-attention decoder loop with KV cache** — shared with family 6 | bespoke only — **no MIL export at all** |
+| 2 | **Audio encoder + AR cross-attention decoder** (AED) | whisper (all sizes), distil-whisper, tiron, canary, cohere-asr ×2, firered-asr, firered-lid, moonshine ×3, moonshine-streaming, whisper-vad | 8 | ~12 | **cross-attention decoder loop with KV cache** — shared with family 6 | **whisper done** (P4.1): the connector is `PrefillDecodeLoop.bound`, one field, and family 6 needs no more than it |
 | 3 | **Speech-LLM adapters** (audio encoder → projector → causal LM) | voxtral, voxtral4b, qwen3-asr ×4, glm-asr, granite ×7, gemma4 ×2, higgs-stt, mimo-asr, canary-qwen, omniasr-llm ×2, moss ×3, vibevoice ×2, ark-asr, lfm2-audio ×2, mini-omni2, kyutai-stt ×2, funasr ×2 | 19 | **~36** | **a projector** (linear / 4-frame stack / Q-Former / VQAdaptor / GatedMLP) + embedding-injection driver | LM half done (`ModularExportSpec`); encoder half is family 1 or 2 |
 | 4 | **CNN + transformer + CTC** | wav2vec2, data2vec, hubert, omniasr-ctc ×2, tada-aligner | 3 | ~6 | CTC head (already done for family 1) | not started; family-1-shaped |
 | 5 | **SANM / FunASR encoders** (+ CIF, + CTC) | funasr ×2, paraformer, sensevoice | 3 | ~4 | CIF predictor + NAR decoder (paraformer only) | not started |
@@ -456,7 +456,7 @@ else — and against which R3/R4 are judged:
 
 | flagship | family | state |
 |---|---|---|
-| **Whisper** | 2 | bespoke converter only; no MIL export |
+| **Whisper** | 2 | MIL export done (BACKLOG.md P4.1) — `whisper_export.py`, two phases + a generated decode loop; the bespoke converter still backs the whisper-tiny tests (R6 blocker recorded there) |
 | **NeMo ASR** (Conformer-CTC, Parakeet TDT/RNNT) | 1 | MIL export done, still a script per model |
 | **GigaAM v3** | 1 | never exported; gap in CrispASR too (see R5) |
 | **Qwen3** | causal LM / speech-LLM | `ModularExportSpec` done for the base LM; ASR/TTS variants not started |
