@@ -866,6 +866,35 @@ class fuse_loom_attention(AbstractGraphPass):
             return k_var, v_var
         return k_src, v_src
 
+    @staticmethod
+    def _insertion_anchor(block, chain, operands):
+        """The op in `chain` to insert the fused node before: the earliest one that already follows
+        every operand's own definition, or None if no position in the chain does.
+
+        **Not simply `chain[0]`, and Whisper is what proved it.** The QK matmul was the anchor from this
+        pass's first version, on the reasonable-looking grounds that it is the first op being subsumed.
+        That silently assumes V is projected *before* Q@K^T, which is true of the traces this pass was
+        written against (Qwen3, LFM2, a 2-layer Llama) and false of HF's Whisper decoder, where
+        `value_states` is traced four ops *after* the matmul. Anchoring there builds an op that reads a
+        var defined later -- an SSA violation `mb` does not reject and `try_replace_uses_of_var_after_op`
+        does not notice. It surfaces one pass later, as `common::dead_code_elimination` walking the block
+        in reverse, reaching the V transpose before it has seen the consumer that sits above it, judging
+        it dead, and raising `Cannot delete op 'transpose_17' with active output`.
+
+        Choosing the earliest *valid* position rather than always the last is what keeps the existing
+        exports byte-identical: wherever the old anchor was already sound, this returns it, so node order
+        in the emitted topology does not move for any model that fused before.
+        """
+        index = {id(op): i for i, op in enumerate(block.operations)}
+        # A `mask` that is a graph input (or otherwise producer-less) constrains nothing.
+        defs = [index.get(id(v.op)) for v in operands if getattr(v, "op", None) is not None]
+        last_def = max([i for i in defs if i is not None], default=-1)
+        for op in chain:
+            position = index.get(id(op))
+            if position is not None and position > last_def:
+                return op
+        return None
+
     def _try_to_transform(self, softmax_op, block) -> bool:
         axis = softmax_op.inputs.get("axis")
         if axis is None or axis.val is None or int(axis.val) not in (-1, 3):
@@ -957,11 +986,18 @@ class fuse_loom_attention(AbstractGraphPass):
         if not isinstance(q_var.shape[1], int) or not isinstance(v_var.shape[3], int):
             return False
 
+        # The subsumed chain, in block order. The fused op replaces all six, so it may be inserted at
+        # any of their positions that is still after every operand it reads -- see `_insertion_anchor`.
+        chain = [qk_op, add_op, softmax_op, av_op, transpose_op, reshape_op]
+        anchor = self._insertion_anchor(block, chain, (q_var, k_var, v_var, mask_var))
+        if anchor is None:
+            return False
+
         with _scope_ctx_like(softmax_op):
             fused = mb.loom_fused_attention(
                 q=q_var, k=k_var, v=v_var, mask=mask_var,
                 scale=np.float32(scale), layer=np.int32(self._next_layer),
-                name=out_var.name, before_op=qk_op,
+                name=out_var.name, before_op=anchor,
             )
 
         if not reshape_op.enclosing_block.try_replace_uses_of_var_after_op(

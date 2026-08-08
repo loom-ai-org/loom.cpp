@@ -342,6 +342,54 @@ class TestFuseLoomAttention(unittest.TestCase):
 
         self.assertEqual([int(op.layer.val) for op in self._fused(prog)], [0, 1, 2])
 
+    def test_a_late_value_projection_still_fuses_and_keeps_ssa_order(self):
+        """V computed AFTER Q@K^T -- HF Whisper's decoder self-attention, and the shape that found the
+        insertion-point bug (BACKEND.md P4.1). The old anchor was the QK matmul unconditionally, which
+        put the fused op above the var it reads; nothing rejected it until `dead_code_elimination` walked
+        the block in reverse and raised `Cannot delete op ... with active output`."""
+        n_head, head_dim, seq = self.N_HEAD, self.HEAD_DIM, self.SEQ
+        specs = [mb.TensorSpec(shape=(1, n_head, seq, head_dim), dtype=types.fp32) for _ in range(3)]
+        specs.append(mb.TensorSpec(shape=(1, 1, seq, seq), dtype=types.fp32))
+
+        @mb.program(input_specs=specs)
+        def prog(q, k, v_src, mask):
+            qs = mb.mul(x=q, y=np.float32(0.35355338))
+            scores = mb.matmul(x=qs, y=k, transpose_x=False, transpose_y=True)
+            scores = mb.add(x=scores, y=mask)
+            probs = mb.softmax(x=scores, axis=-1)
+            # The value projection lands here, below the matmul that the fusion used to anchor on.
+            v = mb.mul(x=v_src, y=np.float32(1.0))
+            ctx = mb.matmul(x=probs, y=v, transpose_x=False, transpose_y=False)
+            ctx = mb.transpose(x=ctx, perm=[0, 2, 1, 3])
+            return mb.reshape(x=ctx, shape=[1, seq, n_head * head_dim])
+
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+        fused = self._fused(prog)
+        self.assertEqual(len(fused), 1)
+
+        # Every operand is defined strictly above the op that reads it -- the property MIL's builder does
+        # not check and DCE relies on.
+        order = {id(op): i for i, op in enumerate(prog.functions["main"].operations)}
+        for name in ("q", "k", "v", "mask"):
+            producer = fused[0].inputs[name].op
+            if producer is not None:
+                self.assertLess(order[id(producer)], order[id(fused[0])], f"{name} is defined too late")
+        PASS_REGISTRY["common::dead_code_elimination"](prog)
+
+    def test_the_anchor_does_not_move_when_the_old_one_was_already_valid(self):
+        """The earliest *valid* chain position is chosen, not simply the last -- which is what keeps
+        every already-fusing model's node order (and therefore its exported topology) unchanged."""
+        def real_ops(p):
+            # `const`s are ignored: the fused op's own `scale`/`layer` constants are materialized at its
+            # insertion point, so counting them would measure the builder rather than the anchor.
+            return [op.op_type for op in p.functions["main"].operations if op.op_type != "const"]
+
+        prog = self._sdpa()
+        matmul_index = real_ops(prog).index("matmul")
+        PASS_REGISTRY["loom::fuse_loom_attention"](prog)
+
+        self.assertEqual(real_ops(prog)[matmul_index], "loom_fused_attention")
+
     def test_an_unscaled_block_fuses_with_scale_1(self):
         # Recovered from the graph rather than recomputed as 1/sqrt(head_dim): a model with no scale (or
         # a non-default one) must not silently acquire one that was never traced.
