@@ -36,8 +36,10 @@ class TaskSpec:
     name: str
     # What the task covers, in the terms a family author needs to decide whether theirs fits.
     summary: str
-    # `module:QualName` of the base `LoomExportConfig` subclass, relative to this package. `None` on a
-    # reserved task -- no family exists yet, so the only check possible is `LoomExportConfig` itself.
+    # `module:QualName` of the base `LoomExportConfig` subclass, relative to this package. `None` means
+    # the only check possible is `LoomExportConfig` itself, for either of two reasons: the task is
+    # *reserved*, so no family exists to have a base yet; or its registered families genuinely share no
+    # narrower one, which is the case for `automatic-speech-recognition` and is argued at that entry.
     base_config: Optional[str]
     # True while the name is declared but unclaimed: registering against it is not an error (the family
     # that claims it will), but the base class is not pinned down yet.
@@ -68,14 +70,23 @@ TASKS: Dict[str, TaskSpec] = {
         TaskSpec(
             name="automatic-speech-recognition",
             summary=(
-                "Audio-in/text-out. Today the encoder half only -- one traced encoder graph plus the "
-                "decoding the driver or the host performs (CTC, TDT, RNNT). Conformer-CTC, Parakeet-TDT, "
-                "Parakeet-RNNT."
+                "Audio-in/text-out, by any route: a traced encoder plus a CTC head (Conformer-CTC), an "
+                "encoder plus a host-side transducer decode (Parakeet-TDT/-RNNT), or an encoder plus a "
+                "KV-cached cross-attention decoder (Whisper). The task fixes the contract; the "
+                "decomposition and the driver are the family's own."
             ),
-            # NeMo-shaped today because all three registered models are NeMo checkpoints. P4.2 (GigaAM)
-            # is the item that moves the loader onto the recognizer and widens this to a loader-agnostic
-            # ASR encoder config; this line is where that change gets recorded.
-            base_config="nemo_asr_export:ASRNemoEncoderExportConfig",
+            # `LoomExportConfig`, and that is the honest answer rather than a widening for convenience
+            # (BACKLOG.md P4.1). This said `ASRNemoEncoderExportConfig` while planning to widen it in
+            # P4.2 for a *loader* reason -- but the three families already registered here build three
+            # different config classes, and two of them were never that one: `_build_parakeet_tdt` and
+            # `_build_parakeet_rnnt` return `ASRParakeetExportConfig`, a `BaseMultiPhaseModelExportConfig`.
+            # The declaration went unchallenged because `register()` checks the ENTRY's `config_class`
+            # and nothing checks what a recognizer's `build_config` actually returns. Whisper is a third
+            # shape again (two phases, one of them KV-cached), so the only true common base for this task
+            # is the root -- which is what an I/O-contract task should have when its families genuinely
+            # do not share an export shape. Making the check bite again means moving `config_class` onto
+            # the recognizer, where the build actually happens; recorded in BACKLOG.md, not done here.
+            base_config=None,
         ),
         TaskSpec(
             name="text-to-speech",

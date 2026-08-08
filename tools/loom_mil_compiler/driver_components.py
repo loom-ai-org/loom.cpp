@@ -52,7 +52,7 @@ from .driver_builder import (
 )
 from .spec_protocol import (
     TOPOLOGIES, ConfigDerived, CoveredBy, FieldRef, NestedSpec, TopologyInput, TopologyName, Unchecked,
-    WhenSet,
+    WhenSet, declared_links,
 )
 
 # Traced-model input names auto-computed by the driver (via loom.range) rather than unpacked from the
@@ -468,6 +468,15 @@ class PrefillDecodeLoop(DriverComponent):
     # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
     # byte-identical to what it was before this field existed.
     mask_windows: dict = dataclasses.field(default_factory=dict)
+    # {input name: the IR expression supplying it}, for inputs that are neither host-computed from
+    # n_tokens/n_past nor the step's own tokens -- an earlier component's output, held constant across
+    # every iteration (BACKLOG.md P4.1).
+    #
+    # **This is what makes the loop a cross-attention decode loop**, and it is one field rather than a
+    # new component because nothing else about the loop changes: a Whisper decoder step is the same
+    # cached call at `n_tokens = 1`, with `xa` bound to the encoder phase's single run. Empty for a
+    # plain causal LM, whose only input that is not host-computed IS the step's tokens.
+    bound: dict = dataclasses.field(default_factory=dict)
 
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
@@ -490,6 +499,12 @@ class PrefillDecodeLoop(DriverComponent):
             "synthesizes the windowed mask inputs in the first place -- so the exporter is the "
             "authority and there is no separate claim here for a checkpoint to disagree with."
         ),
+        "bound": Unchecked(
+            "driver_ir expressions over locals earlier components bind, exactly like "
+            "SubgraphCallComponent.length -- validate() over the assembled function is their authority. "
+            "The input NAMES they are keyed by are checked, by this component's own `inputs` link, "
+            "which is exact against the topology's real declared inputs."
+        ),
         "default_max_new_tokens": Unchecked(
             "a default for a caller-supplied argument, not a claim about the model. Nothing in the "
             "checkpoint could disagree with it."
@@ -507,7 +522,12 @@ class PrefillDecodeLoop(DriverComponent):
         `cache_position`/`attention_mask` are built once for one prefill."""
         out = {}
         for name, kind in self.bindings:
-            if kind == POSITION:
+            if name in self.bound:
+                # Checked before `kind` deliberately: an explicitly bound input wins over what its name
+                # would otherwise imply, so a model whose encoder output happens to be called
+                # `attention_mask` is still bound to the encoder rather than to loom.causal_mask.
+                out[name] = self.bound[name]
+            elif kind == POSITION:
                 out[name] = Call("loom.range", [Var(self.n_past_var), Var(self.n_tokens_var)])
             elif kind == MASK:
                 args = [Var(self.n_tokens_var), Var(self.n_past_var)]
@@ -1386,6 +1406,12 @@ class SubgraphCallComponent(DriverComponent):
     axes: Optional[dict] = None
     note: Optional[str] = None
     multiline: bool = False
+    # Keep this call's outputs in the module's own `OutputStore` instead of marshalling them into Lua
+    # tables (BACKLOG.md P4.0.12). A later call reaches them with an `OutputRef` -- a backend-side
+    # tensor copy -- so a chain edge never becomes a list of Lua doubles. Whisper's encoder is the case
+    # that needs it: its output is `n_audio_ctx * d_model` floats (1.15M for whisper-small), read once
+    # per decode step, and marshalling them would put that table through the boundary on every token.
+    retain: bool = False
 
     __links__ = {
         "topology": TopologyName(),
@@ -1407,6 +1433,12 @@ class SubgraphCallComponent(DriverComponent):
         "axes": Unchecked("an explicit axis table for the rare call that needs more than the root "
                           "axis; the names in it are checked by ExportPhase's own Axis links, which "
                           "run against the declaration that created them"),
+        "retain": Unchecked(
+            "whether this call keeps its outputs in the module's OutputStore. Not a claim about the "
+            "model at all -- and the half that IS checkable is checked where it means something: "
+            "driver_ir.check_subgraph_calls rejects an `OutputRef` naming a module no earlier call "
+            "retained, which is the failure a wrong value here would cause."
+        ),
     }
 
     def link_label(self) -> str:
@@ -1419,6 +1451,7 @@ class SubgraphCallComponent(DriverComponent):
         return _note_block(self.note) + [SubgraphCall(
             outputs=list(self.outputs), extra_outputs=list(self.extra_outputs),
             module=self.topology, axes=axes, inputs=dict(self.inputs), multiline=self.multiline,
+            retain=self.retain,
         )]
 
 
@@ -1587,8 +1620,17 @@ class MultiPhaseDriverBuilder(DriverBuilder):
         a literal parsed out of a fragment, and a computed name declared as data (D.2)."""
         names = set()
         for component in self.components():
-            if isinstance(component, SubgraphCallComponent):
-                names.add(component.topology)
+            # Any field a component declares as a `TopologyName` names a topology it runs -- read off
+            # the declaration rather than by listing the component classes that have one, so a new
+            # component is counted the day it declares its link instead of the day someone remembers to
+            # add it here. `PrefillDecodeLoop` is what proved the difference: it declares `topology`
+            # exactly like `SubgraphCallComponent` does, and an isinstance list reported Whisper's
+            # decoder as a topology no call site names.
+            for field, links in declared_links(component).items():
+                if any(isinstance(link, TopologyName) for link in links):
+                    value = getattr(component, field, None)
+                    if isinstance(value, str):
+                        names.add(value)
             if isinstance(component, FlowMatchingSampler):
                 # The estimator is called from inside the generated sampler function, not from the
                 # entry function -- a fourth kind of call site, and one that has always been checked

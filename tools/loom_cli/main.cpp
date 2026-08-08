@@ -51,6 +51,14 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
     // relative-position table host-side and drove `loom::ctc_greedy_decode` from C++. All three of
     // those were properties of the bespoke converter's artifact: the MIL export names its topologies,
     // traces the mel frontend and rel-pos attention, and carries its own decode.
+    //
+    // **Whisper does not run through here yet, and the reason is the call below, not the model.** Its
+    // driver takes `waveform` (exactly `loom.n_samples` -- 30 s, the length its encoder graph is built
+    // at) plus `tokens`, the forced decoder prefix; this passes `waveform`/`length` instead. Closing
+    // that is two host decisions rather than a missing capability: pad-or-trim to the file's own
+    // `loom.n_samples`, and pick the prefix (`<|startoftranscript|><|en|><|transcribe|>
+    // <|notimestamps|>`), which is a language and timestamp choice a CLI should expose rather than
+    // guess. See BACKLOG.md P4.1.
     auto vocab = loom::Vocab::load(model);
     if (!vocab) {
         throw loom::LoadError("--wav: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
@@ -63,8 +71,18 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
     const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
 
     loom::LoomLuaBridge bridge(backend);
+    // A topology carrying ATTENTION nodes needs a KV cache to write into, sized from the model's own
+    // declared geometry -- the same registration the generation path above already does, and missing
+    // here until an ASR family turned up with a cached phase (Whisper's decoder, BACKLOG.md P4.1).
+    // Without it `op_attention` throws and the file simply cannot be run through the ASR path.
+    std::unique_ptr<loom::KvCache> kv_cache;
     for (const std::string& name : model.topology_names()) {
-        bridge.register_module(name, model, loom::GraphTopology::parse(model.topology_json(name)));
+        loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json(name));
+        if (topo.uses_kv_cache() && kv_cache == nullptr) {
+            kv_cache = loom::make_kv_cache(model, backend);
+        }
+        loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
+        bridge.register_module(name, model, std::move(topo), cache_for_module);
     }
     bridge.load_script(model.kv_str("model.driver_script"));
 
