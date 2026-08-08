@@ -5,10 +5,10 @@
 // "Lean" is the architecture's stated goal, not a description of this file's length -- the engine
 // targets edge devices and all model-specific complexity belongs in the exporter, because adding a
 // family is far cheaper in a Python library than in specialized C++ (EXPORT-PREPARATION.md 1.3). The
-// per-model C++ drivers that predate that decision are NOT included here; they live in
-// "loom/loom_legacy.h", which carries their retirement policy. See P4.0.8/E.2 for why the split
-// exists: while they were re-exported from this file, every consumer depended on them transitively
-// and a grep for consumers reported none.
+// The per-model C++ drivers that predate that decision used to live beside this file in
+// "loom/loom_legacy.h", which carried their retirement policy. All six are gone -- five in P4.0.8's
+// stage E, and WhisperDriver in P4.1, the commit that gave Whisper a MIL export to be replaced by --
+// so that header is gone with them and this IS the surface.
 
 #include "loom/loom_errors.h"
 

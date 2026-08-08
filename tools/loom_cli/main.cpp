@@ -16,6 +16,7 @@
 
 #include <ggml-cpu.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -28,7 +29,8 @@ namespace {
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
-                  "       %s --model <asr.gguf> --wav <path.wav> [--language en]\n",
+                  "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
+                  "[--task transcribe|translate] [--timestamps]\n",
                   argv0, argv0);
 }
 
@@ -49,13 +51,19 @@ std::vector<int32_t> parse_token_ids(const std::string& text) {
 // cannot falls back to its own default -- the resolution order lives in the model's driver, which is the
 // only place that knows whether detection is possible at all.
 std::vector<int32_t> run_driver(loom::LoomLuaBridge& bridge, const std::vector<double>& waveform,
-                                 int32_t language, uint32_t max_new_tokens, int32_t eos_token) {
+                                 int32_t language, int32_t task, bool timestamps,
+                                 uint32_t max_new_tokens, int32_t eos_token) {
     std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
         {"waveform", waveform},
         {"max_new_tokens", static_cast<double>(max_new_tokens)},
         {"eos_token", static_cast<double>(eos_token)},
     };
+    // Each optional argument is OMITTED rather than defaulted when the caller did not name it, which is
+    // what lets the driver apply its own resolution order -- detect, or fall back to what this
+    // checkpoint can actually do.
     if (language >= 0) args["language"] = static_cast<double>(language);
+    if (task >= 0) args["task"] = static_cast<double>(task);
+    if (timestamps) args["timestamps"] = 1.0;
 
     // Held in a named local before unpacking: `call` returns by value, so a reference bound straight
     // into `std::get<...>(call(...))` outlives the variant holding the vector.
@@ -70,7 +78,7 @@ std::vector<int32_t> run_driver(loom::LoomLuaBridge& bridge, const std::vector<d
 }
 
 void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& wav_path,
-             const std::string& language_name) {
+             const std::string& language_name, const std::string& task_name, bool timestamps) {
     // Model-agnostic: register whatever topologies the file declares, call the driver it ships, and
     // detokenize with the vocab it embeds. Conformer-CTC, Parakeet-TDT and Parakeet-RNN-T all work
     // through this one path -- the driver is the thing that differs between them, and it travels with
@@ -98,15 +106,29 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
         throw loom::LoadError("--wav: model carries no driver_script; re-export it with `loom-export "
                               "<checkpoint> --task automatic-speech-recognition`");
     }
-    // The driver returns the end-of-sequence token it stopped on -- deliberately, since a generator's
-    // caller may want to know whether it stopped or ran out of budget. A transcript is not that caller:
-    // decoded literally, `<|endoftext|>` is a real vocabulary piece and prints as those nine characters.
+    // Control tokens a transcript must not contain, dropped before detokenizing because each is a real
+    // vocabulary piece that otherwise prints as its literal spelling.
+    //
+    //   * the end-of-sequence token, which the driver returns deliberately -- a generator's caller may
+    //     want to know whether it stopped or ran out of budget. A transcript is not that caller.
+    //   * `<|notimestamps|>`, which the MODEL emits for itself when the prompt did not force it, i.e.
+    //     exactly under `--timestamps`: it is Whisper deciding not to timestamp, which is a statement
+    //     about the decode rather than a word that was spoken.
+    //
+    // Timestamp markers themselves are NOT dropped: asking for them is the entire point of the flag.
     const int32_t eos_id = model.kv_i32("tokenizer.ggml.eos_token_id", -1);
+    std::vector<int32_t> control_ids{eos_id};
+    if (bpe_vocab) {
+        const int32_t no_ts = bpe_vocab->piece_to_id("<|notimestamps|>");
+        if (no_ts >= 0) control_ids.push_back(no_ts);
+    }
     const auto detokenize = [&](const std::vector<int32_t>& ids) {
         std::vector<int32_t> text_ids;
         text_ids.reserve(ids.size());
         for (int32_t id : ids) {
-            if (id != eos_id) text_ids.push_back(id);
+            if (std::find(control_ids.begin(), control_ids.end(), id) == control_ids.end()) {
+                text_ids.push_back(id);
+            }
         }
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
@@ -114,15 +136,27 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
     // `--language xx` becomes this model's own `<|xx|>` token id, by TEXT rather than by a number this
     // CLI would otherwise have to carry per checkpoint. -1 means "not named", which is what asks the
     // driver to detect it (or to use its default when it cannot).
+    // `--language xx` / `--task transcribe|translate` become this model's own `<|xx|>` / `<|task|>`
+    // token ids, by TEXT rather than by numbers this CLI would otherwise carry per checkpoint.
+    const auto special_id = [&](const std::string& piece, const std::string& flag,
+                                 const std::string& hint) {
+        const int32_t id = bpe_vocab ? bpe_vocab->piece_to_id(piece) : -1;
+        if (id < 0) {
+            throw loom::LoadError(flag + ": this model's vocabulary has no '" + piece + "' token. " + hint);
+        }
+        return id;
+    };
     int32_t language = -1;
     if (!language_name.empty()) {
-        const std::string piece = "<|" + language_name + "|>";
-        language = bpe_vocab ? bpe_vocab->piece_to_id(piece) : -1;
-        if (language < 0) {
-            throw loom::LoadError("--language " + language_name + ": this model's vocabulary has no '" +
-                                  piece + "' token. An English-only checkpoint has no language tokens "
-                                  "at all; a multilingual one names them by ISO code (en, de, fr, ...).");
-        }
+        language = special_id("<|" + language_name + "|>", "--language " + language_name,
+                               "An English-only checkpoint has no language tokens at all; a "
+                               "multilingual one names them by ISO code (en, de, fr, ...).");
+    }
+    int32_t task = -1;
+    if (!task_name.empty()) {
+        task = special_id("<|" + task_name + "|>", "--task " + task_name,
+                           "Whisper names two: transcribe (same language out) and translate "
+                           "(into English). An English-only checkpoint has neither.");
     }
 
     const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
@@ -179,7 +213,7 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
         std::vector<double> window(clip, 0.0); // zero-padded: Whisper's own pad_or_trim convention
         for (size_t i = 0; i < avail; ++i) window[i] = waveform[begin + i];
 
-        const std::vector<int32_t> ids = run_driver(bridge, window, language, kMaxNewTokensPerClip, eos_id);
+        const std::vector<int32_t> ids = run_driver(bridge, window, language, task, timestamps, kMaxNewTokensPerClip, eos_id);
         const std::string piece = detokenize(ids);
         if (n_windows > 1) {
             std::fprintf(stderr, "  window %zu/%zu [%.1fs..%.1fs]: %zu tokens\n", w + 1, n_windows,
@@ -198,6 +232,8 @@ int main(int argc, char** argv) {
     std::string prompt_text;
     std::string wav_path;
     std::string language_name;
+    std::string task_name;
+    bool timestamps = false;
     bool has_prompt = false;
     bool has_wav = false;
     uint32_t n_predict = 16;
@@ -216,6 +252,10 @@ int main(int argc, char** argv) {
             // Optional by design. Omitted, a driver that can detect the language does; one that cannot
             // uses its own default. See run_asr.
             language_name = argv[++i];
+        } else if (arg == "--task" && i + 1 < argc) {
+            task_name = argv[++i];
+        } else if (arg == "--timestamps") {
+            timestamps = true;
         } else if (arg == "--n-predict" && i + 1 < argc) {
             n_predict = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "-h" || arg == "--help") {
@@ -381,7 +421,7 @@ int main(int argc, char** argv) {
         }
 
         if (has_wav) {
-            run_asr(*model, backend.get(), wav_path, language_name);
+            run_asr(*model, backend.get(), wav_path, language_name, task_name, timestamps);
         }
     } catch (const loom::Error& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

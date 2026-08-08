@@ -1266,6 +1266,15 @@ nothing.
 
   **Whisper is the one that remains**, and not because it is harder: `whisper_driver.cpp` has no MIL
   export to replace it. `loom_legacy.h` empties out in P4.1, and its docstring says so.
+
+  > **DONE (2026-08-08), and `loom_legacy.h` is gone rather than empty.** P4.1 gave Whisper its MIL
+  > export, and the R6 precondition — *the last test consuming it is re-pointed in the same commit* —
+  > was then satisfiable: `test_e2e_whisper_mil_export` carries all four retired tests' coverage
+  > check for check, against a stronger oracle (HuggingFace) than the two they used (this engine's own
+  > other implementation). `src/core/whisper_driver.cpp`, `include/loom/core/whisper_driver.h`,
+  > `tools/convert_whisper/` and the four `test_e2e_whisper_*` tests are deleted. All six per-model
+  > C++ drivers are now retired, so the header that carried the policy has nothing left to carry and
+  > `loom.h` IS the surface.
 - **P4.0.9 — KV cache on the MIL path — DONE (stages N/1/2/3).** Specified in [`KV-CACHE.md`](KV-CACHE.md); the one item here
   that adds a *capability* rather than hardening one, which is why its gate differs. `EXPORT-PREPARATION
   .md` §4 filed this for P4/P5 and correctly named `FuseLoomAttention` as the blocker — its
@@ -2663,14 +2672,46 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   The driver already accepts `task` and `timestamps` on the same terms; only `--language` is exposed on
   the CLI, since that is the one the author decided.
 
-  **What is NOT done, and its exact blocker.** R6 retirement of `tools/convert_whisper/` and
-  `src/core/whisper_driver.cpp` (P4.0.8 listed Whisper as the one family blocked on this item). The
-  policy is that a bespoke converter dies in the commit that re-points the last test consuming it, and
-  the four `test_e2e_whisper_*` tests are all fixtured on `whisper-tiny`, which on this machine is an
-  **OpenAI `.pt`** (`tiny.en.pt`, a `{"dims", "model_state_dict"}` dict) while this family loads an HF
-  directory. Re-pointing them therefore needs either an OpenAI-checkpoint loader on the recognizer (P4.2's
-  question, one model early) or whisper-tiny in HF form. The MIL export exists and is verified against a
-  *different* checkpoint, which is what unblocks the retirement, not what performs it.
+  **R6 retirement — DONE (2026-08-08), once the blocker was removed.** The four `test_e2e_whisper_*`
+  tests were fixtured on `whisper-tiny` in **OpenAI `.pt`** form, which this family cannot load; the
+  author downloaded the HF conversion (the `.pt` moved to `openai-whisper-tiny/`), and the retirement
+  followed. `src/core/whisper_driver.cpp`, its header, `tools/convert_whisper/` (8 files) and the four
+  tests are gone, and so is `include/loom/loom_legacy.h` — all six per-model C++ drivers are now retired,
+  so the header that carried the policy has nothing left to carry.
+
+  **The coverage was moved, not dropped**, which is the whole content of the R6 rule. The retired tests
+  checked four things; `test_e2e_whisper_mil_export` now checks all four, and against a better oracle —
+  `test_e2e_whisper_driver` and `test_e2e_whisper_lua_driver` compared two of *this engine's* own
+  implementations with each other, while every check here compares against HuggingFace:
+
+  | retired test | what carries it now |
+  |---|---|
+  | `test_e2e_whisper_encoder_reference` | check 1: the `encoder` topology vs HF's encoder, mel frontend included |
+  | `test_e2e_whisper_decoder_reference` | check 1b, added for this: the `decoder` teacher-forced over the whole prompt at `n_past=0`, logits **and** per-row argmax |
+  | `test_e2e_whisper_driver` | check 2: the full loop, vs HF's greedy token sequence |
+  | `test_e2e_whisper_lua_driver` | check 2, which *is* a Lua driver run — now compared against HF rather than against the C++ driver it was ported from |
+
+  Check 1b runs through a hand-written Lua script rather than a bare `GraphBuilder`, deliberately: the
+  mask and positions then come from `loom.causal_mask`/`loom.range`, the same host math a driver uses,
+  instead of a second implementation of Whisper's mask living in a test.
+
+  **`whisper-tiny` also made the gate cheap.** 4 layers at `d_model=384` against small's 12 at 768:
+  the same test runs in **38 s** instead of ~7 minutes, so the flagship's end-to-end check is now
+  something you can run while working rather than once at the end.
+
+  **Measured, since leanness is the stated goal and P4.0.8's own gate asks for it:** `libloom_engine.so`
+  12,846,600 → 12,529,328 bytes, −309 KB, with `whisper_driver.cpp` the only translation unit removed.
+  8 Python files, 4 C++ tests and 2 headers went with it.
+
+  **The CLI's remaining two flags landed here too**, on the same terms as `--language`:
+  `--task transcribe|translate` (resolved by text, so a bogus one names the two Whisper has and says an
+  English-only checkpoint has neither) and `--timestamps`, which omits `<|notimestamps|>` from the
+  prompt so the model may emit timestamp markers. That flag found one more leak: with the token no
+  longer forced, the model *chooses* it and emits `<|notimestamps|>` as its first output, which decoded
+  literally into the transcript. Control tokens are now dropped before detokenizing — eos and
+  `<|notimestamps|>`, both resolved by text — while timestamp markers are kept, since asking for them
+  is the point of the flag. `--task translate` is visibly real: the same German audio transcribes as
+  `(Lockere Musik)` and translates as `[Water sizzling]`.
 - **P4.2 — GigaAM v3.** Graph is family 1 (already exported); the point is the *second loader*
   (`gigaam.load_model` / `AutoModel.from_pretrained(..., trust_remote_code=True)` instead of
   `ASRModel.restore_from`), which is what proves P3.2's loader/template split. Check first whether the
