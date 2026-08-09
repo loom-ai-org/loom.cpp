@@ -70,8 +70,9 @@ class WindowedAudioEncoder(nn.Module):
     makes the packing step an identity. It also makes the checkpoint's own feature extractor a faithful
     oracle: its mel-axis right-pad becomes a no-op on such a waveform, so HF and this phase see the
     identical mel. The cost is that up to one second of trailing silence becomes real audio embeddings
-    the LM reads, where HF would have masked them out; `EXPORT-ROADMAP.md`'s follow-up for this is a
-    validity mask that trims them, which needs a way to feed a *prefix* of a retained tensor.
+    the LM reads, where HF would have masked them out. Trimming them needs a way to feed a *prefix* of
+    a retained tensor, which nothing has today: BACKLOG.md **P4.3d**, open, and shared with the second
+    leaf, where the chunk is twelve seconds rather than one and the cost is correspondingly larger.
     """
 
     def __init__(self, mel: LogMelFrontend, tower: nn.Module, projector: nn.Module, audio_config):
