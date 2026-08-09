@@ -1050,3 +1050,14 @@ add_executable(test_e2e_qwen3_asr_mil_export test_e2e_qwen3_asr_mil_export.cpp)
 target_link_libraries(test_e2e_qwen3_asr_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3_asr_mil_export COMMAND test_e2e_qwen3_asr_mil_export)
 set_tests_properties(test_e2e_qwen3_asr_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: the MIL-compiler-exported Granite Speech
+#     (tools/loom_mil_compiler/speech_lm_export.py + granite_speech_export.py, BACKLOG.md P4.3c) against
+#     HF's own GraniteSpeechForConditionalGeneration. Family 3's SECOND leaf, and deliberately the same
+#     two checks as the first: a conformer encoder and a Q-Former projector share nothing with
+#     Qwen3-ASR's window-attention stack and linear projector, and the driver, the phase list and the
+#     test are unchanged. See test_e2e_granite_speech_mil_export.cpp. ---
+add_executable(test_e2e_granite_speech_mil_export test_e2e_granite_speech_mil_export.cpp)
+target_link_libraries(test_e2e_granite_speech_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_granite_speech_mil_export COMMAND test_e2e_granite_speech_mil_export)
+set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES SKIP_RETURN_CODE 77)

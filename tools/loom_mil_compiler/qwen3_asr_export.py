@@ -37,7 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .speech_lm_export import BaseSpeechLMExportConfig, LogMelFrontend
+from .speech_lm_export import BaseSpeechLMExportConfig, LogMelFrontend, split_prompt_on_audio
 from .spec_protocol import Unchecked
 
 
@@ -258,24 +258,7 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
             add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
         )
         ids = rendered["input_ids"][0].tolist()
-        if audio_id not in ids:
-            raise ValueError(
-                f"this checkpoint's chat template rendered no audio placeholder (id {audio_id}) at "
-                f"all, so there is no position for the encoder's output to occupy. The template is "
-                f"what this family reads the prompt's shape from."
-            )
-        first = ids.index(audio_id)
-        last = len(ids) - 1 - ids[::-1].index(audio_id)
-        prefix, suffix = ids[:first], ids[last + 1:]
-        if not all(token == audio_id for token in ids[first:last + 1]):
-            # The driver feeds the audio as ONE contiguous segment at one `n_past`. Interleaved text
-            # inside the placeholder run would need a segment list this family does not build, and
-            # would otherwise be silently dropped.
-            raise ValueError(
-                f"this checkpoint's chat template puts non-audio tokens between its audio "
-                f"placeholders (ids {first}..{last}), so the audio does not occupy one contiguous run "
-                f"of prompt positions. PromptSegments feeds the encoder's output as a single segment."
-            )
+        prefix, suffix = split_prompt_on_audio(ids, audio_id)
         # eos: the generation config lists both the base model's end-of-text and the chat turn's end,
         # and a decode loop has to stop on either. These two do NOT become ExportConstants -- they are
         # bound into the loop itself, since it is the loop that compares against them.
@@ -284,8 +267,8 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
         return {
             "EOS": eos_ids[0],
             "EOS_EXTRA": tuple(eos_ids[1:]),
-            "AUDIO_PREFIX": [int(token) for token in prefix],
-            "AUDIO_SUFFIX": [int(token) for token in suffix],
+            "AUDIO_PREFIX": prefix,
+            "AUDIO_SUFFIX": suffix,
         }
 
 

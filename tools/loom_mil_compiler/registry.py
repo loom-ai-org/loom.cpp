@@ -178,6 +178,7 @@ _FAMILY_MODULES = (
     "gigaam_export",
     "whisper_export",
     "qwen3_asr_export",
+    "granite_speech_export",
     "kokoro_export",
     "matcha_export",
     "styletts2_export",

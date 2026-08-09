@@ -35,6 +35,26 @@ from .modular_export import ModularExportSpec
 from .spec_protocol import NestedSpec, Unchecked
 
 
+def _rss_note() -> str:
+    """` (rss N.N GiB)`, or `""` where this process cannot read its own resident set.
+
+    Exports of this size are memory-bound before they are anything else -- BACKLOG.md P5.0 exists
+    because `MultiPhase.export`'s peak is a sum over phases -- and the one number that would have said
+    so was never printed. Reported per phase, beside the node and weight counts, because the phase
+    boundary is where the sum grows and where P5.0's remaining changes would show up.
+
+    /proc, not `psutil`: this is a diagnostic line, not a dependency.
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+    except (OSError, IndexError, ValueError):
+        return ""
+    import resource
+
+    return f" (rss {pages * resource.getpagesize() / (1 << 30):.1f} GiB)"
+
+
 class Decomposition:
     """Base for the three real shapes. Subclasses implement `export(config)` and document which hooks
     they read off `config`."""
@@ -217,6 +237,8 @@ class MultiPhase(Decomposition):
         return MultiPhaseDriverBuilder(peeled=config.driver_components())
 
     def export(self, config) -> str:
+        import gc
+
         import coremltools as ct
         import torch
 
@@ -233,7 +255,7 @@ class MultiPhase(Decomposition):
         checker.check(config)
         phase_topologies = {}
         named_weights = []
-        traced_programs = []
+        fused_geometry = {}
         phases = config.phases()
         # Every phase's axis declarations, checked before the first (slow) trace: an axis name outside
         # axes.py's vocabulary, or a declared_axes entry naming an input this phase does not declare.
@@ -265,14 +287,33 @@ class MultiPhase(Decomposition):
             )
             main_func = mil_prog.functions["main"]
             topo = exporter.generate_graph_topology(main_func, phase.name)
-            print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights")
+            print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights"
+                  f"{_rss_note()}")
             phase_topologies[phase.name] = topo
             named_weights.append((phase.name, exporter.weights))
-            # The converted program, so the output exporter can read this phase's fused nodes back --
-            # its own `program` is None, and the cache geometry lives only in the graph. Kept for every
-            # phase rather than only the fused ones: `_fused_ops` asks the question, and a list that
-            # depends on the answer would have to be rebuilt the day a second geometry is added.
-            traced_programs.append(mil_prog)
+            # The cache geometry of whatever this phase fused, so the output exporter can still write
+            # it: that exporter has no program of its own, and until P5.0's first reduction this was
+            # `traced_programs.append(mil_prog)` -- the whole converted program, kept for a handful of
+            # integers. Extracted for every phase rather than only the fused ones, because
+            # `fused_geometry` asks the question and a list that depended on the answer would have to be
+            # rebuilt the day a second geometry is added.
+            for kind, records in exporter.fused_geometry().items():
+                fused_geometry.setdefault(kind, []).extend(records)
+            # **Everything this phase needed is now extracted, and holding any of it is what decides
+            # which models can be exported at all** (BACKLOG.md P5.0). Three things die here together,
+            # and they have to die together because they are the same memory: `phase.wrapper` holds the
+            # submodule's torch parameters, `torch.jit.trace` holds a module beside it, and the
+            # converted MIL program's constants are those same arrays again. Releasing any one of them
+            # alone frees nothing -- measured, not assumed: dropping the torch half while the program
+            # lived moved the peak by 0.2 GB.
+            #
+            # What the code below this loop wants from `phases` is `name`, `root_axis` and
+            # `kv_cache_size`; what it wants from this phase's conversion is `topo`, `exporter.weights`
+            # and the geometry above, all of which are ordinary Python data by now.
+            del traced, main_func, mil_prog, exporter
+            phase.wrapper = None
+            gc.collect()
+            print(f"    released {phase.name}'s torch and MIL halves:{_rss_note() or ' (rss unknown)'}")
 
         # A cached phase's capacity reaches the writer from the phase that declared it, not from a
         # second `backend_kwargs()` entry a family would have to keep in step: `_kv_cache_geometry`
@@ -296,7 +337,7 @@ class MultiPhase(Decomposition):
         )
         out_exporter.topologies = phase_topologies
         out_exporter.weights = merge_phase_weights(named_weights)
-        out_exporter.phase_programs = traced_programs
+        out_exporter.phase_geometry = fused_geometry
 
         # Every check this used to route through `render_driver` now runs inside the builder, over the
         # same `checker` (P4.0.18): a `FlowMatchingSpec` reaches it as `FlowMatchingSampler.sub_specs`,
