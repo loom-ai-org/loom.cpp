@@ -194,7 +194,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage — **all three flagships DONE** | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE** | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -3026,48 +3026,100 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   ~29 GB (the LM phase alone needs its 14.4 GB of fp32 weights and their 14.4 GB of MIL constants to
   coexist), so a bigger machine is the honest answer, not exporter surgery.
 
-  **Granite Speech 4.0.1b is the second leaf instead**, and it is a better test of the template than
+  **Granite Speech 4.0.1b is the second leaf instead**, and it was a better test of the template than
   Voxtral would have been: a conformer encoder over 160-bin features and a **Q-Former** projector
   (`num_queries = window_size // downsample_rate`), where Voxtral is a Whisper encoder and a linear
-  stack — so it varies both halves the template claims to abstract, not one.
+  stack — so it varies both halves the template claims to abstract, not one. Done, in P4.3c below.
 
-  **P4.3c — Granite Speech 4.0.1b, family 3's second leaf — SCOPED, not started.** The refactor it
-  forced is done and committed (the two hooks below); what remains is the leaf itself. Scoped in enough
-  detail here that it can be picked up cold, because the arithmetic is the part that is easy to get
-  subtly wrong.
+  **P4.3c — Granite Speech 4.0.1b, family 3's second leaf — DONE (2026-08-09).** A 16-layer conformer
+  over 160-bin features (Shaw relative attention in blocks of 200 frames), a **BLIP-2 Q-Former** that
+  turns each 15-frame window into three query rows, and a 40-layer Granite causal LM (2048-wide, GQA
+  16/4) — 2.31B parameters in one 8.75 GB artifact, registered as
+  `automatic-speech-recognition/granite-speech`.
 
-  `has_lora_adapter = False` on this checkpoint, so the LoRA path other Granite Speech variants carry
-  is not in play. It loads in the **piper** venv — `granite_speech` ships in transformers 4.57.6 — so
-  unlike Qwen3-ASR it does not need the ovos split ([[env-python-venvs-export]] equivalent: BACKLOG's
-  P4.3 note on the two environments).
+  `tools/loom_mil_compiler/granite_speech_export.py` (~330 lines, the loader plus the one rewritten
+  encoder) + `tests/test_e2e_granite_speech_mil_export.cpp` +
+  `tools/fixture_gen/reference_forward_granite_speech_mil.py`. The template gained **one hook with a
+  default** (`mel_frontend`) and **one shared helper** (`split_prompt_on_audio`), and nothing else.
 
-  1. **Generalize `LogMelFrontend`** rather than write a second one. Granite's extractor is a
-     torchaudio `MelSpectrogram` (n_fft 512, **win_length 400**, hop 160, 80 mels) followed by
-     `clip_(1e-10).log10_()`, a global `amax`, `maximum(x, mx - 8)` and `.div_(4).add_(1)` — and
-     `x/4 + 1` *is* Whisper's `(x + 4)/4`. So the arithmetic is already there; what the class needs is
-     `win_length` decoupled from `n_fft` and an arbitrary filterbank array. Reimplementing torchaudio's
-     transform with `torch.stft` is required regardless — `complex_shape` cannot be lowered, which is
-     the same wall `gigaam_export._TraceableMelSpectrogram` hit (P4.2). The leaf then adds the
-     drop-last-frame-if-odd and the pair-stacking into 160-dim features.
-  2. **A traceable conformer wrapper** (16 layers: depthwise conv, GLU, Shaw relative attention).
-     Untraceable as written for exactly the reason Qwen3-ASR's was: `num_blocks =
-     math.ceil(num_features / context_size)` and a `remainder`-driven right-pad are Python-level and
-     bake into the trace. Same fix — require the chunk contract so `remainder == 0`, keep the block
-     count dynamic with `reshape(-1)`. `attention_dists` is a static `(200, 200)` buffer and needs
-     nothing.
-  3. **The BLIP-2 Q-Former projector**: a learnable `(1, 3, 1024)` query, windows of 15 encoder frames,
-     `num_queries = window_size // downsample_rate = 3`. Its own `ceil`-pad has to be made exact by the
-     same contract.
-  4. **`audio_geometry()` returns `(192000, 120)`**, and both numbers are forced rather than chosen.
-     Encoder frames must be a multiple of `context_size` (200, the conformer's blocks) **and** of
-     `window_size` (15, the Q-Former's), so the chunk is `lcm(200, 15) = 600` encoder frames = 1200 mel
-     frames = **192000 samples, 12 s**; the rows are `600/15 × 3 = 120`. That is coarse — a host pads up
-     to twelve seconds — and it is a property of this checkpoint's two block sizes, not of the template.
-     `phases()`' existing cross-check is what verifies the pair against the traced encoder.
+  **Acceptance: `test_e2e_granite_speech_mil_export.cpp` against HF's own
+  `GraniteSpeechForConditionalGeneration` on `samples/jfk.wav`.**
 
-  **Gate**, the same shape as Qwen3-ASR's and in the same order: the encoder tensor against HF's own
-  `get_audio_features` first (a tensor oracle, because P4.2 established a wrong encoder still decodes a
-  plausible transcript), then the whole driver's token ids against HF's `generate`.
+  | check | result |
+  |---|---|
+  | the 160-bin features `LogMelFrontend` + the pair-stack produce, vs the checkpoint's own extractor | **`max_abs_diff = 0.000e+00`** — bit-identical, in torch, before anything was exported |
+  | `ConformerQFormerEncoder` vs HF's `get_audio_features`, in torch | `max abs diff 5.8e-06` against a reference whose absmax is 0.999 |
+  | the exported `encoder` topology vs the same tensor, through ggml | `max_abs_diff = 7.3e-04` against a reference whose absmax is 0.999 — 7.3e-4 relative; `mean_abs_diff = 3.7e-06` |
+  | the whole driver — encoder, segmented prompt, cached decode loop — vs HF's greedy sequence | **exact**: all 24 tokens, stopping on `<\|end_of_text\|>`; `"and so my fellow americans ask not what your country can do for you ask what you can do for your country"` |
+  | the driver, the phase list, the component list | **unchanged from Qwen3-ASR's** — no new component, no new field |
+  | kokoro, whisper-small, lfm2-monolithic re-exported against a `git archive HEAD` baseline | byte-identical, every snapshot file |
+  | qwen3-asr re-exported | differs in `model.driver_script` **and nothing else** — every topology and every tensor identical. It is the model that makes this gate able to fail, and the difference is exactly the comment header rewritten now that `speech_lm_driver/00_header.lua` serves two leaves |
+  | the Python suite | 503 passed |
+
+  **The claim this leaf exists to test, and it held.** The two leaves share *no* encoder and *no*
+  projector: a Qwen3-Omni window-attention stack over one-second chunks of 128-bin mel and a two-layer
+  linear projector against a conformer over twelve-second chunks of 160-bin features and a Q-Former.
+  What they share is the log-mel frontend and `(samples_per_chunk, frames_per_chunk)` — the contract
+  P4.3 wrote down before there was a second member to check it against — and that turned out to be
+  enough for `PromptSegments` and `PrefillDecodeLoop` to serve both unmodified.
+
+  **`audio_geometry()` returns `(192000, 120)`, and both numbers are forced rather than chosen.**
+  Encoder frames must be a multiple of `context_size` (200, the conformer's blocks) **and** of
+  `window_size` (15, the Q-Former's), so the chunk is `lcm(200, 15) = 600` encoder frames = 1200 mel
+  frames = **192000 samples, 12 s**; the rows are `600/15 × 3 = 120`. Twelve seconds is coarse — a host
+  pads up to it — and it is a property of this checkpoint's two block sizes, not of the family, which
+  is exactly why the template publishes the pair rather than a duration. `phases()`' existing
+  cross-check verified it against the traced encoder rather than trusting the arithmetic.
+
+  **The mel frontend needed two constructor arguments and no new class.** Granite's extractor is a
+  torchaudio `MelSpectrogram` (n_fft 512, **win_length 400**, hop 160, 80 mels) followed by
+  `clip_(1e-10).log10_()`, a global `amax`, `maximum(x, mx - 8)` and `.div_(4).add_(1)` — and
+  `x/4 + 1` *is* Whisper's `(x + 4)/4`. So `LogMelFrontend` needed `win_length` decoupled from `n_fft`
+  and a filterbank read off a `MelScale` instead of an extractor attribute; `mel_frontend()` is that
+  three-line override, and it has a default because every other family-3 extractor spells it Whisper's
+  way. **The final-frame drop turned out to be Granite's too**: HF computes `L // hop + 1` frames and
+  drops the last only when the count is odd, and under the chunk contract that count is `1200k + 1`,
+  always odd — so Whisper's unconditional `[..., :-1]` removes the identical frame. That is why the
+  features are bit-identical rather than merely close, and it is what makes the checkpoint's own
+  extractor an exact oracle.
+
+  **The encoder rewrite is of two `math.ceil`s, and two ggml shapes.** `num_blocks =
+  math.ceil(num_features / context_size)` with a `remainder`-driven right-pad
+  (`GraniteSpeechConformerAttention`) and `nblocks = math.ceil(seq_len / window_size)`
+  (`GraniteSpeechEncoderProjector`) are Python-level and bake into the trace — the same wall Qwen3-ASR's
+  encoder hit, and the same fix: require the chunk contract so every remainder is zero, and spell the
+  block count `reshape(-1, block, ...)`. Two more things had to be written around the backend:
+
+  * **Shaw's relative-position term is a 5-D einsum, and ggml tensors are 4-D.**
+    `einsum("b m h c d, c r d -> b m h c r")` becomes a batched matmul over the *query position* axis,
+    which contracts the same index with every operand 3-D or 4-D.
+  * **The Q-Former's learnable query is `(1, num_queries, hidden)` broadcast against N windows** — a
+    two-way broadcast ggml's elementwise ops cannot do. An **outer product against a ones column**
+    materializes one copy per window, the same trick and the same reason as `WindowedAudioEncoder`'s
+    window mask. The Q-Former's two attention masks are dropped entirely rather than built: HF makes
+    them with `torch.ones(...)` over a dynamic batch and then `(1 - mask) * -10000`, which is
+    identically zero, so building them would put a MIL `fill` over a dynamic extent in the graph for no
+    arithmetic at all.
+
+  **The logits are Granite's, not `lm_head`'s.** `GraniteForCausalLM.forward` ends with
+  `logits / logits_scaling` (8.0) *outside* the head, so exporting `lm_head` alone drops it — and the
+  driver would never notice, because it takes an argmax and a positive divisor cannot move one. A host
+  that sampled would. `_ScaledLMHead` puts it back; the phase is 3 nodes instead of 2.
+
+  **The export did not fit, and fixing that is P5.0's first item** — recorded there in full. Short
+  version: peak RSS **30.4 GB**, OOM-killed in the `lm_head` phase, on a 33 GB machine; now **22.9 GB**.
+  The finding was that the torch module and the converted MIL program are the *same* arrays, so
+  releasing either alone frees nothing (0.2 GB, measured) and `MultiPhase.export` has to release the
+  traced module, the wrapper and the program together.
+
+  **Not claimed:** only `granite-speech-4.0.1b`. `detect()` requires `model_type == "granite_speech"`
+  **and** `has_lora_adapter == false`, because Granite Speech ships variants whose language model is
+  only correct with a LoRA adapter merged in for audio — this exporter traces base weights, so on such
+  a checkpoint it would produce a model that runs and transcribes badly, and a candidate list is a
+  better answer than that. The two other Granite Speech checkpoints on this machine declare
+  `granite_speech_plus` and `granite_speech_nar`, neither of which transformers 4.57.6 has a module
+  for at all; `-plus` has the identical block geometry and is the obvious third leaf the day its
+  module ships.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's
@@ -3092,18 +3144,33 @@ generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (smal
 - **P5.0 — per-phase process isolation for the conversion step.** Not a family: the thing that decides
   which models can be exported *at all* on a given machine.
 
-  `MultiPhase.export` currently makes peak memory a **sum** where it should be a **max**. It loads the
-  whole checkpoint once, then for every phase holds the converted MIL program (`traced_programs`, kept
-  so `_fused_ops()` can read the KV geometry back), and finally `merge_phase_weights` assembles every
-  phase's weights before `write_gguf` starts. A four-phase model therefore holds four programs, one
-  torch model and one merged weight dict at the same moment, and the torch model plus one phase's MIL
-  constants are already two full copies of that phase's parameters.
+  `MultiPhase.export` makes peak memory a **sum** where it should be a **max**. It loads the whole
+  checkpoint once, then for every phase held the converted MIL program (`traced_programs`, kept so
+  `_fused_ops()` could read the KV geometry back), and `merge_phase_weights` assembles every phase's
+  weights before `write_gguf` starts. A four-phase model therefore held four programs, one torch model
+  and one merged weight dict at the same moment.
 
-  Three changes, in increasing order of cost and of payoff:
+  **Change 1 is DONE (P4.3c), and doing it taught the accounting.** `MultiPhase.export` now extracts
+  each phase's fused-node geometry as it converts (`LoomGGUFExporter.fused_geometry()` → the output
+  exporter's `phase_geometry`) and then drops **three things together**: the traced module, the phase's
+  `wrapper`, and the converted MIL program. Measured on Granite-Speech-4.0.1b (2.31B parameters, four
+  phases): peak RSS **30.4 GB → 22.9 GB**, which is the difference between OOM-killed in the `lm_head`
+  phase and a clean export on this 33 GB machine.
 
-  1. **Read each phase's KV/conv-state geometry when it converts, and drop the program.** The programs
-     are kept only for `_fused_ops()`; nothing needs them after the geometry is extracted. Cheapest,
-     and it removes the accumulation across phases.
+  **The three had to go together, and that is the finding.** Dropping only the torch half — the
+  obvious first try, since a phase's parameters are plainly dead once its topology exists — moved the
+  peak by **0.2 GB** (30.25 → 30.41), i.e. not at all. A converted MIL program's constants are the same
+  arrays as the module's own tensors, so the program pinned every phase's weights for the sake of the
+  few integers `_kv_cache_geometry` reads. `MultiPhase` no longer keeps programs at all, and
+  `_fused_ops` is back to meaning "this exporter's own program".
+
+  What remains resident is `exporter.weights` — the real per-phase copies the writer needs — which is
+  what changes 2 and 3 below address. The per-phase numbers now print beside the node counts
+  (`decomposition._rss_note`), so the next attempt starts from a measurement rather than an estimate:
+  encoder 19.1 → 16.8, embed 17.5 → 17.5, decoder 20.9 → **16.4**, lm_head 17.2 → 16.4 GiB.
+
+  Two changes remain, in increasing order of cost and of payoff:
+
   2. **Quantize (or at least `astype`) each phase's weights as it converts, rather than at write time.**
      `write_gguf`'s loop currently upcasts everything to f32 first, so the `quantize=` argument shrinks
      the artifact and nothing else. Doing it per phase makes the accumulated term small.

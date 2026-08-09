@@ -136,11 +136,18 @@ class LoomGGUFExporter:
         self.kwargs = kwargs
         self.weights = {}
         self.topologies = {}
-        # The traced programs behind `topologies` when this exporter has no `program` of its own -- the
-        # multi-phase case, where each phase was converted by its own exporter and only the finished
-        # topologies were handed over. Set by `decomposition.MultiPhase`; read by `_fused_ops`, which is
-        # how a KV-cached phase's cache geometry still reaches the GGUF. Empty for every other path.
-        self.phase_programs = []
+        # The fused-node geometry behind `topologies` when this exporter has no `program` of its own --
+        # the multi-phase case, where each phase was converted by its own exporter and only the finished
+        # topologies were handed over. `{kind: [(op name, geometry tuple), ...]}` as
+        # `fused_geometry()` returns it, accumulated across phases by `decomposition.MultiPhase` and
+        # read by `_kv_cache_geometry`/`_conv_state_geometry`, which is how a KV-cached phase's cache
+        # geometry still reaches the GGUF. Empty for every other path.
+        #
+        # Was the phase PROGRAMS until P5.0's first reduction. Holding them was what made peak memory a
+        # sum over phases: a MIL program's constants are the phase's whole parameter set, and they are
+        # the only thing the torch module's own tensors are still shared with, so keeping one program
+        # per phase pinned every phase's weights twice over for the sake of these few integers.
+        self.phase_geometry = {}
         # {declared input name: window}, filled by `_route_windowed_masks` as each topology is
         # generated and read by the driver assembly, which is what turns a synthesized mask input into
         # a `loom.causal_mask(n_tokens, n_past, window)` call (BACKLOG.md P4.0.11a).
@@ -2281,21 +2288,48 @@ class LoomGGUFExporter:
         return live
 
     def _fused_ops(self, op_type: str):
-        """Every op of `op_type` in the program(s) this GGUF is being written from.
+        """Every op of `op_type` in this exporter's own traced program."""
+        for func in getattr(self.program, "functions", {}).values():
+            for op in func.operations:
+                if op.op_type == op_type:
+                    yield op
 
-        Usually that is `self.program` -- one traced graph, whether flattened or bespoke. A
-        **multi-phase** export has no program of its own (`MultiPhase` builds each phase's topology with
-        its own exporter and hands this one the finished topologies), so it sets `phase_programs`
-        instead, and both geometries below then read the fused nodes from the phases that produced them.
-        Without that, a multi-phase export with a KV-cached phase writes no cache geometry at all and the
-        artifact is unloadable -- which is exactly what the first Whisper export did (BACKLOG.md P4.1).
+    def fused_geometry(self) -> dict:
+        """`{kind: [(op name, geometry tuple), ...]}` for every fused node in this exporter's program --
+        the handful of integers `_kv_cache_geometry` and `_conv_state_geometry` need, extracted so the
+        program itself can be dropped.
+
+        **This exists so a multi-phase export can let each phase go.** A phase's converted MIL program
+        is its entire parameter set, shared with the torch module it was traced from, and the ONLY
+        thing later phases still wanted from it was these tuples. `MultiPhase` therefore calls this as
+        each phase converts and accumulates the result into the output exporter's `phase_geometry`,
+        which the two geometry methods read exactly as they read a program's own. Without it, a
+        multi-phase export with a KV-cached phase writes no cache geometry at all and the artifact is
+        unloadable -- which is exactly what the first Whisper export did (BACKLOG.md P4.1).
+
+        The op NAME travels with each tuple because the two consumers raise naming the block that
+        disagreed, and a bare tuple could not say which one.
         """
-        programs = [self.program] if self.program is not None else list(self.phase_programs)
-        for program in programs:
-            for func in getattr(program, "functions", {}).values():
-                for op in func.operations:
-                    if op.op_type == op_type:
-                        yield op
+        return {
+            # MIL k/v are [batch, n_head_kv, seq, head_dim].
+            "attention": [
+                (op.name, (int(list(op.inputs["k"].shape)[1]), int(list(op.inputs["k"].shape)[3]),
+                           int(list(op.inputs["v"].shape)[3])))
+                for op in self._fused_ops("loom_fused_attention")
+            ],
+            # MIL x is [batch, channels, seq]; weight is [channels, 1, kernel].
+            "short_conv": [
+                (op.name, (int(op.inputs["weight"].shape[-1]) - 1, int(op.inputs["x"].shape[1])))
+                for op in self._fused_ops("loom_short_conv")
+            ],
+        }
+
+    def _fused_blocks(self, kind: str):
+        """This export's fused nodes of `kind`, whether it has its own program or was handed the
+        geometry by the phases that did."""
+        if self.program is not None:
+            return self.fused_geometry()[kind]
+        return self.phase_geometry.get(kind, [])
 
     def _kv_cache_geometry(self) -> dict:
         """The five facts `loom::make_kv_cache` needs, read off the fused ATTENTION nodes themselves --
@@ -2315,10 +2349,8 @@ class LoomGGUFExporter:
         """
         n_head_kv = head_dim_k = head_dim_v = None
         n_blocks = 0
-        for op in self._fused_ops("loom_fused_attention"):
+        for op_name, geom in self._fused_blocks("attention"):
             n_blocks += 1
-            k_shape, v_shape = list(op.inputs["k"].shape), list(op.inputs["v"].shape)
-            geom = (int(k_shape[1]), int(k_shape[3]), int(v_shape[3]))
             if n_head_kv is None:
                 n_head_kv, head_dim_k, head_dim_v = geom
             elif geom != (n_head_kv, head_dim_k, head_dim_v):
@@ -2326,7 +2358,7 @@ class LoomGGUFExporter:
                 # whose blocks disagree cannot be served by it. Better to say so than to write the
                 # first block's geometry and corrupt the rest.
                 raise NotImplementedError(
-                    f"loom_fused_attention op '{op.name}' has K/V geometry {geom}, but an earlier "
+                    f"loom_fused_attention op '{op_name}' has K/V geometry {geom}, but an earlier "
                     f"block declared {(n_head_kv, head_dim_k, head_dim_v)}. A KvCache is allocated "
                     "with ONE per-layer width, so per-block variation is unsupported."
                 )
@@ -2365,10 +2397,8 @@ class LoomGGUFExporter:
         """
         n_state = n_embd_conv = None
         n_blocks = 0
-        for op in self._fused_ops("loom_short_conv"):
+        for op_name, geom in self._fused_blocks("short_conv"):
             n_blocks += 1
-            # MIL x is [batch, channels, seq]; weight is [channels, 1, kernel].
-            geom = (int(op.inputs["weight"].shape[-1]) - 1, int(op.inputs["x"].shape[1]))
             if n_state is None:
                 n_state, n_embd_conv = geom
             elif geom != (n_state, n_embd_conv):
@@ -2376,7 +2406,7 @@ class LoomGGUFExporter:
                 # disagree cannot be served by it -- say so rather than write the first block's
                 # geometry and corrupt the rest.
                 raise NotImplementedError(
-                    f"loom_short_conv op '{op.name}' has geometry {geom} (kernel-1, channels), but "
+                    f"loom_short_conv op '{op_name}' has geometry {geom} (kernel-1, channels), but "
                     f"an earlier block declared {(n_state, n_embd_conv)}. A ConvStateCache is "
                     "allocated with ONE slot shape, so per-block variation is unsupported."
                 )

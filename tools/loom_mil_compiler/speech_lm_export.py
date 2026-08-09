@@ -36,7 +36,9 @@ only where a token is actually needed, which is the loop.
 
 **What a leaf supplies, and where the boundary actually is.** `load_model()`, `language_model()`,
 `lm_head()`, `feature_extractor()`, `prompt_segment_constants()` -- and, the two that the SECOND leaf
-moved here, `audio_encoder()` and `audio_geometry()`.
+moved here, `audio_encoder()` and `audio_geometry()`. `mel_frontend()` is a third, softer one: it has a
+default, because every family-3 extractor computes the same log-mel, and Granite overrides only where
+its checkpoint writes those numbers down.
 
 The first version of this module built the audio encoder itself, on the reasoning that a family-3
 encoder is a family-3 encoder. Granite Speech disproved that: Qwen3-ASR's is a Qwen3-Omni
@@ -77,16 +79,35 @@ class LogMelFrontend(nn.Module):
     family's extractor computes it with `mel_filter_bank(...)` at construction. Both arrive here as an
     array, which is why that difference does not reach this class.
 
+    **Granite Speech shares every line of this, which was not obvious.** Its extractor is a torchaudio
+    `MelSpectrogram` followed by `clip_(1e-10).log10_()`, a global `amax`, `maximum(x, mx - 8)` and
+    `.div_(4).add_(1)` -- and `x/4 + 1` *is* Whisper's `(x + 4)/4`. Two differences reach this class
+    and both are constructor arguments: the analysis window is shorter than the FFT (400 against 512,
+    hence `win_length`), and the filterbank comes off a torchaudio `MelScale` rather than a
+    transformers extractor -- which is again only an array. Reimplementing torchaudio's transform with
+    `torch.stft` is required regardless of any of that: its own `complex_shape` cannot be lowered,
+    the same wall `gigaam_export._TraceableMelSpectrogram` hit.
+
+    **The final-frame drop is Granite's too, given the chunk contract.** Whisper drops the last STFT
+    frame unconditionally; Granite computes `L // hop + 1` frames and drops the last one only when
+    that count is odd. Under a whole number of 192000-sample chunks the count is `1200k + 1`, always
+    odd, so the conditional fires every time and removes the same frame this line does.
+
     **The global maximum is why this cannot be made per-chunk.** `torch.maximum(log_spec,
     log_spec.max() - 8)` makes every output element depend on the loudest bin in the whole clip, so a
     host cannot stream this frontend without changing the numbers.
     """
 
-    def __init__(self, n_fft: int, hop_length: int, mel_filters: np.ndarray):
+    def __init__(self, n_fft: int, hop_length: int, mel_filters: np.ndarray,
+                 win_length: Optional[int] = None):
         super().__init__()
         self.n_fft = int(n_fft)
         self.hop_length = int(hop_length)
-        self.register_buffer("window", torch.hann_window(self.n_fft))
+        # Defaults to the FFT size, which is Whisper's and Qwen3-ASR's geometry. `torch.stft` centres a
+        # shorter window inside the FFT itself, and `center=True` still pads by `n_fft // 2`, so a
+        # shorter window changes the window buffer and nothing else about the frame grid.
+        self.win_length = int(win_length) if win_length is not None else self.n_fft
+        self.register_buffer("window", torch.hann_window(self.win_length))
         # The extractor stores `(n_freq, n_mels)`; the matmul below wants `(n_mels, n_freq)`.
         self.register_buffer(
             "filters", torch.from_numpy(np.asarray(mel_filters, dtype=np.float32)).T.contiguous()
@@ -94,7 +115,7 @@ class LogMelFrontend(nn.Module):
 
     def forward(self, waveform):
         stft = torch.stft(
-            waveform, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
+            waveform, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
             window=self.window, center=True, return_complex=True,
         )
         # Magnitude BEFORE the final-frame slice, which is the same arithmetic on one fewer element and
@@ -164,6 +185,38 @@ class _LMHeadWrapper(nn.Module):
 
     def forward(self, hidden):
         return self.lm_head(hidden)
+
+
+def split_prompt_on_audio(token_ids: List[int], audio_id: int) -> tuple:
+    """`(prefix, suffix)` -- a rendered prompt's token ids either side of its audio placeholder run.
+
+    Both leaves so far reach their two text segments this way, and both reach them from a rendered
+    chat template rather than a transcription of one, so a template change moves the constants instead
+    of silently disagreeing with them. What differs between the leaves is only how the template is
+    rendered -- Qwen3-ASR's takes an audio *item* through the processor, Granite Speech's is a text
+    template whose placeholder the caller writes -- so that stays in the leaves and this does not.
+
+    The two ways this can be wrong are checked here, because neither would fail later: a template that
+    renders no placeholder leaves the encoder's output with no position to occupy, and one that
+    interleaves text inside the placeholder run means the audio is not one contiguous segment, which is
+    the only shape `PromptSegments` feeds.
+    """
+    if audio_id not in token_ids:
+        raise ValueError(
+            f"this checkpoint's chat template rendered no audio placeholder (id {audio_id}) at all, so "
+            f"there is no position for the encoder's output to occupy. The template is what this "
+            f"family reads the prompt's shape from."
+        )
+    first = token_ids.index(audio_id)
+    last = len(token_ids) - 1 - token_ids[::-1].index(audio_id)
+    if not all(token == audio_id for token in token_ids[first:last + 1]):
+        raise ValueError(
+            f"this checkpoint's chat template puts non-audio tokens between its audio placeholders "
+            f"(ids {first}..{last}), so the audio does not occupy one contiguous run of prompt "
+            f"positions. PromptSegments feeds the encoder's output as a single segment."
+        )
+    return ([int(token) for token in token_ids[:first]],
+            [int(token) for token in token_ids[last + 1:]])
 
 
 def causal_mask(seq_len: int) -> torch.Tensor:
@@ -277,6 +330,20 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
     def feature_extractor(self):
         raise NotImplementedError
 
+    def mel_frontend(self, extractor) -> LogMelFrontend:
+        """The log-mel frontend `audio_encoder` is handed, built from THIS checkpoint's own extractor.
+
+        Overridable rather than a hook a leaf must implement, because the default is what a
+        transformers audio extractor spells: `n_fft`, `hop_length` and a `mel_filters` array as
+        attributes, with the analysis window the full FFT. Granite Speech's extractor is a torchaudio
+        `MelSpectrogram` module instead, so its filterbank and its shorter `win_length` are reached
+        through different attribute names -- which is a difference in where the numbers are written
+        down, not in the arithmetic, and is why the override is three lines and `LogMelFrontend` is
+        still one class.
+        """
+        return LogMelFrontend(extractor.n_fft, extractor.hop_length,
+                              np.asarray(extractor.mel_filters))
+
     def audio_encoder(self, model, mel: LogMelFrontend) -> nn.Module:
         """`waveform -> projected audio embeddings`, as ONE traceable module: this checkpoint's audio
         tower and its projector, with `mel` in front of them.
@@ -298,8 +365,11 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
         """`(samples_per_chunk, frames_per_chunk)` -- the two numbers the DRIVER does arithmetic with.
 
         A "chunk" is the unit of audio this encoder consumes indivisibly, and the unit a host pads up
-        to: one second for Qwen3-ASR (`hop_length * n_window * 2`), thirty for Voxtral (a whole Whisper
-        window). `frames_per_chunk` is how many prompt positions one chunk becomes -- 13 and 375. The
+        to: one second for Qwen3-ASR (`hop_length * n_window * 2`), **twelve** for Granite Speech
+        (`lcm(context_size, window_size)` encoder frames, because its conformer's blocks and its
+        Q-Former's windows must both divide the sequence -- a leaf can be this coarse and the template
+        does not care). `frames_per_chunk` is how many prompt positions one chunk becomes -- 13 and
+        120, which is also why "a chunk" is not a duration this family has any opinion about. The
         driver's audio segment is `floor(#waveform / samples_per_chunk) * frames_per_chunk` rows, which
         is the only place these numbers are used and the reason both are published as hparams.
 
@@ -331,7 +401,7 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
         self.hidden_size = int(language_model.config.hidden_size)
         self.prompt_constants = dict(self.prompt_segment_constants(model))
 
-        mel = LogMelFrontend(extractor.n_fft, extractor.hop_length, np.asarray(extractor.mel_filters))
+        mel = self.mel_frontend(extractor)
         encoder = self.audio_encoder(model, mel).eval()
 
         # The two numbers a host does arithmetic with, checked against the graph that produces them
