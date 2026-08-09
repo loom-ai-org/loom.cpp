@@ -3030,6 +3030,44 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   Voxtral would have been: a conformer encoder over 160-bin features and a **Q-Former** projector
   (`num_queries = window_size // downsample_rate`), where Voxtral is a Whisper encoder and a linear
   stack — so it varies both halves the template claims to abstract, not one.
+
+  **P4.3c — Granite Speech 4.0.1b, family 3's second leaf — SCOPED, not started.** The refactor it
+  forced is done and committed (the two hooks below); what remains is the leaf itself. Scoped in enough
+  detail here that it can be picked up cold, because the arithmetic is the part that is easy to get
+  subtly wrong.
+
+  `has_lora_adapter = False` on this checkpoint, so the LoRA path other Granite Speech variants carry
+  is not in play. It loads in the **piper** venv — `granite_speech` ships in transformers 4.57.6 — so
+  unlike Qwen3-ASR it does not need the ovos split ([[env-python-venvs-export]] equivalent: BACKLOG's
+  P4.3 note on the two environments).
+
+  1. **Generalize `LogMelFrontend`** rather than write a second one. Granite's extractor is a
+     torchaudio `MelSpectrogram` (n_fft 512, **win_length 400**, hop 160, 80 mels) followed by
+     `clip_(1e-10).log10_()`, a global `amax`, `maximum(x, mx - 8)` and `.div_(4).add_(1)` — and
+     `x/4 + 1` *is* Whisper's `(x + 4)/4`. So the arithmetic is already there; what the class needs is
+     `win_length` decoupled from `n_fft` and an arbitrary filterbank array. Reimplementing torchaudio's
+     transform with `torch.stft` is required regardless — `complex_shape` cannot be lowered, which is
+     the same wall `gigaam_export._TraceableMelSpectrogram` hit (P4.2). The leaf then adds the
+     drop-last-frame-if-odd and the pair-stacking into 160-dim features.
+  2. **A traceable conformer wrapper** (16 layers: depthwise conv, GLU, Shaw relative attention).
+     Untraceable as written for exactly the reason Qwen3-ASR's was: `num_blocks =
+     math.ceil(num_features / context_size)` and a `remainder`-driven right-pad are Python-level and
+     bake into the trace. Same fix — require the chunk contract so `remainder == 0`, keep the block
+     count dynamic with `reshape(-1)`. `attention_dists` is a static `(200, 200)` buffer and needs
+     nothing.
+  3. **The BLIP-2 Q-Former projector**: a learnable `(1, 3, 1024)` query, windows of 15 encoder frames,
+     `num_queries = window_size // downsample_rate = 3`. Its own `ceil`-pad has to be made exact by the
+     same contract.
+  4. **`audio_geometry()` returns `(192000, 120)`**, and both numbers are forced rather than chosen.
+     Encoder frames must be a multiple of `context_size` (200, the conformer's blocks) **and** of
+     `window_size` (15, the Q-Former's), so the chunk is `lcm(200, 15) = 600` encoder frames = 1200 mel
+     frames = **192000 samples, 12 s**; the rows are `600/15 × 3 = 120`. That is coarse — a host pads up
+     to twelve seconds — and it is a property of this checkpoint's two block sizes, not of the template.
+     `phases()`' existing cross-check is what verifies the pair against the traced encoder.
+
+  **Gate**, the same shape as Qwen3-ASR's and in the same order: the encoder tensor against HF's own
+  `get_audio_features` first (a tensor oracle, because P4.2 established a wrong encoder still decodes a
+  plausible transcript), then the whole driver's token ids against HF's `generate`.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's
