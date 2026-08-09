@@ -70,9 +70,15 @@ class WindowedAudioEncoder(nn.Module):
     makes the packing step an identity. It also makes the checkpoint's own feature extractor a faithful
     oracle: its mel-axis right-pad becomes a no-op on such a waveform, so HF and this phase see the
     identical mel. The cost is that up to one second of trailing silence becomes real audio embeddings
-    the LM reads, where HF would have masked them out. Trimming them needs a way to feed a *prefix* of
-    a retained tensor, which nothing has today: BACKLOG.md **P4.3d**, open, and shared with the second
-    leaf, where the chunk is twelve seconds rather than one and the cost is correspondingly larger.
+    the LM reads, where HF would have masked them out.
+
+    **This leaf keeps that cost deliberately** (BACKLOG.md P4.3d). The family can now trim a prompt to
+    the rows a caller's real audio produced, and Granite Speech does; the number to trim to is a
+    per-checkpoint formula, and this checkpoint's runs three stride-2 convs over its final partial
+    chunk whose valid mel-frame count comes off an extractor mask with its own padding rules. A closed
+    form over the sample count disagreed with `Qwen3ASRProcessor._get_audio_token_length` at 5 of 12
+    probe lengths, and a chunk here is one second -- at most 13 rows -- so `audio_rows` stays the
+    template's padded default rather than a formula that is wrong at the edges.
     """
 
     def __init__(self, mel: LogMelFrontend, tower: nn.Module, projector: nn.Module, audio_config):

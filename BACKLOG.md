@@ -3122,30 +3122,70 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   for at all; `-plus` has the identical block geometry and is the obvious third leaf the day its
   module ships.
 
-  **P4.3d — the chunk contract's trailing padding reaches the LM — NOT STARTED, and it affects both
-  leaves.** Recorded here because P4.3 and P4.3c each said "filed, not done" against no filed item,
-  and `qwen3_asr_export` pointed at an `EXPORT-ROADMAP.md` follow-up that does not exist.
+  **P4.3d — a prompt segment can be a PREFIX of a retained tensor — DONE (2026-08-09).** Both encoders
+  require the waveform to be a whole number of chunks with every frame valid — that is what makes HF's
+  `nonzero()`-packing and its `ceil`-padding collapse into identities, which is what makes them
+  traceable at all. So a host zero-pads up to the chunk boundary, and the encoder emits **real**
+  embedding rows for that padding, which the LM read as speech. HF masks them out
+  (`input_features_mask`); the driver had no way to, because the encoder's output deliberately never
+  crosses into Lua (P4.0.12) and there was no spelling for "these rows of it".
 
-  Both encoders require the waveform to be a whole number of chunks with every frame valid — that is
-  what makes HF's `nonzero()`-packing and its `ceil`-padding collapse into identities, which is what
-  makes them traceable at all. So a host zero-pads up to the chunk boundary, and the encoder emits
-  **real** embedding rows for that padding, which the LM reads as speech. HF masks them out
-  (`input_features_mask`); this driver has no way to. The cost scales with the chunk: up to 13 junk
-  rows for Qwen3-ASR (one second), up to **120** for Granite Speech (twelve). Neither model's gate sees
-  it, because both fixtures pad `samples/jfk.wav` to a whole chunk and HF is given the same padded
-  waveform, so the reference contains the same junk rows — which is correct as an exporter oracle and
-  says nothing about transcript quality on a clip that is 12.1 s long.
+  Three pieces, one per layer:
 
-  **What it needs is one capability, and it is not a mask.** The driver already computes the true row
-  count (`floor(#waveform / samples_per_chunk) * frames_per_chunk` is the padded one; the unpadded one
-  is the same arithmetic on the caller's real length). What is missing is a way for `PromptSegments`'
-  `bound` segment to feed *a prefix of* a retained tensor to the next `run_subgraph` — the encoder's
-  output deliberately never crosses into Lua (P4.0.12), so it is an opaque backend tensor and there is
-  no spelling for "these rows of it". That is an `OutputRef`-with-extent on the engine side, plus one
-  field on `PromptSegments`; the trimming itself is then arithmetic the driver already does.
+  1. **`{from = 'm', rows = N}`** in `set_tensor_from_output_ref` — `copy_row_prefix` builds a
+     `ggml_view_2d` over the retained tensor and hands it to `ggml_backend_tensor_copy`, so the prefix
+     reuses ggml's own copy strategy rather than restating its three branches. A view needs
+     `ggml_backend_view_init` before it has a buffer at all; without that the copy dereferences null.
+  2. **`OutputRef.rows`**, an *expression* rather than an int, with `reads()` delegating to it — the
+     `Len` lesson from P4.3: a reference this class did not report is a read `validate()` never
+     resolved.
+  3. **`PromptSegments.audio_rows`** replaces the `(samples_per_chunk, audio_rows_per_chunk)` pair, and
+     the component feeds the SAME local as the segment's `n_tokens` axis and as `rows`. That is what
+     makes the two impossible to disagree about: a mismatch is a shape error the engine raises, where a
+     segment that merely asked for the wrong length would be a silently short prompt.
 
-  Not urgent for Qwen3-ASR and genuinely worth doing for Granite Speech, which is the argument for
-  doing it once, in the shared component, rather than per leaf.
+  **The host says how long its real audio was, or says nothing.** `inputs.audio_samples` falls back to
+  `#inputs.waveform`, so a caller that omits it gets exactly the behaviour this family had before — and
+  `rows` then equals the whole retained tensor, which check 5b of
+  `test_lua_bridge_retained_outputs.cpp` pins as bit-identical to the untrimmed copy.
+
+  | check | result |
+  |---|---|
+  | a prefix of a retained output vs the same rows sliced out of the marshalled table | identical, at two row counts; and *not* equal to the same number of rows taken from the tail |
+  | `rows` = everything retained vs no `rows` at all | identical |
+  | the four ways to get it wrong (past the end, zero rows, disagreeing with the consumer's axis, non-2-D) | all raise, naming the real problem — 10 error cases now, was 7 |
+  | Granite's rendered Lua row formula, evaluated in **luajit**, vs `_get_num_audio_features` | identical at all sixteen lengths |
+  | the driver with `audio_samples` = the whole 192000-sample chunk | the untrimmed sequence, token for token |
+  | the driver with `audio_samples` = 32000 (2 s of the 12 s chunk) | `"and so my fellow americans ask"` + eos — the first two seconds and nothing else, from 21 of the retained 120 rows |
+  | kokoro, whisper-small, lfm2-monolithic re-exported | byte-identical, every snapshot file |
+  | qwen3-asr re-exported | two lines of driver text, both in the audio segment: `inputs.audio_samples or #inputs.waveform`, and `rows = _seg_tokens` on the `{from = 'encoder'}` reference. Every topology and every tensor identical, and the row count is the same number it always computed — this leaf keeps the padded default |
+  | the Python suite | 503 passed |
+
+  **The row count is a per-checkpoint formula, and the template's default is the padded one.**
+  Granite Speech's is `ceil((L // hop + 1) // 2 / window) * num_queries`, i.e.
+  `_get_num_audio_features` line for line, **checked against the extractor at sixteen lengths**
+  including both sides of a chunk boundary and lengths shorter than one hop. Qwen3-ASR's is
+  deliberately **not** overridden: its count comes from three stride-2 convs over a final partial chunk
+  whose valid mel-frame count the extractor derives from a mask with its own padding rules, and a
+  closed form over the sample count disagreed with it at 5 of 12 probe lengths. Its chunk is one second
+  (≤13 rows), so it keeps the padded default rather than a formula that is wrong at the edges.
+
+  **What this does NOT fix, measured rather than assumed.** Trimming makes the LM stop reading the
+  silence rows; it does not make the retained rows equal HF's. On a 13 s clip padded to 24 s, the first
+  132 rows of our padded encoder differ from HF's own 132 rows by **max 3.9e-01** against a reference
+  whose absmax is 0.992 — because HF's conformer crops back to the real frame count after every
+  attention block and masks its final partial block, where ours runs the whole padded sequence
+  unmasked. Greedy decoding was unmoved (all three of HF-unpadded, HF-padded and ours-trimmed produced
+  the identical transcript), which is why this was worth doing as a prompt-level fix and is not yet
+  worth doing as an encoder rewrite. That rewrite is **P4.3e**.
+
+  **P4.3e — the encoder's own padding handling — NOT STARTED.** The other half of P4.3d, and the
+  larger one numerically. To make a family-3 encoder agree with HF on audio that does not fill its last
+  chunk, the encoder phase needs the valid length as an input and has to build its own validity masks
+  in-graph — Granite's per-block conformer mask and its post-attention crop, Qwen3-ASR's frame packing.
+  Both are the things the chunk contract exists to avoid, so this is a real project, not a follow-up
+  edit. The measurement above (3.9e-01 on rows the model does read, no token difference) is the
+  argument for filing it rather than doing it now.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's

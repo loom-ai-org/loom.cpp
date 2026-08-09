@@ -242,6 +242,71 @@ int main() {
         }
     }
 
+    // --- 3. `audio_samples`: the prompt is trimmed to the rows the caller's REAL audio produced ---
+    //
+    // The encoder's contract is a whole number of twelve-second chunks, so a host pads and the encoder
+    // emits real embedding rows for that padding. Passing the unpadded length makes the driver hand
+    // the decoder only the rows those samples produce (BACKLOG.md P4.3d).
+    //
+    // **Two checks, and the first is the exact one.** Declaring the whole padded waveform valid must
+    // reproduce check 2's sequence token for token: `rows` then equals everything the encoder retained,
+    // so the trimmed path and the untrimmed path are the same copy, and any difference would be the
+    // prefix machinery corrupting a case it is not even supposed to change. The second declares two
+    // seconds of a twelve-second chunk and requires the answer to CHANGE -- a driver that ignored
+    // `audio_samples` would silently return check 2's sequence, which is precisely the failure that has
+    // no other symptom.
+    {
+        loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        loom::GraphTopology embed_topo = loom::GraphTopology::parse(model->topology_json("embed"));
+        loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
+        loom::GraphTopology head_topo = loom::GraphTopology::parse(model->topology_json("lm_head"));
+        std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
+
+        loom::LoomLuaBridge bridge(backend.get());
+        bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("embed", *model, std::move(embed_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
+        bridge.register_module("lm_head", *model, std::move(head_topo), /*kv_cache=*/nullptr);
+        bridge.load_script(model->kv_str("model.driver_script"));
+
+        const std::vector<double> waveform_d(waveform.begin(), waveform.end());
+        auto run_with = [&](double valid_samples) {
+            std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+                {"waveform", waveform_d},
+                {"audio_samples", valid_samples},
+                {"max_new_tokens", static_cast<double>(expected.size())},
+            };
+            const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
+            const auto& out = std::get<std::vector<double>>(result);
+            std::vector<int32_t> ids;
+            ids.reserve(out.size());
+            for (double v : out) ids.push_back(static_cast<int32_t>(v));
+            return ids;
+        };
+
+        // The whole waveform declared valid: 192000 samples is 120 rows, which is everything the
+        // encoder retained, so this must be check 2's sequence exactly.
+        const std::vector<int32_t> whole = run_with(static_cast<double>(waveform.size()));
+        std::fprintf(stderr, "audio_samples = %zu (the whole chunk): %zu tokens\n", waveform.size(),
+                     whole.size());
+        LOOM_CHECK(whole.size() == expected.size());
+        for (size_t i = 0; i < whole.size(); ++i) LOOM_CHECK(whole[i] == expected[i]);
+
+        // Two seconds of it: 32000 samples is 21 rows by the checkpoint's own
+        // `_get_num_audio_features`, so 99 of the retained 120 rows never reach the decoder and the
+        // transcript cannot still be the whole utterance.
+        const std::vector<int32_t> clipped = run_with(32000.0);
+        std::fprintf(stderr, "audio_samples = 32000 (2 s of 12): %zu tokens: ", clipped.size());
+        for (int32_t t : clipped) std::fprintf(stderr, "%d ", t);
+        std::fprintf(stderr, "\n");
+        LOOM_CHECK(!clipped.empty());
+        bool differs = clipped.size() != expected.size();
+        for (size_t i = 0; i < clipped.size() && i < expected.size() && !differs; ++i) {
+            differs = clipped[i] != expected[i];
+        }
+        LOOM_CHECK(differs);
+    }
+
     std::fprintf(stderr, "test_e2e_granite_speech_mil_export: OK\n");
     return 0;
 }

@@ -147,8 +147,45 @@ LoomLuaBridge* bridge_from_upvalue(lua_State* L) {
 // the module's pieces individually rather than the Module struct.
 using StoreLookup = std::function<OutputStore&(const std::string&)>;
 
+// Copies the first `rows` rows of `src` into `dst`, backend-side and without a host round trip on any
+// backend where a full copy would avoid one.
+//
+// **Why a prefix is a capability and not a caller's slicing problem** (BACKLOG.md P4.3d). A family-3
+// encoder consumes audio in indivisible chunks -- one second for Qwen3-ASR, twelve for Granite Speech
+// -- so a host zero-pads up to the next boundary and the encoder emits real embedding rows for that
+// padding. Those rows are not audio and the language model should not read them. The driver knows how
+// many rows are genuine (it is the same arithmetic the host padded with), but the encoder's output
+// deliberately never becomes a Lua value, so until now there was no way to say "these rows of it".
+//
+// A `ggml_view_2d` over the source rather than three hand-written copy branches: the prefix of a
+// contiguous tensor is contiguous, and a 2-D view of it has exactly the `ne`/`nb` a contiguous
+// destination of that shape has -- which is what `ggml_backend_tensor_copy` asserts. So this reuses
+// ggml's own copy strategy (host memcpy, device-to-device, or its own fallback) instead of restating
+// it here.
+void copy_row_prefix(ggml_tensor* src, ggml_tensor* dst, int64_t rows, const std::string& src_module,
+                      const char* fname) {
+    if (src->ne[2] != 1 || src->ne[3] != 1 || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        throw Error(std::string(fname) + ": module '" + src_module + "' output is not a contiguous 2-D "
+                     "tensor, so a row prefix of it is not a contiguous view -- `rows` is only defined "
+                     "for the [width, rows] outputs a driver splices into another module's input");
+    }
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context_ptr ctx(ggml_init(params));
+    ggml_tensor* view = ggml_view_2d(ctx.get(), src, src->ne[0], rows, src->nb[1], 0);
+    // A freshly created view carries no buffer -- ggml-alloc is what normally attaches one, and this
+    // view never reaches a graph. `ggml_backend_view_init` is the supported way to point it at its
+    // source's buffer, and without it `ggml_backend_tensor_copy` dereferences a null buffer.
+    if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
+        throw Error(std::string(fname) + ": could not view the first " + std::to_string(rows) +
+                     " row(s) of module '" + src_module + "' output");
+    }
+    ggml_backend_tensor_copy(view, dst);
+}
+
 // Is the Lua value at `value_idx` a retained-output reference -- `{from = "module"}`, optionally with
-// `index` and `gen` -- rather than a plain data array?
+// `index`, `gen` and `rows` -- rather than a plain data array?
 //
 // Unambiguous by construction: an input table's ordinary value is a 1-indexed array of numbers, which
 // has no `from` field at all, and a table that HAS one is not something any existing driver passes.
@@ -197,6 +234,36 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
                      "} -- an output index is 1-based, like the declared-output list it indexes");
     }
     ggml_tensor* src = store.get(static_cast<size_t>(index1 - 1));
+
+    // How many of the source's rows to copy. Absent means all of them, which is every caller but the
+    // one that trims an audio encoder's chunk padding -- see `copy_row_prefix`.
+    lua_getfield(L, value_idx, "rows");
+    const bool trimmed = !lua_isnil(L, -1);
+    const auto rows = trimmed ? static_cast<int64_t>(std::llround(lua_tonumber(L, -1))) : int64_t{0};
+    lua_pop(L, 1);
+
+    if (trimmed) {
+        if (rows < 1 || rows > src->ne[1]) {
+            throw Error(std::string(fname) + ": {from='" + src_module + "', rows=" +
+                         std::to_string(rows) + "} -- module '" + src_module + "' retained " +
+                         std::to_string(src->ne[1]) + " row(s), so that is not a prefix of it");
+        }
+        if (src->type != dst->type || src->ne[0] != dst->ne[0] || dst->ne[1] != rows ||
+            dst->ne[2] != 1 || dst->ne[3] != 1) {
+            throw Error(std::string(fname) + ": module '" + src_module + "' output " +
+                         std::to_string(index1) + " is " + ggml_type_name(src->type) + " [" +
+                         std::to_string(src->ne[0]) + "," + std::to_string(src->ne[1]) +
+                         "], and its first " + std::to_string(rows) + " row(s) are " +
+                         ggml_type_name(src->type) + " [" + std::to_string(src->ne[0]) + "," +
+                         std::to_string(rows) + "], but input '" + ggml_get_name(dst) + "' is " +
+                         ggml_type_name(dst->type) + " [" + std::to_string(dst->ne[0]) + "," +
+                         std::to_string(dst->ne[1]) + "," + std::to_string(dst->ne[2]) + "," +
+                         std::to_string(dst->ne[3]) + "] -- a row prefix is copied as-is, so the two "
+                         "must agree exactly");
+        }
+        copy_row_prefix(src, dst, rows, src_module, fname);
+        return;
+    }
 
     if (!ggml_are_same_shape(src, dst) || src->type != dst->type) {
         throw Error(std::string(fname) + ": module '" + src_module + "' output " + std::to_string(index1) +

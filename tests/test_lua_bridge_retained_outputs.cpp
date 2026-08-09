@@ -74,6 +74,43 @@ const char* kScript = R"lua(
         return logits
     end
 
+    -- A PREFIX of a retained output (BACKLOG.md P4.3d), against the only oracle that isolates the copy
+    -- itself: the same rows sliced out of the marshalled table. `cur` is [n_embd, n_tokens] and ne[0]
+    -- is the fastest axis, so its first `k` rows are its first `k * n_embd` marshalled elements --
+    -- which is exactly the claim `copy_row_prefix` makes about a contiguous view.
+    function prefix_marshalled(inputs)
+        local n = #inputs.tokens
+        local cur = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0},
+                                       {tokens = inputs.tokens})
+        -- `#cur / n`, not the shape return: stage_a declares TWO outputs, so run_subgraph's returns are
+        -- (cur, normed, shape_cur, shape_normed) and a two-local capture would bind `normed`.
+        local head = {}
+        for i = 1, inputs.rows * (#cur / n) do head[i] = cur[i] end
+        return loom.run_subgraph('stage_b', {n_tokens = inputs.rows, n_past = 0}, {hidden = head})
+    end
+
+    function prefix_retained(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        return loom.run_subgraph('stage_b', {n_tokens = inputs.rows, n_past = 0},
+                                  {hidden = {from = 'stage_a', rows = inputs.rows}})
+    end
+
+    -- `rows` equal to everything the module retained must be the untrimmed copy, not a near-miss: it is
+    -- the case every driver hits whose audio happens to fill its last chunk exactly, and the case the
+    -- family's own default expression produces.
+    function prefix_all_retained(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local trimmed = loom.run_subgraph('stage_b', {n_tokens = n, n_past = 0},
+                                           {hidden = {from = 'stage_a', rows = n}})
+        local whole = loom.run_subgraph('stage_b', {n_tokens = n, n_past = 0},
+                                         {hidden = {from = 'stage_a'}})
+        local out = {}
+        for i = 1, #whole do out[i] = trimmed[i] - whole[i] end
+        return out
+    end
+
     -- Retrieval by name, marshalling form: must equal what run_subgraph returns for the same output.
     function get_output_roundtrip(inputs)
         local n = #inputs.tokens
@@ -161,6 +198,9 @@ const char* kScript = R"lua(
         "unregistered module 'nope'",
         'is not a non-empty sub-range',
         'is not a non-empty sub-range',
+        'so that is not a prefix of it',
+        'so that is not a prefix of it',
+        'must agree exactly',
     }
 
     function expect_error(inputs)
@@ -192,12 +232,33 @@ const char* kScript = R"lua(
                 loom.run_subgraph_and_retain('stage_b', {n_tokens = 3, n_past = 0},
                                               {hidden = {from = 'stage_a'}})
                 loom.argmax_row_range('stage_b', -1, 2, 99)
-            else
+            elseif inputs.case == 7 then
                 -- An empty window (lo == hi). There is no best of nothing.
                 loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
                 loom.run_subgraph_and_retain('stage_b', {n_tokens = 3, n_past = 0},
                                               {hidden = {from = 'stage_a'}})
                 loom.argmax_row_range('stage_b', -1, 3, 3)
+            elseif inputs.case == 8 then
+                -- A prefix longer than what the module retained. Clamping it would hand the decoder a
+                -- shorter prompt than the driver's own arithmetic said, which nothing downstream can
+                -- notice.
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph('stage_b', {n_tokens = 4, n_past = 0},
+                                   {hidden = {from = 'stage_a', rows = 4}})
+            elseif inputs.case == 9 then
+                -- An empty prefix. There is no zero-row segment; a driver that computed one has a
+                -- wrong row formula, which is exactly what this is here to surface.
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0},
+                                   {hidden = {from = 'stage_a', rows = 0}})
+            else
+                -- `rows` disagreeing with the axis the consumer was built for. This is the failure the
+                -- whole design leans on: PromptSegments feeds ONE local as both, so a formula that is
+                -- wrong in the same way in both places is caught by the encoder's own row count, and a
+                -- formula wrong in only one place is caught right here.
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.run_subgraph('stage_b', {n_tokens = 3, n_past = 0},
+                                   {hidden = {from = 'stage_a', rows = 2}})
             end
         end)
         if ok then return -1 end
@@ -302,10 +363,42 @@ int main() {
     LOOM_CHECK(reshaped.size() == 2 + 4);
     check_all_zero(reshaped, 2, "reshape_then_read");
 
+    // --- 5b. A PREFIX of a retained output equals the same rows sliced out of the marshalled table
+    // (BACKLOG.md P4.3d). This is the capability that lets a family-3 driver hand its decoder only the
+    // audio rows its caller's real waveform produced, rather than the whole chunk-padded encoder
+    // output -- and the oracle is a Lua slice, so it isolates the copy from everything else. ---
+    for (double rows : {1.0, 2.0}) {
+        const std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+            {"tokens", tokens}, {"rows", rows},
+        };
+        const std::vector<double> ref = as_array(bridge.call("prefix_marshalled", args));
+        const std::vector<double> got = as_array(bridge.call("prefix_retained", args));
+        std::fprintf(stderr, "prefix rows=%g: %zu element(s) each\n", rows, got.size());
+        LOOM_CHECK(got.size() == ref.size());
+        LOOM_CHECK(got.size() == static_cast<size_t>(6 * rows)); // [N_VOCAB=6, rows]
+        std::vector<double> diffs(got.size());
+        for (size_t i = 0; i < got.size(); ++i) diffs[i] = got[i] - ref[i];
+        check_all_zero(diffs, 0, "prefix_retained");
+        // ... and a prefix is genuinely a prefix: it must NOT equal the last rows, which is what a
+        // copy that took an offset from the wrong end would produce.
+        bool differs_from_tail = false;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (std::fabs(got[i] - marshalled[marshalled.size() - got.size() + i]) > 1e-6) {
+                differs_from_tail = true;
+            }
+        }
+        LOOM_CHECK(rows == static_cast<double>(tokens.size()) || differs_from_tail);
+    }
+
+    // `rows` equal to the whole retained output is the untrimmed copy exactly -- the case every
+    // chunk-aligned waveform hits, and the one the family's default expression always produces.
+    check_all_zero(as_array(bridge.call("prefix_all_retained", {{"tokens", tokens}})), 0,
+                   "prefix_all_retained");
+
     // --- 6. The failure modes are errors that name the real problem, not silence or a crash.
     // The script returns the case index when the message matched, 0 when it raised something else
     // (printing it), and -1 when nothing was raised at all -- the case that would matter most. ---
-    for (double case_id = 1; case_id <= 7; ++case_id) {
+    for (double case_id = 1; case_id <= 10; ++case_id) {
         const auto verdict = std::get<double>(bridge.call("expect_error", {{"case", case_id}}));
         std::fprintf(stderr, "error case %d: verdict %g\n", static_cast<int>(case_id), verdict);
         LOOM_CHECK(verdict == case_id);

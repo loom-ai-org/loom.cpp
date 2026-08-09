@@ -1607,12 +1607,18 @@ class PromptSegments(DriverComponent):
     embed_topology: Optional[str] = None
     # ((kind, expression), ...) in prompt order, kind in {"text", "bound"}.
     segments: Tuple[Tuple[str, object], ...] = ()
-    # How many decoder positions one chunk of audio occupies, and how many waveform samples one chunk
-    # is. Both READ off the model in `phases()` and cross-checked against the encoder's real output
-    # there -- the driver needs them because a `bound` segment's length is not something it can ask the
-    # retained tensor for.
-    audio_rows_per_chunk: int = 0
-    samples_per_chunk: int = 0
+    # How many decoder positions the bound (audio) segment occupies, as a driver_ir expression over the
+    # call's own inputs. A `bound` segment's length is not something the driver can ask the retained
+    # tensor for -- shapes do not cross the boundary -- so the family states it, and this component
+    # uses the one expression twice: as the segment's `n_tokens` axis AND as the number of rows the
+    # engine copies out of the retained tensor.
+    #
+    # An expression rather than the `(samples_per_chunk, rows_per_chunk)` pair it replaced, because the
+    # honest row count is not that product (BACKLOG.md P4.3d). The product is what the PADDED waveform
+    # produces; the rows past the caller's real audio are silence the language model should not read,
+    # and how many rows a given number of samples really becomes is a per-checkpoint formula --
+    # Granite Speech's rounds up to a Q-Former window, Qwen3-ASR's through three stride-2 convs.
+    audio_rows: object = None
 
     n_past_var: str = "_n_past"
     n_tokens_var: str = "_seg_tokens"
@@ -1633,14 +1639,14 @@ class PromptSegments(DriverComponent):
             "check_subgraph_calls rejects the latter if nothing retained that module, which are the "
             "two ways this list can be wrong."
         ),
-        "audio_rows_per_chunk": Unchecked(
-            "READ off the audio config and CROSS-CHECKED in BaseSpeechLMExportConfig.phases() against "
-            "the number of rows the traced encoder actually emits for a known chunk count -- which is "
-            "the check that matters, because a wrong value here places every later segment at the "
-            "wrong n_past with no shape mismatch to reveal it"
+        "audio_rows": Unchecked(
+            "a driver_ir expression over the call's own inputs, built from numbers READ off the "
+            "checkpoint and CROSS-CHECKED in BaseSpeechLMExportConfig.phases() against the rows the "
+            "traced encoder actually emits for a known chunk count. `validate()` resolves whatever "
+            "symbols it reads, and the engine rejects a count that is not a prefix of what the "
+            "encoder retained -- which is the check that matters, because a wrong value here would "
+            "otherwise place every later segment at the wrong n_past with nothing to reveal it"
         ),
-        "samples_per_chunk": Unchecked("same cross-check: the sample count whose mel is exactly one "
-                                       "encoder chunk"),
         "n_past_var": Unchecked("a local this component binds and PrefillDecodeLoop reads; "
                                 "driver_ir.validate resolves that read over the assembled function"),
         "n_tokens_var": Unchecked("same"),
@@ -1681,20 +1687,17 @@ class PromptSegments(DriverComponent):
                 ))
                 embeds = OutputRef(self.embed_topology)
             elif kind == "bound":
-                # The audio segment's length: one row per `audio_rows_per_chunk` per chunk of waveform.
-                # Computed rather than read back because a retained tensor's shape does not cross the
-                # boundary -- and it is exactly the arithmetic the host already did to pad the audio.
-                # `floordiv`, not `/`: Lua's `/` is float division, so a whole number of chunks would
-                # still make this a float and the axis table would carry 143.0 where the engine binds
-                # an integer extent. The waveform is a whole number of chunks by the encoder's own
-                # contract, so the floor changes no value -- only its type.
-                body.append(Assign(self.n_tokens_var, BinOp(
-                    "*",
-                    BinOp("floordiv", Len(FieldAccess("inputs", "waveform")),
-                          Lit(self.samples_per_chunk)),
-                    Lit(self.audio_rows_per_chunk),
-                )))
-                embeds = expr
+                # The audio segment's length, computed rather than read back because a retained
+                # tensor's shape does not cross the boundary. `audio_rows` is the family's own
+                # expression for it -- see that field.
+                body.append(Assign(self.n_tokens_var, self.audio_rows))
+                # The SAME local is handed to the engine as the row count to copy, which is what makes
+                # the two impossible to disagree about: a `rows` that did not match the axis is a shape
+                # error `set_tensor_from_output_ref` raises, where a segment that merely asked for the
+                # wrong length would be a silently short prompt. Trimming is the whole point -- the
+                # encoder's output is padded up to a whole chunk and the rows past the real audio are
+                # not audio (BACKLOG.md P4.3d).
+                embeds = dataclasses.replace(expr, rows=Var(self.n_tokens_var))
             else:
                 raise ValueError(
                     f"unknown prompt segment kind {kind!r}; this component understands 'text' (token "

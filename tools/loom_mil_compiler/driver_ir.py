@@ -14,7 +14,7 @@ adjacency rule (BACKLOG.md P4.0.12) lives in the second and not the first.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+from typing import Any, Optional
 
 
 class DriverIRError(Exception):
@@ -198,22 +198,36 @@ class OutputRef(Expr):
     all: on CPU that removes two copies of a value nobody looks at, and on a second backend it removes a
     device->host->device round trip per edge per step.
 
-    **`reads()` is empty, and that is the whole reason `check_subgraph_calls` grew an adjacency rule.**
-    This names a MODULE, not a local, so `validate()` -- which only knows about symbols -- has nothing
-    to check and would silently accept a reference to a module that never ran. The ordering question is
-    real either way, so it moved to the checker that knows what a module is.
+    **The MODULE it names is invisible to `reads()`, and that is the whole reason
+    `check_subgraph_calls` grew an adjacency rule.** A module is not a local, so `validate()` -- which
+    only knows about symbols -- has nothing to check and would silently accept a reference to a module
+    that never ran. The ordering question is real either way, so it moved to the checker that knows
+    what a module is. `rows` is an ordinary expression and IS reported, which is why `reads()` is
+    delegating rather than empty.
     """
     module: str
     # 1-based, indexing the target topology's own declared-output list.
     index: int = 1
+    # How many of that output's ROWS to copy, or None for all of them (BACKLOG.md P4.3d). An
+    # expression, not an int: the count a family-3 driver trims to is computed at run time from the
+    # caller's own audio length, and it is the same expression the segment's `n_tokens` uses -- which
+    # is the property that keeps the two from disagreeing, since a mismatch between them is a shape
+    # error the engine raises rather than a silently short prompt.
+    rows: Optional[Expr] = None
 
     def reads(self) -> list[str]:
-        return []
+        # Delegated, exactly as `Len` delegates: the module is not a symbol and never was, but `rows`
+        # is an ordinary expression over locals, and a reference this class did not report would be a
+        # read `validate()` never resolved.
+        return self.rows.reads() if self.rows is not None else []
 
     def render(self) -> str:
-        if self.index == 1:
-            return f"{{from = '{self.module}'}}"
-        return f"{{from = '{self.module}', index = {self.index}}}"
+        fields = [f"from = '{self.module}'"]
+        if self.index != 1:
+            fields.append(f"index = {self.index}")
+        if self.rows is not None:
+            fields.append(f"rows = {self.rows.render()}")
+        return "{" + ", ".join(fields) + "}"
 
 
 class RetainedRead(Expr):

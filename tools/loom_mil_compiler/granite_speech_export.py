@@ -62,10 +62,14 @@ class ConformerQFormerEncoder(nn.Module):
     **192000 samples / 12 s** -- because the conformer's blocks and the Q-Former's windows must BOTH
     divide the sequence. That is coarse compared with Qwen3-ASR's one second, and it is a property of
     this checkpoint's two block sizes rather than of the family. The cost is Qwen3-ASR's, scaled by
-    twelve: up to twelve seconds of trailing silence become real audio embeddings the LM reads -- up to
-    **120 junk rows** against that leaf's 13 -- where HF would have masked them out. Trimming them
-    needs a way to feed a *prefix* of a retained tensor, which nothing has today: BACKLOG.md **P4.3d**,
-    open, and the reason it is worth doing once in `PromptSegments` rather than per leaf.
+    twelve: up to twelve seconds of trailing silence become real audio embeddings -- up to **120 junk
+    rows** against that leaf's 13. `audio_rows` below is what keeps them out of the prompt, given a
+    caller that says how long its real audio was (BACKLOG.md P4.3d).
+
+    **The rows that DO reach the prompt are still not HF's**, and that is a separate, larger gap
+    (P4.3e): HF crops back to the real frame count after every attention block and masks its final
+    partial block, where this runs the whole padded sequence unmasked. Measured at max 3.9e-01 on a
+    reference whose absmax is 0.992, with no effect on the greedy transcript.
 
     The contract also makes the checkpoint's own feature extractor an exact oracle, because its
     "drop the final mel frame if the count is odd" fires on exactly the frame `LogMelFrontend` already
@@ -218,6 +222,10 @@ class ASRGraniteSpeechExportConfig(BaseSpeechLMExportConfig):
     instruction: str = "can you transcribe the speech into a written format?"
 
     _processor: Optional[object] = field(default=None, init=False, repr=False)
+    # `(hop_length, window_size, num_queries)` -- read in `audio_geometry`, used by `audio_rows`.
+    # Defaults to this checkpoint family's own values so `component_registry.usage()` can build the
+    # component list without a checkpoint, the same reason `prompt_constants` is read with `.get`.
+    _row_formula: tuple = field(default=(160, 15, 3), init=False, repr=False)
 
     __unchecked__ = {
         "instruction": Unchecked(
@@ -232,6 +240,11 @@ class ASRGraniteSpeechExportConfig(BaseSpeechLMExportConfig):
             "than per phase. Loaded FROM the checkpoint, never constructed with this family's idea of "
             "the defaults -- the filterbank, FFT geometry and window length are all properties of the "
             "checkpoint and `preprocessor_config.json` is where it states them."
+        ),
+        "_row_formula": Unchecked(
+            "READ off the extractor and projector in audio_geometry(), and checked where it is used: "
+            "`audio_rows` builds the expression these three numbers parameterize, and that expression "
+            "was compared against `_get_num_audio_features` at sixteen lengths"
         ),
     }
 
@@ -298,9 +311,41 @@ class ASRGraniteSpeechExportConfig(BaseSpeechLMExportConfig):
         projector = model.projector
         context_size = int(encoder_config.context_size)
         window_size = int(projector.window_size)
+        hop_length = int(extractor.melspec_kwargs["hop_length"])
+        num_queries = int(projector.num_queries)
         encoder_frames = context_size * window_size // gcd(context_size, window_size)
-        return (encoder_frames * 2 * int(extractor.melspec_kwargs["hop_length"]),
-                encoder_frames // window_size * int(projector.num_queries))
+        # The three numbers `audio_rows` needs, stashed here because this is the one moment the model
+        # and its extractor are both in hand -- the same reason `phases()` reads everything else it
+        # publishes at exactly this point.
+        self._row_formula = (hop_length, window_size, num_queries)
+        return (encoder_frames * 2 * hop_length, encoder_frames // window_size * num_queries)
+
+    def audio_rows(self, valid_samples):
+        """`GraniteSpeechFeatureExtractor._get_num_audio_features`, as a driver expression over the
+        caller's unpadded sample count (BACKLOG.md P4.3d).
+
+        HF's own four lines, in order: `mel = L // hop + 1` frames, `enc = mel // 2` encoder frames
+        (the extractor stacks consecutive pairs), `nblocks = ceil(enc / window_size)`, and
+        `nblocks * num_queries` rows. `ceil(a/b)` is spelled `(a + b - 1) // b` because that is what
+        `driver_ir` has and what Lua's `math.floor` gives; every term is a non-negative integer, so the
+        two agree everywhere.
+
+        **Checked against the extractor rather than believed.** Compared with
+        `_get_num_audio_features` at sixteen lengths, including both sides of a chunk boundary and
+        lengths shorter than one hop: identical at all of them. That matters because this number
+        decides where every later prompt position sits, and a wrong one is a silently mis-placed prompt
+        rather than an error -- the engine only catches it if it exceeds what the encoder retained.
+
+        The saving is large here, unlike the first leaf's: a chunk is twelve seconds, so a 13 s clip
+        pads to 24 s and 108 of its 240 audio rows are the encoder's reading of silence.
+        """
+        from .driver_ir import BinOp, Lit
+
+        hop, window, queries = self._row_formula
+        mel_frames = BinOp("+", BinOp("floordiv", valid_samples, Lit(hop)), Lit(1))
+        encoder_frames = BinOp("floordiv", mel_frames, Lit(2))
+        blocks = BinOp("floordiv", BinOp("+", encoder_frames, Lit(window - 1)), Lit(window))
+        return BinOp("*", blocks, Lit(queries))
 
     def prompt_segment_constants(self, model) -> dict:
         """The token ids the driver's prompt is built from, rendered through the checkpoint's own chat
