@@ -2987,9 +2987,49 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   `thinker_config`) declares the identical `model_type` while transformers reads class defaults off it
   *without raising* — a 1024-wide/24-layer encoder instead of this checkpoint's 896/18. `detect()`
   requires `audio_config` and `text_config` at the top level for that reason, so the native layout fails
-  detection with the candidate list rather than being exported as a plausible wrong model. Voxtral is the
-  obvious second leaf — a Whisper encoder, the same shape of projector, a Llama LM — and is not done;
-  the template predicts it needs only a loader, and that prediction is untested.
+  detection with the candidate list rather than being exported as a plausible wrong model.
+
+  **P4.3b — Voxtral-Mini-3B as a second leaf — DEFERRED, and the reason is this machine rather than the
+  template.** It was the obvious second leaf (a Whisper encoder, a 4-frame-stack projector, a Llama LM)
+  and it is the one member that does not fit here. Measured, so a machine with more memory can pick it
+  up without re-deriving any of it:
+
+  | measurement | value |
+  |---|---|
+  | parameters | 4.68B (`model.safetensors.index.json`'s own `total_size / 2`) |
+  | F32 artifact it would write | **18.7 GB** |
+  | fp32 checkpoint, resident | **18.7 GB** (peak RSS 20.6 GB; the excess is mmap'd checkpoint pages) |
+  | fp16 checkpoint, resident | **9.36 GB** (peak RSS 18.8 GB — RSS double-counts the 9.35 GB of file pages, which are evictable) |
+  | `torch.jit.trace` of the 3.6B LM phase | **free** — 18.8 GB before and after, at fp16 |
+  | `ct.convert` on the LM phase | ~14.4 GB inferred from the parameter count, **not measured** — every probe died at or before this call |
+  | this machine | 28 GB available, **no swap** |
+
+  `MultiPhase.export` holds the torch model, every phase's converted MIL program *and* the merged
+  weights simultaneously, so the peak is a sum rather than a max: ~35 GB against 28.
+
+  **Two routes were measured and closed.**
+
+  * **Half precision does not work, and not for a memory reason.** Tracing a Llama-3B at fp16 on CPU
+    succeeds — the risk that half kernels would be missing did not materialise — but `ct.convert`
+    refuses the resulting graph. With fp16 *inputs* it wants a `minimum_deployment_target >= iOS16`;
+    supplying one, and separately declaring fp32 inputs over fp16 weights, both fail with an internal
+    `TypeError: only 0-dimensional arrays can be converted to Python scalars`. coremltools 9.0 with
+    torch 2.8 will not take a half-precision traced graph through its torch frontend.
+  * **The `quantize=` argument cannot help**, though the mechanism is real and proven
+    (`test_e2e_qwen3_q8_0`, `test_e2e_lfm2_q8_0`). It is a *serialization*-time transform: the loop in
+    `write_gguf` iterates `self.weights`, which by then holds every phase's f32 array, and it
+    `astype(np.float32)`s each one before deciding whether to quantize. It shrinks the artifact —
+    Voxtral would write ~9.6 GB at F16 or ~5 GB at Q8_0 — and changes peak memory not at all. Disk was
+    never the binding constraint.
+
+  **What would actually move it** is P5's per-phase process isolation below. Even then the floor is
+  ~29 GB (the LM phase alone needs its 14.4 GB of fp32 weights and their 14.4 GB of MIL constants to
+  coexist), so a bigger machine is the honest answer, not exporter surgery.
+
+  **Granite Speech 4.0.1b is the second leaf instead**, and it is a better test of the template than
+  Voxtral would have been: a conformer encoder over 160-bin features and a **Q-Former** projector
+  (`num_queries = window_size // downsample_rate`), where Voxtral is a Whisper encoder and a linear
+  stack — so it varies both halves the template claims to abstract, not one.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's
@@ -3010,6 +3050,34 @@ Ordered by coverage-per-effort, subject to P0.3's corrections: family 12 (BERT t
 smallest possible template, proves the registry on a non-audio task) → 11 (codec decoders, unlocks
 family 10's back half) → 4 (CNN+CTC) and 5 (SANM), both family-1-shaped once the encoder template is
 generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small classifiers) → 14 (music).
+
+- **P5.0 — per-phase process isolation for the conversion step.** Not a family: the thing that decides
+  which models can be exported *at all* on a given machine.
+
+  `MultiPhase.export` currently makes peak memory a **sum** where it should be a **max**. It loads the
+  whole checkpoint once, then for every phase holds the converted MIL program (`traced_programs`, kept
+  so `_fused_ops()` can read the KV geometry back), and finally `merge_phase_weights` assembles every
+  phase's weights before `write_gguf` starts. A four-phase model therefore holds four programs, one
+  torch model and one merged weight dict at the same moment, and the torch model plus one phase's MIL
+  constants are already two full copies of that phase's parameters.
+
+  Three changes, in increasing order of cost and of payoff:
+
+  1. **Read each phase's KV/conv-state geometry when it converts, and drop the program.** The programs
+     are kept only for `_fused_ops()`; nothing needs them after the geometry is extracted. Cheapest,
+     and it removes the accumulation across phases.
+  2. **Quantize (or at least `astype`) each phase's weights as it converts, rather than at write time.**
+     `write_gguf`'s loop currently upcasts everything to f32 first, so the `quantize=` argument shrinks
+     the artifact and nothing else. Doing it per phase makes the accumulated term small.
+  3. **Convert each phase in its own process, loading only that phase's submodule.** The real fix, and
+     the expensive one: it needs partial checkpoint loading (instantiate the submodule and load only
+     its keys) and a merge step that reads each child's weights back off disk. Peak becomes
+     `max_phase(submodule + its MIL)`.
+
+  **Gate:** the existing byte-identity sweep — every model re-exports identical — plus a measured peak
+  RSS for one large model before and after. Motivated by P4.3b's Voxtral measurements; note there that
+  even all three changes leave Voxtral at ~29 GB against 28, so this is not a fix for that model, and
+  should not be scheduled as if it were.
 
 #### P6 — cleanup
 
