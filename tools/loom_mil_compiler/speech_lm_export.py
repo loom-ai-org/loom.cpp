@@ -378,6 +378,33 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
         """
         raise NotImplementedError
 
+    def audio_rows(self, valid_samples):
+        """How many prompt positions the audio segment really occupies, as a `driver_ir` expression
+        over `valid_samples` -- the caller's UNPADDED sample count (BACKLOG.md P4.3d).
+
+        **Why this is not `chunks * frames_per_chunk`.** That product is what the padded waveform
+        produces, and the encoder's contract is that a host pads up to a whole chunk -- so the rows
+        past the caller's real audio are the encoder's reading of trailing silence, which HF masks out
+        and the language model should not see. How many rows a given number of samples really becomes
+        is a per-checkpoint formula: Granite Speech rounds up to a Q-Former window, Qwen3-ASR walks
+        three stride-2 convs over its final partial chunk.
+
+        **The default is the padded count**, i.e. exactly what this family did before trimming existed.
+        That is the right default rather than a `NotImplementedError`: a leaf that has not worked out
+        its checkpoint's formula still exports a correct model, one that reads a little silence, and
+        the `rows` it hands the engine then equals the full retained tensor. A leaf overrides this only
+        when it can state the formula and check it against the checkpoint's own extractor.
+
+        **Every division here must be `floordiv`, in any override too.** Lua's `/` is float division,
+        so a whole number of chunks would still produce `143.0` where the engine binds an integer
+        extent -- and `rows` reaches `std::llround` on the engine side, where a fractional count would
+        round rather than fail.
+        """
+        from .driver_ir import BinOp, Lit
+
+        return BinOp("*", BinOp("floordiv", valid_samples, Lit(self.samples_per_chunk)),
+                     Lit(self.frames_per_chunk))
+
     def prompt_segment_constants(self, model) -> dict:
         """`{name: token id}` the driver builds its prompt from, read off this checkpoint's own
         tokenizer and config. A leaf's job because the chat template is a checkpoint fact."""
@@ -521,7 +548,15 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
         from .driver_components import (
             ExportConstants, LuaFragment, PrefillDecodeLoop, PromptSegments, SubgraphCallComponent,
         )
-        from .driver_ir import FieldAccess, Len, Lit, OutputRef, Var
+        from .driver_ir import BinOp, FieldAccess, Len, Lit, OutputRef, Var
+
+        # The caller's real audio length, before it padded up to a whole chunk. Optional, and the
+        # fallback is the padded length itself -- so a host that does not know or does not care gets
+        # exactly the behaviour this family had before trimming existed, and one that passes it gets a
+        # prompt with no silence rows in it (BACKLOG.md P4.3d). Same `or`-with-a-default idiom as
+        # `max_new_tokens`/`eos_token`, and for the same reason: a driver input a host may omit.
+        valid_samples = BinOp("or", FieldAccess("inputs", "audio_samples"),
+                              Len(FieldAccess("inputs", "waveform")))
 
         return [
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
@@ -551,8 +586,7 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
                     ("text", Var("AUDIO_PREFIX")),
                     ("bound", OutputRef("encoder")),
                 ),
-                audio_rows_per_chunk=self.frames_per_chunk,
-                samples_per_chunk=self.samples_per_chunk,
+                audio_rows=self.audio_rows(valid_samples),
             ),
             PrefillDecodeLoop(
                 topology="decoder",

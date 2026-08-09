@@ -20,8 +20,14 @@
 -- has to.
 --
 -- inputs: waveform (flat f32 array, host-padded with zeros to a multiple of `loom.samples_per_chunk`
--- samples, which every leaf's encoder contract requires), and two optional ones, max_new_tokens and
--- eos_token (negative disables the early stop).
+-- samples, which every leaf's encoder contract requires), and three optional ones: audio_samples,
+-- max_new_tokens and eos_token (negative disables the early stop).
+--
+-- `audio_samples` is how many samples the caller's REAL audio was, before it padded. The padding is
+-- audio as far as the encoder is concerned -- it emits embedding rows for it -- and those rows are not
+-- speech, so the prompt is trimmed to the rows the real length produces and the rest never reach the
+-- language model. Omitting it means "the whole waveform is real", which is exactly what a caller whose
+-- audio already filled its last chunk should say.
 --
 -- The prompt is built here, not passed in: it comes from the checkpoint's own chat template, rendered
 -- at export time into the AUDIO_PREFIX/AUDIO_SUFFIX constants this driver's own ExportConstants block

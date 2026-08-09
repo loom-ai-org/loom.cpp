@@ -65,7 +65,7 @@ Three builders exist:
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 13 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, whisper |
-| `prompt_segments` | `PromptSegments` | statements | 2 | 6 | granite-speech, qwen3-asr |
+| `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
 | `export_constants` | `ExportConstants` | statements | 0 | 1 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
