@@ -43,6 +43,21 @@ measured that going *up*). It is that the spec's claims are checked against the 
 time and raise naming the exact mismatch: pointing an `EncoderOutput.CTC_LOG_PROBS` spec at an RNNT
 checkpoint raises before the encoder is traced at all, instead of producing a GGUF whose "log_probs"
 output is silently an encoder activation.
+
+**Half of this module is not NeMo's, and P4.2 is what established that** (BACKLOG.md P4.2, GigaAM v3).
+`EncoderOutput`, `ASREncoderWrapper`, `build_trace` and the three `*_SECONDS` constants describe
+`EXPORT-ROADMAP.md` R5's *family 1* -- a Conformer encoder taking a waveform and a length -- and know
+nothing about how the checkpoint holding it was restored. GigaAM v3 is loaded through
+`AutoModel.from_pretrained(..., trust_remote_code=True)` rather than `ASRModel.restore_from`, and
+imports all four unchanged; the whole of the difference is `load_model()` plus the two keyword-argument
+names its `forward` uses, which is `ASREncoderWrapper.input_names`. That is the loader/template split
+`EXPORT-ROADMAP.md` R3 asked to be proved, and it is proved by reuse rather than by a claim here.
+
+The module keeps its name because NeMo is still the only loader with a config *of its own* in it
+(`ASRNemoEncoderExportConfig`, the CTC leaf) and because `prepare_nemo_environment` and
+`extract_nemo_tokenizer_dir` are genuinely NeMo's. A third loader is the point at which the family-1
+encoder half earns a module of its own; two did not make the case, and splitting on the first
+opportunity would have moved code before anything had shown where the seam is.
 """
 import os
 import sys
@@ -53,7 +68,7 @@ import types
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import yaml
 
@@ -308,6 +323,12 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     def load_model(self):
         return load_model(self)
 
+    def encoder_wrapper(self, model):
+        """The module `build_trace` traces as this family's encoder. Overridden by a family whose
+        checkpoint's `forward` names its two inputs differently -- `gigaam_export` is the one that
+        does, and overriding this method is the whole of what it needs from this half of the family."""
+        return ASREncoderWrapper(model, self.output)
+
     def build_trace(self, model):
         """`Flattened`'s hook. The structural validation runs here rather than in `load_model` because
         it also yields the sample rate the trace length and RangeDim bounds are derived from."""
@@ -354,17 +375,36 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
         return kwargs
 
 
-class _NeMoASREncoderWrapper(nn.Module):
-    """Reduces a NeMo ASR model's multi-value `forward` to the one tensor `spec.output` names, and
-    validates that claim against what the model actually returned while doing it."""
+# NeMo's own (audio, length) forward argument names -- the default every `ASRModel.restore_from`
+# checkpoint declares. See `ASREncoderWrapper.input_names`.
+ENCODER_INPUT_NAMES = ("input_signal", "input_signal_length")
 
-    def __init__(self, model, output: EncoderOutput):
+
+class ASREncoderWrapper(nn.Module):
+    """Reduces an ASR model's multi-value `forward` to the one tensor `spec.output` names, and validates
+    that claim against what the model actually returned while doing it.
+
+    `input_names` is the pair of keyword arguments *this checkpoint's* forward takes for (audio, length).
+    It defaults to NeMo's, because `ASRModel.restore_from` is where this template started and every
+    checkpoint it restores declares that pair. GigaAM v3's remote-code `GigaAM.forward` names the same
+    two tensors `features`/`feature_lengths` (`gigaam_export.py`), and that -- with `load_model()` -- is
+    the entire difference between the two loaders. A parameter rather than a second wrapper class
+    precisely so the size of that difference is visible.
+
+    A wrong name is not checked here and does not need to be: it reaches `nn.Module.__call__` as an
+    unexpected keyword and raises a `TypeError` naming the parameter, before anything is traced.
+    """
+
+    def __init__(self, model, output: EncoderOutput,
+                 input_names: Tuple[str, str] = ENCODER_INPUT_NAMES):
         super().__init__()
         self.model = model
         self.output = output
+        self.input_names = tuple(input_names)
 
     def forward(self, waveform, length):
-        outputs = self.model(input_signal=waveform, input_signal_length=length)
+        audio_name, length_name = self.input_names
+        outputs = self.model(**{audio_name: waveform, length_name: length})
         self.output.validate(self.model, outputs)
         return self.output.select(outputs)
 
@@ -381,10 +421,15 @@ def load_model(spec: ASRNemoEncoderExportConfig):
     return model
 
 
-def build_trace(spec: ASRNemoEncoderExportConfig, model, sample_rate: int):
+def build_trace(spec, model, sample_rate: int):
     """The wrapper, `TRACE_SECONDS` of dummy audio, and the MIL input declarations with a dynamic sample
     axis -- `Flattened` does the trace and the `ct.convert` itself (including the load-bearing
-    FLOAT32 compute precision this module's own docstring explains)."""
+    FLOAT32 compute precision this module's own docstring explains).
+
+    `spec` is any family-1 config: the CTC one here, and both transducer leaves
+    (`transducer_export.BaseTransducerExportConfig`, whose encoder phase IS this trace). All it is asked
+    for is `encoder_wrapper(model)` -- which is where the loader-specific forward argument names live --
+    and the sample rate it was already handed."""
     import coremltools as ct
 
     n_samples = int(TRACE_SECONDS * sample_rate)
@@ -399,7 +444,7 @@ def build_trace(spec: ASRNemoEncoderExportConfig, model, sample_rate: int):
         ct.TensorType(name="waveform", shape=(1, seq_dim), dtype=np.float32),
         ct.TensorType(name="length", shape=(1,), dtype=np.int32),
     ]
-    return _NeMoASREncoderWrapper(model, spec.output), dummy_inputs, mil_inputs
+    return spec.encoder_wrapper(model), dummy_inputs, mil_inputs
 
 
 def export_nemo_asr_encoder(spec: ASRNemoEncoderExportConfig):

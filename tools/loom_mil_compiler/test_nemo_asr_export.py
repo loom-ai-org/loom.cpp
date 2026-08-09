@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
     EncoderOutput,
     ASRNemoEncoderExportConfig,
-    _NeMoASREncoderWrapper,
+    ASREncoderWrapper,
 )
 
 
@@ -67,7 +67,7 @@ def _spec(output=EncoderOutput.CTC_LOG_PROBS, **kw):
 
 
 def _run(model, output):
-    return _NeMoASREncoderWrapper(model, output)(torch.zeros(1, 16000), torch.tensor([16000]))
+    return ASREncoderWrapper(model, output)(torch.zeros(1, 16000), torch.tensor([16000]))
 
 
 # -- the happy paths ---------------------------------------------------------------------------------

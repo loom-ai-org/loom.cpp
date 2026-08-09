@@ -259,6 +259,78 @@ def test_nemo_recognizers_reject_non_nemo_paths(tmp_path):
     assert not _is_parakeet_rnnt(d)
 
 
+# -- GigaAM: the same task, a different loader (BACKLOG.md P4.2) --------------------------------------
+#
+# The `.nemo` recognizers above probe a tarball's `model_config.yaml`; this one probes an HF directory's
+# `config.json`. Same task, same family template, nothing shared between the two detections -- which is
+# the loader/template split stated in the one place a reader can see both.
+
+
+def _make_gigaam_dir(tmp_path: Path, model_class: str = "rnnt", name: str = "gigaam") -> Path:
+    """A GigaAM v3 checkpoint directory, config-wise: `model_type` at the top and the head's own
+    `model_class` buried in the nested `cfg.model.cfg` block the real one carries."""
+    d = tmp_path / name
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({
+        "model_type": "gigaam",
+        "auto_map": {"AutoModel": "modeling_gigaam.GigaAMModel"},
+        "cfg": {"model": {"cfg": {"model_class": model_class, "sample_rate": 16000}}},
+    }))
+    return d
+
+
+def test_gigaam_rnnt_is_matched_by_its_own_head(tmp_path):
+    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+
+    assert _is_gigaam_rnnt(_make_gigaam_dir(tmp_path))
+
+
+def test_a_gigaam_ctc_variant_is_not_claimed_by_the_transducer_recognizer(tmp_path):
+    """The five variants do not share an export: `ctc`/`e2e_ctc` are family 1's `Flattened` shape and
+    this config is the `MultiPhase` transducer one. Nothing here has ever run against a CTC GigaAM
+    checkpoint, so it fails detection -- naming the candidates -- rather than being exported by a path
+    that would produce an artifact whose driver decodes a head the model does not have."""
+    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+    from loom_mil_compiler.registry import default_registry
+
+    ctc_dir = _make_gigaam_dir(tmp_path, model_class="ctc", name="gigaam_ctc")
+    assert not _is_gigaam_rnnt(ctc_dir)
+    with pytest.raises(ValueError, match="no registered recognizer matched"):
+        default_registry().detect(ctc_dir)
+
+
+def test_gigaam_rejects_other_families_hf_directories(tmp_path):
+    """Including the one it is most likely to be confused with: `hf-causal-lm`'s generic fallback also
+    reads `config.json`, and a `model_type` alone is not a GigaAM."""
+    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+
+    assert not _is_gigaam_rnnt(_make_hf_dir(tmp_path, "qwen3"))
+    assert not _is_gigaam_rnnt(_make_hf_dir(tmp_path, "whisper", ["WhisperForConditionalGeneration"]))
+    assert not _is_gigaam_rnnt(tmp_path / "does_not_exist")
+
+
+def test_gigaam_survives_a_malformed_or_shallow_config(tmp_path):
+    """`detect()` runs against unidentified paths by construction, so every way the nested block can be
+    absent has to be an answer rather than a traceback."""
+    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "config.json").write_text("{not json")
+    assert not _is_gigaam_rnnt(broken)
+
+    shallow = tmp_path / "shallow"
+    shallow.mkdir()
+    (shallow / "config.json").write_text(json.dumps({"model_type": "gigaam"}))
+    assert not _is_gigaam_rnnt(shallow)
+
+
+def test_default_registry_detects_a_synthetic_gigaam_dir(tmp_path):
+    from loom_mil_compiler.registry import default_registry
+
+    assert default_registry().detect(_make_gigaam_dir(tmp_path)).name == "gigaam-rnnt"
+
+
 # -- checkpoint_probe, the shared primitive under every TTS recognizer (BACKLOG.md P4.0.1) -------------
 
 def test_probe_reads_globals_and_strings_without_unpickling(tmp_path):

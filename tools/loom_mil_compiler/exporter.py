@@ -410,9 +410,9 @@ class LoomGGUFExporter:
             return self._sub_symbol(dim)
 
         _UNARY_PASSTHROUGH_OPS = {
-            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp",
+            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp", "clip",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
-            "leaky_relu", "cumsum", "atan", "sin", "cos",
+            "leaky_relu", "cumsum", "atan", "sin", "cos", "square",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -422,6 +422,19 @@ class LoomGGUFExporter:
             # length tracking -- `gather(shape(real_div(...(log(...(matmul with the STFT conv's own
             # output)...)))))` -- every one of those intermediate unary ops needed to be walked through,
             # not just the ones this file happened to hit first).
+            #
+            # `square` and `clip` were the next two, found by GigaAM v3 (BACKLOG.md P4.2) and both from
+            # the same three lines of mel frontend. `spec.abs()` on a COMPLEX tensor lowers to
+            # `sqrt(square(re) + square(im))`, so a `.abs()`-based magnitude puts a `square` immediately
+            # downstream of the STFT conv whose frame-count formula this walk exists to derive -- and
+            # `torch.clamp` converts to MIL's `clip`, not to `clamp`, so the entry above it never
+            # matched anything. Both gaps were invisible until now because NeMo's own preprocessor
+            # spells the same magnitude `view_as_real(...).pow(2).sum(-1)` (`pow` is elementwise-binary,
+            # `reduce_sum` has its own case) and never calls either. The failure they produced is worth
+            # recording: not an error, a silent fallback to the bare root axis, so the encoder's frame
+            # count came out as `floor(floor((n_samples - 1)/2)/2) + 1` -- the subsampling formula with
+            # the STFT's own /160 simply missing -- and the export succeeded. It failed at RUN time, in
+            # the engine, as a rotary-table VIEW asking for 44000 rows of a 10000-row constant.
             inner = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
             if inner is not None:
                 return self._infer_dynamic_dim_expr(inner, torch_axis, _seen)

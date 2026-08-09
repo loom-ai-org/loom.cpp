@@ -9,10 +9,10 @@ independently-traced topologies assembled into one GGUF" fits `BaseMultiPhaseMod
 same way `optimum`'s own submodel decomposition isn't unique to any one task. Maps onto
 `EXPORT-ROADMAP.md`'s R5 family table as: `LMCausalModelExportConfig` (`causal_lm_export.py`) ~ family
 3's LM half and plain LMs; `ASRNemoEncoderExportConfig` (`nemo_asr_export.py`) ~ family 1;
-`BaseMultiPhaseModelExportConfig`/`TTSFlowMatchingModelExportConfig` (here) ~ families 7/8/9. A future
-family follows the same `{Domain}{Function}ExportConfig` naming convention before it's written, e.g.
-`ASREncoderDecoderExportConfig` (family 2's AED cross-attention decoder loop, shared with family 6),
-`ASRWhisperExportConfig`/`ASRGigaAMExportConfig` (concrete leaves under it), a future
+`BaseMultiPhaseModelExportConfig`/`TTSFlowMatchingModelExportConfig` (here) ~ families 7/8/9;
+`transducer_export.BaseTransducerExportConfig` ~ family 1's RNN-T/TDT half, with
+`ASRParakeetExportConfig` and `ASRGigaAMExportConfig` as its two leaves. A future family follows the same
+`{Domain}{Function}ExportConfig` naming convention before it's written, e.g. a future
 `BERTTokenClassifierExportConfig` (family 12), or `TTSVocoderExportConfig` if a standalone codec/vocoder
 family (11) ever needs its own abstract tier.
 """
@@ -162,6 +162,16 @@ class RecurrentPhase:
     # all), which is why it is not a `dummy_seq_len`-style sentinel: nothing downstream can collide with
     # it the way `Modular`'s can.
     trace_len: int = 8
+    # Number the layers even when the trace produced exactly one cell -- `{name}_l0_fwd` rather than
+    # `{name}_fwd`. Off by default, which is the rule `topologies()` describes and which keeps Kokoro's
+    # and StyleTTS2's six single-layer BiLSTMs (and `run_bi_lstm`'s own name composition) untouched.
+    #
+    # A driver that addresses the layers BY INDEX needs the naming not to depend on how many there are:
+    # a transducer's prediction stack is two layers on Parakeet and one on GigaAM v3, and the decode
+    # loop is the same loop either way (`transducer_driver/02_decode.lua`). Setting this is how that
+    # family says so once, instead of the driver restating `topologies()`'s rule in Lua and getting it
+    # wrong for whichever depth it was not written against.
+    number_layers: bool = False
 
     __unchecked__ = {
         "name": Unchecked(
@@ -184,6 +194,12 @@ class RecurrentPhase:
         "trace_len": Unchecked(
             "the dummy sequence length. A cell topology has no time axis, so this cannot affect the "
             "result -- it only has to be long enough for coremltools to build an lstm op at all"
+        ),
+        "number_layers": Unchecked(
+            "a naming choice for the topologies this phase CREATES, in the same category as `name` -- "
+            "it does not refer to anything, so there is nothing to disagree with it. What checks it is "
+            "the caller's own driver: a `ComputedCall` declaring names this phase did not emit fails "
+            "the export at `check_subgraph_calls`, which is where the two halves actually meet"
         ),
     }
 
@@ -226,8 +242,9 @@ class RecurrentPhase:
         for layer, op in enumerate(ops):
             # A single-layer module keeps its original unsuffixed names, so every existing caller --
             # Kokoro's six BiLSTMs, and `run_bi_lstm("<phase>", ...)` composing `_fwd`/`_bwd` itself --
-            # is untouched by stacks existing. A stack numbers its layers because it has to.
-            stem = self.name if len(ops) == 1 else f"{self.name}_l{layer}"
+            # is untouched by stacks existing. A stack numbers its layers because it has to, and a phase
+            # whose driver indexes the layers asks for numbering regardless of depth (`number_layers`).
+            stem = self.name if len(ops) == 1 and not self.number_layers else f"{self.name}_l{layer}"
             result = build_lstm_cell_topologies(op, weight_namespace=f"{stem}.")
             # ONE topology per direction, declaring both `h_new` and `c_new` -- see
             # `_lstm_cell_topology` for why it used to be two and what running both cost. The names lose

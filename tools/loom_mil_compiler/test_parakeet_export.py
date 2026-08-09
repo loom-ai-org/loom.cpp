@@ -13,7 +13,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from loom_mil_compiler.parakeet_export import _EmbedWrapper, _JointWrapper
+from loom_mil_compiler.transducer_export import _EmbedWrapper, _JointWrapper
 
 
 class _FakeJoint(nn.Module):

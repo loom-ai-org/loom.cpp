@@ -163,20 +163,32 @@ class ValueFacts:
         torch_axis = idx + real_rank if idx < 0 else idx
         if not (0 <= torch_axis < real_rank):
             return None
+        derived = self.exporter._infer_dynamic_dim_expr(real_var, torch_axis)
         if torch_axis == 0 and real_rank >= 2:
-            # `x.shape[0]` (or `x.size(0)`) on a rank>=2 activation is the canonical PyTorch idiom for
-            # reading BATCH SIZE -- and this whole exporter's architecture only ever targets batch=1
-            # models (every declared model input's own batch axis is a literal 1, stated repeatedly
-            # elsewhere in the exporter, e.g. the `tile` case). Short-circuiting straight to "1" here
-            # is far more robust than walking the full producer chain (which, for a deep Conformer-CTC
-            # encoder layer, runs through `layer_norm`/`linear`/`matmul`/`add` dozens of times before
-            # bottoming out at a real input) AND avoids a real correctness gap: without this, the walk
-            # frequently gives up at some not-yet-handled op type along that long chain and silently
-            # falls back to the SAME "n_tokens" string a genuine batch=1 axis would never actually be,
-            # corrupting whatever RESHAPE/RANGE_1D consumes this value. A genuinely non-1 batch axis
-            # would surface as a numerical mismatch against the reference model, not a syntax error here.
-            return as_expr(1)
-        return self.exporter._infer_dynamic_dim_expr(real_var, torch_axis)
+            # `x.shape[0]` (or `x.size(0)`) on a rank>=2 activation is USUALLY the canonical PyTorch
+            # idiom for reading BATCH SIZE -- and this whole exporter's architecture only ever targets
+            # batch=1 models (every declared model input's own batch axis is a literal 1, stated
+            # repeatedly elsewhere in the exporter, e.g. the `tile` case). The real correctness gap this
+            # guards is that the walk sometimes gives up at a not-yet-handled op type along a long chain
+            # (a deep Conformer-CTC encoder layer runs through `layer_norm`/`linear`/`matmul`/`add`
+            # dozens of times before bottoming out at a real input) and silently falls back to the bare
+            # root axis -- a value a genuine batch=1 axis would never actually be -- corrupting whatever
+            # RESHAPE/RANGE_1D consumes it.
+            #
+            # **The test is the derivation's provenance, not the axis index** (BACKLOG.md P4.2). This
+            # used to short-circuit to 1 for axis 0 unconditionally, which is a claim about the model's
+            # LAYOUT, and GigaAM v3 is the counterexample: its
+            # `RotaryPositionMultiHeadAttention.forward` transposes to (T, B, H, D) *before* applying
+            # the rotary embedding, so `q.shape[0]` there is the sequence length. Read as a batch size
+            # it made the rotary cos/sin crop `pe[0:1]` -- one position wide, which ggml then broadcasts
+            # over every frame, so every position got position zero's rotation. The graph built, ran,
+            # and produced a plausible transcript that was simply wrong; only comparing the encoder's
+            # own output against PyTorch's found it. A genuine batch axis is a LITERAL 1 in the traced
+            # shape, so the walk answers it exactly and immediately without any of this -- and where the
+            # walk has nothing better than the root axis, the batch reading is still the right guess.
+            if derived is None or derived == as_expr(self.exporter.root_axis):
+                return as_expr(1)
+        return derived
 
     def dim_expr(self, var, torch_axis):
         """The real SymbolEnv expression for one symbolic MIL shape dimension -- the memoized front end
