@@ -74,13 +74,23 @@ class RawExpr(Expr):
 
 @dataclasses.dataclass
 class Len(Expr):
-    var: str
+    """`#x`, where `x` is a local's name or any expression that evaluates to a table.
+
+    The string form is the original and every existing call site uses it, so it renders exactly as it
+    always did. The expression form exists for `#inputs.waveform` -- a caller-supplied array whose
+    length a driver needs but which is not bound to a local first (BACKLOG.md P4.3). Delegating
+    `reads()` is what keeps `validate()` honest about it: the string form reports the local, and the
+    expression form reports whatever the expression itself reads, rather than a dotted path that is
+    not a symbol at all.
+    """
+
+    var: object
 
     def reads(self) -> list[str]:
-        return [self.var]
+        return self.var.reads() if isinstance(self.var, Expr) else [self.var]
 
     def render(self) -> str:
-        return f"#{self.var}"
+        return f"#{self.var.render()}" if isinstance(self.var, Expr) else f"#{self.var}"
 
 
 @dataclasses.dataclass

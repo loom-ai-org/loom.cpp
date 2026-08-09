@@ -1,0 +1,240 @@
+// Validates the MIL-compiler-exported Qwen3-ASR GGUF (tools/loom_mil_compiler/speech_lm_export.py +
+// qwen3_asr_export.py, BACKLOG.md P4.3) against HF's own `Qwen3ASRForConditionalGeneration`.
+//
+// **This is family 3's gate** -- the audio-encoder + projector + causal-LM composition, the largest
+// group on EXPORT-ROADMAP.md's R5 table (~19 converters, ~36 models). Two checks, in the order that
+// makes a failure readable:
+//
+//   1. the `encoder` topology's output -- the mel frontend, the chunked conv stem, the window-attention
+//      stack and the projector, as one graph -- against the same tensor HF's `get_audio_features`
+//      produced. A TENSOR oracle, and it is first deliberately: P4.2 established that a wrong encoder
+//      can still decode a plausible transcript (71 of 80 tokens right), so token agreement alone is not
+//      evidence that this half is correct.
+//   2. the whole embedded Lua driver -- encoder once, the prompt fed to the KV cache as text/audio/text
+//      segments, then the decode loop -- against HF's greedy token sequence. Integer equality, no
+//      tolerance: both are deterministic argmax.
+//
+// **Check 2 is what proves the composition mechanism**, and specifically that feeding a prompt as N
+// successive cached calls is identical to feeding it concatenated: 143 of this prompt's 158 positions
+// are audio embeddings the LM never produced, written into the cache by their own call at `n_past = 9`.
+// If that equivalence did not hold, the first generated token would already differ.
+//
+// **Nothing here names a per-model C++ struct.** How long a waveform to hand over comes from the GGUF's
+// own `loom.samples_per_chunk`, whether a topology needs a cache is `GraphTopology::uses_kv_cache()`'s
+// answer, and how big to make it is `make_kv_cache(*model)`'s. The driver supplies its own prompt and
+// its own stop tokens, so this test passes a waveform and nothing else.
+//
+// Not generated at ctest time (needs the real checkpoint + coremltools + transformers >= 5.13) -- skips
+// cleanly if the fixture isn't present. To (re)generate:
+//   ./loom-export /home/flavio/Dev/models/qwen3-asr-0.6b-hf -o qwen3_asr_mil.gguf
+//   python3 tools/fixture_gen/reference_forward_qwen3_asr_mil.py \
+//       /home/flavio/Dev/models/qwen3-asr-0.6b-hf <ref>
+
+#include "test_util.h"
+
+#include "loom/loom.h"
+
+#include <ggml-cpu.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+constexpr int kSkipReturnCode = 77;
+
+bool path_exists(const std::string& path) {
+    struct stat st{};
+    return ::stat(path.c_str(), &st) == 0;
+}
+
+// Minimal .npy reader for the two dtypes this fixture writes, matching the one
+// test_e2e_whisper_mil_export.cpp already carries.
+void npy_header(std::ifstream& f, std::vector<int64_t>& shape_out) {
+    char magic[6];
+    f.read(magic, 6);
+    f.ignore(2);
+    uint16_t header_len = 0;
+    f.read(reinterpret_cast<char*>(&header_len), 2);
+    std::string header(header_len, '\0');
+    f.read(header.data(), header_len);
+    const size_t shape_pos = header.find("'shape':");
+    const size_t paren_open = header.find('(', shape_pos);
+    const size_t paren_close = header.find(')', paren_open);
+    std::stringstream ss(header.substr(paren_open + 1, paren_close - paren_open - 1));
+    shape_out.clear();
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        std::string trimmed;
+        for (char c : tok) if (c != ' ') trimmed += c;
+        if (!trimmed.empty()) shape_out.push_back(std::stoll(trimmed));
+    }
+}
+
+template <typename T>
+std::vector<T> read_npy(const std::string& path, std::vector<int64_t>& shape_out) {
+    std::ifstream f(path, std::ios::binary);
+    LOOM_CHECK(static_cast<bool>(f));
+    npy_header(f, shape_out);
+    int64_t total = 1;
+    for (int64_t d : shape_out) total *= d;
+    std::vector<T> data(static_cast<size_t>(total));
+    f.read(reinterpret_cast<char*>(data.data()), total * static_cast<int64_t>(sizeof(T)));
+    return data;
+}
+
+} // namespace
+
+int main() {
+    const char* gguf_env = std::getenv("LOOM_QWEN3_ASR_MIL_GGUF");
+    const std::string gguf_path = gguf_env != nullptr ? gguf_env : "qwen3_asr_mil.gguf";
+    const char* ref_env = std::getenv("LOOM_QWEN3_ASR_MIL_REF_DIR");
+    const std::string ref_dir = ref_env != nullptr ? ref_env : "";
+
+    if (!path_exists(gguf_path) || ref_dir.empty() ||
+        !path_exists(ref_dir + "/ref_asr_generated.npy")) {
+        std::fprintf(stderr,
+                     "skipping: MIL-exported Qwen3-ASR GGUF ('%s') or LOOM_QWEN3_ASR_MIL_REF_DIR "
+                     "fixture not found (run loom-export and "
+                     "tools/fixture_gen/reference_forward_qwen3_asr_mil.py)\n",
+                     gguf_path.c_str());
+        return kSkipReturnCode;
+    }
+
+    std::vector<int64_t> wav_shape, audio_shape, gen_shape, prompt_shape;
+    const std::vector<float> waveform = read_npy<float>(ref_dir + "/ref_asr_waveform.npy", wav_shape);
+    const std::vector<float> expected_audio = read_npy<float>(ref_dir + "/ref_asr_audio.npy", audio_shape);
+    const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_asr_generated.npy", gen_shape);
+    const std::vector<int32_t> prompt_len =
+        read_npy<int32_t>(ref_dir + "/ref_asr_prompt_len.npy", prompt_shape);
+
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    LOOM_CHECK(backend != nullptr);
+    auto model = loom::GgufModel::load(gguf_path, backend.get());
+    LOOM_CHECK(model != nullptr);
+
+    // The encoder's contract, read from the artifact rather than hardcoded: the waveform is a whole
+    // number of chunks, and each one becomes `frames_per_chunk` prompt positions.
+    const uint32_t samples_per_chunk = model->hparam_u32("samples_per_chunk");
+    const uint32_t frames_per_chunk = model->hparam_u32("frames_per_chunk");
+    LOOM_CHECK(samples_per_chunk > 0 && frames_per_chunk > 0);
+    LOOM_CHECK(waveform.size() % samples_per_chunk == 0);
+    const size_t n_chunks = waveform.size() / samples_per_chunk;
+    std::fprintf(stderr,
+                 "loom.samples_per_chunk = %u, loom.frames_per_chunk = %u, fixture waveform = %zu "
+                 "(%zu chunks -> %zu audio rows)\n",
+                 samples_per_chunk, frames_per_chunk, waveform.size(), n_chunks,
+                 n_chunks * frames_per_chunk);
+    // The audio segment's length as the DRIVER computes it, against what HF actually produced. A
+    // mismatch here would place every later prompt position at the wrong `n_past` with no shape error
+    // to reveal it, which is exactly why the two numbers are published as hparams.
+    LOOM_CHECK(static_cast<size_t>(audio_shape[0]) == n_chunks * frames_per_chunk);
+
+    // --- 1. the encoder half, on its own: a tensor oracle, not a token oracle ---
+    {
+        loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        LOOM_CHECK(!topo.uses_kv_cache());
+        loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
+        const loom::GraphBuilder::BuildResult& result = builder.build(
+            {{"n_samples", static_cast<uint32_t>(waveform.size())}, {"n_past", 0}});
+
+        ggml_tensor* waveform_t = result.input_tensors.at("waveform");
+        ggml_backend_tensor_set(waveform_t, waveform.data(), 0, waveform.size() * sizeof(float));
+        ggml_backend_graph_compute(backend.get(), result.graph);
+
+        // HF returns (n_rows, hidden); the exported topology's ne is [hidden, n_rows] -- same memory.
+        LOOM_CHECK(expected_audio.size() ==
+                   static_cast<size_t>(result.output->ne[0]) * static_cast<size_t>(result.output->ne[1]));
+        std::vector<float> actual(expected_audio.size());
+        ggml_backend_tensor_get(result.output, actual.data(), 0, actual.size() * sizeof(float));
+
+        float max_abs_diff = 0.0f;
+        double sum_abs_diff = 0.0;
+        float ref_absmax = 0.0f;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const float d = std::fabs(actual[i] - expected_audio[i]);
+            max_abs_diff = std::max(max_abs_diff, d);
+            sum_abs_diff += d;
+            ref_absmax = std::max(ref_absmax, std::fabs(expected_audio[i]));
+        }
+        const double mean_abs_diff = sum_abs_diff / static_cast<double>(actual.size());
+        std::fprintf(stderr,
+                     "encoder+projector vs HF: mean_abs_diff=%g max_abs_diff=%g ref_absmax=%g "
+                     "(max/absmax=%g)\n",
+                     mean_abs_diff, static_cast<double>(max_abs_diff),
+                     static_cast<double>(ref_absmax),
+                     static_cast<double>(max_abs_diff / ref_absmax));
+        // Relative to the reference's own scale, as the Whisper gate is and for the same reason: a
+        // fixed epsilon would be a statement about this checkpoint's dynamic range. The rewrite is
+        // bit-identical to HF's eager path in torch (see speech_lm_export.WindowedAudioEncoder), so
+        // everything left here is f32 accumulation order across 18 layers.
+        LOOM_CHECK(max_abs_diff < 2e-3f * ref_absmax);
+        LOOM_CHECK(mean_abs_diff < 1e-3);
+    }
+
+    // --- 2. the whole driver, against HF's greedy token sequence ---
+    {
+        loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        loom::GraphTopology embed_topo = loom::GraphTopology::parse(model->topology_json("embed"));
+        loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
+        loom::GraphTopology head_topo = loom::GraphTopology::parse(model->topology_json("lm_head"));
+        // The decoder is the only cached phase: the encoder is one full-sequence pass, and `embed` and
+        // `lm_head` have no attention at all. Asserted rather than assumed, because a decoder that
+        // silently exported WITHOUT fused ATTENTION nodes is precisely the failure that produced a
+        // 143x143 mask where the cache wanted 143x152 (BACKLOG.md P4.3).
+        LOOM_CHECK(decoder_topo.uses_kv_cache());
+        LOOM_CHECK(!encoder_topo.uses_kv_cache());
+        LOOM_CHECK(!embed_topo.uses_kv_cache());
+        LOOM_CHECK(!head_topo.uses_kv_cache());
+        std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
+
+        loom::LoomLuaBridge bridge(backend.get());
+        bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("embed", *model, std::move(embed_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
+        bridge.register_module("lm_head", *model, std::move(head_topo), /*kv_cache=*/nullptr);
+        bridge.load_script(model->kv_str("model.driver_script"));
+
+        const std::vector<double> waveform_d(waveform.begin(), waveform.end());
+        // **The test passes a waveform and a length cap, and nothing else.** No prompt, no eos: the
+        // driver carries the checkpoint's own chat-template prefix/suffix and its own two stop tokens,
+        // which is the whole point of `prompt_segment_constants`.
+        std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+            {"waveform", waveform_d},
+            {"max_new_tokens", static_cast<double>(expected.size())},
+        };
+        // Held in a named local before unpacking: `call` returns by value, so binding a reference
+        // straight into `std::get<...>(call(...))` reads the vector after the returned variant has
+        // been destroyed -- the bug that cost a full bisect in P4.1, because the first few elements
+        // come back as freed-heap garbage while the rest look correct.
+        const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
+        const auto& out = std::get<std::vector<double>>(result);
+        std::vector<int32_t> generated;
+        generated.reserve(out.size());
+        for (double v : out) generated.push_back(static_cast<int32_t>(v));
+
+        std::fprintf(stderr, "HF prompt was %d positions; HF generated %zu tokens: ",
+                     prompt_len.empty() ? -1 : prompt_len[0], expected.size());
+        for (int32_t t : expected) std::fprintf(stderr, "%d ", t);
+        std::fprintf(stderr, "\nMIL driver generated %zu tokens: ", generated.size());
+        for (int32_t t : generated) std::fprintf(stderr, "%d ", t);
+        std::fprintf(stderr, "\n");
+
+        LOOM_CHECK(generated.size() == expected.size());
+        for (size_t i = 0; i < generated.size(); ++i) {
+            LOOM_CHECK(generated[i] == expected[i]);
+        }
+    }
+
+    std::fprintf(stderr, "test_e2e_qwen3_asr_mil_export: OK\n");
+    return 0;
+}

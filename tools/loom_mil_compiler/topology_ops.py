@@ -1598,9 +1598,21 @@ def _op_clip(self, op, ctx):
 
 
 def _reduce_max_total(self, op):
-    """The element count a `reduce_max` collapses, or None when it does not reduce *every* axis or any
-    axis is dynamic. Shared by the guard and the handler so they cannot disagree about which case they
-    are in -- the same arrangement `_matmul_transposes` and `_reduce_mean_plan` use."""
+    """The element count a `reduce_max` collapses, or None when it does not reduce *every* axis.
+
+    Returns an `int` when every axis is static and a **sympy expression** when some axis is dynamic but
+    its real formula is derivable -- `POOL_1D`'s `k0`/`s0` are read through `resolve_attr_int(...,
+    pc.symbols)` on the engine side, so a span that is only known once the call's axes are bound is as
+    good as a literal one. That is what lets a mel frontend whose clip length is genuinely dynamic keep
+    its global maximum in the graph (BACKLOG.md P4.3): Whisper's is always 30 s and folded to a
+    constant, and family 3's is not.
+
+    Still `None` -- and so still rejected -- when a dynamic axis has no derivable expression, because
+    then the span is unknowable rather than merely symbolic.
+
+    Shared by the guard and the handler so they cannot disagree about which case they are in -- the
+    same arrangement `_matmul_transposes` and `_reduce_mean_plan` use.
+    """
     x_var = op.inputs.get("x")
     if x_var is None:
         return None
@@ -1610,11 +1622,20 @@ def _reduce_max_total(self, op):
     # `axes=None` is MIL's own spelling of "every axis"; an explicit list has to name them all.
     if axes is not None and {a % rank for a in axes} != set(range(rank)):
         return None
-    total = 1
-    for size in shape:
-        if not str(size).isdigit():
+    total = as_expr(1)
+    for index, size in enumerate(shape):
+        if str(size).isdigit():
+            total = total * int(size)
+            continue
+        # `get_var_info` returns the shape REVERSED (ne-order, fastest-varying first), while
+        # `_infer_dynamic_dim_expr` walks the producer chain in the MIL/torch axis order. Passing the
+        # index straight through asks about the wrong axis, and the answer is not an error -- it is the
+        # batch axis's own perfectly good `1`, which silently drops the dynamic factor and emits a span
+        # of 128 for a 140800-element tensor.
+        dim = self._infer_dynamic_dim_expr(x_var, rank - 1 - index)
+        if dim is None:
             return None
-        total *= int(size)
+        total = total * dim
     return total
 
 
@@ -1627,30 +1648,38 @@ def _op_reduce_max_global(self, op, ctx):
     # frontend's `log_spec.max()` is what needs it: Whisper floors every bin at 8 dB below the loudest
     # bin in the entire 30 s clip, so this single scalar reaches every output element.
     total = _reduce_max_total(self, op)
+    # A literal when every axis was static, an expression string when the span is only known once the
+    # call's axes are bound. Both spellings are read the same way on the engine side -- RESHAPE's shape
+    # entries and POOL_1D's k0/s0 all go through the symbol-resolving accessors -- so the only thing
+    # that changes between a 30 s Whisper clip and a variable-length one is this rendering.
+    span = to_number(total)
+    if span is None:
+        span = render(total)
     out_name = self.safe_name(op.outputs[0].name)
     flat_name = f"{out_name}_reduce_max_flat"
     ctx.nodes.append({
         "op": "RESHAPE",
         "inputs": [ctx.resolve(self.safe_name(op.inputs["x"].name))],
         "outputs": [flat_name],
-        "attrs": {"shape": [total]},
+        "attrs": {"shape": [span]},
     })
     ctx.nodes.append({
         "op": "POOL_1D",
         "inputs": [flat_name],
         "outputs": [out_name],
-        "attrs": {"op": "max", "k0": total, "s0": total, "p0": 0},
+        "attrs": {"op": "max", "k0": span, "s0": span, "p0": 0},
     })
 
 
 @topology_rule('reduce_max', when="it reduces only some axes, or a dynamic one (rejected)")
 def _op_reduce_max_unsupported(self, op, ctx):
     raise NotImplementedError(
-        f"reduce_max op '{op.name}' does not reduce every axis of a statically-shaped tensor "
-        f"(shape={self.get_var_info(op.inputs['x'])['shape']!r}, "
+        f"reduce_max op '{op.name}' does not reduce every axis, or reduces a dynamic axis whose real "
+        f"formula this exporter could not derive (shape="
+        f"{self.get_var_info(op.inputs['x'])['shape']!r}, "
         f"axes={static_ints(op.inputs.get('axes'))!r}). Only the global maximum is composed here, as a "
-        "POOL_1D spanning the flattened tensor; a per-axis maximum needs a real ggml reduction that "
-        "does not exist yet."
+        "POOL_1D spanning the flattened tensor -- with a symbolic span when the length is dynamic; a "
+        "per-axis maximum needs a real ggml reduction that does not exist yet."
     )
 
 

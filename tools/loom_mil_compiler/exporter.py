@@ -26,7 +26,7 @@ from .shape_expr import (
 )
 from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
-from .value_facts import ValueFacts, is_const_producer, static_scalar, static_value
+from .value_facts import ValueFacts, is_const_producer, static_array, static_scalar, static_value
 
 def _binding_kind(name: str) -> str:
     """How the driver obtains one traced-model input: computed host-side, or read from the caller.
@@ -542,17 +542,29 @@ class LoomGGUFExporter:
             if x_var is None or weight_var is None or strides is None or pad is None or x_var.shape is None:
                 return None
             rank = len(var.shape)
-            # MIL conv is NC(D...) -- axis 0 is batch (always a literal 1 for every real input this
-            # exporter targets, same architectural assumption used throughout this file -- confirmed
-            # needed on Conformer-CTC's GLU-split VIEW, whose `x` operand's own axis-0 walk bottoms out
-            # here: an earlier version returned `None` unconditionally for torch_axis<2, which skips
-            # straight past this whole function's OWN final "torch_axis==0 -> batch=1" fallback, since a
-            # bare `return None` inside an `if` block returns from the ENCLOSING function, not just this
-            # branch), axis 1 is out-channels (from the weight, not derived from `x`, genuinely
-            # unresolvable here), the remaining `rank - 2` axes are the real spatial ones this formula
-            # applies to, in the same order for `x` and its output (conv never permutes spatial axes).
+            # MIL conv is NC(D...) -- axis 0 is batch, axis 1 is out-channels (from the weight, not
+            # derived from `x`, genuinely unresolvable here), and the remaining `rank - 2` axes are the
+            # real spatial ones this formula applies to, in the same order for `x` and its output
+            # (conv never permutes spatial axes).
+            #
+            # **The batch axis RECURSES rather than answering 1**, which is the same correction P4.2
+            # made to `gather_shape_value` and for the same reason. Conv preserves the batch axis, so
+            # "whatever `x`'s axis 0 is" is a real formula; `1` was an architectural assumption that
+            # happens to hold for every model whose batch is genuinely one -- and those still resolve
+            # to a literal 1 through the recursion, so nothing about them changes. Family 3's audio
+            # encoder is the counterexample: it folds the CHUNK COUNT into the batch axis so the
+            # convolutional stem sees a fixed 100-frame window per chunk, and reading that as 1 did not
+            # fail -- it silently made the post-stem sequence length 13 instead of 13 per chunk, which
+            # surfaced hundreds of ops later as a mask whose two sides had different lengths
+            # (BACKLOG.md P4.3).
+            #
+            # The old fallback is preserved exactly: this function's own trailing "torch_axis == 0 ->
+            # batch = 1" answer still applies when the recursion has nothing better, which is the case
+            # the comment this replaces was really recording (Conformer-CTC's GLU-split VIEW, whose
+            # `x` operand's own axis-0 walk bottoms out here).
             if torch_axis == 0:
-                return as_expr(1)
+                batch_expr = self._infer_dynamic_dim_expr(x_var, 0, _seen)
+                return batch_expr if batch_expr is not None else as_expr(1)
             if torch_axis == 1:
                 return None
             spatial_idx = torch_axis - 2
@@ -670,6 +682,50 @@ class LoomGGUFExporter:
                         inferred = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
                         if inferred is not None:
                             return inferred
+
+        if op.op_type == "slice_by_index":
+            # `slice_by_index` over a dynamic axis, for the one shape this walk can state exactly: a
+            # CONSTANT begin/end at stride 1 with nothing squeezed, whose output length is
+            # `end - begin` with negative bounds taken from the input's own (symbolic) length.
+            #
+            # Needed by every mel frontend that is genuinely dynamic. Whisper's drops the final STFT
+            # frame the same way (`(stft.abs() ** 2)[..., :-1]`) and never needed this because its clip
+            # is always 30 s, so every dim downstream is a literal; family 3's is variable-length, and
+            # without this case the walk gave up exactly here and returned -1 -- which is not an error
+            # anywhere, just a wrong number that reached a POOL_1D span as `-128` (BACKLOG.md P4.3).
+            #
+            # Deliberately narrow, and it falls through rather than guessing: a strided or
+            # rank-changing slice has a real formula too, and inventing one here that nothing in this
+            # tree exercises is how a silently wrong length gets shipped.
+            x_var = op.inputs.get("x")
+            # Explicit `is None` throughout: these are numpy arrays, whose truthiness raises rather
+            # than answering, so an `or []` fallback is a crash and not a default.
+            squeeze_mask = static_array(op.inputs.get("squeeze_mask"))
+            begins = static_array(op.inputs.get("begin"))
+            ends = static_array(op.inputs.get("end"))
+            strides = static_array(op.inputs.get("stride"))
+            begin_mask = static_array(op.inputs.get("begin_mask"))
+            begin_mask = [] if begin_mask is None else list(begin_mask)
+            end_mask = static_array(op.inputs.get("end_mask"))
+            end_mask = [] if end_mask is None else list(end_mask)
+            squeeze_mask = [] if squeeze_mask is None else list(squeeze_mask)
+            if (x_var is not None and begins is not None and ends is not None
+                    and not any(bool(s) for s in squeeze_mask)
+                    and torch_axis < len(begins) and torch_axis < len(ends)
+                    and (strides is None or int(strides[torch_axis]) == 1)):
+                in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                if in_expr is not None:
+                    masked_begin = torch_axis < len(begin_mask) and bool(begin_mask[torch_axis])
+                    masked_end = torch_axis < len(end_mask) and bool(end_mask[torch_axis])
+                    begin = as_expr(0) if masked_begin else as_expr(int(begins[torch_axis]))
+                    end = in_expr if masked_end else as_expr(int(ends[torch_axis]))
+                    # MIL keeps torch's negative-index convention: measured back from this axis's own
+                    # length, which here is symbolic rather than known.
+                    if not masked_begin and int(begins[torch_axis]) < 0:
+                        begin = in_expr + int(begins[torch_axis])
+                    if not masked_end and int(ends[torch_axis]) < 0:
+                        end = in_expr + int(ends[torch_axis])
+                    return end - begin
 
         if op.op_type == "linear":
             # `linear(x, weight, bias)` computes `x @ weight.T + bias`: same rank as `x`, every axis

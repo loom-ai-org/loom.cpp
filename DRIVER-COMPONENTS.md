@@ -64,13 +64,14 @@ Three builders exist:
 | `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 10 | hf-causal-lm, lfm2-monolithic, qwen3, whisper |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 13 | hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, whisper |
+| `prompt_segments` | `PromptSegments` | statements | 2 | 6 | qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 7 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 7 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 6 | matcha, supertonic |
 | `driver_return` | `DriverReturn` | statements | 0 | 1 | kokoro, matcha, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
@@ -104,10 +105,21 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one for the causal LMs**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports `infer` alone. Whisper is not in that caveat: its family declares this component outright, with `bound` supplying the encoder's output to every step, which is what makes the same loop a cross-attention decode loop (BACKLOG.md P4.1).
 
-*Emits:* statements. *Used by:* hf-causal-lm, lfm2-monolithic, qwen3, whisper.
+*Emits:* statements. *Used by:* hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+* `embed_topology` — WhenSet(TopologyName)
+* `head_topology` — WhenSet(TopologyName)
+
+### `prompt_segments` — `PromptSegments`
+
+A prompt made of alternating text and non-text pieces -- family 3's audio embeddings substituted into an LM's input sequence -- fed to a KV-cached decoder as ONE CACHED CALL PER PIECE. That is identical to feeding it concatenated (attention is causal, so a call at n_past = k writes cells [k, k+n) and attends over [0, k+n)), which is what lets this exist without any backend-side tensor concatenation: an engine op that does not exist, and one OutputStore has no shape for. It stops one segment short and leaves the running n_past for `prefill_decode_loop.initial_n_past`, so the final text segment is the loop's own first iteration rather than a third spelling of the same call (BACKLOG.md P4.3).
+
+*Emits:* statements. *Used by:* qwen3-asr.
+
+* `topology` — TopologyName
+* `embed_topology` — WhenSet(TopologyName)
 
 ### `ctc_greedy_epilogue` — `CtcGreedyEpilogue`
 
@@ -129,7 +141,7 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
+*Emits:* statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -151,7 +163,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
+*Emits:* prelude, statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -166,7 +178,7 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
+*Emits:* statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
