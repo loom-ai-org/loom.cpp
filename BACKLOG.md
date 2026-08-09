@@ -2916,7 +2916,8 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   is what makes "every frame valid" true, and it also makes the checkpoint's own feature extractor an
   exact oracle, since its mel-axis right-pad becomes a no-op on such a waveform. The cost is that up to
   one second of trailing silence becomes real audio embeddings the LM reads, where HF would have masked
-  them out. Trimming them needs a way to feed a *prefix* of a retained tensor; filed, not done.
+  them out. Trimming them needs a way to feed a *prefix* of a retained tensor: **P4.3d** below, open,
+  and shared with the second leaf.
 
   **Five bugs in shared exporter machinery, four of which fail silently.** None is Qwen3-ASR-shaped;
   it is the first checkpoint whose encoder is spelled the way that reaches them.
@@ -3120,6 +3121,31 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   `granite_speech_plus` and `granite_speech_nar`, neither of which transformers 4.57.6 has a module
   for at all; `-plus` has the identical block geometry and is the obvious third leaf the day its
   module ships.
+
+  **P4.3d — the chunk contract's trailing padding reaches the LM — NOT STARTED, and it affects both
+  leaves.** Recorded here because P4.3 and P4.3c each said "filed, not done" against no filed item,
+  and `qwen3_asr_export` pointed at an `EXPORT-ROADMAP.md` follow-up that does not exist.
+
+  Both encoders require the waveform to be a whole number of chunks with every frame valid — that is
+  what makes HF's `nonzero()`-packing and its `ceil`-padding collapse into identities, which is what
+  makes them traceable at all. So a host zero-pads up to the chunk boundary, and the encoder emits
+  **real** embedding rows for that padding, which the LM reads as speech. HF masks them out
+  (`input_features_mask`); this driver has no way to. The cost scales with the chunk: up to 13 junk
+  rows for Qwen3-ASR (one second), up to **120** for Granite Speech (twelve). Neither model's gate sees
+  it, because both fixtures pad `samples/jfk.wav` to a whole chunk and HF is given the same padded
+  waveform, so the reference contains the same junk rows — which is correct as an exporter oracle and
+  says nothing about transcript quality on a clip that is 12.1 s long.
+
+  **What it needs is one capability, and it is not a mask.** The driver already computes the true row
+  count (`floor(#waveform / samples_per_chunk) * frames_per_chunk` is the padded one; the unpadded one
+  is the same arithmetic on the caller's real length). What is missing is a way for `PromptSegments`'
+  `bound` segment to feed *a prefix of* a retained tensor to the next `run_subgraph` — the encoder's
+  output deliberately never crosses into Lua (P4.0.12), so it is an opaque backend tensor and there is
+  no spelling for "these rows of it". That is an `OutputRef`-with-extent on the engine side, plus one
+  field on `PromptSegments`; the trimming itself is then arithmetic the driver already does.
+
+  Not urgent for Qwen3-ASR and genuinely worth doing for Granite Speech, which is the argument for
+  doing it once, in the shared component, rather than per leaf.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's

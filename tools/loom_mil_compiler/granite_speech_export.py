@@ -61,9 +61,13 @@ class ConformerQFormerEncoder(nn.Module):
     chunk here is `lcm(context_size, window_size)` encoder frames -- 600, i.e. 1200 mel frames, i.e.
     **192000 samples / 12 s** -- because the conformer's blocks and the Q-Former's windows must BOTH
     divide the sequence. That is coarse compared with Qwen3-ASR's one second, and it is a property of
-    this checkpoint's two block sizes rather than of the family. The cost is the same one: up to twelve
-    seconds of trailing silence become real audio embeddings the LM reads, where HF would have masked
-    them. It also makes the checkpoint's own feature extractor an exact oracle, because its
+    this checkpoint's two block sizes rather than of the family. The cost is Qwen3-ASR's, scaled by
+    twelve: up to twelve seconds of trailing silence become real audio embeddings the LM reads -- up to
+    **120 junk rows** against that leaf's 13 -- where HF would have masked them out. Trimming them
+    needs a way to feed a *prefix* of a retained tensor, which nothing has today: BACKLOG.md **P4.3d**,
+    open, and the reason it is worth doing once in `PromptSegments` rather than per leaf.
+
+    The contract also makes the checkpoint's own feature extractor an exact oracle, because its
     "drop the final mel frame if the count is odd" fires on exactly the frame `LogMelFrontend` already
     drops (`1200k + 1` is always odd).
     """
