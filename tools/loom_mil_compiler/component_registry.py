@@ -130,7 +130,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
-        MonolithicCall, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent,
+        MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, SubgraphCallComponent,
     )
     from .lua_library import LuaLibrary
 
@@ -166,6 +166,17 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "`infer` alone. Whisper is not in that caveat: its family declares this component "
             "outright, with `bound` supplying the encoder's output to every step, which is what makes "
             "the same loop a cross-attention decode loop (BACKLOG.md P4.1).",
+        ),
+        ComponentEntry(
+            "prompt_segments", PromptSegments, (STATEMENTS,),
+            "A prompt made of alternating text and non-text pieces -- family 3's audio embeddings "
+            "substituted into an LM's input sequence -- fed to a KV-cached decoder as ONE CACHED CALL "
+            "PER PIECE. That is identical to feeding it concatenated (attention is causal, so a call "
+            "at n_past = k writes cells [k, k+n) and attends over [0, k+n)), which is what lets this "
+            "exist without any backend-side tensor concatenation: an engine op that does not exist, "
+            "and one OutputStore has no shape for. It stops one segment short and leaves the running "
+            "n_past for `prefill_decode_loop.initial_n_past`, so the final text segment is the loop's "
+            "own first iteration rather than a third spelling of the same call (BACKLOG.md P4.3).",
         ),
         ComponentEntry(
             "ctc_greedy_epilogue", CtcGreedyEpilogue, (STATEMENTS,),

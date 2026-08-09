@@ -58,6 +58,11 @@ class TaskRegistryEntry:
 class TaskRegistry:
     def __init__(self):
         self._entries: Dict[str, TaskRegistryEntry] = {}
+        # {family module name: the ImportError that stopped it loading}. Populated by
+        # `default_registry()`; empty in an environment where every family's dependencies are present.
+        # Kept so a failed detection can distinguish "no family recognizes this checkpoint" from "the
+        # family that would have was not importable here" -- see `default_registry`'s docstring.
+        self.skipped: Dict[str, str] = {}
 
     def register(self, entry: TaskRegistryEntry) -> None:
         """Registers `entry`'s recognizers under its task -- creates the task if new, or extends an
@@ -130,8 +135,14 @@ class TaskRegistry:
         matches = specific or matches
         if not matches:
             tried = [self._label(entry, rec) for entry, rec in candidates]
+            # A family that failed to import registered no recognizer, so it is absent from `tried`
+            # and its checkpoint looks unrecognized rather than unloadable. Say which, or the two are
+            # indistinguishable from the message.
+            unloaded = (f"; NOT loaded in this environment: {sorted(self.skipped)} "
+                        f"({'; '.join(f'{k}: {v}' for k, v in sorted(self.skipped.items()))})"
+                        if self.skipped else "")
             raise ValueError(
-                f"no registered recognizer matched {str(model_path)!r} (tried: {tried}); "
+                f"no registered recognizer matched {str(model_path)!r} (tried: {tried}){unloaded}; "
                 f"pass --task/--model explicitly"
             )
         if len(matches) > 1:
@@ -160,27 +171,48 @@ class TaskRegistry:
         )
 
 
+# Every family module, in registration order. A name here is imported and asked to register itself.
+_FAMILY_MODULES = (
+    "causal_lm_export",
+    "nemo_asr_export",
+    "gigaam_export",
+    "whisper_export",
+    "qwen3_asr_export",
+    "kokoro_export",
+    "matcha_export",
+    "styletts2_export",
+    "supertonic_export",
+    "vits_export",
+)
+
+
 def default_registry() -> TaskRegistry:
     """The registry every `loom-export`/`main_export()` call uses -- one task per family, populated by
-    each family module's own `register(registry)`."""
-    registry = TaskRegistry()
-    from . import causal_lm_export
-    from . import nemo_asr_export
-    from . import gigaam_export
-    from . import whisper_export
-    from . import kokoro_export
-    from . import matcha_export
-    from . import styletts2_export
-    from . import supertonic_export
-    from . import vits_export
+    each family module's own `register(registry)`.
 
-    causal_lm_export.register(registry)
-    nemo_asr_export.register(registry)
-    gigaam_export.register(registry)
-    whisper_export.register(registry)
-    kokoro_export.register(registry)
-    matcha_export.register(registry)
-    styletts2_export.register(registry)
-    supertonic_export.register(registry)
-    vits_export.register(registry)
+    **A family whose third-party dependency is absent is skipped, loudly, rather than killing the
+    run.** Families carry heavy and mutually incompatible optional dependencies -- `nemo_toolkit` for
+    family 1, the `kokoro` package for 8, and, since P4.3, a `transformers` new enough to have
+    `qwen3_asr` (>= 5.13) where `nemo_toolkit` pins `~=4.53`. There is no single environment that
+    imports all of them, so an eager import of every module made the registry only as usable as its
+    least installable member: exporting Qwen3-ASR failed on `No module named 'kokoro'`, from a family
+    the caller had not asked for and whose absence says nothing about the requested export.
+
+    Skipping is deliberately noisy and deliberately narrow. Only `ImportError` is caught -- anything
+    else a module raises on import is a real defect and propagates -- each skip prints the family and
+    the missing module, and `TaskRegistry.skipped` keeps the list so a failed *detection* can say
+    "these families were not loaded" instead of reporting a checkpoint as unrecognized when the family
+    that recognizes it was simply not importable.
+    """
+    import importlib
+
+    registry = TaskRegistry()
+    for name in _FAMILY_MODULES:
+        try:
+            module = importlib.import_module(f".{name}", __package__)
+        except ImportError as exc:
+            registry.skipped[name] = str(exc)
+            print(f"  [registry] skipping {name}: {exc}")
+            continue
+        module.register(registry)
     return registry

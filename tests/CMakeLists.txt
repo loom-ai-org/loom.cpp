@@ -1040,3 +1040,13 @@ add_executable(test_e2e_whisper_mil_export test_e2e_whisper_mil_export.cpp)
 target_link_libraries(test_e2e_whisper_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_whisper_mil_export COMMAND test_e2e_whisper_mil_export)
 set_tests_properties(test_e2e_whisper_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- End-to-end check: the MIL-compiler-exported Qwen3-ASR (tools/loom_mil_compiler/speech_lm_export.py
+#     + qwen3_asr_export.py, BACKLOG.md P4.3) against HF's own Qwen3ASRForConditionalGeneration -- the
+#     encoder+projector half as a TENSOR comparison (a wrong encoder still decodes a plausible
+#     transcript, see P4.2), and the generated driver's whole segmented-prompt-then-decode-loop as an
+#     exact token sequence. Family 3's gate. See test_e2e_qwen3_asr_mil_export.cpp. ---
+add_executable(test_e2e_qwen3_asr_mil_export test_e2e_qwen3_asr_mil_export.cpp)
+target_link_libraries(test_e2e_qwen3_asr_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_qwen3_asr_mil_export COMMAND test_e2e_qwen3_asr_mil_export)
+set_tests_properties(test_e2e_qwen3_asr_mil_export PROPERTIES SKIP_RETURN_CODE 77)

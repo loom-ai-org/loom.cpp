@@ -194,7 +194,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper, GigaAM v3, composition template | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE** | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -2858,8 +2858,138 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   `ctc`/`e2e_ctc` checkpoint fails detection with the candidate list instead of being exported by a path
   nothing here has run. Those are family 1's `Flattened` shape (`ASRNemoEncoderExportConfig` with
   `CTC_LOG_PROBS`) plus this loader — a small addition, and an untested one until a checkpoint exists.
-- **P4.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
-  family 3 (~20 models) and is the single largest coverage lever in the roadmap.
+- **P4.3 — composition template — DONE (2026-08-09).** The audio-encoder + projector + causal-LM family
+  (`EXPORT-ROADMAP.md` R5's family 3), the largest group on the roadmap: ~19 converters, ~36 models.
+
+  `tools/loom_mil_compiler/speech_lm_export.py` (the template) + `qwen3_asr_export.py` (~180 lines, the
+  loader) + `speech_lm_driver/00_header.lua`. Four phases — `encoder` (793 nodes: mel frontend, chunked
+  conv stem, window attention, projector), `embed`, `decoder` (2286 nodes, 28 cached `ATTENTION`
+  blocks) and `lm_head` — in one 3.1 GiB GGUF, registered as `automatic-speech-recognition/qwen3-asr`,
+  so `loom-export <dir> -o qwen3_asr.gguf` needs no `--task`/`--model`.
+
+  **Acceptance: `test_e2e_qwen3_asr_mil_export.cpp` against HF's own `Qwen3ASRForConditionalGeneration`
+  on `samples/jfk.wav`.**
+
+  | check | result |
+  |---|---|
+  | `encoder` topology (mel frontend + projector included) vs HF's `get_audio_features` | `max_abs_diff = 2.2e-05` against a reference whose absmax is 0.128 — 1.7e-4 relative; `mean_abs_diff = 3.7e-07` |
+  | the whole driver — encoder, segmented prompt, cached decode loop — vs HF's greedy sequence | **exact**: all 30 tokens, including stopping on `<|im_end|>` |
+  | nothing in the test names a per-model C++ struct | `uses_kv_cache()`, `make_kv_cache(*model)`, `loom.samples_per_chunk`/`frames_per_chunk` all read from the artifact |
+  | whisper-tiny, conformer-ctc-small, qwen3-0.6b-base re-exported after the shared-exporter fixes | byte-identical by sha256 |
+  | the Python suite | 503 passed |
+
+  **The finding that made this cheap: the prompt needs no concatenation anywhere.** "Inject audio
+  embeddings into the prompt" reads as though something must build one `inputs_embeds` out of text
+  embeddings and audio embeddings, which would need a backend-side concatenation of two retained
+  tensors — an engine op that does not exist and one `OutputStore` has no shape for. It is not needed.
+  Attention is causal and the decoder is KV-cached, so a call at `n_past = k` over `n` rows writes cells
+  `[k, k+n)` and attends over `[0, k+n)`: feeding a prompt as N successive cached calls is *the same
+  arithmetic* as feeding it concatenated. Measured against HF before any component was written —
+  segmented and concatenated prefill agree to 2.3e-04 on hidden states whose absmax is 95.7, and pick
+  the same first token. `PromptSegments` is that walk, and it is the whole of the "embedding-injection
+  driver" the roadmap asked for. It stops one segment short and leaves the running `n_past` for
+  `PrefillDecodeLoop.initial_n_past`, so the final text segment is the loop's own first iteration —
+  exactly as a plain causal LM's prefill is.
+
+  **`PrefillDecodeLoop` grew three fields and no new component**, the same outcome P4.1 reached:
+  `embed_topology` (the step's tokens reach an `inputs_embeds`-traced decoder through the embedding
+  graph, bound by `OutputRef`, so a token id is still all that crosses the Lua boundary),
+  `head_topology`, and `initial_n_past`. All default to None/0, so every earlier family emits
+  byte-identical driver text — which the re-export gate above checks rather than assumes.
+
+  **The head is split off for a cost reason.** A family-3 prompt is dominated by audio rows — 143 of
+  this one's 158 — and a head inside the decoder graph would project every one through a 151936-wide
+  vocabulary that nothing reads (22 GFLOP). `lm_head` is its own phase, run only where a token is
+  needed.
+
+  **The encoder had to be rewritten, and the rewrite is bit-identical.** HF's `Qwen3ASREncoder.forward`
+  is untraceable twice over: it packs valid frames with `valid_mask.flatten().nonzero()` (a
+  data-dependent output shape) and runs attention per window via `torch.split(q, lengths.tolist())`
+  (Python-level lengths that `torch.jit.trace` bakes in). Both dissolve into one observation —
+  `get_audio_cu_seqlens` cuts full `block`-sized windows plus a shorter final one, and attention runs
+  independently inside each, which *is* a block-diagonal additive mask. With every frame valid the
+  packing step is the identity. Verified in torch before anything was exported: `max abs diff 0.000e+00`
+  against HF's eager path (6.3e-05 against sdpa, which is that fused kernel's accumulation order).
+
+  **The contract this imposes**: the waveform is a whole number of chunks, all valid — one chunk is
+  `hop_length * n_window * 2` = 16000 samples, one second — so a host pads up to the next second. That
+  is what makes "every frame valid" true, and it also makes the checkpoint's own feature extractor an
+  exact oracle, since its mel-axis right-pad becomes a no-op on such a waveform. The cost is that up to
+  one second of trailing silence becomes real audio embeddings the LM reads, where HF would have masked
+  them out. Trimming them needs a way to feed a *prefix* of a retained tensor; filed, not done.
+
+  **Five bugs in shared exporter machinery, four of which fail silently.** None is Qwen3-ASR-shaped;
+  it is the first checkpoint whose encoder is spelled the way that reaches them.
+
+  1. **A conv's batch axis was hardcoded to `1`** in the shape walk — the same correction P4.2 made to
+     `gather_shape_value`, one layer down. This encoder folds the CHUNK COUNT into the batch axis so the
+     conv stem sees a fixed 100-frame window per chunk, and reading that as 1 did not fail: it made the
+     post-stem sequence length 13 instead of 13 *per chunk*, surfacing hundreds of ops later as a mask
+     whose two sides had different lengths. Conv preserves batch, so it now recurses; a genuine
+     batch-of-1 still resolves to a literal 1 through the recursion, which is why all three re-exports
+     are byte-identical.
+  2. **`slice_by_index` was missing from the shape walk.** Whisper's frontend drops the final STFT frame
+     the same way (`(stft.abs() ** 2)[..., :-1]`) and never needed it, because its clip is always 30 s
+     and every dim downstream is a literal. Without it the walk returned `-1` — not an error anywhere,
+     just a wrong number that reached a `POOL_1D` span as `-128`.
+  3. **`reduce_max` rejected a dynamic global maximum.** `POOL_1D`'s `k0`/`s0` are already read through
+     `resolve_attr_int(..., pc.symbols)` on the engine side, so a span known only once the axes are
+     bound is as good as a literal one; this was exporter-side only. Whisper's clip is static and folded
+     to a constant, and a variable-length mel frontend is what needs the symbolic form.
+  4. **`MultiPhaseDriverBuilder.called_topologies` could not see through `WhenSet`.** It reads
+     `TopologyName` off the declarations precisely so a new component is counted the day it declares its
+     link — but an OPTIONAL topology field is `WhenSet(TopologyName())`, whose wrapper is not a
+     `TopologyName`, so the field was checked and yet invisible. It reported `embed` and `lm_head` as
+     "topologies no call site names" while the loop was calling both every step. Same failure P4.1 fixed
+     for `PrefillDecodeLoop`, one wrapper deeper.
+  5. **`driver_ir.Len` only accepted a local's name**, so `#inputs.waveform` had no spelling. It now
+     takes either and delegates `reads()`, which is what keeps `validate()` honest: the string form
+     reports the local, the expression form reports what the expression reads, rather than a dotted path
+     that is not a symbol at all.
+
+  **The two that cost the most were both silent successes, and both are worth remembering.**
+
+  * **Forcing `attn_implementation="eager"` in the loader disabled the KV cache.** It looks harmless —
+    `WindowedAudioEncoder` reimplements the tower's attention and never calls the tower's own — but it
+    also reaches the LANGUAGE model, and `fuse_loom_attention` matches the sdpa shape. Under eager the
+    decoder converted with **zero** fused `ATTENTION` nodes: no cache, no `n_kv` mask retyping, and all
+    four phases still exported "successfully". It surfaced only at run time, as a mask sized 143×143
+    where the cache wanted 143×152. Eager belongs on the *reference*, which is where it now is.
+  * **`cache_position` was pruned from the decoder graph.** Handed `inputs_embeds` and an already-built
+    4D mask, this model consumes it nowhere — it exists to derive position ids and to build a mask, and
+    both jobs were done — so the trace dropped it, folding the rotary embedding to the eight positions
+    the trace ran at. Every call at a different `n_past` would have rotated by the wrong angle. Caught
+    by the exporter's own "supplies an input it does not declare" link; the fix is to pass the positions
+    the model actually indexes with (`position_ids`).
+
+  **Two ggml-shaped constraints the graph had to be written around**, both in the window mask:
+
+  * ggml's elementwise ops repeat `b` into `a` and cannot do a **two-way broadcast**, so the natural
+    `window.unsqueeze(1) == window.unsqueeze(0)` aborts in `ggml_sub` inside `equal`. `.expand(T, T)` on
+    both operands is the obvious repair and does **not** work — MIL's `equal` broadcasts natively, so
+    coremltools folds the expands away and re-emits the same broadcast. An **outer product against a
+    vector of ones** survives, because a `matmul` is not a broadcast and nothing rewrites it into one.
+  * That ones vector must be built by arithmetic (`window * 0 + 1`), not `torch.ones_like`, which
+    converts to a MIL `fill` whose length the exporter resolves through the fill's own shape input — and
+    it resolved to a *different expression for the same quantity*, so the two sides of the comparison
+    disagreed about T.
+
+  **The registry now skips a family whose optional dependency is absent**, loudly and only on
+  `ImportError`. Families carry mutually incompatible optional dependencies — `nemo_toolkit` pins
+  `transformers~=4.53`, and `qwen3_asr` first ships in **5.13** — so there is no single environment that
+  imports all of them, and an eager import of every module made the registry only as usable as its least
+  installable member: exporting Qwen3-ASR failed on `No module named 'kokoro'`, from a family the caller
+  had not asked for. A failed *detection* now names the families that were not loaded, so "unrecognized"
+  and "unloadable" stay distinguishable.
+
+  **Not claimed:** only `Qwen3-ASR-0.6B` is on this machine and only the **`-hf`** repo works. Qwen ships
+  the same weights twice, and the native `qwen-asr` layout (`thinker.*` weights, sub-configs under
+  `thinker_config`) declares the identical `model_type` while transformers reads class defaults off it
+  *without raising* — a 1024-wide/24-layer encoder instead of this checkpoint's 896/18. `detect()`
+  requires `audio_config` and `text_config` at the top level for that reason, so the native layout fails
+  detection with the candidate list rather than being exported as a plausible wrong model. Voxtral is the
+  obvious second leaf — a Whisper encoder, the same shape of projector, a Llama LM — and is not done;
+  the template predicts it needs only a loader, and that prediction is untested.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's
@@ -2888,7 +3018,8 @@ R6 executions (one commit per model: re-point the last test, delete the bespoke 
 
 **If only three things get done:** P0.1 + P0.2 (a smaller, honest baseline), P3.1 + P3.2 (the registry,
 which is what makes every later family cheap), and P4.3 (the composition template, which is where the
-model count actually lives).
+model count actually lives). *All three are now done; the next largest lever is family 11's codec
+decoders, which pay twice (P5).*
 
 ### Third family template: NeMo ASR encoders (Conformer-CTC, Parakeet-TDT, Parakeet-RNNT) — DONE
 

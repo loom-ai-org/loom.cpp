@@ -43,8 +43,8 @@ from typing import List, Optional, Tuple
 
 from .driver_ir import (
     ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, Len, Lit, Local,
-    NumericFor, RawBlock, RetainedArgmax, RetainedArgmaxRows, Return, SubgraphCall, TableLit, Var,
-    While,
+    LocalDecl, NumericFor, OutputRef, RawBlock, RetainedArgmax, RetainedArgmaxRows, Return,
+    SubgraphCall, TableLit, Var, While,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import (
@@ -463,6 +463,15 @@ class PrefillDecodeLoop(DriverComponent):
     bindings: Tuple[Tuple[str, str], ...] = ()
     inputs: Tuple[str, ...] = ()
     default_max_new_tokens: int = 16
+    # What `inputs.eos_token` falls back to. -1 keeps the "negative disables the check" convention for
+    # every family that has always let the caller name it; a family whose checkpoint STATES its eos
+    # binds it here instead, so a host does not carry a per-model token id (BACKLOG.md P4.3).
+    default_eos_token: int = -1
+    # Further ids that also end generation. A chat-formatted checkpoint has two -- the base model's
+    # end-of-text and the chat turn's end -- and a loop knowing only the first runs to
+    # `max_new_tokens` on every utterance. Empty for every family with a single eos, which emits
+    # exactly the Lua it emitted before this field existed.
+    extra_eos_tokens: Tuple[int, ...] = ()
     # {input name: sliding-window width} for the masks that are banded rather than full-causal
     # (BACKLOG.md P4.0.11a). Empty for every model that has no windowed attention, which is every model
     # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
@@ -488,6 +497,27 @@ class PrefillDecodeLoop(DriverComponent):
     # the model produced it, so it belongs in what the loop returns, even though it is also fed back in
     # as part of the prompt (BACKLOG.md P4.1).
     generated_prefix: object = None
+    # The topology that turns this step's TOKEN IDS into the embeddings the decoder actually takes, for
+    # a family whose decoder is traced on `inputs_embeds` rather than on ids (BACKLOG.md P4.3, family
+    # 3). Empty for every family whose decoder takes ids, which is every family before this one.
+    #
+    # It is a topology rather than a flag because the embedding table is a traced graph like any other:
+    # the step's tokens go in, its output is retained, and the decoder's embedding input is bound to it
+    # by `OutputRef` -- so a token id is still the only thing that crosses the Lua boundary per step.
+    embed_topology: Optional[str] = None
+    # The topology that turns the decoder's HIDDEN STATES into logits, when the decoder phase stops
+    # short of its own head (BACKLOG.md P4.3). Empty when the decoder emits logits directly.
+    #
+    # **This exists for a cost reason, not a structural one.** A family-3 prompt is dominated by audio
+    # rows -- 143 of Qwen3-ASR's 158 for eleven seconds of speech -- and a head inside the decoder graph
+    # would project every one of them through a 151936-wide vocabulary that nothing reads. Splitting it
+    # off lets the driver run the head only where a token is genuinely needed.
+    head_topology: Optional[str] = None
+    # Where the loop's first iteration starts in the KV cache. Defaults to 0, which is the plain
+    # prefill: the loop's own prompt is the whole prompt. A family whose prompt was fed to the cache in
+    # SEGMENTS before the loop (`PromptSegments`) passes the running total it left behind, so the
+    # loop's first iteration is simply the last segment.
+    initial_n_past: object = None
 
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
@@ -498,6 +528,10 @@ class PrefillDecodeLoop(DriverComponent):
     __links__ = {
         "topology": TopologyName(),
         "inputs": TopologyInput(FieldRef("topology"), exact=True),
+        # Optional, so `WhenSet`: a family whose decoder takes token ids and emits its own logits sets
+        # neither, and must not be asked to name topologies it has no reason to have.
+        "embed_topology": WhenSet(TopologyName()),
+        "head_topology": WhenSet(TopologyName()),
     }
     __unchecked__ = {
         "bindings": Unchecked(
@@ -523,10 +557,22 @@ class PrefillDecodeLoop(DriverComponent):
         ),
         "generated_prefix": Unchecked("same -- an expression over an earlier component's local, "
                                        "resolved by driver_ir.validate"),
+        "initial_n_past": Unchecked(
+            "a driver_ir expression over a local an earlier component bound, exactly like `prompt`; "
+            "driver_ir.validate resolves it over the assembled function, so a name nothing binds "
+            "fails the export rather than reading nil at run time"
+        ),
         "default_max_new_tokens": Unchecked(
             "a default for a caller-supplied argument, not a claim about the model. Nothing in the "
             "checkpoint could disagree with it."
         ),
+        "default_eos_token": Unchecked(
+            "READ off the checkpoint's own generation config by the family that binds it, and a "
+            "default for a caller-supplied argument otherwise. The one thing a link could compare it "
+            "against is that same generation config, which is where the value came from."
+        ),
+        "extra_eos_tokens": Unchecked("same -- the remaining ids the checkpoint's generation config "
+                                      "lists, read rather than claimed"),
         "generated_var": Unchecked("a local this component binds; reads of it are inside its own loop "
                                    "and are checked by driver_ir.validate over the assembled function"),
         "step_var": Unchecked("same"),
@@ -545,6 +591,12 @@ class PrefillDecodeLoop(DriverComponent):
                 # would otherwise imply, so a model whose encoder output happens to be called
                 # `attention_mask` is still bound to the encoder rather than to loom.causal_mask.
                 out[name] = self.bound[name]
+            elif kind == CALLER and self.embed_topology:
+                # The step's tokens reach a `inputs_embeds`-traced decoder through the embedding
+                # topology this loop just ran, backend-side. `OutputRef` rather than a marshalled
+                # table for the same reason Whisper's `xa` is one: a hidden-size-wide row per token
+                # would otherwise cross the Lua boundary on every step.
+                out[name] = OutputRef(self.embed_topology)
             elif kind == POSITION:
                 out[name] = Call("loom.range", [Var(self.n_past_var), Var(self.n_tokens_var)])
             elif kind == MASK:
@@ -557,21 +609,58 @@ class PrefillDecodeLoop(DriverComponent):
                 out[name] = Var(self.step_var)
         return out
 
+    def _step_body(self, ctx: DriverContext) -> List:
+        """The calls one iteration makes, before the token is read.
+
+        One call for a family whose decoder takes ids and emits logits; up to three for a composition
+        (`embed` -> `decoder` -> `lm_head`), each retained so that only the token id itself is ever
+        marshalled. The middle one is the same cached call in both cases -- what changes is where its
+        input comes from and where its output goes, which is exactly what the two topology fields say.
+        """
+        body = []
+        if self.embed_topology:
+            body.append(SubgraphCall(
+                outputs=[], module=self.embed_topology,
+                axes={ctx.root_axis(self.embed_topology): Var(self.n_tokens_var), "n_past": Lit(0)},
+                inputs={ctx.primary_input(self.embed_topology): Var(self.step_var)},
+                retain=True,
+            ))
+        body.append(SubgraphCall(
+            outputs=[], module=self.topology,
+            axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
+                  "n_past": Var(self.n_past_var)},
+            inputs=self._call_inputs(ctx),
+            retain=True,
+        ))
+        if self.head_topology:
+            body.append(SubgraphCall(
+                outputs=[], module=self.head_topology,
+                axes={ctx.root_axis(self.head_topology): Var(self.n_tokens_var), "n_past": Lit(0)},
+                inputs={ctx.primary_input(self.head_topology): OutputRef(self.topology)},
+                retain=True,
+            ))
+        return body
+
     def emit(self, ctx: DriverContext) -> List:
         next_var = "_next_token"
         max_new = "_max_new_tokens"
         eos = "_eos_token"
+        # Whichever module actually holds the logits: the decoder itself, or the head phase it was
+        # split into. One name, so the argmax and the call that produced it cannot disagree.
+        logits_module = self.head_topology or self.topology
         return [
             Local(self.generated_var,
                   self.generated_prefix if self.generated_prefix is not None else ArrayLit([])),
             Local(self.step_var,
                   self.prompt if self.prompt is not None
                   else FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
-            Local(self.n_past_var, Lit(0)),
+            Local(self.n_past_var,
+                  self.initial_n_past if self.initial_n_past is not None else Lit(0)),
             Local(self.n_tokens_var, Len(self.step_var)),
             Local(max_new, BinOp("or", FieldAccess("inputs", "max_new_tokens"),
                                  Lit(self.default_max_new_tokens))),
-            Local(eos, BinOp("or", FieldAccess("inputs", "eos_token"), Lit(-1))),
+            Local(eos, BinOp("or", FieldAccess("inputs", "eos_token"),
+                             Lit(self.default_eos_token))),
             While(cond=Lit(True), body=[
                 # Retain, then reduce by name: the logits stay in the module's own buffer and the only
                 # thing a decode step ships across the boundary is the token id. That is what removes
@@ -581,19 +670,15 @@ class PrefillDecodeLoop(DriverComponent):
                 # facts, and `loom.run_subgraph_and_retain` composes with every other way a retained
                 # output is read; a second, fused spelling of the same reduction is what P4.0.14
                 # retired.
-                SubgraphCall(
-                    outputs=[], module=self.topology,
-                    axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
-                          "n_past": Var(self.n_past_var)},
-                    inputs=self._call_inputs(ctx),
-                    retain=True,
-                ),
-                Local(next_var, RetainedArgmax(self.topology,
+                *self._step_body(ctx),
+                Local(next_var, RetainedArgmax(logits_module,
                                                BinOp("-", Var(self.n_tokens_var), Lit(1)))),
                 CallStmt(Call("table.insert", [Var(self.generated_var), Var(next_var)])),
                 Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
                 If(cond=BinOp(">=", Len(self.generated_var), Var(max_new)), then=[Break()]),
                 If(cond=BinOp("==", Var(next_var), Var(eos)), then=[Break()]),
+                *[If(cond=BinOp("==", Var(next_var), Lit(alt)), then=[Break()])
+                  for alt in self.extra_eos_tokens],
                 # Every later step is the same call at n_tokens = 1: the cache holds the past, so the
                 # graph only ever computes K/V for what it is handed.
                 Assign(self.step_var, ArrayLit([Var(next_var)])),
@@ -1476,6 +1561,158 @@ class SubgraphCallComponent(DriverComponent):
         )]
 
 
+def _names_a_topology(link) -> bool:
+    """Does `link` assert that its field holds a topology name -- including through a wrapper?
+
+    `MultiPhaseDriverBuilder.called_topologies` reads this off the declarations rather than off a list
+    of component classes, precisely so a new component is counted the day it declares its link. A bare
+    `isinstance(link, TopologyName)` undoes half of that: an OPTIONAL topology field is declared
+    `WhenSet(TopologyName())`, whose wrapper is not a `TopologyName`, so the field is checked and yet
+    invisible to the count. That is the same failure the comment at the call site describes, one
+    wrapper deeper -- it reported family 3's `embed` and `lm_head` as "topologies no call site names"
+    while the loop was calling both every step (BACKLOG.md P4.3).
+    """
+    return isinstance(link, TopologyName) or (
+        isinstance(link, WhenSet) and _names_a_topology(link.inner)
+    )
+
+
+@dataclass
+class PromptSegments(DriverComponent):
+    """A prompt made of alternating text and non-text pieces, fed to a KV-cached decoder as one cached
+    call per piece (BACKLOG.md P4.3, `EXPORT-ROADMAP.md` family 3's "embedding-injection driver").
+
+    **Why this is a walk over segments rather than a concatenation.** A speech-LM prompt is text
+    embeddings with the audio encoder's own output rows substituted in where a placeholder token sits.
+    Building that as one tensor would need a backend-side concatenation of two retained values -- an
+    engine op that does not exist, and one `OutputStore` has no shape for. It is not needed: attention
+    is causal and the decoder is cached, so a call at `n_past = k` over `n` rows writes cells
+    `[k, k+n)` and attends over `[0, k+n)`, which makes N successive cached calls the same arithmetic
+    as one call over the concatenation. Measured against HF on Qwen3-ASR-0.6B before this component was
+    written: 2.3e-04 on hidden states whose absmax is 95.7, and the same first token.
+
+    **This component deliberately stops one segment short.** It emits the calls for every segment but
+    the last and leaves `n_past_var` holding the running total, which `PrefillDecodeLoop.initial_n_past`
+    picks up -- so the final text segment is the loop's own first iteration, exactly as a plain causal
+    LM's prefill is its first iteration. Two components, one prompt, and no third spelling of "run the
+    decoder over some rows".
+
+    A `"text"` segment's expression is a Lua array of token ids, which this runs `embed_topology` over;
+    a `"bound"` segment's is an `OutputRef` to a module that has already run and retained, whose row
+    count the driver computes from the audio geometry rather than reading back.
+    """
+
+    topology: str = "main_topology"
+    bindings: Tuple[Tuple[str, str], ...] = ()
+    embed_topology: Optional[str] = None
+    # ((kind, expression), ...) in prompt order, kind in {"text", "bound"}.
+    segments: Tuple[Tuple[str, object], ...] = ()
+    # How many decoder positions one chunk of audio occupies, and how many waveform samples one chunk
+    # is. Both READ off the model in `phases()` and cross-checked against the encoder's real output
+    # there -- the driver needs them because a `bound` segment's length is not something it can ask the
+    # retained tensor for.
+    audio_rows_per_chunk: int = 0
+    samples_per_chunk: int = 0
+
+    n_past_var: str = "_n_past"
+    n_tokens_var: str = "_seg_tokens"
+
+    __links__ = {
+        "topology": TopologyName(),
+        "embed_topology": WhenSet(TopologyName()),
+    }
+    __unchecked__ = {
+        "bindings": Unchecked(
+            "the traced decoder's own declared input names and kinds, READ off the MIL function "
+            "through `exporter._binding_kind` -- the same list PrefillDecodeLoop is built from, so the "
+            "two cannot disagree about this decoder's inputs"
+        ),
+        "segments": Unchecked(
+            "driver_ir expressions over locals earlier components bind, plus an OutputRef per bound "
+            "segment. validate() resolves the former over the assembled function and "
+            "check_subgraph_calls rejects the latter if nothing retained that module, which are the "
+            "two ways this list can be wrong."
+        ),
+        "audio_rows_per_chunk": Unchecked(
+            "READ off the audio config and CROSS-CHECKED in BaseSpeechLMExportConfig.phases() against "
+            "the number of rows the traced encoder actually emits for a known chunk count -- which is "
+            "the check that matters, because a wrong value here places every later segment at the "
+            "wrong n_past with no shape mismatch to reveal it"
+        ),
+        "samples_per_chunk": Unchecked("same cross-check: the sample count whose mel is exactly one "
+                                       "encoder chunk"),
+        "n_past_var": Unchecked("a local this component binds and PrefillDecodeLoop reads; "
+                                "driver_ir.validate resolves that read over the assembled function"),
+        "n_tokens_var": Unchecked("same"),
+    }
+
+    def link_label(self) -> str:
+        return f"prompt segments -> loom.run_subgraph({self.topology!r})"
+
+    def _call_inputs(self, embeds):
+        """The decoder's input table for one segment: the embeddings, and the host-computed pair."""
+        out = {}
+        for name, kind in self.bindings:
+            if kind == POSITION:
+                out[name] = Call("loom.range", [Var(self.n_past_var), Var(self.n_tokens_var)])
+            elif kind == MASK:
+                out[name] = Call("loom.causal_mask", [Var(self.n_tokens_var), Var(self.n_past_var)])
+            else:
+                out[name] = embeds
+        return out
+
+    def emit(self, ctx: DriverContext) -> List:
+        body: List = [
+            _note_block(
+                "Prompt: one cached decoder call per segment. The KV cache makes this identical to "
+                "one call over the concatenated prompt, which is why no tensor is ever joined."
+            )[0],
+            Local(self.n_past_var, Lit(0)),
+            LocalDecl(self.n_tokens_var),
+        ]
+        for kind, expr in self.segments:
+            if kind == "text":
+                body.append(Assign(self.n_tokens_var, Len(expr)))
+                body.append(SubgraphCall(
+                    outputs=[], module=self.embed_topology,
+                    axes={ctx.root_axis(self.embed_topology): Var(self.n_tokens_var), "n_past": Lit(0)},
+                    inputs={ctx.primary_input(self.embed_topology): expr},
+                    retain=True,
+                ))
+                embeds = OutputRef(self.embed_topology)
+            elif kind == "bound":
+                # The audio segment's length: one row per `audio_rows_per_chunk` per chunk of waveform.
+                # Computed rather than read back because a retained tensor's shape does not cross the
+                # boundary -- and it is exactly the arithmetic the host already did to pad the audio.
+                # `floordiv`, not `/`: Lua's `/` is float division, so a whole number of chunks would
+                # still make this a float and the axis table would carry 143.0 where the engine binds
+                # an integer extent. The waveform is a whole number of chunks by the encoder's own
+                # contract, so the floor changes no value -- only its type.
+                body.append(Assign(self.n_tokens_var, BinOp(
+                    "*",
+                    BinOp("floordiv", Len(FieldAccess("inputs", "waveform")),
+                          Lit(self.samples_per_chunk)),
+                    Lit(self.audio_rows_per_chunk),
+                )))
+                embeds = expr
+            else:
+                raise ValueError(
+                    f"unknown prompt segment kind {kind!r}; this component understands 'text' (token "
+                    f"ids to run the embedding topology over) and 'bound' (another module's retained "
+                    f"output, used as embeddings directly)."
+                )
+            body.append(SubgraphCall(
+                outputs=[], module=self.topology,
+                axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
+                      "n_past": Var(self.n_past_var)},
+                inputs=self._call_inputs(embeds),
+                retain=True,
+            ))
+            body.append(Assign(self.n_past_var,
+                               BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))))
+        return body
+
+
 @dataclass
 class FlowMatchingSampler(DriverComponent):
     """A `FlowMatchingSpec`'s generated sampler function, plus the one line that calls it.
@@ -1648,7 +1885,7 @@ class MultiPhaseDriverBuilder(DriverBuilder):
             # exactly like `SubgraphCallComponent` does, and an isinstance list reported Whisper's
             # decoder as a topology no call site names.
             for field, links in declared_links(component).items():
-                if any(isinstance(link, TopologyName) for link in links):
+                if any(_names_a_topology(link) for link in links):
                     value = getattr(component, field, None)
                     if isinstance(value, str):
                         names.add(value)

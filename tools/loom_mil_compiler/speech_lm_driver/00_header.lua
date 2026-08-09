@@ -1,0 +1,22 @@
+-- Family 3: an audio encoder, a projector, and a causal LM that reads the projector's rows as if they
+-- were token embeddings (speech_lm_export.py, BACKLOG.md P4.3).
+--
+-- Four traced topologies. `encoder` takes a waveform -- the mel frontend, the chunked conv stem, the
+-- window-attention stack and the projector are all inside the graph, so a host hands over audio and not
+-- features -- and emits one row per 1/13th of a second, already the LM's own width. `embed` turns token
+-- ids into embeddings, `decoder` is one KV-cached step over embeddings, and `lm_head` turns its hidden
+-- states into logits.
+--
+-- The prompt is text, then audio, then text, and it is fed to the decoder as one cached call per piece.
+-- That is identical to feeding it concatenated -- attention is causal, so a call at n_past = k writes
+-- cells [k, k+n) and attends over [0, k+n) -- and it is what lets the encoder's output reach the LM as
+-- a backend-side tensor rather than a Lua table. Nothing here ever joins two tensors, because nothing
+-- has to.
+--
+-- inputs: waveform (flat f32 array, host-padded with zeros to a multiple of `loom.samples_per_chunk`
+-- samples, which the encoder's contract requires -- see WindowedAudioEncoder), and two optional ones,
+-- max_new_tokens and eos_token (negative disables the early stop).
+--
+-- The prompt is built here, not passed in: it comes from the checkpoint's own chat template, rendered
+-- at export time into AUDIO_PREFIX_*/AUDIO_SUFFIX_* constants. See 01_prompt.lua. Returns the generated
+-- token ids, not including the prompt.

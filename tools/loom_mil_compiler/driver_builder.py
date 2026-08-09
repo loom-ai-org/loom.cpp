@@ -77,6 +77,27 @@ class DriverContext:
     def root_axis(self, topology: str) -> str:
         return self.axes.get(topology, "n_tokens")
 
+    def primary_input(self, topology: str) -> str:
+        """The name of a single-input topology's one declared input, READ off the exported topology.
+
+        For the composition family's `embed` and `lm_head` phases (BACKLOG.md P4.3), whose call sites
+        have exactly one thing to supply and no reason to know what the traced graph called it. Reading
+        it here rather than letting the family state it keeps the exporter the only authority on
+        declared input names -- the same argument `DriverInputs.bindings` is built on.
+
+        Raises rather than guessing when the topology has any other number of inputs: a call site that
+        supplies one value to a two-input graph would leave the second reading as an uninitialised
+        tensor, which is precisely the failure `TopologyInput(exact=True)` exists to catch.
+        """
+        declared = [inp["name"] for inp in self.topologies[topology].get("inputs", [])]
+        if len(declared) != 1:
+            raise ValueError(
+                f"topology {topology!r} declares {len(declared)} inputs ({declared}), and "
+                f"primary_input() is only meaningful for a topology with exactly one. The call site "
+                f"asking for it supplies a single value, so it cannot fill the others."
+            )
+        return declared[0]
+
     def link_slots(self) -> dict:
         """The `spec_protocol` context slots this context can populate, omitting the ones it has
         nothing for -- a slot provided as an empty dict reads as present (`LinkCheckContext.has`), so
