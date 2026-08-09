@@ -5,6 +5,10 @@ driver — the Lua a GGUF embeds as `model.driver_script`, and the only orchestr
 carries — is assembled from **components**, one per contribution. The point of writing them down is
 reuse: P4.1 (Whisper), P4.2 (GigaAM) and P4.3 (composition) are supposed to *reuse* these rather than
 restate them, and that only works if a reader can trust a component without reading its implementation.
+Two of the three are in: Whisper added exactly one field (`PrefillDecodeLoop.bound`) and no component,
+and GigaAM added neither — it appears in the *used by* columns below without a line of driver code of
+its own, because its transducer decode loop is Parakeet's, shared through
+`transducer_export.BaseTransducerExportConfig`.
 
 So the standing rule from `EXPORT-PREPARATION.md` §2 applies to every row below: **every field is either
 checkable against the real model/topology, or explicitly documented as unchecked.** The tables say which
@@ -63,10 +67,10 @@ Three builders exist:
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 2 | 10 | hf-causal-lm, lfm2-monolithic, qwen3, whisper |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 7 | kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 7 | gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 6 | matcha, supertonic |
 | `driver_return` | `DriverReturn` | statements | 0 | 1 | kokoro, matcha, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
@@ -125,7 +129,7 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
+*Emits:* statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -147,7 +151,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
+*Emits:* prelude, statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -162,7 +166,7 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
+*Emits:* statements. *Used by:* gigaam-rnnt, kokoro, matcha, parakeet-rnnt, parakeet-tdt, styletts2, supertonic, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)

@@ -282,7 +282,7 @@ not enough to cost a template, which is P4's job per family.
 
 | # | family | representative members | conv. | models | the connector it needs | Loom status |
 |---|---|---|---|---|---|---|
-| 1 | **Conformer/FastConformer encoders** + CTC / TDT / RNNT heads | parakeet ×6, reazonspeech, `stt_*_fastconformer_ctc_*` ×4, canary-ctc, nemotron-streaming, **GigaAM v3 ×4** | 4 | ~13 (+4) | CTC head (done) / TDT / RNNT decode loop (host-side) | **mostly done** — `NeMoASREncoderSpec`; GigaAM needs a second loader (below) |
+| 1 | **Conformer/FastConformer encoders** + CTC / TDT / RNNT heads | parakeet ×6, reazonspeech, `stt_*_fastconformer_ctc_*` ×4, canary-ctc, nemotron-streaming, **GigaAM v3 ×4** | 4 | ~13 (+4) | CTC head (done) / TDT / RNNT decode loop (host-side) | **done for the four checkpoints here** — the CTC leaf is `ASRNemoEncoderExportConfig`, the transducer leaves are `BaseTransducerExportConfig`; GigaAM v3's second loader landed in P4.2 and is what split loader from template |
 | 2 | **Audio encoder + AR cross-attention decoder** (AED) | whisper (all sizes), distil-whisper, tiron, canary, cohere-asr ×2, firered-asr, firered-lid, moonshine ×3, moonshine-streaming, whisper-vad | 8 | ~12 | **cross-attention decoder loop with KV cache** — shared with family 6 | **whisper done** (P4.1): the connector is `PrefillDecodeLoop.bound`, one field, and family 6 needs no more than it |
 | 3 | **Speech-LLM adapters** (audio encoder → projector → causal LM) | voxtral, voxtral4b, qwen3-asr ×4, glm-asr, granite ×7, gemma4 ×2, higgs-stt, mimo-asr, canary-qwen, omniasr-llm ×2, moss ×3, vibevoice ×2, ark-asr, lfm2-audio ×2, mini-omni2, kyutai-stt ×2, funasr ×2 | 19 | **~36** | **a projector** (linear / 4-frame stack / Q-Former / VQAdaptor / GatedMLP) + embedding-injection driver | LM half done (`ModularExportSpec`); encoder half is family 1 or 2 |
 | 4 | **CNN + transformer + CTC** | wav2vec2, data2vec, hubert, omniasr-ctc ×2, tada-aligner | 3 | ~6 | CTC head (already done for family 1) | not started; family-1-shaped |
@@ -354,13 +354,26 @@ the template's real contract is *"give me an `nn.Module` and tell me what its fo
 "which library restored it" belongs in a per-model loader entry. Doing this with two loaders and one
 family template is a much better test of that boundary than doing it with one.
 
-Two things to check when the work starts, neither yet verified:
+**Done, 2026-08-09 — BACKLOG.md P4.2, `gigaam_export.py`.** Both open questions answered, one each way:
 
-* whether the `trust_remote_code` modeling code traces cleanly under `torch.jit.trace`, or needs a
-  `ModelPatcher` (R4) — custom remote code is exactly the category that tends to contain `.item()`
-  calls and Python-side control flow;
-* whether the `rnnt`/`e2e_rnnt` heads match the RNN-T decoder+joint layout the Parakeet path already
-  drives host-side, or differ enough to need their own decoder topology.
+* **The heads match exactly.** `modeling_gigaam.RNNTJoint` and `RNNTDecoder` are the same three modules
+  under the same three names as NeMo's, so the joint wrapper, the embedding phase, the LSTM cell phase
+  and the whole decode loop are shared *verbatim* — `transducer_export.BaseTransducerExportConfig`, with
+  the two leaves supplying only their loader and where the checkpoint keeps those three modules. The one
+  thing that did move is the depth: GigaAM's prediction network is one layer where Parakeet's is two, so
+  `RecurrentPhase` gained `number_layers`.
+* **The remote code does need patching, but not for the predicted reason.** No `.item()`, no Python
+  control flow. Two other things: a lazily-built `persistent=False` rotary buffer that must be
+  materialized outside `inference_mode` before tracing, and torchaudio's `MelSpectrogram`, which cannot
+  be converted at all — its batch pack/unpack reads `.shape` on a *complex* tensor, emitting a
+  `complex_shape` op coremltools cannot lower. Both handled in `load_model`, the second by a rewritten
+  frontend that every export checks against the real one.
+
+And the prediction that the split is what this exercise buys held: the loader is now four lines and two
+argument names, and `nemo_asr_export.py`'s `EncoderOutput`/`build_trace`/`ASREncoderWrapper` are family-1
+machinery that GigaAM imports without a parameter. Two exporter bugs fell out of it, both older than this
+model and both silent (see P4.2) — the more interesting of the two is that a wrong encoder still decoded
+71 of the first 80 tokens correctly, which is the argument for tensor-level oracles over token-level ones.
 
 ---
 
@@ -458,7 +471,7 @@ else — and against which R3/R4 are judged:
 |---|---|---|
 | **Whisper** | 2 | MIL export done (BACKLOG.md P4.1) — `whisper_export.py`, two phases + a generated decode loop; the bespoke converter still backs the whisper-tiny tests (R6 blocker recorded there) |
 | **NeMo ASR** (Conformer-CTC, Parakeet TDT/RNNT) | 1 | MIL export done, still a script per model |
-| **GigaAM v3** | 1 | never exported; gap in CrispASR too (see R5) |
+| **GigaAM v3** | 1 | MIL export done (BACKLOG.md P4.2) — `gigaam_export.py`, the `e2e_rnnt` variant through the shared transducer template; the CTC variants are unclaimed for want of a checkpoint |
 | **Qwen3** | causal LM / speech-LLM | `ModularExportSpec` done for the base LM; ASR/TTS variants not started |
 
 "Covered" for a flagship means: the export script is deleted, the registry entry exists, and the

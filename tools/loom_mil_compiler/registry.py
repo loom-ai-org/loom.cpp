@@ -166,6 +166,7 @@ def default_registry() -> TaskRegistry:
     registry = TaskRegistry()
     from . import causal_lm_export
     from . import nemo_asr_export
+    from . import gigaam_export
     from . import whisper_export
     from . import kokoro_export
     from . import matcha_export
@@ -175,6 +176,7 @@ def default_registry() -> TaskRegistry:
 
     causal_lm_export.register(registry)
     nemo_asr_export.register(registry)
+    gigaam_export.register(registry)
     whisper_export.register(registry)
     kokoro_export.register(registry)
     matcha_export.register(registry)

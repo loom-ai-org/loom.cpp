@@ -2770,10 +2770,94 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   `<|notimestamps|>`, both resolved by text — while timestamp markers are kept, since asking for them
   is the point of the flag. `--task translate` is visibly real: the same German audio transcribes as
   `(Lockere Musik)` and translates as `[Water sizzling]`.
-- **P4.2 — GigaAM v3.** Graph is family 1 (already exported); the point is the *second loader*
-  (`gigaam.load_model` / `AutoModel.from_pretrained(..., trust_remote_code=True)` instead of
-  `ASRModel.restore_from`), which is what proves P3.2's loader/template split. Check first whether the
-  remote-code modeling traces cleanly or needs a patcher.
+- **P4.2 — GigaAM v3 — DONE (2026-08-09).** Graph is family 1 (already exported); the point was the
+  *second loader* (`AutoModel.from_pretrained(..., trust_remote_code=True)` instead of
+  `ASRModel.restore_from`), which is what proves P3.2's loader/template split.
+
+  `tools/loom_mil_compiler/gigaam_export.py` (~200 lines, over half of it prose) + the transducer
+  template it reuses. `v3_e2e_rnnt` exports as four phases — `encoder` (1455 nodes), `embed`,
+  `pred_lstm_l0_fwd`, `joint` — in one 851 MiB GGUF, registered as
+  `automatic-speech-recognition/gigaam-rnnt` against a real check on the checkpoint's own
+  `cfg.model.cfg.model_class`, so `loom-export <dir> -o gigaam.gguf` needs no `--task`/`--model`.
+  `test_e2e_gigaam_lua_driver.cpp` decodes `samples/jfk.wav` to the same **80 tokens** the checkpoint's
+  own `RNNTGreedyDecoding` emits, and the exported encoder matches PyTorch's to 3.2e-4 over 275 frames.
+
+  **The split the roadmap asked for, drawn where the evidence put it.** `parakeet_export.py` was the
+  only transducer, so everything in it read as Parakeet's. Peeling GigaAM out of it found the boundary
+  is not between the two models at all — it is between *how a checkpoint is loaded and where it keeps
+  its modules* and *everything else*:
+
+  * `transducer_export.py` (new) holds `BaseTransducerExportConfig`: the four phases, their shapes, the
+    blank-id derivation, the joint/duration cross-check and the whole component list. Both leaves.
+  * `parakeet_export.py` shrank to ~70 lines: `ASRModel.restore_from`, `decoder.prediction`/`joint`, and
+    two recognizers.
+  * `gigaam_export.py`: `AutoModel.from_pretrained(...).model`, `head.decoder`/`head.joint`, one
+    recognizer — plus two workarounds the remote code needs, below.
+  * `nemo_asr_export.py`'s `EncoderOutput`, `build_trace` and (renamed) `ASREncoderWrapper` turned out
+    to be family-1's encoder template with no NeMo in them at all. GigaAM imports all three unchanged.
+    **The entire remaining difference is two strings**: `GigaAM.forward` names its inputs
+    `features`/`feature_lengths` where NeMo names them `input_signal`/`input_signal_length`, which is
+    now `ASREncoderWrapper.input_names`. The module keeps its name because NeMo is still the only
+    loader with a config of its own in it; a third loader is when the encoder half earns its own module.
+
+  `transducer_driver/` (was `parakeet_driver/`) is shared verbatim, and Parakeet's own driver text
+  changes by exactly the five header-comment lines that named it — the one intended difference in the
+  re-export gate below. `RecurrentPhase` gained `number_layers`, because GigaAM's prediction network is
+  **one** layer where Parakeet's is two, and the driver loop addresses the cells by index: the phase
+  says "number the layers whatever the depth" rather than the Lua restating `topologies()`' rule.
+
+  **The remote code needed two workarounds, as EXPORT-ROADMAP.md R4 predicted, and neither is the one
+  it predicted.** No `.item()`, no Python control flow:
+
+  1. The rotary positional table is a `persistent=False` buffer built lazily on the first forward.
+     Built during the trace it becomes graph ops; built under `torch.inference_mode()` it becomes an
+     *inference tensor* and the trace dies in autograd. `load_model` builds it eagerly, outside
+     inference mode.
+  2. **torchaudio's `MelSpectrogram` cannot be converted, for a reason that is not about mel.**
+     `torchaudio.functional.spectrogram` reshapes the STFT result back to the input's batch shape, and
+     reading `.shape` on a *complex* tensor emits a `complex_shape` op coremltools' own
+     `lower_complex_dialect_ops` pass cannot lower. `_TraceableMelSpectrogram` is the same arithmetic
+     without that reshape — the same shape of rewrite as `WhisperMelFrontend`, for the neighbouring
+     reason. It is not asserted equivalent: every export runs both on a chirp and compares, and they
+     agree **bit for bit**.
+
+  **Two real exporter bugs, both found by this model and both older than it.** Neither is GigaAM-shaped;
+  GigaAM is just the first checkpoint whose frontend and attention are spelled the way that reaches them.
+
+  * **`square` and `clip` were missing from the shape walk's unary-passthrough set**
+    (`exporter._UNARY_PASSTHROUGH_OPS`). `spec.abs()` on a complex tensor lowers to
+    `sqrt(square(re) + square(im))`, so an `.abs()`-based magnitude puts a `square` immediately
+    downstream of the STFT conv whose frame-count formula that walk exists to derive; and
+    `torch.clamp` converts to MIL's `clip`, so the `clamp` entry never matched anything. NeMo spells the
+    same magnitude `view_as_real(...).pow(2).sum(-1)` and calls neither, which is why this survived four
+    ASR exports. The failure was **not an error**: the walk fell back to the bare root axis, the encoder
+    frame count came out as the subsampling formula with the STFT's own `/160` simply missing, and the
+    export succeeded. It failed at run time as a rotary-table VIEW asking for 44000 rows of a 10000-row
+    constant.
+  * **`gather_shape_value` assumed axis 0 is the batch axis.** `x.shape[0]` on a rank≥2 activation
+    short-circuited to a hardcoded `1` — a claim about the model's *layout*, and GigaAM's
+    `RotaryPositionMultiHeadAttention` is the counterexample: it transposes to `(T, B, H, D)` *before*
+    applying the embedding, so `q.shape[0]` there is the sequence length. Read as a batch size it made
+    the rotary cos/sin crop `pe[0:1]` — one position wide, which ggml then broadcasts over every frame,
+    so **every position got position zero's rotation**. The rule is now about the derivation's
+    provenance, the same distinction `scalar_expr_is_guess` draws: trust a real answer, fall back to the
+    batch reading only when the walk had nothing better than the bare root axis. A genuine batch axis
+    traces as a literal `1` and never reaches this code at all.
+
+  **The second bug is the one worth remembering, because nothing structural could have caught it.**
+  The graph built, ran, produced the right output shape, and decoded 71 of the first 80 tokens
+  correctly — a plausible transcript that was simply wrong. Only dumping the exported encoder's own
+  output and comparing it against PyTorch's found it (max abs diff 2.35 on a scale of 2.29), and only
+  bisecting the encoder into prefixes — static vs. dynamic axis, mel / subsampling / attention /
+  convolution — localized it to one slice in one op. **Token-level agreement is not a substitute for a
+  tensor-level oracle**; a transducer decode is robust enough to absorb a badly wrong encoder and still
+  look about right.
+
+  **Not claimed:** GigaAM v3 ships five variants and only `e2e_rnnt` is on this machine. The recognizer
+  requires `model_class == "rnnt"` rather than claiming every `model_type == "gigaam"` directory, so a
+  `ctc`/`e2e_ctc` checkpoint fails detection with the candidate list instead of being exported by a path
+  nothing here has run. Those are family 1's `Flattened` shape (`ASRNemoEncoderExportConfig` with
+  `CTC_LOG_PROBS`) plus this loader — a small addition, and an untested one until a checkpoint exists.
 - **P4.3 — composition template** (encoder + adapter + LM), acceptance on Qwen3-ASR or Voxtral. Unlocks
   family 3 (~20 models) and is the single largest coverage lever in the roadmap.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because

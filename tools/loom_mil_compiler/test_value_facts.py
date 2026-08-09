@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
-from loom_mil_compiler.shape_expr import N_TOKENS
+from loom_mil_compiler.shape_expr import N_TOKENS, as_expr
 from loom_mil_compiler.value_facts import (
     ValueFacts, is_const_producer, static_array, static_ints, static_scalar, static_value,
 )
@@ -240,6 +240,66 @@ class TestGuessProvenance(unittest.TestCase):
         self.assertEqual(facts.scalar_expr(total), N_TOKENS + 3)
         self.assertTrue(facts.scalar_expr_is_guess(total),
                         "one guessed operand makes the whole expression a guess")
+
+
+class TestAxisZeroIsNotAssumedToBeBatch(unittest.TestCase):
+    """`gather_shape_value`'s axis-0 reading (BACKLOG.md P4.2).
+
+    `x.shape[0]` on a rank>=2 activation is usually a batch-size query, and this exporter's models are
+    all batch=1 -- so the answer used to be a hardcoded `1` for axis 0, whatever the walk said. That is
+    a claim about the model's LAYOUT, and GigaAM v3's rotary attention is the counterexample: it
+    transposes to (T, B, H, D) before applying the embedding, so `q.shape[0]` there is the sequence
+    length. The rule is now about the derivation's PROVENANCE, the same distinction
+    `scalar_expr_is_guess` draws: trust a real answer, fall back to the batch reading only when the walk
+    had nothing better than the bare root axis.
+    """
+
+    def _facts_and_gather(self, stub):
+        from coremltools.converters.mil.mil import Builder as mb, get_new_symbol
+
+        # Axis 0 SYMBOLIC, which is what a (T, B, H, D) activation looks like and what a real batch axis
+        # never does -- a batch axis traces as a literal 1 and never reaches this code at all.
+        @mb.program(input_specs=[mb.TensorSpec(shape=(get_new_symbol(), 1))])
+        def prog(x):
+            shape = mb.shape(x=x)
+            return mb.gather(x=shape, indices=np.array([0], dtype=np.int32), axis=0)
+
+        facts = ValueFacts(exporter=stub)
+        gather = next(op for op in prog.functions["main"].operations
+                      if op.op_type == "gather").outputs[0]
+        return facts, gather
+
+    def test_a_real_derivation_for_axis_zero_is_kept(self):
+        class _Stub:
+            root_axis = "n_samples"
+
+            def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+                return as_expr("n_samples") / 4  # a genuine frame count, not the raw sample axis
+
+        facts, gather = self._facts_and_gather(_Stub())
+        self.assertEqual(facts.gather_shape_value(gather), as_expr("n_samples") / 4)
+
+    def test_a_bare_root_axis_answer_still_reads_as_batch(self):
+        """The gap the old short-circuit existed to cover: the walk ran out of graph and returned the
+        root axis, which a batch=1 activation's axis 0 is never actually equal to."""
+        class _Stub:
+            root_axis = "n_samples"
+
+            def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+                return as_expr("n_samples")
+
+        facts, gather = self._facts_and_gather(_Stub())
+        self.assertEqual(facts.gather_shape_value(gather), as_expr(1))
+
+    def test_no_answer_at_all_still_reads_as_batch(self):
+        class _Stub:
+            root_axis = "n_samples"
+
+            def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+                return None
+
+        facts, gather = self._facts_and_gather(_Stub())
+        self.assertEqual(facts.gather_shape_value(gather), as_expr(1))
 
 
 if __name__ == "__main__":

@@ -496,6 +496,16 @@ target_link_libraries(test_e2e_parakeet_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_parakeet_lua_driver COMMAND test_e2e_parakeet_lua_driver)
 set_tests_properties(test_e2e_parakeet_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- The same transducer template, a different loader: GigaAM v3 (an HF `trust_remote_code` directory,
+#     not a `.nemo` archive) through the identical embedded driver, against the checkpoint's own greedy
+#     hypothesis for samples/jfk.wav (BACKLOG.md P4.2). Also the only check on the two things that
+#     checkpoint needed before it would trace -- a rewritten mel frontend and a one-layer prediction
+#     network whose cell the driver addresses by index. ---
+add_executable(test_e2e_gigaam_lua_driver test_e2e_gigaam_lua_driver.cpp)
+target_link_libraries(test_e2e_gigaam_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_gigaam_lua_driver COMMAND test_e2e_gigaam_lua_driver)
+set_tests_properties(test_e2e_gigaam_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Numerical-correctness check: Kokoro's CustomAlbert (PL-BERT) topology (tools/convert_kokoro/
 #     convert_kokoro_albert.py) against a hand-rolled pure-PyTorch reference -- the first, isolated
 #     verification step of Kokoro's full-continuous-build effort (see BACKLOG.md). ---
