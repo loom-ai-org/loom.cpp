@@ -1,0 +1,753 @@
+{
+  "comment": "Derived from tests/gate/ by scripts/fixtures.py scan. Do not hand-edit `path` or `used_by`; `sha256`/`bytes`/`produced_by` are filled in by `record`.",
+  "repo": "femelo/loom-fixtures",
+  "revision": "main",
+  "fixtures": {
+    "LOOM_CAUSAL_LM_KV_GGUF": {
+      "path": "causal_lm_kv.gguf",
+      "used_by": [
+        "test_e2e_causal_lm_infer_with_past"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_CONFORMER_CTC_DIR": {
+      "path": "conformer_ctc",
+      "used_by": [
+        "test_e2e_conformer_ctc_generic",
+        "test_e2e_conformer_ctc_lua_driver",
+        "test_e2e_conformer_ctc_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_CONFORMER_CTC_GENERIC_DIR": {
+      "path": "conformer_ctc_generic",
+      "used_by": [
+        "test_e2e_conformer_ctc_generic"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_CONFORMER_CTC_MIL_GGUF": {
+      "path": "conformer_ctc_mil.gguf",
+      "used_by": [
+        "test_e2e_conformer_ctc_lua_driver",
+        "test_e2e_conformer_ctc_mil_export",
+        "test_vocab"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_GIGAAM_MIL_GGUF": {
+      "path": "gigaam_mil.gguf",
+      "used_by": [
+        "test_e2e_gigaam_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_GRANITE_SPEECH_MIL_GGUF": {
+      "path": "granite_speech_mil.gguf",
+      "used_by": [
+        "test_e2e_granite_speech_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_GRANITE_SPEECH_MIL_REF_DIR": {
+      "path": "granite_speech_mil_ref",
+      "used_by": [
+        "test_e2e_granite_speech_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_ADAINRESBLOCK1_REF_DIR": {
+      "path": "kokoro_adainresblock1_ref",
+      "used_by": [
+        "test_e2e_kokoro_adainresblock1"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_ALBERT_REF_DIR": {
+      "path": "kokoro_albert_ref",
+      "used_by": [
+        "test_e2e_kokoro_albert"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_BERT_ENCODER_REF_DIR": {
+      "path": "kokoro_bert_encoder_ref",
+      "used_by": [
+        "test_e2e_kokoro_bert_encoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_DECODER_CORE_REF_DIR": {
+      "path": "kokoro_decoder_core_ref",
+      "used_by": [
+        "test_e2e_kokoro_decoder_core"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_DIR": {
+      "path": "kokoro",
+      "used_by": [
+        "test_e2e_kokoro_adainresblock1",
+        "test_e2e_kokoro_albert",
+        "test_e2e_kokoro_bert_encoder",
+        "test_e2e_kokoro_decoder_core",
+        "test_e2e_kokoro_duration_predictor",
+        "test_e2e_kokoro_f0_block0",
+        "test_e2e_kokoro_f0_block1",
+        "test_e2e_kokoro_f0n",
+        "test_e2e_kokoro_generator",
+        "test_e2e_kokoro_sinegen",
+        "test_e2e_kokoro_stft",
+        "test_e2e_kokoro_text_encoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_DURATION_REF_DIR": {
+      "path": "kokoro_duration_ref",
+      "used_by": [
+        "test_e2e_kokoro_duration_predictor"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_F0N_REF_DIR": {
+      "path": "kokoro_f0n_ref",
+      "used_by": [
+        "test_e2e_kokoro_f0n"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_F0_BLOCK0_REF_DIR": {
+      "path": "kokoro_f0_block0_ref",
+      "used_by": [
+        "test_e2e_kokoro_f0_block0"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_F0_BLOCK1_REF_DIR": {
+      "path": "kokoro_f0_block1_ref",
+      "used_by": [
+        "test_e2e_kokoro_f0_block1"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_GENERATOR_REF_DIR": {
+      "path": "kokoro_generator_ref",
+      "used_by": [
+        "test_e2e_kokoro_generator"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_LUA_DIR": {
+      "path": "kokoro_lua",
+      "used_by": [
+        "test_e2e_kokoro_lua_driver",
+        "test_e2e_kokoro_mil_topology_equivalence"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_MIL_ALBERT_REF_DIR": {
+      "path": "kokoro_mil_albert_ref",
+      "used_by": [
+        "test_e2e_kokoro_mil_albert_bert_encoder_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_MIL_DECODER_VOCODER_GGUF": {
+      "path": "kokoro_mil_decoder_vocoder.gguf",
+      "used_by": [
+        "test_e2e_kokoro_mil_decoder_vocoder_smoke"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_MIL_DECODER_VOCODER_REF_DIR": {
+      "path": "kokoro_mil_decoder_vocoder_ref",
+      "used_by": [
+        "test_e2e_kokoro_mil_decoder_vocoder_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_MIL_GGUF": {
+      "path": "kokoro_mil.gguf",
+      "used_by": [
+        "test_e2e_kokoro_mil_albert_bert_encoder_reference",
+        "test_e2e_kokoro_mil_decoder_vocoder_reference",
+        "test_e2e_kokoro_mil_lua_driver",
+        "test_e2e_kokoro_mil_topology_equivalence"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_SINEGEN_REF_DIR": {
+      "path": "kokoro_sinegen_ref",
+      "used_by": [
+        "test_e2e_kokoro_sinegen"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_STFT_REF_DIR": {
+      "path": "kokoro_stft_ref",
+      "used_by": [
+        "test_e2e_kokoro_stft"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_KOKORO_TEXT_ENCODER_REF_DIR": {
+      "path": "kokoro_text_encoder_ref",
+      "used_by": [
+        "test_e2e_kokoro_text_encoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_LFM2_MODULAR_GGUF": {
+      "path": "lfm2_modular.gguf",
+      "used_by": [
+        "test_e2e_lfm2_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_LFM2_MONOLITHIC_GGUF": {
+      "path": "lfm2_monolithic.gguf",
+      "used_by": [
+        "test_e2e_lfm2_mil_export",
+        "test_e2e_lfm2_q8_0",
+        "test_e2e_lfm2_tokenizer"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_LFM2_MONOLITHIC_Q8_0_GGUF": {
+      "path": "lfm2_monolithic_q8_0.gguf",
+      "used_by": [
+        "test_e2e_lfm2_q8_0"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_LSTM_RECURRENT_GGUF": {
+      "path": "lstm_recurrent.gguf",
+      "used_by": [
+        "test_e2e_lstm_recurrent"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MATCHA_DECODER_REF_DIR": {
+      "path": "matcha_decoder_ref",
+      "used_by": [
+        "test_e2e_matcha_decoder",
+        "test_e2e_matcha_mil_decoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MATCHA_DIR": {
+      "path": "matcha",
+      "used_by": [
+        "test_e2e_matcha_decoder",
+        "test_e2e_matcha_text_encoder",
+        "test_e2e_matcha_vocoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MATCHA_LUA_DIR": {
+      "path": "matcha_lua",
+      "used_by": [
+        "test_e2e_matcha_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MATCHA_MIL_GGUF": {
+      "path": "matcha_mil.gguf",
+      "used_by": [
+        "test_e2e_matcha_mil_decoder",
+        "test_e2e_matcha_mil_lua_driver",
+        "test_e2e_matcha_mil_text_encoder",
+        "test_e2e_matcha_mil_vocoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MATCHA_TEXT_ENCODER_REF_DIR": {
+      "path": "matcha_text_encoder_ref",
+      "used_by": [
+        "test_e2e_matcha_mil_text_encoder",
+        "test_e2e_matcha_text_encoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MATCHA_VOCODER_REF_DIR": {
+      "path": "matcha_vocoder_ref",
+      "used_by": [
+        "test_e2e_matcha_mil_vocoder",
+        "test_e2e_matcha_vocoder"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_PARAKEET_RNNT_MIL_GGUF": {
+      "path": "parakeet_rnnt_mil.gguf",
+      "used_by": [
+        "test_e2e_parakeet_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_PARAKEET_TDT_DIR": {
+      "path": "parakeet_tdt",
+      "used_by": [
+        "test_vocab_spm_bpe"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_PARAKEET_TDT_MIL_GGUF": {
+      "path": "parakeet_tdt_mil.gguf",
+      "used_by": [
+        "test_e2e_parakeet_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_PREFILL_CEILING_GGUF": {
+      "path": "prefill_ceiling.gguf",
+      "used_by": [
+        "test_e2e_prefill_past_marshalling_ceiling"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_QWEN3_ASR_MIL_GGUF": {
+      "path": "qwen3_asr_mil.gguf",
+      "used_by": [
+        "test_e2e_qwen3_asr_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_QWEN3_ASR_MIL_REF_DIR": {
+      "path": "qwen3_asr_mil_ref",
+      "used_by": [
+        "test_e2e_qwen3_asr_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_QWEN3_DIR": {
+      "path": "qwen3",
+      "used_by": [
+        "test_e2e_qwen3",
+        "test_e2e_qwen3_generic",
+        "test_e2e_qwen3_q8_0"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_QWEN3_GENERIC_DIR": {
+      "path": "qwen3_generic",
+      "used_by": [
+        "test_e2e_qwen3_generic"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_QWEN3_Q8_0_DIR": {
+      "path": "qwen3_q8_0",
+      "used_by": [
+        "test_e2e_qwen3_q8_0"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SPM_TOKENIZER_GGUF": {
+      "path": "spm_tokenizer.gguf",
+      "used_by": [
+        "test_e2e_spm_byte_fallback_tokenizer"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_STYLETTS2_DIFFUSION_REF_DIR": {
+      "path": "styletts2_diffusion_ref",
+      "used_by": [
+        "test_e2e_styletts2_diffusion_net",
+        "test_e2e_styletts2_mil_diffusion_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_STYLETTS2_DIR": {
+      "path": "styletts2",
+      "used_by": [
+        "test_e2e_styletts2_diffusion_net"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_STYLETTS2_LUA_DIR": {
+      "path": "styletts2_lua",
+      "used_by": [
+        "test_e2e_kokoro_mil_topology_equivalence",
+        "test_e2e_styletts2_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_STYLETTS2_MIL_ALBERT_REF_DIR": {
+      "path": "styletts2_mil_albert_ref",
+      "used_by": [
+        "test_e2e_styletts2_mil_albert_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_STYLETTS2_MIL_DECODER_VOCODER_REF_DIR": {
+      "path": "styletts2_mil_decoder_vocoder_ref",
+      "used_by": [
+        "test_e2e_styletts2_mil_decoder_vocoder_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_STYLETTS2_MIL_GGUF": {
+      "path": "styletts2_mil.gguf",
+      "used_by": [
+        "test_e2e_kokoro_mil_topology_equivalence",
+        "test_e2e_styletts2_mil_albert_reference",
+        "test_e2e_styletts2_mil_decoder_vocoder_reference",
+        "test_e2e_styletts2_mil_diffusion_reference",
+        "test_e2e_styletts2_mil_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_DIR": {
+      "path": "supertonic",
+      "used_by": [
+        "test_e2e_supertonic_convnext",
+        "test_e2e_supertonic_decoder",
+        "test_e2e_supertonic_dp",
+        "test_e2e_supertonic_relpos_attn",
+        "test_e2e_supertonic_style_attn",
+        "test_e2e_supertonic_ttl_text",
+        "test_e2e_supertonic_vf_attn",
+        "test_e2e_supertonic_vfe",
+        "test_e2e_supertonic_vftime"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_LUA_DIR": {
+      "path": "supertonic_lua",
+      "used_by": [
+        "test_e2e_supertonic_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_MIL_GGUF": {
+      "path": "supertonic_mil.gguf",
+      "used_by": [
+        "test_e2e_supertonic_mil_decoder",
+        "test_e2e_supertonic_mil_dp",
+        "test_e2e_supertonic_mil_lua_driver",
+        "test_e2e_supertonic_mil_ttl_text",
+        "test_e2e_supertonic_mil_vfe"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_MIL_REF_DIR": {
+      "path": "supertonic_mil_ref",
+      "used_by": [
+        "test_e2e_supertonic_mil_dp",
+        "test_e2e_supertonic_mil_vfe"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_REF_DIR": {
+      "path": "supertonic_ref",
+      "used_by": [
+        "test_e2e_supertonic_convnext",
+        "test_e2e_supertonic_decoder",
+        "test_e2e_supertonic_dp",
+        "test_e2e_supertonic_mil_decoder",
+        "test_e2e_supertonic_mil_ttl_text",
+        "test_e2e_supertonic_relpos_attn",
+        "test_e2e_supertonic_style_attn",
+        "test_e2e_supertonic_ttl_text",
+        "test_e2e_supertonic_vf_attn",
+        "test_e2e_supertonic_vfe",
+        "test_e2e_supertonic_vftime"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_TEXT_VECTORIZER_GGUF": {
+      "path": "supertonic_text_vectorizer.gguf",
+      "used_by": [
+        "test_supertonic_text_vectorizer"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SUPERTONIC_VOICE_STYLE_JSON": {
+      "path": "supertonic_voice_style_json",
+      "used_by": [
+        "test_e2e_supertonic_lua_driver",
+        "test_e2e_supertonic_mil_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_SWA_GGUF": {
+      "path": "swa.gguf",
+      "used_by": [
+        "test_e2e_sliding_window_attention"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_TOY_LLM_GENERIC_DIR": {
+      "path": "toy_llm_generic",
+      "used_by": [
+        "test_e2e_toy_llm_generic"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VITS_DIR": {
+      "path": "vits",
+      "used_by": [
+        "test_e2e_vits_flow_vocoder_reference",
+        "test_e2e_vits_logw_reference",
+        "test_e2e_vits_smoke",
+        "test_e2e_vits_stats_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VITS_FLOW_VOCODER_REF_DIR": {
+      "path": "vits_flow_vocoder_ref",
+      "used_by": [
+        "test_e2e_vits_flow_vocoder_reference",
+        "test_e2e_vits_mil_flow_vocoder_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VITS_LOGW_REF_DIR": {
+      "path": "vits_logw_ref",
+      "used_by": [
+        "test_e2e_vits_logw_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VITS_LUA_DIR": {
+      "path": "vits_lua",
+      "used_by": [
+        "test_e2e_vits_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VITS_MIL_DIR": {
+      "path": "vits_mil",
+      "used_by": [
+        "test_e2e_vits_mil_flow_vocoder_reference",
+        "test_e2e_vits_mil_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VITS_STATS_REF_DIR": {
+      "path": "vits_stats_ref",
+      "used_by": [
+        "test_e2e_vits_stats_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_WHISPER_MIL_GGUF": {
+      "path": "whisper_mil.gguf",
+      "used_by": [
+        "test_e2e_whisper_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_WHISPER_MIL_REF_DIR": {
+      "path": "whisper_mil_ref",
+      "used_by": [
+        "test_e2e_whisper_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    }
+  }
+}
