@@ -136,7 +136,7 @@ def cmd_scan(_args) -> int:
     MANIFEST.write_text(json.dumps({
         "comment": "Derived from tests/gate/ by scripts/fixtures.py scan. Do not hand-edit `path` or "
                    "`used_by`; `sha256`/`bytes`/`produced_by` are filled in by `record`.",
-        "repo": previous.get("repo", "femelo/loom-fixtures"),
+        "repo": previous.get("repo", "loom-ai-org/loom-fixtures"),
         "revision": previous.get("revision", "main"),
         "fixtures": entries,
     }, indent=2) + "\n")

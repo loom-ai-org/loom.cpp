@@ -22,9 +22,9 @@ specialized C++ driver. See [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md).
 
 | | |
 |---|---|
-| [**loom.cpp**](https://github.com/femelo/loom.cpp) | this one — the runtime, its primitives and its Lua bridge |
-| [**loom-exporter**](https://github.com/femelo/loom-exporter) | turns a PyTorch checkpoint into a GGUF this engine runs |
-| [**loom-py**](https://github.com/femelo/loom-py) | Python bindings, with the engine as a submodule |
+| [**loom.cpp**](https://github.com/loom-ai-org/loom.cpp) | this one — the runtime, its primitives and its Lua bridge |
+| [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | turns a PyTorch checkpoint into a GGUF this engine runs |
+| [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, with the engine as a submodule |
 
 ## Building
 

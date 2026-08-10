@@ -1,6 +1,6 @@
 {
   "comment": "Derived from tests/gate/ by scripts/fixtures.py scan. Do not hand-edit `path` or `used_by`; `sha256`/`bytes`/`produced_by` are filled in by `record`.",
-  "repo": "femelo/loom-fixtures",
+  "repo": "loom-ai-org/loom-fixtures",
   "revision": "main",
   "fixtures": {
     "LOOM_CAUSAL_LM_KV_GGUF": {
