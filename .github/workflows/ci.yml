@@ -21,10 +21,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      # The toy-model fixtures test_*.cpp regenerates at ctest time only need gguf/numpy -- the
-      # heavier deps (torch, librosa, sentencepiece) belong to tools/convert_nemo/, which only the
-      # real-model tests touch, and those skip cleanly (SKIP_RETURN_CODE) without a converted
-      # checkpoint present, so they aren't installed here.
+      # The toy-model fixtures tests/ci/ regenerates at ctest time only need gguf/numpy. The heavier
+      # deps (torch, transformers, librosa) belong to the loom-exporter repo, which is what produces
+      # the real-model fixtures tests/gate/ reads -- and those are not run here at all.
       # Pinned exactly: these two write the toy-model fixtures the C++ tests compare against, so an
       # unpinned resolve makes CI's inputs a moving target and lets a green suite go red with no repo
       # change. Bump deliberately, and re-run the suite when you do.
@@ -51,5 +50,10 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
+      # `-L ci` rather than the whole suite, and the distinction is the point: tests/gate/ compares
+      # against real exported checkpoints, which are gigabytes this runner will never have. Running
+      # them here would report 78 Skipped alongside the real results and turn a green suite into
+      # something you have to read carefully. `scripts/fixtures.py` and `ctest -L gate` are how those
+      # are run, on a machine that has the fixtures.
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build -L ci --output-on-failure
