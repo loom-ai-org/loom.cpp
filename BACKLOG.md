@@ -194,7 +194,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage — **all three flagships DONE** | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -3345,6 +3345,50 @@ generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (smal
   RSS for one large model before and after. Motivated by P4.3b's Voxtral measurements; note there that
   even all three changes leave Voxtral at ~29 GB against 28, so this is not a fix for that model, and
   should not be scheduled as if it were.
+
+#### P4.5 — one repo becomes three — DONE (2026-08-10)
+
+The engine, the exporter and a new Python binding are now three repos under
+`github.com/loom-ai-org`, side by side on disk. **This file stays in `loom.cpp` and remains the ledger
+for all three** — items here still describe exporter work, and splitting the ledger would split the
+record of why anything is the way it is.
+
+| repo | what it holds | history |
+|---|---|---|
+| `loom.cpp` | `src/ include/ tests/ scripts/ docs/`, this file | the original repo, transferred to the org |
+| `loom-exporter` | `loom_exporter/ tools/ fixture_gen/ docs/` | 157 commits, `git filter-repo` by path, so `--follow` crosses the move |
+| `loom-py` | pybind11 bindings, engine as a submodule | new |
+
+**`tools/loom_mil_compiler` became `loom_exporter`**, at the repo root rather than under `tools/`: the
+repo is loom-exporter, the CLI is `loom-export`, and the package now agrees with both. The old name
+described the implementation where every other name describes the job.
+
+**Every repo now splits its tests the same way, and a test's directory is which class it is in.**
+`tests/ci/` is hermetic and is what GitHub Actions runs; `tests/gate/` needs real checkpoints and skips
+cleanly without them. The engine's are labelled too, so `ctest -L ci` selects them without knowing any
+names. The exporter's gate is the byte-identity sweep, which had lived only as a recipe outside the
+repo and is now a test with its own can-this-fail check.
+
+**`LOOM_FIXTURES` replaced sixty-nine per-test environment variables** in the engine. The layout is a
+*derived rule* — drop `LOOM_`, lowercase, `_GGUF` means a file, `_DIR` is dropped — implemented twice
+on purpose (`tests/support/fixtures.h`, `scripts/fixtures.py`) and pinned from both ends by
+`tests/ci/test_fixture_resolution.cpp`. The migration was safe for a stated reason rather than a hoped
+one: `fixture_env` consults each test's own variable FIRST and is shaped exactly like `std::getenv`,
+so the 130 rewritten call sites kept every null check and skip already around them.
+
+**What the split kept breaking, and the fix.** Code that located a sibling with
+`Path(__file__).resolve().parent.parent` — which meant `tools/` before and something else after. It
+took out 55 exporter tests at once. `loom_exporter/paths.py` now holds that relationship once. One
+genuinely cross-repo check survives: the exporter's pre-tokenizer names against this repo's
+`bpe_vocab.cpp`, found via `LOOM_CPP_ROOT` or the sibling checkout, skipping cleanly when absent.
+
+**Two real defects surfaced only because a second consumer appeared.** `loom-export` had been invoking
+`python -m tools.loom_mil_compiler.main_export`, a module path that stopped existing when the package
+moved — the CLI was simply broken and nothing noticed, because the sweep calls the module directly.
+And `loom/loom.h` included `kv_cache.h` but not `conv_state_cache.h`, so a host on the umbrella header
+could load LFM2, tokenize for it, and fail on the first `SHORT_CONV` node; `loom_cli` never noticed
+because it includes the concrete header. Both are the same lesson: a surface with one caller is not a
+surface that has been tested.
 
 #### P6 — cleanup
 
