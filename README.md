@@ -7,8 +7,6 @@
 
 <h1 align="center">loom.cpp</h1>
 
-<p align="center"><em>data-driven ggml engine</em></p>
-
 An inference engine built on [`ggml`](https://github.com/ggml-org/ggml) that hardcodes no model. A
 model is a GGUF that carries its own **graph topologies** as JSON metadata and its own **driver
 script** as embedded Lua, alongside the weights those describe; the engine parses them and builds the
