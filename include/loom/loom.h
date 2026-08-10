@@ -19,6 +19,11 @@
 #include "loom/core/graph_builder.h"
 #include "loom/core/symbol_table.h"
 #include "loom/core/kv_cache.h"
+// A hybrid's ShortConv blocks carry history the KV cache does not hold, so a model with any of them
+// needs this too -- and needing it is not exotic: LFM2 has ten. It was missing here while `kv_cache.h`
+// was present, which meant a host including only this umbrella could load such a model, tokenize for
+// it, and fail inside the driver on the first SHORT_CONV node (BACKLOG.md P4.0.10).
+#include "loom/core/conv_state_cache.h"
 #include "loom/core/output_store.h"
 #include "loom/core/lua_bridge.h"
 #include "loom/ops/primitive_registry.h"
