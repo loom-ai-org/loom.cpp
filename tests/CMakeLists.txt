@@ -1,6 +1,29 @@
+# Two classes of test, and a test's own directory is which class it is in.
+#
+#   ci/    hermetic. Needs nothing but this repo, a C++ toolchain and `gguf`+`numpy`: every fixture it
+#          reads is built from `fixtures/*.py` by a ctest step that runs first. 28 executables, the
+#          whole suite in seconds. This is what GitHub Actions runs, and a failure here is a real
+#          regression rather than a missing download.
+#   gate/  needs a REAL model. 78 executables comparing against reference tensors that only exist once
+#          a checkpoint has been exported (loom-exporter) and a reference forward has been run over it
+#          -- gigabytes, hours, and per-checkpoint licences. Every one of them exits 77 when its
+#          fixture is absent, which ctest reports as Skipped, so a developer with none of them still
+#          gets a green suite that means "nothing hermetic broke".
+#
+# Both are also labelled, so `ctest -L ci` and `ctest -L gate` select them without knowing the names.
+#
+# Where a gate fixture comes from: `LOOM_FIXTURES` names one directory holding all of them, laid out
+# as `scripts/fixtures.py` describes and verifies. The per-model environment variables each test
+# documents still work and still win when set -- see `support/fixtures.h` -- because pointing one test
+# at one file you just rebuilt is exactly what you do while working on it.
+
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(LOOM_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixtures)
+
+# `#include "test_util.h"` keeps working from either subdirectory: the shared headers moved to
+# support/ and this is what spares 106 files an edit that would have said nothing.
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/support)
 
 # The frozen reference waveforms of the retired per-model C++ drivers (P4.0.8, E.3). Unlike
 # LOOM_FIXTURE_DIR these are NOT generated at build time -- the code that produced them is gone -- so
@@ -13,45 +36,53 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_minimal_gguf.py
             ${LOOM_FIXTURE_DIR}/minimal.gguf
 )
+set_tests_properties(gen_minimal_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_minimal_gguf_fixture PROPERTIES FIXTURES_SETUP minimal_gguf_fixture)
 
-add_executable(test_gguf_model_load test_gguf_model_load.cpp)
+add_executable(test_gguf_model_load ci/test_gguf_model_load.cpp)
 target_link_libraries(test_gguf_model_load PRIVATE loom::engine)
 target_compile_definitions(test_gguf_model_load PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_gguf_model_load COMMAND test_gguf_model_load)
+set_tests_properties(test_gguf_model_load PROPERTIES LABELS ci)
 set_tests_properties(test_gguf_model_load PROPERTIES FIXTURES_REQUIRED minimal_gguf_fixture)
 
 # --- Phase 2: primitive registry / topology parsing / graph builder ---
 
-add_executable(test_primitive_registry test_primitive_registry.cpp)
+add_executable(test_primitive_registry ci/test_primitive_registry.cpp)
 target_link_libraries(test_primitive_registry PRIVATE loom::engine)
 add_test(NAME test_primitive_registry COMMAND test_primitive_registry)
+set_tests_properties(test_primitive_registry PROPERTIES LABELS ci)
 
-add_executable(test_e2e_sliding_window_attention test_e2e_sliding_window_attention.cpp)
+add_executable(test_e2e_sliding_window_attention gate/test_e2e_sliding_window_attention.cpp)
 target_link_libraries(test_e2e_sliding_window_attention PRIVATE loom::engine)
 add_test(NAME test_e2e_sliding_window_attention COMMAND test_e2e_sliding_window_attention)
+set_tests_properties(test_e2e_sliding_window_attention PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_sliding_window_attention PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_spm_byte_fallback_tokenizer test_e2e_spm_byte_fallback_tokenizer.cpp)
+add_executable(test_e2e_spm_byte_fallback_tokenizer gate/test_e2e_spm_byte_fallback_tokenizer.cpp)
 target_link_libraries(test_e2e_spm_byte_fallback_tokenizer PRIVATE loom::engine)
 add_test(NAME test_e2e_spm_byte_fallback_tokenizer COMMAND test_e2e_spm_byte_fallback_tokenizer)
+set_tests_properties(test_e2e_spm_byte_fallback_tokenizer PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_spm_byte_fallback_tokenizer PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_short_conv_state test_short_conv_state.cpp)
+add_executable(test_short_conv_state ci/test_short_conv_state.cpp)
 target_link_libraries(test_short_conv_state PRIVATE loom::engine)
 add_test(NAME test_short_conv_state COMMAND test_short_conv_state)
+set_tests_properties(test_short_conv_state PROPERTIES LABELS ci)
 
-add_executable(test_graph_topology_parse test_graph_topology_parse.cpp)
+add_executable(test_graph_topology_parse ci/test_graph_topology_parse.cpp)
 target_link_libraries(test_graph_topology_parse PRIVATE loom::engine)
 add_test(NAME test_graph_topology_parse COMMAND test_graph_topology_parse)
+set_tests_properties(test_graph_topology_parse PROPERTIES LABELS ci)
 
 # Regression: the "heal transposed layouts" heuristics must not fire on already-correct operands when
 # two axes collide (n_tokens == n_head). Reuses the minimal fixture purely as a GgufModel to hand
 # GraphBuilder -- the topologies it runs declare their own inputs and use no weights.
-add_executable(test_broadcast_axis_collision test_broadcast_axis_collision.cpp)
+add_executable(test_broadcast_axis_collision ci/test_broadcast_axis_collision.cpp)
 target_link_libraries(test_broadcast_axis_collision PRIVATE loom::engine)
 target_compile_definitions(test_broadcast_axis_collision PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_broadcast_axis_collision COMMAND test_broadcast_axis_collision)
+set_tests_properties(test_broadcast_axis_collision PROPERTIES LABELS ci)
 set_tests_properties(test_broadcast_axis_collision PROPERTIES FIXTURES_REQUIRED minimal_gguf_fixture)
 
 # Attention-free toy model GGUF shared by test_graph_builder_shapes and test_gallocr_reserve_reuse.
@@ -60,43 +91,50 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_builder_test_gguf.py
             ${LOOM_FIXTURE_DIR}/builder_test.gguf
 )
+set_tests_properties(gen_builder_test_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_builder_test_gguf_fixture PROPERTIES FIXTURES_SETUP builder_test_gguf_fixture)
 
-add_executable(test_graph_builder_shapes test_graph_builder_shapes.cpp)
+add_executable(test_graph_builder_shapes ci/test_graph_builder_shapes.cpp)
 target_link_libraries(test_graph_builder_shapes PRIVATE loom::engine)
 target_compile_definitions(test_graph_builder_shapes PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_graph_builder_shapes COMMAND test_graph_builder_shapes)
+set_tests_properties(test_graph_builder_shapes PROPERTIES LABELS ci)
 set_tests_properties(test_graph_builder_shapes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
-add_executable(test_lua_bridge_run_subgraph test_lua_bridge_run_subgraph.cpp)
+add_executable(test_lua_bridge_run_subgraph ci/test_lua_bridge_run_subgraph.cpp)
 target_link_libraries(test_lua_bridge_run_subgraph PRIVATE loom::engine)
 target_compile_definitions(test_lua_bridge_run_subgraph PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_lua_bridge_run_subgraph COMMAND test_lua_bridge_run_subgraph)
+set_tests_properties(test_lua_bridge_run_subgraph PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_run_subgraph PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
-add_executable(test_lua_bridge_retained_outputs test_lua_bridge_retained_outputs.cpp)
+add_executable(test_lua_bridge_retained_outputs ci/test_lua_bridge_retained_outputs.cpp)
 target_link_libraries(test_lua_bridge_retained_outputs PRIVATE loom::engine)
 target_compile_definitions(test_lua_bridge_retained_outputs PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_outputs)
+set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
-add_executable(test_gallocr_shrink test_gallocr_shrink.cpp)
+add_executable(test_gallocr_shrink ci/test_gallocr_shrink.cpp)
 target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_shrink PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_gallocr_shrink COMMAND test_gallocr_shrink)
+set_tests_properties(test_gallocr_shrink PROPERTIES LABELS ci)
 set_tests_properties(test_gallocr_shrink PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
-add_executable(test_gallocr_reserve_reuse test_gallocr_reserve_reuse.cpp)
+add_executable(test_gallocr_reserve_reuse ci/test_gallocr_reserve_reuse.cpp)
 target_link_libraries(test_gallocr_reserve_reuse PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_reserve_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_gallocr_reserve_reuse COMMAND test_gallocr_reserve_reuse)
+set_tests_properties(test_gallocr_reserve_reuse PROPERTIES LABELS ci)
 set_tests_properties(test_gallocr_reserve_reuse PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
 # --- Phase 3: KV cache / ATTENTION primitive / autoregressive generation ---
 
-add_executable(test_kv_cache test_kv_cache.cpp)
+add_executable(test_kv_cache ci/test_kv_cache.cpp)
 target_link_libraries(test_kv_cache PRIVATE loom::engine)
 add_test(NAME test_kv_cache COMMAND test_kv_cache)
+set_tests_properties(test_kv_cache PROPERTIES LABELS ci)
 
 # Tiny single-layer attention toy model shared by test_generation_smoke.
 add_test(
@@ -104,12 +142,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_attention_test_gguf.py
             ${LOOM_FIXTURE_DIR}/attention_test.gguf
 )
+set_tests_properties(gen_attention_test_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_attention_test_gguf_fixture PROPERTIES FIXTURES_SETUP attention_test_gguf_fixture)
 
-add_executable(test_generation_smoke test_generation_smoke.cpp)
+add_executable(test_generation_smoke ci/test_generation_smoke.cpp)
 target_link_libraries(test_generation_smoke PRIVATE loom::engine)
 target_compile_definitions(test_generation_smoke PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_generation_smoke COMMAND test_generation_smoke)
+set_tests_properties(test_generation_smoke PROPERTIES LABELS ci)
 set_tests_properties(test_generation_smoke PROPERTIES FIXTURES_REQUIRED attention_test_gguf_fixture)
 
 # --- Phase 4: full toy-LLM end-to-end test, verified against an independent numpy reference ---
@@ -121,6 +161,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_llm_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_llm.gguf
 )
+set_tests_properties(gen_toy_llm_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_llm_gguf_fixture PROPERTIES FIXTURES_SETUP toy_llm_gguf_fixture)
 
 add_test(
@@ -128,15 +169,17 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward.py
             ${LOOM_E2E_REF_DIR} --prompt 1 2 3 --n-new 4
 )
+set_tests_properties(gen_toy_llm_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_llm_reference PROPERTIES FIXTURES_SETUP toy_llm_reference_fixture)
 
-add_executable(test_e2e_toy_llm test_e2e_toy_llm.cpp)
+add_executable(test_e2e_toy_llm ci/test_e2e_toy_llm.cpp)
 target_link_libraries(test_e2e_toy_llm PRIVATE loom::engine)
 target_compile_definitions(test_e2e_toy_llm PRIVATE
     LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
     LOOM_TEST_REF_DIR="${LOOM_E2E_REF_DIR}"
 )
 add_test(NAME test_e2e_toy_llm COMMAND test_e2e_toy_llm)
+set_tests_properties(test_e2e_toy_llm PROPERTIES LABELS ci)
 set_tests_properties(test_e2e_toy_llm PROPERTIES FIXTURES_REQUIRED "toy_llm_gguf_fixture;toy_llm_reference_fixture")
 
 # --- Generic-converter proof of concept: same weights/reference as test_e2e_toy_llm above, but the
@@ -145,10 +188,11 @@ set_tests_properties(test_e2e_toy_llm PROPERTIES FIXTURES_REQUIRED "toy_llm_gguf
 #     -- it's not wired into the default fixture-generation flow; it looks for LOOM_TOY_LLM_GENERIC_DIR
 #     and skips cleanly (SKIP_RETURN_CODE) if that GGUF hasn't been prepared. Reuses toy_llm_reference_fixture
 #     (same weights => same expected logits) rather than generating a second reference.
-add_executable(test_e2e_toy_llm_generic test_e2e_toy_llm_generic.cpp)
+add_executable(test_e2e_toy_llm_generic gate/test_e2e_toy_llm_generic.cpp)
 target_link_libraries(test_e2e_toy_llm_generic PRIVATE loom::engine)
 target_compile_definitions(test_e2e_toy_llm_generic PRIVATE LOOM_TEST_REF_DIR="${LOOM_E2E_REF_DIR}")
 add_test(NAME test_e2e_toy_llm_generic COMMAND test_e2e_toy_llm_generic)
+set_tests_properties(test_e2e_toy_llm_generic PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_toy_llm_generic PROPERTIES
     SKIP_RETURN_CODE 77
     FIXTURES_REQUIRED toy_llm_reference_fixture)
@@ -162,6 +206,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_vision_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_vision.gguf
 )
+set_tests_properties(gen_toy_vision_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_vision_gguf_fixture PROPERTIES FIXTURES_SETUP toy_vision_gguf_fixture)
 
 add_test(
@@ -169,15 +214,17 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_vision.py
             ${LOOM_E2E_VISION_REF_DIR}
 )
+set_tests_properties(gen_toy_vision_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_vision_reference PROPERTIES FIXTURES_SETUP toy_vision_reference_fixture)
 
-add_executable(test_e2e_toy_vision test_e2e_toy_vision.cpp)
+add_executable(test_e2e_toy_vision ci/test_e2e_toy_vision.cpp)
 target_link_libraries(test_e2e_toy_vision PRIVATE loom::engine)
 target_compile_definitions(test_e2e_toy_vision PRIVATE
     LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
     LOOM_TEST_REF_DIR="${LOOM_E2E_VISION_REF_DIR}"
 )
 add_test(NAME test_e2e_toy_vision COMMAND test_e2e_toy_vision)
+set_tests_properties(test_e2e_toy_vision PROPERTIES LABELS ci)
 set_tests_properties(test_e2e_toy_vision PROPERTIES FIXTURES_REQUIRED "toy_vision_gguf_fixture;toy_vision_reference_fixture")
 
 # --- Milestone 2: toy ASR encoder end-to-end test ---
@@ -189,6 +236,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_asr_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_asr.gguf
 )
+set_tests_properties(gen_toy_asr_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_asr_gguf_fixture PROPERTIES FIXTURES_SETUP toy_asr_gguf_fixture)
 
 add_test(
@@ -196,15 +244,17 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_asr.py
             ${LOOM_E2E_ASR_REF_DIR}
 )
+set_tests_properties(gen_toy_asr_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_asr_reference PROPERTIES FIXTURES_SETUP toy_asr_reference_fixture)
 
-add_executable(test_e2e_toy_asr test_e2e_toy_asr.cpp)
+add_executable(test_e2e_toy_asr ci/test_e2e_toy_asr.cpp)
 target_link_libraries(test_e2e_toy_asr PRIVATE loom::engine)
 target_compile_definitions(test_e2e_toy_asr PRIVATE
     LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
     LOOM_TEST_REF_DIR="${LOOM_E2E_ASR_REF_DIR}"
 )
 add_test(NAME test_e2e_toy_asr COMMAND test_e2e_toy_asr)
+set_tests_properties(test_e2e_toy_asr PROPERTIES LABELS ci)
 set_tests_properties(test_e2e_toy_asr PROPERTIES FIXTURES_REQUIRED "toy_asr_gguf_fixture;toy_asr_reference_fixture")
 
 # --- Milestone 3's toy ODE-stepper end-to-end test lived here. Retired with `OdeStepper` itself
@@ -222,6 +272,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_vae_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_vae.gguf
 )
+set_tests_properties(gen_toy_vae_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_vae_gguf_fixture PROPERTIES FIXTURES_SETUP toy_vae_gguf_fixture)
 
 add_test(
@@ -229,29 +280,33 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_vae.py
             ${LOOM_E2E_VAE_REF_DIR}
 )
+set_tests_properties(gen_toy_vae_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_toy_vae_reference PROPERTIES FIXTURES_SETUP toy_vae_reference_fixture)
 
-add_executable(test_e2e_toy_vae test_e2e_toy_vae.cpp)
+add_executable(test_e2e_toy_vae ci/test_e2e_toy_vae.cpp)
 target_link_libraries(test_e2e_toy_vae PRIVATE loom::engine)
 target_compile_definitions(test_e2e_toy_vae PRIVATE
     LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
     LOOM_TEST_REF_DIR="${LOOM_E2E_VAE_REF_DIR}"
 )
 add_test(NAME test_e2e_toy_vae COMMAND test_e2e_toy_vae)
+set_tests_properties(test_e2e_toy_vae PROPERTIES LABELS ci)
 set_tests_properties(test_e2e_toy_vae PROPERTIES FIXTURES_REQUIRED "toy_vae_gguf_fixture;toy_vae_reference_fixture")
 
 # --- Regression test pinning down BACKLOG.md's ggml graph-reuse finding (see
 #     tests/test_graph_reuse_safety.cpp) -- the pattern OdeStepper relies on ---
-add_executable(test_graph_reuse_safety test_graph_reuse_safety.cpp)
+add_executable(test_graph_reuse_safety ci/test_graph_reuse_safety.cpp)
 target_link_libraries(test_graph_reuse_safety PRIVATE loom::engine)
 add_test(NAME test_graph_reuse_safety COMMAND test_graph_reuse_safety)
+set_tests_properties(test_graph_reuse_safety PROPERTIES LABELS ci)
 
 # --- The engine-side half of the same finding: GraphBuilder retains and reuses its graph
 #     (BACKLOG.md P4.0.13), so a reused graph must be bit-identical to a from-scratch rebuild ---
-add_executable(test_graph_builder_reuse test_graph_builder_reuse.cpp)
+add_executable(test_graph_builder_reuse ci/test_graph_builder_reuse.cpp)
 target_link_libraries(test_graph_builder_reuse PRIVATE loom::engine)
 target_compile_definitions(test_graph_builder_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_graph_builder_reuse COMMAND test_graph_builder_reuse)
+set_tests_properties(test_graph_builder_reuse PROPERTIES LABELS ci)
 set_tests_properties(test_graph_builder_reuse PROPERTIES FIXTURES_REQUIRED toy_llm_gguf_fixture)
 
 # --- Real-model test: NVIDIA stt_en_conformer_ctc_small, converted via tools/convert_nemo/. Unlike
@@ -262,17 +317,19 @@ set_tests_properties(test_graph_builder_reuse PROPERTIES FIXTURES_REQUIRED toy_l
 
 # --- Conformer-CTC-small exported via the generic MIL compiler (export_conformer_ctc_mil.py), verified
 #     against the SAME reference_forward_conformer.py fixture as the bespoke-conversion test above ---
-add_executable(test_e2e_conformer_ctc_mil_export test_e2e_conformer_ctc_mil_export.cpp)
+add_executable(test_e2e_conformer_ctc_mil_export gate/test_e2e_conformer_ctc_mil_export.cpp)
 target_link_libraries(test_e2e_conformer_ctc_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_conformer_ctc_mil_export COMMAND test_e2e_conformer_ctc_mil_export)
+set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- The same MIL-exported GGUF reached the way every other family is reached: through the embedded
 #     Lua driver's `infer`. Its greedy CTC decode must agree token-for-token with loom::ctc_greedy_decode,
 #     the C++ implementation it replaces (BACKLOG.md P4.0.17). ---
-add_executable(test_e2e_conformer_ctc_lua_driver test_e2e_conformer_ctc_lua_driver.cpp)
+add_executable(test_e2e_conformer_ctc_lua_driver gate/test_e2e_conformer_ctc_lua_driver.cpp)
 target_link_libraries(test_e2e_conformer_ctc_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_conformer_ctc_lua_driver COMMAND test_e2e_conformer_ctc_lua_driver)
+set_tests_properties(test_e2e_conformer_ctc_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_conformer_ctc_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # Proves the same converted GGUF supports a second, different waveform length dynamically (see
@@ -280,21 +337,24 @@ set_tests_properties(test_e2e_conformer_ctc_lua_driver PROPERTIES SKIP_RETURN_CO
 
 # --- Gating-criterion proof of concept: generic converter (tools/convert_generic/) against the real
 #     Conformer-CTC encoder -- a genuinely non-decoder-transformer shape. See BACKLOG.md. ---
-add_executable(test_e2e_conformer_ctc_generic test_e2e_conformer_ctc_generic.cpp)
+add_executable(test_e2e_conformer_ctc_generic gate/test_e2e_conformer_ctc_generic.cpp)
 target_link_libraries(test_e2e_conformer_ctc_generic PRIVATE loom::engine)
 add_test(NAME test_e2e_conformer_ctc_generic COMMAND test_e2e_conformer_ctc_generic)
+set_tests_properties(test_e2e_conformer_ctc_generic PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_conformer_ctc_generic PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Tokenizer: Vocab (SentencePiece unigram, llama.cpp GGUF schema) against the real converted model ---
-add_executable(test_vocab test_vocab.cpp)
+add_executable(test_vocab gate/test_vocab.cpp)
 target_link_libraries(test_vocab PRIVATE loom::engine)
 add_test(NAME test_vocab COMMAND test_vocab)
+set_tests_properties(test_vocab PROPERTIES LABELS gate)
 set_tests_properties(test_vocab PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Vocab's new SentencePiece BPE path ("llama" tag), against the real Parakeet-TDT tokenizer ---
-add_executable(test_vocab_spm_bpe test_vocab_spm_bpe.cpp)
+add_executable(test_vocab_spm_bpe gate/test_vocab_spm_bpe.cpp)
 target_link_libraries(test_vocab_spm_bpe PRIVATE loom::engine)
 add_test(NAME test_vocab_spm_bpe COMMAND test_vocab_spm_bpe)
+set_tests_properties(test_vocab_spm_bpe PROPERTIES LABELS gate)
 set_tests_properties(test_vocab_spm_bpe PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- EXPORT-BACKLOG.md item 4: Vocab's bos_token_id/eos_token_id/add_bos_token/add_eos_token support
@@ -304,22 +364,26 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_vocab_ugm_bos_eos_gguf.py
             ${LOOM_FIXTURE_DIR}/vocab_ugm_bos_eos_test.gguf
 )
+set_tests_properties(gen_vocab_ugm_bos_eos_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_vocab_ugm_bos_eos_gguf_fixture PROPERTIES FIXTURES_SETUP vocab_ugm_bos_eos_gguf_fixture)
 
-add_executable(test_vocab_ugm_bos_eos test_vocab_ugm_bos_eos.cpp)
+add_executable(test_vocab_ugm_bos_eos ci/test_vocab_ugm_bos_eos.cpp)
 target_link_libraries(test_vocab_ugm_bos_eos PRIVATE loom::engine)
 target_compile_definitions(test_vocab_ugm_bos_eos PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_vocab_ugm_bos_eos COMMAND test_vocab_ugm_bos_eos)
+set_tests_properties(test_vocab_ugm_bos_eos PROPERTIES LABELS ci)
 set_tests_properties(test_vocab_ugm_bos_eos PROPERTIES FIXTURES_REQUIRED vocab_ugm_bos_eos_gguf_fixture)
 
-add_executable(test_ctc_decode test_ctc_decode.cpp)
+add_executable(test_ctc_decode ci/test_ctc_decode.cpp)
 target_link_libraries(test_ctc_decode PRIVATE loom::engine)
 add_test(NAME test_ctc_decode COMMAND test_ctc_decode)
+set_tests_properties(test_ctc_decode PROPERTIES LABELS ci)
 
 # --- Qwen3 roadmap item: Unicode subsystem (NFC normalize, \p{L}/\p{N} classification) backing BpeVocab ---
-add_executable(test_unicode test_unicode.cpp)
+add_executable(test_unicode ci/test_unicode.cpp)
 target_link_libraries(test_unicode PRIVATE loom::engine)
 add_test(NAME test_unicode COMMAND test_unicode)
+set_tests_properties(test_unicode PROPERTIES LABELS ci)
 
 # --- Qwen3 roadmap item: BpeVocab (byte-level BPE, llama.cpp "gpt2" GGUF schema) against a small
 #     synthetic fixture with hand-traceable merges (see tests/fixtures/make_bpe_vocab_gguf.py) ---
@@ -328,6 +392,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bpe_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/bpe_vocab_test.gguf
 )
+set_tests_properties(gen_bpe_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_bpe_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_gguf_fixture)
 
 # Same tiny vocab/merges, different `tokenizer.ggml.pre` shapes -- exercises kGpt2Classic (item 4's
@@ -337,6 +402,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bpe_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/bpe_vocab_gpt2_test.gguf --pre gpt-2
 )
+set_tests_properties(gen_bpe_vocab_gpt2_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_bpe_vocab_gpt2_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_gpt2_gguf_fixture)
 
 add_test(
@@ -344,12 +410,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_bpe_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/bpe_vocab_poro_test.gguf --pre poro-chat
 )
+set_tests_properties(gen_bpe_vocab_poro_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_bpe_vocab_poro_gguf_fixture PROPERTIES FIXTURES_SETUP bpe_vocab_poro_gguf_fixture)
 
-add_executable(test_bpe_vocab test_bpe_vocab.cpp)
+add_executable(test_bpe_vocab ci/test_bpe_vocab.cpp)
 target_link_libraries(test_bpe_vocab PRIVATE loom::engine)
 target_compile_definitions(test_bpe_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_bpe_vocab COMMAND test_bpe_vocab)
+set_tests_properties(test_bpe_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_bpe_vocab PROPERTIES
     FIXTURES_REQUIRED "bpe_vocab_gguf_fixture;bpe_vocab_gpt2_gguf_fixture;bpe_vocab_poro_gguf_fixture")
 
@@ -360,12 +428,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_wordpiece_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/wordpiece_vocab_test.gguf
 )
+set_tests_properties(gen_wordpiece_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_wordpiece_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP wordpiece_vocab_gguf_fixture)
 
-add_executable(test_wordpiece_vocab test_wordpiece_vocab.cpp)
+add_executable(test_wordpiece_vocab ci/test_wordpiece_vocab.cpp)
 target_link_libraries(test_wordpiece_vocab PRIVATE loom::engine)
 target_compile_definitions(test_wordpiece_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_wordpiece_vocab COMMAND test_wordpiece_vocab)
+set_tests_properties(test_wordpiece_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_wordpiece_vocab PROPERTIES FIXTURES_REQUIRED wordpiece_vocab_gguf_fixture)
 
 # --- ByT5-family byte-level tokenizer (ByteVocab), synthetic fixture with a small extra_ids count ---
@@ -374,12 +444,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_byte_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/byte_vocab_test.gguf
 )
+set_tests_properties(gen_byte_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_byte_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP byte_vocab_gguf_fixture)
 
-add_executable(test_byte_vocab test_byte_vocab.cpp)
+add_executable(test_byte_vocab ci/test_byte_vocab.cpp)
 target_link_libraries(test_byte_vocab PRIVATE loom::engine)
 target_compile_definitions(test_byte_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
 add_test(NAME test_byte_vocab COMMAND test_byte_vocab)
+set_tests_properties(test_byte_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_byte_vocab PROPERTIES FIXTURES_REQUIRED byte_vocab_gguf_fixture)
 
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
@@ -391,6 +463,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_gqa_test_gguf.py
             ${LOOM_FIXTURE_DIR}/gqa_test.gguf
 )
+set_tests_properties(gen_gqa_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_gqa_gguf_fixture PROPERTIES FIXTURES_SETUP gqa_gguf_fixture)
 
 add_test(
@@ -398,37 +471,42 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_gqa.py
             ${LOOM_E2E_GQA_REF_DIR} --prompt 1 2 3 --n-new 4
 )
+set_tests_properties(gen_gqa_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_gqa_reference PROPERTIES FIXTURES_SETUP gqa_reference_fixture)
 
-add_executable(test_e2e_gqa test_e2e_gqa.cpp)
+add_executable(test_e2e_gqa ci/test_e2e_gqa.cpp)
 target_link_libraries(test_e2e_gqa PRIVATE loom::engine)
 target_compile_definitions(test_e2e_gqa PRIVATE
     LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
     LOOM_TEST_REF_DIR="${LOOM_E2E_GQA_REF_DIR}"
 )
 add_test(NAME test_e2e_gqa COMMAND test_e2e_gqa)
+set_tests_properties(test_e2e_gqa PROPERTIES LABELS ci)
 set_tests_properties(test_e2e_gqa PROPERTIES FIXTURES_REQUIRED "gqa_gguf_fixture;gqa_reference_fixture")
 
 # --- Real-model test: Qwen3-0.6B-Base, converted via tools/convert_qwen3/. Same "not regenerated at
 #     ctest time, skip cleanly if the real checkpoint isn't prepared" pattern as test_e2e_conformer_ctc ---
-add_executable(test_e2e_qwen3 test_e2e_qwen3.cpp)
+add_executable(test_e2e_qwen3 gate/test_e2e_qwen3.cpp)
 target_link_libraries(test_e2e_qwen3 PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3 COMMAND test_e2e_qwen3)
+set_tests_properties(test_e2e_qwen3 PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_qwen3 PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Generic-converter proof of concept, round 2: real Qwen3-0.6B-Base through the same, unmodified
 #     converter/op-mapping table the toy LLM used (tools/convert_generic/) -- see BACKLOG.md ---
-add_executable(test_e2e_qwen3_generic test_e2e_qwen3_generic.cpp)
+add_executable(test_e2e_qwen3_generic gate/test_e2e_qwen3_generic.cpp)
 target_link_libraries(test_e2e_qwen3_generic PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3_generic COMMAND test_e2e_qwen3_generic)
+set_tests_properties(test_e2e_qwen3_generic PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_qwen3_generic PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Quantized-weight proof of concept: same real Qwen3-0.6B-Base checkpoint, matmul weights quantized
 #     to Q8_0 by tools/quantize/quantize_gguf_q8_0.py -- see BACKLOG.md's "quantized weight support"
 #     milestone. Same skip-cleanly-if-not-prepared pattern as the other real-model tests above.
-add_executable(test_e2e_qwen3_q8_0 test_e2e_qwen3_q8_0.cpp)
+add_executable(test_e2e_qwen3_q8_0 gate/test_e2e_qwen3_q8_0.cpp)
 target_link_libraries(test_e2e_qwen3_q8_0 PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3_q8_0 COMMAND test_e2e_qwen3_q8_0)
+set_tests_properties(test_e2e_qwen3_q8_0 PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_qwen3_q8_0 PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Parakeet-TDT roadmap, step 1: the LSTM-step composite-topology pattern (MUL_MAT/ADD/VIEW/SIGMOID/
@@ -442,6 +520,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_lstm_step_gguf.py
             ${LOOM_FIXTURE_DIR}/lstm_step_h.gguf ${LOOM_FIXTURE_DIR}/lstm_step_c.gguf
 )
+set_tests_properties(gen_lstm_step_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_lstm_step_gguf_fixture PROPERTIES FIXTURES_SETUP lstm_step_gguf_fixture)
 
 add_test(
@@ -449,15 +528,17 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_lstm_step.py
             ${LOOM_LSTM_STEP_REF_DIR}
 )
+set_tests_properties(gen_lstm_step_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_lstm_step_reference PROPERTIES FIXTURES_SETUP lstm_step_reference_fixture)
 
-add_executable(test_lstm_step test_lstm_step.cpp)
+add_executable(test_lstm_step ci/test_lstm_step.cpp)
 target_link_libraries(test_lstm_step PRIVATE loom::engine)
 target_compile_definitions(test_lstm_step PRIVATE
     LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}"
     LOOM_TEST_REF_DIR="${LOOM_LSTM_STEP_REF_DIR}"
 )
 add_test(NAME test_lstm_step COMMAND test_lstm_step)
+set_tests_properties(test_lstm_step PROPERTIES LABELS ci)
 set_tests_properties(test_lstm_step PROPERTIES FIXTURES_REQUIRED "lstm_step_gguf_fixture;lstm_step_reference_fixture")
 
 # --- Kokoro/StyleTTS2 roadmap: the host-side duration-based frame-expansion (loom::predict_durations/
@@ -471,14 +552,16 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_duration_aligner.py
             ${LOOM_DURATION_ALIGNER_REF_DIR}
 )
+set_tests_properties(gen_duration_aligner_reference PROPERTIES LABELS ci)
 set_tests_properties(gen_duration_aligner_reference PROPERTIES FIXTURES_SETUP duration_aligner_reference_fixture)
 
-add_executable(test_duration_aligner test_duration_aligner.cpp)
+add_executable(test_duration_aligner ci/test_duration_aligner.cpp)
 target_link_libraries(test_duration_aligner PRIVATE loom::engine)
 target_compile_definitions(test_duration_aligner PRIVATE
     LOOM_TEST_REF_DIR="${LOOM_DURATION_ALIGNER_REF_DIR}"
 )
 add_test(NAME test_duration_aligner COMMAND test_duration_aligner)
+set_tests_properties(test_duration_aligner PROPERTIES LABELS ci)
 set_tests_properties(test_duration_aligner PROPERTIES FIXTURES_REQUIRED "duration_aligner_reference_fixture")
 
 # --- Parakeet TDT and RNN-T, decoded by their own embedded Lua driver and compared against NeMo's own
@@ -491,9 +574,10 @@ set_tests_properties(test_duration_aligner PROPERTIES FIXTURES_REQUIRED "duratio
 #     is now one GGUF whose driver decodes. The oracle is stronger for it -- NeMo itself on real speech,
 #     rather than a hand-rolled reimplementation on a synthetic waveform that, for RNN-T, decoded to an
 #     empty token list. ---
-add_executable(test_e2e_parakeet_lua_driver test_e2e_parakeet_lua_driver.cpp)
+add_executable(test_e2e_parakeet_lua_driver gate/test_e2e_parakeet_lua_driver.cpp)
 target_link_libraries(test_e2e_parakeet_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_parakeet_lua_driver COMMAND test_e2e_parakeet_lua_driver)
+set_tests_properties(test_e2e_parakeet_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_parakeet_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- The same transducer template, a different loader: GigaAM v3 (an HF `trust_remote_code` directory,
@@ -501,161 +585,181 @@ set_tests_properties(test_e2e_parakeet_lua_driver PROPERTIES SKIP_RETURN_CODE 77
 #     hypothesis for samples/jfk.wav (BACKLOG.md P4.2). Also the only check on the two things that
 #     checkpoint needed before it would trace -- a rewritten mel frontend and a one-layer prediction
 #     network whose cell the driver addresses by index. ---
-add_executable(test_e2e_gigaam_lua_driver test_e2e_gigaam_lua_driver.cpp)
+add_executable(test_e2e_gigaam_lua_driver gate/test_e2e_gigaam_lua_driver.cpp)
 target_link_libraries(test_e2e_gigaam_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_gigaam_lua_driver COMMAND test_e2e_gigaam_lua_driver)
+set_tests_properties(test_e2e_gigaam_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_gigaam_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's CustomAlbert (PL-BERT) topology (tools/convert_kokoro/
 #     convert_kokoro_albert.py) against a hand-rolled pure-PyTorch reference -- the first, isolated
 #     verification step of Kokoro's full-continuous-build effort (see BACKLOG.md). ---
-add_executable(test_e2e_kokoro_albert test_e2e_kokoro_albert.cpp)
+add_executable(test_e2e_kokoro_albert gate/test_e2e_kokoro_albert.cpp)
 target_link_libraries(test_e2e_kokoro_albert PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_albert COMMAND test_e2e_kokoro_albert)
+set_tests_properties(test_e2e_kokoro_albert PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_albert PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's TextEncoder (CNN topology + the new loom::BiLstmStepper
 #     host driver for its trailing bidirectional LSTM) against a hand-rolled pure-PyTorch reference. ---
-add_executable(test_e2e_kokoro_text_encoder test_e2e_kokoro_text_encoder.cpp)
+add_executable(test_e2e_kokoro_text_encoder gate/test_e2e_kokoro_text_encoder.cpp)
 target_link_libraries(test_e2e_kokoro_text_encoder PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_text_encoder COMMAND test_e2e_kokoro_text_encoder)
+set_tests_properties(test_e2e_kokoro_text_encoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_text_encoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's ProsodyPredictor duration-prediction half (DurationEncoder's
 #     interleaved BiLSTM+AdaLayerNorm blocks -> top lstm -> duration_proj) against a hand-rolled
 #     pure-PyTorch reference. ---
-add_executable(test_e2e_kokoro_duration_predictor test_e2e_kokoro_duration_predictor.cpp)
+add_executable(test_e2e_kokoro_duration_predictor gate/test_e2e_kokoro_duration_predictor.cpp)
 target_link_libraries(test_e2e_kokoro_duration_predictor PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_duration_predictor COMMAND test_e2e_kokoro_duration_predictor)
+set_tests_properties(test_e2e_kokoro_duration_predictor PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_duration_predictor PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: a single AdainResBlk1d instance (predictor.F0.0, the simplest case --
 #     no learned shortcut, no upsample) against a hand-rolled pure-PyTorch reference -- first isolated
 #     verification step for Kokoro's F0Ntrain assembly. ---
-add_executable(test_e2e_kokoro_f0_block0 test_e2e_kokoro_f0_block0.cpp)
+add_executable(test_e2e_kokoro_f0_block0 gate/test_e2e_kokoro_f0_block0.cpp)
 target_link_libraries(test_e2e_kokoro_f0_block0 PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_f0_block0 COMMAND test_e2e_kokoro_f0_block0)
+set_tests_properties(test_e2e_kokoro_f0_block0 PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_f0_block0 PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: predictor.F0.1, the UPSAMPLING AdainResBlk1d instance (dim_in=512,
 #     dim_out=256, learned conv1x1 shortcut + upsample=True) -- exercises the depthwise-ConvTranspose1d
 #     "pool" composition and the learned shortcut together for the first time. ---
-add_executable(test_e2e_kokoro_f0_block1 test_e2e_kokoro_f0_block1.cpp)
+add_executable(test_e2e_kokoro_f0_block1 gate/test_e2e_kokoro_f0_block1.cpp)
 target_link_libraries(test_e2e_kokoro_f0_block1 PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_f0_block1 COMMAND test_e2e_kokoro_f0_block1)
+set_tests_properties(test_e2e_kokoro_f0_block1 PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_f0_block1 PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: the FULL ProsodyPredictor.F0Ntrain assembly (shared BiLSTM 640->512 +
 #     two independent 3-block AdainResBlk1d stacks + F0_proj/N_proj) against a hand-rolled pure-PyTorch
 #     reference -- ties together every Kokoro F0Ntrain piece verified so far. ---
-add_executable(test_e2e_kokoro_f0n test_e2e_kokoro_f0n.cpp)
+add_executable(test_e2e_kokoro_f0n gate/test_e2e_kokoro_f0n.cpp)
 target_link_libraries(test_e2e_kokoro_f0n PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_f0n COMMAND test_e2e_kokoro_f0n)
+set_tests_properties(test_e2e_kokoro_f0n PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_f0n PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro Generator's forward/inverse STFT (istftnet.py's TorchSTFT),
 #     against real torch.stft/torch.istft -- no real checkpoint weights involved (constant DFT/window
 #     kernels only), but still gated on GGUF/reference files (needs real torch to generate). ---
-add_executable(test_e2e_kokoro_stft test_e2e_kokoro_stft.cpp)
+add_executable(test_e2e_kokoro_stft gate/test_e2e_kokoro_stft.cpp)
 target_link_libraries(test_e2e_kokoro_stft PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_stft COMMAND test_e2e_kokoro_stft)
+set_tests_properties(test_e2e_kokoro_stft PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_stft PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro Generator's NSF harmonic source (istftnet.py's SineGen +
 #     SourceModuleHnNSF), against a hand-rolled real-PyTorch reference. No real checkpoint weights
 #     involved (l_linear is a fixed synthetic draw shared between conversion+reference scripts). ---
-add_executable(test_e2e_kokoro_sinegen test_e2e_kokoro_sinegen.cpp)
+add_executable(test_e2e_kokoro_sinegen gate/test_e2e_kokoro_sinegen.cpp)
 target_link_libraries(test_e2e_kokoro_sinegen PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_sinegen COMMAND test_e2e_kokoro_sinegen)
+set_tests_properties(test_e2e_kokoro_sinegen PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_sinegen PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro Generator's AdaINResBlock1 (Snake-activation dilated resblock,
 #     distinct from predictor.F0/N's AdainResBlk1d), against a hand-rolled PyTorch reference on a small
 #     synthetic (checkpoint-independent) instance -- same precedent as VITS's test_hifigan_generator. ---
-add_executable(test_e2e_kokoro_adainresblock1 test_e2e_kokoro_adainresblock1.cpp)
+add_executable(test_e2e_kokoro_adainresblock1 gate/test_e2e_kokoro_adainresblock1.cpp)
 target_link_libraries(test_e2e_kokoro_adainresblock1 PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_adainresblock1 COMMAND test_e2e_kokoro_adainresblock1)
+set_tests_properties(test_e2e_kokoro_adainresblock1 PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_adainresblock1 PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's full Generator "core" (upsample stack + noise path +
 #     resblocks + conv_post + inverse STFT), against a hand-rolled PyTorch reference on a small synthetic
 #     (real checkpoint shapes, random weights) instance. ---
-add_executable(test_e2e_kokoro_generator test_e2e_kokoro_generator.cpp)
+add_executable(test_e2e_kokoro_generator gate/test_e2e_kokoro_generator.cpp)
 target_link_libraries(test_e2e_kokoro_generator PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_generator COMMAND test_e2e_kokoro_generator)
+set_tests_properties(test_e2e_kokoro_generator PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_generator PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's Decoder "core" (F0_conv/N_conv + encode/decode AdainResBlk1d
 #     stack, everything except the final Generator call), against a hand-rolled PyTorch reference on a
 #     small synthetic (real checkpoint shapes, random weights) instance. ---
-add_executable(test_e2e_kokoro_decoder_core test_e2e_kokoro_decoder_core.cpp)
+add_executable(test_e2e_kokoro_decoder_core gate/test_e2e_kokoro_decoder_core.cpp)
 target_link_libraries(test_e2e_kokoro_decoder_core PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_decoder_core COMMAND test_e2e_kokoro_decoder_core)
+set_tests_properties(test_e2e_kokoro_decoder_core PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_decoder_core PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: Kokoro's bert_encoder (Linear(768,512) + transpose), against the real
 #     checkpoint's own weights -- exercises the CustomAlbert-output (time-major) -> DurationEncoder-input
 #     (channel-first) axis-convention crossing. ---
-add_executable(test_e2e_kokoro_bert_encoder test_e2e_kokoro_bert_encoder.cpp)
+add_executable(test_e2e_kokoro_bert_encoder gate/test_e2e_kokoro_bert_encoder.cpp)
 target_link_libraries(test_e2e_kokoro_bert_encoder PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_bert_encoder COMMAND test_e2e_kokoro_bert_encoder)
+set_tests_properties(test_e2e_kokoro_bert_encoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_bert_encoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Real-model structural smoke test: VITS (piper en-GB "miro"), converted via
 #     tools/convert_piper_vits/convert_vits.py. Builds every declared topology with dummy inputs and
 #     checks for finite output -- NOT yet a numerical-correctness check (that's still to come once the
 #     host driver exists). Same skip-cleanly-if-not-prepared pattern as the other real-model tests. ---
-add_executable(test_e2e_vits_smoke test_e2e_vits_smoke.cpp)
+add_executable(test_e2e_vits_smoke gate/test_e2e_vits_smoke.cpp)
 target_link_libraries(test_e2e_vits_smoke PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_smoke COMMAND test_e2e_vits_smoke)
+set_tests_properties(test_e2e_vits_smoke PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Same structural-smoke role as test_e2e_vits_smoke above, for the (in-progress, see BACKLOG.md)
 #     MIL-traced Kokoro "decoder_vocoder" phase (Decoder core + SineGen + STFT + Generator, the single
 #     riskiest chunk of the model). ---
-add_executable(test_e2e_kokoro_mil_decoder_vocoder_smoke test_e2e_kokoro_mil_decoder_vocoder_smoke.cpp)
+add_executable(test_e2e_kokoro_mil_decoder_vocoder_smoke gate/test_e2e_kokoro_mil_decoder_vocoder_smoke.cpp)
 target_link_libraries(test_e2e_kokoro_mil_decoder_vocoder_smoke PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_decoder_vocoder_smoke COMMAND test_e2e_kokoro_mil_decoder_vocoder_smoke)
+set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_smoke PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check for the same MIL-traced Kokoro "decoder_vocoder" topology, against a
 #     real pure-PyTorch reference (reference_forward_kokoro_decoder_vocoder_mil.py) rather than the smoke
 #     test's zero-filled/structural-only check above. ---
-add_executable(test_e2e_kokoro_mil_decoder_vocoder_reference test_e2e_kokoro_mil_decoder_vocoder_reference.cpp)
+add_executable(test_e2e_kokoro_mil_decoder_vocoder_reference gate/test_e2e_kokoro_mil_decoder_vocoder_reference.cpp)
 target_link_libraries(test_e2e_kokoro_mil_decoder_vocoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_decoder_vocoder_reference COMMAND test_e2e_kokoro_mil_decoder_vocoder_reference)
+set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_decoder_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check for the MIL-traced Kokoro "albert_bert_encoder" combined topology
 #     (CustomAlbert + bert_encoder, export_kokoro_mil.py's AlbertBertEncoderWrapper) against a
 #     hand-rolled pure-PyTorch reference. ---
-add_executable(test_e2e_kokoro_mil_albert_bert_encoder_reference test_e2e_kokoro_mil_albert_bert_encoder_reference.cpp)
+add_executable(test_e2e_kokoro_mil_albert_bert_encoder_reference gate/test_e2e_kokoro_mil_albert_bert_encoder_reference.cpp)
 target_link_libraries(test_e2e_kokoro_mil_albert_bert_encoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_albert_bert_encoder_reference COMMAND test_e2e_kokoro_mil_albert_bert_encoder_reference)
+set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: the deterministic `stats` (TextEncoder) topology against a real
 #     PyTorch forward pass of piper's own models.TextEncoder, using REAL phonemized text (T=62, real
 #     emb_rel_k/v pad branch exercised) -- see test_e2e_vits_stats_reference.cpp's own header comment. ---
-add_executable(test_e2e_vits_stats_reference test_e2e_vits_stats_reference.cpp)
+add_executable(test_e2e_vits_stats_reference gate/test_e2e_vits_stats_reference.cpp)
 target_link_libraries(test_e2e_vits_stats_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_stats_reference COMMAND test_e2e_vits_stats_reference)
+set_tests_properties(test_e2e_vits_stats_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_stats_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: the flow+vocoder topology against a real PyTorch forward pass, with a
 #     FIXED (non-random) z_p -- isolates the coupling-flow+vocoder wiring from any RNG-related
 #     uncertainty in the full stochastic pipeline. See test_e2e_vits_flow_vocoder_reference.cpp. ---
-add_executable(test_e2e_vits_flow_vocoder_reference test_e2e_vits_flow_vocoder_reference.cpp)
+add_executable(test_e2e_vits_flow_vocoder_reference gate/test_e2e_vits_flow_vocoder_reference.cpp)
 target_link_libraries(test_e2e_vits_flow_vocoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_flow_vocoder_reference COMMAND test_e2e_vits_flow_vocoder_reference)
+set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness check: the logw (TextEncoder+SDP reverse) topology against a real PyTorch
 #     forward pass, with FIXED (externally-injected) SDP noise -- isolates the real spline-flow assembly
 #     from RNG-related uncertainty. See test_e2e_vits_logw_reference.cpp. ---
-add_executable(test_e2e_vits_logw_reference test_e2e_vits_logw_reference.cpp)
+add_executable(test_e2e_vits_logw_reference gate/test_e2e_vits_logw_reference.cpp)
 target_link_libraries(test_e2e_vits_logw_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_logw_reference COMMAND test_e2e_vits_logw_reference)
+set_tests_properties(test_e2e_vits_logw_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 
@@ -677,9 +781,10 @@ set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77
 # --- Real-checkpoint test: StyleTTS2's style-diffusion denoiser network (Transformer1d) against a
 #     hand-rolled PyTorch reference, real weights + synthetic driving embedding. See
 #     tools/convert_styletts2/convert_styletts2_diffusion.py. Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_styletts2_diffusion_net test_e2e_styletts2_diffusion_net.cpp)
+add_executable(test_e2e_styletts2_diffusion_net gate/test_e2e_styletts2_diffusion_net.cpp)
 target_link_libraries(test_e2e_styletts2_diffusion_net PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_diffusion_net COMMAND test_e2e_styletts2_diffusion_net)
+set_tests_properties(test_e2e_styletts2_diffusion_net PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_styletts2_diffusion_net PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL-traced StyleTTS2 export (export_styletts2_mil.py, styletts2_mil.gguf) numerical checks: "albert"
@@ -689,82 +794,93 @@ set_tests_properties(test_e2e_styletts2_diffusion_net PROPERTIES SKIP_RETURN_COD
 #     trace of Modules/diffusion/modules.py's Transformer1d.run(), superseding
 #     convert_styletts2_diffusion.py's own hand-derived topology) against the SAME reference fixtures
 #     test_e2e_styletts2_diffusion_net.cpp already uses. Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_styletts2_mil_albert_reference test_e2e_styletts2_mil_albert_reference.cpp)
+add_executable(test_e2e_styletts2_mil_albert_reference gate/test_e2e_styletts2_mil_albert_reference.cpp)
 target_link_libraries(test_e2e_styletts2_mil_albert_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_mil_albert_reference COMMAND test_e2e_styletts2_mil_albert_reference)
+set_tests_properties(test_e2e_styletts2_mil_albert_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_styletts2_mil_albert_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_styletts2_mil_decoder_vocoder_reference test_e2e_styletts2_mil_decoder_vocoder_reference.cpp)
+add_executable(test_e2e_styletts2_mil_decoder_vocoder_reference gate/test_e2e_styletts2_mil_decoder_vocoder_reference.cpp)
 target_link_libraries(test_e2e_styletts2_mil_decoder_vocoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_mil_decoder_vocoder_reference COMMAND test_e2e_styletts2_mil_decoder_vocoder_reference)
+set_tests_properties(test_e2e_styletts2_mil_decoder_vocoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_styletts2_mil_decoder_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_styletts2_mil_diffusion_reference test_e2e_styletts2_mil_diffusion_reference.cpp)
+add_executable(test_e2e_styletts2_mil_diffusion_reference gate/test_e2e_styletts2_mil_diffusion_reference.cpp)
 target_link_libraries(test_e2e_styletts2_mil_diffusion_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_mil_diffusion_reference COMMAND test_e2e_styletts2_mil_diffusion_reference)
+set_tests_properties(test_e2e_styletts2_mil_diffusion_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_styletts2_mil_diffusion_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: ConvNextBlock (replicate-pad composition), verified against the REAL
 #     nn.Module's own forward pass (real package importable in this venv). See
 #     tools/convert_supertonic/convert_supertonic_convnext.py. Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_supertonic_convnext test_e2e_supertonic_convnext.cpp)
+add_executable(test_e2e_supertonic_convnext gate/test_e2e_supertonic_convnext.cpp)
 target_link_libraries(test_e2e_supertonic_convnext PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_convnext COMMAND test_e2e_supertonic_convnext)
+set_tests_properties(test_e2e_supertonic_convnext PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_convnext PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: VFTimeEncoder (sinusoidal time embedding + Mish MLP), verified against
 #     the real vector_estimator.pt's own time_encoder. See convert_supertonic_vftime.py. ---
-add_executable(test_e2e_supertonic_vftime test_e2e_supertonic_vftime.cpp)
+add_executable(test_e2e_supertonic_vftime gate/test_e2e_supertonic_vftime.cpp)
 target_link_libraries(test_e2e_supertonic_vftime PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_vftime COMMAND test_e2e_supertonic_vftime)
+set_tests_properties(test_e2e_supertonic_vftime PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_vftime PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: StyleEncoderCrossAttention (style-token-pooling cross-attention),
 #     verified against the real dp-style-encoder.pt's own style_token_layer. See
 #     convert_supertonic_style_attn.py. ---
-add_executable(test_e2e_supertonic_style_attn test_e2e_supertonic_style_attn.cpp)
+add_executable(test_e2e_supertonic_style_attn gate/test_e2e_supertonic_style_attn.cpp)
 target_link_libraries(test_e2e_supertonic_style_attn PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_style_attn COMMAND test_e2e_supertonic_style_attn)
+set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: confirms VITS's own REL_POS_ATTENTION_SHAW primitive family is directly
 #     reusable for SupertonicTTS's MultiHeadRelativeAttention (same Shaw et al. mechanism, different
 #     window_size/channels). See convert_supertonic_relpos_attn.py. ---
-add_executable(test_e2e_supertonic_relpos_attn test_e2e_supertonic_relpos_attn.cpp)
+add_executable(test_e2e_supertonic_relpos_attn gate/test_e2e_supertonic_relpos_attn.cpp)
 target_link_libraries(test_e2e_supertonic_relpos_attn PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_relpos_attn COMMAND test_e2e_supertonic_relpos_attn)
+set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: full DurationPredictor sub-model (DPTextEncoder + MLP head), the FIRST
 #     complete coherent sub-model in this effort, verified against the real duration_predictor.pt. See
 #     convert_supertonic_dp.py. ---
-add_executable(test_e2e_supertonic_dp test_e2e_supertonic_dp.cpp)
+add_executable(test_e2e_supertonic_dp gate/test_e2e_supertonic_dp.cpp)
 target_link_libraries(test_e2e_supertonic_dp PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_dp COMMAND test_e2e_supertonic_dp)
+set_tests_properties(test_e2e_supertonic_dp PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_dp PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: TTLStyleEncoder + TTLTextEncoder (exercises SpeechPromptedCrossAttention
 #     for the first time), verified against the real ttl-style-encoder.pt/text_encoder.pt. See
 #     convert_supertonic_ttl_text.py. ---
-add_executable(test_e2e_supertonic_ttl_text test_e2e_supertonic_ttl_text.cpp)
+add_executable(test_e2e_supertonic_ttl_text gate/test_e2e_supertonic_ttl_text.cpp)
 target_link_libraries(test_e2e_supertonic_ttl_text PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_ttl_text COMMAND test_e2e_supertonic_ttl_text)
+set_tests_properties(test_e2e_supertonic_ttl_text PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_ttl_text PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: VFTextCrossAttention (fractional RoPE) + VFStyleCrossAttention, verified
 #     against the real vector_estimator.pt's own text_attn[0]/style_attn[0]. See
 #     convert_supertonic_vf_attn.py. ---
-add_executable(test_e2e_supertonic_vf_attn test_e2e_supertonic_vf_attn.cpp)
+add_executable(test_e2e_supertonic_vf_attn gate/test_e2e_supertonic_vf_attn.cpp)
 target_link_libraries(test_e2e_supertonic_vf_attn PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_vf_attn COMMAND test_e2e_supertonic_vf_attn)
+set_tests_properties(test_e2e_supertonic_vf_attn PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_vf_attn PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: the FULL VectorFieldEstimator (biggest single assembly in this effort),
 #     verified against the real vector_estimator.pt, ONE compute_velocity call. See
 #     convert_supertonic_vfe.py. ---
-add_executable(test_e2e_supertonic_vfe test_e2e_supertonic_vfe.cpp)
+add_executable(test_e2e_supertonic_vfe gate/test_e2e_supertonic_vfe.cpp)
 target_link_libraries(test_e2e_supertonic_vfe PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_vfe COMMAND test_e2e_supertonic_vfe)
+set_tests_properties(test_e2e_supertonic_vfe PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_vfe PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- The FULL CFM Euler sampling loop (loom::cfm_euler_sample + the real VectorFieldEstimator) was
@@ -779,131 +895,148 @@ set_tests_properties(test_e2e_supertonic_vfe PROPERTIES SKIP_RETURN_CODE 77)
 # --- SupertonicTTS v2 roadmap: SpeechDecoder (folded BatchNorm, causal ConvNeXt, direct waveform
 #     emission, the FINAL pipeline stage), verified against the real vocoder.pt. See
 #     convert_supertonic_decoder.py. ---
-add_executable(test_e2e_supertonic_decoder test_e2e_supertonic_decoder.cpp)
+add_executable(test_e2e_supertonic_decoder gate/test_e2e_supertonic_decoder.cpp)
 target_link_libraries(test_e2e_supertonic_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_decoder COMMAND test_e2e_supertonic_decoder)
+set_tests_properties(test_e2e_supertonic_decoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS's real TextVectorizer (unicode codepoint-map tokenizer), against the real
 #     unicode_indexer.json asset -- see tools/convert_supertonic/convert_supertonic_text_vectorizer.py.
 #     Skips cleanly if LOOM_SUPERTONIC_TEXT_VECTORIZER_GGUF isn't set. ---
-add_executable(test_supertonic_text_vectorizer test_supertonic_text_vectorizer.cpp)
+add_executable(test_supertonic_text_vectorizer gate/test_supertonic_text_vectorizer.cpp)
 target_link_libraries(test_supertonic_text_vectorizer PRIVATE loom::engine)
 add_test(NAME test_supertonic_text_vectorizer COMMAND test_supertonic_text_vectorizer)
+set_tests_properties(test_supertonic_text_vectorizer PROPERTIES LABELS gate)
 set_tests_properties(test_supertonic_text_vectorizer PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Matcha-TTS roadmap: TextEncoder (ConvReluNorm prenet, partial-rotary NeoX RoPE self-attention,
 #     per-token DurationPredictor) against the real matcha.models.components.text_encoder.TextEncoder
 #     module run directly. See tools/convert_matcha/convert_matcha_text_encoder.py. ---
-add_executable(test_e2e_matcha_text_encoder test_e2e_matcha_text_encoder.cpp)
+add_executable(test_e2e_matcha_text_encoder gate/test_e2e_matcha_text_encoder.cpp)
 target_link_libraries(test_e2e_matcha_text_encoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_text_encoder COMMAND test_e2e_matcha_text_encoder)
+set_tests_properties(test_e2e_matcha_text_encoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_text_encoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Matcha-TTS roadmap: Decoder U-Net (the CFM estimator -- GROUP_NORM, one real downsample/upsample,
 #     skip connections, SnakeBeta-FeedForward BasicTransformerBlocks) against the real
 #     matcha.models.components.decoder.Decoder module run directly. See
 #     tools/convert_matcha/convert_matcha_decoder.py. ---
-add_executable(test_e2e_matcha_decoder test_e2e_matcha_decoder.cpp)
+add_executable(test_e2e_matcha_decoder gate/test_e2e_matcha_decoder.cpp)
 target_link_libraries(test_e2e_matcha_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_decoder COMMAND test_e2e_matcha_decoder)
+set_tests_properties(test_e2e_matcha_decoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Matcha-TTS roadmap: the real HiFi-GAN v1 vocoder (resblock="1", 4 upsample stages -- a different
 #     topology shape from VITS's own resblock="2"/3-stage HiFi-GAN) against the real
 #     matcha.hifigan.models.Generator module run directly. See
 #     tools/convert_matcha/convert_matcha_vocoder.py. ---
-add_executable(test_e2e_matcha_vocoder test_e2e_matcha_vocoder.cpp)
+add_executable(test_e2e_matcha_vocoder gate/test_e2e_matcha_vocoder.cpp)
 target_link_libraries(test_e2e_matcha_vocoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_vocoder COMMAND test_e2e_matcha_vocoder)
+set_tests_properties(test_e2e_matcha_vocoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_vocoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: LoomLuaBridge's host-math bindings (loom.range/causal_mask/zero_mask/
 #     argmax_row) and load_script()/call() plumbing, in isolation (no GGUF needed). See
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
-add_executable(test_lua_bridge test_lua_bridge.cpp)
+add_executable(test_lua_bridge ci/test_lua_bridge.cpp)
 target_link_libraries(test_lua_bridge PRIVATE loom::engine)
 add_test(NAME test_lua_bridge COMMAND test_lua_bridge)
+set_tests_properties(test_lua_bridge PROPERTIES LABELS ci)
 
 
 # --- Procedural generalization: SupertonicTTS's deterministic Euler-ODE (CFM) sampling loop, ported to
 #     Lua (tools/convert_supertonic/supertonic_driver.lua) and compared against the existing
 #     loom::SupertonicDriver on the real checkpoint. See LOOM_PROCEDURAL_GENERALIZATION.md /
 #     LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
-add_executable(test_e2e_supertonic_lua_driver test_e2e_supertonic_lua_driver.cpp)
+add_executable(test_e2e_supertonic_lua_driver gate/test_e2e_supertonic_lua_driver.cpp)
 target_link_libraries(test_e2e_supertonic_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_supertonic_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_supertonic_lua_driver COMMAND test_e2e_supertonic_lua_driver)
+set_tests_properties(test_e2e_supertonic_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness checks for the MIL-traced SupertonicTTS topologies (export_supertonic_mil.py,
 #     part of supertonic_mil.gguf) against real-module reference fixtures. Skips cleanly if env vars
 #     aren't set. ---
-add_executable(test_e2e_supertonic_mil_dp test_e2e_supertonic_mil_dp.cpp)
+add_executable(test_e2e_supertonic_mil_dp gate/test_e2e_supertonic_mil_dp.cpp)
 target_link_libraries(test_e2e_supertonic_mil_dp PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_mil_dp COMMAND test_e2e_supertonic_mil_dp)
+set_tests_properties(test_e2e_supertonic_mil_dp PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_dp PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_supertonic_mil_ttl_text test_e2e_supertonic_mil_ttl_text.cpp)
+add_executable(test_e2e_supertonic_mil_ttl_text gate/test_e2e_supertonic_mil_ttl_text.cpp)
 target_link_libraries(test_e2e_supertonic_mil_ttl_text PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_mil_ttl_text COMMAND test_e2e_supertonic_mil_ttl_text)
+set_tests_properties(test_e2e_supertonic_mil_ttl_text PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_ttl_text PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_supertonic_mil_vfe test_e2e_supertonic_mil_vfe.cpp)
+add_executable(test_e2e_supertonic_mil_vfe gate/test_e2e_supertonic_mil_vfe.cpp)
 target_link_libraries(test_e2e_supertonic_mil_vfe PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_mil_vfe COMMAND test_e2e_supertonic_mil_vfe)
+set_tests_properties(test_e2e_supertonic_mil_vfe PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_vfe PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_supertonic_mil_decoder test_e2e_supertonic_mil_decoder.cpp)
+add_executable(test_e2e_supertonic_mil_decoder gate/test_e2e_supertonic_mil_decoder.cpp)
 target_link_libraries(test_e2e_supertonic_mil_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_mil_decoder COMMAND test_e2e_supertonic_mil_decoder)
+set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Full end-to-end check: the MIL-traced topologies wired via supertonic_driver/, compared
 #     against the existing bespoke loom::SupertonicDriver oracle. Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_supertonic_mil_lua_driver test_e2e_supertonic_mil_lua_driver.cpp)
+add_executable(test_e2e_supertonic_mil_lua_driver gate/test_e2e_supertonic_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_supertonic_mil_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_supertonic_mil_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_supertonic_mil_lua_driver COMMAND test_e2e_supertonic_mil_lua_driver)
+set_tests_properties(test_e2e_supertonic_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: Matcha-TTS's deterministic Euler-ODE (CFM) sampling loop + real
 #     per-token duration expansion, ported to Lua (tools/convert_matcha/matcha_driver.lua) and compared
 #     against the existing loom::MatchaDriver on the real checkpoint. See
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
-add_executable(test_e2e_matcha_lua_driver test_e2e_matcha_lua_driver.cpp)
+add_executable(test_e2e_matcha_lua_driver gate/test_e2e_matcha_lua_driver.cpp)
 target_link_libraries(test_e2e_matcha_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_matcha_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_matcha_lua_driver COMMAND test_e2e_matcha_lua_driver)
+set_tests_properties(test_e2e_matcha_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Numerical-correctness checks for the MIL-traced Matcha-TTS topologies (export_matcha_mil.py, part
 #     of matcha_mil.gguf) against the SAME real-module reference fixtures the bespoke conversion's own
 #     per-module tests already use -- see each test's own docstring for why those fixtures are valid
 #     ground truth for the MIL wrappers too. ---
-add_executable(test_e2e_matcha_mil_text_encoder test_e2e_matcha_mil_text_encoder.cpp)
+add_executable(test_e2e_matcha_mil_text_encoder gate/test_e2e_matcha_mil_text_encoder.cpp)
 target_link_libraries(test_e2e_matcha_mil_text_encoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_mil_text_encoder COMMAND test_e2e_matcha_mil_text_encoder)
+set_tests_properties(test_e2e_matcha_mil_text_encoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_mil_text_encoder PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_matcha_mil_decoder test_e2e_matcha_mil_decoder.cpp)
+add_executable(test_e2e_matcha_mil_decoder gate/test_e2e_matcha_mil_decoder.cpp)
 target_link_libraries(test_e2e_matcha_mil_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_mil_decoder COMMAND test_e2e_matcha_mil_decoder)
+set_tests_properties(test_e2e_matcha_mil_decoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
-add_executable(test_e2e_matcha_mil_vocoder test_e2e_matcha_mil_vocoder.cpp)
+add_executable(test_e2e_matcha_mil_vocoder gate/test_e2e_matcha_mil_vocoder.cpp)
 target_link_libraries(test_e2e_matcha_mil_vocoder PRIVATE loom::engine)
 add_test(NAME test_e2e_matcha_mil_vocoder COMMAND test_e2e_matcha_mil_vocoder)
+set_tests_properties(test_e2e_matcha_mil_vocoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_mil_vocoder PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: the SAME Euler-ODE (CFM) sampling loop + per-token duration expansion
 #     as test_e2e_matcha_lua_driver above, but wired to the MIL-traced topologies
 #     (tools/convert_matcha/matcha_driver/) instead of the bespoke hand-built ones -- compared
 #     against the existing loom::MatchaDriver on the real checkpoint. ---
-add_executable(test_e2e_matcha_mil_lua_driver test_e2e_matcha_mil_lua_driver.cpp)
+add_executable(test_e2e_matcha_mil_lua_driver gate/test_e2e_matcha_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_matcha_mil_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_matcha_mil_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_matcha_mil_lua_driver COMMAND test_e2e_matcha_mil_lua_driver)
+set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: VITS's dynamic-length relative-position table cropping (loom.get_weight
@@ -911,26 +1044,29 @@ set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 
 #     (tools/convert_piper_vits/vits_driver.lua) and compared against the existing loom::VitsDriver on
 #     the real checkpoint. See LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and
 #     BACKLOG.md's dated entry. ---
-add_executable(test_e2e_vits_lua_driver test_e2e_vits_lua_driver.cpp)
+add_executable(test_e2e_vits_lua_driver gate/test_e2e_vits_lua_driver.cpp)
 target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_vits_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
+set_tests_properties(test_e2e_vits_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL exporter: VITS retraced via export_vits_mil.py (real SynthesizerTrn submodules, not the
 #     hand-built bespoke topology above) + tools/convert_piper_vits/vits_driver/. See
 #     BACKLOG.md's VITS MIL-export entry. ---
-add_executable(test_e2e_vits_mil_lua_driver test_e2e_vits_mil_lua_driver.cpp)
+add_executable(test_e2e_vits_mil_lua_driver gate/test_e2e_vits_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_vits_mil_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_mil_lua_driver COMMAND test_e2e_vits_mil_lua_driver)
+set_tests_properties(test_e2e_vits_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL exporter: flow+vocoder topology vs. a REALISTIC-scale real-PyTorch reference (T=194, z_p up
 #     to +-24) -- the fixture that caught a real bug in the bespoke topology (see the test's own
 #     docstring and BACKLOG.md). ---
-add_executable(test_e2e_vits_mil_flow_vocoder_reference test_e2e_vits_mil_flow_vocoder_reference.cpp)
+add_executable(test_e2e_vits_mil_flow_vocoder_reference gate/test_e2e_vits_mil_flow_vocoder_reference.cpp)
 target_link_libraries(test_e2e_vits_mil_flow_vocoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_mil_flow_vocoder_reference COMMAND test_e2e_vits_mil_flow_vocoder_reference)
+set_tests_properties(test_e2e_vits_mil_flow_vocoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_mil_flow_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: Kokoro-82M, the largest driver ported so far (43 topologies, 6 BiLSTM
@@ -938,26 +1074,29 @@ set_tests_properties(test_e2e_vits_mil_flow_vocoder_reference PROPERTIES SKIP_RE
 #     SineGen's rand_ini draws), ported to Lua (tools/convert_kokoro/kokoro_driver.lua) and compared
 #     against the existing loom::KokoroDriver on the real checkpoint. See
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
-add_executable(test_e2e_kokoro_lua_driver test_e2e_kokoro_lua_driver.cpp)
+add_executable(test_e2e_kokoro_lua_driver gate/test_e2e_kokoro_lua_driver.cpp)
 target_link_libraries(test_e2e_kokoro_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_kokoro_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_kokoro_lua_driver COMMAND test_e2e_kokoro_lua_driver)
+set_tests_properties(test_e2e_kokoro_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Real-model test: the MIL-traced Kokoro export (export_kokoro_mil.py) end-to-end, via
 #     kokoro_driver/ -- mixes the two MIL-traced topologies with the LSTM-bound bespoke ones
 #     (kokoro_driver/'s own module docstring explains why those stay bespoke). ---
-add_executable(test_e2e_kokoro_mil_lua_driver test_e2e_kokoro_mil_lua_driver.cpp)
+add_executable(test_e2e_kokoro_mil_lua_driver gate/test_e2e_kokoro_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_kokoro_mil_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_lua_driver COMMAND test_e2e_kokoro_mil_lua_driver)
+set_tests_properties(test_e2e_kokoro_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Drop-in equivalence: each MIL-traced topology against the bespoke one it replaces. The real
 #     numerical gate for moving a topology out of kokoro.gguf and into kokoro_mil.gguf, since
 #     test_e2e_kokoro_mil_lua_driver has no oracle waveform by design (see its own header). ---
-add_executable(test_e2e_kokoro_mil_topology_equivalence test_e2e_kokoro_mil_topology_equivalence.cpp)
+add_executable(test_e2e_kokoro_mil_topology_equivalence gate/test_e2e_kokoro_mil_topology_equivalence.cpp)
 target_link_libraries(test_e2e_kokoro_mil_topology_equivalence PRIVATE loom::engine)
 add_test(NAME test_e2e_kokoro_mil_topology_equivalence COMMAND test_e2e_kokoro_mil_topology_equivalence)
+set_tests_properties(test_e2e_kokoro_mil_topology_equivalence PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_topology_equivalence PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: StyleTTS2, the most complex driver ported so far (44 topologies, 6
@@ -965,80 +1104,90 @@ set_tests_properties(test_e2e_kokoro_mil_topology_equivalence PROPERTIES SKIP_RE
 #     Transformer1d denoiser, ported to Lua as plain host arithmetic + loom.run_subgraph calls), compared
 #     against the existing loom::StyleTTS2Driver on the real checkpoint. See
 #     LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and BACKLOG.md's dated entry. ---
-add_executable(test_e2e_styletts2_lua_driver test_e2e_styletts2_lua_driver.cpp)
+add_executable(test_e2e_styletts2_lua_driver gate/test_e2e_styletts2_lua_driver.cpp)
 target_link_libraries(test_e2e_styletts2_lua_driver PRIVATE loom::engine)
 target_compile_definitions(test_e2e_styletts2_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
 add_test(NAME test_e2e_styletts2_lua_driver COMMAND test_e2e_styletts2_lua_driver)
+set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_styletts2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Real-model test: the MIL-traced StyleTTS2 export (export_styletts2_mil.py) end-to-end, via
 #     styletts2_driver/ -- mirrors test_e2e_kokoro_mil_lua_driver.cpp's own "no oracle, orchestration
 #     sanity" scope (see that test's own docstring, and this one's, for why a tight full-pipeline diff
 #     against the bespoke C++ oracle isn't a meaningful target here). Skips cleanly if env vars aren't set. ---
-add_executable(test_e2e_styletts2_mil_lua_driver test_e2e_styletts2_mil_lua_driver.cpp)
+add_executable(test_e2e_styletts2_mil_lua_driver gate/test_e2e_styletts2_mil_lua_driver.cpp)
 target_link_libraries(test_e2e_styletts2_mil_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_styletts2_mil_lua_driver COMMAND test_e2e_styletts2_mil_lua_driver)
+set_tests_properties(test_e2e_styletts2_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_styletts2_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Procedural generalization: LFM2-350M fully dynamic multi-topology model compiled via coremltools
 #     and Loom MIL compiler backend, executing dynamically via embedded LuaVM and GraphBuilder ---
-add_executable(test_e2e_lfm2_lua_driver test_e2e_lfm2_lua_driver.cpp)
+add_executable(test_e2e_lfm2_lua_driver gate/test_e2e_lfm2_lua_driver.cpp)
 target_link_libraries(test_e2e_lfm2_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_lua_driver COMMAND test_e2e_lfm2_lua_driver)
+set_tests_properties(test_e2e_lfm2_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_lfm2_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- LFM2-350M exported via the generic MIL compiler (export_lfm2_monolithic.py), verified at genuinely
 #     dynamic (non-fixed, unpadded) prompt lengths against real HF logits ---
-add_executable(test_e2e_lfm2_mil_export test_e2e_lfm2_mil_export.cpp)
+add_executable(test_e2e_lfm2_mil_export gate/test_e2e_lfm2_mil_export.cpp)
 target_link_libraries(test_e2e_lfm2_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_mil_export COMMAND test_e2e_lfm2_mil_export)
+set_tests_properties(test_e2e_lfm2_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_lfm2_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- The KV cache's own claim (KV-CACHE.md 3.4): a fused causal LM's `infer_with_past` generates the
 #     same tokens as calling `infer` N times with a growing prompt. Generic over any fused causal-LM
 #     GGUF -- set LOOM_CAUSAL_LM_KV_GGUF; skips if the file has no such entry. ---
-add_executable(test_e2e_causal_lm_infer_with_past test_e2e_causal_lm_infer_with_past.cpp)
+add_executable(test_e2e_causal_lm_infer_with_past gate/test_e2e_causal_lm_infer_with_past.cpp)
 target_link_libraries(test_e2e_causal_lm_infer_with_past PRIVATE loom::engine)
 add_test(NAME test_e2e_causal_lm_infer_with_past COMMAND test_e2e_causal_lm_infer_with_past)
+set_tests_properties(test_e2e_causal_lm_infer_with_past PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_causal_lm_infer_with_past PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- The marshalling ceiling's own claim (BACKLOG.md P4.0.14): a prefill whose logits tensor is larger
 #     than LuaJIT's array part can hold now completes, because the logits never become a Lua table.
 #     Generic over any causal-LM GGUF -- the prompt length comes from the file's own vocab size. Set
 #     LOOM_PREFILL_CEILING_GGUF; skips if unset. ---
-add_executable(test_e2e_prefill_past_marshalling_ceiling test_e2e_prefill_past_marshalling_ceiling.cpp)
+add_executable(test_e2e_prefill_past_marshalling_ceiling gate/test_e2e_prefill_past_marshalling_ceiling.cpp)
 target_link_libraries(test_e2e_prefill_past_marshalling_ceiling PRIVATE loom::engine)
 add_test(NAME test_e2e_prefill_past_marshalling_ceiling COMMAND test_e2e_prefill_past_marshalling_ceiling)
+set_tests_properties(test_e2e_prefill_past_marshalling_ceiling PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_prefill_past_marshalling_ceiling PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- LSTM export via recurrent.py's build_lstm_cell_topologies + LoomLuaBridge::l_run_recurrent
 #     (EXPORT-IMPROVEMENT-BACKLOG.md item 4), verified against a real bidirectional torch.nn.LSTM ---
-add_executable(test_e2e_lstm_recurrent test_e2e_lstm_recurrent.cpp)
+add_executable(test_e2e_lstm_recurrent gate/test_e2e_lstm_recurrent.cpp)
 target_link_libraries(test_e2e_lstm_recurrent PRIVATE loom::engine)
 add_test(NAME test_e2e_lstm_recurrent COMMAND test_e2e_lstm_recurrent)
+set_tests_properties(test_e2e_lstm_recurrent PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_lstm_recurrent PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Same LFM2-350M monolithic export's new tokenizer.ggml.* KVs (EXPORT-BACKLOG.md item 4) --
 #     loom::BpeVocab::encode/decode checked against the real HF AutoTokenizer on the same checkpoint ---
-add_executable(test_e2e_lfm2_tokenizer test_e2e_lfm2_tokenizer.cpp)
+add_executable(test_e2e_lfm2_tokenizer gate/test_e2e_lfm2_tokenizer.cpp)
 target_link_libraries(test_e2e_lfm2_tokenizer PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_tokenizer COMMAND test_e2e_lfm2_tokenizer)
+set_tests_properties(test_e2e_lfm2_tokenizer PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_lfm2_tokenizer PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Same LFM2-350M monolithic export, quantized to Q8_0 via the exporter's `quantize=` kwarg
 #     (EXPORT-BACKLOG.md item 6) -- verifies real per-logit closeness against the F32 reference above ---
-add_executable(test_e2e_lfm2_q8_0 test_e2e_lfm2_q8_0.cpp)
+add_executable(test_e2e_lfm2_q8_0 gate/test_e2e_lfm2_q8_0.cpp)
 target_link_libraries(test_e2e_lfm2_q8_0 PRIVATE loom::engine)
 add_test(NAME test_e2e_lfm2_q8_0 COMMAND test_e2e_lfm2_q8_0)
+set_tests_properties(test_e2e_lfm2_q8_0 PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_lfm2_q8_0 PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- End-to-end check: the MIL-compiler-exported Whisper (tools/loom_mil_compiler/whisper_export.py,
 #     BACKLOG.md P4.1) against HF's own WhisperForConditionalGeneration -- the encoder half (which
 #     includes the in-graph mel frontend) numerically, and the generated Lua driver's whole
 #     encoder-then-cached-decode-loop as an exact token sequence. See test_e2e_whisper_mil_export.cpp. ---
-add_executable(test_e2e_whisper_mil_export test_e2e_whisper_mil_export.cpp)
+add_executable(test_e2e_whisper_mil_export gate/test_e2e_whisper_mil_export.cpp)
 target_link_libraries(test_e2e_whisper_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_whisper_mil_export COMMAND test_e2e_whisper_mil_export)
+set_tests_properties(test_e2e_whisper_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_whisper_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- End-to-end check: the MIL-compiler-exported Qwen3-ASR (tools/loom_mil_compiler/speech_lm_export.py
@@ -1046,9 +1195,10 @@ set_tests_properties(test_e2e_whisper_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 #     encoder+projector half as a TENSOR comparison (a wrong encoder still decodes a plausible
 #     transcript, see P4.2), and the generated driver's whole segmented-prompt-then-decode-loop as an
 #     exact token sequence. Family 3's gate. See test_e2e_qwen3_asr_mil_export.cpp. ---
-add_executable(test_e2e_qwen3_asr_mil_export test_e2e_qwen3_asr_mil_export.cpp)
+add_executable(test_e2e_qwen3_asr_mil_export gate/test_e2e_qwen3_asr_mil_export.cpp)
 target_link_libraries(test_e2e_qwen3_asr_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_qwen3_asr_mil_export COMMAND test_e2e_qwen3_asr_mil_export)
+set_tests_properties(test_e2e_qwen3_asr_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_qwen3_asr_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- End-to-end check: the MIL-compiler-exported Granite Speech
@@ -1057,7 +1207,16 @@ set_tests_properties(test_e2e_qwen3_asr_mil_export PROPERTIES SKIP_RETURN_CODE 7
 #     two checks as the first: a conformer encoder and a Q-Former projector share nothing with
 #     Qwen3-ASR's window-attention stack and linear projector, and the driver, the phase list and the
 #     test are unchanged. See test_e2e_granite_speech_mil_export.cpp. ---
-add_executable(test_e2e_granite_speech_mil_export test_e2e_granite_speech_mil_export.cpp)
+add_executable(test_e2e_granite_speech_mil_export gate/test_e2e_granite_speech_mil_export.cpp)
 target_link_libraries(test_e2e_granite_speech_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_granite_speech_mil_export COMMAND test_e2e_granite_speech_mil_export)
+set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- The gate suite's own gate: how `fixture_env` decides whether a real-model test can run at all.
+#     A ci test about gate tests, deliberately -- a wrong answer there makes 78 checks vanish into
+#     Skipped without anything going red. See ci/test_fixture_resolution.cpp. ---
+add_executable(test_fixture_resolution ci/test_fixture_resolution.cpp)
+target_link_libraries(test_fixture_resolution PRIVATE loom::engine)
+add_test(NAME test_fixture_resolution COMMAND test_fixture_resolution)
+set_tests_properties(test_fixture_resolution PROPERTIES LABELS ci)
