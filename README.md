@@ -1,11 +1,10 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo.svg" alt="loom.cpp" width="96">
+    <img src="assets/logo.svg" alt="" width="52" align="middle">
   </picture>
-</p>
-
-<h1 align="center">loom.cpp</h1>
+  &nbsp;loom.cpp
+</h1>
 
 An inference engine built on [`ggml`](https://github.com/ggml-org/ggml) that hardcodes no model. A
 model is a GGUF that carries its own **graph topologies** as JSON metadata and its own **driver
