@@ -118,14 +118,14 @@ set(LOOM_E2E_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_ref)
 
 add_test(
     NAME gen_toy_llm_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_toy_llm_gguf.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_llm_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_llm.gguf
 )
 set_tests_properties(gen_toy_llm_gguf_fixture PROPERTIES FIXTURES_SETUP toy_llm_gguf_fixture)
 
 add_test(
     NAME gen_toy_llm_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward.py
             ${LOOM_E2E_REF_DIR} --prompt 1 2 3 --n-new 4
 )
 set_tests_properties(gen_toy_llm_reference PROPERTIES FIXTURES_SETUP toy_llm_reference_fixture)
@@ -159,14 +159,14 @@ set(LOOM_E2E_VISION_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_vision_ref)
 
 add_test(
     NAME gen_toy_vision_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_toy_vision_gguf.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_vision_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_vision.gguf
 )
 set_tests_properties(gen_toy_vision_gguf_fixture PROPERTIES FIXTURES_SETUP toy_vision_gguf_fixture)
 
 add_test(
     NAME gen_toy_vision_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward_vision.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_vision.py
             ${LOOM_E2E_VISION_REF_DIR}
 )
 set_tests_properties(gen_toy_vision_reference PROPERTIES FIXTURES_SETUP toy_vision_reference_fixture)
@@ -186,14 +186,14 @@ set(LOOM_E2E_ASR_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_asr_ref)
 
 add_test(
     NAME gen_toy_asr_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_toy_asr_gguf.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_asr_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_asr.gguf
 )
 set_tests_properties(gen_toy_asr_gguf_fixture PROPERTIES FIXTURES_SETUP toy_asr_gguf_fixture)
 
 add_test(
     NAME gen_toy_asr_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward_asr.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_asr.py
             ${LOOM_E2E_ASR_REF_DIR}
 )
 set_tests_properties(gen_toy_asr_reference PROPERTIES FIXTURES_SETUP toy_asr_reference_fixture)
@@ -219,14 +219,14 @@ set(LOOM_E2E_VAE_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_vae_ref)
 
 add_test(
     NAME gen_toy_vae_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_toy_vae_gguf.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_toy_vae_gguf.py
             ${LOOM_FIXTURE_DIR}/toy_vae.gguf
 )
 set_tests_properties(gen_toy_vae_gguf_fixture PROPERTIES FIXTURES_SETUP toy_vae_gguf_fixture)
 
 add_test(
     NAME gen_toy_vae_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward_vae.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_vae.py
             ${LOOM_E2E_VAE_REF_DIR}
 )
 set_tests_properties(gen_toy_vae_reference PROPERTIES FIXTURES_SETUP toy_vae_reference_fixture)
@@ -388,14 +388,14 @@ set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)
 
 add_test(
     NAME gen_gqa_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_gqa_test_gguf.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_gqa_test_gguf.py
             ${LOOM_FIXTURE_DIR}/gqa_test.gguf
 )
 set_tests_properties(gen_gqa_gguf_fixture PROPERTIES FIXTURES_SETUP gqa_gguf_fixture)
 
 add_test(
     NAME gen_gqa_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_forward_gqa.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_forward_gqa.py
             ${LOOM_E2E_GQA_REF_DIR} --prompt 1 2 3 --n-new 4
 )
 set_tests_properties(gen_gqa_reference PROPERTIES FIXTURES_SETUP gqa_reference_fixture)
@@ -439,14 +439,14 @@ set(LOOM_LSTM_STEP_REF_DIR ${LOOM_FIXTURE_DIR}/lstm_step_ref)
 
 add_test(
     NAME gen_lstm_step_gguf_fixture
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/make_lstm_step_gguf.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_lstm_step_gguf.py
             ${LOOM_FIXTURE_DIR}/lstm_step_h.gguf ${LOOM_FIXTURE_DIR}/lstm_step_c.gguf
 )
 set_tests_properties(gen_lstm_step_gguf_fixture PROPERTIES FIXTURES_SETUP lstm_step_gguf_fixture)
 
 add_test(
     NAME gen_lstm_step_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_lstm_step.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_lstm_step.py
             ${LOOM_LSTM_STEP_REF_DIR}
 )
 set_tests_properties(gen_lstm_step_reference PROPERTIES FIXTURES_SETUP lstm_step_reference_fixture)
@@ -468,7 +468,7 @@ set(LOOM_DURATION_ALIGNER_REF_DIR ${LOOM_FIXTURE_DIR}/duration_aligner_ref)
 
 add_test(
     NAME gen_duration_aligner_reference
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fixture_gen/reference_duration_aligner.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reference_duration_aligner.py
             ${LOOM_DURATION_ALIGNER_REF_DIR}
 )
 set_tests_properties(gen_duration_aligner_reference PROPERTIES FIXTURES_SETUP duration_aligner_reference_fixture)

@@ -1,5 +1,0 @@
--- Transducer ASR (RNN-T / TDT): greedy decode, entirely in the driver.
---
--- Four traced topologies (transducer_export.py): `encoder`, `embed`, `pred_lstm_l{i}_fwd` and `joint`.
--- The double loop below -- encoder-frame pointer x symbols-per-frame -- is what `src/core/tdt_decoder.cpp`
--- used to be. Nothing about it needed C++: it is control flow over four subgraph calls.
