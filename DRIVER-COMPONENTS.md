@@ -65,6 +65,7 @@ Three builders exist:
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 13 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, whisper |
+| `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 3 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
@@ -111,6 +112,14 @@ The `infer_with_past` generation loop: prefill, then decode one token at a time 
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
 * `embed_topology` — WhenSet(TopologyName)
 * `head_topology` — WhenSet(TopologyName)
+
+### `waveform_valid_length` — `WaveformValidLength`
+
+Binds how many of a chunk-padded waveform's samples are real audio, and mirrors the frontend's own `torch.stft(center=True)` reflection over the head of the caller's zero padding -- so the mel frames that straddle the real end are the ones the checkpoint's extractor computed, not frames that ran into silence (BACKLOG.md P4.3e).
+
+*Emits:* statements. *Used by:* granite-speech, qwen3-asr.
+
+* nothing — every field is `__unchecked__`, with its reason
 
 ### `prompt_segments` — `PromptSegments`
 

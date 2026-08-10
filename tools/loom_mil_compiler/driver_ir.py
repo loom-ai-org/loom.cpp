@@ -14,6 +14,7 @@ adjacency rule (BACKLOG.md P4.0.12) lives in the second and not the first.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any, Optional
 
 
@@ -347,6 +348,26 @@ class Assign(Stmt):
 
 
 @dataclasses.dataclass
+class IndexAssign(Stmt):
+    """`table[idx] = expr` -- assignment THROUGH a table, where `Assign` assigns a name.
+
+    Its own node rather than a `RawBlock`, for `RawBlock`'s own stated reason: a raw block reports no
+    reads, and every symbol in the three expressions here (the table, the index, the value) is one
+    `validate()` must see. The one caller so far is family 3's waveform edge repair, whose loop body
+    is exactly `w[valid + i] = w[valid - i]` (BACKLOG.md P4.3e).
+
+    Defines nothing: the table it writes through was declared by an earlier statement, and `reads()`
+    reports it -- so writing into an undeclared name is caught the same way `Assign` catches it.
+    """
+    table: Expr
+    idx: Expr
+    expr: Expr
+
+    def reads(self) -> list[str]:
+        return self.table.reads() + self.idx.reads() + self.expr.reads()
+
+
+@dataclasses.dataclass
 class SubgraphCall(Stmt):
     """`local out1, out2 = loom.run_subgraph(module, {axis = expr, ...}, {k = v, ...})`.
 
@@ -515,6 +536,64 @@ def validate(function: Function) -> None:
     a runtime crash or silently wrong Lua."""
     defined = set(function.params) | _BUILTINS
     _validate_block(function.body, defined, function.name)
+
+
+def evaluate(expr: Expr, env: dict):
+    """The value of an arithmetic `Expr` under `env`, in Python -- so an exporter can CHECK a driver
+    expression against the checkpoint that expression is supposed to describe (BACKLOG.md P4.3e).
+
+    **Why this exists rather than a second Python copy of the formula.** A family states things like
+    "how many prompt positions this many samples of audio becomes" as IR, because the driver is what
+    evaluates them at run time. Checking such a formula used to mean rendering it and running the Lua
+    (P4.3d checked Granite Speech's row count in luajit, once, by hand), or restating it in Python --
+    and a restatement is not a check, it is a second thing that can be wrong. This evaluates the
+    *same node* the driver will render.
+
+    Deliberately partial: the arithmetic and comparison subset, plus `math.floor`/`math.min`/`math.max`,
+    and nothing that touches a table, a topology or the `inputs` argument. An expression outside it
+    raises, which is the honest answer -- a caller wanted a number and this cannot supply one.
+
+    `floordiv` floors, matching what `BinOp.render` emits (`math.floor(a / b)`) rather than Python's
+    `//` by coincidence: both floor toward negative infinity, and stating it here is what makes the
+    negative case -- `(0 - 1) // 2 == -1`, which Qwen3-ASR's row formula relies on -- a checked
+    property rather than a lucky one.
+    """
+    if isinstance(expr, Lit):
+        return expr.value
+    if isinstance(expr, Var):
+        if expr.name not in env:
+            raise DriverIRError(f"driver IR evaluate: '{expr.name}' is not in the environment")
+        return env[expr.name]
+    if isinstance(expr, UnaryOp):
+        value = evaluate(expr.operand, env)
+        if expr.op == "-":
+            return -value
+        if expr.op == "not":
+            return not value
+    if isinstance(expr, BinOp):
+        left, right = evaluate(expr.left, env), evaluate(expr.right, env)
+        if expr.op == "floordiv":
+            return math.floor(left / right)
+        ops = {"+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
+               "/": lambda a, b: a / b, "==": lambda a, b: a == b, "~=": lambda a, b: a != b,
+               "<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b,
+               ">=": lambda a, b: a >= b,
+               # Lua's `or`/`and` are the value-returning forms, and `nil`/`false` are the only false
+               # values -- so `x or default` with x = 0 is 0, where Python's `or` would take the
+               # default. The driver's `inputs.audio_samples or #inputs.waveform` is exactly this
+               # shape, which is why the distinction is spelled out rather than delegated.
+               "or": lambda a, b: b if a is None or a is False else a,
+               "and": lambda a, b: a if a is None or a is False else b}
+        if expr.op in ops:
+            return ops[expr.op](left, right)
+    if isinstance(expr, Call) and expr.fn in ("math.floor", "math.min", "math.max"):
+        args = [evaluate(a, env) for a in expr.args]
+        return {"math.floor": lambda *a: math.floor(*a), "math.min": min, "math.max": max}[expr.fn](*args)
+    raise DriverIRError(
+        f"driver IR evaluate: {expr!r} is outside the arithmetic subset this evaluates. It exists to "
+        f"check a numeric driver expression against the checkpoint it describes, so anything reading a "
+        f"table, a topology or the driver's own inputs has no value here."
+    )
 
 
 def _validate_block(stmts: list, defined: set, fn_name: str) -> None:
@@ -745,6 +824,8 @@ class LuaCodegen:
             return [f"{pad}local {stmt.name}"]
         if isinstance(stmt, Assign):
             return [f"{pad}{stmt.name} = {stmt.expr.render()}"]
+        if isinstance(stmt, IndexAssign):
+            return [f"{pad}{Index(stmt.table, stmt.idx).render()} = {stmt.expr.render()}"]
         if isinstance(stmt, SubgraphCall):
             targets = ", ".join(list(stmt.outputs) + list(stmt.extra_outputs))
             if stmt.retain:

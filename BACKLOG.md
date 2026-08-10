@@ -194,7 +194,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage — **all three flagships DONE** | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE** | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -2916,8 +2916,10 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   is what makes "every frame valid" true, and it also makes the checkpoint's own feature extractor an
   exact oracle, since its mel-axis right-pad becomes a no-op on such a waveform. The cost is that up to
   one second of trailing silence becomes real audio embeddings the LM reads, where HF would have masked
-  them out. Trimming them needs a way to feed a *prefix* of a retained tensor: **P4.3d** below, open,
-  and shared with the second leaf.
+  them out. Trimming them needs a way to feed a *prefix* of a retained tensor: **P4.3d** below, done,
+  and shared with the second leaf. **P4.3e went further and removed the cost entirely** — the encoder
+  takes the real sample count and masks the padding out of its own attention and features, so the rows
+  it emits for a partial chunk are bit-identical to HF's.
 
   **Five bugs in shared exporter machinery, four of which fail silently.** None is Qwen3-ASR-shaped;
   it is the first checkpoint whose encoder is spelled the way that reaches them.
@@ -3168,7 +3170,10 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   deliberately **not** overridden: its count comes from three stride-2 convs over a final partial chunk
   whose valid mel-frame count the extractor derives from a mask with its own padding rules, and a
   closed form over the sample count disagreed with it at 5 of 12 probe lengths. Its chunk is one second
-  (≤13 rows), so it keeps the padded default rather than a formula that is wrong at the edges.
+  (≤13 rows), so it keeps the padded default rather than a formula that is wrong at the edges. **P4.3e
+  superseded both halves of that paragraph**: the padded default is gone (a leaf must now state its row
+  count) and Qwen3-ASR's formula exists, because the mel-frame count turned out to be `floor(L / hop)`
+  in both branches of the extractor's mask rescaling rather than the `ceil` it looks like.
 
   **What this does NOT fix, measured rather than assumed.** Trimming makes the LM stop reading the
   silence rows; it does not make the retained rows equal HF's. On a 13 s clip padded to 24 s, the first
@@ -3176,16 +3181,107 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   whose absmax is 0.992 — because HF's conformer crops back to the real frame count after every
   attention block and masks its final partial block, where ours runs the whole padded sequence
   unmasked. Greedy decoding was unmoved (all three of HF-unpadded, HF-padded and ours-trimmed produced
-  the identical transcript), which is why this was worth doing as a prompt-level fix and is not yet
-  worth doing as an encoder rewrite. That rewrite is **P4.3e**.
+  the identical transcript), which is why this was worth doing as a prompt-level fix and separately
+  from the encoder rewrite. That rewrite is **P4.3e**, and it is done — the same comparison is now
+  4.8e-07.
 
-  **P4.3e — the encoder's own padding handling — NOT STARTED.** The other half of P4.3d, and the
-  larger one numerically. To make a family-3 encoder agree with HF on audio that does not fill its last
-  chunk, the encoder phase needs the valid length as an input and has to build its own validity masks
-  in-graph — Granite's per-block conformer mask and its post-attention crop, Qwen3-ASR's frame packing.
-  Both are the things the chunk contract exists to avoid, so this is a real project, not a follow-up
-  edit. The measurement above (3.9e-01 on rows the model does read, no token difference) is the
-  argument for filing it rather than doing it now.
+  **P4.3e — the encoder's own padding handling — DONE (2026-08-10).** The other half of P4.3d, and the
+  larger one numerically. The encoder phase now takes the caller's real sample count as a second input
+  and keeps the padding out of every place it could reach an output row. Both leaves reproduce HF's own
+  rows for a partially filled chunk, in torch:
+
+  | | before | after | reference absmax |
+  |---|---|---|---|
+  | Granite Speech, 11 s in a 12 s chunk | 1.7e-01 | **4.8e-07** | 0.971 |
+  | Qwen3-ASR, 10.625 s in eleven 1 s chunks | 1.0e-01 | **0.0e+00** (bit-identical) | 0.128 |
+
+  **The input is the SAMPLE count, not any frame count, and that is what keeps the template one
+  template.** `valid_samples` is a `(1,)` f32 the driver fills from the same local `audio_rows` reads;
+  every leaf's encoder turns it into its own checkpoint's frames in graph. Declaring frames instead
+  would have put Granite's `(L // hop + 1) // 2` and Qwen3-ASR's `floor(L / hop)` into the template,
+  which is exactly the per-checkpoint arithmetic the leaf boundary exists to hold.
+
+  **Three statements per encoder, and they are three different statements rather than one mask.** This
+  is the finding: "mask the padding" is not a single operation, because a padded frame reaches a real
+  row by three unrelated routes and each has its own correct place to be stopped.
+
+  1. **Attention keys.** Masked with HF's own `-finfo.max` rather than `-inf` — HF's reason, plus one
+     more: under the chunk contract the padding can span *whole* blocks, and a wholly padded block
+     would softmax a row of `-inf` into NaN. A NaN cannot be masked back out downstream; a uniform
+     finite row can, and is never read.
+  2. **The convolution.** Granite's conformer conv module is zeroed **after the GLU**, not on the
+     block's input: `up_conv` carries a bias, so a zeroed frame is not a zeroed activation. Post-GLU is
+     the exact point where HF's sequence ends and `depth_conv`'s own `F.pad` supplies zeros, so this is
+     not an approximation of HF's crop — it *is* the crop.
+  3. **The features.** Qwen3-ASR's extractor right-pads `input_features` with literal **0.0**, and
+     log-mel of silence is emphatically not zero. Its conv stem is 2-D over a whole chunk, so feeding
+     it a zero-padded *waveform* changes the valid rows of the final chunk and not only the padded
+     ones. Zeroing the mel frames past the real audio is what makes that chunk the extractor's.
+
+  Nothing masks the query rows and nothing needs to: a padded row's output reaches no real row, and
+  `audio_rows` stops the prompt before it.
+
+  **The fourth statement is not in the encoder at all, and it is the difference between close and
+  exact.** With 1–3 in place Granite was still 7.7e-04 out, in *one* mel frame — the one whose STFT
+  window straddles the caller's real end. `torch.stft(center=True)` reflects the signal by `n_fft / 2`
+  at each end, so the extractor computed that frame against a mirror of the audio where a host's zero
+  padding puts silence. The new `WaveformValidLength` driver component writes `n_fft / 2` mirrored
+  samples over the head of the padding — `w[valid + i] = w[valid - i]`, torch's reflect in 1-based Lua,
+  bounded by what the caller actually padded — and the same comparison becomes 4.8e-07. It costs one
+  bounded loop over a table the bridge built for this call, and it also binds the `_audio_samples`
+  local the encoder input and the row count both read, so those two cannot disagree.
+
+  **`audio_rows` is now required of a leaf, and Qwen3-ASR's exists.** P4.3d left it defaulting to the
+  padded count on the reasoning that a leaf without a formula still read a little silence. That
+  reasoning ended here: the rows past `valid_samples` are no longer a reading of silence, they are rows
+  whose keys were all masked, so a leaf that cannot state its row count cannot use this template. The
+  formula P4.3d could not write is four lines of `Qwen3ASRProcessor._get_audio_token_length` over
+  `floor(L / hop)` valid mel frames — and `floor` is the whole of what that attempt got wrong: the
+  extractor's mask is `attention_mask[:, ::hop]` with its last entry dropped when the sample count is
+  not a multiple of the hop, which is `floor(L / hop)` in *both* branches rather than the `ceil` the
+  rescaling looks like. It agrees with the processor at every probe length, where the earlier closed
+  form disagreed at 5 of 12.
+
+  **Two checks now run on every family-3 export**, both new, and the first of them found a real bug in
+  the second's own implementation:
+
+  * **padding invariance** — the same audio at the same declared length, once in a waveform that
+    exactly fits and once padded by two further chunks, must produce identical rows. Noise, not
+    silence, because on silence every frame is the same frame and a leak leaks nothing. This is what
+    caught the missing mirror: Qwen3-ASR failed it at 9.0e-05 with masking that was otherwise complete.
+  * **`audio_rows` against `audio_geometry`** — at a whole number of chunks there is no padding for the
+    two to disagree about, so `audio_rows(k * samples_per_chunk)` must be `k * frames_per_chunk`. This
+    needed `driver_ir.evaluate`, which evaluates the arithmetic subset of the IR in Python — so what is
+    checked is the *same node* the driver renders, rather than a restatement of it. P4.3d checked
+    Granite's formula once, by hand, in luajit; this runs on every export of every leaf.
+
+  **The fixtures changed, and that is the substantive part of the test change.** Both generators used
+  to hand HF the *padded* waveform, so both sides read the same trailing silence and neither fixture
+  could see the padding question at all. They now run HF on the real audio — which is what HF's own
+  pipeline does — and write the host's padded waveform, the real length, and the driver's own
+  reflected copy of it separately. Qwen3-ASR's default input is trimmed to land mid-chunk, derived from
+  the checkpoint's chunk rather than written down, because `samples/jfk.wav` is exactly 11.0 s and its
+  chunk is one second; both tests now assert that the fixture does not fill its last chunk, so a
+  generator that silently stopped exercising this would fail rather than pass quietly.
+
+  | check | result |
+  |---|---|
+  | Granite `encoder` topology vs HF on 11 s of a 12 s chunk | max 6.1e-05, mean 2.1e-06, ref absmax 0.971 (was gated at 7.3e-04 against a *padded* oracle) |
+  | Qwen3-ASR `encoder` topology vs HF on 10.5 s of eleven 1 s chunks | max 1.4e-05, mean 3.1e-07, ref absmax 0.128 |
+  | both drivers vs HF's greedy tokens, `audio_samples` supplied | identical, 24 and 30 tokens |
+  | `audio_samples` omitted vs `= #waveform` | identical, both leaves |
+  | `audio_samples` = 2 s | a different, shorter transcript, both leaves |
+  | `audio_rows` vs the checkpoint's own extractor | identical at every probe length, both leaves |
+  | kokoro, whisper-small, lfm2-monolithic re-exported | byte-identical, every snapshot file |
+  | qwen3-asr re-exported against the baseline | 2104 changed snapshot lines — the gate can fail |
+  | the Python suite | 511 passed (8 new, for `IndexAssign` and `evaluate`) |
+
+  **What is still not HF's, stated as a residual rather than left implicit.** The log-mel's `max - 8`
+  clamp reads a global maximum over the whole padded clip, where the extractor's reads over the real
+  one. Silence cannot raise a maximum and the mirrored samples are a copy of audio already in the clip,
+  so on both leaves the two maxima agree exactly — measured, not argued. A clip whose loudest frame
+  only exists across the mirror boundary would shift every bin sitting at the floor, which is the one
+  place this family's exactness is empirical rather than structural.
 - **P4.4 — KV cache in MIL-exported causal LMs — DONE, as P4.0.9.** Kept as a stub because
   `EXPORT-ROADMAP.md:129` points here. This row's full text — the measurement that `FuseLoomAttention`
   was the blocker, and a four-step plan — is superseded by [`KV-CACHE.md`](KV-CACHE.md) and P4.0.9's

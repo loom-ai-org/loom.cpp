@@ -42,9 +42,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .driver_ir import (
-    ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, Len, Lit, Local,
-    LocalDecl, NumericFor, OutputRef, RawBlock, RetainedArgmax, RetainedArgmaxRows, Return,
-    SubgraphCall, TableLit, Var, While,
+    ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, IndexAssign, Len,
+    Lit, Local, LocalDecl, NumericFor, OutputRef, RawBlock, RetainedArgmax, RetainedArgmaxRows,
+    Return, SubgraphCall, TableLit, Var, While,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import (
@@ -1575,6 +1575,90 @@ def _names_a_topology(link) -> bool:
     return isinstance(link, TopologyName) or (
         isinstance(link, WhenSet) and _names_a_topology(link.inner)
     )
+
+
+@dataclass
+class WaveformValidLength(DriverComponent):
+    """Binds "how many of these samples are real audio", and repairs the padding the caller wrote after
+    them so a windowed frontend sees what the checkpoint's own extractor saw (BACKLOG.md P4.3e).
+
+    **Two jobs because they are one fact.** A chunked audio encoder requires a whole number of chunks
+    (family 3's contract: one second for Qwen3-ASR, twelve for Granite Speech), so a host zero-pads.
+    Everything downstream that has to know where the real audio stopped reads the local this binds --
+    the encoder's own validity input, and the prompt's audio row count.
+
+    **The repair is one line of arithmetic and it is the difference between close and exact.** Every
+    log-mel frontend here is `torch.stft(center=True)`, which pads the signal's own ends by `n_fft/2`
+    **by reflection** -- so the extractor computing features for `L` samples of audio evaluates the
+    frames near `L` against a mirror of the audio, while a caller's zero padding puts silence there.
+    That is one mel frame for Granite Speech, and it is not a small difference: masking the encoder's
+    padding without this leaves 7.7e-04 against a reference whose absmax is 0.971, and with it the
+    same comparison is 4.8e-07 -- the float-accumulation floor. Writing `reflect_samples` mirrored
+    samples over the head of the caller's padding is what makes the frames that straddle `L` the
+    extractor's own.
+
+    `w[valid + i] = w[valid - i]` is `torch.nn.functional.pad(..., mode="reflect")` in 1-based Lua:
+    torch mirrors about the last element WITHOUT repeating it, so the first padded sample is
+    `x[L - 2]` 0-based, which is `w[L - 1]` here.
+
+    **The caller's table is written in place, and that is deliberate.** The waveform reaches the driver
+    as a Lua table the bridge built for this call, so mutating it costs no copy and outlives nothing;
+    building a second table would put `n_samples` doubles through the allocator for `reflect_samples`
+    changed values. Bounded by what the caller actually padded (`#waveform - valid`), so a caller who
+    padded less than `reflect_samples` gets as much of the mirror as fits and one who padded nothing
+    is left exactly as they were.
+    """
+
+    # Where the two numbers come from, as IR: the caller's real length (optional, defaulting to the
+    # whole waveform) and the waveform itself.
+    waveform: object = None
+    valid: object = None
+    # `n_fft // 2`, the frontend's own STFT edge padding. Zero means "no repair", which is what a
+    # component list built without a checkpoint renders (`component_registry.usage()`).
+    reflect_samples: int = 0
+    valid_var: str = "_audio_samples"
+    index_var: str = "_i"
+
+    __unchecked__ = {
+        "waveform": Unchecked("a driver_ir expression naming the caller's own waveform; validate() "
+                              "resolves whatever symbols it reads over the assembled function"),
+        "valid": Unchecked("same -- the caller's real sample count, whose family-level spelling is "
+                           "`inputs.audio_samples or #inputs.waveform`"),
+        "reflect_samples": Unchecked(
+            "READ off the exported frontend's own `n_fft` in BaseSpeechLMExportConfig.phases(), which "
+            "is the same number `torch.stft(center=True)` pads by -- there is no second authority to "
+            "compare it against, and the property that matters (the encoder's rows equal HF's on a "
+            "partially-filled chunk) is what the per-leaf e2e tests measure"
+        ),
+        "valid_var": Unchecked("the local this component binds; reads of it are checked by "
+                               "driver_ir.validate over the assembled function"),
+        "index_var": Unchecked("the loop variable, scoped to the loop body by NumericFor itself"),
+    }
+
+    def link_label(self) -> str:
+        return f"waveform valid length -> {self.valid_var}"
+
+    def emit(self, ctx: DriverContext) -> List:
+        body: List = [
+            _note_block(
+                "How many samples are REAL audio, and the mirror the frontend's own STFT would have "
+                "seen at their end -- the caller padded with zeros, which is not what the "
+                "checkpoint's extractor computed its last frames against."
+            )[0],
+            Local(self.valid_var, self.valid),
+        ]
+        if self.reflect_samples:
+            body.append(NumericFor(
+                self.index_var, Lit(1),
+                Call("math.min", [Lit(self.reflect_samples),
+                                  BinOp("-", Len(self.waveform), Var(self.valid_var))]),
+                [IndexAssign(
+                    self.waveform,
+                    BinOp("+", Var(self.valid_var), Var(self.index_var)),
+                    Index(self.waveform, BinOp("-", Var(self.valid_var), Var(self.index_var))),
+                )],
+            ))
+        return body
 
 
 @dataclass

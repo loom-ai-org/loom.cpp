@@ -10,7 +10,7 @@
 // the artifact publishes: a chunk is twelve seconds rather than one, and becomes 120 prompt positions
 // rather than 13.
 //
-// Two checks, in the order that makes a failure readable:
+// Three checks, in the order that makes a failure readable:
 //
 //   1. the `encoder` topology's output -- the mel frontend, the 160-bin feature stacking, the conformer
 //      stack and the Q-Former, as one graph -- against the same tensor HF's `get_audio_features`
@@ -20,13 +20,23 @@
 //   2. the whole embedded Lua driver -- encoder once, the prompt fed to the KV cache as text/audio/text
 //      segments, then the decode loop -- against HF's greedy token sequence. Integer equality, no
 //      tolerance: both are deterministic argmax.
+//   3. `audio_samples`: that omitting it means "all of it", and that supplying a different one changes
+//      the answer.
+//
+// **The fixture's audio deliberately does not fill its last chunk** (BACKLOG.md P4.3e), and here that
+// is the normal case rather than a contrived one: a chunk is twelve seconds and `samples/jfk.wav` is
+// eleven, so a full second of what the encoder sees is the host's padding. HF is run on the real audio
+// and this test hands the driver the padded waveform plus the real length, so what is compared is that
+// the exported encoder produces HF's rows for a chunk it only partly fills. Before P4.3e it was out by
+// 1.7e-01 on rows whose absmax is 0.971, with no effect on the greedy transcript -- which is exactly
+// the sort of wrongness only a tensor oracle on a partial chunk can see.
 //
 // **Nothing here names a per-model C++ struct**, and nothing here is Granite-specific: how long a
 // waveform to hand over comes from the GGUF's own `loom.samples_per_chunk`, whether a topology needs a
 // cache is `GraphTopology::uses_kv_cache()`'s answer, and how big to make it is `make_kv_cache(*model)`'s.
 // The driver supplies its own prompt -- including which task it asks the model to perform, which for
 // this checkpoint is a real choice its chat template does not make -- and its own stop tokens, so this
-// test passes a waveform and nothing else.
+// test passes a waveform and a length.
 //
 // Not generated at ctest time (needs the real checkpoint + coremltools + transformers) -- skips cleanly
 // if the fixture isn't present. To (re)generate:
@@ -114,12 +124,19 @@ int main() {
         return kSkipReturnCode;
     }
 
-    std::vector<int64_t> wav_shape, audio_shape, gen_shape, prompt_shape;
+    std::vector<int64_t> wav_shape, enc_shape, audio_shape, gen_shape, prompt_shape, valid_shape;
     const std::vector<float> waveform = read_npy<float>(ref_dir + "/ref_asr_waveform.npy", wav_shape);
+    // What the DRIVER hands the encoder: the same waveform with the frontend's own STFT reflection
+    // written over the head of the caller's zero padding (BACKLOG.md P4.3e). Check 1 drives that
+    // topology directly, so it needs the driver's input rather than the host's.
+    const std::vector<float> encoder_in = read_npy<float>(ref_dir + "/ref_asr_encoder_in.npy", enc_shape);
     const std::vector<float> expected_audio = read_npy<float>(ref_dir + "/ref_asr_audio.npy", audio_shape);
     const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_asr_generated.npy", gen_shape);
     const std::vector<int32_t> prompt_len =
         read_npy<int32_t>(ref_dir + "/ref_asr_prompt_len.npy", prompt_shape);
+    const std::vector<int32_t> valid = read_npy<int32_t>(ref_dir + "/ref_asr_valid.npy", valid_shape);
+    LOOM_CHECK(!valid.empty());
+    const auto valid_samples = static_cast<size_t>(valid[0]);
 
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
@@ -134,16 +151,21 @@ int main() {
     const uint32_t frames_per_chunk = model->hparam_u32("frames_per_chunk");
     LOOM_CHECK(samples_per_chunk > 0 && frames_per_chunk > 0);
     LOOM_CHECK(waveform.size() % samples_per_chunk == 0);
+    LOOM_CHECK(encoder_in.size() == waveform.size());
     const size_t n_chunks = waveform.size() / samples_per_chunk;
+    const size_t hf_rows = static_cast<size_t>(audio_shape[0]);
     std::fprintf(stderr,
                  "loom.samples_per_chunk = %u, loom.frames_per_chunk = %u, fixture waveform = %zu "
-                 "(%zu chunks -> %zu audio rows)\n",
-                 samples_per_chunk, frames_per_chunk, waveform.size(), n_chunks,
-                 n_chunks * frames_per_chunk);
-    // The audio segment's length as the DRIVER computes it, against what HF actually produced. A
-    // mismatch here would place every later prompt position at the wrong `n_past` with no shape error
-    // to reveal it, which is exactly why the two numbers are published as hparams.
-    LOOM_CHECK(static_cast<size_t>(audio_shape[0]) == n_chunks * frames_per_chunk);
+                 "(%zu real samples in %zu chunks -> %zu padded rows, %zu of them real)\n",
+                 samples_per_chunk, frames_per_chunk, waveform.size(), valid_samples, n_chunks,
+                 n_chunks * frames_per_chunk, hf_rows);
+    // **The fixture must land mid-chunk or this file checks nothing it is here to check** (BACKLOG.md
+    // P4.3e). HF is run on the real audio and produces fewer rows than the padded waveform's own count;
+    // an equality here would mean the generator was handed a whole number of chunks, and every
+    // comparison below would pass without ever exercising the padding -- which for a twelve-second
+    // chunk is most of a clip.
+    LOOM_CHECK(valid_samples > 0 && valid_samples < waveform.size());
+    LOOM_CHECK(hf_rows < n_chunks * frames_per_chunk);
 
     // --- 1. the encoder half, on its own: a tensor oracle, not a token oracle ---
     {
@@ -151,15 +173,24 @@ int main() {
         LOOM_CHECK(!topo.uses_kv_cache());
         loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
         const loom::GraphBuilder::BuildResult& result = builder.build(
-            {{"n_samples", static_cast<uint32_t>(waveform.size())}, {"n_past", 0}});
+            {{"n_samples", static_cast<uint32_t>(encoder_in.size())}, {"n_past", 0}});
 
         ggml_tensor* waveform_t = result.input_tensors.at("waveform");
-        ggml_backend_tensor_set(waveform_t, waveform.data(), 0, waveform.size() * sizeof(float));
+        ggml_backend_tensor_set(waveform_t, encoder_in.data(), 0, encoder_in.size() * sizeof(float));
+        // Where the real audio stops. Without it the conformer reads its own padding as speech --
+        // 1.7e-01 out on rows whose absmax is 0.971, which is what this input exists to remove.
+        ggml_tensor* valid_t = result.input_tensors.at("valid_samples");
+        const float valid_f = static_cast<float>(valid_samples);
+        ggml_backend_tensor_set(valid_t, &valid_f, 0, sizeof(float));
         ggml_backend_graph_compute(backend.get(), result.graph);
 
-        // HF returns (n_rows, hidden); the exported topology's ne is [hidden, n_rows] -- same memory.
-        LOOM_CHECK(expected_audio.size() ==
-                   static_cast<size_t>(result.output->ne[0]) * static_cast<size_t>(result.output->ne[1]));
+        // HF returns (n_rows, hidden) for the REAL audio; the exported topology's ne is
+        // [hidden, padded_rows] -- same memory and the same rows, so HF's are its leading prefix.
+        const auto hidden = static_cast<size_t>(result.output->ne[0]);
+        LOOM_CHECK(static_cast<size_t>(result.output->ne[1]) == n_chunks * frames_per_chunk);
+        LOOM_CHECK(expected_audio.size() == hidden * hf_rows);
+        // A byte prefix, because the rows are contiguous and HF's are the leading ones -- the padded
+        // rows past `hf_rows` are read by nothing, here or in the driver.
         std::vector<float> actual(expected_audio.size());
         ggml_backend_tensor_get(result.output, actual.data(), 0, actual.size() * sizeof(float));
 
@@ -181,9 +212,9 @@ int main() {
                      static_cast<double>(max_abs_diff / ref_absmax));
         // Relative to the reference's own scale, as the Qwen3-ASR and Whisper gates are and for the
         // same reason: a fixed epsilon would be a statement about this checkpoint's dynamic range. The
-        // rewrite agrees with HF to 5.8e-06 in torch (see granite_speech_export), so everything left
-        // here is f32 accumulation order across 16 conformer layers and two Q-Former layers -- 7.3e-04
-        // on a reference whose absmax is 0.999, with a mean of 3.7e-06.
+        // rewrite agrees with HF to 4.8e-07 in torch on this very clip -- a partially filled chunk,
+        // since P4.3e (see granite_speech_export) -- so everything left here is f32 accumulation order
+        // across 16 conformer layers and two Q-Former layers.
         LOOM_CHECK(max_abs_diff < 2e-3f * ref_absmax);
         LOOM_CHECK(mean_abs_diff < 1e-3);
     }
@@ -213,11 +244,14 @@ int main() {
         bridge.load_script(model->kv_str("model.driver_script"));
 
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
-        // **The test passes a waveform and a length cap, and nothing else.** No prompt, no eos: the
-        // driver carries the checkpoint's own chat-template prefix/suffix and its own stop token,
-        // which is the whole point of `prompt_segment_constants`.
+        // **The test passes a waveform, how much of it is real, and a length cap.** No prompt, no eos:
+        // the driver carries the checkpoint's own chat-template prefix/suffix and its own stop token,
+        // which is the whole point of `prompt_segment_constants`. `waveform` is the HOST's array --
+        // zero-padded, no mirror -- so this exercises the driver's own edge repair rather than
+        // check 1's precomputed copy of it.
         std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
             {"waveform", waveform_d},
+            {"audio_samples", static_cast<double>(valid_samples)},
             {"max_new_tokens", static_cast<double>(expected.size())},
         };
         // Held in a named local before unpacking: `call` returns by value, so binding a reference
@@ -242,19 +276,13 @@ int main() {
         }
     }
 
-    // --- 3. `audio_samples`: the prompt is trimmed to the rows the caller's REAL audio produced ---
+    // --- 3. `audio_samples` is optional, and it is not ignored ---
     //
-    // The encoder's contract is a whole number of twelve-second chunks, so a host pads and the encoder
-    // emits real embedding rows for that padding. Passing the unpadded length makes the driver hand
-    // the decoder only the rows those samples produce (BACKLOG.md P4.3d).
-    //
-    // **Two checks, and the first is the exact one.** Declaring the whole padded waveform valid must
-    // reproduce check 2's sequence token for token: `rows` then equals everything the encoder retained,
-    // so the trimmed path and the untrimmed path are the same copy, and any difference would be the
-    // prefix machinery corrupting a case it is not even supposed to change. The second declares two
-    // seconds of a twelve-second chunk and requires the answer to CHANGE -- a driver that ignored
-    // `audio_samples` would silently return check 2's sequence, which is precisely the failure that has
-    // no other symptom.
+    // Two properties, and neither is checked by check 2 above. The first is that omitting it means
+    // "all of it" -- the driver's `inputs.audio_samples or #inputs.waveform`, which is what a host
+    // whose audio already filled its last chunk relies on. The second is that a different value
+    // produces a different answer: a driver that accepted the argument and dropped it would pass
+    // check 2 as long as the fixture's own length happened to be the default.
     {
         loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
         loom::GraphTopology embed_topo = loom::GraphTopology::parse(model->topology_json("embed"));
@@ -270,12 +298,12 @@ int main() {
         bridge.load_script(model->kv_str("model.driver_script"));
 
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
-        auto run_with = [&](double valid_samples) {
+        auto run_with = [&](double declared) {
             std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
                 {"waveform", waveform_d},
-                {"audio_samples", valid_samples},
                 {"max_new_tokens", static_cast<double>(expected.size())},
             };
+            if (declared > 0.0) args["audio_samples"] = declared;
             const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
             const auto& out = std::get<std::vector<double>>(result);
             std::vector<int32_t> ids;
@@ -284,13 +312,12 @@ int main() {
             return ids;
         };
 
-        // The whole waveform declared valid: 192000 samples is 120 rows, which is everything the
-        // encoder retained, so this must be check 2's sequence exactly.
+        const std::vector<int32_t> omitted = run_with(-1.0);
         const std::vector<int32_t> whole = run_with(static_cast<double>(waveform.size()));
-        std::fprintf(stderr, "audio_samples = %zu (the whole chunk): %zu tokens\n", waveform.size(),
-                     whole.size());
-        LOOM_CHECK(whole.size() == expected.size());
-        for (size_t i = 0; i < whole.size(); ++i) LOOM_CHECK(whole[i] == expected[i]);
+        std::fprintf(stderr, "audio_samples omitted: %zu tokens; = %zu (the whole waveform): %zu\n",
+                     omitted.size(), waveform.size(), whole.size());
+        LOOM_CHECK(omitted.size() == whole.size());
+        for (size_t i = 0; i < omitted.size(); ++i) LOOM_CHECK(omitted[i] == whole[i]);
 
         // Two seconds of it: 32000 samples is 21 rows by the checkpoint's own
         // `_get_num_audio_features`, so 99 of the retained 120 rows never reach the decoder and the

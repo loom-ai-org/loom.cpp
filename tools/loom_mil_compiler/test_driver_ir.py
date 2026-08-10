@@ -4,8 +4,9 @@ SubgraphCall/Function IR rather than tracing a real model."""
 import unittest
 
 from driver_ir import (
-    ArrayLit, BinOp, Call, CallStmt, DriverIRError, Function, If, Len, Lit, Local, LuaCodegen,
-    OutputRef, RetainedArgmax, Return, SubgraphCall, Var, While, check_subgraph_calls, validate,
+    ArrayLit, BinOp, Call, CallStmt, DriverIRError, FieldAccess, Function, If, Index, IndexAssign,
+    Len, Lit, Local, LuaCodegen, NumericFor, OutputRef, RetainedArgmax, Return, SubgraphCall, Var,
+    While, check_subgraph_calls, evaluate, validate,
 )
 
 
@@ -258,3 +259,66 @@ class TestArrayLitAndCallStmt(unittest.TestCase):
         with self.assertRaises(DriverIRError) as raised:
             validate(fn)
         self.assertIn("'missing'", str(raised.exception))
+
+
+class TestIndexAssign(unittest.TestCase):
+    """Assignment through a table, which family 3's waveform edge repair needed (BACKLOG.md P4.3e).
+    A node rather than a `RawBlock` for the reason above: all three of its expressions carry symbols
+    `validate()` has to see."""
+
+    def test_it_renders_as_lua_index_assignment(self):
+        stmt = IndexAssign(Var("w"), BinOp("+", Var("n"), Lit(1)), Index(Var("w"), Var("n")))
+        self.assertEqual(LuaCodegen()._emit_stmt(stmt, 1), ["    w[(n + 1)] = w[n]"])
+
+    def test_it_defines_nothing_and_reports_every_read(self):
+        stmt = IndexAssign(Var("w"), Var("i"), Var("v"))
+        self.assertEqual(stmt.defines(), [])
+        self.assertEqual(sorted(stmt.reads()), ["i", "v", "w"])
+
+    def test_validate_rejects_writing_through_an_undeclared_table(self):
+        fn = Function("infer", ["inputs"], [IndexAssign(Var("w"), Lit(1), Lit(0))])
+        with self.assertRaises(DriverIRError) as raised:
+            validate(fn)
+        self.assertIn("'w'", str(raised.exception))
+
+    def test_a_loop_body_writing_through_a_bound_table_validates(self):
+        """The shape `WaveformValidLength` emits: the loop variable is scoped to the body, and the
+        table and the length were bound before it."""
+        fn = Function("infer", ["inputs"], [
+            Local("w", FieldAccess("inputs", "waveform")),
+            Local("n", Lit(4)),
+            NumericFor("i", Lit(1), Lit(2), [
+                IndexAssign(Var("w"), BinOp("+", Var("n"), Var("i")),
+                            Index(Var("w"), BinOp("-", Var("n"), Var("i")))),
+            ]),
+        ])
+        validate(fn)
+
+
+class TestEvaluateArithmetic(unittest.TestCase):
+    """`evaluate` exists so an exporter can check a driver expression against the checkpoint it
+    describes without rendering Lua or restating the formula in Python (BACKLOG.md P4.3e)."""
+
+    def test_floordiv_floors_toward_negative_infinity(self):
+        """`math.floor(a / b)`, which is what `BinOp.render` emits -- and Qwen3-ASR's row formula
+        relies on `(0 - 1) // 2` being -1, so the negative case is load-bearing rather than academic."""
+        self.assertEqual(evaluate(BinOp("floordiv", Lit(7), Lit(2)), {}), 3)
+        self.assertEqual(evaluate(BinOp("floordiv", BinOp("-", Lit(0), Lit(1)), Lit(2)), {}), -1)
+
+    def test_lua_or_returns_the_left_value_when_it_is_zero(self):
+        """Lua's `or` is the value-returning form and 0 is TRUE there, unlike Python's. The driver's
+        `inputs.audio_samples or #inputs.waveform` is exactly this shape."""
+        self.assertEqual(evaluate(BinOp("or", Lit(0), Lit(99)), {}), 0)
+        self.assertEqual(evaluate(BinOp("or", Var("missing"), Lit(99)), {"missing": None}), 99)
+
+    def test_it_reads_the_environment_and_names_what_is_absent(self):
+        self.assertEqual(evaluate(BinOp("*", Var("n"), Lit(3)), {"n": 5}), 15)
+        with self.assertRaises(DriverIRError) as raised:
+            evaluate(Var("n"), {})
+        self.assertIn("'n'", str(raised.exception))
+
+    def test_it_refuses_anything_outside_the_arithmetic_subset(self):
+        """A table read has no value here, and saying so beats returning a plausible wrong number."""
+        with self.assertRaises(DriverIRError) as raised:
+            evaluate(Len(FieldAccess("inputs", "waveform")), {})
+        self.assertIn("arithmetic subset", str(raised.exception))
