@@ -26,8 +26,11 @@ OCHRE = (70, 0.13, 75)
 INDIGO = (45, 0.09, 265)
 CREAM = (97, 0.012, 75)
 INK = (30, 0.02, 60)
-WHITE = (99, 0.0, 0)
 DARK_GROUND = (22, 0.02, 60)
+# The design's monochrome lockups use these two as their threads; see the note in main() for why
+# nothing here writes those files.
+WHITE = (99, 0.0, 0)
+NEAR_WHITE = (99, 0.005, 75)
 
 
 def oklch_to_hex(lightness_pct: float, chroma: float, hue_deg: float) -> str:
@@ -82,15 +85,24 @@ def mark(threads, ground, stroke, title: str) -> str:
 
 
 def main() -> None:
-    colour = mark(
-        threads=[oklch_to_hex(*RUST), oklch_to_hex(*OCHRE), oklch_to_hex(*INDIGO)],
-        ground=oklch_to_hex(*CREAM), stroke=oklch_to_hex(*INK), title="loom.cpp",
-    )
-    # The artifact's "on dark" lockup: white threads on the dark ground, no stroke.
-    dark = mark(
-        threads=[oklch_to_hex(*WHITE)] * 3,
-        ground=oklch_to_hex(*DARK_GROUND), stroke=None, title="loom.cpp",
-    )
+    threads = [oklch_to_hex(*RUST), oklch_to_hex(*OCHRE), oklch_to_hex(*INDIGO)]
+    colour = mark(threads=threads, ground=oklch_to_hex(*CREAM), stroke=oklch_to_hex(*INK),
+                  title="loom.cpp")
+    # The same threads on the dark ground, and this is the one place these files deviate from the
+    # artifact -- deliberately.
+    #
+    # The design's "on dark" lockup is MONOCHROME (white threads, `iconMonoSvgDark`), which is the
+    # right call for a single-colour context. It is the wrong call for a README, because a README's
+    # dark variant is what most people see: `<picture>` serves it on `prefers-color-scheme: dark`, so
+    # shipping the monochrome there means the brand's colours never appear for the majority of
+    # readers. Recolouring the ground instead keeps rust/ochre/indigo in both themes, each on a ground
+    # that suits its page.
+    #
+    # The alternative -- serving the cream-tiled mark everywhere -- also works and reads fine, but it
+    # puts a bright tile on a dark page where this sits in it. The monochrome variants the design
+    # defines are still one call away: `mark([ink]*3, near_white, ink)` and `mark([white]*3, dark,
+    # None)`; nothing here uses them, so nothing here writes them.
+    dark = mark(threads=threads, ground=oklch_to_hex(*DARK_GROUND), stroke=None, title="loom.cpp")
     (HERE / "logo.svg").write_text(colour)
     (HERE / "logo-dark.svg").write_text(dark)
     for name, spec in (("rust", RUST), ("ochre", OCHRE), ("indigo", INDIGO),
