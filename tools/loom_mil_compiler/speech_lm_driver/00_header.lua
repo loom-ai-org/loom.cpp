@@ -23,10 +23,14 @@
 -- samples, which every leaf's encoder contract requires), and three optional ones: audio_samples,
 -- max_new_tokens and eos_token (negative disables the early stop).
 --
--- `audio_samples` is how many samples the caller's REAL audio was, before it padded. The padding is
--- audio as far as the encoder is concerned -- it emits embedding rows for it -- and those rows are not
--- speech, so the prompt is trimmed to the rows the real length produces and the rest never reach the
--- language model. Omitting it means "the whole waveform is real", which is exactly what a caller whose
+-- `audio_samples` is how many samples the caller's REAL audio was, before it padded, and it is what
+-- keeps the padding out of the answer entirely. The encoder is given it, so its attention never reads
+-- the padding, its convolutions never mix it into a real frame and its projector never sees it in a
+-- window; the prompt is then trimmed to the rows the real length produces, so the rest never reach the
+-- language model either. This driver also repairs the head of the padding first: the frontend's own
+-- STFT reflects the signal at its end, and a caller's zeros are not that reflection.
+--
+-- Omitting `audio_samples` means "the whole waveform is real", which is exactly what a caller whose
 -- audio already filled its last chunk should say.
 --
 -- The prompt is built here, not passed in: it comes from the checkpoint's own chat template, rendered

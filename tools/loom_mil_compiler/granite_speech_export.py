@@ -34,8 +34,8 @@ from .spec_protocol import Unchecked
 
 
 class ConformerQFormerEncoder(nn.Module):
-    """`waveform -> projected audio embeddings`: the mel frontend, the 160-bin feature stacking, the
-    conformer stack and the Q-Former projector, as one traced phase.
+    """`(waveform, valid_samples) -> projected audio embeddings`: the mel frontend, the 160-bin feature
+    stacking, the conformer stack and the Q-Former projector, as one traced phase.
 
     **The rewrite is of two `math.ceil`s, and nothing else.** Both halves of this checkpoint pad a
     dynamic sequence up to a block boundary with Python-level arithmetic that `torch.jit.trace` bakes
@@ -61,15 +61,29 @@ class ConformerQFormerEncoder(nn.Module):
     chunk here is `lcm(context_size, window_size)` encoder frames -- 600, i.e. 1200 mel frames, i.e.
     **192000 samples / 12 s** -- because the conformer's blocks and the Q-Former's windows must BOTH
     divide the sequence. That is coarse compared with Qwen3-ASR's one second, and it is a property of
-    this checkpoint's two block sizes rather than of the family. The cost is Qwen3-ASR's, scaled by
-    twelve: up to twelve seconds of trailing silence become real audio embeddings -- up to **120 junk
-    rows** against that leaf's 13. `audio_rows` below is what keeps them out of the prompt, given a
-    caller that says how long its real audio was (BACKLOG.md P4.3d).
+    this checkpoint's two block sizes rather than of the family.
 
-    **The rows that DO reach the prompt are still not HF's**, and that is a separate, larger gap
-    (P4.3e): HF crops back to the real frame count after every attention block and masks its final
-    partial block, where this runs the whole padded sequence unmasked. Measured at max 3.9e-01 on a
-    reference whose absmax is 0.992, with no effect on the greedy transcript.
+    **`valid_samples` is what makes that padding cost nothing** (BACKLOG.md P4.3e). Up to twelve
+    seconds of the waveform can be a host's zero padding, and HF never lets it near an output: it runs
+    the conformer at the real frame count and pads only inside each attention block, masking that
+    block's tail and cropping back afterwards. Three places here have to say the same thing, and the
+    interesting part is that they are three different statements rather than one:
+
+    * **attention** -- the padded frames are masked as KEYS, which is HF's `masked_fill_` of the final
+      block generalized to a tail that may span whole blocks. HF's own `-finfo.max` rather than `-inf`,
+      for HF's reason and one more: a wholly padded block would otherwise softmax a row of `-inf` into
+      NaN, and a NaN cannot be masked back out downstream.
+    * **the conv module** -- zeroed AFTER the GLU rather than on the block's input, because `up_conv`
+      carries a bias and a zero frame is not a zero activation. That is the exact point where HF's
+      sequence ends and `depth_conv`'s own `F.pad` supplies zeros, so this is not an approximation of
+      the crop, it is the crop.
+    * **the projector** -- zeroed again before the windows are cut, which is HF's `nn.functional.pad`
+      of the final partial window.
+
+    Nothing masks the QUERY rows, and nothing needs to: a padded row's output reaches no real row --
+    attention will not read it, the conv zeroes it, the projector zeroes it -- and `audio_rows` stops
+    the prompt before it. Measured against HF on 11 s of audio in a 12 s chunk: 1.7e-01 before,
+    **4.8e-07** after, on rows whose absmax is 0.971.
 
     The contract also makes the checkpoint's own feature extractor an exact oracle, because its
     "drop the final mel frame if the count is odd" fires on exactly the frame `LogMelFrontend` already
@@ -88,13 +102,18 @@ class ConformerQFormerEncoder(nn.Module):
         self.input_dim = int(config.input_dim)
         self.window_size = int(projector.window_size)
         self.num_queries = int(projector.num_queries)
+        # HF's own masked-attention fill. Finite rather than `-inf` -- see the class docstring.
+        self.mask_value = float(-torch.finfo(torch.float32).max)
 
-    def _attention(self, attn, hidden):
-        """`GraniteSpeechConformerAttention.forward` with the block count kept dynamic.
+    def _attention(self, attn, hidden, key_mask):
+        """`GraniteSpeechConformerAttention.forward` with the block count kept dynamic and the padded
+        frames masked out as keys.
 
         `hidden` is `(1, N, hidden_dim)` with `N` a multiple of `context_size`, so HF's `remainder` is
-        zero: its right-pad and its `masked_fill_` of the final block are both dead, and `num_blocks`
-        is whatever `reshape(-1, ...)` infers.
+        zero: its right-pad is dead and `num_blocks` is whatever `reshape(-1, ...)` infers. Its
+        `masked_fill_` of the final block is NOT dead -- it is `key_mask`, whose `(n_blocks, 1, 1,
+        block)` shape adds the same value to every query row of a block, which is what HF's
+        `mask[:remainder, :remainder] = 0` does to the rows that survive its crop.
         """
         block, heads, dim = self.context_size, self.num_heads, self.dim_head
         x = attn.pre_norm(hidden)
@@ -120,21 +139,40 @@ class ConformerQFormerEncoder(nn.Module):
         q = query_blocks.permute(0, 2, 1, 3)
         k = key_blocks.permute(0, 2, 1, 3)
         v = value_blocks.permute(0, 2, 1, 3)
-        scores = torch.matmul(q, k.transpose(2, 3)) * attn.scale + pos_attn
+        scores = torch.matmul(q, k.transpose(2, 3)) * attn.scale + pos_attn + key_mask
         out = torch.matmul(F.softmax(scores, dim=-1), v)
         out = out.permute(0, 2, 1, 3).reshape(1, -1, heads * dim)
         return attn.to_out(out)
 
-    def _conformer(self, features):
-        """`GraniteSpeechCTCEncoder.forward`, with only the attention swapped out. The mid-stack
-        self-conditioning (`out` -> softmax -> `out_mid`, added back at the half-way layer) is the
-        checkpoint's own and traces as written."""
+    def _conv(self, conv, hidden, frame_mask):
+        """`GraniteSpeechConformerConvModule.forward` with the padded frames zeroed where HF's sequence
+        would simply have ended.
+
+        The zeroing is between the GLU and the depthwise convolution, and that position is the whole
+        content of this override: `up_conv` has a bias, so zeroing `hidden` would leave a constant
+        rather than nothing, and every layer after `depth_conv` is pointwise. Zero there and
+        `depth_conv` sees the same neighbourhood HF's `F.pad` gives it -- a real frame's window past
+        the end is zeros in both.
+        """
+        x = conv.norm(hidden)
+        x = conv.up_conv(x.permute(0, 2, 1))
+        x = conv.glu(x)
+        x = x * frame_mask
+        x = conv.depth_conv(x)
+        x = conv.silu(conv.batch_norm(x))
+        return conv.down_conv(x).permute(0, 2, 1)
+
+    def _conformer(self, features, key_mask, frame_mask):
+        """`GraniteSpeechCTCEncoder.forward`, with the attention and the conv module swapped out. The
+        mid-stack self-conditioning (`out` -> softmax -> `out_mid`, added back at the half-way layer) is
+        the checkpoint's own and traces as written -- it is pointwise, so the padding cannot travel
+        through it."""
         encoder = self.encoder
         hidden = encoder.input_linear(features)
         for idx, layer in enumerate(encoder.layers, start=1):
             hidden = 0.5 * layer.ff1(hidden) + hidden
-            hidden = self._attention(layer.attn, hidden) + hidden
-            hidden = layer.conv(hidden) + hidden
+            hidden = self._attention(layer.attn, hidden, key_mask) + hidden
+            hidden = self._conv(layer.conv, hidden, frame_mask) + hidden
             hidden = 0.5 * layer.ff2(hidden) + hidden
             hidden = layer.post_norm(hidden)
             if idx == encoder.num_layers // 2:
@@ -175,13 +213,28 @@ class ConformerQFormerEncoder(nn.Module):
             hidden_states = layer.feed_forward_chunk_query(hidden_states)
         return projector.linear(hidden_states.reshape(-1, width))
 
-    def forward(self, waveform):
+    def forward(self, waveform, valid_samples):
         mel = self.mel(waveform)
         # The extractor's own layout: mel frames on the time axis, then consecutive PAIRS of frames
         # stacked into one 160-bin encoder frame. That halving is why one encoder frame is two mel
         # frames everywhere in this file's arithmetic.
         features = mel.transpose(1, 2).reshape(1, -1, self.input_dim)
-        return self._project(self._conformer(features))
+
+        # `GraniteSpeechFeatureExtractor`'s own frame arithmetic, in graph: `L // hop + 1` mel frames,
+        # the last dropped when that count is odd, then two mel frames per encoder frame. The drop and
+        # the halving compose into a single floor, because `(2k + 1) // 2` and `2k // 2` are both `k`.
+        # Float division, and exactly so: a sample count is far inside f32's exact-integer range, and
+        # an exactly-representable quotient is exactly what IEEE division returns.
+        valid_frames = torch.floor((torch.floor(valid_samples.reshape(1, 1) / self.mel.hop_length)
+                                    + 1.0) / 2.0)
+        position = torch.arange(features.shape[1], dtype=features.dtype, device=features.device)
+        keep = (position.unsqueeze(0) < valid_frames).to(features.dtype)          # (1, N)
+
+        # One value per key position, laid out so it adds to `(n_blocks, heads, block, block)` scores
+        # over the KEY axis. The leading `-1` is the block count, which is what keeps this dynamic.
+        key_mask = (1.0 - keep).reshape(-1, 1, 1, self.context_size) * self.mask_value
+        hidden = self._conformer(features, key_mask, keep.reshape(1, 1, -1))
+        return self._project(hidden * keep.reshape(1, -1, 1))
 
 
 class _ScaledLMHead(nn.Module):
@@ -335,9 +388,11 @@ class ASRGraniteSpeechExportConfig(BaseSpeechLMExportConfig):
         lengths shorter than one hop: identical at all of them. That matters because this number
         decides where every later prompt position sits, and a wrong one is a silently mis-placed prompt
         rather than an error -- the engine only catches it if it exceeds what the encoder retained.
+        `phases()` re-checks it against `audio_geometry` at whole chunks on every export.
 
-        The saving is large here, unlike the first leaf's: a chunk is twelve seconds, so a 13 s clip
-        pads to 24 s and 108 of its 240 audio rows are the encoder's reading of silence.
+        The saving is large here: a chunk is twelve seconds, so a 13 s clip pads to 24 s and 108 of its
+        240 audio rows are past the real audio -- rows the encoder now computes from masked keys and
+        zeroed frames, which is a stronger reason to stop before them than "they are silence" was.
         """
         from .driver_ir import BinOp, Lit
 

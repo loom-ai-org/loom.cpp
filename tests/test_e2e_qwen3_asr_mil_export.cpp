@@ -2,7 +2,7 @@
 // qwen3_asr_export.py, BACKLOG.md P4.3) against HF's own `Qwen3ASRForConditionalGeneration`.
 //
 // **This is family 3's gate** -- the audio-encoder + projector + causal-LM composition, the largest
-// group on EXPORT-ROADMAP.md's R5 table (~19 converters, ~36 models). Two checks, in the order that
+// group on EXPORT-ROADMAP.md's R5 table (~19 converters, ~36 models). Three checks, in the order that
 // makes a failure readable:
 //
 //   1. the `encoder` topology's output -- the mel frontend, the chunked conv stem, the window-attention
@@ -13,16 +13,26 @@
 //   2. the whole embedded Lua driver -- encoder once, the prompt fed to the KV cache as text/audio/text
 //      segments, then the decode loop -- against HF's greedy token sequence. Integer equality, no
 //      tolerance: both are deterministic argmax.
+//   3. `audio_samples`: that omitting it means "all of it", and that supplying a different one changes
+//      the answer.
 //
 // **Check 2 is what proves the composition mechanism**, and specifically that feeding a prompt as N
-// successive cached calls is identical to feeding it concatenated: 143 of this prompt's 158 positions
-// are audio embeddings the LM never produced, written into the cache by their own call at `n_past = 9`.
-// If that equivalence did not hold, the first generated token would already differ.
+// successive cached calls is identical to feeding it concatenated: nearly every one of this prompt's
+// positions is an audio embedding the LM never produced, written into the cache by its own call at
+// `n_past = 9`. If that equivalence did not hold, the first generated token would already differ.
+//
+// **The fixture's audio deliberately does not fill its last chunk** (BACKLOG.md P4.3e). HF is run on
+// the real audio and this test hands the driver the padded waveform plus the real length, so what is
+// being compared is that the exported encoder produces HF's rows for a chunk it only partly fills --
+// which is the case the family's contract creates and the one nothing checked before. An encoder
+// without that handling still exports, still runs and still transcribes plausibly; it is simply out by
+// 1.0e-01 on rows whose absmax is 0.128, which is the sort of wrongness only a tensor oracle on a
+// partial chunk can see.
 //
 // **Nothing here names a per-model C++ struct.** How long a waveform to hand over comes from the GGUF's
 // own `loom.samples_per_chunk`, whether a topology needs a cache is `GraphTopology::uses_kv_cache()`'s
 // answer, and how big to make it is `make_kv_cache(*model)`'s. The driver supplies its own prompt and
-// its own stop tokens, so this test passes a waveform and nothing else.
+// its own stop tokens, so this test passes a waveform and a length.
 //
 // Not generated at ctest time (needs the real checkpoint + coremltools + transformers >= 5.13) -- skips
 // cleanly if the fixture isn't present. To (re)generate:
@@ -110,12 +120,19 @@ int main() {
         return kSkipReturnCode;
     }
 
-    std::vector<int64_t> wav_shape, audio_shape, gen_shape, prompt_shape;
+    std::vector<int64_t> wav_shape, enc_shape, audio_shape, gen_shape, prompt_shape, valid_shape;
     const std::vector<float> waveform = read_npy<float>(ref_dir + "/ref_asr_waveform.npy", wav_shape);
+    // What the DRIVER hands the encoder: the same waveform with the frontend's own STFT reflection
+    // written over the head of the caller's zero padding (BACKLOG.md P4.3e). Check 1 drives that
+    // topology directly, so it needs the driver's input rather than the host's.
+    const std::vector<float> encoder_in = read_npy<float>(ref_dir + "/ref_asr_encoder_in.npy", enc_shape);
     const std::vector<float> expected_audio = read_npy<float>(ref_dir + "/ref_asr_audio.npy", audio_shape);
     const std::vector<int32_t> expected = read_npy<int32_t>(ref_dir + "/ref_asr_generated.npy", gen_shape);
     const std::vector<int32_t> prompt_len =
         read_npy<int32_t>(ref_dir + "/ref_asr_prompt_len.npy", prompt_shape);
+    const std::vector<int32_t> valid = read_npy<int32_t>(ref_dir + "/ref_asr_valid.npy", valid_shape);
+    LOOM_CHECK(!valid.empty());
+    const auto valid_samples = static_cast<size_t>(valid[0]);
 
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     LOOM_CHECK(backend != nullptr);
@@ -128,16 +145,20 @@ int main() {
     const uint32_t frames_per_chunk = model->hparam_u32("frames_per_chunk");
     LOOM_CHECK(samples_per_chunk > 0 && frames_per_chunk > 0);
     LOOM_CHECK(waveform.size() % samples_per_chunk == 0);
+    LOOM_CHECK(encoder_in.size() == waveform.size());
     const size_t n_chunks = waveform.size() / samples_per_chunk;
+    const size_t hf_rows = static_cast<size_t>(audio_shape[0]);
     std::fprintf(stderr,
                  "loom.samples_per_chunk = %u, loom.frames_per_chunk = %u, fixture waveform = %zu "
-                 "(%zu chunks -> %zu audio rows)\n",
-                 samples_per_chunk, frames_per_chunk, waveform.size(), n_chunks,
-                 n_chunks * frames_per_chunk);
-    // The audio segment's length as the DRIVER computes it, against what HF actually produced. A
-    // mismatch here would place every later prompt position at the wrong `n_past` with no shape error
-    // to reveal it, which is exactly why the two numbers are published as hparams.
-    LOOM_CHECK(static_cast<size_t>(audio_shape[0]) == n_chunks * frames_per_chunk);
+                 "(%zu real samples in %zu chunks -> %zu padded rows, %zu of them real)\n",
+                 samples_per_chunk, frames_per_chunk, waveform.size(), valid_samples, n_chunks,
+                 n_chunks * frames_per_chunk, hf_rows);
+    // **The fixture must land mid-chunk or this file checks nothing it is here to check** (BACKLOG.md
+    // P4.3e). HF is run on the real audio and produces fewer rows than the padded waveform's own count;
+    // an equality here would mean the generator was handed a whole number of chunks, and every
+    // comparison below would pass without ever exercising the padding.
+    LOOM_CHECK(valid_samples > 0 && valid_samples < waveform.size());
+    LOOM_CHECK(hf_rows < n_chunks * frames_per_chunk);
 
     // --- 1. the encoder half, on its own: a tensor oracle, not a token oracle ---
     {
@@ -145,15 +166,24 @@ int main() {
         LOOM_CHECK(!topo.uses_kv_cache());
         loom::GraphBuilder builder(topo, *model, backend.get(), /*kv_cache=*/nullptr);
         const loom::GraphBuilder::BuildResult& result = builder.build(
-            {{"n_samples", static_cast<uint32_t>(waveform.size())}, {"n_past", 0}});
+            {{"n_samples", static_cast<uint32_t>(encoder_in.size())}, {"n_past", 0}});
 
         ggml_tensor* waveform_t = result.input_tensors.at("waveform");
-        ggml_backend_tensor_set(waveform_t, waveform.data(), 0, waveform.size() * sizeof(float));
+        ggml_backend_tensor_set(waveform_t, encoder_in.data(), 0, encoder_in.size() * sizeof(float));
+        // Where the real audio stops. Without it the encoder would read its own padding as speech --
+        // 1.0e-01 out on rows whose absmax is 0.128, which is what this input exists to remove.
+        ggml_tensor* valid_t = result.input_tensors.at("valid_samples");
+        const float valid_f = static_cast<float>(valid_samples);
+        ggml_backend_tensor_set(valid_t, &valid_f, 0, sizeof(float));
         ggml_backend_graph_compute(backend.get(), result.graph);
 
-        // HF returns (n_rows, hidden); the exported topology's ne is [hidden, n_rows] -- same memory.
-        LOOM_CHECK(expected_audio.size() ==
-                   static_cast<size_t>(result.output->ne[0]) * static_cast<size_t>(result.output->ne[1]));
+        // HF returns (n_rows, hidden) for the REAL audio; the exported topology's ne is
+        // [hidden, padded_rows] -- same memory and the same rows, so HF's are its leading prefix.
+        const auto hidden = static_cast<size_t>(result.output->ne[0]);
+        LOOM_CHECK(static_cast<size_t>(result.output->ne[1]) == n_chunks * frames_per_chunk);
+        LOOM_CHECK(expected_audio.size() == hidden * hf_rows);
+        // A byte prefix, because the rows are contiguous and HF's are the leading ones -- the padded
+        // rows past `hf_rows` are read by nothing, here or in the driver.
         std::vector<float> actual(expected_audio.size());
         ggml_backend_tensor_get(result.output, actual.data(), 0, actual.size() * sizeof(float));
 
@@ -175,8 +205,9 @@ int main() {
                      static_cast<double>(max_abs_diff / ref_absmax));
         // Relative to the reference's own scale, as the Whisper gate is and for the same reason: a
         // fixed epsilon would be a statement about this checkpoint's dynamic range. The rewrite is
-        // bit-identical to HF's eager path in torch (see speech_lm_export.WindowedAudioEncoder), so
-        // everything left here is f32 accumulation order across 18 layers.
+        // bit-identical to HF's eager path in torch -- on a PARTIALLY FILLED chunk too, since P4.3e
+        // (see qwen3_asr_export.WindowedAudioEncoder) -- so everything left here is f32 accumulation
+        // order across 18 layers.
         LOOM_CHECK(max_abs_diff < 2e-3f * ref_absmax);
         LOOM_CHECK(mean_abs_diff < 1e-3);
     }
@@ -205,11 +236,14 @@ int main() {
         bridge.load_script(model->kv_str("model.driver_script"));
 
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
-        // **The test passes a waveform and a length cap, and nothing else.** No prompt, no eos: the
-        // driver carries the checkpoint's own chat-template prefix/suffix and its own two stop tokens,
-        // which is the whole point of `prompt_segment_constants`.
+        // **The test passes a waveform, how much of it is real, and a length cap.** No prompt, no eos:
+        // the driver carries the checkpoint's own chat-template prefix/suffix and its own two stop
+        // tokens, which is the whole point of `prompt_segment_constants`. `waveform` is the HOST's
+        // array -- zero-padded, no mirror -- so this exercises the driver's own edge repair rather
+        // than check 1's precomputed copy of it.
         std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
             {"waveform", waveform_d},
+            {"audio_samples", static_cast<double>(valid_samples)},
             {"max_new_tokens", static_cast<double>(expected.size())},
         };
         // Held in a named local before unpacking: `call` returns by value, so binding a reference
@@ -233,6 +267,63 @@ int main() {
         for (size_t i = 0; i < generated.size(); ++i) {
             LOOM_CHECK(generated[i] == expected[i]);
         }
+    }
+
+    // --- 3. `audio_samples` is optional, and it is not ignored ---
+    //
+    // Two properties, and neither is checked by check 2 above. The first is that omitting it means
+    // "all of it" -- the driver's `inputs.audio_samples or #inputs.waveform`, which is what a host
+    // whose audio already filled its last chunk relies on. The second is that a different value
+    // produces a different answer: a driver that accepted the argument and dropped it would pass
+    // check 2 as long as the fixture's own length happened to be the default.
+    {
+        loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        loom::GraphTopology embed_topo = loom::GraphTopology::parse(model->topology_json("embed"));
+        loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
+        loom::GraphTopology head_topo = loom::GraphTopology::parse(model->topology_json("lm_head"));
+        std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
+
+        loom::LoomLuaBridge bridge(backend.get());
+        bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("embed", *model, std::move(embed_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
+        bridge.register_module("lm_head", *model, std::move(head_topo), /*kv_cache=*/nullptr);
+        bridge.load_script(model->kv_str("model.driver_script"));
+
+        const std::vector<double> waveform_d(waveform.begin(), waveform.end());
+        auto run_with = [&](double declared) {
+            std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+                {"waveform", waveform_d},
+                {"max_new_tokens", static_cast<double>(expected.size())},
+            };
+            if (declared > 0.0) args["audio_samples"] = declared;
+            const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
+            const auto& out = std::get<std::vector<double>>(result);
+            std::vector<int32_t> ids;
+            ids.reserve(out.size());
+            for (double v : out) ids.push_back(static_cast<int32_t>(v));
+            return ids;
+        };
+
+        const std::vector<int32_t> omitted = run_with(-1.0);
+        const std::vector<int32_t> whole = run_with(static_cast<double>(waveform.size()));
+        std::fprintf(stderr, "audio_samples omitted: %zu tokens; = %zu (the whole waveform): %zu\n",
+                     omitted.size(), waveform.size(), whole.size());
+        LOOM_CHECK(omitted.size() == whole.size());
+        for (size_t i = 0; i < omitted.size(); ++i) LOOM_CHECK(omitted[i] == whole[i]);
+
+        // Two seconds of an eleven-second clip. The transcript cannot still be the whole utterance,
+        // and a driver that ignored `audio_samples` would return check 2's sequence here.
+        const std::vector<int32_t> clipped = run_with(2.0 * samples_per_chunk);
+        std::fprintf(stderr, "audio_samples = %u (2 chunks of the %zu): %zu tokens: ",
+                     2 * samples_per_chunk, n_chunks, clipped.size());
+        for (int32_t t : clipped) std::fprintf(stderr, "%d ", t);
+        std::fprintf(stderr, "\n");
+        bool differs = clipped.size() != expected.size();
+        for (size_t i = 0; i < clipped.size() && i < expected.size() && !differs; ++i) {
+            differs = clipped[i] != expected[i];
+        }
+        LOOM_CHECK(differs);
     }
 
     std::fprintf(stderr, "test_e2e_qwen3_asr_mil_export: OK\n");

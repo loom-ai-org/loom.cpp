@@ -131,6 +131,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, SubgraphCallComponent,
+        WaveformValidLength,
     )
     from .lua_library import LuaLibrary
 
@@ -166,6 +167,13 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "`infer` alone. Whisper is not in that caveat: its family declares this component "
             "outright, with `bound` supplying the encoder's output to every step, which is what makes "
             "the same loop a cross-attention decode loop (BACKLOG.md P4.1).",
+        ),
+        ComponentEntry(
+            "waveform_valid_length", WaveformValidLength, (STATEMENTS,),
+            "Binds how many of a chunk-padded waveform's samples are real audio, and mirrors the "
+            "frontend's own `torch.stft(center=True)` reflection over the head of the caller's zero "
+            "padding -- so the mel frames that straddle the real end are the ones the checkpoint's "
+            "extractor computed, not frames that ran into silence (BACKLOG.md P4.3e).",
         ),
         ComponentEntry(
             "prompt_segments", PromptSegments, (STATEMENTS,),
