@@ -58,7 +58,46 @@ def oklch_to_hex(lightness_pct: float, chroma: float, hue_deg: float) -> str:
     return "#{:02x}{:02x}{:02x}".format(*(gamma(c) for c in linear))
 
 
-def mark(threads, ground, stroke, title: str) -> str:
+# --- the README header's optical compensation ------------------------------------------------------
+#
+# `logo-inline*.svg` is the same mark in a taller box, and the extra space is not decoration.
+#
+# GitHub strips `style` from markdown (verified: it replaces the attribute with its own
+# `max-width:100%`), so the only vertical-alignment lever left on an inline image is the legacy
+# `align="middle"`. That aligns the image's box centre with `baseline + x-height/2` -- the x-height,
+# not the cap-height -- so beside a heading whose visual centre is `baseline + cap-height/2` the mark
+# hangs low by `(cap - x) / 2`. At the mark's full size the drop is plainly visible.
+#
+# Padding the box BELOW the mark raises the mark within it by half the padding, which cancels exactly.
+# The arithmetic, with the image rendered `WIDTH_PX` wide beside a `FONT_PX` heading:
+#
+#     mark centre sits above box centre by   WIDTH_PX * (vb_height - 84) / 168
+#     it needs to sit above it by            (cap - x) / 2
+#     so                                     vb_height = 84 + 84 * (cap - x) / WIDTH_PX
+#
+# **`DROP_PX` is measured, not derived, and the difference matters.** The obvious model says the drop
+# is `(cap - x) / 2`, about 2.8px for a 32px heading -- and correcting by that much fixed only a third
+# of it. The rest comes from the `<picture>` wrapper the dark-mode switch requires: `align="middle"`
+# positions the `<img>` inside its parent inline box, and the *picture* then sits on the text baseline
+# itself, so the real drop is larger than any font metric predicts. Rather than model that, it was
+# measured: render the header, find the mark's and the wordmark's ink centres, and read off the gap.
+#
+# 9px at `WIDTH_PX = 52`, confirmed by sweeping the box height (84 -> +9.0px, 100 -> +4.0, 108 -> +2.0,
+# 113 -> 0.0, 118 -> -2.0), which is also what makes the linear relationship above trustworthy: the
+# measured points sit on it.
+#
+# **This variant exists so that `logo.svg` does not have to.** A compensation for one consumer's
+# typography does not belong in the mark itself, which is used at other sizes and in other places.
+WIDTH_PX = 52.0       # what the READMEs set on the header image
+DROP_PX = 9.0         # how far the mark hangs below the wordmark without compensation
+
+
+def inline_box_height() -> float:
+    """The taller viewBox that puts the mark's optical centre on the heading's."""
+    return 84.0 + 168.0 * DROP_PX / WIDTH_PX
+
+
+def mark(threads, ground, stroke, title: str, box_height: float = 84.0) -> str:
     """The icon: a rounded square with three vertical warp threads across it.
 
     `strip = 15, gap = 8, start = 12` puts the threads at x = 12, 35, 58 and gives each a height of
@@ -74,8 +113,8 @@ def mark(threads, ground, stroke, title: str) -> str:
         for x, colour in zip(positions, threads)
     )
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="84" height="84" viewBox="0 0 84 84" '
-        f'role="img" aria-label="{title}">\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="84" height="{box_height:g}" '
+        f'viewBox="0 0 84 {box_height:g}" role="img" aria-label="{title}">\n'
         f'  <title>{title}</title>\n'
         f'  <rect x="2" y="2" width="80" height="80" rx="16" fill="{ground}" '
         f'stroke="{stroke_attr}" stroke-width="2"/>\n'
@@ -105,6 +144,17 @@ def main() -> None:
     dark = mark(threads=threads, ground=oklch_to_hex(*DARK_GROUND), stroke=None, title="loom.cpp")
     (HERE / "logo.svg").write_text(colour)
     (HERE / "logo-dark.svg").write_text(dark)
+
+    # The same two marks in the taller box the README header needs -- see `inline_box_height`.
+    box = inline_box_height()
+    (HERE / "logo-inline.svg").write_text(
+        mark(threads=threads, ground=oklch_to_hex(*CREAM), stroke=oklch_to_hex(*INK),
+             title="loom.cpp", box_height=box))
+    (HERE / "logo-inline-dark.svg").write_text(
+        mark(threads=threads, ground=oklch_to_hex(*DARK_GROUND), stroke=None,
+             title="loom.cpp", box_height=box))
+    print(f"  inline box  84 x {box:.1f} units "
+          f"({box - 84:.1f} of bottom padding, cancelling the align=middle drop)")
     for name, spec in (("rust", RUST), ("ochre", OCHRE), ("indigo", INDIGO),
                        ("cream", CREAM), ("ink", INK), ("dark ground", DARK_GROUND)):
         print(f"  {name:12} oklch({spec[0]}% {spec[1]} {spec[2]})  ->  {oklch_to_hex(*spec)}")

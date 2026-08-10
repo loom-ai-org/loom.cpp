@@ -1,7 +1,7 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo.svg" alt="" width="52" align="middle">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-inline-dark.svg">
+    <img src="assets/logo-inline.svg" alt="" width="52" align="middle">
   </picture>
   &nbsp;loom.cpp
 </h1>
