@@ -454,6 +454,26 @@ add_test(NAME test_byte_vocab COMMAND test_byte_vocab)
 set_tests_properties(test_byte_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_byte_vocab PROPERTIES FIXTURES_REQUIRED byte_vocab_gguf_fixture)
 
+# --- SupertonicTTS grapheme front-end (SupertonicTextVectorizer), synthetic printable-ASCII fixtures.
+#     The real-asset parity check is gate/test_supertonic_text_vectorizer.cpp; this covers what does NOT
+#     need that checkout -- the inverse map, the derived vocab size, the default-language KV. It also
+#     reads byte_vocab_test.gguf, to check the tag dispatch declines a file that isn't its own. ---
+add_test(
+    NAME gen_supertonic_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_supertonic_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/supertonic_vocab_test.gguf
+            ${LOOM_FIXTURE_DIR}/supertonic_vocab_noninjective.gguf
+)
+set_tests_properties(gen_supertonic_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_supertonic_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP supertonic_vocab_gguf_fixture)
+
+add_executable(test_supertonic_vocab ci/test_supertonic_vocab.cpp)
+target_link_libraries(test_supertonic_vocab PRIVATE loom::engine)
+target_compile_definitions(test_supertonic_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_supertonic_vocab COMMAND test_supertonic_vocab)
+set_tests_properties(test_supertonic_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_supertonic_vocab PROPERTIES FIXTURES_REQUIRED "supertonic_vocab_gguf_fixture;byte_vocab_gguf_fixture")
+
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
 #     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---
 set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)
