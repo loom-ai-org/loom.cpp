@@ -31,8 +31,38 @@ the piper-phonemize fork are GPL-3, incompatible with this repo's permissive lic
 `[[loom_engine_licensing_phonemizer]]` memory). Current plan: integrate **phoonnx** (a friend-of-the-user's
 project) instead, once its license/API are confirmed — not yet investigated. A `src/text/phonemize.cpp` +
 `include/loom/text/phonemize.h` split matching this project's existing driver-code conventions is the
-intended shape. SupertonicTTS is the one model in this family that's already fully closed — its
-`TextVectorizer` is a license-free unicode codepoint lookup table, no phonemizer needed at all.
+intended shape. SupertonicTTS is the one model in this family that needs no phonemizer at all — its
+`TextVectorizer` is a license-free unicode codepoint lookup table.
+
+**Corrected 2026-08-11:** that entry used to call Supertonic "fully closed", which was true of the engine
+and false of everything a user touches. `loom::SupertonicTextVectorizer` existed and was gate-verified,
+but nothing was wired to it: the MIL export never wrote the KVs, and neither `loom_cli` nor loom-py
+dispatched on the tag. Now done end to end — the export carries `tokenizer.ggml.supertonic.*`, both hosts
+read it, and `model.tokenize("hello world")` returns the same ids the real Python `TextVectorizer` does.
+The export is otherwise byte-identical (snapshot diff: three added KVs, every topology, the driver and all
+683 tensors unchanged).
+
+### Supertonic's fixed text length makes its tokenizer near-unusable for synthesis
+
+Found while wiring the above, and NOT fixed. `T_TEXT_FIXED = 10` (`supertonic_export.py`), so `infer`
+takes exactly 10 `txt_ids` — and `<en>` + the pipeline's inserted final period + `</en>` is 10 ids for the
+EMPTY string. Every real sentence overflows: `"hello world"` encodes to 21. So the vocabulary now in the
+file is good for encoding and inspection, and synthesis still effectively takes ids directly. Shipped as a
+"Known limitations" section on the model card rather than silently.
+
+**Scoped as P4.6** (Exporter section, scheduled before P5), which is where the plan, the gates and the
+correction live — in particular that raising the constant *alone* is a trap, because this export builds
+`txt_msk` as all-ones and padding would therefore be attended to as real text.
+
+### Grapheme text front-ends: the shape to generalize to
+
+`src/core/supertonic_text_vectorizer.cpp` is per-MODEL C++ in an engine whose rule is that per-model
+complexity belongs in the exporter. It is kept because it is written and verified, but a SECOND grapheme
+TTS model must not add a second class. The split that generalizes: the codepoint table is data and already
+lives in the GGUF; the normalization pipeline (emoji ranges, the replacement table, the `<lang>` wrap) is
+per-model and belongs in exporter-emitted data or driver Lua. Worth doing when there is a real second data
+point to generalize against — Qwen3-TTS is not one, since it has a real HF tokenizer and needs only
+`tokenizer_dir` set in its export config, no new C++ at all.
 
 ---
 
@@ -3295,6 +3325,91 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   first"; the pass now exists, `infer_with_past` exists, and `whisper_driver.lua` has been doing exactly
   this orchestration by hand since the Lua port (`KV-CACHE.md` §1.2). P4.1's decomposition is now the
   *reuse* of a solved shape, not a blocked one.
+- **P4.6 — Supertonic takes real text: a padded text axis and a real `txt_msk`.** Scheduled *before P5*
+  by explicit user direction. Scoped 2026-08-11, not started.
+
+  **Why.** The export now carries its own grapheme vocabulary (see the Models section) and
+  `model.tokenize("hello world")` returns the same ids the real Python `TextVectorizer` does. It still
+  cannot drive synthesis: `T_TEXT_FIXED = 10`, and `<en>` + the pipeline's inserted final period +
+  `</en>` is *exactly 10 ids for the empty string*. `"hello world"` is 21. So the vocabulary in the file
+  is good for encoding and inspection, and synthesis effectively still takes ids directly.
+
+  **Why raising the constant alone is a trap, and the reason it was not one before.** This export fakes
+  the mask: `_ones_mask_from_ids` / `_ones_mask_from_float` (`supertonic_export.py`) build all-ones
+  regardless of content. The real modules *use* that mask for real work — `x = x * txt_msk` and
+  `attn_mask = txt_msk.unsqueeze(2) * txt_msk.unsqueeze(-1)`
+  (`text_to_latent_encoding/encoders.py:144-164`), and `txt_len = txt_msk.sum(dim=[1,2])` to recover the
+  true length for fractional RoPE (`vector_field_estimator.py:152`). At `T = 10` with ten real ids
+  all-ones is genuinely correct, which is why the simplification was sound and not a latent bug. At
+  `T = N` with `n < N` real ids it is wrong twice over: the model attends to `N - n` padding characters
+  and recovers a text length of `N`. **Raising the number without threading the mask produces a
+  longer, more usable-looking input and quietly wrong audio** — worse than the current honest refusal.
+
+  **Two steps, and the first needs no new ground truth.**
+
+  1. **Thread `txt_msk` as a real traced input, keeping `T_TEXT_FIXED = 10`.** The three wrappers stop
+     synthesizing it and take it as a forward argument — which the real modules already accept, so this
+     is un-faking an input rather than inventing one — and each phase declares one more
+     `ct.TensorType(name="txt_msk", shape=(1, 1, T_TEXT))`. The driver builds it as a Lua table of ones
+     and passes it like any other array input; **no new binding is needed**, since `sample_vfe` already
+     builds `z` with `loom.gaussian_array` and passes `t = { t }` as a literal table.
+
+     **Gate: byte-identity, against every reference that already exists.** All-ones computes exactly
+     what the graph computes today, so the four per-topology `.bin` comparisons
+     (`test_e2e_supertonic_mil_{dp,ttl_text,vfe,decoder}.cpp`) and the frozen waveform
+     (`legacy_driver_reference/supertonic_driver_waveform_F1.npy`, ids `{12,45,67,23,89,34,56,78,90,15}`,
+     style F1, n_steps 10, seed 42) must all still hold *unchanged*. A step that changes the interface
+     and provably not the numbers.
+
+  2. **Raise `T_TEXT_FIXED` to N; pad and mask.** The host pads `txt_ids` to N, the driver builds a mask
+     of `n` ones and `N - n` zeros. Where `n` comes from is the one design choice, resolved per
+     [[feedback_optional_arg_then_autodetect]]: an explicit input, or inferred from a pad sentinel —
+     **id 162 is the real embedding's unused spare row**, the one id no codepoint maps to
+     (`SupertonicTextVectorizer::n_tokens()` is 162 against an `nn.Embedding` of 163), so it is
+     unambiguous as a pad marker in a way id 0 (space) is not.
+
+     **Gate: the frozen fixture becomes the test of the new capability rather than a casualty of it.**
+     Export at N, feed the *same ten ids* padded to N with a ten-ones mask, require the same waveform to
+     1e-3. That asks the question that actually matters — **is padding inert** — against ground truth
+     that already exists. Only if it fails does a new reference need generating, and then from the real
+     Python `SpeechGenerator`, not from the retired C++ driver: `legacy_driver_reference/README.md` is
+     explicit that these files "are not a reference implementation, they are one recorded output of a
+     program that no longer exists".
+
+  **Where padding could fail to be inert — what step 2's gate is really asking.** Three places, from a
+  read of the source, which is not the same as a measurement:
+  * *Attention softmax over pad columns.* Masked in the TTL encoder (`attn_mask` above). Needs checking
+    in `DPTextEncoder`, which pools through a learned `sentence_token` rather than a mean
+    (`duration/duration_prediction.py:34,67,103`) — so its pooling is attention-weighted, and correct
+    under padding only if those scores are masked too. **The most likely place for this to break**, and
+    it would show up as a wrong predicted *duration*, i.e. as audio of the wrong length rather than as a
+    numeric near-miss.
+  * *The ConvNext stacks' receptive field at the boundary.* `x = x * txt_msk` runs before each block, so
+    a conv at the last real position reads zeros either way — this is the mechanism that ought to make
+    padding inert, and the reason the whole approach is plausible.
+  * *Any unmasked reduction over the length axis.* `txt_len = txt_msk.sum()` is masked; nothing else was
+    found.
+
+  **Blast radius.** *loom-exporter:* `supertonic_export.py` (three wrappers, three `mil_inputs` lists,
+  the constant, `driver_components`), `tools/convert_supertonic/supertonic_driver/` (one fragment that
+  builds the mask), `reference_forward_supertonic_{dp,ttl_text,vfe}.py` (emit the mask beside the
+  existing `.bin` inputs). *loom.cpp:* `tests/support/tts_driver_inputs.h:56`, the four
+  `test_e2e_supertonic_mil_*.cpp` (one more input tensor each), and
+  `test_e2e_supertonic_mil_lua_driver.cpp` (the padded-vs-frozen comparison). **No engine source change
+  is expected** — no new binding, no new primitive; the mask is one more f32 input. *loom-py:* none,
+  `infer` passes whatever the driver names. *Model cards:* `build_model_cards.py`'s Supertonic "Known
+  limitations" section comes out and the `text-to-speech-with-vocab` snippet stops warning about length.
+
+  **What N should be: open, and worth measuring rather than choosing.** The axis is static, so its cost
+  is paid on *every* synthesis regardless of how long the real text is — every text topology's attention
+  is O(N²) and the ConvNext stacks O(N). 256 and 512 cost the same to implement and not to run. Export
+  once at each and measure before picking; 256 codepoints is roughly a long sentence after the wrap.
+
+  **What this does not fix.** The axis is still static, for the two independent reasons in
+  `supertonic_export.py`'s docstring — `GraphBuilder::build` resolves one dynamic-length symbol per
+  topology and `T_lat` takes it, and coremltools refuses dynamic padding in `_get_relative_embeddings`
+  regardless. Text longer than N is still not synthesizable in one call; chunking it is a separate
+  question this item does not open.
 
 #### P5 — breadth
 
