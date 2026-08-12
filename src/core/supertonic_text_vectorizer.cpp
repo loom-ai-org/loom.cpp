@@ -3,6 +3,8 @@
 #include "loom/core/unicode.h"
 #include "loom/loom_errors.h"
 
+#include <algorithm>
+
 namespace loom {
 namespace {
 
@@ -116,6 +118,25 @@ std::unique_ptr<SupertonicTextVectorizer> SupertonicTextVectorizer::load(const G
 
     auto vec = std::unique_ptr<SupertonicTextVectorizer>(new SupertonicTextVectorizer());
     vec->table_ = model.kv_arr_i32("tokenizer.ggml.supertonic.codepoint_to_id");
+    vec->default_lang_ = model.has_kv("tokenizer.ggml.supertonic.default_lang")
+                             ? model.kv_str("tokenizer.ggml.supertonic.default_lang")
+                             : std::string("en");
+
+    // Build the id -> codepoint inverse once at load, sized to the highest mapped id. First writer wins
+    // on a collision and `invertible_` records that it happened, so `detokenize` can refuse rather than
+    // return whichever codepoint happened to come first (see its declaration).
+    int32_t max_id = -1;
+    for (int32_t id : vec->table_) max_id = std::max(max_id, id);
+    vec->inverse_.assign(static_cast<size_t>(max_id + 1), -1);
+    for (size_t cp = 0; cp < vec->table_.size(); ++cp) {
+        const int32_t id = vec->table_[cp];
+        if (id < 0) continue;
+        if (vec->inverse_[static_cast<size_t>(id)] >= 0) {
+            vec->invertible_ = false;
+            continue;
+        }
+        vec->inverse_[static_cast<size_t>(id)] = static_cast<int32_t>(cp);
+    }
     return vec;
 }
 
@@ -180,7 +201,7 @@ std::string SupertonicTextVectorizer::preprocess(const std::string& text, const 
 }
 
 std::vector<int32_t> SupertonicTextVectorizer::tokenize(const std::string& text, const std::string& lang) const {
-    const std::string preprocessed = preprocess(text, lang);
+    const std::string preprocessed = preprocess(text, lang.empty() ? default_lang_ : lang);
     const std::vector<char32_t> cps = utf8_decode(preprocessed);
 
     std::vector<int32_t> ids;
@@ -191,6 +212,22 @@ std::vector<int32_t> SupertonicTextVectorizer::tokenize(const std::string& text,
         }
     }
     return ids;
+}
+
+std::string SupertonicTextVectorizer::detokenize(const std::vector<int32_t>& ids) const {
+    if (!invertible_) {
+        throw SchemaError("SupertonicTextVectorizer::detokenize: this file's codepoint_to_id table sends "
+                           "two codepoints to the same id, so ids cannot be mapped back to text "
+                           "unambiguously (the real unicode_indexer.json is injective; this one is not)");
+    }
+    std::vector<char32_t> cps;
+    cps.reserve(ids.size());
+    for (int32_t id : ids) {
+        if (id < 0 || static_cast<size_t>(id) >= inverse_.size()) continue;
+        const int32_t cp = inverse_[static_cast<size_t>(id)];
+        if (cp >= 0) cps.push_back(static_cast<char32_t>(cp));
+    }
+    return utf8_encode(cps);
 }
 
 } // namespace loom
