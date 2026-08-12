@@ -2490,6 +2490,57 @@ verbatim, all encoding exactly and round-tripping. Gemma now exports with no `--
 The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-script splitters,
 case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
 
+### Sweep after the Supertonic text door (P4.6/P4.6a/P4.6b) — 2026-08-12
+
+**All seventeen models, one expected to move, and it did.** Baseline recorded from a `git worktree` at
+`origin/main` (c4e7221) with its own `cwd` and `PYTHONPATH`; current from the branch tip (f10c309).
+22m20s to record, 24m01s to compare.
+
+| | |
+|---|---|
+| **moved (expected)** | supertonic |
+| **byte-identical** | conformer-ctc, gigaam-rnnt, kokoro, matcha, lfm2-monolithic, lfm2-modular, qwen3, smollm2, gemma-3-270m-it, whisper, granite-speech, parakeet-tdt, parakeet-rnnt, styletts2, vits, qwen3-asr |
+
+The prediction was written before the run: supertonic must differ, the other sixteen must not. Four of
+the negatives are the ones that carry weight — **kokoro, styletts2 and both parakeets** use
+`ComputedCall`/`HelperCall`, the machinery nearest `SubgraphCallComponent.variants`, and **matcha** is
+the only other `FlowMatchingSpec` user, so it is what proves `estimator_variants` left the unbucketed
+path alone.
+
+**Supertonic's diff is only what it should be:** 4 topologies → 16, `loom.txt_len` 10 → 512, 646 → 704
+tensors, the three tokenizer KVs added, and two `loom.default_style.*` tensors. The KV-key diff
+contains no other addition or removal.
+
+**Only one test skipped in the whole run** — a model with no recorded baseline *skips* rather than
+passes, so every one of those sixteen was a real diff against a real baseline rather than a silent
+no-op. The sweep's own `test_a_changed_export_is_detected` passed too.
+
+**Three things the sweep needed before it could answer this, all of them real gaps:**
+
+1. **It swept 9 of the 17 models.** supertonic, vits, styletts2, both parakeets, smollm2 and
+   gemma-3-270m-it were absent — including the one model this change was *about*, so the run had no
+   positive control at all. The list's own comment says it "should fail review when a family is added
+   and not swept"; seven had been.
+2. **It never deleted the exported GGUFs**, and pytest keeps `tmp_path` for the session, so its disk
+   cost was the SUM over models (~30 GB, Granite alone 8.75 GB) instead of the largest one. On a
+   machine that has run at 19 GB free that is the difference between a sweep and an out-of-disk.
+3. **qwen3-asr was `pytest.mark.skip`**, unconditionally — so it skipped in the `transformers>=5.13`
+   environment too, and was therefore swept by nothing, ever. It is `skipif` on the interpreter's own
+   `transformers` version now (read from package metadata, not by importing it, since this runs at
+   collection time for every invocation).
+
+**qwen3-asr was swept without pytest and without touching the ovos venv**, which has no pytest
+installed: the *export* ran under ovos, the *snapshot* and *diff* under piper, since those are pure
+`gguf`+`numpy`. Both sides produced a 3136.8 MB artifact with an identical driver-script hash, 4
+topologies, 638 tensors and 24 KVs, and `diff -r` was empty — then the same comparison was shown to
+notice a one-line tamper, because an empty diff between two directories is also what you get when you
+compare nothing to nothing.
+
+It ran **after** the sixteen-model pass rather than beside it, on purpose: Granite-Speech peaks at
+22.9 GB RSS on a 33 GB machine, and a concurrent second export is how an OOM gets mistaken for a
+failed comparison.
+
+
 ### Sweep after the window routing, the marshalling fix and the tokenizer
 
 12 models from a `git worktree` at `abd6b0a` against the working tree, snapshotted and `diff -r`'d.
