@@ -1,9 +1,16 @@
-// Numerical-correctness check for the MIL-traced SupertonicTTS "dp" topology (export_supertonic_mil.py,
+// Numerical-correctness check for the MIL-traced SupertonicTTS "dp" topology (supertonic_export.py,
 // part of supertonic_mil.gguf) against a fresh real-module reference fixture at T=10
 // (reference_forward_supertonic_mil_extra.py -- the EXISTING reference_forward_supertonic_dp.py fixture
 // uses T=12, which doesn't apply here since this "dp" topology is traced dynamically over T; T=10 is just
 // what that fixture happened to use, chosen to match the rest of the MIL export's own fixed T_TEXT_FIXED
-// for consistency, not because "dp" itself requires it -- see export_supertonic_mil.py's own docstring).
+// for consistency, not because "dp" itself requires it -- see supertonic_export.py's own docstring).
+//
+// The reference is 10 REAL ids; the topology's text axis is `txt_len` wide (BACKLOG.md P4.6). So the
+// ids are padded and `txt_msk` says how many are real, and what this asks is exactly P4.6's question:
+// does a padded run reproduce the unpadded ground truth? For `dp` a failure shows up as a wrong
+// predicted duration -- audio of the wrong LENGTH rather than a numeric near-miss -- which is why the
+// bound here is the same 1e-2 it was when the axis was exactly 10 wide.
+//
 // Skips cleanly if the GGUF/reference files aren't present.
 
 #include "test_util.h"
@@ -13,6 +20,7 @@
 
 #include <ggml-cpu.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -73,14 +81,23 @@ int main() {
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_env, backend.get());
     LOOM_CHECK(model != nullptr);
+    const uint32_t t_text = model->hparam_u32("txt_len");
+    LOOM_CHECK(t_text >= txt_ids.size());
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("dp"));
     loom::GraphBuilder builder(topo, *model, backend.get());
-    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", static_cast<uint32_t>(txt_ids.size())}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", t_text}, {"n_past", 0}});
 
-    std::vector<int32_t> txt_ids_copy = txt_ids;
+    // The driver's own padding, done by hand: PAD_ID into the tail, ones-then-zeros for the mask.
+    // Which id pads is measured not to matter (`x = x * txt_msk` zeroes it first, BACKLOG.md P4.6);
+    // 162 is the vocabulary's one unused row, so a dump of these ids is unambiguous.
+    std::vector<int32_t> txt_ids_copy(t_text, 162);
+    std::copy(txt_ids.begin(), txt_ids.end(), txt_ids_copy.begin());
+    std::vector<float> txt_msk(t_text, 0.0f);
+    std::fill(txt_msk.begin(), txt_msk.begin() + txt_ids.size(), 1.0f);
     std::vector<float> stl_emb_copy = stl_emb;
     ggml_backend_tensor_set(r.input_tensors.at("txt_ids"), txt_ids_copy.data(), 0, txt_ids_copy.size() * sizeof(int32_t));
     ggml_backend_tensor_set(r.input_tensors.at("stl_emb"), stl_emb_copy.data(), 0, stl_emb_copy.size() * sizeof(float));
+    ggml_backend_tensor_set(r.input_tensors.at("txt_msk"), txt_msk.data(), 0, txt_msk.size() * sizeof(float));
     ggml_backend_graph_compute(backend.get(), r.graph);
 
     LOOM_CHECK(static_cast<uint32_t>(ggml_nelements(r.output)) == 1);
