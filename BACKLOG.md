@@ -3809,6 +3809,13 @@ then dragged onto the CPU with them because they sit between two CPU nodes. The 
 `RMS_NORM` primitive all along; nothing recognises this sequence as one. Fusing it is the single
 highest-value follow-up this measurement produced, and it belongs in the exporter — see P5 below.
 
+**The KV cache works on a device**, which the first version of this entry listed as untested because no
+export on hand had one. Re-exporting Qwen3-0.6B-Base against loom-exporter HEAD produced a fused causal
+LM with 28 cached `ATTENTION` nodes and an `infer_with_past` entry; twelve greedily-decoded tokens
+through the device's cache agree with twelve full CPU prefills over a growing prompt. That covers the
+cache in a device buffer, `KvCache::fill_cell_index` rewriting the cell-index tensor between steps on an
+already-split graph, and the retained graph outliving a moving `n_past` under a split plan.
+
 **Fidelity.** Frame-wise and token-wise decisions are identical on every model tried; the elementwise
 gap is fp32 reduction order, except where a model amplifies it:
 
@@ -3827,6 +3834,21 @@ at the zero that does the amplifying, takes the output gap from 2.5e-2 to 3.4e-3
 better conditioned. This is a property of that model's front end, not a measure of backend error, which
 is why `tests/gate/test_e2e_device_parity.cpp` compares the argmax exactly on top of the tolerance.
 
+##### The fixtures this was verified against
+
+Every artifact on hand predated this work by enough to get in its way: drivers with a `main` entry point
+rather than `infer`, a Conformer export with no `tokenizer.ggml.*` KVs at all, a Qwen3 export that
+re-prefills instead of caching. Twelve models were re-exported against loom-exporter HEAD into a
+`LOOM_FIXTURES` directory — conformer-ctc, kokoro, matcha, vits, styletts2, supertonic, lfm2
+(monolithic and modular), parakeet-tdt, parakeet-rnnt, gigaam, whisper, plus the fused Qwen3-0.6B-Base
+that gave this entry its `causal_lm_kv.gguf`. With those present, `ctest -L gate` runs 10 real tests
+rather than skipping everything, and all 10 pass on the CPU and Vulkan builds alike.
+
+The rest of the gate suite still skips: those tests want reference `_DIR` fixtures — PyTorch forward
+dumps from `fixture_gen/` — and a GGUF alone does not satisfy them. Producing all of those is a
+separate, much larger job, and the tests that do run are the ones that exercise a whole model through
+the Lua bridge, which is the path this change touched.
+
 ##### Tests
 
 * `tests/ci/test_device_selection.cpp` — what a spec resolves to and what it refuses. Hermetic, so it
@@ -3842,6 +3864,13 @@ is why `tests/gate/test_e2e_device_parity.cpp` compares the argmax exactly on to
   Asserts the device ran the majority of nodes, which is the failure mode "it runs on the GPU now" hides
   best.
 
+* `tests/gate/test_e2e_device_parity_kv.cpp` — the other half, and the one that answers what the first
+  version of this entry listed as unverified: a KV-cached decode on the device against N full prefills
+  on the CPU. It is the only test that exercises the cache living in a device buffer, the cell-index
+  tensor being rewritten between steps on a graph the scheduler has already split, and P4.0.15's graph
+  reuse holding while `n_past` moves underneath a split plan. Twelve greedily-decoded tokens agree, on
+  a graph the scheduler cuts 453 times.
+
 Sharing `LOOM_CONFORMER_CTC_MIL_GGUF` with `test_vocab` turned up a **pre-existing crash in that test**,
 fixed here: `LOOM_CHECK` records a failure and carries on, so a `Vocab::load` returning null — which is
 what an export predating the embedded SentencePiece vocab (P4.0.17 step 3) gives, since it has no
@@ -3850,18 +3879,43 @@ It now reports and returns. Nothing about a device is involved; pointing that va
 artifact on disk is all it took, and "this test is broken" was the wrong message for "this fixture is
 too old".
 
-##### Toolchain, on Debian bookworm
+##### The build tools, and `cmake/VulkanToolchain.cmake`
 
-Neither of the distro's two relevant packages is new enough for `ggml` v0.16.0's Vulkan backend, and
-both fail in ways that do not name the cause:
+Neither of Debian bookworm's two relevant packages is new enough for `ggml` v0.16.0's Vulkan backend,
+and both fail in ways that name neither cause:
 
-* `glslc` 2023.2 answers ggml's `GL_KHR_cooperative_matrix` probe as though it supported it (the probe
-  looks for a specific "extension not supported" string, which this version does not emit), so coopmat
-  shader variants get generated and the build dies in `conv2d_mm.comp` with `'coopmat': undeclared
-  identifier`. Needs a `glslc` new enough to answer honestly, or a build of `google/shaderc`.
+* `glslc` 2023.2 answers ggml's `GL_KHR_cooperative_matrix` probe as though it supported it — the probe
+  greps stderr for "extension not supported", which this version does not emit — so coopmat shader
+  variants get generated and the build dies in `conv2d_mm.comp` with `'coopmat': undeclared
+  identifier`. `-DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF` does not help: ggml's CMake overwrites it from
+  the probe.
 * Vulkan-Headers 1.3.239 lack `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` (1.3.264+) and
-  `vk::LayerSettingEXT` (1.3.272+). The headers are header-only and the loader is ABI-stable, so a
-  newer Vulkan-Headers checkout on the include path is enough; the system `libvulkan.so.1` is fine.
+  `vk::LayerSettingEXT` (1.3.272+). Header-only, and the loader is ABI-stable, so newer headers against
+  the system `libvulkan.so.1` is a supported arrangement rather than a workaround.
+
+`cmake/VulkanToolchain.cmake` makes `-DGGML_VULKAN=ON` work on such a machine without anyone having to
+know the above. **FetchContent with pinned tags, not submodules** — the same answer this repo already
+gives for ggml, nlohmann_json and LuaJIT, and it gives the "bump it when we need to" property a
+submodule would without a `--recursive` clone every consumer has to remember.
+
+Three decisions in it are worth keeping:
+
+* **Both probes test the failure, not a version number.** The glslc probe runs ggml's own feature-test
+  shader and accepts two answers — it compiles, or it refuses in the words ggml greps for; anything
+  else is a glslc that will lie to ggml's probe. The header probe compiles the two declarations
+  `ggml-vulkan.cpp` uses. A version comparison would be a proxy that goes stale in both directions, and
+  a backported distro package is a real case.
+* **glslc is built at CONFIGURE time, not as an ExternalProject.** ggml runs glslc during ITS configure,
+  five times, and those runs decide which shader variants are generated and which compile definitions
+  are set. A binary that does not exist yet makes all five fail to launch, which ggml reads as
+  "supported" and acts on — a wrong answer from a process that never ran. The cost is a slow first
+  configure on a machine that needed it; it is idempotent per build directory.
+* **A generated `SPIRV-HeadersConfig.cmake`.** ggml does `find_package(SPIRV-Headers CONFIG REQUIRED)`
+  and then never links the target, so SPIRV-Headers has to be satisfied twice over and FetchContent's
+  own redirect covers neither: the package config is absent (SPIRV-Headers defines its config through
+  `install(EXPORT)`, which produces nothing in a build tree that never installs) and the include path is
+  absent (nothing links the target that carries it). That is the `'spv' has not been declared` error.
+  The module writes a three-line config and an `include_directories`.
 
 ##### What this does NOT cover
 
@@ -3870,10 +3924,6 @@ both fail in ways that do not name the cause:
 * **Only Vulkan, only one device.** CUDA, Metal, SYCL and the rest are compile-time switches that were
   never flipped here. Multi-GPU is not attempted: `Device` initializes exactly one device backend, and
   `ggml_backend_sched` is handed two backends, not N.
-* **The KV cache on a device is unverified.** It allocates on the primary backend and every write goes
-  through `ggml_backend_tensor_set`, so there is no reason it should not work — but none of the exports
-  on hand uses one (qwen3/lfm2 both re-prefill), so nothing has run it. The first cached export to be
-  tried on a device is where that gets answered.
 * **Quantized weights on a device** (Q8_0 exports) were not run.
 * **`loom-py` ships CPU-only wheels.** The binding takes `device=` and forwards it; a wheel with a
   device backend compiled in does not exist yet.

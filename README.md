@@ -99,12 +99,13 @@ such as `Vulkan0`. **`auto` prefers a device and falls back to the CPU; `gpu` is
 is none**, because a caller who spelled it out is asking a question about the machine, and answering it
 with a silent CPU run turns "no GPU here" into an unexplained performance number.
 
-Vulkan needs `glslc` and the Vulkan headers, and on an older distribution both are likely too old for
-`ggml`'s Vulkan backend — Debian bookworm's fail in ways that do not name the cause (`glslc` 2023.2
-answers ggml's cooperative-matrix probe as though it supported it, and the build dies in
-`conv2d_mm.comp`; Vulkan-Headers 1.3.239 lack `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` and
-`vk::LayerSettingEXT`). Both are header-only or build-time, so a newer `Vulkan-Headers` checkout on the
-include path and a `glslc` built from `google/shaderc` are enough; the system loader is fine.
+**The Vulkan build tools sort themselves out.** `glslc` and the Vulkan headers on a stable distribution
+are likely too old for `ggml`'s Vulkan backend, and both fail in ways that name neither cause — so
+`cmake/VulkanToolchain.cmake` probes for those two failures specifically and, when it finds them,
+fetches pinned Vulkan-Headers and builds `glslc` from a pinned `shaderc` into the build directory. That
+costs several minutes on the first configure of a machine that needed it, and nothing at all on one that
+did not. `-DLOOM_VULKAN_FETCH_TOOLCHAIN=OFF` turns the diagnosis into an error naming what to install
+instead, which is the right setting for an image that provides its own toolchain.
 
 **Not every op runs on a device, and that is by design.** Five primitives (`RSQRT`, `ATAN`, `ATAN2`,
 `POW`, `SHAPE`) are host callbacks through `ggml_map_custom` — a C function pointer, so there is

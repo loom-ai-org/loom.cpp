@@ -346,6 +346,14 @@ add_test(NAME test_e2e_device_parity COMMAND test_e2e_device_parity)
 set_tests_properties(test_e2e_device_parity PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_device_parity PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- The other half of device parity: a KV-cached decode loop, where the cache, the reused graph and
+#     the scheduler's split plan all have to hold together while n_past moves (BACKLOG.md P4.7). ---
+add_executable(test_e2e_device_parity_kv gate/test_e2e_device_parity_kv.cpp)
+target_link_libraries(test_e2e_device_parity_kv PRIVATE loom::engine)
+add_test(NAME test_e2e_device_parity_kv COMMAND test_e2e_device_parity_kv)
+set_tests_properties(test_e2e_device_parity_kv PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_device_parity_kv PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- The same MIL-exported GGUF reached the way every other family is reached: through the embedded
 #     Lua driver's `infer`. Its greedy CTC decode must agree token-for-token with loom::ctc_greedy_decode,
 #     the C++ implementation it replaces (BACKLOG.md P4.0.17). ---
