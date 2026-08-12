@@ -228,7 +228,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e), plus Supertonic's padded and bucketed text axis (P4.6/P4.6a, DONE). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e), plus Supertonic's padded and bucketed text axis and its optional voice style (P4.6/P4.6a/P4.6b, DONE). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -3594,6 +3594,57 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   **The damper stands.** Text length and `t_lat` correlate, because the duration is predicted from the
   text, so the worst padding waste is still on short utterances where total latency is already lowest.
   Bucketing is why that waste is now bounded by the *next rung down* rather than by the ceiling.
+
+  ### P4.6b — the voice style is optional, and one travels in the file — DONE (2026-08-12)
+
+  **The report was "we can't use different styles"; the finding was that the ceiling was lower than
+  that.** `style_ttl`/`style_dp` have always been `infer` inputs, the driver has always passed them
+  through, and loom-py forwards any named array — so a *different* style always worked, and the gate
+  test has been loading `F1.json` and using it since the file existed. What did not work was using
+  **any** style: a published GGUF carried none, so every caller needed the upstream checkpoint repo to
+  get one, and the model card's own snippet said `style_ttl=style_ttl` referencing a variable it never
+  defined. Worth recording because the fix that the literal request implies — "expose them as input
+  arguments" — was already done, and doing it again would have changed nothing.
+
+  So: **both style inputs are OPTIONAL, and the checkpoint's own F1 embeddings ship in the GGUF as the
+  default.** Resolution order is `[[feedback_optional_arg_then_autodetect]]` with the middle rung
+  absent — an explicit argument, else the default; there is nothing to autodetect about a voice.
+
+  **F1 specifically, and not as a coin flip:** it is the style
+  `legacy_driver_reference/supertonic_driver_waveform_F1.npy` was recorded with, so "call `infer` with
+  no style at all" is gated by ground truth that already existed rather than by a fixture recording the
+  decision itself.
+
+  **A third kind of thing a GGUF can carry, and the first time anything needed it.** The two tensors
+  are read by the DRIVER (`loom.get_weight`), not by any topology node — so `_prune_dead_weights`
+  deletes them by construction, since its rule is "no node names it as an input". `write_gguf` gained
+  `driver_weights`, merged in *after* pruning rather than exempted from it: the pruner's own job is
+  catching MIL's incidental attribute constants, and weakening its rule would have cost more than
+  ordering around it. They cannot be `ExportConstants` — 12928 float literals would swamp a driver
+  script that is 6 KB and meant to be read out of the GGUF by a person. Cost: 51.7 KB.
+
+  `loom.get_weight`'s first argument is any *registered module*, and every module shares one
+  `GgufModel`, so the driver reads through `"decoder"` — the one topology whose name carries no text
+  bucket and is therefore spelled the same at every text length.
+
+  **Gates, in the driver test, all three needed:**
+  1. **Omitting the style reproduces passing F1 bit-for-bit** — `max_abs_diff` exactly **0**, not
+     "close": the driver either reached the same numbers or it did not, and there is no arithmetic in
+     between to blur it.
+  2. **The frozen F1 waveform still holds**, 5.065e-06.
+  3. **A different voice produces different audio.** Without this the first two are *both* satisfied by
+     a driver that ignores `inputs.style_*` and always uses the default — passing F1 would match the F1
+     fixture for the wrong reason. M1 gives **76800 samples against F1's 70656** (a different voice
+     predicts a different duration) and 0.268 max-abs where they overlap.
+
+  Skipped rather than failed for a non-F1 style or a GGUF with no default, so the test's meaning does
+  not depend on which fixture the runner points at.
+
+  **Still out of scope, and a genuinely bigger thing: deriving a style from your own audio.**
+  `SpeechGenerator.encode_voice_style` runs mel → `SpeechEncoder` → `lat_compressor` → the two style
+  encoders, i.e. three more real modules than this export traces, plus a second entry point. Selecting
+  among existing voices — which is what was actually asked for — needs none of it. The model card now
+  says which of the two it can do.
 
 #### P5 — breadth
 
