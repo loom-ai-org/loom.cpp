@@ -454,6 +454,26 @@ add_test(NAME test_byte_vocab COMMAND test_byte_vocab)
 set_tests_properties(test_byte_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_byte_vocab PROPERTIES FIXTURES_REQUIRED byte_vocab_gguf_fixture)
 
+# --- SupertonicTTS grapheme front-end (SupertonicTextVectorizer), synthetic printable-ASCII fixtures.
+#     The real-asset parity check is gate/test_supertonic_text_vectorizer.cpp; this covers what does NOT
+#     need that checkout -- the inverse map, the derived vocab size, the default-language KV. It also
+#     reads byte_vocab_test.gguf, to check the tag dispatch declines a file that isn't its own. ---
+add_test(
+    NAME gen_supertonic_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_supertonic_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/supertonic_vocab_test.gguf
+            ${LOOM_FIXTURE_DIR}/supertonic_vocab_noninjective.gguf
+)
+set_tests_properties(gen_supertonic_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_supertonic_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP supertonic_vocab_gguf_fixture)
+
+add_executable(test_supertonic_vocab ci/test_supertonic_vocab.cpp)
+target_link_libraries(test_supertonic_vocab PRIVATE loom::engine)
+target_compile_definitions(test_supertonic_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_supertonic_vocab COMMAND test_supertonic_vocab)
+set_tests_properties(test_supertonic_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_supertonic_vocab PROPERTIES FIXTURES_REQUIRED "supertonic_vocab_gguf_fixture;byte_vocab_gguf_fixture")
+
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
 #     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---
 set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)
@@ -985,6 +1005,15 @@ target_link_libraries(test_e2e_supertonic_mil_decoder PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_mil_decoder COMMAND test_e2e_supertonic_mil_decoder)
 set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- The same two text topologies, but at a REAL sentence's length against the real Python pipeline's
+#     own unpadded answer for it (BACKLOG.md P4.6). The four checks above all run ten ids, which is the
+#     empty string after the `<lang>` wrap and leaves the padding boundary at the very end of the axis. ---
+add_executable(test_e2e_supertonic_mil_real_text gate/test_e2e_supertonic_mil_real_text.cpp)
+target_link_libraries(test_e2e_supertonic_mil_real_text PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_real_text COMMAND test_e2e_supertonic_mil_real_text)
+set_tests_properties(test_e2e_supertonic_mil_real_text PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_supertonic_mil_real_text PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Full end-to-end check: the MIL-traced topologies wired via supertonic_driver/, compared
 #     against the existing bespoke loom::SupertonicDriver oracle. Skips cleanly if env vars aren't set. ---

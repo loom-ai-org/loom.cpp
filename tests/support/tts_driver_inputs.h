@@ -50,9 +50,16 @@ inline constexpr float mel_std = 2.116101f;
 } // namespace matcha
 
 namespace supertonic { // was loom::SupertonicConfig
-// MUST match what convert_supertonic_all.py / export_supertonic_mil.py baked their DPTextEncoder /
-// TTLTextEncoder / VectorFieldEstimator topologies for -- those carry a fixed text length, so `txt_ids`
-// is exactly this long. See supertonic_driver.h's own "KNOWN SCOPE LIMITATION" note (retired with it).
+// MUST match what convert_supertonic_all.py baked its DPTextEncoder / TTLTextEncoder /
+// VectorFieldEstimator topologies for -- that BESPOKE conversion carries a fixed text length, so its
+// `txt_ids` is exactly this long. See supertonic_driver.h's own "KNOWN SCOPE LIMITATION" note (retired
+// with it).
+//
+// The MIL export has no such number and deliberately not a copy of one here: `supertonic_export.py`
+// traces its text-touching graphs at SEVERAL padded widths and the driver runs the smallest that fits
+// (BACKLOG.md P4.6a), so what a caller needs is a ceiling -- `model->hparam_u32("txt_len")`, read off
+// the file (P4.0.8's first follow-up) -- and what a TEST needs is the width the driver would pick,
+// which `support/supertonic_buckets.h` discovers from the model's own `topology_names()`.
 inline constexpr uint32_t txt_len_fixed = 10;
 inline constexpr uint32_t latent_dim = 144;
 inline constexpr float sample_rate = 44100.0f;

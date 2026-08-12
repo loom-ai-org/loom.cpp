@@ -31,8 +31,42 @@ the piper-phonemize fork are GPL-3, incompatible with this repo's permissive lic
 `[[loom_engine_licensing_phonemizer]]` memory). Current plan: integrate **phoonnx** (a friend-of-the-user's
 project) instead, once its license/API are confirmed — not yet investigated. A `src/text/phonemize.cpp` +
 `include/loom/text/phonemize.h` split matching this project's existing driver-code conventions is the
-intended shape. SupertonicTTS is the one model in this family that's already fully closed — its
-`TextVectorizer` is a license-free unicode codepoint lookup table, no phonemizer needed at all.
+intended shape. SupertonicTTS is the one model in this family that needs no phonemizer at all — its
+`TextVectorizer` is a license-free unicode codepoint lookup table.
+
+**Corrected 2026-08-11:** that entry used to call Supertonic "fully closed", which was true of the engine
+and false of everything a user touches. `loom::SupertonicTextVectorizer` existed and was gate-verified,
+but nothing was wired to it: the MIL export never wrote the KVs, and neither `loom_cli` nor loom-py
+dispatched on the tag. Now done end to end — the export carries `tokenizer.ggml.supertonic.*`, both hosts
+read it, and `model.tokenize("hello world")` returns the same ids the real Python `TextVectorizer` does.
+The export is otherwise byte-identical (snapshot diff: three added KVs, every topology, the driver and all
+683 tensors unchanged).
+
+### Supertonic's fixed text length made its tokenizer near-unusable for synthesis — FIXED (2026-08-12)
+
+Found while wiring the above. `T_TEXT_FIXED = 10` (`supertonic_export.py`), so `infer` took exactly 10
+`txt_ids` — and `<en>` + the pipeline's inserted final period + `</en>` is 10 ids for the EMPTY string.
+Every real sentence overflowed: `"hello world"` encodes to 21. So the vocabulary in the file was good for
+encoding and inspection, and synthesis still effectively took ids directly. Shipped as a "Known
+limitations" section on the model card rather than silently.
+
+**Done as P4.6/P4.6a** (Exporter section), which is where the measurements live. The axis is padded and
+traced at five widths up to 512, `txt_msk` is a real input, and the driver picks a width and pads — so `infer` takes any count up to `txt_len`. The
+correction the scoping carried was right (raising the constant *alone* is a trap, because the export
+built `txt_msk` as all-ones) but named the wrong mechanism for *why* padding is not inert: it is
+`ConvNextBlock`'s **replicate** pad, which on a masked tensor replicates a zero column where the
+unpadded reference replicates the last real one. Measured at 97% relative error on `txt_emb` before any
+of it was exported; fixed by `_edge_fill`, with no engine change.
+
+### Grapheme text front-ends: the shape to generalize to
+
+`src/core/supertonic_text_vectorizer.cpp` is per-MODEL C++ in an engine whose rule is that per-model
+complexity belongs in the exporter. It is kept because it is written and verified, but a SECOND grapheme
+TTS model must not add a second class. The split that generalizes: the codepoint table is data and already
+lives in the GGUF; the normalization pipeline (emoji ranges, the replacement table, the `<lang>` wrap) is
+per-model and belongs in exporter-emitted data or driver Lua. Worth doing when there is a real second data
+point to generalize against — Qwen3-TTS is not one, since it has a real HF tokenizer and needs only
+`tokenizer_dir` set in its export config, no new C++ at all.
 
 ---
 
@@ -194,7 +228,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e), plus Supertonic's padded and bucketed text axis and its optional voice style (P4.6/P4.6a/P4.6b, DONE). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -2456,6 +2490,57 @@ verbatim, all encoding exactly and round-tripping. Gemma now exports with no `--
 The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-script splitters,
 case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
 
+### Sweep after the Supertonic text door (P4.6/P4.6a/P4.6b) — 2026-08-12
+
+**All seventeen models, one expected to move, and it did.** Baseline recorded from a `git worktree` at
+`origin/main` (c4e7221) with its own `cwd` and `PYTHONPATH`; current from the branch tip (f10c309).
+22m20s to record, 24m01s to compare.
+
+| | |
+|---|---|
+| **moved (expected)** | supertonic |
+| **byte-identical** | conformer-ctc, gigaam-rnnt, kokoro, matcha, lfm2-monolithic, lfm2-modular, qwen3, smollm2, gemma-3-270m-it, whisper, granite-speech, parakeet-tdt, parakeet-rnnt, styletts2, vits, qwen3-asr |
+
+The prediction was written before the run: supertonic must differ, the other sixteen must not. Four of
+the negatives are the ones that carry weight — **kokoro, styletts2 and both parakeets** use
+`ComputedCall`/`HelperCall`, the machinery nearest `SubgraphCallComponent.variants`, and **matcha** is
+the only other `FlowMatchingSpec` user, so it is what proves `estimator_variants` left the unbucketed
+path alone.
+
+**Supertonic's diff is only what it should be:** 4 topologies → 16, `loom.txt_len` 10 → 512, 646 → 704
+tensors, the three tokenizer KVs added, and two `loom.default_style.*` tensors. The KV-key diff
+contains no other addition or removal.
+
+**Only one test skipped in the whole run** — a model with no recorded baseline *skips* rather than
+passes, so every one of those sixteen was a real diff against a real baseline rather than a silent
+no-op. The sweep's own `test_a_changed_export_is_detected` passed too.
+
+**Three things the sweep needed before it could answer this, all of them real gaps:**
+
+1. **It swept 9 of the 17 models.** supertonic, vits, styletts2, both parakeets, smollm2 and
+   gemma-3-270m-it were absent — including the one model this change was *about*, so the run had no
+   positive control at all. The list's own comment says it "should fail review when a family is added
+   and not swept"; seven had been.
+2. **It never deleted the exported GGUFs**, and pytest keeps `tmp_path` for the session, so its disk
+   cost was the SUM over models (~30 GB, Granite alone 8.75 GB) instead of the largest one. On a
+   machine that has run at 19 GB free that is the difference between a sweep and an out-of-disk.
+3. **qwen3-asr was `pytest.mark.skip`**, unconditionally — so it skipped in the `transformers>=5.13`
+   environment too, and was therefore swept by nothing, ever. It is `skipif` on the interpreter's own
+   `transformers` version now (read from package metadata, not by importing it, since this runs at
+   collection time for every invocation).
+
+**qwen3-asr was swept without pytest and without touching the ovos venv**, which has no pytest
+installed: the *export* ran under ovos, the *snapshot* and *diff* under piper, since those are pure
+`gguf`+`numpy`. Both sides produced a 3136.8 MB artifact with an identical driver-script hash, 4
+topologies, 638 tensors and 24 KVs, and `diff -r` was empty — then the same comparison was shown to
+notice a one-line tamper, because an empty diff between two directories is also what you get when you
+compare nothing to nothing.
+
+It ran **after** the sixteen-model pass rather than beside it, on purpose: Granite-Speech peaks at
+22.9 GB RSS on a 33 GB machine, and a concurrent second export is how an OOM gets mistaken for a
+failed comparison.
+
+
 ### Sweep after the window routing, the marshalling fix and the tokenizer
 
 12 models from a `git worktree` at `abd6b0a` against the working tree, snapshotted and `diff -r`'d.
@@ -3295,6 +3380,322 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   first"; the pass now exists, `infer_with_past` exists, and `whisper_driver.lua` has been doing exactly
   this orchestration by hand since the Lua port (`KV-CACHE.md` §1.2). P4.1's decomposition is now the
   *reuse* of a solved shape, not a blocked one.
+- **P4.6 — Supertonic takes real text: a padded text axis and a real `txt_msk` — DONE (2026-08-12, two
+  commits).** Scheduled *before P5* by explicit user direction. Scoped 2026-08-11.
+
+  **Why.** The export carries its own grapheme vocabulary (see the Models section) and
+  `model.tokenize("hello world")` returns the same ids the real Python `TextVectorizer` does. It could
+  not drive synthesis: `T_TEXT_FIXED = 10`, and `<en>` + the pipeline's inserted final period +
+  `</en>` is *exactly 10 ids for the empty string*. `"hello world"` is 21. So the vocabulary in the
+  file was good for encoding and inspection, and synthesis effectively still took ids directly.
+
+  **`T_TEXT_FIXED` is 256 now, the driver pads to it, and `txt_msk` is a real input.** `"hello world"`
+  synthesizes; so does a 155-character sentence (161 ids). The axis is still static — both reasons in
+  `supertonic_export.py`'s docstring stand — so text past 256 still needs chunking, which this item did
+  not open.
+
+  ### What the plan got right, and the one thing it got wrong
+
+  The scoping was right that **raising the constant alone is a trap**: this export faked the mask
+  (`_ones_mask_from_ids`, all-ones regardless of content) while the real modules genuinely read it, so
+  padding without threading the mask would attend to padding as text and recover a text length of `N`.
+  Step 1 un-faked it and step 2 raised the constant, as planned.
+
+  It was wrong about **why padding might not be inert**, and the difference is the whole of the work.
+  The plan named three candidates from a read of the source and picked the DP text encoder's
+  attention-weighted `sentence_token` pooling as "the most likely place for this to break". It does not
+  break: `DPTextEncoder` builds a `full_mask` and forms `attn_mask = full_mask^T * full_mask` from it,
+  so those scores *are* masked, and so is `VFTextCrossAttention` (`masked_fill(-inf)` plus
+  `txt_len = txt_msk.sum()`), which is why `vfe`'s gate is the one that stays green even in the
+  falsification below.
+
+  The plan's second candidate was dismissed as the mechanism that ought to make padding *work* — "a
+  conv at the last real position reads zeros either way — this is the mechanism that ought to make
+  padding inert, and the reason the whole approach is plausible". **That is exactly backwards, and it is
+  the bug.** `ConvNextBlock` pads with `mode="replicate"`, not with zeros. On a masked tensor the edge
+  it replicates *is* a zero column; on an unpadded run it replicates the last REAL column. The two
+  differ, and the reference implementation is the unpadded one — `TextVectorizer.tokenize` pads only to
+  the longest string in its batch, and synthesis is a batch of one.
+
+  **Measured in PyTorch before a line of export code was written** (ten ids, N=256): `txt_emb` moved by
+  1.77 max-abs against a tensor whose own max is 1.82 — 97% wrong, not a near-miss — and the predicted
+  duration by 0.17%. So the plan's step-2 gate ("require the same waveform to 1e-3") would have failed,
+  and its stated fallback (regenerate the reference from the padded Python) would have *hidden* the
+  problem rather than found it: it would have shipped a model that disagrees with the reference
+  implementation for every text, and made that disagreement the new definition of correct.
+
+  ### `_edge_fill`: the fix, and why it needs no new primitive
+
+  Fill the padded tail with a copy of the last real column, before each block's replicate pad. Then
+  every real position's conv window is byte-for-byte what the unpadded run sees, and everything else in
+  the block is position-local. The last real index is data-dependent, so the obvious implementation is a
+  gather — but it does not need one:
+
+      edge = msk - shift_left(msk)      # one-hot at the last real column
+      last = (x * edge).sum(dim=2)      # (B, C, 1)
+      x    = x * msk + last * (1 - msk)
+
+  A multiply and a reduction, both of which the exporter already lowers — **no new binding, no new
+  primitive, no engine change at all**, which is what the scoping predicted for the mask and turns out
+  to hold for the fix too. At an all-ones mask `1 - msk` is zero, so it is *exactly* the identity, which
+  is why it costs the `T_TEXT = 10` references nothing (see step 1's gate below).
+
+  It is applied by patching `ConvNextBlock.forward` **per instance** on the two text encoders' blocks
+  only, via `types.MethodType`, with the mask reaching it through a holder object. Per-instance rather
+  than on the class because the VectorFieldEstimator's own blocks take a real `msk` over the latent
+  axis, which is dynamic and never padded; and a patched `forward` rather than a wrapper module because
+  a wrapper changes state-dict paths, and those paths are the exported tensor names. A holder rather
+  than an argument because `DPTextEncoder`/`TTLTextPreEncoder` call their blocks as `block(x)` and mask
+  outside — there is no argument to thread, and the alternative was copying both encoders' `forward`
+  into this repo, where every future divergence would be silent.
+
+  ### Where `n` comes from: neither of the two options the plan listed
+
+  The plan resolved this per [[feedback_optional_arg_then_autodetect]] to "an explicit input, or
+  inferred from a pad sentinel", with id 162 named as the sentinel. Both assume the *host* pads. It is
+  simpler for the **driver** to pad: it already receives `txt_ids` as a Lua table, so `#inputs.txt_ids`
+  *is* `n`, with nothing to infer and nothing to declare. The host API did not change and got strictly
+  more permissive — any count up to `txt_len` instead of exactly `txt_len`.
+
+  The sentinel survives as `PAD_ID = 162` anyway, but only as documentation: **which id pads was
+  measured not to matter at all.** `x = x * txt_msk` zeroes every padded embedding before anything reads
+  it, and ids 0, 1 and 162 give bit-identical `txt_emb` and duration. 162 is used because it is the
+  vocabulary's one unused row (`n_tokens()` is 162 against an `nn.Embedding(163)`), so a dump of the
+  padded ids reads unambiguously as padding.
+
+  ### Step 1 — `txt_msk` as a real traced input, `T_TEXT_FIXED` still 10
+
+  The three wrappers stop synthesizing it and take it as a forward argument, which the real modules
+  already accept, so this un-fakes an input rather than inventing one. `lat_msk` stays synthesized.
+  `vfe` needed it for a second reason: its mask was derived from `txt_emb`, whose padded columns are
+  zero, so it would have read all-ones no matter how much padding it was handed.
+
+  **Gate: the numbers, against every reference that already existed.** All five comparisons returned the
+  exact values they returned before — duration 1.19209e-07, `txt_emb` 2.14577e-06, `v` 5.13345e-06,
+  decoder 1.02073e-06, and 3.45102e-06 against the frozen `supertonic_driver_waveform_F1.npy`. A step
+  that changed the interface and provably not the numbers. Adding `_edge_fill` while still at `T = 10`
+  reproduced all five again, unchanged to the last digit — which isolated "does the fill lower
+  correctly" from "does padding work" before either was in question.
+
+  ### Step 2 — the axis at 256, and what the gates say
+
+  | gate | T=10 (before) | T=256, 10 real ids | T=256, no `_edge_fill` |
+  |---|---|---|---|
+  | `dp` duration | 1.19209e-07 | **0** | 0.0291 (1.8% short) ❌ |
+  | `ttl_text` `txt_emb` | 2.14577e-06 | 2.0843e-06 | 1.00379 ❌ |
+  | `vfe` velocity | 5.13345e-06 | 5.66989e-06 | 5.66989e-06 ✓ |
+  | frozen F1 waveform | 3.45102e-06 | 4.70784e-06 | **0.379652** ❌ |
+
+  The frozen fixture became the test of the new capability rather than a casualty of it, exactly as
+  scoped: the same ten ids padded to 256 reproduce the waveform the retired C++ driver left behind, to
+  4.7e-06 against a 1e-3 target. **And the gate can fail** — the last column is a real export with the
+  fill removed, and it is worth reading twice: a 0.38 max-abs error on the waveform is audibly wrong
+  audio, which is precisely the "longer, more usable-looking input and quietly wrong audio" the scoping
+  warned about. `vfe` passing there is not a weakness of the falsification; it is the prediction that
+  the VFE's masking was already correct, confirmed.
+
+  ### A new gate, because ten ids is the empty string
+
+  `test_e2e_supertonic_mil_real_text.cpp` runs a real 161-id sentence — the only shape where the
+  real/padding boundary sits in the *middle* of the axis rather than at its very end — against the real
+  Python pipeline's own unpadded answer for that sentence (`reference_forward_supertonic_mil_extra.py`
+  grew a third case). Four checks, in the order a failure is worth reading:
+
+  1. **The ids**, from `loom::SupertonicTextVectorizer` reading the GGUF's own vocabulary against what
+     the real `TextVectorizer` produced. First because every number after it is meaningless if the two
+     tokenized different text — and it is a real cross-check of two independent implementations at a
+     string neither was tuned on. **Identical.**
+  2. **The duration**, relative rather than absolute, because this sentence is ~10.6 s where the ten-id
+     fixtures are ~1.6 s. **Exact to 0** (10.581952 s).
+  3. **`txt_emb`** over the real columns, plus an exact zero over the padded ones. **4.55976e-06**, tail
+     exactly 0.
+  4. **The driver**, end to end. Checks 1–3 build the graphs directly and pad by hand, which
+     re-implements `01_text_inputs.lua` rather than testing it, and every other end-to-end test hands
+     `infer` exactly ten ids — so nothing else exercises the branch where the driver has real padding to
+     do. There is no waveform oracle (the CFM noise is the driver's own), so what is checked is the
+     sample COUNT, which the reference duration fixes exactly through the driver's own `get_latent_mask`
+     arithmetic, plus a peak-amplitude floor so that silence cannot pass. **466944 samples (10.59 s of
+     real audio from real text), peak 0.175, in 4.3 s wall.**
+  5. **The ceiling is a ceiling.** `txt_len + 1` ids must be REFUSED — by name, from the driver, not by
+     a shape mismatch deep in the engine and above all not by silently dropping the tail, which would
+     produce perfectly plausible audio of the wrong words. `LoomLuaBridge::call: error in 'infer':
+     ...:74: supertonic: 257 txt_ids exceeds this export's T_TEXT of 256`. The branch was written in
+     step 2 and unexercised until this check; it is exactly the kind of guard that is worth nothing
+     until something proves it is reachable.
+
+  Without the fill, three of the four fail: duration 1% short, `txt_emb` off by 0.285, and the driver
+  emits 463872 samples — 151 latent frames where the reference implies 152. The tokenizer check and the
+  peak floor stay green, correctly: neither is about padding.
+
+  The fill was also checked in PyTorch across four real texts (12, 21, 53 and 161 ids at N=256): every
+  duration matches to ≤4.8e-07 and every `txt_emb` to ≤5.9e-05, which is fp32 reduction-order noise from
+  the wider matmuls rather than a residual mechanism.
+
+  ### Why 256 and not 512 — measured, not chosen
+
+  The axis is static, so its cost is paid on **every** synthesis regardless of how long the real text
+  is. Full 1.6 s synthesis, this machine: **T=10 → 1.65 s / 275 MB, T=256 → 2.14 s / 291 MB, T=512 →
+  2.72 s / 330 MB.** 512 is 27% more wall clock and 39 MB for capacity the overwhelming majority of
+  calls would not touch, on an engine whose target is edge devices. Accuracy does not enter into it —
+  the `ttl_text` gate reports 2.0843e-06 at both. 256 ids is roughly 245 characters after the wrap:
+  `"Hi."` is 12 ids, `"hello world"` 21, a 44-character sentence 53, a 155-character one 161.
+
+  ### Blast radius, as executed
+
+  *loom-exporter:* `supertonic_export.py` (three wrappers, three `mil_inputs` lists, the constant,
+  `PAD_ID`, `_edge_fill`/`_patch_text_convnext`, `driver_components`, `hparams`),
+  `supertonic_driver/01_text_inputs.lua` (new) and `00_header.lua`,
+  `reference_forward_supertonic_mil_extra.py` (the real-text case), `tools/build_model_cards.py` (the
+  "Known limitations" section is now a ceiling rather than a refusal, and the snippet no longer warns
+  about length), one `tests/ci` topology declaration. *loom.cpp:* the four
+  `test_e2e_supertonic_mil_*.cpp` gates, the new `real_text` one and its `CMakeLists.txt` entry,
+  `tests/support/tts_driver_inputs.h`'s comment (its `txt_len_fixed = 10` still describes the *bespoke*
+  conversion and is deliberately not a second copy of the MIL number), and `tools/loom_cli`'s hint,
+  which told users to "pad or shorten" anything that was not exactly `txt_len`. **No engine source
+  change, as predicted** — no new binding, no new primitive. *loom-py:* none.
+
+  Nothing shared changed, so no other model in the sweep can have moved; the diff is confined to
+  `supertonic_export.py`, its driver fragments, its fixture generator, the model-card catalogue and
+  supertonic's own tests.
+
+  ### Two follow-ups, settled 2026-08-12 by explicit user direction
+
+  **(a) Chunking long text is OUT OF SCOPE for the engine and the driver — closed, not deferred.**
+  Unlike ASR's *output* chunking (family 3's segmented prefill, P4.3/P4.3d/P4.3e), which is the model's
+  own contract and therefore has to live in the driver, splitting an over-long utterance is
+  preprocessing: it is a decision about where sentences may be broken, which is a text-domain question
+  the engine has no business answering, and the pieces are then just ordinary calls. It does not belong
+  behind `infer`. The ceiling is reported as `loom.txt_len` and enforced by a named error (check 5
+  above), which is the whole of what the engine owes a caller here.
+
+  **(b) A BUCKETED text axis — DONE (2026-08-12, P4.6a), built before P5 by explicit user direction.**
+  The ceiling and the per-call cost used to be the same number, which is the only reason 256 was a
+  compromise at all: a static axis is paid for on every call, so "long enough to be useful" and "cheap
+  enough to always pay" had to be traded against each other. Each text-touching topology is now traced
+  at every width in `TEXT_BUCKETS = (32, 64, 128, 256, 512)`, and the driver runs the smallest that
+  fits `#inputs.txt_ids`.
+
+  **The result is the trade removed rather than re-struck: the ceiling DOUBLED to 512 and an ordinary
+  call got faster than it was at 256.** Full 1.6 s synthesis on this machine, same test, same host:
+
+  | export | ceiling | 10-id synthesis | peak RSS |
+  |---|---|---|---|
+  | fixed 10 (pre-P4.6) | 10 — unusable | 1.65 s | 275 MB |
+  | fixed 256 (P4.6) | 256 | 2.14 s | 291 MB |
+  | fixed 512 | 512 | 2.72 s | 330 MB |
+  | **bucketed** | **512** | **1.96 s** | **289 MB** |
+
+  The bucketed row includes loading a file with sixteen topologies instead of four, so it is a fair
+  comparison and not a favourable one. Against the fixed-512 export it is the same ceiling for 28% less
+  wall clock; against the shipped fixed-256 one it is twice the ceiling and still faster.
+
+  **What it cost, against what was predicted when this was scoped:**
+  * **Weights: nothing, as predicted.** The GGUF writer dedups by content hash (dtype + shape + bytes),
+    so every bucket's identical weights alias despite differing namespaced names — 2333 aliased tensors.
+    The file went 263.0 → 268.2 MB, **+5.2 MB for five buckets**, all of it the genuinely T-dependent
+    constant-folded `(1, 2T-1, D)` relative-position tables.
+  * **Metadata: +0.94 MB** (263 KB → 1204 KB), against a predicted ~+0.7 MB for four buckets. Five.
+  * **Export time: 36 s → 1 m 52 s.** Fifteen traces instead of three. This is the real cost and it is
+    paid once, by whoever exports.
+  * **No engine source change**, again. The host side needed one change and it is a simplification:
+    register what `topology_names()` reports instead of naming four topologies by hand, which is what a
+    host should have been doing anyway.
+
+  **Two shared-machinery generalizations, and neither is a Supertonic special case.** The scoping said
+  "no new machinery", which was right about the ENGINE and wrong about the exporter — `ComputedCall`
+  covers a computed name in *hand-written* Lua, and both of Supertonic's computed call sites are
+  synthesized IR, where dropping to text would have cost the output-arity and define-before-read checks
+  that are the reason the driver is IR at all. So:
+  * `SubgraphCallComponent` gained `topology_expr` + `variants`, and `driver_ir.SubgraphCall` gained
+    `module_expr`. `topology` stays a real name — the canonical member — so every check the component
+    already had keeps running against it, and `sub_specs()` extends the declared-input check to the
+    rest through the same `EstimatorSpec` a hand-written call site uses.
+  * `FlowMatchingSpec` gained `estimator_variants`, so the generated sampler takes its estimator as an
+    argument. `vfe` had to be bucketed — it runs once per CFM step, so leaving it at the ceiling would
+    have given back most of what the other two save — and that is the template's business, not a
+    Supertonic patch. Matcha declares no variants and its generated Lua is byte-identical (verified by
+    rendering it: `local function sample_decoder(length, n_elems, n_steps, step_inputs)` and
+    `loom.run_subgraph("decoder", ...)`, unchanged).
+
+  `called_topologies` needed widening too, and it reported the problem itself: twelve of the sixteen
+  topologies came out as "no call site names" because it recognized `RunSubgraphCall` by class rather
+  than reading the topology field off whatever a sub-spec declares. The same lesson `_names_a_topology`
+  records one wrapper deeper, so the fix matches it — read the declaration, not the class.
+
+  **Why this ladder.** `<lang>` plus the inserted final period costs 10 ids flat, so 32 is ~22 real
+  characters ("Hi." is 12 ids, "hello world" 21), 128 a sentence (a 44-character one is 53), 512 a
+  short paragraph (~490 characters). Doubling holds worst-case waste just under half the axis while
+  keeping the ladder short enough that export time stays in minutes.
+
+  **Gates.** The existing ones, and they got sharper for free rather than being rewritten: the ten-id
+  fixtures now land in **bucket 32** and the real-text sentence in **bucket 256**, so two different
+  exported widths are exercised by tests that already existed. `tests/support/supertonic_buckets.h`
+  DISCOVERS the widths from `topology_names()` rather than listing them, which is what keeps those
+  tests checking the export instead of agreeing with themselves. Results: duration exact, `txt_emb`
+  2.74e-06 at bucket 32 and 4.56e-06 at 256, padded tails exactly zero, and the frozen F1 waveform —
+  ground truth from a retired C++ driver that predates padding *and* buckets — still holds at
+  5.065e-06 against a 1e-3 target.
+
+  Two failures found by the gates while building this, both worth recording because both were mine:
+  the ceiling check in `real_text` used the sentence's own bucket rather than the largest one, so it
+  asked for 257 ids and got audio (correctly — 257 fits in 512); and `test_driver_components` was
+  updated to build its fake topologies from `TEXT_BUCKETS` after the first attempt spelled the names
+  out by hand, which would have made it agree with itself.
+
+  **The damper stands.** Text length and `t_lat` correlate, because the duration is predicted from the
+  text, so the worst padding waste is still on short utterances where total latency is already lowest.
+  Bucketing is why that waste is now bounded by the *next rung down* rather than by the ceiling.
+
+  ### P4.6b — the voice style is optional, and one travels in the file — DONE (2026-08-12)
+
+  **The report was "we can't use different styles"; the finding was that the ceiling was lower than
+  that.** `style_ttl`/`style_dp` have always been `infer` inputs, the driver has always passed them
+  through, and loom-py forwards any named array — so a *different* style always worked, and the gate
+  test has been loading `F1.json` and using it since the file existed. What did not work was using
+  **any** style: a published GGUF carried none, so every caller needed the upstream checkpoint repo to
+  get one, and the model card's own snippet said `style_ttl=style_ttl` referencing a variable it never
+  defined. Worth recording because the fix that the literal request implies — "expose them as input
+  arguments" — was already done, and doing it again would have changed nothing.
+
+  So: **both style inputs are OPTIONAL, and the checkpoint's own F1 embeddings ship in the GGUF as the
+  default.** Resolution order is `[[feedback_optional_arg_then_autodetect]]` with the middle rung
+  absent — an explicit argument, else the default; there is nothing to autodetect about a voice.
+
+  **F1 specifically, and not as a coin flip:** it is the style
+  `legacy_driver_reference/supertonic_driver_waveform_F1.npy` was recorded with, so "call `infer` with
+  no style at all" is gated by ground truth that already existed rather than by a fixture recording the
+  decision itself.
+
+  **A third kind of thing a GGUF can carry, and the first time anything needed it.** The two tensors
+  are read by the DRIVER (`loom.get_weight`), not by any topology node — so `_prune_dead_weights`
+  deletes them by construction, since its rule is "no node names it as an input". `write_gguf` gained
+  `driver_weights`, merged in *after* pruning rather than exempted from it: the pruner's own job is
+  catching MIL's incidental attribute constants, and weakening its rule would have cost more than
+  ordering around it. They cannot be `ExportConstants` — 12928 float literals would swamp a driver
+  script that is 6 KB and meant to be read out of the GGUF by a person. Cost: 51.7 KB.
+
+  `loom.get_weight`'s first argument is any *registered module*, and every module shares one
+  `GgufModel`, so the driver reads through `"decoder"` — the one topology whose name carries no text
+  bucket and is therefore spelled the same at every text length.
+
+  **Gates, in the driver test, all three needed:**
+  1. **Omitting the style reproduces passing F1 bit-for-bit** — `max_abs_diff` exactly **0**, not
+     "close": the driver either reached the same numbers or it did not, and there is no arithmetic in
+     between to blur it.
+  2. **The frozen F1 waveform still holds**, 5.065e-06.
+  3. **A different voice produces different audio.** Without this the first two are *both* satisfied by
+     a driver that ignores `inputs.style_*` and always uses the default — passing F1 would match the F1
+     fixture for the wrong reason. M1 gives **76800 samples against F1's 70656** (a different voice
+     predicts a different duration) and 0.268 max-abs where they overlap.
+
+  Skipped rather than failed for a non-F1 style or a GGUF with no default, so the test's meaning does
+  not depend on which fixture the runner points at.
+
+  **Still out of scope, and a genuinely bigger thing: deriving a style from your own audio.**
+  `SpeechGenerator.encode_voice_style` runs mel → `SpeechEncoder` → `lat_compressor` → the two style
+  encoders, i.e. three more real modules than this export traces, plus a second entry point. Selecting
+  among existing voices — which is what was actually asked for — needs none of it. The model card now
+  says which of the two it can do.
 
 #### P5 — breadth
 

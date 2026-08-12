@@ -49,6 +49,9 @@ int main() {
     auto vec = loom::SupertonicTextVectorizer::load(*model);
     LOOM_CHECK(vec != nullptr);
     LOOM_CHECK(vec->vocab_size() == 65536); // real unicode_indexer.json is a flat BMP-sized array
+    // ...of which only 162 entries are mapped, onto ids 0..161. The real `nn.Embedding` has 163 rows;
+    // the spare one is headroom no codepoint reaches (see supertonic_common.py), so it is not counted.
+    LOOM_CHECK(vec->n_tokens() == 162);
 
     {
         const auto ids = vec->tokenize("hello world", "en");
@@ -112,6 +115,26 @@ int main() {
         const std::vector<int32_t> expected = {27, 66, 70, 28, 106, 114, 138, 97, 120, 154, 13, 27, 14,
                                                 66, 70, 28};
         LOOM_CHECK(ids == expected);
+    }
+    {
+        // An omitted lang uses the file's own declared default. A GGUF written before
+        // "tokenizer.ggml.supertonic.default_lang" existed carries no such KV and falls back to "en",
+        // which is why this asserts the RESULT rather than the KV: both spellings must reach the same
+        // ids the explicit "en" cases above produce.
+        LOOM_CHECK(vec->tokenize("hello world") == vec->tokenize("hello world", vec->default_lang()));
+        if (vec->default_lang() == "en") {
+            const std::vector<int32_t> expected = {27, 60, 69, 28, 63, 60, 67, 67, 70, 0, 78, 70, 73, 67,
+                                                    59, 13, 27, 14, 60, 69, 28};
+            LOOM_CHECK(vec->tokenize("hello world") == expected);
+        }
+    }
+    {
+        // The real asset is injective (162 codepoints -> 162 distinct ids), so the ids round-trip back to
+        // the PREPROCESSED text -- wrap, inserted period and all. Checking the whole wrapped string rather
+        // than "hello world" is the point: detokenize inverts the table, not the pipeline.
+        LOOM_CHECK(vec->detokenize(vec->tokenize("hello world", "en")) == "<en>hello world.</en>");
+        // Id 162 is the spare embedding row no codepoint maps to; it drops, like an unsupported codepoint.
+        LOOM_CHECK(vec->detokenize({60, 162, 69}) == "en");
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

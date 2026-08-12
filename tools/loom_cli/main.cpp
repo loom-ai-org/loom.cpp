@@ -476,6 +476,34 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "supertonic") {
+            // SupertonicTTS's grapheme text front-end: inspection-only, same reasoning as the two branches
+            // above. Falling THROUGH to the generation path below would have been the bug this branch
+            // exists to prevent -- that path's `bpe_vocab` stays null for any non-"gpt2" tag, so a
+            // supertonic GGUF's `--prompt` would have been parsed as literal token ids rather than
+            // encoded, and the model's own vocabulary silently ignored.
+            auto text_vec = loom::SupertonicTextVectorizer::load(*model);
+            std::printf("  tokenizer: grapheme codepoints (supertonic), %zu tokens, default lang \"%s\"\n",
+                        text_vec->n_tokens(), text_vec->default_lang().c_str());
+            if (has_prompt) {
+                const auto ids = text_vec->tokenize(prompt_text);
+                std::printf("  encode(\"%s\") -> [", prompt_text.c_str());
+                for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? ", " : "", ids[i]);
+                std::printf("]\n");
+                // The one number that decides whether those ids are usable: every text-touching topology
+                // in this export was traced at a FIXED length, so it is a CEILING on what a caller may
+                // send. It was an exact requirement until the driver started padding (BACKLOG.md P4.6),
+                // and printing "pad or shorten" at anything under it now would be telling a user to fix
+                // something that already works.
+                if (model->has_kv("loom.txt_len")) {
+                    const uint32_t txt_len = model->hparam_u32("txt_len");
+                    std::printf("  loom.txt_len = %u (max; the driver pads)%s\n", txt_len,
+                                ids.size() <= txt_len ? "" : "  <-- encoded length EXCEEDS it; shorten");
+                }
+            }
+            return 0;
+        }
+
         if (has_prompt) {
             std::unique_ptr<loom::BpeVocab> bpe_vocab;
             if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "gpt2") {
