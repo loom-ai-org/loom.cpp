@@ -3507,6 +3507,49 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   `supertonic_export.py`, its driver fragments, its fixture generator, the model-card catalogue and
   supertonic's own tests.
 
+  ### Two follow-ups, settled 2026-08-12 by explicit user direction
+
+  **(a) Chunking long text is OUT OF SCOPE for the engine and the driver — closed, not deferred.**
+  Unlike ASR's *output* chunking (family 3's segmented prefill, P4.3/P4.3d/P4.3e), which is the model's
+  own contract and therefore has to live in the driver, splitting an over-long utterance is
+  preprocessing: it is a decision about where sentences may be broken, which is a text-domain question
+  the engine has no business answering, and the pieces are then just ordinary calls. It does not belong
+  behind `infer`. The ceiling is reported as `loom.txt_len` and enforced by a named error (check 5
+  above), which is the whole of what the engine owes a caller here.
+
+  **(b) A BUCKETED text axis — scoped, not started.** The ceiling and the per-call cost are currently
+  the same number, which is the only reason 256 was a compromise at all: a static axis is paid for on
+  every call, so "long enough to be useful" and "cheap enough to always pay" had to be traded against
+  each other. Exporting each text-touching topology at several widths and letting the driver pick the
+  smallest that fits `#inputs.txt_ids` **decouples them** — the hard limit could be 1024 while
+  `"hello world"` pays for 32. Same idea as the bucketed KV-cache graph reuse this project already
+  deferred once.
+
+  What makes it cheap, checked rather than assumed:
+  * **Weights cost nothing.** The GGUF writer dedups by **content hash (dtype + shape + bytes), not by
+    name** (`exporter.py`), so `dp@64`'s and `dp@256`'s identical weights alias automatically even
+    though their namespaced names differ. Only genuinely T-dependent constants are stored per bucket —
+    the constant-folded `(1, 2T-1, D)` relative-position tables — which is single-digit MB across four
+    buckets against a 263 MB file.
+  * **Metadata cost is small and now measured.** The three text topologies are 36.1 + 55.9 + 140.4 =
+    232 KB of JSON; four buckets is ~930 KB, i.e. +0.7 MB. `vfe` dominates and is also the one that
+    must be bucketed for the win to be real, since it is called once per CFM step.
+  * **No new machinery in either repo.** `GgufModel::topology_names()` already lets a host enumerate and
+    register what it finds, and `ComputedCall` (P4.0.7/D.2, already used by Kokoro, StyleTTS2 and the
+    transducer) already covers a driver call site whose topology name is computed at run time.
+  * **No new correctness surface.** Each bucket is a fully static trace exactly like today's — this
+    needs none of the dynamic-shape machinery coremltools refuses anyway, and none of the
+    length-dependent-constant hazards that cost Milestone 7 a day. `_edge_fill` is length-agnostic by
+    construction, so every bucket is gated by the gates that already exist, at a different T.
+
+  The honest damper, and the reason this is an optimization rather than a fix: **text length and
+  `t_lat` correlate**, because the duration is *predicted from the text*. So the worst padding waste
+  happens exactly when the utterance is short — which is also when total latency is already lowest.
+  The measured envelope is the whole text-axis cost at 256 on a 1.6 s clip: 2.14 s against 1.65 s at
+  T=10, so ~23% of that call. Real, bounded, and worth having; not urgent.
+
+  Its cost is export time — tracing `vfe` once per bucket — and one more decision in the driver.
+
 #### P5 — breadth
 
 Ordered by coverage-per-effort, subject to P0.3's corrections: family 12 (BERT token classifiers —
