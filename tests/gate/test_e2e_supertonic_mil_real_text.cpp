@@ -16,7 +16,7 @@
 // one. So this asks: does the padded export reproduce, for real text, exactly the answer the real
 // Python produces for that text?
 //
-// Three checks, in order of what they would catch:
+// Four checks, in order of what they would catch:
 //   1. The ids. `loom::SupertonicTextVectorizer` reading the GGUF's own vocabulary must produce the
 //      same ids the real Python `TextVectorizer` produced into the fixture. This runs FIRST because
 //      every number below is meaningless if the two implementations tokenized different text -- and
@@ -24,6 +24,13 @@
 //   2. `dp`'s duration. A wrong one is audio of the wrong LENGTH, which is how a padding bug in the
 //      DPTextEncoder's attention-weighted pooling would present: not as a numeric near-miss.
 //   3. `ttl_text`'s embedding over the real columns, plus an exact zero over the padded ones.
+//   4. The DRIVER, end to end, at this length -- because 1-3 build the graphs directly and pad by
+//      hand, which is a re-implementation of `supertonic_driver/01_text_inputs.lua` rather than a
+//      test of it. Every other end-to-end test hands `infer` exactly ten ids, so nothing else
+//      exercises the branch where the driver has real padding to do. There is no waveform oracle
+//      here (the CFM noise is the driver's own), so what is checked is the sample COUNT, which the
+//      reference duration determines exactly through the driver's own `get_latent_mask` arithmetic:
+//      a driver that mis-padded would predict a different duration and produce a different length.
 //
 // Skips cleanly if the GGUF/reference files aren't present.
 
@@ -183,6 +190,53 @@ int main() {
                      max_abs_diff, n_real, max_abs_pad);
         LOOM_CHECK(max_abs_diff < 1e-2);
         LOOM_CHECK(max_abs_pad == 0.0);
+    }
+
+    // --- 4. the driver, at this length, through its own padding ---
+    {
+        const std::string driver_script = model->kv_str("model.driver_script");
+        LOOM_CHECK(!driver_script.empty());
+
+        loom::LoomLuaBridge bridge(backend.get());
+        for (const char* name : {"dp", "ttl_text", "vfe", "decoder"}) {
+            bridge.register_module(name, *model, loom::GraphTopology::parse(model->topology_json(name)));
+        }
+        bridge.load_script(driver_script);
+
+        // The ids as the tokenizer produced them -- NOT padded. Padding is what the driver is being
+        // tested on, so doing it here would test nothing.
+        const std::vector<double> ids_d(ids.begin(), ids.end());
+        const std::vector<double> ttl_d(ttl_stl.begin(), ttl_stl.end());
+        const std::vector<double> dp_d(dp_stl.begin(), dp_stl.end());
+        constexpr uint32_t kNSteps = 2;  // enough to run the loop; this check is about length, not audio
+        loom::LoomLuaBridge::Value result = bridge.call("infer", {
+            {"txt_ids", ids_d},
+            {"style_ttl", ttl_d},
+            {"style_dp", dp_d},
+            {"n_steps", static_cast<double>(kNSteps)},
+            {"seed", 42.0},
+        });
+        const auto& wav = std::get<std::vector<double>>(result);
+
+        // supertonic_driver/02_latent_length.lua's own arithmetic, from the REFERENCE duration --
+        // which is the point: the driver's `dp` call has to have predicted the same one.
+        constexpr uint32_t kSampleRate = 44100;
+        constexpr uint32_t kBaseChunk = 512;
+        constexpr uint32_t kCompression = 6;
+        const uint32_t latent_size = kBaseChunk * kCompression;
+        const uint32_t wav_length = static_cast<uint32_t>(expected_duration[0] * kSampleRate);
+        const uint32_t t_lat = (wav_length + latent_size - 1) / latent_size;
+        const size_t expected_samples = static_cast<size_t>(t_lat) * latent_size;
+        std::fprintf(stderr, "driver: %zu ids -> %zu samples (%.2f s), expected %zu\n",
+                     ids.size(), wav.size(), static_cast<double>(wav.size()) / kSampleRate,
+                     expected_samples);
+        LOOM_CHECK(wav.size() == expected_samples);
+        // ...and it has to be audio, not silence: a driver that fed the graphs all-zero ids would
+        // still get the length right if the duration happened to survive.
+        double peak = 0.0;
+        for (double s : wav) peak = std::max(peak, std::fabs(s));
+        std::fprintf(stderr, "driver: waveform peak=%g\n", peak);
+        LOOM_CHECK(peak > 1e-3);
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

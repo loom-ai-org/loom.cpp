@@ -3448,12 +3448,27 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   `test_e2e_supertonic_mil_real_text.cpp` runs a real 161-id sentence — the only shape where the
   real/padding boundary sits in the *middle* of the axis rather than at its very end — against the real
   Python pipeline's own unpadded answer for that sentence (`reference_forward_supertonic_mil_extra.py`
-  grew a third case). It checks three things in order: that `loom::SupertonicTextVectorizer` reading the
-  GGUF's own vocabulary produces the same ids the real `TextVectorizer` did (a cross-check of two
-  independent implementations, and the check that stops the other two comparing different sentences),
-  then the duration, then `txt_emb` over the real columns with an exact zero over the padded ones.
-  Result: ids identical, duration **exact to 0** (10.581952 s), `txt_emb` 4.55976e-06, pad tail exactly
-  0. Without the fill: duration 1% short and `txt_emb` off by 0.285.
+  grew a third case). Four checks, in the order a failure is worth reading:
+
+  1. **The ids**, from `loom::SupertonicTextVectorizer` reading the GGUF's own vocabulary against what
+     the real `TextVectorizer` produced. First because every number after it is meaningless if the two
+     tokenized different text — and it is a real cross-check of two independent implementations at a
+     string neither was tuned on. **Identical.**
+  2. **The duration**, relative rather than absolute, because this sentence is ~10.6 s where the ten-id
+     fixtures are ~1.6 s. **Exact to 0** (10.581952 s).
+  3. **`txt_emb`** over the real columns, plus an exact zero over the padded ones. **4.55976e-06**, tail
+     exactly 0.
+  4. **The driver**, end to end. Checks 1–3 build the graphs directly and pad by hand, which
+     re-implements `01_text_inputs.lua` rather than testing it, and every other end-to-end test hands
+     `infer` exactly ten ids — so nothing else exercises the branch where the driver has real padding to
+     do. There is no waveform oracle (the CFM noise is the driver's own), so what is checked is the
+     sample COUNT, which the reference duration fixes exactly through the driver's own `get_latent_mask`
+     arithmetic, plus a peak-amplitude floor so that silence cannot pass. **466944 samples (10.59 s of
+     real audio from real text), peak 0.175, in 4.3 s wall.**
+
+  Without the fill, three of the four fail: duration 1% short, `txt_emb` off by 0.285, and the driver
+  emits 463872 samples — 151 latent frames where the reference implies 152. The tokenizer check and the
+  peak floor stay green, correctly: neither is about padding.
 
   The fill was also checked in PyTorch across four real texts (12, 21, 53 and 161 ids at N=256): every
   duration matches to ≤4.8e-07 and every `txt_emb` to ≤5.9e-05, which is fp32 reduction-order noise from
