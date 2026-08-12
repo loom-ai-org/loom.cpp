@@ -1,5 +1,6 @@
 #pragma once
 
+#include "loom/core/backend.h"
 #include "loom/core/symbol_table.h"
 
 #include <ggml-cpp.h>
@@ -18,11 +19,12 @@ namespace loom {
 // exposes the embedded JSON graph-topology string plus the model's scalar hyperparameters.
 class GgufModel {
 public:
-    // Loads `path`. Weight tensor data is copied into a buffer allocated on `backend` (CPU-only for
-    // now, but this is the same call site that would target a CUDA/Metal backend later). Throws
-    // loom::LoadError if the file can't be opened/parsed, is missing the "model.graph_topology" KV, or
-    // a tensor's data can't be read.
-    static std::unique_ptr<GgufModel> load(const std::string& path, ggml_backend_t backend);
+    // Loads `path`. Weight tensor data is copied into a buffer allocated on `backends.primary` --
+    // a Vulkan/CUDA/Metal device as readily as the CPU, since every write goes through
+    // ggml_backend_tensor_set rather than a memcpy into `tensor->data`. Throws loom::LoadError if the
+    // file can't be opened/parsed, is missing the "model.graph_topology" KV, or a tensor's data can't be
+    // read.
+    static std::unique_ptr<GgufModel> load(const std::string& path, Backends backends);
 
     // Looks up a weight tensor by its GGUF name (e.g. "blk.0.attn_q.weight"). Throws loom::LoadError if
     // not present -- callers that want a non-throwing check should use has_weight() first.

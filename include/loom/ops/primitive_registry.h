@@ -80,6 +80,32 @@ private:
     static const op_name##_registrar_t op_name##_registrar_instance;                                  \
     }
 
+// ---------------------------------------------------------------------------------------------------
+// READING A TENSOR'S VALUES WHILE THE GRAPH IS STILL BEING BUILT
+// ---------------------------------------------------------------------------------------------------
+// A few primitives need a tensor's CONTENTS at build time, not at compute time -- RANGE_1D's bounds and
+// FILL's shape are values that decide what nodes get built at all. Those reads must go through here.
+//
+// `t->data` is NOT a host pointer in general: on a Vulkan/CUDA/Metal backend it addresses device memory,
+// so the `*(float*)t->data` these primitives used to do reads a device address on the host and either
+// faults or returns garbage (BACKLOG.md P4.7). `ggml_backend_tensor_get` is the portable form and costs
+// nothing extra on a CPU buffer, where it is a memcpy.
+
+// Whether `t` already holds real data -- i.e. it is a weight (or any other tensor allocated before this
+// graph was), rather than an as-yet-unallocated node of the graph under construction. Only a
+// materialized tensor can be read at build time, on any backend.
+bool is_materialized(const ggml_tensor* t);
+
+// Copies the first `nbytes` bytes of `t` into `dst`, from whichever backend holds it. `t` must be
+// materialized; a caller that is not sure asks is_materialized() first.
+void read_tensor_prefix(const ggml_tensor* t, void* dst, size_t nbytes);
+
+// Reads element 0 of `t` as a float, converting from whichever of ggml's f32/i32/i16/i8 types it holds.
+// Returns `fallback` for a tensor that is not materialized or is of some other type -- the callers here
+// are all "use this value if it is knowable, otherwise fall back to an axis", and none of them has
+// anything better to do with an unknowable one.
+float scalar_value_or(const ggml_tensor* t, float fallback);
+
 // Reads a numeric attribute that may be given either as a literal JSON number or as a SymbolEnv
 // expression string (e.g. attrs["eps"] may be 1e-5 or "$rms_norm_eps"). Throws loom::SchemaError if
 // `key` is absent or neither a number nor a string.

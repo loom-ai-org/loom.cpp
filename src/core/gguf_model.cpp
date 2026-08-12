@@ -6,7 +6,11 @@
 
 namespace loom {
 
-std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, ggml_backend_t backend) {
+std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends backends) {
+    // The weights go on the PRIMARY backend and nowhere else. When a scheduler later runs part of the
+    // graph on the CPU, it is the scheduler that makes the host-side copies of whatever weights that
+    // part reads -- an arrangement this loader neither knows nor needs to know about (BACKLOG.md P4.7).
+    ggml_backend_t backend = backends.primary;
     auto model = std::unique_ptr<GgufModel>(new GgufModel());
     model->backend_ = backend;
 

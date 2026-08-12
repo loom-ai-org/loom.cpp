@@ -30,9 +30,9 @@ ctest --test-dir build -L gate    # real exported checkpoints; skips cleanly wit
 
 **A test's directory is which class it is in**, and both are also ctest labels:
 
-* `tests/ci/` (28 executables) needs nothing but this repo, a toolchain and `gguf`+`numpy` — every
+* `tests/ci/` (32 executables) needs nothing but this repo, a toolchain and `gguf`+`numpy` — every
   fixture it reads is generated from `tests/fixtures/*.py` by a ctest step that runs first.
-* `tests/gate/` (78) compares against real exported models. Each exits **77** when its fixture is
+* `tests/gate/` (80) compares against real exported models. Each exits **77** when its fixture is
   absent, which ctest reports as Skipped, so a developer with none of them still gets a green suite
   meaning *nothing hermetic broke*.
 

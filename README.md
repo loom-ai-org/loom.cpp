@@ -81,6 +81,38 @@ cmake --build build -j"$(nproc)"
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
 and run the hermetic suite.
 
+### Running on a GPU
+
+A default build is CPU-only. Compiling a device backend in is a `ggml` option, passed straight through
+— this repo adds no options of its own, because there is nothing per-backend for it to decide:
+
+```sh
+cmake -B build -DGGML_VULKAN=ON     # or -DGGML_CUDA=ON, -DGGML_METAL=ON, -DGGML_SYCL=ON, ...
+cmake --build build -j"$(nproc)"
+
+build/tools/loom_cli/loom_cli --list-devices
+build/tools/loom_cli/loom_cli --device gpu --model model.gguf --wav audio.wav
+```
+
+`--device` takes `auto` (the default, and what `$LOOM_DEVICE` sets), `cpu`, `gpu`, or a device name
+such as `Vulkan0`. **`auto` prefers a device and falls back to the CPU; `gpu` is an error when there
+is none**, because a caller who spelled it out is asking a question about the machine, and answering it
+with a silent CPU run turns "no GPU here" into an unexplained performance number.
+
+Vulkan needs `glslc` and the Vulkan headers, and on an older distribution both are likely too old for
+`ggml`'s Vulkan backend — Debian bookworm's fail in ways that do not name the cause (`glslc` 2023.2
+answers ggml's cooperative-matrix probe as though it supported it, and the build dies in
+`conv2d_mm.comp`; Vulkan-Headers 1.3.239 lack `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` and
+`vk::LayerSettingEXT`). Both are header-only or build-time, so a newer `Vulkan-Headers` checkout on the
+include path and a `glslc` built from `google/shaderc` are enough; the system loader is fine.
+
+**Not every op runs on a device, and that is by design.** Five primitives (`RSQRT`, `ATAN`, `ATAN2`,
+`POW`, `SHAPE`) are host callbacks through `ggml_map_custom` — a C function pointer, so there is
+nothing for a GPU to dispatch. Every device run therefore carries a CPU backend behind it and hands
+both to `ggml_backend_sched`, which cuts the graph at those nodes and runs them on the CPU. The CLI
+prints where each module actually ran; `ctest -L gate -R device_parity` checks that a device gets the
+same answer as the CPU.
+
 ## Testing
 
 Two classes of test, and a test's own directory is which class it is in.
@@ -100,7 +132,7 @@ Point the gate suite at its fixtures with one variable:
 
 ```sh
 export LOOM_FIXTURES=~/loom-fixtures
-scripts/fixtures.py status    # what the 77 gate tests want, and what you have
+scripts/fixtures.py status    # what the gate tests want, and what you have
 scripts/fixtures.py fetch     # from the published fixture repo
 ```
 
@@ -119,13 +151,23 @@ rebuilt is what you do while working on it.
 
 ## Roadmap
 
-**1. GPUs and NPUs.** The engine talks to a single `ggml_backend_t` through a plain `ggml_gallocr` and
-uses no `ggml_backend_sched` at all — fine for CPU, and the one thing that has to change before a
-second device can hold part of a graph. Two existing decisions are waiting on it: `ATTENTION` always
-takes the composite `MUL_MAT`→`soft_max_ext`→`MUL_MAT` path because `ggml_flash_attn_ext` forces an F16
-K/V cast that fights exact fp32 verification, and a `FLASH_ATTENTION` primitive becomes worth adding
-once a GPU makes that trade pay; and retained inter-module outputs are a latent win today that becomes
-a paid one the moment a marshalled edge would mean a device→host→device round trip per step.
+**1. GPUs — done; NPUs, not yet.** The engine takes a device backend and a CPU fallback and schedules
+across them (`BACKLOG.md` P4.7); see [Running on a GPU](#running-on-a-gpu) above. Measured on an AMD
+Vega 3 iGPU against 4 CPU threads, one forward each: Conformer-CTC-small **2.85×**, LFM2-350M **1.54×**,
+Qwen3-0.6B **0.95×** — and that spread is the interesting part. What decides it is how many times the
+scheduler has to cut the graph, which is set by the *export*: 5 splits, 181, 453. `ggml_map_custom` is
+what forces a cut, and Qwen3 has 226 of those because the MIL compiler lowers RMS norm to
+`POW`+`RSQRT`, both host callbacks, when the engine has had a native `RMS_NORM` primitive all along.
+**Fusing that back is the highest-value follow-up on this list, and it is exporter work.**
+
+Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
+one is still open. Retained inter-module outputs turn out not to be what a device charges for — LFM2's
+20-module modular export costs 183 splits against the monolithic export's 181. `FLASH_ATTENTION` is
+still unbuilt: a GPU makes `ggml_flash_attn_ext`'s forced F16 K/V cast worth considering, but what
+stands in the way is the gate suite's exact-fp32 comparisons, not the hardware.
+
+NPUs are untouched. The device layer resolves an accelerator device the same way it resolves a GPU, so
+the selection half is there; nothing has been built or run against one.
 
 **2. Builds for more platforms.** Linux x86-64 is what is built and tested today. Next: macOS on Intel,
 macOS on Apple Silicon, and Linux on ARM — the last of which is the one that matters most for an engine

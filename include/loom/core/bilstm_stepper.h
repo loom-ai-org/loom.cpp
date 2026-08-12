@@ -35,7 +35,7 @@ namespace loom {
 class BiLstmStepper {
 public:
     BiLstmStepper(GgufModel& model, GraphTopology fwd_h_topo, GraphTopology fwd_c_topo,
-                  GraphTopology bwd_h_topo, GraphTopology bwd_c_topo, ggml_backend_t backend,
+                  GraphTopology bwd_h_topo, GraphTopology bwd_c_topo, Backends backends,
                   uint32_t hidden_dim_per_direction);
 
     // sequence: T rows, each input_dim floats. Returns T rows, each 2*hidden_dim_per_direction floats:
@@ -45,7 +45,7 @@ public:
 
 private:
     GgufModel& model_;
-    ggml_backend_t backend_;
+    Backends backends_;
     uint32_t hidden_dim_;
 
     GraphTopology fwd_h_topo_;

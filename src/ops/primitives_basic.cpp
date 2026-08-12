@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace loom {
 namespace {
@@ -322,7 +324,11 @@ Outputs op_log(PrimitiveContext& pc, const Inputs& in, const Json&) {
 // noise_convs, a genuine trained-weight dependency with no reformulation that avoids the transcendental
 // function entirely (unlike RQ_SPLINE_INVERSE's gather-avoidance trick elsewhere in this file). Added via
 // ggml_map_custom2, the same "no native op, no viable composition" escape hatch ggml itself provides for
-// exactly this case -- CPU-only, but this whole engine is CPU-only today (see BACKLOG.md).
+// exactly this case. It takes a C FUNCTION POINTER, so it is CPU-only in a way no amount of backend
+// work changes: there is nothing here for a GPU to dispatch. That is not a barrier to running this
+// model on one -- ggml_backend_sched cuts the graph at nodes like this and runs them on the CPU
+// fallback every device build carries (BACKLOG.md P4.7) -- but it is what makes such a graph a SPLIT
+// one, and each split costs a device->host->device round trip.
 void atan2_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, int ith, int nth, void*) {
     const int64_t ne = ggml_nelements(dst);
     const auto* pa = static_cast<const float*>(a->data);
@@ -422,27 +428,37 @@ Outputs op_shape(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_cast(pc.ctx, f32_shape_vec, GGML_TYPE_I32)};
 }
 
+// in[0] is the target shape (a 1D integer tensor of dimensions), in[1] the scalar to fill with. Both are
+// read at BUILD time through primitive_registry.h's helpers rather than off `->data`, because a shape
+// that decides how many elements the output has cannot wait until compute -- and because on a device
+// backend `->data` is not a host address at all (BACKLOG.md P4.7).
+//
+// The fill itself is a graph op, not a host loop. It used to be `float* d = dst->data; d[i] = v;` over a
+// tensor freshly created in the builder's no_alloc context -- where `data` is ALWAYS null, so any
+// topology that used this primitive dereferenced a null pointer. Nothing exports FILL today, which is
+// the only reason that never showed up as a crash. `clamp(arange, v, v)` is the composition that does
+// it in-graph: an arange supplies exactly `n` elements to be clamped, and clamping to [v, v] leaves
+// every one of them at v, whatever the arange put there.
 Outputs op_fill(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("FILL", in, 2);
-    // in[0] contains the shape (a 1D integer tensor containing the target dimensions)
-    // in[1] contains the fill value (a scalar tensor)
-    const int32_t* dims = static_cast<const int32_t*>(in[0]->data);
+    if (in[0]->type != GGML_TYPE_I32) {
+        throw SchemaError("FILL: the shape input must be i32");
+    }
+    const int64_t rank = std::min<int64_t>(ggml_nelements(in[0]), 4);
+    std::vector<int32_t> dims(static_cast<size_t>(rank));
+    read_tensor_prefix(in[0], dims.data(), dims.size() * sizeof(int32_t));
+
     int64_t ne[4] = {1, 1, 1, 1};
-    int64_t rank = ggml_nelements(in[0]);
-    for (int64_t i = 0; i < rank && i < 4; ++i) {
-        ne[i] = dims[i];
+    for (int64_t i = 0; i < rank; ++i) ne[i] = dims[static_cast<size_t>(i)];
+    const int64_t n = ne[0] * ne[1] * ne[2] * ne[3];
+    if (n <= 0) {
+        throw SchemaError("FILL: the shape input describes " + std::to_string(n) + " elements");
     }
-    ggml_tensor* dst = ggml_new_tensor_4d(pc.ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
-    const float fill_val = *static_cast<const float*>(in[1]->data);
-    
-    // Fill the newly allocated float tensor elements directly
-    float* dst_data = static_cast<float*>(dst->data);
-    int64_t num_elements = ggml_nelements(dst);
-    for (int64_t i = 0; i < num_elements; ++i) {
-        dst_data[i] = fill_val;
-    }
-    
-    return {dst};
+
+    const float fill_val = scalar_value_or(in[1], 0.0f);
+    ggml_tensor* flat = ggml_clamp(pc.ctx, ggml_arange(pc.ctx, 0.0f, static_cast<float>(n), 1.0f),
+                                   fill_val, fill_val);
+    return {ggml_reshape_4d(pc.ctx, flat, ne[0], ne[1], ne[2], ne[3])};
 }
 
 Outputs op_diag_mask_inf(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {

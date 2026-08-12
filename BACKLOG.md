@@ -3747,6 +3747,140 @@ generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (smal
   even all three changes leave Voxtral at ~29 GB against 28, so this is not a fix for that model, and
   should not be scheduled as if it were.
 
+#### P4.7 — the engine runs on a GPU — DONE (2026-08-12)
+
+Roadmap item 1 in the README, and the one thing it named as blocking: the engine talked to a single
+`ggml_backend_t` through a plain `ggml_gallocr` and used no `ggml_backend_sched` at all. It now takes a
+**pair** of backends and schedules across them. A default build is unchanged, byte for byte and
+allocator for allocator; a build configured with `-DGGML_VULKAN=ON` (or `GGML_CUDA`/`GGML_METAL`/...)
+gets a device.
+
+**The type that carries it is `loom::Backends` (`include/loom/core/backend.h`): two non-owning handles,
+`primary` and `fallback`.** It is implicitly constructible from a bare `ggml_backend_t`, which is why
+this landed without touching a single one of the 110 test files that construct one — a bare backend
+still means "one backend, no scheduler", and `hybrid()` is false for it. `loom::Device` is the RAII
+owner and the thing that resolves a spec: argument, then `$LOOM_DEVICE`, then autodetection (the
+project's standing order for anything the machine can answer for itself). `"auto"` prefers a device and
+falls back to the CPU; `"gpu"` **throws** when there is none, because a caller who spelled it out is
+asking a question about the machine and a silent CPU run is how a large slowdown goes unnoticed.
+
+**Two allocation strategies, chosen once per builder by `Backends::hybrid()`** (`graph_builder.h`):
+
+* CPU-only keeps the plain `ggml_gallocr`, the shrink policy P4.0.13/P4.0.15 measured, and everything
+  else exactly as it was. A single-backend graph has nothing to schedule.
+* A device plus its CPU fallback uses `ggml_backend_sched`. `GraphBuilder::compute()` exists because the
+  two need different calls; every compute site in the engine goes through it now.
+
+**Graph reuse survives the scheduler, which was the thing most at risk.** `ggml_backend_sched` keeps
+`is_alloc` set until the next `reset`, so a retained graph is re-run without being re-split or
+re-allocated: a fixed-shape loop still reports `builds()==1`, and a decode loop keeps both its graph and
+its split plan. The scheduler is sized from the BUILT graph (`n_nodes` plus the distinct tensors
+reachable through `src`/`view_src`, an upper bound on `n_nodes + n_leafs`, which is what
+`ggml_backend_sched_alloc_graph` asserts on) rather than from `estimate_graph_size()`'s deliberately
+generous 8x — at that bound the scheduler's own context buffer, `capacity *
+GGML_SCHED_MAX_SPLIT_INPUTS * 2` tensor structs, would be hundreds of megabytes for a graph needing
+tens, on an engine whose target is edge devices.
+
+**Three host-pointer reads had to go first.** `t->data` is a device address on a device backend, and
+`op_range_1d`'s bounds and `op_fill`'s shape both dereferenced it at graph-BUILD time.
+`primitive_registry.h` now carries `is_materialized`/`read_tensor_prefix`/`scalar_value_or`, which go
+through `ggml_backend_tensor_get`. `op_fill` additionally wrote its result through `dst->data` on a
+tensor freshly created in the builder's `no_alloc` context, where `data` is ALWAYS null — a
+null-pointer write on any backend, never noticed because nothing exports `FILL`. It is now
+`clamp(arange, v, v)`, in-graph.
+
+##### What was measured
+
+RADV/GFX9 (AMD Radeon Vega 3, an iGPU) against 4 CPU threads on the same machine, one forward per
+figure, graph built once and reused, `ggml` v0.16.0:
+
+| model | ggml nodes | splits | device / CPU nodes | CPU | GPU | |
+|---|---|---|---|---|---|---|
+| conformer-ctc-small | 2104 | **5** | 2086 / 18 | 144.8 ms | 50.8 ms | **2.85x** |
+| lfm2-350m monolithic | 1204 | **181** | 844 / 360 | 465.7 ms | 302.3 ms | 1.54x |
+| qwen3-0.6b monolithic | 3050 | **453** | 2146 / 904 | 776.1 ms | 818.2 ms | **0.95x** |
+
+**The split count is the whole story, and it is set by the EXPORT, not by the engine.** Every split is
+a device→host→device round trip. What forces them is `ggml_map_custom`: a C function pointer, which no
+backend but the CPU can dispatch. And the reason Qwen3 has 453 of them is that the MIL compiler lowers
+**RMS norm** to `POW → REDUCE_SUM → SCALE → ADD → RSQRT → MUL → MUL`, of which `POW` and `RSQRT` are
+custom ops — 113 of each, exactly 28 layers x 4 norms plus the final one. `SUM_ROWS` and `SCALE` are
+then dragged onto the CPU with them because they sit between two CPU nodes. The engine has had a native
+`RMS_NORM` primitive all along; nothing recognises this sequence as one. Fusing it is the single
+highest-value follow-up this measurement produced, and it belongs in the exporter — see P5 below.
+
+**Fidelity.** Frame-wise and token-wise decisions are identical on every model tried; the elementwise
+gap is fp32 reduction order, except where a model amplifies it:
+
+* qwen3-0.6b logits: max relative 7.5e-4, rms 2.1e-3, **0/8 argmax disagreements**.
+* conformer-ctc: max relative 3.4e-3, **0/17 frame argmax disagreements**.
+* lfm2-350m, monolithic and modular: same next token as the CPU. The modular export runs 20 modules
+  through the Lua bridge with retained outputs crossing between them, which is the arrangement P4.0.12
+  built and the one a device makes expensive — 183 splits against the monolithic export's 181, so
+  decomposing a model costs essentially nothing extra here.
+
+**The conformer's 3.4e-3 was bisected, not accepted.** Truncating the topology's node list and comparing
+each prefix: exact through node 19, then the STFT's `CONV_1D` pair introduces 8.3e-5, and node 33 — the
+log-mel's `LOG` — turns that into 1e-2, because `d(log x) = dx/x` and a near-silent mel bin has a tiny
+`x`. Everything downstream inherits it. Giving the test waveform a 1e-3 noise floor, so no mel bin sits
+at the zero that does the amplifying, takes the output gap from 2.5e-2 to 3.4e-3 — the same arithmetic,
+better conditioned. This is a property of that model's front end, not a measure of backend error, which
+is why `tests/gate/test_e2e_device_parity.cpp` compares the argmax exactly on top of the tolerance.
+
+##### Tests
+
+* `tests/ci/test_device_selection.cpp` — what a spec resolves to and what it refuses. Hermetic, so it
+  names only the CPU and states the rest as invariants ("auto" resolves to a device iff one exists).
+* `tests/ci/test_scheduled_graph.cpp` — the scheduler path driven by `Backends{cpu_a, cpu_b}`: two CPU
+  backends, an arrangement no host would ask for and the only one that exercises the machinery with no
+  GPU present. Parity is exact, reuse counters hold, a rebuild releases the previous allocation.
+  **Its limit is recorded in the file:** swapping `ggml_backend_sched_graph_compute` for the plain
+  `ggml_backend_graph_compute` does NOT turn it red, because two CPU backends put every buffer in host
+  memory. The parity comparison itself is live (feeding the scheduled run different tokens fails it).
+* `tests/gate/test_e2e_device_parity.cpp` — CPU vs device on the real Conformer-CTC encoder. Skips (77)
+  on a missing fixture AND on a build with no device backend, so it is green everywhere it cannot speak.
+  Asserts the device ran the majority of nodes, which is the failure mode "it runs on the GPU now" hides
+  best.
+
+Sharing `LOOM_CONFORMER_CTC_MIL_GGUF` with `test_vocab` turned up a **pre-existing crash in that test**,
+fixed here: `LOOM_CHECK` records a failure and carries on, so a `Vocab::load` returning null — which is
+what an export predating the embedded SentencePiece vocab (P4.0.17 step 3) gives, since it has no
+`tokenizer.ggml.*` KVs at all — was dereferenced on the next line and took the process out with SIGSEGV.
+It now reports and returns. Nothing about a device is involved; pointing that variable at an old
+artifact on disk is all it took, and "this test is broken" was the wrong message for "this fixture is
+too old".
+
+##### Toolchain, on Debian bookworm
+
+Neither of the distro's two relevant packages is new enough for `ggml` v0.16.0's Vulkan backend, and
+both fail in ways that do not name the cause:
+
+* `glslc` 2023.2 answers ggml's `GL_KHR_cooperative_matrix` probe as though it supported it (the probe
+  looks for a specific "extension not supported" string, which this version does not emit), so coopmat
+  shader variants get generated and the build dies in `conv2d_mm.comp` with `'coopmat': undeclared
+  identifier`. Needs a `glslc` new enough to answer honestly, or a build of `google/shaderc`.
+* Vulkan-Headers 1.3.239 lack `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` (1.3.264+) and
+  `vk::LayerSettingEXT` (1.3.272+). The headers are header-only and the loader is ABI-stable, so a
+  newer Vulkan-Headers checkout on the include path is enough; the system `libvulkan.so.1` is fine.
+
+##### What this does NOT cover
+
+* **NPUs.** The device layer resolves `GGML_BACKEND_DEVICE_TYPE_ACCEL` alongside GPU/iGPU, so an
+  accelerator backend would be selected; none has been built or run.
+* **Only Vulkan, only one device.** CUDA, Metal, SYCL and the rest are compile-time switches that were
+  never flipped here. Multi-GPU is not attempted: `Device` initializes exactly one device backend, and
+  `ggml_backend_sched` is handed two backends, not N.
+* **The KV cache on a device is unverified.** It allocates on the primary backend and every write goes
+  through `ggml_backend_tensor_set`, so there is no reason it should not work — but none of the exports
+  on hand uses one (qwen3/lfm2 both re-prefill), so nothing has run it. The first cached export to be
+  tried on a device is where that gets answered.
+* **Quantized weights on a device** (Q8_0 exports) were not run.
+* **`loom-py` ships CPU-only wheels.** The binding takes `device=` and forwards it; a wheel with a
+  device backend compiled in does not exist yet.
+* **Flash attention** is still not a primitive. The README named a GPU as what would make
+  `ggml_flash_attn_ext`'s forced F16 K/V cast worth its precision cost; that trade is now possible to
+  make and has not been made.
+
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 
 The engine, the exporter and a new Python binding are now three repos under
@@ -4959,15 +5093,18 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
   plus a cell-index tensor, the indirection listed as absent under "Scope limitations" below), bucketed
   `n_kv` at 32, and padded the mask host-side — a prefill plus 40 decode steps is now three graphs.
   Read P4.0.15 for where the padding actually happens, which is not where this paragraph guessed.
-- **`ggml_backend_sched` / multi-backend.** Not used anywhere — engine talks to a single `ggml_backend_t`
-  directly via a plain `ggml_gallocr`. Fine for CPU-only; needed once a second backend (CUDA/Metal) is
-  added and graphs need splitting across devices. This is what makes P4.0.12's retained outputs a
-  latent win rather than a paid one: a marshalled inter-module edge is two host copies today and a
-  device→host→device round trip per edge per step the moment this lands.
+- **`ggml_backend_sched` / multi-backend — DONE (P4.7).** A `GraphBuilder` built against a device plus
+  its CPU fallback schedules across the two; a CPU-only one still uses the plain `ggml_gallocr` it always
+  did. The prediction in this entry's own last sentence was measured and came out the other way round:
+  LFM2-350M's 20-module modular export costs **183 splits against the monolithic export's 181**, so the
+  marshalled inter-module edges retained outputs replace are not what a device charges for. What it
+  charges for is `ggml_map_custom` — see P4.7 for the 453 splits an RMS norm lowered to POW+RSQRT buys.
 - **Flash attention.** `ATTENTION` (`src/ops/primitives_attention.cpp`) always uses the composite
   (`MUL_MAT`→`soft_max_ext`→`MUL_MAT`) path — chosen because `ggml_flash_attn_ext` forces an F16 K/V cast
   that fights exact fp32 verification. A `FLASH_ATTENTION` primitive can be added later as a purely
-  additive alternative once a GPU backend makes the perf/precision tradeoff worth it.
+  additive alternative once a GPU backend makes the perf/precision tradeoff worth it. **The GPU exists
+  now (P4.7) and the trade still has not been made** — it is a decision about verification, not a
+  blocked dependency, and the gate suite's exact-fp32 comparisons are what would have to give.
 
 ### Scope limitations (still true)
 

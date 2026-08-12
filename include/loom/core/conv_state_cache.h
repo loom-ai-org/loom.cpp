@@ -1,5 +1,7 @@
 #pragma once
 
+#include "loom/core/backend.h"
+
 #include <ggml-cpp.h>
 
 #include <cstdint>
@@ -80,6 +82,6 @@ class GgufModel;
 //   loom.n_embd_conv     channel count
 //
 // Throws loom::LoadError naming the missing key if any is absent.
-std::unique_ptr<ConvStateCache> make_conv_state_cache(const GgufModel& model, ggml_backend_t backend);
+std::unique_ptr<ConvStateCache> make_conv_state_cache(const GgufModel& model, Backends backends);
 
 } // namespace loom

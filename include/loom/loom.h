@@ -14,6 +14,9 @@
 
 // --- The contract a MIL-exported GGUF actually executes against. A model is a GGUF carrying its own
 //     topologies and its own driver script; these headers are what runs it. ---
+// Device selection: which backend(s) a graph runs on, and the CPU fallback behind a device one. Every
+// header below takes the `Backends` this one defines wherever it used to take a bare `ggml_backend_t`.
+#include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/graph_topology.h"
 #include "loom/core/graph_builder.h"
