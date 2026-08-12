@@ -36,6 +36,7 @@
 
 #include "test_util.h"
 #include "fixtures.h"
+#include "supertonic_buckets.h"
 
 #include "loom/loom.h"
 
@@ -116,12 +117,19 @@ int main() {
     auto model = loom::GgufModel::load(gguf_env, backend.get());
     LOOM_CHECK(model != nullptr);
 
-    const uint32_t t_text = model->hparam_u32("txt_len");
-    std::fprintf(stderr, "txt_len=%u, real sentence is %u ids\n", t_text, n_real);
-    // Not an assertion about the model so much as about this test: a `txt_len` this sentence does not
+    // The bucket the driver would pick, which for a 161-id sentence is deliberately NOT the one the
+    // ten-id tests land in -- so between them the two exercise two different exported widths, which is
+    // the coverage bucketing needs and a single fixture length cannot give (BACKLOG.md P4.6a).
+    uint32_t t_text = 0;
+    const std::string dp_topo = loom_test::supertonic_bucket_topology(*model, "dp", n_real, &t_text);
+    const std::string ttl_topo = loom_test::supertonic_bucket_topology(*model, "ttl_text", n_real);
+    std::fprintf(stderr, "txt_len=%u, real sentence is %u ids -> bucket %u\n",
+                 model->hparam_u32("txt_len"), n_real, t_text);
+    // Not an assertion about the model so much as about this test: a ceiling this sentence does not
     // fit in means the fixture cannot be fed to the export at all, which is a different failure from
     // a numeric one and deserves to say so.
-    LOOM_CHECK(t_text >= n_real);
+    LOOM_CHECK(!dp_topo.empty());
+    LOOM_CHECK(!ttl_topo.empty());
     // ...and the sentence has to actually leave padding behind, or this test is the ten-id test again.
     LOOM_CHECK(n_real < t_text);
 
@@ -139,7 +147,7 @@ int main() {
 
     // --- 2. duration ---
     {
-        loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("dp"));
+        loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(dp_topo));
         loom::GraphBuilder builder(topo, *model, backend.get());
         const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", t_text}, {"n_past", 0}});
         std::vector<float> stl = dp_stl;
@@ -160,7 +168,7 @@ int main() {
 
     // --- 3. txt_emb over the real columns, and exact zero over the padded ones ---
     {
-        loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("ttl_text"));
+        loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(ttl_topo));
         loom::GraphBuilder builder(topo, *model, backend.get());
         const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", t_text}, {"n_past", 0}});
         std::vector<float> stl = ttl_stl;
@@ -197,8 +205,10 @@ int main() {
         const std::string driver_script = model->kv_str("model.driver_script");
         LOOM_CHECK(!driver_script.empty());
 
+        // Every topology in the file, by name off the file -- which is what a real host does now that
+        // the text ones come in buckets and only the driver knows which it will pick.
         loom::LoomLuaBridge bridge(backend.get());
-        for (const char* name : {"dp", "ttl_text", "vfe", "decoder"}) {
+        for (const std::string& name : model->topology_names()) {
             bridge.register_module(name, *model, loom::GraphTopology::parse(model->topology_json(name)));
         }
         bridge.load_script(driver_script);
@@ -244,7 +254,11 @@ int main() {
         // that let a too-long input through would either overrun the input tensor or silently drop
         // the tail, and dropping the tail produces perfectly plausible audio of the wrong words. So
         // the driver checks, and this is what proves the check is reachable.
-        std::vector<double> too_many(static_cast<size_t>(t_text) + 1, 42.0);
+        // One past the CEILING, which is the largest bucket -- not one past the bucket this sentence
+        // landed in, which is merely the next rung up and perfectly synthesizable. Getting that wrong
+        // is what this check caught the first time it ran against a bucketed export.
+        const uint32_t ceiling = model->hparam_u32("txt_len");
+        std::vector<double> too_many(static_cast<size_t>(ceiling) + 1, 42.0);
         bool threw = false;
         std::string message;
         try {
@@ -259,7 +273,7 @@ int main() {
             threw = true;
             message = e.what();
         }
-        std::fprintf(stderr, "driver: %zu ids (ceiling is %u) -> %s\n", too_many.size(), t_text,
+        std::fprintf(stderr, "driver: %zu ids (ceiling is %u) -> %s\n", too_many.size(), ceiling,
                      threw ? message.c_str() : "NO ERROR");
         LOOM_CHECK(threw);
         // Named, not just any failure: a shape mismatch deep in the engine would also throw, and

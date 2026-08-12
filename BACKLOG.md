@@ -50,8 +50,8 @@ Every real sentence overflowed: `"hello world"` encodes to 21. So the vocabulary
 encoding and inspection, and synthesis still effectively took ids directly. Shipped as a "Known
 limitations" section on the model card rather than silently.
 
-**Done as P4.6** (Exporter section), which is where the measurements live. The axis is 256 wide and
-padded, `txt_msk` is a real input, and the driver pads — so `infer` takes any count up to `txt_len`. The
+**Done as P4.6/P4.6a** (Exporter section), which is where the measurements live. The axis is padded and
+traced at five widths up to 512, `txt_msk` is a real input, and the driver picks a width and pads — so `infer` takes any count up to `txt_len`. The
 correction the scoping carried was right (raising the constant *alone* is a trap, because the export
 built `txt_msk` as all-ones) but named the wrong mechanism for *why* padding is not inert: it is
 `ConvNextBlock`'s **replicate** pad, which on a masked tensor replicates a zero column where the
@@ -228,7 +228,7 @@ deliberately rewrite shape attributes, and the per-model reference tests for any
 | **P1** | exporter internals — DONE | R1, R2a, R2b | `compare_snapshots.py` | P0 |
 | **P2** | enable multi-output topologies — DONE | `GraphBuilder`/`run_subgraph` engine support, `generate_graph_topology` + `_prune_dead_nodes` generalization | existing single-output models byte-identical; new multi-output test topology exercised end-to-end | P1 |
 | **P3** | the API skeleton — DONE | R3, R4 | byte-identical re-export of all current models | P2 |
-| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e), plus Supertonic's padded text axis (P4.6, DONE). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
+| **P4** | flagship coverage — **all three flagships DONE**; P4.5 split the tree into three repos | P4.0 carry-over from P3 + the five `EXPORT-PREPARATION.md` items, Whisper (P4.1), GigaAM v3 (P4.2), composition template (P4.3) and its second leaf, Granite Speech (P4.3c), and its chunk-padding follow-ups (P4.3d, P4.3e), plus Supertonic's padded and bucketed text axis (P4.6/P4.6a, DONE). P4.0's own remainders are not all closed — P4.0.11(b), the `KvCache` memory redesign, is explicitly deferred | per-model reference tests | P3 |
 | **P5** | breadth | families 12, 11, 4, 5, 9/10, 6, 13, 14 | per-model reference tests | P4 |
 | **P6** | cleanup | R6 executions, docs | tests green with bespoke converters deleted | trails P4/P5 |
 
@@ -3517,38 +3517,83 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   behind `infer`. The ceiling is reported as `loom.txt_len` and enforced by a named error (check 5
   above), which is the whole of what the engine owes a caller here.
 
-  **(b) A BUCKETED text axis — scoped, not started.** The ceiling and the per-call cost are currently
-  the same number, which is the only reason 256 was a compromise at all: a static axis is paid for on
-  every call, so "long enough to be useful" and "cheap enough to always pay" had to be traded against
-  each other. Exporting each text-touching topology at several widths and letting the driver pick the
-  smallest that fits `#inputs.txt_ids` **decouples them** — the hard limit could be 1024 while
-  `"hello world"` pays for 32. Same idea as the bucketed KV-cache graph reuse this project already
-  deferred once.
+  **(b) A BUCKETED text axis — DONE (2026-08-12, P4.6a), built before P5 by explicit user direction.**
+  The ceiling and the per-call cost used to be the same number, which is the only reason 256 was a
+  compromise at all: a static axis is paid for on every call, so "long enough to be useful" and "cheap
+  enough to always pay" had to be traded against each other. Each text-touching topology is now traced
+  at every width in `TEXT_BUCKETS = (32, 64, 128, 256, 512)`, and the driver runs the smallest that
+  fits `#inputs.txt_ids`.
 
-  What makes it cheap, checked rather than assumed:
-  * **Weights cost nothing.** The GGUF writer dedups by **content hash (dtype + shape + bytes), not by
-    name** (`exporter.py`), so `dp@64`'s and `dp@256`'s identical weights alias automatically even
-    though their namespaced names differ. Only genuinely T-dependent constants are stored per bucket —
-    the constant-folded `(1, 2T-1, D)` relative-position tables — which is single-digit MB across four
-    buckets against a 263 MB file.
-  * **Metadata cost is small and now measured.** The three text topologies are 36.1 + 55.9 + 140.4 =
-    232 KB of JSON; four buckets is ~930 KB, i.e. +0.7 MB. `vfe` dominates and is also the one that
-    must be bucketed for the win to be real, since it is called once per CFM step.
-  * **No new machinery in either repo.** `GgufModel::topology_names()` already lets a host enumerate and
-    register what it finds, and `ComputedCall` (P4.0.7/D.2, already used by Kokoro, StyleTTS2 and the
-    transducer) already covers a driver call site whose topology name is computed at run time.
-  * **No new correctness surface.** Each bucket is a fully static trace exactly like today's — this
-    needs none of the dynamic-shape machinery coremltools refuses anyway, and none of the
-    length-dependent-constant hazards that cost Milestone 7 a day. `_edge_fill` is length-agnostic by
-    construction, so every bucket is gated by the gates that already exist, at a different T.
+  **The result is the trade removed rather than re-struck: the ceiling DOUBLED to 512 and an ordinary
+  call got faster than it was at 256.** Full 1.6 s synthesis on this machine, same test, same host:
 
-  The honest damper, and the reason this is an optimization rather than a fix: **text length and
-  `t_lat` correlate**, because the duration is *predicted from the text*. So the worst padding waste
-  happens exactly when the utterance is short — which is also when total latency is already lowest.
-  The measured envelope is the whole text-axis cost at 256 on a 1.6 s clip: 2.14 s against 1.65 s at
-  T=10, so ~23% of that call. Real, bounded, and worth having; not urgent.
+  | export | ceiling | 10-id synthesis | peak RSS |
+  |---|---|---|---|
+  | fixed 10 (pre-P4.6) | 10 — unusable | 1.65 s | 275 MB |
+  | fixed 256 (P4.6) | 256 | 2.14 s | 291 MB |
+  | fixed 512 | 512 | 2.72 s | 330 MB |
+  | **bucketed** | **512** | **1.96 s** | **289 MB** |
 
-  Its cost is export time — tracing `vfe` once per bucket — and one more decision in the driver.
+  The bucketed row includes loading a file with sixteen topologies instead of four, so it is a fair
+  comparison and not a favourable one. Against the fixed-512 export it is the same ceiling for 28% less
+  wall clock; against the shipped fixed-256 one it is twice the ceiling and still faster.
+
+  **What it cost, against what was predicted when this was scoped:**
+  * **Weights: nothing, as predicted.** The GGUF writer dedups by content hash (dtype + shape + bytes),
+    so every bucket's identical weights alias despite differing namespaced names — 2333 aliased tensors.
+    The file went 263.0 → 268.2 MB, **+5.2 MB for five buckets**, all of it the genuinely T-dependent
+    constant-folded `(1, 2T-1, D)` relative-position tables.
+  * **Metadata: +0.94 MB** (263 KB → 1204 KB), against a predicted ~+0.7 MB for four buckets. Five.
+  * **Export time: 36 s → 1 m 52 s.** Fifteen traces instead of three. This is the real cost and it is
+    paid once, by whoever exports.
+  * **No engine source change**, again. The host side needed one change and it is a simplification:
+    register what `topology_names()` reports instead of naming four topologies by hand, which is what a
+    host should have been doing anyway.
+
+  **Two shared-machinery generalizations, and neither is a Supertonic special case.** The scoping said
+  "no new machinery", which was right about the ENGINE and wrong about the exporter — `ComputedCall`
+  covers a computed name in *hand-written* Lua, and both of Supertonic's computed call sites are
+  synthesized IR, where dropping to text would have cost the output-arity and define-before-read checks
+  that are the reason the driver is IR at all. So:
+  * `SubgraphCallComponent` gained `topology_expr` + `variants`, and `driver_ir.SubgraphCall` gained
+    `module_expr`. `topology` stays a real name — the canonical member — so every check the component
+    already had keeps running against it, and `sub_specs()` extends the declared-input check to the
+    rest through the same `EstimatorSpec` a hand-written call site uses.
+  * `FlowMatchingSpec` gained `estimator_variants`, so the generated sampler takes its estimator as an
+    argument. `vfe` had to be bucketed — it runs once per CFM step, so leaving it at the ceiling would
+    have given back most of what the other two save — and that is the template's business, not a
+    Supertonic patch. Matcha declares no variants and its generated Lua is byte-identical (verified by
+    rendering it: `local function sample_decoder(length, n_elems, n_steps, step_inputs)` and
+    `loom.run_subgraph("decoder", ...)`, unchanged).
+
+  `called_topologies` needed widening too, and it reported the problem itself: twelve of the sixteen
+  topologies came out as "no call site names" because it recognized `RunSubgraphCall` by class rather
+  than reading the topology field off whatever a sub-spec declares. The same lesson `_names_a_topology`
+  records one wrapper deeper, so the fix matches it — read the declaration, not the class.
+
+  **Why this ladder.** `<lang>` plus the inserted final period costs 10 ids flat, so 32 is ~22 real
+  characters ("Hi." is 12 ids, "hello world" 21), 128 a sentence (a 44-character one is 53), 512 a
+  short paragraph (~490 characters). Doubling holds worst-case waste just under half the axis while
+  keeping the ladder short enough that export time stays in minutes.
+
+  **Gates.** The existing ones, and they got sharper for free rather than being rewritten: the ten-id
+  fixtures now land in **bucket 32** and the real-text sentence in **bucket 256**, so two different
+  exported widths are exercised by tests that already existed. `tests/support/supertonic_buckets.h`
+  DISCOVERS the widths from `topology_names()` rather than listing them, which is what keeps those
+  tests checking the export instead of agreeing with themselves. Results: duration exact, `txt_emb`
+  2.74e-06 at bucket 32 and 4.56e-06 at 256, padded tails exactly zero, and the frozen F1 waveform —
+  ground truth from a retired C++ driver that predates padding *and* buckets — still holds at
+  5.065e-06 against a 1e-3 target.
+
+  Two failures found by the gates while building this, both worth recording because both were mine:
+  the ceiling check in `real_text` used the sentence's own bucket rather than the largest one, so it
+  asked for 257 ids and got audio (correctly — 257 fits in 512); and `test_driver_components` was
+  updated to build its fake topologies from `TEXT_BUCKETS` after the first attempt spelled the names
+  out by hand, which would have made it agree with itself.
+
+  **The damper stands.** Text length and `t_lat` correlate, because the duration is predicted from the
+  text, so the worst padding waste is still on short utterances where total latency is already lowest.
+  Bucketing is why that waste is now bounded by the *next rung down* rather than by the ceiling.
 
 #### P5 — breadth
 

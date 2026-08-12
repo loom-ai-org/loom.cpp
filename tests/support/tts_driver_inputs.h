@@ -55,10 +55,11 @@ namespace supertonic { // was loom::SupertonicConfig
 // `txt_ids` is exactly this long. See supertonic_driver.h's own "KNOWN SCOPE LIMITATION" note (retired
 // with it).
 //
-// The MIL export is a different number and deliberately not restated here: `supertonic_export.py`
-// traces a 256-wide PADDED axis and the driver pads to it, so what a caller needs is a ceiling, and
-// the ceiling is `model->hparam_u32("txt_len")` read off the file (BACKLOG.md P4.6 / P4.0.8's first
-// follow-up). Nothing in this repo should carry a second copy of it.
+// The MIL export has no such number and deliberately not a copy of one here: `supertonic_export.py`
+// traces its text-touching graphs at SEVERAL padded widths and the driver runs the smallest that fits
+// (BACKLOG.md P4.6a), so what a caller needs is a ceiling -- `model->hparam_u32("txt_len")`, read off
+// the file (P4.0.8's first follow-up) -- and what a TEST needs is the width the driver would pick,
+// which `support/supertonic_buckets.h` discovers from the model's own `topology_names()`.
 inline constexpr uint32_t txt_len_fixed = 10;
 inline constexpr uint32_t latent_dim = 144;
 inline constexpr float sample_rate = 44100.0f;

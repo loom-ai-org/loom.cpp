@@ -15,6 +15,7 @@
 
 #include "test_util.h"
 #include "fixtures.h"
+#include "supertonic_buckets.h"
 
 #include "loom/loom.h"
 
@@ -78,9 +79,12 @@ int main() {
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_env, backend.get());
     LOOM_CHECK(model != nullptr);
-    const uint32_t t_text = model->hparam_u32("txt_len");
-    LOOM_CHECK(t_text >= kTextLen);
-    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("vfe"));
+    uint32_t t_text = 0;
+    const std::string topo_name = loom_test::supertonic_bucket_topology(*model, "vfe", kTextLen,
+                                                                        &t_text);
+    LOOM_CHECK(!topo_name.empty());
+    std::fprintf(stderr, "bucket: %s (%u real text columns)\n", topo_name.c_str(), kTextLen);
+    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(topo_name));
     loom::GraphBuilder builder(topo, *model, backend.get());
     const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", kL}, {"n_past", 0}});
 
