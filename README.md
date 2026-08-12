@@ -167,8 +167,18 @@ one is still open. Retained inter-module outputs turn out not to be what a devic
 still unbuilt: a GPU makes `ggml_flash_attn_ext`'s forced F16 K/V cast worth considering, but what
 stands in the way is the gate suite's exact-fp32 comparisons, not the hardware.
 
-NPUs are untouched. The device layer resolves an accelerator device the same way it resolves a GPU, so
-the selection half is there; nothing has been built or run against one.
+**What is next is scoped as `BACKLOG.md` P4.8: CUDA, then NPUs.** Sixteen backend directories already
+ship in the pinned ggml — CUDA, Metal, SYCL, OpenCL, HIP, OpenVINO, Hexagon (Qualcomm), CANN (Ascend)
+among them — and because `loom::Device` resolves a spec against ggml's *device registry* rather than
+against any backend name it knows, a CUDA build's `CUDA0` is already selectable by code that has never
+heard of CUDA. Those cost a build matrix and a test run, not C++. CoreML (the Neural Engine, which
+Metal is not) and RKNPU2 are out of tree and cost more, licence check included.
+
+Compiling all of them in would end the leanness this engine is for, so the answer is `GGML_BACKEND_DL`:
+each backend becomes a shared library ggml discovers at run time, one engine binary serves every
+accelerator, and the deployment decides which files travel with it. That already works through
+`loom::Device` unchanged. See P4.8 for what is still missing (a `Backends` that holds more than two, and
+the custom-op fusion above, which on an NPU stops being an optimization and becomes a prerequisite).
 
 **2. Builds for more platforms.** Linux x86-64 is what is built and tested today. Next: macOS on Intel,
 macOS on Apple Silicon, and Linux on ARM — the last of which is the one that matters most for an engine

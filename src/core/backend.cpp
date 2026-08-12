@@ -48,12 +48,24 @@ ggml_backend_dev_t first_offload_device() {
     return nullptr;
 }
 
+std::string device_list_for_error();
+
 ggml_backend_dev_t cpu_device() {
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (dev == nullptr) {
-        // Not reachable in any build this project produces -- ggml always links its CPU backend -- but a
-        // null here would otherwise surface as a crash inside ggml_backend_dev_init.
-        throw Error("loom::Device: ggml reports no CPU device");
+        // Reachable, and for one reason worth naming in the message. A `GGML_BACKEND_DL` build links no
+        // backend at all: each is a shared library discovered at run time beside the executable, in
+        // `GGML_BACKEND_DIR`, or at `$GGML_BACKEND_PATH`. When none is found the registry is EMPTY --
+        // there is no CPU to fall back to, because the CPU is a plugin too -- and every spec including
+        // "cpu" and "auto" arrives here. "ggml reports no CPU device" is true and useless; a deployment
+        // that forgot to ship its backends needs to be told that is what happened (BACKLOG.md P4.8).
+        if (ggml_backend_dev_count() == 0) {
+            throw Error("loom::Device: no ggml backends are available at all. A GGML_BACKEND_DL build "
+                        "loads them as shared libraries at run time -- put the ggml-*.so/.dll files "
+                        "beside the executable, or point $GGML_BACKEND_PATH at one.");
+        }
+        throw Error("loom::Device: ggml reports no CPU device (devices: [" + device_list_for_error() +
+                    "])");
     }
     return dev;
 }
