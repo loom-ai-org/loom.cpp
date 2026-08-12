@@ -3805,9 +3805,35 @@ a device→host→device round trip. What forces them is `ggml_map_custom`: a C 
 backend but the CPU can dispatch. And the reason Qwen3 has 453 of them is that the MIL compiler lowers
 **RMS norm** to `POW → REDUCE_SUM → SCALE → ADD → RSQRT → MUL → MUL`, of which `POW` and `RSQRT` are
 custom ops — 113 of each, exactly 28 layers x 4 norms plus the final one. `SUM_ROWS` and `SCALE` are
-then dragged onto the CPU with them because they sit between two CPU nodes. The engine has had a native
-`RMS_NORM` primitive all along; nothing recognises this sequence as one. Fusing it is the single
-highest-value follow-up this measurement produced, and it belongs in the exporter — see P5 below.
+then dragged onto the CPU with them because they sit between two CPU nodes.
+
+**The engine has a native `RMS_NORM` primitive, and not one exported model uses it.** Counted across all
+thirteen fixtures (`v2/`, exporter HEAD): `RMS_NORM` appears **zero** times, while `POW` appears in ten
+of them and `RSQRT` in three.
+
+| fixture | RMS_NORM | POW | RSQRT | |
+|---|---|---|---|---|
+| causal_lm_kv (qwen3-0.6b) | 0 | 113 | 113 | the 453-split case |
+| lfm2, monolithic and modular | 0 | 45 | 45 | |
+| matcha | 0 | 38 | 32 | |
+| kokoro, styletts2 | 0 | 50 | 0 | `POW` without `RSQRT` — not RMS norm, some other power |
+| conformer, parakeet ×2 | 0 | 3 | 0 | |
+| gigaam, whisper | 0 | 1 | 0 | |
+| supertonic, vits | 0 | 0 | 0 | already free of both |
+
+`exporter.py` DOES map `"rms_norm" → "RMS_NORM"`, so this is not a missing translation — it is a
+translation that never fires, because coremltools' MIL decomposes `torch.nn.RMSNorm` into elementwise
+ops before this exporter ever sees it. Recognising the decomposed sequence and emitting the primitive is
+the single highest-value follow-up this measurement produced. **It is NOT implemented**, and it belongs
+in the exporter — see P5 below, and P4.8, where it stops being an optimization and becomes a
+prerequisite.
+
+Two smaller variants are worth pricing alongside it, because they are engine-side and would reach the
+models RMS-norm fusion does not touch: `POW(x, 2)` is `ggml_sqr` and `POW(x, 0.5)` is `ggml_sqrt`
+whenever the exponent is a materialized constant, which would move Kokoro's and StyleTTS2's fifty apiece
+onto the device. Both change CPU-path arithmetic (`powf(x, 2.0f)` is not guaranteed to equal `x*x`), so
+both need the byte-identity sweep run against them before they can land — which is why they are priced
+here rather than done here.
 
 **The KV cache works on a device**, which the first version of this entry listed as untested because no
 export on hand had one. Re-exporting Qwen3-0.6B-Base against loom-exporter HEAD produced a fused causal
@@ -3930,6 +3956,106 @@ Three decisions in it are worth keeping:
 * **Flash attention** is still not a primitive. The README named a GPU as what would make
   `ggml_flash_attn_ext`'s forced F16 K/V cast worth its precision cost; that trade is now possible to
   make and has not been made.
+
+#### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
+
+P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
+Vulkan. That was a hardware accident, not a decision. What follows is the shape of the rest — CUDA
+next, then NPUs — and, because "compile in every backend" and "the engine targets edge devices" cannot
+both hold, how a build stays as small as the box it ships to.
+
+**Nothing here is started. Every number in it is a count of what upstream ships, not a measurement.**
+
+##### The good news first: tier 1 costs a CMake flag
+
+`ggml` v0.16.0, the revision this repo already pins, ships **sixteen** backend directories: `ggml-cuda`,
+`ggml-metal`, `ggml-vulkan`, `ggml-sycl`, `ggml-opencl`, `ggml-hip`, `ggml-musa`, `ggml-blas`,
+`ggml-rpc`, `ggml-webgpu`, `ggml-cann` (Ascend), `ggml-hexagon` (Qualcomm), `ggml-openvino`,
+`ggml-zdnn`, `ggml-zendnn`, `ggml-virtgpu`.
+
+Two of the four NPU targets named for this item are already in there — **OpenVINO** outright, and
+**Qualcomm** as `ggml-hexagon` rather than as the out-of-tree `ggml-qnn`. Which of those two is the
+right Qualcomm path is a real question and is NOT answered here; in-tree costs nothing to try, so it
+should be tried first.
+
+**And for every one of them, the engine needs no work.** That is what P4.7's device layer bought, and it
+is worth being explicit about why: `loom::Device` resolves a spec against the ggml *device registry*,
+never against a backend name it knows. A CUDA build's `CUDA0` is selectable by `--device cuda0` today,
+by code that has never heard of CUDA. `GGML_BACKEND_DEVICE_TYPE_ACCEL` — what an NPU registers as — is
+already in `is_offload_device()`. The work in tier 1 is a build matrix and a test run, not C++.
+
+##### Tier 2: out of tree, and priced accordingly
+
+**CoreML**, **RKNPU2** (`ggml-rknpu2`, and the `rk-llama.cpp` fork), and `ggml-qnn` if it beats
+`ggml-hexagon` are not in the pinned ggml. Each would mean vendoring a backend or carrying a ggml fork,
+and this repo's dependency policy (`Dependencies.cmake`) is pinned FetchContent of upstream, precisely
+so it never owns somebody else's tree. Before any of them: **check the licence.** The project is MIT and
+has already turned down a dependency over exactly this (Task #79, espeak-ng's GPL-3). A vendored
+backend that cannot be shipped under MIT is not a cheap dependency, it is a relicensing decision.
+
+Note also that CoreML is not Metal. Metal is the GPU and is in tier 1; reaching the **Neural Engine**
+means CoreML, and no ggml backend targets it. That is a bigger piece of work than the others, not a
+sibling of them.
+
+##### The leanness answer, and it is already verified
+
+`GGML_BACKEND_DL`. Each backend becomes a shared library that ggml discovers at RUN time, so one engine
+binary serves every accelerator and the deployment decides which `.so` files travel with it. Measured on
+this machine (`-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON`):
+
+* it works through `loom::Device` **unchanged** — `Device::open` already calls `ggml_backend_load_all()`,
+  and `loom_cli --list-devices` reports a dynamically loaded backend exactly as it reports a linked one;
+* the CPU becomes a plugin too, and splits into per-microarchitecture variants (`libggml-cpu-haswell.so`,
+  `-zen4`, `-sapphirerapids`, …) with the best picked at load time — which is a second, unrelated win:
+  one artifact stops being compiled for one `-march`;
+* discovery order is `GGML_BACKEND_DIR` (compile-time), the executable's directory, the current
+  directory, and `$GGML_BACKEND_PATH` (a specific file);
+* **with no `.so` found, the registry is EMPTY — there is no CPU either.** Every spec, `"cpu"` and
+  `"auto"` included, fails. `loom::Device` now says so in as many words rather than reporting "ggml
+  reports no CPU device", because a deployment that forgot to ship its backends needs to be told that is
+  what happened.
+
+So the guard this item asks for is mostly not a new invention: it is `GGML_BACKEND_DL` plus a decision
+about what each artifact carries. What IS still needed on the engine side is small and namable:
+
+1. **A `Backends` that holds more than two.** `Device` initializes exactly one device backend and hands
+   `ggml_backend_sched` a pair. Two GPUs, or a GPU *and* an NPU, needs a list — `ggml_backend_sched`
+   takes N backends already (CPU last), so this is `loom::Backends` growing a vector and `GraphBuilder`
+   passing it through, not a redesign.
+2. **A device-selection story for more than one match.** `"gpu"` means "the first GPU/iGPU/accelerator
+   registered". With two accelerators of different kinds in a box that stops being a sensible default.
+3. **The custom-op fusion stops being an optimization.** P4.7 measured 453 splits costing Qwen3 its
+   entire speedup on a GPU that supports nearly every op. An NPU supports *far fewer*, so the split
+   count there starts higher and the fallback traffic starts worse. **Fusing RMS norm (above) is a
+   prerequisite for the NPU work, not a follow-up to it.**
+
+##### `loom-py`: profiles, and why a wheel matrix is the wrong first instinct
+
+The axes are architecture (x86-64, arm64) × libc/OS (manylinux, macOS, Windows) × accelerator (none,
+CUDA, Metal, Vulkan, OpenVINO, Hexagon, RKNPU2, CoreML). The full cross product is not a plan, and two
+of the combinations people ask for collapse on inspection: **Metal is Apple-only**, so "Arm + Metal" and
+"Apple Silicon + Metal" are one profile; **Arm + CUDA** is real but means Jetson/Grace, which is a
+distinct manylinux variant rather than a flag.
+
+PyPI wheel tags encode architecture and libc but have **no accelerator dimension**, so an accelerator
+has to be expressed as either a package-name suffix (torch's `cu121` shape — a full wheel per
+accelerator, which is the combinatorial matrix) or as something loaded at run time. `GGML_BACKEND_DL`
+makes the second possible: **one arch-tagged base wheel, plus small `loom-py-backend-*` packages that
+drop a `.so` where ggml looks.** `pip install loom-py-rt[cuda]` then means "also fetch that backend",
+`Model(..., device="auto")` finds it, and a Raspberry Pi installs nothing extra and gets the CPU
+variants it already had. That is the option worth costing first, and the reason to prefer it is not
+elegance — it is that the matrix version multiplies every future backend by every existing platform,
+and this one adds a row.
+
+Either way the *engine* side is the same work, which is why this is one item and not two.
+
+##### What would make this item startable
+
+A machine with the hardware, or CI that has it. Every claim above about tier 1 is "upstream ships a
+directory"; none of it is "we ran it". The honest first step is CUDA on a box that has an NVIDIA GPU —
+it is the most used, it is in tier 1, and `tests/gate/test_e2e_device_parity{,_kv}.cpp` are written
+against "the first non-CPU device" and would run against it unmodified. That test passing on a second
+backend is the evidence that the device layer generalizes; until then, it is a claim.
 
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 
