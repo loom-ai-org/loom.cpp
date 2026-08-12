@@ -3465,6 +3465,12 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
      sample COUNT, which the reference duration fixes exactly through the driver's own `get_latent_mask`
      arithmetic, plus a peak-amplitude floor so that silence cannot pass. **466944 samples (10.59 s of
      real audio from real text), peak 0.175, in 4.3 s wall.**
+  5. **The ceiling is a ceiling.** `txt_len + 1` ids must be REFUSED — by name, from the driver, not by
+     a shape mismatch deep in the engine and above all not by silently dropping the tail, which would
+     produce perfectly plausible audio of the wrong words. `LoomLuaBridge::call: error in 'infer':
+     ...:74: supertonic: 257 txt_ids exceeds this export's T_TEXT of 256`. The branch was written in
+     step 2 and unexercised until this check; it is exactly the kind of guard that is worth nothing
+     until something proves it is reachable.
 
   Without the fill, three of the four fail: duration 1% short, `txt_emb` off by 0.285, and the driver
   emits 463872 samples — 151 latent frames where the reference implies 152. The tokenizer check and the

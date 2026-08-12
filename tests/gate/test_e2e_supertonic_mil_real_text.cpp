@@ -237,6 +237,34 @@ int main() {
         for (double s : wav) peak = std::max(peak, std::fabs(s));
         std::fprintf(stderr, "driver: waveform peak=%g\n", peak);
         LOOM_CHECK(peak > 1e-3);
+
+        // --- 5. and text ABOVE the ceiling is refused, not truncated ---
+        // `txt_len` is a ceiling, not a requirement -- but it is still a ceiling, because the axis is
+        // static in the traced graph. The failure mode worth preventing is the quiet one: a driver
+        // that let a too-long input through would either overrun the input tensor or silently drop
+        // the tail, and dropping the tail produces perfectly plausible audio of the wrong words. So
+        // the driver checks, and this is what proves the check is reachable.
+        std::vector<double> too_many(static_cast<size_t>(t_text) + 1, 42.0);
+        bool threw = false;
+        std::string message;
+        try {
+            bridge.call("infer", {
+                {"txt_ids", too_many},
+                {"style_ttl", ttl_d},
+                {"style_dp", dp_d},
+                {"n_steps", 1.0},
+                {"seed", 42.0},
+            });
+        } catch (const loom::Error& e) {
+            threw = true;
+            message = e.what();
+        }
+        std::fprintf(stderr, "driver: %zu ids (ceiling is %u) -> %s\n", too_many.size(), t_text,
+                     threw ? message.c_str() : "NO ERROR");
+        LOOM_CHECK(threw);
+        // Named, not just any failure: a shape mismatch deep in the engine would also throw, and
+        // would be a much worse thing for a caller to read.
+        LOOM_CHECK(message.find("exceeds this export's T_TEXT") != std::string::npos);
     }
 
     LOOM_TEST_REPORT_AND_RETURN();
