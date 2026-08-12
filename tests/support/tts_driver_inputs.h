@@ -50,9 +50,15 @@ inline constexpr float mel_std = 2.116101f;
 } // namespace matcha
 
 namespace supertonic { // was loom::SupertonicConfig
-// MUST match what convert_supertonic_all.py / export_supertonic_mil.py baked their DPTextEncoder /
-// TTLTextEncoder / VectorFieldEstimator topologies for -- those carry a fixed text length, so `txt_ids`
-// is exactly this long. See supertonic_driver.h's own "KNOWN SCOPE LIMITATION" note (retired with it).
+// MUST match what convert_supertonic_all.py baked its DPTextEncoder / TTLTextEncoder /
+// VectorFieldEstimator topologies for -- that BESPOKE conversion carries a fixed text length, so its
+// `txt_ids` is exactly this long. See supertonic_driver.h's own "KNOWN SCOPE LIMITATION" note (retired
+// with it).
+//
+// The MIL export is a different number and deliberately not restated here: `supertonic_export.py`
+// traces a 256-wide PADDED axis and the driver pads to it, so what a caller needs is a ceiling, and
+// the ceiling is `model->hparam_u32("txt_len")` read off the file (BACKLOG.md P4.6 / P4.0.8's first
+// follow-up). Nothing in this repo should carry a second copy of it.
 inline constexpr uint32_t txt_len_fixed = 10;
 inline constexpr uint32_t latent_dim = 144;
 inline constexpr float sample_rate = 44100.0f;

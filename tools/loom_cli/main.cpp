@@ -491,11 +491,14 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? ", " : "", ids[i]);
                 std::printf("]\n");
                 // The one number that decides whether those ids are usable: every text-touching topology
-                // in this export was traced at a FIXED length, so a caller has to match it exactly.
+                // in this export was traced at a FIXED length, so it is a CEILING on what a caller may
+                // send. It was an exact requirement until the driver started padding (BACKLOG.md P4.6),
+                // and printing "pad or shorten" at anything under it now would be telling a user to fix
+                // something that already works.
                 if (model->has_kv("loom.txt_len")) {
                     const uint32_t txt_len = model->hparam_u32("txt_len");
-                    std::printf("  loom.txt_len = %u%s\n", txt_len,
-                                ids.size() == txt_len ? "" : "  <-- encoded length differs; pad or shorten");
+                    std::printf("  loom.txt_len = %u (max; the driver pads)%s\n", txt_len,
+                                ids.size() <= txt_len ? "" : "  <-- encoded length EXCEEDS it; shorten");
                 }
             }
             return 0;

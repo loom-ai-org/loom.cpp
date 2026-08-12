@@ -111,9 +111,13 @@ int main() {
 
         // How many txt_ids this export accepts, read from the file rather than from a C++ constant
         // (P4.0.8's first follow-up). Every text-touching topology here was traced at a FIXED text
-        // length, so this is not advice -- a caller that sends any other count is calling a model that
-        // cannot run, and until now the only thing that said so was a literal in tts_driver_inputs.h.
-        LOOM_CHECK(txt_ids.size() == model->hparam_u32("txt_len"));
+        // length, so this is not advice -- a caller that sends MORE than this is calling a model that
+        // cannot run, and the only thing that said so used to be a literal in tts_driver_inputs.h.
+        //
+        // It was `==` until P4.6 made the driver pad: the ten ids below are now ten real ids in a
+        // `txt_len`-wide axis, and that this still reproduces a waveform frozen when the axis was
+        // exactly ten wide is the whole point of the comparison at the bottom of this file.
+        LOOM_CHECK(txt_ids.size() <= model->hparam_u32("txt_len"));
 
         loom::LoomLuaBridge bridge(backend.get());
         bridge.register_module("dp", *model, loom::GraphTopology::parse(model->topology_json("dp")));

@@ -1006,6 +1006,15 @@ add_test(NAME test_e2e_supertonic_mil_decoder COMMAND test_e2e_supertonic_mil_de
 set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_mil_decoder PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- The same two text topologies, but at a REAL sentence's length against the real Python pipeline's
+#     own unpadded answer for it (BACKLOG.md P4.6). The four checks above all run ten ids, which is the
+#     empty string after the `<lang>` wrap and leaves the padding boundary at the very end of the axis. ---
+add_executable(test_e2e_supertonic_mil_real_text gate/test_e2e_supertonic_mil_real_text.cpp)
+target_link_libraries(test_e2e_supertonic_mil_real_text PRIVATE loom::engine)
+add_test(NAME test_e2e_supertonic_mil_real_text COMMAND test_e2e_supertonic_mil_real_text)
+set_tests_properties(test_e2e_supertonic_mil_real_text PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_supertonic_mil_real_text PROPERTIES SKIP_RETURN_CODE 77)
+
 # --- Full end-to-end check: the MIL-traced topologies wired via supertonic_driver/, compared
 #     against the existing bespoke loom::SupertonicDriver oracle. Skips cleanly if env vars aren't set. ---
 add_executable(test_e2e_supertonic_mil_lua_driver gate/test_e2e_supertonic_mil_lua_driver.cpp)
