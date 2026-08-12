@@ -56,7 +56,19 @@ int main() {
 
     auto model = loom::GgufModel::load(gguf_path, backend.get());
     auto vocab = loom::Vocab::load(*model);
-    LOOM_CHECK(vocab != nullptr);
+    // Reported and then RETURNED on, not merely checked: LOOM_CHECK records a failure and carries on, so
+    // every line below used to dereference a null Vocab and take the whole test out with SIGSEGV. That is
+    // reachable from an ordinary run -- an export of this model that predates the embedded SentencePiece
+    // vocab (BACKLOG.md P4.0.17 step 3) carries no `tokenizer.ggml.*` KVs at all, and pointing
+    // LOOM_CONFORMER_CTC_MIL_GGUF at one is a thing a developer does by having an old artifact on disk.
+    // A crash says "this test is broken"; a failure says "this fixture is too old", which is the truth.
+    if (vocab == nullptr) {
+        LOOM_CHECK(vocab != nullptr);
+        std::fprintf(stderr,
+                      "'%s' carries no tokenizer.ggml.* KVs -- re-export it with a current exporter\n",
+                      gguf_path.c_str());
+        LOOM_TEST_REPORT_AND_RETURN();
+    }
     LOOM_CHECK(vocab->size() == 1024);
     LOOM_CHECK(vocab->unk_id() == 0);
 

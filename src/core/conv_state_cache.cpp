@@ -59,7 +59,8 @@ void ConvStateCache::reset() {
     }
 }
 
-std::unique_ptr<ConvStateCache> make_conv_state_cache(const GgufModel& model, ggml_backend_t backend) {
+std::unique_ptr<ConvStateCache> make_conv_state_cache(const GgufModel& model, Backends backends) {
+    ggml_backend_t backend = backends.primary;
     // Same shape of message as make_kv_cache's: a host reaching this has a topology containing a
     // SHORT_CONV node and a file that does not say how big its state is, and the fix is on the
     // converter side rather than in the host.

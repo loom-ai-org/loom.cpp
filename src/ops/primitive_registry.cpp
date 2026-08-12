@@ -1,11 +1,41 @@
 #include "loom/ops/primitive_registry.h"
 #include "loom/loom_errors.h"
 
+#include <ggml-backend.h>
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdint>
 
 namespace loom {
+
+bool is_materialized(const ggml_tensor* t) {
+    return t != nullptr && t->buffer != nullptr && t->data != nullptr;
+}
+
+void read_tensor_prefix(const ggml_tensor* t, void* dst, size_t nbytes) {
+    if (!is_materialized(t)) {
+        throw Error("read_tensor_prefix: tensor '" + std::string(t != nullptr ? ggml_get_name(t) : "(null)") +
+                    "' has no data to read at graph-build time");
+    }
+    if (nbytes > ggml_nbytes(t)) {
+        throw Error("read_tensor_prefix: asked for " + std::to_string(nbytes) + " bytes of tensor '" +
+                    std::string(ggml_get_name(t)) + "', which holds " + std::to_string(ggml_nbytes(t)));
+    }
+    // Not a memcpy: on a device backend this is the download that makes the value host-readable at all.
+    ggml_backend_tensor_get(const_cast<ggml_tensor*>(t), dst, 0, nbytes);
+}
+
+float scalar_value_or(const ggml_tensor* t, float fallback) {
+    if (!is_materialized(t) || ggml_nelements(t) < 1) return fallback;
+    switch (t->type) {
+        case GGML_TYPE_F32: { float v = 0.0f;   read_tensor_prefix(t, &v, sizeof(v)); return v; }
+        case GGML_TYPE_I32: { int32_t v = 0;    read_tensor_prefix(t, &v, sizeof(v)); return static_cast<float>(v); }
+        case GGML_TYPE_I16: { int16_t v = 0;    read_tensor_prefix(t, &v, sizeof(v)); return static_cast<float>(v); }
+        case GGML_TYPE_I8:  { int8_t  v = 0;    read_tensor_prefix(t, &v, sizeof(v)); return static_cast<float>(v); }
+        default: return fallback;
+    }
+}
 
 PrimitiveRegistry& PrimitiveRegistry::instance() {
     static PrimitiveRegistry registry;

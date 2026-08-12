@@ -7,16 +7,18 @@
 
 namespace loom {
 
-Generator::Generator(GgufModel& model, GraphTopology topo, GenerationConfig cfg, ggml_backend_t backend)
+Generator::Generator(GgufModel& model, GraphTopology topo, GenerationConfig cfg, Backends backends)
     : model_(model),
       topo_(std::move(topo)),
       cfg_(cfg),
-      backend_(backend),
+      backends_(backends),
+      // The cache lives on the PRIMARY backend and only there: it is persistent state the graph reads
+      // and writes through views, so it is not something the scheduler may place (BACKLOG.md P4.7).
       kv_cache_(model.hparam_u32("n_layer"),
                 model.hparam_u32("n_head_kv") * model.hparam_u32("n_embd_head_k"),
                 model.hparam_u32("n_head_kv") * model.hparam_u32("n_embd_head_v"),
-                cfg.n_ctx_max, backend),
-      builder_(topo_, model, backend, &kv_cache_) {
+                cfg.n_ctx_max, backends.primary),
+      builder_(topo_, model, backends, &kv_cache_) {
     builder_.reserve(cfg_.n_ctx_max);
 }
 
@@ -85,7 +87,7 @@ std::vector<int32_t> Generator::generate(const std::vector<int32_t>& prompt_toke
     {
         const GraphBuilder::BuildResult& result = builder_.build({{"n_tokens", n_prompt_tokens}, {"n_past", n_past_}});
         write_inputs(result, prompt_tokens, n_past_);
-        ggml_backend_graph_compute(backend_, result.graph);
+        builder_.compute();
         n_past_ += n_prompt_tokens;
 
         const std::vector<float> row = read_row(result.output, n_prompt_tokens - 1);
@@ -99,7 +101,7 @@ std::vector<int32_t> Generator::generate(const std::vector<int32_t>& prompt_toke
     while (generated.size() < cfg_.max_new_tokens) {
         const GraphBuilder::BuildResult& result = builder_.build({{"n_tokens", 1}, {"n_past", n_past_}});
         write_inputs(result, {generated.back()}, n_past_);
-        ggml_backend_graph_compute(backend_, result.graph);
+        builder_.compute();
         n_past_ += 1;
 
         const std::vector<float> row = read_row(result.output, 0);

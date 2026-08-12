@@ -141,20 +141,6 @@ Outputs op_identity(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_dup(pc.ctx, in[0])};
 }
 
-float get_tensor_scalar_value(ggml_tensor* t) {
-    if (!t || !t->data) return 0.0f;
-    if (t->type == GGML_TYPE_F32) {
-        return *(float*)(t->data);
-    } else if (t->type == GGML_TYPE_I32) {
-        return static_cast<float>(*(int32_t*)(t->data));
-    } else if (t->type == GGML_TYPE_I16) {
-        return static_cast<float>(*(int16_t*)(t->data));
-    } else if (t->type == GGML_TYPE_I8) {
-        return static_cast<float>(*(int8_t*)(t->data));
-    }
-    return 0.0f;
-}
-
 Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     float start = 0.0f;
     float end = 0.0f;
@@ -163,16 +149,14 @@ Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     if (attrs.contains("start")) {
         start = static_cast<float>(resolve_attr_number(attrs, "start", pc.symbols));
     } else if (!in.empty()) {
-        if (in[0]->data) {
-            start = get_tensor_scalar_value(in[0]);
-        }
+        start = scalar_value_or(in[0], start);
     }
     
     if (attrs.contains("end")) {
         end = static_cast<float>(resolve_attr_number(attrs, "end", pc.symbols));
     } else if (in.size() > 1) {
-        if (in[1]->data) {
-            end = get_tensor_scalar_value(in[1]);
+        if (is_materialized(in[1])) {
+            end = scalar_value_or(in[1], end);
         } else {
             // Dynamic sequence length fallback to prevent GGML stop > start failures
             double n_tokens = 1.0;
@@ -186,9 +170,7 @@ Outputs op_range_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     if (attrs.contains("step")) {
         step = static_cast<float>(resolve_attr_number(attrs, "step", pc.symbols));
     } else if (in.size() > 2) {
-        if (in[2]->data) {
-            step = get_tensor_scalar_value(in[2]);
-        }
+        step = scalar_value_or(in[2], step);
     }
 
     // Force strict stop > start bound to guarantee no GGML assertion crashes

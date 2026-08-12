@@ -1,5 +1,7 @@
 #pragma once
 
+#include "loom/core/backend.h"
+
 #include <ggml-cpp.h>
 
 #include <cstdint>
@@ -100,6 +102,6 @@ class GgufModel;
 // Throws loom::LoadError naming the missing key if any of the five is absent -- a model whose topology
 // reports `uses_kv_cache()` and whose file does not say how big the cache is cannot be run, and saying
 // which key is missing is the difference between a fixable error and a mystery.
-std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, ggml_backend_t backend);
+std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, Backends backends);
 
 } // namespace loom

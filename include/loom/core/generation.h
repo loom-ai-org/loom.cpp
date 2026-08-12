@@ -27,7 +27,7 @@ struct GenerationConfig {
 // "tokens" (i32, [n_tokens]), "positions" (i32, [n_tokens]), and "kq_mask" (f32, [n_kv, n_tokens]).
 class Generator {
 public:
-    Generator(GgufModel& model, GraphTopology topo, GenerationConfig cfg, ggml_backend_t backend);
+    Generator(GgufModel& model, GraphTopology topo, GenerationConfig cfg, Backends backends);
 
     // Prefills `prompt_tokens`, then greedily decodes one token at a time until either
     // cfg.max_new_tokens have been generated or eos_token is sampled. Returns just the generated tokens
@@ -43,7 +43,7 @@ private:
     GgufModel& model_;
     GraphTopology topo_;
     GenerationConfig cfg_;
-    ggml_backend_t backend_;
+    Backends backends_;
     KvCache kv_cache_;
     GraphBuilder builder_;
     uint32_t n_past_ = 0;
