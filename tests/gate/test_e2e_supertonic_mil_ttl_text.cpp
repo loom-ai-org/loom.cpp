@@ -1,8 +1,22 @@
 // Numerical-correctness check for the MIL-traced SupertonicTTS "ttl_text" topology
-// (export_supertonic_mil.py, part of supertonic_mil.gguf) against the SAME real-module reference fixture
+// (supertonic_export.py, part of supertonic_mil.gguf) against the SAME real-module reference fixture
 // the bespoke conversion's own test_e2e_supertonic_ttl_text.cpp already uses
 // (reference_forward_supertonic_ttl_text.py, T=10) -- valid ground truth directly, no regeneration
-// needed: that fixture's T already matches export_supertonic_mil.py's own fixed T_TEXT_FIXED=10.
+// needed.
+//
+// THIS is the test that answers P4.6's central question, and it is the one that first answered it
+// "no". The topology's text axis is `txt_len` wide; the reference is 10 real ids run through the real
+// module at T=10 with an all-ones mask, i.e. exactly what the reference implementation does for a
+// single utterance (`TextVectorizer.tokenize` pads to the longest string in the batch, so a batch of
+// one is never padded). Feeding the same ten ids padded to `txt_len` and comparing the first ten
+// columns therefore asks: does padding change the answer?
+//
+// Measured in PyTorch first, before any of this was exported: with a stock `ConvNextBlock` it does,
+// by 1.77 max-abs on a tensor whose own max is 1.82 -- 97% wrong, not a near-miss. The mechanism is
+// the block's `F.pad(mode="replicate")`: on a masked tensor the "edge" it replicates is a ZERO column,
+// where the unpadded run replicates the last REAL one. supertonic_export.py's `_edge_fill` is what
+// closes that gap, and this comparison is what holds it closed. See BACKLOG.md P4.6.
+//
 // Skips cleanly if the GGUF/reference files aren't present.
 
 #include "test_util.h"
@@ -72,26 +86,52 @@ int main() {
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_env, backend.get());
     LOOM_CHECK(model != nullptr);
+    const uint32_t t_text = model->hparam_u32("txt_len");
+    const uint32_t n_real = static_cast<uint32_t>(txt_ids.size());
+    LOOM_CHECK(t_text >= n_real);
     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("ttl_text"));
     loom::GraphBuilder builder(topo, *model, backend.get());
-    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", static_cast<uint32_t>(txt_ids.size())}, {"n_past", 0}});
+    const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", t_text}, {"n_past", 0}});
 
-    std::vector<int32_t> txt_ids_copy = txt_ids;
+    // The driver's own padding, done by hand -- see this file's header and the "dp" test's.
+    std::vector<int32_t> txt_ids_copy(t_text, 162);
+    std::copy(txt_ids.begin(), txt_ids.end(), txt_ids_copy.begin());
+    std::vector<float> txt_msk(t_text, 0.0f);
+    std::fill(txt_msk.begin(), txt_msk.begin() + n_real, 1.0f);
     std::vector<float> stl_emb_copy = stl_emb;
     ggml_backend_tensor_set(r.input_tensors.at("txt_ids"), txt_ids_copy.data(), 0, txt_ids_copy.size() * sizeof(int32_t));
     ggml_backend_tensor_set(r.input_tensors.at("stl_emb"), stl_emb_copy.data(), 0, stl_emb_copy.size() * sizeof(float));
+    ggml_backend_tensor_set(r.input_tensors.at("txt_msk"), txt_msk.data(), 0, txt_msk.size() * sizeof(float));
     ggml_backend_graph_compute(backend.get(), r.graph);
 
     std::vector<float> txt_emb(static_cast<size_t>(ggml_nelements(r.output)));
     ggml_backend_tensor_get(r.output, txt_emb.data(), 0, txt_emb.size() * sizeof(float));
 
-    LOOM_CHECK(txt_emb.size() == expected_txt_emb.size());
+    // ne=[t_text, 256], T-fast, against a reference that is (256, n_real) row-major -- so the
+    // channel stride differs between the two and the comparison has to index rather than memcmp.
+    constexpr uint32_t kTxtDim = 256;
+    LOOM_CHECK(txt_emb.size() == static_cast<size_t>(t_text) * kTxtDim);
+    LOOM_CHECK(expected_txt_emb.size() == static_cast<size_t>(n_real) * kTxtDim);
     double max_abs_diff = 0.0;
-    for (size_t i = 0; i < txt_emb.size(); ++i) {
-        max_abs_diff = std::max(max_abs_diff, static_cast<double>(std::fabs(txt_emb[i] - expected_txt_emb[i])));
+    for (uint32_t c = 0; c < kTxtDim; ++c) {
+        for (uint32_t t = 0; t < n_real; ++t) {
+            const double got = txt_emb[static_cast<size_t>(c) * t_text + t];
+            const double want = expected_txt_emb[static_cast<size_t>(c) * n_real + t];
+            max_abs_diff = std::max(max_abs_diff, std::fabs(got - want));
+        }
     }
-    std::fprintf(stderr, "txt_emb_max_abs_diff=%g (n=%zu)\n", max_abs_diff, txt_emb.size());
+    // The padded tail must be exactly zero, not merely small: the real module's last act is
+    // `x_t.transpose(1, 2) * txt_msk`, so anything nonzero out there means the mask was not applied.
+    double max_abs_pad = 0.0;
+    for (uint32_t c = 0; c < kTxtDim; ++c) {
+        for (uint32_t t = n_real; t < t_text; ++t) {
+            max_abs_pad = std::max(max_abs_pad, std::fabs(static_cast<double>(txt_emb[static_cast<size_t>(c) * t_text + t])));
+        }
+    }
+    std::fprintf(stderr, "txt_emb_max_abs_diff=%g (t_text=%u, n_real=%u), pad_tail_max_abs=%g\n",
+                 max_abs_diff, t_text, n_real, max_abs_pad);
     LOOM_CHECK(max_abs_diff < 1e-2);
+    LOOM_CHECK(max_abs_pad == 0.0);
 
     LOOM_TEST_REPORT_AND_RETURN();
 }
