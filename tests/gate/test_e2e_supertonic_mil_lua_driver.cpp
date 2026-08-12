@@ -9,9 +9,13 @@
 // same 1e-3 bound and with the same observed 2.08e-06 as the live comparison. The fixture is
 // per-voice-style because the style vectors are an input; see that directory's README.md. Per-topology numerical checks against real-module references
 // (test_e2e_supertonic_mil_{dp,ttl_text,vfe,decoder}.cpp: ~1e-2 or tighter) already validate each phase
-// independently before ever reaching here. Text length is fixed at 10 tokens, matching
-// export_supertonic_mil.py's own T_TEXT_FIXED (see that script's module docstring) -- the SAME real
-// constraint the bespoke oracle's own SupertonicConfig::txt_len_fixed already carries.
+// independently before ever reaching here.
+//
+// The ten ids below were the WHOLE text axis when this fixture was frozen. They are ten real ids in a
+// padded, bucketed axis now (BACKLOG.md P4.6/P4.6a) -- so what this test asks has quietly become much
+// sharper than what it was written to ask: the same waveform, out of a graph 32 positions wide with
+// 22 of them padding, chosen at run time by the driver. It is the padding-is-inert claim and the
+// bucket-selection claim at once, against ground truth that predates both.
 //
 // Skips cleanly if the required env vars/files aren't present.
 
@@ -119,11 +123,13 @@ int main() {
         // exactly ten wide is the whole point of the comparison at the bottom of this file.
         LOOM_CHECK(txt_ids.size() <= model->hparam_u32("txt_len"));
 
+        // Every topology in the file, by name off the file. Naming the four by hand worked until the
+        // text ones came in buckets (BACKLOG.md P4.6a) -- there are sixteen now, and which of them a
+        // call runs is the driver's decision, so a host that enumerates is the only kind that works.
         loom::LoomLuaBridge bridge(backend.get());
-        bridge.register_module("dp", *model, loom::GraphTopology::parse(model->topology_json("dp")));
-        bridge.register_module("ttl_text", *model, loom::GraphTopology::parse(model->topology_json("ttl_text")));
-        bridge.register_module("vfe", *model, loom::GraphTopology::parse(model->topology_json("vfe")));
-        bridge.register_module("decoder", *model, loom::GraphTopology::parse(model->topology_json("decoder")));
+        for (const std::string& name : model->topology_names()) {
+            bridge.register_module(name, *model, loom::GraphTopology::parse(model->topology_json(name)));
+        }
         bridge.load_script(driver_script);
 
         const std::vector<double> txt_ids_d(txt_ids.begin(), txt_ids.end());

@@ -15,6 +15,7 @@
 
 #include "test_util.h"
 #include "fixtures.h"
+#include "supertonic_buckets.h"
 
 #include "loom/loom.h"
 
@@ -81,9 +82,15 @@ int main() {
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_env, backend.get());
     LOOM_CHECK(model != nullptr);
-    const uint32_t t_text = model->hparam_u32("txt_len");
-    LOOM_CHECK(t_text >= txt_ids.size());
-    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json("dp"));
+    // The bucket the driver would pick for these ten ids -- the smallest exported width that fits,
+    // which is a much sharper test than always running the widest graph: it is the one production
+    // actually runs for a short utterance (BACKLOG.md P4.6a).
+    uint32_t t_text = 0;
+    const std::string topo_name = loom_test::supertonic_bucket_topology(
+        *model, "dp", static_cast<uint32_t>(txt_ids.size()), &t_text);
+    LOOM_CHECK(!topo_name.empty());
+    std::fprintf(stderr, "bucket: %s (%zu real ids)\n", topo_name.c_str(), txt_ids.size());
+    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(topo_name));
     loom::GraphBuilder builder(topo, *model, backend.get());
     const loom::GraphBuilder::BuildResult& r = builder.build({{"n_tokens", t_text}, {"n_past", 0}});
 
