@@ -3827,11 +3827,9 @@ batch/instance/l2/layer/local_response), so it could never fire, and would have 
 node with no `eps` attr — which the engine raises on — if a future coremltools ever added one. The entry
 is gone; the primitive is reached by a fusion pass instead. **See P4.7a below: this is now DONE.**
 
-Two smaller variants remain priced but not done, because they reach the models RMS-norm fusion does not:
-`POW(x, 2)` is `ggml_sqr` and `POW(x, 0.5)` is `ggml_sqrt` whenever the exponent is a materialized
-constant, which would move Kokoro's and StyleTTS2's fifty apiece onto the device. Both change CPU-path
-arithmetic (`powf(x, 2.0f)` is not guaranteed to equal `x*x`), so both need the byte-identity sweep run
-against them first.
+The two smaller variants this entry priced — `POW(x, 2)` and the hand-rolled LayerNorm — are **DONE as
+P4.7b below**, which took the remaining 149 `POW` and 32 `RSQRT` nodes out of the zoo and left exactly
+two `ggml_map_custom` nodes in it.
 
 **The KV cache works on a device**, which the first version of this entry listed as untested because no
 export on hand had one. Re-exporting Qwen3-0.6B-Base against loom-exporter HEAD produced a fused causal
@@ -4018,6 +4016,82 @@ it would need `LAYER_NORM` plus a transpose, and `LAYER_NORM` has the same ne[0]
 
 Kokoro and StyleTTS2 carry 50 `POW` each with **no** `RSQRT` — a real `x**p`, not a normalization — so
 they still split. `POW(x,2) → ggml_sqr` is the item for those, priced under P4.7 above.
+
+#### P4.7b — the last of the host callbacks: SQR and a hand-rolled LayerNorm — DONE (2026-08-13)
+
+P4.7a took RMS norm out of the causal LMs and left two things behind: 149 `POW` nodes spread across
+every family, and Matcha's 32 `RSQRT`. Both are gone now, and with them essentially every reason a
+scheduler had to cut a graph.
+
+**`lower_pow`** rewrites `pow(x, 2)` to MIL's own `square`, which `exporter.py` already mapped to the
+engine's `SQR`. That it was worth a whole pass is a measurement, not a guess: **every `pow` in every
+model is a square** — 149 of them, exponent 2.0 in every single one (Kokoro 50, StyleTTS2 50, Matcha 38,
+the NeMo encoders 3 each, GigaAM and Whisper 1 each). There was never a general `pow` to preserve, only
+a squaring op nobody had recognised. `pow(x, 0.5)` is deliberately NOT handled: no traced model has
+produced one, and this repo adds a path when a model needs it.
+
+**`fuse_layer_norm`** recognises the four-op statistic a model writes when it normalizes a channel axis
+itself instead of calling `torch.nn.LayerNorm`, and emits MIL's `layer_norm` — transposed into ne[0] and
+back when the axis is not already trailing, since `ggml_norm` normalizes ne[0] and nothing else. It is a
+separate pass from `fuse_rms_norm` and deliberately so: the two differ by exactly the mean-centring, and
+a matcher that treated `sub(x, mean)` as optional would emit `RMS_NORM` for a layer norm the moment a
+`sub` failed to match for an unrelated reason.
+
+##### What is left, across all thirteen fixture models
+
+| | before P4.7 | now |
+|---|---|---|
+| `POW` | 149 | **0** |
+| `RSQRT` | 258 | **0** |
+| `ATAN` / `ATAN2` / `SHAPE` | 2 | **2** |
+
+**Two `ggml_map_custom` nodes remain in the entire model zoo** — one `ATAN` each in Kokoro's and
+StyleTTS2's STFT phase computation, which has no ggml counterpart and no composition that avoids the
+transcendental. Everything else the engine ever pushed onto a host callback is now a real ggml op.
+
+##### What it did (AMD Vega 3 iGPU vs 4 CPU threads, best of three)
+
+| module | splits before | splits now | GPU vs CPU |
+|---|---|---|---|
+| qwen3-0.6b `main_topology` | 453 | **1** | 2.82x |
+| lfm2-350m `main_topology` | 181 | **1** | 2.22x |
+| matcha `encoder_mu` | 61 | **1** | 3.65x (was **0.84x** — slower than the CPU) |
+| kokoro `decoder_vocoder` | 107 | **7** | 4.45x |
+| styletts2 `decoder_vocoder` | ~107 | **7** | 4.28x |
+| conformer-ctc `main_topology` | 5 | **1** | 2.56x |
+
+##### The measurement that was wrong twice, and what it cost
+
+The obvious objection to transposing an axis into ne[0] is that `ggml_norm` calls `ensure_packed`, so
+each norm pays two full copies. A best-of-three on Matcha's `encoder_mu` said that cost **31% of CPU
+throughput** — and on the strength of it the transpose was replaced with `div(centered, sqrt(var+eps))`,
+which removes the same host callback while moving nothing. A second best-of-three then said the
+transpose was the *fastest* of the three. Both were noise: this module swings **33–85 ms between runs of
+the same binary** on this machine.
+
+Six interleaved rounds of twenty runs each, taking the minimum per arm, settled it:
+
+    unfused chain               cpu 50.5 ms   gpu 45.7 ms
+    transpose + layer_norm      cpu 44.2 ms   gpu 12.1 ms      <- what shipped
+    div(centered, sqrt(...))    cpu 54.5 ms   gpu 12.8 ms
+
+**Transposing is the fastest of the three on the CPU as well**, because `ggml_norm` is one fused pass
+where the chain it replaces is eight, and that buys more than two copies cost. The division form — which
+avoids the copies entirely — is the slowest. The lesson is not about layer norms: a best-of-three on a
+40 ms module on a thermally-throttled laptop is not a measurement, and it produced two contradictory
+"findings" before anything interleaved them.
+
+##### Correctness
+
+* **Byte-identity on both sides of the line, which is the check that makes the rest trustworthy.** The
+  four models with nothing to fuse (VITS, Supertonic, LFM2 monolithic and modular) re-export
+  **byte-identical**; the four with something to fuse (Kokoro, StyleTTS2, Matcha, Parakeet) all differ.
+  Naming which must move before diffing is the discipline BACKLOG.md §6 records, and this is it applied.
+* The gate suite passes on a CPU-only and a Vulkan build alike (82/82, 10 tests doing real work),
+  including all three MIL Lua-driver end-to-end tests, whose models are exactly the ones that changed.
+* 542 exporter CI tests, 15 of them new across the two passes, and most of the new ones negative: an
+  exponent that is not 2, a non-constant exponent, two means over different axes, a missing centring
+  (that graph is an RMS norm and belongs to the other pass), a shared intermediate.
 
 #### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
 
