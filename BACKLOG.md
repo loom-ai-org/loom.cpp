@@ -4163,7 +4163,67 @@ the one to reach for before writing any of them.
   minimax rational on `[-1,1]` with `atan(x) = π/2 - atan(1/x)` range reduction would be ~15-20 native
   nodes at ~1e-7 relative error. That would be **the first approximation of a transcendental this
   project has accepted**, and it is worth 2 splits, so it is priced here and not taken.
-* whisper `encoder`: 4 splits — `POOL_1D` and a 400-wide reflect pad, both upstream questions.
+* whisper `encoder`: 4 splits — `POOL_1D` and a 400-wide reflect pad. **`POOL_1D` is DONE as P4.7d
+  below**, taking this to 2.
+
+#### P4.7d — POOL_1D, spelled as the POOL_2D that backends actually implement — DONE (2026-08-13)
+
+The last op P4.7c left on the CPU. **`ggml-vulkan` implements `GGML_OP_POOL_2D` and `GGML_OP_ARGMAX`
+but not `GGML_OP_POOL_1D`** — and a 1-D pool is a 2-D pool with a one-tall window, so the engine now
+spells it that way. `ggml_pool_2d` sizes its output `[calc(ne0,k0,s0,p0), calc(ne1,k1,s1,p1), ne2, ne3]`
+against `ggml_pool_1d`'s `[calc(ne0,k0,s0,p0), ne1, ne2, ne3]`, and `calc(ne1, 1, 1, 0) == ne1`.
+
+**Engine-side, not exporter-side**, unlike P4.7a–c. Nothing per-MODEL is involved: it is one
+primitive's lowering, and a topology that says `POOL_1D` should keep meaning what it says.
+
+##### The thing that was nearly shipped wrong
+
+The two spellings are **not** interchangeable, in one combination, and it is invisible in every
+interior window: **an average pool with padding divides by different numbers.** `ggml_pool_1d` divides
+by `count`, the in-bounds elements the window actually covered; `ggml_pool_2d` divides by `ka = k0*k1`,
+the whole kernel, treating padded cells as zeros it still counts. The shapes agree, so nothing structural
+catches it — only the values at the windows that overhang an edge differ, 8 of 256 in the case that found
+it.
+
+That case was found by running the comparison **before** shipping the lowering, not after. The predicate
+is now `op == MAX || p0 == 0` (a max is indifferent to padding; with no padding no window overhangs, so
+`count == k0 == ka`), and everything else keeps `ggml_pool_1d` — a correct CPU fallback beats a fast
+wrong answer.
+
+`tests/ci/test_pool_1d_lowering.cpp` pins both halves: seven parameter combinations that must be
+bit-identical, and the padded average that must NOT be, asserted against the exposed predicate. A test
+that only covered the equivalent cases would still pass with the guard deleted, which is why the
+negative case is there.
+
+##### What it bought, and what it did not
+
+Whisper's encoder, the only user in the zoo:
+
+| | splits | CPU nodes | GPU |
+|---|---|---|---|
+| before | 4 | 4 | 2967 ms |
+| after | **2** | **3** | 3014 ms |
+
+**The splits halved and the wall clock did not move** — 2967 vs 3014 ms is inside this machine's noise.
+That is not a disappointment to explain away, it is the measurement: Whisper's `POOL_1D` is a *global
+max*, `k0 = s0 = 240000` over a flattened tensor, so its output is **one scalar** and the round trip the
+split was costing was one float. A split is only worth what crosses it.
+
+The value is therefore structural rather than in this number: pooling as an op class now runs on a device
+backend at all, for any model that pools something bigger than a scalar. Whisper happens to be the worst
+possible advertisement for its own fix.
+
+##### What is left in the zoo
+
+* whisper `encoder`: **2 splits** — the 400-wide reflect pad P4.7c's width guard correctly declines to
+  compose (800 nodes into a 503-node topology).
+* kokoro / styletts2 `decoder_vocoder`: **3 splits** — the `ATAN`, priced in P4.7c and not taken.
+* everything else: **1 split**, nothing falling back.
+
+Both remaining items are now upstream questions rather than exporter or engine ones: a `pad_reflect_1d`
+shader and either an `atan` op or a `pool_1d` shader in ggml-vulkan. Which is the natural boundary — the
+three passes and this lowering took every case where loom could express the same thing in ops a backend
+already has, and stopped where that stopped being true.
 
 #### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
 
