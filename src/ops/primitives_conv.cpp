@@ -12,7 +12,7 @@ namespace loom {
 // namespace and declared in primitive_registry.h on purpose: tests/ci/test_pool_1d_lowering.cpp asserts
 // that this predicate agrees with the two spellings' actual bit-level behaviour, which it cannot do if
 // the predicate is private -- and a test that could not see it would still pass with the guard deleted.
-bool pool_1d_lowers_to_pool_2d(ggml_op_pool op, int p0) {
+bool pool_2d_fallback_is_equivalent(ggml_op_pool op, int p0) {
     return op == GGML_OP_POOL_MAX || p0 == 0;
 }
 
@@ -253,8 +253,8 @@ ggml_op_pool parse_pool_op(const Json& attrs) {
     throw SchemaError("POOL: unsupported pool 'op' \"" + op + "\" (expected \"max\" or \"avg\")");
 }
 
-// Whether a 1-D pool can be spelled as a 2-D pool with a one-tall window, which is the whole of
-// op_pool_1d's lowering decision below (BACKLOG.md P4.7d).
+// Whether a 1-D pool can be spelled as a 2-D pool with a one-tall window -- the FALLBACK op_pool_1d
+// reaches for when the backend has no `ggml_pool_1d` of its own.
 //
 // The SHAPES always agree: `ggml_pool_2d` sizes its output
 // `[calc(ne0,k0,s0,p0), calc(ne1,k1,s1,p1), ne2, ne3]` against `ggml_pool_1d`'s
@@ -272,26 +272,33 @@ ggml_op_pool parse_pool_op(const Json& attrs) {
 // either way; and with `p0 == 0` no window overhangs anything, so `count == k0 == ka` and an average
 // agrees too.
 
-
-// Lowered to a 2D pool with a one-tall window wherever that is provably the same operation, because
-// **`ggml-vulkan` implements `GGML_OP_POOL_2D` and not `GGML_OP_POOL_1D`**. The 1D spelling is a node
-// the scheduler has to hand back to the CPU, splitting the graph around it for a reason no caller could
-// see or fix from the export side -- Whisper's encoder is one node of it and paid a split (P4.7d).
+// Asks the backend, then chooses -- the same shape as `op_pad_1d_reflect` and for the same reason
+// (BACKLOG.md P4.7e). The support for these two is not the same across backends and does not have to
+// be reasoned about here: **CUDA has `PAD_REFLECT_1D` but no `POOL_1D`; Metal and SYCL have both;
+// Vulkan has neither but does have `POOL_2D`**, which is the only pooling op every GPU backend
+// implements.
 //
-// This lives here rather than in the exporter because nothing per-MODEL is involved: it is one
-// primitive's lowering detail, and a topology that says POOL_1D should keep meaning what it says. Where
-// the two are not equivalent, the 1D op stays -- a correct CPU fallback beats a fast wrong answer.
+// Keeping the native op wherever the backend runs it matters even though the fallback is exact: a
+// topology that says POOL_1D gets POOL_1D on every backend that has one, and a CPU-only build -- the
+// default -- is left exactly as it was before any of this. An earlier version of this primitive
+// preferred `pool_2d` unconditionally, which quietly changed the graph for every CPU user to work
+// around a gap none of them had.
 Outputs op_pool_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("POOL_1D", in, 1);
     const ggml_op_pool op = parse_pool_op(attrs);
     const int k0 = static_cast<int>(resolve_attr_int(attrs, "k0", pc.symbols));
     const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
-    if (pool_1d_lowers_to_pool_2d(op, p0)) {
-        return {ggml_pool_2d(pc.ctx, in[0], op, k0, /*k1=*/1, s0, /*s1=*/1,
-                              static_cast<float>(p0), /*p1=*/0.0f)};
+    ggml_tensor* native = ggml_pool_1d(pc.ctx, in[0], op, k0, s0, p0);
+    // Not `pool_2d_fallback_is_equivalent` first: the question is what this backend can run, and the
+    // fallback is only interesting when the answer is "not this". Where there is no equivalent fallback
+    // (a padded average) the native op stays and the scheduler sends it to the CPU -- a correct
+    // fallback beats a fast wrong answer.
+    if (backend_can_run(pc, native) || !pool_2d_fallback_is_equivalent(op, p0)) {
+        return {native};
     }
-    return {ggml_pool_1d(pc.ctx, in[0], op, k0, s0, p0)};
+    return {ggml_pool_2d(pc.ctx, in[0], op, k0, /*k1=*/1, s0, /*s1=*/1,
+                          static_cast<float>(p0), /*p1=*/0.0f)};
 }
 
 Outputs op_pool_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
