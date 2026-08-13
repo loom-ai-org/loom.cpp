@@ -4538,12 +4538,90 @@ distinct manylinux variant rather than a flag.
 PyPI wheel tags encode architecture and libc but have **no accelerator dimension**, so an accelerator
 has to be expressed as either a package-name suffix (torch's `cu121` shape — a full wheel per
 accelerator, which is the combinatorial matrix) or as something loaded at run time. `GGML_BACKEND_DL`
-makes the second possible: **one arch-tagged base wheel, plus small `loom-py-backend-*` packages that
+makes the second possible: **one arch-tagged base wheel, plus small `loom-py-rt-<backend>` packages that
 drop a `.so` where ggml looks.** `pip install loom-py-rt[cuda]` then means "also fetch that backend",
 `Model(..., device="auto")` finds it, and a Raspberry Pi installs nothing extra and gets the CPU
-variants it already had. That is the option worth costing first, and the reason to prefer it is not
-elegance — it is that the matrix version multiplies every future backend by every existing platform,
-and this one adds a row.
+variants it already had.
+
+**The sizes make this a constraint rather than a preference**, which is the part that was argued from
+combinatorics before it was measured. Release builds, stripped, on this machine:
+
+| | |
+|---|---|
+| `libloom_engine.so` | **1.2 MB** |
+| `libggml-base.so` + `libggml-cpu.so` | 1.7 MB |
+| a CPU-only deployment | **≈ 3 MB** |
+| `libggml-vulkan.so` | **46.5 MB**, of which 44 MB is `.rodata` — 1785 compiled SPIR-V shaders |
+| the same deployment with Vulkan | **≈ 50 MB** |
+
+Two things follow. First, **compiling backends in never threatens the leanness this repo means by the
+word**: `CLAUDE.md`'s leanness is about CODE — per-model complexity belongs in the exporter — and
+`libloom_engine.so` is byte-identical whether ggml ships one backend or nine. It is 3% of a Vulkan
+deployment. What grows is the ARTIFACT, and every byte of that growth is somebody else's precompiled
+kernels. Second, ~50 MB sits against PyPI's 100 MB default per-file ceiling before anything else is
+added, and CUDA — whose fat binaries carry cubins per SM architecture — clears it outright (not measured
+here; the mechanism is well known and is why torch hosts `cu121` off-index). A wheel matrix is therefore
+not merely inelegant, it does not fit.
+
+##### The backend packages are arch-specific too
+
+A backend package ships native code, so the combinatorics do not vanish — they **factor**. The base is
+`arch × os`; a backend is `arch × os × backend`. The artifact COUNT is comparable; what changes is that
+each artifact is 1–50 MB rather than a full duplicate of everything, each builds independently, and a
+new backend does not force a re-release of the base wheel on every platform.
+
+And the practical matrix is far sparser than the cross product, because most backends exist on one or
+two architectures at all:
+
+| backend | worth building for |
+|---|---|
+| Vulkan | x86-64, aarch64 — the broadest |
+| CUDA | x86-64, aarch64 (Jetson/Grace) |
+| Metal | arm64 macOS only |
+| Hexagon / QNN | aarch64 |
+| RKNPU2 | aarch64 |
+| OpenVINO | x86-64 |
+
+Roughly nine backend wheels, not backends times every platform. **No tag abuse is involved**: the
+package NAME carries the accelerator dimension and the wheel TAG carries architecture, which is what
+each was designed for, and `pip` resolves the right arch itself.
+
+##### Extras compose, and one of them should be allowed to fail
+
+`pip install "loom-py-rt[hub,vulkan]"` is ordinary PEP 508 and works. But the two extras are different
+in kind and the difference is worth being deliberate about rather than discovering:
+
+* `[hub]` is a pure-Python feature toggle (`huggingface_hub`) — architecture-independent, always
+  resolvable, additive.
+* `[vulkan]` is a hardware toggle — native, architecture-specific, and **may not exist for the
+  platform at all**.
+
+Which decides one case: `pip install loom-py-rt[metal]` on Linux. There is no Metal wheel for manylinux,
+so pip fails to resolve it. The alternative — environment markers, so `[metal]` quietly resolves to
+nothing off macOS — lets the install succeed and hands back no Metal.
+
+**Take the loud failure.** It is the same decision `Device::open("gpu")` already makes in raising rather
+than falling back to the CPU (P4.7): a caller who spelled out the accelerator is asserting something
+about the machine, and finding out at install time beats finding out from an unexplained performance
+number later. Install-time loudness matching run-time loudness.
+
+Two corollaries: there should be **no `[all]` extra** — that is the wheel matrix wearing a hat — and
+`[vulkan,cuda]` together is legitimate, because with `GGML_BACKEND_DL` the registry picks at run time.
+
+##### Two costs to price before adopting any of this
+
+1. **The base wheel has to go SHARED, reversing a deliberate decision.** `GGML_BACKEND_DL` refuses to
+   configure without `BUILD_SHARED_LIBS=ON`, and loom-py currently forces it OFF on purpose: `_loom.so`
+   statically folds in the engine and ggml so that its only external dependencies are
+   libc/libstdc++/libgomp/libm. Its CMakeLists comment explains why — a shared build "produces an import
+   that fails the moment the wheel leaves this build tree". The answer is `$ORIGIN` RPATH with
+   `libggml-*.so` shipped beside `_loom.so`, which is routine wheel practice (auditwheel does exactly
+   this), but that comment records a real failure and needs rewriting with the new reason rather than
+   deleting.
+2. **Backend packages need an exact `==` pin on the base version.** A backend `.so` links
+   `libggml-base.so.0`, and ggml offers no ABI guarantee across versions — so any loom-py release that
+   bumps its ggml pin invalidates every previously published backend wheel. A compatible-release range
+   would silently pair mismatched libraries.
 
 Either way the *engine* side is the same work, which is why this is one item and not two.
 
