@@ -81,6 +81,40 @@ cmake --build build -j"$(nproc)"
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
 and run the hermetic suite.
 
+### Running on a GPU
+
+A default build is CPU-only. Compiling a device backend in is a `ggml` option, passed straight through
+— this repo adds no options of its own, because there is nothing per-backend for it to decide:
+
+```sh
+cmake -B build -DGGML_VULKAN=ON     # or -DGGML_CUDA=ON, -DGGML_METAL=ON, -DGGML_SYCL=ON, ...
+cmake --build build -j"$(nproc)"
+
+build/tools/loom_cli/loom_cli --list-devices
+build/tools/loom_cli/loom_cli --device gpu --model model.gguf --wav audio.wav
+```
+
+`--device` takes `auto` (the default, and what `$LOOM_DEVICE` sets), `cpu`, `gpu`, or a device name
+such as `Vulkan0`. **`auto` prefers a device and falls back to the CPU; `gpu` is an error when there
+is none**, because a caller who spelled it out is asking a question about the machine, and answering it
+with a silent CPU run turns "no GPU here" into an unexplained performance number.
+
+**The Vulkan build tools sort themselves out.** `glslc` and the Vulkan headers on a stable distribution
+are likely too old for `ggml`'s Vulkan backend, and both fail in ways that name neither cause — so
+`cmake/VulkanToolchain.cmake` probes for those two failures specifically and, when it finds them,
+fetches pinned Vulkan-Headers and builds `glslc` from a pinned `shaderc` into the build directory. That
+costs several minutes on the first configure of a machine that needed it, and nothing at all on one that
+did not. `-DLOOM_VULKAN_FETCH_TOOLCHAIN=OFF` turns the diagnosis into an error naming what to install
+instead, which is the right setting for an image that provides its own toolchain.
+
+**A primitive can choose its own lowering.** Some ops are host callbacks through `ggml_map_custom` (a C
+function pointer, so there is nothing for a GPU to dispatch) and others are real ggml ops a given backend
+happens not to implement. Either way a primitive builds what the topology asked for, asks
+`ggml_backend_supports_op`, and either keeps it or emits an equivalent — so the same GGUF lowers
+differently per backend and the file on disk keeps saying what the model does. Every device run still
+carries a CPU backend behind it for whatever is left. The CLI prints where each module actually ran;
+`ctest -L gate -R device_parity` checks that a device gets the same answer as the CPU.
+
 ## Testing
 
 Two classes of test, and a test's own directory is which class it is in.
@@ -100,7 +134,7 @@ Point the gate suite at its fixtures with one variable:
 
 ```sh
 export LOOM_FIXTURES=~/loom-fixtures
-scripts/fixtures.py status    # what the 77 gate tests want, and what you have
+scripts/fixtures.py status    # what the gate tests want, and what you have
 scripts/fixtures.py fetch     # from the published fixture repo
 ```
 
@@ -119,13 +153,69 @@ rebuilt is what you do while working on it.
 
 ## Roadmap
 
-**1. GPUs and NPUs.** The engine talks to a single `ggml_backend_t` through a plain `ggml_gallocr` and
-uses no `ggml_backend_sched` at all — fine for CPU, and the one thing that has to change before a
-second device can hold part of a graph. Two existing decisions are waiting on it: `ATTENTION` always
-takes the composite `MUL_MAT`→`soft_max_ext`→`MUL_MAT` path because `ggml_flash_attn_ext` forces an F16
-K/V cast that fights exact fp32 verification, and a `FLASH_ATTENTION` primitive becomes worth adding
-once a GPU makes that trade pay; and retained inter-module outputs are a latent win today that becomes
-a paid one the moment a marshalled edge would mean a device→host→device round trip per step.
+**1. GPUs — done; NPUs, not yet.** The engine takes a device backend and a CPU fallback and schedules
+across them (`BACKLOG.md` P4.7); see [Running on a GPU](#running-on-a-gpu) above. Measured on an AMD
+Vega 3 iGPU against 4 CPU threads, one forward each:
+
+| model | splits | GPU vs CPU |
+|---|---|---|
+| conformer-ctc-small | 1 | **2.56×** |
+| lfm2-350m | 1 | **2.22×** |
+| qwen3-0.6b | 1 | **2.82×** |
+| matcha `encoder_mu` | 1 | **3.65×** |
+| kokoro `decoder_vocoder` | 3 | **4.62×** |
+
+What decides that number is how many times the scheduler has to cut the graph, and what forces a cut is
+`ggml_map_custom` — a host callback, so there is nothing for a device to dispatch. Those splits used to
+be 453, 181, 61, 107 and 5, which left Qwen3 at 0.95× and Matcha at 0.84× — *slower than the CPU*. None
+of it was the engine: it was three patterns the exporter emitted as host callbacks because it had never
+been taught to recognise them — an RMS norm (`POW`+`RSQRT`), a squaring (`POW`), and a hand-rolled
+LayerNorm. **Across all thirteen exported models there are now exactly two `ggml_map_custom` nodes
+left** — one `ATAN` each in Kokoro's and StyleTTS2's STFT phase, which has no ggml counterpart.
+`BACKLOG.md` P4.7a–P4.7c have the numbers, including a CPU measurement that came out wrong twice before
+anything interleaved the runs.
+
+**Counting host callbacks turned out to be the wrong lens**, which is worth knowing before optimizing
+anything here: a graph splits just as readily on a *real* ggml op whose backend kernel is missing, and
+the gaps do not line up between backends — CUDA has `PAD_REFLECT_1D` but no `POOL_1D`, Vulkan has
+`POOL_2D` but neither, and the NPU backends have none of the three.
+
+So **a primitive asks the backend what it can run** (`BACKLOG.md` P4.7e) and emits either the native op
+or an exactly-equivalent composition. That decision belongs in the engine rather than the export: one
+GGUF may be run by any backend, so deciding it at export time compiles every artifact for the least
+capable one. The same Kokoro file builds 1692 ggml nodes on a CPU and 1732 on Vulkan, and its topology
+says `PAD_1D_REFLECT` either way.
+
+`ATAN` had no exact composition anywhere — ggml has no inverse trigonometry in any backend — so it gets
+the one **approximation** in the engine: range reduction, a degree-8 minimax polynomial and a branchless
+reconstruction, measured at **1.81 ULP** and confined to backends that cannot dispatch the host callback,
+so a CPU build still gets libm. **Eleven of the twelve models now run a whole module on the GPU with
+nothing falling back at all.** The twelfth is Whisper, whose 400-wide reflect pad is cheaper to fall back
+on than to compose — and which CUDA, Metal and SYCL run natively regardless.
+
+One caveat on every speedup on this page: the GPU measured here reports `uma: 1`, so it shares memory
+with the host and a split costs a synchronisation rather than a transfer. These numbers are a lower bound
+on what a discrete card over PCIe would show.
+
+Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
+one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured
+before the fusion above, LFM2's 20-module modular export cost 183 splits against the monolithic
+export's 181, so decomposing a model into modules was never the expensive part. `FLASH_ATTENTION` is
+still unbuilt: a GPU makes `ggml_flash_attn_ext`'s forced F16 K/V cast worth considering, but what
+stands in the way is the gate suite's exact-fp32 comparisons, not the hardware.
+
+**What is next is scoped as `BACKLOG.md` P4.8: CUDA, then NPUs.** Sixteen backend directories already
+ship in the pinned ggml — CUDA, Metal, SYCL, OpenCL, HIP, OpenVINO, Hexagon (Qualcomm), CANN (Ascend)
+among them — and because `loom::Device` resolves a spec against ggml's *device registry* rather than
+against any backend name it knows, a CUDA build's `CUDA0` is already selectable by code that has never
+heard of CUDA. Those cost a build matrix and a test run, not C++. CoreML (the Neural Engine, which
+Metal is not) and RKNPU2 are out of tree and cost more, licence check included.
+
+Compiling all of them in would end the leanness this engine is for, so the answer is `GGML_BACKEND_DL`:
+each backend becomes a shared library ggml discovers at run time, one engine binary serves every
+accelerator, and the deployment decides which files travel with it. That already works through
+`loom::Device` unchanged. See P4.8 for what is still missing (a `Backends` that holds more than two, and
+the custom-op fusion above, which on an NPU stops being an optimization and becomes a prerequisite).
 
 **2. Builds for more platforms.** Linux x86-64 is what is built and tested today. Next: macOS on Intel,
 macOS on Apple Silicon, and Linux on ARM — the last of which is the one that matters most for an engine

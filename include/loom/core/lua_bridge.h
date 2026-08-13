@@ -1,5 +1,6 @@
 #pragma once
 
+#include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/graph_topology.h"
 
@@ -73,7 +74,7 @@ class OutputStore;
 // provenance, not a dependency.
 class LoomLuaBridge {
 public:
-    explicit LoomLuaBridge(ggml_backend_t backend);
+    explicit LoomLuaBridge(Backends backends);
     ~LoomLuaBridge();
     LoomLuaBridge(const LoomLuaBridge&) = delete;
     LoomLuaBridge& operator=(const LoomLuaBridge&) = delete;
@@ -107,6 +108,20 @@ public:
     // cleanly through it; callers that need integers cast at the call site).
     using Value = std::variant<double, std::vector<double>>;
 
+    // Where one registered module's graph actually ran, for a device build. One entry per module the
+    // driver has BUILT a graph for -- a module that was registered but never run has no assignment to
+    // report and is left out, which is also what makes this a record of the run rather than of the file.
+    struct ModuleDeviceReport {
+        std::string module;
+        int splits = 0;                    // crossings between the device and the CPU fallback, plus one
+        size_t device_nodes = 0;           // nodes the scheduler put on the primary backend
+        size_t fallback_nodes = 0;         // nodes it had to put on the CPU
+    };
+    // Empty on a CPU-only bridge, which has nothing to schedule and so nothing to report. This is a C++
+    // accessor, not a Lua binding: no driver script can see it, and the leanness rule above is about
+    // what crosses into the VM.
+    std::vector<ModuleDeviceReport> device_report() const;
+
     // Calls the top-level Lua function `fn_name` with a single table argument built from `args` (each
     // entry becomes `inputs.<key>` inside the script, matching the design doc's own
     // `function transcribe(inputs)` convention). Throws loom::Error (wrapping the Lua error message) if
@@ -119,7 +134,7 @@ private:
         GraphTopology topo;
         KvCache* kv_cache;
         ConvStateCache* conv_state;
-        ggml_backend_t backend;
+        Backends backends;
         // Persistent storage for this module's declared outputs (BACKLOG.md P4.0.12), created on the
         // module's first `loom.run_subgraph_and_retain` and owned for the bridge's lifetime thereafter
         // -- unlike `kv_cache`/`conv_state`, which the HOST allocates from declared hparams and lends. It
@@ -151,7 +166,7 @@ private:
     GraphBuilder& module_builder(Module& mod);
 
     lua_State* L_;
-    ggml_backend_t backend_;
+    Backends backends_;
     std::unordered_map<std::string, Module> modules_;
 
     // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes

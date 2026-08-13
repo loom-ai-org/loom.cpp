@@ -4,9 +4,122 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace loom {
+
+// ---------------------------------------------------------------------------------------------------
+// atan WITHOUT A HOST CALLBACK (BACKLOG.md P4.7f)
+// ---------------------------------------------------------------------------------------------------
+// ggml has no inverse trigonometry in any backend -- not in the unary enum, not in CUDA, Metal, Vulkan
+// or any other -- so `ATAN` has always been a `ggml_map_custom` host callback, and on a device that is a
+// node the scheduler must run on the CPU. It is the last one left in the model zoo (Kokoro's and
+// StyleTTS2's STFT phase), and unlike the reflect pad or the 1-D pool there is no exact composition to
+// reach for: every closed form for `atan` over the real ops available routes through `asin`, `acos` or a
+// complex logarithm, none of which exist either.
+//
+// So this is an APPROXIMATION, which is a first for this project, and it is confined accordingly:
+// `op_atan` keeps libm's `std::atan` wherever `backend_can_run` says the backend can dispatch the
+// callback, so **a CPU-only build -- the default -- is bit-for-bit what it always was**. Only a device
+// that would otherwise have split the graph sees the polynomial.
+//
+// The method is the standard one, which is what a GPU's own `atanf` does inline rather than anything
+// exotic like CORDIC -- three stages, no branches:
+//
+//   1. **Range reduction.** `atan(-x) = -atan(x)` strips the sign, and `atan(x) = pi/2 - atan(1/x)`
+//      folds everything above 1 back below it, so the polynomial only ever sees `t` in `[0, 1]`.
+//      Written here as `t = min(a,1) / max(a,1)`, which needs no reciprocal instruction: two clamps and
+//      a divide, and an infinity reduces to `1/FLT_MAX` rather than to a NaN.
+//   2. **A minimax polynomial in `z = t*t`**, evaluated by Horner so every step is a multiply-add.
+//      Not a Taylor series: Taylor converges far too slowly at the end of the interval to be affordable
+//      at this width.
+//   3. **Branchless reconstruction.** `step(a-1)` is a 0/1 mask, and `r + m*(pi/2 - 2r)` is `r` when the
+//      mask is 0 and `pi/2 - r` when it is 1 -- the arithmetic form of a select, because a device wants
+//      every lane executing the same instructions.
+//
+// **Degree 8 in `z`, and that is a measured choice rather than a tasteful one.** Fitted on a Chebyshev
+// grid and evaluated through this exact fp32 op sequence against `atan` in double precision, the error
+// stops improving there: degree 7 gives 3.55 ULP, degree 8 gives 1.84, and degrees 9 through 14 all sit
+// between 1.86 and 2.56 -- past 8 the limit is fp32 rounding in the Horner evaluation itself, not the
+// polynomial, so further terms buy two graph nodes each and nothing else.
+//
+// The whole composition is 30 nodes against the one it replaces. That is the trade: on Kokoro's
+// `decoder_vocoder` it removes the last two scheduler splits and the round trips they cost.
+constexpr float kAtanPoly[] = {
+    +9.9999998425e-01f, -3.3333066809e-01f, +1.9992483932e-01f, -1.4202572489e-01f,
+    +1.0636759878e-01f, -7.4954548398e-02f, +4.2587692157e-02f, -1.6005069470e-02f,
+    +2.8340712491e-03f,
+};
+
+ggml_tensor* compose_atan(ggml_context* ctx, ggml_tensor* x) {
+    constexpr float kHalfPi = 1.57079632679489661923f;
+
+    ggml_tensor* a = ggml_abs(ctx, x);
+
+    // t = min(a,1) / max(a,1): `a` when a <= 1, `1/a` when it is not, and no reciprocal instruction
+    // needed. Both `ggml_dup`s are load-bearing and must not be tidied away -- `ggml_clamp` returns a
+    // VIEW of its argument and writes through it (ggml.c builds it as `ggml_view_tensor(ctx, a)` with
+    // op=CLAMP), so clamping `a` directly would destroy the `a` that the mask below still reads.
+    //
+    // The obvious one-clamp saving -- `t = a / max(a,1)^2`, using `min(a,1)*max(a,1) == a` -- was tried
+    // and is worse twice over: `max(a,1)^2` OVERFLOWS to infinity for any `a` past ~1.8e19 (and `clamp`
+    // caps at FLT_MAX rather than infinity, so `atan(inf)` came out `inf/inf` = NaN), and squaring costs
+    // accuracy in the folded branch besides -- 2.30 ULP against this form's 1.86.
+    ggml_tensor* lo = ggml_clamp(ctx, ggml_dup(ctx, a), 0.0f, 1.0f);
+    ggml_tensor* hi = ggml_clamp(ctx, ggml_dup(ctx, a), 1.0f, FLT_MAX);
+    ggml_tensor* t = ggml_div(ctx, lo, hi);
+    ggml_tensor* z = ggml_sqr(ctx, t);
+
+    // Horner from the top. The first step folds the two highest coefficients into one `ggml_scale_bias`
+    // (z*c[n] + c[n-1]), which saves building a constant tensor just to start the recurrence.
+    constexpr int kN = static_cast<int>(sizeof(kAtanPoly) / sizeof(kAtanPoly[0]));
+    ggml_tensor* p = ggml_scale_bias(ctx, z, kAtanPoly[kN - 1], kAtanPoly[kN - 2]);
+    for (int i = kN - 3; i >= 0; --i) {
+        p = ggml_scale_bias(ctx, ggml_mul(ctx, p, z), 1.0f, kAtanPoly[i]);
+    }
+    ggml_tensor* r = ggml_mul(ctx, t, p);   // atan(t)
+
+    // r + m*(pi/2 - 2r): r where |x| <= 1, pi/2 - r above it.
+    ggml_tensor* m = ggml_step(ctx, ggml_scale_bias(ctx, a, 1.0f, -1.0f));
+    ggml_tensor* folded = ggml_add(ctx, r, ggml_mul(ctx, m, ggml_scale_bias(ctx, r, -2.0f, kHalfPi)));
+    // sgn(0) is 0 and atan(0) is 0, so the zero case needs no special handling.
+    return ggml_mul(ctx, folded, ggml_sgn(ctx, x));
+}
+
+// The fallback half of PAD_1D_REFLECT: reflect padding built from views and concatenations, for a
+// backend with no `ggml_pad_reflect_1d` of its own.
+//
+// Exactly equivalent, and structurally so rather than approximately: torch's "reflect" convention
+// excludes the edge element, so the left block is elements `lp0..1` and the right block `T-2` down to
+// `T-1-rp0`, each a one-element slice of the original. No arithmetic happens in a slice, so there is
+// nothing to round -- the composition reproduces the primitive bit for bit, which is what
+// tests/ci/test_pad_reflect_lowering.cpp asserts.
+ggml_tensor* compose_pad_reflect_1d(ggml_context* ctx, ggml_tensor* a, int lp0, int rp0) {
+    const int64_t t = a->ne[0];
+    auto element = [&](int64_t k) {
+        return ggml_view_4d(ctx, a, 1, a->ne[1], a->ne[2], a->ne[3], a->nb[1], a->nb[2], a->nb[3],
+                             static_cast<size_t>(k) * a->nb[0]);
+    };
+    // Built as its own small block first and joined to the tensor once, rather than concatenated onto it
+    // one element at a time: the blocks are `lp0`/`rp0` elements wide, so those joins are trivial, and
+    // this way the only full-size copies are the two the primitive itself would have made.
+    ggml_tensor* out = a;
+    if (lp0 > 0) {
+        ggml_tensor* left = element(lp0);
+        for (int64_t k = lp0 - 1; k >= 1; --k) left = ggml_concat(ctx, left, element(k), 0);
+        out = ggml_concat(ctx, left, out, 0);
+    }
+    if (rp0 > 0) {
+        ggml_tensor* right = element(t - 2);
+        for (int j = 1; j < rp0; ++j) right = ggml_concat(ctx, right, element(t - 2 - j), 0);
+        out = ggml_concat(ctx, out, right, 0);
+    }
+    return out;
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -322,7 +435,11 @@ Outputs op_log(PrimitiveContext& pc, const Inputs& in, const Json&) {
 // noise_convs, a genuine trained-weight dependency with no reformulation that avoids the transcendental
 // function entirely (unlike RQ_SPLINE_INVERSE's gather-avoidance trick elsewhere in this file). Added via
 // ggml_map_custom2, the same "no native op, no viable composition" escape hatch ggml itself provides for
-// exactly this case -- CPU-only, but this whole engine is CPU-only today (see BACKLOG.md).
+// exactly this case. It takes a C FUNCTION POINTER, so it is CPU-only in a way no amount of backend
+// work changes: there is nothing here for a GPU to dispatch. That is not a barrier to running this
+// model on one -- ggml_backend_sched cuts the graph at nodes like this and runs them on the CPU
+// fallback every device build carries (BACKLOG.md P4.7) -- but it is what makes such a graph a SPLIT
+// one, and each split costs a device->host->device round trip.
 void atan2_custom_op(ggml_tensor* dst, const ggml_tensor* a, const ggml_tensor* b, int ith, int nth, void*) {
     const int64_t ne = ggml_nelements(dst);
     const auto* pa = static_cast<const float*>(a->data);
@@ -351,7 +468,13 @@ void atan_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, vo
 
 Outputs op_atan(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("ATAN", in, 1);
-    return {ggml_map_custom1(pc.ctx, ensure_packed(pc.ctx, in[0]), atan_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
+    ggml_tensor* native = ggml_map_custom1(pc.ctx, x, atan_custom_op, GGML_N_TASKS_MAX, nullptr);
+    // The one place this engine accepts an APPROXIMATION rather than an exact composition, and the
+    // asymmetry is deliberate: a CPU keeps libm's correctly-rounded `std::atan`, and only a backend that
+    // cannot dispatch a C function pointer at all gets the polynomial. See compose_atan.
+    if (backend_can_run(pc, native)) return {native};
+    return {compose_atan(pc.ctx, x)};
 }
 
 Outputs op_atan2(PrimitiveContext& pc, const Inputs& in, const Json&) {
@@ -422,27 +545,37 @@ Outputs op_shape(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_cast(pc.ctx, f32_shape_vec, GGML_TYPE_I32)};
 }
 
+// in[0] is the target shape (a 1D integer tensor of dimensions), in[1] the scalar to fill with. Both are
+// read at BUILD time through primitive_registry.h's helpers rather than off `->data`, because a shape
+// that decides how many elements the output has cannot wait until compute -- and because on a device
+// backend `->data` is not a host address at all (BACKLOG.md P4.7).
+//
+// The fill itself is a graph op, not a host loop. It used to be `float* d = dst->data; d[i] = v;` over a
+// tensor freshly created in the builder's no_alloc context -- where `data` is ALWAYS null, so any
+// topology that used this primitive dereferenced a null pointer. Nothing exports FILL today, which is
+// the only reason that never showed up as a crash. `clamp(arange, v, v)` is the composition that does
+// it in-graph: an arange supplies exactly `n` elements to be clamped, and clamping to [v, v] leaves
+// every one of them at v, whatever the arange put there.
 Outputs op_fill(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("FILL", in, 2);
-    // in[0] contains the shape (a 1D integer tensor containing the target dimensions)
-    // in[1] contains the fill value (a scalar tensor)
-    const int32_t* dims = static_cast<const int32_t*>(in[0]->data);
+    if (in[0]->type != GGML_TYPE_I32) {
+        throw SchemaError("FILL: the shape input must be i32");
+    }
+    const int64_t rank = std::min<int64_t>(ggml_nelements(in[0]), 4);
+    std::vector<int32_t> dims(static_cast<size_t>(rank));
+    read_tensor_prefix(in[0], dims.data(), dims.size() * sizeof(int32_t));
+
     int64_t ne[4] = {1, 1, 1, 1};
-    int64_t rank = ggml_nelements(in[0]);
-    for (int64_t i = 0; i < rank && i < 4; ++i) {
-        ne[i] = dims[i];
+    for (int64_t i = 0; i < rank; ++i) ne[i] = dims[static_cast<size_t>(i)];
+    const int64_t n = ne[0] * ne[1] * ne[2] * ne[3];
+    if (n <= 0) {
+        throw SchemaError("FILL: the shape input describes " + std::to_string(n) + " elements");
     }
-    ggml_tensor* dst = ggml_new_tensor_4d(pc.ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
-    const float fill_val = *static_cast<const float*>(in[1]->data);
-    
-    // Fill the newly allocated float tensor elements directly
-    float* dst_data = static_cast<float*>(dst->data);
-    int64_t num_elements = ggml_nelements(dst);
-    for (int64_t i = 0; i < num_elements; ++i) {
-        dst_data[i] = fill_val;
-    }
-    
-    return {dst};
+
+    const float fill_val = scalar_value_or(in[1], 0.0f);
+    ggml_tensor* flat = ggml_clamp(pc.ctx, ggml_arange(pc.ctx, 0.0f, static_cast<float>(n), 1.0f),
+                                   fill_val, fill_val);
+    return {ggml_reshape_4d(pc.ctx, flat, ne[0], ne[1], ne[2], ne[3])};
 }
 
 Outputs op_diag_mask_inf(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
@@ -466,6 +599,14 @@ Outputs op_pad_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {ggml_pad_ext(pc.ctx, a, lp0, rp0, 0, 0, 0, 0, 0, 0)};
 }
 
+// Above this total width the native op is kept even when the backend cannot run it. The composition
+// below emits `2 * (lp0 + rp0)` nodes -- `ggml_concat` is two-input, so each padded element costs a view
+// and a join -- and past some width, trading one CPU node for hundreds of device nodes is the worse
+// deal. 32 covers every reflect pad any exported model has asked for except one, and that exception is
+// the argument for the limit rather than against it: Whisper's STFT centre-framing pads 200 either side,
+// which would be 800 nodes in a 503-node graph (BACKLOG.md P4.7c/P4.7e).
+constexpr int kReflectPadComposeLimit = 32;
+
 Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // Reflect-pads ne[0] only (lp0 left, rp0 right) via ggml_pad_reflect_1d: [a,b,c,d] -> [b,a,b,c,d,c]
     // (excludes the edge element itself, matching numpy/torch's "reflect" -- not "symmetric" -- padding
@@ -477,7 +618,17 @@ Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& at
     const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
     const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
     ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
-    return {ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
+    ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
+    // Ask, then choose (primitive_registry.h's `backend_can_run`). Of the backends ggml ships, only
+    // Vulkan, OpenCL, OpenVINO and Hexagon lack this op -- CUDA, Metal, SYCL and CANN all have it -- so
+    // on most of them this is the one node it looks like, and the composition never gets built.
+    if (backend_can_run(pc, native) || lp0 + rp0 > kReflectPadComposeLimit) {
+        return {native};
+    }
+    // `native` is left behind in the context, unreferenced. Only tensors reachable from a declared
+    // output reach the cgraph (ggml_build_forward_expand walks backwards from them), so an abandoned
+    // node costs one struct in the no_alloc metadata arena and nothing at run time.
+    return {compose_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
 }
 
 Outputs op_silu(PrimitiveContext& pc, const Inputs& in, const Json&) {

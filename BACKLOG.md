@@ -3747,6 +3747,814 @@ generalized past NeMo → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (smal
   even all three changes leave Voxtral at ~29 GB against 28, so this is not a fix for that model, and
   should not be scheduled as if it were.
 
+#### P4.7 — the engine runs on a GPU — DONE (2026-08-12)
+
+Roadmap item 1 in the README, and the one thing it named as blocking: the engine talked to a single
+`ggml_backend_t` through a plain `ggml_gallocr` and used no `ggml_backend_sched` at all. It now takes a
+**pair** of backends and schedules across them. A default build is unchanged, byte for byte and
+allocator for allocator; a build configured with `-DGGML_VULKAN=ON` (or `GGML_CUDA`/`GGML_METAL`/...)
+gets a device.
+
+**The type that carries it is `loom::Backends` (`include/loom/core/backend.h`): two non-owning handles,
+`primary` and `fallback`.** It is implicitly constructible from a bare `ggml_backend_t`, which is why
+this landed without touching a single one of the 110 test files that construct one — a bare backend
+still means "one backend, no scheduler", and `hybrid()` is false for it. `loom::Device` is the RAII
+owner and the thing that resolves a spec: argument, then `$LOOM_DEVICE`, then autodetection (the
+project's standing order for anything the machine can answer for itself). `"auto"` prefers a device and
+falls back to the CPU; `"gpu"` **throws** when there is none, because a caller who spelled it out is
+asking a question about the machine and a silent CPU run is how a large slowdown goes unnoticed.
+
+**Two allocation strategies, chosen once per builder by `Backends::hybrid()`** (`graph_builder.h`):
+
+* CPU-only keeps the plain `ggml_gallocr`, the shrink policy P4.0.13/P4.0.15 measured, and everything
+  else exactly as it was. A single-backend graph has nothing to schedule.
+* A device plus its CPU fallback uses `ggml_backend_sched`. `GraphBuilder::compute()` exists because the
+  two need different calls; every compute site in the engine goes through it now.
+
+**Graph reuse survives the scheduler, which was the thing most at risk.** `ggml_backend_sched` keeps
+`is_alloc` set until the next `reset`, so a retained graph is re-run without being re-split or
+re-allocated: a fixed-shape loop still reports `builds()==1`, and a decode loop keeps both its graph and
+its split plan. The scheduler is sized from the BUILT graph (`n_nodes` plus the distinct tensors
+reachable through `src`/`view_src`, an upper bound on `n_nodes + n_leafs`, which is what
+`ggml_backend_sched_alloc_graph` asserts on) rather than from `estimate_graph_size()`'s deliberately
+generous 8x — at that bound the scheduler's own context buffer, `capacity *
+GGML_SCHED_MAX_SPLIT_INPUTS * 2` tensor structs, would be hundreds of megabytes for a graph needing
+tens, on an engine whose target is edge devices.
+
+**Three host-pointer reads had to go first.** `t->data` is a device address on a device backend, and
+`op_range_1d`'s bounds and `op_fill`'s shape both dereferenced it at graph-BUILD time.
+`primitive_registry.h` now carries `is_materialized`/`read_tensor_prefix`/`scalar_value_or`, which go
+through `ggml_backend_tensor_get`. `op_fill` additionally wrote its result through `dst->data` on a
+tensor freshly created in the builder's `no_alloc` context, where `data` is ALWAYS null — a
+null-pointer write on any backend, never noticed because nothing exports `FILL`. It is now
+`clamp(arange, v, v)`, in-graph.
+
+##### What was measured
+
+RADV/GFX9 (AMD Radeon Vega 3, an iGPU) against 4 CPU threads on the same machine, one forward per
+figure, graph built once and reused, `ggml` v0.16.0:
+
+| model | ggml nodes | splits | device / CPU nodes | CPU | GPU | |
+|---|---|---|---|---|---|---|
+| conformer-ctc-small | 2104 | **5** | 2086 / 18 | 144.8 ms | 50.8 ms | **2.85x** |
+| lfm2-350m monolithic | 1204 | **181** | 844 / 360 | 465.7 ms | 302.3 ms | 1.54x |
+| qwen3-0.6b monolithic | 3050 | **453** | 2146 / 904 | 776.1 ms | 818.2 ms | **0.95x** |
+
+**The split count is the whole story, and it is set by the EXPORT, not by the engine.** Every split is
+a device→host→device round trip. What forces them is `ggml_map_custom`: a C function pointer, which no
+backend but the CPU can dispatch. And the reason Qwen3 has 453 of them is that the MIL compiler lowers
+**RMS norm** to `POW → REDUCE_SUM → SCALE → ADD → RSQRT → MUL → MUL`, of which `POW` and `RSQRT` are
+custom ops — 113 of each, exactly 28 layers x 4 norms plus the final one. `SUM_ROWS` and `SCALE` are
+then dragged onto the CPU with them because they sit between two CPU nodes.
+
+**The engine has a native `RMS_NORM` primitive, and not one exported model uses it.** Counted across all
+thirteen fixtures (`v2/`, exporter HEAD): `RMS_NORM` appears **zero** times, while `POW` appears in ten
+of them and `RSQRT` in three.
+
+| fixture | RMS_NORM | POW | RSQRT | |
+|---|---|---|---|---|
+| causal_lm_kv (qwen3-0.6b) | 0 | 113 | 113 | the 453-split case |
+| lfm2, monolithic and modular | 0 | 45 | 45 | |
+| matcha | 0 | 38 | 32 | |
+| kokoro, styletts2 | 0 | 50 | 0 | `POW` without `RSQRT` — not RMS norm, some other power |
+| conformer, parakeet ×2 | 0 | 3 | 0 | |
+| gigaam, whisper | 0 | 1 | 0 | |
+| supertonic, vits | 0 | 0 | 0 | already free of both |
+
+`exporter.py` DID map `"rms_norm" → "RMS_NORM"`, and that was worse than a missing translation: it
+mapped an op **MIL does not have** (checked — coremltools' only `*norm*` core ops are
+batch/instance/l2/layer/local_response), so it could never fire, and would have emitted an `RMS_NORM`
+node with no `eps` attr — which the engine raises on — if a future coremltools ever added one. The entry
+is gone; the primitive is reached by a fusion pass instead. **See P4.7a below: this is now DONE.**
+
+The two smaller variants this entry priced — `POW(x, 2)` and the hand-rolled LayerNorm — are **DONE as
+P4.7b below**, which took the remaining 149 `POW` and 32 `RSQRT` nodes out of the zoo and left exactly
+two `ggml_map_custom` nodes in it.
+
+**The KV cache works on a device**, which the first version of this entry listed as untested because no
+export on hand had one. Re-exporting Qwen3-0.6B-Base against loom-exporter HEAD produced a fused causal
+LM with 28 cached `ATTENTION` nodes and an `infer_with_past` entry; twelve greedily-decoded tokens
+through the device's cache agree with twelve full CPU prefills over a growing prompt. That covers the
+cache in a device buffer, `KvCache::fill_cell_index` rewriting the cell-index tensor between steps on an
+already-split graph, and the retained graph outliving a moving `n_past` under a split plan.
+
+**Fidelity.** Frame-wise and token-wise decisions are identical on every model tried; the elementwise
+gap is fp32 reduction order, except where a model amplifies it:
+
+* qwen3-0.6b logits: max relative 7.5e-4, rms 2.1e-3, **0/8 argmax disagreements**.
+* conformer-ctc: max relative 3.4e-3, **0/17 frame argmax disagreements**.
+* lfm2-350m, monolithic and modular: same next token as the CPU. The modular export runs 20 modules
+  through the Lua bridge with retained outputs crossing between them, which is the arrangement P4.0.12
+  built and the one a device makes expensive — 183 splits against the monolithic export's 181, so
+  decomposing a model costs essentially nothing extra here.
+
+**The conformer's 3.4e-3 was bisected, not accepted.** Truncating the topology's node list and comparing
+each prefix: exact through node 19, then the STFT's `CONV_1D` pair introduces 8.3e-5, and node 33 — the
+log-mel's `LOG` — turns that into 1e-2, because `d(log x) = dx/x` and a near-silent mel bin has a tiny
+`x`. Everything downstream inherits it. Giving the test waveform a 1e-3 noise floor, so no mel bin sits
+at the zero that does the amplifying, takes the output gap from 2.5e-2 to 3.4e-3 — the same arithmetic,
+better conditioned. This is a property of that model's front end, not a measure of backend error, which
+is why `tests/gate/test_e2e_device_parity.cpp` compares the argmax exactly on top of the tolerance.
+
+##### The fixtures this was verified against
+
+Every artifact on hand predated this work by enough to get in its way: drivers with a `main` entry point
+rather than `infer`, a Conformer export with no `tokenizer.ggml.*` KVs at all, a Qwen3 export that
+re-prefills instead of caching. Twelve models were re-exported against loom-exporter HEAD into a
+`LOOM_FIXTURES` directory — conformer-ctc, kokoro, matcha, vits, styletts2, supertonic, lfm2
+(monolithic and modular), parakeet-tdt, parakeet-rnnt, gigaam, whisper, plus the fused Qwen3-0.6B-Base
+that gave this entry its `causal_lm_kv.gguf`. With those present, `ctest -L gate` runs 10 real tests
+rather than skipping everything, and all 10 pass on the CPU and Vulkan builds alike.
+
+The rest of the gate suite still skips: those tests want reference `_DIR` fixtures — PyTorch forward
+dumps from `fixture_gen/` — and a GGUF alone does not satisfy them. Producing all of those is a
+separate, much larger job, and the tests that do run are the ones that exercise a whole model through
+the Lua bridge, which is the path this change touched.
+
+##### Tests
+
+* `tests/ci/test_device_selection.cpp` — what a spec resolves to and what it refuses. Hermetic, so it
+  names only the CPU and states the rest as invariants ("auto" resolves to a device iff one exists).
+* `tests/ci/test_scheduled_graph.cpp` — the scheduler path driven by `Backends{cpu_a, cpu_b}`: two CPU
+  backends, an arrangement no host would ask for and the only one that exercises the machinery with no
+  GPU present. Parity is exact, reuse counters hold, a rebuild releases the previous allocation.
+  **Its limit is recorded in the file:** swapping `ggml_backend_sched_graph_compute` for the plain
+  `ggml_backend_graph_compute` does NOT turn it red, because two CPU backends put every buffer in host
+  memory. The parity comparison itself is live (feeding the scheduled run different tokens fails it).
+* `tests/gate/test_e2e_device_parity.cpp` — CPU vs device on the real Conformer-CTC encoder. Skips (77)
+  on a missing fixture AND on a build with no device backend, so it is green everywhere it cannot speak.
+  Asserts the device ran the majority of nodes, which is the failure mode "it runs on the GPU now" hides
+  best.
+
+* `tests/gate/test_e2e_device_parity_kv.cpp` — the other half, and the one that answers what the first
+  version of this entry listed as unverified: a KV-cached decode on the device against N full prefills
+  on the CPU. It is the only test that exercises the cache living in a device buffer, the cell-index
+  tensor being rewritten between steps on a graph the scheduler has already split, and P4.0.15's graph
+  reuse holding while `n_past` moves underneath a split plan. Twelve greedily-decoded tokens agree, on
+  a graph the scheduler cuts 453 times.
+
+Sharing `LOOM_CONFORMER_CTC_MIL_GGUF` with `test_vocab` turned up a **pre-existing crash in that test**,
+fixed here: `LOOM_CHECK` records a failure and carries on, so a `Vocab::load` returning null — which is
+what an export predating the embedded SentencePiece vocab (P4.0.17 step 3) gives, since it has no
+`tokenizer.ggml.*` KVs at all — was dereferenced on the next line and took the process out with SIGSEGV.
+It now reports and returns. Nothing about a device is involved; pointing that variable at an old
+artifact on disk is all it took, and "this test is broken" was the wrong message for "this fixture is
+too old".
+
+##### The build tools, and `cmake/VulkanToolchain.cmake`
+
+Neither of Debian bookworm's two relevant packages is new enough for `ggml` v0.16.0's Vulkan backend,
+and both fail in ways that name neither cause:
+
+* `glslc` 2023.2 answers ggml's `GL_KHR_cooperative_matrix` probe as though it supported it — the probe
+  greps stderr for "extension not supported", which this version does not emit — so coopmat shader
+  variants get generated and the build dies in `conv2d_mm.comp` with `'coopmat': undeclared
+  identifier`. `-DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF` does not help: ggml's CMake overwrites it from
+  the probe.
+* Vulkan-Headers 1.3.239 lack `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` (1.3.264+) and
+  `vk::LayerSettingEXT` (1.3.272+). Header-only, and the loader is ABI-stable, so newer headers against
+  the system `libvulkan.so.1` is a supported arrangement rather than a workaround.
+
+`cmake/VulkanToolchain.cmake` makes `-DGGML_VULKAN=ON` work on such a machine without anyone having to
+know the above. **FetchContent with pinned tags, not submodules** — the same answer this repo already
+gives for ggml, nlohmann_json and LuaJIT, and it gives the "bump it when we need to" property a
+submodule would without a `--recursive` clone every consumer has to remember.
+
+Three decisions in it are worth keeping:
+
+* **Both probes test the failure, not a version number.** The glslc probe runs ggml's own feature-test
+  shader and accepts two answers — it compiles, or it refuses in the words ggml greps for; anything
+  else is a glslc that will lie to ggml's probe. The header probe compiles the two declarations
+  `ggml-vulkan.cpp` uses. A version comparison would be a proxy that goes stale in both directions, and
+  a backported distro package is a real case.
+* **glslc is built at CONFIGURE time, not as an ExternalProject.** ggml runs glslc during ITS configure,
+  five times, and those runs decide which shader variants are generated and which compile definitions
+  are set. A binary that does not exist yet makes all five fail to launch, which ggml reads as
+  "supported" and acts on — a wrong answer from a process that never ran. The cost is a slow first
+  configure on a machine that needed it; it is idempotent per build directory.
+* **A generated `SPIRV-HeadersConfig.cmake`.** ggml does `find_package(SPIRV-Headers CONFIG REQUIRED)`
+  and then never links the target, so SPIRV-Headers has to be satisfied twice over and FetchContent's
+  own redirect covers neither: the package config is absent (SPIRV-Headers defines its config through
+  `install(EXPORT)`, which produces nothing in a build tree that never installs) and the include path is
+  absent (nothing links the target that carries it). That is the `'spv' has not been declared` error.
+  The module writes a three-line config and an `include_directories`.
+
+##### What this does NOT cover
+
+* **NPUs.** The device layer resolves `GGML_BACKEND_DEVICE_TYPE_ACCEL` alongside GPU/iGPU, so an
+  accelerator backend would be selected; none has been built or run.
+* **Only Vulkan, only one device.** CUDA, Metal, SYCL and the rest are compile-time switches that were
+  never flipped here. Multi-GPU is not attempted: `Device` initializes exactly one device backend, and
+  `ggml_backend_sched` is handed two backends, not N.
+* **Quantized weights on a device** (Q8_0 exports) were not run.
+* **`loom-py` ships CPU-only wheels.** The binding takes `device=` and forwards it; a wheel with a
+  device backend compiled in does not exist yet.
+* **Flash attention** is still not a primitive. The README named a GPU as what would make
+  `ggml_flash_attn_ext`'s forced F16 K/V cast worth its precision cost; that trade is now possible to
+  make and has not been made.
+
+#### P4.7a — RMS norm reaches its primitive, and the GPU story changes — DONE (2026-08-13)
+
+P4.7 measured Qwen3-0.6B at **0.95x** on a GPU — slower than the CPU — and named the cause: 226
+`ggml_map_custom` nodes, host callbacks no backend but the CPU can dispatch, each one cutting the graph.
+All 226 were one thing, an RMS norm the exporter never recognised. It is recognised now.
+
+`loom_exporter/passes.py`'s **`fuse_rms_norm`** collapses the five-op chain PyTorch's RMSNorm traces to —
+`pow(x,2) → reduce_mean(-1) → add(eps) → rsqrt → mul(x, ·)` — into one `loom_rms_norm`, which
+`topology_ops.py` lowers to the engine's `RMS_NORM`. The primitive was already there and had never once
+been emitted.
+
+##### What it did
+
+| | splits | device / CPU nodes | CPU | GPU | |
+|---|---|---|---|---|---|
+| qwen3-0.6b, decomposed | 453 | 2879 / 339 | 794.5 ms | 797.5 ms | 1.00x |
+| qwen3-0.6b, **fused** | **1** | **2201 / 0** | 755.9 ms | **275.5 ms** | **2.74x** |
+| lfm2-350m, decomposed | 181 | 1145 / 135 | 453.6 ms | 257.2 ms | 1.76x |
+| lfm2-350m, **fused** | **1** | **875 / 0** | 419.9 ms | **189.1 ms** | **2.22x** |
+
+**One split means the whole graph ran on the device** — not one node fell back. Qwen3's topology drops
+from 2066 nodes to 1501, LFM2's from 820 to 595, and both go from "the GPU is not worth using" to the
+range the Conformer was already in.
+
+**The CPU path is unchanged, and that is the point of checking it.** 794.5 → 755.9 ms and 453.6 → 419.9
+ms are within this machine's run-to-run variance; a fused `ggml_rms_norm` and five vectorized ops cost
+about the same on a CPU. Nobody pays for this.
+
+##### Correctness
+
+* **Numerically**: max relative difference between the two exports' logits is **4.1e-07** on the CPU
+  (fp32 rounding — `ggml_rms_norm` accumulates its sum in double where the decomposed chain's
+  `REDUCE_SUM` does not), with **0/8 argmax disagreements**. On the GPU, 3.1e-04 with the same 0/8.
+* **A model that must NOT change does not.** VITS has no RMS norm, and re-exporting it with the pass in
+  place produced a **byte-identical** GGUF to the one before. That is the check the sweep recipe demands
+  — a fusion that cannot be shown to leave the rest alone is a fusion nobody can trust.
+* The gate suite passes on both a CPU-only and a Vulkan build (82/82, 8–10 tests doing real work),
+  including `test_e2e_causal_lm_infer_with_past` on the re-exported model and both device-parity tests.
+  The KV-cache parity test now reports `splits=1, device=2034, cpu=0` — a whole cached decode on the
+  device, same twelve tokens as the CPU.
+* Eight unit tests in `tests/ci/test_passes.py`, and seven of them are **negative**: a multiply that
+  feeds back a different tensor, a mean over another axis, an exponent that is not 2, a shared
+  intermediate, keep_dims=False. That is where a fusion pass does its damage — emitting `RMS_NORM` for a
+  chain that normalizes something else is silently wrong arithmetic no shape check downstream catches.
+
+##### Two things worth keeping
+
+**MIL's `rsqrt` carries an epsilon of its own** (default 1e-12) and computes `1/sqrt(x + epsilon)`, so
+the value the engine must add to the mean square is the SUM of that and the traced `variance + self.eps`
+— measured, not assumed: the fused op comes out at `1.000001e-06` for a model written with `eps=1e-6`.
+Dropping the term would be a wrong answer nothing downstream would flag, which is why it has its own
+test.
+
+**Matcha was not fused, and should not have been.** It has 38 `POW` and 32 `RSQRT`, which looks like the
+same pattern and is not: its chain starts with `SUB(x, mean)` and reduces ne axis 1. That is a
+hand-rolled **LayerNorm** over a non-`ne[0]` axis, and `ggml_rms_norm` is neither mean-centred nor able
+to reduce any axis but `ne[0]`. The pass's axis guard refuses it. Fusing that one is a separate item —
+it would need `LAYER_NORM` plus a transpose, and `LAYER_NORM` has the same ne[0]-only restriction.
+
+##### The one it does not fix
+
+Kokoro and StyleTTS2 carry 50 `POW` each with **no** `RSQRT` — a real `x**p`, not a normalization — so
+they still split. `POW(x,2) → ggml_sqr` is the item for those, priced under P4.7 above.
+
+#### P4.7b — the last of the host callbacks: SQR and a hand-rolled LayerNorm — DONE (2026-08-13)
+
+P4.7a took RMS norm out of the causal LMs and left two things behind: 149 `POW` nodes spread across
+every family, and Matcha's 32 `RSQRT`. Both are gone now, and with them essentially every reason a
+scheduler had to cut a graph.
+
+**`lower_pow`** rewrites `pow(x, 2)` to MIL's own `square`, which `exporter.py` already mapped to the
+engine's `SQR`. That it was worth a whole pass is a measurement, not a guess: **every `pow` in every
+model is a square** — 149 of them, exponent 2.0 in every single one (Kokoro 50, StyleTTS2 50, Matcha 38,
+the NeMo encoders 3 each, GigaAM and Whisper 1 each). There was never a general `pow` to preserve, only
+a squaring op nobody had recognised. `pow(x, 0.5)` is deliberately NOT handled: no traced model has
+produced one, and this repo adds a path when a model needs it.
+
+**`fuse_layer_norm`** recognises the four-op statistic a model writes when it normalizes a channel axis
+itself instead of calling `torch.nn.LayerNorm`, and emits MIL's `layer_norm` — transposed into ne[0] and
+back when the axis is not already trailing, since `ggml_norm` normalizes ne[0] and nothing else. It is a
+separate pass from `fuse_rms_norm` and deliberately so: the two differ by exactly the mean-centring, and
+a matcher that treated `sub(x, mean)` as optional would emit `RMS_NORM` for a layer norm the moment a
+`sub` failed to match for an unrelated reason.
+
+##### What is left, across all thirteen fixture models
+
+| | before P4.7 | now |
+|---|---|---|
+| `POW` | 149 | **0** |
+| `RSQRT` | 258 | **0** |
+| `ATAN` / `ATAN2` / `SHAPE` | 2 | **2** |
+
+**Two `ggml_map_custom` nodes remain in the entire model zoo** — one `ATAN` each in Kokoro's and
+StyleTTS2's STFT phase computation, which has no ggml counterpart and no composition that avoids the
+transcendental. Everything else the engine ever pushed onto a host callback is now a real ggml op.
+
+**That count was the wrong lens, which P4.7c below discovered.** A graph also splits on real ggml ops
+whose BACKEND kernel is missing — `PAD_REFLECT_1D` and `POOL_1D` are both unimplemented in ggml-vulkan —
+and no amount of counting `ggml_map_custom` reveals them. Kokoro's remaining seven splits were four
+reflect pads and two `ATAN`, not two `ATAN`.
+
+##### What it did (AMD Vega 3 iGPU vs 4 CPU threads, best of three)
+
+| module | splits before | splits now | GPU vs CPU |
+|---|---|---|---|
+| qwen3-0.6b `main_topology` | 453 | **1** | 2.82x |
+| lfm2-350m `main_topology` | 181 | **1** | 2.22x |
+| matcha `encoder_mu` | 61 | **1** | 3.65x (was **0.84x** — slower than the CPU) |
+| kokoro `decoder_vocoder` | 107 | **7** | 4.45x |
+| styletts2 `decoder_vocoder` | ~107 | **7** | 4.28x |
+| conformer-ctc `main_topology` | 5 | **1** | 2.56x |
+
+##### The measurement that was wrong twice, and what it cost
+
+The obvious objection to transposing an axis into ne[0] is that `ggml_norm` calls `ensure_packed`, so
+each norm pays two full copies. A best-of-three on Matcha's `encoder_mu` said that cost **31% of CPU
+throughput** — and on the strength of it the transpose was replaced with `div(centered, sqrt(var+eps))`,
+which removes the same host callback while moving nothing. A second best-of-three then said the
+transpose was the *fastest* of the three. Both were noise: this module swings **33–85 ms between runs of
+the same binary** on this machine.
+
+Six interleaved rounds of twenty runs each, taking the minimum per arm, settled it:
+
+    unfused chain               cpu 50.5 ms   gpu 45.7 ms
+    transpose + layer_norm      cpu 44.2 ms   gpu 12.1 ms      <- what shipped
+    div(centered, sqrt(...))    cpu 54.5 ms   gpu 12.8 ms
+
+**Transposing is the fastest of the three on the CPU as well**, because `ggml_norm` is one fused pass
+where the chain it replaces is eight, and that buys more than two copies cost. The division form — which
+avoids the copies entirely — is the slowest. The lesson is not about layer norms: a best-of-three on a
+40 ms module on a thermally-throttled laptop is not a measurement, and it produced two contradictory
+"findings" before anything interleaved them.
+
+##### Correctness
+
+* **Byte-identity on both sides of the line, which is the check that makes the rest trustworthy.** The
+  four models with nothing to fuse (VITS, Supertonic, LFM2 monolithic and modular) re-export
+  **byte-identical**; the four with something to fuse (Kokoro, StyleTTS2, Matcha, Parakeet) all differ.
+  Naming which must move before diffing is the discipline BACKLOG.md §6 records, and this is it applied.
+* The gate suite passes on a CPU-only and a Vulkan build alike (82/82, 10 tests doing real work),
+  including all three MIL Lua-driver end-to-end tests, whose models are exactly the ones that changed.
+* 542 exporter CI tests, 15 of them new across the two passes, and most of the new ones negative: an
+  exponent that is not 2, a non-constant exponent, two means over different axes, a missing centring
+  (that graph is an RMS norm and belongs to the other pass), a shared intermediate.
+
+#### P4.7c — reflect padding, composed rather than fallen back on — DONE (2026-08-13)
+
+P4.7b left two `ggml_map_custom` nodes in the zoo and I called that the end of the fallbacks. It was
+not. **`PAD_1D_REFLECT` is not a custom op — it is a real ggml op that `ggml-vulkan` does not
+implement**, so every reflect pad was a node the scheduler had to run on the CPU, and nothing about the
+custom-op count said so. Looking only at `ggml_map_custom` was the wrong lens.
+
+##### How much it was worth, measured before deciding
+
+Substituting device-supported stand-ins of identical shape into Kokoro's `decoder_vocoder`, so each
+fallback's cost could be priced separately:
+
+| | splits | CPU nodes |
+|---|---|---|
+| as exported | 7 | 4 |
+| if the `ATAN` were device-native | 5 | 3 |
+| if the reflect pads were device-native | **3** | 1 |
+| if both were | 1 | 0 |
+
+The two reflect pads cost **four** of the six removable splits — twice what the remaining `ATAN` costs.
+And unlike the `ATAN`, this one has an **exact** fix, because reflect padding is not a transcendental:
+it is a slice and a concatenation.
+
+##### The composition
+
+`topology_ops.py`'s `pad` rule now emits, for `mode="reflect"`, one one-element `VIEW` per padded
+element plus the `CONCAT`s that join them — the left block being elements `lp0..1` and the right block
+`T-2` down to `T-1-rp0`, which is exactly torch's "reflect" convention (edge element excluded:
+`[a,b,c,d]` with (1,1) → `[b,a,b,c,d,c]`). `VIEW` inherits the parent's strides, so a `[1, *ne_rest]`
+view at byte offset `k*4` selects element `k` along ne[0] for every row and channel — correct for a
+rank-2 `[T, C]` tensor and not only for the effectively-1-D waveform that motivated it.
+
+**Bit-identical, and checked as such rather than argued.** Same module, two GGUFs, identical inputs:
+**0 of 38400 outputs differ in any bit**, on the CPU and on the device, for Kokoro and StyleTTS2 alike.
+No arithmetic happens in a slice, so there is nothing to round.
+
+| module | splits | CPU nodes | GPU |
+|---|---|---|---|
+| kokoro `decoder_vocoder` | 7 → **3** | 4 → **1** | 1507 → **1274 ms** |
+| styletts2 `decoder_vocoder` | 7 → **3** | 4 → **1** | 1452 → **1309 ms** |
+
+The CPU path is unaffected (6709 → 6428 ms and 6578 → 6170 ms, i.e. no worse, and within this machine's
+noise band — see P4.7b for how wide that is).
+
+*(**Superseded by P4.7e**, which moved this into the engine. P4.7d's support matrix showed the
+composition belongs there: CUDA, Metal, SYCL and CANN all implement `PAD_REFLECT_1D`, so only Vulkan
+needs it, and an export cannot know which backend will run it. Everything below about WHAT the
+composition is and why it is exact still stands — it is the same composition, in `op_pad_1d_reflect`
+now. What changed is who decides to use it.)*
+
+##### The width guard, and Whisper
+
+The composition costs `2 * (lp0 + rp0)` nodes, because `ggml_concat` is two-input. Above
+`_REFLECT_PAD_COMPOSE_LIMIT = 32` the primitive is kept instead. That is not hypothetical tidiness:
+**Whisper's STFT centre-framing pads 200 either side**, and composing it would emit **800 nodes** into a
+503-node topology. It keeps `PAD_1D_REFLECT`, exactly as before, and re-exports bit-identical.
+
+Whisper also shows why this item does not claim to have finished the job. Its encoder still reports 4
+splits, and removing the reflect pad would not change that: it also uses **`POOL_1D`**, which
+`ggml-vulkan` does not implement either. Which is the general shape of what is left — not custom ops,
+but real ggml ops with missing backend kernels, and the answer for those is upstream (a shader) rather
+than here (a composition). The tool that priced this item (substitute a stand-in, re-count splits) is
+the one to reach for before writing any of them.
+
+##### What remains, per module
+
+* kokoro / styletts2 `decoder_vocoder`: 3 splits, 1 CPU node — the `ATAN`. An exact mapping does not
+  exist (ggml has no inverse trig at all, and `atan` has no closed form over the real ops available); a
+  minimax rational on `[-1,1]` with `atan(x) = π/2 - atan(1/x)` range reduction would be ~15-20 native
+  nodes at ~1e-7 relative error. That would be **the first approximation of a transcendental this
+  project has accepted**, and it is worth 2 splits, so it is priced here and not taken.
+* whisper `encoder`: 4 splits — `POOL_1D` and a 400-wide reflect pad. **`POOL_1D` is DONE as P4.7d
+  below**, taking this to 2.
+
+#### P4.7d — POOL_1D, spelled as the POOL_2D that backends actually implement — DONE (2026-08-13)
+
+The last op P4.7c left on the CPU. **`GGML_OP_POOL_2D` is the only pooling op every GPU backend
+implements** — and a 1-D pool is a 2-D pool with a one-tall window, so the engine spells it that way
+**where it has to**. (As shipped this entry substituted unconditionally; **P4.7e put it behind
+`backend_can_run`** along with the reflect pad, so Metal and SYCL — which do implement `POOL_1D` — and a
+CPU-only build all keep the native op. Everything below about the equivalence and its one exception is
+unchanged; what moved is when the substitution happens.)
+
+*(The first version of this entry said "ggml-vulkan implements POOL_2D but not POOL_1D", which was true
+and undersold it: **CUDA has no `POOL_1D` either**. Only Metal and SYCL do. See the support matrix
+below, which was checked after the fact and changed what this item is worth — it is not a workaround for
+one backend, it is the spelling that works on all of them, and CUDA is what P4.8 does next.)* `ggml_pool_2d` sizes its output `[calc(ne0,k0,s0,p0), calc(ne1,k1,s1,p1), ne2, ne3]`
+against `ggml_pool_1d`'s `[calc(ne0,k0,s0,p0), ne1, ne2, ne3]`, and `calc(ne1, 1, 1, 0) == ne1`.
+
+**Engine-side, not exporter-side**, unlike P4.7a–c. Nothing per-MODEL is involved: it is one
+primitive's lowering, and a topology that says `POOL_1D` should keep meaning what it says.
+
+##### The thing that was nearly shipped wrong
+
+The two spellings are **not** interchangeable, in one combination, and it is invisible in every
+interior window: **an average pool with padding divides by different numbers.** `ggml_pool_1d` divides
+by `count`, the in-bounds elements the window actually covered; `ggml_pool_2d` divides by `ka = k0*k1`,
+the whole kernel, treating padded cells as zeros it still counts. The shapes agree, so nothing structural
+catches it — only the values at the windows that overhang an edge differ, 8 of 256 in the case that found
+it.
+
+That case was found by running the comparison **before** shipping the lowering, not after. The predicate
+is now `op == MAX || p0 == 0` (a max is indifferent to padding; with no padding no window overhangs, so
+`count == k0 == ka`), and everything else keeps `ggml_pool_1d` — a correct CPU fallback beats a fast
+wrong answer.
+
+`tests/ci/test_pool_1d_lowering.cpp` pins both halves: seven parameter combinations that must be
+bit-identical, and the padded average that must NOT be, asserted against the exposed predicate. A test
+that only covered the equivalent cases would still pass with the guard deleted, which is why the
+negative case is there.
+
+##### What it bought, and what it did not
+
+Whisper's encoder, the only user in the zoo:
+
+| | splits | CPU nodes | GPU |
+|---|---|---|---|
+| before | 4 | 4 | 2967 ms |
+| after | **2** | **3** | 3014 ms |
+
+**The splits halved and the wall clock did not move** — 2967 vs 3014 ms is inside this machine's noise.
+That is not a disappointment to explain away, it is the measurement: Whisper's `POOL_1D` is a *global
+max*, `k0 = s0 = 240000` over a flattened tensor, so its output is **one scalar** and the round trip the
+split was costing was one float. A split is only worth what crosses it.
+
+The value is therefore structural rather than in this number: pooling as an op class now runs on a device
+backend at all, for any model that pools something bigger than a scalar. Whisper happens to be the worst
+possible advertisement for its own fix.
+
+##### What is left in the zoo
+
+* whisper `encoder`: **2 splits** — the 400-wide reflect pad P4.7c's width guard correctly declines to
+  compose (800 nodes into a 503-node topology).
+* kokoro / styletts2 `decoder_vocoder`: **3 splits** — the `ATAN`, priced in P4.7c and not taken.
+* everything else: **1 split**, nothing falling back.
+
+Both remaining items are now upstream questions rather than exporter or engine ones: a `pad_reflect_1d`
+shader and an `atan` op. Which is the natural boundary — the three passes and this lowering took every
+case where loom could express the same thing in ops a backend already has, and stopped where that
+stopped being true.
+
+##### The support matrix, and where this kind of work belongs
+
+Checked against each backend's own `supports_op`, not by grepping for mentions (v0.16.0):
+
+| op | CPU | CUDA | Metal | Vulkan | SYCL | CANN | OpenCL | OpenVINO | Hexagon |
+|---|---|---|---|---|---|---|---|---|---|
+| `PAD_REFLECT_1D` | yes | **yes** | **yes** | no | yes | yes | no | no | no |
+| `POOL_1D` | yes | **no** | yes | no | yes | no | no | no | no |
+| `POOL_2D` | yes | yes | yes | yes | yes | yes | no | no | no |
+| `atan` | *ggml has no atan op at all — not in the unary enum, not in any backend* |
+
+Three things follow, and the third is the one worth keeping.
+
+1. **This item is worth more than its own first paragraph claimed** — CUDA lacks `POOL_1D` too, so the
+   lowering is what makes pooling run on a device at all for the backend P4.8 goes to next.
+2. **The `ATAN` gap is universal, not Vulkan's.** Those two splits would be splits on CUDA and Metal
+   alike. That cuts both ways: an approximation would pay off everywhere rather than on one backend,
+   which strengthens the case for it somewhat — it is still the first approximation of a transcendental
+   this project would accept.
+3. **P4.7c is in the wrong repo, and this matrix is what shows it.** `PAD_REFLECT_1D` exists on CUDA,
+   Metal, SYCL and CANN; only Vulkan lacks it. So composing it in the EXPORTER bakes a Vulkan-shaped
+   workaround into an artifact that four other backends would have run in one node. The exporter emits
+   one GGUF for every backend and cannot know the target. The engine knows exactly which backend it has,
+   and ggml exposes `ggml_backend_supports_op(backend, op)` to ask it.
+
+   Which gives the line these four items were groping for:
+
+   * **The exporter says what the model MEANS.** The three fusions belong there and would be right even
+     if every backend implemented every op: fewer nodes, a fused kernel, faster on the CPU too.
+   * **The engine says it in ops THIS BACKEND has.** A portability lowering is neither per-model (so not
+     the exporter's, by the standing rule) nor per-task — it is per-BACKEND, and the backend is a thing
+     only the engine ever sees. One branch per gap, no permanent tax on every artifact, and the topology
+     keeps saying `PAD_1D_REFLECT` instead of open-coding it in forty nodes.
+
+   This entry already works that way; P4.7c did not. **P4.7e below is that move**, generalized into a
+   mechanism (`PrimitiveContext` carries the `Backends`; `backend_can_run` asks) rather than a branch in
+   one primitive.
+
+#### P4.7e — a primitive that asks the backend what it can run — DONE (2026-08-13)
+
+P4.7d's support matrix showed P4.7c had solved the right problem in the wrong repo, and this is the
+correction — generalized, because the shape of it recurs: **ggml defines ops that not every backend
+implements, and the gaps do not line up.** CUDA has `PAD_REFLECT_1D` but no `POOL_1D`; Vulkan has
+`POOL_2D` but neither; OpenCL, OpenVINO and Hexagon have none of the three.
+
+**The exporter cannot answer this question and the engine can.** An export is ONE GGUF that any backend
+may later run, so composing around a gap there compiles every artifact for the least capable backend
+anyone might use — P4.7c had Kokoro shipping a forty-node open-coding of a pad that CUDA, Metal, SYCL
+and CANN all run in one node. The engine sees the actual backend, and `ggml_backend_supports_op` will
+answer directly.
+
+So `PrimitiveContext` now carries the `Backends`, and a primitive in that position builds the native op,
+**asks**, and keeps it or emits an equivalent composition:
+
+```
+ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
+if (backend_can_run(pc, native) || lp0 + rp0 > kReflectPadComposeLimit) return {native};
+return {compose_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
+```
+
+##### One artifact, two lowerings
+
+The same Kokoro GGUF, whose topology says `PAD_1D_REFLECT` and means it:
+
+    cpu  (CPU     ): 1692 ggml nodes, 0 splits     <- native op, nothing composed
+    gpu  (Vulkan0 ): 1732 ggml nodes, 3 splits     <- composed, because Vulkan has no kernel for it
+
+That is the whole point: the decision is made where the backend is known, per run, and the file on disk
+says what the model does rather than what one backend could not do. The topology went back to 1373 nodes
+(from P4.7c's 1413), and the exporter change is reverted.
+
+The device outcome is unchanged from P4.7c — 3 splits, 1 CPU node (the `ATAN`) — which is the point: the
+same result, obtained without teaching every artifact about Vulkan.
+
+##### Two rules for anything added this way
+
+Both were learned by nearly getting them wrong, and both are written into `primitive_registry.h` beside
+the helper:
+
+* **The fallback must be EXACTLY equivalent, and shown to be.** P4.7d found two spellings of the same
+  ggml op that divide by different numbers; a composition that differs at the edges is a wrong answer no
+  shape check catches. `tests/ci/test_pad_reflect_lowering.cpp` compares the composition against
+  `ggml_pad_reflect_1d` bit-for-bit across seven shapes and widths — **and independently asserts what
+  reflect padding IS** (`[a,b,c,d]` with (2,1) → `[c,b,a,b,c,d,c]`), because two implementations can be
+  wrong the same way and ggml's convention is not something either of them gets to define.
+* **A composition has a width past which it stops being worth it.** `kReflectPadComposeLimit = 32`;
+  above it the native op is kept and allowed to fall back. Whisper pads 200 either side, which would be
+  800 nodes in a 503-node graph.
+
+##### Applied to POOL_1D as well
+
+`op_pool_1d` was the first lowering of this kind and it predated the mechanism, so it substituted
+`ggml_pool_2d` unconditionally wherever the two were equivalent. That worked, and it was doing more than
+it needed to: **Metal and SYCL implement `POOL_1D`**, and a CPU-only build — the default — implements
+everything, so all of them were getting a rewritten graph to work around a gap they did not have.
+
+It now asks first, and the same Whisper GGUF resolves differently per backend:
+
+    cpu  (CPU     ): POOL_1D=1  POOL_2D=0
+    gpu  (Vulkan0 ): POOL_1D=0  POOL_2D=1
+
+The order of the two conditions is worth keeping: `backend_can_run` first, `pool_2d_fallback_is_equivalent`
+only as the reason to reach for the fallback. Where there is no equivalent fallback — a padded average —
+the native op stays and the scheduler sends it to the CPU, because a correct fallback beats a fast wrong
+answer. `pool_1d_lowers_to_pool_2d` is renamed `pool_2d_fallback_is_equivalent` to say which of the two
+questions it answers.
+
+##### What this does not do
+
+`backend_can_run` is unreachable on a CPU-only build -- the CPU implements every op, so the native branch
+always wins there and no hermetic test can provoke the other one. The test therefore checks the two
+spellings against each other rather than trying to force the branch, so that whichever a device takes, it
+takes one of two things already known to be identical. The branch itself is exercised only by a real
+device, which is what `tests/gate/test_e2e_device_parity*.cpp` are for.
+
+This mechanism was built for ops with an EXACT composition, and the remaining `ATAN` had none — ggml has
+no inverse trig in any backend. **P4.7f takes it anyway, as an approximation**, which is a different
+decision with a different bar: an accuracy budget stated and measured rather than a bit-identity claim.
+The mechanism turned out to be exactly what made that acceptable, because it confines the approximation
+to the backends that cannot do better.
+
+#### P4.7f — `atan` without a host callback, and the first accepted approximation — DONE (2026-08-13)
+
+The last `ggml_map_custom` node in the zoo. **ggml has no inverse trigonometry in any backend** — not in
+the unary enum, not in CUDA, Metal, Vulkan or any other — so unlike the reflect pad and the 1-D pool
+there was nothing exact to compose from: every closed form for `atan` over the available real ops routes
+through `asin`, `acos` or a complex logarithm, none of which exist either.
+
+So this one is an **approximation**, which is a first here, and it is confined by the same mechanism
+P4.7e built: `op_atan` keeps libm's `std::atan` wherever `backend_can_run` says the backend can dispatch
+the callback, so **a CPU-only build — the default — is bit-for-bit what it always was.** Only a device
+that would otherwise have split the graph ever sees the polynomial.
+
+##### The method, which is what a GPU's own `atanf` does inline
+
+Three stages, no branches — not CORDIC, which is what older fixed-function hardware used:
+
+1. **Range reduction.** `atan(-x) = -atan(x)` strips the sign; `atan(x) = pi/2 - atan(1/x)` folds
+   everything above 1 back below it. Written as `t = min(a,1) / max(a,1)`, which needs no reciprocal.
+2. **A minimax polynomial in `z = t*t`**, Horner-evaluated so every step is a multiply-add. Not a Taylor
+   series: Taylor converges far too slowly at the end of the interval to be affordable at this width.
+3. **Branchless reconstruction.** `step(a-1)` is a 0/1 mask and `r + m*(pi/2 - 2r)` is the arithmetic
+   form of a select, because a device wants every lane executing the same instructions.
+
+##### Degree 8, and why not 9
+
+Fitted on a Chebyshev grid and evaluated **through the exact fp32 op sequence the engine emits**, against
+`atan` in double precision:
+
+| degree in z | max ULP |
+|---|---|
+| 6 | 11.74 |
+| 7 | 3.55 |
+| **8** | **1.84** |
+| 9 | 2.56 |
+| 10–14 | 1.88 – 2.18 |
+
+It stops improving at 8 because past there the limit is fp32 rounding in the Horner evaluation itself,
+not the polynomial. Further terms cost two graph nodes each and buy nothing. Measured on the real
+implementation afterwards: **1.81 ULP**, against a test bound of 2.5. For reference a GPU vendor's own
+`atanf` is typically specified at 2–4 ULP; glibc's is under 1, and glibc is what a CPU build still gets.
+
+##### One formulation was tried and rejected, by the test
+
+`t = a / max(a,1)^2` saves a clamp by using `min(a,1)*max(a,1) == a`. It is wrong twice over, and the
+first way is the kind of wrong that reaches production: `max(a,1)^2` **overflows to infinity** for any
+`a` past ~1.8e19 — and `ggml_clamp` caps at `FLT_MAX` rather than at infinity, so `atan(inf)` came out
+`inf/inf` = **NaN**. It is also less accurate in the folded branch (2.30 ULP against 1.86), because
+squaring throws away bits the divide then cannot recover. The special-value assertions in
+`tests/ci/test_atan_lowering.cpp` are what caught it, on the first run.
+
+That test asserts the bound over three sweeps (both reduction branches and the decades from 1e-30 to
+1e30), asserts `atan(0)`, `atan(±1)` and `atan(±inf)` **exactly**, and asserts **monotonicity** — a
+polynomial can wobble inside an ULP bound and invert two neighbouring inputs, which an error bound alone
+would never notice and anything comparing phases would.
+
+##### What it bought
+
+| kokoro / styletts2 `decoder_vocoder` | splits | CPU nodes |
+|---|---|---|
+| before | 3 | 1 |
+| after | **1** | **0** |
+
+**Nothing falls back.** The whole vocoder runs on the device.
+
+The wall clock did not move — 1274.8 ms against 1274.1 before, and 4.53x over the CPU either way — and
+that is worth stating plainly rather than dressing up. The split it removed crossed a small tensor, and
+**this machine's GPU reports `uma: 1`**: it shares memory with the host, so a "device→host→device round
+trip" here is a synchronisation and not a transfer. Every split-cost number in P4.7 through P4.7f is
+therefore a **lower bound** on what a discrete GPU over PCIe would pay, and the case for removing the
+last split is stronger on the hardware this engine is not being measured on.
+
+Also: the Kokoro reference gate test produces `rms=0.865596, max_abs=16.2979` on the Vulkan build both
+before and after this change — swapping libm for a 1.8-ULP polynomial moved the vocoder's output by less
+than the printed precision.
+
+##### Where the zoo now stands
+
+* kokoro, styletts2, matcha, qwen3, lfm2, conformer, gigaam, parakeet ×2, vits, supertonic: **1 split,
+  nothing falling back.**
+* whisper `encoder`: **2 splits** — the 400-wide reflect pad, which the composition limit correctly
+  declines (800 nodes into a 503-node graph) and which CUDA, Metal, SYCL and CANN all run natively
+  anyway. The only genuinely Vulkan-shaped hole left, and the answer for it is a shader upstream.
+
+`ATAN2` is still a host callback and deliberately untouched: **no exported model has ever contained one**
+(0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
+not new mathematics.
+
+#### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
+
+P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
+Vulkan. That was a hardware accident, not a decision. What follows is the shape of the rest — CUDA
+next, then NPUs — and, because "compile in every backend" and "the engine targets edge devices" cannot
+both hold, how a build stays as small as the box it ships to.
+
+**Nothing here is started. Every number in it is a count of what upstream ships, not a measurement.**
+
+##### The good news first: tier 1 costs a CMake flag
+
+`ggml` v0.16.0, the revision this repo already pins, ships **sixteen** backend directories: `ggml-cuda`,
+`ggml-metal`, `ggml-vulkan`, `ggml-sycl`, `ggml-opencl`, `ggml-hip`, `ggml-musa`, `ggml-blas`,
+`ggml-rpc`, `ggml-webgpu`, `ggml-cann` (Ascend), `ggml-hexagon` (Qualcomm), `ggml-openvino`,
+`ggml-zdnn`, `ggml-zendnn`, `ggml-virtgpu`.
+
+Two of the four NPU targets named for this item are already in there — **OpenVINO** outright, and
+**Qualcomm** as `ggml-hexagon` rather than as the out-of-tree `ggml-qnn`. Which of those two is the
+right Qualcomm path is a real question and is NOT answered here; in-tree costs nothing to try, so it
+should be tried first.
+
+**And for every one of them, the engine needs no work.** That is what P4.7's device layer bought, and it
+is worth being explicit about why: `loom::Device` resolves a spec against the ggml *device registry*,
+never against a backend name it knows. A CUDA build's `CUDA0` is selectable by `--device cuda0` today,
+by code that has never heard of CUDA. `GGML_BACKEND_DEVICE_TYPE_ACCEL` — what an NPU registers as — is
+already in `is_offload_device()`. The work in tier 1 is a build matrix and a test run, not C++.
+
+##### Tier 2: out of tree, and priced accordingly
+
+**CoreML**, **RKNPU2** (`ggml-rknpu2`, and the `rk-llama.cpp` fork), and `ggml-qnn` if it beats
+`ggml-hexagon` are not in the pinned ggml. Each would mean vendoring a backend or carrying a ggml fork,
+and this repo's dependency policy (`Dependencies.cmake`) is pinned FetchContent of upstream, precisely
+so it never owns somebody else's tree. Before any of them: **check the licence.** The project is MIT and
+has already turned down a dependency over exactly this (Task #79, espeak-ng's GPL-3). A vendored
+backend that cannot be shipped under MIT is not a cheap dependency, it is a relicensing decision.
+
+Note also that CoreML is not Metal. Metal is the GPU and is in tier 1; reaching the **Neural Engine**
+means CoreML, and no ggml backend targets it. That is a bigger piece of work than the others, not a
+sibling of them.
+
+##### The leanness answer, and it is already verified
+
+`GGML_BACKEND_DL`. Each backend becomes a shared library that ggml discovers at RUN time, so one engine
+binary serves every accelerator and the deployment decides which `.so` files travel with it. Measured on
+this machine (`-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON`):
+
+* it works through `loom::Device` **unchanged** — `Device::open` already calls `ggml_backend_load_all()`,
+  and `loom_cli --list-devices` reports a dynamically loaded backend exactly as it reports a linked one;
+* the CPU becomes a plugin too, and splits into per-microarchitecture variants (`libggml-cpu-haswell.so`,
+  `-zen4`, `-sapphirerapids`, …) with the best picked at load time — which is a second, unrelated win:
+  one artifact stops being compiled for one `-march`;
+* discovery order is `GGML_BACKEND_DIR` (compile-time), the executable's directory, the current
+  directory, and `$GGML_BACKEND_PATH` (a specific file);
+* **with no `.so` found, the registry is EMPTY — there is no CPU either.** Every spec, `"cpu"` and
+  `"auto"` included, fails. `loom::Device` now says so in as many words rather than reporting "ggml
+  reports no CPU device", because a deployment that forgot to ship its backends needs to be told that is
+  what happened.
+
+So the guard this item asks for is mostly not a new invention: it is `GGML_BACKEND_DL` plus a decision
+about what each artifact carries. What IS still needed on the engine side is small and namable:
+
+1. **A `Backends` that holds more than two.** `Device` initializes exactly one device backend and hands
+   `ggml_backend_sched` a pair. Two GPUs, or a GPU *and* an NPU, needs a list — `ggml_backend_sched`
+   takes N backends already (CPU last), so this is `loom::Backends` growing a vector and `GraphBuilder`
+   passing it through, not a redesign.
+2. **A device-selection story for more than one match.** `"gpu"` means "the first GPU/iGPU/accelerator
+   registered". With two accelerators of different kinds in a box that stops being a sensible default.
+3. **Op coverage decides whether an accelerator is worth using at all, and the NPU backends are the
+   sharp end of it.** P4.7 measured 453 splits costing Qwen3 its entire speedup on a GPU that supports
+   nearly every op; P4.7a–d cleared them and the zoo now runs at 1–3 splits. The support matrix in
+   P4.7d is the warning for this item: of `PAD_REFLECT_1D`, `POOL_1D` and `POOL_2D`, **OpenCL, OpenVINO
+   and Hexagon implement none — not even `POOL_2D`**, which every GPU backend has. So a first NPU
+   benchmark will not measure the NPU; it will measure how much of the graph fell back. Budget for
+   the coverage work before drawing any conclusion from a number.
+
+   P4.7d's closing section also settles where that work goes: **portability lowerings in the engine,
+   keyed on `ggml_backend_supports_op`; op-recognition fusions in the exporter.** An NPU backend will
+   need many of the former, and doing them the exporter way would mean an artifact compiled for the
+   least capable backend anyone might run it on.
+
+##### `loom-py`: profiles, and why a wheel matrix is the wrong first instinct
+
+The axes are architecture (x86-64, arm64) × libc/OS (manylinux, macOS, Windows) × accelerator (none,
+CUDA, Metal, Vulkan, OpenVINO, Hexagon, RKNPU2, CoreML). The full cross product is not a plan, and two
+of the combinations people ask for collapse on inspection: **Metal is Apple-only**, so "Arm + Metal" and
+"Apple Silicon + Metal" are one profile; **Arm + CUDA** is real but means Jetson/Grace, which is a
+distinct manylinux variant rather than a flag.
+
+PyPI wheel tags encode architecture and libc but have **no accelerator dimension**, so an accelerator
+has to be expressed as either a package-name suffix (torch's `cu121` shape — a full wheel per
+accelerator, which is the combinatorial matrix) or as something loaded at run time. `GGML_BACKEND_DL`
+makes the second possible: **one arch-tagged base wheel, plus small `loom-py-backend-*` packages that
+drop a `.so` where ggml looks.** `pip install loom-py-rt[cuda]` then means "also fetch that backend",
+`Model(..., device="auto")` finds it, and a Raspberry Pi installs nothing extra and gets the CPU
+variants it already had. That is the option worth costing first, and the reason to prefer it is not
+elegance — it is that the matrix version multiplies every future backend by every existing platform,
+and this one adds a row.
+
+Either way the *engine* side is the same work, which is why this is one item and not two.
+
+##### What would make this item startable
+
+A machine with the hardware, or CI that has it. Every claim above about tier 1 is "upstream ships a
+directory"; none of it is "we ran it". The honest first step is CUDA on a box that has an NVIDIA GPU —
+it is the most used, it is in tier 1, and `tests/gate/test_e2e_device_parity{,_kv}.cpp` are written
+against "the first non-CPU device" and would run against it unmodified. That test passing on a second
+backend is the evidence that the device layer generalizes; until then, it is a claim.
+
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 
 The engine, the exporter and a new Python binding are now three repos under
@@ -4959,15 +5767,18 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
   plus a cell-index tensor, the indirection listed as absent under "Scope limitations" below), bucketed
   `n_kv` at 32, and padded the mask host-side — a prefill plus 40 decode steps is now three graphs.
   Read P4.0.15 for where the padding actually happens, which is not where this paragraph guessed.
-- **`ggml_backend_sched` / multi-backend.** Not used anywhere — engine talks to a single `ggml_backend_t`
-  directly via a plain `ggml_gallocr`. Fine for CPU-only; needed once a second backend (CUDA/Metal) is
-  added and graphs need splitting across devices. This is what makes P4.0.12's retained outputs a
-  latent win rather than a paid one: a marshalled inter-module edge is two host copies today and a
-  device→host→device round trip per edge per step the moment this lands.
+- **`ggml_backend_sched` / multi-backend — DONE (P4.7).** A `GraphBuilder` built against a device plus
+  its CPU fallback schedules across the two; a CPU-only one still uses the plain `ggml_gallocr` it always
+  did. The prediction in this entry's own last sentence was measured and came out the other way round:
+  LFM2-350M's 20-module modular export costs **183 splits against the monolithic export's 181**, so the
+  marshalled inter-module edges retained outputs replace are not what a device charges for. What it
+  charges for is `ggml_map_custom` — see P4.7 for the 453 splits an RMS norm lowered to POW+RSQRT buys.
 - **Flash attention.** `ATTENTION` (`src/ops/primitives_attention.cpp`) always uses the composite
   (`MUL_MAT`→`soft_max_ext`→`MUL_MAT`) path — chosen because `ggml_flash_attn_ext` forces an F16 K/V cast
   that fights exact fp32 verification. A `FLASH_ATTENTION` primitive can be added later as a purely
-  additive alternative once a GPU backend makes the perf/precision tradeoff worth it.
+  additive alternative once a GPU backend makes the perf/precision tradeoff worth it. **The GPU exists
+  now (P4.7) and the trade still has not been made** — it is a decision about verification, not a
+  blocked dependency, and the gate suite's exact-fp32 comparisons are what would have to give.
 
 ### Scope limitations (still true)
 

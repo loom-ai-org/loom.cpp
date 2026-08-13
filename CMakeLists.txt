@@ -15,6 +15,7 @@ option(LOOM_BUILD_TOOLS "Build the CLI/demo tools" ON)
 include(cmake/Dependencies.cmake)
 
 add_library(loom_engine
+    src/core/backend.cpp
     src/core/gguf_model.cpp
     src/core/symbol_env.cpp
     src/core/graph_topology.cpp

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
 
 namespace loom {
 namespace {
@@ -135,12 +136,44 @@ int64_t requested_n_kv(const DynamicAxes& axes) {
     return 0;
 }
 
+// An upper bound on `n_nodes + n_leafs` for `gf`, which is what ggml_backend_sched_alloc_graph asserts
+// its hash set covers -- and the one number a scheduler has to be sized by.
+//
+// It is counted rather than estimated because the alternatives are a crash or a waste. `struct
+// ggml_cgraph` is opaque in ggml's public headers, so `n_leafs` cannot simply be read; the only bound
+// available without counting is the graph's own declared capacity, and since estimate_graph_size() is a
+// deliberately generous 8x that would size the scheduler's fixed overhead (capacity *
+// GGML_SCHED_MAX_SPLIT_INPUTS * 2 ggml_tensor structs of context buffer) at hundreds of megabytes for a
+// model whose graph needs tens -- on an engine whose target is edge devices.
+//
+// Every leaf ggml can add is some node's `src` or `view_src` (that is how ggml_visit_parents reaches
+// one), so counting the DISTINCT tensors reachable through those two edges bounds the leaf count from
+// above without having to reproduce ggml's own node/leaf classification -- which would be the fragile
+// part, since it turns on op codes and tensor flags this file has no business knowing.
+size_t scheduler_capacity_for(ggml_cgraph* gf) {
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    std::unordered_set<const ggml_tensor*> reachable;
+    reachable.reserve(static_cast<size_t>(n_nodes) * 2);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] != nullptr) reachable.insert(node->src[s]);
+        }
+        if (node->view_src != nullptr) reachable.insert(node->view_src);
+    }
+    return static_cast<size_t>(n_nodes) + reachable.size();
+}
+
 } // namespace
 
-GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_backend_t backend,
+GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends backends,
                             KvCache* kv_cache, size_t compute_meta_bytes, ConvStateCache* conv_state)
-    : topo_(topo), model_(model), backend_(backend), kv_cache_(kv_cache), conv_state_(conv_state),
-      compute_meta_bytes_(compute_meta_bytes) {
+    : topo_(topo), model_(model), backends_(backends), backend_(backends.primary),
+      kv_cache_(kv_cache), conv_state_(conv_state), compute_meta_bytes_(compute_meta_bytes) {
+    if (backend_ == nullptr) {
+        throw Error("GraphBuilder: no primary backend -- construct a loom::Device, or pass a "
+                    "ggml_backend_t directly");
+    }
     // Asked once, here, rather than per build: uses_kv_cache() walks every node of the topology, and
     // for a flattened LM that is thousands of them. A cache the caller did not supply counts as "not
     // bucketing" -- op_attention will raise on such a topology anyway, and raising there says more.
@@ -306,7 +339,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     }
 
     std::vector<ggml_tensor*> side_effect_roots;
-    PrimitiveContext pc{ctx.get(), env, kv_cache_, conv_state_, kv_cells_, &side_effect_roots};
+    PrimitiveContext pc{ctx.get(), env, kv_cache_, conv_state_, kv_cells_, &side_effect_roots, backends_};
     for (const TopologyItem& item : topo_.items) {
         if (!item.is_repeat) {
             build_node(item.node, pc, symtab);
@@ -365,22 +398,26 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     }
     result.graph = gf;
 
-    shrink_allocator_if_oversized(gf);
-    if (!galloc_) {
-        galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
-    }
-    const size_t buffer_before = ggml_gallocr_get_buffer_size(galloc_.get(), 0);
-    if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
-        throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
-    }
-    // Arm the shrink for the NEXT build, and only on a growth big enough to be a change of REGIME
-    // rather than the ordinary creep of a decode loop. A cached causal LM's `n_kv` still creeps -- one
-    // bucket every kKvBucket steps since P4.0.15, one token per step before it -- so its buffer still
-    // grows a little on rebuilds that are not regime changes; arming on any growth at all made the probe
-    // run on roughly every other step and cost +1.3 ms/step on gemma-3-270m-it, which is the measurement
-    // that put this factor here. A prefill->decode transition is 500x, not 1.001x.
-    if (ggml_gallocr_get_buffer_size(galloc_.get(), 0) > buffer_before * kShrinkArmingGrowth) {
-        may_shrink_ = true;
+    if (backends_.hybrid()) {
+        allocate_scheduled(gf);
+    } else {
+        shrink_allocator_if_oversized(gf);
+        if (!galloc_) {
+            galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        }
+        const size_t buffer_before = ggml_gallocr_get_buffer_size(galloc_.get(), 0);
+        if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
+            throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
+        }
+        // Arm the shrink for the NEXT build, and only on a growth big enough to be a change of REGIME
+        // rather than the ordinary creep of a decode loop. A cached causal LM's `n_kv` still creeps --
+        // one bucket every kKvBucket steps since P4.0.15, one token per step before it -- so its buffer
+        // still grows a little on rebuilds that are not regime changes; arming on any growth at all made
+        // the probe run on roughly every other step and cost +1.3 ms/step on gemma-3-270m-it, which is
+        // the measurement that put this factor here. A prefill->decode transition is 500x, not 1.001x.
+        if (ggml_gallocr_get_buffer_size(galloc_.get(), 0) > buffer_before * kShrinkArmingGrowth) {
+            may_shrink_ = true;
+        }
     }
 
     result.ctx = std::move(ctx);
@@ -438,7 +475,92 @@ void GraphBuilder::shrink_allocator_if_oversized(ggml_cgraph* gf) {
     ++shrinks_;
 }
 
+// The hybrid counterpart of the gallocr block in build(), and deliberately a much shorter one: a
+// scheduler does its own liveness analysis, its own per-backend buffers and its own growth policy, so
+// the only decisions left here are how big to make it and when to let go of the previous allocation.
+//
+// **Sized from the built graph, not from estimate_graph_size().** ggml_backend_sched_alloc_graph asserts
+// its hash set covers `n_nodes + n_leafs`, and the leafs are the WEIGHTS -- for a flattened LM, thousands
+// of them, a count the 8x-per-topology-node estimate says nothing useful about in either direction.
+// Sizing it from the real graph also keeps the scheduler's own fixed overhead honest: it allocates
+// `capacity * GGML_SCHED_MAX_SPLIT_INPUTS * 2` ggml_tensor structs of context buffer, which at the
+// estimate's bound would be hundreds of megabytes for a model whose graph needs tens.
+//
+// **Recreated, never shrunk.** A scheduler that is big enough stays; one that is not is replaced
+// wholesale. There is no ggml_backend_sched equivalent of the gallocr shrink and none is faked here --
+// see shrink_allocator_if_oversized's comment for what the CPU path's policy is actually buying, and
+// note that none of that reasoning transfers: the scheduler's buffers are per backend and its planner
+// already reuses them across allocations of different sizes.
+void GraphBuilder::allocate_scheduled(ggml_cgraph* gf) {
+    const size_t needed = scheduler_capacity_for(gf);
+    if (!sched_ || sched_capacity_ < needed) {
+        // A quarter of headroom so that the ordinary creep of a decode loop's graph (one KV bucket at a
+        // time) does not rebuild the scheduler every few dozen steps, which would also throw away the
+        // split plan the retained graph exists to keep.
+        const size_t capacity = std::max<size_t>(needed + needed / 4, GGML_DEFAULT_GRAPH_SIZE);
+        ggml_backend_t backends[2] = {backends_.primary, backends_.fallback};
+        // The CPU MUST be last: ggml_backend_sched_new asserts it, because its split planner treats the
+        // final backend as the one that can run anything.
+        sched_.reset(ggml_backend_sched_new(backends, /*bufts=*/nullptr, /*n_backends=*/2, capacity,
+                                            /*parallel=*/false, /*op_offload=*/true));
+        if (!sched_) {
+            throw Error("GraphBuilder::build: ggml_backend_sched_new failed");
+        }
+        sched_capacity_ = capacity;
+    } else {
+        // Releases the PREVIOUS graph's allocation and split plan. Required before another
+        // alloc_graph -- which asserts it is not already allocated -- and safe here for exactly the
+        // reason the retained graph was already dropped above: nothing is going to run that graph again.
+        ggml_backend_sched_reset(sched_.get());
+    }
+    if (!ggml_backend_sched_alloc_graph(sched_.get(), gf)) {
+        throw Error("GraphBuilder::build: ggml_backend_sched_alloc_graph failed");
+    }
+}
+
+// A REUSED graph is not re-allocated and not re-split: ggml_backend_sched keeps `is_alloc` set until the
+// next reset, so repeated computes of the same graph skip straight to running the splits it already
+// planned. That is what makes P4.0.13/P4.0.15's graph reuse worth as much on a device as on a CPU -- a
+// decode loop that reuses its graph also reuses its split plan, and the per-step cost is the copies the
+// splits name and nothing else.
+void GraphBuilder::compute() {
+    if (!has_cached_) {
+        throw Error("GraphBuilder::compute: no graph has been built yet");
+    }
+    const ggml_status status = backends_.hybrid()
+        ? ggml_backend_sched_graph_compute(sched_.get(), cached_.graph)
+        : ggml_backend_graph_compute(backend_, cached_.graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        throw Error("GraphBuilder::compute: the graph failed to run on " +
+                    std::string(ggml_backend_name(backend_)) + " (ggml_status " +
+                    std::to_string(static_cast<int>(status)) + ")");
+    }
+}
+
+std::vector<std::string> GraphBuilder::node_backends() const {
+    std::vector<std::string> out;
+    if (!sched_ || !has_cached_ || cached_.graph == nullptr) return out;
+    const int n = ggml_graph_n_nodes(cached_.graph);
+    out.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched_.get(), ggml_graph_node(cached_.graph, i));
+        out.emplace_back(b ? ggml_backend_name(b) : "");
+    }
+    return out;
+}
+
+int GraphBuilder::splits() const {
+    return sched_ ? ggml_backend_sched_get_n_splits(sched_.get()) : 0;
+}
+
 size_t GraphBuilder::buffer_size() const {
+    if (sched_) {
+        size_t total = 0;
+        for (ggml_backend_t b : {backends_.primary, backends_.fallback}) {
+            total += ggml_backend_sched_get_buffer_size(sched_.get(), b);
+        }
+        return total;
+    }
     return galloc_ ? ggml_gallocr_get_buffer_size(galloc_.get(), 0) : 0;
 }
 

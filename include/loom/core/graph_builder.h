@@ -1,5 +1,6 @@
 #pragma once
 
+#include "loom/core/backend.h"
 #include "loom/core/graph_topology.h"
 #include "loom/core/gguf_model.h"
 #include "loom/core/symbol_table.h"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace loom {
 
@@ -27,10 +29,31 @@ using DynamicAxes = std::unordered_map<std::string, double>;
 // implementing SPECIFICATION.md §5's two-pass allocation strategy: build a no_alloc "ghost graph" from
 // the topology, then hand it to ggml_gallocr to assign real memory.
 //
-// GraphBuilder only builds and allocates -- it deliberately does NOT copy input tensor data in or run
-// ggml_backend_graph_compute. The caller (Generator, a test, ...) owns that: it writes whatever data it
-// has into BuildResult::input_tensors, then calls ggml_backend_graph_compute itself. This keeps
-// "construct the graph" and "execute it" independently testable.
+// GraphBuilder only builds and allocates -- it deliberately does NOT copy input tensor data in. The
+// caller (Generator, a test, ...) owns that: it writes whatever data it has into
+// BuildResult::input_tensors, then asks for the graph to run. This keeps "construct the graph" and
+// "execute it" independently testable.
+//
+// ---------------------------------------------------------------------------------------------------
+// WHICH BACKEND(S) THE GRAPH RUNS ON (BACKLOG.md P4.7)
+// ---------------------------------------------------------------------------------------------------
+// A builder takes a `Backends`, not a `ggml_backend_t`, and there are two allocation strategies behind
+// that one type:
+//
+//   * **CPU-only (`!Backends::hybrid()`)** -- a plain `ggml_gallocr`, exactly as before P4.4, down to
+//     the shrink policy and the reuse key. A single-backend graph has nothing to schedule, and routing
+//     it through `ggml_backend_sched` would buy an extra planning pass per build and a per-graph split
+//     analysis in exchange for nothing.
+//   * **A device backend plus its CPU fallback (`hybrid()`)** -- `ggml_backend_sched`, which owns its
+//     own gallocr and additionally decides, per node, which of the two backends runs it. This is what
+//     lets a graph containing `ggml_map_custom` nodes (RSQRT/ATAN/ATAN2/POW/SHAPE -- C function
+//     pointers no GPU can dispatch) run on a GPU at all: the scheduler cuts the graph at those nodes,
+//     runs them on the CPU, and inserts the device<->host copies itself.
+//
+// `compute()` below is the entry point for BOTH, and exists because those two need different calls.
+// The CPU-only path's is still literally `ggml_backend_graph_compute(backend, graph)`, so a test that
+// keeps calling that itself on a CPU-only builder remains correct; on a hybrid builder it would run an
+// unallocated, unsplit graph, which is why the method is the documented way.
 //
 // ---------------------------------------------------------------------------------------------------
 // THE BUILT GRAPH IS PERSISTENT AND REUSED (BACKLOG.md P4.0.13)
@@ -91,7 +114,7 @@ public:
     // `conv_state` is the same arrangement for SHORT_CONV, and is last so that every existing
     // positional call site keeps compiling unchanged -- a topology needs neither, either or both
     // (GraphTopology::uses_kv_cache / uses_conv_state answer which).
-    GraphBuilder(const GraphTopology& topo, GgufModel& model, ggml_backend_t backend,
+    GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends backends,
                  KvCache* kv_cache = nullptr, size_t compute_meta_bytes = 32 * 1024 * 1024,
                  ConvStateCache* conv_state = nullptr);
 
@@ -158,6 +181,23 @@ public:
     // `loom.run_subgraph`), not a property of the module the way its caches are.
     const BuildResult& build(const DynamicAxes& axes, OutputStore* out_store = nullptr);
 
+    // Runs the graph this builder last handed out, after the caller has written its declared inputs.
+    // Throws loom::Error on a non-GGML_STATUS_SUCCESS result rather than returning it: every caller in
+    // this engine treated a failed compute as fatal already, and the two paths fail for different enough
+    // reasons (an allocation on a device with 2 GiB of shared memory; a CPU thread pool that could not
+    // start) that the message is worth more than the code.
+    //
+    // Only meaningful for the CURRENT graph -- the one `build()` returned last -- because that is the one
+    // a hybrid builder's scheduler holds an allocation and a split plan for.
+    void compute();
+
+    // Which backend ggml_backend_sched assigned each node of the current graph to, as one entry per
+    // graph node in node order, holding the ggml backend NAME ("Vulkan0", "CPU"). Empty for a CPU-only
+    // builder, which has no assignment to report. This is how a test states "these ops fell back and
+    // those did not" as a fact about the scheduler rather than an inference from timing, and how
+    // `loom_cli --device-report` shows where a model actually ran.
+    std::vector<std::string> node_backends() const;
+
     // Builds worst-case prefill (n_tokens=n_ctx_max, n_past=0) and decode (n_tokens=1,
     // n_past=n_ctx_max-1) shapes and reserves the allocator for the larger of the two, so that ordinary
     // build() calls within those bounds don't trigger a gallocr reallocation. Purely a performance
@@ -171,7 +211,9 @@ public:
 
     // Current size (in bytes) of the gallocr-managed compute buffer, or 0 if build()/reserve() haven't
     // been called yet. Exposed mainly so tests can confirm reserve() sizes the allocator once and
-    // ordinary build() calls within those bounds don't grow it further.
+    // ordinary build() calls within those bounds don't grow it further. On a hybrid builder this is the
+    // scheduler's compute buffers SUMMED over its backends, since a split graph holds one per backend
+    // and no single number is the "the" buffer any more.
     size_t buffer_size() const;
 
     // How many build() calls actually constructed a graph, and how many were served from the retained
@@ -180,8 +222,16 @@ public:
     uint64_t builds() const { return builds_; }
     uint64_t reuses() const { return reuses_; }
     // How many builds gave the oversized compute buffer back. A prefill-then-decode generation should
-    // report exactly one, at the transition; a fixed-shape loop, zero.
+    // report exactly one, at the transition; a fixed-shape loop, zero. Always 0 on a hybrid builder: the
+    // shrink is a policy over a gallocr this builder owns, and a hybrid one's allocator belongs to
+    // ggml_backend_sched, which offers no equivalent (BACKLOG.md P4.7).
     uint64_t shrinks() const { return shrinks_; }
+
+    // How many splits ggml_backend_sched cut the current graph into -- one more than the number of times
+    // execution crossed between the device and the CPU. 0 for a CPU-only builder. The number a hybrid
+    // run is actually judged by: a graph that alternates costs a device->host->device round trip per
+    // crossing, and this is what says how many there are.
+    int splits() const;
 
     // The number of KV cells `n_kv` is rounded up to for a cached topology (BACKLOG.md P4.0.15). Not a
     // tuned optimum: it is llama.cpp's own `n_pad` for the non-flash-attention path, and any power of
@@ -193,11 +243,25 @@ public:
 private:
     const GraphTopology& topo_;
     GgufModel& model_;
+    Backends backends_;
+    // == backends_.primary. Kept as its own member because it is what every allocation in here targets
+    // (the declared inputs, the gallocr's buffer type), and spelling that `backends_.primary` at each
+    // site would obscure that they all deliberately go to ONE backend even when two are in play.
     ggml_backend_t backend_;
     KvCache* kv_cache_;
     ConvStateCache* conv_state_;
     size_t compute_meta_bytes_;
+    // Exactly one of these is ever non-null, chosen once by `backends_.hybrid()`: the gallocr for the
+    // CPU-only path, the scheduler for the hybrid one. See the class comment.
     ggml_gallocr_ptr galloc_;
+    ggml_backend_sched_ptr sched_;
+    // The node+leaf capacity `sched_` was created with. ggml_backend_sched_alloc_graph asserts its hash
+    // set is at least the graph's node+leaf count, and that count is only known once a graph is built --
+    // so the scheduler is created on the first build and recreated whenever a later, bigger graph
+    // outgrows it, rather than being sized up front from estimate_graph_size()'s deliberately generous
+    // 8x bound (whose per-node scheduler cost is quadratic-ish in memory: sched allocates
+    // graph_size * MAX_SPLIT_INPUTS * 2 tensor structs of context buffer).
+    size_t sched_capacity_ = 0;
 
     // Whether this builder drives a cached ATTENTION at all (asked once -- uses_kv_cache() walks every
     // node), and whether `n_past` may therefore be dropped from the retained graph's key. The second is
@@ -239,8 +303,13 @@ private:
 
     // Drops the gallocr when this graph needs materially less than the buffer currently holds, so the
     // next alloc sizes a fresh one. See build()'s own comment for why the allocator will not do this
-    // by itself.
+    // by itself. CPU-only path only -- a hybrid builder has no gallocr of its own to shrink.
     void shrink_allocator_if_oversized(ggml_cgraph* gf);
+
+    // The hybrid path's replacement for the gallocr block: creates or grows `sched_` to fit this graph,
+    // releases the previous graph's allocation, and allocates + splits this one. Never called on a
+    // CPU-only builder, which has no scheduler.
+    void allocate_scheduled(ggml_cgraph* gf);
 
     // `n_kv` as the GRAPH sees it: the caller's own value when nothing is bucketed, otherwise rounded
     // up to kKvBucket and capped at the cache's capacity. Returns 0 when this call binds no n_kv at all
