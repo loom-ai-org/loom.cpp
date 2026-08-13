@@ -4175,7 +4175,11 @@ the one to reach for before writing any of them.
 #### P4.7d — POOL_1D, spelled as the POOL_2D that backends actually implement — DONE (2026-08-13)
 
 The last op P4.7c left on the CPU. **`GGML_OP_POOL_2D` is the only pooling op every GPU backend
-implements** — and a 1-D pool is a 2-D pool with a one-tall window, so the engine now spells it that way.
+implements** — and a 1-D pool is a 2-D pool with a one-tall window, so the engine spells it that way
+**where it has to**. (As shipped this entry substituted unconditionally; **P4.7e put it behind
+`backend_can_run`** along with the reflect pad, so Metal and SYCL — which do implement `POOL_1D` — and a
+CPU-only build all keep the native op. Everything below about the equivalence and its one exception is
+unchanged; what moved is when the substitution happens.)
 
 *(The first version of this entry said "ggml-vulkan implements POOL_2D but not POOL_1D", which was true
 and undersold it: **CUDA has no `POOL_1D` either**. Only Metal and SYCL do. See the support matrix
@@ -4323,6 +4327,24 @@ the helper:
 * **A composition has a width past which it stops being worth it.** `kReflectPadComposeLimit = 32`;
   above it the native op is kept and allowed to fall back. Whisper pads 200 either side, which would be
   800 nodes in a 503-node graph.
+
+##### Applied to POOL_1D as well
+
+`op_pool_1d` was the first lowering of this kind and it predated the mechanism, so it substituted
+`ggml_pool_2d` unconditionally wherever the two were equivalent. That worked, and it was doing more than
+it needed to: **Metal and SYCL implement `POOL_1D`**, and a CPU-only build — the default — implements
+everything, so all of them were getting a rewritten graph to work around a gap they did not have.
+
+It now asks first, and the same Whisper GGUF resolves differently per backend:
+
+    cpu  (CPU     ): POOL_1D=1  POOL_2D=0
+    gpu  (Vulkan0 ): POOL_1D=0  POOL_2D=1
+
+The order of the two conditions is worth keeping: `backend_can_run` first, `pool_2d_fallback_is_equivalent`
+only as the reason to reach for the fallback. Where there is no equivalent fallback — a padded average —
+the native op stays and the scheduler sends it to the CPU, because a correct fallback beats a fast wrong
+answer. `pool_1d_lowers_to_pool_2d` is renamed `pool_2d_fallback_is_equivalent` to say which of the two
+questions it answers.
 
 ##### What this does not do
 

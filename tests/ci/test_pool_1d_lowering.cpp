@@ -1,6 +1,10 @@
-// POOL_1D lowers to a one-tall `ggml_pool_2d` wherever that is the same operation, because ggml-vulkan
-// implements `GGML_OP_POOL_2D` and not `GGML_OP_POOL_1D` (BACKLOG.md P4.7d). This is the test that says
-// "wherever that is the same operation" is a checked claim and not a hopeful one.
+// POOL_1D falls back to a one-tall `ggml_pool_2d` when the backend has no `ggml_pool_1d` -- CUDA and
+// Vulkan do not, Metal and SYCL do (BACKLOG.md P4.7d/P4.7e). This is the test that says "the fallback is
+// the same operation" is a checked claim and not a hopeful one.
+//
+// The CHOICE is not tested here and cannot be: `backend_can_run` answers yes for everything on a CPU
+// backend, so a hermetic test always takes the native branch. What is testable, and what matters, is
+// that the thing on the other branch is indistinguishable from the thing on this one.
 //
 // **The claim is bit-identity against `ggml_pool_1d` itself**, across a matrix of (op, kernel, stride,
 // padding), computed on the same input in the same graph. A tolerance would be the wrong instrument:
@@ -115,7 +119,7 @@ int main() {
         {"avg, ragged tail (101 with k=4 s=3)", 101, 5, 4, 3, 0, GGML_OP_POOL_AVG},
     };
     for (const PoolCase& c : equivalent) {
-        LOOM_CHECK(loom::pool_1d_lowers_to_pool_2d(c.op, c.p0));
+        LOOM_CHECK(loom::pool_2d_fallback_is_equivalent(c.op, c.p0));
         const size_t differences = bit_differences(c, backend.get());
         if (differences != 0) {
             std::fprintf(stderr, "  %s: %zu output(s) differ between the two spellings\n", c.label,
@@ -129,7 +133,7 @@ int main() {
     // it would never construct the case the guard exists for. This is that case.
     {
         const PoolCase padded_average{"avg, k=3 s=2, PADDED", 64, 8, 3, 2, 1, GGML_OP_POOL_AVG};
-        LOOM_CHECK(!loom::pool_1d_lowers_to_pool_2d(padded_average.op, padded_average.p0));
+        LOOM_CHECK(!loom::pool_2d_fallback_is_equivalent(padded_average.op, padded_average.p0));
         const size_t differences = bit_differences(padded_average, backend.get());
         std::fprintf(stderr, "padded average: %zu of %d outputs differ between the spellings "
                               "(pool_1d divides by the in-bounds count, pool_2d by the full kernel)\n",
