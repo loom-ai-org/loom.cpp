@@ -4142,6 +4142,11 @@ No arithmetic happens in a slice, so there is nothing to round.
 The CPU path is unaffected (6709 → 6428 ms and 6578 → 6170 ms, i.e. no worse, and within this machine's
 noise band — see P4.7b for how wide that is).
 
+*(P4.7d's support matrix later showed this composition belongs in the ENGINE rather than here: CUDA,
+Metal, SYCL and CANN all implement `PAD_REFLECT_1D`, so only Vulkan needs it, and an export cannot know
+which backend will run it. Correct and measured as it stands — bit-identical, four fewer splits — but
+the wrong home. See P4.7d's closing section.)*
+
 ##### The width guard, and Whisper
 
 The composition costs `2 * (lp0 + rp0)` nodes, because `ggml_concat` is two-input. Above
@@ -4168,9 +4173,13 @@ the one to reach for before writing any of them.
 
 #### P4.7d — POOL_1D, spelled as the POOL_2D that backends actually implement — DONE (2026-08-13)
 
-The last op P4.7c left on the CPU. **`ggml-vulkan` implements `GGML_OP_POOL_2D` and `GGML_OP_ARGMAX`
-but not `GGML_OP_POOL_1D`** — and a 1-D pool is a 2-D pool with a one-tall window, so the engine now
-spells it that way. `ggml_pool_2d` sizes its output `[calc(ne0,k0,s0,p0), calc(ne1,k1,s1,p1), ne2, ne3]`
+The last op P4.7c left on the CPU. **`GGML_OP_POOL_2D` is the only pooling op every GPU backend
+implements** — and a 1-D pool is a 2-D pool with a one-tall window, so the engine now spells it that way.
+
+*(The first version of this entry said "ggml-vulkan implements POOL_2D but not POOL_1D", which was true
+and undersold it: **CUDA has no `POOL_1D` either**. Only Metal and SYCL do. See the support matrix
+below, which was checked after the fact and changed what this item is worth — it is not a workaround for
+one backend, it is the spelling that works on all of them, and CUDA is what P4.8 does next.)* `ggml_pool_2d` sizes its output `[calc(ne0,k0,s0,p0), calc(ne1,k1,s1,p1), ne2, ne3]`
 against `ggml_pool_1d`'s `[calc(ne0,k0,s0,p0), ne1, ne2, ne3]`, and `calc(ne1, 1, 1, 0) == ne1`.
 
 **Engine-side, not exporter-side**, unlike P4.7a–c. Nothing per-MODEL is involved: it is one
@@ -4221,9 +4230,49 @@ possible advertisement for its own fix.
 * everything else: **1 split**, nothing falling back.
 
 Both remaining items are now upstream questions rather than exporter or engine ones: a `pad_reflect_1d`
-shader and either an `atan` op or a `pool_1d` shader in ggml-vulkan. Which is the natural boundary — the
-three passes and this lowering took every case where loom could express the same thing in ops a backend
-already has, and stopped where that stopped being true.
+shader and an `atan` op. Which is the natural boundary — the three passes and this lowering took every
+case where loom could express the same thing in ops a backend already has, and stopped where that
+stopped being true.
+
+##### The support matrix, and where this kind of work belongs
+
+Checked against each backend's own `supports_op`, not by grepping for mentions (v0.16.0):
+
+| op | CPU | CUDA | Metal | Vulkan | SYCL | CANN | OpenCL | OpenVINO | Hexagon |
+|---|---|---|---|---|---|---|---|---|---|
+| `PAD_REFLECT_1D` | yes | **yes** | **yes** | no | yes | yes | no | no | no |
+| `POOL_1D` | yes | **no** | yes | no | yes | no | no | no | no |
+| `POOL_2D` | yes | yes | yes | yes | yes | yes | no | no | no |
+| `atan` | *ggml has no atan op at all — not in the unary enum, not in any backend* |
+
+Three things follow, and the third is the one worth keeping.
+
+1. **This item is worth more than its own first paragraph claimed** — CUDA lacks `POOL_1D` too, so the
+   lowering is what makes pooling run on a device at all for the backend P4.8 goes to next.
+2. **The `ATAN` gap is universal, not Vulkan's.** Those two splits would be splits on CUDA and Metal
+   alike. That cuts both ways: an approximation would pay off everywhere rather than on one backend,
+   which strengthens the case for it somewhat — it is still the first approximation of a transcendental
+   this project would accept.
+3. **P4.7c is in the wrong repo, and this matrix is what shows it.** `PAD_REFLECT_1D` exists on CUDA,
+   Metal, SYCL and CANN; only Vulkan lacks it. So composing it in the EXPORTER bakes a Vulkan-shaped
+   workaround into an artifact that four other backends would have run in one node. The exporter emits
+   one GGUF for every backend and cannot know the target. The engine knows exactly which backend it has,
+   and ggml exposes `ggml_backend_supports_op(backend, op)` to ask it.
+
+   Which gives the line these four items were groping for:
+
+   * **The exporter says what the model MEANS.** The three fusions belong there and would be right even
+     if every backend implemented every op: fewer nodes, a fused kernel, faster on the CPU too.
+   * **The engine says it in ops THIS BACKEND has.** A portability lowering is neither per-model (so not
+     the exporter's, by the standing rule) nor per-task — it is per-BACKEND, and the backend is a thing
+     only the engine ever sees. One branch per gap, no permanent tax on every artifact, and the topology
+     keeps saying `PAD_1D_REFLECT` instead of open-coding it in forty nodes.
+
+   This entry already works that way; P4.7c does not. **Moving P4.7c's composition into
+   `op_pad_1d_reflect`, gated on `ggml_backend_supports_op`, is the follow-up** — `PrimitiveContext`
+   would need to carry the backend, which `GraphBuilder` already holds, so it is one field and a branch.
+   Not done here: it is a refactor of something currently correct and measured, and it should be one
+   commit that says so rather than a rider on this one.
 
 #### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
 
@@ -4292,12 +4341,18 @@ about what each artifact carries. What IS still needed on the engine side is sma
    passing it through, not a redesign.
 2. **A device-selection story for more than one match.** `"gpu"` means "the first GPU/iGPU/accelerator
    registered". With two accelerators of different kinds in a box that stops being a sensible default.
-3. **Custom ops decide whether an accelerator is worth using at all.** P4.7 measured 453 splits
-   costing Qwen3 its entire speedup on a GPU that supports nearly every op; P4.7a removed them and the
-   same model went to 2.74x. An NPU supports *far fewer* ops than a GPU, so this effect starts larger
-   there and every remaining `ggml_map_custom` matters more. The RMS-norm half is done; `POW(x,2)` and
-   the hand-rolled LayerNorm Matcha carries are the ones left, and they should be cleared **before**
-   anyone judges an NPU backend by a benchmark.
+3. **Op coverage decides whether an accelerator is worth using at all, and the NPU backends are the
+   sharp end of it.** P4.7 measured 453 splits costing Qwen3 its entire speedup on a GPU that supports
+   nearly every op; P4.7a–d cleared them and the zoo now runs at 1–3 splits. The support matrix in
+   P4.7d is the warning for this item: of `PAD_REFLECT_1D`, `POOL_1D` and `POOL_2D`, **OpenCL, OpenVINO
+   and Hexagon implement none — not even `POOL_2D`**, which every GPU backend has. So a first NPU
+   benchmark will not measure the NPU; it will measure how much of the graph fell back. Budget for
+   the coverage work before drawing any conclusion from a number.
+
+   P4.7d's closing section also settles where that work goes: **portability lowerings in the engine,
+   keyed on `ggml_backend_supports_op`; op-recognition fusions in the exporter.** An NPU backend will
+   need many of the former, and doing them the exporter way would mean an artifact compiled for the
+   least capable backend anyone might run it on.
 
 ##### `loom-py`: profiles, and why a wheel matrix is the wrong first instinct
 
