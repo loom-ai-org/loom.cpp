@@ -23,7 +23,27 @@ set(JSON_Install OFF CACHE INTERNAL "")
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(ggml nlohmann_json)
+# ggml's Vulkan backend needs two build-host tools, and a stable distribution's are likely too old for
+# it -- in two ways that name neither cause. This makes `-DGGML_VULKAN=ON` work on such a machine by
+# building what is missing, and does nothing at all on a machine that already has both (or on the
+# CPU-only default). See cmake/VulkanToolchain.cmake for the two failures and the two probes.
+#
+# Populated-then-added rather than MakeAvailable'd, because the toolchain setup has to run BETWEEN the
+# two: it reads a feature-test shader out of ggml's sources, and everything it sets has to be in place
+# before ggml's own `find_package(Vulkan COMPONENTS glslc)` runs.
+if(GGML_VULKAN)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    include(${CMAKE_CURRENT_LIST_DIR}/VulkanToolchain.cmake)
+    FetchContent_MakeAvailable(nlohmann_json)
+    FetchContent_GetProperties(ggml)
+    if(NOT ggml_POPULATED)
+        FetchContent_Populate(ggml)
+    endif()
+    loom_setup_vulkan_toolchain()
+    add_subdirectory(${ggml_SOURCE_DIR} ${ggml_BINARY_DIR})
+else()
+    FetchContent_MakeAvailable(ggml nlohmann_json)
+endif()
 
 # LuaJIT: embedded Lua VM for the procedural-generalization orchestration layer (see
 # LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md) -- replaces bespoke per-model C++ drivers

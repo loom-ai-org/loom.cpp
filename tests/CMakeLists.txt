@@ -122,6 +122,39 @@ add_test(NAME test_gallocr_shrink COMMAND test_gallocr_shrink)
 set_tests_properties(test_gallocr_shrink PROPERTIES LABELS ci)
 set_tests_properties(test_gallocr_shrink PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# The scheduler path GPU/NPU support runs on (BACKLOG.md P4.7). Uses the same toy model, driven through
+# a two-backend `Backends` -- see the test's own header for why two CPUs is the right hermetic stand-in.
+add_executable(test_scheduled_graph ci/test_scheduled_graph.cpp)
+target_link_libraries(test_scheduled_graph PRIVATE loom::engine)
+target_compile_definitions(test_scheduled_graph PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_scheduled_graph COMMAND test_scheduled_graph)
+set_tests_properties(test_scheduled_graph PROPERTIES LABELS ci)
+set_tests_properties(test_scheduled_graph PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
+# POOL_1D's lowering to a one-tall POOL_2D, and the one combination it must refuse (BACKLOG.md P4.7d).
+add_executable(test_pool_1d_lowering ci/test_pool_1d_lowering.cpp)
+target_link_libraries(test_pool_1d_lowering PRIVATE loom::engine)
+add_test(NAME test_pool_1d_lowering COMMAND test_pool_1d_lowering)
+set_tests_properties(test_pool_1d_lowering PROPERTIES LABELS ci)
+
+# PAD_1D_REFLECT's composed fallback, against ggml's own primitive (BACKLOG.md P4.7e).
+add_executable(test_pad_reflect_lowering ci/test_pad_reflect_lowering.cpp)
+target_link_libraries(test_pad_reflect_lowering PRIVATE loom::engine)
+add_test(NAME test_pad_reflect_lowering COMMAND test_pad_reflect_lowering)
+set_tests_properties(test_pad_reflect_lowering PROPERTIES LABELS ci)
+
+# ATAN's polynomial fallback, measured against libm (BACKLOG.md P4.7f).
+add_executable(test_atan_lowering ci/test_atan_lowering.cpp)
+target_link_libraries(test_atan_lowering PRIVATE loom::engine)
+add_test(NAME test_atan_lowering COMMAND test_atan_lowering)
+set_tests_properties(test_atan_lowering PROPERTIES LABELS ci)
+
+# Device selection. Needs no fixture at all -- it asks the ggml backend registry what this BUILD has.
+add_executable(test_device_selection ci/test_device_selection.cpp)
+target_link_libraries(test_device_selection PRIVATE loom::engine)
+add_test(NAME test_device_selection COMMAND test_device_selection)
+set_tests_properties(test_device_selection PROPERTIES LABELS ci)
+
 add_executable(test_gallocr_reserve_reuse ci/test_gallocr_reserve_reuse.cpp)
 target_link_libraries(test_gallocr_reserve_reuse PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_reserve_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
@@ -322,6 +355,22 @@ target_link_libraries(test_e2e_conformer_ctc_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_conformer_ctc_mil_export COMMAND test_e2e_conformer_ctc_mil_export)
 set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_conformer_ctc_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- CPU vs GPU on the same real encoder (BACKLOG.md P4.7). Skips on a missing fixture AND on a build
+#     with no device backend compiled in, so it is green everywhere it cannot say anything. ---
+add_executable(test_e2e_device_parity gate/test_e2e_device_parity.cpp)
+target_link_libraries(test_e2e_device_parity PRIVATE loom::engine)
+add_test(NAME test_e2e_device_parity COMMAND test_e2e_device_parity)
+set_tests_properties(test_e2e_device_parity PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_device_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- The other half of device parity: a KV-cached decode loop, where the cache, the reused graph and
+#     the scheduler's split plan all have to hold together while n_past moves (BACKLOG.md P4.7). ---
+add_executable(test_e2e_device_parity_kv gate/test_e2e_device_parity_kv.cpp)
+target_link_libraries(test_e2e_device_parity_kv PRIVATE loom::engine)
+add_test(NAME test_e2e_device_parity_kv COMMAND test_e2e_device_parity_kv)
+set_tests_properties(test_e2e_device_parity_kv PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_device_parity_kv PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- The same MIL-exported GGUF reached the way every other family is reached: through the embedded
 #     Lua driver's `infer`. Its greedy CTC decode must agree token-for-token with loom::ctc_greedy_decode,

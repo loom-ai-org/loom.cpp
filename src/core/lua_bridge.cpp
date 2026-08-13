@@ -401,7 +401,7 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
 // `out_store` is null for the marshalling entry points and the module's own store for
 // `run_subgraph_and_retain` -- see GraphBuilder::build for what it does with it.
 int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GraphBuilder& builder,
-                      ggml_backend_t backend, const DynamicAxes& axes, int inputs_idx,
+                      const DynamicAxes& axes, int inputs_idx,
                       const StoreLookup& lookup, OutputStore* out_store,
                       const std::function<int(const GraphBuilder::BuildResult&)>& emit) {
     const GraphBuilder::BuildResult& r = builder.build(axes, out_store);
@@ -436,7 +436,10 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
         lua_pop(L, 1);
     }
 
-    ggml_backend_graph_compute(backend, r.graph);
+    // Through the BUILDER rather than through a backend handle: on a device build this graph is
+    // scheduler-allocated and split across two backends, and only the builder holds the scheduler that
+    // knows how to run it (BACKLOG.md P4.7 / graph_builder.h).
+    builder.compute();
     // After the compute, so a generation number only ever names a run whose values are really there.
     if (out_store != nullptr) out_store->bump_generation();
     return emit(r);
@@ -461,7 +464,7 @@ int LoomLuaBridge::l_run_subgraph(lua_State* L) {
         Module& mod = it->second;
 
         return compute_and_emit(L, "loom.run_subgraph", module_name, self->module_builder(mod),
-                                 mod.backend, axes, 3, store_lookup(self),
+                                 axes, 3, store_lookup(self),
                                  /*out_store=*/nullptr,
                                  [L](const GraphBuilder::BuildResult& r) {
         // Returns every declared output's DATA first (in the topology's own declared order), THEN
@@ -508,11 +511,11 @@ int LoomLuaBridge::l_run_subgraph_and_retain(lua_State* L) {
             return luaL_error(L, "loom.run_subgraph_and_retain: unregistered module '%s'", module_name);
         }
         Module& mod = it->second;
-        if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backend);
+        if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backends.primary);
         OutputStore* store = mod.outputs.get();
 
         return compute_and_emit(L, "loom.run_subgraph_and_retain", module_name, self->module_builder(mod),
-                                 mod.backend, axes, 3, store_lookup(self), store,
+                                 axes, 3, store_lookup(self), store,
                                  [L, store](const GraphBuilder::BuildResult&) {
             lua_pushnumber(L, static_cast<lua_Number>(store->generation()));
             return 1;
@@ -606,7 +609,7 @@ int LoomLuaBridge::l_run_recurrent(lua_State* L) {
                                      layer_input.size() * sizeof(float));
             ggml_backend_tensor_set(r.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
             ggml_backend_tensor_set(r.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
-            ggml_backend_graph_compute(mod.backend, r.graph);
+            builder.compute();
 
             if (r.outputs.size() < 2) {
                 return luaL_error(L, "loom.run_recurrent: module '%s' declares %d output(s); a cell "
@@ -970,7 +973,7 @@ std::function<OutputStore&(const std::string&)> LoomLuaBridge::store_lookup(Loom
     return [self](const std::string& module) -> OutputStore& { return retained_store(self, module); };
 }
 
-LoomLuaBridge::LoomLuaBridge(ggml_backend_t backend) : L_(luaL_newstate()), backend_(backend) {
+LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_(backends) {
     if (L_ == nullptr) throw Error("LoomLuaBridge: luaL_newstate() failed (out of memory)");
     luaL_openlibs(L_);
 
@@ -1007,7 +1010,26 @@ LoomLuaBridge::~LoomLuaBridge() {
 
 void LoomLuaBridge::register_module(const std::string& name, GgufModel& model, GraphTopology topo,
                                      KvCache* kv_cache, ConvStateCache* conv_state) {
-    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backend_, nullptr, nullptr};
+    modules_[name] = Module{&model, std::move(topo), kv_cache, conv_state, backends_, nullptr, nullptr};
+}
+
+std::vector<LoomLuaBridge::ModuleDeviceReport> LoomLuaBridge::device_report() const {
+    std::vector<ModuleDeviceReport> out;
+    if (!backends_.hybrid()) return out;
+    const std::string device_name = ggml_backend_name(backends_.primary);
+    for (const auto& [name, mod] : modules_) {
+        if (!mod.builder) continue;
+        ModuleDeviceReport report;
+        report.module = name;
+        report.splits = mod.builder->splits();
+        for (const std::string& node_backend : mod.builder->node_backends()) {
+            (node_backend == device_name ? report.device_nodes : report.fallback_nodes)++;
+        }
+        if (report.device_nodes + report.fallback_nodes > 0) out.push_back(std::move(report));
+    }
+    std::sort(out.begin(), out.end(),
+               [](const ModuleDeviceReport& a, const ModuleDeviceReport& b) { return a.module < b.module; });
+    return out;
 }
 
 GraphBuilder& LoomLuaBridge::module_builder(Module& mod) {
@@ -1016,7 +1038,7 @@ GraphBuilder& LoomLuaBridge::module_builder(Module& mod) {
     // Module wholesale, which destroys the old builder along with the topology it pointed at -- the two
     // cannot outlive each other by construction.
     if (!mod.builder) {
-        mod.builder = std::make_unique<GraphBuilder>(mod.topo, *mod.model, mod.backend, mod.kv_cache,
+        mod.builder = std::make_unique<GraphBuilder>(mod.topo, *mod.model, mod.backends, mod.kv_cache,
                                                       /*compute_meta_bytes=*/32 * 1024 * 1024,
                                                       mod.conv_state);
     }

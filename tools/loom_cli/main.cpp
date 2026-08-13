@@ -31,8 +31,24 @@ void print_usage(const char* argv0) {
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--timestamps] "
-                  "[--no-condition-on-previous]\n",
+                  "[--no-condition-on-previous]\n"
+                  "\n"
+                  "  --device <auto|cpu|gpu|NAME>  where to run (default: auto, or $LOOM_DEVICE)\n"
+                  "  --list-devices                print the devices this build can reach, and exit\n",
                   argv0, argv0);
+}
+
+// What ran where, after a device run. The number that matters is the split count: each split is a point
+// at which execution crossed between the device and the CPU fallback, and every crossing is a copy in
+// each direction. A module reported as 1 split ran entirely on one backend.
+void print_device_report(const loom::LoomLuaBridge& bridge) {
+    const auto report = bridge.device_report();
+    if (report.empty()) return;
+    std::printf("device report (module: splits, device nodes / cpu-fallback nodes)\n");
+    for (const auto& m : report) {
+        std::printf("  %-28s %3d   %6zu / %zu\n", m.module.c_str(), m.splits, m.device_nodes,
+                     m.fallback_nodes);
+    }
 }
 
 std::vector<int32_t> parse_token_ids(const std::string& text) {
@@ -142,7 +158,7 @@ std::vector<int32_t> run_driver(loom::LoomLuaBridge& bridge, const std::vector<d
     return ids;
 }
 
-void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& wav_path,
+void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name, bool timestamps,
              bool condition_on_previous) {
     // Model-agnostic: register whatever topologies the file declares, call the driver it ships, and
@@ -227,7 +243,7 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
 
     const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
 
-    loom::LoomLuaBridge bridge(backend);
+    loom::LoomLuaBridge bridge(backends);
     // A topology carrying ATTENTION nodes needs a KV cache to write into, sized from the model's own
     // declared geometry -- the same registration the generation path above already does, and missing
     // here until an ASR family turned up with a cached phase (Whisper's decoder, BACKLOG.md P4.1).
@@ -236,7 +252,7 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
     for (const std::string& name : model.topology_names()) {
         loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json(name));
         if (topo.uses_kv_cache() && kv_cache == nullptr) {
-            kv_cache = loom::make_kv_cache(model, backend);
+            kv_cache = loom::make_kv_cache(model, backends);
         }
         loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
         bridge.register_module(name, model, std::move(topo), cache_for_module);
@@ -260,6 +276,7 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
         token_ids.reserve(ids_d.size());
         for (double id : ids_d) token_ids.push_back(static_cast<int32_t>(id));
         std::printf("transcript: %s\n", detokenize(token_ids).c_str());
+        print_device_report(bridge);
         return;
     }
 
@@ -370,11 +387,13 @@ void run_asr(loom::GgufModel& model, ggml_backend_t backend, const std::string& 
             std::printf("[%s --> %s] %s\n", format_time(s.start).c_str(), format_time(s.end).c_str(),
                          s.text.c_str());
         }
+        print_device_report(bridge);
         return;
     }
     std::string transcript;
     for (const Segment& s : segments) transcript += s.text;
     std::printf("transcript: %s\n", transcript.c_str());
+    print_device_report(bridge);
 }
 
 } // namespace
@@ -390,6 +409,8 @@ int main(int argc, char** argv) {
     bool has_prompt = false;
     bool has_wav = false;
     uint32_t n_predict = 16;
+    std::string device_spec;
+    bool list_devices = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -417,10 +438,27 @@ int main(int argc, char** argv) {
             condition_on_previous = false;
         } else if (arg == "--n-predict" && i + 1 < argc) {
             n_predict = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--device" && i + 1 < argc) {
+            device_spec = argv[++i];
+        } else if (arg == "--list-devices") {
+            list_devices = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
         }
+    }
+
+    // Before the --model check, so it answers on its own -- "what can this build reach" is a question
+    // about the BUILD, and having to name a GGUF to ask it would be absurd.
+    if (list_devices) {
+        for (const loom::DeviceInfo& d : loom::available_devices()) {
+            std::printf("%-12s %s", d.name.c_str(), d.description.c_str());
+            if (d.memory_total > 0) {
+                std::printf("  [%zu / %zu MiB free]", d.memory_free >> 20, d.memory_total >> 20);
+            }
+            std::printf("%s\n", d.is_cpu ? "  (cpu)" : "");
+        }
+        return 0;
     }
 
     if (model_path.empty()) {
@@ -428,14 +466,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
-    if (!backend) {
-        std::fprintf(stderr, "error: failed to initialize CPU backend\n");
+    std::unique_ptr<loom::Device> device;
+    try {
+        device = std::make_unique<loom::Device>(loom::Device::open(device_spec));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
+    }
+    const loom::Backends backends = device->backends();
+    if (!device->is_cpu()) {
+        std::printf("device: %s (%s)\n", device->name().c_str(), device->description().c_str());
     }
 
     try {
-        auto model = loom::GgufModel::load(model_path, backend.get());
+        auto model = loom::GgufModel::load(model_path, backends);
         std::printf("loaded '%s'\n", model_path.c_str());
         std::printf("  architecture: %s\n", model->architecture().c_str());
 
@@ -519,7 +563,7 @@ int main(int argc, char** argv) {
 
             if (is_multi_topology) {
                 // Initialize the Lua JIT dynamic driver bridge
-                loom::LoomLuaBridge bridge(backend.get());
+                loom::LoomLuaBridge bridge(backends);
                 
                 // Dynamically discover and register all sub-graph modules present in GGUF. A topology
                 // carrying ATTENTION nodes needs a KV cache to write into (KV-CACHE.md stage 2), sized
@@ -531,14 +575,14 @@ int main(int argc, char** argv) {
                 for (const std::string& mod_name : sub_modules) {
                     loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(mod_name));
                     if (topo.uses_kv_cache() && kv_cache == nullptr) {
-                        kv_cache = loom::make_kv_cache(*model, backend.get());
+                        kv_cache = loom::make_kv_cache(*model, backends);
                     }
                     loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
                     // A hybrid's ShortConv blocks carry their own history, which the KV cache does not
                     // hold -- allocated from the file's own loom.n_conv_* keys, same as above
                     // (BACKLOG.md P4.0.10).
                     if (topo.uses_conv_state() && conv_state == nullptr) {
-                        conv_state = loom::make_conv_state_cache(*model, backend.get());
+                        conv_state = loom::make_conv_state_cache(*model, backends);
                     }
                     loom::ConvStateCache* conv_for_module = topo.uses_conv_state() ? conv_state.get() : nullptr;
                     bridge.register_module(mod_name, *model, std::move(topo), cache_for_module, conv_for_module);
@@ -587,13 +631,14 @@ int main(int argc, char** argv) {
                     for (int32_t tok : generated) std::printf(" %d", tok);
                     std::printf("\n");
                 }
+                print_device_report(bridge);
             } else {
                 loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
                 loom::GenerationConfig cfg;
                 cfg.max_new_tokens = n_predict;
                 cfg.n_ctx_max = static_cast<uint32_t>(prompt_tokens.size()) + n_predict;
 
-                loom::Generator generator(*model, topo, cfg, backend.get());
+                loom::Generator generator(*model, topo, cfg, backends);
                 const std::vector<int32_t> generated = generator.generate(prompt_tokens);
 
                 if (bpe_vocab) {
@@ -608,7 +653,7 @@ int main(int argc, char** argv) {
         }
 
         if (has_wav) {
-            run_asr(*model, backend.get(), wav_path, language_name, task_name, timestamps,
+            run_asr(*model, backends, wav_path, language_name, task_name, timestamps,
                     condition_on_previous);
         }
     } catch (const loom::Error& e) {

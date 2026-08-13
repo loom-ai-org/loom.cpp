@@ -78,7 +78,8 @@ void KvCache::reset() {
     }
 }
 
-std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, ggml_backend_t backend) {
+std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, Backends backends) {
+    ggml_backend_t backend = backends.primary;
     // hparam_u32 already names the missing key, but not why anything wanted it. A host reaching this
     // has a topology that reports uses_kv_cache() and a file that does not say how big to make one,
     // and the fix is on the CONVERTER side -- so the message has to carry that, not just the key.
