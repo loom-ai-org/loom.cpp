@@ -158,17 +158,21 @@ Vega 3 iGPU against 4 CPU threads, one forward each:
 
 | model | splits | GPU vs CPU |
 |---|---|---|
-| conformer-ctc-small | 5 | **1.91×** |
+| conformer-ctc-small | 1 | **2.56×** |
 | lfm2-350m | 1 | **2.22×** |
-| qwen3-0.6b | 1 | **2.74×** |
+| qwen3-0.6b | 1 | **2.82×** |
+| matcha `encoder_mu` | 1 | **3.65×** |
+| kokoro `decoder_vocoder` | 7 | **4.45×** |
 
 What decides that number is how many times the scheduler has to cut the graph, and what forces a cut is
-`ggml_map_custom` — a host callback, so there is nothing for a device to dispatch. Qwen3 and LFM2 used
-to cost **453** and **181** splits, which left them at 0.95× and 1.76×; all of it was an RMS norm the
-exporter emitted as `POW`+`RSQRT` because it never recognised the pattern, while the engine had a native
-`RMS_NORM` primitive it had never once been asked for. Fusing it (`BACKLOG.md` P4.7a) took both models
-to a single split — the whole graph on the device, nothing falling back — and left the CPU path
-unchanged.
+`ggml_map_custom` — a host callback, so there is nothing for a device to dispatch. Those splits used to
+be 453, 181, 61, 107 and 5, which left Qwen3 at 0.95× and Matcha at 0.84× — *slower than the CPU*. None
+of it was the engine: it was three patterns the exporter emitted as host callbacks because it had never
+been taught to recognise them — an RMS norm (`POW`+`RSQRT`), a squaring (`POW`), and a hand-rolled
+LayerNorm. **Across all thirteen exported models there are now exactly two `ggml_map_custom` nodes
+left** — one `ATAN` each in Kokoro's and StyleTTS2's STFT phase, which has no ggml counterpart.
+`BACKLOG.md` P4.7a and P4.7b have the numbers, including a CPU measurement that came out wrong twice
+before anything interleaved the runs.
 
 Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
 one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured
