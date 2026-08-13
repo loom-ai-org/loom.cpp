@@ -9,6 +9,38 @@
 #include <vector>
 
 namespace loom {
+
+// The fallback half of PAD_1D_REFLECT: reflect padding built from views and concatenations, for a
+// backend with no `ggml_pad_reflect_1d` of its own.
+//
+// Exactly equivalent, and structurally so rather than approximately: torch's "reflect" convention
+// excludes the edge element, so the left block is elements `lp0..1` and the right block `T-2` down to
+// `T-1-rp0`, each a one-element slice of the original. No arithmetic happens in a slice, so there is
+// nothing to round -- the composition reproduces the primitive bit for bit, which is what
+// tests/ci/test_pad_reflect_lowering.cpp asserts.
+ggml_tensor* compose_pad_reflect_1d(ggml_context* ctx, ggml_tensor* a, int lp0, int rp0) {
+    const int64_t t = a->ne[0];
+    auto element = [&](int64_t k) {
+        return ggml_view_4d(ctx, a, 1, a->ne[1], a->ne[2], a->ne[3], a->nb[1], a->nb[2], a->nb[3],
+                             static_cast<size_t>(k) * a->nb[0]);
+    };
+    // Built as its own small block first and joined to the tensor once, rather than concatenated onto it
+    // one element at a time: the blocks are `lp0`/`rp0` elements wide, so those joins are trivial, and
+    // this way the only full-size copies are the two the primitive itself would have made.
+    ggml_tensor* out = a;
+    if (lp0 > 0) {
+        ggml_tensor* left = element(lp0);
+        for (int64_t k = lp0 - 1; k >= 1; --k) left = ggml_concat(ctx, left, element(k), 0);
+        out = ggml_concat(ctx, left, out, 0);
+    }
+    if (rp0 > 0) {
+        ggml_tensor* right = element(t - 2);
+        for (int j = 1; j < rp0; ++j) right = ggml_concat(ctx, right, element(t - 2 - j), 0);
+        out = ggml_concat(ctx, out, right, 0);
+    }
+    return out;
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -482,6 +514,14 @@ Outputs op_pad_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {ggml_pad_ext(pc.ctx, a, lp0, rp0, 0, 0, 0, 0, 0, 0)};
 }
 
+// Above this total width the native op is kept even when the backend cannot run it. The composition
+// below emits `2 * (lp0 + rp0)` nodes -- `ggml_concat` is two-input, so each padded element costs a view
+// and a join -- and past some width, trading one CPU node for hundreds of device nodes is the worse
+// deal. 32 covers every reflect pad any exported model has asked for except one, and that exception is
+// the argument for the limit rather than against it: Whisper's STFT centre-framing pads 200 either side,
+// which would be 800 nodes in a 503-node graph (BACKLOG.md P4.7c/P4.7e).
+constexpr int kReflectPadComposeLimit = 32;
+
 Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // Reflect-pads ne[0] only (lp0 left, rp0 right) via ggml_pad_reflect_1d: [a,b,c,d] -> [b,a,b,c,d,c]
     // (excludes the edge element itself, matching numpy/torch's "reflect" -- not "symmetric" -- padding
@@ -493,7 +533,17 @@ Outputs op_pad_1d_reflect(PrimitiveContext& pc, const Inputs& in, const Json& at
     const int lp0 = static_cast<int>(resolve_attr_int(attrs, "lp0", pc.symbols));
     const int rp0 = static_cast<int>(resolve_attr_int(attrs, "rp0", pc.symbols));
     ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
-    return {ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
+    ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
+    // Ask, then choose (primitive_registry.h's `backend_can_run`). Of the backends ggml ships, only
+    // Vulkan, OpenCL, OpenVINO and Hexagon lack this op -- CUDA, Metal, SYCL and CANN all have it -- so
+    // on most of them this is the one node it looks like, and the composition never gets built.
+    if (backend_can_run(pc, native) || lp0 + rp0 > kReflectPadComposeLimit) {
+        return {native};
+    }
+    // `native` is left behind in the context, unreferenced. Only tensors reachable from a declared
+    // output reach the cgraph (ggml_build_forward_expand walks backwards from them), so an abandoned
+    // node costs one struct in the no_alloc metadata arena and nothing at run time.
+    return {compose_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
 }
 
 Outputs op_silu(PrimitiveContext& pc, const Inputs& in, const Json&) {

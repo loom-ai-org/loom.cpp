@@ -339,7 +339,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     }
 
     std::vector<ggml_tensor*> side_effect_roots;
-    PrimitiveContext pc{ctx.get(), env, kv_cache_, conv_state_, kv_cells_, &side_effect_roots};
+    PrimitiveContext pc{ctx.get(), env, kv_cache_, conv_state_, kv_cells_, &side_effect_roots, backends_};
     for (const TopologyItem& item : topo_.items) {
         if (!item.is_repeat) {
             build_node(item.node, pc, symtab);
