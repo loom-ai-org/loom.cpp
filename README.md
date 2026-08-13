@@ -175,13 +175,18 @@ left** — one `ATAN` each in Kokoro's and StyleTTS2's STFT phase, which has no 
 anything interleaved the runs.
 
 **Counting host callbacks turned out to be the wrong lens**, which is worth knowing before optimizing
-anything here: a graph splits just as readily on a *real* ggml op whose backend kernel is missing.
-Kokoro's last seven splits were four reflect pads (`ggml-vulkan` implements no `PAD_REFLECT_1D`) and two
-`ATAN`, not two `ATAN`. Reflect padding is exactly composable from `VIEW`+`CONCAT`, so the exporter now
-does that below a width limit — bit-identical output, four fewer splits. `POOL_1D` went the same way (P4.7d) — a 1-D pool is a 2-D pool with a one-tall window, and
-ggml-vulkan implements the latter — though not before that comparison turned up one combination where
-the two spellings genuinely differ. What is left is an `ATAN` and a 400-wide reflect pad, both of which
-want a shader upstream rather than anything here.
+anything here: a graph splits just as readily on a *real* ggml op whose backend kernel is missing, and
+the gaps do not line up between backends — CUDA has `PAD_REFLECT_1D` but no `POOL_1D`, Vulkan has
+`POOL_2D` but neither, and the NPU backends have none of the three.
+
+So **a primitive asks the backend what it can run** (`BACKLOG.md` P4.7e) and emits either the native op
+or an exactly-equivalent composition. That decision belongs in the engine rather than the export: one
+GGUF may be run by any backend, so deciding it at export time compiles every artifact for the least
+capable one. The same Kokoro file builds 1692 ggml nodes on a CPU and 1732 on Vulkan, and its topology
+says `PAD_1D_REFLECT` either way.
+
+What is left is one `ATAN`, which has no exact composition anywhere — ggml has no inverse trig in any
+backend — and a 400-wide reflect pad that is cheaper to fall back on than to compose.
 
 Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
 one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured
