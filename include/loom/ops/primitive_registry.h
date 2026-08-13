@@ -106,6 +106,13 @@ void read_tensor_prefix(const ggml_tensor* t, void* dst, size_t nbytes);
 // anything better to do with an unknowable one.
 float scalar_value_or(const ggml_tensor* t, float fallback);
 
+// Whether POOL_1D's `(op, p0)` combination can be lowered to a one-tall `ggml_pool_2d` -- which
+// ggml-vulkan implements where it does not implement `ggml_pool_1d`. False for an AVERAGE pool with
+// padding, the one combination where the two spellings genuinely disagree (they divide by different
+// counts; see op_pool_1d in primitives_conv.cpp). Exposed so a test can hold the predicate and the
+// behaviour against each other.
+bool pool_1d_lowers_to_pool_2d(ggml_op_pool op, int p0);
+
 // Reads a numeric attribute that may be given either as a literal JSON number or as a SymbolEnv
 // expression string (e.g. attrs["eps"] may be 1e-5 or "$rms_norm_eps"). Throws loom::SchemaError if
 // `key` is absent or neither a number nor a string.

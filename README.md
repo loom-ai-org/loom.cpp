@@ -178,8 +178,10 @@ anything interleaved the runs.
 anything here: a graph splits just as readily on a *real* ggml op whose backend kernel is missing.
 Kokoro's last seven splits were four reflect pads (`ggml-vulkan` implements no `PAD_REFLECT_1D`) and two
 `ATAN`, not two `ATAN`. Reflect padding is exactly composable from `VIEW`+`CONCAT`, so the exporter now
-does that below a width limit — bit-identical output, four fewer splits. What is left is `POOL_1D` and a
-400-wide pad in Whisper, both of which want a shader upstream rather than a composition here.
+does that below a width limit — bit-identical output, four fewer splits. `POOL_1D` went the same way (P4.7d) — a 1-D pool is a 2-D pool with a one-tall window, and
+ggml-vulkan implements the latter — though not before that comparison turned up one combination where
+the two spellings genuinely differ. What is left is an `ATAN` and a 400-wide reflect pad, both of which
+want a shader upstream rather than anything here.
 
 Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
 one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured

@@ -131,6 +131,12 @@ add_test(NAME test_scheduled_graph COMMAND test_scheduled_graph)
 set_tests_properties(test_scheduled_graph PROPERTIES LABELS ci)
 set_tests_properties(test_scheduled_graph PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# POOL_1D's lowering to a one-tall POOL_2D, and the one combination it must refuse (BACKLOG.md P4.7d).
+add_executable(test_pool_1d_lowering ci/test_pool_1d_lowering.cpp)
+target_link_libraries(test_pool_1d_lowering PRIVATE loom::engine)
+add_test(NAME test_pool_1d_lowering COMMAND test_pool_1d_lowering)
+set_tests_properties(test_pool_1d_lowering PROPERTIES LABELS ci)
+
 # Device selection. Needs no fixture at all -- it asks the ggml backend registry what this BUILD has.
 add_executable(test_device_selection ci/test_device_selection.cpp)
 target_link_libraries(test_device_selection PRIVATE loom::engine)

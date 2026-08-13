@@ -7,6 +7,15 @@
 #include <cmath>
 
 namespace loom {
+
+// See op_pool_1d below for what this decides and the measurement behind it. Out of the anonymous
+// namespace and declared in primitive_registry.h on purpose: tests/ci/test_pool_1d_lowering.cpp asserts
+// that this predicate agrees with the two spellings' actual bit-level behaviour, which it cannot do if
+// the predicate is private -- and a test that could not see it would still pass with the guard deleted.
+bool pool_1d_lowers_to_pool_2d(ggml_op_pool op, int p0) {
+    return op == GGML_OP_POOL_MAX || p0 == 0;
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -244,12 +253,44 @@ ggml_op_pool parse_pool_op(const Json& attrs) {
     throw SchemaError("POOL: unsupported pool 'op' \"" + op + "\" (expected \"max\" or \"avg\")");
 }
 
+// Whether a 1-D pool can be spelled as a 2-D pool with a one-tall window, which is the whole of
+// op_pool_1d's lowering decision below (BACKLOG.md P4.7d).
+//
+// The SHAPES always agree: `ggml_pool_2d` sizes its output
+// `[calc(ne0,k0,s0,p0), calc(ne1,k1,s1,p1), ne2, ne3]` against `ggml_pool_1d`'s
+// `[calc(ne0,k0,s0,p0), ne1, ne2, ne3]`, and `calc(ne1, 1, 1, 0) == ne1`.
+//
+// The VALUES do not, for exactly one combination, and it is the kind of difference that would never
+// have announced itself: **an AVERAGE pool with padding divides by different numbers.** `pool_1d`
+// divides by `count`, the number of in-bounds elements it actually visited; `pool_2d` divides by
+// `ka = k0*k1`, the full kernel, treating the padded cells as zeros it still counts. So the two agree
+// on every interior window and differ on every window that overhangs an edge. (Measured, not reasoned:
+// tests/ci/test_pool_1d_lowering.cpp compares the two spellings across a matrix of parameters, and the
+// padded-average row is the one that separates them.)
+//
+// A MAX pool is unaffected whatever the padding, because a padded cell contributes nothing to a maximum
+// either way; and with `p0 == 0` no window overhangs anything, so `count == k0 == ka` and an average
+// agrees too.
+
+
+// Lowered to a 2D pool with a one-tall window wherever that is provably the same operation, because
+// **`ggml-vulkan` implements `GGML_OP_POOL_2D` and not `GGML_OP_POOL_1D`**. The 1D spelling is a node
+// the scheduler has to hand back to the CPU, splitting the graph around it for a reason no caller could
+// see or fix from the export side -- Whisper's encoder is one node of it and paid a split (P4.7d).
+//
+// This lives here rather than in the exporter because nothing per-MODEL is involved: it is one
+// primitive's lowering detail, and a topology that says POOL_1D should keep meaning what it says. Where
+// the two are not equivalent, the 1D op stays -- a correct CPU fallback beats a fast wrong answer.
 Outputs op_pool_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("POOL_1D", in, 1);
     const ggml_op_pool op = parse_pool_op(attrs);
     const int k0 = static_cast<int>(resolve_attr_int(attrs, "k0", pc.symbols));
     const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
+    if (pool_1d_lowers_to_pool_2d(op, p0)) {
+        return {ggml_pool_2d(pc.ctx, in[0], op, k0, /*k1=*/1, s0, /*s1=*/1,
+                              static_cast<float>(p0), /*p1=*/0.0f)};
+    }
     return {ggml_pool_1d(pc.ctx, in[0], op, k0, s0, p0)};
 }
 
