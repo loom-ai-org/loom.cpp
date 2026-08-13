@@ -4049,6 +4049,11 @@ a matcher that treated `sub(x, mean)` as optional would emit `RMS_NORM` for a la
 StyleTTS2's STFT phase computation, which has no ggml counterpart and no composition that avoids the
 transcendental. Everything else the engine ever pushed onto a host callback is now a real ggml op.
 
+**That count was the wrong lens, which P4.7c below discovered.** A graph also splits on real ggml ops
+whose BACKEND kernel is missing — `PAD_REFLECT_1D` and `POOL_1D` are both unimplemented in ggml-vulkan —
+and no amount of counting `ggml_map_custom` reveals them. Kokoro's remaining seven splits were four
+reflect pads and two `ATAN`, not two `ATAN`.
+
 ##### What it did (AMD Vega 3 iGPU vs 4 CPU threads, best of three)
 
 | module | splits before | splits now | GPU vs CPU |
@@ -4092,6 +4097,73 @@ avoids the copies entirely — is the slowest. The lesson is not about layer nor
 * 542 exporter CI tests, 15 of them new across the two passes, and most of the new ones negative: an
   exponent that is not 2, a non-constant exponent, two means over different axes, a missing centring
   (that graph is an RMS norm and belongs to the other pass), a shared intermediate.
+
+#### P4.7c — reflect padding, composed rather than fallen back on — DONE (2026-08-13)
+
+P4.7b left two `ggml_map_custom` nodes in the zoo and I called that the end of the fallbacks. It was
+not. **`PAD_1D_REFLECT` is not a custom op — it is a real ggml op that `ggml-vulkan` does not
+implement**, so every reflect pad was a node the scheduler had to run on the CPU, and nothing about the
+custom-op count said so. Looking only at `ggml_map_custom` was the wrong lens.
+
+##### How much it was worth, measured before deciding
+
+Substituting device-supported stand-ins of identical shape into Kokoro's `decoder_vocoder`, so each
+fallback's cost could be priced separately:
+
+| | splits | CPU nodes |
+|---|---|---|
+| as exported | 7 | 4 |
+| if the `ATAN` were device-native | 5 | 3 |
+| if the reflect pads were device-native | **3** | 1 |
+| if both were | 1 | 0 |
+
+The two reflect pads cost **four** of the six removable splits — twice what the remaining `ATAN` costs.
+And unlike the `ATAN`, this one has an **exact** fix, because reflect padding is not a transcendental:
+it is a slice and a concatenation.
+
+##### The composition
+
+`topology_ops.py`'s `pad` rule now emits, for `mode="reflect"`, one one-element `VIEW` per padded
+element plus the `CONCAT`s that join them — the left block being elements `lp0..1` and the right block
+`T-2` down to `T-1-rp0`, which is exactly torch's "reflect" convention (edge element excluded:
+`[a,b,c,d]` with (1,1) → `[b,a,b,c,d,c]`). `VIEW` inherits the parent's strides, so a `[1, *ne_rest]`
+view at byte offset `k*4` selects element `k` along ne[0] for every row and channel — correct for a
+rank-2 `[T, C]` tensor and not only for the effectively-1-D waveform that motivated it.
+
+**Bit-identical, and checked as such rather than argued.** Same module, two GGUFs, identical inputs:
+**0 of 38400 outputs differ in any bit**, on the CPU and on the device, for Kokoro and StyleTTS2 alike.
+No arithmetic happens in a slice, so there is nothing to round.
+
+| module | splits | CPU nodes | GPU |
+|---|---|---|---|
+| kokoro `decoder_vocoder` | 7 → **3** | 4 → **1** | 1507 → **1274 ms** |
+| styletts2 `decoder_vocoder` | 7 → **3** | 4 → **1** | 1452 → **1309 ms** |
+
+The CPU path is unaffected (6709 → 6428 ms and 6578 → 6170 ms, i.e. no worse, and within this machine's
+noise band — see P4.7b for how wide that is).
+
+##### The width guard, and Whisper
+
+The composition costs `2 * (lp0 + rp0)` nodes, because `ggml_concat` is two-input. Above
+`_REFLECT_PAD_COMPOSE_LIMIT = 32` the primitive is kept instead. That is not hypothetical tidiness:
+**Whisper's STFT centre-framing pads 200 either side**, and composing it would emit **800 nodes** into a
+503-node topology. It keeps `PAD_1D_REFLECT`, exactly as before, and re-exports bit-identical.
+
+Whisper also shows why this item does not claim to have finished the job. Its encoder still reports 4
+splits, and removing the reflect pad would not change that: it also uses **`POOL_1D`**, which
+`ggml-vulkan` does not implement either. Which is the general shape of what is left — not custom ops,
+but real ggml ops with missing backend kernels, and the answer for those is upstream (a shader) rather
+than here (a composition). The tool that priced this item (substitute a stand-in, re-count splits) is
+the one to reach for before writing any of them.
+
+##### What remains, per module
+
+* kokoro / styletts2 `decoder_vocoder`: 3 splits, 1 CPU node — the `ATAN`. An exact mapping does not
+  exist (ggml has no inverse trig at all, and `atan` has no closed form over the real ops available); a
+  minimax rational on `[-1,1]` with `atan(x) = π/2 - atan(1/x)` range reduction would be ~15-20 native
+  nodes at ~1e-7 relative error. That would be **the first approximation of a transcendental this
+  project has accepted**, and it is worth 2 splits, so it is priced here and not taken.
+* whisper `encoder`: 4 splits — `POOL_1D` and a 400-wide reflect pad, both upstream questions.
 
 #### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
 
