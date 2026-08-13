@@ -4,11 +4,90 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <vector>
 
 namespace loom {
+
+// ---------------------------------------------------------------------------------------------------
+// atan WITHOUT A HOST CALLBACK (BACKLOG.md P4.7f)
+// ---------------------------------------------------------------------------------------------------
+// ggml has no inverse trigonometry in any backend -- not in the unary enum, not in CUDA, Metal, Vulkan
+// or any other -- so `ATAN` has always been a `ggml_map_custom` host callback, and on a device that is a
+// node the scheduler must run on the CPU. It is the last one left in the model zoo (Kokoro's and
+// StyleTTS2's STFT phase), and unlike the reflect pad or the 1-D pool there is no exact composition to
+// reach for: every closed form for `atan` over the real ops available routes through `asin`, `acos` or a
+// complex logarithm, none of which exist either.
+//
+// So this is an APPROXIMATION, which is a first for this project, and it is confined accordingly:
+// `op_atan` keeps libm's `std::atan` wherever `backend_can_run` says the backend can dispatch the
+// callback, so **a CPU-only build -- the default -- is bit-for-bit what it always was**. Only a device
+// that would otherwise have split the graph sees the polynomial.
+//
+// The method is the standard one, which is what a GPU's own `atanf` does inline rather than anything
+// exotic like CORDIC -- three stages, no branches:
+//
+//   1. **Range reduction.** `atan(-x) = -atan(x)` strips the sign, and `atan(x) = pi/2 - atan(1/x)`
+//      folds everything above 1 back below it, so the polynomial only ever sees `t` in `[0, 1]`.
+//      Written here as `t = min(a,1) / max(a,1)`, which needs no reciprocal instruction: two clamps and
+//      a divide, and an infinity reduces to `1/FLT_MAX` rather than to a NaN.
+//   2. **A minimax polynomial in `z = t*t`**, evaluated by Horner so every step is a multiply-add.
+//      Not a Taylor series: Taylor converges far too slowly at the end of the interval to be affordable
+//      at this width.
+//   3. **Branchless reconstruction.** `step(a-1)` is a 0/1 mask, and `r + m*(pi/2 - 2r)` is `r` when the
+//      mask is 0 and `pi/2 - r` when it is 1 -- the arithmetic form of a select, because a device wants
+//      every lane executing the same instructions.
+//
+// **Degree 8 in `z`, and that is a measured choice rather than a tasteful one.** Fitted on a Chebyshev
+// grid and evaluated through this exact fp32 op sequence against `atan` in double precision, the error
+// stops improving there: degree 7 gives 3.55 ULP, degree 8 gives 1.84, and degrees 9 through 14 all sit
+// between 1.86 and 2.56 -- past 8 the limit is fp32 rounding in the Horner evaluation itself, not the
+// polynomial, so further terms buy two graph nodes each and nothing else.
+//
+// The whole composition is 30 nodes against the one it replaces. That is the trade: on Kokoro's
+// `decoder_vocoder` it removes the last two scheduler splits and the round trips they cost.
+constexpr float kAtanPoly[] = {
+    +9.9999998425e-01f, -3.3333066809e-01f, +1.9992483932e-01f, -1.4202572489e-01f,
+    +1.0636759878e-01f, -7.4954548398e-02f, +4.2587692157e-02f, -1.6005069470e-02f,
+    +2.8340712491e-03f,
+};
+
+ggml_tensor* compose_atan(ggml_context* ctx, ggml_tensor* x) {
+    constexpr float kHalfPi = 1.57079632679489661923f;
+
+    ggml_tensor* a = ggml_abs(ctx, x);
+
+    // t = min(a,1) / max(a,1): `a` when a <= 1, `1/a` when it is not, and no reciprocal instruction
+    // needed. Both `ggml_dup`s are load-bearing and must not be tidied away -- `ggml_clamp` returns a
+    // VIEW of its argument and writes through it (ggml.c builds it as `ggml_view_tensor(ctx, a)` with
+    // op=CLAMP), so clamping `a` directly would destroy the `a` that the mask below still reads.
+    //
+    // The obvious one-clamp saving -- `t = a / max(a,1)^2`, using `min(a,1)*max(a,1) == a` -- was tried
+    // and is worse twice over: `max(a,1)^2` OVERFLOWS to infinity for any `a` past ~1.8e19 (and `clamp`
+    // caps at FLT_MAX rather than infinity, so `atan(inf)` came out `inf/inf` = NaN), and squaring costs
+    // accuracy in the folded branch besides -- 2.30 ULP against this form's 1.86.
+    ggml_tensor* lo = ggml_clamp(ctx, ggml_dup(ctx, a), 0.0f, 1.0f);
+    ggml_tensor* hi = ggml_clamp(ctx, ggml_dup(ctx, a), 1.0f, FLT_MAX);
+    ggml_tensor* t = ggml_div(ctx, lo, hi);
+    ggml_tensor* z = ggml_sqr(ctx, t);
+
+    // Horner from the top. The first step folds the two highest coefficients into one `ggml_scale_bias`
+    // (z*c[n] + c[n-1]), which saves building a constant tensor just to start the recurrence.
+    constexpr int kN = static_cast<int>(sizeof(kAtanPoly) / sizeof(kAtanPoly[0]));
+    ggml_tensor* p = ggml_scale_bias(ctx, z, kAtanPoly[kN - 1], kAtanPoly[kN - 2]);
+    for (int i = kN - 3; i >= 0; --i) {
+        p = ggml_scale_bias(ctx, ggml_mul(ctx, p, z), 1.0f, kAtanPoly[i]);
+    }
+    ggml_tensor* r = ggml_mul(ctx, t, p);   // atan(t)
+
+    // r + m*(pi/2 - 2r): r where |x| <= 1, pi/2 - r above it.
+    ggml_tensor* m = ggml_step(ctx, ggml_scale_bias(ctx, a, 1.0f, -1.0f));
+    ggml_tensor* folded = ggml_add(ctx, r, ggml_mul(ctx, m, ggml_scale_bias(ctx, r, -2.0f, kHalfPi)));
+    // sgn(0) is 0 and atan(0) is 0, so the zero case needs no special handling.
+    return ggml_mul(ctx, folded, ggml_sgn(ctx, x));
+}
 
 // The fallback half of PAD_1D_REFLECT: reflect padding built from views and concatenations, for a
 // backend with no `ggml_pad_reflect_1d` of its own.
@@ -389,7 +468,13 @@ void atan_custom_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, vo
 
 Outputs op_atan(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("ATAN", in, 1);
-    return {ggml_map_custom1(pc.ctx, ensure_packed(pc.ctx, in[0]), atan_custom_op, GGML_N_TASKS_MAX, nullptr)};
+    ggml_tensor* x = ensure_packed(pc.ctx, in[0]);
+    ggml_tensor* native = ggml_map_custom1(pc.ctx, x, atan_custom_op, GGML_N_TASKS_MAX, nullptr);
+    // The one place this engine accepts an APPROXIMATION rather than an exact composition, and the
+    // asymmetry is deliberate: a CPU keeps libm's correctly-rounded `std::atan`, and only a backend that
+    // cannot dispatch a C function pointer at all gets the polynomial. See compose_atan.
+    if (backend_can_run(pc, native)) return {native};
+    return {compose_atan(pc.ctx, x)};
 }
 
 Outputs op_atan2(PrimitiveContext& pc, const Inputs& in, const Json&) {

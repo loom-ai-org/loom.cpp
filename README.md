@@ -107,12 +107,13 @@ costs several minutes on the first configure of a machine that needed it, and no
 did not. `-DLOOM_VULKAN_FETCH_TOOLCHAIN=OFF` turns the diagnosis into an error naming what to install
 instead, which is the right setting for an image that provides its own toolchain.
 
-**Not every op runs on a device, and that is by design.** Five primitives (`RSQRT`, `ATAN`, `ATAN2`,
-`POW`, `SHAPE`) are host callbacks through `ggml_map_custom` — a C function pointer, so there is
-nothing for a GPU to dispatch. Every device run therefore carries a CPU backend behind it and hands
-both to `ggml_backend_sched`, which cuts the graph at those nodes and runs them on the CPU. The CLI
-prints where each module actually ran; `ctest -L gate -R device_parity` checks that a device gets the
-same answer as the CPU.
+**A primitive can choose its own lowering.** Some ops are host callbacks through `ggml_map_custom` (a C
+function pointer, so there is nothing for a GPU to dispatch) and others are real ggml ops a given backend
+happens not to implement. Either way a primitive builds what the topology asked for, asks
+`ggml_backend_supports_op`, and either keeps it or emits an equivalent — so the same GGUF lowers
+differently per backend and the file on disk keeps saying what the model does. Every device run still
+carries a CPU backend behind it for whatever is left. The CLI prints where each module actually ran;
+`ctest -L gate -R device_parity` checks that a device gets the same answer as the CPU.
 
 ## Testing
 
@@ -185,8 +186,16 @@ GGUF may be run by any backend, so deciding it at export time compiles every art
 capable one. The same Kokoro file builds 1692 ggml nodes on a CPU and 1732 on Vulkan, and its topology
 says `PAD_1D_REFLECT` either way.
 
-What is left is one `ATAN`, which has no exact composition anywhere — ggml has no inverse trig in any
-backend — and a 400-wide reflect pad that is cheaper to fall back on than to compose.
+`ATAN` had no exact composition anywhere — ggml has no inverse trigonometry in any backend — so it gets
+the one **approximation** in the engine: range reduction, a degree-8 minimax polynomial and a branchless
+reconstruction, measured at **1.81 ULP** and confined to backends that cannot dispatch the host callback,
+so a CPU build still gets libm. **Eleven of the twelve models now run a whole module on the GPU with
+nothing falling back at all.** The twelfth is Whisper, whose 400-wide reflect pad is cheaper to fall back
+on than to compose — and which CUDA, Metal and SYCL run natively regardless.
+
+One caveat on every speedup on this page: the GPU measured here reports `uma: 1`, so it shares memory
+with the host and a split costs a synchronisation rather than a transfer. These numbers are a lower bound
+on what a discrete card over PCIe would show.
 
 Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
 one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured
