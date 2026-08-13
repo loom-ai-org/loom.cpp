@@ -4142,10 +4142,11 @@ No arithmetic happens in a slice, so there is nothing to round.
 The CPU path is unaffected (6709 → 6428 ms and 6578 → 6170 ms, i.e. no worse, and within this machine's
 noise band — see P4.7b for how wide that is).
 
-*(P4.7d's support matrix later showed this composition belongs in the ENGINE rather than here: CUDA,
-Metal, SYCL and CANN all implement `PAD_REFLECT_1D`, so only Vulkan needs it, and an export cannot know
-which backend will run it. Correct and measured as it stands — bit-identical, four fewer splits — but
-the wrong home. See P4.7d's closing section.)*
+*(**Superseded by P4.7e**, which moved this into the engine. P4.7d's support matrix showed the
+composition belongs there: CUDA, Metal, SYCL and CANN all implement `PAD_REFLECT_1D`, so only Vulkan
+needs it, and an export cannot know which backend will run it. Everything below about WHAT the
+composition is and why it is exact still stands — it is the same composition, in `op_pad_1d_reflect`
+now. What changed is who decides to use it.)*
 
 ##### The width guard, and Whisper
 
@@ -4268,11 +4269,72 @@ Three things follow, and the third is the one worth keeping.
      only the engine ever sees. One branch per gap, no permanent tax on every artifact, and the topology
      keeps saying `PAD_1D_REFLECT` instead of open-coding it in forty nodes.
 
-   This entry already works that way; P4.7c does not. **Moving P4.7c's composition into
-   `op_pad_1d_reflect`, gated on `ggml_backend_supports_op`, is the follow-up** — `PrimitiveContext`
-   would need to carry the backend, which `GraphBuilder` already holds, so it is one field and a branch.
-   Not done here: it is a refactor of something currently correct and measured, and it should be one
-   commit that says so rather than a rider on this one.
+   This entry already works that way; P4.7c did not. **P4.7e below is that move**, generalized into a
+   mechanism (`PrimitiveContext` carries the `Backends`; `backend_can_run` asks) rather than a branch in
+   one primitive.
+
+#### P4.7e — a primitive that asks the backend what it can run — DONE (2026-08-13)
+
+P4.7d's support matrix showed P4.7c had solved the right problem in the wrong repo, and this is the
+correction — generalized, because the shape of it recurs: **ggml defines ops that not every backend
+implements, and the gaps do not line up.** CUDA has `PAD_REFLECT_1D` but no `POOL_1D`; Vulkan has
+`POOL_2D` but neither; OpenCL, OpenVINO and Hexagon have none of the three.
+
+**The exporter cannot answer this question and the engine can.** An export is ONE GGUF that any backend
+may later run, so composing around a gap there compiles every artifact for the least capable backend
+anyone might use — P4.7c had Kokoro shipping a forty-node open-coding of a pad that CUDA, Metal, SYCL
+and CANN all run in one node. The engine sees the actual backend, and `ggml_backend_supports_op` will
+answer directly.
+
+So `PrimitiveContext` now carries the `Backends`, and a primitive in that position builds the native op,
+**asks**, and keeps it or emits an equivalent composition:
+
+```
+ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
+if (backend_can_run(pc, native) || lp0 + rp0 > kReflectPadComposeLimit) return {native};
+return {compose_pad_reflect_1d(pc.ctx, a, lp0, rp0)};
+```
+
+##### One artifact, two lowerings
+
+The same Kokoro GGUF, whose topology says `PAD_1D_REFLECT` and means it:
+
+    cpu  (CPU     ): 1692 ggml nodes, 0 splits     <- native op, nothing composed
+    gpu  (Vulkan0 ): 1732 ggml nodes, 3 splits     <- composed, because Vulkan has no kernel for it
+
+That is the whole point: the decision is made where the backend is known, per run, and the file on disk
+says what the model does rather than what one backend could not do. The topology went back to 1373 nodes
+(from P4.7c's 1413), and the exporter change is reverted.
+
+The device outcome is unchanged from P4.7c — 3 splits, 1 CPU node (the `ATAN`) — which is the point: the
+same result, obtained without teaching every artifact about Vulkan.
+
+##### Two rules for anything added this way
+
+Both were learned by nearly getting them wrong, and both are written into `primitive_registry.h` beside
+the helper:
+
+* **The fallback must be EXACTLY equivalent, and shown to be.** P4.7d found two spellings of the same
+  ggml op that divide by different numbers; a composition that differs at the edges is a wrong answer no
+  shape check catches. `tests/ci/test_pad_reflect_lowering.cpp` compares the composition against
+  `ggml_pad_reflect_1d` bit-for-bit across seven shapes and widths — **and independently asserts what
+  reflect padding IS** (`[a,b,c,d]` with (2,1) → `[c,b,a,b,c,d,c]`), because two implementations can be
+  wrong the same way and ggml's convention is not something either of them gets to define.
+* **A composition has a width past which it stops being worth it.** `kReflectPadComposeLimit = 32`;
+  above it the native op is kept and allowed to fall back. Whisper pads 200 either side, which would be
+  800 nodes in a 503-node graph.
+
+##### What this does not do
+
+`backend_can_run` is unreachable on a CPU-only build -- the CPU implements every op, so the native branch
+always wins there and no hermetic test can provoke the other one. The test therefore checks the two
+spellings against each other rather than trying to force the branch, so that whichever a device takes, it
+takes one of two things already known to be identical. The branch itself is exercised only by a real
+device, which is what `tests/gate/test_e2e_device_parity*.cpp` are for.
+
+Also worth stating plainly: this mechanism is for ops with an EXACT composition. The remaining `ATAN` has
+none (ggml has no inverse trig in any backend), so it is not a candidate — an approximation would be a
+different decision with a different bar, priced in P4.7c and still not taken.
 
 #### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
 

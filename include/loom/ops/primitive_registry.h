@@ -1,5 +1,6 @@
 #pragma once
 
+#include "loom/core/backend.h"
 #include "loom/core/symbol_table.h"
 
 #include <ggml.h>
@@ -48,7 +49,54 @@ struct PrimitiveContext {
     // strictly in array order). Null for graphs with no such ops; primitives that don't need it just
     // leave it untouched.
     std::vector<ggml_tensor*>* side_effects = nullptr;
+
+    // The backend(s) this graph will run on, so a primitive can ask what they can actually execute --
+    // see `backend_can_run` below. Defaulted, so a hand-built PrimitiveContext (several tests have one)
+    // keeps compiling and simply gets the "assume it is supported" answer, which is what a CPU-only
+    // arrangement would have answered anyway.
+    Backends backends;
 };
+
+// ---------------------------------------------------------------------------------------------------
+// PRIMITIVES THAT CHOOSE THEIR OWN LOWERING (BACKLOG.md P4.7e)
+// ---------------------------------------------------------------------------------------------------
+// Some ops that ggml defines are not implemented by every backend, and the gaps do not line up: CUDA
+// has `PAD_REFLECT_1D` but no `POOL_1D`; Vulkan has `POOL_2D` but neither; OpenCL, OpenVINO and Hexagon
+// have none of the three. A primitive whose op falls in one of those holes becomes a node the scheduler
+// must hand back to the CPU, splitting the graph around it.
+//
+// **This is the engine's problem and not the exporter's**, and the reason is that the exporter cannot
+// answer the question. It emits ONE GGUF that any backend may later run, so composing around a gap
+// there compiles every artifact for the least capable backend anyone might use. The engine sees the
+// actual backend, and ggml will answer directly.
+//
+// So a primitive in that position builds the native op, ASKS, and keeps it or emits an equivalent
+// composition instead. The topology still says what the model does; only the lowering moves.
+//
+//     ggml_tensor* native = ggml_pad_reflect_1d(pc.ctx, a, lp0, rp0);
+//     if (backend_can_run(pc, native)) return {native};
+//     return {compose_it_from_views_and_concats(...)};
+//
+// Two rules for anything added this way, both learned the hard way (P4.7d):
+//
+//   * **The fallback must be EXACTLY equivalent, and shown to be.** Not "close enough" -- a composition
+//     that differs at the edges is a wrong answer no shape check catches. `POOL_1D`'s own lowering found
+//     a case where two spellings of the same ggml op divide by different numbers.
+//   * **A composition has a size past which it stops being worth it.** A fallback that emits hundreds of
+//     nodes to avoid one CPU node is a worse trade than the split it prevents; prefer the native op and
+//     let it fall back.
+
+// Whether the backend this graph will run on can execute `node` as built. False only when a real device
+// backend lacks the op -- a CPU backend implements everything, and a PrimitiveContext with no backend
+// (a hand-built one) answers true, which is the pre-P4.7e behaviour.
+bool backend_can_run(const PrimitiveContext& pc, const ggml_tensor* node);
+
+// PAD_1D_REFLECT's fallback lowering, built from views and concatenations -- what `op_pad_1d_reflect`
+// emits when `backend_can_run` says the backend has no `ggml_pad_reflect_1d`. Declared here rather than
+// kept private to the primitive so tests/ci/test_pad_reflect_lowering.cpp can hold it against ggml's own
+// op directly: the branch that selects it cannot be reached on a CPU backend, which implements
+// everything, so the composition has to be reachable on its own to be testable at all.
+ggml_tensor* compose_pad_reflect_1d(ggml_context* ctx, ggml_tensor* a, int lp0, int rp0);
 
 using PrimitiveFn = std::function<std::vector<ggml_tensor*>(
     PrimitiveContext& pc,

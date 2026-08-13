@@ -9,6 +9,16 @@
 
 namespace loom {
 
+bool backend_can_run(const PrimitiveContext& pc, const ggml_tensor* node) {
+    // No backend to ask (a hand-built context) means the caller is not in a position to care -- answer
+    // the way a CPU-only arrangement would, which is what every such context has always been.
+    if (pc.backends.primary == nullptr || node == nullptr) return true;
+    // The PRIMARY backend specifically, not "any of them". The CPU fallback can run everything by
+    // construction, so asking it would always say yes and the question exists precisely to avoid being
+    // sent there.
+    return ggml_backend_supports_op(pc.backends.primary, node);
+}
+
 bool is_materialized(const ggml_tensor* t) {
     return t != nullptr && t->buffer != nullptr && t->data != nullptr;
 }
