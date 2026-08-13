@@ -162,7 +162,7 @@ Vega 3 iGPU against 4 CPU threads, one forward each:
 | lfm2-350m | 1 | **2.22×** |
 | qwen3-0.6b | 1 | **2.82×** |
 | matcha `encoder_mu` | 1 | **3.65×** |
-| kokoro `decoder_vocoder` | 7 | **4.45×** |
+| kokoro `decoder_vocoder` | 3 | **4.62×** |
 
 What decides that number is how many times the scheduler has to cut the graph, and what forces a cut is
 `ggml_map_custom` — a host callback, so there is nothing for a device to dispatch. Those splits used to
@@ -171,8 +171,15 @@ of it was the engine: it was three patterns the exporter emitted as host callbac
 been taught to recognise them — an RMS norm (`POW`+`RSQRT`), a squaring (`POW`), and a hand-rolled
 LayerNorm. **Across all thirteen exported models there are now exactly two `ggml_map_custom` nodes
 left** — one `ATAN` each in Kokoro's and StyleTTS2's STFT phase, which has no ggml counterpart.
-`BACKLOG.md` P4.7a and P4.7b have the numbers, including a CPU measurement that came out wrong twice
-before anything interleaved the runs.
+`BACKLOG.md` P4.7a–P4.7c have the numbers, including a CPU measurement that came out wrong twice before
+anything interleaved the runs.
+
+**Counting host callbacks turned out to be the wrong lens**, which is worth knowing before optimizing
+anything here: a graph splits just as readily on a *real* ggml op whose backend kernel is missing.
+Kokoro's last seven splits were four reflect pads (`ggml-vulkan` implements no `PAD_REFLECT_1D`) and two
+`ATAN`, not two `ATAN`. Reflect padding is exactly composable from `VIEW`+`CONCAT`, so the exporter now
+does that below a width limit — bit-identical output, four fewer splits. What is left is `POOL_1D` and a
+400-wide pad in Whisper, both of which want a shader upstream rather than a composition here.
 
 Of the two decisions the earlier version of this item said were waiting on a GPU, one was answered and
 one is still open. Retained inter-module outputs turn out not to be what a device charges for — measured
