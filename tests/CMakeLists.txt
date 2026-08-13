@@ -143,6 +143,12 @@ target_link_libraries(test_pad_reflect_lowering PRIVATE loom::engine)
 add_test(NAME test_pad_reflect_lowering COMMAND test_pad_reflect_lowering)
 set_tests_properties(test_pad_reflect_lowering PROPERTIES LABELS ci)
 
+# ATAN's polynomial fallback, measured against libm (BACKLOG.md P4.7f).
+add_executable(test_atan_lowering ci/test_atan_lowering.cpp)
+target_link_libraries(test_atan_lowering PRIVATE loom::engine)
+add_test(NAME test_atan_lowering COMMAND test_atan_lowering)
+set_tests_properties(test_atan_lowering PROPERTIES LABELS ci)
+
 # Device selection. Needs no fixture at all -- it asks the ggml backend registry what this BUILD has.
 add_executable(test_device_selection ci/test_device_selection.cpp)
 target_link_libraries(test_device_selection PRIVATE loom::engine)

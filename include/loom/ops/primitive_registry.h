@@ -98,6 +98,14 @@ bool backend_can_run(const PrimitiveContext& pc, const ggml_tensor* node);
 // everything, so the composition has to be reachable on its own to be testable at all.
 ggml_tensor* compose_pad_reflect_1d(ggml_context* ctx, ggml_tensor* a, int lp0, int rp0);
 
+// ATAN's fallback lowering: range reduction, a minimax polynomial and a branchless reconstruction, all
+// in ops every backend has. Unlike the two above this is an APPROXIMATION (~1.84 ULP, measured) and not
+// an exact composition -- ggml has no inverse trigonometry in any backend, so there is nothing exact to
+// compose from. `op_atan` reaches for it only where the backend cannot dispatch the `ggml_map_custom`
+// callback at all; a CPU keeps libm. See compose_atan in primitives_basic.cpp for the method and for why
+// the polynomial is degree 8.
+ggml_tensor* compose_atan(ggml_context* ctx, ggml_tensor* x);
+
 using PrimitiveFn = std::function<std::vector<ggml_tensor*>(
     PrimitiveContext& pc,
     const std::vector<ggml_tensor*>& inputs,
