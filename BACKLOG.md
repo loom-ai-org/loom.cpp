@@ -3821,19 +3821,17 @@ of them and `RSQRT` in three.
 | gigaam, whisper | 0 | 1 | 0 | |
 | supertonic, vits | 0 | 0 | 0 | already free of both |
 
-`exporter.py` DOES map `"rms_norm" → "RMS_NORM"`, so this is not a missing translation — it is a
-translation that never fires, because coremltools' MIL decomposes `torch.nn.RMSNorm` into elementwise
-ops before this exporter ever sees it. Recognising the decomposed sequence and emitting the primitive is
-the single highest-value follow-up this measurement produced. **It is NOT implemented**, and it belongs
-in the exporter — see P5 below, and P4.8, where it stops being an optimization and becomes a
-prerequisite.
+`exporter.py` DID map `"rms_norm" → "RMS_NORM"`, and that was worse than a missing translation: it
+mapped an op **MIL does not have** (checked — coremltools' only `*norm*` core ops are
+batch/instance/l2/layer/local_response), so it could never fire, and would have emitted an `RMS_NORM`
+node with no `eps` attr — which the engine raises on — if a future coremltools ever added one. The entry
+is gone; the primitive is reached by a fusion pass instead. **See P4.7a below: this is now DONE.**
 
-Two smaller variants are worth pricing alongside it, because they are engine-side and would reach the
-models RMS-norm fusion does not touch: `POW(x, 2)` is `ggml_sqr` and `POW(x, 0.5)` is `ggml_sqrt`
-whenever the exponent is a materialized constant, which would move Kokoro's and StyleTTS2's fifty apiece
-onto the device. Both change CPU-path arithmetic (`powf(x, 2.0f)` is not guaranteed to equal `x*x`), so
-both need the byte-identity sweep run against them before they can land — which is why they are priced
-here rather than done here.
+Two smaller variants remain priced but not done, because they reach the models RMS-norm fusion does not:
+`POW(x, 2)` is `ggml_sqr` and `POW(x, 0.5)` is `ggml_sqrt` whenever the exponent is a materialized
+constant, which would move Kokoro's and StyleTTS2's fifty apiece onto the device. Both change CPU-path
+arithmetic (`powf(x, 2.0f)` is not guaranteed to equal `x*x`), so both need the byte-identity sweep run
+against them first.
 
 **The KV cache works on a device**, which the first version of this entry listed as untested because no
 export on hand had one. Re-exporting Qwen3-0.6B-Base against loom-exporter HEAD produced a fused causal
@@ -3957,6 +3955,70 @@ Three decisions in it are worth keeping:
   `ggml_flash_attn_ext`'s forced F16 K/V cast worth its precision cost; that trade is now possible to
   make and has not been made.
 
+#### P4.7a — RMS norm reaches its primitive, and the GPU story changes — DONE (2026-08-13)
+
+P4.7 measured Qwen3-0.6B at **0.95x** on a GPU — slower than the CPU — and named the cause: 226
+`ggml_map_custom` nodes, host callbacks no backend but the CPU can dispatch, each one cutting the graph.
+All 226 were one thing, an RMS norm the exporter never recognised. It is recognised now.
+
+`loom_exporter/passes.py`'s **`fuse_rms_norm`** collapses the five-op chain PyTorch's RMSNorm traces to —
+`pow(x,2) → reduce_mean(-1) → add(eps) → rsqrt → mul(x, ·)` — into one `loom_rms_norm`, which
+`topology_ops.py` lowers to the engine's `RMS_NORM`. The primitive was already there and had never once
+been emitted.
+
+##### What it did
+
+| | splits | device / CPU nodes | CPU | GPU | |
+|---|---|---|---|---|---|
+| qwen3-0.6b, decomposed | 453 | 2879 / 339 | 794.5 ms | 797.5 ms | 1.00x |
+| qwen3-0.6b, **fused** | **1** | **2201 / 0** | 755.9 ms | **275.5 ms** | **2.74x** |
+| lfm2-350m, decomposed | 181 | 1145 / 135 | 453.6 ms | 257.2 ms | 1.76x |
+| lfm2-350m, **fused** | **1** | **875 / 0** | 419.9 ms | **189.1 ms** | **2.22x** |
+
+**One split means the whole graph ran on the device** — not one node fell back. Qwen3's topology drops
+from 2066 nodes to 1501, LFM2's from 820 to 595, and both go from "the GPU is not worth using" to the
+range the Conformer was already in.
+
+**The CPU path is unchanged, and that is the point of checking it.** 794.5 → 755.9 ms and 453.6 → 419.9
+ms are within this machine's run-to-run variance; a fused `ggml_rms_norm` and five vectorized ops cost
+about the same on a CPU. Nobody pays for this.
+
+##### Correctness
+
+* **Numerically**: max relative difference between the two exports' logits is **4.1e-07** on the CPU
+  (fp32 rounding — `ggml_rms_norm` accumulates its sum in double where the decomposed chain's
+  `REDUCE_SUM` does not), with **0/8 argmax disagreements**. On the GPU, 3.1e-04 with the same 0/8.
+* **A model that must NOT change does not.** VITS has no RMS norm, and re-exporting it with the pass in
+  place produced a **byte-identical** GGUF to the one before. That is the check the sweep recipe demands
+  — a fusion that cannot be shown to leave the rest alone is a fusion nobody can trust.
+* The gate suite passes on both a CPU-only and a Vulkan build (82/82, 8–10 tests doing real work),
+  including `test_e2e_causal_lm_infer_with_past` on the re-exported model and both device-parity tests.
+  The KV-cache parity test now reports `splits=1, device=2034, cpu=0` — a whole cached decode on the
+  device, same twelve tokens as the CPU.
+* Eight unit tests in `tests/ci/test_passes.py`, and seven of them are **negative**: a multiply that
+  feeds back a different tensor, a mean over another axis, an exponent that is not 2, a shared
+  intermediate, keep_dims=False. That is where a fusion pass does its damage — emitting `RMS_NORM` for a
+  chain that normalizes something else is silently wrong arithmetic no shape check downstream catches.
+
+##### Two things worth keeping
+
+**MIL's `rsqrt` carries an epsilon of its own** (default 1e-12) and computes `1/sqrt(x + epsilon)`, so
+the value the engine must add to the mean square is the SUM of that and the traced `variance + self.eps`
+— measured, not assumed: the fused op comes out at `1.000001e-06` for a model written with `eps=1e-6`.
+Dropping the term would be a wrong answer nothing downstream would flag, which is why it has its own
+test.
+
+**Matcha was not fused, and should not have been.** It has 38 `POW` and 32 `RSQRT`, which looks like the
+same pattern and is not: its chain starts with `SUB(x, mean)` and reduces ne axis 1. That is a
+hand-rolled **LayerNorm** over a non-`ne[0]` axis, and `ggml_rms_norm` is neither mean-centred nor able
+to reduce any axis but `ne[0]`. The pass's axis guard refuses it. Fusing that one is a separate item —
+it would need `LAYER_NORM` plus a transpose, and `LAYER_NORM` has the same ne[0]-only restriction.
+
+##### The one it does not fix
+
+Kokoro and StyleTTS2 carry 50 `POW` each with **no** `RSQRT` — a real `x**p`, not a normalization — so
+they still split. `POW(x,2) → ggml_sqr` is the item for those, priced under P4.7 above.
+
 #### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
 
 P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
@@ -4024,10 +4086,12 @@ about what each artifact carries. What IS still needed on the engine side is sma
    passing it through, not a redesign.
 2. **A device-selection story for more than one match.** `"gpu"` means "the first GPU/iGPU/accelerator
    registered". With two accelerators of different kinds in a box that stops being a sensible default.
-3. **The custom-op fusion stops being an optimization.** P4.7 measured 453 splits costing Qwen3 its
-   entire speedup on a GPU that supports nearly every op. An NPU supports *far fewer*, so the split
-   count there starts higher and the fallback traffic starts worse. **Fusing RMS norm (above) is a
-   prerequisite for the NPU work, not a follow-up to it.**
+3. **Custom ops decide whether an accelerator is worth using at all.** P4.7 measured 453 splits
+   costing Qwen3 its entire speedup on a GPU that supports nearly every op; P4.7a removed them and the
+   same model went to 2.74x. An NPU supports *far fewer* ops than a GPU, so this effect starts larger
+   there and every remaining `ggml_map_custom` matters more. The RMS-norm half is done; `POW(x,2)` and
+   the hand-rolled LayerNorm Matcha carries are the ones left, and they should be cleared **before**
+   anyone judges an NPU backend by a benchmark.
 
 ##### `loom-py`: profiles, and why a wheel matrix is the wrong first instinct
 
