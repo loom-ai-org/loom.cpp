@@ -4,7 +4,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
+#include <utility>
+
+#ifdef __linux__
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 namespace loom {
 namespace {
@@ -81,7 +88,8 @@ bool is_host_memory(ggml_backend_dev_t dev) {
     return ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(dev));
 }
 
-// HOW "auto" RANKS DEVICES (BACKLOG.md P4.8b). Lower is preferred; 4 is never selected.
+// HOW "auto" RANKS DEVICES (BACKLOG.md P4.8b, corrected by P4.8e). Lower is preferred; 3 is never
+// selected.
 //
 // This exists because "the first non-CPU device the registry reports" -- what this file used to do --
 // **is not a stable notion**. ggml registers in two different orders depending on how the binary was
@@ -91,57 +99,150 @@ bool is_host_memory(ggml_backend_dev_t dev) {
 // Vulkan0 linked and BLAS dynamically loaded. Since DL is what the wheels ship, that divergence is
 // not hypothetical.
 //
-// The ranking is by what the device IS, so registration order stops being an input:
+// The ranking is by the one thing about a device that has a behavioural consequence -- where its
+// tensors live -- so registration order stops being an input:
 //
-//   0  a GPU or iGPU
-//   1  an accelerator with its own memory -- what a discrete NPU registers as
-//   2  an accelerator in host memory -- what BLAS is, and what an NPU on a UMA SoC may be
-//   3  the CPU
+//   0  an offload device with its own memory  (a split against it costs a copy)
+//   1  an offload device in host memory       (BLAS; a split against it copies nothing)
+//   2  the CPU
 //
-// GPUs ahead of accelerators is a judgement rather than a law, and the evidence for it is P4.7d's
-// support matrix: the NPU-shaped backends implement strictly FEWER ops than the GPU ones -- OpenVINO
-// and Hexagon have no POOL_2D, which every GPU backend has -- so more of a graph survives on a GPU.
-// Revisit it when an NPU measures better on a real graph; `"npu"` is the override until then.
+// THERE USED TO BE A FOURTH TIER, and deleting it is P4.8e. Rank 1 was "an accelerator with its own
+// memory -- what a discrete NPU registers as", sitting between GPUs and BLAS. It never had an
+// inhabitant and never could have, because it was built on a misreading of ggml's own enum:
+//
+//     // accelerator devices intended to be used together with the CPU backend (e.g. BLAS or AMX)
+//     GGML_BACKEND_DEVICE_TYPE_ACCEL,
+//
+// ACCEL is DEFINED upstream as the BLAS/AMX co-processor role -- a thing used *together with* the CPU,
+// which is this file's rank 1 -- and GPU is defined as "GPU device using dedicated memory". So a
+// discrete NPU that runs whole graphs out of its own memory is, by upstream's taxonomy, a GPU. All
+// three accelerator backends in ggml agree and return GGML_BACKEND_DEVICE_TYPE_GPU: ggml-openvino
+// (:751), ggml-hexagon (:3917), and ggml-et. Verified unchanged at ggml master 8846b79e, 154 commits
+// past the pinned v0.16.0, so this is upstream's position rather than an immaturity to wait out.
+//
+// The consequence for this file is small precisely because the deleted tier had no members: a device
+// is an offload device or it is the CPU, and what separates the two offload ranks is the memory
+// question that was already being asked.
 int primary_rank(ggml_backend_dev_t dev) {
     switch (ggml_backend_dev_type(dev)) {
         case GGML_BACKEND_DEVICE_TYPE_GPU:
         case GGML_BACKEND_DEVICE_TYPE_IGPU:
-            return 0;
         case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-            return is_host_memory(dev) ? 2 : 1;
+            return is_host_memory(dev) ? 1 : 0;
         case GGML_BACKEND_DEVICE_TYPE_CPU:
-            return 3;
+            return 2;
         default:
-            return 4;
+            return 3;
     }
 }
 
-// The best-ranked device, or null if the registry holds nothing selectable. Ties -- two GPUs, or a
-// GPU and a second GPU from another backend -- are still broken by registration order, which is the
-// half of this problem that is NOT solved here: nothing about a machine tells the engine that CUDA0
-// should beat Vulkan0. A caller with two devices of the same kind should name the one it wants.
-ggml_backend_dev_t best_device(int worst_rank_allowed) {
+// Can the KERNEL confirm this device is a GPU? Breaks ties within a rank, and is the only positive
+// evidence available for the question `ggml_backend_dev_type` stopped being able to answer.
+//
+// Two stages, and neither trusts the backend's self-report:
+//
+//   1. `ggml_backend_dev_props::device_id` is the device's PCI address, or null. Null is RELIABLE
+//      rather than uninitialised -- ggml_backend_dev_get_props memsets the struct before handing it to
+//      the backend -- so a null means "this backend did not say which physical device it is".
+//   2. The kernel then says what that address IS. PCI base class 0x03 is a display controller; the
+//      Intel NPU on the workstation is 0x12, a processing accelerator, at 0000:00:0b.0. The kernel
+//      maintains exactly the taxonomy ggml's backends have stopped maintaining, and it is the one
+//      authority in this stack that is not a self-report.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO is infer "not confirmed" => "not a GPU". Only ggml-cuda and
+// ggml-vulkan populate device_id at all; ggml-metal, ggml-sycl, ggml-opencl, ggml-webgpu and ggml-cann
+// are real GPU backends that leave it null, and there is no sysfs at all on macOS or Windows. So this
+// is a POSITIVE confirmation that promotes, never a negative one that demotes: an unconfirmable device
+// keeps exactly the standing it had before this function existed.
+//
+// What it buys is the case the workstation actually presents -- CUDA0 (confirmed 0x030000) against
+// OPENVINO0 (says nothing), where the old rule picked whichever ggml registered first and could hand a
+// caller an NPU-or-CPU-backed OpenVINO while a 5090 sat idle.
+bool kernel_confirms_gpu(ggml_backend_dev_t dev) {
+#ifdef __linux__
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (props.device_id == nullptr || *props.device_id == '\0') return false;
+
+    const std::string path = std::string("/sys/bus/pci/devices/") + props.device_id + "/class";
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string cls;
+    if (!(f >> cls)) return false;
+
+    // "0x030000" -- base class is the byte after the "0x". Anything shorter is not a class code.
+    if (cls.size() < 4 || cls.compare(0, 2, "0x") != 0) return false;
+    return cls.compare(2, 2, "03") == 0;
+#else
+    (void) dev;
+    return false;
+#endif
+}
+
+// The accelerators the KERNEL knows about, as "accel0 (intel_vpu)", or empty. Diagnostic only -- it is
+// never an input to selection, because it answers "does this machine have an accelerator" and
+// selection needs "is THIS ggml device one", which nothing can answer (see the "npu" spec).
+//
+// /dev/accel is the Linux accel subsystem (drivers/accel: intel_vpu, habanalabs, qaic) and a GPU never
+// appears there -- on the workstation accel0 is intel_vpu while both GPUs are /dev/dri/card{0,1}. So
+// its presence is good evidence that a user who typed "npu" was not confused, and that is exactly the
+// user this string is written for.
+std::string kernel_accelerator_list() {
+#ifdef __linux__
+    std::string out;
+    DIR* dir = opendir("/sys/class/accel");
+    if (dir == nullptr) return out;
+    std::vector<std::string> entries;
+    while (dirent* e = readdir(dir)) {
+        const std::string name = e->d_name;
+        if (name == "." || name == "..") continue;
+        std::string driver;
+        char buf[256];
+        const std::string link = "/sys/class/accel/" + name + "/device/driver";
+        const ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            const std::string target(buf);
+            const size_t slash = target.find_last_of('/');
+            driver = slash == std::string::npos ? target : target.substr(slash + 1);
+        }
+        entries.push_back(driver.empty() ? name : name + " (" + driver + ")");
+    }
+    closedir(dir);
+    std::sort(entries.begin(), entries.end());
+    for (const std::string& e : entries) {
+        if (!out.empty()) out += ", ";
+        out += e;
+    }
+    return out;
+#else
+    return {};
+#endif
+}
+
+// Within a rank, a kernel-confirmed GPU wins. Everything else keeps registration order, which is what
+// a strict `<` on this pair preserves: an unconfirmed device never displaces an earlier unconfirmed
+// one, so the only behaviour this changes is the one it can prove.
+int tie_break(ggml_backend_dev_t dev) {
+    return kernel_confirms_gpu(dev) ? 0 : 1;
+}
+
+// The best device whose rank falls in [best_allowed, worst_allowed], or null if there is none.
+// `"gpu"` passes a single-rank window; `"auto"` passes all of them.
+ggml_backend_dev_t best_device_in_range(int best_allowed, int worst_allowed) {
     ggml_backend_dev_t best = nullptr;
-    int best_rank = worst_rank_allowed + 1;
+    std::pair<int, int> best_key{worst_allowed + 1, 0};
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const int rank = primary_rank(dev);
-        if (rank <= worst_rank_allowed && rank < best_rank) {
+        if (rank < best_allowed || rank > worst_allowed) continue;
+        const std::pair<int, int> key{rank, tie_break(dev)};
+        if (key < best_key) {
             best = dev;
-            best_rank = rank;
+            best_key = key;
         }
     }
     return best;
-}
-
-// The first device matching one rank exactly -- what the specs that name a KIND of device resolve
-// through, so that "gpu" cannot answer with an accelerator and "npu" cannot answer with a GPU.
-ggml_backend_dev_t first_device_of_rank(int wanted) {
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (primary_rank(dev) == wanted) return dev;
-    }
-    return nullptr;
 }
 
 std::string device_list_for_error();
@@ -221,34 +322,56 @@ Device Device::open(const std::string& spec) {
     if (key == "cpu") {
         dev = cpu_device();
     } else if (key == "gpu") {
-        // A GPU or an iGPU, and NOT merely "something that is not the CPU". Answering this with an
-        // accelerator is how a machine's actual GPU got silently skipped in favour of BLAS, which
-        // implements roughly MUL_MAT and would have run the rest of the graph on the CPU while
-        // reporting an accelerator to the caller (BACKLOG.md P4.8b).
-        dev = first_device_of_rank(0);
+        // An offload device with its own memory, preferring one the kernel confirms is a GPU. NOT
+        // merely "something that is not the CPU": answering this with a host-memory accelerator is how
+        // a machine's actual GPU got silently skipped in favour of BLAS, which implements roughly
+        // MUL_MAT and would have run the rest of the graph on the CPU while reporting an accelerator to
+        // the caller (BACKLOG.md P4.8b).
+        //
+        // The spelling stays "gpu" while the guarantee is now "rank 0", and the gap between those two
+        // is real: an NPU backend claiming GPU satisfies this spec. That is upstream's taxonomy rather
+        // than a defect here (see primary_rank), and kernel_confirms_gpu narrows it as far as anything
+        // can -- where a real GPU and an NPU-shaped backend compete, the confirmed one wins.
+        dev = best_device_in_range(0, 0);
         // Deliberately an error rather than a fallback. "auto" already means "the best you have"; a
         // caller who spelled out "gpu" is asking a question about the machine, and answering it with a
         // silent CPU run turns "there is no GPU here" into an unexplained performance number.
         if (dev == nullptr) {
-            throw Error("loom::Device: no GPU device is available -- this build has devices [" +
-                        device_list_for_error() + "]. Configure with -DGGML_VULKAN=ON (or "
-                        "-DGGML_CUDA=ON / -DGGML_METAL=ON) to compile one in, use 'npu' for an "
-                        "accelerator, or use 'auto'.");
+            throw Error("loom::Device: no offload device with its own memory is available -- this "
+                        "build has devices [" + device_list_for_error() + "]. Configure with "
+                        "-DGGML_VULKAN=ON (or -DGGML_CUDA=ON / -DGGML_METAL=ON) to compile one in, or "
+                        "use 'auto'.");
         }
     } else if (key == "npu" || key == "accel") {
-        // An accelerator with its own memory. The spelling is "npu" because that is what such a device
-        // is called outside this file; ggml has no NPU concept and reports one as ACCEL, which BLAS
-        // also is -- so the memory question is what separates them, not the type.
-        dev = first_device_of_rank(1);
-        if (dev == nullptr) {
-            throw Error("loom::Device: no NPU/accelerator device with its own memory is available -- "
-                        "this build has devices [" + device_list_for_error() + "]. Note that a "
-                        "host-memory accelerator such as BLAS is not one; name it directly if that is "
-                        "what you meant, or use 'auto'.");
+        // ALWAYS THROWS, and the message is the whole feature (BACKLOG.md P4.8d/P4.8e).
+        //
+        // This spec used to resolve to rank 1, "an accelerator with its own memory". No such device
+        // exists or can: every NPU backend in ggml registers as GPU, so an NPU is indistinguishable
+        // from a GPU through the device API -- see primary_rank for the enum comment that makes that
+        // upstream's definition rather than an accident.
+        //
+        // Kept as a recognised spelling rather than deleted, because a caller who types it has a real
+        // question and deserves the answer, not "unknown device 'npu'". What that answer costs is one
+        // sentence; what silently resolving it to a GPU would cost is the class of defect P4.8b exists
+        // to have removed.
+        std::string message =
+            "loom::Device: '" + requested +
+            "' cannot be resolved: ggml does not report NPU identity. Every NPU backend it ships "
+            "(OpenVINO, Hexagon, ET) registers as GGML_BACKEND_DEVICE_TYPE_GPU, so an NPU is "
+            "indistinguishable from a GPU through the device API. This build has devices [" +
+            device_list_for_error() + "]";
+        const std::string accelerators = kernel_accelerator_list();
+        if (!accelerators.empty()) {
+            // The kernel DOES keep the distinction ggml dropped, so if this machine has an accelerator
+            // say so -- otherwise the message reads as "you have no NPU" to someone who does.
+            message += ", and this machine has a kernel accelerator [" + accelerators +
+                       "]. If a listed device drives it, select that device by name (and for OpenVINO "
+                       "set GGML_OPENVINO_DEVICE=NPU, which is what chooses its target)";
         }
+        throw Error(message + ". Use 'auto', or name a device.");
     } else if (key == "auto") {
-        // Every rank in preference order, so this cannot fail: the CPU is rank 3 and is always there.
-        dev = best_device(/*worst_rank_allowed=*/3);
+        // Every rank in preference order, so this cannot fail: the CPU is rank 2 and is always there.
+        dev = best_device_in_range(0, 2);
         if (dev == nullptr) dev = cpu_device();
     } else {
         // A device name. Matched case-insensitively against the registry rather than through
@@ -286,15 +409,18 @@ Device Device::open(const std::string& spec) {
         // primary has its own memory. Two reasons for that condition, both in Backends::assists: a
         // host accelerator improves the fallback rather than the primary, so pairing it with a primary
         // that is itself in host memory buys nothing; and a discrete device must never fall back to
-        // another discrete device, which the rank-2 filter below also rules out.
+        // another discrete device, which the rank-1 filter below also rules out.
+        //
+        // The two ranks named here are exactly the two the memory question separates, which is why
+        // P4.8e's collapse of the tier above left this untouched apart from the numbering.
         //
         // A failure to initialize one is not fatal. An assist is an optimization -- the graph is
         // correct without it, because the CPU can run everything -- so a backend that declines to
         // start is skipped rather than taking the whole Device down with it.
-        if (primary_rank(dev) <= 1) {
+        if (primary_rank(dev) == 0) {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t candidate = ggml_backend_dev_get(i);
-                if (candidate == dev || primary_rank(candidate) != 2) continue;
+                if (candidate == dev || primary_rank(candidate) != 1) continue;
                 ggml_backend_ptr assist(ggml_backend_dev_init(candidate, nullptr));
                 if (assist) device.assists_.push_back(std::move(assist));
             }

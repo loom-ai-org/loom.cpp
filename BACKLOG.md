@@ -4447,7 +4447,7 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
-#### P4.8 — more backends, without ending the lean engine — SCOPED 2026-08-13; a/b/c done, NPU open
+#### P4.8 — more backends, without ending the lean engine — SCOPED 2026-08-13; a/b/c/d/e done, NPU open
 
 P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
 Vulkan. That was a hardware accident, not a decision. What follows is the shape of the rest — CUDA
@@ -4958,6 +4958,261 @@ Four things, each of which someone could mistake this entry for having covered.
 The workstation tree lives at `/home/flavio/loom/loom.cpp` (rsynced, not cloned — see the note in
 P4.8's toolchain section), fixtures at `/home/flavio/loom/fixtures`, and the probes are hand-compiled
 into `/home/flavio/loom/probes` per `tools/debug/README.md`.
+
+##### P4.8d — the NPU answers, and the answer invalidates rank 1 (2026-08-14)
+
+`tools/debug/README.md` names the first question to point a probe at: **does a discrete NPU register as
+`GGML_BACKEND_DEVICE_TYPE_ACCEL` with a non-host buffer type?** — the assumption rank 1 rests on, which
+no hardware had ever tested. The Intel NPU in the workstation now answers it, and it is the branch the
+scoping listed as the bad one: **it is not ACCEL at all**, so `Device::open("npu")` never resolves and
+that spec is dead code. Not because of the hardware — because of the backend.
+
+##### Getting there, which is nearly root-free and worth writing down
+
+* **`pip install openvino` is the whole toolkit install.** The 2026.3.0 wheel ships
+  `OpenVINOConfig.cmake` *and* `libopenvino_intel_npu_plugin.so`, so `-DOpenVINO_DIR=<site-packages>/openvino/cmake`
+  is all `ggml-openvino/CMakeLists.txt`'s `find_package(OpenVINO REQUIRED)` needs. No apt, no archive.
+* **The build dies on `CL/cl2.hpp` and it is not obvious why.** OpenVINO's `intel_gpu/ocl/ocl_wrapper.hpp`
+  includes the *deprecated* OpenCL C++ bindings, which `opencl-headers` does not carry. conda-forge's
+  `clhpp` is the missing piece; `ocl-icd` + `opencl-headers` alone configure fine and then fail to compile.
+* **The NPU user-mode driver needs no root either.** `intel/linux-npu-driver` v1.35.0 ships `.deb`s;
+  `dpkg -x` into a prefix and `ZE_ENABLE_ALT_DRIVERS=<prefix>/…/libze_intel_npu.so.1` is enough for the
+  system's `libze_loader` (1.20.6) to find it. The firmware was already in `/lib/firmware/intel/vpu`.
+* **One thing does need root, and it is the whole blocker:** `/dev/accel/accel0` is `root:render` 0660.
+  Without the `render` group the driver says `Failed to detect any VPU device` and OpenVINO reports
+  `['CPU']` — which looks exactly like a machine with no NPU. `sudo usermod -aG render <user>`, then a
+  fresh login. After it: `['CPU', 'NPU']`, `NPU -> Intel(R) AI Boost`.
+
+##### What the probes measure, with the NPU genuinely engaged
+
+    OpenVINO: using device NPU
+    device     type   buft_is_host   host_buffer
+    OPENVINO0  GPU    false          false
+    CPU        CPU    true           false
+
+    "auto" -> OPENVINO0    "gpu" -> OPENVINO0
+    "npu"  -> throws: no NPU/accelerator device with its own memory is available
+
+**Every one of those rows is byte-identical to the run where the backend targeted the CPU.** That is the
+finding, and it is worse than P4.8b's BLAS defect rather than another instance of it:
+
+1. **`ggml_backend_openvino_device_get_type` returns `GGML_BACKEND_DEVICE_TYPE_GPU` unconditionally**
+   (`ggml-openvino.cpp:751`), and the device buffer type leaves `.is_host` null, so it reads as discrete
+   memory. The backend reports the family it belongs to, not the device it drives.
+2. **Which hardware it actually drives is an environment variable the engine never sees.**
+   `GGML_OPENVINO_DEVICE` defaults to `"CPU"`; asking for one that is absent prints
+   `device NPU is not available, fallback to CPU` and carries on, registry entry unchanged. So `"gpu"`
+   can resolve to a backend executing on the CPU, and **no registry property distinguishes the three
+   cases**. BLAS at least declared ACCEL, which is what let a rank partition exclude it. There is no
+   analogous repair here: a ranking cannot correct a backend that misreports its own type.
+3. **`"npu"` throws on the one machine in this project with a real NPU, actively in use.** Not a
+   hypothetical about exotic hardware — the exact configuration the spec was written for.
+
+The WARN is visible at all only because P4.8a's log callback keeps WARN/ERROR while dropping INFO. This
+is precisely the failure that decision was made for, arriving sooner than expected.
+
+##### And then it does not run the graph at all, for a reason op coverage never predicted
+
+P4.8's item 3 warns that **"a first NPU benchmark will not measure the NPU; it will measure how much of
+the graph fell back"**, and points at P4.7d's support matrix. That worry was aimed at the wrong thing.
+Qwen3-0.6B on `--device OPENVINO0` with `GGML_OPENVINO_DEVICE=NPU`:
+
+    GGML OpenVINO backend std::exception: stoi
+    error: GraphBuilder::compute: the graph failed to run on OPENVINO (ggml_status -1)
+
+`ggml-decoder.cpp:304`, `extract_layer_from_name`: find `"_l"` anywhere in a tensor's name, take
+everything up to the next space, `std::stoi` it — llama.cpp's `cache_k_l0` convention. It is called
+through `compute_llm_params`, **unconditionally on the whole graph** (`utils.cpp:185`, `:424`), and at
+two call sites via `.value()` on the optional. So a name with `_l` followed by anything non-numeric
+throws, and a graph with no `_l` at all throws differently.
+
+**`ggml-openvino` is a llama.cpp-shaped backend, not a general ggml one.** It reconstructs a transformer
+from tensor names rather than executing the ggml graph it was handed. Note the trap in that combination:
+`supports_op` is an ordinary per-op table, so the scheduler is told node-by-node that these ops are
+supported, and the execution path then declines to honour it. A backend can advertise op support it
+does not actually provide for an arbitrary graph — which is a second thing `ggml_backend_supports_op`
+cannot be trusted to answer, alongside P4.7e's.
+
+##### What this leaves
+
+* **Rank 1 has no *possible* inhabitant** — stronger than it looked when this was written, and P4.8e
+  below has the enum comment that settles it. It was designed for "an accelerator with its own memory";
+  ggml defines `ACCEL` as the BLAS/AMX co-processor role instead, so the tier was never going to fill.
+* **The tie-break-within-a-rank measurement is still unavailable**, and the reason changed: the
+  workstation was supposed to be the box with a rank-0 GPU *and* a rank-1 NPU at once. It has both
+  physically and only rank 0 in the registry, so a CUDA + OpenVINO build produces two rank-0 devices
+  separated by registration order — which is the tie-break case, but not the one that was wanted.
+* **No throughput number exists, and none should be quoted.** Nothing ran. The NPU's speed on a loom
+  graph is exactly as unknown as it was this morning.
+* **Hexagon: read, not built — and it clears the charge OpenVINO does not** (2026-08-14, below).
+
+The OpenVINO build tree is `/home/flavio/loom/loom.cpp/build-openvino` (tests off), its probes are in
+`/home/flavio/loom/probes-ov`, and the extracted NPU driver is at `/home/flavio/loom/npu-umd/prefix` —
+usable only with `ZE_ENABLE_ALT_DRIVERS` and `LD_LIBRARY_PATH` pointed at it.
+
+##### P4.8d(ii) — `ggml-hexagon`, read rather than built, and rank 1 becomes a pattern
+
+There is no Qualcomm hardware here and `ggml-hexagon/CMakeLists.txt` demands `HEXAGON_SDK_ROOT` — a
+registration-walled proprietary SDK that cross-builds DSP-side "skel" libraries and optionally
+code-signs them (`HEXAGON_HTP_CERT`). So this is a read of 4351 lines, which is the right cost for the
+question: does the other in-tree NPU backend make P4.8d's mistakes?
+
+**On the charge that matters, it is innocent.** `ggml_backend_hexagon_graph_compute` walks
+`graph->nodes[i]`, remaps each node to an HTP opcode, fuses neighbours where it can, and submits. There
+is **no tensor-name parsing anywhere** — every `->name` is logging, every `atoi` is env-var option
+handling — and the string `llama` does not occur in the file. It executes the graph it is handed,
+whatever shape that graph is. So OpenVINO's model-reconstruction design is that backend's choice, not
+something about NPU backends, and a graph-agnostic NPU backend is clearly writable.
+
+**On the ranking it makes the same claim, and that is the finding.**
+
+```c
+static enum ggml_backend_dev_type ggml_backend_hexagon_device_get_type(ggml_backend_dev_t dev) {
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    GGML_UNUSED(dev);          // unreachable -- same tell as ggml-openvino
+}
+```
+
+**Two independent NPU backends, written by different vendors, both report GPU.** One is an accident;
+two is the convention. Rank 1 — "an accelerator with its own memory, a discrete NPU" — is not a tier
+ggml's backends populate, and the `"npu"`/`"accel"` spec has no reachable inhabitant in the pinned
+revision. That is now a statement about ggml rather than about one backend, and it is what should
+decide whether the spec stays.
+
+**And its host/discrete answer is an environment variable.** `ggml_backend_hexagon_buffer_type_is_host`
+returns `opt_hostbuf` — `GGML_HEXAGON_HOSTBUF`, **default 1, i.e. host memory** — and
+`props->caps.host_buffer` is set from the same global. So the probe P4.8b made load-bearing for the
+rank-1/rank-2 split is, for this backend, *runtime-configurable*: same silicon, either answer, chosen
+by the environment. Tallying every backend measured or read so far:
+
+| backend | `caps.host_buffer` | `buft_is_host` |
+|---|---|---|
+| Vulkan, CUDA | true | false |
+| BLAS | false | true |
+| OpenVINO | false | false |
+| Hexagon | `opt_hostbuf` | `opt_hostbuf` (same) |
+
+Inverted, inverted the other way, both false, and identical-but-configurable. **Neither field carries
+the same meaning across backends**, which is a stronger version of the trap P4.8b recorded: the fix was
+to prefer `buft_is_host`, and this says `buft_is_host` is merely the less bad of two unreliable inputs.
+
+**Its op set is aimed at llama.cpp's workload even though its architecture is not**, and for loom's zoo
+that is the binding constraint. The 39 supported ops are LLM-shaped — `MUL_MAT`, `MUL_MAT_ID`, `ROPE`,
+`FLASH_ATTN_EXT`, `RMS_NORM`, `SOFT_MAX`, `GLU`, `SSM_CONV`, `GATED_DELTA_NET` — and contain **no
+convolution of any kind**: no `CONV_1D`, `CONV_2D`, `CONV_TRANSPOSE_1D`, not even `IM2COL`, alongside
+the `POOL_1D`/`POOL_2D`/`PAD_REFLECT_1D` gaps P4.7d already tabulated. Every ASR encoder and every TTS
+vocoder in the zoo would fall back essentially whole; the causal-LM family is the only part with a
+plausible story. So P4.8's "budget for the coverage work before drawing any conclusion from a number"
+holds for Hexagon — it is just that the missing class is convolution, not the three exotic ops the
+matrix pointed at.
+
+#### P4.8e — the tier that could not exist, deleted; and the kernel breaks the tie — DONE (2026-08-14)
+
+P4.8d found that no NPU registers as `ACCEL`. This is the correction, and the reason turned out to be
+in the pinned header the whole time rather than in any backend:
+
+```c
+// accelerator devices intended to be used together with the CPU backend (e.g. BLAS or AMX)
+GGML_BACKEND_DEVICE_TYPE_ACCEL,
+```
+
+**ggml DEFINES `ACCEL` as the BLAS/AMX co-processor role** — a thing used *together with* the CPU,
+which is P4.8b's rank **2** — while `GPU` is defined as "GPU device using dedicated memory". By that
+taxonomy a discrete NPU that runs whole graphs out of its own memory **is** a GPU, and all three of
+ggml's accelerator backends agree: `ggml-openvino` (:751), `ggml-hexagon` (:3917), and `ggml-et`, the
+one new backend directory at master. So P4.8b's rank 1 was not waiting for hardware; it was a
+misreading of the enum, and it could never have had a member.
+
+Checked rather than assumed, because "upstream will fix it" was the live alternative: ggml master
+`8846b79e` is **154 commits and one month past** the pinned `v0.16.0`, and both NPU backends are
+byte-identical at HEAD on exactly these lines. The enums are identical too, comments included. This is
+upstream's position, not an immaturity to wait out — which also retires the idea of a temporary
+name-matching hack, since a temporary fix needs an expiry condition and there is none.
+
+##### The ranking, collapsed to what has behavioural consequences
+
+|   | |
+|---|---|
+| 0 | an offload device with its own memory — a split against it costs a copy |
+| 1 | an offload device in host memory — BLAS; a split against it copies nothing |
+| 2 | the CPU |
+
+`primary_rank` no longer switches on the type to decide the tier, only to separate the CPU from
+everything else; the memory question it was already asking does the rest. The assist rule survives
+unchanged apart from its numbering, because the two ranks it names are exactly the two that question
+separates.
+
+##### `"npu"` now always throws, and the message is the feature
+
+Resolving it was never right: it answered "no NPU with its own memory is available" on the one machine
+whose NPU was running. Deleting the spelling is not right either — a caller who types it has a real
+question and deserves an answer rather than `unknown device 'npu'`. So it is a recognised spec that
+raises, naming the cause (`ggml does not report NPU identity`), the evidence (all three backends
+register as GPU), and the thing that actually works (name the device; for OpenVINO also set
+`GGML_OPENVINO_DEVICE=NPU`, since that is what picks its target).
+
+**And it consults `/dev/accel` to avoid lying by omission.** The Linux accel subsystem (`drivers/accel`
+— `intel_vpu`, `habanalabs`, `qaic`) is where accelerators live and where a GPU never appears: on the
+workstation `accel0` is `intel_vpu` while both GPUs are `/dev/dri/card{0,1}`. So when the kernel does
+know about an accelerator the message says so, and a user with an NPU is not told they have none. It
+is diagnostic only — it answers "does this machine have an accelerator", never "is THIS ggml device
+one", which is the question nothing can answer.
+
+##### Ties within a rank, which the collapse made urgent
+
+Merging the tiers put a real GPU and an NPU-shaped backend in the same rank, so `"auto"` on a CUDA +
+OpenVINO box would go back to registration-order roulette — the exact defect P4.8b was filed for. The
+tie-break is the first *positive* signal found in this whole thread:
+
+```
+device     type   buft_is_host  host_buffer  device_id       kernel says
+CUDA0      GPU    false         true         0000:02:00.0    0x030000  <- display controller
+OPENVINO0  GPU    false         false        (null)          -
+```
+
+`ggml_backend_dev_props::device_id` is the device's PCI address, and **null is a reliable reading**
+rather than uninitialised memory, because `ggml_backend_dev_get_props` memsets the struct before the
+backend fills it. sysfs then says what that address is: base class `0x03` is a display controller, and
+the Intel NPU at `0000:00:0b.0` is `0x12`, a processing accelerator. The kernel maintains exactly the
+taxonomy ggml's backends stopped maintaining, and it is the one authority here that is not a
+self-report.
+
+**It promotes on positive evidence and never demotes on absence**, which is the whole of its safety.
+Only `ggml-cuda` and `ggml-vulkan` populate `device_id`; `ggml-metal`, `ggml-sycl`, `ggml-opencl`,
+`ggml-webgpu` and `ggml-cann` are real GPU backends that leave it null, and there is no sysfs at all
+off Linux. So an unconfirmable device keeps precisely the standing it had before — where nothing is
+confirmable, registration order still decides, exactly as it did yesterday.
+
+##### Verified, and the tie-break was made to fail on purpose first
+
+* **CPU-only build**: `test_device_selection` 49/49 (was 38 — the new checks are the unconditional
+  `"npu"`/`"accel"` raise and its message).
+* **Three-device DL build** (Vulkan + BLAS + CPU, the configuration that produced P4.8b's defect):
+  64/64, and `probe_chain` still shows `auto -> Vulkan0, assists=1, order Vulkan0 BLAS CPU` **with
+  BLAS registering first** — the collapse did not cost the assist chain.
+* **CUDA + OpenVINO on the workstation** — the configuration this tie-break exists for: 61/61,
+  `ci` 58/58, and both device-parity gates still pass. `auto` and `gpu` resolve to `CUDA0`.
+* The `"npu"` message degrades as designed: no `/dev/accel` on the dev box, so the accelerator clause
+  is absent there, and present on the workstation as `[accel0 (intel_vpu)]`.
+
+**`auto -> CUDA0` on that box proves nothing by itself, and nearly shipped as if it did.** CUDA
+registers *first* in both link modes — the `#ifdef` sequence puts it ahead of OpenVINO, and
+`ggml_backend_load_all` calls `cuda` 11th against `openvino` 21st — so the old registration-order rule
+gives the same answer, and the whole tie-break could have been dead code behind a green result.
+
+So it was inverted (`kernel_confirms_gpu(dev) ? 1 : 0`) and re-measured: `auto` and `gpu` both flipped
+to **`OPENVINO0`**, with the registry order unchanged. The tie-break demonstrably overrides
+registration order, and CUDA0 wins for the reason claimed rather than by luck.
+
+**A trap worth recording from doing that:** restoring the file with `rsync -a` and rebuilding did NOT
+revert the binary. rsync preserves mtimes, so the restored source was *older* than the object compiled
+from the inverted version and ninja considered it up to date — the probe kept answering `OPENVINO0`
+from a stale `.o` after a build that reported success. `touch` the file after any rsync-based revert,
+or the next measurement is of the code you thought you removed.
+
+`probe_tiers` gained the `device_id` and kernel-class columns, since it is the tool that answers this
+question for the next backend, and `tools/debug/README.md`'s "first question to point them at" is
+rewritten — that question is now answered.
 
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 

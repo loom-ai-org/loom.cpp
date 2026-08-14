@@ -8,7 +8,7 @@ test binaries would cost every developer time to serve an occasional question.
 | | asks |
 |---|---|
 | `compare_logits.cpp` | elementwise logit difference between two exports of one checkpoint |
-| `probe_tiers.cpp` | per device: ggml type, `buft_is_host`, `caps.host_buffer` |
+| `probe_tiers.cpp` | per device: ggml type, `buft_is_host`, `caps.host_buffer`, `device_id` + its kernel PCI class |
 | `probe_selection.cpp` | registry order, and what `auto`/`gpu`/`npu`/`cpu` resolve to |
 | `probe_chain.cpp` | primary, assist count, and the full `schedule_order()` for a given spec |
 
@@ -44,13 +44,15 @@ g++ -std=c++17 -O0 tools/debug/probe_chain.cpp \
 hand-compiled probe in `/tmp` is in neither, so the registry otherwise comes up empty — which looks
 exactly like a machine with no devices.
 
-## The first question to point them at
+## The question they were pointed at, and how it came out
 
-`probe_tiers`, on a box with a real NPU. **The rank-1 tier rests on an untested assumption**: that a
-discrete NPU registers as `GGML_BACKEND_DEVICE_TYPE_ACCEL` with a non-host buffer type. Only BLAS
-(ACCEL, host memory) and Vulkan (IGPU, device memory) have ever been measured. If an NPU reports
-host memory it belongs in rank 2 and the hierarchy needs revisiting; if it is not ACCEL at all,
-`Device::open("npu")` never resolves and that spec is dead code.
+`probe_tiers` on a box with a real NPU was the open question: does a discrete NPU register as
+`GGML_BACKEND_DEVICE_TYPE_ACCEL` with a non-host buffer type, as the old rank-1 tier assumed? **It
+does not, and cannot** (BACKLOG.md P4.8d). `ggml-openvino` driving an Intel NPU reports `GPU`, with
+output byte-identical to the same backend driving the CPU; `ggml-hexagon` and `ggml-et` report `GPU`
+too. ggml's enum documents `ACCEL` as the BLAS/AMX co-processor role, so this is upstream's taxonomy
+rather than a bug, and the tier was deleted in P4.8e.
 
-Then `probe_chain gpu` and `probe_chain npu` on a machine with both — the first place where the
-rank-0/rank-1 distinction, and the tie-break within a rank, are observable at all.
+What replaced it is the `device_id` column: the kernel can confirm a GPU when the backend will not.
+Point `probe_tiers` at any new backend and the useful questions are now (1) does it fill `device_id`,
+and (2) does its `type` agree with what the kernel says that address is.
