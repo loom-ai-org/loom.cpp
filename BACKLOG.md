@@ -4447,6 +4447,90 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
+#### P4.8i — the runtime comes from NVIDIA's wheels, and the GPU list follows the CPU — DONE (2026-08-14)
+
+P4.8g left two things unfixed and named them: the built library carried an RPATH into the build
+machine's conda prefix, and the architecture set was a release decision. Both are settled, and the
+first one settled the toolkit version rather than the other way round.
+
+##### `nvidia-*-cu13` does not exist, and that chose CUDA 12.9
+
+The plan was to depend on NVIDIA's own runtime wheels rather than bundle `libcublas` — a machine with
+an NVIDIA GPU is not surprised to be asked for NVIDIA's runtime, and bundling it would dwarf a 72 MB
+wheel. Checking the names first turned out to matter:
+
+| package | what is actually on PyPI |
+|---|---|
+| `nvidia-cublas-cu13` | a **1.4 KB placeholder sdist**, version 0.0.1 |
+| `nvidia-cublas-cu12` | a real manylinux wheel, **12.9.2.10** |
+| `nvidia-cuda-runtime-cu12` | a real manylinux wheel, **12.9.79** |
+
+So a CUDA 13 build has no distributable runtime at all. The `cu12` line reaches 12.9 — and **12.9 is
+exactly the minimum for `121a-real`**. That makes 12.9 the only version that gets both DGX Spark
+coverage and a runtime pip can install; 13.1 gets the first and loses the second. P4.8h had reached
+13.1 for the coverage alone, and this reverses that for a reason it could not have seen.
+
+##### The RPATH, and why it is not ctypes preloading
+
+`nvidia-cuda-runtime-cu12` unpacks to `nvidia/cuda_runtime/lib/`, a sibling of `loom_rt_cuda/` in
+site-packages, so `$ORIGIN/../nvidia/cuda_runtime/lib` reaches it with nobody executing anything.
+That property is the point: `loom/__init__.py` finds accelerator packages by SCANNING `sys.path` and
+never imports them, precisely so a broken accelerator cannot take the base package down. torch's
+approach — preloading its CUDA libraries with `ctypes` at import — would require giving that up.
+
+Verified by removing the escape route rather than trusting the ordering. The build still emits conda's
+own `-Wl,-rpath,$PREFIX/lib` ahead of ours (conda's compiler wrappers inject it, and it is absent in a
+manylinux container, which is where CI builds), so the installed library was rewritten with `patchelf`
+to the `$ORIGIN` entries alone before testing:
+
+```
+libcudart.so.12   -> .../loom_rt_cuda/../nvidia/cuda_runtime/lib/libcudart.so.12
+libcublas.so.12   -> .../loom_rt_cuda/../nvidia/cublas/lib/libcublas.so.12
+libcublasLt.so.12 -> .../loom_rt_cuda/../nvidia/cublas/lib/libcublasLt.so.12
+```
+
+and then end to end: `pip install` resolved `nvidia-cublas-cu12 12.9.2.10` and friends, `loom.devices()`
+listed `CUDA0`, and a real model generated correct text in 1.16 s.
+
+**And the repair step needs excludes, or it undoes all of this.** cibuildwheel runs `auditwheel repair`
+by default, whose entire job is to copy external libraries INTO the wheel and repoint RPATHs at its own
+`.libs`. Left alone it would bundle `libcublas.so.12` — cancelling the dependency and adding hundreds
+of megabytes. `libggml-base.so` needs excluding for a different reason: it is genuinely absent at
+repair time, being the base wheel's to ship, and auditwheel treats a library it cannot find as an
+error. Both packages now carry a `repair-wheel-command` saying so.
+
+##### The GPU list follows the CPU architecture
+
+pip already selects by platform tag, so a per-CPU list costs the user nothing and keeps the aarch64
+wheel — going to the most constrained devices — from carrying desktop kernels:
+
+| CPU | real cubins | PTX | why |
+|---|---|---|---|
+| x86_64 | 8.6, 8.9, 12.0a | 7.5, 8.0, 9.0 | RTX 30x/40x/50x. No 12.1a: GB10 is an ARM part |
+| aarch64 | 8.7, 12.1a | 8.0, 9.0 | Orin and DGX Spark. No Ada or RTX 50x board exists on an ARM host |
+
+Orin gets its own `87-real` rather than leaning on 8.6 binary compatibility, because it is a
+first-class target on that side and the wheel has room once the desktop kernels are gone. Measured:
+the x86_64 wheel is **72 MB**, down from 84 MB when it carried `121a` it could never use.
+
+##### Python floor moved to 3.10, and the backends are NOT multiplied by it
+
+3.9 is past EOL. 3.10 stays, and the reason is a target rather than a preference: **JetPack 6 ships
+Ubuntu 22.04, whose system Python is 3.10**, so a 3.11 floor would push Jetson users into a venv before
+they could install anything.
+
+The backend packages are **one wheel per platform, not per interpreter**. They are `py3-none-<platform>`
+because the payload is a plain shared library that ggml dlopens and Python never imports; their
+`build = "cp310-*"` names which interpreter runs the build, not which the wheel serves. Only the base
+wheel, carrying `_loom.so`, needs one build per Python. Worth stating because the natural reading of a
+wheel matrix is that everything multiplies by everything, and here three quarters of that product is
+the same file.
+
+##### Not verified
+
+**The aarch64 arch list has never been compiled.** There is no ARM machine here, so that row of the
+table is a CI-only path — the strings are right in principle and untested in fact.
+
 #### P4.8h — the CUDA wheel fits, and neither lever cost coverage — DONE (2026-08-14)
 
 P4.8g left the CUDA wheel at 112 MB against PyPI's 100 MB per-file ceiling, with the arch set called a
