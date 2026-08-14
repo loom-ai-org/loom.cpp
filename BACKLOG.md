@@ -4447,6 +4447,65 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
+#### P4.8g — `loom-py-rt-cuda`, and what "two strings changed" cost — DONE (2026-08-14)
+
+P4.8a said a second accelerator package would be `packaging/rt-vulkan/` with two strings changed.
+The three files are indeed that small — `CMakeLists.txt` naming `cuda`/`GGML_CUDA`, a `pyproject.toml`
+with the `==` pin, and an `__init__.py` holding nothing importable — and the claim was still wrong,
+because **the pilot had never been built**. `packaging/rt-vulkan/pyproject.toml` declares
+`readme = "README.md"` and no such file exists, so it fails metadata generation before reaching CMake.
+P4.8a's end-to-end verification was of the BASE wheel, which ships its own per-microarchitecture CPU
+plugins and never needed a backend package to prove itself.
+
+So CUDA was the first backend package ever built here, and it found **four defects, every one of them
+in shared code**:
+
+1. **No `README.md`** — `rt-vulkan` has the identical bug.
+2. **`FetchContent_MakeAvailable(ggml)` brought ggml's own `install()` rules into the project.** The
+   first wheel was 297 MB and held `libggml-cuda.so` TWICE — once where this package installs it, once
+   where ggml's rule does — plus a `lib/libggml-base.so` that `BackendPackage.cmake`'s own comment
+   forbids, because two of those on one `sys.path` have no rule about which loads. Vulkan escaped it by
+   accident: it needed `Populate` + `add_subdirectory` for an unrelated glslc reason, and that spelling
+   happens to be the correct one. Both paths now share it.
+3. **`EXCLUDE_FROM_ALL` then excluded the target we wanted** — `ninja: no work to do`, and the install
+   step failed looking for a library nothing had compiled. Introduced by fixing (2); fixed by putting
+   exactly one target back with `set_target_properties(... EXCLUDE_FROM_ALL FALSE)`.
+4. **A soname mismatch, and it fails SILENTLY.** The base wheel ships `libggml-base.so` with no
+   version chain, because P4.8a unset VERSION/SOVERSION when it found a zip cannot carry a symlink and
+   was paying 2.6 MB for three copies of each library. That decision never reached
+   `BackendPackage.cmake`, so the backend built with ggml's defaults and recorded
+   `NEEDED libggml-base.so.0`. Nothing provides that name. The dlopen fails, ggml logs it at a level
+   the binding drops, and **the entire symptom is an accelerator missing from `loom.devices()`** — no
+   error, no warning, no traceback. Found with `ctypes.CDLL` on the shipped file.
+
+Item 4 is the one to carry forward. A backend package has exactly one job, and its failure mode is
+indistinguishable from not having installed it.
+
+##### Verified from a clean venv, on the workstation
+
+```
+   CPU    | Intel(R) Core(TM) Ultra 9 285K
+   CUDA0  | NVIDIA GeForce RTX 5090
+
+cpu     21.19s  ' Paris. The capital of Germany is Berlin. ...'
+CUDA0    1.28s  ' Paris. The capital of Germany is Berlin. ...'
+```
+
+Two wheels, a venv built from nothing, a neutral working directory, character-identical output and
+~16.6x wall clock including load. That is the packaging claim end to end for the first time.
+
+##### Two things left explicitly undone, both real
+
+* **The wheel does not fit PyPI, and stripping cannot help.** Three architectures (`80;89;120`) is
+  **112 MB packed**, against a 100 MB per-file ceiling; the default arch list is far worse at 297 MB.
+  `strip` changes nothing because the payload is `.nv_fatbin` cubins rather than symbols. So the arch
+  set is a release decision with a hard constraint attached, and P4.8c's "a narrow-arch package is a
+  live option" now has numbers: roughly two architectures fit, three do not.
+* **The built library has `RPATH /opt/mamba/envs/py-3.12/lib`** — the build machine's conda prefix, so
+  `libcudart`/`libcublas` resolve from a path no user has. Fine for a local artifact and wrong for a
+  published one, which needs the CUDA runtime bundled (auditwheel) or declared as `nvidia-*` pip
+  dependencies. Not fixed here because it is a CI-shape decision, not a packaging bug.
+
 #### P4.8f — the DL prerequisite was already done, and the gate was green for the wrong reason — DONE (2026-08-14)
 
 P4.8b ends by naming a prerequisite: 109 test files call `ggml_backend_cpu_init()` directly, that
