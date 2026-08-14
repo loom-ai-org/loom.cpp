@@ -5,6 +5,17 @@
 // its own `add_executable` + `add_test`, and a non-zero exit code (any failed LOOM_CHECK) fails the
 // ctest run.
 
+// cpu_backend.h is included for its SIDE EFFECT and not for anything named below, so do not remove it
+// as unused (BACKLOG.md P4.8f). Its `detail::g_backend_loader` registers this build's backend directory
+// before main, which in a GGML_BACKEND_DL build is the difference between a populated registry and an
+// empty one. Every test file includes THIS header -- all 116 of them -- so putting it here is what makes
+// the guarantee unconditional instead of per-file.
+//
+// It was per-file, and that failed in the worst available way: the two device-parity gates did not
+// include it, so under DL they found no GPU and exited 77. ctest renders that as Skipped and the suite
+// as green, which is how a build with Vulkan compiled in reported success while running neither gate.
+#include "cpu_backend.h"
+
 #include <cmath>
 #include <cstdio>
 

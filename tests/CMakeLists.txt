@@ -28,6 +28,18 @@
 # nothing consults it because the backends have already registered themselves.
 add_compile_definitions(LOOM_TEST_BACKEND_DIR="${CMAKE_BINARY_DIR}/bin")
 
+# Was a device backend compiled in? The device-parity gates skip when they find no device, which is
+# right on a CPU-only build and a LIE on a build configured with one -- and a lie that renders as a
+# green ctest run, since exit 77 is Skipped (BACKLOG.md P4.8f). With this defined they fail instead,
+# because "Vulkan is compiled in and the registry has no Vulkan device" is a broken deployment, not an
+# absent GPU.
+#
+# The list is the backends whose devices those gates can compare against, i.e. anything that registers
+# as something other than the CPU. Add a backend here when adding one to the build.
+if(GGML_VULKAN OR GGML_CUDA OR GGML_METAL OR GGML_SYCL OR GGML_HIP OR GGML_OPENCL OR GGML_MUSA OR GGML_CANN OR GGML_OPENVINO OR GGML_HEXAGON)
+    add_compile_definitions(LOOM_TEST_EXPECTS_DEVICE=1)
+endif()
+
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(LOOM_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixtures)
