@@ -7,7 +7,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <memory>
 #include <vector>
@@ -190,7 +190,7 @@ void test_reserve_does_not_break_subsequent_builds(loom::GgufModel& model, ggml_
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/builder_test.gguf";

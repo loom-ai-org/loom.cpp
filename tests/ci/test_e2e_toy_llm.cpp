@@ -8,7 +8,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -38,7 +38,7 @@ std::vector<float> read_f32_binary(const std::string& path) {
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string gguf_path = std::string(LOOM_TEST_FIXTURE_DIR) + "/toy_llm.gguf";

@@ -17,6 +17,17 @@
 # documents still work and still win when set -- see `support/fixtures.h` -- because pointing one test
 # at one file you just rebuilt is exactly what you do while working on it.
 
+# Where a GGML_BACKEND_DL build keeps its backend .so files, for `support/cpu_backend.h`.
+#
+# In such a build the registry starts EMPTY -- the CPU is a plugin too -- and ggml's own search covers
+# the executable's directory and the current directory, neither of which is right here: the test
+# binaries land in `tests/` and ggml puts its backends in `bin/`. So every test is told the directory
+# explicitly, through the engine's own `loom::add_backend_search_path`.
+#
+# A directory-scope definition rather than 129 per-target ones, and harmless in a linked build, where
+# nothing consults it because the backends have already registered themselves.
+add_compile_definitions(LOOM_TEST_BACKEND_DIR="${CMAKE_BINARY_DIR}/bin")
+
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(LOOM_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixtures)

@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -88,7 +88,7 @@ int main() {
     // no reindexing needed (unlike the "mu" TextEncoder OUTPUT comparison in
     // test_e2e_matcha_text_encoder.cpp, which reindexes because it's comparing two DIFFERENT tensors'
     // layouts, not feeding one directly as another's input).
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/matcha_decoder.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

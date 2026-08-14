@@ -29,7 +29,7 @@
 #include "loom/loom.h"
 #include "loom/core/conv_state_cache.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -62,7 +62,7 @@ const Case kCases[] = {
 };
 
 bool run_gguf_case(const std::string& gguf_path) {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     auto model = loom::GgufModel::load(gguf_path, backend.get());

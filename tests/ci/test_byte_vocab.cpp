@@ -8,10 +8,10 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/byte_vocab_test.gguf";

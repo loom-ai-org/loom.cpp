@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -139,7 +139,7 @@ int main() {
     LOOM_CHECK(T_out == 2 * T);
     LOOM_CHECK(static_cast<uint32_t>(n_shape[0]) == T_out);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     // en is (640,T) row-major (channels outer, T inner) -- same "ggml ne=[a,b] <-> numpy (b,a)" rule as

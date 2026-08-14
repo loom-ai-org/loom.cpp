@@ -37,7 +37,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -128,7 +128,7 @@ int main() {
         path_exists(ref_dir + "/ref_mil_prev_raw.npy")
             ? read_npy<int32_t>(ref_dir + "/ref_mil_prev_raw.npy", prev_shape) : std::vector<int32_t>{};
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_path, backend.get());
     LOOM_CHECK(model != nullptr);

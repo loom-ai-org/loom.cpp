@@ -16,7 +16,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 namespace {
 
@@ -34,7 +34,7 @@ std::vector<int32_t> ids_of(const std::string& s) {
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     auto load = [&backend](const char* name) {

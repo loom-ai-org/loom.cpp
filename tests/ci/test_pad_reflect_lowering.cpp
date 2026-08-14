@@ -22,7 +22,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstring>
@@ -91,7 +91,7 @@ size_t bit_differences(const PadCase& c, ggml_backend_t backend, std::vector<flo
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     // --- The composition IS reflect padding, stated independently of both implementations -------------

@@ -19,7 +19,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -78,7 +78,7 @@ int main() {
     LOOM_CHECK(stl_emb.size() == 8 * 16);
     LOOM_CHECK(expected.size() == 1);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_env, backend.get());
     LOOM_CHECK(model != nullptr);

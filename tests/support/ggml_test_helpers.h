@@ -7,7 +7,7 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpp.h>
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <vector>
 
@@ -20,7 +20,7 @@ struct GgmlScratch {
     ggml_gallocr_ptr galloc;
 
     explicit GgmlScratch(size_t mem_size = 16 * 1024 * 1024)
-        : backend_owned(ggml_backend_cpu_init()),
+        : backend_owned(loom_test::cpu_backend()),
           backend(backend_owned.get()),
           ctx(ggml_init(ggml_init_params{mem_size, nullptr, /*no_alloc=*/true})),
           galloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))) {}

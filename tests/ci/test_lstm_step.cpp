@@ -8,7 +8,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -53,7 +53,7 @@ int main() {
     const std::string dir = LOOM_TEST_FIXTURE_DIR;
     const std::string ref_dir = LOOM_TEST_REF_DIR;
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::vector<float> x = read_f32_binary(ref_dir + "/x.bin");
