@@ -1,12 +1,14 @@
 # Third-party dependencies, pulled via FetchContent so no submodules/vendored copies are needed.
 include(FetchContent)
 
-# ggml: the tensor library / graph runtime this engine is built on.
-# Pinned to v0.16.0 (commit 524f974bb21a1013408f76d71c15732482c0c3fe) for reproducible builds.
+# ggml: the tensor library / graph runtime this engine is built on. The revision is pinned in its own
+# file because an out-of-repo build -- an accelerator package shipping one libggml-<backend>.so -- has
+# to build against exactly this one; see cmake/GgmlPin.cmake.
+include(${CMAKE_CURRENT_LIST_DIR}/GgmlPin.cmake)
 FetchContent_Declare(
     ggml
-    GIT_REPOSITORY https://github.com/ggml-org/ggml.git
-    GIT_TAG        v0.16.0
+    GIT_REPOSITORY ${LOOM_GGML_REPOSITORY}
+    GIT_TAG        ${LOOM_GGML_TAG}
 )
 
 # nlohmann/json: parses the JSON graph-topology definition embedded in GGUF metadata.
