@@ -4447,6 +4447,71 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
+#### P4.9 — the ggml pin, v0.16.0 → v0.19.0 — DONE (2026-08-14)
+
+`cmake/GgmlPin.cmake` held `v0.16.0` (`524f974b`, 2026-07-10). Upstream master `8846b79e` (2026-08-12)
+was **154 commits ahead**. Filed as its own item deliberately: it was discovered while asking whether
+upstream had fixed the NPU device-type question (it had not — P4.8e), and **nothing in the gap changes
+that design**, so tangling a pin bump into that work would have mixed a behavioural change into a
+correctness fix.
+
+**The target is a TAG, not master.** Three tags had shipped since the pin — v0.17.0, v0.18.0/1, v0.19.0
+— and `v0.19.0` (`30bf8685`, tagged 2026-08-07) carries **153 of the 154 commits**, master being one
+commit ahead of it. So the whole gap is available without pinning a moving branch, which the file's own
+convention (a tag plus its commit, so a backend package cannot drift from the base) requires anyway.
+
+What is known about the gap, from reading rather than building:
+
+* **One new backend directory, `ggml-et`** — an accelerator platform requiring a proprietary SDK at
+  `/opt/et` (`aifoundry-utils`), with a `GGML_ET_SYSEMU` mode that runs against an emulator instead of
+  hardware. It returns `GGML_BACKEND_DEVICE_TYPE_GPU`, which is the third data point in P4.8e's
+  argument. Unbuildable here; listed so the next backend survey does not rediscover it.
+* **The device-type enum is byte-identical**, comments included, so `primary_rank` needs nothing.
+* Not surveyed: op coverage changes, which is the part that could matter to P4.7d's support matrix and
+  to the two remaining splits in the zoo (`ATAN`, Whisper's 400-wide reflect pad).
+
+##### The result: nothing moved, to every digit
+
+Baselines were captured on the old pin first, because the thing to detect here does not fail a test —
+a backend kernel that stops claiming an op raises the split count and only shows up as lost speed.
+
+| | `ci` | `gate` | conformer | causal_lm_kv |
+|---|---|---|---|---|
+| CPU (dev box) | 58/58 | 82/82, 8 ran | — | — |
+| Vulkan (dev box) | 58/58 | 82/82 | 2104 / 0, **1 split**, rel 3.520e-03, rms 4.292e-02 | **1 split**, 2034 / 0 |
+| CUDA (workstation) | 58/58 | 82/82 | 2104 / 0, **1 split**, rel 3.492e-03, rms 4.188e-02 | **1 split**, 2034 / 0 |
+
+Every one of those equals its pre-bump baseline exactly — same max delta, same element index `[9147]`,
+same rms, same node and split counts, on both backends. That is stronger than "no regression": the
+kernels compute **bit-identically** across 153 commits, so nothing changed a reduction order or a
+kernel selection underneath us. The build itself was the other half of the evidence and passed
+silently: no API breakage in the engine, no new warning from any file this repo owns.
+
+**What this does NOT cover, since "82 tests" overstates the reach.** Only **8** gate tests actually
+run: `v4` holds GGUFs, and most gate tests want PyTorch reference directories that are not in it. So
+the zoo-wide split comparison this item asked for is really two models on two backends. The breadth
+claim rests on the build and the ci suite; the numerical claim is narrow and should be quoted as such.
+
+**`ggml-et`, the one new backend directory, was not built** — it needs a proprietary SDK at `/opt/et`.
+It is read about in P4.8e, where its unconditional `GGML_BACKEND_DEVICE_TYPE_GPU` is the third data
+point in that argument.
+
+##### A build trap that cost a wasted cycle, and it is about this LAN rather than about ggml
+
+The first CUDA rebuild died with `ninja: error: manifest 'build.ninja' still dirty after 100 tries,
+perhaps system time is not set`. The cause is that **the workstation's clock is ~290 s behind the dev
+box**, and `rsync -a` preserves mtimes — so every synced file lands with an mtime in the workstation's
+*future*. Editing `GgmlPin.cmake` made CMake re-run, and ninja then regenerated `build.ninja` in a loop
+because its input was permanently newer than its output.
+
+Same root cause as the stale-`.o` trap recorded in P4.8e, from the opposite direction. **The rule for
+this LAN: `touch` the tree on the workstation after every rsync**, before building.
+
+A second, unrelated self-inflicted wound worth naming because it hid the first: `pgrep -f "cmake
+--build build-cuda"` run over ssh **matches its own shell**, whose command line contains the pattern.
+It reported "still building" for a build that had already failed. Bracket the pattern (`[c]make`), or
+watch the log for a terminal marker rather than watching for a process.
+
 #### P4.8 — more backends, without ending the lean engine — SCOPED 2026-08-13; a/b/c/d/e done, NPU open
 
 P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
