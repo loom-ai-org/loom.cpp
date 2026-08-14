@@ -4633,6 +4633,44 @@ it is the most used, it is in tier 1, and `tests/gate/test_e2e_device_parity{,_k
 against "the first non-CPU device" and would run against it unmodified. That test passing on a second
 backend is the evidence that the device layer generalizes; until then, it is a claim.
 
+##### That machine now exists, and its toolchain is ready (2026-08-14)
+
+The condition above is met. A **workstation on the LAN** (`ssh 192.168.1.100`, passwordless from the
+dev box) carries an **RTX 5090** (32 GB, driver 580.105.08) *and* an **Intel NPU** (Arrow Lake,
+`intel_vpu`, `/dev/accel/accel0`), on 24 cores against this dev box's 4 — so a full suite build drops
+from 20–40 minutes to a few, which is reason enough to build there for ordinary work and not only for
+CUDA.
+
+Toolchain, installed and verified into `/opt/mamba/envs/py-3.12` (micromamba; note the envs are in
+`/opt/mamba/envs`, not `~/micromamba/envs`): **CUDA 12.8**, CMake 4.4.2, Ninja 1.13.2.
+`nvcc -arch=sm_120` compiles — 12.6, which was there before, answers `Value 'sm_120' is not defined`,
+because Blackwell needs 12.8+. Build with `-DCMAKE_CUDA_ARCHITECTURES=120`: it is the only GPU there,
+and a multi-arch build is larger for nothing.
+
+Three things worth knowing before spending time on them:
+
+* **Invoke through `micromamba run -p ...`, always.** Conda's `cuda-nvcc` ships an activation script
+  setting `NVCC_PREPEND_FLAGS=-ccbin=<env>/bin/x86_64-conda-linux-gnu-c++`, which points nvcc at the
+  env's own gcc 12.4. Calling nvcc by absolute path skips it, picks up the system gcc 14.2, and fails
+  with "gcc versions later than 13 are not supported" — a false alarm that looks like a broken
+  toolchain.
+* **`/home` there is 98% full (~34 GB).** micromamba's package cache is `/home/flavio/.conda/pkgs`, on
+  that filesystem, even though the envs live on `/` — so installs eat the tight one. `micromamba
+  clean -t` reclaims tarballs safely. The `v4` fixture set is 13 GB; copy only the GGUFs a given gate
+  needs rather than the tree.
+* **CMake 4 turned out to be fine.** `nlohmann_json` declares `cmake_minimum_required(VERSION
+  3.1...3.14)` and CMake 4 removed <3.5 compatibility, but the range's upper bound governs policy, so
+  it configures. A full build under CMake 4 is still untested; `cmake=3.31` or
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` if it misbehaves.
+
+**And the first measurement to take there is not CUDA.** P4.8b's rank 1 — "an accelerator with its own
+memory" — rests on an assumption no hardware has ever tested: that a discrete NPU registers as
+`GGML_BACKEND_DEVICE_TYPE_ACCEL` with a non-host buffer type. The only two devices ever measured are
+BLAS (ACCEL, host memory) and Vulkan (IGPU, device memory). If the NPU reports host memory it belongs
+in rank 2; if it is not ACCEL at all, `Device::open("npu")` never resolves and that spec is dead code.
+`tools/debug/probe_tiers.cpp` answers it in a minute and could send the ranking back to the drawing
+board, so it is worth answering before building anything on top of it.
+
 ##### P4.8a — the packaging half, built and verified (2026-08-14)
 
 The half of P4.8 that needed no hardware is done, and it is the half CUDA blocks on: a CUDA wheel is
