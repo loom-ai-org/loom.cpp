@@ -11,6 +11,7 @@
 // greedy-CTC-decodes the logits, and detokenizes with the model's real SentencePiece vocab.
 
 #include "loom/loom.h"
+#include "loom/core/audio_window.h"
 #include "loom/core/conv_state_cache.h"
 #include "wav_file.h"
 
@@ -197,7 +198,7 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     //     about the decode rather than a word that was spoken.
     //
     // Timestamp markers themselves are NOT dropped: asking for them is the entire point of the flag.
-    const int32_t eos_id = model.kv_i32("tokenizer.ggml.eos_token_id", -1);
+    const int32_t eos_id = loom::audio::default_eos_token(model);
     std::vector<int32_t> control_ids{eos_id};
     if (bpe_vocab) {
         const int32_t no_ts = bpe_vocab->piece_to_id("<|notimestamps|>");
@@ -262,8 +263,10 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // which is what it was trained on and what its encoder's every shape is a constant of). Absent, the
     // sequence length is genuinely dynamic and the whole file goes through in one call, which is the
     // NeMo families' shape.
-    const uint32_t clip = model.has_kv("loom.n_samples") ? model.hparam_u32("n_samples") : 0;
-    constexpr uint32_t kMaxNewTokensPerClip = 224; // half of Whisper's 448-token context, its own convention
+    const uint32_t clip = loom::audio::fixed_clip_samples(model);
+    // Both from the engine now rather than spelled here (loom/core/audio_window.h): loom-py's binding
+    // needs the identical three facts, and the second copy is what turned them into a shared header.
+    const uint32_t max_new_tokens_per_clip = loom::audio::default_max_new_tokens(model);
 
     if (clip == 0) {
         const std::vector<double> waveform_d(waveform.begin(), waveform.end());
@@ -313,12 +316,11 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     size_t seek = 0;
     while (seek < waveform.size()) {
         const size_t avail = std::min(static_cast<size_t>(clip), waveform.size() - seek);
-        std::vector<double> window(clip, 0.0); // zero-padded: Whisper's own pad_or_trim convention
-        for (size_t i = 0; i < avail; ++i) window[i] = waveform[seek + i];
+        const std::vector<double> window = loom::audio::window_at(waveform, seek, clip);
 
         const std::vector<int32_t> ids =
             run_driver(bridge, window, language, task, want_timestamps, prev_tokens,
-                       kMaxNewTokensPerClip, eos_id);
+                       max_new_tokens_per_clip, eos_id);
         const double window_start = static_cast<double>(seek) / (sample_rate ? sample_rate : 16000);
 
         // How far into THIS window the model actually got. `last_complete_end` is the end of the last
