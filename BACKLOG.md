@@ -4447,7 +4447,7 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
-#### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
+#### P4.8 — more backends, without ending the lean engine — SCOPED 2026-08-13; a/b/c done, NPU open
 
 P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
 Vulkan. That was a hardware accident, not a decision. What follows is the shape of the rest — CUDA
@@ -4865,6 +4865,99 @@ is a backend where the distinction is visible.
 Worth noting for the NPU work specifically: BLAS is a usable local proxy for the ACCEL *selection*
 path, and is nothing at all as a proxy for NPU throughput. No performance number should ever be taken
 from it.
+
+##### P4.8c — CUDA, on the workstation: the tier-1 claim stops being a claim (2026-08-14)
+
+The scoping above says of every backend ggml ships that **"the engine needs no work"**, and that the
+honest first step was "CUDA on a box that has an NVIDIA GPU". That step is taken, on the RTX 5090
+workstation, and it is worth being blunt about what was and was not done: **not one line of C++ was
+written or changed.** The tree was rsynced across, configured with two flags, and built.
+
+```sh
+cmake -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+```
+
+438 targets in **~5 minutes** on 24 cores, against the 20–40 the same suite costs on the dev box, with
+no warning from any file this repo owns (the one that appears is upstream's `ggml-cpu/repack.cpp`).
+`ctest -L ci`: **58/58 in 5.45 s** — CUDA compiled in changes nothing hermetic, which is the null
+result that had to be checked before any of the rest meant anything.
+
+One thing to know before repeating it: **ggml rewrites the architecture.** `-DCMAKE_CUDA_ARCHITECTURES=120`
+configures as `120a`, the arch-*specific* Blackwell feature set, and the native variant as `120a-real`.
+That is upstream's doing rather than a typo to correct, and the resulting binary is what the numbers
+below were measured on.
+
+**What the probes say, and the first one is a second sighting of the P4.8b trap.**
+`tools/debug/probe_tiers` on the workstation:
+
+    device     type   buft_is_host   host_buffer
+    CUDA0      GPU    false          true
+    CPU        CPU    true           false
+
+`caps.host_buffer` is **true** for CUDA and `buft_is_host` **false** — exactly the inversion measured on
+Vulkan, now confirmed on an unrelated backend. Had the ranking been built on `caps.host_buffer`, as its
+name invites, CUDA would have ranked as a host-memory accelerator. `probe_selection` resolves
+`"auto"` → `CUDA0` and `"gpu"` → `CUDA0`; `probe_chain npu` throws the intended message. `assists=0`,
+correctly — there is no host-memory accelerator in this build for a discrete primary to attach.
+
+**Both device-parity gates pass against CUDA0, and they ran rather than skipped** (the fixtures were
+copied over; `ctest` reports Skipped for exit 77 and reported Passed):
+
+| | |
+|---|---|
+| `test_e2e_device_parity` (Conformer-CTC) | 2104 device nodes, **0 CPU fallback, 1 split** |
+| | max relative diff **3.492e-03**, 0 argmax disagreements over 17 frames |
+| `test_e2e_device_parity_kv` (Qwen3-0.6B) | 12/12 tokens identical to the CPU's iterated-prefill oracle |
+| | `main_topology`: **1 split**, 2034 device / 0 CPU |
+
+**The 3.492e-03 is the most informative number here, and not because it is small.** That test's header
+argues the tolerance is a property of *this model's front end* — the log-mel's `LOG` amplifying an
+8.3e-5 `CONV_1D` difference, bisected node by node — rather than a measure of how wrong a backend is
+allowed to be. It was measured at 3.4e-3 on RADV/GFX9. A second backend, different vendor, different
+memory system, different reduction order, landing at 3.49e-3 is what turns that argument into evidence.
+If the number had been a Vulkan artefact there is no reason CUDA should agree to two digits.
+
+**Throughput, whole process including load, Qwen3-0.6B, 64 tokens, interleaved:**
+
+| device | runs | |
+|---|---|---|
+| CPU (Core Ultra 9 285K, 24 cores) | 22.50 / 21.67 / 20.85 s | |
+| CUDA0 (RTX 5090) | 1.46 / 1.42 / 1.48 s | **≈ 14.7x** |
+
+Two caveats that keep this honest: it is wall clock for the whole process, so the 2.3 GB weight upload
+is *inside* the CUDA number rather than excluded from it, and the CPU arm is a 24-core desktop part,
+not a weak baseline. The generated text is character-identical on both — 64 greedy tokens agreeing is
+the same amplifier `test_e2e_device_parity_kv` relies on, run longer.
+
+**Sizing, and it corrects the scoping above.** `libggml-cuda.so` stripped, single arch `120a`: **59 MB**,
+against Vulkan's 46.5 MB — so a CUDA deployment is **≈ 62 MB**, and the engine is still 2% of it. The
+scoping predicted CUDA "clears [PyPI's 100 MB ceiling] outright". **For one architecture it does not**,
+which matters for `loom-py-rt-cuda`: the thing that blows the ceiling is the multi-arch fat binary a
+general-purpose wheel ships (sm_75 through sm_120), not CUDA as such. A per-arch or narrow-arch backend
+package is therefore a live option rather than a lost cause, and which arches to carry becomes a real
+decision instead of a foregone one.
+
+##### What P4.8c did NOT establish
+
+Four things, each of which someone could mistake this entry for having covered.
+
+1. **The NPU is still untested, and the hardware being present is why that is worth saying.** The Intel
+   NPU does not appear in this registry at all — no OpenVINO backend was compiled in, so
+   `/dev/accel/accel0` sits there unregistered. Every rank-1 question the scoping raises (does a discrete
+   NPU register as ACCEL with non-host memory?) is exactly as open as it was.
+2. **This is a LINKED build, not a `GGML_BACKEND_DL` one** — so it is not the configuration the wheels
+   ship, and the 109-file prerequisite P4.8b found still stands between the gate suite and that
+   configuration. It should be cleared before a `loom-py-rt-cuda` is trusted.
+3. **Quantized weights on a device remain unverified.** Both fixtures here are F32/F16; the `q8_0` gates
+   run on the CPU. That gap predates CUDA and is untouched by it.
+4. **No `loom-py-rt-cuda` package exists.** `packaging/common/BackendPackage.cmake` is the reusable
+   half (P4.8a) and a CUDA package is that directory with two strings changed, but it has not been
+   built, so the `==`-pin and `$ORIGIN` story is still verified only for Vulkan.
+
+The workstation tree lives at `/home/flavio/loom/loom.cpp` (rsynced, not cloned — see the note in
+P4.8's toolchain section), fixtures at `/home/flavio/loom/fixtures`, and the probes are hand-compiled
+into `/home/flavio/loom/probes` per `tools/debug/README.md`.
 
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 
