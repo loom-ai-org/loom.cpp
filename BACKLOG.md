@@ -5022,16 +5022,97 @@ Qwen3-0.6B on `--device OPENVINO0` with `GGML_OPENVINO_DEVICE=NPU`:
 
 `ggml-decoder.cpp:304`, `extract_layer_from_name`: find `"_l"` anywhere in a tensor's name, take
 everything up to the next space, `std::stoi` it — llama.cpp's `cache_k_l0` convention. It is called
-through `compute_llm_params`, **unconditionally on the whole graph** (`utils.cpp:185`, `:424`), and at
-two call sites via `.value()` on the optional. So a name with `_l` followed by anything non-numeric
-throws, and a graph with no `_l` at all throws differently.
+through `compute_llm_params` (`utils.cpp:185`, `:424`), and at two call sites via `.value()` on the
+optional. So a name with `_l` followed by anything non-numeric throws, and a graph with no `_l` at all
+throws differently.
 
-**`ggml-openvino` is a llama.cpp-shaped backend, not a general ggml one.** It reconstructs a transformer
-from tensor names rather than executing the ggml graph it was handed. Note the trap in that combination:
-`supports_op` is an ordinary per-op table, so the scheduler is told node-by-node that these ops are
-supported, and the execution path then declines to honour it. A backend can advertise op support it
-does not actually provide for an arbitrary graph — which is a second thing `ggml_backend_supports_op`
-cannot be trusted to answer, alongside P4.7e's.
+> **Correction (2026-08-14, same day).** This entry first said `ggml-openvino` "is a llama.cpp-shaped
+> backend, not a general ggml one" that "reconstructs a transformer from tensor names rather than
+> executing the ggml graph it was handed". **That is wrong and unfair to the backend**, and the
+> upstream doc (`llama.cpp/docs/backend/OPENVINO.md`) plus the source say why. It IS a general
+> translator: `openvino/op/` holds 33 per-op translator files, `op_table.cpp` maps 39 GGML ops onto
+> them, and `translate_session.cpp` builds an `ov::Model` through OpenVINO's frontend API — the doc's
+> own words are that it "walks the GGML graph and identifies inputs, outputs, weights, and KV cache
+> tensors" and then "translates the GGML operations into an `ov::Model`". There is even a general
+> escape hatch: `is_naive(cgraph)` sends any graph of **fewer than 20 compute nodes** to
+> `naive_compute`, which never touches the LLM machinery at all.
+>
+> The accurate statement is narrower and more useful: **it is a general translator with a mandatory
+> LLM-shaped parameter-inference step for any graph of 20 nodes or more**, and that step identifies the
+> KV cache and per-layer tensors by parsing llama.cpp's naming. loom's Qwen3 graph is 2202 nodes, so it
+> takes that path and dies there — before op coverage is ever reached. Everything measured above stands;
+> only the explanation of it was overstated.
+
+Note the trap in the combination, stated carefully: `supports_op` is an ordinary per-op table, so the
+scheduler is told node-by-node that these ops are supported — and above the 20-node threshold the
+execution path imposes a further STRUCTURAL precondition that `supports_op` never mentions. It is not
+that the backend declines to honour its own op table; it is that op support is necessary and not
+sufficient, which no part of the device API can express. That is a second limit on what
+`ggml_backend_supports_op` can be trusted to answer, alongside P4.7e's.
+
+##### Forcing the naive path: measured, and it does NOT capture everything
+
+The obvious follow-up to the correction is whether `naive_compute` — the sub-20-node escape hatch that
+skips all LLM machinery — would run loom's graphs if the threshold simply did not stop it. It is a
+one-constant experiment (`naive_graph_size_threshold = 20` → a million, in a build tree, reverted
+after), and the answer is no. **Three distinct barriers, all hit within one afternoon on two models:**
+
+1. **The name parser is reachable from the naive path too**, which was the surprise. `naive_compute`
+   binds inputs through `get_ov_input_tensor` → `try_make_kv_sliced_tensor` → `extract_layer_from_name`
+   (`utils.cpp:743`, `:806`), so the causal-LM still died on `stoi` with the LLM path bypassed entirely.
+   The cause is loom's own naming: `extract_layer_from_name` does an **unanchored** `name.find("_l")`,
+   and **308 of the causal-LM's 316 tensors** are `model_model_layers_0_...`, where `_layers_...` parses
+   as the layer index and throws. Not one loom tensor matches llama.cpp's `_l<digit>` convention.
+2. **`IM2COL` dynamic-dim propagation asserts a stride-1 convolution** (`ggml-decoder.cpp:1529`,
+   `node->src[1]->ne[src_dyn] == node->ne[...]`, i.e. `IW == OW`). Conformer-CTC's convolutional
+   subsampling is strided, so it fails there on the dynamic path.
+3. **On the static/NPU path a different wall**: `broadcast_merge_into` failing inside OpenVINO's own
+   eltwise shape inference — a translation gap rather than a workload assumption.
+
+Barriers 2 and 3 should not be read as defects. Upstream's doc scopes the backend to "a subset of GGML
+ops and **text-only models**"; Conformer-CTC and the whole TTS half of the zoo are outside that scope,
+and hitting walls there is the documented behaviour rather than a surprise.
+
+##### What that leaves, and what it rules out
+
+**Ruled out: porting a forced-naive backend into this repo.** The idea was that naive is a general
+translator held back by a threshold; it is not — it is the small-graph escape hatch, and outside
+text-only models it fails immediately for reasons a threshold does not touch. Vendoring a 250 KB
+actively-developed backend to reach that is the relicensing-and-maintenance decision `Dependencies.cmake`
+exists to avoid, for a path measured not to work.
+
+**Barrier 1 is on OUR side of the fence — so it was removed, to see what was behind it.** The engine
+renamed every graph tensor `_l` → `_L` just before compute (the parser's `find` is case-sensitive, so
+this defeats it and changes nothing else), env-gated, in a build tree, reverted after. Two rounds,
+because the first did not land where it looked:
+
+* **With the rename alone**, `stoi` is gone and the model **translates and compiles** — real progress.
+  It then fails binding an OUTPUT: model `[1,1,5,?]` against loom's `[1,8,5,128]`. A head count of
+  **one**. The forced naive threshold was not in effect, because the dynamic path gates naive on
+  `!is_model_splitted(cgraph)` and loom's graph trips that heuristic — so it was on the LLM path with
+  `compute_llm_params` having recognised no attention pattern and left the head count at its default.
+* **With `is_model_splitted` forced false as well**, genuinely on the naive path, it fails at the very
+  first INPUT: model `[1,8,5,128]` against loom's `[1,5,8,128]`. **Two middle dimensions transposed.**
+
+So the answer to "does it work at all" is no, and the reason is now specific and is neither naming nor
+op coverage: **the backend's shape and layout derivation disagrees with loom's tensors.** loom builds
+attention out of permuted views, and the translator's idea of a parameter's shape is not that view's
+shape. That is a deeper incompatibility than the parse, and it sits in the part of the backend built
+around llama.cpp's graph conventions.
+
+What that settles: **the naming work is not worth doing.** Re-exporting the zoo to dodge an unanchored
+substring search buys a translation that then disagrees about dimension order on input 0. The upstream
+ask stays worth filing and stays two lines — anchor the search, or return `nullopt` on parse failure
+rather than throwing, so a foreign graph gets a clean "unsupported" instead of a `stoi` — but it should
+be filed as a robustness fix, not as something that unblocks loom.
+
+**And on pre-applying the optimizations the naive path lacks** — the idea that if we know what the LLM
+path does, loom can do it first: mostly true, with one exception that matters. Static shapes and KV
+slicing are things loom is unusually well placed to supply, since it already buckets shapes (P4.0.15)
+and owns its own cache. But `naive_compute` calls `core.compile_model()` on **every** `graph_compute`
+with no `decoder_cache`, so a forced-naive decode would recompile a 2200-node OpenVINO model per token.
+That is not a graph optimization that can be applied earlier; it is a caching layer inside the backend,
+and no amount of preparation on loom's side substitutes for it.
 
 ##### What this leaves
 
@@ -5057,12 +5138,14 @@ registration-walled proprietary SDK that cross-builds DSP-side "skel" libraries 
 code-signs them (`HEXAGON_HTP_CERT`). So this is a read of 4351 lines, which is the right cost for the
 question: does the other in-tree NPU backend make P4.8d's mistakes?
 
-**On the charge that matters, it is innocent.** `ggml_backend_hexagon_graph_compute` walks
-`graph->nodes[i]`, remaps each node to an HTP opcode, fuses neighbours where it can, and submits. There
-is **no tensor-name parsing anywhere** — every `->name` is logging, every `atoi` is env-var option
-handling — and the string `llama` does not occur in the file. It executes the graph it is handed,
-whatever shape that graph is. So OpenVINO's model-reconstruction design is that backend's choice, not
-something about NPU backends, and a graph-agnostic NPU backend is clearly writable.
+**On the charge that matters, it is innocent — and note the charge itself was narrowed by the
+correction above.** `ggml_backend_hexagon_graph_compute` walks `graph->nodes[i]`, remaps each node to
+an HTP opcode, fuses neighbours where it can, and submits. There is **no tensor-name parsing anywhere**
+— every `->name` is logging, every `atoi` is env-var option handling — and the string `llama` does not
+occur in the file. It executes the graph it is handed, whatever shape that graph is, with no
+LLM-parameter step and so no node-count threshold above which a structural assumption switches on.
+That is the difference from `ggml-openvino`: not translator versus reconstructor, since both translate,
+but whether anything is assumed about what the graph MEANS.
 
 **On the ranking it makes the same claim, and that is the finding.**
 
