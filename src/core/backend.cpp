@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <tuple>
 #include <utility>
 
 #ifdef __linux__
@@ -220,23 +221,49 @@ std::string kernel_accelerator_list() {
 #endif
 }
 
-// Within a rank, a kernel-confirmed GPU wins. Everything else keeps registration order, which is what
-// a strict `<` on this pair preserves: an unconfirmed device never displaces an earlier unconfirmed
-// one, so the only behaviour this changes is the one it can prove.
-int tie_break(ggml_backend_dev_t dev) {
-    return kernel_confirms_gpu(dev) ? 0 : 1;
+// Within a rank: a kernel-confirmed GPU first, then a discrete one ahead of an integrated one.
+// Everything else keeps registration order, which is what a strict `<` on this key preserves -- two
+// devices that tie on both parts never displace each other, so the only behaviour this changes is the
+// one it can prove.
+//
+// THE SECOND PART EXISTS BECAUSE P4.8e THREW AWAY SOMETHING IT STILL NEEDED. Collapsing the tiers
+// keyed rank on where a device's memory lives and dropped `ggml_backend_dev_type` entirely, which is
+// right for deciding RANKS and wrong for ordering within one. Measured on the workstation with two
+// Vulkan devices present:
+//
+//     Vulkan0  IGPU  buft_is_host=false  0000:00:02.0  0x030000   <- Intel Arrow Lake
+//     Vulkan1  GPU   buft_is_host=false  0000:02:00.0  0x030000   <- RTX 5090
+//
+// Neither existing signal separates them: both are non-host, so the rank ties, and both are PCI class
+// 0x03, so the kernel confirmation ties. Registration order then chose the iGPU -- and `device="gpu"`
+// on that machine ran 8 tokens in the time the 5090 needed for 24 (BACKLOG.md P4.8j).
+//
+// THE ORDER OF THE TWO PARTS IS LOAD-BEARING, and putting the type first would reintroduce the defect
+// the kernel check exists to prevent. `ggml-openvino` reports GPU while driving an NPU or a CPU and
+// supplies no `device_id` (P4.8d), so a type-first key would rank it above a genuine, kernel-confirmed
+// iGPU. Confirmation first sorts it to (1, 0), behind anything the kernel vouches for.
+std::pair<int, int> tie_break(ggml_backend_dev_t dev) {
+    const int confirmed = kernel_confirms_gpu(dev) ? 0 : 1;
+    int kind;
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:  kind = 0; break;
+        case GGML_BACKEND_DEVICE_TYPE_IGPU: kind = 1; break;
+        default:                            kind = 2; break;  // ACCEL, and anything ggml adds later
+    }
+    return {confirmed, kind};
 }
 
 // The best device whose rank falls in [best_allowed, worst_allowed], or null if there is none.
 // `"gpu"` passes a single-rank window; `"auto"` passes all of them.
 ggml_backend_dev_t best_device_in_range(int best_allowed, int worst_allowed) {
     ggml_backend_dev_t best = nullptr;
-    std::pair<int, int> best_key{worst_allowed + 1, 0};
+    std::tuple<int, int, int> best_key{worst_allowed + 1, 0, 0};
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const int rank = primary_rank(dev);
         if (rank < best_allowed || rank > worst_allowed) continue;
-        const std::pair<int, int> key{rank, tie_break(dev)};
+        const std::pair<int, int> tb = tie_break(dev);
+        const std::tuple<int, int, int> key{rank, tb.first, tb.second};
         if (key < best_key) {
             best = dev;
             best_key = key;

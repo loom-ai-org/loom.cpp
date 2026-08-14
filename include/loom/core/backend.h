@@ -156,12 +156,23 @@ public:
     // therefore not distinguishable from a GPU through this API, which is why "npu" throws rather than
     // guessing, and why a caller who knows their machine should name the device.
     //
-    // Ties WITHIN a rank are broken by asking the KERNEL, and only when it can answer: a device that
-    // reports a PCI address (ggml_backend_dev_props::device_id) whose sysfs class is 0x03 is a display
-    // controller and wins. This is a promotion on positive evidence and never a demotion on its
-    // absence -- ggml-metal, ggml-sycl, ggml-opencl, ggml-webgpu and ggml-cann are real GPU backends
-    // that report no address at all, and there is no sysfs off Linux. Where nothing is confirmable,
-    // registration order still decides and a caller with two such devices should name the one it wants.
+    // Ties WITHIN a rank are broken in two steps, in this order:
+    //
+    //   1. Ask the KERNEL, and only when it can answer: a device reporting a PCI address
+    //      (ggml_backend_dev_props::device_id) whose sysfs class is 0x03 is a display controller and
+    //      wins. This is a promotion on positive evidence and never a demotion on its absence --
+    //      ggml-metal, ggml-sycl, ggml-opencl, ggml-webgpu and ggml-cann are real GPU backends that
+    //      report no address at all, and there is no sysfs off Linux.
+    //   2. Then prefer a DISCRETE GPU over an INTEGRATED one, from ggml's own device type. On a
+    //      machine with an iGPU and a discrete card the first step ties -- both are class 0x03 -- and
+    //      registration order was picking the iGPU while the discrete card sat idle (BACKLOG.md P4.8j).
+    //
+    // The kernel check has to come FIRST. A type-first key would rank a backend that merely CLAIMS to
+    // be a GPU -- ggml-openvino does, while driving an NPU or a CPU -- above a genuine iGPU the kernel
+    // has vouched for.
+    //
+    // Where nothing separates two devices, registration order still decides and a caller with two such
+    // devices should name the one it wants.
     //
     // Throws loom::Error on an unresolvable spec or a device that fails to initialize.
     static Device open(const std::string& spec = "");
