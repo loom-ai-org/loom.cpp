@@ -4633,6 +4633,201 @@ it is the most used, it is in tier 1, and `tests/gate/test_e2e_device_parity{,_k
 against "the first non-CPU device" and would run against it unmodified. That test passing on a second
 backend is the evidence that the device layer generalizes; until then, it is a claim.
 
+##### P4.8a — the packaging half, built and verified (2026-08-14)
+
+The half of P4.8 that needed no hardware is done, and it is the half CUDA blocks on: a CUDA wheel is
+impossible until the base wheel is shared, and that reversal has nothing to do with which accelerator
+ships. **`loom-py` now builds with `GGML_BACKEND_DL`**, and the pilot accelerator package exists.
+
+What the engine gained is one function. `ggml`'s own backend search looks in the executable's
+directory and the current directory, and **inside a Python interpreter the executable is `python`** --
+so a DL-built wheel would have found no backends at all, the CPU included, and every device spec
+including `"cpu"` would have failed. `loom::add_backend_search_path()` (`core/backend.h`) is how a host
+says where its backends actually are; host directories are swept before ggml's defaults, and sweeping
+is repeatable rather than once-only because ggml dedupes on the registration pointer. The pre-existing
+`ensure_backends_loaded` became that sweep. `tests/ci/test_device_selection.cpp` gained the invariant
+that matters -- a stale, blank or twice-added path never costs the registry a device.
+
+On the loom-py side the base wheel is shared, `$ORIGIN`-RPATH'd, and ships `libloom_engine.so` plus the
+ggml family beside `_loom.so`; `loom/__init__.py` registers `$LOOM_BACKEND_DIR`, then the package
+directory, then every `loom_rt_*` package on `sys.path` (a directory scan, not an import, so a broken
+accelerator package cannot take the base package down). `packaging/rt-vulkan/` is the pilot, and
+`packaging/common/BackendPackage.cmake` is the part CUDA reuses -- a CUDA package is that directory
+with two strings changed. `cmake/GgmlPin.cmake` is new here: the ggml revision now lives alone in a
+file so a backend package builds against the base's exact revision with **no second copy of the tag to
+drift**, which is the build-side half of the `==` version pin.
+
+**Verified end to end, which was the point.** The old static build's CMake comment recorded a shared
+build producing "an import that fails the moment the wheel leaves this build tree" -- so the test is
+exactly that: a real wheel, a clean venv, a neutral working directory. It imports, finds its backends,
+and runs 49/49 CI tests from site-packages. The CPU arrives as a per-microarchitecture plugin chosen at
+load time (`libggml-cpu-haswell.so` on this Zen+ box), which is the second, unrelated win --
+one artifact stops being compiled for one `-march`.
+
+Two things this turned up that were not in the scoping.
+
+**Going DL made `import loom` print to stderr.** ggml logs each backend it loads at INFO, and a static
+build had nothing to load, so this was new noise introduced by the packaging change rather than
+something the engine always did. The binding now installs a log callback that drops INFO/DEBUG and
+**keeps WARN/ERROR** -- those are the messages explaining a backend that loaded and then found no
+usable device, which is the exact failure `loom.devices()` (also new) exists to make visible.
+
+**A wheel is a zip, and a zip cannot carry a symlink.** ggml's libraries are built with
+VERSION/SOVERSION, so `libggml-base.so -> .so.0 -> .so.0.16.0` materialised as three byte-identical
+copies of an 880 KB library, and `libggml.so` as three more; 2.6 MB of duplication, which the zip's
+per-entry compression turned into 737 KB of wheel (7.79 MB -> 7.06 MB, measured both ways).
+The properties are now unset for the packaged build, which is
+correct on the merits too: a soname exists to let versions coexist for independently built consumers,
+and nothing here is independently built -- the libraries ship in one directory and a backend package
+pins the base with `==` precisely because ggml's ABI will not tolerate the mixing a soname would allow.
+Worth recording the trap: `set_target_properties(... VERSION "")` does NOT clear it. An empty version
+is still a version, the library comes out named `libggml-base.so.` with a trailing dot, and the wheel
+gains a fourth copy instead of losing two. `set_property(TARGET x PROPERTY VERSION)` with no value is
+the spelling that unsets.
+
+##### P4.8b — item 2 is not a preference problem, it is a correctness one (2026-08-14)
+
+The scoping above says that with two accelerators of different kinds `"gpu"` meaning "the first
+GPU/iGPU/accelerator registered" **"stops being a sensible default"**. That understates it, and this is
+now measured rather than reasoned about.
+
+A second offload device turns out to be available on this machine with no new hardware: **`ggml-blas`
+registers as `GGML_BACKEND_DEVICE_TYPE_ACCEL`** (`ggml-blas.cpp:354`) -- the same type an NPU
+registers as, and one of the three `is_offload_device()` already accepts. `-DGGML_BLAS=ON
+-DGGML_BLAS_VENDOR=OpenBLAS` alongside `-DGGML_VULKAN=ON` gives a three-device registry: an iGPU, an
+ACCEL, and a CPU. `test_device_selection` passes 40/40 against it.
+
+What that registry reveals is that **the first offload device is not a stable notion**. Registration
+order differs between link modes, because they are two different orderings in ggml: a linked build
+registers in the `#ifdef` sequence of `ggml_backend_registry`'s constructor (Vulkan at
+`ggml-backend-reg.cpp:125`, BLAS at :155), while a `GGML_BACKEND_DL` build registers in the call
+sequence of `ggml_backend_load_all` (:566), where `blas` is FIRST and `vulkan` is ninth. Built both
+ways from the same source on the same machine:
+
+| spec | linked build | `GGML_BACKEND_DL` build |
+|---|---|---|
+| `"auto"` | `Vulkan0` | **`BLAS`** |
+| `"gpu"` | `Vulkan0` | **`BLAS`** |
+
+Three things follow, and the third is why this is filed as a defect rather than a nicety.
+
+1. **`"gpu"` resolving to BLAS is wrong on its face.** BLAS is not a GPU. The spec exists so that a
+   caller asserting something about the machine gets an error instead of a silent CPU run -- and here
+   it gets neither: it gets a device that is not what was asked for.
+2. **The cost is the accelerator NOT used, not the fallback itself.** BLAS implements roughly
+   `MUL_MAT`/`OUT_PROD`, so nearly every node in a loom graph goes to the CPU -- correctly, via the
+   `{primary, CPU}` pair the engine already builds. That part is cheap and is worth being precise
+   about rather than alarmed by: `ggml_backend_blas_device_get_buffer_type` returns
+   `ggml_backend_cpu_buffer_type()` (`ggml-blas.cpp:380`), so BLAS tensors are ordinary host memory
+   and a BLAS/CPU split moves no data. This is nothing like the 453 splits P4.7 measured on Vulkan,
+   where every boundary was a real device transfer.
+
+   The damage is that the machine's ACTUAL accelerator is silently skipped. On this box that is the
+   difference between the Vulkan iGPU -- 2.74x on Qwen3 after the P4.7a fusion -- and a CPU run with
+   OpenBLAS doing the matmuls, reported to the caller as an accelerator either way.
+3. **DL is what the wheels ship** (P4.8a). So this is not a hypothetical about exotic hardware: any
+   user who installs two accelerator packages gets a different `device="auto"` than the `loom_cli`
+   the behaviour was tested with. A CUDA box that also has OpenBLAS present is the ordinary case.
+
+##### The selection half, FIXED (2026-08-14)
+
+`is_offload_device`/`first_offload_device` are gone, replaced by a **rank over what a device IS**, so
+registration order is no longer an input:
+
+|   | |
+|---|---|
+| 0 | GPU / iGPU |
+| 1 | an accelerator with its own memory -- a discrete NPU |
+| 2 | an accelerator in host memory -- BLAS; possibly an NPU on a UMA SoC |
+| 3 | the CPU |
+
+`"auto"` takes the best rank present and therefore cannot fail. `"gpu"` is rank 0 **only** and throws
+otherwise; `"npu"` (spelled `"accel"` too) is rank 1 only and throws otherwise. The two specs partition
+rather than overlap, which is the actual repair: `"gpu"` can no longer answer with a non-GPU.
+
+**The discrete/host split is what makes rank 1 and 2 different, and it is derived at run time from
+`ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(dev))`** -- no backend names anywhere, which is
+the same principle the device layer already followed. Two traps found while building it, both recorded
+in the code: `ggml_backend_dev_props::caps.host_buffer` is NOT this question (it means "can hand out
+pinned staging buffers", and measures true for Vulkan and false for BLAS -- exactly inverted); and the
+probe is about ADDRESS SPACES, not packaging, so an iGPU on UMA hardware answers false and is treated
+as discrete, correctly, because a split against it still costs a memcpy.
+
+Verified on the three-device DL build, which is the configuration that produced the defect:
+
+```
+registry order: [0] BLAS  [1] Vulkan0  [2] CPU
+"auto" -> Vulkan0    "gpu" -> Vulkan0    "cpu" -> CPU
+```
+
+`test_device_selection` covers it: 38/38 on a CPU-only build, 46/46 on the three-device DL build. The
+load-bearing assertion is that `"auto"` equals what `"gpu"` would have returned whenever a GPU exists
+-- under the old rule it returned BLAS with the GPU sitting right there.
+
+**Still not solved: ties WITHIN a rank.** Two GPUs are separated by registration order, because nothing
+about a machine says CUDA0 should beat Vulkan0. Documented in `backend.h` as "name one".
+
+**Prerequisite discovered, and it is bigger than it looks: the test suite does not build under
+`GGML_BACKEND_DL`.** 109 test files call `ggml_backend_cpu_init()` directly, and that symbol lives in
+the CPU backend, which a DL build dlopens rather than links. Only 5 files go through
+`tests/support/ggml_test_helpers.h`, so this is not one edit. `test_device_selection.cpp` was converted
+(`ggml_backend_dev_init(ggml_backend_dev_by_type(CPU), nullptr)`, which is correct in both link modes)
+because the DL build is the only place the ranking can be tested against the order it defeats. The
+other 108 are a mechanical follow-up, and until they are done **the gate suite cannot run against the
+configuration the wheels ship** -- which is worth fixing before CUDA, since `test_e2e_device_parity` is
+the evidence the device layer generalizes.
+
+##### The chain half, DONE (2026-08-14)
+
+`Backends` holds N. It keeps `primary` and `fallback` exactly as they were -- so the implicit
+`ggml_backend_t` conversion and every existing call site are untouched -- and gains `assists`, the
+backends that sit BETWEEN the primary and the CPU. `schedule_order()` is the single place that knows
+the ordering ggml requires, and `GraphBuilder`'s hardcoded `backends[2]` is gone.
+
+The rule: **a primary with its own memory attaches every host-memory accelerator; nothing else
+attaches anything.** A host-memory primary gets no assist (there is nothing between it and the CPU
+worth having), and a second discrete device is never attached, because ggml has no general
+peer-to-peer path -- a copy between two discrete backends goes through host memory both ways, four
+transfers where falling back to the CPU costs two. An assist that fails to initialize is skipped
+rather than fatal: the graph is correct without it, since the CPU can run everything.
+
+Verified on the three-device DL build:
+
+```
+spec auto -> primary Vulkan0  assists=1  order: Vulkan0 BLAS CPU
+spec gpu  -> primary Vulkan0  assists=1  order: Vulkan0 BLAS CPU
+spec BLAS -> primary BLAS     assists=0  order: BLAS CPU
+spec cpu  -> primary CPU      assists=0  order: CPU
+```
+
+**And it costs nothing where it gains nothing, which is the measurement that mattered.** The worry was
+that a third backend would perturb split planning -- the thing P4.7a-d spent four items driving down.
+Same binary, same models, `--device Vulkan0`, before and after:
+
+| model | splits before | splits after | device / fallback nodes |
+|---|---|---|---|
+| `lfm2_monolithic` | 1 | 1 | 876 / 0 (unchanged) |
+| `lfm2_modular` (aux, prefix) | 1, 1 | 1, 1 | 13 / 0, 2 / 0 (unchanged) |
+| `causal_lm_kv` | 1 | 1 | 2202 / 0 (unchanged) |
+
+Identical, as predicted from BLAS's op set being a subset of every GPU backend's -- it claims nothing
+the GPU had already claimed. The probe above is what makes that a real result rather than a vacuous
+one: it confirms the assist IS in the chain while the numbers stay flat, so this is "costs nothing",
+not "did nothing".
+
+Where it is expected to pay is untested here and honestly so: a primary with thin op coverage and
+large matmuls falling back -- an NPU. That measurement needs the 285K.
+
+**Not done, deliberately:** `LoomLuaBridge::device_report()` still buckets every node as either
+"device" or "fallback" by comparing against the primary's name, so a node that ran on an assist counts
+as fallback. That is not wrong (it did not run on the primary) but it will under-report an assist
+doing useful work, which is exactly the case the NPU measurement will need to see. Fix it when there
+is a backend where the distinction is visible.
+
+Worth noting for the NPU work specifically: BLAS is a usable local proxy for the ACCEL *selection*
+path, and is nothing at all as a proxy for NPU throughput. No performance number should ever be taken
+from it.
+
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 
 The engine, the exporter and a new Python binding are now three repos under
