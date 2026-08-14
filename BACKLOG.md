@@ -4447,6 +4447,51 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
+#### P4.8f — the DL prerequisite was already done, and the gate was green for the wrong reason — DONE (2026-08-14)
+
+P4.8b ends by naming a prerequisite: 109 test files call `ggml_backend_cpu_init()` directly, that
+symbol lives in the CPU backend, a `GGML_BACKEND_DL` build dlopens rather than links it, so **the gate
+suite cannot run against the configuration the wheels ship**. Picking that up as the next task found it
+already finished: commit `3cb5723` converted 112 files through `tests/support/cpu_backend.h`, and the
+P4.8b text was simply never updated to say so. The link half has been fine for a while.
+
+**The run half had not been checked, and it was broken in the worst available way.** Under
+`GGML_BACKEND_DL` the two device-parity gates — the entire evidence that the device layer generalises —
+did not run. They exited 77. ctest renders 77 as **Skipped** and the suite as **green**, so a build
+with Vulkan compiled in reported success while running neither gate. Every earlier "82/82 on the DL
+build" in this ledger, including this session's pin-bump verification, was counting those two as passes
+when they had quietly declined to execute.
+
+The cause is narrow: `cpu_backend.h` registers this build's backend directory before main (that is what
+makes a DL registry non-empty), and the parity gates never included it — they reach the device layer
+through `loom::available_devices()`, not through a CPU backend. So they saw a registry holding only the
+CPU and concluded, reasonably and wrongly, that the machine had no GPU.
+
+##### Two fixes, because one of them only removes the instance
+
+1. **`test_util.h` now includes `cpu_backend.h`.** All 116 test files include `test_util.h`, so
+   registration stops being something a new test can forget. The include is there for a static
+   initialiser rather than for anything it names, which is a standing invitation to delete it as unused,
+   so the comment says so at the point of the include.
+2. **A skip that would be a lie is now a failure.** `tests/CMakeLists.txt` defines
+   `LOOM_TEST_EXPECTS_DEVICE` when any device backend is configured, and with it defined the gates
+   return 1 instead of 77: "a device backend is compiled in and the registry has no device" is a broken
+   deployment, not a machine without a GPU. Fix 1 alone would have left the next such bug silent again.
+
+##### Verified, including that the new failure can actually fire
+
+* Both gates now **Passed** rather than Skipped under `ctest` on the DL build (Vulkan + BLAS + CPU).
+* **The red case was produced on purpose**: moving `libggml-vulkan.so` and `libggml-blas.so` out of
+  `bin/` turns both gates from Passed into `***Failed`, and restoring them turns them back. Without
+  that check this entry would be asserting a guard that had never been observed to do anything.
+* `ci` 58/58 and `gate` 82/82 on the DL build, and the same on the linked CPU build, where
+  `LOOM_TEST_EXPECTS_DEVICE` is undefined and the honest skip still applies.
+
+The lesson is the one `CLAUDE.md` already states and this suite still managed to violate: a gate that
+cannot fail proves nothing, and **exit 77 is the most dangerous return code in the suite** because it
+is indistinguishable from success in the summary line. Any future skip condition should be read as a
+claim about the machine that something ought to be able to contradict.
+
 #### P4.9 — the ggml pin, v0.16.0 → v0.19.0 — DONE (2026-08-14)
 
 `cmake/GgmlPin.cmake` held `v0.16.0` (`524f974b`, 2026-07-10). Upstream master `8846b79e` (2026-08-12)
@@ -4869,6 +4914,9 @@ load-bearing assertion is that `"auto"` equals what `"gpu"` would have returned 
 
 **Still not solved: ties WITHIN a rank.** Two GPUs are separated by registration order, because nothing
 about a machine says CUDA0 should beat Vulkan0. Documented in `backend.h` as "name one".
+
+**[Superseded by P4.8f — the conversion below was completed in `3cb5723`, and the run-time half of this
+warning turned out to be a silent skip rather than a link error.]**
 
 **Prerequisite discovered, and it is bigger than it looks: the test suite does not build under
 `GGML_BACKEND_DL`.** 109 test files call `ggml_backend_cpu_init()` directly, and that symbol lives in
