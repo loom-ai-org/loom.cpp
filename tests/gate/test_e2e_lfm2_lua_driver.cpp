@@ -14,7 +14,7 @@
 
 #include "test_util.h"
 #include "loom/loom.h"
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 #include <cstdio>
 #include <vector>
 
@@ -26,7 +26,7 @@ int main() {
                  "fixture skip, a known-broken-model skip\n");
     return 77;
 #else
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     // Load our newly compiled LFM2 GGUF model

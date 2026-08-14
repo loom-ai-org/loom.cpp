@@ -13,7 +13,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -80,7 +80,7 @@ int main() {
     const std::string dir = dir_env;
     const std::string ref_dir = ref_dir_env;
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     run_one(dir, ref_dir, "block0_d1_causal", /*T=*/12, /*dim=*/512, backend.get());

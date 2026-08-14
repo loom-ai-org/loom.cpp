@@ -9,7 +9,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -83,7 +83,7 @@ int main() {
     LOOM_CHECK(expected_stl.size() == static_cast<size_t>(kStlDim) * kNStyle);
     LOOM_CHECK(expected_txt.size() == static_cast<size_t>(kT) * kTxtDim);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     // --- TTLStyleEncoder alone ---

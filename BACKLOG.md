@@ -4447,7 +4447,392 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
-#### P4.8 — more backends, without ending the lean engine — SCOPED, not started (2026-08-13)
+#### P4.8j — `"gpu"` chose the iGPU over an RTX 5090 — FIXED (2026-08-14)
+
+P4.8e left one thing open and named it: ties WITHIN a rank fall back to registration order, "and a
+caller with two such devices should name the one it wants". Installing the Vulkan wheel on the
+workstation produced the first machine that actually has the tie, and the outcome is worse than the
+wording suggests -- it is not an arbitrary pick between equals, it is reliably the wrong one.
+
+    Vulkan0 | Intel(R) Graphics (ARL)
+    Vulkan1 | NVIDIA GeForce RTX 5090
+
+`auto` and `gpu` both resolved to **Vulkan0**. The cost is legible without reading a device name:
+`Vulkan1` generated 24 tokens in 8.35 s, while `auto` needed roughly 13 s for **eight**.
+
+##### Why neither existing signal separated them
+
+`probe_tiers`, on the two-device Vulkan build:
+
+    device     type   buft_is_host   host_buffer  device_id       kernel says
+    Vulkan0    IGPU   false          true         0000:00:02.0    0x030000  <- display controller
+    Vulkan1    GPU    false          true         0000:02:00.0    0x030000  <- display controller
+
+Both are non-host, so P4.8e's rank ties. Both are PCI class 0x03 -- they are both genuinely display
+controllers -- so P4.8h's kernel confirmation ties too. Registration order then decided, and it put the
+integrated one first.
+
+**The information needed was there and P4.8e had thrown it away.** That entry collapsed the tiers by
+keying rank on where memory lives and dropping `ggml_backend_dev_type` entirely. Right for deciding
+ranks -- the type is what misled rank 1 into existing at all -- and wrong for ordering within one,
+where GPU-versus-IGPU is exactly the distinction wanted.
+
+##### The fix, and why the order of its two parts is load-bearing
+
+The tie-break key becomes a pair: **kernel-confirmed first, discrete-before-integrated second.**
+
+Putting the type first would reintroduce the defect the kernel check exists to prevent. `ggml-openvino`
+reports `GPU` while driving an NPU or a CPU, and supplies no `device_id` (P4.8d) -- so a type-first key
+would rank it above a genuine, kernel-confirmed iGPU. Confirmation first sorts it to `(1, 0)`, behind
+anything the kernel vouches for, and this machine's two GPUs to `(0, 0)` and `(0, 1)`.
+
+That composition is also why the check below matters more than it did last time: a wrong ORDERING of
+the two parts still produces the right answer on this machine, and only goes wrong on a machine that
+also has OpenVINO installed. Getting the observable case right is not evidence that the key is right.
+
+##### Verified on the hardware that exhibits it, including made to fail
+
+The base wheel rebuilt through cibuildwheel and installed with `rt-vulkan` into a clean venv, 16 tokens
+each:
+
+| spec | correct ordering | ordering INVERTED |
+|---|---|---|
+| `auto` | **0.88 s** | 13.01 s |
+| `gpu` | **0.87 s** | 12.47 s |
+| `Vulkan0` (Intel iGPU) | 12.45 s | — |
+| `Vulkan1` (RTX 5090) | 1.11 s | — |
+
+The timings identify the selection without reading a device name, and the inverted build is what makes
+the first column mean something: flipping discrete-and-integrated sends `auto` back to the iGPU, so the
+comparison demonstrably drives the choice rather than agreeing with registration order by coincidence.
+That coincidence is exactly what P4.8h nearly shipped, where `auto -> CUDA0` looked like proof.
+
+**What this did NOT verify, and the entry should not be read as claiming it:** that the two parts are
+in the right ORDER. Both orderings select the 5090 here, because nothing on this machine claims to be a
+GPU without being one. Only a box with OpenVINO installed beside a real iGPU would separate them, and
+there is none. The confirmation-before-type argument stays reasoned from `ggml-openvino` reporting
+`GPU` with no `device_id`, not measured.
+
+#### P4.8i — the runtime comes from NVIDIA's wheels, and the GPU list follows the CPU — DONE (2026-08-14)
+
+P4.8g left two things unfixed and named them: the built library carried an RPATH into the build
+machine's conda prefix, and the architecture set was a release decision. Both are settled, and the
+first one settled the toolkit version rather than the other way round.
+
+##### `nvidia-*-cu13` does not exist, and that chose CUDA 12.9
+
+The plan was to depend on NVIDIA's own runtime wheels rather than bundle `libcublas` — a machine with
+an NVIDIA GPU is not surprised to be asked for NVIDIA's runtime, and bundling it would dwarf a 72 MB
+wheel. Checking the names first turned out to matter:
+
+| package | what is actually on PyPI |
+|---|---|
+| `nvidia-cublas-cu13` | a **1.4 KB placeholder sdist**, version 0.0.1 |
+| `nvidia-cublas-cu12` | a real manylinux wheel, **12.9.2.10** |
+| `nvidia-cuda-runtime-cu12` | a real manylinux wheel, **12.9.79** |
+
+So a CUDA 13 build has no distributable runtime at all. The `cu12` line reaches 12.9 — and **12.9 is
+exactly the minimum for `121a-real`**. That makes 12.9 the only version that gets both DGX Spark
+coverage and a runtime pip can install; 13.1 gets the first and loses the second. P4.8h had reached
+13.1 for the coverage alone, and this reverses that for a reason it could not have seen.
+
+##### The RPATH, and why it is not ctypes preloading
+
+`nvidia-cuda-runtime-cu12` unpacks to `nvidia/cuda_runtime/lib/`, a sibling of `loom_rt_cuda/` in
+site-packages, so `$ORIGIN/../nvidia/cuda_runtime/lib` reaches it with nobody executing anything.
+That property is the point: `loom/__init__.py` finds accelerator packages by SCANNING `sys.path` and
+never imports them, precisely so a broken accelerator cannot take the base package down. torch's
+approach — preloading its CUDA libraries with `ctypes` at import — would require giving that up.
+
+Verified by removing the escape route rather than trusting the ordering. The build still emits conda's
+own `-Wl,-rpath,$PREFIX/lib` ahead of ours (conda's compiler wrappers inject it, and it is absent in a
+manylinux container, which is where CI builds), so the installed library was rewritten with `patchelf`
+to the `$ORIGIN` entries alone before testing:
+
+```
+libcudart.so.12   -> .../loom_rt_cuda/../nvidia/cuda_runtime/lib/libcudart.so.12
+libcublas.so.12   -> .../loom_rt_cuda/../nvidia/cublas/lib/libcublas.so.12
+libcublasLt.so.12 -> .../loom_rt_cuda/../nvidia/cublas/lib/libcublasLt.so.12
+```
+
+and then end to end: `pip install` resolved `nvidia-cublas-cu12 12.9.2.10` and friends, `loom.devices()`
+listed `CUDA0`, and a real model generated correct text in 1.16 s.
+
+**And the repair step needs excludes, or it undoes all of this.** cibuildwheel runs `auditwheel repair`
+by default, whose entire job is to copy external libraries INTO the wheel and repoint RPATHs at its own
+`.libs`. Left alone it would bundle `libcublas.so.12` — cancelling the dependency and adding hundreds
+of megabytes. `libggml-base.so` needs excluding for a different reason: it is genuinely absent at
+repair time, being the base wheel's to ship, and auditwheel treats a library it cannot find as an
+error. Both packages now carry a `repair-wheel-command` saying so.
+
+##### The GPU list follows the CPU architecture
+
+pip already selects by platform tag, so a per-CPU list costs the user nothing and keeps the aarch64
+wheel — going to the most constrained devices — from carrying desktop kernels:
+
+| CPU | real cubins | PTX | why |
+|---|---|---|---|
+| x86_64 | 8.6, 8.9, 12.0a | 7.5, 8.0, 9.0 | RTX 30x/40x/50x. No 12.1a: GB10 is an ARM part |
+| aarch64 | 8.7, 12.1a | 8.0, 9.0 | Orin and DGX Spark. No Ada or RTX 50x board exists on an ARM host |
+
+Orin gets its own `87-real` rather than leaning on 8.6 binary compatibility, because it is a
+first-class target on that side and the wheel has room once the desktop kernels are gone. Measured:
+the x86_64 wheel is **72 MB**, down from 84 MB when it carried `121a` it could never use.
+
+##### Python floor moved to 3.10, and the backends are NOT multiplied by it
+
+3.9 is past EOL. 3.10 stays, and the reason is a target rather than a preference: **JetPack 6 ships
+Ubuntu 22.04, whose system Python is 3.10**, so a 3.11 floor would push Jetson users into a venv before
+they could install anything.
+
+The backend packages are **one wheel per platform, not per interpreter**. They are `py3-none-<platform>`
+because the payload is a plain shared library that ggml dlopens and Python never imports; their
+`build = "cp310-*"` names which interpreter runs the build, not which the wheel serves. Only the base
+wheel, carrying `_loom.so`, needs one build per Python. Worth stating because the natural reading of a
+wheel matrix is that everything multiplies by everything, and here three quarters of that product is
+the same file.
+
+##### Not verified
+
+**The aarch64 arch list has never been compiled.** There is no ARM machine here, so that row of the
+table is a CI-only path — the strings are right in principle and untested in fact.
+
+#### P4.8h — the CUDA wheel fits, and neither lever cost coverage — DONE (2026-08-14)
+
+P4.8g left the CUDA wheel at 112 MB against PyPI's 100 MB per-file ceiling, with the arch set called a
+release decision. It is settled, and the answer is better than the trade it looked like: **88 MB with
+MORE architectures than the version that did not fit.**
+
+| build | toolkit | configuration | wheel |
+|---|---|---|---|
+| A | 12.8 | `80;89;120`, FA on | 112 MB |
+| B | 12.8 | ggml's default list, FA on | 148 MB |
+| C | 12.8 | ggml's default list, **FA off** | 101 MB |
+| D | 13.1 | **no list**, FA off | 135 MB — ten cubin sets, no PTX |
+| **E/F** | **13.1** | **explicit list, FA off** | **88 MB** |
+
+##### Compression was already maximal, which killed the obvious idea first
+
+`nvcc` gained `--compress-mode` in 12.8 and it looked like free savings. It is not available: **ggml
+already sets `GGML_CUDA_COMPRESSION_MODE` to `"size"` by default** and applies it whenever the toolkit
+is 12.8+. The measurement that proved it is worth keeping — build A was byte-identical to the earlier
+wheel, because the flag both failed to reach `nvcc` and would have changed nothing. There is no
+compression lever left.
+
+##### FlashAttention is unreachable code, and it was a third of the binary
+
+`ggml_flash_attn_ext` appears NOWHERE in the engine. The attention primitive builds the composite path
+— `mul_mat` -> `soft_max_ext` -> `mul_mat`, with `mul_mat_set_prec` on the QK product — so nothing loom
+emits can ever dispatch to a FlashAttention kernel. `GGML_CUDA_FA=OFF` removed **47 MB** (148 -> 101)
+with no functional change of any kind.
+
+Revisit the day the engine grows a primitive that emits `FLASH_ATTN_EXT` — scoped, not built. Two
+things that work would need re-checking: the device/CPU parity tolerance, since FA changes reduction
+order and internal precision, and the property that the composite path runs identically on every
+backend.
+
+##### "Take the default" is not portable across toolkits, and D is the proof
+
+ggml chooses its architecture list only `if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)`. **Under CUDA 13
+CMake defines it first**, so ggml's careful list is skipped entirely and every architecture the toolkit
+knows gets a real cubin: ten sets, no PTX at all, 135 MB — *larger* than the 12.8 default it was meant
+to improve on. The list is now explicit in `packaging/rt-cuda/CMakeLists.txt` rather than inherited.
+
+##### What the shipped list covers, and what it drops
+
+Real cubins for **8.6, 8.9, 12.0a, 12.1a** and PTX for **7.5, 8.0, 9.0**:
+
+* RTX 30x (8.6) and Jetson Orin (8.7, by binary compatibility from 8.6);
+* RTX 40x (8.9); RTX 50x (12.0a); DGX Spark (12.1a);
+* Turing, A100 and Hopper JIT from PTX rather than finding nothing.
+
+Dropped deliberately: Maxwell 5.0, Pascal 6.1, Volta 7.0, which CUDA 13 no longer supports. A real
+loss of the cheapest hobby hardware, accepted on the grounds that those cards cannot run current models
+usefully and that tier is better served by Metal on Apple silicon — a different backend package
+entirely, unaffected by any of this.
+
+**12.1a requires CUDA >= 12.9 and there is no 12.x substitute.** ggml rewrites every `12X` to `12Xa`
+because Blackwell's FP4 tensor-core instructions are not forward-compatible and cannot be branched on
+in host code, and an `a` cubin runs only on its exact architecture. So Spark coverage is a toolkit
+version, not a flag.
+
+##### The toolkit upgrade required installing nothing
+
+`py-3.13` on the workstation already carried **CUDA 13.1.0**. The constraint was to leave `py-3.12`'s
+torch/Lightning alone; nothing was installed in either environment, and the invariants were checked
+after: `py-3.12` still reports `2.8.0+cu128 / True` with `nvcc 12.8`, `py-3.13` still `2.9.0+cu130 /
+True`. `~/.local/bin/ninja` supplied the generator, since `py-3.13` has none.
+
+#### P4.8g — `loom-py-rt-cuda`, and what "two strings changed" cost — DONE (2026-08-14)
+
+P4.8a said a second accelerator package would be `packaging/rt-vulkan/` with two strings changed.
+The three files are indeed that small — `CMakeLists.txt` naming `cuda`/`GGML_CUDA`, a `pyproject.toml`
+with the `==` pin, and an `__init__.py` holding nothing importable — and the claim was still wrong,
+because **the pilot had never been built**. `packaging/rt-vulkan/pyproject.toml` declares
+`readme = "README.md"` and no such file exists, so it fails metadata generation before reaching CMake.
+P4.8a's end-to-end verification was of the BASE wheel, which ships its own per-microarchitecture CPU
+plugins and never needed a backend package to prove itself.
+
+So CUDA was the first backend package ever built here, and it found **four defects, every one of them
+in shared code**:
+
+1. **No `README.md`** — `rt-vulkan` has the identical bug.
+2. **`FetchContent_MakeAvailable(ggml)` brought ggml's own `install()` rules into the project.** The
+   first wheel was 297 MB and held `libggml-cuda.so` TWICE — once where this package installs it, once
+   where ggml's rule does — plus a `lib/libggml-base.so` that `BackendPackage.cmake`'s own comment
+   forbids, because two of those on one `sys.path` have no rule about which loads. Vulkan escaped it by
+   accident: it needed `Populate` + `add_subdirectory` for an unrelated glslc reason, and that spelling
+   happens to be the correct one. Both paths now share it.
+3. **`EXCLUDE_FROM_ALL` then excluded the target we wanted** — `ninja: no work to do`, and the install
+   step failed looking for a library nothing had compiled. Introduced by fixing (2); fixed by putting
+   exactly one target back with `set_target_properties(... EXCLUDE_FROM_ALL FALSE)`.
+4. **A soname mismatch, and it fails SILENTLY.** The base wheel ships `libggml-base.so` with no
+   version chain, because P4.8a unset VERSION/SOVERSION when it found a zip cannot carry a symlink and
+   was paying 2.6 MB for three copies of each library. That decision never reached
+   `BackendPackage.cmake`, so the backend built with ggml's defaults and recorded
+   `NEEDED libggml-base.so.0`. Nothing provides that name. The dlopen fails, ggml logs it at a level
+   the binding drops, and **the entire symptom is an accelerator missing from `loom.devices()`** — no
+   error, no warning, no traceback. Found with `ctypes.CDLL` on the shipped file.
+
+Item 4 is the one to carry forward. A backend package has exactly one job, and its failure mode is
+indistinguishable from not having installed it.
+
+##### Verified from a clean venv, on the workstation
+
+```
+   CPU    | Intel(R) Core(TM) Ultra 9 285K
+   CUDA0  | NVIDIA GeForce RTX 5090
+
+cpu     21.19s  ' Paris. The capital of Germany is Berlin. ...'
+CUDA0    1.28s  ' Paris. The capital of Germany is Berlin. ...'
+```
+
+Two wheels, a venv built from nothing, a neutral working directory, character-identical output and
+~16.6x wall clock including load. That is the packaging claim end to end for the first time.
+
+##### Two things left explicitly undone, both real
+
+* **The wheel does not fit PyPI, and stripping cannot help.** Three architectures (`80;89;120`) is
+  **112 MB packed**, against a 100 MB per-file ceiling; the default arch list is far worse at 297 MB.
+  `strip` changes nothing because the payload is `.nv_fatbin` cubins rather than symbols. So the arch
+  set is a release decision with a hard constraint attached, and P4.8c's "a narrow-arch package is a
+  live option" now has numbers: roughly two architectures fit, three do not.
+* **The built library has `RPATH /opt/mamba/envs/py-3.12/lib`** — the build machine's conda prefix, so
+  `libcudart`/`libcublas` resolve from a path no user has. Fine for a local artifact and wrong for a
+  published one, which needs the CUDA runtime bundled (auditwheel) or declared as `nvidia-*` pip
+  dependencies. Not fixed here because it is a CI-shape decision, not a packaging bug.
+
+#### P4.8f — the DL prerequisite was already done, and the gate was green for the wrong reason — DONE (2026-08-14)
+
+P4.8b ends by naming a prerequisite: 109 test files call `ggml_backend_cpu_init()` directly, that
+symbol lives in the CPU backend, a `GGML_BACKEND_DL` build dlopens rather than links it, so **the gate
+suite cannot run against the configuration the wheels ship**. Picking that up as the next task found it
+already finished: commit `3cb5723` converted 112 files through `tests/support/cpu_backend.h`, and the
+P4.8b text was simply never updated to say so. The link half has been fine for a while.
+
+**The run half had not been checked, and it was broken in the worst available way.** Under
+`GGML_BACKEND_DL` the two device-parity gates — the entire evidence that the device layer generalises —
+did not run. They exited 77. ctest renders 77 as **Skipped** and the suite as **green**, so a build
+with Vulkan compiled in reported success while running neither gate. Every earlier "82/82 on the DL
+build" in this ledger, including this session's pin-bump verification, was counting those two as passes
+when they had quietly declined to execute.
+
+The cause is narrow: `cpu_backend.h` registers this build's backend directory before main (that is what
+makes a DL registry non-empty), and the parity gates never included it — they reach the device layer
+through `loom::available_devices()`, not through a CPU backend. So they saw a registry holding only the
+CPU and concluded, reasonably and wrongly, that the machine had no GPU.
+
+##### Two fixes, because one of them only removes the instance
+
+1. **`test_util.h` now includes `cpu_backend.h`.** All 116 test files include `test_util.h`, so
+   registration stops being something a new test can forget. The include is there for a static
+   initialiser rather than for anything it names, which is a standing invitation to delete it as unused,
+   so the comment says so at the point of the include.
+2. **A skip that would be a lie is now a failure.** `tests/CMakeLists.txt` defines
+   `LOOM_TEST_EXPECTS_DEVICE` when any device backend is configured, and with it defined the gates
+   return 1 instead of 77: "a device backend is compiled in and the registry has no device" is a broken
+   deployment, not a machine without a GPU. Fix 1 alone would have left the next such bug silent again.
+
+##### Verified, including that the new failure can actually fire
+
+* Both gates now **Passed** rather than Skipped under `ctest` on the DL build (Vulkan + BLAS + CPU).
+* **The red case was produced on purpose**: moving `libggml-vulkan.so` and `libggml-blas.so` out of
+  `bin/` turns both gates from Passed into `***Failed`, and restoring them turns them back. Without
+  that check this entry would be asserting a guard that had never been observed to do anything.
+* `ci` 58/58 and `gate` 82/82 on the DL build, and the same on the linked CPU build, where
+  `LOOM_TEST_EXPECTS_DEVICE` is undefined and the honest skip still applies.
+
+The lesson is the one `CLAUDE.md` already states and this suite still managed to violate: a gate that
+cannot fail proves nothing, and **exit 77 is the most dangerous return code in the suite** because it
+is indistinguishable from success in the summary line. Any future skip condition should be read as a
+claim about the machine that something ought to be able to contradict.
+
+#### P4.9 — the ggml pin, v0.16.0 → v0.19.0 — DONE (2026-08-14)
+
+`cmake/GgmlPin.cmake` held `v0.16.0` (`524f974b`, 2026-07-10). Upstream master `8846b79e` (2026-08-12)
+was **154 commits ahead**. Filed as its own item deliberately: it was discovered while asking whether
+upstream had fixed the NPU device-type question (it had not — P4.8e), and **nothing in the gap changes
+that design**, so tangling a pin bump into that work would have mixed a behavioural change into a
+correctness fix.
+
+**The target is a TAG, not master.** Three tags had shipped since the pin — v0.17.0, v0.18.0/1, v0.19.0
+— and `v0.19.0` (`30bf8685`, tagged 2026-08-07) carries **153 of the 154 commits**, master being one
+commit ahead of it. So the whole gap is available without pinning a moving branch, which the file's own
+convention (a tag plus its commit, so a backend package cannot drift from the base) requires anyway.
+
+What is known about the gap, from reading rather than building:
+
+* **One new backend directory, `ggml-et`** — an accelerator platform requiring a proprietary SDK at
+  `/opt/et` (`aifoundry-utils`), with a `GGML_ET_SYSEMU` mode that runs against an emulator instead of
+  hardware. It returns `GGML_BACKEND_DEVICE_TYPE_GPU`, which is the third data point in P4.8e's
+  argument. Unbuildable here; listed so the next backend survey does not rediscover it.
+* **The device-type enum is byte-identical**, comments included, so `primary_rank` needs nothing.
+* Not surveyed: op coverage changes, which is the part that could matter to P4.7d's support matrix and
+  to the two remaining splits in the zoo (`ATAN`, Whisper's 400-wide reflect pad).
+
+##### The result: nothing moved, to every digit
+
+Baselines were captured on the old pin first, because the thing to detect here does not fail a test —
+a backend kernel that stops claiming an op raises the split count and only shows up as lost speed.
+
+| | `ci` | `gate` | conformer | causal_lm_kv |
+|---|---|---|---|---|
+| CPU (dev box) | 58/58 | 82/82, 8 ran | — | — |
+| Vulkan (dev box) | 58/58 | 82/82 | 2104 / 0, **1 split**, rel 3.520e-03, rms 4.292e-02 | **1 split**, 2034 / 0 |
+| CUDA (workstation) | 58/58 | 82/82 | 2104 / 0, **1 split**, rel 3.492e-03, rms 4.188e-02 | **1 split**, 2034 / 0 |
+
+Every one of those equals its pre-bump baseline exactly — same max delta, same element index `[9147]`,
+same rms, same node and split counts, on both backends. That is stronger than "no regression": the
+kernels compute **bit-identically** across 153 commits, so nothing changed a reduction order or a
+kernel selection underneath us. The build itself was the other half of the evidence and passed
+silently: no API breakage in the engine, no new warning from any file this repo owns.
+
+**What this does NOT cover, since "82 tests" overstates the reach.** Only **8** gate tests actually
+run: `v4` holds GGUFs, and most gate tests want PyTorch reference directories that are not in it. So
+the zoo-wide split comparison this item asked for is really two models on two backends. The breadth
+claim rests on the build and the ci suite; the numerical claim is narrow and should be quoted as such.
+
+**`ggml-et`, the one new backend directory, was not built** — it needs a proprietary SDK at `/opt/et`.
+It is read about in P4.8e, where its unconditional `GGML_BACKEND_DEVICE_TYPE_GPU` is the third data
+point in that argument.
+
+##### A build trap that cost a wasted cycle, and it is about this LAN rather than about ggml
+
+The first CUDA rebuild died with `ninja: error: manifest 'build.ninja' still dirty after 100 tries,
+perhaps system time is not set`. The cause is that **the workstation's clock is ~290 s behind the dev
+box**, and `rsync -a` preserves mtimes — so every synced file lands with an mtime in the workstation's
+*future*. Editing `GgmlPin.cmake` made CMake re-run, and ninja then regenerated `build.ninja` in a loop
+because its input was permanently newer than its output.
+
+Same root cause as the stale-`.o` trap recorded in P4.8e, from the opposite direction. **The rule for
+this LAN: `touch` the tree on the workstation after every rsync**, before building.
+
+A second, unrelated self-inflicted wound worth naming because it hid the first: `pgrep -f "cmake
+--build build-cuda"` run over ssh **matches its own shell**, whose command line contains the pattern.
+It reported "still building" for a build that had already failed. Bracket the pattern (`[c]make`), or
+watch the log for a terminal marker rather than watching for a process.
+
+#### P4.8 — more backends, without ending the lean engine — SCOPED 2026-08-13; a/b/c/d/e done, NPU open
 
 P4.7 got the engine onto a GPU and stopped at the one device this machine has: an AMD iGPU through
 Vulkan. That was a hardware accident, not a decision. What follows is the shape of the rest — CUDA
@@ -4538,12 +4923,90 @@ distinct manylinux variant rather than a flag.
 PyPI wheel tags encode architecture and libc but have **no accelerator dimension**, so an accelerator
 has to be expressed as either a package-name suffix (torch's `cu121` shape — a full wheel per
 accelerator, which is the combinatorial matrix) or as something loaded at run time. `GGML_BACKEND_DL`
-makes the second possible: **one arch-tagged base wheel, plus small `loom-py-backend-*` packages that
+makes the second possible: **one arch-tagged base wheel, plus small `loom-py-rt-<backend>` packages that
 drop a `.so` where ggml looks.** `pip install loom-py-rt[cuda]` then means "also fetch that backend",
 `Model(..., device="auto")` finds it, and a Raspberry Pi installs nothing extra and gets the CPU
-variants it already had. That is the option worth costing first, and the reason to prefer it is not
-elegance — it is that the matrix version multiplies every future backend by every existing platform,
-and this one adds a row.
+variants it already had.
+
+**The sizes make this a constraint rather than a preference**, which is the part that was argued from
+combinatorics before it was measured. Release builds, stripped, on this machine:
+
+| | |
+|---|---|
+| `libloom_engine.so` | **1.2 MB** |
+| `libggml-base.so` + `libggml-cpu.so` | 1.7 MB |
+| a CPU-only deployment | **≈ 3 MB** |
+| `libggml-vulkan.so` | **46.5 MB**, of which 44 MB is `.rodata` — 1785 compiled SPIR-V shaders |
+| the same deployment with Vulkan | **≈ 50 MB** |
+
+Two things follow. First, **compiling backends in never threatens the leanness this repo means by the
+word**: `CLAUDE.md`'s leanness is about CODE — per-model complexity belongs in the exporter — and
+`libloom_engine.so` is byte-identical whether ggml ships one backend or nine. It is 3% of a Vulkan
+deployment. What grows is the ARTIFACT, and every byte of that growth is somebody else's precompiled
+kernels. Second, ~50 MB sits against PyPI's 100 MB default per-file ceiling before anything else is
+added, and CUDA — whose fat binaries carry cubins per SM architecture — clears it outright (not measured
+here; the mechanism is well known and is why torch hosts `cu121` off-index). A wheel matrix is therefore
+not merely inelegant, it does not fit.
+
+##### The backend packages are arch-specific too
+
+A backend package ships native code, so the combinatorics do not vanish — they **factor**. The base is
+`arch × os`; a backend is `arch × os × backend`. The artifact COUNT is comparable; what changes is that
+each artifact is 1–50 MB rather than a full duplicate of everything, each builds independently, and a
+new backend does not force a re-release of the base wheel on every platform.
+
+And the practical matrix is far sparser than the cross product, because most backends exist on one or
+two architectures at all:
+
+| backend | worth building for |
+|---|---|
+| Vulkan | x86-64, aarch64 — the broadest |
+| CUDA | x86-64, aarch64 (Jetson/Grace) |
+| Metal | arm64 macOS only |
+| Hexagon / QNN | aarch64 |
+| RKNPU2 | aarch64 |
+| OpenVINO | x86-64 |
+
+Roughly nine backend wheels, not backends times every platform. **No tag abuse is involved**: the
+package NAME carries the accelerator dimension and the wheel TAG carries architecture, which is what
+each was designed for, and `pip` resolves the right arch itself.
+
+##### Extras compose, and one of them should be allowed to fail
+
+`pip install "loom-py-rt[hub,vulkan]"` is ordinary PEP 508 and works. But the two extras are different
+in kind and the difference is worth being deliberate about rather than discovering:
+
+* `[hub]` is a pure-Python feature toggle (`huggingface_hub`) — architecture-independent, always
+  resolvable, additive.
+* `[vulkan]` is a hardware toggle — native, architecture-specific, and **may not exist for the
+  platform at all**.
+
+Which decides one case: `pip install loom-py-rt[metal]` on Linux. There is no Metal wheel for manylinux,
+so pip fails to resolve it. The alternative — environment markers, so `[metal]` quietly resolves to
+nothing off macOS — lets the install succeed and hands back no Metal.
+
+**Take the loud failure.** It is the same decision `Device::open("gpu")` already makes in raising rather
+than falling back to the CPU (P4.7): a caller who spelled out the accelerator is asserting something
+about the machine, and finding out at install time beats finding out from an unexplained performance
+number later. Install-time loudness matching run-time loudness.
+
+Two corollaries: there should be **no `[all]` extra** — that is the wheel matrix wearing a hat — and
+`[vulkan,cuda]` together is legitimate, because with `GGML_BACKEND_DL` the registry picks at run time.
+
+##### Two costs to price before adopting any of this
+
+1. **The base wheel has to go SHARED, reversing a deliberate decision.** `GGML_BACKEND_DL` refuses to
+   configure without `BUILD_SHARED_LIBS=ON`, and loom-py currently forces it OFF on purpose: `_loom.so`
+   statically folds in the engine and ggml so that its only external dependencies are
+   libc/libstdc++/libgomp/libm. Its CMakeLists comment explains why — a shared build "produces an import
+   that fails the moment the wheel leaves this build tree". The answer is `$ORIGIN` RPATH with
+   `libggml-*.so` shipped beside `_loom.so`, which is routine wheel practice (auditwheel does exactly
+   this), but that comment records a real failure and needs rewriting with the new reason rather than
+   deleting.
+2. **Backend packages need an exact `==` pin on the base version.** A backend `.so` links
+   `libggml-base.so.0`, and ggml offers no ABI guarantee across versions — so any loom-py release that
+   bumps its ggml pin invalidates every previously published backend wheel. A compatible-release range
+   would silently pair mismatched libraries.
 
 Either way the *engine* side is the same work, which is why this is one item and not two.
 
@@ -4554,6 +5017,673 @@ directory"; none of it is "we ran it". The honest first step is CUDA on a box th
 it is the most used, it is in tier 1, and `tests/gate/test_e2e_device_parity{,_kv}.cpp` are written
 against "the first non-CPU device" and would run against it unmodified. That test passing on a second
 backend is the evidence that the device layer generalizes; until then, it is a claim.
+
+##### That machine now exists, and its toolchain is ready (2026-08-14)
+
+The condition above is met. A **workstation on the LAN** (`ssh 192.168.1.100`, passwordless from the
+dev box) carries an **RTX 5090** (32 GB, driver 580.105.08) *and* an **Intel NPU** (Arrow Lake,
+`intel_vpu`, `/dev/accel/accel0`), on 24 cores against this dev box's 4 — so a full suite build drops
+from 20–40 minutes to a few, which is reason enough to build there for ordinary work and not only for
+CUDA.
+
+Toolchain, installed and verified into `/opt/mamba/envs/py-3.12` (micromamba; note the envs are in
+`/opt/mamba/envs`, not `~/micromamba/envs`): **CUDA 12.8**, CMake 4.4.2, Ninja 1.13.2.
+`nvcc -arch=sm_120` compiles — 12.6, which was there before, answers `Value 'sm_120' is not defined`,
+because Blackwell needs 12.8+. Build with `-DCMAKE_CUDA_ARCHITECTURES=120`: it is the only GPU there,
+and a multi-arch build is larger for nothing.
+
+Three things worth knowing before spending time on them:
+
+* **Invoke through `micromamba run -p ...`, always.** Conda's `cuda-nvcc` ships an activation script
+  setting `NVCC_PREPEND_FLAGS=-ccbin=<env>/bin/x86_64-conda-linux-gnu-c++`, which points nvcc at the
+  env's own gcc 12.4. Calling nvcc by absolute path skips it, picks up the system gcc 14.2, and fails
+  with "gcc versions later than 13 are not supported" — a false alarm that looks like a broken
+  toolchain.
+* **`/home` there is 98% full (~34 GB).** micromamba's package cache is `/home/flavio/.conda/pkgs`, on
+  that filesystem, even though the envs live on `/` — so installs eat the tight one. `micromamba
+  clean -t` reclaims tarballs safely. The `v4` fixture set is 13 GB; copy only the GGUFs a given gate
+  needs rather than the tree.
+* **CMake 4 turned out to be fine.** `nlohmann_json` declares `cmake_minimum_required(VERSION
+  3.1...3.14)` and CMake 4 removed <3.5 compatibility, but the range's upper bound governs policy, so
+  it configures. A full build under CMake 4 is still untested; `cmake=3.31` or
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` if it misbehaves.
+
+**And the first measurement to take there is not CUDA.** P4.8b's rank 1 — "an accelerator with its own
+memory" — rests on an assumption no hardware has ever tested: that a discrete NPU registers as
+`GGML_BACKEND_DEVICE_TYPE_ACCEL` with a non-host buffer type. The only two devices ever measured are
+BLAS (ACCEL, host memory) and Vulkan (IGPU, device memory). If the NPU reports host memory it belongs
+in rank 2; if it is not ACCEL at all, `Device::open("npu")` never resolves and that spec is dead code.
+`tools/debug/probe_tiers.cpp` answers it in a minute and could send the ranking back to the drawing
+board, so it is worth answering before building anything on top of it.
+
+##### P4.8a — the packaging half, built and verified (2026-08-14)
+
+The half of P4.8 that needed no hardware is done, and it is the half CUDA blocks on: a CUDA wheel is
+impossible until the base wheel is shared, and that reversal has nothing to do with which accelerator
+ships. **`loom-py` now builds with `GGML_BACKEND_DL`**, and the pilot accelerator package exists.
+
+What the engine gained is one function. `ggml`'s own backend search looks in the executable's
+directory and the current directory, and **inside a Python interpreter the executable is `python`** --
+so a DL-built wheel would have found no backends at all, the CPU included, and every device spec
+including `"cpu"` would have failed. `loom::add_backend_search_path()` (`core/backend.h`) is how a host
+says where its backends actually are; host directories are swept before ggml's defaults, and sweeping
+is repeatable rather than once-only because ggml dedupes on the registration pointer. The pre-existing
+`ensure_backends_loaded` became that sweep. `tests/ci/test_device_selection.cpp` gained the invariant
+that matters -- a stale, blank or twice-added path never costs the registry a device.
+
+On the loom-py side the base wheel is shared, `$ORIGIN`-RPATH'd, and ships `libloom_engine.so` plus the
+ggml family beside `_loom.so`; `loom/__init__.py` registers `$LOOM_BACKEND_DIR`, then the package
+directory, then every `loom_rt_*` package on `sys.path` (a directory scan, not an import, so a broken
+accelerator package cannot take the base package down). `packaging/rt-vulkan/` is the pilot, and
+`packaging/common/BackendPackage.cmake` is the part CUDA reuses -- a CUDA package is that directory
+with two strings changed. `cmake/GgmlPin.cmake` is new here: the ggml revision now lives alone in a
+file so a backend package builds against the base's exact revision with **no second copy of the tag to
+drift**, which is the build-side half of the `==` version pin.
+
+**Verified end to end, which was the point.** The old static build's CMake comment recorded a shared
+build producing "an import that fails the moment the wheel leaves this build tree" -- so the test is
+exactly that: a real wheel, a clean venv, a neutral working directory. It imports, finds its backends,
+and runs 49/49 CI tests from site-packages. The CPU arrives as a per-microarchitecture plugin chosen at
+load time (`libggml-cpu-haswell.so` on this Zen+ box), which is the second, unrelated win --
+one artifact stops being compiled for one `-march`.
+
+Two things this turned up that were not in the scoping.
+
+**Going DL made `import loom` print to stderr.** ggml logs each backend it loads at INFO, and a static
+build had nothing to load, so this was new noise introduced by the packaging change rather than
+something the engine always did. The binding now installs a log callback that drops INFO/DEBUG and
+**keeps WARN/ERROR** -- those are the messages explaining a backend that loaded and then found no
+usable device, which is the exact failure `loom.devices()` (also new) exists to make visible.
+
+**A wheel is a zip, and a zip cannot carry a symlink.** ggml's libraries are built with
+VERSION/SOVERSION, so `libggml-base.so -> .so.0 -> .so.0.16.0` materialised as three byte-identical
+copies of an 880 KB library, and `libggml.so` as three more; 2.6 MB of duplication, which the zip's
+per-entry compression turned into 737 KB of wheel (7.79 MB -> 7.06 MB, measured both ways).
+The properties are now unset for the packaged build, which is
+correct on the merits too: a soname exists to let versions coexist for independently built consumers,
+and nothing here is independently built -- the libraries ship in one directory and a backend package
+pins the base with `==` precisely because ggml's ABI will not tolerate the mixing a soname would allow.
+Worth recording the trap: `set_target_properties(... VERSION "")` does NOT clear it. An empty version
+is still a version, the library comes out named `libggml-base.so.` with a trailing dot, and the wheel
+gains a fourth copy instead of losing two. `set_property(TARGET x PROPERTY VERSION)` with no value is
+the spelling that unsets.
+
+##### P4.8b — item 2 is not a preference problem, it is a correctness one (2026-08-14)
+
+The scoping above says that with two accelerators of different kinds `"gpu"` meaning "the first
+GPU/iGPU/accelerator registered" **"stops being a sensible default"**. That understates it, and this is
+now measured rather than reasoned about.
+
+A second offload device turns out to be available on this machine with no new hardware: **`ggml-blas`
+registers as `GGML_BACKEND_DEVICE_TYPE_ACCEL`** (`ggml-blas.cpp:354`) -- the same type an NPU
+registers as, and one of the three `is_offload_device()` already accepts. `-DGGML_BLAS=ON
+-DGGML_BLAS_VENDOR=OpenBLAS` alongside `-DGGML_VULKAN=ON` gives a three-device registry: an iGPU, an
+ACCEL, and a CPU. `test_device_selection` passes 40/40 against it.
+
+What that registry reveals is that **the first offload device is not a stable notion**. Registration
+order differs between link modes, because they are two different orderings in ggml: a linked build
+registers in the `#ifdef` sequence of `ggml_backend_registry`'s constructor (Vulkan at
+`ggml-backend-reg.cpp:125`, BLAS at :155), while a `GGML_BACKEND_DL` build registers in the call
+sequence of `ggml_backend_load_all` (:566), where `blas` is FIRST and `vulkan` is ninth. Built both
+ways from the same source on the same machine:
+
+| spec | linked build | `GGML_BACKEND_DL` build |
+|---|---|---|
+| `"auto"` | `Vulkan0` | **`BLAS`** |
+| `"gpu"` | `Vulkan0` | **`BLAS`** |
+
+Three things follow, and the third is why this is filed as a defect rather than a nicety.
+
+1. **`"gpu"` resolving to BLAS is wrong on its face.** BLAS is not a GPU. The spec exists so that a
+   caller asserting something about the machine gets an error instead of a silent CPU run -- and here
+   it gets neither: it gets a device that is not what was asked for.
+2. **The cost is the accelerator NOT used, not the fallback itself.** BLAS implements roughly
+   `MUL_MAT`/`OUT_PROD`, so nearly every node in a loom graph goes to the CPU -- correctly, via the
+   `{primary, CPU}` pair the engine already builds. That part is cheap and is worth being precise
+   about rather than alarmed by: `ggml_backend_blas_device_get_buffer_type` returns
+   `ggml_backend_cpu_buffer_type()` (`ggml-blas.cpp:380`), so BLAS tensors are ordinary host memory
+   and a BLAS/CPU split moves no data. This is nothing like the 453 splits P4.7 measured on Vulkan,
+   where every boundary was a real device transfer.
+
+   The damage is that the machine's ACTUAL accelerator is silently skipped. On this box that is the
+   difference between the Vulkan iGPU -- 2.74x on Qwen3 after the P4.7a fusion -- and a CPU run with
+   OpenBLAS doing the matmuls, reported to the caller as an accelerator either way.
+3. **DL is what the wheels ship** (P4.8a). So this is not a hypothetical about exotic hardware: any
+   user who installs two accelerator packages gets a different `device="auto"` than the `loom_cli`
+   the behaviour was tested with. A CUDA box that also has OpenBLAS present is the ordinary case.
+
+##### The selection half, FIXED (2026-08-14)
+
+`is_offload_device`/`first_offload_device` are gone, replaced by a **rank over what a device IS**, so
+registration order is no longer an input:
+
+|   | |
+|---|---|
+| 0 | GPU / iGPU |
+| 1 | an accelerator with its own memory -- a discrete NPU |
+| 2 | an accelerator in host memory -- BLAS; possibly an NPU on a UMA SoC |
+| 3 | the CPU |
+
+`"auto"` takes the best rank present and therefore cannot fail. `"gpu"` is rank 0 **only** and throws
+otherwise; `"npu"` (spelled `"accel"` too) is rank 1 only and throws otherwise. The two specs partition
+rather than overlap, which is the actual repair: `"gpu"` can no longer answer with a non-GPU.
+
+**The discrete/host split is what makes rank 1 and 2 different, and it is derived at run time from
+`ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(dev))`** -- no backend names anywhere, which is
+the same principle the device layer already followed. Two traps found while building it, both recorded
+in the code: `ggml_backend_dev_props::caps.host_buffer` is NOT this question (it means "can hand out
+pinned staging buffers", and measures true for Vulkan and false for BLAS -- exactly inverted); and the
+probe is about ADDRESS SPACES, not packaging, so an iGPU on UMA hardware answers false and is treated
+as discrete, correctly, because a split against it still costs a memcpy.
+
+Verified on the three-device DL build, which is the configuration that produced the defect:
+
+```
+registry order: [0] BLAS  [1] Vulkan0  [2] CPU
+"auto" -> Vulkan0    "gpu" -> Vulkan0    "cpu" -> CPU
+```
+
+`test_device_selection` covers it: 38/38 on a CPU-only build, 46/46 on the three-device DL build. The
+load-bearing assertion is that `"auto"` equals what `"gpu"` would have returned whenever a GPU exists
+-- under the old rule it returned BLAS with the GPU sitting right there.
+
+**Still not solved: ties WITHIN a rank.** Two GPUs are separated by registration order, because nothing
+about a machine says CUDA0 should beat Vulkan0. Documented in `backend.h` as "name one".
+
+**[Superseded by P4.8f — the conversion below was completed in `3cb5723`, and the run-time half of this
+warning turned out to be a silent skip rather than a link error.]**
+
+**Prerequisite discovered, and it is bigger than it looks: the test suite does not build under
+`GGML_BACKEND_DL`.** 109 test files call `ggml_backend_cpu_init()` directly, and that symbol lives in
+the CPU backend, which a DL build dlopens rather than links. Only 5 files go through
+`tests/support/ggml_test_helpers.h`, so this is not one edit. `test_device_selection.cpp` was converted
+(`ggml_backend_dev_init(ggml_backend_dev_by_type(CPU), nullptr)`, which is correct in both link modes)
+because the DL build is the only place the ranking can be tested against the order it defeats. The
+other 108 are a mechanical follow-up, and until they are done **the gate suite cannot run against the
+configuration the wheels ship** -- which is worth fixing before CUDA, since `test_e2e_device_parity` is
+the evidence the device layer generalizes.
+
+##### The chain half, DONE (2026-08-14)
+
+`Backends` holds N. It keeps `primary` and `fallback` exactly as they were -- so the implicit
+`ggml_backend_t` conversion and every existing call site are untouched -- and gains `assists`, the
+backends that sit BETWEEN the primary and the CPU. `schedule_order()` is the single place that knows
+the ordering ggml requires, and `GraphBuilder`'s hardcoded `backends[2]` is gone.
+
+The rule: **a primary with its own memory attaches every host-memory accelerator; nothing else
+attaches anything.** A host-memory primary gets no assist (there is nothing between it and the CPU
+worth having), and a second discrete device is never attached, because ggml has no general
+peer-to-peer path -- a copy between two discrete backends goes through host memory both ways, four
+transfers where falling back to the CPU costs two. An assist that fails to initialize is skipped
+rather than fatal: the graph is correct without it, since the CPU can run everything.
+
+Verified on the three-device DL build:
+
+```
+spec auto -> primary Vulkan0  assists=1  order: Vulkan0 BLAS CPU
+spec gpu  -> primary Vulkan0  assists=1  order: Vulkan0 BLAS CPU
+spec BLAS -> primary BLAS     assists=0  order: BLAS CPU
+spec cpu  -> primary CPU      assists=0  order: CPU
+```
+
+**And it costs nothing where it gains nothing, which is the measurement that mattered.** The worry was
+that a third backend would perturb split planning -- the thing P4.7a-d spent four items driving down.
+Same binary, same models, `--device Vulkan0`, before and after:
+
+| model | splits before | splits after | device / fallback nodes |
+|---|---|---|---|
+| `lfm2_monolithic` | 1 | 1 | 876 / 0 (unchanged) |
+| `lfm2_modular` (aux, prefix) | 1, 1 | 1, 1 | 13 / 0, 2 / 0 (unchanged) |
+| `causal_lm_kv` | 1 | 1 | 2202 / 0 (unchanged) |
+
+Identical, as predicted from BLAS's op set being a subset of every GPU backend's -- it claims nothing
+the GPU had already claimed. The probe above is what makes that a real result rather than a vacuous
+one: it confirms the assist IS in the chain while the numbers stay flat, so this is "costs nothing",
+not "did nothing".
+
+Where it is expected to pay is untested here and honestly so: a primary with thin op coverage and
+large matmuls falling back -- an NPU. That measurement needs the 285K.
+
+**Not done, deliberately:** `LoomLuaBridge::device_report()` still buckets every node as either
+"device" or "fallback" by comparing against the primary's name, so a node that ran on an assist counts
+as fallback. That is not wrong (it did not run on the primary) but it will under-report an assist
+doing useful work, which is exactly the case the NPU measurement will need to see. Fix it when there
+is a backend where the distinction is visible.
+
+Worth noting for the NPU work specifically: BLAS is a usable local proxy for the ACCEL *selection*
+path, and is nothing at all as a proxy for NPU throughput. No performance number should ever be taken
+from it.
+
+##### P4.8c — CUDA, on the workstation: the tier-1 claim stops being a claim (2026-08-14)
+
+The scoping above says of every backend ggml ships that **"the engine needs no work"**, and that the
+honest first step was "CUDA on a box that has an NVIDIA GPU". That step is taken, on the RTX 5090
+workstation, and it is worth being blunt about what was and was not done: **not one line of C++ was
+written or changed.** The tree was rsynced across, configured with two flags, and built.
+
+```sh
+cmake -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+```
+
+438 targets in **~5 minutes** on 24 cores, against the 20–40 the same suite costs on the dev box, with
+no warning from any file this repo owns (the one that appears is upstream's `ggml-cpu/repack.cpp`).
+`ctest -L ci`: **58/58 in 5.45 s** — CUDA compiled in changes nothing hermetic, which is the null
+result that had to be checked before any of the rest meant anything.
+
+One thing to know before repeating it: **ggml rewrites the architecture.** `-DCMAKE_CUDA_ARCHITECTURES=120`
+configures as `120a`, the arch-*specific* Blackwell feature set, and the native variant as `120a-real`.
+That is upstream's doing rather than a typo to correct, and the resulting binary is what the numbers
+below were measured on.
+
+**What the probes say, and the first one is a second sighting of the P4.8b trap.**
+`tools/debug/probe_tiers` on the workstation:
+
+    device     type   buft_is_host   host_buffer
+    CUDA0      GPU    false          true
+    CPU        CPU    true           false
+
+`caps.host_buffer` is **true** for CUDA and `buft_is_host` **false** — exactly the inversion measured on
+Vulkan, now confirmed on an unrelated backend. Had the ranking been built on `caps.host_buffer`, as its
+name invites, CUDA would have ranked as a host-memory accelerator. `probe_selection` resolves
+`"auto"` → `CUDA0` and `"gpu"` → `CUDA0`; `probe_chain npu` throws the intended message. `assists=0`,
+correctly — there is no host-memory accelerator in this build for a discrete primary to attach.
+
+**Both device-parity gates pass against CUDA0, and they ran rather than skipped** (the fixtures were
+copied over; `ctest` reports Skipped for exit 77 and reported Passed):
+
+| | |
+|---|---|
+| `test_e2e_device_parity` (Conformer-CTC) | 2104 device nodes, **0 CPU fallback, 1 split** |
+| | max relative diff **3.492e-03**, 0 argmax disagreements over 17 frames |
+| `test_e2e_device_parity_kv` (Qwen3-0.6B) | 12/12 tokens identical to the CPU's iterated-prefill oracle |
+| | `main_topology`: **1 split**, 2034 device / 0 CPU |
+
+**The 3.492e-03 is the most informative number here, and not because it is small.** That test's header
+argues the tolerance is a property of *this model's front end* — the log-mel's `LOG` amplifying an
+8.3e-5 `CONV_1D` difference, bisected node by node — rather than a measure of how wrong a backend is
+allowed to be. It was measured at 3.4e-3 on RADV/GFX9. A second backend, different vendor, different
+memory system, different reduction order, landing at 3.49e-3 is what turns that argument into evidence.
+If the number had been a Vulkan artefact there is no reason CUDA should agree to two digits.
+
+**Throughput, whole process including load, Qwen3-0.6B, 64 tokens, interleaved:**
+
+| device | runs | |
+|---|---|---|
+| CPU (Core Ultra 9 285K, 24 cores) | 22.50 / 21.67 / 20.85 s | |
+| CUDA0 (RTX 5090) | 1.46 / 1.42 / 1.48 s | **≈ 14.7x** |
+
+Two caveats that keep this honest: it is wall clock for the whole process, so the 2.3 GB weight upload
+is *inside* the CUDA number rather than excluded from it, and the CPU arm is a 24-core desktop part,
+not a weak baseline. The generated text is character-identical on both — 64 greedy tokens agreeing is
+the same amplifier `test_e2e_device_parity_kv` relies on, run longer.
+
+**Sizing, and it corrects the scoping above.** `libggml-cuda.so` stripped, single arch `120a`: **59 MB**,
+against Vulkan's 46.5 MB — so a CUDA deployment is **≈ 62 MB**, and the engine is still 2% of it. The
+scoping predicted CUDA "clears [PyPI's 100 MB ceiling] outright". **For one architecture it does not**,
+which matters for `loom-py-rt-cuda`: the thing that blows the ceiling is the multi-arch fat binary a
+general-purpose wheel ships (sm_75 through sm_120), not CUDA as such. A per-arch or narrow-arch backend
+package is therefore a live option rather than a lost cause, and which arches to carry becomes a real
+decision instead of a foregone one.
+
+##### What P4.8c did NOT establish
+
+Four things, each of which someone could mistake this entry for having covered.
+
+1. **The NPU is still untested, and the hardware being present is why that is worth saying.** The Intel
+   NPU does not appear in this registry at all — no OpenVINO backend was compiled in, so
+   `/dev/accel/accel0` sits there unregistered. Every rank-1 question the scoping raises (does a discrete
+   NPU register as ACCEL with non-host memory?) is exactly as open as it was.
+2. **This is a LINKED build, not a `GGML_BACKEND_DL` one** — so it is not the configuration the wheels
+   ship, and the 109-file prerequisite P4.8b found still stands between the gate suite and that
+   configuration. It should be cleared before a `loom-py-rt-cuda` is trusted.
+3. **Quantized weights on a device remain unverified.** Both fixtures here are F32/F16; the `q8_0` gates
+   run on the CPU. That gap predates CUDA and is untouched by it.
+4. **No `loom-py-rt-cuda` package exists.** `packaging/common/BackendPackage.cmake` is the reusable
+   half (P4.8a) and a CUDA package is that directory with two strings changed, but it has not been
+   built, so the `==`-pin and `$ORIGIN` story is still verified only for Vulkan.
+
+The workstation tree lives at `/home/flavio/loom/loom.cpp` (rsynced, not cloned — see the note in
+P4.8's toolchain section), fixtures at `/home/flavio/loom/fixtures`, and the probes are hand-compiled
+into `/home/flavio/loom/probes` per `tools/debug/README.md`.
+
+##### P4.8d — the NPU answers, and the answer invalidates rank 1 (2026-08-14)
+
+`tools/debug/README.md` names the first question to point a probe at: **does a discrete NPU register as
+`GGML_BACKEND_DEVICE_TYPE_ACCEL` with a non-host buffer type?** — the assumption rank 1 rests on, which
+no hardware had ever tested. The Intel NPU in the workstation now answers it, and it is the branch the
+scoping listed as the bad one: **it is not ACCEL at all**, so `Device::open("npu")` never resolves and
+that spec is dead code. Not because of the hardware — because of the backend.
+
+##### Getting there, which is nearly root-free and worth writing down
+
+* **`pip install openvino` is the whole toolkit install.** The 2026.3.0 wheel ships
+  `OpenVINOConfig.cmake` *and* `libopenvino_intel_npu_plugin.so`, so `-DOpenVINO_DIR=<site-packages>/openvino/cmake`
+  is all `ggml-openvino/CMakeLists.txt`'s `find_package(OpenVINO REQUIRED)` needs. No apt, no archive.
+* **The build dies on `CL/cl2.hpp` and it is not obvious why.** OpenVINO's `intel_gpu/ocl/ocl_wrapper.hpp`
+  includes the *deprecated* OpenCL C++ bindings, which `opencl-headers` does not carry. conda-forge's
+  `clhpp` is the missing piece; `ocl-icd` + `opencl-headers` alone configure fine and then fail to compile.
+* **The NPU user-mode driver needs no root either.** `intel/linux-npu-driver` v1.35.0 ships `.deb`s;
+  `dpkg -x` into a prefix and `ZE_ENABLE_ALT_DRIVERS=<prefix>/…/libze_intel_npu.so.1` is enough for the
+  system's `libze_loader` (1.20.6) to find it. The firmware was already in `/lib/firmware/intel/vpu`.
+* **One thing does need root, and it is the whole blocker:** `/dev/accel/accel0` is `root:render` 0660.
+  Without the `render` group the driver says `Failed to detect any VPU device` and OpenVINO reports
+  `['CPU']` — which looks exactly like a machine with no NPU. `sudo usermod -aG render <user>`, then a
+  fresh login. After it: `['CPU', 'NPU']`, `NPU -> Intel(R) AI Boost`.
+
+##### What the probes measure, with the NPU genuinely engaged
+
+    OpenVINO: using device NPU
+    device     type   buft_is_host   host_buffer
+    OPENVINO0  GPU    false          false
+    CPU        CPU    true           false
+
+    "auto" -> OPENVINO0    "gpu" -> OPENVINO0
+    "npu"  -> throws: no NPU/accelerator device with its own memory is available
+
+**Every one of those rows is byte-identical to the run where the backend targeted the CPU.** That is the
+finding, and it is worse than P4.8b's BLAS defect rather than another instance of it:
+
+1. **`ggml_backend_openvino_device_get_type` returns `GGML_BACKEND_DEVICE_TYPE_GPU` unconditionally**
+   (`ggml-openvino.cpp:751`), and the device buffer type leaves `.is_host` null, so it reads as discrete
+   memory. The backend reports the family it belongs to, not the device it drives.
+2. **Which hardware it actually drives is an environment variable the engine never sees.**
+   `GGML_OPENVINO_DEVICE` defaults to `"CPU"`; asking for one that is absent prints
+   `device NPU is not available, fallback to CPU` and carries on, registry entry unchanged. So `"gpu"`
+   can resolve to a backend executing on the CPU, and **no registry property distinguishes the three
+   cases**. BLAS at least declared ACCEL, which is what let a rank partition exclude it. There is no
+   analogous repair here: a ranking cannot correct a backend that misreports its own type.
+3. **`"npu"` throws on the one machine in this project with a real NPU, actively in use.** Not a
+   hypothetical about exotic hardware — the exact configuration the spec was written for.
+
+The WARN is visible at all only because P4.8a's log callback keeps WARN/ERROR while dropping INFO. This
+is precisely the failure that decision was made for, arriving sooner than expected.
+
+##### And then it does not run the graph at all, for a reason op coverage never predicted
+
+P4.8's item 3 warns that **"a first NPU benchmark will not measure the NPU; it will measure how much of
+the graph fell back"**, and points at P4.7d's support matrix. That worry was aimed at the wrong thing.
+Qwen3-0.6B on `--device OPENVINO0` with `GGML_OPENVINO_DEVICE=NPU`:
+
+    GGML OpenVINO backend std::exception: stoi
+    error: GraphBuilder::compute: the graph failed to run on OPENVINO (ggml_status -1)
+
+`ggml-decoder.cpp:304`, `extract_layer_from_name`: find `"_l"` anywhere in a tensor's name, take
+everything up to the next space, `std::stoi` it — llama.cpp's `cache_k_l0` convention. It is called
+through `compute_llm_params` (`utils.cpp:185`, `:424`), and at two call sites via `.value()` on the
+optional. So a name with `_l` followed by anything non-numeric throws, and a graph with no `_l` at all
+throws differently.
+
+> **Correction (2026-08-14, same day).** This entry first said `ggml-openvino` "is a llama.cpp-shaped
+> backend, not a general ggml one" that "reconstructs a transformer from tensor names rather than
+> executing the ggml graph it was handed". **That is wrong and unfair to the backend**, and the
+> upstream doc (`llama.cpp/docs/backend/OPENVINO.md`) plus the source say why. It IS a general
+> translator: `openvino/op/` holds 33 per-op translator files, `op_table.cpp` maps 39 GGML ops onto
+> them, and `translate_session.cpp` builds an `ov::Model` through OpenVINO's frontend API — the doc's
+> own words are that it "walks the GGML graph and identifies inputs, outputs, weights, and KV cache
+> tensors" and then "translates the GGML operations into an `ov::Model`". There is even a general
+> escape hatch: `is_naive(cgraph)` sends any graph of **fewer than 20 compute nodes** to
+> `naive_compute`, which never touches the LLM machinery at all.
+>
+> The accurate statement is narrower and more useful: **it is a general translator with a mandatory
+> LLM-shaped parameter-inference step for any graph of 20 nodes or more**, and that step identifies the
+> KV cache and per-layer tensors by parsing llama.cpp's naming. loom's Qwen3 graph is 2202 nodes, so it
+> takes that path and dies there — before op coverage is ever reached. Everything measured above stands;
+> only the explanation of it was overstated.
+
+Note the trap in the combination, stated carefully: `supports_op` is an ordinary per-op table, so the
+scheduler is told node-by-node that these ops are supported — and above the 20-node threshold the
+execution path imposes a further STRUCTURAL precondition that `supports_op` never mentions. It is not
+that the backend declines to honour its own op table; it is that op support is necessary and not
+sufficient, which no part of the device API can express. That is a second limit on what
+`ggml_backend_supports_op` can be trusted to answer, alongside P4.7e's.
+
+##### Forcing the naive path: measured, and it does NOT capture everything
+
+The obvious follow-up to the correction is whether `naive_compute` — the sub-20-node escape hatch that
+skips all LLM machinery — would run loom's graphs if the threshold simply did not stop it. It is a
+one-constant experiment (`naive_graph_size_threshold = 20` → a million, in a build tree, reverted
+after), and the answer is no. **Three distinct barriers, all hit within one afternoon on two models:**
+
+1. **The name parser is reachable from the naive path too**, which was the surprise. `naive_compute`
+   binds inputs through `get_ov_input_tensor` → `try_make_kv_sliced_tensor` → `extract_layer_from_name`
+   (`utils.cpp:743`, `:806`), so the causal-LM still died on `stoi` with the LLM path bypassed entirely.
+   The cause is loom's own naming: `extract_layer_from_name` does an **unanchored** `name.find("_l")`,
+   and **308 of the causal-LM's 316 tensors** are `model_model_layers_0_...`, where `_layers_...` parses
+   as the layer index and throws. Not one loom tensor matches llama.cpp's `_l<digit>` convention.
+2. **`IM2COL` dynamic-dim propagation asserts a stride-1 convolution** (`ggml-decoder.cpp:1529`,
+   `node->src[1]->ne[src_dyn] == node->ne[...]`, i.e. `IW == OW`). Conformer-CTC's convolutional
+   subsampling is strided, so it fails there on the dynamic path.
+3. **On the static/NPU path a different wall**: `broadcast_merge_into` failing inside OpenVINO's own
+   eltwise shape inference — a translation gap rather than a workload assumption.
+
+Barriers 2 and 3 should not be read as defects. Upstream's doc scopes the backend to "a subset of GGML
+ops and **text-only models**"; Conformer-CTC and the whole TTS half of the zoo are outside that scope,
+and hitting walls there is the documented behaviour rather than a surprise.
+
+##### What that leaves, and what it rules out
+
+**Ruled out: porting a forced-naive backend into this repo.** The idea was that naive is a general
+translator held back by a threshold; it is not — it is the small-graph escape hatch, and outside
+text-only models it fails immediately for reasons a threshold does not touch. Vendoring a 250 KB
+actively-developed backend to reach that is the relicensing-and-maintenance decision `Dependencies.cmake`
+exists to avoid, for a path measured not to work.
+
+**Barrier 1 is on OUR side of the fence — so it was removed, to see what was behind it.** The engine
+renamed every graph tensor `_l` → `_L` just before compute (the parser's `find` is case-sensitive, so
+this defeats it and changes nothing else), env-gated, in a build tree, reverted after. Two rounds,
+because the first did not land where it looked:
+
+* **With the rename alone**, `stoi` is gone and the model **translates and compiles** — real progress.
+  It then fails binding an OUTPUT: model `[1,1,5,?]` against loom's `[1,8,5,128]`. A head count of
+  **one**. The forced naive threshold was not in effect, because the dynamic path gates naive on
+  `!is_model_splitted(cgraph)` and loom's graph trips that heuristic — so it was on the LLM path with
+  `compute_llm_params` having recognised no attention pattern and left the head count at its default.
+* **With `is_model_splitted` forced false as well**, genuinely on the naive path, it fails at the very
+  first INPUT: model `[1,8,5,128]` against loom's `[1,5,8,128]`. **Two middle dimensions transposed.**
+
+So the answer to "does it work at all" is no, and the reason is now specific and is neither naming nor
+op coverage: **the backend's shape and layout derivation disagrees with loom's tensors.** loom builds
+attention out of permuted views, and the translator's idea of a parameter's shape is not that view's
+shape. That is a deeper incompatibility than the parse, and it sits in the part of the backend built
+around llama.cpp's graph conventions.
+
+What that settles: **the naming work is not worth doing.** Re-exporting the zoo to dodge an unanchored
+substring search buys a translation that then disagrees about dimension order on input 0. The upstream
+ask stays worth filing and stays two lines — anchor the search, or return `nullopt` on parse failure
+rather than throwing, so a foreign graph gets a clean "unsupported" instead of a `stoi` — but it should
+be filed as a robustness fix, not as something that unblocks loom.
+
+**And on pre-applying the optimizations the naive path lacks** — the idea that if we know what the LLM
+path does, loom can do it first: mostly true, with one exception that matters. Static shapes and KV
+slicing are things loom is unusually well placed to supply, since it already buckets shapes (P4.0.15)
+and owns its own cache. But `naive_compute` calls `core.compile_model()` on **every** `graph_compute`
+with no `decoder_cache`, so a forced-naive decode would recompile a 2200-node OpenVINO model per token.
+That is not a graph optimization that can be applied earlier; it is a caching layer inside the backend,
+and no amount of preparation on loom's side substitutes for it.
+
+##### What this leaves
+
+* **Rank 1 has no *possible* inhabitant** — stronger than it looked when this was written, and P4.8e
+  below has the enum comment that settles it. It was designed for "an accelerator with its own memory";
+  ggml defines `ACCEL` as the BLAS/AMX co-processor role instead, so the tier was never going to fill.
+* **The tie-break-within-a-rank measurement is still unavailable**, and the reason changed: the
+  workstation was supposed to be the box with a rank-0 GPU *and* a rank-1 NPU at once. It has both
+  physically and only rank 0 in the registry, so a CUDA + OpenVINO build produces two rank-0 devices
+  separated by registration order — which is the tie-break case, but not the one that was wanted.
+* **No throughput number exists, and none should be quoted.** Nothing ran. The NPU's speed on a loom
+  graph is exactly as unknown as it was this morning.
+* **Hexagon: read, not built — and it clears the charge OpenVINO does not** (2026-08-14, below).
+
+The OpenVINO build tree is `/home/flavio/loom/loom.cpp/build-openvino` (tests off), its probes are in
+`/home/flavio/loom/probes-ov`, and the extracted NPU driver is at `/home/flavio/loom/npu-umd/prefix` —
+usable only with `ZE_ENABLE_ALT_DRIVERS` and `LD_LIBRARY_PATH` pointed at it.
+
+##### P4.8d(ii) — `ggml-hexagon`, read rather than built, and rank 1 becomes a pattern
+
+There is no Qualcomm hardware here and `ggml-hexagon/CMakeLists.txt` demands `HEXAGON_SDK_ROOT` — a
+registration-walled proprietary SDK that cross-builds DSP-side "skel" libraries and optionally
+code-signs them (`HEXAGON_HTP_CERT`). So this is a read of 4351 lines, which is the right cost for the
+question: does the other in-tree NPU backend make P4.8d's mistakes?
+
+**On the charge that matters, it is innocent — and note the charge itself was narrowed by the
+correction above.** `ggml_backend_hexagon_graph_compute` walks `graph->nodes[i]`, remaps each node to
+an HTP opcode, fuses neighbours where it can, and submits. There is **no tensor-name parsing anywhere**
+— every `->name` is logging, every `atoi` is env-var option handling — and the string `llama` does not
+occur in the file. It executes the graph it is handed, whatever shape that graph is, with no
+LLM-parameter step and so no node-count threshold above which a structural assumption switches on.
+That is the difference from `ggml-openvino`: not translator versus reconstructor, since both translate,
+but whether anything is assumed about what the graph MEANS.
+
+**On the ranking it makes the same claim, and that is the finding.**
+
+```c
+static enum ggml_backend_dev_type ggml_backend_hexagon_device_get_type(ggml_backend_dev_t dev) {
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    GGML_UNUSED(dev);          // unreachable -- same tell as ggml-openvino
+}
+```
+
+**Two independent NPU backends, written by different vendors, both report GPU.** One is an accident;
+two is the convention. Rank 1 — "an accelerator with its own memory, a discrete NPU" — is not a tier
+ggml's backends populate, and the `"npu"`/`"accel"` spec has no reachable inhabitant in the pinned
+revision. That is now a statement about ggml rather than about one backend, and it is what should
+decide whether the spec stays.
+
+**And its host/discrete answer is an environment variable.** `ggml_backend_hexagon_buffer_type_is_host`
+returns `opt_hostbuf` — `GGML_HEXAGON_HOSTBUF`, **default 1, i.e. host memory** — and
+`props->caps.host_buffer` is set from the same global. So the probe P4.8b made load-bearing for the
+rank-1/rank-2 split is, for this backend, *runtime-configurable*: same silicon, either answer, chosen
+by the environment. Tallying every backend measured or read so far:
+
+| backend | `caps.host_buffer` | `buft_is_host` |
+|---|---|---|
+| Vulkan, CUDA | true | false |
+| BLAS | false | true |
+| OpenVINO | false | false |
+| Hexagon | `opt_hostbuf` | `opt_hostbuf` (same) |
+
+Inverted, inverted the other way, both false, and identical-but-configurable. **Neither field carries
+the same meaning across backends**, which is a stronger version of the trap P4.8b recorded: the fix was
+to prefer `buft_is_host`, and this says `buft_is_host` is merely the less bad of two unreliable inputs.
+
+**Its op set is aimed at llama.cpp's workload even though its architecture is not**, and for loom's zoo
+that is the binding constraint. The 39 supported ops are LLM-shaped — `MUL_MAT`, `MUL_MAT_ID`, `ROPE`,
+`FLASH_ATTN_EXT`, `RMS_NORM`, `SOFT_MAX`, `GLU`, `SSM_CONV`, `GATED_DELTA_NET` — and contain **no
+convolution of any kind**: no `CONV_1D`, `CONV_2D`, `CONV_TRANSPOSE_1D`, not even `IM2COL`, alongside
+the `POOL_1D`/`POOL_2D`/`PAD_REFLECT_1D` gaps P4.7d already tabulated. Every ASR encoder and every TTS
+vocoder in the zoo would fall back essentially whole; the causal-LM family is the only part with a
+plausible story. So P4.8's "budget for the coverage work before drawing any conclusion from a number"
+holds for Hexagon — it is just that the missing class is convolution, not the three exotic ops the
+matrix pointed at.
+
+#### P4.8e — the tier that could not exist, deleted; and the kernel breaks the tie — DONE (2026-08-14)
+
+P4.8d found that no NPU registers as `ACCEL`. This is the correction, and the reason turned out to be
+in the pinned header the whole time rather than in any backend:
+
+```c
+// accelerator devices intended to be used together with the CPU backend (e.g. BLAS or AMX)
+GGML_BACKEND_DEVICE_TYPE_ACCEL,
+```
+
+**ggml DEFINES `ACCEL` as the BLAS/AMX co-processor role** — a thing used *together with* the CPU,
+which is P4.8b's rank **2** — while `GPU` is defined as "GPU device using dedicated memory". By that
+taxonomy a discrete NPU that runs whole graphs out of its own memory **is** a GPU, and all three of
+ggml's accelerator backends agree: `ggml-openvino` (:751), `ggml-hexagon` (:3917), and `ggml-et`, the
+one new backend directory at master. So P4.8b's rank 1 was not waiting for hardware; it was a
+misreading of the enum, and it could never have had a member.
+
+Checked rather than assumed, because "upstream will fix it" was the live alternative: ggml master
+`8846b79e` is **154 commits and one month past** the pinned `v0.16.0`, and both NPU backends are
+byte-identical at HEAD on exactly these lines. The enums are identical too, comments included. This is
+upstream's position, not an immaturity to wait out — which also retires the idea of a temporary
+name-matching hack, since a temporary fix needs an expiry condition and there is none.
+
+##### The ranking, collapsed to what has behavioural consequences
+
+|   | |
+|---|---|
+| 0 | an offload device with its own memory — a split against it costs a copy |
+| 1 | an offload device in host memory — BLAS; a split against it copies nothing |
+| 2 | the CPU |
+
+`primary_rank` no longer switches on the type to decide the tier, only to separate the CPU from
+everything else; the memory question it was already asking does the rest. The assist rule survives
+unchanged apart from its numbering, because the two ranks it names are exactly the two that question
+separates.
+
+##### `"npu"` now always throws, and the message is the feature
+
+Resolving it was never right: it answered "no NPU with its own memory is available" on the one machine
+whose NPU was running. Deleting the spelling is not right either — a caller who types it has a real
+question and deserves an answer rather than `unknown device 'npu'`. So it is a recognised spec that
+raises, naming the cause (`ggml does not report NPU identity`), the evidence (all three backends
+register as GPU), and the thing that actually works (name the device; for OpenVINO also set
+`GGML_OPENVINO_DEVICE=NPU`, since that is what picks its target).
+
+**And it consults `/dev/accel` to avoid lying by omission.** The Linux accel subsystem (`drivers/accel`
+— `intel_vpu`, `habanalabs`, `qaic`) is where accelerators live and where a GPU never appears: on the
+workstation `accel0` is `intel_vpu` while both GPUs are `/dev/dri/card{0,1}`. So when the kernel does
+know about an accelerator the message says so, and a user with an NPU is not told they have none. It
+is diagnostic only — it answers "does this machine have an accelerator", never "is THIS ggml device
+one", which is the question nothing can answer.
+
+##### Ties within a rank, which the collapse made urgent
+
+Merging the tiers put a real GPU and an NPU-shaped backend in the same rank, so `"auto"` on a CUDA +
+OpenVINO box would go back to registration-order roulette — the exact defect P4.8b was filed for. The
+tie-break is the first *positive* signal found in this whole thread:
+
+```
+device     type   buft_is_host  host_buffer  device_id       kernel says
+CUDA0      GPU    false         true         0000:02:00.0    0x030000  <- display controller
+OPENVINO0  GPU    false         false        (null)          -
+```
+
+`ggml_backend_dev_props::device_id` is the device's PCI address, and **null is a reliable reading**
+rather than uninitialised memory, because `ggml_backend_dev_get_props` memsets the struct before the
+backend fills it. sysfs then says what that address is: base class `0x03` is a display controller, and
+the Intel NPU at `0000:00:0b.0` is `0x12`, a processing accelerator. The kernel maintains exactly the
+taxonomy ggml's backends stopped maintaining, and it is the one authority here that is not a
+self-report.
+
+**It promotes on positive evidence and never demotes on absence**, which is the whole of its safety.
+Only `ggml-cuda` and `ggml-vulkan` populate `device_id`; `ggml-metal`, `ggml-sycl`, `ggml-opencl`,
+`ggml-webgpu` and `ggml-cann` are real GPU backends that leave it null, and there is no sysfs at all
+off Linux. So an unconfirmable device keeps precisely the standing it had before — where nothing is
+confirmable, registration order still decides, exactly as it did yesterday.
+
+##### Verified, and the tie-break was made to fail on purpose first
+
+* **CPU-only build**: `test_device_selection` 49/49 (was 38 — the new checks are the unconditional
+  `"npu"`/`"accel"` raise and its message).
+* **Three-device DL build** (Vulkan + BLAS + CPU, the configuration that produced P4.8b's defect):
+  64/64, and `probe_chain` still shows `auto -> Vulkan0, assists=1, order Vulkan0 BLAS CPU` **with
+  BLAS registering first** — the collapse did not cost the assist chain.
+* **CUDA + OpenVINO on the workstation** — the configuration this tie-break exists for: 61/61,
+  `ci` 58/58, and both device-parity gates still pass. `auto` and `gpu` resolve to `CUDA0`.
+* The `"npu"` message degrades as designed: no `/dev/accel` on the dev box, so the accelerator clause
+  is absent there, and present on the workstation as `[accel0 (intel_vpu)]`.
+
+**`auto -> CUDA0` on that box proves nothing by itself, and nearly shipped as if it did.** CUDA
+registers *first* in both link modes — the `#ifdef` sequence puts it ahead of OpenVINO, and
+`ggml_backend_load_all` calls `cuda` 11th against `openvino` 21st — so the old registration-order rule
+gives the same answer, and the whole tie-break could have been dead code behind a green result.
+
+So it was inverted (`kernel_confirms_gpu(dev) ? 1 : 0`) and re-measured: `auto` and `gpu` both flipped
+to **`OPENVINO0`**, with the registry order unchanged. The tie-break demonstrably overrides
+registration order, and CUDA0 wins for the reason claimed rather than by luck.
+
+**A trap worth recording from doing that:** restoring the file with `rsync -a` and rebuilding did NOT
+revert the binary. rsync preserves mtimes, so the restored source was *older* than the object compiled
+from the inverted version and ninja considered it up to date — the probe kept answering `OPENVINO0`
+from a stale `.o` after a build that reported success. `touch` the file after any rsync-based revert,
+or the next measurement is of the code you thought you removed.
+
+`probe_tiers` gained the `device_id` and kernel-class columns, since it is the tool that answers this
+question for the next backend, and `tools/debug/README.md`'s "first question to point them at" is
+rewritten — that question is now answered.
 
 #### P4.5 — one repo becomes three — DONE (2026-08-10)
 

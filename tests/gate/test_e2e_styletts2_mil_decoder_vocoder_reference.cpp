@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -87,7 +87,7 @@ int main() {
     LOOM_CHECK(asr_shape.size() == 3); // (1, dim_in, T_frames)
     const auto t_frames = static_cast<uint32_t>(asr_shape[2]);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_path, backend.get());
     LOOM_CHECK(model != nullptr);

@@ -20,7 +20,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cstdio>
 #include <string>
@@ -41,7 +41,7 @@ std::string mul_topology(int head_dim, const char* n_tokens_expr, int n_head) {
 // x[d, t, h] * y[d, t, 1] must broadcast over the HEAD axis: every head sees the same per-token vector.
 // That is RoPE's contract, and the collision case is n_tokens == n_head.
 bool check_mul_broadcasts_over_heads(int head_dim, int n_tokens, int n_head) {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     auto model = loom::GgufModel::load(std::string(LOOM_TEST_FIXTURE_DIR) + "/minimal.gguf", backend.get());

@@ -11,7 +11,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -60,7 +60,7 @@ int main() {
     }
     const std::string dir = dir_env;
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     constexpr uint32_t kT = 5; // small dummy token count, purely structural

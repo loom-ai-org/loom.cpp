@@ -10,6 +10,7 @@
 
 #include "ggml_test_helpers.h"
 #include "test_util.h"
+#include "cpu_backend.h"
 
 #include "loom/loom.h"
 #include "loom/core/conv_state_cache.h"
@@ -100,7 +101,7 @@ std::vector<float> short_conv_step(ggml_backend_t backend, loom::ConvStateCache*
 // Stateless reference run: no cache, its own backend. Every "one shot" expectation below goes through
 // here, so the comparison is against the path the exporter emitted before P4.0.10 existed.
 std::vector<float> short_conv_one_shot(int64_t n_tokens, const std::vector<float>& data_values) {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     return short_conv_step(backend.get(), /*cache=*/nullptr, n_tokens, /*n_past=*/0, /*layer=*/0, data_values);
 }
 
@@ -148,7 +149,7 @@ void test_incremental_decode_matches_one_shot() {
 
     const std::vector<float> one_shot = short_conv_one_shot(kTotal, signal(kTotal));
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     loom::ConvStateCache cache(/*n_layer=*/1, /*n_state=*/kKernel - 1, kChannels, backend.get());
 
     std::vector<std::vector<float>> stepped;
@@ -181,7 +182,7 @@ void test_prefill_shorter_than_state_depth() {
     constexpr int64_t kTotal = 4;
     const std::vector<float> one_shot = short_conv_one_shot(kTotal, signal(kTotal));
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     loom::ConvStateCache cache(1, kKernel - 1, kChannels, backend.get());
 
     std::vector<float> joined;
@@ -208,7 +209,7 @@ void test_prefill_after_generation_ignores_stale_state() {
     constexpr int64_t kT = 5;
     const std::vector<float> clean = short_conv_one_shot(kT, signal(kT));
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     loom::ConvStateCache cache(1, kKernel - 1, kChannels, backend.get());
 
     // Dirty the slot with an unrelated sequence, then prefill the real one at n_past = 0.
@@ -224,7 +225,7 @@ void test_prefill_after_generation_ignores_stale_state() {
 void test_layers_have_independent_state() {
     constexpr int64_t kTotal = 5;
     constexpr int64_t kPrefill = 3;
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     loom::ConvStateCache cache(/*n_layer=*/2, kKernel - 1, kChannels, backend.get());
 
     const std::vector<float> l0_one_shot = short_conv_one_shot(kTotal, signal(kTotal));

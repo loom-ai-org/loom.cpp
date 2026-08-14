@@ -9,14 +9,14 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 namespace {
 constexpr int32_t kNVocab = 8;
 }
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/attention_test.gguf";

@@ -30,7 +30,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,7 +55,7 @@ int main() {
     constexpr uint32_t kDiffusionSteps = 5;
     constexpr uint32_t kSeed = 42;
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     std::vector<float> lua_wav;

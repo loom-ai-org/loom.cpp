@@ -14,7 +14,6 @@
 #include "loom/core/conv_state_cache.h"
 #include "wav_file.h"
 
-#include <ggml-cpu.h>
 
 #include <algorithm>
 #include <cmath>

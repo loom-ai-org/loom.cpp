@@ -8,10 +8,10 @@
 // real device is actually exercised.
 
 #include "test_util.h"
+#include "cpu_backend.h"
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -130,7 +130,11 @@ int main() {
     // The implicit conversion is what kept every pre-P4.4 call site compiling; this states that it also
     // kept them MEANING the same thing -- one backend, no scheduler.
     {
-        ggml_backend_ptr backend(ggml_backend_cpu_init());
+        // Through the shared helper, which goes via the registry rather than the CPU backend's own
+        // ggml_backend_cpu_init symbol -- that one is not linked in a GGML_BACKEND_DL build. This test
+        // has to work in both configurations, because a DL build is the only place the ranking above
+        // can be exercised against the registration order it exists to defeat.
+        ggml_backend_ptr backend(loom_test::cpu_backend());
         LOOM_CHECK(backend != nullptr);
         const loom::Backends implicit = backend.get();
         LOOM_CHECK(implicit.primary == backend.get());
@@ -140,6 +144,139 @@ int main() {
         // against itself is pure overhead, so the check is `fallback != primary`, not `fallback != null`.
         const loom::Backends self_pair(backend.get(), backend.get());
         LOOM_CHECK(!self_pair.hybrid());
+    }
+
+    // --- A kind-spec answers with that kind, or not at all ------------------------------------------
+    // The defect this replaces: "gpu" meant "the first device that is not the CPU", so on a machine
+    // with both a GPU and a BLAS accelerator it answered with whichever ggml happened to register
+    // first -- and that order differs between a linked build and a GGML_BACKEND_DL one, so the same
+    // spec gave different devices from one source tree (BACKLOG.md P4.8b).
+    //
+    // Hermetic, so what it can assert is the invariant rather than the outcome: on a CPU-only build
+    // "gpu" throws, and on a build with real devices it must answer with an offload device or throw.
+    // The three-device build (-DGGML_VULKAN=ON -DGGML_BLAS=ON) is where this has teeth.
+    {
+        const auto devices = loom::available_devices();
+        const bool any_non_cpu = has_non_cpu_device();
+
+        if (!any_non_cpu) {
+            LOOM_CHECK(throws_loom_error([] { loom::Device::open("gpu"); }));
+        }
+
+        std::string gpu_name;
+        try {
+            loom::Device gpu = loom::Device::open("gpu");
+            LOOM_CHECK(!gpu.is_cpu());
+            gpu_name = gpu.name();
+        } catch (const loom::Error&) {
+        }
+
+        // "npu" and "accel" ALWAYS throw, on every build and every machine, because ggml does not
+        // report NPU identity -- every NPU backend it ships registers as GPU (BACKLOG.md P4.8d/P4.8e).
+        // This is the one spec whose failure is unconditional, so it is asserted unconditionally: an
+        // implementation that quietly resolved it to a GPU would pass every other check in this file.
+        LOOM_CHECK(throws_loom_error([] { loom::Device::open("npu"); }));
+        LOOM_CHECK(throws_loom_error([] { loom::Device::open("accel"); }));
+
+        // And the message earns its keep, because the message IS the feature here: it must name the
+        // reason rather than merely report absence, or a user with an NPU in the machine reads it as
+        // "you have no NPU" and believes it.
+        try {
+            loom::Device::open("npu");
+            LOOM_CHECK(false);
+        } catch (const loom::Error& e) {
+            const std::string message = e.what();
+            LOOM_CHECK(message.find("does not report NPU identity") != std::string::npos);
+            LOOM_CHECK(message.find("name a device") != std::string::npos);
+        }
+
+        // "auto" never fails and never ranks below what an explicit kind-spec could have found: if an
+        // offload device exists, "auto" IS that device. This is the assertion that would have caught
+        // the defect -- under the old rule "auto" returned BLAS on a machine whose GPU was right there.
+        loom::Device automatic = loom::Device::open("auto");
+        if (!gpu_name.empty()) {
+            LOOM_CHECK(automatic.name() == gpu_name);
+        }
+        // And with nothing else present it is the CPU, which is why it cannot throw.
+        if (!any_non_cpu) LOOM_CHECK(automatic.is_cpu());
+
+        // Repeated resolution is stable. Registration order is no longer an input, but a ranking
+        // implemented with a strict `<` could still drift if it were ever made order-sensitive again.
+        LOOM_CHECK(loom::Device::open("auto").name() == automatic.name());
+    }
+
+    // --- The scheduler order: primary first, CPU last, nothing repeated -----------------------------
+    // `ggml_backend_sched_new` ASSERTS that the last backend it is given can run anything, i.e. that it
+    // is the CPU, so this is a crash rather than a slowdown when it is wrong. It is also the invariant
+    // that survives assists being added: whatever else lands in the chain, it lands in the middle.
+    {
+        loom::Device cpu = loom::Device::open("cpu");
+        const loom::Backends cpu_backends = cpu.backends();
+        LOOM_CHECK(cpu_backends.assists.empty());
+        LOOM_CHECK(cpu_backends.schedule_order().size() == 1);
+        LOOM_CHECK(cpu_backends.schedule_order().front() == cpu_backends.primary);
+
+        loom::Device automatic = loom::Device::open("auto");
+        const loom::Backends b = automatic.backends();
+        const std::vector<ggml_backend_t> order = b.schedule_order();
+        LOOM_CHECK(!order.empty());
+        LOOM_CHECK(order.front() == b.primary);
+        if (b.hybrid()) {
+            LOOM_CHECK(order.back() == b.fallback);
+            LOOM_CHECK(order.size() == b.assists.size() + 2);
+        } else {
+            LOOM_CHECK(order.size() == 1);
+        }
+        // An assist is never the primary or the CPU wearing a second hat -- handing ggml the same
+        // backend twice is not a configuration, it is a bug that would show up as strange split plans.
+        for (size_t i = 0; i < order.size(); ++i) {
+            LOOM_CHECK(order[i] != nullptr);
+            for (size_t j = i + 1; j < order.size(); ++j) LOOM_CHECK(order[i] != order[j]);
+        }
+    }
+
+    // --- schedule_order() filters what a caller hands it --------------------------------------------
+    // Constructed by hand rather than through a Device, because the point is that the FILTERING is in
+    // schedule_order and not in Device -- an embedding host assembling its own Backends gets the same
+    // guarantees. Null, the primary repeated, and the CPU repeated all disappear.
+    {
+        ggml_backend_ptr cpu(loom_test::cpu_backend());
+        ggml_backend_ptr other(loom_test::cpu_backend());
+        LOOM_CHECK(cpu != nullptr && other != nullptr);
+
+        const loom::Backends messy(other.get(), {nullptr, other.get(), cpu.get()}, cpu.get());
+        const std::vector<ggml_backend_t> order = messy.schedule_order();
+        // primary, then the CPU last: the null is dropped, the repeated primary is dropped, and the
+        // assist that IS the fallback is dropped rather than being scheduled twice.
+        LOOM_CHECK(order.size() == 2);
+        LOOM_CHECK(order.front() == other.get());
+        LOOM_CHECK(order.back() == cpu.get());
+    }
+
+    // --- A backend search path never costs a device -------------------------------------------------
+    // add_backend_search_path is how an embedded host points at backends ggml's own search would not
+    // find (loom-py's wheel; BACKLOG.md P4.8). What it must NOT do is make things worse, and the way it
+    // could is by being consulted destructively: a stale $LOOM_BACKEND_DIR, a path removed since it was
+    // registered, or the same directory added twice must all leave the registry exactly as it was.
+    // Directories are offered to ggml, not required of it.
+    {
+        const size_t before = loom::available_devices().size();
+        LOOM_CHECK(before > 0);
+
+        loom::add_backend_search_path("/definitely/not/a/directory");
+        loom::add_backend_search_path("");
+        LOOM_CHECK(loom::available_devices().size() == before);
+        LOOM_CHECK(loom::Device::open("cpu").is_cpu());
+
+        // Twice, because ggml dedupes on the registration pointer rather than on the path, and the
+        // engine leans on that to let a host add a directory at any time without tracking what it has
+        // already added. A second sweep of a directory that DID contain a backend must register nothing
+        // new -- here that is asserted the only way a hermetic test can, on a path swept twice.
+        const std::string cwd_path = ".";
+        loom::add_backend_search_path(cwd_path);
+        const size_t once = loom::available_devices().size();
+        loom::add_backend_search_path(cwd_path);
+        LOOM_CHECK(loom::available_devices().size() == once);
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

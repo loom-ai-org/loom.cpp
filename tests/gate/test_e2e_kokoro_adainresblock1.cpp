@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -77,7 +77,7 @@ int main() {
     LOOM_CHECK(style_shape.size() == 1 && static_cast<uint32_t>(style_shape[0]) == kStyleDim);
     const auto T = static_cast<uint32_t>(x_shape[0]);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/kokoro_adainresblock1.gguf", backend.get());
     LOOM_CHECK(model != nullptr);
