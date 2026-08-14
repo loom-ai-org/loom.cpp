@@ -14,7 +14,6 @@
 #include "loom/core/conv_state_cache.h"
 #include "wav_file.h"
 
-#include <ggml-cpu.h>
 
 #include <algorithm>
 #include <cmath>
@@ -33,7 +32,7 @@ void print_usage(const char* argv0) {
                   "[--task transcribe|translate] [--timestamps] "
                   "[--no-condition-on-previous]\n"
                   "\n"
-                  "  --device <auto|cpu|gpu|NAME>  where to run (default: auto, or $LOOM_DEVICE)\n"
+                  "  --device <auto|cpu|gpu|npu|NAME>  where to run (default: auto, or $LOOM_DEVICE)\n"
                   "  --list-devices                print the devices this build can reach, and exit\n",
                   argv0, argv0);
 }
