@@ -101,9 +101,18 @@ int main() {
         return kSkipReturnCode;
     }
     if (!has_device()) {
+#ifdef LOOM_TEST_EXPECTS_DEVICE
+        // See test_e2e_device_parity.cpp: with a device backend compiled in, an empty registry is a
+        // deployment failure and must be red rather than Skipped (BACKLOG.md P4.8f).
+        std::fprintf(stderr,
+                      "FAIL: a device backend is compiled into this build, but the registry reports no "
+                      "device other than the CPU -- see tests/support/cpu_backend.h.\n");
+        return 1;
+#else
         std::fprintf(stderr, "skipping: this build reaches no GPU/accelerator device (configure with "
                               "-DGGML_VULKAN=ON, -DGGML_CUDA=ON or -DGGML_METAL=ON)\n");
         return kSkipReturnCode;
+#endif
     }
 
     loom::Device cpu = loom::Device::open("cpu");

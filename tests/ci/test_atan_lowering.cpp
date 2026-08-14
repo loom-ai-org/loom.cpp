@@ -25,7 +25,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -68,7 +68,7 @@ std::vector<float> run_compose_atan(const std::vector<float>& xs, ggml_backend_t
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     constexpr double kMaxUlp = 2.5;

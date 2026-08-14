@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -104,7 +104,7 @@ int main() {
     const auto n_tokens = static_cast<uint32_t>(tok_shape[0]);
     const auto hidden_size = static_cast<uint32_t>(out_shape[1]);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/kokoro_albert.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

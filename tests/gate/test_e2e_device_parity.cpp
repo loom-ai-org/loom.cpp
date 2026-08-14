@@ -144,11 +144,23 @@ int main() {
         return kSkipReturnCode;
     }
     if (!has_device()) {
+#ifdef LOOM_TEST_EXPECTS_DEVICE
+        // A device backend WAS compiled in, so an empty registry is a broken deployment rather than a
+        // machine without a GPU -- fail, do not skip (BACKLOG.md P4.8f). This exact case shipped: under
+        // GGML_BACKEND_DL nothing had registered the backend directory, the registry held only the CPU,
+        // and this gate exited 77 into a green ctest run on a build with Vulkan compiled in.
+        std::fprintf(stderr,
+                      "FAIL: a device backend is compiled into this build, but the registry reports no "
+                      "device other than the CPU. In a GGML_BACKEND_DL build that means nothing swept "
+                      "for backend .so files -- see tests/support/cpu_backend.h.\n");
+        return 1;
+#else
         std::fprintf(stderr,
                       "skipping: this build reaches no GPU/accelerator device, so there is nothing to "
                       "compare the CPU against (configure with -DGGML_VULKAN=ON, -DGGML_CUDA=ON or "
                       "-DGGML_METAL=ON on a machine that has one)\n");
         return kSkipReturnCode;
+#endif
     }
 
     loom::Device cpu = loom::Device::open("cpu");

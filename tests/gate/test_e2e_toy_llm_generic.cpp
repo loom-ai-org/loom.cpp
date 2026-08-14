@@ -20,7 +20,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -73,7 +73,7 @@ int main() {
         return kSkipReturnCode;
     }
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string ref_dir = LOOM_TEST_REF_DIR; // shared with test_e2e_toy_llm.cpp -- same weights

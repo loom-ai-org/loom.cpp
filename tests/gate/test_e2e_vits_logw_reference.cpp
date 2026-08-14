@@ -14,7 +14,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -115,7 +115,7 @@ int main() {
     std::vector<float> ref_logw = read_npy_f32(ref_dir + "/ref_sdp_logw.npy", logw_shape);
     LOOM_CHECK(zn_shape.size() == 2 && zn_shape[0] == 2 && zn_shape[1] == static_cast<int64_t>(T));
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/vits_logw.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

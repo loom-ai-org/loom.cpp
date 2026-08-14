@@ -29,7 +29,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cstdint>
 #include <string>
@@ -54,8 +54,8 @@ std::vector<float> run_once(loom::GgufModel& model, const loom::GraphTopology& t
 } // namespace
 
 int main() {
-    ggml_backend_ptr cpu_a(ggml_backend_cpu_init());
-    ggml_backend_ptr cpu_b(ggml_backend_cpu_init());
+    ggml_backend_ptr cpu_a(loom_test::cpu_backend());
+    ggml_backend_ptr cpu_b(loom_test::cpu_backend());
     LOOM_CHECK(cpu_a != nullptr && cpu_b != nullptr);
     LOOM_CHECK(cpu_a.get() != cpu_b.get());
 

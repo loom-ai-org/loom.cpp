@@ -33,7 +33,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -102,7 +102,7 @@ const std::vector<int32_t> kRnntExpected = {
 
 bool run_case(const char* label, const std::string& gguf, const std::vector<float>& waveform,
               const std::vector<int32_t>& expected) {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     auto model = loom::GgufModel::load(gguf, backend.get());
