@@ -4490,6 +4490,29 @@ That composition is also why the check below matters more than it did last time:
 the two parts still produces the right answer on this machine, and only goes wrong on a machine that
 also has OpenVINO installed. Getting the observable case right is not evidence that the key is right.
 
+##### Verified on the hardware that exhibits it, including made to fail
+
+The base wheel rebuilt through cibuildwheel and installed with `rt-vulkan` into a clean venv, 16 tokens
+each:
+
+| spec | correct ordering | ordering INVERTED |
+|---|---|---|
+| `auto` | **0.88 s** | 13.01 s |
+| `gpu` | **0.87 s** | 12.47 s |
+| `Vulkan0` (Intel iGPU) | 12.45 s | — |
+| `Vulkan1` (RTX 5090) | 1.11 s | — |
+
+The timings identify the selection without reading a device name, and the inverted build is what makes
+the first column mean something: flipping discrete-and-integrated sends `auto` back to the iGPU, so the
+comparison demonstrably drives the choice rather than agreeing with registration order by coincidence.
+That coincidence is exactly what P4.8h nearly shipped, where `auto -> CUDA0` looked like proof.
+
+**What this did NOT verify, and the entry should not be read as claiming it:** that the two parts are
+in the right ORDER. Both orderings select the 5090 here, because nothing on this machine claims to be a
+GPU without being one. Only a box with OpenVINO installed beside a real iGPU would separate them, and
+there is none. The confirmation-before-type argument stays reasoned from `ggml-openvino` reporting
+`GPU` with no `device_id`, not measured.
+
 #### P4.8i — the runtime comes from NVIDIA's wheels, and the GPU list follows the CPU — DONE (2026-08-14)
 
 P4.8g left two things unfixed and named them: the built library carried an RPATH into the build
