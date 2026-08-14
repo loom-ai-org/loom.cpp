@@ -153,7 +153,7 @@ int main() {
     // spec gave different devices from one source tree (BACKLOG.md P4.8b).
     //
     // Hermetic, so what it can assert is the invariant rather than the outcome: on a CPU-only build
-    // both specs throw, and on a build with real devices each must answer with its own kind or throw.
+    // "gpu" throws, and on a build with real devices it must answer with an offload device or throw.
     // The three-device build (-DGGML_VULKAN=ON -DGGML_BLAS=ON) is where this has teeth.
     {
         const auto devices = loom::available_devices();
@@ -161,41 +161,41 @@ int main() {
 
         if (!any_non_cpu) {
             LOOM_CHECK(throws_loom_error([] { loom::Device::open("gpu"); }));
-            LOOM_CHECK(throws_loom_error([] { loom::Device::open("npu"); }));
         }
 
-        // Whatever "gpu" returns, it is never the CPU and never a device "npu" would also return --
-        // the two specs partition, they do not overlap.
-        std::string gpu_name, npu_name;
+        std::string gpu_name;
         try {
             loom::Device gpu = loom::Device::open("gpu");
             LOOM_CHECK(!gpu.is_cpu());
             gpu_name = gpu.name();
         } catch (const loom::Error&) {
         }
-        try {
-            loom::Device npu = loom::Device::open("npu");
-            LOOM_CHECK(!npu.is_cpu());
-            npu_name = npu.name();
-        } catch (const loom::Error&) {
-        }
-        LOOM_CHECK(gpu_name.empty() || npu_name.empty() || gpu_name != npu_name);
 
-        // "accel" is a spelling of "npu", not a third behaviour.
+        // "npu" and "accel" ALWAYS throw, on every build and every machine, because ggml does not
+        // report NPU identity -- every NPU backend it ships registers as GPU (BACKLOG.md P4.8d/P4.8e).
+        // This is the one spec whose failure is unconditional, so it is asserted unconditionally: an
+        // implementation that quietly resolved it to a GPU would pass every other check in this file.
+        LOOM_CHECK(throws_loom_error([] { loom::Device::open("npu"); }));
+        LOOM_CHECK(throws_loom_error([] { loom::Device::open("accel"); }));
+
+        // And the message earns its keep, because the message IS the feature here: it must name the
+        // reason rather than merely report absence, or a user with an NPU in the machine reads it as
+        // "you have no NPU" and believes it.
         try {
-            LOOM_CHECK(loom::Device::open("accel").name() == npu_name);
-        } catch (const loom::Error&) {
-            LOOM_CHECK(npu_name.empty());
+            loom::Device::open("npu");
+            LOOM_CHECK(false);
+        } catch (const loom::Error& e) {
+            const std::string message = e.what();
+            LOOM_CHECK(message.find("does not report NPU identity") != std::string::npos);
+            LOOM_CHECK(message.find("name a device") != std::string::npos);
         }
 
-        // "auto" never fails and never ranks below what an explicit kind-spec could have found: if a
-        // GPU exists, "auto" IS that GPU. This is the assertion that would have caught the defect --
-        // under the old rule "auto" returned BLAS on a machine whose GPU was sitting right there.
+        // "auto" never fails and never ranks below what an explicit kind-spec could have found: if an
+        // offload device exists, "auto" IS that device. This is the assertion that would have caught
+        // the defect -- under the old rule "auto" returned BLAS on a machine whose GPU was right there.
         loom::Device automatic = loom::Device::open("auto");
         if (!gpu_name.empty()) {
             LOOM_CHECK(automatic.name() == gpu_name);
-        } else if (!npu_name.empty()) {
-            LOOM_CHECK(automatic.name() == npu_name);
         }
         // And with nothing else present it is the CPU, which is why it cannot throw.
         if (!any_non_cpu) LOOM_CHECK(automatic.is_cpu());

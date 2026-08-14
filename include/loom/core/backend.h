@@ -125,31 +125,43 @@ public:
     //                                             only candidate is the CPU, so this behaves exactly
     //                                             as it did before any of this existed.
     //   "cpu"                                   -- the CPU, whatever else is available.
-    //   "gpu"                                   -- a GPU or iGPU, and nothing else; THROWS if there is
+    //   "gpu"                                   -- an offload device with its own memory, preferring
+    //                                             one the kernel confirms is a GPU; THROWS if there is
     //                                             none, because a caller who asked for one specifically
     //                                             is better served by an error than by a CPU run they
     //                                             did not ask for and cannot see.
-    //   "npu" (or "accel")                      -- an accelerator with its own memory; THROWS if there
-    //                                             is none. A host-memory accelerator such as BLAS is
-    //                                             NOT one -- name it directly if that is what you mean.
+    //   "npu" (or "accel")                      -- ALWAYS THROWS, with a message explaining why and
+    //                                             what to type instead. ggml does not report NPU
+    //                                             identity; see below.
     //   a device name ("Vulkan0", "CUDA0", ...) -- that device, matched case-insensitively against
     //                                             available_devices(); throws if absent.
     //
-    // THE RANKING, and why it is not "the first non-CPU device" (BACKLOG.md P4.8b):
+    // THE RANKING, and why it is not "the first non-CPU device" (BACKLOG.md P4.8b, P4.8e):
     //
-    //   0  GPU / iGPU
-    //   1  an accelerator with its own memory (a discrete NPU)
-    //   2  an accelerator in host memory (BLAS; possibly an NPU on a UMA SoC)
-    //   3  the CPU
+    //   0  an offload device with its own memory  (a split against it costs a copy)
+    //   1  an offload device in host memory       (BLAS; a split against it copies nothing)
+    //   2  the CPU
     //
     // "the first non-CPU device registered" was the rule until 2026-08-14, and it is not a stable
     // notion: ggml registers backends in one order when they are linked in and a DIFFERENT order when
     // they are loaded dynamically. The same source on the same machine resolved "gpu" to Vulkan0 in a
     // linked build and to BLAS in a GGML_BACKEND_DL build -- and DL is what the Python wheels ship. A
-    // ranking by device kind removes registration order from the answer entirely.
+    // ranking by what the device IS removes registration order from the answer entirely.
     //
-    // What is NOT solved: ties WITHIN a rank. Two GPUs are still separated by registration order,
-    // because nothing about a machine says CUDA0 should beat Vulkan0. Name one.
+    // WHY THERE IS NO NPU TIER, which is the question this ranking gets asked most: ggml's device enum
+    // documents ACCEL as "accelerator devices intended to be used together with the CPU backend (e.g.
+    // BLAS or AMX)" -- rank 1 here -- and GPU as "GPU device using dedicated memory". By that taxonomy
+    // a discrete NPU IS a GPU, and all three of ggml's accelerator backends agree: ggml-openvino,
+    // ggml-hexagon and ggml-et all return GGML_BACKEND_DEVICE_TYPE_GPU unconditionally. An NPU is
+    // therefore not distinguishable from a GPU through this API, which is why "npu" throws rather than
+    // guessing, and why a caller who knows their machine should name the device.
+    //
+    // Ties WITHIN a rank are broken by asking the KERNEL, and only when it can answer: a device that
+    // reports a PCI address (ggml_backend_dev_props::device_id) whose sysfs class is 0x03 is a display
+    // controller and wins. This is a promotion on positive evidence and never a demotion on its
+    // absence -- ggml-metal, ggml-sycl, ggml-opencl, ggml-webgpu and ggml-cann are real GPU backends
+    // that report no address at all, and there is no sysfs off Linux. Where nothing is confirmable,
+    // registration order still decides and a caller with two such devices should name the one it wants.
     //
     // Throws loom::Error on an unresolvable spec or a device that fails to initialize.
     static Device open(const std::string& spec = "");
