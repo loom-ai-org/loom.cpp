@@ -4447,6 +4447,72 @@ than the printed precision.
 (0 occurrences across all thirteen). If one ever does, it is `compose_atan` plus the quadrant correction,
 not new mathematics.
 
+#### P4.8h — the CUDA wheel fits, and neither lever cost coverage — DONE (2026-08-14)
+
+P4.8g left the CUDA wheel at 112 MB against PyPI's 100 MB per-file ceiling, with the arch set called a
+release decision. It is settled, and the answer is better than the trade it looked like: **88 MB with
+MORE architectures than the version that did not fit.**
+
+| build | toolkit | configuration | wheel |
+|---|---|---|---|
+| A | 12.8 | `80;89;120`, FA on | 112 MB |
+| B | 12.8 | ggml's default list, FA on | 148 MB |
+| C | 12.8 | ggml's default list, **FA off** | 101 MB |
+| D | 13.1 | **no list**, FA off | 135 MB — ten cubin sets, no PTX |
+| **E/F** | **13.1** | **explicit list, FA off** | **88 MB** |
+
+##### Compression was already maximal, which killed the obvious idea first
+
+`nvcc` gained `--compress-mode` in 12.8 and it looked like free savings. It is not available: **ggml
+already sets `GGML_CUDA_COMPRESSION_MODE` to `"size"` by default** and applies it whenever the toolkit
+is 12.8+. The measurement that proved it is worth keeping — build A was byte-identical to the earlier
+wheel, because the flag both failed to reach `nvcc` and would have changed nothing. There is no
+compression lever left.
+
+##### FlashAttention is unreachable code, and it was a third of the binary
+
+`ggml_flash_attn_ext` appears NOWHERE in the engine. The attention primitive builds the composite path
+— `mul_mat` -> `soft_max_ext` -> `mul_mat`, with `mul_mat_set_prec` on the QK product — so nothing loom
+emits can ever dispatch to a FlashAttention kernel. `GGML_CUDA_FA=OFF` removed **47 MB** (148 -> 101)
+with no functional change of any kind.
+
+Revisit the day the engine grows a primitive that emits `FLASH_ATTN_EXT` — scoped, not built. Two
+things that work would need re-checking: the device/CPU parity tolerance, since FA changes reduction
+order and internal precision, and the property that the composite path runs identically on every
+backend.
+
+##### "Take the default" is not portable across toolkits, and D is the proof
+
+ggml chooses its architecture list only `if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)`. **Under CUDA 13
+CMake defines it first**, so ggml's careful list is skipped entirely and every architecture the toolkit
+knows gets a real cubin: ten sets, no PTX at all, 135 MB — *larger* than the 12.8 default it was meant
+to improve on. The list is now explicit in `packaging/rt-cuda/CMakeLists.txt` rather than inherited.
+
+##### What the shipped list covers, and what it drops
+
+Real cubins for **8.6, 8.9, 12.0a, 12.1a** and PTX for **7.5, 8.0, 9.0**:
+
+* RTX 30x (8.6) and Jetson Orin (8.7, by binary compatibility from 8.6);
+* RTX 40x (8.9); RTX 50x (12.0a); DGX Spark (12.1a);
+* Turing, A100 and Hopper JIT from PTX rather than finding nothing.
+
+Dropped deliberately: Maxwell 5.0, Pascal 6.1, Volta 7.0, which CUDA 13 no longer supports. A real
+loss of the cheapest hobby hardware, accepted on the grounds that those cards cannot run current models
+usefully and that tier is better served by Metal on Apple silicon — a different backend package
+entirely, unaffected by any of this.
+
+**12.1a requires CUDA >= 12.9 and there is no 12.x substitute.** ggml rewrites every `12X` to `12Xa`
+because Blackwell's FP4 tensor-core instructions are not forward-compatible and cannot be branched on
+in host code, and an `a` cubin runs only on its exact architecture. So Spark coverage is a toolkit
+version, not a flag.
+
+##### The toolkit upgrade required installing nothing
+
+`py-3.13` on the workstation already carried **CUDA 13.1.0**. The constraint was to leave `py-3.12`'s
+torch/Lightning alone; nothing was installed in either environment, and the invariants were checked
+after: `py-3.12` still reports `2.8.0+cu128 / True` with `nvcc 12.8`, `py-3.13` still `2.9.0+cu130 /
+True`. `~/.local/bin/ninja` supplied the generator, since `py-3.13` has none.
+
 #### P4.8g — `loom-py-rt-cuda`, and what "two strings changed" cost — DONE (2026-08-14)
 
 P4.8a said a second accelerator package would be `packaging/rt-vulkan/` with two strings changed.
