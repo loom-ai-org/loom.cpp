@@ -7,7 +7,6 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
 
 #include <cmath>
 #include <cstdio>
@@ -22,7 +21,12 @@ namespace {
 // driver's argmax epilogue reads.
 std::vector<float> last_row_logits(const std::string& path, const std::vector<int32_t>& tokens,
                                     int64_t& n_vocab_out) {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    // Through the registry, not ggml_backend_cpu_init(): that symbol is inside the CPU backend,
+    // which a GGML_BACKEND_DL build dlopens rather than links (BACKLOG.md P4.8b). Device::open
+    // performs the sweep that populates the registry, so this works in either link mode.
+    (void)loom::available_devices();  // performs the sweep that populates a DL build's registry
+    ggml_backend_ptr backend(ggml_backend_dev_init(
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr));
     auto model = loom::GgufModel::load(path, backend.get());
     // "main_topo" is the pre-KV-CACHE.md-N.2 name, kept so this can also run GGUFs exported before
     // this session -- which is how "did I introduce this?" gets answered rather than argued.

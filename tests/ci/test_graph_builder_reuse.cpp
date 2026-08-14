@@ -30,7 +30,7 @@
 #include "loom/loom.h"
 
 #include <ggml-alloc.h>
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cstdint>
 #include <cstring>
@@ -360,7 +360,7 @@ void test_declared_inputs_are_never_aliased(loom::GgufModel& model, const loom::
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string gguf_path = std::string(LOOM_TEST_FIXTURE_DIR) + "/toy_llm.gguf";

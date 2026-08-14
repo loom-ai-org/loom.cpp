@@ -16,7 +16,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 using loom_test::GgmlScratch;
 using loom_test::set_f32;
@@ -100,7 +100,7 @@ void test_reset_zeroes_everything(ggml_backend_t backend) {
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     test_append_does_not_corrupt_earlier_cells(backend.get());

@@ -29,7 +29,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstring>
@@ -103,7 +103,7 @@ size_t bit_differences(const PoolCase& c, ggml_backend_t backend) {
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     // --- Everything op_pool_1d promises to lower is bit-identical ------------------------------------

@@ -12,7 +12,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -85,7 +85,7 @@ int main() {
     LOOM_CHECK(z_p_shape.size() == 2 && z_p_shape[0] == 192);
     const auto Tp = static_cast<uint32_t>(z_p_shape[1]);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/vits_flow_vocoder.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

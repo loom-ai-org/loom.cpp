@@ -28,7 +28,7 @@
 #include "ggml_test_helpers.h"
 #include "test_util.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <vector>
@@ -259,7 +259,7 @@ void test_full_topology_reuse_with_full_refresh_matches_fresh_rebuild(ggml_backe
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     test_conv1d_reuse_with_full_refresh_matches_fresh_rebuild(backend.get());

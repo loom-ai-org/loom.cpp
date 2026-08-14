@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -79,7 +79,7 @@ int main() {
                && static_cast<uint32_t>(noise_shape[1]) == dim);
     LOOM_CHECK(static_cast<uint32_t>(har_shape[0]) == L);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/kokoro_sinegen.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

@@ -21,7 +21,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -142,7 +142,7 @@ int main() {
     std::vector<float> ref_mu = read_npy_f32(ref_dir + "/ref_text_encoder_mu.npy", mu_shape);
     std::vector<float> ref_logw = read_npy_f32(ref_dir + "/ref_text_encoder_logw.npy", logw_shape);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_path, backend.get());
     LOOM_CHECK(model != nullptr);

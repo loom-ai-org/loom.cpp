@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -65,7 +65,7 @@ int main() {
     LOOM_CHECK(t.size() == 1);
     LOOM_CHECK(expected.size() == z_t.size());
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/supertonic_vfe.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

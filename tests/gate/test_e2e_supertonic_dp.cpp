@@ -12,7 +12,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -67,7 +67,7 @@ int main() {
     LOOM_CHECK(stl_emb.size() == kStlDim);
     LOOM_CHECK(expected.size() == 1);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/supertonic_dp.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

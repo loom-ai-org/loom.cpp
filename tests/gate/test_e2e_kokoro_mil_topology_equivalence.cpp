@@ -25,7 +25,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -211,7 +211,7 @@ int main() {
         {"styletts2", "LOOM_STYLETTS2_LUA_DIR", "styletts2.gguf", "LOOM_STYLETTS2_MIL_GGUF"},
     };
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
 
     int families_run = 0;

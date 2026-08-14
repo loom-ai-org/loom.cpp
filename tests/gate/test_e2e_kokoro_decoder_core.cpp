@@ -10,7 +10,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -80,7 +80,7 @@ int main() {
     LOOM_CHECK(static_cast<uint32_t>(f0_shape[0]) == 2 * T);
     LOOM_CHECK(static_cast<uint32_t>(x_shape[0]) == 2 * T && static_cast<uint32_t>(x_shape[1]) == kAsrCh);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(dir + "/kokoro_decoder_core.gguf", backend.get());
     LOOM_CHECK(model != nullptr);

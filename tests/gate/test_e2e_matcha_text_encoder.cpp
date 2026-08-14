@@ -11,7 +11,7 @@
 
 #include "loom/loom.h"
 
-#include <ggml-cpu.h>
+#include "cpu_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -87,7 +87,7 @@ std::vector<int32_t> read_npy_i32(const std::string& path, std::vector<int64_t>&
 
 // Runs one topology (mu or logw) against the given tokens; returns the flattened output.
 std::vector<float> run_topology(const std::string& gguf_path, const std::vector<int32_t>& tokens) {
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
     auto model = loom::GgufModel::load(gguf_path, backend.get());
     LOOM_CHECK(model != nullptr);
