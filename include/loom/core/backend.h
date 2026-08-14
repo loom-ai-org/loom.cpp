@@ -33,6 +33,21 @@ struct Backends {
     // The CPU, when `primary` is not already one; null otherwise. Non-owning, like `primary`: a Device
     // (or a test's own ggml_backend_ptr) owns both, and must outlive everything holding this.
     ggml_backend_t fallback = nullptr;
+    // Backends BETWEEN `primary` and the CPU: accelerators whose tensors live in host memory, so that
+    // a node the primary cannot run has somewhere better than the CPU to land (BACKLOG.md P4.8b).
+    //
+    // The reason this is worth having is narrower than it looks, and worth stating so it is not
+    // over-applied. A host accelerator does NOT take work away from the primary: BLAS implements
+    // roughly MUL_MAT/OUT_PROD, a strict subset of what every GPU backend does, so with a GPU primary
+    // it can claim nothing the GPU had not already claimed. What it does is improve the FALLBACK --
+    // when a node drops out of the primary its data has to reach host memory anyway, and once it is
+    // there, running a large matmul through OpenBLAS beats running it through the plain CPU kernel at
+    // no extra transfer. That predicts where this pays: a primary with thin op coverage, i.e. an NPU.
+    //
+    // Only host-memory accelerators belong here, never a second discrete device. ggml has no general
+    // peer-to-peer path, so a copy between two discrete backends goes through host memory in both
+    // directions -- four transfers where falling back to the CPU costs two.
+    std::vector<ggml_backend_t> assists;
 
     Backends() = default;
     // Implicit on purpose. Every call site that passed a bare `ggml_backend_t` before this existed --
@@ -41,11 +56,29 @@ struct Backends {
     Backends(ggml_backend_t backend) : primary(backend) {}
     Backends(ggml_backend_t compute_backend, ggml_backend_t cpu_fallback)
         : primary(compute_backend), fallback(cpu_fallback) {}
+    Backends(ggml_backend_t compute_backend, std::vector<ggml_backend_t> assist_backends,
+             ggml_backend_t cpu_fallback)
+        : primary(compute_backend), fallback(cpu_fallback), assists(std::move(assist_backends)) {}
 
     // Whether a graph built against this needs `ggml_backend_sched` rather than a plain gallocr. The
     // `fallback != primary` half matters: `Device::open("cpu")` resolves both to the same CPU backend
     // rather than special-casing itself, and scheduling the CPU against itself is pure overhead.
     bool hybrid() const { return fallback != nullptr && fallback != primary; }
+
+    // Exactly what `ggml_backend_sched_new` is handed, in the order it is handed: the primary first,
+    // then any assists, and the CPU LAST -- which ggml asserts, because its split planner treats the
+    // final backend as the one able to run anything. Nulls and duplicates are dropped here so that no
+    // caller has to think about either.
+    std::vector<ggml_backend_t> schedule_order() const {
+        std::vector<ggml_backend_t> order;
+        order.reserve(assists.size() + 2);
+        if (primary != nullptr) order.push_back(primary);
+        for (ggml_backend_t assist : assists) {
+            if (assist != nullptr && assist != primary && assist != fallback) order.push_back(assist);
+        }
+        if (hybrid()) order.push_back(fallback);
+        return order;
+    }
 };
 
 // One entry per device the LINKED-IN ggml backends report -- the CPU is always among them. What
@@ -58,6 +91,19 @@ struct DeviceInfo {
     size_t memory_free = 0;
     size_t memory_total = 0;
 };
+
+// Tell the engine where to find dynamically loaded backends, for a build configured with
+// GGML_BACKEND_DL (where every backend, the CPU included, is a .so found at run time rather than linked).
+//
+// ggml searches the executable's directory and the current directory by default. That is right for
+// loom_cli and wrong for an embedded host: inside a Python interpreter the executable is `python`, and
+// the current directory belongs to the caller. A host that ships backends alongside itself passes their
+// directory here, before the first Device::open or available_devices() -- or after, which also works,
+// since the next call sweeps whatever has been added since.
+//
+// Directories added here are searched BEFORE ggml's own defaults, and adding the same one twice is
+// harmless. Has no effect on a build with backends linked in: those register themselves.
+void add_backend_search_path(const std::string& dir);
 
 // Every registered device, in ggml's own registration order. Safe to call before any Device exists --
 // it is what initializes the backend registry.
@@ -73,23 +119,47 @@ public:
     // for itself: the explicit argument first, then the `LOOM_DEVICE` environment variable, then
     // autodetection. The accepted spellings are:
     //
-    //   "auto"  (or empty, with no LOOM_DEVICE) -- the first GPU/iGPU/accelerator device registered,
-    //                                             else the CPU. On a build with no device backend
-    //                                             compiled in there IS no such device, so this is the
-    //                                             CPU and the engine behaves exactly as it did before
-    //                                             this existed.
+    //   "auto"  (or empty, with no LOOM_DEVICE) -- the best device present, ranked by WHAT IT IS and
+    //                                             never by the order ggml registered it (see below).
+    //                                             On a build with no device backend compiled in the
+    //                                             only candidate is the CPU, so this behaves exactly
+    //                                             as it did before any of this existed.
     //   "cpu"                                   -- the CPU, whatever else is available.
-    //   "gpu"                                   -- the first GPU/iGPU/accelerator; THROWS if there is
+    //   "gpu"                                   -- a GPU or iGPU, and nothing else; THROWS if there is
     //                                             none, because a caller who asked for one specifically
     //                                             is better served by an error than by a CPU run they
     //                                             did not ask for and cannot see.
+    //   "npu" (or "accel")                      -- an accelerator with its own memory; THROWS if there
+    //                                             is none. A host-memory accelerator such as BLAS is
+    //                                             NOT one -- name it directly if that is what you mean.
     //   a device name ("Vulkan0", "CUDA0", ...) -- that device, matched case-insensitively against
     //                                             available_devices(); throws if absent.
+    //
+    // THE RANKING, and why it is not "the first non-CPU device" (BACKLOG.md P4.8b):
+    //
+    //   0  GPU / iGPU
+    //   1  an accelerator with its own memory (a discrete NPU)
+    //   2  an accelerator in host memory (BLAS; possibly an NPU on a UMA SoC)
+    //   3  the CPU
+    //
+    // "the first non-CPU device registered" was the rule until 2026-08-14, and it is not a stable
+    // notion: ggml registers backends in one order when they are linked in and a DIFFERENT order when
+    // they are loaded dynamically. The same source on the same machine resolved "gpu" to Vulkan0 in a
+    // linked build and to BLAS in a GGML_BACKEND_DL build -- and DL is what the Python wheels ship. A
+    // ranking by device kind removes registration order from the answer entirely.
+    //
+    // What is NOT solved: ties WITHIN a rank. Two GPUs are still separated by registration order,
+    // because nothing about a machine says CUDA0 should beat Vulkan0. Name one.
     //
     // Throws loom::Error on an unresolvable spec or a device that fails to initialize.
     static Device open(const std::string& spec = "");
 
-    Backends backends() const { return {primary_.get(), fallback_.get()}; }
+    Backends backends() const {
+        std::vector<ggml_backend_t> assist_handles;
+        assist_handles.reserve(assists_.size());
+        for (const ggml_backend_ptr& assist : assists_) assist_handles.push_back(assist.get());
+        return {primary_.get(), std::move(assist_handles), fallback_.get()};
+    }
     // The selected device's ggml name and human-readable description -- what a host prints to say what
     // it is actually running on.
     const std::string& name() const { return name_; }
@@ -108,6 +178,9 @@ private:
     // Held only when `primary_` is a device backend. Null for a CPU Device, which is what is_cpu() reads
     // and what keeps `backends().hybrid()` false there.
     ggml_backend_ptr fallback_;
+    // Host-memory accelerators, held only when `primary_` is a device with its own memory. See
+    // Backends::assists for why they are worth carrying and why a second discrete device is not.
+    std::vector<ggml_backend_ptr> assists_;
     std::string name_;
     std::string description_;
 };

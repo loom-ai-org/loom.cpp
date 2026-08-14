@@ -498,10 +498,14 @@ void GraphBuilder::allocate_scheduled(ggml_cgraph* gf) {
         // time) does not rebuild the scheduler every few dozen steps, which would also throw away the
         // split plan the retained graph exists to keep.
         const size_t capacity = std::max<size_t>(needed + needed / 4, GGML_DEFAULT_GRAPH_SIZE);
-        ggml_backend_t backends[2] = {backends_.primary, backends_.fallback};
-        // The CPU MUST be last: ggml_backend_sched_new asserts it, because its split planner treats the
-        // final backend as the one that can run anything.
-        sched_.reset(ggml_backend_sched_new(backends, /*bufts=*/nullptr, /*n_backends=*/2, capacity,
+        // The primary, then any host-memory assists, then the CPU. The CPU MUST be last:
+        // ggml_backend_sched_new asserts it, because its split planner treats the final backend as the
+        // one that can run anything. Backends::schedule_order() is what guarantees that ordering, and
+        // it is the only place that knows it.
+        // Non-const because ggml_backend_sched_new takes `ggml_backend_t *`, not a pointer to const.
+        std::vector<ggml_backend_t> order = backends_.schedule_order();
+        sched_.reset(ggml_backend_sched_new(order.data(), /*bufts=*/nullptr,
+                                            /*n_backends=*/static_cast<int>(order.size()), capacity,
                                             /*parallel=*/false, /*op_offload=*/true));
         if (!sched_) {
             throw Error("GraphBuilder::build: ggml_backend_sched_new failed");
@@ -556,7 +560,9 @@ int GraphBuilder::splits() const {
 size_t GraphBuilder::buffer_size() const {
     if (sched_) {
         size_t total = 0;
-        for (ggml_backend_t b : {backends_.primary, backends_.fallback}) {
+        // Every backend the scheduler was given, not just the pair -- an assist allocates its own
+        // buffers like any other, and omitting it would under-report the graph's real footprint.
+        for (ggml_backend_t b : backends_.schedule_order()) {
             total += ggml_backend_sched_get_buffer_size(sched_.get(), b);
         }
         return total;
