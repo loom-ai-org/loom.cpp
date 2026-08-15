@@ -7,6 +7,7 @@
 #include "loom/loom_errors.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <unordered_map>
 
@@ -229,7 +230,19 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         // iterations to cross it.
         size_t advance = clip;
         if (last_complete_end > window_start) {
-            auto candidate = static_cast<size_t>((last_complete_end - window_start) * rate);
+            // ROUNDED, not truncated, and the difference is a whole extra decode. A segment end is a
+            // float number of seconds, so the sample index it maps to is almost never exact: with the
+            // timestamp step read from the file as f32 (`loom.asr.timestamp_step_sec`), 550 steps of
+            // 0.02 s come to 10.99999975 s rather than 11, and 11 s of audio at 16 kHz truncates to
+            // 175999 -- one sample short of the end. The loop then ran a SECOND window over four
+            // samples of real audio and 30 s of zero padding, and Whisper transcribed the silence as
+            // "[BLANK_AUDIO]", which was appended to the transcript.
+            //
+            // Truncating a sample index derived from a float time was arbitrary anyway; the value is a
+            // measurement with error either side of it, and rounding is what that deserves. Found by
+            // re-exporting the gate fixtures with the declared table and comparing against the same
+            // audio through the old derived-from-hparams path, which had absorbed the error by luck.
+            auto candidate = static_cast<size_t>(std::llround((last_complete_end - window_start) * rate));
             candidate = std::max(candidate, static_cast<size_t>(rate));
             if (candidate <= clip) advance = candidate;
         }

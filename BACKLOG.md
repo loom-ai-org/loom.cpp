@@ -6978,6 +6978,20 @@ ASR family gates was decorative: they printed "OK" and exited 0 no matter how ma
 fixed here. Caught only because the new test was deliberately sabotaged to confirm it could go red, and
 did not — which is the argument for that habit rather than a coincidence.
 
+**The seek truncated a sample index, and re-exporting the fixtures is what showed it.** A segment end
+is a float number of seconds, so the sample index it maps to is almost never exact. With the timestamp
+step read from the file as f32 (`loom.asr.timestamp_step_sec`), 550 steps of 0.02 s come to 10.99999975
+rather than 11, and 11 s at 16 kHz truncated to 175999 -- one sample short of the end. The loop then ran
+a second window over four samples of real audio plus 30 s of zero padding, and Whisper transcribed the
+silence as `[BLANK_AUDIO]`, appended to the transcript. Rounded now, which is what a measurement with
+error either side of it deserves; truncation was arbitrary regardless of where the float came from.
+
+Invisible until the fixtures carried the declared table: the old path derived the step from three
+hparams in double and absorbed the error by luck, so v4 gave one window and v5 gave two on identical
+audio. **Verified behaviourally on both fixture sets through `loom_cli`, and NOT pinned by a test** -- a
+hermetic one needs a fixture that emits timestamp tokens and carries a vocabulary to detokenize them,
+which does not exist yet. Worth building before the next change to this loop.
+
 **Not done here, and the sequence for it** is docs/HIGH-LEVEL-API.md §7. Next: the exporter writes the
 contract (§3), then loom-py's X2Y interface layer consumes it.
 
