@@ -37,6 +37,7 @@ add_library(loom_engine
     src/core/bpe_vocab.cpp
     src/core/wordpiece_vocab.cpp
     src/core/byte_vocab.cpp
+    src/core/phoneme_vocab.cpp
     src/core/supertonic_text_vectorizer.cpp
     src/core/ctc_decode.cpp
     src/ops/primitive_registry.cpp
