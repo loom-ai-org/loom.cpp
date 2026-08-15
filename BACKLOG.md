@@ -7018,9 +7018,31 @@ default voice; the other three take one through `infer`.
    24 kHz. Each needs it read from its own checkpoint. Silent when wrong, which is why it warns.
 2. **`orthography2ipa` is not ported.** The Python path behind `loom-py-rt[phonemes]` is what runs
    today; Task #79 above holds the plan and the two risks.
-3. **`loom.tts.voices` is empty everywhere.** Kokoro's default is the style from its own `ref/` dump
-   rather than a named upstream pack, so there is nothing yet for `voice=` to select between.
-4. **The legacy fallbacks in `model_contract.h` are now dead weight** for any re-exported model, and
+3. **`loom.tts.voices` is empty everywhere, and cannot mean one thing across TTS models.** The five
+   families obtain a voice three different ways, which is a property of what was traced rather than a
+   gap:
+
+   | | where the voice comes from | what selects it |
+   |---|---|---|
+   | StyleTTS2 | the traced `diffusion` topology samples it from noise; no `ref_s` input exists | `seed` |
+   | Kokoro | passed in as `2*style_dim` floats; its diffusion is NOT traced | the vector (a default now ships in-file) |
+   | Supertonic | two style tensors; default `F1` in-file, nine more as repo files | the vectors |
+   | VITS, Matcha | single-speaker — the voice IS the weights | nothing |
+
+   So `voice=` would select a vector for two families and a seed for one, and mean nothing for two.
+   Worth settling before the key is filled in rather than after. Reference-audio cloning is out of
+   scope for all of them for the same reason: it needs the style-encoder chain none of these exports
+   traces.
+
+4. **Gate fixtures live at `loom-engine-artifacts/v5`** — 13 models, all declaring their contracts,
+   `ctest -L gate` green against them. v4 is the pre-contract set and is superseded; it is what the
+   engine's legacy fallbacks are still tested against, so do not delete it without reading the
+   `model_contract.h` fallback note first.
+
+5. **Any recorded export-sweep baseline from before 2026-08-15 is stale.** Every model gained the
+   contract KVs, so a sweep against an older baseline reports 17 diffs that are all expected. Re-record
+   before using one to judge a change.
+6. **The legacy fallbacks in `model_contract.h` are now dead weight** for any re-exported model, and
    deleting them should be its own commit once the published fleet is re-exported.
 
 **Not done here, and the sequence for it** is docs/HIGH-LEVEL-API.md §7. Next: the exporter writes the
