@@ -69,6 +69,36 @@ add_test(NAME test_gguf_model_load COMMAND test_gguf_model_load)
 set_tests_properties(test_gguf_model_load PROPERTIES LABELS ci)
 set_tests_properties(test_gguf_model_load PROPERTIES FIXTURES_REQUIRED minimal_gguf_fixture)
 
+# --- What a file declares about itself, and what a file that declares nothing falls back to ---
+add_test(
+    NAME gen_contract_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_contract_gguf.py
+            ${LOOM_FIXTURE_DIR}
+)
+set_tests_properties(gen_contract_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_contract_gguf_fixture PROPERTIES FIXTURES_SETUP contract_gguf_fixture)
+
+add_executable(test_model_contract ci/test_model_contract.cpp)
+target_link_libraries(test_model_contract PRIVATE loom::engine)
+target_compile_definitions(test_model_contract PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_model_contract COMMAND test_model_contract)
+set_tests_properties(test_model_contract PROPERTIES LABELS ci)
+set_tests_properties(test_model_contract PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
+add_executable(test_text_generate ci/test_text_generate.cpp)
+target_link_libraries(test_text_generate PRIVATE loom::engine)
+target_compile_definitions(test_text_generate PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_text_generate COMMAND test_text_generate)
+set_tests_properties(test_text_generate PROPERTIES LABELS ci)
+set_tests_properties(test_text_generate PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
+add_executable(test_transcribe_seek ci/test_transcribe_seek.cpp)
+target_link_libraries(test_transcribe_seek PRIVATE loom::engine)
+target_compile_definitions(test_transcribe_seek PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_transcribe_seek COMMAND test_transcribe_seek)
+set_tests_properties(test_transcribe_seek PROPERTIES LABELS ci)
+set_tests_properties(test_transcribe_seek PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
 # --- Phase 2: primitive registry / topology parsing / graph builder ---
 
 add_executable(test_primitive_registry ci/test_primitive_registry.cpp)
