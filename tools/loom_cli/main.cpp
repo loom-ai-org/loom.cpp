@@ -103,18 +103,14 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     }
     bridge.load_script(model.kv_str("model.driver_script"));
 
-    auto bpe_vocab = loom::BpeVocab::load(model);
     loom::audio::TranscribeOptions options;
     options.timestamps = timestamps;
     options.condition_on_previous = condition_on_previous;
-    // `--language en` -> the id of `<|en|>`, resolvable only through a BPE vocab. Left negative when
-    // the caller named none, which is how the driver is told to detect or fall back.
-    if (!language_name.empty() && bpe_vocab) {
-        options.language = bpe_vocab->piece_to_id("<|" + language_name + "|>");
-    }
-    if (!task_name.empty() && bpe_vocab) {
-        options.task = bpe_vocab->piece_to_id("<|" + task_name + "|>");
-    }
+    // Straight through as NAMES. Resolving them to `<|en|>`-style token ids used to happen here, which
+    // is why loom-py callers had to pass an integer they could not look up; the engine holds the vocab
+    // and does it for both front ends now.
+    options.language = language_name;
+    options.task = task_name;
 
     const loom::audio::Transcription result = loom::audio::transcribe(bridge, model, waveform, options);
 

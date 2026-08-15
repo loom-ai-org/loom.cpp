@@ -136,6 +136,26 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
 
+    // Names to token ids, here rather than in a host: only the vocabulary can answer, and every host
+    // would otherwise reimplement it or push the lookup onto a caller who cannot do it.
+    const auto resolve = [&](const std::string& name, const char* what) -> int32_t {
+        if (name.empty()) return -1;
+        if (!bpe_vocab) {
+            throw LoadError("transcribe: this model's vocabulary cannot resolve a " + std::string(what) +
+                            " by name (only a byte-level BPE vocab carries `<|" + name + "|>` tokens); "
+                            "omit it and let the driver decide.");
+        }
+        const int32_t id = bpe_vocab->piece_to_id("<|" + name + "|>");
+        if (id < 0) {
+            throw LoadError("transcribe: this model has no " + std::string(what) + " token `<|" + name +
+                            "|>`. An English-only checkpoint has no language tokens at all, and no "
+                            "translate task; omit the argument to let the driver decide.");
+        }
+        return id;
+    };
+    const int32_t language_id = resolve(options.language, "language");
+    const int32_t task_id = resolve(options.task, "task");
+
     Transcription out;
     const uint32_t clip = fixed_clip_samples(model);
     const uint32_t max_new_tokens = default_max_new_tokens(model);
@@ -181,7 +201,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     while (seek < waveform.size()) {
         const size_t avail = std::min(static_cast<size_t>(clip), waveform.size() - seek);
         const std::vector<double> window = window_at(waveform, seek, clip);
-        const std::vector<int32_t> ids = run_driver(bridge, window, options.language, options.task,
+        const std::vector<int32_t> ids = run_driver(bridge, window, language_id, task_id,
                                                     want_timestamps, prev_tokens, max_new_tokens,
                                                     eos_id);
         const double window_start = static_cast<double>(seek) / rate;
