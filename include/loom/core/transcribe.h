@@ -48,11 +48,21 @@ struct Segment {
 };
 
 struct TranscribeOptions {
-    // Negative means OMIT the argument rather than pass a default, which is how a driver is told to
+    // NAMES, not token ids, and that is the whole point of them being here. Whisper takes the language
+    // as a vocabulary token -- `<|en|>` -- and resolving a name to that id needs the BPE vocab the
+    // GGUF embeds. When that resolution lived in the CLI, `loom_cli --language en` worked and loom-py
+    // callers had to supply a raw integer they had no way to look up. The engine holds the vocab, so
+    // the engine resolves it, and both front ends take "en".
+    //
+    // Empty means OMIT the argument rather than pass a default, which is how a driver is told to
     // decide for itself -- one that can detect the language does so, one that cannot falls back to its
     // own default, and only the driver knows which it is.
-    int32_t language = -1;
-    int32_t task = -1;
+    //
+    // An unknown name is an ERROR rather than a silent omission: "language=en" that quietly becomes
+    // "detect" is a wrong transcript with no explanation, and the caller asserting a language is
+    // exactly the caller who wants to hear that this model does not have it.
+    std::string language;
+    std::string task;
     // Ask the model for timestamps in the OUTPUT. They are requested internally whenever the seek
     // needs them regardless, so this only controls what the caller gets back.
     bool timestamps = false;
