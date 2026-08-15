@@ -327,6 +327,10 @@ int main() {
         LOOM_CHECK(differs);
     }
 
-    std::fprintf(stderr, "test_e2e_qwen3_asr_mil_export: OK\n");
-    return 0;
+    // NOT `return 0`, which is what this said and what made every LOOM_CHECK above
+    // decorative: the macro only COUNTS failures, so this gate reported "OK" and exited 0
+    // however many of them had fired. It could not go red, and a gate that cannot fail
+    // proves nothing (CLAUDE.md).
+    std::fprintf(stderr, "test_e2e_qwen3_asr_mil_export: done\n");
+    LOOM_TEST_REPORT_AND_RETURN();
 }

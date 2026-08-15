@@ -14,10 +14,14 @@
 // early stop is unarmed will happily emit two hundred `<|endoftext|>` tokens. A third host should
 // inherit them rather than rediscover them.
 //
-// WHAT IS DELIBERATELY NOT HERE: the CLI's timestamp-aware seek, which advances to where the model
-// closed its last segment rather than by a fixed stride, so an utterance straddling a window edge is
-// re-decoded whole. That needs the timestamp token ids out of the vocabulary and a segment splitter,
-// and it is long-form transcription policy rather than a property of the file. It stays in the CLI.
+// WHAT IS DELIBERATELY NOT HERE: the timestamp-aware seek, which advances to where the model closed
+// its last segment rather than by a fixed stride, so an utterance straddling a window edge is
+// re-decoded whole. That needs a segment splitter and the model's declared timestamp ids, and it is
+// long-form transcription POLICY rather than a property of the file -- so it lives one layer up, in
+// `transcribe.h`, which owns the loop that calls these. An earlier version of this comment said it
+// "stays in the CLI", which was true for about a day: the same reasoning that brought windowing here
+// took the seek the rest of the way, since a policy every host needs is not a property of any one of
+// them.
 
 #include "loom/core/gguf_model.h"
 

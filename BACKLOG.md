@@ -22,17 +22,49 @@ investigation before scoping).
 Deferred by explicit user direction (flow-matching TTS, `OdeStepper`-adjacent — likely shares primitives
 with Matcha-TTS, which is done). Last of the originally-considered 7-model TTS list still untouched.
 
-### Task #79: permissively-licensed phonemizer
+### Task #79: permissively-licensed phonemizer — UNBLOCKED (2026-08-15), sequenced
 
 VITS, Kokoro, StyleTTS2, and Matcha-TTS drivers all still take raw token-id/demo text input — none of them
 do real text→phoneme conversion. Real `espeak-ng`-based phonemization was confirmed to work numerically
 (via the external `piper_phonemize` Python package) but vendoring it was rejected: both stock espeak-ng and
 the piper-phonemize fork are GPL-3, incompatible with this repo's permissive licensing (see
-`[[loom_engine_licensing_phonemizer]]` memory). Current plan: integrate **phoonnx** (a friend-of-the-user's
-project) instead, once its license/API are confirmed — not yet investigated. A `src/text/phonemize.cpp` +
-`include/loom/text/phonemize.h` split matching this project's existing driver-code conventions is the
-intended shape. SupertonicTTS is the one model in this family that needs no phonemizer at all — its
-`TextVectorizer` is a license-free unicode codepoint lookup table.
+`[[loom_engine_licensing_phonemizer]]` memory). SupertonicTTS is the one model in this family that needs
+no phonemizer at all — its `TextVectorizer` is a license-free unicode codepoint lookup table.
+
+**The licence blocker is gone.** The plan is now a C++ port of
+[`orthography2ipa`](https://github.com/TigreGotico/orthography2ipa) (TigreGotico, same org as phoonnx),
+vendored as a **submodule**: verified **Apache-2.0**, which is permissive and compatible with this repo's
+MIT. It is rule-based transduction with no weights — ~900 language JSON specs plus one language-agnostic
+engine (tokenizer, beam search, allophone rules, stress, sandhi), which is the same interpreter/data
+split this repo argues for everywhere else. `src/text/phonemize.cpp` + `include/loom/text/phonemize.h`
+remains the intended shape.
+
+**Decided with it (user direction, 2026-08-15; docs/HIGH-LEVEL-API.md §5):**
+
+* **Rules and data live in the engine, one copy** — single source of truth, improvable for every model
+  at once by bumping the submodule, no re-export. Embedding per-GGUF was considered and rejected
+  despite preserving "the model is one file": it trades that for the re-export corollary, which is the
+  wrong side for data expected to keep improving. The file declares only what it needs
+  (`loom.text.phoneme_alphabet`, `loom.text.languages`, its own symbol→id table) plus
+  `loom.phonemizer.ruleset`, the version it was validated against, so a rule change that alters output
+  is *attributable*. It WARNS, never fails.
+* **Python door first, the CLI's native one scoped as the target.** The Python path is not a stopgap:
+  it is the oracle the C++ port is verified against, the same relationship `fixture_gen/`'s reference
+  forwards have to the exported graphs.
+
+**Task #79 splits in two, and only the second half needs the port.** The phoneme symbol table is data
+already sitting in the checkpoint and simply not exported; exporting it as a vocabulary family gives
+four TTS models a real `model.tokenizer` and a working `synthesize(phonemes=...)` with no licence
+question involved at any point.
+
+**Two risks, both measurable before any C++ (§5).** `orthography2ipa` is a superset of the union of
+espeak-ng, Epitran and others, harmonized across references and literature-validated, so feeding a
+checkpoint richer IPA than its training front end produced is a low *quality* risk — these models
+degrade gracefully, Piper managing in some languages with graphemes substituted outright. What the
+superset does require is a **fold-down** into each checkpoint's fixed symbol→id table, since a symbol
+outside it has no id at all and that is a lookup with no answer rather than a degradation. Second: the
+beam search returns ranked lattices, and the tie-break must be pinned or the CLI and loom-py drift —
+the exact failure P5.0 exists to stop.
 
 **Corrected 2026-08-11:** that entry used to call Supertonic "fully closed", which was true of the engine
 and false of everything a user touches. `loom::SupertonicTextVectorizer` existed and was gate-verified,
@@ -6883,6 +6915,71 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 ---
 
 ## Engine
+
+### P5.0 — the high-level API: one door per task, declared by the file (2026-08-15)
+
+Design: **`docs/HIGH-LEVEL-API.md`**, which is the authority; this entry is the ledger stub and the
+record of what shipped.
+
+**What prompted it.** loom-py #6 added `transcribe` and had to argue from first principles where a
+high-level door belongs, because `generate` — the only one that existed — was never placed by a rule.
+It was the causal-LM task's door, added when that was the only task with one, and named as if it were
+universal. TTS needs a third door and the modality list does not stop there, so the placement question
+was going to recur until it was answered once.
+
+**What was actually broken, found while writing it up:**
+
+* **The causal-LM decode loop existed twice and had drifted.** `tools/loom_cli/main.cpp` ran the full
+  `--n-predict` with **no EOS stop at all**, took `vec[0]` of a list return where the new token is the
+  last, and silently rewrote any id `>= 65536` to `0`. loom-py's `generate_ids` stopped on the file's
+  own `eos_token_id`, took `vec[-1]`, and stripped the stop token. Same model, same driver, two
+  different transcripts depending on which host you asked. None of the three differences was a decision.
+* **Hosts inferred what a model IS from its tokenizer tag.** `loom_cli` branched on
+  `tokenizer.ggml.model == "bert" | "byt5" | "supertonic"` and dead-ended each as inspection-only — a
+  Supertonic GGUF is a complete TTS model reaching a branch that exists to stop it being parsed as
+  token ids.
+* **`transcribe.cpp` was per-task in shape and per-family in its constants** (`<|0.00|>`, `<|en|>`,
+  `<|notimestamps|>` — Whisper's spellings, not ASR's), so the second timestamped family would have
+  cost engine code.
+* **The bridge/cache setup existed three times**, and `run_asr`'s copy attached a `KvCache` and no
+  `ConvStateCache` — a speech model with ShortConv blocks would have thrown on its first SHORT_CONV
+  node, the same failure P4.0.10 fixed for the umbrella header.
+
+The common cause is one sentence: **nothing in a GGUF said what contract it implements**, so every
+host-side high-level door was either impossible or per-architecture code.
+
+**The rule adopted** (docs/HIGH-LEVEL-API.md §2): in the FILE when it is a property of the checkpoint;
+in the ENGINE when it is a property of the task; in the HOST when it needs the host's ecosystem. With
+the corollary that settles the hard cases: anything shipped inside a GGUF can only be fixed by
+re-exporting every model, so an evolving policy must not be baked into files even when Lua could
+express it. Net: **per-task code may live in any layer; per-architecture code only in the exporter.**
+
+**Shipped in the engine (this branch):**
+
+| | |
+|---|---|
+| `include/loom/core/model_contract.h` | the one place that knows the declared KV names; every reader absence-tolerant, `declared()` separates a file that states its contract from one a caller must know about |
+| `include/loom/core/text_generate.h` | `loom::text::generate` — one LM loop, both driver shapes, the file's own EOS. CLI switched to it; the three CLI-only behaviours above are gone |
+| `include/loom/core/session.h` | topologies registered and caches attached once, owned in an order that cannot dangle. Kills three copies including the one missing `ConvStateCache` |
+| `transcribe.cpp` | reads the declared ASR table; the Whisper spellings survive only as a flagged legacy fallback for files that predate it |
+| `audio_window.h` | header comment said the timestamp seek "stays in the CLI", which its own sibling in the same PR contradicted |
+
+**Verified.** ci 60/60 (the new `test_model_contract` covers the declared file AND the legacy fallback,
+because a declared-only test would stay green while the fallback every GGUF on disk depends on rotted).
+gate 82/82 against `loom-engine-artifacts/v4`. Behaviourally on real files: `jfk.wav` through
+whisper_mil transcribes identically with `--language en` (the legacy spelled-lookup path) and produces
+one closed segment at `00:00:00.000 --> 00:00:11.000` with `--timestamps`; LFM2 generates coherent text
+through the unified loop.
+
+**A gate that could not fail, found on the way.** `LOOM_CHECK` only counts failures —
+`LOOM_TEST_REPORT_AND_RETURN()` is what turns the count into an exit code. `test_e2e_qwen3_asr_mil_export`
+and `test_e2e_granite_speech_mil_export` both ended with `return 0`, so every check in the two newest
+ASR family gates was decorative: they printed "OK" and exited 0 no matter how many had fired. Both
+fixed here. Caught only because the new test was deliberately sabotaged to confirm it could go red, and
+did not — which is the argument for that habit rather than a coincidence.
+
+**Not done here, and the sequence for it** is docs/HIGH-LEVEL-API.md §7. Next: the exporter writes the
+contract (§3), then loom-py's X2Y interface layer consumes it.
 
 ### Performance optimizations designed but not implemented
 

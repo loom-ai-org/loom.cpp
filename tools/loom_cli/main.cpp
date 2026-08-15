@@ -88,20 +88,10 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // actually owns: turning `--language en` into an id, and printing.
     const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
 
-    loom::LoomLuaBridge bridge(backends);
-    // A topology carrying ATTENTION nodes needs a KV cache to write into, sized from the model's own
-    // declared geometry -- Whisper's decoder is one (BACKLOG.md P4.1), and without it `op_attention`
-    // throws and the file cannot be run through the ASR path at all.
-    std::unique_ptr<loom::KvCache> kv_cache;
-    for (const std::string& name : model.topology_names()) {
-        loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json(name));
-        if (topo.uses_kv_cache() && kv_cache == nullptr) {
-            kv_cache = loom::make_kv_cache(model, backends);
-        }
-        loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
-        bridge.register_module(name, model, std::move(topo), cache_for_module);
-    }
-    bridge.load_script(model.kv_str("model.driver_script"));
+    // Registering the topologies and attaching the caches they declare is the engine's now too
+    // (loom/core/session.h). The copy that used to be here attached a KvCache and no ConvStateCache,
+    // which would have thrown inside the driver for any speech model carrying ShortConv blocks.
+    loom::Session session(model, backends);
 
     loom::audio::TranscribeOptions options;
     options.timestamps = timestamps;
@@ -112,7 +102,8 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     options.language = language_name;
     options.task = task_name;
 
-    const loom::audio::Transcription result = loom::audio::transcribe(bridge, model, waveform, options);
+    const loom::audio::Transcription result =
+        loom::audio::transcribe(session.bridge(), model, waveform, options);
 
     if (timestamps && result.timestamped) {
         for (const loom::audio::Segment& seg : result.segments) {
@@ -127,7 +118,7 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
                      result.timestamped ? ", seeking on the model's own timestamps"
                                         : ", cut at fixed boundaries -- this model exposes no timestamps");
     }
-    print_device_report(bridge);
+    print_device_report(session.bridge());
 }
 
 
@@ -297,67 +288,21 @@ int main(int argc, char** argv) {
             }
 
             if (is_multi_topology) {
-                // Initialize the Lua JIT dynamic driver bridge
-                loom::LoomLuaBridge bridge(backends);
-                
-                // Dynamically discover and register all sub-graph modules present in GGUF. A topology
-                // carrying ATTENTION nodes needs a KV cache to write into (KV-CACHE.md stage 2), sized
-                // from the model's own declared geometry -- the CLI asks the file rather than knowing
-                // anything per-model, which is the point of declaring it there.
-                std::unique_ptr<loom::KvCache> kv_cache;
-                std::unique_ptr<loom::ConvStateCache> conv_state;
-                const std::vector<std::string> sub_modules = model->topology_names();
-                for (const std::string& mod_name : sub_modules) {
-                    loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json(mod_name));
-                    if (topo.uses_kv_cache() && kv_cache == nullptr) {
-                        kv_cache = loom::make_kv_cache(*model, backends);
-                    }
-                    loom::KvCache* cache_for_module = topo.uses_kv_cache() ? kv_cache.get() : nullptr;
-                    // A hybrid's ShortConv blocks carry their own history, which the KV cache does not
-                    // hold -- allocated from the file's own loom.n_conv_* keys, same as above
-                    // (BACKLOG.md P4.0.10).
-                    if (topo.uses_conv_state() && conv_state == nullptr) {
-                        conv_state = loom::make_conv_state_cache(*model, backends);
-                    }
-                    loom::ConvStateCache* conv_for_module = topo.uses_conv_state() ? conv_state.get() : nullptr;
-                    bridge.register_module(mod_name, *model, std::move(topo), cache_for_module, conv_for_module);
-                }
-                
-                // Load the master driver script
-                bridge.load_script(model->kv_str("model.driver_script"));
-                
-                // Set up autoregressive prompt and loop
-                std::vector<double> current_prompt;
-                current_prompt.reserve(prompt_tokens.size() + n_predict);
-                for (int32_t tok : prompt_tokens) {
-                    current_prompt.push_back(static_cast<double>(tok));
-                }
-                
+                // THE LOOP IS THE ENGINE'S NOW (loom/core/text_generate.h), and unifying it changed this
+                // CLI's behaviour in three ways that were all bugs rather than choices: it ran the full
+                // `--n-predict` regardless of the model's own end-of-sequence token, it took the FIRST
+                // element of a list return where the new token is the last, and it silently rewrote any
+                // id >= 65536 to 0 -- a guard that would corrupt output for any vocabulary larger than
+                // that rather than reporting anything. loom-py's copy of this loop did none of the three,
+                // which is how the divergence was found (docs/HIGH-LEVEL-API.md §1).
+                loom::Session session(*model, backends);
+
                 std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
-                std::vector<int32_t> generated;
-                generated.reserve(n_predict);
-                
-                for (uint32_t step = 0; step < n_predict; ++step) {
-                    loom::LoomLuaBridge::Value result = bridge.call("infer", {
-                        {"tokens", current_prompt}
-                    });
-                    double next_tok_val = 0.0;
-                    if (std::holds_alternative<double>(result)) {
-                        next_tok_val = std::get<double>(result);
-                    } else if (std::holds_alternative<std::vector<double>>(result)) {
-                        const auto& vec = std::get<std::vector<double>>(result);
-                        if (!vec.empty()) {
-                            next_tok_val = vec[0];
-                        }
-                    }
-                    int32_t next_tok = static_cast<int32_t>(next_tok_val);
-                    if (next_tok < 0 || next_tok >= 65536) {
-                        next_tok = 0; // Guard out-of-range token predictions
-                    }
-                    generated.push_back(next_tok);
-                    current_prompt.push_back(static_cast<double>(next_tok));
-                }
-                
+                loom::text::GenerateOptions gen;
+                gen.max_new_tokens = n_predict;
+                const std::vector<int32_t> generated =
+                    loom::text::generate(session.bridge(), *model, prompt_tokens, gen);
+
                 if (bpe_vocab) {
                     std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
                                 bpe_vocab->decode(generated).c_str());
@@ -366,7 +311,7 @@ int main(int argc, char** argv) {
                     for (int32_t tok : generated) std::printf(" %d", tok);
                     std::printf("\n");
                 }
-                print_device_report(bridge);
+                print_device_report(session.bridge());
             } else {
                 loom::GraphTopology topo = loom::GraphTopology::parse(model->topology_json());
                 loom::GenerationConfig cfg;

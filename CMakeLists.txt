@@ -23,7 +23,10 @@ add_library(loom_engine
     src/core/conv_state_cache.cpp
     src/core/kv_cache.cpp
     src/core/output_store.cpp
+    src/core/model_contract.cpp
+    src/core/session.cpp
     src/core/transcribe.cpp
+    src/core/text_generate.cpp
     src/core/generation.cpp
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp

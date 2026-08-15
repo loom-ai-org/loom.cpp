@@ -2,6 +2,7 @@
 
 #include "loom/core/audio_window.h"
 #include "loom/core/bpe_vocab.h"
+#include "loom/core/model_contract.h"
 #include "loom/core/vocab.h"
 #include "loom/loom_errors.h"
 
@@ -115,16 +116,25 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
                         "<checkpoint> --task automatic-speech-recognition`");
     }
 
+    // What this checkpoint declares about its own decode -- timestamp ids, control ids, the language and
+    // task tables. Everything below reads from here rather than spelling a token, which is what keeps
+    // this loop per-TASK: Canary, Qwen3-ASR and Granite-Speech each spell timestamps and languages
+    // differently, and under the old arrangement the second of them would have cost engine code (see
+    // model_contract.h, and docs/HIGH-LEVEL-API.md §3). Files exported before the table existed get the
+    // Whisper spellings back as a documented fallback inside `read`.
+    const ModelContract contract = ModelContract::read(model);
+    const AsrDecodeTable table = AsrDecodeTable::read(model, bpe_vocab.get(), contract);
+
     // Control tokens a transcript must not contain, dropped before detokenizing because each is a real
     // vocabulary piece that otherwise prints as its literal spelling: the end-of-sequence token, which
     // the driver returns deliberately, and `<|notimestamps|>`, which is the model stating something
     // about the decode rather than a word that was spoken. Timestamp markers are NOT dropped.
+    //
+    // EOS is added here rather than read from the table because every vocabulary family names it the
+    // same way, in `tokenizer.ggml.eos_token_id` -- it needs no per-task declaration to be found.
     const int32_t eos_id = default_eos_token(model);
-    std::vector<int32_t> control_ids{eos_id};
-    if (bpe_vocab) {
-        const int32_t no_ts = bpe_vocab->piece_to_id("<|notimestamps|>");
-        if (no_ts >= 0) control_ids.push_back(no_ts);
-    }
+    std::vector<int32_t> control_ids = table.control_ids;
+    control_ids.push_back(eos_id);
     const auto detokenize = [&](const std::vector<int32_t>& ids) {
         std::vector<int32_t> text_ids;
         text_ids.reserve(ids.size());
@@ -136,25 +146,23 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
 
-    // Names to token ids, here rather than in a host: only the vocabulary can answer, and every host
-    // would otherwise reimplement it or push the lookup onto a caller who cannot do it.
-    const auto resolve = [&](const std::string& name, const char* what) -> int32_t {
+    // Names to token ids, here rather than in a host: only the file can answer, and every host would
+    // otherwise reimplement it or push the lookup onto a caller who cannot do it. The declared table is
+    // asked first; a file that carries none falls back to Whisper's `<|xx|>` spelling, which is the one
+    // place that spelling survives and is flagged as such by `legacy_spelling`.
+    const auto resolve = [&](const std::string& name, const char* what, bool is_task) -> int32_t {
         if (name.empty()) return -1;
-        if (!bpe_vocab) {
-            throw LoadError("transcribe: this model's vocabulary cannot resolve a " + std::string(what) +
-                            " by name (only a byte-level BPE vocab carries `<|" + name + "|>` tokens); "
-                            "omit it and let the driver decide.");
-        }
-        const int32_t id = bpe_vocab->piece_to_id("<|" + name + "|>");
+        int32_t id = is_task ? table.task(name) : table.language(name);
+        if (id < 0 && table.legacy_spelling && bpe_vocab) id = bpe_vocab->piece_to_id("<|" + name + "|>");
         if (id < 0) {
-            throw LoadError("transcribe: this model has no " + std::string(what) + " token `<|" + name +
-                            "|>`. An English-only checkpoint has no language tokens at all, and no "
+            throw LoadError("transcribe: this model has no " + std::string(what) + " named \"" + name +
+                            "\". An English-only checkpoint has no language tokens at all, and no "
                             "translate task; omit the argument to let the driver decide.");
         }
         return id;
     };
-    const int32_t language_id = resolve(options.language, "language");
-    const int32_t task_id = resolve(options.task, "task");
+    const int32_t language_id = resolve(options.language, "language", /*is_task=*/false);
+    const int32_t task_id = resolve(options.task, "task", /*is_task=*/true);
 
     Transcription out;
     const uint32_t clip = fixed_clip_samples(model);
@@ -178,15 +186,13 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         return out;
     }
 
-    const uint32_t sample_rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
-    const uint32_t n_audio_ctx = model.has_kv("loom.n_audio_ctx") ? model.hparam_u32("n_audio_ctx") : 0;
-    const int32_t ts_base = bpe_vocab ? bpe_vocab->piece_to_id("<|0.00|>") : -1;
-    // Seconds per timestamp token: one encoder frame, i.e. the clip's duration over the number of
-    // frames it becomes. Derived from the file's own three numbers rather than hardcoded as 0.02.
-    const double ts_step = (ts_base >= 0 && sample_rate > 0 && n_audio_ctx > 0)
-        ? (static_cast<double>(clip) / sample_rate) / n_audio_ctx : 0.0;
-    const bool can_timestamp = ts_step > 0.0;
-    const double rate = sample_rate ? sample_rate : 16000;
+    const int32_t ts_base = table.timestamp_first_id;
+    const double ts_step = table.timestamp_step_sec;
+    const bool can_timestamp = table.timestamped();
+    // 16 kHz is what every ASR family exported so far takes, and is the only rate at which a file that
+    // declares none can be interpreted at all -- the alternative is refusing to transcribe a model that
+    // worked before the contract existed.
+    const double rate = contract.sample_rate ? contract.sample_rate : 16000;
     const size_t n_clips = (waveform.size() + clip - 1) / clip;
     out.timestamped = can_timestamp;
 
@@ -195,7 +201,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     // them keeps decoding in no-timestamps mode, so short audio behaves exactly as it did.
     const bool want_timestamps = options.timestamps || (can_timestamp && n_clips > 1);
 
-    const size_t prev_cap = model.has_kv("loom.n_text_ctx") ? model.hparam_u32("n_text_ctx") : 448;
+    const size_t prev_cap = table.prev_context ? table.prev_context : 448;
     std::vector<double> prev_tokens;
     size_t seek = 0;
     while (seek < waveform.size()) {
