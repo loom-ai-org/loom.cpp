@@ -15,6 +15,32 @@ That is the whole architectural bet, and it is why this repo stays small: it tar
 every per-model decision belongs in the exporter where it costs a Python change instead of a
 specialized C++ driver. See [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md).
 
+## What the engine offers a host, and what it leaves alone
+
+The engine hardcodes no model, but it does own the loops every host would otherwise write. Those are
+**per-task, not per-model** — one CTC decoder covers every CTC model — and they live here because the
+copies hosts wrote had already drifted apart from each other:
+
+| | |
+|---|---|
+| `loom::text::generate` | the causal-LM decode loop, both driver shapes, the file's own stop token |
+| `loom::audio::transcribe` | long-form ASR: windowing, segment splitting, and the seek to where the model closed its last segment |
+| `loom::Session` | topologies registered and caches attached, in an order that cannot dangle |
+
+Underneath them the low-level surface is unchanged and stays raw: `LoomLuaBridge::call` invokes the
+driver with the driver's own arguments. The split is the same rule the whole tree is built on —
+**in the file when it is a property of the checkpoint, in the engine when it is a property of the
+task, in the host when it needs the host's ecosystem** — and
+[`docs/HIGH-LEVEL-API.md`](docs/HIGH-LEVEL-API.md) is where it is argued.
+
+A model says what it is, so a host never has to recognise one:
+
+```cpp
+const loom::ModelContract contract = loom::ModelContract::read(model);
+contract.task;             // "automatic-speech-recognition"
+contract.interface_name(); // "speech2text" -- the modality pair a host offers a door for
+```
+
 ## The three repos
 
 | | |
@@ -150,6 +176,7 @@ rebuilt is what you do while working on it.
 | [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) | the data-driven design and why the engine hardcodes nothing |
 | [`docs/KV-CACHE.md`](docs/KV-CACHE.md) | how a cached attention block reaches the engine from an export |
 | [`docs/LOOM_PROCEDURAL_GENERALIZATION.md`](docs/LOOM_PROCEDURAL_GENERALIZATION.md) | the embedded-Lua orchestration blueprint |
+| [`docs/HIGH-LEVEL-API.md`](docs/HIGH-LEVEL-API.md) | one door per task, what each layer owns, and what a file must declare for a host to dispatch |
 
 ## Roadmap
 

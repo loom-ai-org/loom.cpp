@@ -1,6 +1,11 @@
 # The high-level layer: one door per task, declared by the file
 
-Status: proposal. Prompted by loom-py #6 / loom.cpp #5, which added `transcribe` and had to argue from
+Status: **implemented** (2026-08-15) -- see BACKLOG.md P5.0 for what shipped and what is open.
+Written as a proposal, kept as the argument rather than rewritten into a description: the reasoning is
+why the code is shaped this way, and a reader who disagrees with the shape needs the argument, not a
+summary of the result.
+
+Originally: proposal. Prompted by loom-py #6 / loom.cpp #5, which added `transcribe` and had to argue from
 first principles where it belonged. That argument was won on the merits and should not have to be won
 again for the third door and the fourth. This is the rule it implies, written down, plus the metadata
 gap that stops the rule from being applicable today.
