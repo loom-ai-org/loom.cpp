@@ -204,6 +204,31 @@ Two symmetry rules, so the fourth door does not need this document:
 Python-only, correctly: `loom.audio` (wav read/write, resample-to-declared-rate), numpy interop, and
 the G2P plugin below.
 
+### Canonical input names
+
+A high-level door passes **canonical names only**, and the canonical name follows from the kind or the
+role rather than from which model it is. Three tiers, and the third is the boundary between the two
+APIs rather than a gap in the first:
+
+| | name | fixed by |
+|---|---|---|
+| primary input | `waveform` / `tokens` | `loom.input.kind` |
+| recurring roles | `language`, `task`, `timestamps`, `prev_tokens`, `max_new_tokens`, `eos_token`, `seed`, `steps` | the role |
+| model-specific knobs | `noise_scale_w`, `ref_s`, `style_ttl`, … | nothing — they stay per-model |
+
+**A knob with no canonical role is not part of the high-level API**, and `infer` is what it is for. That
+also answers "what does a new family cost the API": nothing, unless it introduces a new *role*.
+
+Every driver accepts the canonical name for any role it has. `caller_input()` does that for a
+synthesized driver at each read site; for a driver adopted from hand-written Lua the builder emits one
+alias at the top of `infer` from the family's declared `driver_primary_input()`. The private name is
+never written into the GGUF — the canonical one is the only public name, and a file that published its
+own spelling would invite hosts to use it.
+
+ASR already agreed on all six of its roles before any of this. TTS did not: `n_steps` (Matcha,
+Supertonic) and `diffusion_steps` (StyleTTS2) are one concept spelled twice, and normalising them is
+the remaining work in this section.
+
 ### The phonemizer, and how this splits Task #79
 
 Task #79 is currently one blocked item: VITS, Kokoro, StyleTTS2 and Matcha take phoneme ids, real
