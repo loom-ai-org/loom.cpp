@@ -213,7 +213,7 @@ APIs rather than a gap in the first:
 | | name | fixed by |
 |---|---|---|
 | primary input | `waveform` / `tokens` | `loom.input.kind` |
-| recurring roles | `language`, `task`, `timestamps`, `prev_tokens`, `max_new_tokens`, `eos_token`, `seed`, `steps` | the role |
+| recurring roles | `language`, `task`, `timestamps`, `prev_tokens`, `max_new_tokens`, `eos_token`, `seed`, `n_steps` | the role |
 | model-specific knobs | `noise_scale_w`, `ref_s`, `style_ttl`, … | nothing — they stay per-model |
 
 **A knob with no canonical role is not part of the high-level API**, and `infer` is what it is for. That
@@ -225,9 +225,16 @@ alias at the top of `infer` from the family's declared `driver_primary_input()`.
 never written into the GGUF — the canonical one is the only public name, and a file that published its
 own spelling would invite hosts to use it.
 
-ASR already agreed on all six of its roles before any of this. TTS did not: `n_steps` (Matcha,
-Supertonic) and `diffusion_steps` (StyleTTS2) are one concept spelled twice, and normalising them is
-the remaining work in this section.
+ASR already agreed on all six of its roles before any of this. TTS did not -- `n_steps` (Matcha,
+Supertonic) and `diffusion_steps` (StyleTTS2) were one concept spelled twice -- and the majority
+spelling won, so two families' drivers stayed byte-identical and only StyleTTS2 gained an alias.
+
+**A model that declares no sample rate gets 16 kHz and a `RuntimeWarning.`** That rate is what every
+speech model here takes on the way IN, so it is the one a loom model is known to have opinions about;
+for a TTS export it is usually wrong, since these families run at 22.05, 24 and 44.1 kHz. The warning
+is load-bearing rather than decorative: audio at the wrong rate does not fail, it plays at the wrong
+speed, so a caller who never sees it has no other signal that the number was invented. Only Supertonic
+declares its rate today; the other four need it read from their own checkpoints.
 
 ### The phonemizer, and how this splits Task #79
 
