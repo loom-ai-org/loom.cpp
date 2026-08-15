@@ -29,6 +29,11 @@
 #include "loom/core/conv_state_cache.h"
 #include "loom/core/output_store.h"
 #include "loom/core/lua_bridge.h"
+// What a file declares about ITSELF -- the task it performs and the modality pair it maps between --
+// and the ready-to-run bundle a host builds from it. Both exist so a host dispatches on what the file
+// says rather than on which architecture it recognises (docs/HIGH-LEVEL-API.md).
+#include "loom/core/model_contract.h"
+#include "loom/core/session.h"
 #include "loom/ops/primitive_registry.h"
 
 // --- Host-side primitives the bridge exposes to a driver script. `lua_bridge.cpp` includes exactly
@@ -49,6 +54,10 @@
 #include "loom/core/supertonic_text_vectorizer.h"
 #include "loom/core/ctc_decode.h"
 #include "loom/core/generation.h"
+// The two end-to-end task loops. Per-TASK like the decoders above, and here for the same reason the
+// CTC decoder is: every host needs them, and the copies hosts wrote had already drifted apart.
+#include "loom/core/text_generate.h"
+#include "loom/core/transcribe.h"
 
 // --- One standalone C++ component from the pre-MIL era. It was four; P4.0.8's follow-up retired
 //     `cfm_euler_sampler.h`, `ode_stepper.h` and `style_diffusion_sampler.h`, each of which had a Lua
