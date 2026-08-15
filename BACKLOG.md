@@ -6988,9 +6988,11 @@ error either side of it deserves; truncation was arbitrary regardless of where t
 
 Invisible until the fixtures carried the declared table: the old path derived the step from three
 hparams in double and absorbed the error by luck, so v4 gave one window and v5 gave two on identical
-audio. **Verified behaviourally on both fixture sets through `loom_cli`, and NOT pinned by a test** -- a
-hermetic one needs a fixture that emits timestamp tokens and carries a vocabulary to detokenize them,
-which does not exist yet. Worth building before the next change to this loop.
+audio. Pinned by `tests/ci/test_transcribe_seek.cpp` now, against a fixture that emits timestamp tokens and
+carries a vocabulary to detokenize them -- built for this, since the only ASR artifact that emitted
+timestamps at all was a 970 MB Whisper export. The step is stored as **f32 on purpose**: storing it as
+f64 would sidestep the precision loss and let the test pass against the truncating code it exists to
+catch. Verified by re-introducing the truncation, which fails it on `windows == 1`.
 
 **Not done here, and the sequence for it** is docs/HIGH-LEVEL-API.md §7. Next: the exporter writes the
 contract (§3), then loom-py's X2Y interface layer consumes it.
