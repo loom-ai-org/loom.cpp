@@ -11,7 +11,7 @@
 // greedy-CTC-decodes the logits, and detokenizes with the model's real SentencePiece vocab.
 
 #include "loom/loom.h"
-#include "loom/core/audio_window.h"
+#include "loom/core/transcribe.h"
 #include "loom/core/conv_state_cache.h"
 #include "wav_file.h"
 
@@ -78,176 +78,20 @@ std::string format_time(double seconds) {
     return buf;
 }
 
-// Splits one window's token ids into timestamped segments, appending them to `out`.
-//
-// Whisper emits `<|t0|> text <|t1|> <|t1|> more text <|t2|> ...`: every timestamp token both closes the
-// span before it and opens the one after, which is why this is a two-state walk rather than a scan for
-// pairs. Anything after the final timestamp is text the model had not finished when the window ran out
-// -- kept (it is real transcript) but marked `closed = false`, because it must not be trusted as a seek
-// boundary: its end time is the window edge, not something the model chose.
-//
-// `last_complete_end` returns the end of the last CLOSED segment, in whole-file seconds, or stays
-// negative when the model closed none.
-template <typename Detokenize>
-void split_into_segments(const std::vector<int32_t>& ids, int32_t ts_base, double ts_step,
-                          double window_start, double window_end, const Detokenize& detokenize,
-                          std::vector<Segment>& out, double& last_complete_end) {
-    std::vector<int32_t> pending;
-    bool open = false;
-    double start = window_start;
-
-    const auto flush = [&](double end, bool closed) {
-        if (pending.empty()) return;
-        std::string text = detokenize(pending);
-        pending.clear();
-        // A segment whose text is only the special tokens we drop is not a segment.
-        if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
-        out.push_back({start, end, std::move(text), closed});
-        if (closed) last_complete_end = end;
-    };
-
-    for (int32_t id : ids) {
-        if (id >= ts_base) {
-            const double t = window_start + static_cast<double>(id - ts_base) * ts_step;
-            if (open) flush(t, /*closed=*/true);
-            start = t;
-            open = true;
-            continue;
-        }
-        pending.push_back(id);
-    }
-    // Whatever is left ran past the window: end it at the window edge and mark it unclosed.
-    flush(window_end, /*closed=*/false);
-}
-
-// A decode of one clip's worth of audio: the driver's own `infer`, with whatever optional arguments the
-// caller supplied. Returns the token ids it generated.
-//
-// `language` is passed through only when the caller named one. Omitting the key is not the same as
-// passing a default: a driver that can detect the language does so when it is absent, and one that
-// cannot falls back to its own default -- the resolution order lives in the model's driver, which is the
-// only place that knows whether detection is possible at all.
-std::vector<int32_t> run_driver(loom::LoomLuaBridge& bridge, const std::vector<double>& waveform,
-                                 int32_t language, int32_t task, bool timestamps,
-                                 const std::vector<double>& prev_tokens,
-                                 uint32_t max_new_tokens, int32_t eos_token) {
-    std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
-        {"waveform", waveform},
-        {"max_new_tokens", static_cast<double>(max_new_tokens)},
-        {"eos_token", static_cast<double>(eos_token)},
-    };
-    // The previous window's tokens, raw: which of them count as TEXT is the driver's question, since
-    // the ids that do not (timestamps, <|notimestamps|>, eos) are the ones it has constants for.
-    if (!prev_tokens.empty()) args["prev_tokens"] = prev_tokens;
-    // Each optional argument is OMITTED rather than defaulted when the caller did not name it, which is
-    // what lets the driver apply its own resolution order -- detect, or fall back to what this
-    // checkpoint can actually do.
-    if (language >= 0) args["language"] = static_cast<double>(language);
-    if (task >= 0) args["task"] = static_cast<double>(task);
-    if (timestamps) args["timestamps"] = 1.0;
-
-    // Held in a named local before unpacking: `call` returns by value, so a reference bound straight
-    // into `std::get<...>(call(...))` outlives the variant holding the vector.
-    const loom::LoomLuaBridge::Value result = bridge.call("infer", args);
-    std::vector<int32_t> ids;
-    if (std::holds_alternative<std::vector<double>>(result)) {
-        const auto& out = std::get<std::vector<double>>(result);
-        ids.reserve(out.size());
-        for (double v : out) ids.push_back(static_cast<int32_t>(v));
-    }
-    return ids;
-}
-
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
              const std::string& language_name, const std::string& task_name, bool timestamps,
              bool condition_on_previous) {
-    // Model-agnostic: register whatever topologies the file declares, call the driver it ships, and
-    // detokenize with the vocab it embeds. Conformer-CTC, Parakeet-TDT and Parakeet-RNN-T all work
-    // through this one path -- the driver is the thing that differs between them, and it travels with
-    // the model (BACKLOG.md P4.0.17).
-    //
-    // It replaces a Conformer-specific routine that read the BARE `model.graph_topology`, computed the
-    // relative-position table host-side and drove `loom::ctc_greedy_decode` from C++. All three of
-    // those were properties of the bespoke converter's artifact: the MIL export names its topologies,
-    // traces the mel frontend and rel-pos attention, and carries its own decode.
-    //
-    // Two vocab schemas reach this path, so both are tried: NeMo's checkpoints carry SentencePiece
-    // ("llama"/"t5" -> loom::Vocab) and Whisper's carries GPT-2 byte-level BPE ("gpt2" -> BpeVocab).
-    // Only the BPE one can resolve a token by TEXT, which is what `--language` needs.
-    //
-    // **BPE first, and the order is load-bearing rather than arbitrary**: `BpeVocab::load` returns
-    // nullptr for a schema that is not its own (its header says so, and says callers should try both),
-    // while `Vocab::load` THROWS on one -- so asking the SentencePiece loader about a gpt2 file kills
-    // the run before the BPE loader is ever reached.
-    auto bpe_vocab = loom::BpeVocab::load(model);
-    auto spm_vocab = bpe_vocab ? nullptr : loom::Vocab::load(model);
-    if (!spm_vocab && !bpe_vocab) {
-        throw loom::LoadError("--wav: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
-    }
-    if (!model.has_kv("model.driver_script")) {
-        throw loom::LoadError("--wav: model carries no driver_script; re-export it with `loom-export "
-                              "<checkpoint> --task automatic-speech-recognition`");
-    }
-    // Control tokens a transcript must not contain, dropped before detokenizing because each is a real
-    // vocabulary piece that otherwise prints as its literal spelling.
-    //
-    //   * the end-of-sequence token, which the driver returns deliberately -- a generator's caller may
-    //     want to know whether it stopped or ran out of budget. A transcript is not that caller.
-    //   * `<|notimestamps|>`, which the MODEL emits for itself when the prompt did not force it, i.e.
-    //     exactly under `--timestamps`: it is Whisper deciding not to timestamp, which is a statement
-    //     about the decode rather than a word that was spoken.
-    //
-    // Timestamp markers themselves are NOT dropped: asking for them is the entire point of the flag.
-    const int32_t eos_id = loom::audio::default_eos_token(model);
-    std::vector<int32_t> control_ids{eos_id};
-    if (bpe_vocab) {
-        const int32_t no_ts = bpe_vocab->piece_to_id("<|notimestamps|>");
-        if (no_ts >= 0) control_ids.push_back(no_ts);
-    }
-    const auto detokenize = [&](const std::vector<int32_t>& ids) {
-        std::vector<int32_t> text_ids;
-        text_ids.reserve(ids.size());
-        for (int32_t id : ids) {
-            if (std::find(control_ids.begin(), control_ids.end(), id) == control_ids.end()) {
-                text_ids.push_back(id);
-            }
-        }
-        return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
-    };
-
-    // `--language xx` becomes this model's own `<|xx|>` token id, by TEXT rather than by a number this
-    // CLI would otherwise have to carry per checkpoint. -1 means "not named", which is what asks the
-    // driver to detect it (or to use its default when it cannot).
-    // `--language xx` / `--task transcribe|translate` become this model's own `<|xx|>` / `<|task|>`
-    // token ids, by TEXT rather than by numbers this CLI would otherwise carry per checkpoint.
-    const auto special_id = [&](const std::string& piece, const std::string& flag,
-                                 const std::string& hint) {
-        const int32_t id = bpe_vocab ? bpe_vocab->piece_to_id(piece) : -1;
-        if (id < 0) {
-            throw loom::LoadError(flag + ": this model's vocabulary has no '" + piece + "' token. " + hint);
-        }
-        return id;
-    };
-    int32_t language = -1;
-    if (!language_name.empty()) {
-        language = special_id("<|" + language_name + "|>", "--language " + language_name,
-                               "An English-only checkpoint has no language tokens at all; a "
-                               "multilingual one names them by ISO code (en, de, fr, ...).");
-    }
-    int32_t task = -1;
-    if (!task_name.empty()) {
-        task = special_id("<|" + task_name + "|>", "--task " + task_name,
-                           "Whisper names two: transcribe (same language out) and translate "
-                           "(into English). An English-only checkpoint has neither.");
-    }
-
+    // EVERYTHING BELOW THE ARGUMENT PARSING IS THE ENGINE'S NOW (loom/core/transcribe.h). This function
+    // used to hold the whole long-form loop -- windowing, segment splitting, the timestamp-aware seek,
+    // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
+    // and a worse transcript for no reason but where the code sat. What is left here is what a CLI
+    // actually owns: turning `--language en` into an id, and printing.
     const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
 
     loom::LoomLuaBridge bridge(backends);
     // A topology carrying ATTENTION nodes needs a KV cache to write into, sized from the model's own
-    // declared geometry -- the same registration the generation path above already does, and missing
-    // here until an ASR family turned up with a cached phase (Whisper's decoder, BACKLOG.md P4.1).
-    // Without it `op_attention` throws and the file simply cannot be run through the ASR path.
+    // declared geometry -- Whisper's decoder is one (BACKLOG.md P4.1), and without it `op_attention`
+    // throws and the file cannot be run through the ASR path at all.
     std::unique_ptr<loom::KvCache> kv_cache;
     for (const std::string& name : model.topology_names()) {
         loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json(name));
@@ -259,143 +103,37 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     }
     bridge.load_script(model.kv_str("model.driver_script"));
 
-    // A model whose graph is built at ONE fixed clip length says so with `loom.n_samples` (Whisper: 30 s,
-    // which is what it was trained on and what its encoder's every shape is a constant of). Absent, the
-    // sequence length is genuinely dynamic and the whole file goes through in one call, which is the
-    // NeMo families' shape.
-    const uint32_t clip = loom::audio::fixed_clip_samples(model);
-    // Both from the engine now rather than spelled here (loom/core/audio_window.h): loom-py's binding
-    // needs the identical three facts, and the second copy is what turned them into a shared header.
-    const uint32_t max_new_tokens_per_clip = loom::audio::default_max_new_tokens(model);
-
-    if (clip == 0) {
-        const std::vector<double> waveform_d(waveform.begin(), waveform.end());
-        const std::vector<double> length_d{static_cast<double>(waveform.size())};
-        const loom::LoomLuaBridge::Value result = bridge.call(
-            "infer", {{"waveform", waveform_d}, {"length", length_d}});
-        const auto& ids_d = std::get<std::vector<double>>(result);
-        std::vector<int32_t> token_ids;
-        token_ids.reserve(ids_d.size());
-        for (double id : ids_d) token_ids.push_back(static_cast<int32_t>(id));
-        std::printf("transcript: %s\n", detokenize(token_ids).c_str());
-        print_device_report(bridge);
-        return;
+    auto bpe_vocab = loom::BpeVocab::load(model);
+    loom::audio::TranscribeOptions options;
+    options.timestamps = timestamps;
+    options.condition_on_previous = condition_on_previous;
+    // `--language en` -> the id of `<|en|>`, resolvable only through a BPE vocab. Left negative when
+    // the caller named none, which is how the driver is told to detect or fall back.
+    if (!language_name.empty() && bpe_vocab) {
+        options.language = bpe_vocab->piece_to_id("<|" + language_name + "|>");
+    }
+    if (!task_name.empty() && bpe_vocab) {
+        options.task = bpe_vocab->piece_to_id("<|" + task_name + "|>");
     }
 
-    // Fixed-clip models walk the file one `clip`-sample window at a time. WHERE the next window starts
-    // is the whole question, and the answer is the model's own timestamps -- see the loop below.
-    const uint32_t sample_rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
-    const uint32_t n_audio_ctx = model.has_kv("loom.n_audio_ctx") ? model.hparam_u32("n_audio_ctx") : 0;
-    const int32_t ts_base = bpe_vocab ? bpe_vocab->piece_to_id("<|0.00|>") : -1;
-    // Seconds per timestamp token: one encoder frame, i.e. the clip's duration over the number of frames
-    // it becomes. Derived from the file's own three numbers rather than hardcoded as Whisper's 0.02.
-    const double ts_step = (ts_base >= 0 && sample_rate > 0 && n_audio_ctx > 0)
-        ? (static_cast<double>(clip) / sample_rate) / n_audio_ctx : 0.0;
-    const bool can_timestamp = ts_step > 0.0;
-    const size_t n_clips = (waveform.size() + clip - 1) / clip;
+    const loom::audio::Transcription result = loom::audio::transcribe(bridge, model, waveform, options);
 
-    // Timestamps are REQUESTED whenever they are usable and there is more than one window, even if the
-    // caller did not ask to see them: they are what the seek below advances on. A single-window file
-    // without `--timestamps` keeps decoding in no-timestamps mode, so short audio behaves exactly as it
-    // did -- forcing them would change its transcript for no benefit, since there is nothing to seek to.
-    const bool want_timestamps = timestamps || (can_timestamp && n_clips > 1);
-    if (n_clips > 1 && !can_timestamp) {
-        std::fprintf(stderr, "note: this model exposes no timestamp tokens, so the %zu windows are cut "
-                              "at a fixed %.0f s and each is decoded independently\n",
-                     n_clips, static_cast<double>(clip) / (sample_rate ? sample_rate : 16000));
+    if (timestamps && result.timestamped) {
+        for (const loom::audio::Segment& seg : result.segments) {
+            std::printf("[%s --> %s] %s\n", format_time(seg.start).c_str(),
+                        format_time(seg.end).c_str(), seg.text.c_str());
+        }
+    } else {
+        std::printf("transcript: %s\n", result.text.c_str());
     }
-
-    // Everything generated so far, carried into the next window as context (`<|startofprev|>`). The
-    // driver takes the tail it has room for and filters it down to text; this just has to not grow
-    // without bound, so it is capped at the text context the file declares -- comfortably more than the
-    // half of it the driver will use.
-    const size_t prev_cap = model.has_kv("loom.n_text_ctx") ? model.hparam_u32("n_text_ctx") : 448;
-    std::vector<double> prev_tokens;
-
-    std::vector<Segment> segments;
-    size_t seek = 0;
-    while (seek < waveform.size()) {
-        const size_t avail = std::min(static_cast<size_t>(clip), waveform.size() - seek);
-        const std::vector<double> window = loom::audio::window_at(waveform, seek, clip);
-
-        const std::vector<int32_t> ids =
-            run_driver(bridge, window, language, task, want_timestamps, prev_tokens,
-                       max_new_tokens_per_clip, eos_id);
-        const double window_start = static_cast<double>(seek) / (sample_rate ? sample_rate : 16000);
-
-        // How far into THIS window the model actually got. `last_complete_end` is the end of the last
-        // segment it closed with a timestamp; text after that has no closing timestamp, which is the
-        // model saying "this segment runs past the window edge".
-        double last_complete_end = -1.0;
-        const size_t before = segments.size();
-        const double rate = sample_rate ? sample_rate : 16000;
-        const double window_end = window_start + static_cast<double>(avail) / rate;
-        if (can_timestamp && want_timestamps) {
-            split_into_segments(ids, ts_base, ts_step, window_start, window_end, detokenize, segments,
-                                 last_complete_end);
-        } else {
-            segments.push_back({window_start, window_end, detokenize(ids), /*closed=*/false});
-        }
-
-        // **This is the timestamp-aware part.** Advance to where the last complete segment ended rather
-        // than by a fixed `clip`, so the next window begins on a boundary the model itself chose -- an
-        // utterance cut in half by the window edge is re-decoded whole instead of being transcribed as
-        // two fragments. Whisper's own long-form loop does exactly this.
-        //
-        // The fallback is the window edge, for the case where the model closed no segment at all -- then
-        // there is no boundary it chose and a full stride is the only honest guess.
-        //
-        // **The final window is NOT special-cased, and an earlier version of this got that wrong.** It
-        // looked reasonable to advance by the full stride once `avail < clip`, on the grounds that the
-        // rest is padding -- but `avail < clip` only means the window is not FULL, and the audio inside
-        // it is real. A model that closes at 23 s of a 20..45 s window has transcribed three seconds and
-        // stopped; seeking to 23 gives the remaining twenty-two another decode, which is exactly what
-        // re-seeking is for. Ending the loop there instead silently dropped them.
-        size_t advance = clip;
-        if (last_complete_end > window_start) {
-            // Relative to THIS window: `last_complete_end` is a whole-file time, the seek is a sample
-            // offset from the window's own start.
-            //
-            // Floored at one second, which is a guarantee of progress rather than a tuning knob: a model
-            // that closes a zero-length or 0.02 s segment on a mostly-silent window would otherwise take
-            // ~1500 iterations to cross it. Real segments are seconds long, so the floor is unreachable
-            // in the case it is not protecting against.
-            auto candidate = static_cast<size_t>((last_complete_end - window_start) * rate);
-            candidate = std::max(candidate, static_cast<size_t>(rate));
-            if (candidate <= clip) advance = candidate;
-        }
-
-        if (n_clips > 1) {
-            std::fprintf(stderr, "  window at %.2fs: %zu tokens, %zu segment(s), advancing %.2fs\n",
-                         window_start, ids.size(), segments.size() - before,
-                         static_cast<double>(advance) / rate);
-        }
-        // Carry this window's output forward. Off (`--no-condition-on-previous`) it stays empty, which
-        // is how the driver is told not to condition -- the same "omit the argument" convention the
-        // optional inputs use everywhere else here.
-        if (condition_on_previous) {
-            for (int32_t id : ids) prev_tokens.push_back(static_cast<double>(id));
-            if (prev_tokens.size() > prev_cap) {
-                prev_tokens.erase(prev_tokens.begin(),
-                                   prev_tokens.end() - static_cast<std::ptrdiff_t>(prev_cap));
-            }
-        }
-        seek += advance;
+    if (result.windows > 1) {
+        std::fprintf(stderr, "(%zu windows%s)\n", result.windows,
+                     result.timestamped ? ", seeking on the model's own timestamps"
+                                        : ", cut at fixed boundaries -- this model exposes no timestamps");
     }
-
-    if (timestamps) {
-        for (const Segment& s : segments) {
-            std::printf("[%s --> %s] %s\n", format_time(s.start).c_str(), format_time(s.end).c_str(),
-                         s.text.c_str());
-        }
-        print_device_report(bridge);
-        return;
-    }
-    std::string transcript;
-    for (const Segment& s : segments) transcript += s.text;
-    std::printf("transcript: %s\n", transcript.c_str());
     print_device_report(bridge);
 }
+
 
 } // namespace
 
