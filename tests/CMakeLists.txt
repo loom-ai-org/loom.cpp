@@ -85,6 +85,13 @@ add_test(NAME test_model_contract COMMAND test_model_contract)
 set_tests_properties(test_model_contract PROPERTIES LABELS ci)
 set_tests_properties(test_model_contract PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
 
+add_executable(test_text_generate ci/test_text_generate.cpp)
+target_link_libraries(test_text_generate PRIVATE loom::engine)
+target_compile_definitions(test_text_generate PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_text_generate COMMAND test_text_generate)
+set_tests_properties(test_text_generate PROPERTIES LABELS ci)
+set_tests_properties(test_text_generate PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
 # --- Phase 2: primitive registry / topology parsing / graph builder ---
 
 add_executable(test_primitive_registry ci/test_primitive_registry.cpp)

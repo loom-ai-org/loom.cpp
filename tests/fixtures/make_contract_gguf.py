@@ -70,11 +70,39 @@ def write_legacy(path: Path) -> None:
     _finish(w)
 
 
+# A driver with both LM shapes in one file, selected by an input. `loom::text::generate` tells them
+# apart by what comes BACK -- a list means the driver generated internally, a number means one token per
+# call -- so a fixture that can produce either is what pins that branch.
+#
+# `#inputs.tokens + 100` rather than a constant: the returned token then encodes how long the prompt was
+# when it was produced, which is how the test sees that the prompt actually grows between calls. A
+# constant would pass whether the loop re-fed the prompt or not.
+GENERATE_DRIVER = """
+function infer(inputs)
+    if inputs.mode == 1 then
+        return {7, 8, 9}
+    end
+    return #inputs.tokens + 100
+end
+"""
+
+
+def write_generate(path: Path) -> None:
+    w = _base(path, "generate_test")
+    w.add_string("model.driver_script", GENERATE_DRIVER)
+    # The stop token the engine substitutes when a caller names none. 103 is the token this driver
+    # produces on its second step from a two-token prompt, so "stops where the file says" is testable
+    # without the test naming an eos itself.
+    w.add_uint32("tokenizer.ggml.eos_token_id", 103)
+    _finish(w)
+
+
 def main() -> None:
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
     write_declared(out_dir / "contract_declared.gguf")
     write_legacy(out_dir / "contract_legacy.gguf")
+    write_generate(out_dir / "generate_driver.gguf")
 
 
 if __name__ == "__main__":
