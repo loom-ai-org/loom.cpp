@@ -6994,6 +6994,35 @@ timestamps at all was a 970 MB Whisper export. The step is stored as **f32 on pu
 f64 would sidestep the precision loss and let the test pass against the truncating code it exists to
 catch. Verified by re-introducing the truncation, which fails it on `windows == 1`.
 
+#### P5.0 status (2026-08-15, end of the thread)
+
+**Done and verified end to end on real models:**
+
+| | |
+|---|---|
+| the declared contract | every export writes `loom.task` + the modality pair; 17/17 models swept, added-KVs-only |
+| `loom::text::generate` | one LM loop; both hosts call it; the CLI's three divergent behaviours gone |
+| `loom::audio::transcribe` | reads the declared ASR table; Whisper declares timestamp ids, languages and tasks |
+| `loom::Session` | one bridge/cache setup, replacing three including one missing `ConvStateCache` |
+| `loom::PhonemeVocab` | the phoneme symbol tables all four families were carrying, now exported and read back |
+| loom-py's X2Y layer | `text2text` / `speech2text` / `text2speech`, selected by the declared pair |
+| gate fixtures | re-exported as `loom-engine-artifacts/v5`, 13 models, all declaring their contracts |
+
+`text2speech.infer("hello world")` works on all five TTS families. Kokoro and Supertonic ship a
+default voice; the other three take one through `infer`.
+
+**Open, in the order it matters:**
+
+1. **Four TTS families declare no sample rate** (VITS, Matcha, Kokoro, StyleTTS2). loom-py warns and
+   falls back to a caller-supplied 16 kHz, which is wrong for all four -- they run at 22.05, 24 and
+   24 kHz. Each needs it read from its own checkpoint. Silent when wrong, which is why it warns.
+2. **`orthography2ipa` is not ported.** The Python path behind `loom-py-rt[phonemes]` is what runs
+   today; Task #79 above holds the plan and the two risks.
+3. **`loom.tts.voices` is empty everywhere.** Kokoro's default is the style from its own `ref/` dump
+   rather than a named upstream pack, so there is nothing yet for `voice=` to select between.
+4. **The legacy fallbacks in `model_contract.h` are now dead weight** for any re-exported model, and
+   deleting them should be its own commit once the published fleet is re-exported.
+
 **Not done here, and the sequence for it** is docs/HIGH-LEVEL-API.md §7. Next: the exporter writes the
 contract (§3), then loom-py's X2Y interface layer consumes it.
 
