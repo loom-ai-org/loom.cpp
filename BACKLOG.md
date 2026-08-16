@@ -3729,6 +3729,140 @@ one behavioral difference in the rename: a hypothetical caller handing the expor
   among existing voices — which is what was actually asked for — needs none of it. The model card now
   says which of the two it can do.
 
+#### P4.10 — macOS wheels: Apple Silicon and Apple Intel — SCOPED (2026-08-16), lands BEFORE P5
+
+**Why before P5 rather than after.** P5 adds model families, and a family lands in `loom-py` for free
+— a model the bindings have never heard of works the day the exporter can produce it. That is true
+only on a platform that exists. Every model P5 adds is unreachable from a Mac until this is done, so
+this multiplies P5's value while P5 does nothing for it. It is also the item most visible from
+outside, since it is what `pip install loom-py-rt` can resolve to.
+
+**What already ships (2026-08-16):** `manylinux_2_28` on x86-64 and aarch64, CPython 3.10–3.13. The
+aarch64 wheel serves Raspberry Pi 4 and 5 on 64-bit Raspberry Pi OS — see `loom-py`'s
+`raspberry-pi-check` job, which executes the Cortex-A72 rung under QEMU because no CI runner is that
+old. 32-bit Raspberry Pi OS (`armv7l`) is deliberately NOT supported: `GGML_CPU_ALL_VARIANTS`'
+Linux-ARM ladder is AArch64-only, so it is an unbuildable configuration rather than a slow one.
+
+**The two Apple targets, and what they are called.** Apple Intel is plain `x86_64`
+(`macosx_10_13_x86_64`). Apple Silicon is `arm64` in Apple's naming — the same ISA Linux calls
+`aarch64` — and tags as `macosx_11_0_arm64`.
+
+**The variant ladder is already solved for both, which is the one thing that needs no work.** ggml's
+`GGML_CPU_ALL_VARIANTS` has an `elseif (APPLE)` arm: `apple_m1` (DOTPROD), `apple_m2_m3` (+I8MM),
+`apple_m4` (+SME). Every Apple Silicon part has dotprod, so the lowest rung covers M1 and there is no
+baseline hole of the kind that made every pre-2026-08-14 wheel require AVX2. Apple Intel resolves to
+`GGML_SYSTEM_ARCH == "x86"`, whose ladder starts at a true `x64` baseline.
+
+**Four blockers, in the order a build hits them.** All four were established by reading the pinned
+sources on 2026-08-16; none has been observed on a Mac, because there is no Mac here.
+
+1. **LuaJIT stops the build outright.** `luajit-src/src/Makefile:321-322` is a hard
+   `$(error missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY)` on Darwin, and `cmake/Dependencies.cmake`
+   invokes `make -C ... BUILDMODE=static XCFLAGS=-fPIC` with no environment at all. Engine-side fix,
+   and the cheap one: the same variable cibuildwheel needs anyway to tag the wheel (`11.0` on arm64,
+   `10.13` on x86-64), so one export does both jobs.
+2. **`loom-py`'s install rule ships nothing.** `CMakeLists.txt`'s
+   `install(DIRECTORY ... FILES_MATCHING PATTERN "*.so*")` — on macOS the engine and ggml libraries are
+   `.dylib`, so the wheel would contain `_loom.so` alone. That revives the exact
+   `cannot open shared object file` failure the same file's comment records as already fixed, through a
+   different door, and only at import time.
+3. **`$ORIGIN` is ELF-only.** `loom-py/CMakeLists.txt` sets it on both install and build RPATH; macOS
+   needs `@loader_path`. There is no `if(APPLE)` anywhere in either repo's CMake — grepped, not assumed.
+4. **The one that would burn a day of CI: ggml's DL loader looks for the wrong extension on macOS.**
+   `ggml-backend-reg.cpp`'s `backend_filename_extension()` returns `.dll` on `_WIN32` and `.so`
+   otherwise — there is no `.dylib` case, and its only `__APPLE__` block is `get_executable_path()`.
+   CMake emits `.dylib` for shared libraries on macOS and nothing in ggml's build overrides `SUFFIX`.
+   So a macOS `GGML_BACKEND_DL` build plausibly produces backends its own loader will never find by
+   name, which with DL means **zero devices, including no CPU** — the failure mode P4.8a already
+   showed is silent. Confirm on a Mac first; the fix is `SUFFIX ".so"` on the backend targets in our
+   build, or upstream. Do not start the macOS work by writing a workflow — start by settling this.
+
+**The wheel shape: two wheels, not `universal2`.** cibuildwheel builds each natively (`macos-14` for
+arm64, `macos-13` for x86-64), a fat binary doubles the download for everyone to serve one half, and
+the half it serves is ending — macOS 26 is Apple's last Intel release, and an Apple Silicon Mac can
+resolve the x86-64 wheel under Rosetta 2 anyway. **Do Apple Silicon first and treat Intel as one extra
+matrix row**, not as an equal target.
+
+**Metal is a separate package, and is NOT part of this item — it is P4.11, below.** `loom-py-rt-metal` is
+`packaging/rt-vulkan/` with four strings changed (`packaging/README.md`), and it is the only
+accelerator that would ever apply to a Mac — CoreML is not Metal, and no ggml backend targets the
+Neural Engine. Blocker 4 has to be settled before a `[metal]` package can mean anything, since a
+backend `.dylib` is discovered by the same code path. Open question to answer then, not now: whether
+`GGML_METAL_EMBED_LIBRARY` is required for a DL-loaded Metal backend that travels without a bundle.
+
+**Verification is CI-only, and weaker than the Linux story — say so rather than paper over it.** There
+is no Mac on this network and no QEMU equivalent for macOS, so the checks are: the wheel test step
+running `pytest tests/ci` on both runner architectures, and `tests/ci/test_cpu_variants.py` gaining
+`arm64 → libggml-cpu-apple_m1.*` in its baseline table (note the extension follows blocker 4's
+resolution). There is no analogue of `raspberry-pi-check` — nobody can select an M1's feature set on
+an M4 runner. Until someone runs a model on a real Mac, "supported" means "built and imported in CI".
+
+**Done means:** wheels for `macosx_11_0_arm64` and `macosx_10_13_x86_64` published for 3.10–3.13;
+`import loom` and `loom.devices()` reporting a CPU on both; `pytest tests/ci` green on both;
+`loom-py`'s *Supported platforms* table extended; and this item's blocker 4 answered in writing either
+way. Windows stays out of scope and stays behind this.
+
+#### P4.11 — Metal, the only accelerator a Mac can have — SCOPED (2026-08-16), strictly AFTER P4.10
+
+**Ordering, both halves of it.** This cannot start before P4.10: there is no macOS base wheel for a
+backend package to attach to, and P4.10's blocker 4 — ggml's DL loader searching for `.so` where CMake
+wrote `.dylib` — is the *same code path* that would discover `libggml-metal`, so starting here would
+mean debugging that twice. But unlike P4.10 this does **not** block P5, and the reason is worth stating
+so the sequence is not read as one long Apple project: P4.10 decides what a Mac can run **at all**,
+which multiplies every family P5 adds; P4.11 decides how **fast** one platform runs, which multiplies
+nothing. If P5 is ready first, P5 goes first.
+
+**The shape is already decided and is not the work.** `loom-py-rt-metal` is `packaging/rt-vulkan/`
+with the four strings `packaging/README.md` names, plus `archs = "arm64"` (cibuildwheel's macOS
+spelling) instead of `"x86_64 aarch64"`. **Intel Macs get no Metal wheel**: `packaging/README.md`
+already scopes Metal as arm64-only, and P4.10 explains why Apple Intel is a target one row wide.
+
+**What it costs elsewhere: a version bump becomes TEN strings across FOUR files**, up from seven
+across three — the root pyproject gains a `metal` extra pin, and the new package carries its own
+`version` plus its `loom-py-rt ==` pin. That circular exact-pin set is the ggml-ABI agreement, so the
+new file joins it rather than sitting beside it.
+
+**Four questions to answer before any workflow is written.** The Vulkan and CUDA packages made every
+one of these a Linux answer, and none of them carries over:
+
+1. **Discovery** — P4.10 blocker 4, unchanged and shared. Settle it there; this inherits the answer.
+2. **Linking is `install_name`/`@rpath`, not soname.** The build-side half of the `==` pin
+   (`cmake/GgmlPin.cmake`, read by both builds so the revision cannot drift) is unaffected, but the
+   mechanism that binds a backend to its base library is different on macOS, and P4.8g is the record of
+   what a mismatch looks like: it loads without error, registers nothing, and shows up only as an
+   accelerator missing from `loom.devices()`.
+3. **`GGML_METAL_EMBED_LIBRARY`.** A DL backend travels as a lone `.dylib` with no bundle around it. If
+   the shader library is not embedded, ggml-metal looks for `default.metallib` next to the executable —
+   and inside an interpreter the executable is `python`, which is precisely the trap
+   `loom/__init__.py`'s `_register_backend_paths` exists to work around for backend `.so` files. Verify
+   before assuming it is on by default.
+4. **Size, measured rather than guessed.** `libggml-vulkan.so` is 46.5 MB because 44 MB of it is
+   compiled SPIR-V; Metal ships shader *source* or a metallib and should be far smaller, which would
+   make it the first backend package that is small for a reason other than restraint. The number belongs
+   in `packaging/README.md`'s table once it exists — do not write it before.
+
+**What to expect when it does run, and the trap in expecting it.** Metal implements both
+`PAD_REFLECT_1D` and `POOL_1D` natively (P4.7d's support matrix; only Vulkan lacks the pad, and only
+Metal and SYCL have the 1-D pool), and P4.7e put the engine's substitutions behind
+`backend_can_run` — so on Metal those lowerings stay *off* and the graph should split less than
+Vulkan's does. That is a prediction, not a result. P4.8's standing warning applies unchanged: a first
+benchmark measures how much of the graph fell back, not the backend, so read the split count before
+reading the timing.
+
+**Device selection needs no new work**, and that is a claim to check rather than assume: ggml-metal
+registers as a GPU-kind device, so P4.8e's hierarchy should rank it without a new tier and
+`device="gpu"` should find it. `loom.devices()` naming it is the check.
+
+**Done means something stricter than P4.10's bar, because this failure is silent.** P4.10 can be
+called done on "built and imported in CI"; a backend cannot, since one that fails to load is
+indistinguishable from a slow CPU run. Done here is: `loom.devices()` listing Metal on a real Mac, a
+model producing output that matches the CPU path, and a timing pair for both. **Nobody in this project
+has that hardware**, so this stays scoped until someone with an Apple Silicon Mac runs it — the same
+honesty P4.8c applied to CUDA, which stopped being a claim only on the workstation.
+
+**Non-goals:** CoreML and the Neural Engine (not Metal, no ggml backend targets it, and out-of-tree
+options were already turned down on licensing); Intel Macs; a `universal2` backend wheel.
+
 #### P5 — breadth
 
 Ordered by coverage-per-effort, subject to P0.3's corrections: family 12 (BERT token classifiers —
