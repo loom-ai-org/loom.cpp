@@ -7294,6 +7294,141 @@ a ggml-side concern, not something the exporter or a new backend can reach. The 
 onnxruntime fusing conv+bias+activation where loom emits separate ADD/activation nodes, plus loom's
 165 ms of graph build, Lua driver and marshalling.
 
+### P4.15 — the F32 GEMM micro-kernel, which is 71% of that gap — SCOPED, NOT STARTED (2026-08-20)
+
+**The single biggest lever this investigation found, and it is ~60 lines.**
+
+`ggml_compute_forward_mul_mat`'s F32 path computes ONE output element per `ggml_vec_dot_f32` call --
+1x1 register blocking. On plain NEON that inner loop (`GGML_F32_STEP` 16, `GGML_F32_ARR` 4) issues
+**two 128-bit loads per 128-bit FMA**. A72 is load-issue limited well before FMA peak, so that ratio,
+not cache or bandwidth, is what caps it. The 16x16 "block-tiling attempt" above it only helps locality;
+it does not amortise anything into registers.
+
+MLAS (**github.com/microsoft/MLAS**, now its own repo, **MIT** -- so license-compatible with this one)
+does the opposite: `src/lib/aarch64/SgemmKernelNeon.S` holds a **4 rows x 16 columns** accumulator tile
+in v16-v31 and its inner op is a broadcast-lane FMA, `fmla v.4s, v4.4s, vA.s[lane]` -- ~5 loads feed 16
+FMAs, **0.31 loads/FMA against ggml's 2.0**. That requires B pre-packed into 16-column panels, which is
+what `MlasSgemmCopyPackB` exists for.
+
+**We do not need the packing, because loom's operand layout is friendlier than the one MLAS was
+designed for.** A conv mul_mat here has BOTH operands K-contiguous (im2col `[K, M]`, kernel `[K, N]`),
+i.e. `C = A * B^T` with both row-major over K. A 4x4 tile of dot-product accumulators then needs no
+repacking at all: 8 loads feed 16 FMAs, 0.5 loads/FMA. Measured on the Pi at the eleven real
+`flow_vocoder` GEMM shapes (`tests/`-external prototype, ~60 lines of NEON intrinsics):
+
+| | GFLOP/s | vs ggml |
+|---|---|---|
+| ggml `mul_mat`, `GGML_LLAMAFILE=OFF` | 15.0 | — |
+| ggml `mul_mat`, `GGML_LLAMAFILE=ON` | 15.4 | 1.03x |
+| **4x4 blocked NEON prototype** | **24.4** | **1.62x** |
+| onnxruntime/MLAS, measured in-model | 25.7 | 1.71x |
+| A72 fp32 peak (1.8 GHz x 4 cores x 4 lanes x 2) | 57.6 | — |
+
+**A ~60-line kernel reaches 95% of MLAS's rate.** Per shape the win is 1.35-2.13x, concentrated in the
+long-activation convs (M = 18368-73472); the two small-M cases (M=288) only get 1.13-1.22x.
+
+**This also re-confirms the `GGML_LLAMAFILE` finding after the zero-page bug invalidated the first
+test.** The original ON/OFF comparison ran on unfilled buffers; redone with filled inputs it is 15.4 vs
+15.0 GFLOP/s -- still nothing. Curiously tinyBLAS's output is bit-identical to the 4x4 prototype's
+(max diff exactly 0.0, where ggml's own path differs by ~3e-7), so it is accumulating the same way and
+losing the 1.6x somewhere else. Worth one look before writing a kernel from scratch.
+
+**What it is worth end-to-end.** MUL_MAT is ~84.5% of loom's 1.55 s conv time (from P4.14's 1-thread
+profile, MUL_MAT:IM2COL = 4181:767), so 1.56x on it saves ~0.47 s: **2.35 s -> ~1.88 s**, and
+loom-vs-onnxruntime **2.30x -> 1.84x**. With the CONV_TRANSPOSE_1D item above, ~1.76x.
+
+**Where the change has to live, in preference order.** Not in loom: loom calls `ggml_mul_mat`, and a
+loom-side `ggml_map_custom` kernel would be a C function pointer no GPU can dispatch, forcing scheduler
+splits (see `lua_bridge.h`'s own criterion and `graph_builder.h` on hybrid splits) as well as violating
+the lean-runtime rule. So: **(1)** fix tinyBLAS's ARM F32 path in ggml's `llamafile/sgemm.cpp` -- it is
+already the designated hook and already gated in; **(2)** add a blocked F32 path to
+`ggml_compute_forward_mul_mat` and upstream it; **(3)** vendoring MLAS wholesale is license-clean but
+7.6 MB of multi-architecture assembly with its own build system, against an engine whose selling point
+is size -- read it, do not import it.
+
+**One gate consequence.** The prototype is NOT bit-identical to ggml's current output (~3e-7 relative,
+a different summation order). Any byte-identity gate over a conv-bearing model has to become a
+tolerance gate, or be re-baselined, before this can land. See CLAUDE.md's tensor-oracle rule.
+
+#### Picking this up from a cold start — environment, commands, and the numbers to check yourself against
+
+Everything below was measured on **`rpi4`** (Raspberry Pi 4B rev 1.5, Cortex-A72, 4 cores @ 1.8 GHz,
+LPDDR4, Debian aarch64), reachable over the LAN as `ssh pi@rpi4` with key auth. Two engines, one model,
+one utterance throughout:
+
+* model `loom-ai-org/vits-piper-en-gb-miro-loom`, HF cache at
+  `~/.cache/huggingface/hub/models--loom-ai-org--vits-piper-en-gb-miro-loom/snapshots/*/vits-piper-en-gb-miro.gguf`
+  (the same GGUF is at `../hf-models/vits-piper-en-gb-miro/` on the dev box);
+* the ONNX original at `/home/pi/pipertts-en-gb-miro/miro_en-GB.onnx`, driven through `phoonnx`;
+* venv `/home/pi/test` (has `loom-py-rt` 1.0.0rc4, `onnxruntime` 1.28.0, `phoonnx`);
+* text "Hey, can you shutdown the computer, my friend?", phonemes
+  `hˈeɪ, kæn juː ʃˈʌtdaʊn ðə kəmpjˈuːtɐ, maɪ fɹˈɛnd?` -> 100 ids -> y_length 287 -> 73472 samples.
+
+**Baselines to reproduce before trusting anything you measure** (idle box, both steady-state after a
+warm-up call): loom **2.35 s**, onnxruntime **1.024 s**, ratio **2.3x**. loom `from_file` load 0.19 s
+(`from_pretrained` is 1.55 s — that extra 1.36 s is an HF revision check, not loading); onnxruntime
+`InferenceSession` construction **5.5 s**. If your loom number is far off 2.35 s, stop and fix the
+measurement rather than reasoning from it.
+
+**Commands.**
+
+```sh
+# per-op profile of the real graph -- ONE thread, see the trap in P4.14
+LOOM_THREADS=1 LOOM_PROFILE=1 loom_cli --model <gguf> --prompt "..." --n-predict 8
+LOOM_PROFILE=/tmp/p.txt loom_cli ...            # to a file instead of stderr
+
+# the GEMM prototype vs ggml, at the eleven real flow_vocoder shapes
+g++ -O3 -std=c++17 -fopenmp -march=armv8-a -I <ggml>/include -I <ggml>/src \
+    scripts/bench6.cpp -o bench6 -L<build>/src -L<build>/src/ggml-cpu \
+    -lggml -lggml-base -lggml-cpu -lgomp -lpthread -lm
+./bench6 4          # expect ggml ~15.0 GFLOP/s, prototype ~24.4, ratio ~1.62x
+
+# onnxruntime's own per-op profile, for the other side of the comparison
+#   ort.SessionOptions(); so.enable_profiling = True; so.intra_op_num_threads = 4
+#   ... then session.end_profiling() -> JSON; aggregate events with
+#   cat == "Node" and name ending "_kernel_time" by args["op_name"].
+#   This build's events carry NO run_index: split runs by ORDER (len(kernels)//n_runs).
+#   Profiling costs onnxruntime 1.18x, so use SHARES only and apportion them over an
+#   un-profiled wall time measured separately.
+```
+
+**Three measurement traps, each of which produced a wrong answer here that survived a full write-up.
+Check all three before believing a number.**
+
+1. **Never read a ggml tensor you have not written.** Untouched anonymous pages all map to the shared
+   zero page, so the whole read set sits in L1. Inflated an isolated conv benchmark **2.1x** (103 ms
+   against a real 219 ms) and silently invalidated the first `GGML_LLAMAFILE` A/B. `scripts/bench6.cpp`
+   fills every input; copy that.
+2. **Confirm the box is idle.** `uptime` costs nothing. An orphaned `prof_main` held one of four cores
+   for 67 minutes and manufactured a 1.22x win for `ggml_conv_2d_direct` that is really 0.98x.
+   **A `timeout`-killed ssh does NOT kill the remote process** — `pkill` on the far side after any
+   aborted remote run.
+3. **Check the parts fit inside the whole.** The contaminated run put the conv total at **2.589 s
+   inside a 2.35 s synthesis**. A component larger than its container is not a noisy measurement, it is
+   a wrong one; stop and find the cause instead of caveating it.
+
+**Already measured and CLOSED — do not re-propose without new evidence:**
+
+| proposal | result |
+|---|---|
+| unfused elementwise/activation chain is the gap | **no** — 6.5% of graph time at 1 thread |
+| the C++<->Lua array boundary is expensive | **no** — 18.7 ms total |
+| `GGML_LLAMAFILE=ON` (tinyBLAS) fixes the GEMM | **no** — 15.4 vs 15.0 GFLOP/s, retested with filled inputs |
+| lower CONV_1D as `kw` shifted mul_mats to dodge im2col | **worse** — 0.43-0.98x |
+| `ggml_conv_2d_direct` (ggml's MLAS-shaped fused conv) | **nothing** — 0.98x, despite bit-identical output |
+| im2col materialisation is the gap | **no** — removing it (row above) changes nothing |
+
+**Still open, in the order they are worth doing:** P4.15 (this item, ~0.47 s), then
+`CONV_TRANSPOSE_1D` as mul_mat + reshape (P4.14's follow-up list, ~60-90 ms), then fusing
+conv+bias+activation (part of the 27% "everything else" column above). P4.13 (quantized conv kernels)
+**conflicts** with any direct-conv work — decide between them rather than starting both.
+
+**Start P4.15 by re-reading `scripts/bench6.cpp`'s header, then ggml's
+`src/ggml-cpu/vec.cpp:ggml_vec_dot_f32` and `llamafile/sgemm.cpp`'s `mnpack`/`gemm<M,N>`.** The open
+question that decides the approach is the bit-identity oddity noted above: tinyBLAS already accumulates
+exactly like the fast prototype yet runs 1.6x slower, so find out where it loses that before writing a
+new kernel.
+
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
 
 **Do this before P5.** Not because P5 depends on it, but because it closes the thread P4.12 opened and
