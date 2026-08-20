@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 
 using loom_test::GgmlScratch;
@@ -690,6 +691,136 @@ void test_conv_1d() {
     s.compute(gf);
 
     LOOM_CHECK((get_f32(out) == std::vector<float>{3, 5, 7}));
+}
+
+// A PACKED (non-F32) conv kernel has to go in mul_mat's FIRST operand, because
+// ggml_compute_forward_mul_mat asserts its second is F32. primitives_conv.cpp branches on the kernel's
+// dtype to do that, which means CONV_1D has two formulations producing one result -- and this is what
+// says they agree. Without it the packed path could transpose wrongly and still produce a
+// plausibly-shaped tensor full of the right numbers in the wrong places.
+//
+// F16 rather than Q8_0 on purpose: ggml lays quantization blocks along ne[0], which for a conv kernel
+// is the KERNEL WIDTH (1, 3, 5 ...), never a multiple of 32 -- so a block-quantized conv kernel is not
+// representable in this layout at all and the exporter declines it. F16 has a block size of 1 and is
+// what convolutional weights actually ship as.
+void test_conv_1d_packed_kernel_matches_f32() {
+    GgmlScratch s;
+    // IC=2, OC=3, K=2 -- wide enough that a wrong transpose reorders values instead of being invisible.
+    constexpr int64_t kK = 2, kIC = 2, kOC = 3, kIL = 5;
+    const std::vector<float> kernel_data = {
+        0.5f, -1.0f,  0.25f, 2.0f,      // OC 0: [K,IC]
+        1.5f,  0.75f, -0.5f, 0.125f,    // OC 1
+       -2.0f,  0.25f,  1.0f, -0.75f,    // OC 2
+    };
+    std::vector<float> data_data(kIL * kIC);
+    for (size_t i = 0; i < data_data.size(); ++i) data_data[i] = static_cast<float>(i + 1) * 0.5f;
+
+    nlohmann::json attrs = {{"s0", 1}, {"p0", 0}, {"d0", 1}};
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+
+    // F32 kernel: the original formulation, kernel in mul_mat's second operand.
+    ggml_tensor* k32 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, kK, kIC, kOC);
+    ggml_set_input(k32);
+    ggml_tensor* d32 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(d32);
+    ggml_tensor* out32 = op("CONV_1D")(pc, {k32, d32}, attrs)[0];
+
+    // F16 kernel: the packed formulation, kernel in the first operand plus the transpose back.
+    ggml_tensor* k16 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F16, kK, kIC, kOC);
+    ggml_set_input(k16);
+    ggml_tensor* d16 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(d16);
+    ggml_tensor* out16 = op("CONV_1D")(pc, {k16, d16}, attrs)[0];
+
+    // Same declared geometry from both, which the transpose is what preserves.
+    LOOM_CHECK(out16->ne[0] == out32->ne[0]);
+    LOOM_CHECK(out16->ne[1] == out32->ne[1]);
+    LOOM_CHECK(out32->ne[1] == kOC);
+
+    // Both outputs in ONE graph, so they share the allocator and the comparison is of two
+    // formulations rather than of two runs.
+    ggml_cgraph* gf = ggml_new_graph(s.ctx.get());
+    ggml_build_forward_expand(gf, out32);
+    ggml_build_forward_expand(gf, out16);
+    ggml_gallocr_alloc_graph(s.galloc.get(), gf);
+    set_f32(k32, kernel_data);
+    set_f32(d32, data_data);
+    std::vector<ggml_fp16_t> half(kernel_data.size());
+    for (size_t i = 0; i < kernel_data.size(); ++i) half[i] = ggml_fp32_to_fp16(kernel_data[i]);
+    std::memcpy(k16->data, half.data(), ggml_nbytes(k16));
+    set_f32(d16, data_data);
+    s.compute(gf);
+
+    const std::vector<float> a = get_f32(out32), b = get_f32(out16);
+    LOOM_CHECK(a.size() == b.size());
+    bool ok = true;
+    // fp16 has ~3 decimal digits, and these values reach ~20, so the tolerance is relative.
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::fabs(a[i] - b[i]) > 1e-2f * std::max(1.0f, std::fabs(a[i]))) ok = false;
+    }
+    LOOM_CHECK(ok);
+}
+
+// The other packed form, and the one that needs the operand SWAP rather than a matching im2col. A
+// block-quantized kernel has no F16 vec_dot partner, so it can only sit in mul_mat's first operand --
+// which is what mul_mat_kernel_first + its transpose exist for.
+//
+// ne[0] is 32 here on purpose. ggml lays Q8_0 blocks along ne[0], which for a REAL conv kernel is the
+// kernel width (1, 3, 5 ...) and never block-aligned -- so the exporter declines real conv kernels for
+// Q8_0 and this path is currently reached only by a kernel shaped like this one. It is tested anyway:
+// the alternative is an untested branch that the day a 32-wide kernel appears would silently transpose
+// wrongly.
+void test_conv_1d_quantized_kernel_matches_f32() {
+    GgmlScratch s;
+    constexpr int64_t kK = 32, kIC = 1, kOC = 2, kIL = 40;
+    std::vector<float> kernel_data(kK * kIC * kOC);
+    for (size_t i = 0; i < kernel_data.size(); ++i) kernel_data[i] = std::sin(0.7f * static_cast<float>(i));
+    std::vector<float> data_data(kIL * kIC);
+    for (size_t i = 0; i < data_data.size(); ++i) data_data[i] = std::cos(0.3f * static_cast<float>(i));
+
+    nlohmann::json attrs = {{"s0", 1}, {"p0", 0}, {"d0", 1}};
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+
+    ggml_tensor* k32 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, kK, kIC, kOC);
+    ggml_set_input(k32);
+    ggml_tensor* d32 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(d32);
+    ggml_tensor* out32 = op("CONV_1D")(pc, {k32, d32}, attrs)[0];
+
+    ggml_tensor* kq = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_Q8_0, kK, kIC, kOC);
+    ggml_set_input(kq);
+    ggml_tensor* dq = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(dq);
+    ggml_tensor* outq = op("CONV_1D")(pc, {kq, dq}, attrs)[0];
+
+    LOOM_CHECK(outq->ne[0] == out32->ne[0]);
+    LOOM_CHECK(outq->ne[1] == out32->ne[1]);
+
+    ggml_cgraph* gf = ggml_new_graph(s.ctx.get());
+    ggml_build_forward_expand(gf, out32);
+    ggml_build_forward_expand(gf, outq);
+    ggml_gallocr_alloc_graph(s.galloc.get(), gf);
+
+    set_f32(k32, kernel_data);
+    set_f32(d32, data_data);
+    std::vector<char> packed(ggml_nbytes(kq));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, kernel_data.data(), packed.data(), 0,
+                        kIC * kOC, kK, nullptr);
+    std::memcpy(kq->data, packed.data(), packed.size());
+    set_f32(dq, data_data);
+    s.compute(gf);
+
+    const std::vector<float> a = get_f32(out32), b = get_f32(outq);
+    LOOM_CHECK(a.size() == b.size());
+    bool ok = true;
+    // Q8_0 keeps ~8 bits per weight over a 32-wide block, so this is a quantization-error bound, not an
+    // exactness one -- what it rules out is a wrong TRANSPOSE, which reorders values wholesale.
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::fabs(a[i] - b[i]) > 5e-2f * std::max(1.0f, std::fabs(a[i]))) ok = false;
+    }
+    LOOM_CHECK(ok);
 }
 
 void test_conv_2d() {
@@ -2394,6 +2525,8 @@ int main() {
     test_rope_identity_at_position_zero();
     test_conv_1d();
     test_conv_2d();
+    test_conv_1d_packed_kernel_matches_f32();
+    test_conv_1d_quantized_kernel_matches_f32();
     test_conv_2d_dw();
     test_conv_transpose_1d();
     test_conv_transpose_2d();
