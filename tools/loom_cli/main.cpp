@@ -34,7 +34,11 @@ void print_usage(const char* argv0) {
                   "[--no-condition-on-previous]\n"
                   "\n"
                   "  --device <auto|cpu|gpu|NAME>  where to run (default: auto, or $LOOM_DEVICE)\n"
-                  "  --list-devices                print the devices this build can reach, and exit\n",
+                  "  --list-devices                print the devices this build can reach, and exit\n"
+                  "\n"
+                  "  $LOOM_PROFILE=1               time every graph node and print a per-op breakdown\n"
+                  "  $LOOM_PROFILE=<path>          ... to a file instead of stderr\n"
+                  "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
                   argv0, argv0);
 }
 
@@ -344,5 +348,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Explicit rather than left to the atexit handler profile.cpp registers, purely for ORDERING: this
+    // process writes its results to a block-buffered stdout, and a report emitted at exit to unbuffered
+    // stderr lands ahead of them in a pipe. No-op unless $LOOM_PROFILE asked for one.
+    loom::profile::write_report();
     return 0;
 }

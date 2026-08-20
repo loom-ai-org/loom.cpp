@@ -7157,6 +7157,143 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 
 ## Engine
 
+### P4.14 — `$LOOM_PROFILE`: per-node timing of the graph the engine actually runs — DONE (2026-08-20)
+
+**Why it exists: three plausible answers were wrong.** Chasing why VITS
+(`vits-piper-en-gb-miro`) synthesises ~2.2x slower than the same checkpoint under onnxruntime on a
+Raspberry Pi 4, three explanations were argued for from the code and each was measured at a few percent
+or less — ggml not fusing conv+bias+activation (the whole unfused elementwise + activation chain is
+**6.5%**), the C++<->Lua array boundary (**18.7 ms**), and `GGML_LLAMAFILE` being off in the shipped
+wheel (it is off, and building ggml both ways on the Pi measured **no difference at all**: 20.5 vs
+20.3 GFLOP/s — tinyBLAS's ARM F32 path does run, it just isn't faster for these shapes). The answer was
+`MUL_MAT` at **70.4%**. Rebuilding the engine with a hand-rolled hook to find that out is a day; this
+makes it five minutes, and it works against a SHIPPED WHEEL, which is where the question actually gets
+asked.
+
+**What it is.** `include/loom/core/profile.h` + `src/core/profile.cpp`. `$LOOM_PROFILE=1` (or a path)
+makes `GraphBuilder::compute` walk the already-built, already-allocated graph one node at a time,
+bucketing time by `(op, ne0, ne1)`; the report is per-bucket then rolled up by op. Two routes, because
+the builder has two: the CPU-only path uses `ggml_graph_view` directly, and the hybrid path installs
+ggml's own `ggml_backend_sched_set_eval_callback` (which already runs a split node-by-node when a
+callback is present) and clears it afterwards.
+
+**The one trap, documented at the top of the header because a user who misses it gets a misleading
+answer rather than a noisy one.** One `ggml_backend_graph_compute` per node is one threadpool
+synchronisation per node. Measured on the Pi over ~2 990 node executions:
+
+| | sum of node times | un-profiled run | overhead |
+|---|---|---|---|
+| `threads=1` | 5.939 s | 5.982 s | **0.7%** — exact |
+| `threads=4` | 5.53 s | 2.35 s | **~1.4 ms floor per node** |
+
+At four threads that floor is bigger than most nodes' real work, so it lands on whichever op has the
+most NODES rather than the most work. **Profile with one thread.** `Totals::floor_seconds` reports the
+floor the run observed and the report prints a floor-corrected column, but a corrected four-thread
+number is an estimate where a one-thread number is a measurement.
+
+**What it cannot see:** anything outside a graph — graph *building*, the driver script's host-side
+loops, marshalling. For VITS those came to 165 ms of a 2.4 s call, so "the profile does not add up to
+the wall clock" is expected.
+
+**Notes on the implementation, both of which were bugs first.** The table is a deliberately leaked
+`new`'d `std::map`: an earlier draft dumped from a static destructor, which on a shared-library build
+ran after the table's own and threw `std::bad_alloc` out of `__cxa_finalize` — a crash at exit in the
+tool whose job is to print at exit. And `profile.cpp` is the one TU that includes ggml's private
+`ggml-impl.h` (for `ggml_graph_view`, which returns `ggml_cgraph` by value); the CMakeLists adds
+`${ggml_SOURCE_DIR}/src` PRIVATE to that target alone. Affordable only because `cmake/GgmlPin.cmake`
+pins ggml exactly, so the header cannot shift without a deliberate bump turning this into a compile
+error. The alternative — routing the CPU path through `ggml_backend_sched` to borrow its callback —
+would have profiled a *different execution path* from the one production uses.
+
+**Tests:** `tests/ci/test_profile.cpp`, registered TWICE against one binary differing only in
+`ENVIRONMENT`, because `profile::enabled()` caches on first call and one process can only observe one
+route. It pins (a) node-by-node output is **bit-identical** to whole-graph — the claim that matters,
+since a profiler that silently corrupts what it observes is worse than none; (b) buckets account for
+every node executed; (c) the branch routes in both directions. **Both directions were verified to go
+red** by sabotage (branch forced off; walk made to skip the last node) — and the first attempt at this
+test could NOT fail, because `LOOM_CHECK` only counts failures and the test ended in `return 0;`
+instead of `LOOM_TEST_REPORT_AND_RETURN()`. Exactly the trap CLAUDE.md warns about, caught only by
+running the sabotage.
+
+#### What the profiler then measured, which P4.13 should read
+
+VITS `flow_vocoder` + text encoder + duration predictor, y_length=287, **1 thread, total 5.94 s**:
+
+| op | calls | ms | % |
+|---|---|---|---|
+| MUL_MAT | 213 | 4181 | **70.4%** |
+| IM2COL | 165 | 767 | **12.9%** |
+| CONV_TRANSPOSE_1D | 3 | 528 | **8.9%** |
+| ADD | 376 | 256 | 4.3% |
+| CONT | 311 | 66 | 1.1% |
+| everything else | — | ~145 | 2.4% |
+
+Conv path **92%**. At 4 threads the model runs 2.35 s (2.53x), and the big convs individually scale
+only **1.4–2.1x**.
+
+Three things follow, all measured rather than reasoned:
+
+* **`CONV_TRANSPOSE_1D` as mul_mat + reshape is 1.11-2.05x faster** than ggml's native op, which is a
+  naive scatter loop with a single-threaded memset+permute prologue. Re-measured on an IDLE box after
+  the contamination below, where it got stronger rather than weaker (2.05x on the first upsample vs
+  1.30x under load), so unlike the fused-conv result this one is real. The three upsamples cost 189 ms
+  of a 2.35 s synthesis, so it is worth ~60-90 ms, ~7% of the loom-vs-onnxruntime gap. The benchmark
+  skipped the final interleave, so the real win is smaller. **Open** -- and it is the ONE conv-side
+  change in this whole investigation that survived measurement.
+* **Re-lowering `CONV_1D` as `kw` shifted mul_mats over views of the activation — to avoid im2col's
+  ~7x memory blowup — is WORSE, 0.58–0.77x.** The per-tap `cont(transpose(view))` re-materialises the
+  activation anyway. Do not re-propose this; it was measured on the real shapes.
+* **ggml's own fused conv does NOT help here, measured twice.** `GGML_OP_CONV_2D` /
+  `ggml_conv_2d_direct` does im2col into a per-batch working buffer and GEMMs each batch -- the
+  blocked/implicit-GEMM structure onnxruntime's MLAS uses, already in ggml, already implemented for the
+  CPU. There is no `ggml_conv_1d_direct`, but a 1-D conv IS a 2-D conv with `KH=1, H=1` and every step
+  to get there is a reshape, so it is a few lines in `primitives_conv.cpp` to try. Output is
+  **bit-identical** (max abs diff 0.0). Over all 60 `flow_vocoder` convs at 4 threads it is **0.98x** --
+  i.e. nothing, marginally worse -- and per-shape it ranges 0.88-1.09x with no pattern worth exploiting.
+  **Closed, do not re-propose.**
+
+  **Read the retraction below before quoting any earlier number for this.** A first pass measured
+  1.14-1.30x per shape and 1.22x overall and was written up here as a real win. It was an artefact: an
+  orphaned `prof_main` (a `timeout`-killed ssh whose REMOTE process kept running) had been pegging one
+  of the Pi's four cores for 67 minutes, so every "4-thread" benchmark in that window actually had three
+  cores. ggml's `mul_mat` partitions work assuming `n_threads` equal workers and degrades badly when one
+  is starved; `conv_2d_direct`'s per-batch structure tolerates it. Remove the contention and the
+  advantage is gone. The tell was visible and was ignored for one round: the contaminated run put the
+  conv total at **2.589 s inside a 2.35 s synthesis**, i.e. 110% of a whole that it is a part of. On an
+  idle box the same measurement gives 1.550 s = 66%, which is possible. **A component that does not fit
+  inside its own total is not a noisy measurement, it is a wrong one -- stop and find the cause.**
+
+**Two benchmarking traps, both of which produced a wrong answer that survived a full write-up:**
+
+1. **Never read a ggml tensor you have not written.** Untouched anonymous pages all map to the shared
+   zero page, so the entire read set sits in L1 — that inflated an isolated conv benchmark by **2.1x**
+   (103 ms measured against a real 219 ms).
+2. **Check the box is idle, and check that the parts fit inside the whole.** See the orphaned-process
+   retraction above. `uptime` before a run costs nothing; a `timeout`-killed ssh does NOT kill the
+   remote process, so use `pkill` on the far side after any aborted remote benchmark.
+
+#### Where the loom-vs-onnxruntime gap actually is (idle box, 4 threads, 2.35 s vs 1.024 s)
+
+Both engines profiled per-op on the SAME model and utterance — loom via P4.14, onnxruntime via its own
+`enable_profiling` (shares only; profiling costs it 1.18x, so shares are apportioned over the
+un-profiled 1.024 s).
+
+| | loom | onnxruntime | delta | share of gap |
+|---|---|---|---|---|
+| convolution | 1.550 s | 0.605 s (`Conv`+`FusedConv`) | 0.95 s | **71%** |
+| transposed conv | 0.189 s | 0.162 s (`ConvTranspose`) | 0.03 s | 2% |
+| everything else | 0.61 s | 0.257 s | 0.35 s | 27% |
+
+The convolution carries 15.578 GFLOP: loom runs it at **10.0 GFLOP/s**, onnxruntime at **25.7
+GFLOP/s**, against a Pi 4 fp32 peak of ~57.6 GFLOP/s (4 cores x 1.8 GHz x 4 lanes x 2). So MLAS reaches
+45% of peak and ggml's generic F32 `mul_mat` reaches 17%, on identical arithmetic. That single ratio is
+most of the 2.2x, it is NOT the im2col materialisation (removing it changes nothing, above), and
+`GGML_LLAMAFILE`'s tinyBLAS is present and does run for these shapes (`n >= 4`) and measures no better.
+**The gap is F32 micro-kernel quality in the large-M / small-N (32-384) / medium-K regime**, which is
+a ggml-side concern, not something the exporter or a new backend can reach. The remaining 27% is
+onnxruntime fusing conv+bias+activation where loom emits separate ADD/activation nodes, plus loom's
+165 ms of graph build, Lua driver and marshalling.
+
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
 
 **Do this before P5.** Not because P5 depends on it, but because it closes the thread P4.12 opened and

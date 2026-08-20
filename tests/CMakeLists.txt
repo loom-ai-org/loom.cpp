@@ -175,6 +175,24 @@ add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# Registered TWICE against one binary, differing only in ENVIRONMENT: `profile::enabled()` caches its
+# answer on first call, so a single process can only ever observe one of the two routes through
+# GraphBuilder::compute, and the branch being stuck in either direction is a real failure (one makes
+# every shipped run pay per-node dispatch, the other makes the feature do nothing). The test asserts
+# whichever direction its own environment selects.
+add_executable(test_profile ci/test_profile.cpp)
+target_link_libraries(test_profile PRIVATE loom::engine)
+target_compile_definitions(test_profile PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_profile COMMAND test_profile)
+set_tests_properties(test_profile PROPERTIES LABELS ci)
+set_tests_properties(test_profile PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+set_tests_properties(test_profile PROPERTIES ENVIRONMENT "LOOM_PROFILE=")
+
+add_test(NAME test_profile_enabled COMMAND test_profile)
+set_tests_properties(test_profile_enabled PROPERTIES LABELS ci)
+set_tests_properties(test_profile_enabled PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+set_tests_properties(test_profile_enabled PROPERTIES ENVIRONMENT "LOOM_PROFILE=1")
+
 add_executable(test_gallocr_shrink ci/test_gallocr_shrink.cpp)
 target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_shrink PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
