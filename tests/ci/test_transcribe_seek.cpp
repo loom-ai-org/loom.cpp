@@ -50,6 +50,8 @@ int main() {
     // ONE window. Two means the seek landed short of the end -- the bug -- and the extra window is a
     // decode of zero padding whose text lands in the transcript.
     LOOM_CHECK(result.windows == 1);
+    // True because this call ASKED for timestamps (`options.timestamps` above) and the model has them
+    // -- it reports whether these boundaries are the model's, not whether it could produce some.
     LOOM_CHECK(result.timestamped);
     LOOM_CHECK(result.segments.size() == 1);
     LOOM_CHECK(result.segments[0].closed);
@@ -65,6 +67,18 @@ int main() {
     const loom::audio::Transcription multi =
         loom::audio::transcribe(session.bridge(), *model, longer, options);
     LOOM_CHECK(multi.windows > 1);
+
+    // `timestamped` reports whether the SEGMENTS carry model-chosen times, so a call that decodes
+    // without them says so even though this model has them. It used to report the capability and was
+    // therefore true here too -- indistinguishable from the timestamped call above, in the one case a
+    // caller is most likely to hit: short audio, default arguments.
+    loom::audio::TranscribeOptions plain;   // timestamps NOT requested
+    const loom::audio::Transcription untimed =
+        loom::audio::transcribe(session.bridge(), *model, waveform, plain);
+    LOOM_CHECK(untimed.windows == 1);
+    LOOM_CHECK(!untimed.timestamped);
+    LOOM_CHECK(untimed.segments.size() == 1);
+    LOOM_CHECK(!untimed.segments[0].closed);       // a window edge, and both fields now say so
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

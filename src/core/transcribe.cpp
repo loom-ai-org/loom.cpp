@@ -262,12 +262,19 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     const double ts_step = table.timestamp_step_sec;
     const bool can_timestamp = table.timestamped();
     const size_t n_clips = (waveform.size() + clip - 1) / clip;
-    out.timestamped = can_timestamp;
 
     // Timestamps are REQUESTED whenever they are usable and there is more than one window, even if the
     // caller did not ask to see them: they are what the seek advances on. A single-window file without
     // them keeps decoding in no-timestamps mode, so short audio behaves exactly as it did.
     const bool want_timestamps = options.timestamps || (can_timestamp && n_clips > 1);
+
+    // WHETHER THE BOUNDARIES BELOW ARE THE MODEL'S, not whether it could have produced some. This used
+    // to report `can_timestamp`, the CAPABILITY -- which is true of Whisper on every call, including
+    // the ones decoded in `<|notimestamps|>` mode whose segments are window edges. A caller reading
+    // `timestamped` as "these times are real" was then wrong in exactly the case they would not think
+    // to check: short audio, default arguments. The per-segment `closed` flag always carried the
+    // honest answer, but only for a reader who knew to ask it.
+    out.timestamped = can_timestamp && want_timestamps;
 
     const size_t prev_cap = table.prev_context ? table.prev_context : 448;
     std::vector<double> prev_tokens;
