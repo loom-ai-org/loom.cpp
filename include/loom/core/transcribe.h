@@ -76,9 +76,27 @@ struct Transcription {
     std::string text;
     // How many windows were decoded: 1 for a dynamic-length model or short audio.
     size_t windows = 0;
-    // Whether the model exposed timestamp tokens at all. False means the segments below are window
-    // slices rather than boundaries the model chose, which is worth a caller knowing.
+    // Whether the segments below carry times THE MODEL CHOSE. False means they are window slices --
+    // either because this model emits no timestamp tokens, or because this call decoded without them
+    // (which is what a single-window file does unless `timestamps` was asked for).
+    //
+    // Deliberately not "can this model emit timestamps": that was the old meaning, and it made the
+    // field true for Whisper on every call including the ones whose segments are window edges. The
+    // question a caller is really asking here is whether a start/end can be trusted as a boundary, and
+    // `closed` answers it per segment.
     bool timestamped = false;
+    // Things the caller asked for that this model has no way to honour, and which were IGNORED rather
+    // than refused -- currently an argument that selects nothing on this file, such as `language` on a
+    // monolingual checkpoint. One human-readable sentence each.
+    //
+    // Returned rather than printed because this is a library: it has no logger, no opinion about
+    // stderr, and no way to know whether its host wants a Python warning, a log line, or nothing.
+    // The host decides; loom-py raises each of these as a RuntimeWarning.
+    //
+    // What does NOT belong here is a request this model cannot serve -- asking an English-only file to
+    // TRANSLATE, or naming a language a multilingual file does not have. Those still throw, because
+    // proceeding would return confident output that is not what was asked for.
+    std::vector<std::string> warnings;
 };
 
 // Transcribes `waveform` with the model's own driver. Throws loom::LoadError when the file carries no
