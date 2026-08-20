@@ -7157,6 +7157,121 @@ atomic/monolithic). Four things from that iteration's own plan were originally o
 
 ## Engine
 
+### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
+
+**Do this before P5.** Not because P5 depends on it, but because it closes the thread P4.12 opened and
+the measurements below are fresh: the eligibility half shipped on
+`loom.cpp feature/packed-conv-kernels` + `loom-exporter feature/phoneme-lexicon-model-cards`, and this
+is the other half. Left alone, `--quantize Q8_0` on a convolutional model keeps reporting a 0% file
+and the reason keeps having to be re-derived.
+
+**One sentence.** A convolution kernel is stored `[K, IC, OC]`, ggml lays quantization blocks along
+`ne[0]`, `ne[0]` is the KERNEL WIDTH (1, 3, 5 ...), and no block size divides that — so no conv kernel
+is block-quantizable *as stored*, and the fix is to store it `[IC*K, OC]` and give the op the geometry
+it loses.
+
+#### What already landed, and what it did not solve
+
+Two independent gates decide whether a weight gets quantized, and only the first is fixed:
+
+1. **Op eligibility — FIXED.** Only a MUL_MAT's *first* operand can be non-F32
+   (`ggml_compute_forward_mul_mat` asserts `src1->type == GGML_TYPE_F32` for the operand it converts),
+   and every conv kernel sat in the second. `primitives_conv.cpp` now branches on the kernel dtype:
+   an F16 kernel keeps its slot and the **im2col follows it** (`conv_im2col_type`, :77 — legal because
+   `vec_dot_type[F16]` is F16, and cheaper than converting the big operand per call); a block-quantized
+   kernel moves to the first operand via `mul_mat_kernel_first` (:85) and pays a transpose back.
+   `conv_kernel_is_packed` (:66) is the predicate. F32 runs the identical graph as before.
+   The exporter's `PACKED_WEIGHT_FIRST_OPS` (`exporter.py:2438`) offers conv ops accordingly.
+2. **Block alignment — OPEN, and this entry.** `exporter.py:2713` declines any tensor whose fastest
+   axis is not a multiple of the block size. For a conv kernel that axis is `K`, so **every real conv
+   kernel is declined** and Q8_0 changes nothing. F16 slips through only because its block size is 1.
+
+The warning at `exporter.py` now reports the two separately ("N weight(s) WERE eligible by op and were
+declined for shape") — do not let a future edit re-merge them, that wording is what made the cause
+findable at all.
+
+#### The measurement that says it is worth doing
+
+VITS (`vits-piper-en-gb-miro`, 81.5 MB of weights, 132 conv kernels holding 62.2 MB):
+
+| stored as | aligned for block 32 |
+|---|---|
+| `[K, IC, OC]` (today) | **0 / 132** |
+| `[IC*K, OC]` (proposed) | **117 / 132 = 100.0% of conv BYTES** (the 15 stragglers are rounding dust) |
+
+Projected file: **81.5 -> 28.1 MB at Q4_0**, 35.8 MB at Q8_0. The same reshape helps every
+convolutional family — conv kernels are 53-92% of the weight bytes in Kokoro/Matcha/StyleTTS2/
+Supertonic and 126-303 MB inside the NeMo ASR encoders.
+
+#### Why it is feasible: im2col never reads the kernel
+
+`ggml_compute_forward_im2col_f32` (ggml-cpu/ops.cpp) touches **`src1->data` only**; `src0` (the kernel)
+is used purely for `ne[0]/ne[1]/ne[2]` to size the patch matrix. So the kernel passed to `ggml_im2col`
+needs correct dimensions and nothing else — its contents are never read. That is the whole reason this
+is a moderate change rather than a reimplementation of im2col.
+
+#### Design sketch
+
+* **Exporter** — store an eligible conv kernel as `[IC*K, OC]` and put `k`/`ic` on the CONV node's
+  attrs (the op currently recovers both from the kernel's own shape). Keep the 3-D form for kernels
+  that stay F32, or make 2-D unconditional and let the op reshape back — decide by whichever keeps the
+  gate baselines readable. `_collect_mul_mat_weight_names` already selects the right tensors.
+* **Engine** — in `op_conv_1d`/`op_conv_2d`, when the kernel arrives 2-D, build a **shape carrier** with
+  `ne = [K, IC, OC]` to hand `ggml_im2col`, then `mul_mat_kernel_first(kernel_2d, im2col_2d)` exactly as
+  today. The kernel is ALREADY the shape the mul_mat wants, so this path gets *simpler*, not harder.
+* **The one real cost to decide.** The shape carrier is a graph leaf, so `gallocr` allocates it even
+  though nothing reads it — ~1.7 MB for VITS's largest kernel, reused across the graph, so peak is the
+  largest single kernel and not the sum. If that is unacceptable on an edge target the alternative is a
+  patched `ggml_im2col` taking explicit dims, which means carrying a ggml delta; do not start there.
+
+#### Acceptance
+
+* `vits-piper-en-gb-miro` exports at Q4_0 to ~28 MB with a non-zero coverage line and no WARNING.
+* Its audio still transcribes correctly through whisper-small (the ASR oracle; correlation alone is not
+  enough — see P4.12, and see the StyleTTS2 note below).
+* `test_conv_1d_quantized_kernel_matches_f32` (tests/ci/test_primitive_registry.cpp:774) still passes,
+  and gains a 2-D-kernel sibling. It is the test that catches a wrong transpose — verified by sabotage:
+  replacing the transpose with a bare reshape fails it, and produces a right-shaped tensor with the
+  right numbers in the wrong places, which nothing else notices.
+* The export sweep is re-recorded: every conv model's tensor shapes change.
+
+#### Benchmarks on record (Ryzen 3 3250U, CPU, medians)
+
+| model | quant | coverage | size | time vs F32 |
+|---|---|---|---|---|
+| qwen3-0.6b | Q8_0 | 100% | 2390 -> 640 MB | **1.22x FASTER** |
+| styletts2 | Q8_0 | 43% | 411 -> 281 MB | 1.03x slower |
+| matcha | Q8_0 | 17% | 129 -> 109 MB | 1.13x slower |
+| vits | F16 | 67% | 81.7 -> 52.0 MB | **1.8x SLOWER**, cosine 0.999895 |
+
+Read these together before assuming Q4_0 will be fast: **integer quants and F16 behave oppositely
+here.** Q8_0 sped qwen3 up (real integer SIMD vec_dot, activations quantized to match) while F16 lost
+badly — this CPU has `f16c` (convert) and no native FP16 arithmetic, so every F16 dot converts to F32
+first. That is a property of THIS box; expect it to invert on the RTX 5090 workstation, which is where
+the GPU numbers should be taken and have NOT been. The TTS slowdowns also correlate with low coverage
+on small compute-bound models, which is exactly what this entry raises — so Q4_0 on VITS is the first
+case where a conv model gets high coverage, and its speed is genuinely unknown rather than predicted.
+
+#### Do not spend time on K-quants
+
+`Q4_K_M` is not a tensor type at all — it is a llama.cpp mixed-precision RECIPE. The real type `Q4_K`
+exists but `gguf.quants` raises `NotImplementedError` for every K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K), so
+this toolchain cannot write one. `main_export.quantize_choices()` (:24) derives the offered list by
+probing the writer for exactly this reason. Writable today: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
+Q8_0, TQ1_0, TQ2_0. K-quants also use block **256**, where only 9/132 VITS kernels would align even
+after the reshape — so they lose twice over. **Q4_0 is the target.**
+
+#### Unrelated flag found while benchmarking, worth its own look
+
+StyleTTS2 at Q8_0 produces audio with correlation **0.015** against its F32 audio while transcribing
+correctly through whisper-small. The plausible reading is its stochastic style-diffusion sampler
+diverging onto a different-but-valid trajectory from small numerical differences (Matcha's
+deterministic CFM stayed at 0.985) — but that is a HYPOTHESIS, not a verified result, and P4.12 is the
+standing reminder that plausible-sounding TTS reasoning has been wrong before. Verify before shipping a
+quantized StyleTTS2.
+
+---
+
 ### P5.0 — the high-level API: one door per task, declared by the file (2026-08-15)
 
 Design: **`docs/HIGH-LEVEL-API.md`**, which is the authority; this entry is the ledger stub and the
