@@ -34,6 +34,58 @@ void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
 // composite path over ggml_flash_attn_ext). ggml_compute_forward_im2col fully supports GGML_TYPE_F32 on
 // CPU, so these primitives replicate ggml_conv_1d/2d's own im2col->reshape->mul_mat(->permute->cont)
 // recipe with an F32 im2col instead of calling the convenience wrappers directly.
+//
+// WHICH OPERAND HOLDS THE KERNEL, AND WHY IT DEPENDS ON ITS DTYPE.
+//
+// ggml_mul_mat(a, b) can only read a NON-F32 `a`: ggml_compute_forward_mul_mat converts `b` to
+// type_traits_cpu[a->type].vec_dot_type and asserts `b->type == GGML_TYPE_F32` while doing it. The
+// recipe above (and stock ggml_conv_1d's) puts the kernel in `b`, so a conv kernel had to be F32 --
+// which is why quantizing a convolutional model used to change nothing at all: only a MUL_MAT's FIRST
+// operand is eligible, and every conv weight sat in the second. Measured over the shipped files, that
+// was 53-92% of the weight bytes in Kokoro/Matcha/StyleTTS2/Supertonic and 73% of VITS, whose Q8_0
+// export came out byte-identical to its F32 one.
+//
+// So the kernel moves to `a` -- but ONLY when it is not F32, and that condition is the whole design.
+// mul_mat(kernel, im2col) yields [OC, ...] where the F32 recipe yields [..., OC], so recovering the
+// declared layout costs a transpose + cont that the F32 path does not pay. Branching on the dtype means
+// an ordinary F32 export runs precisely the graph it ran before -- same ops, same order, bit-identical
+// -- and only a file that asked for quantized weights pays for them. `conv_kernel_is_packed` below is
+// that predicate, and it covers F16 as well as the quantized types: vec_dot_type[F16] is F16, so an F16
+// kernel in `a` needs no conversion either.
+//
+// The depthwise and causal forms need no transpose at all: their mul_mat is batched per channel, so
+// swapping the operands moves OC=1 into ne[0] and the result reshapes back as a pure view. CONV_2D_DW
+// was already written kernel-first for unrelated reasons and is unchanged. CONV_TRANSPOSE_1D/2D are
+// native ggml ops with no mul_mat, so they are untouched here and their kernels stay F32.
+//
+// Padding and striding are unaffected by any of this -- they are im2col parameters (p0/s0/d0), and
+// reflect padding is a separate op applied upstream (PAD_1D_REFLECT, primitives_basic.cpp).
+
+// Whether `kernel` is stored in a form that must occupy mul_mat's FIRST operand. F32 is the only dtype
+// that can sit in the second, and it is the one every pre-quantization export uses.
+bool conv_kernel_is_packed(const ggml_tensor* kernel) {
+    return ggml_is_quantized(kernel->type);
+}
+
+// The dtype the im2col patch matrix is materialised in, which is what decides whether the kernel can
+// stay in mul_mat's SECOND operand. ggml converts src1 to `vec_dot_type[src0->type]` and asserts src1
+// is F32 while doing it -- so an F16 kernel is legal in src1 exactly when src0 is also F16, because
+// vec_dot_type[F16] is F16 and no conversion is attempted. Matching the im2col to the kernel is what
+// stock ggml_conv_1d does for the same reason, and it is strictly cheaper than the alternative: the
+// patch matrix is written in its final type once, instead of being written F32 and then converted to
+// F16 into scratch on every call -- and the im2col is the BIG operand here, sized by the activations.
+ggml_type conv_im2col_type(const ggml_tensor* kernel) {
+    return kernel->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+}
+
+// mul_mat with the kernel in `a`, transposed back to the [.., OC] the F32 recipe produces.
+// Split out because CONV_1D and CONV_2D need exactly the same two lines around otherwise identical
+// reshapes, and because the transpose is the entire runtime cost of quantized conv weights -- one
+// place to find it when benchmarking, and one place to change if a future ggml can write it directly.
+ggml_tensor* mul_mat_kernel_first(ggml_context* ctx, ggml_tensor* kernel_2d, ggml_tensor* im2col_2d) {
+    ggml_tensor* result = ggml_mul_mat(ctx, kernel_2d, im2col_2d);   // [OC, N*OL]
+    return ggml_cont(ctx, ggml_transpose(ctx, result));              // [N*OL, OC]
+}
 
 Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("CONV_1D", in, 2);
@@ -48,10 +100,12 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // straight into a pointwise/depthwise conv (confirmed on Conformer-CTC's GLU-split conv module: the
     // first half of a channel-split tensor is a genuinely strided view, not a fresh contiguous buffer).
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
-    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, GGML_TYPE_F32); // [IC*K, OL, N]
-    ggml_tensor* result = ggml_mul_mat(pc.ctx,
-        ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),       // [IC*K, N*OL]
-        ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));       // [IC*K, OC]
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, conv_im2col_type(kernel)); // [IC*K, OL, N]
+    ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]); // [IC*K, N*OL]
+    ggml_tensor* kernel_2d = ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]); // [IC*K, OC]
+    ggml_tensor* result = conv_kernel_is_packed(kernel)
+        ? mul_mat_kernel_first(pc.ctx, kernel_2d, im2col_2d)
+        : ggml_mul_mat(pc.ctx, im2col_2d, kernel_2d);                                         // [N*OL, OC]
     result = ggml_reshape_3d(pc.ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);    // [OL, OC, N]
     return {result};
 }
@@ -68,10 +122,12 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
 
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
-    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, GGML_TYPE_F32); // [IC*KH*KW, OW, OH, N]
-    ggml_tensor* result = ggml_mul_mat(pc.ctx,
-        ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),          // [IC*KH*KW, N*OH*OW]
-        ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));         // [IC*KH*KW, OC]
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, conv_im2col_type(kernel)); // [IC*KH*KW, OW, OH, N]
+    ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]); // [IC*KH*KW, N*OH*OW]
+    ggml_tensor* kernel_2d = ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]); // [IC*KH*KW, OC]
+    ggml_tensor* result = conv_kernel_is_packed(kernel)
+        ? mul_mat_kernel_first(pc.ctx, kernel_2d, im2col_2d)
+        : ggml_mul_mat(pc.ctx, im2col_2d, kernel_2d);                                                          // [N*OH*OW, OC]
     result = ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], kernel->ne[3]);       // [OW, OH, N, OC]
     result = ggml_cont(pc.ctx, ggml_permute(pc.ctx, result, 0, 1, 3, 2));                                        // [OW, OH, OC, N]
     return {result};
@@ -154,9 +210,15 @@ Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
 
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
     ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, data->ne[0], 1, data->ne[1], data->ne[2]);
-    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, GGML_TYPE_F32);
-    ggml_tensor* result = ggml_mul_mat(pc.ctx, im2col, kernel);
-    result = ggml_reshape_3d(pc.ctx, result, result->ne[0], result->ne[2], 1);
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, conv_im2col_type(kernel));
+    // Free either way here, unlike the dense forms. This mul_mat is BATCHED over channels (ggml_mul_mat
+    // pairs index-for-index over ne[2] rather than taking a cross product), so the per-channel matrix is
+    // [K, OL] against [K, 1] and swapping the operands moves the length of 1 from ne[1] to ne[0]:
+    // [OL, 1, C] becomes [1, OL, C], whose buffer is `ol + c*OL` either way. So the reshape that follows
+    // is a pure view in both branches and no transpose is needed.
+    ggml_tensor* result = conv_kernel_is_packed(kernel)
+        ? ggml_reshape_3d(pc.ctx, ggml_mul_mat(pc.ctx, kernel, im2col), im2col->ne[1], im2col->ne[2], 1)
+        : ggml_reshape_3d(pc.ctx, ggml_mul_mat(pc.ctx, im2col, kernel), im2col->ne[1], im2col->ne[2], 1);
     return {result};
 }
 
@@ -232,9 +294,12 @@ Outputs op_short_conv(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     const int p0 = use_state ? 0 : static_cast<int>(n_state);
     ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, conv_in, conv_in->ne[0], 1, conv_in->ne[1], conv_in->ne[2]);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, /*s0=*/1, 0, p0, 0, /*d0=*/1, 0,
-                                       /*is_2D=*/false, GGML_TYPE_F32);
-    ggml_tensor* result = ggml_mul_mat(pc.ctx, im2col, kernel);
-    result = ggml_reshape_3d(pc.ctx, result, result->ne[0], result->ne[2], 1);
+                                       /*is_2D=*/false, conv_im2col_type(kernel));
+    // Same batched-per-channel shape as CONV_1D_DW, so the same free swap -- see the note there. The
+    // history concat above is upstream of this and unaffected: it changes what is convolved, not how.
+    ggml_tensor* result = conv_kernel_is_packed(kernel)
+        ? ggml_reshape_3d(pc.ctx, ggml_mul_mat(pc.ctx, kernel, im2col), im2col->ne[1], im2col->ne[2], 1)
+        : ggml_reshape_3d(pc.ctx, ggml_mul_mat(pc.ctx, im2col, kernel), im2col->ne[1], im2col->ne[2], 1);
 
     if (!use_state) {
         // The stateless form pads on BOTH sides (n_state + n_tokens + n_state - (K-1) = n_tokens +
