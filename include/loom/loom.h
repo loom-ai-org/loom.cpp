@@ -28,6 +28,7 @@
 // it, and fail inside the driver on the first SHORT_CONV node (BACKLOG.md P4.0.10).
 #include "loom/core/conv_state_cache.h"
 #include "loom/core/output_store.h"
+#include "loom/core/profile.h"
 #include "loom/core/lua_bridge.h"
 // What a file declares about ITSELF -- the task it performs and the modality pair it maps between --
 // and the ready-to-run bundle a host builds from it. Both exist so a host dispatches on what the file

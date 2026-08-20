@@ -1,6 +1,7 @@
 #include "loom/core/graph_builder.h"
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
+#include "loom/core/profile.h"
 #include "loom/loom_errors.h"
 #include "loom/ops/primitive_registry.h"
 
@@ -531,9 +532,15 @@ void GraphBuilder::compute() {
     if (!has_cached_) {
         throw Error("GraphBuilder::compute: no graph has been built yet");
     }
+    // The profiled variants are node-by-node and otherwise identical -- same graph, same order, same
+    // buffers (loom/core/profile.h). The branch is a load of a cached bool, and it is here rather than
+    // inside profile::compute so that a non-profiled run reaches the ggml call it always did.
+    const bool profiled = profile::enabled();
     const ggml_status status = backends_.hybrid()
-        ? ggml_backend_sched_graph_compute(sched_.get(), cached_.graph)
-        : ggml_backend_graph_compute(backend_, cached_.graph);
+        ? (profiled ? profile::compute(sched_.get(), cached_.graph)
+                    : ggml_backend_sched_graph_compute(sched_.get(), cached_.graph))
+        : (profiled ? profile::compute(backend_, cached_.graph)
+                    : ggml_backend_graph_compute(backend_, cached_.graph));
     if (status != GGML_STATUS_SUCCESS) {
         throw Error("GraphBuilder::compute: the graph failed to run on " +
                     std::string(ggml_backend_name(backend_)) + " (ggml_status " +
