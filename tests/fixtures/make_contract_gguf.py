@@ -162,6 +162,52 @@ def write_timestamped_asr(path: Path) -> None:
     _finish(w)
 
 
+# A DYNAMIC-LENGTH ASR model: no `loom.n_samples`, no timestamp ids, no language or task table -- the
+# shape of the NeMo CTC and transducer families, which is every ASR export here except Whisper.
+#
+# Two behaviours need it and neither is reachable with the fixed-clip fixture above.
+#
+# 1. THE SEGMENT'S EXTENT. This family emits no timestamp tokens, so `transcribe` returns one segment
+#    for the whole file. It used to report `{0.0, 0.0}` -- which reads as a zero-length span at the
+#    start of the audio, a measurement, and a wrong one. It reports `{0.0, duration}` now: no boundary
+#    the model chose (`timestamped` stays false, `closed` stays false), but a true statement of what
+#    the transcript covers.
+#
+# 2. AN ARGUMENT THAT SELECTS NOTHING. This driver is called with the waveform and its length and
+#    nothing else, so `language=` cannot reach it however multilingual the checkpoint. That used to
+#    throw. It warns and proceeds now, and the warning is returned rather than printed because a
+#    library has no logger.
+DYNAMIC_DRIVER = """
+function infer(inputs)
+    -- Ignores its input, like the fixture above: what is under test is what `transcribe` does around
+    -- the call -- the segment it synthesises and the arguments it accepts -- not a decode.
+    return {HELLO_ID}
+end
+"""
+
+
+def write_dynamic_asr(path: Path) -> None:
+    from gguf import GGUFWriter
+
+    w = _base(path, "dynamic_asr_test")
+    w.add_string("loom.task", "automatic-speech-recognition")
+    w.add_string("loom.input.kind", "audio")
+    w.add_string("loom.output.kind", "token_ids")
+    w.add_uint32("loom.sample_rate", 16000)
+    # Deliberately NO `loom.n_samples`: that absence is what makes the length dynamic, and it is the
+    # condition both behaviours above key on.
+
+    hello_id = 5
+    tokens = ["<pad>", "<eos>", "!", "?", ".", "hello", "!?"]
+    w.add_tokenizer_model("gpt2")
+    w.add_tokenizer_pre("qwen2")
+    w.add_token_list(tokens)
+    w.add_token_merges(["! ?"])
+    w.add_eos_token_id(1)
+    w.add_string("model.driver_script", DYNAMIC_DRIVER.replace("HELLO_ID", str(hello_id)))
+    _finish(w)
+
+
 def main() -> None:
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +215,7 @@ def main() -> None:
     write_legacy(out_dir / "contract_legacy.gguf")
     write_generate(out_dir / "generate_driver.gguf")
     write_timestamped_asr(out_dir / "timestamped_asr.gguf")
+    write_dynamic_asr(out_dir / "dynamic_asr.gguf")
 
 
 if __name__ == "__main__":
