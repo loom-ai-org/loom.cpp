@@ -147,27 +147,90 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
 
+    Transcription out;
+
+    const uint32_t clip = fixed_clip_samples(model);
+    const uint32_t max_new_tokens = default_max_new_tokens(model);
+
+    // Whether this file lets a caller CHOOSE at all, which is a different question from whether it has
+    // the particular name asked for -- and telling the two apart is what decides between a warning and
+    // a refusal. A declared table answers directly. A file with no table falls back to Whisper's
+    // `<|xx|>` spelling, and there the probe is `<|en|>` / `<|transcribe|>`: Whisper's multilingual
+    // vocabulary carries every language token including English, and its English-only vocabulary
+    // carries none of them, so the presence of the probe separates "wrong name" from "no choice here".
+    //
+    // The FIRST condition is the decode path, and it is the one that generalises. A dynamic-length
+    // family (`clip == 0` -- the NeMo CTC and transducer models) calls `infer` with the waveform and
+    // its length and NOTHING else: there is no prompt to put a language token in, so no argument here
+    // can reach the model whatever its vocabulary happens to contain. Deciding on the vocabulary alone
+    // got this wrong in a way worth recording -- parakeet-tdt carries a literal `<|en|>` PIECE in its
+    // SentencePiece vocabulary, so a spelled probe reports it as language-selectable, and a caller
+    // passing `language="en"` would have been given neither a warning nor an effect.
+    const auto offers = [&](const std::vector<std::string>& declared, const char* probe) {
+        if (clip == 0) return false;
+        if (!declared.empty()) return true;
+        return table.legacy_spelling && bpe_vocab && bpe_vocab->piece_to_id(probe) >= 0;
+    };
+    const bool selectable_language = offers(table.language_names, "<|en|>");
+    const bool selectable_task = offers(table.task_names, "<|transcribe|>");
+
     // Names to token ids, here rather than in a host: only the file can answer, and every host would
     // otherwise reimplement it or push the lookup onto a caller who cannot do it. The declared table is
     // asked first; a file that carries none falls back to Whisper's `<|xx|>` spelling, which is the one
     // place that spelling survives and is flagged as such by `legacy_spelling`.
-    const auto resolve = [&](const std::string& name, const char* what, bool is_task) -> int32_t {
+    //
+    // AN ARGUMENT THAT SELECTS NOTHING IS IGNORED, NOT REFUSED. A monolingual checkpoint has no
+    // language tokens, so `language="en"` on one is redundant rather than wrong -- it names exactly
+    // what the model was always going to do. Throwing there sent callers to look for a defect in a
+    // pipeline that had none, and made the obvious spelling of a correct call an error. It warns and
+    // proceeds now.
+    //
+    // A request the model cannot SERVE still throws, and the two are not the same:
+    //   * a multilingual file asked for a language it does not have -- the caller wants that language;
+    //   * any file asked to `translate` when it has no task tokens -- transcribing instead would
+    //     return fluent output in the wrong language and look like a success.
+    // `transcribe` is the exception among tasks: it names the default, so on a file with no task
+    // tokens it is redundant in exactly the way `language` is.
+    const auto resolve = [&](const std::string& name, const char* what, bool is_task,
+                             bool selectable) -> int32_t {
         if (name.empty()) return -1;
         int32_t id = is_task ? table.task(name) : table.language(name);
         if (id < 0 && table.legacy_spelling && bpe_vocab) id = bpe_vocab->piece_to_id("<|" + name + "|>");
         if (id < 0) {
+            // A file that DECLARES which languages it speaks overrules the "no tokens, so harmless"
+            // reading: an English-only checkpoint asked for French has no way to comply, and ignoring
+            // the argument would hand back fluent English as though it were the translation. Inert
+            // today -- no exporter writes `loom.text.languages` yet (its own gap) -- and correct the
+            // day one does, which is why it is a check rather than a comment.
+            const bool contradicted = !is_task && !contract.languages.empty() &&
+                std::find(contract.languages.begin(), contract.languages.end(), name) ==
+                    contract.languages.end();
+            const bool redundant = !selectable && !contradicted && (!is_task || name == "transcribe");
+            if (redundant) {
+                out.warnings.push_back(
+                    "transcribe: this model has no " + std::string(what) + " tokens, so " +
+                    std::string(what) + "=\"" + name + "\" selects nothing and was ignored. It "
+                    "decodes in the one " + std::string(what) + " it was trained for; omit the "
+                    "argument to say so explicitly.");
+                return -1;
+            }
             throw LoadError("transcribe: this model has no " + std::string(what) + " named \"" + name +
-                            "\". An English-only checkpoint has no language tokens at all, and no "
-                            "translate task; omit the argument to let the driver decide.");
+                            "\". " + (selectable
+                                ? "It does select a " + std::string(what) + ", so this name is wrong "
+                                  "rather than unnecessary -- `model.contract` lists what it declares."
+                                : "It has no " + std::string(what) + " tokens at all, so this cannot "
+                                  "be honoured by ignoring it: the result would not be what was asked "
+                                  "for."));
         }
         return id;
     };
-    const int32_t language_id = resolve(options.language, "language", /*is_task=*/false);
-    const int32_t task_id = resolve(options.task, "task", /*is_task=*/true);
+    const int32_t language_id = resolve(options.language, "language", /*is_task=*/false, selectable_language);
+    const int32_t task_id = resolve(options.task, "task", /*is_task=*/true, selectable_task);
 
-    Transcription out;
-    const uint32_t clip = fixed_clip_samples(model);
-    const uint32_t max_new_tokens = default_max_new_tokens(model);
+    // 16 kHz is what every ASR family exported so far takes, and is the only rate at which a file that
+    // declares none can be interpreted at all -- the alternative is refusing to transcribe a model that
+    // worked before the contract existed.
+    const double rate = contract.sample_rate ? contract.sample_rate : 16000;
 
     if (clip == 0) {
         // Dynamic length: the whole file in one call, which is the NeMo families' shape.
@@ -182,7 +245,15 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
             }
         }
         out.text = detokenize(ids);
-        out.segments.push_back({0.0, 0.0, out.text, false});
+        // The ONE segment spans the whole clip, and says so. It used to be `{0.0, 0.0}`, which reads as
+        // a zero-length segment at the start of the file -- a measurement, and a wrong one. These
+        // families (CTC and transducer) emit no timestamp tokens, so there is no boundary the model
+        // chose to report; what IS true is the extent this transcript covers, which is all of it.
+        //
+        // `closed` stays false and `out.timestamped` stays false, which is where a caller reads that
+        // these are not model-chosen boundaries. An end of 0.0 said that too, but only to a reader who
+        // already knew -- and it broke anything that sorts, seeks, or sums durations.
+        out.segments.push_back({0.0, static_cast<double>(waveform.size()) / rate, out.text, false});
         out.windows = 1;
         return out;
     }
@@ -190,10 +261,6 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     const int32_t ts_base = table.timestamp_first_id;
     const double ts_step = table.timestamp_step_sec;
     const bool can_timestamp = table.timestamped();
-    // 16 kHz is what every ASR family exported so far takes, and is the only rate at which a file that
-    // declares none can be interpreted at all -- the alternative is refusing to transcribe a model that
-    // worked before the contract existed.
-    const double rate = contract.sample_rate ? contract.sample_rate : 16000;
     const size_t n_clips = (waveform.size() + clip - 1) / clip;
     out.timestamped = can_timestamp;
 

@@ -79,6 +79,18 @@ struct Transcription {
     // Whether the model exposed timestamp tokens at all. False means the segments below are window
     // slices rather than boundaries the model chose, which is worth a caller knowing.
     bool timestamped = false;
+    // Things the caller asked for that this model has no way to honour, and which were IGNORED rather
+    // than refused -- currently an argument that selects nothing on this file, such as `language` on a
+    // monolingual checkpoint. One human-readable sentence each.
+    //
+    // Returned rather than printed because this is a library: it has no logger, no opinion about
+    // stderr, and no way to know whether its host wants a Python warning, a log line, or nothing.
+    // The host decides; loom-py raises each of these as a RuntimeWarning.
+    //
+    // What does NOT belong here is a request this model cannot serve -- asking an English-only file to
+    // TRANSLATE, or naming a language a multilingual file does not have. Those still throw, because
+    // proceeding would return confident output that is not what was asked for.
+    std::vector<std::string> warnings;
 };
 
 // Transcribes `waveform` with the model's own driver. Throws loom::LoadError when the file carries no
