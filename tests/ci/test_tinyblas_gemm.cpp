@@ -145,11 +145,19 @@ int main() {
     check_mul_mat(backend.get(), 96,  260, 128);  // m % 4  == 0, m % 8  != 0
     check_mul_mat(backend.get(), 1344, 288, 384); // large K, wide N -- the two small-M shapes
 
+    // Every remainder of the row split, because those rows take a DIFFERENT path from the ones above
+    // them -- the tiled kernel handles `m - m % 4` and a separate loop finishes the rest, so a bug
+    // there shows up in one to three rows of a matrix whose other 256 are right. The reference check
+    // covers the last four rows of every shape precisely so this is visible.
+    check_mul_mat(backend.get(), 224, 257, 32);   // m % 4 == 1
+    check_mul_mat(backend.get(), 224, 258, 64);   // m % 4 == 2
+    check_mul_mat(backend.get(), 960, 287, 384);  // m % 4 == 3 -- the real VITS vocoder shape
+    check_mul_mat(backend.get(), 224, 3,   32);   // fewer rows than one tile: no tiled part at all
+
     // And the fall-offs, where ggml's own kernel has to produce the same answer: n < 4 (NEON bails),
-    // m not a multiple of 4 (no branch matches), K not a multiple of KN (KN is 4 for F32 NEON, 8 for
-    // AVX2, 16 for AVX-512, so 97 is odd enough to miss all three).
+    // and K not a multiple of KN (KN is 4 for F32 NEON, 8 for AVX2, 16 for AVX-512, so 97 misses all
+    // three).
     check_mul_mat(backend.get(), 224, 256, 3);
-    check_mul_mat(backend.get(), 224, 257, 32);
     check_mul_mat(backend.get(), 97,  256, 32);
 
     LOOM_TEST_REPORT_AND_RETURN();
