@@ -7448,8 +7448,10 @@ number, not dispatch).
 | transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.19 s | 0.19 s | 0.162 s (`ConvTranspose`) | 0.03 s | 5% |
 | everything else | 0.34 s | 0.33 s | 0.33 s | 0.36 s | 0.29 s | 0.257 s | 0.03 s | 6% |
 
-**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x, and the gap itself 1.31 -> 0.92 ->
-0.76 -> 0.59 -> 0.55 s: 58% of it closed.**
+**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x -> 1.47x with the direct kernel
+(ggml-0006), and the gap itself 1.31 -> 0.92 -> 0.76 -> 0.59 -> 0.55 -> 0.48 s: 63% of it closed.**
+The x86 box, which had been on a different lowering entirely and had no end-to-end number until this
+one, went 1.503 -> 1.169 s on the same utterance.
 
 **The 0005 column's split is arithmetic, not measurement, and this is the one place in this entry where
 that is true.** Its total (1.576 s) is measured, against 1.605 s for the identical build with
@@ -7483,7 +7485,51 @@ puts it at ~1.04 s, against the 1.024 s the per-op shares above were apportioned
   P4.14's follow-up list is ~60-90 ms, i.e. still real but no longer near the top.
 
 
-#### The direct convolution, prototyped: right in one regime, four times wrong in the other
+#### The hybrid: a direct kernel behind a cache-size heuristic (ggml-0006)
+
+The prototype said a direct convolution wins where the activation is long and the weights are small and
+loses badly where they are not. `cmake/patches/ggml-0006-conv1d-direct.patch` is that kernel inside
+ggml's `CONV_2D`, with the heuristic that decides. **loom now lowers `CONV_1D` to `CONV_2D` on every
+architecture** — the `#if defined(__aarch64__)` is gone, because the direct kernel is what x86 was
+missing.
+
+| | before | after | |
+|---|---|---|---|
+| Pi 4, 4 threads | 1.576 s | **1.508 s** | 1.05x |
+| Ryzen 3 3250U, 2 threads pinned | 1.503 s | **1.169 s** | **1.29x** |
+
+**Three conditions, and the third one is the whole lesson.**
+
+1. **Shape and type**: F32, `KH = 1`, one image, stride 1, contiguous, `OC % 4 == 0`. Anything else
+   takes the batched im2col, which is also the fallback when the scratch does not fit.
+2. **Weights must fit cache** — they are re-read once per position block, and at 1.5 MB against a
+   287-position activation that is the entire cost. The budget is `L3/2` where the machine reports it,
+   else `L2`, else 512 KB: **2 MB on the x86 box and 512 KB on the Pi**, which is exactly where the two
+   machines' measurements say the line is. One rule, two answers, no `#if`.
+3. **There must be at least as many position blocks as output-channel tiles.** Without this the
+   synthesis went **1.576 -> 1.703 s** — slower than not having the kernel at all. The eleven shapes
+   the bench holds are not the shapes the model runs: it also has 77 convolutions of 100 positions and
+   192 channels, every one of which passes the weight test and none of which should take this path.
+   Adding the condition also improved x86 (1.258 -> 1.169 s), so it was never an ARM quirk.
+
+**Why ARM gets 1.05x where the bench promised 1.6x: dilation.** The bench measured every shape at
+dilation 1. The model's HiFi-GAN resblocks run the same shapes at **1, 2, 3, 6 and 12**, and a dilated
+convolution's taps are twelve floats apart rather than adjacent. Re-measured at the model's own
+dilations, the direct kernel's advantage on those shapes falls from ~1.6x to **1.2-1.4x**, which is
+what the end-to-end number reflects. `scripts/bench10.cpp` now carries the real dilations; a bench that
+does not is measuring a convolution the model does not have.
+
+**Why x86 gains six times more than ARM.** It was starting from further back: `CONV_2D`'s batched
+im2col measured 0.87x there against plain im2col + mul_mat, so x86 had been left on the mul_mat
+lowering entirely (P4.15's earlier entry). The direct kernel is 3.5-4.7x on that machine's
+long-activation convolutions, which is enough to carry the whole op past the lowering it replaces.
+
+**Numerics.** This one is NOT bit-identical -- it is a different summation order, so the products are
+grouped differently. Against a `-DLOOM_TINYBLAS=OFF` build the whole synthesis differs by max
+**3.5e-6** on a 0.17 peak, rel-RMS 6.5e-6, cosine 0.99999999998 -- the same order as every other change
+in this entry, and every gate passes on both lowerings.
+
+#### The direct convolution, prototyped: right in one regime, four times wrong in the other (SHIPPED, above)
 
 With the GEMM finished, the im2col that feeds it is the largest single item left -- **396 ms of the
 1070 ms** this model spends in convolution, phase-timed inside ggml's own op (GEMM 663 ms, gather 396,
@@ -7822,10 +7868,11 @@ a 0.55 s gap that the table at the top of this entry attributes. Convolution is 
 that convolution the GEMM is finished (23.5 GFLOP/s in-model against 25.1 standalone) while the im2col
 that feeds it is 37% of the time:
 
-1. **A direct convolution behind a shape heuristic** — prototyped in `scripts/bench10.cpp` and written
-   up above: 1.57x on the long-activation convolutions, 0.15-0.25x on the weight-heavy ones, **1.15x
-   for this model if each shape takes the faster path**, worth ~174 ms. The largest remaining item and
-   the largest remaining piece of work.
+1. ~~A direct convolution behind a shape heuristic~~ — **DONE, `ggml-0006`**, 1.05x on the Pi and
+   1.29x on x86; see the section above for why those two numbers are so far apart and why the bench
+   promised more than either. What is left inside the convolution is the dilated shapes, where the
+   direct kernel gets 1.2-1.4x rather than the 1.6x it manages at dilation 1 -- a tap-major traversal
+   that reads each dilated stream contiguously is the obvious next idea, and is unmeasured.
 2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
    and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it

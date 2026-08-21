@@ -47,7 +47,11 @@
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include <arm_neon.h>
+#if defined(__aarch64__)
+#  include <arm_neon.h>
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 #include <omp.h>
 #include <cstdio>
 #include <cstdlib>
@@ -81,10 +85,11 @@ static void pad_input(const float* x, float* xp, int64_t IC, int64_t L, int64_t 
     }
 }
 
+#if defined(__aarch64__)
 // OCB output channels x (VEC*4) output positions held in registers, over the padded input.
 template <int OCB, int VEC>
 static void conv1d_direct(const float* xp, const float* wp, float* y,
-                          int64_t IC, int64_t OC, int64_t KW, int64_t L, int64_t pad, int nth) {
+                          int64_t IC, int64_t OC, int64_t KW, int64_t L, int64_t pad, int nth, int64_t dil = 1) {
     const int64_t OL = L, LP = L + 2*pad, P = VEC*4;
     const int64_t nblk = OL / P;                 // whole blocks; the ragged tail is handled after
     // POSITION BLOCK OUTERMOST, output channels inside it. The other way round -- which is the obvious
@@ -103,7 +108,7 @@ static void conv1d_direct(const float* xp, const float* wp, float* y,
             for (int64_t ic = 0; ic < IC; ++ic) {
                 const float* xrow = xp + ic*LP + p0;
                 for (int64_t kx = 0; kx < KW; ++kx) {
-                    const float* q = xrow + kx;
+                    const float* q = xrow + kx*dil;
                     float32x4_t xv[VEC];
                     for (int j = 0; j < VEC; ++j) xv[j] = vld1q_f32(q + j*4);
                     const float32x4_t wv = vld1q_f32(wp + (ic*KW + kx)*OC + oc0);
@@ -127,13 +132,133 @@ static void conv1d_direct(const float* xp, const float* wp, float* y,
                 float acc = 0.0f;
                 for (int64_t ic = 0; ic < IC; ++ic)
                     for (int64_t kx = 0; kx < KW; ++kx)
-                        acc += wp[(ic*KW + kx)*OC + oc] * xp[ic*LP + p + kx];
+                        acc += wp[(ic*KW + kx)*OC + oc] * xp[ic*LP + p + kx*dil];
                 y[oc*OL + p] = acc;
             }
     }
 }
 
-struct Conf { int64_t IC, OC, kw, L; int calls; };
+#elif defined(__AVX2__)
+
+// The same kernel for AVX2. Two differences that matter: the vector is 8 floats rather than 4, and
+// there is no lane-broadcast FMA, so each weight costs its own broadcast load -- 0.5 loads/FMA at
+// 4x2 against NEON's 0.31. And there are 16 vector registers, not 32, so the accumulator tile has to
+// be half the size: 4 channels x 16 positions is 8 accumulators here, where aarch64 affords 16.
+template <int OCB, int VEC>
+static void conv1d_direct(const float* xp, const float* wp, float* y,
+                          int64_t IC, int64_t OC, int64_t KW, int64_t L, int64_t pad, int nth) {
+    const int64_t OL = L, LP = L + 2*pad, P = VEC*8;
+    const int64_t nblk = OL / P;
+#pragma omp parallel for num_threads(nth) schedule(static)
+    for (int64_t b = 0; b < nblk; ++b) {
+        for (int64_t oc0 = 0; oc0 < OC; oc0 += OCB) {
+            const int64_t p0 = b * P;
+            __m256 acc[OCB][VEC];
+            for (int i = 0; i < OCB; ++i)
+                for (int j = 0; j < VEC; ++j) acc[i][j] = _mm256_setzero_ps();
+            for (int64_t ic = 0; ic < IC; ++ic) {
+                const float* xrow = xp + ic*LP + p0;
+                for (int64_t kx = 0; kx < KW; ++kx) {
+                    const float* q = xrow + kx;
+                    __m256 xv[VEC];
+                    for (int j = 0; j < VEC; ++j) xv[j] = _mm256_loadu_ps(q + j*8);
+                    const float* w = wp + (ic*KW + kx)*OC + oc0;
+                    for (int i = 0; i < OCB; ++i) {
+                        const __m256 wv = _mm256_set1_ps(w[i]);
+                        for (int j = 0; j < VEC; ++j) acc[i][j] = _mm256_fmadd_ps(xv[j], wv, acc[i][j]);
+                    }
+                }
+            }
+            for (int i = 0; i < OCB; ++i)
+                for (int j = 0; j < VEC; ++j) _mm256_storeu_ps(y + (oc0+i)*OL + p0 + j*8, acc[i][j]);
+        }
+    }
+    const int64_t done = nblk * P;
+    if (done < OL) {
+#pragma omp parallel for num_threads(nth) schedule(static)
+        for (int64_t oc = 0; oc < OC; ++oc)
+            for (int64_t p = done; p < OL; ++p) {
+                float acc = 0.0f;
+                for (int64_t ic = 0; ic < IC; ++ic)
+                    for (int64_t kx = 0; kx < KW; ++kx)
+                        acc += wp[(ic*KW + kx)*OC + oc] * xp[ic*LP + p + kx*dil];
+                y[oc*OL + p] = acc;
+            }
+    }
+}
+
+#endif
+
+// The same kernel WITHOUT the padded copy: interior blocks read the activation where it lies, and the
+// two blocks per convolution that hang off an edge fall back per (channel, tap) -- a tap whose whole
+// vector is in range takes the vector path, one that is not takes a scalar loop. The copy it removes
+// is 5.5 ms on the largest shape here, ~22% of what the direct form wins.
+#if defined(__aarch64__)
+template <int OCB, int VEC>
+static void conv1d_direct_nocopy(const float* x, const float* wp, float* y,
+                                 int64_t IC, int64_t OC, int64_t KW, int64_t L, int64_t pad, int64_t dil, int nth) {
+    const int64_t OL = L, P = VEC*4;
+    const int64_t nblk = OL / P;
+#pragma omp parallel for num_threads(nth) schedule(static)
+    for (int64_t b = 0; b < nblk; ++b) {
+        for (int64_t oc0 = 0; oc0 < OC; oc0 += OCB) {
+            const int64_t p0 = b * P;
+            float32x4_t acc[OCB][VEC];
+            for (int i = 0; i < OCB; ++i)
+                for (int j = 0; j < VEC; ++j) acc[i][j] = vdupq_n_f32(0.0f);
+            for (int64_t ic = 0; ic < IC; ++ic) {
+                const float* xrow = x + ic*L;
+                for (int64_t kx = 0; kx < KW; ++kx) {
+                    const int64_t lo = p0 + kx*dil - pad;
+                    const float32x4_t wv = vld1q_f32(wp + (ic*KW + kx)*OC + oc0);
+                    if (lo >= 0 && lo + P <= L) {
+                        const float* q = xrow + lo;
+                        float32x4_t xv[VEC];
+                        for (int j = 0; j < VEC; ++j) xv[j] = vld1q_f32(q + j*4);
+                        for (int j = 0; j < VEC; ++j) {
+                            if (OCB > 0) acc[0][j] = vfmaq_laneq_f32(acc[0][j], xv[j], wv, 0);
+                            if (OCB > 1) acc[1][j] = vfmaq_laneq_f32(acc[1][j], xv[j], wv, 1);
+                            if (OCB > 2) acc[2][j] = vfmaq_laneq_f32(acc[2][j], xv[j], wv, 2);
+                            if (OCB > 3) acc[3][j] = vfmaq_laneq_f32(acc[3][j], xv[j], wv, 3);
+                        }
+                    } else {
+                        float tmp[VEC*4];
+                        for (int64_t t = 0; t < P; ++t) {
+                            const int64_t sx = lo + t;
+                            tmp[t] = (sx < 0 || sx >= L) ? 0.0f : xrow[sx];
+                        }
+                        for (int j = 0; j < VEC; ++j) {
+                            const float32x4_t xv = vld1q_f32(tmp + j*4);
+                            if (OCB > 0) acc[0][j] = vfmaq_laneq_f32(acc[0][j], xv, wv, 0);
+                            if (OCB > 1) acc[1][j] = vfmaq_laneq_f32(acc[1][j], xv, wv, 1);
+                            if (OCB > 2) acc[2][j] = vfmaq_laneq_f32(acc[2][j], xv, wv, 2);
+                            if (OCB > 3) acc[3][j] = vfmaq_laneq_f32(acc[3][j], xv, wv, 3);
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < OCB; ++i)
+                for (int j = 0; j < VEC; ++j) vst1q_f32(y + (oc0+i)*OL + p0 + j*4, acc[i][j]);
+        }
+    }
+    const int64_t done = nblk * P;
+    if (done < OL) {
+#pragma omp parallel for num_threads(nth) schedule(static)
+        for (int64_t oc = 0; oc < OC; ++oc)
+            for (int64_t p = done; p < OL; ++p) {
+                float a = 0.0f;
+                for (int64_t ic = 0; ic < IC; ++ic)
+                    for (int64_t kx = 0; kx < KW; ++kx) {
+                        const int64_t sx = p + kx*dil - pad;
+                        if (sx >= 0 && sx < L) a += wp[(ic*KW + kx)*OC + oc] * x[ic*L + sx];
+                    }
+                y[oc*OL + p] = a;
+            }
+    }
+}
+#endif
+
+struct Conf { int64_t IC, OC, kw, L; int calls; int64_t dil; };
 
 int main(int argc,char**argv){
     ggml_backend_load_all();
@@ -141,17 +266,25 @@ int main(int argc,char**argv){
     int nth = argc>1?atoi(argv[1]):4;
     ggml_backend_cpu_set_n_threads(B,nth);
     printf("threads=%d\n\n%-22s %5s %10s %9s %9s %9s %9s   %s\n", nth,
-           "IC x OC x kw x L","calls","ggml conv","4x16","4x8","2x16","pad","max|rel|");
+           "IC x OC x kw x L","calls","ggml conv","4x16 pad","4x8 pad","4x16 nocopy","pad","max|rel|");
 
     Conf cs[] = {
-        { 32,  32, 7, 73472, 3}, { 32,  32, 5, 73472, 2}, { 32,  32, 3, 73472, 2},
-        { 64,  64, 7, 18368, 2}, { 64,  64, 5, 18368, 2}, { 64,  64, 3, 18368, 2},
-        {128, 128, 7,  2296, 2}, {128, 128, 5,  2296, 2}, {128, 128, 3,  2296, 2},
-        {192, 384, 5,   287,16}, {768, 768, 3,   100,12},
+        // dilations are the model's own -- a HiFi-GAN resblock runs the same shape at several, and
+        // they matter: the taps of a dilated convolution are 12 floats apart, not adjacent.
+        { 32,  32, 7, 73472, 1, 3}, { 32,  32, 7, 73472, 1,12},
+        { 32,  32, 5, 73472, 1, 2}, { 32,  32, 5, 73472, 1, 6},
+        { 32,  32, 3, 73472, 1, 1}, { 32,  32, 3, 73472, 1, 2},
+        { 64,  64, 7, 18368, 1, 3}, { 64,  64, 7, 18368, 1,12},
+        { 64,  64, 5, 18368, 1, 2}, { 64,  64, 5, 18368, 1, 6},
+        { 64,  64, 3, 18368, 1, 1}, { 64,  64, 3, 18368, 1, 2},
+        {128, 128, 7,  2296, 1, 3}, {128, 128, 7,  2296, 1,12},
+        {128, 128, 5,  2296, 1, 2}, {128, 128, 5,  2296, 1, 6},
+        {128, 128, 3,  2296, 1, 1}, {128, 128, 3,  2296, 1, 2},
+        {192, 384, 5,   287,16, 1}, {768, 768, 3,   100,12, 1},
     };
     double tot_g=0, tot_a=0, tot_b=0, tot_c=0, tot_pack=0, tot_f=0;
     for (auto& c : cs) {
-        const int64_t pad = (c.kw - 1) / 2;
+        const int64_t pad = (c.kw - 1) * c.dil / 2;
         std::vector<float> K((size_t)c.kw*c.IC*c.OC), X((size_t)c.L*c.IC), WP(K.size());
         for (size_t i=0;i<K.size();++i) K[i] = 0.02f - 0.001f*(float)(i%53);
         for (size_t i=0;i<X.size();++i) X[i] = 0.01f + 0.001f*(float)(i%97);
@@ -163,7 +296,7 @@ int main(int argc,char**argv){
         ggml_tensor* tk = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,c.kw,1,c.IC,c.OC);
         ggml_tensor* tx = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,c.L,1,c.IC,1);
         ggml_set_input(tk); ggml_set_input(tx);
-        ggml_tensor* r = ggml_conv_2d_direct(ctx,tk,tx,1,1,(int)pad,0,1,1);
+        ggml_tensor* r = ggml_conv_2d_direct(ctx,tk,tx,1,1,(int)pad,0,(int)c.dil,1);
         ggml_build_forward_expand(gf,r);
         ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_get_default_buffer_type(B));
         if(!ggml_gallocr_alloc_graph(ga,gf)){fprintf(stderr,"alloc fail\n");exit(1);}
@@ -180,7 +313,7 @@ int main(int argc,char**argv){
         const double tp=(now()-t0)/3;
 
         std::vector<float> Y(ref.size());
-        std::vector<float> XP((size_t)c.IC*(c.L + 2*pad));
+        std::vector<float> XP((size_t)c.IC*(c.L + 2*pad + 2*c.kw*c.dil));
         double t1=now(); for(int i=0;i<3;i++) pad_input(X.data(), XP.data(), c.IC, c.L, pad, nth);
         const double tpad=(now()-t1)/3;
         double ta, tb, tc, md = 0;
@@ -195,19 +328,25 @@ int main(int argc,char**argv){
             }
             return t;
         };
-        ta = run([&]{ conv1d_direct<4,4>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth); });
-        tb = run([&]{ conv1d_direct<4,2>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth); });
-        tc = run([&]{ conv1d_direct<2,4>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth); });
+#if defined(__aarch64__)
+        ta = run([&]{ conv1d_direct<4,4>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
+        tb = run([&]{ conv1d_direct<4,2>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
+        tc = run([&]{ conv1d_direct_nocopy<4,4>(X.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,c.dil,nth); }) - tpad;
+#else
+        ta = run([&]{ conv1d_direct<4,2>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
+        tb = run([&]{ conv1d_direct<2,4>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
+        tc = run([&]{ conv1d_direct<4,1>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
+#endif
 
         const double gf_=2.0*c.kw*c.IC*c.OC*c.L/1e9;
         ta+=tpad; tb+=tpad; tc+=tpad;   // the padded copy is part of what a direct conv costs
         tot_g+=tg*c.calls; tot_a+=ta*c.calls; tot_b+=tb*c.calls; tot_c+=tc*c.calls;
         tot_pack+=tp; tot_f+=gf_*c.calls;
-        char buf[64]; snprintf(buf,sizeof buf,"%lld x %lld x %lld x %lld",(long long)c.IC,(long long)c.OC,(long long)c.kw,(long long)c.L);
+        char buf[64]; snprintf(buf,sizeof buf,"%lldx%lld k%lld L%lld d%lld",(long long)c.IC,(long long)c.OC,(long long)c.kw,(long long)c.L,(long long)c.dil);
         printf("%-22s %5d %7.2f ms %6.2f ms %6.2f ms %6.2f ms %6.2f ms   %.1e\n",
                buf,c.calls,tg*1e3,ta*1e3,tb*1e3,tc*1e3,tpad*1e3,md);
     }
-    printf("\nweighted total: ggml conv %.3f s | direct 4x16 %.3f s (%.2fx) | 4x8 %.3f s (%.2fx) | 2x16 %.3f s (%.2fx)\n",
+    printf("\nweighted total: ggml conv %.3f s | direct A %.3f s (%.2fx) | B %.3f s (%.2fx) | C %.3f s (%.2fx)\n",
            tot_g, tot_a, tot_g/tot_a, tot_b, tot_g/tot_b, tot_c, tot_g/tot_c);
     printf("arithmetic: %.3f GFLOP -> ggml %.1f GFLOP/s, best direct %.1f GFLOP/s   (weight packing, once per model: %.1f ms total)\n",
            tot_f, tot_f/tot_g, tot_f/std::min(std::min(tot_a,tot_b),tot_c), tot_pack*1e3);

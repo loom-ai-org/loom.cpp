@@ -1,6 +1,6 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Five diffs, each independently useful and independently reviewable. They are written against the pin in
+Six diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
@@ -9,16 +9,17 @@ onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block 
 though 1 and 2 only pay off together (see below) and are best sent as one PR or two linked ones. 4 and
 5 touch the CPU convolution; **5 depends on 4** (it uses the `ldc` mul_mat helper 4 introduces, and its
 staging only makes sense once 4 has made the op batch-oriented). A reviewer taking 4 without 5 is fine;
-5 without 4 is not.
+5 without 4 is not. **6 also sits on top of 4** -- it is a second path inside the same op -- and is
+independent of 5, though it serves 5's fused bias for free.
 
 **Every number below is a Raspberry Pi 4B (Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2, Debian
 aarch64, gcc 14.2) unless it says otherwise; x86-64 numbers are a Ryzen 3 3250U (AVX2, 2 cores), median
 of seven runs pinned to the physical cores.** The workload is a VITS TTS vocoder — an all-convolutional
 generator, F32 throughout, one image per batch, `KH = 1`. The benches are in `scripts/` in this repo
-(`bench6.cpp` GEMM, `bench7.cpp` register tiles, `bench9.cpp` conv lowering) and are self-contained
-against a built ggml.
+(`bench6.cpp` GEMM, `bench7.cpp` register tiles, `bench9.cpp` conv lowering, `bench10.cpp` direct
+convolution) and are self-contained against a built ggml.
 
-**What a reviewer is likely to ask, for all five: measurements on hardware neither of these two boxes
+**What a reviewer is likely to ask, for all six: measurements on hardware neither of these two boxes
 represents** — a wide ARM core (Neoverse V2, Apple M-series) and a many-core x86 server. Say so up
 front rather than being asked.
 
@@ -209,3 +210,57 @@ and with the aliasing guard removed, which reproduces the corruption hermeticall
   option, not a patch).
 * The two machines, and the explicit request for a third.
 * For 4 and 5: that they are CPU-backend-only and leave every other backend's path untouched.
+
+---
+
+## PR 6 — `conv_2d`: a direct 1-D convolution behind a cache-size heuristic
+
+*(`cmake/patches/ggml-0006-conv1d-direct.patch`, sits on top of PR 4; independent of PR 5, though it
+serves the fused bias for free)*
+
+**Problem.** im2col turns a convolution into a GEMM, which is the right move when the weights are large
+— a GEMM blocks both operands so neither is re-read. It is the wrong move when the activation is long
+and the weights are small: it writes every input element `kw` times (137 M element-writes for one TTS
+synthesis) to feed a kernel that reads them once. Phase-timed inside the op, that gather is **37% of
+all convolution time** (396 ms of 1070 ms), against a GEMM that is already running at 23.5 GFLOP/s.
+
+**Fix.** A direct kernel: hold a tile of the OUTPUT in registers, sweep the activation where it lies,
+one broadcast weight per (input channel, tap). Nothing is materialised. The tile is ISA-sized —
+aarch64 has 32 vector registers and a lane-broadcast FMA, so 4 channels x 16 positions with one vector
+load per four weights; AVX2 has 16 registers and no lane broadcast, so half the accumulators and a
+broadcast load per weight. A bias, when the caller has fused one, costs nothing: the accumulators start
+at it.
+
+**Evidence**, against the batched im2col, eleven convolution shapes of a VITS vocoder:
+
+| | Cortex-A72, 4 threads | Ryzen 3 3250U (AVX2), 2 threads |
+|---|---|---|
+| 32x32 kw7 L73472 | 63.2 → 38.5 ms (1.64x) | 70.8 → 15.0 ms (**4.7x**) |
+| 64x64 kw7 L18368 | 58.1 → 40.6 ms (1.43x) | 70.7 → 16.0 ms (4.4x) |
+| 192x384 kw5 L287 | 10.6 → 40.9 ms (**0.26x**) | 11.0 → 6.5 ms (1.7x) |
+| 768x768 kw3 L100 | 24.6 → 164 ms (**0.15x**) | 16.4 → 16.0 ms (1.03x) |
+
+End-to-end on a whole synthesis: **1.576 → 1.508 s** on the Pi and **1.503 → 1.169 s** on the x86 box.
+
+**The heuristic is the reviewable part.** Three conditions:
+
+* shape and type (F32, `KH = 1`, one image, stride 1, contiguous, `OC % 4 == 0`), everything else
+  falling through to the batched path unchanged;
+* **weights must fit cache** — `L3/2` where the machine reports one, else `L2`, else 512 KB. That is
+  2 MB on the x86 box and 512 KB on the Pi, which is where each machine's measurements put the line.
+  One rule, two answers, no `#if`. `sysconf(_SC_LEVEL*_CACHE_SIZE)` returns 0 on every aarch64 Linux
+  box tried, hence the floor;
+* **at least as many position blocks as output-channel tiles.** Without it the synthesis was 1.576 →
+  **1.703 s**, slower than not having the kernel: the model has 77 convolutions of 100 positions and
+  192 channels that pass the weight test and should not take this path.
+
+**Not bit-identical** — a different summation order. Whole-synthesis difference against the previous
+lowering: max 3.5e-6 on a 0.17 peak, rel-RMS 6.5e-6.
+
+**What a reviewer should push on.** The 512 KB floor and the `OC % 4` restriction are both "good enough
+for what was measured" rather than principled; the tile sizes are tuned on two machines; and there is
+no ARM64 counterpart to the AVX2 path for AVX-512 or SVE, which would want their own tile. Also worth
+saying: benchmarks of convolution shapes must carry the model's **dilations**. At dilation 1 this
+kernel measures ~1.6x on the shapes above; at the model's own dilations (1, 2, 3, 6, 12) the same
+shapes give 1.2-1.4x, and that difference is most of the gap between the bench and the end-to-end
+number.
