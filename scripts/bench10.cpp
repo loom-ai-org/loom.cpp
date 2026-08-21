@@ -258,6 +258,97 @@ static void conv1d_direct_nocopy(const float* x, const float* wp, float* y,
 }
 #endif
 
+// PHASE-MAJOR ("a trous") variant, for dilated convolutions. A convolution with dilation d is d
+// independent DENSE convolutions, one over each subsequence p = j*d + r. Laid out that way, the taps a
+// channel needs for one output block stop being d floats apart: at d = 12 and kw = 7 the kernel reads
+// seven separate 64-byte runs spread over 352 bytes per channel -- 448 streams for a prefetcher that
+// tracks a dozen -- where the phase-major form reads one contiguous 88-byte run per channel, exactly
+// as an undilated convolution does. The input transform is free: this path already copies the input
+// once for padding, so it copies it phase-major instead.
+//
+// What is NOT free is the output, which comes out phase-major and has to be interleaved back. Timed
+// separately below, because whether it eats the win is the entire question.
+#if defined(__aarch64__)
+static void pad_input_phase(const float* x, float* xp, int64_t IC, int64_t L, int64_t KW,
+                            int64_t dil, int64_t J, int nth) {
+    const int64_t H = (KW - 1) / 2;                 // taps either side, in j-space
+    const int64_t JP = J + 2*H;                     // padded length of one phase
+#pragma omp parallel for num_threads(nth) schedule(static)
+    for (int64_t ic = 0; ic < IC; ++ic) {
+        float* base = xp + ic * dil * JP;
+        memset(base, 0, (size_t) dil * JP * sizeof(float));
+        for (int64_t r = 0; r < dil; ++r) {
+            float* dst = base + r * JP + H;
+            for (int64_t j = 0; j < J; ++j) {
+                const int64_t p = j * dil + r;
+                if (p < L) dst[j] = x[ic * L + p];
+            }
+        }
+    }
+}
+
+template <int OCB, int VEC>
+static void conv1d_direct_phase(const float* xp, const float* wp, float* yp,
+                                int64_t IC, int64_t OC, int64_t KW, int64_t dil, int64_t J, int nth) {
+    const int64_t H = (KW - 1) / 2, JP = J + 2*H, P = VEC*4;
+    const int64_t nblk = J / P;
+#pragma omp parallel for collapse(2) num_threads(nth) schedule(static)
+    for (int64_t r = 0; r < dil; ++r) {
+        for (int64_t b = 0; b < nblk; ++b) {
+            for (int64_t oc0 = 0; oc0 < OC; oc0 += OCB) {
+                const int64_t j0 = b * P;
+                float32x4_t acc[OCB][VEC];
+                for (int i = 0; i < OCB; ++i)
+                    for (int v = 0; v < VEC; ++v) acc[i][v] = vdupq_n_f32(0.0f);
+                for (int64_t ic = 0; ic < IC; ++ic) {
+                    const float* xrow = xp + (ic * dil + r) * JP + j0;
+                    for (int64_t kx = 0; kx < KW; ++kx) {
+                        const float* q = xrow + kx;      // dense in j-space
+                        float32x4_t xv[VEC];
+                        for (int v = 0; v < VEC; ++v) xv[v] = vld1q_f32(q + v*4);
+                        const float32x4_t wv = vld1q_f32(wp + (ic*KW + kx)*OC + oc0);
+                        for (int v = 0; v < VEC; ++v) {
+                            acc[0][v] = vfmaq_laneq_f32(acc[0][v], xv[v], wv, 0);
+                            acc[1][v] = vfmaq_laneq_f32(acc[1][v], xv[v], wv, 1);
+                            acc[2][v] = vfmaq_laneq_f32(acc[2][v], xv[v], wv, 2);
+                            acc[3][v] = vfmaq_laneq_f32(acc[3][v], xv[v], wv, 3);
+                        }
+                    }
+                }
+                for (int i = 0; i < OCB; ++i)
+                    for (int v = 0; v < VEC; ++v)
+                        vst1q_f32(yp + ((oc0+i) * dil + r) * J + j0 + v*4, acc[i][v]);
+            }
+        }
+    }
+    // ragged j-tail, scalar
+    const int64_t done = nblk * P;
+#pragma omp parallel for collapse(2) num_threads(nth) schedule(static)
+    for (int64_t r = 0; r < dil; ++r)
+        for (int64_t oc = 0; oc < OC; ++oc)
+            for (int64_t j = done; j < J; ++j) {
+                float a = 0.0f;
+                for (int64_t ic = 0; ic < IC; ++ic)
+                    for (int64_t kx = 0; kx < KW; ++kx)
+                        a += wp[(ic*KW + kx)*OC + oc] * xp[(ic*dil + r)*JP + j + kx];
+                yp[(oc*dil + r)*J + j] = a;
+            }
+}
+
+// phase-major [OC][dil][J] back to [OC][OL]
+static void unphase_output(const float* yp, float* y, int64_t OC, int64_t OL, int64_t dil, int64_t J, int nth) {
+#pragma omp parallel for num_threads(nth) schedule(static)
+    for (int64_t oc = 0; oc < OC; ++oc)
+        for (int64_t r = 0; r < dil; ++r) {
+            const float* src = yp + (oc * dil + r) * J;
+            for (int64_t j = 0; j < J; ++j) {
+                const int64_t p = j * dil + r;
+                if (p < OL) y[oc * OL + p] = src[j];
+            }
+        }
+}
+#endif
+
 struct Conf { int64_t IC, OC, kw, L; int calls; int64_t dil; };
 
 int main(int argc,char**argv){
@@ -266,7 +357,7 @@ int main(int argc,char**argv){
     int nth = argc>1?atoi(argv[1]):4;
     ggml_backend_cpu_set_n_threads(B,nth);
     printf("threads=%d\n\n%-22s %5s %10s %9s %9s %9s %9s   %s\n", nth,
-           "IC x OC x kw x L","calls","ggml conv","4x16 pad","4x8 pad","4x16 nocopy","pad","max|rel|");
+           "IC x OC x kw x L","calls","ggml conv","4x16 pad","phase tot","4x16 nocopy","ph kern","ph xform");
 
     Conf cs[] = {
         // dilations are the model's own -- a HiFi-GAN resblock runs the same shape at several, and
@@ -316,7 +407,7 @@ int main(int argc,char**argv){
         std::vector<float> XP((size_t)c.IC*(c.L + 2*pad + 2*c.kw*c.dil));
         double t1=now(); for(int i=0;i<3;i++) pad_input(X.data(), XP.data(), c.IC, c.L, pad, nth);
         const double tpad=(now()-t1)/3;
-        double ta, tb, tc, md = 0;
+        double ta, tb, tc, md = 0, phase_kernel = 0, phase_xform = 0;
         auto run = [&](auto fn) {
             std::fill(Y.begin(), Y.end(), 0.0f);
             fn();
@@ -330,7 +421,24 @@ int main(int argc,char**argv){
         };
 #if defined(__aarch64__)
         ta = run([&]{ conv1d_direct<4,4>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
-        tb = run([&]{ conv1d_direct<4,2>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
+        {   // phase-major: transform, kernel, and the interleave back, each timed
+            const int64_t J = (c.L + c.dil - 1) / c.dil;
+            const int64_t H = (c.kw - 1) / 2, JP = J + 2*H;
+            std::vector<float> XPP((size_t)c.IC*c.dil*JP), YP((size_t)c.OC*c.dil*J);
+            double t2=now(); for(int i=0;i<3;i++) pad_input_phase(X.data(),XPP.data(),c.IC,c.L,c.kw,c.dil,J,nth);
+            const double t_tr=(now()-t2)/3;
+            std::fill(Y.begin(), Y.end(), 0.0f);
+            auto k = [&]{ conv1d_direct_phase<4,4>(XPP.data(),WP.data(),YP.data(),c.IC,c.OC,c.kw,c.dil,J,nth); };
+            k(); t2=now(); for(int i=0;i<3;i++) k(); const double t_k=(now()-t2)/3;
+            t2=now(); for(int i=0;i<3;i++) unphase_output(YP.data(),Y.data(),c.OC,c.L,c.dil,J,nth);
+            const double t_un=(now()-t2)/3;
+            double m=0;
+            for (size_t i=0;i<Y.size();++i){ double d=std::fabs((double)Y[i]-(double)ref[i]);
+                double rr=std::fabs((double)ref[i])+1e-6; if(d/rr>m) m=d/rr; }
+            if (m > 1e-4) printf("[PHASE MISMATCH %.1e]", m);
+            tb = t_k + t_tr + t_un;
+            phase_kernel = t_k; phase_xform = t_tr + t_un;
+        }
         tc = run([&]{ conv1d_direct_nocopy<4,4>(X.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,c.dil,nth); }) - tpad;
 #else
         ta = run([&]{ conv1d_direct<4,2>(XP.data(),WP.data(),Y.data(),c.IC,c.OC,c.kw,c.L,pad,nth,c.dil); });
@@ -343,8 +451,8 @@ int main(int argc,char**argv){
         tot_g+=tg*c.calls; tot_a+=ta*c.calls; tot_b+=tb*c.calls; tot_c+=tc*c.calls;
         tot_pack+=tp; tot_f+=gf_*c.calls;
         char buf[64]; snprintf(buf,sizeof buf,"%lldx%lld k%lld L%lld d%lld",(long long)c.IC,(long long)c.OC,(long long)c.kw,(long long)c.L,(long long)c.dil);
-        printf("%-22s %5d %7.2f ms %6.2f ms %6.2f ms %6.2f ms %6.2f ms   %.1e\n",
-               buf,c.calls,tg*1e3,ta*1e3,tb*1e3,tc*1e3,tpad*1e3,md);
+        printf("%-22s %5d %7.2f ms %6.2f ms %6.2f ms %6.2f ms %6.2f ms %6.2f ms\n",
+               buf,c.calls,tg*1e3,ta*1e3,tb*1e3,tc*1e3,phase_kernel*1e3,phase_xform*1e3);
     }
     printf("\nweighted total: ggml conv %.3f s | direct A %.3f s (%.2fx) | B %.3f s (%.2fx) | C %.3f s (%.2fx)\n",
            tot_g, tot_a, tot_g/tot_a, tot_b, tot_g/tot_b, tot_c, tot_g/tot_c);
