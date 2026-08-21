@@ -7448,9 +7448,9 @@ number, not dispatch).
 | transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.19 s | 0.19 s | 0.162 s (`ConvTranspose`) | 0.03 s | 5% |
 | everything else | 0.34 s | 0.33 s | 0.33 s | 0.36 s | 0.29 s | 0.257 s | 0.03 s | 6% |
 
-**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x -> 1.43x with the direct kernel and
-its phase-major sibling (ggml-0006), and the gap itself 1.31 -> 0.92 -> 0.76 -> 0.59 -> 0.55 -> 0.44 s:
-66% of it closed.**
+**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x -> 1.41x with the direct kernel,
+its phase-major sibling and contiguous block partitioning (ggml-0006), and the gap itself 1.31 -> 0.92
+-> 0.76 -> 0.59 -> 0.55 -> 0.42 s: 68% of it closed.**
 The x86 box, which had been on a different lowering entirely and had no end-to-end number until this
 one, went 1.503 -> 1.169 s on the same utterance.
 
@@ -7496,7 +7496,7 @@ missing.
 
 | | before | after | |
 |---|---|---|---|
-| Pi 4, 4 threads | 1.576 s | **1.465 s** | 1.08x |
+| Pi 4, 4 threads | 1.576 s | **1.440 s** | 1.09x |
 | Ryzen 3 3250U, 2 threads pinned | 1.503 s | **1.169 s** | **1.29x** |
 
 **Three conditions, and the third one is the whole lesson.**
@@ -7529,6 +7529,36 @@ long-activation convolutions, which is enough to carry the whole op past the low
 grouped differently. Against a `-DLOOM_TINYBLAS=OFF` build the whole synthesis differs by max
 **3.5e-6** on a 0.17 peak, rel-RMS 6.5e-6, cosine 0.99999999998 -- the same order as every other change
 in this entry, and every gate passes on both lowerings.
+
+#### The 32- and 64-channel shapes: what limits them, and the 10% that was still there
+
+These are the convolutions the phase window excludes and the ones the vocoder spends most of its time
+in. Four measurements, in the order that made them answerable:
+
+* **The machine's peak is 56.6 GFLOP/s**, 0.98 FMA per cycle per core, measured with a loop of nothing
+  but independent 128-bit FMAs (`scripts/` has it as a comment; it is ten lines). The 57.6 this entry
+  had been quoting from the datasheet is right. **Lane-broadcast FMA -- what the kernel uses -- runs at
+  the same rate** (1.00/cycle), so the `fmla v, v, w[lane]` form costs nothing.
+* **The kernel compiles well**: 22 instructions per 16 `fmla` in the inner loop, one `ldr q` plus
+  `ldp`s, and **no spills** -- the trap that patch 0001 exists for does not recur here.
+* **In cache, single-threaded, it reaches 83% of peak** (11.9 of 14.4). On the real shape it drops to
+  **60%** single-threaded and **35-51%** at four. So what is left is not the loop, it is memory and
+  scaling: 1 -> 4 threads is 2.35x, not 4x, on a chip whose L2 is shared.
+* **The tile is already the right one.** Against the shipped 4-channels x 16-positions: 2x32 (half the
+  weight traffic per FLOP, worse load/FMA ratio) is 20.1 vs 20.2 GFLOP/s at four threads and clearly
+  worse at one; 4x8 is 15.6. Both lose at every thread count, so the obvious knob is turned correctly.
+
+**And one thing was not.** The kernel handed out position blocks round-robin -- block b to thread
+b % nth -- so every core's working set spanned the whole activation instead of its own share. Handing
+out contiguous ranges instead is worth **10% on 32 channels x 73472** (39.3 -> 35.8 ms at four
+threads), nothing on the shapes where the activation is short enough not to matter, and it is the same
+total work either way. Shipped: **1.465 -> 1.440 s**.
+
+**What is left on these shapes is not a kernel problem.** At 60% of peak single-threaded and 2.35x
+scaling, the next lever is reducing how much memory the convolution touches at all -- which for a
+resblock means keeping an intermediate activation in cache between two convolutions rather than writing
+9.4 MB out and reading it back. That is a graph-level fusion, not a kernel, and nothing in this item's
+approach reaches it.
 
 #### Tap-major (phase-major) traversal: vectorised, narrowed, and SHIPPED as a third path
 
@@ -7917,9 +7947,11 @@ that feeds it is 37% of the time:
    promised more than either. What is left inside the convolution is the dilated shapes, where the
    direct kernel gets 1.2-1.4x rather than the 1.6x it manages at dilation 1. The tap-major traversal that
    would fix it **is shipped** (section above), for the two shapes in this model where it measures a
-   win: 1.487 -> 1.463 s. What is left is the shapes outside its window -- 32 and 64 channels, where
-   the transform costs more than the prefetching it fixes -- and no idea currently on the table
-   addresses those without materialising something.
+   win: 1.487 -> 1.463 s. The shapes outside its window -- 32 and 64
+   channels -- are **measured out**: the kernel is at 83% of peak in cache and the loss is scaling on a
+   shared L2, the tile is already the best of three, and the one thing still on the table there was
+   round-robin block partitioning, now fixed for another 10% on the largest shape. What remains needs
+   graph-level fusion (keeping a resblock's intermediate in cache), not a better kernel.
 2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
    and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
