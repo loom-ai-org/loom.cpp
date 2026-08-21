@@ -7165,7 +7165,9 @@ Raspberry Pi 4, three explanations were argued for from the code and each was me
 or less — ggml not fusing conv+bias+activation (the whole unfused elementwise + activation chain is
 **6.5%**), the C++<->Lua array boundary (**18.7 ms**), and `GGML_LLAMAFILE` being off in the shipped
 wheel (it is off, and building ggml both ways on the Pi measured **no difference at all**: 20.5 vs
-20.3 GFLOP/s — tinyBLAS's ARM F32 path does run, it just isn't faster for these shapes). The answer was
+20.3 GFLOP/s — tinyBLAS's ARM F32 path does run, it just isn't faster for these shapes — though P4.15
+later found out WHY not, and fixing it made this the biggest single win in the thread, so do not quote
+this parenthesis without that one). The answer was
 `MUL_MAT` at **70.4%**. Rebuilding the engine with a hand-rolled hook to find that out is a day; this
 makes it five minutes, and it works against a SHIPPED WHEEL, which is where the question actually gets
 asked.
@@ -7294,7 +7296,193 @@ a ggml-side concern, not something the exporter or a new backend can reach. The 
 onnxruntime fusing conv+bias+activation where loom emits separate ADD/activation nodes, plus loom's
 165 ms of graph build, Lua driver and marshalling.
 
-### P4.15 — the F32 GEMM micro-kernel, which is 71% of that gap — SCOPED, NOT STARTED (2026-08-20)
+### P4.15 — the F32 GEMM micro-kernel, which is 71% of that gap — DONE (2026-08-21)
+
+**What it turned out to be: not a missing kernel, a spilled one.** Nothing was written from scratch,
+nothing in this repo computes a GEMM, and `scripts/bench6.cpp`'s prototype shipped nothing -- it was
+the measuring stick. Two build-side changes:
+
+* **`GGML_LLAMAFILE=ON`** (`cmake/Dependencies.cmake`, behind a `LOOM_TINYBLAS` option so the A/B
+  stays runnable). A standalone ggml defaults tinyBLAS OFF -- it is llama.cpp that turns it on -- so
+  every wheel this project has ever shipped ran ggml's one-output-element-per-call F32 kernel. On
+  x86-64 that flag alone is **1.97x** at the eleven vocoder shapes (27.6 -> 54.4 GFLOP/s, AVX2 Ryzen 3
+  3250U, median of seven runs pinned to the two physical cores). On the Pi it is worth **nothing**
+  (15.0 -> 15.6), which is exactly why it was written off above. It costs 111 KB of `libggml-cpu`
+  (979 -> 1090 KB, x86-64 release build).
+
+  **That 1.97x was first written up here as 2.83x**, from one unpinned run of each build on a
+  thermally noisy laptop -- 20.6 and 58.3, which are the low and high ends of this box's spread. Seven
+  pinned runs put the pair at 27.6 and 54.4. The x86 numbers in this entry are all medians of pinned
+  runs for that reason; the Pi's are not pinned because that box is idle, single-socket and repeatable
+  to about 1%.
+* **`cmake/patches/ggml-0001-tinyblas-neon-gcc-tile.patch`**, which routes NEON-on-GCC to tinyBLAS's
+  *16-register* schedule instead of its 32-register one, because GCC spills the 24-accumulator tile
+  the 32-register one asks for. **15.6 -> 22.0 GFLOP/s, 1.41x**, from a one-line change to a `#if`.
+* **`cmake/patches/ggml-0002-tinyblas-aarch64-address-hoist.patch`**, which writes the operand
+  addresses in a form GCC will strength-reduce, because it will not do it through the class members:
+  35 instructions per k-iteration where 21 do the same work. **22.0 -> 25.1 GFLOP/s**, and that is
+  PAST the hand-written 4x4 kernel this item was scoped around (24.3 in the same process). Found by
+  asking why the first patch stopped at 92% of it -- see the section below, and note that the answer
+  was worth as much again as the tile.
+
+**The open question left at the bottom of this item -- tinyBLAS accumulates exactly like the fast
+prototype yet runs 1.6x slower -- turned out to BE the item. Four measurements answered it.**
+
+1. **At ONE thread the gap gets WIDER**, 1.78x against 1.55x at four (`./bench6-on 1`). That rules out
+   ggml's threadpool, its barriers and its chunk scheduling in one command, before reading any of it.
+2. **Lifting tinyBLAS's `gemm_bloc` out of ggml and into the prototype's own OpenMP driver reproduces
+   the loss with ggml gone** (`scripts/bench7.cpp`). Same buffers, same parallelisation, same file --
+   only the tile differs, so the tile IS the difference. All eleven shapes, 4 threads:
+
+   | tile (RM x RN) | live accumulators | q-registers spilled in the block | GFLOP/s |
+   |---|---|---|---|
+   | 4x3 | 12 | 0 | 24.2 |
+   | **4x4** | 16 | 0 | **24.5** |
+   | 4x5 | 20 | 8 | 18.4 |
+   | **4x6 -- what tinyBLAS picks on ARM** | 24 | 10 | **16.3** |
+   | 8x4 | 32 | 32 | 16.3 |
+   | 4x8 | 32 | 29 | 14.6 |
+
+   The array-of-vectors form is NOT the cause: tinyBLAS's own `D Cv[RN][RM]` code at 4x4 measures
+   24.4, indistinguishable from the prototype's 16 named variables at 24.5. Only the size matters.
+3. **The disassembly says it outright.** In the 4x6 block gcc 14.2 (aarch64, `-O3`) emits twelve
+   `stp q` per k-iteration -- all 24 accumulators written to the stack on **every** step, against the
+   24 `fmla` they exist to accumulate. The A72 has one store pipe, so those stores cost about what the
+   arithmetic does. Writing the same tile with 24 named variables instead of an array only reduces it
+   (5 spill stores, 22.5 GFLOP/s); it does not remove it.
+4. **So the paper ratio was measuring the wrong constraint.** 4x6 issues 10 loads per 24 FMAs (0.42)
+   against 4x4's 8 per 16 (0.50) and should therefore win. It loses because 24 accumulators do not fit
+   *this compiler's allocator* -- not because they do not fit the register file, where 29 of 32 live
+   values is comfortable. A load/FMA argument is only valid downstream of "does the tile stay in
+   registers", which is a fact about the compiler and has to be read out of the object file.
+
+**Why the patch reuses the existing 16-register branch instead of adding a 4x4 one.** Through the
+dispatcher the two measure 22.2 (RN=3) and 22.3 (RN=4) -- a wash -- and RN=3 is the schedule every
+AVX2 x86 build already takes, so the diff is one `#if` line and no new code path. It is scoped to
+`defined(__GNUC__) && !defined(__clang__)`: clang's aarch64 allocator was never measured (no clang on
+the Pi, the dev box or the workstation that day), and Apple silicon is both clang-built and far wider
+than an A72, so a change that helps here could hurt there.
+
+**End-to-end, the same VITS utterance, Pi 4, 4 threads, idle box, steady state over five reps:**
+
+| build | synthesis | vs onnxruntime's 1.024 s |
+|---|---|---|
+| as shipped (no tinyBLAS) | 2.318 s | 2.26x |
+| tinyBLAS on, unpatched | 2.262 s | 2.21x |
+| tinyBLAS on + tile patch (0001) | 2.021 s | 1.97x |
+| **+ address hoist (0002)** | **1.94 s** | **1.89x** |
+
+The 1-thread profile attributes it where predicted: `MUL_MAT` **4181 -> 3210 -> 2782 ms** over the
+three steps, whole run 5.94 -> 4.96 -> 4.55 s, with `IM2COL` and everything else unmoved.
+
+Steady-state reps land at 1.93-1.95 s; the baseline row was measured the same way and lands at
+2.318-2.319. Reproduced from a clean checkout on the Pi -- `rsync`, `cmake -B build
+-DCMAKE_BUILD_TYPE=Release`, one target -- twice, which is what says the CMake plumbing (patch
+application in order, `LOOM_TINYBLAS` default) delivers this and not just a hand-edited `_deps` tree.
+
+**And a trap that cost half an hour, worth knowing before any measurement here:** `cmake -B build`
+gives you **RelWithDebInfo**, this repo's default (top-level `CMakeLists.txt`), i.e. `-O2`. The same
+tree, same sources, same patch, Release against RelWithDebInfo: **2.019 s against 2.810 s, 1.39x**.
+That is bigger than everything P4.15 changed. A benchmark run out of a default build dir is measuring
+`-O2` and is not comparable with any number in P4.14 or P4.15, all of which are Release -- which is
+also what the wheels ship (`loom-py/CMakeLists.txt` forces it).
+
+**It is 0.37 s against the ~0.47 s predicted above, and what is left of the difference has a name.**
+The GEMM itself is done -- ggml's kernel now runs slightly faster than the hand-written one this item
+was scoped around, so there is nothing left to win by writing a kernel. What remains is the work
+tinyBLAS never sees: **it declines any `mul_mat` whose `m` is not a multiple of 4**, and VITS's
+heaviest MUL_MAT bucket is exactly that -- `[287, 384]`, 28 calls, **825 ms, 18.1% of the 1-thread
+run**, m = 287 -- so that work still runs on ggml's one-element-at-a-time kernel. A tail path in
+tinyBLAS, or padding the duration-predictor shapes on the export side, is now the biggest single lever
+left in this thread.
+
+**What is pinned, and how each part fails loudly.**
+
+* `tests/ci/test_tinyblas_gemm.cpp` asserts the CPU backend reports the `LLAMAFILE` feature (through
+  the registry's `ggml_backend_get_features`, not `ggml_cpu_has_llamafile()`, which a `GGML_BACKEND_DL`
+  build does not link -- the trap `tests/support/cpu_backend.h` documents) and checks `mul_mat` against
+  a double-precision reference at shapes on **both** sides of every condition tinyBLAS selects on
+  (`n >= 4`, `k % KN == 0`, `m % 16/8/4`), because a tiling change's failure mode is a wrong tail
+  block. Both directions were sabotage-verified: a 1.0001x factor on the result makes it red, and a
+  `-DLOOM_TINYBLAS=OFF` build correctly reports the feature absent.
+* `cmake/GgmlPatches.cmake` re-checks the patches on **every** configure, not on populate, so an
+  existing build tree cannot end up silently unpatched; a ggml bump that makes one stop applying is a
+  configure FATAL_ERROR naming the choice (delete it if upstream took it, rebase and re-measure if
+  not). They are applied in filename order and touch disjoint regions of one file.
+* The numerics change is real and inaudible, and was checked as a waveform rather than argued from the
+  flag: the same VITS utterance synthesised by an otherwise identical `-DLOOM_TINYBLAS=OFF` build
+  differs by **max 3.7e-6 against a 0.17 peak** (2e-5 relative), rel-RMS 7.1e-6, **cosine
+  1.0000000000**. No existing tolerance gate is anywhere near that -- the ci suite (66/66) and every
+  gate with a fixture present on this box (8 of 82, including the kokoro / styletts2 / matcha lua
+  drivers, i.e. the conv-bearing ones) stay green. What P4.15 predicted might need re-baselining does
+  not, because tinyBLAS is a different summation ORDER and not a different algorithm. The tensor-oracle
+  gates whose reference dirs are absent here were not run; if a full-fixture sweep is done later, this
+  is the change to attribute a ~1e-5 movement to. Patch 0002 moves nothing at all: the waveform after
+  it is **bit-identical** to the waveform before it, as an addressing change should be.
+
+**Still to do upstream.** Both patches are diffs against `v0.19.0` and belong in ggml-org/ggml. The
+clang question that was open here is answered -- clang 19/aarch64 holds the 4x6 tile and wants neither
+change, which is exactly what the two guards say -- so what a PR still needs is breadth this bench
+cannot supply: one wide ARM core (Neoverse V2, an M-series Mac) to confirm that the smaller tile is
+right for GCC there too and not just on an A72, and one more x86 part to confirm 0002's guard. Neither
+blocks carrying them locally, and both are the kind of thing an upstream reviewer will ask for.
+
+
+#### Why the tile patch stopped at 92% of a hand-written kernel — and the second patch that answers it
+
+The tile fix left ggml's tinyBLAS at 22.0 GFLOP/s against 24.4 for the standalone 4x4 prototype in
+`scripts/bench6.cpp`. Chasing that 8% produced a second patch worth as much as the first, so the
+sequence is worth keeping — every step killed a candidate rather than confirming one.
+
+* **It is not per-call overhead.** `scripts/bench6.cpp` now measures the fixed cost of one
+  `ggml_backend_graph_compute` (a 4x16x4 node, whose arithmetic is nothing) and subtracts it: **0.009
+  ms** at 4 threads. That is 0.03% of these shapes, not 8%. Note this also retires a plausible misuse
+  of P4.14's number: the ~1.4 ms floor recorded there is the cost of the PROFILING path, one compute
+  per node with its own graph view, and says nothing about a normal compute.
+* **It is not ggml's work partitioning.** `scripts/bench7.cpp` grew a driver that copies tinyBLAS's
+  own scheme — jobs of `BM*RM` = 16 rows handed out from a shared atomic, instead of OpenMP's static
+  split. Same tile, same buffers: **22.7 against 22.9 GFLOP/s**. The scheduling is worth ~1%.
+* **At ONE thread the gap is WIDER** — 84% (6.3 vs 7.5 GFLOP/s) against 91% at four. Whatever it is,
+  it is in the serial path, which is also what makes the next step cheap: read the object code.
+* **It is 14 extra instructions per k-iteration, and they are all address arithmetic.** ggml's
+  `gemm<4,3,4>` inner loop is **35 instructions** for 12 `fmla` + 7 `ldr q`; the identical source in
+  `bench7.cpp` compiles to **21**. GCC does not form pointer induction variables over `l` when the
+  bases and strides are read through `this` — it re-derives all seven operand addresses every
+  iteration (8 `add` + 6 `lsl`). **Not the flags:** compiled with ggml's own
+  (`-O3 -mcpu=cortex-a72+crc+nodotprod...`, lifted verbatim out of `flags.make`), the standalone copy
+  is still 21.
+* **Hoisting the bases and strides into locals fixes it**: 35 -> 21 instructions, and 22.0 -> **25.1
+  GFLOP/s**, which is past the hand-written kernel (24.3 in the same process). Bit-identical output --
+  it changes how an address is computed, not what is loaded or in what order.
+
+**The two patches are not alternatives and neither works alone.** Measured through the dispatcher at
+4 threads, each row normalised by the standalone kernel timed in the SAME process (which is how these
+numbers survive a laptop-grade noise floor):
+
+| | GCC | clang 19 |
+|---|---|---|
+| pristine v0.19.0 | 15.6 (0.65) | 23.8 (0.94) |
+| tile only (0001) | 22.0 (0.90) | 23.6 (0.98) |
+| address hoist only (0002) | 15.5 (0.76) | 24.0 (0.95) |
+| **both** | **25.1 (1.03)** | 23.9 (0.95) |
+
+Which settles the guards, both of which are now measurements rather than caution:
+
+* **0001 is GCC-only because clang measurably does not want it.** clang 19 holds the 24-accumulator
+  tile with zero spills (checked in the object code) and runs pristine at 23.8; giving it the smaller
+  tile costs ~1%. The `!defined(__clang__)` in that patch is what keeps a clang-built wheel — every
+  macOS one — on the schedule that is faster for it.
+* **0002 is aarch64-only because x86-64 measurably does not want it.** There GCC already forms the
+  induction variables, and the extra live values only add pressure: hoisting costs **55.4 -> 53.6
+  GFLOP/s** (median of seven runs pinned to two physical cores) and puts 12 more `%rsp` reads in the
+  block. With the `#if defined(__aarch64__)` in place, the x86 object code is **register-renaming
+  identical to pristine** — which is a better check than re-timing it on a thermally noisy laptop, and
+  is how the parity above was confirmed.
+
+**One more thing this round paid for:** clang is now installed on both boxes (`clang-19` on the Pi,
+`clang-14` on the dev box), so "we could not measure clang" is no longer a reason for anything.
+
+#### What it was scoped as, and the measurements that got it there
 
 **The single biggest lever this investigation found, and it is ~60 lines.**
 
@@ -7331,7 +7519,8 @@ long-activation convs (M = 18368-73472); the two small-M cases (M=288) only get 
 test.** The original ON/OFF comparison ran on unfilled buffers; redone with filled inputs it is 15.4 vs
 15.0 GFLOP/s -- still nothing. Curiously tinyBLAS's output is bit-identical to the 4x4 prototype's
 (max diff exactly 0.0, where ggml's own path differs by ~3e-7), so it is accumulating the same way and
-losing the 1.6x somewhere else. Worth one look before writing a kernel from scratch.
+losing the 1.6x somewhere else. Worth one look before writing a kernel from scratch. **That one look
+was the whole item**: it spills the tile it accumulates into. See the top of this entry.
 
 **What it is worth end-to-end.** MUL_MAT is ~84.5% of loom's 1.55 s conv time (from P4.14's 1-thread
 profile, MUL_MAT:IM2COL = 4181:767), so 1.56x on it saves ~0.47 s: **2.35 s -> ~1.88 s**, and
@@ -7413,21 +7602,23 @@ Check all three before believing a number.**
 |---|---|
 | unfused elementwise/activation chain is the gap | **no** — 6.5% of graph time at 1 thread |
 | the C++<->Lua array boundary is expensive | **no** — 18.7 ms total |
-| `GGML_LLAMAFILE=ON` (tinyBLAS) fixes the GEMM | **no** — 15.4 vs 15.0 GFLOP/s, retested with filled inputs |
+| `GGML_LLAMAFILE=ON` (tinyBLAS) fixes the GEMM | **on ARM only once GCC's codegen for it is fixed** — 15.4 vs 15.0 as upstream ships it, 25.1 with P4.15's two patches. On x86-64 the flag alone is ~2x |
 | lower CONV_1D as `kw` shifted mul_mats to dodge im2col | **worse** — 0.43-0.98x |
 | `ggml_conv_2d_direct` (ggml's MLAS-shaped fused conv) | **nothing** — 0.98x, despite bit-identical output |
 | im2col materialisation is the gap | **no** — removing it (row above) changes nothing |
 
-**Still open, in the order they are worth doing:** P4.15 (this item, ~0.47 s), then
-`CONV_TRANSPOSE_1D` as mul_mat + reshape (P4.14's follow-up list, ~60-90 ms), then fusing
-conv+bias+activation (part of the 27% "everything else" column above). P4.13 (quantized conv kernels)
-**conflicts** with any direct-conv work — decide between them rather than starting both.
+**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.30 s off 2.32 s: the
+`m % 4 != 0` mul_mats tinyBLAS declines outright (826 ms of the 1-thread profile is one such bucket,
+see the top of this entry), then `CONV_TRANSPOSE_1D` as mul_mat + reshape (P4.14's follow-up list,
+~60-90 ms), then fusing conv+bias+activation (part of the 27% "everything else" column above). P4.13
+(quantized conv kernels) **conflicts** with any direct-conv work — decide between them rather than
+starting both.
 
-**Start P4.15 by re-reading `scripts/bench6.cpp`'s header, then ggml's
-`src/ggml-cpu/vec.cpp:ggml_vec_dot_f32` and `llamafile/sgemm.cpp`'s `mnpack`/`gemm<M,N>`.** The open
-question that decides the approach is the bit-identity oddity noted above: tinyBLAS already accumulates
-exactly like the fast prototype yet runs 1.6x slower, so find out where it loses that before writing a
-new kernel.
+**This is what the item told its own future reader to do first, and it was the right instruction:**
+re-read `scripts/bench6.cpp`'s header, then ggml's `src/ggml-cpu/vec.cpp:ggml_vec_dot_f32` and
+`llamafile/sgemm.cpp`'s `mnpack`/`gemm<M,N>`, and settle the bit-identity oddity BEFORE writing a
+kernel. Settling it made the kernel unnecessary. `scripts/bench7.cpp` is the bench that settled it:
+one OpenMP driver, tinyBLAS's own block lifted verbatim, one tile shape per column.
 
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
 

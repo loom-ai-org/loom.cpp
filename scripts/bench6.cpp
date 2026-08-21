@@ -3,6 +3,13 @@
 // MLAS's rate. NOT part of the build: a standalone measurement, kept because the number it produces is
 // the justification for P4.15 and has to stay reproducible.
 //
+// NONE OF THIS KERNEL SHIPPED, and that is the item's result rather than a change of plan. What closed
+// P4.15 was building ggml's own tinyBLAS in (`GGML_LLAMAFILE`, which a standalone ggml defaults OFF)
+// and fixing the two things GCC does badly to it on ARM: a 24-accumulator tile it spills, and operand
+// addresses it will not strength-reduce (cmake/patches/). `scripts/bench7.cpp` found the first; the
+// per-shape columns below found the second. This file is the yardstick both were measured against,
+// and the end state is that ggml's own kernel is FASTER than the one below -- 25.1 against 24.3.
+//
 //   g++ -O3 -std=c++17 -fopenmp -march=armv8-a
 //       -I <ggml-src>/include -I <ggml-src>/src scripts/bench6.cpp -o bench6
 //       -L <ggml-build>/src -L <ggml-build>/src/ggml-cpu -lggml -lggml-base -lggml-cpu
@@ -90,8 +97,36 @@ int main(int argc,char**argv){
     int nth = argc>1?atoi(argv[1]):4;
     ggml_backend_cpu_set_n_threads(B,nth);
     printf("threads=%d  llamafile=%d\n\n",nth,ggml_cpu_has_llamafile());
-    printf("%-26s %11s %11s %8s %10s %10s %9s\n",
-           "K x M x N","ggml ms","4x4 ms","speedup","ggml GF/s","4x4 GF/s","max|diff|");
+    printf("%-26s %11s %11s %11s %10s %11s %10s %9s\n",
+           "K x M x N","ggml ms","-floor ms","4x4 ms","ggml GF/s","-floor GF/s","4x4 GF/s","max|diff|");
+
+    // The FIXED cost of one ggml_backend_graph_compute at this thread count: threadpool wake-up, the
+    // two ggml_barrier calls tinyBLAS's gemm() brackets its work with, and the dispatch around them.
+    // Measured on a node small enough that its arithmetic is nothing (4x16x4 = 512 FLOP), then
+    // subtracted from every shape below -- because the question this file answers is how the KERNEL
+    // compares, and a per-call constant is not the kernel. On a Pi 4 at 4 threads it is 0.009 ms,
+    // i.e. 0.03% of these shapes, which is what retired "ggml's per-op overhead" as the explanation
+    // for tinyBLAS trailing the kernel below (BACKLOG.md P4.15). Do not confuse it with P4.14's ~1.4
+    // ms floor: that one is the PROFILING path's, one compute per node with its own graph view.
+    double floor_s = 0.0;
+    {
+        ggml_init_params ip={64u*1024*1024,nullptr,true};
+        ggml_context* c=ggml_init(ip);
+        ggml_cgraph* gf=ggml_new_graph(c);
+        ggml_tensor* ta=ggml_new_tensor_2d(c,GGML_TYPE_F32,4,16); ggml_set_input(ta);
+        ggml_tensor* tb=ggml_new_tensor_2d(c,GGML_TYPE_F32,4,4);  ggml_set_input(tb);
+        ggml_build_forward_expand(gf,ggml_mul_mat(c,ta,tb));
+        ggml_gallocr_t ga=ggml_gallocr_new(ggml_backend_get_default_buffer_type(B));
+        ggml_gallocr_alloc_graph(ga,gf);
+        std::vector<float> z(64, 0.5f);                      // filled, always -- see the trap above
+        ggml_backend_tensor_set(ta,z.data(),0,16*4*sizeof(float));
+        ggml_backend_tensor_set(tb,z.data(),0,4*4*sizeof(float));
+        for(int i=0;i<20;i++) ggml_backend_graph_compute(B,gf);
+        double t0=now(); for(int i=0;i<200;i++) ggml_backend_graph_compute(B,gf);
+        floor_s=(now()-t0)/200;
+        ggml_gallocr_free(ga); ggml_free(c);
+    }
+    printf("per-compute floor: %.3f ms\n\n", floor_s*1e3);
 
     // the real flow_vocoder GEMMs (K=IC*kw, M=OL, N=OC), K/M/N all divisible by 4
     struct S{int64_t K,M,N;};
@@ -133,11 +168,12 @@ int main(int argc,char**argv){
         double gf_=2.0*s.K*s.M*s.N/1e9;
         tot_g+=gms; tot_k+=kms; tot_f+=gf_;
         char buf[64]; snprintf(buf,sizeof buf,"%lld x %lld x %lld",(long long)s.K,(long long)s.M,(long long)s.N);
-        printf("%-26s %8.2f ms %8.2f ms %7.2fx %10.1f %10.1f %9.1e\n",
-               buf,gms*1e3,kms*1e3,gms/kms,gf_/gms,gf_/kms,md);
+        printf("%-26s %8.2f ms %8.2f ms %8.2f ms %10.1f %11.1f %10.1f %9.1e\n",
+               buf,gms*1e3,(gms-floor_s)*1e3,kms*1e3,gf_/gms,gf_/(gms-floor_s),gf_/kms,md);
     }
-    printf("\ntotal: ggml %.3f s (%.1f GFLOP/s)  ->  4x4 kernel %.3f s (%.1f GFLOP/s)   %.2fx\n",
-           tot_g, tot_f/tot_g, tot_k, tot_f/tot_k, tot_g/tot_k);
+    const double tot_c = tot_g - 11*floor_s;
+    printf("\ntotal: ggml %.3f s (%.1f GFLOP/s)  |  minus floor %.3f s (%.1f GFLOP/s)  |  4x4 kernel %.3f s (%.1f GFLOP/s)\n",
+           tot_g, tot_f/tot_g, tot_c, tot_f/tot_c, tot_k, tot_f/tot_k);
     printf("A72 fp32 peak at 1.8 GHz x %d cores: %.1f GFLOP/s\n", nth, 1.8*4*2*nth);
     return 0;
 }

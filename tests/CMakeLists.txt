@@ -193,6 +193,15 @@ set_tests_properties(test_profile_enabled PROPERTIES LABELS ci)
 set_tests_properties(test_profile_enabled PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 set_tests_properties(test_profile_enabled PROPERTIES ENVIRONMENT "LOOM_PROFILE=1")
 
+# Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
+# build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
+# meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
+add_executable(test_tinyblas_gemm ci/test_tinyblas_gemm.cpp)
+target_link_libraries(test_tinyblas_gemm PRIVATE loom::engine)
+target_compile_definitions(test_tinyblas_gemm PRIVATE LOOM_EXPECT_TINYBLAS=$<BOOL:${LOOM_TINYBLAS}>)
+add_test(NAME test_tinyblas_gemm COMMAND test_tinyblas_gemm)
+set_tests_properties(test_tinyblas_gemm PROPERTIES LABELS ci)
+
 add_executable(test_gallocr_shrink ci/test_gallocr_shrink.cpp)
 target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_shrink PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
