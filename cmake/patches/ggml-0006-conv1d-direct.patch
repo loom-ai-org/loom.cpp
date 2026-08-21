@@ -12,7 +12,7 @@
  
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
-@@ -6990,6 +6997,452 @@
+@@ -6990,6 +6997,463 @@
  
  // ggml_compute_forward_conv_2d
  
@@ -356,9 +356,17 @@
 +    // Position block OUTERMOST, output channels inside it. The other way round -- the obvious way --
 +    // every channel block re-streams the whole activation from DRAM, and the kernel then measures the
 +    // same time whatever KW is, because it is not computing, it is waiting. 3x, on the shapes here.
++    // Position blocks are split into CONTIGUOUS ranges, one per thread, not round-robin. Round-robin
++    // gives each core every nth block, so its working set spans the whole activation rather than its
++    // own share of it, and on a chip whose L2 is shared that costs 10% at 32 channels x 73472
++    // (39.3 -> 35.8 ms, four threads) -- the largest convolutions in the model. It is the same total
++    // work either way; only the locality differs.
 +    const int64_t P    = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
 +    const int64_t nblk = OL / P;
-+    for (int64_t b = params->ith; b < nblk; b += params->nth)
++    const int64_t per  = (nblk + params->nth - 1) / params->nth;
++    const int64_t b0   = params->ith * per;
++    const int64_t b1   = MIN(b0 + per, nblk);
++    for (int64_t b = b0; b < b1; ++b)
 +        for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
 +            ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
 +                                     oc0, b * P, GGML_CONV1D_OCB);
@@ -432,7 +440,10 @@
 +    const int64_t P    = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
 +    const int64_t nblk = J / P;
 +    const int64_t njob = dil * nblk;
-+    for (int64_t job = params->ith; job < njob; job += params->nth) {
++    const int64_t jper = (njob + params->nth - 1) / params->nth;      // contiguous, as above
++    const int64_t j0   = params->ith * jper;
++    const int64_t j1   = MIN(j0 + jper, njob);
++    for (int64_t job = j0; job < j1; ++job) {
 +        const int64_t r = job / nblk, bkl = job % nblk;
 +        for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
 +            ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
@@ -465,7 +476,7 @@
  
  static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
                                                const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
-@@ -7030,6 +7483,25 @@
+@@ -7030,6 +7494,25 @@
      const float * src_data = (float *) src->data;
      void  * knl_data       = kernel->data;
      float * dst_data       = out_data ? out_data : (float *) dst->data;
