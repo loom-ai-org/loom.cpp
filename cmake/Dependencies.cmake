@@ -42,11 +42,13 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 option(LOOM_TINYBLAS "Build ggml's tinyBLAS (llamafile) GEMM path into the CPU backend" ON)
 set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
 
-# The pinned ggml, patched -- two diffs, both aarch64-only and both about GCC's code generation for
-# tinyBLAS's inner loop: one picks a register tile GCC can actually allocate, the other writes the
-# operand addresses in a form it will strength-reduce. Together they are 15.6 -> 25.1 GFLOP/s and take
-# ggml's own kernel PAST a hand-written one. See cmake/GgmlPatches.cmake for why a patch here rather
-# than a fork, a vendored copy, or a change in this engine. Populated up front so that both branches below -- and any
+# The pinned ggml, patched -- three diffs against tinyBLAS. Two are aarch64-only and about GCC's code
+# generation for its inner loop: one picks a register tile GCC can actually allocate, the other writes
+# the operand addresses in a form it will strength-reduce; together 15.6 -> 25.1 GFLOP/s, which takes
+# ggml's own kernel PAST a hand-written one. The third is architecture-neutral and about which matmuls
+# tinyBLAS accepts at all: it declined every `m % 4 != 0` matrix outright, handing thousands of rows
+# back to the generic kernel because of one or two leftovers. See cmake/GgmlPatches.cmake for why a
+# patch here rather than a fork, a vendored copy, or a change in this engine. Populated up front so that both branches below -- and any
 # future one -- compile the patched sources, and re-checked on every configure so that an existing
 # build tree cannot end up silently unpatched.
 include(${CMAKE_CURRENT_LIST_DIR}/GgmlPatches.cmake)

@@ -7411,8 +7411,9 @@ left in this thread.
   not). They are applied in filename order and touch disjoint regions of one file.
 * The numerics change is real and inaudible, and was checked as a waveform rather than argued from the
   flag: the same VITS utterance synthesised by an otherwise identical `-DLOOM_TINYBLAS=OFF` build
-  differs by **max 3.7e-6 against a 0.17 peak** (2e-5 relative), rel-RMS 7.1e-6, **cosine
-  1.0000000000**. No existing tolerance gate is anywhere near that -- the ci suite (66/66) and every
+  differs by **max 3.7e-6 against a 0.17 peak** (2e-5 relative), rel-RMS 7.1e-6, cosine
+  **0.99999999998** -- computed in float64, because a float32 dot product over 73472 samples prints
+  1.0000000000 for this and would have hidden a difference ten times larger. No existing tolerance gate is anywhere near that -- the ci suite (66/66) and every
   gate with a fixture present on this box (8 of 82, including the kokoro / styletts2 / matcha lua
   drivers, i.e. the conv-bearing ones) stay green. What P4.15 predicted might need re-baselining does
   not, because tinyBLAS is a different summation ORDER and not a different algorithm. The tensor-oracle
@@ -7438,15 +7439,16 @@ each build's own un-profiled wall clock (profiling costs ~6%, and with prof_main
 threadpool the per-node floor is 0.001 ms rather than P4.14's 1.4 ms -- create/join per node was that
 number, not dispatch).
 
-| | before (2.33 s) | **after (1.94 s)** | onnxruntime (1.02 s) | remaining delta | share of remaining gap |
-|---|---|---|---|---|---|
-| convolution: `MUL_MAT` | 1.30 s | **0.90 s** | — | | |
-| convolution: `IM2COL` | 0.53 s | 0.53 s | — | | |
-| **convolution, total** | **1.81 s** | **1.43 s** | 0.605 s (`Conv`+`FusedConv`) | 0.82 s | **91%** |
-| transposed conv | 0.18 s | 0.18 s | 0.162 s (`ConvTranspose`) | 0.02 s | 2% |
-| everything else | 0.34 s | 0.33 s | 0.257 s | 0.07 s | 8% |
+| | before (2.33 s) | 0001+0002 (1.94 s) | **+0003 (1.79 s)** | onnxruntime (1.02 s) | remaining delta | share of remaining gap |
+|---|---|---|---|---|---|---|
+| convolution: `MUL_MAT` | 1.30 s | 0.90 s | **0.78 s** | — | | |
+| convolution: `IM2COL` | 0.53 s | 0.53 s | 0.51 s | — | | |
+| **convolution, total** | **1.81 s** | **1.43 s** | **1.27 s** | 0.605 s (`Conv`+`FusedConv`) | 0.67 s | **88%** |
+| transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.162 s (`ConvTranspose`) | 0.02 s | 3% |
+| everything else | 0.34 s | 0.33 s | 0.33 s | 0.257 s | 0.07 s | 9% |
 
-**loom-vs-onnxruntime is 2.28x -> 1.86x, and the gap itself 1.31 s -> 0.92 s: 30% of it closed.**
+**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x, and the gap itself 1.31 -> 0.92 -> 0.76 s: 42% of
+it closed.**
 Only `MUL_MAT` moved (1.375 -> 0.990 s of profiled node time, 1.39x); `IM2COL`, `CONV_TRANSPOSE_1D`
 and everything else are unchanged to within a millisecond, which is the check that the patches did what
 they claim and nothing else. onnxruntime re-measured the same day at 1.01-1.08 s raw -- its duration
@@ -7455,15 +7457,19 @@ puts it at ~1.04 s, against the 1.024 s the per-op shares above were apportioned
 
 **What the new balance says, and it is not what it said before.**
 
-* **The GEMM is no longer the thing to fix -- the work it never sees is.** `MUL_MAT [287, 384]` is
-  **324 ms before and 324 ms after**, unchanged to the millisecond, because m = 287 is not a multiple
-  of 4 and tinyBLAS declines it outright. That single bucket is now a third of all remaining `MUL_MAT`
-  time. A tail path in tinyBLAS, or padding those shapes on the export side, is worth ~0.2 s of the
-  0.92 s.
-* **`IM2COL` is now 37% of loom's convolution** (0.53 s of 1.43 s) where onnxruntime has no equivalent
+* **The GEMM was no longer the thing to fix -- the work it never saw was. FIXED, patch 0003.**
+  `MUL_MAT [287, 384]` was **324 ms before and 324 ms after** the first two patches, unchanged to the
+  millisecond, because m = 287 is not a multiple of 4 and tinyBLAS declined it outright -- every tile
+  in that file is 4 rows tall, so one leftover row sent all 287 to ggml's generic kernel.
+  `ggml-0003-tinyblas-row-tail.patch` runs the aligned prefix through the tiles and finishes the <= 3
+  remaining rows in a 1x1-blocked loop, which is what those rows would have got anyway. That bucket is
+  **324 -> 190 ms**, all four m = 287 buckets **354 -> 208 ms**, and the synthesis **1.94 -> 1.79 s**.
+  It cannot regress anything: the tail rows get exactly the kernel they had, and every other shape is
+  unaffected. Architecture-neutral, so x86 gets it too.
+* **`IM2COL` is now 40% of loom's convolution** (0.51 s of 1.27 s) where onnxruntime has no equivalent
   line at all -- MLAS packs inside `Conv`. P4.14 measured `ggml_conv_2d_direct` (which does its own
   im2col into a small per-batch buffer) at 0.98x and CLOSED it; that verdict was reached when the GEMM
-  was 1.4x slower and im2col was proportionally a smaller share, so it is the one closed item worth
+  was 1.7x slower and im2col was proportionally a smaller share, so it is the one closed item worth
   re-opening -- with the same rule as before, that a component may not exceed its own total.
 * **Transposed conv is at parity** (0.18 vs 0.162 s) and worth 2%. The mul_mat + reshape lowering from
   P4.14's follow-up list is ~60-90 ms, i.e. still real but no longer near the top.
@@ -7648,10 +7654,9 @@ Check all three before believing a number.**
 | `ggml_conv_2d_direct` (ggml's MLAS-shaped fused conv) | **nothing** — 0.98x, despite bit-identical output |
 | im2col materialisation is the gap | **no** — removing it (row above) changes nothing |
 
-**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.39 s off 2.33 s, leaving
-a 0.92 s gap to onnxruntime that the updated table at the top of this entry attributes: the
-`m % 4 != 0` mul_mats tinyBLAS declines outright (~0.2 s, one bucket), then re-testing
-`ggml_conv_2d_direct` now that `IM2COL` is 37% of the conv stack rather than a smaller slice (it was
+**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.54 s off 2.33 s, leaving
+a 0.76 s gap to onnxruntime that the table at the top of this entry attributes: re-testing
+`ggml_conv_2d_direct` now that `IM2COL` is 40% of the conv stack rather than a smaller slice (it was
 closed at 0.98x under the old balance), then `CONV_TRANSPOSE_1D` as mul_mat + reshape (~60-90 ms),
 then fusing conv+bias+activation. P4.13 (quantized conv kernels) **conflicts** with any direct-conv
 work — decide between them rather than starting both.
