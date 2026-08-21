@@ -226,6 +226,58 @@ int main() {
         LOOM_CHECK(written2 == fusion_disabled);
     }
 
+    // 5. A WIDE, DILATED convolution, which on aarch64 takes a third path again: phase-major, where
+    //    the activation is de-interleaved into `dil` dense subsequences so a channel's taps stop being
+    //    `dil` floats apart (ggml-0006, ggml_conv1d_phase_ok). The window is narrow -- kw >= 7,
+    //    dilation >= 3, IC*kw >= 768 -- so the shape here is chosen to sit inside it, and on any other
+    //    target the same shape takes the ordinary direct path and this is simply a second correctness
+    //    case. Either way the answer is the answer.
+    {
+        constexpr int64_t KW2 = 7, IC2 = 128, OC2 = 4, IL2 = 200, DIL = 3;
+        const int64_t pad2 = (KW2 - 1) * DIL / 2;
+        std::vector<float> K3((size_t) KW2*IC2*OC2), X3((size_t) IL2*IC2), B3((size_t) OC2);
+        for (size_t i = 0; i < K3.size(); ++i) K3[i] = 0.01f - 0.0005f * (float) (i % 71);
+        for (size_t i = 0; i < X3.size(); ++i) X3[i] = 0.02f + 0.0007f * (float) (i % 83);
+        for (size_t i = 0; i < B3.size(); ++i) B3[i] = 0.125f * (float) (i + 1);
+
+        ggml_tensor* k3 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KW2, 1, IC2, OC2);
+        ggml_tensor* x3 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IL2, 1, IC2, 1);
+        ggml_tensor* b3 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, OC2, 1);
+        std::memcpy(k3->data, K3.data(), K3.size() * sizeof(float));
+        std::memcpy(x3->data, X3.data(), X3.size() * sizeof(float));
+        std::memcpy(b3->data, B3.data(), B3.size() * sizeof(float));
+
+        ggml_tensor* conv3 = ggml_conv_2d_direct(ctx, k3, x3, 1, 1, (int) pad2, 0, (int) DIL, 1);
+        ggml_tensor* out3  = ggml_add(ctx, ggml_reshape_3d(ctx, conv3, conv3->ne[0], OC2, 1), b3);
+        ggml_cgraph* gf3 = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf3, out3);
+        LOOM_CHECK(ggml_graph_compute_with_ctx(ctx, gf3, 2) == GGML_STATUS_SUCCESS);
+
+        const int64_t OL2 = conv3->ne[0];
+        double worst3 = 0.0;
+        for (int64_t oc = 0; oc < OC2; ++oc)
+            for (int64_t ol = 0; ol < OL2; ++ol) {
+                double ref = (double) B3[oc];
+                for (int64_t ic = 0; ic < IC2; ++ic)
+                    for (int64_t kx = 0; kx < KW2; ++kx) {
+                        const int64_t sx = ol + kx*DIL - pad2;
+                        if (sx < 0 || sx >= IL2) continue;
+                        ref += (double) K3[oc*(IC2*KW2) + ic*KW2 + kx] * (double) X3[ic*IL2 + sx];
+                    }
+                const double got = (double) ((const float*) out3->data)[oc * OL2 + ol];
+                const double rel = std::fabs(got - ref) / (std::fabs(ref) + 1e-6);
+                if (rel > worst3) worst3 = rel;
+            }
+        // Looser than the cases above because the reduction is: 128 channels x 7 taps is 896 products
+        // per output, accumulated in float32 against a double reference, which lands at ~1e-5 on its
+        // own. Still three orders tighter than any real defect -- a mis-indexed tap or channel moves
+        // these values by percent, not by ulps.
+        LOOM_CHECK(worst3 < 1e-4);
+        if (worst3 >= 1e-4) {
+            std::fprintf(stderr, "  dilated wide kernel: worst relative error %.3e\n", worst3);
+        }
+    }
+
     ggml_free(ctx);
     LOOM_TEST_REPORT_AND_RETURN();
 }

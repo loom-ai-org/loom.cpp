@@ -124,17 +124,34 @@ static void conv1d_direct(const float* xp, const float* wp, float* y,
                 for (int j = 0; j < VEC; ++j) vst1q_f32(y + (oc0+i)*OL + p0 + j*4, acc[i][j]);
         }
     }
-    const int64_t done = nblk * P;
-    if (done < OL) {                              // ragged tail, scalar: at most P-1 positions
+    // Ragged tail as ONE MORE OVERLAPPING tile, matching the shipped kernel. A scalar tail here biases
+    // every comparison in this bench by up to 2x on any shape whose length is not a whole number of
+    // blocks -- which is most of them, and which is how it hid the phase-major comparison for a while.
+    if (nblk * P < OL && OL >= P) {
+        const int64_t p0 = OL - P;
 #pragma omp parallel for num_threads(nth) schedule(static)
-        for (int64_t oc = 0; oc < OC; ++oc)
-            for (int64_t p = done; p < OL; ++p) {
-                float acc = 0.0f;
-                for (int64_t ic = 0; ic < IC; ++ic)
-                    for (int64_t kx = 0; kx < KW; ++kx)
-                        acc += wp[(ic*KW + kx)*OC + oc] * xp[ic*LP + p + kx*dil];
-                y[oc*OL + p] = acc;
+        for (int64_t oc0 = 0; oc0 < OC; oc0 += OCB) {
+            float32x4_t acc[OCB][VEC];
+            for (int i = 0; i < OCB; ++i)
+                for (int v = 0; v < VEC; ++v) acc[i][v] = vdupq_n_f32(0.0f);
+            for (int64_t ic = 0; ic < IC; ++ic) {
+                const float* xrow = xp + ic*LP + p0;
+                for (int64_t kx = 0; kx < KW; ++kx) {
+                    const float* q = xrow + kx*dil;
+                    float32x4_t xv[VEC];
+                    for (int v = 0; v < VEC; ++v) xv[v] = vld1q_f32(q + v*4);
+                    const float32x4_t wv = vld1q_f32(wp + (ic*KW + kx)*OC + oc0);
+                    for (int v = 0; v < VEC; ++v) {
+                        if (OCB > 0) acc[0][v] = vfmaq_laneq_f32(acc[0][v], xv[v], wv, 0);
+                        if (OCB > 1) acc[1][v] = vfmaq_laneq_f32(acc[1][v], xv[v], wv, 1);
+                        if (OCB > 2) acc[2][v] = vfmaq_laneq_f32(acc[2][v], xv[v], wv, 2);
+                        if (OCB > 3) acc[3][v] = vfmaq_laneq_f32(acc[3][v], xv[v], wv, 3);
+                    }
+                }
             }
+            for (int i = 0; i < OCB; ++i)
+                for (int v = 0; v < VEC; ++v) vst1q_f32(y + (oc0+i)*OL + p0 + v*4, acc[i][v]);
+        }
     }
 }
 

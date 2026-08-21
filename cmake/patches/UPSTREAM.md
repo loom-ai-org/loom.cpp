@@ -262,8 +262,17 @@ synthesis. Recomputing up to P-1 positions is much cheaper than computing any of
 **Not bit-identical** — a different summation order. Whole-synthesis difference against the previous
 lowering: max 3.5e-6 on a 0.17 peak, rel-RMS 6.5e-6.
 
-**What a reviewer should push on.** The 512 KB floor and the `OC % 4` restriction are both "good enough
-for what was measured" rather than principled; the tile sizes are tuned on two machines; and there is
+**A third path, for wide dilated kernels.** The same patch carries a phase-major ("a trous") variant:
+a convolution with dilation d is d dense convolutions over the subsequences `p = j*d + r`, and laid out
+that way a channel's taps stop being d floats apart -- at dilation 12 with kw 7 the direct kernel reads
+seven 64-byte runs spread over 352 bytes per channel, which is 896 prefetch streams for a 128-channel
+convolution. NEON de-interleaves by 2, 3 and 4 in one instruction and 6 and 12 factor into two such
+passes. It is worth **1.52x** at 128x128 kw7 dilation 12 and **0.48x** at 32x32 kw5 dilation 6, so it
+is gated to `kw >= 7 && dilation >= 3 && IC*kw >= 768` and to aarch64, where those instructions exist.
+Two convolutions of the model take it, for 1.487 -> 1.463 s.
+
+**What a reviewer should push on.** The 512 KB floor, the `OC % 4` restriction and the phase window's
+three constants are all "good enough for what was measured" rather than principled; the tile sizes are tuned on two machines; and there is
 no ARM64 counterpart to the AVX2 path for AVX-512 or SVE, which would want their own tile. Also worth
 saying: benchmarks of convolution shapes must carry the model's **dilations**. At dilation 1 this
 kernel measures ~1.6x on the shapes above; at the model's own dilations (1, 2, 3, 6, 12) the same
