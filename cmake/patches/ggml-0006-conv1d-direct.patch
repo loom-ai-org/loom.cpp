@@ -12,7 +12,7 @@
  
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
-@@ -6990,6 +6997,232 @@
+@@ -6990,6 +6997,236 @@
  
  // ggml_compute_forward_conv_2d
  
@@ -229,15 +229,19 @@
 +            ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
 +                                     oc0, b * P, GGML_CONV1D_OCB);
 +
-+    // The ragged tail: fewer than one tile's worth of positions, scalar.
-+    for (int64_t oc = params->ith; oc < OC; oc += params->nth)
-+        for (int64_t p = nblk * P; p < OL; ++p) {
-+            float acc = bias_data ? bias_data[oc] : 0.0f;
-+            for (int64_t ic = 0; ic < IC; ++ic)
-+                for (int64_t kx = 0; kx < KW; ++kx)
-+                    acc += wp[(ic * KW + kx) * OC + oc] * xp[ic * LP + p + kx * dil];
-+            y[oc * OL + p] = acc;
++    // The ragged tail, as ONE MORE OVERLAPPING TILE ending at OL rather than a scalar loop. It
++    // recomputes up to P-1 positions the last full tile already did, which is far cheaper than doing
++    // any of them at scalar speed: at OL = 2296 the tail is 8 positions, but 8 x OC x IC x KW scalar
++    // multiply-accumulates is ~2 ms of a 20 ms convolution. The heuristic guarantees OL >= P, so this
++    // is always a whole tile.
++    if (nblk * P < OL) {
++        const int64_t p0 = OL - P;
++        for (int64_t oc0 = params->ith * GGML_CONV1D_OCB; oc0 < OC;
++             oc0 += params->nth * GGML_CONV1D_OCB) {
++            ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
++                                     oc0, p0, GGML_CONV1D_OCB);
 +        }
++    }
 +}
 +
 +
@@ -245,7 +249,7 @@
  
  static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
                                                const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
-@@ -7030,6 +7263,16 @@
+@@ -7030,6 +7267,16 @@
      const float * src_data = (float *) src->data;
      void  * knl_data       = kernel->data;
      float * dst_data       = out_data ? out_data : (float *) dst->data;

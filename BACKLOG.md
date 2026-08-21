@@ -7448,8 +7448,8 @@ number, not dispatch).
 | transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.19 s | 0.19 s | 0.162 s (`ConvTranspose`) | 0.03 s | 5% |
 | everything else | 0.34 s | 0.33 s | 0.33 s | 0.36 s | 0.29 s | 0.257 s | 0.03 s | 6% |
 
-**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x -> 1.47x with the direct kernel
-(ggml-0006), and the gap itself 1.31 -> 0.92 -> 0.76 -> 0.59 -> 0.55 -> 0.48 s: 63% of it closed.**
+**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x -> 1.45x with the direct kernel
+(ggml-0006), and the gap itself 1.31 -> 0.92 -> 0.76 -> 0.59 -> 0.55 -> 0.46 s: 65% of it closed.**
 The x86 box, which had been on a different lowering entirely and had no end-to-end number until this
 one, went 1.503 -> 1.169 s on the same utterance.
 
@@ -7495,7 +7495,7 @@ missing.
 
 | | before | after | |
 |---|---|---|---|
-| Pi 4, 4 threads | 1.576 s | **1.508 s** | 1.05x |
+| Pi 4, 4 threads | 1.576 s | **1.486 s** | 1.06x |
 | Ryzen 3 3250U, 2 threads pinned | 1.503 s | **1.169 s** | **1.29x** |
 
 **Three conditions, and the third one is the whole lesson.**
@@ -7529,42 +7529,43 @@ grouped differently. Against a `-DLOOM_TINYBLAS=OFF` build the whole synthesis d
 **3.5e-6** on a 0.17 peak, rel-RMS 6.5e-6, cosine 0.99999999998 -- the same order as every other change
 in this entry, and every gate passes on both lowerings.
 
-#### Tap-major (phase-major) traversal for the dilated shapes: the kernel wins, the transform eats it
+#### Tap-major (phase-major) traversal, vectorised: still not worth it, but it found a bug worth 1.5%
 
-The direct kernel gets 1.2-1.4x on the model's dilated convolutions where it gets 1.6x at dilation 1,
-and the reason is prefetching: at dilation 12 with kw 7, one channel's taps are **seven separate
-64-byte runs spread over 352 bytes**, so a 64-channel convolution asks the prefetcher to track 448
-streams. A convolution with dilation d is d independent DENSE convolutions, one over each subsequence
-`p = j*d + r`; laid out that way each channel reads **one contiguous 88-byte run**, exactly as an
-undilated convolution does. `scripts/bench10.cpp` has that variant.
+A convolution with dilation d is d independent DENSE convolutions over the subsequences
+`p = j*d + r`. Laid out that way a channel reads one contiguous run instead of, at dilation 12 with
+kw 7, seven separate 64-byte runs spread over 352 bytes -- 448 streams for a prefetcher that tracks a
+dozen. The kernel half of that was confirmed earlier; the blocker was the transform into and out of
+the layout, a strided gather and scatter running at ~0.5 GB/s.
 
-**The theory is right about the kernel.** On rows where the phase length is a whole number of blocks
-(so no scalar tail distorts it), phase-major against the shipped direct kernel:
+**Vectorised, the transform is 2x faster.** NEON de-interleaves by 2, 3 and 4 in one instruction
+(`vld2q`/`vld3q`/`vld4q`, and the mirrored `vst`), and the model's 6 and 12 factor into two such
+passes: splitting by `a` then by `b` lands element `p = j*d + r` in phase `r1 + a*r2`, because
+`p = a*(j*b + r2) + r1`. Both passes have to be vectorised -- doing only the first, which is the
+obvious thing, leaves dilation 6 and 12 exactly where they started. On the largest shape (9.4 MB in
+and out): dilation 3 **28.4 -> 16.2 ms**, dilation 6 **40.0 -> 26.3**, dilation 12 **53.6 -> 27.8**.
 
-| shape | direct | phase-major kernel | |
+**And it is still not enough, for the shapes that matter here.** Against the shipped direct kernel,
+transform included:
+
+| shape | direct | phase-major | |
 |---|---|---|---|
-| 128x128 kw7 L2296 **d12** | 38.5 ms | **24.1 ms** | **1.60x** |
-| 32x32 kw5 L73472 d2 | 30.6 ms | 28.0 ms | 1.10x |
-| 64x64 kw3 L18368 d2 | 20.5 ms | 19.1 ms | 1.07x |
+| 128x128 kw7 L2296 d12 | 39.8 ms | **22.8 ms** | **1.74x** |
+| 128x128 kw7 L2296 d3 | 29.4 ms | 24.5 ms | 1.20x |
+| 32x32 kw7 L73472 d12 | 45.9 ms | 66.9 ms | 0.69x |
+| 32x32 kw5 L73472 d6 | 27.1 ms | 54.5 ms | 0.50x |
 
-The gain tracks the dilation, which is what the stream-count explanation predicts: the worst-prefetched
-shape gains the most.
+The rule is the same one as before, just with the line moved: transform is O(elements), arithmetic is
+O(elements x IC x KW), so it pays where the channel count is high. That is six of this model's eighteen
+convolutions and the cheapest six -- **~25 ms, 1.6%** -- for a third path inside the op and a third
+heuristic on top of the two already there. Not shipped. The bench carries the working implementation.
 
-**And the transform eats it, except where the arithmetic is dense enough to hide it.** Getting into and
-out of phase-major is a strided gather over the input and a strided scatter over the output -- for
-L=73472 that is **22-54 ms** against a kernel of 28-41 ms, i.e. it doubles the cost; for L=2296 it is
-**2 ms** against a kernel of 24, and there the whole thing wins. The ratio is transform (O(elements))
-over arithmetic (O(elements x IC x KW)), so it pays exactly when `IC * KW` is large -- high-channel,
-wide-kernel, heavily dilated. In this model that describes six of eighteen convolutions, and they are
-the cheapest six: perhaps 10-20 ms.
-
-**Not shipped**, on that arithmetic. What would change it is vectorising the transform: NEON's
-`vld3q_f32` / `vst3q_f32` de-interleave and interleave in exactly the pattern a dilation of 3 needs
-(and `vld2q`/`vld4q` for 2 and 4, composable for the model's 6 and 12), which should take the strided
-copy from ~0.5 GB/s to near memcpy speed and turn the 22-54 ms into 6-14. That flips the large shapes
-and is the thing to try if this is picked up -- along with a vectorised tail, since the scalar
-remainder in the phase kernel is visible in the bench wherever the phase length is not a multiple of
-the block.
+**What it did find, by making the comparison clean enough to read: the shipped kernel's ragged tail was
+scalar.** The phase kernel's own tail was distorting rows by up to 2x (42 ms on a shape it does in 20
+when the phase length happens to divide evenly), and fixing it there -- run ONE MORE OVERLAPPING TILE
+ending at the last position, recomputing up to P-1 positions rather than doing any of them at scalar
+speed -- applies verbatim to `ggml-0006`. At OL = 2296 the tail is 8 positions, but 8 x OC x IC x KW
+scalar multiply-accumulates is ~2 ms of a 20 ms convolution. **1.508 -> 1.486 s**, and it is in the
+patch now.
 
 #### The direct convolution, prototyped: right in one regime, four times wrong in the other (SHIPPED, above)
 
@@ -7909,9 +7910,10 @@ that feeds it is 37% of the time:
    1.29x on x86; see the section above for why those two numbers are so far apart and why the bench
    promised more than either. What is left inside the convolution is the dilated shapes, where the
    direct kernel gets 1.2-1.4x rather than the 1.6x it manages at dilation 1. The tap-major traversal
-   that would fix it **is now measured** (section above): the kernel gains up to 1.60x, the layout
-   transform costs more than that on all but the high-channel shapes, and vectorising the transform
-   with `vld3`/`vst3` is the open question.
+   that would fix it **is measured and closed** (section above): vectorising the transform with
+   `vld3`/`vst3` made it 2x cheaper and the phase form still only pays on the high-channel shapes,
+   worth ~25 ms for a third path in the op. What came out of it instead was the scalar tail, worth
+   22 ms and now in `ggml-0006`.
 2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
    and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it

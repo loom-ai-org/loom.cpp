@@ -269,20 +269,107 @@ static void conv1d_direct_nocopy(const float* x, const float* wp, float* y,
 // What is NOT free is the output, which comes out phase-major and has to be interleaved back. Timed
 // separately below, because whether it eats the win is the entire question.
 #if defined(__aarch64__)
+// De-interleave `n` floats: dst[r*stride + j] = src[j*f + r], for f = 2, 3 or 4, which is exactly what
+// NEON's vld2q/vld3q/vld4q do in one instruction. Everything else falls back to the scalar gather this
+// replaces -- which runs at about 0.5 GB/s, where these run near memcpy.
+static void deint(const float* src, float* dst, int64_t stride, int64_t n, int f) {
+    int64_t j = 0;
+    if (f == 2) {
+        for (; j + 4 <= n/2; j += 4) {
+            const float32x4x2_t v = vld2q_f32(src + j*2);
+            vst1q_f32(dst + 0*stride + j, v.val[0]);
+            vst1q_f32(dst + 1*stride + j, v.val[1]);
+        }
+    } else if (f == 3) {
+        for (; j + 4 <= n/3; j += 4) {
+            const float32x4x3_t v = vld3q_f32(src + j*3);
+            vst1q_f32(dst + 0*stride + j, v.val[0]);
+            vst1q_f32(dst + 1*stride + j, v.val[1]);
+            vst1q_f32(dst + 2*stride + j, v.val[2]);
+        }
+    } else if (f == 4) {
+        for (; j + 4 <= n/4; j += 4) {
+            const float32x4x4_t v = vld4q_f32(src + j*4);
+            vst1q_f32(dst + 0*stride + j, v.val[0]);
+            vst1q_f32(dst + 1*stride + j, v.val[1]);
+            vst1q_f32(dst + 2*stride + j, v.val[2]);
+            vst1q_f32(dst + 3*stride + j, v.val[3]);
+        }
+    }
+    for (int64_t jj = j; jj * f < n; ++jj)                 // remainder, and every other f
+        for (int r = 0; r < f; ++r)
+            if (jj*f + r < n) dst[r*stride + jj] = src[jj*f + r];
+}
+
+// The inverse: dst[j*f + r] = src[r*stride + j], i.e. vst2q/vst3q/vst4q.
+static void inter(const float* src, float* dst, int64_t stride, int64_t n, int f) {
+    int64_t j = 0;
+    if (f == 2) {
+        for (; j + 4 <= n/2; j += 4) {
+            float32x4x2_t v; v.val[0] = vld1q_f32(src + 0*stride + j); v.val[1] = vld1q_f32(src + 1*stride + j);
+            vst2q_f32(dst + j*2, v);
+        }
+    } else if (f == 3) {
+        for (; j + 4 <= n/3; j += 4) {
+            float32x4x3_t v; v.val[0] = vld1q_f32(src + 0*stride + j); v.val[1] = vld1q_f32(src + 1*stride + j);
+            v.val[2] = vld1q_f32(src + 2*stride + j);
+            vst3q_f32(dst + j*3, v);
+        }
+    } else if (f == 4) {
+        for (; j + 4 <= n/4; j += 4) {
+            float32x4x4_t v; v.val[0] = vld1q_f32(src + 0*stride + j); v.val[1] = vld1q_f32(src + 1*stride + j);
+            v.val[2] = vld1q_f32(src + 2*stride + j); v.val[3] = vld1q_f32(src + 3*stride + j);
+            vst4q_f32(dst + j*4, v);
+        }
+    }
+    for (int64_t jj = j; jj * f < n; ++jj)
+        for (int r = 0; r < f; ++r)
+            if (jj*f + r < n) dst[jj*f + r] = src[r*stride + jj];
+}
+
+// NEON only splits by 2, 3 or 4, and the model wants 6 and 12 as well. d = a*b decomposes: splitting
+// first by `a` and then by `b` lands element p = j*d + r in phase r = r1 + a*r2, because
+// p = a*(j*b + r2) + r1. Two vectorised passes still beat one scalar one.
+static void phase_factors(int64_t d, int* a, int* b) {
+    *a = (int) d; *b = 1;
+    if (d == 6)  { *a = 2; *b = 3; }
+    if (d == 8)  { *a = 2; *b = 4; }
+    if (d == 9)  { *a = 3; *b = 3; }
+    if (d == 12) { *a = 4; *b = 3; }
+    if (d == 16) { *a = 4; *b = 4; }
+}
+
 static void pad_input_phase(const float* x, float* xp, int64_t IC, int64_t L, int64_t KW,
                             int64_t dil, int64_t J, int nth) {
-    const int64_t H = (KW - 1) / 2;                 // taps either side, in j-space
-    const int64_t JP = J + 2*H;                     // padded length of one phase
+    const int64_t H = (KW - 1) / 2;
+    const int64_t JP = J + 2*H;
+    int a, b; phase_factors(dil, &a, &b);
+    const bool vec = (a == 2 || a == 3 || a == 4) && (b == 1 || b == 2 || b == 3 || b == 4);
 #pragma omp parallel for num_threads(nth) schedule(static)
     for (int64_t ic = 0; ic < IC; ++ic) {
         float* base = xp + ic * dil * JP;
         memset(base, 0, (size_t) dil * JP * sizeof(float));
-        for (int64_t r = 0; r < dil; ++r) {
-            float* dst = base + r * JP + H;
-            for (int64_t j = 0; j < J; ++j) {
-                const int64_t p = j * dil + r;
-                if (p < L) dst[j] = x[ic * L + p];
+        if (dil == 1) { memcpy(base + H, x + ic*L, (size_t) L * sizeof(float)); continue; }
+        if (!vec) {
+            for (int64_t r = 0; r < dil; ++r) {
+                float* dst = base + r * JP + H;
+                for (int64_t j = 0; j < J; ++j) { const int64_t p = j*dil + r; if (p < L) dst[j] = x[ic*L + p]; }
             }
+            continue;
+        }
+        if (b == 1) {                                   // one vectorised pass
+            deint(x + ic*L, base + H, JP, L, a);
+        } else {
+            // Two vectorised passes: split by `a`, then split each of those streams by `b`. The second
+            // call lands phase r2 of stream r1 at base + (r1 + a*r2)*JP, which is just a stride of
+            // a*JP -- so it is the same de-interleave, not a scalar walk. Vectorising only the first
+            // pass (the first thing tried) left dilation 6 and 12 exactly where they started.
+            static thread_local std::vector<float> tmp;
+            const int64_t na = (L + a - 1) / a;
+            if ((int64_t) tmp.size() < a * na) tmp.assign(a * na, 0.0f);
+            deint(x + ic*L, tmp.data(), na, L, a);
+            for (int r1 = 0; r1 < a; ++r1)
+                deint(tmp.data() + (int64_t) r1*na, base + (int64_t) r1*JP + H, (int64_t) a*JP, na, b);
         }
     }
 }
@@ -321,31 +408,76 @@ static void conv1d_direct_phase(const float* xp, const float* wp, float* yp,
             }
         }
     }
-    // ragged j-tail, scalar
-    const int64_t done = nblk * P;
+    // The ragged j-tail, as ONE MORE OVERLAPPING BLOCK ending at J rather than a scalar loop. It
+    // recomputes up to P-1 positions that the last full block already did, which is cheaper than doing
+    // a handful of them at scalar speed: with a scalar tail this kernel measured 42 ms on a shape it
+    // does in 20 when the phase length happens to be a whole number of blocks, and that artefact was
+    // large enough to hide the comparison this bench exists for.
+    if (nblk * P < J && J >= P) {
+        const int64_t j0 = J - P;
 #pragma omp parallel for collapse(2) num_threads(nth) schedule(static)
-    for (int64_t r = 0; r < dil; ++r)
-        for (int64_t oc = 0; oc < OC; ++oc)
-            for (int64_t j = done; j < J; ++j) {
-                float a = 0.0f;
-                for (int64_t ic = 0; ic < IC; ++ic)
-                    for (int64_t kx = 0; kx < KW; ++kx)
-                        a += wp[(ic*KW + kx)*OC + oc] * xp[(ic*dil + r)*JP + j + kx];
-                yp[(oc*dil + r)*J + j] = a;
+        for (int64_t r = 0; r < dil; ++r)
+            for (int64_t oc0 = 0; oc0 < OC; oc0 += OCB) {
+                float32x4_t acc[OCB][VEC];
+                for (int i = 0; i < OCB; ++i)
+                    for (int v = 0; v < VEC; ++v) acc[i][v] = vdupq_n_f32(0.0f);
+                for (int64_t ic = 0; ic < IC; ++ic) {
+                    const float* xrow = xp + (ic * dil + r) * JP + j0;
+                    for (int64_t kx = 0; kx < KW; ++kx) {
+                        const float* q = xrow + kx;
+                        float32x4_t xv[VEC];
+                        for (int v = 0; v < VEC; ++v) xv[v] = vld1q_f32(q + v*4);
+                        const float32x4_t wv = vld1q_f32(wp + (ic*KW + kx)*OC + oc0);
+                        for (int v = 0; v < VEC; ++v) {
+                            acc[0][v] = vfmaq_laneq_f32(acc[0][v], xv[v], wv, 0);
+                            acc[1][v] = vfmaq_laneq_f32(acc[1][v], xv[v], wv, 1);
+                            acc[2][v] = vfmaq_laneq_f32(acc[2][v], xv[v], wv, 2);
+                            acc[3][v] = vfmaq_laneq_f32(acc[3][v], xv[v], wv, 3);
+                        }
+                    }
+                }
+                for (int i = 0; i < OCB; ++i)
+                    for (int v = 0; v < VEC; ++v)
+                        vst1q_f32(yp + ((oc0+i) * dil + r) * J + j0 + v*4, acc[i][v]);
             }
+    } else if (nblk * P < J) {
+        const int64_t done = nblk * P;
+#pragma omp parallel for collapse(2) num_threads(nth) schedule(static)
+        for (int64_t r = 0; r < dil; ++r)
+            for (int64_t oc = 0; oc < OC; ++oc)
+                for (int64_t j = done; j < J; ++j) {
+                    float a = 0.0f;
+                    for (int64_t ic = 0; ic < IC; ++ic)
+                        for (int64_t kx = 0; kx < KW; ++kx)
+                            a += wp[(ic*KW + kx)*OC + oc] * xp[(ic*dil + r)*JP + j + kx];
+                    yp[(oc*dil + r)*J + j] = a;
+                }
+    }
 }
 
-// phase-major [OC][dil][J] back to [OC][OL]
+// phase-major [OC][dil][J] back to [OC][OL], interleaved with vst2/3/4 where the dilation allows.
 static void unphase_output(const float* yp, float* y, int64_t OC, int64_t OL, int64_t dil, int64_t J, int nth) {
+    int a, b; phase_factors(dil, &a, &b);
+    const bool vec1 = b == 1 && (a == 2 || a == 3 || a == 4);
+    const bool vec2 = (a == 2 || a == 3 || a == 4) && (b == 2 || b == 3 || b == 4);
 #pragma omp parallel for num_threads(nth) schedule(static)
-    for (int64_t oc = 0; oc < OC; ++oc)
-        for (int64_t r = 0; r < dil; ++r) {
-            const float* src = yp + (oc * dil + r) * J;
-            for (int64_t j = 0; j < J; ++j) {
-                const int64_t p = j * dil + r;
-                if (p < OL) y[oc * OL + p] = src[j];
-            }
+    for (int64_t oc = 0; oc < OC; ++oc) {
+        if (dil == 1) { memcpy(y + oc*OL, yp + oc*J, (size_t) OL * sizeof(float)); continue; }
+        if (vec1) { inter(yp + oc*dil*J, y + oc*OL, J, OL, a); continue; }
+        if (vec2) {                                    // the mirror image of the two-pass split
+            static thread_local std::vector<float> tmp;
+            const int64_t na = (OL + a - 1) / a;
+            if ((int64_t) tmp.size() < a * na) tmp.assign(a * na, 0.0f);
+            for (int r1 = 0; r1 < a; ++r1)
+                inter(yp + oc*dil*J + (int64_t) r1*J, tmp.data() + (int64_t) r1*na, (int64_t) a*J, na, b);
+            inter(tmp.data(), y + oc*OL, na, OL, a);
+            continue;
         }
+        for (int64_t r = 0; r < dil; ++r) {
+            const float* src = yp + (oc*dil + r) * J;
+            for (int64_t j = 0; j < J; ++j) { const int64_t p = j*dil + r; if (p < OL) y[oc*OL + p] = src[j]; }
+        }
+    }
 }
 #endif
 
