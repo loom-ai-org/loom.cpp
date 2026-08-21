@@ -8,8 +8,12 @@
 // Fusion is the kind of change that is invisible until it is wrong, so this pins both halves:
 //
 //   1. **It produces the same numbers.** Compared against a double-precision reference AND against
-//      the same graph computed with `GGML_CPU_DISABLE_FUSION=1`, which must agree BIT for bit -- the
-//      fused kernel adds the same bias to the same sums, so anything else is a real difference.
+//      the same graph computed with `GGML_CPU_DISABLE_FUSION=1`. Those agree BIT for bit on the
+//      batched path, where the fused kernel adds the same bias to the same sums; the direct kernel
+//      (ggml-0006) starts its accumulators AT the bias instead, which is a different rounding, so
+//      shapes it accepts are held to the reference tolerance rather than to equality. The first shape
+//      below has OC = 6 and therefore always takes the batched path, which is what keeps the
+//      bit-for-bit half of this test meaningful.
 //   2. **It actually fuses**, which no output comparison can show. The convolution's own result
 //      tensor is poisoned before the run: when the pattern is fused that tensor is never written, so
 //      the poison survives, and when it is not, it holds the convolution's output. Registered twice

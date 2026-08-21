@@ -61,15 +61,11 @@ void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
 // Padding and striding are unaffected by any of this -- they are im2col parameters (p0/s0/d0), and
 // reflect padding is a separate op applied upstream (PAD_1D_REFLECT, primitives_basic.cpp).
 
-// Whether CONV_1D lowers to ggml's single convolution op instead of im2col + mul_mat. Defaults on for
-// aarch64 and off elsewhere, for the measured reason spelled out in op_conv_1d below; override it to
-// build (and test) either path anywhere.
+// Whether CONV_1D lowers to ggml's single convolution op instead of im2col + mul_mat. On everywhere
+// now, for the measured reason spelled out in op_conv_1d below; override it to build (and test) the
+// other path anywhere.
 #ifndef LOOM_CONV1D_DIRECT
-#  if defined(__aarch64__)
-#    define LOOM_CONV1D_DIRECT 1
-#  else
-#    define LOOM_CONV1D_DIRECT 0
-#  endif
+#  define LOOM_CONV1D_DIRECT 1
 #endif
 
 // Whether `kernel` is stored in a form that must occupy mul_mat's FIRST operand. F32 is the only dtype
@@ -126,12 +122,16 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // BIT-IDENTICAL either way (the batching splits the patch axis, never the reduction): **1.18x**,
     // and 1.10-1.63x on the long-activation convs that dominate.
     //
-    // NOT on x86-64, where the same comparison on an AVX2 Ryzen 3 3250U is **0.87x** -- i.e. the
-    // patch matrix is worth materialising there. That machine spends 0.555 s on the work the Pi spends
-    // 1.37 s on; cache-blocking buys a bandwidth-rich core much less, and the batching costs it the
-    // one big GEMM. Both numbers are `scripts/bench9.cpp`, and re-running it is how this `#if` should
-    // be revisited rather than reasoned about -- including on a many-core x86 server, which is the
-    // configuration neither of those two boxes represents.
+    // THIS USED TO BE aarch64-ONLY, and the reason it is not any more is worth keeping. On the
+    // cache-blocked im2col alone, x86-64 measured **0.87x** -- there the patch matrix is worth
+    // materialising, because that machine does in 0.555 s what the Pi takes 1.37 s to do and
+    // cache-blocking buys a bandwidth-rich core much less. What changed is that ggml's convolution now
+    // has a DIRECT kernel behind a cache-size heuristic (ggml-0006), which does not materialise
+    // anything at all: **4.7x** on that machine's long-activation convolutions, and **1.19x**
+    // end-to-end on the same synthesis (1.503 -> 1.258 s, two threads pinned). The shapes the
+    // heuristic declines still get the batched im2col, and are the only thing this lowering gives up.
+    // `scripts/bench10.cpp` is where that decision lives; re-run it on a machine neither of these two
+    // represents -- a many-core server, a wide ARM core -- rather than reasoning about it.
     //
     // Eligibility mirrors ggml_compute_forward_conv_2d's own asserts: an F32 or F16 kernel (a
     // quantized one takes the packed path below), contiguous, and a dense (non-grouped) conv, which
