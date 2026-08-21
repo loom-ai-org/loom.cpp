@@ -1,6 +1,6 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Six diffs, each independently useful and independently reviewable. They are written against the pin in
+Seven diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
@@ -10,7 +10,9 @@ though 1 and 2 only pay off together (see below) and are best sent as one PR or 
 5 touch the CPU convolution; **5 depends on 4** (it uses the `ldc` mul_mat helper 4 introduces, and its
 staging only makes sense once 4 has made the op batch-oriented). A reviewer taking 4 without 5 is fine;
 5 without 4 is not. **6 also sits on top of 4** -- it is a second path inside the same op -- and is
-independent of 5, though it serves 5's fused bias for free.
+independent of 5, though it serves 5's fused bias for free. **7 generalises 5** -- it replaces 5's
+entry point with one that also takes a `LEAKY_RELU` on the input and a residual `ADD` on the output --
+so it must be sent after 5, or the two folded into one PR.
 
 **Every number below is a Raspberry Pi 4B (Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2, Debian
 aarch64, gcc 14.2) unless it says otherwise; x86-64 numbers are a Ryzen 3 3250U (AVX2, 2 cores), median
@@ -19,7 +21,7 @@ generator, F32 throughout, one image per batch, `KH = 1`. The benches are in `sc
 (`bench6.cpp` GEMM, `bench7.cpp` register tiles, `bench9.cpp` conv lowering, `bench10.cpp` direct
 convolution) and are self-contained against a built ggml.
 
-**What a reviewer is likely to ask, for all six: measurements on hardware neither of these two boxes
+**What a reviewer is likely to ask, for all seven: measurements on hardware neither of these two boxes
 represents** — a wide ARM core (Neoverse V2, Apple M-series) and a many-core x86 server. Say so up
 front rather than being asked.
 
@@ -206,6 +208,7 @@ and with the aliasing guard removed, which reproduces the corruption hermeticall
 
 * The bench that produced each number, and the fact that they are reproducible from this repo.
 * Which claims are bit-identical (1, 2, 3, 4, and 5's fused-vs-unfused) and which change numerics
+  (6 and 7 do, by summation order: 7 is 6.7e-8 max on a 0.17 peak, thread-count invariant)
   (none of these do; enabling `GGML_LLAMAFILE` at all does, by ~3e-7 relative, but that is a build
   option, not a patch).
 * The two machines, and the explicit request for a third.
@@ -278,3 +281,65 @@ saying: benchmarks of convolution shapes must carry the model's **dilations**. A
 kernel measures ~1.6x on the shapes above; at the model's own dilations (1, 2, 3, 6, 12) the same
 shapes give 1.2-1.4x, and that difference is most of the gap between the bench and the end-to-end
 number.
+
+---
+
+## PR 7 — CPU backend: fuse the `LEAKY_RELU` before a `CONV_2D` and the residual `ADD` after it
+
+*(`cmake/patches/ggml-0007-conv1d-elementwise-fusion.patch`, generalises PR 5; benefits from PR 6)*
+
+**Problem.** PR 5 removed one of the three elementwise passes a HiFi-GAN resblock layer puts around its
+convolution. The layer is exactly:
+
+```
+h  = LEAKY_RELU(x)        a full read and a full write of the activation
+c  = CONV_1D(w, h)
+xt = ADD(c, bias)         PR 5 folded this one in
+x' = ADD(xt, x)           the residual: two reads and a write
+```
+
+On a Cortex-A72 one pass over this vocoder's largest activation (9.4 MB) costs **4.7 ms** to
+read-and-write and **8.3 ms** for the two-read-one-write add, at 3.4–4.0 GB/s — and one core nearly
+saturates that, so threads do not help. Against a convolution that is 20–40 ms, the passes are not a
+rounding error. They are also not slow code: the only way to make them cheaper is not to do them.
+
+**Fix.** Neither needs a pass of its own. The convolution already copies its input into a padded
+buffer, so the unary is applied *as* that copy is made; the accumulators already start at the bias, so
+they can start at `bias + residual[p]` — in this kernel the residual is added as each accumulator is
+stored, which is the one moment both are in registers. The intermediates are never written. Detection
+extends `ggml_cpu_conv_2d_bias_add_idx` into `ggml_cpu_conv_2d_fusion`, which matches the chain from
+either end (from the `LEAKY_RELU`, when the convolution is its only consumer, or from the convolution),
+and all three of `act`, `bias` and `residual` are optional.
+
+**Evidence.** Whole VITS synthesis, Pi 4B, 4 threads: **1.441 -> 1.345 s**, and the fusion's own share
+of that is **~50 ms** (the other half comes from a change in the calling project that stopped putting a
+`CONT` between the bias add and the residual add, which this detector cannot look past). Measured by
+switching each fusion off at runtime inside ONE binary — the box drifts 1.45 -> 1.58 s over twenty
+minutes of continuous load, which is larger than the effect, and rebuilding between arms confounds that
+drift with code layout. Four rounds, order rotated between them, cooldown before each; the ordering of
+the arms was identical every time.
+
+**Two things a reviewer should push on.**
+
+**1. It was a 19% *regression* before it was a win, and the cause is not the residual.** The
+accumulators are a 2-D array indexed by the store loop's own counters. A compiler can only keep such an
+array in registers if it unrolls that loop, and GCC stops unrolling the moment the body has a branch in
+it. Written the obvious way — `if (res) …; if (whole) …` inside the store — sixteen vector accumulators
+moved to the stack in **every convolution in the model**, including all the ones with nothing fused
+into them, and the synthesis went **1.44 → 1.73 s**. The two conditions are constant across a whole
+convolution, so they are template parameters and the call site picks one of four specialisations; the
+"nothing fused" one then compiles to exactly what PR 6 shipped. This is the same failure mode as PR 1,
+in a different function.
+
+**2. The residual may be the destination, and the tail tile must not double it.** As in PR 5, the graph
+allocator hands `x + f(x)` the block `x` just vacated, so the residual operand and the output are
+frequently the same memory. That is safe here — every output element reads exactly the residual element
+it is about to overwrite — *except* for PR 6's overlapping tail tile, which deliberately recomputes
+positions the last full tile already wrote, on a different thread with no barrier between them. Adding
+a residual to those a second time is a real corruption, so the tail tile carries a floor position below
+which it does not store. The detector separately rejects any *partial* overlap between the destination
+and either the input or the residual, and any overlap at all with the weights or the bias.
+
+**Testing.** ci (68) and gate (82) green, fused-vs-unfused agreeing to 6.7e-8 max on a 0.17 peak and
+identical at 2 and 4 threads (a race here would not be). The gate was verified able to fail by
+perturbing the fused slope by 5% and, separately, the fused residual by 5%: `matcha_mil` catches both.

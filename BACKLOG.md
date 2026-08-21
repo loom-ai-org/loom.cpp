@@ -7951,8 +7951,8 @@ that feeds it is 37% of the time:
    channels -- are **measured out**: the kernel is at 83% of peak in cache and the loss is scaling on a
    shared L2, the tile is already the best of three, and the one thing still on the table there was
    round-robin block partitioning, now fixed for another 10% on the largest shape. What remains needs
-   graph-level fusion (keeping a resblock's intermediate in cache), not a better kernel — **scoped as
-   P4.15b below**, with the traffic measurements that bound it.
+   graph-level fusion (keeping a resblock's intermediate in cache), not a better kernel — **done as
+   P4.15b below**, for 1.44 -> 1.34 s.
 2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
    and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
@@ -7968,7 +7968,17 @@ re-read `scripts/bench6.cpp`'s header, then ggml's `src/ggml-cpu/vec.cpp:ggml_ve
 kernel. Settling it made the kernel unnecessary. `scripts/bench7.cpp` is the bench that settled it:
 one OpenMP driver, tinyBLAS's own block lifted verbatim, one tile shape per column.
 
-### P4.15b — graph-level fusion for resblock chains — SCOPED, NOT STARTED (2026-08-21)
+### P4.15b — graph-level fusion for resblock chains — STEP 1 DONE (2026-08-21)
+
+**What shipped, and what it is worth.** Two changes. `ggml-0007-conv1d-elementwise-fusion.patch` folds
+a resblock's `LEAKY_RELU` and its residual `ADD` into the convolution between them; a one-function
+change to `ensure_packed` in loom's own op layer stops emitting one `ggml_cont` per CONSUMER of a
+non-contiguous tensor. On a Pi 4 at 4 threads, steady state on a quiet box, **1.441 -> 1.345 s** —
+**96 ms, 6.7%**, and the same delta again from the interleaved four-arm run below. The gap to
+onnxruntime's 1.024 s on the same utterance goes 1.41x -> 1.31x.
+
+That is close to the ~120 ms this item predicted from the traffic table below, which is the first thing
+in this thread where the arithmetic and the measurement agreed.
 
 **Why this exists.** P4.15 took the convolution from 2.33 s to 1.44 s and then measured itself out: the
 kernel reaches 83% of the machine's peak in cache, it has no spills, its tile is the best of three, and
@@ -7989,47 +7999,94 @@ From `model.graph_topology.flow_vocoder`, a HiFi-GAN resblock layer is exactly t
 ```
 LEAKY_RELU(x)            -> h          # a full pass, 4.7 ms at the largest scale
 CONV_1D(w, h)            -> c
-ADD(c, bias_reshaped)    -> xt         # ALREADY FUSED into the convolution by ggml-0005
+ADD(c, bias_reshaped)    -> xt         # FUSED by ggml-0005
 ADD(xt, x)               -> x'         # the residual: a full pass, 8.3 ms
 LEAKY_RELU(x')           -> h'         # and round again
 ```
 
-So per convolution there are **two** elementwise passes left that the convolution could absorb, and one
-that it already has. Measured on the current build, 4 threads, `$LOOM_PROFILE` (which does not fuse, so
-the bias ADDs in it are not a real cost — subtract them):
+Per convolution there are **two** elementwise passes the convolution could absorb and one it already
+has. Measured on the pre-P4.15b build, 4 threads, `$LOOM_PROFILE` (which does not fuse, so the bias
+ADDs in it are not a real cost — subtract them):
 
 | op | profile | of which is real |
 |---|---|---|
 | `ADD` | 193 ms | ~80-100 ms is the residual; the rest is bias, already fused |
 | `LEAKY_RELU` | 41 ms | all of it, and every one feeds a convolution |
 | `UNARY` | 36 ms | mostly tanh/sigmoid in the flow, not the resblocks |
-| `CONT` | 49 ms | copies the graph asks for; a separate question |
+| `CONT` | 49 ms | copies the graph asks for — and **three quarters of them were redundant**, below |
 | `MUL` | 15 ms | gating |
 
-#### Step 1: absorb the input activation and the residual into the convolution (~120 ms, 8%)
+#### What was done, and the four numbers that decompose it
 
-The convolution already reads its input and already writes its output. Applying `LEAKY_RELU` to each
-input vector as it is gathered costs nothing (it is in a register either way), and adding the residual
-to each accumulator before the store costs one extra stream. Both patterns are visible in the graph
-without changing it, which means they belong in **`ggml_cpu_try_fuse_ops`** exactly as the bias fusion
-does — `cmake/patches/ggml-0005-conv2d-bias-fusion.patch` is the template, including its detector,
-its use-count checks and its test.
+Both changes are switchable at runtime in the measurement build (`LOOM_NO_DEDUP`, `LOOM_NO_ACT`,
+`LOOM_NO_RES` — probes, not shipped), so all four arms are the same binary. That matters more than it
+sounds: see the measurement note below.
 
-* **Input side**: `LEAKY_RELU -> CONV_2D`, where the conv's `src[1]` is the unary's output and nothing
-  else reads it. The kernel needs the slope from the unary's op_params and applies it in
-  `ggml_conv_1d_direct_tile`'s load. Note `LEAKY_RELU` is its own op with a parameter, while tanh and
-  sigmoid are `GGML_OP_UNARY` sub-ops — support the first and the pattern generalises later.
-* **Output side**: `CONV_2D -> ADD(bias) -> ADD(residual)`, where the second add's other operand is a
-  tensor of the same shape. The accumulators start at the bias already; they can start at
-  `bias + residual[p]` instead, which is one extra load per output vector.
-* **Both at once** is where the win is, and the detector should handle the chain rather than two
-  independent fusions, because the middle tensor (`xt`) is what disappears.
+| arm | Pi 4, 4 threads | vs base |
+|---|---|---|
+| base (patches 1-6, no dedup — matches the 1.441 s baseline binary within noise) | **1.44 s** | — |
+| `ensure_packed` dedup alone | 1.43-1.45 s | ~0-20 ms |
+| the fusion alone | **1.40 s** | ~50 ms |
+| both | **1.34 s** | **~100 ms** |
 
-**Expected: ~120 ms of 1.44 s.** That is arithmetic on the table above, not a measurement — the first
-job is to check it by timing a build with `GGML_CPU_DISABLE_FUSION=1` against one without, which is how
-ggml-0005 was measured and is the only comparison that is not confounded.
+**The two are strongly superadditive, and that is the whole finding.** The dedup on its own is worth
+almost nothing — it removes three copies of a large tensor, and a copy is cheaper inside a graph than
+its isolated profile time suggests. What it is really worth is **unblocking the fusion on half the
+vocoder's convolutions**, which is 50 ms more on top of the fusion's own 50.
 
-#### Step 2: tile the chain over the sequence (bigger, and only worth it after step 1)
+* **The fusion** (`ggml-0007`). `ggml_cpu_conv_2d_bias_add_idx` becomes `ggml_cpu_conv_2d_fusion`,
+  matching the chain from either end — from the `LEAKY_RELU` when the convolution is its only consumer,
+  or from the convolution — with all of `act`, `bias` and `residual` optional. Fusion runs FORWARD from
+  a node, so a unary before the convolution can only be absorbed by starting the match at the unary;
+  that is why there are two entry shapes and not one.
+* **The dedup** (`src/ops/primitives_*.cpp`). `ensure_packed` called `ggml_cont` unconditionally, so a
+  non-contiguous tensor got one packed copy per op that read it. The upsampler's output is a trimmed
+  view read by a `LEAKY_RELU` and by three resblock residual adds: **four copies of the same 9.4 MB
+  tensor** (`CONT 73472x32, 4 calls` in the profile, now 1). It now reuses one already built in the same
+  `ggml_context`, which is per graph build, so there is nothing stale to find.
+
+**Why the dedup unblocks the fusion.** With a `CONT` per consumer, the graph reads
+`CONV -> ADD(bias) -> CONT -> ADD(residual)`, and the `CONT` is a real node whose result the residual
+add needs — it cannot be skipped, and the detector requires the residual add to be the next node it
+would compute. So the three convolutions per upsample stage whose residual is the upsampler output
+matched `act=0 bias=1 res=0`, and only the three whose residual is a plain ADD output matched fully.
+After the dedup all six match, three of them with the unary as well:
+
+```
+3 FUSE conv ne=[73472,1,32] act=1 bias=1 res=1      # the inner convolutions
+3 FUSE conv ne=[73472,1,32] act=0 bias=1 res=1      # act=0: their LEAKY_RELU has three consumers
+```
+
+The first activation of each resblock layer is shared by three convolutions, so it can never be
+absorbed — 3 of every 4 unaries in a layer can be, which is where the leaky half of the win stops.
+
+#### Two traps this cost real time to find
+
+1. **It was a 19% REGRESSION before it was a win, and the residual was not the cause.**
+   `ggml_conv_1d_direct_tile`'s accumulators are a 2-D array indexed by the store loop's own counters.
+   A compiler keeps such an array in registers only if it unrolls that loop, and GCC stops unrolling
+   the moment the body has a branch in it. Written the obvious way — `if (res) …; if (whole) …` inside
+   the store — sixteen vector accumulators moved to the stack in **every convolution in the model**,
+   including all the ones with nothing fused into them, and the synthesis went **1.44 -> 1.73 s**. Both
+   conditions are constant across a whole convolution, so they are template parameters and the call
+   site picks one of four specialisations; the "nothing fused" one then compiles to exactly what
+   `ggml-0006` shipped. This is P4.15's tile-spill failure in a different function — **when a change to
+   a store loop makes the whole model slower, look for the accumulators before you look at the
+   feature.**
+2. **A `timeout`-killed background ssh does not kill the remote process, and the second run does not
+   look broken — it looks slow.** An orphaned `prof_main` loop from an aborted measurement ran
+   alongside a new one and produced 3.3 s where the truth was 1.35. This is already trap #2 in P4.15
+   and it was walked into anyway. `pgrep -a prof_main` on the far side before believing any number,
+   `pkill -9 -f prof_main` after any aborted remote run.
+
+**And a measurement note that changed the answer.** The Pi is **not** repeatable to 1% under sustained
+load: over twenty minutes of back-to-back runs the same arm drifts 1.45 -> 1.58 s, which is larger than
+everything being measured. Rebuilding between arms confounds that drift with code layout. Both are
+avoided by making every arm a runtime switch inside ONE binary and running them **interleaved, with the
+order rotated between rounds and a cooldown before each** — four rounds here, and the ordering of the
+four arms was identical in every one.
+
+#### Step 2: tile the chain over the sequence — still open, and now on firmer ground
 
 Even with step 1, each convolution still writes its whole output and the next one reads it back. Tiling
 the chain — compute `[p0, p0+T)` of the second convolution from `[p0 - halo, p0 + T + halo)` of the
@@ -8037,13 +8094,12 @@ first — keeps the intermediate in cache and removes that crossing too. The hal
 second convolution, which at dilation 12 and kw 7 is 72 positions: with T = 4096 that is under 2%
 recomputation, and at dilation 1 it is nothing.
 
-This is where the remaining ~15-20% lives, and it is a different shape of change: a kernel that takes
-**two** weight sets and runs a chain, plus a detector that matches the whole resblock layer. It is also
-the first thing in this thread that cannot be expressed as "one ggml op, unchanged graph" — the fused
-unit spans four graph nodes. **Do step 1 first**; if it lands, the traffic model behind step 2 is
-confirmed, and if it does not, step 2 rests on nothing.
+Step 1 landing at 7% is the confirmation this needed: the traffic model behind it is right, and the
+elementwise passes it predicted were there. What is left is a kernel that takes **two** weight sets and
+runs a chain, plus a detector that matches a whole resblock layer — the first thing in this thread that
+cannot be expressed as "one ggml op, unchanged graph", since the fused unit spans four graph nodes.
 
-#### What NOT to re-propose (all measured, in P4.15 above)
+#### What NOT to re-propose (all measured, in P4.15 and above)
 
 | idea | verdict |
 |---|---|
@@ -8053,23 +8109,27 @@ confirmed, and if it does not, step 2 rests on nothing.
 | phase-major for the low-channel shapes | 0.48-0.92x; shipped only for `kw>=7, dil>=3, IC*kw>=768` |
 | vectorising the im2col gather | ~10% of it, twice measured; the cost is the write amplification |
 | `kw` shifted mul_mats to dodge im2col | 0.43-0.98x (P4.14), and the direct kernel supersedes it |
+| runtime `if`s in the direct kernel's store | **1.44 -> 1.73 s** — see trap 1 above |
+| fusing the resblock layer's FIRST unary | it has three consumers; nothing to skip |
 
 #### Cold start: everything needed to pick this up
 
 **Machines.** `ssh pi@rpi4` — Raspberry Pi 4B, Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2, 32 KB
-L1D, gcc 14.2 and clang 19, **quiet and repeatable to ~1%**; this is where end-to-end numbers are made.
-The dev box is x86-64 (Ryzen 3 3250U, AVX2, 2 cores, 4 MB L3) and is **thermally noisy** — pin with
-`taskset -c 0,2` and take medians of seven, or it will lie to you by 15%.
+L1D, gcc 14.2 and clang 19. Repeatable to ~1% **when it is cool and nothing else is on it**, and to
+about 9% when it is not — see the measurement note above. The dev box is x86-64 (Ryzen 3 3250U, AVX2,
+2 cores, 4 MB L3) and is **thermally noisy** — pin with `taskset -c 0,2` and take medians of seven, or
+it will lie to you by 15%.
 
-**The model and the utterance**, used by every number in P4.14/P4.15:
+**The model and the utterance**, used by every number in P4.14/P4.15/P4.15b:
 `loom-ai-org/vits-piper-en-gb-miro-loom`, phonemes
 `hˈeɪ, kæn juː ʃˈʌtdaʊn ðə kəmpjˈuːtɐ, maɪ fɹˈɛnd?` -> 100 ids -> y_length 287 -> 73472 samples. On the
 Pi: `~/.cache/huggingface/hub/models--loom-ai-org--vits-piper-en-gb-miro-loom/snapshots/*/*.gguf` (two
 snapshots exist — take `ls -t | head -1`). On the dev box: `../hf-models/vits-piper-en-gb-miro/`.
 
-**Baselines to reproduce before trusting anything.** Pi, 4 threads, idle, steady state: **1.44 s**
-(onnxruntime does the same utterance in **1.024 s**, so the ratio is 1.41x). x86, two threads pinned:
-**~1.19 s**. If your first number is far off, fix the measurement, not the code.
+**Baselines to reproduce before trusting anything.** Pi, 4 threads, idle, steady state: **1.34 s**
+after this item (**1.44 s** before it; onnxruntime does the same utterance in **1.024 s**, so the ratio
+is 1.31x). x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
+not the code.
 
 **Scratch trees on the Pi** (all disposable, none of them a git repo):
 * `~/loom-p415/loom.cpp` — a full checkout with `prof_main` appended to its CMakeLists; this is what
@@ -8091,30 +8151,39 @@ cmake -B build -DLOOM_TINYBLAS=OFF                      # no tinyBLAS, for GEMM 
 GGML_CPU_DISABLE_FUSION=1 <binary>                      # turns every CPU-backend fusion off
 ```
 
-**The six ggml patches** live in `cmake/patches/` and are applied at configure time by
+**The seven ggml patches** live in `cmake/patches/` and are applied at configure time by
 `cmake/GgmlPatches.cmake`, which resets and retries if one no longer applies — so **editing a patch and
 re-running cmake just works**, and `git -C build/_deps/ggml-src checkout -- .` is the manual reset.
-`cmake/patches/UPSTREAM.md` is the PR write-up for all six. To develop a seventh, edit
-`build/_deps/ggml-src/...` directly, then regenerate the diff against a tree with the earlier patches
-applied but not yours (the recipe is in this entry's git history: move your patch aside, reset,
-configure, diff).
+`cmake/patches/UPSTREAM.md` is the PR write-up for all seven. To develop an eighth, snapshot the three
+files `cmake/patches/` touches after a clean configure, edit `build/_deps/ggml-src/...` directly, and
+`diff -u` the snapshot against the tree — the snapshot IS the "earlier patches applied but not yours"
+baseline, and it survives the reconfigure that a `git checkout` would undo.
 
-**Five traps, each of which produced a wrong answer that survived a write-up:**
+**Five traps, each of which produced a wrong answer that survived a write-up** (and see the two above,
+which are new):
 
 1. **The profiler cannot see fusion.** `$LOOM_PROFILE` submits one node per graph, and a one-node graph
    has nothing to fuse with, so a profiled run is always the unfused one. Measure fusion with
-   `GGML_CPU_DISABLE_FUSION=1` against the same binary, never by profiling.
+   `GGML_CPU_DISABLE_FUSION=1` against the same binary — or, better, with a runtime switch per fusion,
+   which is what P4.15b did — never by profiling.
 2. **A node's isolated profile time is an upper bound on its marginal cost, sometimes a loose one.**
-   The bias ADDs profiled at 0.20 s and removing them saved 0.03 s.
+   The bias ADDs profiled at 0.20 s and removing them saved 0.03 s; the redundant `CONT`s profiled at
+   7 ms and removing them saved under 20.
 3. **A graph allocator will hand an op the buffer its own input just vacated.** Safe in the unfused
    order, corruption when fused — it cost a 0.54 max-abs-diff on two gate models. Any new fusion must
-   check `ggml_cpu_tensors_overlap` against every tensor it reads while writing.
+   check `ggml_cpu_tensors_overlap` against every tensor it reads while writing. P4.15b adds a second
+   case of the same thing: the residual operand is usually the DESTINATION.
 4. **An artefact big enough to hide the comparison is worth fixing before reading the comparison** —
-   twice here, a scalar tail and scalar edge blocks, and both times the fix was worth more than the
-   thing being compared.
+   three times here now: a scalar tail, scalar edge blocks, and the accumulator spill above.
 5. **The shapes a bench holds are not the shapes a model runs.** A heuristic tuned on eleven shapes made
    the synthesis *slower* until it was checked against all 153 convolutions the model actually issues;
    and a bench without the model's dilations measures a convolution the model does not have.
+
+**And the check that made this item honest: prove the gate can fail before believing it passed.**
+Perturbing the fused slope by 5%, and separately the fused residual by 5%, both make
+`test_e2e_matcha_mil_lua_driver` fail — so the 82 green tests are green about something. Fused and
+unfused VITS output agree to 6.7e-8 max on a 0.17 peak, identically at 2 and 4 threads, which a race
+would not do.
 
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
 
