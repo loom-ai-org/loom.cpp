@@ -7951,7 +7951,8 @@ that feeds it is 37% of the time:
    channels -- are **measured out**: the kernel is at 83% of peak in cache and the loss is scaling on a
    shared L2, the tile is already the best of three, and the one thing still on the table there was
    round-robin block partitioning, now fixed for another 10% on the largest shape. What remains needs
-   graph-level fusion (keeping a resblock's intermediate in cache), not a better kernel.
+   graph-level fusion (keeping a resblock's intermediate in cache), not a better kernel — **scoped as
+   P4.15b below**, with the traffic measurements that bound it.
 2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
    and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
@@ -7966,6 +7967,154 @@ re-read `scripts/bench6.cpp`'s header, then ggml's `src/ggml-cpu/vec.cpp:ggml_ve
 `llamafile/sgemm.cpp`'s `mnpack`/`gemm<M,N>`, and settle the bit-identity oddity BEFORE writing a
 kernel. Settling it made the kernel unnecessary. `scripts/bench7.cpp` is the bench that settled it:
 one OpenMP driver, tinyBLAS's own block lifted verbatim, one tile shape per column.
+
+### P4.15b — graph-level fusion for resblock chains — SCOPED, NOT STARTED (2026-08-21)
+
+**Why this exists.** P4.15 took the convolution from 2.33 s to 1.44 s and then measured itself out: the
+kernel reaches 83% of the machine's peak in cache, it has no spills, its tile is the best of three, and
+its remaining loss is scaling on a shared L2 (1 -> 4 threads is 2.35x, not 4x). What is left is not
+arithmetic, it is **how many times the vocoder's activations cross the memory bus**. This item is about
+removing crossings, which is a graph-level question and not a kernel one.
+
+**The machine's number, which bounds everything below.** One pass over a 9.4 MB activation (the
+vocoder's largest) costs **4.7 ms** to read-and-write and **8.3 ms** for a two-read-one-write add, at
+**3.4-4.0 GB/s** — and *one* core almost saturates that, so more threads do not help. Elementwise ops
+here are not slow code; they are the bus. The only way to make them cheaper is to not do them.
+
+#### What the graph actually looks like
+
+From `model.graph_topology.flow_vocoder`, a HiFi-GAN resblock layer is exactly this, repeated (dilations
+1, 2, 3, 6, 12 across layers):
+
+```
+LEAKY_RELU(x)            -> h          # a full pass, 4.7 ms at the largest scale
+CONV_1D(w, h)            -> c
+ADD(c, bias_reshaped)    -> xt         # ALREADY FUSED into the convolution by ggml-0005
+ADD(xt, x)               -> x'         # the residual: a full pass, 8.3 ms
+LEAKY_RELU(x')           -> h'         # and round again
+```
+
+So per convolution there are **two** elementwise passes left that the convolution could absorb, and one
+that it already has. Measured on the current build, 4 threads, `$LOOM_PROFILE` (which does not fuse, so
+the bias ADDs in it are not a real cost — subtract them):
+
+| op | profile | of which is real |
+|---|---|---|
+| `ADD` | 193 ms | ~80-100 ms is the residual; the rest is bias, already fused |
+| `LEAKY_RELU` | 41 ms | all of it, and every one feeds a convolution |
+| `UNARY` | 36 ms | mostly tanh/sigmoid in the flow, not the resblocks |
+| `CONT` | 49 ms | copies the graph asks for; a separate question |
+| `MUL` | 15 ms | gating |
+
+#### Step 1: absorb the input activation and the residual into the convolution (~120 ms, 8%)
+
+The convolution already reads its input and already writes its output. Applying `LEAKY_RELU` to each
+input vector as it is gathered costs nothing (it is in a register either way), and adding the residual
+to each accumulator before the store costs one extra stream. Both patterns are visible in the graph
+without changing it, which means they belong in **`ggml_cpu_try_fuse_ops`** exactly as the bias fusion
+does — `cmake/patches/ggml-0005-conv2d-bias-fusion.patch` is the template, including its detector,
+its use-count checks and its test.
+
+* **Input side**: `LEAKY_RELU -> CONV_2D`, where the conv's `src[1]` is the unary's output and nothing
+  else reads it. The kernel needs the slope from the unary's op_params and applies it in
+  `ggml_conv_1d_direct_tile`'s load. Note `LEAKY_RELU` is its own op with a parameter, while tanh and
+  sigmoid are `GGML_OP_UNARY` sub-ops — support the first and the pattern generalises later.
+* **Output side**: `CONV_2D -> ADD(bias) -> ADD(residual)`, where the second add's other operand is a
+  tensor of the same shape. The accumulators start at the bias already; they can start at
+  `bias + residual[p]` instead, which is one extra load per output vector.
+* **Both at once** is where the win is, and the detector should handle the chain rather than two
+  independent fusions, because the middle tensor (`xt`) is what disappears.
+
+**Expected: ~120 ms of 1.44 s.** That is arithmetic on the table above, not a measurement — the first
+job is to check it by timing a build with `GGML_CPU_DISABLE_FUSION=1` against one without, which is how
+ggml-0005 was measured and is the only comparison that is not confounded.
+
+#### Step 2: tile the chain over the sequence (bigger, and only worth it after step 1)
+
+Even with step 1, each convolution still writes its whole output and the next one reads it back. Tiling
+the chain — compute `[p0, p0+T)` of the second convolution from `[p0 - halo, p0 + T + halo)` of the
+first — keeps the intermediate in cache and removes that crossing too. The halo is `(kw-1)*dil` of the
+second convolution, which at dilation 12 and kw 7 is 72 positions: with T = 4096 that is under 2%
+recomputation, and at dilation 1 it is nothing.
+
+This is where the remaining ~15-20% lives, and it is a different shape of change: a kernel that takes
+**two** weight sets and runs a chain, plus a detector that matches the whole resblock layer. It is also
+the first thing in this thread that cannot be expressed as "one ggml op, unchanged graph" — the fused
+unit spans four graph nodes. **Do step 1 first**; if it lands, the traffic model behind step 2 is
+confirmed, and if it does not, step 2 rests on nothing.
+
+#### What NOT to re-propose (all measured, in P4.15 above)
+
+| idea | verdict |
+|---|---|
+| a better GEMM micro-kernel | ggml's tinyBLAS now beats a hand-written 4x4; 25.1 GFLOP/s |
+| a better direct-conv tile (2x32, 4x8) | both lose at every thread count |
+| MLAS-style weight packing | the packing is not the lever; the gather was, and it is gone |
+| phase-major for the low-channel shapes | 0.48-0.92x; shipped only for `kw>=7, dil>=3, IC*kw>=768` |
+| vectorising the im2col gather | ~10% of it, twice measured; the cost is the write amplification |
+| `kw` shifted mul_mats to dodge im2col | 0.43-0.98x (P4.14), and the direct kernel supersedes it |
+
+#### Cold start: everything needed to pick this up
+
+**Machines.** `ssh pi@rpi4` — Raspberry Pi 4B, Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2, 32 KB
+L1D, gcc 14.2 and clang 19, **quiet and repeatable to ~1%**; this is where end-to-end numbers are made.
+The dev box is x86-64 (Ryzen 3 3250U, AVX2, 2 cores, 4 MB L3) and is **thermally noisy** — pin with
+`taskset -c 0,2` and take medians of seven, or it will lie to you by 15%.
+
+**The model and the utterance**, used by every number in P4.14/P4.15:
+`loom-ai-org/vits-piper-en-gb-miro-loom`, phonemes
+`hˈeɪ, kæn juː ʃˈʌtdaʊn ðə kəmpjˈuːtɐ, maɪ fɹˈɛnd?` -> 100 ids -> y_length 287 -> 73472 samples. On the
+Pi: `~/.cache/huggingface/hub/models--loom-ai-org--vits-piper-en-gb-miro-loom/snapshots/*/*.gguf` (two
+snapshots exist — take `ls -t | head -1`). On the dev box: `../hf-models/vits-piper-en-gb-miro/`.
+
+**Baselines to reproduce before trusting anything.** Pi, 4 threads, idle, steady state: **1.44 s**
+(onnxruntime does the same utterance in **1.024 s**, so the ratio is 1.41x). x86, two threads pinned:
+**~1.19 s**. If your first number is far off, fix the measurement, not the code.
+
+**Scratch trees on the Pi** (all disposable, none of them a git repo):
+* `~/loom-p415/loom.cpp` — a full checkout with `prof_main` appended to its CMakeLists; this is what
+  produces the end-to-end numbers. Rebuild with `cmake -B build -DCMAKE_BUILD_TYPE=Release` (**Release
+  matters: the repo default is RelWithDebInfo and that is 1.39x slower**).
+* `~/ggml-bench` — standalone benches with a stale ggml checkout of its own; `bench10` links against
+  `~/loom-p415/loom.cpp/build/_deps/ggml-build/src`, so `LD_LIBRARY_PATH` must point there.
+* `prof_main <gguf> <phonemes> <reps>` prints per-rep wall time; `LOOM_THREADS` sets threads;
+  `LOOM_PROFILE=1` or `=<path>` gives the per-node profile.
+
+**Commands.**
+
+```sh
+cmake -B build && cmake --build build -j"$(nproc)"     # applies cmake/patches/ automatically
+ctest --test-dir build -L ci                            # 68 tests, hermetic
+LOOM_FIXTURES=~/Dev/loom-engine-artifacts/v5 ctest --test-dir build -L gate    # 82, real models
+cmake -B build -DCMAKE_CXX_FLAGS=-DLOOM_CONV1D_DIRECT=0 # the OTHER conv lowering; both must pass
+cmake -B build -DLOOM_TINYBLAS=OFF                      # no tinyBLAS, for GEMM A/Bs
+GGML_CPU_DISABLE_FUSION=1 <binary>                      # turns every CPU-backend fusion off
+```
+
+**The six ggml patches** live in `cmake/patches/` and are applied at configure time by
+`cmake/GgmlPatches.cmake`, which resets and retries if one no longer applies — so **editing a patch and
+re-running cmake just works**, and `git -C build/_deps/ggml-src checkout -- .` is the manual reset.
+`cmake/patches/UPSTREAM.md` is the PR write-up for all six. To develop a seventh, edit
+`build/_deps/ggml-src/...` directly, then regenerate the diff against a tree with the earlier patches
+applied but not yours (the recipe is in this entry's git history: move your patch aside, reset,
+configure, diff).
+
+**Five traps, each of which produced a wrong answer that survived a write-up:**
+
+1. **The profiler cannot see fusion.** `$LOOM_PROFILE` submits one node per graph, and a one-node graph
+   has nothing to fuse with, so a profiled run is always the unfused one. Measure fusion with
+   `GGML_CPU_DISABLE_FUSION=1` against the same binary, never by profiling.
+2. **A node's isolated profile time is an upper bound on its marginal cost, sometimes a loose one.**
+   The bias ADDs profiled at 0.20 s and removing them saved 0.03 s.
+3. **A graph allocator will hand an op the buffer its own input just vacated.** Safe in the unfused
+   order, corruption when fused — it cost a 0.54 max-abs-diff on two gate models. Any new fusion must
+   check `ggml_cpu_tensors_overlap` against every tensor it reads while writing.
+4. **An artefact big enough to hide the comparison is worth fixing before reading the comparison** —
+   twice here, a scalar tail and scalar edge blocks, and both times the fix was worth more than the
+   thing being compared.
+5. **The shapes a bench holds are not the shapes a model runs.** A heuristic tuned on eleven shapes made
+   the synthesis *slower* until it was checked against all 153 convolutions the model actually issues;
+   and a bench without the model's dilations measures a convolution the model does not have.
 
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
 
