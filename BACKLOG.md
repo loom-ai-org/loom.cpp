@@ -7439,17 +7439,24 @@ each build's own un-profiled wall clock (profiling costs ~6%, and with prof_main
 threadpool the per-node floor is 0.001 ms rather than P4.14's 1.4 ms -- create/join per node was that
 number, not dispatch).
 
-| | before (2.33 s) | 0001+0002 (1.94 s) | +0003 (1.79 s) | **+0004 (1.62 s)** | onnxruntime (1.02 s) | delta | share of gap |
-|---|---|---|---|---|---|---|---|
-| convolution: `MUL_MAT` | 1.30 s | 0.90 s | 0.78 s | — | — | | |
-| convolution: `IM2COL` | 0.53 s | 0.53 s | 0.51 s | — | — | | |
-| convolution: `CONV_2D` | — | — | — | 1.06 s | — | | |
-| **convolution, total** | **1.81 s** | **1.43 s** | **1.27 s** | **1.07 s** | 0.605 s (`Conv`+`FusedConv`) | 0.47 s | **79%** |
-| transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.19 s | 0.162 s (`ConvTranspose`) | 0.03 s | 4% |
-| everything else | 0.34 s | 0.33 s | 0.33 s | 0.36 s | 0.257 s | 0.10 s | 17% |
+| | before (2.33 s) | 0001+0002 (1.94 s) | +0003 (1.79 s) | +0004 (1.62 s) | **+0005 (1.58 s)** | onnxruntime (1.02 s) | delta | share of gap |
+|---|---|---|---|---|---|---|---|---|
+| convolution: `MUL_MAT` | 1.30 s | 0.90 s | 0.78 s | — | — | — | | |
+| convolution: `IM2COL` | 0.53 s | 0.53 s | 0.51 s | — | — | — | | |
+| convolution: `CONV_2D` (+ bias from 0005) | — | — | — | 1.06 s | **1.10 s** | — | | |
+| **convolution, total** | **1.81 s** | **1.43 s** | **1.27 s** | **1.07 s** | **1.10 s** | 0.605 s (`Conv`+`FusedConv`) | 0.50 s | **84%** |
+| transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.19 s | 0.19 s | 0.162 s (`ConvTranspose`) | 0.03 s | 5% |
+| everything else | 0.34 s | 0.33 s | 0.33 s | 0.36 s | 0.29 s | 0.257 s | 0.03 s | 6% |
 
-**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x, and the gap itself 1.31 -> 0.92 -> 0.76 ->
-0.59 s: 55% of it closed.** The last column is one op now, because the convolutions no longer lower to
+**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x -> 1.54x, and the gap itself 1.31 -> 0.92 ->
+0.76 -> 0.59 -> 0.55 s: 58% of it closed.**
+
+**The 0005 column's split is arithmetic, not measurement, and this is the one place in this entry where
+that is true.** Its total (1.576 s) is measured, against 1.605 s for the identical build with
+`GGML_CPU_DISABLE_FUSION=1`. The rows are the +0004 profile with the bias ADD moved out of "everything
+else" and into the convolution, less the 0.03 s the fusion actually saves -- because `$LOOM_PROFILE`
+CANNOT observe a fused run: it submits one node per graph, and a one-node graph has nothing to fuse
+with. If a future item needs the fused split for real, that is the thing to fix first. The last column is one op now, because the convolutions no longer lower to
 im2col + mul_mat on this architecture -- see the im2col section below.
 Only `MUL_MAT` moved (1.375 -> 0.990 s of profiled node time, 1.39x); `IM2COL`, `CONV_TRANSPOSE_1D`
 and everything else are unchanged to within a millisecond, which is the check that the patches did what
@@ -7475,6 +7482,52 @@ puts it at ~1.04 s, against the 1.024 s the per-op shares above were apportioned
 * **Transposed conv is at parity** (0.18 vs 0.162 s) and worth 2%. The mul_mat + reshape lowering from
   P4.14's follow-up list is ~60-90 ms, i.e. still real but no longer near the top.
 
+
+#### Fusing the bias into the convolution — and what a per-node profile does NOT tell you
+
+The table above put `ADD` at 0.20 s, 12% of the synthesis, against an onnxruntime that folds bias and
+activation into `FusedConv`. `cmake/patches/ggml-0005-conv2d-bias-fusion.patch` does the same thing:
+ggml's CPU backend already has a graph-level fusion hook (`ggml_cpu_try_fuse_ops`, used for one pattern,
+RMS_NORM + MUL), and this adds `CONV_2D` + per-channel `ADD` to it, adding the bias to each batch of the
+result while that batch is still in cache. **The graph is unchanged** -- fusion is a decision the CPU
+backend makes at compute time -- so no other backend, and nothing in the exporter, has to know.
+
+**It is worth 1.8%, not 12%, and the difference is the point.** Measured against the same build with
+`GGML_CPU_DISABLE_FUSION=1`: **1.605 s -> 1.576 s**. P4.14's profiler runs each node alone, and an
+elementwise pass costs less as part of a graph than it does in isolation -- the fused kernel still has
+to write the output, so what actually disappears is the ADD's read pass, not the whole node. Nothing
+in the profiler is wrong; what is wrong is reading a node's isolated time as the time that would be
+saved by removing it. **An op's profile time is an upper bound on its marginal cost, sometimes a very
+loose one.** (The profiler also cannot observe fusion at all: it submits one node per graph, and a
+one-node graph has nothing to fuse with -- so a profiled run is always the unfused one.)
+
+**Two things had to be true before it worked at all, and the first one was found by the gates.**
+
+* **The destination is usually the convolution's own input.** A graph allocator hands the ADD a block
+  the input has just been freed from -- in the unfused order nothing reads that input by the time the
+  ADD runs -- and in this vocoder it does that to EVERY large convolution. Writing the result there
+  progressively, while later batches still need the input, corrupts it in a way that still sounds like
+  speech: **max_abs_diff 0.54** on the Matcha and Kokoro lua-driver gates, which is what caught it. The
+  kernel now stages each batch and lands it only after the NEXT batch's im2col has read what it would
+  overwrite; batch k reads input from `s_k - pad` upwards, batch k-1's output covers `[s_{k-1}, s_k)`,
+  and nothing at or after k ever reads below `s_k - pad`. Where a batch is shorter than the kernel's
+  reach the fusion keeps the convolution's own destination and pays for one extra pass instead.
+* **The staging buffer has to be channel-major.** Staged the way the existing permute path wants it --
+  one row per patch -- landing it reads with a stride of `c_out`, and that gather costs more than the
+  entire ADD being removed: **1.70 s, slower than not fusing at all.** Written `[c_out, patch_n]`
+  instead, via the `ldc` mul_mat from patch 0004, each channel lands as a contiguous copy out of cache
+  and the same code is 1.576 s. Two lines apart, 0.13 s of difference.
+
+An earlier version simply declined whenever the destination overlapped the input. It was correct, and
+it fired on nothing that mattered: **0.3%**.
+
+**Pinned by `tests/ci/test_conv_bias_fusion.cpp`**, which asserts the numbers against a double
+reference, asserts the two paths agree **bit for bit** (the registrations hand each other their output
+through `LOOM_TEST_TMPDIR`), and asserts *that the fusion happened* -- by poisoning the convolution's
+own result tensor, which a fused run never writes. It covers the aliased destination explicitly, and
+was verified red for each: the detector forced to decline, and the aliasing guard removed (which is the
+Matcha bug, reproduced hermetically at 1.3e-1). The whole VITS synthesis is byte-identical fused and
+unfused on the Pi.
 
 #### The im2col item, re-opened and repaired (P4.14's `ggml_conv_2d_direct`, closed at 0.98x)
 

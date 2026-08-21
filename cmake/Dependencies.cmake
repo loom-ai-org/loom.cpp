@@ -50,7 +50,9 @@ set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
 # generic kernel over one or two leftovers). The fourth is ggml's fused convolution, which batched its
 # im2col 16 MB at a time -- larger than any cache, so the patches it exists to keep local went to DRAM
 # anyway -- and scattered its GEMM output one element at a time. See cmake/GgmlPatches.cmake for why a
-# patch here rather than a fork, a vendored copy, or a change in this engine. Populated up front so that both branches below -- and any
+# patch here rather than a fork, a vendored copy, or a change in this engine. The fifth teaches the CPU
+# backend to fuse a convolution with the bias add that follows it, which is a graph-level decision made
+# at compute time and therefore invisible to every other backend. Populated up front so that both branches below -- and any
 # future one -- compile the patched sources, and re-checked on every configure so that an existing
 # build tree cannot end up silently unpatched.
 include(${CMAKE_CURRENT_LIST_DIR}/GgmlPatches.cmake)
