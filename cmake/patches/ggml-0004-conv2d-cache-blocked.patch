@@ -1,0 +1,106 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6862,6 +6862,56 @@
+     ggml_compute_forward_mul_mat(params, &dst);
+ }
+ 
++// As above, but C is [m, n] with an arbitrary row stride, so a caller can hand the GEMM a VIEW of a
++// larger output and have it write its result in place. NOTE the operands are the other way round:
++// the fast-varying axis of a mul_mat's result is src0's row index, so the patches go in src0 -- which
++// is what makes the output [patch, c_out] with a c_out stride of ldc, i.e. exactly the [OW, OH, OC]
++// layout a convolution's dst already has. See ggml_compute_forward_conv_2d_impl below.
++static void ggml_call_mul_mat_ldc(ggml_type type, const ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
++                                  void * a, void * b, float * c, int64_t ldc) {
++    const ggml_type_traits * traits = ggml_get_type_traits(type);
++
++    struct ggml_tensor src0 = {};
++    src0.type  = type;
++    src0.ne[0] = k;
++    src0.ne[1] = m;
++    src0.ne[2] = 1;
++    src0.ne[3] = 1;
++    src0.nb[0] = traits->type_size;
++    src0.nb[1] = k * traits->type_size;
++    src0.nb[2] = src0.nb[1];
++    src0.nb[3] = src0.nb[2];
++    src0.data  = a;
++
++    struct ggml_tensor src1 = {};
++    src1.type  = type;
++    src1.ne[0] = k;
++    src1.ne[1] = n;
++    src1.ne[2] = 1;
++    src1.ne[3] = 1;
++    src1.nb[0] = traits->type_size;
++    src1.nb[1] = k * traits->type_size;
++    src1.nb[2] = src1.nb[1];
++    src1.nb[3] = src1.nb[2];
++    src1.data  = b;
++
++    struct ggml_tensor dst = {};
++    dst.ne[0] = m;
++    dst.ne[1] = n;
++    dst.ne[2] = 1;
++    dst.ne[3] = 1;
++    dst.nb[0] = sizeof(float);
++    dst.nb[1] = ldc * sizeof(float);
++    dst.nb[2] = dst.nb[1];
++    dst.nb[3] = dst.nb[2];
++    dst.data  = c;
++
++    dst.src[0] = &src0;
++    dst.src[1] = &src1;
++
++    ggml_compute_forward_mul_mat(params, &dst);
++}
++
+ static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
+     return (coord  + size) % size; // adding size avoids negative number weirdness
+ }
+@@ -6979,7 +7029,25 @@
+     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
+ 
+     const int64_t space_per_patch   = knl_n * traits->type_size + c_out * sizeof(float);
+-    const int64_t batch_size        = params->wsize / space_per_patch;
++
++    // WHY THE BATCH IS CAPPED WELL BELOW THE WORK BUFFER. The whole point of doing im2col a batch at a
++    // time is that the patches are written and then immediately read by the GEMM, so they never need
++    // to reach DRAM -- but that only holds if a batch FITS IN CACHE. At the stock 16 MB the batch is
++    // larger than most last-level caches, the patches are written out and read back exactly as a
++    // full im2col matrix would be, and this op is then a slower way to do the same thing. Measured on
++    // a Cortex-A72 (1 MB L2) over a VITS vocoder's eleven convolution shapes, against ggml's
++    // im2col + mul_mat: 16 MB is 0.97x -- i.e. this op loses -- 2 MB is 1.03x, 1 MB 1.12x, **512 KB
++    // 1.16x**, 256 KB 1.07x. Half the L2 is the peak because the kernel panel and the output slice
++    // have to live there too.
++    //
++    // The second clause is for convolutions small enough that the whole thing already fits: splitting
++    // those only costs barriers and shrinks the GEMM. Without it, the two shortest shapes measured
++    // 0.98x and 0.92x; with it they are 0.98x and 1.02x, and the weighted total goes 1.16x -> 1.18x.
++    const int64_t patch_budget      = 512 * 1024;
++    const int64_t wbudget           = (patch_total * space_per_patch > 3 * patch_budget)
++                                        ? MIN(params->wsize, patch_budget)
++                                        : params->wsize;
++    const int64_t batch_size        = wbudget / space_per_patch;
+     const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
+     const int64_t batch_n           = (patch_total + patches_per_batch - 1) / patches_per_batch;
+ 
+@@ -7035,6 +7103,19 @@
+         }   // patches handled by this thread
+ 
+         ggml_barrier(params->threadpool);
++
++        // The GEMM can write straight into dst when dst is contiguous and there is one image in the
++        // batch: `C[ldc*oc + p]` with `ldc = dst_w*dst_h` IS the [OW, OH, OC] layout, so the scratch
++        // buffer and the element-at-a-time scatter below are both unnecessary. That scatter is not
++        // free -- it is one strided store per output element, 2.35 M of them for a single vocoder
++        // conv -- and skipping it is most of what makes this op worth using at all: with the cache
++        // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
++        if (dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
++            ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
++                                  dst_data + patch_start_batch, dst_w * dst_h);
++            ggml_barrier(params->threadpool);
++            continue;
++        }
+ 
+         float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
+ 

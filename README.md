@@ -106,8 +106,9 @@ cmake --build build -j"$(nproc)"
 
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
 and run the hermetic suite. The fetched `ggml` is patched at configure time from `cmake/patches/` —
-two diffs at present, both fixing GCC code generation in ggml's ARM F32 GEMM, together worth 1.6x on
-it; see `cmake/GgmlPatches.cmake` for the rules such a patch has to meet.
+four diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
+declined to accept at all, and a fused convolution that batched its work too coarsely to stay in
+cache; see `cmake/GgmlPatches.cmake` for the rules such a patch has to meet.
 
 There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
 (`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,

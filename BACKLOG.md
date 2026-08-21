@@ -7439,16 +7439,18 @@ each build's own un-profiled wall clock (profiling costs ~6%, and with prof_main
 threadpool the per-node floor is 0.001 ms rather than P4.14's 1.4 ms -- create/join per node was that
 number, not dispatch).
 
-| | before (2.33 s) | 0001+0002 (1.94 s) | **+0003 (1.79 s)** | onnxruntime (1.02 s) | remaining delta | share of remaining gap |
-|---|---|---|---|---|---|---|
-| convolution: `MUL_MAT` | 1.30 s | 0.90 s | **0.78 s** | — | | |
-| convolution: `IM2COL` | 0.53 s | 0.53 s | 0.51 s | — | | |
-| **convolution, total** | **1.81 s** | **1.43 s** | **1.27 s** | 0.605 s (`Conv`+`FusedConv`) | 0.67 s | **88%** |
-| transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.162 s (`ConvTranspose`) | 0.02 s | 3% |
-| everything else | 0.34 s | 0.33 s | 0.33 s | 0.257 s | 0.07 s | 9% |
+| | before (2.33 s) | 0001+0002 (1.94 s) | +0003 (1.79 s) | **+0004 (1.62 s)** | onnxruntime (1.02 s) | delta | share of gap |
+|---|---|---|---|---|---|---|---|
+| convolution: `MUL_MAT` | 1.30 s | 0.90 s | 0.78 s | — | — | | |
+| convolution: `IM2COL` | 0.53 s | 0.53 s | 0.51 s | — | — | | |
+| convolution: `CONV_2D` | — | — | — | 1.06 s | — | | |
+| **convolution, total** | **1.81 s** | **1.43 s** | **1.27 s** | **1.07 s** | 0.605 s (`Conv`+`FusedConv`) | 0.47 s | **79%** |
+| transposed conv | 0.18 s | 0.18 s | 0.18 s | 0.19 s | 0.162 s (`ConvTranspose`) | 0.03 s | 4% |
+| everything else | 0.34 s | 0.33 s | 0.33 s | 0.36 s | 0.257 s | 0.10 s | 17% |
 
-**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x, and the gap itself 1.31 -> 0.92 -> 0.76 s: 42% of
-it closed.**
+**loom-vs-onnxruntime is 2.28x -> 1.86x -> 1.75x -> 1.58x, and the gap itself 1.31 -> 0.92 -> 0.76 ->
+0.59 s: 55% of it closed.** The last column is one op now, because the convolutions no longer lower to
+im2col + mul_mat on this architecture -- see the im2col section below.
 Only `MUL_MAT` moved (1.375 -> 0.990 s of profiled node time, 1.39x); `IM2COL`, `CONV_TRANSPOSE_1D`
 and everything else are unchanged to within a millisecond, which is the check that the patches did what
 they claim and nothing else. onnxruntime re-measured the same day at 1.01-1.08 s raw -- its duration
@@ -7466,14 +7468,66 @@ puts it at ~1.04 s, against the 1.024 s the per-op shares above were apportioned
   **324 -> 190 ms**, all four m = 287 buckets **354 -> 208 ms**, and the synthesis **1.94 -> 1.79 s**.
   It cannot regress anything: the tail rows get exactly the kernel they had, and every other shape is
   unaffected. Architecture-neutral, so x86 gets it too.
-* **`IM2COL` is now 40% of loom's convolution** (0.51 s of 1.27 s) where onnxruntime has no equivalent
-  line at all -- MLAS packs inside `Conv`. P4.14 measured `ggml_conv_2d_direct` (which does its own
-  im2col into a small per-batch buffer) at 0.98x and CLOSED it; that verdict was reached when the GEMM
-  was 1.7x slower and im2col was proportionally a smaller share, so it is the one closed item worth
-  re-opening -- with the same rule as before, that a component may not exceed its own total.
+* **`IM2COL` was 40% of loom's convolution** (0.51 s of 1.27 s) where onnxruntime has no equivalent
+  line at all -- MLAS packs inside `Conv`. P4.14 measured `ggml_conv_2d_direct` at 0.98x and CLOSED it;
+  that verdict was reached when the GEMM was 1.7x slower and im2col was proportionally a smaller
+  share. **Re-opened and repaired** -- see the section above: convolution 1.27 -> 1.07 s.
 * **Transposed conv is at parity** (0.18 vs 0.162 s) and worth 2%. The mul_mat + reshape lowering from
   P4.14's follow-up list is ~60-90 ms, i.e. still real but no longer near the top.
 
+
+#### The im2col item, re-opened and repaired (P4.14's `ggml_conv_2d_direct`, closed at 0.98x)
+
+P4.14 measured ggml's own fused convolution against loom's im2col + mul_mat lowering, got **0.98x**,
+and closed it: "nothing, marginally worse -- do not re-propose". That verdict was right for the engine
+it was measured on and wrong for this one. With the GEMM 1.7x faster, `IM2COL` had gone from a modest
+slice to **40% of all convolution time**, and re-running the same comparison (`scripts/bench9.cpp`)
+reproduced 0.97x — so the op really was no better, and the question became WHY, given that not
+materialising a 66 MB patch matrix ought to be worth something.
+
+**Two answers, both in ggml's implementation rather than in the idea.**
+
+1. **Its batch was 16 MB, so the patches never stayed in cache.** The whole point of doing im2col a
+   batch at a time is that each batch is written and immediately consumed by the GEMM without reaching
+   DRAM -- which requires the batch to FIT IN CACHE. `GGML_IM2COL_WORK_SIZE` is 16 MB, larger than most
+   last-level caches and 16x the Pi's L2, so the op wrote the patches out and read them back exactly as
+   a full im2col does, for no saving and with extra structure. Sweeping the budget on the A72: 16 MB
+   **0.97x**, 2 MB 1.03x, 1 MB 1.12x, **512 KB 1.16x**, 256 KB 1.07x.
+2. **It scattered its GEMM output one element at a time.** The GEMM wrote to scratch and a permute loop
+   then copied it into place with a strided scalar store per output element -- 2.35 M of them for one
+   vocaler conv. That pass is unnecessary: a mul_mat writes `C[ldc*col + row]`, which with
+   `ldc = OW*OH` and the patches in `src0` **is** the [OW, OH, OC] layout the destination already has,
+   so the GEMM can write straight into it. Worth the difference between 1.08x and **1.18x**.
+
+Both are `cmake/patches/ggml-0004-conv2d-cache-blocked.patch`, along with a rule not to split a
+convolution whose whole patch matrix already fits the budget (without it the two shortest shapes
+measured 0.98x and 0.92x; with it, 0.98x and 1.02x). loom then lowers `CONV_1D` to `GGML_OP_CONV_2D`
+with KH = 1 (`src/ops/primitives_conv.cpp`), which is the "few lines in primitives_conv.cpp" P4.14
+predicted -- it just needed the op underneath to be worth calling.
+
+**On aarch64 only, and that is measured, not cautious.** The same bench on an AVX2 Ryzen 3 3250U says
+**0.87x** — best case 0.91x at a 2 MB budget — so on x86-64 the patch matrix is worth materialising.
+That machine does in 0.555 s what the Pi takes 1.37 s to do; cache-blocking buys a bandwidth-rich core
+much less, and the batching costs it its one big GEMM. A hypothesis that the difference was the
+parallel axis (`conv_2d` splits patches, ggml's standalone `IM2COL` splits channels, so each thread
+juggles IC read streams) was tested by switching `conv_2d` to the channel split: **worse**, 0.70x. The
+`#if` in `primitives_conv.cpp` is therefore a measurement on two machines, and neither of them is a
+many-core x86 server -- which is the configuration to re-run `bench9` on before generalising it.
+
+**Testability, because an `#if defined(__aarch64__)` otherwise means the path is never covered by the
+gates.** The macro is `LOOM_CONV1D_DIRECT`, defaulting to the architecture but overridable:
+`-DLOOM_CONV1D_DIRECT=1` builds the direct lowering anywhere. The whole suite was run that way on
+x86 -- **ci 66/66, gate 82/82**, including every conv-bearing gate (kokoro, styletts2, matcha, the
+NeMo encoders), none of which exists on a Raspberry Pi.
+
+**The two lowerings agree bit for bit**, on every one of bench9's eleven shapes and on the whole VITS
+synthesis: the engine built `-DLOOM_CONV1D_DIRECT=0` and `=1` on the Pi produces byte-identical audio
+(`cmp`, 293888 bytes). That is expected rather than lucky -- the batching splits the patch axis and
+never the reduction, so every output element is the same sum in the same order -- but it is the
+difference between a refactor and a rewrite, and it is worth checking rather than assuming.
+
+**What it bought:** convolution 1.27 -> 1.07 s, synthesis **1.79 -> 1.62 s**, and 153 `CONV_2D` nodes
+in place of 165 `IM2COL` + 213 `MUL_MAT`.
 
 #### Why the tile patch stopped at 92% of a hand-written kernel — and the second patch that answers it
 
@@ -7654,12 +7708,15 @@ Check all three before believing a number.**
 | `ggml_conv_2d_direct` (ggml's MLAS-shaped fused conv) | **nothing** — 0.98x, despite bit-identical output |
 | im2col materialisation is the gap | **no** — removing it (row above) changes nothing |
 
-**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.54 s off 2.33 s, leaving
-a 0.76 s gap to onnxruntime that the table at the top of this entry attributes: re-testing
-`ggml_conv_2d_direct` now that `IM2COL` is 40% of the conv stack rather than a smaller slice (it was
-closed at 0.98x under the old balance), then `CONV_TRANSPOSE_1D` as mul_mat + reshape (~60-90 ms),
-then fusing conv+bias+activation. P4.13 (quantized conv kernels) **conflicts** with any direct-conv
-work — decide between them rather than starting both.
+**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.71 s off 2.33 s, leaving
+a 0.59 s gap that the table at the top of this entry attributes. Convolution is still 79% of it and
+still 1.8x onnxruntime's, but the shape of what is left has changed: **fusing conv+bias+activation**
+is now the biggest single item (`ADD` alone is 0.20 s, 12% of the synthesis, against an onnxruntime
+that folds it into `FusedConv`), then `CONV_TRANSPOSE_1D` as mul_mat + reshape (~60-90 ms), then
+whatever remains inside `CONV_2D` itself — its GEMM is fast now, so the next question there is MLAS's
+packing. P4.13 (quantized conv kernels) **conflicts** with the direct-conv lowering — `CONV_2D` takes
+an F32/F16 kernel and a quantized one falls back to the im2col path, so decide between them rather
+than starting both.
 
 **This is what the item told its own future reader to do first, and it was the right instruction:**
 re-read `scripts/bench6.cpp`'s header, then ggml's `src/ggml-cpu/vec.cpp:ggml_vec_dot_f32` and
