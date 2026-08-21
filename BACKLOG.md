@@ -7529,6 +7529,43 @@ grouped differently. Against a `-DLOOM_TINYBLAS=OFF` build the whole synthesis d
 **3.5e-6** on a 0.17 peak, rel-RMS 6.5e-6, cosine 0.99999999998 -- the same order as every other change
 in this entry, and every gate passes on both lowerings.
 
+#### Tap-major (phase-major) traversal for the dilated shapes: the kernel wins, the transform eats it
+
+The direct kernel gets 1.2-1.4x on the model's dilated convolutions where it gets 1.6x at dilation 1,
+and the reason is prefetching: at dilation 12 with kw 7, one channel's taps are **seven separate
+64-byte runs spread over 352 bytes**, so a 64-channel convolution asks the prefetcher to track 448
+streams. A convolution with dilation d is d independent DENSE convolutions, one over each subsequence
+`p = j*d + r`; laid out that way each channel reads **one contiguous 88-byte run**, exactly as an
+undilated convolution does. `scripts/bench10.cpp` has that variant.
+
+**The theory is right about the kernel.** On rows where the phase length is a whole number of blocks
+(so no scalar tail distorts it), phase-major against the shipped direct kernel:
+
+| shape | direct | phase-major kernel | |
+|---|---|---|---|
+| 128x128 kw7 L2296 **d12** | 38.5 ms | **24.1 ms** | **1.60x** |
+| 32x32 kw5 L73472 d2 | 30.6 ms | 28.0 ms | 1.10x |
+| 64x64 kw3 L18368 d2 | 20.5 ms | 19.1 ms | 1.07x |
+
+The gain tracks the dilation, which is what the stream-count explanation predicts: the worst-prefetched
+shape gains the most.
+
+**And the transform eats it, except where the arithmetic is dense enough to hide it.** Getting into and
+out of phase-major is a strided gather over the input and a strided scatter over the output -- for
+L=73472 that is **22-54 ms** against a kernel of 28-41 ms, i.e. it doubles the cost; for L=2296 it is
+**2 ms** against a kernel of 24, and there the whole thing wins. The ratio is transform (O(elements))
+over arithmetic (O(elements x IC x KW)), so it pays exactly when `IC * KW` is large -- high-channel,
+wide-kernel, heavily dilated. In this model that describes six of eighteen convolutions, and they are
+the cheapest six: perhaps 10-20 ms.
+
+**Not shipped**, on that arithmetic. What would change it is vectorising the transform: NEON's
+`vld3q_f32` / `vst3q_f32` de-interleave and interleave in exactly the pattern a dilation of 3 needs
+(and `vld2q`/`vld4q` for 2 and 4, composable for the model's 6 and 12), which should take the strided
+copy from ~0.5 GB/s to near memcpy speed and turn the 22-54 ms into 6-14. That flips the large shapes
+and is the thing to try if this is picked up -- along with a vectorised tail, since the scalar
+remainder in the phase kernel is visible in the bench wherever the phase length is not a multiple of
+the block.
+
 #### The direct convolution, prototyped: right in one regime, four times wrong in the other (SHIPPED, above)
 
 With the GEMM finished, the im2col that feeds it is the largest single item left -- **396 ms of the
@@ -7871,8 +7908,10 @@ that feeds it is 37% of the time:
 1. ~~A direct convolution behind a shape heuristic~~ — **DONE, `ggml-0006`**, 1.05x on the Pi and
    1.29x on x86; see the section above for why those two numbers are so far apart and why the bench
    promised more than either. What is left inside the convolution is the dilated shapes, where the
-   direct kernel gets 1.2-1.4x rather than the 1.6x it manages at dilation 1 -- a tap-major traversal
-   that reads each dilated stream contiguously is the obvious next idea, and is unmeasured.
+   direct kernel gets 1.2-1.4x rather than the 1.6x it manages at dilation 1. The tap-major traversal
+   that would fix it **is now measured** (section above): the kernel gains up to 1.60x, the layout
+   transform costs more than that on all but the high-channel shapes, and vectorising the transform
+   with `vld3`/`vst3` is the open question.
 2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
    and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
