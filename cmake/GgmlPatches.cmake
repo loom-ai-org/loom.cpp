@@ -7,6 +7,10 @@
 # thing it fixes is 71% of the loom-vs-onnxruntime gap on a Raspberry Pi (BACKLOG.md P4.14/P4.15), so
 # each patch here is carried locally until the pin can be bumped past its upstream equivalent.
 #
+# Each of them is also written up as an upstream pull request in `cmake/patches/UPSTREAM.md` -- what
+# the problem is, what it measures, what a reviewer will ask. Keeping that file current is part of
+# adding a patch here, because a patch nobody can submit is a patch this repo carries forever.
+#
 # The contract for anything added to `cmake/patches/`:
 #   * it is a diff against the EXACT pin, so bumping `LOOM_GGML_TAG` makes it fail loudly at configure
 #     time rather than silently no-op -- see the FATAL_ERROR below, which is the whole point;
