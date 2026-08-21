@@ -7483,6 +7483,62 @@ puts it at ~1.04 s, against the 1.024 s the per-op shares above were apportioned
   P4.14's follow-up list is ~60-90 ms, i.e. still real but no longer near the top.
 
 
+#### The direct convolution, prototyped: right in one regime, four times wrong in the other
+
+With the GEMM finished, the im2col that feeds it is the largest single item left -- **396 ms of the
+1070 ms** this model spends in convolution, phase-timed inside ggml's own op (GEMM 663 ms, gather 396,
+staging 11). The obvious next move is the one MLAS makes: don't materialise anything. Hold a tile of
+the OUTPUT in registers, sweep the input in place, one lane-broadcast weight per (channel, tap).
+`scripts/bench10.cpp` is that kernel, at the same eleven shapes.
+
+**First, what the gather is NOT.** Its inner copy is a scalar element-at-a-time loop with a bounds test
+per element; making it branch-free and width-specialised (so the copy inlines instead of calling
+`memcpy` ~20 M times a synthesis) is worth **~10%, measured twice**. The cost is not the loop, it is
+the 137 M element-writes im2col performs because it writes every input element `kw` times.
+
+**The result, best tile (4 output channels x 16 positions), padded copy included:**
+
+| shape | ggml conv | direct | |
+|---|---|---|---|
+| 32x32 kw7 L73472 | 59.3 ms | **37.7 ms** | **1.57x** |
+| 32x32 kw5 L73472 | 46.6 ms | 30.9 ms | 1.51x |
+| 64x64 kw7 L18368 | 56.3 ms | 41.0 ms | 1.37x |
+| 128x128 kw7 L2296 | 27.5 ms | 24.7 ms | 1.11x |
+| 192x384 kw5 L287 | 10.3 ms | 40.8 ms | **0.25x** |
+| 768x768 kw3 L100 | 24.8 ms | 167 ms | **0.15x** |
+
+**Weighted by call count: 0.37x overall.** Take the faster of the two per shape and it is **1.15x**,
+worth ~174 ms of this model's convolution time, ~11% of the synthesis.
+
+**The split is not about the kernel and not close.** A direct convolution re-reads the WEIGHTS once per
+position block; a GEMM blocks both operands. When the weights are 1.5 MB and the activation is 287
+positions, re-reading them seventeen times is the entire cost and no register tuning touches it. When
+the activation is 73472 long and the weights are 28 KB, the direct form wins by not materialising 66 MB
+nobody needed. That is why MLAS is a library of kernels behind a heuristic rather than one kernel.
+
+**Two things that looked like the answer and were not, each worth about 3x on its own** -- both are the
+kind of mistake that would have made this look like a dead end:
+
+* **The loop nesting.** With the position block INSIDE the output-channel loop -- the obvious way to
+  write it -- every channel block re-streams the whole input from DRAM, 8 passes over 9.4 MB for the
+  first shape. The tell was that the kernel measured the same time whatever `kw` was: it was not doing
+  arithmetic, it was waiting for memory. Position block outermost: **0.12x -> 0.36x**.
+* **The edges.** Testing "is this block interior" and sending whole blocks to a scalar path costs a
+  third of a short convolution. One zero-padded copy of the input makes every block interior, and that
+  copy is one pass against im2col's `kw`.
+
+**What it would take to ship, and why it is not done here.** A hybrid: direct kernel when the weights
+are small against cache and the activation is long, GEMM otherwise, with weight packing done once
+(24 ms for this model, or moved to the exporter). That is a new kernel in ggml -- the thing this whole
+item avoided writing -- plus a shape heuristic, plus an x86 counterpart, for ~11%. It is the right next
+move for this thread, it is a bigger piece of work than any of the five patches, and the prototype
+above is what a decision about it should be made from rather than from the idea.
+
+**Not the same thing as P4.14's closed item.** That one ("lower CONV_1D as `kw` shifted mul_mats",
+0.43-0.98x) kept `mul_mat` and re-materialised the activation per tap through `cont(transpose(view))`.
+This writes the accumulation loop directly and materialises nothing. The closed verdict does not
+transfer -- and neither does it vouch for this one, which is why it was measured.
+
 #### Fusing the bias into the convolution — and what a per-node profile does NOT tell you
 
 The table above put `ADD` at 0.20 s, 12% of the synthesis, against an onnxruntime that folds bias and
@@ -7761,15 +7817,23 @@ Check all three before believing a number.**
 | `ggml_conv_2d_direct` (ggml's MLAS-shaped fused conv) | **nothing** — 0.98x, despite bit-identical output |
 | im2col materialisation is the gap | **no** — removing it (row above) changes nothing |
 
-**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.71 s off 2.33 s, leaving
-a 0.59 s gap that the table at the top of this entry attributes. Convolution is still 79% of it and
-still 1.8x onnxruntime's, but the shape of what is left has changed: **fusing conv+bias+activation**
-is now the biggest single item (`ADD` alone is 0.20 s, 12% of the synthesis, against an onnxruntime
-that folds it into `FusedConv`), then `CONV_TRANSPOSE_1D` as mul_mat + reshape (~60-90 ms), then
-whatever remains inside `CONV_2D` itself — its GEMM is fast now, so the next question there is MLAS's
-packing. P4.13 (quantized conv kernels) **conflicts** with the direct-conv lowering — `CONV_2D` takes
-an F32/F16 kernel and a quantized one falls back to the im2col path, so decide between them rather
-than starting both.
+**Still open, in the order they are worth doing** — P4.15 is DONE and took 0.75 s off 2.33 s, leaving
+a 0.55 s gap that the table at the top of this entry attributes. Convolution is 84% of it, and inside
+that convolution the GEMM is finished (23.5 GFLOP/s in-model against 25.1 standalone) while the im2col
+that feeds it is 37% of the time:
+
+1. **A direct convolution behind a shape heuristic** — prototyped in `scripts/bench10.cpp` and written
+   up above: 1.57x on the long-activation convolutions, 0.15-0.25x on the weight-heavy ones, **1.15x
+   for this model if each shape takes the faster path**, worth ~174 ms. The largest remaining item and
+   the largest remaining piece of work.
+2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
+   and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
+3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
+   is loom's own 165 ms of graph build, Lua driver and marshalling rather than any op.
+
+P4.13 (quantized conv kernels) **conflicts** with the direct-conv lowering — `CONV_2D` takes an F32/F16
+kernel and a quantized one falls back to the im2col path, so decide between them rather than starting
+both.
 
 **This is what the item told its own future reader to do first, and it was the right instruction:**
 re-read `scripts/bench6.cpp`'s header, then ggml's `src/ggml-cpu/vec.cpp:ggml_vec_dot_f32` and
