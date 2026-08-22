@@ -325,6 +325,15 @@ minutes of continuous load, which is larger than the effect, and rebuilding betw
 drift with code layout. Four rounds, order rotated between them, cooldown before each; the ordering of
 the arms was identical every time.
 
+**Why it stops here.** The obvious next step is to fuse the resblock's TWO convolutions into one
+kernel tiled over the sequence, so the activation between them never leaves cache. That was
+prototyped and measured (`scripts/bench11.cpp` in the calling project, with the rolling window that
+makes it recompute nothing): **1.05x on the nine real chains with an oracle choosing the tile size per
+shape, and below 1.0x at 128 channels for any tile size.** The reason is worth carrying into any
+review of this patch — a convolution's loads are already overlapped with its FMAs, so removing them
+removes no time. The only memory pass on the clock is the padded copy, which is a `memcpy` with no
+arithmetic over it. Count passes that way before predicting a win from any of this.
+
 **Two things a reviewer should push on.**
 
 **1. It was a 19% *regression* before it was a win, and the cause is not the residual.** The
