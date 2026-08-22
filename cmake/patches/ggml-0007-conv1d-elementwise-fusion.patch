@@ -264,10 +264,10 @@
      const float * w = (const float *) kernel->data;
      float *       y = out_data ? out_data : (float *) dst->data;
  
-@@ -7323,7 +7457,12 @@
-         memset(row, 0, (size_t) LP * sizeof(float));
-         const int64_t lo = pad;                            // input position 0 lands here
-         const int64_t n  = MIN(L, LP - lo);
+@@ -7329,7 +7463,12 @@
+         // `pad` floats each: 36 at the widest dilation here.
+         memset(row, 0, (size_t) lo * sizeof(float));
+         if (LP > lo + n) memset(row + lo + n, 0, (size_t) (LP - lo - n) * sizeof(float));
 -        if (n > 0) memcpy(row + lo, x + ic * L, (size_t) n * sizeof(float));
 +        if (n > 0) {
 +            // and the fused LEAKY_RELU, if there is one, applied here rather than as its own pass:
@@ -278,7 +278,7 @@
      }
      // Packed [ic][kx][oc] so the four output channels a tile covers are contiguous: on aarch64 that is
      // one vector load feeding four lane-broadcast FMAs instead of four scalar loads.
-@@ -7350,19 +7489,21 @@
+@@ -7356,19 +7495,21 @@
      for (int64_t b = b0; b < b1; ++b)
          for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
              ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
@@ -303,7 +303,7 @@
          }
      }
  }
-@@ -7374,7 +7515,8 @@
+@@ -7380,7 +7521,8 @@
  static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
                                     const ggml_tensor * kernel, const ggml_tensor * src,
                                     ggml_tensor * dst, const float * bias_data, float * out_data,
@@ -313,7 +313,7 @@
      const int64_t IC  = src->ne[2];
      const int64_t OC  = dst->ne[2];
      const int64_t KW  = kernel->ne[0];
-@@ -7389,7 +7531,7 @@
+@@ -7395,7 +7537,7 @@
      const int64_t nb   = (OL + a - 1) / a;
      const int64_t nmax = (na > nb ? na : nb) + 1;      // one slice per thread, sized for either pass
  
@@ -322,7 +322,7 @@
      const float * w = (const float *) kernel->data;
      float *       y = out_data ? out_data : (float *) dst->data;
  
-@@ -7397,17 +7539,19 @@
+@@ -7403,17 +7545,19 @@
      float * yp  = xp + (size_t) IC * dil * JP;          // [OC, dil, J]
      float * wp  = yp + (size_t) OC * dil * J;           // [IC, KW, OC]
      float * tmp = wp + (size_t) IC * KW * OC;           // two-pass scratch, per thread below
@@ -345,7 +345,7 @@
          }
      }
      for (int64_t ic = params->ith; ic < IC; ic += params->nth)
-@@ -7429,7 +7573,7 @@
+@@ -7435,7 +7579,7 @@
          for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
              ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
                                       IC, OC, KW, (int64_t) dil * JP, (int64_t) dil * J, 1,
@@ -354,7 +354,7 @@
      }
      if (nblk * P < J) {                                  // overlapping tail tile, as in the direct path
          const int64_t j0 = J - P;
-@@ -7437,20 +7581,30 @@
+@@ -7443,20 +7587,30 @@
              for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
                  ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
                                           IC, OC, KW, (int64_t) dil * JP, (int64_t) dil * J, 1,
@@ -388,7 +388,7 @@
          }
      }
  }
-@@ -7460,12 +7614,20 @@
+@@ -7466,12 +7620,20 @@
                                                const ggml_tensor *         src,     // [W, H, C, N]
                                                ggml_tensor *               dst,     // [OW, OH, OC, N]
                                                ggml_type                   kernel_type,
@@ -412,7 +412,7 @@
  
      GGML_ASSERT(ggml_is_contiguous(kernel));
      GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
-@@ -7491,7 +7653,7 @@
+@@ -7497,7 +7659,7 @@
      const int64_t dst_w = dst->ne[0];
      const int64_t dst_h = dst->ne[1];
  
@@ -421,7 +421,7 @@
      void  * knl_data       = kernel->data;
      float * dst_data       = out_data ? out_data : (float *) dst->data;
  
-@@ -7504,12 +7666,15 @@
+@@ -7510,12 +7672,15 @@
              // see ggml_conv1d_phase_ok for the window and the numbers that drew it.
              int64_t jphase = 0; size_t need = 0;
              if (ggml_conv1d_phase_ok(src->ne[2], dst->ne[2], kernel->ne[0], dst->ne[0],
@@ -440,7 +440,7 @@
              return;
          }
      }
-@@ -7558,9 +7723,17 @@
+@@ -7564,9 +7729,17 @@
      // destination and pays for one extra pass rather than being wrong.
      const bool aliases_input = out_data != nullptr && (const void *) out_data == (const void *) src_data
                              && ggml_nbytes(dst) == ggml_nbytes(src);
@@ -461,7 +461,7 @@
          ggml_barrier(params->threadpool);
          for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
              const float * in = (const float *) dst->data + oc * dst_w * dst_h;
-@@ -7605,6 +7778,11 @@
+@@ -7611,6 +7784,11 @@
                          } else {
                              const float * src_ptr = (const float *)((const char *)src_base + sx * src->nb[0] + sy * src->nb[1] + ic * src->nb[2]);
                              src_val               = *src_ptr;
@@ -473,7 +473,7 @@
                          }
  
                          char * element_ptr = dst_row + dst_idx * traits->type_size;
-@@ -7629,8 +7807,15 @@
+@@ -7635,8 +7813,15 @@
                  float *       out = out_data + oc * dst_w * dst_h + pending_start;
                  const float * in  = staged + oc * pending_n;
                  const float   b   = bias_data ? bias_data[oc] : 0.0f;
@@ -491,7 +491,7 @@
                  }
              }
              pending_start = -1;
-@@ -7647,17 +7832,26 @@
+@@ -7653,17 +7838,26 @@
              ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
                                    dst_data + patch_start_batch, dst_w * dst_h);
              ggml_barrier(params->threadpool);
@@ -525,7 +525,7 @@
                      }
                  }
              }
-@@ -7699,7 +7893,8 @@
+@@ -7705,7 +7899,8 @@
              const int64_t dst_x   = p % dst_w;
  
              for (int64_t oc = 0; oc < c_out; ++oc) {
@@ -535,7 +535,7 @@
                  float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
                  *dst_ptr = value;
              }
-@@ -7713,27 +7908,56 @@
+@@ -7719,27 +7914,56 @@
              float *       out = out_data + oc * dst_w * dst_h + pending_start;
              const float * in  = staged + oc * pending_n;
              const float   b   = bias_data ? bias_data[oc] : 0.0f;
