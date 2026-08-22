@@ -1,6 +1,6 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Seven diffs, each independently useful and independently reviewable. They are written against the pin in
+Eight diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
@@ -21,7 +21,7 @@ generator, F32 throughout, one image per batch, `KH = 1`. The benches are in `sc
 (`bench6.cpp` GEMM, `bench7.cpp` register tiles, `bench9.cpp` conv lowering, `bench10.cpp` direct
 convolution) and are self-contained against a built ggml.
 
-**What a reviewer is likely to ask, for all seven: measurements on hardware neither of these two boxes
+**What a reviewer is likely to ask, for all eight: measurements on hardware neither of these two boxes
 represents** — a wide ARM core (Neoverse V2, Apple M-series) and a many-core x86 server. Say so up
 front rather than being asked.
 
@@ -358,3 +358,50 @@ and either the input or the residual, and any overlap at all with the weights or
 **Testing.** ci (68) and gate (82) green, fused-vs-unfused agreeing to 6.7e-8 max on a 0.17 peak and
 identical at 2 and 4 threads (a race here would not be). The gate was verified able to fail by
 perturbing the fused slope by 5% and, separately, the fused residual by 5%: `matcha_mil` catches both.
+
+---
+
+## PR 8 — `conv_transpose_1d`: the whole prologue ran on one thread, and zeroed 16 MB it did not use
+
+*(`cmake/patches/ggml-0008-conv-transpose-1d-prologue.patch`, independent of every other patch here)*
+
+**Problem.** `ggml_compute_forward_conv_transpose_1d_f32` does four things before it computes anything,
+all of them inside `if (ith == 0)`:
+
+```c
+memset(params->wdata, 0, params->wsize);   // the whole PLAN's work buffer
+... transpose the kernel  (K x Cout x Cin) -> (Cin x K x Cout)
+... transpose the source  (L x Cin)        -> (Cin x L), element by element
+memset(dst->data, 0, ggml_nbytes(dst));    // dst is accumulated into
+```
+
+Phase-timed on a VITS vocoder (Pi 4B, 4 threads, three calls per synthesis) that prologue is **47% of
+the op** — 100 ms of a 1.31 s synthesis spent in a serial section in the middle of a graph whose every
+other op is parallel.
+
+The `memset` of `params->wdata` is the easiest part to fix because **nothing needs it**: the two
+transposes below write every element of the two regions this op uses, `[0, nk)` and
+`[nk, nk + ne10*ne11)`. And `wsize` is not this op's requirement, it is the **whole plan's** — the
+maximum over every node in the graph. Here that is 16 MB, sized by an unrelated convolution, so the op
+zeroes 16 MB per call to use about 4.
+
+The rest is parallel work written serially. Nothing in it has a cross-thread dependency.
+
+**Fix.** Delete the `wdata` memset; split the kernel transpose over `Cout` and the `dst` zeroing over
+bytes, both into disjoint ranges. Split the source transpose over **`L` rather than `Cin`**, which is
+the other way round from how it read: a transpose is strided on one side, and strided reads beat
+strided writes — each thread then fills whole contiguous `ne11`-wide rows instead of scattering single
+floats `ne11` apart across the buffer, which also keeps two threads off one cache line.
+
+**Evidence.** Whole synthesis, Pi 4B, 4 threads, switching the old serial prologue back on at runtime
+inside one binary, ABBA in both orders over two rounds: **1.314 s -> 1.247 s by mean, 1.307 -> 1.234 by
+min. ~70 ms, 5.3%.** The op itself goes from 196 ms to about 126 ms — which puts it *below*
+onnxruntime's 166 ms for the same three convolutions, where it had been 1.18x above.
+
+**What a reviewer should push on.** The `dst` zeroing is split by raw byte range rather than by row; it
+is correct because this op's `dst` is contiguous, but a row split would be the more conservative shape.
+And the source transpose is still element-at-a-time — a blocked transpose would do better, and was not
+attempted here because the serial-to-parallel change alone took the prologue off the critical path.
+
+**Not a numerics change**: identical output, bit for bit, at 1, 2 and 4 threads — which is also the
+check that the new parallel sections do not race.

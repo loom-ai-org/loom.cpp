@@ -7965,8 +7965,11 @@ that feeds it is 37% of the time:
    P4.15b below**, for 1.441 -> 1.307 s. Note that P4.15b also MEASURED OUT the "keep the intermediate
    in cache" half of that sentence: it is worth 1.05x, and the win came from the elementwise nodes and
    from a padded copy that was writing everything twice.
-2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms), now 5% of the gap
-   and at rough parity with onnxruntime's, so this is a small item rather than a structural one.
+2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms) — **half done**.
+   Its serial prologue is gone (P4.15e, ~70 ms), which was never on this list because nobody had looked
+   inside the op; the mul_mat lowering itself is still open and is now worth ~55 ms more, because the
+   compute half runs at 7.3 GFLOP/s against the machine's 25. "At rough parity with onnxruntime's" was
+   true and misleading: both engines were sitting on the same floor.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
    is loom's own 165 ms of graph build, Lua driver and marshalling rather than any op.
 
@@ -8286,6 +8289,111 @@ Perturbing the fused slope by 5%, and separately the fused residual by 5%, both 
 unfused VITS output agree to 6.7e-8 max on a 0.17 peak, identically at 2 and 4 threads, which a race
 would not do.
 
+### P4.15e — `conv_transpose_1d` ran its whole prologue on one thread — DONE (2026-08-22)
+
+**What it was worth.** `cmake/patches/ggml-0008-conv-transpose-1d-prologue.patch`, on a Pi 4 at 4
+threads: **1.314 -> 1.247 s by mean, 1.307 -> 1.234 by min — ~70 ms, 5.3%.** The op goes from 196 ms to
+**126.3 ms** re-profiled, which puts it **below** onnxruntime's 166.4 ms for the same three
+convolutions — 1.32x FASTER, where P4.16 had it 1.18x slower. Per shape, before -> after:
+73476x32 105.7 -> 63.3, 18376x64 53.1 -> 43.0, 2304x128 37.0 -> 19.9 ms. Measured by switching the old prologue back on at runtime inside one binary, ABBA
+in both orders over two rounds.
+
+**How it was found, which is the reusable part.** P4.16 put `CONV_TRANSPOSE_1D` at 1.18x and +29 ms —
+the smallest row in the table, and by that ranking not worth doing. The ranking was wrong because it
+compared loom against onnxruntime, and **both engines were slow at it**: 1.43 GFLOP in 196 ms is
+**7.3 GFLOP/s**, against 25 GFLOP/s for a GEMM on this machine, and onnxruntime's 166 ms is only
+8.6 GFLOP/s. A ratio against a competitor cannot see a floor they are both sitting on. Phase-timing the
+op against the machine's own peak could, and did, in about twenty minutes.
+
+**What the prologue was doing**, all of it under `if (ith == 0)`:
+
+```c
+memset(params->wdata, 0, params->wsize);   // the whole PLAN's work buffer -- 16 MB here
+... transpose the kernel  (K x Cout x Cin) -> (Cin x K x Cout)
+... transpose the source  (L x Cin)        -> (Cin x L), element by element
+memset(dst->data, 0, ggml_nbytes(dst));    // dst is accumulated into, so this one is needed
+```
+
+| OC x OL | calls/synth | prologue (serial) | compute |
+|---|---:|---:|---:|
+| 128 x 2304 | 1 | 27.2 ms | 16.9 ms |
+| 64 x 18376 | 1 | 16.9 ms | 40.1 ms |
+| 32 x 73476 | 1 | 56.2 ms | 54.7 ms |
+| **total** | 3 | **100.4 ms** | 111.7 ms |
+
+**47% of the op, serial, in the middle of a graph whose every other op is parallel.** And the `wdata`
+memset needed to exist at all: the two transposes write every element of the two regions the op uses,
+and `wsize` is not this op's requirement but the **maximum over every node in the plan** — 16 MB, sized
+by an unrelated convolution, zeroed per call to use about 4.
+
+The fix is the obvious one plus one non-obvious choice: the source transpose is split over **`L` rather
+than `Cin`**, the other way round from how it read. A transpose is strided on one side, and strided
+READS beat strided writes — each thread now fills whole contiguous `ne11`-wide rows instead of
+scattering single floats `ne11` apart across the buffer, which also keeps two threads off one cache
+line.
+
+**What is still on the table here, and it is bigger than what was taken.** The compute half is
+111.7 ms for 1.43 GFLOP — **still 7.3 GFLOP/s** after this patch, because the fix did not touch it. Its
+inner loop is one `ggml_vec_dot_f32` of length `Cin` per `(output channel, input position, tap)`: 1x1
+register blocking, the exact shape P4.15 removed from `mul_mat`. Lowered as a GEMM it is
+`[OC*K, IC] x [IC, L]` followed by an overlap-add scatter with stride `s0` — one matmul per call
+instead of `OC*L*K` dot products. At tinyBLAS's 25 GFLOP/s that is ~57 ms of arithmetic against
+111.7 ms now, so **~55 ms more**, less whatever the scatter costs (the intermediate is `K/s0 = 2x` the
+output, so block it over `L` and keep it in L2). This is the "`CONV_TRANSPOSE_1D` as mul_mat + reshape"
+that P4.14 and P4.15 both listed and neither did; it is now the largest single item left in the model.
+
+### P4.15c — `kw = 1` is a matmul, and loom runs it as a convolution — SCOPED, NOT STARTED (2026-08-22)
+
+**The observation.** In the flow and encoder, onnxruntime runs 38 convolutions of `[1,192,101] x
+[192,192,1]` in **13.5 ms**, and carries a further 26 of loom's `CONV_1D` nodes as `MatMul` /
+`FusedMatMul` — its graph does not call them convolutions at all. loom issues every one through
+`op_conv_1d`. Those shapes sit inside the L~100 group that P4.16 measures at **2.59x**, the worst ratio
+in the model.
+
+**MEASURE BEFORE BUILDING, because the obvious version of this fix may be worth nothing.** The tempting
+statement is "a `kw = 1` convolution is a matmul, so skip the im2col". Half of that is wrong: for
+`kw = 1` the im2col is not a redundant copy, it is a **transpose** — `ggml_im2col` produces `[IC, OL]`
+from data laid out `[OL, IC]`, and `ggml_mul_mat` contracts over `ne[0]`, so BOTH operands need `IC`
+first. A hand-written `mul_mat` lowering would have to do the same transpose. What may still be there:
+
+* the batched im2col inside ggml's `CONV_2D` carries per-batch bookkeeping, a work-buffer round trip
+  and a barrier per batch, where a single `cont(transpose(x))` + one GEMM has none of that;
+* `ggml_conv_1d_direct_ok` **declines these shapes** (`OL/P < OC/OCB`, 6 blocks against 48 channel
+  tiles) so they fall to the batched path, which was tuned for `kw >= 3`;
+* and the activation may not need transposing at all if the surrounding graph could be persuaded to
+  keep it `[IC, L]`, which is a question for the exporter, not the engine.
+
+**The first measurement, before any code**: time one `[1,192,101] x [192,192,1]` three ways —
+as it runs today, as `cont(transpose) + mul_mat`, and as a bare `mul_mat` on already-transposed data.
+If the first two are within 10% of each other, this item is only the third bullet and belongs in
+loom-exporter. `scripts/bench9.cpp` is the conv-lowering bench and is the right place to add the row.
+
+### P4.15d — loom issues 153 convolutions where onnxruntime runs 129 — SCOPED, NOT STARTED (2026-08-22)
+
+**The observation.** Per synthesis, `$LOOM_PROFILE` counts **153 `CONV_2D`** (plus 12 `CONV_1D_DW`);
+onnxruntime's profile has **121 `Conv` + 8 `FusedConv` = 129** dense convolution nodes (plus the same 12
+depthwise). At the L~100 scale alone it is **93 against 57**. Thirty-six convolutions at that scale, and
+twenty-four overall, that one engine runs and the other does not.
+
+Some of it is accounted for: onnxruntime's exporter emitted 6 `MatMul` and 20 `FusedMatMul` nodes for
+convolutions loom keeps as `CONV_1D` (P4.15c). That is 26 of the 24-node gap — so it over-explains the
+total while leaving the per-scale discrepancy open, which means the counts are not lining up the way
+this paragraph assumes and the first job is to stop assuming.
+
+**What to actually do**, in order:
+
+1. Dump loom's 153 with their shapes. `$LOOM_PROFILE` keys on `(op, ne0, ne1)` and `ne1 = 1` for every
+   1-D convolution, so all 93 of the L~100 ones collapse into one row and the profile cannot answer
+   this. Extend the profile key with the weight's `ne`, or walk `model.graph_topology` — the topology
+   JSON is in the GGUF and lists every `CONV_1D` with its attrs, which is the cheaper path.
+2. Line those up against the onnxruntime table in P4.16 and name the ones that have no counterpart.
+3. Only then ask whether they are loom lowering something in more nodes than it needs, or the ONNX
+   export folding something loom cannot see (a constant-folded branch, a fused activation).
+
+**Why it is worth an item of its own.** It is the cheapest question in the P4.16 group — no kernel work,
+no measurement rig, just two node lists — and it gates the interpretation of everything else in that
+entry. A per-shape ratio is only meaningful once both sides are known to be running the same work.
+
 ### P4.16 — the convolution gap, shape by shape against onnxruntime — SCOPED, NOT STARTED (2026-08-22)
 
 **Why this exists.** After P4.15b, loom is **1.24x** onnxruntime on the reference utterance (1.313 s
@@ -8320,15 +8428,13 @@ have never been touched**, and the worst of them is 2.59x.
 against MLAS's 25.7. A 1.1x arithmetic difference cannot produce 2.59x. The excess is around the GEMM,
 not in it. Three leads, in the order they are cheap to check:
 
-1. **`kw = 1` needs no im2col at all** — it IS a matmul, and materialising a patch matrix for one is a
-   pure copy of the input to no purpose. onnxruntime runs 38 of them (`[1,192,101] x [192,192,1]`) in
-   13.5 ms; loom's direct path declines them (`OL/P < OC/OCB`) and they fall to the batched im2col.
-   **And onnxruntime's graph does not even call them convolutions** — it carries 6 `MatMul` and 20
-   `FusedMatMul` nodes (7.4 ms together) that loom issues as `CONV_1D`. Lowering `kw == 1` straight to
-   `ggml_mul_mat` in `op_conv_1d` is a handful of lines and is the first thing to try.
-2. **loom issues 153 `CONV_1D` where onnxruntime has 129 dense convolution nodes**, and 93 against 57
-   at this scale alone. Some of that is the `MatMul` representation above; find out what the rest is
-   before optimising any of it. Cheapest measurement in the item, and it may be most of the answer.
+1. **`kw = 1` convolutions** — onnxruntime runs 38 of them as `Conv` and carries 26 more as
+   `MatMul`/`FusedMatMul`; loom issues every one through `op_conv_1d`. **Scoped as P4.15c**, with the
+   reason the obvious fix may be worth nothing (for `kw = 1` the im2col is a transpose, not a redundant
+   copy, and `ggml_mul_mat` needs that transpose anyway).
+2. **loom issues 153 `CONV_1D` where onnxruntime has 129 dense convolution nodes**, 93 against 57 at
+   this scale alone. **Scoped as P4.15d**, and it should be done FIRST: a per-shape ratio only means
+   something once both engines are known to be running the same work.
 
 **Checked and NOT a lead: depthwise.** The obvious suspicion — a `groups=192` convolution lowered as a
 dense 192x192, which would be 192x the arithmetic — is wrong. The exporter emits **12 `CONV_1D_DW`
