@@ -7965,11 +7965,11 @@ that feeds it is 37% of the time:
    P4.15b below**, for 1.441 -> 1.307 s. Note that P4.15b also MEASURED OUT the "keep the intermediate
    in cache" half of that sentence: it is worth 1.05x, and the win came from the elementwise nodes and
    from a padded copy that was writing everything twice.
-2. **`CONV_TRANSPOSE_1D` as mul_mat + reshape** (P4.14's follow-up list, ~60-90 ms) — **half done**.
-   Its serial prologue is gone (P4.15e, ~70 ms), which was never on this list because nobody had looked
-   inside the op; the mul_mat lowering itself is still open and is now worth ~55 ms more, because the
-   compute half runs at 7.3 GFLOP/s against the machine's 25. "At rough parity with onnxruntime's" was
-   true and misleading: both engines were sitting on the same floor.
+2. ~~**`CONV_TRANSPOSE_1D` as mul_mat + reshape**~~ (P4.14's follow-up list, ~60-90 ms) — **DONE,
+   P4.15e**, and worth about twice what this line estimated: 195.8 -> 79.1 ms for the op, ~115 ms of
+   the synthesis. Half of it was a serial prologue nobody had looked for. "At rough parity with
+   onnxruntime's" was true and misleading — both engines were sitting on the same floor, and a ratio
+   against a competitor cannot see that. Phase-timing against the machine's own peak can.
 3. **"everything else"**, 0.29 s against onnxruntime's 0.257 s — nearly closed, and what is left of it
    is loom's own 165 ms of graph build, Lua driver and marshalling rather than any op.
 
@@ -8210,8 +8210,9 @@ Pi: `~/.cache/huggingface/hub/models--loom-ai-org--vits-piper-en-gb-miro-loom/sn
 snapshots exist — take `ls -t | head -1`). On the dev box: `../hf-models/vits-piper-en-gb-miro/`.
 
 **Baselines to reproduce before trusting anything.** Pi, 4 threads, idle, steady state: **1.307 s**
-after this item (**1.441 s** before it; onnxruntime does the same utterance in **1.063 s** with its
-duration predictor pinned, so the ratio is **1.24x**). x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
+after this item, and **1.205 s** as of P4.15e (**1.441 s** before either; onnxruntime does the same
+utterance in **1.063 s** with its duration predictor pinned, so the ratio is **1.24x** after P4.15b and
+**1.13x** now). x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
 not the code.
 
 **Scratch trees on the Pi** (all disposable, none of them a git repo):
@@ -8289,10 +8290,18 @@ Perturbing the fused slope by 5%, and separately the fused residual by 5%, both 
 unfused VITS output agree to 6.7e-8 max on a 0.17 peak, identically at 2 and 4 threads, which a race
 would not do.
 
-### P4.15e — `conv_transpose_1d` ran its whole prologue on one thread — DONE (2026-08-22)
+### P4.15e — `conv_transpose_1d`: a serial prologue and a dot-product compute — DONE (2026-08-22)
 
-**What it was worth.** `cmake/patches/ggml-0008-conv-transpose-1d-prologue.patch`, on a Pi 4 at 4
-threads: **1.314 -> 1.247 s by mean, 1.307 -> 1.234 by min — ~70 ms, 5.3%.** The op goes from 196 ms to
+**What it was worth.** Two patches, `ggml-0008` (the prologue) and `ggml-0009` (the compute), on a Pi 4
+at 4 threads: **1.314 -> 1.202 s, about 115 ms and 8.5%.** The op itself goes **195.8 -> 79.1 ms,
+2.5x**, and against onnxruntime's 166.4 ms for the same three convolutions it ends up **2.1x faster**
+where P4.16 had it 1.18x slower. Each half was measured on its own with the old path switchable at
+runtime inside one binary, ABBA in both orders over two rounds: the prologue 1.314 -> 1.247 by mean
+(~70 ms), the GEMM 1.252 -> 1.202 by mean and 1.239 -> 1.186 by min (~50 ms).
+
+#### Part 1: the prologue (`ggml-0008`, ~70 ms)
+
+ The op goes from 196 ms to
 **126.3 ms** re-profiled, which puts it **below** onnxruntime's 166.4 ms for the same three
 convolutions — 1.32x FASTER, where P4.16 had it 1.18x slower. Per shape, before -> after:
 73476x32 105.7 -> 63.3, 18376x64 53.1 -> 43.0, 2304x128 37.0 -> 19.9 ms. Measured by switching the old prologue back on at runtime inside one binary, ABBA
@@ -8332,15 +8341,34 @@ READS beat strided writes — each thread now fills whole contiguous `ne11`-wide
 scattering single floats `ne11` apart across the buffer, which also keeps two threads off one cache
 line.
 
-**What is still on the table here, and it is bigger than what was taken.** The compute half is
-111.7 ms for 1.43 GFLOP — **still 7.3 GFLOP/s** after this patch, because the fix did not touch it. Its
-inner loop is one `ggml_vec_dot_f32` of length `Cin` per `(output channel, input position, tap)`: 1x1
-register blocking, the exact shape P4.15 removed from `mul_mat`. Lowered as a GEMM it is
-`[OC*K, IC] x [IC, L]` followed by an overlap-add scatter with stride `s0` — one matmul per call
-instead of `OC*L*K` dot products. At tinyBLAS's 25 GFLOP/s that is ~57 ms of arithmetic against
-111.7 ms now, so **~55 ms more**, less whatever the scatter costs (the intermediate is `K/s0 = 2x` the
-output, so block it over `L` and keep it in L2). This is the "`CONV_TRANSPOSE_1D` as mul_mat + reshape"
-that P4.14 and P4.15 both listed and neither did; it is now the largest single item left in the model.
+#### Part 2: the compute is a GEMM (`ggml-0009`, ~50 ms)
+
+The inner loop was one `ggml_vec_dot_f32` of length `Cin` per `(output channel, input position, tap)` —
+1x1 register blocking, the exact shape P4.15 removed from `mul_mat`, and 7.3 GFLOP/s where the machine
+does 25.
+
+**The right-hand side does not depend on `s0` at all.** `y[oc][i10*s0 + k] += sum_ic w[oc][k][ic] *
+x[i10][ic]` is, over `(oc, k)` and `i10`, exactly `[Cout*K, Cin] x [Cin, L]`; only the SCATTER of the
+result knows about the stride. And the prologue's two transposes already leave both operands in the
+layout a GEMM wants, contraction over `Cin` fastest on both sides — so this is one
+`ggml_call_mul_mat_ldc` (patch 0004's helper) plus an overlap-add, and nothing had to be repacked.
+
+Blocked over input positions, because the whole result is `K/s0` times the size of dst — 18.8 MB
+against 9.4 for the largest upsample — and not paying that traffic is the point. A 256 KB block stays
+in L2 and the scatter reads it immediately; `ggml_graph_plan`'s work size for the op grows by the same
+budget, and both read one constant so they cannot drift.
+
+**The scatter splits by OUTPUT CHANNEL, and that is load-bearing.** Consecutive input positions write
+overlapping runs whenever `K > s0` — which is every upsampling convolution, they are built that way —
+so a split over positions would race exactly where this op accumulates. Per (channel, position) both
+sides are then contiguous over the tap.
+
+Not bit-identical: the GEMM sums over `Cin` in a different order, 8.9e-8 max on a 0.17 peak, and
+identical at 1, 2 and 4 threads — which is also the check that the scatter does not race.
+
+This was the "`CONV_TRANSPOSE_1D` as mul_mat + reshape" that P4.14 and P4.15 both listed and neither
+did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27.6, 2304x128
+37.0 -> 16.4 ms.
 
 ### P4.15c — `kw = 1` is a matmul, and loom runs it as a convolution — SCOPED, NOT STARTED (2026-08-22)
 
@@ -8413,9 +8441,16 @@ by that before splitting hairs; it moves each ratio by ~2%.
 | resblocks 64ch @ L18368 | 6 | 216.8 ms | 6 | 144.9 ms | 1.50x | +71.9 |
 | resblocks 32ch @ L73472 | 7 | 226.9 ms | 7 | 166.5 ms | 1.36x | +60.4 |
 | flow/encoder @ L~287 | 41 | 203.4 ms | 41 | 155.6 ms | 1.31x | +47.8 |
-| `CONV_TRANSPOSE_1D` | 3 | 195.8 ms | 3 | 166.4 ms | 1.18x | +29.4 |
+| ~~`CONV_TRANSPOSE_1D`~~ | 3 | ~~195.8~~ **79.1 ms** | 3 | 166.4 ms | **0.48x** | **-87.3** |
 | resblocks 128ch @ L2296 | 6 | 104.4 ms | 6 | 75.7 ms | 1.38x | +28.7 |
-| **total** | **156** | **1098 ms** | **132** | **767 ms** | **1.43x** | **+331** |
+| **total** (after P4.15e) | **156** | **981 ms** | **132** | **767 ms** | **1.28x** | **+214** |
+
+`CONV_TRANSPOSE_1D` is struck through because **P4.15e did it**, and the way it fell is the warning
+this table needs. It was ranked LAST here — 1.18x, +29 ms, the smallest row — and it turned out to hold
+115 ms, more than any other row has yet given up. The ranking was wrong because it is a ratio against
+onnxruntime, and both engines were sitting on the same floor: 7.3 and 8.6 GFLOP/s where the machine
+does 25. **Rank by the machine's peak as well as by the competitor**, or a row where both
+implementations are equally bad will sort to the bottom.
 
 **The order this says to work in is NOT the order P4.15 worked in.** The vocoder resblocks — three
 rows, +161 ms — are the ones P4.15 and P4.15b spent themselves on and measured out at 83% of the

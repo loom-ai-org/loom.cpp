@@ -1,6 +1,6 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Eight diffs, each independently useful and independently reviewable. They are written against the pin in
+Nine diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
@@ -21,7 +21,7 @@ generator, F32 throughout, one image per batch, `KH = 1`. The benches are in `sc
 (`bench6.cpp` GEMM, `bench7.cpp` register tiles, `bench9.cpp` conv lowering, `bench10.cpp` direct
 convolution) and are self-contained against a built ggml.
 
-**What a reviewer is likely to ask, for all eight: measurements on hardware neither of these two boxes
+**What a reviewer is likely to ask, for all nine: measurements on hardware neither of these two boxes
 represents** — a wide ARM core (Neoverse V2, Apple M-series) and a many-core x86 server. Say so up
 front rather than being asked.
 
@@ -363,7 +363,7 @@ perturbing the fused slope by 5% and, separately, the fused residual by 5%: `mat
 
 ## PR 8 — `conv_transpose_1d`: the whole prologue ran on one thread, and zeroed 16 MB it did not use
 
-*(`cmake/patches/ggml-0008-conv-transpose-1d-prologue.patch`, independent of every other patch here)*
+*(`cmake/patches/ggml-0008-conv-transpose-1d-prologue.patch`, independent of every other patch here; **PR 9 sits on top of it**)*
 
 **Problem.** `ggml_compute_forward_conv_transpose_1d_f32` does four things before it computes anything,
 all of them inside `if (ith == 0)`:
@@ -405,3 +405,60 @@ attempted here because the serial-to-parallel change alone took the prologue off
 
 **Not a numerics change**: identical output, bit for bit, at 1, 2 and 4 threads — which is also the
 check that the new parallel sections do not race.
+
+---
+
+## PR 9 — `conv_transpose_1d`: the compute is a GEMM, and it was one dot product per output element
+
+*(`cmake/patches/ggml-0009-conv-transpose-1d-gemm.patch`, on top of PR 8, and independent of 1-7 except
+that it calls PR 4's `ggml_call_mul_mat_ldc`)*
+
+**Problem.** The inner loop is
+
+```c
+for (i1 = ...)                       // output channel
+  for (i10 = 0; i10 < ne10; i10++)   // input position
+    for (i00 = 0; i00 < ne00; i00++) // kernel tap
+        ggml_vec_dot_f32(ne02, &v, ..., wdata_src + i10*ne11, ..., wdata_kernel + i00*ne02, ...);
+        dst_data[i10*s0 + i00] += v;
+```
+
+— one `ggml_vec_dot_f32` per `(output channel, input position, tap)`, which is 1x1 register blocking
+and the same shape PR 1 removed from `sgemm`. On a VITS vocoder that is **1.43 GFLOP in 196 ms, 7.3
+GFLOP/s**, on a machine that does 25 on a GEMM. It is not a competitive-gap story either: onnxruntime
+runs the same three convolutions at 8.6 GFLOP/s, so both implementations were sitting on the same floor.
+
+**The observation.** The right-hand side does not depend on `s0` at all:
+
+```
+y[oc][i10*s0 + k] += sum_ic  w[oc][k][ic] * x[i10][ic]
+```
+
+Over `(oc, k)` and `i10` that is exactly `[Cout*K, Cin] x [Cin, L]`. Only the SCATTER of the result
+knows about the stride — and the transposes this op already does in its prologue leave both operands in
+precisely the layout a GEMM wants, contraction over `Cin` fastest on both sides.
+
+**Fix.** One `ggml_call_mul_mat_ldc` per block of input positions, then an overlap-add. Blocked because
+the whole result is `K/s0` times the size of `dst` — 18.8 MB against 9.4 for this model's largest
+upsample — and the point is not to pay that traffic; a 256 KB block keeps it in L2 and the scatter
+reads it immediately. `ggml_graph_plan`'s work-size for this op grows by the same budget, and the two
+share one constant so they cannot drift.
+
+**The scatter is split by output channel, and that is load-bearing.** Consecutive input positions write
+overlapping runs whenever `K > s0` — which is every upsampling convolution, they are built that way —
+so a split over positions would race exactly where this op accumulates. Per `(channel, position)` both
+sides are then contiguous over the tap: `K` floats read, `K` floats added.
+
+**Evidence.** Whole synthesis, Pi 4B, 4 threads, old path switchable at runtime inside one binary, ABBA
+in both orders over two rounds: **1.252 -> 1.202 s by mean, 1.239 -> 1.186 by min. ~50 ms, 4%.** The op
+itself is **126 -> 79 ms** re-profiled, and with PR 8 in front of it **196 -> 79 ms, 2.5x**. Against
+onnxruntime's 166 ms for the same three convolutions it is now 2.1x faster.
+
+**Not bit-identical** — the GEMM sums over `Cin` in a different order. Whole-synthesis difference
+against the previous lowering: max 8.9e-8 on a 0.17 peak, and identical at 1, 2 and 4 threads, which is
+also the check that the scatter does not race.
+
+**What a reviewer should push on.** The 256 KB block budget is one constant tuned on one machine, and
+the fallback to the old loop when the work buffer is too small exists only for a caller that sized a
+`cplan` by hand — a reviewer may prefer that to be an assert. The F16 path is untouched and still runs
+the old loop.
