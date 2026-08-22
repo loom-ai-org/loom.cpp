@@ -250,6 +250,12 @@ position rather than a scalar loop over the remainder. At OL = 2296 that remaind
 8 x OC x IC x KW scalar multiply-accumulates is ~2 ms of a 20 ms convolution — 22 ms across a whole
 synthesis. Recomputing up to P-1 positions is much cheaper than computing any of them slowly.
 
+**And the padded copy really is one pass.** It is worth saying explicitly because the first version of
+this patch made it two: it zeroed the whole padded row and then copied over all but the `pad` floats at
+each end, writing every element of a 9.4 MB buffer twice. Zeroing only the two strips is **26 ms of a
+1.34 s synthesis**, about a third of what the copy costs. A reviewer comparing against `ggml_im2col`
+should compare against the fixed version.
+
 **The heuristic is the reviewable part.** Three conditions:
 
 * shape and type (F32, `KH = 1`, one image, stride 1, contiguous, `OC % 4 == 0`), everything else
