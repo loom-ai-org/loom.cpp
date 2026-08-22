@@ -7276,6 +7276,16 @@ Three things follow, all measured rather than reasoned:
 
 #### Where the loom-vs-onnxruntime gap actually is (idle box, 4 threads, 2.35 s vs 1.024 s)
 
+> **CORRECTION (2026-08-22): the 1.024 s is not reproducible, and every ratio in this section derived
+> from it is ~4% optimistic.** VITS's duration predictor is stochastic, phoonnx does not seed it, and
+> each run therefore synthesises a DIFFERENT number of samples — while both engines' time is very
+> nearly linear in output samples. 1.024 s timed an unknown length. Pinned
+> (`SynthesisConfig(noise_scale=0.0, noise_w_scale=0.0)`, or `scales=[0,1,0]` driving the session
+> directly) onnxruntime is **1.044 s at 72192 samples, 1.063 s normalised to loom's 73472**, repeatable
+> to 0.5%. The per-op SHARES below are unaffected — only the wall time they are apportioned over moves,
+> and by less than the 1.18x profiling cost already accounted for. **Pin it before quoting any ratio;**
+> see the recipe in P4.15b's cold start.
+
 Both engines profiled per-op on the SAME model and utterance — loom via P4.14, onnxruntime via its own
 `enable_profiling` (shares only; profiling costs it 1.18x, so shares are apportioned over the
 un-profiled 1.024 s).
@@ -7980,8 +7990,10 @@ to overwrite. On a Pi 4 at 4 threads, steady state on a quiet box, **1.441 -> 1.
 **96 ms, 6.7%**, and the same delta again from the interleaved four-arm run below. Step 2 turned out
 to be worth 1.05x on the chains and was **not built**; what its investigation found instead — a padded
 copy writing every element twice — took another **38 ms**, so the item as a whole is
-**1.441 -> 1.307 s, 134 ms and 9.3%**. The gap to onnxruntime's 1.024 s on the same utterance goes
-1.41x -> 1.28x.
+**1.441 -> 1.307 s, 134 ms and 9.3%**. Against onnxruntime **re-measured with its duration predictor
+pinned** — 1.044 s raw `session.run` at 72192 samples, 1.063 s normalised to loom's 73472 — the ratio
+goes **1.36x -> 1.24x**. (The 1.024 s this thread quoted for years was an UNPINNED run; see the
+correction under P4.15's own onnx baseline. Every ratio derived from it is ~4% optimistic.)
 
 That is close to the ~120 ms this item predicted from the traffic table below, which is the first thing
 in this thread where the arithmetic and the measurement agreed.
@@ -8195,8 +8207,8 @@ Pi: `~/.cache/huggingface/hub/models--loom-ai-org--vits-piper-en-gb-miro-loom/sn
 snapshots exist — take `ls -t | head -1`). On the dev box: `../hf-models/vits-piper-en-gb-miro/`.
 
 **Baselines to reproduce before trusting anything.** Pi, 4 threads, idle, steady state: **1.307 s**
-after this item (**1.441 s** before it; onnxruntime does the same utterance in **1.024 s**, so the
-ratio is 1.28x). x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
+after this item (**1.441 s** before it; onnxruntime does the same utterance in **1.063 s** with its
+duration predictor pinned, so the ratio is **1.24x**). x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
 not the code.
 
 **Scratch trees on the Pi** (all disposable, none of them a git repo):
@@ -8218,6 +8230,25 @@ cmake -B build -DCMAKE_CXX_FLAGS=-DLOOM_CONV1D_DIRECT=0 # the OTHER conv lowerin
 cmake -B build -DLOOM_TINYBLAS=OFF                      # no tinyBLAS, for GEMM A/Bs
 GGML_CPU_DISABLE_FUSION=1 <binary>                      # turns every CPU-backend fusion off
 ```
+
+**Measuring against onnxruntime — PIN THE DURATION PREDICTOR FIRST.** It lives in the `~/test` venv on
+the Pi (onnxruntime 1.28.0, phoonnx), model `~/pipertts-en-gb-miro/miro_en-GB.onnx`. VITS's duration
+predictor is stochastic and phoonnx does not seed it, so consecutive runs synthesise 72k-76k samples
+and time a different amount of work each; both engines are near-linear in output samples, so an
+unpinned comparison is a comparison of two different utterances. It cost this thread a baseline that
+stood for weeks — see the correction under P4.15's onnx section.
+
+```python
+cfg = SynthesisConfig(noise_scale=0.0, noise_w_scale=0.0)   # phoonnx, or
+sess.run(None, {"input": ids, "input_lengths": n, "scales": [0.0, 1.0, 0.0]})  # raw session
+```
+
+Then normalise by sample count before quoting a ratio: onnxruntime is 1.044 s at its pinned 72192 and
+**1.063 s at loom's 73472**. Drive the session directly for an engine-to-engine number (phoonnx adds
+~14 ms of Python); its per-op profile needs `so.enable_profiling = True` and `so.intra_op_num_threads
+= 4`, and **shares only** — profiling costs onnxruntime 1.18x, and this build's events carry no
+`run_index`, so runs split by ORDER. `scripts/` has no onnx bench; the two used here are
+`~/bench_onnx2.py` (wall) and `~/prof_onnx_shapes.py` (per-shape) on the Pi.
 
 **The seven ggml patches** live in `cmake/patches/` and are applied at configure time by
 `cmake/GgmlPatches.cmake`, which resets and retries if one no longer applies — so **editing a patch and
@@ -8254,6 +8285,69 @@ Perturbing the fused slope by 5%, and separately the fused residual by 5%, both 
 `test_e2e_matcha_mil_lua_driver` fail — so the 82 green tests are green about something. Fused and
 unfused VITS output agree to 6.7e-8 max on a 0.17 peak, identically at 2 and 4 threads, which a race
 would not do.
+
+### P4.16 — the convolution gap, shape by shape against onnxruntime — SCOPED, NOT STARTED (2026-08-22)
+
+**Why this exists.** After P4.15b, loom is **1.24x** onnxruntime on the reference utterance (1.313 s
+against 1.063 s, same boot, predictor pinned) and **everything outside the convolution is at parity or
+better**: ~240 ms against onnxruntime's 282 ms. The whole remaining gap is convolution — 1103 ms
+against 767 ms, **1.43x, +336 ms** — so this item is the only place left with anything in it.
+
+Both engines profiled per-op on the same box and boot; onnxruntime's shares apportioned over its
+un-profiled 1.044 s, loom's from `$LOOM_PROFILE` (which cannot see fusion, but fusion changes a
+convolution's NEIGHBOURS, not the convolution, so the conv rows are valid). onnxruntime's activations
+are 1.8% shorter because its pinned `y_length` is 282 against loom's 287 — scale its vocoder rows up
+by that before splitting hairs; it moves each ratio by ~2%.
+
+| group | loom calls | loom | onnx calls | onnx | ratio | excess |
+|---|---:|---:|---:|---:|---:|---:|
+| flow/encoder @ L~100 | 93 | 151.1 ms | 69 | 58.3 ms | **2.59x** | **+92.8** |
+| resblocks 64ch @ L18368 | 6 | 216.8 ms | 6 | 144.9 ms | 1.50x | +71.9 |
+| resblocks 32ch @ L73472 | 7 | 226.9 ms | 7 | 166.5 ms | 1.36x | +60.4 |
+| flow/encoder @ L~287 | 41 | 203.4 ms | 41 | 155.6 ms | 1.31x | +47.8 |
+| `CONV_TRANSPOSE_1D` | 3 | 195.8 ms | 3 | 166.4 ms | 1.18x | +29.4 |
+| resblocks 128ch @ L2296 | 6 | 104.4 ms | 6 | 75.7 ms | 1.38x | +28.7 |
+| **total** | **156** | **1098 ms** | **132** | **767 ms** | **1.43x** | **+331** |
+
+**The order this says to work in is NOT the order P4.15 worked in.** The vocoder resblocks — three
+rows, +161 ms — are the ones P4.15 and P4.15b spent themselves on and measured out at 83% of the
+machine's peak in cache. The **short, weight-heavy convolutions of the flow and encoder are +141 ms and
+have never been touched**, and the worst of them is 2.59x.
+
+**And 2.59x cannot be a GEMM-throughput story, which is what makes it interesting.** onnxruntime runs
+`[1,768,103] x [192,768,3]` six times in 22.8 ms — 546 MFLOP, **24 GFLOP/s** — and `[1,192,103] x
+[768,192,3]` six times in 19.6 ms, 28 GFLOP/s. P4.15 measured loom's in-model GEMM at **23.5 GFLOP/s**
+against MLAS's 25.7. A 1.1x arithmetic difference cannot produce 2.59x. The excess is around the GEMM,
+not in it. Three leads, in the order they are cheap to check:
+
+1. **`kw = 1` needs no im2col at all** — it IS a matmul, and materialising a patch matrix for one is a
+   pure copy of the input to no purpose. onnxruntime runs 38 of them (`[1,192,101] x [192,192,1]`) in
+   13.5 ms; loom's direct path declines them (`OL/P < OC/OCB`) and they fall to the batched im2col.
+   **And onnxruntime's graph does not even call them convolutions** — it carries 6 `MatMul` and 20
+   `FusedMatMul` nodes (7.4 ms together) that loom issues as `CONV_1D`. Lowering `kw == 1` straight to
+   `ggml_mul_mat` in `op_conv_1d` is a handful of lines and is the first thing to try.
+2. **loom issues 153 `CONV_1D` where onnxruntime has 129 dense convolution nodes**, and 93 against 57
+   at this scale alone. Some of that is the `MatMul` representation above; find out what the rest is
+   before optimising any of it. Cheapest measurement in the item, and it may be most of the answer.
+
+**Checked and NOT a lead: depthwise.** The obvious suspicion — a `groups=192` convolution lowered as a
+dense 192x192, which would be 192x the arithmetic — is wrong. The exporter emits **12 `CONV_1D_DW`
+nodes**, exactly matching onnxruntime's 12 `[1,192,101] x [192,1,3]` calls, and `op_conv_1d_dw` runs
+them batched per channel. They cost loom 5.1 ms (the `IM2COL` row in its profile) against
+onnxruntime's 1.1 ms — 4.6x, but +4 ms, so it is a rounding error in this item.
+
+`CONV_TRANSPOSE_1D` at 1.18x (+29 ms) is the same item P4.15 already lists as "~60-90 ms, at rough
+parity"; it is now the second-largest op in the profile and still lowered as a dense transpose.
+
+**What NOT to do first.** Do not start on the resblock kernel again. P4.15 measured it at 83% of peak
+in cache with the best of three tiles and no spills, P4.15b measured out both graph-level ideas that
+were supposed to help, and onnxruntime being 1.4x faster there is a fact without a mechanism attached
+yet — get one from the rows above, where the mechanism is visible, before spending another item on it.
+
+**Reproducing the table.** loom: `LOOM_PROFILE=<path> LOOM_THREADS=4 ./build/prof_main <gguf> <ipa> 3`,
+divide by the rep count. onnxruntime: the recipe and the pinning requirement are in P4.15b's cold
+start; the per-shape aggregation is `~/prof_onnx_shapes.py` on the Pi, which groups `Conv`,
+`FusedConv` and `ConvTranspose` events by `args.input_type_shape`.
 
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED (2026-08-20)
 
