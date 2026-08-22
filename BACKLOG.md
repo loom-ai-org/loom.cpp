@@ -8210,9 +8210,11 @@ Pi: `~/.cache/huggingface/hub/models--loom-ai-org--vits-piper-en-gb-miro-loom/sn
 snapshots exist — take `ls -t | head -1`). On the dev box: `../hf-models/vits-piper-en-gb-miro/`.
 
 **Baselines to reproduce before trusting anything.** Pi, 4 threads, idle, steady state: **1.307 s**
-after this item, and **1.205 s** as of P4.15e (**1.441 s** before either; onnxruntime does the same
-utterance in **1.063 s** with its duration predictor pinned, so the ratio is **1.24x** after P4.15b and
-**1.13x** now). x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
+after this item, **1.205 s** as of P4.15e, and **1.099 s** as of P4.15f (**1.441 s** before any of
+them; onnxruntime does the same utterance in **1.063 s** with its duration predictor pinned, so the
+ratio is **1.24x** after P4.15b, 1.13x after P4.15e and **1.03x** now). **P4.15f changed the GGUF**, so
+a pre-P4.15f export measures the old number on a new engine -- check the file has a `text` topology
+before comparing. x86, two threads pinned: **~1.17 s**. If your first number is far off, fix the measurement,
 not the code.
 
 **Scratch trees on the Pi** (all disposable, none of them a git repo):
@@ -8283,6 +8285,10 @@ above, which are new):
 5. **The shapes a bench holds are not the shapes a model runs.** A heuristic tuned on eleven shapes made
    the synthesis *slower* until it was checked against all 153 convolutions the model actually issues;
    and a bench without the model's dilations measures a convolution the model does not have.
+6. **A ratio against another engine silently assumes both engines are doing the same work.** They were
+   not: loom ran the text encoder twice, and P4.16's table was written, ranked and reasoned from
+   before anyone counted the nodes (P4.15d). Counting them cost an afternoon and no measurement rig, and it moved the worst
+   row in P4.16's table from 2.59x to 1.38x. `scripts/conv_census.py` is that count, for any GGUF.
 
 **And the check that made this item honest: prove the gate can fail before believing it passed.**
 Perturbing the fused slope by 5%, and separately the fused residual by 5%, both make
@@ -8372,11 +8378,20 @@ did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27
 
 ### P4.15c — `kw = 1` is a matmul, and loom runs it as a convolution — SCOPED, NOT STARTED (2026-08-22)
 
+**Half of this item's premise was wrong, and P4.15d is what disproved it. Read the correction before
+the observation.** The claim that onnxruntime "carries a further 26 of loom's `CONV_1D` nodes as
+`MatMul`/`FusedMatMul`" is false: the census in P4.15d shows **none of those 26 has a constant
+operand** — 24 are the four attention products of the text encoder's six layers and 2 are the top-level
+path expansion, and loom runs every one of them as `MUL_MAT` too. Both engines agree on which nodes are
+convolutions; there is no set of convolutions onnxruntime declines to call convolutions. What survives
+is the first sentence only. **And the 2.59x it invokes is mostly P4.15d's duplicated encoder**: with
+that removed the L~100 group is 1.38x, in line with the rest of the model, so this item should be
+re-ranked AFTER P4.15f (**done** — the group is 57 calls now, and 1.38x) rather than treated as the
+worst ratio in the model.
+
 **The observation.** In the flow and encoder, onnxruntime runs 38 convolutions of `[1,192,101] x
-[192,192,1]` in **13.5 ms**, and carries a further 26 of loom's `CONV_1D` nodes as `MatMul` /
-`FusedMatMul` — its graph does not call them convolutions at all. loom issues every one through
-`op_conv_1d`. Those shapes sit inside the L~100 group that P4.16 measures at **2.59x**, the worst ratio
-in the model.
+[192,192,1]` in **13.5 ms**; loom ran 62 at that scale until P4.15f and runs the same 38 now, all of
+them through `op_conv_1d`.
 
 **MEASURE BEFORE BUILDING, because the obvious version of this fix may be worth nothing.** The tempting
 statement is "a `kw = 1` convolution is a matmul, so skip the im2col". Half of that is wrong: for
@@ -8396,31 +8411,193 @@ as it runs today, as `cont(transpose) + mul_mat`, and as a bare `mul_mat` on alr
 If the first two are within 10% of each other, this item is only the third bullet and belongs in
 loom-exporter. `scripts/bench9.cpp` is the conv-lowering bench and is the right place to add the row.
 
-### P4.15d — loom issues 153 convolutions where onnxruntime runs 129 — SCOPED, NOT STARTED (2026-08-22)
+### P4.15d — the 24-node gap is one text encoder, run twice — DONE (2026-08-22)
 
-**The observation.** Per synthesis, `$LOOM_PROFILE` counts **153 `CONV_2D`** (plus 12 `CONV_1D_DW`);
-onnxruntime's profile has **121 `Conv` + 8 `FusedConv` = 129** dense convolution nodes (plus the same 12
-depthwise). At the L~100 scale alone it is **93 against 57**. Thirty-six convolutions at that scale, and
-twenty-four overall, that one engine runs and the other does not.
+**The answer, in one sentence.** Every one of loom's 153 dense convolutions has an onnxruntime
+counterpart of exactly the same shape, and **36 of them are the same 36 convolutions run twice**: the
+VITS export splits the text side into two topologies, `stats` and `logw`, and each carries its own
+complete copy of the TextEncoder. loom lowers nothing in more nodes than it needs and the ONNX exporter
+folds nothing away — the gap is entirely a phase split in loom-exporter, and it is **~72 ms of the
+1.205 s**, 78% of the excess in P4.16's worst row. (P4.15f removed it and measured **98 ms**; the
+sentences below are the prediction, left as written.)
 
-Some of it is accounted for: onnxruntime's exporter emitted 6 `MatMul` and 20 `FusedMatMul` nodes for
-convolutions loom keeps as `CONV_1D` (P4.15c). That is 26 of the 24-node gap — so it over-explains the
-total while leaving the per-scale discrepancy open, which means the counts are not lining up the way
-this paragraph assumes and the first job is to stop assuming.
+**The two node lists, and the tool that produces them.** `scripts/conv_census.py` walks the topology
+JSON out of the GGUF, propagates shapes symbolically, and prints every convolution with its real
+`(IL, IC, K, OC, OL, s, p, d)`; with `--onnx` it does the same statically for an ONNX graph and diffs
+the two. The profiler cannot answer this on its own — it buckets by `(op, ne0, ne1)` and a 1-D
+convolution's output is `[OL, 1, OC]`, so all 93 of the L~100 convolutions collapse into one row with
+their weight shapes gone.
 
-**What to actually do**, in order:
+```sh
+python3 scripts/conv_census.py ../hf-models/vits-piper-en-gb-miro/vits-piper-en-gb-miro.gguf \
+    --syms n_tokens=100 --syms flow_vocoder:n_tokens=287 --quiet \
+    --onnx ~/Dev/piper/pipertts_en-GB_miro/miro_en-GB.onnx
+```
 
-1. Dump loom's 153 with their shapes. `$LOOM_PROFILE` keys on `(op, ne0, ne1)` and `ne1 = 1` for every
-   1-D convolution, so all 93 of the L~100 ones collapse into one row and the profile cannot answer
-   this. Extend the profile key with the weight's `ne`, or walk `model.graph_topology` — the topology
-   JSON is in the GGUF and lists every `CONV_1D` with its attrs, which is the cheaper path.
-2. Line those up against the onnxruntime table in P4.16 and name the ones that have no counterpart.
-3. Only then ask whether they are loom lowering something in more nodes than it needs, or the ONNX
-   export folding something loom cannot see (a constant-folded branch, a fused activation).
+The two `--syms` are the driver script's own sequencing, not something the topology JSON reveals:
+`stats`/`logw` run at the token count, `flow_vocoder` at the duration-expanded `y_length`. **The ONNX
+file is already on the dev box** at `~/Dev/piper/pipertts_en-GB_miro/miro_en-GB.onnx` — sha256
+`c2122147…`, byte-identical to the Pi's `~/pipertts-en-gb-miro/miro_en-GB.onnx` and to
+`OpenVoiceOS/pipertts_en-GB_miro` on the Hub. Reading it needs `pip install onnx` (1.21 here) and no
+runtime, no session and no Pi: **this whole item was done on the dev box with the Pi unreachable.**
 
-**Why it is worth an item of its own.** It is the cheapest question in the P4.16 group — no kernel work,
-no measurement rig, just two node lists — and it gates the interpretation of everything else in that
-entry. A per-shape ratio is only meaningful once both sides are known to be running the same work.
+Thirty-five distinct shapes, of which **exactly three differ**, and all three are text-encoder shapes:
+
+| op | K | IC | OC | loom | onnx | diff |
+|---|---:|---:|---:|---:|---:|---:|
+| `CONV_1D` | 1 | 192 | 192 | 66 | 42 | **+24** — the six attention layers' q/k/v/o |
+| `CONV_1D` | 3 | 192 | 768 | 12 | 6 | **+6** — the six FFN first convs |
+| `CONV_1D` | 3 | 768 | 192 | 12 | 6 | **+6** — the six FFN second convs |
+| everything else (32 shapes) | | | | 78 | 78 | 0 |
+| **total** | | | | **168** | **132** | **+36** |
+
+Both sides include the 12 depthwise and the 3 transposed convolutions, and both agree on them exactly.
+**Both totals are also the ones P4.16's table arrived at independently, by profiling**: its onnx column
+sums to 132 calls, which is exactly the ONNX graph's 132 convolution nodes; its loom column sums to 156,
+which is the census's 168 minus the 12 depthwise that loom profiles under `IM2COL` rather than as
+convolutions. Two engines, two methods, four numbers, no discrepancy — which is what makes the +36
+believable.
+The onnx side's own module split is the confirmation that the +36 is one encoder: `enc_p` 37, `dp` 32,
+`flow` 40, `dec` 23 — and loom's `stats` is 37 (= `enc_p`), its `logw` is 68 (= `enc_p` minus its
+projection, 36, **plus** `dp`'s 32), its `flow_vocoder` is 63 (= `flow` + `dec`).
+
+**The duplicated prefix is provably the same computation, not merely the same shapes** — which is
+`conv_census.py --shared-prefix`, a structural isomorphism over the two node lists with weights compared
+by identity rather than by shape. `stats`'s first
+**469 nodes and `logw`'s first 469 nodes are identical node for node** — same ops, same attrs, same
+weight tensors once `loom.tensor_alias` is resolved — and they diverge at exactly the node where
+`stats` applies `enc_proj` and `logw` applies `dp_pre`. That is 469 of the model's 1744 graph nodes
+recomputed: 36 `CONV_1D`, 24 `MUL_MAT`, 12 `LAYER_NORM`, 18 `PAD_1D`, 18 `CONCAT` and the elementwise
+around them. **The FILE already dedupes** — 137 of `logw`'s weights are `loom.tensor_alias` entries
+pointing into `stats.`, which is why `logw` holds 2.2 MB of tensors against `stats`'s 44.2 MB. Only the
+compute is duplicated.
+
+**Three corrections to what the previous entries assumed.** Each of them was load-bearing:
+
+1. **onnx has 129 `Conv` nodes in total, twelve of them grouped — so its DENSE count is 117, not 129.**
+   The observation this item was written from ("129 dense convolution nodes plus the same 12
+   depthwise") counted the depthwise twice. The real gap is 153 - 117 = **36**, which is one encoder
+   exactly; there is nothing left over and nothing to over-explain.
+2. **The 26 `MatMul`/`FusedMatMul` nodes are not convolutions in disguise.** None of the 26 has an
+   initializer operand — 24 are the four attention products of `enc_p`'s six layers and 2 are the
+   top-level path expansion. loom runs the same products as `MUL_MAT`, 48 of them, again 2x for the
+   same reason. **This deletes the second half of P4.15c's premise**, which is corrected in place.
+3. **The per-scale counts line up once the depthwise are put on the right side.** onnx's 69 at L~100 is
+   `enc_p` 37 + `dp` 32, and `dp`'s 32 includes the 12 depthwise; its dense count there is 57. loom's
+   93 dense is `stats` 37 + `logw` 56. 93 - 36 = 57. Nothing is unaccounted for at any scale.
+
+**What it is worth, and the decomposition it hands P4.16's worst row.** From the census (arithmetic) and
+P4.16's table (time), at L~100 on the Pi:
+
+| | convs | MFLOP | ms | GFLOP/s |
+|---|---:|---:|---:|---:|
+| loom | 93 | 2598.7 | 151.1 | 17.2 |
+| onnx | 57 | 1360.1 | 57.2 | 23.8 |
+
+(Dense only on both sides, which is why onnx reads 57 and 57.2 ms here against the 69 and 58.3 ms in
+P4.16's row: that row counts onnxruntime's 12 depthwise convolutions and their 1.1 ms, loom's does not —
+loom's depthwise land in its `IM2COL` row instead. The FLOP columns are the census's, the ms columns are
+P4.16's.)
+
+**1.91x of the work at 1.38x lower throughput is 2.64x — and the row measures 2.59x.** So P4.16's "2.59x
+cannot be a GEMM-throughput story" is right for a reason it did not consider: **most of that row is not
+a kernel problem at all.** The duplicated encoder is 1238.6 MFLOP, and at loom's own measured throughput
+for that group it is **72.0 ms** — 78% of the row's +92.8 ms excess. What remains after it is 1.38x,
+which is the same ~1.3-1.4x the rest of the model already shows and is a throughput question like the
+others.
+
+That 72 ms is convolution only. The other 433 nodes of the duplicated prefix (24 `MUL_MAT`, 12
+`LAYER_NORM`, the elementwise) are on top of it, out of the ~240 ms loom spends outside convolution.
+
+**And VITS is not the only model that does it.** `--shared-prefix` over all seventeen local exports
+finds one other: **Matcha-TTS's `encoder_mu` and `encoder_logw` share 642 nodes of 668/647**, including
+40 convolutions, and its driver runs both. Everything else is clean. Details and the one false-positive
+shape to know about are in P4.15f.
+
+**The fix belongs in loom-exporter, and it is P4.15f below — DONE the same day.** The engine was doing
+exactly what the GGUF told it to. Measured outcome: **1.196 -> 1.099 s on the Pi, 98 ms**, against the
+~72 ms this entry predicted for the convolutions alone; the rest is the other 433 nodes of the
+duplicated prefix, which is where the prediction said the remainder would be.
+
+### P4.15f — the text encoder, once (VITS and Matcha) — DONE (2026-08-22)
+
+**What it was worth.** Raspberry Pi 4, 4 threads, cool and idle, ABBA in both orders, medians of the
+steady-state reps: **1.196 -> 1.099 s, 98 ms and 8.2%** on the reference utterance. Against
+onnxruntime's 1.063 s for the same 73472 samples that is **1.126x -> 1.033x**. (A second session at a
+warmer ambient measured 1.204 -> 1.115, 89 ms; the delta is stable, the absolute is not.) At ONE thread
+the L~100 convolution group — the one P4.16 has at 2.59x — falls **376.7 -> 199.1 ms, 1.89x**, against
+the 1.91x arithmetic reduction the census predicted. Matcha's half is real but small: see below.
+
+**The change, in both exporters.** `stats` and `logw` were two topologies, each carrying its own copy
+of the TextEncoder; they are now one two-output `text` topology
+(`vits_export.py`'s `TextWrapper`, replacing `StatsWrapper` + `LogwWrapper`), and the driver's two
+`run_subgraph` calls are one:
+
+```lua
+local stats, logw = loom.run_subgraph('text', {n_tokens = T, n_past = 0}, {tokens = ..., z_noise = ...})
+```
+
+`z_noise` moves ahead of the call — it is sized from the token count alone, so the RNG draw order does
+not change, which is the whole reason the result can be required to be bit-identical. Matcha is the
+same edit: `MuWrapper` + `LogwWrapper` -> `EncoderWrapper`, `encoder_mu` + `encoder_logw` -> `encoder`.
+
+**Verification, in the order it is worth trusting.**
+
+1. **The waveform is bit-identical**, `==` on the float lists, not a tolerance: VITS at seeds 0/7/42/1234
+   and at two utterance lengths; Matcha at seeds 0/42 and n_steps 1/2/10. **And the comparison can
+   fail** — changing the seed or one token id makes it differ, checked both ways.
+2. **The tensor oracle.** `test_e2e_matcha_mil_text_encoder` now runs the merged topology and reads
+   both outputs from one build, against `reference_forward_matcha_text_encoder.py`'s real-PyTorch
+   fixture: **mu 1.24e-4, logw 6.4e-5**. Perturbing the reference by 0.01 makes it fail, so the bound
+   is doing work.
+3. **The census closes.** `conv_census.py --onnx` reads **132 against 132, every shape row zero** where
+   it read 168 against 132; `--shared-prefix` reports no shared prefix for either model. loom now
+   issues exactly onnxruntime's 117 dense convolutions, 12 depthwise and 3 transposed.
+4. **The profiler agrees, per node.** VITS at one thread: `CONV_2D` **153 -> 117 calls per rep**, the
+   L~100 bucket **93 -> 57**, `MUL_MAT` **60 -> 36** (the 24 duplicated attention products), and every
+   other bucket unchanged to the call. Matcha: node executions 2972 -> 2083, its L=38 convolution
+   bucket 84 -> 44 calls and 177.3 -> 88.3 ms.
+5. **Structure.** The GGUF snapshot moves exactly where it should and nowhere else: three topologies to
+   two, one fewer KV, `stats.*`/`logw.*` renamed to `text.*` — and **the multiset of tensor sha256s is
+   unchanged**, so no weight moved, only the namespace.
+6. **Suites.** loom-exporter `tests/ci` 572 passed; loom.cpp `-L ci` 68 passed and `-L gate` 82 passed
+   with the new exports in place.
+
+**Matcha: the same bug, and honestly not worth much.** 642 duplicated nodes of 668, 40 convolutions,
+and the driver did run both — but its HiFi-GAN v1 vocoder dominates the synthesis so completely that
+even at `n_steps=1` a 39-token utterance takes 5.1 s on the Pi, of which the duplicated encoder is
+**~96 ms at one thread (0.7%)**. End to end at four threads it is **below the noise floor of a Pi that
+heats from 53 to 83 C during the measurement** — eight interleaved rounds put before and after within
+each other's spread while the drift moved both by 13%. Recorded as measured: the fix is right, the
+speedup is not visible from outside on this model. **And that thermal drift is itself the lesson** — a
+6-second-per-rep workload heats a Pi 4 faster than an 80 ms effect can be resolved; VITS at 1.2 s per
+rep is measurable, Matcha at 6 s is not.
+
+**What moved outside the two exporters.** Three engine gate tests hardcoded the old topology names and
+now name the new ones: `test_e2e_vits_mil_lua_driver`, `test_e2e_matcha_mil_lua_driver`, and
+`test_e2e_matcha_mil_text_encoder` (which also grew a `run_topology` that returns every declared
+output). The two **bespoke**-conversion tests (`test_e2e_vits_lua_driver`, `test_e2e_matcha_lua_driver`)
+still say `stats`/`logw` and `encoder_mu`/`encoder_logw`, correctly: the hand-built converters are
+unchanged. Four hermetic exporter tests build the real Matcha config against stub topologies and needed
+the stub to declare two outputs (`_topo(..., outputs=[...])`).
+
+**Follow-ups this leaves open, none of them blocking:**
+
+* **The published GGUFs are pre-P4.15f.** `loom-ai-org/vits-piper-en-gb-miro` and the Matcha repo both
+  carry the three/four-topology export, and `../hf-models/` mirrors them. Re-exporting and pushing is a
+  publishing decision, so it is not done here — but note that an OLD published GGUF still runs
+  correctly on a new engine (nothing about the format changed), while a NEW GGUF needs no engine change
+  either. The two are independent.
+* **The local gate fixture set is refreshed, and one test that never ran now runs.**
+  `loom-engine-artifacts/v5` has the new `vits_mil.gguf` and `matcha_mil.gguf`, plus
+  `v5/vits_mil/vits_mil.gguf` — the DIRECTORY form `LOOM_VITS_MIL_DIR` actually resolves to, whose
+  absence is why the VITS MIL gate had been skipping silently. `v5/matcha_text_encoder_ref/` is new
+  too (regenerate with `reference_forward_matcha_text_encoder.py`, which needs
+  `PYTHONPATH=~/Dev/Matcha-TTS` and the `matcha` venv), so the tensor oracle above runs by default.
+  `LOOM_FIXTURES=~/Dev/loom-engine-artifacts/v5 ctest -L gate` is **82/82** on this machine.
+* **`~/loom-p415/tts_main.cpp` on the Pi** is new: prof_main's sibling for a driver that takes raw
+  token ids plus scalar knobs (`tts_main <gguf> <id,id,...> [reps] [name=value ...]`), which is what
+  timing Matcha needed. Same disposable scratch tree, appended to its CMakeLists the same way.
 
 ### P4.16 — the convolution gap, shape by shape against onnxruntime — SCOPED, NOT STARTED (2026-08-22)
 
@@ -8437,13 +8614,21 @@ by that before splitting hairs; it moves each ratio by ~2%.
 
 | group | loom calls | loom | onnx calls | onnx | ratio | excess |
 |---|---:|---:|---:|---:|---:|---:|
-| flow/encoder @ L~100 | 93 | 151.1 ms | 69 | 58.3 ms | **2.59x** | **+92.8** |
+| flow/encoder @ L~100 | 93 | 151.1 ms | 69 | 58.3 ms | **2.59x** ¹ | **+92.8** ¹ |
 | resblocks 64ch @ L18368 | 6 | 216.8 ms | 6 | 144.9 ms | 1.50x | +71.9 |
 | resblocks 32ch @ L73472 | 7 | 226.9 ms | 7 | 166.5 ms | 1.36x | +60.4 |
 | flow/encoder @ L~287 | 41 | 203.4 ms | 41 | 155.6 ms | 1.31x | +47.8 |
 | ~~`CONV_TRANSPOSE_1D`~~ | 3 | ~~195.8~~ **79.1 ms** | 3 | 166.4 ms | **0.48x** | **-87.3** |
 | resblocks 128ch @ L2296 | 6 | 104.4 ms | 6 | 75.7 ms | 1.38x | +28.7 |
 | **total** (after P4.15e) | **156** | **981 ms** | **132** | **767 ms** | **1.28x** | **+214** |
+
+¹ **P4.15d took this row apart afterwards and P4.15f removed it: most of the +92.8 ms was one text
+encoder run twice, not a kernel.** The group is now 57 calls, not 93 — at one thread it fell
+376.7 -> 199.1 ms, **1.89x**, against the 1.91x arithmetic the census predicted, and end to end the
+model went 1.196 -> 1.099 s (1.126x -> **1.033x** of onnxruntime). What is left in this row is the
+~1.38x throughput gap, in line with every other row. **The whole table needs re-measuring against the
+new export**; this is the only row that moves, but it moves from first to last. The discussion below
+predates all of that and is kept for the reasoning, not the ranking.
 
 `CONV_TRANSPOSE_1D` is struck through because **P4.15e did it**, and the way it fell is the warning
 this table needs. It was ranked LAST here — 1.18x, +29 ms, the smallest row — and it turned out to hold
@@ -8455,26 +8640,39 @@ implementations are equally bad will sort to the bottom.
 **The order this says to work in is NOT the order P4.15 worked in.** The vocoder resblocks — three
 rows, +161 ms — are the ones P4.15 and P4.15b spent themselves on and measured out at 83% of the
 machine's peak in cache. The **short, weight-heavy convolutions of the flow and encoder are +141 ms and
-have never been touched**, and the worst of them is 2.59x.
+have never been touched**.
 
-**And 2.59x cannot be a GEMM-throughput story, which is what makes it interesting.** onnxruntime runs
-`[1,768,103] x [192,768,3]` six times in 22.8 ms — 546 MFLOP, **24 GFLOP/s** — and `[1,192,103] x
-[768,192,3]` six times in 19.6 ms, 28 GFLOP/s. P4.15 measured loom's in-model GEMM at **23.5 GFLOP/s**
-against MLAS's 25.7. A 1.1x arithmetic difference cannot produce 2.59x. The excess is around the GEMM,
-not in it. Three leads, in the order they are cheap to check:
+**The top row's 2.59x has since been taken apart, and it was not a kernel at all.** P4.15d's census
+shows loom running **1.91x the arithmetic** there — the text encoder is in the graph twice — at 1.38x
+lower throughput, and 1.91 x 1.38 = 2.64 against the 2.59 this table measured. So ~72 of the +92.8 ms
+is duplicated work (**P4.15f** removed it) and ~21 ms is throughput, which puts this row in line with
+every other row rather than at the top of the table. **The whole table still needs re-measuring against
+the post-P4.15f export**: it is the only row that moves, but it moves from first to last.
 
-1. **`kw = 1` convolutions** — onnxruntime runs 38 of them as `Conv` and carries 26 more as
-   `MatMul`/`FusedMatMul`; loom issues every one through `op_conv_1d`. **Scoped as P4.15c**, with the
-   reason the obvious fix may be worth nothing (for `kw = 1` the im2col is a transpose, not a redundant
-   copy, and `ggml_mul_mat` needs that transpose anyway).
-2. **loom issues 153 `CONV_1D` where onnxruntime has 129 dense convolution nodes**, 93 against 57 at
-   this scale alone. **Scoped as P4.15d**, and it should be done FIRST: a per-shape ratio only means
-   something once both engines are known to be running the same work.
+The paragraph this replaces argued that 2.59x "cannot be a GEMM-throughput story" from the arithmetic —
+onnxruntime runs `[1,768,103] x [192,768,3]` six times in 22.8 ms (546 MFLOP, **24 GFLOP/s**) and
+`[1,192,103] x [768,192,3]` six times in 19.6 ms (28 GFLOP/s), against loom's in-model GEMM at **23.5
+GFLOP/s** (P4.15), and a 1.1x arithmetic difference cannot produce 2.59x. That reasoning was right and
+its conclusion — "the excess is around the GEMM, not in it" — was righter than intended: the excess was
+not in this group's convolutions at all. **When a ratio is inexplicable by the kernel, count the nodes
+before profiling them.**
+
+The leads that remain:
+
+1. **`kw = 1` convolutions** — onnxruntime runs 38 of them as `Conv`; loom issues every one through
+   `op_conv_1d`. **Scoped as P4.15c**, whose second premise P4.15d disproved and whose ranking should
+   now wait for P4.15f. The reason the obvious fix may still be worth nothing is unchanged: for
+   `kw = 1` the im2col is a transpose, not a redundant copy, and `ggml_mul_mat` needs that transpose
+   anyway.
+2. ~~**loom issues 153 `CONV_1D` where onnxruntime has 129 dense convolution nodes**~~ — **ANSWERED by
+   P4.15d and FIXED by P4.15f.** onnxruntime has 117 dense convolutions plus 12 depthwise, loom had
+   153, and the 36-node difference was one text encoder run twice. Every other shape matched one for
+   one, and loom now issues 117 too.
 
 **Checked and NOT a lead: depthwise.** The obvious suspicion — a `groups=192` convolution lowered as a
 dense 192x192, which would be 192x the arithmetic — is wrong. The exporter emits **12 `CONV_1D_DW`
-nodes**, exactly matching onnxruntime's 12 `[1,192,101] x [192,1,3]` calls, and `op_conv_1d_dw` runs
-them batched per channel. They cost loom 5.1 ms (the `IM2COL` row in its profile) against
+nodes**, exactly matching onnxruntime's 12 `[1,192,101] x [192,1,3]` calls — dilation for dilation, four
+each at d=1, d=3 and d=9, per P4.15d's census — and `op_conv_1d_dw` runs them batched per channel. They cost loom 5.1 ms (the `IM2COL` row in its profile) against
 onnxruntime's 1.1 ms — 4.6x, but +4 ms, so it is a rounding error in this item.
 
 `CONV_TRANSPOSE_1D` at 1.18x (+29 ms) is the same item P4.15 already lists as "~60-90 ms, at rough
@@ -8485,7 +8683,9 @@ in cache with the best of three tiles and no spills, P4.15b measured out both gr
 were supposed to help, and onnxruntime being 1.4x faster there is a fact without a mechanism attached
 yet — get one from the rows above, where the mechanism is visible, before spending another item on it.
 
-**Reproducing the table.** loom: `LOOM_PROFILE=<path> LOOM_THREADS=4 ./build/prof_main <gguf> <ipa> 3`,
+**Reproducing the table.** The node lists, which are what the shapes below mean, come from
+`scripts/conv_census.py` (P4.15d) and need neither a run nor a Pi. The times: loom
+`LOOM_PROFILE=<path> LOOM_THREADS=4 ./build/prof_main <gguf> <ipa> 3`,
 divide by the rep count. onnxruntime: the recipe and the pinning requirement are in P4.15b's cold
 start; the per-shape aggregation is `~/prof_onnx_shapes.py` on the Pi, which groups `Conv`,
 `FusedConv` and `ConvTranspose` events by `args.input_type_shape`.
