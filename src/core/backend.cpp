@@ -303,6 +303,37 @@ std::string device_list_for_error() {
     return names;
 }
 
+
+// The CPU backend's thread count, which nothing in this engine used to set.
+//
+// `ggml` defaults to `GGML_DEFAULT_N_THREADS` -- **4, whatever the machine has** (`ggml.h:232`) -- so
+// loom ran a 24-core workstation on four cores and said nothing about it.
+//
+// Set through the REGISTRY's proc address rather than by calling `ggml_backend_cpu_set_n_threads`,
+// which lives inside the CPU backend and is therefore unlinkable in the `GGML_BACKEND_DL` build the
+// wheels ship (ADR-009) -- the same reason `tests/support/cpu_backend.h` exists. A backend that does
+// not export it (every GPU one) is left alone, which is correct: their parallelism is not a host
+// thread count.
+//
+// `$LOOM_N_THREADS` is the only way in and **unset changes nothing**, so no existing deployment moves
+// underneath its owner. Whether the default should become the core count is a decision with a
+// benchmark attached rather than a patch, and is filed rather than taken here.
+void apply_cpu_threads(ggml_backend_t backend) {
+    if (backend == nullptr) return;
+    const char* env = std::getenv("LOOM_N_THREADS");
+    if (env == nullptr || *env == '\0') return;
+    const int n = std::atoi(env);
+    if (n <= 0) return;
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) return;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) return;
+    auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+    if (set_n_threads != nullptr) set_n_threads(backend, n);
+}
+
 } // namespace
 
 void add_backend_search_path(const std::string& dir) {
@@ -421,6 +452,7 @@ Device Device::open(const std::string& spec) {
     }
     device.name_ = ggml_backend_dev_name(dev);
     device.description_ = ggml_backend_dev_description(dev);
+    apply_cpu_threads(device.primary_.get());
 
     // The CPU comes along whenever the primary is not one, and it is not optional: see backend.h for why
     // a device backend can never run this engine's ggml_map_custom nodes. ggml_backend_sched additionally
@@ -431,6 +463,7 @@ Device Device::open(const std::string& spec) {
         if (!device.fallback_) {
             throw Error("loom::Device: the CPU fallback backend failed to initialize");
         }
+        apply_cpu_threads(device.fallback_.get());
 
         // Host-memory accelerators join the chain between the primary and the CPU, but ONLY when the
         // primary has its own memory. Two reasons for that condition, both in Backends::assists: a

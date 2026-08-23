@@ -15,7 +15,6 @@
 // `scales = [0.0, 1.0, 0.0]`, so both sides synthesise the same number of samples -- which the two
 // harnesses print, and which must match before any ratio is believed.
 #include "loom/loom.h"
-#include "cpu_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -36,13 +35,15 @@ int main(int argc, char** argv) {
         17,0,14,0,100,0,26,0,3,0,41,0,59,0,3,0,23,0,59,0,25,0,28,0,22,0,120,0,33,0,122,0,32,0,50,0,8,
         0,3,0,25,0,14,0,74,0,3,0,19,0,88,0,120,0,61,0,26,0,17,0,13,0,2};
 
-    ggml_backend_ptr backend(loom_test::cpu_backend());
-    if (!backend) { std::fprintf(stderr, "no cpu backend\n"); return 1; }
+    // Device::open rather than a bare CPU backend, because that is what applies $LOOM_N_THREADS --
+    // ggml's own default is 4 whatever the machine has, so a bare backend cannot be asked for 24.
+    loom::Device device = loom::Device::open("cpu");
+    loom::Backends backends = device.backends();
 
-    auto model = loom::GgufModel::load(dir + "/vits_mil.gguf", backend.get());
+    auto model = loom::GgufModel::load(dir + "/vits_mil.gguf", backends.primary);
     if (!model) { std::fprintf(stderr, "load failed\n"); return 1; }
 
-    loom::LoomLuaBridge bridge(backend.get());
+    loom::LoomLuaBridge bridge(backends);
     bridge.register_module("text", *model, loom::GraphTopology::parse(model->topology_json("text")));
     bridge.register_module("flow_vocoder", *model,
                            loom::GraphTopology::parse(model->topology_json("flow_vocoder")));
