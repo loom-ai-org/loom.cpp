@@ -126,6 +126,12 @@ public:
     // entry becomes `inputs.<key>` inside the script, matching the design doc's own
     // `function transcribe(inputs)` convention). Throws loom::Error (wrapping the Lua error message) if
     // the function doesn't exist or raises an error.
+    // Whether the loaded script defines `fn_name` as a callable global. Exists so a caller can PREFER
+    // an optional entry point over a mandatory one without catching an exception to find out -- see
+    // `loom::text::generate`, which takes a driver's `infer_with_past` over its `infer` when both are
+    // exported.
+    bool has_function(const std::string& fn_name) const;
+
     Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args);
 
 private:

@@ -81,6 +81,49 @@ box that leaves 20 cores idle, and it is why the comparison above is honest at `
 4` rather than generous. Whether the engine should expose a thread count is not filed as work here —
 naming it so the next person does not read the 4 as a measurement artifact.
 
+### Three tasks, not one — and the convolutional one is the good one
+
+VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
+Measured the same day on the same box, F32 on both sides, 4 threads on both sides:
+
+| task | model | loom | onnxruntime | |
+|---|---|---|---|---|
+| TTS | VITS (piper en-GB) | 0.0708 s | 0.0650 s | **1.09x** |
+| ASR | whisper-small | 3.80 s | 3.23 s | **1.18x** |
+| LM | Qwen3-0.6B | 2.98 s / 65 tok | 3.33 s / 65 tok | **0.89x** (loom faster) |
+
+**That LM row was the engine calling the wrong function, and it is fixed.** `loom::text::generate`
+called `infer` unconditionally. Every generated causal-LM driver exports **two** entry points — `infer`,
+one forward over whatever it is handed, returning one token; and `infer_with_past`, which runs the
+decode loop itself against the KV cache and returns the whole sequence. Taking `infer`, the host re-fed
+a growing prompt and every step recomputed the entire sequence.
+
+`$LOOM_PROFILE` is what showed it, and only because it prints shapes: **112 `MUL_MAT` calls per step at
+`ne1` = the current sequence length rather than 1** — 28 layers x 4 projections, over the whole prompt,
+every token. A plausible-sounding Lua-marshalling explanation was argued first and was wrong; `MUL_MAT`
+was 83-88% of the profile the whole time. That is the fourth time on this thread that reasoning from
+code lost to reading a profile.
+
+| Qwen3-0.6B, 65 tokens | | |
+|---|---|---|
+| `infer`, re-fed prompt (was shipping) | 8.43 s | 7.71 tok/s |
+| `infer_with_past` (now selected) | **2.98 s** | **21.78 tok/s** |
+| onnxruntime | 3.33 s | 19.21 tok/s |
+
+**So loom is at parity on all three tasks**, and the LM was never a kernel problem. The tell was the
+*shape* of the curve, not its height: onnxruntime's cost per token is flat (46.7 ms at 64 tokens, 45.2
+at 128) and loom's was not (146 -> 305 ms), which is what O(n^2) looks like from outside.
+
+Both ASR engines produce the identical transcript, so that 1.18x is comparable work. The LM figures are
+**differenced** — the same prompt at 1 and at 65 new tokens, so model load, tokenisation and prefill
+cancel and what remains is 64 decode steps; loom's raw wall times include a 2.4 GB GGUF load that
+onnxruntime's do not, and quoting them undifferenced would flatter onnxruntime by about a second.
+
+Harnesses: `scripts/bench_vits_loom.cpp` and, for the other two, `loom_cli` timed against a raw
+`onnxruntime` decode loop. **Do not use `optimum` for Qwen3** — 2.3.0 infers `head_dim` as
+`hidden / n_heads` (64) where Qwen3 decouples it to 128, and the session rejects the KV cache it
+builds. Reading the shapes off `session.get_inputs()` avoids assuming anything.
+
 ### Operating notes: benchmarking
 
 **Machines.** The Pi is **`192.168.1.35`** — the `rpi4` name does not resolve. The workstation is
