@@ -1,0 +1,932 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -7056,11 +7056,66 @@
+ #  define GGML_CONV1D_LANES 1
+ #endif
+ 
++// LEAKY_RELU, in the two forms the fused input path needs it. Written as compare-and-select rather
++// than max/min so the result is bit-identical to ggml_vec_leaky_relu_f32, which is what the node this
++// replaces would have produced -- including for a NaN, where max() propagates and the comparison does
++// not.
++#if defined(__aarch64__)
++static inline float32x4_t ggml_conv1d_leaky_v(float32x4_t v, float32x4_t z, float32x4_t s) {
++    return vfmaq_f32(vbslq_f32(vcgtq_f32(v, z), v, z), s, vbslq_f32(vcltq_f32(v, z), v, z));
++}
++#endif
++
++static inline float ggml_conv1d_leaky_s(float v, float slope) {
++    return (v > 0.0f ? v : 0.0f) + slope * (v < 0.0f ? v : 0.0f);
++}
++
++// The activation transformed on its way into the padded buffer the sweep below reads. The convolution
++// makes that copy anyway, so the unary node this stands in for -- a full read and a full write of the
++// activation, 4.7 ms for the 9.4 MB one in a VITS vocoder on a Cortex-A72 -- costs nothing here.
++static void ggml_conv1d_leaky_copy(float * dst, const float * src, int64_t n, float slope) {
++    int64_t i = 0;
++#if defined(__aarch64__)
++    const float32x4_t z = vdupq_n_f32(0.0f);
++    const float32x4_t s = vdupq_n_f32(slope);
++    for (; i + 4 <= n; i += 4) {
++        vst1q_f32(dst + i, ggml_conv1d_leaky_v(vld1q_f32(src + i), z, s));
++    }
++#elif defined(__AVX2__) && defined(__FMA__)
++    const __m256 z = _mm256_setzero_ps();
++    const __m256 s = _mm256_set1_ps(slope);
++    for (; i + 8 <= n; i += 8) {
++        const __m256 v = _mm256_loadu_ps(src + i);
++        _mm256_storeu_ps(dst + i, _mm256_fmadd_ps(s, _mm256_and_ps(v, _mm256_cmp_ps(v, z, _CMP_LT_OQ)),
++                                                     _mm256_and_ps(v, _mm256_cmp_ps(v, z, _CMP_GT_OQ))));
++    }
++#endif
++    for (; i < n; ++i) {
++        dst[i] = ggml_conv1d_leaky_s(src[i], slope);
++    }
++}
++
+ // One tile: [oc0, oc0+OCB) x [p0, p0 + VEC*LANES), reading the zero-padded activation `xp`.
+-static inline void ggml_conv_1d_direct_tile(const float * xp, const float * wp, const float * bias,
++//
++// `res`, when it is not null, is the residual add that follows the convolution, in the destination's
++// own layout. It is applied as each accumulator is stored, which is the one moment both are in
++// registers -- and it may be the destination itself, because every output element reads exactly the
++// residual element it is about to overwrite. `pmin` is what keeps that true: the tail tile below
++// recomputes positions the last full tile already wrote, and adding a residual to those twice is
++// exactly the corruption this parameter exists to prevent.
++//
++// RES and CLAMP are template parameters and not arguments FOR A MEASURED REASON. The accumulators are
++// an array indexed by the store loop's own counters, which the compiler can only keep in registers if
++// it unrolls that loop -- and it stops unrolling as soon as the body has a branch in it. Written with
++// two runtime `if`s the whole synthesis went 1.44 -> 1.73 s on a Cortex-A72: not the cost of the
++// residual, the cost of sixteen vector accumulators moving to the stack in every convolution in the
++// model, including the ones with nothing fused into them at all.
++template <bool RES, bool CLAMP>
++static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float * wp, const float * bias,
+                                             float * y, int64_t IC, int64_t OC, int64_t KW,
+                                             int64_t LP, int64_t OL, int64_t dil,
+-                                            int64_t oc0, int64_t p0, int64_t ocn) {
++                                            int64_t oc0, int64_t p0, int64_t ocn,
++                                            const float * res, int64_t pmin) {
+     const int64_t P = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
+ #if defined(__aarch64__)
+     float32x4_t acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
+@@ -7083,8 +7138,28 @@
+             }
+         }
+     }
+-    for (int i = 0; i < ocn; ++i)
+-        for (int j = 0; j < GGML_CONV1D_VEC; ++j) vst1q_f32(y + (oc0 + i) * OL + p0 + j * 4, acc[i][j]);
++    if (CLAMP) {
++        // the tail tile, and only it: staged through the stack so the loops the other two branches use
++        // stay the shape the compiler will unroll, then written back element by element from the first
++        // position the last full tile did not already cover.
++        float t[GGML_CONV1D_OCB][GGML_CONV1D_VEC * 4];
++        for (int i = 0; i < GGML_CONV1D_OCB; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) vst1q_f32(&t[i][j * 4], acc[i][j]);
++        for (int i = 0; i < ocn; ++i) {
++            const int64_t off = (oc0 + i) * OL + p0;
++            for (int64_t k = pmin - p0; k < GGML_CONV1D_VEC * 4; ++k)
++                y[off + k] = t[i][k] + (RES ? res[off + k] : 0.0f);
++        }
++    } else if (RES) {
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++                const int64_t off = (oc0 + i) * OL + p0 + j * 4;
++                vst1q_f32(y + off, vaddq_f32(acc[i][j], vld1q_f32(res + off)));
++            }
++    } else {
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) vst1q_f32(y + (oc0 + i) * OL + p0 + j * 4, acc[i][j]);
++    }
+ #elif defined(__AVX2__) && defined(__FMA__)
+     __m256 acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
+     for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
+@@ -7104,8 +7179,25 @@
+             }
+         }
+     }
+-    for (int i = 0; i < ocn; ++i)
+-        for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
++    if (CLAMP) {
++        float t[GGML_CONV1D_OCB][GGML_CONV1D_VEC * 8];
++        for (int i = 0; i < GGML_CONV1D_OCB; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(&t[i][j * 8], acc[i][j]);
++        for (int i = 0; i < ocn; ++i) {
++            const int64_t off = (oc0 + i) * OL + p0;
++            for (int64_t k = pmin - p0; k < GGML_CONV1D_VEC * 8; ++k)
++                y[off + k] = t[i][k] + (RES ? res[off + k] : 0.0f);
++        }
++    } else if (RES) {
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++                const int64_t off = (oc0 + i) * OL + p0 + j * 8;
++                _mm256_storeu_ps(y + off, _mm256_add_ps(acc[i][j], _mm256_loadu_ps(res + off)));
++            }
++    } else {
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
++    }
+ #else
+     float acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
+     for (int i = 0; i < GGML_CONV1D_OCB; ++i)
+@@ -7119,9 +7211,29 @@
+                     acc[i][j] += w * xp[ic * LP + p0 + j + kx * dil];
+             }
+     for (int i = 0; i < ocn; ++i)
+-        for (int j = 0; j < GGML_CONV1D_VEC; ++j) y[(oc0 + i) * OL + p0 + j] = acc[i][j];
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++            if (CLAMP && p0 + j < pmin) continue;
++            const int64_t off = (oc0 + i) * OL + p0 + j;
++            y[off] = acc[i][j] + (RES ? res[off] : 0.0f);
++        }
+ #endif
+-    (void) P;
++    (void) P; (void) res; (void) pmin;
++}
++
++// The four specialisations, picked from values that are constant across a whole convolution.
++static inline void ggml_conv_1d_direct_tile(const float * xp, const float * wp, const float * bias,
++                                            float * y, int64_t IC, int64_t OC, int64_t KW,
++                                            int64_t LP, int64_t OL, int64_t dil,
++                                            int64_t oc0, int64_t p0, int64_t ocn,
++                                            const float * res, int64_t pmin) {
++    const bool clamp = pmin > p0;
++    if (res) {
++        if (clamp) ggml_conv_1d_direct_tile_impl<true,  true >(xp, wp, bias, y, IC, OC, KW, LP, OL, dil, oc0, p0, ocn, res, pmin);
++        else       ggml_conv_1d_direct_tile_impl<true,  false>(xp, wp, bias, y, IC, OC, KW, LP, OL, dil, oc0, p0, ocn, res, pmin);
++    } else {
++        if (clamp) ggml_conv_1d_direct_tile_impl<false, true >(xp, wp, bias, y, IC, OC, KW, LP, OL, dil, oc0, p0, ocn, res, pmin);
++        else       ggml_conv_1d_direct_tile_impl<false, false>(xp, wp, bias, y, IC, OC, KW, LP, OL, dil, oc0, p0, ocn, res, pmin);
++    }
+ }
+ 
+ // Whether this convolution should take the direct path at all. Everything the kernel assumes is here.
+@@ -7190,35 +7302,51 @@
+ // number of streams (kw) and with the dilation that spreads them, and the transform is only affordable
+ // when there is enough arithmetic per element to hide it (IC * kw). Everything outside that window
+ // keeps the direct kernel, which is why this is a third path rather than a replacement.
+-static void ggml_conv1d_deint(const float * src, float * dst, int64_t stride, int64_t n, int f) {
++//
++// `leaky`, when it is not null, is a LEAKY_RELU applied as the activation is read -- this de-interleave
++// is the phase-major path's copy of the input, so it is where the fused unary lands. Only the FIRST of
++// the two passes may apply it; the second only moves data that has already been through it.
++static void ggml_conv1d_deint(const float * src, float * dst, int64_t stride, int64_t n, int f,
++                              const float * leaky) {
+     int64_t j = 0;
+ #if defined(__aarch64__)
++    const float32x4_t z = vdupq_n_f32(0.0f);
++    const float32x4_t s = vdupq_n_f32(leaky ? *leaky : 0.0f);
++#define GGML_CONV1D_DEINT_LEAKY(v, N) \
++    if (leaky) { for (int r = 0; r < N; ++r) v.val[r] = ggml_conv1d_leaky_v(v.val[r], z, s); }
+     if (f == 2) {
+         for (; (j + 4) * 2 <= n; j += 4) {
+-            const float32x4x2_t v = vld2q_f32(src + j*2);
++            float32x4x2_t v = vld2q_f32(src + j*2);
++            GGML_CONV1D_DEINT_LEAKY(v, 2)
+             vst1q_f32(dst + 0*stride + j, v.val[0]);
+             vst1q_f32(dst + 1*stride + j, v.val[1]);
+         }
+     } else if (f == 3) {
+         for (; (j + 4) * 3 <= n; j += 4) {
+-            const float32x4x3_t v = vld3q_f32(src + j*3);
++            float32x4x3_t v = vld3q_f32(src + j*3);
++            GGML_CONV1D_DEINT_LEAKY(v, 3)
+             vst1q_f32(dst + 0*stride + j, v.val[0]);
+             vst1q_f32(dst + 1*stride + j, v.val[1]);
+             vst1q_f32(dst + 2*stride + j, v.val[2]);
+         }
+     } else if (f == 4) {
+         for (; (j + 4) * 4 <= n; j += 4) {
+-            const float32x4x4_t v = vld4q_f32(src + j*4);
++            float32x4x4_t v = vld4q_f32(src + j*4);
++            GGML_CONV1D_DEINT_LEAKY(v, 4)
+             vst1q_f32(dst + 0*stride + j, v.val[0]);
+             vst1q_f32(dst + 1*stride + j, v.val[1]);
+             vst1q_f32(dst + 2*stride + j, v.val[2]);
+             vst1q_f32(dst + 3*stride + j, v.val[3]);
+         }
+     }
++#undef GGML_CONV1D_DEINT_LEAKY
+ #endif
+     for (; j * f < n; ++j)
+         for (int r = 0; r < f; ++r)
+-            if (j*f + r < n) dst[r*stride + j] = src[j*f + r];
++            if (j*f + r < n) {
++                const float u = src[j*f + r];
++                dst[r*stride + j] = leaky ? ggml_conv1d_leaky_s(u, *leaky) : u;
++            }
+ }
+ 
+ static void ggml_conv1d_inter(const float * src, float * dst, int64_t stride, int64_t n, int f) {
+@@ -7265,11 +7393,12 @@
+ }
+ 
+ static bool ggml_conv1d_phase_ok(int64_t IC, int64_t OC, int64_t KW, int64_t OL, int64_t dil,
+-                                 int nth, int64_t * j_out, size_t * need_out) {
++                                 int nth, bool fuse_res, int64_t * j_out, size_t * need_out) {
+ #if !defined(__aarch64__)
+     // The transform is only cheap where the ISA de-interleaves in one instruction; without vld3/vst3
+     // it is the strided copy this exists to avoid. AVX2 has no 3-way de-interleave.
+-    (void) IC; (void) OC; (void) KW; (void) OL; (void) dil; (void) nth; (void) j_out; (void) need_out;
++    (void) IC; (void) OC; (void) KW; (void) OL; (void) dil; (void) nth; (void) fuse_res;
++    (void) j_out; (void) need_out;
+     return false;
+ #else
+     if (dil < 3 || KW < 7) return false;              // too few streams, or too little spread
+@@ -7290,7 +7419,11 @@
+               // two-pass scratch, PER THREAD -- each one de-interleaves a whole channel into its own
+               // copy, so this is nth of them, not one. Reserving a single copy fits inside the 16 MB
+               // work buffer at the sizes measured here and would have overrun it at larger ones.
+-              + (size_t) nth * a * (((OL + a - 1) / a) + 1) * sizeof(float);
++              + (size_t) nth * a * (((OL + a - 1) / a) + 1) * sizeof(float)
++              // and, when a residual is being folded in, one more slice per thread: the interleave
++              // has to land somewhere OTHER than the destination, because the destination is where
++              // the residual is read from. It is a per-channel buffer, so this is small.
++              + (fuse_res ? (size_t) nth * a * (((OL + a - 1) / a) + 1) * sizeof(float) : 0);
+     return true;
+ #endif
+ }
+@@ -7299,7 +7432,8 @@
+ static void ggml_conv_1d_direct_run(const ggml_compute_params * params,
+                                     const ggml_tensor * kernel, const ggml_tensor * src,
+                                     ggml_tensor * dst, const float * bias_data, float * out_data,
+-                                    int64_t LP) {
++                                    int64_t LP, const float * src_data, const float * leaky,
++                                    const float * res) {
+     const int64_t IC  = src->ne[2];
+     const int64_t OC  = dst->ne[2];
+     const int64_t KW  = kernel->ne[0];
+@@ -7308,7 +7442,7 @@
+     const int64_t dil = ggml_get_op_params_i32(dst, 4);
+     const int64_t pad = ggml_get_op_params_i32(dst, 2);
+ 
+-    const float * x = (const float *) src->data;
++    const float * x = src_data;
+     const float * w = (const float *) kernel->data;
+     float *       y = out_data ? out_data : (float *) dst->data;
+ 
+@@ -7329,7 +7463,12 @@
+         // `pad` floats each: 36 at the widest dilation here.
+         memset(row, 0, (size_t) lo * sizeof(float));
+         if (LP > lo + n) memset(row + lo + n, 0, (size_t) (LP - lo - n) * sizeof(float));
+-        if (n > 0) memcpy(row + lo, x + ic * L, (size_t) n * sizeof(float));
++        if (n > 0) {
++            // and the fused LEAKY_RELU, if there is one, applied here rather than as its own pass:
++            // this loop already reads every input element and writes it once.
++            if (leaky) ggml_conv1d_leaky_copy(row + lo, x + ic * L, n, *leaky);
++            else       memcpy(row + lo, x + ic * L, (size_t) n * sizeof(float));
++        }
+     }
+     // Packed [ic][kx][oc] so the four output channels a tile covers are contiguous: on aarch64 that is
+     // one vector load feeding four lane-broadcast FMAs instead of four scalar loads.
+@@ -7356,19 +7495,21 @@
+     for (int64_t b = b0; b < b1; ++b)
+         for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
+             ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
+-                                     oc0, b * P, GGML_CONV1D_OCB);
++                                     oc0, b * P, GGML_CONV1D_OCB, res, 0);
+ 
+     // The ragged tail, as ONE MORE OVERLAPPING TILE ending at OL rather than a scalar loop. It
+     // recomputes up to P-1 positions the last full tile already did, which is far cheaper than doing
+     // any of them at scalar speed: at OL = 2296 the tail is 8 positions, but 8 x OC x IC x KW scalar
+     // multiply-accumulates is ~2 ms of a 20 ms convolution. The heuristic guarantees OL >= P, so this
+-    // is always a whole tile.
++    // is always a whole tile. What it must NOT do is store the positions the last full tile already
++    // stored: with a residual folded in those elements would take it twice, and the two tiles run on
++    // different threads with no barrier between them. Hence the `nblk * P` floor.
+     if (nblk * P < OL) {
+         const int64_t p0 = OL - P;
+         for (int64_t oc0 = params->ith * GGML_CONV1D_OCB; oc0 < OC;
+              oc0 += params->nth * GGML_CONV1D_OCB) {
+             ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
+-                                     oc0, p0, GGML_CONV1D_OCB);
++                                     oc0, p0, GGML_CONV1D_OCB, res, nblk * P);
+         }
+     }
+ }
+@@ -7380,7 +7521,8 @@
+ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+                                    const ggml_tensor * kernel, const ggml_tensor * src,
+                                    ggml_tensor * dst, const float * bias_data, float * out_data,
+-                                   int64_t J) {
++                                   int64_t J, const float * src_data, const float * leaky,
++                                   const float * res) {
+     const int64_t IC  = src->ne[2];
+     const int64_t OC  = dst->ne[2];
+     const int64_t KW  = kernel->ne[0];
+@@ -7395,7 +7537,7 @@
+     const int64_t nb   = (OL + a - 1) / a;
+     const int64_t nmax = (na > nb ? na : nb) + 1;      // one slice per thread, sized for either pass
+ 
+-    const float * x = (const float *) src->data;
++    const float * x = src_data;
+     const float * w = (const float *) kernel->data;
+     float *       y = out_data ? out_data : (float *) dst->data;
+ 
+@@ -7403,17 +7545,19 @@
+     float * yp  = xp + (size_t) IC * dil * JP;          // [OC, dil, J]
+     float * wp  = yp + (size_t) OC * dil * J;           // [IC, KW, OC]
+     float * tmp = wp + (size_t) IC * KW * OC;           // two-pass scratch, per thread below
++    float * rbf = tmp + (size_t) params->nth * a * nmax; // interleave staging, per thread, when fusing
++                                                        // a residual (see ggml_conv1d_phase_ok)
+ 
+     for (int64_t ic = params->ith; ic < IC; ic += params->nth) {
+         float * base = xp + ic * dil * JP;
+         memset(base, 0, (size_t) dil * JP * sizeof(float));
+         if (b == 1) {
+-            ggml_conv1d_deint(x + ic*L, base + H, JP, L, a);
++            ggml_conv1d_deint(x + ic*L, base + H, JP, L, a, leaky);
+         } else {
+             float * t = tmp + (size_t) params->ith * a * nmax;
+-            ggml_conv1d_deint(x + ic*L, t, nmax, L, a);
++            ggml_conv1d_deint(x + ic*L, t, nmax, L, a, leaky);
+             for (int r1 = 0; r1 < a; ++r1)
+-                ggml_conv1d_deint(t + (int64_t) r1*nmax, base + (int64_t) r1*JP + H, (int64_t) a*JP, na, b);
++                ggml_conv1d_deint(t + (int64_t) r1*nmax, base + (int64_t) r1*JP + H, (int64_t) a*JP, na, b, nullptr);
+         }
+     }
+     for (int64_t ic = params->ith; ic < IC; ic += params->nth)
+@@ -7435,7 +7579,7 @@
+         for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
+             ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
+                                      IC, OC, KW, (int64_t) dil * JP, (int64_t) dil * J, 1,
+-                                     oc0, bkl * P, GGML_CONV1D_OCB);
++                                     oc0, bkl * P, GGML_CONV1D_OCB, NULL, 0);
+     }
+     if (nblk * P < J) {                                  // overlapping tail tile, as in the direct path
+         const int64_t j0 = J - P;
+@@ -7443,20 +7587,30 @@
+             for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
+                 ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
+                                          IC, OC, KW, (int64_t) dil * JP, (int64_t) dil * J, 1,
+-                                         oc0, j0, GGML_CONV1D_OCB);
++                                         oc0, j0, GGML_CONV1D_OCB, NULL, 0);
+     }
+ 
+     ggml_barrier(params->threadpool);
+ 
+     for (int64_t oc = params->ith; oc < OC; oc += params->nth) {
+         const float * s = yp + (size_t) oc * dil * J;
++        // A residual cannot be folded into the interleave itself -- the interleave writes lanes that
++        // came from `dil` different places, and the residual is contiguous -- so it lands in a
++        // per-thread buffer and is added on the way out. The buffer is one channel wide and hot, so
++        // this is still one read of the residual and one write of the result, not a pass each.
++        float * out = res ? (rbf + (size_t) params->ith * a * nmax) : (y + oc*OL);
+         if (b == 1) {
+-            ggml_conv1d_inter(s, y + oc*OL, J, OL, a);
++            ggml_conv1d_inter(s, out, J, OL, a);
+         } else {
+             float * t = tmp + (size_t) params->ith * a * nmax;
+             for (int r1 = 0; r1 < a; ++r1)
+                 ggml_conv1d_inter(s + (int64_t) r1*J, t + (int64_t) r1*nmax, (int64_t) a*J, nb, b);
+-            ggml_conv1d_inter(t, y + oc*OL, nmax, OL, a);
++            ggml_conv1d_inter(t, out, nmax, OL, a);
++        }
++        if (res) {
++            const float * r = res + oc*OL;
++            float *       o = y   + oc*OL;
++            for (int64_t i = 0; i < OL; ++i) o[i] = out[i] + r[i];
+         }
+     }
+ }
+@@ -7466,12 +7620,20 @@
+                                               const ggml_tensor *         src,     // [W, H, C, N]
+                                               ggml_tensor *               dst,     // [OW, OH, OC, N]
+                                               ggml_type                   kernel_type,
+-                                              // Fusion (see ggml_compute_forward_conv_2d_bias_fused):
+-                                              // a per-output-channel bias, added to each batch of the
++                                              // Fusion (see ggml_compute_forward_conv_2d_fused): a
++                                              // per-output-channel bias, added to each batch of the
+                                               // result while it is still in cache, and the buffer to
+                                               // write into when that is not dst's own.
+                                               const float *               bias_data = nullptr,
+-                                              float *                     out_data  = nullptr) {
++                                              float *                     out_data  = nullptr,
++                                              // ... and the two elementwise neighbours a resblock puts
++                                              // around a convolution: a LEAKY_RELU on the input, whose
++                                              // slope this is and whose OWN input `in_data` then is,
++                                              // and a residual of the result's shape, added as each
++                                              // output element is stored.
++                                              const float *               in_data   = nullptr,
++                                              const float *               leaky     = nullptr,
++                                              const float *               res_data  = nullptr) {
+ 
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
+@@ -7497,7 +7659,7 @@
+     const int64_t dst_w = dst->ne[0];
+     const int64_t dst_h = dst->ne[1];
+ 
+-    const float * src_data = (float *) src->data;
++    const float * src_data = in_data ? in_data : (const float *) src->data;
+     void  * knl_data       = kernel->data;
+     float * dst_data       = out_data ? out_data : (float *) dst->data;
+ 
+@@ -7510,12 +7672,15 @@
+             // see ggml_conv1d_phase_ok for the window and the numbers that drew it.
+             int64_t jphase = 0; size_t need = 0;
+             if (ggml_conv1d_phase_ok(src->ne[2], dst->ne[2], kernel->ne[0], dst->ne[0],
+-                                     ggml_get_op_params_i32(dst, 4), params->nth, &jphase, &need) &&
++                                     ggml_get_op_params_i32(dst, 4), params->nth, res_data != nullptr,
++                                     &jphase, &need) &&
+                 need <= params->wsize) {
+-                ggml_conv_1d_phase_run(params, kernel, src, dst, bias_data, out_data, jphase);
++                ggml_conv_1d_phase_run(params, kernel, src, dst, bias_data, out_data, jphase,
++                                       src_data, leaky, res_data);
+                 return;
+             }
+-            ggml_conv_1d_direct_run(params, kernel, src, dst, bias_data, out_data, lp);
++            ggml_conv_1d_direct_run(params, kernel, src, dst, bias_data, out_data, lp,
++                                    src_data, leaky, res_data);
+             return;
+         }
+     }
+@@ -7564,9 +7729,17 @@
+     // destination and pays for one extra pass rather than being wrong.
+     const bool aliases_input = out_data != nullptr && (const void *) out_data == (const void *) src_data
+                             && ggml_nbytes(dst) == ggml_nbytes(src);
+-    const bool defer = aliases_input && stride_x == 1 && patches_per_batch > (knl_w - 1) * dilation_x;
+-    if (aliases_input && !defer) {
+-        ggml_compute_forward_conv_2d_impl(params, kernel, src, dst, kernel_type, bias_data, nullptr);
++    // A FUSED RESIDUAL FORCES THE SAME STAGING, for a different reason. The residual may BE the
++    // destination -- the graph allocator gives a resblock's `x + f(x)` the block `x` just vacated --
++    // and this path's GEMM writes the destination before anything reads the residual out of it. Held
++    // back through the scratch buffer, each element is read at the moment it is written, which is what
++    // the direct kernel above does for free.
++    const bool res_aliases_out = res_data != nullptr && (const void *) res_data == (const void *) dst_data;
++    const bool stage = aliases_input || res_aliases_out;
++    const bool defer = stage && stride_x == 1 && patches_per_batch > (knl_w - 1) * dilation_x;
++    if (stage && !defer) {
++        ggml_compute_forward_conv_2d_impl(params, kernel, src, dst, kernel_type, bias_data, nullptr,
++                                          in_data, leaky, res_data);
+         ggml_barrier(params->threadpool);
+         for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
+             const float * in = (const float *) dst->data + oc * dst_w * dst_h;
+@@ -7611,6 +7784,11 @@
+                         } else {
+                             const float * src_ptr = (const float *)((const char *)src_base + sx * src->nb[0] + sy * src->nb[1] + ic * src->nb[2]);
+                             src_val               = *src_ptr;
++                            // the fused LEAKY_RELU. This gather writes each input element `knl_w`
++                            // times, so the transform is done more than once per element -- but it is
++                            // a compare and a multiply against a write that has to happen anyway,
++                            // where the node it replaces is a whole extra pass over the activation.
++                            if (leaky) src_val = ggml_conv1d_leaky_s(src_val, *leaky);
+                         }
+ 
+                         char * element_ptr = dst_row + dst_idx * traits->type_size;
+@@ -7635,8 +7813,15 @@
+                 float *       out = out_data + oc * dst_w * dst_h + pending_start;
+                 const float * in  = staged + oc * pending_n;
+                 const float   b   = bias_data ? bias_data[oc] : 0.0f;
+-                for (int64_t i = 0; i < pending_n; ++i) {
+-                    out[i] = in[i] + b;
++                if (res_data) {
++                    const float * r = res_data + oc * dst_w * dst_h + pending_start;
++                    for (int64_t i = 0; i < pending_n; ++i) {
++                        out[i] = in[i] + b + r[i];
++                    }
++                } else {
++                    for (int64_t i = 0; i < pending_n; ++i) {
++                        out[i] = in[i] + b;
++                    }
+                 }
+             }
+             pending_start = -1;
+@@ -7653,17 +7838,26 @@
+             ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
+                                   dst_data + patch_start_batch, dst_w * dst_h);
+             ggml_barrier(params->threadpool);
+-            if (bias_data) {
++            if (bias_data || res_data) {
+                 // Applied HERE rather than as its own pass over the finished result: these are the
+                 // exact lines the GEMM has just written, so they are still in cache, where the ADD
+-                // node this replaces is a read and a write of the whole output -- 9.4 MB each way for
+-                // one vocoder convolution, and 12% of a VITS synthesis across all of them. Split by
+-                // channel, so each thread's stores stay in one contiguous run.
++                // nodes this replaces are a read and a write of the whole output -- 9.4 MB each way
++                // for one vocoder convolution, and 12% of a VITS synthesis across all of them. Split
++                // by channel, so each thread's stores stay in one contiguous run. The residual can
++                // only be reached here when it is NOT the destination; when it is, `defer` above
++                // holds the result back instead.
+                 for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
+                     float *     out = dst_data + oc * dst_w * dst_h + patch_start_batch;
+-                    const float b   = bias_data[oc];
+-                    for (int64_t i = 0; i < patch_n; ++i) {
+-                        out[i] += b;
++                    const float b   = bias_data ? bias_data[oc] : 0.0f;
++                    if (res_data) {
++                        const float * r = res_data + oc * dst_w * dst_h + patch_start_batch;
++                        for (int64_t i = 0; i < patch_n; ++i) {
++                            out[i] += b + r[i];
++                        }
++                    } else {
++                        for (int64_t i = 0; i < patch_n; ++i) {
++                            out[i] += b;
++                        }
+                     }
+                 }
+             }
+@@ -7705,7 +7899,8 @@
+             const int64_t dst_x   = p % dst_w;
+ 
+             for (int64_t oc = 0; oc < c_out; ++oc) {
+-                const float value = gemm_output[i * c_out + oc] + (bias_data ? bias_data[oc] : 0.0f);
++                const float value = gemm_output[i * c_out + oc] + (bias_data ? bias_data[oc] : 0.0f)
++                                  + (res_data ? res_data[oc * dst_w * dst_h + p] : 0.0f);
+                 float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
+                 *dst_ptr = value;
+             }
+@@ -7719,27 +7914,56 @@
+             float *       out = out_data + oc * dst_w * dst_h + pending_start;
+             const float * in  = staged + oc * pending_n;
+             const float   b   = bias_data ? bias_data[oc] : 0.0f;
+-            for (int64_t i = 0; i < pending_n; ++i) {
+-                out[i] = in[i] + b;
++            if (res_data) {
++                const float * r = res_data + oc * dst_w * dst_h + pending_start;
++                for (int64_t i = 0; i < pending_n; ++i) {
++                    out[i] = in[i] + b + r[i];
++                }
++            } else {
++                for (int64_t i = 0; i < pending_n; ++i) {
++                    out[i] = in[i] + b;
++                }
+             }
+         }
+     }
+ }
+ 
+-// CONV_2D with the bias ADD that follows it folded in, writing the ADD's output tensor instead of the
+-// convolution's own. What makes two nodes that pattern is decided by the caller
+-// (ggml_cpu_try_fuse_ops); everything this relies on is checked there.
+-void ggml_compute_forward_conv_2d_bias_fused(
++// CONV_2D with the elementwise neighbours a HiFi-GAN resblock puts around it folded in: a LEAKY_RELU
++// on its input, the per-output-channel bias ADD after it, and the residual ADD after that. Each of
++// those is a full pass over an activation and none of them needs one -- the unary is applied as the
++// convolution copies its input in, the bias is what the accumulators start at, and the residual is
++// added to each accumulator on its way out. On a Cortex-A72 a pass over this model's largest
++// activation is 4.7 ms against a 20-40 ms convolution, so the passes are not a rounding error.
++//
++// The fused kernel writes `out`, the last of those ADDs, and the intermediates never exist. What makes
++// these nodes that pattern -- and, crucially, where they are allowed to be in memory -- is decided by
++// the caller (ggml_cpu_try_fuse_ops). Any of `act`, `bias` and `residual` may be null.
++void ggml_compute_forward_conv_2d_fused(
+         const ggml_compute_params * params,
+         ggml_tensor *               conv,
++        const ggml_tensor *         act,
+         const ggml_tensor *         bias,
++        const ggml_tensor *         residual,
+         ggml_tensor *               out) {
+ 
+     const ggml_tensor * kernel = conv->src[0];
+     const ggml_tensor * src    = conv->src[1];
+ 
++    // The unary is skipped by reading ITS input in place of its output; the caller has checked that
++    // the two have the same contiguous layout, so `src`'s shape still describes what is being read.
++    float         slope   = 0.0f;
++    const float * in_data = nullptr;
++    const float * leaky   = nullptr;
++    if (act) {
++        memcpy(&slope, act->op_params, sizeof(float));
++        in_data = (const float *) act->src[0]->data;
++        leaky   = &slope;
++    }
++
+     ggml_compute_forward_conv_2d_impl(params, kernel, src, conv, kernel->type,
+-                                      (const float *) bias->data, (float *) out->data);
++                                      bias ? (const float *) bias->data : nullptr,
++                                      (float *) out->data, in_data, leaky,
++                                      residual ? (const float *) residual->data : nullptr);
+ }
+ 
+ void ggml_compute_forward_conv_2d(
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -70,7 +70,7 @@
+ void ggml_compute_forward_im2col_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_col2im_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+-void ggml_compute_forward_conv_2d_bias_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * bias, struct ggml_tensor * out);
++void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * act, const struct ggml_tensor * bias, const struct ggml_tensor * residual, struct ggml_tensor * out);
+ void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3043,100 +3043,221 @@
+     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+ }
+ 
+-// If the node at `conv_idx` is a convolution whose result is consumed by exactly one bias ADD --
+-// possibly through reshapes, which is how loom's CONV_1D lowering emits it -- returns that ADD's node
+-// index, else -1.
+-//
+-// Everything the fused kernel assumes is decided here:
+-//   * the convolution has one image and a contiguous, non-output result, so the ADD's destination can
+-//     be written in the convolution's own [OW, OH, OC] coordinates;
+-//   * the ADD is elementwise over that result with a per-output-channel operand broadcast along the
+-//     length axis -- [OL, OC] plus [1, OC], which is what a conv bias is;
+-//   * nothing else reads the convolution's result, directly or through any view of it, so skipping
+-//     the intermediate entirely is safe.
+-// Anything else and the two nodes are computed normally.
+-static int ggml_cpu_conv_2d_bias_add_idx(const struct ggml_cgraph * cgraph, int conv_idx) {
+-    const struct ggml_tensor * conv = cgraph->nodes[conv_idx];
+-
+-    if (conv->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv)) {
+-        return -1;
++// Whether anything but the node at `except` still needs `t`'s result -- reading it directly, reading
++// any view of it, or having it as a graph output. A node whose result is still needed is a node that
++// cannot be skipped, which is what fusing it amounts to.
++static bool ggml_cpu_result_is_private(const struct ggml_cgraph * cgraph,
++                                       const struct ggml_tensor * t, int except) {
++    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
++        return false;
+     }
+-    if (conv->ne[1] != 1 || conv->ne[3] != 1) {   // one row of output positions, one image
+-        return -1;
+-    }
+-    if (conv->flags & GGML_TENSOR_FLAG_OUTPUT) {
+-        return -1;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const struct ggml_tensor * n = cgraph->nodes[i];
++        if (i == except) {
++            continue;
++        }
++        if (ggml_view_root(n) == t) {            // a view of the result: harmless in itself, but its
++            if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {   // own readers are caught by the loop below
++                return false;
++            }
++            continue;
++        }
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (n->src[s] && ggml_view_root(n->src[s]) == t) {
++                return false;
++            }
++        }
+     }
++    return true;
++}
+ 
+-    int add_idx = conv_idx + 1;
+-    while (add_idx < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[add_idx]->op)) {
+-        add_idx++;
++// The next node the compute loop would actually run. Views and reshapes cost nothing and are stepped
++// over -- loom's CONV_1D lowering emits several of them around each convolution -- while a node the
++// scheduler has excluded ends the chain rather than being folded into it.
++static int ggml_cpu_next_compute_node(const struct ggml_cgraph * cgraph, int from) {
++    while (from < cgraph->n_nodes && ggml_op_is_empty(cgraph->nodes[from]->op)) {
++        from++;
+     }
+-    if (add_idx >= cgraph->n_nodes || cgraph->nodes[add_idx]->op != GGML_OP_ADD) {
++    if (from >= cgraph->n_nodes || (cgraph->nodes[from]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+         return -1;
+     }
++    return from;
++}
+ 
+-    const struct ggml_tensor * add = cgraph->nodes[add_idx];
++// The other operand of an ADD that consumes `prev`'s result, or NULL if this ADD is not the one the
++// convolution can absorb. With `per_channel` the operand wanted is a convolution bias -- one value per
++// output channel, broadcast along the length axis; without it, a residual of the result's full shape.
++static const struct ggml_tensor * ggml_cpu_conv_2d_add_operand(const struct ggml_tensor * add,
++                                                               const struct ggml_tensor * prev,
++                                                               const struct ggml_tensor * conv,
++                                                               bool per_channel) {
+     if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+         ggml_nelements(add) != ggml_nelements(conv)) {
+-        return -1;
++        return NULL;
+     }
+ 
+-    const struct ggml_tensor * x    = NULL;
+-    const struct ggml_tensor * bias = NULL;
++    const struct ggml_tensor * x = NULL;
++    const struct ggml_tensor * o = NULL;
+     for (int s = 0; s < 2; ++s) {
+-        if (add->src[s] && ggml_view_root(add->src[s]) == conv) {
+-            x    = add->src[s];
+-            bias = add->src[1 - s];
++        if (add->src[s] && ggml_view_root(add->src[s]) == prev) {
++            x = add->src[s];
++            o = add->src[1 - s];
+         }
+     }
+-    if (x == NULL || bias == NULL || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias)) {
+-        return -1;
++    if (x == NULL || o == NULL || o->type != GGML_TYPE_F32 || !ggml_is_contiguous(o)) {
++        return NULL;
+     }
++    // the convolution's result seen as [length, channels], which is how loom's lowering reshapes it
+     if (x->ne[0] != conv->ne[0] || x->ne[1] != conv->ne[2] || x->ne[2] != 1 || x->ne[3] != 1) {
+-        return -1;
++        return NULL;
+     }
+-    if (bias->ne[0] != 1 || bias->ne[1] != conv->ne[2] || bias->ne[2] != 1 || bias->ne[3] != 1) {
+-        return -1;
++    if (o->ne[0] != (per_channel ? 1 : conv->ne[0]) || o->ne[1] != conv->ne[2] ||
++        o->ne[2] != 1 || o->ne[3] != 1) {
++        return NULL;
+     }
++    return o;
++}
+ 
+-    // WHERE THE DESTINATION IS ALLOWED TO BE. Fusing makes the convolution write its result
+-    // progressively, batch by batch, into the ADD's destination -- while it is still reading the input
+-    // for the batches it has not done yet. A graph allocator is entitled to give that ADD a block the
+-    // input has just vacated, because in the UNFUSED order nothing is left to read it by the time the
+-    // ADD runs, and for a VITS vocoder it does that to every large convolution.
+-    //
+-    // The kernel handles the case where the destination IS the input, by staging each batch until the
+-    // next one has read what it would overwrite (see ggml_compute_forward_conv_2d_impl). It cannot
+-    // handle a PARTIAL overlap, where output and input positions do not correspond, so those are left
+-    // to run unfused -- as are overlaps with the kernel or the bias, which are read throughout.
+-    const bool exact_input_alias = add->data == conv->src[1]->data &&
+-                                   ggml_nbytes(add) == ggml_nbytes(conv->src[1]);
+-    if ((!exact_input_alias && ggml_cpu_tensors_overlap(add, conv->src[1])) ||
+-        ggml_cpu_tensors_overlap(add, conv->src[0]) ||
+-        ggml_cpu_tensors_overlap(add, bias)) {
++// What one fused convolution stands in for.
++struct ggml_conv_2d_fusion {
++    const struct ggml_tensor * act;       // LEAKY_RELU feeding the input, or NULL
++    const struct ggml_tensor * bias;      // the per-output-channel ADD's other operand, or NULL
++    const struct ggml_tensor * residual;  // the elementwise ADD's other operand, or NULL
++    struct ggml_tensor *       conv;      // the CONV_2D itself
++    struct ggml_tensor *       out;       // the tensor the fused kernel writes: the last node covered
++};
++
++// Whether the nodes from `node_n` are a convolution with elementwise neighbours it can absorb. Fills
++// `f` and returns the index of the LAST node covered, else -1.
++//
++// A HiFi-GAN resblock layer is exactly this, repeated at dilations 1, 2, 3, 6 and 12:
++//
++//     h  = LEAKY_RELU(x)        a full pass over the activation
++//     c  = CONV_1D(w, h)
++//     xt = ADD(c, bias)         a full pass
++//     x' = ADD(xt, x)           the residual: two reads and a write
++//
++// and all four are one kernel here. There are two entry shapes because fusion runs FORWARD from a
++// node: the chain is matched from the LEAKY_RELU when the convolution is its only consumer, and from
++// the convolution otherwise. Either ADD may be absent, and the first activation of a resblock layer
++// is shared by three convolutions and so is never the first kind.
++static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n,
++                                   struct ggml_conv_2d_fusion * f) {
++    memset(f, 0, sizeof(*f));
++
++    int idx = node_n;
++    struct ggml_tensor * node = cgraph->nodes[idx];
++
++    if (node->op == GGML_OP_LEAKY_RELU) {
++        const struct ggml_tensor * act = node;
++        const struct ggml_tensor * in  = act->src[0];
++
++        // Substituting the unary's INPUT for its output, pointer for pointer, is only sound if the two
++        // have the same contiguous layout -- then the convolution's own view of `act` still describes
++        // what is being read, and only the base pointer changes.
++        if (act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || in == NULL ||
++            in->type != GGML_TYPE_F32 || !ggml_is_contiguous(in) ||
++            ggml_nbytes(in) != ggml_nbytes(act)) {
++            return -1;
++        }
++        idx = ggml_cpu_next_compute_node(cgraph, idx + 1);
++        if (idx < 0 || cgraph->nodes[idx]->op != GGML_OP_CONV_2D) {
++            return -1;
++        }
++        node = cgraph->nodes[idx];
++        if (node->src[1] == NULL || ggml_view_root(node->src[1]) != act ||
++            node->src[1]->data != act->data ||
++            !ggml_cpu_result_is_private(cgraph, act, idx)) {
++            return -1;
++        }
++        f->act = act;
++    }
++
++    if (node->op != GGML_OP_CONV_2D) {
+         return -1;
+     }
+ 
+-    for (int i = 0; i < cgraph->n_nodes; ++i) {
+-        const struct ggml_tensor * n = cgraph->nodes[i];
+-        if (i == add_idx) {
+-            continue;
+-        }
+-        if (ggml_view_root(n) == conv) {          // the convolution itself, or a view of its result
+-            if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
+-                return -1;
++    struct ggml_tensor * conv = node;
++    if (conv->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv)) {
++        return -1;
++    }
++    if (conv->ne[1] != 1 || conv->ne[3] != 1) {   // one row of output positions, one image
++        return -1;
++    }
++    if (conv->flags & GGML_TENSOR_FLAG_OUTPUT) {
++        return -1;
++    }
++    f->conv = conv;
++    f->out  = conv;
++    int last = idx;
++
++    // the bias ADD, then the residual ADD after it. loom's lowering always emits the bias, so a
++    // residual is only looked for behind one.
++    const int bias_idx = ggml_cpu_next_compute_node(cgraph, last + 1);
++    if (bias_idx >= 0 && cgraph->nodes[bias_idx]->op == GGML_OP_ADD) {
++        struct ggml_tensor * add = cgraph->nodes[bias_idx];
++        const struct ggml_tensor * bias = ggml_cpu_conv_2d_add_operand(add, f->out, conv, true);
++        if (bias && ggml_cpu_result_is_private(cgraph, f->out, bias_idx)) {
++            f->bias = bias;
++            f->out  = add;
++            last    = bias_idx;
++
++            const int res_idx = ggml_cpu_next_compute_node(cgraph, last + 1);
++            if (res_idx >= 0 && cgraph->nodes[res_idx]->op == GGML_OP_ADD) {
++                struct ggml_tensor * add2 = cgraph->nodes[res_idx];
++                const struct ggml_tensor * res = ggml_cpu_conv_2d_add_operand(add2, f->out, conv, false);
++                if (res && ggml_cpu_result_is_private(cgraph, f->out, res_idx)) {
++                    f->residual = res;
++                    f->out      = add2;
++                    last        = res_idx;
++                }
+             }
+-            continue;
+         }
+-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+-            if (n->src[s] && ggml_view_root(n->src[s]) == conv) {
+-                return -1;
+-            }
++    }
++
++    if (f->act == NULL && f->out == conv) {
++        return -1;                                // nothing to fuse
++    }
++
++    // WHERE THE DESTINATION AND THE RESIDUAL ARE ALLOWED TO BE. Fusing makes the convolution write its
++    // result progressively into the LAST node's tensor -- while it is still reading the input for the
++    // parts it has not done yet, and while it still has the residual to read. A graph allocator is
++    // entitled to hand that tensor a block one of those just vacated, because in the unfused order
++    // each of them is dead by the time the node that gets the block runs; for a VITS vocoder it does
++    // exactly that, to every large convolution, so declining the case outright leaves the fusion worth
++    // almost nothing.
++    //
++    // The kernels handle it where the overlap is EXACT: the direct path copies the input out before it
++    // writes anything, and reads the residual for an element in the instruction before it stores that
++    // element; the batched path stages each block until the next one has read what it would overwrite.
++    // A PARTIAL overlap, where input and output positions do not correspond, is what neither can do,
++    // and neither can an overlap with the weights or the bias, which are read throughout.
++    const struct ggml_tensor * in  = f->act ? f->act->src[0] : conv->src[1];
++    const struct ggml_tensor * out = f->out;
++
++    const bool out_is_in = out->data == in->data && ggml_nbytes(out) == ggml_nbytes(in);
++    if ((!out_is_in && ggml_cpu_tensors_overlap(out, in)) ||
++        ggml_cpu_tensors_overlap(out, conv->src[0]) ||
++        (f->bias && ggml_cpu_tensors_overlap(out, f->bias))) {
++        return -1;
++    }
++    // The convolution's own tensor is the scratch the batched path falls back to when it cannot stage,
++    // so the result has to be either exactly it or nowhere near it.
++    if (out != conv && out->data != conv->data && ggml_cpu_tensors_overlap(out, conv)) {
++        return -1;
++    }
++    if (f->residual) {
++        const bool res_is_out = f->residual->data == out->data &&
++                                ggml_nbytes(f->residual) == ggml_nbytes(out);
++        if ((!res_is_out && ggml_cpu_tensors_overlap(f->residual, out)) ||
++            ggml_cpu_tensors_overlap(f->residual, conv) ||
++            ggml_cpu_tensors_overlap(f->residual, conv->src[0]) ||
++            (f->bias && ggml_cpu_tensors_overlap(f->residual, f->bias))) {
++            return -1;
+         }
+     }
+ 
+-    return add_idx;
++    return last;
+ }
+ 
+ static int ggml_cpu_try_fuse_ops(
+@@ -3151,18 +3272,16 @@
+ 
+     struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+-    if (node->op == GGML_OP_CONV_2D) {
+-        // CONV_2D + bias ADD fusion. The ADD is a full read and write of the convolution's output --
+-        // 12% of a VITS synthesis on a Pi 4 -- and folding it in costs nothing, because the fused
+-        // kernel adds the bias to each batch of the result while that batch is still in cache.
+-        const int add_idx = ggml_cpu_conv_2d_bias_add_idx(cgraph, node_n);
+-        if (add_idx > 0) {
+-            struct ggml_tensor * add  = cgraph->nodes[add_idx];
+-            const struct ggml_tensor * bias =
+-                (add->src[0] && ggml_view_root(add->src[0]) == node) ? add->src[1] : add->src[0];
+-
+-            ggml_compute_forward_conv_2d_bias_fused(params, node, bias, add);
+-            return add_idx - node_n;   // the ADD, and any views of the result between here and it
++    if (node->op == GGML_OP_CONV_2D || node->op == GGML_OP_LEAKY_RELU) {
++        // A convolution and the elementwise nodes around it -- see ggml_cpu_conv_2d_fusion. Each of
++        // those is a whole pass over an activation, which on a Pi 4 is 4.7 ms for this model's largest
++        // and 12% of a VITS synthesis across all of them, and the fused kernel does every one of them
++        // while the data is still in registers.
++        struct ggml_conv_2d_fusion f;
++        const int last = ggml_cpu_conv_2d_fusion(cgraph, node_n, &f);
++        if (last > node_n) {
++            ggml_compute_forward_conv_2d_fused(params, f.conv, f.act, f.bias, f.residual, f.out);
++            return last - node_n;   // the nodes covered, and any views of the result between them
+         }
+     }
+ 

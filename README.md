@@ -105,12 +105,22 @@ cmake --build build -j"$(nproc)"
 ```
 
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
-and run the hermetic suite.
+and run the hermetic suite. The fetched `ggml` is patched at configure time from `cmake/patches/` —
+seven diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
+declined to accept at all, a fused convolution that batched its work too coarsely to stay in cache, a
+direct 1-D convolution for long activations with small weights, and the elementwise nodes a vocoder's
+resblock wraps around every convolution — its bias, its leaky ReLU and its residual — none of which now
+costs a pass over memory of its own; see `cmake/GgmlPatches.cmake` for the rules such a patch has to
+meet.
+
+There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
+(`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,
+where it is worth ~2x on x86-64 and 1.6x on aarch64 at convolutional shapes (BACKLOG.md P4.15).
 
 ### Running on a GPU
 
 A default build is CPU-only. Compiling a device backend in is a `ggml` option, passed straight through
-— this repo adds no options of its own, because there is nothing per-backend for it to decide:
+— this repo adds no option of its own here, because there is nothing per-backend for it to decide:
 
 ```sh
 cmake -B build -DGGML_VULKAN=ON     # or -DGGML_CUDA=ON, -DGGML_METAL=ON, -DGGML_SYCL=ON, ...

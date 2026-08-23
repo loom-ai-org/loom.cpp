@@ -25,27 +25,62 @@ set(JSON_Install OFF CACHE INTERNAL "")
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
+# tinyBLAS, ggml's blocked F32/F16 GEMM (`src/ggml-cpu/llamafile/sgemm.cpp`). A standalone ggml
+# defaults it OFF -- it is llama.cpp that turns it on -- so this engine was shipping the generic
+# one-output-element-per-call kernel. Measured at the eleven F32 GEMM shapes a VITS vocoder runs
+# (BACKLOG.md P4.15), 4 threads:
+#
+#   x86-64, Ryzen 3 3250U (AVX2)      27.6 -> 54.4 GFLOP/s    1.97x   (median of 7, two cores, pinned)
+#   aarch64, Cortex-A72               15.0 -> 15.6 GFLOP/s    1.04x -- nothing, until the two patches
+#                                             -> 25.1          1.67x with them
+#
+# and it costs 111 KB of libggml-cpu (979 -> 1090 KB), which against the engine's size budget is the
+# cheapest ratio in this repo. Two details in one line: the FORCE is what makes an EXISTING build tree
+# pick this up -- ggml's own `option(GGML_LLAMAFILE ...)` would otherwise keep the OFF already in its
+# cache and nothing would say so -- and the LOOM_ option is so that A/B-ing a GEMM change is a
+# `-D` flag rather than an edit to this file.
+option(LOOM_TINYBLAS "Build ggml's tinyBLAS (llamafile) GEMM path into the CPU backend" ON)
+set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
+
+# The pinned ggml, patched -- four diffs, each carrying its own measurement. Three are tinyBLAS: two
+# aarch64-only fixes to GCC's code generation for its inner loop (a register tile GCC can actually
+# allocate, and operand addresses it will strength-reduce -- together 15.6 -> 25.1 GFLOP/s, which takes
+# ggml's own kernel PAST a hand-written one), and one architecture-neutral fix to which matmuls it
+# accepts at all (it declined every `m % 4 != 0` matrix outright, handing thousands of rows back to the
+# generic kernel over one or two leftovers). The fourth is ggml's fused convolution, which batched its
+# im2col 16 MB at a time -- larger than any cache, so the patches it exists to keep local went to DRAM
+# anyway -- and scattered its GEMM output one element at a time. See cmake/GgmlPatches.cmake for why a
+# patch here rather than a fork, a vendored copy, or a change in this engine. The fifth teaches the CPU
+# backend to fuse a convolution with the bias add that follows it, which is a graph-level decision made
+# at compute time and therefore invisible to every other backend. Populated up front so that both branches below -- and any
+# future one -- compile the patched sources, and re-checked on every configure so that an existing
+# build tree cannot end up silently unpatched.
+include(${CMAKE_CURRENT_LIST_DIR}/GgmlPatches.cmake)
+FetchContent_GetProperties(ggml)
+if(NOT ggml_POPULATED)
+    FetchContent_Populate(ggml)
+endif()
+loom_patch_ggml(${ggml_SOURCE_DIR})
+
+FetchContent_MakeAvailable(nlohmann_json)
+
 # ggml's Vulkan backend needs two build-host tools, and a stable distribution's are likely too old for
 # it -- in two ways that name neither cause. This makes `-DGGML_VULKAN=ON` work on such a machine by
 # building what is missing, and does nothing at all on a machine that already has both (or on the
 # CPU-only default). See cmake/VulkanToolchain.cmake for the two failures and the two probes.
 #
-# Populated-then-added rather than MakeAvailable'd, because the toolchain setup has to run BETWEEN the
-# two: it reads a feature-test shader out of ggml's sources, and everything it sets has to be in place
-# before ggml's own `find_package(Vulkan COMPONENTS glslc)` runs.
+# It runs BETWEEN populating ggml and adding it: it reads a feature-test shader out of ggml's sources,
+# and everything it sets has to be in place before ggml's own `find_package(Vulkan COMPONENTS glslc)`.
 if(GGML_VULKAN)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     include(${CMAKE_CURRENT_LIST_DIR}/VulkanToolchain.cmake)
-    FetchContent_MakeAvailable(nlohmann_json)
-    FetchContent_GetProperties(ggml)
-    if(NOT ggml_POPULATED)
-        FetchContent_Populate(ggml)
-    endif()
     loom_setup_vulkan_toolchain()
-    add_subdirectory(${ggml_SOURCE_DIR} ${ggml_BINARY_DIR})
-else()
-    FetchContent_MakeAvailable(ggml nlohmann_json)
 endif()
+
+# Added by hand rather than through FetchContent_MakeAvailable, which adds a dependency's subdirectory
+# only on the configure that populates it -- so pre-populating ggml above (to patch it) would leave
+# MakeAvailable a no-op and the ggml targets undefined.
+add_subdirectory(${ggml_SOURCE_DIR} ${ggml_BINARY_DIR})
 
 # LuaJIT: embedded Lua VM for the procedural-generalization orchestration layer (see
 # LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md) -- replaces bespoke per-model C++ drivers

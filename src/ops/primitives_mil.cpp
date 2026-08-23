@@ -43,10 +43,30 @@ ggml_tensor* promote_i32_to_f32(ggml_context* ctx, ggml_tensor* t) {
 // cpp's `op_sub`, which already had -- and has since been upgraded to this same stricter check --
 // its own guard) had no contiguity guard AT ALL, so this was the first of these helpers to crash.
 ggml_tensor* ensure_packed(ggml_context* ctx, ggml_tensor* t) {
-    if (!ggml_is_contiguous(t) || t->nb[0] != ggml_type_size(t->type)) {
-        return ggml_cont(ctx, t);
+    if (ggml_is_contiguous(t) && t->nb[0] == ggml_type_size(t->type)) {
+        return t;
     }
-    return t;
+    // A PACKED COPY IS PER-TENSOR, NOT PER-CONSUMER. `ggml_cont(t)` is the same value however many
+    // times it is asked for, and a graph asked once per op that read `t`. A HiFi-GAN vocoder's
+    // upsampler output is a trimmed view read by a LEAKY_RELU and by three resblock residual adds, so
+    // the same 9.4 MB tensor was copied FOUR times (`CONT 73472x32, 4 calls` in $LOOM_PROFILE, now 1).
+    //
+    // The copies themselves are the smaller half of it. The extra ones also land BETWEEN a
+    // convolution's bias add and its residual add, which is exactly the run of nodes the CPU backend
+    // fuses -- so with them there, half of this vocoder's convolutions could not take the fused path
+    // at all. Removing them is worth little alone and ~50 ms of a 1.44 s synthesis in combination;
+    // BACKLOG.md P4.15b has the four-arm decomposition.
+    //
+    // Scanning the context for one already built is affordable because it happens once per graph
+    // BUILD -- graphs are built once and reused, see GraphBuilder, and a build gets a fresh context so
+    // there is nothing stale to find -- and only for tensors that are not already packed.
+    for (ggml_tensor* o = ggml_get_first_tensor(ctx); o != nullptr; o = ggml_get_next_tensor(ctx, o)) {
+        if (o->op == GGML_OP_CONT && o->src[0] == t && o->type == t->type &&
+            ggml_are_same_shape(o, t)) {
+            return o;
+        }
+    }
+    return ggml_cont(ctx, t);
 }
 
 // 1. Implementation of brand new CoreML MIL primitives using GGML:
