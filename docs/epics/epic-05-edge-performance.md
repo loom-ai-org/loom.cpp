@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-22
+last_updated: 2026-08-23
 ---
 
 # Epic-05: Edge CPU Performance
@@ -54,9 +54,40 @@ Nothing in this repository computes a GEMM — the fixes are patches to `ggml`
 **loom lowers `CONV_1D` to `CONV_2D` on every architecture** — the `#if defined(__aarch64__)` guard is
 gone, because the direct kernel is what x86 was missing.
 
+### The same question on a 24-core x86 box
+
+The Pi is the stated target, but every heuristic in the pinned `ggml` was tuned on it and on a 2-core
+AVX2 laptop, so the many-core x86 class was the one that could plausibly have been regressed. Measured
+2026-08-23 on an **Intel Core Ultra 9 285K (24 cores, 36 MB L3)**, same VITS checkpoint, same utterance,
+scales pinned to `[0, 1, 0]` so both engines synthesise the same 73216 samples:
+
+| | median | vs loom |
+|---|---|---|
+| **loom**, engine default threads | **0.0708 s** | — |
+| onnxruntime, `intra_op_num_threads = 4` | 0.0650 s | **1.09x** |
+
+So the 1.03x on the Pi is **1.09x here** — the thread's result holds on a machine nothing in it was
+tuned for. The harnesses are `scripts/bench_vits_loom.cpp` and its onnxruntime counterpart; both print
+their sample count, and a ratio taken without checking those match is measuring two different
+utterances ([Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md)).
+
+**Both convolution heuristics are a 1.75x win here, not the feared regression** — 0.1242 s with
+`GGML_CPU_DISABLE_CONV_HEURISTICS=1`, 0.0708 s without it. That switch is new, and is the run-time
+escape patches 0004 and 0006 previously lacked; `cmake/patches/UPSTREAM.md` carries the per-patch
+numbers and the reason `bench10`'s kernel-only 0.84x does not contradict this.
+
+**`n_threads` is never set anywhere in the engine**, so ggml's default of 4 is what runs. On a 24-core
+box that leaves 20 cores idle, and it is why the comparison above is honest at `intra_op_num_threads =
+4` rather than generous. Whether the engine should expose a thread count is not filed as work here —
+naming it so the next person does not read the 4 as a measurement artifact.
+
 ### Operating notes: benchmarking
 
-**Machines.** `ssh pi@rpi4` — Raspberry Pi 4B rev 1.5, Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2,
+**Machines.** The Pi is **`192.168.1.35`** — the `rpi4` name does not resolve. The workstation is
+**`192.168.1.100`** (Intel Core Ultra 9 285K, 24 cores, 40 MB L2 / 36 MB L3, Debian, gcc 14.2); it has
+no `cmake` on the default PATH (there is a `buildtools` micromamba env) and its `/home` runs at 99%.
+
+`ssh pi@rpi4` — Raspberry Pi 4B rev 1.5, Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2,
 32 KB L1D, LPDDR4, Debian aarch64, gcc 14.2 / clang 19. Repeatable to ~1% **when it is cool and nothing
 else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX2, 2 cores, 4 MB L3) is
 **thermally noisy** — pin with `taskset -c 0,2` and take medians of seven, or it will lie by 15%.
