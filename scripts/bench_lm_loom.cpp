@@ -12,7 +12,6 @@
 // (src/core/text_generate.cpp:58), so the host re-feeds a growing prompt and every step recomputes
 // the entire sequence. This times both so the difference is a number rather than an argument.
 #include "loom/loom.h"
-#include "cpu_backend.h"
 
 #include <chrono>
 #include <cstdio>
@@ -28,14 +27,16 @@ int main(int argc, char** argv) {
     // "The capital of France is", Qwen3 BPE.
     const std::vector<double> prompt = {785, 6722, 315, 9625, 374};
 
-    ggml_backend_ptr backend(loom_test::cpu_backend());
-    auto model = loom::GgufModel::load(path, backend.get());
+    // Device::open rather than a bare CPU backend: it is what applies $LOOM_N_THREADS.
+    loom::Device device = loom::Device::open("cpu");
+    loom::Backends backends = device.backends();
+
+    auto model = loom::GgufModel::load(path, backends.primary);
     if (!model) { std::fprintf(stderr, "load failed\n"); return 1; }
 
     // A Session, not a bare bridge: it is what ALLOCATES THE KV CACHE the topology declares, and
     // `infer_with_past` throws without one ("no KvCache was provided to GraphBuilder"). This is the
     // same object loom_cli builds, so both timings below are the engine's real configuration.
-    loom::Backends backends{backend.get(), nullptr};
     loom::Session session(*model, backends);
     loom::LoomLuaBridge& bridge = session.bridge();
 
