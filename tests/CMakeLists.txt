@@ -175,6 +175,50 @@ add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# Registered TWICE against one binary, differing only in ENVIRONMENT: `profile::enabled()` caches its
+# answer on first call, so a single process can only ever observe one of the two routes through
+# GraphBuilder::compute, and the branch being stuck in either direction is a real failure (one makes
+# every shipped run pay per-node dispatch, the other makes the feature do nothing). The test asserts
+# whichever direction its own environment selects.
+add_executable(test_profile ci/test_profile.cpp)
+target_link_libraries(test_profile PRIVATE loom::engine)
+target_compile_definitions(test_profile PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_profile COMMAND test_profile)
+set_tests_properties(test_profile PROPERTIES LABELS ci)
+set_tests_properties(test_profile PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+set_tests_properties(test_profile PROPERTIES ENVIRONMENT "LOOM_PROFILE=")
+
+add_test(NAME test_profile_enabled COMMAND test_profile)
+set_tests_properties(test_profile_enabled PROPERTIES LABELS ci)
+set_tests_properties(test_profile_enabled PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+set_tests_properties(test_profile_enabled PROPERTIES ENVIRONMENT "LOOM_PROFILE=1")
+
+# Registered TWICE, differing only in ENVIRONMENT, for the same reason test_profile is: ggml reads
+# GGML_CPU_DISABLE_FUSION once, on first use, so one process can only observe one of the two paths.
+# The two registrations also hand each other their outputs through LOOM_TEST_TMPDIR, so whichever runs
+# second compares them byte for byte -- ordered by ctest's DEPENDS so that always happens.
+add_executable(test_conv_bias_fusion ci/test_conv_bias_fusion.cpp)
+target_link_libraries(test_conv_bias_fusion PRIVATE loom::engine)
+add_test(NAME test_conv_bias_fusion_unfused COMMAND test_conv_bias_fusion)
+set_tests_properties(test_conv_bias_fusion_unfused PROPERTIES LABELS ci)
+set_tests_properties(test_conv_bias_fusion_unfused PROPERTIES ENVIRONMENT
+    "GGML_CPU_DISABLE_FUSION=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+
+add_test(NAME test_conv_bias_fusion COMMAND test_conv_bias_fusion)
+set_tests_properties(test_conv_bias_fusion PROPERTIES LABELS ci)
+set_tests_properties(test_conv_bias_fusion PROPERTIES ENVIRONMENT
+    "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_conv_bias_fusion PROPERTIES DEPENDS test_conv_bias_fusion_unfused)
+
+# Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
+# build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
+# meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
+add_executable(test_tinyblas_gemm ci/test_tinyblas_gemm.cpp)
+target_link_libraries(test_tinyblas_gemm PRIVATE loom::engine)
+target_compile_definitions(test_tinyblas_gemm PRIVATE LOOM_EXPECT_TINYBLAS=$<BOOL:${LOOM_TINYBLAS}>)
+add_test(NAME test_tinyblas_gemm COMMAND test_tinyblas_gemm)
+set_tests_properties(test_tinyblas_gemm PROPERTIES LABELS ci)
+
 add_executable(test_gallocr_shrink ci/test_gallocr_shrink.cpp)
 target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_shrink PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")

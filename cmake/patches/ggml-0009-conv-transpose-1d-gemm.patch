@@ -1,0 +1,112 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6240,6 +6240,12 @@
+     }
+ }
+ 
++// Defined with the 2-D convolution below, which is where it is explained; conv_transpose_1d is the
++// second caller and comes first in this file.
++static void ggml_call_mul_mat_ldc(ggml_type type, const ggml_compute_params * params,
++                                  int64_t m, int64_t n, int64_t k,
++                                  void * a, void * b, float * c, int64_t ldc);
++
+ static void ggml_compute_forward_conv_transpose_1d_f32(
+         const ggml_compute_params * params,
+               ggml_tensor * dst) {
+@@ -6314,19 +6320,61 @@
+ 
+     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
+ 
+-    // total rows in dst
+-    const int nr = ne1;
++    float * const wdata     = (float *) params->wdata + 0;     // [Cout, K, Cin], packed above
++    float * const wdata_src = wdata + nk;                      // [L, Cin], transposed above
++    float * const gemm      = wdata_src + ne10*ne11;           // [tile, Cout*K], this path's scratch
+ 
+-    // rows per thread
+-    const int dr = (nr + nth - 1)/nth;
++    // THIS IS A GEMM, AND IT WAS BEING RUN AS ONE DOT PRODUCT PER OUTPUT ELEMENT.
++    //
++    //     y[oc][i10*s0 + k] += sum_ic  w[oc][k][ic] * x[i10][ic]
++    //
++    // The right-hand side does not depend on `s0` at all: over (oc, k) and i10 it is exactly
++    // `[Cout*K, Cin] x [Cin, L]`, and only the SCATTER of the result knows about the stride. The loop
++    // this replaces called ggml_vec_dot_f32 once per (output channel, input position, tap) -- 1x1
++    // register blocking, the same shape P4.15 took out of mul_mat, and it left this op at 7.3 GFLOP/s
++    // where the machine does 25 on a GEMM.
++    //
++    // Blocked over input positions so the result stays in cache: the scatter reads it immediately, and
++    // whole it would be `K/s0` times the size of dst (18.8 MB against 9.4 for a VITS vocoder's largest
++    // upsample), which is the traffic this is trying not to pay.
++    const int64_t mk   = ne01 * ne00;                          // Cout * K, the GEMM's m
++    const int64_t tile = MAX(1, MIN(ne10, (int64_t) GGML_CONV_TRANSPOSE_1D_TILE / mk));
++
++    const size_t need = (size_t) (nk + ne10*ne11 + tile*mk) * sizeof(float);
++    if (need <= params->wsize) {
++        for (int64_t l0 = 0; l0 < ne10; l0 += tile) {
++            const int64_t nl = MIN(tile, ne10 - l0);
++
++            ggml_call_mul_mat_ldc(GGML_TYPE_F32, params, mk, nl, ne02,
++                                  wdata, wdata_src + l0*ne11, gemm, mk);
++            ggml_barrier(params->threadpool);
++
++            // Overlap-add, split by OUTPUT CHANNEL. Consecutive input positions write overlapping runs
++            // whenever K > s0 -- which is every upsampling convolution, they are built that way -- so a
++            // split over positions would race precisely where this op accumulates. Per (channel,
++            // position) both sides are contiguous over the tap: K floats read, K floats added.
++            for (int64_t i1 = ith; i1 < ne1; i1 += nth) {
++                float * dst_data = (float *)((char *) dst->data + i1*nb1);
++                for (int64_t l = 0; l < nl; ++l) {
++                    const float * src = gemm + l*mk + i1*ne00;
++                    float *       out = dst_data + (l0 + l)*s0;
++                    for (int64_t i00 = 0; i00 < ne00; ++i00) {
++                        out[i00] += src[i00];
++                    }
++                }
++            }
++            ggml_barrier(params->threadpool);
++        }
++        return;
++    }
+ 
+-    // row range for this thread
++    // The scratch above is reserved by ggml_graph_plan, so this is unreachable with a plan this
++    // library built -- it is here for a caller that sized a cplan by hand against an older version.
++    const int nr  = ne1;
++    const int dr  = (nr + nth - 1)/nth;
+     const int ir0 = dr*ith;
+     const int ir1 = MIN(ir0 + dr, nr);
+ 
+-    float * const wdata     = (float *) params->wdata + 0;
+-    float * const wdata_src = wdata + nk;
+-
+     for (int i1 = ir0; i1 < ir1; i1++) {
+         float * dst_data = (float *)((char *) dst->data + i1*nb1);
+         float * wdata_kernel = wdata + i1*ne02*ne00;
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -64,6 +64,11 @@
+ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++// How much of the GEMM result this op keeps in flight, in FLOATS. The result is `K/s0` times the size
++// of dst if computed whole, so it is blocked over input positions and this is the block's budget --
++// 256 KB, chosen to sit inside a small shared L2 alongside the two operands. Reserved by
++// ggml_graph_plan (see GGML_OP_CONV_TRANSPOSE_1D there), so the two must agree.
++#define GGML_CONV_TRANSPOSE_1D_TILE (64*1024)
+ void ggml_compute_forward_conv_transpose_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -2912,6 +2912,10 @@
+                                    node->src[1]->type == GGML_TYPE_F32) {
+                             cur += sizeof(float)*ne00*ne01*ne02;
+                             cur += sizeof(float)*ne10*ne11;
++                            // and the block of GEMM result the F32 path keeps in flight; it computes
++                            // its own tile from the same budget, so the two have to agree. The MAX is
++                            // the tile == 1 case, where one position's worth of Cout*K is all it takes.
++                            cur += sizeof(float)*MAX((int64_t) GGML_CONV_TRANSPOSE_1D_TILE, ne00*ne01);
+                         } else {
+                             GGML_ABORT("fatal error");
+                         }

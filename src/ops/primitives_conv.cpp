@@ -61,6 +61,13 @@ void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
 // Padding and striding are unaffected by any of this -- they are im2col parameters (p0/s0/d0), and
 // reflect padding is a separate op applied upstream (PAD_1D_REFLECT, primitives_basic.cpp).
 
+// Whether CONV_1D lowers to ggml's single convolution op instead of im2col + mul_mat. On everywhere
+// now, for the measured reason spelled out in op_conv_1d below; override it to build (and test) the
+// other path anywhere.
+#ifndef LOOM_CONV1D_DIRECT
+#  define LOOM_CONV1D_DIRECT 1
+#endif
+
 // Whether `kernel` is stored in a form that must occupy mul_mat's FIRST operand. F32 is the only dtype
 // that can sit in the second, and it is the one every pre-quantization export uses.
 bool conv_kernel_is_packed(const ggml_tensor* kernel) {
@@ -100,6 +107,55 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // straight into a pointwise/depthwise conv (confirmed on Conformer-CTC's GLU-split conv module: the
     // first half of a channel-split tensor is a genuinely strided view, not a fresh contiguous buffer).
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+
+    // ON aarch64, LOWER TO ggml's SINGLE CONV OP INSTEAD, because materialising the whole patch matrix
+    // is the wrong trade there. The recipe below writes an [IC*K, OL] im2col matrix to memory and then
+    // GEMMs it: for a VITS vocoder that is ~550 MB written and read back per synthesis, and after
+    // P4.15 made the GEMM 1.7x faster it accounted for 40% of all convolution time. GGML_OP_CONV_2D
+    // (with KH=1, which is what the reshapes below it are for) does the same arithmetic a cache-sized
+    // BATCH of patches at a time, so the patches never leave L2 -- but only once ggml's implementation
+    // of it is fixed to size its batch for a cache and to write the GEMM straight into the output;
+    // both are cmake/patches/ggml-0004-conv2d-cache-blocked.patch, and without them this op measured
+    // 0.97x, which is why P4.14 closed it.
+    //
+    // Measured on a Cortex-A72 over a VITS vocoder's eleven convolution shapes, 4 threads, output
+    // BIT-IDENTICAL either way (the batching splits the patch axis, never the reduction): **1.18x**,
+    // and 1.10-1.63x on the long-activation convs that dominate.
+    //
+    // THIS USED TO BE aarch64-ONLY, and the reason it is not any more is worth keeping. On the
+    // cache-blocked im2col alone, x86-64 measured **0.87x** -- there the patch matrix is worth
+    // materialising, because that machine does in 0.555 s what the Pi takes 1.37 s to do and
+    // cache-blocking buys a bandwidth-rich core much less. What changed is that ggml's convolution now
+    // has a DIRECT kernel behind a cache-size heuristic (ggml-0006), which does not materialise
+    // anything at all: **4.7x** on that machine's long-activation convolutions, and **1.19x**
+    // end-to-end on the same synthesis (1.503 -> 1.258 s, two threads pinned). The shapes the
+    // heuristic declines still get the batched im2col, and are the only thing this lowering gives up.
+    // `scripts/bench10.cpp` is where that decision lives; re-run it on a machine neither of these two
+    // represents -- a many-core server, a wide ARM core -- rather than reasoning about it.
+    //
+    // Eligibility mirrors ggml_compute_forward_conv_2d's own asserts: an F32 or F16 kernel (a
+    // quantized one takes the packed path below), contiguous, and a dense (non-grouped) conv, which
+    // is what this primitive is. Vulkan, CUDA and Metal all implement GGML_OP_CONV_2D, so this does
+    // not strand a graph on the CPU when a backend is present.
+    //
+    // The `#if` is a DEFAULT, not a wall: `-DLOOM_CONV1D_DIRECT=1` builds this path on any target, and
+    // running the suite that way is how it gets tested where the fixtures are -- the conv-bearing
+    // gates (kokoro, styletts2, matcha, the NeMo encoders) live on an x86 dev box, and a Raspberry Pi
+    // has none of them. Both directions are expected to pass, because the two lowerings agree bit for
+    // bit.
+#if LOOM_CONV1D_DIRECT
+    if (!conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel) &&
+        (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
+        const int64_t IC = kernel->ne[1], OC = kernel->ne[2], K = kernel->ne[0];
+        const int64_t IL = data->ne[0], N = data->ne[2];   // ggml never leaves an axis at 0; [IL,IC,N]
+        GGML_ASSERT(data->ne[1] == IC && data->ne[3] == 1);
+        ggml_tensor* kernel_4d = ggml_reshape_4d(pc.ctx, kernel, K, 1, IC, OC);   // [KW, KH=1, IC, OC]
+        ggml_tensor* data_4d   = ggml_reshape_4d(pc.ctx, data, IL, 1, IC, N);     // [W, H=1, C, N]
+        ggml_tensor* conv = ggml_conv_2d_direct(pc.ctx, kernel_4d, data_4d, s0, 1, p0, 0, d0, 1);
+        return {ggml_reshape_3d(pc.ctx, conv, conv->ne[0], OC, N)};               // [OL, OC, N]
+    }
+#endif
+
     ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, conv_im2col_type(kernel)); // [IC*K, OL, N]
     ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]); // [IC*K, N*OL]
     ggml_tensor* kernel_2d = ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]); // [IC*K, OC]

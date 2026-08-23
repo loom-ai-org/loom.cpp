@@ -1,0 +1,79 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6261,39 +6261,54 @@
+     GGML_ASSERT(nb00 == sizeof(float));
+     GGML_ASSERT(nb10 == sizeof(float));
+ 
+-    if (ith == 0) {
+-        memset(params->wdata, 0, params->wsize);
+-
+-        // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout)
+-        {
+-            float * const wdata = (float *) params->wdata + 0;
++    // THE WHOLE PROLOGUE, ON EVERY THREAD. It used to run under `if (ith == 0)`, and on a VITS vocoder
++    // that made it 47% of this op and 100 ms of a 1.31 s synthesis -- a serial section in the middle of
++    // a graph whose every other op is parallel. Nothing in it has to be serial: each part below writes
++    // a region no other thread writes.
++    //
++    // The `memset(params->wdata, 0, params->wsize)` that stood here is gone entirely. It zeroed the
++    // whole PLAN's work buffer -- 16 MB here, sized by an unrelated op -- and nothing needed it: the
++    // two transposes below write every element of the two regions this op uses, `[0, nk)` and
++    // `[nk, nk + ne10*ne11)`.
++
++    // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout).
++    // Split over Cout, so each thread owns the contiguous block `[i01*ne00*ne02, ...)` it writes.
++    {
++        float * const wdata = (float *) params->wdata + 0;
+ 
++        for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
++            float * dst_data = wdata + i01*ne00*ne02;
+             for (int64_t i02 = 0; i02 < ne02; i02++) {
+-                for (int64_t i01 = 0; i01 < ne01; i01++) {
+-                    const float * const src = (float *)((char *) src0->data + i02*nb02 + i01*nb01);
+-                    float * dst_data = wdata + i01*ne00*ne02;
+-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+-                        dst_data[i00*ne02 + i02] = src[i00];
+-                    }
++                const float * const src = (float *)((char *) src0->data + i02*nb02 + i01*nb01);
++                for (int64_t i00 = 0; i00 < ne00; i00++) {
++                    dst_data[i00*ne02 + i02] = src[i00];
+                 }
+             }
+         }
++    }
+ 
+-        // prepare source data (src1)
+-        {
+-            float * const wdata = (float *) params->wdata + nk;
+-            float * dst_data = wdata;
++    // prepare source data (src1), transposed from (L x Cin) to (Cin x L).
++    // Split over L rather than over Cin, which is the other way round from how this read: a transpose
++    // has to be strided on one side, and strided READS beat strided WRITES -- each thread now fills
++    // whole contiguous `ne11`-wide rows instead of scattering single floats `ne11` apart across the
++    // whole buffer, which also keeps two threads off the same cache line.
++    {
++        float * const wdata = (float *) params->wdata + nk;
+ 
++        for (int64_t i10 = ith; i10 < ne10; i10 += nth) {
++            float * dst_data = wdata + i10*ne11;
+             for (int64_t i11 = 0; i11 < ne11; i11++) {
+-                const float * const src = (float *)((char *) src1->data + i11*nb11);
+-                for (int64_t i10 = 0; i10 < ne10; i10++) {
+-                    dst_data[i10*ne11 + i11] = src[i10];
+-                }
++                dst_data[i11] = *(const float *)((const char *) src1->data + i11*nb11 + i10*nb10);
+             }
+         }
++    }
+ 
+-        // need to zero dst since we are accumulating into it
+-        memset(dst->data, 0, ggml_nbytes(dst));
++    // and dst, which is accumulated into, so it does have to be zeroed -- but not by one thread.
++    {
++        const size_t total = ggml_nbytes(dst);
++        const size_t chunk = (total + nth - 1)/nth;
++        const size_t begin = MIN((size_t) ith*chunk, total);
++        memset((char *) dst->data + begin, 0, MIN(chunk, total - begin));
+     }
+     ggml_barrier(params->threadpool);
+ 

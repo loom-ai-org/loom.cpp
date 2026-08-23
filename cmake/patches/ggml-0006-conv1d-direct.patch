@@ -1,0 +1,511 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -1,5 +1,12 @@
+ #include "ops.h"
+ 
++#if defined(__aarch64__)
++#  include <arm_neon.h>
++#elif defined(__AVX2__)
++#  include <immintrin.h>
++#endif
++#include <unistd.h>
++
+ #include "ggml-cpu.h"
+ #include "ggml-impl.h"
+ #include "binary-ops.h"
+@@ -6990,6 +6997,469 @@
+ 
+ // ggml_compute_forward_conv_2d
+ 
++// ---------------------------------------------------------------------------------------------
++// Direct 1-D convolution: no im2col at all.
++//
++// The batched im2col below is a good way to run a convolution whose weights are large: it turns the
++// problem into a GEMM, and a GEMM blocks BOTH operands, so neither has to be re-read. It is a poor way
++// to run one whose activation is long and whose weights are small, because it writes every input
++// element `kw` times -- 137 M element-writes for one VITS synthesis -- to feed a kernel that reads
++// them once. This path is for that case: hold a tile of the OUTPUT in registers, sweep the input where
++// it lies, one broadcast weight per (input channel, tap). Nothing is materialised, and the bias, when
++// there is one, costs nothing at all -- the accumulators start at it.
++//
++// Measured against the batched path over the eleven convolution shapes of a VITS vocoder:
++//
++//                                    Cortex-A72, 4 threads      Ryzen 3 3250U (AVX2), 2 threads
++//   32x32 kw7 L73472                 63.2 -> 38.5 ms  1.64x     70.8 -> 15.0 ms  4.7x
++//   64x64 kw7 L18368                 58.1 -> 40.6 ms  1.43x     70.7 -> 16.0 ms  4.4x
++//   128x128 kw7 L2296                27.0 -> 24.9 ms  1.08x     28.1 ->  8.1 ms  3.5x
++//   192x384 kw5 L287                 10.6 -> 40.9 ms  0.26x     11.0 ->  6.5 ms  1.7x
++//   768x768 kw3 L100                 24.6 -> 164  ms  0.15x     16.4 -> 16.0 ms  1.03x
++//
++// The turn is where the weights stop fitting in cache: a direct convolution re-reads them once per
++// position block, and at 1.5 MB against a 287-position activation that is the entire cost. Hence the
++// budget below, which is why the same rule can say yes on a machine with 4 MB of L3 and no on one with
++// 1 MB of L2 -- and why the two columns above disagree about the last two rows.
++static int64_t ggml_conv_1d_direct_budget(void) {
++    static int64_t budget = -1;
++    if (budget < 0) {
++        long l2 = 0, l3 = 0;
++#if defined(_SC_LEVEL3_CACHE_SIZE)
++        l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
++#endif
++#if defined(_SC_LEVEL2_CACHE_SIZE)
++        l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
++#endif
++        // Half of the last level, because the activation slice and the output share it; and a floor of
++        // 512 KB for the machines that report nothing at all, which is every aarch64 Linux box tried.
++        budget = l3 > 0 ? (int64_t) l3 / 2 : (l2 > 0 ? (int64_t) l2 : 512 * 1024);
++    }
++    return budget;
++}
++
++// OCB output channels x (VEC * lanes) output positions, held in registers across the whole reduction.
++// The tile is ISA-sized: aarch64 has 32 vector registers and a lane-broadcast FMA, so it affords 16
++// accumulators and one vector load per four weights; AVX2 has 16 registers and no lane broadcast, so
++// it takes 8 accumulators and a broadcast load per weight.
++#if defined(__aarch64__)
++#  define GGML_CONV1D_OCB 4
++#  define GGML_CONV1D_VEC 4
++#  define GGML_CONV1D_LANES 4
++#elif defined(__AVX2__) && defined(__FMA__)
++#  define GGML_CONV1D_OCB 4
++#  define GGML_CONV1D_VEC 2
++#  define GGML_CONV1D_LANES 8
++#else
++#  define GGML_CONV1D_OCB 4
++#  define GGML_CONV1D_VEC 4
++#  define GGML_CONV1D_LANES 1
++#endif
++
++// One tile: [oc0, oc0+OCB) x [p0, p0 + VEC*LANES), reading the zero-padded activation `xp`.
++static inline void ggml_conv_1d_direct_tile(const float * xp, const float * wp, const float * bias,
++                                            float * y, int64_t IC, int64_t OC, int64_t KW,
++                                            int64_t LP, int64_t OL, int64_t dil,
++                                            int64_t oc0, int64_t p0, int64_t ocn) {
++    const int64_t P = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
++#if defined(__aarch64__)
++    float32x4_t acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
++    for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
++        const float b = (bias && oc0 + i < OC) ? bias[oc0 + i] : 0.0f;
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) acc[i][j] = vdupq_n_f32(b);
++    }
++    for (int64_t ic = 0; ic < IC; ++ic) {
++        const float * xrow = xp + ic * LP + p0;
++        for (int64_t kx = 0; kx < KW; ++kx) {
++            const float * q = xrow + kx * dil;
++            float32x4_t xv[GGML_CONV1D_VEC];
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) xv[j] = vld1q_f32(q + j * 4);
++            const float32x4_t wv = vld1q_f32(wp + (ic * KW + kx) * OC + oc0);
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++                acc[0][j] = vfmaq_laneq_f32(acc[0][j], xv[j], wv, 0);
++                acc[1][j] = vfmaq_laneq_f32(acc[1][j], xv[j], wv, 1);
++                acc[2][j] = vfmaq_laneq_f32(acc[2][j], xv[j], wv, 2);
++                acc[3][j] = vfmaq_laneq_f32(acc[3][j], xv[j], wv, 3);
++            }
++        }
++    }
++    for (int i = 0; i < ocn; ++i)
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) vst1q_f32(y + (oc0 + i) * OL + p0 + j * 4, acc[i][j]);
++#elif defined(__AVX2__) && defined(__FMA__)
++    __m256 acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
++    for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
++        const float b = (bias && oc0 + i < OC) ? bias[oc0 + i] : 0.0f;
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) acc[i][j] = _mm256_set1_ps(b);
++    }
++    for (int64_t ic = 0; ic < IC; ++ic) {
++        const float * xrow = xp + ic * LP + p0;
++        for (int64_t kx = 0; kx < KW; ++kx) {
++            const float * q = xrow + kx * dil;
++            __m256 xv[GGML_CONV1D_VEC];
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) xv[j] = _mm256_loadu_ps(q + j * 8);
++            const float * w = wp + (ic * KW + kx) * OC + oc0;
++            for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
++                const __m256 wv = _mm256_set1_ps(w[i]);
++                for (int j = 0; j < GGML_CONV1D_VEC; ++j) acc[i][j] = _mm256_fmadd_ps(xv[j], wv, acc[i][j]);
++            }
++        }
++    }
++    for (int i = 0; i < ocn; ++i)
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
++#else
++    float acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
++    for (int i = 0; i < GGML_CONV1D_OCB; ++i)
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j)
++            acc[i][j] = (bias && oc0 + i < OC) ? bias[oc0 + i] : 0.0f;
++    for (int64_t ic = 0; ic < IC; ++ic)
++        for (int64_t kx = 0; kx < KW; ++kx)
++            for (int i = 0; i < GGML_CONV1D_OCB; ++i) {
++                const float w = wp[(ic * KW + kx) * OC + oc0 + i];
++                for (int j = 0; j < GGML_CONV1D_VEC; ++j)
++                    acc[i][j] += w * xp[ic * LP + p0 + j + kx * dil];
++            }
++    for (int i = 0; i < ocn; ++i)
++        for (int j = 0; j < GGML_CONV1D_VEC; ++j) y[(oc0 + i) * OL + p0 + j] = acc[i][j];
++#endif
++    (void) P;
++}
++
++// Whether this convolution should take the direct path at all. Everything the kernel assumes is here.
++static bool ggml_conv_1d_direct_ok(const ggml_tensor * kernel, const ggml_tensor * src,
++                                   const ggml_tensor * dst, ggml_type kernel_type,
++                                   int64_t stride_x, int64_t stride_y, size_t wsize,
++                                   int64_t * lp_out) {
++    if (kernel_type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32) return false;
++    if (kernel->ne[1] != 1 || src->ne[1] != 1 || dst->ne[1] != 1) return false;   // 1-D only
++    if (dst->ne[3] != 1 || src->ne[3] != 1) return false;                        // one image
++    if (stride_x != 1 || stride_y != 1) return false;   // a strided output is not a contiguous vector
++    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(kernel) || !ggml_is_contiguous(dst)) return false;
++
++    const int64_t IC = src->ne[2], OC = dst->ne[2], KW = kernel->ne[0];
++    const int64_t OL = dst->ne[0];
++    const int64_t dil = ggml_get_op_params_i32(dst, 4);
++    if (OC % GGML_CONV1D_OCB != 0) return false;        // the tail would need its own kernel
++    if (OL < GGML_CONV1D_VEC * GGML_CONV1D_LANES) return false;
++
++    // Weights are re-read once per position block, so they have to live in cache for this to pay.
++    if ((int64_t) IC * OC * KW * (int64_t) sizeof(float) > ggml_conv_1d_direct_budget()) return false;
++
++    // AND THE ACTIVATION HAS TO BE LONG RELATIVE TO THE NUMBER OF CHANNEL TILES. This kernel sweeps
++    // position blocks on the outside and output-channel tiles on the inside: with fewer position
++    // blocks than channel tiles there is neither enough parallelism to fill the threads nor enough
++    // reuse to pay for walking the weights, and the ragged tail is a large fraction of the work. The
++    // model this was measured on has 77 convolutions of 100 positions and 192 channels, all of which
++    // pass the weight test and none of which should take this path: without this line the whole
++    // synthesis went 1.576 -> 1.703 s, i.e. the eleven shapes a bench holds are not the eleven shapes
++    // a model runs.
++    if (OL / (GGML_CONV1D_VEC * GGML_CONV1D_LANES) < OC / GGML_CONV1D_OCB) return false;
++
++    const int64_t LP = OL + (KW - 1) * dil;
++    const size_t need = (size_t) IC * LP * sizeof(float) + (size_t) IC * KW * OC * sizeof(float);
++    if (need > wsize) return false;                     // scratch does not fit; the batched path does
++    *lp_out = LP;
++    return true;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Phase-major ("a trous") variant of the direct convolution, for wide dilated kernels.
++//
++// A convolution with dilation d is d independent DENSE convolutions over the subsequences
++// p = j*d + r. It matters because of prefetching: at dilation 12 with kw 7 the direct kernel above
++// reads, per channel, SEVEN separate 64-byte runs spread over 352 bytes, so a 128-channel convolution
++// asks the prefetcher to track 896 streams. Laid out phase-major each channel is one contiguous run of
++// (P + kw - 1) floats, exactly as an undilated convolution is.
++//
++// What it costs is getting into the layout and back out: a de-interleave of the activation and an
++// interleave of the result. NEON does both in one instruction for factors of 2, 3 and 4
++// (vld2q/vld3q/vld4q and the vst mirrors), and 6 and 12 factor into two such passes -- splitting by a
++// and then by b lands element p = j*d + r in phase r1 + a*r2, because p = a*(j*b + r2) + r1. Both
++// passes have to be vectorised: doing only the first leaves dilation 6 and 12 where they started.
++//
++// Measured on a Cortex-A72 at 4 threads, against the direct kernel above, transform included, median
++// of three (`scripts/bench10.cpp`):
++//
++//   128x128 kw7 L2296 d12   35.0 -> 23.0 ms   1.52x
++//   128x128 kw7 L2296 d3    26.1 -> 23.5 ms   1.11x
++//    64x64  kw7 L18368 d12  52.0 -> 49.8 ms   1.04x
++//    64x64  kw7 L18368 d3   44.2 -> 50.4 ms   0.88x
++//   128x128 kw5 L2296 d6    15.7 -> 17.0 ms   0.92x
++//    32x32  kw5 L73472 d6   26.5 -> 54.9 ms   0.48x
++//
++// so the window is narrow and the heuristic below is narrow to match: the benefit grows with the
++// number of streams (kw) and with the dilation that spreads them, and the transform is only affordable
++// when there is enough arithmetic per element to hide it (IC * kw). Everything outside that window
++// keeps the direct kernel, which is why this is a third path rather than a replacement.
++static void ggml_conv1d_deint(const float * src, float * dst, int64_t stride, int64_t n, int f) {
++    int64_t j = 0;
++#if defined(__aarch64__)
++    if (f == 2) {
++        for (; (j + 4) * 2 <= n; j += 4) {
++            const float32x4x2_t v = vld2q_f32(src + j*2);
++            vst1q_f32(dst + 0*stride + j, v.val[0]);
++            vst1q_f32(dst + 1*stride + j, v.val[1]);
++        }
++    } else if (f == 3) {
++        for (; (j + 4) * 3 <= n; j += 4) {
++            const float32x4x3_t v = vld3q_f32(src + j*3);
++            vst1q_f32(dst + 0*stride + j, v.val[0]);
++            vst1q_f32(dst + 1*stride + j, v.val[1]);
++            vst1q_f32(dst + 2*stride + j, v.val[2]);
++        }
++    } else if (f == 4) {
++        for (; (j + 4) * 4 <= n; j += 4) {
++            const float32x4x4_t v = vld4q_f32(src + j*4);
++            vst1q_f32(dst + 0*stride + j, v.val[0]);
++            vst1q_f32(dst + 1*stride + j, v.val[1]);
++            vst1q_f32(dst + 2*stride + j, v.val[2]);
++            vst1q_f32(dst + 3*stride + j, v.val[3]);
++        }
++    }
++#endif
++    for (; j * f < n; ++j)
++        for (int r = 0; r < f; ++r)
++            if (j*f + r < n) dst[r*stride + j] = src[j*f + r];
++}
++
++static void ggml_conv1d_inter(const float * src, float * dst, int64_t stride, int64_t n, int f) {
++    int64_t j = 0;
++#if defined(__aarch64__)
++    if (f == 2) {
++        for (; (j + 4) * 2 <= n; j += 4) {
++            float32x4x2_t v;
++            v.val[0] = vld1q_f32(src + 0*stride + j); v.val[1] = vld1q_f32(src + 1*stride + j);
++            vst2q_f32(dst + j*2, v);
++        }
++    } else if (f == 3) {
++        for (; (j + 4) * 3 <= n; j += 4) {
++            float32x4x3_t v;
++            v.val[0] = vld1q_f32(src + 0*stride + j); v.val[1] = vld1q_f32(src + 1*stride + j);
++            v.val[2] = vld1q_f32(src + 2*stride + j);
++            vst3q_f32(dst + j*3, v);
++        }
++    } else if (f == 4) {
++        for (; (j + 4) * 4 <= n; j += 4) {
++            float32x4x4_t v;
++            v.val[0] = vld1q_f32(src + 0*stride + j); v.val[1] = vld1q_f32(src + 1*stride + j);
++            v.val[2] = vld1q_f32(src + 2*stride + j); v.val[3] = vld1q_f32(src + 3*stride + j);
++            vst4q_f32(dst + j*4, v);
++        }
++    }
++#endif
++    for (; j * f < n; ++j)
++        for (int r = 0; r < f; ++r)
++            if (j*f + r < n) dst[j*f + r] = src[r*stride + j];
++}
++
++// d = a*b, with both factors ones NEON can de-interleave in a single instruction.
++static void ggml_conv1d_phase_factors(int64_t d, int * a, int * b) {
++    *a = (int) d; *b = 1;
++    switch (d) {
++        case 6:  *a = 2; *b = 3; break;
++        case 8:  *a = 2; *b = 4; break;
++        case 9:  *a = 3; *b = 3; break;
++        case 12: *a = 4; *b = 3; break;
++        case 16: *a = 4; *b = 4; break;
++        default: break;
++    }
++}
++
++static bool ggml_conv1d_phase_ok(int64_t IC, int64_t OC, int64_t KW, int64_t OL, int64_t dil,
++                                 int nth, int64_t * j_out, size_t * need_out) {
++#if !defined(__aarch64__)
++    // The transform is only cheap where the ISA de-interleaves in one instruction; without vld3/vst3
++    // it is the strided copy this exists to avoid. AVX2 has no 3-way de-interleave.
++    (void) IC; (void) OC; (void) KW; (void) OL; (void) dil; (void) nth; (void) j_out; (void) need_out;
++    return false;
++#else
++    if (dil < 3 || KW < 7) return false;              // too few streams, or too little spread
++    if (IC * KW < 768) return false;                  // not enough arithmetic to hide the transform
++    int a, b; ggml_conv1d_phase_factors(dil, &a, &b);
++    if (!(a == 2 || a == 3 || a == 4)) return false;
++    if (!(b == 1 || b == 2 || b == 3 || b == 4)) return false;
++
++    const int64_t J  = (OL + dil - 1) / dil;
++    const int64_t P  = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
++    if (J < P) return false;                          // a phase shorter than one tile
++    const int64_t H  = (KW - 1) / 2;
++    const int64_t JP = J + 2*H;
++    *j_out = J;
++    *need_out = (size_t) IC * dil * JP * sizeof(float)      // phase-major activation
++              + (size_t) OC * dil * J  * sizeof(float)      // phase-major result
++              + (size_t) IC * KW * OC  * sizeof(float)      // packed weights
++              // two-pass scratch, PER THREAD -- each one de-interleaves a whole channel into its own
++              // copy, so this is nth of them, not one. Reserving a single copy fits inside the 16 MB
++              // work buffer at the sizes measured here and would have overrun it at larger ones.
++              + (size_t) nth * a * (((OL + a - 1) / a) + 1) * sizeof(float);
++    return true;
++#endif
++}
++
++// The direct path itself: pad the activation once, pack the weights once, then sweep.
++static void ggml_conv_1d_direct_run(const ggml_compute_params * params,
++                                    const ggml_tensor * kernel, const ggml_tensor * src,
++                                    ggml_tensor * dst, const float * bias_data, float * out_data,
++                                    int64_t LP) {
++    const int64_t IC  = src->ne[2];
++    const int64_t OC  = dst->ne[2];
++    const int64_t KW  = kernel->ne[0];
++    const int64_t L   = src->ne[0];
++    const int64_t OL  = dst->ne[0];
++    const int64_t dil = ggml_get_op_params_i32(dst, 4);
++    const int64_t pad = ggml_get_op_params_i32(dst, 2);
++
++    const float * x = (const float *) src->data;
++    const float * w = (const float *) kernel->data;
++    float *       y = out_data ? out_data : (float *) dst->data;
++
++    float * xp = (float *) params->wdata;                 // [IC, LP], zero-padded
++    float * wp = xp + (size_t) IC * LP;                   // [IC, KW, OC], packed
++
++    // The padded copy is also what makes writing the output over the input safe -- which the bias
++    // fusion makes the common case, since a graph allocator hands the ADD the block the input just
++    // vacated. Everything after this reads the copy, never the original.
++    for (int64_t ic = params->ith; ic < IC; ic += params->nth) {
++        float * row = xp + ic * LP;
++        const int64_t lo = pad;                            // input position 0 lands here
++        const int64_t n  = MIN(L, LP - lo);
++        // ONLY THE TWO EDGE STRIPS ARE ZEROED, because the copy covers everything between them.
++        // Zeroing the whole row first writes every element of this buffer TWICE -- 9.4 MB of memset
++        // that the copy immediately discards, for this model's largest convolution. That is a third of
++        // what the padded copy costs and 26 ms of a 1.34 s synthesis on a Cortex-A72. The strips are
++        // `pad` floats each: 36 at the widest dilation here.
++        memset(row, 0, (size_t) lo * sizeof(float));
++        if (LP > lo + n) memset(row + lo + n, 0, (size_t) (LP - lo - n) * sizeof(float));
++        if (n > 0) memcpy(row + lo, x + ic * L, (size_t) n * sizeof(float));
++    }
++    // Packed [ic][kx][oc] so the four output channels a tile covers are contiguous: on aarch64 that is
++    // one vector load feeding four lane-broadcast FMAs instead of four scalar loads.
++    for (int64_t ic = params->ith; ic < IC; ic += params->nth)
++        for (int64_t kx = 0; kx < KW; ++kx)
++            for (int64_t oc = 0; oc < OC; ++oc)
++                wp[(ic * KW + kx) * OC + oc] = w[oc * (IC * KW) + ic * KW + kx];
++
++    ggml_barrier(params->threadpool);
++
++    // Position block OUTERMOST, output channels inside it. The other way round -- the obvious way --
++    // every channel block re-streams the whole activation from DRAM, and the kernel then measures the
++    // same time whatever KW is, because it is not computing, it is waiting. 3x, on the shapes here.
++    // Position blocks are split into CONTIGUOUS ranges, one per thread, not round-robin. Round-robin
++    // gives each core every nth block, so its working set spans the whole activation rather than its
++    // own share of it, and on a chip whose L2 is shared that costs 10% at 32 channels x 73472
++    // (39.3 -> 35.8 ms, four threads) -- the largest convolutions in the model. It is the same total
++    // work either way; only the locality differs.
++    const int64_t P    = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
++    const int64_t nblk = OL / P;
++    const int64_t per  = (nblk + params->nth - 1) / params->nth;
++    const int64_t b0   = params->ith * per;
++    const int64_t b1   = MIN(b0 + per, nblk);
++    for (int64_t b = b0; b < b1; ++b)
++        for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
++            ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
++                                     oc0, b * P, GGML_CONV1D_OCB);
++
++    // The ragged tail, as ONE MORE OVERLAPPING TILE ending at OL rather than a scalar loop. It
++    // recomputes up to P-1 positions the last full tile already did, which is far cheaper than doing
++    // any of them at scalar speed: at OL = 2296 the tail is 8 positions, but 8 x OC x IC x KW scalar
++    // multiply-accumulates is ~2 ms of a 20 ms convolution. The heuristic guarantees OL >= P, so this
++    // is always a whole tile.
++    if (nblk * P < OL) {
++        const int64_t p0 = OL - P;
++        for (int64_t oc0 = params->ith * GGML_CONV1D_OCB; oc0 < OC;
++             oc0 += params->nth * GGML_CONV1D_OCB) {
++            ggml_conv_1d_direct_tile(xp, wp, bias_data, y, IC, OC, KW, LP, OL, dil,
++                                     oc0, p0, GGML_CONV1D_OCB);
++        }
++    }
++}
++
++
++
++
++// The phase-major path: de-interleave, run the dense kernel per phase, interleave back.
++static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
++                                   const ggml_tensor * kernel, const ggml_tensor * src,
++                                   ggml_tensor * dst, const float * bias_data, float * out_data,
++                                   int64_t J) {
++    const int64_t IC  = src->ne[2];
++    const int64_t OC  = dst->ne[2];
++    const int64_t KW  = kernel->ne[0];
++    const int64_t L   = src->ne[0];
++    const int64_t OL  = dst->ne[0];
++    const int64_t dil = ggml_get_op_params_i32(dst, 4);
++    const int64_t H   = (KW - 1) / 2;
++    const int64_t JP  = J + 2*H;
++
++    int a, b; ggml_conv1d_phase_factors(dil, &a, &b);
++    const int64_t na   = (L  + a - 1) / a;
++    const int64_t nb   = (OL + a - 1) / a;
++    const int64_t nmax = (na > nb ? na : nb) + 1;      // one slice per thread, sized for either pass
++
++    const float * x = (const float *) src->data;
++    const float * w = (const float *) kernel->data;
++    float *       y = out_data ? out_data : (float *) dst->data;
++
++    float * xp  = (float *) params->wdata;              // [IC, dil, JP]
++    float * yp  = xp + (size_t) IC * dil * JP;          // [OC, dil, J]
++    float * wp  = yp + (size_t) OC * dil * J;           // [IC, KW, OC]
++    float * tmp = wp + (size_t) IC * KW * OC;           // two-pass scratch, per thread below
++
++    for (int64_t ic = params->ith; ic < IC; ic += params->nth) {
++        float * base = xp + ic * dil * JP;
++        memset(base, 0, (size_t) dil * JP * sizeof(float));
++        if (b == 1) {
++            ggml_conv1d_deint(x + ic*L, base + H, JP, L, a);
++        } else {
++            float * t = tmp + (size_t) params->ith * a * nmax;
++            ggml_conv1d_deint(x + ic*L, t, nmax, L, a);
++            for (int r1 = 0; r1 < a; ++r1)
++                ggml_conv1d_deint(t + (int64_t) r1*nmax, base + (int64_t) r1*JP + H, (int64_t) a*JP, na, b);
++        }
++    }
++    for (int64_t ic = params->ith; ic < IC; ic += params->nth)
++        for (int64_t kx = 0; kx < KW; ++kx)
++            for (int64_t oc = 0; oc < OC; ++oc)
++                wp[(ic * KW + kx) * OC + oc] = w[oc * (IC * KW) + ic * KW + kx];
++
++    ggml_barrier(params->threadpool);
++
++    // Within a phase the taps are adjacent, so this is the dense kernel with dilation 1.
++    const int64_t P    = GGML_CONV1D_VEC * GGML_CONV1D_LANES;
++    const int64_t nblk = J / P;
++    const int64_t njob = dil * nblk;
++    const int64_t jper = (njob + params->nth - 1) / params->nth;      // contiguous, as above
++    const int64_t j0   = params->ith * jper;
++    const int64_t j1   = MIN(j0 + jper, njob);
++    for (int64_t job = j0; job < j1; ++job) {
++        const int64_t r = job / nblk, bkl = job % nblk;
++        for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
++            ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
++                                     IC, OC, KW, (int64_t) dil * JP, (int64_t) dil * J, 1,
++                                     oc0, bkl * P, GGML_CONV1D_OCB);
++    }
++    if (nblk * P < J) {                                  // overlapping tail tile, as in the direct path
++        const int64_t j0 = J - P;
++        for (int64_t r = params->ith; r < dil; r += params->nth)
++            for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_OCB)
++                ggml_conv_1d_direct_tile(xp + (size_t) r * JP, wp, bias_data, yp + (size_t) r * J,
++                                         IC, OC, KW, (int64_t) dil * JP, (int64_t) dil * J, 1,
++                                         oc0, j0, GGML_CONV1D_OCB);
++    }
++
++    ggml_barrier(params->threadpool);
++
++    for (int64_t oc = params->ith; oc < OC; oc += params->nth) {
++        const float * s = yp + (size_t) oc * dil * J;
++        if (b == 1) {
++            ggml_conv1d_inter(s, y + oc*OL, J, OL, a);
++        } else {
++            float * t = tmp + (size_t) params->ith * a * nmax;
++            for (int r1 = 0; r1 < a; ++r1)
++                ggml_conv1d_inter(s + (int64_t) r1*J, t + (int64_t) r1*nmax, (int64_t) a*J, nb, b);
++            ggml_conv1d_inter(t, y + oc*OL, nmax, OL, a);
++        }
++    }
++}
+ 
+ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
+                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
+@@ -7031,6 +7501,25 @@
+     void  * knl_data       = kernel->data;
+     float * dst_data       = out_data ? out_data : (float *) dst->data;
+ 
++    // The direct path, when the shape suits it -- see ggml_conv_1d_direct_ok. Everything below is the
++    // batched im2col, which is what a convolution with large weights wants instead.
++    {
++        int64_t lp = 0;
++        if (ggml_conv_1d_direct_ok(kernel, src, dst, kernel_type, stride_x, stride_y, params->wsize, &lp)) {
++            // A wide, heavily dilated kernel wants the phase-major form of the same sweep instead --
++            // see ggml_conv1d_phase_ok for the window and the numbers that drew it.
++            int64_t jphase = 0; size_t need = 0;
++            if (ggml_conv1d_phase_ok(src->ne[2], dst->ne[2], kernel->ne[0], dst->ne[0],
++                                     ggml_get_op_params_i32(dst, 4), params->nth, &jphase, &need) &&
++                need <= params->wsize) {
++                ggml_conv_1d_phase_run(params, kernel, src, dst, bias_data, out_data, jphase);
++                return;
++            }
++            ggml_conv_1d_direct_run(params, kernel, src, dst, bias_data, out_data, lp);
++            return;
++        }
++    }
++
+     const int64_t knl_n           = knl_w * knl_h * c_in;
+     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
+ 
