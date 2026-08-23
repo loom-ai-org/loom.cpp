@@ -1,6 +1,14 @@
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -6862,6 +6862,56 @@
+@@ -11,6 +11,7 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <cstdlib>
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -6862,6 +6863,56 @@
      ggml_compute_forward_mul_mat(params, &dst);
  }
  
@@ -57,7 +65,7 @@
  static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
      return (coord  + size) % size; // adding size avoids negative number weirdness
  }
-@@ -6979,7 +7029,25 @@
+@@ -6979,7 +7030,32 @@
      const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
  
      const int64_t space_per_patch   = knl_n * traits->type_size + c_out * sizeof(float);
@@ -76,15 +84,22 @@
 +    // The second clause is for convolutions small enough that the whole thing already fits: splitting
 +    // those only costs barriers and shrinks the GEMM. Without it, the two shortest shapes measured
 +    // 0.98x and 0.92x; with it they are 0.98x and 1.02x, and the weighted total goes 1.16x -> 1.18x.
++    // KILL SWITCH. Everything above is a heuristic tuned on two machines, so a box it mispredicts
++    // needs an escape that is not a rebuild. Spelled like ggml's own GGML_CPU_DISABLE_FUSION.
++    static int conv_heur_off = -1;
++    if (conv_heur_off < 0) {
++        const char * e = getenv("GGML_CPU_DISABLE_CONV_HEURISTICS");
++        conv_heur_off = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
 +    const int64_t patch_budget      = 512 * 1024;
-+    const int64_t wbudget           = (patch_total * space_per_patch > 3 * patch_budget)
++    const int64_t wbudget           = (!conv_heur_off && patch_total * space_per_patch > 3 * patch_budget)
 +                                        ? MIN(params->wsize, patch_budget)
 +                                        : params->wsize;
 +    const int64_t batch_size        = wbudget / space_per_patch;
      const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
      const int64_t batch_n           = (patch_total + patches_per_batch - 1) / patches_per_batch;
  
-@@ -7035,6 +7103,19 @@
+@@ -7035,6 +7111,19 @@
          }   // patches handled by this thread
  
          ggml_barrier(params->threadpool);

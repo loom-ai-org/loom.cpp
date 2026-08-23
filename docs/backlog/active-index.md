@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-08-22
+last_updated: 2026-08-23
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -86,6 +86,11 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
+* [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
+  carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
+  LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
+  somewhere to put ShortConv state, which is a real design question and not a one-line change.
+  → [Epic-05 §2](../epics/epic-05-edge-performance.md)
 * [ ] **P4.16 — the convolution gap, shape by shape.** Both named mechanisms are spent (P4.15c measured
   one out, P4.15d/f fixed the other) and the model is at 1.033x of onnxruntime end to end.
   **Re-measure the table against the post-P4.15f export before opening anything new on it.**

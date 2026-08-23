@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-22
+last_updated: 2026-08-23
 ---
 
 # Epic-05: Edge CPU Performance
@@ -54,9 +54,83 @@ Nothing in this repository computes a GEMM — the fixes are patches to `ggml`
 **loom lowers `CONV_1D` to `CONV_2D` on every architecture** — the `#if defined(__aarch64__)` guard is
 gone, because the direct kernel is what x86 was missing.
 
+### The same question on a 24-core x86 box
+
+The Pi is the stated target, but every heuristic in the pinned `ggml` was tuned on it and on a 2-core
+AVX2 laptop, so the many-core x86 class was the one that could plausibly have been regressed. Measured
+2026-08-23 on an **Intel Core Ultra 9 285K (24 cores, 36 MB L3)**, same VITS checkpoint, same utterance,
+scales pinned to `[0, 1, 0]` so both engines synthesise the same 73216 samples:
+
+| | median | vs loom |
+|---|---|---|
+| **loom**, engine default threads | **0.0708 s** | — |
+| onnxruntime, `intra_op_num_threads = 4` | 0.0650 s | **1.09x** |
+
+So the 1.03x on the Pi is **1.09x here** — the thread's result holds on a machine nothing in it was
+tuned for. The harnesses are `scripts/bench_vits_loom.cpp` and its onnxruntime counterpart; both print
+their sample count, and a ratio taken without checking those match is measuring two different
+utterances ([Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md)).
+
+**Both convolution heuristics are a 1.75x win here, not the feared regression** — 0.1242 s with
+`GGML_CPU_DISABLE_CONV_HEURISTICS=1`, 0.0708 s without it. That switch is new, and is the run-time
+escape patches 0004 and 0006 previously lacked; `cmake/patches/UPSTREAM.md` carries the per-patch
+numbers and the reason `bench10`'s kernel-only 0.84x does not contradict this.
+
+**`n_threads` is never set anywhere in the engine**, so ggml's default of 4 is what runs. On a 24-core
+box that leaves 20 cores idle, and it is why the comparison above is honest at `intra_op_num_threads =
+4` rather than generous. Whether the engine should expose a thread count is not filed as work here —
+naming it so the next person does not read the 4 as a measurement artifact.
+
+### Three tasks, not one — and the convolutional one is the good one
+
+VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
+Measured the same day on the same box, F32 on both sides, 4 threads on both sides:
+
+| task | model | loom | onnxruntime | |
+|---|---|---|---|---|
+| TTS | VITS (piper en-GB) | 0.0708 s | 0.0650 s | **1.09x** |
+| ASR | whisper-small | 3.80 s | 3.23 s | **1.18x** |
+| LM | Qwen3-0.6B | 2.98 s / 65 tok | 3.33 s / 65 tok | **0.89x** (loom faster) |
+
+**That LM row was the engine calling the wrong function, and it is fixed.** `loom::text::generate`
+called `infer` unconditionally. Every generated causal-LM driver exports **two** entry points — `infer`,
+one forward over whatever it is handed, returning one token; and `infer_with_past`, which runs the
+decode loop itself against the KV cache and returns the whole sequence. Taking `infer`, the host re-fed
+a growing prompt and every step recomputed the entire sequence.
+
+`$LOOM_PROFILE` is what showed it, and only because it prints shapes: **112 `MUL_MAT` calls per step at
+`ne1` = the current sequence length rather than 1** — 28 layers x 4 projections, over the whole prompt,
+every token. A plausible-sounding Lua-marshalling explanation was argued first and was wrong; `MUL_MAT`
+was 83-88% of the profile the whole time. That is the fourth time on this thread that reasoning from
+code lost to reading a profile.
+
+| Qwen3-0.6B, 65 tokens | | |
+|---|---|---|
+| `infer`, re-fed prompt (was shipping) | 8.43 s | 7.71 tok/s |
+| `infer_with_past` (now selected) | **2.98 s** | **21.78 tok/s** |
+| onnxruntime | 3.33 s | 19.21 tok/s |
+
+**So loom is at parity on all three tasks**, and the LM was never a kernel problem. The tell was the
+*shape* of the curve, not its height: onnxruntime's cost per token is flat (46.7 ms at 64 tokens, 45.2
+at 128) and loom's was not (146 -> 305 ms), which is what O(n^2) looks like from outside.
+
+Both ASR engines produce the identical transcript, so that 1.18x is comparable work. The LM figures are
+**differenced** — the same prompt at 1 and at 65 new tokens, so model load, tokenisation and prefill
+cancel and what remains is 64 decode steps; loom's raw wall times include a 2.4 GB GGUF load that
+onnxruntime's do not, and quoting them undifferenced would flatter onnxruntime by about a second.
+
+Harnesses: `scripts/bench_vits_loom.cpp` and, for the other two, `loom_cli` timed against a raw
+`onnxruntime` decode loop. **Do not use `optimum` for Qwen3** — 2.3.0 infers `head_dim` as
+`hidden / n_heads` (64) where Qwen3 decouples it to 128, and the session rejects the KV cache it
+builds. Reading the shapes off `session.get_inputs()` avoids assuming anything.
+
 ### Operating notes: benchmarking
 
-**Machines.** `ssh pi@rpi4` — Raspberry Pi 4B rev 1.5, Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2,
+**Machines.** The Pi is **`192.168.1.35`** — the `rpi4` name does not resolve. The workstation is
+**`192.168.1.100`** (Intel Core Ultra 9 285K, 24 cores, 40 MB L2 / 36 MB L3, Debian, gcc 14.2); it has
+no `cmake` on the default PATH (there is a `buildtools` micromamba env) and its `/home` runs at 99%.
+
+`ssh pi@rpi4` — Raspberry Pi 4B rev 1.5, Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2,
 32 KB L1D, LPDDR4, Debian aarch64, gcc 14.2 / clang 19. Repeatable to ~1% **when it is cool and nothing
 else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX2, 2 cores, 4 MB L3) is
 **thermally noisy** — pin with `taskset -c 0,2` and take medians of seven, or it will lie by 15%.

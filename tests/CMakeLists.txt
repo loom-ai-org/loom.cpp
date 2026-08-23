@@ -161,6 +161,11 @@ add_test(NAME test_graph_builder_shapes COMMAND test_graph_builder_shapes)
 set_tests_properties(test_graph_builder_shapes PROPERTIES LABELS ci)
 set_tests_properties(test_graph_builder_shapes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+add_executable(test_lua_bridge_has_function ci/test_lua_bridge_has_function.cpp)
+target_link_libraries(test_lua_bridge_has_function PRIVATE loom::engine)
+add_test(NAME test_lua_bridge_has_function COMMAND test_lua_bridge_has_function)
+set_tests_properties(test_lua_bridge_has_function PROPERTIES LABELS ci)
+
 add_executable(test_lua_bridge_run_subgraph ci/test_lua_bridge_run_subgraph.cpp)
 target_link_libraries(test_lua_bridge_run_subgraph PRIVATE loom::engine)
 target_compile_definitions(test_lua_bridge_run_subgraph PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
