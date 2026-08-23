@@ -86,6 +86,22 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
+* [ ] **loom stops scaling at 8 threads and then goes backwards** — VITS on a 24-core x86 is 0.080 s
+  at 8 threads and **0.191 s at 24, the same as one thread**, while onnxruntime keeps improving across
+  that range. The LM does the same (21.8 tok/s at 4, 10.6 at 24). ggml's default of 4 sits near the good
+  part of the curve, which is why it was never seen, and is why `$LOOM_N_THREADS` defaults to leaving it
+  alone. *Mechanism first:* per-op profile at 8 vs 24 threads to separate barrier count from allocator
+  contention from idle-thread partitioning. → [Epic-05 §2](../epics/epic-05-edge-performance.md)
+* [ ] **Whisper recomputes its cross-attention K/V on every decode step**, and it is **57.7% of ASR
+  runtime**. The driver passes `xa = {from = 'encoder'}` into `decoder` each step, so the topology
+  re-projects all 1500 encoder frames per token: `MUL_MAT 768x1500` is called **684** times for one
+  11-second clip where the encoder itself needs 48 (12 decoder layers x K,V x ~25 steps accounts for
+  the rest). onnxruntime computes that KV once and holds it — its whisper-small is 1.54 s against
+  loom's 3.73 s on a 24-core x86 at 4 threads, and this is where the 2.4x lives.
+  *This is the same shape of defect as the `infer`/`infer_with_past` one, one layer down:* there the
+  host re-fed the prompt, here the graph re-derives a constant. The fix is an **export** change —
+  the cross-KV has to become a retained output computed once, the way ONNX's `present.N.encoder` is —
+  not an engine one. → [Epic-05 §2](../epics/epic-05-edge-performance.md)
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
