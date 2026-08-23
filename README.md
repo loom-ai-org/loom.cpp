@@ -115,7 +115,7 @@ meet.
 
 There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
 (`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,
-where it is worth ~2x on x86-64 and 1.6x on aarch64 at convolutional shapes (BACKLOG.md P4.15).
+where it is worth ~2x on x86-64 and 1.6x on aarch64 at convolutional shapes ([Epic-05](docs/epics/epic-05-edge-performance.md)).
 
 ### Running on a GPU
 
@@ -180,18 +180,33 @@ rebuilt is what you do while working on it.
 
 ## Documentation
 
+The project's knowledge base is a four-tier hub-and-spoke set under [`docs/`](docs/), covering all
+three repos.
+
 | | |
 |---|---|
-| [`BACKLOG.md`](BACKLOG.md) | the project ledger: every work item, what was measured, and what was found |
+| [`docs/backlog/active-index.md`](docs/backlog/active-index.md) | **the hub** — open work only, one line each, linked to its context |
+| [`docs/epics/`](docs/epics/) | what each domain is and how it works (engine, exporter, models, backends, performance, host API, text front-ends, packaging) |
+| [`docs/adrs/`](docs/adrs/) | why a technical choice was made, what was considered, and what it cost |
+| [`docs/retros/`](docs/retros/) | what broke, the root cause, and the takeaway |
+
+The specifications those tiers refer back to:
+
+| | |
+|---|---|
 | [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) | the data-driven design and why the engine hardcodes nothing |
 | [`docs/KV-CACHE.md`](docs/KV-CACHE.md) | how a cached attention block reaches the engine from an export |
 | [`docs/LOOM_PROCEDURAL_GENERALIZATION.md`](docs/LOOM_PROCEDURAL_GENERALIZATION.md) | the embedded-Lua orchestration blueprint |
 | [`docs/HIGH-LEVEL-API.md`](docs/HIGH-LEVEL-API.md) | one door per task, what each layer owns, and what a file must declare for a host to dispatch |
 
+[`BACKLOG.md`](BACKLOG.md) was the single-file ledger until it reached ~9,000 lines. It is now a
+redirect carrying a map from every old section to its new home, so a code comment citing an item by
+number (`P4.3e`, `P4.15b`) still resolves. Item numbers were not changed.
+
 ## Roadmap
 
 **1. GPUs — done; NPUs, not yet.** The engine takes a device backend and a CPU fallback and schedules
-across them (`BACKLOG.md` P4.7); see [Running on a GPU](#running-on-a-gpu) above. Measured on an AMD
+across them ([Epic-04](docs/epics/epic-04-backends-and-accelerators.md)); see [Running on a GPU](#running-on-a-gpu) above. Measured on an AMD
 Vega 3 iGPU against 4 CPU threads, one forward each:
 
 | model | splits | GPU vs CPU |
@@ -209,7 +224,7 @@ of it was the engine: it was three patterns the exporter emitted as host callbac
 been taught to recognise them — an RMS norm (`POW`+`RSQRT`), a squaring (`POW`), and a hand-rolled
 LayerNorm. **Across all thirteen exported models there are now exactly two `ggml_map_custom` nodes
 left** — one `ATAN` each in Kokoro's and StyleTTS2's STFT phase, which has no ggml counterpart.
-`BACKLOG.md` P4.7a–P4.7c have the numbers, including a CPU measurement that came out wrong twice before
+[Retro-009](docs/retros/retro-009-host-callback-count-was-the-wrong-lens.md) has the numbers, including a CPU measurement that came out wrong twice before
 anything interleaved the runs.
 
 **Counting host callbacks turned out to be the wrong lens**, which is worth knowing before optimizing
@@ -217,7 +232,7 @@ anything here: a graph splits just as readily on a *real* ggml op whose backend 
 the gaps do not line up between backends — CUDA has `PAD_REFLECT_1D` but no `POOL_1D`, Vulkan has
 `POOL_2D` but neither, and the NPU backends have none of the three.
 
-So **a primitive asks the backend what it can run** (`BACKLOG.md` P4.7e) and emits either the native op
+So **a primitive asks the backend what it can run** ([ADR-007](docs/adrs/adr-007-backend-capability-negotiation.md)) and emits either the native op
 or an exactly-equivalent composition. That decision belongs in the engine rather than the export: one
 GGUF may be run by any backend, so deciding it at export time compiles every artifact for the least
 capable one. The same Kokoro file builds 1692 ggml nodes on a CPU and 1732 on Vulkan, and its topology
@@ -241,7 +256,7 @@ export's 181, so decomposing a model into modules was never the expensive part. 
 still unbuilt: a GPU makes `ggml_flash_attn_ext`'s forced F16 K/V cast worth considering, but what
 stands in the way is the gate suite's exact-fp32 comparisons, not the hardware.
 
-**What is next is scoped as `BACKLOG.md` P4.8: CUDA, then NPUs.** Sixteen backend directories already
+**What is next is CUDA, then NPUs** — see [Epic-04](docs/epics/epic-04-backends-and-accelerators.md). Sixteen backend directories already
 ship in the pinned ggml — CUDA, Metal, SYCL, OpenCL, HIP, OpenVINO, Hexagon (Qualcomm), CANN (Ascend)
 among them — and because `loom::Device` resolves a spec against ggml's *device registry* rather than
 against any backend name it knows, a CUDA build's `CUDA0` is already selectable by code that has never
@@ -251,20 +266,20 @@ Metal is not) and RKNPU2 are out of tree and cost more, licence check included.
 Compiling all of them in would end the leanness this engine is for, so the answer is `GGML_BACKEND_DL`:
 each backend becomes a shared library ggml discovers at run time, one engine binary serves every
 accelerator, and the deployment decides which files travel with it. That already works through
-`loom::Device` unchanged. See P4.8 for what is still missing (a `Backends` that holds more than two, and
+`loom::Device` unchanged. See [ADR-009](docs/adrs/adr-009-backends-as-dynamic-libraries.md) and the [backlog](docs/backlog/active-index.md#backends--accelerators) for what is still missing (a `Backends` that holds more than two, and
 the custom-op fusion above, which on an NPU stops being an optimization and becomes a prerequisite).
 
 **2. Builds for more platforms.** Linux x86-64 is what is built and tested today. Next: macOS on Intel,
 macOS on Apple Silicon, and Linux on ARM — the last of which is the one that matters most for an engine
 whose stated target is edge devices.
 
-**3. More models — P5 in the ledger**, ordered by coverage per unit of effort: BERT token classifiers
+**3. More models — [Epic-03](docs/epics/epic-03-model-coverage.md)**, ordered by coverage per unit of effort: BERT token classifiers
 (the smallest possible template, and the first non-audio task) → codec decoders → CNN+CTC and SANM
 encoders → the remaining TTS families → text encoder-decoders → small classifiers → music. Each is an
 export, so the measure of the design is that none of them should need engine work.
 
-**4. The follow-ups the docs already name.** [`BACKLOG.md`](BACKLOG.md) is the ledger and the authority;
-the ones worth knowing about from here are the `KvCache` memory redesign (deferred with its reasons),
+**4. The follow-ups the docs already name.** [`docs/backlog/active-index.md`](docs/backlog/active-index.md)
+is the ledger and the authority; the ones worth knowing about from here are the `KvCache` memory redesign (deferred with its reasons),
 KV-cache addressing policies beyond the contiguous append `ggml_set_rows` already permits, quantized KV
 cache, a permissively-licensed phonemiser so the phoneme-input TTS models get a text door, and
 generalizing the grapheme front-end out of C++ once a second such model exists.
