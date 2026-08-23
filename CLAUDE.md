@@ -43,15 +43,71 @@ twice on purpose — `tests/support/fixtures.h` and `scripts/fixtures.py` — an
 (`LOOM_KOKORO_MIL_GGUF`, …) is still checked **first** and wins. `scripts/fixtures.py status` says
 what is present.
 
-## Conventions worth knowing before changing anything
+## The knowledge base, and how to keep it
 
-* **`BACKLOG.md` is the project ledger for all three repos** — every work item, what was measured, and
-  what was found. Code comments reference it by item (`BACKLOG.md P4.3e`). Read the relevant entry
-  before touching an area; add to it when you finish something.
-* **Comments say why, not what.** The codebase's density is deliberate: where a line is the way it is
-  because an alternative was tried and failed, the comment records the failure and the measurement.
-  Match that.
-* **A gate that cannot fail proves nothing.** Before trusting a byte-identity or reference comparison,
-  confirm it can go red — the sweep has produced a false pass before.
-* **Tensor oracle, not token oracle.** A wrong encoder still decodes a plausible transcript; compare
-  tensors before believing token agreement.
+**Documentation for all three repos lives in `loom.cpp/docs/`, in four tiers.** `BACKLOG.md` was one
+9,000-line ledger; it is now a redirect with a map from every old section to its new home.
+
+| tier | path | holds | size |
+|---|---|---|---|
+| **Hub** | [`docs/backlog/active-index.md`](docs/backlog/active-index.md) | **open work only**, one line each | one screen per domain |
+| **Epic** | [`docs/epics/`](docs/epics/) | what a domain is, how it works, and its planned work | ~100 lines, except where a live plan lives there |
+| **ADR** | [`docs/adrs/`](docs/adrs/) | why a choice was made: context, options, decision, consequences | ~60 lines |
+| **Retro** | [`docs/retros/`](docs/retros/) | what broke: issue, root cause, takeaway — then the verbatim record | ~50 lines + record |
+
+`docs/archive/` holds per-commit detail for work closed before 2026-08-10. **Unmaintained. Never cite
+it as current, never add to it.**
+
+### Where does this belong?
+
+Ask in this order and stop at the first yes.
+
+1. **Is it work still to be done?** → the hub, as one line, linked to the epic or ADR that gives it
+   context. Nothing else goes in the hub — no explanations, no history.
+2. **Does it explain why a technical choice was made, with alternatives that were considered?** → an
+   **ADR**. If you can name what you *didn't* do and why, it is an ADR.
+3. **Was something wrong, debugged, and understood?** → a **retro**. The test is whether there is a
+   takeaway that changes how the next person works. A bug with no transferable lesson is a git commit,
+   not a retro.
+4. **Does it describe how a domain works today?** → the relevant **epic**.
+5. **None of the above?** → it is a commit message.
+
+### The protocol
+
+* **Item IDs are the existing `P`-numbers** (`P4.15b`, `P4.3e`). Code comments across all three repos
+  cite them. Do **not** renumber; new items continue the scheme. ADRs and retros get their own
+  sequential numbers.
+* **When you finish an item, it leaves the hub.** Move its decision into an ADR, its lesson into a
+  retro, its architecture into the epic — then delete the line. "Done" is not a state the hub tracks.
+* **Nothing closed and older than about two weeks stays tracked anywhere as an item.** Its knowledge
+  has to have landed in a tier by then, or it is lost.
+* **One file, one thing.** A retro covers one failure; an ADR covers one decision. If you are writing
+  "and also", start a second file.
+* **Every new file gets YAML frontmatter** (`type`, `status`/`date`, `domain`, `tags`) so the set stays
+  queryable, and links to its neighbours: an ADR names the epic it serves, an epic names its ADRs and
+  retros, the hub links out to both.
+* **Update `last_updated` on an epic or the hub when you change it.**
+* **Check links before committing:** every relative link and `#anchor` in `docs/` must resolve.
+
+### Standing rules these tiers encode
+
+* **Comments say why, not what.** Where a line is the way it is because an alternative was tried and
+  failed, the comment records the failure and the measurement. Match that density.
+* **A gate that cannot fail proves nothing.** Sabotage it and confirm it goes red before trusting a
+  byte-identity or reference comparison. This has produced a false pass before —
+  [ADR-015](docs/adrs/adr-015-ci-and-gate-test-classes.md).
+* **Tensor oracle, not token oracle.** A wrong encoder still decodes a plausible transcript.
+* **ASR oracle for TTS.** Cosine 0.996 against PyTorch and unintelligible output are compatible states
+  — [Retro-006](docs/retros/retro-006-kokoro-shipped-noise.md).
+* **Before opening a performance item**, read
+  [Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md). The register of
+  measured-out ideas exists so they are not re-proposed.
+* **Per-model complexity belongs in the exporter, not here** —
+  [ADR-003](docs/adrs/adr-003-per-model-complexity-in-the-exporter.md). C++ in this repo is for what is
+  per-*task*: tokenizers, CTC decode, the caches.
+
+## Where to start
+
+Read [`docs/backlog/active-index.md`](docs/backlog/active-index.md) for what is open, then the epic for
+the area you are touching. Read the relevant entry before changing anything in an area; add to the
+right tier when you finish.
