@@ -206,6 +206,9 @@ in place of 165 `IM2COL` + 213 `MUL_MAT`.
 | runtime `if`s in the direct kernel's store | **1.44 -> 1.73 s** — see trap 1 above |
 | fusing the resblock layer's FIRST unary | it has three consumers; nothing to skip |
 | tiling the two convolutions of a resblock as one chain | **1.05x on the chains, <2% end-to-end** — step 2 above, and `scripts/bench11.cpp` is the prototype that says so |
+| clamping `ggml_get_n_tasks` by work size for small elementwise ops | **not the mechanism** of P4.17's thread-scaling collapse — that was libgomp's wait policy, and nothing was clamped. [Retro-017](retro-017-libgomp-slept-at-every-graph-node.md) |
+| a cheaper `ggml_barrier` | a fifth of P4.17 at most: 2520 barriers x 11.4 us = 28.7 ms of a ~124 ms delta. Retro-017 |
+| `OMP_PROC_BIND` / `taskset` pinning for the many-core collapse | no effect once threads spin; `bind=close` without spinning is far worse. Retro-017 |
 | counting a convolution's memory passes to predict a win | only the passes with NO arithmetic over them are on the clock; the rest are hidden behind the FMAs |
 | lowering `kw = 1` as a matmul instead of a convolution | **1.04-1.05x on the Pi, 2.2 ms of 1.099 s** — the im2col at `kw = 1` IS the transpose a `mul_mat` needs, so there is nothing to skip. P4.15c, `scripts/bench9.cpp`'s second table |
 | channel-major activations so `kw = 1` needs no transpose at all | 1.19x, 7.3 ms — and that is an upper bound that ignores the transposes it moves onto the `kw = 3` convolutions next to them, which are 12x the arithmetic. P4.15c |

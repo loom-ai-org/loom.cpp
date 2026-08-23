@@ -42,6 +42,37 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 option(LOOM_TINYBLAS "Build ggml's tinyBLAS (llamafile) GEMM path into the CPU backend" ON)
 set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
 
+# OpenMP, which ggml defaults ON (`ggml/CMakeLists.txt`) and which this engine never chose. Turning it
+# OFF is worth 4.8x on a 24-core box -- P4.17, and see Retro-017 for the whole measurement.
+#
+# With GGML_OPENMP=ON, `ggml_barrier` is `#pragma omp barrier` and ggml runs one after EVERY non-empty
+# graph node -- 2520 of them in a VITS synthesis -- and libgomp's default wait policy makes every
+# thread SLEEP on a futex at each one. Counted, 5 syntheses at 24 threads: 334,609 voluntary context
+# switches against 160 with this OFF, which is one sleep per thread per node. VITS, Core Ultra 9 285K,
+# median of 7:
+#
+#   threads               1       2       4       8      12      16      24
+#   GGML_OPENMP=ON    0.186   0.114   0.071   0.079   0.087   0.118   0.189   <- peaks at 8, then back
+#   GGML_OPENMP=OFF   0.186   0.111   0.064   0.041   0.042   0.037   0.040      to 1-thread speed
+#
+# and the causal-LM decode loop the same way: 11.0 tok/s at 24 threads becomes 19.1. Nothing regresses
+# at any thread count.
+#
+# ggml's own threadpool replaces it, and its BOUNDED spin is why this is a straight win rather than a
+# trade: ~6.5M rounds (`poll = 50`, `ggml.c`) before sleeping, so it spins through a graph's barriers
+# and still sleeps between inferences. `OMP_WAIT_POLICY=active` buys a little more (0.031 s at 24) by
+# spinning forever, and a LIBRARY cannot set it anyway -- libgomp reads that variable in its load-time
+# constructor, before any loom code runs. ggml tried: `ggml-cpu.c` has that `setenv` commented out and
+# sets `KMP_BLOCKTIME` instead, which only Intel's libomp reads -- so a gcc build gets no mitigation.
+#
+# It also takes libgomp out of the wheels, which matters past speed: loom-py is imported next to numpy
+# and torch, which bring their own OpenMP runtimes, and two in one process is a known hazard.
+#
+# The LOOM_ option is so that A/B-ing this is a `-D` flag rather than an edit, and the FORCE is for the
+# same reason as GGML_LLAMAFILE above -- an existing build tree must pick it up.
+option(LOOM_OPENMP "Build ggml's CPU backend against OpenMP instead of ggml's own threadpool" OFF)
+set(GGML_OPENMP ${LOOM_OPENMP} CACHE BOOL "" FORCE)
+
 # The pinned ggml, patched -- four diffs, each carrying its own measurement. Three are tinyBLAS: two
 # aarch64-only fixes to GCC's code generation for its inner loop (a register tile GCC can actually
 # allocate, and operand addresses it will strength-reduce -- together 15.6 -> 25.1 GFLOP/s, which takes
