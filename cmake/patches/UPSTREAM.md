@@ -37,13 +37,27 @@ above admits to guessing at, and it was the one that could plausibly have made P
 both are heuristics, and 6's cache budget is `L3/2`, so a 36 MB L3 lets it say yes to shapes a 1 MB L2
 never would.
 
-| what | Pi 4B | Ryzen 3 3250U | **Core Ultra 9 285K** |
-|---|---|---|---|
-| PR 4, `bench9` weighted (im2col+mm → cache-blocked conv_2d) | 1.18x | 0.87x | **1.93x** |
-| PRs 4+6 together, whole VITS synthesis, engine default 4 threads | — | — | **1.75x** (0.1242 → 0.0708 s) |
+`bench9`'s weighted total is the LOWERING choice — im2col + one big `mul_mat` against ggml's
+`CONV_2D` — and the `CONV_2D` arm carries **both** PR 4 and PR 6, because 6 is a second path inside
+the same op. Splitting them by flipping the new kill switch, 24 threads:
 
-**PR 4 is a clear win on a many-core x86 server, not a regression.** The 0.87x that made the lowering
-architecture-conditional is a 2-core AVX2 laptop part, and it does not generalise to AVX2 as a class.
+| `bench9` weighted, Core Ultra 9 285K | im2col+mm | `CONV_2D` | ratio |
+|---|---|---|---|
+| PRs 4+6 active | 0.046 s | 0.026 s | **1.80x** |
+| `GGML_CPU_DISABLE_CONV_HEURISTICS=1` | 0.045 s | 0.045 s | **1.00x** |
+
+**Unpatched, ggml's `CONV_2D` is dead level with im2col + `mul_mat` on this machine; the entire win is
+the two patches.** It does not go below 1.00x here, so there is no bad path being dodged — 4 and 6 are
+creating the margin, not avoiding a loss.
+
+**On the 0.87x, which is the number most likely to be misread.** It was PR 4 *alone*, on a 2-core AVX2
+Ryzen, and it is why this lowering was once aarch64-only. It was not refuted by moving to a bigger
+x86 box — it was **superseded by PR 6**, whose direct kernel materialises no patch matrix at all: 4.7x
+on that same Ryzen's long-activation convolutions and 1.19x end-to-end there. That is why
+`LOOM_CONV1D_DIRECT` now defaults to 1 on **every** architecture rather than being switched by one.
+
+For the Pi and Ryzen columns quoted elsewhere in this file, read 1.18x and 0.87x as PR 4 alone against
+the unpatched op; they are not comparable to the 1.80x above, which includes PR 6.
 
 **Read `bench10` on this machine carefully, because its headline is misleading.** Kernel-only and
 applied to *every* shape, the direct convolution is **0.84x** — ggml's patched `conv_2d` reaches 489
