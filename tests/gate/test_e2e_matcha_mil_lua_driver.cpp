@@ -60,9 +60,9 @@ int main() {
         LOOM_CHECK(!driver_script.empty());
 
         loom::LoomLuaBridge bridge(backend.get());
-        bridge.register_module("encoder_mu", *model, loom::GraphTopology::parse(model->topology_json("encoder_mu")));
-        bridge.register_module("encoder_logw", *model,
-                                loom::GraphTopology::parse(model->topology_json("encoder_logw")));
+        // One `encoder`, not `encoder_mu` + `encoder_logw`: P4.15f merged them, because each carried
+        // its own copy of the TextEncoder and the driver ran both on the same tokens.
+        bridge.register_module("encoder", *model, loom::GraphTopology::parse(model->topology_json("encoder")));
         bridge.register_module("decoder", *model, loom::GraphTopology::parse(model->topology_json("decoder")));
         bridge.register_module("vocoder", *model, loom::GraphTopology::parse(model->topology_json("vocoder")));
         bridge.load_script(driver_script);

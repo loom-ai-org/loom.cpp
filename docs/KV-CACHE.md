@@ -10,12 +10,12 @@ neither option is where the gap is. What is missing is three concrete things, no
 
 Relationship to the other documents:
 
-* [`EXPORT-PREPARATION.md`](EXPORT-PREPARATION.md) — §4's second bullet is this thread's origin. It
+* `loom-exporter/docs/EXPORT-PREPARATION.md` — §4's second bullet is this thread's origin. It
   filed the work as "a real gap and a real capability item — it belongs in P4/P5, not in preparation",
   and its measured note (2026-08-01) correctly identified `FuseLoomAttention` as the blocker. This
   document supersedes that bullet's *four-step* decomposition (see §2: one of the four is not needed)
   and schedules the work **before stage D**, at the author's direction.
-* [`BACKLOG.md`](BACKLOG.md) — P4.0.9 is this document's backlog row.
+* [the backlog](backlog/active-index.md) — P4.0.9 is this document's backlog row.
 
 Everything below that cites a file or a count was checked against the tree during the session.
 

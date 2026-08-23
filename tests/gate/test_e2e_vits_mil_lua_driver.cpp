@@ -20,7 +20,7 @@
 // a trustworthy comparison target at these input scales, so this test doesn't use it -- the per-phase
 // reference tests (test_e2e_vits_mil_flow_vocoder_reference.cpp, plus the standalone probes recorded in
 // BACKLOG.md for `stats`/`logw`) are where the real numerical confidence comes from. This test's own job
-// is just to confirm the LUA ORCHESTRATION (three-topology packing, cross-phase RNG, generate_path) runs
+// is just to confirm the LUA ORCHESTRATION (two-topology packing, cross-phase RNG, generate_path) runs
 // end-to-end without crashing and produces a sane result.
 
 #include "test_util.h"
@@ -65,8 +65,9 @@ int main() {
         LOOM_CHECK(!driver_script.empty());
 
         loom::LoomLuaBridge bridge(backend.get());
-        bridge.register_module("stats", *model, loom::GraphTopology::parse(model->topology_json("stats")));
-        bridge.register_module("logw", *model, loom::GraphTopology::parse(model->topology_json("logw")));
+        // TWO modules, not three: P4.15f merged `stats` and `logw` into one two-output `text`
+        // topology, because each carried its own copy of the TextEncoder and the engine ran it twice.
+        bridge.register_module("text", *model, loom::GraphTopology::parse(model->topology_json("text")));
         bridge.register_module("flow_vocoder", *model,
                                 loom::GraphTopology::parse(model->topology_json("flow_vocoder")));
         bridge.load_script(driver_script);

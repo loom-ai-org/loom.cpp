@@ -1,5 +1,6 @@
-// Numerical-correctness check for the MIL-traced Matcha-TTS "encoder_mu"/"encoder_logw" topologies
-// (export_matcha_mil.py, part of matcha_mil.gguf) against the SAME real-module reference fixture the
+// Numerical-correctness check for the MIL-traced Matcha-TTS "encoder" topology's two outputs, `mu` and
+// `logw` (matcha_export.py, part of matcha_mil.gguf; two separate topologies until P4.15f merged the
+// TextEncoder they each carried a copy of), against the SAME real-module reference fixture the
 // bespoke conversion's own test_e2e_matcha_text_encoder.cpp already uses
 // (reference_forward_matcha_text_encoder.py) -- valid ground truth for BOTH conversions: the MIL
 // wrapper's own `sequence_mask -> ones_like` simplification (export_matcha_mil.py's own module
@@ -7,7 +8,7 @@
 // reference fixture's own tokens (no padding, single utterance) always satisfy.
 //
 // Layout note: unlike the bespoke topology's own `mu` output (C-fast, ne=[n_feats,T]), the MIL-traced
-// "encoder_mu" topology's `mu` output is T-fast (ne=[T,n_feats], matching the real module's own native
+// "encoder" topology's `mu` output is T-fast (ne=[T,n_feats], matching the real module's own native
 // torch (1,n_feats,T) layout untouched -- see export_matcha_mil.py's module docstring). The reference
 // fixture's `ref_text_encoder_mu.npy` was saved as `mu.squeeze(0)` (numpy shape (n_feats,T), C-order),
 // i.e. flat[c*T+t] -- EXACTLY the T-fast ne=[T,n_feats] byte layout already (numpy's row-major (C,T)
@@ -92,8 +93,13 @@ std::vector<int32_t> read_npy_i32(const std::string& path, std::vector<int64_t>&
     return data;
 }
 
-std::vector<float> run_topology(loom::GgufModel& model, ggml_backend_t backend, const std::string& name,
-                                 const std::vector<int32_t>& tokens) {
+// Runs the named topology once and returns EVERY declared output. Two of them here since P4.15f
+// merged `encoder_mu` and `encoder_logw` into one two-output `encoder`: the TextEncoder they shared
+// was being traced, stored and RUN twice. Reading both from one build is also a stronger check than
+// the two separate runs it replaces -- it is the same graph the driver runs, outputs and all.
+std::vector<std::vector<float>> run_topology(loom::GgufModel& model, ggml_backend_t backend,
+                                              const std::string& name,
+                                              const std::vector<int32_t>& tokens) {
     loom::GraphTopology topo = loom::GraphTopology::parse(model.topology_json(name));
     const auto T = static_cast<uint32_t>(tokens.size());
     loom::GraphBuilder builder(topo, model, backend);
@@ -103,9 +109,13 @@ std::vector<float> run_topology(loom::GgufModel& model, ggml_backend_t backend, 
     ggml_backend_tensor_set(r.input_tensors.at("tokens"), tokens_copy.data(), 0, tokens_copy.size() * sizeof(int32_t));
 
     ggml_backend_graph_compute(backend, r.graph);
-    std::vector<float> out(static_cast<size_t>(ggml_nelements(r.output)));
-    ggml_backend_tensor_get(r.output, out.data(), 0, out.size() * sizeof(float));
-    return out;
+    std::vector<std::vector<float>> outs;
+    for (ggml_tensor* t : r.outputs) {
+        std::vector<float> out(static_cast<size_t>(ggml_nelements(t)));
+        ggml_backend_tensor_get(t, out.data(), 0, out.size() * sizeof(float));
+        outs.push_back(std::move(out));
+    }
+    return outs;
 }
 
 double max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
@@ -147,8 +157,11 @@ int main() {
     auto model = loom::GgufModel::load(gguf_path, backend.get());
     LOOM_CHECK(model != nullptr);
 
-    std::vector<float> mu = run_topology(*model, backend.get(), "encoder_mu", tokens);
-    std::vector<float> logw = run_topology(*model, backend.get(), "encoder_logw", tokens);
+    // (mu, logw), in the order `EncoderWrapper.forward` returns them and the driver binds them.
+    std::vector<std::vector<float>> encoded = run_topology(*model, backend.get(), "encoder", tokens);
+    LOOM_CHECK(encoded.size() == 2);
+    const std::vector<float>& mu = encoded[0];
+    const std::vector<float>& logw = encoded[1];
 
     LOOM_CHECK(mu.size() == ref_mu.size());
     LOOM_CHECK(logw.size() == ref_logw.size());
