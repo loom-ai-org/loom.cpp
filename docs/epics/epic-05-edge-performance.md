@@ -84,10 +84,30 @@ says "the lowering is chosen by architecture"; `src/ops/primitives_conv.cpp` is 
 escape patches 0004 and 0006 previously lacked; `cmake/patches/UPSTREAM.md` carries the per-patch
 numbers and the reason `bench10`'s kernel-only 0.84x does not contradict this.
 
-**`n_threads` is never set anywhere in the engine**, so ggml's default of 4 is what runs. On a 24-core
-box that leaves 20 cores idle, and it is why the comparison above is honest at `intra_op_num_threads =
-4` rather than generous. Whether the engine should expose a thread count is not filed as work here —
-naming it so the next person does not read the 4 as a measurement artifact.
+**`n_threads` was never set anywhere in the engine**, so ggml's default of 4 ran on every machine.
+`$LOOM_N_THREADS` now overrides it (unset changes nothing). Measuring what that buys produced the more
+interesting result:
+
+### loom stops scaling at 8 threads, and then goes backwards
+
+VITS, Core Ultra 9 285K, median of 7:
+
+| threads | 1 | 2 | 4 | **8** | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|---|
+| synthesis | 0.198 s | 0.113 s | 0.093 s | **0.080 s** | 0.116 s | 0.157 s | 0.191 s |
+
+**24 threads is as slow as one.** onnxruntime on the same box keeps improving over the same range
+(0.087 s at 4 threads, 0.075 s at 24), so this is loom's curve and not the workload's. The same shape
+shows in the LM: 21.8 tok/s at 4 threads, 10.6 at 24.
+
+The shapes are small — a vocoder convolution is 100-300 positions, and a decode step's `mul_mat` has
+`ne1 = 1` — so past a point every added thread is a barrier rather than a worker. **ggml's default of 4
+happens to sit near the good part of this curve**, which is why nothing noticed, and it is the reason
+the default was left alone when the override was added: raising it to the core count would be a
+regression on exactly the machines it looks like it should help.
+
+Nothing here is diagnosed yet. The next step is a per-op profile at 8 versus 24 to see whether the loss
+is barrier count, allocator contention, or work partitioning that leaves threads idle.
 
 ### Three tasks, not one — and the convolutional one is the good one
 
