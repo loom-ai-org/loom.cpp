@@ -86,6 +86,15 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
+* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards.** VITS on a 24-core x86 is
+  0.080 s at 8 threads and **0.191 s at 24, the same as one thread**, while onnxruntime keeps improving
+  across that range. **Scoped, not started** — [Epic-05 §2](../epics/epic-05-edge-performance.md) holds
+  the per-op profile and the three candidate mechanisms with the experiment that separates them. The
+  short version: it is **not** one slow op. Every op degrades, and the cheapest degrade worst — `ADD`
+  39 -> 186 ms and `MUL` 14 -> 87 ms going 4 -> 24 threads, over 1192 and 936 calls of a few hundred
+  elements each. That is the shape of per-op barrier cost, not of work.
+  *Do not raise the default thread count until this is understood*: `$LOOM_N_THREADS` exists but
+  deliberately leaves ggml's 4 alone.
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine

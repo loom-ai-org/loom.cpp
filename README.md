@@ -97,6 +97,66 @@ Each takes a raw waveform: the mel frontend is inside the graph, not in front of
 the other four consume *phoneme* ids that a phonemiser produces outside the engine, so their files
 embed no vocabulary at all. That is a real limitation of those checkpoints, not a missing feature here.
 
+## Performance against onnxruntime
+
+The reference question for an edge runtime: **the same checkpoint, on the same machine, at the same
+thread count — how does loom compare to onnxruntime?** Three tasks, because no single one is
+representative: an all-convolutional vocoder, an encoder-decoder ASR model, and an autoregressive LM.
+
+**`>1.00x` means loom is faster.** Measured 2026-08-23.
+
+| machine | arch | threads | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
+|---|---|---|---|---|---|
+| Intel Core Ultra 9 285K | x86-64 | 4 | **1.25x** | **1.16x** | 0.41x |
+| Intel Core Ultra 9 285K | x86-64 | 24 | 0.36x | 0.38x | 0.56x |
+| AMD Ryzen 3 3250U | x86-64 | 4 (all) | **1.06x** | 0.87x | 0.33x |
+| Raspberry Pi 4B | aarch64 | 4 (all) | **1.00x** | 0.98x | 0.28x |
+
+**The three columns are three different stories, and the caveats matter as much as the numbers.**
+
+* **TTS is at parity or better on every machine.** That is what P4.14/P4.15 was for: a built-in F32 GEMM
+  micro-kernel, four convolution patches to the pinned `ggml`, and a duplicated text encoder removed
+  from the export.
+* **The LM is at parity except on the smallest x86 part.** It only just became so — until 2026-08-23 the
+  engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host re-fed a
+  growing prompt and each token recomputed the whole sequence. That was worth 2.83x.
+* **ASR is 2.4-3.6x behind, and it is one defect rather than diffuse slowness.** Whisper's exported
+  driver hands the decoder the raw encoder output every step, so cross-attention K/V is re-projected
+  over all 1500 encoder frames per token — `MUL_MAT 768x1500` runs 684 times for an 11-second clip
+  where the encoder itself needs 48. That is **57.7% of ASR runtime**, and onnxruntime computes those
+  tensors once. The fix is an export change and is
+  [open work](docs/backlog/active-index.md).
+* **loom stops scaling at 8 threads and then goes backwards.** VITS on the 285K: 0.198 s at 1 thread,
+  0.080 s at 8, and **0.191 s at 24 — the same as one thread** — while onnxruntime keeps improving. The
+  shapes are small (a vocoder convolution is 100-300 positions; a decode step's `mul_mat` has
+  `ne1 = 1`), so past a point each added thread is a barrier rather than a worker. `ggml`'s default of 4
+  happens to sit near the good part of that curve, which is why `$LOOM_N_THREADS` can override it but
+  does not raise it.
+
+### What these numbers are not
+
+**The baseline is `pip install onnxruntime` 1.28.0**, the same distribution channel `loom-py` ships
+through. That choice flatters loom: at the *identical* version, the conda-forge build synthesises VITS
+in 0.065 s where the PyPI wheel takes 0.120 s — **1.86x apart, same machine, same script**. Against
+conda-forge, the 4-thread x86 wins above become losses. Whichever baseline a comparison uses, it should
+say which.
+
+**Each pair is checked for equal work, not merely equal wall time.** TTS pins the three scales so both
+engines emit the same 73216 samples, and both harnesses print that count; ASR compares the transcripts;
+the LM figures are *differenced* — the same prompt at 1 and at 65 new tokens — so model load,
+tokenisation and prefill cancel out of both sides.
+
+**Reproducing it:** `scripts/bench_vits_loom.cpp` and `scripts/bench_lm_loom.cpp` are loom's side. The
+onnxruntime side drives `onnxruntime` directly rather than through `optimum`, which added roughly 2x of
+its own overhead to whisper and mis-derives Qwen3's `head_dim`.
+
+**The Pi throttles, and it will lie if allowed to.** It goes 55 -> 84 C during a single whisper run and
+caps the ARM clock at 1580 MHz; two back-to-back measurements came out 87.1 s and 115.8 s, 33% apart.
+Its row is taken with a cooldown before every measurement and the two engines interleaved, so both meet
+the same clock. Its ASR figure additionally subtracts a separately measured model load, and with only
+3.8 GB of RAM the onnx arm evicts loom's weights from page cache between runs — so 3.6x is an upper
+bound on loom's disadvantage there rather than an exact figure.
+
 ## Building
 
 ```sh
@@ -106,12 +166,16 @@ cmake --build build -j"$(nproc)"
 
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
 and run the hermetic suite. The fetched `ggml` is patched at configure time from `cmake/patches/` —
-seven diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
+nine diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
 declined to accept at all, a fused convolution that batched its work too coarsely to stay in cache, a
-direct 1-D convolution for long activations with small weights, and the elementwise nodes a vocoder's
+direct 1-D convolution for long activations with small weights, the elementwise nodes a vocoder's
 resblock wraps around every convolution — its bias, its leaky ReLU and its residual — none of which now
-costs a pass over memory of its own; see `cmake/GgmlPatches.cmake` for the rules such a patch has to
-meet.
+costs a pass over memory of its own, and `conv_transpose_1d`'s single-threaded prologue and
+dot-product-at-a-time compute; see `cmake/GgmlPatches.cmake` for the rules such a patch has to meet.
+
+Two of them are heuristics tuned on measured hardware, so they carry a run-time escape:
+`GGML_CPU_DISABLE_CONV_HEURISTICS=1` declines both, the way ggml's own `GGML_CPU_DISABLE_FUSION`
+declines its fusions.
 
 There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
 (`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,
