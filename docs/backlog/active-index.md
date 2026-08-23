@@ -86,15 +86,25 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
-* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards.** VITS on a 24-core x86 is
-  0.080 s at 8 threads and **0.191 s at 24, the same as one thread**, while onnxruntime keeps improving
-  across that range. **Scoped, not started** — [Epic-05 §2](../epics/epic-05-edge-performance.md) holds
-  the per-op profile and the three candidate mechanisms with the experiment that separates them. The
-  short version: it is **not** one slow op. Every op degrades, and the cheapest degrade worst — `ADD`
-  39 -> 186 ms and `MUL` 14 -> 87 ms going 4 -> 24 threads, over 1192 and 936 calls of a few hundred
-  elements each. That is the shape of per-op barrier cost, not of work.
-  *Do not raise the default thread count until this is understood*: `$LOOM_N_THREADS` exists but
-  deliberately leaves ggml's 4 alone.
+* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards. ROOT CAUSE FOUND
+  2026-08-23; the fix is applied to the working tree and green, not yet committed.** It is **libgomp's default wait
+  policy**. loom builds ggml with `GGML_OPENMP=ON` (ggml's default, which loom's CMake never chose),
+  so `ggml_barrier` is `#pragma omp barrier` and ggml runs one after every non-empty graph node —
+  2520 per VITS synthesis — and **every thread sleeps on a futex at every one**: 334,609 voluntary
+  context switches over 5 syntheses at 24 threads, against 160 without OpenMP.
+  **`GGML_OPENMP=OFF` is worth 4.8x at 24 threads** (0.189 -> 0.040 s) and restores a monotonic curve;
+  the LM goes 11.0 -> 19.1 tok/s. Nothing regresses at any thread count, and a Pi 4 at 4 threads is
+  unchanged — **this is a many-core fix, not a Pi one**.
+  Of the three candidates only **(3) wake-up latency** was right; **(2) `n_tasks` clamping is not the
+  mechanism and needs no ggml patch**, and (1) barrier cost is only a fifth of the delta.
+  [Epic-05 §2](../epics/epic-05-edge-performance.md) has the full measurement and why the fix is the
+  build flag rather than `OMP_WAIT_POLICY=active` (a library cannot set that variable).
+  *Still open:* (1) **the four-machine loom-vs-onnxruntime table in `README.md` is now stale on loom's
+  side** — it was measured on the OpenMP build, and even at its 4 threads this is worth ~1.1x on x86;
+  re-measure before quoting it again. (2) Re-ask the **default thread count** question, which this
+  unblocks but does not answer: at ggml's default of 4 the fix is worth only ~1.1x, so raising it is
+  still its own benchmark. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
+  ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
