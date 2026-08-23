@@ -14,6 +14,11 @@ independent of 5, though it serves 5's fused bias for free. **7 generalises 5** 
 entry point with one that also takes a `LEAKY_RELU` on the input and a residual `ADD` on the output --
 so it must be sent after 5, or the two folded into one PR.
 
+**Submission status (2026-08-23).** PRs 1, 2 and 3 have been **sent upstream**. 4 through 9 have
+not, and are deliberately held: each of 5, 6, 7 and 9 depends on 4, and 4 itself reads more naturally
+once the `sgemm` three have landed and the review conversation has a shape. Nothing below is blocked on
+new measurement — it is blocked on 1-3.
+
 **Every number below is a Raspberry Pi 4B (Cortex-A72, 4 cores @ 1.8 GHz, 1 MB shared L2, Debian
 aarch64, gcc 14.2) unless it says otherwise; x86-64 numbers are a Ryzen 3 3250U (AVX2, 2 cores), median
 of seven runs pinned to the physical cores.** The workload is a VITS TTS vocoder — an all-convolutional
@@ -24,6 +29,40 @@ convolution) and are self-contained against a built ggml.
 **What a reviewer is likely to ask, for all nine: measurements on hardware neither of these two boxes
 represents** — a wide ARM core (Neoverse V2, Apple M-series) and a many-core x86 server. Say so up
 front rather than being asked.
+
+### The many-core x86 half of that gap is now measured
+
+**Intel Core Ultra 9 285K, 24 cores, 36 MB L3, gcc 14.2, Debian.** This is the class the paragraph
+above admits to guessing at, and it was the one that could plausibly have made PRs 4 and 6 regressions:
+both are heuristics, and 6's cache budget is `L3/2`, so a 36 MB L3 lets it say yes to shapes a 1 MB L2
+never would.
+
+| what | Pi 4B | Ryzen 3 3250U | **Core Ultra 9 285K** |
+|---|---|---|---|
+| PR 4, `bench9` weighted (im2col+mm → cache-blocked conv_2d) | 1.18x | 0.87x | **1.93x** |
+| PRs 4+6 together, whole VITS synthesis, engine default 4 threads | — | — | **1.75x** (0.1242 → 0.0708 s) |
+
+**PR 4 is a clear win on a many-core x86 server, not a regression.** The 0.87x that made the lowering
+architecture-conditional is a 2-core AVX2 laptop part, and it does not generalise to AVX2 as a class.
+
+**Read `bench10` on this machine carefully, because its headline is misleading.** Kernel-only and
+applied to *every* shape, the direct convolution is **0.84x** — ggml's patched `conv_2d` reaches 489
+GFLOP/s against the best direct tile's 412. But per shape it wins 1.2-1.8x on the long activations
+(32-128 channels, L 2296-73472) and loses badly on exactly two — `192x384 kw5 L287` and
+`768x768 kw3 L100` — which are the two `ggml_conv_1d_direct_ok` already declines, by the position-block
+rule. The weighted total is dominated by those two because of their call counts. End to end, with the
+predicate doing its job, PRs 4+6 are the 1.75x in the table.
+
+**`bench10` had never compiled on x86 at all** (fixed 2026-08-23). Its AVX2 `conv1d_direct` was never
+given the `dil` parameter the aarch64 one grew: nine parameters against three ten-argument call sites,
+and a tail loop naming a `dil` not in scope. So "nobody has measured the generic path" was
+understated — nobody had measured the *AVX2* path either.
+
+**Both heuristics now have a run-time kill switch.** `GGML_CPU_DISABLE_CONV_HEURISTICS=1` declines PR
+4's cache blocking and PR 6's direct path, spelled after ggml's own `GGML_CPU_DISABLE_FUSION`
+(`ggml-cpu.c:4141`), which PRs 5 and 7 already sit behind. Before it the only escape was a rebuild,
+which is not available to somebody who installed a wheel. The 1.75x above is that switch measured in
+both positions.
 
 ---
 
