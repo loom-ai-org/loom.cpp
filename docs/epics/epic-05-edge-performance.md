@@ -106,8 +106,43 @@ happens to sit near the good part of this curve**, which is why nothing noticed,
 the default was left alone when the override was added: raising it to the core count would be a
 regression on exactly the machines it looks like it should help.
 
-Nothing here is diagnosed yet. The next step is a per-op profile at 8 versus 24 to see whether the loss
-is barrier count, allocator contention, or work partitioning that leaves threads idle.
+#### P4.17: the per-op profile, and what it rules out
+
+`$LOOM_PROFILE` over one VITS synthesis, same binary, thread count the only variable:
+
+| op | calls | 4 threads | 8 | 24 |
+|---|---|---|---|---|
+| `CONV_2D` | 468 | 192 ms | 174 ms | **485 ms** |
+| `ADD` | 1192 | 39 ms | 52 ms | **186 ms** |
+| `MUL` | 936 | 14 ms | 22 ms | **87 ms** |
+| `CONV_TRANSPOSE_1D` | 12 | 30 ms | 38 ms | **158 ms** |
+
+**It is not one slow op, and it is not the convolutions.** *Every* op degrades, and the ones with the
+least work per call degrade worst: `ADD` is 4.8x worse at 24 threads than at 4 and `MUL` 6.3x, over
+1192 and 936 calls of a few hundred elements each. `CONV_2D` — by far the most work per call — degrades
+least in relative terms. Cost that grows with thread count and shrinks with work per call is the
+signature of **per-op synchronisation**, not of the work itself.
+
+Only `CONV_2D` is faster at 8 than at 4; everything else is already worse by 8, which is why the
+end-to-end curve peaks there rather than higher.
+
+**Three candidates, and the experiment that separates them:**
+
+1. **Barrier cost per op.** ggml runs `ggml_barrier` per op per graph node; at 24 threads that is a
+   24-way synchronisation for an `ADD` over a few hundred floats. *Test:* count nodes and multiply by a
+   measured barrier cost at each thread count — a microbenchmark of `ggml_barrier` alone against thread
+   count predicts the whole delta if this is it.
+2. **`n_tasks` not clamped by work size.** `ggml_get_n_tasks` hands most elementwise ops the full thread
+   count regardless of tensor size, so a 300-element `ADD` is split 24 ways. *Test:* clamp `n_tasks` to
+   `max(1, nelements / T)` for a threshold `T` and re-run the table; this is a ggml patch and would join
+   `cmake/patches/` if it works.
+3. **Thread wake-up latency.** ggml's CPU threadpool spins then sleeps; more threads means more wakeups
+   per op. *Test:* `GGML_CPU_WAIT_POLICY`/spin settings, or pin with `taskset` and compare.
+
+**(1) and (2) are the same fix from different ends** and are the likely answer together; (3) is
+cheapest to rule out and should go first. **Do not raise the default thread count until this is
+understood** — ggml's 4 sits near the peak of the curve by luck, and a "use all cores" default would
+be a regression on exactly the machines it looks like it should help.
 
 ### Three tasks, not one — and the convolutional one is the good one
 
