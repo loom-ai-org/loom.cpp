@@ -190,20 +190,34 @@ int main() {
     // -- the same host math a driver uses, instead of a second implementation living in a test.
     {
         loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        // THREE topologies since the cross-attention K/V were hoisted out of the decode step: they are
+        // a function of the encoder alone, so `cross_kv` computes them once per window and the decoder
+        // takes them as inputs. A test that registered only two would fail on the driver's own call.
+        loom::GraphTopology cross_kv_topo = loom::GraphTopology::parse(model->topology_json("cross_kv"));
         loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
+        const size_t n_text_layers = cross_kv_topo.outputs.size() / 2;
+        LOOM_CHECK(n_text_layers > 0 && cross_kv_topo.outputs.size() % 2 == 0);
         std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
         loom::LoomLuaBridge bridge(backend.get());
         bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("cross_kv", *model, std::move(cross_kv_topo), /*kv_cache=*/nullptr);
         bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
         bridge.load_script(R"lua(
             function decoder_logits(inputs)
                 loom.run_subgraph_and_retain('encoder', {n_samples = inputs.n_samples, n_past = 0},
                                               {waveform = inputs.waveform})
+                loom.run_subgraph_and_retain('cross_kv', {n_enc_frames = inputs.n_enc_frames, n_past = 0},
+                                              {xa = {from = 'encoder'}})
                 local n = #inputs.tokens
-                return loom.run_subgraph('decoder', {n_tokens = n, n_past = 0}, {
+                local args = {
                     tokens = inputs.tokens, position_ids = loom.range(0, n),
-                    attention_mask = loom.causal_mask(n, 0), xa = {from = 'encoder'},
-                })
+                    attention_mask = loom.causal_mask(n, 0),
+                }
+                for l = 0, inputs.n_text_layers - 1 do
+                    args["xk_" .. l] = {from = 'cross_kv', index = 2 * l + 1}
+                    args["xv_" .. l] = {from = 'cross_kv', index = 2 * l + 2}
+                end
+                return loom.run_subgraph('decoder', {n_tokens = n, n_past = 0}, args)
             end
         )lua");
 
@@ -212,6 +226,11 @@ int main() {
         const loom::LoomLuaBridge::Value value = bridge.call("decoder_logits", {
             {"waveform", waveform_d}, {"tokens", prompt_d},
             {"n_samples", static_cast<double>(n_samples)},
+            {"n_enc_frames", static_cast<double>(model->hparam_u32("n_audio_ctx"))},
+            // Two `cross_kv` outputs per decoder layer, so the topology's own declared-output list is
+            // the layer count -- read from the file rather than hardcoded, like every other geometry
+            // in this test, so pointing it at a different Whisper size moves the number.
+            {"n_text_layers", static_cast<double>(n_text_layers)},
         });
         const auto& logits = std::get<std::vector<double>>(value);
         LOOM_CHECK(logits.size() == expected_decoder.size());
@@ -244,12 +263,17 @@ int main() {
     // --- 2. the whole driver, both ways round the language: pinned, and auto-detected ---
     {
         loom::GraphTopology encoder_topo = loom::GraphTopology::parse(model->topology_json("encoder"));
+        loom::GraphTopology cross_kv_topo = loom::GraphTopology::parse(model->topology_json("cross_kv"));
         loom::GraphTopology decoder_topo = loom::GraphTopology::parse(model->topology_json("decoder"));
         LOOM_CHECK(decoder_topo.uses_kv_cache());
+        // `cross_kv` must NOT be cached: it runs once per window over a fixed 1500 frames, and a cache
+        // there would be the mistake hoisting it out of the loop exists to avoid.
+        LOOM_CHECK(!cross_kv_topo.uses_kv_cache());
         std::unique_ptr<loom::KvCache> kv_cache = loom::make_kv_cache(*model, backend.get());
 
         loom::LoomLuaBridge bridge(backend.get());
         bridge.register_module("encoder", *model, std::move(encoder_topo), /*kv_cache=*/nullptr);
+        bridge.register_module("cross_kv", *model, std::move(cross_kv_topo), /*kv_cache=*/nullptr);
         bridge.register_module("decoder", *model, std::move(decoder_topo), kv_cache.get());
         bridge.load_script(model->kv_str("model.driver_script"));
 

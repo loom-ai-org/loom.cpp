@@ -71,26 +71,96 @@ tuned for. The harnesses are `scripts/bench_vits_loom.cpp` and its onnxruntime c
 their sample count, and a ratio taken without checking those match is measuring two different
 utterances ([Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md)).
 
-**Both convolution heuristics are a 1.75x win here, not the feared regression** — 0.1242 s with
-`GGML_CPU_DISABLE_CONV_HEURISTICS=1`, 0.0708 s without it. That switch is new, and is the run-time
+**Both convolution heuristics together are a 1.75x win here, not the feared regression** — 0.1242 s
+with `GGML_CPU_DISABLE_CONV_HEURISTICS=1`, 0.0708 s without it. At the `bench9` level the same switch
+gives 1.80x against 1.00x: **unpatched, ggml's `CONV_2D` is exactly level with im2col + `mul_mat` on
+this machine, and the whole margin is patches 0004 + 0006.** Nothing here is dodging a slow path.
+
+The **0.87x** that appears in `bench9.cpp`'s header is easy to misread as one. It was patch 0004
+*alone* on a 2-core AVX2 Ryzen, and it is why this lowering used to be aarch64-only. It was superseded
+by 0006 — a direct kernel that materialises no patch matrix — not by measuring a roomier x86 box, which
+is why `LOOM_CONV1D_DIRECT` now defaults on for every architecture. `scripts/bench9.cpp`'s header still
+says "the lowering is chosen by architecture"; `src/ops/primitives_conv.cpp` is the current word. That switch is new, and is the run-time
 escape patches 0004 and 0006 previously lacked; `cmake/patches/UPSTREAM.md` carries the per-patch
 numbers and the reason `bench10`'s kernel-only 0.84x does not contradict this.
 
-**`n_threads` is never set anywhere in the engine**, so ggml's default of 4 is what runs. On a 24-core
-box that leaves 20 cores idle, and it is why the comparison above is honest at `intra_op_num_threads =
-4` rather than generous. Whether the engine should expose a thread count is not filed as work here —
-naming it so the next person does not read the 4 as a measurement artifact.
+**`n_threads` was never set anywhere in the engine**, so ggml's default of 4 ran on every machine.
+`$LOOM_N_THREADS` now overrides it (unset changes nothing). Measuring what that buys produced the more
+interesting result:
+
+### loom stops scaling at 8 threads, and then goes backwards
+
+VITS, Core Ultra 9 285K, median of 7:
+
+| threads | 1 | 2 | 4 | **8** | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|---|
+| synthesis | 0.198 s | 0.113 s | 0.093 s | **0.080 s** | 0.116 s | 0.157 s | 0.191 s |
+
+**24 threads is as slow as one.** onnxruntime on the same box keeps improving over the same range
+(0.087 s at 4 threads, 0.075 s at 24), so this is loom's curve and not the workload's. The same shape
+shows in the LM: 21.8 tok/s at 4 threads, 10.6 at 24.
+
+The shapes are small — a vocoder convolution is 100-300 positions, and a decode step's `mul_mat` has
+`ne1 = 1` — so past a point every added thread is a barrier rather than a worker. **ggml's default of 4
+happens to sit near the good part of this curve**, which is why nothing noticed, and it is the reason
+the default was left alone when the override was added: raising it to the core count would be a
+regression on exactly the machines it looks like it should help.
+
+#### P4.17: the per-op profile, and what it rules out
+
+`$LOOM_PROFILE` over one VITS synthesis, same binary, thread count the only variable:
+
+| op | calls | 4 threads | 8 | 24 |
+|---|---|---|---|---|
+| `CONV_2D` | 468 | 192 ms | 174 ms | **485 ms** |
+| `ADD` | 1192 | 39 ms | 52 ms | **186 ms** |
+| `MUL` | 936 | 14 ms | 22 ms | **87 ms** |
+| `CONV_TRANSPOSE_1D` | 12 | 30 ms | 38 ms | **158 ms** |
+
+**It is not one slow op, and it is not the convolutions.** *Every* op degrades, and the ones with the
+least work per call degrade worst: `ADD` is 4.8x worse at 24 threads than at 4 and `MUL` 6.3x, over
+1192 and 936 calls of a few hundred elements each. `CONV_2D` — by far the most work per call — degrades
+least in relative terms. Cost that grows with thread count and shrinks with work per call is the
+signature of **per-op synchronisation**, not of the work itself.
+
+Only `CONV_2D` is faster at 8 than at 4; everything else is already worse by 8, which is why the
+end-to-end curve peaks there rather than higher.
+
+**Three candidates, and the experiment that separates them:**
+
+1. **Barrier cost per op.** ggml runs `ggml_barrier` per op per graph node; at 24 threads that is a
+   24-way synchronisation for an `ADD` over a few hundred floats. *Test:* count nodes and multiply by a
+   measured barrier cost at each thread count — a microbenchmark of `ggml_barrier` alone against thread
+   count predicts the whole delta if this is it.
+2. **`n_tasks` not clamped by work size.** `ggml_get_n_tasks` hands most elementwise ops the full thread
+   count regardless of tensor size, so a 300-element `ADD` is split 24 ways. *Test:* clamp `n_tasks` to
+   `max(1, nelements / T)` for a threshold `T` and re-run the table; this is a ggml patch and would join
+   `cmake/patches/` if it works.
+3. **Thread wake-up latency.** ggml's CPU threadpool spins then sleeps; more threads means more wakeups
+   per op. *Test:* `GGML_CPU_WAIT_POLICY`/spin settings, or pin with `taskset` and compare.
+
+**(1) and (2) are the same fix from different ends** and are the likely answer together; (3) is
+cheapest to rule out and should go first. **Do not raise the default thread count until this is
+understood** — ggml's 4 sits near the peak of the curve by luck, and a "use all cores" default would
+be a regression on exactly the machines it looks like it should help.
 
 ### Three tasks, not one — and the convolutional one is the good one
 
 VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
 Measured the same day on the same box, F32 on both sides, 4 threads on both sides:
 
-| task | model | loom | onnxruntime | |
+| machine | threads | TTS | LM | ASR |
 |---|---|---|---|---|
-| TTS | VITS (piper en-GB) | 0.0708 s | 0.0650 s | **1.09x** |
-| ASR | whisper-small | 3.80 s | 3.23 s | **1.18x** |
-| LM | Qwen3-0.6B | 2.98 s / 65 tok | 3.33 s / 65 tok | **0.89x** (loom faster) |
+| Core Ultra 9 285K | 4 | **1.25x** | **1.16x** | 0.41x |
+| Core Ultra 9 285K | 24 | 0.36x | 0.38x | 0.56x |
+| Ryzen 3 3250U | 4 (all) | **1.06x** | 0.87x | 0.33x |
+| Raspberry Pi 4B | 4 (all) | **1.00x** | 0.98x | 0.28x |
+
+`>1.00x` is loom faster. The full table with its methodology and caveats is in the
+[README](../../README.md#performance-against-onnxruntime); the two that change how it should be read
+are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
+1.86x faster on VITS, and against it the 4-thread x86 wins become losses), and that the Pi row is taken
+cooled and interleaved because that board drifts 33% when it is not.
 
 **That LM row was the engine calling the wrong function, and it is fixed.** `loom::text::generate`
 called `infer` unconditionally. Every generated causal-LM driver exports **two** entry points — `infer`,

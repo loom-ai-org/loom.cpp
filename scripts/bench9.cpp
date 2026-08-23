@@ -14,8 +14,15 @@
 //
 // P4.14 measured this at 0.98x and closed it. It is 1.18x on a Cortex-A72 once ggml's implementation
 // of B is fixed to size its batch for a cache and to write its GEMM straight into the output
-// (cmake/patches/ggml-0004-conv2d-cache-blocked.patch) -- and still 0.87x on an AVX2 Ryzen 3 3250U,
-// which is why the lowering is chosen by architecture. Both of those are the LAST line of output;
+// (cmake/patches/ggml-0004-conv2d-cache-blocked.patch) -- and still 0.87x on an AVX2 Ryzen 3 3250U.
+//
+// **Both of those are patch 0004 ALONE, and the lowering is no longer chosen by architecture.** The
+// 0.87x is what made it aarch64-only; ggml-0006's direct kernel, which materialises no patch matrix,
+// superseded it (4.7x on that Ryzen's long-activation convs, 1.19x end-to-end), and
+// LOOM_CONV1D_DIRECT now defaults to 1 everywhere -- src/ops/primitives_conv.cpp is the current word.
+// So B below carries 0004 AND 0006 on any machine that has them, and its ratio is not comparable to
+// the two numbers above. On a 24-core Core Ultra 9 285K it is 1.80x with both, and 1.00x under
+// GGML_CPU_DISABLE_CONV_HEURISTICS=1 -- i.e. unpatched, B is exactly level with A there. Both of those are the LAST line of output;
 // per-shape, the win on ARM is 1.10-1.63x on the long-activation convs and neutral on the short ones.
 //
 // If a number here is far from those, suspect the measurement first: check the box is idle, and see
