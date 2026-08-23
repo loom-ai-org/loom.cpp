@@ -71,8 +71,16 @@ tuned for. The harnesses are `scripts/bench_vits_loom.cpp` and its onnxruntime c
 their sample count, and a ratio taken without checking those match is measuring two different
 utterances ([Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md)).
 
-**Both convolution heuristics are a 1.75x win here, not the feared regression** — 0.1242 s with
-`GGML_CPU_DISABLE_CONV_HEURISTICS=1`, 0.0708 s without it. That switch is new, and is the run-time
+**Both convolution heuristics together are a 1.75x win here, not the feared regression** — 0.1242 s
+with `GGML_CPU_DISABLE_CONV_HEURISTICS=1`, 0.0708 s without it. At the `bench9` level the same switch
+gives 1.80x against 1.00x: **unpatched, ggml's `CONV_2D` is exactly level with im2col + `mul_mat` on
+this machine, and the whole margin is patches 0004 + 0006.** Nothing here is dodging a slow path.
+
+The **0.87x** that appears in `bench9.cpp`'s header is easy to misread as one. It was patch 0004
+*alone* on a 2-core AVX2 Ryzen, and it is why this lowering used to be aarch64-only. It was superseded
+by 0006 — a direct kernel that materialises no patch matrix — not by measuring a roomier x86 box, which
+is why `LOOM_CONV1D_DIRECT` now defaults on for every architecture. `scripts/bench9.cpp`'s header still
+says "the lowering is chosen by architecture"; `src/ops/primitives_conv.cpp` is the current word. That switch is new, and is the run-time
 escape patches 0004 and 0006 previously lacked; `cmake/patches/UPSTREAM.md` carries the per-patch
 numbers and the reason `bench10`'s kernel-only 0.84x does not contradict this.
 
