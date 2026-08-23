@@ -106,12 +106,16 @@ cmake --build build -j"$(nproc)"
 
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
 and run the hermetic suite. The fetched `ggml` is patched at configure time from `cmake/patches/` —
-seven diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
+nine diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
 declined to accept at all, a fused convolution that batched its work too coarsely to stay in cache, a
-direct 1-D convolution for long activations with small weights, and the elementwise nodes a vocoder's
+direct 1-D convolution for long activations with small weights, the elementwise nodes a vocoder's
 resblock wraps around every convolution — its bias, its leaky ReLU and its residual — none of which now
-costs a pass over memory of its own; see `cmake/GgmlPatches.cmake` for the rules such a patch has to
-meet.
+costs a pass over memory of its own, and `conv_transpose_1d`'s single-threaded prologue and
+dot-product-at-a-time compute; see `cmake/GgmlPatches.cmake` for the rules such a patch has to meet.
+
+Two of them are heuristics tuned on measured hardware, so they carry a run-time escape:
+`GGML_CPU_DISABLE_CONV_HEURISTICS=1` declines both, the way ggml's own `GGML_CPU_DISABLE_FUSION`
+declines its fusions.
 
 There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
 (`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,
