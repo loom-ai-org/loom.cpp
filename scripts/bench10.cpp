@@ -163,7 +163,7 @@ static void conv1d_direct(const float* xp, const float* wp, float* y,
 // be half the size: 4 channels x 16 positions is 8 accumulators here, where aarch64 affords 16.
 template <int OCB, int VEC>
 static void conv1d_direct(const float* xp, const float* wp, float* y,
-                          int64_t IC, int64_t OC, int64_t KW, int64_t L, int64_t pad, int nth) {
+                          int64_t IC, int64_t OC, int64_t KW, int64_t L, int64_t pad, int nth, int64_t dil = 1) {
     const int64_t OL = L, LP = L + 2*pad, P = VEC*8;
     const int64_t nblk = OL / P;
 #pragma omp parallel for num_threads(nth) schedule(static)
@@ -176,7 +176,7 @@ static void conv1d_direct(const float* xp, const float* wp, float* y,
             for (int64_t ic = 0; ic < IC; ++ic) {
                 const float* xrow = xp + ic*LP + p0;
                 for (int64_t kx = 0; kx < KW; ++kx) {
-                    const float* q = xrow + kx;
+                    const float* q = xrow + kx*dil;
                     __m256 xv[VEC];
                     for (int j = 0; j < VEC; ++j) xv[j] = _mm256_loadu_ps(q + j*8);
                     const float* w = wp + (ic*KW + kx)*OC + oc0;
