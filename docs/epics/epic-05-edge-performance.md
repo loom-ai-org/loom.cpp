@@ -114,11 +114,18 @@ is barrier count, allocator contention, or work partitioning that leaves threads
 VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
 Measured the same day on the same box, F32 on both sides, 4 threads on both sides:
 
-| task | model | loom | onnxruntime | |
+| machine | threads | TTS | LM | ASR |
 |---|---|---|---|---|
-| TTS | VITS (piper en-GB) | 0.0708 s | 0.0650 s | **1.09x** |
-| ASR | whisper-small | 3.80 s | 3.23 s | **1.18x** |
-| LM | Qwen3-0.6B | 2.98 s / 65 tok | 3.33 s / 65 tok | **0.89x** (loom faster) |
+| Core Ultra 9 285K | 4 | **1.25x** | **1.16x** | 0.41x |
+| Core Ultra 9 285K | 24 | 0.36x | 0.38x | 0.56x |
+| Ryzen 3 3250U | 4 (all) | **1.06x** | 0.87x | 0.33x |
+| Raspberry Pi 4B | 4 (all) | **1.00x** | 0.98x | 0.28x |
+
+`>1.00x` is loom faster. The full table with its methodology and caveats is in the
+[README](../../README.md#performance-against-onnxruntime); the two that change how it should be read
+are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
+1.86x faster on VITS, and against it the 4-thread x86 wins become losses), and that the Pi row is taken
+cooled and interleaved because that board drifts 33% when it is not.
 
 **That LM row was the engine calling the wrong function, and it is fixed.** `loom::text::generate`
 called `infer` unconditionally. Every generated causal-LM driver exports **two** entry points — `infer`,
