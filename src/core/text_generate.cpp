@@ -2,6 +2,8 @@
 
 #include "loom/loom_errors.h"
 
+#include <string>
+
 namespace loom {
 namespace text {
 namespace {
@@ -50,12 +52,26 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
     // `tokens` is a CONVENTION the exporter guarantees, not a guess: every generated driver accepts it
     // as an alias for its primary input whatever the traced graph called it (`input_ids`, `token_ids`,
     // `audio_signal`) -- `driver_components.GENERIC_PRIMARY_INPUT` is where that is written down.
+    // WHICH ENTRY POINT, and it is worth 2.83x. Every generated causal-LM driver exports BOTH `infer`
+    // -- one forward over whatever it is handed, returning one token -- and `infer_with_past`, which
+    // runs the decode loop itself against the KV cache. Calling `infer` unconditionally meant the
+    // branch below re-fed a growing prompt, so every step recomputed the WHOLE sequence: 112 MUL_MATs
+    // per step at `ne1` = the current length rather than 1, and a decode that is O(n^2) in tokens.
+    //
+    // Measured on Qwen3-0.6B, 65 tokens, 24-core x86: 8.43 s through `infer`, 2.98 s through
+    // `infer_with_past` -- 7.71 vs 21.78 tok/s. onnxruntime does 19.2-21.4 on the same box, so this
+    // one call was the entire gap to it (Epic-05 §2).
+    //
+    // Not every driver has one: LFM2's ShortConv blocks carry history no KV cache holds, so its export
+    // has only `infer` and must keep the re-fed loop. Hence prefer-if-present rather than require.
+    const std::string entry = bridge.has_function("infer_with_past") ? "infer_with_past" : "infer";
+
     const auto call = [&]() {
         std::unordered_map<std::string, LoomLuaBridge::Value> args = options.extra_inputs;
         args["tokens"] = running;
         args["max_new_tokens"] = static_cast<double>(options.max_new_tokens);
         args["eos_token"] = static_cast<double>(eos);
-        return bridge.call("infer", args);
+        return bridge.call(entry, args);
     };
 
     std::vector<int32_t> generated;
