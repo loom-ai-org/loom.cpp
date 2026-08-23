@@ -1058,6 +1058,13 @@ void LoomLuaBridge::load_script(const std::string& lua_source) {
     }
 }
 
+bool LoomLuaBridge::has_function(const std::string& fn_name) const {
+    lua_getglobal(L_, fn_name.c_str());
+    const bool ok = lua_isfunction(L_, -1);
+    lua_pop(L_, 1);
+    return ok;
+}
+
 LoomLuaBridge::Value LoomLuaBridge::call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args) {
     lua_getglobal(L_, fn_name.c_str());
     if (!lua_isfunction(L_, -1)) {
