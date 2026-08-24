@@ -1,6 +1,6 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Nine diffs, each independently useful and independently reviewable. They are written against the pin in
+Ten diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
@@ -12,7 +12,9 @@ staging only makes sense once 4 has made the op batch-oriented). A reviewer taki
 5 without 4 is not. **6 also sits on top of 4** -- it is a second path inside the same op -- and is
 independent of 5, though it serves 5's fused bias for free. **7 generalises 5** -- it replaces 5's
 entry point with one that also takes a `LEAKY_RELU` on the input and a residual `ADD` on the output --
-so it must be sent after 5, or the two folded into one PR.
+so it must be sent after 5, or the two folded into one PR. **10 depends on nothing** -- it touches
+`vec.h` alone, is the only one of the ten that is not about convolution or GEMM, and is the most
+self-contained thing here to send first if a reviewer wants a small one.
 
 **Submission status (2026-08-23).** PRs 1, 2 and 3 have been **sent upstream**. 4 through 9 have
 not, and are deliberately held: each of 5, 6, 7 and 9 depends on 4, and 4 itself reads more naturally
@@ -24,7 +26,9 @@ aarch64, gcc 14.2) unless it says otherwise; x86-64 numbers are a Ryzen 3 3250U 
 of seven runs pinned to the physical cores.** The workload is a VITS TTS vocoder — an all-convolutional
 generator, F32 throughout, one image per batch, `KH = 1`. The benches are in `scripts/` in this repo
 (`bench6.cpp` GEMM, `bench7.cpp` register tiles, `bench9.cpp` conv lowering, `bench10.cpp` direct
-convolution) and are self-contained against a built ggml.
+convolution, `bench12.cpp` GELU and soft_max) and are self-contained against a built ggml. **PR 10 is
+the exception to the workload sentence above** -- it is a speech ENCODER, whisper-small at 1500 frames,
+and its numbers are one thread on the Core Ultra 9 285K.
 
 **What a reviewer is likely to ask, for all nine: measurements on hardware neither of these two boxes
 represents** — a wide ARM core (Neoverse V2, Apple M-series) and a many-core x86 server. Say so up
@@ -515,3 +519,64 @@ also the check that the scatter does not race.
 the fallback to the old loop when the work buffer is too small exists only for a caller that sized a
 `cplan` by hand — a reviewer may prefer that to be an assert. The F16 path is untouched and still runs
 the old loop.
+
+## PR 10 — `vec.h`: the exact-erf GELU is a scalar `erff()` call per element
+
+`ggml_vec_gelu_erf_f32` is the only activation in `vec.h` with **no SIMD path on any architecture** —
+it is a bare `erff()` libm call per element, where the tanh-approximation GELU beside it has a 128 KB
+f16 lookup table and `ggml_v_silu`/`ggml_v_expf` have hand-written SVE, NEON, AVX-512, AVX2, SSE2 and
+RVV paths. That asymmetry is easy to miss because the exact form looks like the rarely-taken one. It
+is not: it is what PyTorch's default `approximate="none"` lowers to, so it is the GELU in a large
+fraction of transformer MLPs, at full hidden width.
+
+**What it costs.** A 12-layer speech encoder (whisper-small, 1500 frames, `3072 x 1500` per layer):
+**273 ms of a 5.91 s run at one thread**, against **55 ms** for the same 96 activations under
+onnxruntime — **5.3x, the single worst per-op ratio in that model**, in a profile where `LayerNorm` is
+3x *faster* than onnxruntime's, so this is one kernel and not a systemic gap.
+
+**Fix.** Keep the function — this is not a switch to the tanh approximation, which is a different
+function that callers distinguish deliberately — and replace only the libm call:
+
+```
+erf(z) ~ z * P(w)/Q(w),   w = z*z,   deg P = deg Q = 5,   z clamped to [-4, 4],   result saturated to [-1, 1]
+```
+
+AVX-512, AVX2, SSE2 and NEON paths, plus a scalar tail running the *same* rational so that one tensor
+is one function regardless of where the vector body stopped. SVE and RVV fall to that tail — correct,
+just not yet accelerated, and the obvious follow-up.
+
+**Both of the guards are load-bearing, and one of them needed an exhaustive sweep to find.**
+`P/Q -> P5/Q5 = 0.053` as `w` grows, so `z*P(w)/Q(w)` grows *linearly* where `erf` saturates: outside
+the fitted interval the approximation diverges rather than merely degrading, and the clamp is what
+makes the function total. The saturation to `[-1, 1]` is subtler — without it, `1 + z*P/Q` at the clamp
+leaves a residual of order 1e-7 instead of exactly 0, and `0.5*x*residual` is then scaled by `|x|`:
+**at `x = -FLT_MAX` the error is 2e31 for an exact answer of `-0`.** Saturating makes both tails exact
+and costs nothing elsewhere, because true `erf(4) = 0.99999998` rounds to `1.0f` anyway.
+
+**Accuracy, exhaustively.** Not a sampled maximum — every one of the 2^32 float32 bit patterns against
+a double-precision `erf`, with the libm path measured the same way in the same sweep:
+
+| | max abs err | max err / max(\|x\|,1) |
+|---|---|---|
+| this path | 1.32e-06 | **2.64e-07** |
+| `erff()` reference | 4.47e-07 | **1.08e-07** |
+
+**2.4x the error of the path it replaces** — about two f32 ulps of the value's own scale — with the
+worst case at `x = 5.0` rather than in a tail. Worth stating plainly for a reviewer: the fit is *not*
+what limits this. The underlying rational is 7.2e-08 in double; f32 rounding in the Horner evaluation
+accounts for the rest, so tightening the coefficients would buy nothing.
+
+**Evidence.** One thread, `3072 x 1500`, median of seven, `scripts/bench12.cpp` in the loom repo:
+**19.0 -> 1.32 ms on a Core Ultra 9 285K (14.3x)** and **121 -> 5.5 ms on a Ryzen 3 3250U (21.8x)**.
+In-model that takes the op from 5.3x slower than onnxruntime to roughly 3x faster.
+
+`GGML_CPU_DISABLE_GELU_ERF_SIMD=1` restores the libm path exactly, for bisecting a numerical
+regression without a rebuild — spelled like ggml's own `GGML_CPU_DISABLE_FUSION`.
+
+**What a reviewer should push on.** (1) Whether 2.4x the libm error is acceptable for a default, or
+whether it belongs behind a build option — the counter-argument is that the tanh-approximation GELU
+already shipping in this file is far less accurate than either. (2) The `f16` entry point
+`ggml_vec_gelu_erf_f16` is untouched and still calls `erff` per element. (3) SVE and RVV take the
+scalar tail. (4) The coefficients are a least-squares fit refined by reweighting, not a Remez
+exchange; a reviewer who wants an equioscillation certificate rather than an exhaustive sweep should
+say so, though the sweep is the stronger statement for a fixed input type.
