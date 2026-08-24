@@ -111,6 +111,24 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
+* [ ] **P4.18 — the ASR gap against onnxruntime is entirely the ENCODER.** whisper-small is the one
+  task still behind (0.57-0.72x at four threads). Splitting it settles where: **encoder 5.91 s against
+  onnxruntime's 2.38 s (2.49x slower), decode 0.65 s against 0.97 s (1.50x FASTER)** — same clip, same
+  transcript, one thread on both sides (re-verified 2026-08-24: onnxruntime's encoder graph alone is
+  2.49 s at `intra_op=1`, 0.79 at 4). **The decode loop needs nothing; the cross-KV fix overshot it
+  into a win.** Two of the four candidates are now closed:
+  **fused attention is ruled out** (onnxruntime does not fuse it either — 96 `MatMul`, 12 `Softmax`,
+  no attention node), and **GELU is DONE** — `ggml_vec_gelu_erf_f32` was a scalar `erff()` libm call
+  per element on every architecture, now a SIMD rational (`cmake/patches/ggml-0010`), **14.3x on the
+  Core Ultra, 21.8x on the Ryzen**, taking the op from 5.3x slower than onnxruntime to ~3x faster.
+  **`SOFT_MAX` is MEASURED OUT** — its 5-pass row is worth only 1.06x on the target machine, and
+  deleting the exp entirely is worth 0.99x: it is DRAM-bandwidth bound at these shapes, so do not
+  write a kernel for it. What is left is **`MUL_MAT` 1.93x = 66% of the gap** and **layout `CONT` 33x
+  = 16%**. Take the **layout** item first: it is a graph-level fix in the exporter for a cost
+  onnxruntime demonstrably does not pay (but it means a whisper re-export and a fixture refresh). The
+  GEMM item is larger, risks re-treading Retro-012, and needs its 1.93x confirmed at *these* shapes
+  first — P4.15 only ever measured VITS's, and `scripts/bench6.cpp` is aarch64-only as written.
+  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU done, two items open.*
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
