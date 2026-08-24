@@ -1,12 +1,13 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Ten diffs, each independently useful and independently reviewable. They are written against the pin in
+Eleven diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
 
-**Order and independence.** 1, 2 and 3 touch `llamafile/sgemm.cpp` and are independent of each other,
-though 1 and 2 only pay off together (see below) and are best sent as one PR or two linked ones. 4 and
+**Order and independence.** 1, 2, 3 and 11 touch `llamafile/sgemm.cpp`. 1 and 2 only pay off together
+(see below) and are best sent as one PR or two linked ones; **11 is the same fix as 3 on the other
+axis** and lands on adjacent lines of the same function, so send them together or 3 first. 4 and
 5 touch the CPU convolution; **5 depends on 4** (it uses the `ldc` mul_mat helper 4 introduces, and its
 staging only makes sense once 4 has made the op batch-oriented). A reviewer taking 4 without 5 is fine;
 5 without 4 is not. **6 also sits on top of 4** -- it is a second path inside the same op -- and is
@@ -580,3 +581,64 @@ already shipping in this file is far less accurate than either. (2) The `f16` en
 scalar tail. (4) The coefficients are a least-squares fit refined by reweighting, not a Remez
 exchange; a reviewer who wants an equioscillation certificate rather than an exhaustive sweep should
 say so, though the sweep is the stronger statement for a fixed input type.
+
+---
+
+## PR 11 — `sgemm`: handle `k % KN != 0` instead of declining the whole matmul
+
+*(`cmake/patches/ggml-0011-tinyblas-k-tail.patch`)*
+
+**Problem.** The same shape as PR 3, on the other axis, and a worse one. `matmul` opens with
+`if (k % KN != 0) return false;`, so a contraction that is not a whole number of vectors sends the
+**entire** matmul to ggml's generic one-output-element-per-call kernel. `m` is a row count; `k` is the
+**contraction**, and in attention the contraction is a sequence length — a number nothing rounds.
+
+whisper's encoder is the clean example. Its `A@V` contracts over 1500 mel frames, and **1500 % 8 == 4**
+on AVX2, **1500 % 16 == 12** on AVX-512. That matmul has never entered this file on x86 at all. NEON
+has `KN == 4` and 1500 % 4 == 0, which is why it is invisible from aarch64 — and why the whole of
+PRs 1–3 was written without anyone noticing.
+
+**Fix.** Split the contraction the way PR 3 splits the rows: the aligned prefix runs the vector loop
+unchanged, and the ≤ `KN-1` leftover elements are accumulated as scalars **inside the tile**, into the
+same accumulator, before the `hsum`. No extra pass over `C` and no extra memory traffic; the added work
+is at most 7 scalar products per output element.
+
+Scoped to the F32 instantiation because the tail is a scalar multiply and the other instantiations
+carry `ggml_fp16_t`/`ggml_bf16_t`, which do not convert that way. Those keep the existing rejection.
+
+**One thing a reviewer should not simplify away.** There are two epilogues, and the branch is outside
+the tile on purpose. Folding the tail loop into a single epilogue — where it is *statically empty*
+whenever `k % KN == 0` — costs the small-`k` shapes **30%**: whisper's `QK^T` at `k = 64` went
+154 → 201 ms, because the extra live values change how the accumulators are spilled around the `hsum`.
+At `k = 64` the epilogue is a large fraction of eight loop iterations, so the aligned case has to keep
+byte-for-byte the code it had.
+
+**Evidence.** One thread, Ryzen 3 3250U (AVX2), at whisper-small's own `A@V` shape (`m=64, n=1500,
+k=1500`, 12 heads): **176.2 → 81.8 ms, 2.15x**. A `k` sweep at that shape shows the cliff is the
+divisibility and nothing else:
+
+| `m=64, n=1500` | k=1496 | k=1500 | k=1504 |
+|---|---|---|---|
+| GFLOP/s | 44.5 | **20.8** | 47.0 |
+
+In model (whisper-small, `jfk.wav`, `$LOOM_PROFILE` at one thread, two interleaved runs per arm) the
+`MUL_MAT 64 x 1500` bucket goes **2240/2460 → 1119/1136 ms** and no other bucket moves.
+Architecture-neutral in the same sense PR 3 is: every ISA whose `KN` does not divide a model's
+sequence length benefits, and the wider the vector the more often that is.
+
+**Accuracy.** Against a double-precision reference over every `k` in [1, 40] plus 63/64/65 and
+1496–1504, the worst relative error is **2.6e-05**, and the aligned `k` sit in the same place as the
+unaligned ones (k=1496 2.1e-05, k=1500 2.3e-05) — f32 accumulation noise, not a dropped term. loom's
+whisper gate (encoder against HuggingFace) moves `max/absmax` 4.19e-04 → 4.34e-04 against a 1e-3 limit
+and `mean_abs_diff` 9.36e-06 → **9.33e-06**, passing 67/67 either way.
+
+**Testing.** The same shape as PR 3's test on the other axis: `k % KN` over its whole residue range
+against a double-precision reference, including `k < KN` (which still declines), and whisper's own
+`k = 1500`. Verified red by dropping the tail accumulation — 16 of 113 checks fail, at exactly the
+unaligned `k`, by 2e-02 to 1.7e-01 against a 1e-5 tolerance.
+
+**What a reviewer should push on.** (1) Whether the two-epilogue split is worth its duplication —
+the measurement above is the argument, and it is compiler-specific enough to want a second data point.
+(2) The f16/bf16 instantiations keep the rejection, so a reviewer may want the same treatment there
+via `GGML_FP16_TO_FP32`. (3) This lands on top of PR 3; the two are independent in mechanism but touch
+adjacent lines of the same function, so they want reviewing together.

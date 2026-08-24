@@ -111,24 +111,33 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
-* [ ] **P4.18 — the ASR gap against onnxruntime is entirely the ENCODER.** whisper-small is the one
-  task still behind (0.57-0.72x at four threads). Splitting it settles where: **encoder 5.91 s against
-  onnxruntime's 2.38 s (2.49x slower), decode 0.65 s against 0.97 s (1.50x FASTER)** — same clip, same
-  transcript, one thread on both sides (re-verified 2026-08-24: onnxruntime's encoder graph alone is
-  2.49 s at `intra_op=1`, 0.79 at 4). **The decode loop needs nothing; the cross-KV fix overshot it
-  into a win.** Two of the four candidates are now closed:
-  **fused attention is ruled out** (onnxruntime does not fuse it either — 96 `MatMul`, 12 `Softmax`,
-  no attention node), and **GELU is DONE** — `ggml_vec_gelu_erf_f32` was a scalar `erff()` libm call
-  per element on every architecture, now a SIMD rational (`cmake/patches/ggml-0010`), **14.3x on the
-  Core Ultra, 21.8x on the Ryzen**, taking the op from 5.3x slower than onnxruntime to ~3x faster.
-  **`SOFT_MAX` is MEASURED OUT** — its 5-pass row is worth only 1.06x on the target machine, and
-  deleting the exp entirely is worth 0.99x: it is DRAM-bandwidth bound at these shapes, so do not
-  write a kernel for it. What is left is **`MUL_MAT` 1.93x = 66% of the gap** and **layout `CONT` 33x
-  = 16%**. Take the **layout** item first: it is a graph-level fix in the exporter for a cost
-  onnxruntime demonstrably does not pay (but it means a whisper re-export and a fixture refresh). The
-  GEMM item is larger, risks re-treading Retro-012, and needs its 1.93x confirmed at *these* shapes
-  first — P4.15 only ever measured VITS's, and `scripts/bench6.cpp` is aarch64-only as written.
-  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU done, two items open.*
+* [ ] **P4.18 — the ASR gap is the encoder's ATTENTION, plus a loop-invariant copy in the decoder.**
+  whisper-small is the one task still behind (0.57-0.72x at four threads).
+  **Two of the first version's conclusions were wrong and are corrected in the epic.**
+  (a) The `CONT 1500 x 64` bucket was assigned to the encoder by eye; `$LOOM_PROFILE` keys on
+  `(op, ne0, ne1)` and cannot say which graph a bucket is in. Node names say it is **the decoder**:
+  454 of its 471 ms are 26 executions of the decode graph. The corrected split is **encoder 5.46 s vs
+  2.38 (2.29x), decode 1.10 s vs 0.97 (1.14x SLOWER)** — so "the decoder is ahead and needs nothing"
+  was wrong. (b) Splitting onnxruntime's own `MatMul` time by shape shows loom's **dense GEMMs are
+  within 10-12% of MLAS**; the whole 1.93x is the two batched attention matmuls.
+  **Fused attention stays ruled out**, **GELU is DONE** (`ggml-0010`), **`SOFT_MAX` stays measured
+  out**, and now **`k % KN` is DONE** (`ggml-0011`): tinyBLAS rejected every matmul whose CONTRACTION
+  was not a whole number of vectors, and whisper's A@V contracts over 1500 frames (1500 % 8 == 4 on
+  AVX2, % 16 == 12 on AVX-512, **% 4 == 0 on NEON, which is why an aarch64-only bench6 could not find
+  it**). **2.15x at that shape; in model the `MUL_MAT 64 x 1500` bucket goes 2240 -> 1119 ms with no
+  other bucket moving.** `scripts/bench13.cpp` is the x86 bench that was missing, `--check` is its
+  correctness sweep, and `tests/ci/test_tinyblas_gemm.cpp` now covers the `k` residues (verified red).
+  *Two things left, in order:*
+  (1) **the decoder's cross-attention V is re-transposed every step** — 12 nodes x 4.6 MB per token,
+  **9.0% of the whole transcription and 47% of the decode loop** at one thread. It is a function of a
+  graph input that is constant for the utterance. The fix is `_WhisperCrossKvWrapper.forward`
+  (`loom-exporter/whisper_export.py:147`) emitting V already head-split and transposed — a whisper
+  re-export and a fixture refresh, so not free at release time (ADR-003).
+  (2) **`QK^T` at `k = 64` runs at 23.5 GFLOP/s where the same core does 44 at k >= 256**, while MLAS
+  drops only 9% over that range. ggml vectorises along `k` and pays a per-tile `hsum` epilogue that
+  eight loop iterations cannot amortise. ~1.1 s of the 1-thread encoder on the dev box, and the
+  largest thing left in the encoder. *Do not start by writing a fused attention kernel.*
+  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU + k-tail done, two items open.*
 * [ ] **The README's TTS and LM columns need the per-launch sampling the ASR column just got.** On the
   Core Ultra 9 285K (8 P-cores + 16 E-cores, no SMT) thread placement is chosen **once per process**
   and then sticks, so every run inside one process inherits the same luck and a within-process median
