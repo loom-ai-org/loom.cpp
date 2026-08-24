@@ -21,6 +21,23 @@
 #
 # `bench_onnx.py` is the older, Pi-specific TTS harness that also carries the per-shape convolution
 # profile P4.16's table is built from. This file is the portable three-task one.
+#
+# WHERE THE PIECES LIVE, because the assets are large and are not in any repo (2026-08-24):
+#
+#   dev box       onnx models  ~/Dev/loom/onnx/{qwen3-0.6b,whisper-small}, VITS at
+#                              ~/Dev/piper/pipertts_en-GB_miro/miro_en-GB.onnx
+#                 python       ~/.venvs/ovos/bin/python  (onnxruntime 1.28.0)
+#   workstation   onnx models  ~/loom/onnx/{qwen3-0.6b,whisper-small}, VITS in ~/loom/fixtures/
+#                 python       ~/micromamba/envs/onnxbench/bin/python3
+#   rpi4          onnx models  ~/bench/onnx/{qwen3-0.6b,whisper-small,miro_en-GB.onnx}
+#                 python       ~/test/bin/python3
+#
+# The whisper directory must be the FULL export -- `onnx/` plus the tokenizer and preprocessor JSON
+# next to it -- because the ASR task builds features and detokenises with `transformers`.
+#
+# Pin the version you quote. `pip install onnxruntime` 1.28.0 is the README's baseline; conda-forge's
+# build of the SAME version is 1.86x faster on VITS, which is large enough to change every conclusion
+# ([Retro-012](../docs/retros/retro-012-optimizations-that-were-measured-out.md)).
 import statistics, sys, time, wave
 import numpy as np
 import onnxruntime as ort
