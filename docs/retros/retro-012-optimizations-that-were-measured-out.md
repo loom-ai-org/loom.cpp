@@ -206,6 +206,7 @@ in place of 165 `IM2COL` + 213 `MUL_MAT`.
 | runtime `if`s in the direct kernel's store | **1.44 -> 1.73 s** — see trap 1 above |
 | fusing the resblock layer's FIRST unary | it has three consumers; nothing to skip |
 | tiling the two convolutions of a resblock as one chain | **1.05x on the chains, <2% end-to-end** — step 2 above, and `scripts/bench11.cpp` is the prototype that says so |
+| scaling a published loom-vs-onnxruntime ratio by a measured engine-side factor instead of re-measuring both sides | 30% out on the first cell checked; the published baseline was itself unreproducible. [Retro-018](retro-018-a-table-of-ratios-nobody-could-re-derive.md) |
 | clamping `ggml_get_n_tasks` by work size for small elementwise ops | **not the mechanism** of P4.17's thread-scaling collapse — that was libgomp's wait policy, and nothing was clamped. [Retro-017](retro-017-libgomp-slept-at-every-graph-node.md) |
 | a cheaper `ggml_barrier` | a fifth of P4.17 at most: 2520 barriers x 11.4 us = 28.7 ms of a ~124 ms delta. Retro-017 |
 | `OMP_PROC_BIND` / `taskset` pinning for the many-core collapse | no effect once threads spin; `bind=close` without spinning is far worse. Retro-017 |

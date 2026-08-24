@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-08-23
+last_updated: 2026-08-24
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -99,11 +99,15 @@ are not renumbered. New items continue the scheme.
   mechanism and needs no ggml patch**, and (1) barrier cost is only a fifth of the delta.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has the full measurement and why the fix is the
   build flag rather than `OMP_WAIT_POLICY=active` (a library cannot set that variable).
-  *Still open:* (1) **the four-machine loom-vs-onnxruntime table in `README.md` is now stale on loom's
-  side** — it was measured on the OpenMP build, and even at its 4 threads this is worth ~1.1x on x86;
-  re-measure before quoting it again. (2) Re-ask the **default thread count** question, which this
-  unblocks but does not answer: at ggml's default of 4 the fix is worth only ~1.1x, so raising it is
-  still its own benchmark. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
+  *Still open:* (1) **the README table has been re-measured** (2026-08-24) with both engines run back
+  to back on each machine, and the previous one could not be reproduced from either side — see
+  [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md). (2) **The default thread count is now benchmarked and the answer is the
+  PHYSICAL CORE COUNT** — 24 on the 285K (1.98x TTS / 2.41x ASR / 1.18x LM against today's 4), but
+  **2 on a 2-core SMT Ryzen, where 4 is worse than 2 on all three tasks**. "Every CPU" would be a
+  1.28x TTS regression there; "every physical core" is right on both. Not implemented: every figure is
+  one inference on an idle machine, and a host running several loom instances concurrently is exactly
+  what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
+  [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
