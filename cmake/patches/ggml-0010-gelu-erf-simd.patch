@@ -1,0 +1,188 @@
+diff --git a/src/ggml-cpu/vec.h b/src/ggml-cpu/vec.h
+index 5de9cb5b..0dd31465 100644
+--- a/src/ggml-cpu/vec.h
++++ b/src/ggml-cpu/vec.h
+@@ -1007,13 +1007,182 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+ }
+ #endif
+ 
+-inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
++// EXACT-erf GELU, vectorised.
++//
++// The reference form below -- one `erff()` libm call per element -- is the only GELU in this file with
++// no SIMD path at all, on any architecture. It is also the one an exporter picks when it wants the
++// exact function rather than the tanh approximation (PyTorch's `approximate="none"`, the default), so
++// it lands in transformer MLPs at full width: on a 12-layer speech encoder at 1500 frames it was 273
++// ms of a 5.9 s run, against 55 ms for the same 96 activations under onnxruntime -- 5.3x, and the
++// single worst per-op ratio in that model.
++//
++// It is replaced here by a rational approximation of erf itself:
++//
++//     erf(z) ~ z * P(w)/Q(w),   w = z*z,   P, Q of degree 5,   z clamped to [-4, 4]
++//
++// then saturated to [-1, 1]. Every step of that is load-bearing:
++//
++//   * THE CLAMP IS NOT COSMETIC. P/Q tends to P5/Q5 = 0.053 as w grows, so z*P(w)/Q(w) grows
++//     LINEARLY where erf saturates. Outside the fitted interval the approximation does not merely
++//     lose accuracy, it diverges; the clamp is what makes the function total. Its own error is
++//     analytic and negligible -- erfc(4) = 1.5e-8, below f32 resolution at that magnitude.
++//   * THE SATURATION TO [-1, 1] IS NOT COSMETIC EITHER, and it is the one thing an exhaustive sweep
++//     was needed to find. Without it, `1 + z*P/Q` at the clamp leaves a residual of order 1e-7
++//     instead of exactly 0, and 0.5*x*residual is then multiplied by |x|: at x = -FLT_MAX the error
++//     is 2e31, for an exact answer of -0. Saturating makes both tails exact, and because true
++//     erf(4) = 0.99999998 rounds to 1.0f, it costs no accuracy anywhere else.
++//   * DO NOT REPLACE THE CLAMP WITH THE BRANCHLESS IDENTITY 0.5*(a+b-|a-b|). It vectorises where a
++//     select does not, which makes it tempting; it also cancels to zero in f32 once a+b == a, and
++//     gelu(1e30) then comes back as 5e29.
++//
++// ACCURACY, EXHAUSTIVELY. Not a sampled maximum -- every one of the 2^32 float32 bit patterns, against
++// a double-precision erf, measuring the libm path the same way in the same sweep:
++//
++//                        max abs err        max err / max(|x|,1)
++//     this path          1.32e-06            2.64e-07
++//     erff() reference   4.47e-07            1.08e-07
++//
++// i.e. 2.4x the error of the path it replaces, or about 2 f32 ulps of the value's own scale, with the
++// worst case at x = 5.0 rather than in a tail. The fit is not what limits this: the underlying
++// approximation is 7.2e-08 in double, and f32 rounding in the Horner evaluation accounts for the rest.
++// Tightening the coefficients would buy nothing.
++//
++// EACH BRANCH WAS SWEPT SEPARATELY, because they do not round alike: SSE2 2.64e-07, AVX2 2.28e-07
++// (better -- it has FMA), and the NEON branch is BIT-IDENTICAL to the scalar tail over all 2^32
++// inputs, checked on a Cortex-A72. AVX-512 is compile-verified only; neither box available had it.
++// The generator for the coefficients, and the reasoning about what is and is not a bound, is
++// `scripts/erf_fit.py` in the loom repo -- it reprints these twelve constants exactly.
++//
++// PERFORMANCE. One thread, 3072 x 1500, median of seven, `scripts/bench12.cpp` in the loom repo:
++// 19.0 ms -> 1.32 ms on a Core Ultra 9 285K (14.3x) and 121 -> 5.5 ms on a Ryzen 3 3250U (21.8x).
++//
++// `GGML_CPU_DISABLE_GELU_ERF_SIMD=1` restores the libm path exactly, for bisecting a numerical
++// regression without a rebuild. Spelled like ggml's own GGML_CPU_DISABLE_FUSION.
++#define GGML_ERF_CLAMP 4.0f
++static const float ggml_erf_rat_p[6] = {1.128379046e+00f, 1.923043769e-01f, 5.298133013e-02f,
++                                        3.844561124e-03f, 2.861880010e-04f, 2.027359838e-06f};
++static const float ggml_erf_rat_q[6] = {1.000000000e+00f, 5.037572164e-01f, 1.148780232e-01f,
++                                        1.512413709e-02f, 1.181028205e-03f, 3.792931260e-05f};
++
++inline static void ggml_vec_gelu_erf_f32_libm(const int n, float * y, const float * x) {
+     for (int i = 0; i < n; ++i) {
+         float xi = x[i];
+         y[i] = 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV));
+     }
+ }
+ 
++inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
++    static int gelu_erf_simd_off = -1;
++    if (gelu_erf_simd_off < 0) {
++        const char * e = getenv("GGML_CPU_DISABLE_GELU_ERF_SIMD");
++        gelu_erf_simd_off = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    if (gelu_erf_simd_off) {
++        ggml_vec_gelu_erf_f32_libm(n, y, x);
++        return;
++    }
++
++    int i = 0;
++#if defined(__AVX512F__) && defined(__AVX512DQ__)
++    {
++        const __m512 chi = _mm512_set1_ps(GGML_ERF_CLAMP), clo = _mm512_set1_ps(-GGML_ERF_CLAMP);
++        const __m512 one = _mm512_set1_ps(1.0f), mone = _mm512_set1_ps(-1.0f);
++        const __m512 half = _mm512_set1_ps(0.5f), sq = _mm512_set1_ps(SQRT_2_INV);
++        for (; i + 15 < n; i += 16) {
++            const __m512 xi = _mm512_loadu_ps(x + i);
++            const __m512 z  = _mm512_max_ps(clo, _mm512_min_ps(chi, _mm512_mul_ps(xi, sq)));
++            const __m512 w  = _mm512_mul_ps(z, z);
++            __m512 p = _mm512_set1_ps(ggml_erf_rat_p[5]);
++            __m512 q = _mm512_set1_ps(ggml_erf_rat_q[5]);
++            for (int k = 4; k >= 0; --k) {
++                p = _mm512_fmadd_ps(p, w, _mm512_set1_ps(ggml_erf_rat_p[k]));
++                q = _mm512_fmadd_ps(q, w, _mm512_set1_ps(ggml_erf_rat_q[k]));
++            }
++            __m512 e = _mm512_mul_ps(z, _mm512_div_ps(p, q));
++            e = _mm512_max_ps(mone, _mm512_min_ps(one, e));
++            _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_mul_ps(half, xi), _mm512_add_ps(one, e)));
++        }
++    }
++#elif defined(__AVX2__) && defined(__FMA__)
++    {
++        const __m256 chi = _mm256_set1_ps(GGML_ERF_CLAMP), clo = _mm256_set1_ps(-GGML_ERF_CLAMP);
++        const __m256 one = _mm256_set1_ps(1.0f), mone = _mm256_set1_ps(-1.0f);
++        const __m256 half = _mm256_set1_ps(0.5f), sq = _mm256_set1_ps(SQRT_2_INV);
++        for (; i + 7 < n; i += 8) {
++            const __m256 xi = _mm256_loadu_ps(x + i);
++            const __m256 z  = _mm256_max_ps(clo, _mm256_min_ps(chi, _mm256_mul_ps(xi, sq)));
++            const __m256 w  = _mm256_mul_ps(z, z);
++            __m256 p = _mm256_set1_ps(ggml_erf_rat_p[5]);
++            __m256 q = _mm256_set1_ps(ggml_erf_rat_q[5]);
++            for (int k = 4; k >= 0; --k) {
++                p = _mm256_fmadd_ps(p, w, _mm256_set1_ps(ggml_erf_rat_p[k]));
++                q = _mm256_fmadd_ps(q, w, _mm256_set1_ps(ggml_erf_rat_q[k]));
++            }
++            __m256 e = _mm256_mul_ps(z, _mm256_div_ps(p, q));
++            e = _mm256_max_ps(mone, _mm256_min_ps(one, e));
++            _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_mul_ps(half, xi), _mm256_add_ps(one, e)));
++        }
++    }
++#elif defined(__SSE2__)
++    {
++        const __m128 chi = _mm_set1_ps(GGML_ERF_CLAMP), clo = _mm_set1_ps(-GGML_ERF_CLAMP);
++        const __m128 one = _mm_set1_ps(1.0f), mone = _mm_set1_ps(-1.0f);
++        const __m128 half = _mm_set1_ps(0.5f), sq = _mm_set1_ps(SQRT_2_INV);
++        for (; i + 3 < n; i += 4) {
++            const __m128 xi = _mm_loadu_ps(x + i);
++            const __m128 z  = _mm_max_ps(clo, _mm_min_ps(chi, _mm_mul_ps(xi, sq)));
++            const __m128 w  = _mm_mul_ps(z, z);
++            __m128 p = _mm_set1_ps(ggml_erf_rat_p[5]);
++            __m128 q = _mm_set1_ps(ggml_erf_rat_q[5]);
++            for (int k = 4; k >= 0; --k) {
++                p = _mm_add_ps(_mm_mul_ps(p, w), _mm_set1_ps(ggml_erf_rat_p[k]));
++                q = _mm_add_ps(_mm_mul_ps(q, w), _mm_set1_ps(ggml_erf_rat_q[k]));
++            }
++            __m128 e = _mm_mul_ps(z, _mm_div_ps(p, q));
++            e = _mm_max_ps(mone, _mm_min_ps(one, e));
++            _mm_storeu_ps(y + i, _mm_mul_ps(_mm_mul_ps(half, xi), _mm_add_ps(one, e)));
++        }
++    }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    {
++        const float32x4_t chi = vdupq_n_f32(GGML_ERF_CLAMP), clo = vdupq_n_f32(-GGML_ERF_CLAMP);
++        const float32x4_t one = vdupq_n_f32(1.0f), mone = vdupq_n_f32(-1.0f);
++        const float32x4_t sq = vdupq_n_f32(SQRT_2_INV);
++        for (; i + 3 < n; i += 4) {
++            const float32x4_t xi = vld1q_f32(x + i);
++            const float32x4_t z  = vmaxq_f32(clo, vminq_f32(chi, vmulq_f32(xi, sq)));
++            const float32x4_t w  = vmulq_f32(z, z);
++            float32x4_t p = vdupq_n_f32(ggml_erf_rat_p[5]);
++            float32x4_t q = vdupq_n_f32(ggml_erf_rat_q[5]);
++            for (int k = 4; k >= 0; --k) {
++                p = vfmaq_f32(vdupq_n_f32(ggml_erf_rat_p[k]), p, w);
++                q = vfmaq_f32(vdupq_n_f32(ggml_erf_rat_q[k]), q, w);
++            }
++            float32x4_t e = vmulq_f32(z, vdivq_f32(p, q));
++            e = vmaxq_f32(mone, vminq_f32(one, e));
++            vst1q_f32(y + i, vmulq_f32(vmulq_n_f32(xi, 0.5f), vaddq_f32(one, e)));
++        }
++    }
++#endif
++    // Scalar tail -- the SAME rational, not the libm reference, so that one tensor is one function
++    // regardless of where the vector body stopped.
++    for (; i < n; ++i) {
++        const float xi = x[i];
++        float z = xi*SQRT_2_INV;
++        z = z <  GGML_ERF_CLAMP ? z :  GGML_ERF_CLAMP;
++        z = z > -GGML_ERF_CLAMP ? z : -GGML_ERF_CLAMP;
++        const float w = z*z;
++        const float p = ((((ggml_erf_rat_p[5]*w + ggml_erf_rat_p[4])*w + ggml_erf_rat_p[3])*w
++                          + ggml_erf_rat_p[2])*w + ggml_erf_rat_p[1])*w + ggml_erf_rat_p[0];
++        const float q = ((((ggml_erf_rat_q[5]*w + ggml_erf_rat_q[4])*w + ggml_erf_rat_q[3])*w
++                          + ggml_erf_rat_q[2])*w + ggml_erf_rat_q[1])*w + ggml_erf_rat_q[0];
++        float e = z*(p/q);
++        e = e <  1.0f ? e :  1.0f;
++        e = e > -1.0f ? e : -1.0f;
++        y[i] = 0.5f*xi*(1.0f + e);
++    }
++}
++
+ inline static float ggml_gelu_quick_f32(float x) {
+     return x*(1.0f/(1.0f+expf(GELU_QUICK_COEF*x)));
+ }
