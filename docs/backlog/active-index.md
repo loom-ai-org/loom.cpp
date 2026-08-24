@@ -103,8 +103,10 @@ are not renumbered. New items continue the scheme.
   to back on each machine, and the previous one could not be reproduced from either side — see
   [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md). (2) **The default thread count is now benchmarked and the answer is the
   PHYSICAL CORE COUNT** — 24 on the 285K (1.98x TTS / 2.41x ASR / 1.18x LM against today's 4), but
-  **2 on a 2-core SMT Ryzen, where 4 is worse than 2 on all three tasks**. "Every CPU" would be a
-  1.28x TTS regression there; "every physical core" is right on both. Not implemented: every figure is
+  **2 on a 2-core SMT Ryzen**, where the two extra SMT threads buy nothing on any task and cost on two
+  (TTS 1.19x, LM 1.03x, ASR unchanged). "Every CPU" would be a TTS regression there; "every physical
+  core" is right on both. **On the Ryzen it barely moves the published ratios, because onnxruntime
+  prefers 2 threads too** — the rule is a property of the CPU, not of loom. Not implemented: every figure is
   one inference on an idle machine, and a host running several loom instances concurrently is exactly
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
