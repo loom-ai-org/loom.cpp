@@ -115,12 +115,15 @@ are not renumbered. New items continue the scheme.
   task still behind (0.57-0.72x at four threads). Splitting it settles where: **encoder 5.91 s against
   onnxruntime's 2.38 s (2.49x slower), decode 0.65 s against 0.97 s (1.50x FASTER)** — same clip, same
   transcript, one thread. **The decode loop needs nothing; the cross-KV fix overshot it into a win.**
-  Three candidates in [Epic-05 §2](../epics/epic-05-edge-performance.md), cheapest first: (1) attention
-  is materialised rather than fused — `QK^T` + `SOFT_MAX` + `AV` is **31.8% of the whole run** and
-  re-reads a 108 MB score matrix per layer, and the deciding test is a *read* of onnxruntime's existing
-  per-op profile; (2) 324 `CONT` copies of `1500x64`, 6.8%, likely an **exporter** fix; (3) GEMM
-  efficiency at encoder shapes, which P4.15 never measured — enter last.
-  *Scoped, not started.*
+  **The cheap test already ran and inverted the ordering: onnxruntime does NOT fuse attention either**
+  (96 `MatMul`, 12 `Softmax`, no attention node), so a fused kernel is not what makes it faster. Its
+  profile attributes the gap instead, at equal call counts:
+  **`MUL_MAT` 1.93x = 66% of it**, layout `CONT` 33x = 16%, `Softmax` 4.3x = 10%, GELU 5.3x = 8% —
+  and `LayerNorm` where **loom is 3x faster**, so this is specific kernels, not a systemic gap.
+  Start with the **layout** item: it is a graph-level fix in the exporter for a cost onnxruntime
+  demonstrably does not pay. The GEMM item is larger but risks re-treading Retro-012 and needs its
+  1.93x confirmed at *these* shapes first — P4.15 only ever measured VITS's.
+  [Epic-05 §2](../epics/epic-05-edge-performance.md). *Scoped, not started.*
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine

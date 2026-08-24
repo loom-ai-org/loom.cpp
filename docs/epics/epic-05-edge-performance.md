@@ -389,30 +389,57 @@ projections the export now computes once. The 25 `NORM` at `768 x 1500` are 12 l
 one — **checked, because 25 is also the token count and that coincidence looks exactly like the
 cross-KV defect. It is not one; nothing encoder-width runs per decode step.**
 
-#### Three candidates, cheapest experiment first
+#### The cheap test ran first, and it inverted the ordering
 
-1. **Attention is materialised rather than fused.** `MUL_MAT 1500x1500` + `SOFT_MAX 1500x1500` +
-   `MUL_MAT 64x1500` is **2.21 s, 31.8% of the whole run**, and it writes then re-reads a
-   `1500 x 1500 x 12` F32 score matrix — **108 MB per layer**, twelve times, none of which fits in the
-   36 MB L3. onnxruntime has fused `MultiHeadAttention`/`Attention` kernels that tile this and never
-   materialise it. *Test:* take onnxruntime's own per-op profile (the recipe is in this epic's
-   operating notes) and check whether those three ops appear at all or collapse into one fused node.
-   That is a read of an existing profile, costs nothing, and decides whether this is the mechanism
-   before any kernel is written.
-2. **Layout churn around attention.** 324 `CONT` of `1500 x 64` is 471 ms of **pure data movement, 27
-   per layer**, and copies are the one thing a graph can often be re-shaped to avoid. *Test:* dump the
-   encoder topology and find which `permute`/`transpose` each `CONT` is servicing; ask whether the
-   exporter can emit Q/K/V already in the layout attention wants. This is an **exporter** change if it
-   works, which is where per-model complexity belongs (ADR-003).
-3. **GEMM efficiency at the encoder's shapes.** `768 x 1500` alone is 1.94 s. P4.15 measured `ggml`'s
-   F32 GEMM against MLAS at *VITS vocoder* shapes and fixed it there; these shapes are much larger and
-   were never measured. *Test:* `scripts/bench6.cpp` with the seven shapes above, against the same
-   MLAS baseline. **Do not assume P4.15's conclusion carries** — Retro-012 records that tinyBLAS now
-   beats a hand-written 4x4 *at the shapes it was measured on*.
+The first candidate was *attention is materialised rather than fused* — 31.8% of the run in
+`QK^T` + `SOFT_MAX` + `AV`, writing and re-reading a 108 MB score matrix per layer, against
+onnxruntime's fused `MultiHeadAttention`. The deciding experiment was a **read** of onnxruntime's own
+per-op profile, so it went first.
 
-**(1) is the likely answer and (2) is the cheapest real change**; (3) is the one that would be
-re-treading measured ground, so it should be entered last and only if the profile read in (1) says
-attention is not the story.
+**It is ruled out. onnxruntime does not fuse attention either** — its encoder is 96 `MatMul`, 12
+`Softmax`, 24 `LayerNormalization`, 12 `BiasGelu`, 49 `Transpose`, 48 `Reshape`, and no attention node
+of any kind. It materialises the same score matrix loom does. *Fusing attention is not what makes it
+faster, so nothing here should start by writing a fused kernel.*
+
+The same profile then attributes the gap directly. onnxruntime shares are apportioned over its
+un-profiled 2.376 s encoder (profiling costs it ~1.18x, so only shares are used); loom's 84
+`768 x 1500` matmuls include 24 cross-attention K/V projections that onnxruntime computes in its
+**decoder's** first pass, so those are stripped to leave 96 against 96:
+
+| | loom | onnxruntime | ratio | gap |
+|---|---|---|---|---|
+| `MatMul` / `MUL_MAT` (96 calls each) | 4017 ms | 2086 ms | **1.93x** | **1931 ms — 66%** |
+| layout (`CONT` 324 vs `Transpose`+`Reshape` 97) | 471 ms | 14 ms | **33x** | 456 ms — 16% |
+| `Softmax` | 396 ms | 93 ms | **4.3x** | 303 ms — 10% |
+| GELU (+ bias) | 289 ms | 55 ms | **5.3x** | 234 ms — 8% |
+| conv frontend | 82 ms | 40 ms | 2.0x | 42 ms — 1% |
+| LayerNorm | 21 ms | 64 ms | **0.32x** | **-43 ms — loom is 3x faster here** |
+
+#### Three candidates, re-ordered by what the profile says
+
+1. **GEMM efficiency at the encoder's shapes — 66% of the gap, and the item this now is.** Same call
+   count, **1.93x slower**. P4.15 measured `ggml`'s F32 GEMM against MLAS at *VITS vocoder* shapes and
+   fixed it there; the encoder's are far larger (`768 x 1500`, `3072 x 1500`, `1500 x 1500`) and were
+   never measured. **P4.15's conclusion does not carry to shapes it never saw**, and Retro-012's "the
+   GEMM micro-kernel is done" verdict is scoped to those shapes. *Test:* `scripts/bench6.cpp` at the
+   seven shapes in the table above, against MLAS.
+2. **Layout churn — 16%, and the cheapest real change.** 324 `CONT` of `1500 x 64` against
+   onnxruntime's 97 `Transpose`/`Reshape`: **3.3x as many layout ops and 33x the cost**, which says
+   ggml is *materialising* copies where onnxruntime is re-striding views. 27 per layer. *Test:* dump
+   the encoder topology and find which `permute` each `CONT` is servicing; ask whether the exporter can
+   emit Q/K/V in the layout attention already wants. An **exporter** fix if it works (ADR-003).
+3. **`SOFT_MAX` and GELU — 18% together, and both are plain elementwise kernels** at 4.3x and 5.3x.
+   onnxruntime's `BiasGelu` is a fused bias+activation, which loom runs as `ADD` then `UNARY`; that
+   fusion is worth having but is the smaller half of the 5.3x. These are the two lines where a kernel
+   change is unambiguously a kernel change, with no graph question attached.
+
+**Do not start with (1) despite it being the largest**: it is the one that risks re-treading Retro-012,
+and the 1.93x needs confirming at these shapes *before* any kernel work, because the same measurement
+already came out the other way once. **(2) is where a first change should land** — it is a graph-level
+fix, in the exporter, for a cost onnxruntime demonstrably does not pay.
+
+**And note the LayerNorm row: loom is 3x faster there.** Nothing in this table is uniformly behind,
+which is the usual sign that the gap is specific kernels rather than a systemic disadvantage.
 
 **Not a gap, but worth knowing:** whisper pads every clip to 30 s, so an 11-second file pays the full
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
