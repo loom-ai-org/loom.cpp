@@ -108,11 +108,17 @@ in the row** — see [what these numbers are not](#what-these-numbers-are-not).
 
 | machine | arch | threads | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
 |---|---|---|---|---|---|
-| Intel Core Ultra 9 285K | x86-64 | 4 | **1.03x** | **1.01x** | 0.71x |
-| Intel Core Ultra 9 285K | x86-64 | 24 (all) | **1.17x** | 0.96x | **1.29x** |
-| AMD Ryzen 3 3250U | x86-64 | 2 (physical) | **1.02x** | **1.05x** | 0.67x |
-| AMD Ryzen 3 3250U | x86-64 | 4 (all) | 0.99x | **1.04x** | 0.72x |
-| Raspberry Pi 4B | aarch64 | 4 (all) | 0.98x | **1.08x** | 0.57x |
+| Intel Core Ultra 9 285K | x86-64 | 4 | **1.03x** | **1.01x** | 0.59x |
+| Intel Core Ultra 9 285K | x86-64 | 24 (all) | **1.17x** | 0.96x | **1.54x** |
+| AMD Ryzen 3 3250U | x86-64 | 2 (physical) | **1.02x** | **1.05x** | 0.78x |
+| AMD Ryzen 3 3250U | x86-64 | 4 (all) | 0.99x | **1.04x** | 0.76x |
+| Raspberry Pi 4B | aarch64 | 4 (all) | 0.98x | **1.08x** | 0.58x |
+
+**The ASR column was re-measured on 2026-08-24 after `ggml-0010`** (below) and is sampled differently
+from its neighbours: each ASR cell is a median over **separate process launches** rather than over runs
+inside one process. That is not a refinement, it is a correction — see
+[the note on thread placement](#what-these-numbers-are-not). **The TTS and LM columns have not had that
+treatment**, and on the two 285K rows they carry the same uncertainty.
 
 **TTS and the LM are at parity; ASR is still behind.** Most cells sit within a few percent of 1.00x,
 which on these machines is the noise floor rather than a result — read them as parity, not as wins. The
@@ -129,14 +135,33 @@ caveats below matter as much as the numbers.
   `mul_mat` has `ne1 = 1`, so this task peaks at 8 threads and plateaus after. It shows up as *spread* —
   loom ranges 24.5-28.6 tok/s over nine runs there where onnxruntime holds 27.1-27.6, so loom's best
   run wins and its typical run does not. The table reports the typical one.
-* **ASR is the one still behind, and it is now 1.4–1.8x rather than 2.4–3.6x.** Whisper's exported
-  driver used to hand the decoder the raw encoder output every step, so cross-attention K/V was
-  re-projected over all 1500 encoder frames per token — `MUL_MAT 768x1500` ran 684 times for an
-  11-second clip where the encoder itself needs 48, **57.7% of ASR runtime**, where onnxruntime computes
-  those tensors once. Exporting the projected K/V as its own topology is worth **2.4–2.6x on every
-  machine here** (on the Pi, 90.0 s to 37.4 s for the same clip). What is left is a genuine gap at four
-  threads and a **win at 24**, which is the clearest sign that what remains is thread-scaling headroom
-  rather than a second defect of the same kind.
+* **ASR is the one still behind — 1.3-1.7x at four threads, against a 1.54x win at 24.** Whisper's
+  exported driver used to hand the decoder the raw encoder output every step, so cross-attention K/V
+  was re-projected over all 1500 encoder frames per token — `MUL_MAT 768x1500` ran 684 times for an
+  11-second clip where the encoder itself needs 84, **57.7% of ASR runtime**, where onnxruntime
+  computes those tensors once. Exporting the projected K/V as its own topology is worth **2.4-2.6x on
+  every machine here** (on the Pi, 90.0 s to 37.4 s for the same clip).
+* **The whole remaining ASR gap is the ENCODER, and it is three specific kernels rather than a
+  systemic deficit.** Timed separately at one thread on the 285K, loom's encoder is 5.91 s against
+  onnxruntime's 2.38 s while its **decode loop is 1.50x FASTER** (0.65 s against 0.97 s) — the cross-KV
+  fix overshot the decoder into a win, so there is nothing left there. Attributing the encoder's gap at
+  equal call counts: `MUL_MAT` **1.93x = 66%**, layout `CONT` **33x = 16%**, `Softmax` 4.3x, GELU 5.3x
+  — and `LayerNorm`, where **loom is 3x faster than onnxruntime**. Two of those are now closed:
+  * **GELU is done.** ggml's exact-erf GELU was a scalar `erff()` libm call per element with no SIMD
+    path on any architecture; `cmake/patches/ggml-0010` replaces it with a rational approximation,
+    **9.9x on the op in model** and 14.3-21.8x standalone. End to end on whisper that is **2.1% on the
+    285K at four threads, 4.4% on the Ryzen at two, and 0.9% on the Pi** — a large kernel win that is a
+    small share of a whole transcription, which is exactly what a 3.6%-of-runtime op can be.
+  * **`SOFT_MAX` is measured out.** Its five row passes really are three too many, and rewriting them
+    is worth 1.06x on the machine that motivated it; **deleting the exp entirely is worth 0.99x**. At
+    108 MB the op is DRAM-bandwidth bound, so no kernel fixes it
+    ([Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md)).
+  * What is left is the GEMM (66%) and the layout churn (16%), neither started.
+* **Read the 285K's four-thread ASR cell as unstable, not as a 0.12 regression.** It moved 0.71x ->
+  0.59x in the same re-measurement that added `ggml-0010`, and the patch is not why: onnxruntime's own
+  time at that thread count ranges **1.07 s to 1.59 s across 18 launches, a 1.48x spread**, because
+  that part is 8 P-cores plus 16 E-cores and a process is placed once and then stays there. loom's
+  spread over the same 18 is 1.10x. Better sampling moved the median; the engines did not.
 * **loom used to stop scaling at 8 threads and go backwards; that is fixed, and the 24-thread row is
   the fix.** VITS on the 285K was 0.080 s at 8 threads and **0.191 s at 24 — the same as at one
   thread**. The cause was not in this repository: `ggml` defaults to OpenMP, so `ggml_barrier` was
@@ -176,6 +201,21 @@ run, because thermal drift on that board only ever makes a run slower and the co
 the least contaminated. The choice changes cells: loom's LM at 24 threads is bimodal (24.5-28.6 tok/s
 over nine runs, against onnxruntime's steady 27.1-27.6), so its best run takes that cell at 1.03x and
 its typical run loses it at 0.96x. **This table reports typical, not best.**
+
+**Thread placement is chosen once per PROCESS on a hybrid part, and it is worth up to 1.48x.** The
+Core Ultra 9 285K is 8 P-cores plus 16 E-cores with no SMT. A four-thread process lands on one kind or
+the other and then stays there, so **every run inside that process inherits the same luck** and a
+within-process median does not average it out: onnxruntime's whisper time at `intra_op=4` is bimodal
+across launches, ~1.07 s or ~1.57 s, and two adjacent measurements minutes apart on an idle box came
+out 1.076 s and 1.430 s. At 24 threads loom shows the same thing in a milder form — 0.994 s to 1.291 s
+over 16 launches, a 1.34x spread, which is the ASR twin of the LM spread described above.
+
+**So the ASR cells are medians over separate launches** (18 per engine on the 285K at four threads, 16
+at 24), and that is why re-measuring moved cells further than `ggml-0010` can explain. Pinning both
+engines to the same four P-cores makes each side reproducible to ~0.2% — but it is not what the rest
+of this table does, and it constrains onnxruntime more than loom (pinned to P-cores it runs *slower*,
+1.76 s, than its lucky unpinned launches), so it would not be a like-for-like fix either. **The TTS and
+LM columns have not been re-sampled this way and the two 285K rows should be read with that in mind.**
 
 **Both sides use the same estimator**, which is not a detail: every harness here warms up and reports
 a best-or-median over repeated runs in one process. `bench_lm_loom.cpp` used to time a single cold

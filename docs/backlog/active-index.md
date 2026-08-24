@@ -129,6 +129,17 @@ are not renumbered. New items continue the scheme.
   GEMM item is larger, risks re-treading Retro-012, and needs its 1.93x confirmed at *these* shapes
   first — P4.15 only ever measured VITS's, and `scripts/bench6.cpp` is aarch64-only as written.
   [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU done, two items open.*
+* [ ] **The README's TTS and LM columns need the per-launch sampling the ASR column just got.** On the
+  Core Ultra 9 285K (8 P-cores + 16 E-cores, no SMT) thread placement is chosen **once per process**
+  and then sticks, so every run inside one process inherits the same luck and a within-process median
+  does not average it out. Measured on ASR: onnxruntime at `intra_op=4` is bimodal across launches,
+  **~1.07 s or ~1.57 s, a 1.48x spread**, and loom at 24 threads spans 0.994-1.291 s over 16 launches.
+  The ASR cells were re-sampled as medians over separate launches (2026-08-24) and moved further than
+  `ggml-0010` explains; **the TTS and LM cells on both 285K rows were not, and are still single-process
+  medians.** Not a new measurement idea — it is [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md)'s
+  problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
+  (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
+  → [Epic-05 §2](../epics/epic-05-edge-performance.md)
 * [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
   carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
