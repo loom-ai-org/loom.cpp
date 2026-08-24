@@ -349,6 +349,75 @@ Harnesses: `scripts/bench_vits_loom.cpp` and, for the other two, `loom_cli` time
 `hidden / n_heads` (64) where Qwen3 decouples it to 128, and the session rejects the KV cache it
 builds. Reading the shapes off `session.get_inputs()` avoids assuming anything.
 
+### P4.18: the ASR gap is entirely the ENCODER — SCOPED 2026-08-24, not started
+
+whisper-small is the one task still behind onnxruntime (0.57-0.72x at four threads). The
+cross-attention K/V export fix bought 2.4-2.6x and closed most of it; the question is what is left.
+
+**Split it and the answer is not ambiguous.** whisper's onnxruntime export puts the encoder in its own
+graph, so the two halves can be timed directly; loom's half comes from `$LOOM_PROFILE` at **one
+thread** (see P4.14's floor trap), where `ne1 = 1500` is an encoder op and `ne1 = 1` is a decode step.
+Same clip (`jfk.wav`, 11 s), same transcript, Core Ultra 9 285K:
+
+| | loom | onnxruntime | |
+|---|---|---|---|
+| encoder | **5.91 s** (84.8%) | 2.38 s | loom **2.49x slower** |
+| decode (25 tokens) | **0.65 s** (9.3%) | 0.97 s | loom **1.50x faster** |
+| total | 6.97 s | 3.34 s | |
+
+**The decoder is already ahead and needs nothing. 100% of the remaining gap is the encoder** — and
+more than that, the gap (3.53 s) is *larger* than the encoder's whole runtime on onnxruntime. Anyone
+picking this up should stop reading the decoder.
+
+Note what this also says about the cross-KV fix: it did not merely improve the decode loop, it
+**overshot it into a win**. The item that follows is a different problem in a different graph.
+
+#### Where the encoder's 5.91 s goes
+
+| op | shape | calls | ms | share of run |
+|---|---|---|---|---|
+| `MUL_MAT` | 768 x 1500 | 84 | 1941 | 29.2% |
+| `MUL_MAT` | 64 x 1500 | 12 | 1062 | 16.0% |
+| `MUL_MAT` | 3072 x 1500 | 12 | 813 | 12.2% |
+| `MUL_MAT` | 1500 x 1500 | 12 | 755 | 11.3% |
+| `CONT` | 1500 x 64 | **324** | 471 | 7.1% |
+| `SOFT_MAX` | 1500 x 1500 | 12 | 396 | 5.9% |
+| `UNARY` | 3072 x 1500 | 12 | 273 | 4.1% |
+
+The 84 calls at `768 x 1500` are 12 layers x (Q, K, V, O, fc2) = 60, plus the 24 cross-attention K/V
+projections the export now computes once. The 25 `NORM` at `768 x 1500` are 12 layers x 2 + the final
+one — **checked, because 25 is also the token count and that coincidence looks exactly like the
+cross-KV defect. It is not one; nothing encoder-width runs per decode step.**
+
+#### Three candidates, cheapest experiment first
+
+1. **Attention is materialised rather than fused.** `MUL_MAT 1500x1500` + `SOFT_MAX 1500x1500` +
+   `MUL_MAT 64x1500` is **2.21 s, 31.8% of the whole run**, and it writes then re-reads a
+   `1500 x 1500 x 12` F32 score matrix — **108 MB per layer**, twelve times, none of which fits in the
+   36 MB L3. onnxruntime has fused `MultiHeadAttention`/`Attention` kernels that tile this and never
+   materialise it. *Test:* take onnxruntime's own per-op profile (the recipe is in this epic's
+   operating notes) and check whether those three ops appear at all or collapse into one fused node.
+   That is a read of an existing profile, costs nothing, and decides whether this is the mechanism
+   before any kernel is written.
+2. **Layout churn around attention.** 324 `CONT` of `1500 x 64` is 471 ms of **pure data movement, 27
+   per layer**, and copies are the one thing a graph can often be re-shaped to avoid. *Test:* dump the
+   encoder topology and find which `permute`/`transpose` each `CONT` is servicing; ask whether the
+   exporter can emit Q/K/V already in the layout attention wants. This is an **exporter** change if it
+   works, which is where per-model complexity belongs (ADR-003).
+3. **GEMM efficiency at the encoder's shapes.** `768 x 1500` alone is 1.94 s. P4.15 measured `ggml`'s
+   F32 GEMM against MLAS at *VITS vocoder* shapes and fixed it there; these shapes are much larger and
+   were never measured. *Test:* `scripts/bench6.cpp` with the seven shapes above, against the same
+   MLAS baseline. **Do not assume P4.15's conclusion carries** — Retro-012 records that tinyBLAS now
+   beats a hand-written 4x4 *at the shapes it was measured on*.
+
+**(1) is the likely answer and (2) is the cheapest real change**; (3) is the one that would be
+re-treading measured ground, so it should be entered last and only if the profile read in (1) says
+attention is not the story.
+
+**Not a gap, but worth knowing:** whisper pads every clip to 30 s, so an 11-second file pays the full
+1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
+model-semantics change (the positional embedding is fixed at 1500), so it is not part of this item.
+
 ### Operating notes: benchmarking
 
 **Machines.** The Pi is **`192.168.1.35`** — the `rpi4` name does not resolve. The workstation is
