@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-23
+last_updated: 2026-08-24
 ---
 
 # Epic-05: Edge CPU Performance
@@ -100,67 +100,222 @@ VITS, Core Ultra 9 285K, median of 7:
 (0.087 s at 4 threads, 0.075 s at 24), so this is loom's curve and not the workload's. The same shape
 shows in the LM: 21.8 tok/s at 4 threads, 10.6 at 24.
 
-The shapes are small — a vocoder convolution is 100-300 positions, and a decode step's `mul_mat` has
-`ne1 = 1` — so past a point every added thread is a barrier rather than a worker. **ggml's default of 4
-happens to sit near the good part of this curve**, which is why nothing noticed, and it is the reason
-the default was left alone when the override was added: raising it to the core count would be a
-regression on exactly the machines it looks like it should help.
+**Resolved below: it was libgomp's default wait policy, and the fix is `GGML_OPENMP=OFF`.** The table
+above is the *broken* curve, kept because it is what the investigation started from. ggml's default of
+4 happened to sit near the good part of it, which is why nothing noticed for so long.
 
-#### P4.17: the per-op profile, and what it rules out
+#### P4.17: it was libgomp's default wait policy — RESOLVED 2026-08-23
 
-`$LOOM_PROFILE` over one VITS synthesis, same binary, thread count the only variable:
+**loom builds ggml with `GGML_OPENMP=ON`.** That is ggml's own default
+(`ggml/CMakeLists.txt:245`); loom's CMake never mentioned OpenMP, so it was inherited, never chosen.
 
-| op | calls | 4 threads | 8 | 24 |
+In that configuration `ggml_barrier` is `#pragma omp barrier` (`ggml-cpu.c:575`, `582`) and ggml runs one
+after **every non-empty graph node** (`ggml-cpu.c:3370`) — **2520** of them in a VITS synthesis (4240
+nodes, less the 1720 `RESHAPE`/`VIEW`/`PERMUTE` that `ggml_op_is_empty` skips). **libgomp's default
+wait policy makes every thread sleep on a futex at every one of them.**
+
+That is not an inference. 5 syntheses at 24 threads, `getrusage(RUSAGE_CHILDREN)`:
+
+| build | voluntary ctx switches | user CPU | median |
+|---|---|---|---|
+| `GGML_OPENMP=ON`, as shipped | **334,609** | 2.90 s | 0.2050 s |
+| `GGML_OPENMP=ON` + `OMP_WAIT_POLICY=active` | **101** | 13.82 s | 0.0314 s |
+| `GGML_OPENMP=OFF` (ggml's threadpool, `poll = 50`) | **160** | 10.16 s | 0.0500 s |
+
+334609 / 5 / 24 = **2789 sleeps per thread per synthesis** against 2520 barrier-carrying nodes — one
+per node, plus the few ops that barrier internally.
+
+**The curve with the fix.** VITS, same box, median of 7:
+
+| threads | 1 | 2 | 4 | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|---|
+| `GGML_OPENMP=ON`, as shipped | 0.186 | 0.114 | 0.071 | 0.079 | 0.087 | 0.118 | 0.189 |
+| + `OMP_WAIT_POLICY=active` | 0.195 | 0.159 | 0.064 | 0.040 | 0.040 | 0.036 | **0.031** |
+| `GGML_OPENMP=OFF` | 0.186 | 0.111 | 0.064 | 0.041 | 0.042 | 0.037 | **0.040** |
+
+**4.8x at 24 threads from a build flag, and the curve is monotonic again.** The causal-LM decode loop
+agrees — `infer_with_past` tok/s, best of 5:
+
+| threads | 1 | 4 | 8 | 16 | 24 |
+|---|---|---|---|---|---|
+| as shipped | 9.66 | 21.9 | 24.7 | 14.0 | 11.0 |
+| + `active` | 11.0 | 23.4 | 29.8 | 28.4 | 26.6 |
+| `GGML_OPENMP=OFF` | 10.0 | 23.5 | 29.6 | 24.4 | 19.1 |
+
+Nothing regresses at any thread count on either workload. A single LM run at 4 threads showed 17.7
+tok/s for both fixed arms; repeated five times it is 23.4–23.5 against 21.9. **Benchmark the LM more
+than once — its first run is cold by several tok/s.**
+
+#### Which of the three candidates it was, and what that costs the other two
+
+It was **(3), alone** — the one ranked last and called cheapest to rule out.
+
+* **(3) wake-up latency — CONFIRMED.** `GOMP_SPINCOUNT=100` reproduces the broken curve exactly
+  (0.068 / 0.070 / 0.128 / 0.138 at 4 / 8 / 16 / 24); `GOMP_SPINCOUNT=300000`, which is libgomp's own
+  documented default, reproduces the fixed one. Every value at or above 300000 is identical.
+* **(1) barrier cost — real, and a fifth of it.** Microbenchmarked directly: **12591 ns per barrier at
+  24 threads against 1187 ns** with `active` (fork-join 36139 against 2853). 2520 barriers × 11404 ns
+  = **28.7 ms of a ~124 ms delta**. The rest is threads sleeping *inside* ops, which is why
+  `CONV_TRANSPOSE_1D` loses 89 ms over **6** calls — 6 barriers cannot buy that.
+* **(2) `n_tasks` not clamped by work size — NOT the mechanism.** Nothing was clamped and the curve
+  was fixed anyway. The earlier claim that "(1) and (2) are the same fix from different ends and are
+  the likely answer together" was wrong: **no ggml patch to `ggml_get_n_tasks` is needed.**
+* **Heterogeneous cores — NOT the mechanism.** The box is 8 P-cores + 16 E-cores and the peak sat at
+  exactly 8, which made this look compelling. `OMP_PROC_BIND=close/spread` changes nothing once
+  spinning is on; `bind=close` *without* spinning is far worse (0.456 s at 24).
+
+**The candidate-(3) text above described the wrong threadpool.** ggml's hybrid poll/sleep loop
+(`ggml-cpu.c:3421`, `threadpool->poll`) is inside `#ifndef GGML_USE_OPENMP` — **compiled out of every
+build loom ships**. The spin policy that mattered was libgomp's, and `$GGML_CPU_WAIT_POLICY` does not
+exist. When a threading question comes up, **check which threadpool is actually compiled in first**;
+this one cost a full round of reading dead code.
+
+#### ggml knows about this, and only fixes it for Intel's OpenMP
+
+`ggml-cpu.c:4114` — in the pinned v0.19.0, inside `#ifdef GGML_USE_OPENMP`:
+
+```c
+//if (!getenv("OMP_WAIT_POLICY")) {
+//    // set the wait policy to active, so that OpenMP threads don't sleep
+//    setenv("OMP_WAIT_POLICY", "active", 0)
+//}
+
+if (!getenv("KMP_BLOCKTIME")) {
+    // set the time to wait before sleeping a thread
+    setenv("KMP_BLOCKTIME", "200", 0); // 200ms
+}
+```
+
+**`KMP_BLOCKTIME` is Intel/LLVM `libomp`'s knob and GNU `libgomp` ignores it entirely**, so every
+gcc-built ggml — which is what Debian, the wheels, and the Pi all produce — gets no mitigation at all.
+The `OMP_WAIT_POLICY` line that *would* have covered libgomp is commented out, and it could not have
+worked from there anyway: libgomp reads that variable in its **load-time constructor**, long before
+`ggml_init` runs.
+
+This is independent confirmation of the diagnosis, and it is the reason the fix cannot be an
+environment variable set from inside the library.
+
+#### Why the fix is the build flag and not the environment variable
+
+`OMP_WAIT_POLICY=active` is the fastest arm and is still the wrong answer:
+
+* **A library cannot set it.** libgomp reads it in its load-time constructor, before any loom code
+  runs, so `setenv` from inside the engine is too late.
+* **It spins forever**, including between inferences — 13.82 s of CPU against 2.90 s for a run that
+  takes 0.16 s of wall time.
+
+ggml's own threadpool spins a **bounded** ~6.5M rounds (`poll = 50`, `ggml.c:8011`) and then sleeps,
+so it spins through a graph's barriers and still sleeps between calls. It also takes libgomp out of
+the wheels, which matters past speed: loom-py is imported alongside numpy and torch, which bring their
+own OpenMP runtimes, and two in one process is a known hazard.
+
+**If the residual 24-thread gap (0.040 against 0.031 s) is ever worth closing**, the follow-up is a
+tenth ggml patch adding `ggml_backend_cpu_set_threadpool` to the CPU backend's registry proc-address
+table (`ggml-cpu.cpp:648`). It is absent today, so the `GGML_BACKEND_DL` build the wheels ship
+(ADR-009) cannot reach it and `poll` is not tunable in-process — the same constraint that shaped
+`apply_cpu_threads`.
+
+#### Scope: this is a many-core fix
+
+**A Pi 4 at its 4 cores is unchanged**, measured both ways with the arms interleaved and cooling gaps
+between them so each pays the same thermals (the Pi throttles ~33% under sustained load):
+`OMP_WAIT_POLICY=active` is 1.00x (1.108 s against 1.109 s), and `GGML_OPENMP=OFF` against `ON`, same
+source tree, three rounds, is **1.011 / 1.015 / 0.997**. At 4 threads the whole barrier bill is a
+couple of ms of a 1.1 s synthesis.
+
+That "unchanged" is the result the change needed: ggml's threadpool spins its workers where libgomp
+slept them, and the worry was that on a 4-core box three spinning workers would starve the main thread
+between graph computes. They do not. The fix is worth only ~1.1x at ggml's default of 4, so raising
+that default is a separate question — **and it now has its own benchmark, below.**
+
+### What the default thread count should be, now that the curve is monotonic
+
+The default was left at ggml's 4 because raising it "would be a regression on exactly the machines it
+looks like it should help". **That objection was about the libgomp collapse and no longer holds.**
+Re-measured on the fixed engine, best of 3 per point, `$LOOM_N_THREADS` the only variable.
+
+**Core Ultra 9 285K — 24 physical cores, no SMT:**
+
+| threads | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 20 | 24 |
+|---|---|---|---|---|---|---|---|---|---|
+| TTS (s) | 0.2887 | 0.1541 | 0.0638 | 0.0481 | 0.0411 | 0.0411 | 0.0358 | 0.0346 | **0.0323** |
+| LM (tok/s) | 11.29 | 15.38 | 23.24 | 27.37 | **29.59** | 27.93 | 27.21 | 26.93 | 27.45 |
+| ASR (s) | 6.654 | 3.973 | 2.446 | 1.631 | 1.430 | 1.249 | 1.153 | 1.070 | **1.014** |
+
+**Ryzen 3 3250U — 2 physical cores, SMT, so 4 logical:**
+
+| threads | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|
-| `CONV_2D` | 468 | 192 ms | 174 ms | **485 ms** |
-| `ADD` | 1192 | 39 ms | 52 ms | **186 ms** |
-| `MUL` | 936 | 14 ms | 22 ms | **87 ms** |
-| `CONV_TRANSPOSE_1D` | 12 | 30 ms | 38 ms | **158 ms** |
+| TTS (s) | 0.6400 | **0.4339** | 0.5725 | 0.5576 |
+| LM (tok/s) | 6.04 | **6.71** | 6.67 | 6.26 |
+| ASR (s) | 17.52 | **11.29** | 11.54 | 12.30 |
 
-**It is not one slow op, and it is not the convolutions.** *Every* op degrades, and the ones with the
-least work per call degrade worst: `ADD` is 4.8x worse at 24 threads than at 4 and `MUL` 6.3x, over
-1192 and 936 calls of a few hundred elements each. `CONV_2D` — by far the most work per call — degrades
-least in relative terms. Cost that grows with thread count and shrinks with work per call is the
-signature of **per-op synchronisation**, not of the work itself.
+The 2-against-4 comparison was then re-measured on its own, median of 5 interleaved rounds rather than
+one sweep point, because this box is a two-core laptop that also runs the session driving it and its
+single-point numbers move by up to 10%: **TTS 0.4230 against 0.5038 (1.19x), LM 6.81 against 6.59
+(1.03x), ASR 11.21 against 11.17 (1.00x — unchanged).** The sweep row above overstated the ASR and LM
+gains; the shape of the answer is the same.
 
-Only `CONV_2D` is faster at 8 than at 4; everything else is already worse by 8, which is why the
-end-to-end curve peaks there rather than higher.
+**The answer is the PHYSICAL CORE COUNT, and the two machines only agree once it is put that way.**
+The 285K wants 24 — every logical CPU, because it has no SMT. The Ryzen wants **2, not its 4 logical
+CPUs**, and its two extra SMT threads buy nothing on any task and cost on two. "Use every CPU" would be right on one machine and a
+1.28x TTS regression on the other; "use every physical core" is right on both.
 
-**Three candidates, and the experiment that separates them:**
+Against today's default of 4: the 285K gains **1.98x on TTS, 2.41x on ASR, 1.18x on the LM**, and the
+Ryzen gains **1.19x on TTS and 1.03x on the LM** by going *down* to 2, with ASR unchanged. A Pi 4
+(4 physical cores) does not move.
 
-1. **Barrier cost per op.** ggml runs `ggml_barrier` per op per graph node; at 24 threads that is a
-   24-way synchronisation for an `ADD` over a few hundred floats. *Test:* count nodes and multiply by a
-   measured barrier cost at each thread count — a microbenchmark of `ggml_barrier` alone against thread
-   count predicts the whole delta if this is it.
-2. **`n_tasks` not clamped by work size.** `ggml_get_n_tasks` hands most elementwise ops the full thread
-   count regardless of tensor size, so a 300-element `ADD` is split 24 ways. *Test:* clamp `n_tasks` to
-   `max(1, nelements / T)` for a threshold `T` and re-run the table; this is a ggml patch and would join
-   `cmake/patches/` if it works.
-3. **Thread wake-up latency.** ggml's CPU threadpool spins then sleeps; more threads means more wakeups
-   per op. *Test:* `GGML_CPU_WAIT_POLICY`/spin settings, or pin with `taskset` and compare.
+**On the Ryzen this does not move the published ratios, because onnxruntime prefers 2 threads too** —
+it gains 1.17x / 1.02x / 1.07x over the same change, so loom's ASR column actually gets *worse*
+(0.72x -> 0.67x) for want of a gain onnxruntime does get. **The physical-core rule is a property of
+these CPUs rather than of loom**, which is worth saying out loud before it is quoted as an engine win.
 
-**(1) and (2) are the same fix from different ends** and are the likely answer together; (3) is
-cheapest to rule out and should go first. **Do not raise the default thread count until this is
-understood** — ggml's 4 sits near the peak of the curve by luck, and a "use all cores" default would
-be a regression on exactly the machines it looks like it should help.
+Two things this measurement is not:
 
+* **Nothing goes backwards any more, but the LM still has a preference.** It peaks at 8 on the 285K and
+  sits on a plateau after — 27.45 tok/s at 24 against 29.59 at 8, **7% off its own optimum rather than
+  the 2.7x collapse it used to be**. A single default cannot serve all three tasks perfectly and does
+  not need to.
+* **Every number is one inference at a time on an idle machine.** A host running several loom instances
+  concurrently, or sharing the box, would have each claim every core; ggml's conservative 4 is a
+  reasonable default for that world and a bad one for this. Raising the default is a **policy** choice
+  about which world loom is for, not a further measurement.
+
+**Low thread counts on a hybrid part are noisy, and the noise is placement.** On the 285K's 8 P-cores +
+16 E-cores a 1-, 2- or 4-thread run can be scheduled entirely onto E-cores: one sweep read 0.0926 s at
+4 threads where a repeat read 0.0638 s. Hence best-of-3 above, and **a single measurement below ~6
+threads on a hybrid CPU should not be trusted.**
 ### Three tasks, not one — and the convolutional one is the good one
 
 VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
-Measured the same day on the same box, F32 on both sides, 4 threads on both sides:
+**Re-measured 2026-08-24 with both engines run back to back on each machine**, F32 on both sides:
 
 | machine | threads | TTS | LM | ASR |
 |---|---|---|---|---|
-| Core Ultra 9 285K | 4 | **1.25x** | **1.16x** | 0.41x |
-| Core Ultra 9 285K | 24 | 0.36x | 0.38x | 0.56x |
-| Ryzen 3 3250U | 4 (all) | **1.06x** | 0.87x | 0.33x |
-| Raspberry Pi 4B | 4 (all) | **1.00x** | 0.98x | 0.28x |
+| Core Ultra 9 285K | 4 | **1.03x** | **1.01x** | 0.71x |
+| Core Ultra 9 285K | 24 (all) | **1.17x** | 0.96x | **1.29x** |
+| Ryzen 3 3250U | 2 (physical) | **1.02x** | **1.05x** | 0.67x |
+| Ryzen 3 3250U | 4 (all) | 0.99x | **1.04x** | 0.72x |
+| Raspberry Pi 4B | 4 (all) | 0.98x | **1.08x** | 0.57x |
 
 `>1.00x` is loom faster. The full table with its methodology and caveats is in the
-[README](../../README.md#performance-against-onnxruntime); the two that change how it should be read
+[README](../../README.md#performance-against-onnxruntime); the ones that change how it should be read
 are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
-1.86x faster on VITS, and against it the 4-thread x86 wins become losses), and that the Pi row is taken
+1.86x faster on VITS, and against it the x86 TTS wins become losses), and that the Pi row is taken
 cooled and interleaved because that board drifts 33% when it is not.
+
+**The estimator is the median** of repeated runs on both sides, except the Pi row, which reports the
+FASTEST run — on that board thermal drift only ever makes a run slower, so the coolest run is the least
+contaminated one. That choice is not cosmetic: loom's LM at 24 threads is bimodal (24.5-28.6 tok/s
+across nine runs, against onnxruntime's steady 27.1-27.6), so its best run wins the cell at 1.03x and
+its typical run loses it at 0.96x. The table reports the typical one.
+
+**The previous version of this table was wrong in both directions and is worth keeping as a warning.**
+It read 1.25x / 1.16x / 0.41x for the 285K at 4 threads. Two independent errors made it so: its
+onnxruntime figures could not be reproduced by any harness in this repository, and its loom LM figure
+came from a harness that timed ONE COLD generation where the onnxruntime side warmed up — two
+different estimators, worth 5-7%. **Ratios carried forward from a previous table cannot be trusted;
+re-measure both sides or quote neither.**
 
 **That LM row was the engine calling the wrong function, and it is fixed.** `loom::text::generate`
 called `infer` unconditionally. Every generated causal-LM driver exports **two** entry points — `infer`,
@@ -180,7 +335,7 @@ code lost to reading a profile.
 | `infer_with_past` (now selected) | **2.98 s** | **21.78 tok/s** |
 | onnxruntime | 3.33 s | 19.21 tok/s |
 
-**So loom is at parity on all three tasks**, and the LM was never a kernel problem. The tell was the
+**So the LM reached parity, and it was never a kernel problem** (ASR did not — see the re-measured table above, where it is still 1.4-1.8x behind at four threads). The tell was the
 *shape* of the curve, not its height: onnxruntime's cost per token is flat (46.7 ms at 64 tokens, 45.2
 at 128) and loom's was not (146 -> 305 ms), which is what O(n^2) looks like from outside.
 
