@@ -1,0 +1,84 @@
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -492,8 +492,37 @@ class tinyBLAS {
+     }
+ 
+     bool matmul(int64_t m, int64_t n) {
+-        if (k % KN != 0)
++        // WHY THE CONTRACTION IS SPLIT HERE, and why only the F32 path splits it. `k % KN` rejected
++        // the WHOLE matmul, exactly as `m % 4` did before the row tail below -- and k is the
++        // CONTRACTION, so in attention it is a sequence length, i.e. a number nothing rounds.
++        // whisper's encoder contracts A@V over its 1500 frames: 1500 % 8 == 4 on AVX2 and
++        // 1500 % 16 == 12 on AVX-512, so that GEMM never entered this file at all and got ggml's
++        // generic one-output-element-per-call kernel instead. NEON has KN == 4 and 1500 % 4 == 0,
++        // which is why an aarch64-only bench could not have found this.
++        //
++        // Measured at whisper-small's own A@V shape -- m=64, n=1500, k=1500, 12 heads -- one thread,
++        // Ryzen 3 3250U (AVX2): **176.2 -> 81.8 ms, 2.15x**. In model (jfk.wav, $LOOM_PROFILE at one
++        // thread, two interleaved runs per arm) the `MUL_MAT 64 x 1500` bucket goes 2240/2460 ->
++        // 1119/1136 ms and no other bucket moves. A k sweep at that shape shows the cliff is the
++        // divisibility and nothing else: k=1496 44.5 GFLOP/s, k=1500 20.8, k=1504 47.0.
++        //
++        // The tail is <= KN-1 scalar products per output, so it cannot lose to the status quo: the
++        // alternative for these shapes was the generic kernel for ALL of k.
++        //
++        // Accuracy is unchanged in kind. Against a double-precision reference over every k in [1, 40]
++        // plus 63/64/65 and 1496-1504, the worst relative error is 2.6e-05, and the aligned k values
++        // sit in the same place as the unaligned ones (k=1496 2.1e-05, k=1500 2.3e-05) -- it is f32
++        // accumulation noise, not a dropped term. loom's whisper gate (`test_e2e_whisper_mil_export`,
++        // encoder against HuggingFace) moves max/absmax 4.19e-04 -> 4.34e-04 against a 1e-3 limit,
++        // mean_abs_diff 9.36e-06 -> 9.33e-06, and passes 67/67 either way.
++        //
++        // Scoped to F32 because the tail is a scalar multiply and the other instantiations carry
++        // ggml_fp16_t / ggml_bf16_t, which do not convert that way. Those keep the old rejection.
++        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
++        if (k % KN != 0 && !k_tail_f32)
+             return false;
++        if (k < KN)
++            return false;                 // fewer than one vector of contraction: let ggml have it
+         // WHY THE ROW COUNT IS SPLIT HERE. Every tile below is 4 rows tall, so the schedule chooser
+         // that follows only accepts m divisible by 4 -- and when it does not, this function returns
+         // false and ggml computes the ENTIRE matmul with its generic one-output-element-per-call
+@@ -636,7 +665,8 @@ class tinyBLAS {
+         auto Aat = [&](int64_t i, int64_t l) { return A + lda * (ii + i) + l; };
+         auto Bat = [&](int64_t j, int64_t l) { return B + ldb * (jj + j) + l; };
+ #endif
+-        const int64_t kk = k;
++        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
++        const int64_t kk = k_tail_f32 ? k - (k % KN) : k;
+         D Cv[RN][RM] = {};
+         for (int64_t l = 0; l < kk; l += KN) {
+             // help compiler for op order.
+@@ -664,9 +694,29 @@ class tinyBLAS {
+                 }
+             }
+         }
+-        for (int64_t j = 0; j < RN; ++j)
+-            for (int64_t i = 0; i < RM; ++i)
+-                C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
++        // TWO EPILOGUES, and the branch is outside the tile deliberately. Folding the tail loop into
++        // one epilogue -- where it is statically empty whenever k % KN == 0 -- costs the SMALL-k
++        // shapes 30%: whisper's QK^T at k = 64 went 154 -> 201 ms, because the extra live values
++        // change how the accumulators are spilled around the hsum. At k = 64 the epilogue is a large
++        // fraction of eight loop iterations, so the aligned case has to keep exactly the code it had.
++        if (!k_tail_f32 || kk == k) {
++            for (int64_t j = 0; j < RN; ++j)
++                for (int64_t i = 0; i < RM; ++i)
++                    C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
++            return;
++        }
++        if constexpr (k_tail_f32) {
++            for (int64_t j = 0; j < RN; ++j) {
++                for (int64_t i = 0; i < RM; ++i) {
++                    float acc = hsum(Cv[j][i]);
++                    for (int64_t l = kk; l < k; ++l) {
++                        acc += *(const float *)(const void *) Aat(i, l) *
++                               *(const float *)(const void *) Bat(j, l);
++                    }
++                    C[ldc * (jj + j) + (ii + i)] = acc;
++                }
++            }
++        }
+     }
+ 
+     template <int RM, int RN, int BM>

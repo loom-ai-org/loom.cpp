@@ -349,7 +349,10 @@ Harnesses: `scripts/bench_vits_loom.cpp` and, for the other two, `loom_cli` time
 `hidden / n_heads` (64) where Qwen3 decouples it to 128, and the session rejects the KV cache it
 builds. Reading the shapes off `session.get_inputs()` avoids assuming anything.
 
-### P4.18: the ASR gap is entirely the ENCODER — GELU DONE 2026-08-24, two items left
+### P4.18: the ASR gap is the ENCODER'S ATTENTION and a loop-invariant copy in the DECODER
+
+*(GELU done 2026-08-24; the `k % KN` GEMM cliff done 2026-08-24 as `ggml-0011`; the encoder/decoder
+split below was WRONG in the first version of this section and is corrected here.)*
 
 whisper-small is the one task still behind onnxruntime (0.57-0.72x at four threads). The
 cross-attention K/V export fix bought 2.4-2.6x and closed most of it; the question is what is left.
@@ -359,30 +362,33 @@ graph, so the two halves can be timed directly; loom's half comes from `$LOOM_PR
 thread** (see P4.14's floor trap), where `ne1 = 1500` is an encoder op and `ne1 = 1` is a decode step.
 Same clip (`jfk.wav`, 11 s), same transcript, Core Ultra 9 285K:
 
-| | loom | onnxruntime | |
-|---|---|---|---|
-| encoder | **5.91 s** (84.8%) | 2.38 s | loom **2.49x slower** |
-| decode (25 tokens) | **0.65 s** (9.3%) | 0.97 s | loom **1.50x faster** |
-| total | 6.97 s | 3.34 s | |
+| | loom, as first published | **corrected** | onnxruntime | |
+|---|---|---|---|---|
+| encoder | 5.91 s (84.8%) | **5.46 s** | 2.38 s | loom **2.29x slower** |
+| decode (25 tokens) | 0.65 s (9.3%) | **1.10 s** | 0.97 s | loom **1.14x slower** |
+| total | 6.97 s | 6.97 s | 3.34 s | |
 
-**The decoder is already ahead and needs nothing. 100% of the remaining gap is the encoder** — and
-more than that, the gap (3.53 s) is *larger* than the encoder's whole runtime on onnxruntime. Anyone
-picking this up should stop reading the decoder.
+**Read the corrected column.** The first version of this table put the whole `CONT 1500 x 64` bucket
+(471 ms) in the encoder, on the reasoning that `ne1 = 1500` is an encoder op and `ne1 = 1` is a decode
+step. That bucket's `ne1` is **64**, so it is neither, and it was assigned by eye. It is the decoder's:
+**454 of those 471 ms are 26 executions of the decode graph**, and only 17 ms are the encoder's own.
+See "the layout bucket was the decoder all along" below, which has the node names.
 
-Note what this also says about the cross-KV fix: it did not merely improve the decode loop, it
-**overshot it into a win**. The item that follows is a different problem in a different graph.
+So **the decoder is not ahead, and the claim that it "needs nothing" was wrong** — it is 1.14x behind,
+and 41% of it is one removable memcpy. The encoder is still where most of the gap is (3.08 s of 3.63 s)
+and is still the place to start, but not to the exclusion of the other graph.
 
 #### Where the encoder's 5.91 s goes
 
-| op | shape | calls | ms | share of run |
-|---|---|---|---|---|
-| `MUL_MAT` | 768 x 1500 | 84 | 1941 | 29.2% |
-| `MUL_MAT` | 64 x 1500 | 12 | 1062 | 16.0% |
-| `MUL_MAT` | 3072 x 1500 | 12 | 813 | 12.2% |
-| `MUL_MAT` | 1500 x 1500 | 12 | 755 | 11.3% |
-| `CONT` | 1500 x 64 | **324** | 471 | 7.1% |
-| `SOFT_MAX` | 1500 x 1500 | 12 | 396 | 5.9% |
-| `UNARY` | 3072 x 1500 | 12 | 273 | 4.1% |
+| op | shape | calls | ms | share of run | |
+|---|---|---|---|---|---|
+| `MUL_MAT` | 768 x 1500 | 84 | 1941 | 29.2% | |
+| `MUL_MAT` | 64 x 1500 | 12 | 1062 | 16.0% | |
+| `MUL_MAT` | 3072 x 1500 | 12 | 813 | 12.2% | |
+| `MUL_MAT` | 1500 x 1500 | 12 | 755 | 11.3% | |
+| `CONT` | 1500 x 64 | **324** | 471 | 7.1% | *(not the encoder's — see below)* |
+| `SOFT_MAX` | 1500 x 1500 | 12 | 396 | 5.9% | |
+| `UNARY` | 3072 x 1500 | 12 | 273 | 4.1% | |
 
 The 84 calls at `768 x 1500` are 12 layers x (Q, K, V, O, fc2) = 60, plus the 24 cross-attention K/V
 projections the export now computes once. The 25 `NORM` at `768 x 1500` are 12 layers x 2 + the final
@@ -421,21 +427,16 @@ un-profiled 2.376 s encoder (profiling costs it ~1.18x, so only shares are used)
 above by reading onnxruntime's own profile. The ordering below then put GELU *third*, as the small
 safe one — and it turned out to be the only one of the three that was a kernel defect at all.
 
-1. **GEMM efficiency at the encoder's shapes — 66% of the gap. STILL OPEN, still the largest.** Same
-   call count, **1.93x slower**. P4.15 measured `ggml`'s F32 GEMM against MLAS at *VITS vocoder*
-   shapes and fixed it there; the encoder's are far larger (`768 x 1500`, `3072 x 1500`,
-   `1500 x 1500`) and were never measured. **P4.15's conclusion does not carry to shapes it never
-   saw**, and Retro-012's "the GEMM micro-kernel is done" verdict is scoped to those shapes.
-   *Test:* `scripts/bench6.cpp` at the seven shapes in the table above, against MLAS — note bench6 is
-   **aarch64-only** as written, so this needs an x86 arm before it can be run on the machine the
-   profile came from.
-2. **Layout churn — 16%. STILL OPEN, still the cheapest real change.** 324 `CONT` of `1500 x 64`
-   against onnxruntime's 97 `Transpose`/`Reshape`: **3.3x as many layout ops and 33x the cost**, which
-   says ggml is *materialising* copies where onnxruntime is re-striding views. 27 per layer. *Test:*
-   dump the encoder topology and find which `permute` each `CONT` is servicing; ask whether the
-   exporter can emit Q/K/V in the layout attention already wants. An **exporter** fix if it works
-   (ADR-003) — which also means a whisper re-export and a fixture refresh, so it is not free at
-   release time.
+1. **GEMM efficiency at the encoder's shapes — "66% of the gap". HALF DONE, and the premise was
+   wrong.** The 1.93x is an average over four shapes that do not behave alike, and splitting
+   onnxruntime's own `MatMul` time by shape (which the first pass did not do) shows loom's dense GEMMs
+   are **within 10-12% of MLAS** and the whole matmul gap is the two batched attention matmuls. One of
+   those, `A@V`, turned out never to have entered tinyBLAS at all — see "`k % KN` rejected the whole
+   matmul" below, now shipped as `ggml-0011`. `QK^T` at `k = 64` is the piece still open.
+2. **Layout churn — "16%". NOT AN ENCODER ITEM.** The 324 `CONT` of `1500 x 64` are 12 encoder nodes
+   and **312 executions of the decode graph**. See "the layout bucket was the decoder all along" —
+   it is a loop-invariant transform of a constant, and the fix is in the exporter's `cross_kv` phase,
+   not in the encoder's layout.
 3. **`SOFT_MAX` and GELU — 18% together. GELU IS DONE; SOFT_MAX IS MEASURED OUT.** These were put last
    as the safe pair, on the reasoning that both are "plain elementwise kernels at 4.3x and 5.3x". Only
    half of that reasoning survived contact with a bench.
@@ -550,6 +551,136 @@ elements is a number no single core reaches by streaming.
 **And note the LayerNorm row: loom is 3x faster there.** Nothing in this table is uniformly behind,
 which is the usual sign that the gap is specific kernels rather than a systemic disadvantage.
 
+#### The layout bucket was the decoder all along
+
+`$LOOM_PROFILE` buckets by `(op, ne0, ne1)` and nothing else, so **no bucket in its report says which
+graph it came from**. Patching `profile.cpp` to also print `node->name` settles it in one run
+(whisper-small, `jfk.wav`, one thread, Ryzen 3 3250U):
+
+```
+151.3 ms  x27  CONT  xv_0 (reshaped) (permuted) (permuted) (cont)  ne=1500,64,12,1
+147.1 ms  x27  CONT  xv_1 (reshaped) (permuted) (permuted) (cont)  ne=1500,64,12,1
+   ... twelve of these, one per decoder layer ...
+```
+
+`xv_N` is a **decoder graph input** — the cross-attention V that the cross-KV fix already made
+constant for the whole utterance. The decoder re-materialises its transpose **every decode step, in
+every layer**: 12 x 4.6 MB = **55 MB of memcpy per token**. The chain is nodes 42-44 of the decoder
+topology (`RESHAPE(xv_0) -> PERMUTE(0,2,1,3) -> PERMUTE(1,0,2,3) -> CONT`), and the `CONT` is genuinely
+required — a double permute leaves `nb[0] != type_size`, which `ggml_mul_mat` will not take.
+
+**The count is exact arithmetic on the published figure, not a re-measurement.** 324 = 12 encoder nodes
++ 12 layers x 26 decoder executions (25 tokens plus the prompt prefill). The run here produced 26
+tokens and 336 = 12 + 12 x 27. So on the 285K, **454 of the 471 ms are the decode loop**.
+
+At one thread on the dev box the twelve nodes are **1730 ms of a 19.28 s run — 9.0% of the whole
+transcription and 47% of the decode loop**, larger than the LM head (352 ms) and larger than every
+per-step projection put together (694 ms).
+
+**The fix is one wrapper.** `_WhisperCrossKvWrapper.forward` (`loom-exporter/whisper_export.py:147`) is
+`tuple(proj(xa) for proj in self.projs)` — a traced PyTorch module. Emitting the V half already
+head-split and transposed makes the decoder's chain a no-op and the copy happen twelve times per
+utterance instead of 324. Its own docstring already anticipates the cost ("the copy is not free,
+~110 MB per step") — the profile says what actually survived is the V half, 55 MB per step, and that
+it is removable. A whisper re-export and a fixture refresh, so not free at release time (ADR-003).
+
+**And the general lesson, which is Retro-012's shape again:** a bucket keyed on `(op, ne0, ne1)` cannot
+tell you which graph it is in, and `ne1 = 1500 means encoder` only classifies buckets whose `ne1` is
+1500 or 1. This one's was 64. The `NORM` coincidence in the same table *was* checked; this one was not.
+
+#### `k % KN` rejected the whole matmul — DONE (`ggml-0011`)
+
+Splitting onnxruntime's encoder profile by input shape — one thread, same clip, same box, its numbers
+carrying ~1.18x profiling inflation, loom's from `$LOOM_PROFILE`, the `768 x 1500` bucket apportioned
+by FLOPs to strip the 24 `cross_kv` calls so it is 96 against 96:
+
+| Ryzen 3 3250U, 1 thread | loom | onnxruntime | ratio |
+|---|---|---|---|
+| Q/K/V/O + fc2 (60 calls) | 4866 ms | 4434 ms | **1.10x** |
+| fc1 (12) | 2493 ms | 2235 ms | **1.12x** |
+| `QK^T` (12) | 2570 ms | 1193 ms | **2.15x** |
+| `A@V` (12) | 2638 ms | 1185 ms | **2.23x** |
+| `Softmax` | 949 ms | 515 ms | 1.84x |
+| GELU | 77 ms | 206 ms | **0.37x** |
+| LayerNorm | ~90 ms | 176 ms | **0.51x** |
+| conv frontend | ~200 ms | 176 ms | 1.14x |
+
+**The dense GEMMs are not the problem.** P4.15 finished that job: 1.10-1.12x of MLAS. The entire
+matmul gap — 2830 ms, **75% of the encoder gap** — is the two batched attention matmuls. The 1.93x in
+the earlier table is an average that hides this, and "GEMM efficiency at the encoder's shapes" as an
+item was aimed at the wrong half of it.
+
+**The obvious explanation is wrong, and was tested first.** loom hands `QK^T` a *permuted* `src0` (`K`
+is `[64, 12, 1500]` contiguous, and `permute(0,2,1,3)` gives `lda = 768` floats while only 64 are
+used), where onnxruntime materialises a dense transpose per head. Materialising it in loom too is
+worth **4%** (`scripts/bench13.cpp` section 1): 154.3 -> 147.7 ms plus a 1.5 ms `cont`. Not the
+mechanism, and the section is kept so nobody spends a day on the transposes again.
+
+**What it is:** `sgemm.cpp`'s `matmul` opened with `if (k % KN != 0) return false;`, which sends the
+*whole* matmul to ggml's generic one-output-element-per-call kernel. `A@V` contracts over the encoder's
+1500 frames, and **1500 % 8 == 4** on AVX2 (`KN = 8`), **1500 % 16 == 12** on AVX-512. A sweep at that
+exact shape, one thread:
+
+| `m=64, n=1500` | k=1496 | k=1497 | k=1500 | k=1502 | k=1504 |
+|---|---|---|---|---|---|
+| GFLOP/s | 44.5 | 16.4 | **20.8** | 17.0 | 47.0 |
+
+(`scripts/bench13.cpp` section 3 — which is **flat** once `ggml-0011` is in the tree, so reproducing
+that column means building a ggml with the patch removed.) `n` divisibility does not matter (46.0
+GFLOP/s at n=1496/1500/1504) and `m` was already handled by `ggml-0003`. **`k` is the contraction, so in attention it is a sequence length — a number nothing
+rounds**, which is exactly `ggml-0003`'s own argument about `m = 287` on the other axis.
+
+**NEON has `KN = 4`, and 1500 % 4 == 0.** The Pi never sees this. `scripts/bench6.cpp` being
+aarch64-only was not an inconvenience in getting to this item — it is *why* the whole of P4.15 ran on
+the one ISA where whisper's contraction happens to be aligned.
+
+`ggml-0011` splits the contraction the way `ggml-0003` splits the rows: aligned prefix through the
+vector loop, the <= `KN-1` leftovers accumulated as scalars inside the tile before the `hsum`.
+Measured, one thread:
+
+| | baseline | patched | |
+|---|---|---|---|
+| bench, `m=64 n=1500 k=1500` x 12 heads | 176.2 ms | **81.8 ms** | **2.15x** |
+| in model, `MUL_MAT 64 x 1500` (12 calls) | 2240 / 2460 ms | **1119 / 1136 ms** | **2.0-2.2x** |
+| in model, every other bucket | — | unmoved | |
+
+(two interleaved runs per arm; `MUL_MAT 768 x 1500` 5508 vs 5517 ms across the pair, which is what
+"unmoved" means here.) End to end at four threads, interleaved, six launches: 12.74/12.68/12.46 ->
+12.44/12.16/12.17 s — a wall that includes a 2.4 GB GGUF load, so the per-op line is the evidence.
+
+**One trap for anyone editing it.** Folding the tail loop into a single epilogue — where it is
+*statically empty* whenever `k % KN == 0` — costs the small-`k` shapes **30%**: `QK^T` at `k = 64` went
+154 -> 201 ms. The aligned case needs byte-for-byte the epilogue it had, so there are two of them and
+the branch is outside the tile.
+
+**Accuracy, and the gate.** Against a double-precision reference over every `k` in [1, 40] plus
+63/64/65 and 1496-1504 (`scripts/bench13.cpp --check`), the worst relative error is 2.6e-05, and the
+aligned `k` sit in the same place as the unaligned ones — k=1496 2.1e-05 against k=1500 2.3e-05, i.e.
+f32 accumulation noise rather than a dropped term. `tests/ci/test_tinyblas_gemm.cpp` now sweeps the
+whole `k % KN` residue range the way it already swept `m % 4`, and it was **verified red**: deleting
+the tail accumulation fails 16 of its 113 checks, at exactly the unaligned k, by 2e-02 to 1.7e-01 —
+four orders of magnitude past its 1e-5 tolerance (ADR-015). `test_e2e_whisper_mil_export` against HuggingFace
+moves `max/absmax` **4.19e-04 -> 4.34e-04** against a 1e-3 limit and `mean_abs_diff` 9.36e-06 ->
+**9.33e-06** (better), 67/67 either way; the full suite is 150/150.
+
+#### `QK^T` at `k = 64` — STILL OPEN, and the largest thing left in the encoder
+
+`k = 64` divides 8, so `QK^T` does run through tinyBLAS — at **23.5 GFLOP/s where the same core does
+44 at k >= 256**:
+
+| `m=n=1500` | k=64 | k=128 | k=256 | k=512 | k=768 |
+|---|---|---|---|---|---|
+| GFLOP/s | **23.5** | 36.7 | 41.6 | 43.8 | 44.4 |
+
+(`scripts/bench13.cpp` section 2a, and this one is NOT flattened by `ggml-0011` — every k in it
+already divided 8.)
+
+MLAS drops only 9% over the same range (34.8 GFLOP/s at k=64 against 38.3 at k=768, from its own
+per-node profile), so this is a kernel-design difference and not a property of the shape: ggml
+vectorises **along k** and pays a per-tile `hsum` epilogue, which at k = 64 amortises over eight loop
+iterations. Worth ~1.1 s of the 1-thread encoder on the dev box. *Do not start by writing a fused
+attention kernel* — that is still ruled out above.
+
 **Not a gap, but worth knowing:** whisper pads every clip to 30 s, so an 11-second file pays the full
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
 model-semantics change (the positional embedding is fixed at 1500), so it is not part of this item.
@@ -582,6 +713,26 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
   nothing and it takes ten minutes, and it separates "this kernel is slow" from "this kernel is a
   memcpy with arithmetic attached". P4.18's soft_max was the second, and the probe said so before any
   of it was written (Retro-012).
+* **A `$LOOM_PROFILE` bucket does not know which graph it is in.** The key is `(op, ne0, ne1)` and
+  nothing else, so "`ne1 = 1500` is the encoder, `ne1 = 1` is a decode step" classifies only the
+  buckets whose `ne1` is one of those two. P4.18's largest layout bucket had `ne1 = 64`, was assigned
+  to the encoder by eye, and was 93% decoder — which inverted the item built on it AND the claim that
+  the decode loop needed nothing. Patching `record()` to print `node->name` settles it in one run and
+  costs nothing to keep out of the report.
+* **When a kernel's rate depends on a shape, sweep the shape before blaming the kernel.** P4.18's
+  attention matmuls looked like a 2x micro-kernel deficit and were a `k % 8` cliff: 44.5 GFLOP/s at
+  k=1496, 20.8 at k=1500, 47.0 at k=1504. A ratio against a competitor cannot see that, because the
+  competitor does not have the cliff. Three lines of sweep did.
+* **Split the competitor's profile by shape, not just by op.** onnxruntime's 96 `MatMul` against
+  loom's 96 gave 1.93x, which read as "the GEMM is 2x slow everywhere" and sent P4.18's largest item
+  at the dense projections. Split by input shape it is 1.10x on the projections and 2.2x on the two
+  attention matmuls — a different item with a different fix. The split is one `input_type_shape` key
+  in the profile JSON onnxruntime already writes.
+* **An ISA-conditional bug is invisible from the other ISA, and benches inherit that.**
+  `scripts/bench6.cpp` is aarch64-only, so every GEMM measurement in P4.15 ran where tinyBLAS's
+  `KN` is 4 and whisper's 1500-frame contraction divides it exactly. The same matmul on x86 never
+  entered the file. When a bench only builds on one architecture, that is a coverage hole with a
+  measurement attached, not a portability chore.
 * **For a float32 kernel, the error bound is enumerable — do not sample it.** The domain is 2^32
   values; a sweep against a double-precision reference takes about 30 s on 24 cores and gives the
   actual worst case rather than a grid maximum. It is also the only thing that finds the tails: P4.18's

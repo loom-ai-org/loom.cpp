@@ -73,17 +73,24 @@ set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
 option(LOOM_OPENMP "Build ggml's CPU backend against OpenMP instead of ggml's own threadpool" OFF)
 set(GGML_OPENMP ${LOOM_OPENMP} CACHE BOOL "" FORCE)
 
-# The pinned ggml, patched -- four diffs, each carrying its own measurement. Three are tinyBLAS: two
+# The pinned ggml, patched -- each diff carrying its own measurement. Four are tinyBLAS: two
 # aarch64-only fixes to GCC's code generation for its inner loop (a register tile GCC can actually
 # allocate, and operand addresses it will strength-reduce -- together 15.6 -> 25.1 GFLOP/s, which takes
-# ggml's own kernel PAST a hand-written one), and one architecture-neutral fix to which matmuls it
-# accepts at all (it declined every `m % 4 != 0` matrix outright, handing thousands of rows back to the
-# generic kernel over one or two leftovers). The fourth is ggml's fused convolution, which batched its
-# im2col 16 MB at a time -- larger than any cache, so the patches it exists to keep local went to DRAM
-# anyway -- and scattered its GEMM output one element at a time. See cmake/GgmlPatches.cmake for why a
-# patch here rather than a fork, a vendored copy, or a change in this engine. The fifth teaches the CPU
-# backend to fuse a convolution with the bias add that follows it, which is a graph-level decision made
-# at compute time and therefore invisible to every other backend. Populated up front so that both branches below -- and any
+# ggml's own kernel PAST a hand-written one), and two architecture-neutral fixes to which matmuls it
+# accepts at all: it declined every `m % 4 != 0` matrix outright, handing thousands of rows back to the
+# generic kernel over one or two leftovers, and it declined every `k % KN != 0` one the same way --
+# where k is the CONTRACTION, so in attention it is a sequence length that nothing rounds. whisper's
+# encoder A@V contracts over 1500 frames and 1500 % 8 == 4, so on x86 that GEMM never entered the file
+# at all: 2.15x at its own shape, and invisible from aarch64, where KN is 4 and 1500 % 4 == 0 (P4.18).
+#
+# Most of the rest are ggml's convolution: one batched its im2col 16 MB at a time -- larger than any
+# cache, so the blocking it exists for went to DRAM anyway -- and scattered its GEMM output one element
+# at a time; another teaches the CPU backend to fuse a convolution with the bias add that follows it,
+# which is a graph-level decision made at compute time and therefore invisible to every other backend.
+# The last is `vec.h`'s exact-erf GELU, which was a scalar libm `erff()` call per element on every
+# architecture. cmake/patches/UPSTREAM.md has one section per patch -- what it fixes, what it measures,
+# what a reviewer will ask -- and cmake/GgmlPatches.cmake has why a patch here rather than a fork, a
+# vendored copy, or a change in this engine. Populated up front so that both branches below -- and any
 # future one -- compile the patched sources, and re-checked on every configure so that an existing
 # build tree cannot end up silently unpatched.
 include(${CMAKE_CURRENT_LIST_DIR}/GgmlPatches.cmake)
