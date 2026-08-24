@@ -35,6 +35,41 @@ on the other side that cancels it.
 | ggml not fusing conv+bias+activation | 6.5% of the whole unfused elementwise + activation chain |
 | the C++↔Lua array boundary | 18.7 ms |
 | depthwise convolutions lowered as dense | wrong — the exporter emits 12 `CONV_1D_DW` nodes, matching onnxruntime one for one |
+| fusing `SOFT_MAX`'s five row passes into three | 1.06x on the machine that motivated it; **deleting the exp entirely is 0.99x** — see below |
+| a cheaper `exp` for `SOFT_MAX` | same measurement: there is nothing there to buy |
+
+### `SOFT_MAX`: a real mechanism, on the wrong side of the bottleneck (2026-08-24, P4.18)
+
+The mechanism was real and easy to confirm by reading `ggml_compute_forward_soft_max_f32`: **five
+passes over every row** (copy to scratch, scale scratch, max-reduce, exp+sum, normalise) where three
+suffice, and an AVX2 loop that **horizontally reduces its accumulator every 8 elements**. It profiled
+at 4.3x onnxruntime. A 3-pass row with the scale folded into the exp and four accumulators reduced
+once is an obvious, safe rewrite, and on the dev box it is worth 1.34x.
+
+**On the machine that motivated the item it is worth 1.06x**, and two throwaway probes said why before
+any of it was written as a patch — `1500 x 1500 x 12 heads`, one thread, Core Ultra 9 285K:
+
+| | one call | vs ggml |
+|---|---|---|
+| ggml, 5-pass row | 31.4 ms | — |
+| 3-pass candidate | 29.6 ms | 1.06x |
+| *probe:* 3-pass with a fast bit-trick exp | 32.3 ms | 0.97x |
+| *probe:* 3-pass with **no exp at all** | 31.6 ms | 0.99x |
+
+**Deleting the exp is not faster than computing it.** The score matrix is 108 MB, a row is 6 KB and
+stays in L1 across every pass, and the op is bound by streaming ~540 MB through one core's memory
+path. Neither the pass count nor the exp is the lever.
+
+**Actionable takeaway — probe the floor before optimising the middle.** The "no exp at all" arm is not
+a candidate and could never ship; it took ten minutes and it is the entire result. Any elementwise
+kernel over a tensor larger than cache deserves that probe *first*, because it distinguishes "this
+kernel is slow" from "this kernel is a memcpy with arithmetic attached", and only the first is
+fixable by writing a better kernel.
+
+**And a caveat this leaves behind on P4.18's table:** a memory-bound op is exactly where a per-op
+ratio against another engine stops meaning "same work". onnxruntime's 93 ms for 324 M elements is a
+rate no single core reaches by streaming, so that 4.3x should be treated as unexplained rather than as
+a target. The clamp/GELU sibling in the same item was the opposite case and went 9.9x in model.
 
 * **Actionable takeaway 1 — a verdict has a shelf life.** The im2col item was closed at 0.98x with
   "do not re-propose", and that verdict was *right for the engine it was measured on*. Once the GEMM

@@ -349,7 +349,7 @@ Harnesses: `scripts/bench_vits_loom.cpp` and, for the other two, `loom_cli` time
 `hidden / n_heads` (64) where Qwen3 decouples it to 128, and the session rejects the KV cache it
 builds. Reading the shapes off `session.get_inputs()` avoids assuming anything.
 
-### P4.18: the ASR gap is entirely the ENCODER — SCOPED 2026-08-24, not started
+### P4.18: the ASR gap is entirely the ENCODER — GELU DONE 2026-08-24, two items left
 
 whisper-small is the one task still behind onnxruntime (0.57-0.72x at four threads). The
 cross-attention K/V export fix bought 2.4-2.6x and closed most of it; the question is what is left.
@@ -415,28 +415,137 @@ un-profiled 2.376 s encoder (profiling costs it ~1.18x, so only shares are used)
 | conv frontend | 82 ms | 40 ms | 2.0x | 42 ms — 1% |
 | LayerNorm | 21 ms | 64 ms | **0.32x** | **-43 ms — loom is 3x faster here** |
 
-#### Three candidates, re-ordered by what the profile says
+#### Three candidates, re-ordered by what the profile says — and what happened to each
 
-1. **GEMM efficiency at the encoder's shapes — 66% of the gap, and the item this now is.** Same call
-   count, **1.93x slower**. P4.15 measured `ggml`'s F32 GEMM against MLAS at *VITS vocoder* shapes and
-   fixed it there; the encoder's are far larger (`768 x 1500`, `3072 x 1500`, `1500 x 1500`) and were
-   never measured. **P4.15's conclusion does not carry to shapes it never saw**, and Retro-012's "the
-   GEMM micro-kernel is done" verdict is scoped to those shapes. *Test:* `scripts/bench6.cpp` at the
-   seven shapes in the table above, against MLAS.
-2. **Layout churn — 16%, and the cheapest real change.** 324 `CONT` of `1500 x 64` against
-   onnxruntime's 97 `Transpose`/`Reshape`: **3.3x as many layout ops and 33x the cost**, which says
-   ggml is *materialising* copies where onnxruntime is re-striding views. 27 per layer. *Test:* dump
-   the encoder topology and find which `permute` each `CONT` is servicing; ask whether the exporter can
-   emit Q/K/V in the layout attention already wants. An **exporter** fix if it works (ADR-003).
-3. **`SOFT_MAX` and GELU — 18% together, and both are plain elementwise kernels** at 4.3x and 5.3x.
-   onnxruntime's `BiasGelu` is a fused bias+activation, which loom runs as `ADD` then `UNARY`; that
-   fusion is worth having but is the smaller half of the 5.3x. These are the two lines where a kernel
-   change is unambiguously a kernel change, with no graph question attached.
+**Read this ordering knowing it was wrong twice.** The first candidate (fused attention) was ruled out
+above by reading onnxruntime's own profile. The ordering below then put GELU *third*, as the small
+safe one — and it turned out to be the only one of the three that was a kernel defect at all.
 
-**Do not start with (1) despite it being the largest**: it is the one that risks re-treading Retro-012,
-and the 1.93x needs confirming at these shapes *before* any kernel work, because the same measurement
-already came out the other way once. **(2) is where a first change should land** — it is a graph-level
-fix, in the exporter, for a cost onnxruntime demonstrably does not pay.
+1. **GEMM efficiency at the encoder's shapes — 66% of the gap. STILL OPEN, still the largest.** Same
+   call count, **1.93x slower**. P4.15 measured `ggml`'s F32 GEMM against MLAS at *VITS vocoder*
+   shapes and fixed it there; the encoder's are far larger (`768 x 1500`, `3072 x 1500`,
+   `1500 x 1500`) and were never measured. **P4.15's conclusion does not carry to shapes it never
+   saw**, and Retro-012's "the GEMM micro-kernel is done" verdict is scoped to those shapes.
+   *Test:* `scripts/bench6.cpp` at the seven shapes in the table above, against MLAS — note bench6 is
+   **aarch64-only** as written, so this needs an x86 arm before it can be run on the machine the
+   profile came from.
+2. **Layout churn — 16%. STILL OPEN, still the cheapest real change.** 324 `CONT` of `1500 x 64`
+   against onnxruntime's 97 `Transpose`/`Reshape`: **3.3x as many layout ops and 33x the cost**, which
+   says ggml is *materialising* copies where onnxruntime is re-striding views. 27 per layer. *Test:*
+   dump the encoder topology and find which `permute` each `CONT` is servicing; ask whether the
+   exporter can emit Q/K/V in the layout attention already wants. An **exporter** fix if it works
+   (ADR-003) — which also means a whisper re-export and a fixture refresh, so it is not free at
+   release time.
+3. **`SOFT_MAX` and GELU — 18% together. GELU IS DONE; SOFT_MAX IS MEASURED OUT.** These were put last
+   as the safe pair, on the reasoning that both are "plain elementwise kernels at 4.3x and 5.3x". Only
+   half of that reasoning survived contact with a bench.
+
+##### GELU: the only ggml activation with no SIMD path at all — DONE (`ggml-0010`)
+
+`ggml_vec_gelu_erf_f32` was a scalar **`erff()` libm call per element**, on every architecture. That is
+easy to miss because the tanh-approximation GELU beside it in `vec.h` has a 128 KB f16 lookup table and
+`ggml_v_silu`/`ggml_v_expf` have hand-written SVE, NEON, AVX-512, AVX2, SSE2 and RVV paths — the exact
+form *looks* like the rarely-taken one. It is not: it is what PyTorch's default `approximate="none"`
+lowers to, and **loom picks it deliberately** (`op_gelu`, `src/ops/primitives_basic.cpp`, and the
+exporter distinguishes the two modes in `topology_ops.py`), so it lands in transformer MLPs at full
+hidden width.
+
+Replaced with `erf(z) ~ z*P(z^2)/Q(z^2)`, degree 5 over degree 5, `z` clamped to `[-4, 4]`, result
+saturated to `[-1, 1]`. **One thread, `3072 x 1500`, median of seven** (`scripts/bench12.cpp`, both
+arms ggml's own functions so what is measured is the patch and not a copy of it):
+
+| | Core Ultra 9 285K | Ryzen 3 3250U |
+|---|---|---|
+| `erff()` libm, per element | 19.0 ms | 121 ms |
+| `ggml-0010` rational | **1.32 ms** | **5.5 ms** |
+| | **14.3x** | **21.8x** |
+
+**In model, which is the number that counts**, same binary with the kill switch flipped, one thread,
+`$LOOM_PROFILE`, the post-cross-KV-fix export (84 calls at `768 x 1500`, so directly comparable to the
+table above):
+
+| `UNARY 3072 x 1500`, 12 calls | ms | share of run |
+|---|---|---|
+| `GGML_CPU_DISABLE_GELU_ERF_SIMD=1` | **209.2** | 3.6% |
+| patched | **21.2** | 0.4% |
+
+**9.9x in model** — less than the microbench's 14.3x, which is what a kernel that now streams memory
+instead of computing should do. Against onnxruntime's 55 ms for the same 96 activations, 21 ms is
+**2.6x faster**: the 8% GELU line closes and reverses. `GGML_CPU_DISABLE_GELU_ERF_SIMD=1` restores the
+libm path exactly, without a rebuild.
+
+**Do not quote the whole-transcription delta from that run** (6.115 -> 5.290 s). The two arms were not
+interleaved and `MUL_MAT` moved 17% between them, which nothing in this patch touches — that is
+thermal drift on a loaded box, and it inflates the end-to-end figure. The defensible statement is
+**~190 ms off a ~5.9 s encoder, about 3%**; the per-op line is the evidence, not the wall clock.
+
+**Accuracy was bounded exhaustively, not sampled** — every one of the 2^32 float32 bit patterns against
+a double-precision `erf`, with the libm path measured the same way in the same sweep: **2.64e-07
+against 1.08e-07 relative to `max(|x|,1)`, i.e. 2.4x the error of the path it replaces**, about two f32
+ulps of the value's own scale, worst case at `x = 5.0` rather than in a tail.
+
+**Two things that sweep caught, and a grid would not have.** (a) `P/Q -> 0.053` as `w` grows, so the
+approximation *diverges* outside the fitted interval rather than merely degrading — the clamp makes the
+function total, it is not a tidiness measure. (b) Without the saturation to `[-1,1]`, the residual of
+`1 + z*P/Q` at the clamp is ~1e-7 instead of 0 and then gets multiplied by `|x|`: **at `x = -FLT_MAX`
+the error was 2e31 for an exact answer of `-0`.** And one trap for anyone editing it: the branchless
+min `0.5*(a+b-|a-b|)` vectorises where a select does not, which is why it is tempting, and it cancels
+to zero in f32 once `a+b == a` — `gelu(1e30)` came back as `5e29`.
+
+**What it costs against the real oracle.** `test_e2e_whisper_mil_export` compares the encoder output
+with HuggingFace, not with loom's own other path, at `max_abs_diff < 1e-3 * ref_absmax`. Same binary,
+kill switch flipped:
+
+| encoder vs HF | libm | patched | limit |
+|---|---|---|---|
+| `max_abs_diff / ref_absmax` | 3.25e-04 | **4.19e-04** | 1e-3 |
+| `mean_abs_diff` | 9.27e-06 | **9.36e-06** | 1e-3 |
+
+So it spends real headroom on the max — **3.1x margin becomes 2.4x** — and essentially none on the
+mean (+0.9%). The decoder logits are unchanged (`mean_abs_diff` 6.50e-06 -> 6.47e-06). Worth watching
+if a second approximation ever lands in the same graph; not close today.
+
+**And the gate was checked for teeth, per ADR-015.** Setting the clamp to 0.5 and rebuilding takes
+`max/absmax` from 4.19e-04 to **0.907** and fails all four checks, encoder and decoder. It is a gate
+that can see this kernel and can go red on it — the two arms above differing is the other half of that
+evidence.
+
+**Auto-vectorisation was tried first and does not work here.** The loop is branchless arithmetic plus
+one clamp, and GCC 12 still refuses it — *"not vectorized: control flow in loop"* — for the clamp
+written as `z<C?z:C`, as `fminf`, and as a clamp on `z^2` recovered with `sqrt`, on both x86-64 and
+aarch64. (clang vectorises all of them.) Hence explicit intrinsics, in the shape of ggml's own
+`ggml_v_expf`.
+
+##### SOFT_MAX: not the pass count, not the exp — MEASURED OUT
+
+The mechanism looked as clean as GELU's. Per row `ggml_compute_forward_soft_max_f32` makes **five
+passes** (copy to scratch, scale scratch, max-reduce, exp+sum, normalise) where three suffice, and its
+AVX2 loop does **a full horizontal reduction of the accumulator every 8 elements**. Folding the scale
+into the exp, dropping the scratch copy and keeping four accumulators reduced once is a clean 3-pass
+row, and on the *dev box* it is worth 1.34x.
+
+**On the machine the profile came from it is worth 1.06x, and two probes say why it cannot be more:**
+
+| `1500 x 1500 x 12 heads`, one thread, Core Ultra 9 285K | one call | vs ggml |
+|---|---|---|
+| ggml, 5-pass row | 31.4 ms | — |
+| 3-pass, scale folded, accumulators reduced once | 29.6 ms | 1.06x |
+| *probe:* 3-pass with a **fast bit-trick exp** (far too inaccurate to ship) | 32.3 ms | **0.97x** |
+| *probe:* 3-pass with **no exp at all** | 31.6 ms | **0.99x** |
+
+**Deleting the exp entirely buys nothing.** At these shapes the score matrix is 108 MB, a row is 6 KB
+and stays in L1 across every pass, and what the op is actually bound by is streaming 108 MB in and out
+of DRAM on one thread — roughly 540 MB of traffic in 30 ms, which is single-core bandwidth. A cheaper
+exp is not the lever and neither is the pass count; **do not write a soft_max kernel for this.** If
+anything moves this line it is not touching `SOFT_MAX` at all — it is not materialising the score
+matrix, which is candidate 2's territory.
+
+This also means **the 4.3x in the table above should be read with suspicion rather than as a target.**
+The premise behind the whole table was checked and does hold — onnxruntime's encoder graph alone, same
+clip, same machine, is **2.49 s at `intra_op=1`** against 1.29 at 2 and 0.79 at 4, so the 2.376 s it is
+compared with is genuinely a one-thread number and the split is like-for-like. But a memory-bound op is
+the one place where "same wall time, same threads" still does not mean "same work", and 93 ms for 324 M
+elements is a number no single core reaches by streaming.
 
 **And note the LayerNorm row: loom is 3x faster there.** Nothing in this table is uniformly behind,
 which is the usual sign that the gap is specific kernels rather than a systemic disadvantage.
@@ -468,6 +577,17 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
   equally bad sorts to the bottom of a ratio table and can still hold the most time.
 * **When a ratio is inexplicable by the kernel, count the nodes before profiling them.**
   `scripts/conv_census.py` needs neither a run nor the target hardware.
+* **Probe the floor before optimising the middle.** Before writing a faster kernel, run the arm with
+  the expensive part *deleted* — a soft_max with no `exp` in it, a GEMM that only streams. It ships
+  nothing and it takes ten minutes, and it separates "this kernel is slow" from "this kernel is a
+  memcpy with arithmetic attached". P4.18's soft_max was the second, and the probe said so before any
+  of it was written (Retro-012).
+* **For a float32 kernel, the error bound is enumerable — do not sample it.** The domain is 2^32
+  values; a sweep against a double-precision reference takes about 30 s on 24 cores and gives the
+  actual worst case rather than a grid maximum. It is also the only thing that finds the tails: P4.18's
+  GELU approximation was 2.6e-07 relative to scale over a grid and **2e31 absolute at `x = -FLT_MAX`**,
+  and nothing but enumeration was going to surface that. Sweep once per ISA branch, since each one
+  rounds differently — the AVX2 path came out slightly *more* accurate than SSE2 because of FMA.
 
 **Before opening a performance item, read
 [Retro-012: Optimizations That Were Measured Out](../retros/retro-012-optimizations-that-were-measured-out.md).**
