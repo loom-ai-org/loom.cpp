@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-23
+last_updated: 2026-08-24
 ---
 
 # Epic-05: Edge CPU Performance
@@ -225,27 +225,78 @@ couple of ms of a 1.1 s synthesis.
 
 That "unchanged" is the result the change needed: ggml's threadpool spins its workers where libgomp
 slept them, and the worry was that on a 4-core box three spinning workers would starve the main thread
-between graph computes. They do not. The `$LOOM_N_THREADS`
-hold on raising the default thread count can be lifted for many-core machines once this lands, but the
-fix is worth only ~1.1x at ggml's default of 4, so **the default-thread-count question is still its own
-question with its own benchmark.**
+between graph computes. They do not. The fix is worth only ~1.1x at ggml's default of 4, so raising
+that default is a separate question — **and it now has its own benchmark, below.**
+
+### What the default thread count should be, now that the curve is monotonic
+
+The default was left at ggml's 4 because raising it "would be a regression on exactly the machines it
+looks like it should help". **That objection was about the libgomp collapse and no longer holds.**
+Re-measured on the fixed engine, best of 3 per point, `$LOOM_N_THREADS` the only variable.
+
+**Core Ultra 9 285K — 24 physical cores, no SMT:**
+
+| threads | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 20 | 24 |
+|---|---|---|---|---|---|---|---|---|---|
+| TTS (s) | 0.2887 | 0.1541 | 0.0638 | 0.0481 | 0.0411 | 0.0411 | 0.0358 | 0.0346 | **0.0323** |
+| LM (tok/s) | 11.29 | 15.38 | 23.24 | 27.37 | **29.59** | 27.93 | 27.21 | 26.93 | 27.45 |
+| ASR (s) | 6.654 | 3.973 | 2.446 | 1.631 | 1.430 | 1.249 | 1.153 | 1.070 | **1.014** |
+
+**Ryzen 3 3250U — 2 physical cores, SMT, so 4 logical:**
+
+| threads | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| TTS (s) | 0.6400 | **0.4339** | 0.5725 | 0.5576 |
+| LM (tok/s) | 6.04 | **6.71** | 6.67 | 6.26 |
+| ASR (s) | 17.52 | **11.29** | 11.54 | 12.30 |
+
+**The answer is the PHYSICAL CORE COUNT, and the two machines only agree once it is put that way.**
+The 285K wants 24 — every logical CPU, because it has no SMT. The Ryzen wants **2, not its 4 logical
+CPUs**, and 4 is worse than 2 on all three tasks. "Use every CPU" would be right on one machine and a
+1.28x TTS regression on the other; "use every physical core" is right on both.
+
+Against today's default of 4: the 285K gains **1.98x on TTS, 2.41x on ASR, 1.18x on the LM**, and the
+Ryzen gains **1.28x / 1.09x / 1.07x** by going *down* to 2. A Pi 4 (4 physical cores) does not move.
+
+Two things this measurement is not:
+
+* **Nothing goes backwards any more, but the LM still has a preference.** It peaks at 8 on the 285K and
+  sits on a plateau after — 27.45 tok/s at 24 against 29.59 at 8, **7% off its own optimum rather than
+  the 2.7x collapse it used to be**. A single default cannot serve all three tasks perfectly and does
+  not need to.
+* **Every number is one inference at a time on an idle machine.** A host running several loom instances
+  concurrently, or sharing the box, would have each claim every core; ggml's conservative 4 is a
+  reasonable default for that world and a bad one for this. Raising the default is a **policy** choice
+  about which world loom is for, not a further measurement.
+
+**Low thread counts on a hybrid part are noisy, and the noise is placement.** On the 285K's 8 P-cores +
+16 E-cores a 1-, 2- or 4-thread run can be scheduled entirely onto E-cores: one sweep read 0.0926 s at
+4 threads where a repeat read 0.0638 s. Hence best-of-3 above, and **a single measurement below ~6
+threads on a hybrid CPU should not be trusted.**
 ### Three tasks, not one — and the convolutional one is the good one
 
 VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
-Measured the same day on the same box, F32 on both sides, 4 threads on both sides:
+**Re-measured 2026-08-24 with both engines run back to back on each machine**, F32 on both sides:
 
 | machine | threads | TTS | LM | ASR |
 |---|---|---|---|---|
-| Core Ultra 9 285K | 4 | **1.25x** | **1.16x** | 0.41x |
-| Core Ultra 9 285K | 24 | 0.36x | 0.38x | 0.56x |
-| Ryzen 3 3250U | 4 (all) | **1.06x** | 0.87x | 0.33x |
-| Raspberry Pi 4B | 4 (all) | **1.00x** | 0.98x | 0.28x |
+| Core Ultra 9 285K | 4 | **1.03x** | **1.02x** | 0.71x |
+| Core Ultra 9 285K | 24 (all) | **1.17x** | **1.03x** | **1.29x** |
+| Ryzen 3 3250U | 4 (all) | **1.03x** | **1.05x** | 0.69x |
+| Raspberry Pi 4B | 4 (all) | 0.98x | **1.08x** | 0.57x |
 
 `>1.00x` is loom faster. The full table with its methodology and caveats is in the
-[README](../../README.md#performance-against-onnxruntime); the two that change how it should be read
+[README](../../README.md#performance-against-onnxruntime); the ones that change how it should be read
 are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
-1.86x faster on VITS, and against it the 4-thread x86 wins become losses), and that the Pi row is taken
+1.86x faster on VITS, and against it the x86 TTS wins become losses), and that the Pi row is taken
 cooled and interleaved because that board drifts 33% when it is not.
+
+**The previous version of this table was wrong in both directions and is worth keeping as a warning.**
+It read 1.25x / 1.16x / 0.41x for the 285K at 4 threads. Two independent errors made it so: its
+onnxruntime figures could not be reproduced by any harness in this repository, and its loom LM figure
+came from a harness that timed ONE COLD generation where the onnxruntime side warmed up — two
+different estimators, worth 5-7%. **Ratios carried forward from a previous table cannot be trusted;
+re-measure both sides or quote neither.**
 
 **That LM row was the engine calling the wrong function, and it is fixed.** `loom::text::generate`
 called `infer` unconditionally. Every generated causal-LM driver exports **two** entry points — `infer`,
@@ -265,7 +316,7 @@ code lost to reading a profile.
 | `infer_with_past` (now selected) | **2.98 s** | **21.78 tok/s** |
 | onnxruntime | 3.33 s | 19.21 tok/s |
 
-**So loom is at parity on all three tasks**, and the LM was never a kernel problem. The tell was the
+**So the LM reached parity, and it was never a kernel problem** (ASR did not — see the re-measured table above, where it is still 1.4-1.8x behind at four threads). The tell was the
 *shape* of the curve, not its height: onnxruntime's cost per token is flat (46.7 ms at 64 tokens, 45.2
 at 128) and loom's was not (146 -> 305 ms), which is what O(n^2) looks like from outside.
 

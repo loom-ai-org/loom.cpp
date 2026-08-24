@@ -103,59 +103,77 @@ The reference question for an edge runtime: **the same checkpoint, on the same m
 thread count — how does loom compare to onnxruntime?** Three tasks, because no single one is
 representative: an all-convolutional vocoder, an encoder-decoder ASR model, and an autoregressive LM.
 
-**`>1.00x` means loom is faster.** Measured 2026-08-23.
+**`>1.00x` means loom is faster.** Measured 2026-08-24, **both engines run back to back on the machine
+in the row** — see [what these numbers are not](#what-these-numbers-are-not).
 
 | machine | arch | threads | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
 |---|---|---|---|---|---|
-| Intel Core Ultra 9 285K | x86-64 | 4 | **1.25x** | **1.16x** | 0.41x |
-| Intel Core Ultra 9 285K | x86-64 | 24 | 0.36x | 0.38x | 0.56x |
-| AMD Ryzen 3 3250U | x86-64 | 4 (all) | **1.06x** | 0.87x | 0.33x |
-| Raspberry Pi 4B | aarch64 | 4 (all) | **1.00x** | 0.98x | 0.28x |
+| Intel Core Ultra 9 285K | x86-64 | 4 | **1.03x** | **1.02x** | 0.71x |
+| Intel Core Ultra 9 285K | x86-64 | 24 (all) | **1.17x** | **1.03x** | **1.29x** |
+| AMD Ryzen 3 3250U | x86-64 | 4 (all) | **1.03x** | **1.05x** | 0.69x |
+| Raspberry Pi 4B | aarch64 | 4 (all) | 0.98x | **1.08x** | 0.57x |
 
-**The three columns are three different stories, and the caveats matter as much as the numbers.**
+**TTS and the LM are at parity; ASR is still behind at four threads.** The caveats below matter as
+much as the numbers.
 
-* **TTS is at parity or better on every machine.** That is what P4.14/P4.15 was for: a built-in F32 GEMM
+* **TTS is at or just above parity everywhere.** That is what P4.14/P4.15 was for: a built-in F32 GEMM
   micro-kernel, four convolution patches to the pinned `ggml`, and a duplicated text encoder removed
   from the export.
-* **The LM is at parity except on the smallest x86 part.** It only just became so — until 2026-08-23 the
-  engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host re-fed a
-  growing prompt and each token recomputed the whole sequence. That was worth 2.83x.
-* **ASR is 2.4-3.6x behind, and it is one defect rather than diffuse slowness.** Whisper's exported
-  driver hands the decoder the raw encoder output every step, so cross-attention K/V is re-projected
-  over all 1500 encoder frames per token — `MUL_MAT 768x1500` runs 684 times for an 11-second clip
-  where the encoder itself needs 48. That is **57.7% of ASR runtime**, and onnxruntime computes those
-  tensors once. The fix is an export change and is
-  [open work](docs/backlog/active-index.md).
-* **loom stops scaling at 8 threads and then goes backwards.** VITS on the 285K: 0.198 s at 1 thread,
-  0.080 s at 8, and **0.191 s at 24 — the same as one thread** — while onnxruntime keeps improving. The
-  shapes are small (a vocoder convolution is 100-300 positions; a decode step's `mul_mat` has
-  `ne1 = 1`), so past a point each added thread is a barrier rather than a worker. `ggml`'s default of 4
-  happens to sit near the good part of that curve, which is why `$LOOM_N_THREADS` can override it but
-  does not raise it.
+* **The LM is at parity**, a few percent ahead everywhere. It only just became so — until 2026-08-23
+  the engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host
+  re-fed a growing prompt and each token recomputed the whole sequence. That was worth 2.83x. Note that
+  **its 24-thread figure is the LM at a thread count that does not suit it**: a decode step's `mul_mat`
+  has `ne1 = 1`, so this task peaks at 8 threads and plateaus after. That shows up as spread rather than
+  as a loss — loom ranges 24.5-28.6 tok/s across nine runs there where onnxruntime holds 27.1-27.6.
+* **ASR is the one still behind, and it is now 1.4–1.8x rather than 2.4–3.6x.** Whisper's exported
+  driver used to hand the decoder the raw encoder output every step, so cross-attention K/V was
+  re-projected over all 1500 encoder frames per token — `MUL_MAT 768x1500` ran 684 times for an
+  11-second clip where the encoder itself needs 48, **57.7% of ASR runtime**, where onnxruntime computes
+  those tensors once. Exporting the projected K/V as its own topology is worth **2.4–2.6x on every
+  machine here** (on the Pi, 90.0 s to 37.4 s for the same clip). What is left is a genuine gap at four
+  threads and a **win at 24**, which is the clearest sign that what remains is thread-scaling headroom
+  rather than a second defect of the same kind.
+* **loom used to stop scaling at 8 threads and go backwards; that is fixed, and the 24-thread row is
+  the fix.** VITS on the 285K was 0.080 s at 8 threads and **0.191 s at 24 — the same as at one
+  thread**. The cause was not in this repository: `ggml` defaults to OpenMP, so `ggml_barrier` was
+  `#pragma omp barrier` — one after every non-empty graph node, 2520 of them in a synthesis — and
+  libgomp's default wait policy **slept every thread on a futex at each one** (334,609 voluntary
+  context switches per 5 syntheses, against 160 now). Building `ggml` against its own threadpool, whose
+  spin is bounded, made the curve monotonic again and is worth **4.8x at 24 threads**
+  ([Retro-017](docs/retros/retro-017-libgomp-slept-at-every-graph-node.md)).
+* **The engine still defaults to 4 threads whatever the machine has**, which is `ggml`'s default and is
+  why the 285K has two rows. `$LOOM_N_THREADS` overrides it. Measured across both x86 parts, the best
+  default would be the **physical core count** — 24 on the 285K, but **2 rather than 4 on the
+  two-core-plus-SMT Ryzen**, where 4 is slower than 2 on all three tasks. That change is not made here:
+  every figure on this page is one inference at a time on an idle machine, and a host running several
+  loom instances concurrently is exactly the case `ggml`'s conservative 4 suits.
 
 ### What these numbers are not
 
 **The baseline is `pip install onnxruntime` 1.28.0**, the same distribution channel `loom-py` ships
 through. That choice flatters loom: at the *identical* version, the conda-forge build synthesises VITS
 in 0.065 s where the PyPI wheel takes 0.120 s — **1.86x apart, same machine, same script**. Against
-conda-forge, the 4-thread x86 wins above become losses. Whichever baseline a comparison uses, it should
-say which.
+conda-forge, the x86 TTS wins above become losses. Whichever baseline a comparison uses, it should say
+which.
 
-**Each pair is checked for equal work, not merely equal wall time.** TTS pins the three scales so both
-engines emit the same 73216 samples, and both harnesses print that count; ASR compares the transcripts;
-the LM figures are *differenced* — the same prompt at 1 and at 65 new tokens — so model load,
-tokenisation and prefill cancel out of both sides.
+**Each pair is checked for equal work, not merely equal wall time.** TTS pins VITS's three scales so
+both engines emit the same 73216 samples, and both harnesses print that count; ASR compares the
+transcripts, which are identical; the LM runs the same prompt to the same token budget greedily on both
+sides, and both emit the same tokens. **Model load is outside every timer on both sides.**
 
-**Reproducing it:** `scripts/bench_vits_loom.cpp` and `scripts/bench_lm_loom.cpp` are loom's side. The
-onnxruntime side drives `onnxruntime` directly rather than through `optimum`, which added roughly 2x of
-its own overhead to whisper and mis-derives Qwen3's `head_dim`.
+**Both sides use the same estimator**, which is not a detail: every harness here warms up and reports
+a best-or-median over repeated runs in one process. `bench_lm_loom.cpp` used to time a single cold
+generation instead, and comparing that against a warmed-up onnxruntime moved the LM column by 5-7% —
+enough to flip its sign on all three machines.
+
+**Reproducing it:** loom's side is `scripts/bench_{vits,lm,asr}_loom.cpp`, onnxruntime's is
+`scripts/bench_onnx_tasks.py`. The latter drives `onnxruntime` directly rather than through `optimum`,
+which added roughly 2x of its own overhead to whisper and mis-derives Qwen3's `head_dim`.
 
 **The Pi throttles, and it will lie if allowed to.** It goes 55 -> 84 C during a single whisper run and
-caps the ARM clock at 1580 MHz; two back-to-back measurements came out 87.1 s and 115.8 s, 33% apart.
-Its row is taken with a cooldown before every measurement and the two engines interleaved, so both meet
-the same clock. Its ASR figure additionally subtracts a separately measured model load, and with only
-3.8 GB of RAM the onnx arm evicts loom's weights from page cache between runs — so 3.6x is an upper
-bound on loom's disadvantage there rather than an exact figure.
+caps the ARM clock at 1580 MHz; two back-to-back measurements once came out 87.1 s and 115.8 s, 33%
+apart. Its row is taken with a cooldown before every measurement and the two engines interleaved, so
+both meet the same clock.
 
 ## Building
 
