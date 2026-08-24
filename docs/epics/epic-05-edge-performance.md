@@ -250,13 +250,25 @@ Re-measured on the fixed engine, best of 3 per point, `$LOOM_N_THREADS` the only
 | LM (tok/s) | 6.04 | **6.71** | 6.67 | 6.26 |
 | ASR (s) | 17.52 | **11.29** | 11.54 | 12.30 |
 
+The 2-against-4 comparison was then re-measured on its own, median of 5 interleaved rounds rather than
+one sweep point, because this box is a two-core laptop that also runs the session driving it and its
+single-point numbers move by up to 10%: **TTS 0.4230 against 0.5038 (1.19x), LM 6.81 against 6.59
+(1.03x), ASR 11.21 against 11.17 (1.00x — unchanged).** The sweep row above overstated the ASR and LM
+gains; the shape of the answer is the same.
+
 **The answer is the PHYSICAL CORE COUNT, and the two machines only agree once it is put that way.**
 The 285K wants 24 — every logical CPU, because it has no SMT. The Ryzen wants **2, not its 4 logical
-CPUs**, and 4 is worse than 2 on all three tasks. "Use every CPU" would be right on one machine and a
+CPUs**, and its two extra SMT threads buy nothing on any task and cost on two. "Use every CPU" would be right on one machine and a
 1.28x TTS regression on the other; "use every physical core" is right on both.
 
 Against today's default of 4: the 285K gains **1.98x on TTS, 2.41x on ASR, 1.18x on the LM**, and the
-Ryzen gains **1.28x / 1.09x / 1.07x** by going *down* to 2. A Pi 4 (4 physical cores) does not move.
+Ryzen gains **1.19x on TTS and 1.03x on the LM** by going *down* to 2, with ASR unchanged. A Pi 4
+(4 physical cores) does not move.
+
+**On the Ryzen this does not move the published ratios, because onnxruntime prefers 2 threads too** —
+it gains 1.17x / 1.02x / 1.07x over the same change, so loom's ASR column actually gets *worse*
+(0.72x -> 0.67x) for want of a gain onnxruntime does get. **The physical-core rule is a property of
+these CPUs rather than of loom**, which is worth saying out loud before it is quoted as an engine win.
 
 Two things this measurement is not:
 
@@ -280,9 +292,10 @@ VITS is the model this whole thread optimised, so it is the least representative
 
 | machine | threads | TTS | LM | ASR |
 |---|---|---|---|---|
-| Core Ultra 9 285K | 4 | **1.03x** | **1.02x** | 0.71x |
-| Core Ultra 9 285K | 24 (all) | **1.17x** | **1.03x** | **1.29x** |
-| Ryzen 3 3250U | 4 (all) | **1.03x** | **1.05x** | 0.69x |
+| Core Ultra 9 285K | 4 | **1.03x** | **1.01x** | 0.71x |
+| Core Ultra 9 285K | 24 (all) | **1.17x** | 0.96x | **1.29x** |
+| Ryzen 3 3250U | 2 (physical) | **1.02x** | **1.05x** | 0.67x |
+| Ryzen 3 3250U | 4 (all) | 0.99x | **1.04x** | 0.72x |
 | Raspberry Pi 4B | 4 (all) | 0.98x | **1.08x** | 0.57x |
 
 `>1.00x` is loom faster. The full table with its methodology and caveats is in the
@@ -290,6 +303,12 @@ VITS is the model this whole thread optimised, so it is the least representative
 are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
 1.86x faster on VITS, and against it the x86 TTS wins become losses), and that the Pi row is taken
 cooled and interleaved because that board drifts 33% when it is not.
+
+**The estimator is the median** of repeated runs on both sides, except the Pi row, which reports the
+FASTEST run — on that board thermal drift only ever makes a run slower, so the coolest run is the least
+contaminated one. That choice is not cosmetic: loom's LM at 24 threads is bimodal (24.5-28.6 tok/s
+across nine runs, against onnxruntime's steady 27.1-27.6), so its best run wins the cell at 1.03x and
+its typical run loses it at 0.96x. The table reports the typical one.
 
 **The previous version of this table was wrong in both directions and is worth keeping as a warning.**
 It read 1.25x / 1.16x / 0.41x for the 285K at 4 threads. Two independent errors made it so: its

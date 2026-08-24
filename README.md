@@ -108,23 +108,27 @@ in the row** — see [what these numbers are not](#what-these-numbers-are-not).
 
 | machine | arch | threads | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
 |---|---|---|---|---|---|
-| Intel Core Ultra 9 285K | x86-64 | 4 | **1.03x** | **1.02x** | 0.71x |
-| Intel Core Ultra 9 285K | x86-64 | 24 (all) | **1.17x** | **1.03x** | **1.29x** |
-| AMD Ryzen 3 3250U | x86-64 | 4 (all) | **1.03x** | **1.05x** | 0.69x |
+| Intel Core Ultra 9 285K | x86-64 | 4 | **1.03x** | **1.01x** | 0.71x |
+| Intel Core Ultra 9 285K | x86-64 | 24 (all) | **1.17x** | 0.96x | **1.29x** |
+| AMD Ryzen 3 3250U | x86-64 | 2 (physical) | **1.02x** | **1.05x** | 0.67x |
+| AMD Ryzen 3 3250U | x86-64 | 4 (all) | 0.99x | **1.04x** | 0.72x |
 | Raspberry Pi 4B | aarch64 | 4 (all) | 0.98x | **1.08x** | 0.57x |
 
-**TTS and the LM are at parity; ASR is still behind at four threads.** The caveats below matter as
-much as the numbers.
+**TTS and the LM are at parity; ASR is still behind.** Most cells sit within a few percent of 1.00x,
+which on these machines is the noise floor rather than a result — read them as parity, not as wins. The
+caveats below matter as much as the numbers.
 
-* **TTS is at or just above parity everywhere.** That is what P4.14/P4.15 was for: a built-in F32 GEMM
-  micro-kernel, four convolution patches to the pinned `ggml`, and a duplicated text encoder removed
-  from the export.
-* **The LM is at parity**, a few percent ahead everywhere. It only just became so — until 2026-08-23
-  the engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host
-  re-fed a growing prompt and each token recomputed the whole sequence. That was worth 2.83x. Note that
-  **its 24-thread figure is the LM at a thread count that does not suit it**: a decode step's `mul_mat`
-  has `ne1 = 1`, so this task peaks at 8 threads and plateaus after. That shows up as spread rather than
-  as a loss — loom ranges 24.5-28.6 tok/s across nine runs there where onnxruntime holds 27.1-27.6.
+* **TTS is at parity everywhere**, between 0.98x and 1.03x on three of the four rows. That is what
+  P4.14/P4.15 was for: a built-in F32 GEMM micro-kernel, four convolution patches to the pinned `ggml`,
+  and a duplicated text encoder removed from the export. Only the 285K's 24-thread row is a clear win,
+  and that one is P4.17.
+* **The LM is at parity**, a few percent either way. It only just became so — until 2026-08-23 the
+  engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host re-fed
+  a growing prompt and each token recomputed the whole sequence. That was worth 2.83x. **Its one loss
+  is the 24-thread cell, and that is the LM at a thread count that does not suit it**: a decode step's
+  `mul_mat` has `ne1 = 1`, so this task peaks at 8 threads and plateaus after. It shows up as *spread* —
+  loom ranges 24.5-28.6 tok/s over nine runs there where onnxruntime holds 27.1-27.6, so loom's best
+  run wins and its typical run does not. The table reports the typical one.
 * **ASR is the one still behind, and it is now 1.4–1.8x rather than 2.4–3.6x.** Whisper's exported
   driver used to hand the decoder the raw encoder output every step, so cross-attention K/V was
   re-projected over all 1500 encoder frames per token — `MUL_MAT 768x1500` ran 684 times for an
@@ -142,11 +146,17 @@ much as the numbers.
   spin is bounded, made the curve monotonic again and is worth **4.8x at 24 threads**
   ([Retro-017](docs/retros/retro-017-libgomp-slept-at-every-graph-node.md)).
 * **The engine still defaults to 4 threads whatever the machine has**, which is `ggml`'s default and is
-  why the 285K has two rows. `$LOOM_N_THREADS` overrides it. Measured across both x86 parts, the best
-  default would be the **physical core count** — 24 on the 285K, but **2 rather than 4 on the
-  two-core-plus-SMT Ryzen**, where 4 is slower than 2 on all three tasks. That change is not made here:
-  every figure on this page is one inference at a time on an idle machine, and a host running several
-  loom instances concurrently is exactly the case `ggml`'s conservative 4 suits.
+  why two machines have two rows. `$LOOM_N_THREADS` overrides it. Measured across both x86 parts, the
+  best default would be the **physical core count** — 24 on the 285K, but **2 rather than 4 on the
+  two-core-plus-SMT Ryzen**, where the extra two SMT threads buy nothing on any task and cost on two.
+  **On the Ryzen that barely moves the ratios, because onnxruntime wants the same thing.** Going 4 -> 2
+  makes loom 1.19x faster on TTS and 1.03x on the LM and leaves ASR unchanged (1.00x); onnxruntime gains
+  1.17x, 1.02x and 1.07x on the same three. So the columns shift by a point or two in each direction,
+  and ASR gets *worse* for loom (0.72x -> 0.67x) purely because onnxruntime is the one that gains there.
+  The physical-core rule is a property of these CPUs, not of loom.
+  The default is not changed here regardless: every figure on this page is one inference at a time on
+  an idle machine, and a host running several loom instances concurrently is exactly the case `ggml`'s
+  conservative 4 suits.
 
 ### What these numbers are not
 
@@ -160,6 +170,12 @@ which.
 both engines emit the same 73216 samples, and both harnesses print that count; ASR compares the
 transcripts, which are identical; the LM runs the same prompt to the same token budget greedily on both
 sides, and both emit the same tokens. **Model load is outside every timer on both sides.**
+
+**Each cell is a MEDIAN** of repeated runs on both sides — except the Pi row, which reports the fastest
+run, because thermal drift on that board only ever makes a run slower and the coolest run is therefore
+the least contaminated. The choice changes cells: loom's LM at 24 threads is bimodal (24.5-28.6 tok/s
+over nine runs, against onnxruntime's steady 27.1-27.6), so its best run takes that cell at 1.03x and
+its typical run loses it at 0.96x. **This table reports typical, not best.**
 
 **Both sides use the same estimator**, which is not a detail: every harness here warms up and reports
 a best-or-median over repeated runs in one process. `bench_lm_loom.cpp` used to time a single cold

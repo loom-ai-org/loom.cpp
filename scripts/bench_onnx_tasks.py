@@ -35,6 +35,12 @@
 # The whisper directory must be the FULL export -- `onnx/` plus the tokenizer and preprocessor JSON
 # next to it -- because the ASR task builds features and detokenises with `transformers`.
 #
+# ONE TRAP WHEN DRIVING THIS FROM A SHELL WRAPPER: build the loom binaries somewhere durable, and make
+# the wrapper FAIL when a measurement comes back empty. Putting them under /tmp cost a whole run here --
+# systemd-tmpfiles reaped them mid-sweep, and the wrapper cheerfully printed rows with a blank loom
+# column and a syntax error where the ratio should have been, exit code 0. A missing arm has to be
+# louder than a slow one.
+#
 # Pin the version you quote. `pip install onnxruntime` 1.28.0 is the README's baseline; conda-forge's
 # build of the SAME version is 1.86x faster on VITS, which is large enough to change every conclusion
 # ([Retro-012](../docs/retros/retro-012-optimizations-that-were-measured-out.md)).
