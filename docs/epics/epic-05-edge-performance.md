@@ -578,7 +578,8 @@ which is the usual sign that the gap is specific kernels rather than a systemic 
 
 `$LOOM_PROFILE` buckets by `(op, ne0, ne1)` and nothing else, so **no bucket in its report says which
 graph it came from**. Patching `profile.cpp` to also print `node->name` settles it in one run
-(whisper-small, `jfk.wav`, one thread, Ryzen 3 3250U):
+(whisper-small, `jfk.wav`, one thread, Ryzen 3 3250U) — **that patch is P4.19, and it should stop
+being something each investigation rewrites**:
 
 ```
 151.3 ms  x27  CONT  xv_0 (reshaped) (permuted) (permuted) (cont)  ne=1500,64,12,1

@@ -111,6 +111,17 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
+* [ ] **P4.19 — `$LOOM_PROFILE` should be able to say WHICH GRAPH a bucket is in.** It keys on
+  `(op, ne0, ne1)` and nothing else, so "`ne1 = 1500` is the encoder, `ne1 = 1` is a decode step"
+  classifies only the buckets whose `ne1` is one of those two — and **a bucket that is neither gets
+  assigned by eye**. That is exactly how P4.18's largest layout cost sat in the encoder's column while
+  being 93% decoder, which inverted the item built on it AND the claim that the decode loop needed
+  nothing. **The fix is about ten lines in `record()` (`src/core/profile.cpp`)**: behind
+  `$LOOM_PROFILE_NODES`, print `node->name` and the full four-element `ne` per execution, so one run
+  attributes every bucket. It was written as a scratch patch during P4.18 and reverted; Epic-05
+  currently *tells the reader to write it again*, which is the tell that it should be a feature.
+  Cheap, and it is the tool item (1) of P4.18 gets verified with.
+  → [Epic-05 §2](../epics/epic-05-edge-performance.md)
 * [ ] **P4.18 — the ASR gap is the encoder's ATTENTION, plus a loop-invariant copy in the decoder.**
   whisper-small is the one task still behind (0.57-0.72x at four threads).
   **Two of the first version's conclusions were wrong and are corrected in the epic.**
@@ -120,14 +131,15 @@ are not renumbered. New items continue the scheme.
   2.38 (2.29x), decode 1.10 s vs 0.97 (1.14x SLOWER)** — so "the decoder is ahead and needs nothing"
   was wrong. (b) Splitting onnxruntime's own `MatMul` time by shape shows loom's **dense GEMMs are
   within 10-12% of MLAS**; the whole 1.93x is the two batched attention matmuls.
-  **Fused attention stays ruled out**, **GELU is DONE** (`ggml-0010`), **`SOFT_MAX` stays measured
-  out**, and now **`k % KN` is DONE** (`ggml-0011`): tinyBLAS rejected every matmul whose CONTRACTION
+  **Fused attention stays ruled out**, **GELU is DONE** (`ggml-0010`), **`SOFT_MAX` is RE-OPENED**
+  (item 3 below — the probes that closed it were not floors), and **`k % KN` is DONE**
+  (`ggml-0011`): tinyBLAS rejected every matmul whose CONTRACTION
   was not a whole number of vectors, and whisper's A@V contracts over 1500 frames (1500 % 8 == 4 on
   AVX2, % 16 == 12 on AVX-512, **% 4 == 0 on NEON, which is why an aarch64-only bench6 could not find
   it**). **2.15x at that shape; in model the `MUL_MAT 64 x 1500` bucket goes 2240 -> 1119 ms with no
   other bucket moving.** `scripts/bench13.cpp` is the x86 bench that was missing, `--check` is its
   correctness sweep, and `tests/ci/test_tinyblas_gemm.cpp` now covers the `k` residues (verified red).
-  *Three things left, in order:*
+  *Five things left; (1) is by far the largest:*
   (1) **the decoder's cross-attention V is re-transposed every step** — 12 nodes x 4.6 MB per token,
   **9.0% of the whole transcription and 47% of the decode loop** at one thread. It is a function of a
   graph input that is constant for the utterance. The fix is `_WhisperCrossKvWrapper.forward`
@@ -156,7 +168,25 @@ are not renumbered. New items continue the scheme.
   92 ggml's two extra passes; onnxruntime does the same 12 calls in 515. **The item to open is
   `ggml_v_expf`, not a soft_max rewrite** — the same shape of finding as `ggml-0010`'s GELU, in the
   same file. The 285K's 1.06x for the fusion stands as a number and falls as a reason.
-  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU + k-tail done, three items open.*
+  (4) **`ggml-0011` is worth MORE on the other ASR models than on whisper, and nobody has measured
+  it.** whisper's 1500 frames are FIXED, so it missed `KN` on every clip; a Conformer's frame count is
+  DYNAMIC. Found by accident on `conformer_ctc_mil` (jfk.wav, 1 thread, dev box): **856 -> 718 ms end
+  to end, 1.19x**, from `MUL_MAT 551x276` 160.9 -> 82.6 (1.95x), `276x276` 84.8 -> 46.5 (1.82x) and
+  `44x276` 35.2 -> 12.9 (2.73x). **276 % 8 == 4**, and the subsampling stride is 4, so an encoder
+  length is always a multiple of 4 and its residue mod 8 is 0 or 4 — **about half of all clips hit
+  this, per utterance, at run time.** That is a better claim than whisper's and it belongs in the
+  README's ASR column. *gigaam 0.97x and parakeet-tdt 1.03x are INSIDE the dev box's ~1.2x noise floor
+  — do not report them; re-run paired (`scripts/bench14.cpp`) or on the workstation.* The baseline arm
+  is a ggml built without `ggml-0011`, not an older commit. Mind the sweep recipe's
+  `cd`-into-the-measured-tree trap and Retro-018's per-launch sampling.
+  (5) **Re-measure all of this on the 285K.** Everything above is the 2-core dev box. The corrected
+  encoder/decoder split is *arithmetic* on the 285K's own published call counts (324 = 12 encoder
+  nodes + 12 layers x 26 decoder executions, exactly) rather than a re-measurement, and the k tail's
+  **in-model** effect there has never been run. The mechanism carries — the 285K is Arrow Lake, so
+  AVX2, so `KN = 8`, so `1500 % 8 == 4` misses there too — only the magnitudes are open. While on that
+  box, re-run the corrected soft_max floors: Retro-012's 1.06x came from there and the `memcpy` arm
+  has still never been run on it.
+  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU + k-tail done, five items open.*
 * [ ] **The README's TTS and LM columns need the per-launch sampling the ASR column just got.** On the
   Core Ultra 9 285K (8 P-cores + 16 E-cores, no SMT) thread placement is chosen **once per process**
   and then sticks, so every run inside one process inherits the same luck and a within-process median
