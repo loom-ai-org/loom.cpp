@@ -38,6 +38,8 @@ void print_usage(const char* argv0) {
                   "\n"
                   "  $LOOM_PROFILE=1               time every graph node and print a per-op breakdown\n"
                   "  $LOOM_PROFILE=<path>          ... to a file instead of stderr\n"
+                  "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
+                  "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
                   argv0, argv0);
 }

@@ -43,6 +43,24 @@ struct Bucket {
 // the report deterministic without a second sort for equal times.
 using Table = std::map<std::pair<std::string, std::pair<int64_t, int64_t>>, Bucket>;
 
+// The finer table, filled only under `$LOOM_PROFILE_NODES`. Keyed on the node's NAME and all four
+// `ne`, which is what lets a report say which graph a bucket came from -- see `NodeRow` in the header
+// for why that is worth a second map. Ordered for the same reason `Table` is.
+struct NodeKey {
+    std::string op;
+    std::string name;
+    int64_t ne[4];
+    bool operator<(const NodeKey& other) const {
+        if (op != other.op) return op < other.op;
+        if (name != other.name) return name < other.name;
+        for (int i = 0; i < 4; ++i) {
+            if (ne[i] != other.ne[i]) return ne[i] < other.ne[i];
+        }
+        return false;
+    }
+};
+using NodeTable = std::map<NodeKey, Bucket>;
+
 // DELIBERATELY LEAKED, and this is not tidiness lost to laziness. An earlier draft held the table in a
 // function-local `static Table` and dumped it from a static destructor; on a shared-library build that
 // destructor ran AFTER the table's own, and iterating the corpse allocated a garbage-sized vector and
@@ -51,6 +69,12 @@ using Table = std::map<std::pair<std::string, std::pair<int64_t, int64_t>>, Buck
 // later host call both find a live object. The memory is a few kB and the process is ending.
 Table& table() {
     static Table* t = new Table();
+    return *t;
+}
+
+// Leaked for the same reason `table()` is -- it is dumped from the same atexit handler.
+NodeTable& node_table() {
+    static NodeTable* t = new NodeTable();
     return *t;
 }
 
@@ -85,6 +109,16 @@ const std::string& spec() {
     return value;
 }
 
+// `$LOOM_PROFILE_NODES`, read once, same rule as `spec()`. Its VALUE carries nothing -- the report
+// still goes wherever `$LOOM_PROFILE` says -- so this is a bool rather than a string.
+bool nodes_spec() {
+    static const bool value = [] {
+        const char* raw = std::getenv("LOOM_PROFILE_NODES");
+        return raw != nullptr && raw[0] != '\0' && std::strcmp(raw, "0") != 0;
+    }();
+    return value;
+}
+
 void record(const ggml_tensor* node, double seconds) {
     if (!atexit_registered()) {
         atexit_registered() = true;
@@ -97,6 +131,17 @@ void record(const ggml_tensor* node, double seconds) {
     // are dispatch and nothing else. Asking ggml rather than restating the list keeps this true if ggml
     // adds a fifth.
     b.computes = !ggml_op_is_empty(node->op);
+
+    if (nodes_spec()) {
+        NodeKey key;
+        key.op = ggml_op_name(node->op);
+        key.name = node->name;
+        for (int i = 0; i < 4; ++i) key.ne[i] = node->ne[i];
+        Bucket& n = node_table()[key];
+        n.seconds += seconds;
+        n.calls += 1;
+        n.computes = b.computes;
+    }
 }
 
 // The scheduler's eval callback needs somewhere to leave the start timestamp between its `ask` and its
@@ -129,6 +174,8 @@ void append(std::string& out, const char* fmt, ...) {
 } // namespace
 
 bool enabled() { return !spec().empty(); }
+
+bool nodes_enabled() { return nodes_spec(); }
 
 ggml_status compute(ggml_backend_t backend, ggml_cgraph* graph) {
     ggml_status worst = GGML_STATUS_SUCCESS;
@@ -173,6 +220,23 @@ std::vector<Row> rows() {
     return out;
 }
 
+std::vector<NodeRow> node_rows() {
+    std::vector<NodeRow> out;
+    out.reserve(node_table().size());
+    for (const auto& entry : node_table()) {
+        NodeRow row;
+        row.op = entry.first.op;
+        row.name = entry.first.name;
+        for (int i = 0; i < 4; ++i) row.ne[i] = entry.first.ne[i];
+        row.seconds = entry.second.seconds;
+        row.calls = entry.second.calls;
+        out.push_back(std::move(row));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const NodeRow& a, const NodeRow& b) { return a.seconds > b.seconds; });
+    return out;
+}
+
 Totals totals() {
     Totals t;
     double floor = 0;
@@ -189,6 +253,7 @@ Totals totals() {
 
 void reset() {
     table().clear();
+    node_table().clear();
     reported() = false;
 }
 
@@ -240,6 +305,28 @@ std::string report() {
         append(out, "%-22s %8llu %10.2f %7.1f%% %12.2f\n", op.first.c_str(),
                static_cast<unsigned long long>(op.second.calls), op.second.seconds * 1e3,
                t.seconds > 0 ? 100.0 * op.second.seconds / t.seconds : 0.0, corrected * 1e3);
+    }
+
+    // The per-node section, which is what makes a bucket above attributable to a GRAPH. Printed last so
+    // that a reader who did not ask for it -- and it is opt-in -- still finds the summary at the top.
+    const std::vector<NodeRow> nodes = node_rows();
+    if (!nodes.empty()) {
+        append(out, "\n%10s %6s  %-20s %-46s %s\n", "ms", "calls", "op", "name", "ne");
+        double shown_nodes = 0;
+        size_t printed = 0;
+        for (const NodeRow& r : nodes) {
+            // Deeper than the summary's 98.5%: this table is read by looking a specific bucket UP, and
+            // a cut that hides the row you came for defeats it. The tail below is genuinely nothing.
+            if (t.seconds > 0 && shown_nodes / t.seconds > 0.999) break;
+            shown_nodes += r.seconds;
+            ++printed;
+            append(out, "%10.2f %6llu  %-20s %-46s %lld,%lld,%lld,%lld\n", r.seconds * 1e3,
+                   static_cast<unsigned long long>(r.calls), r.op.c_str(), r.name.c_str(),
+                   static_cast<long long>(r.ne[0]), static_cast<long long>(r.ne[1]),
+                   static_cast<long long>(r.ne[2]), static_cast<long long>(r.ne[3]));
+        }
+        append(out, "%zu of %zu node buckets, %.1f%% of the time\n", printed, nodes.size(),
+               t.seconds > 0 ? 100.0 * shown_nodes / t.seconds : 0.0);
     }
     return out;
 }

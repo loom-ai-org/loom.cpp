@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-24
+last_updated: 2026-08-25
 ---
 
 # Epic-05: Edge CPU Performance
@@ -352,7 +352,11 @@ builds. Reading the shapes off `session.get_inputs()` avoids assuming anything.
 ### P4.18: the ASR gap is the ENCODER'S ATTENTION and a loop-invariant copy in the DECODER
 
 *(GELU done 2026-08-24; the `k % KN` GEMM cliff done 2026-08-24 as `ggml-0011`; the encoder/decoder
-split below was WRONG in the first version of this section and is corrected here.)*
+split below was WRONG in the first version of this section and is corrected here. **`SOFT_MAX` /
+`ggml_v_expf` closed 2026-08-25**, on a floor argument, with the 285K's memcpy arm finally run;
+**`ggml-0011`'s reach across the ASR models measured 2026-08-25**, and its mechanism turned out to be
+the attention head dimension rather than the clip length. **Two items are left: the decoder's
+loop-invariant V transpose, and `QK^T` at `k = 64`.**)*
 
 whisper-small is the one task still behind onnxruntime (0.57-0.72x at four threads). The
 cross-attention K/V export fix bought 2.4-2.6x and closed most of it; the question is what is left.
@@ -564,6 +568,36 @@ The item to re-open is not a soft_max rewrite — it is **`ggml_v_expf`**, which
 prices at 1.4-1.6x of a fused row. That is the same shape of finding as `ggml-0010`'s GELU, in the
 same file. See [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), corrected.
 
+##### `ggml_v_expf`, and the memcpy floor on the 285K — CLOSED (2026-08-25)
+
+The item above was the right one to open and it is now closed. Both halves of what it asked for were
+run: **the memcpy arm on the 285K**, which had never been measured on the machine the original
+"bandwidth bound" claim was made about, and **a candidate `ggml_v_expf`**.
+
+| 12 calls, `SOFT_MAX 1500 x 1500 x 12`, one thread | Ryzen 3 3250U | Core Ultra 9 285K |
+|---|---|---|
+| ggml, 5-pass row | 600 ms | 398 ms |
+| 3-pass candidate | 508 ms (**1.19x**) | 365 ms (**1.08x**) |
+| *floor:* same arm, exp switched off | 372 ms — the exp is **1.37x** | 338 ms — the exp is **1.08x** |
+| *floor:* `memcpy` of the same bytes | 168 ms (14.4 GB/s) | **51 ms (47.4 GB/s)** |
+| ggml above the memcpy floor | 3.6x | **7.8x** |
+
+**The 285K is FURTHER from bandwidth bound than the dev box, not closer.** That closes the original
+reading for good on the machine it was made about. It also explains the 1.19x / 1.08x split without
+appealing to memory at all: **the exp is 26% of the op on the dev box and 7% on the 285K**, because the
+285K's cores are fast enough at the arithmetic that what remains is the traffic.
+
+**And the exp has no accessible headroom.** `sm_expf` (`scripts/bench12.cpp`) is ggml's own fast path
+with the general-case mask, `movemask` and branch — which SOFT_MAX's domain provably cannot reach —
+replaced by one `max`: **0.97-1.02x on the dev box, 1.13-1.16x on the 285K, at bit-for-bit the same
+worst-case error** (1.847e-07 both arms). Fourteen of ggml's sixteen operations survive the
+specialisation, which is the whole story. The floor that bounds every *other* exp candidate is the same
+function with the polynomial replaced by `exp(b) ~ 1 + b`: **1.64-1.95x**, so no exp rewrite at any
+accuracy is worth more than that, against an exp that is 7-26% of an op that is 5.9% of the encoder.
+
+*Do not re-propose a faster `exp` for `SOFT_MAX`* —
+[Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) carries the takeaway.
+
 And **the 4.3x in the table above needs no suspicion after all.** It was discounted on the grounds
 that a memory-bound op cannot be compared per-op; the op is not memory bound, loom is 1.24x
 onnxruntime at the bench level, and the difference is work per element. The premise behind the whole
@@ -686,6 +720,103 @@ the tail accumulation fails 16 of its 113 checks, at exactly the unaligned k, by
 four orders of magnitude past its 1e-5 tolerance (ADR-015). `test_e2e_whisper_mil_export` against HuggingFace
 moves `max/absmax` **4.19e-04 -> 4.34e-04** against a 1e-3 limit and `mean_abs_diff` 9.36e-06 ->
 **9.33e-06** (better), 67/67 either way; the full suite is 150/150.
+
+#### What `ggml-0011` is worth on the OTHER ASR models — DONE (2026-08-25), and the mechanism was misnamed
+
+The patch was found on whisper, where the ragged contraction is the encoder's **1500 frames**. That
+number is fixed (whisper pads every clip to 30 s), so the first reading of the accidental Conformer
+result — `conformer_ctc_mil` 856 -> 718 ms, 1.19x — was that a Conformer's frame count is *dynamic*,
+`276 % 8 == 4`, the subsampling stride is 4, and therefore **"about half of all clips hit this, per
+utterance, at run time"**.
+
+**That mechanism is wrong, and the measurement that says so is a clip sweep.** Six clips trimmed from
+`jfk.wav` in 160 ms steps — 160 ms of audio is 16 mel frames is exactly **4 encoder frames**, so the
+encoder length steps by 4 and its residue mod 8 alternates 0 / 4. Paired arms
+(`scripts/paired_arms.py`, baseline = the same tree with `ggml-0011` reverse-applied), 11 rounds each,
+one thread, Ryzen 3 3250U:
+
+| clip | encoder length | `% 8` | p10 | **median** | p90 |
+|---|---|---|---|---|---|
+| 10.20 s | 256 | **0** | 1.199 | **1.229** | 1.293 |
+| 10.36 s | 260 | 4 | 1.160 | **1.196** | 1.237 |
+| 10.52 s | 264 | **0** | 1.173 | **1.202** | 1.232 |
+| 10.68 s | 268 | 4 | 1.183 | **1.236** | 1.260 |
+| 10.84 s | 272 | **0** | 1.178 | **1.229** | 1.246 |
+| 11.00 s | 276 | 4 | 1.198 | **1.244** | 1.293 |
+
+**Flat.** The aligned clips gain as much as the unaligned ones, every p10 is above 1.16, and the
+encoder length's residue does not appear in the result at all.
+
+**What it actually is: the attention HEAD DIMENSION.** `$LOOM_PROFILE` on both arms, same clips, names
+the buckets that move — and the two candidate contractions separate perfectly:
+
+| bucket (output `ne0 x ne1`) | contracts over | base | patched | |
+|---|---|---|---|---|
+| **enc = 256, aligned** | | | | |
+| `511 x 256` (`QK^T`, rel-pos) | head dim **44** | 409 ms | 170 ms | **2.41x** |
+| `256 x 256` (`QK^T`) | head dim **44** | 210 ms | 92 ms | **2.27x** |
+| `44 x 256` (`A@V`) | encoder length **256** | 27.6 ms | 29.6 ms | **0.93x — nothing** |
+| **enc = 276, unaligned** | | | | |
+| `551 x 276` (`QK^T`, rel-pos) | head dim **44** | 540 ms | 239 ms | **2.26x** |
+| `276 x 276` (`QK^T`) | head dim **44** | 279 ms | 124 ms | **2.24x** |
+| `44 x 276` (`A@V`) | encoder length **276** | 108 ms | 38 ms | **2.82x** |
+
+The clip-dependent half is real — `A@V` moves 2.82x at 276 and not at all at 256, exactly as the
+original story predicted — but it is **69 ms of a 739 ms total delta, under 10%**. The other 90% is
+`QK^T`, whose contraction is `d_model / n_heads` = **176 / 4 = 44**, and **44 % 8 == 4 on AVX2 for
+every clip this model will ever see.**
+
+**So the rule is about the model, not the utterance,** and it predicts the other three:
+
+| model | head dim | `% 8` | paired, 1 thread, dev box |
+|---|---|---|---|
+| `conformer_ctc_mil` | **44** | **4** | **1.196-1.244x**, every clip |
+| `whisper_mil` | 64 | 0 | **1.059x** (p10 1.033) — from `A@V` over its fixed 1500 frames |
+| `gigaam_mil` | 48 | 0 | 1.025x, p10 0.789 — **unresolved** |
+| `parakeet_tdt_mil` | 128 | 0 | 0.992x, p10 0.868 — **unresolved** |
+| `parakeet_rnnt_mil` | 128 | 0 | 0.995x, p10 0.898 — **unresolved** |
+
+The three that gain nothing all have head dimensions divisible by 8, and their `A@V` buckets are 1-2%
+of the run rather than whisper's 16%. **The backlog's "gigaam 0.97x / parakeet-tdt 1.03x are inside
+the noise floor — re-run paired" was right, and re-running them paired confirms them as unresolved
+rather than converting them into numbers.**
+
+**What belongs in the README's ASR column** is therefore the Conformer number and not a general claim
+about dynamic frame counts: a model whose head dimension is not a multiple of 8 pays this on every
+utterance, and Conformer-CTC small is one.
+
+#### The same thing on the 285K — DONE (2026-08-25)
+
+Everything above is the 2-core dev box; the 285K is Arrow Lake, so AVX2, so `KN = 8`, so the mechanism
+must carry and only the magnitudes were open. Same harness, same clips, same two arms built from the
+same tree:
+
+| paired, one thread | p10 | **median** | p90 |
+|---|---|---|---|
+| conformer, enc 256 (aligned) | 1.149 | **1.192** | 1.222 |
+| conformer, enc 276 (unaligned) | 1.173 | **1.222** | 1.229 |
+| whisper-small, 11 s | 1.054 | **1.085** | 1.135 |
+
+It carries, to within a couple of percent of the dev box, flat across the residue there too.
+
+**At 24 threads none of it is resolvable, and more rounds do not fix it.** Eleven paired rounds give
+conformer 0.930 / 1.064 and whisper 0.993, every one straddling 1.0; **41 and 31 rounds give conformer
+0.955 (p10 0.715, p90 1.231) and whisper 0.988 (p10 0.849, p90 1.089)** — a tighter median around the
+same place, and a spread that has not moved.
+
+The reason is visible in the raw arms rather than inferred: whisper's baseline spans **1.102-1.328 s
+across launches of the same binary**, which is the per-launch thread-placement lottery the README item
+below names — and **pairing does not cancel it**, because placement is drawn fresh in each process
+rather than drifting slowly across one. Everything a paired test is good for assumes the noise is
+shared *within* a pair; this noise is not. A 42 ms Conformer transcription at 24 threads is far under
+that spread.
+
+**Flagged, not claimed:** at 24 threads both medians sit slightly *below* 1.0 over 41 and 31 rounds,
+and whisper's patched median (1.225 s) is consistently above its baseline (1.119 s) while their minima
+are within 1%. That is what a patch that stops helping — or costs a little — at high thread counts
+would look like, and it is also what this estimator does to a null. Not resolvable here.
+**`ggml-0011` is a ONE-THREAD result on this box**; if a 24-thread number is ever needed, the estimator
+has to change (pin the placement, or compare per-op rather than end to end), not just the round count.
 
 #### `QK^T` at `k = 64` — STILL OPEN, and the largest thing left in the encoder
 
@@ -924,6 +1055,42 @@ red** by sabotage (branch forced off; walk made to skip the last node) — and t
 test could NOT fail, because `LOOM_CHECK` only counts failures and the test ended in `return 0;`
 instead of `LOOM_TEST_REPORT_AND_RETURN()`. Exactly the trap CLAUDE.md warns about, caught only by
 running the sabotage.
+
+### P4.19 — `$LOOM_PROFILE_NODES`: which GRAPH a bucket is in — DONE (2026-08-25)
+
+**A `(op, ne0, ne1)` bucket cannot say where its time came from, and that is not a hypothetical
+limitation.** P4.18's largest layout cost — `CONT 1500 x 64`, 471 ms — was assigned to whisper's
+encoder on the reasoning that `ne1 = 1500` is an encoder op and `ne1 = 1` is a decode step. That
+bucket's `ne1` is 64, so it is neither, and it was assigned by eye. It is 93% the decode loop's, which
+inverted the item built on it *and* the claim that the decoder needed nothing. The same table's `NORM`
+coincidence **was** checked; this one was not, and nothing in the report marked the difference.
+
+**`$LOOM_PROFILE_NODES=1` adds a second table keyed on `(op, node name, all four ne)`.** ggml grows a
+node's name as it is transformed (`xv_0 (reshaped) (permuted) (permuted) (cont)`), so the name carries
+the graph the node came from; the four `ne` separate nodes that agree on the leading two. Same run,
+same `$LOOM_PROFILE` destination, printed after the summary so a reader who did not ask for it still
+finds the rollup at the top. Off by default: it is a per-node map on the recording path and a report
+long enough to bury what it sits under.
+
+It settles the bucket it was written for in one run — whisper-small, `jfk.wav`, one thread, Ryzen 3
+3250U, `CONT` at `1500,64,12,1`:
+
+| ms | calls | name |
+|---|---|---|
+| 202.3 | 27 | `xv_3 (reshaped) (permuted) (permuted) (cont)` |
+| ... | ... | *twelve of these, one per decoder layer, 2276 ms together* |
+| 88.7 | 12 | ` (reshaped) (permuted) (permuted) (cont)` — the encoder's own, unnamed |
+
+**96.3% of that bucket is the decode loop**, and the arithmetic the epic previously had to do by hand
+(324 = 12 encoder nodes + 12 layers x 26 decoder executions) is now a line of the report. The count
+here is 336 = 12 + 12 x 27, for the 27-step decode this run produced.
+
+**Tests:** a THIRD registration of `tests/ci/test_profile.cpp`, for the same caching reason as the
+other two. It asserts the finer table accounts for *exactly* the node executions the shape table does —
+if the two disagree, some execution landed in a shape bucket without landing in a node bucket, and an
+attribution built on the report would be reading a partial graph — and that the table is empty when
+the variable is unset. **Verified red** (ADR-015) by making `record()` skip `GGML_OP_ADD`: the
+accounting check fails, the other two registrations stay green.
 
 ### What the profiler then measured, which P4.13 should read
 

@@ -55,6 +55,11 @@ namespace profile {
 // anything containing a '/' or ending in a filename is opened as a file. See `write_report()`.
 bool enabled();
 
+// Whether `$LOOM_PROFILE_NODES` additionally asks for the per-node table -- same "set, non-empty, not
+// 0" rule, and read once for the same reasons. Independent of where the report goes; it only adds a
+// section to it. Has no effect unless `enabled()`.
+bool nodes_enabled();
+
 // Runs `graph` node by node on `backend`, timing each node. Semantically identical to
 // `ggml_backend_graph_compute(backend, graph)` -- same nodes, same order, same buffers -- and returns
 // what that would have returned. Only meaningful for a graph that has already been allocated.
@@ -84,6 +89,28 @@ struct Row {
 
 // Every bucket recorded since the last `reset()`, heaviest first.
 std::vector<Row> rows();
+
+// One (op, node name, full shape) bucket -- the finer table, recorded only when `$LOOM_PROFILE_NODES`
+// is set. A `Row` cannot say WHICH GRAPH its time came from: it is keyed on `(op, ne0, ne1)` and
+// nothing else, so a bucket whose leading dimensions do not happen to identify a phase gets attributed
+// by eye. That is not a hypothetical -- whisper's largest layout bucket (`CONT 1500 x 64`) was read as
+// the encoder's on exactly that reasoning and is 93% the decode loop's, which inverted the item built
+// on it. A node NAME carries its graph (`xv_0 (reshaped) (permuted) (cont)` is a decoder input), and
+// all four `ne` distinguish nodes that agree on the leading two.
+//
+// Off by default because it is a per-node table rather than a per-shape one -- a bigger map on the
+// recording path, and a report long enough to bury the summary it sits under.
+struct NodeRow {
+    std::string op;        // `ggml_op_name` of the node
+    std::string name;      // `node->name`, which ggml grows as `(reshaped) (permuted) ...`
+    int64_t ne[4] = {0, 0, 0, 0};
+    double seconds = 0;
+    uint64_t calls = 0;
+};
+
+// Every node bucket recorded since the last `reset()`, heaviest first. Empty unless
+// `$LOOM_PROFILE_NODES` was set when the first node was recorded.
+std::vector<NodeRow> node_rows();
 
 struct Totals {
     double seconds = 0;        // summed over every node execution

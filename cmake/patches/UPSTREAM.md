@@ -626,6 +626,23 @@ In model (whisper-small, `jfk.wav`, `$LOOM_PROFILE` at one thread, two interleav
 Architecture-neutral in the same sense PR 3 is: every ISA whose `KN` does not divide a model's
 sequence length benefits, and the wider the vector the more often that is.
 
+**And whisper is not the best case — a HEAD DIMENSION misses `KN` more reliably than a sequence length
+does.** whisper's `A@V` contracts over frames; `QK^T` contracts over `d_model / n_heads`, which is a
+constant of the architecture. NVIDIA's Conformer-CTC small is `176 / 4 = 44`, and **44 % 8 == 4 on every
+utterance that model will ever run**. End to end, one thread, two builds of this file differing only in
+this patch, paired over 11 rounds per cell:
+
+| | Ryzen 3 3250U | Core Ultra 9 285K |
+|---|---|---|
+| conformer-ctc-small, 11 s clip | **1.244x** (p10 1.198) | **1.222x** (p10 1.173) |
+| whisper-small, 11 s clip | **1.059x** (p10 1.033) | **1.085x** (p10 1.054) |
+
+Its `QK^T` buckets move 2.24-2.41x. Six clips trimmed so the *encoder length* steps through both
+residues mod 8 gain the same 1.20-1.24x either way, which is what says the head dimension rather than
+the frame count is doing the work. Models whose head dimension already divides `KN` — GigaAM (48),
+Parakeet (128), whisper (64) — gain nothing measurable from `QK^T` and only what their `A@V` shape
+happens to give.
+
 **Accuracy.** Against a double-precision reference over every `k` in [1, 40] plus 63/64/65 and
 1496–1504, the worst relative error is **2.6e-05**, and the aligned `k` sit in the same place as the
 unaligned ones (k=1496 2.1e-05, k=1500 2.3e-05) — f32 accumulation noise, not a dropped term. loom's
