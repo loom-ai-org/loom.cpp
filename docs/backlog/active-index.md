@@ -127,17 +127,36 @@ are not renumbered. New items continue the scheme.
   it**). **2.15x at that shape; in model the `MUL_MAT 64 x 1500` bucket goes 2240 -> 1119 ms with no
   other bucket moving.** `scripts/bench13.cpp` is the x86 bench that was missing, `--check` is its
   correctness sweep, and `tests/ci/test_tinyblas_gemm.cpp` now covers the `k` residues (verified red).
-  *Two things left, in order:*
+  *Three things left, in order:*
   (1) **the decoder's cross-attention V is re-transposed every step** — 12 nodes x 4.6 MB per token,
   **9.0% of the whole transcription and 47% of the decode loop** at one thread. It is a function of a
   graph input that is constant for the utterance. The fix is `_WhisperCrossKvWrapper.forward`
   (`loom-exporter/whisper_export.py:147`) emitting V already head-split and transposed — a whisper
   re-export and a fixture refresh, so not free at release time (ADR-003).
-  (2) **`QK^T` at `k = 64` runs at 23.5 GFLOP/s where the same core does 44 at k >= 256**, while MLAS
-  drops only 9% over that range. ggml vectorises along `k` and pays a per-tile `hsum` epilogue that
-  eight loop iterations cannot amortise. ~1.1 s of the 1-thread encoder on the dev box, and the
-  largest thing left in the encoder. *Do not start by writing a fused attention kernel.*
-  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU + k-tail done, two items open.*
+  (2) **`QK^T` at `k = 64` runs at about HALF the rate of a projection-shaped GEMM** — 2.10x paired
+  (p10 1.66, p90 2.48), against a witness that is itself at 84-88% of this box's ~54 GFLOP/s
+  single-core peak (Zen+ has 128-bit FPU datapaths, so a 256-bit FMA is one per cycle). ~1.1 s of the
+  1-thread encoder. **Partly explained: tinyBLAS's `BM` row blocking is worth ~1.15x at k=64 and 1.02x
+  at k=768, and whisper's `m = 1500` cannot reach `BM = 4` because 1500 % 16 == 12** — the same "a
+  frame count is a number nothing rounds" as the `k % KN` finding. Reaching it needs a **cascade**
+  (16-row prefix at BM=4, then 8, then 4, then the existing <= 3 row 1x1 tail); the naive version — a
+  16-row prefix with a 15-row `gemm_bloc<1,1>` tail — is a regression, because that tail is one `hsum`
+  per element. Ceiling ~1.15x on one op, needs a row offset threaded through `gemm`'s job
+  partitioning: **do it on the workstation, not the 2-core dev box.** The remaining ~1.8x has no
+  identified mechanism; the epilogue, the store pattern (mechanism falsified — no dependence on the
+  size of C) and the address arithmetic are all ruled out. **Start the next attempt with a hardware
+  profiler**, not a fifth guess. *Do not write a fused attention kernel.*
+  → [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)
+  (3) **`SOFT_MAX` is RE-OPENED, and Retro-012's reason for closing it was wrong.** Its two "floor"
+  probes were plain scalar C measured against a hand-vectorised candidate, so they compared compilers,
+  not work — on the dev box the "no exp" arm comes out SLOWER than the arm it bounds. Rebuilt as the
+  same function with the exp switched off, plus the `memcpy` arm nobody ever ran: **ggml is 3.9x the
+  memcpy floor, so it is not bandwidth bound**, the exp is **1.42x** of a fused row, and the pass
+  fusion is 1.16x. Of its 682 ms over 12 calls, 174 is the bytes, 241 the pass structure, 175 the exp,
+  92 ggml's two extra passes; onnxruntime does the same 12 calls in 515. **The item to open is
+  `ggml_v_expf`, not a soft_max rewrite** — the same shape of finding as `ggml-0010`'s GELU, in the
+  same file. The 285K's 1.06x for the fusion stands as a number and falls as a reason.
+  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU + k-tail done, three items open.*
 * [ ] **The README's TTS and LM columns need the per-launch sampling the ASR column just got.** On the
   Core Ultra 9 285K (8 P-cores + 16 E-cores, no SMT) thread placement is chosen **once per process**
   and then sticks, so every run inside one process inherits the same luck and a within-process median
