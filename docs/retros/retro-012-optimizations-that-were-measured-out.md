@@ -35,10 +35,18 @@ on the other side that cancels it.
 | ggml not fusing conv+bias+activation | 6.5% of the whole unfused elementwise + activation chain |
 | the C++↔Lua array boundary | 18.7 ms |
 | depthwise convolutions lowered as dense | wrong — the exporter emits 12 `CONV_1D_DW` nodes, matching onnxruntime one for one |
-| fusing `SOFT_MAX`'s five row passes into three | 1.06x on the machine that motivated it; **deleting the exp entirely is 0.99x** — see below |
-| a cheaper `exp` for `SOFT_MAX` | same measurement: there is nothing there to buy |
+| fusing `SOFT_MAX`'s five row passes into three | **CORRECTED 2026-08-24** — 1.06x on the 285K, but the reasoning that closed it was wrong and the dev box gets 1.16x; see below |
+| a cheaper `exp` for `SOFT_MAX` | **CORRECTED 2026-08-24** — the probe that closed this was not a floor; the exp is 1.4-1.6x of the row, not 1.0x |
+| a cheaper `hsum` epilogue for tinyBLAS at `k = 64` | 1.06x, under the dev box's noise floor (P4.18) |
+| rows-inner loop order, so a store finishes a cache line of C | **mechanism falsified**: no dependence on the size of C — see below |
+| `ggml-0002`'s aarch64 address hoist applied to x86 | neutral at every k tested, small and large |
+| *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired, and 1.02x at k=768; real but partial, and whisper's m=1500 cannot reach `BM = 4` |
 
-### `SOFT_MAX`: a real mechanism, on the wrong side of the bottleneck (2026-08-24, P4.18)
+### `SOFT_MAX`: closed on the right number for the wrong reason (2026-08-24, P4.18)
+
+*(This section was written as "a real mechanism, on the wrong side of the bottleneck" and is kept
+with its original reasoning intact, because the correction below is about the reasoning and a
+rewritten section would hide what went wrong.)*
 
 The mechanism was real and easy to confirm by reading `ggml_compute_forward_soft_max_f32`: **five
 passes over every row** (copy to scratch, scale scratch, max-reduce, exp+sum, normalise) where three
@@ -46,8 +54,9 @@ suffice, and an AVX2 loop that **horizontally reduces its accumulator every 8 el
 at 4.3x onnxruntime. A 3-pass row with the scale folded into the exp and four accumulators reduced
 once is an obvious, safe rewrite, and on the dev box it is worth 1.34x.
 
-**On the machine that motivated the item it is worth 1.06x**, and two throwaway probes said why before
-any of it was written as a patch — `1500 x 1500 x 12 heads`, one thread, Core Ultra 9 285K:
+**On the machine that motivated the item it is worth 1.06x**, and two throwaway probes were read as
+saying why before any of it was written as a patch — `1500 x 1500 x 12 heads`, one thread, Core
+Ultra 9 285K:
 
 | | one call | vs ggml |
 |---|---|---|
@@ -56,20 +65,86 @@ any of it was written as a patch — `1500 x 1500 x 12 heads`, one thread, Core 
 | *probe:* 3-pass with a fast bit-trick exp | 32.3 ms | 0.97x |
 | *probe:* 3-pass with **no exp at all** | 31.6 ms | 0.99x |
 
-**Deleting the exp is not faster than computing it.** The score matrix is 108 MB, a row is 6 KB and
-stays in L1 across every pass, and the op is bound by streaming ~540 MB through one core's memory
-path. Neither the pass count nor the exp is the lever.
+**That was the conclusion, and the two probes it rests on are not floors.** Both were written as
+plain scalar C and left to the auto-vectoriser, and both were compared against a candidate written in
+hand intrinsics — so what they measured was two compilers' output, not two amounts of work.
 
-**Actionable takeaway — probe the floor before optimising the middle.** The "no exp at all" arm is not
-a candidate and could never ship; it took ten minutes and it is the entire result. Any elementwise
-kernel over a tensor larger than cache deserves that probe *first*, because it distinguishes "this
-kernel is slow" from "this kernel is a memcpy with arithmetic attached", and only the first is
-fixable by writing a better kernel.
+#### The correction (2026-08-24, dev box)
 
-**And a caveat this leaves behind on P4.18's table:** a memory-bound op is exactly where a per-op
-ratio against another engine stops meaning "same work". onnxruntime's 93 ms for 324 M elements is a
-rate no single core reaches by streaming, so that 4.3x should be treated as unexplained rather than as
-a target. The clamp/GELU sibling in the same item was the opposite case and went 9.9x in model.
+Re-run on a Ryzen 3 3250U with the floor arm built the *same way* as the arm it bounds —
+`cand_soft_max_row<0>`, the identical function with `ggml_v_expf` switched off at compile time and
+nothing else changed — and with the arm the original never had at all, a `memcpy` of the same bytes:
+
+| `1500 x 18000` rows, one thread, Ryzen 3 3250U | one call | x12 calls | |
+|---|---|---|---|
+| ggml, 5-pass row | 56.8 ms | 682 ms | — |
+| 3-pass candidate | 49.2 ms | 590 ms | **1.16x** |
+| *floor:* same arm, exp switched off | 34.6 ms | 415 ms | the exp is **1.42x** of the candidate |
+| *floor:* `memcpy` of the same bytes | 14.5 ms | 174 ms | 13.9 GB/s |
+
+**ggml's row body is 3.9x the memcpy floor, so this op is not bandwidth bound**, and the tell was
+visible in the old probes all along: on this box the "no exp" arm came out at 47.2 ms against the
+candidate's 42.6 — *slower than the thing it claimed to bound*, which cannot happen if it is a floor.
+
+The **number** for the 285K stands: the 3-pass candidate really is 1.06x there, measured directly.
+What does not stand is the **reason** — "bound by streaming 540 MB through one core" was inferred from
+the probes rather than measured, and the memcpy arm that would have tested it costs ten minutes and
+was never run. On the machine where it *was* run, the bytes are a quarter of the time and the exp is
+another third.
+
+**So: `SOFT_MAX` stays closed on the 285K on its own 1.06x, and is OPEN on any machine where the
+fusion is worth more.** The item to re-open is not a soft_max rewrite; it is `ggml_v_expf`, which the
+corrected floor prices at 1.4-1.6x of a fused row — the same shape of finding as `ggml-0010`'s GELU,
+in the same file.
+
+#### The takeaway, restated correctly
+
+**A floor arm must be built the same way as the arm it bounds.** "Probe the floor before optimising
+the middle" was right and is still right; what this retro got wrong is that a probe written in a
+different style is not a floor, it is a second candidate. Two rules follow:
+
+* **Delete the expensive part from the REAL arm** — a template parameter, a `#if`, a lambda — rather
+  than writing a simpler program that does the same job. If the floor comes out slower than the thing
+  it bounds, that is not a surprising result, it is a broken probe.
+* **For "it is memory bound", the floor is `memcpy`.** Not a cheaper kernel, not a deleted operation:
+  the actual bytes, moved by the actual machine, in the actual working-set size. It is three lines,
+  and it is the only arm that can support the claim.
+
+**And the caveat this leaves on P4.18's table:** the 4.3x against onnxruntime was read as suspicious
+on the grounds that a memory-bound op cannot be compared. It is not memory bound, and the comparison
+is fine — onnxruntime's own per-node profile on the dev box puts its 12 `Softmax` at 515 ms against
+loom's 682, which is 1.24x and sits almost exactly on the 3-pass candidate's 590. It was never a rate
+"no single core reaches by streaming"; it is a core doing less work per element.
+
+### A dev-box noise floor that ate two verdicts (2026-08-24, P4.18)
+
+Chasing `QK^T` at `k = 64`, the same binary reported **27.9 GFLOP/s and then 12.6** for the same shape
+twenty minutes apart, on a 2-core laptop still warm from a `ctest` run. Two verdicts were written from
+inside that noise before it was characterised, and both were wrong:
+
+* **"rows-inner loop order is worth 1.26x"** — it appeared once, in one standalone run, with a
+  plausible mechanism (a 4-float store finishes a 64-byte line of C) and a control that fitted
+  (the gap vanishes at k=768). Re-run with C shrunk until it fits in cache and the flops held equal,
+  the ratio went 1.07 / 1.28 / 0.96 / 1.04 / 0.96 / 0.98 — **no dependence on the size of C**, which
+  is the one thing that mechanism has to show. Implementing it in ggml measured -6%.
+* **"`BM` row blocking has no effect"** — three shapes, one run, 27.2 / 25.7 / 27.7 GFLOP/s. A later
+  run of the same three gave 17.8 / 22.4 / 26.5, a 1.49x spread the other way. Neither was the answer.
+
+**What worked was a paired test** (`scripts/bench14.cpp`). Two arms back to back inside one round, the
+*ratio* recorded per round, 31 rounds, reported as a median with p10/p90. Clock drift moves both halves of a pair together
+and cancels; two independent minima do not. It resolved `BM = 4` at **1.16x (p10 0.95)** with a k=768
+control at **1.02x** — a real but partial effect, weakly resolved, which is a different verdict from
+either of the first two.
+
+* **Interleaving arms is not enough; pair them and take the ratio.** Min-over-interleaved-rounds still
+  compares two independent minima drawn from different parts of a thermal excursion. A per-round
+  ratio does not.
+* **Publish the noise floor with the result.** The witness spread on this box is 1.4-2.5x. Anything
+  under ~1.2x is not measurable here, and saying so is more useful than a number that will not
+  reproduce. A p10 that crosses 1.0 is "weak", not "1.16x".
+* **A falsified mechanism outlives a noisy number.** The useful half of the loop-order result is not
+  "-6%"; it is that C's size does not matter, which closes the store-traffic explanation for good
+  however the timings land next week.
 
 * **Actionable takeaway 1 — a verdict has a shelf life.** The im2col item was closed at 0.98x with
   "do not re-propose", and that verdict was *right for the engine it was measured on*. Once the GEMM

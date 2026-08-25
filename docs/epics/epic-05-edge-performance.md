@@ -517,7 +517,7 @@ written as `z<C?z:C`, as `fminf`, and as a clamp on `z^2` recovered with `sqrt`,
 aarch64. (clang vectorises all of them.) Hence explicit intrinsics, in the shape of ggml's own
 `ggml_v_expf`.
 
-##### SOFT_MAX: not the pass count, not the exp — MEASURED OUT
+##### SOFT_MAX: measured out, then RE-OPENED — the floor arm was not a floor
 
 The mechanism looked as clean as GELU's. Per row `ggml_compute_forward_soft_max_f32` makes **five
 passes** (copy to scratch, scale scratch, max-reduce, exp+sum, normalise) where three suffice, and its
@@ -534,19 +534,42 @@ row, and on the *dev box* it is worth 1.34x.
 | *probe:* 3-pass with a **fast bit-trick exp** (far too inaccurate to ship) | 32.3 ms | **0.97x** |
 | *probe:* 3-pass with **no exp at all** | 31.6 ms | **0.99x** |
 
-**Deleting the exp entirely buys nothing.** At these shapes the score matrix is 108 MB, a row is 6 KB
-and stays in L1 across every pass, and what the op is actually bound by is streaming 108 MB in and out
-of DRAM on one thread — roughly 540 MB of traffic in 30 ms, which is single-core bandwidth. A cheaper
-exp is not the lever and neither is the pass count; **do not write a soft_max kernel for this.** If
-anything moves this line it is not touching `SOFT_MAX` at all — it is not materialising the score
-matrix, which is candidate 2's territory.
+**That was the conclusion, and it was wrong — the two probes are not floors.** Both were written as
+plain scalar C and left to the auto-vectoriser, and both were compared against a candidate written in
+hand intrinsics, so what they measured was two compilers' output rather than two amounts of work. The
+tell was visible in them: on the dev box the "no exp" arm comes out at 47.2 ms against the candidate's
+42.6 — *slower than the thing it claims to bound*, which cannot happen if it is a floor.
 
-This also means **the 4.3x in the table above should be read with suspicion rather than as a target.**
-The premise behind the whole table was checked and does hold — onnxruntime's encoder graph alone, same
-clip, same machine, is **2.49 s at `intra_op=1`** against 1.29 at 2 and 0.79 at 4, so the 2.376 s it is
-compared with is genuinely a one-thread number and the split is like-for-like. But a memory-bound op is
-the one place where "same wall time, same threads" still does not mean "same work", and 93 ms for 324 M
-elements is a number no single core reaches by streaming.
+Re-measured (2026-08-24) with the floor built the same way as the arm it bounds —
+`cand_soft_max_row<0>`, the identical function with `ggml_v_expf` switched off at compile time — and
+with the arm neither pass ever had, a `memcpy` of the same bytes. One thread, Ryzen 3 3250U,
+`scripts/bench12.cpp`:
+
+| `1500 x 18000` rows | one call | x12 calls | |
+|---|---|---|---|
+| ggml, 5-pass row | 56.8 ms | 682 ms | — |
+| 3-pass candidate | 49.2 ms | 590 ms | **1.16x** |
+| *floor:* same arm, exp switched off | 34.6 ms | 415 ms | the exp is **1.42x** of the candidate |
+| *floor:* `memcpy` of the same bytes | 14.5 ms | 174 ms | 13.9 GB/s |
+
+**ggml's row body is 3.9x the memcpy floor, so `SOFT_MAX` is not bandwidth bound here.** Where its
+682 ms goes: 174 ms is the bytes, 241 ms is the pass structure above them, 175 ms is the exp, and
+92 ms is ggml's two extra passes. onnxruntime's own per-node profile on the same box puts its 12
+`Softmax` at **515 ms** — between the candidate (590) and the no-exp floor (415), i.e. a core doing
+less work per element, not one moving fewer bytes.
+
+**So the 285K's 1.06x stands as a number and falls as a reason.** It was measured directly there and
+is not in doubt; what was never measured on either machine is the memcpy floor, which is three lines.
+The item to re-open is not a soft_max rewrite — it is **`ggml_v_expf`**, which the corrected floor
+prices at 1.4-1.6x of a fused row. That is the same shape of finding as `ggml-0010`'s GELU, in the
+same file. See [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), corrected.
+
+And **the 4.3x in the table above needs no suspicion after all.** It was discounted on the grounds
+that a memory-bound op cannot be compared per-op; the op is not memory bound, loom is 1.24x
+onnxruntime at the bench level, and the difference is work per element. The premise behind the whole
+table was separately checked and does hold — onnxruntime's encoder graph alone, same clip, same
+machine, is **2.49 s at `intra_op=1`** against 1.29 at 2 and 0.79 at 4, so the 2.376 s it is compared
+with is genuinely a one-thread number and the split is like-for-like.
 
 **And note the LayerNorm row: loom is 3x faster there.** Nothing in this table is uniformly behind,
 which is the usual sign that the gap is specific kernels rather than a systemic disadvantage.
@@ -676,10 +699,79 @@ moves `max/absmax` **4.19e-04 -> 4.34e-04** against a 1e-3 limit and `mean_abs_d
 already divided 8.)
 
 MLAS drops only 9% over the same range (34.8 GFLOP/s at k=64 against 38.3 at k=768, from its own
-per-node profile), so this is a kernel-design difference and not a property of the shape: ggml
-vectorises **along k** and pays a per-tile `hsum` epilogue, which at k = 64 amortises over eight loop
-iterations. Worth ~1.1 s of the 1-thread encoder on the dev box. *Do not start by writing a fused
-attention kernel* — that is still ruled out above.
+per-node profile), so it is a property of ggml's kernel and not of the shape. Worth ~1.1 s of the
+1-thread encoder on the dev box. *Do not start by writing a fused attention kernel* — that is still
+ruled out above.
+
+**First, the estimator, because it cost two wrong answers here.** The same binary measured this shape
+at 27.9 GFLOP/s and, twenty minutes later on a box still warm from a `ctest` run, at 12.6 — a 2.2x
+swing. Min-over-interleaved-rounds fixes the worst of it (every shape runs once per round, rounds
+repeat, and a `proj`-shaped GEMM re-runs every round as a clock witness) but **it is still not enough
+on this machine**: the witness's own worst/best spread is 1.4-2.5x, which is larger than most of the
+effects being tested, and a longer table depresses every row in it by ~15% as the laptop heats.
+
+**What does work here is a PAIRED test.** Two arms run back to back inside one round, the *ratio* is
+recorded per round, and the report is the median ratio with its p10/p90. Clock drift moves both halves
+of a pair together and cancels; two independent minima do not. Everything below is 31 paired rounds.
+**Nothing smaller than about 1.2x is resolvable on this box even so**, and a result whose p10 crosses
+1.0 should be read as "weak" rather than as a number.
+
+**Second, the ceiling, because 44 GFLOP/s is not "peak".** The dev box is Zen+, which has **128-bit
+FPU datapaths**: a 256-bit FMA is two uops retiring one per cycle, so single-core F32 peak is 8 lanes
+x 2 flops x ~3.4 GHz = **~54 GFLOP/s**, not the ~112 a lane count suggests. The `proj` witness lands
+at 84-88% of that on a cool run — which is the real reason loom's dense GEMM is only 1.10x behind
+MLAS: **there is nothing there to win.**
+
+##### The size of the thing, and what is under it
+
+| paired, 31 rounds, ratio of rates (`scripts/bench14.cpp`) | p10 | median | p90 |
+|---|---|---|---|
+| `QK^T` k=64 against `proj 768x1500x768` | 1.66 | **2.10** | 2.48 |
+| `BM=4` (m=1504) against `BM=1` (m=1500), k=64 | 0.95 | **1.16** | 1.45 |
+| `BM=2` (m=1496) against `BM=1` (m=1500), k=64 | 0.86 | 1.06 | 1.36 |
+| `BM=4` (m=1504) against `BM=1` (m=1492), k=64 | 1.01 | **1.13** | 1.58 |
+| *control:* the same BM pair at **k=768** | 0.89 | **1.02** | 1.09 |
+
+So `QK^T` at k=64 runs at about **half** the rate of a projection-shaped GEMM, and **tinyBLAS's row
+blocking is a real but partial contributor**: `BM = 4` is worth ~1.15x at k=64 and **nothing at k=768**
+(1.02, which is the control behaving exactly as a blocking story predicts). It is not the whole 2.1x,
+and its p10 sits on 1.0, so it is weakly resolved.
+
+**And whisper's `QK^T` cannot reach `BM = 4`.** tinyBLAS picks `BM` from `m % 16 / 8 / 4`, and
+1500 % 16 == 12, so it gets `BM = 1` — the least blocked of the three, for the same reason `k = 1500`
+missed `KN`: a frame count is a number nothing rounds.
+
+##### What was tried, and what each attempt is worth knowing for
+
+| candidate | measured | verdict |
+|---|---|---|
+| a 16-row prefix so `BM = 4` is reachable for an m that is only `% 4` | 27.2 -> 21.1 GFLOP/s in ggml | **a regression — but on the tail, not the idea** |
+| rows inner, columns outer, so a 4-float store finishes a 64-byte line of C | 1.26x once; **no dependence on the size of C** on re-run | **mechanism falsified** |
+| a cheaper `hsum` epilogue — 3 `hadd` + one `_mm_storeu_ps` for four reductions | 7.77 -> 7.33 ms standalone | 1.06x, **under the noise floor** |
+| `ggml-0002`'s aarch64 address hoist applied to x86 | 27.3 against 27.2 | **neutral** |
+
+**The 16-row prefix failed on the row tail, not on the idea** — which the paired table above now makes
+clear, since `BM = 4` really is worth ~1.15x. `ggml-0003`'s `gemm_tail` is `gemm_bloc<1,1>` per output
+— one `hsum` per element instead of one per twelve — so widening the tail from <= 3 rows to <= 15
+costs more than the better schedule returns. **The shape of a fix that could work is a cascade**: a
+16-row prefix at `BM = 4`, then the next 8 at `BM = 2`, then 4 at `BM = 1`, then the existing <= 3 row
+1x1 tail. That needs a row offset threaded through `gemm`'s job partitioning, which is threaded code
+this box has two cores to test, for a ceiling of ~1.15x on one op — about 1.7% of a transcription.
+Worth doing on the workstation, not here.
+
+**The store-locality one is the cautionary tale.** A standalone 4x3 tile measured 36.4 GFLOP/s with
+rows inner against 28.9 with columns inner — same tile function, verified identical C, and the gap
+vanishing at k=768 exactly as a store-traffic story predicts. It looked settled. It was not: re-run
+with C shrunk until it fits in cache and the flops held equal, the ratio went 1.07 / 1.28 / 0.96 /
+1.04 / 0.96 / 0.98 — **no dependence on the size of C at all**, which is the one thing a store-traffic
+mechanism has to show. That is a falsified mechanism rather than a noisy number, and it is the useful
+half of the result.
+
+**Where that leaves it.** Roughly 2.1x against the witness, of which ~1.15x is row blocking that
+whisper's `m = 1500` cannot reach; **the remaining ~1.8x has no identified mechanism.** It is not the
+epilogue, not the store pattern and not the address arithmetic. The next attempt should start with a
+hardware profiler — `perf` is not installed on the dev box — or on the workstation, where the noise
+floor is low enough to resolve what this one cannot.
 
 **Not a gap, but worth knowing:** whisper pads every clip to 30 s, so an 11-second file pays the full
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
@@ -733,6 +825,24 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
   `KN` is 4 and whisper's 1500-frame contraction divides it exactly. The same matmul on x86 never
   entered the file. When a bench only builds on one architecture, that is a coverage hole with a
   measurement attached, not a portability chore.
+* **A floor arm must be built the same way as the arm it bounds.** Deleting the expensive part is the
+  right idea; writing a *simpler program* that does the same job is not the same thing. Retro-012
+  closed `SOFT_MAX` on two scalar-C probes measured against a hand-vectorised candidate — and on the
+  dev box the "no exp" one comes out SLOWER than the arm it bounds, which is impossible for a floor.
+  Use a template parameter or a `#if` on the real arm. And for "it is memory bound", the floor is
+  `memcpy` of the actual bytes at the actual working-set size — three lines, never run, and it turned
+  out to be 3.9x below where the kernel sat.
+* **On a laptop, interleaving is not enough — pair the arms and take the RATIO.** The same binary
+  gave 27.9 and 12.6 GFLOP/s for the same shape twenty minutes apart. Min-over-interleaved-rounds
+  still compares two independent minima drawn from different parts of a thermal excursion; a per-round
+  ratio of two arms run back to back cancels the drift. Keep a fixed reference shape in every round as
+  a clock witness and **publish its spread with the result** — on the dev box it is 1.4-2.5x, so
+  nothing under ~1.2x is measurable there, and saying so beats a number that will not reproduce. Two
+  P4.18 verdicts were written from inside that noise and both were wrong (Retro-012).
+* **Know the machine's actual peak before calling a kernel efficient or slow.** Zen+ has 128-bit FPU
+  datapaths, so a 256-bit FMA retires one per cycle and single-core F32 peak is ~54 GFLOP/s, not the
+  ~112 a lane count suggests. That one number turned "the dense GEMM is 44 GFLOP/s and MLAS does
+  better" into "the dense GEMM is at 88% of the machine and there is nothing to win".
 * **For a float32 kernel, the error bound is enumerable — do not sample it.** The domain is 2^32
   values; a sweep against a double-precision reference takes about 30 s on 24 cores and gives the
   actual worst case rather than a grid maximum. It is also the only thing that finds the tails: P4.18's

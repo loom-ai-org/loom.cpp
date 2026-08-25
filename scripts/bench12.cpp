@@ -77,7 +77,21 @@ static void base_soft_max_row(const int n, float * dp, const float * sp, float *
     ggml_vec_scale_f32(n, dp, (float) sum);
 }
 
+// `ggml_v_expf` or nothing, chosen at compile time. See cand_soft_max_row.
+template <int WITH_EXP, typename V> static inline V EXPV(V x) { return WITH_EXP ? ggml_v_expf(x) : x; }
+
 // SOFT_MAX candidate: three passes, scale folded into the exp, accumulators reduced once.
+//
+// TEMPLATED ON WHETHER THE EXP IS REAL, and that is the whole point. `WITH_EXP = 0` replaces
+// `ggml_v_expf` with the identity and changes NOTHING else -- same intrinsics, same unroll, same
+// stores, same reduction -- so the difference between the two instantiations is the exp and only the
+// exp. The two scalar-C probes this file used to carry could not say that: they were plain loops left
+// to the auto-vectoriser, measured against a hand-written AVX2/AVX-512 arm, so what they compared was
+// two compilers' output. On a Ryzen 3 3250U the `noexp` one came out SLOWER than the arm it was
+// supposed to bound -- impossible for a floor, and the tell that it was never one. Retro-012 read
+// those probes as "deleting the exp buys nothing (0.99x)" and concluded SOFT_MAX was DRAM-bound; with
+// the floor built this way it is 1.63x, and the memcpy arm below says the bytes are a quarter of it.
+template <int WITH_EXP = 1>
 static void cand_soft_max_row(const int n, float * dp, const float * sp, float scale) {
     int i = 0;
     float max = -INFINITY;
@@ -91,15 +105,15 @@ static void cand_soft_max_row(const int n, float * dp, const float * sp, float s
         const __m512 vs = _mm512_set1_ps(scale), vm = _mm512_set1_ps(maxs);
         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
         for (; i + 31 < n; i += 32) {
-            __m512 v0 = ggml_v_expf(_mm512_fmsub_ps(_mm512_loadu_ps(sp + i     ), vs, vm));
-            __m512 v1 = ggml_v_expf(_mm512_fmsub_ps(_mm512_loadu_ps(sp + i + 16), vs, vm));
+            __m512 v0 = EXPV<WITH_EXP>(_mm512_fmsub_ps(_mm512_loadu_ps(sp + i     ), vs, vm));
+            __m512 v1 = EXPV<WITH_EXP>(_mm512_fmsub_ps(_mm512_loadu_ps(sp + i + 16), vs, vm));
             _mm512_storeu_ps(dp + i,      v0);
             _mm512_storeu_ps(dp + i + 16, v1);
             a0 = _mm512_add_ps(a0, v0);
             a1 = _mm512_add_ps(a1, v1);
         }
         for (; i + 15 < n; i += 16) {
-            __m512 v0 = ggml_v_expf(_mm512_fmsub_ps(_mm512_loadu_ps(sp + i), vs, vm));
+            __m512 v0 = EXPV<WITH_EXP>(_mm512_fmsub_ps(_mm512_loadu_ps(sp + i), vs, vm));
             _mm512_storeu_ps(dp + i, v0);
             a0 = _mm512_add_ps(a0, v0);
         }
@@ -111,17 +125,17 @@ static void cand_soft_max_row(const int n, float * dp, const float * sp, float s
         __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
         __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
         for (; i + 31 < n; i += 32) {
-            __m256 v0 = ggml_v_expf(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i     ), vs, vm));
-            __m256 v1 = ggml_v_expf(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i +  8), vs, vm));
-            __m256 v2 = ggml_v_expf(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i + 16), vs, vm));
-            __m256 v3 = ggml_v_expf(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i + 24), vs, vm));
+            __m256 v0 = EXPV<WITH_EXP>(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i     ), vs, vm));
+            __m256 v1 = EXPV<WITH_EXP>(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i +  8), vs, vm));
+            __m256 v2 = EXPV<WITH_EXP>(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i + 16), vs, vm));
+            __m256 v3 = EXPV<WITH_EXP>(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i + 24), vs, vm));
             _mm256_storeu_ps(dp + i,      v0);  _mm256_storeu_ps(dp + i +  8, v1);
             _mm256_storeu_ps(dp + i + 16, v2);  _mm256_storeu_ps(dp + i + 24, v3);
             a0 = _mm256_add_ps(a0, v0);  a1 = _mm256_add_ps(a1, v1);
             a2 = _mm256_add_ps(a2, v2);  a3 = _mm256_add_ps(a3, v3);
         }
         for (; i + 7 < n; i += 8) {
-            __m256 v0 = ggml_v_expf(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i), vs, vm));
+            __m256 v0 = EXPV<WITH_EXP>(_mm256_fmsub_ps(_mm256_loadu_ps(sp + i), vs, vm));
             _mm256_storeu_ps(dp + i, v0);
             a0 = _mm256_add_ps(a0, v0);
         }
@@ -137,17 +151,17 @@ static void cand_soft_max_row(const int n, float * dp, const float * sp, float s
         float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
         float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
         for (; i + 15 < n; i += 16) {
-            float32x4_t v0 = ggml_v_expf(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i     ), vs));
-            float32x4_t v1 = ggml_v_expf(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i +  4), vs));
-            float32x4_t v2 = ggml_v_expf(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i +  8), vs));
-            float32x4_t v3 = ggml_v_expf(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i + 12), vs));
+            float32x4_t v0 = EXPV<WITH_EXP>(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i     ), vs));
+            float32x4_t v1 = EXPV<WITH_EXP>(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i +  4), vs));
+            float32x4_t v2 = EXPV<WITH_EXP>(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i +  8), vs));
+            float32x4_t v3 = EXPV<WITH_EXP>(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i + 12), vs));
             vst1q_f32(dp + i, v0);      vst1q_f32(dp + i +  4, v1);
             vst1q_f32(dp + i + 8, v2);  vst1q_f32(dp + i + 12, v3);
             a0 = vaddq_f32(a0, v0);  a1 = vaddq_f32(a1, v1);
             a2 = vaddq_f32(a2, v2);  a3 = vaddq_f32(a3, v3);
         }
         for (; i + 3 < n; i += 4) {
-            float32x4_t v0 = ggml_v_expf(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i), vs));
+            float32x4_t v0 = EXPV<WITH_EXP>(vfmsq_f32(vnegq_f32(vm), vld1q_f32(sp + i), vs));
             vst1q_f32(dp + i, v0);
             a0 = vaddq_f32(a0, v0);
         }
@@ -155,7 +169,7 @@ static void cand_soft_max_row(const int n, float * dp, const float * sp, float s
     }
 #endif
     for (; i < n; ++i) {
-        const float v = expf(scale*sp[i] - maxs);
+        const float v = WITH_EXP ? expf(scale*sp[i] - maxs) : (scale*sp[i] - maxs);
         dp[i] = v;
         sum += (ggml_float) v;
     }
@@ -163,43 +177,23 @@ static void cand_soft_max_row(const int n, float * dp, const float * sp, float s
     for (i = 0; i < n; ++i) dp[i] *= inv;
 }
 
-// A THIRD soft_max arm, which exists only to bound what is left: identical 3-pass structure, but the
-// exp replaced by the Schraudolph bit-trick (build 2^x by writing the exponent field directly, ~2e-2
-// relative). FAR too inaccurate to ship -- it is here to answer "is the remaining time the exp, or the
-// traffic?", and nothing else. If this arm is not much faster than the candidate, the exp is not what
-// soft_max is spending its time on and a cheaper exp is not the lever.
-static inline float fast_expf(float a) {
-    union { float f; int32_t i; } u;
-    const float k = 12102203.16156148f;      // 2^23 / ln 2
-    const float b = 1064986816.0f;           // 127*2^23 - a small bias correction
-    float t = k*a + b;
-    t = t < 0.0f ? 0.0f : t;
-    u.i = (int32_t) t;
-    return u.f;
-}
-
-static void probe_soft_max_row_fastexp(const int n, float * dp, const float * sp, float scale) {
-    float max = -INFINITY;
-    for (int i = 0; i < n; ++i) max = sp[i] > max ? sp[i] : max;
-    const float maxs = scale*max;
-    float sum = 0;
-    for (int i = 0; i < n; ++i) { const float v = fast_expf(scale*sp[i] - maxs); dp[i] = v; sum += v; }
-    const float inv = 1.0f/sum;
-    for (int i = 0; i < n; ++i) dp[i] *= inv;
-}
-
-// And a FOURTH: the candidate's 3-pass traffic with NO exp at all (a plain copy in its place), which
-// puts a hard floor under the structure -- whatever this costs is what three passes over the row
-// cost, and everything above it is arithmetic.
-static void probe_soft_max_row_noexp(const int n, float * dp, const float * sp, float scale) {
-    float max = -INFINITY;
-    for (int i = 0; i < n; ++i) max = sp[i] > max ? sp[i] : max;
-    const float maxs = scale*max;
-    float sum = 0;
-    for (int i = 0; i < n; ++i) { const float v = scale*sp[i] - maxs; dp[i] = v; sum += v; }
-    const float inv = 1.0f/(sum == 0.0f ? 1.0f : sum);
-    for (int i = 0; i < n; ++i) dp[i] *= inv;
-}
+// THE TWO FLOORS, and why the ones that used to be here were not floors.
+//
+// This file previously carried two probes -- a Schraudolph bit-trick exp and a no-exp copy -- both
+// written as plain scalar C and left to the auto-vectoriser, and both compared against a candidate
+// written in hand intrinsics. What they measured was two compilers' output, not two amounts of work.
+// On a Ryzen 3 3250U the no-exp one came out at 47.2 ms against the candidate's 42.6 -- SLOWER than
+// the thing it claimed to put a floor under, which cannot happen and is the tell. Retro-012 read them
+// as "deleting the exp entirely is 0.99x" and concluded SOFT_MAX was DRAM-bandwidth bound.
+//
+// Both floors below are honest ones:
+//   * `cand_soft_max_row<0>` is the SAME FUNCTION with the exp switched off at compile time, so the
+//     only difference is the exp. On the dev box that is 1.63x, not 1.00x.
+//   * `memcpy` of the same bytes is what "bandwidth bound" is a claim ABOUT, and neither Retro-012
+//     nor its predecessor ever measured it. On the dev box ggml's row body is 3.9x above it.
+//
+// A floor arm has to be built the same way as the arm it bounds. That is the lesson, and it is
+// cheaper to restate here than to re-derive.
 
 // ---------------------------------------------------------------------------------------------
 
@@ -299,20 +293,23 @@ int main(int argc, char ** argv) {
         std::vector<double> vc, vd;
         for (int r = 0; r < reps; ++r) {
             double t0 = now();
-            for (int i = 0; i < SR; ++i) probe_soft_max_row_fastexp(SN, yb.data() + (size_t) i*SN, x.data() + (size_t) i*SN, scale);
+            for (int i = 0; i < SR; ++i) cand_soft_max_row<0>(SN, yb.data() + (size_t) i*SN, x.data() + (size_t) i*SN, scale);
             vc.push_back(now() - t0);
             t0 = now();
-            for (int i = 0; i < SR; ++i) probe_soft_max_row_noexp(SN, yb.data() + (size_t) i*SN, x.data() + (size_t) i*SN, scale);
+            std::memcpy(yb.data(), x.data(), (size_t) SN*SR*sizeof(float));
             vd.push_back(now() - t0);
         }
         double mc = median(vc), md = median(vd);
-        printf("SOFT_MAX  %d x %d rows (12 heads), one call\n", SN, SR);
+        const double MB = (double) SN*SR*4 / (1024*1024);
+        printf("SOFT_MAX  %d x %d rows (12 heads), one call -- %.0f MB in + %.0f MB out\n", SN, SR, MB, MB);
         printf("  ggml  5-pass row    %8.2f ms   -> %7.1f ms over %d calls\n", ma*1e3, ma*1e3*SCALLS, SCALLS);
         printf("  cand  3-pass fused  %8.2f ms   -> %7.1f ms over %d calls\n", mb*1e3, mb*1e3*SCALLS, SCALLS);
         printf("  speedup %.2fx        max abs diff %.3e   max rel diff (|y|>1e-6) %.3e\n", ma/mb, maxabs, maxrel);
-        printf("  -- bounds, not candidates --\n");
-        printf("  probe 3-pass, fast exp  %8.2f ms  (%.2fx over ggml)   <- all that a cheaper exp could buy\n", mc*1e3, ma/mc);
-        printf("  probe 3-pass, NO exp    %8.2f ms  (%.2fx over ggml)   <- the floor the row structure sets\n", md*1e3, ma/md);
+        printf("  -- floors, not candidates; both built the same way as the arm above them --\n");
+        printf("  same arm, exp switched off  %8.2f ms  (%.2fx of the candidate)  <- what the exp costs\n", mc*1e3, mb/mc);
+        printf("  memcpy of the same bytes    %8.2f ms  (%.2f GB/s)               <- what the BYTES cost\n",
+               md*1e3, 2*MB/1024.0/md);
+        printf("  ggml is %.1fx the memcpy floor: if that is far above 1, this op is not bandwidth bound\n", ma/md);
     }
     return 0;
 }
