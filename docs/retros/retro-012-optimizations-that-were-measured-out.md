@@ -36,7 +36,8 @@ on the other side that cancels it.
 | the C++↔Lua array boundary | 18.7 ms |
 | depthwise convolutions lowered as dense | wrong — the exporter emits 12 `CONV_1D_DW` nodes, matching onnxruntime one for one |
 | fusing `SOFT_MAX`'s five row passes into three | **CORRECTED 2026-08-24** — 1.06x on the 285K, but the reasoning that closed it was wrong and the dev box gets 1.16x; see below |
-| a cheaper `exp` for `SOFT_MAX` | **CORRECTED 2026-08-24** — the probe that closed this was not a floor; the exp is 1.4-1.6x of the row, not 1.0x |
+| a cheaper `exp` for `SOFT_MAX` | **CORRECTED 2026-08-24, then CLOSED 2026-08-25** — the probe that closed this in the first place was not a floor and the exp really is 1.1-1.4x of the row; but the exp has no accessible headroom, see below |
+| specialising `ggml_v_expf` to `SOFT_MAX`'s domain (no overflow/subnormal path) | **1.00x** on the dev box, **1.13-1.16x** on the 285K, at identical accuracy — and the exp is 7-26% of the op. See below |
 | a cheaper `hsum` epilogue for tinyBLAS at `k = 64` | 1.06x, under the dev box's noise floor (P4.18) |
 | rows-inner loop order, so a store finishes a cache line of C | **mechanism falsified**: no dependence on the size of C — see below |
 | `ggml-0002`'s aarch64 address hoist applied to x86 | neutral at every k tested, small and large |
@@ -115,6 +116,71 @@ on the grounds that a memory-bound op cannot be compared. It is not memory bound
 is fine — onnxruntime's own per-node profile on the dev box puts its 12 `Softmax` at 515 ms against
 loom's 682, which is 1.24x and sits almost exactly on the 3-pass candidate's 590. It was never a rate
 "no single core reaches by streaming"; it is a core doing less work per element.
+
+### `ggml_v_expf`: the item the correction opened, and what closed it (2026-08-25, P4.18)
+
+The correction above ended by naming the next item: *"The item to re-open is not a soft_max rewrite; it
+is `ggml_v_expf`, which the corrected floor prices at 1.4-1.6x of a fused row — the same shape of
+finding as `ggml-0010`'s GELU, in the same file."* That was the right item to open and it is now
+closed, on a floor argument rather than on one candidate's number.
+
+**What looked specialisable.** `ggml_v_expf` is ARM's optimized-routines `expf`: correct for every
+float, including the ones whose result is subnormal or infinite. It pays for that with a mask
+(`|n| > 126`), a `movemask`, and a branch around a slow path that rebuilds the scale in two halves.
+SOFT_MAX's argument is `x - max <= 0` and its result is in `(0, 1]`, so **that path can never be
+reached** — the argument only needs clamping where the answer stops being a normal float.
+
+`scripts/bench12.cpp` carries `sm_expf`: ggml's own fast path, verbatim, with the mask/movemask/branch
+replaced by one `max`. Same range reduction, same degree-5 polynomial, same `2^n` by integer add, so it
+isolates the general-case handling and nothing else. One thread, 131072 floats in `[-30, 0]`, ABBA-paired,
+both arms writing the same destination:
+
+| | Ryzen 3 3250U | Core Ultra 9 285K |
+|---|---|---|
+| `ggml_v_expf` | 0.69 ns/elem | 0.17 ns/elem |
+| `sm_expf` | 0.71 ns/elem | 0.16 ns/elem |
+| **above the load/store floor** | **0.97-1.02x** | **1.13-1.16x** |
+| max rel err vs a double `exp` | 1.847e-07 *both arms* | 1.847e-07 *both arms* |
+
+**And the floor that closes it for every other candidate too.** The same function again with the
+polynomial replaced by `exp(b) ~ 1 + b` — six of its fourteen operations gone, and an answer wrong in
+the second decimal place — runs at **1.64-1.95x**. Nothing that still computes an exp can beat that, so
+**1.8x is the ceiling on any exp rewrite at any accuracy**, and a shippable one gets a fraction of it.
+
+Put that against what the exp is worth inside the op, which is where the two machines part company:
+
+| 12 calls of `SOFT_MAX 1500 x 1500 x 12`, one thread | Ryzen 3 3250U | Core Ultra 9 285K |
+|---|---|---|
+| ggml, 5-pass row | 600 ms | 398 ms |
+| 3-pass candidate | 508 ms (1.19x) | 365 ms (1.08x) |
+| *floor:* same arm, exp off | 372 ms — **the exp is 1.37x** | 338 ms — **the exp is 1.08x** |
+| *floor:* `memcpy` of the same bytes | 168 ms (14.4 GB/s) | **51 ms (47.4 GB/s)** |
+| ggml above the memcpy floor | 3.6x | **7.8x** |
+
+**So the exp is 26% of the op on the dev box and 7% on the 285K**, which is the whole reason the 3-pass
+fusion is 1.19x on one and 1.08x on the other: the 285K's cores are fast enough at the arithmetic that
+what is left is the traffic. Even a *free* exp would be 1.37x / 1.08x on `SOFT_MAX`, which is 5.9% of
+whisper's encoder — **at most 2% and 0.5% of a transcription.** The realistic candidate returns 0-16%
+of that.
+
+**The memcpy arm the correction asked for has now been run on the 285K, and it agrees.** Retro-012's
+original reading — "bound by streaming 540 MB through one core" — is wrong on *both* machines, not just
+the one where it was first disproved: ggml's row body is 7.8x the memcpy floor there, further above it
+than on the dev box.
+
+#### The takeaway
+
+**A "specialise the general-case kernel" item needs the floor priced before the candidate is written.**
+This one had a real mechanism (a mask, a `movemask` and a branch that provably cannot fire), a real
+motivating number (the exp is a third of the op), and a working patch — and it is worth nothing,
+because the general-case handling was never where the operations were. Fourteen of ggml's sixteen
+operations survive the specialisation. **Count the operations you are removing against the operations
+that remain, before measuring; a two-of-sixteen removal cannot be a 1.4x.** The `1 + b` floor is what
+turns that from an argument into a bound, and it is three characters of `if constexpr`.
+
+*Do not re-propose a faster `exp` for `SOFT_MAX`.* If SOFT_MAX is ever worth attacking again, the
+target is the **pass structure** — 287 ms of the 285K's 398 — and even that is capped by the 3-pass
+candidate's own 1.08x there.
 
 ### A dev-box noise floor that ate two verdicts (2026-08-24, P4.18)
 

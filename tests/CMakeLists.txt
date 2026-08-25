@@ -198,6 +198,14 @@ set_tests_properties(test_profile_enabled PROPERTIES LABELS ci)
 set_tests_properties(test_profile_enabled PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 set_tests_properties(test_profile_enabled PROPERTIES ENVIRONMENT "LOOM_PROFILE=1")
 
+# A THIRD registration, for `$LOOM_PROFILE_NODES` -- cached on first call like the other two, so it
+# needs its own process to be observed. The two above run with it unset and assert the finer table is
+# empty; this one asserts it is populated and accounts for exactly the same node executions.
+add_test(NAME test_profile_nodes COMMAND test_profile)
+set_tests_properties(test_profile_nodes PROPERTIES LABELS ci)
+set_tests_properties(test_profile_nodes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+set_tests_properties(test_profile_nodes PROPERTIES ENVIRONMENT "LOOM_PROFILE=1;LOOM_PROFILE_NODES=1")
+
 # Registered TWICE, differing only in ENVIRONMENT, for the same reason test_profile is: ggml reads
 # GGML_CPU_DISABLE_FUSION once, on first use, so one process can only observe one of the two paths.
 # The two registrations also hand each other their outputs through LOOM_TEST_TMPDIR, so whichever runs

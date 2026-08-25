@@ -141,22 +141,33 @@ caveats below matter as much as the numbers.
   11-second clip where the encoder itself needs 84, **57.7% of ASR runtime**, where onnxruntime
   computes those tensors once. Exporting the projected K/V as its own topology is worth **2.4-2.6x on
   every machine here** (on the Pi, 90.0 s to 37.4 s for the same clip).
-* **The whole remaining ASR gap is the ENCODER, and it is three specific kernels rather than a
-  systemic deficit.** Timed separately at one thread on the 285K, loom's encoder is 5.91 s against
-  onnxruntime's 2.38 s while its **decode loop is 1.50x FASTER** (0.65 s against 0.97 s) — the cross-KV
-  fix overshot the decoder into a win, so there is nothing left there. Attributing the encoder's gap at
-  equal call counts: `MUL_MAT` **1.93x = 66%**, layout `CONT` **33x = 16%**, `Softmax` 4.3x, GELU 5.3x
-  — and `LayerNorm`, where **loom is 3x faster than onnxruntime**. Two of those are now closed:
+* **Most of the remaining ASR gap is the ENCODER, and it is specific kernels rather than a systemic
+  deficit.** Timed separately at one thread on the 285K, loom's encoder is 5.46 s against onnxruntime's
+  2.38 s (2.29x) and its decode loop is 1.10 s against 0.97 s (**1.14x slower**). *An earlier version of
+  this table read the decoder as 1.50x FASTER and "nothing left there".* That was wrong: the 471 ms
+  layout bucket under it was assigned to the encoder by eye, and 93% of it is the decode loop — which is
+  why `$LOOM_PROFILE_NODES=1` now exists to attribute a bucket to a graph instead of to a guess.
+  Attributing the encoder's gap at equal call counts: `MUL_MAT` **1.93x = 66%**, layout `CONT`
+  **33x = 16%**, `Softmax` 4.3x, GELU 5.3x — and `LayerNorm`, where **loom is 3x faster than
+  onnxruntime**. Three of those are now closed:
   * **GELU is done.** ggml's exact-erf GELU was a scalar `erff()` libm call per element with no SIMD
     path on any architecture; `cmake/patches/ggml-0010` replaces it with a rational approximation,
     **9.9x on the op in model** and 14.3-21.8x standalone. End to end on whisper that is **2.1% on the
     285K at four threads, 4.4% on the Ryzen at two, and 0.9% on the Pi** — a large kernel win that is a
     small share of a whole transcription, which is exactly what a 3.6%-of-runtime op can be.
-  * **`SOFT_MAX` is measured out.** Its five row passes really are three too many, and rewriting them
-    is worth 1.06x on the machine that motivated it; **deleting the exp entirely is worth 0.99x**. At
-    108 MB the op is DRAM-bandwidth bound, so no kernel fixes it
+  * **A GEMM cliff is done.** tinyBLAS rejected every matmul whose *contraction* was not a whole number
+    of vectors (`k % KN`), handing the whole thing to ggml's generic kernel — and a contraction in
+    attention is a sequence length or a head dimension, i.e. a number nothing rounds. `ggml-0011` splits
+    it: **2.15x at whisper's `A@V` shape**, and **1.19-1.24x end to end on Conformer-CTC**, whose head
+    dimension (176/4 = 44) misses the vector width on every utterance.
+  * **`SOFT_MAX` is measured out — but not for the reason first given.** Its five row passes really are
+    three too many, and rewriting them is worth 1.08x on the machine that motivated it. The original
+    reason, *"at 108 MB the op is DRAM-bandwidth bound"*, is false: against a `memcpy` of the same bytes
+    ggml's row body is **3.6x on the Ryzen and 7.8x on the 285K**. It is closed on size instead —
+    the exp is 7-26% of the op depending on the core, specialising `ggml_v_expf` to this domain is
+    1.00-1.16x, and deleting the polynomial outright is only 1.8x
     ([Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md)).
-  * What is left is the GEMM (66%) and the layout churn (16%), neither started.
+  * What is left is `QK^T` at `k = 64` and the decoder's loop-invariant V transpose, neither started.
 * **Read the 285K's four-thread ASR cell as unstable, not as a 0.12 regression.** It moved 0.71x ->
   0.59x in the same re-measurement that added `ggml-0010`, and the patch is not why: onnxruntime's own
   time at that thread count ranges **1.07 s to 1.59 s across 18 launches, a 1.48x spread**, because
