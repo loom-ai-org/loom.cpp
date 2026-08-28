@@ -112,6 +112,9 @@ are not renumbered. New items continue the scheme.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
 * [ ] **P4.18 — the ASR gap is the encoder's ATTENTION, plus a loop-invariant copy in the decoder.**
+  **A cold session picking this up should start from [`docs/HANDOVER-p4.18.md`](../HANDOVER-p4.18.md)** —
+  the three remaining items with their machines, commands, traps and one decision that needs the
+  repo owner. *Transient: delete it when they are closed.*
   whisper-small is the one task still behind (0.57-0.72x at four threads). The corrected split is
   **encoder 5.46 s vs onnxruntime's 2.38 (2.29x), decode 1.10 s vs 0.97 (1.14x SLOWER)**, and splitting
   onnxruntime's own `MatMul` time by shape shows loom's **dense GEMMs are within 10-12% of MLAS** — the
