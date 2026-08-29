@@ -177,10 +177,17 @@ are not renumbered. New items continue the scheme.
   LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
   somewhere to put ShortConv state, which is a real design question and not a one-line change.
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **P4.16 — the convolution gap, shape by shape.** Both named mechanisms are spent (P4.15c measured
-  one out, P4.15d/f fixed the other) and the model is at 1.033x of onnxruntime end to end.
-  **Re-measure the table against the post-P4.15f export before opening anything new on it.**
-  *Do not start on the resblock kernel again* — measured at 83% of the machine's peak in cache.
+* [ ] **P4.16 — re-measure the convolution table, then decide if anything is left.** **The premise is
+  superseded, so do not read the old table as a ranking.** It was scoped at **1.24x** of onnxruntime on
+  VITS with the whole gap in convolution; since then P4.15c measured one named mechanism out, P4.15d/f
+  fixed the other (a text encoder in the graph twice), P4.15e turned the lowest-ranked row into the
+  thread's biggest win, and the model ended at **1.033x** end to end. **Nothing has been re-measured
+  against the post-P4.15f export**, and the remaining rows have no mechanism attached to any of them.
+  **Step 1 is the table, and it has a close condition:** re-run it (recipe in the epic) and if nothing
+  clears the box's noise floor, **close the item and record the table in Retro-012** — a 1.033x model
+  has ~30 ms of headroom spread over six groups, so that is a likely outcome. *Do not start on the
+  resblock kernel* (83% of the machine's peak in cache, both graph-level ideas measured out) and *rank
+  by the machine's peak as well as by the competitor* — that mistake is why P4.15e was ranked last.
   → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0.** Op eligibility is fixed;
   layout alignment is not (0 of 132 VITS kernels align for block 32 as stored). Acceptance: VITS exports
@@ -232,11 +239,15 @@ are not renumbered. New items continue the scheme.
   Qwen3-TTS is not one. *Context: [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md)*
 * [ ] **Remaining BPE pretokenizer families** beyond the ~40 in `pre_spec_table()` (CJK-script splitters,
   case-transition shapes, `byte_encode=false` SPM-style families). Each raises a named error rather than
-  mis-tokenizing — bounded; add one when a real model needs it.
+  mis-tokenizing — bounded; add one when a real model needs it. **Distinct from P4.23**, which is about
+  ADDED tokens (`<|im_start|>` and friends, which `encode` cannot emit at all) rather than pretokenizer
+  regexes — but both land in `bpe_vocab.cpp`, so check that item before opening this one.
 
 ## Host API
 
-* [ ] **Sampling is greedy argmax only.** No temperature, top-k, top-p or repetition penalty.
+* [ ] **Sampling is greedy argmax only** — **now scoped as P4.24** (above, under Edge performance):
+  the constraint that decides the design, the sizing against the checkpoints, and the reason greedy must
+  stay the default are all there. → [Epic-06 §4](../epics/epic-06-high-level-api-and-hosts.md)
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 

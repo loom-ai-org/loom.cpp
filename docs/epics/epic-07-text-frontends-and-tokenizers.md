@@ -102,7 +102,30 @@ so a chat template is not merely un-applied — it is **unrepresentable**, and e
 LM in the fixture set is being run outside the distribution it was trained on.
 
 Reported as three symptoms; two reproduce, and they share one root cause. All measurements below are
-on the shipped GGUFs in `hf-models/`, through `loom-py` and `tools/loom_cli`, 2026-08-29.
+on the shipped GGUFs in **`../hf-models/`** (a sibling of this checkout, mirroring what is on the Hub —
+`loom-ai-org/gemma-3-270m-it-loom`'s artifact is byte-identical to the local one, `md5 d6591bcf…`),
+through `loom-py` and `tools/loom_cli`, 2026-08-29.
+
+**To reproduce any of this from a cold start**, none of which needs a Pi or the workstation:
+
+```sh
+# the released wheel the report came from, in a throwaway venv
+python3 -m venv /tmp/rc6 && /tmp/rc6/bin/pip install "loom-py-rt==1.0.0rc6"
+/tmp/rc6/bin/python -c '
+import loom
+m = loom.Model.from_file("../hf-models/gemma-3-270m-it/gemma-3-270m-it.gguf")
+print(m.tokenize("<start_of_turn>"))                                  # 8 ids; should be [105]
+print(repr(m.text2text.infer("The capital of France is", 14)))        # the card snippet, loops
+print(m.generate_ids(m.tokenize("The capital of France is"), 14))     # ids: not a prefill echo
+'
+```
+
+The GGUF's own driver and eos KVs come out with `gguf.GGUFReader` — read
+`model.driver_script` for the Lua loop and `tokenizer.ggml.eos_token_id` for the single eos.
+
+The upstream checkpoints these were exported from are in **`~/Dev/models/`** (`gemma-3-270m-it`,
+`smollm2-360m-it`, `qwen3-0.6b-base`, `lfm2-350m`) — which is where `generation_config.json` and
+`tokenizer_config.json` are read from, **not** the HF cache, which holds only refs.
 
 #### The asymmetry, which is the whole item
 

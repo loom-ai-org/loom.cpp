@@ -1215,7 +1215,9 @@ model-semantics change (the positional embedding is fixed at 1500), so it is not
 
 ### Operating notes: benchmarking
 
-**Machines.** The Pi is **`192.168.1.35`** — the `rpi4` name does not resolve. The workstation is
+**Machines.** The Pi answers to **`ssh pi@rpi4`** (verified 2026-08-29; it resolves over IPv6 — an
+earlier note here said the name does not resolve and gave `192.168.1.35`, but **the IPv4 address
+moves**, so prefer the name and fall back to `ip -4 addr` on the console). The workstation is
 **`192.168.1.100`** (Intel Core Ultra 9 285K, 24 cores, 40 MB L2 / 36 MB L3, Debian, gcc 14.2); it has
 no `cmake` on the default PATH (there is a `buildtools` micromamba env) and its `/home` runs at 99%.
 
@@ -1881,7 +1883,7 @@ measurement rather than reasoning from it.
 
 ```sh
 ## per-op profile of the real graph -- ONE thread, see the trap in P4.14
-LOOM_THREADS=1 LOOM_PROFILE=1 loom_cli --model <gguf> --prompt "..." --n-predict 8
+LOOM_N_THREADS=1 LOOM_PROFILE=1 ./build/tools/loom_cli/loom_cli --model <gguf> --prompt "..." --n-predict 8
 LOOM_PROFILE=/tmp/p.txt loom_cli ...            # to a file instead of stderr
 
 ## the GEMM prototype vs ggml, at the eleven real flow_vocoder shapes
@@ -2109,7 +2111,12 @@ not the code.
   matters: the repo default is RelWithDebInfo and that is 1.39x slower**).
 * `~/ggml-bench` — standalone benches with a stale ggml checkout of its own; `bench10` links against
   `~/loom-p415/loom.cpp/build/_deps/ggml-build/src`, so `LD_LIBRARY_PATH` must point there.
-* `prof_main <gguf> <phonemes> <reps>` prints per-rep wall time; `LOOM_THREADS` sets threads;
+* `prof_main <gguf> <phonemes> <reps>` prints per-rep wall time. **It is NOT in this repository** --
+  no source, no CMake target (checked 2026-08-29); it exists only as the local addition to the Pi's
+  `~/loom-p415/loom.cpp` checkout described one bullet above, so **anywhere else it is not a command
+  you can run.** Off the Pi use `scripts/bench_vits_loom.cpp` for VITS wall time (it pins the three
+  scales the onnxruntime arm pins) or `tools/loom_cli` with `$LOOM_PROFILE` for per-op.
+  **`$LOOM_N_THREADS` sets threads -- not `LOOM_THREADS`, which nothing reads** (`backend.cpp:323`);
   `LOOM_PROFILE=1` or `=<path>` gives the per-node profile.
 
 **Commands.**
@@ -2449,12 +2456,32 @@ lines on odd columns. Closing it means padding `C`, which is an allocator change
 proposition than this. Worth ~4 ms of a 3.9 s transcription; **do not open it without re-measuring
 first.**
 
-### P4.16 — the convolution gap, shape by shape against onnxruntime — SCOPED, NOT STARTED
+### P4.16 — re-measure the convolution table, then decide if anything is left — PREMISE SUPERSEDED, RE-MEASURE FIRST
 
-**Why this exists.** After P4.15b, loom is **1.24x** onnxruntime on the reference utterance (1.313 s
-against 1.063 s, same boot, predictor pinned) and **everything outside the convolution is at parity or
-better**: ~240 ms against onnxruntime's 282 ms. The whole remaining gap is convolution — 1103 ms
-against 767 ms, **1.43x, +336 ms** — so this item is the only place left with anything in it.
+> **READ THIS BEFORE THE TABLE BELOW.** This item was scoped when loom was **1.24x** onnxruntime on
+> VITS and the whole remaining gap was convolution. **It is not that any more.** P4.15c measured one of
+> its two named mechanisms out, P4.15d/f fixed the other (a text encoder in the graph twice, which was
+> most of the largest row), P4.15e took `CONV_TRANSPOSE_1D` from the bottom of the ranking to the
+> biggest single win in the thread, and the model ended at **1.033x** of onnxruntime end to end.
+>
+> **So this is no longer an optimisation item; it is a measurement with a close condition.** Nothing
+> below has been re-measured against the post-P4.15f export, and the rows that remain have **no
+> mechanism attached to any of them** — which is the state P4.15's own warning says not to start
+> optimising from.
+>
+> **Step 1, and it decides whether there is an item at all:** re-run the table (recipe at the end of
+> this section) on the current export. If nothing clears the box's noise floor — the dev box does not
+> resolve below ~1.2x, [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) — then
+> **close this item and record the table in Retro-012**. It is entirely possible that is the outcome:
+> a 1.033x model has ~30 ms of total headroom against a competitor, spread over six groups.
+>
+> Everything from here to the reproduction recipe is the ORIGINAL scoping, kept for its reasoning and
+> its warnings, **not for its ranking or its numbers**.
+
+**Why this existed.** After P4.15b, loom was **1.24x** onnxruntime on the reference utterance (1.313 s
+against 1.063 s, same boot, predictor pinned) and **everything outside the convolution was at parity or
+better**: ~240 ms against onnxruntime's 282 ms. The whole remaining gap was convolution — 1103 ms
+against 767 ms, **1.43x, +336 ms** — which is what made this the only place left with anything in it.
 
 Both engines profiled per-op on the same box and boot; onnxruntime's shares apportioned over its
 un-profiled 1.044 s, loom's from `$LOOM_PROFILE` (which cannot see fusion, but fusion changes a
@@ -2541,9 +2568,23 @@ were supposed to help, and onnxruntime being 1.4x faster there is a fact without
 yet — get one from the rows above, where the mechanism is visible, before spending another item on it.
 
 **Reproducing the table.** The node lists, which are what the shapes below mean, come from
-`scripts/conv_census.py` (P4.15d) and need neither a run nor a Pi. The times: loom
-`LOOM_PROFILE=<path> LOOM_THREADS=4 ./build/prof_main <gguf> <ipa> 3`,
-divide by the rep count. onnxruntime: the recipe and the pinning requirement are in P4.15b's cold
+`scripts/conv_census.py` (P4.15d) and need neither a run nor a Pi.
+
+**The times, and the recipe this section used to give was broken in two ways — both fixed here
+(2026-08-29), because following it would have produced plausible wrong numbers.** It named
+`./build/prof_main`, which **is not in this repository** at all -- it is a local addition to the Pi's
+scratch checkout (see "Scratch trees on the Pi" above) -- and
+`LOOM_THREADS`, which **the engine never reads** — `backend.cpp:323` reads `LOOM_N_THREADS`, so the
+old line measured at the default thread count while claiming four. What works:
+
+```sh
+# per-op, which is what the table's rows are
+LOOM_N_THREADS=4 LOOM_PROFILE=<path> LOOM_PROFILE_NODES=1 \
+    ./build/tools/loom_cli/loom_cli --model <vits.gguf> --prompt "<ipa>"
+# wall time, with the three scales pinned the way the onnxruntime arm pins them
+#   (build line in the file's own header)
+./bench_vits_loom <dir-with-vits_mil.gguf> [nrun]
+``` onnxruntime: the recipe and the pinning requirement are in P4.15b's cold
 start; the per-shape aggregation is `~/prof_onnx_shapes.py` on the Pi, which groups `Conv`,
 `FusedConv` and `ConvTranspose` events by `args.input_type_shape`.
 
