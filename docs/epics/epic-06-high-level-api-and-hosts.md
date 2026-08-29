@@ -134,6 +134,18 @@ tokens or audio against a reference, and none of those movements would mean anyt
 than assert it, the way P4.22 did: the ids for every existing fixture must be bit-identical before and
 after.
 
+#### Where to start, cold
+
+* **The gap is one grep**: `grep -rn "top_k\|top_p\|temperature\|multinomial" --include=*.cpp --include=*.h src/ include/` returns nothing.
+* **The precedent to copy** is `LoomLuaBridge::l_argmax_row` and `l_gaussian_array` in
+  `src/core/lua_bridge.cpp` — registration table at `:986`, the marshalling argument at `:283`, the
+  shared-RNG draw-order caveat at `:856`. A new builtin is one entry in that table plus a static.
+* **The knobs' path from host to driver already exists**: `GenerateOptions::extra_inputs`
+  (`include/loom/core/text_generate.h`) is passed to the driver verbatim, and the generated loop reads
+  `inputs.max_new_tokens` / `inputs.eos_token` the same way — so `inputs.temperature` needs no new
+  plumbing, only a default emitted by `driver_components.py`'s `GenerationLoop`.
+* **Reproduce the symptom** with the P4.23 recipe (Epic-07 §4); the two items share it.
+
 #### Acceptance
 
 * `loom.sample_row` beside `argmax_row`, reducing on the tensor, drawing from `rng_`.
