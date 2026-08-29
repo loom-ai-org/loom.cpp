@@ -69,6 +69,11 @@ These are deliberate boundaries, not defects. Each names what would have to chan
   place a second addressing policy would go. What is still missing is a *policy* that uses it: only the
   contiguous append `[n_past, n_past + n_tokens)` is ever written, reads are still a plain view over
   `[0, n_kv)`, and there is one `kv_size` for every layer.
+- **Decoding is greedy, always.** `loom.argmax_row` is the only decode rule the bridge offers; there is
+  no temperature, top-k, top-p or multinomial draw in the engine. The RNG to build one on already
+  exists (`rng_`, `loom.seed_rng`, shared with `gaussian_array`/`uniform_array`), and the reduction
+  must stay on the tensor for the reason `argmax_row` itself exists. Scoped as **P4.24**,
+  [Epic-06 §4](epic-06-high-level-api-and-hosts.md).
 - **KV cache storage is always F32.** No quantized cache types (`Q8_0` etc.). Weight quantization is
   handled per-model by the MIL exporter's `quantize=` kwarg (LFM2, Qwen3) — KV-cache quantization is a
   separate, still-untouched runtime concern (different mechanism, different point in the inference

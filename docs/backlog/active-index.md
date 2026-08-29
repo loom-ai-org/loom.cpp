@@ -112,6 +112,18 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
+* [ ] **P4.24 — the engine cannot sample: `argmax_row` is the only decode rule.** No temperature,
+  top-k, top-p or multinomial anywhere in `src/` or `include/`, so a checkpoint whose own
+  `generation_config.json` says `"do_sample": true` (gemma-3-270m-it: `top_k 64, top_p 0.95`) is run in
+  a mode its authors did not choose. Split from P4.23 because it is a **capability gap, not a bug**,
+  and it is the half of that symptom which is not about tokenization — greedy is what makes a missing
+  chat template a repetition LOOP rather than just a wrong answer. **The design is already constrained:**
+  a sampler must be a bridge builtin reducing ON the tensor, because marshalling a 262144-wide vocab
+  into Lua overflows LuaJIT's array part at ~512 prompt tokens ([Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md),
+  and it is why `argmax_row` exists) — and the RNG half already exists (`rng_` + `loom.seed_rng`,
+  shared with `gaussian_array`). Temperature+top-k+top-p covers the whole fixture set; exactly one
+  model needs any of it. **Greedy stays the default** or every byte-identity baseline moves for nothing.
+  → [Epic-06 §4](../epics/epic-06-high-level-api-and-hosts.md)
 * [ ] **P4.23 — an instruction-tuned causal LM cannot be prompted correctly.** `detokenize` knows a
   checkpoint's special tokens and **`tokenize` cannot produce them** — `tokenize("<|im_start|>")` is
   seven literal ids where it should be `[1]`, `tokenize("<start_of_turn>")` seven where it should be
