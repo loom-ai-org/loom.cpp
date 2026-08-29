@@ -95,6 +95,125 @@ The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-scrip
 case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
 
 
+### P4.23 — an instruction-tuned causal LM cannot be prompted correctly — SCOPED, NOT STARTED
+
+**One sentence.** `detokenize` knows a checkpoint's special tokens and `tokenize` cannot produce them,
+so a chat template is not merely un-applied — it is **unrepresentable**, and every instruction-tuned
+LM in the fixture set is being run outside the distribution it was trained on.
+
+Reported as three symptoms; two reproduce, and they share one root cause. All measurements below are
+on the shipped GGUFs in `hf-models/`, through `loom-py` and `tools/loom_cli`, 2026-08-29.
+
+#### The asymmetry, which is the whole item
+
+```
+smollm2-360m-instruct   tokenize("<|im_start|>") -> [44,108,306,79,3738,108,46]   should be [1]
+                        tokenize("<|im_end|>")   -> [44,108,306,79,486,108,46]    should be [2]
+                        detokenize([1, 2])       -> "<|im_start|><|im_end|>"      correct
+gemma-3-270m-it         tokenize("<start_of_turn>") -> [2,236820,3041,236779,1340,236779,887,236813]
+                                                                                  should be [105]
+```
+
+`BpeVocab::encode` runs the input straight through BPE. HF's tokenizers **split on added tokens first**
+and emit their ids atomically; there is no such pre-pass in `bpe_vocab.cpp` (no `added`/`special`
+handling anywhere in the file). The decode side works only because a special token's *spelling* is in
+the vocabulary like any other entry.
+
+**And the file does not even carry the information.** Neither GGUF has
+`tokenizer.ggml.token_type` — the standard KV marking which ids are `CONTROL` / `USER_DEFINED`. The
+exporter never writes it, so the engine could not do the pre-pass today even if `encode` wanted to.
+
+This is a gap in a tokenizer that is otherwise verified: `test_e2e_spm_byte_fallback_tokenizer` checks
+nine cases against `AutoTokenizer.encode` verbatim and all of them round-trip. **None of the nine
+contains a special token**, which is exactly how a correct-looking tokenizer ships unable to encode a
+chat turn.
+
+#### What it does to real models — reproduced, not inferred
+
+**Gemma 3 270M IT**, hand-written template through `loom_cli`, `--n-predict 80`:
+
+```
+<start_of_turn>user\nWho discovered Brazil?<end_of_turn>\n<start_of_turn>model\n
+  -> "<end_of_turn>model\n<start_of_turn>artist\n<end_of_turn>artist\n<start_of_turn>artist..."
+```
+
+runs to the ceiling emitting turn after turn. **Two independent faults produce that**, and fixing
+either alone is not enough:
+
+1. the template's markers went in as ~7 literal tokens each, so the model never saw a turn boundary;
+2. the file declares `tokenizer.ggml.eos_token_id = 1` (`<eos>`) while an IT checkpoint ends a turn on
+   **`<end_of_turn>` = 106**, so the loop would not have stopped even if the model had emitted it.
+
+`driver_components.py` **already has the field for (2)** — `GenerationLoop.extra_eos_tokens`, whose
+own comment says "a chat-formatted checkpoint has two … and a loop knowing only the first runs to
+`max_new_tokens` on every utterance". It is set by `speech_lm_export.py:770` and **never by
+`causal_lm_export.py`**. That half is a one-line export change, not a design question.
+
+**SmolLM2 360M Instruct** shows the same cause with the opposite symptom: asked a bare question it
+emits its own `<|im_end|>` (id 2, its declared eos) as the *first* token, `strip_eos` drops it, and
+`generate` returns **the empty string**. With `eos_token=-1` it continues
+`"<|im_end|>\n<|im_start|>assistant\nThe discovery of Brazil"` — it is trying to open the assistant
+turn itself, because nothing opened one for it. **An empty completion is the same bug as a runaway
+one.**
+
+**"Answers differ from HF"** follows from the above and needs no separate mechanism: the model is
+being asked to continue malformed text. Gemma 3 on a bare `"Who discovered Brazil?"` produces a
+repeating bulleted list (`"The Portuguese / The indigenous people of Brazil / …"`).
+
+#### The reported symptom that did NOT reproduce, and the latent path it names
+
+**"Inference outputs the prefill as well as the generated tokens" did not reproduce** — four causal LMs
+(gemma-3-270m-it, smollm2-360m-instruct, lfm2-350m-monolithic, qwen3-0.6b-base) x three doors
+(`loom_cli --prompt`, `Model.generate`/`generate_ids`, `text2text.infer`). In every case the returned
+ids begin after the prompt. **Do not start here without a repro from the reporter** — model, door, and
+call.
+
+There is nonetheless a real hole to close while the item is open. `text_generate.h` promises "returns
+the GENERATED ids only, never the prompt — **both driver shapes are normalised to that here**", and
+`text_generate.cpp` does not normalise: the list branch copies the driver's return verbatim with no
+check that it excludes the prompt. The two shapes are told apart by *what the driver returns* (list vs
+number), never by *whether it contains the prompt*, so a driver that returned prompt+generated would
+be echoed and nothing would catch it. A generated `infer_with_past` starts `_gen` empty
+(`driver_components.py:652`) and is fine today; a hand-written or future driver is unconstrained.
+**Cheapest fix is an assertion plus a CI case**, independent of whether the reported symptom is ever
+reproduced.
+
+#### Where the work divides
+
+* **Engine — `BpeVocab`**: an added-token pre-pass in `encode`, driven by a `tokenizer.ggml.token_type`
+  the exporter must start writing. Longest-match-first over the added set, applied before regex
+  pretokenization, which is what HF does.
+* **Exporter**: write `tokenizer.ggml.token_type`; set `extra_eos_tokens` for `causal_lm_export.py`
+  the way `speech_lm_export.py` already does.
+* **Chat template — the open design question, and it is the only one.** The checkpoint's template is a
+  Jinja string in `tokenizer_config.json`. Options, in ascending cost: (a) carry it as a KV and let the
+  HOST render it, which needs no Jinja in the engine and no per-model C++; (b) ship the rendered
+  role-tag strings as structured KV and have `text2text` assemble them; (c) a Jinja subset in the
+  engine, which ADR-014's reasoning argues against on the same grounds as per-model kernels.
+  **Decide this before writing anything**, and note that (a) and (b) both need the tokenizer fix first
+  — a rendered template is worthless if it cannot be encoded.
+
+#### Acceptance
+
+* `tokenize("<|im_start|>") == [1]` on SmolLM2 and `tokenize("<start_of_turn>") == [105]` on Gemma 3,
+  and `test_e2e_spm_byte_fallback_tokenizer` grows special-token cases against `AutoTokenizer.encode`
+  verbatim — the nine that exist are the reason this shipped, and they are the shape to copy.
+* Gemma 3 IT, correctly templated, **stops at `<end_of_turn>`** instead of running to the ceiling.
+* SmolLM2 IT, correctly templated, returns a non-empty answer.
+* Both models' answers compared against `transformers` on the same prompt through the checkpoint's own
+  `apply_chat_template` — the reference this item is defined against.
+* Round-trip preserved: `detokenize(tokenize(s)) == s` for text with and without special tokens.
+
+#### What NOT to do
+
+* **Do not add a `--chat-template` flag to `loom_cli` and call it done.** The tokenizer cannot encode
+  the result; the flag would produce exactly the output above.
+* **Do not special-case Gemma 3.** Every instruction-tuned checkpoint in the set has this, with
+  different markers — SmolLM2's are `<|im_start|>`/`<|im_end|>`, Gemma's are
+  `<start_of_turn>`/`<end_of_turn>`. It is one mechanism, not two models.
+* **Do not touch the decode loop for the runaway turns.** `max_new_tokens` is doing its job; the loop
+  is stopping where it was told to stop.
+
 ### Grapheme text front-ends: the shape to generalize to
 
 `src/core/supertonic_text_vectorizer.cpp` is per-MODEL C++ in an engine whose rule is that per-model

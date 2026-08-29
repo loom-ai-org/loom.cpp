@@ -86,10 +86,11 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
-* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards. ROOT CAUSE FOUND
-  2026-08-23; the fix is applied to the working tree and green, not yet committed.** It is **libgomp's default wait
-  policy**. loom builds ggml with `GGML_OPENMP=ON` (ggml's default, which loom's CMake never chose),
-  so `ggml_barrier` is `#pragma omp barrier` and ggml runs one after every non-empty graph node —
+* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards. ROOT CAUSE FOUND and FIXED
+  2026-08-23 (`bb95996`); what is left here is measurement, listed at the end.** It was **libgomp's
+  default wait policy**. loom built ggml with `GGML_OPENMP=ON` (ggml's default, which loom's CMake had
+  never chosen; it is now `LOOM_OPENMP`, default OFF, `cmake/Dependencies.cmake:73`),
+  so `ggml_barrier` was `#pragma omp barrier` and ggml runs one after every non-empty graph node —
   2520 per VITS synthesis — and **every thread sleeps on a futex at every one**: 334,609 voluntary
   context switches over 5 syntheses at 24 threads, against 160 without OpenMP.
   **`GGML_OPENMP=OFF` is worth 4.8x at 24 threads** (0.189 -> 0.040 s) and restores a monotonic curve;
@@ -111,6 +112,22 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
+* [ ] **P4.23 — an instruction-tuned causal LM cannot be prompted correctly.** `detokenize` knows a
+  checkpoint's special tokens and **`tokenize` cannot produce them** — `tokenize("<|im_start|>")` is
+  seven literal ids where it should be `[1]`, `tokenize("<start_of_turn>")` seven where it should be
+  `[105]` — so a chat template is not un-applied, it is **unrepresentable**. `BpeVocab::encode` has no
+  added-token pre-pass (HF splits on added tokens before BPE) and the exporter never writes
+  `tokenizer.ggml.token_type`, so the file does not carry which ids are special. Reproduced:
+  **Gemma 3 270M IT runs to the token ceiling emitting turn after turn** (also declares
+  `eos_token_id = 1` while an IT turn ends on `<end_of_turn>` = 106 — `GenerationLoop.extra_eos_tokens`
+  exists and is set only by `speech_lm_export.py`, never by `causal_lm_export.py`), and **SmolLM2 360M
+  IT returns the empty string** because its first token is its own `<|im_end|>` and `strip_eos` drops
+  it. *Not reproduced:* the reported prefill echo — four causal LMs x three doors all return ids
+  starting after the prompt; **needs a repro before anyone starts there**, though
+  `text_generate.cpp`'s list branch does trust the driver's return with no prompt check, against the
+  header's claim that both shapes are normalised. **The chat template is the one open design question**
+  (host-rendered KV vs structured role tags vs Jinja in the engine) and the tokenizer fix comes first
+  either way. → [Epic-07 §4](../epics/epic-07-text-frontends-and-tokenizers.md)
 * [ ] **P4.18 release chore — the refreshed whisper GGUF is not on the Hub.** The export changed
   (the decoder's loop-invariant V transpose, 2026-08-29), so the local fixture
   (`$LOOM_FIXTURES/whisper_mil.gguf`, `md5 7d921b9a…`) is ahead of the published one and the README's
