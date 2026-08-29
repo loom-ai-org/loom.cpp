@@ -84,12 +84,24 @@ void check_mul_mat(ggml_backend_t backend, int64_t K, int64_t M, int64_t N) {
     std::vector<float> out((size_t)ggml_nelements(td));
     ggml_backend_tensor_get(td, out.data(), 0, out.size() * sizeof(float));
 
-    // Every element of the first and last row-block and every column: the tail blocks a tiling change
-    // gets wrong are at the edges, and checking a diagonal would walk straight past them.
+    // Every element of the first and last row-block, of the 16-ROW SEAM, and every column: the tail
+    // blocks a tiling change gets wrong are at the edges, and checking a diagonal would walk straight
+    // past them.
+    //
+    // THE SEAM IS NOT AN EDGE, and that is why it is computed here rather than assumed. `matmul` peels
+    // `M % 4` rows off the bottom, and `matmul_aligned` then runs `m - (m % 16)` of what is left at
+    // the widest row block and finishes the 0/4/8/12 remainder in a separate loop
+    // (cmake/patches/ggml-0012, P4.22). That remainder sits in the MIDDLE of the matrix whenever
+    // `M % 4 != 0`, so a first-and-last-rows check has nothing to say about it -- the patch that
+    // introduced it would have gone in green.
+    const int64_t m0   = M - (M % 4);
+    const int64_t seam = m0 - (m0 % 16);
     double worst = 0.0;
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t m = 0; m < M; ++m) {
-            if (m > 3 && m < M - 4) continue;
+            const bool at_edge = m < 4 || m >= M - 4;
+            const bool at_seam = m >= seam - 4 && m < seam + 4;
+            if (!at_edge && !at_seam) continue;
             const double ref = reference_element(A, B, K, m, n);
             const double got = (double)out[(size_t)n * M + m];
             const double rel = std::fabs(got - ref) / (std::fabs(ref) + 1e-6);
@@ -181,6 +193,22 @@ int main() {
     // frames. 1500 % 8 == 4, 1500 % 16 == 12, 1500 % 4 == 0 -- so this is a tail on x86 and not on
     // ARM, which is exactly how it stayed invisible. Small M and N keep it under a second.
     check_mul_mat(backend.get(), 1500, 64, 48);
+
+    // Every remainder of the SIXTEEN-row split, which is a different seam from the four-row one above
+    // and lands in the middle of the matrix rather than at its bottom (cmake/patches/ggml-0012,
+    // P4.22). `M = 1500` is whisper-small's `QK^T` row count and the residue -- 12 -- that made the
+    // GEMM stop threading; the other three are the rest of the class, and 1488 is the control that
+    // takes no remainder loop at all. Rows are what varies here, so K and N stay small.
+    check_mul_mat(backend.get(), 64, 1500, 48);   // m % 16 == 12
+    check_mul_mat(backend.get(), 64, 1500, 50);   // ...and with a column count that does NOT divide
+                                                  // evenly across the threads, so the remainder loop
+                                                  // gets a ragged slice to finish. Without this N the
+                                                  // whole `gemm_bloc<4,1>` path can be deleted and
+                                                  // every shape above still passes.
+    check_mul_mat(backend.get(), 64, 1496, 48);   // m % 16 ==  8
+    check_mul_mat(backend.get(), 64, 1492, 48);   // m % 16 ==  4
+    check_mul_mat(backend.get(), 64, 1488, 48);   // m % 16 ==  0 -- control, no remainder rows
+    check_mul_mat(backend.get(), 64, 1501, 48);   // both seams at once: 1 row past m % 4, 12 past 16
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

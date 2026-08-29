@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-08-24
+last_updated: 2026-08-29
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -111,47 +111,19 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
-* [ ] **P4.18 — the ASR gap is the encoder's ATTENTION, plus a loop-invariant copy in the decoder.**
-  **A cold session picking this up should start from [`docs/HANDOVER-p4.18.md`](../HANDOVER-p4.18.md)** —
-  the three remaining items with their machines, commands, traps and one decision that needs the
-  repo owner. *Transient: delete it when they are closed.*
-  whisper-small is the one task still behind (0.57-0.72x at four threads). The corrected split is
-  **encoder 5.46 s vs onnxruntime's 2.38 (2.29x), decode 1.10 s vs 0.97 (1.14x SLOWER)**, and splitting
-  onnxruntime's own `MatMul` time by shape shows loom's **dense GEMMs are within 10-12% of MLAS** — the
-  whole 1.93x is the two batched attention matmuls. **Fused attention stays ruled out.**
-  *Done and closed:* **GELU** (`ggml-0010`), the **`k % KN` cliff** (`ggml-0011`), **`SOFT_MAX` /
-  `ggml_v_expf`** (2026-08-25 — measured out on a floor argument, [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md);
-  *do not re-propose a faster exp*), **`ggml-0011`'s reach across the ASR models** and **the 285K
-  re-measurement** (both 2026-08-25 — see below).
-  *Two things left; (1) is by far the largest:*
-  (1) **the decoder's cross-attention V is re-transposed every step** — 12 nodes x 4.6 MB per token,
-  **9.0% of the whole transcription and 47% of the decode loop** at one thread. It is a function of a
-  graph input that is constant for the utterance. The fix is `_WhisperCrossKvWrapper.forward`
-  (`loom-exporter/whisper_export.py:147`) emitting V already head-split and transposed — a whisper
-  re-export and a fixture refresh, so not free at release time (ADR-003). `$LOOM_PROFILE_NODES=1`
-  (P4.19) is the tool that attributes it; it names the twelve `xv_N ... (cont)` nodes directly.
-  (2) **`QK^T` at `k = 64` runs at about HALF the rate of a projection-shaped GEMM** — 2.10x paired
-  (p10 1.66, p90 2.48), against a witness that is itself at 84-88% of this box's ~54 GFLOP/s
-  single-core peak (Zen+ has 128-bit FPU datapaths, so a 256-bit FMA is one per cycle). ~1.1 s of the
-  1-thread encoder. **Partly explained: tinyBLAS's `BM` row blocking is worth ~1.15x at k=64 and 1.02x
-  at k=768, and whisper's `m = 1500` cannot reach `BM = 4` because 1500 % 16 == 12** — the same "a
-  frame count is a number nothing rounds" as the `k % KN` finding. Reaching it needs a **cascade**
-  (16-row prefix at BM=4, then 8, then 4, then the existing <= 3 row 1x1 tail); the naive version — a
-  16-row prefix with a 15-row `gemm_bloc<1,1>` tail — is a regression, because that tail is one `hsum`
-  per element. Ceiling ~1.15x on one op, needs a row offset threaded through `gemm`'s job
-  partitioning: **do it on the workstation, not the 2-core dev box.** The remaining ~1.8x has no
-  identified mechanism; the epilogue, the store pattern (mechanism falsified — no dependence on the
-  size of C) and the address arithmetic are all ruled out. **Start the next attempt with a hardware
-  profiler**, not a fifth guess. *Do not write a fused attention kernel.*
-  → [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)
-  *Two findings from closing the rest, which the next item should not re-derive:* **`ggml-0011`'s
-  mechanism is the attention HEAD DIMENSION, not the clip length** — Conformer-CTC's `176/4 = 44` misses
-  `KN = 8` on every utterance (1.20-1.24x, flat across six clip lengths whose encoder residue
-  alternates), while gigaam (48), parakeet (128) and whisper (64) are aligned and gain nothing
-  resolvable; whisper's own 1.06x comes from `A@V` over its FIXED 1500 frames. And **the 285K cannot
-  resolve any of this at 24 threads** — 41 paired rounds still straddle 1.0, because the per-launch
-  thread-placement lottery is drawn fresh per process and pairing therefore does not cancel it.
-  [Epic-05 §2](../epics/epic-05-edge-performance.md). *Four of six sub-items closed.*
+* [ ] **P4.18 release chore — the refreshed whisper GGUF is not on the Hub.** The export changed
+  (the decoder's loop-invariant V transpose, 2026-08-29), so the local fixture
+  (`$LOOM_FIXTURES/whisper_mil.gguf`, `md5 7d921b9a…`) is ahead of the published one and the README's
+  ASR column describes the rc6 artifact. rc6 shipped without it; **it lands in rc7**, alongside the
+  three already-stale Hub models (whisper, vits, matcha) — so it is one push, not four.
+  *Everything else in P4.18 is closed:* the per-shape encoder re-measure and the README's ASR column
+  (item A), the V transpose (item B, **1.106x**), and `QK^T`'s mechanism (item C — the counters found
+  it; see P4.21). [Epic-05 §2](../epics/epic-05-edge-performance.md) has all three.
+* [ ] **`ldc` alignment is the last of the `QK^T` thread, and it is small.** After P4.22, `m = 1500`
+  reaches 15.0 ms where a padded `m = 1504` reaches 10.9 — 1500 floats is 6000 bytes and `6000 % 64 =
+  16`, so a job's full-line store still straddles two lines on odd columns. Closing it means padding
+  `C` (an allocator change, not a kernel one) for ~4 ms of a 3.9 s transcription. **Re-measure before
+  opening it.** *Context: [Epic-05 §5](../epics/epic-05-edge-performance.md), P4.22.*
 * [ ] **The README's TTS and LM columns need the per-launch sampling the ASR column just got.** On the
   Core Ultra 9 285K (8 P-cores + 16 E-cores, no SMT) thread placement is chosen **once per process**
   and then sticks, so every run inside one process inherits the same luck and a within-process median

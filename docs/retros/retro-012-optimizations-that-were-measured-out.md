@@ -38,10 +38,11 @@ on the other side that cancels it.
 | fusing `SOFT_MAX`'s five row passes into three | **CORRECTED 2026-08-24** — 1.06x on the 285K, but the reasoning that closed it was wrong and the dev box gets 1.16x; see below |
 | a cheaper `exp` for `SOFT_MAX` | **CORRECTED 2026-08-24, then CLOSED 2026-08-25** — the probe that closed this in the first place was not a floor and the exp really is 1.1-1.4x of the row; but the exp has no accessible headroom, see below |
 | specialising `ggml_v_expf` to `SOFT_MAX`'s domain (no overflow/subnormal path) | **1.00x** on the dev box, **1.13-1.16x** on the 285K, at identical accuracy — and the exp is 7-26% of the op. See below |
+| an outer-product `QK^T` tile, lanes on `m` instead of on the contraction | **1.38x** on the 285K against a 1.5x gate, and its ceiling there was 1.52x before a line was written; 1.85x on a 2019 Zen+, 1.23x on NEON. See below |
 | a cheaper `hsum` epilogue for tinyBLAS at `k = 64` | 1.06x, under the dev box's noise floor (P4.18) |
 | rows-inner loop order, so a store finishes a cache line of C | **mechanism falsified**: no dependence on the size of C — see below |
 | `ggml-0002`'s aarch64 address hoist applied to x86 | neutral at every k tested, small and large |
-| *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired, and 1.02x at k=768; real but partial, and whisper's m=1500 cannot reach `BM = 4` |
+| *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired at ONE thread, and 1.02x at k=768. **The "m=1500 cannot reach `BM = 4`" half was the bug, not a constraint** — at four threads that is 2.75x of false sharing, fixed in P4.22; see [Retro-020](retro-020-a-knob-measured-at-one-thread.md) |
 
 ### `SOFT_MAX`: closed on the right number for the wrong reason (2026-08-24, P4.18)
 
@@ -181,6 +182,87 @@ turns that from an argument into a bound, and it is three characters of `if cons
 *Do not re-propose a faster `exp` for `SOFT_MAX`.* If SOFT_MAX is ever worth attacking again, the
 target is the **pass structure** — 287 ms of the 285K's 398 — and even that is capped by the 3-pass
 candidate's own 1.08x there.
+
+### The batched tile epilogue: a mechanism found and a patch declined (2026-08-29, P4.18 item C)
+
+**This one is different from everything else in this file: it works, and it is measured, and it is
+still not worth carrying.** Recorded so it is re-proposed as a priced option rather than as an idea.
+
+`tinyBLAS`'s `gemm_bloc` ends by horizontally reducing `RN*RM` vector accumulators to scalars and
+storing each on its own. Counted with `perf` on a 285K P-core, that epilogue is a **`k`-independent
+18.0 instructions per output element** — `instructions/output = 0.2355k + 18.0`, within 1.5% over
+`k` in [32, 768] — which is 9% of the work at `k = 768` and **54% at `k = 64`**, the shape of whisper's
+`QK^T`.
+
+Batching the reduction over the row dimension (three `vhaddps` + an extract + an add + one 16-byte
+store for four contiguous outputs, as an overload on `<4, __m256, float>` so nothing else changes)
+removes **exactly 6.7 of those 18 instructions, at every `k` measured**. What that buys:
+
+| | |
+|---|---|
+| 285K, k=64, 9 ABBA rounds | **1.085x** (p10 1.021) |
+| 285K, k=768 | 1.022x (p10 1.016) |
+| Ryzen, k=64, 9 ABBA rounds | 1.023x, **p10 0.982 — unresolved** |
+| over the encoder's real bucket mix | **~2.8%**, i.e. 1-2% of a transcription |
+
+* **Actionable takeaway — a 20% instruction cut bought 8.5% of the time**, so "retirement-bound" was
+  only half true: three dependent `vhaddps` at 6-cycle latency serialise part of what they save. If
+  this is ever revisited, an unpack/shuffle reduction tree has the same instruction count with a
+  shorter dependency chain, and that is the version to measure.
+* **Declined on the same grounds as `SOFT_MAX`'s pass fusion** — a ggml patch carried forever for 1-2%
+  end to end, resolvable on one of the two x86 machines and not the other. Two items now closed on
+  size rather than on being wrong; that is the bar this thread has settled on.
+* **And it re-priced an older verdict.** The line above that reads "a cheaper `hsum` epilogue, 1.06x,
+  under the noise floor" was measuring the right thing on a box that could not resolve it. The
+  mechanism was real all along; what was missing was a machine with counters.
+
+### The outer-product tile: the mechanism was real, the ceiling was not (2026-08-29, P4.21)
+
+**The cleanest example in this file of an idea that was right about the cause and wrong about the
+size**, and the only one so far killed by a number about the MACHINE rather than about either kernel.
+
+P4.18 counted `tinyBLAS`'s per-output horizontal reduction at a `k`-independent **18.0 instructions per
+output**, 54% of everything the core retires at whisper's `QK^T` (`k = 64`). An outer-product tile
+never reduces per output, so the item scoped a standalone gate: clear **1.5x** at `m = n = 1500,
+k = 64, 12 heads`, transpose counted, or stop. `scripts/bench16.cpp` is that gate.
+
+**It did exactly what it was supposed to do mechanically.** Instructions per output on a 285K P-core:
+**36.2 -> 19.7**, a 1.84x cut, the intercept gone. **And it bought 1.38x**, because:
+
+| | 285K P-core | Ryzen 3 3250U | Raspberry Pi 4 |
+|---|---:|---:|---:|
+| one-core FMA roofline | 177.2 GF | 54.6 GF | 14.3 GF |
+| `tinyBLAS` dot | 116.6 GF (**66%**) | 23.9 GF (44%) | 7.45 GF (52%) |
+| outer product, pack counted | 161.3 GF (**91%**) | 44.3 GF (81%) | 9.18 GF (64%) |
+| ratio | **1.38x** | **1.85x** | **1.23x** |
+| what ANY perfect kernel could be | **1.52x** | 2.24x | 1.93x |
+
+* **Actionable takeaway — an instruction ratio is not a time ratio, and the way to know in advance is
+  to divide the incumbent's throughput by the machine's roofline.** IPC went **5.02 -> 3.63** between
+  the two arms: the horizontal reductions were being issued in slots the FMA ports were leaving idle,
+  so deleting them freed instructions and not cycles. The 1.76x ceiling in the item's own scope was
+  `(0.2355k + 18.0) / 0.2355k`, and on the box it was measured on the real ceiling was **1.52x**. One
+  cheap probe — a dependency-free FMA loop — would have priced the item before it was scoped.
+* **The intercept was an ISA artifact and nobody had noticed.** `hsum(__m256)` in `sgemm.cpp` is six
+  instructions; `hsum(float32x4_t)` is `vaddvq_f32`, **one**. So "every output ends in a horizontal
+  reduction" is true everywhere and expensive only where the vector is wide. That is the Pi's 1.23x,
+  and it is the second time this thread has been caught extrapolating one ISA's kernel result to the
+  other ([Retro-019](retro-019-a-patch-measured-on-one-isa.md)) — this time before shipping rather
+  than after.
+* **The trend runs against re-opening it.** The dot-product kernel reaches 44% of roofline on a 2019
+  Zen+, 52% on a Cortex-A72 and 66% on a Lion Cove P-core. The wider and more out-of-order the core,
+  the better it hides the epilogue and the less this is worth. The Ryzen's 1.85x and the 285K's 1.38x
+  are two points on that line, not two boxes disagreeing.
+* **The pack was NOT the problem**, which is worth saying because it was the suspected cost: 1.0-1.5%
+  of the packed arm, panel-major. Nor was the tile shape (six swept per ISA, spread 1.1-1.2x) or the
+  loop order — though **column blocking is worth 1.50x -> 1.80x on the Ryzen and 1.005x -> 1.23x on
+  the Pi**, so a first-cut kernel with a naive loop order would have failed the gate for the wrong
+  reason. Sweep the blocking before believing a negative.
+* **And the experiment paid for itself anyway**, which is the argument for cheap standalone gates: it
+  found that ggml's F32 GEMM **uses 3.65 CPUs to deliver 1.02x** at this exact shape, because `BM`
+  leaves each job writing 16 bytes of a 64-byte line of `C`. Four rows of padding on `m` are worth
+  **2.75x**. That is P4.22 in [Epic-05](../epics/epic-05-edge-performance.md), and it is a bigger
+  number than the item that found it.
 
 ### A dev-box noise floor that ate two verdicts (2026-08-24, P4.18)
 

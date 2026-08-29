@@ -624,7 +624,8 @@ divisibility and nothing else:
 In model (whisper-small, `jfk.wav`, `$LOOM_PROFILE` at one thread, two interleaved runs per arm) the
 `MUL_MAT 64 x 1500` bucket goes **2240/2460 → 1119/1136 ms** and no other bucket moves.
 Architecture-neutral in the same sense PR 3 is: every ISA whose `KN` does not divide a model's
-sequence length benefits, and the wider the vector the more often that is.
+sequence length benefits, and the wider the vector the more often that is. **It was not, for four
+days** — see the aarch64 section below, which is why the tail is dispatched out of line.
 
 **And whisper is not the best case — a HEAD DIMENSION misses `KN` more reliably than a sequence length
 does.** whisper's `A@V` contracts over frames; `QK^T` contracts over `d_model / n_heads`, which is a
@@ -643,6 +644,44 @@ the frame count is doing the work. Models whose head dimension already divides `
 Parakeet (128), whisper (64) — gain nothing measurable from `QK^T` and only what their `A@V` shape
 happens to give.
 
+**THE TAIL IS DISPATCHED OUT OF LINE, AND THAT PLACEMENT IS LOAD-BEARING (aarch64, 2026-08-29).**
+The first version of this patch put the scalar tail loop inside `gemm_bloc` — as a second epilogue,
+with the branch outside the tile. On x86 that is the fast arrangement and the note above says why. On a
+Cortex-A72 it cost **every f32 GEMM shape measured 1.3-1.75x**, one thread, three rounds, and *none of
+those shapes ever takes the tail* — NEON's `KN` is 4 and every one of these `k` divides it:
+
+| Pi 4B, m x n x k | with the tail inlined | with it out of line | unpatched |
+|---|---|---|---|
+| 1500 x 1500 x 64 (`QK^T`) | 4.67 GFLOP/s | **7.38** | 7.54 |
+| 64 x 1500 x 1500 (`A@V`) | 4.70 | **7.80** | 7.88 |
+| 768 x 1500 x 768 (`proj`) | 4.86 | **8.43** | 8.38 |
+| 3072 x 1500 x 768 (`fc1`) | 4.86 | — | 8.56 |
+| 768 x 1500 x 3072 (`fc2`) | 4.01 | **5.25** | 5.30 |
+
+**Bisected to the hunk, not guessed:** a build with `kk` truncated and the tail loop *removed* runs at
+full speed (8.56 GFLOP/s on `proj`); a build with `kk = k` and the tail loop *present* runs slow (4.83).
+Folding the tail into a single epilogue instead of two does not help either (5.12). **It is the presence
+of the scalar tail loop in the tile function**, which reaches `Aat`/`Bat` after the main loop and
+changes what GCC's register allocator does with the 4x3 NEON tile — the same fragility PR 1 exists for,
+approached from the other side.
+
+So the tail now has its own `NOINLINE` function, dispatched on `k % KN` *before* the tile. The aligned
+path is then instruction-for-instruction what it was before this patch on every ISA, which is exactly
+what the x86 note above demands, and the tail path is unchanged in what it computes. Verified on both:
+
+| | x86 (Core Ultra 9 285K, AVX2) | aarch64 (Cortex-A72) |
+|---|---|---|
+| `A@V` k=1500, where the tail FIRES | 150.7 GFLOP/s against 53.2 unpatched — **2.83x, the win intact** | n/a (1500 % 4 == 0) |
+| `QK^T` k=64, aligned | 119.3 against 118.8 shipped / 120.7 unpatched | 7.38 against 7.54 unpatched |
+| `proj` k=768, aligned | 162.0 against 162.2 / 161.9 | 8.43 against 8.38 |
+| whisper-small end to end | 2.076 s against 2.086 s — unmoved | 36.4 s against 46.4 s — **1.27x** |
+| `tests/ci/test_tinyblas_gemm` | 113/113 | 113/113 |
+
+**And the rule this patch is the reason for:** a diff in `cmake/patches/` is not done until this file
+carries a number from an x86 box **and** one from the Pi, even when one of them is "no change". This
+one shipped with only the first, and cost the reference device 1.3-1.75x for four days
+([Retro-019](../../docs/retros/retro-019-a-patch-measured-on-one-isa.md)).
+
 **Accuracy.** Against a double-precision reference over every `k` in [1, 40] plus 63/64/65 and
 1496–1504, the worst relative error is **2.6e-05**, and the aligned `k` sit in the same place as the
 unaligned ones (k=1496 2.1e-05, k=1500 2.3e-05) — f32 accumulation noise, not a dropped term. loom's
@@ -659,3 +698,86 @@ the measurement above is the argument, and it is compiler-specific enough to wan
 (2) The f16/bf16 instantiations keep the rejection, so a reviewer may want the same treatment there
 via `GGML_FP16_TO_FP32`. (3) This lands on top of PR 3; the two are independent in mechanism but touch
 adjacent lines of the same function, so they want reviewing together.
+
+## PR 12 — `sgemm`: a job should own a whole cache line of `C`, not a quarter of one
+
+`llamafile_sgemm`'s F32 path picks its row block from what divides `m`:
+
+```c
+if (m % 16 == 0 && (m/16 >= params->nth)) mnpack<4, RN, 4>(...);   // 4 tiles of 4 rows
+if (m % 8  == 0)                          mnpack<4, RN, 2>(...);
+if (m % 4  == 0)                          mnpack<4, RN, 1>(...);   // one tile of 4 rows
+```
+
+`gemm()` hands ONE JOB the rows `[ii, ii + BM*RM)`, and `C` is `m`-contiguous — so a job's store to one
+column of its range is `BM*RM*4` **bytes** wide. At `BM = 1` that is **16 bytes, a quarter of a cache
+line**, and four threads write four quarters of the same line for every column of the whole matmul.
+
+**It does not make the kernel slower. It stops it threading.** Core Ultra 9 285K (24 cores, no SMT),
+`m = n = 1500, k = 64`, 12 head-slices — the shape of whisper-small's `QK^T` — against the same shape
+padded, so the only difference is which branch above is taken:
+
+| `m` | branch | `BM` | bytes of `C` per job | 1 thread | 4 threads | scaling |
+|---:|---|---:|---:|---:|---:|---:|
+| 1496 | `m % 8 == 0` | 2 | 32 | 29.4–30.5 ms | 21.2–21.9 ms | 1.40x |
+| **1500** | `m % 4 == 0` | **1** | **16** | 29.6–30.9 ms | 30.0–31.5 ms | **0.98x** |
+| 1504 | `m % 16 == 0` | 4 | 64 | 29.4 ms | 10.6–11.0 ms | **2.75x** |
+
+Monotone in the fraction of a line a job owns. `perf stat -e task-clock` reports **3.65 CPUs utilised**
+in the 0.98x row: the threads are running, they are just passing a line back and forth.
+
+**`m` is a sequence length in every attention matmul** — a number nothing rounds — so this is the
+common case rather than a corner. whisper-small's encoder runs 1500 frames, which is `4 mod 16`, the
+worst residue there is.
+
+**The fix takes a prefix instead of demanding divisibility**, which is PR 3's trick on the other end of
+the same axis: run `m - (m % 16)` at `BM = 4` and finish the 0/4/8/12 leftover rows in a separate
+column-split loop that keeps the same `4 x RN` tile. It is guarded on `nth > 1`, because false sharing
+needs a second thread by definition and a patch that cannot help at one thread should not be able to
+hurt there either — at `nth == 1` the schedule is instruction-for-instruction what it was before.
+
+| `m = 1500`, 285K | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|
+| before | 29.38 ms | 30.30 ms | 29.40 ms | 19.90 ms |
+| after | 29.38 ms | 24.98 ms | **15.00 ms** | **8.12 ms** |
+| | 1.00x | 1.21x | **1.96x** | **2.45x** |
+
+and the `m = 1504` control is flat to within 1% at every thread count, which is what says the patch
+only reaches the branch it is aimed at.
+
+**In model**, whisper-small on `jfk.wav` at 4 threads, `$LOOM_PROFILE`, four interleaved rounds per arm:
+the `MUL_MAT 1500 x 1500` bucket goes **391.2 → 185.9 ms (2.10x)** and it is the **only** bucket that
+moves by more than 1.2 ms out of 40 — the six dense GEMM groups, `SOFT_MAX`, `CONT` and the rest are
+all within noise. End to end **4.050 → 3.858 s, 1.050x** at 4 threads, 1.056x at 8 (2.570 → 2.433 s)
+and 1.011x at 2.
+
+**Bit-identical output, which is the point of it being a SCHEDULING change.** Each output is still one
+dot product accumulated over `k` in the same order; only which thread computes it and how many rows a
+job owns have moved. FNV-1a over the whole result buffer agrees between the two builds at
+`m = 1492/1500/1501/1504` x 1/4/8 threads — so no byte-identity gate baseline needs re-recording, and
+the accuracy question PR 11 had to answer does not arise here.
+
+**Both ISAs, per the standing rule this file learned the hard way (PR 11).** aarch64 is **no change**,
+and that is a result rather than a gap: a Raspberry Pi 4 threads 3.5x at *every* one of the three `m`
+above, so there is nothing there to fix — 133.10 ms before against 133.65 after at `m = 1500`,
+4 threads, ABBA-interleaved medians of ten. Four small cores behind a shared 1 MB L2 do not pay for a
+contended line the way a 24-core mesh does. A 2-core Ryzen 3 3250U cannot resolve it either (±40%
+spread on that box; see the dev-box noise floor in loom's Retro-012).
+
+**Testing.** `tests/ci/test_tinyblas_gemm` gains the whole residue class of the 16-row split —
+`m = 1488/1492/1496/1500/1501`, plus an `n` that does not divide evenly across the threads so the
+ragged column slice is exercised — and the element check gains a window around the seam. **That window
+is load-bearing:** the leftover rows sit in the MIDDLE of the matrix, not at its edge, and with the
+window disabled a sabotage that skips the first leftover tile drops from 8 failing checks to 2.
+Verified red three ways: leftover rows never computed (7 checks fail, by 1e1–1e2 relative), the ragged
+column slice never finished (3 fail), and the first leftover tile skipped (8 fail). 137/137 green with
+all three removed, on x86 and on the workstation.
+
+**What a reviewer should push on.** (1) The `nth > 1` guard makes the patch invisible on a
+single-threaded benchmark, which is how this went unnoticed — a reviewer may reasonably want it
+unconditional, and the argument against is that it buys nothing measurable there. (2) `BM` remains a
+cache knob as well as a sharing knob, and the two now disagree about small `m`; the `m16/16 >= nth`
+condition is inherited unchanged rather than re-derived. (3) The residual gap — `m = 1500` reaches
+15.0 ms where `m = 1504` reaches 10.9 — is `ldc` alignment, not sharing: 1500 floats is 6000 bytes, so
+a 64-byte store still straddles two lines on odd columns. Padding `C` would close it and is a bigger
+change than this.
