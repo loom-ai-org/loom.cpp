@@ -162,11 +162,32 @@ repeating bulleted list (`"The Portuguese / The indigenous people of Brazil / �
 
 #### The reported symptom that did NOT reproduce, and the latent path it names
 
-**"Inference outputs the prefill as well as the generated tokens" did not reproduce** — four causal LMs
-(gemma-3-270m-it, smollm2-360m-instruct, lfm2-350m-monolithic, qwen3-0.6b-base) x three doors
-(`loom_cli --prompt`, `Model.generate`/`generate_ids`, `text2text.infer`). In every case the returned
-ids begin after the prompt. **Do not start here without a repro from the reporter** — model, door, and
-call.
+**"Inference outputs the prefill as well as the generated tokens" did not reproduce**, and the three
+things that would have explained it away are each ruled out by measurement rather than by argument:
+
+* **Not a door.** Five of them, all returning generated-only: `Model.generate`, `generate_ids`,
+  `text2text.infer`, `Model.infer` (one token, as designed), and `Model.call("infer_with_past", …)`
+  straight at the driver. Plus `loom_cli --prompt`. Four causal LMs — gemma-3-270m-it,
+  smollm2-360m-instruct, lfm2-350m-monolithic, qwen3-0.6b-base.
+* **Not "already fixed since the reported version".** The report is against **loom-py-rt 1.0.0rc6**,
+  which pins loom.cpp `646c91c`. `git diff 646c91c..HEAD` over `text_generate.{h,cpp}`,
+  `bpe_vocab.cpp` and `lua_bridge.cpp` is **empty** — the only engine change since rc6 is P4.19's
+  profiler — and loom-py's Python layer is unchanged since its `1.0.0-rc6` tag.
+* **Not a stale model.** The Hub artifact (`loom-ai-org/gemma-3-270m-it-loom`) and the local export are
+  **byte-identical**, `md5 d6591bcf…`.
+* **And rc6 itself was run**, installed from PyPI into a clean venv, against that same file: no echo,
+  and output identical to the working tree's.
+
+**The likeliest benign explanation, which should be checked before any code is touched:** an
+instruction-tuned model given an un-templated prompt behaves like a base model and **continues in the
+prompt's own format**. `"Question: Who discovered Brazil?\nAnswer:"` generates
+`" The Portuguese\n\nQuestion: What is the capital of Brazil?\nAnswer: Brasília\nQuestion: …"` — the
+prompt's shape reappears in the output as *generated* text, which reads exactly like a prefill echo and
+is not one. That is the same root cause as the rest of this item, and it would be fixed by the same
+work.
+
+**Do not start here without a repro from the reporter** — model, exact call, and the observed output.
+If it is the above, this bullet closes with the rest of the item.
 
 There is nonetheless a real hole to close while the item is open. `text_generate.h` promises "returns
 the GENERATED ids only, never the prompt — **both driver shapes are normalised to that here**", and
