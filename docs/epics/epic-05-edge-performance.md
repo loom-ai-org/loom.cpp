@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-25
+last_updated: 2026-08-29
 ---
 
 # Epic-05: Edge CPU Performance
@@ -15,6 +15,11 @@ onnxruntime running the same checkpoint on a Raspberry Pi 4?**
 The answer went from **2.2x slower** to **1.03x** over this thread, and every step of it was a
 measurement. In scope: profiling infrastructure, kernel-level performance in the pinned `ggml`,
 graph-level work reduction, and quantization for artifact size.
+
+**That 1.03x reads 0.96x today**, on a re-measurement with matched estimators. It briefly read
+**0.84x**: `ggml-0011` was found and measured on x86, shipped to every architecture, and regressed this
+board by 1.3-1.75x on every f32 GEMM for four days (P4.20, below — found and fixed 2026-08-29). It is
+the only thing in this epic that has moved the reference number backwards.
 
 ## 2. Architectural Overview
 
@@ -635,12 +640,45 @@ At one thread on the dev box the twelve nodes are **1730 ms of a 19.28 s run —
 transcription and 47% of the decode loop**, larger than the LM head (352 ms) and larger than every
 per-step projection put together (694 ms).
 
-**The fix is one wrapper.** `_WhisperCrossKvWrapper.forward` (`loom-exporter/whisper_export.py:147`) is
-`tuple(proj(xa) for proj in self.projs)` — a traced PyTorch module. Emitting the V half already
-head-split and transposed makes the decoder's chain a no-op and the copy happen twelve times per
-utterance instead of 324. Its own docstring already anticipates the cost ("the copy is not free,
-~110 MB per step") — the profile says what actually survived is the V half, 55 MB per step, and that
-it is removable. A whisper re-export and a fixture refresh, so not free at release time (ADR-003).
+##### The fix — DONE 2026-08-29 (P4.18 item B), and it was one wrapper AND one rewrite
+
+`_WhisperCrossKvWrapper.forward` now emits the V half already head-split and transposed —
+`[1, frames, d_model]` becomes `[1, heads, head_dim, frames]`, the layout `ggml_mul_mat` wants as its A
+operand — so the transpose happens **twelve times per utterance instead of 324**. K is untouched:
+`Q @ K^T` is `transpose_y=True`, which composes to a bare `MUL_MAT` over the natural layout, and only
+`scores @ V` is the `transpose_y=False` case that `topology_ops._op_matmul_x_y` composes as
+PERMUTE + CONT.
+
+**Changing the wrapper is only half of it, and the half that does not work alone.** HF's attention
+reshapes and transposes whatever `v_proj` returns *whatever shape reaches it*, so the traced decoder
+still contains the chain. `whisper_export.hoist_cross_v_transpose` deletes it afterwards — it matches
+`RESHAPE(xv_i) -> PERMUTE[0,2,1,3] -> PERMUTE[1,0,2,3] -> CONT` per layer, checks each intermediate has
+exactly one consumer, rewires the `MUL_MAT` to read `xv_i` directly, and **raises** if any of that is
+not exactly so. It runs from `ExportPhase.topology_rewrite`, a new hook whose whole justification is
+that "invariant across the driver's calls" is a fact about the *driver's loop* that no pass over one
+traced function can see.
+
+**Measured.** Ryzen 3 3250U, `samples/jfk.wav`:
+
+| | before | after |
+|---|---|---|
+| `CONT` total, 1 thread | 1583 ms (2007 calls) | **209 ms** (1695 calls) |
+| the `xv_N` buckets | 12 buckets x 27 calls | **one bucket x 12 calls**, 63 ms |
+| whole transcription, 2 threads | 10.64 s | **9.63 s** |
+
+**1.106x end to end** — 10 paired rounds in both orders (old-first and new-first, because the second
+arm of a fixed order inherits the box's thermal ramp), min 1.041, max 1.176. The decoder topology loses
+48 nodes; the `cross_kv` topology gains 36.
+
+**Numerically it is a no-op, and that is checked rather than argued.**
+`test_e2e_whisper_mil_export` teacher-forces the decoder over the whole prompt against HF's own logits,
+and the diffs are **bit-identical** to the previous export's — `mean_abs_diff` 6.29746e-06 and
+`max_abs_diff` 3.52859e-05 on the decoder, `max/absmax` 4.34e-04 on the encoder, 67/67 either way. That
+test mattering here is the point: whisper's gate compares tensors, so a wrong V permutation fails it,
+where the transcript alone would not have (Retro-006).
+
+**Its cost is a release cost.** A whisper re-export and a fixture refresh (ADR-003), so the Hub copy
+needs a push — it lands in rc7, and rc6 shipped without it.
 
 **And the general lesson, which is Retro-012's shape again:** a bucket keyed on `(op, ne0, ne1)` cannot
 tell you which graph it is in, and `ne1 = 1500 means encoder` only classifies buckets whose `ne1` is
@@ -818,6 +856,177 @@ would look like, and it is also what this estimator does to a null. Not resolvab
 **`ggml-0011` is a ONE-THREAD result on this box**; if a 24-thread number is ever needed, the estimator
 has to change (pin the placement, or compare per-op rather than end to end), not just the round count.
 
+#### `ggml-0011` regressed aarch64 for four days — P4.20, FIXED 2026-08-29
+
+Found while re-measuring the README's ASR column, which is the only reason it was found at all: the
+Pi's ASR cell had fallen **0.58x → 0.45x** and nothing in the change log predicted it.
+
+Raspberry Pi 4B, Cortex-A72, 4 threads, cooldown to 58 C before **every** measurement, arms alternated
+inside each round, one tree, one checkpoint, three builds differing only in which patches
+`cmake/patches/` contained:
+
+| Pi 4B, 4 threads | shipped (0001-0011) | without `ggml-0011` | without 0010 and 0011 |
+|---|---|---|---|
+| whisper-small, `loom_cli` wall | 49.42 / 49.33 s | **42.35 / 39.51** | 40.44 / 39.62 |
+| VITS synthesis, 73216 samples both | 1.2545 / 1.2594 s | **1.1142 / 1.0930** | — |
+| Qwen3-0.6B, 24 tokens, best of 5 | 16.80 / 16.68 s | 16.66 / 16.58 | — |
+
+**and against onnxruntime on the same board, which is what the README's Pi row now says:**
+
+| Pi 4B, 4 threads | as shipped | without `ggml-0011` | published 2026-08-24 |
+|---|---|---|---|
+| TTS | **0.84x** | ~0.95x | 0.98x |
+| LM | **1.05x** | 1.06x | 1.08x |
+| ASR | **0.45x** | ~0.54x | 0.58x |
+
+**The LM is untouched**, and that is the control this finding needed: a decode step's `mul_mat` has
+`ne1 = 1` and never reaches the blocked GEMM, so a patch to that kernel should do nothing there. It
+does nothing there. The two tasks that do reach it both lose.
+
+(These whisper wall times include the model load, which both arms pay; the harness figure for the same
+board and build is ~46 s. **Every measurement on this board cools it to 58 C first** — that is the only
+reason any of them repeat, and `~/pi_accept.sh` on the Pi is the acceptance sweep with that protocol in
+it. The checkpoint throughout is `~/bench/fixtures/whisper_new.gguf`, **`md5 1deaac83…`, the rc6
+export**: this item is about a ggml kernel, so comparing against the published Pi row needs the
+published artifact, which is also why the ASR cell below lands at 0.57x rather than at the ~0.63x the
+newer V-transpose export would give on the same board. The variant builds used for the bisect were
+deleted once the fix landed; rebuilding one is `cmake -B build-no11` with the patch moved aside, about
+40 minutes there.)
+
+**`ggml-0011` costs this board 1.17-1.25x on whisper and 1.13-1.15x on VITS.** `ggml-0010` is inside
+the noise here (42.35 against 40.44, then 39.51 against 39.62), which is what a 3.6%-of-runtime op can
+be and agrees with the 0.9% the README already claims for it on this machine.
+
+**Why it can only cost on this ISA, and why that was predictable from the patch's own analysis.** The
+patch exists because tinyBLAS rejected any matmul with `k % KN != 0`. On AVX2 `KN = 8` and whisper's
+1500-frame contraction leaves 4, so the patch converts a rejected matmul into an accepted one — 2.15x.
+**On NEON `KN = 4`, and 1500, 768, 3072 and 64 all divide 4**, so the tail it adds is *never taken* on
+any shape this model has. Everything that remains is its restructuring of the **aligned** path — and
+this epic already records that folding that path's epilogue costs the aligned case **30%** on x86,
+which is why the patch carries two epilogues with the branch outside the tile. The aarch64 build was
+never re-measured after it landed. `ggml-0001` exists precisely because GCC's register allocation for
+the NEON tile is fragile (15.6 → 25.1 GFLOP/s from a tile it can actually allocate), so a second
+structural change to the same loop is exactly where a NEON regression would be expected to appear.
+
+##### What it actually was, and the fix
+
+**Step 1 reproduced it at the kernel, and made it bigger.** `scripts/bench15.cpp` on the Pi, one
+thread, three rounds, both builds — whisper's five encoder GEMMs, **every one of whose `k` divides
+NEON's `KN = 4`, so none of them ever takes the tail this patch adds**:
+
+| Pi 4B, m x n x k | with `ggml-0011` | without | |
+|---|---|---|---|
+| 1500 x 1500 x 64 (`QK^T`) | 4.67 GFLOP/s | 7.62 | **1.63x** |
+| 64 x 1500 x 1500 (`A@V`) | 4.70 | 7.84 | **1.67x** |
+| 768 x 1500 x 768 (`proj`) | 4.86 | 8.50 | **1.75x** |
+| 3072 x 1500 x 768 (`fc1`) | 4.86 | 8.56 | **1.76x** |
+| 768 x 1500 x 3072 (`fc2`) | 4.01 | 5.28 | **1.32x** |
+
+That it hits **every** shape rather than the small-`k` ones is what ruled out the epilogue's runtime
+cost and pointed at the main loop's code generation.
+
+**Step 2 bisected the patch into its two hunks**, four builds of one `.so`, ABBA:
+
+| variant | `proj` | `QK^T` |
+|---|---|---|
+| shipped (truncated `kk` + two epilogues) | 4.87 | 4.65 |
+| `kk = k`, two epilogues kept | 4.82 | 4.45 |
+| truncated `kk`, single epilogue, **tail removed** | **8.56** | **7.67** |
+| neither (unpatched) | 8.47 | 7.57 |
+
+**It is not the `kk` arithmetic — it is the presence of the scalar tail loop in the tile function.** A
+fifth build folding the tail into one epilogue rather than two is also slow (5.12), so it is not the
+number of epilogues either. The tail reaches `Aat`/`Bat` after the main loop, and on GCC/aarch64 that
+changes what the register allocator does with the 4x3 NEON tile — **the same fragility `ggml-0001`
+exists for, approached from the other side.** The patch's own x86 note says folding the tail into one
+epilogue costs *x86* 30%; both ISAs were saying the same thing about this code, and only one had been
+asked.
+
+**Step 3: the tail got its own `NOINLINE` function, dispatched on `k % KN` before the tile.** The
+aligned path is then instruction-for-instruction what it was before the patch existed, on every ISA —
+which is what the x86 trap note demands and what aarch64 needed. Measured on both:
+
+| | x86 (285K, AVX2) | aarch64 (Cortex-A72) |
+|---|---|---|
+| `A@V` k=1500, **where the tail fires** | 150.7 vs 53.2 unpatched — **2.83x, intact** | n/a (1500 % 4 == 0) |
+| `QK^T` k=64, aligned | 119.3 vs 118.8 shipped / 120.7 unpatched | 7.38 vs 7.54 unpatched |
+| `proj` k=768, aligned | 162.0 vs 162.2 / 161.9 | 8.43 vs 8.38 |
+| whisper end to end | 2.076 s vs 2.086 s — unmoved | 36.4 s vs 46.4 s — **1.27x** |
+| `test_tinyblas_gemm` | 113/113 | 113/113 |
+
+**Acceptance — the Pi's three README cells against onnxruntime**, cooled to 58 C before every
+measurement, arms alternated:
+
+| Pi 4B, 4 threads | published 2026-08-24 | regressed | **fixed** |
+|---|---|---|---|
+| TTS | 0.98x | 0.84x | **0.96x** |
+| LM | 1.08x | 1.05x | **1.06x** |
+| ASR | 0.58x | 0.45x | **0.57x** |
+
+**Neither half of that table was optional.** The x86 column is what says this is a fix rather than a
+revert with extra steps; the aarch64 column is what the patch shipped without. `UPSTREAM.md` carries
+both now, and that is the standing rule this cost bought
+([Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md)).
+
+#### Where the encoder gap is NOW, measured per shape — P4.18 item A (2026-08-28)
+
+The table above is what motivated `ggml-0011`. **This one is the state after it**, and it exists
+because the version of it that P4.18 was steering by had one measured column and one **composed** one
+(`A@V` scaled by the microbenchmark's 2.15x, GELU by `ggml-0010`'s), while every remaining decision
+rested on it.
+
+Ryzen 3 3250U, **one thread**, `taskset -c 0`, `samples/jfk.wav`. **Five interleaved rounds** — one
+loom transcription and one onnxruntime encoder run per round — so the box's thermal drift, 12% across
+five runs here, moves both arms together instead of landing on one of them. loom's column is
+`$LOOM_PROFILE` with `$LOOM_PROFILE_NODES=1`, split **by node** so the 24 `cross_kv` projections are
+removed rather than apportioned by FLOPs; onnxruntime's is its own per-node profile keyed on
+**(op, input shape, output shape)** — the output shape is what separates `fc1` from `fc2`, which share
+an input shape with the projections — apportioned over a separately measured un-profiled encoder wall
+of **9.30 s**. Profiling costs onnxruntime **1.01x** here, not the 1.18x it costs on the Pi.
+
+| encoder piece | calls l/o | loom | onnxruntime | ratio (lo-hi) | share of gap |
+|---|---|---|---|---|---|
+| **`QK^T`** | 12/12 | 1957 ms | 1027 ms | **1.96x** (1.77-2.08) | **51%** |
+| `Softmax` | 12/12 | 780 | 491 | 1.60x (1.54-1.71) | 16% |
+| `fc2` | 12/12 | 2302 | 2016 | 1.14x (1.12-1.26) | 16% |
+| `fc1` | 12/12 | 2240 | 2034 | 1.09x (1.04-1.22) | 11% |
+| Q/K/V/O projections | 48/48 | 2138 | 1970 | 1.11x (1.06-1.37) | 9% |
+| `A@V` | 12/12 | 1101 | 1046 | **1.07x** (1.02-1.21) | 3% |
+| layout (`CONT` vs `Transpose`) | 152/97 | 124 | 70 | 1.77x (1.63-1.83) | 3% |
+| conv frontend | 2/2 | 179 | 155 | 1.15x (1.08-1.22) | 1% |
+| norm + bias + residual | 186/108 | 212 | 281 | 0.77x (0.73-0.82) | −4% |
+| GELU | 14/14 | 78 | 195 | **0.41x** (0.38-0.43) | −7% |
+| **encoder total** | | **11110 ms** | **9284 ms** | **1.20x** | 1826 ms |
+
+**`ggml-0011` did in the model what the microbenchmark predicted.** `A@V` is **2.23x in the table
+above and 1.07x here** — the largest single item in the pre-patch split is now the smallest. That is
+the check this item existed to run, and it passed: the composed column was not wrong about where the
+rest of the gap is, so the item below is still aimed at the right thing.
+
+**`QK^T` is 51% of what is left**, against the composed column's 58%. Closing it entirely would take
+the encoder from 1.20x to **1.10x**, and it is **6.0% of a whole one-thread transcription** (15.4 s of
+node time) — that is the number to weigh the work below against.
+
+**The dense GEMMs are 1.09-1.14x each AND 36% of the gap.** Both are true and neither replaces the
+other: per shape they are inside P4.15's stated 1.10-1.12x of MLAS and there is nothing in them to
+win; in aggregate they are 6.7 s of an 11.1 s encoder, so their 12% is 660 ms — more than `Softmax`,
+`A@V` and the layout bucket combined. **A gap can be dominated by the path that is already fast.**
+
+**Two rows are loom ahead, and they are this thread's two ggml patches**: GELU at 0.41x (`ggml-0010`)
+and the norm/bias/residual group at 0.77x. Together they are −11% of the gap; without them the encoder
+would read 1.22x instead of 1.20x.
+
+**What is not in either column.** loom's 24 `cross_kv` projections — 1090 ms at one thread — are a
+separate topology with no counterpart in `encoder_model.onnx`, because onnxruntime computes those
+tensors on its decoder's first pass. They are real work both engines do; they are simply not encoder
+work on either side. The mel frontend is excluded for the same reason: onnxruntime's is `transformers`
+in numpy, outside its timer.
+
+**The absolute times here are ~20% below the ones in the table above, and that is the box, not a
+regression.** Buckets that nothing touched between the two measurements moved by the same factor as
+the ones that did; only the *ratios*, taken inside a round, are comparable across the two tables. It
+is the reason this one was taken paired.
+
 #### `QK^T` at `k = 64` — STILL OPEN, and the largest thing left in the encoder
 
 `k = 64` divides 8, so `QK^T` does run through tinyBLAS — at **23.5 GFLOP/s where the same core does
@@ -831,9 +1040,10 @@ has to change (pin the placement, or compare per-op rather than end to end), not
 already divided 8.)
 
 MLAS drops only 9% over the same range (34.8 GFLOP/s at k=64 against 38.3 at k=768, from its own
-per-node profile), so it is a property of ggml's kernel and not of the shape. Worth ~1.1 s of the
-1-thread encoder on the dev box. *Do not start by writing a fused attention kernel* — that is still
-ruled out above.
+per-node profile), so it is a property of ggml's kernel and not of the shape. **Measured against
+onnxruntime in the model** (the table above): 1957 ms against 1027, a **930 ms gap that is 51% of
+everything left in the encoder** and 6.0% of a one-thread transcription. *Do not start by writing a
+fused attention kernel* — that is still ruled out above.
 
 **First, the estimator, because it cost two wrong answers here.** The same binary measured this shape
 at 27.9 GFLOP/s and, twenty minutes later on a box still warm from a `ctest` run, at 12.6 — a 2.2x
@@ -879,7 +1089,7 @@ missed `KN`: a frame count is a number nothing rounds.
 |---|---|---|
 | a 16-row prefix so `BM = 4` is reachable for an m that is only `% 4` | 27.2 -> 21.1 GFLOP/s in ggml | **a regression — but on the tail, not the idea** |
 | rows inner, columns outer, so a 4-float store finishes a 64-byte line of C | 1.26x once; **no dependence on the size of C** on re-run | **mechanism falsified** |
-| a cheaper `hsum` epilogue — 3 `hadd` + one `_mm_storeu_ps` for four reductions | 7.77 -> 7.33 ms standalone | 1.06x, **under the noise floor** |
+| a cheaper `hsum` epilogue — 3 `hadd` + one `_mm_storeu_ps` for four reductions | 7.77 -> 7.33 ms standalone | 1.06x, under this box's noise floor — **and right: 1.085x with counters on the 285K, see below** |
 | `ggml-0002`'s aarch64 address hoist applied to x86 | 27.3 against 27.2 | **neutral** |
 
 **The 16-row prefix failed on the row tail, not on the idea** — which the paired table above now makes
@@ -899,11 +1109,105 @@ with C shrunk until it fits in cache and the flops held equal, the ratio went 1.
 mechanism has to show. That is a falsified mechanism rather than a noisy number, and it is the useful
 half of the result.
 
-**Where that leaves it.** Roughly 2.1x against the witness, of which ~1.15x is row blocking that
-whisper's `m = 1500` cannot reach; **the remaining ~1.8x has no identified mechanism.** It is not the
-epilogue, not the store pattern and not the address arithmetic. The next attempt should start with a
-hardware profiler — `perf` is not installed on the dev box — or on the workstation, where the noise
-floor is low enough to resolve what this one cannot.
+##### The counters answered it — P4.18 item C, 2026-08-29
+
+Run on the workstation with `perf`, one thread, pinned to a P-core with `cpu_core/`-prefixed events
+(`scripts/bench15.cpp`, which exists so a counter reading covers ONE shape instead of a table of
+shapes that behave differently). **Instruction counts are deterministic; they resolve what this
+thread's timings could not.**
+
+**1. The FP port is not saturated at `k = 64`, so the time is not arithmetic.**
+
+| m=n=1500, 1 thread, 285K P-core | k=64 | k=768 |
+|---|---|---|
+| GFLOP/s | 118.8 | 158.4 |
+| instructions retired per FMA | **4.16** | **2.08** |
+| IPC | **5.40** | 3.50 |
+| FMA per cycle (2/cycle is the port) | **1.15** | 1.73 |
+
+At `k = 768` the kernel is at 86% of the FP ports. At `k = 64` it is at 58%, while retiring 5.4
+instructions per cycle — it is **retirement-bound on instructions that are not FMAs**.
+
+**2. What those instructions are: a fixed cost per OUTPUT, not per flop.** Sweeping `k` and fitting:
+
+```
+instructions per output element = 0.2355 * k + 18.0        (within 1.5% at every k in [32, 768])
+```
+
+| k | 32 | 64 | 128 | 256 | 512 | 768 |
+|---|---|---|---|---|---|---|
+| GFLOP/s | 79.0 | 118.8 | 137.2 | 153.6 | 158.4 | 158.4 |
+| insn/output | 25.9 | 33.3 | 48.1 | 77.9 | 138.1 | 199.3 |
+| the intercept's share | 70% | **54%** | 37% | 23% | 13% | 9% |
+
+The intercept is **the tile epilogue** — `gemm_bloc` ends by horizontally reducing `RN*RM` vector
+accumulators to scalars and storing each one on its own, and that is the only per-output,
+`k`-independent work in the function. **At whisper's `k = 64` it is 54% of everything the core
+retires.** The whole GFLOP/s curve is this one term going away.
+
+**3. `BM` is NOT the mechanism, and the ~1.15x above is a cache effect that does not travel.** All
+three `BM` branches call `mnpack<4, 6, BM>` — the *register tile is 4x6 in every one of them*; `BM` is
+the outer block, i.e. cache blocking. Counted at `k = 64` on the 285K:
+
+| m | 1500 (BM=1) | 1496 (BM=2) | 1504 (BM=4) |
+|---|---|---|---|
+| instructions | 15.06e9 | 15.01e9 | 15.07e9 |
+| GFLOP/s | 117.1 | 118.6 | 119.6 |
+
+**Identical instruction counts and rates within 2%.** The 1.15x measured on the Ryzen was blocking
+working against a 4 MB L3; the 285K has 36 MB and whisper's operands are 384 KB. **So the "~1.15x is
+explained" line above explained it with the wrong mechanism, and the `BM` cascade it recommends is not
+worth building.** Nothing was wrong with the Ryzen measurement — it was a machine-specific cache
+result read as a code-shape one.
+
+##### Pricing the fix, and why it is NOT shipped
+
+If the epilogue is the mechanism, batching it is the direct test. The four outputs of an `RM = 4` tile
+column are contiguous in C, so they can be reduced together: three `vhaddps`, an extract, an add and
+one 16-byte store for four outputs, against four independent `hsum`s and four scalar stores. Written as
+an overload on `<4, __m256, float>` so no other type, tile width or ISA changes at all.
+
+**It does exactly what the model says, and the model is why it is not enough.**
+
+| | before | after |
+|---|---|---|
+| instructions per output | `0.2355k + 18.0` | **`0.2357k + 11.5`** |
+| — saved, at every k measured | | 6.67 / 6.68 / 6.68 / 6.77 |
+| 285K, k=64, 9 ABBA rounds | | **1.085x** (p10 1.021, p90 1.145) |
+| 285K, k=768, 9 ABBA rounds | | 1.022x (p10 1.016) |
+| Ryzen, k=64, 9 ABBA rounds | | 1.023x — **p10 0.982, unresolved** |
+| `tests/ci/test_tinyblas_gemm` | | 113/113 |
+
+A 20% instruction cut at `k = 64` buys 8.5% of the time, so the kernel is not *purely* retirement-bound
+either — three dependent `vhaddps` at 6-cycle latency serialise part of what they save. Weighted over
+the encoder's real bucket mix that is **~2.8% of the encoder, 1-2% of a transcription**.
+
+**Declined on exactly the grounds `SOFT_MAX`'s pass fusion was declined**: a ggml patch carried forever
+for ~1-2% end to end, resolvable on one of the two x86 machines and not the other. It is recorded in
+[Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) with its numbers so it is not
+re-proposed as a guess — it is now a measured option, not an idea.
+
+##### Where the rest of it actually is
+
+After the batched epilogue the fixed cost is still **11.5 instructions per output**, which is 42% of
+everything retired at `k = 64`; removing all of it is a **1.76x ceiling on the op**, and the measured
+gap against onnxruntime at this shape is 1.96x. **The two numbers agreeing is the finding.** MLAS does
+not pay a per-output reduction at all: a dot-product kernel whose vector lanes are `k` must reduce
+horizontally once per output, and an outer-product kernel whose lanes are `m` or `n` never does — it
+accumulates into C directly.
+
+So the remaining gap is **the kernel's formulation, not its schedule**, and closing it means packing an
+operand so the contracted axis is not the vector axis. That is a new kernel plus a packing step rather
+than a patch to this one, it is what ADR-014 exists to make a deliberate decision about, and **it
+should be scoped as its own item rather than started from here.** What is now settled and should not be
+re-derived: the FP ports are not the limit, the epilogue is 54% of the work at this shape, `BM` is a
+cache knob **at one thread** (at four it is a false-sharing knob worth 2.75x -- P4.22 and
+[Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md); this paragraph is the entry that
+lesson is about), and 6.7 of the 18 instructions are available for 1.085x if anyone wants them.
+
+**And the conclusion of the first sentence did not survive its own experiment:** packing an operand so
+the contracted axis is not the vector axis WAS built and measured, as P4.21, and it is 1.38x on this
+machine against a 1.52x roofline ceiling. See §5.
 
 **Not a gap, but worth knowing:** whisper pads every clip to 30 s, so an 11-second file pays the full
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
@@ -924,6 +1228,21 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
 
 * **Make both A/B arms the same binary**, switched at run time, and interleave them ABBA in both orders
   over two rounds.
+* **`perf` on the workstation, and the four things that make it usable.** It is installed there
+  (6.12.105, 2026-08-25) and it is a **hybrid PMU**: events split across `cpu_core` and `cpu_atom`, so
+  **pin to a P-core and prefix the events** — `taskset -c 0 perf stat -e cpu_core/cycles/,cpu_core/instructions/`
+  — or they are counted on both and the shares mean nothing. Basic counters (cycles, instructions,
+  branches, branch-misses) work per-process without privileges at `perf_event_paranoid = 2`; the
+  `topdown-*` group does **not** ("Invalid event in per-thread mode"), and needs system-wide collection
+  — ask before changing a sysctl or running sudo on someone's machine. There are no named
+  microarchitectural events in this build (`perf list` has zero matches for `fp_arith*` or `uops_*`);
+  raw encodings would have to come from Intel's perfmon JSON **for Lion Cove**, not from an older core.
+* **Count instructions before timing anything.** Instruction counts are deterministic to ~0.4% where
+  this project's timings are noisy to 15%, and P4.18 item C was settled entirely on them: a `k` sweep
+  fitted `instructions/output = 0.2355k + 18.0` and named the mechanism, where three years of timing
+  had produced four falsified guesses. **Point the counter at ONE shape** — `scripts/bench15.cpp` runs
+  a single GEMM in a loop for exactly this reason, because `perf` counts a process and every other
+  bench here runs a table of shapes that behave differently.
 * **Pin any stochastic sampler before quoting a ratio.** VITS's duration predictor is stochastic and
   the reference host does not seed it, so each run synthesises a different number of samples — see
   [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md).
@@ -990,7 +1309,7 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
 | | |
 |---|---|
 | Decisions | [ADR-014](../adrs/adr-014-patch-ggml-rather-than-write-kernels.md), [ADR-017](../adrs/adr-017-no-k-quants.md) |
-| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md) |
+| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md) |
 | Active tasks | [Backlog → Performance](../backlog/active-index.md#engine--performance) |
 
 ## 4. The Record
@@ -1946,6 +2265,189 @@ did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27
 
 
 ## 5. Planned Work
+
+### P4.21 — `QK^T` at `k = 64`: the vector lanes are on the wrong axis — MEASURED OUT, CLOSED 2026-08-29
+
+**The premise held and the ceiling did not.** An outer-product tile really does delete the per-output
+horizontal reduction — instructions per output fall **36.2 -> 19.7**, a 1.84x cut, exactly the
+mechanism P4.18 predicted. It buys **1.38x** on the machine the mechanism was found on, because the
+instruction count was never a time ceiling: the reductions were filling issue slots the FMA ports were
+not using, and once they are gone the kernel is port-bound at **91% of the machine's roofline**. The
+gate was 1.5x; it clears on one of three boxes. **Do not re-propose it as scoped.** What the
+experiment found instead is worth 2.75x and is P4.22, below.
+
+The measuring stick is `scripts/bench16.cpp`, which is self-contained against a built ggml and prints
+the gate verdict itself. Everything below re-derives from it. **The counters this item was scoped from
+are not repeated here** — the `perf` table (IPC 5.40, 58% of the FP ports at `k = 64`, the
+`0.2355k + 18.0` fit and its `k` sweep) is P4.18 item C's, in §2 above, and it is still correct; what
+was wrong was the conclusion drawn about time, below.
+
+#### The gate, on three boxes
+
+whisper-small's own `QK^T` — `m = n = 1500, k = 64, 12 heads` — one thread, ABBA per rep and median
+per arm, **pack counted**, best register tile and column block per box (`-DMR_VECS -DNR_TILE
+-DNB_COLS`):
+
+| box | ISA | roofline, 1 core | `tinyBLAS` dot | outer product | **ratio** | perfect-kernel ceiling |
+|---|---|---:|---:|---:|---:|---:|
+| Ryzen 3 3250U | AVX2 | 54.6 GF | 23.9 GF (44%) | 44.3 GF (81%) | **1.85x** | 2.24x |
+| Core Ultra 9 285K, P-core | AVX2 | 177.2 GF | 116.6 GF (66%) | 161.3 GF (91%) | **1.38x** | 1.52x |
+| Raspberry Pi 4, Cortex-A72 | NEON | 14.3 GF | 7.45 GF (52%) | 9.18 GF (64%) | **1.23x** | 1.93x |
+
+The last column is the number that ends the item: **`roofline / ggml`, what a flawless kernel of any
+formulation could be.** On the 285K it is 1.52x, so the 1.5x gate was at the machine's own ceiling
+before a line was written, and the 8% between 1.38x and 1.52x is all that any further tuning could
+find. The 1.76x from P4.18 was `(0.2355k + 18.0) / 0.2355k`, an INSTRUCTION ratio, and it is only a
+time ratio if IPC holds. It does not: **5.02 -> 3.63** across the two arms.
+
+The pack is not what killed it, and this is worth stating because it was the suspected cost: **1.0-1.5%
+of the packed arm** at this shape (0.32 ms against 21.5 ms on the 285K, 4.4 MB copied). Panel-major,
+not a plain transpose — a `[m, k]` transpose leaves the tile striding 6000 bytes between `k` steps.
+
+#### Why the three boxes disagree, which is the transferable part
+
+**`hsum` costs what the vector is wide.** In `sgemm.cpp`, `hsum(__m256)` is an `extractf128`, an
+`addps`, a `movehl`, an `addps`, a `movehdup` and an `addss` — **six instructions**. `hsum(float32x4_t)`
+is `vaddvq_f32` — **one**. So P4.18's 18.0-instructions-per-output intercept is an **AVX2 artifact**,
+and on NEON there is almost no epilogue to remove. That is the whole of the Pi's 1.23x, and it is why
+an aarch64 measurement could never have been extrapolated from the x86 one, or the reverse.
+
+**And the wider the core, the better it hides what is left.** The dot-product kernel reaches 44% of
+roofline on a 2019 laptop Zen+, 52% on an A72 and **66%** on a Lion Cove P-core. The reductions are
+cheap ALU work that a wide out-of-order core issues in slots the FMA ports leave idle, so the newer
+the core, the less there is to win — the trend runs against this item, not with it. Anyone tempted to
+re-open it x86-only should read the 1.85x on the Ryzen and the 1.38x on the 285K as two points on that
+line, not as two boxes disagreeing.
+
+#### The `k` threshold, since the sweep is cheap and settles the dispatch question
+
+285K, one thread, unblocked, ratio with pack: **k=32 1.77x, k=48 1.72x, k=64 1.38-1.54x, k=96 1.25x,
+k=128 1.14x, k=192 1.08x, k=256 1.03x, k=384 1.01x, k=768 0.94x.** It goes under 1.0 by `k = 768`,
+where the pack is 3.9% and the epilogue is 9% of the work. So the dispatch condition the design sketch
+asked for is real and it is roughly `k <= 128` — but the band where it pays anything is also the band
+where it pays least on the boxes that matter.
+
+#### What was tried before it was called, so it is not re-tried
+
+* **Register tile**, both ISAs: `MR_VECS x NR_TILE` of (2,6) (3,4) (2,5) (3,3) (4,3) (2,4) on x86;
+  (2,6) (3,4) (4,3) (2,8) (4,4) (3,6) on NEON. Best per box is in the table's config; the spread
+  between the best and worst tile is 1.1-1.2x, and no tile changes the verdict.
+* **Column blocking.** It is NOT optional on a small cache and it is nearly free on a large one: the
+  Ryzen goes **1.50x -> 1.80x** from `NB = 48` alone (94 A-panels each streaming 384 KB of B becomes
+  A re-read once per column block), the Pi 1.005x -> 1.23x, and the 285K moves 1.8% because its 3 MB
+  L2 already held everything. A naive loop order failing is not the formulation failing — that is why
+  the knob exists.
+* **The operand-pointer hoist.** Worth ~1.15x on the Ryzen, nothing on the 285K. Same failure
+  `ggml-0002` documents on aarch64, on the other ISA.
+
+#### One trap in the harness, recorded because it nearly published a false number
+
+The roofline probe must be checked in the disassembly, twice. Written the obvious way, gcc 14.2
+collapsed sixteen independent vector FMA chains into a handful of **scalar** `vfmadd132ss` and reported
+585 GFLOP/s on a machine that does 55 — every "% of roofline" on this page would have been a seventh of
+the truth. It needs an empty `asm volatile` barrier on the operands. Then, fixed, `ACC = 16`
+accumulators plus two operands is 18 live vectors in a 16-register file, and the spill reported 108
+GFLOP/s on a machine whose own GEMM was doing 163. **`grep -c vfmadd231ps` on the probe's own loop is
+the check**, and `bench16.cpp` carries both fixes.
+
+### P4.22 — `tinyBLAS` false-shares `C` and stops threading at whisper's `m` — DONE 2026-08-29
+
+**Shipped as `cmake/patches/ggml-0012-tinyblas-line-aligned-jobs.patch`.** whisper-small's `QK^T`
+bucket is **391.2 -> 185.9 ms in model, 2.10x**, and it is the only bucket of forty that moves by more
+than 1.2 ms. The transcription is **4.050 -> 3.858 s at 4 threads (1.050x)**, 1.056x at 8. Output is
+**bit-identical**, so no gate baseline moved.
+
+#### The bug, which is one line of arithmetic
+
+`gemm()` gives ONE JOB the rows `[ii, ii + BM*RM)`; `C` is `m`-contiguous; so a job's store to one
+column of its range is `BM*RM*4` **bytes** wide. `matmul_aligned` picks `BM` from what divides `m`:
+
+| `m` | branch | `BM` | bytes of `C` per job | 1 thread | 4 threads | scaling |
+|---:|---|---:|---:|---:|---:|---:|
+| 1496 | `m % 8 == 0` | 2 | 32 (half a line) | 29.4-30.5 ms | 21.2-21.9 ms | 1.40x |
+| **1500** | `m % 4 == 0` | **1** | **16 (a quarter)** | 29.6-30.9 ms | 30.0-31.5 ms | **0.98x** |
+| 1504 | `m % 16 == 0` | 4 | 64 (**a full line**) | 29.4 ms | 10.6-11.0 ms | **2.75x** |
+
+Monotone in the fraction of a line a job owns, and `perf stat -e task-clock` shows **3.65 CPUs busy**
+in the 0.98x row — the threads run, they just pass a line back and forth. **It does not make the
+kernel slower; it stops it threading.** `m` is a sequence length in every attention matmul, so this is
+the common case: whisper's 1500 frames is `4 mod 16`, the worst residue there is.
+
+#### The fix, and the guard that bounds its blast radius
+
+PR 3's trick on the other end of the same axis: run `m - (m % 16)` at `BM = 4` and finish the 0/4/8/12
+leftover rows in a column-split loop that keeps the same `4 x RN` tile (`gemm_rows`, modelled on
+`gemm_tail`). **Guarded on `nth > 1`** — false sharing needs a second thread by definition, so at one
+thread the schedule is instruction-for-instruction the old one. That guard is not decoration: the dev
+box measured 148.7 vs 147.8 ms single-threaded either way, i.e. the guard costs no measured win and
+removes a whole class of risk.
+
+| `m = 1500`, 285K, `QK^T` shape | 1 thr | 2 thr | 4 thr | 8 thr |
+|---|---:|---:|---:|---:|
+| before | 29.38 ms | 30.30 ms | 29.40 ms | 19.90 ms |
+| after | 29.38 ms | 24.98 ms | **15.00 ms** | **8.12 ms** |
+| | 1.00x | 1.21x | **1.96x** | **2.45x** |
+
+**The `m = 1504` control is flat to within 1% at every thread count**, which is what says the patch
+reaches only the branch it is aimed at.
+
+#### Both ISAs, and "no change" is one of the results
+
+* **x86, Core Ultra 9 285K**: the table above, plus the in-model numbers.
+* **aarch64, Raspberry Pi 4**: **no change, and there is nothing there to fix** — it threads 3.5x at
+  *every* one of the three `m`, so the collapse does not exist on it. 133.10 ms before against 133.65
+  after (`m = 1500`, 4 threads, ABBA-interleaved medians of ten). A first pass that sampled base first
+  in each pair read 1.9% slower; the box warmed 54 -> 82 C across the run and the ordering attributed
+  the ramp to one arm. **Interleave ABBA or do not quote the number.**
+* **Ryzen 3 3250U, 2 cores**: cannot resolve it, +-40% spread by the end of a session. Recorded as
+  unresolved rather than as neutral — [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s
+  dev-box lesson.
+
+#### Why it stayed invisible, which is the transferable part
+
+**P4.18 measured `BM` at one thread and concluded it was a cache knob, not a mechanism.** That was
+TRUE: the instruction counts across 1496/1500/1504 are identical, which is what it measured. At four
+threads the same knob is a **false-sharing** knob worth 2.75x. A single-threaded instruction count
+cannot see a coherence protocol, and this repo's default profiling advice is *"profile with ONE
+thread, or dispatch cost dominates"* — which is right for attributing time to ops and blind to exactly
+this class of bug.
+
+And it was found by an experiment aimed at something else: P4.21's standalone gate needed a threaded
+arm to compare against, and the incumbent's arm not scaling was visible only because both were in the
+same harness. **A measuring stick that only measures the thing you are proposing cannot tell you the
+thing you are proposing is not the problem.**
+
+#### Testing
+
+`tests/ci/test_tinyblas_gemm` gains the residue class of the 16-row split — `m =
+1488/1492/1496/1500/1501`, with 1488 as the no-remainder control — plus an `n` that does not divide
+evenly across the threads, so the ragged column slice inside `gemm_rows` is exercised. The element
+check gains a window around the seam, and **that window is load-bearing**: the leftover rows sit in the
+MIDDLE of the matrix, not at its edge, so the pre-existing first-and-last-four-rows check had nothing
+to say about them. With the window disabled, a sabotage that skips the first leftover tile drops from
+8 failing checks to 2.
+
+Verified red three ways before it was believed ([ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md)):
+leftover rows never computed (7 checks fail, 1e1-1e2 relative), ragged column slice never finished
+(3 fail), first leftover row-tile skipped (8 fail). **137/137 green** with all three removed, on the
+dev box and on the workstation. The whole `ci` label is green as well: **70/70**.
+
+**The export gates were NOT re-run, and here is the argument for why they cannot move.** This is a
+SCHEDULING change: which thread takes which tile, and how many rows a job owns. Every output element
+is still computed by the same `gemm_bloc<RM, RN>` over the same `k` range in the same order, so the
+bytes are identical -- verified rather than asserted, with an FNV-1a hash of the whole result buffer
+agreeing between the two builds at `m = 1492/1500/1501/1504` x 1/4/8 threads, and at every GEMM shape
+whisper's encoder runs (`QK^T`, `A@V`, the three dense projections) plus VITS's `m = 287`. A
+byte-identity baseline cannot move under a change that produces identical bytes; if a future edit here
+ever does move them, that is the signal to re-record.
+
+#### Still open here, and it is not this patch
+
+`m = 1500` reaches 15.0 ms where `m = 1504` reaches 10.9. The remainder is **`ldc` alignment, not
+sharing**: 1500 floats is 6000 bytes, `6000 % 64 = 16`, so a job's 64-byte store still straddles two
+lines on odd columns. Closing it means padding `C`, which is an allocator change and a much bigger
+proposition than this. Worth ~4 ms of a 3.9 s transcription; **do not open it without re-measuring
+first.**
 
 ### P4.16 — the convolution gap, shape by shape against onnxruntime — SCOPED, NOT STARTED
 
