@@ -112,6 +112,17 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
+* [ ] **Which venv runs loom-exporter's tests is not written down, and the wrong one fails 4 of them.**
+  `python3` on the dev box resolves to **`~/.venvs/ovos`** — transformers 5.14.1, **no `sentencepiece`**
+  — which is the Qwen3-ASR-only env. `tests/ci` under it is `4 failed, 568 passed`:
+  `test_spec_protocol` because `spm_tokenizer_export` cannot import without `sentencepiece`, and three
+  `test_causal_lm_export` registry tests with
+  `LinkError: MonolithicCall … supplies input(s) it does not declare: ['cache_position']`, which has
+  the shape of a transformers-version difference in what the trace sees. **`~/.venvs/piper`
+  (transformers 4.57.6, sentencepiece 0.2.1) is the env for everything except Qwen3-ASR** and must not
+  be upgraded — NeMo pins `~=4.53`. Put that in the exporter's CONTRIBUTING/README so the next person
+  does not spend an hour on four red tests that are an environment, and confirm whether the three
+  `cache_position` failures are green under piper.
 * [ ] **P4.24 — the engine cannot sample: `argmax_row` is the only decode rule.** No temperature,
   top-k, top-p or multinomial anywhere in `src/` or `include/`, so a checkpoint whose own
   `generation_config.json` says `"do_sample": true` (gemma-3-270m-it: `top_k 64, top_p 0.95`) is run in
