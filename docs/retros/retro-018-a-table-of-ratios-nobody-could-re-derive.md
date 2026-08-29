@@ -70,3 +70,37 @@ siblings. The table is now measured with both engines run back to back on each m
 
 **What NOT to re-propose:** scaling the table by a measured engine-side factor. It was tried, it was
 30% out on the first cell checked, and the arithmetic is not the problem — the published baseline is.
+
+---
+
+## CORRECTION (2026-08-28): the same bug was in `bench_asr_loom.cpp`, and this retro said it was not
+
+The root-cause section above states that "`bench_vits_loom.cpp` and `bench_asr_loom.cpp` both take a
+median over runs in a warm process, so the LM harness was also the odd one out". **The second half of
+that was false.** `bench_vits_loom.cpp:63` and `bench_lm_loom.cpp:67` each discard a warm-up run;
+`bench_asr_loom.cpp` had none. Its ASR counterpart in `bench_onnx_tasks.py` does
+(`text = run()  # warm up`), so **the ASR column of the README table was loom's cold run against
+onnxruntime's warm one** — the exact fault this retro is about, in the one column that still showed a
+loss, left in place by a fix that assumed it had been checked.
+
+There was a second fault in the same seven lines. `times[times.size() / 2]` on **two** samples is
+`times[1]` — the **larger** of the two, not a median. At `nrun=2` the harness therefore reported the
+max of a cold run and a warm one.
+
+Measured on 2026-08-28, cold/warm for whisper-small: **1.25-1.7x at 24 threads on the 285K**, 1.02x at
+four on the same box, and *below* 1.0 on the 2-core Ryzen, where the box heats up faster than the first
+run pays for itself. It is a thread-count effect, so it hit hardest exactly where the README claimed
+loom's one ASR win.
+
+**Together the two faults are 1.43x** on the 285K at 24 threads: nine launches at `nrun=2` with no
+warm-up give a median of **1.650 s**, nine at `nrun=5` with one give **1.157 s** — same binary, same
+clip, same box, same afternoon.
+
+**The lesson is not lesson 2 again — it is what "fixed" meant.** Lesson 2 was correct and was acted on;
+what failed is that the audit behind it checked one harness and asserted the other two, and the
+assertion was written into the retro as a finding. **When a retro's root cause is "these N things
+disagree", open all N.** The fix is four lines in each file and the check is one `grep -n warm
+scripts/bench_*_loom.cpp`.
+
+`bench_asr_loom.cpp` now discards a warm-up run and prints it, so the asymmetry is visible in the
+output rather than implicit in the estimator, and the comment there says to use `nrun >= 3`.
