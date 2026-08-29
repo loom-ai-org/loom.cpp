@@ -122,8 +122,12 @@ are not renumbered. New items continue the scheme.
   `eos_token_id = 1` while an IT turn ends on `<end_of_turn>` = 106 — `GenerationLoop.extra_eos_tokens`
   exists and is set only by `speech_lm_export.py`, never by `causal_lm_export.py`), and **SmolLM2 360M
   IT returns the empty string** because its first token is its own `<|im_end|>` and `strip_eos` drops
-  it. *Not reproduced:* the reported prefill echo — four causal LMs x three doors all return ids
-  starting after the prompt; **needs a repro before anyone starts there**, though
+  it. *Not reproduced:* the reported prefill echo — **rc6 itself, installed from PyPI**, over five doors
+  and four causal LMs, all returning ids that start after the prompt; the engine's generation path is
+  byte-identical between rc6's pin (`646c91c`) and HEAD, and the Hub artifact matches the local export
+  (`md5 d6591bcf…`), so neither "already fixed" nor "stale model" explains it. Likeliest is that an
+  un-templated IT model **continues in the prompt's own format** and that reads as an echo. **Needs a
+  repro before anyone starts there**, though
   `text_generate.cpp`'s list branch does trust the driver's return with no prompt check, against the
   header's claim that both shapes are normalised. **The chat template is the one open design question**
   (host-rendered KV vs structured role tags vs Jinja in the engine) and the tokenizer fix comes first
