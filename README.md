@@ -103,53 +103,91 @@ The reference question for an edge runtime: **the same checkpoint, on the same m
 thread count — how does loom compare to onnxruntime?** Three tasks, because no single one is
 representative: an all-convolutional vocoder, an encoder-decoder ASR model, and an autoregressive LM.
 
-**`>1.00x` means loom is faster.** Measured 2026-08-24, **both engines run back to back on the machine
-in the row** — see [what these numbers are not](#what-these-numbers-are-not).
+**`>1.00x` means loom is faster.** The x86 TTS and LM cells are from 2026-08-24; **the ASR column and
+the whole Pi row were re-measured 2026-08-29**. **Both engines run back to back on the machine in the
+row** — see [what these numbers are not](#what-these-numbers-are-not).
 
-| machine | arch | threads | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
-|---|---|---|---|---|---|
-| Intel Core Ultra 9 285K | x86-64 | 4 | **1.03x** | **1.01x** | 0.59x |
-| Intel Core Ultra 9 285K | x86-64 | 24 (all) | **1.17x** | 0.96x | **1.54x** |
-| AMD Ryzen 3 3250U | x86-64 | 2 (physical) | **1.02x** | **1.05x** | 0.78x |
-| AMD Ryzen 3 3250U | x86-64 | 4 (all) | 0.99x | **1.04x** | 0.76x |
-| Raspberry Pi 4B | aarch64 | 4 (all) | 0.98x | **1.08x** | 0.58x |
+| machine | arch | threads | onnxruntime 1.28.0 build | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
+|---|---|---|---|---|---|---|
+| Intel Core Ultra 9 285K | x86-64 | 4 | conda-forge | **1.03x** | **1.01x** | 0.64x |
+| Intel Core Ultra 9 285K | x86-64 | 24 (all) | conda-forge | **1.17x** | 0.96x | **1.37x** |
+| AMD Ryzen 3 3250U | x86-64 | 2 (physical) | PyPI wheel | **1.02x** | **1.05x** | 0.80x |
+| AMD Ryzen 3 3250U | x86-64 | 4 (all) | PyPI wheel | 0.99x | **1.04x** | 0.81x |
+| Raspberry Pi 4B | aarch64 | 4 (all) | PyPI wheel | 0.96x | **1.06x** | 0.57x |
 
-**The ASR column was re-measured on 2026-08-24 after `ggml-0010`** (below) and is sampled differently
-from its neighbours: each ASR cell is a median over **separate process launches** rather than over runs
-inside one process. That is not a refinement, it is a correction — see
-[the note on thread placement](#what-these-numbers-are-not). **The TTS and LM columns have not had that
-treatment**, and on the two 285K rows they carry the same uncertainty.
+**The ASR column is the only one measured with the estimators matched.** Until 2026-08-29
+`bench_asr_loom.cpp` had no warm-up run while its onnxruntime counterpart did, so every ASR cell timed
+loom's *cold* transcription against a warmed onnxruntime — 1.43x at 24 threads on the 285K, where it
+had hidden loom's one ASR win. Each ASR cell is now a median over **separate process launches** (9 on
+the 285K, 7 on the Ryzen, and the Pi's own cooldown protocol below), with both sides warmed and every
+machine running the **byte-identical** whisper GGUF (`md5 1deaac83…`). **The TTS and LM columns have
+not had that treatment** and were taken before it; on the two 285K rows they also carry the thread-placement
+uncertainty described below.
 
-**TTS and the LM are at parity; ASR is still behind.** Most cells sit within a few percent of 1.00x,
-which on these machines is the noise floor rather than a result — read them as parity, not as wins. The
-caveats below matter as much as the numbers.
+**The Pi row was regressed by one of this repository's own ggml patches, and that is now fixed.**
+`ggml-0011` — worth 2.15x at whisper's `A@V` shape on AVX2 — cost a Cortex-A72 **1.3-1.75x on every
+f32 GEMM shape measured**, because it inlined a scalar tail loop into the register tile. NEON's
+`KN = 4` divides every contraction these models have, so that tail never even ran; its presence alone
+changed what GCC's allocator did with the tile. Dispatching it out of line, before the tile, restores
+aarch64 without moving x86 at all:
 
-* **TTS is at parity everywhere**, between 0.98x and 1.03x on three of the four rows. That is what
-  P4.14/P4.15 was for: a built-in F32 GEMM micro-kernel, four convolution patches to the pinned `ggml`,
-  and a duplicated text encoder removed from the export. Only the 285K's 24-thread row is a clear win,
-  and that one is P4.17.
-* **The LM is at parity**, a few percent either way. It only just became so — until 2026-08-23 the
+| Raspberry Pi 4B, 4 threads | published 2026-08-24 | with the regression | **fixed** |
+|---|---|---|---|
+| TTS | 0.98x | 0.84x | **0.96x** |
+| LM | 1.08x | 1.05x | **1.06x** |
+| ASR | 0.58x | 0.45x | **0.57x** |
+
+It was measured on x86 and shipped to every architecture, and **the Pi was not re-measured after it
+landed** — which is the whole of why it survived four days.
+[Retro-019](docs/retros/retro-019-a-patch-measured-on-one-isa.md) is that lesson;
+[Epic-05](docs/epics/epic-05-edge-performance.md) has the per-shape numbers and the bisect that found
+the mechanism.
+
+**TTS and the LM are at parity on x86; ASR is still behind, and the Pi has regressed.** Most x86 cells
+sit within a few percent of 1.00x, which on these machines is the noise floor rather than a result —
+read them as parity, not as wins. The caveats below matter as much as the numbers.
+
+* **TTS is at parity everywhere**, 0.96x to 1.03x. That is what P4.14/P4.15 was for: a built-in F32
+  GEMM micro-kernel, four convolution patches to the pinned `ggml`, and a duplicated text encoder
+  removed from the export. Only the 285K's 24-thread row is a clear win, and that one is P4.17. The
+  Pi's cell read 0.84x for four days while `ggml-0011` was regressing it (above).
+* **The LM is at parity**, a few percent either way, and it was the one task `ggml-0011`'s aarch64
+  regression left alone — a decode step's `mul_mat` has `ne1 = 1` and never reaches the blocked GEMM,
+  which is the control that made that diagnosis trustworthy. It only just became so — until 2026-08-23 the
   engine called every causal-LM driver's `infer` rather than its `infer_with_past`, so the host re-fed
   a growing prompt and each token recomputed the whole sequence. That was worth 2.83x. **Its one loss
   is the 24-thread cell, and that is the LM at a thread count that does not suit it**: a decode step's
   `mul_mat` has `ne1 = 1`, so this task peaks at 8 threads and plateaus after. It shows up as *spread* —
   loom ranges 24.5-28.6 tok/s over nine runs there where onnxruntime holds 27.1-27.6, so loom's best
   run wins and its typical run does not. The table reports the typical one.
-* **ASR is the one still behind — 1.3-1.7x at four threads, against a 1.54x win at 24.** Whisper's
+* **ASR is the one still behind — 1.24x on the Ryzen and 1.57x on the 285K at four threads, 2.2x on the
+  Pi, against a 1.37x win at 24.** (The Pi is the outlier for a reason that is not the encoder: see
+  `ggml-0011` above.) Whisper's
   exported driver used to hand the decoder the raw encoder output every step, so cross-attention K/V
   was re-projected over all 1500 encoder frames per token — `MUL_MAT 768x1500` ran 684 times for an
   11-second clip where the encoder itself needs 84, **57.7% of ASR runtime**, where onnxruntime
   computes those tensors once. Exporting the projected K/V as its own topology is worth **2.4-2.6x on
   every machine here** (on the Pi, 90.0 s to 37.4 s for the same clip).
-* **Most of the remaining ASR gap is the ENCODER, and it is specific kernels rather than a systemic
-  deficit.** Timed separately at one thread on the 285K, loom's encoder is 5.46 s against onnxruntime's
-  2.38 s (2.29x) and its decode loop is 1.10 s against 0.97 s (**1.14x slower**). *An earlier version of
-  this table read the decoder as 1.50x FASTER and "nothing left there".* That was wrong: the 471 ms
-  layout bucket under it was assigned to the encoder by eye, and 93% of it is the decode loop — which is
-  why `$LOOM_PROFILE_NODES=1` now exists to attribute a bucket to a graph instead of to a guess.
-  Attributing the encoder's gap at equal call counts: `MUL_MAT` **1.93x = 66%**, layout `CONT`
-  **33x = 16%**, `Softmax` 4.3x, GELU 5.3x — and `LayerNorm`, where **loom is 3x faster than
-  onnxruntime**. Three of those are now closed:
+* **Most of the remaining ASR gap is the ENCODER, and it is two kernels rather than a systemic
+  deficit.** Split per shape at one thread with both engines' own profilers, interleaved round by round
+  (2026-08-28, Ryzen; `scripts/whisper_encoder_split.py` re-derives it), loom's encoder is **1.20x**:
+
+  | encoder piece | loom | onnxruntime | ratio | share of the gap |
+  |---|---|---|---|---|
+  | **`QK^T`** (12 calls) | 1957 ms | 1027 ms | **1.96x** | **51%** |
+  | `Softmax` (12) | 780 | 491 | 1.60x | 16% |
+  | `fc2` (12) | 2302 | 2016 | 1.14x | 16% |
+  | `fc1` (12) | 2240 | 2034 | 1.09x | 11% |
+  | Q/K/V/O (48) | 2138 | 1970 | 1.11x | 9% |
+  | `A@V` (12) | 1101 | 1046 | **1.07x** | 3% |
+  | GELU, LayerNorm + bias | 290 | 476 | **0.61x** | *loom ahead, −11%* |
+
+  **The dense GEMMs are 1.09-1.14x each and 36% of the gap** — both true: per shape there is nothing in
+  them to win, but they are 6.7 s of an 11.1 s encoder. `QK^T` alone is 6.0% of a whole transcription.
+  *An earlier version of this table read the decoder as 1.50x FASTER and "nothing left there".* That was
+  wrong: the 471 ms layout bucket under it was assigned to the encoder by eye, and 93% of it is the
+  decode loop — which is why `$LOOM_PROFILE_NODES=1` now exists to attribute a bucket to a graph instead
+  of to a guess. Three items on that list are now closed:
   * **GELU is done.** ggml's exact-erf GELU was a scalar `erff()` libm call per element with no SIMD
     path on any architecture; `cmake/patches/ggml-0010` replaces it with a rational approximation,
     **9.9x on the op in model** and 14.3-21.8x standalone. End to end on whisper that is **2.1% on the
@@ -158,8 +196,11 @@ caveats below matter as much as the numbers.
   * **A GEMM cliff is done.** tinyBLAS rejected every matmul whose *contraction* was not a whole number
     of vectors (`k % KN`), handing the whole thing to ggml's generic kernel — and a contraction in
     attention is a sequence length or a head dimension, i.e. a number nothing rounds. `ggml-0011` splits
-    it: **2.15x at whisper's `A@V` shape**, and **1.19-1.24x end to end on Conformer-CTC**, whose head
-    dimension (176/4 = 44) misses the vector width on every utterance.
+    it: **2.15x at whisper's `A@V` shape** — confirmed in the model, where `A@V` went 2.23x to **1.07x**
+    against onnxruntime — and **1.19-1.24x end to end on Conformer-CTC**, whose head dimension
+    (176/4 = 44) misses the vector width on every utterance. It also **regressed aarch64 by 1.3-1.75x
+    for four days** by inlining its tail into the register tile; dispatching that out of line fixed it
+    without moving x86 (see the note under the table).
   * **`SOFT_MAX` is measured out — but not for the reason first given.** Its five row passes really are
     three too many, and rewriting them is worth 1.08x on the machine that motivated it. The original
     reason, *"at 108 MB the op is DRAM-bandwidth bound"*, is false: against a `memcpy` of the same bytes
@@ -167,12 +208,22 @@ caveats below matter as much as the numbers.
     the exp is 7-26% of the op depending on the core, specialising `ggml_v_expf` to this domain is
     1.00-1.16x, and deleting the polynomial outright is only 1.8x
     ([Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md)).
-  * What is left is `QK^T` at `k = 64` and the decoder's loop-invariant V transpose, neither started.
-* **Read the 285K's four-thread ASR cell as unstable, not as a 0.12 regression.** It moved 0.71x ->
-  0.59x in the same re-measurement that added `ggml-0010`, and the patch is not why: onnxruntime's own
-  time at that thread count ranges **1.07 s to 1.59 s across 18 launches, a 1.48x spread**, because
-  that part is 8 P-cores plus 16 E-cores and a process is placed once and then stays there. loom's
-  spread over the same 18 is 1.10x. Better sampling moved the median; the engines did not.
+  * **The decoder's loop-invariant V transpose is done** (2026-08-29), and it is an EXPORT change, so
+    the table above does not contain it. Whisper's decoder re-materialised the transpose of its
+    cross-attention V every token in every layer — 12 nodes x 4.6 MB, 47% of the decode loop — of a
+    tensor the cross-KV fix had already made constant for the utterance. The `cross_kv` phase now emits
+    it transposed and the traced chain is deleted from the decoder topology: **1.106x end to end**, and
+    the decoder's logits against HF are bit-identical. **The published GGUFs do not have it yet** — the
+    ASR column above is the rc6 artifact, and the re-export lands in rc7.
+  * What is left is `QK^T` at `k = 64` — **51% of the remaining encoder gap**, and closing it entirely
+    would take the encoder from 1.20x to 1.10x.
+* **Read the 285K's four-thread ASR cell as unstable.** onnxruntime's own time at that thread count
+  ranges **1.08 s to 1.64 s across launches, a 1.5x spread**, because that part is 8 P-cores plus 16
+  E-cores and a process is placed once and then stays there; loom's spread over the same launches is
+  1.09x. The cell has read 0.71x, 0.59x and now 0.64x across three samplings in which the engines did
+  not change. **The two onnxruntime builds are indistinguishable here** — nine paired launches of the
+  conda-forge and PyPI 1.28.0 wheels straddle 1.0 at four threads and are 1.01x at 24 — so the 1.86x
+  build difference that VITS shows does **not** carry to whisper.
 * **loom used to stop scaling at 8 threads and go backwards; that is fixed, and the 24-thread row is
   the fix.** VITS on the 285K was 0.080 s at 8 threads and **0.191 s at 24 — the same as at one
   thread**. The cause was not in this repository: `ggml` defaults to OpenMP, so `ggml_barrier` was
@@ -196,11 +247,14 @@ caveats below matter as much as the numbers.
 
 ### What these numbers are not
 
-**The baseline is `pip install onnxruntime` 1.28.0**, the same distribution channel `loom-py` ships
-through. That choice flatters loom: at the *identical* version, the conda-forge build synthesises VITS
-in 0.065 s where the PyPI wheel takes 0.120 s — **1.86x apart, same machine, same script**. Against
-conda-forge, the x86 TTS wins above become losses. Whichever baseline a comparison uses, it should say
-which.
+**The onnxruntime build is named per row, because at the identical version it is worth up to 1.86x.**
+The conda-forge build synthesises VITS in 0.065 s where the PyPI wheel takes 0.120 s — same machine,
+same script — and against conda-forge the x86 TTS wins above become losses. The two 285K rows are
+measured against conda-forge and the other three against the PyPI wheel, which is the channel `loom-py`
+ships through. **That difference does not carry to whisper**: nine paired launches on the 285K put the
+two builds within the thread-placement noise at four threads and at 1.01x at 24, so the ASR column is
+comparable across rows even though its baselines are not the same package. The TTS column is not, and
+the Pi and Ryzen TTS cells are the PyPI-wheel ones.
 
 **Each pair is checked for equal work, not merely equal wall time.** TTS pins VITS's three scales so
 both engines emit the same 73216 samples, and both harnesses print that count; ASR compares the
@@ -221,8 +275,9 @@ across launches, ~1.07 s or ~1.57 s, and two adjacent measurements minutes apart
 out 1.076 s and 1.430 s. At 24 threads loom shows the same thing in a milder form — 0.994 s to 1.291 s
 over 16 launches, a 1.34x spread, which is the ASR twin of the LM spread described above.
 
-**So the ASR cells are medians over separate launches** (18 per engine on the 285K at four threads, 16
-at 24), and that is why re-measuring moved cells further than `ggml-0010` can explain. Pinning both
+**So the ASR cells are medians over separate launches** (9 per engine on each 285K row, 7 on each Ryzen
+row, and 5 cooled pairs on the Pi), and that is why re-measuring moves cells further than any patch in
+this repository can explain. Pinning both
 engines to the same four P-cores makes each side reproducible to ~0.2% — but it is not what the rest
 of this table does, and it constrains onnxruntime more than loom (pinned to P-cores it runs *slower*,
 1.76 s, than its lucky unpinned launches), so it would not be a like-for-like fix either. **The TTS and
@@ -231,7 +286,13 @@ LM columns have not been re-sampled this way and the two 285K rows should be rea
 **Both sides use the same estimator**, which is not a detail: every harness here warms up and reports
 a best-or-median over repeated runs in one process. `bench_lm_loom.cpp` used to time a single cold
 generation instead, and comparing that against a warmed-up onnxruntime moved the LM column by 5-7% —
-enough to flip its sign on all three machines.
+enough to flip its sign on all three machines. **`bench_asr_loom.cpp` had the same fault until
+2026-08-29** and it was missed because the retro that fixed the LM harness asserted this one was
+already warm rather than checking. Cold/warm on whisper is 1.25-1.7x at 24 threads on the 285K, 1.02x
+at four, and *below* 1.0 on the Ryzen, where the box heats faster than the first run pays for itself —
+a thread-count effect, which is why it landed on the one cell the table called an ASR win. The harness
+now discards a warm-up run and prints it, and **`nrun` must be >= 3**: `times[size / 2]` on two samples
+is the larger of the two, not a median.
 
 **Reproducing it:** loom's side is `scripts/bench_{vits,lm,asr}_loom.cpp`, onnxruntime's is
 `scripts/bench_onnx_tasks.py`. The latter drives `onnxruntime` directly rather than through `optimum`,
@@ -251,12 +312,16 @@ cmake --build build -j"$(nproc)"
 
 Dependencies (`ggml`, `nlohmann_json`, LuaJIT) are fetched by CMake; nothing else is needed to build
 and run the hermetic suite. The fetched `ggml` is patched at configure time from `cmake/patches/` —
-nine diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
-declined to accept at all, a fused convolution that batched its work too coarsely to stay in cache, a
-direct 1-D convolution for long activations with small weights, the elementwise nodes a vocoder's
-resblock wraps around every convolution — its bias, its leaky ReLU and its residual — none of which now
-costs a pass over memory of its own, and `conv_transpose_1d`'s single-threaded prologue and
+eleven diffs at present, fixing GCC's code generation for ggml's ARM F32 GEMM (1.6x), the matmuls it
+declined to accept at all — by row count and by contraction length — a fused convolution that batched
+its work too coarsely to stay in cache, a direct 1-D convolution for long activations with small
+weights, the elementwise nodes a vocoder's resblock wraps around every convolution — its bias, its
+leaky ReLU and its residual — none of which now costs a pass over memory of its own, an exact-erf GELU
+that was a scalar libm call per element, and `conv_transpose_1d`'s single-threaded prologue and
 dot-product-at-a-time compute; see `cmake/GgmlPatches.cmake` for the rules such a patch has to meet.
+**`ggml-0011` is why `UPSTREAM.md` now requires a number from an x86 box AND one from the Pi before a
+patch here is called done** — it was measured on one ISA, shipped to both, and regressed the other by
+1.3-1.75x.
 
 Two of them are heuristics tuned on measured hardware, so they carry a run-time escape:
 `GGML_CPU_DISABLE_CONV_HEURISTICS=1` declines both, the way ggml's own `GGML_CPU_DISABLE_FUSION`
