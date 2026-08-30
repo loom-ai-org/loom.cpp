@@ -1,6 +1,7 @@
 #include "loom/core/symbol_table.h"
 #include "loom/loom_errors.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 
@@ -109,6 +110,21 @@ private:
                 double v = parse_expr();
                 expect(')');
                 return std::floor(v);
+            }
+            // Two-argument `Max(a, b)` / `Min(a, b)`, which is how sympy prints a clamp -- and a clamp
+            // is how a shape expression says "this axis is padded, but never by a negative amount".
+            // VITS's relative-position table is the case that needed it: its padded extent is
+            // `2*Max(n_tokens - 5, 0) + 9`, and without this the exporter had to bake a static 2048-wide
+            // pad into the weights instead (18.9 MB of zeros -- see Epic-05 §5). Both capitalisations
+            // are accepted because sympy writes `Max` and a hand-written attr would write `max`.
+            if (ident == "Max" || ident == "max" || ident == "Min" || ident == "min") {
+                const bool is_max = (ident == "Max" || ident == "max");
+                expect('(');
+                double a = parse_expr();
+                expect(',');
+                double b = parse_expr();
+                expect(')');
+                return is_max ? std::max(a, b) : std::min(a, b);
             }
             // Bare identifier with no '$' sigil: still treated as a symbol reference for convenience
             // (e.g. a lone "n_layer" attribute value with no arithmetic around it).

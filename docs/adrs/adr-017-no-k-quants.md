@@ -39,7 +39,9 @@ reason — so the CLI cannot offer something that will fail at write time.
 * **Positive:** the offered list is always true, and no effort goes into a format the writer cannot
   produce.
 * **Negative:** loom cannot match a llama.cpp size/quality point users may ask for by name. The honest
-  answer is Q4_0 or Q8_0.
+  answer is Q4_0 or Q8_0 — and, since P4.13 and P4.28, a competitive one: VITS ships at **11.7 MB at
+  Q4_0 against an 81.7 MB F32 export**, and every TTS family tested stays intelligible at Q8_0
+  (Epic-05 §5).
 * **Revisit when:** `gguf.quants` grows K-quant support upstream. The block-256 alignment finding would
   still need re-checking against the model in question.
 

@@ -3102,7 +3102,7 @@ actually moved, which a tensor count does not.
 VITS is the extreme case and the reason the item existed: it is the one model where *nothing* was
 quantizable before, because it has no MUL_MAT weight that is not a convolution.
 
-#### The 2.08x, decomposed — read this before turning it on
+#### The 2.08x, decomposed — read this before turning it on (and it is 2.13x on aarch64)
 
 Ryzen 3 3250U (2 cores / 4 threads), 4 threads, `scripts/bench_vits_loom.cpp` with the three scales
 pinned so both arms synthesise the same utterance, arms interleaved A-B-B-A over two rounds on an idle
@@ -3124,17 +3124,35 @@ convolution (4.7x on this machine's long-activation convs), ggml-0005's bias fus
 resblock LEAKY_RELU + residual-ADD fusion. Folding costs all three at once. The remaining **1.33x** on
 top is the quantized dot products themselves.
 
-**So the trade on a convolutional model is ~2.7x smaller for ~2x slower**, on this machine. That is a
-real choice and not a defect, but it is the opposite of what quantization bought the LMs — qwen3 at
-Q8_0 got 1.22x *faster*, because a transformer's weights were already in the operand ggml can read
-packed and there was no fused direct-convolution path to give up. **Do not carry "quantization makes it
-faster" across from the LM column.** Where it is worth it is a size-constrained edge target: VITS in
-30.6 MB at half the speed is a different product from VITS in 81.7 MB, and only the deployment knows
-which one it wants.
+**So the trade on a convolutional model is ~2x slower for a much smaller file**, and after P4.28 below
+that file is **11.7 MB against 81.7 MB, 7.0x**. That is a real choice and not a defect, but it is the
+opposite of what quantization bought the LMs — qwen3 at Q8_0 got 1.22x *faster*, because a
+transformer's weights were already in the operand ggml can read packed and there was no fused
+direct-convolution path to give up. **Do not carry "quantization makes it faster" across from the LM
+column.** Where it is worth it is a size-constrained edge target: VITS in 11.7 MB at half the speed is
+a different product from VITS in 81.7 MB, and only the deployment knows which one it wants.
 
-Not measured, and the obvious next question: **aarch64**, where the direct lowering is worth 1.18x
-rather than 4.7x, so the 1.55x arm should shrink and the trade should look better. And a **GPU**, where
-the whole comparison is different code.
+**And on aarch64 it is the same, which this entry predicted wrong (2026-08-31).** Raspberry Pi 4,
+Cortex-A72, 4 threads, same harness and same two files, arms interleaved A-B-B-A over two rounds with a
+20 s settle between them, best-of-5:
+
+| arm | time | normalised to 73216 samples | vs F32 |
+|---|---|---|---|
+| declared F32 | **1.096 s** (73216 samples) | 1.096 s | 1.00x |
+| folded Q4_0 | **2.166 s** (67840 samples) | **2.338 s** | **2.13x slower** |
+
+Against x86-64's 2.08x, i.e. no better. The prediction was that the Pi would lose less because
+`ggml_conv_2d_direct` is worth 1.18x there rather than 4.7x — true, and not the whole mechanism. A
+Cortex-A72 loses less on the kernel and **more on the memory traffic**, because materialising the
+im2col patch matrix (~550 MB written and read back per synthesis, §2) is precisely what that lowering
+was adopted on that machine to avoid. The two cancel. **A cross-ISA prediction derived from one of two
+opposing mechanisms is not a prediction.**
+
+The run is clean rather than assumed so: the box went 52.5 °C -> 70.1 °C across it and the four F32
+arms — one at each end and one in each round — agree within 2.5% (1.0957 / 1.1208 / 1.0976 / 1.1229 s
+minima), so no thermal drift is hiding in the ratio, and each arm's `fnv1a` digest is constant across
+all four repetitions.
+
 
 #### What is deliberately not folded
 
@@ -3152,48 +3170,44 @@ The export's declined-for-shape line now reports exactly this remainder, and its
 Keeping the two gates — eligible-by-op and declined-for-shape — reported separately is what made the
 original cause findable at all; do not let a future edit re-merge them.
 
-#### What P4.13 leaves open, and the biggest one is not a quantization question
+#### What P4.13 left open, and what each of the five turned out to be — ALL CLOSED 2026-08-31
 
-**1. 62% of the Q4_0 VITS file is zero padding, and no quantization gate can ever reach it.** Found by
-asking what the remaining 22.0 MB of F32 actually is. Twelve tensors named `text.padded*`, `ne=[96,
-4105, 1]`, **1.576 MB each and 99.78% zeros** — 864 nonzero values out of 394080, contiguous in one
-band. 18.9 MB of the 30.6 MB file. They are the relative-position tables of the text encoder's
-attention, and the node that reads one is
+Every one was measured the day after. One changed a number in this entry, one changed a *prediction* in
+it, and one became P4.28 below.
 
-```
-VIEW  text.padded_1 -> [96, 2*n_tokens - 1, 1]  at offset  788352 - 384*n_tokens
-```
+**1. The zero padding — FIXED, and it was not a quantization problem. → P4.28.** 62% of the Q4_0 file
+was a constant-folded pad. Removing it takes VITS to **11.7 MB at Q4_0 and 62.8 MB at F32**, and the
+coverage line from 73% to **95%**. Its own entry is below.
 
-i.e. `pad_crop_relative_embeddings` — which this engine already has as a primitive
-(`src/core/relative_position.cpp`) — **constant-folded by the MIL trace into a materialised weight
-sized for a maximum `n_tokens`**. The zeros are genuinely read (the crop slides into the zero band for
-a short sequence), so they cannot be dropped; they need not be STORED, because the pad is reproducible
-at graph-build time from a ~3.5 KB table. Estimated from the measured zero fraction: **VITS Q4_0
-30.6 -> ~11.8 MB, and F32 81.7 -> ~62.8 MB** — larger than everything the fold itself won, and it
-helps the unquantized file too.
+**2. Intelligibility on the other three families — ANSWERED, all three pass, and the correlations were
+worthless.** Matcha, Kokoro and StyleTTS2 at Q8_0 each transcribe **word-for-word identically to their
+own F32 arm** through whisper-small, on a real phonemized sentence rather than the gates' synthetic
+token ids. StyleTTS2 at **Q4_0** passes too. The measurement is in the resolved flag at the end of this
+section, and so is the thing it kills: **"deterministic ⇒ high correlation ⇒ fine" does not survive** —
+Matcha's CFM is deterministic and its correlation still fell to 0.58 once 90% of its bytes were
+quantized.
 
-It is an exporter constant-folding item, not a quantization one, and it is filed as such in the ledger.
-Quantization was never going to touch it: the tables are a VIEW's source, and only a mul_mat's first
-operand is eligible. Note the `4105` is also a fixed-maximum-length artifact, the same shape of problem
-as [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md).
+**3. The speed trade on aarch64 — MEASURED, AND THIS ENTRY PREDICTED IT WRONG.** See the table above,
+which now has both ISAs: **2.13x on a Cortex-A72 against x86-64's 2.08x**, i.e. the same, where this
+entry predicted the aarch64 arm would shrink.
 
-**2. Intelligibility is verified for VITS and for nothing else.** See the StyleTTS2 flag at the end of
-this section, which P4.13 made more urgent rather than settling.
+**4. A folded kernel on a device backend — RUNS, and not vacuously.** Vulkan (Radeon Vega 3, RADV
+RAVEN2), Q4_0 VITS: it synthesises, and whisper transcribes it identically to the CPU arm. The check
+that makes that mean anything is `LoomLuaBridge::device_report()`, because a scheduler that handed
+every quantized convolution back to the CPU would have produced exactly the same correct audio:
+**`flow_vocoder` 771 device nodes / 0 fallback, `text` 1577 / 0.** Nothing fell back — not the shape
+carriers, not the IM2COLs, not the kernel-first quantized MUL_MATs. (Those node counts are the 1.55x in
+another form: the same graphs at F32 are 651 and 1469, and the difference is the im2col path replacing
+one fused convolution node.)
 
-**3. The speed trade is measured on one x86-64 box only.** aarch64 should look better (the direct
-lowering is worth 1.18x there rather than 4.7x, so the 1.55x arm shrinks); a GPU is different code
-entirely.
+**5. The depthwise exclusion — confirmed not worth revisiting**, as recorded above: 0.028 MB.
 
-**4. A folded kernel has never run on a device backend.** The shape carrier is an ordinary allocated
-F32 leaf that nothing writes and nothing reads, and Vulkan/CUDA/Metal all implement `IM2COL`, so
-there is no reason to expect trouble — but "no reason to expect trouble" is not a measurement, and
-`ggml_vk_op_f32` binds `src0`'s buffer whether or not its shader reads it. Run a quantized conv model
-on the Vulkan build before claiming GPU support for one.
-
-**5. The depthwise exclusion costs nothing, and this is worth recording so nobody re-opens it.**
-Measured on the Q4_0 VITS: the twelve never-folded depthwise kernels hold **0.028 MB**, and the three
-dense kernels still unaligned after folding hold 0.002 MB. Together 0.1% of what stays F32. The
-correctness argument against folding them stands on its own, but even if it did not, there is no prize.
+One thing the device arm exposed, worth keeping. **The Q4_0 duration predictor is accumulation-order
+sensitive**: the same file synthesises 67840 samples on this CPU build, 67072 on the Vulkan build's CPU
+backend and 67328 on its GPU, while the F32 file gives exactly 73216 on all three. VITS durations are a
+`ceil()` of a float, so a 1-ULP difference flips one and changes the sample count. Harmless — every arm
+transcribes — but **a quantized VITS has no cross-device bit-identity to assert**, and a gate that
+assumed one would be wrong rather than strict.
 
 #### Testing
 
@@ -3246,24 +3260,164 @@ Q8_0, TQ1_0, TQ2_0. K-quants also use block **256**, where — re-measured on th
 that P4.13 exists — only **6 of VITS's 117** conv kernels align against block 32's 114, 17.9% of the
 convolution bytes against 100.0%. They lose twice over. **Q4_0 is the target.**
 
-### Unrelated flag found while benchmarking, worth its own look
+### The quantized-TTS intelligibility flag — RESOLVED 2026-08-31, and correlation was never the test
 
-StyleTTS2 at Q8_0 produces audio with correlation **0.015** against its F32 audio while transcribing
-correctly through whisper-small. The plausible reading is its stochastic style-diffusion sampler
-diverging onto a different-but-valid trajectory from small numerical differences (Matcha's
-deterministic CFM stayed at 0.985) — but that is a HYPOTHESIS, not a verified result, and P4.12 is the
-standing reminder that plausible-sounding TTS reasoning has been wrong before. Verify before shipping a
-quantized StyleTTS2.
+**What it was.** StyleTTS2 at Q8_0 produced audio at correlation **0.015** against its own F32 audio
+while transcribing correctly, and Matcha's deterministic CFM stayed at 0.985 — so the standing
+hypothesis was that a *stochastic* sampler diverges onto a different-but-valid trajectory and a
+deterministic one does not. P4.13 made the question urgent by taking Q8_0 coverage from 21% to 90% on
+Matcha, 29% to 74% on Kokoro and 43% to 79% on StyleTTS2, which is to say none of those numbers
+described a file the toolchain still produced.
 
-**P4.13 raised the stakes on this and did not settle it.** Those correlations were measured when Q8_0
-reached 43% of StyleTTS2 and 21% of Matcha; the fold takes them to 79% and 90%, so neither number
-describes the file the toolchain produces now. One new measurement, on Matcha: against the frozen
-PyTorch reference waveform its Q8_0 export moves from **max abs diff 0.0105 (F32) to 0.498**, on a
-reference whose own peak is 0.332 and rms 0.044 — i.e. the error is no longer small against the signal.
-The fold is not the cause (see the isolated-fold measurement above, correlation 1.00000000), and the
-`test_e2e_matcha_mil_lua_driver` gate that reports it is an exact-fp32 comparison a quantized file was
-never expected to pass. What is genuinely unknown is **intelligibility**, and the only oracle for that
-is ASR on real phonemes — which P4.13 ran for VITS and for no other family. Do it for Matcha, Kokoro
-and StyleTTS2 before shipping any of them quantized.
+**What the ASR oracle says, on a real sentence.** Each family phonemized with espeak-ng through its own
+`tokenizer.ggml.tokens` table (Kokoro with the real `loom.default_style.ref_s` out of its own file, not
+a synthetic style), F32 and Q8_0 arms of the same checkpoint, both transcribed by whisper-small:
+
+| model | quant | coverage | corr vs its own F32 | transcript |
+|---|---|---|---|---|
+| matcha | Q8_0 | 90% | **0.58** | *identical to F32* |
+| kokoro | Q8_0 | 74% | **0.22** | *identical to F32* |
+| styletts2 | Q8_0 | 79% | **0.025** | *identical to F32* |
+| styletts2 | Q4_0 | — | — | *identical to F32* |
+
+Every arm says "Hey, can you shut down the computer, my friend?" — the F32 arms included, word for
+word. **All three families are fine at Q8_0**, and StyleTTS2 is fine at Q4_0 too.
+
+**The hypothesis is dead, and that is the useful part.** "Deterministic ⇒ high correlation ⇒ safe" does
+not survive contact with high coverage: **Matcha's CFM is deterministic and its correlation fell from
+0.985 to 0.58** once 90% of its bytes were quantized rather than 21%. The correlation was never
+measuring intelligibility; it was measuring how much of the model had been touched. Three families now
+sit between 0.025 and 0.58 and all three are perfectly intelligible.
+
+**And the oracle can fail, which is the only reason to believe it passed.** Matcha exported at
+**TQ2_0** — ternary, the coarsest type this toolchain can write — synthesises audio whisper-small
+transcribes as **"(water splashing)"**. A test that cannot tell a working model from a broken one is
+not evidence; this one can, at the same sentence, through the same pipeline.
+
+The standing rule is unchanged and now has a second demonstration behind it: **transcribe, do not
+correlate.** [Retro-006](../retros/retro-006-kokoro-shipped-noise.md) is the case where correlation
+0.996 shipped noise; this is the case where correlation 0.025 shipped speech.
+
+### The Matcha gate's own number, kept because it is what looked alarming
+
+`test_e2e_matcha_mil_lua_driver` compares against a frozen PyTorch reference waveform at a 0.02 bound,
+and Matcha's Q8_0 export moves it from **max abs diff 0.0105 to 0.498**, on a reference whose own peak
+is 0.332 and rms 0.044 — an error no longer small against the signal, and 48x the F32 arm's. That is
+what raised the question above, and it is **not a failure**: the gate is an exact-fp32 comparison
+against a real-module reference, which a quantized file was never expected to pass, and its inputs are
+eight synthetic token ids rather than speech. The fold is not the cause either — see the isolated-fold
+measurement under P4.13, correlation 1.00000000.
+
+Kept because anyone pointing that gate at a quantized file will meet the number again, and because it
+is a clean instance of the rule above: **a large numerical divergence from an F32 reference is not
+evidence about intelligibility, in either direction.**
+
+### P4.28 — the relative-position pad: 18.9 MB of a VITS export was zeros — DONE 2026-08-31
+
+**Found while closing P4.13, by asking what the 22.0 MB of F32 left in the quantized file actually
+was.** Twelve tensors named `text.padded*`, `ne=[96, 4105, 1]`, **1.576 MB each and 99.78% zeros** —
+864 real values out of 394080, contiguous in one band. 18.9 MB of a 30.6 MB Q4_0 file, and the same
+18.9 MB of the 81.7 MB F32 one.
+
+| | before | after |
+|---|---|---|
+| vits F32 | 81.7 MB | **62.8 MB** |
+| vits Q4_0 | 30.6 MB | **11.7 MB** |
+| Q4_0 coverage | 73% | **95%** |
+| maximum utterance | ~2053 tokens | **no limit** |
+
+**7.0x smaller than the F32 file this thread started with**, and the coverage line moves because the
+*denominator* shrank: the tables were unquantizable F32 counted against every export's percentage.
+
+**Why quantization could never have reached them, which is why this hid.** They are a VIEW's source,
+and only a mul_mat's FIRST operand is eligible to be packed. The export's own coverage line counted
+18.9 MB of zeros in its denominator and reported a healthy "73%, no warning" while 62% of what it wrote
+was zeros. **A coverage percentage says what fraction of the bytes moved, not whether the bytes should
+have been there at all.**
+
+#### What they were
+
+`_get_relative_embeddings` in piper's `MultiHeadAttention`: pad-and-crop of a learned Shaw-style table.
+The engine has had a host-side port of it since the bespoke driver
+(`src/core/relative_position.cpp::pad_crop_relative_embeddings`); the MIL trace does not use it, and
+could not trace the real thing either, because **coremltools' torch frontend refuses a dynamic pad
+amount on a rank>2 tensor** — a documented runtime limitation of that converter, not a gap in this
+exporter. `vits_export.py` had routed around it the obvious way: pad by a *static* `_REL_EMB_MAX_PAD =
+2048` on each side and slice dynamically, which is exact for any length up to the bound. The pad then
+constant-folded into the weight.
+
+#### The fix, and the three small pieces it needed
+
+The pad is now a **CONCAT of dynamically-sized zero blocks** — the same trick `_dynamic_zero_pad_last`
+already used in that file for a sibling problem, legal for the same reason: the frontend's restriction
+is on `pad`, not on `cat` or on slicing.
+
+The awkward part is worth keeping, because it is why those sibling helpers could not simply be called.
+They build their zero block from a slice of `x` itself, which needs `x` to be at least as wide as the
+block — and here `x` is the learned table, **9 columns**, while the block needed is `length - 5`. So
+the zeros have to come from something whose extent already scales with the sequence, and
+`_get_relative_embeddings` is handed `length` as a scalar and no tensor at all.
+`_install_length_carrier` wraps `MultiHeadAttention.attention` — a **wrapper, not a transcription**, so
+the rest of that method stays upstream's — to put `key` (shaped `[b, d, t_s]`) within reach.
+
+Three pieces, each independently useful:
+
+1. **`ValueFacts._scalar_entry` learned `clip`** (`value_facts.py`), resolving it to `sympy.Max`/`Min`
+   so the clamp survives into the emitted shape expression instead of defeating the walk. A
+   *derivation*, not a guess — unlike the `select` case beside it, which picks a branch on an
+   invariant. It also has to ignore a `beta` of the float32 maximum, which is how `torch.clamp(x,
+   min=0)` reaches MIL: a bound at the representable limit is not a bound.
+2. **`shape_expr.render`/`parse` learned `Max`/`Min`** — two-argument only, because sympy's are n-ary
+   and the engine's grammar is not.
+3. **`symbol_env.cpp` learned `Max(a, b)` / `Min(a, b)`.** Both capitalisations, since sympy writes
+   `Max` and a hand-written attribute would write `max`.
+
+The exported shape is `2*Max(n_tokens - 5, 0) + 9` — literally "padded, but never by a negative
+amount", where 5 is `window_size + 1`.
+
+**One `+ 1`, which is not cosmetic.** `Max(length - 5, 0)` is 0 at `length <= window_size`, and a
+zero-width block makes a zero-width VIEW, which the engine rejects outright. A single-phoneme utterance
+(`[BOS, p, blank, EOS]`, four tokens) had worked and stopped. Padding by one extra row on each side and
+letting `start` move with it keeps both of the real code's branches exact — checked against the
+original export at lengths 2, 4, 6 and 62 — and costs 96 floats.
+
+#### Verification, and it is exact
+
+* **The audio is bit-identical.** The rewritten export and the original produce byte-for-byte the same
+  waveform at T=62 — same 73216 samples, `np.array_equal` true. Not "close": identical.
+* **Both branches, against the original file.** `n_tokens` = 2 and 4 (the crop branch, below the
+  window) give the same sample counts and peaks as the pre-change export; 6, 22 and 62 likewise.
+* **The bound is gone, not moved.** `n_tokens` = 2202 and 5002 now synthesise. On the old file both
+  threw — loudly, which was the redeeming feature of the static pad: the engine's own VIEW bounds check
+  caught the overrun and named the tensor, the resolved shape, the offset and the parent extent.
+* **The exporter refused the intermediate wrong version by itself.** Before `shape_expr` learned `Min`,
+  `render` raised `UnsupportedShapeExpression: Min has no equivalent in symbol_env.cpp's grammar`
+  rather than emitting an attribute the engine could not read. That guard is why this change could be
+  made at all without risking a silent wrong slice — the exact failure `value_facts.py`'s own docstring
+  records from the last time this table's slice went wrong (silently ~34x too long at a real T=62).
+* **No other model moved.** `clip`, `Max` and `Min` are general additions, so conformer-ctc and matcha
+  were re-exported and diffed against the shipped artifacts: topology JSON and every tensor shape
+  identical. The additions are inert for a model that does not need them.
+
+#### The same question asked of every other model
+
+Every export in `hf-models/` was swept for F32 tensors above 200 KB that are more than half zeros:
+
+| model | F32 | zero-heavy | share |
+|---|---|---|---|
+| vits-piper-en-gb-miro | 81.5 MB | **18.92 MB** | **23.2%** |
+| supertonic-2 | 266.5 MB | 2.30 MB | 0.9% |
+| everything else (15 models) | — | ≤ 1.05 MB each | ≤ 0.1% |
+
+VITS was the only real case. Supertonic's 2.3 MB (`ttl_text_512.emb_*`, 99.1% zeros) is the same
+mechanism at a much smaller scale and **is not the same fix**: its text axis is statically sized on
+purpose, for two independent reasons documented in `supertonic_export.py` — one of which is that
+`GraphBuilder` resolves only one dynamic-length symbol per topology. That belongs with
+[Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), not here. Everything else the sweep
+found is genuine all-zero bias vectors, which are real weights.
+
+**The transferable part is how it was found**: bucket the tensors a quantized file left as F32 by *what
+reads them and in which operand position*, not by name. The buckets came out 86.8% "second operand /
+GET_ROWS / other" — and a bucket named for what it is *not* is where a thing nobody is looking at hides.
 
 ---
