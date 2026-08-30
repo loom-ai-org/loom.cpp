@@ -40,6 +40,7 @@ on the other side that cancels it.
 | specialising `ggml_v_expf` to `SOFT_MAX`'s domain (no overflow/subnormal path) | **1.00x** on the dev box, **1.13-1.16x** on the 285K, at identical accuracy — and the exp is 7-26% of the op. See below |
 | an outer-product `QK^T` tile, lanes on `m` instead of on the contraction | **1.38x** on the 285K against a 1.5x gate, and its ceiling there was 1.52x before a line was written; 1.85x on a 2019 Zen+, 1.23x on NEON. See below |
 | a cheaper `hsum` epilogue for tinyBLAS at `k = 64` | 1.06x, under the dev box's noise floor (P4.18) |
+| a per-shape ranking of the convolution gap (P4.16's whole premise) | **the gap is not in the convolution** — every row at the box's GEMM or memory roofline; see below |
 | rows-inner loop order, so a store finishes a cache line of C | **mechanism falsified**: no dependence on the size of C — see below |
 | `ggml-0002`'s aarch64 address hoist applied to x86 | neutral at every k tested, small and large |
 | *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired at ONE thread, and 1.02x at k=768. **The "m=1500 cannot reach `BM = 4`" half was the bug, not a constraint** — at four threads that is 2.75x of false sharing, fixed in P4.22; see [Retro-020](retro-020-a-knob-measured-at-one-thread.md) |
@@ -263,6 +264,56 @@ k = 64, 12 heads`, transpose counted, or stop. `scripts/bench16.cpp` is that gat
   leaves each job writing 16 bytes of a 64-byte line of `C`. Four rows of padding on `m` are worth
   **2.75x**. That is P4.22 in [Epic-05](../epics/epic-05-edge-performance.md), and it is a bigger
   number than the item that found it.
+
+### The convolution table, and a profiler that could not attribute the gap it was pointed at (2026-08-30, P4.16)
+
+P4.16 asked for one thing: re-run the per-shape convolution table against the post-P4.15f export and
+decide whether anything was left. It was re-run, on a Pi 4B cooled to a fixed 60 C before every run
+with the two arms interleaved, against a fresh build of `45d5db9` and an export byte-identical to the v5
+fixture. **Nothing is left in the convolution, and the table itself turned out not to be buildable at
+the thread count the engine ships at.** The full numbers are in
+[Epic-05 §5](../epics/epic-05-edge-performance.md); this is the register entry.
+
+| idea | verdict |
+|---|---|
+| a per-shape ranking of the convolution gap, at four threads | **not measurable** — `$LOOM_PROFILE` costs 291 ms there against a 78 ms gap, and how that is charged swings the answer by 230 ms |
+| the three vocoder resblock rows (P4.15/P4.15b's +161 ms) | **closed** — ~22 of the box's ~25 GFLOP/s at four threads; 1.28-1.44x at one, over a floor both engines share |
+| the flow/encoder rows the old table said had "never been touched" | **closed** — 1.16x and 1.29x at one thread, at a single core's GEMM rate |
+| threading loom's big elementwise ops | **closed by the machine** — they run at 98-99% of a *measured* 3.64 GB/s bus, and the same bus does 4.56 GB/s on ONE core |
+| *(NOT measured out)* the `TANH`/`SIGMOID` gate | 30.4 ms, identical at one thread and four, 0.46 GB/s — the only thing in the model not against a roofline. **P4.25** |
+
+**Three things this cost, and each is reusable.**
+
+**1. A node-by-node profiler cannot attribute a gap smaller than its own overhead — and its overhead
+is per NODE, not per millisecond.** `$LOOM_PROFILE` computes every node alone. At one thread that is
+51 us per node, 3.6% of the wall, ignorable. At four it is **137 us per node, 291 ms on a 1137 ms
+wall**, because each node now pays a thread-pool barrier. Apportioning that by share (what the
+onnxruntime side does, correctly, for a profiler whose overhead *is* proportional) said convolution
+was **0.98x** and the gap was elsewhere; charging it per node executed said **1.20x** and the gap was
+all of it. Same profile, same run, opposite conclusions. **Before apportioning a profiler's overhead,
+ask what unit it is charged in** — and if the answer is "per node" while the buckets are "per
+millisecond", the profile cannot answer a question this small.
+
+**2. 135 ms of that overhead was fusion, which no node-by-node profile can ever see.**
+`GGML_CPU_DISABLE_FUSION=1` costs 1.136 -> 1.265 s. With `ggml-0005`/`ggml-0007` a fused convolution
+absorbs its own bias and activation, so in the shipped configuration **"the convolution" is not a
+separable term at all** — the old table's aside that "fusion changes a convolution's NEIGHBOURS, not
+the convolution" was true for the ggml of the day and is not true now. A profiler that has to turn a
+feature off to measure is measuring a different engine.
+
+**3. Rank against the machine, not only against the competitor — and the machine's number has to be
+measured too.** Every row of the one-thread table is 6.3-7.7 GFLOP/s for loom against 8.1-9.7 for
+onnxruntime: a real 1.2-1.4x, and entirely over a floor at a single core's GEMM rate. The elementwise
+half looked worse still — loom's largest `ADD` does not speed up at all over four cores — until
+`scripts/membw.c` measured the bus: **4.56 GB/s at one thread, 3.64 at four.** The op is at 98% of the
+four-thread figure, and threading a streaming kernel on this board makes it *slower*. Without that
+20-line measurement, "an elementwise op that ignores three cores" reads like a defect. It is the bus.
+
+**And the shape of the answer moved with the thread count, which nothing in the item anticipated.**
+loom is **1.209x** onnxruntime at one thread and **1.074x** at four; loom scales 2.64x over the four
+cores and onnxruntime 2.34x. P4.16 was scoped from a picture that is only true at one thread, and more
+than half of it closes on its own at the thread count that ships. **State the thread count in the
+verdict, not just in the method** — the same two engines have two different ratios.
 
 ### A dev-box noise floor that ate two verdicts (2026-08-24, P4.18)
 

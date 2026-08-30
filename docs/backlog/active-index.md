@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-08-29
+last_updated: 2026-08-30
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -149,17 +149,15 @@ are not renumbered. New items continue the scheme.
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **P4.16 — re-measure the convolution table, then decide if anything is left.** **The premise is
-  superseded, so do not read the old table as a ranking.** It was scoped at **1.24x** of onnxruntime on
-  VITS with the whole gap in convolution; since then P4.15c measured one named mechanism out, P4.15d/f
-  fixed the other (a text encoder in the graph twice), P4.15e turned the lowest-ranked row into the
-  thread's biggest win, and the model ended at **1.033x** end to end. **Nothing has been re-measured
-  against the post-P4.15f export**, and the remaining rows have no mechanism attached to any of them.
-  **Step 1 is the table, and it has a close condition:** re-run it (recipe in the epic) and if nothing
-  clears the box's noise floor, **close the item and record the table in Retro-012** — a 1.033x model
-  has ~30 ms of headroom spread over six groups, so that is a likely outcome. *Do not start on the
-  resblock kernel* (83% of the machine's peak in cache, both graph-level ideas measured out) and *rank
-  by the machine's peak as well as by the competitor* — that mistake is why P4.15e was ranked last.
+* [ ] **P4.25 — ggml runs `TANH`/`SIGMOID` on one core, with a scalar `tanhf`.** The only thing in the
+  VITS profile that is **not** against a roofline, and P4.16's re-measurement is what found it.
+  `ggml_get_n_tasks` gives the cheap-unary list `n_tasks = 1` while `GELU`/`SILU` get `n_threads`, and
+  `ggml_vec_tanh_f32`/`ggml_vec_sigmoid_f32` have no SIMD path. VITS's WN gate: **30.4 ms per
+  synthesis at one thread and 30.4 ms at four**, on 220 KB tensors at 0.46 GB/s — 39% of the whole
+  78 ms gap to onnxruntime. **Do the thread count first**: one line, no accuracy question, and it
+  bounds the SIMD half. Measure it on more than one thread ([Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md)),
+  and read Retro-012's `ggml_v_expf` entry before opening the SIMD half — that is the case where a real
+  speed-up on the transcendental had no accessible headroom in the op around it.
   → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0.** Op eligibility is fixed;
   layout alignment is not (0 of 132 VITS kernels align for block 32 as stored). Acceptance: VITS exports

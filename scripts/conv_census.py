@@ -16,9 +16,12 @@ the arithmetic. It knows the ops the exported models actually use and RAISES on 
 than guessing a shape -- a census that silently invented a length would be worse than no census.
 
 WHAT VALIDATES IT. Every count and length it produces for VITS matches a number that was measured
-independently: 153 CONV_1D + 12 CONV_1D_DW + 3 CONV_TRANSPOSE_1D (`$LOOM_PROFILE`'s own totals), the
-93/41/6/6/7/3 per-scale split of P4.16's table, and the 73472-sample output the driver synthesises for
-the reference utterance. If a change here breaks one of those, the propagator is wrong, not the table.
+independently. Re-checked against the post-P4.15f export on 2026-08-30 (P4.16): 117 CONV_1D + 12
+CONV_1D_DW + 3 CONV_TRANSPOSE_1D, the 57/41/6/6/7 per-scale split, and the 73216-sample output the
+driver synthesises for the reference utterance -- all three confirmed by `$LOOM_PROFILE`'s own bucket
+counts, and the same 117/12/3 confirmed node for node by onnxruntime's profile of the same graph. (The
+pre-P4.15f numbers were 153 CONV_1D and a 93-call first group; the 36-node difference was one text
+encoder run twice.) If a change here breaks one of those, the propagator is wrong, not the table.
 
 AND `--shared-prefix`, WHICH IS WHAT ACTUALLY FOUND THE BUG. It reports every pair of topologies in a
 file that begins with the same computation -- structural isomorphism with weights compared by identity,
@@ -233,9 +236,18 @@ def propagate(topology, tensors, syms, on_conv):
 
 
 def macs(row):
-    """Multiply-accumulates, x2 for FLOPs. Depthwise contracts over K alone, not over IC."""
+    """Multiply-accumulates, x2 for FLOPs. Depthwise contracts over K alone, not over IC.
+
+    A TRANSPOSED convolution is counted over its INPUT length, not its output: it scatters each of the
+    `il` input positions across `k` taps, where a forward convolution gathers `k` taps into each of the
+    `ol` output positions. Counting it over `ol` -- which this did until P4.16 -- overstates it by
+    exactly the stride, which for VITS's three transposes is 8x, 8x and 4x, and puts both engines above
+    the machine's roofline on that row.
+    """
     if row["op"] == "CONV_1D_DW":
         return row["ol"] * row["oc"] * row["k"]
+    if row["op"] == "CONV_TRANSPOSE_1D":
+        return row["il"] * row["oc"] * row["ic"] * row["k"]
     return row["ol"] * row["oc"] * row["ic"] * row["k"]
 
 

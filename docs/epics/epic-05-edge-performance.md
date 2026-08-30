@@ -2106,8 +2106,15 @@ before comparing. x86, two threads pinned: **~1.17 s**. If your first number is 
 not the code.
 
 **Scratch trees on the Pi** (all disposable, none of them a git repo):
-* `~/loom-p415/loom.cpp` — a full checkout with `prof_main` appended to its CMakeLists; this is what
-  produces the end-to-end numbers. Rebuild with `cmake -B build -DCMAKE_BUILD_TYPE=Release` (**Release
+* `~/loom-p416/loom.cpp` — **the current one (P4.16, 2026-08-30)**: a plain rsync of `45d5db9` with
+  `bench_vits_loom` built beside it, `-DCMAKE_BUILD_TYPE=Release`, targets `loom_engine loom_cli` only
+  (the test targets are the long tail of that build and nothing here needs them).
+  (`~/prof_onnx_shapes.py`, the Pi-only original, reads its phoneme ids from `/tmp/ids.json`;
+  `scripts/prof_onnx_conv_shapes.py` carries them inline and needs no such file.)
+  **rsync to this board leaves FUTURE mtimes** — its clock runs ~240 s behind
+  the dev box — so `find <tree> -type f -exec touch {} +` afterwards, or ninja rebuilds in a loop.
+* `~/loom-p415/loom.cpp` — the older one, pre-`ggml-0010`; a full checkout with `prof_main` appended to
+  its CMakeLists. Rebuild with `cmake -B build -DCMAKE_BUILD_TYPE=Release` (**Release
   matters: the repo default is RelWithDebInfo and that is 1.39x slower**).
 * `~/ggml-bench` — standalone benches with a stale ggml checkout of its own; `bench10` links against
   `~/loom-p415/loom.cpp/build/_deps/ggml-build/src`, so `LD_LIBRARY_PATH` must point there.
@@ -2146,10 +2153,11 @@ Then normalise by sample count before quoting a ratio: onnxruntime is 1.044 s at
 **1.063 s at loom's 73472**. Drive the session directly for an engine-to-engine number (phoonnx adds
 ~14 ms of Python); its per-op profile needs `so.enable_profiling = True` and `so.intra_op_num_threads
 = 4`, and **shares only** — profiling costs onnxruntime 1.18x, and this build's events carry no
-`run_index`, so runs split by ORDER. `scripts/` has no onnx bench; the two used here are
-`~/bench_onnx2.py` (wall) and `~/prof_onnx_shapes.py` (per-shape) on the Pi.
+`run_index`, so runs split by ORDER. **Both halves are in `scripts/` as of 2026-08-30** —
+`bench_onnx_tasks.py vits` (wall) and `prof_onnx_conv_shapes.py` (per-shape); the Pi's
+`~/bench_onnx2.py` and `~/prof_onnx_shapes.py` are the originals they were lifted from.
 
-**The seven ggml patches** live in `cmake/patches/` and are applied at configure time by
+**The twelve ggml patches** live in `cmake/patches/` and are applied at configure time by
 `cmake/GgmlPatches.cmake`, which resets and retries if one no longer applies — so **editing a patch and
 re-running cmake just works**, and `git -C build/_deps/ggml-src checkout -- .` is the manual reset.
 `cmake/patches/UPSTREAM.md` is the PR write-up for all seven. The benches are in `scripts/`:
@@ -2179,9 +2187,10 @@ above, which are new):
    the synthesis *slower* until it was checked against all 153 convolutions the model actually issues;
    and a bench without the model's dilations measures a convolution the model does not have.
 6. **A ratio against another engine silently assumes both engines are doing the same work.** They were
-   not: loom ran the text encoder twice, and P4.16's table was written, ranked and reasoned from
+   not: loom ran the text encoder twice, and P4.16's ORIGINAL table (since re-measured and replaced,
+   see P4.16 below) was written, ranked and reasoned from
    before anyone counted the nodes (P4.15d). Counting them cost an afternoon and no measurement rig, and it moved the worst
-   row in P4.16's table from 2.59x to 1.38x. `scripts/conv_census.py` is that count, for any GGUF.
+   row in that table from 2.59x to 1.38x. `scripts/conv_census.py` is that count, for any GGUF.
 
 **And the check that made this item honest: prove the gate can fail before believing it passed.**
 Perturbing the fused slope by 5%, and separately the fused residual by 5%, both make
@@ -2195,7 +2204,7 @@ would not do.
 **What it was worth.** Two patches, `ggml-0008` (the prologue) and `ggml-0009` (the compute), on a Pi 4
 at 4 threads: **1.314 -> 1.202 s, about 115 ms and 8.5%.** The op itself goes **195.8 -> 79.1 ms,
 2.5x**, and against onnxruntime's 166.4 ms for the same three convolutions it ends up **2.1x faster**
-where P4.16 had it 1.18x slower. Each half was measured on its own with the old path switchable at
+where P4.16's original table had it 1.18x slower. Each half was measured on its own with the old path switchable at
 runtime inside one binary, ABBA in both orders over two rounds: the prologue 1.314 -> 1.247 by mean
 (~70 ms), the GEMM 1.252 -> 1.202 by mean and 1.239 -> 1.186 by min (~50 ms).
 
@@ -2203,11 +2212,11 @@ runtime inside one binary, ABBA in both orders over two rounds: the prologue 1.3
 
  The op goes from 196 ms to
 **126.3 ms** re-profiled, which puts it **below** onnxruntime's 166.4 ms for the same three
-convolutions — 1.32x FASTER, where P4.16 had it 1.18x slower. Per shape, before -> after:
+convolutions — 1.32x FASTER, where P4.16's original table had it 1.18x slower. Per shape, before -> after:
 73476x32 105.7 -> 63.3, 18376x64 53.1 -> 43.0, 2304x128 37.0 -> 19.9 ms. Measured by switching the old prologue back on at runtime inside one binary, ABBA
 in both orders over two rounds.
 
-**How it was found, which is the reusable part.** P4.16 put `CONV_TRANSPOSE_1D` at 1.18x and +29 ms —
+**How it was found, which is the reusable part.** P4.16's original table put `CONV_TRANSPOSE_1D` at 1.18x and +29 ms —
 the smallest row in the table, and by that ranking not worth doing. The ranking was wrong because it
 compared loom against onnxruntime, and **both engines were slow at it**: 1.43 GFLOP in 196 ms is
 **7.3 GFLOP/s**, against 25 GFLOP/s for a GEMM on this machine, and onnxruntime's 166 ms is only
@@ -2456,138 +2465,216 @@ lines on odd columns. Closing it means padding `C`, which is an allocator change
 proposition than this. Worth ~4 ms of a 3.9 s transcription; **do not open it without re-measuring
 first.**
 
-### P4.16 — re-measure the convolution table, then decide if anything is left — PREMISE SUPERSEDED, RE-MEASURE FIRST
+### P4.16 — the convolution table, re-measured — DONE, AND CLOSED: the gap is not in the convolution
 
-> **READ THIS BEFORE THE TABLE BELOW.** This item was scoped when loom was **1.24x** onnxruntime on
-> VITS and the whole remaining gap was convolution. **It is not that any more.** P4.15c measured one of
-> its two named mechanisms out, P4.15d/f fixed the other (a text encoder in the graph twice, which was
-> most of the largest row), P4.15e took `CONV_TRANSPOSE_1D` from the bottom of the ranking to the
-> biggest single win in the thread, and the model ended at **1.033x** of onnxruntime end to end.
->
-> **So this is no longer an optimisation item; it is a measurement with a close condition.** Nothing
-> below has been re-measured against the post-P4.15f export, and the rows that remain have **no
-> mechanism attached to any of them** — which is the state P4.15's own warning says not to start
-> optimising from.
->
-> **Step 1, and it decides whether there is an item at all:** re-run the table (recipe at the end of
-> this section) on the current export. If nothing clears the box's noise floor — the dev box does not
-> resolve below ~1.2x, [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) — then
-> **close this item and record the table in Retro-012**. It is entirely possible that is the outcome:
-> a 1.033x model has ~30 ms of total headroom against a competitor, spread over six groups.
->
-> Everything from here to the reproduction recipe is the ORIGINAL scoping, kept for its reasoning and
-> its warnings, **not for its ranking or its numbers**.
+**Executed 2026-08-30 on the Pi 4B, against the post-P4.15f export** (`vits_mil.gguf`, md5
+`28f0cd01…`, byte-identical to the v5 fixture) **and a fresh build of `45d5db9`** — the tree the old
+numbers came from predates `ggml-0010/0011/0012`, which includes P4.20's aarch64 regression fix, so
+nothing measured before this is comparable on this machine.
 
-**Why this existed.** After P4.15b, loom was **1.24x** onnxruntime on the reference utterance (1.313 s
-against 1.063 s, same boot, predictor pinned) and **everything outside the convolution was at parity or
-better**: ~240 ms against onnxruntime's 282 ms. The whole remaining gap was convolution — 1103 ms
-against 767 ms, **1.43x, +336 ms** — which is what made this the only place left with anything in it.
+**The verdict, in one paragraph.** Convolution is no longer where the gap is, and there is no longer a
+per-shape ranking to attack. At four threads loom is **1.074x** onnxruntime (**+78 ms** of 1137), its
+convolution runs at **~22 GFLOP/s against the box's ~25 GFLOP/s GEMM peak** and onnxruntime's at 23.7,
+and its largest elementwise ops sit at **98-99% of the machine's measured streaming roofline**. Both
+engines are against a roofline in both halves of the model. What the re-measurement *did* find is a
+mechanism, and it is not a convolution: **ggml runs `TANH`, `SIGMOID`, `EXP` and `LEAKY_RELU`
+single-threaded by construction** (`ggml_get_n_tasks`, `n_tasks = 1`) with scalar `tanhf`/`expf` loops
+in `ggml_vec_*`, and VITS's WN gate spends **30.4 ms per synthesis** there — identical at one thread
+and at four, and nowhere near any roofline. That is P4.25; this item is closed.
 
-Both engines profiled per-op on the same box and boot; onnxruntime's shares apportioned over its
-un-profiled 1.044 s, loom's from `$LOOM_PROFILE` (which cannot see fusion, but fusion changes a
-convolution's NEIGHBOURS, not the convolution, so the conv rows are valid). onnxruntime's activations
-are 1.8% shorter because its pinned `y_length` is 282 against loom's 287 — scale its vocoder rows up
-by that before splitting hairs; it moves each ratio by ~2%.
+#### The invariant, checked before any ratio was believed
 
-| group | loom calls | loom | onnx calls | onnx | ratio | excess |
-|---|---:|---:|---:|---:|---:|---:|
-| flow/encoder @ L~100 | 93 | 151.1 ms | 69 | 58.3 ms | **2.59x** ¹ | **+92.8** ¹ |
-| resblocks 64ch @ L18368 | 6 | 216.8 ms | 6 | 144.9 ms | 1.50x | +71.9 |
-| resblocks 32ch @ L73472 | 7 | 226.9 ms | 7 | 166.5 ms | 1.36x | +60.4 |
-| flow/encoder @ L~287 | 41 | 203.4 ms | 41 | 155.6 ms | 1.31x | +47.8 |
-| ~~`CONV_TRANSPOSE_1D`~~ | 3 | ~~195.8~~ **79.1 ms** | 3 | 166.4 ms | **0.48x** | **-87.3** |
-| resblocks 128ch @ L2296 | 6 | 104.4 ms | 6 | 75.7 ms | 1.38x | +28.7 |
-| **total** (after P4.15e) | **156** | **981 ms** | **132** | **767 ms** | **1.28x** | **+214** |
+Both engines synthesised **73216 samples** on every run (the duration predictor pinned to
+`noise_scale = noise_scale_w = 0`, `length_scale = 1` on both sides), and `scripts/conv_census.py`
+and both profiles agree on the graph **one node for one node**:
 
-¹ **P4.15d took this row apart afterwards and P4.15f removed it: most of the +92.8 ms was one text
-encoder run twice, not a kernel.** The group is now 57 calls, not 93 — at one thread it fell
-376.7 -> 199.1 ms, **1.89x**, against the 1.91x arithmetic the census predicted, and end to end the
-model went 1.196 -> 1.099 s (1.126x -> **1.033x** of onnxruntime). What is left in this row is the
-~1.38x throughput gap, in line with every other row. **The whole table needs re-measuring against the
-new export**; this is the only row that moves, but it moves from first to last. The discussion below
-predates all of that and is kept for the reasoning, not the ranking.
+| | loom | onnxruntime |
+|---|---:|---:|
+| dense convolutions | 117 | 117 (109 `Conv` + 8 `FusedConv`) |
+| depthwise | 12 | 12, weights `[192, 1, 3]` |
+| transposed | 3 | 3 |
+| per group (L = 100 / 286 / 2288 / 18304 / 73216) | 57 / 41 / 6 / 6 / 7 | 57 / 41 / 6 / 6 / 7 |
 
-`CONV_TRANSPOSE_1D` is struck through because **P4.15e did it**, and the way it fell is the warning
-this table needs. It was ranked LAST here — 1.18x, +29 ms, the smallest row — and it turned out to hold
-115 ms, more than any other row has yet given up. The ranking was wrong because it is a ratio against
-onnxruntime, and both engines were sitting on the same floor: 7.3 and 8.6 GFLOP/s where the machine
-does 25. **Rank by the machine's peak as well as by the competitor**, or a row where both
-implementations are equally bad will sort to the bottom.
+#### Wall time, cooled to 60 C before every run and the two arms interleaved
 
-**The order this says to work in is NOT the order P4.15 worked in.** The vocoder resblocks — three
-rows, +161 ms — are the ones P4.15 and P4.15b spent themselves on and measured out at 83% of the
-machine's peak in cache. The **short, weight-heavy convolutions of the flow and encoder are +141 ms and
-have never been touched**.
+| threads | loom | onnxruntime | ratio |
+|---|---:|---:|---:|
+| 4 | 1.1384 / 1.1371 / 1.1235 s | 1.0501 / 1.0741 / 1.0588 s | **1.074x**, +78 ms |
+| 1 | 2.9903 / 3.0057 s | 2.4545 / 2.5047 s | **1.209x**, +518 ms |
 
-**The top row's 2.59x has since been taken apart, and it was not a kernel at all.** P4.15d's census
-shows loom running **1.91x the arithmetic** there — the text encoder is in the graph twice — at 1.38x
-lower throughput, and 1.91 x 1.38 = 2.64 against the 2.59 this table measured. So ~72 of the +92.8 ms
-is duplicated work (**P4.15f** removed it) and ~21 ms is throughput, which puts this row in line with
-every other row rather than at the top of the table. **The whole table still needs re-measuring against
-the post-P4.15f export**: it is the only row that moves, but it moves from first to last.
+**The gap is thread-count dependent, which is new and is why the old reasoning no longer describes the
+shipped configuration**: loom scales 2.64x over four cores, onnxruntime 2.34x, so more than half of
+the single-thread gap closes on its own. P4.16 was scoped from a picture that is only true at one
+thread.
 
-The paragraph this replaces argued that 2.59x "cannot be a GEMM-throughput story" from the arithmetic —
-onnxruntime runs `[1,768,103] x [192,768,3]` six times in 22.8 ms (546 MFLOP, **24 GFLOP/s**) and
-`[1,192,103] x [768,192,3]` six times in 19.6 ms (28 GFLOP/s), against loom's in-model GEMM at **23.5
-GFLOP/s** (P4.15), and a 1.1x arithmetic difference cannot produce 2.59x. That reasoning was right and
-its conclusion — "the excess is around the GEMM, not in it" — was righter than intended: the excess was
-not in this group's convolutions at all. **When a ratio is inexplicable by the kernel, count the nodes
-before profiling them.**
+#### The table, at ONE thread — because at four it cannot be built
 
-**Both leads are now closed**, and with them everything this entry had a mechanism for:
+| group | n | loom | GF/s | onnx | GF/s | ratio | excess |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| resblocks 32ch @ L73216 | 7 | 718.4 ms | 6.3 | 560.5 ms | 8.1 | 1.28 | +157.9 |
+| resblocks 64ch @ L18304 | 6 | 613.8 ms | 7.3 | 473.8 ms | 9.5 | 1.30 | +140.0 |
+| resblocks 128ch @ L2288 | 6 | 332.0 ms | 6.8 | 231.2 ms | 9.7 | 1.44 | +100.9 |
+| flow/encoder @ L286 | 41 | 567.5 ms | 7.5 | 487.4 ms | 8.7 | 1.16 | +80.0 |
+| text encoder @ L100 | 57 | 214.7 ms | 6.3 | 166.1 ms | 8.2 | 1.29 | +48.6 |
+| `CONV_TRANSPOSE_1D` | 3 | 223.1 ms | 6.7 | 269.8 ms | 5.6 | **0.83** | -46.8 |
+| depthwise @ L100 | 12 | 7.2 ms | 0.2 | 1.5 ms | 0.9 | 4.72 | +5.7 |
+| **convolution** | **132** | **2677 ms** | 6.9 | **2190 ms** | 8.4 | **1.22** | **+486** |
+| everything else | | 321 ms | | 289 ms | | 1.11 | +32 |
+| **wall** | | **2998 ms** | | **2480 ms** | | **1.209** | **+518** |
 
-1. ~~**`kw = 1` convolutions**~~ — **CLOSED by P4.15c, which measured it out.** The obvious fix was
-   worth nothing, for exactly the reason that entry suspected: for `kw = 1` the im2col is a transpose
-   and not a redundant copy, so a hand-written `mul_mat` lowering pays it too — 1.04-1.05x on the Pi,
-   2.2 ms per synthesis. What is left is a layout question for the exporter worth at most 7.3 ms, and
-   that bound ignores the transposes it would move onto the `kw = 3` convolutions beside them.
-2. ~~**loom issues 153 `CONV_1D` where onnxruntime has 129 dense convolution nodes**~~ — **ANSWERED by
-   P4.15d and FIXED by P4.15f.** onnxruntime has 117 dense convolutions plus 12 depthwise, loom had
-   153, and the 36-node difference was one text encoder run twice. Every other shape matched one for
-   one, and loom now issues 117 too.
+Arithmetic from `scripts/conv_census.py --syms n_tokens=100 --syms flow_vocoder:n_tokens=286`
+(18.39 GFLOP). loom's column is the difference of two `$LOOM_PROFILE` runs — four calls minus two,
+over two — so the cold first call is cancelled rather than averaged in; onnxruntime's is
+`scripts/prof_onnx_conv_shapes.py`'s shares over its own un-profiled wall, rescaled to the
+interleaved median.
+Every row is **within 5% under either overhead model**, so at one thread the table is real.
 
-**What is left of this item after P4.15c/d/f.** The two mechanisms it could name are spent, and the
-model is at 1.033x of onnxruntime end to end — so the remaining rows are the three vocoder resblock
-groups (+161 ms) that P4.15/P4.15b measured at 83% of the machine's peak in cache, plus the L~287
-row at 1.31x. **Nobody has a mechanism for any of them yet**, which is the same state P4.15's warning
-describes: onnxruntime being 1.4x faster there is a fact without a cause attached. Re-measure the
-table against the post-P4.15f export before opening a new item on it.
+**Rank it against the machine and the ranking dissolves.** Every dense row is 6.3-7.7 GFLOP/s for loom
+and 8.1-9.7 for onnxruntime, against **~6.3 GFLOP/s per core** for a pure GEMM on this box (P4.15's
+25.1 GFLOP/s at four threads). loom's convolution is *at* a single core's GEMM rate. onnxruntime is
+above it, which is a real 1.2-1.4x, but it is 1.2-1.4x over a roofline-shaped floor, not over an
+implementation with an obvious defect — and it is worth +486 ms only at a thread count nothing ships at.
 
-**Checked and NOT a lead: depthwise.** The obvious suspicion — a `groups=192` convolution lowered as a
-dense 192x192, which would be 192x the arithmetic — is wrong. The exporter emits **12 `CONV_1D_DW`
-nodes**, exactly matching onnxruntime's 12 `[1,192,101] x [192,1,3]` calls — dilation for dilation, four
-each at d=1, d=3 and d=9, per P4.15d's census — and `op_conv_1d_dw` runs them batched per channel. They cost loom 5.1 ms (the `IM2COL` row in its profile) against
-onnxruntime's 1.1 ms — 4.6x, but +4 ms, so it is a rounding error in this item.
+#### Why there is no four-thread version of that table, and this is the reusable part
 
-`CONV_TRANSPOSE_1D` at 1.18x (+29 ms) is the same item P4.15 already lists as "~60-90 ms, at rough
-parity"; it is now the second-largest op in the profile and still lowered as a dense transpose.
+`$LOOM_PROFILE` computes **every node alone**. At one thread that costs 51 us per node — 108 ms on a
+3.0 s wall, 3.6%, small enough to ignore. At four threads it costs **137 us per node, 291 ms on a
+1137 ms wall — 3.7x the entire gap being measured.** And how that 291 ms is charged decides the
+answer, not marginally but completely:
 
-**What NOT to do first.** Do not start on the resblock kernel again. P4.15 measured it at 83% of peak
-in cache with the best of three tiles and no spills, P4.15b measured out both graph-level ideas that
-were supposed to help, and onnxruntime being 1.4x faster there is a fact without a mechanism attached
-yet — get one from the rows above, where the mechanism is visible, before spending another item on it.
+| 4-thread model | convolution | everything else |
+|---|---|---|
+| charge it per node executed | 931 ms, **1.20x**, +155 | 207 ms, 0.73x, -76 |
+| charge it per millisecond (share x wall) | 757 ms, **0.98x**, -19 | 380 ms, 1.34x, +97 |
 
-**Reproducing the table.** The node lists, which are what the shapes below mean, come from
-`scripts/conv_census.py` (P4.15d) and need neither a run nor a Pi.
+**A 230 ms swing on a 78 ms gap.** Neither model is right, and the reason is measurable: **135 ms of
+the 291 is fusion the profiler cannot see** — `GGML_CPU_DISABLE_FUSION=1` costs 1.136 -> 1.265 s and
+1.127 -> 1.267 s, and with `ggml-0005`/`ggml-0007` a fused convolution *absorbs* its bias and
+activation, so under fusion "the convolution" is not a separable term at all. The rest is a
+thread-pool barrier per node, which lands only on the ~190 node executions in the buckets that
+measurably scale — the convolutions and almost nothing else. **The honest four-thread split** — taking the one-thread breakdown and applying the
+measured per-bucket scaling, since the elementwise buckets measure 1.00-1.14x over four cores — is
+convolution **~837 ms against onnxruntime's 776** (1.08x, +61) and everything else **~300 against 283**
+(+17). Both halves are close, and neither has a defect in it.
 
-**The times, and the recipe this section used to give was broken in two ways — both fixed here
-(2026-08-29), because following it would have produced plausible wrong numbers.** It named
-`./build/prof_main`, which **is not in this repository** at all -- it is a local addition to the Pi's
-scratch checkout (see "Scratch trees on the Pi" above) -- and
-`LOOM_THREADS`, which **the engine never reads** — `backend.cpp:323` reads `LOOM_N_THREADS`, so the
-old line measured at the default thread count while claiming four. What works:
+#### What the elementwise half is actually bound by — measured, not assumed
+
+`scripts/membw.c` (a `c[i] = a[i] + b[i]` over exactly the `ADD 73216x32` bucket's 8.9 MB tensor):
+
+| threads | 1 | 2 | 4 |
+|---|---:|---:|---:|
+| GB/s (2r + 1w) | **4.56** | 4.13 | **3.64** |
+
+The bus is saturated by **one** core and gets *worse* with four. loom's two largest `ADD` buckets run
+at **98% and 99%** of that four-thread number, and its `LEAKY_RELU` — one read and one write rather
+than two and one — moves 4.5 GB/s at both thread counts, which is what the bus gives a single core.
+So the fact that they do not scale is the machine, not the engine, and no amount of threading
+recovers it.
+
+#### The one thing that is NOT against a roofline — now P4.25
+
+`ggml_get_n_tasks` (`ggml-cpu.c:2271`) hands `n_tasks = 1` to `TANH`, `SIGMOID`, `EXP`, `RELU`,
+`LEAKY_RELU` and the rest of the cheap-unary list, while `GELU`, `GELU_ERF` and `SILU` get
+`n_threads`; and `ggml_vec_tanh_f32` / `ggml_vec_sigmoid_f32` (`vec.h:909`, `:936`) are scalar
+`tanhf` / `1/(1+expf(-x))` loops with no SIMD path — where GELU got one in `ggml-0010`.
+
+VITS's flow has 17 `TANH` and 16 `SIGMOID` nodes on **220 KB** tensors, and they measure
+**30.4 ms per synthesis at one thread and 30.4 ms at four** — 26 cycles per element, 0.46 GB/s, a
+full order of magnitude clear of the memory roofline and unaffected by three idle cores. It is 2.7% of
+the wall and **39% of the 78 ms gap**, with two independent untried levers (thread it; vectorise it).
+That is the first named mechanism this thread has had since P4.15f, and it is not a convolution.
+
+#### Also fixed here
+
+`scripts/conv_census.py`'s `macs()` counted a **transposed** convolution over its output length. A
+transpose scatters each of `il` inputs across `k` taps, so the count is `il * oc * ic * k`; over `ol`
+it overstates by exactly the stride — 8x, 8x and 4x for VITS's three, which put **both** engines above
+the machine's roofline on that row (149.9 and 56.8 GFLOP/s on a box that does 25) and would have made
+the only row loom *wins* unreadable. The file's total for VITS goes 26.58 -> **18.39 GFLOP**. Node
+counts and dense-conv arithmetic are unaffected, so nothing P4.15d concluded moves.
+
+#### Reproducing all of it
+
+**Both halves are in `scripts/` now.** `prof_onnx_conv_shapes.py` is new here — the per-shape half
+existed only as `~/prof_onnx_shapes.py` on the Pi, which is precisely
+[Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md)'s failure, and this
+table would have been unreproducible for the same reason the last one was.
 
 ```sh
-# per-op, which is what the table's rows are
-LOOM_N_THREADS=4 LOOM_PROFILE=<path> LOOM_PROFILE_NODES=1 \
-    ./build/tools/loom_cli/loom_cli --model <vits.gguf> --prompt "<ipa>"
-# wall time, with the three scales pinned the way the onnxruntime arm pins them
-#   (build line in the file's own header)
-./bench_vits_loom <dir-with-vits_mil.gguf> [nrun]
-``` onnxruntime: the recipe and the pinning requirement are in P4.15b's cold
-start; the per-shape aggregation is `~/prof_onnx_shapes.py` on the Pi, which groups `Conv`,
-`FusedConv` and `ConvTranspose` events by `args.input_type_shape`.
+# loom, on a fresh Release build (the repo default is RelWithDebInfo and 1.39x slower)
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4 --target loom_engine
+g++ -O3 -std=c++17 -I include -I tests/support -I build/_deps/ggml-src/include \
+    -I build/_deps/nlohmann_json-src/single_include scripts/bench_vits_loom.cpp \
+    -o bench_vits_loom -L build -lloom_engine -L build/_deps/ggml-build/src -lggml -lggml-base -lpthread
+export LD_LIBRARY_PATH=build:build/_deps/ggml-build/src
+LOOM_N_THREADS=4 ./bench_vits_loom <dir-with-vits_mil.gguf> 9          # wall
+GGML_CPU_DISABLE_FUSION=1 LOOM_N_THREADS=4 ./bench_vits_loom <dir> 9   # what fusion is worth
+# per-op: TWO runs at different call counts, so the cold first call can be differenced out
+#   (nrun is MEASURED calls; the harness makes nrun+1, so these are 2 and 4)
+for n in 1 3; do LOOM_N_THREADS=1 LOOM_PROFILE=prof_$n.txt LOOM_PROFILE_NODES=1 \
+    ./bench_vits_loom <dir> $n; done
+gcc -O3 -fopenmp -march=native scripts/membw.c -o membw && ./membw 4   # the streaming roofline
 
+# onnxruntime -- SAME estimator on both sides (one warm-up, median of 9) or the ratio is meaningless
+python3 scripts/bench_onnx_tasks.py vits <miro_en-GB.onnx> 4 9         # wall
+python3 scripts/prof_onnx_conv_shapes.py <miro_en-GB.onnx> 4 5         # per shape
+```
+
+**Check the invariant before believing any ratio:** every harness above prints its sample count, and
+all of them must say **73216**. A row whose two sides synthesised different utterances is
+[Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md) again.
+
+**Cool to a fixed temperature before every single run and interleave the two arms** — the board
+reaches 75 C during one measurement, and two back-to-back runs have measured 33% apart:
+
+```sh
+cool() { until vcgencmd measure_temp | tr -dc 0-9. |
+             awk -v t="${1:-60}" '{exit !($1 <= t)}'; do sleep 10; done; }
+for i in 1 2 3; do cool 60; <loom arm>; cool 60; <onnxruntime arm>; done
+```
+
+With that discipline the three loom walls spanned 1.3% and the three onnxruntime walls 2.3%, which is
+what makes a 6.9% gap readable at all on this machine. Alternating the arms without cooling is not
+enough — one arm systematically gets the cool half of every thermal excursion.
+
+
+### P4.25 — the unary gate is single-threaded and scalar, by ggml's construction — SCOPED, NOT STARTED
+
+**Found by P4.16's re-measurement, and it is the only thing in the VITS profile that is not against a
+roofline.** Everything else in that model is at the machine's limit: the convolution at ~22 of ~25
+GFLOP/s, the big elementwise ops at 98-99% of a measured 3.64 GB/s bus. This is not.
+
+**One sentence.** `ggml_get_n_tasks` hands `n_tasks = 1` to `TANH`, `SIGMOID`, `EXP`, `RELU` and
+`LEAKY_RELU` while `GELU`/`GELU_ERF`/`SILU` get `n_threads`, and `ggml_vec_tanh_f32` /
+`ggml_vec_sigmoid_f32` are scalar `tanhf` / `1/(1+expf(-x))` loops — so VITS's WN gate runs its 17
+`TANH` and 16 `SIGMOID` over 220 KB tensors at 26 cycles per element on one core while three sit idle.
+
+| | |
+|---|---|
+| where | `ggml-cpu.c:2271` (`n_tasks`), `ggml-cpu/vec.h:909` and `:936` (the loops) |
+| cost | **30.4 ms per synthesis at one thread, 30.4 ms at four** — the 32 of them at `[286, 192]`, 0.95 ms each |
+| share | 2.7% of a 1137 ms wall; **39% of the whole 78 ms gap to onnxruntime** |
+| bound by | neither bandwidth (0.46 GB/s) nor cores (1.00x over four) — the scalar transcendental |
+| levers | two, independent and both untried: give it `n_tasks = n_threads`; give it a SIMD path |
+
+**Do the thread count first, and separately.** It is a one-line change to a switch, it needs no new
+arithmetic, and it bounds the other half: if 30.4 ms does not fall to ~8 ms on four cores then the op
+is not core-bound and the SIMD half is the only lever left. Both must be measured on **more than one
+thread** — a single-threaded instruction count is blind to exactly the property being changed
+([Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md)).
+
+**Two warnings from this thread's own record, both directly applicable.** `ggml-0010` already
+vectorised GELU-erf, so the SIMD half has a template and a precedent — but Retro-012's `ggml_v_expf`
+entry is the case where a real 1.1-1.4x on the transcendental turned out to have **no accessible
+headroom** in the op around it, and it took two corrections to establish that. And the accuracy
+question is not free: glibc's `tanhf` and `expf` are sub-ulp, a SIMD approximation is not, and the
+gate suite compares fp32 exactly. **Measure the thread lever, which has no accuracy question at all,
+before opening the one that does.**
+
+**Reaches further than VITS.** Every WN-style flow (VITS, and StyleTTS2's decoder) is built from this
+gate, and `LEAKY_RELU` is on the same `n_tasks = 1` list — though there the fix is worthless, because
+its tensors are 8.9 MB and already at the bus roofline. The lever only exists where the tensor is
+cache-resident, which is what makes the 220 KB gate the case worth doing.
 
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED
 
