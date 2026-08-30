@@ -105,7 +105,7 @@ thread count — how does loom compare to onnxruntime?** Three tasks, because no
 representative: an all-convolutional vocoder, an encoder-decoder ASR model, and an autoregressive LM.
 
 **`>1.00x` means loom is faster.** The x86 TTS and LM cells are from 2026-08-24; **the ASR column and
-the whole Pi row were re-measured 2026-08-29**. **Both engines run back to back on the machine in the
+the whole Pi row were re-measured 2026-08-29, and the Pi's TTS cell again on 2026-08-30**. **Both engines run back to back on the machine in the
 row** — see [what these numbers are not](#what-these-numbers-are-not).
 
 | machine | arch | threads | onnxruntime 1.28.0 build | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
@@ -114,7 +114,7 @@ row** — see [what these numbers are not](#what-these-numbers-are-not).
 | Intel Core Ultra 9 285K | x86-64 | 24 (all) | conda-forge | **1.17x** | 0.96x | **1.37x** |
 | AMD Ryzen 3 3250U | x86-64 | 2 (physical) | PyPI wheel | **1.02x** | **1.05x** | 0.80x |
 | AMD Ryzen 3 3250U | x86-64 | 4 (all) | PyPI wheel | 0.99x | **1.04x** | 0.81x |
-| Raspberry Pi 4B | aarch64 | 4 (all) | PyPI wheel | 0.96x | **1.06x** | 0.57x |
+| Raspberry Pi 4B | aarch64 | 4 (all) | PyPI wheel | 0.93x | **1.06x** | 0.57x |
 
 **The ASR column is the only one measured with the estimators matched.** Until 2026-08-29
 `bench_asr_loom.cpp` had no warm-up run while its onnxruntime counterpart did, so every ASR cell timed
@@ -140,6 +140,17 @@ aarch64 without moving x86 at all:
 
 It was measured on x86 and shipped to every architecture, and **the Pi was not re-measured after it
 landed** — which is the whole of why it survived four days.
+
+**And it has happened again, with the next patch.** `ggml-0012` — worth **2.75x** at whisper's `QK^T`
+on x86 — was checked on this board at that same shape and found neutral, which it is. VITS's matmuls
+are `m = 96 / 100 / 199`, every one of which takes the branch it changed, and there it costs the Pi
+**2.4%** (1.032x and 1.016x over two ABBA-interleaved rounds), most of it in the *convolution*, because
+this repository lowers convolution through the same `sgemm`. **That is why the Pi's TTS cell moved
+0.96x -> 0.93x between 2026-08-29 and 2026-08-30 with no change to the harness.** The lesson Retro-019
+already carries is "measure every ISA a patch is enabled for"; the amendment is **every shape class**,
+since an ISA check at one shape is exactly what let this through. The Pi's LM and ASR cells have not
+been re-measured against it and may carry the same regression. It is open as P4.26 in
+[Epic-05](docs/epics/epic-05-edge-performance.md).
 [Retro-019](docs/retros/retro-019-a-patch-measured-on-one-isa.md) is that lesson;
 [Epic-05](docs/epics/epic-05-edge-performance.md) has the per-shape numbers and the bisect that found
 the mechanism.

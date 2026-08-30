@@ -91,3 +91,27 @@ first listed were all plausible and all wrong about the mechanism; what identifi
 the patch into its hunks and building each one**, four `.so` files of one source. A patch small enough
 to review is usually small enough to bisect, and that is cheaper than reading the disassembly it was
 going to take.
+
+## It happened again, one patch later (2026-08-30, P4.26)
+
+Takeaway 3 above asked for "a number from an x86 box and a number from the Pi". `ggml-0012` has both,
+and it still shipped a 2.4% aarch64 regression, because **the number from the Pi was taken at one
+shape** — whisper's `QK^T`, `m = 1500`, where the patch is genuinely neutral (133.10 ms against 133.65,
+correctly ABBA-interleaved). VITS's matmuls are `m = 96 / 100 / 199`. Every one of them takes the branch
+the patch adds, and there it costs **1.032x and 1.016x** over two ABBA rounds — ~27 ms per synthesis,
+of which `CONV_2D` is +22.6 ms and `MUL_MAT` only +5.4, because `ggml-0004` and `ggml-0009` lower
+convolution through the same `sgemm`.
+
+It surfaced the same way the last one did: a published cell was re-derived from scratch (P4.16) and
+disagreed with itself by 3%.
+
+* **Takeaway 3, amended — a number per ISA is not enough; it has to be a number per SHAPE CLASS the
+  patch is enabled for.** `ggml-0012`'s whole purpose is to change what happens when `m % 16 != 0`,
+  and it was validated on aarch64 at an `m` from a different model. The shapes to run are the ones in
+  `scripts/conv_census.py`'s output for the models that ship, not the one the patch was aimed at.
+* **A patch to `sgemm` is a patch to the convolution.** Nothing in `ggml-0012`'s own reasoning mentions
+  convolution, and convolution is where 80% of its cost landed. Before scoping a GEMM patch by the ops
+  that call `ggml_mul_mat`, check which lowerings reach `sgemm` by another door.
+
+P4.26 in [Epic-05](../epics/epic-05-edge-performance.md) is the open item, and it is deliberately *not*
+"gate it on `__aarch64__`": the 2.75x it buys on x86 is a bigger number than the 2.4% it costs here.

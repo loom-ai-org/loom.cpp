@@ -757,10 +757,22 @@ job owns have moved. FNV-1a over the whole result buffer agrees between the two 
 `m = 1492/1500/1501/1504` x 1/4/8 threads — so no byte-identity gate baseline needs re-recording, and
 the accuracy question PR 11 had to answer does not arise here.
 
-**Both ISAs, per the standing rule this file learned the hard way (PR 11).** aarch64 is **no change**,
-and that is a result rather than a gap: a Raspberry Pi 4 threads 3.5x at *every* one of the three `m`
-above, so there is nothing there to fix — 133.10 ms before against 133.65 after at `m = 1500`,
-4 threads, ABBA-interleaved medians of ten. Four small cores behind a shared 1 MB L2 do not pay for a
+**Both ISAs, per the standing rule this file learned the hard way (PR 11).** aarch64 is **no change
+at `m = 1500`** — a Raspberry Pi 4 threads 3.5x at *every* one of the three `m` above, so there is
+nothing there to fix: 133.10 ms before against 133.65 after, 4 threads, ABBA-interleaved medians of ten.
+
+> **CORRECTION (2026-08-30, loom P4.26): that is true at `m = 1500` and NOT true in general.** The
+> paragraph above is the only aarch64 number this patch was ever given, and `m = 1500` is the one shape
+> where the new branch changes nothing. At the small `m` a convolutional model actually runs —
+> VITS's `m = 96 / 100 / 199`, every one of which *does* take the new branch — the same board measures
+> **1.032x and 1.016x SLOWER** over two ABBA-interleaved rounds, ~27 ms on a 1.1 s synthesis. Attributed
+> by profile: `CONV_2D` +22.6 ms and `MUL_MAT` +5.4 ms per synthesis, because loom lowers convolution
+> and transposed convolution through this same `sgemm` (`ggml-0004`, `ggml-0009`) — so a change written
+> for attention reaches every convolutional model. **An upstream reviewer should be given both numbers**,
+> and the open question is whether a predicate exists that keeps the x86 2.75x without the aarch64
+> 2.4%; gating the new branch on `!__aarch64__` is the fallback, not the answer. This is a second
+> instance of PR 11's own lesson, one level down: a number per ISA is not enough, it has to be a number
+> per SHAPE CLASS the branch is enabled for. Four small cores behind a shared 1 MB L2 do not pay for a
 contended line the way a 24-core mesh does. A 2-core Ryzen 3 3250U cannot resolve it either (±40%
 spread on that box; see the dev-box noise floor in loom's Retro-012).
 

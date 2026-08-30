@@ -2108,10 +2108,10 @@ not the code.
 **Scratch trees on the Pi** (all disposable, none of them a git repo):
 * `~/loom-p416/loom.cpp` — **the current one (P4.16, 2026-08-30)**: a plain rsync of `45d5db9` with
   `bench_vits_loom` built beside it, `-DCMAKE_BUILD_TYPE=Release`, targets `loom_engine loom_cli` only
-  (the test targets are the long tail of that build and nothing here needs them).
-  (`~/prof_onnx_shapes.py`, the Pi-only original, reads its phoneme ids from `/tmp/ids.json`;
-  `scripts/prof_onnx_conv_shapes.py` carries them inline and needs no such file.)
-  **rsync to this board leaves FUTURE mtimes** — its clock runs ~240 s behind
+  (the test targets are the long tail of that build and nothing here needs them). `~/loom-no12` is the
+  same tree with `ggml-0012` removed, for P4.26's A/B. (`~/prof_onnx_shapes.py`, the Pi-only original,
+  reads its phoneme ids from `/tmp/ids.json`; `scripts/prof_onnx_conv_shapes.py` carries them inline and
+  needs no such file.) **rsync to this board leaves FUTURE mtimes** — its clock runs ~240 s behind
   the dev box — so `find <tree> -type f -exec touch {} +` afterwards, or ninja rebuilds in a loop.
 * `~/loom-p415/loom.cpp` — the older one, pre-`ggml-0010`; a full checkout with `prof_main` appended to
   its CMakeLists. Rebuild with `cmake -B build -DCMAKE_BUILD_TYPE=Release` (**Release
@@ -2637,6 +2637,56 @@ With that discipline the three loom walls spanned 1.3% and the three onnxruntime
 what makes a 6.9% gap readable at all on this machine. Alternating the arms without cooling is not
 enough — one arm systematically gets the cool half of every thermal excursion.
 
+
+### P4.26 — `ggml-0012` costs a Cortex-A72 2.4% on VITS, at shapes P4.22 never measured — OPEN
+
+**Found while re-measuring P4.16, from a 3% disagreement with the README's own Pi cell**, and it is
+[Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md)'s pattern for the second time in this
+thread: a patch worth **2.75x** on x86 at the shape it was aimed at, checked on aarch64 **only at that
+same shape**, and shipped.
+
+P4.22 checked `ggml-0012` on this board at whisper's `QK^T` (`m = 1500`, 4 threads) and found it
+neutral — 133.10 ms against 133.65, correctly ABBA-interleaved. That is a real result and it is still
+true. **It is also the only aarch64 shape it was ever run at.** VITS's matmuls are `m = 96 / 100 / 199`,
+and every one of them takes the *new* branch, because the patch's whole point is to give `m % 16 != 0`
+a 16-aligned prefix instead of falling through to `BM = 1`.
+
+**ABBA-interleaved, cooled to a fixed 60 C before every arm, two rounds of A B B A**, the two trees
+identical but for the presence of `cmake/patches/ggml-0012-tinyblas-line-aligned-jobs.patch`:
+
+| round | with `0012` | without | ratio |
+|---|---:|---:|---:|
+| 1 | 1.1503 / 1.1335 s | 1.0996 / 1.1136 s | 1.032x |
+| 2 | 1.1274 / 1.1285 s | 1.1049 / 1.1158 s | 1.016x |
+
+**~2.4%, ~27 ms per synthesis, and the mechanism is attributed** — `$LOOM_PROFILE` on both trees, same
+four threads, same profiler overhead on both sides so the *difference* is meaningful:
+
+| op (6 syntheses) | with `0012` | without | delta per synthesis |
+|---|---:|---:|---:|
+| `CONV_2D` | 5416.2 ms | 5280.7 ms | **+22.6 ms** |
+| `MUL_MAT` | 169.2 ms | 137.1 ms | **+5.4 ms** |
+
++28 ms against a +27 ms wall difference, so nothing else moved. **The convolution is most of it**, which
+is the part nobody would predict from the patch's own description: `ggml-0004` and `ggml-0009` lower
+convolution and transposed convolution through the same `sgemm` this patch edits, so a change written
+for attention reaches every convolutional model on the board. Per shape it is not even uniform —
+`MUL_MAT 199x100` is 1.86x slower with the patch and `MUL_MAT 100x1` is *faster* — which is what a job
+partitioning changed underneath a set of small `m` looks like.
+
+**What to do, in order.** (1) Reproduce on a second aarch64 machine if one is available, since n=1 board.
+(2) The cheap fix is to gate the new branch on `!defined(__aarch64__)`, but **measure that on x86
+first** — the 2.75x it buys there is a bigger number than the 2.4% it costs here, and the honest
+question is whether a predicate exists that gets both. (3) Whatever lands, run it at VITS's small `m`
+*and* whisper's `m = 1500`, on both ISAs. The rule Retro-019 already wrote is "measure every ISA a
+patch is enabled for"; the amendment this adds is **every SHAPE CLASS it is enabled for** — an ISA
+check at one shape is what let this through.
+
+**It also explains a published number.** The README's Pi TTS cell read **0.96x** on 2026-08-29 and
+reads **0.93x** on the same harness today; `ggml-0012` landed between the two, and 0.96 / 1.024 = 0.937.
+The cell has been updated. **The Pi's LM and ASR cells were not re-measured here** and may carry the
+same regression — whisper's `m = 1500` is the shape P4.22 *did* check, so ASR is the least likely to
+have moved, but that is a prediction and not a measurement.
 
 ### P4.25 — the unary gate is single-threaded and scalar, by ggml's construction — SCOPED, NOT STARTED
 
