@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-08-22
+last_updated: 2026-08-29
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -27,6 +27,16 @@ characters), and two more — each measured against the real tokenizer rather th
 
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.
+
+**ADDED tokens are handled before any of that** (P4.23). `encode` splits the raw input on the
+vocabulary's added set — every CONTROL and USER_DEFINED entry of `tokenizer.ggml.token_type` — longest
+match first, and only the runs between them reach the normalizer and the pretokenizer. That is HF's own
+order, and without it a marker merges into ordinary pieces and a chat template is unrepresentable. A
+file carrying no `token_type` skips the pre-pass entirely, which is what keeps every GGUF exported
+before P4.23 tokenizing exactly as it did.
+
+**And the checkpoint's chat template is DATA in the file**, not a program: the exporter reduces its
+Jinja to role tags and `loom::ChatTemplate` concatenates them — [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md).
 
 ### Grapheme front ends
 
@@ -68,9 +78,9 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 
 | | |
 |---|---|
-| Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) |
+| Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
-| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md) |
+| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record
@@ -95,212 +105,98 @@ The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-scrip
 case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
 
 
-### P4.23 — an instruction-tuned causal LM cannot be prompted correctly — SCOPED, NOT STARTED
+### P4.23 — an instruction-tuned causal LM could not be prompted correctly — DONE (2026-08-29)
 
-**One sentence.** `detokenize` knows a checkpoint's special tokens and `tokenize` cannot produce them,
-so a chat template is not merely un-applied — it is **unrepresentable**, and every instruction-tuned
-LM in the fixture set is being run outside the distribution it was trained on.
+**One sentence.** `detokenize` knew a checkpoint's special tokens and `tokenize` could not produce
+them, so a chat template was not merely un-applied but **unrepresentable** — and every
+instruction-tuned LM in the fixture set was being run outside the distribution it was trained on.
 
-Reported as three symptoms; two reproduce, and they share one root cause. All measurements below are
-on the shipped GGUFs in **`../hf-models/`** (a sibling of this checkout, mirroring what is on the Hub —
-`loom-ai-org/gemma-3-270m-it-loom`'s artifact is byte-identical to the local one, `md5 d6591bcf…`),
-through `loom-py` and `tools/loom_cli`, 2026-08-29.
+Three independent defects, one symptom, and **fixing any one alone was not enough**. All three are
+closed. The reference the item was defined against — the same prompt through the checkpoint's own
+`apply_chat_template` in `transformers`, greedy — now matches **exactly**:
 
-**To reproduce any of this from a cold start**, none of which needs a Pi or the workstation:
+| | loom | `transformers` |
+|---|---|---|
+| gemma-3-270m-it | `The discovery of Brazil was made by **Hernán Cortés**.\n` | identical |
+| smollm2-360m-it | `Brazil was discovered by Portuguese explorers in the 15th century. …` | identical |
 
-```sh
-# the released wheel the report came from, in a throwaway venv
-python3 -m venv /tmp/rc6 && /tmp/rc6/bin/pip install "loom-py-rt==1.0.0rc6"
-/tmp/rc6/bin/python -c '
-import loom
-m = loom.Model.from_file("../hf-models/gemma-3-270m-it/gemma-3-270m-it.gguf")
-print(m.tokenize("<start_of_turn>"))                                  # 8 ids; should be [105]
-print(repr(m.text2text.infer("The capital of France is", 14)))        # the card snippet, loops
-print(m.generate_ids(m.tokenize("The capital of France is"), 14))     # ids: not a prefill echo
-'
-```
+#### What was wrong, and what each fix was
 
-The GGUF's own driver and eos KVs come out with `gguf.GGUFReader` — read
-`model.driver_script` for the Lua loop and `tokenizer.ggml.eos_token_id` for the single eos.
+**1. `BpeVocab::encode` had no added-token pre-pass.** HF's `AddedVocabulary` splits the raw input on
+the added set *before* the normalizer and the pretokenizer; loom ran the input straight through BPE, so
+`tokenize("<|im_start|>")` was seven literal ids and `tokenize("<start_of_turn>")` eight. The decode
+side worked only because a marker's *spelling* is in the vocabulary like any other entry.
 
-The upstream checkpoints these were exported from are in **`~/Dev/models/`** (`gemma-3-270m-it`,
-`smollm2-360m-it`, `qwen3-0.6b-base`, `lfm2-350m`) — which is where `generation_config.json` and
-`tokenizer_config.json` are read from, **not** the HF cache, which holds only refs.
+Fixed at both ends, because **the file did not even carry the information**: the exporter now writes
+`tokenizer.ggml.token_type` (llama.cpp's own KV, parallel to the token list), and `encode` splits on
+every CONTROL and USER_DEFINED entry, longest match first, on the raw bytes.
 
-#### The asymmetry, which is the whole item
+* **All added tokens, not just the special ones.** Gemma 3 declares 6408 non-special ones — the
+  whitespace runs — and HF splits on those too, so a pre-pass that only knew about markers would have
+  disagreed with the reference tokenizer on ordinary prose rather than only on chat.
+* **BYTE entries are excluded.** `<0xNN>` exists to be reached by fallback; treating it as splittable
+  would turn someone's literal text `"<0x41>"` into byte 0x41.
+* **A file with no `token_type` behaves exactly as it did**, which is what keeps every pre-P4.23 GGUF
+  tokenizing identically. Guessing (every `<…>`-looking piece, say) would have made `encode` disagree
+  with the reference on ordinary text that happens to look like a marker.
+* `decode` now returns an added token's piece verbatim rather than through the byte decoder. For
+  `<|im_end|>` the two agree; for one containing a newline the byte map has no key at all and every
+  such character was silently dropped.
 
-```
-smollm2-360m-instruct   tokenize("<|im_start|>") -> [44,108,306,79,3738,108,46]   should be [1]
-                        tokenize("<|im_end|>")   -> [44,108,306,79,486,108,46]    should be [2]
-                        detokenize([1, 2])       -> "<|im_start|><|im_end|>"      correct
-gemma-3-270m-it         tokenize("<start_of_turn>") -> [2,236820,3041,236779,1340,236779,887,236813]
-                                                                                  should be [105]
-```
+**2. The export read the tokenizer config's single `eos_token`.** gemma-3-270m-it's
+`generation_config.json` says `eos_token_id: [1, 106]` — `<eos>` and `<end_of_turn>` — and a loop
+knowing only the first runs to `max_new_tokens` on every utterance. `bpe_tokenizer_export.py` now
+reads the generation config (as `granite_speech_export.py:437` and `qwen3_asr_export.py:363` already
+did), writes the whole set as `tokenizer.ggml.eos_token_ids` beside the unchanged scalar, and passes
+the remainder to `PrefillDecodeLoop.extra_eos_tokens`. `loom::text::eos_token_ids` is where a host
+reads it back, and `strip_eos` now strips ANY of them — stripping only the scalar left
+`<end_of_turn>`'s literal spelling on the end of every chat answer.
 
-`BpeVocab::encode` runs the input straight through BPE. HF's tokenizers **split on added tokens first**
-and emit their ids atomically; there is no such pre-pass in `bpe_vocab.cpp` (no `added`/`special`
-handling anywhere in the file). The decode side works only because a special token's *spelling* is in
-the vocabulary like any other entry.
+**3. There was no chat template anywhere.** Decided and recorded as
+[ADR-018](../adrs/adr-018-chat-template-as-role-tags.md): the EXPORTER reduces the checkpoint's Jinja
+to role tags by differencing real renders, verifies the reduction against `apply_chat_template` at the
+string AND id level, and writes seven KVs; `loom::ChatTemplate` concatenates them. No Jinja on either
+side of the boundary, and no per-model C++.
 
-**And the file does not even carry the information.** Neither GGUF has
-`tokenizer.ggml.token_type` — the standard KV marking which ids are `CONTROL` / `USER_DEFINED`. The
-exporter never writes it, so the engine could not do the pre-pass today even if `encode` wanted to.
+Reached from `loom_cli --chat`/`--system`, `model.chat(...)` and `model.text2text.chat(...)`.
 
-This is a gap in a tokenizer that is otherwise verified: `test_e2e_spm_byte_fallback_tokenizer` checks
-nine cases against `AutoTokenizer.encode` verbatim and all of them round-trip. **None of the nine
-contains a special token**, which is exactly how a correct-looking tokenizer ships unable to encode a
-chat turn.
+#### What this does NOT fix, and did not need to
 
-#### What it does to real models — reproduced, not inferred
+**The reported "prefill echo" was never a bug.** The model *re-generates* the prompt's text: an
+instruction-tuned model given an un-templated prompt continues in the prompt's own format. Verified on
+rc6 over five doors — the ids do not start with the prompt, they re-emit it from position 3. Closed by
+measurement, not by code.
 
-**Gemma 3 270M IT**, hand-written template through `loom_cli`, `--n-predict 80`:
+There WAS a real hole beside it, and it is now closed: `text_generate.h` promised both driver shapes
+were normalised to generated-ids-only and the list branch did not check. **The check is on the COUNT,
+deliberately** — a conforming driver breaks at `#_gen >= max_new_tokens` and can never return more,
+whatever it generated. "Does the return start with the prompt" was rejected as the test: it cannot tell
+an echo from a model repeating its own prompt back, which is exactly what an un-templated instruction
+model does, so it would have thrown on correct output.
 
-```
-<start_of_turn>user\nWho discovered Brazil?<end_of_turn>\n<start_of_turn>model\n
-  -> "<end_of_turn>model\n<start_of_turn>artist\n<end_of_turn>artist\n<start_of_turn>artist..."
-```
+#### Gates
 
-runs to the ceiling emitting turn after turn. **Two independent faults produce that**, and fixing
-either alone is not enough:
+* `tests/ci/test_chat_template.cpp` — hermetic, over a 263-token fixture with three added tokens and a
+  ChatML decomposition. **Two files from one generator**, with and without `token_type`, because the
+  backward-compatibility claim is only a claim until both are compared.
+* `tests/gate/test_e2e_spm_byte_fallback_tokenizer.cpp` — nine more cases, every expectation
+  `AutoTokenizer.encode` verbatim, including markers, a marker inside prose, a non-special added token,
+  `<bos>` and `<0x41>`. **A pre-P4.23 GGUF fails it**, which is correct: the fix is a re-export. Why
+  the nine that were already there could all pass while `encode` was broken is
+  [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md).
+* `tests/gate/test_e2e_chat_generation.cpp` — generic over any GGUF carrying a template. The central
+  assertion is that **no generated id is a CONTROL token**: a model given a turn produces text, one
+  that was not produces structure. Both sabotage checks bite (the pre-pass off, and the eos set
+  narrowed to the scalar).
+* `loom-py/tests/ci/test_api.py` — that this layer hands the engine a conversation and renders none
+  itself.
 
-1. the template's markers went in as ~7 literal tokens each, so the model never saw a turn boundary;
-2. the file declares `tokenizer.ggml.eos_token_id = 1` (`<eos>`) while an IT checkpoint ends a turn on
-   **`<end_of_turn>` = 106**, so the loop would not have stopped even if the model had emitted it.
+#### The one thing left over
 
-`driver_components.py` **already has the field for (2)** — `GenerationLoop.extra_eos_tokens`, whose
-own comment says "a chat-formatted checkpoint has two … and a loop knowing only the first runs to
-`max_new_tokens` on every utterance". It is set by `speech_lm_export.py:770` and **never by
-`causal_lm_export.py`**. That half is a one-line export change, not a design question.
-
-**SmolLM2 360M Instruct** shows the same cause with the opposite symptom: asked a bare question it
-emits its own `<|im_end|>` (id 2, its declared eos) as the *first* token, `strip_eos` drops it, and
-`generate` returns **the empty string**. With `eos_token=-1` it continues
-`"<|im_end|>\n<|im_start|>assistant\nThe discovery of Brazil"` — it is trying to open the assistant
-turn itself, because nothing opened one for it. **An empty completion is the same bug as a runaway
-one.**
-
-**"Answers differ from HF"** follows from the above and needs no separate mechanism: the model is
-being asked to continue malformed text. Gemma 3 on a bare `"Who discovered Brazil?"` produces a
-repeating bulleted list (`"The Portuguese / The indigenous people of Brazil / …"`).
-
-#### The reported symptom that did NOT reproduce, and the latent path it names
-
-**"Inference outputs the prefill as well as the generated tokens" did not reproduce**, and the three
-things that would have explained it away are each ruled out by measurement rather than by argument:
-
-* **Not a door.** Five of them, all returning generated-only: `Model.generate`, `generate_ids`,
-  `text2text.infer`, `Model.infer` (one token, as designed), and `Model.call("infer_with_past", …)`
-  straight at the driver. Plus `loom_cli --prompt`. Four causal LMs — gemma-3-270m-it,
-  smollm2-360m-instruct, lfm2-350m-monolithic, qwen3-0.6b-base.
-* **Not "already fixed since the reported version".** The report is against **loom-py-rt 1.0.0rc6**,
-  which pins loom.cpp `646c91c`. `git diff 646c91c..HEAD` over `text_generate.{h,cpp}`,
-  `bpe_vocab.cpp` and `lua_bridge.cpp` is **empty** — the only engine change since rc6 is P4.19's
-  profiler — and loom-py's Python layer is unchanged since its `1.0.0-rc6` tag.
-* **Not a stale model.** The Hub artifact (`loom-ai-org/gemma-3-270m-it-loom`) and the local export are
-  **byte-identical**, `md5 d6591bcf…`.
-* **And rc6 itself was run**, installed from PyPI into a clean venv, against that same file: no echo,
-  and output identical to the working tree's.
-
-**The likeliest benign explanation, which should be checked before any code is touched:** an
-instruction-tuned model given an un-templated prompt behaves like a base model and **continues in the
-prompt's own format**. `"Question: Who discovered Brazil?\nAnswer:"` generates
-`" The Portuguese\n\nQuestion: What is the capital of Brazil?\nAnswer: Brasília\nQuestion: …"` — the
-prompt's shape reappears in the output as *generated* text, which reads exactly like a prefill echo and
-is not one. That is the same root cause as the rest of this item, and it would be fixed by the same
-work.
-
-**REPRODUCED 2026-08-29 from the model card's own snippet, and it is the format continuation above.**
-`loom-ai-org/gemma-3-270m-it-loom`'s card says exactly:
-
-```python
-print(model.text2text.infer("The capital of France is", max_new_tokens=14))
-#  -> ' Paris.\n\nThe capital of France is Paris.\n\nThe capital of'
-```
-
-The prompt comes back, which is what was reported. It is **generated, not echoed**, and the ids say so
-without ambiguity:
-
-```
-prompt ids     [2, 818, 5279, 529, 7001, 563]                                    "<bos>The capital of France is"
-generated ids  [9079, 236761, 108, 818, 5279, 529, 7001, 563, 9079, 236761, ...]
-               ^^^^^^^^^^^^^^^^^ " Paris.\n\n"   then 818,5279,529,7001,563 = the prompt's own tokens, AGAIN
-```
-
-It does not START with the prompt (so `generate` is honouring its contract) and it CONTAINS the
-prompt's tokens from position 3 (so the model re-emitted them). **The prefill-echo reading is closed;
-the behaviour is real and belongs to this item.**
-
-**And there is a second cause beside the missing template, which the checkpoint states outright.**
-`google/gemma-3-270m-it`'s `generation_config.json`:
-
-```json
-{ "do_sample": true, "top_k": 64, "top_p": 0.95, "eos_token_id": [1, 106] }
-```
-
-* **`eos_token_id` is a LIST, `[1, 106]`** — the checkpoint itself declares both `<eos>` and
-  `<end_of_turn>`. Nothing had to be guessed. `bpe_tokenizer_export.py:55` derives eos from the
-  *tokenizer* config's single `eos_token` and never consults `generation_config`; meanwhile
-  `granite_speech_export.py:437` and `qwen3_asr_export.py:363` **already read
-  `model.generation_config.eos_token_id`** for exactly this. The causal-LM path is the one that does
-  not, and the precedent for fixing it is in the same repository.
-* **`do_sample: true`.** loom decodes by `argmax_row` and **there is no sampling anywhere in the
-  engine** — no temperature, top-k, top-p or multinomial in `include/` or `src/`. Greedy decoding on a
-  270M model is what turns "no chat template" into a repetition LOOP rather than merely a wrong answer,
-  and it is an independent reason any answer differs from `transformers`, whose default for this
-  checkpoint is sampled. **Scoped separately as P4.24** ([Epic-06 §4](epic-06-high-level-api-and-hosts.md))
-  — it is a capability gap rather than a bug, and the only strand here that is not about tokenization.
-  **Neither item fixes the symptom alone:** a correct template still decodes greedily, and a sampler
-  still has no turn to sample inside.
-
-**The model cards ship the failing example.** The snippet above is generated by
-`loom-exporter/tools/build_model_cards.py`, so every causal-LM card demonstrates the defect to anyone
-who pastes it. Regenerating the cards is part of this item's acceptance, not a follow-up.
-
-There is nonetheless a real hole to close while the item is open. `text_generate.h` promises "returns
-the GENERATED ids only, never the prompt — **both driver shapes are normalised to that here**", and
-`text_generate.cpp` does not normalise: the list branch copies the driver's return verbatim with no
-check that it excludes the prompt. The two shapes are told apart by *what the driver returns* (list vs
-number), never by *whether it contains the prompt*, so a driver that returned prompt+generated would
-be echoed and nothing would catch it. A generated `infer_with_past` starts `_gen` empty
-(`driver_components.py:652`) and is fine today; a hand-written or future driver is unconstrained.
-**Cheapest fix is an assertion plus a CI case**, independent of whether the reported symptom is ever
-reproduced.
-
-#### Where the work divides
-
-* **Engine — `BpeVocab`**: an added-token pre-pass in `encode`, driven by a `tokenizer.ggml.token_type`
-  the exporter must start writing. Longest-match-first over the added set, applied before regex
-  pretokenization, which is what HF does.
-* **Exporter**: write `tokenizer.ggml.token_type`; set `extra_eos_tokens` for `causal_lm_export.py`
-  the way `speech_lm_export.py` already does.
-* **Chat template — the open design question, and it is the only one.** The checkpoint's template is a
-  Jinja string in `tokenizer_config.json`. Options, in ascending cost: (a) carry it as a KV and let the
-  HOST render it, which needs no Jinja in the engine and no per-model C++; (b) ship the rendered
-  role-tag strings as structured KV and have `text2text` assemble them; (c) a Jinja subset in the
-  engine, which ADR-014's reasoning argues against on the same grounds as per-model kernels.
-  **Decide this before writing anything**, and note that (a) and (b) both need the tokenizer fix first
-  — a rendered template is worthless if it cannot be encoded.
-
-#### Acceptance
-
-* `tokenize("<|im_start|>") == [1]` on SmolLM2 and `tokenize("<start_of_turn>") == [105]` on Gemma 3,
-  and `test_e2e_spm_byte_fallback_tokenizer` grows special-token cases against `AutoTokenizer.encode`
-  verbatim — the nine that exist are the reason this shipped, and they are the shape to copy.
-* Gemma 3 IT, correctly templated, **stops at `<end_of_turn>`** instead of running to the ceiling.
-* SmolLM2 IT, correctly templated, returns a non-empty answer.
-* Both models' answers compared against `transformers` on the same prompt through the checkpoint's own
-  `apply_chat_template` — the reference this item is defined against.
-* Round-trip preserved: `detokenize(tokenize(s)) == s` for text with and without special tokens.
-
-#### What NOT to do
-
-* **Do not add a `--chat-template` flag to `loom_cli` and call it done.** The tokenizer cannot encode
-  the result; the flag would produce exactly the output above.
-* **Do not special-case Gemma 3.** Every instruction-tuned checkpoint in the set has this, with
-  different markers — SmolLM2's are `<|im_start|>`/`<|im_end|>`, Gemma's are
-  `<start_of_turn>`/`<end_of_turn>`. It is one mechanism, not two models.
-* **Do not touch the decode loop for the runaway turns.** `max_new_tokens` is doing its job; the loop
-  is stopping where it was told to stop.
+Every causal-LM model card shipped the failing snippet (`build_model_cards.py`). The five IT cards now
+show `text2text.chat(...)`; the base-model cards keep `infer(...)`, which is the right call for them.
+**The re-exported GGUFs are not on the Hub** — that is the rc7 push, tracked in the hub with the three
+already-stale models.
 
 ### Grapheme text front-ends: the shape to generalize to
 
