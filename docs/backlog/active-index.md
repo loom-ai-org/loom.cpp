@@ -149,6 +149,15 @@ are not renumbered. New items continue the scheme.
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
+* [ ] **P4.26 — `ggml-0012` costs a Cortex-A72 2.4% on VITS.** [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md)'s
+  pattern a second time: worth 2.75x on x86 at whisper's `m = 1500`, checked on aarch64 **only at that
+  same shape**, and every VITS matmul takes the branch it changed. ABBA-interleaved, two rounds:
+  **1.032x and 1.016x**, ~27 ms per synthesis, attributed by profile to `CONV_2D` (+22.6 ms) and
+  `MUL_MAT` (+5.4 ms) — the convolution, because `ggml-0004`/`ggml-0009` lower through the same
+  `sgemm`. **Do not just gate it on `__aarch64__` without re-measuring x86**, and run whatever lands at
+  VITS's small `m` *and* `m = 1500` on both ISAs. It moved the README's Pi TTS cell 0.96x -> 0.93x; the
+  Pi's LM and ASR cells have **not** been re-measured and may carry it too.
+  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **P4.25 — ggml runs `TANH`/`SIGMOID` on one core, with a scalar `tanhf`.** The only thing in the
   VITS profile that is **not** against a roofline, and P4.16's re-measurement is what found it.
   `ggml_get_n_tasks` gives the cheap-unary list `n_tasks = 1` while `GELU`/`SILU` get `n_threads`, and
