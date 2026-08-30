@@ -329,6 +329,110 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     return lo + best;
 }
 
+// One token DRAWN from a row of a 2D f32 tensor, instead of the maximum of it (P4.24).
+//
+// **`argmax_tensor_row` when the settings are greedy, literally**, and that is the invariant rather
+// than an optimization: `temperature <= 0` and `top_k == 1` both mean "the highest-scoring id", so
+// this returns the same function's answer rather than a second implementation's. Two ways to get a
+// token out of one forward pass that can disagree is the failure this project keeps removing, and
+// P4.0.14 already retired one of them.
+//
+// The order is `transformers`' own processor order -- temperature, then top-k, then top-p, then a
+// multinomial draw -- because the reference this is defined against is `generate` under the
+// checkpoint's own `generation_config.json`. Any other order gives a different distribution from the
+// same three numbers.
+//
+// It reduces ON the tensor for the same reason its greedy sibling does: `run_subgraph` marshals every
+// output element into a Lua table and LuaJIT's array part tops out near 2^27 entries, so a 262144-wide
+// vocab overflows at ~512 prompt tokens (Retro-004). Sampling in Lua would reinstate that ceiling at
+// exactly the vocabulary size that found it.
+int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname, std::mt19937& rng,
+                           std::uniform_real_distribution<float>& uniform, float temperature,
+                           int64_t top_k, float top_p) {
+    if (temperature <= 0.0f || top_k == 1) {
+        return argmax_tensor_row(out, requested_row, fname);
+    }
+    if (out->type != GGML_TYPE_F32) {
+        throw Error(std::string(fname) + ": output must be f32");
+    }
+    const int64_t n_vocab = out->ne[0];
+    const int64_t n_rows = out->ne[1];
+    const int64_t row = requested_row < 0 ? n_rows - 1 : requested_row;
+    if (n_vocab <= 0 || row < 0 || row >= n_rows) {
+        throw Error(std::string(fname) + ": row " + std::to_string(requested_row) + " out of range for an "
+                     "output with " + std::to_string(n_rows) + " row(s) of width " + std::to_string(n_vocab));
+    }
+    if (top_k < 0) {
+        throw Error(std::string(fname) + ": top_k is " + std::to_string(top_k) + "; it is a count of "
+                     "candidates, and 0 means 'do not truncate'");
+    }
+    if (!(top_p > 0.0f) || top_p > 1.0f) {
+        throw Error(std::string(fname) + ": top_p is " + std::to_string(top_p) + "; it is a cumulative "
+                     "probability in (0, 1], and 1 means 'do not truncate'");
+    }
+
+    std::vector<float> logits(static_cast<size_t>(n_vocab));
+    ggml_backend_tensor_get(out, logits.data(), static_cast<size_t>(row) * out->nb[1],
+                             logits.size() * sizeof(float));
+
+    // Top-k first, on the LOGITS, because ordering by logit and ordering by probability are the same
+    // ordering -- softmax is monotone -- so the k candidates can be chosen before anything is
+    // exponentiated. That also bounds every step after this one by k rather than by the vocabulary,
+    // which for Gemma 3 is 64 against 262144.
+    std::vector<int64_t> candidates(static_cast<size_t>(n_vocab));
+    for (int64_t i = 0; i < n_vocab; ++i) candidates[static_cast<size_t>(i)] = i;
+    const auto by_logit_desc = [&](int64_t a, int64_t b) {
+        return logits[static_cast<size_t>(a)] > logits[static_cast<size_t>(b)];
+    };
+    if (top_k > 0 && top_k < n_vocab) {
+        std::partial_sort(candidates.begin(), candidates.begin() + top_k, candidates.end(), by_logit_desc);
+        candidates.resize(static_cast<size_t>(top_k));
+    } else {
+        std::sort(candidates.begin(), candidates.end(), by_logit_desc);
+    }
+
+    // Softmax over the survivors, shifted by the maximum -- which is `candidates[0]`, since they are
+    // sorted. Without the shift a logit around 30 (ordinary for a 262144-wide head at temperature 0.1)
+    // overflows expf.
+    const float max_logit = logits[static_cast<size_t>(candidates[0])] / temperature;
+    std::vector<float> probs(candidates.size());
+    float sum = 0.0f;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        probs[i] = std::exp(logits[static_cast<size_t>(candidates[i])] / temperature - max_logit);
+        sum += probs[i];
+    }
+
+    // Top-p: the shortest prefix of the descending order whose probability mass reaches `top_p`. At
+    // least one candidate always survives -- a threshold below the single most likely token's own
+    // probability would otherwise select nothing to draw from.
+    size_t keep = candidates.size();
+    if (top_p < 1.0f) {
+        float cumulative = 0.0f;
+        for (size_t i = 0; i < probs.size(); ++i) {
+            cumulative += probs[i] / sum;
+            if (cumulative >= top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+
+    // One draw from the SHARED stream, through the same distribution object `loom.uniform_array` uses
+    // -- so a script that seeds with `loom.seed_rng` gets a reproducible token, and so the draw-ORDER
+    // caveat that stream already documents covers this too.
+    float mass = 0.0f;
+    for (size_t i = 0; i < keep; ++i) mass += probs[i];
+    const float target = uniform(rng) * mass;
+    float running = 0.0f;
+    for (size_t i = 0; i < keep; ++i) {
+        running += probs[i];
+        if (running >= target) return candidates[i];
+    }
+    // Only reachable when floating-point accumulation lands the target past the total; the last
+    // candidate is the answer either way.
+    return candidates[keep - 1];
+}
+
 // The same reduction over EVERY row: one id per row, in row order. `argmax_tensor_row`'s plural.
 //
 // Exists because a frame-wise classifier reduces the whole tensor rather than one row of it, and the
@@ -796,6 +900,57 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
     }
 }
 
+// `loom.sample_row(module, row, options)` -> one token id drawn from `module`'s retained first output.
+//
+// `options` is `{temperature =, top_k =, top_p =, generation =}`, every entry optional. The defaults
+// are the greedy ones (`temperature = 0`, no truncation), so `loom.sample_row(m, r, {})` IS
+// `loom.argmax_row(m, r)` -- see `sample_tensor_row`, which returns that function's own answer rather
+// than reproducing it.
+//
+// **A table rather than three positional arguments** because the knobs are a set that grows: min-p and
+// the repetition penalties are not implemented (nothing in the fixture set asks for them) and adding
+// one later must not renumber what a shipped GGUF's driver already passes.
+//
+// Module form only, like `argmax_row_range` and for the same reason: the array form of `argmax_row`
+// exists for a driver that already holds the row in Lua, and a causal LM's row is exactly what must
+// never get there.
+int LoomLuaBridge::l_sample_row(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string module_name = luaL_checkstring(L, 1);
+        const auto requested_row = static_cast<int64_t>(luaL_checknumber(L, 2));
+        float temperature = 0.0f;
+        int64_t top_k = 0;
+        float top_p = 1.0f;
+        bool check_generation = false;
+        uint64_t generation = 0;
+        if (!lua_isnoneornil(L, 3)) {
+            luaL_checktype(L, 3, LUA_TTABLE);
+            const auto number_field = [&](const char* name, double fallback) {
+                lua_getfield(L, 3, name);
+                const double value = lua_isnil(L, -1) ? fallback : luaL_checknumber(L, -1);
+                lua_pop(L, 1);
+                return value;
+            };
+            temperature = static_cast<float>(number_field("temperature", 0.0));
+            top_k = static_cast<int64_t>(number_field("top_k", 0.0));
+            top_p = static_cast<float>(number_field("top_p", 1.0));
+            lua_getfield(L, 3, "generation");
+            check_generation = !lua_isnil(L, -1);
+            if (check_generation) generation = static_cast<uint64_t>(std::llround(luaL_checknumber(L, -1)));
+            lua_pop(L, 1);
+        }
+        OutputStore& store = retained_store(self, module_name);
+        if (check_generation) store.check_generation(generation, module_name);
+        lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
+            store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
+            temperature, top_k, top_p)));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.sample_row: %s", e.what());
+    }
+}
+
 // `loom.argmax_rows(module [, generation])` -> a flat array of one class id per ROW of `module`'s
 // retained first output, in row order. `loom.argmax_row`'s plural, and module-form only: the array form
 // of the singular exists because a flat Lua array has lost its shape, and a caller who already holds
@@ -821,6 +976,12 @@ int LoomLuaBridge::l_argmax_rows(lua_State* L) {
     }
 }
 
+void LoomLuaBridge::seed_rng(uint32_t seed) {
+    rng_.seed(seed);
+    normal_dist_.reset();
+    uniform_dist_.reset();
+}
+
 // Resets the bridge's own std::mt19937 -- the SAME engine every hand-written driver's own RNG uses
 // (VitsDriver/SupertonicDriver/MatchaDriver all construct `std::mt19937 rng(seed)` directly), so a
 // script that calls loom.seed_rng(seed) then loom.gaussian_array(n) in the SAME order a C++ driver
@@ -829,10 +990,7 @@ int LoomLuaBridge::l_argmax_rows(lua_State* L) {
 int LoomLuaBridge::l_seed_rng(lua_State* L) {
     try {
         auto* self = bridge_from_upvalue(L);
-        const auto seed = static_cast<uint32_t>(luaL_checknumber(L, 1));
-        self->rng_.seed(seed);
-        self->normal_dist_.reset();
-        self->uniform_dist_.reset();
+        self->seed_rng(static_cast<uint32_t>(luaL_checknumber(L, 1)));
         return 0;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.seed_rng: %s", e.what());
@@ -989,7 +1147,8 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"causal_mask", &LoomLuaBridge::l_causal_mask},   {"zero_mask", &LoomLuaBridge::l_zero_mask},
         {"argmax_row", &LoomLuaBridge::l_argmax_row},
         {"argmax_row_range", &LoomLuaBridge::l_argmax_row_range},
-        {"argmax_rows", &LoomLuaBridge::l_argmax_rows},   {"seed_rng", &LoomLuaBridge::l_seed_rng},
+        {"argmax_rows", &LoomLuaBridge::l_argmax_rows},
+        {"sample_row", &LoomLuaBridge::l_sample_row},     {"seed_rng", &LoomLuaBridge::l_seed_rng},
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},

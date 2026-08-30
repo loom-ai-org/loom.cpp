@@ -180,6 +180,15 @@ add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# --- P4.24: loom.sample_row, on the same toy fixture -- 6 classes wide, which is what makes "every
+#     class is eventually drawn" a statement a test can make.
+add_executable(test_sample_row ci/test_sample_row.cpp)
+target_link_libraries(test_sample_row PRIVATE loom::engine)
+target_compile_definitions(test_sample_row PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_sample_row COMMAND test_sample_row)
+set_tests_properties(test_sample_row PROPERTIES LABELS ci)
+set_tests_properties(test_sample_row PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 # Registered TWICE against one binary, differing only in ENVIRONMENT: `profile::enabled()` caches its
 # answer on first call, so a single process can only ever observe one of the two routes through
 # GraphBuilder::compute, and the branch being stuck in either direction is a real failure (one makes
