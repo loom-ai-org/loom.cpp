@@ -5,12 +5,21 @@
 
 #include <cstdio>
 
+#include <algorithm>
 #include <array>
 #include <climits>
 #include <unordered_map>
 
 namespace loom {
 namespace {
+
+// gguf's `TokenType`, the values `tokenizer.ggml.token_type` holds -- llama.cpp's own enum, and the
+// only two this vocabulary acts on. CONTROL is a marker the model emits or consumes rather than text;
+// USER_DEFINED is an added token that is not special (Gemma 3 declares 6408 of them, the whitespace
+// runs). NORMAL (1), UNKNOWN (2), UNUSED (5) and BYTE (6) are not named here because nothing branches
+// on them: see `added_to_id_`'s own comment for why BYTE in particular must NOT be splittable.
+constexpr int32_t kTokenTypeControl = 3;
+constexpr int32_t kTokenTypeUserDefined = 4;
 
 // GPT2's standard byte<->unicode-codepoint mapping (Radford et al.'s "byte-level BPE" trick, identical
 // across every GPT2/RoBERTa/GPT-NeoX/Qwen tokenizer -- not model-specific, a fixed universal convention):
@@ -438,6 +447,31 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
         vocab->merge_rank_.emplace(pair.substr(0, sep) + '\x01' + pair.substr(sep + 1), static_cast<int32_t>(rank));
     }
 
+    // The ADDED-token set, and the KV that carries it (P4.23). `tokenizer.ggml.token_type` is
+    // llama.cpp's own KV, parallel to `tokenizer.ggml.tokens`, holding gguf's `TokenType`. Absent for
+    // every GGUF exported before P4.23, and absent means the pre-pass below does nothing -- the file
+    // does not say which of its ids are added, and GUESSING (every `<...>`-looking piece, say) would
+    // make `encode` disagree with the reference tokenizer on ordinary text that happens to look like a
+    // marker. So an old file tokenizes exactly as it did, and a re-export is what turns this on.
+    if (model.has_kv("tokenizer.ggml.token_type")) {
+        vocab->token_type_ = model.kv_arr_i32("tokenizer.ggml.token_type");
+        if (vocab->token_type_.size() != vocab->tokens_.size()) {
+            throw LoadError("BpeVocab::load: tokenizer.ggml.token_type has " +
+                             std::to_string(vocab->token_type_.size()) + " entries but there are " +
+                             std::to_string(vocab->tokens_.size()) + " tokens -- the two arrays are "
+                             "parallel by definition");
+        }
+        for (size_t i = 0; i < vocab->token_type_.size(); ++i) {
+            const int32_t type = vocab->token_type_[i];
+            if (type != kTokenTypeControl && type != kTokenTypeUserDefined) continue;
+            const std::string& piece = vocab->tokens_[i];
+            if (piece.empty()) continue;
+            vocab->added_to_id_.emplace(piece, static_cast<int32_t>(i));
+            vocab->max_added_len_ = std::max(vocab->max_added_len_, piece.size());
+            vocab->added_first_byte_[static_cast<unsigned char>(piece[0])] = true;
+        }
+    }
+
     vocab->bos_id_ = model.kv_i32("tokenizer.ggml.bos_token_id", -1);
     vocab->eos_id_ = model.kv_i32("tokenizer.ggml.eos_token_id", -1);
     vocab->sep_id_ = model.kv_i32("tokenizer.ggml.seperator_token_id", -1); // llama.cpp's own (misspelled) KV name, kept verbatim
@@ -537,7 +571,69 @@ void BpeVocab::bpe_merge(std::vector<std::string>& pieces) const {
 // U+2581 LOWER ONE EIGHTH BLOCK, SentencePiece's space marker.
 static const char* kSpmSpace = "\xe2\x96\x81";
 
+int32_t BpeVocab::added_token_at(const std::string& text, size_t pos, size_t* len) const {
+    if (added_to_id_.empty() || !added_first_byte_[static_cast<unsigned char>(text[pos])]) return -1;
+    // LONGEST match, which is the whole reason this is a scan and not a lookup: `<|im_start|>` and
+    // `<|im_start|>x` can both be added tokens, and HF's own AddedVocabulary resolves that overlap the
+    // same way. Bounded by `max_added_len_` rather than by the rest of the string, so a long document
+    // costs the same per position as a short one.
+    const size_t limit = std::min(max_added_len_, text.size() - pos);
+    for (size_t n = limit; n >= 1; --n) {
+        const auto it = added_to_id_.find(text.substr(pos, n));
+        if (it != added_to_id_.end()) {
+            *len = n;
+            return it->second;
+        }
+    }
+    return -1;
+}
+
+bool BpeVocab::is_control(int32_t id) const {
+    if (id < 0 || static_cast<size_t>(id) >= token_type_.size()) return false;
+    return token_type_[static_cast<size_t>(id)] == kTokenTypeControl;
+}
+
 std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
+    std::vector<int32_t> ids;
+    if (add_bos_token_ && bos_id_ >= 0) {
+        ids.push_back(bos_id_);
+    }
+    // ADDED TOKENS FIRST, on the RAW bytes, before the normalizer and the pretokenizer (P4.23). This is
+    // HF's own order -- `AddedVocabulary::extract_and_normalize` splits the input on the added set and
+    // only then normalizes each remaining segment -- and it is what makes a marker's id emittable at
+    // all: run through BPE, `<|im_start|>` merges into seven ordinary pieces, because its spelling is in
+    // the vocabulary like any other entry and nothing marks it as atomic.
+    //
+    // On the raw bytes and not the normalized ones because every added token these checkpoints declare
+    // is `normalized: false` -- Gemma 3's `\n\n\n` matches literal newlines, and its `\u2581\u2581`
+    // entry deliberately does NOT match two literal spaces (HF reaches that id through the merges after
+    // normalization instead, and so does the segment path below).
+    size_t segment_begin = 0;
+    for (size_t i = 0; i < text.size();) {
+        size_t match_len = 0;
+        const int32_t added = added_token_at(text, i, &match_len);
+        if (added < 0) {
+            ++i;
+            continue;
+        }
+        encode_segment(text.substr(segment_begin, i - segment_begin), ids);
+        ids.push_back(added);
+        i += match_len;
+        segment_begin = i;
+    }
+    encode_segment(text.substr(segment_begin), ids);
+
+    if (add_sep_token_ && sep_id_ >= 0) {
+        ids.push_back(sep_id_);
+    }
+    return ids;
+}
+
+void BpeVocab::encode_segment(const std::string& text, std::vector<int32_t>& ids) const {
+    // A segment between two adjacent added tokens is empty, and an empty segment is nothing at all --
+    // not a chunk, not a piece, not a byte-fallback candidate.
+    if (text.empty()) return;
+
     // NFC is deliberately skipped for the SPM family: its HF normalizer is a bare
     // Replace(" ", "\u2581") and nothing else, so composing decomposed sequences here would tokenize
     // differently from the reference model on exactly the inputs where it matters.
@@ -546,10 +642,6 @@ std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
     const std::vector<std::string> chunks = pretokenize(normalized);
     const auto& enc = byte_encoder();
 
-    std::vector<int32_t> ids;
-    if (add_bos_token_ && bos_id_ >= 0) {
-        ids.push_back(bos_id_);
-    }
     for (const std::string& chunk : chunks) {
         std::vector<std::string> pieces;
         if (shape_ == BpeShape::kSpmByteFallback) {
@@ -589,10 +681,6 @@ std::vector<int32_t> BpeVocab::encode(const std::string& text) const {
                              "(every single byte-mapped character should be a base vocab entry)");
         }
     }
-    if (add_sep_token_ && sep_id_ >= 0) {
-        ids.push_back(sep_id_);
-    }
-    return ids;
 }
 
 std::string BpeVocab::decode(const std::vector<int32_t>& ids) const {
@@ -624,6 +712,16 @@ std::string BpeVocab::decode(const std::vector<int32_t>& ids) const {
     std::string raw;
     for (int32_t id : ids) {
         const std::string& piece = id_to_piece(id);
+        // An ADDED token's piece is its RAW content, not a byte-level spelling -- `write_bpe_vocab`
+        // writes `tokens[id] = added_tokens[...]["content"]` verbatim -- so it must not go through the
+        // byte decoder. For `<|im_end|>` the two agree, because printable ASCII maps to itself; for one
+        // containing a newline they do not, and the byte map has no key for U+000A at all, so every
+        // such character would be silently DROPPED. Reachable only for a file carrying
+        // `tokenizer.ggml.token_type`, so no pre-P4.23 GGUF's output moves.
+        if (!added_to_id_.empty() && added_to_id_.count(piece) != 0) {
+            raw += piece;
+            continue;
+        }
         for (char32_t cp : utf8_decode(piece)) {
             const auto it = dec.find(cp);
             if (it != dec.end()) raw.push_back(static_cast<char>(it->second));

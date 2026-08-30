@@ -54,6 +54,7 @@
 #include "loom/core/phoneme_vocab.h"
 #include "loom/core/unicode.h"
 #include "loom/core/supertonic_text_vectorizer.h"
+#include "loom/core/chat_template.h"
 #include "loom/core/ctc_decode.h"
 #include "loom/core/generation.h"
 // The two end-to-end task loops. Per-TASK like the decoders above, and here for the same reason the

@@ -13,6 +13,11 @@
 // (one token each, because the vocab has no multi-digit merges rather than because anything splits
 // them), and the empty string, which must still emit BOS alone.
 //
+// The second group is P4.23's: ADDED tokens, which `encode` could not emit at all until the file
+// started carrying `tokenizer.ggml.token_type`. **A GGUF exported before that has none of them and
+// will fail this test**, which is correct -- the fix is a re-export, and the whole point of the item is
+// that the two halves ship together.
+//
 // Set LOOM_SPM_TOKENIZER_GGUF to a GGUF exported from /home/flavio/Dev/models/gemma-3-270m-it.
 
 #include "test_util.h"
@@ -67,6 +72,28 @@ int main() {
         {"1234567890",
          {2, 236770, 236778, 236800, 236812, 236810, 236825, 236832, 236828, 236819, 236771}},
         {"", {2}},
+        // --- P4.23. None of the nine cases above contains a SPECIAL token, which is exactly how a
+        // correct-looking tokenizer shipped unable to encode a chat turn: `<start_of_turn>` came back
+        // as eight literal ids. Same oracle, same `AutoTokenizer.encode`, verbatim.
+        {"<start_of_turn>", {2, 105}},
+        {"<end_of_turn>", {2, 106}},
+        // The whole templated turn, which is what the item is actually about.
+        {"<start_of_turn>user\nWho discovered Brazil?<end_of_turn>\n<start_of_turn>model\n",
+         {2, 105, 2364, 107, 15938, 11788, 14600, 236881, 106, 107, 105, 4368, 107}},
+        // A marker inside ordinary text: the words either side still go through BPE, and the marker
+        // does not merge with them.
+        {"text <end_of_turn> more", {2, 1005, 236743, 106, 919}},
+        // A NON-special added token. Gemma 3 declares 6408 of these -- every whitespace run -- and HF
+        // splits on them like any other added token, so `\n\n\n` is ONE id (109). A pre-pass that only
+        // knew about markers would disagree with the reference tokenizer on ordinary prose.
+        {"a\n\n\nb", {2, 236746, 109, 236763}},
+        {"<unused42>", {2, 48}},
+        // And the two cases the added set must NOT swallow. `<bos>` is an added token, so it encodes as
+        // its own id -- twice here, because `add_bos_token` prepends one as well. `<0x41>` is a BYTE
+        // entry, whose whole job is to be reached by FALLBACK from a character with no entry: treating
+        // it as splittable would turn someone's literal text into byte 0x41.
+        {"<bos>", {2, 2}},
+        {"<0x41>", {2, 236820, 236771, 236781, 236812, 236770, 236813}},
     };
 
     for (const Case& c : cases) {
