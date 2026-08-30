@@ -124,50 +124,15 @@ are not renumbered. New items continue the scheme.
   pins `~=4.53`. It is written nowhere in the repo, so the next person meets four red tests with no
   way to tell. Put it in loom-exporter's README, and note that piper is ~3x slower to run them
   (4m12s against 1m21s for the same two files).
-* [ ] **P4.24 — the engine cannot sample: `argmax_row` is the only decode rule.** No temperature,
-  top-k, top-p or multinomial anywhere in `src/` or `include/`, so a checkpoint whose own
-  `generation_config.json` says `"do_sample": true` (gemma-3-270m-it: `top_k 64, top_p 0.95`) is run in
-  a mode its authors did not choose. Split from P4.23 because it is a **capability gap, not a bug**,
-  and it is the half of that symptom which is not about tokenization — greedy is what makes a missing
-  chat template a repetition LOOP rather than just a wrong answer. **The design is already constrained:**
-  a sampler must be a bridge builtin reducing ON the tensor, because marshalling a 262144-wide vocab
-  into Lua overflows LuaJIT's array part at ~512 prompt tokens ([Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md),
-  and it is why `argmax_row` exists) — and the RNG half already exists (`rng_` + `loom.seed_rng`,
-  shared with `gaussian_array`). Temperature+top-k+top-p covers the whole fixture set; exactly one
-  model needs any of it. **Greedy stays the default** or every byte-identity baseline moves for nothing.
-  → [Epic-06 §4](../epics/epic-06-high-level-api-and-hosts.md)
-* [ ] **P4.23 — an instruction-tuned causal LM cannot be prompted correctly.** `detokenize` knows a
-  checkpoint's special tokens and **`tokenize` cannot produce them** — `tokenize("<|im_start|>")` is
-  seven literal ids where it should be `[1]`, `tokenize("<start_of_turn>")` seven where it should be
-  `[105]` — so a chat template is not un-applied, it is **unrepresentable**. `BpeVocab::encode` has no
-  added-token pre-pass (HF splits on added tokens before BPE) and the exporter never writes
-  `tokenizer.ggml.token_type`, so the file does not carry which ids are special. Reproduced:
-  **Gemma 3 270M IT runs to the token ceiling emitting turn after turn** (also declares
-  `eos_token_id = 1` while an IT turn ends on `<end_of_turn>` = 106 — `GenerationLoop.extra_eos_tokens`
-  exists and is set only by `speech_lm_export.py`, never by `causal_lm_export.py`), and **SmolLM2 360M
-  IT returns the empty string** because its first token is its own `<|im_end|>` and `strip_eos` drops
-  it. *The reported "repeated input" is REPRODUCED and diagnosed:* the model card's own snippet,
-  `text2text.infer("The capital of France is", 14)`, returns
-  `' Paris.\n\nThe capital of France is Paris.\n\nThe capital of'` — **generated, not echoed** (the ids
-  do not start with the prompt but re-emit it from position 3). Two causes beside the template, both
-  stated by the checkpoint's own `generation_config.json`: **`eos_token_id` is the LIST `[1, 106]`**
-  (the causal-LM export reads the tokenizer's single `eos_token` instead, while
-  `granite_speech_export.py:437` already reads `generation_config.eos_token_id`), and
-  **`do_sample: true`** against an engine with **no sampling at all** — `argmax_row` only, no
-  temperature/top-k/top-p anywhere in `src/` or `include/`. Greedy on a 270M model is what makes it a
-  repetition LOOP. The cards ship the failing example, so regenerating them is in scope. NB
-  `text_generate.cpp`'s list branch does trust the driver's return with no prompt check, against the
-  header's claim that both shapes are normalised. **The chat template is the one open design question**
-  (host-rendered KV vs structured role tags vs Jinja in the engine) and the tokenizer fix comes first
-  either way. → [Epic-07 §4](../epics/epic-07-text-frontends-and-tokenizers.md)
-* [ ] **P4.18 release chore — the refreshed whisper GGUF is not on the Hub.** The export changed
-  (the decoder's loop-invariant V transpose, 2026-08-29), so the local fixture
-  (`$LOOM_FIXTURES/whisper_mil.gguf`, `md5 7d921b9a…`) is ahead of the published one and the README's
-  ASR column describes the rc6 artifact. rc6 shipped without it; **it lands in rc7**, alongside the
-  three already-stale Hub models (whisper, vits, matcha) — so it is one push, not four.
-  *Everything else in P4.18 is closed:* the per-shape encoder re-measure and the README's ASR column
-  (item A), the V transpose (item B, **1.106x**), and `QK^T`'s mechanism (item C — the counters found
-  it; see P4.21). [Epic-05 §2](../epics/epic-05-edge-performance.md) has all three.
+* [ ] **The rc7 Hub push — now nine models, not four.** The refreshed whisper GGUF is not on the Hub
+  (the decoder's loop-invariant V transpose, 2026-08-29), alongside the three already-stale models
+  (whisper, vits, matcha) — and **P4.23 re-exported all five causal LMs**, whose published artifacts
+  now tokenize a marker as seven literal ids and carry no chat template. The five cards are already
+  regenerated in `../hf-models/` and show `text2text.chat(...)`; the GGUFs beside them are not.
+  One push, and it is the only release chore left: *everything else in P4.18 is closed* — the
+  per-shape encoder re-measure and the README's ASR column (item A), the V transpose (item B,
+  **1.106x**), and `QK^T`'s mechanism (item C — the counters found it; see P4.21).
+  [Epic-05 §2](../epics/epic-05-edge-performance.md) has all three.
 * [ ] **`ldc` alignment is the last of the `QK^T` thread, and it is small.** After P4.22, `m = 1500`
   reaches 15.0 ms where a padded `m = 1504` reaches 10.9 — 1500 floats is 6000 bytes and `6000 % 64 =
   16`, so a job's full-line store still straddles two lines on odd columns. Closing it means padding
@@ -183,11 +148,6 @@ are not renumbered. New items continue the scheme.
   medians.** Not a new measurement idea — it is [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md)'s
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
-  → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
-  carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
-  LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
-  somewhere to put ShortConv state, which is a real design question and not a one-line change.
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
 * [ ] **P4.16 — re-measure the convolution table, then decide if anything is left.** **The premise is
   superseded, so do not read the old table as a ranking.** It was scoped at **1.24x** of onnxruntime on
@@ -251,15 +211,13 @@ are not renumbered. New items continue the scheme.
   Qwen3-TTS is not one. *Context: [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md)*
 * [ ] **Remaining BPE pretokenizer families** beyond the ~40 in `pre_spec_table()` (CJK-script splitters,
   case-transition shapes, `byte_encode=false` SPM-style families). Each raises a named error rather than
-  mis-tokenizing — bounded; add one when a real model needs it. **Distinct from P4.23**, which is about
-  ADDED tokens (`<|im_start|>` and friends, which `encode` cannot emit at all) rather than pretokenizer
-  regexes — but both land in `bpe_vocab.cpp`, so check that item before opening this one.
+  mis-tokenizing — bounded; add one when a real model needs it. **Distinct from the added-token pre-pass** P4.23
+  shipped (`<|im_start|>` and friends, which `encode` could not emit at all) rather than pretokenizer
+  regexes — but both land in `bpe_vocab.cpp`, so read
+  [Epic-07 §4](../epics/epic-07-text-frontends-and-tokenizers.md) before opening this one.
 
 ## Host API
 
-* [ ] **Sampling is greedy argmax only** — **now scoped as P4.24** (above, under Edge performance):
-  the constraint that decides the design, the sizing against the checkpoints, and the reason greedy must
-  stay the default are all there. → [Epic-06 §4](../epics/epic-06-high-level-api-and-hosts.md)
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
@@ -269,8 +227,9 @@ are not renumbered. New items continue the scheme.
   loader searching for `.so` where CMake wrote `.dylib`) is shared with P4.11.
   → [Epic-08 §4](../epics/epic-08-packaging-and-release.md)
 * [ ] **Linux on ARM builds** — the platform that matters most for an engine whose stated target is edge
-  devices.
-* [ ] **The HF push of the outstanding re-exports.**
+  devices. 
+* [ ] **The rc7 Hub push** — tracked once, under Engine — performance, with the list of what is stale
+  and why.
 
 ## Standing scope limitations
 

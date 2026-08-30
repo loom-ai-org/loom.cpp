@@ -23,7 +23,8 @@ copies hosts wrote had already drifted apart from each other:
 
 | | |
 |---|---|
-| `loom::text::generate` | the causal-LM decode loop, both driver shapes, the file's own stop token |
+| `loom::text::generate` | the causal-LM decode loop, both driver shapes, the file's own stop tokens and its own decode rule |
+| `loom::ChatTemplate` | a conversation to the prompt text a checkpoint was tuned on, from role tags the exporter reduced its own Jinja to |
 | `loom::audio::transcribe` | long-form ASR: windowing, segment splitting, and the seek to where the model closed its last segment |
 | `loom::Session` | topologies registered and caches attached, in an order that cannot dangle |
 
