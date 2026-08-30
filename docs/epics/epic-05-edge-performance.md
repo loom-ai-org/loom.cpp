@@ -2688,43 +2688,105 @@ The cell has been updated. **The Pi's LM and ASR cells were not re-measured here
 same regression — whisper's `m = 1500` is the shape P4.22 *did* check, so ASR is the least likely to
 have moved, but that is a prediction and not a measurement.
 
-### P4.25 — the unary gate is single-threaded and scalar, by ggml's construction — SCOPED, NOT STARTED
+### P4.25 — thread the unary gate — MEASURED OUT, CLOSED. The op is 3.92x; the model is not.
 
-**Found by P4.16's re-measurement, and it is the only thing in the VITS profile that is not against a
-roofline.** Everything else in that model is at the machine's limit: the convolution at ~22 of ~25
-GFLOP/s, the big elementwise ops at 98-99% of a measured 3.64 GB/s bus. This is not.
+**Executed 2026-08-30, and the patch is NOT carried.** The mechanism was real and every prediction it
+made about the op held. It did not survive contact with the model, on any of three machines, and the
+gap between those two statements is the useful part of this entry.
 
-**One sentence.** `ggml_get_n_tasks` hands `n_tasks = 1` to `TANH`, `SIGMOID`, `EXP`, `RELU` and
-`LEAKY_RELU` while `GELU`/`GELU_ERF`/`SILU` get `n_threads`, and `ggml_vec_tanh_f32` /
-`ggml_vec_sigmoid_f32` are scalar `tanhf` / `1/(1+expf(-x))` loops — so VITS's WN gate runs its 17
-`TANH` and 16 `SIGMOID` over 220 KB tensors at 26 cycles per element on one core while three sit idle.
+**What was built.** One patch to `ggml_get_n_tasks`, in two independent halves:
 
-| | |
-|---|---|
-| where | `ggml-cpu.c:2271` (`n_tasks`), `ggml-cpu/vec.h:909` and `:936` (the loops) |
-| cost | **30.4 ms per synthesis at one thread, 30.4 ms at four** — the 32 of them at `[286, 192]`, 0.95 ms each |
-| share | 2.7% of a 1137 ms wall; **39% of the whole 78 ms gap to onnxruntime** |
-| bound by | neither bandwidth (0.46 GB/s) nor cores (1.00x over four) — the scalar transcendental |
-| levers | two, independent and both untried: give it `n_tasks = n_threads`; give it a SIMD path |
+* **the list** — move `TANH`, `SIGMOID`, `EXP`, `ELU`, `SOFTPLUS`, `EXPM1` from `n_tasks = 1` to
+  `n_threads`, leaving the arithmetic unaries (`abs`, `sgn`, `neg`, `step`, `relu`, `hardswish`,
+  `hardsigmoid`, the rounding family) and `GGML_OP_LEAKY_RELU` alone;
+* **the cap** — `n_tasks = MIN(n_threads, ggml_nrows(node))`, applied to every unary including the
+  ones upstream already threads.
 
-**Do the thread count first, and separately.** It is a one-line change to a switch, it needs no new
-arithmetic, and it bounds the other half: if 30.4 ms does not fall to ~8 ms on four cores then the op
-is not core-bound and the SIMD half is the only lever left. Both must be measured on **more than one
-thread** — a single-threaded instruction count is blind to exactly the property being changed
-([Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md)).
+Both are gone from `cmake/patches/`. `scripts/bench17.c` and `scripts/bench18.cpp` stay, because a
+negative result nobody can re-run is a rumour.
 
-**Two warnings from this thread's own record, both directly applicable.** `ggml-0010` already
-vectorised GELU-erf, so the SIMD half has a template and a precedent — but Retro-012's `ggml_v_expf`
-entry is the case where a real 1.1-1.4x on the transcendental turned out to have **no accessible
-headroom** in the op around it, and it took two corrections to establish that. And the accuracy
-question is not free: glibc's `tanhf` and `expf` are sub-ulp, a SIMD approximation is not, and the
-gate suite compares fp32 exactly. **Measure the thread lever, which has no accuracy question at all,
-before opening the one that does.**
+#### The op-level case, which is not in doubt
 
-**Reaches further than VITS.** Every WN-style flow (VITS, and StyleTTS2's decoder) is built from this
-gate, and `LEAKY_RELU` is on the same `n_tasks = 1` list — though there the fix is worthless, because
-its tensors are 8.9 MB and already at the bus roofline. The lever only exists where the tensor is
-cache-resident, which is what makes the 220 KB gate the case worth doing.
+`scripts/bench17.c` (raw loops, both sizes a real model has, four threads against one, Cortex-A72):
+
+| | tanh | sigmoid | exp | elu | expm1 | softplus | relu | neg |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 220 KB, L2-resident | 3.98x | 3.98x | 3.98x | 3.96x | 3.99x | 3.98x | 1.23x | 1.31x |
+| 9.4 MB, streaming | 3.99x | 4.00x | 4.00x | 3.86x | 3.99x | 3.99x | **0.77x** | **0.77x** |
+
+A clean class split, and it justifies the list exactly: a transcendental unary is a libm call per
+element and compute-bound at any size; an arithmetic one is memory-bound and, on this board, threading
+it is a 1.3x **loss**, because one core already saturates the bus (`scripts/membw.c`: 4.56 GB/s at one
+thread, 3.64 at four). That is also why `LEAKY_RELU` was left alone.
+
+`scripts/bench18.cpp` runs the same question through **ggml's own threadpool**, 256 nodes in one graph
+so the pool wakes once the way a real graph wakes it. At VITS's gate shape `[286, 192]`, four threads
+against one on the Pi: **1107.8 -> 282.7 us, 3.92x.** The model issues 32 of those per synthesis, so
+the arithmetic says **~26 ms of a 1130 ms wall, 2.3%**.
+
+#### The model-level result, which is nothing
+
+Twelve **paired ABBA rounds** — the ratio recorded per round, both arms the same harness, both Release,
+same ggml commit and compiler, cooled to a fixed 60 C before every arm:
+
+| board | rounds | median | mean | p10 | p90 |
+|---|---:|---:|---:|---:|---:|
+| Raspberry Pi 4B, 4 threads | 12 | **1.0048** | 1.0028 | 0.9952 | 1.0099 |
+| Ryzen 3 3250U, 4 threads (2 physical) | 6 | **0.9846** | 0.9867 | 0.9667 | 1.0123 |
+
+**0.5% on one board, -1.5% on the other, both p-ranges straddling 1.0.** By this thread's own
+standard — [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), "a p10 that
+crosses 1.0 is weak, not 1.16x" — that is not a result. The precedent that *did* ship on a weak
+resolution was P4.22 at **1.16x**; this is 1.005x.
+
+Output is **bit-identical** throughout (`fnv1a` of the audio, now printed by `bench_vits_loom`): the
+same digest at 1, 2 and 4 threads and across both builds, on both ISAs. `ctest -L ci` 74/74 and
+`-L gate` 83/83 with the patch applied. Nothing here is a correctness question.
+
+#### Two things it found on the way, and they are why the entry is worth reading
+
+**1. ggml's unary ops split over ROWS, so a one-row tensor is all barrier and no split.**
+`apply_unary_op` takes its slice from `get_thread_range` (`ggml-cpu/common.h`), which divides
+`ggml_nrows(src0)` by `nth`. At `nrows = 1`, thread 0 gets everything and threads 1..n-1 get an empty
+range. The first cut of the patch had no cap, and **Kokoro — 870 `UNARY [256, 1]` nodes per synthesis,
+a per-frame block — went 5.8 -> 179.9 ms on that bucket, 31x.** `bench18`'s row sweep is the shape of
+it (`ne0 = 256`, Pi, four threads): `nrows` 1 / 2 / 3 / 4 / 8 / 16 / 64 / 192 gives **1.00 / 1.75 /
+2.36 / 2.91 / 3.36 / 3.69 / 3.89 / 3.92x**. One row is the cliff; two rows already win. The cap fixes
+it and is provably never worse — a thread with an empty range does no work and still costs its share
+of the barrier — but **nothing shipped hits the cliff on an op upstream already threads** (the only
+`UNARY` bucket in whisper, Qwen3-0.6B, LFM2 and the NeMo encoders is `[3072, 1500]`), so the cap alone
+buys nothing today either. It is a real latent bug in ggml and it is written up in `UPSTREAM.md`.
+
+**2. A wide machine does not rescue it, and adds a second floor.** At 24 threads on a Core Ultra 9
+285K (measured through `SILU`, which upstream already threads, so it needs no patch) the same gate
+shape gives **5.58x** — a bigger multiplier, and still worthless end to end, because that machine runs
+the whole node in 28 us where the Pi takes 1108. The 32 gate nodes are ~0.9 ms of a 65-120 ms
+synthesis there: ~1% before threading, ~0.7% after. **And 24 threads impose a hard ~1.9 us floor per
+node**, so on that box threading is a LOSS below ~16 K elements — which VITS's own `UNARY [100, 192]`
+(19 200) and Matcha's `[40, 256]` and `[20, 256]` (10 240, 5 120) sit at or under. A correct patch
+therefore needs a work floor as well as a row cap, and the floor is machine-dependent (1.9 us at 24
+threads against ~0.3 us at 4). That is a tuned constant in a carried patch, for ~0.5%.
+
+#### The reusable lesson
+
+**An isolated op measurement is an upper bound on what a model will see, never an estimate of it.**
+Every number above the fold is right: the op really is 3.92x, the class split really is what
+`bench17` says, the 26 ms really is what 32 nodes at 825 us each comes to. The model still moved
+0.5%. Whatever absorbs it lives *between* the nodes rather than in them, and ggml's threadpool
+sleeping between two multi-threaded nodes is the named suspect —
+[Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md) is that exact mechanism from
+the libgomp side. **Nobody chased it, and it is the thing to chase if this is ever reopened**, because
+it would be worth far more than this item was: it is a tax on every threaded node in every model, not
+on 32 of them in one.
+
+#### What would reopen this
+
+A model where the transcendental unaries are a much larger share of the wall than VITS's 2.7% —
+StyleTTS2 and Kokoro have 73 such nodes against VITS's 33, and neither was measured end to end here
+because their fixtures are not on the reference board. **Measure the share first** (`$LOOM_PROFILE`,
+one thread) and only build if it is worth more than five percent; and if it is built, it needs the row
+cap, a work floor, and a number from **every** ISA and thread count it is enabled for — the three
+machines here disagreed in sign, not just in magnitude.
 
 ### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED
 

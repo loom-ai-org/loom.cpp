@@ -89,6 +89,7 @@ Code comments cite items by their `P`-number, and those numbers are unchanged.
 | P4.15c, chain tiling, im2col, "what not to re-propose" | [Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md) |
 | P4.15d / P4.15f — the text encoder, twice then once | [Retro-014](docs/retros/retro-014-the-text-encoder-was-in-the-graph-twice.md) |
 | P4.16 — the convolution gap, re-measured and closed | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md) |
+| P4.25 — threading the unary gate, measured out | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md) |
 | P4.13 — 2-D conv kernels for Q4_0 | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [ADR-017](docs/adrs/adr-017-no-k-quants.md) |
 | P5.0 — the high-level API | [ADR-013](docs/adrs/adr-013-one-door-per-task.md) · [Epic-06](docs/epics/epic-06-high-level-api-and-hosts.md) |
 | Performance optimizations designed but not implemented | [Backlog → Engine performance](docs/backlog/active-index.md#engine--performance) |

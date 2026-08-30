@@ -18,10 +18,21 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+// The audio's identity, printed beside the timing, so a SCHEDULING change (a thread count, a job
+// split, a fusion) can be shown not to have moved a bit rather than argued not to have. Two runs that
+// disagree here are not two measurements of the same thing, whatever their sample counts say.
+static uint64_t fnv1a(const std::vector<double>& v) {
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(v.data());
+    for (size_t i = 0; i < v.size() * sizeof(double); ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: %s <dir> [nrun]\n", argv[0]); return 2; }
@@ -49,6 +60,7 @@ int main(int argc, char** argv) {
                            loom::GraphTopology::parse(model->topology_json("flow_vocoder")));
     bridge.load_script(model->kv_str("model.driver_script"));
 
+    std::vector<double> last_audio;
     auto once = [&]() {
         loom::LoomLuaBridge::Value r = bridge.call("infer", {
             {"token_ids", token_ids},
@@ -57,10 +69,12 @@ int main(int argc, char** argv) {
             {"length_scale", 1.0},         //                 scales[1]
             {"noise_scale_w", 0.0},        //                 scales[2]
         });
-        return std::get<std::vector<double>>(r).size();
+        last_audio = std::get<std::vector<double>>(r);
+        return last_audio.size();
     };
 
     const size_t n_samples = once();        // warm: first call builds the graphs
+    const uint64_t digest = fnv1a(last_audio);
     std::vector<double> ts;
     for (int i = 0; i < nrun; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -68,7 +82,8 @@ int main(int argc, char** argv) {
         ts.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     std::sort(ts.begin(), ts.end());
-    std::printf("loom   vits  samples=%zu  median %.4f s  min %.4f s  (n=%d)\n",
-                n_samples, ts[ts.size()/2], ts.front(), nrun);
+    std::printf("loom   vits  samples=%zu  fnv1a=%016llx  median %.4f s  min %.4f s  (n=%d)\n",
+                n_samples, static_cast<unsigned long long>(digest),
+                ts[ts.size()/2], ts.front(), nrun);
     return 0;
 }
