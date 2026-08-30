@@ -26,6 +26,7 @@
 #include "loom/core/lua_bridge.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,13 +41,39 @@ struct GenerateOptions {
     // the checkpoint says it should rather than where a host's default happened to land.
     int32_t eos_token = kEosFromFile;
     // Drop the stop token from the returned ids. It is a control token rather than text, and a caller
-    // detokenizing the result would otherwise get its literal spelling on the end.
+    // detokenizing the result would otherwise get its literal spelling on the end. Applies to ANY id in
+    // the checkpoint's stop set, not only `eos_token`: an instruction-tuned turn ends on
+    // `<end_of_turn>`, and stripping only `<eos>` leaves that marker's spelling in the answer.
     bool strip_eos = true;
+
+    // The decode rule (P4.24), unset by default -- which means "use what the file declared", and a file
+    // declaring nothing means GREEDY. That default is not conservatism: a sampled default would move
+    // every gate baseline that compares tokens or audio against a reference, and none of those
+    // movements would mean anything.
+    //
+    // These reach the DRIVER, as `inputs.temperature` and friends, because the decode loop for a
+    // KV-cached model is the driver's own -- a sampler applied in the loop below would reach only the
+    // one-token driver shape and would silently do nothing for every model that matters here.
+    std::optional<float> temperature;
+    std::optional<int32_t> top_k;
+    std::optional<float> top_p;
+    // Seeds the bridge's RNG before the run, so a sampled generation is reproducible. Unset leaves the
+    // stream where it was, which is what lets two calls in one session differ.
+    std::optional<uint32_t> seed;
+
     // Passed through to the driver verbatim, for a model whose `infer` takes more than tokens.
     std::unordered_map<std::string, LoomLuaBridge::Value> extra_inputs;
 
     static constexpr int32_t kEosFromFile = -2;
 };
+
+// Every id that ends generation for `model`: `tokenizer.ggml.eos_token_ids` when the file carries the
+// checkpoint's full set (P4.23), and its single `tokenizer.ggml.eos_token_id` otherwise.
+//
+// Exists as its own function because three callers need the same answer -- `generate` for its stop and
+// its strip, and a host deciding whether a returned id is text. gemma-3-270m-it declares `[1, 106]`:
+// `<eos>`, which its base model emits, and `<end_of_turn>`, which every chat turn ends on.
+std::vector<int32_t> eos_token_ids(const GgufModel& model);
 
 // Runs the model's driver until it stops or `max_new_tokens` are produced. Returns the GENERATED ids
 // only, never the prompt -- both driver shapes are normalised to that here, since a caller who has the

@@ -6,7 +6,18 @@
     "LOOM_CAUSAL_LM_KV_GGUF": {
       "path": "causal_lm_kv.gguf",
       "used_by": [
-        "test_e2e_causal_lm_infer_with_past"
+        "test_e2e_causal_lm_infer_with_past",
+        "test_e2e_device_parity_kv"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_CHAT_LM_GGUF": {
+      "path": "chat_lm.gguf",
+      "used_by": [
+        "test_e2e_chat_generation"
       ],
       "sha256": null,
       "bytes": null,
@@ -40,6 +51,7 @@
       "used_by": [
         "test_e2e_conformer_ctc_lua_driver",
         "test_e2e_conformer_ctc_mil_export",
+        "test_e2e_device_parity",
         "test_vocab"
       ],
       "sha256": null,
@@ -584,6 +596,7 @@
         "test_e2e_supertonic_mil_decoder",
         "test_e2e_supertonic_mil_dp",
         "test_e2e_supertonic_mil_lua_driver",
+        "test_e2e_supertonic_mil_real_text",
         "test_e2e_supertonic_mil_ttl_text",
         "test_e2e_supertonic_mil_vfe"
       ],
@@ -596,6 +609,7 @@
       "path": "supertonic_mil_ref",
       "used_by": [
         "test_e2e_supertonic_mil_dp",
+        "test_e2e_supertonic_mil_real_text",
         "test_e2e_supertonic_mil_vfe"
       ],
       "sha256": null,
