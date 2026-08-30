@@ -91,7 +91,8 @@ Code comments cite items by their `P`-number, and those numbers are unchanged.
 | P4.16 — the convolution gap, re-measured and closed | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md) |
 | P4.25 — threading the unary gate, measured out | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [Retro-012](docs/retros/retro-012-optimizations-that-were-measured-out.md) |
 | P4.13 — the conv-kernel fold, and the 2.08x it costs | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [ADR-017](docs/adrs/adr-017-no-k-quants.md) |
-| The constant-folded relative-position pad (18.9 MB of zeros) | [Backlog → Exporter](docs/backlog/active-index.md#exporter--mil-compiler) |
+| P4.28 — the relative-position pad (18.9 MB of zeros), and VITS at 11.7 MB | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) |
+| Quantized TTS intelligibility, and why correlation is not the test | [Epic-05 §5](docs/epics/epic-05-edge-performance.md) · [Retro-006](docs/retros/retro-006-kokoro-shipped-noise.md) |
 | P5.0 — the high-level API | [ADR-013](docs/adrs/adr-013-one-door-per-task.md) · [Epic-06](docs/epics/epic-06-high-level-api-and-hosts.md) |
 | Performance optimizations designed but not implemented | [Backlog → Engine performance](docs/backlog/active-index.md#engine--performance) |
 | Scope limitations | [Epic-01 §4](docs/epics/epic-01-inference-engine-core.md) |

@@ -22,7 +22,6 @@ are not renumbered. New items continue the scheme.
 | **P4.10 — macOS wheels** | multiplies every model family added afterwards; a family is unreachable from a Mac until this lands → [Epic-08 §4](../epics/epic-08-packaging-and-release.md) |
 | **Task #79 part 1 — export the phoneme symbol table** | no licence question, no C++, and it gives four TTS models a real text door → [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md) |
 | **P5 family 12 — BERT token classifiers** | smallest possible template, and the first non-audio task → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
-| **The constant-folded relative-position pad** | 18.9 MB of 99.78%-zero weight in every VITS artifact, quantized or not — a bigger win than P4.13's fold, and the engine already has the primitive → [Backlog → Exporter](#exporter--mil-compiler) |
 
 ---
 
@@ -45,19 +44,13 @@ are not renumbered. New items continue the scheme.
 
 ## Exporter / MIL compiler
 
-* [ ] **A constant-folded pad is 62% of the quantized VITS file.** Twelve `text.padded*` tensors,
-  `ne=[96, 4105, 1]`, 1.576 MB each and **99.78% zeros** (864 nonzero of 394080) — 18.9 MB of a 30.6 MB
-  Q4_0 file, and 18.9 MB of the 81.7 MB F32 one. They are the text encoder's relative-position tables,
-  which the MIL trace materialised as a weight padded for a maximum `n_tokens`; the consumer is a single
-  `VIEW -> [96, 2*n_tokens - 1, 1]` at offset `788352 - 384*n_tokens`. The engine already has the
-  primitive that does this properly (`src/core/relative_position.cpp`,
-  `pad_crop_relative_embeddings`). The zeros are read, so they cannot be dropped — they need not be
-  STORED, since the pad rebuilds at graph-build time from a ~3.5 KB table. Estimated **30.6 -> ~11.8 MB
-  quantized, 81.7 -> ~62.8 MB unquantized**, which is more than P4.13's fold won and it helps the F32
-  file too. No quantization gate can reach these: only a mul_mat's FIRST operand is eligible and these
-  are a VIEW's source. The `4105` is also a fixed-maximum-length artifact — same shape of problem as
-  [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md). *Found while closing P4.13;
-  measurement in [Epic-05 §5](../epics/epic-05-edge-performance.md).*
+* [ ] **Supertonic carries 2.3 MB of the same zero padding VITS just lost.** `ttl_text_512.emb_*`,
+  99.1% zeros — 0.9% of that model, against VITS's 23.2%. **Not the same fix**: P4.28 made VITS's pad
+  dynamic, and Supertonic's text axis is statically sized on purpose for two independent reasons its
+  own export docstring gives, one of which is that `GraphBuilder` resolves only one dynamic-length
+  symbol per topology. It belongs to that limitation, not to the pad.
+  *Context: [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md),
+  [Epic-05 §5](../epics/epic-05-edge-performance.md) P4.28.*
 * [ ] **Modular-export generality is unproven** — the blueprint's whole point was structural rather than
   by-name discovery, and that claim still rests on LFM2 alone. Needs a second, structurally different HF
   model in the regression suite. *Context:
@@ -162,18 +155,12 @@ are not renumbered. New items continue the scheme.
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **Is a quantized TTS model still intelligible? Answered for VITS only.** P4.13 ran the ASR oracle
-  on VITS at Q4_0 (it transcribes) and on no other family — and it raised the stakes for the rest by
-  taking Q8_0 coverage from 43% to 79% on StyleTTS2 and from 21% to 90% on Matcha, so the correlations
-  recorded for those (0.015 and 0.985) describe files the toolchain no longer produces. Matcha's Q8_0
-  now misses its frozen F32 reference by **0.498 peak on a signal whose own peak is 0.332**. The fold
-  is measurably not the cause (isolated at correlation 1.00000000). Transcribe before shipping any of
-  them quantized; correlation is not the oracle. → [Epic-05 §5](../epics/epic-05-edge-performance.md)
-* [ ] **The conv-quantization speed trade is unmeasured off x86-64.** Q4_0 VITS is **2.08x slower** on a
-  Ryzen 3 3250U, and 1.55x of that is losing `GGML_OP_CONV_2D` and the three fusions that hang off it
-  rather than the arithmetic. On aarch64 the direct lowering is worth 1.18x rather than 4.7x, so that
-  arm should shrink and the trade should look better — nobody has run it. `scripts/bench_vits_loom.cpp`
-  against two GGUFs of the same checkpoint is the whole harness; the Pi is `pi@rpi4`.
+* [ ] **A quantized convolutional model is ~2x slower, on both ISAs, and nothing has been done about
+  it.** 2.08x on x86-64 and 2.13x on a Cortex-A72 — measured, not predicted, and the prediction that
+  aarch64 would be better was wrong. **1.55x of it is not the arithmetic**: a quantized kernel cannot
+  use `GGML_OP_CONV_2D`, so it gives up ggml-0006's direct convolution and the two fusions (ggml-0005
+  bias, ggml-0007 resblock) that hang off that op. Closing any of that back would need a quantized
+  direct-conv path in ggml, which is a real piece of work and is not scoped.
   → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **`FLASH_ATTENTION`.** Unbuilt. The blocker is **the gate suite's exact-fp32 comparisons, not the
   hardware** — `ggml_flash_attn_ext` forces an F16 K/V cast. A GPU exists now and the trade still has not
@@ -188,11 +175,6 @@ are not renumbered. New items continue the scheme.
 * [ ] **General multi-scheme quantization tool.** `quantize_gguf_q8_0.py` is Q8_0-only and
   single-model-shaped. A model-agnostic tool with a per-tensor-role policy (skip norm weights and
   embeddings) is unbuilt. *Scope note: [ADR-017](../adrs/adr-017-no-k-quants.md)*
-* [ ] **Flag, not yet a bug: StyleTTS2 at Q8_0** produced audio at correlation **0.015** against its F32
-  audio while transcribing correctly. The plausible reading is its stochastic style-diffusion sampler
-  diverging onto a different-but-valid trajectory (Matcha's deterministic CFM stayed at 0.985) — but
-  that is a **hypothesis**. Both numbers predate P4.13's fold and were taken at 43%/21% coverage;
-  see the intelligibility item above.
 
 ## Backends & accelerators
 
@@ -203,12 +185,6 @@ are not renumbered. New items continue the scheme.
 * [ ] **P4.11 — Metal.** Scoped; strictly after P4.10, because there is no macOS base wheel for a backend
   package to attach to and P4.10's `.so`-vs-`.dylib` loader blocker is the *same code path* that would
   discover `libggml-metal`. Does **not** block new model families. → [Epic-04 §5](../epics/epic-04-backends-and-accelerators.md)
-* [ ] **A quantized convolutional model has never run on a device backend.** P4.13's shape carrier is an
-  ordinary allocated F32 leaf that nothing writes and nothing reads, and Vulkan/CUDA/Metal all implement
-  `IM2COL`, so there is no reason to expect trouble — but `ggml_vk_op_f32` binds `src0`'s buffer whether
-  its shader reads it or not, and "no reason to expect trouble" is not a measurement. Run a Q4_0 conv
-  model on the Vulkan build before claiming GPU support for one.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL
