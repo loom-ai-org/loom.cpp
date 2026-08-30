@@ -149,25 +149,6 @@ are not renumbered. New items continue the scheme.
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **P4.26 — `ggml-0012` costs a Cortex-A72 2.4% on VITS.** [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md)'s
-  pattern a second time: worth 2.75x on x86 at whisper's `m = 1500`, checked on aarch64 **only at that
-  same shape**, and every VITS matmul takes the branch it changed. ABBA-interleaved, two rounds:
-  **1.032x and 1.016x**, ~27 ms per synthesis, attributed by profile to `CONV_2D` (+22.6 ms) and
-  `MUL_MAT` (+5.4 ms) — the convolution, because `ggml-0004`/`ggml-0009` lower through the same
-  `sgemm`. **Do not just gate it on `__aarch64__` without re-measuring x86**, and run whatever lands at
-  VITS's small `m` *and* `m = 1500` on both ISAs. It moved the README's Pi TTS cell 0.96x -> 0.93x; the
-  Pi's LM and ASR cells have **not** been re-measured and may carry it too.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
-* [ ] **P4.27 — 26 ms of op-level saving arrived as 5 ms of wall, and nobody knows where it went.**
-  Opened by P4.25's negative result, and worth more than P4.25 was. VITS's 32 gate nodes measure
-  **825 us each faster** when threaded (`scripts/bench18.cpp`, ggml's own threadpool, 3.92x at the
-  exact shape) and the model moves **0.5%**, twelve paired ABBA rounds. Every number on both sides is
-  careful; the loss is *between* the nodes. **Named suspect: ggml's threadpool sleeping between two
-  multi-threaded nodes** — [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md) is
-  that mechanism from the libgomp side. If it is that, it is a tax on **every** threaded node in every
-  model, not on 32 of them in one. Measure before building: instrument the gap between nodes, or A/B a
-  graph of N threaded nodes against the same N interleaved with single-threaded ones.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0.** Op eligibility is fixed;
   layout alignment is not (0 of 132 VITS kernels align for block 32 as stored). Acceptance: VITS exports
   at Q4_0 to ~28 MB with a non-zero coverage line, and its audio still transcribes through whisper-small.

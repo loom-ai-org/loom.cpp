@@ -761,20 +761,48 @@ the accuracy question PR 11 had to answer does not arise here.
 at `m = 1500`** — a Raspberry Pi 4 threads 3.5x at *every* one of the three `m` above, so there is
 nothing there to fix: 133.10 ms before against 133.65 after, 4 threads, ABBA-interleaved medians of ten.
 
-> **CORRECTION (2026-08-30, loom P4.26): that is true at `m = 1500` and NOT true in general.** The
-> paragraph above is the only aarch64 number this patch was ever given, and `m = 1500` is the one shape
-> where the new branch changes nothing. At the small `m` a convolutional model actually runs —
-> VITS's `m = 96 / 100 / 199`, every one of which *does* take the new branch — the same board measures
-> **1.032x and 1.016x SLOWER** over two ABBA-interleaved rounds, ~27 ms on a 1.1 s synthesis. Attributed
-> by profile: `CONV_2D` +22.6 ms and `MUL_MAT` +5.4 ms per synthesis, because loom lowers convolution
-> and transposed convolution through this same `sgemm` (`ggml-0004`, `ggml-0009`) — so a change written
-> for attention reaches every convolutional model. **An upstream reviewer should be given both numbers**,
-> and the open question is whether a predicate exists that keeps the x86 2.75x without the aarch64
-> 2.4%; gating the new branch on `!__aarch64__` is the fallback, not the answer. This is a second
-> instance of PR 11's own lesson, one level down: a number per ISA is not enough, it has to be a number
-> per SHAPE CLASS the branch is enabled for. Four small cores behind a shared 1 MB L2 do not pay for a
-contended line the way a 24-core mesh does. A 2-core Ryzen 3 3250U cannot resolve it either (±40%
-spread on that box; see the dev-box noise floor in loom's Retro-012).
+**AND THE RAGGED PREFIX IS GATED ON `k <= 256`, WHICH IS THE OTHER HALF OF THIS PATCH.** The `m = 1500`
+number above is the only aarch64 measurement this patch had for a week, and `m = 1500` is the one
+shape where it changes nothing there. Shipped without a `k` guard it cost a Raspberry Pi 4 **2.4% on
+VITS** — 27 ms of a 1.1 s synthesis, of which a per-node profile put 22.6 ms in `CONV_2D`.
+
+What the branch removes is a **per-output** cost — `m*n` contended stores, one per element of `C`,
+however long the contraction is. What it adds is **per-work**: a job's row block is four times taller,
+so it holds `RM*BM*k*4 = 16k` bytes of `A` instead of `4k`, and there are four times fewer jobs to
+balance. **The benefit decays as `1/k`; the cost does not.** Sweeping `k` at `m = 284, n = 384`,
+4 threads, both arms in one process behind a run-time switch, ABBA-interleaved, ratio per round:
+
+| `k` | 64 | 128 | 192 | 256 | 384 | 512 | 768 | 960 | 2304 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Core Ultra 9 285K | **2.035** | **1.317** | 1.046 | 1.030 | 1.005 | 0.996 | 0.987 | 0.983 | 0.974 |
+| Cortex-A72 | 1.014 | 1.011 | 1.005 | 0.997 | 0.995 | 0.977 | 0.959 | **0.912** | 0.901 |
+
+Monotone on both, crossing 1.0 within a factor of two of each other — **so the predicate is `k`, not
+the ISA**, and `!defined(__aarch64__)` would have been wrong in both directions (it keeps the x86
+losses at `k >= 512` and throws away the aarch64 wins at `k <= 192`). 256 is the largest power of two
+inside the winning region on both machines. `m % 16 == 0` keeps the schedule it always had, at every
+thread count and every `k`, so the patch is strictly additive:
+
+```c
+const bool ragged_prefix = (m % 16 != 0) && params->nth > 1 && k <= 256;
+if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) { ... }
+```
+
+**Why a reviewer of an attention patch should care about `k`:** `m` is a sequence length and `k` is a
+head dimension in attention, which is where this was measured — but the ggml CPU backend lowers 1-D and
+2-D convolution through this same `sgemm` (in loom's tree via the conv patches above; upstream via
+`ggml_conv_*`'s im2col + `mul_mat`), and there `k` is `in_channels * kernel_width`: 576 to 2304 in one
+small TTS vocoder, which issues **10.9 of its 14.4 GFLOP** through matmuls this branch newly accepts.
+With the guard, whisper's `QK^T` on the 285K goes from 1.809x to **1.941x** against the unpatched
+schedule (the shapes it now declines were dragging the average down) and the Pi returns to parity with
+the unpatched tree: 12 paired ABBA rounds, cooled to a fixed 60 C, **1.003** with p10 0.985 and
+p90 1.018.
+
+This is PR 11's lesson one level down: a number per ISA is not enough — it has to be a number per
+**regime the branch is enabled for**, and the ISA is only one axis. Four small cores behind a shared
+1 MB L2 also do not pay for a contended line the way a 24-core mesh does, so there is nothing for this
+patch to win on the Pi at any `k`; a 2-core Ryzen 3 3250U cannot resolve it either (±40% spread on that
+box).
 
 **Testing.** `tests/ci/test_tinyblas_gemm` gains the whole residue class of the 16-row split —
 `m = 1488/1492/1496/1500/1501`, plus an `n` that does not divide evenly across the threads so the
@@ -794,51 +822,64 @@ condition is inherited unchanged rather than re-derived. (3) The residual gap �
 a 64-byte store still straddles two lines on odd columns. Padding `C` would close it and is a bigger
 change than this.
 
-## Not a PR here, but upstream should know: `apply_unary_op` splits over rows, so `nrows = 1` is all barrier
+## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
-**No patch in this directory depends on this.** It was found by loom P4.25, which built a patch to
-thread ggml's cheap-unary list, measured it out end to end (Epic-05 §5, Retro-012) and dropped it.
-The *finding* survives the patch and is worth carrying upstream on its own, because it is a property
-of code that ships today.
+**No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
+opposite belief, and then by P4.27, which found out why that patch measured nothing. Both write-ups are
+in loom's Epic-05 §5 and
+[Retro-023](https://github.com/loom-ai-org/loom.cpp/blob/main/docs/retros/retro-023-a-bench-whose-graph-was-the-treatment.md).
 
-`apply_unary_op` (`ggml-cpu/unary-ops.cpp`) takes its slice from `get_thread_range`
-(`ggml-cpu/common.h`), which divides `ggml_nrows(src0)` by `nth`:
+`ggml_get_n_tasks` reads like a per-node thread count, and in this version it is not one. It is called
+in **exactly one place** — `ggml_graph_plan` — where it sizes the work buffer and feeds `max_tasks`,
+and then:
 
 ```c
-const int64_t nr = ggml_nrows(src0);
-const int64_t dr = (nr + nth - 1)/nth;
-const int64_t ir0 = dr*ith;
-const int64_t ir1 = MIN(ir0 + dr, nr);
+cplan.n_threads = MIN(max_tasks, n_threads);
 ```
 
-At `nr = 1` thread 0 gets the whole tensor and threads `1..nth-1` get an **empty range** — every one
-of them still enters the node, synchronises, and does nothing. `GELU`, `GELU_ERF`, `GELU_QUICK`,
-`SILU` and `XIELU` are given `n_tasks = n_threads` unconditionally in `ggml_get_n_tasks`, so any
-one-row tensor of those ops pays a full barrier for a single-threaded computation today.
+`ggml_graph_compute_thread` runs **every node on every thread** with `params.nth = cplan.n_threads`.
+An op that must not split says so itself — `ggml_compute_forward_sum_f32` and
+`ggml_compute_forward_leaky_relu_f32` open with `if (params->ith != 0) return;`. So `n_tasks` survives
+only as a **graph-level clamp**, which can take a whole graph down to one thread and can do nothing
+else.
 
-**Measured**, `ne0 = 256`, four threads against one, Raspberry Pi 4B, through ggml's own threadpool
-with 256 nodes per graph so the pool wakes once (`scripts/bench18.cpp` in loom.cpp):
+**Three consequences, and the third is the one that costs people time.**
+
+1. **The table and the ops disagree.** `GGML_OP_UNARY`'s `TANH`, `SIGMOID`, `EXP`, `RELU`, `ELU` are
+   declared `n_tasks = 1`, but `apply_unary_op` splits over rows through `get_thread_range` and threads
+   3.9-4.8x — measured on a Cortex-A72 at 4 threads, a Core Ultra 9 285K at 24 and a Ryzen at 2. The
+   declaration is ignored in every graph that also holds one op declaring more, which is every real
+   model graph. Nothing is *wrong* — but a reader who trusts the table gets the opposite of the truth,
+   and a patch that "fixes" the table changes nothing.
+2. **A homogeneous graph silently runs single-threaded.** Build a graph of nothing but `TANH` nodes and
+   it plans one thread however many you asked for, even though every one of those nodes would have
+   split. It is easy to write such a graph by accident in a benchmark, and it makes the benchmark
+   measure its own plan.
+3. **Anything that computes node-by-node changes the thread count of those nodes.**
+   `ggml_backend_sched`'s eval-callback path computes one node at a time, and so does any profiler
+   built on `ggml_graph_view(graph, i, i + 1)`. Under such a tool every `n_tasks = 1` node is planned
+   at **one** thread while the rest of the report is threaded — in one small TTS model at 4 threads
+   that is 122 `UNARY`, 126 `SUB`, 106 `SCALE`, 42 `SUM_ROWS` and 32 `LEAKY_RELU` nodes. loom read a
+   threaded op as "30.4 ms, identical at one thread and four, three cores idle" for four days on the
+   strength of it, and scoped two items on that reading.
+
+**A one-row tensor still cannot split by rows**, which is worth saying separately because it is a real
+(if small) limitation rather than a misunderstanding: `get_thread_range` divides `ggml_nrows(src0)` by
+`nth`, so at `nr = 1` thread 0 gets everything. Measured `ne0 = 256`, four threads against one, Pi 4B,
+256 nodes per graph:
 
 | `nrows` | 1 | 2 | 3 | 4 | 8 | 16 | 64 | 192 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | speedup | **1.00x** | 1.75x | 2.36x | 2.91x | 3.36x | 3.69x | 3.89x | 3.92x |
 
-and on a Ryzen 3 3250U the `nrows = 1` row is **0.63x** — an outright loss. One row is a cliff; two
-rows already win.
+In a real graph this costs nothing — the threads handed an empty range reach the per-node barrier they
+were going to reach anyway — so it is a missed opportunity (split on `ne0` when `nrows` is small), not a
+regression. **An earlier version of this section proposed `n_tasks = MIN(n_threads, ggml_nrows(node))`
+as a one-line fix that "removes only barrier participation". That was wrong**: `n_tasks` does not gate
+barrier participation, and the only thing that cap can do is clamp an all-one-row graph to a single
+thread.
 
-**The fix is one line and cannot make anything slower**: `n_tasks = MIN(n_threads, ggml_nrows(node))`
-for the `GGML_OP_UNARY` branch. A thread handed an empty range does no work, so capping at the row
-count removes only barrier participation.
-
-**How much it matters depends entirely on the model, and in an LLM it does not.** Every `UNARY` bucket
-in whisper-small, Qwen3-0.6B, LFM2 and the NeMo encoders is many-rowed (the only one is
-`[3072, 1500]`). It bites vocoders: Kokoro issues **870 one-row `UNARY [256, 1]` nodes** per
-synthesis, and when loom's P4.25 patch threaded those ops without the cap that bucket went
-**5.8 -> 179.9 ms**. So this is worth fixing pre-emptively rather than because it is costing anything
-in llama.cpp today.
-
-**A second floor a reviewer should ask about**, from the same measurements: at 24 threads on a Core
-Ultra 9 285K the per-node cost bottoms out at **~1.9 us**, so threading a unary below ~16K elements is
-a loss there regardless of row count. `n_tasks` has no work floor for these ops at all. Any future
-change that threads more unary ops needs one, and it is machine-dependent — which is a large part of
-why loom did not carry its patch.
+**A work floor is still missing, and that one is real.** At 24 threads on a Core Ultra 9 285K the
+per-node cost bottoms out at **~1.9 us**, so threading a unary below ~16K elements is a loss there
+regardless of row count — against ~0.3 us at 4 threads, so the floor is machine-dependent. Any future
+change that threads more ops needs one.

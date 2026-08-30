@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-29
+last_updated: 2026-08-30
 ---
 
 # Epic-05: Edge CPU Performance
@@ -2571,7 +2571,15 @@ than two and one — moves 4.5 GB/s at both thread counts, which is what the bus
 So the fact that they do not scale is the machine, not the engine, and no amount of threading
 recovers it.
 
-#### The one thing that is NOT against a roofline — now P4.25
+#### The one thing that is NOT against a roofline — now P4.25 — AND IT WAS A PROFILER ARTIFACT
+
+> **Corrected 2026-08-30 by [P4.27](#p427--the-26-ms-that-arrived-as-5-ms-of-wall--closed-2026-08-30-it-was-never-on-the-table).**
+> "30.4 ms at one thread and 30.4 ms at four" is what `$LOOM_PROFILE` reports for **any** op ggml
+> declares `n_tasks = 1` for, at any thread count, because the profiler runs each node as a graph of
+> its own and ggml plans a thread count per graph. The gate was threaded the whole time; removing that
+> threading costs this board 2.5% of the synthesis. The `n_tasks` half of the paragraph below is
+> wrong; the scalar-`tanhf` half (no SIMD path where GELU got one in `ggml-0010`) is still true and is
+> still untried.
 
 `ggml_get_n_tasks` (`ggml-cpu.c:2271`) hands `n_tasks = 1` to `TANH`, `SIGMOID`, `EXP`, `RELU`,
 `LEAKY_RELU` and the rest of the cheap-unary list, while `GELU`, `GELU_ERF` and `SILU` get
@@ -2638,57 +2646,242 @@ what makes a 6.9% gap readable at all on this machine. Alternating the arms with
 enough — one arm systematically gets the cool half of every thermal excursion.
 
 
-### P4.26 — `ggml-0012` costs a Cortex-A72 2.4% on VITS, at shapes P4.22 never measured — OPEN
+### P4.26 — `ggml-0012` cost a Cortex-A72 2.4% on VITS — FIXED AND CLOSED 2026-08-30
 
-**Found while re-measuring P4.16, from a 3% disagreement with the README's own Pi cell**, and it is
-[Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md)'s pattern for the second time in this
-thread: a patch worth **2.75x** on x86 at the shape it was aimed at, checked on aarch64 **only at that
-same shape**, and shipped.
+**Found while re-measuring P4.16, from a 3% disagreement with the README's own Pi cell.** It is
+[Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md)'s pattern one patch later — a patch
+worth **2.75x** on x86 at the shape it was aimed at, checked on aarch64 **only at that same shape**,
+and shipped — and the fix says the axis was never the ISA.
+[Retro-022](../retros/retro-022-a-benefit-and-a-cost-on-the-same-axis.md) is the lesson.
 
-P4.22 checked `ggml-0012` on this board at whisper's `QK^T` (`m = 1500`, 4 threads) and found it
-neutral — 133.10 ms against 133.65, correctly ABBA-interleaved. That is a real result and it is still
-true. **It is also the only aarch64 shape it was ever run at.** VITS's matmuls are `m = 96 / 100 / 199`,
-and every one of them takes the *new* branch, because the patch's whole point is to give `m % 16 != 0`
-a 16-aligned prefix instead of falling through to `BM = 1`.
+**The predicate is `k`.** `ggml-0012` now reads
 
-**ABBA-interleaved, cooled to a fixed 60 C before every arm, two rounds of A B B A**, the two trees
-identical but for the presence of `cmake/patches/ggml-0012-tinyblas-line-aligned-jobs.patch`:
+```c
+const bool ragged_prefix = (m % 16 != 0) && params->nth > 1 && k <= 256;
+if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) { ... }
+```
 
-| round | with `0012` | without | ratio |
-|---|---:|---:|---:|
-| 1 | 1.1503 / 1.1335 s | 1.0996 / 1.1136 s | 1.032x |
-| 2 | 1.1274 / 1.1285 s | 1.1049 / 1.1158 s | 1.016x |
+so an `m` that already divides 16 keeps the schedule it has always had at every thread count, and the
+ragged prefix — the only thing the patch adds — is taken only where it pays.
 
-**~2.4%, ~27 ms per synthesis, and the mechanism is attributed** — `$LOOM_PROFILE` on both trees, same
-four threads, same profiler overhead on both sides so the *difference* is meaningful:
+#### Why `k`, and why it is not the ISA
 
-| op (6 syntheses) | with `0012` | without | delta per synthesis |
-|---|---:|---:|---:|
-| `CONV_2D` | 5416.2 ms | 5280.7 ms | **+22.6 ms** |
-| `MUL_MAT` | 169.2 ms | 137.1 ms | **+5.4 ms** |
+The branch removes a **per-output** cost and adds a **per-work** one. Removed: `m*n` contended stores,
+one per element of `C`, because at `BM = 1` a job owns 16 bytes of each column and four threads write
+four quarters of one line. Added: a job's row block is four times taller, so it holds `RM*BM*k*4` =
+`16k` bytes of `A` instead of `4k`, and there are four times fewer jobs to balance. The benefit
+therefore decays as `1/k` while the cost does not.
 
-+28 ms against a +27 ms wall difference, so nothing else moved. **The convolution is most of it**, which
-is the part nobody would predict from the patch's own description: `ggml-0004` and `ggml-0009` lower
-convolution and transposed convolution through the same `sgemm` this patch edits, so a change written
-for attention reaches every convolutional model on the board. Per shape it is not even uniform —
-`MUL_MAT 199x100` is 1.86x slower with the patch and `MUL_MAT 100x1` is *faster* — which is what a job
-partitioning changed underneath a set of small `m` looks like.
+`scripts/bench19.cpp` sweeps exactly that, at `m = 284, n = 384`, 4 threads, **both arms in one
+process** through the run-time switch in `scripts/probes/ggml-p426-sgemm-policy-probe.patch`,
+ABBA-interleaved, ratio per round (`> 1` means the branch beats the `m % 4` schedule it replaces):
 
-**What to do, in order.** (1) Reproduce on a second aarch64 machine if one is available, since n=1 board.
-(2) The cheap fix is to gate the new branch on `!defined(__aarch64__)`, but **measure that on x86
-first** — the 2.75x it buys there is a bigger number than the 2.4% it costs here, and the honest
-question is whether a predicate exists that gets both. (3) Whatever lands, run it at VITS's small `m`
-*and* whisper's `m = 1500`, on both ISAs. The rule Retro-019 already wrote is "measure every ISA a
-patch is enabled for"; the amendment this adds is **every SHAPE CLASS it is enabled for** — an ISA
-check at one shape is what let this through.
+| `k` | 64 | 128 | 192 | 256 | 384 | 512 | 768 | 960 | 1536 | 2304 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Core Ultra 9 285K | **2.035** | **1.317** | 1.046 | 1.030 | 1.005 | 0.996 | 0.987 | 0.983 | 1.000 | 0.974 |
+| Cortex-A72 | 1.014 | 1.011 | 1.005 | 0.997 | 0.995 | 0.977 | 0.959 | **0.912** | **0.886** | 0.901 |
 
-**It also explains a published number.** The README's Pi TTS cell read **0.96x** on 2026-08-29 and
-reads **0.93x** on the same harness today; `ggml-0012` landed between the two, and 0.96 / 1.024 = 0.937.
-The cell has been updated. **The Pi's LM and ASR cells were not re-measured here** and may carry the
-same regression — whisper's `m = 1500` is the shape P4.22 *did* check, so ASR is the least likely to
-have moved, but that is a prediction and not a measurement.
+Monotone on both to within the witness's own resolution — the two rows that break it, `k = 1536`, are
+1.000 and 0.886 against neighbours of 0.983/0.974 and 0.912/0.901 — and they cross 1.0 within a factor
+of two of each other. **A `!defined(__aarch64__)` gate would have been wrong in both directions** — it would have kept a loss on x86 at `k >= 512` and
+thrown away a win on aarch64 at `k <= 192`. 256 is the largest power of two inside the winning region
+on both machines. The Pi's clock witness (a shape neither arm touches) held 0.992-1.027 across the
+sweep; the 285K's held 0.995-1.150.
+
+#### Why a patch written for attention reached a TTS vocoder
+
+`m` is a sequence length in an attention matmul and `k` is a head dimension — small, which is the
+regime `ggml-0012` was measured in. But `ggml-0004` and `ggml-0009` lower **convolution** and
+transposed convolution through the same `sgemm`, and there `k` is `in_channels * kernel_width`.
+`GGML_SGEMM_CENSUS=1` on one VITS synthesis (the probe patch prints it; the shape set is
+**identical on both ISAs**, being a property of the graph) gives 22 distinct shapes, of which the three
+ragged `m` — 100, 196, 284 — carry **10.9 of the synthesis's 14.4 GFLOP, 76% of all `sgemm` work**,
+with `k` from 96 to 2304. Nothing in the patch's own reasoning mentions convolution, which is exactly
+how this was missed.
+
+#### Per shape, 4 threads, ratio against the pre-`0012` schedule
+
+`scripts/bench19.cpp` mode 0, the VITS census shapes plus whisper's. `1.000` is the clock witness's
+resolution on each machine.
+
+| shape (`m`x`n`x`k`) | calls | Cortex-A72 `0012` | A72 **fixed** | 285K `0012` | 285K **fixed** |
+|---|---:|---:|---:|---:|---:|
+| 284 x 384 x 960 | 32 | **0.896** | 0.999 | 0.973 | 0.994 |
+| 100 x 192 x 2304 | 12 | **0.889** | 0.996 | 0.926 | 0.984 |
+| 100 x 768 x 576 | 12 | 0.929 | 1.002 | 0.982 | 1.001 |
+| 284 x 384 x 192 | 24 | 1.009 | 1.013 | 1.068 | 1.025 |
+| 284 x 192 x 192 | 8 | 1.021 | 1.018 | 1.092 | 1.098 |
+| 284 x 192 x 96 | 8 | 1.027 | 1.036 | **1.672** | **1.687** |
+| 196 x 100 x 96 | 24 | 1.022 | 1.018 | **1.476** | **1.466** |
+| 100 x 100 x 96 | 24 | 0.877 | 0.892 | **1.367** | **1.321** |
+| 100 x 192 x 192 | 76 | 0.976 | 0.978 | 1.007 | 1.023 |
+| 284 x 96 x 192 | 8 | 0.930 | 0.933 | 0.980 | 0.976 |
+| **1500 x 1500 x 64** (whisper `QK^T`) | — | 1.001 | 0.993 | **1.809** | **1.941** |
+
+Weighted by the census, `ggml-0012` as shipped cost the Pi **+48 ms of `sgemm` per synthesis**; the
+fixed predicate costs it **+1.0 ms**, and keeps every x86 win including the one the patch exists for.
+The two shapes still slightly down on the A72 (`284 x 96 x 192`, `100 x 100 x 96`) are together 0.6 ms
+and are the job-count effect rather than the footprint one — a job-count guard removes them and costs
+x86 the two 1.3-1.5x wins above, which is a worse trade on both machines.
+
+#### End to end
+
+Paired ABBA rounds, both arms one binary switched by `GGML_SGEMM_POLICY`, `scripts/paired_arms.py`
+(which grew an `--env` arm mode and a `--between` cooling hook for this), Pi cooled to a fixed 60 C
+before **every** arm:
+
+| | rounds | median ratio | p10 | p90 |
+|---|---:|---:|---:|---:|
+| Pi 4B, VITS, 4 threads — **fixed** / `0012` | **24** | **0.986** | 0.968 | **0.997** |
+| Pi 4B, VITS, 4 threads — **fixed** / pre-`0012` | 12 | **1.003** | 0.985 | 1.018 |
+| 285K, whisper, 24 threads — **fixed** / pre-`0012` | 15 | 0.956 | 0.829 | 1.108 |
+| 285K, whisper, 24 threads — **fixed** / `0012` | 15 | 0.996 | 0.883 | 1.151 |
+
+**The first row is the result and it resolves**: 24 paired rounds put the whole p10-p90 band below
+1.0, medians 1.1364 s against 1.1158 s. **The second says parity with pre-`0012` is restored**
+(1.1103 s), and it does not resolve, which is the correct shape for a null. The two 285K rows are
+unresolved for a reason the README already documents — thread placement on that machine is chosen once
+per launch and is bimodal — so they say only that nothing moved there. The case rests on the op-level
+sweeps above, where the witness resolves to 1%.
+
+`ctest -L ci` 74/74 and `-L gate` 83/83 with the fixed patch, on x86. **On aarch64 — which compiles the
+*other* arm of the `#if`** — the tree builds 267/267 and one synthesis gives `fnv1a=aa320f8a1377a92a`,
+**the same digest as every other predicate on that board**, which is what a scheduling-only change has
+to show. The reference Pi cannot run `ctest -L ci` at all (its `python3` has no `gguf` module, so the
+fixture generators fail and 49 tests never run); that is an environment gap on the board, unrelated to
+this change, and it is the reason the digest is the aarch64 correctness evidence here.
+
+#### What is left, and one thing that was not done
+
+* **The Pi's README TTS cell is re-measured and reads 0.95x** (0.96x before the patch, 0.93x with it).
+  Four rounds, both engines back to back, cooled to a fixed 60 C before every arm, arm order alternated,
+  onnxruntime normalised to loom's sample count: loom 1.1118-1.1193 s against onnxruntime
+  1.0552-1.0609 s, per-round ratios 1.002 / 0.950 / 0.948 / 0.947, **median 0.949**. The 1.002 is the
+  session's first onnxruntime arm paying the 63 MB model's cold page cache; it is kept, because
+  dropping the round that disagrees is how a number stops being reproducible.
+  **Two things about that harness were wrong and are fixed** (`scripts/bench_onnx.py`): its model path
+  was hardcoded to one Pi directory, and `LOOM_SAMPLES` — which normalises onnxruntime's time to loom's
+  output length — still said 73472 where the current export gives **73216**, worth 0.35% in loom's
+  favour. Both now come from the environment, and the second should be read off `bench_vits_loom`'s own
+  output in the same session.
+* **The Pi's LM and ASR cells did not move, and could not have.** whisper's `QK^T` is `k = 64` and
+  measures 1.001 on this board with the patch and 0.993 with the fix (both inside the witness's
+  resolution), its `A@V` is `m = 64` and takes the same branch either way, and a decode step's
+  `mul_mat` has `ne1 = 1`, which `llamafile_sgemm` rejects at its second line — the same control that
+  made `ggml-0011`'s diagnosis trustworthy. End to end, fixed against pre-`0012`, 4 paired rounds:
+  **median 1.007, p10 0.989, p90 1.016 — unresolved**, on a 97 s transcription with no cooldown
+  between arms. **Read the rounds, not the first one**: they run 1.018, 1.011, 1.002, 0.983, and the
+  first two would have read as a 1.5% regression to anyone who stopped there. The `fixed` arm's own
+  spread is 94.9-98.5 s against pre-`0012`'s 96.1-96.9, which is what an uncooled board looks like —
+  the encoder `QK^T` bucket this branch touches is ~1.6 s of those 97, so it cannot produce a 1.5%
+  wall difference in either direction. The LM, 6 paired rounds of 32 tokens through
+  `infer_with_past`: **median 0.995, p10 0.983, p90 1.003 — unresolved**, 23.35 s against 23.41 s.
+
+### P4.27 — the 26 ms that arrived as 5 ms of wall — CLOSED 2026-08-30: it was never on the table
+
+**The premise was false, and the thing that made it false is loom's own profiler.** P4.27 was opened by
+P4.25 to find where 26 ms of op-level saving went. It went nowhere: the VITS gate was threaded before
+P4.25's patch, during it and after it, and the two arms of that model A/B ran the same code.
+[Retro-023](../retros/retro-023-a-bench-whose-graph-was-the-treatment.md) is the lesson.
+
+#### `ggml_get_n_tasks` does not decide whether a node threads. It decides whether a GRAPH does.
+
+Three lines of ggml v0.19.0, none of which had been read:
+
+* `ggml_get_n_tasks` is called in **exactly one place** — `ggml_graph_plan` — where it sizes the work
+  buffer and feeds `max_tasks`, and then `cplan.n_threads = MIN(max_tasks, n_threads)`
+  (`ggml-cpu.c:3018`). There is no per-node thread count anywhere in this version.
+* `ggml_graph_compute_thread` runs **every node on every thread** with `params.nth = cplan.n_threads`
+  (`ggml-cpu.c:3342-3372`).
+* An op that must not split therefore says so **itself**: `ggml_compute_forward_sum_f32` and
+  `ggml_compute_forward_leaky_relu_f32` open with `if (params->ith != 0) return;`. `apply_unary_op`
+  does **not** — it splits over rows through `get_thread_range` (`common.h:74`), whatever `n_tasks`
+  says about it.
+
+So `n_tasks` is a graph-level clamp that can only take a whole graph **down** to one thread, when no
+node in it declares more. `TANH` sitting beside a `MUL_MAT` has been threaded all along.
+
+`scripts/bench20.cpp` is that in one table — it prints `ggml_graph_plan(...).n_threads` itself, so the
+mechanism needs no timing — for a graph of 128 `TANH [286, 192]` nodes, and for the same graph with
+**one** `MUL_MAT [32x8]` added, which is 0.03% of the work:
+
+| machine | threads asked | TANH only: planned / us per node | + one MUL_MAT: planned / us per node |
+|---|---:|---|---|
+| Raspberry Pi 4B | 4 | 1 / 1108.6 | **4 / 281.1** (3.94x) |
+| Core Ultra 9 285K | 24 | 1 / 129.3 | **24 / 27.2** (4.76x) |
+| Ryzen 3 3250U | 2 | 1 / 942.2 | **2 / 546.2** (1.72x) |
+
+And VITS's real graphs are not clamped: `LOOM_PLAN_PROBE=2`
+(`scripts/probes/ggml-p427-graph-plan-probe.patch`) prints `ok: 1469 nodes, asked 24, planned 24` and
+`ok: 651 nodes, asked 24, planned 24`. Across the whole gate suite — 83 tests, 13 real
+checkpoints, run at ggml's default four threads with `LOOM_PLAN_PROBE=1` — **not one production graph
+is clamped**, so the ggml wart costs loom nothing today (the probe's positive control is `bench20`,
+which prints a clamp on every round). It is `bench18`'s
+graph, and the profiler's, that were clamped.
+
+#### What P4.25 actually measured, and what P4.16 actually saw
+
+* **`bench18`'s 3.92x was its own graph.** 256 `TANH` nodes and nothing else plans one thread without
+  the patch and `n_threads` with it, so its "1 thread vs 4 threads" comparison was really "this graph
+  cannot thread vs this graph can". The op number is right and means something else than it was read
+  to mean.
+* **The model A/B was two identical arms.** VITS's graph plans `n_threads` either way, so 1.005x over
+  twelve paired rounds is the correct measurement of no change at all. Nothing was absorbed between the
+  nodes; the ggml-threadpool-sleeping suspect is not needed and there is no evidence for it.
+* **P4.16's "30.4 ms per synthesis at one thread and 30.4 ms at four" is a profiler artifact, and it is
+  the origin of the whole chain.** `profile::compute` runs each node as a graph of its own
+  (`ggml_graph_view(graph, i, i+1)`, `src/core/profile.cpp:180`) — so under `$LOOM_PROFILE` every node
+  whose op declares `n_tasks = 1` is *planned at one thread*, at any thread count. On VITS at 4 threads
+  that is 122 `UNARY`, 126 `SUB`, 106 `SCALE`, 42 `SUM_ROWS`, 32 `LEAKY_RELU`, 12 `CLAMP` and 6 `SQRT`
+  nodes, each timed on one core inside a report whose other buckets are threaded. "Identical at one
+  thread and four" is what that looks like from outside.
+
+This is a **second, different** failure mode from the per-node floor the profiler's header already
+warns about. The floor is noise with a known sign; this changes what the code under measurement
+*does*. Both are now in `include/loom/core/profile.h`, and `report()` prints the caveat next to the
+floor so it cannot be read without it.
+
+#### The measurement that settles it: take the threading away
+
+The honest way to price something that is already happening is to remove it.
+`scripts/probes/ggml-p427-graph-plan-probe.patch` adds `LOOM_UNARY_SERIAL=1`, which puts every row of
+an `apply_unary_op` on thread 0 — what P4.25 believed ggml was doing. Paired ABBA rounds of the real
+model, `scripts/paired_arms.py --env`:
+
+| | rounds | serial / threaded | p10 | p90 |
+|---|---:|---:|---:|---:|
+| Pi 4B, VITS, 4 threads (cooled to 62 C before every arm) | 12 | **1.025** | 1.016 | 1.037 |
+| 285K, VITS, 4 threads | 15 | **1.046** | 1.043 | 1.060 |
+| 285K, VITS, 24 threads | 15 | 1.087 | 0.805 | 1.304 (unresolved) |
+
+**Threading the transcendental unaries is worth 2.5% of a VITS synthesis on the reference Pi and 4.6%
+on the 285K, and loom has been getting it since before P4.16 was written.** 2.5% of 1115 ms is
+**28 ms**, against the **26 ms** P4.25 predicted from `bench18` — the arithmetic was right to within
+the resolution of the board. It was a prediction of something already collected, and P4.25's patch
+could not add it a second time.
+
+#### What this closes, and what it leaves
+
+* **P4.27 is closed with no patch**, and so is the "ggml's threadpool sleeps between multi-threaded
+  nodes" hypothesis it was opened on — there was no gap to explain.
+* **`cmake/patches/UPSTREAM.md`'s `nrows = 1` section was wrong in its remedy** and has been rewritten:
+  `n_tasks = MIN(n_threads, ggml_nrows(node))` removes no barrier participation, because `n_tasks` does
+  not gate barrier participation. The upstream-worthy finding is the graph-level clamp itself, and that
+  `ggml_backend_sched`'s own eval-callback path has the same distortion any node-by-node profiler does.
+* **A one-row unary still cannot split by rows** — that observation stands — but in a real graph the
+  threads that get an empty range simply reach the per-node barrier they were going to reach anyway.
+  The 31x Kokoro figure P4.25 recorded was measured through the profiler, i.e. through one-node graphs,
+  and is not a production number.
 
 ### P4.25 — thread the unary gate — MEASURED OUT, CLOSED. The op is 3.92x; the model is not.
+
+> **Read [P4.27](#p427--the-26-ms-that-arrived-as-5-ms-of-wall--closed-2026-08-30-it-was-never-on-the-table)
+> first: this entry's premise is wrong, and P4.27 says why.** ggml has no per-node thread count —
+> `n_tasks` clamps a whole GRAPH — so `TANH` was already threaded in every model graph, both arms of
+> the model A/B below ran the same code, and `bench18`'s 3.92x is the difference between its own
+> homogeneous graph planning one thread and planning four. The numbers below are all real; the two
+> sentences that read them as "the op got faster and the model did not" are not. What survives is
+> kept, corrected, in P4.27 and in [Retro-023](../retros/retro-023-a-bench-whose-graph-was-the-treatment.md).
 
 **Executed 2026-08-30, and the patch is NOT carried.** The mechanism was real and every prediction it
 made about the op held. It did not survive contact with the model, on any of three machines, and the
@@ -2745,7 +2938,11 @@ same digest at 1, 2 and 4 threads and across both builds, on both ISAs. `ctest -
 
 #### Two things it found on the way, and they are why the entry is worth reading
 
-**1. ggml's unary ops split over ROWS, so a one-row tensor is all barrier and no split.**
+**1. ggml's unary ops split over ROWS, so a one-row tensor cannot split.** *(Corrected by P4.27: in a
+real graph the threads handed an empty range simply reach the per-node barrier they were going to
+reach anyway, and the Kokoro figure below was measured through the node-by-node profiler, i.e. through
+one-node graphs, so it is not a production number. `n_tasks` cannot remove barrier participation,
+because it does not gate it.)*
 `apply_unary_op` takes its slice from `get_thread_range` (`ggml-cpu/common.h`), which divides
 `ggml_nrows(src0)` by `nth`. At `nrows = 1`, thread 0 gets everything and threads 1..n-1 get an empty
 range. The first cut of the patch had no cap, and **Kokoro — 870 `UNARY [256, 1]` nodes per synthesis,
@@ -2772,12 +2969,16 @@ threads against ~0.3 us at 4). That is a tuned constant in a carried patch, for 
 **An isolated op measurement is an upper bound on what a model will see, never an estimate of it.**
 Every number above the fold is right: the op really is 3.92x, the class split really is what
 `bench17` says, the 26 ms really is what 32 nodes at 825 us each comes to. The model still moved
-0.5%. Whatever absorbs it lives *between* the nodes rather than in them, and ggml's threadpool
-sleeping between two multi-threaded nodes is the named suspect —
-[Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md) is that exact mechanism from
-the libgomp side. **Nobody chased it, and it is the thing to chase if this is ever reopened**, because
-it would be worth far more than this item was: it is a tax on every threaded node in every model, not
-on 32 of them in one.
+0.5%.
+
+**This paragraph used to end "whatever absorbs it lives between the nodes, and ggml's threadpool
+sleeping between two multi-threaded nodes is the named suspect". That was wrong, and P4.27 chased it:**
+nothing absorbed it, because it had already been collected. The 26 ms is real and the model was
+already banking it — taking the threading away with `LOOM_UNARY_SERIAL=1` costs this same board
+**28 ms, 2.5%** — so a patch that switched it on again could only measure zero. The lesson that
+survives is narrower and sharper than the one that was written here: **a bench whose graph is not the
+model's graph can measure a property of the bench.** See P4.27 and
+[Retro-023](../retros/retro-023-a-bench-whose-graph-was-the-treatment.md).
 
 #### What would reopen this
 

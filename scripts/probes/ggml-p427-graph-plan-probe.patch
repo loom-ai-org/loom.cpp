@@ -1,0 +1,99 @@
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3016,6 +3016,35 @@
+ 
+     cplan.threadpool = threadpool;
+     cplan.n_threads  = MIN(max_tasks, n_threads);
++
++    // ================= P4.27 MEASUREMENT PROBE -- NOT CARRIED, NOT FOR UPSTREAM =================
++    // `ggml_get_n_tasks` is read nowhere else: there is no per-node thread count in this version of
++    // ggml. Every thread runs every node with `params.nth = cplan.n_threads`, and an op that must not
++    // split says so itself by returning early when `ith != 0`. So the line above is a GRAPH-level
++    // clamp -- it can only take the whole graph down to one thread, when NO node in it declares more.
++    // A `TANH` sitting in a graph that also holds a `MUL_MAT` has been threaded all along.
++    //
++    //   LOOM_PLAN_PROBE=1   print only the graphs that are clamped
++    //   LOOM_PLAN_PROBE=2   print every plan, so "not clamped" is a positive observation
++    //
++    // See loom.cpp Epic-05 P4.27 and scripts/bench20.cpp.
++    {
++        static int probe = -1;
++        if (probe < 0) {
++            const char * s = getenv("LOOM_PLAN_PROBE");
++            probe = s ? atoi(s) : 0;
++        }
++        if (probe >= 2 || (probe == 1 && cplan.n_threads < n_threads)) {
++            fprintf(stderr, "[plan] %s: %d nodes, asked %d threads, planned %d",
++                    cplan.n_threads < n_threads ? "CLAMPED" : "ok",
++                    cgraph->n_nodes, n_threads, cplan.n_threads);
++            if (cgraph->n_nodes > 0) {
++                fprintf(stderr, " (first node %s %s)", ggml_op_name(cgraph->nodes[0]->op),
++                        cgraph->nodes[0]->name);
++            }
++            fprintf(stderr, "\n");
++        }
++    }
+     cplan.work_size  = work_size;
+     cplan.work_data  = NULL;
+ 
+--- a/src/ggml-cpu/unary-ops.cpp
++++ b/src/ggml-cpu/unary-ops.cpp
+@@ -1,4 +1,5 @@
+ #include "unary-ops.h"
++#include <cstdlib>   // P4.27 probe
+ 
+ static inline float op_abs(float x) {
+     return fabsf(x);
+@@ -107,6 +108,22 @@
+     }
+ }
+ 
++// ================= P4.27 MEASUREMENT PROBE -- NOT CARRIED, NOT FOR UPSTREAM =================
++// `LOOM_UNARY_SERIAL=1` puts every row of an `apply_unary_op` on thread 0, which is what P4.25
++// believed ggml was already doing (`ggml_get_n_tasks` gives TANH/SIGMOID/EXP `n_tasks = 1`). It is
++// not: `n_tasks` is a graph-level clamp in this version and these ops split over rows like any other.
++// Flipping this on is therefore the measurement P4.25 never made -- what threading the transcendental
++// unaries is worth in a REAL model, measured by taking it away rather than by adding it.
++// See loom.cpp Epic-05 P4.27.
++static bool loom_unary_serial() {
++    static int v = -1;
++    if (v < 0) {
++        const char * s = getenv("LOOM_UNARY_SERIAL");
++        v = (s && atoi(s)) ? 1 : 0;
++    }
++    return v == 1;
++}
++
+ template <float (*op)(float), typename src0_t, typename dst_t>
+ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+@@ -118,7 +135,13 @@
+     GGML_ASSERT( nb0 == sizeof(dst_t));
+     GGML_ASSERT(nb00 == sizeof(src0_t));
+ 
+-    const auto [ir0, ir1] = get_thread_range(params, src0);
++    auto [ir0_, ir1_] = get_thread_range(params, src0);
++    if (loom_unary_serial()) {                       // P4.27 probe, see above
++        const int64_t nr = ggml_nrows(src0);
++        ir0_ = params->ith == 0 ? 0  : nr;
++        ir1_ = nr;
++    }
++    const int64_t ir0 = ir0_, ir1 = ir1_;
+ 
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t i03 = ir/(ne02*ne01);
+@@ -198,7 +221,13 @@
+     GGML_ASSERT( nb0 == sizeof(dst_t));
+     GGML_ASSERT(nb00 == sizeof(src0_t));
+ 
+-    const auto [ir0, ir1] = get_thread_range(params, src0);
++    auto [ir0_, ir1_] = get_thread_range(params, src0);
++    if (loom_unary_serial()) {                       // P4.27 probe, see above
++        const int64_t nr = ggml_nrows(src0);
++        ir0_ = params->ith == 0 ? 0  : nr;
++        ir1_ = nr;
++    }
++    const int64_t ir0 = ir0_, ir1 = ir1_;
+ 
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t i03 = ir/(ne02*ne01);

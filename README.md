@@ -105,7 +105,8 @@ thread count — how does loom compare to onnxruntime?** Three tasks, because no
 representative: an all-convolutional vocoder, an encoder-decoder ASR model, and an autoregressive LM.
 
 **`>1.00x` means loom is faster.** The x86 TTS and LM cells are from 2026-08-24; **the ASR column and
-the whole Pi row were re-measured 2026-08-29, and the Pi's TTS cell again on 2026-08-30**. **Both engines run back to back on the machine in the
+the whole Pi row were re-measured 2026-08-29, and the Pi's TTS cell twice on 2026-08-30** — once when
+`ggml-0012` regressed it and again when P4.26 fixed it. **Both engines run back to back on the machine in the
 row** — see [what these numbers are not](#what-these-numbers-are-not).
 
 | machine | arch | threads | onnxruntime 1.28.0 build | TTS<br>VITS (piper en-GB) | LM<br>Qwen3-0.6B | ASR<br>whisper-small |
@@ -114,7 +115,7 @@ row** — see [what these numbers are not](#what-these-numbers-are-not).
 | Intel Core Ultra 9 285K | x86-64 | 24 (all) | conda-forge | **1.17x** | 0.96x | **1.37x** |
 | AMD Ryzen 3 3250U | x86-64 | 2 (physical) | PyPI wheel | **1.02x** | **1.05x** | 0.80x |
 | AMD Ryzen 3 3250U | x86-64 | 4 (all) | PyPI wheel | 0.99x | **1.04x** | 0.81x |
-| Raspberry Pi 4B | aarch64 | 4 (all) | PyPI wheel | 0.93x | **1.06x** | 0.57x |
+| Raspberry Pi 4B | aarch64 | 4 (all) | PyPI wheel | 0.95x | **1.06x** | 0.57x |
 
 **The ASR column is the only one measured with the estimators matched.** Until 2026-08-29
 `bench_asr_loom.cpp` had no warm-up run while its onnxruntime counterpart did, so every ASR cell timed
@@ -141,25 +142,51 @@ aarch64 without moving x86 at all:
 It was measured on x86 and shipped to every architecture, and **the Pi was not re-measured after it
 landed** — which is the whole of why it survived four days.
 
-**And it has happened again, with the next patch.** `ggml-0012` — worth **2.75x** at whisper's `QK^T`
-on x86 — was checked on this board at that same shape and found neutral, which it is. VITS's matmuls
-are `m = 96 / 100 / 199`, every one of which takes the branch it changed, and there it costs the Pi
-**2.4%** (1.032x and 1.016x over two ABBA-interleaved rounds), most of it in the *convolution*, because
-this repository lowers convolution through the same `sgemm`. **That is why the Pi's TTS cell moved
-0.96x -> 0.93x between 2026-08-29 and 2026-08-30 with no change to the harness.** The lesson Retro-019
-already carries is "measure every ISA a patch is enabled for"; the amendment is **every shape class**,
-since an ISA check at one shape is exactly what let this through. The Pi's LM and ASR cells have not
-been re-measured against it and may carry the same regression. It is open as P4.26 in
-[Epic-05](docs/epics/epic-05-edge-performance.md).
-[Retro-019](docs/retros/retro-019-a-patch-measured-on-one-isa.md) is that lesson;
-[Epic-05](docs/epics/epic-05-edge-performance.md) has the per-shape numbers and the bisect that found
-the mechanism.
+**And it happened again with the next patch — now fixed, and the axis was not the ISA.** `ggml-0012` —
+worth **2.75x** at whisper's `QK^T` on x86 — was checked on this board at that same shape and found
+neutral, which it is. It was never checked at any other shape, and it cost the Pi **2.4%** on VITS,
+most of it in the *convolution*, because this repository lowers convolution through the same `sgemm`.
+**That is why the Pi's TTS cell moved 0.96x -> 0.93x between 2026-08-29 and 2026-08-30 with no change
+to the harness.**
+
+What the patch removes is a per-*output* cost and what it adds is per-*work*, so its benefit decays as
+`1/k` while its cost does not: over a `k` sweep it is 2.04x at `k = 64` and 0.97x at `k = 2304` on the
+285K, 1.01x and 0.90x on the Pi — monotone on both, crossing 1.0 at about the same place. **So the
+predicate is `k`, not the ISA**, and `!defined(__aarch64__)` would have been wrong in both directions.
+Gating the ragged prefix on `k <= 256` keeps every x86 win (whisper's `QK^T` improves further, 1.81x to
+**1.94x**) and returns the Pi to parity with the unpatched tree. P4.26 in
+[Epic-05](docs/epics/epic-05-edge-performance.md) has the sweeps;
+[Retro-022](docs/retros/retro-022-a-benefit-and-a-cost-on-the-same-axis.md) is the lesson, which
+generalises [Retro-019](docs/retros/retro-019-a-patch-measured-on-one-isa.md)'s "measure every ISA a
+patch is enabled for" to **every regime it is enabled for**.
+
+**The Pi's LM and ASR cells did not carry it**, which was the open question when this was found: the
+LM's decode step has `ne1 = 1` and never reaches the blocked GEMM, and whisper's own `QK^T` is `k = 64`
+— the regime the branch is *for* — and measures neutral on that board at the op level and unresolved
+end to end (ASR median 1.007 over four paired rounds, p10 0.989, p90 1.016; LM median 0.995, p10 0.983,
+p90 1.003 over six).
+
+**The Pi's TTS cell is re-measured, and it reads 0.95x** — it was 0.93x with the regression and 0.96x
+before it. Four rounds, both engines back to back on the board, **cooled to a fixed 60 C before every
+arm** and the arm order alternated round to round, onnxruntime normalised to loom's 73 216 samples:
+
+| round | loom | onnxruntime | ratio |
+|---|---:|---:|---:|
+| 1 (loom first) | 1.1154 s | 1.1172 s | 1.002 |
+| 2 (onnx first) | 1.1118 s | 1.0567 s | 0.950 |
+| 3 (loom first) | 1.1193 s | 1.0609 s | 0.948 |
+| 4 (onnx first) | 1.1147 s | 1.0552 s | 0.947 |
+
+**Round 1's onnxruntime arm is the session's first and pays the 63 MB model's cold page cache**; it is
+kept in the table and in the median (0.949) rather than dropped, because dropping the round that
+disagrees is how a number stops being reproducible. The other three span 0.5% and loom's four span
+0.7%, which is what the cooling protocol is for.
 
 **TTS and the LM are at parity on x86; ASR is still behind, and the Pi has regressed.** Most x86 cells
 sit within a few percent of 1.00x, which on these machines is the noise floor rather than a result —
 read them as parity, not as wins. The caveats below matter as much as the numbers.
 
-* **TTS is at parity everywhere**, 0.96x to 1.03x. That is what P4.14/P4.15 was for: a built-in F32
+* **TTS is at parity everywhere**, 0.95x to 1.03x. That is what P4.14/P4.15 was for: a built-in F32
   GEMM micro-kernel, four convolution patches to the pinned `ggml`, and a duplicated text encoder
   removed from the export. Only the 285K's 24-thread row is a clear win, and that one is P4.17. The
   Pi's cell read 0.84x for four days while `ggml-0011` was regressing it (above).

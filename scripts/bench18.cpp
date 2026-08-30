@@ -1,5 +1,16 @@
 // Where threading a unary op starts to pay, measured through ggml's OWN threadpool (P4.25).
 //
+// ** READ THIS FIRST (P4.27, 2026-08-30). THIS BENCH'S GRAPH IS THE TREATMENT. **
+// Its graph is `nodes` TANH nodes and NOTHING ELSE, and ggml plans a thread count per GRAPH:
+// `cplan.n_threads = MIN(max_tasks, n_threads)` where `max_tasks` is the largest `ggml_get_n_tasks`
+// over the graph's nodes. TANH declares `n_tasks = 1`, so WITHOUT the P4.25 patch this graph plans
+// ONE thread whatever you ask for, and the "1 thread against N" comparison below is really "this
+// graph cannot thread against this graph can". The 3.92x is real and it is a property of the bench.
+// A real model graph holds a MUL_MAT, plans the full thread count, and has been threading its TANH
+// nodes all along -- which is why P4.25's patch moved the model 1.005x. `scripts/bench20.cpp` is that
+// in one table; take the threading away with `LOOM_UNARY_SERIAL=1` and the model loses 2.5% on a Pi.
+// The op-level numbers below stand; what they were read to MEAN did not.
+//
 // NOT part of the build. P4.25 needed to decide when a TANH is worth more than one core, and the
 // number cannot come from a raw OpenMP loop (scripts/bench17.c): what it trades against is ggml's
 // in-graph barrier, and -- far more importantly -- ggml's unary ops split over ROWS.
@@ -27,10 +38,9 @@
 // which is the right way to price the op and the wrong way to price the op *in a model*. On the Pi it
 // puts VITS's gate shape [286, 192] at 3.92x (1107.8 -> 282.7 us), so the model's 32 gate nodes ought
 // to be worth ~26 ms of a 1130 ms synthesis -- and twelve paired ABBA rounds of the real model measure
-// essentially nothing. Whatever eats it lives between the nodes, not in them; ggml's threadpool
-// sleeping between two multi-threaded nodes is the named suspect (loom.cpp Retro-017 is that
-// mechanism, from the libgomp side). An isolated op measurement is an upper bound on what a model
-// will see, never an estimate of it.
+// essentially nothing -- because the model was already getting it (P4.27). An isolated op measurement
+// is an upper bound on what a model will see, never an estimate of it, and this one was not even
+// measuring the same plan.
 //
 // BUILD (same recipe as bench15/bench16):
 //
@@ -39,7 +49,7 @@
 //       scripts/bench18.cpp -o bench18 \
 //       -L <ggml-build>/src -L <ggml-build>/src/ggml-cpu -lggml -lggml-base -lggml-cpu -lpthread -lm
 //
-//   ./bench18 [threads] [op]      # op: 0 = TANH (needs the P4.25 patch to thread), 1 = SILU (always)
+//   ./bench18 [threads] [op]      # op: 0 = TANH (see the P4.27 note above), 1 = SILU
 //
 // TWO HARNESS MISTAKES IT IS WRITTEN TO AVOID, both of which produced confident wrong numbers here:
 //  * ONE NODE PER GRAPH. Then every ggml_backend_graph_compute pays a full pool WAKE, and threading
@@ -92,7 +102,9 @@ static double time_one(int64_t ne0, int64_t rows, int threads, int nodes) {
     // INDEPENDENT nodes off one input, not a chain: a chain would time the dependency stall too, and
     // a vocoder's unaries are not a chain.
     // SILU is the same apply_unary_op row-split path and is ALREADY n_tasks = n_threads upstream, so
-    // it measures that path's scaling on a stock build -- which is how the 285K numbers were taken.
+    // this graph plans the full thread count for it and it measures the row-split path on a stock
+    // build -- which is how the 285K numbers were taken, and, per the P4.27 note at the top, the ONLY
+    // arm here whose plan matches what a model graph would give it.
     for (int j = 0; j < nodes; ++j)
         ggml_build_forward_expand(gf, g_op ? ggml_silu(gc, x) : ggml_tanh(gc, x));
     ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
