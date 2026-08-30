@@ -1,5 +1,7 @@
 # onnxruntime's side of the loom comparison: wall time with the duration predictor PINNED, and the
-# per-op / per-shape profile that BACKLOG.md P4.16's table is built from. Not part of the build; run it
+# per-op / per-shape profile P4.16's ORIGINAL table was built from -- superseded by
+# scripts/prof_onnx_conv_shapes.py, which is portable and takes its model as an argument. Not part of
+# the build; run it
 # on the Pi in the venv that has onnxruntime + phoonnx (`~/test` there).
 #
 #   source ~/test/bin/activate && python3 scripts/bench_onnx.py            # wall time, both harnesses
