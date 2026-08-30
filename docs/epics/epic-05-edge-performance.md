@@ -1957,6 +1957,13 @@ P4.13 (quantized conv kernels) **conflicts** with the direct-conv lowering — `
 kernel and a quantized one falls back to the im2col path, so decide between them rather than starting
 both.
 
+> **Resolved when P4.13 shipped (2026-08-30), and the conflict turned out to be a choice, not a
+> collision.** The trade is per FILE, not per build: the kernel fold happens only when the export is
+> block-quantizing, so an F32 or F16 artifact keeps the direct lowering untouched and byte-identical
+> (verified — an unquantized VITS export is byte-for-byte what it was), and only a Q4_0/Q8_0 artifact
+> gives it up. It was never giving up anything it could have had: `ggml_conv_2d_direct` takes an
+> F32/F16 kernel, so a quantized model could not have reached that path in any layout. See P4.13 in §5.
+
 **This is what the item told its own future reader to do first, and it was the right instruction:**
 re-read `scripts/bench6.cpp`'s header, then ggml's `src/ggml-cpu/vec.cpp:ggml_vec_dot_f32` and
 `llamafile/sgemm.cpp`'s `mnpack`/`gemm<M,N>`, and settle the bit-identity oddity BEFORE writing a
@@ -2989,83 +2996,224 @@ one thread) and only build if it is worth more than five percent; and if it is b
 cap, a work floor, and a number from **every** ISA and thread count it is enabled for — the three
 machines here disagreed in sign, not just in magnitude.
 
-### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — SCOPED, NOT STARTED
+### P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0 — DONE 2026-08-30
 
-**Do this before P5.** Not because P5 depends on it, but because it closes the thread P4.12 opened and
-the measurements below are fresh: the eligibility half shipped on
-`loom.cpp feature/packed-conv-kernels` + `loom-exporter feature/phoneme-lexicon-model-cards`, and this
-is the other half. Left alone, `--quantize Q8_0` on a convolutional model keeps reporting a 0% file
-and the reason keeps having to be re-derived.
+**VITS exports at Q4_0 to 30.6 MB and still says the sentence.** 81.7 MB → 30.6 MB, coverage 0% →
+73%, 114 conv kernels quantized where the previous build quantized none and printed a warning about
+it. The audio transcribes through whisper-small as *"Hey, can you shut down the computer, my friend?"*
+— which is the utterance, and which is more of it than the F32 arm's own transcript recovers (*"A. Can
+you shut down the computer, my friend?"*: whisper mishears the leading "Hey" on the unquantized file).
 
-**One sentence.** A convolution kernel is stored `[K, IC, OC]`, ggml lays quantization blocks along
-`ne[0]`, `ne[0]` is the KERNEL WIDTH (1, 3, 5 ...), and no block size divides that — so no conv kernel
-is block-quantizable *as stored*, and the fix is to store it `[IC*K, OC]` and give the op the geometry
-it loses.
+**And it costs 2.08x in speed on x86-64.** That is the result this item could not predict and the one
+that should govern whether anyone turns it on; it is decomposed below.
 
-### What already landed, and what it did not solve
+#### What the problem was, in one sentence
 
-Two independent gates decide whether a weight gets quantized, and only the first is fixed:
+A convolution kernel is stored `[K, IC, OC]`, ggml lays quantization blocks along `ne[0]`, `ne[0]` is
+the KERNEL WIDTH (1, 3, 5 …), and no block size divides that — so **no conv kernel was
+block-quantizable as stored**, and P4.12's operand swap, which fixed the *op* gate, bought nothing on
+its own. Measured on `vits-piper-en-gb-miro`: 117 distinct conv kernels, every one of them eligible by
+op, **zero** of them block-alignable, and a Q8_0 export byte-identical to its F32 one.
 
-1. **Op eligibility — FIXED.** Only a MUL_MAT's *first* operand can be non-F32
-   (`ggml_compute_forward_mul_mat` asserts `src1->type == GGML_TYPE_F32` for the operand it converts),
-   and every conv kernel sat in the second. `primitives_conv.cpp` now branches on the kernel dtype:
-   an F16 kernel keeps its slot and the **im2col follows it** (`conv_im2col_type`, :77 — legal because
-   `vec_dot_type[F16]` is F16, and cheaper than converting the big operand per call); a block-quantized
-   kernel moves to the first operand via `mul_mat_kernel_first` (:85) and pays a transpose back.
-   `conv_kernel_is_packed` (:66) is the predicate. F32 runs the identical graph as before.
-   The exporter's `PACKED_WEIGHT_FIRST_OPS` (`exporter.py:2438`) offers conv ops accordingly.
-2. **Block alignment — OPEN, and this entry.** `exporter.py:2713` declines any tensor whose fastest
-   axis is not a multiple of the block size. For a conv kernel that axis is `K`, so **every real conv
-   kernel is declined** and Q8_0 changes nothing. F16 slips through only because its block size is 1.
+#### What shipped, in two halves
 
-The warning at `exporter.py` now reports the two separately ("N weight(s) WERE eligible by op and were
-declined for shape") — do not let a future edit re-merge them, that wording is what made the cause
-findable at all.
+**The exporter FOLDS an eligible kernel's spatial axes into `ne[0]`.** `[K, IC, OC]` becomes
+`[IC*K, OC]`; `[KW, KH, IC, OC]` becomes `[IC*KH*KW, OC]`. `ne[0]` is then a channel count, which is a
+multiple of 32 essentially always: **114 of VITS's 117 kernels align, 100.0% of the convolution
+bytes** (the three that do not are `[1, 1, 192]` duration-predictor pre-nets holding 768 bytes each).
+`LoomGGUFExporter._fold_conv_kernels_for_quantization` is the pass.
 
-### The measurement that says it is worth doing
+The fold moves no bytes. A C-order `(OC, IC, K)` array reshaped to `(OC, IC*K)` is the same buffer read
+differently, and it is the *identical* reinterpretation `op_conv_1d` already performed on the kernel on
+every call before handing it to the mul_mat. What the fold does is move that reshape from run time to
+export time — which is why it is safe to do to a stored tensor and not only to a view of one.
 
-VITS (`vits-piper-en-gb-miro`, 81.5 MB of weights, 132 conv kernels holding 62.2 MB):
+**The engine takes the geometry back as attrs.** The fold erases the shape the convolution *is*, so
+the node carries it: `kernel_k`/`kernel_ic` for CONV_1D, `kernel_kw`/`kernel_kh`/`kernel_ic` for
+CONV_2D. OC survives as `ne[1]` and is deliberately not restated. `folded_kernel_geometry` in
+`src/ops/primitives_conv.cpp` reads them, and **their presence is the signal, not the tensor's rank** —
+which cannot tell a folded `[IC*K, OC]` from a declared `[K, IC]` with OC left implicit.
 
-| stored as | aligned for block 32 |
-|---|---|
-| `[K, IC, OC]` (today) | **0 / 132** |
-| `[IC*K, OC]` (proposed) | **117 / 132 = 100.0% of conv BYTES** (the 15 stragglers are rounding dust) |
+Feasible at all because **`ggml_compute_forward_im2col_f32/f16` touch `src1->data` only**: `src0`, the
+kernel, is read purely for `ne[0]`/`ne[1]` (and `ne[2]` when `is_2D`), to size the patch matrix. What
+im2col wants from a kernel is a *shape*, so it is given one.
 
-Projected file: **81.5 -> 28.1 MB at Q4_0**, 35.8 MB at Q8_0. The same reshape helps every
-convolutional family — conv kernels are 53-92% of the weight bytes in Kokoro/Matcha/StyleTTS2/
-Supertonic and 126-303 MB inside the NeMo ASR encoders.
+#### Three departures from the sketch, each of which made it smaller
 
-### Why it is feasible: im2col never reads the kernel
+**1. The fold is quantize-only, so no export baseline moves.** The item predicted "the export sweep is
+re-recorded: every conv model's tensor shapes change". It does not, because
+`_fold_conv_kernels_for_quantization` returns immediately when the block size is 1 — no `--quantize`,
+or F16/BF16. **Verified rather than reasoned: an unquantized VITS export is byte-for-byte identical
+before and after this change** (`cmp`, on the whole 81.7 MB file). Every gate that runs on an F32
+fixture is therefore untouched, and confirmed so — the four conv-heavy MIL driver gates (VITS, Matcha,
+Kokoro, StyleTTS2) plus Whisper all pass unchanged.
 
-`ggml_compute_forward_im2col_f32` (ggml-cpu/ops.cpp) touches **`src1->data` only**; `src0` (the kernel)
-is used purely for `ne[0]/ne[1]/ne[2]` to size the patch matrix. So the kernel passed to `ggml_im2col`
-needs correct dimensions and nothing else — its contents are never read. That is the whole reason this
-is a moderate change rather than a reimplementation of im2col.
+**2. The shape carrier is the kernel MINUS its OC axis, which is why it is free.** The sketch's carrier
+was a `[K, IC, OC]` leaf gallocr has to allocate — ~1.7 MB for VITS's largest kernel, and the item's
+one real cost to decide. But im2col never reads `a->ne[3]`, and in the 1-D case never reads `a->ne[2]`
+either: **OC is not part of the patch geometry.** So the carrier is `[K, IC]` (1-D) or `[KW, KH, IC]`
+(2-D). VITS's largest is 3×512 floats — **6 KB**, and every carrier in the model together is under a
+megabyte. The "carry a ggml delta with an explicit-dims `ggml_im2col`" fallback the sketch warned
+against was never needed.
 
-### Design sketch
+**3. The direct-conv conflict was a per-file choice, not a collision.** §2 recorded P4.13 as
+*conflicting* with the direct-conv lowering (`ggml_conv_2d_direct`, ggml-0006) and said to pick one.
+Both ship: an F32/F16 artifact keeps the direct lowering, a quantized one gives it up. It gives up
+nothing it could have had — `ggml_conv_2d_direct` takes an F32/F16 kernel, so a quantized model could
+not reach that path in any layout.
 
-* **Exporter** — store an eligible conv kernel as `[IC*K, OC]` and put `k`/`ic` on the CONV node's
-  attrs (the op currently recovers both from the kernel's own shape). Keep the 3-D form for kernels
-  that stay F32, or make 2-D unconditional and let the op reshape back — decide by whichever keeps the
-  gate baselines readable. `_collect_mul_mat_weight_names` already selects the right tensors.
-* **Engine** — in `op_conv_1d`/`op_conv_2d`, when the kernel arrives 2-D, build a **shape carrier** with
-  `ne = [K, IC, OC]` to hand `ggml_im2col`, then `mul_mat_kernel_first(kernel_2d, im2col_2d)` exactly as
-  today. The kernel is ALREADY the shape the mul_mat wants, so this path gets *simpler*, not harder.
-* **The one real cost to decide.** The shape carrier is a graph leaf, so `gallocr` allocates it even
-  though nothing reads it — ~1.7 MB for VITS's largest kernel, reused across the graph, so peak is the
-  largest single kernel and not the sum. If that is unacceptable on an edge target the alternative is a
-  patched `ggml_im2col` taking explicit dims, which means carrying a ggml delta; do not start there.
+#### The fold, isolated from the quantization — and this is the measurement that proves it correct
 
-### Acceptance
+The fold and the packing always ship together, so a difference in a Q4_0 file's audio cannot say which
+of the two caused it. **Force the fold on an otherwise untouched F32 export and the question separates**
+— same dtype, same bytes, same everything else, so the resulting waveform measures the fold and nothing
+else. Eight lines, and worth re-running against any future change to either side:
 
-* `vits-piper-en-gb-miro` exports at Q4_0 to ~28 MB with a non-zero coverage line and no WARNING.
-* Its audio still transcribes correctly through whisper-small (the ASR oracle; correlation alone is not
-  enough — see P4.12, and see the StyleTTS2 note below).
-* `test_conv_1d_quantized_kernel_matches_f32` (tests/ci/test_primitive_registry.cpp:774) still passes,
-  and gains a 2-D-kernel sibling. It is the test that catches a wrong transpose — verified by sabotage:
-  replacing the transpose with a bare reshape fails it, and produces a right-shaped tensor with the
-  right numbers in the wrong places, which nothing else notices.
-* The export sweep is re-recorded: every conv model's tensor shapes change.
+```python
+from loom_exporter.exporter import LoomGGUFExporter
+from loom_exporter.main_export import main_export
+_orig = LoomGGUFExporter.write_gguf
+def patched(self, driver_script):
+    self._fold_conv_kernels_for_quantization(32)   # `quantize` stays None, so nothing is packed
+    return _orig(self, driver_script)
+LoomGGUFExporter.write_gguf = patched
+main_export(CKPT, OUT, task="text-to-speech", model="vits")
+```
+
+All 114 kernels fold; the file stays F32. Against the declared-layout export, over the same synthesis:
+**identical sample count (73216), max abs diff 3.05e-05, rmse 4.07e-07, correlation 1.00000000.** That
+3.05e-05 is one LSB of the 16-bit WAV the two arms were compared through — i.e. the two float waveforms
+are the same waveform. **Every difference in a quantized file's output is the quantization, not the
+fold**, and that is now a measured statement about a real 117-kernel model rather than an inference
+from unit tests.
+
+#### What it is worth, on four models
+
+Coverage is the fraction of F32 weight BYTES the file quantizes — the number that says whether the file
+actually moved, which a tensor count does not.
+
+| model | quant | coverage before → after | file |
+|---|---|---|---|
+| vits-piper-en-gb-miro | Q4_0 | **0% → 73%** | 81.7 → **30.6 MB** |
+| matcha-tts-ljspeech | Q8_0 | 21% → **90%** | 128.7 → **44.1 MB** |
+| kokoro-82m | Q8_0 | 29% → **74%** | 325.5 → **149.2 MB** |
+| styletts2-ljspeech | Q8_0 | 43% → **79%** | 411.0 → **172.4 MB** |
+
+VITS is the extreme case and the reason the item existed: it is the one model where *nothing* was
+quantizable before, because it has no MUL_MAT weight that is not a convolution.
+
+#### The 2.08x, decomposed — read this before turning it on
+
+Ryzen 3 3250U (2 cores / 4 threads), 4 threads, `scripts/bench_vits_loom.cpp` with the three scales
+pinned so both arms synthesise the same utterance, arms interleaved A-B-B-A over two rounds on an idle
+box, best-of-7 per arm.
+
+| arm | lowering | time | vs declared F32 |
+|---|---|---|---|
+| declared F32 | `ggml_conv_2d_direct` (+ bias and resblock fusions) | **0.50 s** | 1.00x |
+| **folded** F32 | im2col + mul_mat | **0.78 s** | **1.55x slower** |
+| **folded Q4_0** | im2col + mul_mat, packed weights | **1.04 s**¹ | **2.08x slower** |
+
+¹ Q4_0 synthesises 67840 samples rather than 73216 — quantizing the duration predictor changes the
+predicted durations — so its 0.96 s raw is normalised to the F32 arms' sample count. The two F32 arms
+need no normalisation; they produce the same 73216 samples.
+
+**Where the 1.55x goes, and it is not the arithmetic.** A quantized kernel cannot use
+`GGML_OP_CONV_2D`, and three shipped patches hang off that op: ggml-0006's direct cache-blocked
+convolution (4.7x on this machine's long-activation convs), ggml-0005's bias fusion, and ggml-0007's
+resblock LEAKY_RELU + residual-ADD fusion. Folding costs all three at once. The remaining **1.33x** on
+top is the quantized dot products themselves.
+
+**So the trade on a convolutional model is ~2.7x smaller for ~2x slower**, on this machine. That is a
+real choice and not a defect, but it is the opposite of what quantization bought the LMs — qwen3 at
+Q8_0 got 1.22x *faster*, because a transformer's weights were already in the operand ggml can read
+packed and there was no fused direct-convolution path to give up. **Do not carry "quantization makes it
+faster" across from the LM column.** Where it is worth it is a size-constrained edge target: VITS in
+30.6 MB at half the speed is a different product from VITS in 81.7 MB, and only the deployment knows
+which one it wants.
+
+Not measured, and the obvious next question: **aarch64**, where the direct lowering is worth 1.18x
+rather than 4.7x, so the 1.55x arm should shrink and the trade should look better. And a **GPU**, where
+the whole comparison is different code.
+
+#### What is deliberately not folded
+
+* **Anything, unless the export is block-quantizing.** See departure 1 above.
+* **The depthwise forms and SHORT_CONV.** Not a size trade-off, a correctness one: their mul_mat is
+  BATCHED per channel over `ne[2]`, so flattening `ne[0..1]` turns a per-channel pairing into a cross
+  product — a wrong answer, not a slower one. It would not pay anyway: a depthwise kernel is
+  `[K, 1, C]`, so the fold puts K alone on `ne[0]` and K is 3.
+* **A kernel any other node reads.** A weight that is also a MUL_MAT operand, or any node's second
+  input, must keep the shape that consumer expects. There is no shape that satisfies both, so the fold
+  declines rather than reconciles.
+* **A kernel still unaligned after folding.** Folding it would cost the geometry and gain nothing.
+
+The export's declined-for-shape line now reports exactly this remainder, and its wording says so.
+Keeping the two gates — eligible-by-op and declined-for-shape — reported separately is what made the
+original cause findable at all; do not let a future edit re-merge them.
+
+#### What P4.13 leaves open, and the biggest one is not a quantization question
+
+**1. 62% of the Q4_0 VITS file is zero padding, and no quantization gate can ever reach it.** Found by
+asking what the remaining 22.0 MB of F32 actually is. Twelve tensors named `text.padded*`, `ne=[96,
+4105, 1]`, **1.576 MB each and 99.78% zeros** — 864 nonzero values out of 394080, contiguous in one
+band. 18.9 MB of the 30.6 MB file. They are the relative-position tables of the text encoder's
+attention, and the node that reads one is
+
+```
+VIEW  text.padded_1 -> [96, 2*n_tokens - 1, 1]  at offset  788352 - 384*n_tokens
+```
+
+i.e. `pad_crop_relative_embeddings` — which this engine already has as a primitive
+(`src/core/relative_position.cpp`) — **constant-folded by the MIL trace into a materialised weight
+sized for a maximum `n_tokens`**. The zeros are genuinely read (the crop slides into the zero band for
+a short sequence), so they cannot be dropped; they need not be STORED, because the pad is reproducible
+at graph-build time from a ~3.5 KB table. Estimated from the measured zero fraction: **VITS Q4_0
+30.6 -> ~11.8 MB, and F32 81.7 -> ~62.8 MB** — larger than everything the fold itself won, and it
+helps the unquantized file too.
+
+It is an exporter constant-folding item, not a quantization one, and it is filed as such in the ledger.
+Quantization was never going to touch it: the tables are a VIEW's source, and only a mul_mat's first
+operand is eligible. Note the `4105` is also a fixed-maximum-length artifact, the same shape of problem
+as [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md).
+
+**2. Intelligibility is verified for VITS and for nothing else.** See the StyleTTS2 flag at the end of
+this section, which P4.13 made more urgent rather than settling.
+
+**3. The speed trade is measured on one x86-64 box only.** aarch64 should look better (the direct
+lowering is worth 1.18x there rather than 4.7x, so the 1.55x arm shrinks); a GPU is different code
+entirely.
+
+**4. A folded kernel has never run on a device backend.** The shape carrier is an ordinary allocated
+F32 leaf that nothing writes and nothing reads, and Vulkan/CUDA/Metal all implement `IM2COL`, so
+there is no reason to expect trouble — but "no reason to expect trouble" is not a measurement, and
+`ggml_vk_op_f32` binds `src0`'s buffer whether or not its shader reads it. Run a quantized conv model
+on the Vulkan build before claiming GPU support for one.
+
+**5. The depthwise exclusion costs nothing, and this is worth recording so nobody re-opens it.**
+Measured on the Q4_0 VITS: the twelve never-folded depthwise kernels hold **0.028 MB**, and the three
+dense kernels still unaligned after folding hold 0.002 MB. Together 0.1% of what stays F32. The
+correctness argument against folding them stands on its own, but even if it did not, there is no prize.
+
+#### Testing
+
+`tests/ci/test_primitive_registry.cpp` gained three: `test_conv_1d_folded_kernel_matches_declared`
+(three arms in one graph — declared F32, folded F32, folded Q8_0),
+`test_conv_2d_folded_kernel_matches_declared`, and
+`test_conv_1d_folded_kernel_rejects_inconsistent_geometry`. `tests/ci/test_quantize_export.py` gained
+six on the exporter side, including the two declines above and the F32-export-does-not-fold claim.
+
+**Verified by sabotage, which is the only reason to believe the exactness arms.** Replacing
+`mul_mat_kernel_first`'s transpose with a bare reshape fails all three arms of the 1-D test, the 2-D
+test, and P4.12's own `test_conv_1d_quantized_kernel_matches_f32` — the failure it exists to catch is a
+right-shaped tensor full of the right numbers in the wrong places, which nothing else notices.
+
+One thing the sabotage changed in the design: **swapping `kernel_k` and `kernel_ic` keeps their product
+equal to `ne[0]`, so a kernel-side consistency check passes it** — and what it produced was a raw
+`GGML_ASSERT` abort inside `ggml_im2col` naming no kernel, no attr and no model. `folded_kernel_geometry`
+therefore also compares the declared IC against the *activation's* own channel count, which is what
+turns that into a named `SchemaError`. That check exists because the sabotage found the gap, not
+because it was designed in.
 
 ### Benchmarks on record (Ryzen 3 3250U, CPU, medians)
 
@@ -3076,13 +3224,17 @@ is a moderate change rather than a reimplementation of im2col.
 | matcha | Q8_0 | 17% | 129 -> 109 MB | 1.13x slower |
 | vits | F16 | 67% | 81.7 -> 52.0 MB | **1.8x SLOWER**, cosine 0.999895 |
 
+**These coverages and sizes are PRE-P4.13 and are kept only for the timing column** — the fold moved
+every convolutional row of this table, and the current numbers are in P4.13's own table above.
+
 Read these together before assuming Q4_0 will be fast: **integer quants and F16 behave oppositely
 here.** Q8_0 sped qwen3 up (real integer SIMD vec_dot, activations quantized to match) while F16 lost
 badly — this CPU has `f16c` (convert) and no native FP16 arithmetic, so every F16 dot converts to F32
 first. That is a property of THIS box; expect it to invert on the RTX 5090 workstation, which is where
 the GPU numbers should be taken and have NOT been. The TTS slowdowns also correlate with low coverage
-on small compute-bound models, which is exactly what this entry raises — so Q4_0 on VITS is the first
-case where a conv model gets high coverage, and its speed is genuinely unknown rather than predicted.
+on small compute-bound models — and P4.13's own measurement is what settled where that goes: at HIGH
+coverage VITS is 2.08x slower, and the mechanism is the lost direct-convolution lowering rather than
+the arithmetic.
 
 ### Do not spend time on K-quants
 
@@ -3090,8 +3242,9 @@ case where a conv model gets high coverage, and its speed is genuinely unknown r
 exists but `gguf.quants` raises `NotImplementedError` for every K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K), so
 this toolchain cannot write one. `main_export.quantize_choices()` (:24) derives the offered list by
 probing the writer for exactly this reason. Writable today: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
-Q8_0, TQ1_0, TQ2_0. K-quants also use block **256**, where only 9/132 VITS kernels would align even
-after the reshape — so they lose twice over. **Q4_0 is the target.**
+Q8_0, TQ1_0, TQ2_0. K-quants also use block **256**, where — re-measured on the real folded layout now
+that P4.13 exists — only **6 of VITS's 117** conv kernels align against block 32's 114, 17.9% of the
+convolution bytes against 100.0%. They lose twice over. **Q4_0 is the target.**
 
 ### Unrelated flag found while benchmarking, worth its own look
 
@@ -3102,5 +3255,15 @@ deterministic CFM stayed at 0.985) — but that is a HYPOTHESIS, not a verified 
 standing reminder that plausible-sounding TTS reasoning has been wrong before. Verify before shipping a
 quantized StyleTTS2.
 
----
+**P4.13 raised the stakes on this and did not settle it.** Those correlations were measured when Q8_0
+reached 43% of StyleTTS2 and 21% of Matcha; the fold takes them to 79% and 90%, so neither number
+describes the file the toolchain produces now. One new measurement, on Matcha: against the frozen
+PyTorch reference waveform its Q8_0 export moves from **max abs diff 0.0105 (F32) to 0.498**, on a
+reference whose own peak is 0.332 and rms 0.044 — i.e. the error is no longer small against the signal.
+The fold is not the cause (see the isolated-fold measurement above, correlation 1.00000000), and the
+`test_e2e_matcha_mil_lua_driver` gate that reports it is an exact-fp32 comparison a quantized file was
+never expected to pass. What is genuinely unknown is **intelligibility**, and the only oracle for that
+is ASR on real phonemes — which P4.13 ran for VITS and for no other family. Do it for Matcha, Kokoro
+and StyleTTS2 before shipping any of them quantized.
 
+---

@@ -823,6 +823,183 @@ void test_conv_1d_quantized_kernel_matches_f32() {
     LOOM_CHECK(ok);
 }
 
+// P4.13's engine half. A conv kernel the exporter FOLDED to [IC*K, OC] -- so that ne[0], where ggml
+// lays quantization blocks, becomes a channel count instead of a kernel width of 3 -- held against the
+// SAME weights in the declared [K, IC, OC] layout, in one graph.
+//
+// Three arms on purpose, and each rules out a different wrong answer:
+//
+//   * declared F32 (the reference) vs FOLDED F32. This is the arm that catches the fold being a
+//     PERMUTATION rather than a reinterpretation. Both arms hold identical bytes, so a fold that
+//     shuffled them -- or an op that recovered K and IC the wrong way round -- produces a
+//     right-shaped tensor full of the right numbers in the wrong places, which is exactly the failure
+//     nothing else notices. Verified by sabotage: replacing `mul_mat_kernel_first`'s transpose with a
+//     bare reshape fails all three arms of this test (and the declared-layout siblings above with it).
+//     Swapping `kernel_ic` and `kernel_k` does NOT reach a number -- it is refused by
+//     `folded_kernel_geometry`'s IC check, which is what the throw test below pins.
+//   * declared F32 vs FOLDED Q8_0, which is the combination a real quantized export actually produces
+//     and the only one that exercises the packed path and the fold together.
+//
+// The tolerance on the first pair is loose enough to survive a different summation order and nothing
+// more: the declared arm lowers to `ggml_conv_2d_direct` and the folded one to im2col + mul_mat, which
+// are two different accumulations of the same products. A wrong fold misses by ORDERS of that.
+void test_conv_1d_folded_kernel_matches_declared() {
+    GgmlScratch s;
+    // IC=32 so IC*K is block-aligned for Q8_0 (which is the whole point of the fold), K=3 because that
+    // is the width every real convolutional model uses and the one no block size divides.
+    constexpr int64_t kK = 3, kIC = 32, kOC = 5, kIL = 11;
+    std::vector<float> kernel_data(kK * kIC * kOC);
+    for (size_t i = 0; i < kernel_data.size(); ++i) kernel_data[i] = std::sin(0.41f * static_cast<float>(i));
+    std::vector<float> data_data(kIL * kIC);
+    for (size_t i = 0; i < data_data.size(); ++i) data_data[i] = std::cos(0.17f * static_cast<float>(i));
+
+    const nlohmann::json declared = {{"s0", 1}, {"p0", 1}, {"d0", 1}};
+    // What the exporter writes beside a folded kernel: the geometry the fold erased. OC is not among
+    // them -- it survives as ne[1] -- and their PRESENCE is what tells the op the kernel is folded.
+    const nlohmann::json folded = {{"s0", 1}, {"p0", 1}, {"d0", 1},
+                                   {"kernel_k", kK}, {"kernel_ic", kIC}};
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+
+    ggml_tensor* k3 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, kK, kIC, kOC);
+    ggml_set_input(k3);
+    ggml_tensor* d3 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(d3);
+    ggml_tensor* out3 = op("CONV_1D")(pc, {k3, d3}, declared)[0];
+
+    ggml_tensor* k2 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIC * kK, kOC);
+    ggml_set_input(k2);
+    ggml_tensor* d2 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(d2);
+    ggml_tensor* out2 = op("CONV_1D")(pc, {k2, d2}, folded)[0];
+
+    ggml_tensor* kq = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_Q8_0, kIC * kK, kOC);
+    ggml_set_input(kq);
+    ggml_tensor* dq = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(dq);
+    ggml_tensor* outq = op("CONV_1D")(pc, {kq, dq}, folded)[0];
+
+    // The declared geometry comes back from all three, which is what makes the fold invisible to
+    // everything downstream of this op.
+    for (ggml_tensor* out : {out2, outq}) {
+        LOOM_CHECK(out->ne[0] == out3->ne[0]);
+        LOOM_CHECK(out->ne[1] == out3->ne[1]);
+        LOOM_CHECK(out->ne[2] == out3->ne[2]);
+    }
+    LOOM_CHECK(out3->ne[1] == kOC);
+
+    ggml_cgraph* gf = ggml_new_graph(s.ctx.get());
+    ggml_build_forward_expand(gf, out3);
+    ggml_build_forward_expand(gf, out2);
+    ggml_build_forward_expand(gf, outq);
+    ggml_gallocr_alloc_graph(s.galloc.get(), gf);
+
+    set_f32(k3, kernel_data);
+    set_f32(d3, data_data);
+    // The fold is a pure reinterpretation of the SAME buffer -- that claim is what the identical
+    // `kernel_data` here, written into a differently-shaped tensor, is asserting.
+    set_f32(k2, kernel_data);
+    set_f32(d2, data_data);
+    std::vector<char> packed(ggml_nbytes(kq));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, kernel_data.data(), packed.data(), 0, kOC, kIC * kK, nullptr);
+    std::memcpy(kq->data, packed.data(), packed.size());
+    set_f32(dq, data_data);
+    s.compute(gf);
+
+    const std::vector<float> a = get_f32(out3), b = get_f32(out2), c = get_f32(outq);
+    LOOM_CHECK(a.size() == b.size() && a.size() == c.size());
+    bool exact_enough = true, quantized_ok = true;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::fabs(a[i] - b[i]) > 1e-4f * std::max(1.0f, std::fabs(a[i]))) exact_enough = false;
+        if (std::fabs(a[i] - c[i]) > 5e-2f * std::max(1.0f, std::fabs(a[i]))) quantized_ok = false;
+    }
+    LOOM_CHECK(exact_enough);
+    LOOM_CHECK(quantized_ok);
+}
+
+// The same claim for the 2-D form, where the fold swallows three axes instead of two and the op has to
+// hand `ggml_im2col` a THREE-dimensional patch geometry. Q8_0-free: the operand swap and the transpose
+// back are already covered above, and what is unproven here is only that KW, KH and IC come back out in
+// the order they went in -- which an exact-ish comparison against the declared layout answers, and
+// which a quantization tolerance would only obscure.
+void test_conv_2d_folded_kernel_matches_declared() {
+    GgmlScratch s;
+    constexpr int64_t kKW = 3, kKH = 2, kIC = 16, kOC = 4, kIW = 7, kIH = 5;
+    std::vector<float> kernel_data(kKW * kKH * kIC * kOC);
+    for (size_t i = 0; i < kernel_data.size(); ++i) kernel_data[i] = std::sin(0.29f * static_cast<float>(i));
+    std::vector<float> data_data(kIW * kIH * kIC);
+    for (size_t i = 0; i < data_data.size(); ++i) data_data[i] = std::cos(0.11f * static_cast<float>(i));
+
+    const nlohmann::json declared = {{"s0", 1}, {"s1", 1}, {"p0", 0}, {"p1", 0}, {"d0", 1}, {"d1", 1}};
+    nlohmann::json folded = declared;
+    folded["kernel_kw"] = kKW;
+    folded["kernel_kh"] = kKH;
+    folded["kernel_ic"] = kIC;
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+
+    ggml_tensor* k4 = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, kKW, kKH, kIC, kOC);
+    ggml_set_input(k4);
+    ggml_tensor* d4 = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, kIW, kIH, kIC, 1);
+    ggml_set_input(d4);
+    ggml_tensor* out4 = op("CONV_2D")(pc, {k4, d4}, declared)[0];
+
+    ggml_tensor* k2 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIC * kKH * kKW, kOC);
+    ggml_set_input(k2);
+    ggml_tensor* d2 = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, kIW, kIH, kIC, 1);
+    ggml_set_input(d2);
+    ggml_tensor* out2 = op("CONV_2D")(pc, {k2, d2}, folded)[0];
+
+    for (int i = 0; i < 4; ++i) LOOM_CHECK(out2->ne[i] == out4->ne[i]);
+    LOOM_CHECK(out4->ne[2] == kOC);
+
+    ggml_cgraph* gf = ggml_new_graph(s.ctx.get());
+    ggml_build_forward_expand(gf, out4);
+    ggml_build_forward_expand(gf, out2);
+    ggml_gallocr_alloc_graph(s.galloc.get(), gf);
+    set_f32(k4, kernel_data);
+    set_f32(d4, data_data);
+    set_f32(k2, kernel_data);
+    set_f32(d2, data_data);
+    s.compute(gf);
+
+    const std::vector<float> a = get_f32(out4), b = get_f32(out2);
+    LOOM_CHECK(a.size() == b.size());
+    bool ok = true;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::fabs(a[i] - b[i]) > 1e-4f * std::max(1.0f, std::fabs(a[i]))) ok = false;
+    }
+    LOOM_CHECK(ok);
+}
+
+// A fold whose attrs and whose tensor disagree is a corrupt file, and it has to say so HERE. Without
+// the check the geometry simply flows into ggml_im2col, which sizes a patch matrix from it and either
+// asserts somewhere with no mention of the kernel or -- worse, when the numbers happen to be
+// self-consistent -- computes a wrong convolution silently.
+void test_conv_1d_folded_kernel_rejects_inconsistent_geometry() {
+    GgmlScratch s;
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* k2 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 32 * 3, 5);   // IC*K = 96
+    ggml_tensor* d2 = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 11, 32);
+    // 32 * 4 = 128, not the 96 the tensor has.
+    LOOM_CHECK_THROWS(op("CONV_1D")(pc, {k2, d2}, nlohmann::json{{"s0", 1}, {"p0", 1}, {"d0", 1},
+                                                                 {"kernel_k", 4}, {"kernel_ic", 32}}),
+                       loom::SchemaError);
+    // Still 3-D, so the fold attrs describe a tensor that is not the one that arrived.
+    ggml_tensor* k3 = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 3, 32, 5);
+    LOOM_CHECK_THROWS(op("CONV_1D")(pc, {k3, d2}, nlohmann::json{{"s0", 1}, {"p0", 1}, {"d0", 1},
+                                                                 {"kernel_k", 3}, {"kernel_ic", 32}}),
+                       loom::SchemaError);
+    // K and IC swapped. Their PRODUCT is still 96, so the kernel-side check passes and only the
+    // comparison against the activation's own channel count catches it -- and without that comparison
+    // this is a GGML_ASSERT abort inside ggml_im2col rather than an error naming the model.
+    LOOM_CHECK_THROWS(op("CONV_1D")(pc, {k2, d2}, nlohmann::json{{"s0", 1}, {"p0", 1}, {"d0", 1},
+                                                                 {"kernel_k", 32}, {"kernel_ic", 3}}),
+                       loom::SchemaError);
+}
+
 void test_conv_2d() {
     GgmlScratch s;
     // kernel: KW=2, KH=2, IC=1, OC=1, all weights=1 (2x2 sum filter).
@@ -2527,6 +2704,9 @@ int main() {
     test_conv_2d();
     test_conv_1d_packed_kernel_matches_f32();
     test_conv_1d_quantized_kernel_matches_f32();
+    test_conv_1d_folded_kernel_matches_declared();
+    test_conv_2d_folded_kernel_matches_declared();
+    test_conv_1d_folded_kernel_rejects_inconsistent_geometry();
     test_conv_2d_dw();
     test_conv_transpose_1d();
     test_conv_transpose_2d();
