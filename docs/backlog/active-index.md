@@ -158,15 +158,15 @@ are not renumbered. New items continue the scheme.
   VITS's small `m` *and* `m = 1500` on both ISAs. It moved the README's Pi TTS cell 0.96x -> 0.93x; the
   Pi's LM and ASR cells have **not** been re-measured and may carry it too.
   → [Epic-05 §5](../epics/epic-05-edge-performance.md)
-* [ ] **P4.25 — ggml runs `TANH`/`SIGMOID` on one core, with a scalar `tanhf`.** The only thing in the
-  VITS profile that is **not** against a roofline, and P4.16's re-measurement is what found it.
-  `ggml_get_n_tasks` gives the cheap-unary list `n_tasks = 1` while `GELU`/`SILU` get `n_threads`, and
-  `ggml_vec_tanh_f32`/`ggml_vec_sigmoid_f32` have no SIMD path. VITS's WN gate: **30.4 ms per
-  synthesis at one thread and 30.4 ms at four**, on 220 KB tensors at 0.46 GB/s — 39% of the whole
-  78 ms gap to onnxruntime. **Do the thread count first**: one line, no accuracy question, and it
-  bounds the SIMD half. Measure it on more than one thread ([Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md)),
-  and read Retro-012's `ggml_v_expf` entry before opening the SIMD half — that is the case where a real
-  speed-up on the transcendental had no accessible headroom in the op around it.
+* [ ] **P4.27 — 26 ms of op-level saving arrived as 5 ms of wall, and nobody knows where it went.**
+  Opened by P4.25's negative result, and worth more than P4.25 was. VITS's 32 gate nodes measure
+  **825 us each faster** when threaded (`scripts/bench18.cpp`, ggml's own threadpool, 3.92x at the
+  exact shape) and the model moves **0.5%**, twelve paired ABBA rounds. Every number on both sides is
+  careful; the loss is *between* the nodes. **Named suspect: ggml's threadpool sleeping between two
+  multi-threaded nodes** — [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md) is
+  that mechanism from the libgomp side. If it is that, it is a tax on **every** threaded node in every
+  model, not on 32 of them in one. Measure before building: instrument the gap between nodes, or A/B a
+  graph of N threaded nodes against the same N interleaved with single-threaded ones.
   → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0.** Op eligibility is fixed;
   layout alignment is not (0 of 132 VITS kernels align for block 32 as stored). Acceptance: VITS exports

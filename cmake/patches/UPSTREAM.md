@@ -793,3 +793,52 @@ condition is inherited unchanged rather than re-derived. (3) The residual gap �
 15.0 ms where `m = 1504` reaches 10.9 — is `ldc` alignment, not sharing: 1500 floats is 6000 bytes, so
 a 64-byte store still straddles two lines on odd columns. Padding `C` would close it and is a bigger
 change than this.
+
+## Not a PR here, but upstream should know: `apply_unary_op` splits over rows, so `nrows = 1` is all barrier
+
+**No patch in this directory depends on this.** It was found by loom P4.25, which built a patch to
+thread ggml's cheap-unary list, measured it out end to end (Epic-05 §5, Retro-012) and dropped it.
+The *finding* survives the patch and is worth carrying upstream on its own, because it is a property
+of code that ships today.
+
+`apply_unary_op` (`ggml-cpu/unary-ops.cpp`) takes its slice from `get_thread_range`
+(`ggml-cpu/common.h`), which divides `ggml_nrows(src0)` by `nth`:
+
+```c
+const int64_t nr = ggml_nrows(src0);
+const int64_t dr = (nr + nth - 1)/nth;
+const int64_t ir0 = dr*ith;
+const int64_t ir1 = MIN(ir0 + dr, nr);
+```
+
+At `nr = 1` thread 0 gets the whole tensor and threads `1..nth-1` get an **empty range** — every one
+of them still enters the node, synchronises, and does nothing. `GELU`, `GELU_ERF`, `GELU_QUICK`,
+`SILU` and `XIELU` are given `n_tasks = n_threads` unconditionally in `ggml_get_n_tasks`, so any
+one-row tensor of those ops pays a full barrier for a single-threaded computation today.
+
+**Measured**, `ne0 = 256`, four threads against one, Raspberry Pi 4B, through ggml's own threadpool
+with 256 nodes per graph so the pool wakes once (`scripts/bench18.cpp` in loom.cpp):
+
+| `nrows` | 1 | 2 | 3 | 4 | 8 | 16 | 64 | 192 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| speedup | **1.00x** | 1.75x | 2.36x | 2.91x | 3.36x | 3.69x | 3.89x | 3.92x |
+
+and on a Ryzen 3 3250U the `nrows = 1` row is **0.63x** — an outright loss. One row is a cliff; two
+rows already win.
+
+**The fix is one line and cannot make anything slower**: `n_tasks = MIN(n_threads, ggml_nrows(node))`
+for the `GGML_OP_UNARY` branch. A thread handed an empty range does no work, so capping at the row
+count removes only barrier participation.
+
+**How much it matters depends entirely on the model, and in an LLM it does not.** Every `UNARY` bucket
+in whisper-small, Qwen3-0.6B, LFM2 and the NeMo encoders is many-rowed (the only one is
+`[3072, 1500]`). It bites vocoders: Kokoro issues **870 one-row `UNARY [256, 1]` nodes** per
+synthesis, and when loom's P4.25 patch threaded those ops without the cap that bucket went
+**5.8 -> 179.9 ms**. So this is worth fixing pre-emptively rather than because it is costing anything
+in llama.cpp today.
+
+**A second floor a reviewer should ask about**, from the same measurements: at 24 threads on a Core
+Ultra 9 285K the per-node cost bottoms out at **~1.9 us**, so threading a unary below ~16K elements is
+a loss there regardless of row count. `n_tasks` has no work floor for these ops at all. Any future
+change that threads more unary ops needs one, and it is machine-dependent — which is a large part of
+why loom did not carry its patch.

@@ -41,6 +41,7 @@ on the other side that cancels it.
 | an outer-product `QK^T` tile, lanes on `m` instead of on the contraction | **1.38x** on the 285K against a 1.5x gate, and its ceiling there was 1.52x before a line was written; 1.85x on a 2019 Zen+, 1.23x on NEON. See below |
 | a cheaper `hsum` epilogue for tinyBLAS at `k = 64` | 1.06x, under the dev box's noise floor (P4.18) |
 | a per-shape ranking of the convolution gap (P4.16's whole premise) | **the gap is not in the convolution** — every row at the box's GEMM or memory roofline; see below |
+| threading ggml's `TANH`/`SIGMOID` gate (P4.25) | the op is **3.92x**, the model is **1.005x** — and without a row cap it is 31x WORSE on Kokoro; see below |
 | rows-inner loop order, so a store finishes a cache line of C | **mechanism falsified**: no dependence on the size of C — see below |
 | `ggml-0002`'s aarch64 address hoist applied to x86 | neutral at every k tested, small and large |
 | *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired at ONE thread, and 1.02x at k=768. **The "m=1500 cannot reach `BM = 4`" half was the bug, not a constraint** — at four threads that is 2.75x of false sharing, fixed in P4.22; see [Retro-020](retro-020-a-knob-measured-at-one-thread.md) |
@@ -264,6 +265,54 @@ k = 64, 12 heads`, transpose counted, or stop. `scripts/bench16.cpp` is that gat
   leaves each job writing 16 bytes of a 64-byte line of `C`. Four rows of padding on `m` are worth
   **2.75x**. That is P4.22 in [Epic-05](../epics/epic-05-edge-performance.md), and it is a bigger
   number than the item that found it.
+
+### Threading ggml's unary gate: the op went 3.92x and the model went 0.5% (2026-08-30, P4.25)
+
+P4.16 found the one thing in VITS not against a roofline: `ggml_get_n_tasks` hands `n_tasks = 1` to
+`TANH`, `SIGMOID`, `EXP` and the rest of the cheap-unary list while `GELU`/`SILU` get `n_threads`, and
+VITS's WN gate spent 30.4 ms per synthesis on one core with three idle. It was scoped as a one-line
+change with a measured 2.7%-of-wall prize. **It is measured out.** Full numbers in
+[Epic-05 §5](../epics/epic-05-edge-performance.md); this is the register entry.
+
+| idea | verdict |
+|---|---|
+| `n_tasks = n_threads` for the transcendental unaries | **measured out** — op 3.92x, model **1.005x** on the Pi and **0.985x** on the dev box, both p-ranges straddling 1.0 |
+| the same, without a row cap | **a 31x REGRESSION on Kokoro** — ggml's unary ops split over ROWS, and Kokoro issues 870 one-row unary nodes |
+| `n_tasks = MIN(n_threads, nrows)` | correct, provably never worse, and **buys nothing today** — nothing shipped hits the cliff on an op upstream already threads |
+| threading the ARITHMETIC unaries too (relu, neg, …) | **0.77x** at the streaming size on a Pi — one core already saturates the bus |
+| a wide machine rescuing it | no — 5.58x at 24 threads on the same shape, still ~0.7% of that machine's wall, and a ~1.9 us per-node floor makes small unary nodes a LOSS there |
+
+**The headline lesson: an isolated op measurement is an upper bound on what a model will see, never
+an estimate of it.** Everything measured about the op was right — `scripts/bench17.c` gave a clean
+transcendental-vs-arithmetic class split (3.86-4.00x against 0.77-1.31x), `scripts/bench18.cpp` put
+the exact gate shape at **1107.8 -> 282.7 us through ggml's own threadpool**, and 32 nodes at 825 us
+each is 26 ms of a 1130 ms wall. Twelve paired ABBA rounds of the real model measured **0.5%**. The
+arithmetic was not wrong; the model just did not keep the saving.
+
+**Three procedural things it cost, each already a rule here and each re-paid.**
+
+* **Unequal arms, again, and the epic had already written the warning down.** The first dev-box A/B
+  read **2.2x** — the two build directories were `Release` and `RelWithDebInfo`. The epic's own
+  scratch-tree note says "Release matters: the repo default is RelWithDebInfo and that is 1.39x
+  slower". **Print or diff the two arms' `CMAKE_BUILD_TYPE` before believing any cross-build ratio**;
+  it costs one `grep` and it is the difference between a 2.2x and a 1.00x.
+* **A harness can measure its own shape instead of the op's, twice in one bench.** `bench18` first ran
+  ONE node per graph, so every call paid a full pool WAKE, and it reported threading as a loss at
+  every size up to 2.3M elements. Fixed, it then used a **1-D tensor** — one row — and measured the
+  `nrows = 1` cliff and called it the op. Both versions produced clean, monotone, entirely wrong
+  tables. Same shape as this file's entry on `$LOOM_PROFILE`: **when a bench's answer does not depend
+  on the size of the thing it varies, the bench is measuring itself.**
+* **A profile comparison between two runs is not paired.** The two Pi profiles differed by 6% on ops
+  the patch does not touch — `CONV_2D` -265 ms, `ADD` -39, `MUL` -28 — so the `UNARY` delta read off
+  them was contaminated by a global drift. **Diff every bucket, not the one you came for**; the
+  control ops are what tell you the two runs are comparable at all.
+
+**What is left open is bigger than what was closed.** 26 ms of measured op-level saving arrived as
+5 ms of wall, and the loss is *between* the nodes rather than in them. ggml's threadpool sleeping
+between two multi-threaded nodes is the named suspect —
+[Retro-017](retro-017-libgomp-slept-at-every-graph-node.md) is that exact mechanism from the libgomp
+side — and if it is that, it is a tax on every threaded node in every model rather than on 32 of them
+in one. That is **P4.27**, and it should be measured before anything is built.
 
 ### The convolution table, and a profiler that could not attribute the gap it was pointed at (2026-08-30, P4.16)
 
