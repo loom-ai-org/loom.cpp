@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Two builds of one shared library, compared as PAIRED rounds rather than as two medians.
+"""Two arms of one benchmark, compared as PAIRED rounds rather than as two medians.
+
+An arm is either a BUILD of one shared library (`--lib` plus two `--arm NAME=PATH`) or a VALUE of one
+environment variable (`--env VAR` plus two `--arm NAME=VALUE`).  The second form is what a run-time
+kill switch inside the thing being measured is for: one binary, one allocation, one page cache, and a
+branch flipped between the two halves of a pair.  P4.26 measured `ggml-0012` that way after P4.22 had
+measured it by building two whole trees, which cannot make that claim.
 
 WHY THIS EXISTS.  P4.18's `ggml-0011` is a patch to `sgemm.cpp`, so the honest baseline is "the same
 tree with that patch reverse-applied", not an older commit -- and the two arms are then two builds of
@@ -74,9 +80,15 @@ def percentile(sorted_values, q):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lib", required=True, help="the library file each arm is copied over")
-    ap.add_argument("--arm", action="append", required=True, metavar="NAME=PATH",
+    ap.add_argument("--lib", help="the library file each arm is copied over (library-arm mode)")
+    ap.add_argument("--env", metavar="VAR",
+                    help="environment variable each arm sets instead (env-arm mode)")
+    ap.add_argument("--arm", action="append", required=True, metavar="NAME=PATH_OR_VALUE",
                     help="an arm; give it exactly twice, first one is the baseline")
+    ap.add_argument("--between", metavar="CMD",
+                    help="shell command run before every arm -- on the reference Pi this is the "
+                         "cool-to-a-fixed-temperature wait, which has to happen inside the pairing "
+                         "rather than around it")
     ap.add_argument("--rounds", type=int, default=15)
     ap.add_argument("--metric", default=r"median\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)",
                     help="regex selecting the number; a capture group IS the number, else the "
@@ -89,27 +101,37 @@ def main():
     command = args.command[1:] if args.command and args.command[0] == "--" else args.command
     if not command:
         ap.error("no command given (put it after --)")
+    if bool(args.lib) == bool(args.env):
+        ap.error("give exactly one of --lib (library arms) and --env (environment arms)")
     arms = []
     for spec in args.arm:
-        name, _, path = spec.partition("=")
-        if not path:
-            ap.error("--arm wants NAME=PATH, got %r" % spec)
-        arms.append((name, path))
+        name, sep, value = spec.partition("=")
+        if not sep:
+            ap.error("--arm wants NAME=PATH or NAME=VALUE, got %r" % spec)
+        arms.append((name, value))
     if len(arms) != 2:
         ap.error("exactly two arms, so that a round is a pair")
 
     # The library as it stands now, restored whatever happens -- see the docstring.
-    saved = tempfile.NamedTemporaryFile(delete=False, suffix=".so").name
-    shutil.copy2(args.lib, saved)
+    saved = None
+    if args.lib:
+        saved = tempfile.NamedTemporaryFile(delete=False, suffix=".so").name
+        shutil.copy2(args.lib, saved)
     samples = {name: [] for name, _ in arms}
     ratios = []
     try:
         for r in range(args.rounds):
             # ABBA: the baseline runs first on even rounds and second on odd ones.
             order = arms if r % 2 == 0 else arms[::-1]
-            for name, path in order:
-                shutil.copy2(path, args.lib)
-                proc = subprocess.run(command, capture_output=True, text=True)
+            for name, value in order:
+                env = None
+                if args.lib:
+                    shutil.copy2(value, args.lib)
+                else:
+                    env = dict(os.environ, **{args.env: value})
+                if args.between:
+                    subprocess.run(args.between, shell=True, check=True)
+                proc = subprocess.run(command, capture_output=True, text=True, env=env)
                 if proc.returncode != 0:
                     raise RuntimeError("arm %s failed (%d):\n%s\n%s"
                                        % (name, proc.returncode, proc.stdout, proc.stderr))
@@ -120,8 +142,9 @@ def main():
                   % (r + 1, args.rounds, a, samples[a][-1], b, samples[b][-1], ratios[-1]),
                   file=sys.stderr, flush=True)
     finally:
-        shutil.copy2(saved, args.lib)
-        os.unlink(saved)
+        if saved:
+            shutil.copy2(saved, args.lib)
+            os.unlink(saved)
 
     ratios.sort()
     a, b = arms[0][0], arms[1][0]

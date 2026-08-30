@@ -15,13 +15,22 @@
 #
 # And profiling costs onnxruntime ~1.18x, so only the SHARES are used -- apportioned over an un-profiled
 # wall time measured in the same process. This build's events carry no run_index, so runs split by ORDER.
-import json, statistics, sys, time
+#
+# TWO MACHINE-SPECIFIC CONSTANTS, BOTH OVERRIDABLE, because a hardcoded path on one Raspberry Pi is
+# exactly what Retro-018 is about -- and because the second one went stale without anyone noticing:
+# `LOOM_SAMPLES` normalises onnxruntime's time to loom's output length, so a value 256 samples too
+# high (73472 against the 73216 the current export gives) makes loom look 0.35% better than it is.
+# **Take it from the loom run in the same session** rather than trusting the default.
+#
+#   $LOOM_ONNX_MODEL    path to miro_en-GB.onnx
+#   $LOOM_SAMPLES       loom's sample count for this utterance, from bench_vits_loom's own output
+import json, os, statistics, sys, time
 import numpy as np
 import onnxruntime as ort
 
-MODEL = "/home/pi/pipertts-en-gb-miro/miro_en-GB.onnx"
+MODEL = os.environ.get("LOOM_ONNX_MODEL", "/home/pi/pipertts-en-gb-miro/miro_en-GB.onnx")
 PHONEMES = "hˈeɪ, kæn juː ʃˈʌtdaʊn ðə kəmpjˈuːtɐ, maɪ fɹˈɛnd?"
-LOOM_SAMPLES = 73472          # what loom synthesises for the same utterance at seed 0
+LOOM_SAMPLES = int(os.environ.get("LOOM_SAMPLES", 73216))   # bench_vits_loom prints it every run
 NRUN = 9
 
 def phoneme_ids():

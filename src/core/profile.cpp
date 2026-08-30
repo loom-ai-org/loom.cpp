@@ -268,7 +268,18 @@ std::string report() {
     append(out, "sum of node time  %10.3f s\n", t.seconds);
     append(out, "per-node floor    %10.3f ms   (dispatch cost; see include/loom/core/profile.h --\n",
            t.floor_seconds * 1e3);
-    append(out, "                               profile with ONE thread, or this dominates)\n\n");
+    append(out, "                               profile with ONE thread, or this dominates)\n");
+    // Not a nicety: this is how P4.16 read a threaded op as single-threaded, P4.25 was scoped on that
+    // reading, and P4.27 was opened to explain a saving that had never been on the table. Every node
+    // here is computed as a GRAPH OF ITS OWN (`compute()` above), and ggml plans a thread count per
+    // graph -- `cplan.n_threads = MIN(max_tasks, n_threads)`, where `max_tasks` is the largest
+    // `ggml_get_n_tasks` over the graph's nodes. A node whose op declares `n_tasks = 1` is therefore
+    // planned at ONE thread here, however many the model runs with, even though the op splits over
+    // rows perfectly well inside a real graph. In VITS at 4 threads that is 122 `UNARY`, 126 `SUB`,
+    // 106 `SCALE`, 42 `SUM_ROWS`, 32 `LEAKY_RELU` and more, every one of them timed on one core.
+    append(out, "                               ops ggml declares n_tasks = 1 for (UNARY, SUB, SCALE,\n");
+    append(out, "                               SUM_ROWS, LEAKY_RELU, ...) are timed SINGLE-THREADED\n");
+    append(out, "                               here at any thread count -- Epic-05 P4.27\n\n");
 
     append(out, "%-22s %8s %8s %8s %10s %8s\n", "op", "ne0", "ne1", "calls", "ms", "%");
     double shown = 0;

@@ -266,18 +266,25 @@ k = 64, 12 heads`, transpose counted, or stop. `scripts/bench16.cpp` is that gat
   **2.75x**. That is P4.22 in [Epic-05](../epics/epic-05-edge-performance.md), and it is a bigger
   number than the item that found it.
 
-### Threading ggml's unary gate: the op went 3.92x and the model went 0.5% (2026-08-30, P4.25)
+### Threading ggml's unary gate: it was already threaded (2026-08-30, P4.25 then P4.27)
 
-P4.16 found the one thing in VITS not against a roofline: `ggml_get_n_tasks` hands `n_tasks = 1` to
-`TANH`, `SIGMOID`, `EXP` and the rest of the cheap-unary list while `GELU`/`SILU` get `n_threads`, and
-VITS's WN gate spent 30.4 ms per synthesis on one core with three idle. It was scoped as a one-line
-change with a measured 2.7%-of-wall prize. **It is measured out.** Full numbers in
-[Epic-05 §5](../epics/epic-05-edge-performance.md); this is the register entry.
+P4.16 read `ggml_get_n_tasks`'s `n_tasks = 1` for `TANH`/`SIGMOID`/`EXP` as "one core, three idle" and
+measured VITS's WN gate at 30.4 ms per synthesis, identical at one thread and four. P4.25 wrote the
+one-line patch, measured the op at 3.92x, predicted 26 ms, and measured the model at 1.005x.
+
+**P4.27 then found that the patch was a no-op and the 30.4 ms was a profiler artifact.** `n_tasks` is a
+GRAPH-level clamp in ggml v0.19.0 — there is no per-node thread count — and `$LOOM_PROFILE` times each
+node in a graph of its own, so it plans one thread for every `n_tasks = 1` node whatever the model
+runs with. The gate was threaded all along: taking that away (`LOOM_UNARY_SERIAL=1`) costs the Pi
+**2.5%** and the 285K **4.6%** of a synthesis. Both entries below stand as measurements and neither
+means what it was recorded to mean; see
+[Retro-023](retro-023-a-bench-whose-graph-was-the-treatment.md) and
+[Epic-05 §5](../epics/epic-05-edge-performance.md).
 
 | idea | verdict |
 |---|---|
-| `n_tasks = n_threads` for the transcendental unaries | **measured out** — op 3.92x, model **1.005x** on the Pi and **0.985x** on the dev box, both p-ranges straddling 1.0 |
-| the same, without a row cap | **a 31x REGRESSION on Kokoro** — ggml's unary ops split over ROWS, and Kokoro issues 870 one-row unary nodes |
+| `n_tasks = n_threads` for the transcendental unaries | **not an optimisation at all** — it changes nothing in a graph that holds one `MUL_MAT`, which every model graph does. Model 1.005x on the Pi and 0.985x on the dev box: two identical arms |
+| the same, without a row cap | **31x on a Kokoro PROFILE bucket, and nothing in production** — the profiler's one-node graphs are the only place the patch changes the plan |
 | `n_tasks = MIN(n_threads, nrows)` | correct, provably never worse, and **buys nothing today** — nothing shipped hits the cliff on an op upstream already threads |
 | threading the ARITHMETIC unaries too (relu, neg, …) | **0.77x** at the streaming size on a Pi — one core already saturates the bus |
 | a wide machine rescuing it | no — 5.58x at 24 threads on the same shape, still ~0.7% of that machine's wall, and a ~1.9 us per-node floor makes small unary nodes a LOSS there |
@@ -329,12 +336,15 @@ the thread count the engine ships at.** The full numbers are in
 | the three vocoder resblock rows (P4.15/P4.15b's +161 ms) | **closed** — ~22 of the box's ~25 GFLOP/s at four threads; 1.28-1.44x at one, over a floor both engines share |
 | the flow/encoder rows the old table said had "never been touched" | **closed** — 1.16x and 1.29x at one thread, at a single core's GEMM rate |
 | threading loom's big elementwise ops | **closed by the machine** — they run at 98-99% of a *measured* 3.64 GB/s bus, and the same bus does 4.56 GB/s on ONE core |
-| *(NOT measured out)* the `TANH`/`SIGMOID` gate | 30.4 ms, identical at one thread and four, 0.46 GB/s — the only thing in the model not against a roofline. **P4.25** |
+| *(NOT measured out)* the `TANH`/`SIGMOID` gate | 30.4 ms, identical at one thread and four, 0.46 GB/s — the only thing in the model not against a roofline. **P4.25** — **and the "identical at one thread and four" was the profiler, not the op: P4.27, [Retro-023](retro-023-a-bench-whose-graph-was-the-treatment.md)** |
 
 **Three things this cost, and each is reusable.**
 
 **1. A node-by-node profiler cannot attribute a gap smaller than its own overhead — and its overhead
-is per NODE, not per millisecond.** `$LOOM_PROFILE` computes every node alone. At one thread that is
+is per NODE, not per millisecond.** *(And it has a second, worse failure mode, found by P4.27: a
+one-node graph is PLANNED differently, so any op ggml declares `n_tasks = 1` for is timed
+single-threaded inside the profile. That is not overhead, it is a different computation —
+[Retro-023](retro-023-a-bench-whose-graph-was-the-treatment.md).)* `$LOOM_PROFILE` computes every node alone. At one thread that is
 51 us per node, 3.6% of the wall, ignorable. At four it is **137 us per node, 291 ms on a 1137 ms
 wall**, because each node now pays a thread-pool barrier. Apportioning that by share (what the
 onnxruntime side does, correctly, for a profiler whose overhead *is* proportional) said convolution

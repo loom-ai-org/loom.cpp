@@ -7,6 +7,11 @@ tags: [ggml-patches, aarch64, benchmarking, measurement-hygiene, p4.18]
 
 # Retro-019: A Kernel Patch Measured On One ISA, Shipped To Both
 
+> **It happened again with the next patch, and the second time the ISA was not the axis.** `ggml-0012`
+> cost the same board 2.4% on VITS, and the predicate that fixes it is `k`, not `__aarch64__` — see
+> [Retro-022](retro-022-a-benefit-and-a-cost-on-the-same-axis.md). The rule this retro wrote,
+> "measure every ISA a patch is enabled for", generalises to **every regime it is enabled for**.
+
 ## The Issue
 
 `ggml-0011` landed as a **2.15x** win at whisper's `A@V` shape and **1.19-1.24x end to end on
