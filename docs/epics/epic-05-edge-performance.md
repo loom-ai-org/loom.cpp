@@ -3271,7 +3271,21 @@ described a file the toolchain still produced.
 
 **What the ASR oracle says, on a real sentence.** Each family phonemized with espeak-ng through its own
 `tokenizer.ggml.tokens` table (Kokoro with the real `loom.default_style.ref_s` out of its own file, not
-a synthetic style), F32 and Q8_0 arms of the same checkpoint, both transcribed by whisper-small:
+a synthetic style), F32 and Q8_0 arms of the same checkpoint, both transcribed by whisper-small. The
+whole pipeline is three committed tools, because a verdict nobody can re-run is not one:
+
+```
+scripts/tts_ids.py "Hey, can you shut down the computer, my friend?" model.gguf ids.txt
+./tts_synth model.gguf <family> ids.txt <rate> out.wav [--ref-s ids.txt.ref_s]   # scripts/tts_synth.cpp
+# resample to 16 kHz, then:
+./build/tools/loom_cli/loom_cli --model whisper-small.gguf --wav out16k.wav --language en
+```
+
+`tts_ids.py` carries the two facts that are easy to get wrong — a `bos`/`eos`/`blank` of **-1 is a
+sentinel meaning "none"**, not an id, and Kokoro's `ref_s` is a **[510, 256] voice pack indexed by the
+phoneme count**, not a vector. `tts_synth.cpp` carries the per-family `infer` signature and prints
+`device_report()`, and its `synthetic:N` mode is the length sweep P4.28 used.
+
 
 | model | quant | coverage | corr vs its own F32 | transcript |
 |---|---|---|---|---|
@@ -3333,6 +3347,21 @@ the middle arm from the first:
 
 1.46 × 1.07 = **1.56**, against the 1.55x measured end-to-end in P4.13. The arithmetic closes, which is
 the check that says these are three measurements of one thing rather than three numbers.
+
+Re-running it is two files and an environment variable, which is the whole reason the kill switch
+exists — arm C is the only one needing a different artifact, because it is loom's own lowering rather
+than ggml's:
+
+```
+# A and B: one F32 export, the variable is the only difference
+                                   ./bench_vits_loom <dir-with-vits_mil.gguf> 7    # A
+GGML_CPU_DISABLE_CONV_HEURISTICS=1 ./bench_vits_loom <dir-with-vits_mil.gguf> 7    # B
+# C: a FOLDED F32 export -- the probe under P4.13 builds one, and folding is what routes a kernel
+# through loom's im2col instead of ggml_conv_2d_direct
+```
+
+Interleave the arms A-B-B-A and check the two A arms agree before believing the ratio; on a Pi, cool to
+a stated temperature first ([Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md)).
 
 **The same A/B on a Cortex-A72, because one machine is not evidence** (Raspberry Pi 4, 4 threads,
 interleaved A-B-B-A, best-of-3, 58 °C): **1.0930 s -> 1.4554 s, 1.33x.** Less than x86-64's 1.46x, as
@@ -3580,8 +3609,11 @@ purpose, for two independent reasons documented in `supertonic_export.py` — on
 [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), not here. Everything else the sweep
 found is genuine all-zero bias vectors, which are real weights.
 
-**The transferable part is how it was found**: bucket the tensors a quantized file left as F32 by *what
-reads them and in which operand position*, not by name. The buckets came out 86.8% "second operand /
-GET_ROWS / other" — and a bucket named for what it is *not* is where a thing nobody is looking at hides.
+**The transferable part is how it was found**, and it is `scripts/weight_census.py`: bucket the tensors
+a quantized file left as F32 by *what reads them and in which operand position*, not by name. The
+buckets came out 86.8% "second operand / GET_ROWS / other" — and a bucket named for what it is *not* is
+where a thing nobody is looking at hides. Point it at one file for the buckets and the zero-heavy list,
+or at `hf-models/*/*.gguf` for the sweep above; on the fixed VITS the zero-heavy line is now 0.00 MB
+and the conv kernels are 95% of what remains.
 
 ---
