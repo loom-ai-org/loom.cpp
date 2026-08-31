@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-30
+last_updated: 2026-08-31
 ---
 
 # Epic-05: Edge CPU Performance
@@ -3007,6 +3007,11 @@ you shut down the computer, my friend?"*: whisper mishears the leading "Hey" on 
 **And it costs 2.08x in speed on x86-64.** That is the result this item could not predict and the one
 that should govern whether anyone turns it on; it is decomposed below.
 
+> **SUPERSEDED BY P4.29 (2026-08-31), and the rest of this section is the reasoning that led there.**
+> The 2.08x is gone: a quantized conv model now runs at F32 speed (1.000x per sample on x86-64, 1.029x
+> on a Cortex-A72). Everything below is still the right account of *why* it was 2.08x — it is what
+> P4.29 was scoped from — but "read this before turning it on" no longer applies. Turn it on.
+
 #### What the problem was, in one sentence
 
 A convolution kernel is stored `[K, IC, OC]`, ggml lays quantization blocks along `ne[0]`, `ne[0]` is
@@ -3102,7 +3107,7 @@ actually moved, which a tensor count does not.
 VITS is the extreme case and the reason the item existed: it is the one model where *nothing* was
 quantizable before, because it has no MUL_MAT weight that is not a convolution.
 
-#### The 2.08x, decomposed — read this before turning it on (and it is 2.13x on aarch64)
+#### The 2.08x, decomposed — this is what P4.29 recovered (and it is 2.13x on aarch64)
 
 Ryzen 3 3250U (2 cores / 4 threads), 4 threads, `scripts/bench_vits_loom.cpp` with the three scales
 pinned so both arms synthesise the same utterance, arms interleaved A-B-B-A over two rounds on an idle
@@ -3189,7 +3194,8 @@ quantized.
 
 **3. The speed trade on aarch64 — MEASURED, AND THIS ENTRY PREDICTED IT WRONG.** See the table above,
 which now has both ISAs: **2.13x on a Cortex-A72 against x86-64's 2.08x**, i.e. the same, where this
-entry predicted the aarch64 arm would shrink.
+entry predicted the aarch64 arm would shrink. *(And P4.29 has since removed
+both: 2.075x recovered on the Pi, 2.101x on x86-64.)*
 
 **4. A folded kernel on a device backend — RUNS, and not vacuously.** Vulkan (Radeon Vega 3, RADV
 RAVEN2), Q4_0 VITS: it synthesises, and whisper transcribes it identically to the CPU arm. The check
@@ -3247,8 +3253,9 @@ badly — this CPU has `f16c` (convert) and no native FP16 arithmetic, so every 
 first. That is a property of THIS box; expect it to invert on the RTX 5090 workstation, which is where
 the GPU numbers should be taken and have NOT been. The TTS slowdowns also correlate with low coverage
 on small compute-bound models — and P4.13's own measurement is what settled where that goes: at HIGH
-coverage VITS is 2.08x slower, and the mechanism is the lost direct-convolution lowering rather than
-the arithmetic.
+coverage VITS was 2.08x slower, and the mechanism is the lost direct-convolution lowering rather than
+the arithmetic. **P4.29 gave that lowering back to a quantized kernel, so the conv rows of this table
+are stale in loom's favour** and want re-measuring before anyone quotes them.
 
 ### Do not spend time on K-quants
 
@@ -3326,14 +3333,18 @@ Kept because anyone pointing that gate at a quantized file will meet the number 
 is a clean instance of the rule above: **a large numerical divergence from an F32 reference is not
 evidence about intelligibility, in either direction.**
 
-### P4.29 — a quantized direct convolution: the kernel is already repacked, so dequantize it there — SCOPED, NOT STARTED
+### P4.29 — a quantized direct convolution: the kernel is already repacked, so dequantize it there — DONE 2026-08-31
 
-**The claim this is worth doing on.** A quantized convolutional model gives up **2.08x on x86-64 and
-2.13x on aarch64** (P4.13), and essentially all of it is recoverable for a ~30-line ggml patch whose
-only new cost measures **1.8 ms on a 500 ms synthesis**. If it works, **VITS runs at F32 speed in
-11.7 MB** — because after the dequantize the arithmetic *is* the F32 path.
+**Result. A quantized convolutional model now runs at F32 speed.** VITS at Q4_0 is **2.075x faster on a
+Cortex-A72 and 2.101x on x86-64** than it was, which is the whole 2.13x / 2.08x P4.13 measured it giving
+up — and against its own F32 export it lands at **1.029x / 1.000x per output sample**. **62.8 MB of F32
+speed out of an 11.7 MB file.** The F32 path is bit-identical, on both ISAs and in both of its lowerings.
 
-#### Where the 2.08x actually lives, measured rather than apportioned
+Shipped as `cmake/patches/ggml-0013-conv-quantized-kernel.patch` (+ `UPSTREAM.md` PR 13) and one branch
+in `op_conv_1d`. Nothing in the exporter changed: the fold, the attrs and the file are exactly what
+P4.28 left.
+
+#### Where the 2.08x actually lived, measured rather than apportioned
 
 Three arms on the same VITS synthesis, Ryzen 3 3250U, 4 threads, interleaved A-B-B-A over two rounds,
 best-of-7. `GGML_CPU_DISABLE_CONV_HEURISTICS=1` is ggml-0004's own kill switch and is what separates
@@ -3346,37 +3357,19 @@ the middle arm from the first:
 | C | loom's own im2col + mul_mat, no fusions | **0.78 s** | **1.07x** — the fusions and ggml's batching |
 
 1.46 × 1.07 = **1.56**, against the 1.55x measured end-to-end in P4.13. The arithmetic closes, which is
-the check that says these are three measurements of one thing rather than three numbers.
+the check that says these are three measurements of one thing rather than three numbers. The same A/B
+on a Cortex-A72 (Pi 4B, 4 threads, A-B-B-A, best-of-3, 58 °C): **1.0930 -> 1.4554 s, 1.33x** — less than
+x86-64's 1.46x, as the direct lowering's own per-shape table predicts, and still the largest single
+piece.
 
-Re-running it is two files and an environment variable, which is the whole reason the kill switch
-exists — arm C is the only one needing a different artifact, because it is loom's own lowering rather
-than ggml's:
-
-```
-# A and B: one F32 export, the variable is the only difference
-                                   ./bench_vits_loom <dir-with-vits_mil.gguf> 7    # A
-GGML_CPU_DISABLE_CONV_HEURISTICS=1 ./bench_vits_loom <dir-with-vits_mil.gguf> 7    # B
-# C: a FOLDED F32 export -- the probe under P4.13 builds one, and folding is what routes a kernel
-# through loom's im2col instead of ggml_conv_2d_direct
-```
-
-Interleave the arms A-B-B-A and check the two A arms agree before believing the ratio; on a Pi, cool to
-a stated temperature first ([Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md)).
-
-**The same A/B on a Cortex-A72, because one machine is not evidence** (Raspberry Pi 4, 4 threads,
-interleaved A-B-B-A, best-of-3, 58 °C): **1.0930 s -> 1.4554 s, 1.33x.** Less than x86-64's 1.46x, as
-the direct lowering's own per-shape table predicts, and still the largest single piece. The two A arms
-agree to 0.1 ms and the two B arms to 0.3 ms, and each arm's `fnv1a` is constant, so this is a clean
-pair rather than a lucky one. **The premise holds on both ISAs.**
-
-**So the cheap-looking option is worth almost nothing.** Making ggml's *batched* path accept a
+**So the cheap-looking option was worth almost nothing.** Making ggml's *batched* path accept a
 quantized kernel is nearly free — it already calls `ggml_compute_forward_mul_mat` through
 `ggml_call_mul_mat_ldc`, and mul_mat has handled a quantized first operand forever — and it buys
-**1.07x**. That is also consistent with the standing "ggml's own fused conv does NOT help here,
-measured twice, closed, do not re-propose" result in §4: that closure was about the batched path, and
-this entry is not re-proposing it. **The prize is the direct sweep (ggml-0006), which postdates it.**
+**1.07x**. **The prize was the direct sweep (ggml-0006)**, which postdates the standing "ggml's own
+fused conv does NOT help here, measured twice, closed" result in §4 — that closure was about the
+batched path.
 
-#### Why the hard-looking option is not hard: the sweep never reads the kernel as stored
+#### Why the hard-looking option was not hard: the sweep never reads the kernel as stored
 
 `ggml_conv_1d_direct_run` **already repacks the whole kernel into an F32 scratch buffer** before it
 computes anything:
@@ -3390,18 +3383,62 @@ for (ic) for (kx) for (oc)
 ```
 
 The register-tiled kernel (`ggml_conv_1d_direct_tile`) reads `wp`, never `w`. So a quantized kernel
-does not need a quantized inner loop, a `vec_dot`, or an activation quantized to `vec_dot_type` — it
-needs **one dequantize into the buffer that already exists**, and everything below is untouched: the
-tile kernel, the bias fusion (ggml-0005), the LEAKY_RELU + residual fusion (ggml-0007), the phase-major
-variant, the thread split, the scratch budget (`need` is already sized for an F32 `[IC, KW, OC]`).
+needs no quantized inner loop, no `vec_dot`, and no activation quantized to `vec_dot_type` — it needs
+**one dequantize into the buffer that already exists**, and everything below is untouched: the tile
+kernel, the bias fusion (ggml-0005), the LEAKY_RELU + residual fusion (ggml-0007), the phase-major
+variant, the thread split.
 
-**And it is more accurate, not less.** Dequantize-then-F32-FMA beats the current quantized path, which
-dots Q4_0 weights against activations rounded to Q8_0.
+**And it is more accurate, not less.** Dequantize-then-F32-FMA replaces a path that dotted Q4_0 weights
+against activations rounded to Q8_0.
+
+#### The design problem that was load-bearing: the fold and the sweep want opposite layouts
+
+P4.13 folds a quantized kernel to `[IC*K, OC]` so its blocks align along `ne[0]`. `ggml_conv_2d_direct`
+reads `KW`/`KH`/`IC`/`OC` **off `a->ne`**, and a folded kernel no longer carries them. Reshaping the
+folded tensor back is not available: a `[IC*K, OC]` Q4_0 tensor reshaped to `[K, 1, IC, OC]` puts K=3 on
+`ne[0]`, which is not a multiple of the block size, and the resulting `nb` is nonsense (the same hazard
+the P4.13 shape carrier exists to avoid — and there it was safe only because `ggml_im2col` never reads
+`src0->data`, which is not true here).
+
+So ggml is **told** the geometry. `GGML_MAX_OP_PARAMS` is 64 bytes and `CONV_2D` used 24, so there was
+room for three more int32s and no new op code, no new dispatch entry, no ABI change:
+
+```c
+ggml_conv_2d_direct_packed(ctx, a, b, s0, s1, p0, p1, d0, d1, /* kw */ K, /* kh */ 1, /* ic */ IC);
+```
+
+A zero `kw` in `op_params[6]` is what says "declared layout", which `ggml_new_tensor` gives every
+existing graph for free.
+
+#### THE PIECE WORTH KEEPING: dequantize at the top and RE-ENTER, rather than threading geometry down
+
+The scoping note called risk 1 "the single most likely way to ship something slower than today":
+`ggml_conv_1d_direct_ok` prices the kernel against a cache budget as `IC*OC*KW*sizeof(float)`, and `wp`
+is F32 whatever the kernel is. Priced by 8.4 MB of stored Q4_0 rather than 59.5 MB of dequantized F32,
+that predicate silently admits the shapes it was tuned to reject.
+
+**It is not fixed by patching the predicate. It is fixed by making the stored size unreachable.**
+`ggml_compute_forward_conv_2d_impl` dequantizes off the FRONT of the work buffer and then **calls
+itself** with a stack `ggml_tensor` that is an ordinary contiguous F32 kernel in the declared layout,
+and a `ggml_compute_params` holding what is left of the buffer:
+
+```c
+ggml_tensor kdq = *kernel;                       // F32, [KW, KH, IC, OC], data = the dequantized buffer
+ggml_compute_params p = *params;                 // wdata advanced past it, wsize reduced by it
+ggml_compute_forward_conv_2d_impl(&p, &kdq, src, dst, GGML_TYPE_F32, ...);
+```
+
+Every predicate below prices the dequantized size **because that is the only size it can see**, and the
+two users of `wdata` cannot overlap by construction rather than by an accounting agreement (risk 2).
+Threading `kw/kh/ic/oc` down through six functions would have left both risks live at every one of them.
+
+*The general shape: when a representation change has to be invisible below some line, convert at the
+line and re-enter, rather than teaching everything below to recognise both representations.*
 
 #### The one new cost, measured
 
-`scripts/bench21.c` on this box, over all 59.5 MB of VITS's convolution
-weights at once — i.e. the whole model's per-synthesis kernel packing, not one convolution:
+`scripts/bench21.c`, over all 59.5 MB of VITS's convolution weights at once — the whole model's
+per-synthesis kernel packing, not one convolution:
 
 | | dequantize | the F32 copy it replaces | delta |
 |---|---|---|---|
@@ -3409,8 +3446,8 @@ weights at once — i.e. the whole model's per-synthesis kernel packing, not one
 | Q8_0 | **9.3 ms** | 8.4 ms | +0.9 ms |
 
 **+1.8 ms against a 500 ms synthesis: 0.4%**, to recover 160 ms. The pack loop reads *less* memory in
-the quantized case (8.4 MB of Q4_0 rather than 59.5 MB of F32) and writes the same 59.5 MB, which is
-why the delta is arithmetic rather than traffic.
+the quantized case (8.4 MB of Q4_0 rather than 59.5 MB of F32) and writes the same 59.5 MB, which is why
+the delta is arithmetic rather than traffic.
 
 **The caveat that bounds where this design is legal.** It dequantizes **per call**. That is right for a
 convolution that runs once per utterance, which is every convolutional model in this engine (TTS
@@ -3418,92 +3455,80 @@ vocoders, ASR encoders), and wrong for anything inside a decode loop, where it w
 `SHORT_CONV` — the one convolution that *is* in a decode loop — is a different op, is not folded, and
 must stay that way; see P4.13's "what is deliberately not folded".
 
-#### The design problem that is actually load-bearing: the fold and the sweep want opposite layouts
+#### What it measured
 
-P4.13 folds a quantized kernel to `[IC*K, OC]` so its blocks align along `ne[0]`. `ggml_conv_2d_direct`
-reads `KW`/`KH`/`IC`/`OC` **off `a->ne`**, and a folded kernel no longer carries them. Reshaping the
-folded tensor back is not available: a `[IC*K, OC]` Q4_0 tensor reshaped to `[K, 1, IC, OC]` puts K=3 on
-`ne[0]`, which is not a multiple of the block size, and the resulting `nb` is nonsense (this is the same
-hazard the P4.13 shape carrier exists to avoid — and there it was safe only because `ggml_im2col` never
-reads `src0->data`, which is not true here).
+`scripts/paired_arms.py`, interleaved ABBA rounds, both arms one binary switched by `LD_LIBRARY_PATH`
+over three shared libraries, the Pi cooled to a fixed 60 C before **every** arm. Both arms are the same
+`vits-q4_0-dyn.gguf`; only the engine changes.
 
-So ggml has to be **told** the geometry rather than infer it. `GGML_MAX_OP_PARAMS` is 64 bytes and
-`CONV_2D` uses six int32s, so there is room:
+| VITS at Q4_0, 4 threads | rounds | before | after | median ratio | p10 | p90 |
+|---|---:|---:|---:|---:|---:|---:|
+| **Cortex-A72** (Pi 4B) | 7 | 2.197 s | 1.059 s | **2.075x** | 2.060 | 2.126 |
+| **x86-64** (Ryzen 3 3250U) | 9 | 1.417 s | 0.681 s | **2.101x** | 1.927 | 2.441 |
 
-```c
-ggml_conv_2d_direct_packed(ctx, a, b, s0, s1, p0, p1, d0, d1,
-                           /* kw */ K, /* kh */ 1, /* ic */ IC);
-```
+The Pi's band is 3% wide and is the one to read; the x86 band is wide because that box is a noisy
+2-core laptop part, and its quiet single-shot pair says the same thing (0.968 -> 0.446 s, 2.17x).
 
-storing three more params and a flag. No new op code, no new dispatch entry, and the F32 path is
-untouched — `ggml_conv_2d_direct` keeps inferring from `ne` exactly as it does now.
+**The recovery is TOTAL, which was the claim most likely to be wrong.** The scoping note warned that if
+the packed model landed nearer arm B than arm A, the heuristic was declining shapes it accepts for F32 —
+risk 1. It lands on arm A. Same harness, the two exports of the same model against each other:
 
-#### Sketch
+| VITS Q4_0 / its own F32 | rounds | q4 | f32 | ratio | **per output sample** |
+|---|---:|---:|---:|---:|---:|
+| Cortex-A72 | 7 | 1.060 s | 1.113 s | 0.950 | **1.029x** |
+| x86-64 | 9 | 0.500 s | 0.537 s | 0.923 | **1.000x** |
 
-* **ggml (`ggml-0013-conv-quantized-kernel.patch`).** Relax
-  `ggml_compute_forward_conv_2d_impl`'s `kernel_type == F16 || F32` assert to admit a quantized type
-  when the packed geometry is present; read `KW/KH/IC/OC` from op_params in that case; replace the pack
-  loop's scalar gather with a per-output-channel `traits->to_float` into a row buffer followed by the
-  same scatter. `ggml_conv_1d_direct_ok`'s `kernel_type != GGML_TYPE_F32` early-out becomes "F32 or
-  dequantizable". The batched fallback below it takes the same dequantized `wp` and needs no other
-  change, which is what keeps the two paths from diverging.
-* **loom (`primitives_conv.cpp`).** `op_conv_1d`'s direct branch currently excludes `fold.folded` and
-  `conv_kernel_is_packed`. It gains a third case: a folded kernel goes to
-  `ggml_conv_2d_direct_packed` when `backend_can_run` says the backend has it, and otherwise keeps
-  today's im2col + `mul_mat_kernel_first` — which is the established P4.7e pattern and is already known
-  to run end-to-end on Vulkan with zero fallback nodes (P4.13).
-* **Nothing changes in the exporter.** The fold, the attrs and the file are exactly what P4.28 leaves.
+The raw ratio understates because the two exports produce 67584 and 73216 samples — VITS durations are a
+`ceil()` of a float and the arithmetic changed — so the normalised column is the honest one. Well inside
+the 1.1x the item was accepted against, and **1.000x on x86-64 is arm A plus the dequantize**, which is
+exactly what the design predicted.
 
-#### Acceptance
+#### The rest of the acceptance, in the order it was checked
 
-* `vits-piper-en-gb-miro` at Q4_0 is **within 1.1x of its own F32 export** on the same synthesis, on
-  both x86-64 and a Cortex-A72, measured with the interleaved harness above rather than back to back.
-* Its audio still transcribes through whisper-small, and its correlation against the *current* Q4_0
-  audio is high — the arithmetic changes (dequantized F32 FMA rather than a Q8_0-activation dot), so
-  this is not a bit-identity check and must not be written as one.
-* `test_conv_1d_folded_kernel_matches_declared` gains a fourth arm driving the packed direct path, and
-  the declared-F32 reference still bounds it.
-* The F32 path is bit-identical: the same `fnv1a` digest `bench_vits_loom` already prints.
-* `GGML_CPU_DISABLE_CONV_HEURISTICS=1` still falls back cleanly, since that is the escape hatch a
-  machine this heuristic mispredicts needs.
+* **The F32 path is bit-identical**, which is what a branch guarded on `ggml_is_quantized` has to show.
+  `bench_vits_loom`'s FNV-1a over the whole audio, before and after, **and in both lowerings**:
+  `68c3229eab373455` (x86, heuristic on), `bbb3b173ce35fe2a` (x86, `GGML_CPU_DISABLE_CONV_HEURISTICS=1`),
+  `aa320f8a1377a92a` (aarch64) — all three unchanged, so no byte-identity baseline moved.
+* **The kill switch still falls back cleanly.** `GGML_CPU_DISABLE_CONV_HEURISTICS=1` on the quantized
+  model runs, produces the same 67584 samples, and is slower (1.27 s against 0.45), which is the
+  escape hatch behaving as an escape hatch.
+* **The audio still says the sentence.** whisper-small transcribes the Q4_0 output as *"Hey, can you
+  shut down the computer, my friend?"* — **word-identical to the pre-P4.29 Q4_0 arm**, peak 0.156 and
+  rms 0.0161 against 0.149 / 0.0160. Correlation against that arm is **0.054**, and that is the expected
+  number rather than a warning: a 1-ULP duration difference shifts the whole waveform, and the
+  before-arm's correlation against F32 was already **-0.008** when P4.13 shipped it. *Transcribe, do not
+  correlate* — see the Retro-006 discussion above.
+* **Vulkan is unchanged: 0 fallback nodes**, both topologies, on a folded Q4_0 VITS, and the audio
+  transcribes. The loom-side branch asks `backend_can_run` (P4.7e) and keeps the im2col +
+  `mul_mat_kernel_first` lowering when the answer is no, which on Vulkan it is — twice over, on a type
+  test and on `cout == op->ne[2]`. **CUDA had to be told**: its `supports_op` for `CONV_2D` was
+  `ggml_is_contiguous(src0) && ggml_is_contiguous(src1)`, which accepts a folded quantized kernel and
+  then reads it as a wrong-shaped F32 one — a silent wrong answer rather than a failure. Now declined.
+* **`test_conv_1d_folded_kernel_matches_declared` has a fourth arm**, and runs over **two shape sets**
+  because the packed op has two lowerings inside it and the shape picks between them: `OC=5, IL=11`
+  lands on the batched im2col, `OC=4, IL=64` on the direct register-tiled sweep (verified by
+  instrumenting both). Arm four builds `ggml_conv_2d_direct_packed` directly rather than through the
+  primitive — on a CPU the primitive already chooses it, so driving it through the op would only re-test
+  arm three, and would stop testing anything the day `backend_can_run` says no. **Verified red by
+  sabotage**: swapping `kw` and `kh` in the geometry reader keeps `kw*kh*ic*oc` equal to `nelements`, so
+  every assert passes and only the numbers catch it — 4 checks fail. Swapping `kw` and `ic` does not
+  reach a number; it trips `c_in == kernel->ne[2]` first.
+* `ctest -L ci` **74/74**, `ctest -L gate` **83/83** on x86-64.
 
-#### Risks, in the order they are likely to bite
+#### What is left
 
-1. **The heuristic may decline the shapes that matter.** `ggml_conv_1d_direct_ok` requires the kernel to
-   fit a cache budget *as F32* — and it should keep doing so, because `wp` is F32 either way. But the
-   budget is computed from `sizeof(float)` against the stored kernel, so a quantized kernel must be
-   priced by its **dequantized** size or the predicate will silently admit shapes it was tuned to
-   reject. This is the single most likely way to ship something slower than today.
-2. **`params->wdata` is shared.** The dequantize writes into the same buffer the padded activation copy
-   uses. The existing `need` accounting already covers both, but it is computed in
-   `ggml_conv_1d_direct_ok` from `sizeof(float)` — see risk 1; the two must be changed together.
-3. **Per-call dequantize in the wrong place.** See the caveat above. A conv inside a decode loop would
-   pay it per token; nothing in tree does today, and nothing should start without re-measuring.
-4. **A GPU has none of this.** The packed direct op would be CPU-only at first, so the loom-side branch
-   must ask `backend_can_run` rather than assume, exactly as P4.7e prescribes.
-
-#### Why the recovery should be TOTAL, not 1.46x
-
-Worth stating precisely, because it is easy to read the table above as "this item is worth 1.46x". It is
-worth more. The dequantize happens **at the top of `ggml_compute_forward_conv_2d_impl`, before either
-path**, so once `wp` holds F32 weights every branch below is the F32 branch — the direct sweep for the
-shapes the heuristic accepts, the batched im2col for the ones it declines, and the three fusions in
-both. A quantized convolution then executes the *same instructions* as arm A. The expected end state is
-therefore **arm A plus 1.8 ms**, i.e. a quantized model at F32 speed on both machines, and the
-1.46x/1.33x numbers are evidence that the thing being unlocked is real rather than a statement of the
-prize.
-
-That is also the claim most likely to be wrong, and the acceptance criterion above is written to catch
-it: if the packed model lands nearer arm B than arm A, the heuristic is declining shapes it accepts for
-F32 — which is risk 1, and the first thing to check.
-
-#### What would make this NOT worth doing
-
-The premise was that the direct sweep is where the loss lives, and both machines now say it is
-(1.46x and 1.33x), so the remaining way for this to fail is risk 1: a predicate that prices the kernel
-by its *stored* size admits shapes it was tuned to reject and ships something slower than today. Price
-`ggml_conv_1d_direct_ok`'s cache budget on the DEQUANTIZED size, and re-run the eleven-shape table in
-§4 before believing any end-to-end number.
+* **A second convolutional family at Q8_0 has not been re-run end to end.** P4.13's follow-ups
+  transcribed Matcha, Kokoro and StyleTTS2 word-identically at Q8_0 through the *old* lowering; the
+  mechanism here is per-node and model-independent, and VITS's 114 folded kernels already span both of
+  ggml's lowerings, but a second family is what would say so rather than argue it.
+* **`op_conv_2d` (the genuinely 2-D form) is untouched** and still takes im2col + `mul_mat_kernel_first`
+  for a folded kernel. Nothing in tree has a quantized 2-D convolution hot enough to notice; the same
+  `ggml_conv_2d_direct_packed` would serve it, with `kh > 1`, whenever one does.
+* **`cmake/patches` reverse-check.** ggml-0013 edits `ops.cpp` inside ggml-0007's context, so that patch
+  joins 0004-0006 in failing `git apply --reverse --check` on an already-patched tree, and every
+  `cmake` re-run therefore takes `GgmlPatches.cmake`'s reset-and-retry path (which works, and rebuilds
+  ggml). Pre-existing, now one patch worse, and cheap to fix by regenerating the earlier patches with
+  more context.
 
 ### P4.28 — the relative-position pad: 18.9 MB of a VITS export was zeros — DONE 2026-08-31
 
