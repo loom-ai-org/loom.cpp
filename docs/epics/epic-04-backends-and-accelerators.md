@@ -699,11 +699,18 @@ one of these a Linux answer, and none of them carries over:
    `.incbin` in a `__DATA,__ggml_metallib` section, compiled by the Metal framework at run time. Two
    consequences. **(a)** The lone-`.dylib` trap does not arise — nothing looks for `default.metallib`
    beside a `python` executable. **(b)** **Full Xcode is NOT required to build it.** `xcrun -sdk macosx
-   metal` appears only in the non-embed `GGML_METAL_SHADER_DEBUG` branch, and it is absent on a
-   Command-Line-Tools-only install — which is exactly what `macbook-pro` has. Do not let a missing
-   `metal` compiler be read as "cannot build Metal here"; it means "do not turn EMBED off". (Should a
-   full Xcode ever be wanted for the non-embed path, that is an install, not a blocker — the machine
-   has Homebrew and cmake already; Epic-08 §4 has the inventory.)
+   metal` is invoked at `src/ggml-metal/CMakeLists.txt:95`, inside the `else()` of
+   `if (GGML_METAL_EMBED_LIBRARY)` — the **whole** non-embed branch, not just its `SHADER_DEBUG` arm,
+   which only picks flags. So with EMBED on, nothing in the build ever calls it. Do not let a missing
+   `metal` compiler be read as "cannot build Metal here"; it means "do not turn EMBED off".
+
+   **And it is not a Homebrew formula, so do not go looking for one.** `xcrun` itself is present
+   (`/usr/bin/xcrun`); what is absent on a Command-Line-Tools-only install is the `metal` *utility* it
+   dispatches to, which ships with **full Xcode** — App Store, ~10-15 GB, then
+   `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`, and on Xcode 16+ the Metal
+   compiler is a further downloadable component (`xcodebuild -downloadComponent MetalToolchain`).
+   **The recommendation is not to**: it buys only the non-embed path, which a DL-loaded backend must
+   not use anyway.
 4. **Size, measured rather than guessed.** `libggml-vulkan.so` is 46.5 MB because 44 MB of it is
    compiled SPIR-V; Metal ships shader *source* or a metallib and should be far smaller, which would
    make it the first backend package that is small for a reason other than restraint. The number belongs

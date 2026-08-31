@@ -100,6 +100,13 @@ Python 3.10, envs `env-py-3.11` (3.11.12, arm64 — **use this one**), `env-py-3
 error; see Epic-04 §5, where that turns out **not** to block Metal. Missing and likely wanted:
 **`ninja`** and **`pkg-config`**, both a `brew install` away.
 
+**What is NOT there yet, and is needed before the "run a model on it" bar can be met:** neither repo is
+checked out on the machine (`~/loom*` does not exist) and there are **no GGUFs** on it, so a model has
+to be copied over — the smallest useful pair is `vits-piper-en-gb-miro` (11.7 MB at Q4_0 after P4.28)
+and `whisper-small.gguf` as its ASR oracle. Disk is not a constraint: **207 GB free of 460**. Rosetta 2
+is installed, which matters only if the `macosx_10_13_x86_64` wheel is ever smoke-tested locally rather
+than in CI.
+
 **THE SSH INVOCATION GOTCHA, which cost one wrong inventory already.** `ssh macbook-pro 'cmd'` runs a
 **non-login, non-interactive** shell, so it sources neither `~/.zprofile` (Homebrew's `shellenv`) nor
 the conda init block: `brew`, `cmake` and `conda` all report as absent and the bare `python3` resolves
