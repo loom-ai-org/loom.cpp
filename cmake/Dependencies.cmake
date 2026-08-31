@@ -73,17 +73,24 @@ set(GGML_LLAMAFILE ${LOOM_TINYBLAS} CACHE BOOL "" FORCE)
 option(LOOM_OPENMP "Build ggml's CPU backend against OpenMP instead of ggml's own threadpool" OFF)
 set(GGML_OPENMP ${LOOM_OPENMP} CACHE BOOL "" FORCE)
 
-# The pinned ggml, patched -- four diffs, each carrying its own measurement. Three are tinyBLAS: two
+# The pinned ggml, patched -- each diff carrying its own measurement. Four are tinyBLAS: two
 # aarch64-only fixes to GCC's code generation for its inner loop (a register tile GCC can actually
 # allocate, and operand addresses it will strength-reduce -- together 15.6 -> 25.1 GFLOP/s, which takes
-# ggml's own kernel PAST a hand-written one), and one architecture-neutral fix to which matmuls it
-# accepts at all (it declined every `m % 4 != 0` matrix outright, handing thousands of rows back to the
-# generic kernel over one or two leftovers). The fourth is ggml's fused convolution, which batched its
-# im2col 16 MB at a time -- larger than any cache, so the patches it exists to keep local went to DRAM
-# anyway -- and scattered its GEMM output one element at a time. See cmake/GgmlPatches.cmake for why a
-# patch here rather than a fork, a vendored copy, or a change in this engine. The fifth teaches the CPU
-# backend to fuse a convolution with the bias add that follows it, which is a graph-level decision made
-# at compute time and therefore invisible to every other backend. Populated up front so that both branches below -- and any
+# ggml's own kernel PAST a hand-written one), and two architecture-neutral fixes to which matmuls it
+# accepts at all: it declined every `m % 4 != 0` matrix outright, handing thousands of rows back to the
+# generic kernel over one or two leftovers, and it declined every `k % KN != 0` one the same way --
+# where k is the CONTRACTION, so in attention it is a sequence length that nothing rounds. whisper's
+# encoder A@V contracts over 1500 frames and 1500 % 8 == 4, so on x86 that GEMM never entered the file
+# at all: 2.15x at its own shape, and invisible from aarch64, where KN is 4 and 1500 % 4 == 0 (P4.18).
+#
+# Most of the rest are ggml's convolution: one batched its im2col 16 MB at a time -- larger than any
+# cache, so the blocking it exists for went to DRAM anyway -- and scattered its GEMM output one element
+# at a time; another teaches the CPU backend to fuse a convolution with the bias add that follows it,
+# which is a graph-level decision made at compute time and therefore invisible to every other backend.
+# The last is `vec.h`'s exact-erf GELU, which was a scalar libm `erff()` call per element on every
+# architecture. cmake/patches/UPSTREAM.md has one section per patch -- what it fixes, what it measures,
+# what a reviewer will ask -- and cmake/GgmlPatches.cmake has why a patch here rather than a fork, a
+# vendored copy, or a change in this engine. Populated up front so that both branches below -- and any
 # future one -- compile the patched sources, and re-checked on every configure so that an existing
 # build tree cannot end up silently unpatched.
 include(${CMAKE_CURRENT_LIST_DIR}/GgmlPatches.cmake)
@@ -150,9 +157,80 @@ endif()
 # XCFLAGS=-fPIC: loom_engine is built as a shared library (libloom_engine.so), so every statically-linked
 # .o inside it (including LuaJIT's own) must be position-independent -- without this, linking fails with
 # "relocation R_X86_64_TPOFF32 ... can not be used when making a shared object".
+# macOS: the FIRST thing a Mac build hits, and it is a stop rather than a slowdown. LuaJIT's
+# `src/Makefile` has a hard `$(error missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY)` in its
+# `ifeq (Darwin,$(TARGET_SYS))` arm, reached before any compilation -- and CMake does not put that
+# variable into a custom command's environment, so the invocation below arrives with none at all.
+#
+# The value is not a local convention invented here: it is the same number that TAGS THE WHEEL, so
+# one export does both jobs. cibuildwheel exports `MACOSX_DEPLOYMENT_TARGET`, which CMake reads into
+# `CMAKE_OSX_DEPLOYMENT_TARGET`; when nothing set it we fall back to a per-arch platform minimum
+# rather than to the BUILDING machine's macOS version, because a library tagged with the builder's
+# OS refuses to load on any older one -- the AVX2-wheel defect (tests/ci/test_cpu_variants.py in
+# loom-py) in a different spelling.
+#
+# THE FALLBACKS BELOW ARE PLATFORM MINIMA, NOT THE WHEEL'S FLOOR, and the two are deliberately
+# allowed to differ. `loom-py` sets **14.0** for both architectures because ggml's BLAS backend needs
+# Accelerate's new interface (macOS 13.3), rounded up to the next expressible wheel tag -- see
+# Epic-08 §4.3. That is a packaging decision and belongs to the package; a bare engine build has no
+# wheel to tag, and building LuaJIT against an older minimum than the rest of the tree is harmless
+# because a lower deployment target is the more permissive one.
+# THE OUTER MAKE'S JOBSERVER MUST NOT REACH THIS INNER ONE, and clearing it is not a macOS
+# concern -- it is what makes the line below survive a `Unix Makefiles` generator anywhere. GNU make
+# advertises its jobserver to sub-makes through `MAKEFLAGS` (`--jobserver-auth=R,W`), but only hands
+# the file descriptors to a recipe it recognises as recursive, which means one spelled `$(MAKE)`.
+# This one is deliberately plain `make` (see above: the generator may not be make at all), so LuaJIT
+# starts, reads the inherited MAKEFLAGS, and tries to talk to descriptors that were never passed:
+#
+#     make[3]: warning: -jN forced in submake: disabling jobserver mode
+#     make[3]: /bin/sh: Bad file descriptor
+#     make[3]: *** write jobserver: Bad file descriptor.  Stop.
+#
+# Ninja has no jobserver of this kind, which is why the failure had never been seen: every build that
+# matters -- CI, and scikit-build-core, which pulls ninja in as a build requirement -- uses it. A
+# plain `cmake -B build && make -j` does not, on any platform.
+#
+# `MAKELEVEL=` as well as `MAKEFLAGS=`: it is MAKELEVEL that makes the inner make consider itself a
+# submake and print the first of those three lines.
+set(LUAJIT_MAKE_LAUNCHER ${CMAKE_COMMAND} -E env MAKEFLAGS= MAKELEVEL=)
+if(APPLE)
+    # universal2 is a declared non-goal (Epic-08 §4: two native wheels, not one fat one), and a
+    # cross-arch build is a different job from this one -- LuaJIT bootstraps through `minilua` and
+    # `buildvm`, which run on the HOST, so a target arch that is not the host arch needs a
+    # HOST_CC/TARGET_CFLAGS split that nothing here sets up. Fail with the reason rather than
+    # produce a library for the wrong architecture and let the link discover it.
+    list(LENGTH CMAKE_OSX_ARCHITECTURES LUAJIT_NARCH)
+    if(LUAJIT_NARCH GREATER 1)
+        message(FATAL_ERROR
+            "CMAKE_OSX_ARCHITECTURES='${CMAKE_OSX_ARCHITECTURES}': the vendored LuaJIT builds one "
+            "architecture at a time, so a universal binary is not buildable here. Build each arch "
+            "separately -- which is what this project ships anyway.")
+    endif()
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(LUAJIT_TARGET_ARCH ${CMAKE_OSX_ARCHITECTURES})
+    else()
+        set(LUAJIT_TARGET_ARCH ${CMAKE_HOST_SYSTEM_PROCESSOR})
+    endif()
+    if(NOT LUAJIT_TARGET_ARCH STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
+        message(FATAL_ERROR
+            "Cross-compiling LuaJIT (host ${CMAKE_HOST_SYSTEM_PROCESSOR} -> target "
+            "${LUAJIT_TARGET_ARCH}) is not wired up: its build runs minilua/buildvm on the host and "
+            "would need a HOST_CC/TARGET_CFLAGS split. Build on a machine of the target arch.")
+    endif()
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(LUAJIT_MACOS_TARGET ${CMAKE_OSX_DEPLOYMENT_TARGET})
+    elseif(LUAJIT_TARGET_ARCH STREQUAL "arm64")
+        set(LUAJIT_MACOS_TARGET "11.0")
+    else()
+        set(LUAJIT_MACOS_TARGET "10.13")
+    endif()
+    list(APPEND LUAJIT_MAKE_LAUNCHER MACOSX_DEPLOYMENT_TARGET=${LUAJIT_MACOS_TARGET})
+    message(STATUS "LuaJIT: MACOSX_DEPLOYMENT_TARGET=${LUAJIT_MACOS_TARGET} (${LUAJIT_TARGET_ARCH})")
+endif()
+
 add_custom_command(
     OUTPUT ${LUAJIT_LIBRARY}
-    COMMAND make -C ${LUAJIT_SRC_DIR} BUILDMODE=static XCFLAGS=-fPIC -j${LUAJIT_NPROC}
+    COMMAND ${LUAJIT_MAKE_LAUNCHER} make -C ${LUAJIT_SRC_DIR} BUILDMODE=static XCFLAGS=-fPIC -j${LUAJIT_NPROC}
     WORKING_DIRECTORY ${LUAJIT_SRC_DIR}
     COMMENT "Building LuaJIT (static, via its own Makefile)"
     VERBATIM

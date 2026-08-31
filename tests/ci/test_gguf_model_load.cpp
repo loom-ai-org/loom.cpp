@@ -94,6 +94,27 @@ int main() {
     env.set("n_even", 64.0);
     LOOM_CHECK_NEAR(env.eval("floor(($n_even - 1)/2) + 1"), 32.0, 1e-9); // floor(31.5)+1 = 32, NOT llround's 33
 
+    // -- Max()/Min(), added so a shape expression can say "padded, but never by a negative amount".
+    //    sympy prints a clamp this way and the exporter emits it verbatim; VITS's relative-position
+    //    table is the case that needed it, and without it the exporter had to bake a 2048-wide static
+    //    pad into the weights (18.9 MB of zeros). Both capitalisations, because sympy writes `Max` and
+    //    a hand-written attribute would write `max`. --
+    LOOM_CHECK_NEAR(env.eval("Max(3, 7)"), 7.0, 1e-9);
+    LOOM_CHECK_NEAR(env.eval("max(3, 7)"), 7.0, 1e-9);
+    LOOM_CHECK_NEAR(env.eval("Min(3, 7)"), 3.0, 1e-9);
+    LOOM_CHECK_NEAR(env.eval("min(-2, 1)"), -2.0, 1e-9);
+    // The real expression, at a length above and below the window. window_size = 4, so the pad is
+    // `Max(n_tokens - 5, 0)` and the padded table is `2*pad + 9` rows -- 2*n_tokens - 1 above the
+    // window, and the un-padded 9 at or below it, which is what the clamp is for.
+    env.set("n_tokens", 62.0);
+    LOOM_CHECK_NEAR(env.eval("2*Max($n_tokens - 5, 0) + 9"), 123.0, 1e-9);
+    env.set("n_tokens", 4.0);
+    LOOM_CHECK_NEAR(env.eval("2*Max($n_tokens - 5, 0) + 9"), 9.0, 1e-9);
+    env.set("n_tokens", 65.0);  // restore, so later checks read what they were written against
+    // Nested, and with an expression on each side -- the arguments are full expressions, not operands.
+    LOOM_CHECK_NEAR(env.eval("Max(Min($n_tokens, 10) * 2, 3 + 4)"), 20.0, 1e-9);
+    LOOM_CHECK_THROWS(env.eval("Max(1)"), loom::SchemaError);   // two arguments, not one
+
     // -- generic KV accessors (added for the tokenizer.ggml.* vocab schema) --
     LOOM_CHECK(model->has_kv("test.flag_true"));
     LOOM_CHECK(!model->has_kv("test.does_not_exist"));

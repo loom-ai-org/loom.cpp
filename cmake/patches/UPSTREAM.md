@@ -1,12 +1,13 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Ten diffs, each independently useful and independently reviewable. They are written against the pin in
+Eleven diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
 
-**Order and independence.** 1, 2 and 3 touch `llamafile/sgemm.cpp` and are independent of each other,
-though 1 and 2 only pay off together (see below) and are best sent as one PR or two linked ones. 4 and
+**Order and independence.** 1, 2, 3 and 11 touch `llamafile/sgemm.cpp`. 1 and 2 only pay off together
+(see below) and are best sent as one PR or two linked ones; **11 is the same fix as 3 on the other
+axis** and lands on adjacent lines of the same function, so send them together or 3 first. 4 and
 5 touch the CPU convolution; **5 depends on 4** (it uses the `ldc` mul_mat helper 4 introduces, and its
 staging only makes sense once 4 has made the op batch-oriented). A reviewer taking 4 without 5 is fine;
 5 without 4 is not. **6 also sits on top of 4** -- it is a second path inside the same op -- and is
@@ -580,3 +581,412 @@ already shipping in this file is far less accurate than either. (2) The `f16` en
 scalar tail. (4) The coefficients are a least-squares fit refined by reweighting, not a Remez
 exchange; a reviewer who wants an equioscillation certificate rather than an exhaustive sweep should
 say so, though the sweep is the stronger statement for a fixed input type.
+
+---
+
+## PR 11 — `sgemm`: handle `k % KN != 0` instead of declining the whole matmul
+
+*(`cmake/patches/ggml-0011-tinyblas-k-tail.patch`)*
+
+**Problem.** The same shape as PR 3, on the other axis, and a worse one. `matmul` opens with
+`if (k % KN != 0) return false;`, so a contraction that is not a whole number of vectors sends the
+**entire** matmul to ggml's generic one-output-element-per-call kernel. `m` is a row count; `k` is the
+**contraction**, and in attention the contraction is a sequence length — a number nothing rounds.
+
+whisper's encoder is the clean example. Its `A@V` contracts over 1500 mel frames, and **1500 % 8 == 4**
+on AVX2, **1500 % 16 == 12** on AVX-512. That matmul has never entered this file on x86 at all. NEON
+has `KN == 4` and 1500 % 4 == 0, which is why it is invisible from aarch64 — and why the whole of
+PRs 1–3 was written without anyone noticing.
+
+**Fix.** Split the contraction the way PR 3 splits the rows: the aligned prefix runs the vector loop
+unchanged, and the ≤ `KN-1` leftover elements are accumulated as scalars **inside the tile**, into the
+same accumulator, before the `hsum`. No extra pass over `C` and no extra memory traffic; the added work
+is at most 7 scalar products per output element.
+
+Scoped to the F32 instantiation because the tail is a scalar multiply and the other instantiations
+carry `ggml_fp16_t`/`ggml_bf16_t`, which do not convert that way. Those keep the existing rejection.
+
+**One thing a reviewer should not simplify away.** There are two epilogues, and the branch is outside
+the tile on purpose. Folding the tail loop into a single epilogue — where it is *statically empty*
+whenever `k % KN == 0` — costs the small-`k` shapes **30%**: whisper's `QK^T` at `k = 64` went
+154 → 201 ms, because the extra live values change how the accumulators are spilled around the `hsum`.
+At `k = 64` the epilogue is a large fraction of eight loop iterations, so the aligned case has to keep
+byte-for-byte the code it had.
+
+**Evidence.** One thread, Ryzen 3 3250U (AVX2), at whisper-small's own `A@V` shape (`m=64, n=1500,
+k=1500`, 12 heads): **176.2 → 81.8 ms, 2.15x**. A `k` sweep at that shape shows the cliff is the
+divisibility and nothing else:
+
+| `m=64, n=1500` | k=1496 | k=1500 | k=1504 |
+|---|---|---|---|
+| GFLOP/s | 44.5 | **20.8** | 47.0 |
+
+In model (whisper-small, `jfk.wav`, `$LOOM_PROFILE` at one thread, two interleaved runs per arm) the
+`MUL_MAT 64 x 1500` bucket goes **2240/2460 → 1119/1136 ms** and no other bucket moves.
+Architecture-neutral in the same sense PR 3 is: every ISA whose `KN` does not divide a model's
+sequence length benefits, and the wider the vector the more often that is. **It was not, for four
+days** — see the aarch64 section below, which is why the tail is dispatched out of line.
+
+**And whisper is not the best case — a HEAD DIMENSION misses `KN` more reliably than a sequence length
+does.** whisper's `A@V` contracts over frames; `QK^T` contracts over `d_model / n_heads`, which is a
+constant of the architecture. NVIDIA's Conformer-CTC small is `176 / 4 = 44`, and **44 % 8 == 4 on every
+utterance that model will ever run**. End to end, one thread, two builds of this file differing only in
+this patch, paired over 11 rounds per cell:
+
+| | Ryzen 3 3250U | Core Ultra 9 285K |
+|---|---|---|
+| conformer-ctc-small, 11 s clip | **1.244x** (p10 1.198) | **1.222x** (p10 1.173) |
+| whisper-small, 11 s clip | **1.059x** (p10 1.033) | **1.085x** (p10 1.054) |
+
+Its `QK^T` buckets move 2.24-2.41x. Six clips trimmed so the *encoder length* steps through both
+residues mod 8 gain the same 1.20-1.24x either way, which is what says the head dimension rather than
+the frame count is doing the work. Models whose head dimension already divides `KN` — GigaAM (48),
+Parakeet (128), whisper (64) — gain nothing measurable from `QK^T` and only what their `A@V` shape
+happens to give.
+
+**THE TAIL IS DISPATCHED OUT OF LINE, AND THAT PLACEMENT IS LOAD-BEARING (aarch64, 2026-08-29).**
+The first version of this patch put the scalar tail loop inside `gemm_bloc` — as a second epilogue,
+with the branch outside the tile. On x86 that is the fast arrangement and the note above says why. On a
+Cortex-A72 it cost **every f32 GEMM shape measured 1.3-1.75x**, one thread, three rounds, and *none of
+those shapes ever takes the tail* — NEON's `KN` is 4 and every one of these `k` divides it:
+
+| Pi 4B, m x n x k | with the tail inlined | with it out of line | unpatched |
+|---|---|---|---|
+| 1500 x 1500 x 64 (`QK^T`) | 4.67 GFLOP/s | **7.38** | 7.54 |
+| 64 x 1500 x 1500 (`A@V`) | 4.70 | **7.80** | 7.88 |
+| 768 x 1500 x 768 (`proj`) | 4.86 | **8.43** | 8.38 |
+| 3072 x 1500 x 768 (`fc1`) | 4.86 | — | 8.56 |
+| 768 x 1500 x 3072 (`fc2`) | 4.01 | **5.25** | 5.30 |
+
+**Bisected to the hunk, not guessed:** a build with `kk` truncated and the tail loop *removed* runs at
+full speed (8.56 GFLOP/s on `proj`); a build with `kk = k` and the tail loop *present* runs slow (4.83).
+Folding the tail into a single epilogue instead of two does not help either (5.12). **It is the presence
+of the scalar tail loop in the tile function**, which reaches `Aat`/`Bat` after the main loop and
+changes what GCC's register allocator does with the 4x3 NEON tile — the same fragility PR 1 exists for,
+approached from the other side.
+
+So the tail now has its own `NOINLINE` function, dispatched on `k % KN` *before* the tile. The aligned
+path is then instruction-for-instruction what it was before this patch on every ISA, which is exactly
+what the x86 note above demands, and the tail path is unchanged in what it computes. Verified on both:
+
+| | x86 (Core Ultra 9 285K, AVX2) | aarch64 (Cortex-A72) |
+|---|---|---|
+| `A@V` k=1500, where the tail FIRES | 150.7 GFLOP/s against 53.2 unpatched — **2.83x, the win intact** | n/a (1500 % 4 == 0) |
+| `QK^T` k=64, aligned | 119.3 against 118.8 shipped / 120.7 unpatched | 7.38 against 7.54 unpatched |
+| `proj` k=768, aligned | 162.0 against 162.2 / 161.9 | 8.43 against 8.38 |
+| whisper-small end to end | 2.076 s against 2.086 s — unmoved | 36.4 s against 46.4 s — **1.27x** |
+| `tests/ci/test_tinyblas_gemm` | 113/113 | 113/113 |
+
+**And the rule this patch is the reason for:** a diff in `cmake/patches/` is not done until this file
+carries a number from an x86 box **and** one from the Pi, even when one of them is "no change". This
+one shipped with only the first, and cost the reference device 1.3-1.75x for four days
+([Retro-019](../../docs/retros/retro-019-a-patch-measured-on-one-isa.md)).
+
+**Accuracy.** Against a double-precision reference over every `k` in [1, 40] plus 63/64/65 and
+1496–1504, the worst relative error is **2.6e-05**, and the aligned `k` sit in the same place as the
+unaligned ones (k=1496 2.1e-05, k=1500 2.3e-05) — f32 accumulation noise, not a dropped term. loom's
+whisper gate (encoder against HuggingFace) moves `max/absmax` 4.19e-04 → 4.34e-04 against a 1e-3 limit
+and `mean_abs_diff` 9.36e-06 → **9.33e-06**, passing 67/67 either way.
+
+**Testing.** The same shape as PR 3's test on the other axis: `k % KN` over its whole residue range
+against a double-precision reference, including `k < KN` (which still declines), and whisper's own
+`k = 1500`. Verified red by dropping the tail accumulation — 16 of 113 checks fail, at exactly the
+unaligned `k`, by 2e-02 to 1.7e-01 against a 1e-5 tolerance.
+
+**What a reviewer should push on.** (1) Whether the two-epilogue split is worth its duplication —
+the measurement above is the argument, and it is compiler-specific enough to want a second data point.
+(2) The f16/bf16 instantiations keep the rejection, so a reviewer may want the same treatment there
+via `GGML_FP16_TO_FP32`. (3) This lands on top of PR 3; the two are independent in mechanism but touch
+adjacent lines of the same function, so they want reviewing together.
+
+## PR 12 — `sgemm`: a job should own a whole cache line of `C`, not a quarter of one
+
+`llamafile_sgemm`'s F32 path picks its row block from what divides `m`:
+
+```c
+if (m % 16 == 0 && (m/16 >= params->nth)) mnpack<4, RN, 4>(...);   // 4 tiles of 4 rows
+if (m % 8  == 0)                          mnpack<4, RN, 2>(...);
+if (m % 4  == 0)                          mnpack<4, RN, 1>(...);   // one tile of 4 rows
+```
+
+`gemm()` hands ONE JOB the rows `[ii, ii + BM*RM)`, and `C` is `m`-contiguous — so a job's store to one
+column of its range is `BM*RM*4` **bytes** wide. At `BM = 1` that is **16 bytes, a quarter of a cache
+line**, and four threads write four quarters of the same line for every column of the whole matmul.
+
+**It does not make the kernel slower. It stops it threading.** Core Ultra 9 285K (24 cores, no SMT),
+`m = n = 1500, k = 64`, 12 head-slices — the shape of whisper-small's `QK^T` — against the same shape
+padded, so the only difference is which branch above is taken:
+
+| `m` | branch | `BM` | bytes of `C` per job | 1 thread | 4 threads | scaling |
+|---:|---|---:|---:|---:|---:|---:|
+| 1496 | `m % 8 == 0` | 2 | 32 | 29.4–30.5 ms | 21.2–21.9 ms | 1.40x |
+| **1500** | `m % 4 == 0` | **1** | **16** | 29.6–30.9 ms | 30.0–31.5 ms | **0.98x** |
+| 1504 | `m % 16 == 0` | 4 | 64 | 29.4 ms | 10.6–11.0 ms | **2.75x** |
+
+Monotone in the fraction of a line a job owns. `perf stat -e task-clock` reports **3.65 CPUs utilised**
+in the 0.98x row: the threads are running, they are just passing a line back and forth.
+
+**`m` is a sequence length in every attention matmul** — a number nothing rounds — so this is the
+common case rather than a corner. whisper-small's encoder runs 1500 frames, which is `4 mod 16`, the
+worst residue there is.
+
+**The fix takes a prefix instead of demanding divisibility**, which is PR 3's trick on the other end of
+the same axis: run `m - (m % 16)` at `BM = 4` and finish the 0/4/8/12 leftover rows in a separate
+column-split loop that keeps the same `4 x RN` tile. It is guarded on `nth > 1`, because false sharing
+needs a second thread by definition and a patch that cannot help at one thread should not be able to
+hurt there either — at `nth == 1` the schedule is instruction-for-instruction what it was before.
+
+| `m = 1500`, 285K | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|
+| before | 29.38 ms | 30.30 ms | 29.40 ms | 19.90 ms |
+| after | 29.38 ms | 24.98 ms | **15.00 ms** | **8.12 ms** |
+| | 1.00x | 1.21x | **1.96x** | **2.45x** |
+
+and the `m = 1504` control is flat to within 1% at every thread count, which is what says the patch
+only reaches the branch it is aimed at.
+
+**In model**, whisper-small on `jfk.wav` at 4 threads, `$LOOM_PROFILE`, four interleaved rounds per arm:
+the `MUL_MAT 1500 x 1500` bucket goes **391.2 → 185.9 ms (2.10x)** and it is the **only** bucket that
+moves by more than 1.2 ms out of 40 — the six dense GEMM groups, `SOFT_MAX`, `CONT` and the rest are
+all within noise. End to end **4.050 → 3.858 s, 1.050x** at 4 threads, 1.056x at 8 (2.570 → 2.433 s)
+and 1.011x at 2.
+
+**Bit-identical output, which is the point of it being a SCHEDULING change.** Each output is still one
+dot product accumulated over `k` in the same order; only which thread computes it and how many rows a
+job owns have moved. FNV-1a over the whole result buffer agrees between the two builds at
+`m = 1492/1500/1501/1504` x 1/4/8 threads — so no byte-identity gate baseline needs re-recording, and
+the accuracy question PR 11 had to answer does not arise here.
+
+**Both ISAs, per the standing rule this file learned the hard way (PR 11).** aarch64 is **no change
+at `m = 1500`** — a Raspberry Pi 4 threads 3.5x at *every* one of the three `m` above, so there is
+nothing there to fix: 133.10 ms before against 133.65 after, 4 threads, ABBA-interleaved medians of ten.
+
+**AND THE RAGGED PREFIX IS GATED ON `k <= 256`, WHICH IS THE OTHER HALF OF THIS PATCH.** The `m = 1500`
+number above is the only aarch64 measurement this patch had for a week, and `m = 1500` is the one
+shape where it changes nothing there. Shipped without a `k` guard it cost a Raspberry Pi 4 **2.4% on
+VITS** — 27 ms of a 1.1 s synthesis, of which a per-node profile put 22.6 ms in `CONV_2D`.
+
+What the branch removes is a **per-output** cost — `m*n` contended stores, one per element of `C`,
+however long the contraction is. What it adds is **per-work**: a job's row block is four times taller,
+so it holds `RM*BM*k*4 = 16k` bytes of `A` instead of `4k`, and there are four times fewer jobs to
+balance. **The benefit decays as `1/k`; the cost does not.** Sweeping `k` at `m = 284, n = 384`,
+4 threads, both arms in one process behind a run-time switch, ABBA-interleaved, ratio per round:
+
+| `k` | 64 | 128 | 192 | 256 | 384 | 512 | 768 | 960 | 2304 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Core Ultra 9 285K | **2.035** | **1.317** | 1.046 | 1.030 | 1.005 | 0.996 | 0.987 | 0.983 | 0.974 |
+| Cortex-A72 | 1.014 | 1.011 | 1.005 | 0.997 | 0.995 | 0.977 | 0.959 | **0.912** | 0.901 |
+
+Monotone on both, crossing 1.0 within a factor of two of each other — **so the predicate is `k`, not
+the ISA**, and `!defined(__aarch64__)` would have been wrong in both directions (it keeps the x86
+losses at `k >= 512` and throws away the aarch64 wins at `k <= 192`). 256 is the largest power of two
+inside the winning region on both machines. `m % 16 == 0` keeps the schedule it always had, at every
+thread count and every `k`, so the patch is strictly additive:
+
+```c
+const bool ragged_prefix = (m % 16 != 0) && params->nth > 1 && k <= 256;
+if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) { ... }
+```
+
+**Why a reviewer of an attention patch should care about `k`:** `m` is a sequence length and `k` is a
+head dimension in attention, which is where this was measured — but the ggml CPU backend lowers 1-D and
+2-D convolution through this same `sgemm` (in loom's tree via the conv patches above; upstream via
+`ggml_conv_*`'s im2col + `mul_mat`), and there `k` is `in_channels * kernel_width`: 576 to 2304 in one
+small TTS vocoder, which issues **10.9 of its 14.4 GFLOP** through matmuls this branch newly accepts.
+With the guard, whisper's `QK^T` on the 285K goes from 1.809x to **1.941x** against the unpatched
+schedule (the shapes it now declines were dragging the average down) and the Pi returns to parity with
+the unpatched tree: 12 paired ABBA rounds, cooled to a fixed 60 C, **1.003** with p10 0.985 and
+p90 1.018.
+
+This is PR 11's lesson one level down: a number per ISA is not enough — it has to be a number per
+**regime the branch is enabled for**, and the ISA is only one axis. Four small cores behind a shared
+1 MB L2 also do not pay for a contended line the way a 24-core mesh does, so there is nothing for this
+patch to win on the Pi at any `k`; a 2-core Ryzen 3 3250U cannot resolve it either (±40% spread on that
+box).
+
+**Testing.** `tests/ci/test_tinyblas_gemm` gains the whole residue class of the 16-row split —
+`m = 1488/1492/1496/1500/1501`, plus an `n` that does not divide evenly across the threads so the
+ragged column slice is exercised — and the element check gains a window around the seam. **That window
+is load-bearing:** the leftover rows sit in the MIDDLE of the matrix, not at its edge, and with the
+window disabled a sabotage that skips the first leftover tile drops from 8 failing checks to 2.
+Verified red three ways: leftover rows never computed (7 checks fail, by 1e1–1e2 relative), the ragged
+column slice never finished (3 fail), and the first leftover tile skipped (8 fail). 137/137 green with
+all three removed, on x86 and on the workstation.
+
+**What a reviewer should push on.** (1) The `nth > 1` guard makes the patch invisible on a
+single-threaded benchmark, which is how this went unnoticed — a reviewer may reasonably want it
+unconditional, and the argument against is that it buys nothing measurable there. (2) `BM` remains a
+cache knob as well as a sharing knob, and the two now disagree about small `m`; the `m16/16 >= nth`
+condition is inherited unchanged rather than re-derived. (3) The residual gap — `m = 1500` reaches
+15.0 ms where `m = 1504` reaches 10.9 — is `ldc` alignment, not sharing: 1500 floats is 6000 bytes, so
+a 64-byte store still straddles two lines on odd columns. Padding `C` would close it and is a bigger
+change than this.
+
+## PR 13 — `conv_2d`: accept a quantized kernel, because the direct path already repacks it
+
+`GGML_OP_CONV_2D` takes an F32 or F16 kernel. A quantized one is not merely unsupported — it is
+**unrepresentable**, and for a reason worth stating: quantization blocks are laid along `ne[0]`, and for
+a kernel stored the way it is declared, `[KW, KH, IC, OC]`, `ne[0]` is the kernel WIDTH — 1, 3, 5, 7 —
+which no block size divides. So a producer that wants a block-quantized convolution has to fold the
+spatial and channel axes into `ne[0]` first, giving `[IC*KH*KW, OC]`, and a folded kernel then carries
+none of the geometry this op reads off `a->ne`.
+
+The result is that a convolutional model gets nothing from quantizing except a smaller file. Measured on
+a VITS vocoder at Q4_0 — 81.7 -> 30.6 MB — one synthesis went **0.50 -> 1.04 s on x86-64 (2.08x) and
+1.03 -> 2.18 s on a Cortex-A72 (2.13x)**, because the whole model dropped out of `CONV_2D` into
+`im2col` + `mul_mat` and gave up the direct 1-D sweep (PR 6) and the two fusions (PR 5, PR 7) with it.
+
+**The fix is one dequantize, and the reason it is only one is that the direct path never reads the
+kernel as stored.** `ggml_conv_1d_direct_run` repacks the whole kernel into an F32 scratch buffer before
+it computes anything, and the register-tiled inner kernel reads only that. So a quantized kernel needs
+no quantized inner loop, no `vec_dot`, and no activation quantized to `vec_dot_type` — it needs a
+`to_float` into a buffer that already exists.
+
+Three pieces:
+
+* **`ggml_conv_2d_direct_packed`** — `ggml_conv_2d_direct` plus `kw`, `kh`, `ic`, stored in `op_params`
+  6..8. `GGML_MAX_OP_PARAMS` is 64 bytes and `CONV_2D` used 24, so this needs no new op code, no new
+  dispatch entry and no ABI change. A zero `kw` is what says "declared layout", which is every existing
+  graph. Reshaping the folded tensor back is not an alternative: a `[IC*K, OC]` Q4_0 tensor reshaped to
+  `[K, 1, IC, OC]` puts K=3 on `ne[0]`, which is not a multiple of the block size, and the resulting
+  `nb` is nonsense.
+* **`ggml_compute_forward_conv_2d_impl`** dequantizes off the FRONT of the work buffer and **re-enters
+  itself** with a stack `ggml_tensor` that is an ordinary contiguous F32 kernel in the declared layout,
+  and a `ggml_compute_params` holding what is left of the buffer. Nothing below that point knows: the
+  direct sweep, the phase-major variant, the batched `im2col` fallback, all three fusions, every thread
+  split. The fold is a pure reinterpretation of the stored order — element `(kx, ky, ic, oc)` sits at
+  `oc*(IC*KH*KW) + ic*(KH*KW) + ky*KW + kx` either way — so the dequantized buffer read with the
+  declared strides IS the declared kernel, with no permutation and no second pass.
+* **`ggml_graph_plan`** adds the dequantized kernel's bytes to `GGML_IM2COL_WORK_SIZE` for a quantized
+  `src0`, since the buffer now holds both.
+
+**The re-entry is the design decision, not an implementation detail.** The alternative — threading
+`kw/kh/ic/oc` through every function below — leaves each predicate free to price the kernel by its
+STORED size, and one of them must not: `ggml_conv_1d_direct_ok`'s cache budget is
+`IC*OC*KW*sizeof(float)`, and `wp` is F32 whatever the kernel is. Priced by 8.4 MB of Q4_0 rather than
+59.5 MB of F32, that predicate silently admits shapes it was tuned to reject, which is the one way this
+change could ship something SLOWER than what it replaces. Re-entering with a rebound tensor makes every
+predicate below price the dequantized size because that is the only size it can see.
+
+**What the dequantize costs, measured over all 59.5 MB of that model's convolution weights at once** —
+i.e. a whole synthesis's worth of kernel packing, not one convolution (Ryzen 3 3250U):
+
+| | dequantize | the F32 pack it replaces | delta |
+|---|---:|---:|---:|
+| Q4_0 | **10.3 ms** (5.77 GB/s of output) | 8.5 ms | **+1.8 ms** |
+| Q8_0 | 9.3 ms | 8.4 ms | +0.9 ms |
+
+0.4% of a 500 ms synthesis, and the pack loop reads LESS memory in the quantized case (8.4 MB rather
+than 59.5 MB) while writing the same amount, which is why the delta is arithmetic rather than traffic.
+
+**End to end, and on both ISAs** — `paired_arms.py`, interleaved ABBA rounds, one binary per arm swapped
+by `LD_LIBRARY_PATH`, the Pi cooled to a fixed 60 C before every arm:
+
+| VITS at Q4_0, 4 threads | rounds | before | after | median ratio | p10 | p90 |
+|---|---:|---:|---:|---:|---:|---:|
+| **Cortex-A72** (Pi 4B) | 7 | 2.197 s | 1.059 s | **2.075x** | 2.060 | 2.126 |
+| **x86-64** (Ryzen 3 3250U) | 9 | 1.417 s | 0.681 s | **2.101x** | 1.927 | 2.441 |
+
+which is the whole 2.08x / 2.13x back. The x86 band is wide because that box is a noisy 2-core laptop
+part; the Pi's band is 3% wide and is the one to read.
+
+**The end state is a quantized model at F32 speed, which is the claim worth checking.** Because the
+dequantize happens before either lowering, a quantized convolution then executes the *same instructions*
+as an F32 one. Against its own F32 export, same harness, per-round ratios:
+
+| VITS Q4_0 / its own F32 | rounds | ratio | per output sample |
+|---|---:|---:|---:|
+| Cortex-A72 | 7 | 0.950 | **1.029x** |
+| x86-64 | 9 | 0.923 | **1.000x** |
+
+(the two exports produce 67584 and 73216 samples — VITS durations are a `ceil()` of a float and the
+arithmetic changed — so the raw ratio understates and the normalised column is the honest one). **F32 in
+11.7 MB rather than 62.8.**
+
+**The F32 path is bit-identical**, which is what a branch guarded on `ggml_is_quantized` has to show:
+FNV-1a over the whole audio agrees before and after on both machines and in **both** lowerings —
+`68c3229eab373455` / `bbb3b173ce35fe2a` (x86, heuristic on / `GGML_CPU_DISABLE_CONV_HEURISTICS=1`) and
+`aa320f8a1377a92a` (aarch64) — so no byte-identity baseline needs re-recording.
+
+**It is also more accurate, not less.** Dequantize-then-F32-FMA replaces a path that dotted Q4_0 weights
+against activations rounded to Q8_0.
+
+**Backends.** The CPU's `supports_op` gains "or quantized with a `to_float`"; **CUDA's declines a
+quantized or folded `src0`**, which today it would accept (`ggml_is_contiguous(src0) &&
+ggml_is_contiguous(src1)`) and then read as a wrong-shaped F32 kernel — a silent wrong answer, not a
+failure. Vulkan already declines it twice over (a type test, and `cout == op->ne[2]`). Verified: a
+folded Q4_0 VITS on Vulkan still runs with **0 fallback nodes** in both topologies, because the caller
+asks `supports_op` and keeps its own `im2col` lowering when the answer is no.
+
+**Where this design is NOT legal.** It dequantizes **per call**. That is right for a convolution that
+runs once per utterance — every convolutional model in this space is a TTS vocoder or an ASR encoder —
+and wrong for one inside a decode loop, where it would be paid per token. `SSM_CONV` is a different op
+and does not route here.
+
+**What a reviewer should push on.** (1) `op_params` 6..8 is a side channel; a `GGML_OP_CONV_2D_PACKED`
+would be more explicit and would cost a dispatch entry and a `supports_op` case in every backend.
+(2) The producer has to fold the kernel itself, and nothing in ggml helps it or checks it beyond the
+three asserts in `ggml_conv_2d_direct_packed`. (3) A per-call dequantize is a policy, and there is no
+mechanism to cache it across calls if someone puts one of these in a loop.
+
+## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
+
+**No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
+opposite belief, and then by P4.27, which found out why that patch measured nothing. Both write-ups are
+in loom's Epic-05 §5 and
+[Retro-023](https://github.com/loom-ai-org/loom.cpp/blob/main/docs/retros/retro-023-a-bench-whose-graph-was-the-treatment.md).
+
+`ggml_get_n_tasks` reads like a per-node thread count, and in this version it is not one. It is called
+in **exactly one place** — `ggml_graph_plan` — where it sizes the work buffer and feeds `max_tasks`,
+and then:
+
+```c
+cplan.n_threads = MIN(max_tasks, n_threads);
+```
+
+`ggml_graph_compute_thread` runs **every node on every thread** with `params.nth = cplan.n_threads`.
+An op that must not split says so itself — `ggml_compute_forward_sum_f32` and
+`ggml_compute_forward_leaky_relu_f32` open with `if (params->ith != 0) return;`. So `n_tasks` survives
+only as a **graph-level clamp**, which can take a whole graph down to one thread and can do nothing
+else.
+
+**Three consequences, and the third is the one that costs people time.**
+
+1. **The table and the ops disagree.** `GGML_OP_UNARY`'s `TANH`, `SIGMOID`, `EXP`, `RELU`, `ELU` are
+   declared `n_tasks = 1`, but `apply_unary_op` splits over rows through `get_thread_range` and threads
+   3.9-4.8x — measured on a Cortex-A72 at 4 threads, a Core Ultra 9 285K at 24 and a Ryzen at 2. The
+   declaration is ignored in every graph that also holds one op declaring more, which is every real
+   model graph. Nothing is *wrong* — but a reader who trusts the table gets the opposite of the truth,
+   and a patch that "fixes" the table changes nothing.
+2. **A homogeneous graph silently runs single-threaded.** Build a graph of nothing but `TANH` nodes and
+   it plans one thread however many you asked for, even though every one of those nodes would have
+   split. It is easy to write such a graph by accident in a benchmark, and it makes the benchmark
+   measure its own plan.
+3. **Anything that computes node-by-node changes the thread count of those nodes.**
+   `ggml_backend_sched`'s eval-callback path computes one node at a time, and so does any profiler
+   built on `ggml_graph_view(graph, i, i + 1)`. Under such a tool every `n_tasks = 1` node is planned
+   at **one** thread while the rest of the report is threaded — in one small TTS model at 4 threads
+   that is 122 `UNARY`, 126 `SUB`, 106 `SCALE`, 42 `SUM_ROWS` and 32 `LEAKY_RELU` nodes. loom read a
+   threaded op as "30.4 ms, identical at one thread and four, three cores idle" for four days on the
+   strength of it, and scoped two items on that reading.
+
+**A one-row tensor still cannot split by rows**, which is worth saying separately because it is a real
+(if small) limitation rather than a misunderstanding: `get_thread_range` divides `ggml_nrows(src0)` by
+`nth`, so at `nr = 1` thread 0 gets everything. Measured `ne0 = 256`, four threads against one, Pi 4B,
+256 nodes per graph:
+
+| `nrows` | 1 | 2 | 3 | 4 | 8 | 16 | 64 | 192 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| speedup | **1.00x** | 1.75x | 2.36x | 2.91x | 3.36x | 3.69x | 3.89x | 3.92x |
+
+In a real graph this costs nothing — the threads handed an empty range reach the per-node barrier they
+were going to reach anyway — so it is a missed opportunity (split on `ne0` when `nrows` is small), not a
+regression. **An earlier version of this section proposed `n_tasks = MIN(n_threads, ggml_nrows(node))`
+as a one-line fix that "removes only barrier participation". That was wrong**: `n_tasks` does not gate
+barrier participation, and the only thing that cap can do is clamp an all-one-row graph to a single
+thread.
+
+**A work floor is still missing, and that one is real.** At 24 threads on a Core Ultra 9 285K the
+per-node cost bottoms out at **~1.9 us**, so threading a unary below ~16K elements is a loss there
+regardless of row count — against ~0.3 us at 4 threads, so the floor is machine-dependent. Any future
+change that threads more ops needs one.

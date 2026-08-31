@@ -169,9 +169,19 @@ backbones": the decode loop is a component the ASR path *calls*, not a second pu
 an ASR model. A Qwen3-ASR model's public door stays `transcribe`; `generate` on it would be a method
 whose prompt requires audio it has no parameter for. Reuse belongs inside the tier, not in the API.
 
+`loom::ChatTemplate` sits beside `generate` and is what makes it answerable rather than merely
+runnable for an instruction-tuned checkpoint (P4.23). It is per-TASK by the §2 rule: what is per-MODEL
+is the template itself, and that is reduced to role tags by the EXPORTER and carried in the file —
+[ADR-018](adrs/adr-018-chat-template-as-role-tags.md). No Jinja on either side of the boundary.
+
 `loom::speech::synthesize` stays deliberately thin, because the samplers are already Lua and must stay
 there (the ADPM2 diffusion sampler and the CFM Euler loop are per-checkpoint orchestration by the §2
 rule, and `lua_bridge.h` already argues that if ADPM2 did not need C++, no orchestration shape does).
+**A token SAMPLER is the exception that proves that rule rather than a counter-example to it** (P4.24):
+`loom.sample_row` is a reduction over one row, not a loop over steps, and its input cannot cross the
+Lua boundary at all — a 262144-wide row overflows LuaJIT's array part
+([Retro-004](retros/retro-004-luajit-array-limit-caps-prefill.md)). The decode loop around it is still
+driver Lua.
 What the engine adds is only what every host would otherwise redo: padding to the declared text axis,
 filling in declared defaults for steps/seed/voice, and returning a waveform with its declared rate.
 

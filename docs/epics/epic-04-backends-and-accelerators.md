@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-08-22
+last_updated: 2026-08-31
 ---
 
 # Epic-04: Backends and Accelerators
@@ -663,64 +663,197 @@ holds for Hexagon — it is just that the missing class is convolution, not the 
 matrix pointed at.
 
 
-## 5. Planned: Metal (P4.11) — SCOPED, strictly after macOS wheels
+## 5. Metal (P4.11) — SHIPPED 2026-08-31, run on an Apple M1 Pro
 
-**Ordering, both halves of it.** This cannot start before P4.10: there is no macOS base wheel for a
-backend package to attach to, and P4.10's blocker 4 — ggml's DL loader searching for `.so` where CMake
-wrote `.dylib` — is the *same code path* that would discover `libggml-metal`, so starting here would
-mean debugging that twice. But unlike P4.10 this does **not** block P5, and the reason is worth stating
-so the sequence is not read as one long Apple project: P4.10 decides what a Mac can run **at all**,
-which multiplies every family P5 adds; P4.11 decides how **fast** one platform runs, which multiplies
-nothing. If P5 is ready first, P5 goes first.
+`loom-py-rt-metal` builds, installs beside the base wheel, registers as a device, and produces
+output an ASR model reads back identically to the CPU's. **The interesting part is not that it
+works — it is that whether it is faster depends entirely on the model, by 14x.**
 
-**The shape is already decided and is not the work.** `loom-py-rt-metal` is `packaging/rt-vulkan/`
-with the four strings `packaging/README.md` names, plus `archs = "arm64"` (cibuildwheel's macOS
-spelling) instead of `"x86_64 aarch64"`. **Intel Macs get no Metal wheel**: `packaging/README.md`
-already scopes Metal as arm64-only, and P4.10 explains why Apple Intel is a target one row wide.
+### 5.1 The four scoped questions, answered
 
-**What it costs elsewhere: a version bump becomes TEN strings across FOUR files**, up from seven
-across three — the root pyproject gains a `metal` extra pin, and the new package carries its own
-`version` plus its `loom-py-rt ==` pin. That circular exact-pin set is the ggml-ABI agreement, so the
-new file joins it rather than sitting beside it.
+1. **Discovery — inherited from P4.10's blocker 4, and there was nothing to fix.** ggml builds every
+   backend as a CMake `MODULE`, and Darwin gives module libraries the `.so` suffix. So the shipped
+   file is `loom_rt_metal/libggml-metal.so`, not `.dylib`, and ggml's extension-less-of-`__APPLE__`
+   loader finds it. Full reasoning in [Epic-08 §4.1](epic-08-packaging-and-release.md).
+2. **Linking is `install_name`/`@rpath`, and it DID need work.** The backend records
+   `@rpath/libggml-base.dylib` as its `LC_LOAD_DYLIB`, and `@rpath` expands against the `LC_RPATH` of
+   *the binary doing the loading* — this library. With none set there are no candidate paths at all.
+   That is the real difference from ELF, where a `NEEDED libggml-base.so` resolves against whatever
+   is already loaded in the process (and it always is, pulled in by `libloom_engine` long before any
+   backend is dlopened) — which is why the Vulkan and CUDA packages need no rpath and have none.
+   `packaging/common/BackendPackage.cmake` now sets `INSTALL_RPATH "@loader_path/../loom"` under
+   `if(APPLE)`: `site-packages/loom_rt_metal/` → `site-packages/loom/`, siblings by construction.
+   Verified with `otool -l` on the shipped wheel and then by loading it.
+3. **`GGML_METAL_EMBED_LIBRARY` — confirmed by building.** It defaults on with Metal and embeds the
+   `.metal` **source** through `.incbin`, compiled by the Metal framework at run time. **Full Xcode
+   was not required**: `xcrun metal` appears only in the non-embed branch, and this machine has
+   Command Line Tools only. Do not read a missing `metal` compiler as "cannot build Metal here".
+4. **Size — measured, and it is the smallest backend by a wide margin.**
 
-**Four questions to answer before any workflow is written.** The Vulkan and CUDA packages made every
-one of these a Linux answer, and none of them carries over:
+   | backend | shipped library | wheel |
+   |---|---|---|
+   | Vulkan | 46.5 MB (44 MB of it compiled SPIR-V) | ~46 MB |
+   | CUDA | larger still (fat binaries, cubins per SM) | 88 MB |
+   | **Metal** | **0.87 MB** | **0.18 MB zipped** |
 
-1. **Discovery** — P4.10 blocker 4, unchanged and shared. Settle it there; this inherits the answer.
-2. **Linking is `install_name`/`@rpath`, not soname.** The build-side half of the `==` pin
-   (`cmake/GgmlPin.cmake`, read by both builds so the revision cannot drift) is unaffected, but the
-   mechanism that binds a backend to its base library is different on macOS, and P4.8g is the record of
-   what a mismatch looks like: it loads without error, registers nothing, and shows up only as an
-   accelerator missing from `loom.devices()`.
-3. **`GGML_METAL_EMBED_LIBRARY`.** A DL backend travels as a lone `.dylib` with no bundle around it. If
-   the shader library is not embedded, ggml-metal looks for `default.metallib` next to the executable —
-   and inside an interpreter the executable is `python`, which is precisely the trap
-   `loom/__init__.py`'s `_register_backend_paths` exists to work around for backend `.so` files. Verify
-   before assuming it is on by default.
-4. **Size, measured rather than guessed.** `libggml-vulkan.so` is 46.5 MB because 44 MB of it is
-   compiled SPIR-V; Metal ships shader *source* or a metallib and should be far smaller, which would
-   make it the first backend package that is small for a reason other than restraint. The number belongs
-   in `packaging/README.md`'s table once it exists — do not write it before.
+   Metal ships shader *source*, not compiled kernels, so it is small for a structural reason rather
+   than out of restraint.
 
-**What to expect when it does run, and the trap in expecting it.** Metal implements both
-`PAD_REFLECT_1D` and `POOL_1D` natively (P4.7d's support matrix; only Vulkan lacks the pad, and only
-Metal and SYCL have the 1-D pool), and P4.7e put the engine's substitutions behind
-`backend_can_run` — so on Metal those lowerings stay *off* and the graph should split less than
-Vulkan's does. That is a prediction, not a result. P4.8's standing warning applies unchanged: a first
-benchmark measures how much of the graph fell back, not the backend, so read the split count before
-reading the timing.
+### 5.2 It works, and the correctness bar was met
 
-**Device selection needs no new work**, and that is a claim to check rather than assume: ggml-metal
-registers as a GPU-kind device, so P4.8e's hierarchy should rank it without a new tier and
-`device="gpu"` should find it. `loom.devices()` naming it is the check.
+`pip install loom_py_rt_metal-...whl` beside the base wheel, from a clean venv:
 
-**Done means something stricter than P4.10's bar, because this failure is silent.** P4.10 can be
-called done on "built and imported in CI"; a backend cannot, since one that fails to load is
-indistinguishable from a slow CPU run. Done here is: `loom.devices()` listing Metal on a real Mac, a
-model producing output that matches the CPU path, and a timing pair for both. **Nobody in this project
-has that hardware**, so this stays scoped until someone with an Apple Silicon Mac runs it — the same
-honesty P4.8c applied to CUDA, which stopped being a claim only on the workstation.
+```
+devices: [('BLAS','Accelerate'), ('CPU','Apple M1 Pro'), ('MTL0','Apple M1 Pro')]
+device="gpu" -> MTL0
+```
 
-**Non-goals:** CoreML and the Neural Engine (not Metal, no ggml backend targets it, and out-of-tree
-options were already turned down on licensing); Intel Macs; a `universal2` backend wheel.
+So **device selection needed no new work**, as predicted: ggml-metal registers as a GPU-kind device
+and P4.8e's hierarchy ranks it without a new tier.
 
+Output agreement, on VITS: same sample count, **cosine 0.99999250**, max abs difference 1.55e-3 — and
+because [correlation is not the test for a TTS family](../retros/retro-006-kokoro-shipped-noise.md),
+whisper-small transcribed both waveforms and returned **byte-identical text**.
+
+**P4.29 reconciles with Metal, and this was RUN rather than read.** The prediction was that
+ggml-metal's `supports_op` would decline a folded, block-quantized `CONV_2D` on its
+`src[0]->type == F16 || F32` test and keep the `im2col` lowering, as Vulkan does. It does. The 2x2 of
+{F32, Q4_0} x {CPU, Metal} all four transcribe identically:
+
+```
+f32   cpu   peak=0.1416 -> ' This is a test of balloon energy running on Apple Silicon.'
+f32   MTL0  peak=0.1418 -> ' This is a test of balloon energy running on Apple Silicon.'
+q4_0  cpu   peak=0.1381 -> ' This is a test of balloon energy running on Apple Silicon.'
+q4_0  MTL0  peak=0.1380 -> ' This is a test of balloon energy running on Apple Silicon.'
+```
+
+Q4_0 carries the *same* 27/56 split profile as F32 — the fallback is the `PAD` nodes, not the
+quantization — and is faster on both devices (CPU 87.4 ms vs 94.1 ms; Metal 348.2 ms vs 493.3 ms).
+**The standing caveat is unchanged and still untested:** Metal declines on the type test ALONE, where
+CUDA was given an explicit `op_params[6] == 0` guard. That is sufficient only because loom builds a
+packed node for a *quantized* kernel and never an F32 one. If that ever changes, Metal needs CUDA's
+guard or it will read a `[IC*K, OC]` tensor as `[KW, KH, IC, OC]` and return a wrong answer rather
+than an error.
+
+### 5.3 The result that matters: 2.69x faster, or 5.24x slower, depending on the model
+
+Measured on the M1 Pro, F32, best-of-n, same input both sides. **The split count is listed first
+because it is the explanation, not a footnote** — a first benchmark on a new backend measures how
+much of the graph fell back.
+
+| model | shape | splits (CPU / total) | CPU | Metal | |
+|---|---|---|---|---|---|
+| whisper-small | encoder is large matmuls | **0 / 4** | 1764.3 ms | **654.9 ms** | **2.69x faster** |
+| VITS (f32) | 1-D convolution throughout | **27 / 56** | 94.1 ms | 493.3 ms | **5.24x slower** |
+
+**The cause of VITS's fallback is one op.** Of 1308 nodes, only 48 land on the CPU — but they are
+scattered, so each is a round trip. By op: **21 `PAD`**, 12 `CONT`, 6 `SUB`, 6 `SCALE`, 3 `DIV`.
+`ggml-metal`'s `supports_op` accepts `GGML_OP_PAD` only when the **leading** pads are zero
+(`op_params` 0, 2, 4 and 6), i.e. trailing padding only. A convolution pads both sides, so every one
+of VITS's declines on that test. Where do they come from? The exported topology declares
+`12 x PAD_1D {lp0: 1, rp0: 1}` (which fall back) and `6 x PAD_1D {lp0: 0, rp0: 1}` (which do not);
+the remaining 9 are the rational-quadratic spline's own `ggml_pad_ext(..., 1, 0, ...)` and
+`(..., 1, 1, ...)` in `primitives_spline.cpp`. **Every one of them has `lp0 == 1`** — a single
+leading element, not an arbitrary pad.
+
+**And then the fix was prototyped, which is the only reason that paragraph does not end in the wrong
+conclusion.** See §5.4 — collapsing the fallback entirely is worth **1.8%**, not 5x.
+
+### 5.4 The PAD fix, prototyped and measured: it is a correctness item, not a performance one
+
+The `supports_op` test is easy to relax and the kernel change is small, so rather than estimate the
+payoff it was **built as a throwaway** on the M1 Pro (hand-edited in the build tree, measured,
+reverted — nothing of it is in the repo). Four edits: four `lp0..lp3` fields on
+`ggml_metal_kargs_pad`, filled from `op_params` 0/2/4/6 in `ggml_metal_op_pad`; `kernel_pad_impl`
+mapping `dst[i0] <- src[i0 - lp0]` per dimension instead of `src[i0]`, copying when every index is in
+range and zero-filling otherwise; and `supports_op` returning `true`. The `_4` vectorised variant
+needs no thought because `is_c4` is already hardcoded `false` upstream ("note: this is slower").
+
+The result:
+
+| | splits (CPU / total) | Metal | digest |
+|---|---|---|---|
+| stock | 27 / 56 | 493.3 ms | `bbc58397d238efde` |
+| with leading-pad support | **0 / 2** | **484.7 ms** | `bbc58397d238efde` |
+
+**The hypothesis was right and the conclusion drawn from it was wrong.** `PAD` really is the only op
+in VITS's graph that Metal declines: the other 27 CPU nodes (12 `CONT`, 6 `SUB`, 6 `SCALE`, 3 `DIV`)
+are all supported for these shapes and were scheduler collateral, assigned to the CPU to avoid
+copying around an unsupported neighbour. Remove the one op and the whole graph moves — 56 splits
+become 2, none on the CPU. The identical digest also says the patched kernel is numerically right.
+
+**And it buys 1.8%.** So the 27 round trips were nearly free, and the 5.24x is not the fallback.
+
+**Where the 5.24x actually is: work, not overhead.** VITS's node count is fixed by its architecture,
+so scaling the utterance scales the work inside each node while leaving the graph shape alone. If the
+gap were per-dispatch overhead, Metal's cost per output sample would fall sharply as the utterance
+grows. It does not:
+
+| utterance | CPU µs/sample | Metal µs/sample |
+|---|---|---|
+| x1 (23.5k samples) | 1.355 | 7.247 |
+| x2 | 1.358 | 7.013 |
+| x4 | 1.341 | 6.846 |
+| x8 (136k samples) | 1.702 | 6.693 |
+
+Metal is flat within 8% across a 5.8x change in work. It is **compute-bound and simply ~5x more
+expensive per unit of work on this graph**, which is a statement about kernels and lowering, not
+about scheduling.
+
+**The likeliest reason, and it is a hypothesis rather than a result.** VITS is convolution-dominated
+(the vocoder profile puts the conv path at 92%), and loom's CPU convolution carries **seven
+hand-written ggml patches** — `ggml-0004` through `ggml-0007`, plus P4.13's kernel fold and P4.29's
+quantized direct convolution — while its Metal path runs stock `im2col` + `mul_mat`. whisper-small,
+which wins 2.69x, is dominated by large matrix multiplications where stock Metal is strong and the
+CPU has no such advantage. That contrast is consistent, and confirming it means a per-op profile on
+Metal, not more reasoning.
+
+**So the follow-up splits in two**, and neither is a release blocker:
+
+* The **PAD kernel** — worth doing for cleanliness and upstreamability (it is the same shape of gap
+  P4.7d recorded for Vulkan's `PAD_REFLECT_1D`), and it removes a fallback that would matter more on
+  a discrete GPU where a round trip crosses PCIe. On Apple it is worth 1.8%. Do not scope it as a
+  performance fix.
+* **Why Metal's convolution is 5x the CPU's here** — the item with the payoff in it, and the one
+  that has to start with a per-op profile.
+
+### 5.5 The finding that was not scoped: `device=""` now picks the slower device
+
+`device=""` means "decide for me", and on this laptop it resolves to `MTL0` — because the hierarchy
+ranks a GPU above a CPU. That rule was written for a discrete GPU across a PCIe bus, where the ranking
+is a proxy for "has its own fast memory". **Apple Silicon is unified memory**, so the proxy no longer
+carries the thing it stood for: the win of moving work to the GPU no longer includes escaping a slow
+bus, and what is left is per-dispatch overhead plus, here, 27 round trips.
+
+The consequence is concrete: with Metal present, a default-device VITS run is **5.24x slower** than
+the same call without it. This is a statement about the hierarchy on a unified-memory part, not about
+Metal — and it is **why Metal is NOT in the base macOS wheel** even though 0.87 MB would otherwise be
+a very cheap accelerator to ship by default. `loom-py/CMakeLists.txt` sets `GGML_METAL OFF` for the
+base wheel explicitly, since ggml defaults it ON whenever `APPLE`; without that line the base wheel
+and the backend package would each carry a copy, which is two on one `sys.path` with no rule about
+which loads. Shipping it as an extra applies the trade to somebody who asked for a GPU.
+
+Ranking on unified memory is on the hub as its own item. If it stops preferring a GPU whose memory is
+the CPU's, folding Metal into the base wheel is worth revisiting.
+
+**A related non-problem, checked rather than assumed:** ggml also defaults `GGML_BLAS` on for Apple,
+so the base wheel ships a 59 KB `libggml-blas.so` (Accelerate) and `device=""` resolves to `BLAS`.
+That splits VITS's graph 50 ways and costs **nothing measurable** — 94.3 ms against the CPU's
+94.0 ms — because BLAS shares host memory, so a split is not a copy. It stays.
+
+### 5.6 What is verified, and what is not
+
+Verified on hardware: build, install, registration, `device="gpu"`, output agreement under an ASR
+oracle, and timings on two model families. That is the P4.8c standard — CUDA stopped being a claim
+when it ran on the workstation, and Metal stops being one here.
+
+Not verified: **the wheel has not been published**, and **`cibuildwheel`'s `delocate` repair step has
+not been run** — cibuildwheel refuses to system-install a framework CPython outside CI, so the local
+wheels were built with `python -m build`. The `repair-wheel-command` in `packaging/rt-metal/
+pyproject.toml` carries `--exclude libggml-base --ignore-missing-dependencies`, reasoned from how
+delocate resolves an `@rpath` that points outside the wheel, and **first exercised by CI**.
+A fourth PyPI project also needs its own trusted publisher before `publish-pypi`'s Metal step can
+succeed; until it exists that step fails while everything above it still uploads.
+
+**Non-goals, unchanged:** CoreML and the Neural Engine (not Metal, no ggml backend targets it, and
+out-of-tree options were turned down on licensing); Intel Macs; a `universal2` backend wheel.

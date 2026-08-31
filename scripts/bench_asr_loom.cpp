@@ -52,6 +52,25 @@ int main(int argc, char** argv) {
     options.language = language;
     options.task = "transcribe";
 
+    // ONE WARM-UP, DISCARDED, because the other arm has one. bench_onnx_tasks.py's ASR task warms
+    // before timing (`text = run()`), and bench_{vits,lm}_loom.cpp both do too -- this harness was the
+    // only one that did not, so every ratio taken from it timed loom's COLD run against onnxruntime's
+    // warm one (Retro-012's rule: equal work, equal thermals, equal ESTIMATOR).
+    //
+    // Measured 2026-08-28, cold/warm on whisper-small: 1.25-1.7x at 24 threads on the 285K, 1.02x at
+    // four on the same box, and BELOW 1.0 on the 2-core Ryzen, where the box heats up faster than the
+    // first run pays for itself. The penalty is a thread-count effect, so it hit exactly the cell the
+    // README called loom's ASR win.
+    //
+    // AND USE nrun >= 3. `times[times.size() / 2]` on two samples is the LARGER of the two, not a
+    // median, so nrun=2 reported the max of a cold run and a warm one. The two faults together are
+    // 1.43x at 24 threads on the 285K: nine launches at nrun=2 with no warm-up median 1.650 s, nine at
+    // nrun=5 with one median 1.157 s, same binary, same clip, same box.
+    const auto w0 = std::chrono::steady_clock::now();
+    const loom::audio::Transcription warm_r =
+        loom::audio::transcribe(session.bridge(), *model, waveform, options);
+    const double warm = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+
     std::vector<double> times;
     std::string first_text;
     for (int i = 0; i < nrun; ++i) {
@@ -60,14 +79,15 @@ int main(int argc, char** argv) {
             loom::audio::transcribe(session.bridge(), *model, waveform, options);
         times.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         if (i == 0) first_text = r.text;
-        else if (r.text != first_text) {
+        if (r.text != warm_r.text) {
             std::fprintf(stderr, "TRANSCRIPT CHANGED between runs -- not equal work, ratio meaningless\n");
             return 1;
         }
     }
     std::sort(times.begin(), times.end());
-    std::printf("loom   asr   audio=%.2fs  median %.4f s  min %.4f s  (n=%d)\n",
-                waveform.size() / 16000.0, times[times.size() / 2], times.front(), nrun);
+    std::printf("loom   asr   audio=%.2fs  median %.4f s  min %.4f s  (n=%d, warm-up %.4f s "
+                "discarded)\n",
+                waveform.size() / 16000.0, times[times.size() / 2], times.front(), nrun, warm);
     std::printf("  text: %s\n", first_text.c_str());
     return 0;
 }

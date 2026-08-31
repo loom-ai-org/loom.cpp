@@ -24,8 +24,11 @@ users know by name.
 * `Q4_K_M` is **not a tensor type at all** — it is a llama.cpp mixed-precision *recipe*.
 * The real type `Q4_K` exists, but `gguf.quants` raises `NotImplementedError` for **every** K-quant
   (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K), so this toolchain cannot write one.
-* K-quants use block **256**, where only 9 of 132 VITS convolution kernels would align even after the
-  layout fix that makes block-32 quantization possible at all.
+* K-quants use block **256**, where almost nothing aligns even after the layout fix that makes block-32
+  quantization possible at all. Re-measured on 2026-08-30, once that fix (P4.13) existed and the
+  question could be asked of the real folded layout rather than estimated: of VITS's 117 distinct
+  convolution kernels, **114 align for block 32 and only 6 for block 256** — 100.0% of the convolution
+  bytes against 17.9%. K-quants would lose the fold's entire gain and keep its cost.
 
 Writable today: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, TQ1_0, TQ2_0.
 `main_export.quantize_choices()` derives the offered list by **probing the writer**, for exactly this
@@ -36,7 +39,9 @@ reason — so the CLI cannot offer something that will fail at write time.
 * **Positive:** the offered list is always true, and no effort goes into a format the writer cannot
   produce.
 * **Negative:** loom cannot match a llama.cpp size/quality point users may ask for by name. The honest
-  answer is Q4_0 or Q8_0.
+  answer is Q4_0 or Q8_0 — and, since P4.13 and P4.28, a competitive one: VITS ships at **11.7 MB at
+  Q4_0 against an 81.7 MB F32 export**, and every TTS family tested stays intelligible at Q8_0
+  (Epic-05 §5).
 * **Revisit when:** `gguf.quants` grows K-quant support upstream. The block-256 alignment finding would
   still need re-checking against the model in question.
 

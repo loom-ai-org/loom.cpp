@@ -19,8 +19,8 @@
 #  * it does not leave VITS's duration predictor free. `scales` is pinned to [0, 1, 0] so both engines
 #    synthesise ONE identical utterance; unpinned, they time two different ones (Retro-010).
 #
-# `bench_onnx.py` is the older, Pi-specific TTS harness that also carries the per-shape convolution
-# profile P4.16's table is built from. This file is the portable three-task one.
+# `bench_onnx.py` is the older, Pi-specific TTS harness. This file is the portable three-task one, and
+# `prof_onnx_conv_shapes.py` is the per-shape convolution profile P4.16's table is built from.
 #
 # WHERE THE PIECES LIVE, because the assets are large and are not in any repo (2026-08-24):
 #

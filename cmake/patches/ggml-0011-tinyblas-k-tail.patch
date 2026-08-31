@@ -1,0 +1,163 @@
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -492,8 +492,37 @@
+     }
+ 
+     bool matmul(int64_t m, int64_t n) {
+-        if (k % KN != 0)
++        // WHY THE CONTRACTION IS SPLIT HERE, and why only the F32 path splits it. `k % KN` rejected
++        // the WHOLE matmul, exactly as `m % 4` did before the row tail below -- and k is the
++        // CONTRACTION, so in attention it is a sequence length, i.e. a number nothing rounds.
++        // whisper's encoder contracts A@V over its 1500 frames: 1500 % 8 == 4 on AVX2 and
++        // 1500 % 16 == 12 on AVX-512, so that GEMM never entered this file at all and got ggml's
++        // generic one-output-element-per-call kernel instead. NEON has KN == 4 and 1500 % 4 == 0,
++        // which is why an aarch64-only bench could not have found this.
++        //
++        // Measured at whisper-small's own A@V shape -- m=64, n=1500, k=1500, 12 heads -- one thread,
++        // Ryzen 3 3250U (AVX2): **176.2 -> 81.8 ms, 2.15x**. In model (jfk.wav, $LOOM_PROFILE at one
++        // thread, two interleaved runs per arm) the `MUL_MAT 64 x 1500` bucket goes 2240/2460 ->
++        // 1119/1136 ms and no other bucket moves. A k sweep at that shape shows the cliff is the
++        // divisibility and nothing else: k=1496 44.5 GFLOP/s, k=1500 20.8, k=1504 47.0.
++        //
++        // The tail is <= KN-1 scalar products per output, so it cannot lose to the status quo: the
++        // alternative for these shapes was the generic kernel for ALL of k.
++        //
++        // Accuracy is unchanged in kind. Against a double-precision reference over every k in [1, 40]
++        // plus 63/64/65 and 1496-1504, the worst relative error is 2.6e-05, and the aligned k values
++        // sit in the same place as the unaligned ones (k=1496 2.1e-05, k=1500 2.3e-05) -- it is f32
++        // accumulation noise, not a dropped term. loom's whisper gate (`test_e2e_whisper_mil_export`,
++        // encoder against HuggingFace) moves max/absmax 4.19e-04 -> 4.34e-04 against a 1e-3 limit,
++        // mean_abs_diff 9.36e-06 -> 9.33e-06, and passes 67/67 either way.
++        //
++        // Scoped to F32 because the tail is a scalar multiply and the other instantiations carry
++        // ggml_fp16_t / ggml_bf16_t, which do not convert that way. Those keep the old rejection.
++        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
++        if (k % KN != 0 && !k_tail_f32)
+             return false;
++        if (k < KN)
++            return false;                 // fewer than one vector of contraction: let ggml have it
+         // WHY THE ROW COUNT IS SPLIT HERE. Every tile below is 4 rows tall, so the schedule chooser
+         // that follows only accepts m divisible by 4 -- and when it does not, this function returns
+         // false and ggml computes the ENTIRE matmul with its generic one-output-element-per-call
+@@ -608,6 +637,38 @@
+ 
+     template <int RM, int RN>
+     inline void gemm_bloc(int64_t ii, int64_t jj) {
++        // THE RAGGED CONTRACTION IS DISPATCHED HERE, BEFORE THE TILE, AND THAT PLACEMENT IS THE
++        // WHOLE FIX. The tail this patch adds is only ever needed when `k % KN != 0`, which is a
++        // property of the matmul and not of the tile -- so the aligned case takes a perfectly
++        // predicted branch and then runs, instruction for instruction, the code it ran before this
++        // patch existed.
++        //
++        // Written the other way -- the tail loop inlined into this function, whether as a second
++        // epilogue or folded into the only one -- **every f32 GEMM on a Cortex-A72 loses 1.3-1.75x**,
++        // measured per shape over whisper's five encoder GEMMs, one thread, three rounds:
++        //
++        //     m=n=1500 k=64 (QK^T)   4.67 -> 7.62 GFLOP/s      m=64 n=1500 k=1500 (A@V)  4.70 -> 7.84
++        //     m=768 n=1500 k=768     4.86 -> 8.50              m=3072 n=1500 k=768       4.86 -> 8.56
++        //     m=768 n=1500 k=3072    4.01 -> 5.28
++        //
++        // and NONE of those shapes ever takes the tail: NEON's KN is 4 and every one of those k
++        // divides it. It is not the `kk` arithmetic either -- a build with `kk` truncated and the tail
++        // loop removed runs at full speed (8.56), and a build with `kk = k` and the tail loop present
++        // runs slow (4.83). **It is the presence of the scalar tail loop in this function**, which
++        // reaches `Aat`/`Bat` after the main loop and changes what GCC's register allocator does with
++        // the 4x3 NEON tile -- the same fragility PR 1 exists for, from the other direction.
++        //
++        // x86 is why the tail cannot simply be folded into one epilogue instead: that costs the
++        // small-k shapes 30% there (whisper's QK^T at k = 64, 154 -> 201 ms), because the extra live
++        // values change how the accumulators spill around the `hsum`. Out of line, both ISAs keep the
++        // epilogue they measured fastest.
++        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
++        if constexpr (k_tail_f32) {
++            if (k % KN != 0) {
++                gemm_bloc_ktail<RM, RN>(ii, jj);
++                return;
++            }
++        }
+         // WHERE THE OPERAND ADDRESSES COME FROM, and why aarch64 needs its own answer.
+         //
+         // Written as `A + lda * (ii + i) + l` against the members, GCC 14.2 on aarch64 (-O3,
+@@ -669,6 +730,82 @@
+                 C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
+     }
+ 
++    // The <= KN-1 leftover elements of a ragged contraction, out of line so that the aligned tile
++    // above never sees this code. NOINLINE is load-bearing, not a hint: see gemm_bloc.
++    //
++    // The alternative for these shapes is not the aligned tile -- it is ggml's generic
++    // one-output-element-per-call kernel, because before this patch `matmul` rejected them outright.
++    // So this path only has to beat that, and it does by the same 2.15x the patch measures on x86.
++    template <int RM, int RN>
++    NOINLINE void gemm_bloc_ktail(int64_t ii, int64_t jj) {
++        // WHERE THE OPERAND ADDRESSES COME FROM, and why aarch64 needs its own answer.
++        //
++        // Written as `A + lda * (ii + i) + l` against the members, GCC 14.2 on aarch64 (-O3,
++        // -mcpu=cortex-a72) does not form pointer induction variables over `l`: it re-derives all
++        // seven operand addresses every iteration, 8 `add` + 6 `lsl` wrapped around 12 `fmla` and
++        // 7 `ldr q` -- a 35-instruction loop where 21 do the same work. Hoisting the two bases and
++        // the strides into locals is enough for it to strength-reduce, and the loop drops to exactly
++        // the 21 a hand-written kernel gets.
++        //
++        // Measured on a Cortex-A72 over the eleven F32 GEMM shapes of a VITS vocoder, 4 threads,
++        // through this dispatcher, with the aarch64 tile fix also in place: **22.0 -> 24.9 GFLOP/s**,
++        // which is a hair faster than a standalone hand-written 4x4 kernel timed in the same process.
++        //
++        // NOT applied elsewhere, because it is not free: on x86-64 (AVX2, 16 GPRs) the same change
++        // measures 55.1 -> 53.6 GFLOP/s median of seven pinned runs and puts 12 more `%rsp` reads in
++        // the block -- there the compiler already forms the induction variables, and the extra live
++        // values only add pressure. clang/aarch64 is likewise neutral (24.0 vs 23.8) since it already
++        // did this. See loom.cpp BACKLOG.md P4.15.
++#if defined(__aarch64__)
++        const TA * const a0 = A + lda * ii;
++        const TB * const b0 = B + ldb * jj;
++        const int64_t la = lda, lb = ldb;
++        auto Aat = [&](int64_t i, int64_t l) { return a0 + la * i + l; };
++        auto Bat = [&](int64_t j, int64_t l) { return b0 + lb * j + l; };
++#else
++        auto Aat = [&](int64_t i, int64_t l) { return A + lda * (ii + i) + l; };
++        auto Bat = [&](int64_t j, int64_t l) { return B + ldb * (jj + j) + l; };
++#endif
++        const int64_t kk = k - (k % KN);
++        D Cv[RN][RM] = {};
++        for (int64_t l = 0; l < kk; l += KN) {
++            // help compiler for op order.
++            if constexpr (RM <= RN) {
++                V Av[RM];
++                for (int64_t i = 0; i < RM; ++i) {
++                    Av[i] = load<V>(Aat(i, l));
++                }
++                for (int64_t j = 0; j < RN; ++j) {
++                    V Bv = load<V>(Bat(j, l));
++                    for (int64_t i = 0; i < RM; ++i) {
++                        Cv[j][i] = madd(Av[i], Bv, Cv[j][i]);
++                    }
++                }
++            } else {
++                V Bv[RN];
++                for (int64_t j = 0; j < RN; ++j) {
++                    Bv[j] = load<V>(Bat(j, l));
++                }
++                for (int64_t i = 0; i < RM; ++i) {
++                    V Av = load<V>(Aat(i, l));
++                    for (int64_t j = 0; j < RN; ++j) {
++                        Cv[j][i] = madd(Av, Bv[j], Cv[j][i]);
++                    }
++                }
++            }
++        }
++        for (int64_t j = 0; j < RN; ++j) {
++            for (int64_t i = 0; i < RM; ++i) {
++                float acc = hsum(Cv[j][i]);
++                for (int64_t l = kk; l < k; ++l) {
++                    acc += *(const float *)(const void *) Aat(i, l) *
++                           *(const float *)(const void *) Bat(j, l);
++                }
++                C[ldc * (jj + j) + (ii + i)] = acc;
++            }
++        }
++    }
++
+     template <int RM, int RN, int BM>
+     NOINLINE void gemm(int64_t m, int64_t n, int64_t BN) {
+         GGML_ASSERT(m % (RM * BM) == 0);

@@ -1,0 +1,142 @@
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -551,6 +551,13 @@
+ 
+   private:
+     bool matmul_aligned(int64_t m, int64_t n) {
++        // The largest prefix of `m` that divides the widest row block, so the branch below can take
++        // it even when `m` itself does not divide 16. `m` is already a multiple of 4 here -- the row
++        // tail in matmul() took the rest -- so `m - m16` is 0, 4, 8 or 12.
++        const int64_t m16 = m - (m % 16);
++        // Whether to take that prefix when `m` is RAGGED, which is the only thing this patch adds:
++        // an `m` that already divides 16 keeps the schedule it always had. See the `k` rule below.
++        const bool ragged_prefix = (m % 16 != 0) && params->nth > 1 && k <= 256;
+         // compute RM for only need tile with size RM&RM-1
+ // A 4x6 tile keeps 24 vector accumulators live. That fits aarch64's 32 registers on paper -- with
+ // 4 A-vectors and 1 B-vector the block needs 29 -- but GCC does not allocate it: at -O3 it keeps the
+@@ -574,10 +581,82 @@
+ // operand addresses, which the companion patch (0002) fixes. Tile alone is 22.0 GFLOP/s, addresses
+ // alone are 15.5 -- the spill dominates until it is gone -- and the two together are 25.1, which is
+ // past a hand-written kernel. See loom.cpp BACKLOG.md P4.15.
++//
++// WHY THE FIRST BRANCH TAKES A PREFIX INSTEAD OF DEMANDING `m % 16 == 0`, AND WHY IT IS A
++// CORRECTNESS-SHAPED BUG WEARING A PERFORMANCE COSTUME.
++//
++// `BM` is not only a cache knob. `gemm()` gives ONE JOB the rows `[ii, ii + BM*RM)`, `C` is
++// `m`-contiguous, and a job's store to one column of that range is therefore `BM*RM*4` BYTES wide.
++// At `BM = 1` that is **16 bytes -- a quarter of a cache line** -- so four different threads write
++// four quarters of the same line, for every column, for the whole matmul. That is false sharing, and
++// it does not slow the kernel down, it stops it threading at all.
++//
++// Measured at whisper-small's `QK^T` (`m = n = 1500, k = 64`, 12 heads) on a Core Ultra 9 285K,
++// against the same shape padded to the next multiple of 16 -- so the ONLY difference is which branch
++// below is taken:
++//
++//     m = 1500  ->  BM = 1  ->  16 B/job   1 thread 29.6-30.9 ms   4 threads 30.0-31.5 ms   0.98x
++//     m = 1496  ->  BM = 2  ->  32 B/job   1 thread 29.4-30.5 ms   4 threads 21.2-21.9 ms   1.40x
++//     m = 1504  ->  BM = 4  ->  64 B/job   1 thread        29.4 ms 4 threads 10.6-11.0 ms   2.75x
++//
++// Monotone in the fraction of a line a job owns, and `perf stat -e task-clock` shows 3.65 CPUs busy
++// in the 0.98x row: the threads run, they just spend their time on coherence traffic. **Four rows of
++// padding are worth 2.8x.**
++//
++// `m` is a sequence length in every attention matmul -- a number nothing rounds -- so this is the
++// common case, not the corner: whisper's 1500 frames is `4 mod 16`, the worst residue there is.
++// Taking the `m - (m % 16)` prefix at `BM = 4` and finishing the <= 12 leftover rows separately
++// costs nothing (they are 0.8% of the rows at m = 1500, and they keep the same 4xRN tile) and makes
++// the common case behave like the aligned one.
++//
++// NOT VISIBLE ON EVERY MACHINE, and the ISA is not what decides it: a Raspberry Pi 4 threads 3.5x at
++// every one of the three `m` above -- four small cores behind a shared 1 MB L2 do not pay for a
++// contended line the way a 24-core mesh does -- and a 2-core Ryzen 3 3250U shows no collapse either.
++// It is a many-core effect, which is exactly the class of machine `bench9`'s reviewers asked about.
++//
++// GUARDED ON `nth > 1` because false sharing needs a second thread by definition, and a patch that
++// cannot help at one thread should not be able to hurt there either: at `nth == 1` the ragged prefix
++// is skipped and the schedule below is the one that ran before the patch existed, instruction for
++// instruction. Measured single-threaded either way on a Ryzen 3 3250U, m = 1500: 148.7 vs 147.8 ms,
++// i.e. nothing -- the guard costs no measured win and removes a whole class of risk. An `m` that
++// divides 16 keeps the schedule it had at every thread count, this patch included: measured either
++// way at one thread over eleven shapes on a Core Ultra 9 285K, every ratio is 1.00 +- 0.01.
++//
++// GUARDED ON `k <= 256`, WHICH IS THE OTHER HALF OF THE STORY AND WAS MISSING FOR A WEEK.
++//
++// What this branch removes is a per-OUTPUT cost: `m*n` contended stores, one per element of `C`,
++// however long the contraction is. What it adds is per-WORK -- a job's row block is four times
++// taller, so one job holds `RM*BM*k*4` = `16k` bytes of `A` instead of `4k`, and there are four times
++// fewer jobs to balance across the threads. The benefit therefore decays as `1/k` while the cost does
++// not, and past some `k` the branch is a LOSS. It was only ever measured at `k = 64`.
++//
++// `scripts/bench19.cpp` in loom.cpp sweeps `k` at `m = 284, n = 384`, 4 threads, both arms in ONE
++// process, ABBA-interleaved, ratio taken per round (> 1 means this branch beats the `m % 4` schedule
++// it replaces):
++//
++//     k                      64     128     192     256     384     512     768     960    2304
++//     Core Ultra 9 285K   2.035   1.317   1.046   1.030   1.005   0.996   0.987   0.983   0.974
++//     Cortex-A72          1.014   1.011   1.005   0.997   0.995   0.977   0.959   0.912   0.901
++//
++// Monotone on both, and they cross 1.0 within a factor of two of each other -- so the predicate is
++// `k`, and NOT the ISA, which an `!defined(__aarch64__)` guess would have got wrong in both
++// directions. 256 is the largest power of two inside the winning region on both machines.
++//
++// WHAT THE MISSING GUARD COST, which is why this is written out at such length: `m` is a sequence
++// length in an ATTENTION matmul, where `k` is a head dimension and small -- but the same `sgemm` is
++// where `ggml-0004` and `ggml-0009` lower CONVOLUTION and transposed convolution, and there `k` is
++// `in_channels * kernel_width`, 576 to 2304. A VITS TTS synthesis issues 10.9 of its 14.4 GFLOP
++// through matmuls this branch newly accepted, and shipping it without the `k` guard cost a
++// Cortex-A72 2.4% end to end -- 27 ms per synthesis, of which `$LOOM_PROFILE` put 22.6 ms in
++// `CONV_2D`. Nothing in the reasoning above mentions convolution, which is exactly how it was missed.
++// See loom.cpp Epic-05 P4.26 and Retro-022.
++// See loom.cpp Epic-05 P4.22.
+ #if VECTOR_REGISTERS == 32 && !(defined(__ARM_NEON) && defined(__GNUC__) && !defined(__clang__))
+-        if (m % 16 == 0 && (m/16 >= params->nth)) {
++        if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) {
+             const int64_t SIZE_N = BLOCK_SIZE<6>(n);
+-            mnpack<4, 6, 4>(m, n, SIZE_N, 12);
++            mnpack<4, 6, 4>(m16, n, SIZE_N, 12);
++            if (m16 < m)
++                gemm_rows<6>(m16, m, n);
+             return true;
+         }
+         if (m % 8 == 0 ) {
+@@ -591,9 +670,11 @@
+             return true;
+         }
+ #else  // VECTOR_REGISTERS == 16, or NEON on GCC (see above)
+-        if (m % 16 == 0 && (m/16 >= params->nth)) {
++        if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) {
+             const int64_t SIZE_N = BLOCK_SIZE<3>(n);
+-            mnpack<4, 3, 4>(m, n, SIZE_N, 24);
++            mnpack<4, 3, 4>(m16, n, SIZE_N, 24);
++            if (m16 < m)
++                gemm_rows<3>(m16, m, n);
+             return true;
+         }
+         if (m % 8 == 0 ) {
+@@ -610,6 +691,26 @@
+         return false;
+     }
+ 
++    // The 4, 8 or 12 rows left over by the `m - (m % 16)` prefix above. Split by COLUMN across the
++    // threads, exactly as `gemm_tail` splits the <= 3 rows left over by `matmul` -- each thread then
++    // writes a disjoint slice of C, which is the property this whole patch is about, and the barrier
++    // ending gemm() has already run by the time this is called.
++    //
++    // These rows keep the 4xRN tile: they are a row REMAINDER, not a ragged edge, so there is no
++    // reason to drop to the 1x1 kernel `gemm_tail` has to use.
++    template <int RN>
++    NOINLINE void gemm_rows(int64_t i0, int64_t i1, int64_t n) {
++        const int64_t j0 = (params->ith * n) / params->nth;
++        const int64_t j1 = ((params->ith + 1) * n) / params->nth;
++        for (int64_t i = i0; i < i1; i += 4) {
++            int64_t j = j0;
++            for (; j + RN <= j1; j += RN)
++                gemm_bloc<4, RN>(i, j);
++            for (; j < j1; ++j)
++                gemm_bloc<4, 1>(i, j);
++        }
++    }
++
+     // The rows `matmul_aligned` could not take -- at most three. Split by COLUMN across the threads,
+     // which is the only axis with enough of them to split by; each thread writes a disjoint slice of
+     // C, and the graph's own per-node barrier covers the hand-off (the barrier ending gemm() has

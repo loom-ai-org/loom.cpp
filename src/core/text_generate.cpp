@@ -2,6 +2,7 @@
 
 #include "loom/loom_errors.h"
 
+#include <algorithm>
 #include <string>
 
 namespace loom {
@@ -29,6 +30,15 @@ int32_t new_token(const LoomLuaBridge::Value& result) {
 
 } // namespace
 
+std::vector<int32_t> eos_token_ids(const GgufModel& model) {
+    if (model.has_kv("tokenizer.ggml.eos_token_ids")) {
+        std::vector<int32_t> ids = model.kv_arr_i32("tokenizer.ggml.eos_token_ids");
+        if (!ids.empty()) return ids;
+    }
+    const int32_t single = model.kv_i32("tokenizer.ggml.eos_token_id", -1);
+    return single >= 0 ? std::vector<int32_t>{single} : std::vector<int32_t>{};
+}
+
 std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
                               const std::vector<int32_t>& prompt_tokens,
                               const GenerateOptions& options) {
@@ -40,12 +50,25 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
                     "model asked to continue nothing has nothing to continue.");
     }
 
-    // The file's own stop token unless the caller named one, so the loop stops where the checkpoint
+    // The file's own stop tokens unless the caller named one, so the loop stops where the checkpoint
     // says it should rather than where a host's default happened to land. Negative means no early stop,
     // which the generated drivers document as the meaning of a negative `eos_token`.
+    //
+    // The whole SET, not the one the tokenizer config happened to name (P4.23). `eos` stays the first
+    // of them because it is what the driver's own loop is told to stop on and what a caller may
+    // override; the rest are what the driver breaks on from `extra_eos_tokens`, and what the strip
+    // below has to know about -- a chat turn ends on `<end_of_turn>`, so stripping only `<eos>` leaves
+    // a control token's spelling on the end of the answer.
+    const std::vector<int32_t> stop_ids = eos_token_ids(model);
     const int32_t eos = options.eos_token == GenerateOptions::kEosFromFile
-        ? model.kv_i32("tokenizer.ggml.eos_token_id", -1)
+        ? (stop_ids.empty() ? -1 : stop_ids.front())
         : options.eos_token;
+    // A caller-named stop token replaces the file's set rather than joining it: "stop here" is an
+    // instruction, and a loop that also stopped somewhere else would not be following it.
+    const std::vector<int32_t> strip_ids =
+        options.eos_token == GenerateOptions::kEosFromFile ? stop_ids : std::vector<int32_t>{eos};
+
+    if (options.seed) bridge.seed_rng(*options.seed);
 
     std::vector<double> running(prompt_tokens.begin(), prompt_tokens.end());
 
@@ -71,6 +94,13 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
         args["tokens"] = running;
         args["max_new_tokens"] = static_cast<double>(options.max_new_tokens);
         args["eos_token"] = static_cast<double>(eos);
+        // Only what the caller SET (P4.24). An entry that is absent leaves the driver's own
+        // `inputs.<knob> or <default>` fallback intact, which is the checkpoint's declared value --
+        // passing a host default here instead would silently overrule the file for every caller who
+        // named nothing.
+        if (options.temperature) args["temperature"] = static_cast<double>(*options.temperature);
+        if (options.top_k) args["top_k"] = static_cast<double>(*options.top_k);
+        if (options.top_p) args["top_p"] = static_cast<double>(*options.top_p);
         return bridge.call(entry, args);
     };
 
@@ -84,6 +114,29 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
         for (double id : std::get<std::vector<double>>(first)) {
             generated.push_back(static_cast<int32_t>(id));
         }
+        // The header promises the GENERATED ids only, and until P4.23 nothing enforced it on this
+        // branch: the two shapes are told apart by what the driver RETURNS (list vs number), never by
+        // whether the return contains the prompt, so a driver that handed back prompt+generated would
+        // be echoed and nothing would catch it. Every generated `infer_with_past` starts its `_gen`
+        // empty (`driver_components.py`), so this has never fired -- a hand-written or future driver
+        // is what it exists for.
+        //
+        // **The COUNT is the check, deliberately, and not "does it start with the prompt".** That
+        // second test cannot tell an echo from a model repeating its own prompt back, which is exactly
+        // what an un-templated instruction model does (P4.23's reported symptom was that, generated) --
+        // so it would throw on correct output. The count cannot be wrong about anything: the loop
+        // breaks at `#_gen >= max_new_tokens`, so a conforming driver never returns more, whatever it
+        // generated. `max(1)` because that break is checked AFTER the first token is appended, so one
+        // token comes back even from `max_new_tokens = 0`.
+        const size_t ceiling = std::max<size_t>(options.max_new_tokens, 1);
+        if (generated.size() > ceiling) {
+            throw Error("generate: the driver returned " + std::to_string(generated.size()) +
+                        " ids for max_new_tokens=" + std::to_string(options.max_new_tokens) +
+                        ". The list shape is defined as the GENERATED ids alone, so this driver is "
+                        "returning something else -- the prompt in front of them, most likely. Fix its "
+                        "own loop; normalising it here would hide which of the two contracts it thinks "
+                        "it is meeting.");
+        }
     } else {
         // One token per call: the prompt grows and is re-fed, which is what a driver without cross-step
         // state requires (LFM2's ShortConv blocks carry history no cache holds).
@@ -95,7 +148,10 @@ std::vector<int32_t> generate(LoomLuaBridge& bridge, const GgufModel& model,
         }
     }
 
-    if (options.strip_eos && !generated.empty() && generated.back() == eos) generated.pop_back();
+    if (options.strip_eos && !generated.empty() &&
+        std::find(strip_ids.begin(), strip_ids.end(), generated.back()) != strip_ids.end()) {
+        generated.pop_back();
+    }
     return generated;
 }
 

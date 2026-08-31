@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-08-24
+last_updated: 2026-08-31
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,9 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P4.10 — macOS wheels** | multiplies every model family added afterwards; a family is unreachable from a Mac until this lands → [Epic-08 §4](../epics/epic-08-packaging-and-release.md) |
 | **Task #79 part 1 — export the phoneme symbol table** | no licence question, no C++, and it gives four TTS models a real text door → [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md) |
-| **P4.13 — 2-D conv kernels** | closes the thread P4.12 opened while its measurements are fresh → [Epic-05 §5](../epics/epic-05-edge-performance.md) |
 | **P5 family 12 — BERT token classifiers** | smallest possible template, and the first non-audio task → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
 ---
@@ -45,6 +43,13 @@ are not renumbered. New items continue the scheme.
 
 ## Exporter / MIL compiler
 
+* [ ] **Supertonic carries 2.3 MB of the same zero padding VITS just lost.** `ttl_text_512.emb_*`,
+  99.1% zeros — 0.9% of that model, against VITS's 23.2%. **Not the same fix**: P4.28 made VITS's pad
+  dynamic, and Supertonic's text axis is statically sized on purpose for two independent reasons its
+  own export docstring gives, one of which is that `GraphBuilder` resolves only one dynamic-length
+  symbol per topology. It belongs to that limitation, not to the pad.
+  *Context: [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md),
+  [Epic-05 §5](../epics/epic-05-edge-performance.md) P4.28.*
 * [ ] **Modular-export generality is unproven** — the blueprint's whole point was structural rather than
   by-name discovery, and that claim still rests on LFM2 alone. Needs a second, structurally different HF
   model in the regression suite. *Context:
@@ -86,10 +91,11 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
-* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards. ROOT CAUSE FOUND
-  2026-08-23; the fix is applied to the working tree and green, not yet committed.** It is **libgomp's default wait
-  policy**. loom builds ggml with `GGML_OPENMP=ON` (ggml's default, which loom's CMake never chose),
-  so `ggml_barrier` is `#pragma omp barrier` and ggml runs one after every non-empty graph node —
+* [ ] **P4.17 — loom stops scaling at 8 threads and then goes backwards. ROOT CAUSE FOUND and FIXED
+  2026-08-23 (`bb95996`); what is left here is measurement, listed at the end.** It was **libgomp's
+  default wait policy**. loom built ggml with `GGML_OPENMP=ON` (ggml's default, which loom's CMake had
+  never chosen; it is now `LOOM_OPENMP`, default OFF, `cmake/Dependencies.cmake:73`),
+  so `ggml_barrier` was `#pragma omp barrier` and ggml runs one after every non-empty graph node —
   2520 per VITS synthesis — and **every thread sleeps on a futex at every one**: 334,609 voluntary
   context switches over 5 syntheses at 24 threads, against 160 without OpenMP.
   **`GGML_OPENMP=OFF` is worth 4.8x at 24 threads** (0.189 -> 0.040 s) and restores a monotonic curve;
@@ -111,24 +117,32 @@ are not renumbered. New items continue the scheme.
   what ggml's conservative 4 suits, so this is a policy call rather than a further measurement.
   [Epic-05 §2](../epics/epic-05-edge-performance.md) has both sweeps. (3) Consider sending the `OMP_WAIT_POLICY`/`KMP_BLOCKTIME` gap upstream —
   ggml mitigates this for Intel's libomp only, and `cmake/patches/UPSTREAM.md` is where that would go.
-* [ ] **P4.18 — the ASR gap against onnxruntime is entirely the ENCODER.** whisper-small is the one
-  task still behind (0.57-0.72x at four threads). Splitting it settles where: **encoder 5.91 s against
-  onnxruntime's 2.38 s (2.49x slower), decode 0.65 s against 0.97 s (1.50x FASTER)** — same clip, same
-  transcript, one thread on both sides (re-verified 2026-08-24: onnxruntime's encoder graph alone is
-  2.49 s at `intra_op=1`, 0.79 at 4). **The decode loop needs nothing; the cross-KV fix overshot it
-  into a win.** Two of the four candidates are now closed:
-  **fused attention is ruled out** (onnxruntime does not fuse it either — 96 `MatMul`, 12 `Softmax`,
-  no attention node), and **GELU is DONE** — `ggml_vec_gelu_erf_f32` was a scalar `erff()` libm call
-  per element on every architecture, now a SIMD rational (`cmake/patches/ggml-0010`), **14.3x on the
-  Core Ultra, 21.8x on the Ryzen**, taking the op from 5.3x slower than onnxruntime to ~3x faster.
-  **`SOFT_MAX` is MEASURED OUT** — its 5-pass row is worth only 1.06x on the target machine, and
-  deleting the exp entirely is worth 0.99x: it is DRAM-bandwidth bound at these shapes, so do not
-  write a kernel for it. What is left is **`MUL_MAT` 1.93x = 66% of the gap** and **layout `CONT` 33x
-  = 16%**. Take the **layout** item first: it is a graph-level fix in the exporter for a cost
-  onnxruntime demonstrably does not pay (but it means a whisper re-export and a fixture refresh). The
-  GEMM item is larger, risks re-treading Retro-012, and needs its 1.93x confirmed at *these* shapes
-  first — P4.15 only ever measured VITS's, and `scripts/bench6.cpp` is aarch64-only as written.
-  [Epic-05 §2](../epics/epic-05-edge-performance.md). *GELU done, two items open.*
+* [ ] **Write down that loom-exporter's tests run under `~/.venvs/piper`.** `python3` on the dev box
+  resolves to **`~/.venvs/ovos`** — transformers 5.14.1, **no `sentencepiece`** — which is the
+  Qwen3-ASR-only env, and `tests/ci` under it is `4 failed, 568 passed`. **All four are the
+  environment and nothing else: under `~/.venvs/piper` the same four are green** (38 passed, verified
+  2026-08-29). `test_spec_protocol` fails on ovos because `spm_tokenizer_export` cannot import without
+  `sentencepiece`; the three `test_causal_lm_export` registry tests fail with
+  `LinkError: MonolithicCall … supplies input(s) it does not declare: ['cache_position']`, a
+  transformers-version difference in what the trace sees. **`piper` (transformers 4.57.6,
+  sentencepiece 0.2.1) is the env for everything except Qwen3-ASR** and must not be upgraded — NeMo
+  pins `~=4.53`. It is written nowhere in the repo, so the next person meets four red tests with no
+  way to tell. Put it in loom-exporter's README, and note that piper is ~3x slower to run them
+  (4m12s against 1m21s for the same two files).
+* [ ] **The rc7 Hub push — now nine models, not four.** The refreshed whisper GGUF is not on the Hub
+  (the decoder's loop-invariant V transpose, 2026-08-29), alongside the three already-stale models
+  (whisper, vits, matcha) — and **P4.23 re-exported all five causal LMs**, whose published artifacts
+  now tokenize a marker as seven literal ids and carry no chat template. The five cards are already
+  regenerated in `../hf-models/` and show `text2text.chat(...)`; the GGUFs beside them are not.
+  One push, and it is the only release chore left: *everything else in P4.18 is closed* — the
+  per-shape encoder re-measure and the README's ASR column (item A), the V transpose (item B,
+  **1.106x**), and `QK^T`'s mechanism (item C — the counters found it; see P4.21).
+  [Epic-05 §2](../epics/epic-05-edge-performance.md) has all three.
+* [ ] **`ldc` alignment is the last of the `QK^T` thread, and it is small.** After P4.22, `m = 1500`
+  reaches 15.0 ms where a padded `m = 1504` reaches 10.9 — 1500 floats is 6000 bytes and `6000 % 64 =
+  16`, so a job's full-line store still straddles two lines on odd columns. Closing it means padding
+  `C` (an allocator change, not a kernel one) for ~4 ms of a 3.9 s transcription. **Re-measure before
+  opening it.** *Context: [Epic-05 §5](../epics/epic-05-edge-performance.md), P4.22.*
 * [ ] **The README's TTS and LM columns need the per-launch sampling the ASR column just got.** On the
   Core Ultra 9 285K (8 P-cores + 16 E-cores, no SMT) thread placement is chosen **once per process**
   and then sticks, so every run inside one process inherits the same luck and a within-process median
@@ -140,20 +154,15 @@ are not renumbered. New items continue the scheme.
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **LFM2 is the only causal LM still on the O(n^2) decode path**, because its ShortConv blocks
-  carry history no KV cache holds and its export therefore has no `infer_with_past`. Every other causal
-  LM now takes the driver's own cached loop. Giving LFM2 a cached entry point means giving the engine
-  somewhere to put ShortConv state, which is a real design question and not a one-line change.
-  → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **P4.16 — the convolution gap, shape by shape.** Both named mechanisms are spent (P4.15c measured
-  one out, P4.15d/f fixed the other) and the model is at 1.033x of onnxruntime end to end.
-  **Re-measure the table against the post-P4.15f export before opening anything new on it.**
-  *Do not start on the resblock kernel again* — measured at 83% of the machine's peak in cache.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
-* [ ] **P4.13 — 2-D conv kernels, so a convolutional model can be Q4_0.** Op eligibility is fixed;
-  layout alignment is not (0 of 132 VITS kernels align for block 32 as stored). Acceptance: VITS exports
-  at Q4_0 to ~28 MB with a non-zero coverage line, and its audio still transcribes through whisper-small.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
+* [ ] **A second convolutional family at Q8_0, end to end, after P4.29.** P4.29 took a quantized conv
+  model from 2.1x slower back to F32 speed (2.075x on a Cortex-A72, 2.101x on x86-64) and the whole
+  verification is VITS. The mechanism is per-node and model-independent, and VITS's 114 folded kernels
+  already reach both of ggml's lowerings — but Matcha, Kokoro and StyleTTS2 were last transcribed
+  through the *old* one (P4.13's follow-ups), so nothing has re-run them. One export and one whisper
+  pass each. → [Epic-05 §5](../epics/epic-05-edge-performance.md)
+* [ ] **`op_conv_2d` (the genuinely 2-D form) still takes im2col + `mul_mat_kernel_first` for a folded
+  kernel.** P4.29 gave the 1-D form `ggml_conv_2d_direct_packed`; the same call serves 2-D with
+  `kh > 1`. Nothing in tree has a quantized 2-D convolution hot enough to notice, so this waits for one.
 * [ ] **`FLASH_ATTENTION`.** Unbuilt. The blocker is **the gate suite's exact-fp32 comparisons, not the
   hardware** — `ggml_flash_attn_ext` forces an F16 K/V cast. A GPU exists now and the trade still has not
   been made; it is a decision about verification. *Context:
@@ -167,10 +176,6 @@ are not renumbered. New items continue the scheme.
 * [ ] **General multi-scheme quantization tool.** `quantize_gguf_q8_0.py` is Q8_0-only and
   single-model-shaped. A model-agnostic tool with a per-tensor-role policy (skip norm weights and
   embeddings) is unbuilt. *Scope note: [ADR-017](../adrs/adr-017-no-k-quants.md)*
-* [ ] **Flag, not yet a bug: StyleTTS2 at Q8_0** produces audio at correlation **0.015** against its F32
-  audio while transcribing correctly. The plausible reading is its stochastic style-diffusion sampler
-  diverging onto a different-but-valid trajectory (Matcha's deterministic CFM stayed at 0.985) — but
-  that is a **hypothesis**. Verify before shipping a quantized StyleTTS2.
 
 ## Backends & accelerators
 
@@ -178,9 +183,30 @@ are not renumbered. New items continue the scheme.
   the engine can resolve, so `"npu"` throws by design. CoreML (the Neural Engine, which Metal is not)
   and RKNPU2 are out of tree and cost more, licence check included. *Context:
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [Epic-04](../epics/epic-04-backends-and-accelerators.md)*
-* [ ] **P4.11 — Metal.** Scoped; strictly after P4.10, because there is no macOS base wheel for a backend
-  package to attach to and P4.10's `.so`-vs-`.dylib` loader blocker is the *same code path* that would
-  discover `libggml-metal`. Does **not** block new model families. → [Epic-04 §5](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **A Metal `PAD` kernel that accepts a leading pad — SCOPED AND PROTOTYPED, worth 1.8%.** Do
+  not pick this up expecting a speedup. `ggml-metal`'s `supports_op` accepts `GGML_OP_PAD` only with
+  the LEADING pads zero (`op_params` 0/2/4/6); 21 of VITS's nodes have `lp0 == 1` and fall back,
+  taking 27 non-PAD nodes with them as scheduler collateral. A throwaway patch on the M1 Pro (four
+  `lp0..lp3` fields on `ggml_metal_kargs_pad`, `dst[i0] <- src[i0 - lp0]` in `kernel_pad_impl`,
+  `supports_op` returning true) took the graph from **27/56 CPU splits to 0/2 with an identical
+  output digest — and 493.3 ms to 484.7 ms.** Worth doing for cleanliness, upstreamability and for
+  discrete GPUs where a round trip crosses PCIe; not worth doing for Apple performance. Same shape as
+  Vulkan's missing `PAD_REFLECT_1D` (P4.7d).
+  → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **Why Metal costs ~5x the CPU per unit of work on a convolutional graph** — this is where
+  VITS's 5.24x actually lives, and it is NOT the fallback above and NOT dispatch overhead: cost per
+  output sample is flat within 8% across a 5.8x change in utterance length (7.25 → 6.69 µs, against
+  the CPU's 1.36), so it is compute-bound. Hypothesis to test, not a result: loom's CPU convolution
+  carries seven hand-written ggml patches (`ggml-0004`–`0007`, P4.13, P4.29) and its Metal path runs
+  stock `im2col` + `mul_mat`, while whisper-small — large matmuls, where stock Metal is strong — wins
+  2.69x. **Starts with a per-op profile on Metal**, not with more reasoning.
+  → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **The device hierarchy ranks a GPU above the CPU on unified memory, where the proxy does not
+  hold.** That rule stands for "has its own fast memory", which an Apple Silicon GPU does not — it has
+  the CPU's. Measured: `device=""` picks `MTL0` and is 2.69x faster on whisper-small and 5.24x SLOWER
+  on VITS. It is why Metal ships as an extra rather than in the base macOS wheel; if this changes,
+  folding it in is worth revisiting. → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md),
+  [ADR-010](../adrs/adr-010-device-selection-by-kind.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL
@@ -200,22 +226,35 @@ are not renumbered. New items continue the scheme.
   Qwen3-TTS is not one. *Context: [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md)*
 * [ ] **Remaining BPE pretokenizer families** beyond the ~40 in `pre_spec_table()` (CJK-script splitters,
   case-transition shapes, `byte_encode=false` SPM-style families). Each raises a named error rather than
-  mis-tokenizing — bounded; add one when a real model needs it.
+  mis-tokenizing — bounded; add one when a real model needs it. **Distinct from the added-token pre-pass** P4.23
+  shipped (`<|im_start|>` and friends, which `encode` could not emit at all) rather than pretokenizer
+  regexes — but both land in `bpe_vocab.cpp`, so read
+  [Epic-07 §4](../epics/epic-07-text-frontends-and-tokenizers.md) before opening this one.
 
 ## Host API
 
-* [ ] **Sampling is greedy argmax only.** No temperature, top-k, top-p or repetition penalty.
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
 ## Packaging & release
 
-* [ ] **P4.10 — macOS wheels**, Apple Silicon and Apple Intel. Four blockers scoped; blocker 4 (the DL
-  loader searching for `.so` where CMake wrote `.dylib`) is shared with P4.11.
-  → [Epic-08 §4](../epics/epic-08-packaging-and-release.md)
+* [ ] **Publish the Apple wheels, and `loom-py-rt-metal` with them.** P4.10 and P4.11 are built,
+  installed and run on an M1 Pro, but nothing has reached PyPI. Two things are needed that only a
+  release run can do: `cibuildwheel`'s `delocate` repair step has never executed (it refuses to
+  system-install a framework CPython outside CI, so local builds used `python -m build`), and
+  **`loom-py-rt-metal` is a FOURTH PyPI project and needs its own trusted publisher** — owner
+  `loom-ai-org`, repo `loom-py`, workflow `wheels.yml`, environment `pypi` — before its publish step
+  can succeed. Fold into the rc7 push. → [Epic-08 §4.5](../epics/epic-08-packaging-and-release.md)
+* [ ] **`loom-py`'s submodule pointer predates P4.20–P4.29**, and `loom.cpp/main` is well ahead of its
+  own origin. Every macOS build used the working tree instead. Bumping it is a release-time act and
+  belongs with the rc7 push.
+* [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
+  twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
+  (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 * [ ] **Linux on ARM builds** — the platform that matters most for an engine whose stated target is edge
-  devices.
-* [ ] **The HF push of the outstanding re-exports.**
+  devices. 
+* [ ] **The rc7 Hub push** — tracked once, under Engine — performance, with the list of what is stale
+  and why.
 
 ## Standing scope limitations
 
@@ -232,6 +271,24 @@ primitive set.
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
   `repeat_for`'s own loop bound.
 * [ ] `export_config.py`'s module docstring points at a ledger section that no longer exists.
+* [ ] **The direct-conv budget is now correct on macOS but UNTESTED IN THE REGIME WHERE IT BINDS.**
+  `ggml_conv_1d_direct_budget()` took its 512 KB floor on every Mac (`_SC_LEVEL{2,3}_CACHE_SIZE` are
+  glibc extensions absent from the macOS SDK, so both arms compiled out); `ggml-0006` now has an
+  `__APPLE__` arm reading `hw.perflevel0.l2cachesize` — the PERFORMANCE cluster, 12 MB on an M1 Pro,
+  against the flat `hw.l2cachesize`'s 4 MB. Swept on VITS at 512 KB / 4 MB / 12 MB / 1 GB: **94.0,
+  93.3, 94.0, 94.2 ms — no difference, same digest**, because VITS's largest conv weight already fits
+  under the floor. (Budget 0, disabling the direct path entirely, is 135.4 ms and a different digest,
+  which is what proves the sweep was live.) So the change is right on its own terms and its effect is
+  unmeasured: the shapes where a 24x budget change matters are in the OTHER conv families, none of
+  which is staged on that machine. Re-measure with Matcha/Kokoro/StyleTTS2.
+  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
+* [ ] **`GgmlPatches.cmake` asks "already applied?" the wrong way, so every `cmake` re-run rebuilds
+  ggml from scratch** (~30 min on the Pi). It reverse-applies **each patch individually against the
+  final tree**, which only holds while no later patch rewrites lines an earlier one added —
+  `ggml-0004`..`0007` all fail it today. **Not a context-width problem**: regenerating one at `-U3`,
+  `-U1` and `-U0` all still fail, because the added lines themselves are gone. The fix is a stamp file
+  holding the applied set's names and hashes, skipped when it matches. Build-time cost only; the
+  reset-and-retry path it falls into is correct.
 
 ---
 
