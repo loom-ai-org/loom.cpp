@@ -100,12 +100,25 @@ Python 3.10, envs `env-py-3.11` (3.11.12, arm64 — **use this one**), `env-py-3
 error; see Epic-04 §5, where that turns out **not** to block Metal. Missing and likely wanted:
 **`ninja`** and **`pkg-config`**, both a `brew install` away.
 
-**What is NOT there yet, and is needed before the "run a model on it" bar can be met:** neither repo is
-checked out on the machine (`~/loom*` does not exist) and there are **no GGUFs** on it, so a model has
-to be copied over — the smallest useful pair is `vits-piper-en-gb-miro` (11.7 MB at Q4_0 after P4.28)
-and `whisper-small.gguf` as its ASR oracle. Disk is not a constraint: **207 GB free of 460**. Rosetta 2
-is installed, which matters only if the `macosx_10_13_x86_64` wheel is ever smoke-tested locally rather
-than in CI.
+**The homebase is `/Users/fdemelo/loom`, and it is already staged** (2026-08-31) — the same layout as
+`~/Dev/loom` here, so a path in one repo's docs resolves on both:
+
+```
+/Users/fdemelo/loom/{loom.cpp, loom-exporter, loom-py}           # clean trees at the current HEADs
+/Users/fdemelo/loom/hf-models/vits-{f32,q4_0}-dyn.gguf           # 62.8 MB / 11.7 MB, post-P4.28
+/Users/fdemelo/loom/hf-models/whisper-small/whisper-small.gguf   # the ASR oracle, 16 kHz only
+```
+
+1.1 GB of 207 GB free, and **no build directories** — they are Linux objects and would only confuse a
+macOS configure. Rosetta 2 is installed, which matters only if the `macosx_10_13_x86_64` wheel is ever
+smoke-tested locally rather than in CI.
+
+**Three rsync traps, all already paid for here.** (1) The Mac's clock is **241 s behind** this host, so
+freshly-synced files carry future mtimes and a build system will loop on stale objects — `touch`
+everything newer than now after any sync, exactly as the workstation precedent requires. (2) macOS ships
+**openrsync** ("rsync version 2.6.9 compatible"), which rejects `--info=stats2` and other modern flags:
+keep to `-a --stats`. (3) `--exclude 'build-*'` is a **glob, not a directory match**, and it silently
+swallowed `loom-py/.github/workflows/build-image.yml` on the first pass.
 
 **THE SSH INVOCATION GOTCHA, which cost one wrong inventory already.** `ssh macbook-pro 'cmd'` runs a
 **non-login, non-interactive** shell, so it sources neither `~/.zprofile` (Homebrew's `shellenv`) nor
