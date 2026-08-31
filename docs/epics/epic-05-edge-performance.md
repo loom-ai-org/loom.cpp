@@ -3527,6 +3527,19 @@ exactly what the design predicted.
 * **`op_conv_2d` (the genuinely 2-D form) is untouched** and still takes im2col + `mul_mat_kernel_first`
   for a folded kernel. Nothing in tree has a quantized 2-D convolution hot enough to notice; the same
   `ggml_conv_2d_direct_packed` would serve it, with `kh > 1`, whenever one does.
+* **Apple Silicon reconciliation: the direct-conv cache budget falls to its 512 KB floor on macOS, and
+  on an M1 Pro that is an 8x under-estimate.** `ggml_conv_1d_direct_budget()` (ggml-0006) reads
+  `sysconf(_SC_LEVEL3_CACHE_SIZE)` then `_SC_LEVEL2_CACHE_SIZE`, both **glibc extensions**: neither name
+  exists in the macOS SDK's `unistd.h` (checked on `macbook-pro`, 0 hits), so both `#if defined` arms
+  compile out and the budget takes the 512 KB floor. That same M1 Pro reports
+  `hw.l2cachesize = 4194304` and no L3 key — **4 MB of L2 priced as 512 KB**, so the predicate will
+  decline shapes it should take and a quantized *and* an F32 conv model both leave speed on the table.
+  Not a regression and not P4.29's doing: aarch64 Linux hits the same floor (the Pi reports nothing
+  either, which is what the floor was put there for), so every number in this section was measured on
+  it. The fix is a `__APPLE__` arm using `sysctlbyname("hw.l3cachesize")` then `"hw.l2cachesize"`, in
+  ggml-0006. **Measure before and after on the Mac** — the floor may be accidentally near-optimal, as
+  it is on a 1 MB-L2 Pi, and half of a 4 MB L2 is a different regime from anything this heuristic has
+  been swept on. → Epic-04 §5, Epic-08 §4.
 * **`cmake/patches`' idempotency test is the wrong test, and ggml-0013 makes it one patch wronger.**
   `GgmlPatches.cmake` asks "is this patch already applied?" by reverse-applying **each patch
   individually against the final tree**, which only holds while no *later* patch rewrites lines an
