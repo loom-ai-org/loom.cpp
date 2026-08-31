@@ -108,8 +108,14 @@ ggml_tensor* mul_mat_kernel_first(ggml_context* ctx, ggml_tensor* kernel_2d, ggm
 // shape the mul_mat already reshapes to, so ne[0] becomes IC*K and 114 of those same 117 kernels align
 // (99.99% of the conv BYTES; the three that do not are 1x1x192 duct tape). It does this ONLY for a
 // kernel it is about to block-quantize: an F32 or F16 export keeps the declared 3-D/4-D form and runs
-// precisely the graph it ran before, bit for bit, including the direct-conv lowering below, which
-// takes an F32/F16 kernel and which a quantized kernel could never have used anyway.
+// precisely the graph it ran before, bit for bit, including the direct-conv lowering below.
+//
+// A FOLDED KERNEL NOW REACHES THAT LOWERING TOO (P4.29). It could not when the fold shipped -- ggml's
+// GGML_OP_CONV_2D read its geometry off the kernel's `ne`, which the fold erases, and took an F32 or
+// F16 kernel besides -- and giving it up, rather than the arithmetic, is where essentially all of a
+// quantized model's 2.08x (x86-64) / 2.13x (Cortex-A72) went. `ggml_conv_2d_direct_packed` is told the geometry instead, and the CPU backend
+// dequantizes the kernel into the scratch buffer its direct sweep already repacks an F32 one into.
+// See the second branch in op_conv_1d.
 //
 // What the fold costs is the geometry, because the shape it erases is the shape the convolution IS.
 // The exporter hands it back on the node instead, as `kernel_k`/`kernel_ic` (CONV_1D) and
@@ -239,7 +245,8 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // `!fold.folded` is not implied by the dtype test beside it and is not redundant: a folded kernel
     // has lost the [KW, KH, IC, OC] shape ggml_conv_2d_direct reads its geometry from, and the fold is
     // the exporter's decision rather than this op's, so it is checked rather than inferred. In practice
-    // only a block-quantized kernel is ever folded, and that one is excluded twice over.
+    // only a block-quantized kernel is ever folded, and that one is excluded twice over -- and then
+    // caught by the branch immediately below, which is the same lowering told the geometry.
     if (!fold.folded && !conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel) &&
         (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
         const int64_t IC = kernel->ne[1], OC = kernel->ne[2], K = kernel->ne[0];
@@ -249,6 +256,37 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         ggml_tensor* data_4d   = ggml_reshape_4d(pc.ctx, data, IL, 1, IC, N);     // [W, H=1, C, N]
         ggml_tensor* conv = ggml_conv_2d_direct(pc.ctx, kernel_4d, data_4d, s0, 1, p0, 0, d0, 1);
         return {ggml_reshape_3d(pc.ctx, conv, conv->ne[0], OC, N)};               // [OL, OC, N]
+    }
+
+    // ... AND THE SAME LOWERING FOR A FOLDED, BLOCK-QUANTIZED KERNEL (BACKLOG P4.29).
+    //
+    // Everything the branch above buys is what quantizing a convolutional model used to give up, and
+    // that is where essentially all of the 2.08x (x86-64) / 2.13x (Cortex-A72) cost of quantizing one
+    // lived -- not in the arithmetic. Measured on a VITS vocoder, one synthesis, interleaved A-B-B-A:
+    // the direct sweep alone is worth 1.46x / 1.33x, and ggml's batching plus the three CONV_2D
+    // fusions the other 1.07x. A quantized kernel could reach none of it, because GGML_OP_CONV_2D took
+    // an F32 or F16 kernel and a folded one carries no geometry on its `ne` at all.
+    //
+    // ggml-0013 fixes both halves: `ggml_conv_2d_direct_packed` is told the geometry the fold erased,
+    // and the CPU backend dequantizes the kernel into the scratch buffer its direct sweep already
+    // repacks an F32 one into -- so from that point down a quantized convolution executes the SAME
+    // instructions as an F32 one, and the expected end state is F32 speed plus the dequantize (+1.8 ms
+    // on a ~500 ms synthesis, measured over all 59.5 MB of that model's conv weights at once).
+    //
+    // ASKED rather than assumed, which is the P4.7e pattern: this is a CPU-only arrangement today. A
+    // Vulkan or CUDA backend declines the node -- neither can read a folded kernel, and saying so is
+    // part of the same patch -- and the graph keeps the im2col + `mul_mat_kernel_first` lowering below,
+    // which is what those backends already run with zero fallback nodes.
+    if (fold.folded && fold.kh == 1 && conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel)) {
+        const int64_t IL = data->ne[0], N = data->ne[2];
+        GGML_ASSERT(data->ne[1] == fold.ic && data->ne[3] == 1);
+        ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, IL, 1, fold.ic, N);   // [W, H=1, C, N]
+        ggml_tensor* conv = ggml_conv_2d_direct_packed(pc.ctx, kernel, data_4d, s0, 1, p0, 0, d0, 1,
+                                                       static_cast<int>(fold.kw), 1,
+                                                       static_cast<int>(fold.ic));
+        if (backend_can_run(pc, conv)) {
+            return {ggml_reshape_3d(pc.ctx, conv, conv->ne[0], fold.oc, N)};       // [OL, OC, N]
+        }
     }
 #endif
 

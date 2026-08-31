@@ -843,11 +843,12 @@ void test_conv_1d_quantized_kernel_matches_f32() {
 // The tolerance on the first pair is loose enough to survive a different summation order and nothing
 // more: the declared arm lowers to `ggml_conv_2d_direct` and the folded one to im2col + mul_mat, which
 // are two different accumulations of the same products. A wrong fold misses by ORDERS of that.
-void test_conv_1d_folded_kernel_matches_declared() {
+// Parameterised on the shape, because the fourth arm's op picks its lowering by shape -- see the two
+// calls below. IC is 32 in both so that IC*K is block-aligned for Q8_0, which is the whole point of the
+// fold, and K is 3 because that is the width every real convolutional model uses and the one no block
+// size divides.
+void check_conv_1d_folded_kernel_matches_declared(int64_t kK, int64_t kIC, int64_t kOC, int64_t kIL) {
     GgmlScratch s;
-    // IC=32 so IC*K is block-aligned for Q8_0 (which is the whole point of the fold), K=3 because that
-    // is the width every real convolutional model uses and the one no block size divides.
-    constexpr int64_t kK = 3, kIC = 32, kOC = 5, kIL = 11;
     std::vector<float> kernel_data(kK * kIC * kOC);
     for (size_t i = 0; i < kernel_data.size(); ++i) kernel_data[i] = std::sin(0.41f * static_cast<float>(i));
     std::vector<float> data_data(kIL * kIC);
@@ -879,9 +880,27 @@ void test_conv_1d_folded_kernel_matches_declared() {
     ggml_set_input(dq);
     ggml_tensor* outq = op("CONV_1D")(pc, {kq, dq}, folded)[0];
 
-    // The declared geometry comes back from all three, which is what makes the fold invisible to
+    // ARM FOUR (P4.29): ggml's packed direct convolution, built here RATHER THAN through the primitive.
+    // On a CPU `op("CONV_1D")` above already chooses it, so driving it through the op would only re-test
+    // arm three -- and would stop testing anything at all the day `backend_can_run` says no. Built
+    // directly, this arm pins ggml-0013 itself: that a kernel whose K and IC were folded into ne[0] and
+    // then block-quantized, with the erased geometry passed in op_params instead, computes the same
+    // convolution as the declared F32 kernel it was made from. Its tolerance is the quantization one
+    // for the same reason arm three's is; what it rules out is a wrong geometry, which misses by orders
+    // of that.
+    ggml_tensor* kp = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_Q8_0, kIC * kK, kOC);
+    ggml_set_input(kp);
+    ggml_tensor* dp = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, kIL, kIC);
+    ggml_set_input(dp);
+    ggml_tensor* outp = ggml_conv_2d_direct_packed(
+        s.ctx.get(), kp, ggml_reshape_4d(s.ctx.get(), dp, kIL, 1, kIC, 1),
+        /*s0=*/1, /*s1=*/1, /*p0=*/1, /*p1=*/0, /*d0=*/1, /*d1=*/1,
+        /*kw=*/static_cast<int>(kK), /*kh=*/1, /*ic=*/static_cast<int>(kIC));
+    outp = ggml_reshape_3d(s.ctx.get(), outp, outp->ne[0], kOC, 1);
+
+    // The declared geometry comes back from all of them, which is what makes the fold invisible to
     // everything downstream of this op.
-    for (ggml_tensor* out : {out2, outq}) {
+    for (ggml_tensor* out : {out2, outq, outp}) {
         LOOM_CHECK(out->ne[0] == out3->ne[0]);
         LOOM_CHECK(out->ne[1] == out3->ne[1]);
         LOOM_CHECK(out->ne[2] == out3->ne[2]);
@@ -892,6 +911,7 @@ void test_conv_1d_folded_kernel_matches_declared() {
     ggml_build_forward_expand(gf, out3);
     ggml_build_forward_expand(gf, out2);
     ggml_build_forward_expand(gf, outq);
+    ggml_build_forward_expand(gf, outp);
     ggml_gallocr_alloc_graph(s.galloc.get(), gf);
 
     set_f32(k3, kernel_data);
@@ -904,17 +924,32 @@ void test_conv_1d_folded_kernel_matches_declared() {
     ggml_quantize_chunk(GGML_TYPE_Q8_0, kernel_data.data(), packed.data(), 0, kOC, kIC * kK, nullptr);
     std::memcpy(kq->data, packed.data(), packed.size());
     set_f32(dq, data_data);
+    std::memcpy(kp->data, packed.data(), packed.size());
+    set_f32(dp, data_data);
     s.compute(gf);
 
-    const std::vector<float> a = get_f32(out3), b = get_f32(out2), c = get_f32(outq);
-    LOOM_CHECK(a.size() == b.size() && a.size() == c.size());
-    bool exact_enough = true, quantized_ok = true;
+    const std::vector<float> a = get_f32(out3), b = get_f32(out2), c = get_f32(outq),
+                             d = get_f32(outp);
+    LOOM_CHECK(a.size() == b.size() && a.size() == c.size() && a.size() == d.size());
+    bool exact_enough = true, quantized_ok = true, packed_ok = true;
     for (size_t i = 0; i < a.size(); ++i) {
         if (std::fabs(a[i] - b[i]) > 1e-4f * std::max(1.0f, std::fabs(a[i]))) exact_enough = false;
         if (std::fabs(a[i] - c[i]) > 5e-2f * std::max(1.0f, std::fabs(a[i]))) quantized_ok = false;
+        if (std::fabs(a[i] - d[i]) > 5e-2f * std::max(1.0f, std::fabs(a[i]))) packed_ok = false;
     }
     LOOM_CHECK(exact_enough);
     LOOM_CHECK(quantized_ok);
+    LOOM_CHECK(packed_ok);
+}
+
+// TWO SHAPE SETS, because the fourth arm's op has two lowerings inside it and the shape is what picks
+// between them. `ggml_conv_1d_direct_ok` wants OC a multiple of its output-channel tile and enough
+// output positions to fill more position blocks than channel tiles; the first set below fails both and
+// lands on the batched im2col, the second passes and takes the direct register-tiled sweep. Both must
+// give the declared-layout answer, and it is the second that P4.29 exists for.
+void test_conv_1d_folded_kernel_matches_declared() {
+    check_conv_1d_folded_kernel_matches_declared(/*K=*/3, /*IC=*/32, /*OC=*/5,  /*IL=*/11);
+    check_conv_1d_folded_kernel_matches_declared(/*K=*/3, /*IC=*/32, /*OC=*/4,  /*IL=*/64);
 }
 
 // The same claim for the 2-D form, where the fold swallows three axes instead of two and the op has to

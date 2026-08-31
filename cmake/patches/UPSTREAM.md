@@ -822,6 +822,113 @@ condition is inherited unchanged rather than re-derived. (3) The residual gap �
 a 64-byte store still straddles two lines on odd columns. Padding `C` would close it and is a bigger
 change than this.
 
+## PR 13 — `conv_2d`: accept a quantized kernel, because the direct path already repacks it
+
+`GGML_OP_CONV_2D` takes an F32 or F16 kernel. A quantized one is not merely unsupported — it is
+**unrepresentable**, and for a reason worth stating: quantization blocks are laid along `ne[0]`, and for
+a kernel stored the way it is declared, `[KW, KH, IC, OC]`, `ne[0]` is the kernel WIDTH — 1, 3, 5, 7 —
+which no block size divides. So a producer that wants a block-quantized convolution has to fold the
+spatial and channel axes into `ne[0]` first, giving `[IC*KH*KW, OC]`, and a folded kernel then carries
+none of the geometry this op reads off `a->ne`.
+
+The result is that a convolutional model gets nothing from quantizing except a smaller file. Measured on
+a VITS vocoder at Q4_0 — 81.7 -> 30.6 MB — one synthesis went **0.50 -> 1.04 s on x86-64 (2.08x) and
+1.03 -> 2.18 s on a Cortex-A72 (2.13x)**, because the whole model dropped out of `CONV_2D` into
+`im2col` + `mul_mat` and gave up the direct 1-D sweep (PR 6) and the two fusions (PR 5, PR 7) with it.
+
+**The fix is one dequantize, and the reason it is only one is that the direct path never reads the
+kernel as stored.** `ggml_conv_1d_direct_run` repacks the whole kernel into an F32 scratch buffer before
+it computes anything, and the register-tiled inner kernel reads only that. So a quantized kernel needs
+no quantized inner loop, no `vec_dot`, and no activation quantized to `vec_dot_type` — it needs a
+`to_float` into a buffer that already exists.
+
+Three pieces:
+
+* **`ggml_conv_2d_direct_packed`** — `ggml_conv_2d_direct` plus `kw`, `kh`, `ic`, stored in `op_params`
+  6..8. `GGML_MAX_OP_PARAMS` is 64 bytes and `CONV_2D` used 24, so this needs no new op code, no new
+  dispatch entry and no ABI change. A zero `kw` is what says "declared layout", which is every existing
+  graph. Reshaping the folded tensor back is not an alternative: a `[IC*K, OC]` Q4_0 tensor reshaped to
+  `[K, 1, IC, OC]` puts K=3 on `ne[0]`, which is not a multiple of the block size, and the resulting
+  `nb` is nonsense.
+* **`ggml_compute_forward_conv_2d_impl`** dequantizes off the FRONT of the work buffer and **re-enters
+  itself** with a stack `ggml_tensor` that is an ordinary contiguous F32 kernel in the declared layout,
+  and a `ggml_compute_params` holding what is left of the buffer. Nothing below that point knows: the
+  direct sweep, the phase-major variant, the batched `im2col` fallback, all three fusions, every thread
+  split. The fold is a pure reinterpretation of the stored order — element `(kx, ky, ic, oc)` sits at
+  `oc*(IC*KH*KW) + ic*(KH*KW) + ky*KW + kx` either way — so the dequantized buffer read with the
+  declared strides IS the declared kernel, with no permutation and no second pass.
+* **`ggml_graph_plan`** adds the dequantized kernel's bytes to `GGML_IM2COL_WORK_SIZE` for a quantized
+  `src0`, since the buffer now holds both.
+
+**The re-entry is the design decision, not an implementation detail.** The alternative — threading
+`kw/kh/ic/oc` through every function below — leaves each predicate free to price the kernel by its
+STORED size, and one of them must not: `ggml_conv_1d_direct_ok`'s cache budget is
+`IC*OC*KW*sizeof(float)`, and `wp` is F32 whatever the kernel is. Priced by 8.4 MB of Q4_0 rather than
+59.5 MB of F32, that predicate silently admits shapes it was tuned to reject, which is the one way this
+change could ship something SLOWER than what it replaces. Re-entering with a rebound tensor makes every
+predicate below price the dequantized size because that is the only size it can see.
+
+**What the dequantize costs, measured over all 59.5 MB of that model's convolution weights at once** —
+i.e. a whole synthesis's worth of kernel packing, not one convolution (Ryzen 3 3250U):
+
+| | dequantize | the F32 pack it replaces | delta |
+|---|---:|---:|---:|
+| Q4_0 | **10.3 ms** (5.77 GB/s of output) | 8.5 ms | **+1.8 ms** |
+| Q8_0 | 9.3 ms | 8.4 ms | +0.9 ms |
+
+0.4% of a 500 ms synthesis, and the pack loop reads LESS memory in the quantized case (8.4 MB rather
+than 59.5 MB) while writing the same amount, which is why the delta is arithmetic rather than traffic.
+
+**End to end, and on both ISAs** — `paired_arms.py`, interleaved ABBA rounds, one binary per arm swapped
+by `LD_LIBRARY_PATH`, the Pi cooled to a fixed 60 C before every arm:
+
+| VITS at Q4_0, 4 threads | rounds | before | after | median ratio | p10 | p90 |
+|---|---:|---:|---:|---:|---:|---:|
+| **Cortex-A72** (Pi 4B) | 7 | 2.197 s | 1.059 s | **2.075x** | 2.060 | 2.126 |
+| **x86-64** (Ryzen 3 3250U) | 9 | 1.417 s | 0.681 s | **2.101x** | 1.927 | 2.441 |
+
+which is the whole 2.08x / 2.13x back. The x86 band is wide because that box is a noisy 2-core laptop
+part; the Pi's band is 3% wide and is the one to read.
+
+**The end state is a quantized model at F32 speed, which is the claim worth checking.** Because the
+dequantize happens before either lowering, a quantized convolution then executes the *same instructions*
+as an F32 one. Against its own F32 export, same harness, per-round ratios:
+
+| VITS Q4_0 / its own F32 | rounds | ratio | per output sample |
+|---|---:|---:|---:|
+| Cortex-A72 | 7 | 0.950 | **1.029x** |
+| x86-64 | 9 | 0.923 | **1.000x** |
+
+(the two exports produce 67584 and 73216 samples — VITS durations are a `ceil()` of a float and the
+arithmetic changed — so the raw ratio understates and the normalised column is the honest one). **F32 in
+11.7 MB rather than 62.8.**
+
+**The F32 path is bit-identical**, which is what a branch guarded on `ggml_is_quantized` has to show:
+FNV-1a over the whole audio agrees before and after on both machines and in **both** lowerings —
+`68c3229eab373455` / `bbb3b173ce35fe2a` (x86, heuristic on / `GGML_CPU_DISABLE_CONV_HEURISTICS=1`) and
+`aa320f8a1377a92a` (aarch64) — so no byte-identity baseline needs re-recording.
+
+**It is also more accurate, not less.** Dequantize-then-F32-FMA replaces a path that dotted Q4_0 weights
+against activations rounded to Q8_0.
+
+**Backends.** The CPU's `supports_op` gains "or quantized with a `to_float`"; **CUDA's declines a
+quantized or folded `src0`**, which today it would accept (`ggml_is_contiguous(src0) &&
+ggml_is_contiguous(src1)`) and then read as a wrong-shaped F32 kernel — a silent wrong answer, not a
+failure. Vulkan already declines it twice over (a type test, and `cout == op->ne[2]`). Verified: a
+folded Q4_0 VITS on Vulkan still runs with **0 fallback nodes** in both topologies, because the caller
+asks `supports_op` and keeps its own `im2col` lowering when the answer is no.
+
+**Where this design is NOT legal.** It dequantizes **per call**. That is right for a convolution that
+runs once per utterance — every convolutional model in this space is a TTS vocoder or an ASR encoder —
+and wrong for one inside a decode loop, where it would be paid per token. `SSM_CONV` is a different op
+and does not route here.
+
+**What a reviewer should push on.** (1) `op_params` 6..8 is a side channel; a `GGML_OP_CONV_2D_PACKED`
+would be more explicit and would cost a dispatch entry and a `supports_op` case in every backend.
+(2) The producer has to fold the kernel itself, and nothing in ggml helps it or checks it beyond the
+three asserts in `ggml_conv_2d_direct_packed`. (3) A per-call dequantize is a policy, and there is no
+mechanism to cache it across calls if someone puts one of these in a loop.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
