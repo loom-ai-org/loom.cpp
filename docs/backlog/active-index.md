@@ -19,7 +19,6 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P4.10 — macOS wheels** | multiplies every model family added afterwards; a family is unreachable from a Mac until this lands → [Epic-08 §4](../epics/epic-08-packaging-and-release.md) |
 | **Task #79 part 1 — export the phoneme symbol table** | no licence question, no C++, and it gives four TTS models a real text door → [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md) |
 | **P5 family 12 — BERT token classifiers** | smallest possible template, and the first non-audio task → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
@@ -184,9 +183,30 @@ are not renumbered. New items continue the scheme.
   the engine can resolve, so `"npu"` throws by design. CoreML (the Neural Engine, which Metal is not)
   and RKNPU2 are out of tree and cost more, licence check included. *Context:
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [Epic-04](../epics/epic-04-backends-and-accelerators.md)*
-* [ ] **P4.11 — Metal.** Scoped; strictly after P4.10, because there is no macOS base wheel for a backend
-  package to attach to and P4.10's `.so`-vs-`.dylib` loader blocker is the *same code path* that would
-  discover `libggml-metal`. Does **not** block new model families. → [Epic-04 §5](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **A Metal `PAD` kernel that accepts a leading pad — SCOPED AND PROTOTYPED, worth 1.8%.** Do
+  not pick this up expecting a speedup. `ggml-metal`'s `supports_op` accepts `GGML_OP_PAD` only with
+  the LEADING pads zero (`op_params` 0/2/4/6); 21 of VITS's nodes have `lp0 == 1` and fall back,
+  taking 27 non-PAD nodes with them as scheduler collateral. A throwaway patch on the M1 Pro (four
+  `lp0..lp3` fields on `ggml_metal_kargs_pad`, `dst[i0] <- src[i0 - lp0]` in `kernel_pad_impl`,
+  `supports_op` returning true) took the graph from **27/56 CPU splits to 0/2 with an identical
+  output digest — and 493.3 ms to 484.7 ms.** Worth doing for cleanliness, upstreamability and for
+  discrete GPUs where a round trip crosses PCIe; not worth doing for Apple performance. Same shape as
+  Vulkan's missing `PAD_REFLECT_1D` (P4.7d).
+  → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **Why Metal costs ~5x the CPU per unit of work on a convolutional graph** — this is where
+  VITS's 5.24x actually lives, and it is NOT the fallback above and NOT dispatch overhead: cost per
+  output sample is flat within 8% across a 5.8x change in utterance length (7.25 → 6.69 µs, against
+  the CPU's 1.36), so it is compute-bound. Hypothesis to test, not a result: loom's CPU convolution
+  carries seven hand-written ggml patches (`ggml-0004`–`0007`, P4.13, P4.29) and its Metal path runs
+  stock `im2col` + `mul_mat`, while whisper-small — large matmuls, where stock Metal is strong — wins
+  2.69x. **Starts with a per-op profile on Metal**, not with more reasoning.
+  → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **The device hierarchy ranks a GPU above the CPU on unified memory, where the proxy does not
+  hold.** That rule stands for "has its own fast memory", which an Apple Silicon GPU does not — it has
+  the CPU's. Measured: `device=""` picks `MTL0` and is 2.69x faster on whisper-small and 5.24x SLOWER
+  on VITS. It is why Metal ships as an extra rather than in the base macOS wheel; if this changes,
+  folding it in is worth revisiting. → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md),
+  [ADR-010](../adrs/adr-010-device-selection-by-kind.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL
@@ -218,9 +238,19 @@ are not renumbered. New items continue the scheme.
 
 ## Packaging & release
 
-* [ ] **P4.10 — macOS wheels**, Apple Silicon and Apple Intel. Four blockers scoped; blocker 4 (the DL
-  loader searching for `.so` where CMake wrote `.dylib`) is shared with P4.11.
-  → [Epic-08 §4](../epics/epic-08-packaging-and-release.md)
+* [ ] **Publish the Apple wheels, and `loom-py-rt-metal` with them.** P4.10 and P4.11 are built,
+  installed and run on an M1 Pro, but nothing has reached PyPI. Two things are needed that only a
+  release run can do: `cibuildwheel`'s `delocate` repair step has never executed (it refuses to
+  system-install a framework CPython outside CI, so local builds used `python -m build`), and
+  **`loom-py-rt-metal` is a FOURTH PyPI project and needs its own trusted publisher** — owner
+  `loom-ai-org`, repo `loom-py`, workflow `wheels.yml`, environment `pypi` — before its publish step
+  can succeed. Fold into the rc7 push. → [Epic-08 §4.5](../epics/epic-08-packaging-and-release.md)
+* [ ] **`loom-py`'s submodule pointer predates P4.20–P4.29**, and `loom.cpp/main` is well ahead of its
+  own origin. Every macOS build used the working tree instead. Bumping it is a release-time act and
+  belongs with the rc7 push.
+* [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
+  twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
+  (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 * [ ] **Linux on ARM builds** — the platform that matters most for an engine whose stated target is edge
   devices. 
 * [ ] **The rc7 Hub push** — tracked once, under Engine — performance, with the list of what is stale
@@ -241,11 +271,16 @@ primitive set.
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
   `repeat_for`'s own loop bound.
 * [ ] `export_config.py`'s module docstring points at a ledger section that no longer exists.
-* [ ] **The direct-conv cache budget takes its 512 KB floor on macOS — 4 MB of M1 Pro L2 priced as
-  512 KB.** `ggml_conv_1d_direct_budget()` reads `_SC_LEVEL{2,3}_CACHE_SIZE`, glibc extensions absent
-  from the macOS SDK, so both `#if defined` arms compile out. Affects F32 and quantized conv models
-  alike, and aarch64 Linux hits the same floor. Fix is a `__APPLE__` arm on `sysctlbyname`, in
-  `ggml-0006`; measure before and after, since the floor may be accidentally near-optimal.
+* [ ] **The direct-conv budget is now correct on macOS but UNTESTED IN THE REGIME WHERE IT BINDS.**
+  `ggml_conv_1d_direct_budget()` took its 512 KB floor on every Mac (`_SC_LEVEL{2,3}_CACHE_SIZE` are
+  glibc extensions absent from the macOS SDK, so both arms compiled out); `ggml-0006` now has an
+  `__APPLE__` arm reading `hw.perflevel0.l2cachesize` — the PERFORMANCE cluster, 12 MB on an M1 Pro,
+  against the flat `hw.l2cachesize`'s 4 MB. Swept on VITS at 512 KB / 4 MB / 12 MB / 1 GB: **94.0,
+  93.3, 94.0, 94.2 ms — no difference, same digest**, because VITS's largest conv weight already fits
+  under the floor. (Budget 0, disabling the direct path entirely, is 135.4 ms and a different digest,
+  which is what proves the sweep was live.) So the change is right on its own terms and its effect is
+  unmeasured: the shapes where a 24x budget change matters are in the OTHER conv families, none of
+  which is staged on that machine. Re-measure with Matcha/Kokoro/StyleTTS2.
   → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **`GgmlPatches.cmake` asks "already applied?" the wrong way, so every `cmake` re-run rebuilds
   ggml from scratch** (~30 min on the Pi). It reverse-applies **each patch individually against the
