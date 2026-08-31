@@ -162,12 +162,19 @@ endif()
 # `ifeq (Darwin,$(TARGET_SYS))` arm, reached before any compilation -- and CMake does not put that
 # variable into a custom command's environment, so the invocation below arrives with none at all.
 #
-# The value is not a local convention invented here: it is the same number that TAGS THE WHEEL
-# (`macosx_11_0_arm64`, `macosx_10_13_x86_64`), so one export does both jobs. cibuildwheel exports
-# `MACOSX_DEPLOYMENT_TARGET`, which CMake reads into `CMAKE_OSX_DEPLOYMENT_TARGET`; when nothing set
-# it we fall back to those same per-arch defaults rather than to the BUILDING machine's macOS
-# version, because a library tagged with the builder's OS refuses to load on any older one -- the
-# AVX2-wheel defect (tests/ci/test_cpu_variants.py in loom-py) in a different spelling.
+# The value is not a local convention invented here: it is the same number that TAGS THE WHEEL, so
+# one export does both jobs. cibuildwheel exports `MACOSX_DEPLOYMENT_TARGET`, which CMake reads into
+# `CMAKE_OSX_DEPLOYMENT_TARGET`; when nothing set it we fall back to a per-arch platform minimum
+# rather than to the BUILDING machine's macOS version, because a library tagged with the builder's
+# OS refuses to load on any older one -- the AVX2-wheel defect (tests/ci/test_cpu_variants.py in
+# loom-py) in a different spelling.
+#
+# THE FALLBACKS BELOW ARE PLATFORM MINIMA, NOT THE WHEEL'S FLOOR, and the two are deliberately
+# allowed to differ. `loom-py` sets **14.0** for both architectures because ggml's BLAS backend needs
+# Accelerate's new interface (macOS 13.3), rounded up to the next expressible wheel tag -- see
+# Epic-08 §4.3. That is a packaging decision and belongs to the package; a bare engine build has no
+# wheel to tag, and building LuaJIT against an older minimum than the rest of the tree is harmless
+# because a lower deployment target is the more permissive one.
 # THE OUTER MAKE'S JOBSERVER MUST NOT REACH THIS INNER ONE, and clearing it is not a macOS
 # concern -- it is what makes the line below survive a `Unix Makefiles` generator anywhere. GNU make
 # advertises its jobserver to sub-makes through `MAKEFLAGS` (`--jobserver-auth=R,W`), but only hands
