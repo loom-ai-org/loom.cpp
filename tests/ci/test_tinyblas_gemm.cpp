@@ -12,11 +12,19 @@
 //      symbol inside the CPU backend and a GGML_BACKEND_DL build -- the one the wheels ship -- does not
 //      link it (the same trap tests/support/cpu_backend.h documents for `ggml_backend_cpu_init`).
 //   2. **mul_mat is right, at the shapes that take the tinyBLAS path and at the ones that fall off
-//      it.** tinyBLAS is selected by shape: `n >= 4` on NEON, `k % KN == 0`, and one of `m % 16/8/4`,
-//      with the remainder handled by ggml's own kernel. Both sides of each of those conditions are
-//      covered below, so a patch that got the tail blocks wrong -- the failure mode of ANY change to
-//      the tiling, which is exactly what P4.15 changed -- shows up as an arithmetic error rather than
-//      as a performance change nobody notices.
+//      it.** tinyBLAS is selected by shape: `n >= 4` on NEON, `k >= KN`, and one of `m % 16/8/4`, with
+//      BOTH remainders -- rows past `m % 4` and the `k % KN` leftovers -- handled separately from the
+//      tiled body. Both sides of each of those conditions are covered below, so a patch that got a
+//      tail block wrong -- the failure mode of ANY change to the tiling, which is exactly what P4.15
+//      and P4.18 changed -- shows up as an arithmetic error rather than as a performance change
+//      nobody notices.
+//
+//      **`k % KN` used to be a rejection and is now a tail** (cmake/patches/ggml-0011, P4.18): the
+//      contraction is a sequence length in every attention matmul, so whisper's `k = 1500` missed
+//      `KN = 8` on AVX2 and `KN = 16` on AVX-512 and sent that whole GEMM to the generic kernel. The
+//      residue sweep below is the analogue of the `m % 4` one above it, and it is the check that the
+//      leftover elements are ACCUMULATED rather than dropped -- a dropped term is O(1) relative,
+//      four orders of magnitude past the 1e-5 this file already tolerates.
 //
 // Compared against a double-precision reference within a relative tolerance, not bit-exactly: tinyBLAS
 // accumulates in a different order from ggml's own path (~3e-7 relative), which is the whole point of
@@ -76,12 +84,24 @@ void check_mul_mat(ggml_backend_t backend, int64_t K, int64_t M, int64_t N) {
     std::vector<float> out((size_t)ggml_nelements(td));
     ggml_backend_tensor_get(td, out.data(), 0, out.size() * sizeof(float));
 
-    // Every element of the first and last row-block and every column: the tail blocks a tiling change
-    // gets wrong are at the edges, and checking a diagonal would walk straight past them.
+    // Every element of the first and last row-block, of the 16-ROW SEAM, and every column: the tail
+    // blocks a tiling change gets wrong are at the edges, and checking a diagonal would walk straight
+    // past them.
+    //
+    // THE SEAM IS NOT AN EDGE, and that is why it is computed here rather than assumed. `matmul` peels
+    // `M % 4` rows off the bottom, and `matmul_aligned` then runs `m - (m % 16)` of what is left at
+    // the widest row block and finishes the 0/4/8/12 remainder in a separate loop
+    // (cmake/patches/ggml-0012, P4.22). That remainder sits in the MIDDLE of the matrix whenever
+    // `M % 4 != 0`, so a first-and-last-rows check has nothing to say about it -- the patch that
+    // introduced it would have gone in green.
+    const int64_t m0   = M - (M % 4);
+    const int64_t seam = m0 - (m0 % 16);
     double worst = 0.0;
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t m = 0; m < M; ++m) {
-            if (m > 3 && m < M - 4) continue;
+            const bool at_edge = m < 4 || m >= M - 4;
+            const bool at_seam = m >= seam - 4 && m < seam + 4;
+            if (!at_edge && !at_seam) continue;
             const double ref = reference_element(A, B, K, m, n);
             const double got = (double)out[(size_t)n * M + m];
             const double rel = std::fabs(got - ref) / (std::fabs(ref) + 1e-6);
@@ -154,11 +174,41 @@ int main() {
     check_mul_mat(backend.get(), 960, 287, 384);  // m % 4 == 3 -- the real VITS vocoder shape
     check_mul_mat(backend.get(), 224, 3,   32);   // fewer rows than one tile: no tiled part at all
 
-    // And the fall-offs, where ggml's own kernel has to produce the same answer: n < 4 (NEON bails),
-    // and K not a multiple of KN (KN is 4 for F32 NEON, 8 for AVX2, 16 for AVX-512, so 97 misses all
-    // three).
+    // And the fall-off, where ggml's own kernel has to produce the same answer: n < 4 (NEON bails).
     check_mul_mat(backend.get(), 224, 256, 3);
+
+    // Every remainder of the CONTRACTION split, for the same reason as the row split above: the tiled
+    // body computes `k - k % KN` and a scalar loop inside the tile finishes the rest, so a bug there
+    // is a small systematic error in EVERY element rather than a wrong row. 16 covers KN of 4, 8 and
+    // 16 with one sweep, and 97 is kept because it was the shape this file already had.
+    for (int64_t r = 1; r < 16; ++r) {
+        check_mul_mat(backend.get(), 224 + r, 256, 32);
+    }
     check_mul_mat(backend.get(), 97,  256, 32);
+
+    // k below one vector, which still declines -- there is no aligned prefix to tile.
+    check_mul_mat(backend.get(), 3,   256, 32);
+
+    // And the real shape the tail exists for: whisper-small's encoder A@V contracts over 1500 mel
+    // frames. 1500 % 8 == 4, 1500 % 16 == 12, 1500 % 4 == 0 -- so this is a tail on x86 and not on
+    // ARM, which is exactly how it stayed invisible. Small M and N keep it under a second.
+    check_mul_mat(backend.get(), 1500, 64, 48);
+
+    // Every remainder of the SIXTEEN-row split, which is a different seam from the four-row one above
+    // and lands in the middle of the matrix rather than at its bottom (cmake/patches/ggml-0012,
+    // P4.22). `M = 1500` is whisper-small's `QK^T` row count and the residue -- 12 -- that made the
+    // GEMM stop threading; the other three are the rest of the class, and 1488 is the control that
+    // takes no remainder loop at all. Rows are what varies here, so K and N stay small.
+    check_mul_mat(backend.get(), 64, 1500, 48);   // m % 16 == 12
+    check_mul_mat(backend.get(), 64, 1500, 50);   // ...and with a column count that does NOT divide
+                                                  // evenly across the threads, so the remainder loop
+                                                  // gets a ragged slice to finish. Without this N the
+                                                  // whole `gemm_bloc<4,1>` path can be deleted and
+                                                  // every shape above still passes.
+    check_mul_mat(backend.get(), 64, 1496, 48);   // m % 16 ==  8
+    check_mul_mat(backend.get(), 64, 1492, 48);   // m % 16 ==  4
+    check_mul_mat(backend.get(), 64, 1488, 48);   // m % 16 ==  0 -- control, no remainder rows
+    check_mul_mat(backend.get(), 64, 1501, 48);   // both seams at once: 1 row past m % 4, 12 past 16
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

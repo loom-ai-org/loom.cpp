@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -81,7 +82,8 @@ public:
     // entirely, it still defaults to "qwen2" unchanged, same as before this family registry existed.
     static std::unique_ptr<BpeVocab> load(const GgufModel& model);
 
-    // NFC-normalizes `text` (loom::nfc_normalize), splits it via this vocab's `BpeShape` pretokenizer
+    // Splits `text` on this vocabulary's ADDED tokens first (see `added_to_id_`), then NFC-normalizes
+    // each remaining segment (loom::nfc_normalize), splits it via this vocab's `BpeShape` pretokenizer
     // regex (hand-scanned against loom::is_letter/is_number/is_mark -- see bpe_vocab.cpp), GPT2
     // byte-level-maps each chunk's raw UTF-8 bytes, and greedily BPE-merges each chunk independently
     // (merges never cross a pretokenizer chunk boundary, matching the reference tokenizer exactly).
@@ -89,6 +91,11 @@ public:
     // "tokenizer.ggml.add_sep_token" is true (both mirror llama.cpp's own convention; absent, both default
     // to false -- unchanged behavior for existing GGUFs that never wrote them).
     std::vector<int32_t> encode(const std::string& text) const;
+
+    // Whether `id` is a CONTROL token -- a marker the model emits or consumes rather than text
+    // (`<|im_end|>`, `<end_of_turn>`, `<bos>`). Reads "tokenizer.ggml.token_type"; false for every id
+    // of a file that carries none, which is every GGUF exported before P4.23.
+    bool is_control(int32_t id) const;
 
     // Joins each id's piece text and reverses the GPT2 byte-level mapping back to raw UTF-8 bytes.
     std::string decode(const std::vector<int32_t>& ids) const;
@@ -115,9 +122,40 @@ private:
 
     std::vector<std::string> pretokenize(const std::string& nfc_text) const;
     void bpe_merge(std::vector<std::string>& pieces) const;
+    // One added-token-free run of text, normalized, pretokenized, merged and appended to `ids`. The
+    // whole of `encode` before P4.23, minus the bos/sep bracketing, which brackets the WHOLE input and
+    // not each segment of it.
+    void encode_segment(const std::string& text, std::vector<int32_t>& ids) const;
+    // The id of the longest added token whose spelling starts at `pos` in `text`, or -1 when none
+    // does; `len` receives that spelling's byte length on a match.
+    int32_t added_token_at(const std::string& text, size_t pos, size_t* len) const;
 
     std::vector<std::string> tokens_;
     std::unordered_map<std::string, int32_t> token_to_id_;
+    // The ADDED tokens -- what HF's `AddedVocabulary` splits the raw input on before the normalizer and
+    // the pretokenizer ever see it, so their ids are emitted atomically and BPE never gets the chance to
+    // spell them out. Without this, `encode("<|im_start|>")` is seven literal ids where it should be
+    // one, and a chat template is not merely un-applied but UNREPRESENTABLE (P4.23).
+    //
+    // Populated from "tokenizer.ggml.token_type": every CONTROL (a special marker) and USER_DEFINED (an
+    // added token that is not special -- Gemma 3 adds 6408 of them, whitespace runs like "\n\n\n") entry.
+    // A file without that KV leaves this EMPTY and encode() behaves exactly as it did before, which is
+    // what keeps every pre-P4.23 GGUF tokenizing identically.
+    //
+    // The other two token types are deliberately not here: NORMAL is ordinary vocabulary, and BYTE is
+    // `<0xNN>`, whose whole job is to be reached by fallback from a character no entry covers -- a
+    // literal "<0x41>" in someone's text is not a request for byte 0x41.
+    std::unordered_map<std::string, int32_t> added_to_id_;
+    size_t max_added_len_ = 0;
+    // Which byte values any added token can START with, so the scan skips the overwhelming majority of
+    // positions with one array read instead of `max_added_len_` hash lookups. Gemma 3's added set is
+    // 6415 entries and its first bytes are '<', '[', '\n', '\t' and U+2581's lead byte -- prose touches
+    // almost none of them.
+    std::array<bool, 256> added_first_byte_{};
+    // Parallel to `tokens_`, or empty when the file carries no "tokenizer.ggml.token_type" -- llama.cpp's
+    // own KV, whose values are gguf's `TokenType` (1 NORMAL, 2 UNKNOWN, 3 CONTROL, 4 USER_DEFINED,
+    // 5 UNUSED, 6 BYTE).
+    std::vector<int32_t> token_type_;
     std::unordered_map<std::string, int32_t> merge_rank_; // key: piece_a + '\x01' + piece_b
     int32_t bos_id_ = -1;
     int32_t eos_id_ = -1;

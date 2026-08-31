@@ -1,0 +1,133 @@
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -56,6 +56,100 @@
+ 
+ #include <array>
+ #include <type_traits>
++#include <cstdlib>   // P4.26 probe
++#include <cstdio>
++#include <map>
++#include <mutex>
++#include <utility>
++
++// ================= P4.26 MEASUREMENT PROBE -- NOT CARRIED, NOT FOR UPSTREAM =================
++// The `ragged_prefix` predicate below, as a run-time switch, so that both arms of an A/B are the SAME
++// BINARY: one process, one allocation, one page cache, one branch flipped. Epic-05's operating notes
++// ask for that and neither P4.22 nor P4.26's first pass could do it -- both built two whole trees.
++// Also a shape census, so that "which matmuls does a VITS synthesis actually issue" is a fact rather
++// than a guess. Inert unless its env var is set; the default is the predicate as shipped.
++//
++//   GGML_SGEMM_POLICY=0     pre-0012                m % 16 == 0 && m/16 >= nth
++//   GGML_SGEMM_POLICY=1     0012 as first shipped   m16 > 0 && nth > 1 && m16/16 >= nth
++//   GGML_SGEMM_POLICY=6     as shipped now (default): 0 plus a ragged prefix when k <= 256
++//   GGML_SGEMM_POLICY=7,8   the same with k <= 512 / k <= 128
++//   GGML_SGEMM_POLICY=2,3,4 job-count floors instead: m16/16 >= 2*nth / 4*nth / 8*nth
++//   GGML_SGEMM_CENSUS=1     print an (m, n, k, nth) histogram of every call, at exit
++static int loom_sgemm_policy_value = -1;
++
++extern "C" void loom_sgemm_set_policy(int p) { loom_sgemm_policy_value = p; }
++
++static inline int loom_sgemm_policy() {
++    if (loom_sgemm_policy_value < 0) {
++        const char * s = getenv("GGML_SGEMM_POLICY");
++        loom_sgemm_policy_value = s ? atoi(s) : 6;
++    }
++    return loom_sgemm_policy_value;
++}
++
++// `m16` is the largest multiple of 16 in `m`; `m` is already a multiple of 4 by the time this runs.
++static bool loom_sgemm_take_prefix(int64_t m, int64_t m16, int64_t k, int nth) {
++    const bool reach = m16 > 0 && (m16 / 16 >= nth);
++    switch (loom_sgemm_policy()) {
++        case 0:  return (m % 16 == 0) && (m / 16 >= nth);
++        case 1:  return m16 > 0 && nth > 1 && (m16 / 16 >= nth);
++        case 2:  return m16 > 0 && nth > 1 && (m16 / 16 >= 2 * nth);
++        case 3:  return m16 > 0 && nth > 1 && (m16 / 16 >= 4 * nth);
++        case 4:  return m16 > 0 && nth > 1 && (m16 / 16 >= 8 * nth);
++        case 5:  return (m % 16 == 0) && nth > 1 && (m / 16 >= nth);
++        case 7:  return reach && ((m % 16 == 0) || (nth > 1 && k <= 512));
++        case 8:  return reach && ((m % 16 == 0) || (nth > 1 && k <= 128));
++        default: return reach && ((m % 16 == 0) || (nth > 1 && k <= 256));
++    }
++}
++
++struct loom_sgemm_key {
++    int64_t m, n, k;
++    int nth, atype;
++    bool operator<(const loom_sgemm_key & o) const {
++        if (m != o.m) return m < o.m;
++        if (n != o.n) return n < o.n;
++        if (k != o.k) return k < o.k;
++        if (nth != o.nth) return nth < o.nth;
++        return atype < o.atype;
++    }
++};
++
++static std::map<loom_sgemm_key, std::pair<long, long>> loom_sgemm_counts;   // key -> (taken, rejected)
++static std::mutex loom_sgemm_mu;
++
++static bool loom_sgemm_census_on() {
++    static int on = -1;
++    if (on < 0) {
++        const char * s = getenv("GGML_SGEMM_CENSUS");
++        on = (s && atoi(s)) ? 1 : 0;
++    }
++    return on == 1;
++}
++
++static void loom_sgemm_census_dump() {
++    std::lock_guard<std::mutex> lock(loom_sgemm_mu);
++    std::fprintf(stderr, "\n=== llamafile_sgemm census (calls seen by ith == 0) ===\n");
++    std::fprintf(stderr, "%8s %8s %8s %5s %6s %10s %10s %14s\n",
++                 "m", "n", "k", "nth", "Atype", "taken", "rejected", "Mflop/call");
++    for (const auto & kv : loom_sgemm_counts) {
++        const double mflop = 2.0 * (double) kv.first.m * (double) kv.first.n * (double) kv.first.k / 1e6;
++        std::fprintf(stderr, "%8lld %8lld %8lld %5d %6d %10ld %10ld %14.3f\n",
++                     (long long) kv.first.m, (long long) kv.first.n, (long long) kv.first.k,
++                     kv.first.nth, kv.first.atype, kv.second.first, kv.second.second, mflop);
++    }
++    std::fprintf(stderr, "=== end census ===\n");
++}
++
++static void loom_sgemm_census(int64_t m, int64_t n, int64_t k, int nth, int atype, bool taken) {
++    std::lock_guard<std::mutex> lock(loom_sgemm_mu);
++    static bool registered = false;
++    if (!registered) { registered = true; atexit(loom_sgemm_census_dump); }
++    auto & e = loom_sgemm_counts[loom_sgemm_key{m, n, k, nth, atype}];
++    (taken ? e.first : e.second)++;
++}
++// ================= end P4.26 measurement probe =================
++
+ 
+ #ifdef _MSC_VER
+ #define NOINLINE __declspec(noinline)
+@@ -558,6 +652,11 @@
+         // Whether to take that prefix when `m` is RAGGED, which is the only thing this patch adds:
+         // an `m` that already divides 16 keeps the schedule it always had. See the `k` rule below.
+         const bool ragged_prefix = (m % 16 != 0) && params->nth > 1 && k <= 256;
++        const bool take_prefix = loom_sgemm_take_prefix(m, m16, k, params->nth);   // P4.26 probe
++        (void) ragged_prefix;
++        if (loom_sgemm_census_on() && params->ith == 0) {
++            loom_sgemm_census(m, n, k, params->nth, (int) sizeof(TA), take_prefix);
++        }
+         // compute RM for only need tile with size RM&RM-1
+ // A 4x6 tile keeps 24 vector accumulators live. That fits aarch64's 32 registers on paper -- with
+ // 4 A-vectors and 1 B-vector the block needs 29 -- but GCC does not allocate it: at -O3 it keeps the
+@@ -652,7 +751,7 @@
+ // See loom.cpp Epic-05 P4.26 and Retro-019.
+ // See loom.cpp Epic-05 P4.22.
+ #if VECTOR_REGISTERS == 32 && !(defined(__ARM_NEON) && defined(__GNUC__) && !defined(__clang__))
+-        if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) {
++        if (take_prefix) {   // P4.26 probe replaces the shipped predicate
+             const int64_t SIZE_N = BLOCK_SIZE<6>(n);
+             mnpack<4, 6, 4>(m16, n, SIZE_N, 12);
+             if (m16 < m)
+@@ -670,7 +769,7 @@
+             return true;
+         }
+ #else  // VECTOR_REGISTERS == 16, or NEON on GCC (see above)
+-        if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) {
++        if (take_prefix) {   // P4.26 probe replaces the shipped predicate
+             const int64_t SIZE_N = BLOCK_SIZE<3>(n);
+             mnpack<4, 3, 4>(m16, n, SIZE_N, 24);
+             if (m16 < m)

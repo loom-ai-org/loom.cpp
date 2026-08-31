@@ -94,6 +94,103 @@ ggml_tensor* mul_mat_kernel_first(ggml_context* ctx, ggml_tensor* kernel_2d, ggm
     return ggml_cont(ctx, ggml_transpose(ctx, result));              // [N*OL, OC]
 }
 
+// ---------------------------------------------------------------------------------------------------
+// FOLDED CONV KERNELS (P4.13) -- how a convolutional model becomes block-quantizable at all
+// ---------------------------------------------------------------------------------------------------
+// ggml lays quantization blocks along ne[0]. For a conv kernel stored the way torch declares it,
+// [K, IC, OC] (1-D) or [KW, KH, IC, OC] (2-D), ne[0] is the KERNEL WIDTH -- 1, 3, 5, 7 -- and no block
+// size divides that. So a conv kernel is not block-quantizable AS STORED, and the operand swap above
+// bought nothing on its own: every kernel cleared the op gate and then failed the shape gate. Measured
+// on vits-piper-en-gb-miro, 0 of its 117 conv kernels aligned for block 32.
+//
+// The exporter therefore FOLDS an eligible kernel's spatial axes into ne[0] before quantizing it --
+// [K, IC, OC] becomes [IC*K, OC], [KW, KH, IC, OC] becomes [IC*KH*KW, OC] -- which is exactly the 2-D
+// shape the mul_mat already reshapes to, so ne[0] becomes IC*K and 114 of those same 117 kernels align
+// (99.99% of the conv BYTES; the three that do not are 1x1x192 duct tape). It does this ONLY for a
+// kernel it is about to block-quantize: an F32 or F16 export keeps the declared 3-D/4-D form and runs
+// precisely the graph it ran before, bit for bit, including the direct-conv lowering below.
+//
+// A FOLDED KERNEL NOW REACHES THAT LOWERING TOO (P4.29). It could not when the fold shipped -- ggml's
+// GGML_OP_CONV_2D read its geometry off the kernel's `ne`, which the fold erases, and took an F32 or
+// F16 kernel besides -- and giving it up, rather than the arithmetic, is where essentially all of a
+// quantized model's 2.08x (x86-64) / 2.13x (Cortex-A72) went. `ggml_conv_2d_direct_packed` is told the geometry instead, and the CPU backend
+// dequantizes the kernel into the scratch buffer its direct sweep already repacks an F32 one into.
+// See the second branch in op_conv_1d.
+//
+// What the fold costs is the geometry, because the shape it erases is the shape the convolution IS.
+// The exporter hands it back on the node instead, as `kernel_k`/`kernel_ic` (CONV_1D) and
+// `kernel_kw`/`kernel_kh`/`kernel_ic` (CONV_2D); OC survives as ne[1]. `folded_kernel_geometry` below
+// reads them, and its absence is what says a kernel is in the declared layout -- NOT the tensor's rank,
+// which cannot tell a folded [IC*K, OC] from a declared [K, IC] with OC left implicit.
+//
+// WHY THIS IS A MODERATE CHANGE AND NOT A REIMPLEMENTATION OF im2col:
+// `ggml_compute_forward_im2col_f32/f16` touch `src1->data` only. `src0` -- the kernel -- is read purely
+// for ne[0]/ne[1] (and ne[2] when is_2D), to size the patch matrix. Confirmed by reading both, and it
+// is the whole reason the op can be handed a kernel whose contents are somewhere else entirely: what
+// im2col needs is a SHAPE, so it is given one.
+//
+// THE SHAPE CARRIER IS THE KERNEL MINUS ITS OC AXIS, WHICH IS WHY IT IS FREE.
+// The obvious carrier is a [K, IC, OC]-shaped tensor, and it is what this item was scoped with -- a
+// graph leaf gallocr has to allocate, ~1.7 MB for VITS's largest kernel. But im2col never reads a->ne[3]
+// and, in the 1-D case, never reads a->ne[2] either: the OC axis is not part of the patch geometry. So
+// the carrier is [K, IC] (1-D) or [KW, KH, IC] (2-D) -- the largest one in VITS is 3x512 floats, 6 KB,
+// and the whole model's carriers together are under a megabyte. Nothing writes it and nothing reads it;
+// it exists to carry four int64s past a signature that takes a tensor.
+struct FoldedKernel {
+    bool folded = false;
+    int64_t kw = 1, kh = 1, ic = 1, oc = 1;
+};
+
+// The fold attrs, validated against BOTH tensors that arrived. Two checks, and the second is the one
+// that matters more than it looks: `data_ic` is the activation's own channel count, and comparing it
+// against the declared IC is what turns a transposed or mis-ordered fold into a named error here
+// instead of a raw GGML_ASSERT inside ggml_im2col -- which is what it aborts with otherwise, with no
+// mention of a kernel, an attr or a model. (Verified by sabotage: swapping `kernel_k` and `kernel_ic`
+// keeps their product equal to ne[0], so the first check passes and only this one catches it.)
+//
+// `is_2D` also decides which spelling is looked for: `kernel_k` for a 1-D convolution,
+// `kernel_kw`/`kernel_kh` for a 2-D one. A 1-D fold declares no KH because it has none, and accepting
+// one silently would let a 2-D export drive a 1-D op.
+FoldedKernel folded_kernel_geometry(const char* op, const ggml_tensor* kernel, const Json& attrs,
+                                     const SymbolEnv& symbols, bool is_2D, int64_t data_ic) {
+    FoldedKernel g;
+    if (!attrs.is_object() || !attrs.contains(is_2D ? "kernel_kw" : "kernel_k")) return g;
+    g.folded = true;
+    g.kw = resolve_attr_int(attrs, is_2D ? "kernel_kw" : "kernel_k", symbols);
+    g.kh = is_2D ? resolve_attr_int(attrs, "kernel_kh", symbols) : 1;
+    g.ic = resolve_attr_int(attrs, "kernel_ic", symbols);
+    g.oc = kernel->ne[1];
+    // A fold that does not multiply back out is a file whose attrs and whose tensor disagree, and the
+    // failure without this check is a wrong-shaped im2col deep inside ggml rather than a named one.
+    if (g.kw < 1 || g.kh < 1 || g.ic < 1 || kernel->ne[0] != g.kw * g.kh * g.ic ||
+        kernel->ne[2] != 1 || kernel->ne[3] != 1) {
+        throw SchemaError(std::string(op) + ": the topology declares a kernel folded to [IC*" +
+                          (is_2D ? "KH*KW" : "K") + ", OC] with K=" + std::to_string(g.kw) +
+                          (is_2D ? ("x" + std::to_string(g.kh)) : "") + " IC=" + std::to_string(g.ic) +
+                          ", which needs ne[0] == " + std::to_string(g.kw * g.kh * g.ic) +
+                          " on a 2-D tensor -- the weight it names is [" +
+                          std::to_string(kernel->ne[0]) + ", " + std::to_string(kernel->ne[1]) + ", " +
+                          std::to_string(kernel->ne[2]) + ", " + std::to_string(kernel->ne[3]) + "]");
+    }
+    if (g.ic != data_ic) {
+        throw SchemaError(std::string(op) + ": the topology declares a folded kernel with IC=" +
+                          std::to_string(g.ic) + " but the activation has " + std::to_string(data_ic) +
+                          " channel(s). The fold hands K and IC back as attrs because folding erased "
+                          "them, so a disagreement here is the attrs, not the data.");
+    }
+    return g;
+}
+
+// A tensor whose ne carries the patch geometry `ggml_im2col` reads off its kernel operand, and nothing
+// else -- see the block comment above for why that is all it has to carry, and why it is small.
+ggml_tensor* im2col_shape_carrier(ggml_context* ctx, const ggml_tensor* kernel, const FoldedKernel& g,
+                                   bool is_2D) {
+    ggml_tensor* carrier = is_2D ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, g.kw, g.kh, g.ic)
+                                 : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, g.kw, g.ic);
+    ggml_format_name(carrier, "%s.geom", kernel->name);
+    return carrier;
+}
+
 Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("CONV_1D", in, 2);
     ggml_tensor* kernel = in[0];
@@ -101,6 +198,7 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+    const FoldedKernel fold = folded_kernel_geometry("CONV_1D", kernel, attrs, pc.symbols, /*is_2D=*/false, data->ne[1]);
 
     // ggml_compute_forward_im2col asserts its `data` operand's fastest-varying axis is densely packed
     // (nb[0] == sizeof(float)) -- true for most producers, but not for a channel-split VIEW feeding
@@ -144,7 +242,12 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // has none of them. Both directions are expected to pass, because the two lowerings agree bit for
     // bit.
 #if LOOM_CONV1D_DIRECT
-    if (!conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel) &&
+    // `!fold.folded` is not implied by the dtype test beside it and is not redundant: a folded kernel
+    // has lost the [KW, KH, IC, OC] shape ggml_conv_2d_direct reads its geometry from, and the fold is
+    // the exporter's decision rather than this op's, so it is checked rather than inferred. In practice
+    // only a block-quantized kernel is ever folded, and that one is excluded twice over -- and then
+    // caught by the branch immediately below, which is the same lowering told the geometry.
+    if (!fold.folded && !conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel) &&
         (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
         const int64_t IC = kernel->ne[1], OC = kernel->ne[2], K = kernel->ne[0];
         const int64_t IL = data->ne[0], N = data->ne[2];   // ggml never leaves an axis at 0; [IL,IC,N]
@@ -154,15 +257,52 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
         ggml_tensor* conv = ggml_conv_2d_direct(pc.ctx, kernel_4d, data_4d, s0, 1, p0, 0, d0, 1);
         return {ggml_reshape_3d(pc.ctx, conv, conv->ne[0], OC, N)};               // [OL, OC, N]
     }
+
+    // ... AND THE SAME LOWERING FOR A FOLDED, BLOCK-QUANTIZED KERNEL (BACKLOG P4.29).
+    //
+    // Everything the branch above buys is what quantizing a convolutional model used to give up, and
+    // that is where essentially all of the 2.08x (x86-64) / 2.13x (Cortex-A72) cost of quantizing one
+    // lived -- not in the arithmetic. Measured on a VITS vocoder, one synthesis, interleaved A-B-B-A:
+    // the direct sweep alone is worth 1.46x / 1.33x, and ggml's batching plus the three CONV_2D
+    // fusions the other 1.07x. A quantized kernel could reach none of it, because GGML_OP_CONV_2D took
+    // an F32 or F16 kernel and a folded one carries no geometry on its `ne` at all.
+    //
+    // ggml-0013 fixes both halves: `ggml_conv_2d_direct_packed` is told the geometry the fold erased,
+    // and the CPU backend dequantizes the kernel into the scratch buffer its direct sweep already
+    // repacks an F32 one into -- so from that point down a quantized convolution executes the SAME
+    // instructions as an F32 one, and the expected end state is F32 speed plus the dequantize (+1.8 ms
+    // on a ~500 ms synthesis, measured over all 59.5 MB of that model's conv weights at once).
+    //
+    // ASKED rather than assumed, which is the P4.7e pattern: this is a CPU-only arrangement today. A
+    // Vulkan or CUDA backend declines the node -- neither can read a folded kernel, and saying so is
+    // part of the same patch -- and the graph keeps the im2col + `mul_mat_kernel_first` lowering below,
+    // which is what those backends already run with zero fallback nodes.
+    if (fold.folded && fold.kh == 1 && conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel)) {
+        const int64_t IL = data->ne[0], N = data->ne[2];
+        GGML_ASSERT(data->ne[1] == fold.ic && data->ne[3] == 1);
+        ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, IL, 1, fold.ic, N);   // [W, H=1, C, N]
+        ggml_tensor* conv = ggml_conv_2d_direct_packed(pc.ctx, kernel, data_4d, s0, 1, p0, 0, d0, 1,
+                                                       static_cast<int>(fold.kw), 1,
+                                                       static_cast<int>(fold.ic));
+        if (backend_can_run(pc, conv)) {
+            return {ggml_reshape_3d(pc.ctx, conv, conv->ne[0], fold.oc, N)};       // [OL, OC, N]
+        }
+    }
 #endif
 
-    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, conv_im2col_type(kernel)); // [IC*K, OL, N]
+    // A folded kernel IS the [IC*K, OC] matrix this recipe reshapes to, so it skips the reshape and
+    // hands im2col a shape carrier instead of itself; an unfolded one is reshaped exactly as before.
+    ggml_tensor* im2col_src = fold.folded ? im2col_shape_carrier(pc.ctx, kernel, fold, /*is_2D=*/false) : kernel;
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, im2col_src, data, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, conv_im2col_type(kernel)); // [IC*K, OL, N]
     ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]); // [IC*K, N*OL]
-    ggml_tensor* kernel_2d = ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]); // [IC*K, OC]
-    ggml_tensor* result = conv_kernel_is_packed(kernel)
+    ggml_tensor* kernel_2d = fold.folded
+        ? kernel
+        : ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]);      // [IC*K, OC]
+    const int64_t oc = fold.folded ? fold.oc : kernel->ne[2];
+    ggml_tensor* result = (fold.folded || conv_kernel_is_packed(kernel))
         ? mul_mat_kernel_first(pc.ctx, kernel_2d, im2col_2d)
         : ggml_mul_mat(pc.ctx, im2col_2d, kernel_2d);                                         // [N*OL, OC]
-    result = ggml_reshape_3d(pc.ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);    // [OL, OC, N]
+    result = ggml_reshape_3d(pc.ctx, result, im2col->ne[1], oc, im2col->ne[2]);               // [OL, OC, N]
     return {result};
 }
 
@@ -176,15 +316,20 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int p1 = static_cast<int>(resolve_attr_int(attrs, "p1", pc.symbols));
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
     const int d1 = static_cast<int>(resolve_attr_int(attrs, "d1", pc.symbols));
+    const FoldedKernel fold = folded_kernel_geometry("CONV_2D", kernel, attrs, pc.symbols, /*is_2D=*/true, data->ne[2]);
 
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
-    ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, conv_im2col_type(kernel)); // [IC*KH*KW, OW, OH, N]
+    ggml_tensor* im2col_src = fold.folded ? im2col_shape_carrier(pc.ctx, kernel, fold, /*is_2D=*/true) : kernel;
+    ggml_tensor* im2col = ggml_im2col(pc.ctx, im2col_src, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, conv_im2col_type(kernel)); // [IC*KH*KW, OW, OH, N]
     ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]); // [IC*KH*KW, N*OH*OW]
-    ggml_tensor* kernel_2d = ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]); // [IC*KH*KW, OC]
-    ggml_tensor* result = conv_kernel_is_packed(kernel)
+    ggml_tensor* kernel_2d = fold.folded
+        ? kernel
+        : ggml_reshape_2d(pc.ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]); // [IC*KH*KW, OC]
+    const int64_t oc = fold.folded ? fold.oc : kernel->ne[3];
+    ggml_tensor* result = (fold.folded || conv_kernel_is_packed(kernel))
         ? mul_mat_kernel_first(pc.ctx, kernel_2d, im2col_2d)
         : ggml_mul_mat(pc.ctx, im2col_2d, kernel_2d);                                                          // [N*OH*OW, OC]
-    result = ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], kernel->ne[3]);       // [OW, OH, N, OC]
+    result = ggml_reshape_4d(pc.ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], oc);                  // [OW, OH, N, OC]
     result = ggml_cont(pc.ctx, ggml_permute(pc.ctx, result, 0, 1, 3, 2));                                        // [OW, OH, OC, N]
     return {result};
 }

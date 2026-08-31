@@ -5,9 +5,15 @@
 // per-machine question and has to stay re-runnable on the next machine.
 //
 //   g++ -O3 -std=c++17 -I include -I tests/support -I build/_deps/ggml-src/include \
+//       -I build/_deps/nlohmann_json-src/include \
 //       scripts/bench_vits_loom.cpp -o bench_vits_loom -L build -lloom_engine \
 //       -L build/_deps/ggml-build/src -lggml -lggml-base -lpthread
-//   ./bench_vits_loom <dir-with-vits_mil.gguf> [nrun]
+//
+// The nlohmann include is not optional and was missing from this line until someone tried to use it:
+// loom.h reaches graph_topology.h, which includes <nlohmann/json.hpp>. On macOS, swap `g++` for
+// `clang++`, drop `-lpthread`, and add `-Wl,-rpath,<abs build dir>` twice -- once for libloom_engine
+// and once for _deps/ggml-build/src -- since there is no LD_LIBRARY_PATH equivalent that survives.
+//   ./bench_vits_loom <dir-with-vits_mil.gguf || path.gguf> [nrun] [device]   # device defaults to cpu
 //
 // THE PINNING IS THE POINT, and it is bench_onnx.py's point too: VITS's duration predictor is
 // stochastic, both engines are near-linear in output samples, and an unpinned comparison times two
@@ -18,13 +24,27 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
+// The audio's identity, printed beside the timing, so a SCHEDULING change (a thread count, a job
+// split, a fusion) can be shown not to have moved a bit rather than argued not to have. Two runs that
+// disagree here are not two measurements of the same thing, whatever their sample counts say.
+static uint64_t fnv1a(const std::vector<double>& v) {
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(v.data());
+    for (size_t i = 0; i < v.size() * sizeof(double); ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s <dir> [nrun]\n", argv[0]); return 2; }
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: %s <dir-or-gguf> [nrun] [device]\n", argv[0]);
+        return 2;
+    }
     const std::string dir = argv[1];
     const int nrun = argc > 2 ? std::atoi(argv[2]) : 9;
 
@@ -37,10 +57,25 @@ int main(int argc, char** argv) {
 
     // Device::open rather than a bare CPU backend, because that is what applies $LOOM_N_THREADS --
     // ggml's own default is 4 whatever the machine has, so a bare backend cannot be asked for 24.
-    loom::Device device = loom::Device::open("cpu");
+    //
+    // The device is an ARGUMENT, defaulting to "cpu" so every existing invocation means what it did.
+    // It is here because "which device is faster for this model" turned out to be a per-MODEL
+    // question and not only a per-machine one: on an M1 Pro, Metal is 2.69x faster than the CPU on
+    // whisper-small and 5.24x SLOWER on this file, because 21 of its `PAD` nodes have a nonzero
+    // leading pad that ggml-metal declines, splitting the graph 27 ways onto the CPU (P4.11).
+    // Run it with GGML_SCHED_DEBUG=1 and count `## SPLIT` lines per backend before believing a
+    // timing -- a first measurement on a new backend measures how much of the graph fell back.
+    const std::string dev_spec = argc > 3 ? argv[3] : "cpu";
+    loom::Device device = loom::Device::open(dev_spec);
+    std::fprintf(stderr, "device: %s (%s)\n", device.name().c_str(), device.description().c_str());
     loom::Backends backends = device.backends();
 
-    auto model = loom::GgufModel::load(dir + "/vits_mil.gguf", backends.primary);
+    // A directory (the original contract, `<dir>/vits_mil.gguf`) or a .gguf path directly -- the
+    // second because the file this now gets pointed at is usually an exported `vits-f32-dyn.gguf`
+    // sitting beside other models rather than a directory of one.
+    const std::string model_path =
+        dir.size() > 5 && dir.compare(dir.size() - 5, 5, ".gguf") == 0 ? dir : dir + "/vits_mil.gguf";
+    auto model = loom::GgufModel::load(model_path, backends.primary);
     if (!model) { std::fprintf(stderr, "load failed\n"); return 1; }
 
     loom::LoomLuaBridge bridge(backends);
@@ -49,6 +84,7 @@ int main(int argc, char** argv) {
                            loom::GraphTopology::parse(model->topology_json("flow_vocoder")));
     bridge.load_script(model->kv_str("model.driver_script"));
 
+    std::vector<double> last_audio;
     auto once = [&]() {
         loom::LoomLuaBridge::Value r = bridge.call("infer", {
             {"token_ids", token_ids},
@@ -57,10 +93,12 @@ int main(int argc, char** argv) {
             {"length_scale", 1.0},         //                 scales[1]
             {"noise_scale_w", 0.0},        //                 scales[2]
         });
-        return std::get<std::vector<double>>(r).size();
+        last_audio = std::get<std::vector<double>>(r);
+        return last_audio.size();
     };
 
     const size_t n_samples = once();        // warm: first call builds the graphs
+    const uint64_t digest = fnv1a(last_audio);
     std::vector<double> ts;
     for (int i = 0; i < nrun; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -68,7 +106,8 @@ int main(int argc, char** argv) {
         ts.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     std::sort(ts.begin(), ts.end());
-    std::printf("loom   vits  samples=%zu  median %.4f s  min %.4f s  (n=%d)\n",
-                n_samples, ts[ts.size()/2], ts.front(), nrun);
+    std::printf("loom   vits  [%s]  samples=%zu  fnv1a=%016llx  median %.4f s  min %.4f s  (n=%d)\n",
+                dev_spec.c_str(), n_samples, static_cast<unsigned long long>(digest),
+                ts[ts.size()/2], ts.front(), nrun);
     return 0;
 }

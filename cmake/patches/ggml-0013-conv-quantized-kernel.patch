@@ -1,0 +1,260 @@
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2187,6 +2187,36 @@
+             int                   d0,  // dilation dimension 0
+             int                   d1); // dilation dimension 1
+ 
++    // As ggml_conv_2d_direct, but for a kernel whose spatial and input-channel axes have been FOLDED
++    // into ne[0] -- [IC*KH*KW, OC] rather than [KW, KH, IC, OC].
++    //
++    // That fold is what makes a convolution kernel block-quantizable at all: quantization blocks are
++    // laid along ne[0], and for a declared kernel ne[0] is the KERNEL WIDTH -- 1, 3, 5, 7 -- which no
++    // block size divides. Folded, ne[0] is IC*KH*KW and it does. What the fold costs is the geometry,
++    // because the shape it erases is the shape the convolution IS, so it is passed here instead of
++    // being read off `a->ne`.
++    //
++    // The kernel may therefore be of any type with a `to_float`. The CPU backend dequantizes it once
++    // per call into the scratch buffer its direct sweep already repacks an F32 kernel into, so every
++    // lowering below that point is the F32 lowering -- see ggml_compute_forward_conv_2d_impl. Other
++    // backends decline a node built this way and it falls back, which is what their supports_op says.
++    //
++    // Dequantizing PER CALL is right for a convolution that runs once per utterance (a TTS vocoder, an
++    // ASR encoder) and wrong for one inside a decode loop, where it would be paid per token.
++    GGML_API struct ggml_tensor * ggml_conv_2d_direct_packed(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,   // convolution kernel [IC*KH*KW, OC]
++            struct ggml_tensor  * b,   // input data [W, H, C, N]
++            int                   s0,  // stride dimension 0
++            int                   s1,  // stride dimension 1
++            int                   p0,  // padding dimension 0
++            int                   p1,  // padding dimension 1
++            int                   d0,  // dilation dimension 0
++            int                   d1,  // dilation dimension 1
++            int                   kw,  // the folded kernel width
++            int                   kh,  // the folded kernel height (1 for a 1-D convolution)
++            int                   ic); // the folded input-channel count
++
+     GGML_API struct ggml_tensor * ggml_conv_3d_direct(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,   // kernel [KW, KH, KD, IC * OC]
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4885,6 +4885,58 @@
+     return result;
+ }
+ 
++// ggml_conv_2d_direct_packed
++
++struct ggml_tensor * ggml_conv_2d_direct_packed(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,   // convolution kernel [IC*KH*KW, OC]
++        struct ggml_tensor  * b,   // input data [W, H, C, N]
++        int                   s0,
++        int                   s1,
++        int                   p0,
++        int                   p1,
++        int                   d0,
++        int                   d1,
++        int                   kw,
++        int                   kh,
++        int                   ic) {
++
++    // The geometry is CHECKED against the tensor rather than trusted, because a folded [IC*KH*KW, OC]
++    // and a declared [KW, KH, IC] are indistinguishable by shape: a disagreement here is a wrong
++    // convolution computed silently, everywhere else.
++    GGML_ASSERT(kw > 0 && kh > 0 && ic > 0);
++    GGML_ASSERT(a->ne[0] == (int64_t) kw * kh * ic);
++    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
++    GGML_ASSERT(ic == b->ne[2]);
++    GGML_ASSERT(ggml_is_contiguous(a));
++
++    int64_t ne[4];
++    ne[0] = ggml_calc_conv_output_size(b->ne[0], kw, s0, p0, d0);
++    ne[1] = ggml_calc_conv_output_size(b->ne[1], kh, s1, p1, d1);
++    ne[2] = a->ne[1];   // OC, the one axis the fold leaves alone
++    ne[3] = b->ne[3];
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, b->type, 4, ne);
++
++    ggml_set_op_params_i32(result, 0, s0);
++    ggml_set_op_params_i32(result, 1, s1);
++    ggml_set_op_params_i32(result, 2, p0);
++    ggml_set_op_params_i32(result, 3, p1);
++    ggml_set_op_params_i32(result, 4, d0);
++    ggml_set_op_params_i32(result, 5, d1);
++    // 6..8 are the fold, and their ABSENCE (a zero kw, which ggml_new_tensor zeroes op_params to) is
++    // what says a kernel is in the declared layout. GGML_MAX_OP_PARAMS is 64 bytes; this uses 36.
++    ggml_set_op_params_i32(result, 6, kw);
++    ggml_set_op_params_i32(result, 7, kh);
++    ggml_set_op_params_i32(result, 8, ic);
++
++    result->op = GGML_OP_CONV_2D;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
+ // ggml_conv_3d_direct
+ 
+ struct ggml_tensor * ggml_conv_3d_direct(
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -7687,6 +7687,48 @@
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// A QUANTIZED CONVOLUTION KERNEL, AND WHY IT COSTS ONE DEQUANTIZE AND NOTHING ELSE
++//
++// ggml lays quantization blocks along ne[0]. For a conv kernel stored the way it is declared --
++// [KW, KH, IC, OC] -- ne[0] is the kernel WIDTH, 1, 3, 5 or 7, and no block size divides that. So a
++// producer that wants a block-quantized convolution folds the kernel's spatial and input-channel axes
++// into ne[0] first, giving [IC*KH*KW, OC], and hands the erased geometry back on the node
++// (ggml_conv_2d_direct_packed, op_params 6..8). A folded kernel and a declared one are then
++// indistinguishable by shape, which is why the geometry is READ rather than inferred.
++//
++// What makes this cheap is that the direct sweep below never reads the kernel as stored: it repacks
++// the whole thing into an F32 scratch buffer (`wp`) before computing anything, and the register-tiled
++// inner kernel reads only that. So a quantized kernel needs no quantized inner loop, no vec_dot and no
++// activation quantized to vec_dot_type -- it needs ONE dequantize into a buffer of the same shape, and
++// everything below is untouched: the direct sweep, the phase-major variant, the batched im2col
++// fallback, the bias/leaky/residual fusions, the thread splits.
++//
++// It is also more accurate than a quantized dot would be: dequantize-then-F32-FMA against a Q8_0
++// activation dot. And it costs, over ALL 59.5 MB of a VITS vocoder's convolution weights at once,
++// 10.3 ms against the 8.5 ms F32 pack it replaces -- +1.8 ms on a ~500 ms synthesis (scripts/bench21.c
++// in the loom tree). The pack loop reads LESS memory in the quantized case (8.4 MB of Q4_0 rather than
++// 59.5 MB of F32) and writes the same amount, so the delta is arithmetic rather than traffic.
++//
++// The one thing it is NOT right for is a convolution inside a decode loop, where the dequantize would
++// be paid per token rather than per utterance. Nothing in ggml routes SSM_CONV here.
++
++// The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
++// `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
++static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
++                                         int64_t * kw, int64_t * kh, int64_t * ic, int64_t * oc) {
++    const int32_t pkw = ggml_get_op_params_i32(dst, 6);
++    if (pkw <= 0) {
++        *kw = kernel->ne[0]; *kh = kernel->ne[1]; *ic = kernel->ne[2]; *oc = kernel->ne[3];
++        return false;
++    }
++    *kw = pkw;
++    *kh = ggml_get_op_params_i32(dst, 7);
++    *ic = ggml_get_op_params_i32(dst, 8);
++    *oc = kernel->ne[1];                      // the axis the fold leaves alone
++    return true;
++}
++
+ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
+                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
+                                               const ggml_tensor *         src,     // [W, H, C, N]
+@@ -7708,9 +7750,58 @@
+                                               const float *               res_data  = nullptr) {
+ 
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+-    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
+     GGML_ASSERT(kernel->type == kernel_type);
+ 
++    // A QUANTIZED KERNEL IS DEQUANTIZED ONCE, HERE, AND NOTHING BELOW EVER KNOWS -- see the block
++    // comment above this function. The re-entry is what keeps that claim true rather than approximately
++    // true: the rest of this function is handed a tensor that IS an ordinary contiguous F32 kernel in
++    // the declared layout, so every predicate below (the direct path's cache budget included) prices it
++    // by its DEQUANTIZED size, which is the size that is actually read.
++    if (ggml_is_quantized(kernel_type)) {
++        int64_t kw, kh, ic, oc;
++        ggml_conv_2d_packed_geometry(dst, kernel, &kw, &kh, &ic, &oc);
++        const ggml_type_traits * kt = ggml_get_type_traits(kernel_type);
++        GGML_ASSERT(kt->to_float != NULL);
++        GGML_ASSERT(kw * kh * ic * oc == ggml_nelements(kernel));
++
++        // Off the FRONT of the work buffer, with everything below given what is left -- so the two
++        // users of `wdata` (this and the padded activation copy / packed weights / im2col patches)
++        // cannot overlap by construction rather than by an accounting agreement. ggml_cpu.c sizes the
++        // buffer for both; see its GGML_OP_CONV_2D case.
++        const size_t kbytes = GGML_PAD((size_t) kw * kh * ic * oc * sizeof(float), 64);
++        GGML_ASSERT(kbytes < params->wsize);
++
++        float *       kbuf   = (float *) params->wdata;
++        const int64_t nrows  = ggml_nrows(kernel);
++        const int64_t rowlen = kernel->ne[0];
++        for (int64_t r = params->ith; r < nrows; r += params->nth) {
++            kt->to_float((const char *) kernel->data + r * kernel->nb[1], kbuf + r * rowlen, rowlen);
++        }
++        ggml_barrier(params->threadpool);
++
++        // The fold is a pure REINTERPRETATION of the stored order: element (kx, ky, ic, oc) sits at
++        // oc*(IC*KH*KW) + ic*(KH*KW) + ky*KW + kx either way. So the dequantized buffer, read with the
++        // declared strides, IS the declared kernel -- no permutation, no second pass.
++        ggml_tensor kdq = *kernel;
++        kdq.type  = GGML_TYPE_F32;
++        kdq.ne[0] = kw; kdq.ne[1] = kh; kdq.ne[2] = ic; kdq.ne[3] = oc;
++        kdq.nb[0] = sizeof(float);
++        kdq.nb[1] = kdq.nb[0] * kw;
++        kdq.nb[2] = kdq.nb[1] * kh;
++        kdq.nb[3] = kdq.nb[2] * ic;
++        kdq.data  = kbuf;
++
++        ggml_compute_params p = *params;
++        p.wdata = (char *) params->wdata + kbytes;
++        p.wsize = params->wsize - kbytes;
++
++        ggml_compute_forward_conv_2d_impl(&p, &kdq, src, dst, GGML_TYPE_F32,
++                                          bias_data, out_data, in_data, leaky, res_data);
++        return;
++    }
++
++    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
++
+     const ggml_type_traits * traits = ggml_get_type_traits(kernel_type);
+ 
+     const int32_t stride_x   = dst->op_params[0];
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -2924,6 +2924,13 @@
+                 case GGML_OP_CONV_3D:
+                     {
+                         cur = GGML_IM2COL_WORK_SIZE;
++                        // A QUANTIZED KERNEL IS DEQUANTIZED INTO THE FRONT OF THIS BUFFER, once per
++                        // call, and everything below that point then runs the F32 lowering out of what
++                        // is left -- so the buffer has to hold BOTH, and this is the only place that
++                        // can say so. See ggml_compute_forward_conv_2d_impl.
++                        if (ggml_is_quantized(node->src[0]->type)) {
++                            cur += GGML_PAD(ggml_nelements(node->src[0]) * sizeof(float), 64);
++                        }
+                     } break;
+                 case GGML_OP_CONV_TRANSPOSE_2D:
+                     {
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -470,7 +470,13 @@
+                     ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
+                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_2D:
+-            return ggml_is_contiguous(op->src[0]);
++            // A QUANTIZED KERNEL IS LEGAL HERE, and on this backend only: it is dequantized into the
++            // work buffer before either lowering runs (ggml_compute_forward_conv_2d_impl). All it has
++            // to have is a `to_float`. Saying so is what lets a scheduler place such a node, and the
++            // device backends declining it is what keeps it off them.
++            return ggml_is_contiguous(op->src[0]) &&
++                   (!ggml_is_quantized(op->src[0]->type) ||
++                    ggml_get_type_traits(op->src[0]->type)->to_float != NULL);
+         default:
+             return true;
+     }
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -5109,7 +5109,12 @@
+         case GGML_OP_IM2COL:
+         case GGML_OP_IM2COL_3D:
+         case GGML_OP_CONV_2D:
+-            return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
++            // NOT a quantized or axis-folded kernel: this backend reads the convolution's geometry
++            // straight off src0->ne and its weights as stored, where the CPU backend reads the geometry
++            // from op_params 6..8 and dequantizes. Both of those are silent wrong answers here rather
++            // than failures, so they are declined and the node falls back.
++            return !ggml_is_quantized(op->src[0]->type) && ggml_get_op_params_i32(op, 6) == 0 &&
++                   (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+         case GGML_OP_CONV_2D_DW:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_TRANSPOSE_2D:

@@ -33,11 +33,20 @@ void print_usage(const char* argv0) {
                   "[--task transcribe|translate] [--timestamps] "
                   "[--no-condition-on-previous]\n"
                   "\n"
+                  "  --chat                        wrap --prompt in the model's own chat template\n"
+                  "  --system <text>               a system turn ahead of it (implies --chat)\n"
+                  "  --temperature F --top-k N --top-p F   sample instead of taking the argmax;\n"
+                  "                                omitted, each falls back to what the checkpoint\n"
+                  "                                declared, which for most models is greedy\n"
+                  "  --seed N                      make a sampled generation reproducible\n"
+                  "\n"
                   "  --device <auto|cpu|gpu|NAME>  where to run (default: auto, or $LOOM_DEVICE)\n"
                   "  --list-devices                print the devices this build can reach, and exit\n"
                   "\n"
                   "  $LOOM_PROFILE=1               time every graph node and print a per-op breakdown\n"
                   "  $LOOM_PROFILE=<path>          ... to a file instead of stderr\n"
+                  "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
+                  "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
                   argv0, argv0);
 }
@@ -136,9 +145,13 @@ int main(int argc, char** argv) {
     std::string task_name;
     bool timestamps = false;
     bool condition_on_previous = true;
+    std::string system_text;
     bool has_prompt = false;
     bool has_wav = false;
+    bool chat = false;
+    bool has_system = false;
     uint32_t n_predict = 16;
+    loom::text::GenerateOptions gen_opts;
     std::string device_spec;
     bool list_devices = false;
 
@@ -166,6 +179,25 @@ int main(int argc, char** argv) {
             // lets a repetition loop persist across one. With greedy decoding and no temperature
             // fallback to break out of such a loop, an off switch is the only recovery.
             condition_on_previous = false;
+        } else if (arg == "--chat") {
+            // Wraps --prompt in the checkpoint's own chat template (P4.23). A flag rather than the
+            // default because a base model has no template and an un-templated prompt is a legitimate
+            // thing to ask an instruction-tuned one for -- but a flag that could only produce the
+            // wrong answer would be worse than no flag, which is why this shipped with the tokenizer
+            // fix and not before it.
+            chat = true;
+        } else if (arg == "--system" && i + 1 < argc) {
+            system_text = argv[++i];
+            has_system = true;
+            chat = true;
+        } else if (arg == "--temperature" && i + 1 < argc) {
+            gen_opts.temperature = std::stof(argv[++i]);
+        } else if (arg == "--top-k" && i + 1 < argc) {
+            gen_opts.top_k = static_cast<int32_t>(std::stol(argv[++i]));
+        } else if (arg == "--top-p" && i + 1 < argc) {
+            gen_opts.top_p = std::stof(argv[++i]);
+        } else if (arg == "--seed" && i + 1 < argc) {
+            gen_opts.seed = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--n-predict" && i + 1 < argc) {
             n_predict = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--device" && i + 1 < argc) {
@@ -284,8 +316,27 @@ int main(int argc, char** argv) {
                 bpe_vocab = loom::BpeVocab::load(*model);
             }
 
+            // The chat template and the tokenizer are one feature, not two: the template's markers are
+            // ADDED tokens, and a vocabulary that cannot emit those atomically turns each of them into
+            // seven literal ids (P4.23). So this path exists only where `bpe_vocab` does.
+            std::string effective_prompt = prompt_text;
+            if (chat) {
+                auto tmpl = loom::ChatTemplate::load(*model);
+                if (!tmpl) {
+                    std::fprintf(stderr, "error: --chat, but this model carries no chat template. A "
+                                          "base model has none, and one whose template could not be "
+                                          "reduced to role tags exports without it -- see the export's "
+                                          "own \"no chat template\" line.\n");
+                    return 1;
+                }
+                std::vector<loom::ChatMessage> messages;
+                if (has_system) messages.push_back({"system", system_text});
+                messages.push_back({"user", prompt_text});
+                effective_prompt = tmpl->apply(messages, /*add_generation_prompt=*/true);
+            }
+
             const std::vector<int32_t> prompt_tokens =
-                bpe_vocab ? bpe_vocab->encode(prompt_text) : parse_token_ids(prompt_text);
+                bpe_vocab ? bpe_vocab->encode(effective_prompt) : parse_token_ids(effective_prompt);
             if (prompt_tokens.empty()) {
                 std::fprintf(stderr, "error: --prompt produced no token ids\n");
                 return 1;
@@ -302,7 +353,7 @@ int main(int argc, char** argv) {
                 loom::Session session(*model, backends);
 
                 std::printf("Running dynamic GGUF generation for %d tokens...\n", n_predict);
-                loom::text::GenerateOptions gen;
+                loom::text::GenerateOptions gen = gen_opts;
                 gen.max_new_tokens = n_predict;
                 const std::vector<int32_t> generated =
                     loom::text::generate(session.bridge(), *model, prompt_tokens, gen);

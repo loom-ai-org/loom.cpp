@@ -125,6 +125,14 @@ add_test(NAME test_e2e_spm_byte_fallback_tokenizer COMMAND test_e2e_spm_byte_fal
 set_tests_properties(test_e2e_spm_byte_fallback_tokenizer PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_spm_byte_fallback_tokenizer PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- P4.23: the whole item end to end on a real IT checkpoint -- templated, tokenized, and stopping
+#     where the checkpoint says a turn stops. Generic over any GGUF carrying a chat template.
+add_executable(test_e2e_chat_generation gate/test_e2e_chat_generation.cpp)
+target_link_libraries(test_e2e_chat_generation PRIVATE loom::engine)
+add_test(NAME test_e2e_chat_generation COMMAND test_e2e_chat_generation)
+set_tests_properties(test_e2e_chat_generation PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_chat_generation PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_short_conv_state ci/test_short_conv_state.cpp)
 target_link_libraries(test_short_conv_state PRIVATE loom::engine)
 add_test(NAME test_short_conv_state COMMAND test_short_conv_state)
@@ -180,6 +188,15 @@ add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# --- P4.24: loom.sample_row, on the same toy fixture -- 6 classes wide, which is what makes "every
+#     class is eventually drawn" a statement a test can make.
+add_executable(test_sample_row ci/test_sample_row.cpp)
+target_link_libraries(test_sample_row PRIVATE loom::engine)
+target_compile_definitions(test_sample_row PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_sample_row COMMAND test_sample_row)
+set_tests_properties(test_sample_row PROPERTIES LABELS ci)
+set_tests_properties(test_sample_row PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 # Registered TWICE against one binary, differing only in ENVIRONMENT: `profile::enabled()` caches its
 # answer on first call, so a single process can only ever observe one of the two routes through
 # GraphBuilder::compute, and the branch being stuck in either direction is a real failure (one makes
@@ -197,6 +214,14 @@ add_test(NAME test_profile_enabled COMMAND test_profile)
 set_tests_properties(test_profile_enabled PROPERTIES LABELS ci)
 set_tests_properties(test_profile_enabled PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 set_tests_properties(test_profile_enabled PROPERTIES ENVIRONMENT "LOOM_PROFILE=1")
+
+# A THIRD registration, for `$LOOM_PROFILE_NODES` -- cached on first call like the other two, so it
+# needs its own process to be observed. The two above run with it unset and assert the finer table is
+# empty; this one asserts it is populated and accounts for exactly the same node executions.
+add_test(NAME test_profile_nodes COMMAND test_profile)
+set_tests_properties(test_profile_nodes PROPERTIES LABELS ci)
+set_tests_properties(test_profile_nodes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+set_tests_properties(test_profile_nodes PROPERTIES ENVIRONMENT "LOOM_PROFILE=1;LOOM_PROFILE_NODES=1")
 
 # Registered TWICE, differing only in ENVIRONMENT, for the same reason test_profile is: ggml reads
 # GGML_CPU_DISABLE_FUSION once, on first use, so one process can only observe one of the two paths.
@@ -578,6 +603,34 @@ add_test(NAME test_bpe_vocab COMMAND test_bpe_vocab)
 set_tests_properties(test_bpe_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_bpe_vocab PROPERTIES
     FIXTURES_REQUIRED "bpe_vocab_gguf_fixture;bpe_vocab_gpt2_gguf_fixture;bpe_vocab_poro_gguf_fixture")
+
+# --- P4.23: the added-token pre-pass and the chat template it exists for. Two files from one
+#     generator -- with and without `tokenizer.ggml.token_type` -- because the backward-compatibility
+#     claim (a pre-P4.23 GGUF tokenizes exactly as it did) is only a claim until both are compared.
+add_test(
+    NAME gen_chat_template_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_chat_template_gguf.py
+            ${LOOM_FIXTURE_DIR}/chat_template_test.gguf
+)
+set_tests_properties(gen_chat_template_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_chat_template_gguf_fixture PROPERTIES FIXTURES_SETUP chat_template_gguf_fixture)
+
+add_test(
+    NAME gen_chat_template_legacy_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_chat_template_gguf.py
+            ${LOOM_FIXTURE_DIR}/chat_template_legacy_test.gguf --no-token-type
+)
+set_tests_properties(gen_chat_template_legacy_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_chat_template_legacy_gguf_fixture PROPERTIES
+    FIXTURES_SETUP chat_template_legacy_gguf_fixture)
+
+add_executable(test_chat_template ci/test_chat_template.cpp)
+target_link_libraries(test_chat_template PRIVATE loom::engine)
+target_compile_definitions(test_chat_template PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_chat_template COMMAND test_chat_template)
+set_tests_properties(test_chat_template PROPERTIES LABELS ci)
+set_tests_properties(test_chat_template PROPERTIES
+    FIXTURES_REQUIRED "chat_template_gguf_fixture;chat_template_legacy_gguf_fixture")
 
 # --- EXPORT-BACKLOG.md item 4: WordPieceVocab (BERT-family), synthetic fixture with hand-traceable
 #     "##"-continuation split, punctuation isolation, [UNK] fallback, accents, CLS/SEP wrap ---

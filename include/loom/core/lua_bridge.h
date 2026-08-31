@@ -56,10 +56,17 @@ class OutputStore;
 //
 // Model adaptation -- does NOT belong here, and belongs in the exporter instead:
 //   * anything whose behaviour branches on which model is running;
-//   * anything that encodes a family's orchestration (a sampler, a decode loop, a phase ordering).
-//     These are Lua, and the hard cases already are: the CFM Euler loop, the ADPM2 diffusion sampler
-//     and BiLSTM stepping all run as driver script today. If ADPM2 did not need C++, essentially no
-//     orchestration shape does.
+//   * anything that encodes a family's orchestration (a sampling LOOP, a decode loop, a phase
+//     ordering). These are Lua, and the hard cases already are: the CFM Euler loop, the ADPM2
+//     diffusion sampler and BiLSTM stepping all run as driver script today. If ADPM2 did not need
+//     C++, essentially no orchestration shape does.
+//
+//     Read that as it is written -- an orchestration, a LOOP over steps -- and not as "nothing named
+//     sampler". `loom.sample_row` (P4.24) is a REDUCTION over one row of a tensor, the same shape as
+//     `loom.argmax_row`: it reads no model config, every knob is a call argument, two unrelated
+//     families could use it unchanged, and its input cannot cross the boundary at all (Retro-004: a
+//     262144-wide row overflows LuaJIT's array part). The token-by-token decode loop AROUND it is
+//     still Lua, in the driver, where every other family's orchestration is.
 //
 // The two bindings that look family-specific, labelled against the criterion (both were reviewed and
 // KEPT on 2026-08-01; see their declarations below for the per-binding argument):
@@ -133,6 +140,11 @@ public:
     bool has_function(const std::string& fn_name) const;
 
     Value call(const std::string& fn_name, const std::unordered_map<std::string, Value>& args);
+
+    // Reseeds the shared RNG from C++, the same door `loom.seed_rng` gives a driver script -- so a HOST
+    // can make a sampled generation reproducible without the driver having to expose a seed argument
+    // (P4.24). Same stream, so the draw-ORDER caveat `rng_` documents applies to both callers.
+    void seed_rng(uint32_t seed);
 
 private:
     struct Module {
@@ -254,6 +266,10 @@ private:
     // language detection, whose 98 language tokens sit inside the transcript vocabulary, so an
     // unrestricted argmax would answer with a word (BACKLOG.md P4.1 follow-up).
     static int l_argmax_row_range(lua_State* L);
+    // `loom.sample_row(module, row, {temperature =, top_k =, top_p =, generation =})` -> one token id
+    // DRAWN from that row rather than maximized over it (P4.24). Greedy settings return
+    // `l_argmax_row`'s own answer, by calling the same function -- see `sample_tensor_row`.
+    static int l_sample_row(lua_State* L);
     static int l_seed_rng(lua_State* L);
     static int l_gaussian_array(lua_State* L);
     static int l_uniform_array(lua_State* L);

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-08-22
+last_updated: 2026-08-31
 ---
 
 # Epic-08: Packaging and Release
@@ -58,82 +58,189 @@ illegal-instruction report from an older install.
 | | |
 |---|---|
 | Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md) |
-| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md) |
+| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 
-## 4. Planned: macOS wheels (P4.10) — SCOPED, lands before new model families
+## 4. macOS wheels (P4.10) — SHIPPED 2026-08-31, verified on an M1 Pro
 
+Apple Silicon and Apple Intel wheels are wired into `wheels.yml`, and the arm64 one has been built,
+installed from a clean venv and used to run two models on real hardware. **What follows is the
+record, not a plan** — the scoping that preceded it is in §5.
 
-**Why before P5 rather than after.** P5 adds model families, and a family lands in `loom-py` for free
-— a model the bindings have never heard of works the day the exporter can produce it. That is true
-only on a platform that exists. Every model P5 adds is unreachable from a Mac until this is done, so
-this multiplies P5's value while P5 does nothing for it. It is also the item most visible from
-outside, since it is what `pip install loom-py-rt` can resolve to.
+**Why it went before P5.** P5 adds model families, and a family lands in `loom-py` for free — a model
+the bindings have never heard of works the day the exporter can produce it. That is true only on a
+platform that exists, so every model P5 adds was unreachable from a Mac until this landed. It
+multiplies P5's value while P5 does nothing for it.
 
-**What already ships (2026-08-16):** `manylinux_2_28` on x86-64 and aarch64, CPython 3.10–3.13. The
-aarch64 wheel serves Raspberry Pi 4 and 5 on 64-bit Raspberry Pi OS — see `loom-py`'s
-`raspberry-pi-check` job, which executes the Cortex-A72 rung under QEMU because no CI runner is that
-old. 32-bit Raspberry Pi OS (`armv7l`) is deliberately NOT supported: `GGML_CPU_ALL_VARIANTS`'
-Linux-ARM ladder is AArch64-only, so it is an unbuildable configuration rather than a slow one.
+**The two Apple targets.** Apple Silicon tags `macosx_14_0_arm64` (`arm64` is Apple's name for the
+ISA Linux calls `aarch64`); Apple Intel tags `macosx_14_0_x86_64`. **Two native wheels, not
+`universal2`** — a fat binary doubles the download for everyone to serve one half, and that half is
+ending. Apple Intel remains **CI-only**: "supported" there means built and imported by a runner, and
+the platforms table says so rather than implying parity.
 
-**The two Apple targets, and what they are called.** Apple Intel is plain `x86_64`
-(`macosx_10_13_x86_64`). Apple Silicon is `arm64` in Apple's naming — the same ISA Linux calls
-`aarch64` — and tags as `macosx_11_0_arm64`.
+**The variant ladder needed no work, as predicted.** ggml's `GGML_CPU_ALL_VARIANTS` has an
+`elseif (APPLE)` arm giving `apple_m1` (DOTPROD) / `apple_m2_m3` (+I8MM) / `apple_m4` (+SME). Every
+Apple Silicon part has dotprod, so the lowest rung is not a compromise baseline the way Linux-ARM's
+`armv8.0_1` is. All three build, and `tests/ci/test_cpu_variants.py` now carries an `arm64` row and
+confirms **`libggml-cpu-apple_m1.so` is the one an M1 Pro selects**.
 
-**The variant ladder is already solved for both, which is the one thing that needs no work.** ggml's
-`GGML_CPU_ALL_VARIANTS` has an `elseif (APPLE)` arm: `apple_m1` (DOTPROD), `apple_m2_m3` (+I8MM),
-`apple_m4` (+SME). Every Apple Silicon part has dotprod, so the lowest rung covers M1 and there is no
-baseline hole of the kind that made every pre-2026-08-14 wheel require AVX2. Apple Intel resolves to
-`GGML_SYSTEM_ARCH == "x86"`, whose ladder starts at a true `x64` baseline.
+### 4.1 The four scoped blockers: three were real, and the fourth did not exist
 
-**Four blockers, in the order a build hits them.** All four were established by reading the pinned
-sources on 2026-08-16; none has been observed on a Mac, because there is no Mac here.
+| # | scoped as | what it actually was |
+|---|---|---|
+| 1 | LuaJIT's Makefile hard-errors on Darwin without `MACOSX_DEPLOYMENT_TARGET` | **REAL.** First thing the build hit. Fixed in `cmake/Dependencies.cmake`. |
+| 2 | `loom-py`'s install rule matches `*.so*`, so a macOS wheel ships `_loom.so` alone | **REAL**, and half of it. Fixed by matching both suffixes. |
+| 3 | `$ORIGIN` is ELF-only; macOS needs `@loader_path` | **REAL.** Fixed in `loom-py/CMakeLists.txt`. |
+| 4 | ggml's DL loader searches for `.so` where CMake wrote `.dylib` → zero devices, silently | **DID NOT EXIST.** See below. |
 
-1. **LuaJIT stops the build outright.** `luajit-src/src/Makefile:321-322` is a hard
-   `$(error missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY)` on Darwin, and `cmake/Dependencies.cmake`
-   invokes `make -C ... BUILDMODE=static XCFLAGS=-fPIC` with no environment at all. Engine-side fix,
-   and the cheap one: the same variable cibuildwheel needs anyway to tag the wheel (`11.0` on arm64,
-   `10.13` on x86-64), so one export does both jobs.
-2. **`loom-py`'s install rule ships nothing.** `CMakeLists.txt`'s
-   `install(DIRECTORY ... FILES_MATCHING PATTERN "*.so*")` — on macOS the engine and ggml libraries are
-   `.dylib`, so the wheel would contain `_loom.so` alone. That revives the exact
-   `cannot open shared object file` failure the same file's comment records as already fixed, through a
-   different door, and only at import time.
-3. **`$ORIGIN` is ELF-only.** `loom-py/CMakeLists.txt` sets it on both install and build RPATH; macOS
-   needs `@loader_path`. There is no `if(APPLE)` anywhere in either repo's CMake — grepped, not assumed.
-4. **The one that would burn a day of CI: ggml's DL loader looks for the wrong extension on macOS.**
-   `ggml-backend-reg.cpp`'s `backend_filename_extension()` returns `.dll` on `_WIN32` and `.so`
-   otherwise — there is no `.dylib` case, and its only `__APPLE__` block is `get_executable_path()`.
-   CMake emits `.dylib` for shared libraries on macOS and nothing in ggml's build overrides `SUFFIX`.
-   So a macOS `GGML_BACKEND_DL` build plausibly produces backends its own loader will never find by
-   name, which with DL means **zero devices, including no CPU** — the failure mode P4.8a already
-   showed is silent. Confirm on a Mac first; the fix is `SUFFIX ".so"` on the backend targets in our
-   build, or upstream. Do not start the macOS work by writing a workflow — start by settling this.
+**Blocker 4 is the one worth reading, because the reasoning that produced it was sound and the
+conclusion was still wrong.** `ggml-backend-reg.cpp`'s `backend_filename_extension()` really does
+return `.dll` on `_WIN32` and `.so` otherwise, with no `__APPLE__` case — that was read correctly at
+the pin. The missing half was **what kind of target a backend is**. ggml builds each one with
+`add_library(${backend} MODULE ...)`, and on Darwin CMake gives *module* libraries the suffix `.so`
+(`CMAKE_SHARED_MODULE_SUFFIX`) while only *shared* libraries get `.dylib`
+(`CMAKE_SHARED_LIBRARY_SUFFIX`). So the loader and the build already agree, and they agree on `.so`.
 
-**The wheel shape: two wheels, not `universal2`.** cibuildwheel builds each natively (`macos-14` for
-arm64, `macos-13` for x86-64), a fat binary doubles the download for everyone to serve one half, and
-the half it serves is ending — macOS 26 is Apple's last Intel release, and an Apple Silicon Mac can
-resolve the x86-64 wheel under Rosetta 2 anyway. **Do Apple Silicon first and treat Intel as one extra
-matrix row**, not as an equal target.
+Confirmed by building it. The runtime directory of a macOS build:
 
-**Metal is a separate package, and is NOT part of this item — it is P4.11, below.** `loom-py-rt-metal` is
-`packaging/rt-vulkan/` with four strings changed (`packaging/README.md`), and it is the only
-accelerator that would ever apply to a Mac — CoreML is not Metal, and no ggml backend targets the
-Neural Engine. Blocker 4 has to be settled before a `[metal]` package can mean anything, since a
-backend `.dylib` is discovered by the same code path. Open question to answer then, not now: whether
-`GGML_METAL_EMBED_LIBRARY` is required for a DL-loaded Metal backend that travels without a bundle.
+```
+libggml-base.dylib   libggml.dylib   libloom_engine.dylib      <- SHARED, linked, .dylib
+libggml-cpu-apple_m1.so   libggml-cpu-apple_m2_m3.so           <- MODULE, dlopened, .so
+libggml-cpu-apple_m4.so   libggml-blas.so   libggml-metal.so
+```
 
-**Verification is CI-only, and weaker than the Linux story — say so rather than paper over it.** There
-is no Mac on this network and no QEMU equivalent for macOS, so the checks are: the wheel test step
-running `pytest tests/ci` on both runner architectures, and `tests/ci/test_cpu_variants.py` gaining
-`arm64 → libggml-cpu-apple_m1.*` in its baseline table (note the extension follows blocker 4's
-resolution). There is no analogue of `raspberry-pi-check` — nobody can select an M1's feature set on
-an M4 runner. Until someone runs a model on a real Mac, "supported" means "built and imported in CI".
+and `loom.devices()` reports a CPU. **The takeaway is that a loader and a build are two halves of one
+agreement, and reading one half predicts nothing.** No `SUFFIX ".so"` override was needed, in our
+build or upstream; the fix that was scoped would have been a no-op papering over nothing. It is also
+why blocker 2 is *asymmetric* and not merely "add `.dylib`": the linked libraries are `.dylib` and
+the backends beside them are `.so`, so the install rule has to match both.
 
-**Done means:** wheels for `macosx_11_0_arm64` and `macosx_10_13_x86_64` published for 3.10–3.13;
-`import loom` and `loom.devices()` reporting a CPU on both; `pytest tests/ci` green on both;
-`loom-py`'s *Supported platforms* table extended; and this item's blocker 4 answered in writing either
-way. Windows stays out of scope and stays behind this.
+### 4.2 Three blockers nobody predicted, and one wrong wheel tag
+
+None of these are exotic; all three are invisible on Linux for a structural reason.
+
+1. **The vendored LuaJIT `make` inherits the outer make's jobserver and dies.** `make[3]: /bin/sh: Bad
+   file descriptor`, then `write jobserver: Bad file descriptor`. GNU make advertises its jobserver
+   through `MAKEFLAGS` but only passes the descriptors to a recipe it recognises as recursive — one
+   spelled `$(MAKE)`. Ours is deliberately plain `make`, because the outer generator may not be make
+   at all. **Not a macOS bug**: it is any `Unix Makefiles` build on any platform, and it had never
+   been seen because everything that matters (CI, scikit-build-core) uses Ninja. Fixed by clearing
+   `MAKEFLAGS`/`MAKELEVEL` for that one command, which is generator-independent.
+2. **`loom.LoomError` silently became `RuntimeError`.** The engine throws `loom::Error` from
+   `libloom_engine.dylib`; the `catch` that translates it lives in `_loom.so`. Those classes are
+   header-only, so their typeinfo is a weak symbol in both binaries — and pybind11 builds every
+   extension module `-fvisibility=hidden`, which under Mach-O's two-level namespace stops the two
+   copies coalescing. **Apple's libc++ compares `type_info` by address**, so the catch clause was
+   simply skipped. ELF's flat namespace merges them, which is why Linux never saw it. Fixed by giving
+   the exception classes explicit default visibility in `loom_errors.h`. The symptom was not a crash
+   — it was `except loom.LoomError` catching nothing, i.e. the documented way to tell "your GGUF is
+   wrong" from "this binding is wrong" quietly ceasing to work.
+3. **`/tmp` and `/var` are symlinks on macOS.** `test_backend_discovery.py` compared an
+   `os.path.abspath` against a path the package had `resolve()`d, which follows symlinks. On Linux
+   they agree; on macOS a venv under either standard temporary root compares `/tmp/.../loom` against
+   `/private/tmp/.../loom` and fails on a path that is the same directory. **This would have failed
+   in CI too** — cibuildwheel's test step runs from a temp directory. The production code is right to
+   resolve; the test now does the same.
+
+**And the wheel tag comes from the environment, not from CMake.** `CMAKE_OSX_DEPLOYMENT_TARGET`
+decides what the Mach-O binaries require; **scikit-build-core decides the filename**, and it reads
+`MACOSX_DEPLOYMENT_TARGET`. With only the CMake half set, a hand build produced binaries good for
+11.0 inside a wheel named `macosx_15_0_arm64` — which pip then refuses to install on the macOS 12 it
+would have run on perfectly. Both halves are now set: a pre-`project()` default in
+`loom-py/CMakeLists.txt` and `[tool.cibuildwheel.macos].environment` in `pyproject.toml`.
+
+### 4.3 The floor is 14.0, and the first macOS CI run is what said so
+
+Scoped as cibuildwheel's defaults, **11.0 on arm64 and 10.13 on x86-64**. Both are wrong, and the
+reason is a backend nobody was thinking about.
+
+ggml compiles its BLAS backend with `ACCELERATE_NEW_LAPACK` and `ACCELERATE_LAPACK_ILP64`
+(`src/ggml-blas/CMakeLists.txt`, unconditional for Apple, with **no deployment-target gating**),
+which selects Accelerate's *new* BLAS interface — `cblas_sgemm$NEWLAPACK$ILP64`, a symbol that
+exists only on **macOS 13.3+**. The first `macos-15` CI run said it in as many words:
+
+```
+ggml-blas.cpp:142:13: warning: 'cblas_sgemm' is only available on macOS 13.3 or newer
+```
+
+An 11.0-tagged wheel would therefore install on macOS 11 or 12 and **quietly have no BLAS**: the
+backend is `dlopen`ed, the symbol is missing, ggml logs at a level the binding drops, and the
+accelerator is simply absent — the silent shape P4.8a already cost a build cycle to find.
+
+**Dropping BLAS was the obvious fix and is the wrong one.** It is **1.80x on whisper-small** (990 ms
+against the CPU's 1778 ms) on an M1 Pro. It is neutral on VITS, which is what an early, VITS-only
+measurement said — and would have been the wrong basis for removing it. A BLAS is for large matrix
+multiplication; the model that shows it is the ASR encoder, not the TTS vocoder.
+
+So the floor rose, on both architectures -- Accelerate's new BLAS lands on 13.3 for Intel too -- which
+removed the `overrides` block along with the mismatch. The alternatives were a tag that overpromises, or a fourteenth ggml patch dropping
+the two defines so ggml-blas uses classic Accelerate — the latter keeps 11.0 and is the better
+long-term answer, but it needs its own measurement (classic is LP64, and the new interface may not be
+the same speed) and did not belong in a release.
+
+**And the floor is 14.0 rather than the 13.3 the requirement actually is, because 13.3 cannot be
+spelled.** Since macOS 11 a wheel's platform tag carries only the MAJOR version: `packaging` generates
+`macosx_15_0`, `macosx_14_0`, `macosx_13_0`, and nothing with a non-zero minor, so `macosx_13_3_arm64`
+matches nothing pip offers. scikit-build-core knows this and zeroes the minor -- checked rather than
+assumed, `normalize_macos_version("13.3", arm=True)` returns `13.0` -- so setting 13.3 would ship
+binaries needing 13.3 inside a wheel tagged `macosx_13_0`: installable on 13.0, 13.1 and 13.2, and
+silently BLAS-less there. That is the same defect one major version smaller. **14.0 is the lowest
+floor that is both expressible and true**, and the extra cost over 13.3 is macOS 13.x.
+
+**The general point is that this cost nothing to find because a macOS row exists in `ci.yml`.** It
+was invisible on every local build, which used the same 11.0 floor and never read the warnings.
+
+### 4.4 The runner labels are not the ones this was scoped with
+
+`macos-13` (Intel) has been **retired** and `macos-14` is **deprecated**. The matrix uses
+**`macos-15`** for arm64 and **`macos-15-intel`** for x86_64 — the GA pair. This is the first thing
+to check if the job one day fails to schedule rather than fails to build.
+
+The matrix also gained an `artifact` key, because `arch` stopped being unique: Linux x86_64 and Apple
+Intel are both `x86_64`, and two `upload-artifact` steps sharing a name is an error rather than a
+merge. `gpu-smoke-test` installs `dist/*manylinux*.whl` for the same reason — its `wheels-*-x86_64`
+glob now also matches an Apple wheel, and pip treats an explicit filename as a request, not a
+preference.
+
+### 4.5 What was verified, and on what
+
+On **`fdemelo@macbook-pro`** — Apple M1 Pro, macOS 15.6.1, the **`apple_m1` rung**, which is the
+lowest of ggml's three Apple rungs and therefore the one every `macosx_14_0_arm64` wheel must serve.
+An M4 runner could not have stood in for it. This is the analogue of `raspberry-pi-check` that the
+item was scoped as lacking.
+
+* `loom_py_rt-cp311-cp311-macosx_14_0_arm64.whl` — **2.23 MB zipped, 5.64 MB unpacked**.
+* Installed into a clean venv, imported from a neutral cwd: `loom.devices()` → `BLAS (Accelerate)`,
+  `CPU (Apple M1 Pro)`.
+* **`pytest tests/ci`: 80 passed, 1 skipped** (the skip is `orthography2ipa`, absent by choice), both
+  against the installed wheel and against the source tree. The same suite is green on Linux.
+* **Two models actually run**: VITS synthesised speech, and whisper-small transcribed it back —
+  the ASR oracle, because correlation is not the test for a TTS family.
+
+**`cibuildwheel` cannot be run locally on macOS** and this is not a defect: it refuses to
+system-install python.org CPython outside CI, which is the right call on someone's laptop. The local
+builds went through `python -m build` instead, so **the `delocate` repair step is exercised only in
+CI** — worth knowing when reading a first macOS CI run.
+
+**One piece of friction that is not ours**: `nlohmann/json` is fetched as a **full ~290 MB clone** for
+a header-only library, and it failed twice on this link before succeeding. `GIT_SHALLOW` on that
+`FetchContent_Declare` is an obvious improvement and is deliberately left out of this item.
+
+### 4.6 What "done" means here, and what is still open
+
+Done: wheels for both Apple architectures wired into the release workflow; `import loom` and
+`loom.devices()` reporting a CPU; `pytest tests/ci` green; blocker 4 answered **in writing, and
+answered "no"**; and — the bar this item was raised to once the hardware existed — the arm64 wheel
+installed and a model run on a real M1 Pro.
+
+Still open, and deliberately not folded in:
+
+* **Publishing.** Nothing here has been uploaded to PyPI. The macOS rows produce artifacts on the
+  next release run; the first Apple wheels reach the index when someone publishes them.
+* **The `loom-py` submodule pointer** still names a `loom.cpp` commit that predates P4.20–P4.29, and
+  `loom.cpp/main` is many commits ahead of its origin. Every macOS build here used the working tree.
+  Bumping the pointer is a release-time act and belongs with the rc7 push, not here.
+* **Windows** stays out of scope and stays behind this.
 
 
 ## 5. The Record

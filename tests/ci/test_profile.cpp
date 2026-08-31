@@ -16,6 +16,10 @@
 //      profiling on records something. Checked by registering this binary twice with different
 //      ENVIRONMENT rather than by re-execing, because `profile::enabled()` caches its answer on first
 //      call and a single process therefore only ever gets one of the two answers.
+//   4. **`$LOOM_PROFILE_NODES` accounts for the same executions the shape table does.** The whole point
+//      of the finer table is to attribute a shape bucket to a graph, and an attribution is only as good
+//      as its coverage -- so the two tables' call counts must agree exactly. A THIRD registration, for
+//      the same caching reason as (3).
 //
 // Deliberately not asserted: that any particular op is heaviest, or that the floor is any given size.
 // Those are properties of the host, not of this code.
@@ -98,6 +102,32 @@ int main() {
     const std::string text = loom::profile::report();
     LOOM_CHECK(text.find("loom profile") != std::string::npos);
     LOOM_CHECK(text.find("by op") != std::string::npos);
+
+    // --- 2b. `$LOOM_PROFILE_NODES` adds the per-node table, and only when asked. ---
+    //
+    // The claim under test is the one the coarse table CANNOT make: that every node execution is
+    // attributable to a named node. So the same accounting check as (2) is run over the finer table --
+    // if the two disagree, some execution landed in a shape bucket without landing in a node bucket and
+    // an attribution built on this report would be reading a partial graph. The OFF direction matters
+    // for the same reason the routing check below does: a per-node map on the recording path is a cost
+    // nobody who did not ask for it should pay.
+    const std::vector<loom::profile::NodeRow> node_table = loom::profile::node_rows();
+    if (loom::profile::nodes_enabled()) {
+        LOOM_CHECK(!node_table.empty());
+        uint64_t node_calls = 0;
+        for (const loom::profile::NodeRow& row : node_table) node_calls += row.calls;
+        LOOM_CHECK(node_calls == totals.nodes);
+        // Finer than the shape table by construction: a node bucket carries all four `ne` and a name,
+        // so it can only ever split a shape bucket, never merge two.
+        LOOM_CHECK(node_table.size() >= loom::profile::rows().size());
+        LOOM_CHECK(text.find("name") != std::string::npos);
+        LOOM_CHECK(text.find("node buckets") != std::string::npos);
+        std::fprintf(stderr, "LOOM_PROFILE_NODES set: %zu node buckets over %zu shape buckets\n",
+                     node_table.size(), loom::profile::rows().size());
+    } else {
+        LOOM_CHECK(node_table.empty());
+        LOOM_CHECK(text.find("node buckets") == std::string::npos);
+    }
 
     // --- 3. GraphBuilder::compute routes on $LOOM_PROFILE, in whichever direction this registration is
     // testing. Both directions are real failure modes: a branch stuck ON makes every shipped run pay
