@@ -92,11 +92,20 @@ arm64, macOS **15.6.1** (24G90), 10 cores, L1d 64 KB / L2 4 MB / no L3. That is 
 verification target: it is the baseline every `macosx_11_0_arm64` wheel has to serve, and an M4 runner
 could never have stood in for it. It does **not** cover Apple Intel, which stays a CI-only row.
 
-**What is on it, because this decides what can be attempted before installing anything:** Apple clang
-17.0.0, **Command Line Tools only — no full Xcode**; **no cmake**; **no Homebrew**; system `python3` is
-**3.9.6**, below the 3.10 floor the wheels target. So P4.10 needs a cmake and a Python ≥3.10 put there
-first (cibuildwheel supplies its own Python, a local build does not). `xcrun metal` is absent with CLT
-alone — see Epic-04 §5, where that turns out not to block Metal.
+**What is on it, because this decides what can be attempted before installing anything.** Homebrew
+**6.0.18** at `/opt/homebrew`, with **cmake 4.4.2** and git; **mambaforge** at `~/mambaforge`, base
+Python 3.10, envs `env-py-3.11` (3.11.12, arm64 — **use this one**), `env-py-3.13`, `env-py-3.9`,
+`hummingbot`. Apple clang **17.0.0**, and **Command Line Tools only — no full Xcode**
+(`xcode-select -p` is `/Library/Developer/CommandLineTools`), so `xcodebuild` and `xcrun metal` both
+error; see Epic-04 §5, where that turns out **not** to block Metal. Missing and likely wanted:
+**`ninja`** and **`pkg-config`**, both a `brew install` away.
+
+**THE SSH INVOCATION GOTCHA, which cost one wrong inventory already.** `ssh macbook-pro 'cmd'` runs a
+**non-login, non-interactive** shell, so it sources neither `~/.zprofile` (Homebrew's `shellenv`) nor
+the conda init block: `brew`, `cmake` and `conda` all report as absent and the bare `python3` resolves
+to the system **3.9.6**. Use **`ssh macbook-pro 'zsh -lc "..."'`** for anything on the Homebrew path,
+and note that **`conda` is not on the login PATH either** — reach the interpreter by absolute path,
+`~/mambaforge/envs/env-py-3.11/bin/python`, or activate explicitly via `~/mambaforge/bin/conda`.
 
 **Four blockers, in the order a build hits them.** All four were established by reading the pinned
 sources on 2026-08-16 and **re-verified against the current pins on 2026-08-31**; none has yet been

@@ -701,7 +701,9 @@ one of these a Linux answer, and none of them carries over:
    beside a `python` executable. **(b)** **Full Xcode is NOT required to build it.** `xcrun -sdk macosx
    metal` appears only in the non-embed `GGML_METAL_SHADER_DEBUG` branch, and it is absent on a
    Command-Line-Tools-only install — which is exactly what `macbook-pro` has. Do not let a missing
-   `metal` compiler be read as "cannot build Metal here"; it means "do not turn EMBED off".
+   `metal` compiler be read as "cannot build Metal here"; it means "do not turn EMBED off". (Should a
+   full Xcode ever be wanted for the non-embed path, that is an install, not a blocker — the machine
+   has Homebrew and cmake already; Epic-08 §4 has the inventory.)
 4. **Size, measured rather than guessed.** `libggml-vulkan.so` is 46.5 MB because 44 MB of it is
    compiled SPIR-V; Metal ships shader *source* or a metallib and should be far smaller, which would
    make it the first backend package that is small for a reason other than restraint. The number belongs
