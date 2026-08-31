@@ -40,11 +40,40 @@ inline uint32_t fixed_clip_samples(const GgufModel& model) {
     return model.has_kv("loom.n_samples") ? model.hparam_u32("n_samples") : 0;
 }
 
+// The chunk a segmented-prefill model's encoder consumes, in samples, or 0 when it has none.
+//
+// A DIFFERENT QUESTION FROM `fixed_clip_samples`, and both can be 0 on the same file. That one asks
+// "is this graph built at one clip length" -- Whisper's shape, which forces windowed decoding. This
+// asks "must the waveform arrive as a whole number of encoder chunks", which is family 3's shape
+// (Qwen3-ASR at 16000 samples, Granite Speech at 192000): one pass over the whole waveform, but a
+// waveform whose length is a multiple of the chunk, because the encoder reshapes the mel frames into
+// exactly `frames_per_chunk` rows per chunk and a remainder has nowhere to go.
+//
+// The failure when a host ignores it is not a wrong transcript, it is `RESHAPE: input element count
+// is not evenly divisible by the known 'shape' dimensions`, thrown from inside the driver -- which is
+// how this was found, on a 5.41 s clip that is not a whole number of seconds.
+inline uint32_t chunk_samples(const GgufModel& model) {
+    return model.has_kv("loom.samples_per_chunk") ? model.hparam_u32("samples_per_chunk") : 0;
+}
+
+// `n` rounded up to a whole number of `chunk` samples. `chunk == 0` means "no requirement".
+inline size_t padded_to_chunk(size_t n, uint32_t chunk) {
+    if (chunk == 0) return n;
+    return ((n + chunk - 1) / chunk) * chunk;
+}
+
 // One window of exactly `clip` samples starting at `seek`, zero-padded when the audio runs out.
 //
 // Zeros rather than edge-repeat or reflection, because that is what Whisper's own `pad_or_trim` does
 // and what the checkpoint was trained against -- a padded clip transcribes normally, where a clip
 // padded some other way is a distribution the model has not seen.
+//
+// ZEROS ARE ALSO WHAT FAMILY 3 WANTS, and for a different reason worth recording, because it looks
+// like the sort of thing a caller should be smarter about. Its driver repairs the head of the
+// padding itself -- it mirrors the last 200 real samples over the start of the zeros, reconstructing
+// what the checkpoint's own STFT would have reflected there. So a host that helpfully padded by
+// reflection would be handing it a signal it then reflects again. Pad with zeros and say how many
+// samples are real; the driver does the rest.
 inline std::vector<double> window_at(const std::vector<float>& waveform, size_t seek, uint32_t clip) {
     std::vector<double> window(clip, 0.0);
     if (seek >= waveform.size()) return window;
