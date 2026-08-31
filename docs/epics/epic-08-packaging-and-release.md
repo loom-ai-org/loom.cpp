@@ -72,8 +72,8 @@ the bindings have never heard of works the day the exporter can produce it. That
 platform that exists, so every model P5 adds was unreachable from a Mac until this landed. It
 multiplies P5's value while P5 does nothing for it.
 
-**The two Apple targets.** Apple Silicon tags `macosx_11_0_arm64` (`arm64` is Apple's name for the
-ISA Linux calls `aarch64`); Apple Intel tags `macosx_10_13_x86_64`. **Two native wheels, not
+**The two Apple targets.** Apple Silicon tags `macosx_14_0_arm64` (`arm64` is Apple's name for the
+ISA Linux calls `aarch64`); Apple Intel tags `macosx_14_0_x86_64`. **Two native wheels, not
 `universal2`** — a fat binary doubles the download for everyone to serve one half, and that half is
 ending. Apple Intel remains **CI-only**: "supported" there means built and imported by a runner, and
 the platforms table says so rather than implying parity.
@@ -149,7 +149,48 @@ decides what the Mach-O binaries require; **scikit-build-core decides the filena
 would have run on perfectly. Both halves are now set: a pre-`project()` default in
 `loom-py/CMakeLists.txt` and `[tool.cibuildwheel.macos].environment` in `pyproject.toml`.
 
-### 4.3 The runner labels are not the ones this was scoped with
+### 4.3 The floor is 14.0, and the first macOS CI run is what said so
+
+Scoped as cibuildwheel's defaults, **11.0 on arm64 and 10.13 on x86-64**. Both are wrong, and the
+reason is a backend nobody was thinking about.
+
+ggml compiles its BLAS backend with `ACCELERATE_NEW_LAPACK` and `ACCELERATE_LAPACK_ILP64`
+(`src/ggml-blas/CMakeLists.txt`, unconditional for Apple, with **no deployment-target gating**),
+which selects Accelerate's *new* BLAS interface — `cblas_sgemm$NEWLAPACK$ILP64`, a symbol that
+exists only on **macOS 13.3+**. The first `macos-15` CI run said it in as many words:
+
+```
+ggml-blas.cpp:142:13: warning: 'cblas_sgemm' is only available on macOS 13.3 or newer
+```
+
+An 11.0-tagged wheel would therefore install on macOS 11 or 12 and **quietly have no BLAS**: the
+backend is `dlopen`ed, the symbol is missing, ggml logs at a level the binding drops, and the
+accelerator is simply absent — the silent shape P4.8a already cost a build cycle to find.
+
+**Dropping BLAS was the obvious fix and is the wrong one.** It is **1.80x on whisper-small** (990 ms
+against the CPU's 1778 ms) on an M1 Pro. It is neutral on VITS, which is what an early, VITS-only
+measurement said — and would have been the wrong basis for removing it. A BLAS is for large matrix
+multiplication; the model that shows it is the ASR encoder, not the TTS vocoder.
+
+So the floor rose, on both architectures -- Accelerate's new BLAS lands on 13.3 for Intel too -- which
+removed the `overrides` block along with the mismatch. The alternatives were a tag that overpromises, or a fourteenth ggml patch dropping
+the two defines so ggml-blas uses classic Accelerate — the latter keeps 11.0 and is the better
+long-term answer, but it needs its own measurement (classic is LP64, and the new interface may not be
+the same speed) and did not belong in a release.
+
+**And the floor is 14.0 rather than the 13.3 the requirement actually is, because 13.3 cannot be
+spelled.** Since macOS 11 a wheel's platform tag carries only the MAJOR version: `packaging` generates
+`macosx_15_0`, `macosx_14_0`, `macosx_13_0`, and nothing with a non-zero minor, so `macosx_13_3_arm64`
+matches nothing pip offers. scikit-build-core knows this and zeroes the minor -- checked rather than
+assumed, `normalize_macos_version("13.3", arm=True)` returns `13.0` -- so setting 13.3 would ship
+binaries needing 13.3 inside a wheel tagged `macosx_13_0`: installable on 13.0, 13.1 and 13.2, and
+silently BLAS-less there. That is the same defect one major version smaller. **14.0 is the lowest
+floor that is both expressible and true**, and the extra cost over 13.3 is macOS 13.x.
+
+**The general point is that this cost nothing to find because a macOS row exists in `ci.yml`.** It
+was invisible on every local build, which used the same 11.0 floor and never read the warnings.
+
+### 4.4 The runner labels are not the ones this was scoped with
 
 `macos-13` (Intel) has been **retired** and `macos-14` is **deprecated**. The matrix uses
 **`macos-15`** for arm64 and **`macos-15-intel`** for x86_64 — the GA pair. This is the first thing
@@ -161,14 +202,14 @@ merge. `gpu-smoke-test` installs `dist/*manylinux*.whl` for the same reason — 
 glob now also matches an Apple wheel, and pip treats an explicit filename as a request, not a
 preference.
 
-### 4.4 What was verified, and on what
+### 4.5 What was verified, and on what
 
 On **`fdemelo@macbook-pro`** — Apple M1 Pro, macOS 15.6.1, the **`apple_m1` rung**, which is the
-lowest of ggml's three Apple rungs and therefore the one every `macosx_11_0_arm64` wheel must serve.
+lowest of ggml's three Apple rungs and therefore the one every `macosx_14_0_arm64` wheel must serve.
 An M4 runner could not have stood in for it. This is the analogue of `raspberry-pi-check` that the
 item was scoped as lacking.
 
-* `loom_py_rt-1.0.0rc6-cp311-cp311-macosx_11_0_arm64.whl` — **2.23 MB zipped, 5.64 MB unpacked**.
+* `loom_py_rt-cp311-cp311-macosx_14_0_arm64.whl` — **2.23 MB zipped, 5.64 MB unpacked**.
 * Installed into a clean venv, imported from a neutral cwd: `loom.devices()` → `BLAS (Accelerate)`,
   `CPU (Apple M1 Pro)`.
 * **`pytest tests/ci`: 80 passed, 1 skipped** (the skip is `orthography2ipa`, absent by choice), both
@@ -185,7 +226,7 @@ CI** — worth knowing when reading a first macOS CI run.
 a header-only library, and it failed twice on this link before succeeding. `GIT_SHALLOW` on that
 `FetchContent_Declare` is an obvious improvement and is deliberately left out of this item.
 
-### 4.5 What "done" means here, and what is still open
+### 4.6 What "done" means here, and what is still open
 
 Done: wheels for both Apple architectures wired into the release workflow; `import loom` and
 `loom.devices()` reporting a CPU; `pytest tests/ci` green; blocker 4 answered **in writing, and
