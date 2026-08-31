@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-08-22
+last_updated: 2026-08-31
 ---
 
 # Epic-04: Backends and Accelerators
@@ -713,6 +713,20 @@ reading the timing.
 **Device selection needs no new work**, and that is a claim to check rather than assume: ggml-metal
 registers as a GPU-kind device, so P4.8e's hierarchy should rank it without a new tier and
 `device="gpu"` should find it. `loom.devices()` naming it is the check.
+
+**A quantized convolutional model is already safe on Metal, and here is why so it is not re-derived.**
+P4.29 gave a folded, block-quantized conv kernel a CPU-only lowering
+(`ggml_conv_2d_direct_packed`, geometry in `op_params` 6..8) and gated it on `backend_can_run`.
+Metal's `supports_op` for `GGML_OP_CONV_2D` (`ggml-metal-device.m`) requires
+`src[0]->type == F16 || F32`, so it declines the node and the graph keeps the `im2col` +
+`mul_mat_kernel_first` lowering — the same path Vulkan runs with zero fallback nodes. **Checked by
+reading, not run**, like everything else in this section.
+
+The one thing to watch: Metal declines on the TYPE test alone, where Vulkan also fails a geometry test
+(`cout == op->ne[2]`) and CUDA was given an explicit `op_params[6] == 0` guard because it had neither.
+Today that is enough, because loom only ever builds a packed node for a *quantized* kernel. **If a
+packed node is ever built from an F32 folded kernel, Metal needs CUDA's guard**, or it will read a
+`[IC*K, OC]` tensor as a `[KW, KH, IC, OC]` one and return a wrong answer rather than an error.
 
 **Done means something stricter than P4.10's bar, because this failure is silent.** P4.10 can be
 called done on "built and imported in CI"; a backend cannot, since one that fails to load is
