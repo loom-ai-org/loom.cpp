@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-08-22
+last_updated: 2026-08-31
 ---
 
 # Epic-08: Packaging and Release
@@ -86,8 +86,21 @@ Linux-ARM ladder is AArch64-only, so it is an unbuildable configuration rather t
 baseline hole of the kind that made every pre-2026-08-14 wheel require AVX2. Apple Intel resolves to
 `GGML_SYSTEM_ARCH == "x86"`, whose ladder starts at a true `x64` baseline.
 
+**THERE IS NOW A MAC, as of 2026-08-31: `fdemelo@macbook-pro`, passwordless ssh.** Apple **M1 Pro**,
+arm64, macOS **15.6.1** (24G90), 10 cores, L1d 64 KB / L2 4 MB / no L3. That is the **`apple_m1` rung**
+— DOTPROD, no I8MM, no SME — which is the *lowest* of ggml's three Apple rungs and therefore the right
+verification target: it is the baseline every `macosx_11_0_arm64` wheel has to serve, and an M4 runner
+could never have stood in for it. It does **not** cover Apple Intel, which stays a CI-only row.
+
+**What is on it, because this decides what can be attempted before installing anything:** Apple clang
+17.0.0, **Command Line Tools only — no full Xcode**; **no cmake**; **no Homebrew**; system `python3` is
+**3.9.6**, below the 3.10 floor the wheels target. So P4.10 needs a cmake and a Python ≥3.10 put there
+first (cibuildwheel supplies its own Python, a local build does not). `xcrun metal` is absent with CLT
+alone — see Epic-04 §5, where that turns out not to block Metal.
+
 **Four blockers, in the order a build hits them.** All four were established by reading the pinned
-sources on 2026-08-16; none has been observed on a Mac, because there is no Mac here.
+sources on 2026-08-16 and **re-verified against the current pins on 2026-08-31**; none has yet been
+observed on the Mac, which is now a thing that can be done rather than a standing limitation.
 
 1. **LuaJIT stops the build outright.** `luajit-src/src/Makefile:321-322` is a hard
    `$(error missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY)` on Darwin, and `cmake/Dependencies.cmake`
@@ -123,17 +136,20 @@ Neural Engine. Blocker 4 has to be settled before a `[metal]` package can mean a
 backend `.dylib` is discovered by the same code path. Open question to answer then, not now: whether
 `GGML_METAL_EMBED_LIBRARY` is required for a DL-loaded Metal backend that travels without a bundle.
 
-**Verification is CI-only, and weaker than the Linux story — say so rather than paper over it.** There
-is no Mac on this network and no QEMU equivalent for macOS, so the checks are: the wheel test step
-running `pytest tests/ci` on both runner architectures, and `tests/ci/test_cpu_variants.py` gaining
-`arm64 → libggml-cpu-apple_m1.*` in its baseline table (note the extension follows blocker 4's
-resolution). There is no analogue of `raspberry-pi-check` — nobody can select an M1's feature set on
-an M4 runner. Until someone runs a model on a real Mac, "supported" means "built and imported in CI".
+**Verification: CI for both architectures, plus a real M1 Pro for arm64.** The CI checks are the wheel
+test step running `pytest tests/ci` on both runner architectures, and `tests/ci/test_cpu_variants.py`
+gaining `arm64 → libggml-cpu-apple_m1.*` in its baseline table (the extension follows blocker 4's
+resolution). **The `macbook-pro` above is the analogue of `raspberry-pi-check` that this item was
+scoped as lacking** — it is a genuine `apple_m1` part, so it answers the question an M4 runner cannot:
+does the lowest rung actually run. **Apple Intel remains CI-only**, and for that row "supported" still
+means "built and imported in CI" — say so in the platforms table rather than implying parity.
 
 **Done means:** wheels for `macosx_11_0_arm64` and `macosx_10_13_x86_64` published for 3.10–3.13;
 `import loom` and `loom.devices()` reporting a CPU on both; `pytest tests/ci` green on both;
-`loom-py`'s *Supported platforms* table extended; and this item's blocker 4 answered in writing either
-way. Windows stays out of scope and stays behind this.
+`loom-py`'s *Supported platforms* table extended; blocker 4 answered in writing either way; and — new,
+now that the hardware exists — **the arm64 wheel installed from the index on `macbook-pro` and a model
+run on it**, which is a stronger bar than this item was originally scoped with and should not be
+dropped back to the CI one. Windows stays out of scope and stays behind this.
 
 
 ## 5. The Record

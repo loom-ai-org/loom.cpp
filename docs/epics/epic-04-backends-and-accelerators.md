@@ -692,11 +692,16 @@ one of these a Linux answer, and none of them carries over:
    mechanism that binds a backend to its base library is different on macOS, and P4.8g is the record of
    what a mismatch looks like: it loads without error, registers nothing, and shows up only as an
    accelerator missing from `loom.devices()`.
-3. **`GGML_METAL_EMBED_LIBRARY`.** A DL backend travels as a lone `.dylib` with no bundle around it. If
-   the shader library is not embedded, ggml-metal looks for `default.metallib` next to the executable —
-   and inside an interpreter the executable is `python`, which is precisely the trap
-   `loom/__init__.py`'s `_register_backend_paths` exists to work around for backend `.so` files. Verify
-   before assuming it is on by default.
+3. **`GGML_METAL_EMBED_LIBRARY` — ANSWERED 2026-08-31 by reading, and the answer is better than
+   expected.** It defaults to `${GGML_METAL}` (`ggml/CMakeLists.txt:241`), so it is already ON whenever
+   Metal is. What it embeds is the **`.metal` SOURCE**, not a compiled metallib: two `sed` passes
+   inline `ggml-common.h` and `ggml-metal-impl.h`, and the result goes into the binary through
+   `.incbin` in a `__DATA,__ggml_metallib` section, compiled by the Metal framework at run time. Two
+   consequences. **(a)** The lone-`.dylib` trap does not arise — nothing looks for `default.metallib`
+   beside a `python` executable. **(b)** **Full Xcode is NOT required to build it.** `xcrun -sdk macosx
+   metal` appears only in the non-embed `GGML_METAL_SHADER_DEBUG` branch, and it is absent on a
+   Command-Line-Tools-only install — which is exactly what `macbook-pro` has. Do not let a missing
+   `metal` compiler be read as "cannot build Metal here"; it means "do not turn EMBED off".
 4. **Size, measured rather than guessed.** `libggml-vulkan.so` is 46.5 MB because 44 MB of it is
    compiled SPIR-V; Metal ships shader *source* or a metallib and should be far smaller, which would
    make it the first backend package that is small for a reason other than restraint. The number belongs
@@ -731,9 +736,13 @@ packed node is ever built from an F32 folded kernel, Metal needs CUDA's guard**,
 **Done means something stricter than P4.10's bar, because this failure is silent.** P4.10 can be
 called done on "built and imported in CI"; a backend cannot, since one that fails to load is
 indistinguishable from a slow CPU run. Done here is: `loom.devices()` listing Metal on a real Mac, a
-model producing output that matches the CPU path, and a timing pair for both. **Nobody in this project
-has that hardware**, so this stays scoped until someone with an Apple Silicon Mac runs it — the same
-honesty P4.8c applied to CUDA, which stopped being a claim only on the workstation.
+model producing output that matches the CPU path, and a timing pair for both.
+
+**The hardware now exists — `fdemelo@macbook-pro`, an Apple M1 Pro on macOS 15.6.1 (Epic-08 §4 has the
+full inventory)** — so this item is no longer blocked on borrowing a machine, and the P4.8c standard
+becomes reachable rather than aspirational: CUDA stopped being a claim only when it ran on the
+workstation, and Metal should stop being one only when it runs on this laptop. **Read the split count
+before the timing** — a first benchmark measures how much of the graph fell back, not the backend.
 
 **Non-goals:** CoreML and the Neural Engine (not Metal, no ggml backend targets it, and out-of-tree
 options were already turned down on licensing); Intel Macs; a `universal2` backend wheel.

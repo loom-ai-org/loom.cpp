@@ -241,6 +241,12 @@ primitive set.
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
   `repeat_for`'s own loop bound.
 * [ ] `export_config.py`'s module docstring points at a ledger section that no longer exists.
+* [ ] **The direct-conv cache budget takes its 512 KB floor on macOS — 4 MB of M1 Pro L2 priced as
+  512 KB.** `ggml_conv_1d_direct_budget()` reads `_SC_LEVEL{2,3}_CACHE_SIZE`, glibc extensions absent
+  from the macOS SDK, so both `#if defined` arms compile out. Affects F32 and quantized conv models
+  alike, and aarch64 Linux hits the same floor. Fix is a `__APPLE__` arm on `sysctlbyname`, in
+  `ggml-0006`; measure before and after, since the floor may be accidentally near-optimal.
+  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **`GgmlPatches.cmake` asks "already applied?" the wrong way, so every `cmake` re-run rebuilds
   ggml from scratch** (~30 min on the Pi). It reverse-applies **each patch individually against the
   final tree**, which only holds while no later patch rewrites lines an earlier one added —
