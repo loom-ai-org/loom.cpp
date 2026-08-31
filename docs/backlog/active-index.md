@@ -22,6 +22,7 @@ are not renumbered. New items continue the scheme.
 | **P4.10 — macOS wheels** | multiplies every model family added afterwards; a family is unreachable from a Mac until this lands → [Epic-08 §4](../epics/epic-08-packaging-and-release.md) |
 | **Task #79 part 1 — export the phoneme symbol table** | no licence question, no C++, and it gives four TTS models a real text door → [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md) |
 | **P5 family 12 — BERT token classifiers** | smallest possible template, and the first non-audio task → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
+| **P4.29 — quantized direct convolution** | scoped and measured: ~30 lines of ggml to take a quantized conv model from 2.1x slower back to F32 speed, and the prize reproduces on both ISAs → [Epic-05 §5](../epics/epic-05-edge-performance.md) |
 
 ---
 
@@ -155,13 +156,16 @@ are not renumbered. New items continue the scheme.
   problem with a named mechanism. Pinning is NOT the fix: it constrains onnxruntime more than loom
   (pinned to four P-cores it runs *slower* than its lucky unpinned launches).
   → [Epic-05 §2](../epics/epic-05-edge-performance.md)
-* [ ] **A quantized convolutional model is ~2x slower, on both ISAs, and nothing has been done about
-  it.** 2.08x on x86-64 and 2.13x on a Cortex-A72 — measured, not predicted, and the prediction that
-  aarch64 would be better was wrong. **1.55x of it is not the arithmetic**: a quantized kernel cannot
-  use `GGML_OP_CONV_2D`, so it gives up ggml-0006's direct convolution and the two fusions (ggml-0005
-  bias, ggml-0007 resblock) that hang off that op. Closing any of that back would need a quantized
-  direct-conv path in ggml, which is a real piece of work and is not scoped.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md)
+* [ ] **P4.29 — a quantized direct convolution, which should take a quantized conv model back to F32
+  speed.** SCOPED 2026-08-31, not started. A quantized model is 2.08x slower on x86-64 and 2.13x on a
+  Cortex-A72, and the loss is not the arithmetic — it is giving up `GGML_OP_CONV_2D` and the three
+  patches that hang off it. **`ggml_conv_1d_direct_run` already repacks the whole kernel into an F32
+  scratch buffer before computing anything**, so the fix is to dequantize into that buffer rather than
+  copy into it, and every path below is untouched. Measured: the direct sweep is worth **1.46x on
+  x86-64 and 1.33x on aarch64**, and the new cost is **+1.8 ms on a ~500 ms synthesis**
+  (`scripts/bench21.c`). The load-bearing design problem is that P4.13's fold and the direct sweep want
+  opposite layouts, so ggml has to be *told* the geometry; the first risk is a cache-budget predicate
+  that prices the kernel by its stored size. → [Epic-05 §5](../epics/epic-05-edge-performance.md)
 * [ ] **`FLASH_ATTENTION`.** Unbuilt. The blocker is **the gate suite's exact-fp32 comparisons, not the
   hardware** — `ggml_flash_attn_ext` forces an F16 K/V cast. A GPU exists now and the trade still has not
   been made; it is a decision about verification. *Context:
