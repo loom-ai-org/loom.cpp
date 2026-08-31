@@ -160,9 +160,11 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     // carries none of them, so the presence of the probe separates "wrong name" from "no choice here".
     //
     // The FIRST condition is the decode path, and it is the one that generalises. A dynamic-length
-    // family (`clip == 0` -- the NeMo CTC and transducer models) calls `infer` with the waveform and
-    // its length and NOTHING else: there is no prompt to put a language token in, so no argument here
-    // can reach the model whatever its vocabulary happens to contain. Deciding on the vocabulary alone
+    // family (`clip == 0`) calls `infer` with the waveform and a length and NOTHING else, so no
+    // argument here can reach the model whatever its vocabulary happens to contain. That covers both
+    // tenants of that branch, for different reasons: the NeMo models have no prompt at all, and
+    // family 3 has one that was rendered from the checkpoint's chat template AT EXPORT TIME into the
+    // driver's own constants -- so it is equally out of reach of a run-time argument. Deciding on the vocabulary alone
     // got this wrong in a way worth recording -- parakeet-tdt carries a literal `<|en|>` PIECE in its
     // SentencePiece vocabulary, so a spelled probe reports it as language-selectable, and a caller
     // passing `language="en"` would have been given neither a warning nor an effect.
@@ -233,11 +235,42 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     const double rate = contract.sample_rate ? contract.sample_rate : 16000;
 
     if (clip == 0) {
-        // Dynamic length: the whole file in one call, which is the NeMo families' shape.
-        const std::vector<double> waveform_d(waveform.begin(), waveform.end());
-        const std::vector<double> length_d{static_cast<double>(waveform.size())};
-        const LoomLuaBridge::Value result =
-            bridge.call("infer", {{"waveform", waveform_d}, {"length", length_d}});
+        // ONE PASS OVER THE WHOLE WAVEFORM -- and TWO families share this branch, which is worth
+        // saying because it used to say "the NeMo families' shape" and then quietly acquired a
+        // second tenant that it did not serve correctly.
+        //
+        //   * the NeMo CTC and transducer models take any length at all, and want `length`;
+        //   * family 3 (Qwen3-ASR, Granite Speech) takes any length too, but its encoder reshapes
+        //     mel frames into whole chunks, so the waveform it is HANDED must be a multiple of
+        //     `loom.samples_per_chunk` -- and the true length then has to travel separately, as
+        //     `audio_samples`, or the model transcribes the padding as if it were silence it heard.
+        //
+        // Both are "no windowing, no timestamps, one call", which is why they belong together; the
+        // difference is two arguments, not a decode strategy. Splitting them into sibling branches
+        // would duplicate the detokenize-and-one-segment tail below for that.
+        //
+        // A file declaring no chunk pads by nothing and passes `length`, exactly as before, so the
+        // NeMo path is bit-for-bit unchanged.
+        const uint32_t chunk = chunk_samples(model);
+        const size_t n_real = waveform.size();
+        const size_t n_padded = padded_to_chunk(n_real, chunk);
+
+        std::unordered_map<std::string, LoomLuaBridge::Value> args;
+        if (chunk == 0) {
+            args = {{"waveform", std::vector<double>(waveform.begin(), waveform.end())},
+                    {"length", std::vector<double>{static_cast<double>(n_real)}}};
+        } else {
+            // `window_at` from seek 0 is the padding: `n_padded` samples, zero-filled past the audio.
+            // The driver mirrors the tail of the real signal over the head of those zeros itself.
+            // `audio_samples` is a NUMBER, where `length` beside it is a one-element table. That
+            // asymmetry is the drivers', not a slip: family 3's does arithmetic on it directly
+            // (`#inputs.waveform - _audio_samples`), so handing it a table fails inside Lua with
+            // `attempt to perform arithmetic on local '_audio_samples' (a table value)` -- which is
+            // what the first version of this did.
+            args = {{"waveform", window_at(waveform, 0, static_cast<uint32_t>(n_padded))},
+                    {"audio_samples", static_cast<double>(n_real)}};
+        }
+        const LoomLuaBridge::Value result = bridge.call("infer", args);
         std::vector<int32_t> ids;
         if (std::holds_alternative<std::vector<double>>(result)) {
             for (double id : std::get<std::vector<double>>(result)) {
@@ -247,8 +280,11 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         out.text = detokenize(ids);
         // The ONE segment spans the whole clip, and says so. It used to be `{0.0, 0.0}`, which reads as
         // a zero-length segment at the start of the file -- a measurement, and a wrong one. These
-        // families (CTC and transducer) emit no timestamp tokens, so there is no boundary the model
-        // chose to report; what IS true is the extent this transcript covers, which is all of it.
+        // families emit no timestamp tokens -- neither the NeMo CTC and transducer models nor family
+        // 3 -- so there is no boundary the model chose to report; what IS true is the extent this
+        // transcript covers, which is all of it. Note that is the REAL audio's extent: `waveform` is
+        // the caller's, never the chunk-padded copy handed to the driver, so a 5.4 s clip padded to
+        // 6 s still reports 5.4 s.
         //
         // `closed` stays false and `out.timestamped` stays false, which is where a caller reads that
         // these are not model-chosen boundaries. An end of 0.0 said that too, but only to a reader who
