@@ -157,9 +157,73 @@ endif()
 # XCFLAGS=-fPIC: loom_engine is built as a shared library (libloom_engine.so), so every statically-linked
 # .o inside it (including LuaJIT's own) must be position-independent -- without this, linking fails with
 # "relocation R_X86_64_TPOFF32 ... can not be used when making a shared object".
+# macOS: the FIRST thing a Mac build hits, and it is a stop rather than a slowdown. LuaJIT's
+# `src/Makefile` has a hard `$(error missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY)` in its
+# `ifeq (Darwin,$(TARGET_SYS))` arm, reached before any compilation -- and CMake does not put that
+# variable into a custom command's environment, so the invocation below arrives with none at all.
+#
+# The value is not a local convention invented here: it is the same number that TAGS THE WHEEL
+# (`macosx_11_0_arm64`, `macosx_10_13_x86_64`), so one export does both jobs. cibuildwheel exports
+# `MACOSX_DEPLOYMENT_TARGET`, which CMake reads into `CMAKE_OSX_DEPLOYMENT_TARGET`; when nothing set
+# it we fall back to those same per-arch defaults rather than to the BUILDING machine's macOS
+# version, because a library tagged with the builder's OS refuses to load on any older one -- the
+# AVX2-wheel defect (tests/ci/test_cpu_variants.py in loom-py) in a different spelling.
+# THE OUTER MAKE'S JOBSERVER MUST NOT REACH THIS INNER ONE, and clearing it is not a macOS
+# concern -- it is what makes the line below survive a `Unix Makefiles` generator anywhere. GNU make
+# advertises its jobserver to sub-makes through `MAKEFLAGS` (`--jobserver-auth=R,W`), but only hands
+# the file descriptors to a recipe it recognises as recursive, which means one spelled `$(MAKE)`.
+# This one is deliberately plain `make` (see above: the generator may not be make at all), so LuaJIT
+# starts, reads the inherited MAKEFLAGS, and tries to talk to descriptors that were never passed:
+#
+#     make[3]: warning: -jN forced in submake: disabling jobserver mode
+#     make[3]: /bin/sh: Bad file descriptor
+#     make[3]: *** write jobserver: Bad file descriptor.  Stop.
+#
+# Ninja has no jobserver of this kind, which is why the failure had never been seen: every build that
+# matters -- CI, and scikit-build-core, which pulls ninja in as a build requirement -- uses it. A
+# plain `cmake -B build && make -j` does not, on any platform.
+#
+# `MAKELEVEL=` as well as `MAKEFLAGS=`: it is MAKELEVEL that makes the inner make consider itself a
+# submake and print the first of those three lines.
+set(LUAJIT_MAKE_LAUNCHER ${CMAKE_COMMAND} -E env MAKEFLAGS= MAKELEVEL=)
+if(APPLE)
+    # universal2 is a declared non-goal (Epic-08 §4: two native wheels, not one fat one), and a
+    # cross-arch build is a different job from this one -- LuaJIT bootstraps through `minilua` and
+    # `buildvm`, which run on the HOST, so a target arch that is not the host arch needs a
+    # HOST_CC/TARGET_CFLAGS split that nothing here sets up. Fail with the reason rather than
+    # produce a library for the wrong architecture and let the link discover it.
+    list(LENGTH CMAKE_OSX_ARCHITECTURES LUAJIT_NARCH)
+    if(LUAJIT_NARCH GREATER 1)
+        message(FATAL_ERROR
+            "CMAKE_OSX_ARCHITECTURES='${CMAKE_OSX_ARCHITECTURES}': the vendored LuaJIT builds one "
+            "architecture at a time, so a universal binary is not buildable here. Build each arch "
+            "separately -- which is what this project ships anyway.")
+    endif()
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(LUAJIT_TARGET_ARCH ${CMAKE_OSX_ARCHITECTURES})
+    else()
+        set(LUAJIT_TARGET_ARCH ${CMAKE_HOST_SYSTEM_PROCESSOR})
+    endif()
+    if(NOT LUAJIT_TARGET_ARCH STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
+        message(FATAL_ERROR
+            "Cross-compiling LuaJIT (host ${CMAKE_HOST_SYSTEM_PROCESSOR} -> target "
+            "${LUAJIT_TARGET_ARCH}) is not wired up: its build runs minilua/buildvm on the host and "
+            "would need a HOST_CC/TARGET_CFLAGS split. Build on a machine of the target arch.")
+    endif()
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(LUAJIT_MACOS_TARGET ${CMAKE_OSX_DEPLOYMENT_TARGET})
+    elseif(LUAJIT_TARGET_ARCH STREQUAL "arm64")
+        set(LUAJIT_MACOS_TARGET "11.0")
+    else()
+        set(LUAJIT_MACOS_TARGET "10.13")
+    endif()
+    list(APPEND LUAJIT_MAKE_LAUNCHER MACOSX_DEPLOYMENT_TARGET=${LUAJIT_MACOS_TARGET})
+    message(STATUS "LuaJIT: MACOSX_DEPLOYMENT_TARGET=${LUAJIT_MACOS_TARGET} (${LUAJIT_TARGET_ARCH})")
+endif()
+
 add_custom_command(
     OUTPUT ${LUAJIT_LIBRARY}
-    COMMAND make -C ${LUAJIT_SRC_DIR} BUILDMODE=static XCFLAGS=-fPIC -j${LUAJIT_NPROC}
+    COMMAND ${LUAJIT_MAKE_LAUNCHER} make -C ${LUAJIT_SRC_DIR} BUILDMODE=static XCFLAGS=-fPIC -j${LUAJIT_NPROC}
     WORKING_DIRECTORY ${LUAJIT_SRC_DIR}
     COMMENT "Building LuaJIT (static, via its own Makefile)"
     VERBATIM

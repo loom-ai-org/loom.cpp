@@ -1,6 +1,6 @@
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -1,5 +1,12 @@
+@@ -1,5 +1,15 @@
  #include "ops.h"
  
 +#if defined(__aarch64__)
@@ -9,11 +9,14 @@
 +#  include <immintrin.h>
 +#endif
 +#include <unistd.h>
++#if defined(__APPLE__)
++#  include <sys/sysctl.h>
++#endif
 +
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
  #include "binary-ops.h"
-@@ -6990,6 +6997,477 @@
+@@ -6990,6 +6997,502 @@
  
  // ggml_compute_forward_conv_2d
  
@@ -45,11 +48,36 @@
 +    static int64_t budget = -1;
 +    if (budget < 0) {
 +        long l2 = 0, l3 = 0;
++#if defined(__APPLE__)
++        // sysctl, BECAUSE THE sysconf NAMES BELOW DO NOT EXIST HERE. `_SC_LEVEL2_CACHE_SIZE` and
++        // `_SC_LEVEL3_CACHE_SIZE` are glibc extensions and are absent from the macOS SDK's
++        // <unistd.h>, so both `#if defined` arms compile out and this function silently returned the
++        // 512 KB floor on every Mac -- on a laptop whose performance cluster has 12 MB of L2. The
++        // failure mode is not a wrong answer, it is a rule that says "no" to every convolution big
++        // enough to be worth the direct path.
++        //
++        // `hw.perflevel0.l2cachesize` RATHER THAN `hw.l2cachesize`, and the difference is 3x on this
++        // part. Apple Silicon is heterogeneous: perflevel0 is the PERFORMANCE cluster (12 MB on an
++        // M1 Pro) and perflevel1 the efficiency one, while the flat `hw.l2cachesize` reports 4 MB.
++        // ggml's threads run on the performance cores, so that is the cache this decision is about.
++        // The flat name is kept as a fallback for the Intel Macs that do not publish perflevel keys.
++        size_t sz = sizeof(uint64_t);
++        uint64_t v = 0;
++        if (sysctlbyname("hw.perflevel0.l2cachesize", &v, &sz, NULL, 0) == 0 && v > 0) {
++            l2 = (long) v;
++        } else {
++            sz = sizeof(uint64_t); v = 0;
++            if (sysctlbyname("hw.l2cachesize", &v, &sz, NULL, 0) == 0) l2 = (long) v;
++        }
++        sz = sizeof(uint64_t); v = 0;
++        if (sysctlbyname("hw.l3cachesize", &v, &sz, NULL, 0) == 0) l3 = (long) v;
++#else
 +#if defined(_SC_LEVEL3_CACHE_SIZE)
 +        l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
 +#endif
 +#if defined(_SC_LEVEL2_CACHE_SIZE)
 +        l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
++#endif
 +#endif
 +        // Half of the last level, because the activation slice and the output share it; and a floor of
 +        // 512 KB for the machines that report nothing at all, which is every aarch64 Linux box tried.
