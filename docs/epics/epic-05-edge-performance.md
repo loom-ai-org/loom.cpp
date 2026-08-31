@@ -3503,7 +3503,10 @@ exactly what the design predicted.
   `mul_mat_kernel_first` lowering when the answer is no, which on Vulkan it is — twice over, on a type
   test and on `cout == op->ne[2]`. **CUDA had to be told**: its `supports_op` for `CONV_2D` was
   `ggml_is_contiguous(src0) && ggml_is_contiguous(src1)`, which accepts a folded quantized kernel and
-  then reads it as a wrong-shaped F32 one — a silent wrong answer rather than a failure. Now declined.
+  then reads it as a wrong-shaped F32 one — a silent wrong answer rather than a failure. Now declined. **Metal
+  was read too and needs nothing**: its `supports_op` requires `src[0]->type == F16 || F32`, so it
+  declines like Vulkan — see [Epic-04 §5](epic-04-backends-and-accelerators.md), which records the one
+  condition under which that would stop being enough.
 * **`test_conv_1d_folded_kernel_matches_declared` has a fourth arm**, and runs over **two shape sets**
   because the packed op has two lowerings inside it and the shape picks between them: `OC=5, IL=11`
   lands on the batched im2col, `OC=4, IL=64` on the direct register-tiled sweep (verified by
