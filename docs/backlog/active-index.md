@@ -241,11 +241,13 @@ primitive set.
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
   `repeat_for`'s own loop bound.
 * [ ] `export_config.py`'s module docstring points at a ledger section that no longer exists.
-* [ ] **Four ggml patches fail `git apply --reverse --check` on an already-patched tree**
-  (`ggml-0004`..`ggml-0007`), because later patches edit `ops.cpp` inside their context. So
-  `GgmlPatches.cmake` takes its reset-and-retry path on *every* `cmake` re-run and rebuilds ggml from
-  scratch. It works and it is only a build-time cost; regenerating those four with more context lines
-  would end it.
+* [ ] **`GgmlPatches.cmake` asks "already applied?" the wrong way, so every `cmake` re-run rebuilds
+  ggml from scratch** (~30 min on the Pi). It reverse-applies **each patch individually against the
+  final tree**, which only holds while no later patch rewrites lines an earlier one added —
+  `ggml-0004`..`0007` all fail it today. **Not a context-width problem**: regenerating one at `-U3`,
+  `-U1` and `-U0` all still fail, because the added lines themselves are gone. The fix is a stamp file
+  holding the applied set's names and hashes, skipped when it matches. Build-time cost only; the
+  reset-and-retry path it falls into is correct.
 
 ---
 

@@ -3524,11 +3524,17 @@ exactly what the design predicted.
 * **`op_conv_2d` (the genuinely 2-D form) is untouched** and still takes im2col + `mul_mat_kernel_first`
   for a folded kernel. Nothing in tree has a quantized 2-D convolution hot enough to notice; the same
   `ggml_conv_2d_direct_packed` would serve it, with `kh > 1`, whenever one does.
-* **`cmake/patches` reverse-check.** ggml-0013 edits `ops.cpp` inside ggml-0007's context, so that patch
-  joins 0004-0006 in failing `git apply --reverse --check` on an already-patched tree, and every
-  `cmake` re-run therefore takes `GgmlPatches.cmake`'s reset-and-retry path (which works, and rebuilds
-  ggml). Pre-existing, now one patch worse, and cheap to fix by regenerating the earlier patches with
-  more context.
+* **`cmake/patches`' idempotency test is the wrong test, and ggml-0013 makes it one patch wronger.**
+  `GgmlPatches.cmake` asks "is this patch already applied?" by reverse-applying **each patch
+  individually against the final tree**, which only holds while no *later* patch rewrites lines an
+  earlier one added. ggml-0013 moves `conv_2d_impl`'s `kernel_type == F16 || F32` assert past the new
+  quantized branch — lines ggml-0007 also rewrites — so 0007 joins 0004-0006 in failing the check, and
+  every `cmake` re-run takes the reset-and-retry path and rebuilds ggml from scratch (~30 min on the
+  Pi). **It is not a context-width problem**: regenerating 0007 at `-U3`, `-U1` and `-U0` all still
+  fail, because the *added* lines themselves are gone, not their surroundings. The fix is to change the
+  test, not the patches — a stamp file holding the applied set's names and hashes, skipped when it
+  matches. Correctness is unaffected either way: the reset path re-applies all 13 and the tree is
+  verified byte-identical to the one the suites were run against.
 
 ### P4.28 — the relative-position pad: 18.9 MB of a VITS export was zeros — DONE 2026-08-31
 
