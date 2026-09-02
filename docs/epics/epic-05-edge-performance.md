@@ -235,6 +235,11 @@ that default is a separate question — **and it now has its own benchmark, belo
 
 ### What the default thread count should be, now that the curve is monotonic
 
+*(**SHIPPED 2026-09-02 as P4.30b step 1.** The default is now this machine's physical core count —
+`loom::default_cpu_thread_count()`, `src/core/backend.cpp`, exposed on `loom/core/backend.h` so a host
+can report it and `tests/ci/test_default_thread_count.cpp` can check it. The sweeps below are what
+decided it and are unchanged; what follows them is the shape the implementation took.)*
+
 The default was left at ggml's 4 because raising it "would be a regression on exactly the machines it
 looks like it should help". **That objection was about the libgomp collapse and no longer holds.**
 Re-measured on the fixed engine, best of 3 per point, `$LOOM_N_THREADS` the only variable.
@@ -284,36 +289,146 @@ Two things this measurement is not:
 * **Every number is one inference at a time on an idle machine.** A host running several loom instances
   concurrently, or sharing the box, would have each claim every core; ggml's conservative 4 is a
   reasonable default for that world and a bad one for this. Raising the default is a **policy** choice
-  about which world loom is for, not a further measurement.
+  about which world loom is for, not a further measurement. **The call was taken on 2026-09-02: loom is
+  for the edge, one model on one device, and the default is the physical core count. That host sets
+  `$LOOM_N_THREADS`, which is the only thing it has to do and the only thing this change asks of it.**
+
+**How the count is obtained**, since "physical core" is not something ggml will answer — it has no such
+helper, and `GGML_DEFAULT_N_THREADS` is the constant 4:
+
+* **Linux:** the process's CPU affinity mask (`sched_getaffinity`) intersected with
+  `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`, counting each SMT sibling group once at
+  the lowest member the process may use. **Affinity-aware on purpose:** a process under `taskset` or in
+  a cgroup cpuset has been told how much machine it has, and answering with the whole socket would
+  oversubscribe exactly the deployment that took the trouble to say. Verified on both boxes — the 285K
+  reads 24, the Ryzen reads 2 rather than its 4 logical CPUs, `taskset -c 0-7` on the 285K reads 8, and
+  `taskset -c 0,1` on the Ryzen (one sibling pair) reads 1 while `-c 0,2` (two cores) reads 2.
+* **macOS:** `hw.perflevel0.physicalcpu`, falling back to `hw.physicalcpu`. Apple Silicon's E-cores are
+  a slower core *design* rather than SMT siblings, so a pool sized to include them runs at the pace of
+  its slowest member; `perflevel0` does not exist on an Intel Mac, where the fallback is the whole
+  answer.
+* **Anywhere else:** 0, meaning "cannot be asked", and ggml's 4 stands. loom-py publishes manylinux and
+  macOS wheels and nothing else, so an untested guess at a third topology API would be a liability
+  rather than a feature.
+
+**A cgroup CPU *quota* (`cpu.max`, docker's `--cpus=2.5`) is deliberately NOT read.** A quota is a
+bandwidth cap rather than a set of CPUs — it throttles a thread pool instead of confining it — and the
+right thread count under one is not a function of the quota alone. A `$LOOM_N_THREADS` decision, not an
+engine one.
+
+**A non-numeric `$LOOM_N_THREADS` falls through to autodetection rather than to 4.** `LOOM_N_THREADS=oops`
+is a typo; honouring it as a request for four threads would make a typo silently mean "run this 24-core
+box on four cores", which is the exact failure this item closed.
+
+**The risk worth checking was that the suites' exact-fp32 comparisons are thread-count sensitive** — a
+reduction ordering changes with the job split, and raising the default silently changes what every
+gate test runs at. Swept: `ctest -L ci` is **75/75 at 1, 2, 4 and 8 threads**, and `ctest -L gate` is
+**83/83 at all four**. That gate figure is 13 tests that actually ran and 70 skipped for absent
+fixtures on this box (the `v5` set is the MIL GGUFs without most reference directories), so the sweep
+covers the 13 — `whisper_mil_export`, `causal_lm_infer_with_past`, the four TTS Lua drivers and the
+tokenizer tests — and not the other 70.
 
 **Low thread counts on a hybrid part are noisy, and the noise is placement.** On the 285K's 8 P-cores +
 16 E-cores a 1-, 2- or 4-thread run can be scheduled entirely onto E-cores: one sweep read 0.0926 s at
 4 threads where a repeat read 0.0638 s. Hence best-of-3 above, and **a single measurement below ~6
 threads on a hybrid CPU should not be trusted.**
+
+**P4.30b pinned that down and it is not noise — it is which cluster.** `/sys/devices/cpu_core/cpus` is
+0-7 and `cpu_atom` is 8-23. Pinned to one cluster, VITS at 4 threads is reproducible to ~1% on both
+engines, and the two clusters give *different ratios*: P-cluster loom 0.0624-0.0628 s against
+onnxruntime 0.0646-0.0661 (**1.034-1.053**), E-cluster loom 0.0916-0.0927 against 0.1033-0.1075
+(**1.114-1.165**). A four-thread process lands on one cluster and keeps it for its whole life, which is
+why a within-process median cannot average it out — and why the 0.0926/0.0638 pair above is exactly
+this, seen before it had a name.
 ### Three tasks, not one — and the convolutional one is the good one
 
 VITS is the model this whole thread optimised, so it is the least representative thing to quote alone.
-**Re-measured 2026-08-24 with both engines run back to back on each machine**, F32 on both sides:
+**Every TTS and LM cell was re-sampled per launch on 2026-09-02 (P4.30b step 2), on all three
+machines**; the ASR column is from 2026-08-29. F32 on both sides, both engines run back to back on each
+machine — one second between arms on x86, cooled to 60 C before each arm on the Pi:
 
 | machine | threads | TTS | LM | ASR |
 |---|---|---|---|---|
-| Core Ultra 9 285K | 4 | **1.03x** | **1.01x** | 0.71x |
-| Core Ultra 9 285K | 24 (all) | **1.17x** | 0.96x | **1.29x** |
-| Ryzen 3 3250U | 2 (physical) | **1.02x** | **1.05x** | 0.67x |
-| Ryzen 3 3250U | 4 (all) | 0.99x | **1.04x** | 0.72x |
-| Raspberry Pi 4B | 4 (all) | 0.98x | **1.08x** | 0.57x |
+| Core Ultra 9 285K | 4 | **1.05x** | 1.02x | 0.71x |
+| Core Ultra 9 285K | 24 (default) | 1.20x | 0.99x | **1.29x** |
+| Ryzen 3 3250U | 2 (default) | 0.98x | **1.01x** | 0.67x |
+| Ryzen 3 3250U | 4 (all) | 1.00x | **1.02x** | 0.72x |
+| Raspberry Pi 4B | 4 (default) | **0.96x** | **1.03x** | 0.57x |
 
-`>1.00x` is loom faster. The full table with its methodology and caveats is in the
+`>1.00x` is loom faster, and a **bolded** TTS or LM cell is one whose paired p10 and p90 both sit on one
+side of 1.00x — five of the ten do, and the Pi's TTS is the only one that resolves as a loss. The full
+table with its methodology and caveats is in the
 [README](../../README.md#performance-against-onnxruntime); the ones that change how it should be read
 are that the baseline is the **PyPI** onnxruntime wheel (conda-forge's build of the *same version* is
 1.86x faster on VITS, and against it the x86 TTS wins become losses), and that the Pi row is taken
 cooled and interleaved because that board drifts 33% when it is not.
 
-**The estimator is the median** of repeated runs on both sides, except the Pi row, which reports the
-FASTEST run — on that board thermal drift only ever makes a run slower, so the coolest run is the least
-contaminated one. That choice is not cosmetic: loom's LM at 24 threads is bimodal (24.5-28.6 tok/s
-across nine runs, against onnxruntime's steady 27.1-27.6), so its best run wins the cell at 1.03x and
-its typical run loses it at 0.96x. The table reports the typical one.
+**The re-sample confirmed the table rather than overturning it.** No TTS or LM cell on any machine
+moved by more than 0.04; the largest was the Ryzen's two-thread LM, 1.05x → 1.01x, and the Pi's two
+moved 0.95x → 0.96x and 1.06x → 1.03x. That is the useful result — the columns that carried the "not
+re-sampled per launch" caveat for a week did not need rescuing.
+
+**The Pi turned out to be the best-behaved machine in the table.** Cooled to 60 C before every arm it
+holds a **1.02-1.05x** spread per engine across launches, against the 285K's 1.45x, and **both its
+cells resolve** where only three of the eight x86 cells do. That also retires its "report the fastest
+run" special case: the cooldown removes the drift the special case was estimating around, so the Pi now
+uses the same mean-over-launches estimator as every other row. Its LM arms run `nrun=2` on both sides
+rather than 3, because a generation there is 47 s — matched within the row, which is what the ratio
+depends on, and `bench_lm_loom.cpp` grew a `refeed` argument so the `infer` diagnostic arm (1.4x the
+timed one, 65 s a launch on that board) can be skipped when nothing reads it.
+
+**The estimator for the re-sampled cells is the MEAN over launches**, not the median, and that is the
+substantive change. At 24 threads on the 285K both engines' VITS time splits into two per-launch modes
+about 1.4x apart at roughly even odds; a median over that lands on whichever mode drew the majority, so
+the same measurement can report 1.19x or 1.66x with nothing changed. The ASR column stays a median over
+launches and the Pi row stays the FASTEST run — on that board thermal drift only ever makes a run
+slower, so the coolest run is the least contaminated one.
+
+**And letting the machine settle between arms is worth more than any estimator choice here.** Run
+immediately after loom, onnxruntime landed in its slow VITS mode in 29 of 31 launches; run alone in the
+same session, 10 of 20. One second between arms restored it to 21 of 31 and moved the 285K's 24-thread
+TTS cell from 1.41x to 1.20x, and its 24-thread LM cell from 0.94x to 0.99x. ABBA does not cancel this
+— both orders penalise whoever runs second, and not equally, since ggml's threadpool spins where
+onnxruntime re-decides placement at session creation. On the homogeneous Ryzen the same settle is worth
+~1%, which is what identifies it as a placement effect on the hybrid part. **The Pi's cooldown is the
+same idea arrived at earlier for a different reason** — it was introduced for thermal drift, and it
+happens to be the strongest settle in the table, which is why that board produces the tightest
+numbers.
+[Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md) has the whole of it,
+including the three harness faults found on the way and the P-cluster/E-cluster decomposition that
+turns "a 1.48x lottery" into two reproducible numbers.
+
+**How to re-derive a TTS or LM cell.** `paired_arms.py` grew a `--cmd` mode for exactly this — two
+engines rather than two builds of one binary — with a `--metric` per arm, because the two do not print
+alike, and a named `--ratio`, because 0.6 is a win for a seconds metric and a loss for a tok/s one:
+
+```sh
+# TTS. --ratio onnx/loom, since the metric is seconds and >1 must mean loom won.
+./scripts/paired_arms.py --cmd --rounds 31 --between "sleep 1" --label "285K TTS @24" \
+    --arm loom="LOOM_N_THREADS=24 ./bench_vits_loom $LOOM_FIXTURES/../vits-piper-en-gb-miro.gguf 9" \
+    --arm onnx="python3 scripts/bench_onnx_tasks.py vits miro_en-GB.onnx 24 9" \
+    --metric 'loom   vits.*median\s+([0-9.]+)' \
+    --metric 'onnx   vits.*median\s+([0-9.]+)' --ratio onnx/loom
+
+# LM. --ratio loom/onnx, since the metric is tok/s. The `loom   lm` prefix matters: bench_lm_loom
+# prints tok/s TWICE, and the second is the re-fed `infer` arm that is 1.4x slower.
+./scripts/paired_arms.py --cmd --rounds 21 --between "sleep 1" --label "285K LM @24" \
+    --arm loom="LOOM_N_THREADS=24 ./bench_lm_loom qwen3-0.6b-base.gguf 65 3" \
+    --arm onnx="python3 scripts/bench_onnx_tasks.py lm qwen3-0.6b/onnx/model.onnx 24 65 3" \
+    --metric 'loom   lm.*\(\d+ tokens, ([0-9.]+) tok/s\)' \
+    --metric 'onnx   lm.*\(\d+ tokens, ([0-9.]+) tok/s\)' --ratio loom/onnx
+```
+
+**On the Pi, two substitutions.** `--between "$HOME/cool.sh 60"` replaces the `sleep 1` — it is that
+board's standing protocol and it is also the strongest settle in the table. And the loom LM arm takes a
+fourth argument, `0`, to skip the re-fed `infer` diagnostic (`./bench_lm_loom <gguf> 65 2 0`): it is
+1.4x the timed arm, which at 1.38 tok/s is 65 s a launch of work nothing here reads. `nrun` drops to 2
+on **both** sides for the same reason — matched within the row is what the ratio depends on.
+
+It reports the median AND the mean of each arm, the paired ratio with p10/p90, and warns when an arm's
+launches split into two weighted clusters — which is the signal to quote the mean. **Quote the cell
+only if the two engines' equal-work checks agree in the same session:** VITS must print the same
+`samples=` on both sides (73216), and the LM the same `first5=`.
 
 **The previous version of this table was wrong in both directions and is worth keeping as a warning.**
 It read 1.25x / 1.16x / 0.41x for the 285K at 4 threads. Two independent errors made it so: its
@@ -1311,7 +1426,7 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
 | | |
 |---|---|
 | Decisions | [ADR-014](../adrs/adr-014-patch-ggml-rather-than-write-kernels.md), [ADR-017](../adrs/adr-017-no-k-quants.md) |
-| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md) |
+| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md), [Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md) |
 | Active tasks | [Backlog → Performance](../backlog/active-index.md#engine--performance) |
 
 ## 4. The Record
@@ -2292,7 +2407,8 @@ did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27
 **P4.10–P4.29 are all closed as headline items.** Their remainders are gathered as **P4.30** in
 [the hub](../backlog/active-index.md#p430--the-tails-of-p410p429), as three tasks: P4.30a (Metal's
 convolutional cost, → [Epic-04 §5.4](epic-04-backends-and-accelerators.md)), P4.30b (the default
-thread count, then the README's TTS and LM columns per launch — §2 above), and P4.30c (a sequential
+thread count, then the README's TTS and LM columns per launch — §2 above, **CLOSED 2026-09-02**), and
+P4.30c (a sequential
 pass over the small tails: the three other conv families at Q8_0 and the direct-conv budget with
 them, `op_conv_2d`, `ldc` alignment, the Metal `PAD` kernel, and the upstream `OMP_WAIT_POLICY`
 note — §5 below and Epic-04 §5.4). The evidence for each stays where it was measured; the hub holds

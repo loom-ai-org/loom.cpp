@@ -11,7 +11,12 @@
 
 #ifdef __linux__
 #include <dirent.h>
+#include <sched.h>
 #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
 #endif
 
 namespace loom {
@@ -304,25 +309,126 @@ std::string device_list_for_error() {
 }
 
 
+#ifdef __linux__
+// A Linux cpu list -- "0-3", "0,2,4", "0-1,4-5" -- appended to `out`. False on anything it cannot
+// parse, rather than returning what it managed to read: a half-parsed sibling list would silently
+// double a core count, and the caller needs to tell "unknown" apart from an answer.
+bool parse_cpu_list(const std::string& s, std::vector<int>& out) {
+    size_t i = 0;
+    while (i < s.size()) {
+        if (std::isdigit(static_cast<unsigned char>(s[i])) == 0) return false;
+        long lo = std::strtol(s.c_str() + i, nullptr, 10);
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])) != 0) ++i;
+        long hi = lo;
+        if (i < s.size() && s[i] == '-') {
+            ++i;
+            if (i >= s.size() || std::isdigit(static_cast<unsigned char>(s[i])) == 0) return false;
+            hi = std::strtol(s.c_str() + i, nullptr, 10);
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])) != 0) ++i;
+        }
+        if (hi < lo || hi - lo > CPU_SETSIZE) return false;
+        for (long c = lo; c <= hi; ++c) out.push_back(static_cast<int>(c));
+        if (i < s.size()) {
+            if (s[i] != ',') return false;
+            ++i;
+        }
+    }
+    return !out.empty();
+}
+#endif
+
+// The number of PHYSICAL cores this process may run on, or 0 when the machine cannot be asked.
+//
+// PHYSICAL rather than logical is a measurement rather than a preference, and the two machines it was
+// swept on only agree once it is put that way. The Core Ultra 9 285K has 24 cores and no SMT, so every
+// logical CPU is a physical one and using all of them is 1.98x on TTS, 2.41x on ASR and 1.18x on the LM
+// against ggml's 4. A 2-core-plus-SMT Ryzen 3 3250U wants 2 rather than its 4 logical CPUs: the two
+// extra siblings buy nothing on any of the three tasks and COST 1.19x on TTS. "Use every CPU" would be
+// right on one of those machines and a regression on the other; "use every physical core" is right on
+// both. The sweeps are in Epic-05 SS2.
+//
+// AFFINITY-aware on Linux, and that is not decoration. A process under `taskset`, or in a cgroup with a
+// cpuset, has been told how much machine it has; answering with the whole socket would ignore it and
+// oversubscribe exactly the deployment that took the trouble to say so. An SMT sibling group is counted
+// at the lowest member THIS PROCESS MAY USE, so a mask covering one thread of a pair still counts that
+// core once, and a mask covering both also counts it once.
+//
+// What this deliberately does not read is a cgroup CPU *quota* (`cpu.max`, docker's `--cpus=2.5`). A
+// quota is a bandwidth cap rather than a set of CPUs -- it throttles a thread pool instead of confining
+// it, and the right thread count under one is not a function of the quota alone. A host in that world
+// sets $LOOM_N_THREADS.
+int physical_core_count() {
+#if defined(__linux__)
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0) return 0;
+
+    std::vector<int> cpus;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, &mask)) cpus.push_back(c);
+    }
+    if (cpus.empty()) return 0;
+
+    std::vector<int> leaders;
+    bool topology_readable = false;
+    for (int c : cpus) {
+        const std::string path =
+            "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list";
+        std::ifstream f(path);
+        std::string line;
+        std::vector<int> siblings;
+        int leader = c;
+        if (f && std::getline(f, line) && parse_cpu_list(line, siblings)) {
+            topology_readable = true;
+            for (int s : siblings) {
+                if (s < leader && std::find(cpus.begin(), cpus.end(), s) != cpus.end()) leader = s;
+            }
+        }
+        // A cpu whose own topology is unreadable counts as its own core rather than vanishing.
+        if (std::find(leaders.begin(), leaders.end(), leader) == leaders.end()) leaders.push_back(leader);
+    }
+
+    // Nothing under /sys answered at all -- a container without sysfs, most likely. Report "cannot be
+    // asked" rather than the logical count dressed up as a physical one: on an SMT part those differ by
+    // 2x, in the direction that costs.
+    if (!topology_readable) return 0;
+    return static_cast<int>(leaders.size());
+
+#elif defined(__APPLE__)
+    // Apple Silicon reports its performance cores separately, and those are the ones to count: its
+    // E-cores are a slower core DESIGN rather than SMT siblings, and a pool sized to include them runs
+    // at the pace of its slowest member. `hw.perflevel0` is the highest-performance level and does not
+    // exist on an Intel Mac, where `hw.physicalcpu` is the whole answer.
+    int32_t n = 0;
+    size_t len = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) return n;
+    n = 0;
+    len = sizeof(n);
+    if (sysctlbyname("hw.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) return n;
+    return 0;
+
+#else
+    // Every platform this project builds and tests on is covered above -- loom-py publishes manylinux
+    // and macOS wheels and nothing else. Anywhere else keeps ggml's 4 and can be raised with
+    // $LOOM_N_THREADS, which is a better outcome than an untested guess at a topology API.
+    return 0;
+#endif
+}
+
 // The CPU backend's thread count, which nothing in this engine used to set.
 //
 // `ggml` defaults to `GGML_DEFAULT_N_THREADS` -- **4, whatever the machine has** (`ggml.h:232`) -- so
-// loom ran a 24-core workstation on four cores and said nothing about it.
+// loom ran a 24-core workstation on four cores and said nothing about it. As of P4.30b the default is
+// this machine's physical core count instead, and `$LOOM_N_THREADS` overrides that.
 //
 // Set through the REGISTRY's proc address rather than by calling `ggml_backend_cpu_set_n_threads`,
 // which lives inside the CPU backend and is therefore unlinkable in the `GGML_BACKEND_DL` build the
 // wheels ship (ADR-009) -- the same reason `tests/support/cpu_backend.h` exists. A backend that does
 // not export it (every GPU one) is left alone, which is correct: their parallelism is not a host
 // thread count.
-//
-// `$LOOM_N_THREADS` is the only way in and **unset changes nothing**, so no existing deployment moves
-// underneath its owner. Whether the default should become the core count is a decision with a
-// benchmark attached rather than a patch, and is filed rather than taken here.
 void apply_cpu_threads(ggml_backend_t backend) {
     if (backend == nullptr) return;
-    const char* env = std::getenv("LOOM_N_THREADS");
-    if (env == nullptr || *env == '\0') return;
-    const int n = std::atoi(env);
+    const int n = default_cpu_thread_count();
     if (n <= 0) return;
 
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -335,6 +441,19 @@ void apply_cpu_threads(ggml_backend_t backend) {
 }
 
 } // namespace
+
+int default_cpu_thread_count() {
+    // Resolution order is this project's usual one for something the machine can answer for itself
+    // (see Device::open's `spec`): the environment first, then autodetection. A non-numeric or
+    // non-positive $LOOM_N_THREADS falls through to autodetection rather than to ggml's 4, because
+    // "LOOM_N_THREADS=oops" is a typo and not a request for four threads.
+    const char* env = std::getenv("LOOM_N_THREADS");
+    if (env != nullptr && *env != '\0') {
+        const int n = std::atoi(env);
+        if (n > 0) return n;
+    }
+    return physical_core_count();
+}
 
 void add_backend_search_path(const std::string& dir) {
     // An empty path is not a directory, and ggml would resolve it to one anyway -- it joins the search
