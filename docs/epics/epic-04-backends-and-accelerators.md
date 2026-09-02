@@ -747,13 +747,14 @@ questions turned out to be.
 | whisper-small | encoder is large matmuls | **0 / 4** | 1764.3 ms | **654.9 ms** | **2.69x faster** |
 | VITS (f32) | 1-D convolution throughout | **27 / 56** | 94.1 ms | 493.3 ms | **5.24x slower** |
 
-**Both columns have since moved, and §5.7 carries the current pair.** The CPU side because P4.30b
-made the default thread count this machine's eight physical cores rather than ggml's four; the Metal
-side because P4.30a found what the 5.24x was and `ggml-0014` removed half of it. Re-measured at HEAD
-on 2026-09-02, VITS f32 is **55.0 ms on the CPU and 278.7 ms on Metal**, and whisper-small — a whole
-transcription of `samples/jfk.wav` through `scripts/bench_asr_loom.cpp`, not the encoder alone — is
-**1.325 s on the CPU and 0.874 s on Metal**. The shape of the finding is unchanged: **it depends on
-the model, and for a convolutional one Metal loses.**
+**Both columns have since moved twice, and §5.8 carries the current pair.** The CPU side because
+P4.30b made the default thread count this machine's eight physical cores rather than ggml's four; the
+Metal side because P4.30a found what the 5.24x was and `ggml-0014` removed half of it, and then
+P4.30d rewrote the convolution kernel as `ggml-0015`. Re-measured at HEAD on 2026-09-02, VITS f32 is
+**54.6 ms on the CPU and 97.6 ms on Metal**, and whisper-small — a whole transcription of
+`samples/jfk.wav` through `scripts/bench_asr_loom.cpp`, not the encoder alone — is **1.326 s on the
+CPU and 0.752 s on Metal**. The shape of the finding is unchanged even though the gap is now a fifth
+of what it was: **it depends on the model, and for a convolutional one Metal still loses.**
 
 **The cause of VITS's fallback is one op.** Of 1308 nodes, only 48 land on the CPU — but they are
 scattered, so each is a round trip. By op: **21 `PAD`**, 12 `CONT`, 6 `SUB`, 6 `SCALE`, 3 `DIV`.
@@ -968,7 +969,9 @@ if `CONV_2D` ran at the rate Metal's own `MUL_MAT` already demonstrates, 16.89 G
 ~11 ms and VITS on Metal would land near the 8-thread CPU's 55 ms. That is the size of the prize and
 it is an upper bound, not an estimate. The two candidate shapes are the two loom already knows: a
 tiled implicit-GEMM kernel with threadgroup staging (what the CPU's `ggml-0004`/`0006` do), or lower
-to `im2col` + `mul_mat` and accept the expansion traffic. Tracked on the hub as **P4.30d**.
+to `im2col` + `mul_mat` and accept the expansion traffic. **Neither is what worked — see §5.8, which
+closes this as `ggml-0015`, and note before reading it that the 5.31 TFLOP/s every ratio above is
+divided by is a SPEC number the part does not deliver.**
 
 #### What this decides for the device hierarchy
 
@@ -976,15 +979,151 @@ It does not rescue it. With `ggml-0014` in, a default-device VITS run on this la
 **5.07x slower** than the same call without Metal (f32; 2.91x at Q4_0), because the residual is a
 kernel-quality gap and not a scheduling one. §5.5's conclusion stands unchanged — Metal ships as an
 extra, `GGML_METAL OFF` stays in `loom-py/CMakeLists.txt` — and the unified-memory ranking item stays
-open on the hub with a smaller, better-understood number attached to it.
+open on the hub with a smaller, better-understood number attached to it. **§5.8 shrinks that number
+again without changing the conclusion.**
+
+### 5.8 P4.30d — the convolution kernel, and the register that was an address
+
+**SHIPPED 2026-09-02**, on the M1 Pro, as
+`cmake/patches/ggml-0015-metal-conv-2d-register-tile.patch`. §5.7 left one op at 86% of a VITS
+synthesis and named two candidate shapes for fixing it. **Neither is what worked**, and the thing
+that carried half the win is not a tile at all.
+
+#### First, throw away the denominator
+
+Every ratio in §5.7 is quoted against the M1 Pro's **5.31 TFLOP/s** spec. That number is not
+reachable by any kernel here. A pure FMA loop with sixteen independent chains and no memory traffic
+at all measures **2.11 TFLOP/s** on this part (`scripts/bench22.mm` prints it before anything else,
+alongside a 180 GB/s streaming-read figure against a 200 GB/s spec). So the stock kernel's "1.3% of
+peak" is really **3.6% of what a kernel can get**, and the headroom was always 28x, not 77x. This is
+[Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md)'s rule applied one level up
+— divide by a measured roofline before scoping — and a GPU is where it is easiest to skip, because
+the spec sheet is published and looks authoritative.
+
+#### The harness, because the model was the wrong loop
+
+Iterating on a Metal kernel through a VITS synthesis costs a ggml rebuild — the Metal library is
+embedded — plus a profiled run, per idea. `scripts/bench22.mm` runs **the same work** against a bare
+Metal device instead: the 31 distinct convolution shapes `scripts/conv_census.py` reports for the
+utterance `bench_vits_loom.cpp` pins, each at the multiplicity the graph issues it. **117 nodes,
+16.884 GFLOP** — the `CONV_2D` row of §5.7's profile table exactly. It reproduces the stock kernel at
+**222.3 ms / 76 GFLOP/s** against the model's 241 ms / 70, so a ratio it reports is a prediction about
+the model, and a variant is a recompile of one `.mm`.
+
+Every variant is checked before it is timed, against a two-level oracle: the stock kernel is the
+reference for all 31 shapes, and the stock kernel is itself checked against a scalar CPU reference on
+every shape small enough to afford one (a `L=73216 IC=32 K=7 OC=32` reference is half a billion MACs
+and there are six of that size).
+
+#### What the kernel does now
+
+One thread accumulates **eight output channels at one output position**. Each activation it loads
+feeds eight FMAs instead of one; the eight weights beside it sit at an address every lane in the
+threadgroup shares, so one cache line serves the SIMD group. Loads per FMA: 2 -> 1.125. The grid
+becomes the output's own shape — x over columns, y over blocks of eight channels, z over rows and
+batch — and `KW` becomes a ggml function constant so the tap loop unrolls for the widths that occur.
+
+#### The half of it that is not the tile
+
+The same tile, written with one `device const TK *` per output channel, is **68.8 ms**. Written with
+32-bit element indices off a single base pointer it is **45.6 ms**. Nothing about the arithmetic
+changed; sixteen registers of pure address stopped competing with the accumulators.
+
+`maxTotalThreadsPerThreadgroup` is the only register-pressure signal Metal exposes without a GPU
+capture, and it reads the story directly: **704 threads for the pointer version, 896 for the index
+version**, against 1024 for a kernel under no pressure. On this GPU occupancy *is* latency hiding,
+and the kernel is latency-bound throughout — it issues 17 instructions per 8 FMAs and reaches 40% of
+what that mix allows.
+
+**That probe explains this gap and does not catch the next one.** Push past 32 accumulators per
+thread — 8 positions x 8 channels — and the kernel runs **302.7 ms, 0.73x, slower than the stock
+kernel it was meant to beat**, while `maxTotalThreadsPerThreadgroup` still reads 896. The compiler
+spilled to scratch rather than raise the register count, and the probe reports register *pressure*,
+not spilling. Only the clock finds that one.
+
+Because 32-bit indices cannot address every tensor, the fast path declines — at threadgroup
+granularity — a stride that is not a whole number of elements or a tensor past 4G elements, and falls
+into the original 64-bit loop. That loop is kept as the general path and also carries the padded
+edges and partial channel tiles, so declining is always *correct*, not merely safe.
+
+#### The sweep, in the order the wins landed
+
+All rows from one run, because a table assembled from several is not a table:
+
+| | total | rate | occupancy | |
+|---|---:|---:|---:|---:|
+| stock | 222.3 ms | 76 GFLOP/s | 1024 | 1.00x |
+| + register tile, 64-bit pointers | 68.8 ms | 245 GFLOP/s | 704 | 3.23x |
+| + 32-bit element indices | 45.6 ms | 370 GFLOP/s | 896 | 4.88x |
+| + `KW` as a function constant | 44.8 ms | 377 GFLOP/s | 896 | 4.96x |
+| + 128 threads per threadgroup | **43.6 ms** | **387 GFLOP/s** | 896 | **5.10x** |
+
+**5.10x on the op set, and 18% of the measured roofline** against the stock kernel's 3.6%.
+
+#### What did not work, which is the part worth keeping
+
+* **Threadgroup staging — the shape §5.7 named first — is worse at every activation length.**
+  Staging the weight tile into threadgroup memory and reading it as a broadcast gives **55.2 ms**
+  against 43.6. The uniform global loads were already being served by one cache line per SIMD group,
+  so there was nothing to save, and the barriers are not free.
+* **More output positions per thread loses, despite a much better ratio — and that is the trap in
+  reasoning about loads per FMA at all.** A 4-position x 4-channel tile has **0.5 loads per FMA
+  against the shipped kernel's 1.125**, less than half, and runs **69.7 ms**: it gives back more
+  occupancy than the ratio buys. The exception is real but small: on the two longest activations a
+  2-position x 8-channel tile runs 6.56 and 7.38 ms against 7.71 and 8.69, about 6% of the whole set.
+  It is **left on the table deliberately**, because taking it costs a second pipeline family and a
+  threshold on `OW`.
+* **The `im2col` + `mul_mat` route is no longer the fast one.** §5.7's natural experiment ran it at
+  7.0 ms/GFLOP against the native kernel's 14.3; this kernel is at 2.6.
+
+#### End to end, and the control
+
+| op | calls | Metal `+ggml-0014` | Metal `+ggml-0015` | CPU @ 1 thread |
+|---|---:|---:|---:|---:|
+| `CONV_2D` | 117 | 241.3 ms | **60.1 ms** | ~212 ms |
+| `CONV_TRANSPOSE_1D` | 3 | 7.8 ms | 7.7 ms | ~21.6 ms |
+| everything else | 2078 | ~30 ms | ~22 ms | ~62 ms |
+| **wall (un-profiled)** | | **278.1 ms** | **97.6 ms** | 296.0 ms |
+
+The re-profile is the same clean control §5.7 used: the patch touched one op and one bucket moved.
+Both profile columns are calibrated against the graph's own no-op nodes (§5.7's method; the per-node
+overhead here is 0.180 ms, from 872 `RESHAPE`/`VIEW`/`PERMUTE` executions that agree to 0.02 ms).
+The calibrated buckets sum to 89.4 ms against a 97.6 ms wall — a looser fit than §5.7's 1%, because
+the run is now short enough that a 378 ms profiling overhead dominates what is being subtracted.
+
+**Correctness.** `test-backend-ops test -o CONV_2D` is **2026/2026 on MTL0** against the CPU
+reference — F16 and F32 kernels, `KH > 1`, stride, dilation, padding and batch, none of which VITS
+exercises. The VITS waveform digest is **bit-identical** to stock on both exports (`bbc58397d238efde`
+f32, `c5f02103027bcaee` q4_0). `ctest -L ci` is 75/75.
+
+#### It is not a VITS-only fix, and it moves whisper too
+
+whisper-small's encoder opens with two convolutions over 3000 frames, and it gains without anything
+else changing: **0.874 -> 0.752 s**, so Metal goes from 1.52x to **1.76x faster than the CPU** on
+that model.
+
+#### What this decides for the device hierarchy — still not rescued, and a new inversion
+
+A default-device VITS run on this laptop is **1.79x slower** than the same call without Metal at f32,
+down from 5.07x. Smaller, same conclusion: §5.5 stands, Metal ships as an extra, `GGML_METAL OFF`
+stays in `loom-py/CMakeLists.txt`.
+
+**But the Q4_0 column is now the slow one, and that is new.** Metal declines loom's folded
+block-quantized convolution kernel on its type test (§5.2), so a Q4_0 export lowers through
+`im2col` + `mul_mat` — untouched by this patch, and now **1.53x slower than the same model at f32**
+(149.1 ms against 97.6). Before `ggml-0015` the ordering was the other way round, at 149.7 against
+278.7. Quantizing a convolutional model for Metal now costs time as well as accuracy, which is a
+reason to look at that type test rather than at the quantization. Filed on the hub.
 
 #### Current numbers, for anyone re-running this
 
-M1 Pro, macOS 15.7.9, `7782a30` + `ggml-0014`, `scripts/bench_vits_loom.cpp` median of 9,
-`scripts/bench_asr_loom.cpp` median of 5 interleaved ABBA. `ctest -L ci` on this build is 75/75.
+M1 Pro (16-core GPU), macOS 15.7.9, `7167822` + `ggml-0015`, `scripts/bench_vits_loom.cpp` median of
+9 and `scripts/bench_asr_loom.cpp` median of 5, interleaved ABBA with a settle between arms.
+`ctest -L ci` on this build is 75/75. Achievable rooflines on this part, measured by
+`scripts/bench22.mm`: **2.11 TFLOP/s** F32 FMA, **180 GB/s** streaming read.
 
-| | CPU (8 threads) | Metal, stock | Metal, `+ggml-0014` |
-|---|---:|---:|---:|
-| VITS f32 | **55.0 ms** | 494.1 ms (8.98x) | **278.7 ms (5.07x)** |
-| VITS q4_0 | **51.5 ms** | 350.2 ms (6.80x) | **149.7 ms (2.91x)** |
-| whisper-small, `jfk.wav` | 1.325 s | — | **0.874 s (1.52x faster)** |
+| | CPU (8 threads) | Metal, stock | `+ggml-0014` | `+ggml-0015` |
+|---|---:|---:|---:|---:|
+| VITS f32 | **54.6 ms** | 494.1 ms (9.05x) | 278.1 ms (5.09x) | **97.6 ms (1.79x)** |
+| VITS q4_0 | **51.4 ms** | 350.2 ms (6.81x) | 149.7 ms (2.91x) | 149.1 ms (2.90x) |
+| whisper-small, `jfk.wav` | 1.326 s | — | 0.874 s (1.52x faster) | **0.752 s (1.76x faster)** |
