@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-08-31
+last_updated: 2026-09-02
 ---
 
 # Epic-05: Edge CPU Performance
@@ -2288,6 +2288,16 @@ did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27
 
 
 ## 5. Planned Work
+
+**P4.10–P4.29 are all closed as headline items.** Their remainders are gathered as **P4.30** in
+[the hub](../backlog/active-index.md#p430--the-tails-of-p410p429), as three tasks: P4.30a (Metal's
+convolutional cost, → [Epic-04 §5.4](epic-04-backends-and-accelerators.md)), P4.30b (the default
+thread count, then the README's TTS and LM columns per launch — §2 above), and P4.30c (a sequential
+pass over the small tails: the three other conv families at Q8_0 and the direct-conv budget with
+them, `op_conv_2d`, `ldc` alignment, the Metal `PAD` kernel, and the upstream `OMP_WAIT_POLICY`
+note — §5 below and Epic-04 §5.4). The evidence for each stays where it was measured; the hub holds
+only the scope and the ordering.
+
 
 ### P4.21 — `QK^T` at `k = 64`: the vector lanes are on the wrong axis — MEASURED OUT, CLOSED 2026-08-29
 

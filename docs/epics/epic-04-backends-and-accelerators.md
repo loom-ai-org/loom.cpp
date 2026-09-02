@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-08-31
+last_updated: 2026-09-02
 ---
 
 # Epic-04: Backends and Accelerators
@@ -761,6 +761,9 @@ conclusion.** See §5.4 — collapsing the fallback entirely is worth **1.8%**, 
 
 ### 5.4 The PAD fix, prototyped and measured: it is a correctness item, not a performance one
 
+**Tracked as P4.30c step 5**, alongside the open question of where VITS's 5.24x actually comes from
+(**P4.30a**) — which this is not.
+
 The `supports_op` test is easy to relax and the kernel change is small, so rather than estimate the
 payoff it was **built as a throwaway** on the M1 Pro (hand-edited in the build tree, measured,
 reverted — nothing of it is in the repo). Four edits: four `lp0..lp3` fields on
@@ -853,7 +856,9 @@ wheels were built with `python -m build`. The `repair-wheel-command` in `packagi
 pyproject.toml` carries `--exclude libggml-base --ignore-missing-dependencies`, reasoned from how
 delocate resolves an `@rpath` that points outside the wheel, and **first exercised by CI**.
 A fourth PyPI project also needs its own trusted publisher before `publish-pypi`'s Metal step can
-succeed; until it exists that step fails while everything above it still uploads.
+succeed. **Both were settled by the 1.0.0-rc7 release (2026-08-31):** `delocate` ran in CI for the
+first time, and `loom-py-rt-metal` published its first release, so all four projects now sit at
+`1.0.0rc7`.
 
 **Non-goals, unchanged:** CoreML and the Neural Engine (not Metal, no ggml backend targets it, and
 out-of-tree options were turned down on licensing); Intel Macs; a `universal2` backend wheel.
