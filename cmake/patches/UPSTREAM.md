@@ -5,6 +5,11 @@ Eleven diffs, each independently useful and independently reviewable. They are w
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
 
+**14 and 15 are the Metal pair and depend on nothing else here** — different backend, different files,
+and independent of each other: 14 fixes `conv_transpose_1d`'s dispatch, 15 rewrites `conv_2d`'s inner
+loop, and a re-profile of either moves exactly one op's bucket. Either is a reasonable one to send
+first.
+
 **Order and independence.** 1, 2, 3 and 11 touch `llamafile/sgemm.cpp`. 1 and 2 only pay off together
 (see below) and are best sent as one PR or two linked ones; **11 is the same fix as 3 on the other
 axis** and lands on adjacent lines of the same function, so send them together or 3 first. 4 and
@@ -17,8 +22,8 @@ so it must be sent after 5, or the two folded into one PR. **10 depends on nothi
 `vec.h` alone, is the only one of the ten that is not about convolution or GEMM, and is the most
 self-contained thing here to send first if a reviewer wants a small one.
 
-**Submission status (2026-08-23).** PRs 1, 2 and 3 have been **sent upstream**. 4 through 9 have
-not, and are deliberately held: each of 5, 6, 7 and 9 depends on 4, and 4 itself reads more naturally
+**Submission status (2026-08-23; 14 and 15 added 2026-09-02).** PRs 1, 2 and 3 have been **sent
+upstream**. 4 through 9 have not, and are deliberately held: each of 5, 6, 7 and 9 depends on 4, and 4 itself reads more naturally
 once the `sgemm` three have landed and the review conversation has a shape. Nothing below is blocked on
 new measurement — it is blocked on 1-3.
 
@@ -985,9 +990,74 @@ further win and a much larger patch. (3) This does not touch `supports_op`, the 
 **Where the rest of that model's time went, since a reviewer will ask.** After this patch, 86% of the
 same synthesis is `GGML_OP_CONV_2D` — 241 ms for 16.89 GFLOP, **70 GFLOP/s, 1.3% of peak**, from a
 `kernel_conv_2d` that is one thread per output element with two global loads per FMA and no reuse of
-any kind. For contrast, this backend's own `mul_mat` runs the same convolutions at about 1.49 TFLOP/s
-when the graph is lowered through `im2col` instead. That is a separate, larger patch and is not
-proposed here.
+any kind. **That is PR 15, below.** The two are independent: 15 does not touch
+`conv_transpose_1d` and 14 does not touch `conv_2d`, and a re-profile of either moves exactly one
+bucket.
+
+## PR 15 — `metal`: `conv_2d` is one thread per output element, at 1.3% of peak
+
+`kernel_conv_2d` gives each thread one output element and loops `IC*KH*KW` doing **two global loads
+per FMA with no reuse of either operand** — no register tile, no staging, no vectorisation.
+Arithmetic intensity 0.25 FLOP/byte. Over the 117 convolutions of one VITS synthesis (16.88 GFLOP)
+on an M1 Pro that is **70 GFLOP/s: slower than a single CPU core**, and 1.3% of the part's
+5.31 TFLOP/s spec. After PR 14 it is **86% of the whole model**.
+
+**Divide by an achievable number, not the spec.** A pure FMA loop with sixteen independent chains
+reaches **2.1 TFLOP/s** on this part, not 5.31, so the stock kernel is at 3.6% of what a kernel can
+actually get and the headroom below is quoted against 2.1.
+
+**The change.** A thread now accumulates `OP_CONV_2D_NC = 8` output channels at one output position:
+each activation it loads feeds eight FMAs, and the eight weights beside it are at an address every
+lane in the threadgroup shares, so one cache line serves the SIMD group. Loads per FMA go 2 ->
+1.125. The grid becomes the output's own shape — x over columns, y over blocks of 8 channels, z over
+rows and batch — instead of a flat element count, and `KW` becomes a function constant (`FC_CONV_2D`)
+so the tap loop unrolls for the widths a convolution actually uses.
+
+**The half of it that is not the tile: 32-bit element indices.** The same tile written with one
+`device const TK *` per output channel — sixteen registers of pure address — runs **68.8 ms against
+45.6**, and `maxTotalThreadsPerThreadgroup` says why: **704 threads against 896**. On this GPU
+occupancy is latency hiding, and the addresses were competing with the accumulators. The fast path
+therefore declines, at threadgroup granularity, anything it cannot address in 32 bits (a stride that
+is not a whole number of elements, or a tensor past 4G elements) and falls into the original 64-bit
+loop, which is kept as the general path and also carries the edges and partial channel tiles.
+
+Measured over the 31 distinct shapes of that synthesis, at the multiplicity the graph issues them:
+
+| | total | rate | |
+|---|---:|---:|---:|
+| stock | 222.3 ms | 76 GFLOP/s | occupancy 1024 |
+| + register tile, 64-bit pointers | 68.8 ms | 245 GFLOP/s | occupancy 704 |
+| + 32-bit element indices | 45.6 ms | 370 GFLOP/s | occupancy 896 |
+| + `KW` as a function constant | 44.8 ms | 377 GFLOP/s | |
+| + 128 threads per threadgroup | **43.6 ms** | **387 GFLOP/s** | **5.10x** |
+
+End to end an F32 VITS synthesis goes **278.1 -> 97.6 ms** — 2.85x on the whole model — whisper-small
+goes 0.874 -> 0.752 s from the two convolutions its encoder opens with, and the
+`CONV_2D` bucket of a calibrated per-op profile goes 241.3 -> 60.1 ms while every other bucket sits
+still.
+
+**Verification.** `test-backend-ops test -o CONV_2D` is **2026/2026 on MTL0** against the CPU
+reference, covering F16 and F32 kernels, `KH > 1`, stride, dilation, padding and batch — the fast
+path here handles all of them and the shapes that reach the general path are exercised by the same
+run. The VITS waveform digest is bit-identical to stock on both an F32 and a Q4_0 export.
+
+**What did NOT work**, so a reviewer does not ask for it. Staging the weight tile in threadgroup
+memory is **worse at every activation length** (55.2 ms) — the uniform loads were already being served
+by one cache line per SIMD group, and the barriers are not free. More than 32 accumulators per thread
+spills to scratch and costs up to 5x (8 positions x 8 channels is 302.7 ms, slower than the kernel it
+replaces — and `maxTotalThreadsPerThreadgroup` still reads a healthy 896 for it, so that probe finds
+register pressure but not spilling). And giving a thread several output *positions* loses despite a
+much better ratio: a 4-position x 4-channel tile has **0.5 loads per FMA against this kernel's
+1.125** and runs 69.7 ms, because it gives back more occupancy than the ratio buys.
+
+**What a reviewer should push on.** (1) `OP_CONV_2D_NC = 8` and `nth = 128` are swept on ONE part
+(M1 Pro, 16-core) and one workload family — an all-convolutional TTS vocoder, `KH = 1`, batch 1. A
+wider Apple part or a real 2-D image stack may want different numbers, and there is no autotune here.
+(2) A 2-position tile is worth about 6% on the two longest activations and is deliberately not taken,
+because it needs a second pipeline family and a threshold on `OW`. (3) The ceiling is still open:
+this backend's own `mul_mat` runs the same convolutions at about 1.49 TFLOP/s through an `im2col`
+lowering, so a simdgroup-matrix implicit GEMM would be another 2-3x and a much larger patch.
+(4) `supports_op`, the depthwise sibling and the quantized-kernel type test are untouched.
 
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 

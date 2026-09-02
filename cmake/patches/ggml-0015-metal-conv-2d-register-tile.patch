@@ -1,0 +1,356 @@
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -104,6 +104,7 @@
+ #define FC_SUM_ROWS                    1400
+ #define FC_UPSCALE                     1500
+ #define FC_GATED_DELTA_NET             1600
++#define FC_CONV_2D                     1700
+ 
+ // op-specific constants
+ #define OP_FLASH_ATTN_EXT_NQPSG 8
+@@ -119,6 +120,10 @@
+ #define OP_LIGHTNING_INDEXER_NSG     8
+ #define OP_LIGHTNING_INDEXER_NBPTG   8
+ 
++// How many output channels one `kernel_conv_2d` thread accumulates in registers. Shared with the
++// host because the dispatch has to divide the output-channel axis by it.
++#define OP_CONV_2D_NC 8
++
+ #define OP_UNARY_NUM_SCALE      10
+ #define OP_UNARY_NUM_FILL       11
+ #define OP_UNARY_NUM_CLAMP      12
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -4997,7 +4997,62 @@
+ 
+ template [[host_name("kernel_im2col_ext_f32")]] kernel im2col_ext_t kernel_im2col_ext<float>;
+ template [[host_name("kernel_im2col_ext_f16")]] kernel im2col_ext_t kernel_im2col_ext<half>;
++
++// `KW` as a function constant: 0 means "read it from the args", anything else is the compile-time
++// kernel width, which lets the tap loop unroll. Every convolution a TTS vocoder issues has KW in
++// {1, 3, 5, 7} and the host knows which before it picks a pipeline.
++constant short FC_conv_2d_kw [[function_constant(FC_CONV_2D + 0)]];
+ 
++// ONE THREAD PER OUTPUT ELEMENT WAS THE WHOLE COST OF THIS OP. The previous kernel walked
++// `IC*KH*KW` with two global loads per FMA and no reuse of either operand -- arithmetic intensity
++// 0.25 FLOP/byte -- and ran a VITS synthesis's 117 convolutions (16.88 GFLOP) at 76 GFLOP/s on an
++// M1 Pro: slower than a single CPU core. Quote that against a MEASURED roofline, not the 5.31
++// TFLOP/s on the spec sheet: a pure FMA loop with sixteen independent chains reaches 2.11 TFLOP/s on
++// this part, so the stock kernel is at 3.6% of what a kernel can get, not 1.4% of what it cannot.
++//
++// A thread now owns OP_CONV_2D_NC = 8 output channels at ONE output position, so each activation it
++// loads feeds eight FMAs instead of one. The eight weights beside it are at an address every lane in
++// the threadgroup shares -- uniform, so one cache line serves the SIMD group. Loads per FMA go from
++// 2 to 1.125 and the eight accumulators live in registers.
++//
++// THE ADDRESSES ARE 32-BIT ELEMENT INDICES, NOT 64-BIT BYTE OFFSETS, and that is most of the patch,
++// not a detail of it. One `device const TK *` per output channel is sixteen registers of pure
++// address competing with the eight accumulators they exist to feed, and
++// `maxTotalThreadsPerThreadgroup` -- the only register-pressure signal Metal exposes without a GPU
++// capture -- reads 704 for that form against 896 for this one. On this GPU occupancy is latency
++// hiding, and the kernel is latency-bound: it issues 17 instructions per 8 FMAs and reaches 40% of
++// what that mix allows.
++//
++// Measured by `scripts/bench22.mm` over the 117 convolutions of the utterance
++// `scripts/bench_vits_loom.cpp` pins, all rows from one run:
++//
++//     stock                              222.3 ms    76 GFLOP/s    occupancy 1024
++//     + register tile, 64-bit pointers    68.8 ms   245 GFLOP/s    occupancy  704
++//     + 32-bit element indices            45.6 ms   370 GFLOP/s    occupancy  896
++//     + KW as a function constant         44.8 ms   377 GFLOP/s
++//     + 128 threads per threadgroup       43.6 ms   387 GFLOP/s    5.10x
++//
++// End to end an f32 VITS synthesis goes 278.1 -> 97.6 ms with a BIT-IDENTICAL waveform, the
++// `CONV_2D` bucket of a calibrated `$LOOM_PROFILE` goes 241.3 -> 60.1 ms with every other bucket
++// still, and `test-backend-ops -o CONV_2D` is 2026/2026 on MTL0 either way. whisper-small, whose
++// encoder opens with two convolutions, goes 0.874 -> 0.752 s without anything else changing.
++//
++// WHAT DID NOT WORK, so nobody pays for it twice:
++//
++//   * Staging the weight tile in threadgroup memory -- 55.2 ms, worse at every activation length.
++//     The uniform loads were already being served by one cache line per SIMD group, so there was
++//     nothing to save, and the barriers are not free.
++//   * More than 32 accumulators per thread. 8 positions x 8 channels is 302.7 ms -- 0.73x, SLOWER
++//     THAN STOCK. Note that `maxTotalThreadsPerThreadgroup` still reads 896 for it: the compiler
++//     spilled to scratch rather than raise the register count, and the probe does not report that.
++//     It explains the pointer-vs-index gap above; it does not catch a spill. Only the clock does.
++//   * Giving a thread several output POSITIONS, which is where the loads-per-FMA argument leads and
++//     is a trap. A 4-position x 4-channel tile has 0.5 loads per FMA against this kernel's 1.125 --
++//     less than half -- and runs 69.7 ms. It gives back more occupancy than the ratio buys.
++//     One exception is real and is left on the table deliberately: on the two longest activations a
++//     2-position x 8-channel tile runs 6.56 and 7.38 ms against 7.71 and 8.69, about 6% of the whole
++//     set, at the cost of a second pipeline family and a threshold on OW.
++//
+ template <typename TK>
+ kernel void kernel_conv_2d(
+         constant ggml_metal_kargs_conv_2d & args,
+@@ -5009,84 +5064,143 @@
+         uint3   tpitg[[thread_position_in_threadgroup]],
+         uint3     ntg[[threads_per_threadgroup]]) {
+ 
+-    const uint threads_per_tg = ntg.x * ntg.y * ntg.z;
+-    const uint tg_index = (tgpig.z * tgpg.y + tgpig.y) * tgpg.x + tgpig.x;
+-    const uint local_thread = tpitg.z * (ntg.x * ntg.y) + tpitg.y * ntg.x + tpitg.x;
+-    const uint thread_index = tg_index * threads_per_tg + local_thread;
+-    const uint64_t total_threads = (uint64_t) threads_per_tg * tgpg.x * tgpg.y * tgpg.z;
+-    const uint64_t total_outputs = (uint64_t) args.N * args.OC * args.OH * args.OW;
++    const int32_t KW = FC_conv_2d_kw ? (int32_t) FC_conv_2d_kw : args.KW;
+ 
+-    for (uint64_t index = thread_index; index < total_outputs; index += total_threads) {
+-        uint64_t tmp = index;
++    const int32_t ow  = (int32_t)(tgpig.x*ntg.x + tpitg.x);
++    const int32_t oc0 = (int32_t) tgpig.y * OP_CONV_2D_NC;
++    const int32_t oh  = (int32_t)(tgpig.z % (uint) args.OH);
++    const int32_t n   = (int32_t)(tgpig.z / (uint) args.OH);
+ 
+-        const int32_t ow = tmp % args.OW; tmp /= args.OW;
+-        const int32_t oh = tmp % args.OH; tmp /= args.OH;
+-        const int32_t oc = tmp % args.OC; tmp /= args.OC;
+-        const int32_t  n = tmp;
++    if (ow >= args.OW) {
++        return;
++    }
+ 
+-        float acc = 0.0f;
++    const int32_t base_x = ow*args.s0 - args.p0;
++    const int32_t base_y = oh*args.s1 - args.p1;
+ 
+-        const int32_t base_x = ow*args.s0 - args.p0;
+-        const int32_t base_y = oh*args.s1 - args.p1;
++    int32_t ky_start = 0;
++    if (base_y < 0) {
++        ky_start = (-base_y + args.d1 - 1)/args.d1;
++    }
++    int32_t ky_end = args.KH;
++    const int32_t y_max = args.IH - 1 - base_y;
++    if (y_max < 0) {
++        ky_end = ky_start;
++    } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
++        ky_end = min(ky_end, y_max/args.d1 + 1);
++    }
+ 
+-        int32_t ky_start = 0;
+-        if (base_y < 0) {
+-            ky_start = (-base_y + args.d1 - 1)/args.d1;
+-        }
+-        int32_t ky_end = args.KH;
+-        const int32_t y_max = args.IH - 1 - base_y;
+-        if (y_max < 0) {
+-            ky_end = ky_start;
+-        } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
+-            ky_end = min(ky_end, y_max/args.d1 + 1);
+-        }
++    int32_t kx_start = 0;
++    if (base_x < 0) {
++        kx_start = (-base_x + args.d0 - 1)/args.d0;
++    }
++    int32_t kx_end = KW;
++    const int32_t x_max = args.IW - 1 - base_x;
++    if (x_max < 0) {
++        kx_end = kx_start;
++    } else if (base_x + (KW - 1)*args.d0 >= args.IW) {
++        kx_end = min(kx_end, x_max/args.d0 + 1);
++    }
+ 
+-        int32_t kx_start = 0;
+-        if (base_x < 0) {
+-            kx_start = (-base_x + args.d0 - 1)/args.d0;
+-        }
+-        int32_t kx_end = args.KW;
+-        const int32_t x_max = args.IW - 1 - base_x;
+-        if (x_max < 0) {
+-            kx_end = kx_start;
+-        } else if (base_x + (args.KW - 1)*args.d0 >= args.IW) {
+-            kx_end = min(kx_end, x_max/args.d0 + 1);
+-        }
++    float acc[OP_CONV_2D_NC];
++    #pragma unroll
++    for (int32_t t = 0; t < OP_CONV_2D_NC; ++t) {
++        acc[t] = 0.0f;
++    }
+ 
+-        if (ky_start < ky_end && kx_start < kx_end) {
+-            const uint64_t src_base_n = (uint64_t) n  * args.nb13;
+-            const uint64_t w_base_oc  = (uint64_t) oc * args.nb03;
++    // The fast path indexes with 32-bit element counts, so it declines a tensor that does not fit
++    // one and a stride that is not a whole number of elements. It also declines a partial channel
++    // tile and any position the padding reaches, which is what keeps every bound out of the inner
++    // loop. Declining is always CORRECT, not merely safe: the path below is the general one.
++    const bool addressable =
++        (args.nb10 % 4) == 0 && (args.nb11 % 4) == 0 &&
++        (args.nb12 % 4) == 0 && (args.nb13 % 4) == 0 &&
++        (args.nb03 % sizeof(TK)) == 0 &&
++        (ulong) args.nb13*args.N /4           < 0xffffffffull &&
++        (ulong) args.nb03*args.OC/sizeof(TK)  < 0xffffffffull;
+ 
+-            for (int32_t ic = 0; ic < args.IC; ++ic) {
+-                const uint64_t src_base_nc = src_base_n + (uint64_t) ic * args.nb12;
+-                const uint64_t w_base_ocic = w_base_oc  + (uint64_t) ic * args.nb02;
++    const bool fast =
++        addressable &&
++        oc0 + OP_CONV_2D_NC <= args.OC &&
++        ky_start == 0 && ky_end == args.KH &&
++        kx_start == 0 && kx_end == KW;
+ 
+-                for (int32_t ky = ky_start; ky < ky_end; ++ky) {
+-                    const int32_t iy = base_y + ky*args.d1;
+-                    const uint64_t src_base_row = src_base_nc + (uint64_t) iy * args.nb11;
+-                    const uint64_t w_base_row   = w_base_ocic + (uint64_t) ky * args.nb01;
++    if (fast) {
++        device const TK    * w0 = (device const TK    *) weights;
++        device const float * x0 = (device const float *) src;
+ 
+-                    for (int32_t kx = kx_start; kx < kx_end; ++kx) {
+-                        const int32_t ix = base_x + kx*args.d0;
+-                        const uint64_t src_offs = src_base_row + (uint64_t) ix * args.nb10;
+-                        const uint64_t w_offs   = w_base_row   + (uint64_t) kx * args.nb00;
++        // `ggml_is_contiguous(src[0])` is asserted, so one output channel's (ic, ky, kx) block is a
++        // contiguous run and the whole weight address is a single running index.
++        const uint w_oc  = (uint)(args.nb03/sizeof(TK));
++        const uint xs_ic = (uint)(args.nb12/4);
++        const uint xs_ky = (uint)(args.nb11/4)*(uint) args.d1;
++        const uint xs_kx = (uint)(args.nb10/4)*(uint) args.d0;
++        const uint wt0   = (uint) oc0 * w_oc;
+ 
+-                        const float x = *(device const float *)(src + src_offs);
+-                        const float w = (float) (*(device const TK *)(weights + w_offs));
++        uint xi = (uint)((ulong) n*args.nb13/4)
++                + (uint)(args.nb11/4)*(uint) base_y
++                + (uint)(args.nb10/4)*(uint) base_x;
++        uint wi = 0;
+ 
+-                        acc += x * w;
++        for (int32_t ic = 0; ic < args.IC; ++ic) {
++            uint xj = xi;
++            for (int32_t ky = 0; ky < args.KH; ++ky) {
++                uint xk = xj;
++                #pragma unroll
++                for (int32_t kx = 0; kx < KW; ++kx) {
++                    const float x = x0[xk];
++                    #pragma unroll
++                    for (int32_t t = 0; t < OP_CONV_2D_NC; ++t) {
++                        acc[t] += x*(float) w0[wt0 + (uint) t*w_oc + wi];
+                     }
++                    ++wi;
++                    xk += xs_kx;
+                 }
++                xj += xs_ky;
+             }
++            xi += xs_ic;
+         }
++    } else if (ky_start < ky_end && kx_start < kx_end) {
++        const int32_t nt = min(OP_CONV_2D_NC, args.OC - oc0);
+ 
+-        const uint64_t dst_offs =
+-            (uint64_t) n  * args.nb3 +
+-            (uint64_t) oc * args.nb2 +
+-            (uint64_t) oh * args.nb1 +
+-            (uint64_t) ow * args.nb0;
++        const ulong src_base_n = (ulong) n * args.nb13;
+ 
+-        *(device float *)(dst + dst_offs) = acc;
++        for (int32_t ic = 0; ic < args.IC; ++ic) {
++            const ulong src_base_nc = src_base_n + (ulong) ic * args.nb12;
++            const ulong w_base_ic   =              (ulong) ic * args.nb02;
++
++            for (int32_t ky = ky_start; ky < ky_end; ++ky) {
++                const int32_t iy = base_y + ky*args.d1;
++                const ulong src_base_row = src_base_nc + (ulong) iy * args.nb11;
++                const ulong w_base_row   = w_base_ic   + (ulong) ky * args.nb01;
++
++                for (int32_t kx = kx_start; kx < kx_end; ++kx) {
++                    const int32_t ix = base_x + kx*args.d0;
++                    const float x = *(device const float *)(src + src_base_row + (ulong) ix * args.nb10);
++
++                    for (int32_t t = 0; t < nt; ++t) {
++                        const float w = (float) *(device const TK *)(
++                            weights + (ulong)(oc0 + t)*args.nb03 + w_base_row + (ulong) kx * args.nb00);
++                        acc[t] += x*w;
++                    }
++                }
++            }
++        }
++    }
++
++    #pragma unroll
++    for (int32_t t = 0; t < OP_CONV_2D_NC; ++t) {
++        const int32_t oc = oc0 + t;
++        if (oc >= args.OC) {
++            continue;
++        }
++        const ulong dst_offs =
++            (ulong) n  * args.nb3 +
++            (ulong) oc * args.nb2 +
++            (ulong) oh * args.nb1 +
++            (ulong) ow * args.nb0;
++
++        *(device float *)(dst + dst_offs) = acc[t];
+     }
+ }
+ 
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4067,15 +4067,18 @@
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
+ 
++    // 128 rather than 256: a thread now carries OP_CONV_2D_NC accumulators, and the smaller
++    // threadgroup measured better over VITS's whole convolution set -- 43.6 ms against 46.9 for 256,
++    // and no activation length preferred 256.
+     int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+-    nth = std::min(nth, 256);
++    nth = std::min(nth, 128);
+     nth = std::max(nth, 1);
+ 
+-    const uint64_t n_out = ggml_nelements(op);
+-
+-    uint64_t tg = (n_out + nth - 1)/nth;
+-    tg = std::max<uint64_t>(tg, 1);
+-    tg = std::min<uint64_t>(tg, (uint64_t) std::numeric_limits<int>::max());
++    // The grid is now the output's own shape rather than a flat element count: x over output
++    // columns, y over BLOCKS of OP_CONV_2D_NC output channels, z over rows and batch.
++    const int64_t tgx = ((int64_t) ne0 + nth - 1)/nth;
++    const int64_t tgy = ((int64_t) ne03 + OP_CONV_2D_NC - 1)/OP_CONV_2D_NC;
++    const int64_t tgz = (int64_t) ne3 * ne1;
+ 
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+@@ -4083,7 +4086,7 @@
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, tg, 1, 1, nth, 1, 1);
++    ggml_metal_encoder_dispatch_threadgroups(enc, tgx, tgy, tgz, nth, 1, 1);
+ 
+     return 1;
+ }
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1934,13 +1934,25 @@
+ 
+     char base[256];
+     char name[256];
++
++    // Specialise on the kernel width so the tap loop unrolls. Only the widths a convolution
++    // actually uses are worth a pipeline; anything else compiles the generic form, which reads KW
++    // from the args exactly as before.
++    const int64_t kw = op->src[0]->ne[0];
++    const int16_t kw_c = (kw == 1 || kw == 3 || kw == 5 || kw == 7) ? (int16_t) kw : (int16_t) 0;
+ 
+     snprintf(base, 256, "kernel_conv_2d_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+-    snprintf(name, 256, "%s", base);
++    snprintf(name, 256, "%s_kw=%d", base, kw_c);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int16(cv, kw_c, FC_CONV_2D + 0);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
+     }
+ 
+     return res;
