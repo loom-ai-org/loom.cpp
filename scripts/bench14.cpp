@@ -7,7 +7,14 @@
 //       -I <ggml-src>/include -I <ggml-src>/src -I <ggml-src>/src/ggml-cpu \
 //       scripts/bench14.cpp -o bench14 \
 //       -L <ggml-build>/src -L <ggml-build>/src/ggml-cpu -lggml -lggml-base -lggml-cpu -lpthread -lm
-//   ./bench14 [rounds]     # default 31
+//   ./bench14 [rounds] [threads]     # default 31 1
+//
+// **THREADS DEFAULTS TO 1 AND THE PAIRS BELOW WERE ALL READ AT 1** -- P4.18 asked a single-core
+// question. It is an argument because P4.30c's `ldc` item is the same pairs at a thread count: after
+// `ggml-0012` gave every job a full 64-byte line of `C`, the residue is that `m = 1500` floats is 6000
+// bytes and `6000 % 64 = 16`, so that line is not ALIGNED to one and straddles two on odd columns.
+// That is invisible at one thread by construction -- see Retro-019 -- and the m=1500-against-m=1504
+// pair below is exactly the control it needs.
 //
 // WHY NOT scripts/bench13.cpp's min-over-interleaved-rounds. That already fixed the worst failure --
 // timing each shape as a BLOCK of repetitions, which on a 2-core laptop measures the clock (the same
@@ -71,9 +78,10 @@ static double once(ggml_tensor * A, ggml_tensor * B) {
 struct Pair { std::string name; ggml_tensor *A1,*B1,*A2,*B2; double f1, f2; std::vector<double> r; };
 
 int main(int argc, char ** argv) {
-    const int rounds = argc > 1 ? atoi(argv[1]) : 31;
+    const int rounds  = argc > 1 ? atoi(argv[1]) : 31;
+    const int nthreads = argc > 2 ? atoi(argv[2]) : 1;
     backend = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(backend, 1);
+    ggml_backend_cpu_set_n_threads(backend, nthreads);
     struct ggml_init_params dp = { (size_t) 6144ull*1024*1024, nullptr, false };
     dctx = ggml_init(dp);
 
@@ -103,7 +111,8 @@ int main(int argc, char ** argv) {
             // ratio of RATES: (f2/b) / (f1/a)  -- >1 means the second arm is faster per flop
             p.r.push_back((p.f2/b) / (p.f1/a));
         }
-    printf("%d paired rounds, 1 thread. Ratio > 1 means the SECOND arm is faster per flop.\n\n", rounds);
+    printf("%d paired rounds, %d thread(s). Ratio > 1 means the SECOND arm is faster per flop.\n\n",
+           rounds, nthreads);
     printf("%-44s %8s %8s %8s %8s\n", "pair", "p10", "median", "p90", "min");
     for (auto & p : ps) {
         std::sort(p.r.begin(), p.r.end());
