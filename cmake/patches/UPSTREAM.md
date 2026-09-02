@@ -1,14 +1,17 @@
 # Upstreaming these patches to ggml-org/ggml
 
-Eleven diffs, each independently useful and independently reviewable. They are written against the pin in
+Sixteen diffs, each independently useful and independently reviewable. They are written against the pin in
 `cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
 
-**14 and 15 are the Metal pair and depend on nothing else here** — different backend, different files,
-and independent of each other: 14 fixes `conv_transpose_1d`'s dispatch, 15 rewrites `conv_2d`'s inner
-loop, and a re-profile of either moves exactly one op's bucket. Either is a reasonable one to send
-first.
+**14, 15 and 16 are the Metal set and depend on nothing else here** — different backend, different
+files, and independent of each other: 14 fixes `conv_transpose_1d`'s dispatch, 15 rewrites `conv_2d`'s
+inner loop, 16 teaches `pad` a leading pad, and a re-profile of any one moves exactly one op's bucket.
+Any of them is a reasonable one to send first. **16 is the smallest thing in this file** — four kargs
+fields, an index shift, and a `supports_op` that stops declining — and it is the only one whose case
+is made by the SCHEDULER rather than by the op: it removes a fallback, and the fallback was dragging
+55 of a graph's 56 splits onto the CPU with it.
 
 **Order and independence.** 1, 2, 3 and 11 touch `llamafile/sgemm.cpp`. 1 and 2 only pay off together
 (see below) and are best sent as one PR or two linked ones; **11 is the same fix as 3 on the other
@@ -1059,6 +1062,65 @@ this backend's own `mul_mat` runs the same convolutions at about 1.49 TFLOP/s th
 lowering, so a simdgroup-matrix implicit GEMM would be another 2-3x and a much larger patch.
 (4) `supports_op`, the depthwise sibling and the quantized-kernel type test are untouched.
 
+## PR 16 — `metal`: `pad` can only append, so every leading pad falls back to the CPU
+
+`kernel_pad_impl` writes `dst[i] <- src[i]` inside the source extent and zero outside it. That is a
+pad whose four LEADING pads are all zero, and `supports_op` says so honestly:
+
+```c
+return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
+       (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
+```
+
+So `ggml_pad_ext` with any leading pad — which is what a symmetric or left-only pad is — runs on the
+CPU. `test-backend-ops` shows the same thing from the other side: of its 21 `PAD` cases, the ones with
+a non-zero `lp` were reported `not supported [MTL0]`, so no Metal `PAD` case with a leading pad had
+ever been executed.
+
+**And the cost is not the op, it is the graph.** A VITS text encoder issues 21 such nodes. Removing
+them removes 72 nodes and 54 splits, because `ggml_backend_sched` assigns a declined node's supported
+neighbours to the CPU as well rather than copy a tensor across each boundary:
+
+| Apple M1 Pro, one f32 VITS synthesis | splits | CPU nodes | time | FNV-1a of the audio |
+|---|---:|---:|---:|---|
+| stock | 56 | 72 | 97.9 ms | `bbc58397d238efde` |
+| with a leading pad | **2** | **0** | **88.7 ms** | `bbc58397d238efde` |
+
+**1.104x**, medians of seven, the two arms interleaved A-B-B-A over six rounds by swapping
+`libggml-metal.dylib` between runs, and the digest identical in all twelve. On a discrete GPU the
+same fallback costs a PCIe round trip per node rather than a shared-memory one, so the ratio there
+should be larger, not smaller.
+
+**A number NOT to quote from this.** An earlier throwaway of this same change measured
+493.3 → 484.7 ms, 1.8%, on a Metal backend whose convolution kernels PRs 14 and 15 had not yet fixed.
+The absolute saving carried across that 5x almost exactly — 8.6 ms then, 9.2 ms now — and the
+percentage did not. It is the reason this was filed as "cleanliness, not performance" and then turned
+out to be worth shipping: the denominator moved, not the patch.
+
+**The change.** Four `int32_t lp0..lp3` on `ggml_metal_kargs_pad`, filled from `op_params` 0/2/4/6;
+`kernel_pad_impl` maps `dst[i] <- src[i - lp]` per dimension, copying when every index is in range and
+zero-filling otherwise; `supports_op` returns `true`. The `_4` vectorised variant needs no thought
+because `is_c4` is hardcoded `false` upstream ("note: this is slower"), but the two conditions it would
+now need — `lp0 % 4 == 0` and a dense `nb[0]` — are written into the commented-out line beside it.
+
+**One bug this found, which is the argument for the `nb00` line in the diff.** The kernel indexed the
+source as `T[]`, i.e. assuming its fastest axis is dense. `ggml_pad_ext` accepts a permuted view and
+the CPU path honours one, so that was already wrong — but every shape that could expose it has a
+non-zero leading pad somewhere, and those were all declined, so the bug was unreachable. Allowing them
+made it reachable and `test-backend-ops`' `tfrm=2` case at `ne_a=[11,22,33,44]` failed at
+**ERR 1.94** the first time this kernel saw it. Reading through `nb00` fixes it and costs nothing
+measurable (the 1.104x above is the fixed kernel).
+
+**What it does not do.** `supports_op` now returns an unconditional `true` for non-circular `PAD`, and
+that keeps a pre-existing hole rather than adding one: only `kernel_pad_f32` is instantiated, and the
+old predicate did not check the type either. Circular padding is still declined, as before.
+
+**Verified:** `test-backend-ops -b MTL0` is **21/21 on `PAD`** where it was 20/21 with the leading-pad
+cases enabled and skipped before that, and **13887/13887 over the whole suite**. loom's `ctest -L ci`
+is 75/75 on the same machine. whisper-small on Metal is unchanged, which is the control — it issues no
+leading pad, so nothing in it should move, and nothing does.
+
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
@@ -1120,3 +1182,57 @@ thread.
 per-node cost bottoms out at **~1.9 us**, so threading a unary below ~16K elements is a loss there
 regardless of row count — against ~0.3 us at 4 threads, so the floor is machine-dependent. Any future
 change that threads more ops needs one.
+
+## Not a PR here, but upstream should know: the OpenMP wait-policy mitigation covers only Intel's `libomp`
+
+`ggml-cpu.c` (v0.19.0, around line 4114, inside `#ifdef GGML_USE_OPENMP`) sets `KMP_BLOCKTIME` and
+nothing else:
+
+```c
+//if (!getenv("OMP_WAIT_POLICY")) {
+//    // set the wait policy to active, so that OpenMP threads don't sleep
+//    setenv("OMP_WAIT_POLICY", "active", 0)
+//}
+
+if (!getenv("KMP_BLOCKTIME")) {
+    // set the time to wait before sleeping a thread
+    setenv("KMP_BLOCKTIME", "200", 0); // 200ms
+}
+```
+
+**`KMP_BLOCKTIME` is Intel/LLVM `libomp`'s knob and GNU `libgomp` ignores it entirely.** So a
+gcc-built `GGML_OPENMP=ON` — which is what Debian, a Raspberry Pi, and any manylinux wheel produce —
+gets no mitigation at all, and the line that would have covered it is commented out. What that costs,
+measured on a **Core Ultra 9 285K, 24 threads, a 2520-node VITS graph**: every thread sleeps on a futex
+at each node's `#pragma omp barrier`, **334,609 voluntary context switches over five syntheses against
+160** without OpenMP, and the thread-count curve stops being monotonic — more cores make it slower.
+`GGML_OPENMP=OFF` is **4.8x** there. At four threads it is 1.0x, so this is a many-core report;
+[Epic-05 §2](../../docs/epics/epic-05-edge-performance.md) and
+[Retro-017](../../docs/retros/retro-017-libgomp-slept-at-every-graph-node.md) carry the full table.
+
+**And un-commenting the line would not fix it**, which is the part worth saying in the report rather
+than leaving a reviewer to find: libgomp reads `OMP_WAIT_POLICY` in its **load-time constructor**, long
+before `ggml_init` runs, so a `setenv` from inside the library is always too late. `OMP_WAIT_POLICY=active`
+set from the *shell* is the fastest arm and is still the wrong default — it spins forever, including
+between inferences (13.82 s of CPU for a run that takes 0.16 s of wall time), where ggml's own
+threadpool spins a bounded ~6.5M rounds (`poll = 50`) and then sleeps.
+
+So there is no environment variable that fixes this from where ggml stands. Two things upstream could
+do, and neither is a patch we hold:
+
+1. **Say so in the build system.** `GGML_OPENMP` defaults ON, and on the most common toolchain on the
+   most common platform it is a large regression at high thread counts. A note at the option, or a
+   default that follows the detected OpenMP runtime, would have saved this diagnosis.
+2. **Delete the commented-out block, or replace it with the reason it cannot work.** As it stands it
+   reads like a mitigation that is merely disabled, which is how loom first read it.
+
+**A third item that was on this list is withdrawn, because it was not true.** Epic-05 §2 proposed
+adding `ggml_backend_cpu_set_threadpool` to the CPU backend's registry proc-address table on the
+grounds that it was absent and a `GGML_BACKEND_DL` build therefore could not tune `poll` in-process.
+It is **present** at the pin — `ggml-cpu.cpp`'s `ggml_backend_cpu_get_proc_address` exports it beside
+`ggml_threadpool_new` and `ggml_threadpool_free`, under a `// threadpool - TODO: move to ggml-base`
+comment, and no patch of ours put it there. So the residual 24-thread gap (0.040 s against 0.031 s)
+has an in-process route already and needs nothing from upstream; whether it is worth taking is a loom
+question, not a ggml one. Checked by reading the pinned tree, 2026-09-02.
+
+loom's own fix was the build flag: `LOOM_OPENMP`, default OFF (`cmake/Dependencies.cmake:73`).

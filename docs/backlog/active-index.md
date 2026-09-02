@@ -91,18 +91,6 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
-* [ ] **P4.17 — the libgomp wait-policy fix is SHIPPED (`bb95996`); only its two remainders are open,
-  and both now sit in P4.30.** Root cause: loom built ggml with `GGML_OPENMP=ON`, so `ggml_barrier` was
-  `#pragma omp barrier` and every thread slept on a futex at each of VITS's 2520 graph nodes — 334,609
-  voluntary context switches over 5 syntheses at 24 threads against 160 without. `GGML_OPENMP=OFF` (now
-  `LOOM_OPENMP`, default OFF, `cmake/Dependencies.cmake:73`) is **4.8x at 24 threads** and restores a
-  monotonic curve. The full measurement, and why the fix is the build flag rather than
-  `OMP_WAIT_POLICY=active` (a library cannot set that variable), is in
-  [Epic-05 §2](../epics/epic-05-edge-performance.md) and
-  [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md). The default thread count is
-  **closed** (P4.30b, 2026-09-02: it is the physical core count). Open: the upstream note
-  (**P4.30c step 6**).
-
 * [ ] **Write down that loom-exporter's tests run under `~/.venvs/piper`.** `python3` on the dev box
   resolves to **`~/.venvs/ovos`** — transformers 5.14.1, **no `sentencepiece`** — which is the
   Qwen3-ASR-only env, and `tests/ci` under it is `4 failed, 568 passed`. **All four are the
@@ -129,50 +117,6 @@ are not renumbered. New items continue the scheme.
   single-model-shaped. A model-agnostic tool with a per-tensor-role policy (skip norm weights and
   embeddings) is unbuilt. *Scope note: [ADR-017](../adrs/adr-017-no-k-quants.md)*
 
-## P4.30 — the tails of P4.10–P4.29
-
-Every P4.10–P4.29 item is closed as a headline, and the release carrying them (**1.0.0-rc7**, PyPI and
-the Hub, 2026-08-31) is complete. What survives is a set of remainders, gathered here so they stop
-being scattered across four sections. **None blocks a release and none is on the critical path to
-P5.** Each line names the number that sizes it, and the epic that holds the evidence.
-
-**P4.30a, P4.30b and P4.30d are CLOSED (2026-09-02)** — the default thread count is the physical core
-count; the x86 TTS and LM columns are re-sampled per launch; and the Metal convolution gap is fully
-closed, as `ggml-0014` (the transposed convolution's dispatch) and `ggml-0015` (the convolution
-kernel itself, **5.10x on the op, 278.1 -> 97.6 ms on an f32 VITS synthesis**, bit-identical
-waveform). **P4.30c** is one sequential pass whose steps share setup.
-
-* [ ] **P4.30c — the small tails, one sequential pass.** Steps 1–3 are the same three exports, so the
-  setup is paid once.
-  1. **Matcha, Kokoro and StyleTTS2 through the post-P4.29 lowering** — one export and one whisper
-     pass each. P4.29's entire verification is VITS; these three were last transcribed through the old
-     lowering. Transcribe, do not correlate —
-     [Retro-006](../retros/retro-006-kokoro-shipped-noise.md).
-  2. **Re-measure the direct-conv budget on those same exports, on macOS.** `ggml-0006`'s new
-     `__APPLE__` arm reads a 12 MB L2 where every Mac previously took the 512 KB floor; swept on VITS
-     it changes nothing, because VITS's largest conv weight already fits under the floor. The shapes
-     where a 24x budget change binds are in exactly these families.
-  3. **Decide `op_conv_2d` on the evidence step 1 produces.** The 2-D form still takes im2col for a
-     folded kernel; P4.29 gave only the 1-D form. Nothing in tree has a quantized 2-D convolution hot
-     enough to notice — step 1's profiles say whether that holds. **If it does, close it unfixed.**
-  4. **Re-measure `ldc` alignment, then decide.** `C`'s leading dimension is not a multiple of the
-     cache line, so a job's full-line store straddles two lines on odd columns — *alignment*, not the
-     false sharing P4.22 fixed. Worth **~4 ms of a 3.9 s transcription**, and closing it means padding
-     `C`, an allocator change rather than a kernel one. If the 4 ms holds, that ratio is the argument
-     for closing it unfixed.
-  5. **A Metal `PAD` kernel that accepts a leading pad** — scoped and prototyped: **27/56 CPU splits
-     to 0/2, identical digest, 493.3 → 484.7 ms.** Do not pick it up expecting a speedup; it is worth
-     doing for cleanliness, upstreamability, and discrete GPUs where a round trip crosses PCIe. Same
-     shape as Vulkan's missing `PAD_REFLECT_1D` (P4.7d). *That 1.8% was measured against a 493.3 ms
-     baseline that `ggml-0014` and `ggml-0015` have since taken to 97.6 ms, so re-measure it rather
-     than quoting the percentage — the absolute 8.6 ms is the number that carried, and against the
-     new baseline it would be 9%, which changes what this item is worth.*
-  6. **Send the `OMP_WAIT_POLICY` / `KMP_BLOCKTIME` gap upstream.** ggml mitigates P4.17's mechanism
-     for Intel's libomp only; `cmake/patches/UPSTREAM.md` is where it goes. Last, because it depends
-     on nothing here.
-  → [Epic-05 §5](../epics/epic-05-edge-performance.md),
-  [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
-
 ## Backends & accelerators
 
 * [ ] **NPUs.** Open, and the shape of the problem is known: no NPU registers as a `ggml` device type
@@ -181,23 +125,25 @@ waveform). **P4.30c** is one sequential pass whose steps share setup.
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [Epic-04](../epics/epic-04-backends-and-accelerators.md)*
 * [ ] **The device hierarchy ranks a GPU above the CPU on unified memory, where the proxy does not
   hold.** The rule stands for "has its own fast memory", which an Apple Silicon GPU does not — it has
-  the CPU's. Measured at HEAD with `ggml-0015`: `device=""` picks `MTL0` and is **1.76x faster on
-  whisper-small and 1.79x SLOWER on VITS** (2.90x at Q4_0). It is why Metal ships as an extra rather
-  than in the base macOS wheel; if this changes, folding it in is worth revisiting. **P4.30a and
-  P4.30d between them took the VITS ratio from 8.98x to 1.79x and did NOT rescue the rule** — a
-  GPU that is 1.8x slower on one model and 1.8x faster on another still cannot be ranked above the
+  the CPU's. Measured at HEAD with `ggml-0016`: `device=""` picks `MTL0` and is **1.76x faster on
+  whisper-small and 1.63x SLOWER on VITS** (2.75x at Q4_0). It is why Metal ships as an extra rather
+  than in the base macOS wheel; if this changes, folding it in is worth revisiting. **P4.30a, P4.30d and
+  P4.30c step 5 between them took the VITS ratio from 8.98x to 1.63x and did NOT rescue the rule** — a
+  GPU that is 1.6x slower on one model and 1.8x faster on another still cannot be ranked above the
   CPU by a rule that reads neither. This stays open on its own terms, with a much smaller number.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md)
 
-* [ ] **On Metal, a Q4_0 convolutional model is now SLOWER than the same model at f32** — 149.1 ms
-  against 97.6 on VITS, an inversion `ggml-0015` created and did not exist before it (149.7 against
-  278.7). The mechanism is known and is not the quantization: ggml-metal declines loom's folded
+* [ ] **On Metal, a Q4_0 convolutional model is now SLOWER than the same model at f32** — 141.7 ms
+  against 88.7 on VITS, an inversion `ggml-0015` created and did not exist before it (149.7 against
+  278.7); `ggml-0016` helps both arms and so leaves the ratio slightly WIDER, at 1.60x. The mechanism is known and is not the quantization: ggml-metal declines loom's folded
   block-quantized convolution kernel on its type test ([Epic-04 §5.2](../epics/epic-04-backends-and-accelerators.md)),
   so a Q4_0 export lowers through `im2col` + `mul_mat` and never reaches the new kernel — whose fast
   path is F32/F16-only by the same test. The choice is between teaching that type test about the
   folded kernel (P4.13's format) and dequantizing into the new kernel's fast path the way `ggml-0013`
-  does on the CPU. **Neither is on any critical path** — Metal is an extra — but "quantizing costs
+  does on the CPU — and **P4.30c step 3 has since done the CPU-side equivalent of the second option
+  for the 2-D form** (`op_conv_2d` hands a folded kernel to `ggml_conv_2d_direct_packed`, which
+  dequantizes and re-enters), so the shape of the fix is now demonstrated on one backend. **Neither is on any critical path** — Metal is an extra — but "quantizing costs
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
