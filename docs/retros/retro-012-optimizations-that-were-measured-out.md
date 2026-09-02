@@ -45,6 +45,8 @@ on the other side that cancels it.
 | rows-inner loop order, so a store finishes a cache line of C | **mechanism falsified**: no dependence on the size of C — see below |
 | `ggml-0002`'s aarch64 address hoist applied to x86 | neutral at every k tested, small and large |
 | *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired at ONE thread, and 1.02x at k=768. **The "m=1500 cannot reach `BM = 4`" half was the bug, not a constraint** — at four threads that is 2.75x of false sharing, fixed in P4.22; see [Retro-020](retro-020-a-knob-measured-at-one-thread.md) |
+| staging a Metal `conv_2d` weight tile in threadgroup memory | **55.2 ms against 43.6**, worse at every activation length — the loads it stages were already uniform; see below |
+| more output POSITIONS per thread in a Metal `conv_2d` tile | **69.7 ms against 43.6 at less than half the loads per FMA** — occupancy, not the ratio, is the constraint; see below |
 
 ### `SOFT_MAX`: closed on the right number for the wrong reason (2026-08-24, P4.18)
 
@@ -413,6 +415,46 @@ either of the first two.
   re-check rather than re-argue.
 
 ---
+
+### Two Metal convolution tiles, and the ratio that picked the wrong one (2026-09-02, P4.30d)
+
+**The register's first GPU entries, and both were named in a scoping note as the way to fix the op**
+— Epic-04 §5.7 proposed "a tiled implicit-GEMM kernel with threadgroup staging, or lower to `im2col`
++ `mul_mat`". The kernel that shipped (`ggml-0015`, 5.10x) is neither. Measured by
+`scripts/bench22.mm` over the 117 convolutions of one VITS synthesis, on an M1 Pro.
+
+**Threadgroup staging: 55.2 ms against the shipped kernel's 43.6, worse at every activation length.**
+The mechanism was real and the quantity was zero. The kernel loads eight weights per output position,
+and every lane in the threadgroup reads *the same address* — so one cache line already served the
+whole SIMD group, and staging them into threadgroup memory replaced a hit with a hit plus two
+barriers per input-channel chunk. **Before staging an operand, check whether it is uniform across the
+threadgroup**; a uniform global load on this part is not the thing that costs.
+
+**More output positions per thread: 69.7 ms, at less than half the loads per FMA.** This is the one
+worth remembering, because the ratio argument is the standard one and it points the wrong way:
+
+| tile (positions x channels) | loads per FMA | total |
+|---|---:|---:|
+| **1 x 8 — shipped** | **1.125** | **43.6 ms** |
+| 2 x 8 | 0.625 | 65.1 ms |
+| 4 x 4 | 0.5 | 69.7 ms |
+| 8 x 8 | 0.375 | 302.7 ms — slower than the stock kernel |
+
+* **Actionable takeaway — on a GPU, loads per FMA is not the objective; occupancy is, and the two
+  trade against each other.** Every accumulator a wider tile adds is a register not available to hide
+  latency, and this kernel is latency-bound throughout (17 instructions per 8 FMAs, at 40% of what
+  that mix allows). The tile with a third of the winner's memory traffic is 60% slower.
+* **`maxTotalThreadsPerThreadgroup` prices that trade for free, and has one blind spot.** It reads
+  1024 under no register pressure, and it caught the real win in this item: the same tile addressed
+  with one 64-bit pointer per output channel reads 704 and runs 68.8 ms, against 896 and 45.6 ms for
+  32-bit element indices. **But it does not report spilling** — the 8x8 row above reads a healthy 896
+  while running 0.73x, because the compiler spilled to scratch rather than raise the register count.
+  Print it beside every variant; do not conclude from it alone.
+* **And the denominator these were all scoped against was a spec sheet.** The M1 Pro's 5.31 TFLOP/s
+  is not reachable by any kernel here; a dependency-free FMA loop measures **2.11**. Every "% of peak"
+  in Epic-04 §5.7 and [Retro-026](retro-026-three-nodes-were-half-the-runtime.md) is understated 2.5x.
+  Same lesson as the outer-product tile above, on a part where the published number is easier to
+  trust. Full record: [Retro-027](retro-027-the-register-that-was-an-address.md).
 
 ## Full record (verbatim from the ledger)
 
