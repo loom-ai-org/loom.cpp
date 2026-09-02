@@ -214,11 +214,18 @@ so it spins through a graph's barriers and still sleeps between calls. It also t
 the wheels, which matters past speed: loom-py is imported alongside numpy and torch, which bring their
 own OpenMP runtimes, and two in one process is a known hazard.
 
-**If the residual 24-thread gap (0.040 against 0.031 s) is ever worth closing**, the follow-up is a
-tenth ggml patch adding `ggml_backend_cpu_set_threadpool` to the CPU backend's registry proc-address
-table (`ggml-cpu.cpp:648`). It is absent today, so the `GGML_BACKEND_DL` build the wheels ship
-(ADR-009) cannot reach it and `poll` is not tunable in-process — the same constraint that shaped
-`apply_cpu_threads`.
+**If the residual 24-thread gap (0.040 against 0.031 s) is ever worth closing**, the route is
+`ggml_backend_cpu_set_threadpool`, which lets a caller build its own threadpool and choose `poll`.
+
+> **CORRECTED 2026-09-02 (P4.30c step 6), and the correction is the useful part.** This paragraph used
+> to say that entry point was **absent** from the CPU backend's registry proc-address table and that a
+> tenth ggml patch would have to add it. It is **present** at the pin: `ggml_backend_cpu_get_proc_address`
+> in `ggml-cpu.cpp` exports it beside `ggml_threadpool_new` and `ggml_threadpool_free`, under a
+> `// threadpool - TODO: move to ggml-base` comment, and no patch in `cmake/patches` put it there. So
+> the `GGML_BACKEND_DL` build the wheels ship (ADR-009) **can** reach it and `poll` **is** tunable
+> in-process; the constraint that shaped `apply_cpu_threads` was never this one. Found while writing
+> the upstream note that was going to propose adding it — see `cmake/patches/UPSTREAM.md`. Nothing
+> downstream was built on the wrong claim, because nothing was built on it at all.
 
 #### Scope: this is a many-core fix
 
@@ -2404,16 +2411,21 @@ did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27
 
 ## 5. Planned Work
 
-**P4.10–P4.29 are all closed as headline items.** Their remainders are gathered as **P4.30** in
-[the hub](../backlog/active-index.md#p430--the-tails-of-p410p429): P4.30a (Metal's convolutional
-cost — **CLOSED 2026-09-02**, answered in [Epic-04 §5.7](epic-04-backends-and-accelerators.md), with
-its own remainder tracked as P4.30d and closed the same day by `ggml-0015`), P4.30b (the default
-thread count, then the README's TTS and LM columns per launch — §2 above, **CLOSED 2026-09-02**), and
-P4.30c (a sequential
-pass over the small tails: the three other conv families at Q8_0 and the direct-conv budget with
-them, `op_conv_2d`, `ldc` alignment, the Metal `PAD` kernel, and the upstream `OMP_WAIT_POLICY`
-note — §5 below and Epic-04 §5.4). The evidence for each stays where it was measured; the hub holds
-only the scope and the ordering.
+**P4.10–P4.29 are all closed as headline items, and so is P4.30, which gathered their remainders — all
+of a, b, c and d, on 2026-09-02.** It is therefore off the hub entirely (that ledger holds only open
+work) and this is where it lives:
+
+* **P4.30a** — Metal's convolutional cost, answered in
+  [Epic-04 §5.7](epic-04-backends-and-accelerators.md); its own remainder became **P4.30d** and closed
+  the same day as `ggml-0015`, [§5.8](epic-04-backends-and-accelerators.md).
+* **P4.30b** — the default thread count is the physical core count, and the README's TTS and LM
+  columns are re-sampled per launch. §2 above.
+* **P4.30c** — the six small tails, below (steps 1, 3, 4 and 6) and in
+  [Epic-04 §5.9](epic-04-backends-and-accelerators.md) (steps 2 and 5, both Apple-only). **Two of them
+  shipped code rather than closing unfixed**, which is
+  [Retro-028](../retros/retro-028-three-closing-arguments-that-were-never-measured.md).
+
+The evidence for each stays where it was measured.
 
 
 ### P4.21 — `QK^T` at `k = 64`: the vector lanes are on the wrong axis — MEASURED OUT, CLOSED 2026-08-29
@@ -3791,3 +3803,174 @@ or at `hf-models/*/*.gguf` for the sweep above; on the fixed VITS the zero-heavy
 and the conv kernels are 95% of what remains.
 
 ---
+
+### P4.30c — the small tails, one sequential pass — DONE AND CLOSED 2026-09-02
+
+Six steps, and **three of the six existed to confirm a number that would let them close unfixed. Two
+of those three numbers were wrong**, so one became a shipped patch and one changed by an order of
+magnitude. That is the pattern worth taking out of this item and it is
+[Retro-028](../retros/retro-028-three-closing-arguments-that-were-never-measured.md).
+
+Steps 2 and 5 are Apple-only and their record is
+[Epic-04 §5.9](epic-04-backends-and-accelerators.md); in one line each, the `__APPLE__` cache budget
+**binds** on Matcha/Kokoro/StyleTTS2 where it did not on VITS (~1.1x on two of them, and the output
+bytes change where VITS's did not), and the Metal `PAD` kernel **shipped as `ggml-0016`**, 97.9 → 88.7
+ms, because the 1.8% it was filed at was measured against a baseline `ggml-0014`/`ggml-0015` have since
+cut by 5x.
+
+#### Step 1 — the three other conv families, through the post-P4.29 lowering
+
+Re-exported at HEAD and synthesised, one utterance each, plus VITS as the control:
+
+| | samples | peak | rms | whisper-small says |
+|---|---:|---:|---:|---|
+| vits (control) | 70400 | 0.1587 | 0.0165 | *"A. Can you shut down the computer, my friend?"* |
+| matcha | 76800 | 0.4414 | 0.0612 | *"Hey, can you shut down the computer, my friend?"* |
+| kokoro | 73200 | 0.3340 | 0.0481 | *"Hey, can you shut down the computer, my friend?"* |
+| styletts2 | 84000 | 0.4464 | 0.0535 | *"Hey, can you shut down the computer? My friend."* |
+
+**The control is the point of the control.** VITS's mis-heard leading "Hey" is what P4.13 recorded for
+its F32 arm, word for word, so the harness is reading the same thing it read then. The three new
+families all say the sentence.
+
+**And the harness had a bug that only clang reports, which is how this table nearly came out empty.**
+`scripts/tts_synth.cpp` bound `const auto&` to a `std::vector<double>` inside a `Value` returned BY
+VALUE; the reference dangles at the end of the full expression. gcc left the storage readable and every
+Linux run looked right — the numbers above are unchanged after the fix — but the same binary on macOS
+printed `samples=0 peak=0.0000` for all four families, which reads exactly like four broken exports.
+`-Wdangling-gsl` names it. **A silent zero from a measurement harness is a dangling read until proven
+otherwise**, and it is worth knowing that the two compilers disagree about whether this one is visible.
+
+#### Step 3 — `op_conv_2d`: the premise was false, and it is now `ggml-0013`'s second caller
+
+The item said to close this unfixed if nothing in tree had a quantized 2-D convolution hot enough to
+notice. **Something does.**
+
+A census of every topology in all seventeen shipped models says where to look: **the four TTS families
+have no genuinely 2-D convolution at all** — 117/141/90/90 `CONV_1D`, plus `CONV_1D_DW` and
+`CONV_TRANSPOSE_1D`, and nothing else — so step 1's own profiles could never have answered this. The
+2-D convolutions are in four ASR encoders' subsampling stems, and only some of their kernels can be
+block-quantized at all: the fold makes `ne[0] = IC*KH*KW`, which must be a multiple of 32.
+
+| model | 2-D conv kernels | folds to | quantizable |
+|---|---|---:|---|
+| conformer-ctc-small | 2 × `[3,3,1,176]`, `[3,3,176,176]` | 9, 1584 | **no** (neither is a multiple of 32) |
+| parakeet-tdt / -rnnt | 3 dense + 2 depthwise | 9, 256, 256 | the two pointwise ones |
+| qwen3-asr-0.6b | 3 × `[3,3,·,480]` | 9, 4320, 4320 | **the two big ones** |
+
+qwen3-asr is the one that matters. **One thread**, dev box, `jfk.wav`, medians of six ABBA-interleaved
+runs, `$LOOM_PROFILE` node time:
+
+| | F32 | Q4_0, before | Q4_0, after |
+|---|---:|---:|---:|
+| `conv2d2` (`[3,3,480,480]`) | 974 ms | 1720 ms (**1.77x**) | **1180 ms** |
+| `conv2d3` | 251 ms | 455 ms (**1.81x**) | **300 ms** |
+| whole transcription (node time) | 12.8 s | 14.9 s | **13.85 s** (1.08x) |
+
+**Quantizing those two convolutions cost 1.8x, which is P4.13's 2.08x surviving in the one op P4.29
+did not reach**, and it is 6% of a transcription rather than the "nothing" the premise assumed. The
+fix is eleven lines in `op_conv_2d` and no ggml change at all: `ggml_conv_2d_direct_packed` has taken a
+`kh` since `ggml-0013` shipped it, its CPU implementation dequantizes into the DECLARED
+`[KW, KH, IC, OC]` layout and re-enters the general 2-D path, and nothing had ever passed it a `kh > 1`.
+The op also stops paying `mul_mat_kernel_first`'s transpose — 15.2 ms on qwen3-asr's larger stem
+convolution by itself — because the direct sweep writes `[OW, OH, OC, N]` straight out.
+
+#### At the thread count that actually ships, and one arm of it goes the other way
+
+One thread is where the mechanism is legible; it is not where the engine runs. Re-measured on the
+Core Ultra 9 285K at the default thread count, same ABBA protocol:
+
+| Q4_0 qwen3-asr, 24 threads | before | after | |
+|---|---:|---:|---|
+| `conv2d2` | 69.0 ms | **41.3 ms** | 1.67x |
+| `conv2d3` | 9.4 ms | 11.1 ms | **0.85x — slower** |
+| the pair | 78.4 ms | **52.4 ms** | 1.50x, plus the `IM2COL` and `CONT` the old path also paid |
+
+**The smaller of the two convolutions is a regression at 24 threads and a 1.5x win at one**, which is
+the direct sweep threading less well than a GEMM at that shape (`[13,16]` output against `[25,32]`).
+It is 1.7 ms of a 2 s transcription and does not change the verdict, but it is the kind of thing that
+only appears if both thread counts are measured — Retro-019's rule, on the other axis. If a model ever
+arrives whose 2-D convolutions are all small, this branch wants a work floor.
+
+**Model-level, honestly:** 1.08x on a one-thread node-time sum; on a 2-core dev box at the default
+thread count ~1.04x, which is inside that box's noise; on the 24-core box the whole transcription is
+~2 s and the 26 ms this saves is not separable from run-to-run variance there. **The op numbers are
+the result; the model numbers are the sanity check.** Also measured: 2.06x on parakeet's two pointwise
+stem convolutions (79.5 → 38.7 and 19.5 → 9.5 ms at one thread), where the stem is 2% of the model so
+the model does not move.
+
+All four quantized ASR exports transcribe `jfk.wav` word-identically before and after. `ctest -L ci`
+**75/75**, `ctest -L gate` **83/83**, and the F32 path cannot move because the branch is guarded on
+`conv_kernel_is_packed`.
+
+**Testing.** `test_conv_2d_folded_kernel_matches_declared` gains the two arms the 1-D check has had
+since P4.29 — a folded Q8_0 kernel through the primitive, and `ggml_conv_2d_direct_packed` built
+directly — and a second shape set that lands on the direct sweep rather than the batched im2col.
+`KW != KH` in both sets on purpose: the 1-D arms all pass `kh = 1`, so a geometry that confuses those
+two axes was invisible to every check that existed. Verified red three ways: swapping KW and KH in
+`op_conv_2d`'s geometry misses by 3.4 (8e22 on the smaller set), swapping them in the direct call by
+3.4 and 6.1, and swapping KH with IC never reaches a number because
+`ggml_conv_2d_direct_packed` asserts `ic == b->ne[2]` first. The Q8_0 tolerance is 1e-1 on the deeper
+set against 5e-2 on the other, because the reduction is 288 terms rather than 96 and the worst error
+goes 2.3e-2 → 4.2e-2 with it.
+
+**What is still not covered**, and it is the same sentence P4.29 wrote about the 1-D form: a Vulkan or
+CUDA backend declines a packed node, `backend_can_run` sees that, and the graph keeps the im2col
+lowering. Nothing here changes what those backends run.
+
+#### Step 4 — `ldc` alignment: the ratio held, the model number was 12x wrong, and it still closes unfixed
+
+Re-measured at HEAD on the Core Ultra 9 285K — the box the original number came from, since a 2-core
+dev box cannot resolve this at all (P4.22 recorded ±40% there) — with `scripts/bench14.cpp`, which
+gains an optional thread-count argument for exactly this and defaults to the one thread every existing
+row was read at.
+
+**The ratio is confirmed and it is a threading effect**, `m = 1500` against a padded `m = 1504` at
+whisper's `QK^T` shape (`n = 1500, k = 64`), 21 paired rounds:
+
+| threads | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| ratio | 1.021 | 1.248 | **1.310** | 1.239 |
+
+**The model number was not.** The handover said *"~4 ms of a 3.9 s transcription"*; 4.1 ms is the
+delta on ONE call (15.0 against 10.9), and whisper-small runs **twelve** of them. At HEAD on that box
+the `MUL_MAT 1500x1500` bucket is **186.5 ms of a 3.95 s transcription** at four threads, so the
+ceiling is **~49 ms, 1.25%** — twelve times what the argument for closing it assumed.
+
+**Two things the sweep found that the item did not have.** First, the cost is **not flat across
+residues**: it is worst where `m % 16` is odd and mildest at the multiples of four, so whisper's 1500
+is the *cheapest* non-zero residue there is and a model with an odd sequence length pays nearly twice
+as much. Second, it **needs a big `C`**:
+
+| `m % 16` | 0 | 1 | 2 | 4 | 7 | 8 | 12 | 14 | 15 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `n=1500, k=64` (9 MB of `C`) | 0.98 | 1.67 | 1.55 | 1.38 | **1.93** | 1.37 | 1.36 | 1.58 | 1.72 |
+| `n=276, k=44` (0.6 MB, conformer's) | 1.02 | 1.16 | 1.10 | 1.03 | 1.11 | 1.04 | 1.05 | 1.10 | 1.12 |
+
+Conformer's relative-position attention runs at `m = 551`, `551 % 16 = 7` — the worst residue class —
+and reaches 1.11x, inside its own noise, because `C` fits in cache and the coherence traffic is cheap.
+So this is a property of large attention scores, not of every GEMM, and whisper's is the only one in
+tree.
+
+**And the mechanism cannot be separated from the ragged prefix by shape, which is worth stating
+because the name says otherwise.** `ldc % 64 == 0` and `m % 16 == 0` are the SAME predicate on f32
+(`ldc = 4m`), so no choice of `m` distinguishes "the store straddles a line" from "the prefix rows are
+slow". The U-shape above argues for a mix of the two — a leftover-row story predicts cost rising with
+the residue and it does not — but proving it means padding `C`, which is the fix.
+
+**Decision: closed UNFIXED, on a corrected number rather than the wrong one.** 1.25% of a whisper
+transcription, on x86 only (a Pi threads 3.5x at every `m`), at more than one thread only, on the one
+shape in tree big enough to show it — against an allocator change that would give every ggml matmul
+destination a padded leading dimension. **Reopen it if a model arrives with a large attention score
+matrix at an odd sequence length**; that is the 1.9x row, and it is the only thing that would move
+this.
+
+#### Step 6 — the `OMP_WAIT_POLICY` gap, sent upstream
+
+Written up in `cmake/patches/UPSTREAM.md` as a report rather than a held patch: `KMP_BLOCKTIME` is
+Intel/LLVM `libomp`'s knob, `libgomp` ignores it, the `OMP_WAIT_POLICY` line that would have covered
+it is commented out, and un-commenting it could not work anyway because libgomp reads that variable in
+its load-time constructor. **Writing it up cost the third item of this pass a claim** — see the
+correction in §2 above: the follow-up this epic proposed, adding `ggml_backend_cpu_set_threadpool` to
+the CPU backend's proc-address table, is not a follow-up, because it is already there.
+
