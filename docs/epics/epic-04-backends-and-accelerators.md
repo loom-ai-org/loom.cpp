@@ -771,6 +771,13 @@ conclusion.** See §5.4 — collapsing the fallback entirely is worth **1.8%**, 
 
 ### 5.4 The PAD fix, prototyped and measured: it is a correctness item, not a performance one
 
+> **SHIPPED 2026-09-02 as `cmake/patches/ggml-0016-metal-pad-leading.patch` (P4.30c step 5), and the
+> verdict in this section's title is the thing that changed.** Re-measured against the post-`ggml-0014`
+> / `ggml-0015` baseline it is **97.9 → 88.7 ms, 1.104x**, not 1.8% — and the reason is the denominator,
+> not the patch. See §5.9 below, which carries the shipped numbers, the permuted-source bug the
+> re-measurement uncovered, and the general lesson. Everything below this banner is the prototype that
+> led there and is left as it was written.
+
 **Tracked as P4.30c step 5**, alongside the open question of where VITS's 5.24x actually comes from
 (**P4.30a**) — which this is not.
 
@@ -1125,8 +1132,102 @@ M1 Pro (16-core GPU), macOS 15.7.9, `7167822` + `ggml-0015`, `scripts/bench_vits
 `ctest -L ci` on this build is 75/75. Achievable rooflines on this part, measured by
 `scripts/bench22.mm`: **2.11 TFLOP/s** F32 FMA, **180 GB/s** streaming read.
 
-| | CPU (8 threads) | Metal, stock | `+ggml-0014` | `+ggml-0015` |
-|---|---:|---:|---:|---:|
-| VITS f32 | **54.6 ms** | 494.1 ms (9.05x) | 278.1 ms (5.09x) | **97.6 ms (1.79x)** |
-| VITS q4_0 | **51.4 ms** | 350.2 ms (6.81x) | 149.7 ms (2.91x) | 149.1 ms (2.90x) |
-| whisper-small, `jfk.wav` | 1.326 s | — | 0.874 s (1.52x faster) | **0.752 s (1.76x faster)** |
+| | CPU (8 threads) | Metal, stock | `+ggml-0014` | `+ggml-0015` | `+ggml-0016` |
+|---|---:|---:|---:|---:|---:|
+| VITS f32 | **54.4 ms** | 494.1 ms (9.05x) | 278.1 ms (5.09x) | 97.9 ms (1.79x) | **88.7 ms (1.63x)** |
+| VITS q4_0 | **51.6 ms** | 350.2 ms (6.81x) | 149.7 ms (2.91x) | 149.7 ms (2.90x) | **141.7 ms (2.75x)** |
+| whisper-small, `jfk.wav` | 1.326 s | — | 0.874 s (1.52x faster) | 0.752 s (1.76x faster) | **0.752 s (1.76x faster)** |
+
+The `+ggml-0016` column is 2026-09-02's own re-measurement (P4.30c step 5, §5.9); the CPU column and
+the two Metal VITS rows were re-run in the same session, which is why they differ from the `+ggml-0015`
+column by less than 1%. **whisper is the control and does not move** — 0.7547/0.7518 s before against
+0.7531/0.7534 after, interleaved — because it issues no leading pad. VITS q4_0's digest is unchanged
+too (`c5f02103027bcaee`), so `ggml-0016` moves the schedule and nothing else on either export.
+
+### 5.9 P4.30c on macOS: the PAD kernel shipped, and the cache budget finally met a model it binds on
+
+Two steps of P4.30c are Apple-only, and both were carried on the same M1 Pro on 2026-09-02, at
+`a2464d6` plus the working tree of this pass. The other four are in
+[Epic-05 §5](epic-05-edge-performance.md).
+
+#### Step 5 — `ggml-0016`, and a 1.8% that became 11%
+
+`kernel_pad_impl` could only APPEND: it wrote `dst[i] <- src[i]` inside the source extent and zero
+outside it, and `supports_op` declined anything with a non-zero leading pad. §5.4 built that fix as a
+throwaway, measured **493.3 → 484.7 ms**, and filed it as cleanliness rather than performance. The
+instruction it left behind — *re-measure it rather than quoting the percentage* — is the whole reason
+this is now a shipped patch:
+
+| M1 Pro, one f32 VITS synthesis, `--device gpu` | splits | CPU nodes | median of 7 | FNV-1a |
+|---|---:|---:|---:|---|
+| stock | 56 | 72 | 97.9 ms | `bbc58397d238efde` |
+| `+ggml-0016` | **2** | **0** | **88.7 ms** | `bbc58397d238efde` |
+
+**1.104x**, the two arms interleaved A-B-B-A over six rounds by swapping `libggml-metal.dylib` between
+runs, and the audio's digest identical in all twelve. **The absolute saving is what carried across the
+5x change in baseline — 8.6 ms then, 9.2 ms now — and the percentage is not**, which is the reusable
+half of this: a percentage measured against a baseline that is itself under repair has a shelf life,
+and the note that recorded 1.8% was right to say so and to say re-measure.
+
+**One node dragged 72 with it, which is why the graph moved more than the op.** VITS's text encoder
+issues 21 declined `PAD` nodes; `ggml_backend_sched` then assigns their *supported* neighbours to the
+CPU as well rather than copy a tensor back across every boundary, so removing one op took 54 splits
+and 72 nodes off the CPU. §5.4 already knew this and drew the opposite conclusion from it — the round
+trips were nearly free on unified memory *at the time*, when the graph they were interrupting was 5x
+slower. On a discrete GPU each of those boundaries is a PCIe crossing, so the ratio there should be
+larger than 1.104x rather than smaller.
+
+**And enabling the op found a bug that had been unreachable.** The kernel indexed its source as `T[]`
+— assuming a dense fastest axis — while `ggml_pad_ext` accepts a permuted view and the CPU honours
+one. Every shape that can expose that has a non-zero leading pad somewhere, so every such shape was
+declined and the bug could not fire. `test-backend-ops -b MTL0 -o PAD` failed at **ERR 1.94** on
+`ne_a=[11,22,33,44], tfrm=2` the first time the kernel was allowed to see it; reading through `nb00`
+fixes it at no measurable cost. **A backend test that reports `not supported` is not a passing test**,
+and 21 `PAD` cases had been reading as green while the interesting ones were being skipped.
+
+**Verified:** `test-backend-ops -b MTL0` **21/21 on `PAD`** and **13887/13887** over the whole suite;
+`ctest -L ci` 75/75 on the Mac. whisper-small on Metal is the control — it issues no leading pad, and
+it does not move: **0.7547 / 0.7518 s before against 0.7531 / 0.7534 s after**, interleaved, same
+transcript. The Q4_0 VITS export moves for the same reason the f32 one does — its fallback was always
+the `PAD`, not the quantization (§5.2) — **149.7 → 141.7 ms**, digest `c5f02103027bcaee` unchanged. So
+the Q4_0-slower-than-f32 inversion on this backend is now 1.60x rather than 1.53x: `ggml-0016` helps
+both arms and helps the faster one more.
+
+**What this does to the device split**, which is the only reason any of these numbers matter: a
+default-device VITS run is now **1.63x slower** than the CPU at f32 and **2.75x** at Q4_0, against
+1.76x FASTER on whisper-small. The rule still reads neither, Metal still ships as an extra, and §5.5
+still stands — with a smaller number for the third time.
+
+#### Step 2 — the `__APPLE__` cache budget, on the three families where it binds
+
+`ggml-0006`'s `ggml_conv_1d_direct_budget()` took the 512 KB floor on every Mac until P4.29 gave it a
+`sysctlbyname` arm; on this part that arm reads `hw.perflevel0.l2cachesize` = **12 MB**, a 24x change.
+Swept on VITS it changed nothing at all — same time, same digest — because VITS's largest convolution
+weight already fits under the floor, so the arm shipped **correct on its own terms and untested in the
+regime where it binds**. Matcha, Kokoro and StyleTTS2 are that regime.
+
+Budget forced through a throwaway `getenv` in the build tree, three reps each, `--device cpu`, median
+of the `$LOOM_PROFILE` node-time sum:
+
+| budget | matcha | kokoro | styletts2 | digest |
+|---|---:|---:|---:|---|
+| 512 KB (the old floor) | 1.540 s | 2.290 s | 2.498 s | **differs** |
+| 4 MB (`hw.l2cachesize`) | 1.416 s | 2.045 s | 2.516 s | agrees |
+| **12 MB (shipped)** | **1.425 s** | **2.155 s** | **2.437 s** | agrees |
+| 1 GB | 1.467 s | 2.118 s | 2.470 s | agrees |
+
+**The digest is the result, not the timing.** All three families produce different output BYTES at the
+floor and identical bytes at every budget above it, which is the direct sweep being declined and then
+accepted — the thing VITS could not show. All six of those outputs transcribe through whisper-small as
+the utterance, word for word, at both budgets and identically to the Linux CPU (*"Hey, can you shut
+down the computer, my friend?"*, and StyleTTS2's *"…computer? My friend."* at both) — so the two
+lowerings disagree in the last bits of an F32 accumulation and nowhere else. **Transcribe, do not
+correlate**, and here also: do not read a byte difference as a defect before asking the oracle.
+
+The timing says the arm is worth **1.08x on Matcha and 1.12x on Kokoro and nothing on StyleTTS2**, and
+that **12 MB is indistinguishable from 4 MB or from 1 GB** — everything the 24x buys is already bought
+at 4 MB, so the exact value the `sysctl` returns does not matter and the choice of
+`hw.perflevel0.l2cachesize` over `hw.l2cachesize` is not load-bearing for speed. It remains the right
+key to read for the reason §5 gives (ggml's threads run on the performance cluster), just not a
+consequential one. **Closed: the arm is correct, it binds, and it is worth ~1.1x on two of the four
+families.**

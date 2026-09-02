@@ -1,0 +1,140 @@
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -1066,6 +1066,12 @@
+     uint64_t nb1;
+     uint64_t nb2;
+     uint64_t nb3;
++    // The LEADING pad per dimension (op_params 0/2/4/6). Without these the kernel can only append,
++    // which is why supports_op used to decline every ggml_pad_ext with a non-zero leading pad.
++    int32_t  lp0;
++    int32_t  lp1;
++    int32_t  lp2;
++    int32_t  lp3;
+ } ggml_metal_kargs_pad;
+ 
+ typedef struct {
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4600,7 +4600,11 @@
+         /*.nb0  =*/ nb0,
+         /*.nb1  =*/ nb1,
+         /*.nb2  =*/ nb2,
+-        /*.nb3  =*/ nb3
++        /*.nb3  =*/ nb3,
++        /*.lp0  =*/ ggml_get_op_params_i32(op, 0),
++        /*.lp1  =*/ ggml_get_op_params_i32(op, 2),
++        /*.lp2  =*/ ggml_get_op_params_i32(op, 4),
++        /*.lp3  =*/ ggml_get_op_params_i32(op, 6),
+     };
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
+@@ -4608,6 +4612,11 @@
+     if (pipeline.c4) {
+         args.ne00 = ne00/4;
+         args.ne0  = ne0/4;
++        // Each of these is sound only because of a condition the pipeline selector imposes: `lp0 % 4`
++        // for the shift, and a DENSE fastest axis for the stride, since the kernel now steps by nb00
++        // and one float4 is four of them.
++        args.lp0  = args.lp0/4;
++        args.nb00 = nb00*4;
+     }
+ 
+     const int nth_max = MIN(64, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -5974,6 +5974,19 @@
+     }
+ }
+ 
++// PADDING WAS APPEND-ONLY, AND THE COST WAS NOT THE OP. This kernel wrote `dst[i] <- src[i]` inside
++// the source extent and zero outside it, which is a pad whose LEADING pads are all zero; `supports_op`
++// declined anything else, so every `ggml_pad_ext` with a leading pad fell back to the CPU. In a VITS
++// text encoder that is 21 declined nodes -- and the scheduler then assigns their supported neighbours
++// to the CPU as well, rather than copy a tensor back and forth across each one, so ONE declined op
++// took 72 nodes and 55 of that graph's 56 splits with it.
++//
++// Measured on an Apple M1 Pro, one f32 VITS synthesis, the two arms interleaved A-B-B-A over six
++// rounds of seven: 55 splits and 72 fallback nodes -> 1 and 0, and 97.9 -> 88.7 ms, 1.104x, with the
++// audio's FNV-1a identical in all twelve runs. The op itself is not what moved. An earlier throwaway
++// of this same change measured 493.3 -> 484.7 ms, 1.8%, on a Metal backend whose convolution kernels
++// had not been fixed yet: the ABSOLUTE saving is what carried across that 5x (8.6 ms then, 9.2 ms
++// now), the percentage is not, and the ratio is what makes this worth shipping rather than noting.
+ template <typename T>
+ kernel void kernel_pad_impl(
+     constant ggml_metal_kargs_pad & args,
+@@ -5987,21 +6000,39 @@
+     const int32_t k0 = tgpig.x/args.ne1;
+     const int32_t i1 = tgpig.x - k0*args.ne1;
+ 
+-    const int32_t i03 = i3;
+-    const int32_t i02 = i2;
+-    const int32_t i01 = i1;
++    // Shifted by the LEADING pad, which is what makes this a pad rather than an append. The three
++    // outer indices decide whether this destination row exists in the source AT ALL; when it does not
++    // the row is entirely zeros and the source pointer is never dereferenced, so it is formed from
++    // clamped indices rather than negative ones.
++    const int32_t i03 = i3 - args.lp3;
++    const int32_t i02 = i2 - args.lp2;
++    const int32_t i01 = i1 - args.lp1;
+ 
+-    device const T * src0_ptr = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+-    device       T * dst_ptr  = (device       T *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
++    const bool row_in_src = i01 >= 0 && i01 < args.ne01 &&
++                            i02 >= 0 && i02 < args.ne02 &&
++                            i03 >= 0 && i03 < args.ne03;
+ 
++    device const char * src0_row = src0 + (row_in_src ? i03 : 0)*args.nb03
++                                        + (row_in_src ? i02 : 0)*args.nb02
++                                        + (row_in_src ? i01 : 0)*args.nb01;
++    device       T *    dst_ptr  = (device T *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
++
+     for (int32_t l0 = 0; l0 < 1024; l0 += ntg.x) {
+         const int32_t i0 = k0*1024 + tpitg.x + l0;
+         if (i0 >= args.ne0) {
+             break;
+         }
+ 
+-        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
+-            dst_ptr[i0] = src0_ptr[i0];
++        const int32_t i00 = i0 - args.lp0;
++
++        // THROUGH `nb00` RATHER THAN AS `T[]`, because src0 may be a PERMUTED view whose fastest axis
++        // is not dense -- `ggml_pad_ext` accepts one and the CPU path honours it. The old kernel
++        // indexed `src0_ptr[i0]` and got away with it: every shape that could expose the difference
++        // has a non-zero leading pad somewhere, and those were all declined. Caught by
++        // test-backend-ops' `tfrm=2` case at ne_a=[11,22,33,44], which failed at ERR 1.94 the first
++        // time this kernel was allowed to see it.
++        if (row_in_src && i00 >= 0 && i00 < args.ne00) {
++            dst_ptr[i0] = *((device const T *) (src0_row + i00*args.nb00));
+         } else {
+             dst_ptr[i0] = 0.0f;
+         }
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1258,8 +1258,9 @@
+                 return false;
+             }
+ 
+-            return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
+-                   (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
++            // The four leading pads (op_params 0/2/4/6) used to have to be zero, because the kernel
++            // could only append. They no longer do -- kernel_pad_impl shifts by them.
++            return true;
+         case GGML_OP_PAD_REFLECT_1D:
+         case GGML_OP_TIMESTEP_EMBEDDING:
+             return op->src[0]->type == GGML_TYPE_F32;
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -2061,7 +2061,11 @@
+     char name[256];
+ 
+     // note: this is slower
+-    //const bool is_c4 = op->src[0]->ne[0] % 4 == 0 && op->ne[0] % 4 == 0;
++    // note: the leading pad has to be a whole number of float4s (the kernel shifts by lp0/4), and the
++    //       source's fastest axis has to be dense (it steps by nb00, and a float4 is four of them)
++    //const bool is_c4 = op->src[0]->ne[0] % 4 == 0 && op->ne[0] % 4 == 0 &&
++    //                   ggml_get_op_params_i32(op, 0) % 4 == 0 &&
++    //                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
+     const bool is_c4 = false;
+ 
+     snprintf(base, 256, "kernel_pad_%s%s", ggml_type_name(op->src[0]->type), is_c4 ? "_4" : "");
