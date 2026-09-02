@@ -1,0 +1,121 @@
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -609,6 +609,7 @@ typedef struct {
+     int32_t  IL;
+     int32_t  K;
+     int32_t  s0;
++    int32_t  OL;
+     uint64_t nb0;
+     uint64_t nb1;
+ } ggml_metal_kargs_conv_transpose_1d;
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4267,6 +4267,7 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
+         /*.IL  =*/ IL,
+         /*.K   =*/ K,
+         /*.s0  =*/ s0,
++        /*.OL  =*/ OL,
+         /*.nb0 =*/ nb0,
+         /*.nb1 =*/ nb1,
+     };
+@@ -4279,7 +4280,29 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 1, 1, 1);
++    // ONE THREAD PER THREADGROUP WAS THE ENTIRE COST OF THIS OP. This dispatch used to be
++    // `(OL, OC, 1)` threadgroups of `(1, 1, 1)` threads, so each threadgroup occupied ONE lane of a
++    // 32-wide SIMD group and 31 of every 32 lanes on the GPU were idle by construction. It is not a
++    // small effect and it is not visible in a split count -- the op is fully supported, so nothing
++    // falls back and nothing looks wrong.
++    //
++    // Measured on an M1 Pro over VITS's three vocoder upsamples (1.50 GFLOP, `$LOOM_PROFILE`):
++    //
++    //     stock                224.7 ms     6.7 GFLOP/s   -- 0.13% of this part's 5.31 TFLOP/s
++    //     nth threads/group      7.8 ms   193.5 GFLOP/s   -- 29x
++    //
++    // For scale, ONE CPU core runs the same three nodes in 21.6 ms through ggml-0008/ggml-0009, so
++    // the stock kernel had the whole GPU losing 10x to a single core. End to end an f32 VITS
++    // synthesis goes 494 -> 280 ms with a bit-identical waveform, and `test-backend-ops -o
++    // CONV_TRANSPOSE_1D` is 116/116 on MTL0 either way.
++    //
++    // The shape is exactly what `ggml_metal_op_conv_2d` above already does: `nth` threads on the x
++    // axis, the grid divided by the same factor, and the kernel bounds-checking the tail.
++    int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
++    nth = std::min(nth, 256);
++    nth = std::max(nth, 1);
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, (OL + nth - 1)/nth, OC, 1, nth, 1, 1);
+ 
+     return 1;
+ }
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -5314,7 +5314,9 @@ typedef void (conv_transpose_1d_t)(
+         device const float * src1,
+         device        char * dst,
+         uint3   tgpig[[threadgroup_position_in_grid]],
+-        uint3    tgpg[[threadgroups_per_grid]]);
++        uint3    tgpg[[threadgroups_per_grid]],
++        uint3   tpitg[[thread_position_in_threadgroup]],
++        uint3     ntg[[threads_per_threadgroup]]);
+ 
+ template <typename T>
+ kernel void kernel_conv_transpose_1d(
+@@ -5323,14 +5325,23 @@ kernel void kernel_conv_transpose_1d(
+         device const float * src1,
+         device        char * dst,
+         uint3   tgpig[[threadgroup_position_in_grid]],
+-        uint3   tgpg[[threadgroups_per_grid]]) {
++        uint3   tgpg[[threadgroups_per_grid]],
++        uint3   tpitg[[thread_position_in_threadgroup]],
++        uint3     ntg[[threads_per_threadgroup]]) {
+ 
+     // For output position j on the time axis, only input positions
+     //   i such that i*s0 <= j < i*s0 + K
+     // contribute -- i.e. i in [ceil((j - K + 1)/s0), floor(j/s0)]
+     // intersected with [0, IL-1]. That's at most ceil(K/s0) values
+     // (typically 2 for stride==K/2 transposed convs).
+-    const int32_t j  = tgpig[0];
++    // `j` spans (threadgroup, thread) rather than the threadgroup alone, so one threadgroup covers
++    // `ntg.x` output positions instead of one -- see the dispatch, where the entire cost of this op
++    // was. `OL` is in the args only for this bounds check: the grid is rounded up, and none of the
++    // lengths that matter divide evenly (a VITS vocoder upsamples to 2296, 18312 and 73220).
++    const int32_t j  = tgpig[0]*ntg.x + tpitg.x;
++    if (j >= args.OL) {
++        return;
++    }
+     const int32_t s0 = args.s0;
+     const int32_t K  = args.K;
+     const int32_t IL = args.IL;
+@@ -5355,7 +5366,7 @@ kernel void kernel_conv_transpose_1d(
+         }
+     }
+ 
+-    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
++    device float * dst_ptr = (device float *) (dst + j * args.nb0 + tgpig[1] * args.nb1);
+ 
+     dst_ptr[0] = v;
+ }
+@@ -5367,7 +5378,9 @@ kernel void kernel_conv_transpose_1d<float>(
+     device const float * src1,
+     device        char * dst,
+     uint3   tgpig[[threadgroup_position_in_grid]],
+-    uint3    tgpg[[threadgroups_per_grid]]);
++    uint3    tgpg[[threadgroups_per_grid]],
++    uint3   tpitg[[thread_position_in_threadgroup]],
++    uint3     ntg[[threads_per_threadgroup]]);
+ 
+ template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
+ kernel void kernel_conv_transpose_1d<half>(
+@@ -5376,7 +5389,9 @@ kernel void kernel_conv_transpose_1d<half>(
+     device const float * src1,
+     device        char * dst,
+     uint3   tgpig[[threadgroup_position_in_grid]],
+-    uint3    tgpg[[threadgroups_per_grid]]);
++    uint3    tgpg[[threadgroups_per_grid]],
++    uint3   tpitg[[thread_position_in_threadgroup]],
++    uint3     ntg[[threads_per_threadgroup]]);
+ 
+ 
+ template <typename T>
