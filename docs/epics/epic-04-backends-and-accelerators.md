@@ -73,7 +73,7 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | | |
 |---|---|
 | Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md) |
-| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md) |
+| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
 ## 4. The Record
@@ -735,16 +735,25 @@ packed node for a *quantized* kernel and never an F32 one. If that ever changes,
 guard or it will read a `[IC*K, OC]` tensor as `[KW, KH, IC, OC]` and return a wrong answer rather
 than an error.
 
-### 5.3 The result that matters: 2.69x faster, or 5.24x slower, depending on the model
+### 5.3 The result that matters: faster or slower depending on the model
 
 Measured on the M1 Pro, F32, best-of-n, same input both sides. **The split count is listed first
-because it is the explanation, not a footnote** — a first benchmark on a new backend measures how
-much of the graph fell back.
+because it is where the graph went** — a first benchmark on a new backend measures how much of it
+fell back. It is *not* where the time went; §5.4 and §5.7 are both about how far apart those two
+questions turned out to be.
 
 | model | shape | splits (CPU / total) | CPU | Metal | |
 |---|---|---|---|---|---|
 | whisper-small | encoder is large matmuls | **0 / 4** | 1764.3 ms | **654.9 ms** | **2.69x faster** |
 | VITS (f32) | 1-D convolution throughout | **27 / 56** | 94.1 ms | 493.3 ms | **5.24x slower** |
+
+**Both columns have since moved, and §5.7 carries the current pair.** The CPU side because P4.30b
+made the default thread count this machine's eight physical cores rather than ggml's four; the Metal
+side because P4.30a found what the 5.24x was and `ggml-0014` removed half of it. Re-measured at HEAD
+on 2026-09-02, VITS f32 is **55.0 ms on the CPU and 278.7 ms on Metal**, and whisper-small — a whole
+transcription of `samples/jfk.wav` through `scripts/bench_asr_loom.cpp`, not the encoder alone — is
+**1.325 s on the CPU and 0.874 s on Metal**. The shape of the finding is unchanged: **it depends on
+the model, and for a convolutional one Metal loses.**
 
 **The cause of VITS's fallback is one op.** Of 1308 nodes, only 48 land on the CPU — but they are
 scattered, so each is a round trip. By op: **21 `PAD`**, 12 `CONT`, 6 `SUB`, 6 `SCALE`, 3 `DIV`.
@@ -803,22 +812,25 @@ Metal is flat within 8% across a 5.8x change in work. It is **compute-bound and 
 expensive per unit of work on this graph**, which is a statement about kernels and lowering, not
 about scheduling.
 
-**The likeliest reason, and it is a hypothesis rather than a result.** VITS is convolution-dominated
-(the vocoder profile puts the conv path at 92%), and loom's CPU convolution carries **seven
-hand-written ggml patches** — `ggml-0004` through `ggml-0007`, plus P4.13's kernel fold and P4.29's
-quantized direct convolution — while its Metal path runs stock `im2col` + `mul_mat`. whisper-small,
-which wins 2.69x, is dominated by large matrix multiplications where stock Metal is strong and the
-CPU has no such advantage. That contrast is consistent, and confirming it means a per-op profile on
-Metal, not more reasoning.
+**The likeliest reason, written here as a hypothesis and since MEASURED WRONG in both halves — see
+§5.7.** The hypothesis was: VITS is convolution-dominated (the vocoder profile puts the conv path at
+92%), loom's CPU convolution carries **seven hand-written ggml patches** — `ggml-0004` through
+`ggml-0007`, plus P4.13's kernel fold and P4.29's quantized direct convolution — "while its Metal path
+runs stock `im2col` + `mul_mat`". Both halves of that last clause are false. At F32 ggml-metal does
+not lower a convolution through `im2col` at all: it has a native `CONV_2D` kernel and runs it. And
+where it *does* take the `im2col` route — the Q4_0 export, whose folded kernel it declines on its type
+test — that route is the **faster** of the two. What was right is only the contrast with whisper-small,
+which wins because it is large matrix multiplications, and the instruction that closes the paragraph:
+**confirming it means a per-op profile on Metal, not more reasoning.**
 
-**So the follow-up splits in two**, and neither is a release blocker:
+**So the follow-up split in two**, and neither was a release blocker:
 
 * The **PAD kernel** — worth doing for cleanliness and upstreamability (it is the same shape of gap
   P4.7d recorded for Vulkan's `PAD_REFLECT_1D`), and it removes a fallback that would matter more on
   a discrete GPU where a round trip crosses PCIe. On Apple it is worth 1.8%. Do not scope it as a
-  performance fix.
+  performance fix. **Still open, as P4.30c step 5.**
 * **Why Metal's convolution is 5x the CPU's here** — the item with the payoff in it, and the one
-  that has to start with a per-op profile.
+  that had to start with a per-op profile. **That is P4.30a, and §5.7 is its answer.**
 
 ### 5.5 The finding that was not scoped: `device=""` now picks the slower device
 
@@ -862,3 +874,117 @@ first time, and `loom-py-rt-metal` published its first release, so all four proj
 
 **Non-goals, unchanged:** CoreML and the Neural Engine (not Metal, no ggml backend targets it, and
 out-of-tree options were turned down on licensing); Intel Macs; a `universal2` backend wheel.
+
+### 5.7 P4.30a — where the gap actually is: two convolution kernels, one of them a one-line bug
+
+**SHIPPED 2026-09-02**, on the M1 Pro, at `7782a30`. The charter was "start with a per-op profile,
+not with more reasoning", and the profile put **97% of Metal's VITS time in two ops** — one of which
+has **three nodes in the whole graph** and was costing 45% of the run.
+
+#### How to read a device profile, because the raw table cannot be read at face value
+
+`$LOOM_PROFILE` on a scheduler costs a `ggml_backend_synchronize` per node (see
+`include/loom/core/profile.h`), and on Metal that is not a rounding error: a profiled f32 VITS run is
+925 ms against a 494 ms un-profiled one. **The calibration is free and exact, because the graph
+contains its own control.** `RESHAPE`, `VIEW`, `PERMUTE` and `TRANSPOSE` compute nothing at all, so
+whatever the report charges them *is* the per-node overhead: 611 `RESHAPE` at 122.13 ms is
+0.1998 ms each, 167 `VIEW` at 32.17 ms is 0.1926, 112 `PERMUTE` at 23.64 ms is 0.2111. Subtract
+0.196 ms x calls from every bucket and those three land on zero, and **the remaining buckets sum to
+the un-profiled wall clock within 1%**. Do that before quoting a device profile; do not do it on the
+CPU at more than one thread, where the overhead is a thread-pool barrier that lands unevenly and the
+same subtraction drives no-op rows negative.
+
+#### The profile, f32 VITS, calibrated
+
+| op | calls | Metal, stock | Metal, `+ggml-0014` | CPU @ 1 thread |
+|---|---:|---:|---:|---:|
+| `CONV_2D` | 117 | **241.0 ms** | 241.3 ms | ~212 ms |
+| `CONV_TRANSPOSE_1D` | **3** | **224.7 ms** | **7.8 ms** | ~21.6 ms |
+| everything else | 2078 | ~28 ms | ~30 ms | ~62 ms |
+| **wall (un-profiled)** | | **494.1 ms** | **278.7 ms** | **296.0 ms** |
+
+**Three nodes were 45% of the run**, and nothing upstream of a profile would have said so: the op is
+fully supported by ggml-metal, so it produces no split, no fallback and no warning. Ranking by node
+count or by split count both miss it completely — which is the same lesson §5.4 learned from the
+`PAD` prototype, one level further in. The hypothesis this replaced, and why it survived two weeks of
+being right about the outcome and wrong about every fact in it, is
+[Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md).
+
+#### `CONV_TRANSPOSE_1D`: one thread per threadgroup
+
+`ggml_metal_op_conv_transpose_1d` dispatched `(OL, OC, 1)` threadgroups of **`(1, 1, 1)` threads**.
+Every threadgroup therefore occupied a single lane of a 32-wide SIMD group, and 31 of every 32 lanes
+on the GPU were idle by construction. Against `scripts/conv_census.py`'s arithmetic for the reference
+utterance — VITS's three vocoder upsamples are **1.50 GFLOP** of the graph's 18.39 —
+
+| | time | rate | of this part's 5.31 TFLOP/s |
+|---|---:|---:|---:|
+| Metal, stock | 224.7 ms | 6.7 GFLOP/s | **0.13%** |
+| Metal, `+ggml-0014` | 7.8 ms | 193 GFLOP/s | 3.6% |
+| **one** CPU core (`ggml-0008`/`0009`) | 21.6 ms | 69 GFLOP/s | — |
+
+so the stock kernel had the entire GPU losing **10x to a single Firestorm core**.
+`cmake/patches/ggml-0014-metal-conv-transpose-1d-threadgroup.patch` gives the x axis `nth` threads,
+divides the grid by the same factor and bounds-checks the tail — the shape `ggml_metal_op_conv_2d`
+directly above it already uses. Written up for upstream as PR 14 in
+[`cmake/patches/UPSTREAM.md`](../../cmake/patches/UPSTREAM.md).
+
+**Verified three ways.** `test-backend-ops test -o CONV_TRANSPOSE_1D` is **116/116 on MTL0** against
+the CPU reference; the VITS waveform digest is **bit-identical** to stock on both exports
+(`bbc58397d238efde` f32, `c5f02103027bcaee` q4_0); and the re-profile is a clean control — the
+`CONV_TRANSPOSE_1D` bucket collapses 224.7 -> 7.8 ms while `CONV_2D` sits unchanged at 241 ms.
+
+**It is not a VITS-only fix.** `scripts/conv_census.py` over the zoo: Kokoro **4**, StyleTTS2 **4**,
+Matcha **5**, VITS **3**. Every vocoder-bearing TTS family hits it; the ASR families and Supertonic
+do not use the op at all.
+
+#### `CONV_2D`: 1.3% of peak, and Metal's own matmul proves the headroom
+
+What is left is one op. After `ggml-0014`, **`CONV_2D` is 86% of Metal's VITS time** — 241 ms for the
+other 16.89 GFLOP, i.e. **70 GFLOP/s, 1.3% of the part's peak, and slower than one CPU core.** The
+kernel explains it without a microbenchmark: `kernel_conv_2d` is one thread per output element
+looping `IC*KH*KW` with **two global loads per FMA and no reuse at all** — no register tile, no
+threadgroup staging, no vectorisation. The occupancy is fine; the arithmetic intensity is 0.25
+FLOP/byte.
+
+**The Q4_0 export is the natural experiment that says this is fixable**, because there Metal declines
+the folded block-quantized kernel on its type test (§5.2) and loom's `im2col` + `mul_mat` lowering
+runs instead. Calibrated the same way:
+
+| path | | |
+|---|---:|---:|
+| native `CONV_2D` (f32) | 117 calls | **241 ms** for 16.89 GFLOP — 14.3 ms/GFLOP |
+| `IM2COL` + `MUL_MAT` (q4_0) | 126 + 150 calls | **99.7 + 10.5 ms** for ~15.7 GFLOP — 7.0 ms/GFLOP |
+
+Two things fall out. **The arithmetic is not the problem** — `MUL_MAT` does the whole graph's
+convolution in **10.5 ms, about 1.49 TFLOP/s, 28% of peak** (with Q4_0 weights, so an F32 matmul
+would pay more weight traffic; `IM2COL` touches only F32 activations and carries no such caveat).
+And **the data movement is** — `im2col`'s materialisation alone costs 10x the matmul it feeds.
+Even so, the im2col route is ~2x better than the native kernel, which is why q4_0 on Metal is
+149.7 ms against f32's 278.7 ms.
+
+**The ceiling, stated as a ceiling** ([Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md)):
+if `CONV_2D` ran at the rate Metal's own `MUL_MAT` already demonstrates, 16.89 GFLOP would take
+~11 ms and VITS on Metal would land near the 8-thread CPU's 55 ms. That is the size of the prize and
+it is an upper bound, not an estimate. The two candidate shapes are the two loom already knows: a
+tiled implicit-GEMM kernel with threadgroup staging (what the CPU's `ggml-0004`/`0006` do), or lower
+to `im2col` + `mul_mat` and accept the expansion traffic. Tracked on the hub as **P4.30d**.
+
+#### What this decides for the device hierarchy
+
+It does not rescue it. With `ggml-0014` in, a default-device VITS run on this laptop is still
+**5.07x slower** than the same call without Metal (f32; 2.91x at Q4_0), because the residual is a
+kernel-quality gap and not a scheduling one. §5.5's conclusion stands unchanged — Metal ships as an
+extra, `GGML_METAL OFF` stays in `loom-py/CMakeLists.txt` — and the unified-memory ranking item stays
+open on the hub with a smaller, better-understood number attached to it.
+
+#### Current numbers, for anyone re-running this
+
+M1 Pro, macOS 15.7.9, `7782a30` + `ggml-0014`, `scripts/bench_vits_loom.cpp` median of 9,
+`scripts/bench_asr_loom.cpp` median of 5 interleaved ABBA. `ctest -L ci` on this build is 75/75.
+
+| | CPU (8 threads) | Metal, stock | Metal, `+ggml-0014` |
+|---|---:|---:|---:|
+| VITS f32 | **55.0 ms** | 494.1 ms (8.98x) | **278.7 ms (5.07x)** |
+| VITS q4_0 | **51.5 ms** | 350.2 ms (6.80x) | **149.7 ms (2.91x)** |
+| whisper-small, `jfk.wav` | 1.325 s | — | **0.874 s (1.52x faster)** |
