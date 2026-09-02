@@ -54,10 +54,15 @@ import sys
 
 import gguf
 
-# The engine's own expression grammar (src/core/symbol_env.cpp): + - * / floor() sqrt(), identifiers,
-# numbers, and a '$' sigil that is optional even mid-expression. Anything outside this character set is
-# rejected rather than handed to eval().
-_SAFE = re.compile(r"^[0-9A-Za-z_+\-*/(). $]*$")
+# The engine's own expression grammar (src/core/symbol_env.cpp): + - * / floor() sqrt(),
+# Max(a, b)/Min(a, b), identifiers, numbers, and a '$' sigil that is optional even mid-expression.
+# Anything outside this character set is rejected rather than handed to eval().
+#
+# THE COMMA IS NOT DECORATION. `Max`/`Min` are two-argument, and they are how sympy prints the clamp
+# P4.28's relative-position work put into every VITS-family export -- `Max(0, n_tokens - 5) + 1`. Until
+# they were admitted here this tool rejected every GGUF exported after that change, which is a census
+# that reads only stale models.
+_SAFE = re.compile(r"^[0-9A-Za-z_+\-*/(),. $]*$")
 
 
 def ev(expr, syms):
@@ -71,7 +76,10 @@ def ev(expr, syms):
     text = re.sub(r"\bfloor\(", "math.floor(", text)
     text = re.sub(r"\bsqrt\(", "math.sqrt(", text)
     try:
-        return int(eval(text, {"__builtins__": {}}, dict(syms, math=math)))
+        # Both spellings of each, for the same reason symbol_env.cpp takes both: sympy writes `Max`
+        # and a hand-written attr would write `max`.
+        env = dict(syms, math=math, Max=max, Min=min, max=max, min=min)
+        return int(eval(text, {"__builtins__": {}}, env))
     except NameError as e:
         # An unbound shape symbol is the most common way to hold this tool wrong -- every model names
         # its own (n_tokens, n_samples, n_kv, n_enc_frames ...) and only its driver script knows which

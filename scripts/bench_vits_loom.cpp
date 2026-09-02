@@ -21,6 +21,7 @@
 // `scales = [0.0, 1.0, 0.0]`, so both sides synthesise the same number of samples -- which the two
 // harnesses print, and which must match before any ratio is believed.
 #include "loom/loom.h"
+#include "loom/core/profile.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,11 +61,16 @@ int main(int argc, char** argv) {
     //
     // The device is an ARGUMENT, defaulting to "cpu" so every existing invocation means what it did.
     // It is here because "which device is faster for this model" turned out to be a per-MODEL
-    // question and not only a per-machine one: on an M1 Pro, Metal is 2.69x faster than the CPU on
-    // whisper-small and 5.24x SLOWER on this file, because 21 of its `PAD` nodes have a nonzero
-    // leading pad that ggml-metal declines, splitting the graph 27 ways onto the CPU (P4.11).
+    // question and not only a per-machine one: on an M1 Pro, Metal is 1.52x FASTER than the CPU on
+    // whisper-small and 5.07x SLOWER on this file (P4.11, P4.30a).
+    //
     // Run it with GGML_SCHED_DEBUG=1 and count `## SPLIT` lines per backend before believing a
-    // timing -- a first measurement on a new backend measures how much of the graph fell back.
+    // timing -- a first measurement on a new backend measures how much of the graph fell back. But
+    // DO NOT THEN READ THE TIMING OFF THE SPLIT COUNT, which is the trap this file has now walked
+    // into twice. VITS splits 27 ways onto the CPU because ggml-metal declines a `PAD` with a
+    // nonzero leading pad, and collapsing all 27 is worth 1.8%; the time was in two convolution
+    // kernels that never fell back at all, one of which was dispatching a single thread per
+    // threadgroup (`ggml-0014`, worth 1.77x). Epic-04 SS5.7.
     const std::string dev_spec = argc > 3 ? argv[3] : "cpu";
     loom::Device device = loom::Device::open(dev_spec);
     std::fprintf(stderr, "device: %s (%s)\n", device.name().c_str(), device.description().c_str());
@@ -99,6 +105,11 @@ int main(int argc, char** argv) {
 
     const size_t n_samples = once();        // warm: first call builds the graphs
     const uint64_t digest = fnv1a(last_audio);
+    // Drop the warm-up's nodes from any `$LOOM_PROFILE` report. The first call builds and allocates
+    // the graphs, so every buffer it touches takes a first-touch page fault -- a cost that belongs to
+    // neither the op it lands on nor the steady state the rest of this loop measures. A no-op when
+    // profiling is off.
+    loom::profile::reset();
     std::vector<double> ts;
     for (int i = 0; i < nrun; ++i) {
         const auto t0 = std::chrono::steady_clock::now();

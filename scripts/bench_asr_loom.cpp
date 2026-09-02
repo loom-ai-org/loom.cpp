@@ -28,7 +28,10 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s <asr.gguf> <clip.wav> [nrun] [language]\n", argv[0]); return 2; }
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s <asr.gguf> <clip.wav> [nrun] [language] [device]\n", argv[0]);
+        return 2;
+    }
     const std::string gguf = argv[1];
     const std::string wav  = argv[2];
     const int nrun = argc > 3 ? std::atoi(argv[3]) : 5;
@@ -36,7 +39,14 @@ int main(int argc, char** argv) {
 
     // Device::open rather than a bare CPU backend, because that is what applies $LOOM_N_THREADS --
     // ggml's own default is 4 whatever the machine has, so a bare backend cannot be asked for 24.
-    loom::Device device = loom::Device::open("cpu");
+    //
+    // The device is an ARGUMENT, defaulting to "cpu" so every existing invocation means what it did --
+    // the same addition bench_vits_loom.cpp carries, and for the same reason: "which device is faster"
+    // is a per-MODEL question, and this file and that one are the two halves of the answer. On an
+    // M1 Pro they point OPPOSITE WAYS, which is why both have to stay re-runnable (Epic-04 §5.3).
+    const std::string dev_spec = argc > 5 ? argv[5] : "cpu";
+    loom::Device device = loom::Device::open(dev_spec);
+    std::fprintf(stderr, "device: %s (%s)\n", device.name().c_str(), device.description().c_str());
     loom::Backends backends = device.backends();
 
     auto model = loom::GgufModel::load(gguf, backends.primary);
@@ -85,9 +95,10 @@ int main(int argc, char** argv) {
         }
     }
     std::sort(times.begin(), times.end());
-    std::printf("loom   asr   audio=%.2fs  median %.4f s  min %.4f s  (n=%d, warm-up %.4f s "
+    std::printf("loom   asr   [%s]  audio=%.2fs  median %.4f s  min %.4f s  (n=%d, warm-up %.4f s "
                 "discarded)\n",
-                waveform.size() / 16000.0, times[times.size() / 2], times.front(), nrun, warm);
+                dev_spec.c_str(), waveform.size() / 16000.0, times[times.size() / 2], times.front(),
+                nrun, warm);
     std::printf("  text: %s\n", first_text.c_str());
     return 0;
 }
