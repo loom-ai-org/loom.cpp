@@ -99,8 +99,9 @@ are not renumbered. New items continue the scheme.
   monotonic curve. The full measurement, and why the fix is the build flag rather than
   `OMP_WAIT_POLICY=active` (a library cannot set that variable), is in
   [Epic-05 §2](../epics/epic-05-edge-performance.md) and
-  [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md). Open: the default thread count
-  (**P4.30b step 1**) and the upstream note (**P4.30c step 6**).
+  [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md). The default thread count is
+  **closed** (P4.30b, 2026-09-02: it is the physical core count). Open: the upstream note
+  (**P4.30c step 6**).
 
 * [ ] **Write down that loom-exporter's tests run under `~/.venvs/piper`.** `python3` on the dev box
   resolves to **`~/.venvs/ovos`** — transformers 5.14.1, **no `sentencepiece`** — which is the
@@ -136,6 +137,8 @@ being scattered across four sections. **None blocks a release and none is on the
 P5.** Each line names the number that sizes it, and the epic that holds the evidence.
 
 Three tasks: **a** and **b** are one task each, **c** is one sequential pass whose steps share setup.
+**P4.30b is CLOSED (2026-09-02)** — the default thread count is the physical core count, and the x86
+TTS and LM columns are re-sampled per launch. Two remain.
 
 * [ ] **P4.30a — why Metal costs ~5x the CPU per unit of work on a convolutional graph.** Where VITS's
   5.24x actually lives. Not the `PAD` fallback (P4.30c step 5, worth 1.8%) and not dispatch overhead:
@@ -143,19 +146,6 @@ Three tasks: **a** and **b** are one task each, **c** is one sequential pass who
   compute-bound. **Starts with a per-op profile on Metal**, not with more reasoning. Its answer also
   decides the device-hierarchy item under Backends.
   → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
-
-* [ ] **P4.30b — what the published README table says, and at what thread count.** Two steps, in this
-  order, because step 1 changes the configuration step 2 quotes.
-  1. **Settle the default thread count** — benchmarked, not implemented. The answer is the *physical
-     core count* (24 on the 285K: 1.98x TTS / 2.41x ASR / 1.18x LM against today's 4; but 2 on a
-     2-core SMT Ryzen, where "every CPU" would be a TTS regression). A **policy call, not a further
-     measurement** — a host running several loom instances is what ggml's conservative 4 suits.
-  2. **Then re-sample the TTS and LM columns per launch.** Thread placement on the 285K is chosen once
-     per process and sticks, so a within-process median does not average it out — onnxruntime is
-     bimodal across launches at a 1.48x spread. The ASR cells were re-sampled 2026-08-24; TTS and LM
-     were not. Pinning is not the fix.
-  → [Epic-05 §2](../epics/epic-05-edge-performance.md),
-  [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md)
 
 * [ ] **P4.30c — the small tails, one sequential pass.** Steps 1–3 are the same three exports, so the
   setup is paid once.

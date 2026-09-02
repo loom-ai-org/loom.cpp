@@ -4,7 +4,7 @@
 //   g++ -O3 -std=c++17 -I include -I tests/support -I build/_deps/ggml-src/include \
 //       -I build/_deps/nlohmann_json-src/include scripts/bench_lm_loom.cpp -o bench_lm_loom \
 //       -L build -lloom_engine -L build/_deps/ggml-build/src -lggml -lggml-base -lpthread
-//   ./bench_lm_loom <causal_lm.gguf> [n_new] [nrun]
+//   ./bench_lm_loom <causal_lm.gguf> [n_new] [nrun] [refeed]
 //
 // Every generated causal-LM driver exports BOTH `infer` -- one forward over the whole prompt,
 // returning one token -- and `infer_with_past`, which runs the decode loop itself against the KV
@@ -35,6 +35,11 @@ int main(int argc, char** argv) {
     const std::string path = argv[1];
     const int n_new = argc > 2 ? std::atoi(argv[2]) : 65;
     const int nrun  = argc > 3 ? std::atoi(argv[3]) : 3;
+    // The `infer` arm is a DIAGNOSTIC -- it exists to show what re-feeding the prompt costs, and it is
+    // what P4.23 was closed on. It is also 1.4x the timed arm, which on a Raspberry Pi 4 is 65 seconds
+    // per launch of work nothing reads. `refeed=0` skips it, for a per-launch sample on a slow board;
+    // it defaults to 1 so every existing invocation still means what it did.
+    const bool refeed = argc > 4 ? std::atoi(argv[4]) != 0 : true;
 
     // "The capital of France is", Qwen3 BPE.
     const std::vector<double> prompt = {785, 6722, 315, 9625, 374};
@@ -81,17 +86,35 @@ int main(int argc, char** argv) {
     }
 
     // `infer`: what the engine actually calls -- re-fed growing prompt, whole sequence every step.
-    std::vector<double> running = prompt;
-    const auto t1 = std::chrono::steady_clock::now();
-    for (int i = 0; i < n_new; ++i) {
-        loom::LoomLuaBridge::Value one = bridge.call("infer", {{"tokens", running}});
-        running.push_back(std::get<double>(one));
+    double refeed_s = 0.0;
+    if (refeed) {
+        std::vector<double> running = prompt;
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n_new; ++i) {
+            loom::LoomLuaBridge::Value one = bridge.call("infer", {{"tokens", running}});
+            running.push_back(std::get<double>(one));
+        }
+        refeed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     }
-    const double refeed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 
+    // The first five tokens, because EQUAL WORK is what makes the ratio mean anything and this is the
+    // LM's version of the check the other two harnesses already print (VITS prints a sample count and
+    // a digest, ASR prints the transcript). bench_onnx_tasks.py's `lm` task prints `first5=[...]`;
+    // these two lists must match before any loom-against-onnxruntime LM number is believed. It was
+    // asserted rather than shown until 2026-09-02, which is how the ASR column's estimator mismatch
+    // survived (Retro-018's correction).
+    std::printf("loom   lm    %6.2f s  (%zu tokens, %.2f tok/s)  best of %d  first5=[", with_past, got,
+                got / with_past, nrun);
+    for (size_t i = 0; i < 5 && i < warm.size(); ++i) {
+        std::printf("%s%d", i ? ", " : "", static_cast<int>(warm[i]));
+    }
+    std::printf("]\n");
     std::printf("infer_with_past  %6.2f s  (%zu tokens, %.2f tok/s)  best of %d\n",
                 with_past, got, got / with_past, nrun);
-    std::printf("infer (re-fed)   %6.2f s  (%d tokens, %.2f tok/s)\n", refeed, n_new, n_new / refeed);
-    std::printf("speedup available: %.2fx\n", refeed / with_past);
+    if (refeed) {
+        std::printf("infer (re-fed)   %6.2f s  (%d tokens, %.2f tok/s)\n", refeed_s, n_new,
+                    n_new / refeed_s);
+        std::printf("speedup available: %.2fx\n", refeed_s / with_past);
+    }
     return 0;
 }
