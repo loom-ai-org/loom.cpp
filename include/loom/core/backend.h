@@ -109,6 +109,16 @@ void add_backend_search_path(const std::string& dir);
 // it is what initializes the backend registry.
 std::vector<DeviceInfo> available_devices();
 
+// How many CPU threads a Device opened right now would run with, or 0 if this build would leave ggml's
+// own `GGML_DEFAULT_N_THREADS` in place. Exposed so a host can report it and a test can check it; the
+// engine applies it to the CPU backend itself, and nothing has to call this.
+//
+// `$LOOM_N_THREADS` first, then this machine's PHYSICAL core count -- not its logical CPU count, which
+// on an SMT part is up to 2x too many and measurably slower (P4.30b, Epic-05 SS2). On Linux the count
+// respects the process's CPU affinity, so `taskset` and a cgroup cpuset are honoured. 0 means the
+// topology could not be read: a platform with no branch here, or a container with no sysfs.
+int default_cpu_thread_count();
+
 // Owns the backends a `Backends` points at. One per host process is the intended shape: the backends it
 // initializes are process-wide resources (a Vulkan device and queue, a CPU thread pool), and every
 // GgufModel, cache and GraphBuilder built against it holds its handles without owning them, so it must

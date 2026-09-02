@@ -289,6 +289,11 @@ target_link_libraries(test_device_selection PRIVATE loom::engine)
 add_test(NAME test_device_selection COMMAND test_device_selection)
 set_tests_properties(test_device_selection PROPERTIES LABELS ci)
 
+add_executable(test_default_thread_count ci/test_default_thread_count.cpp)
+target_link_libraries(test_default_thread_count PRIVATE loom::engine)
+add_test(NAME test_default_thread_count COMMAND test_default_thread_count)
+set_tests_properties(test_default_thread_count PROPERTIES LABELS ci)
+
 add_executable(test_gallocr_reserve_reuse ci/test_gallocr_reserve_reuse.cpp)
 target_link_libraries(test_gallocr_reserve_reuse PRIVATE loom::engine)
 target_compile_definitions(test_gallocr_reserve_reuse PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
