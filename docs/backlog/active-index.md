@@ -136,21 +136,11 @@ the Hub, 2026-08-31) is complete. What survives is a set of remainders, gathered
 being scattered across four sections. **None blocks a release and none is on the critical path to
 P5.** Each line names the number that sizes it, and the epic that holds the evidence.
 
-**P4.30a and P4.30b are both CLOSED (2026-09-02)** — the default thread count is the physical core
-count and the x86 TTS and LM columns are re-sampled per launch; and the Metal convolution gap is
-diagnosed, with half of it fixed and shipped as `ggml-0014`. P4.30a's remainder is **P4.30d** below.
-**P4.30c** is one sequential pass whose steps share setup.
-
-* [ ] **P4.30d — Metal's `CONV_2D` is 1.3% of the part's peak, and its own `MUL_MAT` is 28%.** All that
-  is left of P4.30a: after `ggml-0014`, one op is **86% of a VITS synthesis on Metal** — 241 ms for
-  16.89 GFLOP, i.e. 70 GFLOP/s and slower than a single CPU core, from a `kernel_conv_2d` that is one
-  thread per output with two global loads per FMA and no reuse. The Q4_0 export is the natural
-  experiment that says it is fixable: there Metal declines the folded kernel and the `im2col` +
-  `mul_mat` route runs the same work at 7.0 ms/GFLOP against the native kernel's 14.3. Two candidate
-  shapes, both already known here — a tiled implicit-GEMM kernel with threadgroup staging (what
-  `ggml-0004`/`ggml-0006` do on the CPU), or lower to `im2col` + `mul_mat` and pay the expansion. The
-  ceiling is a **ceiling**: at `MUL_MAT`'s demonstrated rate VITS on Metal lands near the 8-thread
-  CPU's 55 ms. → [Epic-04 §5.7](../epics/epic-04-backends-and-accelerators.md)
+**P4.30a, P4.30b and P4.30d are CLOSED (2026-09-02)** — the default thread count is the physical core
+count; the x86 TTS and LM columns are re-sampled per launch; and the Metal convolution gap is fully
+closed, as `ggml-0014` (the transposed convolution's dispatch) and `ggml-0015` (the convolution
+kernel itself, **5.10x on the op, 278.1 -> 97.6 ms on an f32 VITS synthesis**, bit-identical
+waveform). **P4.30c** is one sequential pass whose steps share setup.
 
 * [ ] **P4.30c — the small tails, one sequential pass.** Steps 1–3 are the same three exports, so the
   setup is paid once.
@@ -174,8 +164,9 @@ diagnosed, with half of it fixed and shipped as `ggml-0014`. P4.30a's remainder 
      to 0/2, identical digest, 493.3 → 484.7 ms.** Do not pick it up expecting a speedup; it is worth
      doing for cleanliness, upstreamability, and discrete GPUs where a round trip crosses PCIe. Same
      shape as Vulkan's missing `PAD_REFLECT_1D` (P4.7d). *That 1.8% was measured against a 493.3 ms
-     baseline that `ggml-0014` has since taken to 278.7 ms, so re-measure it rather than quoting the
-     percentage — the absolute 8.6 ms is the number that carried.*
+     baseline that `ggml-0014` and `ggml-0015` have since taken to 97.6 ms, so re-measure it rather
+     than quoting the percentage — the absolute 8.6 ms is the number that carried, and against the
+     new baseline it would be 9%, which changes what this item is worth.*
   6. **Send the `OMP_WAIT_POLICY` / `KMP_BLOCKTIME` gap upstream.** ggml mitigates P4.17's mechanism
      for Intel's libomp only; `cmake/patches/UPSTREAM.md` is where it goes. Last, because it depends
      on nothing here.
@@ -190,13 +181,26 @@ diagnosed, with half of it fixed and shipped as `ggml-0014`. P4.30a's remainder 
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [Epic-04](../epics/epic-04-backends-and-accelerators.md)*
 * [ ] **The device hierarchy ranks a GPU above the CPU on unified memory, where the proxy does not
   hold.** The rule stands for "has its own fast memory", which an Apple Silicon GPU does not — it has
-  the CPU's. Measured at HEAD: `device=""` picks `MTL0` and is **1.52x faster on whisper-small and
-  5.07x SLOWER on VITS** (2.91x at Q4_0). It is why Metal ships as an extra rather than in the base
-  macOS wheel; if this changes, folding it in is worth revisiting. **P4.30a answered what the ratio
-  is made of and did NOT rescue the rule** — the residual is `CONV_2D` kernel quality (P4.30d), not
-  scheduling, so this stays open on its own terms with a smaller number attached.
-  → [Epic-04 §5.7](../epics/epic-04-backends-and-accelerators.md),
+  the CPU's. Measured at HEAD with `ggml-0015`: `device=""` picks `MTL0` and is **1.76x faster on
+  whisper-small and 1.79x SLOWER on VITS** (2.90x at Q4_0). It is why Metal ships as an extra rather
+  than in the base macOS wheel; if this changes, folding it in is worth revisiting. **P4.30a and
+  P4.30d between them took the VITS ratio from 8.98x to 1.79x and did NOT rescue the rule** — a
+  GPU that is 1.8x slower on one model and 1.8x faster on another still cannot be ranked above the
+  CPU by a rule that reads neither. This stays open on its own terms, with a much smaller number.
+  → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md)
+
+* [ ] **On Metal, a Q4_0 convolutional model is now SLOWER than the same model at f32** — 149.1 ms
+  against 97.6 on VITS, an inversion `ggml-0015` created and did not exist before it (149.7 against
+  278.7). The mechanism is known and is not the quantization: ggml-metal declines loom's folded
+  block-quantized convolution kernel on its type test ([Epic-04 §5.2](../epics/epic-04-backends-and-accelerators.md)),
+  so a Q4_0 export lowers through `im2col` + `mul_mat` and never reaches the new kernel — whose fast
+  path is F32/F16-only by the same test. The choice is between teaching that type test about the
+  folded kernel (P4.13's format) and dequantizing into the new kernel's fast path the way `ggml-0013`
+  does on the CPU. **Neither is on any critical path** — Metal is an extra — but "quantizing costs
+  1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
+  → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
+  [ADR-017](../adrs/adr-017-no-k-quants.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL

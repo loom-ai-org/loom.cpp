@@ -93,8 +93,12 @@ the patch touched one op and exactly one bucket moved.
 What is left is `CONV_2D` at **70 GFLOP/s, 1.3% of peak** — 86% of the remaining run — from a kernel
 that is one thread per output element with two global loads per FMA and no reuse. Metal's own
 `MUL_MAT` runs the same convolutions at about **1.49 TFLOP/s** through the Q4_0 lowering, so the
-headroom is real and the arithmetic was never the problem. Tracked as **P4.30d**; full record in
-[Epic-04 §5.7](../epics/epic-04-backends-and-accelerators.md).
+headroom is real and the arithmetic was never the problem. Tracked as **P4.30d**, and **CLOSED the
+same day** by `ggml-0015` — a register tile whose other half is that sixteen registers of 64-bit
+address were competing with the accumulators; 5.10x on the op, 278.1 -> 97.6 ms on the model. Full
+record in [Epic-04 §5.7 and §5.8](../epics/epic-04-backends-and-accelerators.md). **Note while
+reading the "of peak" columns above that 5.31 TFLOP/s is a spec number this part does not deliver:
+the measured F32 FMA roofline is 2.11 TFLOP/s, so every percentage here is understated by 2.5x.**
 
 Two smaller things fell out of the same pass and are fixed here rather than tracked:
 `scripts/conv_census.py` rejected `Max(a, b)` — the clamp `SymbolEnv` gained in P4.28 and sympy now
