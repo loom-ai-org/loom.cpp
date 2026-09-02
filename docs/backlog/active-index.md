@@ -136,16 +136,21 @@ the Hub, 2026-08-31) is complete. What survives is a set of remainders, gathered
 being scattered across four sections. **None blocks a release and none is on the critical path to
 P5.** Each line names the number that sizes it, and the epic that holds the evidence.
 
-Three tasks: **a** and **b** are one task each, **c** is one sequential pass whose steps share setup.
-**P4.30b is CLOSED (2026-09-02)** — the default thread count is the physical core count, and the x86
-TTS and LM columns are re-sampled per launch. Two remain.
+**P4.30a and P4.30b are both CLOSED (2026-09-02)** — the default thread count is the physical core
+count and the x86 TTS and LM columns are re-sampled per launch; and the Metal convolution gap is
+diagnosed, with half of it fixed and shipped as `ggml-0014`. P4.30a's remainder is **P4.30d** below.
+**P4.30c** is one sequential pass whose steps share setup.
 
-* [ ] **P4.30a — why Metal costs ~5x the CPU per unit of work on a convolutional graph.** Where VITS's
-  5.24x actually lives. Not the `PAD` fallback (P4.30c step 5, worth 1.8%) and not dispatch overhead:
-  cost per output sample is flat within 8% across a 5.8x change in utterance length, so it is
-  compute-bound. **Starts with a per-op profile on Metal**, not with more reasoning. Its answer also
-  decides the device-hierarchy item under Backends.
-  → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **P4.30d — Metal's `CONV_2D` is 1.3% of the part's peak, and its own `MUL_MAT` is 28%.** All that
+  is left of P4.30a: after `ggml-0014`, one op is **86% of a VITS synthesis on Metal** — 241 ms for
+  16.89 GFLOP, i.e. 70 GFLOP/s and slower than a single CPU core, from a `kernel_conv_2d` that is one
+  thread per output with two global loads per FMA and no reuse. The Q4_0 export is the natural
+  experiment that says it is fixable: there Metal declines the folded kernel and the `im2col` +
+  `mul_mat` route runs the same work at 7.0 ms/GFLOP against the native kernel's 14.3. Two candidate
+  shapes, both already known here — a tiled implicit-GEMM kernel with threadgroup staging (what
+  `ggml-0004`/`ggml-0006` do on the CPU), or lower to `im2col` + `mul_mat` and pay the expansion. The
+  ceiling is a **ceiling**: at `MUL_MAT`'s demonstrated rate VITS on Metal lands near the 8-thread
+  CPU's 55 ms. → [Epic-04 §5.7](../epics/epic-04-backends-and-accelerators.md)
 
 * [ ] **P4.30c — the small tails, one sequential pass.** Steps 1–3 are the same three exports, so the
   setup is paid once.
@@ -168,7 +173,9 @@ TTS and LM columns are re-sampled per launch. Two remain.
   5. **A Metal `PAD` kernel that accepts a leading pad** — scoped and prototyped: **27/56 CPU splits
      to 0/2, identical digest, 493.3 → 484.7 ms.** Do not pick it up expecting a speedup; it is worth
      doing for cleanliness, upstreamability, and discrete GPUs where a round trip crosses PCIe. Same
-     shape as Vulkan's missing `PAD_REFLECT_1D` (P4.7d).
+     shape as Vulkan's missing `PAD_REFLECT_1D` (P4.7d). *That 1.8% was measured against a 493.3 ms
+     baseline that `ggml-0014` has since taken to 278.7 ms, so re-measure it rather than quoting the
+     percentage — the absolute 8.6 ms is the number that carried.*
   6. **Send the `OMP_WAIT_POLICY` / `KMP_BLOCKTIME` gap upstream.** ggml mitigates P4.17's mechanism
      for Intel's libomp only; `cmake/patches/UPSTREAM.md` is where it goes. Last, because it depends
      on nothing here.
@@ -183,10 +190,12 @@ TTS and LM columns are re-sampled per launch. Two remain.
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [Epic-04](../epics/epic-04-backends-and-accelerators.md)*
 * [ ] **The device hierarchy ranks a GPU above the CPU on unified memory, where the proxy does not
   hold.** The rule stands for "has its own fast memory", which an Apple Silicon GPU does not — it has
-  the CPU's. Measured: `device=""` picks `MTL0` and is 2.69x faster on whisper-small and 5.24x SLOWER
-  on VITS. It is why Metal ships as an extra rather than in the base macOS wheel; if this changes,
-  folding it in is worth revisiting. **Downstream of P4.30a**, not independent of it: the 5.24x is
-  what the rule is being judged against, and P4.30a is what explains it. → [Epic-04 §5.4](../epics/epic-04-backends-and-accelerators.md),
+  the CPU's. Measured at HEAD: `device=""` picks `MTL0` and is **1.52x faster on whisper-small and
+  5.07x SLOWER on VITS** (2.91x at Q4_0). It is why Metal ships as an extra rather than in the base
+  macOS wheel; if this changes, folding it in is worth revisiting. **P4.30a answered what the ratio
+  is made of and did NOT rescue the rule** — the residual is `CONV_2D` kernel quality (P4.30d), not
+  scheduling, so this stays open on its own terms with a smaller number attached.
+  → [Epic-04 §5.7](../epics/epic-04-backends-and-accelerators.md),
   [ADR-010](../adrs/adr-010-device-selection-by-kind.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.

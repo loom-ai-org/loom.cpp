@@ -2405,8 +2405,9 @@ did. Per shape, 195.8 ms -> 79.1 ms: 73476x32 105.7 -> 35.1, 18376x64 53.1 -> 27
 ## 5. Planned Work
 
 **P4.10–P4.29 are all closed as headline items.** Their remainders are gathered as **P4.30** in
-[the hub](../backlog/active-index.md#p430--the-tails-of-p410p429), as three tasks: P4.30a (Metal's
-convolutional cost, → [Epic-04 §5.4](epic-04-backends-and-accelerators.md)), P4.30b (the default
+[the hub](../backlog/active-index.md#p430--the-tails-of-p410p429): P4.30a (Metal's convolutional
+cost — **CLOSED 2026-09-02**, answered in [Epic-04 §5.7](epic-04-backends-and-accelerators.md), with
+its own remainder now tracked as P4.30d), P4.30b (the default
 thread count, then the README's TTS and LM columns per launch — §2 above, **CLOSED 2026-09-02**), and
 P4.30c (a sequential
 pass over the small tails: the three other conv families at Q8_0 and the direct-conv budget with

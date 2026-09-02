@@ -929,6 +929,66 @@ would be more explicit and would cost a dispatch entry and a `supports_op` case 
 three asserts in `ggml_conv_2d_direct_packed`. (3) A per-call dequantize is a policy, and there is no
 mechanism to cache it across calls if someone puts one of these in a loop.
 
+## PR 14 — `metal`: `conv_transpose_1d` dispatched one thread per threadgroup
+
+`ggml_metal_op_conv_transpose_1d` ends with
+
+```c
+ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 1, 1, 1);
+```
+
+`OL * OC` threadgroups, each of **one thread**. Every threadgroup therefore occupies a single lane of a
+32-wide SIMD group, and 31 of every 32 lanes on the GPU are idle by construction. `kernel_conv_2d`, 400
+lines above it in the same file, already does the opposite — `max_theads_per_threadgroup` capped at 256,
+grid divided by the same factor — so this is a gap rather than a design.
+
+**It is invisible from anywhere except a per-op profile.** The op is fully supported, so it produces no
+split, no CPU fallback and no warning; and it is a *small number of nodes*, so it is missed by anything
+that ranks by node count. In a VITS synthesis it is **three nodes of 1308 and 45% of the run**.
+
+Measured on an Apple M1 Pro (16-core GPU, 5.31 TFLOP/s F32), over those three vocoder upsamples —
+`[286,256] K=16 s0=8 -> [2296,128]`, `[2288,128] K=16 s0=8 -> [18312,64]`, `[18304,64] K=8 s0=4 ->
+[73220,32]`, **1.50 GFLOP** in total:
+
+| | time | rate | of peak |
+|---|---:|---:|---:|
+| stock | 224.7 ms | 6.7 GFLOP/s | **0.13%** |
+| with this patch | **7.8 ms** | 193 GFLOP/s | 3.6% |
+
+**29x on the op, and 1.77x on the whole model** — an F32 VITS synthesis goes 494.1 -> 278.7 ms, a Q4_0
+one 350.2 -> 149.7 ms. For scale, the same three nodes take 21.6 ms on **one** CPU core with PR 8 and
+PR 9 applied, so before this the entire GPU was losing 10x to a single Firestorm core.
+
+The change is three edits and no new kernel:
+
+* `ggml_metal_kargs_conv_transpose_1d` gains an `OL` field, used only for the tail bounds check. The
+  grid is rounded up and none of the lengths that matter divide evenly.
+* `kernel_conv_transpose_1d` computes `j = tgpig[0]*ntg.x + tpitg.x` instead of `j = tgpig[0]`, returns
+  early when `j >= OL`, and writes to `j * nb0` instead of `tgpig[0] * nb0`. The `tgpig[1]` / `tgpg[1]`
+  channel indexing is untouched, so the arithmetic is byte-for-byte what it was.
+* the dispatch takes `nth = min(max_theads_per_threadgroup, 256)` threads on x and `(OL + nth - 1)/nth`
+  threadgroups.
+
+**Verification.** `test-backend-ops test -o CONV_TRANSPOSE_1D` is **116/116 on MTL0** against the CPU
+reference (`perf` mode registers no case for this op, which is its own small gap). End to end the VITS
+waveform digest is bit-identical to stock on both an F32 and a Q4_0 export, and a re-profile is a clean
+control: the `CONV_TRANSPOSE_1D` bucket collapses 224.7 -> 7.8 ms while `CONV_2D` sits unchanged at
+241 ms.
+
+**What a reviewer should push on.** (1) 256 is copied from `kernel_conv_2d` rather than tuned; the op is
+memory-bound enough that it is unlikely to matter, but nobody has swept it. (2) A threadgroup now spans
+`nth` consecutive output positions of one channel, which is the coalescing-friendly axis, but the `src0`
+weight reads are still per-thread and unstaged — a threadgroup-memory tile for the kernel would be a
+further win and a much larger patch. (3) This does not touch `supports_op`, the F16 path or the
+`col2im_1d` sibling below it.
+
+**Where the rest of that model's time went, since a reviewer will ask.** After this patch, 86% of the
+same synthesis is `GGML_OP_CONV_2D` — 241 ms for 16.89 GFLOP, **70 GFLOP/s, 1.3% of peak**, from a
+`kernel_conv_2d` that is one thread per output element with two global loads per FMA and no reuse of
+any kind. For contrast, this backend's own `mul_mat` runs the same convolutions at about 1.49 TFLOP/s
+when the graph is lowered through `im2col` instead. That is a separate, larger patch and is not
+proposed here.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
