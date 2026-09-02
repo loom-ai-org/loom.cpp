@@ -953,13 +953,15 @@ void test_conv_1d_folded_kernel_matches_declared() {
 }
 
 // The same claim for the 2-D form, where the fold swallows three axes instead of two and the op has to
-// hand `ggml_im2col` a THREE-dimensional patch geometry. Q8_0-free: the operand swap and the transpose
-// back are already covered above, and what is unproven here is only that KW, KH and IC come back out in
-// the order they went in -- which an exact-ish comparison against the declared layout answers, and
-// which a quantization tolerance would only obscure.
-void test_conv_2d_folded_kernel_matches_declared() {
+// hand `ggml_im2col` a THREE-dimensional patch geometry -- and, since P4.30c, where a folded kernel may
+// also be BLOCK-QUANTIZED and take ggml's packed direct convolution instead of that im2col. Four arms,
+// the same four the 1-D check above runs and for the same reasons: declared F32, folded F32, folded
+// Q8_0 through the primitive, and `ggml_conv_2d_direct_packed` built directly. What only the 2-D form
+// can get wrong is KH -- the 1-D arms pass `kh = 1`, so every geometry error involving it is invisible
+// there -- which is why the shapes below all have KH > 1 and KW != KH.
+void check_conv_2d_folded_kernel_matches_declared(int64_t kKW, int64_t kKH, int64_t kIC, int64_t kOC,
+                                                   int64_t kIW, int64_t kIH, float quant_tol) {
     GgmlScratch s;
-    constexpr int64_t kKW = 3, kKH = 2, kIC = 16, kOC = 4, kIW = 7, kIH = 5;
     std::vector<float> kernel_data(kKW * kKH * kIC * kOC);
     for (size_t i = 0; i < kernel_data.size(); ++i) kernel_data[i] = std::sin(0.29f * static_cast<float>(i));
     std::vector<float> data_data(kIW * kIH * kIC);
@@ -986,26 +988,84 @@ void test_conv_2d_folded_kernel_matches_declared() {
     ggml_set_input(d2);
     ggml_tensor* out2 = op("CONV_2D")(pc, {k2, d2}, folded)[0];
 
-    for (int i = 0; i < 4; ++i) LOOM_CHECK(out2->ne[i] == out4->ne[i]);
+    ggml_tensor* kq = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_Q8_0, kIC * kKH * kKW, kOC);
+    ggml_set_input(kq);
+    ggml_tensor* dq = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, kIW, kIH, kIC, 1);
+    ggml_set_input(dq);
+    ggml_tensor* outq = op("CONV_2D")(pc, {kq, dq}, folded)[0];
+
+    // Built directly rather than through the primitive, for the reason arm four of the 1-D check gives:
+    // on a CPU the op already chooses this lowering, so going through it would re-test arm three and
+    // would stop testing anything the day `backend_can_run` says no. Here it also pins the one thing
+    // ggml-0013 shipped and nothing exercised -- that `kh > 1` is honoured in the geometry the fold
+    // erased, which every existing caller passed as 1.
+    ggml_tensor* kp = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_Q8_0, kIC * kKH * kKW, kOC);
+    ggml_set_input(kp);
+    ggml_tensor* dp = ggml_new_tensor_4d(s.ctx.get(), GGML_TYPE_F32, kIW, kIH, kIC, 1);
+    ggml_set_input(dp);
+    ggml_tensor* outp = ggml_conv_2d_direct_packed(
+        s.ctx.get(), kp, dp, /*s0=*/1, /*s1=*/1, /*p0=*/0, /*p1=*/0, /*d0=*/1, /*d1=*/1,
+        /*kw=*/static_cast<int>(kKW), /*kh=*/static_cast<int>(kKH), /*ic=*/static_cast<int>(kIC));
+
+    for (ggml_tensor* out : {out2, outq, outp}) {
+        for (int i = 0; i < 4; ++i) LOOM_CHECK(out->ne[i] == out4->ne[i]);
+    }
     LOOM_CHECK(out4->ne[2] == kOC);
 
     ggml_cgraph* gf = ggml_new_graph(s.ctx.get());
     ggml_build_forward_expand(gf, out4);
     ggml_build_forward_expand(gf, out2);
+    ggml_build_forward_expand(gf, outq);
+    ggml_build_forward_expand(gf, outp);
     ggml_gallocr_alloc_graph(s.galloc.get(), gf);
     set_f32(k4, kernel_data);
     set_f32(d4, data_data);
     set_f32(k2, kernel_data);
     set_f32(d2, data_data);
+    std::vector<char> packed(ggml_nbytes(kq));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, kernel_data.data(), packed.data(), 0, kOC, kIC * kKH * kKW,
+                        nullptr);
+    std::memcpy(kq->data, packed.data(), packed.size());
+    set_f32(dq, data_data);
+    std::memcpy(kp->data, packed.data(), packed.size());
+    set_f32(dp, data_data);
     s.compute(gf);
 
-    const std::vector<float> a = get_f32(out4), b = get_f32(out2);
-    LOOM_CHECK(a.size() == b.size());
-    bool ok = true;
+    const std::vector<float> a = get_f32(out4), b = get_f32(out2), c = get_f32(outq),
+                             d = get_f32(outp);
+    LOOM_CHECK(a.size() == b.size() && a.size() == c.size() && a.size() == d.size());
+    bool ok = true, quantized_ok = true, packed_ok = true;
     for (size_t i = 0; i < a.size(); ++i) {
         if (std::fabs(a[i] - b[i]) > 1e-4f * std::max(1.0f, std::fabs(a[i]))) ok = false;
+        if (std::fabs(a[i] - c[i]) > quant_tol * std::max(1.0f, std::fabs(a[i]))) quantized_ok = false;
+        if (std::fabs(a[i] - d[i]) > quant_tol * std::max(1.0f, std::fabs(a[i]))) packed_ok = false;
     }
     LOOM_CHECK(ok);
+    LOOM_CHECK(quantized_ok);
+    LOOM_CHECK(packed_ok);
+}
+
+// TWO SHAPE SETS, for the reason the 1-D check gives: ggml's packed convolution has a direct
+// register-tiled sweep and a batched-im2col fallback inside it, and the shape is what picks between
+// them. The first set is small and lands on the batched path; the second has OC a multiple of the
+// output-channel tile and enough output positions to fill it, and takes the direct sweep -- which is
+// the path P4.30c routed the 2-D form to and therefore the one that must give the declared answer.
+void test_conv_2d_folded_kernel_matches_declared() {
+    check_conv_2d_folded_kernel_matches_declared(/*KW=*/3, /*KH=*/2, /*IC=*/16, /*OC=*/4,
+                                                  /*IW=*/7, /*IH=*/5, /*quant_tol=*/5e-2f);
+    // 1e-1 rather than the 5e-2 above, and it is the REDUCTION DEPTH that moved it: this set sums
+    // KW*KH*IC = 288 quantized products per output against the first set's 96, and the worst relative
+    // error goes 2.3e-2 -> 4.2e-2 with it. 5e-2 would pass here too, with 18% of headroom on a machine
+    // whose FMA order is this one's; 1e-1 is a step of room rather than a number fitted to a failure.
+    //
+    // It still separates what these arms are for by more than an order of magnitude, VERIFIED RED three
+    // ways: swapping KW and KH inside `op_conv_2d`'s geometry misses by 3.4 here (and 8e22 on the first
+    // set), swapping them in arm four's own direct call by 3.4 and 6.1 -- and swapping KH with IC never
+    // reaches a number at all, because `ggml_conv_2d_direct_packed` asserts `ic == b->ne[2]` first. KW
+    // and KH are unequal in BOTH sets for exactly this reason: the 1-D arms all pass `kh = 1`, so a
+    // geometry that confuses the two axes is invisible to every check that existed before P4.30c.
+    check_conv_2d_folded_kernel_matches_declared(/*KW=*/3, /*KH=*/2, /*IC=*/48, /*OC=*/8,
+                                                  /*IW=*/34, /*IH=*/12, /*quant_tol=*/1e-1f);
 }
 
 // A fold whose attrs and whose tensor disagree is a corrupt file, and it has to say so HERE. Without

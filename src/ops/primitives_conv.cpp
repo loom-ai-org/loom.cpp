@@ -61,11 +61,16 @@ void expect_n_inputs(const char* op, const Inputs& in, size_t n) {
 // Padding and striding are unaffected by any of this -- they are im2col parameters (p0/s0/d0), and
 // reflect padding is a separate op applied upstream (PAD_1D_REFLECT, primitives_basic.cpp).
 
-// Whether CONV_1D lowers to ggml's single convolution op instead of im2col + mul_mat. On everywhere
-// now, for the measured reason spelled out in op_conv_1d below; override it to build (and test) the
-// other path anywhere.
+// Whether CONV_1D and CONV_2D lower to ggml's single convolution op instead of im2col + mul_mat. On
+// everywhere now, for the measured reason spelled out in op_conv_1d below; override it to build (and
+// test) the other path anywhere. `LOOM_CONV1D_DIRECT` is the name it shipped under while only the 1-D
+// form had a direct lowering (P4.29); it is still honoured so that a build line, a bench script or a
+// suite run that sets it keeps working, and setting either to 0 turns off both.
 #ifndef LOOM_CONV1D_DIRECT
 #  define LOOM_CONV1D_DIRECT 1
+#endif
+#ifndef LOOM_CONV_DIRECT
+#  define LOOM_CONV_DIRECT LOOM_CONV1D_DIRECT
 #endif
 
 // Whether `kernel` is stored in a form that must occupy mul_mat's FIRST operand. F32 is the only dtype
@@ -241,7 +246,7 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // gates (kokoro, styletts2, matcha, the NeMo encoders) live on an x86 dev box, and a Raspberry Pi
     // has none of them. Both directions are expected to pass, because the two lowerings agree bit for
     // bit.
-#if LOOM_CONV1D_DIRECT
+#if LOOM_CONV_DIRECT
     // `!fold.folded` is not implied by the dtype test beside it and is not redundant: a folded kernel
     // has lost the [KW, KH, IC, OC] shape ggml_conv_2d_direct reads its geometry from, and the fold is
     // the exporter's decision rather than this op's, so it is checked rather than inferred. In practice
@@ -319,6 +324,40 @@ Outputs op_conv_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const FoldedKernel fold = folded_kernel_geometry("CONV_2D", kernel, attrs, pc.symbols, /*is_2D=*/true, data->ne[2]);
 
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+
+#if LOOM_CONV_DIRECT
+    // A FOLDED, BLOCK-QUANTIZED KERNEL TAKES THE DIRECT SWEEP HERE TOO (P4.30c step 3), and this is the
+    // only line of it that is new: `ggml_conv_2d_direct_packed` has taken a `kh` since ggml-0013 shipped
+    // it for the 1-D form, its CPU implementation dequantizes into the DECLARED [KW, KH, IC, OC] layout
+    // and re-enters, and every predicate below that point is already the general 2-D one. P4.29 left
+    // this form on im2col + `mul_mat_kernel_first` on the argument that nothing in tree had a quantized
+    // 2-D convolution hot enough to notice. That argument was WRONG and the census is why: three ASR
+    // encoders fold a 2-D subsampling kernel to a block-aligned [IC*KH*KW, OC], and on qwen3-asr-0.6b
+    // the two that do are ~10% of an F32 transcription. Quantizing them cost 1.77x and 1.81x -- 974 ->
+    // 1720 ms and 251 -> 455 ms on an 11 s utterance, one thread -- which is P4.13's 2.08x surviving in
+    // the one op P4.29 did not reach. See Epic-05 P4.30c.
+    //
+    // The transpose the fallback owes is not paid here either. `mul_mat_kernel_first` has to put the
+    // kernel in mul_mat's first operand and transpose the result back, and at these shapes that CONT is
+    // 15.2 ms of qwen3-asr's larger stem convolution on its own; the direct sweep writes [OW, OH, OC, N]
+    // straight out, which is the layout this op returns.
+    //
+    // Same two guards as the 1-D branch, for the same two reasons: `fold.folded` because a folded kernel
+    // is the only thing that can carry the geometry ggml is being told, and `backend_can_run` because a
+    // Vulkan or CUDA backend declines a packed node and must be left the im2col lowering it already runs
+    // with zero fallback nodes.
+    if (fold.folded && conv_kernel_is_packed(kernel) && ggml_is_contiguous(kernel)) {
+        GGML_ASSERT(data->ne[2] == fold.ic);
+        ggml_tensor* conv = ggml_conv_2d_direct_packed(pc.ctx, kernel, data, s0, s1, p0, p1, d0, d1,
+                                                       static_cast<int>(fold.kw),
+                                                       static_cast<int>(fold.kh),
+                                                       static_cast<int>(fold.ic));
+        if (backend_can_run(pc, conv)) {
+            return {conv};                                                        // [OW, OH, OC, N]
+        }
+    }
+#endif
+
     ggml_tensor* im2col_src = fold.folded ? im2col_shape_carrier(pc.ctx, kernel, fold, /*is_2D=*/true) : kernel;
     ggml_tensor* im2col = ggml_im2col(pc.ctx, im2col_src, data, s0, s1, p0, p1, d0, d1, /*is_2D=*/true, conv_im2col_type(kernel)); // [IC*KH*KW, OW, OH, N]
     ggml_tensor* im2col_2d = ggml_reshape_2d(pc.ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]); // [IC*KH*KW, N*OH*OW]
