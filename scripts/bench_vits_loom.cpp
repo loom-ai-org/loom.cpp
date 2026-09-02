@@ -106,8 +106,14 @@ int main(int argc, char** argv) {
         ts.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     std::sort(ts.begin(), ts.end());
+    // A real median rather than `ts[ts.size()/2]`, which at an EVEN nrun is the larger of the two
+    // middle samples. Retro-018's correction caught that in bench_asr_loom.cpp at nrun=2, where it
+    // reported the max of a cold run and a warm one; the same index was here, harmless at the default
+    // nrun=9 and wrong the moment anyone passes an even one.
+    const double median = ts.size() % 2 == 1 ? ts[ts.size()/2]
+                                             : 0.5 * (ts[ts.size()/2 - 1] + ts[ts.size()/2]);
     std::printf("loom   vits  [%s]  samples=%zu  fnv1a=%016llx  median %.4f s  min %.4f s  (n=%d)\n",
                 dev_spec.c_str(), n_samples, static_cast<unsigned long long>(digest),
-                ts[ts.size()/2], ts.front(), nrun);
+                median, ts.front(), nrun);
     return 0;
 }

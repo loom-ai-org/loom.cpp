@@ -78,6 +78,13 @@ def bench_vits(model, threads, nrun):
     feed = {"input": x,
             "input_lengths": np.array([x.shape[1]], dtype=np.int64),
             "scales": np.array([0.0, 1.0, 0.0], dtype=np.float32)}   # noise, length, noise_w -- PINNED
+    # ONE WARM-UP, DISCARDED, because the other arm has one. This was missing until 2026-09-02 and it
+    # is the same fault Retro-018 is about, in the one task that had not been audited for it: the `lm`
+    # and `asr` tasks below both warm up, and `bench_vits_loom.cpp:100` discards its first synthesis
+    # because that call is what builds the graphs. Comparing a warmed loom against a cold-first
+    # onnxruntime is not one measurement of two engines. It biases the median by 1/nrun of the
+    # cold/warm gap, i.e. in loom's favour, which is the direction that flatters this repository.
+    sess.run(None, feed)
     ts, n = [], 0
     for _ in range(nrun):
         t0 = time.perf_counter()
