@@ -142,7 +142,13 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        const auto& audio = std::get<std::vector<double>>(bridge.call("infer", args));
+        // BY VALUE, and the `const auto&` this used to be was a real bug that only clang reports.
+        // `bridge.call` returns a `Value` by value; binding a reference to the vector INSIDE that
+        // temporary leaves the reference dangling at the end of the full expression. gcc happened to
+        // leave the storage readable and every Linux run looked right; on macOS the same line printed
+        // `samples=0 peak=0.0000` for all four families, which reads exactly like a broken export.
+        // -Wdangling-gsl names it; the lesson is that a silent zero is what a dangling read looks like.
+        const std::vector<double> audio = std::get<std::vector<double>>(bridge.call("infer", args));
         double peak = 0.0, energy = 0.0;
         for (double s : audio) { peak = std::max(peak, std::fabs(s)); energy += s * s; }
         std::printf("%-10s n_ids=%zu samples=%zu peak=%.4f rms=%.5f\n", family.c_str(), ids.size(),
