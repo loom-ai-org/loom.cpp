@@ -842,8 +842,11 @@ carries the thing it stood for: the win of moving work to the GPU no longer incl
 bus, and what is left is per-dispatch overhead plus, here, 27 round trips.
 
 The consequence is concrete: with Metal present, a default-device VITS run is **5.24x slower** than
-the same call without it. This is a statement about the hierarchy on a unified-memory part, not about
-Metal — and it is **why Metal is NOT in the base macOS wheel** even though 0.87 MB would otherwise be
+the same call without it. (**That figure is P4.11's and is kept here because the rest of this section
+reasons from it; it is 1.79x at HEAD** — `ggml-0014` and `ggml-0015` fixed two convolution kernels,
+§5.7 and §5.8. The conclusion below is unchanged, which is the point: a smaller ratio in the same
+direction still is not a rule.) This is a statement about the hierarchy on a unified-memory part, not
+about Metal — and it is **why Metal is NOT in the base macOS wheel** even though 0.87 MB would otherwise be
 a very cheap accelerator to ship by default. `loom-py/CMakeLists.txt` sets `GGML_METAL OFF` for the
 base wheel explicitly, since ggml defaults it ON whenever `APPLE`; without that line the base wheel
 and the backend package would each carry a copy, which is two on one `sys.path` with no rule about
