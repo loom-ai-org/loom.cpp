@@ -104,3 +104,26 @@ scripts/bench_*_loom.cpp`.
 
 `bench_asr_loom.cpp` now discards a warm-up run and prints it, so the asymmetry is visible in the
 output rather than implicit in the estimator, and the comment there says to use `nrun >= 3`.
+
+---
+
+## SECOND CORRECTION (2026-09-02): the onnxruntime side had the same two faults
+
+The correction above says the fix is *"one `grep -n warm scripts/bench_*_loom.cpp`"*. **That glob is
+half the comparison.** `bench_onnx_tasks.py`'s `vits` task had **no warm-up** while
+`bench_vits_loom.cpp:100` discards its first synthesis, and `bench_vits_loom.cpp` still took
+`ts[ts.size()/2]` — the same not-a-median index this correction caught in the ASR harness and fixed
+only there. Both were found by P4.30b while re-sampling the TTS column, five days later. Both are
+fixed, and the check is now `grep -n 'warm' scripts/bench_*_loom.cpp scripts/bench_onnx_tasks.py`.
+
+Neither was worth much on its own — a missing warm-up biases a median over nine runs by 1/9 of the
+cold/warm gap — but the direction matters: it was in **onnxruntime's** arm, so it flattered this
+repository, which is the direction a repository's own benchmark is least likely to question.
+
+**The lesson is this retro's own, applied one level out.** Lesson 4 of the correction is *"when a
+retro's root cause is 'these N things disagree', open all N"*, and the audit it prompted opened
+loom's three harnesses. The other engine's three tasks are the fourth, fifth and sixth things, in the
+same comparison, and nobody counted them. **N is every arm of the comparison, not every arm on your
+own side.** [Retro-025](retro-025-the-arm-that-ran-second-paid-for-the-first.md) is where that landed,
+along with the finding that actually moved cells: a benchmark that runs its two arms back to back
+measures the hand-off between them as well.
