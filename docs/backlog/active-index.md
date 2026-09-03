@@ -179,8 +179,13 @@ are not renumbered. New items continue the scheme.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
-* [ ] **Linux on ARM builds** — the platform that matters most for an engine whose stated target is edge
-  devices.
+* [ ] **P7 — 32-bit ARM Linux (`armv7l`), after P5.** Scoped 2026-09-03 from a source read, not
+  started, and the first task is to make the estimate falsifiable with a QEMU build. **The Pi Zero 2 W
+  is not in it** — that board is ARMv8 and already a supported target on a 64-bit OS, costing one
+  `QEMU_CPU=cortex-a53` gate row. The port itself is one `CMAKE_SIZEOF_VOID_P` guard on
+  `GGML_CPU_ALL_VARIANTS`, a LuaJIT armv7 build, and a runner-policy decision for the wheel; **ARMv6
+  (Pi Zero / Zero W / Pi 1) is a declared non-goal**. *Context:
+  [Epic-08 §6](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
 

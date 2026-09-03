@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-08-31
+last_updated: 2026-09-03
 ---
 
 # Epic-08: Packaging and Release
@@ -456,3 +456,86 @@ the same file.
 **The aarch64 arch list has never been compiled.** There is no ARM machine here, so that row of the
 table is a CI-only path — the strings are right in principle and untested in fact.
 
+
+## 6. Planned work — 32-bit ARM Linux (P7), after P5
+
+**Scoped 2026-09-03 from a source read, deliberately not started.** It sits after P5 because P5 adds
+model families and this adds a platform tier that every one of them would then have to be re-verified
+on; doing it first multiplies the verification cost of P5 by a rung nothing ships to yet. Nothing here
+has been compiled — there is no 32-bit ARM toolchain on the dev box (`arm-linux-gnueabihf-gcc` absent)
+and no hosted runner of that architecture on any provider, so **the first task in this item is to make
+the claim below falsifiable**: an `armv7l` build under QEMU/docker, which is installed.
+
+### 6.1 Three tiers, and only one of them is a port
+
+The question is usually asked as "Raspberry Pi Zero", which is two different machines.
+
+| board | ISA | status |
+|---|---|---|
+| **Zero 2 W** (BCM2710, Cortex-A53) on **64-bit** Raspberry Pi OS | ARMv8.0-A | **already a supported target.** A53 is ARMv8.0 with no dotprod/FP16/SVE — the same profile the A72 rows of `wheels.yml`'s `raspberry-pi-check` already gate, and it selects the same `libggml-cpu-armv8.0_1.so`. Costs a QEMU row (`QEMU_CPU=cortex-a53`), not a port. |
+| Zero 2 W on the **32-bit** image, Pi 2/3 on 32-bit | ARMv7-A + NEON | a real but small port — §6.3 |
+| **Zero / Zero W**, Pi 1 (BCM2835, ARM1176JZF-S) | ARMv6 + VFP, **no NEON** | out of scope — §6.5 |
+
+**The distinction is the whole item.** "Zero 2 W support" is a documentation line ("64-bit OS
+required") plus a gate row; only the 32-bit userland is engineering.
+
+### 6.2 What the source read found, and it is mostly good news
+
+* **This engine has no port to do.** `grep -rE '__aarch64__|__ARM_NEON|immintrin|AVX' src include tools`
+  returns **nothing**. Every byte of ISA-specific code in the project is in ggml and in the sixteen
+  patches under `cmake/patches/` — which is [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md)'s
+  principle paying out on an axis it was not written for.
+* **ggml v0.19.0 still maintains ARM32.** `src/ggml-cpu/ggml-cpu-impl.h:87–305` is an explicit
+  `#if !defined(__aarch64__)` "32-bit ARM compatibility" block shimming `vaddvq_f32`, `vaddvq_s32`,
+  `vmaxvq_f32`, `vcvtnq_s32_f32`, `vpaddq_*` and `vaddlvq_s16`; `src/ggml-cpu/CMakeLists.txt:107`
+  probes for `-mfp16-format=ieee`, which is an ARM32-only GCC flag; `arch/arm/quants.c` carries 33
+  `#else` scalar fallbacks and `arch/arm/repack.cpp` gates its bodies on `__aarch64__` so they compile
+  out rather than break.
+* **Our own patches degrade rather than fail.** `ggml-0006`/`0007` (conv1d direct + fusion) have
+  generic `#else` arms; `ggml-0010` (GELU) falls back to scalar `erff`; `ggml-0001`/`0002`/`0011`/`0012`
+  are `__aarch64__`-guarded and go inert. It builds. It builds *slow* — see §6.4.
+
+### 6.3 The blockers, in the order a build would hit them
+
+1. **`GGML_CPU_ALL_VARIANTS`** — `loom-py/CMakeLists.txt:66` FORCEs it ON, and ggml's ARM ladder
+   (`src/CMakeLists.txt:403`) is aarch64-only: `armv8.0_1`, `armv8.2_1 DOTPROD`, … emitted as
+   `-march=armv8.x-a` against a 32-bit compiler. **Hard configure failure, one-line fix** — gate the
+   FORCE on `CMAKE_SIZEOF_VOID_P EQUAL 8`. A 32-bit wheel is one un-split `libggml-cpu.so`.
+2. **LuaJIT is a hard dependency built from its own Makefile** (`cmake/Dependencies.cmake`). Its ARM
+   port covers ARMv5TE and up, so armv7 hard-float should work — but it bootstraps through
+   `minilua`/`buildvm` and has never been built for this target here. **The one genuine unknown.**
+3. **No native runner.** `wheels.yml:46` rejects QEMU *for building* on purpose and is right to; there
+   is no 32-bit ARM hosted runner to replace it with. A shipped `manylinux_2_17_armv7l` wheel therefore
+   means either emulated builds or a self-hosted Pi, and both are policy changes.
+4. **`llamafile/sgemm.cpp:66` sets `VECTOR_REGISTERS 32` on any `__ARM_NEON`** — but armv7 NEON has 16
+   Q registers, not 32, so the 4×6 tile would spill catastrophically. **`ggml-0001`'s guard
+   (`!(defined(__ARM_NEON) && __GNUC__ && !__clang__)`) already routes a GCC build to the 16-register
+   schedule**, so we are covered by accident, not by intent. A clang armv7 build is not. Upstream-worthy.
+5. **F16 conversion paths** (`sgemm.cpp:4172`, `:4312`, `simd-mappings.h:38`) reach `__fp16` under plain
+   `__ARM_NEON`. Expected to work with the `-mfp16-format=ieee` of §6.2; unverified.
+6. **RAM, and it is the binding constraint on the boards actually asked about.** Both Zeros have
+   **512 MB**, and `src/core/gguf_model.cpp:21` parses with `no_alloc=true` and then reads weights into
+   a backend buffer — **there is no mmap path**. VITS at Q4_0 is 11.7 MB and fine; whisper-small is
+   tight; the 0.6B ASR and LM models do not fit at any quantization this repo ships
+   ([ADR-017](../adrs/adr-017-no-k-quants.md)).
+
+### 6.4 Effort, and what it buys
+
+| | |
+|---|---|
+| Zero 2 W via 64-bit OS | **~1 day**, all of it verification: one `QEMU_CPU=cortex-a53` row on `raspberry-pi-check`, and a README line saying 64-bit. |
+| armv7l, source build green | **1–2 days**: blocker 1, then LuaJIT, then whatever 4 and 5 throw. |
+| armv7l, shipped as a wheel | **+~1 week**, and it forces the blocker-3 policy decision. |
+
+**What it does not buy is speed.** Every optimisation in [Epic-05](epic-05-edge-performance.md) is
+either `__aarch64__`-guarded or AVX2-guarded, so an armv7 build runs at roughly the generic-C rung —
+the README's Pi 4 columns do not transfer, and would need a per-architecture caveat rather than a
+footnote.
+
+### 6.5 ARMv6 is a declared non-goal
+
+Pi Zero / Zero W / Pi 1 would compile — `__ARM_NEON` simply goes undefined and everything takes the
+scalar arm — and that is the problem: a single ~1 GHz ARM11 with no SIMD, no tinyBLAS benefit and
+512 MB. There is also no PyPI wheel tag anyone consumes for `linux_armv6l`. **Only the smallest TTS
+(VITS/Matcha at Q4_0) is even plausible, at many times the Pi 4's time.** Reopen only if a real user
+names the board and accepts source builds.
