@@ -20,7 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 10 — AR LM + codec TTS** | Dia picked (decodes through the DAC already exported); encoder unblocked, decoder next → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 10 — AR LM + codec TTS** | Dia exports and drives end to end; what is left is the sampler, the DAC composition and the card → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
 ---
 
@@ -35,23 +35,37 @@ are not renumbered. New items continue the scheme.
   11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
   classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
   for what family 12 cost, which is the estimate the rest of this list should be read against.*
-* [ ] **P5 family 10 — Dia-1.6B, the composition target.** Chosen over MusicGen because its
-  `audio_tokenizer_config.json` names `descript/dac_44khz` — the codec already exported and verified —
-  so it costs the LM half only. Checkpoint replaced in place with the transformers-native
-  `nari-labs/Dia-1.6B-0626` (`DiaForConditionalGeneration`, 1.61B).
-  **State: the encoder is unblocked and converts with a symbolic text axis.** It needed one patch, and
-  the diagnosis is the reusable part: `modeling_dia.rotate_half` slices at `x.shape[-1] // 2`, which
-  traces to 48 × `aten::Int(aten::floor_divide(...))` that coremltools' `_int` handler cannot fold
-  (`only 0-dimensional arrays can be converted to Python scalars`). It fails at a STATIC length too, so
-  it is not the dynamic-shape class of problem the other families hit — it is unconditional. The
-  midpoint is a config constant (`head_dim // 2`), so patching `rotate_half` to slice at it is the same
-  arithmetic with nothing to fold. Every op the encoder lowers to is already in the dialect.
-  **Remaining:** the 18-layer decoder (2048 wide, cross-attention, KV-cached, **9 channels** out at
-  vocab 1028), the delay pattern — declared in the config as `[0, 8, 9, ..., 15]`, so it is read rather
-  than derived and belongs in the driver by [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md)
-  — and the composition with the DAC GGUF. Family 2's shape (Whisper: fixed-ish encoder, KV-cached
-  cross-attention decode) with a 9-wide head, so `multi_phase_export` + `PrefillDecodeLoop.bound` is
-  the precedent to build on.
+* [ ] **P5 family 10 — Dia-1.6B: exported and driving; three things left.** The export is done and
+  registered (`dia_export.py`, task `text-to-codes`, three phases + a driver), it produces a 6.1 GB F32
+  GGUF whose contract resolves to `text2codes`, and the driver runs the whole loop — byte encoder,
+  hoisted cross-attention K/V, a nine-channel KV-cached decode with the delay scaffold, and the
+  realignment back to audio frames. `tests/ci/test_dia_export.py` (14 cases) and
+  `tests/gate/test_e2e_dia_mil_export.cpp` cover it. Two decisions from it are written down:
+  [ADR-021](../adrs/adr-021-dias-decoder-resolves-two-dynamic-axes.md) (the decoder resolves two
+  dynamic axes, so there is no padded text axis) and
+  [Retro-030](../retros/retro-030-a-guard-that-could-not-fire.md) (the `rotate_half` fix, and why the
+  one recorded before it could not work). What remains:
+  * [ ] **Sampling and classifier-free guidance — the one item with ENGINE work in it.** The driver is
+    GREEDY and runs CFG-free, which is a real quality decision and not a detail: this checkpoint
+    declares `temperature 1.8, top_k 50, top_p 0.9, do_sample true` and `guidance_scale 3.0`. Two
+    bindings are missing, and neither is obvious from the driver side: `loom.sample_row` samples the
+    WHOLE row where Dia needs it restricted per channel (`argmax_row_range` has the restricted form;
+    the sampler does not), and CFG combines LOGITS in the retained buffer, which nothing composes
+    today. Both are per-*task* reductions, so they belong in the engine by
+    [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) — but "family 10 needed no
+    engine C++" stops being true of its sampler. `scripts/dia_reference_codes.py` must learn the same
+    algorithm on the same commit. **Nothing has been listened to yet** — grade it with the ASR oracle,
+    not correlation ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)).
+  * [ ] **The composition with DAC.** Decide deliberately whether Dia ships as one GGUF with DAC merged
+    (~6.6 GB, loom's "the model is one file" property) or two files chained by the host. Either way the
+    end-to-end check is the point of the whole exercise: text → Dia → 9 delayed code streams → realign
+    → DAC → waveform, against `transformers` running the identical pipeline. `codec.n_codebooks` is
+    written on both sides under the same key so a host can match them.
+  * [ ] **Quantize, catalogue, card.** 6.1 GB F32 is the unquantized export; a row in the export sweep,
+    an entry in `build_model_cards.py`, and an arm in loom-py's model-card gate that asks the *is it
+    right* question for this family. loom-py also has no `Text2Codes` door yet — the interface resolves,
+    but nothing implements it.
+
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
   Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a

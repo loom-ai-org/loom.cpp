@@ -31,6 +31,7 @@ topologies, driver and — where the architecture has one — its vocabulary.
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz | `audio_codec_export.py` |
+| **Text → codec tokens** | Dia-1.6B | `dia_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
 decomposition paths stay honest about producing the same model.
@@ -145,6 +146,53 @@ EnCodec directory and raises naming both reasons — detection is what makes the
 **This is why the composition target changed.** MusicGen was picked for its small LM and would have
 dragged in this codec; Dia decodes through DAC, which is done, so it costs the LM half only.
 
+### Family 10, and the axis that did not have to be padded
+
+Family 10 — an AR LM that emits **codec tokens** rather than text — is the other half of family 11,
+and the pair is the whole point: text → Dia → nine delayed code streams → realign → DAC → waveform.
+Dia is the leaf because its own `audio_tokenizer_config.json` names `descript/dac_44khz`, the codec
+already exported and verified, so it costs the LM half only.
+
+Structurally it is family 2's shape — encoder once, then a KV-cached decoder cross-attending to its
+output — and `whisper_export`'s three-phase split (`encoder`, `cross_kv`, `decoder`) transfers
+unchanged. **Three things do not, and each is the reason for code that has no Whisper counterpart.**
+
+* **Two dynamic axes, not one.** Whisper's encoder always emits 1500 frames; Dia's emits one per input
+  BYTE, so the cross-attention K/V carry a second independent symbol. Received wisdom said a topology
+  could resolve only one — [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md)
+  says so about Supertonic — and that turned out to be a statement about *one model's trace*, not
+  about the machinery: `declared_axes` and the engine's axis map both already supported it. So Dia's
+  text axis is fully dynamic, with no padding, no buckets and no mask input.
+  [ADR-021](../adrs/adr-021-dias-decoder-resolves-two-dynamic-axes.md) has the argument and the
+  alternatives.
+* **Nine output heads, and still no engine primitive.** Every decode loop in this tree reduces one row
+  to one token; this one emits nine per step. The wrapper slices `hidden[:, -1:, :]` before the head,
+  so the graph's output is `[vocab, 9]` on a prefill and on a decode step alike — which is exactly the
+  `[n_classes, n_rows]` tensor `loom.argmax_rows` was built for in P4.0.17 and family 12 reused. The
+  driver takes it a step further and uses `loom.argmax_row_range` per channel, because
+  `DiaEOSChannelFilterLogitsProcessor` bans the control ids per channel rather than globally — the same
+  restricted argmax `whisper_driver` detects a language with. **Three families running, and none has
+  needed engine C++ for its graph**, which is the acceptance criterion the roadmap states.
+* **The delay pattern lives in the driver**, by [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md)'s
+  reasoning and [ADR-013](../adrs/adr-013-one-door-per-task.md) §2's: it is declared in `config.json`,
+  so it is read rather than derived, and undoing it is index arithmetic over a nine-element array. The
+  engine never learns what a delay pattern is. Two halves of it are in Lua — a scaffold on the way in
+  (channel k is forced to BOS until step `delay[k]` has passed) and a gather on the way out (audio
+  frame t's channel k was emitted at row `t + delay[k]`).
+
+The tracing lesson is [Retro-030](../retros/retro-030-a-guard-that-could-not-fire.md), and it is worth
+reading before the next family: under `torch.jit.trace` *every* shape read is a 0-d Tensor, the static
+ones included, so a guard testing `isinstance(dim, int)` detects tracing rather than staticness.
+`rotate_half` is fixed with `torch.chunk`, which asks for a count instead of an index and therefore
+needs no arithmetic over the axis at all.
+
+**Not yet graded on what it sounds like.** The driver is greedy and runs without classifier-free
+guidance, while the checkpoint declares `temperature 1.8 / top_k 50 / top_p 0.9` and
+`guidance_scale 3.0`. Correctness against `transformers` under the *same* algorithm is what the gate
+asserts; whether the audio is intelligible is a separate question and
+[Retro-006](../retros/retro-006-kokoro-shipped-noise.md) is the standing warning about answering it
+with a correlation. See [the backlog](../backlog/active-index.md#models) for what is left.
+
 ### Text input
 
 **Only Supertonic takes text.** It encodes graphemes itself and its GGUF carries the codepoint table.
@@ -157,11 +205,12 @@ those checkpoints, addressed by [Epic-07](epic-07-text-frontends-and-tokenizers.
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** codec decoders (unlocks the back half of the remaining TTS group) → CNN+CTC and
-SANM encoders (both family-1-shaped once the encoder template generalizes past NeMo) → the remaining
-TTS families → text encoder-decoders → small classifiers → music. BERT token classifiers came first and
-are **done** (2026-09-03) — see §2 for what they cost, which is the number the rest of this list should
-be estimated against.
+**Next families:** the second codec decoder (EnCodec or SNAC) → CNN+CTC and SANM encoders (both
+family-1-shaped once the encoder template generalizes past NeMo) → the remaining TTS families → text
+encoder-decoders → small classifiers → music. Three are **done** as of 2026-09-03 — token
+classifiers (12), codec decoders' first leaf (11) and the AR codec-token LM (10) — and §2 says what
+each cost, which is the number the rest of this list should be estimated against. Family 10 landing
+means the `text2codes` → `codes2speech` composition now has both halves in the tree.
 
 **Named but unstarted:** Qwen3-ASR-0.6B and Qwen3-TTS-0.6B variants — Qwen3-TTS is expected to be the
 most architecturally novel item in that family and needs its own source-level read before scoping.

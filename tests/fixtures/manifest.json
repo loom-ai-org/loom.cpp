@@ -59,6 +59,16 @@
       "kind": null,
       "produced_by": null
     },
+    "LOOM_DIA_MIL_GGUF": {
+      "path": "dia_mil.gguf",
+      "used_by": [
+        "test_e2e_dia_mil_export"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
     "LOOM_GIGAAM_MIL_GGUF": {
       "path": "gigaam_mil.gguf",
       "used_by": [
