@@ -29,7 +29,7 @@ topologies, driver and — where the architecture has one — its vocabulary.
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
-| **Token classification** | any HF `*ForTokenClassification` (verified on bert-base-NER) | `token_classification_export.py` |
+| **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
 decomposition paths stay honest about producing the same model.
@@ -71,15 +71,25 @@ end, and it turned `Text2Class` from a `_Planned` interface into an answered one
 
 What it did cost is one door in the engine, `loom::text::classify` — per-TASK by the §2 rule of
 [HIGH-LEVEL-API](../HIGH-LEVEL-API.md), because whether the framing tokens an encode adds come back
-labelled is a policy two hosts would otherwise decide independently. And one tracing decision, recorded
-as [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md): a single unpadded sequence exports
-with **no attention mask at all**, because every route `transformers` takes to build one bakes the
-traced length into the graph.
+labelled is a policy two hosts would otherwise decide independently. And one tracing rule, recorded as
+[ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md): **every tensor the model needs is
+derived from an input, never computed from `.shape[1]`** — the mask, `token_type_ids` and
+`position_ids` alike, because `transformers` computes all three from the Python-level sequence length
+and a traced graph bakes each of them.
 
-Verified against `transformers` on the tensor rather than on the argmax
-(the *tensor oracle, not token oracle* standing rule): max |Δ| 1.24e-05 over every logit of 138 tokens, worst
-sentence cosine 0.99999988, 138/138 argmax agreement, and the engine's own WordPiece encode identical
-to HF's ids. The sabotage arm — the same graph against a different sentence's reference — reads 11.16.
+**It is the first family here proved on a second, structurally different checkpoint**, which is what
+the "modular-export generality is unproven" item asks of a template and what this one now has.
+DistilBERT has no token-type embeddings, no `position_ids` argument and `.transformer` where BERT has
+`.encoder`; the template absorbs all three by reading `base.forward`'s signature rather than its name,
+and the two exports produce identical graph inputs and identical drivers. The first version of ADR-019
+generalised from BERT alone and was falsified within a day, which is the argument for the second
+checkpoint stated as cheaply as it can be.
+
+Verified against `transformers` on the tensor rather than on the argmax (the *tensor oracle, not token
+oracle* standing rule), over 138 tokens: max |Δ| 1.24e-05 (BERT) and 5.72e-06 (DistilBERT), worst
+sentence cosine 0.99999988 for both, 138/138 argmax, and the engine's own WordPiece encode identical to
+HF's ids. The sabotage arm — the same graph against a different sentence's reference — reads 11.94 and
+9.54.
 
 ### Text input
 
