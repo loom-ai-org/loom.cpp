@@ -20,7 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 10 — AR LM + codec TTS** | the composition DAC unlocks; `text-to-codes` is reserved for it → [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md) |
+| **P5 family 10 — AR LM + codec TTS** | Dia picked (decodes through the DAC already exported); encoder unblocked, decoder next → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
 ---
 
@@ -35,6 +35,23 @@ are not renumbered. New items continue the scheme.
   11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
   classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
   for what family 12 cost, which is the estimate the rest of this list should be read against.*
+* [ ] **P5 family 10 — Dia-1.6B, the composition target.** Chosen over MusicGen because its
+  `audio_tokenizer_config.json` names `descript/dac_44khz` — the codec already exported and verified —
+  so it costs the LM half only. Checkpoint replaced in place with the transformers-native
+  `nari-labs/Dia-1.6B-0626` (`DiaForConditionalGeneration`, 1.61B).
+  **State: the encoder is unblocked and converts with a symbolic text axis.** It needed one patch, and
+  the diagnosis is the reusable part: `modeling_dia.rotate_half` slices at `x.shape[-1] // 2`, which
+  traces to 48 × `aten::Int(aten::floor_divide(...))` that coremltools' `_int` handler cannot fold
+  (`only 0-dimensional arrays can be converted to Python scalars`). It fails at a STATIC length too, so
+  it is not the dynamic-shape class of problem the other families hit — it is unconditional. The
+  midpoint is a config constant (`head_dim // 2`), so patching `rotate_half` to slice at it is the same
+  arithmetic with nothing to fold. Every op the encoder lowers to is already in the dialect.
+  **Remaining:** the 18-layer decoder (2048 wide, cross-attention, KV-cached, **9 channels** out at
+  vocab 1028), the delay pattern — declared in the config as `[0, 8, 9, ..., 15]`, so it is read rather
+  than derived and belongs in the driver by [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md)
+  — and the composition with the DAC GGUF. Family 2's shape (Whisper: fixed-ish encoder, KV-cached
+  cross-attention decode) with a 9-wide head, so `multi_phase_export` + `PrefillDecodeLoop.bound` is
+  the precedent to build on.
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
   Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
