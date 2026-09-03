@@ -262,6 +262,26 @@ def write_pooled_classifier(path: Path) -> None:
     _finish(w)
 
 
+def write_codec(path: Path) -> None:
+    """A codec decoder: `audio_codes` in, `audio` out (ADR-020).
+
+    No driver and no graph -- what is under test is the modality FOLD, which is metadata all the way
+    down. It exists so `token_ids` -> "text" and `audio_codes` -> "codes" are pinned by two fixtures
+    that differ in one key, which is the only way the asymmetry survives someone tidying it.
+    """
+    w = _base(path, "codec_test")
+    w.add_string("loom.task", "audio-codec")
+    w.add_string("loom.input.kind", "audio_codes")
+    w.add_string("loom.output.kind", "audio")
+    w.add_uint32("loom.sample_rate", 44100)
+    # What a caller needs in order to build the input at all: the matrix is n_codebooks wide, and the
+    # ids in each column are bounded by the codebook size.
+    w.add_uint32("loom.codec.n_codebooks", 9)
+    w.add_uint32("loom.codec.codebook_size", 1024)
+    w.add_float32("loom.codec.frame_rate", 86.1328125)
+    _finish(w)
+
+
 def main() -> None:
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -270,6 +290,7 @@ def main() -> None:
     write_generate(out_dir / "generate_driver.gguf")
     write_timestamped_asr(out_dir / "timestamped_asr.gguf")
     write_dynamic_asr(out_dir / "dynamic_asr.gguf")
+    write_codec(out_dir / "contract_codec.gguf")
     write_classifier(out_dir / "classify_driver.gguf")
     write_pooled_classifier(out_dir / "pooled_classifier.gguf")
 

@@ -110,8 +110,23 @@ on *both* sides would need two, and none exists yet.
 ```
 loom.task                    str    canonical name from tasks.py
 loom.entry_points            str[]  Lua functions the driver defines ("infer", ...)
-loom.input.kind              str    "text" | "token_ids" | "phoneme_ids" | "audio" | "image"
+loom.input.kind              str    "text" | "token_ids" | "phoneme_ids" | "audio_codes" | "audio" | "image"
 loom.output.kind             str    "text" | "token_ids" | "audio" | "class" | "embeddings"
+```
+
+`audio_codes` does NOT fold onto `text` the way `token_ids` and `phoneme_ids` do, and the asymmetry is
+argued in [ADR-020](adrs/adr-020-audio-codes-is-its-own-modality.md): those two fold because text is
+what they encode, and a codec token encodes audio with no string behind it. A codec decoder that
+declared `token_ids` would resolve to `text2speech` and be handed a sentence.
+
+Per-family tables that follow the same rule — a number only the checkpoint knows, that a host needs
+before it can call the model at all:
+
+```
+loom.labels                  str[]  id-indexed class names, for a `class` output
+loom.codec.n_codebooks       u32    code streams per frame; the width of the matrix a caller passes
+loom.codec.codebook_size     u32    the valid id range per stream
+loom.codec.frame_rate        f32    codes per second, so a caller can size a clip
 ```
 
 ASR decode table — what turns `transcribe` from Whisper-flavoured into per-task:

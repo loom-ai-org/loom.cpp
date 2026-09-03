@@ -57,6 +57,11 @@ inline constexpr const char* TOKEN_IDS = "token_ids";
 inline constexpr const char* PHONEME_IDS = "phoneme_ids";
 inline constexpr const char* AUDIO = "audio";
 inline constexpr const char* IMAGE = "image";
+// Codec tokens, and NOT a flavour of `token_ids` (ADR-020). The fold below sends `token_ids` and
+// `phoneme_ids` to "text" because text is what they encode -- a caller holding the string could
+// produce them. A codec token encodes AUDIO: it is a compressed acoustic frame with no string behind
+// it, and a file declaring `token_ids` here would advertise `text2speech` and be handed a sentence.
+inline constexpr const char* AUDIO_CODES = "audio_codes";
 inline constexpr const char* CLASS = "class";
 inline constexpr const char* EMBEDDINGS = "embeddings";
 } // namespace modality
