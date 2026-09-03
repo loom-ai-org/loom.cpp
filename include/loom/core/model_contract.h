@@ -44,6 +44,7 @@ inline constexpr const char* TEXT_GENERATION = "text-generation";
 inline constexpr const char* ASR = "automatic-speech-recognition";
 inline constexpr const char* TTS = "text-to-speech";
 inline constexpr const char* AUDIO_CODEC = "audio-codec";
+inline constexpr const char* TOKEN_CLASSIFICATION = "token-classification";
 } // namespace task_names
 
 // The modality names `loom.input.kind` / `loom.output.kind` take. Same reasoning: strings, open set.
@@ -98,6 +99,17 @@ struct ModelContract {
     uint32_t default_steps = 0;
     // Named voices the file carries.
     std::vector<std::string> voices;
+
+    // The class names a `class`-output model chooses between, INDEXED BY the id its driver returns --
+    // `loom.labels`. Empty for every model that is not a classifier, and legitimately empty for one
+    // that names its classes nothing, in which case the id is the only answer there is.
+    //
+    // It is in the FILE rather than here by the tier-0 admission test (docs/HIGH-LEVEL-API.md §2):
+    // only the checkpoint knows that class 3 is `B-PER`, and a host has to branch on it to say anything
+    // a person can read. Written as one id-indexed string array rather than parallel name/id arrays --
+    // unlike the ASR language table, which is a sparse map into a vocabulary -- because a classifier's
+    // classes are 0..n-1 by construction.
+    std::vector<std::string> labels;
 
     // Reads whatever `model` declares. Never throws for an absent key -- see the header comment.
     static ModelContract read(const GgufModel& model);

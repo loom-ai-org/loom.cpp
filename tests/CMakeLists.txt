@@ -92,6 +92,13 @@ add_test(NAME test_text_generate COMMAND test_text_generate)
 set_tests_properties(test_text_generate PROPERTIES LABELS ci)
 set_tests_properties(test_text_generate PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
 
+add_executable(test_text_classify ci/test_text_classify.cpp)
+target_link_libraries(test_text_classify PRIVATE loom::engine)
+target_compile_definitions(test_text_classify PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_text_classify COMMAND test_text_classify)
+set_tests_properties(test_text_classify PROPERTIES LABELS ci)
+set_tests_properties(test_text_classify PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
 add_executable(test_transcribe_seek ci/test_transcribe_seek.cpp)
 target_link_libraries(test_transcribe_seek PRIVATE loom::engine)
 target_compile_definitions(test_transcribe_seek PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")

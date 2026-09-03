@@ -254,9 +254,44 @@ int main(int argc, char** argv) {
         }
         std::printf("  weights: %zu tensors\n", model->weights().size());
 
+        // The first branch here that asks the FILE what it is instead of guessing from its vocabulary
+        // tag, which is what docs/HIGH-LEVEL-API.md §3 said the tag branches below would become. A
+        // token classifier is a WordPiece file like the `"bert"` dead-end underneath it and is not
+        // inspection-only: it has a driver, a declared task and a declared label set, so it gets run.
+        const loom::ModelContract contract = loom::ModelContract::read(*model);
+        if (contract.task == loom::task_names::TOKEN_CLASSIFICATION) {
+            auto wp_vocab = loom::WordPieceVocab::load(*model);
+            std::printf("  task: %s (%s), %zu labels\n", contract.task.c_str(),
+                        contract.interface_name().c_str(), contract.labels.size());
+            if (!has_prompt) {
+                std::printf("  tokenizer: WordPiece (bert), %zu tokens\n", wp_vocab->size());
+                std::printf("  pass --prompt \"<text>\" to label it\n");
+                return 0;
+            }
+            const std::vector<int32_t> ids = wp_vocab->encode(prompt_text);
+            if (ids.empty()) {
+                std::fprintf(stderr, "error: --prompt produced no token ids\n");
+                return 1;
+            }
+            loom::Session session(*model, backends);
+            const auto labelled = loom::text::classify(session.bridge(), *model, ids);
+            for (const auto& entry : labelled) {
+                // The piece, not the sentence: a token classifier's answer IS per token, and joining
+                // the labelled pieces back into text is a presentation choice this host has no basis
+                // for making -- a "##continuation" piece belongs to the word before it, and which of
+                // the two labels then wins is the caller's rule, not the model's.
+                std::printf("  %-16s %s\n", wp_vocab->decode({entry.token}).c_str(),
+                            entry.label.empty() ? std::to_string(entry.label_id).c_str()
+                                                : entry.label.c_str());
+            }
+            print_device_report(session.bridge());
+            return 0;
+        }
+
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "bert") {
-            // WordPiece (BERT-family) models aren't causal LMs -- no generation loop applies, this is
-            // inspection-only so loom_cli doesn't dead-end on a "bert" GGUF (see EXPORT-BACKLOG.md item 4).
+            // A WordPiece file that declares no task -- a plain encoder, or an export older than
+            // `loom.task`. No generation loop applies, so this stays inspection-only rather than
+            // dead-ending loom_cli on a "bert" GGUF (see EXPORT-BACKLOG.md item 4).
             auto wp_vocab = loom::WordPieceVocab::load(*model);
             std::printf("  tokenizer: WordPiece (bert), %zu tokens\n", wp_vocab->size());
             if (has_prompt) {
