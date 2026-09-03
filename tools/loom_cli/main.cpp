@@ -310,6 +310,49 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "phonemes") {
+            // The four phoneme-input TTS families (VITS, Kokoro, StyleTTS2, Matcha). Inspection-only for
+            // the same reason as the three branches above -- no generation loop applies to a vocoder --
+            // but here the fall-through was not a hypothetical: `bpe_vocab` stays null for any non-"gpt2"
+            // tag, so an IPA `--prompt` reached `parse_token_ids`, which found no integers in it and
+            // died on "produced no token ids" while the model's own symbol table sat unread in the same
+            // file. loom-py has encoded through that table since it was exported and
+            // this host never learned to; that is the identical half-wiring the Supertonic branch above
+            // was written to correct.
+            auto phoneme_vocab = loom::PhonemeVocab::load(*model);
+            std::printf("  tokenizer: phoneme symbols (phonemes), %zu tokens\n", phoneme_vocab->size());
+            // The assembly is declared per checkpoint and is not part of the table, so it is printed
+            // beside it: piper builds [BOS, p1, blank, ..., pn, blank, EOS] where StyleTTS2 wraps with
+            // neither. A -1 is this model saying it HAS no such token -- printing the sentinel as a
+            // number invites a caller to send it, which reaches the engine as an out-of-range GET_ROWS.
+            const auto assembly = [](int32_t id) {
+                return id < 0 ? std::string("none") : std::to_string(id);
+            };
+            std::printf("  assembly: bos=%s eos=%s blank=%s%s\n", assembly(phoneme_vocab->bos_id()).c_str(),
+                        assembly(phoneme_vocab->eos_id()).c_str(), assembly(phoneme_vocab->blank_id()).c_str(),
+                        phoneme_vocab->interleave_blank() ? ", interleaved between every phoneme" : "");
+            if (has_prompt) {
+                // --prompt is PHONEMES here, not text: grapheme-to-phoneme is a property of the language
+                // rather than of any checkpoint and is in no GGUF, so this host has nothing to run it
+                // with (docs/HIGH-LEVEL-API.md §5). What it can do is the half that IS in the file,
+                // which is exactly the half that was unreachable from here.
+                size_t unknown = 0;
+                const auto ids = phoneme_vocab->encode(prompt_text, &unknown);
+                std::printf("  encode(\"%s\") -> [", prompt_text.c_str());
+                for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? ", " : "", ids[i]);
+                std::printf("]\n");
+                // A dropped symbol is expected rather than exceptional -- a rule-based G2P emits a
+                // superset of what any one checkpoint was trained on, which is why the vocabulary skips
+                // instead of raising -- but a SILENT drop is how a caller gets audio that is subtly not
+                // the sentence, so say how many went and what is left to say (Retro-006).
+                if (unknown > 0) {
+                    std::printf("  %zu symbol%s not in this model's table, dropped; it will say \"%s\"\n",
+                                unknown, unknown == 1 ? "" : "s", phoneme_vocab->decode(ids).c_str());
+                }
+            }
+            return 0;
+        }
+
         if (has_prompt) {
             std::unique_ptr<loom::BpeVocab> bpe_vocab;
             if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "gpt2") {

@@ -253,14 +253,15 @@ declares its rate today; the other four need it read from their own checkpoints.
 
 ### The phonemizer, and how this splits Task #79
 
-Task #79 is currently one blocked item: VITS, Kokoro, StyleTTS2 and Matcha take phoneme ids, real
+Task #79 arrived as one blocked item: VITS, Kokoro, StyleTTS2 and Matcha take phoneme ids, real
 phonemization is GPL-3, and vendoring it was rejected. It is actually two items, and only one of them
-is blocked:
+was ever blocked:
 
-1. **The phoneme symbol table is data in the checkpoint and is simply not exported.** Export it as a
-   vocabulary family (`tokenizer.ggml.model = "phonemes"`, `loom.text.frontend = "phonemes"`) and
-   `model.tokenizer` stops being `None` for four families, `tokenize("ˈhɛloʊ")` works, and
-   `synthesize(phonemes=...)` becomes a real door. No licence question is involved at any point.
+1. **The phoneme symbol table is data in the checkpoint and was simply not exported** — **shipped
+   2026-08-15.** It goes out as a vocabulary family (`tokenizer.ggml.model = "phonemes"`,
+   `loom.text.frontend = "phonemes"`), `model.tokenizer` stopped being `None` for four families,
+   `tokenize("ˈhɛloʊ")` works, and `synthesize(phonemes=...)` is a real door. No licence question was
+   involved at any point. Record: [Epic-07 §4](epics/epic-07-text-frontends-and-tokenizers.md).
 2. **Grapheme→phoneme is the only part that needs an external engine**, and it can be an *optional
    Python dependency* resolved through a registry:
 
