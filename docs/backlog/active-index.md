@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-02
+last_updated: 2026-09-03
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,7 +19,6 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Task #79 part 1 — export the phoneme symbol table** | no licence question, no C++, and it gives four TTS models a real text door → [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md) |
 | **P5 family 12 — BERT token classifiers** | smallest possible template, and the first non-audio task → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
 ---
@@ -154,13 +153,12 @@ are not renumbered. New items continue the scheme.
 
 ## Text front-ends
 
-* [ ] **Task #79 part 1 — export the phoneme symbol table** as a vocabulary family. The data already
-  sits in each checkpoint. No licence question, no C++. Gives VITS, Kokoro, StyleTTS2 and Matcha a real
-  `model.tokenizer` and a working `synthesize(phonemes=...)`.
 * [ ] **Task #79 part 2 — the C++ `orthography2ipa` port.** `src/text/phonemize.cpp` +
   `include/loom/text/phonemize.h`, vendored as an Apache-2.0 submodule, verified against the Python
-  door as its oracle. **Measure both risks first:** the fold-down into each checkpoint's fixed symbol→id
-  table, and pinning the beam search's tie-break.
+  door as its oracle. Part 1 is closed — every phoneme-input TTS GGUF carries its symbol table and both
+  hosts read it ([Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md)).
+  **Measure both risks first:** the fold-down into each checkpoint's fixed symbol→id table, and
+  pinning the beam search's tie-break.
   *Context: [ADR-012](../adrs/adr-012-permissive-phonemizer.md)*
 * [ ] **Generalize the grapheme front end out of C++** — when a real second grapheme TTS model exists.
   Qwen3-TTS is not one. *Context: [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md)*

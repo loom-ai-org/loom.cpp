@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-08-29
+last_updated: 2026-09-03
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -55,17 +55,19 @@ set in its export config — no new C++ at all.
 
 ### Phonemization
 
-Four TTS models (VITS, Kokoro, StyleTTS2, Matcha) take phoneme ids and have no text door. The licence
-blocker is resolved: a C++ port of the Apache-2.0 `orthography2ipa`, vendored as a submodule, with
-rules and data in the engine as one copy —
-[ADR-012](../adrs/adr-012-permissive-phonemizer.md).
+Four TTS models (VITS, Kokoro, StyleTTS2, Matcha) take phoneme ids. The licence blocker is resolved: a
+C++ port of the Apache-2.0 `orthography2ipa`, vendored as a submodule, with rules and data in the engine
+as one copy — [ADR-012](../adrs/adr-012-permissive-phonemizer.md).
 
 **The work splits in two, and only the second half needs the port:**
 
-1. **Export the phoneme symbol table** as a vocabulary family. The data is already in each checkpoint
-   and simply not exported. Gives four models a real `model.tokenizer` and a working
-   `synthesize(phonemes=...)`, with no licence question at any point.
-2. **The C++ port**, verified against the Python door as its oracle.
+1. **Export the phoneme symbol table** as a vocabulary family — **DONE**. The data was already in each
+   checkpoint and simply not exported; `tokenizer.ggml.model = "phonemes"` plus an id-indexed
+   `tokenizer.ggml.tokens` and the four `tokenizer.ggml.phoneme.*` assembly KVs now travel in all four
+   published GGUFs, and `loom::PhonemeVocab` (`src/core/phoneme_vocab.cpp`) reads them back for both
+   hosts. No licence question arose at any point. §4 records what shipping it took a second pass to
+   finish — [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md).
+2. **The C++ port**, verified against the Python door as its oracle. Still open.
 
 Target shape: `src/text/phonemize.cpp` + `include/loom/text/phonemize.h`. The Python half already ships
 behind `loom-py-rt[phonemes]`.
@@ -80,7 +82,7 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 |---|---|
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
-| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md) |
+| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record
@@ -197,6 +199,35 @@ Every causal-LM model card shipped the failing snippet (`build_model_cards.py`).
 show `text2text.chat(...)`; the base-model cards keep `infer(...)`, which is the right call for them.
 **The re-exported GGUFs are not on the Hub** — that is the rc7 push, tracked in the hub with the three
 already-stale models.
+
+### Task #79 part 1 — the phoneme symbol table — DONE (2026-08-15, finished 2026-09-03)
+
+**What the file carries.** `tokenizer.ggml.model = "phonemes"`, an id-indexed `tokenizer.ggml.tokens`
+(159 symbols for piper's VITS, 178 each for Kokoro, StyleTTS2 and Matcha), and four
+`tokenizer.ggml.phoneme.*` KVs for the assembly. The table was always in the checkpoint; nothing was
+computed, only exported. `ExportConfig.phoneme_table()` is the per-family door and
+`exporter.py` writes the KVs.
+
+**The assembly is declared, not reimplemented.** Piper builds `[BOS, p1, blank, ..., pn, blank, EOS]`
+with no blank after BOS; StyleTTS2 wraps with neither an EOS nor blanks. So `bos_id`/`eos_id`/`blank_id`
+and `interleave_blank` travel with the table and `loom::PhonemeVocab::encode` applies them — the same
+arrangement `SupertonicTextVectorizer` has for its `<lang>` wrap, one modality over. **A `-1` is the
+sentinel for "this model has none"**, not an id: three of the four declare at least one, and appending
+it literally reaches the engine as an out-of-range `GET_ROWS`.
+
+**Two properties the lookup needs.** Longest match, because IPA symbols are not one codepoint each
+(`t͡ʃ`, `aɪ`), so a per-codepoint walk splits every diphthong into pieces no model has seen. And an
+unknown symbol is **skipped, not raised on**, with a count returned — a rule-based G2P emits a superset
+of any one checkpoint's inventory, so refusing an utterance over one diacritic would fail every long
+sentence.
+
+**What the first pass left.** `loom_cli` never learned the tag, so the C++ host reported no tokenizer
+for any of the four and an IPA `--prompt` died in the LM path's `parse_token_ids`; and `PhonemeVocab`
+had no test in this tree. Both closed 2026-09-03, and both hosts now agree id for id on the same string.
+The lesson is [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md).
+
+**What is still outside every GGUF, deliberately:** grapheme→phoneme, which is a property of the
+language rather than of any checkpoint. That is part 2.
 
 ### Grapheme text front-ends: the shape to generalize to
 

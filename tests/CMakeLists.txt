@@ -690,6 +690,27 @@ add_test(NAME test_supertonic_vocab COMMAND test_supertonic_vocab)
 set_tests_properties(test_supertonic_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_supertonic_vocab PROPERTIES FIXTURES_REQUIRED "supertonic_vocab_gguf_fixture;byte_vocab_gguf_fixture")
 
+# --- The phoneme vocabulary the four phoneme-input TTS families carry (PhonemeVocab), against synthetic
+#     twelve-symbol fixtures. Their gate tests drive them with synthetic ids and so never reach this
+#     table at all, which is why the class shipped with the export half of Task #79 and no test here.
+#     It also reads byte_vocab_test.gguf, to check the tag dispatch declines a file that isn't its own. ---
+add_test(
+    NAME gen_phoneme_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_phoneme_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/phoneme_vocab_test.gguf
+            ${LOOM_FIXTURE_DIR}/phoneme_vocab_bare.gguf
+            ${LOOM_FIXTURE_DIR}/phoneme_vocab_no_tokens.gguf
+)
+set_tests_properties(gen_phoneme_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_phoneme_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP phoneme_vocab_gguf_fixture)
+
+add_executable(test_phoneme_vocab ci/test_phoneme_vocab.cpp)
+target_link_libraries(test_phoneme_vocab PRIVATE loom::engine)
+target_compile_definitions(test_phoneme_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_phoneme_vocab COMMAND test_phoneme_vocab)
+set_tests_properties(test_phoneme_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_phoneme_vocab PROPERTIES FIXTURES_REQUIRED "phoneme_vocab_gguf_fixture;byte_vocab_gguf_fixture")
+
 # --- Qwen3 roadmap item: GQA (n_head_kv < n_head) regression test, verified against numpy before the
 #     real Qwen3-0.6B-Base checkpoint (16 query / 8 KV heads) depends on ATTENTION's broadcast path ---
 set(LOOM_E2E_GQA_REF_DIR ${LOOM_FIXTURE_DIR}/e2e_gqa_ref)
