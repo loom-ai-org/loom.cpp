@@ -118,6 +118,33 @@ Verified against `transformers` on the waveform, on real speech at two clip leng
 (2 s) and 2.22e-04 (5 s), cosine ~1.0. Sabotage arm — the same graph against a different clip's
 reference — 1.14.
 
+#### What the second codec costs, measured before starting it
+
+EnCodec 32 kHz (MusicGen's codec) was probed and is **not** a repeat of DAC. Two blockers, both
+confirmed on the real checkpoint and neither a gap in this exporter:
+
+* **coremltools refuses its convolution padding** once the frame axis is dynamic — `Dynamic padding
+  for n-dimensional tensors is not supported`, because `EncodecConv1d` pads by a length-derived
+  amount. It is the same limitation that keeps Supertonic's text axis static
+  ([Retro-005](../retros/retro-005-supertonic-fixed-text-length.md)). Tractable: every decode-path
+  convolution is stride 1, where the extra padding works out to exactly 0, so patching it to a
+  constant should be sound — but a wrong pad is a silent output shift rather than an error, so it has
+  to be proved per stage.
+* **Its decoder contains a 2-layer LSTM over the time axis.** DAC's is purely convolutional. A
+  flattened trace unrolls the LSTM at the traced length and bakes it, so this is a
+  `ScriptedLoop`/`run_recurrent` export rather than the four-line `Flattened` one. The machinery
+  exists — StyleTTS2's BiLSTM already goes through it — and what is missing is wiring this family to
+  it.
+
+The half that is already done: `CodecFamily.decode` knows EnCodec's chunked
+`(audio_codes, audio_scales)` signature and `[chunks, batch, n_q, frames]` layout, and `geometry`
+knows its config spellings, which differ from DAC's in every field but `codebook_size`. Both are
+pinned by tests so they cannot rot while the blockers stay open, and the recognizer **detects** an
+EnCodec directory and raises naming both reasons — detection is what makes the failure sayable at all.
+
+**This is why the composition target changed.** MusicGen was picked for its small LM and would have
+dragged in this codec; Dia decodes through DAC, which is done, so it costs the LM half only.
+
 ### Text input
 
 **Only Supertonic takes text.** It encodes graphemes itself and its GGUF carries the codepoint table.

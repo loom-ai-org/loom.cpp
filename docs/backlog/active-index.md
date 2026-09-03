@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — codec decoders** | DAC done and verified; SNAC next (multi-rate `vq_strides`, the second member that tests the contract) → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 family 10 — AR LM + codec TTS** | the composition DAC unlocks; `text-to-codes` is reserved for it → [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md) |
 
 ---
@@ -35,6 +35,16 @@ are not renumbered. New items continue the scheme.
   11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
   classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
   for what family 12 cost, which is the estimate the rest of this list should be read against.*
+* [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
+  leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
+  Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
+  constant, per stage. (2) Its decoder has a 2-layer LSTM over the time axis, so it needs the
+  `ScriptedLoop`/`run_recurrent` path rather than `Flattened`. Its `decode` signature and config
+  spellings are already written and tested in `CodecFamily`; the recognizer detects it and raises
+  naming both reasons. *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
+* [ ] **SNAC** — the other family-11 candidate, and a different axis of difficulty from EnCodec:
+  `vq_strides [4, 2, 1]` puts its codebooks at DIFFERENT frame rates, which is what tests whether
+  "codes in, frame-major" survives a multi-rate codec. Needs the `snac` package (not in transformers).
 * [ ] **A family-12 checkpoint that is not WordPiece.** Two are verified — `dslim/bert-base-NER` and
   `dslim/distilbert-NER`, structurally different encoders — and both are WordPiece with a CoNLL-03
   head, so what is still untested is the TOKENIZER half rather than the graph half. `fullstop-punc` is
