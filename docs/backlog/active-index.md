@@ -34,12 +34,10 @@ are not renumbered. New items continue the scheme.
   11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
   classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
   for what family 12 cost, which is the estimate the rest of this list should be read against.*
-* [ ] **A second token classifier, structurally different from BERT.** Family 12 ships through one
-  generic recognizer and is verified on one checkpoint (`dslim/bert-base-NER`, cased, WordPiece,
-  `vocab.txt`-only). The template names no architecture and patches `base_model`, so RoBERTa/XLM-R/
-  ELECTRA/DeBERTa should need nothing — but "should" is the same word the modular-export generality
-  item below is open on. The punctuation checkpoints the roadmap names (`fullstop-punc` is XLM-R, so
-  SentencePiece rather than WordPiece) are the natural second.
+* [ ] **A family-12 checkpoint that is not WordPiece.** Two are verified — `dslim/bert-base-NER` and
+  `dslim/distilbert-NER`, structurally different encoders — and both are WordPiece with a CoNLL-03
+  head, so what is still untested is the TOKENIZER half rather than the graph half. `fullstop-punc` is
+  XLM-R (SentencePiece), which is the natural third and the one the roadmap actually names.
 * [ ] **P5.0 — per-phase process isolation for conversion.** Decides which models are exportable at all
   on a given machine. Change 1 done (30.4 → 22.9 GB peak on Granite-Speech). Two remain:
   * [ ] quantize/`astype` each phase's weights as it converts, rather than at write time
@@ -183,13 +181,11 @@ are not renumbered. New items continue the scheme.
 
 ## Packaging & release
 
-* [ ] **No family-12 GGUF is published.** The family works end to end and is swept, but the Hub still
-  lists seventeen models and none of them is a token classifier — so `model.text2class` is a door with
-  no downloadable model behind it, and loom-py's README documents a call a reader cannot run from
-  `from_pretrained`. One export + one model card in the next release; `dslim/bert-base-NER` is the
-  checkpoint it was verified on (MIT, so the licence question is answered).
-  *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md), and the model-card gate in
-  [Epic-08](../epics/epic-08-packaging-and-release.md).*
+* [ ] **`distilbert-ner-loom` is staged but not pushed.** `build_model_cards.py` produces it, the
+  model-card gate passes on it, and `upload_all.py --create` will make the repo — but until it is run
+  the Hub lists seventeen models and `model.text2class` is a door with no downloadable model behind
+  it, which loom-py's README documents a call against. One `--create` upload, then the Hub count in
+  that README and in [Epic-03 §2](../epics/epic-03-model-coverage.md) goes to eighteen.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
