@@ -30,6 +30,7 @@ topologies, driver and — where the architecture has one — its vocabulary.
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
+| **Audio codec (decode)** | DAC-44kHz | `audio_codec_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
 decomposition paths stay honest about producing the same model.
@@ -90,6 +91,32 @@ oracle* standing rule), over 138 tokens: max |Δ| 1.24e-05 (BERT) and 5.72e-06 (
 sentence cosine 0.99999988 for both, 138/138 argmax, and the engine's own WordPiece encode identical to
 HF's ids. The sabotage arm — the same graph against a different sentence's reference — reads 11.94 and
 9.54.
+
+### Family 11, and the bug that had no symptom
+
+Family 11 — neural audio codec decoders, `audio_codes` in and a waveform out — is family 10's
+connector: an AR codec-token LM (~20 models whose LM half already exports) emits integers and is
+silent without it. DAC is the first leaf.
+
+Like family 12 it needed **no new engine primitive** — the whole decode path lowers to ops the
+dialect already had, because the HiFi-GAN/iSTFT half was exported inside families 7/8/9 and Snake
+decomposes into Kokoro's SnakeBeta ops. And like family 12, the real work was tracing rather than
+architecture. Two findings worth carrying to the next codec:
+
+* **The RVQ loop is a graph fact and unrolls**, correctly: `from_codes` is a Python loop over N
+  codebook lookups, and N is a property of the checkpoint, not of the input. No hparam the driver
+  reads, no Lua loop.
+* **The dynamic axis broke on a rank-reducing slice.** `audio_codes[:, i, :]` drops the codebook axis,
+  and the exporter's shape walk bailed on any squeezing slice — so the length came back as a literal
+  `1`, and every transposed convolution downstream was cropped to `(1-1)*stride + kernel - pad`.
+  **Nothing raised.** The export succeeded, the audio was correct, and the model returned one frame's
+  worth of samples for every input. It is the sharpest instance yet of the standing lesson: an export
+  that runs is not an export that works, and the only thing that catches this class is asserting on
+  the emitted shapes rather than on the call.
+
+Verified against `transformers` on the waveform, on real speech at two clip lengths: max |Δ| 1.85e-04
+(2 s) and 2.22e-04 (5 s), cosine ~1.0. Sabotage arm — the same graph against a different clip's
+reference — 1.14.
 
 ### Text input
 

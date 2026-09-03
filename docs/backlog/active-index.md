@@ -19,7 +19,8 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — codec decoders** | unlocks family 10's back half (~20 models) and is ~11 models itself, so it pays twice → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — codec decoders** | DAC done and verified; SNAC next (multi-rate `vq_strides`, the second member that tests the contract) → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 10 — AR LM + codec TTS** | the composition DAC unlocks; `text-to-codes` is reserved for it → [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md) |
 
 ---
 
