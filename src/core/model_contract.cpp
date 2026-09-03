@@ -59,6 +59,7 @@ ModelContract ModelContract::read(const GgufModel& model) {
     c.phoneme_alphabet = opt_str(model, "text.phoneme_alphabet");
     c.phonemizer_ruleset = opt_str(model, "phonemizer.ruleset");
     c.languages = opt_arr_str(model, "loom.text.languages");
+    c.labels = opt_arr_str(model, "loom.labels");
     c.entry_points = opt_arr_str(model, "loom.entry_points");
 
     c.default_steps = opt_u32(model, "tts.default_steps");
