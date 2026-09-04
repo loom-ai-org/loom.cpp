@@ -49,8 +49,8 @@ are not renumbered. New items continue the scheme.
     binding change is written and compiles against the new headers; the bump waits on loom.cpp being
     merged. Until then `test_model_cards.py`'s new `text2codes` arm — which chains the card through
     `dac-44khz` and transcribes the result — has never executed against the shipped file.
-  * [ ] **The Hub upload.** `hf-models/dia-1.6b/` is built: a 1.8 GB `Q8_0` GGUF (`--quantize Q8_0`,
-    253 of 344 tensors, 99% of the float weight bytes) and its card. Not pushed.
+  * [ ] **The Hub upload.** `hf-models/dia-1.6b/` is built — a 6.4 GB F32 GGUF and its card, F32 like
+    every other entry after the Q8_0 version was tried and reverted for consistency. Not pushed.
 
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
@@ -215,7 +215,8 @@ are not renumbered. New items continue the scheme.
   behind them (loom-py's README documents calls against both). Two `--create` uploads, then the Hub
   count in that README and in [Epic-03 §2](../epics/epic-03-model-coverage.md) goes to nineteen.
   **`dia-1.6b-loom`'s card loads `dac-44khz-loom` too**, so the pair has to be published together or
-  its snippet is a broken link.
+  its snippet is a broken link. At 6.4 GB it is also by far the largest thing in the collection —
+  see [Epic-03 §2](../epics/epic-03-model-coverage.md) for why it is not quantized.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
