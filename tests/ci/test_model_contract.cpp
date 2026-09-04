@@ -61,6 +61,31 @@ int main() {
         LOOM_CHECK(!t.legacy_spelling);
     }
 
+    // ---- Codec tokens are their own modality, and the fold is asymmetric on purpose --------------
+    //
+    // ADR-020. This block and the `speech2text` check above are the two halves of one claim: an id
+    // modality folds onto "text" when text is what it encodes (`token_ids`, `phoneme_ids`) and does
+    // NOT when it encodes audio (`audio_codes`). Making the fold uniform in either direction breaks
+    // one of these two, which is the whole reason both are here.
+    {
+        const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/contract_codec.gguf";
+        auto model = loom::GgufModel::load(path, backend.get());
+        LOOM_CHECK(model != nullptr);
+
+        const loom::ModelContract c = loom::ModelContract::read(*model);
+        LOOM_CHECK(c.declared());
+        LOOM_CHECK(c.task == loom::task_names::AUDIO_CODEC);
+        LOOM_CHECK(c.input_kind == loom::modality::AUDIO_CODES);
+        LOOM_CHECK(c.output_kind == loom::modality::AUDIO);
+        // NOT "text2speech", which is what `token_ids` here would have produced -- and which would
+        // have had every host offer a text door on a model with no vocabulary.
+        LOOM_CHECK(c.interface_name() == "codes2speech");
+        LOOM_CHECK(c.sample_rate == 44100);
+        // The three numbers a caller cannot build the input without.
+        LOOM_CHECK(model->hparam_u32("codec.n_codebooks") == 9);
+        LOOM_CHECK(model->hparam_u32("codec.codebook_size") == 1024);
+    }
+
     // ---- A file exported before any of it existed -------------------------------------------------
     {
         const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/contract_legacy.gguf";

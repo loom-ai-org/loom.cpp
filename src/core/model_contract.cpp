@@ -38,6 +38,12 @@ std::string interface_side(const std::string& kind) {
     if (kind == modality::TEXT || kind == modality::TOKEN_IDS || kind == modality::PHONEME_IDS) {
         return "text";
     }
+    // Deliberately NOT folded in with the two above, and the asymmetry is the decision rather than an
+    // oversight (ADR-020): `token_ids`/`phoneme_ids` are how you supply TEXT to a model that cannot
+    // encode it, so folding them keeps one door from being named twice. Codec tokens are how you
+    // supply AUDIO, there is no string they came from, and folding them would make every codec
+    // decoder declare itself a text-to-speech model.
+    if (kind == modality::AUDIO_CODES) return "codes";
     return kind; // image, class, embeddings, and whatever a newer exporter declares
 }
 
@@ -59,6 +65,7 @@ ModelContract ModelContract::read(const GgufModel& model) {
     c.phoneme_alphabet = opt_str(model, "text.phoneme_alphabet");
     c.phonemizer_ruleset = opt_str(model, "phonemizer.ruleset");
     c.languages = opt_arr_str(model, "loom.text.languages");
+    c.labels = opt_arr_str(model, "loom.labels");
     c.entry_points = opt_arr_str(model, "loom.entry_points");
 
     c.default_steps = opt_u32(model, "tts.default_steps");

@@ -208,6 +208,80 @@ def write_dynamic_asr(path: Path) -> None:
     _finish(w)
 
 
+# A token classifier, for `loom::text::classify`. One class per ROW of the model's output, which is
+# what `token_labels_epilogue` returns from `loom.argmax_rows` in a real export -- spelled here as a
+# table so the fixture needs no graph.
+#
+# It labels by POSITION rather than by token value (row i gets class i % 3), which is what makes the
+# framing-token strip observable: a driver returning a constant would look identical whether the [CLS]
+# and [SEP] rows were dropped or not.
+CLASSIFY_DRIVER = """
+function infer(inputs)
+    local out = {}
+    for i = 1, #inputs.tokens do
+        out[i] = (i - 1) % 3
+    end
+    return out
+end
+"""
+
+# A driver that returns one class for the whole sentence rather than one per token. Not a degenerate
+# case of the contract above -- a pooled sequence classifier is a different task -- and the fixture
+# exists so the length check is tested against something real rather than by inspection.
+POOLED_DRIVER = """
+function infer(inputs)
+    return {2}
+end
+"""
+
+
+def write_classifier(path: Path) -> None:
+    w = _base(path, "token_classifier_test")
+    w.add_string("loom.task", "token-classification")
+    w.add_string("loom.input.kind", "text")
+    w.add_string("loom.output.kind", "class")
+    # Id-indexed, which is the whole convention: the driver returns 0/1/2 and these are their names.
+    # Three names for a head the fixture pretends has four classes, so the "an id past the table keeps
+    # its number" branch has something to hit.
+    w.add_array("loom.labels", ["O", "B-PER", "I-PER"])
+    # The framing ids a WordPiece encode adds, under the generic KVs the vocabulary writer uses -- CLS
+    # reuses BOS, SEP has its own. `classify` strips on these DECLARED ids rather than on a spelling,
+    # so the fixture needs no vocabulary at all to exercise it.
+    w.add_bos_token_id(101)
+    w.add_sep_token_id(102)
+    w.add_string("model.driver_script", CLASSIFY_DRIVER)
+    _finish(w)
+
+
+def write_pooled_classifier(path: Path) -> None:
+    w = _base(path, "pooled_classifier_test")
+    w.add_string("loom.task", "token-classification")
+    w.add_string("loom.input.kind", "text")
+    w.add_string("loom.output.kind", "class")
+    w.add_string("model.driver_script", POOLED_DRIVER)
+    _finish(w)
+
+
+def write_codec(path: Path) -> None:
+    """A codec decoder: `audio_codes` in, `audio` out (ADR-020).
+
+    No driver and no graph -- what is under test is the modality FOLD, which is metadata all the way
+    down. It exists so `token_ids` -> "text" and `audio_codes` -> "codes" are pinned by two fixtures
+    that differ in one key, which is the only way the asymmetry survives someone tidying it.
+    """
+    w = _base(path, "codec_test")
+    w.add_string("loom.task", "audio-codec")
+    w.add_string("loom.input.kind", "audio_codes")
+    w.add_string("loom.output.kind", "audio")
+    w.add_uint32("loom.sample_rate", 44100)
+    # What a caller needs in order to build the input at all: the matrix is n_codebooks wide, and the
+    # ids in each column are bounded by the codebook size.
+    w.add_uint32("loom.codec.n_codebooks", 9)
+    w.add_uint32("loom.codec.codebook_size", 1024)
+    w.add_float32("loom.codec.frame_rate", 86.1328125)
+    _finish(w)
+
+
 def main() -> None:
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -216,6 +290,9 @@ def main() -> None:
     write_generate(out_dir / "generate_driver.gguf")
     write_timestamped_asr(out_dir / "timestamped_asr.gguf")
     write_dynamic_asr(out_dir / "dynamic_asr.gguf")
+    write_codec(out_dir / "contract_codec.gguf")
+    write_classifier(out_dir / "classify_driver.gguf")
+    write_pooled_classifier(out_dir / "pooled_classifier.gguf")
 
 
 if __name__ == "__main__":

@@ -74,6 +74,21 @@ GraphTopology GraphTopology::parse(const std::string& json_text) {
             topo.outputs = {topo.output};
         }
 
+        // Whether this module's KV cache is its own or the session's shared one. DECLARED, unlike
+        // `uses_kv_cache()`, and the two are not the same kind of question: whether a cache is
+        // reachable is visible in the graph, while whether two modules are two streams of one
+        // generation or two phases of one stream is not written anywhere a graph could show it.
+        // Absent means "shared", so every GGUF exported before this key keeps the behaviour it had.
+        if (j.contains("kv_cache_scope")) {
+            const auto scope = j.at("kv_cache_scope").get<std::string>();
+            if (scope == "private") {
+                topo.private_kv_cache = true;
+            } else if (scope != "shared") {
+                throw SchemaError("GraphTopology::parse: kv_cache_scope is '" + scope +
+                                   "'; it is 'shared' (the default) or 'private'");
+            }
+        }
+
         for (const Json& node_json : j.at("nodes")) {
             topo.items.push_back(parse_item(node_json));
         }

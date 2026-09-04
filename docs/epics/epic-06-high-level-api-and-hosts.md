@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-08-29
+last_updated: 2026-09-03
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -70,6 +70,14 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 `loom.sample_row(module, row, {temperature =, top_k =, top_p =})` now sits beside `loom.argmax_row`,
 reducing ON the tensor and drawing from the bridge's shared `rng_`.
 
+**It has since grown two more options**, both for family 10 and both in the same table rather than in
+new bindings: `lo`/`hi` restrict the draw to a half-open id window and return absolute ids, and
+`guidance = {module =, scale =, top_k =}` is classifier-free guidance over a second module's retained
+logits. [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md) argues both, including why this
+deliberately does not mirror the `argmax_row`/`argmax_row_range` split, and
+[Retro-031](../retros/retro-031-dias-guidance-is-not-the-standard-formula.md) is why "guidance" needed
+reading rather than assuming.
+
 #### The shape, and the two decisions inside it
 
 **Greedy is `temperature = 0`, not a separate flag**, and that is what makes the two bindings incapable
@@ -100,9 +108,11 @@ and LuaJIT's array part tops out near 2^27, so a 262144-wide vocab overflows at 
 that ceiling at exactly the vocabulary size that found it. The decode loop AROUND it is still driver
 Lua.
 
-Temperature + top-k + top-p covers the whole fixture set and exactly one model needs any of it
-(gemma-3-270m-it: `top_k 64, top_p 0.95`). Min-p, the repetition penalties, Mirostat and beam search are
-not implemented and nothing asks for them.
+Temperature + top-k + top-p covered the whole fixture set when this was written, and exactly one model
+needed any of it (gemma-3-270m-it: `top_k 64, top_p 0.95`). Family 10 added the second — Dia declares
+`do_sample` at 1.8/50/0.9 *and* a guidance scale, which is what the two extra options above are for.
+Min-p, the repetition penalties, Mirostat and beam search are still not implemented and nothing asks
+for them.
 
 #### Gates
 

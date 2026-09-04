@@ -110,8 +110,23 @@ on *both* sides would need two, and none exists yet.
 ```
 loom.task                    str    canonical name from tasks.py
 loom.entry_points            str[]  Lua functions the driver defines ("infer", ...)
-loom.input.kind              str    "text" | "token_ids" | "phoneme_ids" | "audio" | "image"
+loom.input.kind              str    "text" | "token_ids" | "phoneme_ids" | "audio_codes" | "audio" | "image"
 loom.output.kind             str    "text" | "token_ids" | "audio" | "class" | "embeddings"
+```
+
+`audio_codes` does NOT fold onto `text` the way `token_ids` and `phoneme_ids` do, and the asymmetry is
+argued in [ADR-020](adrs/adr-020-audio-codes-is-its-own-modality.md): those two fold because text is
+what they encode, and a codec token encodes audio with no string behind it. A codec decoder that
+declared `token_ids` would resolve to `text2speech` and be handed a sentence.
+
+Per-family tables that follow the same rule — a number only the checkpoint knows, that a host needs
+before it can call the model at all:
+
+```
+loom.labels                  str[]  id-indexed class names, for a `class` output
+loom.codec.n_codebooks       u32    code streams per frame; the width of the matrix a caller passes
+loom.codec.codebook_size     u32    the valid id range per stream
+loom.codec.frame_rate        f32    codes per second, so a caller can size a clip
 ```
 
 ASR decode table — what turns `transcribe` from Whisper-flavoured into per-task:
@@ -157,7 +172,16 @@ loom::text::generate(bridge, model, prompt_ids, opts) -> ids        NEW — one 
 loom::audio::transcribe(bridge, model, waveform, opts) -> Transcription   EXISTS (#5)
 loom::speech::synthesize(bridge, model, ids, opts) -> Waveform      NEW — thin: pad the text axis,
                                                                     apply declared sampler/voice defaults
+loom::text::classify(bridge, model, tokens, opts) -> [TokenLabel]   P5 — one class per token
 ```
+
+`loom::text::classify` is the case where the "it was written twice and drifted" argument does NOT
+apply, and it is here anyway. There is no loop to unify — one driver call, no iteration — but there is
+a POLICY: a WordPiece encode wraps every sentence in the checkpoint's framing tokens, the model labels
+those rows like any other, and whether they come back is a decision. That is the half of the drift
+argument that is about judgement rather than about loops, and two hosts making it independently is
+exactly how the CLI and loom-py ended up with two transcripts one task over. Made once, on the ids the
+file declares, so a family whose framing tokens are not `[CLS]`/`[SEP]` needs no change here.
 
 `loom::text::generate` is the smallest and most overdue: it is the loop that exists twice and disagrees
 with itself. It absorbs both driver shapes (returns-a-sequence vs returns-one-token, told apart by the
@@ -199,7 +223,16 @@ model.generate(prompt, *, max_new_tokens=64, ...) -> str
 model.transcribe(audio, *, language=None, task=None, timestamps=False) -> Transcription
 model.synthesize(text=None, *, phonemes=None, tokens=None,
                  voice=None, steps=None, seed=None, language=None) -> Audio
+model.classify(tokens, *, strip_special=True) -> Classification    # P5, family 12
 ```
+
+The fourth door arrived without needing this document, which is what §5's two symmetry rules were for.
+It introduced no new *role*: `Text2Class.infer` takes `text=` or `tokens=`, the same ladder
+`synthesize` offers, and returns a result object carrying the labelled pieces beside the label set they
+came from — because a WordPiece encode splits words, so joining them back is a rule the caller makes.
+`strip_special` is the one knob, and it is a switch on a decision the ENGINE makes: whether the framing
+tokens an encode added come back labelled, decided on the ids the file declares rather than on their
+spelling.
 
 **One `Model` class with task-named methods, not task subclasses.** `from_pretrained` keeps one return
 type; a model that legitimately sits under two tasks is not forced into a false hierarchy; and calling
