@@ -19,9 +19,12 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **`fullstop-punc` (XLM-R) upload** | Family 12's SentencePiece checkpoint is exported and pushed in all three repos, but is not on the Hub — so the TOKENIZER half of that family is still the untested one → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. SNAC is the one that tests something — `vq_strides [4, 2, 1]` puts its codebooks at different frame rates. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 | **loom-py's README says "Seventeen"** | The org publishes twenty. A user-facing count that is three low, on `main` → below, Minor cleanups |
+
+*1.0.0-rc8 shipped families 10, 11 and 12 (PyPI ×4, and the org now lists twenty models), and family
+12's third checkpoint landed after it. There is no release chore open.*
 
 ---
 
@@ -32,10 +35,21 @@ are not renumbered. New items continue the scheme.
   needs its own read before scoping. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
-* [ ] **P5 breadth**, in coverage-per-effort order. Family 12 is DONE (2026-09-03) — the remainder:
-  11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
-  classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
-  for what family 12 cost, which is the estimate the rest of this list should be read against.*
+* [ ] **P5 breadth**, in coverage-per-effort order. Families 10, 11 and 12 are DONE — the remainder:
+  11's second leaf (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text
+  enc-dec) → 13 (small classifiers) → 14 (music). *Context:
+  [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
+  [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
+  cost across three checkpoints, which is the estimate the rest of this list should be read against.
+  Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id handling for free.*
+* [ ] **A SentencePiece checkpoint for family 12's zoo slot — WHICH ONE IS OPEN.** The engine work is
+  done and merged; what is undecided is the checkpoint. `fullstop-punc` is exported, oracled, swept and
+  carded, but it is XLM-R **large**: 2.24 GB, of which 1.02 GB is a 250k-entry embedding matrix that
+  stays F32 while `GET_ROWS` is outside `PACKED_WEIGHT_FIRST_OPS`, to predict six punctuation classes.
+  `kredor/punctuate-all` is the same task, the same labels and the same architecture at half the size
+  (XLM-R base, 1.11 GB) with far more use, and its `tokenizer.json` is Unigram with scores already in
+  final fairseq id order — so it needs no protobuf and ADR-027's remapping is a no-op for it.
+  *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
   Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
@@ -46,10 +60,6 @@ are not renumbered. New items continue the scheme.
 * [ ] **SNAC** — the other family-11 candidate, and a different axis of difficulty from EnCodec:
   `vq_strides [4, 2, 1]` puts its codebooks at DIFFERENT frame rates, which is what tests whether
   "codes in, frame-major" survives a multi-rate codec. Needs the `snac` package (not in transformers).
-* [ ] **A family-12 checkpoint that is not WordPiece.** Two are verified — `dslim/bert-base-NER` and
-  `dslim/distilbert-NER`, structurally different encoders — and both are WordPiece with a CoNLL-03
-  head, so what is still untested is the TOKENIZER half rather than the graph half. `fullstop-punc` is
-  XLM-R (SentencePiece), which is the natural third and the one the roadmap actually names.
 * [ ] **P5.0 — per-phase process isolation for conversion.** Decides which models are exportable at all
   on a given machine. Change 1 done (30.4 → 22.9 GB peak on Granite-Speech). Two remain:
   * [ ] quantize/`astype` each phase's weights as it converts, rather than at write time
