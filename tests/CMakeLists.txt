@@ -1518,6 +1518,15 @@ set_tests_properties(test_e2e_dia_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- Family 10 and family 11 chained across two GGUFs: the pair is the point of family 10, and with
 #     two files (ADR-022) nothing inside either one asserts that they fit together. ---
+# --- `GgufModel::load_metadata`: the KV table without the weights, and the guard that keeps a
+#     data-less model from reaching a graph build. See ci/test_load_metadata.cpp. ---
+add_executable(test_load_metadata ci/test_load_metadata.cpp)
+target_link_libraries(test_load_metadata PRIVATE loom::engine)
+target_compile_definitions(test_load_metadata PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_load_metadata COMMAND test_load_metadata)
+set_tests_properties(test_load_metadata PROPERTIES LABELS ci)
+set_tests_properties(test_load_metadata PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)
 add_test(NAME test_e2e_dia_dac_composition COMMAND test_e2e_dia_dac_composition)
