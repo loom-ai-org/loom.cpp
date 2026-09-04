@@ -60,6 +60,20 @@ struct GraphTopology {
     std::vector<std::string> outputs;
     std::vector<TopologyItem> items;
 
+    // Whether this module wants a KV cache OF ITS OWN rather than the session's shared one, from the
+    // topology's optional `"kv_cache_scope": "private"`. Default false, so every file exported before
+    // the key keeps the single shared cache it has always had.
+    //
+    // **Declared rather than derived, and that is the opposite of `uses_kv_cache()` on purpose.** The
+    // graph is the only authority on whether a cache is REACHABLE, so declaring that could only agree
+    // or be wrong. Which cache is a different question and nothing in a graph answers it: two modules
+    // running the same topology are two streams of one generation when a driver runs them side by
+    // side, and two phases of one stream when it runs them in sequence, and only the driver knows
+    // which. Family 10 is the first model to need the first reading -- classifier-free guidance runs
+    // the decoder twice per step over two independent histories -- and getting it wrong is silent,
+    // because two streams sharing a cache read each other's cells and produce plausible tokens.
+    bool private_kv_cache = false;
+
     // Throws loom::SchemaError on malformed JSON, an unsupported "version", or a structurally invalid
     // node/repeat_for block.
     static GraphTopology parse(const std::string& json_text);

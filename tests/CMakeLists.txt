@@ -1486,6 +1486,22 @@ add_test(NAME test_e2e_granite_speech_mil_export COMMAND test_e2e_granite_speech
 set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES SKIP_RETURN_CODE 77)
 
+# --- `kv_cache_scope: "private"`: two decode streams of one model, and the shared-cache arm that
+#     proves the check can fail. See ci/test_private_kv_cache.cpp. ---
+add_test(NAME gen_cfg_streams_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_cfg_streams_gguf.py
+            ${LOOM_FIXTURE_DIR}/cfg_streams.gguf
+)
+set_tests_properties(gen_cfg_streams_gguf_fixture PROPERTIES FIXTURES_SETUP cfg_streams_gguf_fixture)
+set_tests_properties(gen_cfg_streams_gguf_fixture PROPERTIES LABELS ci)
+
+add_executable(test_private_kv_cache ci/test_private_kv_cache.cpp)
+target_link_libraries(test_private_kv_cache PRIVATE loom::engine)
+target_compile_definitions(test_private_kv_cache PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_private_kv_cache COMMAND test_private_kv_cache)
+set_tests_properties(test_private_kv_cache PROPERTIES LABELS ci)
+set_tests_properties(test_private_kv_cache PROPERTIES FIXTURES_REQUIRED cfg_streams_gguf_fixture)
+
 # --- The gate suite's own gate: how `fixture_env` decides whether a real-model test can run at all.
 #     A ci test about gate tests, deliberately -- a wrong answer there makes 78 checks vanish into
 #     Skipped without anything going red. See ci/test_fixture_resolution.cpp. ---
@@ -1499,3 +1515,11 @@ target_link_libraries(test_e2e_dia_mil_export PRIVATE loom::engine)
 add_test(NAME test_e2e_dia_mil_export COMMAND test_e2e_dia_mil_export)
 set_tests_properties(test_e2e_dia_mil_export PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_dia_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Family 10 and family 11 chained across two GGUFs: the pair is the point of family 10, and with
+#     two files (ADR-022) nothing inside either one asserts that they fit together. ---
+add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
+target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)
+add_test(NAME test_e2e_dia_dac_composition COMMAND test_e2e_dia_dac_composition)
+set_tests_properties(test_e2e_dia_dac_composition PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_dia_dac_composition PROPERTIES SKIP_RETURN_CODE 77)
