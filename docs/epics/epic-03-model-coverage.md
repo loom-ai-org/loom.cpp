@@ -233,16 +233,22 @@ the model, not the export, and establishing it took two deterministic bisections
 [Retro-006](../retros/retro-006-kokoro-shipped-noise.md)'s converse and the rule for grading any
 sampling family. The model card has to name a seed.
 
-**It is also the first quantized entry in the catalogue.** At F32 the export is 6.4 GB, which is not a
-thing to publish for a 1.6 B checkpoint; `--quantize Q8_0` packs 253 of its 344 tensors — 99% of the
-float weight bytes — and brings it to 1.8 GB, and the ASR oracle passes on that file at the card's own
-sentence and seed. Nothing else in the catalogue is quantized, deliberately: those artifacts are
-references as much as downloads, the sweep compares them byte-for-byte, and at 300 MB a lossy step buys
-nothing. The eligible weights are derived from the topologies rather than from tensor names, which is
-also what made it work here at all — a multi-phase export declares five of them, and the standalone
-`tools/quantize/quantize_gguf_q8_0.py` read only `model.graph_topology`, so it silently quantized
-nothing on every multi-phase family until this landed. The two paths now agree byte-for-byte on Dia,
-which is the cross-check that they implement one rule.
+**It publishes at F32, like every other model in the catalogue, and that was decided twice.** At 6.4 GB
+it is by far the largest artifact here, and `--quantize Q8_0` packs 253 of its 344 tensors — 99% of the
+float weight bytes — down to 1.8 GB, verified working: the ASR oracle passes on the quantized file at
+the card's own sentence and seed. It shipped that way briefly and was reverted, because **consistency
+across the collection is worth more than one model's download size**. These artifacts are reference
+exports as much as downloads; the sweep snapshots them byte-for-byte, and one lossy member among
+seventeen faithful ones is a difference the sweep is not comparing and nothing in the file announces.
+The card names the `--quantize` invocation instead, which puts the trade-off where it belongs — with
+whoever is short of disk.
+
+**The quantizer bug that surfaced underneath it stands regardless.** The eligible weights are derived
+from the topologies rather than from tensor names — and the standalone
+`tools/quantize/quantize_gguf_q8_0.py` read only `model.graph_topology`, singular, so it silently
+quantized *nothing* on every multi-phase family (Whisper's three topologies, Dia's five) while printing
+a success line. It unions them now, and the two paths agree byte-for-byte on Dia, which is the
+cross-check that they implement one rule.
 
 See [the backlog](../backlog/active-index.md#models) for what is left.
 
