@@ -31,6 +31,24 @@ public:
     ggml_tensor* weight(const std::string& name) const;
     bool has_weight(const std::string& name) const;
 
+    // **The same file, KV TABLE ONLY: no backend, no weights, no read of the tensor data.**
+    //
+    // `load` above allocates a backend buffer for every tensor and streams the file into it, which for
+    // a 6.4 GB model is 6.4 GB and several seconds. A caller that only wants to know *what a file is* --
+    // its task, its modality pair, its declared hparams -- pays all of that for a handful of strings
+    // sitting in the header, ahead of the tensor data it never touches. That is not a hypothetical
+    // caller: it is every host deciding whether a GGUF is the one it wants before committing to it,
+    // and it is what the declared contract (ADR-013) exists to be asked.
+    //
+    // Everything metadata-shaped works on the result -- `kv_*`, `hparam_*`, `topology_json`,
+    // `ModelContract::read`. **`weight()` and `has_weight()` throw**, naming this loader, because a
+    // half-loaded model whose tensors have null data is a segfault waiting for the first caller who
+    // forgets. That is the whole of what makes this safe to hand out.
+    static std::unique_ptr<GgufModel> load_metadata(const std::string& path);
+
+    // Whether this model carries its weights, i.e. came from `load` rather than `load_metadata`.
+    bool has_weights() const { return weights_buf_ != nullptr; }
+
     // Read-only view of every loaded weight, for seeding a per-call SymbolTable in GraphBuilder.
     const SymbolTable& weights() const { return symbols_; }
 
