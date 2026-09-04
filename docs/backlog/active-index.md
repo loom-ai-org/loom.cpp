@@ -20,7 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 10 — AR LM + codec TTS** | Dia exports and drives end to end; what is left is the sampler, the DAC composition and the card → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 10 — AR LM + codec TTS** | Gated end to end and the ASR oracle passes; the card and the loom-py bump are what is left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
 ---
 
@@ -35,36 +35,22 @@ are not renumbered. New items continue the scheme.
   11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
   classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
   for what family 12 cost, which is the estimate the rest of this list should be read against.*
-* [ ] **P5 family 10 — Dia-1.6B: exported and driving; three things left.** The export is done and
-  registered (`dia_export.py`, task `text-to-codes`, three phases + a driver), it produces a 6.1 GB F32
-  GGUF whose contract resolves to `text2codes`, and the driver runs the whole loop — byte encoder,
-  hoisted cross-attention K/V, a nine-channel KV-cached decode with the delay scaffold, and the
-  realignment back to audio frames. `tests/ci/test_dia_export.py` (14 cases) and
-  `tests/gate/test_e2e_dia_mil_export.cpp` cover it. Two decisions from it are written down:
-  [ADR-021](../adrs/adr-021-dias-decoder-resolves-two-dynamic-axes.md) (the decoder resolves two
-  dynamic axes, so there is no padded text axis) and
-  [Retro-030](../retros/retro-030-a-guard-that-could-not-fire.md) (the `rotate_half` fix, and why the
-  one recorded before it could not work). What remains:
-  * [ ] **Sampling and classifier-free guidance — the one item with ENGINE work in it.** The driver is
-    GREEDY and runs CFG-free, which is a real quality decision and not a detail: this checkpoint
-    declares `temperature 1.8, top_k 50, top_p 0.9, do_sample true` and `guidance_scale 3.0`. Two
-    bindings are missing, and neither is obvious from the driver side: `loom.sample_row` samples the
-    WHOLE row where Dia needs it restricted per channel (`argmax_row_range` has the restricted form;
-    the sampler does not), and CFG combines LOGITS in the retained buffer, which nothing composes
-    today. Both are per-*task* reductions, so they belong in the engine by
-    [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) — but "family 10 needed no
-    engine C++" stops being true of its sampler. `scripts/dia_reference_codes.py` must learn the same
-    algorithm on the same commit. **Nothing has been listened to yet** — grade it with the ASR oracle,
-    not correlation ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)).
-  * [ ] **The composition with DAC.** Decide deliberately whether Dia ships as one GGUF with DAC merged
-    (~6.6 GB, loom's "the model is one file" property) or two files chained by the host. Either way the
-    end-to-end check is the point of the whole exercise: text → Dia → 9 delayed code streams → realign
-    → DAC → waveform, against `transformers` running the identical pipeline. `codec.n_codebooks` is
-    written on both sides under the same key so a host can match them.
-  * [ ] **Quantize, catalogue, card.** 6.1 GB F32 is the unquantized export; a row in the export sweep,
-    an entry in `build_model_cards.py`, and an arm in loom-py's model-card gate that asks the *is it
-    right* question for this family. loom-py also has no `Text2Codes` door yet — the interface resolves,
-    but nothing implements it.
+* [ ] **P5 family 10 — Dia-1.6B: one thing left.** The export, the driver, the sampler, the
+  classifier-free guidance and the composition with DAC are all done and gated. It ships as TWO files
+  chained by the host ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)), its sampler
+  cost the engine two additions
+  ([ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md),
+  [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)), and Dia's guidance turned out not to
+  be the standard formula
+  ([Retro-031](../retros/retro-031-dias-guidance-is-not-the-standard-formula.md)). What remains:
+  * [ ] **loom-py needs the submodule bump and a rebuild, then its card gate can run.**
+    `src/binding.cpp` now calls `loom::register_topologies`, without which a guided generation through
+    the Python door runs both decode streams into one KV cache and returns plausible, wrong codes. The
+    binding change is written and compiles against the new headers; the bump waits on loom.cpp being
+    merged. Until then `test_model_cards.py`'s new `text2codes` arm — which chains the card through
+    `dac-44khz` and transcribes the result — has never executed against the shipped file.
+  * [ ] **The Hub upload.** `hf-models/dia-1.6b/` is built: a 1.8 GB `Q8_0` GGUF (`--quantize Q8_0`,
+    253 of 344 tensors, 99% of the float weight bytes) and its card. Not pushed.
 
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
@@ -223,11 +209,13 @@ are not renumbered. New items continue the scheme.
 
 ## Packaging & release
 
-* [ ] **`distilbert-ner-loom` is staged but not pushed.** `build_model_cards.py` produces it, the
-  model-card gate passes on it, and `upload_all.py --create` will make the repo — but until it is run
-  the Hub lists seventeen models and `model.text2class` is a door with no downloadable model behind
-  it, which loom-py's README documents a call against. One `--create` upload, then the Hub count in
-  that README and in [Epic-03 §2](../epics/epic-03-model-coverage.md) goes to eighteen.
+* [ ] **`distilbert-ner-loom` and `dia-1.6b-loom` are staged but not pushed.**
+  `build_model_cards.py` produces both — but until `upload_all.py --create` is run the Hub lists
+  seventeen models, and `model.text2class` and `model.text2codes` are doors with no downloadable model
+  behind them (loom-py's README documents calls against both). Two `--create` uploads, then the Hub
+  count in that README and in [Epic-03 §2](../epics/epic-03-model-coverage.md) goes to nineteen.
+  **`dia-1.6b-loom`'s card loads `dac-44khz-loom` too**, so the pair has to be published together or
+  its snippet is a broken link.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.

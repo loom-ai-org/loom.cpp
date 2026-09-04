@@ -148,6 +148,15 @@ dragged in this codec; Dia decodes through DAC, which is done, so it costs the L
 
 ### Family 10, and the axis that did not have to be padded
 
+**It ships as two files, not one** — the LM and the codec, chained by the host, with a frame-major
+array of integers between them. One codec serves ~20 autoregressive LMs and the codes are worth
+having on their own, so merging would ship the same 217 MB inside every model and make the useful
+intermediate unreachable.
+[ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md) has the decision; what it costs is a
+test of the JOIN, which neither file's own suite covers —
+`tests/gate/test_e2e_dia_dac_composition.cpp` drives both real GGUFs and compares codes and waveform
+against `transformers` running the identical pipeline, at two clip lengths.
+
 Family 10 — an AR LM that emits **codec tokens** rather than text — is the other half of family 11,
 and the pair is the whole point: text → Dia → nine delayed code streams → realign → DAC → waveform.
 Dia is the leaf because its own `audio_tokenizer_config.json` names `descript/dac_44khz`, the codec
@@ -169,10 +178,11 @@ unchanged. **Three things do not, and each is the reason for code that has no Wh
   to one token; this one emits nine per step. The wrapper slices `hidden[:, -1:, :]` before the head,
   so the graph's output is `[vocab, 9]` on a prefill and on a decode step alike — which is exactly the
   `[n_classes, n_rows]` tensor `loom.argmax_rows` was built for in P4.0.17 and family 12 reused. The
-  driver takes it a step further and uses `loom.argmax_row_range` per channel, because
+  driver takes it a step further and restricts the draw per channel, because
   `DiaEOSChannelFilterLogitsProcessor` bans the control ids per channel rather than globally — the same
-  restricted argmax `whisper_driver` detects a language with. **Three families running, and none has
-  needed engine C++ for its graph**, which is the acceptance criterion the roadmap states.
+  restricted reduction `whisper_driver` detects a language with. **Three families running, and none has
+  needed engine C++ for its graph**, which is the acceptance criterion the roadmap states — though its
+  *sampler* did, and §"What its sampler cost" below is that bill.
 * **The delay pattern lives in the driver**, by [ADR-020](../adrs/adr-020-audio-codes-is-its-own-modality.md)'s
   reasoning and [ADR-013](../adrs/adr-013-one-door-per-task.md) §2's: it is declared in `config.json`,
   so it is read rather than derived, and undoing it is index arithmetic over a nine-element array. The
@@ -186,12 +196,55 @@ ones included, so a guard testing `isinstance(dim, int)` detects tracing rather 
 `rotate_half` is fixed with `torch.chunk`, which asks for a count instead of an index and therefore
 needs no arithmetic over the axis at all.
 
-**Not yet graded on what it sounds like.** The driver is greedy and runs without classifier-free
-guidance, while the checkpoint declares `temperature 1.8 / top_k 50 / top_p 0.9` and
-`guidance_scale 3.0`. Correctness against `transformers` under the *same* algorithm is what the gate
-asserts; whether the audio is intelligible is a separate question and
-[Retro-006](../retros/retro-006-kokoro-shipped-noise.md) is the standing warning about answering it
-with a correlation. See [the backlog](../backlog/active-index.md#models) for what is left.
+#### What its sampler cost
+
+The graph needed no engine C++. **The sampler did**, and that is the honest form of the acceptance
+criterion: the checkpoint declares `do_sample: true` at `temperature 1.8 / top_k 50 / top_p 0.9` with
+`guidance_scale 3.0`, so a greedy, guidance-free export is a file whose default output is not the
+model anyone published. Two things were added, both per-*task* rather than per-model by
+[ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md):
+
+* **`loom.sample_row` gained `lo`/`hi` and `guidance`** — a restricted draw, and classifier-free
+  guidance over two modules' retained logits — as entries in its options table rather than as new
+  bindings. [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md) says why that differs from
+  the `argmax_row`/`argmax_row_range` pair, and why the greedy-equals-argmax invariant came out of it
+  stronger.
+* **A topology can declare `kv_cache_scope: "private"`** and `ExportPhase.extra_streams` emits it.
+  Guidance runs the decoder twice per step over two histories, and this engine's cache is
+  single-sequence, so the second run is a second module rather than a second batch row.
+  [ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md).
+
+**Dia's guidance is not the standard formula**, in two ways, and neither is visible from the name of
+the technique — [Retro-031](../retros/retro-031-dias-guidance-is-not-the-standard-formula.md) is the
+finding and the rule it produced. The engine implements the general form; the model's centring is one
+`+ 1` in its own driver.
+
+**What the gate can and cannot compare.** Exact integer equality needs a deterministic algorithm, so
+the oracles are greedy — but *guidance* is deterministic too, so there are two of them: greedy with
+guidance off (32 frames) and greedy with guidance on at the checkpoint's own 3.0. The second is what
+grades the two streams, the shortlist and the channel filter. Sampling itself has no exact oracle in
+either direction and is not claimed to reproduce `transformers`' draw.
+
+**And it has been listened to.** Under the checkpoint's own sampling and guidance, a 3.02 s utterance
+transcribes back at 9/9 words through `whisper-small` — but only at some seeds: at four tried, one was
+perfect, one was laughter and two were near-silence, and `transformers` behaves the same way. That is
+the model, not the export, and establishing it took two deterministic bisections rather than a guess —
+[Retro-032](../retros/retro-032-one-seed-is-not-an-asr-oracle.md), which is
+[Retro-006](../retros/retro-006-kokoro-shipped-noise.md)'s converse and the rule for grading any
+sampling family. The model card has to name a seed.
+
+**It is also the first quantized entry in the catalogue.** At F32 the export is 6.4 GB, which is not a
+thing to publish for a 1.6 B checkpoint; `--quantize Q8_0` packs 253 of its 344 tensors — 99% of the
+float weight bytes — and brings it to 1.8 GB, and the ASR oracle passes on that file at the card's own
+sentence and seed. Nothing else in the catalogue is quantized, deliberately: those artifacts are
+references as much as downloads, the sweep compares them byte-for-byte, and at 300 MB a lossy step buys
+nothing. The eligible weights are derived from the topologies rather than from tensor names, which is
+also what made it work here at all — a multi-phase export declares five of them, and the standalone
+`tools/quantize/quantize_gguf_q8_0.py` read only `model.graph_topology`, so it silently quantized
+nothing on every multi-phase family until this landed. The two paths now agree byte-for-byte on Dia,
+which is the cross-check that they implement one rule.
+
+See [the backlog](../backlog/active-index.md#models) for what is left.
 
 ### Text input
 

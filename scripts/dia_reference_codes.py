@@ -10,10 +10,25 @@ It prints the expected frame count and the codes as a C array, ready to paste in
 `kExpectedCodes`. It writes nothing into the repo -- the numbers live in the test source, which is
 where a reader can see what is being asserted.
 
-**Greedy, with classifier-free guidance OFF, and both of those are load-bearing.** The driver under
-test decodes that way today, and an oracle produced by a different algorithm grades the sampler rather
-than the export. When the driver learns to sample and to run CFG, this script has to learn the same
-thing on the same commit, or the gate silently starts measuring the difference between two samplers.
+**Greedy, and `--guidance` chooses whether classifier-free guidance is on.** Greedy is not a
+simplification here, it is the only thing an exact-integer oracle can be: two samplers running the
+same algorithm from different RNGs agree on nothing, so a comparison under `do_sample` would grade
+neither the export nor the sampler. What CFG does to the logits, on the other hand, is entirely
+deterministic -- so `--guidance` gives a greedy oracle that exercises the whole guided path: two
+encoder passes, two decode streams, the `cond + g * (cond - uncond)` combination, and its shortlist.
+
+**But it only exercises it if `--top-k` is small, and that is not a tuning detail.**
+`DiaClassifierFreeGuidanceLogitsProcessor` uses the guided logits to pick a shortlist of
+`guidance_top_k` ids and then returns the CONDITIONAL logits masked to it -- the guided values are
+discarded. So under a greedy decode the answer is the conditional argmax whenever that id is inside
+the shortlist, which at this checkpoint's own `top_k = 50` it essentially always is: **measured, at
+`--guidance 3.0` with the default k, all 288 codes are byte-identical to the guidance-free run.** A
+gate built on that would pass with the unconditional stream removed entirely.
+
+`--top-k 1` makes the shortlist one id, so the answer IS the guided argmax and every code depends on
+both streams. That is a real configuration of this model's own processors, chosen because it is the
+one a deterministic oracle can see guidance through.
+
 `rotate_half` is deliberately left unpatched here: the reference must come from the unmodified model,
 or the export's own patch is grading itself.
 
@@ -40,6 +55,14 @@ def main() -> int:
     ap.add_argument("--text", default="[S1] Hello world.",
                     help="the sentence to capture; must match the test's kPromptIds")
     ap.add_argument("--frames", type=int, default=32, help="how many AUDIO frames to capture")
+    ap.add_argument("--guidance", type=float, default=None,
+                    help="classifier-free guidance scale, in the CHECKPOINT's own centring (Dia's "
+                         "generation_config says 3.0). Omit, or pass 1.0, for the guidance-free "
+                         "decode. The loom driver takes the same number under the same name.")
+    ap.add_argument("--top-k", type=int, default=None,
+                    help="`generation_config.top_k`, which under guidance is ALSO the shortlist size "
+                         "`DiaClassifierFreeGuidanceLogitsProcessor` selects with -- see the module "
+                         "docstring for why a greedy oracle needs a small one to see guidance at all.")
     args = ap.parse_args()
 
     processor = DiaProcessor.from_pretrained(args.model)
@@ -54,8 +77,13 @@ def main() -> int:
 
     encoded = processor(text=[args.text])
     with torch.no_grad():
+        # `guidance_scale=None` is how `DiaGenerationMixin` spells "do not install the CFG processor";
+        # a scale of 1.0 is the same thing said with a number, and its own check rejects <= 1. Both
+        # spellings reach the same code path, so this normalizes to the one the model accepts.
+        guidance = args.guidance if (args.guidance or 1.0) > 1.0 else None
+        extra = {} if args.top_k is None else {"top_k": args.top_k}
         out = model.generate(**encoded, do_sample=False, temperature=1.0,
-                             guidance_scale=None, max_new_tokens=max_new_tokens)
+                             guidance_scale=guidance, max_new_tokens=max_new_tokens, **extra)
 
     seq = out[0]
     # The delay revert, exactly as `DiaProcessor.batch_decode` does it before handing codes to DAC --
@@ -71,7 +99,8 @@ def main() -> int:
               f"on its own before the ceiling. Use this count in the test, not the one you asked for.",
               file=sys.stderr)
 
-    print(f"// {args.text!r}, greedy, CFG off, {len(frames)} frames x {n_channels} channels")
+    guidance_note = f"CFG {args.guidance}" if (args.guidance or 1.0) > 1.0 else "CFG off"
+    print(f"// {args.text!r}, greedy, {guidance_note}, {len(frames)} frames x {n_channels} channels")
     print(f"const std::vector<double> kPromptIds = {{"
           f"{', '.join(str(i) for i in encoded['input_ids'][0].tolist())}}};")
     print(f"constexpr int kExpectedFrames = {len(frames)};")

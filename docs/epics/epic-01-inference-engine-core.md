@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-08-22
+last_updated: 2026-09-03
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -68,18 +68,24 @@ These are deliberate boundaries, not defects. Each names what would have to chan
   P4.0.15** — writes are addressed by a cell-index tensor, and `KvCache::fill_cell_index` is the single
   place a second addressing policy would go. What is still missing is a *policy* that uses it: only the
   contiguous append `[n_past, n_past + n_tokens)` is ever written, reads are still a plain view over
-  `[0, n_kv)`, and there is one `kv_size` for every layer.
-- **Decoding is greedy, always.** `loom.argmax_row` is the only decode rule the bridge offers; there is
-  no temperature, top-k, top-p or multinomial draw in the engine. The RNG to build one on already
-  exists (`rng_`, `loom.seed_rng`, shared with `gaussian_array`/`uniform_array`), and the reduction
-  must stay on the tensor for the reason `argmax_row` itself exists. Scoped as **P4.24**,
-  [Epic-06 §4](epic-06-high-level-api-and-hosts.md).
+  `[0, n_kv)`, and there is one `kv_size` for every layer. **A model needing two independent sequences
+  gets two CACHES**, which is how family 10's classifier-free guidance runs (a topology declaring
+  `kv_cache_scope: "private"`, [ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md)) --
+  that is a workaround at the allocation level, not multi-sequence support, and it costs a full cache
+  per stream.
+- ~~**Decoding is greedy, always.**~~ **Closed by P4.24**, and extended for family 10:
+  `loom.sample_row` draws with temperature/top-k/top-p, `lo`/`hi` restrict it to an id window, and
+  `guidance` combines two modules' logits ([Epic-06 §4](epic-06-high-level-api-and-hosts.md),
+  [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)). What is still greedy-only is
+  `Generator::argmax` in `src/core/generation.cpp`, the legacy per-model driver path — see the entry
+  below, which is that one and not this.
 - **KV cache storage is always F32.** No quantized cache types (`Q8_0` etc.). Weight quantization is
   handled per-model by the MIL exporter's `quantize=` kwarg (LFM2, Qwen3) — KV-cache quantization is a
   separate, still-untouched runtime concern (different mechanism, different point in the inference
   pipeline; check how the KV cache is currently allocated/typed before assuming it's a trivial extension).
-- **Sampling is greedy argmax only** (`Generator::argmax` in `src/core/generation.cpp`). No temperature,
-  top-k, top-p, or repetition penalty.
+- **`Generator::argmax` is greedy argmax only** (`src/core/generation.cpp`). No temperature, top-k,
+  top-p, or repetition penalty. It is the legacy per-model driver path rather than the bridge's, so it
+  is a limitation of code that is on its way out rather than of the engine.
 - **Only one level of `repeat_for` nesting** is supported in the JSON graph schema
   (`include/loom/core/graph_topology.h`'s `RepeatBlock::nodes` is a flat `vector<TopologyNode>`, not
   recursive).
