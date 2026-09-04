@@ -19,7 +19,8 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 12 — BERT token classifiers** | smallest possible template, and the first non-audio task → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 10 — AR LM + codec TTS** | Gated end to end and the ASR oracle passes; the card and the loom-py bump are what is left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
 ---
 
@@ -30,9 +31,41 @@ are not renumbered. New items continue the scheme.
   needs its own read before scoping. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
-* [ ] **P5 breadth**, in coverage-per-effort order: family 12 (BERT token classifiers) → 11 (codec
-  decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
-  classifiers) → 14 (music).
+* [ ] **P5 breadth**, in coverage-per-effort order. Family 12 is DONE (2026-09-03) — the remainder:
+  11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
+  classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
+  for what family 12 cost, which is the estimate the rest of this list should be read against.*
+* [ ] **P5 family 10 — Dia-1.6B: one thing left.** The export, the driver, the sampler, the
+  classifier-free guidance and the composition with DAC are all done and gated. It ships as TWO files
+  chained by the host ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)), its sampler
+  cost the engine two additions
+  ([ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md),
+  [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)), and Dia's guidance turned out not to
+  be the standard formula
+  ([Retro-031](../retros/retro-031-dias-guidance-is-not-the-standard-formula.md)). What remains:
+  * [ ] **loom-py needs the submodule bump and a rebuild, then its card gate can run.**
+    `src/binding.cpp` now calls `loom::register_topologies`, without which a guided generation through
+    the Python door runs both decode streams into one KV cache and returns plausible, wrong codes. The
+    binding change is written and compiles against the new headers; the bump waits on loom.cpp being
+    merged. Until then `test_model_cards.py`'s new `text2codes` arm — which chains the card through
+    `dac-44khz` and transcribes the result — has never executed against the shipped file.
+  * [ ] **The Hub upload.** `hf-models/dia-1.6b/` is built: a 1.8 GB `Q8_0` GGUF (`--quantize Q8_0`,
+    253 of 344 tensors, 99% of the float weight bytes) and its card. Not pushed.
+
+* [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
+  leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
+  Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
+  constant, per stage. (2) Its decoder has a 2-layer LSTM over the time axis, so it needs the
+  `ScriptedLoop`/`run_recurrent` path rather than `Flattened`. Its `decode` signature and config
+  spellings are already written and tested in `CodecFamily`; the recognizer detects it and raises
+  naming both reasons. *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
+* [ ] **SNAC** — the other family-11 candidate, and a different axis of difficulty from EnCodec:
+  `vq_strides [4, 2, 1]` puts its codebooks at DIFFERENT frame rates, which is what tests whether
+  "codes in, frame-major" survives a multi-rate codec. Needs the `snac` package (not in transformers).
+* [ ] **A family-12 checkpoint that is not WordPiece.** Two are verified — `dslim/bert-base-NER` and
+  `dslim/distilbert-NER`, structurally different encoders — and both are WordPiece with a CoNLL-03
+  head, so what is still untested is the TOKENIZER half rather than the graph half. `fullstop-punc` is
+  XLM-R (SentencePiece), which is the natural third and the one the roadmap actually names.
 * [ ] **P5.0 — per-phase process isolation for conversion.** Decides which models are exportable at all
   on a given machine. Change 1 done (30.4 → 22.9 GB peak on Granite-Speech). Two remain:
   * [ ] quantize/`astype` each phase's weights as it converts, rather than at write time
@@ -176,6 +209,13 @@ are not renumbered. New items continue the scheme.
 
 ## Packaging & release
 
+* [ ] **`distilbert-ner-loom` and `dia-1.6b-loom` are staged but not pushed.**
+  `build_model_cards.py` produces both — but until `upload_all.py --create` is run the Hub lists
+  seventeen models, and `model.text2class` and `model.text2codes` are doors with no downloadable model
+  behind them (loom-py's README documents calls against both). Two `--create` uploads, then the Hub
+  count in that README and in [Epic-03 §2](../epics/epic-03-model-coverage.md) goes to nineteen.
+  **`dia-1.6b-loom`'s card loads `dac-44khz-loom` too**, so the pair has to be published together or
+  its snippet is a broken link.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.

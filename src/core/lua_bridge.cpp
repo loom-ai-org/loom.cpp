@@ -299,8 +299,8 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
 // a language is one decode step whose argmax must ignore every ordinary text token -- otherwise the
 // answer is whatever word the model would have emitted. Only the window is copied off the backend, so
 // asking about 99 ids does not read 51865 floats.
-int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname,
-                           int64_t lo = 0, int64_t hi = -1) {
+std::vector<float> read_row_window(ggml_tensor* out, int64_t requested_row, const char* fname,
+                                   int64_t lo, int64_t& hi) {
     if (out->type != GGML_TYPE_F32) {
         throw Error(std::string(fname) + ": output must be f32");
     }
@@ -317,25 +317,48 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
                      ") is not a non-empty sub-range of this output's " + std::to_string(n_vocab) +
                      " class(es)");
     }
-    const int64_t width = hi - lo;
-    std::vector<float> logits(static_cast<size_t>(width));
+    std::vector<float> logits(static_cast<size_t>(hi - lo));
     ggml_backend_tensor_get(out, logits.data(),
                              static_cast<size_t>(row) * out->nb[1] + static_cast<size_t>(lo) * sizeof(float),
                              logits.size() * sizeof(float));
-    int64_t best = 0;
-    for (int64_t i = 1; i < width; ++i) {
-        if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(best)]) best = i;
+    return logits;
+}
+
+// The maximum of an already-read window, as an offset into it. Split out from `argmax_tensor_row` so
+// that the sampler's greedy path can reduce the SAME array it would otherwise have drawn from --
+// under classifier-free guidance the logits being maximized are not the ones in any tensor, so
+// "greedy sampling is argmax" can no longer be preserved by delegating to a tensor reduction.
+int64_t argmax_of_window(const std::vector<float>& window) {
+    size_t best = 0;
+    for (size_t i = 1; i < window.size(); ++i) {
+        if (window[i] > window[best]) best = i;
     }
-    return lo + best;
+    return static_cast<int64_t>(best);
+}
+
+int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname,
+                           int64_t lo = 0, int64_t hi = -1) {
+    const std::vector<float> window = read_row_window(out, requested_row, fname, lo, hi);
+    return lo + argmax_of_window(window);
 }
 
 // One token DRAWN from a row of a 2D f32 tensor, instead of the maximum of it (P4.24).
 //
-// **`argmax_tensor_row` when the settings are greedy, literally**, and that is the invariant rather
-// than an optimization: `temperature <= 0` and `top_k == 1` both mean "the highest-scoring id", so
-// this returns the same function's answer rather than a second implementation's. Two ways to get a
-// token out of one forward pass that can disagree is the failure this project keeps removing, and
-// P4.0.14 already retired one of them.
+// **`argmax_tensor_row`'s own reduction when the settings are greedy**, and that is the invariant
+// rather than an optimization: `temperature <= 0` and `top_k == 1` both mean "the highest-scoring
+// id", so this runs `argmax_of_window` over the same window that function would have read. Two ways
+// to get a token out of one forward pass that can disagree is the failure this project keeps
+// removing, and P4.0.14 already retired one of them. It shares the reduction rather than calling the
+// tensor form because guidance produces logits that are in no tensor -- see below.
+//
+// **`lo`/`hi` restrict it to the half-open id window `[lo, hi)`, ids returned ABSOLUTE**, which is
+// `argmax_tensor_row`'s window with the same meaning and the same reason for returning absolute ids.
+// Family 10 is what asked for it: Dia's four highest ids are control tokens and
+// `DiaEOSChannelFilterLogitsProcessor` bans them PER CHANNEL rather than globally, so channel 8
+// sampling over the whole row can emit PAD or BOS -- which under an argmax it never did, because the
+// argmax already had the window. A sampler without one is not a smaller version of the same thing.
+//
+// **`uncond`/`guidance_scale` are classifier-free guidance**, off when `uncond` is null. See the body.
 //
 // The order is `transformers`' own processor order -- temperature, then top-k, then top-p, then a
 // multinomial draw -- because the reference this is defined against is `generate` under the
@@ -348,19 +371,11 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 // exactly the vocabulary size that found it.
 int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname, std::mt19937& rng,
                            std::uniform_real_distribution<float>& uniform, float temperature,
-                           int64_t top_k, float top_p) {
-    if (temperature <= 0.0f || top_k == 1) {
-        return argmax_tensor_row(out, requested_row, fname);
-    }
-    if (out->type != GGML_TYPE_F32) {
-        throw Error(std::string(fname) + ": output must be f32");
-    }
-    const int64_t n_vocab = out->ne[0];
-    const int64_t n_rows = out->ne[1];
-    const int64_t row = requested_row < 0 ? n_rows - 1 : requested_row;
-    if (n_vocab <= 0 || row < 0 || row >= n_rows) {
-        throw Error(std::string(fname) + ": row " + std::to_string(requested_row) + " out of range for an "
-                     "output with " + std::to_string(n_rows) + " row(s) of width " + std::to_string(n_vocab));
+                           int64_t top_k, float top_p, int64_t lo, int64_t hi,
+                           ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k) {
+    if (guidance_top_k < 0) {
+        throw Error(std::string(fname) + ": guidance top_k is " + std::to_string(guidance_top_k) +
+                     "; it is a count of candidates, and 0 means 'do not shortlist'");
     }
     if (top_k < 0) {
         throw Error(std::string(fname) + ": top_k is " + std::to_string(top_k) + "; it is a count of "
@@ -371,14 +386,110 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
                      "probability in (0, 1], and 1 means 'do not truncate'");
     }
 
-    std::vector<float> logits(static_cast<size_t>(n_vocab));
-    ggml_backend_tensor_get(out, logits.data(), static_cast<size_t>(row) * out->nb[1],
-                             logits.size() * sizeof(float));
+    // **Classifier-free guidance, and it happens HERE rather than in a graph**: over two retained
+    // outputs the caller names, in one of the two forms below. It is in this function because it is
+    // part of turning logits into a token, and this project has one place that does that on purpose --
+    // two ways to get a token out of a forward pass that can disagree is a failure it keeps removing
+    // (P4.0.14, and the greedy/argmax invariant below).
+    //
+    // The alternative a driver has is marshalling both rows into Lua and combining them there, which
+    // for Dia is 9252 floats twice per step and reinstates exactly the boundary cost every retained
+    // reduction in this tree exists to avoid (Retro-004).
+    std::vector<float> logits;
+    if (uncond == nullptr) {
+        logits = read_row_window(out, requested_row, fname, lo, hi);
+    } else {
+        // The two rows must be the same head over the same vocabulary, checked on the FULL widths
+        // rather than on the window: with `hi` resolved against the conditional output, a wider
+        // unconditional one would be silently guided against its first `hi` classes and a narrower one
+        // would fail with a window message that blames the caller's `lo`/`hi`. Neither says the true
+        // thing, which is that these are two runs of ONE model and something handed over two models.
+        if (uncond->ne[0] != out->ne[0]) {
+            throw Error(std::string(fname) + ": the guidance output's rows are " +
+                         std::to_string(uncond->ne[0]) + " wide and this one's are " +
+                         std::to_string(out->ne[0]) + " -- guidance combines two runs of ONE model, "
+                         "over one vocabulary");
+        }
+        // **The guidance runs over the WHOLE row, and the window is applied after it.** That is the
+        // order `transformers` composes these in -- the CFG processor is inserted at index 0, ahead of
+        // the per-channel filter that bans the control ids -- and with `guidance_top_k` the two orders
+        // give different candidate sets: a control token inside the guided top-k occupies one of the k
+        // slots and is then banned, leaving k-1 real candidates. Restricting first would silently give
+        // back the full k. Without a top-k the two orders agree, and only the window is read.
+        const bool whole_row = guidance_top_k > 0;
+        int64_t cond_hi = whole_row ? -1 : hi;
+        int64_t uncond_hi = cond_hi;
+        const int64_t base = whole_row ? 0 : lo;
+        logits = read_row_window(out, requested_row, fname, base, cond_hi);
+        const std::vector<float> other = read_row_window(uncond, requested_row, fname, base, uncond_hi);
+
+        std::vector<float> guided(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i) {
+            guided[i] = other[i] + guidance_scale * (logits[i] - other[i]);
+        }
+
+        if (!whole_row) {
+            logits = std::move(guided);
+        } else {
+            // **`guidance_top_k` selects with the GUIDED logits and scores with the CONDITIONAL ones**,
+            // which is not a variation on the formula above but a different operation -- and it is what
+            // `DiaClassifierFreeGuidanceLogitsProcessor` does. Guidance sharpens the ranking, and the
+            // model's own (unsharpened) distribution over that shortlist is what gets drawn from; the
+            // guided values themselves are discarded. Anything outside the shortlist is -inf, spelled
+            // here as "removed from the candidate set", which is the same thing one representation up.
+            const int64_t k = std::min<int64_t>(guidance_top_k, static_cast<int64_t>(guided.size()));
+            std::vector<int64_t> order(guided.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int64_t>(i);
+            std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                              [&](int64_t a, int64_t b) {
+                                  return guided[static_cast<size_t>(a)] > guided[static_cast<size_t>(b)];
+                              });
+            std::vector<bool> kept(guided.size(), false);
+            for (int64_t i = 0; i < k; ++i) kept[static_cast<size_t>(order[static_cast<size_t>(i)])] = true;
+            for (size_t i = 0; i < logits.size(); ++i) {
+                if (!kept[i]) logits[i] = -std::numeric_limits<float>::infinity();
+            }
+            // Now apply the window that was deliberately not applied above -- validated here, since
+            // the read above was of the whole row and so validated nothing about `lo`/`hi`.
+            const auto width = static_cast<int64_t>(logits.size());
+            if (hi < 0) hi = width;
+            if (lo < 0 || lo >= hi || hi > width) {
+                throw Error(std::string(fname) + ": id window [" + std::to_string(lo) + ", " +
+                             std::to_string(hi) + ") is not a non-empty sub-range of this output's " +
+                             std::to_string(width) + " class(es)");
+            }
+            logits = std::vector<float>(logits.begin() + lo, logits.begin() + hi);
+        }
+        // Every candidate banned. Reachable only when a guidance shortlist and an id window do not
+        // intersect at all, which `transformers` answers with a row of -inf and a NaN softmax. Saying
+        // so is the difference between a fixable export and a token drawn out of nothing.
+        if (std::none_of(logits.begin(), logits.end(),
+                         [](float v) { return v > -std::numeric_limits<float>::infinity(); })) {
+            throw Error(std::string(fname) + ": the guidance shortlist and the id window [" +
+                         std::to_string(lo) + ", " + std::to_string(hi) + ") have no id in common, so "
+                         "there is nothing to draw from");
+        }
+    }
+
+    // **The greedy invariant, preserved through guidance.** `temperature <= 0` and `top_k == 1` both
+    // mean "the highest-scoring id", and that must be the maximum of the GUIDED logits -- which are
+    // not in any tensor, so this can no longer delegate to `argmax_tensor_row` and instead shares its
+    // reduction. Unguided, the two paths read the same window and run the same loop, which is the
+    // invariant stated more strongly than before rather than less.
+    if (temperature <= 0.0f || top_k == 1) {
+        return lo + argmax_of_window(logits);
+    }
+
+    const auto n_vocab = static_cast<int64_t>(logits.size());
 
     // Top-k first, on the LOGITS, because ordering by logit and ordering by probability are the same
     // ordering -- softmax is monotone -- so the k candidates can be chosen before anything is
     // exponentiated. That also bounds every step after this one by k rather than by the vocabulary,
     // which for Gemma 3 is 64 against 262144.
+    //
+    // `candidates` holds offsets INTO THE WINDOW; `lo` is added back at every return, because a
+    // restricted sampler exists to answer "which of THESE ids" and a caller that had to add it back
+    // would be one addition away from a wrong token -- the same argument `argmax_tensor_row` makes.
     std::vector<int64_t> candidates(static_cast<size_t>(n_vocab));
     for (int64_t i = 0; i < n_vocab; ++i) candidates[static_cast<size_t>(i)] = i;
     const auto by_logit_desc = [&](int64_t a, int64_t b) {
@@ -426,11 +537,11 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     float running = 0.0f;
     for (size_t i = 0; i < keep; ++i) {
         running += probs[i];
-        if (running >= target) return candidates[i];
+        if (running >= target) return lo + candidates[i];
     }
     // Only reachable when floating-point accumulation lands the target past the total; the last
     // candidate is the answer either way.
-    return candidates[keep - 1];
+    return lo + candidates[keep - 1];
 }
 
 // The same reduction over EVERY row: one id per row, in row order. `argmax_tensor_row`'s plural.
@@ -907,9 +1018,35 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
 // `loom.argmax_row(m, r)` -- see `sample_tensor_row`, which returns that function's own answer rather
 // than reproducing it.
 //
-// **A table rather than three positional arguments** because the knobs are a set that grows: min-p and
-// the repetition penalties are not implemented (nothing in the fixture set asks for them) and adding
-// one later must not renumber what a shipped GGUF's driver already passes.
+// **A table rather than positional arguments** because the knobs are a set that grows, and it has now
+// grown twice: min-p and the repetition penalties are still not implemented (nothing in the fixture
+// set asks for them), while `lo`/`hi` and `guidance` were added for family 10. Adding one must not
+// renumber what a shipped GGUF's driver already passes, which is the whole reason for the table.
+//
+// **`lo`/`hi` here rather than a `sample_row_range` binding**, which is where this deliberately
+// departs from `argmax_row`/`argmax_row_range`. That pair is two bindings for a stated MECHANICAL
+// reason: `argmax_row`'s module form already ends in an optional `generation`, so `(module, row, lo,
+// hi)` and `(module, row, generation)` cannot be told apart by arity or type. This one has a table,
+// so it has no such ambiguity, and a second binding would be a second door onto one reduction --
+// which is what `sample_tensor_row` exists to avoid one level down.
+//
+// **`guidance = {module =, scale =, top_k =}` is classifier-free guidance**: `uncond + scale * (cond
+// - uncond)`, where `cond` is this call's own module and `uncond` is a SECOND module the driver ran
+// over the unconditional input. Two modules rather than two calls because the combination happens on
+// the logits, and logits are what never cross this boundary. `scale` defaults to 1.0, which is the
+// identity -- guidance that changes nothing, so a mis-specified table degenerates to plain sampling
+// rather than to noise.
+//
+// `guidance.top_k` selects a shortlist with the GUIDED logits and then draws from the CONDITIONAL
+// ones restricted to it, which is a different operation rather than a variation -- see
+// `sample_tensor_row`. It is what `DiaClassifierFreeGuidanceLogitsProcessor` means by
+// `guidance_top_k`, and it is separate from the plain `top_k` above, which truncates whatever
+// distribution is being drawn from.
+//
+// **A model whose own formula is centred on the conditional logits passes `scale + 1`.** Dia's is:
+// `cond + g * (cond - uncond)` is `uncond + (g + 1) * (cond - uncond)`. The general form is the one
+// here, because it is `ClassifierFreeGuidanceLogitsProcessor`'s and because the centring is the
+// model's convention -- so the conversion belongs in that model's driver, next to its own constant.
 //
 // Module form only, like `argmax_row_range` and for the same reason: the array form of `argmax_row`
 // exists for a driver that already holds the row in Lua, and a causal LM's row is exactly what must
@@ -922,29 +1059,76 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         float temperature = 0.0f;
         int64_t top_k = 0;
         float top_p = 1.0f;
+        int64_t lo = 0;
+        int64_t hi = -1;
         bool check_generation = false;
         uint64_t generation = 0;
+        std::string uncond_module;
+        float guidance_scale = 1.0f;
+        int64_t guidance_top_k = 0;
+        bool check_uncond_generation = false;
+        uint64_t uncond_generation = 0;
         if (!lua_isnoneornil(L, 3)) {
             luaL_checktype(L, 3, LUA_TTABLE);
-            const auto number_field = [&](const char* name, double fallback) {
-                lua_getfield(L, 3, name);
+            const auto number_field = [&](int table_idx, const char* name, double fallback) {
+                lua_getfield(L, table_idx, name);
                 const double value = lua_isnil(L, -1) ? fallback : luaL_checknumber(L, -1);
                 lua_pop(L, 1);
                 return value;
             };
-            temperature = static_cast<float>(number_field("temperature", 0.0));
-            top_k = static_cast<int64_t>(number_field("top_k", 0.0));
-            top_p = static_cast<float>(number_field("top_p", 1.0));
+            temperature = static_cast<float>(number_field(3, "temperature", 0.0));
+            top_k = static_cast<int64_t>(number_field(3, "top_k", 0.0));
+            top_p = static_cast<float>(number_field(3, "top_p", 1.0));
+            // `hi` defaults to -1, which `read_row_window` reads as "to the end of the row" -- so a
+            // caller who names neither gets the whole row, which is what every pre-family-10 driver
+            // passes and must keep meaning.
+            lo = static_cast<int64_t>(number_field(3, "lo", 0.0));
+            hi = static_cast<int64_t>(number_field(3, "hi", -1.0));
             lua_getfield(L, 3, "generation");
             check_generation = !lua_isnil(L, -1);
             if (check_generation) generation = static_cast<uint64_t>(std::llround(luaL_checknumber(L, -1)));
             lua_pop(L, 1);
+
+            lua_getfield(L, 3, "guidance");
+            if (!lua_isnil(L, -1)) {
+                luaL_checktype(L, -1, LUA_TTABLE);
+                const int guidance_idx = lua_gettop(L);
+                lua_getfield(L, guidance_idx, "module");
+                if (!lua_isstring(L, -1)) {
+                    lua_pop(L, 2);
+                    return luaL_error(L, "loom.sample_row: guidance needs a `module` naming the "
+                                          "unconditional run's retained output");
+                }
+                uncond_module = lua_tostring(L, -1);
+                lua_pop(L, 1);
+                guidance_scale = static_cast<float>(number_field(guidance_idx, "scale", 1.0));
+                guidance_top_k = static_cast<int64_t>(number_field(guidance_idx, "top_k", 0.0));
+                lua_getfield(L, guidance_idx, "generation");
+                check_uncond_generation = !lua_isnil(L, -1);
+                if (check_uncond_generation) {
+                    uncond_generation = static_cast<uint64_t>(std::llround(luaL_checknumber(L, -1)));
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
         }
         OutputStore& store = retained_store(self, module_name);
         if (check_generation) store.check_generation(generation, module_name);
+        ggml_tensor* uncond = nullptr;
+        if (!uncond_module.empty()) {
+            if (uncond_module == module_name) {
+                return luaL_error(L, "loom.sample_row: guidance names module '%s', which is the one "
+                                      "being sampled -- a module has ONE retained output, so the "
+                                      "conditional and unconditional runs cannot share it",
+                                  uncond_module.c_str());
+            }
+            OutputStore& uncond_store = retained_store(self, uncond_module);
+            if (check_uncond_generation) uncond_store.check_generation(uncond_generation, uncond_module);
+            uncond = uncond_store.get(0);
+        }
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
-            temperature, top_k, top_p)));
+            temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());

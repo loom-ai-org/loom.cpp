@@ -266,9 +266,14 @@ private:
     // language detection, whose 98 language tokens sit inside the transcript vocabulary, so an
     // unrestricted argmax would answer with a word (BACKLOG.md P4.1 follow-up).
     static int l_argmax_row_range(lua_State* L);
-    // `loom.sample_row(module, row, {temperature =, top_k =, top_p =, generation =})` -> one token id
-    // DRAWN from that row rather than maximized over it (P4.24). Greedy settings return
-    // `l_argmax_row`'s own answer, by calling the same function -- see `sample_tensor_row`.
+    // `loom.sample_row(module, row, {temperature =, top_k =, top_p =, lo =, hi =, generation =,
+    // guidance = {module =, scale =}})` -> one token id DRAWN from that row rather than maximized over
+    // it (P4.24). Greedy settings run `l_argmax_row`'s own reduction over the same window -- see
+    // `sample_tensor_row`. `lo`/`hi` restrict it to a half-open id window and return absolute ids, as
+    // `l_argmax_row_range` does; `guidance` combines this module's logits with a second module's as
+    // `uncond + scale * (cond - uncond)`, which is classifier-free guidance done where the logits are.
+    // Both were added for family 10 and both live in the OPTIONS table rather than in new bindings --
+    // the definition says why that differs from the argmax pair.
     static int l_sample_row(lua_State* L);
     static int l_seed_rng(lua_State* L);
     static int l_gaussian_array(lua_State* L);

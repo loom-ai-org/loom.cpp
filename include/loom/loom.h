@@ -57,9 +57,10 @@
 #include "loom/core/chat_template.h"
 #include "loom/core/ctc_decode.h"
 #include "loom/core/generation.h"
-// The two end-to-end task loops. Per-TASK like the decoders above, and here for the same reason the
+// The end-to-end task doors. Per-TASK like the decoders above, and here for the same reason the
 // CTC decoder is: every host needs them, and the copies hosts wrote had already drifted apart.
 #include "loom/core/text_generate.h"
+#include "loom/core/text_classify.h"
 #include "loom/core/transcribe.h"
 
 // --- One standalone C++ component from the pre-MIL era. It was four; P4.0.8's follow-up retired

@@ -195,6 +195,17 @@ absent-means-false would report exactly the models that need a cache as not need
 `uses_kv_cache()` but whose file omits a geometry key raises naming the key *and* saying the fix is on
 the converter side.
 
+**1.2a — *whether* is derived; *which* is declared (2026-09-03, ADR-023).** `uses_kv_cache()` above
+answers whether a topology needs a cache, and derives it because the graph is the only authority. It
+cannot answer **which** cache, and that is not the same question: two modules running one topology are
+two STREAMS of one generation when a driver runs them side by side — which is what classifier-free
+guidance does — and two PHASES of one stream when it runs them in sequence. Nothing in a graph
+distinguishes those, and getting it wrong is silent: two streams sharing a cache read each other's
+cells and still produce plausible tokens. So a topology may declare `"kv_cache_scope": "private"`,
+absent meaning shared, and `loom::register_topologies` allocates accordingly. See
+[ADR-023](adrs/adr-023-a-second-stream-is-declared-not-derived.md); this does not weaken decision 5,
+it bounds it.
+
 **1.3 — delete `WhisperConfig`'s cache fields from the Lua test.** This is the step's real acceptance
 test and the reason stage 1 exists: `test_e2e_whisper_lua_driver.cpp` allocates from the GGUF alone, and
 the transcription stays token-identical to the C++ oracle. *Negative gate: remove one KV and confirm the
