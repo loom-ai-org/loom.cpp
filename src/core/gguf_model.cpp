@@ -147,7 +147,34 @@ std::vector<std::string> GgufModel::topology_names() const {
     return names;
 }
 
+std::unique_ptr<GgufModel> GgufModel::load_metadata(const std::string& path) {
+    auto model = std::unique_ptr<GgufModel>(new GgufModel());
+
+    // The identical parse `load` opens with, and then it stops. `no_alloc=true` gives correctly-shaped
+    // `ggml_tensor` structs with null `data`, which is all the KV accessors and `ModelContract::read`
+    // ever look at -- they read the gguf context, not the tensors. What is skipped is the backend
+    // buffer and the streaming loop, which is the entire cost.
+    ggml_context* raw_meta_ctx = nullptr;
+    gguf_init_params gguf_params{/*no_alloc=*/true, /*ctx=*/&raw_meta_ctx};
+    gguf_context* raw_gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
+    if (!raw_gguf_ctx) {
+        throw LoadError("GgufModel::load_metadata: failed to parse GGUF file '" + path + "'");
+    }
+    model->gguf_ctx_.reset(raw_gguf_ctx);
+    model->meta_ctx_.reset(raw_meta_ctx);
+    // `symbols_` is deliberately left EMPTY and `weights_buf_` null: `has_weights()` reads the latter,
+    // and the two accessors that would hand out a data-less tensor throw on it.
+    return model;
+}
+
 ggml_tensor* GgufModel::weight(const std::string& name) const {
+    // The metadata-only guard, and it is a guard rather than a comment because the failure it replaces
+    // is a null `tensor->data` dereferenced deep inside a graph build -- a segfault with no name on it.
+    if (!has_weights()) {
+        throw LoadError("GgufModel::weight: '" + name + "' was requested from a model opened with "
+                        "load_metadata(), which reads the KV table and no tensor data. Open it with "
+                        "load() to run it.");
+    }
     auto it = symbols_.find(name);
     if (it == symbols_.end()) {
         throw LoadError("GgufModel::weight: no such weight '" + name + "'");
@@ -156,6 +183,10 @@ ggml_tensor* GgufModel::weight(const std::string& name) const {
 }
 
 bool GgufModel::has_weight(const std::string& name) const {
+    if (!has_weights()) {
+        throw LoadError("GgufModel::has_weight: asked of a model opened with load_metadata(), which "
+                        "reads no tensor data. Its answer would be about a tensor that is not there.");
+    }
     return symbols_.find(name) != symbols_.end();
 }
 
