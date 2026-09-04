@@ -56,6 +56,33 @@ int main() {
         LOOM_CHECK(labelled[4].token == 102 && labelled[4].label_id == 1);
     }
 
+    // ---- The framing is PER-TOKENIZER, so BOS/EOS is stripped where CLS/SEP was ------------------
+    {
+        // Family 12's third checkpoint is XLM-R, whose encode wraps in `<s> ... </s>` rather than in
+        // CLS/SEP (P5). Reading only BOS/SEP/PAD left the trailing `</s>` in the answer wearing the
+        // head's own label for it -- one extra entry, at the END, which is where a caller comparing
+        // lengths against its own word count would find it and where a NER expectation would not look.
+        const std::string spm_path =
+            std::string(LOOM_TEST_FIXTURE_DIR) + "/classify_driver_spm.gguf";
+        auto spm = loom::GgufModel::load(spm_path, backend.get());
+        LOOM_CHECK(spm != nullptr);
+        loom::Session spm_session(*spm, backend.get());
+
+        // `<s> one two three </s>` at XLM-R's own ids. The driver labels by POSITION, so all five rows
+        // get 0,1,2,0,1 and the three that survive are rows 1..3.
+        const std::vector<int32_t> tokens = {0, 7, 8, 9, 2};
+        const auto labelled = loom::text::classify(spm_session.bridge(), *spm, tokens);
+        LOOM_CHECK(labelled.size() == 3);
+        LOOM_CHECK(labelled[0].token == 7 && labelled[0].label_id == 1);
+        LOOM_CHECK(labelled[2].token == 9 && labelled[2].label_id == 0);
+
+        // This fixture names no separator at all, so a file naming only some of the four framing roles
+        // strips only those -- and `strip_special = false` still hands back every row.
+        loom::text::ClassifyOptions options;
+        options.strip_special = false;
+        LOOM_CHECK(loom::text::classify(spm_session.bridge(), *spm, tokens, options).size() == 5);
+    }
+
     // ---- A model whose output is not one row per token is refused, not zipped ---------------------
     {
         const std::string pooled_path =
@@ -86,5 +113,9 @@ int main() {
     }
 
     std::printf("test_text_classify: OK\n");
-    return 0;
+    // NOT `return 0`. `LOOM_CHECK` counts a failure and keeps going, so a hand-written main that
+    // returns 0 unconditionally reports every failure to stderr and exits green -- this file's checks
+    // could not fail a ctest run, and were found not to while a real one was being sabotage-tested
+    // (P5). Every other test here already ends on this macro.
+    LOOM_TEST_REPORT_AND_RETURN();
 }

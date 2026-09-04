@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-03
+last_updated: 2026-09-04
 ---
 
 # Epic-03: Model Coverage
@@ -92,6 +92,40 @@ oracle* standing rule), over 138 tokens: max |Δ| 1.24e-05 (BERT) and 5.72e-06 (
 sentence cosine 0.99999988 for both, 138/138 argmax, and the engine's own WordPiece encode identical to
 HF's ids. The sabotage arm — the same graph against a different sentence's reference — reads 11.94 and
 9.54.
+
+#### The third checkpoint, where the TOKENIZER was the new thing (2026-09-04)
+
+BERT and DistilBERT are structurally different **encoders** and the same WordPiece vocabulary with the
+same CoNLL-03 head, so what the first two checkpoints left untested was the other half of the door.
+`oliverguhr/fullstop-punctuation-multilang-large` — XLM-R, SentencePiece Unigram, 250,002 pieces, a
+punctuation-restoration head — is the third, and it moved nothing in the template and two things
+either side of it.
+
+**The tokenizer half cost one reader.** A fairseq-derived checkpoint's ids are not its protobuf's piece
+order: `transformers`' converter re-heads the vocabulary and shifts every piece by one, so writing the
+proto verbatim yields a file that loads, decodes to readable text, and is off by one against the
+embedding table everywhere. The fix is to read the ids off the `tokenizer.json` the checkpoint already
+ships and keep the piece TYPES and the normalizer from the protobuf —
+[ADR-025](../adrs/adr-025-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), whose seam
+(`tokenizer.json`'s presence) is why the six NeMo SentencePiece models in the sweep are byte-identical.
+Engine encode now matches `AutoTokenizer` on 8/8 multilingual sentences including the `<s> … </s>`
+framing. **No engine change**: `loom::Vocab`'s UGM Viterbi already did all of it, and had simply never
+been handed a vocabulary this family produced.
+
+**The template half cost three lines and a retro.** XLM-R numbers positions from `padding_idx + 1`, so
+the family's 0-based `loom.range(0, n_tokens)` read two rows of the position table that were trained as
+padding — max |Δ| 7.040 in the logits with **24 of 27 argmaxes still agreeing**
+([Retro-033](../retros/retro-033-position-zero-was-not-row-zero.md)). `_position_offset` reads it off
+the table's own `padding_idx`, the wrapper adds it, and the artifact's contract is unchanged for every
+member. The same offset shortens the family's cap: XLM-R's 514-row table serves 512 tokens.
+
+**The engine half cost one KV in one list.** `loom::text::classify` strips the framing an encode added,
+and read BOS/SEP/PAD only — so a SentencePiece checkpoint's trailing `</s>` came back labelled. The
+framing is per-TOKENIZER, not per-task.
+
+Verified the same way as the first two, over 70 tokens: max |Δ| **4.196e-05**, cosine 0.999999973,
+70/70 argmax, sabotage arm 17.49. The larger delta than BERT's is the model — 24 layers at width 1024
+against 12 at 768.
 
 ### Family 11, and the bug that had no symptom
 
@@ -271,6 +305,10 @@ classifiers (12), codec decoders' first leaf (11) and the AR codec-token LM (10)
 each cost, which is the number the rest of this list should be estimated against. Family 10 landing
 means the `text2codes` → `codes2speech` composition now has both halves in the tree.
 
+Family 12 is now proved on **three** checkpoints and both tokenizer halves — two WordPiece encoders
+and one SentencePiece Unigram one — which is what closes the "a family-12 checkpoint that is not
+WordPiece" item.
+
 **Named but unstarted:** Qwen3-ASR-0.6B and Qwen3-TTS-0.6B variants — Qwen3-TTS is expected to be the
 most architecturally novel item in that family and needs its own source-level read before scoping.
 F5-TTS is deferred by explicit direction (flow-matching, `OdeStepper`-adjacent, likely sharing
@@ -286,7 +324,7 @@ the traced module, the wrapper and the converted MIL program **together** took G
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-025](../adrs/adr-025-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-033](../retros/retro-033-position-zero-was-not-row-zero.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

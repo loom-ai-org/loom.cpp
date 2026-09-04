@@ -13,10 +13,17 @@ namespace {
 // WordPiece export writes CLS (llama.cpp's own convention, which `wordpiece_tokenizer_export.py`
 // follows and `wordpiece_vocab.h` documents) and `sep` is SEP; a file naming neither strips nothing,
 // which is the right answer for a model whose encode adds nothing.
+//
+// `eos` is here because the FRAMING IS PER-TOKENIZER, NOT PER-TASK. A WordPiece classifier wraps its
+// sentence in CLS/SEP; a SentencePiece one wraps it in BOS/EOS (XLM-R's own post-processor is
+// `<s> $A </s>`), and reading only the first list left a trailing `</s>` in the answer wearing whatever
+// label the head gave it -- one extra entry, at the end, where a caller comparing lengths against its
+// own word count would find it last. Every id is looked up by KV and skipped when the file names none,
+// so a model that frames with two of these four still strips exactly two.
 std::vector<int32_t> framing_ids(const GgufModel& model) {
     std::vector<int32_t> ids;
-    for (const char* key : {"tokenizer.ggml.bos_token_id", "tokenizer.ggml.seperator_token_id",
-                            "tokenizer.ggml.padding_token_id"}) {
+    for (const char* key : {"tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id",
+                            "tokenizer.ggml.seperator_token_id", "tokenizer.ggml.padding_token_id"}) {
         const int32_t id = model.kv_i32(key, -1);
         if (id >= 0) ids.push_back(id);
     }
