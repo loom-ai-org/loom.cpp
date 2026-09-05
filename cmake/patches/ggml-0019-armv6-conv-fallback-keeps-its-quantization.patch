@@ -1,0 +1,156 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index bd719d66..813351ba 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -17,6 +17,9 @@
+ #include "ggml.h"
+ #include "unary-ops.h"
+ #include "vec.h"
++#if defined(GGML_USE_LLAMAFILE)
++#include "llamafile/sgemm.h"
++#endif
+ 
+ #include <algorithm>
+ #include <cfloat>
+@@ -7741,6 +7744,88 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+ // The one thing it is NOT right for is a convolution inside a decode loop, where the dequantize would
+ // be paid per token rather than per utterance. Nothing in ggml routes SSM_CONV here.
+ 
++// THE CONVOLUTIONS THE DIRECT SWEEP DECLINES, ON ARMv6, WITHOUT THROWING THE QUANTIZATION AWAY.
++//
++// ARMv6 only -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1. Not the 64-bit ARMs, which have a
++// vectorised direct sweep and a NEON quantized dot; not ARMv7 either, which has NEON (see the guard
++// in llamafile/sgemm.cpp).
++//
++// `ggml_conv_1d_direct_ok` refuses a convolution whose weights exceed the cache budget or whose
++// activation is short relative to its channel count -- and on a VITS vocoder that is the LARGEST
++// bucket, 41 calls of IC*K=960, OC=384 at OL=275, 36% of a synthesis. Those fall to the batched
++// im2col below, which runs against the DEQUANTIZED kernel because the block at the top of
++// `ggml_compute_forward_conv_2d_impl` has already expanded it. On a core with no vector unit that is
++// the worst of both: F32 arithmetic over 1.47 MB of weights where the stored form is 207 KB.
++//
++// Measured on a Pi Zero W at that shape, all arms verified identical:
++//     F32 GEMM (what this replaces)                29.7 MMAC/s
++//     q4_0 x q8_0 through this path               167.9 MMAC/s   5.65x
++//
++// The folded kernel layout [IC*KH*KW, OC] that loom's ggml-0013 introduced so the weights could be
++// block-quantized at all IS a GEMM's weight matrix, so nothing is repacked here: the stored kernel is
++// handed to the GEMM as it sits, and only the im2col patches are quantized.
++//
++// Returns false -- and the F32 path runs -- for anything it cannot serve: a contraction that is not a
++// whole number of Q8_0 blocks, a work buffer too small for the quantized patches, or the kill switch.
++static bool ggml_conv_2d_armv6_qgemm(const ggml_compute_params * params, const void * qk,
++                                     void * tmp, int64_t patches_per_batch, int64_t patch_n,
++                                     int64_t c_out, int64_t knl_n, float * out, int64_t ldc) {
++#if defined(GGML_USE_LLAMAFILE) && defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++    const int64_t blck = ggml_blck_size(GGML_TYPE_Q8_0);   // == ggml_blck_size(Q4_0) == 32
++    if (qk == NULL || (knl_n % blck) != 0) {
++        return false;
++    }
++    // OFF BY DEFAULT, AND THE DEFAULT IS THE FINDING. Measured on a Pi Zero W with this route on:
++    //
++    //   * VITS (every convolution 1-D, kh == 1): bit-identical output, 246.9 s against 253.2 s --
++    //     2.6%, not the 1.42x the shape-level benchmark projected. Most of the vocoder's declined
++    //     convolutions do not reach this call site.
++    //   * conformer-ctc: WRONG. Its only quantized convolutions are the 2-D subsampling stem, and
++    //     the transcript comes back as "i" instead of the sentence. Something in the kh > 1 case is
++    //     not what this assumes, and it has not been found yet.
++    //
++    // So it stays behind an opt-in until the 2-D case is understood: 2.6% on one model is not worth
++    // a silent wrong answer on another. The GEMM itself (llamafile/sgemm.cpp) is unaffected and is
++    // on by default -- it is verified bit-identical and is worth 1.62x on distilbert-ner.
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * e = getenv("GGML_CPU_ENABLE_ARMV6_CONV_QGEMM");
++        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    if (!enabled) {
++        return false;
++    }
++
++    // Staged where the F32 path would have put `gemm_output`, which this branch does not use because
++    // it writes straight into dst. Checked against the buffer's real end rather than assumed: a
++    // convolution with a long contraction and few output channels would not fit, and must fall back.
++    const size_t q8row = ggml_row_size(GGML_TYPE_Q8_0, knl_n);
++    char * const   qb  = (char *) tmp + (size_t) patches_per_batch * knl_n * sizeof(float);
++    const char * const wend = (const char *) params->wdata + params->wsize;
++    if (qb + (size_t) patch_n * q8row > wend) {
++        return false;
++    }
++
++    const ggml_from_float_t quantize = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;
++    for (int64_t i = params->ith; i < patch_n; i += params->nth) {
++        quantize((const float *) tmp + i * knl_n, qb + (size_t) i * q8row, knl_n);
++    }
++    ggml_barrier(params->threadpool);
++
++    // c_out rows of kernel against patch_n columns of patches, written channel-major -- which is why
++    // this is not `llamafile_sgemm`, whose store is the other way round.
++    llamafile_sgemm_q4_0_q8_0_cm(params, c_out, patch_n, knl_n,
++                                 qk, knl_n / blck,
++                                 qb, knl_n / blck,
++                                 out, ldc);
++    return true;
++#else
++    GGML_UNUSED(params); GGML_UNUSED(qk); GGML_UNUSED(tmp); GGML_UNUSED(patches_per_batch);
++    GGML_UNUSED(patch_n); GGML_UNUSED(c_out); GGML_UNUSED(knl_n); GGML_UNUSED(out); GGML_UNUSED(ldc);
++    return false;
++#endif
++}
++
+ // The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
+ // `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
+ static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
+@@ -7775,7 +7860,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+                                               // output element is stored.
+                                               const float *               in_data   = nullptr,
+                                               const float *               leaky     = nullptr,
+-                                              const float *               res_data  = nullptr) {
++                                              const float *               res_data  = nullptr,
++                                              // ARMv6 ONLY (ggml_conv_2d_armv6_qgemm): the kernel as
++                                              // STORED, carried past the dequantize below so the
++                                              // im2col fallback can run a quantized GEMM instead of
++                                              // an F32 one. Null everywhere else, and null here too
++                                              // whenever the stored type is not Q4_0.
++                                              const void *                qk_data   = nullptr) {
+ 
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(kernel->type == kernel_type);
+@@ -7823,8 +7914,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         p.wdata = (char *) params->wdata + kbytes;
+         p.wsize = params->wsize - kbytes;
+ 
++        // The dequantize above still happens, and is still cheap (+1.8 ms over a whole VITS vocoder):
++        // keeping it means every predicate below -- the direct path's cache budget included -- prices
++        // the kernel by its dequantized size, which is what those predicates were tuned against. What
++        // is new is that the STORED kernel is carried alongside, so a fallback GEMM on ARMv6 can use
++        // it instead and never touch the expansion.
++        const void * qk = NULL;
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        if (kernel_type == GGML_TYPE_Q4_0) {
++            qk = kernel->data;
++        }
++#endif
+         ggml_compute_forward_conv_2d_impl(&p, &kdq, src, dst, GGML_TYPE_F32,
+-                                          bias_data, out_data, in_data, leaky, res_data);
++                                          bias_data, out_data, in_data, leaky, res_data, qk);
+         return;
+     }
+ 
+@@ -8033,8 +8135,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         // conv -- and skipping it is most of what makes this op worth using at all: with the cache
+         // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
+         if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
+-            ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
+-                                  dst_data + patch_start_batch, dst_w * dst_h);
++            // ARMv6 takes a quantized GEMM here when it can (5.65x at a VITS vocoder's largest
++            // shape); everything else, and anything it declines, runs the F32 one. Only THIS call
++            // site is served: the staged path below is the rarer one and is left alone.
++            if (!ggml_conv_2d_armv6_qgemm(params, qk_data, tmp, patches_per_batch, patch_n, c_out,
++                                          knl_n, dst_data + patch_start_batch, dst_w * dst_h)) {
++                ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
++                                      dst_data + patch_start_batch, dst_w * dst_h);
++            }
+             ggml_barrier(params->threadpool);
+             if (bias_data || res_data) {
+                 // Applied HERE rather than as its own pass over the finished result: these are the

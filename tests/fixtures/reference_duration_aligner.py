@@ -40,7 +40,12 @@ def main() -> None:
     duration = sigmoid(duration_logits.astype(np.float64)).sum(axis=-1) / speed
     pred_dur = np.clip(np.round(duration), 1, None).astype(np.uint32)
 
-    expanded = np.repeat(seq, pred_dur.astype(np.int64), axis=0)
+    # `np.intp`, NOT `np.int64`: numpy casts `repeats` to the platform's index type under the `safe`
+    # rule, and on a 32-bit interpreter that is `int32` -- so an explicit int64 raises
+    # "Cannot cast array data from dtype('int64') to dtype('int32')" and this fixture, alone of the
+    # 81 in `ctest -L ci`, failed on armv6l (P7). `intp` IS the index type on both, so the cast says
+    # what was meant. The written files are unaffected: `expected_pred_dur.bin` is int32 either way.
+    expanded = np.repeat(seq, pred_dur.astype(np.intp), axis=0)
 
     duration_logits.tofile(out_dir / "duration_logits.bin")
     seq.tofile(out_dir / "seq.bin")
