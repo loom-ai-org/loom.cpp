@@ -711,36 +711,32 @@ Three patches, `cmake/patches/ggml-0017` to `0019`. Two ship on by default and o
 
 | | baseline A / B | kernels A / B | |
 |---|---|---|---|
-| `distilbert-ner`, 17 tokens | 8.80–9.07 s | **6.27–6.51 s** | **1.35x** |
-| `conformer-ctc`, 3 s of audio | 65.8 / 64.8 s | **18.5 / 18.5 s** | **3.53x** — 21.8x -> **6.2x** real time |
-| VITS, 3.19 s of audio | 253.6 / 251.1 s | 253.2 s | neutral |
+| `conformer-ctc`, 3 s of audio | 66.2 / 67.6 s | **14.3 / 17.0 s** | **4.28x** — 22.3x -> **5.2x** real time |
+| VITS, 3.2 s of audio | 259.9 / 258.2 s | **141.3 / 146.6 s** | **1.80x** — 81x -> **44x** real time |
+| `distilbert-ner`, 17 tokens | 9.54 / 8.74 s | 9.57 / 6.29 s | 1.15–1.62x; too noisy at 10 s to pin |
 
-**conformer-ctc is the headline and it came from the F32 kernel, not the quantized one.** With only the
-q4_0 kernel it was 1.07x, because 99.7% of its weights cannot be block-quantized (d_model 176, QK 32)
-and never reached that kernel at all. Adding the F32 arm to `llamafile_sgemm` — which on this
-architecture had none and returned false — took it from 65.3 s to 18.5 s. It beats what Amdahl
-predicts from the 82.2% `MUL_MAT` share (2.2x) because conformer's convolutions are F32 too and lower
-to im2col + `MUL_MAT`, so the same kernel serves the 13% `CONV_2D` as well.
+Every transcript correct. VITS's waveform **changes** — `sha 1e5fa69a` rather than the baseline's
+`cf88b7ae`, identical across both kernel arms — because the convolution route now quantizes its
+activations to Q8_0, which `ggml-0013`'s own comment warned is less accurate than dequantize-then-F32.
+The ASR oracle is what clears it: the board's own audio still transcribes as *"Hello world, this is a
+Raspberry Pi Zero."* ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)'s rule — cosine
+agreement is not intelligibility, and here there is not even a cosine to appeal to, since the duration
+predictor lands on 3.24 s instead of 3.19 s.)
 
-Every output identical to the baseline's, VITS bit-for-bit (`sha256 cf88b7ae…`). The DistilBERT gain
-comes with a second, unlooked-for improvement: the baseline swings **8.70–12.57 s** run to run and the
-kernel build **6.28–6.42 s** — a 3.9 s spread becomes 0.14 s, which is what dropping a 256 KB lookup
-table on a 16 KB cache does to variance.
+**distilbert-ner is where the measurement is weakest and this should say so.** At ~10 s a run it swings
+±40% on this board; the kernel-arm readings across three ABBAs are 6.27, 6.31, 6.37, 6.51 and then
+9.57, and the last is as likely to be the machine as the code. conformer at 66 s and VITS at 260 s are
+the signals worth quoting.
 
-* **`ggml-0017` — fp16 scales by arithmetic, not `ggml_table_f32_f16`.** 65536 floats, 256 KB, on a
-  core with 16 KB of L1 and a 128 KB L2 the BCM2835 gives to the GPU. `ggml_compute_fp16_to_fp32` is
-  the function that *built* the table, so this is bit-identical by construction.
-* **`ggml-0018` — a dedicated ARMv6 q4_0 x q8_0 GEMM** in `llamafile/sgemm.cpp`: `__uxtb16`/`__sxtb16`
-  to unpack, `__smlad` for two MACs per instruction, a 2x2 register tile, and a tile order chosen per
-  call. Same products as `ggml_vec_dot_q4_0_q8_0`, so results are equal rather than close.
-* **`ggml-0019` — the conv fallback keeping its quantization. OFF BY DEFAULT.** Correct and
-  bit-identical on VITS, where every convolution is 1-D, and worth **2.6%** there rather than the
-  1.42x projected. **Wrong on conformer-ctc**, whose only quantized convolutions are its 2-D
-  subsampling stem: the transcript comes back `'i'`. The kh > 1 case is not understood, so it is
-  behind `GGML_CPU_ENABLE_ARMV6_CONV_QGEMM=1` until it is. The GEMM it calls is fine; the routing
-  around it is not.
+**Three changes got it there, and the last is an ARMv6 arm of a kernel that already existed:**
 
-**How to size a tile on this architecture, which took three benchmarks to get right.** The first
+| | what | measured in isolation |
+|---|---|---|
+| `0018` `gemm44` | the F32 GEMM's 4x4 tile written out longhand | 173.9 vs 110.6 MMAC/s |
+| `0019` conv route | `k` was passed in elements where `llamafile_sgemm` wants blocks | fixes a wrong answer |
+| `0019` conv tile | an ARMv6 arm for `ggml_conv_1d_direct_tile_impl` | 51.8 vs 22.5 MMAC/s, **2.30x** |
+
+**How to size a tile on this architecture**How to size a tile on this architecture, which took three benchmarks to get right.** The first
 attempt at 4x4 measured **27.2 MMAC/s** against 2x2's 153.7 and was written off as register pressure.
 It was not: it was the `av[RM]`/`bv[RN]` arrays in the inner loop going to the stack, plus
 `A[lda*(ii+i)+l]` recomputing addresses every iteration. Rewritten with explicit scalar accumulators

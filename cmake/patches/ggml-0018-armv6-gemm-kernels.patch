@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
-index bf9b8c8b..f9910c1a 100644
+index bf9b8c8b..bd9d0b6d 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
 @@ -57,6 +57,21 @@
@@ -50,7 +50,7 @@ index bf9b8c8b..f9910c1a 100644
          mnpack(0, m, 0, n);
      }
  
-@@ -4098,6 +4132,267 @@ class tinyBLAS_PPC {
+@@ -4098,6 +4132,335 @@ class tinyBLAS_PPC {
      const int nth;
  };
  #endif
@@ -261,10 +261,13 @@ index bf9b8c8b..f9910c1a 100644
 +  private:
 +    NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
 +        int64_t mc, nc, mp, np;
-+        switch ((MIN(m - m0, 2) << 4) | MIN(n - n0, 2ll)) {
-+        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
-+        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
-+        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
++        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4ll)) {
++        case 0x44: mc = 4; nc = 4; gemm44(m0, m, n0, n); break;   // hand-written, see below
++        case 0x43: case 0x42: case 0x34: case 0x33: case 0x32:
++        case 0x24: case 0x23: case 0x22:
++                              mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
++        case 0x41: case 0x31: case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
++        case 0x14: case 0x13: case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
 +        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
 +        default: return;
 +        }
@@ -272,6 +275,67 @@ index bf9b8c8b..f9910c1a 100644
 +        np = n0 + (n - n0) / nc * nc;
 +        mnpack(mp, m, n0, np);
 +        mnpack(m0, m, np, n);
++    }
++
++    // THE 4x4 TILE IS WRITTEN OUT LONGHAND AND THE TEMPLATE IS NOT USED FOR IT, which is ugly and is
++    // the difference between 174 MMAC/s and 27. GCC will not scalarise `float acc[RN][RM]` and
++    // `const float *ap[RM]` at RM=RN=4: the aggregates go to the stack and every accumulate becomes
++    // a load and a store. Measured three ways on the board, same shape, same run
++    // (loom scripts/bench33.c):
++    //
++    //     explicit scalars, 4x4        173.9 MMAC/s
++    //     template arrays + pointers, 4x4  27.2      <- what this function would be as a template
++    //     template arrays + pointers, 2x2 110.6
++    //
++    // At 2x2 the template is fine -- GCC scalarises four accumulators happily -- so every other shape
++    // below stays generic and only this one is spelled out.
++    //
++    // AND 4x4 IS THIS KERNEL'S CEILING, NOT THE QUANTIZED ONE'S, because the two accumulate in
++    // different register files. Sixteen floats live in VFP, which has 32 single registers, and the
++    // eight pointers live in the GPRs independently. tinyBLAS_Q0_ARMV6's accumulators are int32 in
++    // the SAME 14-register GPR file as its pointers -- and it needs four more live registers per row
++    // and per column for the nibble unpack -- so it stays at 2x2.
++    NOINLINE void gemm44(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        const int64_t ytiles = (m - m0) / 4;
++        const int64_t xtiles = (n - n0) / 4;
++        const int64_t tiles  = xtiles * ytiles;
++        const int64_t duty   = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end   = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            const int64_t jj = col_outer ? n0 + job / ytiles * 4 : n0 + job % xtiles * 4;
++            const int64_t ii = col_outer ? m0 + job % ytiles * 4 : m0 + job / xtiles * 4;
++            const float * a0 = A + lda * (ii + 0);
++            const float * a1 = A + lda * (ii + 1);
++            const float * a2 = A + lda * (ii + 2);
++            const float * a3 = A + lda * (ii + 3);
++            const float * b0 = B + ldb * (jj + 0);
++            const float * b1 = B + ldb * (jj + 1);
++            const float * b2 = B + ldb * (jj + 2);
++            const float * b3 = B + ldb * (jj + 3);
++            float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
++            float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
++            float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
++            float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
++            for (int64_t l = 0; l < k; ++l) {
++                const float x0 = *a0++, x1 = *a1++, x2 = *a2++, x3 = *a3++;
++                const float y0 = *b0++, y1 = *b1++, y2 = *b2++, y3 = *b3++;
++                c00 += x0 * y0; c01 += x1 * y0; c02 += x2 * y0; c03 += x3 * y0;
++                c10 += x0 * y1; c11 += x1 * y1; c12 += x2 * y1; c13 += x3 * y1;
++                c20 += x0 * y2; c21 += x1 * y2; c22 += x2 * y2; c23 += x3 * y2;
++                c30 += x0 * y3; c31 += x1 * y3; c32 += x2 * y3; c33 += x3 * y3;
++            }
++            float * r0 = C + ldc * (jj + 0) + ii;
++            float * r1 = C + ldc * (jj + 1) + ii;
++            float * r2 = C + ldc * (jj + 2) + ii;
++            float * r3 = C + ldc * (jj + 3) + ii;
++            r0[0] = c00; r0[1] = c01; r0[2] = c02; r0[3] = c03;
++            r1[0] = c10; r1[1] = c11; r1[2] = c12; r1[3] = c13;
++            r2[0] = c20; r2[1] = c21; r2[2] = c22; r2[3] = c23;
++            r3[0] = c30; r3[1] = c31; r3[2] = c32; r3[3] = c33;
++        }
 +    }
 +
 +    template <int RM, int RN>
@@ -287,11 +351,15 @@ index bf9b8c8b..f9910c1a 100644
 +        for (int64_t job = start; job < end; ++job) {
 +            const int64_t jj = col_outer ? n0 + job / ytiles * RN : n0 + job % xtiles * RN;
 +            const int64_t ii = col_outer ? m0 + job % ytiles * RM : m0 + job / xtiles * RM;
++            const float * ap[RM];
++            const float * bp[RN];
++            for (int i = 0; i < RM; ++i) ap[i] = A + lda * (ii + i);
++            for (int j = 0; j < RN; ++j) bp[j] = B + ldb * (jj + j);
 +            float acc[RN][RM] = {};
 +            for (int64_t l = 0; l < k; ++l) {
 +                float av[RM], bv[RN];
-+                for (int i = 0; i < RM; ++i) av[i] = A[lda * (ii + i) + l];
-+                for (int j = 0; j < RN; ++j) bv[j] = B[ldb * (jj + j) + l];
++                for (int i = 0; i < RM; ++i) av[i] = *ap[i]++;
++                for (int j = 0; j < RN; ++j) bv[j] = *bp[j]++;
 +                for (int j = 0; j < RN; ++j)
 +                    for (int i = 0; i < RM; ++i)
 +                        acc[j][i] += av[i] * bv[j];
@@ -318,7 +386,7 @@ index bf9b8c8b..f9910c1a 100644
  } // namespace
  
  /**
-@@ -4130,6 +4425,34 @@ class tinyBLAS_PPC {
+@@ -4130,6 +4493,34 @@ class tinyBLAS_PPC {
   * @param Ctype is GGML data type of `C`
   * @return true if this function was able to service the matmul request
   */
@@ -353,7 +421,7 @@ index bf9b8c8b..f9910c1a 100644
  bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
                       const void *A, int64_t lda, const void *B, int64_t ldb, void *C,
                       int64_t ldc, int Atype, int Btype, int Ctype) {
-@@ -4213,6 +4536,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4213,6 +4604,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              (float *)C, ldc};
      #endif
          return tb.matmul(m, n);
@@ -368,7 +436,7 @@ index bf9b8c8b..f9910c1a 100644
  #else
          return false;
  #endif
-@@ -4435,6 +4766,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4435,6 +4834,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              params->ith, params->nth};
          tb.matmul(m, n);
          return true;
