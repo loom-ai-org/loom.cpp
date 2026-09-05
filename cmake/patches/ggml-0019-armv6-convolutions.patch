@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index bd719d66..813351ba 100644
+index bd719d66..8c336c6c 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -17,6 +17,9 @@
@@ -12,7 +12,55 @@ index bd719d66..813351ba 100644
  
  #include <algorithm>
  #include <cfloat>
-@@ -7741,6 +7744,88 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+@@ -7290,6 +7293,47 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
+         for (int i = 0; i < ocn; ++i)
+             for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
+     }
++#elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++    // ARMv6 -- ARM1176, the Pi Zero / Zero W / Pi 1, and only it. Arithmetically identical to the
++    // generic arm below (bit-identical output, checked); the sixteen accumulators are named scalars
++    // instead of `float acc[4][4]` because GCC will not scalarise that array at 4x4 -- it puts it on
++    // the stack and every one of the 16 accumulates becomes a load and a store. Measured on the board
++    // at a VITS resblock shape, IC=OC=128 KW=7 OL=2200 (loom scripts/bench34.c):
++    //
++    //     generic arm, float acc[4][4]   22.5 MMAC/s
++    //     these scalars                  51.8 MMAC/s   2.30x
++    //
++    // The same defect and the same fix as tinyBLAS_F32_ARMV6's 4x4 tile in llamafile/sgemm.cpp; this
++    // architecture has no vector unit to hide it behind, so it shows up here as a 2.3x rather than as
++    // a rounding error. GGML_CONV1D_OCB and _VEC are both 4 on this arm by construction.
++    float a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33;
++    a00 = a01 = a02 = a03 = (bias && oc0 + 0 < OC) ? bias[oc0 + 0] : 0.0f;
++    a10 = a11 = a12 = a13 = (bias && oc0 + 1 < OC) ? bias[oc0 + 1] : 0.0f;
++    a20 = a21 = a22 = a23 = (bias && oc0 + 2 < OC) ? bias[oc0 + 2] : 0.0f;
++    a30 = a31 = a32 = a33 = (bias && oc0 + 3 < OC) ? bias[oc0 + 3] : 0.0f;
++    for (int64_t ic = 0; ic < IC; ++ic) {
++        const float * xr = xp + ic * LP + p0;
++        const float * wr = wp + ic * KW * OC + oc0;
++        for (int64_t kx = 0; kx < KW; ++kx, xr += dil, wr += OC) {
++            const float x0 = xr[0], x1 = xr[1], x2 = xr[2], x3 = xr[3];
++            const float w0 = wr[0], w1 = wr[1], w2 = wr[2], w3 = wr[3];
++            a00 += w0 * x0; a01 += w0 * x1; a02 += w0 * x2; a03 += w0 * x3;
++            a10 += w1 * x0; a11 += w1 * x1; a12 += w1 * x2; a13 += w1 * x3;
++            a20 += w2 * x0; a21 += w2 * x1; a22 += w2 * x2; a23 += w2 * x3;
++            a30 += w3 * x0; a31 += w3 * x1; a32 += w3 * x2; a33 += w3 * x3;
++        }
++    }
++    {
++        const float st[4][4] = {{a00,a01,a02,a03},{a10,a11,a12,a13},
++                                {a20,a21,a22,a23},{a30,a31,a32,a33}};
++        // Outside the reduction, so this array costs nothing the loop above was avoiding.
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++                if (CLAMP && p0 + j < pmin) continue;
++                const int64_t off = (oc0 + i) * OL + p0 + j;
++                y[off] = st[i][j] + (RES ? res[off] : 0.0f);
++            }
++    }
+ #else
+     float acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
+     for (int i = 0; i < GGML_CONV1D_OCB; ++i)
+@@ -7741,6 +7785,87 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
  // The one thing it is NOT right for is a convolution inside a decode loop, where the dequantize would
  // be paid per token rather than per utterance. Nothing in ggml routes SSM_CONV here.
  
@@ -47,24 +95,17 @@ index bd719d66..813351ba 100644
 +    if (qk == NULL || (knl_n % blck) != 0) {
 +        return false;
 +    }
-+    // OFF BY DEFAULT, AND THE DEFAULT IS THE FINDING. Measured on a Pi Zero W with this route on:
-+    //
-+    //   * VITS (every convolution 1-D, kh == 1): bit-identical output, 246.9 s against 253.2 s --
-+    //     2.6%, not the 1.42x the shape-level benchmark projected. Most of the vocoder's declined
-+    //     convolutions do not reach this call site.
-+    //   * conformer-ctc: WRONG. Its only quantized convolutions are the 2-D subsampling stem, and
-+    //     the transcript comes back as "i" instead of the sentence. Something in the kh > 1 case is
-+    //     not what this assumes, and it has not been found yet.
-+    //
-+    // So it stays behind an opt-in until the 2-D case is understood: 2.6% on one model is not worth
-+    // a silent wrong answer on another. The GEMM itself (llamafile/sgemm.cpp) is unaffected and is
-+    // on by default -- it is verified bit-identical and is worth 1.62x on distilbert-ner.
-+    static int enabled = -1;
-+    if (enabled < 0) {
-+        const char * e = getenv("GGML_CPU_ENABLE_ARMV6_CONV_QGEMM");
-+        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
++    // A KILL SWITCH RATHER THAN AN OPT-IN, now that the `k`-in-blocks bug below is fixed. It was
++    // opt-in for one round because with that bug conformer-ctc transcribed "i", and the first
++    // attempt to attribute that was itself wrong -- the ABBA script reinstalls the baseline wheel in
++    // its last arm, so the "disabled" run that looked like a clean bisect was measuring the baseline.
++    // Same wheel, same session, one environment variable is what finally isolated it.
++    static int disabled = -1;
++    if (disabled < 0) {
++        const char * e = getenv("GGML_CPU_DISABLE_ARMV6_CONV_QGEMM");
++        disabled = (e && e[0] && e[0] != '0') ? 1 : 0;
 +    }
-+    if (!enabled) {
++    if (disabled) {
 +        return false;
 +    }
 +
@@ -86,7 +127,13 @@ index bd719d66..813351ba 100644
 +
 +    // c_out rows of kernel against patch_n columns of patches, written channel-major -- which is why
 +    // this is not `llamafile_sgemm`, whose store is the other way round.
-+    llamafile_sgemm_q4_0_q8_0_cm(params, c_out, patch_n, knl_n,
++    // `k` IS IN BLOCKS, NOT ELEMENTS -- `llamafile_sgemm`'s own callers pass
++    // `ne00 / ggml_blck_size(src0->type)`, and the kernel indexes `A[lda * row + l]` on a
++    // `block_q4_0 *` for `l < k`. Passing `knl_n` here ran the contraction 32x too far off the end of
++    // every row: conformer-ctc came back with "i" instead of the sentence and took 1.94x as long.
++    // It did not show up on VITS because VITS never reaches this call at all -- its patch batches do
++    // not leave room for the Q8_0 staging and the size check above declines them.
++    llamafile_sgemm_q4_0_q8_0_cm(params, c_out, patch_n, knl_n / blck,
 +                                 qk, knl_n / blck,
 +                                 qb, knl_n / blck,
 +                                 out, ldc);
@@ -101,7 +148,7 @@ index bd719d66..813351ba 100644
  // The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
  // `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
  static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
-@@ -7775,7 +7860,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7775,7 +7900,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                                                // output element is stored.
                                                const float *               in_data   = nullptr,
                                                const float *               leaky     = nullptr,
@@ -116,7 +163,7 @@ index bd719d66..813351ba 100644
  
      GGML_ASSERT(ggml_is_contiguous(kernel));
      GGML_ASSERT(kernel->type == kernel_type);
-@@ -7823,8 +7914,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7823,8 +7954,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          p.wdata = (char *) params->wdata + kbytes;
          p.wsize = params->wsize - kbytes;
  
@@ -137,7 +184,7 @@ index bd719d66..813351ba 100644
          return;
      }
  
-@@ -8033,8 +8135,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -8033,8 +8175,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          // conv -- and skipping it is most of what makes this op worth using at all: with the cache
          // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
          if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
