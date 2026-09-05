@@ -854,7 +854,61 @@ afterthought came from the same shape-level model that overstated steps 1 and 3,
 direct convolution is worth here is not known until step 3's 2-D case is understood. That is the next
 task, and it is debugging rather than kernel writing.
 
-### 6.8 What is still not there
+### 6.8 Where the remaining ARMv6 performance is
+
+Ordered by evidence, not by appeal. Everything here was measured on the board with the kernels of
+§6.6 installed.
+
+**1. The direct-convolution predicate is now wrong on this architecture, and turning it off is worth
+1.27x today.** `ggml_conv_1d_direct_ok` chooses the direct sweep over im2col + GEMM, and it was tuned
+where that is right. It no longer is here, because the GEMM got a tile and the sweep's is worse:
+
+| VITS, 3.24 s of audio | |
+|---|---|
+| direct sweep (default) | 130.6 s |
+| `GGML_CPU_DISABLE_CONV_HEURISTICS=1` -> im2col + GEMM | **103.0 s** |
+
+ASR oracle passes on the second (the waveform changes again — a different lowering rounds
+differently). Against the pre-kernel baseline that is **259.0 -> 103.0 s, 2.51x, 81x -> 32x real
+time**. Note this reverses an earlier measurement: before the tiled GEMM the same switch was **1.63x
+SLOWER** ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) carries that entry
+and it should be annotated rather than deleted — both numbers are true, of different kernels).
+
+**Do not simply hardcode the predicate to false.** The switch disables it for every shape, and the
+direct path exists partly to avoid materialising im2col — at VITS's L=70400 that is 15.8 MB on a
+427 MB board. The work is a per-bucket comparison and then an ARMv6 arm of the predicate, not a
+one-liner, however tempting the one-liner looks.
+
+**2. The convolution tile is still 4.4x below the GEMM.** After the explicit-scalar rewrite it is
+51.8 MMAC/s (`scripts/bench34.c`) where `tinyBLAS_F32_ARMV6` reaches 226.7. If (1) makes im2col + GEMM
+the default this matters less; if the direct path is kept for the long activations, its tile is the
+next thing to look at. Its access pattern is worse than a GEMM's -- weights strided by OC, activations
+by LP -- so the gap is not all spill.
+
+**3. `CONV_TRANSPOSE_1D` is 11.5% of a VITS synthesis and has never been looked at here.** Patches
+`ggml-0008`/`0009` shaped it for other architectures; whether its inner loop holds an accumulator
+array of the kind that cost 2.3x in `ggml_conv_1d_direct_tile_impl` is unknown. One benchmark answers
+it.
+
+**4. The ceiling, so the remaining work can be sized.** VITS's convolutions are ~7.46 GMAC (§6.7's
+bucket table). At the GEMM's 226.7 MMAC/s that is **33 s**; it currently takes 103. So roughly 3x is
+still on the table in the convolution path, and almost nothing anywhere else -- `MUL_MAT` is 1% of
+that graph and the elementwise remainder is memory-bound.
+
+**5. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
+the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
+
+**Two things that look like opportunities and are not.** Padding conformer's `d_model` from 176 to 192
+so its weights could be block-quantized is now a **pessimisation**: the F32 kernel reaches 226.7 where
+the q4_0 one reaches 167.9, so quantizing those weights would make them slower, not faster. And
+threading is not a lever at all -- the board has one core.
+
+**One that is not FLOPs but raises the ceiling.** `distilbert-ner` carries **90.9 MB of F32
+embeddings** out of its 131 MB RSS, declined by the exporter's op gate rather than by any shape rule
+(`GET_ROWS` is not in `PACKED_WEIGHT_FIRST_OPS`). Quantizing it would cut the model's footprint about
+2.5x, which on 512 MB is the difference between what fits and what does not.
+
+### 6.9 What is still not there
 
 * **No PyPI install.** `pip install <release-asset URL>`, and README says so rather than letting pip
   fall through to building an sdist on a 1 GHz core.
