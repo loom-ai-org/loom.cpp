@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index bd719d66..8c336c6c 100644
+index 81ccc8fa..956b5cc8 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -17,6 +17,9 @@
@@ -12,7 +12,45 @@ index bd719d66..8c336c6c 100644
  
  #include <algorithm>
  #include <cfloat>
-@@ -7290,6 +7293,47 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
+@@ -7137,6 +7140,37 @@ static int64_t ggml_conv_1d_direct_budget(void) {
+         }
+         sz = sizeof(uint64_t); v = 0;
+         if (sysctlbyname("hw.l3cachesize", &v, &sz, NULL, 0) == 0) l3 = (long) v;
++#elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        // ARMv6 -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1, and only it. `sysconf` reports 0
++        // for every cache level here, so without this arm the 512 KB floor below applies: THIRTY-TWO
++        // TIMES the only cache this core has. An ARM1176 has a 16 KB L1 data cache and no L2 it can
++        // use -- the BCM2835's 128 KB L2 sits in front of the GPU -- so a rule written as "the
++        // weights have to live in cache" was answering with a number no weight tensor could ever
++        // meet.
++        //
++        // It matters more here than the arithmetic does, because of what the direct sweep spends its
++        // bandwidth on: it re-reads the WHOLE weight tensor once per position block, and a block is
++        // GGML_CONV1D_VEC * GGML_CONV1D_LANES = 4 positions on this arm, so the traffic is one byte
++        // of weights per MAC no matter the shape. Inside L1 that byte is free; outside it the sweep
++        // is DRAM-bound and a GEMM -- which blocks both operands instead of streaming one of them --
++        // wins by whatever the miss rate is.
++        //
++        // Measured per shape on a Pi Zero W, one VITS synthesis, direct sweep against im2col + the
++        // tinyBLAS_F32_ARMV6 GEMM of ggml-0018 (loom `docs/epics/epic-08` 6.8):
++        //
++        //     OC=32,  L=70400, weights  28 KB    22.53 s   vs   23.71 s    sweep wins by 5%
++        //     OC=64,  L=17600, weights 112 KB    35.29 s   vs   22.81 s    GEMM 1.55x
++        //     OC=128, L=2200,  weights 448 KB    26.60 s   vs   11.84 s    GEMM 2.25x
++        //
++        // so the turn is between 28 KB and 112 KB, and 32 KB is where it goes: twice the L1, because
++        // this core's replacement policy is not LRU and a working set of about twice the cache still
++        // takes roughly half its reads out of it -- which is what the 28 KB row is. End to end, ABBA
++        // on one wheel: VITS 137.1 -> 100.0 s, 1.371x, and 80x -> 31x of real time.
++        //
++        // NOT `return false` from the predicate, however tempting: at OC=32 the sweep is still ahead,
++        // and it is also the arm that does not stage patches at all. This is a budget because the
++        // question is a budget.
++        l2 = 32 * 1024;
+ #else
+ #if defined(_SC_LEVEL3_CACHE_SIZE)
+         l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+@@ -7312,6 +7346,47 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
          for (int i = 0; i < ocn; ++i)
              for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
      }
@@ -60,7 +98,7 @@ index bd719d66..8c336c6c 100644
  #else
      float acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
      for (int i = 0; i < GGML_CONV1D_OCB; ++i)
-@@ -7741,6 +7785,87 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+@@ -7763,6 +7838,87 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
  // The one thing it is NOT right for is a convolution inside a decode loop, where the dequantize would
  // be paid per token rather than per utterance. Nothing in ggml routes SSM_CONV here.
  
@@ -148,7 +186,7 @@ index bd719d66..8c336c6c 100644
  // The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
  // `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
  static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
-@@ -7775,7 +7900,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7797,7 +7953,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                                                // output element is stored.
                                                const float *               in_data   = nullptr,
                                                const float *               leaky     = nullptr,
@@ -163,7 +201,7 @@ index bd719d66..8c336c6c 100644
  
      GGML_ASSERT(ggml_is_contiguous(kernel));
      GGML_ASSERT(kernel->type == kernel_type);
-@@ -7823,8 +7954,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7845,8 +8007,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          p.wdata = (char *) params->wdata + kbytes;
          p.wsize = params->wsize - kbytes;
  
@@ -184,7 +222,7 @@ index bd719d66..8c336c6c 100644
          return;
      }
  
-@@ -8033,8 +8175,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -8055,8 +8228,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          // conv -- and skipping it is most of what makes this op worth using at all: with the cache
          // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
          if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
