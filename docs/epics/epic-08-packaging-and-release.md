@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-04
+last_updated: 2026-09-08
 ---
 
 # Epic-08: Packaging and Release
@@ -58,7 +58,7 @@ illegal-instruction report from an older install.
 | | |
 |---|---|
 | Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) |
-| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md) |
+| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 
 ## 4. macOS wheels (P4.10) — SHIPPED 2026-08-31, verified on an M1 Pro
@@ -859,43 +859,81 @@ task, and it is debugging rather than kernel writing.
 Ordered by evidence, not by appeal. Everything here was measured on the board with the kernels of
 §6.6 installed.
 
-**1. The direct-convolution predicate is now wrong on this architecture, and turning it off is worth
-1.27x today.** `ggml_conv_1d_direct_ok` chooses the direct sweep over im2col + GEMM, and it was tuned
-where that is right. It no longer is here, because the GEMM got a tile and the sweep's is worse:
+**1. SHIPPED — the direct-convolution predicate was reading a cache size from another machine.**
+`ggml_conv_1d_direct_budget()` decides whether a convolution's weights are small enough for the direct
+sweep to pay, and it asks `sysconf`. An ARM1176 reports **0 for every level**, so the function fell to
+its 512 KB floor — on a core with a 16 KB L1 data cache and no L2 it can use, the BCM2835's 128 KB L2
+belonging to the GPU. Thirty-two times too generous, and silently.
 
-| VITS, 3.24 s of audio | |
-|---|---|
-| direct sweep (default) | 130.6 s |
-| `GGML_CPU_DISABLE_CONV_HEURISTICS=1` -> im2col + GEMM | **103.0 s** |
+That matters more here than the arithmetic does. The direct sweep re-reads the WHOLE weight tensor
+once per position block, and a block is four positions on this arm, so its weight traffic is **one
+byte per MAC whatever the shape**. Inside L1 that byte is free; outside it the sweep is DRAM-bound and
+a GEMM, which blocks both operands, wins by whatever the miss rate is. Per shape, one VITS synthesis,
+`LOOM_PROFILE_NODES=1` at one thread, same wheel both arms:
 
-ASR oracle passes on the second (the waveform changes again — a different lowering rounds
-differently). Against the pre-kernel baseline that is **259.0 -> 103.0 s, 2.51x, 81x -> 32x real
-time**. Note this reverses an earlier measurement: before the tiled GEMM the same switch was **1.63x
-SLOWER** ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) carries that entry
-and it should be annotated rather than deleted — both numbers are true, of different kernels).
+| dst shape (OL,1,OC,1) | calls | weights | direct sweep | im2col + GEMM | |
+|---|---|---|---|---|---|
+| 70400,1,32,1  | 6  |  28 KB | **22529.7 ms** | 23714.6 ms | sweep by 5% |
+| 17600,1,64,1  | 6  | 112 KB | 35290.3 ms | **22806.2 ms** | GEMM 1.55x |
+|  2200,1,128,1 | 6  | 448 KB | 26598.5 ms | **11837.2 ms** | GEMM 2.25x |
+|   275,1,384,1 | 28 | 1.47 MB | 17520.1 ms | 17854.1 ms | declines in both |
+|    94,1,192,1 | 44 | 147 KB | 3800.7 ms | 3833.6 ms | declines in both |
 
-**Do not simply hardcode the predicate to false.** The switch disables it for every shape, and the
-direct path exists partly to avoid materialising im2col — at VITS's L=70400 that is 15.8 MB on a
-427 MB board. The work is a per-bucket comparison and then an ARMv6 arm of the predicate, not a
-one-liner, however tempting the one-liner looks.
+The turn is between 28 KB and 112 KB, so `ggml-0019` gives the function an ARMv6 arm returning
+**32 KB** — twice the L1, because this core's replacement policy is not LRU and a working set of about
+twice the cache still takes roughly half its reads out of it, which is what the 28 KB row is.
+`ggml-0006` grows **`GGML_CPU_CONV1D_BUDGET`** alongside it, a byte count that overrides the detection
+entirely; that is what made every number below measurable.
 
-**2. The convolution tile is still 4.4x below the GEMM.** After the explicit-scalar rewrite it is
-51.8 MMAC/s (`scripts/bench34.c`) where `tinyBLAS_F32_ARMV6` reaches 226.7. If (1) makes im2col + GEMM
-the default this matters less; if the direct path is kept for the long activations, its tile is the
-next thing to look at. Its access pattern is worse than a GEMM's -- weights strided by OC, activations
-by LP -- so the gap is not all spill.
+**End to end on the board**, one wheel, one session per block, VITS on 3.24 s of audio. The four
+configurations are the two decisions `GGML_CPU_DISABLE_CONV_HEURISTICS` used to gate together:
+
+| | direct predicate | im2col patch batching | VITS |
+|---|---|---|---|
+| **OLD** — `CONV1D_BUDGET=524288`, today's floor | accepts all three | on | 149.20 / 125.03 s |
+| **NEW** — default, **shipped** | accepts OC=32 only | on | 101.12 / 100.81 / 97.24 / 100.92 s |
+| **ZERO** — `CONV1D_BUDGET=0` | off entirely | on | 113.14 / 115.88 s |
+| **SWITCH** — `DISABLE_CONV_HEURISTICS=1` | off entirely | **off** | 99.62 s |
+
+**VITS 137.1 -> 100.0 s, 1.371x**, and 80x -> **31x real time** against the pre-kernel baseline.
+conformer-ctc (17.2 / 13.6 -> 13.3 / 13.5 s) and distilbert-ner (6.36 / 6.00 -> 5.93 / 8.34 s) have no
+convolution in this budget's range and sit inside their own spread; this board's first launch after an
+install is routinely 15-20% slow, which is the 149.2 and the 17.2. The ASR oracle transcribes the OLD,
+NEW and ZERO waveforms alike as *"Hello world, this is a Raspberry Pi Zero."*, 8/8 words.
+
+**Read the last two rows before quoting the old 1.27x, because it was two things.** ZERO and SWITCH
+differ only in the batch budget, so the switch decomposes: **1.197x is the predicate** (OLD -> ZERO)
+and **1.149x is the batch budget** (ZERO -> SWITCH), and 1.197 x 1.149 = 1.376 is the whole of it. The
+predicate was never the whole story, and the "**15.8 MB of im2col at L=70400**" this section used to
+warn about was a property of the switch's *other* half rather than of declining the direct path.
+[Retro-036](../retros/retro-036-one-switch-two-decisions.md) carries how that was got wrong twice.
+
+**What the shipped change is worth is that it needs neither.** At 1.371x it matches the whole switch
+without touching the batch budget at all, because it keeps the sweep on the one bucket where the sweep
+wins — which is also why it is a budget and not a `return false`: ZERO gives up 14% against NEW.
+
+**2. The im2col patch-batch budget, now sized: 1.149x, and in the wrong direction.** `ggml-0004` caps
+a batch at 512 KB so the patches stay in cache between the im2col and the GEMM. That is 32x this
+core's L1, so nothing stays in anything, and all the cap buys is barriers and a narrower GEMM. Turning
+it off is worth 1.149x on the buckets that batch — and those are exactly the long convolutions the new
+predicate now sends to im2col, so this is the next item rather than an aside. It needs its own knob to
+measure on top of the new predicate: `GGML_CPU_DISABLE_CONV_HEURISTICS` still moves both.
 
 **3. `CONV_TRANSPOSE_1D` is 11.5% of a VITS synthesis and has never been looked at here.** Patches
 `ggml-0008`/`0009` shaped it for other architectures; whether its inner loop holds an accumulator
 array of the kind that cost 2.3x in `ggml_conv_1d_direct_tile_impl` is unknown. One benchmark answers
 it.
 
-**4. The ceiling, so the remaining work can be sized.** VITS's convolutions are ~7.46 GMAC (§6.7's
-bucket table). At the GEMM's 226.7 MMAC/s that is **33 s**; it currently takes 103. So roughly 3x is
-still on the table in the convolution path, and almost nothing anywhere else -- `MUL_MAT` is 1% of
-that graph and the elementwise remainder is memory-bound.
+**4. The direct tile is still 4.4x below the GEMM, and now applies to one bucket.** 51.8 MMAC/s
+(`scripts/bench34.c`) against `tinyBLAS_F32_ARMV6`'s 226.7. After (1) the only convolution still taking
+the sweep is OC=32 at L=70400 — the bucket where the sweep is already ahead — so this is worth less
+than it was, not more.
 
-**5. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
+**5. The ceiling, so the remaining work can be sized.** VITS's convolutions are ~7.46 GMAC (§6.7's
+bucket table). At the GEMM's 226.7 MMAC/s that is **33 s**. Everything else is small — `MUL_MAT` is 1%
+of that graph and the elementwise remainder is memory-bound.
+
+**6. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
 the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
 
 **Two things that look like opportunities and are not.** Padding conformer's `d_model` from 176 to 192

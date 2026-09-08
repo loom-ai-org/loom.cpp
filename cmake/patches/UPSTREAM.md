@@ -346,6 +346,18 @@ passes. It is worth **1.52x** at 128x128 kw7 dilation 12 and **0.48x** at 32x32 
 is gated to `kw >= 7 && dilation >= 3 && IC*kw >= 768` and to aarch64, where those instructions exist.
 Two convolutions of the model take it, for 1.487 -> 1.463 s.
 
+**An escape hatch for the cache rule, added after the floor was caught being wrong.**
+`GGML_CPU_CONV1D_BUDGET` overrides the whole detection with a plain byte count; zero declines the
+direct path for every shape. It exists because the floor is not merely approximate on a machine that
+reports nothing — it can be off by a factor of thirty-two. An ARM1176 (Raspberry Pi Zero) has a 16 KB
+L1 and no L2 the CPU can use, `sysconf` reports 0 for every level, and the 512 KB floor therefore said
+yes to every convolution in a TTS model; routing three of its shapes by their real weight footprint
+instead is worth **1.371x on a whole synthesis**. The important part for a reviewer is *why a second
+switch*: `GGML_CPU_DISABLE_CONV_HEURISTICS` already existed and could not be used to find this,
+because it also disables PR 4's patch-batch budget. Splitting them showed the two are worth 1.197x and
+1.149x respectively — half of what that switch had been credited with belonged to the other decision.
+One switch per decision.
+
 **What a reviewer should push on.** The 512 KB floor, the `OC % 4` restriction and the phase window's
 three constants are all "good enough for what was measured" rather than principled; the tile sizes are tuned on two machines; and there is
 no ARM64 counterpart to the AVX2 path for AVX-512 or SVE, which would want their own tile. Also worth

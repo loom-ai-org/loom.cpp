@@ -1,3 +1,5 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index b0d201d4..eba80c44 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -1,5 +1,15 @@
@@ -16,7 +18,7 @@
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
  #include "binary-ops.h"
-@@ -6990,6 +6997,502 @@
+@@ -6991,6 +7001,524 @@ void ggml_compute_forward_col2im_1d(
  
  // ggml_compute_forward_conv_2d
  
@@ -47,6 +49,28 @@
 +static int64_t ggml_conv_1d_direct_budget(void) {
 +    static int64_t budget = -1;
 +    if (budget < 0) {
++        // AN OVERRIDE AHEAD OF ANY OF THE DETECTION. Everything below is a cache size read from the
++        // OS -- which several platforms simply do not report, and every one of those lands on the
++        // 512 KB floor -- combined with a fraction tuned on the machines that were to hand. A board
++        // it mispredicts needs an escape that is not a rebuild, and it needs one that is NOT
++        // GGML_CPU_DISABLE_CONV_HEURISTICS: that switch also disables the im2col batch budget below,
++        // so it cannot tell a wrong answer here from a wrong answer there. Sweeping this is how the
++        // ARMv6 arm of this function was found, and the two switches disagreed about which of them
++        // the win belonged to.
++        //
++        // Bytes, decimal. Zero declines the direct path for every shape, which is the clean way to
++        // ask "what is this path worth on my model" without changing anything else.
++        {
++            const char * e = getenv("GGML_CPU_CONV1D_BUDGET");
++            if (e && e[0]) {
++                char * end = NULL;
++                const long long v = strtoll(e, &end, 10);
++                if (end != e && *end == '\0' && v >= 0) {
++                    budget = (int64_t) v;
++                    return budget;
++                }
++            }
++        }
 +        long l2 = 0, l3 = 0;
 +#if defined(__APPLE__)
 +        // sysctl, BECAUSE THE sysconf NAMES BELOW DO NOT EXIST HERE. `_SC_LEVEL2_CACHE_SIZE` and
@@ -519,7 +543,7 @@
  
  static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
                                                const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
-@@ -7031,6 +7501,25 @@
+@@ -7032,6 +7560,25 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
      void  * knl_data       = kernel->data;
      float * dst_data       = out_data ? out_data : (float *) dst->data;
  

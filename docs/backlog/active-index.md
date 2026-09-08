@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-05
+last_updated: 2026-09-08
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -221,15 +221,24 @@ are not renumbered. New items continue the scheme.
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 
-* [ ] **P7.1 — the rest of the ARMv6 convolution path.** ARMv6 shipped (P7, commits `e321220` and
-  `82061ac` on `feat/p7-armv6`) and its matmuls are done: conformer-ctc is **4.28x** and VITS
-  **1.80x** on a Pi Zero W. What is left is all convolution. **The first item is measured and worth
-  1.27x on VITS today** — `ggml_conv_1d_direct_ok` now picks the wrong lowering on this architecture,
-  and `GGML_CPU_DISABLE_CONV_HEURISTICS=1` takes VITS 130.6 -> 103.0 s with the ASR oracle passing.
-  It needs a per-bucket comparison rather than a hardcoded `false`, because the direct path also
-  avoids materialising 15.8 MB of im2col at L=70400. Roughly **3x total** remains in that path
-  (7.46 GMAC against a 226.7 MMAC/s GEMM is 33 s; it takes 103). *Context:
-  [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
+* [ ] **P7.1 — the rest of the ARMv6 convolution path.** ARMv6 shipped (P7), and so has the first
+  item of this one: **`ggml_conv_1d_direct_budget` was returning 512 KB on a core with a 16 KB L1**,
+  because `sysconf` reports nothing there. An ARMv6 arm returning 32 KB routes every VITS convolution
+  the way a per-shape profile says it should — **VITS 137.1 -> 100.0 s, 1.371x, 80x -> 31x real
+  time**, ASR oracle 8/8 — and `ggml-0006` grew `GGML_CPU_CONV1D_BUDGET` to make it measurable. Not a
+  hardcoded `false`: declining every shape gives up 14%. What is left, in order:
+  * **the im2col patch-batch budget, sized at 1.149x and pointing the wrong way.** `ggml-0004` caps a
+    batch at 512 KB so the patches stay in cache between the im2col and the GEMM; that is 32x this
+    core's L1, so the cap buys nothing and costs barriers and a narrower GEMM. It needs its own knob
+    to measure on top of the new predicate — `GGML_CPU_DISABLE_CONV_HEURISTICS` still moves both, and
+    [Retro-036](../retros/retro-036-one-switch-two-decisions.md) is what that cost the first time;
+  * **`CONV_TRANSPOSE_1D`, 11.5% of a synthesis and never looked at here** — `ggml-0008`/`0009`
+    shaped it for other architectures, and whether its inner loop holds the accumulator array that
+    cost 2.3x in `ggml_conv_1d_direct_tile_impl` is unknown. One benchmark answers it;
+  * the **direct tile at OC=32**, now the only bucket that takes the sweep — and the one where it is
+    already ahead, so worth less than it looks;
+  * an **int16 `__smlad` path**, 1.19x and a type ggml does not have. Last.
+  *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
 
