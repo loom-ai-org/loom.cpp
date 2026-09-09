@@ -1030,21 +1030,44 @@ pays twice. [Retro-012](../retros/retro-012-optimizations-that-were-measured-out
 isolated number usually overstates; this is the case where it understated, and for a reason worth
 recognising — a phase that interleaves with another in a tight loop is not separable by construction.
 
-**7. MOSTLY MEASURED OUT — cache-blocking the GEMM's reduction.** `tinyBLAS`'s `mnpack` is a 4x4
-REGISTER tile with no cache blocking, so the patch panel is re-read once per 4-column tile — 16x, 32x
-and 96x at the three buckets' shapes. Blocking `k` so the panel slice stays resident wins on two of
-seven shapes (2200 k=7 at **1.55x**, k=3 at 1.16x) and loses on five, for **1.76 s** available. A gate
-derived from the L1 rather than fitted — block when the tile's eight operand strips exceed it, i.e.
-`k > 512` — captures 1.58 s of that and classifies six of the seven correctly. Not taken for now: it
-reorders the reduction, so unlike everything else in this section it would not be bit-identical, and
-it needs accumulate variants of every tile kernel. `scripts/bench40.c`.
+**7. SHIPPED — the GEMM had a register tile and no cache blocking.** `tinyBLAS`'s `mnpack` sweeps the
+whole (m, n) space flat, so with `col_outer` set the patch panel is streamed once per 4-column tile —
+16x, 32x and 96x at the three buckets' shapes, against panels of 18-56 KB and a 16 KB L1. `ggml-0018`
+blocks the reduction so the panel slice stays resident, accumulating C across chunks.
 
-**THE ESTIMATE THIS SECTION CARRIED FOR THIS WORK WAS WRONG, and instructively.** It said 16-21 s was
-in the im2col path, computed by dividing the buckets' MACs by 226.7 and 285.6 MMAC/s. Those are
-rooflines measured at *other shapes* — the exact error
-[Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md) had just been written to record. At
-these shapes the flat GEMM already runs at 114-262 MMAC/s and there was never 16 s in it. What was
-really there: 5.7 s in the gather, 1.8 s in blocking, and the permute below.
+**The gate is `k > 512`, and it is derived rather than fitted**: a 4x4 tile keeps eight operand strips
+live — four rows of each panel, `k` floats each — so they stop fitting the L1 at `L1 / (8 * 4)`.
+Swept over the seven real shapes in both sweep orders, with the unblocked arm re-measured after each
+(`scripts/bench40.c`):
+
+| shape | flat | blocked | |
+|---|---|---|---|
+| m=16 n=128 k=896 | 114.5 | **178.3** | 1.55x, blocked |
+| m=8 n=384 k=960 | 148.4 | 147.0 | 1.00x, blocked, neutral |
+| m=32 n=128 k=384 | 165.5 | 190.1 | 1.16x, **not** blocked, k <= 512 |
+| m=32 n=64 k=448 | 198.9 | 195.4 | 0.98x |
+| m=40 n=64 k=320 | 211.5 | 193.9 | 0.92x |
+| m=64 n=64 k=192 | 247.4 | 198.1 | 0.80x |
+| m=24 n=384 k=192 | 261.7 | 190.4 | 0.73x |
+
+Five of the seven LOSE when blocked, some by a quarter, so the gate leaves the k=384 shape's 1.16x on
+the table rather than widen to a threshold the cache does not justify. **VITS, ABBA: 68.92 / 69.02 ->
+67.92 / 67.70 s, 1.017x.** conformer-ctc (10.5 s, its `k` is 176 and never blocks) and distilbert-ner
+(5.08 s) do not move.
+
+**THE ONE CHANGE IN THIS WORK THAT IS NOT BIT-IDENTICAL.** Splitting a reduction re-associates it, so
+per [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) it owes the ASR oracle
+rather than a hash. Waveform against the unblocked wheel: **corr 0.99999976, rel-RMS 6.9e-4**, peak
+and RMS identical to four decimals — a lowering change on this model gives 0.19 by comparison, so this
+is a reordered sum and nothing else. Transcripts exact on all three models, VITS 8/8 words.
+
+**And it was gated without the board**, which is new: `scripts/armv6_oracle.sh` runs the wheel in the
+`linux/arm/v6` build container, so the real `__ARM_FEATURE_SIMD32` kernels execute under qemu.
+Calibrated twice — the gather wheel gives `f4859f55` in both places, and this one gives `5e48639e` in
+both — the second being the stronger check, since a re-associating change is exactly where softfloat
+and a real VFP could have diverged. An x86 build cannot test any of this: the kernels are `#if`'d out.
+conformer-ctc and distilbert-ner emit text and are checked there by equality; only VITS needs
+`scripts/asr_oracle.py`, which is `transformers`' whisper-small and runs natively.
 
 **8. MEASURED OUT — the permute-back.** After the GEMM the result is scattered into `dst` with a
 stride of `dst_w*dst_h` floats: a cache line per output element, 11.4 M of them across a synthesis,
