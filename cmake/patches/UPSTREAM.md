@@ -1166,6 +1166,46 @@ is 75/75 on the same machine. whisper-small on Metal is unchanged, which is the 
 leading pad, so nothing in it should move, and nothing does.
 
 
+## PR 17 — `conv_2d`: gather the im2col patches a run at a time, not an element at a time
+
+*(`cmake/patches/ggml-0020-conv2d-gather-runs.patch`, sits on top of PR 4 and PR 7)*
+
+**Problem.** The patch gather computes, per ELEMENT, two strided coordinates, a four-way bounds test
+and a three-term address — roughly fifteen instructions to move one float. For a 1-D convolution over
+a contiguous source all of that is spent walking a straight line: for a fixed `(ic, kx)` the elements
+successive patches contribute are a **contiguous run** of the input, `p + kx*dilation - pad` for
+consecutive `p`, and the only thing that varies is where they land, a store of stride `knl_n`.
+
+**Fix.** Take the run at a time when the shape allows it — `knl_h == 1`, one image, stride 1, F32,
+contiguous source — and resolve the bounds into a leading zero-fill, a body and a trailing zero-fill,
+computed once per run instead of once per element. Everything else falls through to the general loop
+unchanged.
+
+**Evidence**, a Pi Zero W over a VITS vocoder's seven convolution shapes (`scripts/bench41.c`):
+
+| | per element | across a synthesis |
+|---|---|---|
+| element at a time | 33-75 ns | 2.17 s |
+| run at a time | 18-32 ns | **0.98 s** |
+
+End to end, ABBA on one board: **74.44 / 75.13 s -> 69.15 / 69.05 s, 1.082x**, with `CONV_2D` as a
+whole 62697 -> 58159 ms.
+
+**Bit-identical**: the same values to the same places in a different order. Verified by hashing a whole
+synthesis on x86 and across all four arms on the board.
+
+**Worth noting for a reviewer, because it cuts against the usual caution.** The gather measured alone
+saves 1.19 s and end to end it saves 5.69 s — the isolated number UNDERSTATED it, which is rare. The
+element-at-a-time gather was evicting the cache for the GEMM that consumes its output immediately
+afterwards, so the locality fix pays twice. A phase that interleaves with another in a tight loop is
+not separable by construction.
+
+**What a reviewer should push on.** The fast path duplicates the general loop's semantics rather than
+sharing them, so a change to one has to be mirrored in the other; the guard is the honest way to keep
+that bounded but it is still two code paths. And the leaky-ReLU fusion of PR 7 is applied in both.
+
+---
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
