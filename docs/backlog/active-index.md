@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-09
+last_updated: 2026-09-10
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -221,25 +221,23 @@ are not renumbered. New items continue the scheme.
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 
-* [ ] **P7.1 — the ARMv6 convolution path.** Five shipped, four measured out; VITS across P7 and
-  P7.1 is **181.8 -> 67.8 s, 57.0x -> 20.9x real time**. Four of the five were the same bug, a
-  cache-sized decision made on a machine with a bigger cache: the **direct-1d predicate's budget**
-  512 KB -> 32 KB (**1.223x**), the **im2col patch-batch cap** 512 KB -> 64 KB (**1.061x**),
-  **`CONV_TRANSPOSE_1D`'s two GEMM panels** skewed off a shared cache way (**1.49x on the op**), and
-  the **GEMM's missing cache blocking**, gated at `k > L1/32` (**1.017x**). The fifth is the **im2col
-  patch gather**, fifteen instructions per float to walk a straight line, now taken a run at a time
-  (**1.082x**). All bit-identical except the last, which re-associates a reduction and was gated on
-  the ASR oracle instead.
-  **Measured out — do not re-propose** ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)):
-  the OC=32 direct sweep (im2col is 12% *slower*, phase-major loses on five of six), the permute-back
-  (**3.2x on its own, 0.24 s slower in the model**), and `CONV_TRANSPOSE_1D`'s remaining data
-  movement (0.03%).
-  **What is left is one item**: the **int16 `__smlad` path**, 270 against 226.7 MMAC/s on the best F32
-  tile — 1.19x on the kernel, and it needs a type ggml does not have.
-  **Two things to read first.** A phase of `conv_2d` measured alone does not predict its worth in the
-  graph and **the sign is not predictable** — the gather understated by 5x, the permute overstated
-  past zero. And correctness no longer needs the board: `scripts/armv6_oracle.sh` runs the wheel in
-  the emulated container, calibrated bit-identical to the Pi twice over, so the board is for timings.
+* [ ] **P7.1 — the ARMv6 convolution path.** Six shipped, five measured out. VITS across P7 and
+  P7.1: **181.8 -> 60.2 s, 57.0x -> 18.9x real time**, a **3.02x** on the tier's own baseline.
+  Four of the six fixes were one bug — a cache-sized decision made on a machine with a bigger cache:
+  the **direct-1d budget** 512 KB -> 32 KB (**1.223x**), the **im2col patch cap** 512 KB -> 64 KB
+  (**1.061x**), **`CONV_TRANSPOSE_1D`'s panels** skewed off a shared cache way (**1.49x on the op**),
+  and the **GEMM's missing cache blocking**, gated at `k > L1/32` (**1.017x**). The fifth is the
+  **patch gather**, now taken a run at a time (**1.082x**). The sixth is **declining the ARMv6
+  quantized convolution GEMM** (**1.107x**) — it won 5.65x when written, against an F32 kernel that
+  has since been replaced twice.
+  **Measured out** ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)): the
+  OC=32 direct sweep, phase-major, `CONV_TRANSPOSE_1D`'s data movement, the permute-back (3.2x alone,
+  slower in the model), and the **int16 `__smlad` path** — §6.5 already retracted the 3.61x that
+  motivated it, and §6.8 item 9 measured this project's actual integer GEMM at 0.90x.
+  **What is left is one thing, and it is new**: `ggml-0013` **dequantizes the kernel once per call**,
+  which is 73728 elements x 44 calls on VITS's 94 bucket and costs **1.4 s** there — the one bucket
+  where the quantized GEMM was winning. A dequant-amortisation problem, not a GEMM one; unmeasured
+  beyond that delta.
   *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
