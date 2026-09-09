@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
-index bf9b8c8b..bd9d0b6d 100644
+index bf9b8c8b..5babe8a3 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
 @@ -57,6 +57,21 @@
@@ -50,7 +50,7 @@ index bf9b8c8b..bd9d0b6d 100644
          mnpack(0, m, 0, n);
      }
  
-@@ -4098,6 +4132,335 @@ class tinyBLAS_PPC {
+@@ -4098,6 +4132,388 @@ class tinyBLAS_PPC {
      const int nth;
  };
  #endif
@@ -255,6 +255,41 @@ index bf9b8c8b..bd9d0b6d 100644
 +    void matmul(int64_t m, int64_t n) {
 +        // Same rule as the quantized kernel: keep the smaller panel resident and stream the other.
 +        col_outer = n * k > m * k;
++
++        // AND, WHEN THE REDUCTION IS LONG ENOUGH, BLOCK IT -- because the tile below is a REGISTER
++        // tile and there is no cache blocking anywhere else in this class. A 4x4 tile keeps EIGHT
++        // operand strips live, four rows of each panel, `k` floats each; past `L1 / (8 * 4)` they stop
++        // fitting and every tile re-reads them from memory. On an ARM1176's 16 KB L1 that boundary is
++        // k = 512, which is where the gate is -- derived, not fitted.
++        //
++        // Swept on a Pi Zero W over a VITS vocoder's seven im2col GEMM shapes, two passes in both
++        // sweep orders with the unblocked arm re-measured after each (loom `scripts/bench40.c`):
++        //
++        //     m= 16 n=128 k=896   114.5 -> 178.3 MMAC/s   1.55x   <- blocked
++        //     m=  8 n=384 k=960   148.4 -> 147.0            1.00x   <- blocked, neutral
++        //     m= 32 n=128 k=384   165.5 -> 190.1            1.16x   <- NOT blocked, k <= 512
++        //     m= 32 n= 64 k=448   198.9 -> 195.4            0.98x
++        //     m= 40 n= 64 k=320   211.5 -> 193.9            0.92x
++        //     m= 64 n= 64 k=192   247.4 -> 198.1            0.80x
++        //     m= 24 n=384 k=192   261.7 -> 190.4            0.73x
++        //
++        // The gate leaves the k=384 win on the table rather than widen to a threshold the L1 does not
++        // justify: five of the seven shapes LOSE when blocked, some by a quarter, so a rule fitted to
++        // include one more winner would be fitted to the model in front of it. `kc = 128` is the
++        // measured optimum across the blocked shapes (1.55x against 1.31x at 32 and 1.39x at 512).
++        //
++        // THIS IS THE ONE THING IN THE ARMv6 WORK THAT IS NOT BIT-IDENTICAL: splitting the reduction
++        // re-associates it. See ADR-026 on what that obliges.
++        if (k > (int64_t) 512) {
++            for (int64_t k0 = 0; k0 < k; k0 += 128) {
++                kk0   = k0;
++                kkn   = MIN((int64_t) 128, k - k0);
++                accum = k0 > 0;
++                mnpack(0, m, 0, n);
++            }
++            return;
++        }
++        kk0 = 0; kkn = k; accum = false;
 +        mnpack(0, m, 0, n);
 +    }
 +
@@ -307,19 +342,19 @@ index bf9b8c8b..bd9d0b6d 100644
 +        for (int64_t job = start; job < end; ++job) {
 +            const int64_t jj = col_outer ? n0 + job / ytiles * 4 : n0 + job % xtiles * 4;
 +            const int64_t ii = col_outer ? m0 + job % ytiles * 4 : m0 + job / xtiles * 4;
-+            const float * a0 = A + lda * (ii + 0);
-+            const float * a1 = A + lda * (ii + 1);
-+            const float * a2 = A + lda * (ii + 2);
-+            const float * a3 = A + lda * (ii + 3);
-+            const float * b0 = B + ldb * (jj + 0);
-+            const float * b1 = B + ldb * (jj + 1);
-+            const float * b2 = B + ldb * (jj + 2);
-+            const float * b3 = B + ldb * (jj + 3);
++            const float * a0 = A + lda * (ii + 0) + kk0;
++            const float * a1 = A + lda * (ii + 1) + kk0;
++            const float * a2 = A + lda * (ii + 2) + kk0;
++            const float * a3 = A + lda * (ii + 3) + kk0;
++            const float * b0 = B + ldb * (jj + 0) + kk0;
++            const float * b1 = B + ldb * (jj + 1) + kk0;
++            const float * b2 = B + ldb * (jj + 2) + kk0;
++            const float * b3 = B + ldb * (jj + 3) + kk0;
 +            float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
 +            float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
 +            float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
 +            float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
-+            for (int64_t l = 0; l < k; ++l) {
++            for (int64_t l = 0; l < kkn; ++l) {
 +                const float x0 = *a0++, x1 = *a1++, x2 = *a2++, x3 = *a3++;
 +                const float y0 = *b0++, y1 = *b1++, y2 = *b2++, y3 = *b3++;
 +                c00 += x0 * y0; c01 += x1 * y0; c02 += x2 * y0; c03 += x3 * y0;
@@ -331,10 +366,17 @@ index bf9b8c8b..bd9d0b6d 100644
 +            float * r1 = C + ldc * (jj + 1) + ii;
 +            float * r2 = C + ldc * (jj + 2) + ii;
 +            float * r3 = C + ldc * (jj + 3) + ii;
-+            r0[0] = c00; r0[1] = c01; r0[2] = c02; r0[3] = c03;
-+            r1[0] = c10; r1[1] = c11; r1[2] = c12; r1[3] = c13;
-+            r2[0] = c20; r2[1] = c21; r2[2] = c22; r2[3] = c23;
-+            r3[0] = c30; r3[1] = c31; r3[2] = c32; r3[3] = c33;
++            if (accum) {
++                r0[0] += c00; r0[1] += c01; r0[2] += c02; r0[3] += c03;
++                r1[0] += c10; r1[1] += c11; r1[2] += c12; r1[3] += c13;
++                r2[0] += c20; r2[1] += c21; r2[2] += c22; r2[3] += c23;
++                r3[0] += c30; r3[1] += c31; r3[2] += c32; r3[3] += c33;
++            } else {
++                r0[0] = c00; r0[1] = c01; r0[2] = c02; r0[3] = c03;
++                r1[0] = c10; r1[1] = c11; r1[2] = c12; r1[3] = c13;
++                r2[0] = c20; r2[1] = c21; r2[2] = c22; r2[3] = c23;
++                r3[0] = c30; r3[1] = c31; r3[2] = c32; r3[3] = c33;
++            }
 +        }
 +    }
 +
@@ -353,10 +395,10 @@ index bf9b8c8b..bd9d0b6d 100644
 +            const int64_t ii = col_outer ? m0 + job % ytiles * RM : m0 + job / xtiles * RM;
 +            const float * ap[RM];
 +            const float * bp[RN];
-+            for (int i = 0; i < RM; ++i) ap[i] = A + lda * (ii + i);
-+            for (int j = 0; j < RN; ++j) bp[j] = B + ldb * (jj + j);
++            for (int i = 0; i < RM; ++i) ap[i] = A + lda * (ii + i) + kk0;
++            for (int j = 0; j < RN; ++j) bp[j] = B + ldb * (jj + j) + kk0;
 +            float acc[RN][RM] = {};
-+            for (int64_t l = 0; l < k; ++l) {
++            for (int64_t l = 0; l < kkn; ++l) {
 +                float av[RM], bv[RN];
 +                for (int i = 0; i < RM; ++i) av[i] = *ap[i]++;
 +                for (int j = 0; j < RN; ++j) bv[j] = *bp[j]++;
@@ -364,9 +406,15 @@ index bf9b8c8b..bd9d0b6d 100644
 +                    for (int i = 0; i < RM; ++i)
 +                        acc[j][i] += av[i] * bv[j];
 +            }
-+            for (int j = 0; j < RN; ++j)
-+                for (int i = 0; i < RM; ++i)
-+                    C[ldc * (jj + j) + (ii + i)] = acc[j][i];
++            if (accum) {
++                for (int j = 0; j < RN; ++j)
++                    for (int i = 0; i < RM; ++i)
++                        C[ldc * (jj + j) + (ii + i)] += acc[j][i];
++            } else {
++                for (int j = 0; j < RN; ++j)
++                    for (int i = 0; i < RM; ++i)
++                        C[ldc * (jj + j) + (ii + i)] = acc[j][i];
++            }
 +        }
 +    }
 +
@@ -380,13 +428,18 @@ index bf9b8c8b..bd9d0b6d 100644
 +    const int ith;
 +    const int nth;
 +    bool col_outer = false;
++    // The current reduction block, set by matmul: [kk0, kk0 + kkn), accumulated into C when it is not
++    // the first. Unblocked they are 0, k and false, which is what every other shape gets.
++    int64_t kk0 = 0;
++    int64_t kkn = 0;
++    bool    accum = false;
 +};
 +#endif // __ARM_FEATURE_SIMD32 && !__ARM_NEON && !__aarch64__
 +
  } // namespace
  
  /**
-@@ -4130,6 +4493,34 @@ class tinyBLAS_PPC {
+@@ -4130,6 +4546,34 @@ class tinyBLAS_PPC {
   * @param Ctype is GGML data type of `C`
   * @return true if this function was able to service the matmul request
   */
@@ -421,7 +474,7 @@ index bf9b8c8b..bd9d0b6d 100644
  bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
                       const void *A, int64_t lda, const void *B, int64_t ldb, void *C,
                       int64_t ldc, int Atype, int Btype, int Ctype) {
-@@ -4213,6 +4604,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4213,6 +4657,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              (float *)C, ldc};
      #endif
          return tb.matmul(m, n);
@@ -436,7 +489,7 @@ index bf9b8c8b..bd9d0b6d 100644
  #else
          return false;
  #endif
-@@ -4435,6 +4834,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4435,6 +4887,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              params->ith, params->nth};
          tb.matmul(m, n);
          return true;

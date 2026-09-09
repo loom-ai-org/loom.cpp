@@ -221,25 +221,25 @@ are not renumbered. New items continue the scheme.
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 
-* [ ] **P7.1 — the ARMv6 convolution path.** Four items shipped, four measured out; VITS across P7
-  and P7.1 is **181.8 -> 69.0 s, 57.0x -> 21.3x real time**, ASR oracle 8/8. Three of the four fixes
-  were the same bug — a cache-sized decision made on a machine with a much bigger cache: the
-  **direct-1d predicate's budget** 512 KB -> 32 KB (**1.223x**), the **im2col patch-batch cap**
-  512 KB -> 64 KB (**1.061x**), and **`CONV_TRANSPOSE_1D`'s two GEMM panels**, a whole number of 4 KB
-  cache ways apart, now skewed 16 floats (**1.49x on the op**). The fourth is the **im2col patch
-  gather**, fifteen instructions per float to walk a straight line, now taken a run at a time
-  (**1.082x**). All four bit-identical.
-  **Measured out, in [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) — do
-  not re-propose**: the OC=32 direct sweep (im2col is 12% *slower*, phase-major loses on five of six),
-  `CONV_TRANSPOSE_1D`'s remaining data movement (0.03%), cache-blocking the GEMM's reduction (two of
-  seven shapes, 1.76 s, not bit-identical), and the permute-back (**3.2x on its own and 0.24 s slower
-  in the model**).
-  **What is left**: the gated GEMM blocking, if 1.58 s is ever worth losing bit-identity for, and the
-  **int16 `__smlad` path** (1.19x, and a type ggml does not have). Neither is large.
-  **Before opening any of it**, note what §6.8 keeps producing: a phase of `conv_2d` measured alone
-  does not predict its worth in the graph and **the sign is not predictable** — the gather understated
-  by 5x, the permute overstated past zero. `scripts/bench35-42.c` are the attribution tools; only an
-  ABBA on the model decides.
+* [ ] **P7.1 — the ARMv6 convolution path.** Five shipped, four measured out; VITS across P7 and
+  P7.1 is **181.8 -> 67.8 s, 57.0x -> 20.9x real time**. Four of the five were the same bug, a
+  cache-sized decision made on a machine with a bigger cache: the **direct-1d predicate's budget**
+  512 KB -> 32 KB (**1.223x**), the **im2col patch-batch cap** 512 KB -> 64 KB (**1.061x**),
+  **`CONV_TRANSPOSE_1D`'s two GEMM panels** skewed off a shared cache way (**1.49x on the op**), and
+  the **GEMM's missing cache blocking**, gated at `k > L1/32` (**1.017x**). The fifth is the **im2col
+  patch gather**, fifteen instructions per float to walk a straight line, now taken a run at a time
+  (**1.082x**). All bit-identical except the last, which re-associates a reduction and was gated on
+  the ASR oracle instead.
+  **Measured out — do not re-propose** ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)):
+  the OC=32 direct sweep (im2col is 12% *slower*, phase-major loses on five of six), the permute-back
+  (**3.2x on its own, 0.24 s slower in the model**), and `CONV_TRANSPOSE_1D`'s remaining data
+  movement (0.03%).
+  **What is left is one item**: the **int16 `__smlad` path**, 270 against 226.7 MMAC/s on the best F32
+  tile — 1.19x on the kernel, and it needs a type ggml does not have.
+  **Two things to read first.** A phase of `conv_2d` measured alone does not predict its worth in the
+  graph and **the sign is not predictable** — the gather understated by 5x, the permute overstated
+  past zero. And correctness no longer needs the board: `scripts/armv6_oracle.sh` runs the wheel in
+  the emulated container, calibrated bit-identical to the Pi twice over, so the board is for timings.
   *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 
@@ -90,6 +91,24 @@ static void gemm44_kblocked(int64_t m, int64_t n, int64_t k, int64_t lda, int64_
 static const int64_t KCS[] = {32, 64, 128, 256, 512};
 static int g_reverse = 0;
 
+/* the blocked path must agree with the flat one to within re-association error -- it is the same sum
+   in a different order, so the difference is rounding and nothing else. */
+static void verify(int64_t m, int64_t n, int64_t k, int64_t kc) {
+    float * ref = malloc(sizeof(float)*(size_t)m*n);
+    gemm44_flat(m, n, k, k, k, m);
+    memcpy(ref, C, sizeof(float)*(size_t)m*n);
+    gemm44_kblocked(m, n, k, k, k, m, kc);
+    double worst = 0, scale = 0;
+    for (int64_t i = 0; i < m*n; ++i) {
+        const double d = fabs((double)C[i] - ref[i]);
+        if (d > worst) worst = d;
+        if (fabs((double)ref[i]) > scale) scale = fabs((double)ref[i]);
+    }
+    printf("        verify vs flat: max|diff| %.3e on a peak of %.3e  (rel %.2e)\n",
+           worst, scale, scale > 0 ? worst/scale : 0.0);
+    free(ref);
+}
+
 static void run(const char *name, int64_t m, int64_t n, int64_t k, int64_t batches, int64_t calls) {
     const double mmac = (double)m*n*k*batches*calls/1e6;
 
@@ -113,6 +132,7 @@ static void run(const char *name, int64_t m, int64_t n, int64_t k, int64_t batch
         printf("        kc=%-4lld        %8.1f ms  %6.1f MMAC/s  -> %6.2f s/synth   %.2fx%s\n",
                (long long)kc, tb*1e3, mmac/calls/tb, tb*calls, tf/tb, tf/tb > 1.0 ? "" : "   (loses)");
     }
+    if (k > 512) verify(m, n, k, 128);   /* the shapes the shipped gate blocks */
     /* the flat arm again, last, so any drift across the arms above is visible rather than folded in */
     t0 = now();
     for (int64_t b = 0; b < batches; ++b) gemm44_flat(m, n, k, k, k, m);
