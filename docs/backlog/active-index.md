@@ -221,20 +221,21 @@ are not renumbered. New items continue the scheme.
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 
-* [ ] **P7.1 — the rest of the ARMv6 convolution path.** Three items shipped; the first two were the
-  same mistake and the third was its cousin. **The direct-1d predicate's budget** was 512 KB on a core
-  with a 16 KB L1 (`sysconf` reports nothing there), now 32 KB — **1.223x**. **The im2col patch-batch
-  cap** was 512 KB, half of a Cortex-A72's L2, now 64 KB — **1.061x**. **`CONV_TRANSPOSE_1D`** packed
-  its two GEMM panels `nk` floats apart, and `nk` is a whole number of 4 KB cache ways, so they shared
-  sets four ways deep; a 16-float skew is **1.49x on the op**, 1.013x end to end, bit-identical. Each
-  of the first two got its own env knob (`GGML_CPU_CONV1D_BUDGET`, `GGML_CPU_CONV2D_PATCH_BUDGET`)
-  because the one that existed moved both. VITS across P7 and P7.1: **181.8 -> 75.0 s, 57.0x -> 23.1x
-  real time**, ASR oracle 8/8. What is left:
-  * the **direct tile at OC=32**, now the only bucket that takes the sweep — and the one where it is
-    already ahead, so worth less than it looks;
-  * **`CONV_TRANSPOSE_1D`'s remaining data movement** — 545 ms of overlap-add and transposes across
-    the three nodes, all scalar read-modify-write on a core with no vector unit;
-  * an **int16 `__smlad` path**, 1.19x and a type ggml does not have. Last.
+* [ ] **P7.1 — the rest of the ARMv6 convolution path.** Three items shipped, all the same shape of
+  bug: a cache-sized decision made on a machine with a much bigger cache. **The direct-1d predicate's
+  budget** 512 KB -> 32 KB, **1.223x**. **The im2col patch-batch cap** 512 KB -> 64 KB, **1.061x**.
+  **`CONV_TRANSPOSE_1D`'s two GEMM panels**, `nk` floats apart and so a whole number of 4 KB cache
+  ways, now skewed 16 floats — **1.49x on the op**, bit-identical. VITS across P7 and P7.1:
+  **181.8 -> 74.6 s, 57.0x -> 23.0x real time**, ASR oracle 8/8.
+  **Two things are now measured out** and are in
+  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md): the OC=32 direct sweep
+  (routing it to im2col is 12% *slower*; phase-major loses on five of six convolutions) and
+  `CONV_TRANSPOSE_1D`'s remaining 545 ms of data movement (a gather is worth 22 ms, 0.03%).
+  **What is left is one item and it is large.** With the sweep closed, three im2col buckets are
+  **38.5 s of a 72 s synthesis at 132.5 MMAC/s**, against a GEMM that reaches 226.7-285.6 — so
+  **16 to 21 seconds sits in the patch gather and the permute-back**, not in any kernel. That is more
+  than everything P7.1 has shipped put together. After it, the **int16 `__smlad` path** (1.19x, and a
+  type ggml does not have) is last.
   *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
