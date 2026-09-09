@@ -978,17 +978,48 @@ worse**, 91.5 MMAC/s at n=32 down to 72.1 at n=272. And nodes 2 and 3 were read 
 226.7 MMAC/s roofline, effectively done", then got 27% and 15% faster: that roofline was measured at a
 different shape and was never a property of the machine.
 
-**4. The direct tile is still 4.4x below the GEMM, and now applies to one bucket.** 51.8 MMAC/s
-(`scripts/bench34.c`) against `tinyBLAS_F32_ARMV6`'s 226.7. After (1) the only convolution still taking
-the sweep is OC=32 at L=70400 — the bucket where the sweep is already ahead — so this is worth less
-than it was, not more.
+**4. MEASURED OUT — the OC=32 direct sweep, from both directions.** It is the last bucket taking the
+sweep and the second largest in the graph (15505 ms of a 72 s synthesis), and neither obvious move
+helps. **Routing it to im2col is 12% slower** end to end — 74.58 s against 83.58 s at
+`GGML_CPU_CONV1D_BUDGET=0`, so the sweep is worth **1.12x** there rather than the 5% previously
+recorded, and that is worth knowing because the arm it beats had since got faster. **Phase-major loses
+on five of the six convolutions** and wins 1.08x on the sixth, which is 261 ms.
 
-**5. The ceiling, so the remaining work can be sized.** VITS's convolutions are ~7.46 GMAC (§6.7's
-bucket table). At the GEMM's 226.7 MMAC/s that is **33 s**, against a whole synthesis of 76.2 s.
-Everything else is small — `MUL_MAT` is 1% of that graph and the elementwise remainder is
-memory-bound.
+The rate does track what it looked like it tracked -- the tap window's byte span, `(k-1)*dilation`,
+because a tile touches `IC * ceil(span/32)` of this core's 512 lines:
 
-**6. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
+| span | 8 B | 16 B | 32 B | 72 B | 96 B | 288 B |
+|---|---|---|---|---|---|---|
+| MMAC/s, in the model | 207.7 | 198.1 | 154.1 | 136.3 | 135.8 | **107.9** |
+
+-- but the **dense ceiling is only 165-191 MMAC/s** (`scripts/bench38.c`, arm B), so a layout fix
+cannot reach the GEMM's rate on this core and the de-interleave costs 138-396 ms per call. Both entries
+are in [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md).
+
+**5. MEASURED OUT — `CONV_TRANSPOSE_1D`'s remaining data movement.** 545 ms of the op's 3236, split
+overlap-add 389, transposes 120, kernel repack 35. A gather instead of the scatter-add is worth
+**22 ms on a whole synthesis, 0.03%** (`scripts/bench39.c`), and that is the optimistic arm -- a
+correct one has to carry the previous tile's last row across the boundary. The other two are
+structural: the GEMM wants position-major and the tensor is channel-major, and ggml has no per-node
+persistent scratch in which to cache a repack of a constant kernel.
+
+**6. WHERE THE TIME ACTUALLY IS NOW — the im2col path's own overhead, and it is 16-20 s.** With the
+sweep and `CONV_TRANSPOSE_1D` both closed, three im2col buckets are 38.5 s of a 72 s synthesis and
+they run at **132.5 MMAC/s** against a GEMM that reaches 226.7 on its tuned shape and 285.6 on
+`conv_transpose_1d`'s:
+
+| bucket | ms | MMAC | MMAC/s |
+|---|---|---|---|
+| 17600,1,64,1 | 19005.4 | 2162.7 | 113.8 |
+| 275,1,384,1 | 11697.3 | 1865.3 | 159.5 |
+| 2200,1,128,1 | 7845.8 | 1081.3 | 137.8 |
+| **the three** | **38548** | **5109** | **132.5** |
+
+At 226.7 that work is 22.5 s and at 285.6 it is 17.9 s, so **16.0 to 20.7 seconds** is in the patch
+gather and the permute-back rather than in any kernel. That is larger than everything P7.1 has shipped
+put together, and nothing measured so far touches it.
+
+**7. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
 the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
 
 **Two things that look like opportunities and are not.** Padding conformer's `d_model` from 176 to 192
