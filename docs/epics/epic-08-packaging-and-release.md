@@ -58,7 +58,7 @@ illegal-instruction report from an older install.
 | | |
 |---|---|
 | Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) |
-| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md), [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md) |
+| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md), [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md), [Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 
 ## 4. macOS wheels (P4.10) — SHIPPED 2026-08-31, verified on an M1 Pro
@@ -945,10 +945,38 @@ different set of buckets. Measured directly, on its own knob, on a quiet board, 
 23.5x real time**; conformer-ctc 10.9 s for 3 s of audio (3.62x real time) and distilbert-ner 5.07 s
 for 17 tokens.
 
-**3. `CONV_TRANSPOSE_1D` is 11.5% of a VITS synthesis and has never been looked at here.** Patches
-`ggml-0008`/`0009` shaped it for other architectures; whether its inner loop holds an accumulator
-array of the kind that cost 2.3x in `ggml_conv_1d_direct_tile_impl` is unknown. One benchmark answers
-it.
+**3. SHIPPED — `CONV_TRANSPOSE_1D` was packing its two GEMM panels onto the same cache way.** The op
+is **6.5%** of a synthesis rather than the 11.5% this list used to claim, and it holds no accumulator
+array: `ggml-0009` already made the compute a GEMM. What was wrong is where the operands sit.
+
+`gemm44` walks eight live streams — four rows of each operand, `lda`/`ldb` apart — and
+`ggml_call_mul_mat_ldc` pins `lda = ldb = k`. This op packs its kernel at `wdata` and its transposed
+activation at `wdata + nk`, and for the first node **`nk` is 524288 floats, exactly 2 MB** — a whole
+number of this core's 4 KB L1 ways. The two panels are placed on top of each other by construction, so
+the a-streams and the b-streams share sets four ways deep and evict each other on every access.
+`ggml-0009` now skews the second panel by 16 floats, with the matching reservation in
+`ggml_graph_plan`:
+
+| | before | after | |
+|---|---|---|---|
+| K=16 Cout=128 Cin=256 L=275 | 1638.6 ms | **596.2 ms** | 2.75x |
+| K=16 Cout=64 Cin=128 L=2200 | 1521.2 ms | 1199.9 ms | 1.27x |
+| K=8 Cout=32 Cin=64 L=17600 | 1653.4 ms | 1439.7 ms | 1.15x |
+| the op | 4813.1 ms | **3235.7 ms** | **1.49x** |
+| VITS, ABBA on one board | 75.82 / 76.04 s | 74.69 / 75.20 s | **1.013x** |
+
+**Bit-identical** — it is an address, not arithmetic — checked by hash on x86 across a whole synthesis
+and on the board across all four ABBA arms. **No measurable change on x86** (min-of-7 on the op, 44.0
+against 45.1 ms, inside that box's spread): the win is where the L1 is small, and the patch is inert
+elsewhere rather than a speedup everywhere.
+
+Two things this cost that are worth not repeating, both in
+[Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md). The axis looked like `n` — the tile
+constant `GGML_CONV_TRANSPOSE_1D_TILE / mk` gives that node only 32 columns, and a cache constant
+sized for a bigger machine is exactly what §6.8's first two items were — and **raising `n` makes it
+worse**, 91.5 MMAC/s at n=32 down to 72.1 at n=272. And nodes 2 and 3 were read as "92% and 97% of the
+226.7 MMAC/s roofline, effectively done", then got 27% and 15% faster: that roofline was measured at a
+different shape and was never a property of the machine.
 
 **4. The direct tile is still 4.4x below the GEMM, and now applies to one bucket.** 51.8 MMAC/s
 (`scripts/bench34.c`) against `tinyBLAS_F32_ARMV6`'s 226.7. After (1) the only convolution still taking
