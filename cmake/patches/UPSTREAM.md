@@ -548,6 +548,32 @@ the fallback to the old loop when the work buffer is too small exists only for a
 `cplan` by hand — a reviewer may prefer that to be an assert. The F16 path is untouched and still runs
 the old loop.
 
+**And the two packed panels must not be a whole number of cache ways apart, which by default they
+are.** This op packs the kernel at `wdata` and the transposed activation at `wdata + nk`, and the GEMM
+then walks four rows of each with `lda = ldb = k`. `nk` is `K*Cout*Cin`, so it is almost always a
+round number of KB — on a VITS vocoder's first upsample it is exactly 2 MB — and on any machine whose
+L1 way divides it the a-streams and the b-streams land in the same sets and evict each other.
+Measured on a Pi Zero W (16 KB 4-way L1, so a 4 KB way) at that node's GEMM shape, m=2048 k=256 n=64:
+
+| | MMAC/s |
+|---|---|
+| panels adjacent, as this patch first wrote them | 82.1 / 81.7 |
+| second panel skewed by 16 floats | **286.4 / 285.6** |
+| `k` loop blocked at 128 or 64, no skew | 81.7 / 83.1 |
+
+The last row is the one for a reviewer: blocking the reduction changes nothing, which is what
+distinguishes a set conflict from a capacity miss. End to end the op goes **4813 -> 3236 ms, 1.49x**,
+and all three of the model's nodes improve rather than only the one whose `nk` is a round 2 MB. The
+output is bit-identical, because it is an address. Padding `lda`/`ldb` instead measures the same and
+costs a stride parameter threaded through `ggml_call_mul_mat_ldc`; the skew costs one addend and a
+matching four bytes in `ggml_graph_plan`.
+
+No measurable effect on an AVX2 x86 box (min-of-7 on the op, 44.0 against 45.1 ms, inside its own
+spread), which is what should be expected: the exposure scales with how little associativity there is
+to spare.
+
+---
+
 ## PR 10 — `vec.h`: the exact-erf GELU is a scalar `erff()` call per element
 
 `ggml_vec_gelu_erf_f32` is the only activation in `vec.h` with **no SIMD path on any architecture** —

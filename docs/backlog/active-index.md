@@ -221,18 +221,19 @@ are not renumbered. New items continue the scheme.
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
 
-* [ ] **P7.1 — the rest of the ARMv6 convolution path.** Two items shipped, both the same mistake:
-  a cache-sized constant chosen on a machine with a much larger cache. **The direct-1d predicate's
-  budget** was 512 KB on a core with a 16 KB L1 and no usable L2 (`sysconf` reports nothing there),
-  now 32 KB — **1.223x**; **the im2col patch-batch cap** was 512 KB, half of a Cortex-A72's L2, now
-  64 KB — **1.061x**. Each got its own env knob (`GGML_CPU_CONV1D_BUDGET`,
-  `GGML_CPU_CONV2D_PATCH_BUDGET`) because the one that existed moved both. VITS across P7 and P7.1:
-  **181.8 -> 76.2 s, 57.0x -> 23.5x real time**, ASR oracle 8/8. What is left:
-  * **`CONV_TRANSPOSE_1D`, 11.5% of a synthesis and never looked at here** — `ggml-0008`/`0009`
-    shaped it for other architectures, and whether its inner loop holds the accumulator array that
-    cost 2.3x in `ggml_conv_1d_direct_tile_impl` is unknown. One benchmark answers it;
+* [ ] **P7.1 — the rest of the ARMv6 convolution path.** Three items shipped; the first two were the
+  same mistake and the third was its cousin. **The direct-1d predicate's budget** was 512 KB on a core
+  with a 16 KB L1 (`sysconf` reports nothing there), now 32 KB — **1.223x**. **The im2col patch-batch
+  cap** was 512 KB, half of a Cortex-A72's L2, now 64 KB — **1.061x**. **`CONV_TRANSPOSE_1D`** packed
+  its two GEMM panels `nk` floats apart, and `nk` is a whole number of 4 KB cache ways, so they shared
+  sets four ways deep; a 16-float skew is **1.49x on the op**, 1.013x end to end, bit-identical. Each
+  of the first two got its own env knob (`GGML_CPU_CONV1D_BUDGET`, `GGML_CPU_CONV2D_PATCH_BUDGET`)
+  because the one that existed moved both. VITS across P7 and P7.1: **181.8 -> 75.0 s, 57.0x -> 23.1x
+  real time**, ASR oracle 8/8. What is left:
   * the **direct tile at OC=32**, now the only bucket that takes the sweep — and the one where it is
     already ahead, so worth less than it looks;
+  * **`CONV_TRANSPOSE_1D`'s remaining data movement** — 545 ms of overlap-add and transposes across
+    the three nodes, all scalar read-modify-write on a core with no vector unit;
   * an **int16 `__smlad` path**, 1.19x and a type ggml does not have. Last.
   *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
