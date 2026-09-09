@@ -222,6 +222,14 @@ almost certainly wrong for something else; 16 MB is equally arbitrary but much f
 cache. The honest options are a constant with this measurement next to it (what the patch does), or a
 cache-size query, which ggml does not currently have and glibc answers unreliably on ARM.
 
+**It has since been found wrong on a second machine, and the way it is wrong is worth a reviewer's
+attention.** On an ARM1176 (16 KB L1, no usable L2) the peak is at **64 KB**, worth 1.061x over
+512 KB — but the curve has a **floor as well as a ceiling**: 16 KB, the value this rule's own
+reasoning asks for on that core, is as bad as 512 KB, because a batch that small leaves the GEMM eight
+columns wide. So "half the last level" is not a rule that extrapolates down; the patch now carries
+`GGML_CPU_CONV2D_PATCH_BUDGET` (bytes, 0 = no cap) so the constant can be swept per machine without a
+rebuild, which is how that curve was found.
+
 **Second question: this op only wins on some machines.** On the AVX2 x86 box the same comparison is
 0.87x — best case 0.91x at a 2 MB budget — so there the full im2col matrix is worth materialising. The
 patch makes the op better everywhere it is used; it does not make it the right lowering everywhere. In
@@ -352,11 +360,10 @@ direct path for every shape. It exists because the floor is not merely approxima
 reports nothing — it can be off by a factor of thirty-two. An ARM1176 (Raspberry Pi Zero) has a 16 KB
 L1 and no L2 the CPU can use, `sysconf` reports 0 for every level, and the 512 KB floor therefore said
 yes to every convolution in a TTS model; routing three of its shapes by their real weight footprint
-instead is worth **1.371x on a whole synthesis**. The important part for a reviewer is *why a second
+instead is worth **1.223x on a whole synthesis**. The important part for a reviewer is *why a second
 switch*: `GGML_CPU_DISABLE_CONV_HEURISTICS` already existed and could not be used to find this,
-because it also disables PR 4's patch-batch budget. Splitting them showed the two are worth 1.197x and
-1.149x respectively — half of what that switch had been credited with belonged to the other decision.
-One switch per decision.
+because it also disables PR 4's patch-batch budget — which turned out to be independently mis-sized on
+the same machine and worth another 1.061x. One switch per decision, or neither number exists.
 
 **What a reviewer should push on.** The 512 KB floor, the `OC % 4` restriction and the phase window's
 three constants are all "good enough for what was measured" rather than principled; the tile sizes are tuned on two machines; and there is

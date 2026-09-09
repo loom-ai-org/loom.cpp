@@ -60,9 +60,12 @@ Measured properly — one wheel, one session, VITS on 3.24 s of audio, with a kn
 | budget 0 | off entirely | on | 113.14 / 115.88 s |
 | `DISABLE_CONV_HEURISTICS=1` | off entirely | **off** | 99.62 s |
 
-**1.197x is the predicate and 1.149x is the batch budget**, and 1.197 x 1.149 = 1.376 is all of what
-the switch had been measuring. Half of a number that had already steered two rounds of scoping
-belonged to the decision nobody was looking at.
+**both halves are real and neither is the whole**, which is all this needed to establish. (The exact
+split first recorded here — 1.197x and 1.149x — was taken on a board that turned out to be losing half
+its core to a runaway service, and is superseded: measured on their own knobs on a quiet board, the
+predicate is **1.223x** and the cap **1.061x**.
+[Retro-037](retro-037-ps-said-six-percent-top-said-fifty.md).) The point stands and is the reason both
+knobs now exist: a decision nobody was looking at was carrying part of the credit.
 
 ## Resolution & Lesson Learned
 
@@ -72,13 +75,12 @@ cache level on an ARM1176, so the function fell to its 512 KB floor on a core wi
 it can use. The direct sweep re-reads the whole weight tensor once per four-position block, one byte
 of weights per MAC, so past L1 it is DRAM-bound; the turn between 28 KB and 112 KB in the first table
 is that boundary. An ARMv6 arm returning **32 KB** routes all five shapes the way the table says, and
-is worth **1.371x** on its own — as much as the whole switch, without touching the batch budget,
-because it keeps the sweep on the one bucket where the sweep still wins. Declining every shape instead
-gives up 14%.
+is worth **1.223x** on its own, because it keeps the sweep on the one bucket where the sweep still
+wins. Declining every shape instead gives up more than that.
 
-The batch budget is now a sized item of its own rather than a footnote: 512 KB is 32x this core's L1,
-so the cap buys none of the cache residency it was designed for and costs 1.149x in barriers and a
-narrower GEMM.
+The batch budget became a sized item of its own rather than a footnote, and shipped as 64 KB for
+**1.061x** — with a shape nobody predicted from this investigation, since uncapping it entirely, the
+obvious reading of "the cap buys nothing here", is a percent *worse* than 64 KB.
 
 * **Actionable takeaway 1 — a kill switch that gates two decisions cannot attribute a win to either.**
   It is a fine escape hatch and a bad instrument. The moment a number from one is used to *scope work*,

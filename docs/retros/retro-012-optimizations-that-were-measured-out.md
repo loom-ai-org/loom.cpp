@@ -637,10 +637,9 @@ incumbent has changed. Epic-08 §6.8.
 
 **And then the reversal itself needed a correction, which is the second thing this row is now good
 for.** That switch gates *two* decisions — the direct-convolution predicate and the im2col patch-batch
-budget — so neither the 1.63x nor the 1.27x was ever about one of them. Split with a knob that moves
-only the predicate: **1.197x is the predicate and 1.149x is the batch budget**, so half of the number
-that had steered two rounds of scoping belonged to the decision nobody was looking at. What shipped is
-a cache budget rather than a hardcoded `false` — the sweep still wins at OC=32 — and it is worth
-1.371x on its own. **An entry in this register names a SWITCH; make sure the switch names one idea
+budget — so neither the 1.63x nor the 1.27x was ever about one of them. Each got a knob of its own,
+and on a quiet board they are **1.223x** (the predicate, shipped as a 32 KB cache budget rather than a
+hardcoded `false`, because the sweep still wins at OC=32) and **1.061x** (the cap, shipped as 64 KB).
+Part of the credit had been sitting with a decision nobody was looking at. **An entry in this register names a SWITCH; make sure the switch names one idea
 before you read a number off it.**
 [Retro-036](retro-036-one-switch-two-decisions.md).

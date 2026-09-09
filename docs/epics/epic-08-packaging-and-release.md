@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-08
+last_updated: 2026-09-09
 ---
 
 # Epic-08: Packaging and Release
@@ -58,7 +58,7 @@ illegal-instruction report from an older install.
 | | |
 |---|---|
 | Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) |
-| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md) |
+| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md), [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 
 ## 4. macOS wheels (P4.10) — SHIPPED 2026-08-31, verified on an M1 Pro
@@ -704,6 +704,14 @@ bound this table describes.
 
 ### 6.6 The ARMv6 kernels, built and measured on the board
 
+> **The seconds in this section are about a third high.** They were taken while
+> `bluetooth-km-switch` was spinning on half of this board's single core — `ps` reported it at 5.7%,
+> which is an average over its lifetime rather than a rate. The **ratios are ABBA'd and hold**: the
+> 1.80x below re-measures at 1.837x on a quiet board. For a clean anchor, the pre-kernel VITS
+> synthesis is **181.8 s**, not the 259 s recorded here.
+> [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md).
+
+
 Three patches, `cmake/patches/ggml-0017` to `0019`. Two ship on by default and one does not.
 
 **What shipped, measured on a Pi Zero W by same-session ABBA** — baseline wheel against kernel wheel,
@@ -885,39 +893,57 @@ twice the cache still takes roughly half its reads out of it, which is what the 
 `ggml-0006` grows **`GGML_CPU_CONV1D_BUDGET`** alongside it, a byte count that overrides the detection
 entirely; that is what made every number below measurable.
 
-**End to end on the board**, one wheel, one session per block, VITS on 3.24 s of audio. The four
-configurations are the two decisions `GGML_CPU_DISABLE_CONV_HEURISTICS` used to gate together:
+**End to end on the board**, one wheel, one session, an idle board, VITS on 3.24 s of audio:
 
-| | direct predicate | im2col patch batching | VITS |
-|---|---|---|---|
-| **OLD** — `CONV1D_BUDGET=524288`, today's floor | accepts all three | on | 149.20 / 125.03 s |
-| **NEW** — default, **shipped** | accepts OC=32 only | on | 101.12 / 100.81 / 97.24 / 100.92 s |
-| **ZERO** — `CONV1D_BUDGET=0` | off entirely | on | 113.14 / 115.88 s |
-| **SWITCH** — `DISABLE_CONV_HEURISTICS=1` | off entirely | **off** | 99.62 s |
+| | VITS | |
+|---|---|---|
+| before P7 — no ARMv6 kernels at all | 181.49 / 182.14 s | 57.0x real time |
+| P7's kernels, `CONV1D_BUDGET=524288` | 98.96 s | |
+| **+ the 32 KB budget, this item** | **80.96 / 80.87 / 80.88 s** | **1.223x** |
 
-**VITS 137.1 -> 100.0 s, 1.371x**, and 80x -> **31x real time** against the pre-kernel baseline.
-conformer-ctc (17.2 / 13.6 -> 13.3 / 13.5 s) and distilbert-ner (6.36 / 6.00 -> 5.93 / 8.34 s) have no
-convolution in this budget's range and sit inside their own spread; this board's first launch after an
-install is routinely 15-20% slow, which is the 149.2 and the 17.2. The ASR oracle transcribes the OLD,
-NEW and ZERO waveforms alike as *"Hello world, this is a Raspberry Pi Zero."*, 8/8 words.
+conformer-ctc and distilbert-ner have no convolution in this budget's range and do not move. The ASR
+oracle transcribes the waveforms either side of the change alike as *"Hello world, this is a Raspberry
+Pi Zero."*, 8/8 words.
 
-**Read the last two rows before quoting the old 1.27x, because it was two things.** ZERO and SWITCH
-differ only in the batch budget, so the switch decomposes: **1.197x is the predicate** (OLD -> ZERO)
-and **1.149x is the batch budget** (ZERO -> SWITCH), and 1.197 x 1.149 = 1.376 is the whole of it. The
-predicate was never the whole story, and the "**15.8 MB of im2col at L=70400**" this section used to
-warn about was a property of the switch's *other* half rather than of declining the direct path.
-[Retro-036](../retros/retro-036-one-switch-two-decisions.md) carries how that was got wrong twice.
+**These numbers replace a set that was 25% high**, and the ones in §6.6 are high by about a third for
+the same reason — a service on the board had entered a spin and was taking half the core, while `ps`
+reported it at 5.7% because that column is an average over the process's lifetime. Ratios taken by
+ABBA survived it (§6.6's 1.80x for VITS re-measures at 1.837x); seconds and real-time factors did not.
+[Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md).
 
-**What the shipped change is worth is that it needs neither.** At 1.371x it matches the whole switch
-without touching the batch budget at all, because it keeps the sweep on the one bucket where the sweep
-wins — which is also why it is a budget and not a `return false`: ZERO gives up 14% against NEW.
+**One thing this corrects about the switch it came from.** `GGML_CPU_DISABLE_CONV_HEURISTICS` gates
+*two* decisions — this predicate and the im2col patch-batch budget — so the 1.27x it was first
+measured at could not be attributed to either, and the "**15.8 MB of im2col at L=70400**" this section
+used to warn about is a property of the switch's *other* half rather than of declining the direct
+path: the fallback is `ggml-0004`'s **batched** im2col. It is still not a `return false`, but for the
+opposite reason to the one recorded — at OC=32 the sweep wins.
+[Retro-036](../retros/retro-036-one-switch-two-decisions.md).
 
-**2. The im2col patch-batch budget, now sized: 1.149x, and in the wrong direction.** `ggml-0004` caps
-a batch at 512 KB so the patches stay in cache between the im2col and the GEMM. That is 32x this
-core's L1, so nothing stays in anything, and all the cap buys is barriers and a narrower GEMM. Turning
-it off is worth 1.149x on the buckets that batch — and those are exactly the long convolutions the new
-predicate now sends to im2col, so this is the next item rather than an aside. It needs its own knob to
-measure on top of the new predicate: `GGML_CPU_DISABLE_CONV_HEURISTICS` still moves both.
+**2. SHIPPED — the im2col patch-batch budget was sized against a cache eight times too big.**
+`ggml-0004` caps a batch at 512 KB so the patches are still resident when the GEMM reads them back,
+and that number is half of a Cortex-A72's 1 MB L2. This core's last level is a 16 KB L1. `ggml-0019`
+gives it **64 KB**, and `ggml-0004` grows **`GGML_CPU_CONV2D_PATCH_BUDGET`** (bytes; 0 = no cap) so
+that the cap can be moved without also moving the predicate.
+
+Swept on an idle board, one wheel, one session, this cap the only variable:
+
+| cap | 16 KB | 32 KB | **64 KB** | 256 KB | none | 512 KB |
+|---|---|---|---|---|---|---|
+| VITS | 80.58 s | 76.68 s | **76.37 / 76.07 / 76.35 s** | 77.16 s | 77.57 / 77.52 s | 80.92 / 79.71 / 80.06 / 80.88 s |
+
+**1.061x**, and the shape is the interesting part rather than the size. There is a **floor as well as a
+ceiling**: at 16 KB — the size that would actually fit this L1, which is what the rule's own reasoning
+asks for — it is as bad as 512 KB, because a batch that small leaves the GEMM eight columns wide and
+what is won in residency is lost in shape. So the constant is swept, not derived, and it is not
+`l1 / 2`. **Uncapping entirely is not the answer either**, though it was the obvious guess and was
+what this section previously predicted: 77.5 s, a full percent worse than 64 KB.
+
+That prediction came from reading 1.149x off the old kill switch, on the contaminated board, for a
+different set of buckets. Measured directly, on its own knob, on a quiet board, it is 1.061x.
+
+**Where P7.1 leaves the board.** VITS **181.8 -> 76.2 s** across P7 and P7.1 together, **57.0x ->
+23.5x real time**; conformer-ctc 10.9 s for 3 s of audio (3.62x real time) and distilbert-ner 5.07 s
+for 17 tokens.
 
 **3. `CONV_TRANSPOSE_1D` is 11.5% of a VITS synthesis and has never been looked at here.** Patches
 `ggml-0008`/`0009` shaped it for other architectures; whether its inner loop holds an accumulator
@@ -930,8 +956,9 @@ the sweep is OC=32 at L=70400 — the bucket where the sweep is already ahead �
 than it was, not more.
 
 **5. The ceiling, so the remaining work can be sized.** VITS's convolutions are ~7.46 GMAC (§6.7's
-bucket table). At the GEMM's 226.7 MMAC/s that is **33 s**. Everything else is small — `MUL_MAT` is 1%
-of that graph and the elementwise remainder is memory-bound.
+bucket table). At the GEMM's 226.7 MMAC/s that is **33 s**, against a whole synthesis of 76.2 s.
+Everything else is small — `MUL_MAT` is 1% of that graph and the elementwise remainder is
+memory-bound.
 
 **6. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
 the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
