@@ -1003,23 +1003,58 @@ correct one has to carry the previous tile's last row across the boundary. The o
 structural: the GEMM wants position-major and the tensor is channel-major, and ggml has no per-node
 persistent scratch in which to cache a repack of a constant kernel.
 
-**6. WHERE THE TIME ACTUALLY IS NOW — the im2col path's own overhead, and it is 16-20 s.** With the
-sweep and `CONV_TRANSPOSE_1D` both closed, three im2col buckets are 38.5 s of a 72 s synthesis and
-they run at **132.5 MMAC/s** against a GEMM that reaches 226.7 on its tuned shape and 285.6 on
-`conv_transpose_1d`'s:
+**6. SHIPPED — the patch gather moved one element at a time down a straight line.** The im2col
+gather computes, per ELEMENT, two strided coordinates, a four-way bounds test and a three-term
+address: about fifteen instructions to move one float. On a 1-D convolution over a contiguous source
+that is work spent walking a straight line — for a fixed `(ic, kx)` the elements successive patches
+contribute are a **contiguous run** of the input, and only the destination stride varies. `ggml-0020`
+takes the run at a time, resolving the bounds to two ends and a body once per run.
 
-| bucket | ms | MMAC | MMAC/s |
+| | gather only, per element | across a synthesis |
+|---|---|---|
+| element at a time | 33-75 ns | 2.17 s |
+| **run at a time** | **18-32 ns** | **0.98 s** |
+
+| VITS, ABBA | 74.44 / 75.13 s | 69.15 / 69.05 s | **1.082x** |
 |---|---|---|---|
-| 17600,1,64,1 | 19005.4 | 2162.7 | 113.8 |
-| 275,1,384,1 | 11697.3 | 1865.3 | 159.5 |
-| 2200,1,128,1 | 7845.8 | 1081.3 | 137.8 |
-| **the three** | **38548** | **5109** | **132.5** |
 
-At 226.7 that work is 22.5 s and at 285.6 it is 17.9 s, so **16.0 to 20.7 seconds** is in the patch
-gather and the permute-back rather than in any kernel. That is larger than everything P7.1 has shipped
-put together, and nothing measured so far touches it.
+**Bit-identical** — the same values to the same places in a different order — checked by hash on x86
+across a whole synthesis and on the board across all four arms. conformer-ctc (10.8 s) and
+distilbert-ner (5.17 s) do not move.
 
-**7. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
+**And it is worth nearly five times what the isolated bench said**, which is the opposite of this
+project's usual correction. `scripts/bench41.c` measures the gather alone at 1.19 s saved; end to end
+it is 5.69 s, and `CONV_2D` as a whole drops 62697 -> 58159 ms. The element-at-a-time gather was
+evicting the cache for the GEMM that reads its output immediately afterwards, so fixing its locality
+pays twice. [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) exists because an
+isolated number usually overstates; this is the case where it understated, and for a reason worth
+recognising — a phase that interleaves with another in a tight loop is not separable by construction.
+
+**7. MOSTLY MEASURED OUT — cache-blocking the GEMM's reduction.** `tinyBLAS`'s `mnpack` is a 4x4
+REGISTER tile with no cache blocking, so the patch panel is re-read once per 4-column tile — 16x, 32x
+and 96x at the three buckets' shapes. Blocking `k` so the panel slice stays resident wins on two of
+seven shapes (2200 k=7 at **1.55x**, k=3 at 1.16x) and loses on five, for **1.76 s** available. A gate
+derived from the L1 rather than fitted — block when the tile's eight operand strips exceed it, i.e.
+`k > 512` — captures 1.58 s of that and classifies six of the seven correctly. Not taken for now: it
+reorders the reduction, so unlike everything else in this section it would not be bit-identical, and
+it needs accumulate variants of every tile kernel. `scripts/bench40.c`.
+
+**THE ESTIMATE THIS SECTION CARRIED FOR THIS WORK WAS WRONG, and instructively.** It said 16-21 s was
+in the im2col path, computed by dividing the buckets' MACs by 226.7 and 285.6 MMAC/s. Those are
+rooflines measured at *other shapes* — the exact error
+[Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md) had just been written to record. At
+these shapes the flat GEMM already runs at 114-262 MMAC/s and there was never 16 s in it. What was
+really there: 5.7 s in the gather, 1.8 s in blocking, and the permute below.
+
+**8. WHERE THE TIME IS NOW — the permute-back, and a fast path that cannot fire.** After the GEMM the
+result is scattered into `dst` one element at a time with a stride of `dst_w*dst_h` floats — a cache
+line per output element, 11.4 M of them across a synthesis. `ggml-0004` has a fast path for this
+(`defer`, which stages channel-major and lands it with a contiguous copy per channel), but it requires
+`patches_per_batch > (knl_w - 1) * dilation_x`, and **that is false for every high-dilation
+convolution in the model**: at k=7 d=12 it wants 72 and the 64 KB cap gives 32. Unmeasured, and the
+largest thing left.
+
+**9. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
 the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
 
 **Two things that look like opportunities and are not.** Padding conformer's `d_model` from 176 to 192
