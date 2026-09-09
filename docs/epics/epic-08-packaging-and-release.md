@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-09
+last_updated: 2026-09-10
 ---
 
 # Epic-08: Packaging and Release
@@ -1094,8 +1094,51 @@ in place), and the GEMM's cache blocking wins on two shapes of seven. These phas
 working sets, so the only number that decides anything here is an ABBA on the model.
 [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) carries all three.
 
-**9. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
-the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
+**9. SHIPPED — the ARMv6 quantized convolution GEMM is a LOSS, and it had been switched on by
+accident.** `ggml-0019`'s q4_0 x q8_0 path was measured at **5.65x** against the F32 GEMM it replaced.
+That F32 GEMM was ggml's untiled `vec_dot` loop at 29.7 MMAC/s; it has since become
+`tinyBLAS_F32_ARMV6` and then cache-blocked, and it now does 178-262 at these shapes. **The kernel
+this beat no longer exists.** Re-measured against the one that does, ABBA on one wheel with only the
+switch between arms:
+
+| | VITS | audio | per second of audio |
+|---|---|---|---|
+| taken | 67.73 / 67.83 s | 3.24 s | 20.92x |
+| **declined** | **60.44 / 60.05 s** | 3.19 s | **18.89x** |
+
+**1.107x by not taking it.** Both arms transcribe the sentence, so this is speed, not correctness. It
+is now opt-in behind `GGML_CPU_ENABLE_ARMV6_CONV_QGEMM` rather than deleted — 80 lines of measured
+work that may still win where the F32 path is worse.
+
+**How it came to be on, which is the part worth carrying.** It used to be unreachable for VITS: the
+512 KB patch cap left no room in the work buffer for the Q8_0 staging, so the size check declined
+every call. §6.8's second item cut that cap to 64 KB **for cache reasons**, and every one of VITS's
+shapes started fitting. So that change did two things, and the **1.061x credited to it was the net of
+a win and this loss**. One change, two decisions — the same shape as
+[Retro-036](../retros/retro-036-one-switch-two-decisions.md), missed a second time by the person who
+wrote it.
+
+**And one bucket disagrees, which points at the next thing rather than at a gate.** Per node:
+
+| bucket | taken | declined | |
+|---|---|---|---|
+| 17600 | 16316.6 | 11767.6 | -4549 ms |
+| 275 | 12500.0 | 10798.1 | -1702 ms |
+| 2200 | 7207.5 | 5757.5 | -1450 ms |
+| 70400 | 17748.6 | 16603.2 | -1145 ms |
+| **94** | **4147.3** | **5544.2** | **+1397 ms** |
+
+The 94 bucket is 44 calls of `knl_n=192`, `OC=384`, `OL=94` — a large kernel against a tiny
+activation. What the F32 path pays there is `ggml-0013`'s **dequantize once per call**: 73728 elements
+x 44 calls, which outweighs what the better GEMM wins back. That is a dequant-amortisation problem,
+not a GEMM one, and gating the qgemm on shape would be treating the symptom.
+
+**10. An int16 `__smlad` path — NOT recommended, and this section already says why.** §6.5's own
+correction found the 3.61x for `__smlad` was a loop measurement, and that a tiled F32 GEMM (153.7) and
+a tiled quantized one (167.9) land within 10% of each other: **on this core the win is the register
+tile, not the integer arithmetic**. Item 9 then measured the integer GEMM this project actually has,
+against the current F32 one, at **0.90x**. Building a second integer path needs a type ggml does not
+have, changes numerics, and starts from a number this epic has retracted.
 
 **Two things that look like opportunities and are not.** Padding conformer's `d_model` from 176 to 192
 so its weights could be block-quantized is now a **pessimisation**: the F32 kernel reaches 226.7 where
