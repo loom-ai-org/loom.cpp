@@ -1046,13 +1046,30 @@ rooflines measured at *other shapes* — the exact error
 these shapes the flat GEMM already runs at 114-262 MMAC/s and there was never 16 s in it. What was
 really there: 5.7 s in the gather, 1.8 s in blocking, and the permute below.
 
-**8. WHERE THE TIME IS NOW — the permute-back, and a fast path that cannot fire.** After the GEMM the
-result is scattered into `dst` one element at a time with a stride of `dst_w*dst_h` floats — a cache
-line per output element, 11.4 M of them across a synthesis. `ggml-0004` has a fast path for this
-(`defer`, which stages channel-major and lands it with a contiguous copy per channel), but it requires
-`patches_per_batch > (knl_w - 1) * dilation_x`, and **that is false for every high-dilation
-convolution in the model**: at k=7 d=12 it wants 72 and the 64 KB cap gives 32. Unmeasured, and the
-largest thing left.
+**8. MEASURED OUT — the permute-back.** After the GEMM the result is scattered into `dst` with a
+stride of `dst_w*dst_h` floats: a cache line per output element, 11.4 M of them across a synthesis,
+and on a 128-set L1 the 70400-byte row pitch puts 64 output channels into 16 sets. Walking channels on
+the outside instead makes the write contiguous and the read strided, which is **3.2x faster measured
+on its own** — 69.6 -> 21.7 ms at the largest shape, 0.63 -> 0.19 s across a synthesis
+(`scripts/bench42.c`).
+
+**End to end it is 0.24 s SLOWER**: 68.98 / 69.00 s against 69.22 / 69.24 s, with brackets 0.02 s
+wide. The `CONV_2D` buckets do improve by 239 ms and something outside them gets slower by more. Not
+shipped. Bit-identical at one and four threads, correct, and not worth having.
+
+Also measured and worse than both: letting the GEMM write straight into `dst` with
+`ldc = dst_w*dst_h` — which `ggml-0004`'s own header proposes and the `defer` path uses — because the
+bias pass that then remains has to read-modify-write the destination, 43.6 ms against 21.7. So
+`defer`'s unreachability for the high-dilation convolutions (it needs
+`patches_per_batch > (knl_w-1)*dilation`, 72 wanted against the 64 KB cap's 32) turns out not to
+matter: the path it cannot take is not the one to want.
+
+**THE PATTERN THIS SECTION KEEPS PRODUCING, now three times.** A phase of this op measured on its own
+does not predict what it is worth in the graph, and **the sign is not predictable either**: the gather
+understated by 5x (1.19 s alone, 5.69 s in place), this one overstates past zero (0.44 s alone, -0.24 s
+in place), and the GEMM's cache blocking wins on two shapes of seven. These phases evict each other's
+working sets, so the only number that decides anything here is an ABBA on the model.
+[Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) carries all three.
 
 **9. An int16 `__smlad` path is worth 1.19x and needs a type ggml does not have.** 270 MMAC/s against
 the best F32 tile's 226.7 (`scripts/bench32.c`). Real, small, and a numerics change; last.
