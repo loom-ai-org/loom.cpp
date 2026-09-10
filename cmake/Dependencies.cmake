@@ -120,6 +120,48 @@ endif()
 # MakeAvailable a no-op and the ggml targets undefined.
 add_subdirectory(${ggml_SOURCE_DIR} ${ggml_BINARY_DIR})
 
+# 64-BIT ATOMICS ARE A LIBRARY CALL ON ARMv6, AND NOTHING LINKS THAT LIBRARY (P7).
+#
+# `ggml_graph_next_uid()` (ggml.c) is a `__atomic_fetch_add` on a static `uint64_t`. Every 64-bit
+# host inlines it, and so does every 32-bit CPU with a double-word exclusive -- i686 has `cmpxchg8b`,
+# ARMv7 has `LDREXD`. **ARMv6 has `LDREX`/`STREX` and no `LDREXD`**, so GCC emits a call to
+# libatomic's `__atomic_fetch_add_8` instead, and no target in this tree links libatomic.
+#
+# WHAT THAT LOOKS LIKE IS WORSE THAN A BUILD ERROR, and it is why this is a probe rather than a
+# comment somewhere. `libggml-base.so` links CLEAN: a shared library is allowed to carry undefined
+# symbols. So does `libloom_engine.so`, and so does a Python extension module -- which is also a
+# shared object. The first EXECUTABLE to link fails ("undefined reference to `__atomic_fetch_add_8'",
+# from ld, blaming libggml-base), and a build that links no executable at all -- exactly the wheel
+# build -- succeeds completely and fails at `import loom`, in `dlopen`, on a user's board.
+#
+# PROBED, NOT GATED ON THE ARCHITECTURE NAME. `check_c_source_compiles` compiles *and links*, so it
+# asks the only question that matters -- does this toolchain resolve a 64-bit atomic on its own --
+# and answers it for ARMv5, MIPS32, RISC-V rv32 and anything else with the same shape, without this
+# file carrying a list. On every platform that inlines it, the probe passes and nothing is linked.
+#
+# PUBLIC and on `ggml-base` rather than on our own targets: the symbol is ggml's, so the DT_NEEDED
+# belongs on the library that references it. Everything downstream -- loom_engine, the tools, the
+# tests, loom-py's `_loom` -- then needs no change and cannot forget.
+include(CheckCSourceCompiles)
+check_c_source_compiles("
+#include <stdint.h>
+static uint64_t counter = 1;
+int main(void) { return (int) __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED); }
+" LOOM_HAVE_BUILTIN_ATOMIC64)
+if(NOT LOOM_HAVE_BUILTIN_ATOMIC64)
+    find_library(LOOM_LIBATOMIC NAMES atomic libatomic.so.1)
+    if(NOT LOOM_LIBATOMIC)
+        message(FATAL_ERROR
+            "This toolchain compiles a 64-bit __atomic_fetch_add into a libatomic call (no "
+            "double-word exclusive on ${CMAKE_SYSTEM_PROCESSOR}) and libatomic was not found. "
+            "Install it -- on Debian/Raspbian it is libatomic1 plus the gcc dev package. Without "
+            "it the libraries still build and the first executable, or the first `dlopen`, does "
+            "not.")
+    endif()
+    target_link_libraries(ggml-base PUBLIC ${LOOM_LIBATOMIC})
+    message(STATUS "64-bit atomics need libatomic on this target: ${LOOM_LIBATOMIC}")
+endif()
+
 # LuaJIT: embedded Lua VM for the procedural-generalization orchestration layer (see
 # LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md) -- replaces bespoke per-model C++ drivers
 # with a data-driven Lua script embedded in each model's GGUF. LuaJIT has no upstream CMakeLists (it's a

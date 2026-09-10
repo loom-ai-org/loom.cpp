@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-03
+last_updated: 2026-09-10
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,8 +19,9 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 10 — AR LM + codec TTS** | Gated end to end and the ASR oracle passes; the card and the loom-py bump are what is left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **`fullstop-punc` (XLM-R) upload** | Family 12's SentencePiece checkpoint is exported and pushed in all three repos, but is not on the Hub — so the TOKENIZER half of that family is still the untested one → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **loom-py's README says "Seventeen"** | The org publishes twenty. A user-facing count that is three low, on `main` → below, Minor cleanups |
 
 ---
 
@@ -35,23 +36,6 @@ are not renumbered. New items continue the scheme.
   11 (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small
   classifiers) → 14 (music). *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md)
   for what family 12 cost, which is the estimate the rest of this list should be read against.*
-* [ ] **P5 family 10 — Dia-1.6B: one thing left.** The export, the driver, the sampler, the
-  classifier-free guidance and the composition with DAC are all done and gated. It ships as TWO files
-  chained by the host ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)), its sampler
-  cost the engine two additions
-  ([ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md),
-  [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)), and Dia's guidance turned out not to
-  be the standard formula
-  ([Retro-031](../retros/retro-031-dias-guidance-is-not-the-standard-formula.md)). What remains:
-  * [ ] **loom-py needs the submodule bump and a rebuild, then its card gate can run.**
-    `src/binding.cpp` now calls `loom::register_topologies`, without which a guided generation through
-    the Python door runs both decode streams into one KV cache and returns plausible, wrong codes. The
-    binding change is written and compiles against the new headers; the bump waits on loom.cpp being
-    merged. Until then `test_model_cards.py`'s new `text2codes` arm — which chains the card through
-    `dac-44khz` and transcribes the result — has never executed against the shipped file.
-  * [ ] **The Hub upload.** `hf-models/dia-1.6b/` is built — a 6.4 GB F32 GGUF and its card, F32 like
-    every other entry after the Q8_0 version was tried and reverted for consistency. Not pushed.
-
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
   Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
@@ -209,24 +193,9 @@ are not renumbered. New items continue the scheme.
 
 ## Packaging & release
 
-* [ ] **`distilbert-ner-loom` and `dia-1.6b-loom` are staged but not pushed.**
-  `build_model_cards.py` produces both — but until `upload_all.py --create` is run the Hub lists
-  seventeen models, and `model.text2class` and `model.text2codes` are doors with no downloadable model
-  behind them (loom-py's README documents calls against both). Two `--create` uploads, then the Hub
-  count in that README and in [Epic-03 §2](../epics/epic-03-model-coverage.md) goes to nineteen.
-  **`dia-1.6b-loom`'s card loads `dac-44khz-loom` too**, so the pair has to be published together or
-  its snippet is a broken link. At 6.4 GB it is also by far the largest thing in the collection —
-  see [Epic-03 §2](../epics/epic-03-model-coverage.md) for why it is not quantized.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
-* [ ] **P7 — 32-bit ARM Linux (`armv7l`), after P5.** Scoped 2026-09-03 from a source read, not
-  started, and the first task is to make the estimate falsifiable with a QEMU build. **The Pi Zero 2 W
-  is not in it** — that board is ARMv8 and already a supported target on a 64-bit OS, costing one
-  `QEMU_CPU=cortex-a53` gate row. The port itself is one `CMAKE_SIZEOF_VOID_P` guard on
-  `GGML_CPU_ALL_VARIANTS`, a LuaJIT armv7 build, and a runner-policy decision for the wheel; **ARMv6
-  (Pi Zero / Zero W / Pi 1) is a declared non-goal**. *Context:
-  [Epic-08 §6](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
 
@@ -242,6 +211,9 @@ primitive set.
   rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr could in principle reach
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
   `repeat_for`'s own loop bound.
+* [ ] **loom-py's README says the org publishes "Seventeen" models; it publishes twenty.**
+  `distilbert-ner-loom`, `dia-1.6b-loom` and `dac-44khz-loom` went up with 1.0.0-rc8 and the count
+  was never advanced. The table below that line lists them, so only the sentence is wrong.
 * [ ] `export_config.py`'s module docstring points at a ledger section that no longer exists.
 * [ ] **`GgmlPatches.cmake` asks "already applied?" the wrong way, so every `cmake` re-run rebuilds
   ggml from scratch** (~30 min on the Pi). It reverse-applies **each patch individually against the

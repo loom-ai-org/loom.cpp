@@ -1,0 +1,54 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 8ebe6c26..a24e43d0 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -8215,6 +8215,49 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         const int64_t patch_start       = patch_start_batch + params->ith * patch_per_thread;
+         const int64_t patch_end         = std::min(patch_start + patch_per_thread, patch_end_batch);
+ 
++        // THE PATCH GATHER, A RUN AT A TIME RATHER THAN AN ELEMENT AT A TIME.
++        //
++        // The general loop below computes, per ELEMENT, two strided coordinates, a four-way bounds
++        // test and a three-term address -- about fifteen instructions to move one float. On a 1-D
++        // convolution over a contiguous source it is doing that work to walk a straight line: for a
++        // fixed (ic, kx) the elements contributed by consecutive patches are a CONTIGUOUS RUN of the
++        // input, `p + kx*dilation - pad` for successive `p`, and the only thing that varies is where
++        // they land -- a store of stride `knl_n`. The bounds test then resolves to two ends and a
++        // body, computed once per run instead of once per element.
++        //
++        // Measured on a Pi Zero W over a VITS vocoder's seven convolution shapes, gather only
++        // (loom `scripts/bench41.c`), 48.2 -> 20.7 ns per element at the largest and 2.17 -> 0.98 s
++        // across a whole synthesis: **2.2x**, and bit-identical, because it is the same values
++        // written to the same places in a different order.
++        //
++        // Everything the general path handles and this does not -- 2-D kernels, a strided output, a
++        // non-contiguous source, F16 -- falls through to it unchanged.
++        const bool gather_runs = knl_h == 1 && dst_h == 1 && stride_x == 1
++                              && kernel_type == GGML_TYPE_F32
++                              && src->nb[0] == sizeof(float) && dst->ne[3] == 1;
++        if (gather_runs) {
++            const int64_t base = patch_start_batch;
++            for (int64_t ic = 0; ic < c_in; ++ic) {
++                const float * srow = (const float *) ((const char *) src_data + ic * src->nb[2]);
++                for (int64_t kx = 0; kx < knl_w; ++kx) {
++                    float * d = (float *) tmp + ic * knl_w + kx;
++                    const int64_t off = kx * dilation_x - pad_x;
++                    // the window of p for which p + off lands inside the source
++                    int64_t lo = -off;          if (lo < patch_start) lo = patch_start;
++                    if (lo > patch_end) lo = patch_end;
++                    int64_t hi = src_w - off;   if (hi > patch_end)   hi = patch_end;
++                    if (hi < lo) hi = lo;
++                    for (int64_t q = patch_start; q < lo; ++q) d[(q - base) * knl_n] = 0.0f;
++                    if (leaky) {
++                        for (int64_t q = lo; q < hi; ++q)
++                            d[(q - base) * knl_n] = ggml_conv1d_leaky_s(srow[q + off], *leaky);
++                    } else {
++                        for (int64_t q = lo; q < hi; ++q) d[(q - base) * knl_n] = srow[q + off];
++                    }
++                    for (int64_t q = hi; q < patch_end; ++q) d[(q - base) * knl_n] = 0.0f;
++                }
++            }
++        } else
+         //im2col for a patch
+         for (int64_t p = patch_start; p < patch_end; ++p) {
+             const int64_t  batch_n     =  p / (dst_w * dst_h);

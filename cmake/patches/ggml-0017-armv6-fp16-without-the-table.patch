@@ -1,0 +1,27 @@
+diff --git a/src/ggml-cpu/simd-mappings.h b/src/ggml-cpu/simd-mappings.h
+index fca5119e..2e76878b 100644
+--- a/src/ggml-cpu/simd-mappings.h
++++ b/src/ggml-cpu/simd-mappings.h
+@@ -141,6 +141,22 @@ extern float ggml_table_f32_ue4m3[1 << 8];
+ // On ARM NEON, it's quicker to directly convert x -> x instead of calling into ggml_lookup_fp16_to_fp32,
+ // so we define GGML_CPU_FP16_TO_FP32 and GGML_CPU_FP32_TO_FP16 elsewhere for NEON.
+ // This is also true for POWER9.
++// ARMv6 -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1, and the one ARM rung with no NEON. The
++// 64-bit ARMs are served by the __ARM_NEON arm far above; this is only for the 32-bit v6 floor.
++//
++// WHY IT NEEDS ITS OWN ARM AT ALL. The generic fallback immediately below is a lookup into
++// `ggml_table_f32_f16` -- 65536 floats, 256 KB. This core has 16 KB of L1 D-cache and a 128 KB L2
++// that the BCM2835 assigns to the GPU, so every block scale in a quantized dot product is a
++// scattered read into a table sixteen times the size of the cache it has to miss out of.
++//
++// `ggml_compute_fp16_to_fp32` is the function that BUILT that table (ggml.c fills it by calling
++// exactly this), so substituting it is bit-identical by construction rather than by tolerance, and
++// it touches no memory. Measured on a Pi Zero W, q4_0 x q8_0 GEMV: 1.17-1.19x.
++#if defined(__ARM_ARCH) && (__ARM_ARCH == 6) && !defined(__aarch64__)
++    #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) GGML_COMPUTE_FP16_TO_FP32(x)
++    #define GGML_CPU_FP16_TO_FP32(x)         GGML_COMPUTE_FP16_TO_FP32(x)
++#endif
++
+ #if !defined(GGML_CPU_FP16_TO_FP32)
+ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
+     uint16_t s;
