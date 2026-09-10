@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-04
+last_updated: 2026-09-10
 ---
 
 # Epic-03: Model Coverage
@@ -32,6 +32,7 @@ topologies, driver and — where the architecture has one — its vocabulary.
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz | `audio_codec_export.py` |
 | **Text → codec tokens** | Dia-1.6B | `dia_export.py` |
+| **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
 decomposition paths stay honest about producing the same model.
@@ -180,6 +181,49 @@ EnCodec directory and raises naming both reasons — detection is what makes the
 **This is why the composition target changed.** MusicGen was picked for its small LM and would have
 dragged in this codec; Dia decodes through DAC, which is done, so it costs the LM half only.
 
+### Family 6, and the primitive the engine already had
+
+Family 6 — text in, text out, through an encoder read once and a KV-cached decoder cross-attending to
+it — is structurally family 2's and family 10's shape, so the `encoder`/`cross_kv`/`decoder` split
+came for free. Dia is the closer precedent of the two: its encoder length is genuinely dynamic, so its
+decoder carries a second symbol, and T5's does for the same reason.
+
+**What made it look expensive was one paragraph of scoping, and it was wrong.** T5 has no positional
+embedding at all: every attention score is offset by a learned value chosen by the *bucketed* distance
+between the query and the key. The backlog entry read that mechanism accurately, concluded correctly
+that the engine has no primitive for it, and named three ways out — a new primitive, a Lua
+computation, or a per-length constant fold.
+
+None was needed. By the time the bias reaches attention, `transformers` has already summed it with the
+causal mask into ONE `[1, n_head, q, k]` additive tensor, in exactly the place `fuse_loom_attention`
+anchors on — and `ggml_soft_max_ext` has always accepted a mask with a head axis, since it asks only
+that `a->ne[2] % mask->ne[2] == 0`. Nothing here had used that degree of freedom because every mask
+this tree ever built was one head deep. **T5's relative bias is a mask this engine could already
+take**, and the only open question was who computes it: the driver does, from a 192-float table per
+stack that the export writes in as constants
+([ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md)).
+
+So this family, like 11 and 12, needed **no new engine primitive** — but unlike them it was *scoped*
+as needing one, which is the lesson
+([Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md)): a capability gap is a
+claim about an interface, and it was costed entirely from the producing side.
+
+Two things did cost real work, and neither was the bias:
+
+* **The fusion matched zero blocks.** `merge_consecutive_transposes` merges T5's head-split and score
+  transposes into a permutation MIL can no longer fold into `transpose_y`, because — unlike Qwen3 and
+  Whisper — T5 has no RoPE between them. An unfused block still runs and still answers, just without a
+  cache, so nothing failed; a `topology_rewrite` that counts is what said so
+  ([Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md)).
+* **`inner_dim` is not `d_model`.** T5 sizes its heads (`num_heads * d_kv` = 384) independently of its
+  residual stream (512), and this is the first model here where the two differ. The engine's own
+  retained-output-vs-input shape check caught it at the first decode step.
+
+Verified as a tensor rather than as a token sequence: greedy generation is id-for-id identical to
+`transformers` on four prompts of 11–43 source tokens, and the encoder matches at 3.1e-7 max absolute
+error on a tensor whose max magnitude is 0.481. The second is the check that covers the bias; the
+first would pass with a slightly wrong one.
+
 ### Family 10, and the axis that did not have to be padded
 
 **It ships as two files, not one** — the LM and the codec, chained by the host, with a frame-major
@@ -299,11 +343,12 @@ Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
 **Next families:** the second codec decoder (EnCodec or SNAC) → CNN+CTC and SANM encoders (both
-family-1-shaped once the encoder template generalizes past NeMo) → the remaining TTS families → text
-encoder-decoders → small classifiers → music. Three are **done** as of 2026-09-03 — token
-classifiers (12), codec decoders' first leaf (11) and the AR codec-token LM (10) — and §2 says what
-each cost, which is the number the rest of this list should be estimated against. Family 10 landing
-means the `text2codes` → `codes2speech` composition now has both halves in the tree.
+family-1-shaped once the encoder template generalizes past NeMo) → the remaining TTS families → small
+classifiers → music. Four are **done** — token classifiers (12), codec decoders' first leaf (11), the
+AR codec-token LM (10) and, as of 2026-09-10, text encoder-decoders (6) — and §2 says what each cost,
+which is the number the rest of this list should be estimated against. Family 10 landing means the
+`text2codes` → `codes2speech` composition has both halves in the tree; family 6 landing means the zoo
+has an encoder-decoder text model and a SentencePiece Unigram LM for the first time.
 
 Family 12 is now proved on **three** checkpoints and both tokenizer halves — two WordPiece encoders
 and one SentencePiece Unigram one — which is what closes the "a family-12 checkpoint that is not
@@ -324,7 +369,7 @@ the traced module, the wrapper and the converted MIL program **together** took G
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
