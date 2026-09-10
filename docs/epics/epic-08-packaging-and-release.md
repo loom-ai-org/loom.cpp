@@ -1118,20 +1118,37 @@ a win and this loss**. One change, two decisions — the same shape as
 [Retro-036](../retros/retro-036-one-switch-two-decisions.md), missed a second time by the person who
 wrote it.
 
-**And one bucket disagrees, which points at the next thing rather than at a gate.** Per node:
+**And one bucket disagrees.** One wheel, one switch, per-node profiles either side, both runs
+synthesising the same 3.19 s:
 
-| bucket | taken | declined | |
+| bucket | declined | taken | |
 |---|---|---|---|
-| 17600 | 16316.6 | 11767.6 | -4549 ms |
-| 275 | 12500.0 | 10798.1 | -1702 ms |
-| 2200 | 7207.5 | 5757.5 | -1450 ms |
-| 70400 | 17748.6 | 16603.2 | -1145 ms |
-| **94** | **4147.3** | **5544.2** | **+1397 ms** |
+| 17600 | 12099 | 16336 | +4237 ms |
+| 275 | 10501 | 12490 | +1989 ms |
+| 2200 | 5629 | 7337 | +1708 ms |
+| 70400 | 16484 | 17919 | +1435 ms |
+| **94** | **5425** | **4145** | **-1280 ms** |
 
-The 94 bucket is 44 calls of `knl_n=192`, `OC=384`, `OL=94` — a large kernel against a tiny
-activation. What the F32 path pays there is `ggml-0013`'s **dequantize once per call**: 73728 elements
-x 44 calls, which outweighs what the better GEMM wins back. That is a dequant-amortisation problem,
-not a GEMM one, and gating the qgemm on shape would be treating the symptom.
+and inside that bucket it is a single shape: **`94,1,192,1`, 4090 -> 2570 ms, 1.59x** over 44 calls of
+the text encoder. Its sibling `94,1,768,1` loses.
+
+**Three explanations for that have been proposed and all three are wrong**, which is why none is
+offered here now:
+
+* *"the F32 path pays a dequantize per call"* — it does not differ: `ggml-0013` dequantizes
+  unconditionally before `ggml_compute_forward_conv_2d_impl` is entered, and `qk` is merely passed
+  alongside. **Both arms pay it.** (This claim reached a commit message and this section before it was
+  checked; it is retracted.)
+* *"the quantized path skips the permute-back"* — it does not: both arms write straight into `dst`
+  with `ldc = dst_w*dst_h`, and neither scatters.
+* *"the quantized operands fit the L1 and the F32 ones do not"* — the 17600 shape has a BETTER ratio
+  (16 KB against 114 KB) and the quantized path loses there by 4.2 s.
+
+What is left that differs is the GEMM alone, in two ways at once — operand format and orientation, the
+quantized call being `m=c_out, n=patch_n` where the F32 one is the reverse. **One winning shape is not
+enough to draw a gate from**, and this epic's own history is what says so: every rule fitted to a
+handful of shapes here has been wrong. So the kernel stays opt-in with the number recorded, for a
+model whose shapes look like that text encoder's.
 
 **10. An int16 `__smlad` path — NOT recommended, and this section already says why.** §6.5's own
 correction found the 3.61x for `__smlad` was a loop measurement, and that a tiled F32 GEMM (153.7) and
