@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
-index bf9b8c8b..5babe8a3 100644
+index bf9b8c8b..82ce1aa9 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
 @@ -57,6 +57,21 @@
@@ -24,33 +24,7 @@ index bf9b8c8b..5babe8a3 100644
  #ifdef _MSC_VER
  #define NOINLINE __declspec(noinline)
  #else
-@@ -1552,6 +1567,25 @@ class tinyBLAS_Q0_ARM {
-     }
- 
-     void matmul(int64_t m, int64_t n) {
-+        // WHICH OPERAND STAYS RESIDENT, decided per call because the answer is not the same for the
-+        // two things this kernel serves, and getting it wrong costs more than the tile wins.
-+        //
-+        // A tile loop can sweep one operand once and re-read the other per tile. Row-tile-outer reads
-+        // the weights once and re-reads the activation panel; column-tile-outer does the reverse. On
-+        // a core with 16 KB of L1 and no usable L2 the cheaper choice is to keep the SMALLER panel
-+        // resident, so:
-+        //
-+        //   distilbert-ner, m=768 n=17 k=24    weights 324 KB   activations  13.5 KB  -> row-outer
-+        //   a VITS conv,    m=384 n=276 k=30   weights 202 KB   activations 275 KB    -> column-outer
-+        //
-+        // This was column-outer unconditionally first, tuned on the convolution shape alone, and on
-+        // the board that made conformer-ctc 5% SLOWER while the microbenchmark said 1.73x: at n=17 the
-+        // whole activation panel fits in cache, and re-reading 324 KB of weights eight times to avoid
-+        // re-reading 13.5 KB is exactly backwards. Retro-012's rule, again -- the shapes a bench holds
-+        // are not the shapes a model runs.
-+        const int64_t wbytes = m * k * (int64_t) sizeof(block_q4_0);
-+        const int64_t abytes = n * k * (int64_t) sizeof(block_q8_0);
-+        col_outer = abytes > wbytes;
-         mnpack(0, m, 0, n);
-     }
- 
-@@ -4098,6 +4132,388 @@ class tinyBLAS_PPC {
+@@ -4098,6 +4113,407 @@ class tinyBLAS_PPC {
      const int nth;
  };
  #endif
@@ -100,6 +74,25 @@ index bf9b8c8b..5babe8a3 100644
 +    }
 +
 +    void matmul(int64_t m, int64_t n) {
++        // WHICH OPERAND STAYS RESIDENT, decided per call because the answer is not the same for the
++        // two things this kernel serves, and getting it wrong costs more than the tile wins.
++        //
++        // A tile loop can sweep one operand once and re-read the other per tile. Row-tile-outer reads
++        // the weights once and re-reads the activation panel; column-tile-outer does the reverse. On
++        // a core with 16 KB of L1 and no usable L2 the cheaper choice is to keep the SMALLER panel
++        // resident, so:
++        //
++        //   distilbert-ner, m=768 n=17 k=24    weights 324 KB   activations  13.5 KB  -> row-outer
++        //   a VITS conv,    m=384 n=276 k=30   weights 202 KB   activations 275 KB    -> column-outer
++        //
++        // This was column-outer unconditionally first, tuned on the convolution shape alone, and on
++        // the board that made conformer-ctc 5% SLOWER while the microbenchmark said 1.73x: at n=17 the
++        // whole activation panel fits in cache, and re-reading 324 KB of weights eight times to avoid
++        // re-reading 13.5 KB is exactly backwards. Retro-012's rule, again -- the shapes a bench holds
++        // are not the shapes a model runs.
++        const int64_t wbytes = m * k * (int64_t) sizeof(block_q4_0);
++        const int64_t abytes = n * k * (int64_t) sizeof(block_q8_0);
++        col_outer = abytes > wbytes;
 +        mnpack(0, m, 0, n);
 +    }
 +
