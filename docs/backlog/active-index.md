@@ -21,7 +21,6 @@ are not renumbered. New items continue the scheme.
 |---|---|
 | **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. SNAC is the one that tests something — `vq_strides [4, 2, 1]` puts its codebooks at different frame rates. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
-| **P5 family 6 — `flan-t5-small`** | The zoo has no encoder-decoder text model and no Unigram LM, and this is 60M params / 308 MB. Export path and tokenizer are both ready; the ONE blocker is T5's learned relative attention bias, which is engine work → below, Models |
 | **loom-py's README says "Seventeen"** | The org publishes twenty. A user-facing count that is three low, on `main` → below, Minor cleanups |
 
 *1.0.0-rc8 shipped families 10, 11 and 12 (PyPI ×4, and the org now lists twenty models), and family
@@ -51,21 +50,20 @@ are not renumbered. New items continue the scheme.
   (XLM-R base, 1.11 GB) with far more use, and its `tokenizer.json` is Unigram with scores already in
   final fairseq id order — so it needs no protobuf and ADR-027's remapping is a no-op for it.
   *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
-* [ ] **`google/flan-t5-small` — family 6's first leaf, blocked on ONE engine primitive.** Picked
-  because the zoo has no encoder-decoder text model and no Unigram LM, at 60M params / 308 MB against
-  XLM-R large's 2.24 GB. Two halves are already done and should not be re-scoped: the **encoder-decoder
-  shape is not new** — Whisper ships one, and `whisper_export`'s `encoder`/`cross_kv`/`decoder` split
-  with `attrs.kv_cache=false` for cross-attention is the pattern to copy
-  ([`docs/KV-CACHE.md`](../KV-CACHE.md)); and the **tokenizer is not new** — it ships `spiece.model`, so
-  it takes the existing `sentencepiece_proto` path, NOT ADR-027's new `sentencepiece_json` one. What is
-  missing is T5's **learned relative attention bias**: `relative_position_bucket` maps
-  (query − key) into 32 log-spaced buckets, indexes a `[32, n_head]` table and adds it to the scores,
-  recomputed per sequence length. **`src/core/relative_position.cpp` is NOT this** — the name matches but
-  it is VITS's windowed `pad_crop_relative_embeddings`, a different mechanism, and reusing it is wrong.
-  Three ways out, none scoped further: a new engine primitive, computing the bias in the Lua driver per
-  call, or folding it per length at export — the last forfeits dynamic length and re-invites P4.28's
-  18.9-MB-of-zeros problem. Also needs this branch's per-tokenizer `framing_ids`, since T5 frames with
-  `</s>`. *Context: [Epic-03 §3](../epics/epic-03-model-coverage.md).*
+* [ ] **`flan-t5-small` is exported and verified; the HUB UPLOAD and the model card are what is
+  left.** Family 6's first leaf, and the first encoder-decoder TEXT model and first Unigram/SentencePiece
+  LM in the zoo. Greedy generation matches `transformers` id-for-id on four prompts of different lengths,
+  and the ENCODER matches at 3.1e-7 max absolute error (`fixture_gen/reference_forward_t5_mil.py`), which
+  is the check that actually covers the relative bias — a token match does not
+  ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)). The blocker this line used to
+  carry did not exist; see [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md)
+  and [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md).
+  *Two known limits, neither blocking: the vocabulary is 32,100 pieces against a 32,128-wide logit row
+  (T5 pads its embedding to a multiple of 128), so an argmax could in principle name an id with no piece
+  — untrained rows, never seen in practice, and worth a bound if a leaf in this family ever emits one.
+  And the driver marshals `n_head * n_src²` doubles for the encoder's bias, which is tens of thousands
+  for a sentence and 1.5M at the 512-token ceiling; ADR-028 records the in-graph alternative if that
+  becomes measurable.*
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
   Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
