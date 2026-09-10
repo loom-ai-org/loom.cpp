@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-03
+last_updated: 2026-09-10
 ---
 
 # Epic-08: Packaging and Release
@@ -57,8 +57,8 @@ illegal-instruction report from an older install.
 
 | | |
 |---|---|
-| Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md) |
-| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md) |
+| Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) |
+| Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md), [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md), [Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 
 ## 4. macOS wheels (P4.10) — SHIPPED 2026-08-31, verified on an M1 Pro
@@ -457,85 +457,725 @@ the same file.
 table is a CI-only path — the strings are right in principle and untested in fact.
 
 
-## 6. Planned work — 32-bit ARM Linux (P7), after P5
+## 6. 32-bit ARM Linux — ARMv6 shipped (P7)
 
-**Scoped 2026-09-03 from a source read, deliberately not started.** It sits after P5 because P5 adds
-model families and this adds a platform tier that every one of them would then have to be re-verified
-on; doing it first multiplies the verification cost of P5 by a rung nothing ships to yet. Nothing here
-has been compiled — there is no 32-bit ARM toolchain on the dev box (`arm-linux-gnueabihf-gcc` absent)
-and no hosted runner of that architecture on any provider, so **the first task in this item is to make
-the claim below falsifiable**: an `armv7l` build under QEMU/docker, which is installed.
+**Shipped 2026-09-04, on the board rather than in a container**: a Raspberry Pi Zero W synthesises
+speech from the `linux_armv6l` wheel this section describes. What §6 said before this was a scope
+from a source read, with ARMv6 named a non-goal; the read was accurate about the mechanics and wrong
+about the cost, which turned out to be one CMake guard and no C++ at all.
 
-### 6.1 Three tiers, and only one of them is a port
+### 6.1 Three tiers, and only one of them was ever a port
 
 The question is usually asked as "Raspberry Pi Zero", which is two different machines.
 
 | board | ISA | status |
 |---|---|---|
-| **Zero 2 W** (BCM2710, Cortex-A53) on **64-bit** Raspberry Pi OS | ARMv8.0-A | **already a supported target.** A53 is ARMv8.0 with no dotprod/FP16/SVE — the same profile the A72 rows of `wheels.yml`'s `raspberry-pi-check` already gate, and it selects the same `libggml-cpu-armv8.0_1.so`. Costs a QEMU row (`QEMU_CPU=cortex-a53`), not a port. |
-| Zero 2 W on the **32-bit** image, Pi 2/3 on 32-bit | ARMv7-A + NEON | a real but small port — §6.3 |
-| **Zero / Zero W**, Pi 1 (BCM2835, ARM1176JZF-S) | ARMv6 + VFP, **no NEON** | out of scope — §6.5 |
+| **Zero 2 W** (BCM2710, Cortex-A53) on **64-bit** Raspberry Pi OS | ARMv8.0-A | **a supported target since aarch64 shipped.** A53 is ARMv8.0 with no dotprod/FP16/SVE — the same profile `wheels.yml`'s `raspberry-pi-check` already gates on its A72 rows, selecting the same `libggml-cpu-armv8.0_1.so`. |
+| Zero 2 W on the **32-bit** image, Pi 2/3 on 32-bit | ARMv7-A + NEON | **builds, unverified.** The guard below is on pointer width, so armv7 takes the same path; no board here runs it and no wheel is published for it. |
+| **Zero / Zero W**, Pi 1 (BCM2835, ARM1176JZF-S) | ARMv6 + VFPv2, **no NEON** | **shipped** — §6.3 |
 
-**The distinction is the whole item.** "Zero 2 W support" is a documentation line ("64-bit OS
-required") plus a gate row; only the 32-bit userland is engineering.
+### 6.2 The port was one guard, and the predicted blockers mostly were not
 
-### 6.2 What the source read found, and it is mostly good news
+`GGML_CPU_ALL_VARIANTS` was the only hard failure, and it is a configure-time one rather than a
+compile-time one: `loom-py/CMakeLists.txt` FORCEd it ON, and ggml's ARM ladder
+(`src/CMakeLists.txt`) is aarch64-only — every rung is emitted as `-march=armv8.x-a[+dotprod…]` at a
+compiler that has no such architecture. `armv6l` and `aarch64` both resolve to `GGML_SYSTEM_ARCH ==
+"ARM"`, so a 32-bit build walks straight into it. The fix is `CMAKE_SIZEOF_VOID_P EQUAL 8` around
+the FORCE, and a 32-bit wheel is therefore one un-split `libggml-cpu.so`. Nothing is lost: every rung
+of that ladder distinguishes dotprod / FP16 / SVE / i8mm, none of which exists below ARMv8.
 
-* **This engine has no port to do.** `grep -rE '__aarch64__|__ARM_NEON|immintrin|AVX' src include tools`
-  returns **nothing**. Every byte of ISA-specific code in the project is in ggml and in the sixteen
-  patches under `cmake/patches/` — which is [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md)'s
-  principle paying out on an axis it was not written for.
-* **ggml v0.19.0 still maintains ARM32.** `src/ggml-cpu/ggml-cpu-impl.h:87–305` is an explicit
-  `#if !defined(__aarch64__)` "32-bit ARM compatibility" block shimming `vaddvq_f32`, `vaddvq_s32`,
-  `vmaxvq_f32`, `vcvtnq_s32_f32`, `vpaddq_*` and `vaddlvq_s16`; `src/ggml-cpu/CMakeLists.txt:107`
-  probes for `-mfp16-format=ieee`, which is an ARM32-only GCC flag; `arch/arm/quants.c` carries 33
-  `#else` scalar fallbacks and `arch/arm/repack.cpp` gates its bodies on `__aarch64__` so they compile
-  out rather than break.
-* **Our own patches degrade rather than fail.** `ggml-0006`/`0007` (conv1d direct + fusion) have
-  generic `#else` arms; `ggml-0010` (GELU) falls back to scalar `erff`; `ggml-0001`/`0002`/`0011`/`0012`
-  are `__aarch64__`-guarded and go inert. It builds. It builds *slow* — see §6.4.
+**One blocker was not on the list at all, and it is the only code change this item needed outside
+that guard: `libggml-base.so` references `__atomic_fetch_add_8`.** `ggml_graph_next_uid()` (ggml.c)
+is a `__atomic_fetch_add` on a static `uint64_t`; ARMv6 has `LDREX`/`STREX` and no `LDREXD`, so GCC
+cannot inline a 64-bit atomic and emits a libatomic call that nothing in this tree links.
+`cmake/Dependencies.cmake` now probes for it with `check_c_source_compiles` — which links, not just
+compiles — and puts libatomic on `ggml-base` PUBLIC when the toolchain needs it. **How it fails is
+the reason it is worth reading about**: every shared library in the build links clean, because a
+shared object is allowed to carry undefined symbols; the first *executable* is what fails, and a
+build that links no executable — the wheel build — succeeds and fails at `import loom`, in `dlopen`,
+on the user's board. See [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md).
 
-### 6.3 The blockers, in the order a build would hit them
+The rest of the predicted list came out better than the read expected:
 
-1. **`GGML_CPU_ALL_VARIANTS`** — `loom-py/CMakeLists.txt:66` FORCEs it ON, and ggml's ARM ladder
-   (`src/CMakeLists.txt:403`) is aarch64-only: `armv8.0_1`, `armv8.2_1 DOTPROD`, … emitted as
-   `-march=armv8.x-a` against a 32-bit compiler. **Hard configure failure, one-line fix** — gate the
-   FORCE on `CMAKE_SIZEOF_VOID_P EQUAL 8`. A 32-bit wheel is one un-split `libggml-cpu.so`.
-2. **LuaJIT is a hard dependency built from its own Makefile** (`cmake/Dependencies.cmake`). Its ARM
-   port covers ARMv5TE and up, so armv7 hard-float should work — but it bootstraps through
-   `minilua`/`buildvm` and has never been built for this target here. **The one genuine unknown.**
-3. **No native runner.** `wheels.yml:46` rejects QEMU *for building* on purpose and is right to; there
-   is no 32-bit ARM hosted runner to replace it with. A shipped `manylinux_2_17_armv7l` wheel therefore
-   means either emulated builds or a self-hosted Pi, and both are policy changes.
-4. **`llamafile/sgemm.cpp:66` sets `VECTOR_REGISTERS 32` on any `__ARM_NEON`** — but armv7 NEON has 16
-   Q registers, not 32, so the 4×6 tile would spill catastrophically. **`ggml-0001`'s guard
-   (`!(defined(__ARM_NEON) && __GNUC__ && !__clang__)`) already routes a GCC build to the 16-register
-   schedule**, so we are covered by accident, not by intent. A clang armv7 build is not. Upstream-worthy.
-5. **F16 conversion paths** (`sgemm.cpp:4172`, `:4312`, `simd-mappings.h:38`) reach `__fp16` under plain
-   `__ARM_NEON`. Expected to work with the `-mfp16-format=ieee` of §6.2; unverified.
-6. **RAM, and it is the binding constraint on the boards actually asked about.** Both Zeros have
-   **512 MB**, and `src/core/gguf_model.cpp:21` parses with `no_alloc=true` and then reads weights into
-   a backend buffer — **there is no mmap path**. VITS at Q4_0 is 11.7 MB and fine; whisper-small is
-   tight; the 0.6B ASR and LM models do not fit at any quantization this repo ships
-   ([ADR-017](../adrs/adr-017-no-k-quants.md)).
+* **LuaJIT — the "one genuine unknown" — needed nothing.** Its ARM port covers ARMv5TE up
+  (`lj_arch.h` sets `LJ_ARCH_VERSION 60` for `__ARM_ARCH_6__`), and because the build is native
+  inside an emulated target userland, the `minilua`/`buildvm` bootstrap that makes cross-compiling it
+  hard never has a host/target split to reconcile. A 703 KB `libluajit.a`, unpatched.
+* **This engine still has no ISA-specific code.** `grep -rE '__aarch64__|__ARM_NEON|immintrin|AVX'
+  src include tools` returns nothing; every byte of it is in ggml and in `cmake/patches/`, which is
+  [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) paying out on an axis it was not
+  written for.
+* **ggml compiles clean.** `__ARM_NEON` is simply undefined, every `arm_neon.h` include is guarded by
+  it, `arch/arm/quants.c` takes its 33 scalar `#else` arms and `arch/arm/repack.cpp` gates its bodies
+  on `__aarch64__`. Our own patches degrade rather than fail: `ggml-0006`/`0007` have generic arms,
+  `ggml-0010` falls back to scalar `erff`, and `ggml-0001`/`0002`/`0011`/`0012` go inert.
+* **Blocker 4 (`VECTOR_REGISTERS 32` on any `__ARM_NEON`) does not arise at all here** — there is no
+  NEON on this rung. It is still live for armv7.
 
-### 6.4 Effort, and what it buys
+### 6.3 The wheel is built in an emulated Raspbian, and does not go to PyPI
+
+Both halves are forced rather than chosen, and [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md)
+records why: no provider has a 32-bit ARM runner; cross-compiling gets the wheel tag, the default
+`-march` and *libgcc* wrong; and PyPI accepts only `manylinux*`/`musllinux*` tags for Linux, whose
+floor is armv7.
+
+`.github/docker/Dockerfile.armv6` is the build environment — Raspbian bookworm (glibc 2.36, the
+board's own), `docker run --platform linux/arm/v6`, `qemu-arm` under binfmt. `wheels.yml`'s
+`build-armv6-wheel` job builds it on every release and attaches it to the GitHub release; the
+artifact is deliberately **not** named `wheels-base-*`, because `publish-pypi` globs that into one
+upload and one refused tag fails all of it.
+
+**`QEMU_CPU=arm1176` is what makes the emulated check a check**, and it is worth stating because the
+failure it catches is invisible without it. qemu-user runs whatever CPU model it is given; under a
+permissive one (`cortex-a15`, `max`) an ARMv7 build imports, runs and passes, and then takes SIGILL
+on the board. Measured: a program containing one `movw`/`movt` pair — ARMv6T2, which an ARM1176 is
+not — prints its answer under `QEMU_CPU=cortex-a15` and dies with "Illegal instruction" under
+`QEMU_CPU=arm1176`.
+
+### 6.4 What it does, and how slowly
+
+Measured on the board — a Raspberry Pi Zero W (BCM2835, one ARM1176JZF-S at 1 GHz, 427 MB usable),
+Raspbian bookworm, Python 3.11.2, the `linux_armv6l` wheel installed from a file. VITS at Q4_0,
+11.7 MB, given the phonemes for *"hello world, this is a Raspberry Pi Zero"*:
 
 | | |
 |---|---|
-| Zero 2 W via 64-bit OS | **~1 day**, all of it verification: one `QEMU_CPU=cortex-a53` row on `raspberry-pi-check`, and a README line saying 64-bit. |
-| armv7l, source build green | **1–2 days**: blocker 1, then LuaJIT, then whatever 4 and 5 throw. |
-| armv7l, shipped as a wheel | **+~1 week**, and it forces the blocker-3 policy decision. |
+| model load | 1.2 s warm, 4.5 s cold |
+| synthesis | **237–265 s for 3.19 s of audio** — 74x to 83x slower than real time |
+| peak RSS | 90 MB, of which 11.7 MB is the model |
+| wheel | 1.49 MB (one `libggml-cpu.so`; the x86-64 wheel ships fourteen variants) |
 
-**What it does not buy is speed.** Every optimisation in [Epic-05](epic-05-edge-performance.md) is
-either `__aarch64__`-guarded or AVX2-guarded, so an armv7 build runs at roughly the generic-C rung —
-the README's Pi 4 columns do not transfer, and would need a per-architecture caveat rather than a
-footnote.
+**The spread is thermal, and [Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md)
+is why it is reported as a spread.** One run on a board that had been idle is 236.7 s; three
+back-to-back are 266.4 / 263.5 / 265.0 s. A Zero W has no heatsink and this is four and a half
+minutes of solid floating point, so the second and third runs are paying for the first.
 
-### 6.5 ARMv6 is a declared non-goal
+It scales linearly rather than falling off a cliff — on the same idle board, 0.43 s of audio costs
+30.8 s, 0.98 s costs 71.7 s, 2.19 s costs 165.8 s and 3.19 s costs 236.7 s — so ~74x is the shape of
+the thing and not an artifact of one utterance length. For comparison, the same file and the same
+phonemes on the x86-64 dev box take 1.18 s: the board is **200x slower than a laptop**, and the Pi 4
+columns in the README's benchmark tables transfer to it in no way at all.
 
-Pi Zero / Zero W / Pi 1 would compile — `__ARM_NEON` simply goes undefined and everything takes the
-scalar arm — and that is the problem: a single ~1 GHz ARM11 with no SIMD, no tinyBLAS benefit and
-512 MB. There is also no PyPI wheel tag anyone consumes for `linux_armv6l`. **Only the smallest TTS
-(VITS/Matcha at Q4_0) is even plausible, at many times the Pi 4's time.** Reopen only if a real user
-names the board and accepts source builds.
+**It is deterministic, and that was checked rather than assumed** — all three runs produced
+byte-identical output (`sha256 cf88b7ae…` over the 16-bit PCM), as did the earlier one-off.
+
+**Q4_0 buys size here, not speed, and the difference is worth stating because the name implies
+otherwise.** ABBA on the board, 60 s settle between arms, normalised to seconds of compute per second
+of audio (the two files disagree on duration — the predictor is quantization-sensitive — so raw
+seconds are not comparable):
+
+| | ms of audio per run | A | B | mean |
+|---|---|---|---|---|
+| VITS **Q4_0**, 11.7 MB | 3.19 s | 78.8x | 82.5x | **80.7x** |
+| VITS **F32**, 62.8 MB | 3.33 s | 79.8x | 83.5x | **81.7x** |
+
+**1.2% apart, inside the thermal drift** — and the drift is visible in the table, both B arms being
+slower than both A arms. What Q4_0 is worth on this board is 5.4x of file, on 427 MB of RAM.
+
+**And 96% of the run is convolution.** `LOOM_PROFILE`, one thread (which is all there is), Q4_0:
+
+```
+by op            calls        ms       %
+CONV_2D            117  217234.6   84.4%
+CONV_TRANSPOSE_1D    3   29587.4   11.5%
+ADD                298    4180.3    1.6%
+MUL_MAT             36    2577.5    1.0%
+```
+
+`MUL_MAT` is **1.0%**, which is why it costs nothing that tinyBLAS declines this target outright:
+`llamafile/sgemm.cpp`'s F32 case has no arm for a machine with neither AVX, NEON, VXE, MMA nor RVV
+and falls through to `return false`. The engine's ~2x-on-x86 GEMM is simply not on the critical path
+of a vocoder here. Any future work on this rung is convolution work.
+
+**The ceiling is the board, not the engine.** Measured with the same eight-chain scalar FMA loop at
+`-O2` on each machine, one core: the Zero W does **87 MFLOP/s** and the x86 dev box **~8.9 GFLOP/s**
+— 100x per core, ~400x against its four. loom's measured end-to-end gap is **210x**, so the ARMv6
+build is doing *better* than the raw floating-point ratio, not worse. There is no order of magnitude
+sitting on the floor waiting for a patch; there is an ARM1176 with VFPv2, no SIMD of any kind, and
+one of it.
+
+**And it is CORRECT, which is the part that had to be checked rather than assumed.** The board's
+waveform against the dev box's, same model, same seed, sample for sample:
+
+```
+n 70400 70400
+samples differing: 102 (0.14%)
+max abs diff (of 32767): 1
+cosine: 0.999999999
+```
+
+Every difference is one least-significant bit of 16-bit PCM — floating-point summation in a different
+order, which is what two ISAs are expected to disagree by and nothing more. The duration predictor
+produced the same 70400 samples on both, and the ASR oracle ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)'s
+rule: cosine agreement is not intelligibility) transcribes the board's own file back as
+*"Hello world, this is a Raspberry Pi Zero."*
+
+**Both hermetic suites are green on this rung.** loom-py's `pytest tests/ci` is **95 passed /
+4 skipped on the board itself** and identically so in the emulated Raspbian under `QEMU_CPU=arm1176`;
+the engine's own `ctest -L ci` is **81/81** in 150 s emulated (it needs a build tree, which the board
+has no room for).
+
+`ctest` found exactly one 32-bit defect, and it was in a fixture rather than in the engine:
+`tests/fixtures/reference_duration_aligner.py` passed `np.int64` as `np.repeat`'s `repeats`, and
+numpy casts that argument to the platform index type under the `safe` rule — which on a 32-bit
+interpreter is `int32`, so it raises rather than truncating. `np.intp` is the type that was meant and
+is correct on both. Nothing in `src/` or `include/` needed a line.
+
+**One caveat that is the board's and not the wheel's, because it cost an hour to establish that.**
+The reference Pi segfaults at backend discovery — intermittently, in a way that looks exactly like a
+32-bit memory bug — and it is not one: a third-party package had installed its own
+`libstdc++.so.6.0.32` into `/usr/local/lib/arm-linux-gnueabihf`, which `/etc/ld.so.conf.d` puts ahead
+of Raspbian's 6.0.30, so `std::filesystem::directory_iterator` frees its shared state under one
+libstdc++ and releases it under another. Fifteen lines of C++ that never mention this project
+reproduce it, and `LD_PRELOAD` of the distribution's own copy fixes it 5/5 —
+[Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md). Worth knowing because the emulated gate
+cannot see it: the container has exactly one libstdc++, which is the point of building there.
+
+**Which models are worth putting on this board, measured rather than reasoned.** Every output below
+is identical to the same file's on x86-64, and all three are Q4_0:
+
+| model | file | peak RSS | task | on the board |
+|---|---|---|---|---|
+| `distilbert-ner` | 115 MB | 131 MB | 17-token sentence → a label per token | **8.7–12.0 s** |
+| `conformer-ctc-small` | 44.6 MB | 84 MB | 3 s of speech → transcript | 61.9 s = **20.6x** real time |
+| `vits-piper-en-gb-miro` | 11.7 MB | 90 MB | 3.19 s of speech synthesised | 245–265 s = **80x** real time |
+| both ASR and NER, one process | 160 MB | 185 MB | audio → transcript → entities | 65.5 s end to end |
+
+**And Q4_0 is worth 3.8x on the transformer and nothing on the vocoder**, which is the rule this rung
+turns out to have. ABBA on the board, DistilBERT: Q4_0 **12.04 / 8.74 s** against F32 **39.60 /
+39.90 s**, and 131 MB of RSS against 262 MB. Against VITS's 1.2%, that is the same knob giving two
+opposite answers, and the profile above says why: VITS is 96% `CONV_2D`/`CONV_TRANSPOSE_1D`, whose
+kernels are float, while DistilBERT is essentially all `MUL_MAT`, where Q4_0 × Q8_0 is an **integer**
+dot product — and an ARM1176's integer path is far better than its VFPv2 scalar float. The
+transformer sustains roughly 140 MFLOP-equivalent/s against the board's measured 87 MFLOP/s *floating
+point* ceiling, which is only possible because it is not doing floating point.
+
+So the selection rule for an ARMv6 board is **matmul-shaped models, quantized** — encoders, token
+classifiers, CTC ASR — and not convolutional vocoders, where the quantization pays for itself in file
+size alone. A causal LM is a separate no: decode costs 2 FLOPs per parameter per token, so even
+`gemma-3-270m-it` at Q4_0 projects to several seconds per token before the 512 MB question is asked.
+
+### 6.5 What INT8 would and would not buy, and where the headroom actually is
+
+The obvious idea on a board with no floating-point SIMD is to get the arithmetic into integers.
+Measured, on the board:
+
+| MAC throughput, one core, eight independent chains, `-O2` | MMAC/s | vs VFP |
+|---|---|---|
+| `float` VFP multiply-add | 43.4 | 1.00x |
+| `uint32_t` scalar multiply-add | 70.0 | 1.61x |
+| `__smlad` — ARMv6's dual 16x16 MAC on a GPR pair | **156.7** | **3.61x** |
+
+**THE 3.61x IN THAT TABLE IS WRONG, and `scripts/bench30.c` is what disproved it.** Its `float` arm
+measures the loop rather than the FPU: a real 2x2-tiled F32 GEMM on the same board reaches **153.7
+MMAC/s**, against the tiled *quantized* kernel's 167.9 — within 10% of each other. `__smlad` is
+genuinely emitted (192 of them in the shipped `libggml-cpu.so`, checked with `objdump`) and genuinely
+does two MACs per instruction; the advantage is simply spent on the `uxtb16`/`ssub16`/`sxtb16` that
+unpack Q4_0 nibbles and Q8_0 bytes around it — twelve setup instructions per eight MACs, where an F32
+`vmla` needs none. **On this core the win is the register tile, not the integer arithmetic**, and
+quantization's value is memory: eight times less weight through a 16 KB cache. The rest of this
+section is kept for the instruction inventory, which is accurate.
+
+ARMv6 does have SIMD; it is just not NEON. `__ARM_FEATURE_SIMD32` and `__ARM_FEATURE_DSP` are both
+defined by the stock Raspbian compiler, `<arm_acle.h>` exposes `__smlad`, `__smlald`, `__sxtb16` and
+the rest, and they work on an ARM1176 — two 16-bit MACs per instruction on the general-purpose
+registers, with `__sxtb16` unpacking two int8s into two int16s in one more. **3.61x is the ceiling for
+any "make it integer" idea on this core.**
+
+**It does not reach VITS by changing the quantization type, and the code says why before a stopwatch
+does.** `ggml_conv_2d_direct_packed` (`cmake/patches/ggml-0013`) "dequantizes it once per call into
+the scratch buffer its direct sweep already repacks an F32 kernel into, so every lowering below that
+point is the F32 lowering". Q4_0 and Q8_0 differ in what is stored, not in what is computed —
+confirmed by ABBA on the board: **80.6x / 81.1x / 81.7x** real time for Q4_0 / Q8_0 / F32, a 1.4%
+spread. And the other lowering is not the answer either: `GGML_CPU_DISABLE_CONV_HEURISTICS=1`, which
+sends the convolutions to im2col + `MUL_MAT`, is **1.63x slower** (416 s against 256 s). Both are in
+[Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md).
+
+Getting integers into a convolution therefore needs an **int8 x int8 -> int32 direct-conv kernel**,
+which ggml has for no architecture — quantized dot products exist only under `MUL_MAT`. §6.7 measures
+what that is actually worth, and the answer is far below the 3.61x ceiling above: most of VITS's
+convolution time is not in the direct sweep at all.
+
+**The headroom worth having is under `MUL_MAT`, which serves both models this rung should actually
+run (§6.4).** That was scoped from the table above and then measured properly — see §6.6 for the
+prototype, and for the correction: the projection made here from these microbenchmark numbers was
+**2.2x and the measured answer is 1.47x**, because the incumbent kernel was never at the naive scalar
+bound this table describes.
+
+### 6.6 The ARMv6 kernels, built and measured on the board
+
+> **The seconds in this section are about a third high.** They were taken while
+> `bluetooth-km-switch` was spinning on half of this board's single core — `ps` reported it at 5.7%,
+> which is an average over its lifetime rather than a rate. The **ratios are ABBA'd and hold**: the
+> 1.80x below re-measures at 1.837x on a quiet board. For a clean anchor, the pre-kernel VITS
+> synthesis is **181.8 s**, not the 259 s recorded here.
+> [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md).
+
+
+Three patches, `cmake/patches/ggml-0017` to `0019`. Two ship on by default and one does not.
+
+**What shipped, measured on a Pi Zero W by same-session ABBA** — baseline wheel against kernel wheel,
+`pip install --force-reinstall` between arms, 30 s settle, four arms:
+
+| | baseline A / B | kernels A / B | |
+|---|---|---|---|
+| `conformer-ctc`, 3 s of audio | 66.2 / 67.6 s | **14.3 / 17.0 s** | **4.28x** — 22.3x -> **5.2x** real time |
+| VITS, 3.2 s of audio | 259.9 / 258.2 s | **141.3 / 146.6 s** | **1.80x** — 81x -> **44x** real time |
+| `distilbert-ner`, 17 tokens | 9.54 / 8.74 s | 9.57 / 6.29 s | 1.15–1.62x; too noisy at 10 s to pin |
+
+Every transcript correct. VITS's waveform **changes** — `sha 1e5fa69a` rather than the baseline's
+`cf88b7ae`, identical across both kernel arms — because the convolution route now quantizes its
+activations to Q8_0, which `ggml-0013`'s own comment warned is less accurate than dequantize-then-F32.
+The ASR oracle is what clears it: the board's own audio still transcribes as *"Hello world, this is a
+Raspberry Pi Zero."* ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)'s rule — cosine
+agreement is not intelligibility, and here there is not even a cosine to appeal to, since the duration
+predictor lands on 3.24 s instead of 3.19 s.)
+
+**distilbert-ner is where the measurement is weakest and this should say so.** At ~10 s a run it swings
+±40% on this board; the kernel-arm readings across three ABBAs are 6.27, 6.31, 6.37, 6.51 and then
+9.57, and the last is as likely to be the machine as the code. conformer at 66 s and VITS at 260 s are
+the signals worth quoting.
+
+**Three changes got it there, and the last is an ARMv6 arm of a kernel that already existed:**
+
+| | what | measured in isolation |
+|---|---|---|
+| `0018` `gemm44` | the F32 GEMM's 4x4 tile written out longhand | 173.9 vs 110.6 MMAC/s |
+| `0019` conv route | `k` was passed in elements where `llamafile_sgemm` wants blocks | fixes a wrong answer |
+| `0019` conv tile | an ARMv6 arm for `ggml_conv_1d_direct_tile_impl` | 51.8 vs 22.5 MMAC/s, **2.30x** |
+
+**How to size a tile on this architecture**How to size a tile on this architecture, which took three benchmarks to get right.** The first
+attempt at 4x4 measured **27.2 MMAC/s** against 2x2's 153.7 and was written off as register pressure.
+It was not: it was the `av[RM]`/`bv[RN]` arrays in the inner loop going to the stack, plus
+`A[lda*(ii+i)+l]` recomputing addresses every iteration. Rewritten with explicit scalar accumulators
+and post-incremented pointers, the same 4x4 tile reaches **226.7 MMAC/s** — the best F32 result on the
+board and 1.45x over the shipped 2x2.
+
+**And the two kernels then top out at different shapes, for a reason worth remembering**
+(`scripts/bench31.c`, `bench32.c`):
+
+| tile | F32 | int16 `__smlad` |
+|---|---|---|
+| 2x2 | 155.9 | 228 |
+| 4x2 | — | **270** |
+| 4x4 | **226.7** | 217 (spills) |
+
+**Size the tile by which register file the accumulators land in.** F32 accumulates in VFP, which has
+32 single-precision registers, so 4x4's sixteen accumulators fit and the pointers use the GPR file
+independently. Integer accumulates in the *same* 14-register GPR file the pointers are in, so 4x2 —
+eight accumulators and six pointers — is the wall. The Q4_0 kernel is stricter again: its unpack needs
+four live registers per row and four per column on top, which is why it stays at 2x2.
+
+That table also settles what `__smlad` is worth. At its best tile it is 270 against F32's best 226.7 —
+**1.19x**, with int16 operands and no unpacking at all. Real, but a fraction of what the tile is worth,
+and it would need an int16 type ggml does not have.
+
+**Two things went wrong on the way and both are recorded**, because both were the kind of error that
+passes review: the tile order was first fixed to what one convolution shape wanted, which made
+conformer 5% slower ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)), and
+the emulated `ctest` that pronounced the first version green had compiled the kernels *out*
+([Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md)). The suite is green now on a
+build whose `sgemm.cpp.o` is `Tag_CPU_arch: v6` and whose `libggml-cpu.so` carries ten ARMv6 symbols
+— checked with `nm` before the suite was believed.
+
+**Emulated builds of this repo must pass `-DGGML_NATIVE=OFF`.** Under QEMU `gcc -mcpu=native` answers
+`-mcpu=arm10e -march=armv5te+fp`, one rung below the target, and everything still builds and passes.
+
+### 6.7 How the work was scoped, and where the scoping was wrong
+
+*Recorded as [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md).*
+
+**Two earlier versions of this section argued against ARMv6-specific kernels on carry cost — code ggml
+would never take, maintained here forever. That is not an objection on this project's terms**: ARMv6
+is the declared floor (below it is microcontrollers, which have none of the machinery this engine
+assumes), so a kernel for it serves a permanent tier. Once that is granted the answer changes, because
+a *dedicated* kernel can do what a drop-in `vec_dot` replacement cannot — pick its own loop order and
+hold a register tile — and that turns out to be where most of the win is.
+
+**Where the convolution time goes.** Attributing `LOOM_PROFILE`'s buckets to the topology's real
+shapes gives the rate each lowering achieves on the board:
+
+| bucket | ms | MMAC | MMAC/s | lowering |
+|---|---|---|---|---|
+| L=275, flow + vocoder pre (41 calls) | 92195 | 2041 | **22.1** | direct path **declines** -> F32 im2col |
+| L=94, text encoder (57 calls) | 33166 | — | — | same shape class |
+| L=2200 / L=17600 / L=70400 resblocks | 91874 | 5422 | 43.0 / 50.8 / 90.2 | direct sweep |
+
+`ggml_conv_1d_direct_ok` refuses the top row twice over — weights 1.47 MB against a 512 KB budget, and
+`OL/4 = 68 < OC/4 = 96` — so `ggml_compute_forward_conv_2d_impl` dequantizes the kernel and runs a
+batched **F32** im2col GEMM at 22 MMAC/s. **49% of the runtime is convolutions that threw their
+quantization away.**
+
+**What a dedicated kernel reaches at that exact shape** (IC*K=960, OC=384, OL=276 —
+`scripts/bench27.c`, `bench28.c`, `bench29.c`; every arm verified `memcmp`-identical to the first):
+
+| | MMAC/s | vs today |
+|---|---|---|
+| F32 GEMM — what runs today | 29.7 | 1.00x |
+| q4_0 x q8_0, shipped `vec_dot` | 66.3 | 2.23x |
+| q4_0 x q8_0, `__smlad` `vec_dot` (the drop-in of §6.6) | 78.3 | 2.63x |
+| order A, 1x4 column tile | 97.0 | 3.27x |
+| order B — weights stream, not activations | 106.9 | 3.60x |
+| **order B + 2x2 register tile** | **167.9** | **5.65x** |
+
+Two things in that table are worth more than the `__smlad` instruction itself. **The loop order**:
+`for oc { for ol }` keeps the weight row in L1 and sweeps all 281 KB of activations once per output
+row — 108 MB per call. The other order sweeps 207 KB of weights per column, 57 MB. **And the 2x2
+tile**: the nibble unpack is ~10 instructions and the activation unpack ~6, so 1x1 pays 20
+instructions per 8 MACs and 2x2 pays 48 per 32 — 2.50 down to 1.50. At 167.9 the kernel is past the
+isolated dot product's 149.6 and past the pure-`__smlad` microbenchmark's 156.7, because the tile
+amortises the overheads those still carried.
+
+**Neither is expressible as a `vec_dot`.** `vec_dot` computes one output element from one row and one
+column; the loop order and the tile belong to whatever calls it. That is the technical reason a
+dedicated ARMv6 `MUL_MAT` is worth more than a patched kernel, and it is measured rather than argued.
+
+**Everything below is the SCOPING, kept because its reasoning produced the patches and because two of
+its numbers turned out wrong in instructive ways — §6.6 is what was actually built and measured.** The
+shape-level benchmark said the dedicated GEMM was **5.65x** against the F32 conv fallback and **2.53x**
+against the shipped quantized path; end to end on the board it is **1.62x** on distilbert-ner and
+**1.07x** on conformer-ctc. Both are real wins and both are far below what a single-shape benchmark
+promised, which is [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s whole
+reason for existing.
+
+**Order to build:**
+
+1. **A dedicated ARMv6 `MUL_MAT` for q4_0 x q8_0** — order B, 2x2 tile, `__smlad`, behind
+   `__ARM_FEATURE_SIMD32 && !__aarch64__`. **2.53x** over the shipped quantized path. Amdahl on the two
+   models this rung is good at (§6.4): distilbert-ner is 96.6% `MUL_MAT` -> **2.40x** (9.1 s -> 3.8 s),
+   conformer-ctc 82.2% -> **1.99x** (61.8 s -> 31 s, 20.6x -> 10.3x real time).
+2. **fp16 scales by arithmetic instead of the 256 KB table** — 1.18x measured, bit-identical, not even
+   ISA-specific (§6.6), and worth relatively more once the arithmetic is 2.5x faster.
+3. **Route the convolutions the direct sweep declines through it** rather than dequantizing to F32.
+   **5.65x on 49% of VITS**: 80x -> **48x** real time.
+4. **An int8 `__smlad` direct convolution** for the buckets the sweep accepts — still last, but no
+   longer marginal now that there is a 167.9 MMAC/s target to aim at against the sweep's 59 average.
+   It keeps its reason to exist: at L=70400 an im2col materialises 15.8 MB, which a 427 MB board should
+   not pay. If it reached the same 167.9, VITS lands at **29x** real time.
+
+**What became of that order.** Steps 1 and 2 were built, measured and shipped (§6.6), and they are the
+two that mattered — though at 1.62x and 1.07x rather than the 2.53x projected here, and distilbert-ner
+landed at 6.3 s rather than the 3.8 s this section predicted. Step 3 was built and is **off by
+default**: correct on 1-D convolutions and worth 2.6% there rather than 5.65x, and *wrong* on 2-D
+ones. Step 4 was **not** built, and step 3 is the reason — the 1.14x that made it look like an
+afterthought came from the same shape-level model that overstated steps 1 and 3, so what an int8
+direct convolution is worth here is not known until step 3's 2-D case is understood. That is the next
+task, and it is debugging rather than kernel writing.
+
+### 6.8 Where the remaining ARMv6 performance is
+
+Ordered by evidence, not by appeal. Everything here was measured on the board with the kernels of
+§6.6 installed.
+
+**1. SHIPPED — the direct-convolution predicate was reading a cache size from another machine.**
+`ggml_conv_1d_direct_budget()` decides whether a convolution's weights are small enough for the direct
+sweep to pay, and it asks `sysconf`. An ARM1176 reports **0 for every level**, so the function fell to
+its 512 KB floor — on a core with a 16 KB L1 data cache and no L2 it can use, the BCM2835's 128 KB L2
+belonging to the GPU. Thirty-two times too generous, and silently.
+
+That matters more here than the arithmetic does. The direct sweep re-reads the WHOLE weight tensor
+once per position block, and a block is four positions on this arm, so its weight traffic is **one
+byte per MAC whatever the shape**. Inside L1 that byte is free; outside it the sweep is DRAM-bound and
+a GEMM, which blocks both operands, wins by whatever the miss rate is. Per shape, one VITS synthesis,
+`LOOM_PROFILE_NODES=1` at one thread, same wheel both arms:
+
+| dst shape (OL,1,OC,1) | calls | weights | direct sweep | im2col + GEMM | |
+|---|---|---|---|---|---|
+| 70400,1,32,1  | 6  |  28 KB | **22529.7 ms** | 23714.6 ms | sweep by 5% |
+| 17600,1,64,1  | 6  | 112 KB | 35290.3 ms | **22806.2 ms** | GEMM 1.55x |
+|  2200,1,128,1 | 6  | 448 KB | 26598.5 ms | **11837.2 ms** | GEMM 2.25x |
+|   275,1,384,1 | 28 | 1.47 MB | 17520.1 ms | 17854.1 ms | declines in both |
+|    94,1,192,1 | 44 | 147 KB | 3800.7 ms | 3833.6 ms | declines in both |
+
+The turn is between 28 KB and 112 KB, so `ggml-0019` gives the function an ARMv6 arm returning
+**32 KB** — twice the L1, because this core's replacement policy is not LRU and a working set of about
+twice the cache still takes roughly half its reads out of it, which is what the 28 KB row is.
+`ggml-0006` grows **`GGML_CPU_CONV1D_BUDGET`** alongside it, a byte count that overrides the detection
+entirely; that is what made every number below measurable.
+
+**End to end on the board**, one wheel, one session, an idle board, VITS on 3.24 s of audio:
+
+| | VITS | |
+|---|---|---|
+| before P7 — no ARMv6 kernels at all | 181.49 / 182.14 s | 57.0x real time |
+| P7's kernels, `CONV1D_BUDGET=524288` | 98.96 s | |
+| **+ the 32 KB budget, this item** | **80.96 / 80.87 / 80.88 s** | **1.223x** |
+
+conformer-ctc and distilbert-ner have no convolution in this budget's range and do not move. The ASR
+oracle transcribes the waveforms either side of the change alike as *"Hello world, this is a Raspberry
+Pi Zero."*, 8/8 words.
+
+**These numbers replace a set that was 25% high**, and the ones in §6.6 are high by about a third for
+the same reason — a service on the board had entered a spin and was taking half the core, while `ps`
+reported it at 5.7% because that column is an average over the process's lifetime. Ratios taken by
+ABBA survived it (§6.6's 1.80x for VITS re-measures at 1.837x); seconds and real-time factors did not.
+[Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md).
+
+**One thing this corrects about the switch it came from.** `GGML_CPU_DISABLE_CONV_HEURISTICS` gates
+*two* decisions — this predicate and the im2col patch-batch budget — so the 1.27x it was first
+measured at could not be attributed to either, and the "**15.8 MB of im2col at L=70400**" this section
+used to warn about is a property of the switch's *other* half rather than of declining the direct
+path: the fallback is `ggml-0004`'s **batched** im2col. It is still not a `return false`, but for the
+opposite reason to the one recorded — at OC=32 the sweep wins.
+[Retro-036](../retros/retro-036-one-switch-two-decisions.md).
+
+**2. SHIPPED — the im2col patch-batch budget was sized against a cache eight times too big.**
+`ggml-0004` caps a batch at 512 KB so the patches are still resident when the GEMM reads them back,
+and that number is half of a Cortex-A72's 1 MB L2. This core's last level is a 16 KB L1. `ggml-0019`
+gives it **64 KB**, and `ggml-0004` grows **`GGML_CPU_CONV2D_PATCH_BUDGET`** (bytes; 0 = no cap) so
+that the cap can be moved without also moving the predicate.
+
+Swept on an idle board, one wheel, one session, this cap the only variable:
+
+| cap | 16 KB | 32 KB | **64 KB** | 256 KB | none | 512 KB |
+|---|---|---|---|---|---|---|
+| VITS | 80.58 s | 76.68 s | **76.37 / 76.07 / 76.35 s** | 77.16 s | 77.57 / 77.52 s | 80.92 / 79.71 / 80.06 / 80.88 s |
+
+**1.061x**, and the shape is the interesting part rather than the size. There is a **floor as well as a
+ceiling**: at 16 KB — the size that would actually fit this L1, which is what the rule's own reasoning
+asks for — it is as bad as 512 KB, because a batch that small leaves the GEMM eight columns wide and
+what is won in residency is lost in shape. So the constant is swept, not derived, and it is not
+`l1 / 2`. **Uncapping entirely is not the answer either**, though it was the obvious guess and was
+what this section previously predicted: 77.5 s, a full percent worse than 64 KB.
+
+That prediction came from reading 1.149x off the old kill switch, on the contaminated board, for a
+different set of buckets. Measured directly, on its own knob, on a quiet board, it is 1.061x.
+
+**Where P7.1 leaves the board.** VITS **181.8 -> 76.2 s** across P7 and P7.1 together, **57.0x ->
+23.5x real time**; conformer-ctc 10.9 s for 3 s of audio (3.62x real time) and distilbert-ner 5.07 s
+for 17 tokens.
+
+**3. SHIPPED — `CONV_TRANSPOSE_1D` was packing its two GEMM panels onto the same cache way.** The op
+is **6.5%** of a synthesis rather than the 11.5% this list used to claim, and it holds no accumulator
+array: `ggml-0009` already made the compute a GEMM. What was wrong is where the operands sit.
+
+`gemm44` walks eight live streams — four rows of each operand, `lda`/`ldb` apart — and
+`ggml_call_mul_mat_ldc` pins `lda = ldb = k`. This op packs its kernel at `wdata` and its transposed
+activation at `wdata + nk`, and for the first node **`nk` is 524288 floats, exactly 2 MB** — a whole
+number of this core's 4 KB L1 ways. The two panels are placed on top of each other by construction, so
+the a-streams and the b-streams share sets four ways deep and evict each other on every access.
+`ggml-0009` now skews the second panel by 16 floats, with the matching reservation in
+`ggml_graph_plan`:
+
+| | before | after | |
+|---|---|---|---|
+| K=16 Cout=128 Cin=256 L=275 | 1638.6 ms | **596.2 ms** | 2.75x |
+| K=16 Cout=64 Cin=128 L=2200 | 1521.2 ms | 1199.9 ms | 1.27x |
+| K=8 Cout=32 Cin=64 L=17600 | 1653.4 ms | 1439.7 ms | 1.15x |
+| the op | 4813.1 ms | **3235.7 ms** | **1.49x** |
+| VITS, ABBA on one board | 75.82 / 76.04 s | 74.69 / 75.20 s | **1.013x** |
+
+**Bit-identical** — it is an address, not arithmetic — checked by hash on x86 across a whole synthesis
+and on the board across all four ABBA arms. **No measurable change on x86** (min-of-7 on the op, 44.0
+against 45.1 ms, inside that box's spread): the win is where the L1 is small, and the patch is inert
+elsewhere rather than a speedup everywhere.
+
+Two things this cost that are worth not repeating, both in
+[Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md). The axis looked like `n` — the tile
+constant `GGML_CONV_TRANSPOSE_1D_TILE / mk` gives that node only 32 columns, and a cache constant
+sized for a bigger machine is exactly what §6.8's first two items were — and **raising `n` makes it
+worse**, 91.5 MMAC/s at n=32 down to 72.1 at n=272. And nodes 2 and 3 were read as "92% and 97% of the
+226.7 MMAC/s roofline, effectively done", then got 27% and 15% faster: that roofline was measured at a
+different shape and was never a property of the machine.
+
+**4. MEASURED OUT — the OC=32 direct sweep, from both directions.** It is the last bucket taking the
+sweep and the second largest in the graph (15505 ms of a 72 s synthesis), and neither obvious move
+helps. **Routing it to im2col is 12% slower** end to end — 74.58 s against 83.58 s at
+`GGML_CPU_CONV1D_BUDGET=0`, so the sweep is worth **1.12x** there rather than the 5% previously
+recorded, and that is worth knowing because the arm it beats had since got faster. **Phase-major loses
+on five of the six convolutions** and wins 1.08x on the sixth, which is 261 ms.
+
+The rate does track what it looked like it tracked -- the tap window's byte span, `(k-1)*dilation`,
+because a tile touches `IC * ceil(span/32)` of this core's 512 lines:
+
+| span | 8 B | 16 B | 32 B | 72 B | 96 B | 288 B |
+|---|---|---|---|---|---|---|
+| MMAC/s, in the model | 207.7 | 198.1 | 154.1 | 136.3 | 135.8 | **107.9** |
+
+-- but the **dense ceiling is only 165-191 MMAC/s** (`scripts/bench38.c`, arm B), so a layout fix
+cannot reach the GEMM's rate on this core and the de-interleave costs 138-396 ms per call. Both entries
+are in [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md).
+
+**5. MEASURED OUT — `CONV_TRANSPOSE_1D`'s remaining data movement.** 545 ms of the op's 3236, split
+overlap-add 389, transposes 120, kernel repack 35. A gather instead of the scatter-add is worth
+**22 ms on a whole synthesis, 0.03%** (`scripts/bench39.c`), and that is the optimistic arm -- a
+correct one has to carry the previous tile's last row across the boundary. The other two are
+structural: the GEMM wants position-major and the tensor is channel-major, and ggml has no per-node
+persistent scratch in which to cache a repack of a constant kernel.
+
+**6. SHIPPED — the patch gather moved one element at a time down a straight line.** The im2col
+gather computes, per ELEMENT, two strided coordinates, a four-way bounds test and a three-term
+address: about fifteen instructions to move one float. On a 1-D convolution over a contiguous source
+that is work spent walking a straight line — for a fixed `(ic, kx)` the elements successive patches
+contribute are a **contiguous run** of the input, and only the destination stride varies. `ggml-0020`
+takes the run at a time, resolving the bounds to two ends and a body once per run.
+
+| | gather only, per element | across a synthesis |
+|---|---|---|
+| element at a time | 33-75 ns | 2.17 s |
+| **run at a time** | **18-32 ns** | **0.98 s** |
+
+| VITS, ABBA | 74.44 / 75.13 s | 69.15 / 69.05 s | **1.082x** |
+|---|---|---|---|
+
+**Bit-identical** — the same values to the same places in a different order — checked by hash on x86
+across a whole synthesis and on the board across all four arms. conformer-ctc (10.8 s) and
+distilbert-ner (5.17 s) do not move.
+
+**And it is worth nearly five times what the isolated bench said**, which is the opposite of this
+project's usual correction. `scripts/bench41.c` measures the gather alone at 1.19 s saved; end to end
+it is 5.69 s, and `CONV_2D` as a whole drops 62697 -> 58159 ms. The element-at-a-time gather was
+evicting the cache for the GEMM that reads its output immediately afterwards, so fixing its locality
+pays twice. [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) exists because an
+isolated number usually overstates; this is the case where it understated, and for a reason worth
+recognising — a phase that interleaves with another in a tight loop is not separable by construction.
+
+**7. SHIPPED — the GEMM had a register tile and no cache blocking.** `tinyBLAS`'s `mnpack` sweeps the
+whole (m, n) space flat, so with `col_outer` set the patch panel is streamed once per 4-column tile —
+16x, 32x and 96x at the three buckets' shapes, against panels of 18-56 KB and a 16 KB L1. `ggml-0018`
+blocks the reduction so the panel slice stays resident, accumulating C across chunks.
+
+**The gate is `k > 512`, and it is derived rather than fitted**: a 4x4 tile keeps eight operand strips
+live — four rows of each panel, `k` floats each — so they stop fitting the L1 at `L1 / (8 * 4)`.
+Swept over the seven real shapes in both sweep orders, with the unblocked arm re-measured after each
+(`scripts/bench40.c`):
+
+| shape | flat | blocked | |
+|---|---|---|---|
+| m=16 n=128 k=896 | 114.5 | **178.3** | 1.55x, blocked |
+| m=8 n=384 k=960 | 148.4 | 147.0 | 1.00x, blocked, neutral |
+| m=32 n=128 k=384 | 165.5 | 190.1 | 1.16x, **not** blocked, k <= 512 |
+| m=32 n=64 k=448 | 198.9 | 195.4 | 0.98x |
+| m=40 n=64 k=320 | 211.5 | 193.9 | 0.92x |
+| m=64 n=64 k=192 | 247.4 | 198.1 | 0.80x |
+| m=24 n=384 k=192 | 261.7 | 190.4 | 0.73x |
+
+Five of the seven LOSE when blocked, some by a quarter, so the gate leaves the k=384 shape's 1.16x on
+the table rather than widen to a threshold the cache does not justify. **VITS, ABBA: 68.92 / 69.02 ->
+67.92 / 67.70 s, 1.017x.** conformer-ctc (10.5 s, its `k` is 176 and never blocks) and distilbert-ner
+(5.08 s) do not move.
+
+**THE ONE CHANGE IN THIS WORK THAT IS NOT BIT-IDENTICAL.** Splitting a reduction re-associates it, so
+per [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) it owes the ASR oracle
+rather than a hash. Waveform against the unblocked wheel: **corr 0.99999976, rel-RMS 6.9e-4**, peak
+and RMS identical to four decimals — a lowering change on this model gives 0.19 by comparison, so this
+is a reordered sum and nothing else. Transcripts exact on all three models, VITS 8/8 words.
+
+**And it was gated without the board**, which is new: `scripts/armv6_oracle.sh` runs the wheel in the
+`linux/arm/v6` build container, so the real `__ARM_FEATURE_SIMD32` kernels execute under qemu.
+Calibrated twice — the gather wheel gives `f4859f55` in both places, and this one gives `5e48639e` in
+both — the second being the stronger check, since a re-associating change is exactly where softfloat
+and a real VFP could have diverged. An x86 build cannot test any of this: the kernels are `#if`'d out.
+conformer-ctc and distilbert-ner emit text and are checked there by equality; only VITS needs
+`scripts/asr_oracle.py`, which is `transformers`' whisper-small and runs natively.
+
+**8. MEASURED OUT — the permute-back.** After the GEMM the result is scattered into `dst` with a
+stride of `dst_w*dst_h` floats: a cache line per output element, 11.4 M of them across a synthesis,
+and on a 128-set L1 the 70400-byte row pitch puts 64 output channels into 16 sets. Walking channels on
+the outside instead makes the write contiguous and the read strided, which is **3.2x faster measured
+on its own** — 69.6 -> 21.7 ms at the largest shape, 0.63 -> 0.19 s across a synthesis
+(`scripts/bench42.c`).
+
+**End to end it is 0.24 s SLOWER**: 68.98 / 69.00 s against 69.22 / 69.24 s, with brackets 0.02 s
+wide. The `CONV_2D` buckets do improve by 239 ms and something outside them gets slower by more. Not
+shipped. Bit-identical at one and four threads, correct, and not worth having.
+
+Also measured and worse than both: letting the GEMM write straight into `dst` with
+`ldc = dst_w*dst_h` — which `ggml-0004`'s own header proposes and the `defer` path uses — because the
+bias pass that then remains has to read-modify-write the destination, 43.6 ms against 21.7. So
+`defer`'s unreachability for the high-dilation convolutions (it needs
+`patches_per_batch > (knl_w-1)*dilation`, 72 wanted against the 64 KB cap's 32) turns out not to
+matter: the path it cannot take is not the one to want.
+
+**THE PATTERN THIS SECTION KEEPS PRODUCING, now three times.** A phase of this op measured on its own
+does not predict what it is worth in the graph, and **the sign is not predictable either**: the gather
+understated by 5x (1.19 s alone, 5.69 s in place), this one overstates past zero (0.44 s alone, -0.24 s
+in place), and the GEMM's cache blocking wins on two shapes of seven. These phases evict each other's
+working sets, so the only number that decides anything here is an ABBA on the model.
+[Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) carries all three.
+
+**9. SHIPPED — the ARMv6 quantized convolution GEMM is a LOSS, and it had been switched on by
+accident.** `ggml-0019`'s q4_0 x q8_0 path was measured at **5.65x** against the F32 GEMM it replaced.
+That F32 GEMM was ggml's untiled `vec_dot` loop at 29.7 MMAC/s; it has since become
+`tinyBLAS_F32_ARMV6` and then cache-blocked, and it now does 178-262 at these shapes. **The kernel
+this beat no longer exists.** Re-measured against the one that does, ABBA on one wheel with only the
+switch between arms:
+
+| | VITS | audio | per second of audio |
+|---|---|---|---|
+| taken | 67.73 / 67.83 s | 3.24 s | 20.92x |
+| **declined** | **60.44 / 60.05 s** | 3.19 s | **18.89x** |
+
+**1.107x by not taking it.** Both arms transcribe the sentence, so this is speed, not correctness. It
+is now opt-in behind `GGML_CPU_ENABLE_ARMV6_CONV_QGEMM` rather than deleted — 80 lines of measured
+work that may still win where the F32 path is worse.
+
+**How it came to be on, which is the part worth carrying.** It used to be unreachable for VITS: the
+512 KB patch cap left no room in the work buffer for the Q8_0 staging, so the size check declined
+every call. §6.8's second item cut that cap to 64 KB **for cache reasons**, and every one of VITS's
+shapes started fitting. So that change did two things, and the **1.061x credited to it was the net of
+a win and this loss**. One change, two decisions — the same shape as
+[Retro-036](../retros/retro-036-one-switch-two-decisions.md), missed a second time by the person who
+wrote it.
+
+**And one bucket disagrees.** One wheel, one switch, per-node profiles either side, both runs
+synthesising the same 3.19 s:
+
+| bucket | declined | taken | |
+|---|---|---|---|
+| 17600 | 12099 | 16336 | +4237 ms |
+| 275 | 10501 | 12490 | +1989 ms |
+| 2200 | 5629 | 7337 | +1708 ms |
+| 70400 | 16484 | 17919 | +1435 ms |
+| **94** | **5425** | **4145** | **-1280 ms** |
+
+and inside that bucket it is a single shape: **`94,1,192,1`, 4090 -> 2570 ms, 1.59x** over 44 calls of
+the text encoder. Its sibling `94,1,768,1` loses.
+
+**Three explanations for that have been proposed and all three are wrong**, which is why none is
+offered here now:
+
+* *"the F32 path pays a dequantize per call"* — it does not differ: `ggml-0013` dequantizes
+  unconditionally before `ggml_compute_forward_conv_2d_impl` is entered, and `qk` is merely passed
+  alongside. **Both arms pay it.** (This claim reached a commit message and this section before it was
+  checked; it is retracted.)
+* *"the quantized path skips the permute-back"* — it does not: both arms write straight into `dst`
+  with `ldc = dst_w*dst_h`, and neither scatters.
+* *"the quantized operands fit the L1 and the F32 ones do not"* — the 17600 shape has a BETTER ratio
+  (16 KB against 114 KB) and the quantized path loses there by 4.2 s.
+
+What is left that differs is the GEMM alone, in two ways at once — operand format and orientation, the
+quantized call being `m=c_out, n=patch_n` where the F32 one is the reverse. **One winning shape is not
+enough to draw a gate from**, and this epic's own history is what says so: every rule fitted to a
+handful of shapes here has been wrong. So the kernel stays opt-in with the number recorded, for a
+model whose shapes look like that text encoder's.
+
+**10. An int16 `__smlad` path — NOT recommended, and this section already says why.** §6.5's own
+correction found the 3.61x for `__smlad` was a loop measurement, and that a tiled F32 GEMM (153.7) and
+a tiled quantized one (167.9) land within 10% of each other: **on this core the win is the register
+tile, not the integer arithmetic**. Item 9 then measured the integer GEMM this project actually has,
+against the current F32 one, at **0.90x**. Building a second integer path needs a type ggml does not
+have, changes numerics, and starts from a number this epic has retracted.
+
+**Two things that look like opportunities and are not.** Padding conformer's `d_model` from 176 to 192
+so its weights could be block-quantized is now a **pessimisation**: the F32 kernel reaches 226.7 where
+the q4_0 one reaches 167.9, so quantizing those weights would make them slower, not faster. And
+threading is not a lever at all -- the board has one core.
+
+**One that is not FLOPs but raises the ceiling.** `distilbert-ner` carries **90.9 MB of F32
+embeddings** out of its 131 MB RSS, declined by the exporter's op gate rather than by any shape rule
+(`GET_ROWS` is not in `PACKED_WEIGHT_FIRST_OPS`). Quantizing it would cut the model's footprint about
+2.5x, which on 512 MB is the difference between what fits and what does not.
+
+### 6.9 What is still not there
+
+* **No PyPI install.** `pip install <release-asset URL>`, and README says so rather than letting pip
+  fall through to building an sdist on a 1 GHz core.
+* **No armv7l wheel.** The build path is the same and no board here runs it.
+* **RAM is the ceiling, not the ISA.** Both Zeros have 512 MB, and `src/core/gguf_model.cpp` parses
+  with `no_alloc=true` and then reads weights into a backend buffer — there is no mmap path. The
+  0.6B ASR and LM models do not fit at any quantization this repo ships
+  ([ADR-017](../adrs/adr-017-no-k-quants.md)).
+* **The README's Pi 4 columns do not transfer.** Every optimisation in
+  [Epic-05](epic-05-edge-performance.md) is `__aarch64__`- or AVX2-guarded, so this rung runs at the
+  generic-C level.

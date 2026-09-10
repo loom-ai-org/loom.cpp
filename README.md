@@ -449,6 +449,17 @@ Two of them are heuristics tuned on measured hardware, so they carry a run-time 
 `GGML_CPU_DISABLE_CONV_HEURISTICS=1` declines both, the way ggml's own `GGML_CPU_DISABLE_FUSION`
 declines its fusions.
 
+**32-bit ARM (ARMv6, ARMv7) builds from this checkout with no flags of its own.** There is no
+ISA-specific code in this repo — `grep -rE '__aarch64__|__ARM_NEON|immintrin|AVX' src include tools`
+returns nothing — so `__ARM_NEON` simply goes undefined, ggml takes its scalar arms, and the patches
+above take their generic ones. Two things are worth knowing before you do it. `GGML_NATIVE` is off in
+a wheel build and this path passes no `-march`, so the baseline is **the compiler's own default**:
+build in the userland the binary is for, or a Debian armhf toolchain's `armv7-a+neon` will produce
+something that dies on a Pi Zero. And `GGML_CPU_ALL_VARIANTS` cannot be used at all here — ggml's ARM
+variant ladder is AArch64-only, so a 32-bit build is one un-split `libggml-cpu.so`. `loom-py` handles
+both for you; [Epic-08 §6](docs/epics/epic-08-packaging-and-release.md) is the whole story, including
+the emulated Raspbian the `linux_armv6l` wheel is built in.
+
 There is one build option of this repo's own, `-DLOOM_TINYBLAS=OFF`, which drops ggml's blocked GEMM
 (`GGML_LLAMAFILE`) back out again. It exists to make GEMM measurements A/B-able and defaults **on**,
 where it is worth ~2x on x86-64 and 1.6x on aarch64 at convolutional shapes ([Epic-05](docs/epics/epic-05-edge-performance.md)).

@@ -222,6 +222,14 @@ almost certainly wrong for something else; 16 MB is equally arbitrary but much f
 cache. The honest options are a constant with this measurement next to it (what the patch does), or a
 cache-size query, which ggml does not currently have and glibc answers unreliably on ARM.
 
+**It has since been found wrong on a second machine, and the way it is wrong is worth a reviewer's
+attention.** On an ARM1176 (16 KB L1, no usable L2) the peak is at **64 KB**, worth 1.061x over
+512 KB — but the curve has a **floor as well as a ceiling**: 16 KB, the value this rule's own
+reasoning asks for on that core, is as bad as 512 KB, because a batch that small leaves the GEMM eight
+columns wide. So "half the last level" is not a rule that extrapolates down; the patch now carries
+`GGML_CPU_CONV2D_PATCH_BUDGET` (bytes, 0 = no cap) so the constant can be swept per machine without a
+rebuild, which is how that curve was found.
+
 **Second question: this op only wins on some machines.** On the AVX2 x86 box the same comparison is
 0.87x — best case 0.91x at a 2 MB budget — so there the full im2col matrix is worth materialising. The
 patch makes the op better everywhere it is used; it does not make it the right lowering everywhere. In
@@ -345,6 +353,17 @@ convolution. NEON de-interleaves by 2, 3 and 4 in one instruction and 6 and 12 f
 passes. It is worth **1.52x** at 128x128 kw7 dilation 12 and **0.48x** at 32x32 kw5 dilation 6, so it
 is gated to `kw >= 7 && dilation >= 3 && IC*kw >= 768` and to aarch64, where those instructions exist.
 Two convolutions of the model take it, for 1.487 -> 1.463 s.
+
+**An escape hatch for the cache rule, added after the floor was caught being wrong.**
+`GGML_CPU_CONV1D_BUDGET` overrides the whole detection with a plain byte count; zero declines the
+direct path for every shape. It exists because the floor is not merely approximate on a machine that
+reports nothing — it can be off by a factor of thirty-two. An ARM1176 (Raspberry Pi Zero) has a 16 KB
+L1 and no L2 the CPU can use, `sysconf` reports 0 for every level, and the 512 KB floor therefore said
+yes to every convolution in a TTS model; routing three of its shapes by their real weight footprint
+instead is worth **1.223x on a whole synthesis**. The important part for a reviewer is *why a second
+switch*: `GGML_CPU_DISABLE_CONV_HEURISTICS` already existed and could not be used to find this,
+because it also disables PR 4's patch-batch budget — which turned out to be independently mis-sized on
+the same machine and worth another 1.061x. One switch per decision, or neither number exists.
 
 **What a reviewer should push on.** The 512 KB floor, the `OC % 4` restriction and the phase window's
 three constants are all "good enough for what was measured" rather than principled; the tile sizes are tuned on two machines; and there is
@@ -528,6 +547,32 @@ also the check that the scatter does not race.
 the fallback to the old loop when the work buffer is too small exists only for a caller that sized a
 `cplan` by hand — a reviewer may prefer that to be an assert. The F16 path is untouched and still runs
 the old loop.
+
+**And the two packed panels must not be a whole number of cache ways apart, which by default they
+are.** This op packs the kernel at `wdata` and the transposed activation at `wdata + nk`, and the GEMM
+then walks four rows of each with `lda = ldb = k`. `nk` is `K*Cout*Cin`, so it is almost always a
+round number of KB — on a VITS vocoder's first upsample it is exactly 2 MB — and on any machine whose
+L1 way divides it the a-streams and the b-streams land in the same sets and evict each other.
+Measured on a Pi Zero W (16 KB 4-way L1, so a 4 KB way) at that node's GEMM shape, m=2048 k=256 n=64:
+
+| | MMAC/s |
+|---|---|
+| panels adjacent, as this patch first wrote them | 82.1 / 81.7 |
+| second panel skewed by 16 floats | **286.4 / 285.6** |
+| `k` loop blocked at 128 or 64, no skew | 81.7 / 83.1 |
+
+The last row is the one for a reviewer: blocking the reduction changes nothing, which is what
+distinguishes a set conflict from a capacity miss. End to end the op goes **4813 -> 3236 ms, 1.49x**,
+and all three of the model's nodes improve rather than only the one whose `nk` is a round 2 MB. The
+output is bit-identical, because it is an address. Padding `lda`/`ldb` instead measures the same and
+costs a stride parameter threaded through `ggml_call_mul_mat_ldc`; the skew costs one addend and a
+matching four bytes in `ggml_graph_plan`.
+
+No measurable effect on an AVX2 x86 box (min-of-7 on the op, 44.0 against 45.1 ms, inside its own
+spread), which is what should be expected: the exposure scales with how little associativity there is
+to spare.
+
+---
 
 ## PR 10 — `vec.h`: the exact-erf GELU is a scalar `erff()` call per element
 
@@ -1120,6 +1165,46 @@ cases enabled and skipped before that, and **13887/13887 over the whole suite**.
 is 75/75 on the same machine. whisper-small on Metal is unchanged, which is the control — it issues no
 leading pad, so nothing in it should move, and nothing does.
 
+
+## PR 17 — `conv_2d`: gather the im2col patches a run at a time, not an element at a time
+
+*(`cmake/patches/ggml-0020-conv2d-gather-runs.patch`, sits on top of PR 4 and PR 7)*
+
+**Problem.** The patch gather computes, per ELEMENT, two strided coordinates, a four-way bounds test
+and a three-term address — roughly fifteen instructions to move one float. For a 1-D convolution over
+a contiguous source all of that is spent walking a straight line: for a fixed `(ic, kx)` the elements
+successive patches contribute are a **contiguous run** of the input, `p + kx*dilation - pad` for
+consecutive `p`, and the only thing that varies is where they land, a store of stride `knl_n`.
+
+**Fix.** Take the run at a time when the shape allows it — `knl_h == 1`, one image, stride 1, F32,
+contiguous source — and resolve the bounds into a leading zero-fill, a body and a trailing zero-fill,
+computed once per run instead of once per element. Everything else falls through to the general loop
+unchanged.
+
+**Evidence**, a Pi Zero W over a VITS vocoder's seven convolution shapes (`scripts/bench41.c`):
+
+| | per element | across a synthesis |
+|---|---|---|
+| element at a time | 33-75 ns | 2.17 s |
+| run at a time | 18-32 ns | **0.98 s** |
+
+End to end, ABBA on one board: **74.44 / 75.13 s -> 69.15 / 69.05 s, 1.082x**, with `CONV_2D` as a
+whole 62697 -> 58159 ms.
+
+**Bit-identical**: the same values to the same places in a different order. Verified by hashing a whole
+synthesis on x86 and across all four arms on the board.
+
+**Worth noting for a reviewer, because it cuts against the usual caution.** The gather measured alone
+saves 1.19 s and end to end it saves 5.69 s — the isolated number UNDERSTATED it, which is rare. The
+element-at-a-time gather was evicting the cache for the GEMM that consumes its output immediately
+afterwards, so the locality fix pays twice. A phase that interleaves with another in a tight loop is
+not separable by construction.
+
+**What a reviewer should push on.** The fast path duplicates the general loop's semantics rather than
+sharing them, so a change to one has to be mirrored in the other; the guard is the honest way to keep
+that bounded but it is still two code paths. And the leaky-ReLU fusion of PR 7 is applied in both.
+
+---
 
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 

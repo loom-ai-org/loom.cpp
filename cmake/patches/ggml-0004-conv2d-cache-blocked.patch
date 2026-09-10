@@ -1,3 +1,5 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 42ec809c..64742235 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -11,6 +11,7 @@
@@ -8,7 +10,7 @@
  
  // ggml_compute_forward_dup
  
-@@ -6862,6 +6863,56 @@
+@@ -6862,6 +6863,56 @@ static void ggml_call_mul_mat(ggml_type type, const ggml_compute_params * params
      ggml_compute_forward_mul_mat(params, &dst);
  }
  
@@ -65,7 +67,39 @@
  static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
      return (coord  + size) % size; // adding size avoids negative number weirdness
  }
-@@ -6979,7 +7030,32 @@
+@@ -6938,6 +6989,31 @@ void ggml_compute_forward_col2im_1d(
+     }
+ }
+ 
++// How many bytes of im2col patches one batch may hold -- see the block inside
++// ggml_compute_forward_conv_2d_impl for what the number is and why. A function only so that it can
++// have an override and a per-architecture arm, both of which it turned out to need.
++//
++// ZERO MEANS NO CAP: one batch, as large as the work buffer allows. That is NOT the same as
++// GGML_CPU_DISABLE_CONV_HEURISTICS, which also turns off the direct-1d predicate -- one variable,
++// two decisions, so a whole-model timing taken with it belongs to neither on its own. On ARMv6 this
++// cap is worth 1.061x by itself and that number took a knob of its own to get.
++static int64_t ggml_conv_2d_patch_budget(void) {
++    static int64_t budget = -1;
++    if (budget < 0) {
++        const char * e = getenv("GGML_CPU_CONV2D_PATCH_BUDGET");
++        if (e && e[0]) {
++            char * end = NULL;
++            const long long v = strtoll(e, &end, 10);
++            if (end != e && *end == '\0' && v >= 0) {
++                budget = (int64_t) v;
++                return budget;
++            }
++        }
++        budget = 512 * 1024;
++    }
++    return budget;
++}
++
+ // ggml_compute_forward_conv_2d
+ 
+ 
+@@ -6979,7 +7055,39 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
      const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
  
      const int64_t space_per_patch   = knl_n * traits->type_size + c_out * sizeof(float);
@@ -86,24 +120,30 @@
 +    // 0.98x and 0.92x; with it they are 0.98x and 1.02x, and the weighted total goes 1.16x -> 1.18x.
 +    // KILL SWITCH. Everything above is a heuristic tuned on two machines, so a box it mispredicts
 +    // needs an escape that is not a rebuild. Spelled like ggml's own GGML_CPU_DISABLE_FUSION.
++    //
++    // IT IS THE WRONG SWITCH TO MEASURE THIS DECISION WITH, though, because it also disables
++    // ggml_conv_1d_direct_ok -- one variable, two decisions, and a whole-model timing taken with it
++    // cannot be attributed to either. `GGML_CPU_CONV2D_PATCH_BUDGET` moves only this cap and
++    // `GGML_CPU_CONV1D_BUDGET` only the predicate; measure with those. This one stays the coarse
++    // escape it was written to be.
 +    static int conv_heur_off = -1;
 +    if (conv_heur_off < 0) {
 +        const char * e = getenv("GGML_CPU_DISABLE_CONV_HEURISTICS");
 +        conv_heur_off = (e && e[0] && e[0] != '0') ? 1 : 0;
 +    }
-+    const int64_t patch_budget      = 512 * 1024;
-+    const int64_t wbudget           = (!conv_heur_off && patch_total * space_per_patch > 3 * patch_budget)
-+                                        ? MIN(params->wsize, patch_budget)
-+                                        : params->wsize;
++    const int64_t patch_budget      = ggml_conv_2d_patch_budget();
++    const int64_t wbudget           = (!conv_heur_off && patch_budget > 0
++                                       && patch_total * space_per_patch > 3 * patch_budget)
++                                        ? MIN((int64_t) params->wsize, patch_budget)
++                                        : (int64_t) params->wsize;
 +    const int64_t batch_size        = wbudget / space_per_patch;
      const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
      const int64_t batch_n           = (patch_total + patches_per_batch - 1) / patches_per_batch;
  
-@@ -7035,6 +7111,19 @@
-         }   // patches handled by this thread
+@@ -7036,6 +7144,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
  
          ggml_barrier(params->threadpool);
-+
+ 
 +        // The GEMM can write straight into dst when dst is contiguous and there is one image in the
 +        // batch: `C[ldc*oc + p]` with `ldc = dst_w*dst_h` IS the [OW, OH, OC] layout, so the scratch
 +        // buffer and the element-at-a-time scatter below are both unnecessary. That scatter is not
@@ -116,6 +156,7 @@
 +            ggml_barrier(params->threadpool);
 +            continue;
 +        }
- 
++
          float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
  
+         GGML_ASSERT(gemm_output + patch_n * c_out <= (float*)tmp + params->wsize);

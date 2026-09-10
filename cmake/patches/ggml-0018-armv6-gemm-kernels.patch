@@ -1,0 +1,518 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index bf9b8c8b..82ce1aa9 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -57,6 +57,21 @@
+ #include <array>
+ #include <type_traits>
+ 
++// ARMv6 -- ARM1176, i.e. Raspberry Pi Zero / Zero W / Pi 1. This is NOT one of the 64-bit ARMs, which
++// are served by the NEON and DOTPROD arms throughout this file; it is the 32-bit v6 floor, which has
++// no NEON at all and instead has the SIMD32/DSP instructions on the general-purpose registers.
++//
++// `!defined(__ARM_NEON)` IS LOAD-BEARING AND ARMv7 IS WHY. SIMD32 is not an ARMv6 feature that ARMv7
++// dropped -- ARMv7-A has it too, so this guard without the NEON clause would capture every 32-bit
++// Raspberry Pi OS install on a Pi 2/3/4 as well. That would be a REGRESSION, not a win: ARMv7-A has
++// NEON, whose `vmull_s8` does eight 8-bit MACs against `__smlad`'s two, and ggml's
++// `vec_dot_q4_0_q8_0` already has a NEON arm (arch/arm/quants.c) that those boards take today. The
++// tiling below is what ARMv7 would want -- as a NEON kernel, which is different work. This one is
++// for the rung with no vector unit at all.
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++#include <arm_acle.h>
++#endif
++
+ #ifdef _MSC_VER
+ #define NOINLINE __declspec(noinline)
+ #else
+@@ -4098,6 +4113,407 @@ class tinyBLAS_PPC {
+     const int nth;
+ };
+ #endif
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++// Q4_0 x Q8_0 for ARMv6, AND ONLY ARMv6 -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1. Every
++// other ARM in this file is 64-bit and has NEON; this rung has neither, and until now fell through
++// `llamafile_sgemm`'s final `return false` to ggml's one-element-at-a-time `vec_dot`.
++//
++// WHY IT PAYS TO BE A GEMM RATHER THAN A BETTER vec_dot. Measured on a Pi Zero W at the shape of
++// VITS's largest convolution bucket (IC*K=960, OC=384, OL=276), all arms verified identical:
++//
++//     F32 GEMM, what the conv fallback runs                       29.7 MMAC/s
++//     q4_0 x q8_0, ggml's vec_dot                                 66.3
++//     the same vec_dot with __smlad swapped in                    78.3   <- all a generic patch can do
++//     + column tile, weight row outer                             97.0
++//     + activation column outer, so the WEIGHTS stream            106.9
++//     + 2x2 register tile                                        167.9   <- this kernel
++//
++// Two of those three steps are not expressible inside a `vec_dot`, which computes one output element
++// from one row and one column and does not own the loop that calls it:
++//
++//   * THE TILE ITERATION ORDER IS CHOSEN PER CALL, unlike every other class here, which is row-outer
++//     unconditionally. At this shape column-outer is 57 MB of traffic against 108; at a 17-token
++//     transformer matmul it is the other way round by a wide margin. See matmul().
++//   * THE 2x2 TILE amortises both unpacks. The Q4_0 nibble unpack is ~10 instructions per four bytes
++//     and the Q8_0 sign-extend ~6, so 1x1 pays 20 instructions per 8 MACs and 2x2 pays 48 per 32 --
++//     2.50 down to 1.50. That is why 167.9 lands ABOVE an isolated dot product's 149.6 and above a
++//     pure-`__smlad` microbenchmark's 156.7: the tile amortises overheads those still carried.
++//
++// The arithmetic: `__uxtb16`/`__sxtb16` unpack two bytes into two 16-bit halves of one register, and
++// `__smlad` multiplies both halves and accumulates into a 32-bit sum -- two MACs per instruction.
++// Products are at most 8x128, 32 per block, so the int32 accumulator cannot overflow. The set of
++// products is exactly `ggml_vec_dot_q4_0_q8_0`'s, so results are equal rather than close, which
++// `scripts/bench23.c` in the loom tree checks with `==` before it times anything.
++//
++// RM/RN stop at 2. 1x4 was measured and plateaued (91.5 against 91.0 for 1x2) -- ARM has fourteen
++// usable general-purpose registers and a wider tile spills.
++template <bool CHANNEL_MAJOR>
++class tinyBLAS_Q0_ARMV6 {
++  public:
++    tinyBLAS_Q0_ARMV6(int64_t k,
++                      const block_q4_0 *A, int64_t lda,
++                      const block_q8_0 *B, int64_t ldb,
++                      float *C, int64_t ldc,
++                      int ith, int nth)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++    }
++
++    void matmul(int64_t m, int64_t n) {
++        // WHICH OPERAND STAYS RESIDENT, decided per call because the answer is not the same for the
++        // two things this kernel serves, and getting it wrong costs more than the tile wins.
++        //
++        // A tile loop can sweep one operand once and re-read the other per tile. Row-tile-outer reads
++        // the weights once and re-reads the activation panel; column-tile-outer does the reverse. On
++        // a core with 16 KB of L1 and no usable L2 the cheaper choice is to keep the SMALLER panel
++        // resident, so:
++        //
++        //   distilbert-ner, m=768 n=17 k=24    weights 324 KB   activations  13.5 KB  -> row-outer
++        //   a VITS conv,    m=384 n=276 k=30   weights 202 KB   activations 275 KB    -> column-outer
++        //
++        // This was column-outer unconditionally first, tuned on the convolution shape alone, and on
++        // the board that made conformer-ctc 5% SLOWER while the microbenchmark said 1.73x: at n=17 the
++        // whole activation panel fits in cache, and re-reading 324 KB of weights eight times to avoid
++        // re-reading 13.5 KB is exactly backwards. Retro-012's rule, again -- the shapes a bench holds
++        // are not the shapes a model runs.
++        const int64_t wbytes = m * k * (int64_t) sizeof(block_q4_0);
++        const int64_t abytes = n * k * (int64_t) sizeof(block_q8_0);
++        col_outer = abytes > wbytes;
++        mnpack(0, m, 0, n);
++    }
++
++  private:
++    NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t mc, nc, mp, np;
++        switch ((MIN(m - m0, 2) << 4) | MIN(n - n0, 2ll)) {
++        case 0x22:
++            mc = 2;
++            nc = 2;
++            gemm<2, 2>(m0, m, n0, n);
++            break;
++        case 0x21:
++            mc = 2;
++            nc = 1;
++            gemm<2, 1>(m0, m, n0, n);
++            break;
++        case 0x12:
++            mc = 1;
++            nc = 2;
++            gemm<1, 2>(m0, m, n0, n);
++            break;
++        case 0x11:
++            mc = 1;
++            nc = 1;
++            gemm<1, 1>(m0, m, n0, n);
++            break;
++        default:
++            return;
++        }
++        mp = m0 + (m - m0) / mc * mc;
++        np = n0 + (n - n0) / nc * nc;
++        mnpack(mp, m, n0, np);
++        mnpack(m0, m, np, n);
++    }
++
++    static inline uint32_t ld32(const void * p) {
++        uint32_t v;
++        // The block's `qs` sits at offset 2 behind the fp16 scale, so every one of these is
++        // unaligned. ARMv6 does unaligned LDR in hardware (SCTLR.U, which Linux sets) and measuring
++        // a 4-byte-aligned variant of the block found no difference either way -- 1.01x and 0.95x
++        // over two runs. `__builtin_memcpy` is how the load is spelled without claiming alignment.
++        __builtin_memcpy(&v, p, 4);
++        return v;
++    }
++
++    template <int RM, int RN>
++    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        const int64_t ytiles = (m - m0) / RM;
++        const int64_t xtiles = (n - n0) / RN;
++        const int64_t tiles  = xtiles * ytiles;
++        const int64_t duty   = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end   = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            // See matmul(): column-outer keeps the weights streaming and the activations resident,
++            // row-outer the reverse. Every other class in this file is row-outer unconditionally.
++            const int64_t jj = col_outer ? n0 + job / ytiles * RN : n0 + job % xtiles * RN;
++            const int64_t ii = col_outer ? m0 + job % ytiles * RM : m0 + job / xtiles * RM;
++            float Cv[RN][RM] = {};
++            for (int64_t l = 0; l < k; ++l) {
++                int32_t acc[RN][RM] = {};
++                for (int q = 0; q < QK4_0 / 2; q += 4) {
++                    uint32_t wl0[RM], wl1[RM], wh0[RM], wh1[RM];
++                    for (int i = 0; i < RM; ++i) {
++                        const uint32_t v  = ld32(A[lda * (ii + i) + l].qs + q);
++                        const uint32_t lo = v & 0x0F0F0F0Fu;
++                        const uint32_t hi = (v >> 4) & 0x0F0F0F0Fu;
++                        wl0[i] = __ssub16(__uxtb16(lo),      0x00080008u);
++                        wl1[i] = __ssub16(__uxtb16(lo >> 8), 0x00080008u);
++                        wh0[i] = __ssub16(__uxtb16(hi),      0x00080008u);
++                        wh1[i] = __ssub16(__uxtb16(hi >> 8), 0x00080008u);
++                    }
++                    for (int j = 0; j < RN; ++j) {
++                        const int8_t * bq = B[ldb * (jj + j) + l].qs;
++                        const uint32_t p = ld32(bq + q);
++                        const uint32_t r = ld32(bq + QK4_0 / 2 + q);
++                        const uint32_t y0 = __sxtb16(p),      y1 = __sxtb16(p >> 8);
++                        const uint32_t y2 = __sxtb16(r),      y3 = __sxtb16(r >> 8);
++                        for (int i = 0; i < RM; ++i) {
++                            int32_t a = acc[j][i];
++                            a = __smlad(wl0[i], y0, a);
++                            a = __smlad(wl1[i], y1, a);
++                            a = __smlad(wh0[i], y2, a);
++                            a = __smlad(wh1[i], y3, a);
++                            acc[j][i] = a;
++                        }
++                    }
++                }
++                for (int j = 0; j < RN; ++j) {
++                    const float db = unhalf(B[ldb * (jj + j) + l].d);
++                    for (int i = 0; i < RM; ++i)
++                        Cv[j][i] += acc[j][i] * unhalf(A[lda * (ii + i) + l].d) * db;
++                }
++            }
++            // CHANNEL_MAJOR is for the convolution fallback, whose output is [OW*OH] contiguous per
++            // output channel -- C[ldc*oc + patch] -- where a matmul wants C[ldc*col + row]. Same
++            // arithmetic, one index swapped, so the conv does not need a transposing pass over its
++            // result (which `ggml_compute_forward_conv_2d_impl` measured at 1.18x -> 1.08x).
++            for (int j = 0; j < RN; ++j)
++                for (int i = 0; i < RM; ++i)
++                    if (CHANNEL_MAJOR)
++                        C[ldc * (ii + i) + (jj + j)] = Cv[j][i];
++                    else
++                        C[ldc * (jj + j) + (ii + i)] = Cv[j][i];
++        }
++    }
++
++    const block_q4_0 * const A;
++    const block_q8_0 * const B;
++    float * const C;
++    const int64_t k;
++    const int64_t lda;
++    const int64_t ldb;
++    const int64_t ldc;
++    const int ith;
++    const int nth;
++    bool col_outer = false;
++};
++#endif // __ARM_FEATURE_SIMD32 && !__ARM_NEON && !__aarch64__
++
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++// F32 x F32 for ARMv6, AND ONLY ARMv6. Same rung and same guard as tinyBLAS_Q0_ARMV6 above; see its
++// header for why this architecture gets its own kernels at all.
++//
++// WHY AN F32 GEMM IS WORTH HAVING HERE TOO. The quantized kernel only serves weights ggml could
++// block-quantize, and a model whose ne[0] is not a multiple of 32 has none: conformer-ctc-small's
++// d_model is 176, so 99.7% of its weight bytes stay F32 and reach `llamafile_sgemm`'s F32 case, which
++// on this architecture has no arm and returns false -- leaving ggml's one-output-element-at-a-time
++// `ggml_vec_dot_f32`. Measured on a Pi Zero W at that model's feed-forward shape (m=704, n=75, k=176):
++//
++//     ggml's shape, one element at a time      50.9 MMAC/s
++//     2x2 register tile                       153.7 MMAC/s   3.02x
++//     4x2 / 4x4                                36.4 / 27.2   spills; VFP has 32 single registers and
++//                                                             the address arithmetic wants some too
++//
++// THERE IS NO WIDER INSTRUCTION IN THIS -- VFP is scalar and ARMv6 has no vector float. The 3.02x is
++// load amortisation alone: one element at a time is two loads per multiply-add, a 2x2 tile is four
++// loads per four. That the result is close to the QUANTIZED kernel's 167.9 MMAC/s is the useful
++// finding: on this core the win was the tile, not the integer arithmetic.
++class tinyBLAS_F32_ARMV6 {
++  public:
++    tinyBLAS_F32_ARMV6(int64_t k,
++                       const float *A, int64_t lda,
++                       const float *B, int64_t ldb,
++                       float *C, int64_t ldc,
++                       int ith, int nth)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {
++    }
++
++    void matmul(int64_t m, int64_t n) {
++        // Same rule as the quantized kernel: keep the smaller panel resident and stream the other.
++        col_outer = n * k > m * k;
++
++        // AND, WHEN THE REDUCTION IS LONG ENOUGH, BLOCK IT -- because the tile below is a REGISTER
++        // tile and there is no cache blocking anywhere else in this class. A 4x4 tile keeps EIGHT
++        // operand strips live, four rows of each panel, `k` floats each; past `L1 / (8 * 4)` they stop
++        // fitting and every tile re-reads them from memory. On an ARM1176's 16 KB L1 that boundary is
++        // k = 512, which is where the gate is -- derived, not fitted.
++        //
++        // Swept on a Pi Zero W over a VITS vocoder's seven im2col GEMM shapes, two passes in both
++        // sweep orders with the unblocked arm re-measured after each (loom `scripts/bench40.c`):
++        //
++        //     m= 16 n=128 k=896   114.5 -> 178.3 MMAC/s   1.55x   <- blocked
++        //     m=  8 n=384 k=960   148.4 -> 147.0            1.00x   <- blocked, neutral
++        //     m= 32 n=128 k=384   165.5 -> 190.1            1.16x   <- NOT blocked, k <= 512
++        //     m= 32 n= 64 k=448   198.9 -> 195.4            0.98x
++        //     m= 40 n= 64 k=320   211.5 -> 193.9            0.92x
++        //     m= 64 n= 64 k=192   247.4 -> 198.1            0.80x
++        //     m= 24 n=384 k=192   261.7 -> 190.4            0.73x
++        //
++        // The gate leaves the k=384 win on the table rather than widen to a threshold the L1 does not
++        // justify: five of the seven shapes LOSE when blocked, some by a quarter, so a rule fitted to
++        // include one more winner would be fitted to the model in front of it. `kc = 128` is the
++        // measured optimum across the blocked shapes (1.55x against 1.31x at 32 and 1.39x at 512).
++        //
++        // THIS IS THE ONE THING IN THE ARMv6 WORK THAT IS NOT BIT-IDENTICAL: splitting the reduction
++        // re-associates it. See ADR-026 on what that obliges.
++        if (k > (int64_t) 512) {
++            for (int64_t k0 = 0; k0 < k; k0 += 128) {
++                kk0   = k0;
++                kkn   = MIN((int64_t) 128, k - k0);
++                accum = k0 > 0;
++                mnpack(0, m, 0, n);
++            }
++            return;
++        }
++        kk0 = 0; kkn = k; accum = false;
++        mnpack(0, m, 0, n);
++    }
++
++  private:
++    NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t mc, nc, mp, np;
++        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4ll)) {
++        case 0x44: mc = 4; nc = 4; gemm44(m0, m, n0, n); break;   // hand-written, see below
++        case 0x43: case 0x42: case 0x34: case 0x33: case 0x32:
++        case 0x24: case 0x23: case 0x22:
++                              mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
++        case 0x41: case 0x31: case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
++        case 0x14: case 0x13: case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
++        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
++        default: return;
++        }
++        mp = m0 + (m - m0) / mc * mc;
++        np = n0 + (n - n0) / nc * nc;
++        mnpack(mp, m, n0, np);
++        mnpack(m0, m, np, n);
++    }
++
++    // THE 4x4 TILE IS WRITTEN OUT LONGHAND AND THE TEMPLATE IS NOT USED FOR IT, which is ugly and is
++    // the difference between 174 MMAC/s and 27. GCC will not scalarise `float acc[RN][RM]` and
++    // `const float *ap[RM]` at RM=RN=4: the aggregates go to the stack and every accumulate becomes
++    // a load and a store. Measured three ways on the board, same shape, same run
++    // (loom scripts/bench33.c):
++    //
++    //     explicit scalars, 4x4        173.9 MMAC/s
++    //     template arrays + pointers, 4x4  27.2      <- what this function would be as a template
++    //     template arrays + pointers, 2x2 110.6
++    //
++    // At 2x2 the template is fine -- GCC scalarises four accumulators happily -- so every other shape
++    // below stays generic and only this one is spelled out.
++    //
++    // AND 4x4 IS THIS KERNEL'S CEILING, NOT THE QUANTIZED ONE'S, because the two accumulate in
++    // different register files. Sixteen floats live in VFP, which has 32 single registers, and the
++    // eight pointers live in the GPRs independently. tinyBLAS_Q0_ARMV6's accumulators are int32 in
++    // the SAME 14-register GPR file as its pointers -- and it needs four more live registers per row
++    // and per column for the nibble unpack -- so it stays at 2x2.
++    NOINLINE void gemm44(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        const int64_t ytiles = (m - m0) / 4;
++        const int64_t xtiles = (n - n0) / 4;
++        const int64_t tiles  = xtiles * ytiles;
++        const int64_t duty   = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end   = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            const int64_t jj = col_outer ? n0 + job / ytiles * 4 : n0 + job % xtiles * 4;
++            const int64_t ii = col_outer ? m0 + job % ytiles * 4 : m0 + job / xtiles * 4;
++            const float * a0 = A + lda * (ii + 0) + kk0;
++            const float * a1 = A + lda * (ii + 1) + kk0;
++            const float * a2 = A + lda * (ii + 2) + kk0;
++            const float * a3 = A + lda * (ii + 3) + kk0;
++            const float * b0 = B + ldb * (jj + 0) + kk0;
++            const float * b1 = B + ldb * (jj + 1) + kk0;
++            const float * b2 = B + ldb * (jj + 2) + kk0;
++            const float * b3 = B + ldb * (jj + 3) + kk0;
++            float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
++            float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
++            float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
++            float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
++            for (int64_t l = 0; l < kkn; ++l) {
++                const float x0 = *a0++, x1 = *a1++, x2 = *a2++, x3 = *a3++;
++                const float y0 = *b0++, y1 = *b1++, y2 = *b2++, y3 = *b3++;
++                c00 += x0 * y0; c01 += x1 * y0; c02 += x2 * y0; c03 += x3 * y0;
++                c10 += x0 * y1; c11 += x1 * y1; c12 += x2 * y1; c13 += x3 * y1;
++                c20 += x0 * y2; c21 += x1 * y2; c22 += x2 * y2; c23 += x3 * y2;
++                c30 += x0 * y3; c31 += x1 * y3; c32 += x2 * y3; c33 += x3 * y3;
++            }
++            float * r0 = C + ldc * (jj + 0) + ii;
++            float * r1 = C + ldc * (jj + 1) + ii;
++            float * r2 = C + ldc * (jj + 2) + ii;
++            float * r3 = C + ldc * (jj + 3) + ii;
++            if (accum) {
++                r0[0] += c00; r0[1] += c01; r0[2] += c02; r0[3] += c03;
++                r1[0] += c10; r1[1] += c11; r1[2] += c12; r1[3] += c13;
++                r2[0] += c20; r2[1] += c21; r2[2] += c22; r2[3] += c23;
++                r3[0] += c30; r3[1] += c31; r3[2] += c32; r3[3] += c33;
++            } else {
++                r0[0] = c00; r0[1] = c01; r0[2] = c02; r0[3] = c03;
++                r1[0] = c10; r1[1] = c11; r1[2] = c12; r1[3] = c13;
++                r2[0] = c20; r2[1] = c21; r2[2] = c22; r2[3] = c23;
++                r3[0] = c30; r3[1] = c31; r3[2] = c32; r3[3] = c33;
++            }
++        }
++    }
++
++    template <int RM, int RN>
++    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        const int64_t ytiles = (m - m0) / RM;
++        const int64_t xtiles = (n - n0) / RN;
++        const int64_t tiles  = xtiles * ytiles;
++        const int64_t duty   = (tiles + nth - 1) / nth;
++        int64_t start = duty * ith;
++        int64_t end   = start + duty;
++        if (end > tiles)
++            end = tiles;
++        for (int64_t job = start; job < end; ++job) {
++            const int64_t jj = col_outer ? n0 + job / ytiles * RN : n0 + job % xtiles * RN;
++            const int64_t ii = col_outer ? m0 + job % ytiles * RM : m0 + job / xtiles * RM;
++            const float * ap[RM];
++            const float * bp[RN];
++            for (int i = 0; i < RM; ++i) ap[i] = A + lda * (ii + i) + kk0;
++            for (int j = 0; j < RN; ++j) bp[j] = B + ldb * (jj + j) + kk0;
++            float acc[RN][RM] = {};
++            for (int64_t l = 0; l < kkn; ++l) {
++                float av[RM], bv[RN];
++                for (int i = 0; i < RM; ++i) av[i] = *ap[i]++;
++                for (int j = 0; j < RN; ++j) bv[j] = *bp[j]++;
++                for (int j = 0; j < RN; ++j)
++                    for (int i = 0; i < RM; ++i)
++                        acc[j][i] += av[i] * bv[j];
++            }
++            if (accum) {
++                for (int j = 0; j < RN; ++j)
++                    for (int i = 0; i < RM; ++i)
++                        C[ldc * (jj + j) + (ii + i)] += acc[j][i];
++            } else {
++                for (int j = 0; j < RN; ++j)
++                    for (int i = 0; i < RM; ++i)
++                        C[ldc * (jj + j) + (ii + i)] = acc[j][i];
++            }
++        }
++    }
++
++    const float * const A;
++    const float * const B;
++    float * const C;
++    const int64_t k;
++    const int64_t lda;
++    const int64_t ldb;
++    const int64_t ldc;
++    const int ith;
++    const int nth;
++    bool col_outer = false;
++    // The current reduction block, set by matmul: [kk0, kk0 + kkn), accumulated into C when it is not
++    // the first. Unblocked they are 0, k and false, which is what every other shape gets.
++    int64_t kk0 = 0;
++    int64_t kkn = 0;
++    bool    accum = false;
++};
++#endif // __ARM_FEATURE_SIMD32 && !__ARM_NEON && !__aarch64__
++
+ } // namespace
+ 
+ /**
+@@ -4130,6 +4546,34 @@ class tinyBLAS_PPC {
+  * @param Ctype is GGML data type of `C`
+  * @return true if this function was able to service the matmul request
+  */
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++/**
++ * Q4_0 x Q8_0 with a CHANNEL-MAJOR result, for the ARMv6 convolution fallback.
++ *
++ * `llamafile_sgemm` cannot serve that call: its contract writes `C[ldc*j + i]` with `i` indexing the
++ * A-side rows, and a convolution wants its output channel-contiguous -- `C[ldc*oc + patch]`, with the
++ * KERNEL on the A side. Rather than transpose afterwards (a pass this op exists to avoid) the kernel
++ * is instantiated with the other store.
++ *
++ * A is the folded convolution kernel [IC*KH*KW, OC] as Q4_0, which is already exactly a GEMM's weight
++ * matrix -- that fold (loom's ggml-0013) is what makes it block-quantizable along the contraction, and
++ * it makes this call free of any repacking. B is the im2col patch batch quantized to Q8_0.
++ */
++bool llamafile_sgemm_q4_0_q8_0_cm(const struct ggml_compute_params * params,
++                                  int64_t m, int64_t n, int64_t k,
++                                  const void * A, int64_t lda,
++                                  const void * B, int64_t ldb,
++                                  float * C, int64_t ldc) {
++    tinyBLAS_Q0_ARMV6<true> tb{
++        k, (const block_q4_0 *)A, lda,
++        (const block_q8_0 *)B, ldb,
++        C, ldc,
++        params->ith, params->nth};
++    tb.matmul(m, n);
++    return true;
++}
++#endif
++
+ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
+                      const void *A, int64_t lda, const void *B, int64_t ldb, void *C,
+                      int64_t ldc, int Atype, int Btype, int Ctype) {
+@@ -4213,6 +4657,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             (float *)C, ldc};
+     #endif
+         return tb.matmul(m, n);
++#elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        tinyBLAS_F32_ARMV6 tb{
++            k, (const float *)A, lda,
++            (const float *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
+ #else
+         return false;
+ #endif
+@@ -4435,6 +4887,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+             params->ith, params->nth};
+         tb.matmul(m, n);
+         return true;
++#elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        tinyBLAS_Q0_ARMV6<false> tb{
++            k, (const block_q4_0 *)A, lda,
++            (const block_q8_0 *)B, ldb,
++            (float *)C, ldc,
++            params->ith, params->nth};
++        tb.matmul(m, n);
++        return true;
+ #else
+         return false;
+ #endif
+diff --git a/src/ggml-cpu/llamafile/sgemm.h b/src/ggml-cpu/llamafile/sgemm.h
+index 867b0c04..5c9a5dfc 100644
+--- a/src/ggml-cpu/llamafile/sgemm.h
++++ b/src/ggml-cpu/llamafile/sgemm.h
+@@ -20,6 +20,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t, int64_t
+                      const void *, int64_t, const void *, int64_t, void *, int64_t,
+                      int, int, int);
+ 
++
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++// ARMv6 only -- see sgemm.cpp. A channel-major q4_0 x q8_0 GEMM for the convolution fallback.
++bool llamafile_sgemm_q4_0_q8_0_cm(const struct ggml_compute_params * params,
++                                  int64_t, int64_t, int64_t, const void *, int64_t,
++                                  const void *, int64_t, float *, int64_t);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif

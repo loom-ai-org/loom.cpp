@@ -1,6 +1,25 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index dbd9263a..e49975e2 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -2911,7 +2911,12 @@ struct ggml_cplan ggml_graph_plan(
+                         } else if (node->src[0]->type == GGML_TYPE_F32 &&
+                                    node->src[1]->type == GGML_TYPE_F32) {
+                             cur += sizeof(float)*ne00*ne01*ne02;
++                            cur += sizeof(float)*GGML_CONV_TRANSPOSE_1D_SKEW;
+                             cur += sizeof(float)*ne10*ne11;
++                            // and the block of GEMM result the F32 path keeps in flight; it computes
++                            // its own tile from the same budget, so the two have to agree. The MAX is
++                            // the tile == 1 case, where one position's worth of Cout*K is all it takes.
++                            cur += sizeof(float)*MAX((int64_t) GGML_CONV_TRANSPOSE_1D_TILE, ne00*ne01);
+                         } else {
+                             GGML_ABORT("fatal error");
+                         }
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index b39b67d0..07a53dcf 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -6240,6 +6240,12 @@
+@@ -6244,6 +6244,12 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
      }
  }
  
@@ -13,14 +32,24 @@
  static void ggml_compute_forward_conv_transpose_1d_f32(
          const ggml_compute_params * params,
                ggml_tensor * dst) {
-@@ -6314,19 +6320,61 @@
+@@ -6297,7 +6303,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+     // whole contiguous `ne11`-wide rows instead of scattering single floats `ne11` apart across the
+     // whole buffer, which also keeps two threads off the same cache line.
+     {
+-        float * const wdata = (float *) params->wdata + nk;
++        float * const wdata = (float *) params->wdata + nk + GGML_CONV_TRANSPOSE_1D_SKEW;
+ 
+         for (int64_t i10 = ith; i10 < ne10; i10 += nth) {
+             float * dst_data = wdata + i10*ne11;
+@@ -6318,19 +6324,62 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
  
      const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
  
 -    // total rows in dst
 -    const int nr = ne1;
 +    float * const wdata     = (float *) params->wdata + 0;     // [Cout, K, Cin], packed above
-+    float * const wdata_src = wdata + nk;                      // [L, Cin], transposed above
++    float * const wdata_src = wdata + nk + GGML_CONV_TRANSPOSE_1D_SKEW;   // [L, Cin], skewed
++                                                               // off the kernel -- see ops.h
 +    float * const gemm      = wdata_src + ne10*ne11;           // [tile, Cout*K], this path's scratch
  
 -    // rows per thread
@@ -41,7 +70,7 @@
 +    const int64_t mk   = ne01 * ne00;                          // Cout * K, the GEMM's m
 +    const int64_t tile = MAX(1, MIN(ne10, (int64_t) GGML_CONV_TRANSPOSE_1D_TILE / mk));
 +
-+    const size_t need = (size_t) (nk + ne10*ne11 + tile*mk) * sizeof(float);
++    const size_t need = (size_t) (nk + GGML_CONV_TRANSPOSE_1D_SKEW + ne10*ne11 + tile*mk) * sizeof(float);
 +    if (need <= params->wsize) {
 +        for (int64_t l0 = 0; l0 < ne10; l0 += tile) {
 +            const int64_t nl = MIN(tile, ne10 - l0);
@@ -49,7 +78,8 @@
 +            ggml_call_mul_mat_ldc(GGML_TYPE_F32, params, mk, nl, ne02,
 +                                  wdata, wdata_src + l0*ne11, gemm, mk);
 +            ggml_barrier(params->threadpool);
-+
+ 
+-    // row range for this thread
 +            // Overlap-add, split by OUTPUT CHANNEL. Consecutive input positions write overlapping runs
 +            // whenever K > s0 -- which is every upsampling convolution, they are built that way -- so a
 +            // split over positions would race precisely where this op accumulates. Per (channel,
@@ -68,8 +98,7 @@
 +        }
 +        return;
 +    }
- 
--    // row range for this thread
++
 +    // The scratch above is reserved by ggml_graph_plan, so this is unreachable with a plan this
 +    // library built -- it is here for a caller that sized a cplan by hand against an older version.
 +    const int nr  = ne1;
@@ -83,9 +112,11 @@
      for (int i1 = ir0; i1 < ir1; i1++) {
          float * dst_data = (float *)((char *) dst->data + i1*nb1);
          float * wdata_kernel = wdata + i1*ne02*ne00;
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index f009f789..56dcfe74 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
-@@ -64,6 +64,11 @@
+@@ -64,6 +64,39 @@ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * p
  void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -94,19 +125,34 @@
 +// 256 KB, chosen to sit inside a small shared L2 alongside the two operands. Reserved by
 +// ggml_graph_plan (see GGML_OP_CONV_TRANSPOSE_1D there), so the two must agree.
 +#define GGML_CONV_TRANSPOSE_1D_TILE (64*1024)
++
++// A SKEW BETWEEN THE TWO PANELS THIS OP PACKS, in FLOATS, and it is worth 3.5x on one of a VITS
++// vocoder's three conv_transpose_1d nodes.
++//
++// The kernel goes to `wdata` and the transposed activation to `wdata + nk`, and the GEMM then walks
++// both with lda = ldb = k. Its 4x4 tile has eight live streams -- four rows of each operand, k floats
++// apart -- so whenever `nk` is a whole number of cache ways the a-streams and the b-streams land in
++// the SAME SETS, four ways deep, and evict each other on every access. That is not a rare alignment:
++// `nk` is K*Cout*Cin, and the node this was found on has nk = 524288 floats, exactly 2 MB. The
++// panels are placed on top of each other by construction.
++//
++// Measured on a Pi Zero W (16 KB 4-way L1, so a 4 KB way) at that node's shape, m=2048 k=256 n=64,
++// gemm44 in isolation, two passes (loom `scripts/bench37.c`):
++//
++//     panels adjacent, as before          82.1 / 81.7 MMAC/s
++//     +4 floats                          200.8 / 200.4
++//     +8 floats  (one 32-byte line)      283.4 / 236.4     <- works, but not stably
++//     +16 floats (two lines)             286.4 / 285.6     <- this
++//
++// Sixteen rather than eight because eight is one line and lands differently depending on where the
++// work buffer itself starts. THE OTHER OBVIOUS FIX DOES NOT WORK, and it is worth recording: blocking
++// the k loop so the live window is smaller changes nothing at all (81.7 at KB=128, 83.1 at KB=64),
++// which is what says this is a set conflict rather than a capacity miss. Padding lda/ldb instead
++// works equally well (up to 284.8) and costs a stride parameter through ggml_call_mul_mat_ldc; this
++// costs one addend.
++//
++// Reserved by ggml_graph_plan alongside the tile above, so the two must agree.
++#define GGML_CONV_TRANSPOSE_1D_SKEW 16
  void ggml_compute_forward_conv_transpose_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
---- a/src/ggml-cpu/ggml-cpu.c
-+++ b/src/ggml-cpu/ggml-cpu.c
-@@ -2912,6 +2912,10 @@
-                                    node->src[1]->type == GGML_TYPE_F32) {
-                             cur += sizeof(float)*ne00*ne01*ne02;
-                             cur += sizeof(float)*ne10*ne11;
-+                            // and the block of GEMM result the F32 path keeps in flight; it computes
-+                            // its own tile from the same budget, so the two have to agree. The MAX is
-+                            // the tile == 1 case, where one position's worth of Cout*K is all it takes.
-+                            cur += sizeof(float)*MAX((int64_t) GGML_CONV_TRANSPOSE_1D_TILE, ne00*ne01);
-                         } else {
-                             GGML_ABORT("fatal error");
-                         }

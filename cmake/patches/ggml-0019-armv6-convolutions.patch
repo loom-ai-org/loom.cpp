@@ -1,0 +1,295 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index f5df8151..9f267b3f 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -17,6 +17,9 @@
+ #include "ggml.h"
+ #include "unary-ops.h"
+ #include "vec.h"
++#if defined(GGML_USE_LLAMAFILE)
++#include "llamafile/sgemm.h"
++#endif
+ 
+ #include <algorithm>
+ #include <cfloat>
+@@ -7083,7 +7086,35 @@ static int64_t ggml_conv_2d_patch_budget(void) {
+                 return budget;
+             }
+         }
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        // ARMv6 -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1. 64 KB, an eighth of what every
++        // other architecture gets, because the cache this is sized against is an eighth as big: an
++        // ARM1176 has a 16 KB L1 and no L2 it can use (the BCM2835's 128 KB L2 belongs to the GPU),
++        // where the 512 KB default was drawn as half of a Cortex-A72's 1 MB L2.
++        //
++        // Swept on the board rather than derived, because this has a floor as well as a ceiling. One
++        // VITS synthesis, 3.24 s of audio, ONE wheel, one session, an idle board, this cap the only
++        // variable (loom `docs/epics/epic-08` 6.8):
++        //
++        //     16 KB   80.58 s      256 KB   77.16 s
++        //     32 KB   76.68 s      512 KB   80.92 / 79.71 / 80.06 s   <- the default elsewhere
++        //     64 KB   76.37 s      no cap   77.57 / 77.52 s
++        //
++        // A broad basin at 32-64 KB, worth 1.050x over the default; 64 KB because it is the measured
++        // best and the further from the cliff.
++        //
++        // THE CLIFF IS THE INTERESTING PART. At 16 KB -- the size that would actually fit this L1,
++        // which is what the rule's own reasoning asks for -- it is as bad as 512 KB, because a batch
++        // that small leaves the GEMM eight columns wide and what is won in residency is lost in
++        // shape. The rule cannot be followed to its logical end on a core this small, so this is a
++        // swept constant rather than a derived one, and it is not `l1 / 2`.
++        //
++        // Uncapping entirely is not the answer either, though it was the obvious guess: 77.5 s, a
++        // full percent worse than 64 KB.
++        budget = 64 * 1024;
++#else
+         budget = 512 * 1024;
++#endif
+     }
+     return budget;
+ }
+@@ -7163,6 +7194,37 @@ static int64_t ggml_conv_1d_direct_budget(void) {
+         }
+         sz = sizeof(uint64_t); v = 0;
+         if (sysctlbyname("hw.l3cachesize", &v, &sz, NULL, 0) == 0) l3 = (long) v;
++#elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        // ARMv6 -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1, and only it. `sysconf` reports 0
++        // for every cache level here, so without this arm the 512 KB floor below applies: THIRTY-TWO
++        // TIMES the only cache this core has. An ARM1176 has a 16 KB L1 data cache and no L2 it can
++        // use -- the BCM2835's 128 KB L2 sits in front of the GPU -- so a rule written as "the
++        // weights have to live in cache" was answering with a number no weight tensor could ever
++        // meet.
++        //
++        // It matters more here than the arithmetic does, because of what the direct sweep spends its
++        // bandwidth on: it re-reads the WHOLE weight tensor once per position block, and a block is
++        // GGML_CONV1D_VEC * GGML_CONV1D_LANES = 4 positions on this arm, so the traffic is one byte
++        // of weights per MAC no matter the shape. Inside L1 that byte is free; outside it the sweep
++        // is DRAM-bound and a GEMM -- which blocks both operands instead of streaming one of them --
++        // wins by whatever the miss rate is.
++        //
++        // Measured per shape on a Pi Zero W, one VITS synthesis, direct sweep against im2col + the
++        // tinyBLAS_F32_ARMV6 GEMM of ggml-0018 (loom `docs/epics/epic-08` 6.8):
++        //
++        //     OC=32,  L=70400, weights  28 KB    22.53 s   vs   23.71 s    sweep wins by 5%
++        //     OC=64,  L=17600, weights 112 KB    35.29 s   vs   22.81 s    GEMM 1.55x
++        //     OC=128, L=2200,  weights 448 KB    26.60 s   vs   11.84 s    GEMM 2.25x
++        //
++        // so the turn is between 28 KB and 112 KB, and 32 KB is where it goes: twice the L1, because
++        // this core's replacement policy is not LRU and a working set of about twice the cache still
++        // takes roughly half its reads out of it -- which is what the 28 KB row is. End to end, ABBA
++        // on one wheel and an idle board: VITS 98.96 -> 80.88 s, 1.223x.
++        //
++        // NOT `return false` from the predicate, however tempting: at OC=32 the sweep is still ahead,
++        // and it is also the arm that does not stage patches at all. This is a budget because the
++        // question is a budget.
++        l2 = 32 * 1024;
+ #else
+ #if defined(_SC_LEVEL3_CACHE_SIZE)
+         l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+@@ -7338,6 +7400,47 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
+         for (int i = 0; i < ocn; ++i)
+             for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
+     }
++#elif defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++    // ARMv6 -- ARM1176, the Pi Zero / Zero W / Pi 1, and only it. Arithmetically identical to the
++    // generic arm below (bit-identical output, checked); the sixteen accumulators are named scalars
++    // instead of `float acc[4][4]` because GCC will not scalarise that array at 4x4 -- it puts it on
++    // the stack and every one of the 16 accumulates becomes a load and a store. Measured on the board
++    // at a VITS resblock shape, IC=OC=128 KW=7 OL=2200 (loom scripts/bench34.c):
++    //
++    //     generic arm, float acc[4][4]   22.5 MMAC/s
++    //     these scalars                  51.8 MMAC/s   2.30x
++    //
++    // The same defect and the same fix as tinyBLAS_F32_ARMV6's 4x4 tile in llamafile/sgemm.cpp; this
++    // architecture has no vector unit to hide it behind, so it shows up here as a 2.3x rather than as
++    // a rounding error. GGML_CONV1D_OCB and _VEC are both 4 on this arm by construction.
++    float a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33;
++    a00 = a01 = a02 = a03 = (bias && oc0 + 0 < OC) ? bias[oc0 + 0] : 0.0f;
++    a10 = a11 = a12 = a13 = (bias && oc0 + 1 < OC) ? bias[oc0 + 1] : 0.0f;
++    a20 = a21 = a22 = a23 = (bias && oc0 + 2 < OC) ? bias[oc0 + 2] : 0.0f;
++    a30 = a31 = a32 = a33 = (bias && oc0 + 3 < OC) ? bias[oc0 + 3] : 0.0f;
++    for (int64_t ic = 0; ic < IC; ++ic) {
++        const float * xr = xp + ic * LP + p0;
++        const float * wr = wp + ic * KW * OC + oc0;
++        for (int64_t kx = 0; kx < KW; ++kx, xr += dil, wr += OC) {
++            const float x0 = xr[0], x1 = xr[1], x2 = xr[2], x3 = xr[3];
++            const float w0 = wr[0], w1 = wr[1], w2 = wr[2], w3 = wr[3];
++            a00 += w0 * x0; a01 += w0 * x1; a02 += w0 * x2; a03 += w0 * x3;
++            a10 += w1 * x0; a11 += w1 * x1; a12 += w1 * x2; a13 += w1 * x3;
++            a20 += w2 * x0; a21 += w2 * x1; a22 += w2 * x2; a23 += w2 * x3;
++            a30 += w3 * x0; a31 += w3 * x1; a32 += w3 * x2; a33 += w3 * x3;
++        }
++    }
++    {
++        const float st[4][4] = {{a00,a01,a02,a03},{a10,a11,a12,a13},
++                                {a20,a21,a22,a23},{a30,a31,a32,a33}};
++        // Outside the reduction, so this array costs nothing the loop above was avoiding.
++        for (int i = 0; i < ocn; ++i)
++            for (int j = 0; j < GGML_CONV1D_VEC; ++j) {
++                if (CLAMP && p0 + j < pmin) continue;
++                const int64_t off = (oc0 + i) * OL + p0 + j;
++                y[off] = st[i][j] + (RES ? res[off] : 0.0f);
++            }
++    }
+ #else
+     float acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
+     for (int i = 0; i < GGML_CONV1D_OCB; ++i)
+@@ -7789,6 +7892,105 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+ // The one thing it is NOT right for is a convolution inside a decode loop, where the dequantize would
+ // be paid per token rather than per utterance. Nothing in ggml routes SSM_CONV here.
+ 
++// THE CONVOLUTIONS THE DIRECT SWEEP DECLINES, ON ARMv6, WITHOUT THROWING THE QUANTIZATION AWAY.
++//
++// ARMv6 only -- ARM1176, the Raspberry Pi Zero / Zero W / Pi 1. Not the 64-bit ARMs, which have a
++// vectorised direct sweep and a NEON quantized dot; not ARMv7 either, which has NEON (see the guard
++// in llamafile/sgemm.cpp).
++//
++// `ggml_conv_1d_direct_ok` refuses a convolution whose weights exceed the cache budget or whose
++// activation is short relative to its channel count -- and on a VITS vocoder that is the LARGEST
++// bucket, 41 calls of IC*K=960, OC=384 at OL=275, 36% of a synthesis. Those fall to the batched
++// im2col below, which runs against the DEQUANTIZED kernel because the block at the top of
++// `ggml_compute_forward_conv_2d_impl` has already expanded it. On a core with no vector unit that is
++// the worst of both: F32 arithmetic over 1.47 MB of weights where the stored form is 207 KB.
++//
++// Measured on a Pi Zero W at that shape, all arms verified identical:
++//     F32 GEMM (what this replaces)                29.7 MMAC/s
++//     q4_0 x q8_0 through this path               167.9 MMAC/s   5.65x
++//
++// The folded kernel layout [IC*KH*KW, OC] that loom's ggml-0013 introduced so the weights could be
++// block-quantized at all IS a GEMM's weight matrix, so nothing is repacked here: the stored kernel is
++// handed to the GEMM as it sits, and only the im2col patches are quantized.
++//
++// Returns false -- and the F32 path runs -- for anything it cannot serve: a contraction that is not a
++// whole number of Q8_0 blocks, a work buffer too small for the quantized patches, or the kill switch.
++static bool ggml_conv_2d_armv6_qgemm(const ggml_compute_params * params, const void * qk,
++                                     void * tmp, int64_t patches_per_batch, int64_t patch_n,
++                                     int64_t c_out, int64_t knl_n, float * out, int64_t ldc) {
++#if defined(GGML_USE_LLAMAFILE) && defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++    const int64_t blck = ggml_blck_size(GGML_TYPE_Q8_0);   // == ggml_blck_size(Q4_0) == 32
++    if (qk == NULL || (knl_n % blck) != 0) {
++        return false;
++    }
++    // BACK TO AN OPT-IN, BECAUSE THE KERNEL IT BEAT NO LONGER EXISTS.
++    //
++    // This path was measured at **5.65x** -- 29.7 MMAC/s for the F32 GEMM it replaced against 167.9
++    // for this one (see the block above). That F32 GEMM was ggml's untiled `vec_dot` loop. It has
++    // since been replaced by `tinyBLAS_F32_ARMV6` and then cache-blocked (ggml-0018), and the
++    // incumbent is now 178-262 MMAC/s at these shapes. Re-measured against THAT, on a Pi Zero W, ABBA
++    // on one wheel with only this switch between the arms:
++    //
++    //     this path on    67.80 / 67.68 s   (3.24 s of audio)   20.91x real time
++    //     this path off   60.19 / 60.46 s   (3.19 s of audio)   18.91x real time
++    //
++    // **1.11x by NOT taking it.** Both arms transcribe the sentence, so this is a speed decision and
++    // not a correctness one.
++    //
++    // It is kept, opt-in, rather than deleted: it is 80 lines of measured work and it may still win
++    // on a model whose F32 path is worse than VITS's, or on a core with less cache to lose. But it is
++    // off unless asked for.
++    //
++    // HOW IT CAME TO BE ON. It used to be unreachable for VITS -- the 512 KB patch cap left no room
++    // in the work buffer for the Q8_0 staging, so the size check below declined every call. P7.1's
++    // second item cut that cap to 64 KB for cache reasons, and every one of VITS's shapes started
++    // fitting. So that change did TWO things and the 1.061x credited to it was a net of a win and
++    // this loss. One change, two decisions -- the same shape as Retro-036, missed a second time.
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * e = getenv("GGML_CPU_ENABLE_ARMV6_CONV_QGEMM");
++        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    if (!enabled) {
++        return false;
++    }
++
++    // Staged where the F32 path would have put `gemm_output`, which this branch does not use because
++    // it writes straight into dst. Checked against the buffer's real end rather than assumed: a
++    // convolution with a long contraction and few output channels would not fit, and must fall back.
++    const size_t q8row = ggml_row_size(GGML_TYPE_Q8_0, knl_n);
++    char * const   qb  = (char *) tmp + (size_t) patches_per_batch * knl_n * sizeof(float);
++    const char * const wend = (const char *) params->wdata + params->wsize;
++    if (qb + (size_t) patch_n * q8row > wend) {
++        return false;
++    }
++
++    const ggml_from_float_t quantize = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;
++    for (int64_t i = params->ith; i < patch_n; i += params->nth) {
++        quantize((const float *) tmp + i * knl_n, qb + (size_t) i * q8row, knl_n);
++    }
++    ggml_barrier(params->threadpool);
++
++    // c_out rows of kernel against patch_n columns of patches, written channel-major -- which is why
++    // this is not `llamafile_sgemm`, whose store is the other way round.
++    // `k` IS IN BLOCKS, NOT ELEMENTS -- `llamafile_sgemm`'s own callers pass
++    // `ne00 / ggml_blck_size(src0->type)`, and the kernel indexes `A[lda * row + l]` on a
++    // `block_q4_0 *` for `l < k`. Passing `knl_n` here ran the contraction 32x too far off the end of
++    // every row: conformer-ctc came back with "i" instead of the sentence and took 1.94x as long.
++    // It did not show up on VITS because VITS never reaches this call at all -- its patch batches do
++    // not leave room for the Q8_0 staging and the size check above declines them.
++    llamafile_sgemm_q4_0_q8_0_cm(params, c_out, patch_n, knl_n / blck,
++                                 qk, knl_n / blck,
++                                 qb, knl_n / blck,
++                                 out, ldc);
++    return true;
++#else
++    GGML_UNUSED(params); GGML_UNUSED(qk); GGML_UNUSED(tmp); GGML_UNUSED(patches_per_batch);
++    GGML_UNUSED(patch_n); GGML_UNUSED(c_out); GGML_UNUSED(knl_n); GGML_UNUSED(out); GGML_UNUSED(ldc);
++    return false;
++#endif
++}
++
+ // The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
+ // `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
+ static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
+@@ -7823,7 +8025,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+                                               // output element is stored.
+                                               const float *               in_data   = nullptr,
+                                               const float *               leaky     = nullptr,
+-                                              const float *               res_data  = nullptr) {
++                                              const float *               res_data  = nullptr,
++                                              // ARMv6 ONLY (ggml_conv_2d_armv6_qgemm): the kernel as
++                                              // STORED, carried past the dequantize below so the
++                                              // im2col fallback can run a quantized GEMM instead of
++                                              // an F32 one. Null everywhere else, and null here too
++                                              // whenever the stored type is not Q4_0.
++                                              const void *                qk_data   = nullptr) {
+ 
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(kernel->type == kernel_type);
+@@ -7871,8 +8079,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         p.wdata = (char *) params->wdata + kbytes;
+         p.wsize = params->wsize - kbytes;
+ 
++        // The dequantize above still happens, and is still cheap (+1.8 ms over a whole VITS vocoder):
++        // keeping it means every predicate below -- the direct path's cache budget included -- prices
++        // the kernel by its dequantized size, which is what those predicates were tuned against. What
++        // is new is that the STORED kernel is carried alongside, so a fallback GEMM on ARMv6 can use
++        // it instead and never touch the expansion.
++        const void * qk = NULL;
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        if (kernel_type == GGML_TYPE_Q4_0) {
++            qk = kernel->data;
++        }
++#endif
+         ggml_compute_forward_conv_2d_impl(&p, &kdq, src, dst, GGML_TYPE_F32,
+-                                          bias_data, out_data, in_data, leaky, res_data);
++                                          bias_data, out_data, in_data, leaky, res_data, qk);
+         return;
+     }
+ 
+@@ -8088,8 +8307,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         // conv -- and skipping it is most of what makes this op worth using at all: with the cache
+         // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
+         if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
+-            ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
+-                                  dst_data + patch_start_batch, dst_w * dst_h);
++            // ARMv6 takes a quantized GEMM here when it can (5.65x at a VITS vocoder's largest
++            // shape); everything else, and anything it declines, runs the F32 one. Only THIS call
++            // site is served: the staged path below is the rarer one and is left alone.
++            if (!ggml_conv_2d_armv6_qgemm(params, qk_data, tmp, patches_per_batch, patch_n, c_out,
++                                          knl_n, dst_data + patch_start_batch, dst_w * dst_h)) {
++                ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
++                                      dst_data + patch_start_batch, dst_w * dst_h);
++            }
+             ggml_barrier(params->threadpool);
+             if (bias_data || res_data) {
+                 // Applied HERE rather than as its own pass over the finished result: these are the
