@@ -234,10 +234,13 @@ are not renumbered. New items continue the scheme.
   OC=32 direct sweep, phase-major, `CONV_TRANSPOSE_1D`'s data movement, the permute-back (3.2x alone,
   slower in the model), and the **int16 `__smlad` path** — §6.5 already retracted the 3.61x that
   motivated it, and §6.8 item 9 measured this project's actual integer GEMM at 0.90x.
-  **What is left is one thing, and it is new**: `ggml-0013` **dequantizes the kernel once per call**,
-  which is 73728 elements x 44 calls on VITS's 94 bucket and costs **1.4 s** there — the one bucket
-  where the quantized GEMM was winning. A dequant-amortisation problem, not a GEMM one; unmeasured
-  beyond that delta.
+  **Nothing is left that is worth opening.** The one bucket where the quantized GEMM wins is a single
+  text-encoder shape, `94,1,192,1` — 4090 -> 2570 ms, 1.59x over 44 calls, 1.5 s. Three explanations
+  for it have been proposed and measured wrong (a per-call dequantize, which both arms pay; a skipped
+  permute, which neither does; operands fitting the L1, which fits the LOSING shapes better). **One
+  winning shape is not a gate**, and every rule fitted to a handful of shapes in this epic has been
+  wrong, so the kernel stays opt-in behind `GGML_CPU_ENABLE_ARMV6_CONV_QGEMM` with the number
+  recorded.
   *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
