@@ -19,8 +19,10 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — codec decoders** | DAC done and verified; the second leaf is scoped, not started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 10 — AR LM + codec TTS** | Gated end to end and the ASR oracle passes; the card and the loom-py bump are what is left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 10 — Dia: the loom-py bump and the Hub upload** | Everything else is done and gated. The bump is what makes `test_model_cards.py`'s `text2codes` arm executable at all, and it has never run against the shipped file → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **Push `distilbert-ner-loom` and `dia-1.6b-loom`** | Both staged; until they go up, `model.text2class` and `model.text2codes` are doors with no model behind them, and loom-py's README documents calls against both → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — the second codec leaf** | DAC done and verified; EnCodec and SNAC are both scoped with named blockers, neither started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **`feat/p7-armv6` has no PR** | Six shipped items across two repos sit on an unmerged branch → [Epic-08 §6](../epics/epic-08-packaging-and-release.md) |
 
 ---
 
@@ -220,28 +222,6 @@ are not renumbered. New items continue the scheme.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
-
-* [ ] **P7.1 — the ARMv6 convolution path.** Six shipped, five measured out. VITS across P7 and
-  P7.1: **181.8 -> 60.2 s, 57.0x -> 18.9x real time**, a **3.02x** on the tier's own baseline.
-  Four of the six fixes were one bug — a cache-sized decision made on a machine with a bigger cache:
-  the **direct-1d budget** 512 KB -> 32 KB (**1.223x**), the **im2col patch cap** 512 KB -> 64 KB
-  (**1.061x**), **`CONV_TRANSPOSE_1D`'s panels** skewed off a shared cache way (**1.49x on the op**),
-  and the **GEMM's missing cache blocking**, gated at `k > L1/32` (**1.017x**). The fifth is the
-  **patch gather**, now taken a run at a time (**1.082x**). The sixth is **declining the ARMv6
-  quantized convolution GEMM** (**1.107x**) — it won 5.65x when written, against an F32 kernel that
-  has since been replaced twice.
-  **Measured out** ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)): the
-  OC=32 direct sweep, phase-major, `CONV_TRANSPOSE_1D`'s data movement, the permute-back (3.2x alone,
-  slower in the model), and the **int16 `__smlad` path** — §6.5 already retracted the 3.61x that
-  motivated it, and §6.8 item 9 measured this project's actual integer GEMM at 0.90x.
-  **Nothing is left that is worth opening.** The one bucket where the quantized GEMM wins is a single
-  text-encoder shape, `94,1,192,1` — 4090 -> 2570 ms, 1.59x over 44 calls, 1.5 s. Three explanations
-  for it have been proposed and measured wrong (a per-call dequantize, which both arms pay; a skipped
-  permute, which neither does; operands fitting the L1, which fits the LOSING shapes better). **One
-  winning shape is not a gate**, and every rule fitted to a handful of shapes in this epic has been
-  wrong, so the kernel stays opt-in behind `GGML_CPU_ENABLE_ARMV6_CONV_QGEMM` with the number
-  recorded.
-  *Context: [Epic-08 §6.8](../epics/epic-08-packaging-and-release.md)*
 
 ## Standing scope limitations
 
