@@ -253,6 +253,29 @@ def write_classifier(path: Path) -> None:
     _finish(w)
 
 
+def write_spm_classifier(path: Path) -> None:
+    """The same door, framed the way a SentencePiece encode frames it: `<s> ... </s>`, no SEP.
+
+    A second fixture rather than a second KV on the first, because what it pins is that the framing is
+    PER-TOKENIZER: family 12's WordPiece checkpoints wrap in CLS/SEP and its XLM-R one wraps in BOS/EOS
+    (P5). `framing_ids` reading only the first pair left a trailing `</s>` in the answer wearing
+    whatever label the head gave it -- one extra entry, at the end, which is exactly where a caller
+    comparing lengths against its own word count would find it.
+    """
+    w = _base(path, "spm_token_classifier_test")
+    w.add_string("loom.task", "token-classification")
+    w.add_string("loom.input.kind", "text")
+    w.add_string("loom.output.kind", "class")
+    w.add_array("loom.labels", ["O", "B-PER", "I-PER"])
+    # XLM-R's own ids, and no separator token at all -- so this fixture also covers the "a file naming
+    # only some of the four strips only those" half of `framing_ids`.
+    w.add_bos_token_id(0)
+    w.add_eos_token_id(2)
+    w.add_pad_token_id(1)
+    w.add_string("model.driver_script", CLASSIFY_DRIVER)
+    _finish(w)
+
+
 def write_pooled_classifier(path: Path) -> None:
     w = _base(path, "pooled_classifier_test")
     w.add_string("loom.task", "token-classification")
@@ -292,6 +315,7 @@ def main() -> None:
     write_dynamic_asr(out_dir / "dynamic_asr.gguf")
     write_codec(out_dir / "contract_codec.gguf")
     write_classifier(out_dir / "classify_driver.gguf")
+    write_spm_classifier(out_dir / "classify_driver_spm.gguf")
     write_pooled_classifier(out_dir / "pooled_classifier.gguf")
 
 

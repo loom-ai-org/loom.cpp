@@ -390,9 +390,34 @@ int main(int argc, char** argv) {
 
         if (has_prompt) {
             std::unique_ptr<loom::BpeVocab> bpe_vocab;
-            if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "gpt2") {
+            // The SentencePiece half of the same job, and it is here because family 6 arrived without
+            // it: `loom::Vocab` has encoded and decoded UGM/SentencePiece-BPE vocabularies since the
+            // ASR families needed them, and this branch only ever asked for `"gpt2"` -- so a T5 file
+            // reached `parse_token_ids`, which found no integers in the sentence and reported
+            // "produced no token ids" while the model's own 32,100-piece vocabulary sat unread in it.
+            // Exactly the half-wiring the phoneme branch above was written to correct, one modality
+            // over.
+            std::unique_ptr<loom::Vocab> spm_vocab;
+            const std::string vocab_tag =
+                model->has_kv("tokenizer.ggml.model") ? model->kv_str("tokenizer.ggml.model") : "";
+            if (vocab_tag == "gpt2") {
                 bpe_vocab = loom::BpeVocab::load(*model);
+            } else if (vocab_tag == "t5" || vocab_tag == "llama") {
+                spm_vocab = loom::Vocab::load(*model);
             }
+            // One name for "this file can turn text into ids", so the three call sites below cannot
+            // disagree about which vocabulary answered.
+            const auto encode_prompt = [&](const std::string& text) {
+                if (bpe_vocab) return bpe_vocab->encode(text);
+                if (spm_vocab) return spm_vocab->encode(text);
+                return parse_token_ids(text);
+            };
+            const auto decode_ids = [&](const std::vector<int32_t>& ids) {
+                if (bpe_vocab) return bpe_vocab->decode(ids);
+                if (spm_vocab) return spm_vocab->decode(ids);
+                return std::string();
+            };
+            const bool has_text_vocab = bpe_vocab != nullptr || spm_vocab != nullptr;
 
             // The chat template and the tokenizer are one feature, not two: the template's markers are
             // ADDED tokens, and a vocabulary that cannot emit those atomically turns each of them into
@@ -413,8 +438,7 @@ int main(int argc, char** argv) {
                 effective_prompt = tmpl->apply(messages, /*add_generation_prompt=*/true);
             }
 
-            const std::vector<int32_t> prompt_tokens =
-                bpe_vocab ? bpe_vocab->encode(effective_prompt) : parse_token_ids(effective_prompt);
+            const std::vector<int32_t> prompt_tokens = encode_prompt(effective_prompt);
             if (prompt_tokens.empty()) {
                 std::fprintf(stderr, "error: --prompt produced no token ids\n");
                 return 1;
@@ -436,9 +460,9 @@ int main(int argc, char** argv) {
                 const std::vector<int32_t> generated =
                     loom::text::generate(session.bridge(), *model, prompt_tokens, gen);
 
-                if (bpe_vocab) {
+                if (has_text_vocab) {
                     std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
-                                bpe_vocab->decode(generated).c_str());
+                                decode_ids(generated).c_str());
                 } else {
                     std::printf("generated %zu tokens:", generated.size());
                     for (int32_t tok : generated) std::printf(" %d", tok);
@@ -454,9 +478,9 @@ int main(int argc, char** argv) {
                 loom::Generator generator(*model, topo, cfg, backends);
                 const std::vector<int32_t> generated = generator.generate(prompt_tokens);
 
-                if (bpe_vocab) {
+                if (has_text_vocab) {
                     std::printf("generated %zu tokens -> \"%s\"\n", generated.size(),
-                                bpe_vocab->decode(generated).c_str());
+                                decode_ids(generated).c_str());
                 } else {
                     std::printf("generated %zu tokens:", generated.size());
                     for (int32_t tok : generated) std::printf(" %d", tok);

@@ -49,5 +49,9 @@ int main() {
     }
 
     std::printf("ok\n");
-    return 0;
+    // NOT `return 0`. `LOOM_CHECK` counts a failure and keeps going, so a hand-written main that
+    // returns 0 unconditionally reports every failure to stderr and exits green -- this file's checks
+    // could not fail a ctest run, and were found not to while a real one was being sabotage-tested
+    // (P5). Every other test here already ends on this macro.
+    LOOM_TEST_REPORT_AND_RETURN();
 }
