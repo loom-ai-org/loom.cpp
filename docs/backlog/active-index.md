@@ -41,15 +41,7 @@ are not renumbered. New items continue the scheme.
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
   cost across three checkpoints, which is the estimate the rest of this list should be read against.
   Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id handling for free.*
-* [ ] **A SentencePiece checkpoint for family 12's zoo slot — WHICH ONE IS OPEN.** The engine work is
-  done and merged; what is undecided is the checkpoint. `fullstop-punc` is exported, oracled, swept and
-  carded, but it is XLM-R **large**: 2.24 GB, of which 1.02 GB is a 250k-entry embedding matrix that
-  stays F32 while `GET_ROWS` is outside `PACKED_WEIGHT_FIRST_OPS`, to predict six punctuation classes.
-  `kredor/punctuate-all` is the same task, the same labels and the same architecture at half the size
-  (XLM-R base, 1.11 GB) with far more use, and its `tokenizer.json` is Unigram with scores already in
-  final fairseq id order — so it needs no protobuf and ADR-027's remapping is a no-op for it.
-  *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
-* [ ] **`flan-t5-small` is exported and verified; the HUB UPLOAD and the model card are what is
+* [ ] **`flan-t5-small` and `punctuate-all` are exported, carded and gated; the HUB UPLOAD is what is
   left.** Family 6's first leaf, and the first encoder-decoder TEXT model and first Unigram/SentencePiece
   LM in the zoo. Greedy generation matches `transformers` id-for-id on four prompts of different lengths,
   and the ENCODER matches at 3.1e-7 max absolute error (`fixture_gen/reference_forward_t5_mil.py`), which
@@ -57,7 +49,14 @@ are not renumbered. New items continue the scheme.
   ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)). The blocker this line used to
   carry did not exist; see [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md)
   and [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md).
-  *Two known limits, neither blocking: the vocabulary is 32,100 pieces against a 32,128-wide logit row
+  **`punctuate-all` takes family 12's zoo slot and that choice is now made** — same task, same six
+  classes, twelve languages against four, at half the size. `fullstop-punc` is not going up; it left
+  the card catalogue and STAYS in the export sweep, because the two take different tokenizer paths
+  (`sentencepiece_json` against `sentencepiece_proto`) and it is the only swept checkpoint whose
+  protobuf order and fast-tokenizer ids actually disagree, which is what
+  [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) is about.
+  Both cards pass the card gate against freshly exported GGUFs.
+  *Two known limits on flan-t5, neither blocking: the vocabulary is 32,100 pieces against a 32,128-wide logit row
   (T5 pads its embedding to a multiple of 128), so an argmax could in principle name an id with no piece
   — untrained rows, never seen in practice, and worth a bound if a leaf in this family ever emits one.
   And the driver marshals `n_head * n_src²` doubles for the encoder's bias, which is tens of thousands
