@@ -21,7 +21,6 @@ are not renumbered. New items continue the scheme.
 |---|---|
 | **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. SNAC is the one that tests something — `vq_strides [4, 2, 1]` puts its codebooks at different frame rates. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
-| **loom-py's README says "Seventeen"** | The org publishes twenty. A user-facing count that is three low, on `main` → below, Minor cleanups |
 
 *1.0.0-rc8 shipped families 10, 11 and 12 (PyPI ×4, and the org now lists twenty models), and family
 12's third checkpoint landed after it. There is no release chore open.*
@@ -288,9 +287,6 @@ primitive set.
   rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr could in principle reach
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
   `repeat_for`'s own loop bound.
-* [ ] **loom-py's README says the org publishes "Seventeen" models; it publishes twenty.**
-  `distilbert-ner-loom`, `dia-1.6b-loom` and `dac-44khz-loom` went up with 1.0.0-rc8 and the count
-  was never advanced. The table below that line lists them, so only the sentence is wrong.
 * [ ] `export_config.py`'s module docstring points at a ledger section that no longer exists.
 * [ ] **`GgmlPatches.cmake` asks "already applied?" the wrong way, so every `cmake` re-run rebuilds
   ggml from scratch** (~30 min on the Pi). It reverse-applies **each patch individually against the
