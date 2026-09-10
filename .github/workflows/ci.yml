@@ -57,3 +57,31 @@ jobs:
       # are run, on a machine that has the fixtures.
       - name: Test
         run: ctest --test-dir build -L ci --output-on-failure
+
+      # THE ONLY ARM COMPILE ANYWHERE IN THIS REPO'S CI, and it exists because the ggml patches are
+      # partitioned by `#if` into per-ISA slices that an x86 build never sees. `cmake/patches` carries
+      # kernels for aarch64 (`__ARM_FEATURE_DOTPROD`, `__ARM_NEON`) and for ARMv6
+      # (`__ARM_FEATURE_SIMD32 && !__ARM_NEON && !__aarch64__`), and a compile error inside either is
+      # unreachable from a build on this runner.
+      #
+      # That is not hypothetical. P7's per-call operand-order decision was written into
+      # `tinyBLAS_Q0_ARM` -- the 64-bit class -- rather than into its ARMv6 copy, assigning a
+      # `col_outer` that only the copy declares. This job was green throughout; the Pi Zero never
+      # compiles that class either (`!__ARM_NEON` excludes it); and the break survived five days until
+      # loom-py's macOS job, the project's only aarch64 compile, ran on a submodule bump.
+      #
+      # A SYNTAX CHECK, not a build: no libraries to link and about a second to run, which is all it
+      # takes to catch "this hunk landed in the wrong `#if`". ARMv6 is deliberately NOT checked here --
+      # it needs an armhf sysroot this runner has no reason to carry, and it is compiled for real by
+      # the emulated wheel build in loom-py, which is where an ARMv6 break would surface anyway.
+      #
+      # The tree is the PATCHED one FetchContent produced during Build above; sabotage it by moving a
+      # `col_outer` assignment into `tinyBLAS_Q0_ARM` and confirm this step goes red.
+      - name: Syntax-check the aarch64 kernels the x86 build cannot reach
+        run: |
+          sudo apt-get install -y g++-aarch64-linux-gnu
+          src=build/_deps/ggml-src/src
+          aarch64-linux-gnu-g++ -march=armv8.2-a+dotprod -O2 -std=gnu++17 -fsyntax-only \
+            -I "$src" -I "$src/ggml-cpu" -I "$src/../include" \
+            -DGGML_USE_LLAMAFILE -DGGML_USE_CPU_REPACK \
+            "$src/ggml-cpu/llamafile/sgemm.cpp" "$src/ggml-cpu/ops.cpp"
