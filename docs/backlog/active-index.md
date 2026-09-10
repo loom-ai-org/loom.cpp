@@ -131,6 +131,59 @@ are not renumbered. New items continue the scheme.
 
 ## Engine — performance
 
+* [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
+  runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
+  four things, and mapping them onto this tree ranks very unevenly — the important structural finding
+  is that **three of the four are kernel/runtime work, not export-time metadata**, so this is a
+  different bet from the GGUF memory-layout and prescribed-tiling thread and should not be expected to
+  fall out of it.
+  * [ ] **XNNPACK-class microkernels — the actual gap, and the one worth the most.** Per-ISA
+    hand-written microkernels, packed weights, **indirection buffers** so a convolution never
+    materialises an im2col matrix, and conv+bias+activation fused into one pass over the accumulator
+    tile. That last is the same idea as "evaluate activations in accumulators to avoid the round trip
+    through cache", and XNNPACK is the existence proof that it pays. **This tree is already walking
+    the same road**: the F32 GEMM microkernel was measured at **71% of the whole onnxruntime gap** and
+    shipped as two tinyBLAS patches; the ARMv6 run-at-a-time im2col patch gather is an indirection
+    buffer in miniature; P4.29's dequantize-at-the-top-and-re-enter is a reusable piece. What is
+    missing is doing it deliberately and across ops rather than one measured hotspot at a time.
+    *Two standing cautions apply and both are ours: a node-by-node profile swung a 78 ms gap by 230 ms
+    depending on how its own overhead was apportioned, and 3.92x on an isolated op became 0.5% on the
+    model. Fusion wins are routinely smaller than a node table implies — measure what fusion is worth
+    separately.*
+  * [ ] **Direct I/O buffers — which for loom means the LUA MARSHALLING BOUNDARY, not the host API.**
+    LiteRT hands a caller a pointer into the arena so an input costs no copy. The analogous cost here
+    is `loom.causal_mask` and its siblings building a Lua table of doubles that is then converted to
+    float and copied into a backend tensor: three passes plus a table allocation. This class has bitten
+    once already as the prefill ceiling (P4.0.14,
+    [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md)), and family 6 made it larger —
+    `t5_position_bias` marshals `n_head * n_src²` doubles per encoder call. The fix is a "fill the
+    tensor in place" primitive: the driver names the builder, the engine writes straight into the
+    declared input. Cheap, bounded, and the measurement is easy.
+  * [ ] **Serializing a COMPILED accelerator program.** The "fewer dispatches" half of LiteRT's
+    delegate story has already been probed here, and the honest reading is that **a split count does
+    not predict it either way**: the Metal `PAD` prototype removed 27 of 56 splits and bought 1.8% on
+    the model it was measured on
+    ([Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md) §5.4), and the same kernel
+    later measured **11.0% on VITS** (97.9 → 88.7 ms) and shipped as `ggml-0016`
+    ([Retro-028](../retros/retro-028-three-closing-arguments-that-were-never-measured.md)). So neither
+    "dispatch reduction is worthless" nor "it is the gap" is supported — it is per model and has to be
+    measured per model. What is NOT measured at all is the other half: Vulkan and Metal recompile
+    their shaders at every startup, and caching a compiled program is a cold-start win nobody here has
+    put a number on. That is the one piece of LiteRT's fourth item that fits the GGUF-metadata thread
+    naturally.
+  * [x] **FlatBuffers — investigated and declined, so it is not re-derived.** A flatbuffer replaces a
+    load-time parse, not the per-call ggml graph build; ExecuTorch's own `GRAPH_REBUILD.md` rebuilds
+    too. And the container is not where TFLite's memory win comes from — the **arena planner** is,
+    which precomputes every tensor offset once and reuses it forever *because TFLite shapes are
+    static*. Loom's are not (`n_tokens`/`n_kv` are dynamic, which is why P4.0.15 buckets and keys
+    graph reuse on the bucketed length), so the equivalent is already partly held by `gallocr` plus
+    graph reuse, and the rest is a trade this engine made deliberately for dynamic length rather than
+    a gap to close.
+  * *Context: [Epic-05](../epics/epic-05-edge-performance.md). Whoever picks this up measures against
+    a competitor build that is NAMED —
+    [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md) is the standing rule, and the
+    reason is that conda-forge onnxruntime is 1.86x faster than the PyPI wheel at the same version. A
+    LiteRT baseline has the same hazard and no one here has pinned one yet.*
 * [ ] **Write down that loom-exporter's tests run under `~/.venvs/piper`.** `python3` on the dev box
   resolves to **`~/.venvs/ovos`** — transformers 5.14.1, **no `sentencepiece`** — which is the
   Qwen3-ASR-only env, and `tests/ci` under it is `4 failed, 568 passed`. **All four are the
