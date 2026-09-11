@@ -22,8 +22,15 @@ are not renumbered. New items continue the scheme.
 | **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. SNAC is the one that tests something — `vq_strides [4, 2, 1]` puts its codebooks at different frame rates. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
-*1.0.0-rc8 shipped families 10, 11 and 12 (PyPI ×4, and the org now lists twenty models), and family
-12's third checkpoint landed after it. There is no release chore open.*
+***1.0.0-rc9 is tagged and its models are published; the PyPI publish is the one release chore
+open.*** It ships **ARMv6 as a supported target** (P7/P7.1 — a `linux_armv6l` wheel for the Pi Zero
+and Pi 1, VITS from 57x to 18.9x real time), **family 12's SentencePiece reading** (XLM-R, where a
+fairseq checkpoint's ids are not its protobuf's piece order — plus a `tokenizer.json`-only path and a
+correctness fix, since `framing_ids` had been returning a SentencePiece encode's trailing `</s>`
+*labelled*), and **family 6, `flan-t5-small`** — the first text encoder-decoder and first Unigram LM
+in the zoo. The org now lists **twenty-two** models, every one re-exported and card-gated against this
+tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`. What remains is four packages to PyPI:
+`loom-py-rt` and the `-cuda`/`-vulkan`/`-metal` accelerators.
 
 ---
 
@@ -41,27 +48,14 @@ are not renumbered. New items continue the scheme.
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
   cost across three checkpoints, which is the estimate the rest of this list should be read against.
   Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id handling for free.*
-* [ ] **`flan-t5-small` and `punctuate-all` are exported, carded and gated; the HUB UPLOAD is what is
-  left.** Family 6's first leaf, and the first encoder-decoder TEXT model and first Unigram/SentencePiece
-  LM in the zoo. Greedy generation matches `transformers` id-for-id on four prompts of different lengths,
-  and the ENCODER matches at 3.1e-7 max absolute error (`fixture_gen/reference_forward_t5_mil.py`), which
-  is the check that actually covers the relative bias — a token match does not
-  ([Retro-006](../retros/retro-006-kokoro-shipped-noise.md)). The blocker this line used to
-  carry did not exist; see [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md)
-  and [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md).
-  **`punctuate-all` takes family 12's zoo slot and that choice is now made** — same task, same six
-  classes, twelve languages against four, at half the size. `fullstop-punc` is not going up; it left
-  the card catalogue and STAYS in the export sweep, because the two take different tokenizer paths
-  (`sentencepiece_json` against `sentencepiece_proto`) and it is the only swept checkpoint whose
-  protobuf order and fast-tokenizer ids actually disagree, which is what
-  [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) is about.
-  Both cards pass the card gate against freshly exported GGUFs.
-  *Two known limits on flan-t5, neither blocking: the vocabulary is 32,100 pieces against a 32,128-wide logit row
-  (T5 pads its embedding to a multiple of 128), so an argmax could in principle name an id with no piece
-  — untrained rows, never seen in practice, and worth a bound if a leaf in this family ever emits one.
-  And the driver marshals `n_head * n_src²` doubles for the encoder's bias, which is tens of thousands
-  for a sentence and 1.5M at the 512-token ceiling; ADR-028 records the in-graph alternative if that
-  becomes measurable.*
+* [ ] **`flan-t5-small`'s vocabulary is 32,100 pieces against a 32,128-wide logit row.** T5 pads its
+  embedding to a multiple of 128, so an argmax could in principle name an id with no piece — untrained
+  rows, never observed in practice, and the model is shipped and verified without a bound on it. Worth
+  one if a leaf in this family ever emits such an id. *The other limit recorded alongside this one is
+  the driver marshalling `n_head * n_src²` doubles for the encoder bias — tens of thousands for a
+  sentence, 1.5M at the 512-token ceiling;
+  [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md) records the in-graph
+  alternative if it ever becomes measurable.*
 * [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
   leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
   Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
