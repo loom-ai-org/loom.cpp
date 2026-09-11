@@ -19,7 +19,8 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — the second codec leaf** | DAC is on the Hub and verified; EnCodec and SNAC are both scoped with named blockers and neither is started. SNAC is the one that tests something — `vq_strides [4, 2, 1]` puts its codebooks at different frame rates. Confirmed absent from the org → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **SNAC's Hub upload** | Exported, verified against the package's own decode (max \|Δ\| 2.45e-06, 22/22 words through the ASR oracle) and card-gated in the staging tree at `hf-models/snac-24khz`. The upload is the one step left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 11 — EnCodec, the remaining codec leaf** | The multi-rate question is answered ([ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md)); EnCodec's two blockers are unchanged and neither is started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
 ***1.0.0-rc9 is tagged and its models are published; the PyPI publish is the one release chore
@@ -42,7 +43,7 @@ tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`. What remains is four pa
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
 * [ ] **P5 breadth**, in coverage-per-effort order. Families 10, 11 and 12 are DONE — the remainder:
-  11's second leaf (codec decoders) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text
+  11's remaining leaf (EnCodec) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text
   enc-dec) → 13 (small classifiers) → 14 (music). *Context:
   [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
@@ -63,9 +64,6 @@ tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`. What remains is four pa
   `ScriptedLoop`/`run_recurrent` path rather than `Flattened`. Its `decode` signature and config
   spellings are already written and tested in `CodecFamily`; the recognizer detects it and raises
   naming both reasons. *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
-* [ ] **SNAC** — the other family-11 candidate, and a different axis of difficulty from EnCodec:
-  `vq_strides [4, 2, 1]` puts its codebooks at DIFFERENT frame rates, which is what tests whether
-  "codes in, frame-major" survives a multi-rate codec. Needs the `snac` package (not in transformers).
 * [ ] **P5.0 — per-phase process isolation for conversion.** Decides which models are exportable at all
   on a given machine. Change 1 done (30.4 → 22.9 GB peak on Granite-Speech). Two remain:
   * [ ] quantize/`astype` each phase's weights as it converts, rather than at write time

@@ -13,9 +13,10 @@ The measure of the data-driven design is how cheaply a new architecture arrives.
 models ship, which family template each belongs to, and the roadmap for the rest — with the standing
 acceptance criterion that **a new family should need no engine work**.
 
-Seventeen models are published at
-[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). Each is a single GGUF carrying its own
-topologies, driver and — where the architecture has one — its vocabulary.
+Twenty-two models are published at
+[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), and SNAC-24kHz is exported, verified
+and staged as the twenty-third. Each is a single GGUF carrying its own topologies, driver and — where
+the architecture has one — its vocabulary.
 
 ## 2. Architectural Overview
 
@@ -30,7 +31,7 @@ topologies, driver and — where the architecture has one — its vocabulary.
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
-| **Audio codec (decode)** | DAC-44kHz | `audio_codec_export.py` |
+| **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Text → codec tokens** | Dia-1.6B | `dia_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
@@ -180,6 +181,34 @@ EnCodec directory and raises naming both reasons — detection is what makes the
 
 **This is why the composition target changed.** MusicGen was picked for its small LM and would have
 dragged in this codec; Dia decodes through DAC, which is done, so it costs the LM half only.
+
+#### The second leaf was SNAC, and the layout claim held
+
+SNAC 24 kHz shipped 2026-09-11 and is the leaf Epic-03 had named for the purpose: `vq_strides =
+[4, 2, 1]` puts its three codebooks at three different frame rates, which is what tests whether "codes
+in, frame-major" survives a multi-rate codec. **It survives**, with the row read as the coarsest
+codebook's frame — `sum(coarse // stride)` ids wide, 7 here, level-major — which is `n_codebooks`
+exactly when every stride is 1, so DAC is the same formula rather than a second branch.
+[ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md) records that and the
+two consequences a caller sees: `codec.n_codebooks` is code streams per frame (7 for 3 codebooks), and
+`codec.frame_rate` is the rate of the rows (11.72 Hz, not the codec's own 46.875).
+
+**No new engine primitive, again** — the third family in a row. The decode path lowers to convolutions
+(depthwise and transposed), `SIN`/`SQR` and the `REPEAT` that carries `from_codes`' `repeat_interleave`
+back up to the finest rate. What it cost outside the family was one export dependency (`snac` is its
+own MIT package, imported lazily) and two class-level patches: `Snake1d`, whose `@torch.jit.script`
+body reshapes through `x.shape[i]` and does not convert, and `NoiseBlock`, because **this decoder is
+stochastic** — ADR-029 has the measurement behind dropping it.
+
+It also paid for itself outside family 11 entirely. The first export matched at cosine 0.999998 and
+was wrong: coremltools lowers `reciprocal` to an op whose epsilon defaults to 1e-4, and Snake's
+`1/alpha` had folded to `1/(alpha + 1e-4)`. That is fixed in `torch_patches.py` for every model this
+pipeline will ever trace — [Retro-042](../retros/retro-042-a-converters-op-default-changed-the-function.md),
+which also records the f32-vs-f64 arm that told a defect from float noise.
+
+Verified against the package's own decode on real speech, after the fix: max |Δ| **2.45e-06**, cosine
+0.99999976, the exact sample count (`n_rows * 4 * 512`), and the ASR oracle reading 22/22 words.
+Sabotage arm — the same graph against a reversed-code reference — 1.07.
 
 ### Family 6, and the primitive the engine already had
 
