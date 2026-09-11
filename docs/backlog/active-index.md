@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **SNAC's Hub upload** | Exported, verified against the package's own decode (max \|Δ\| 2.45e-06, 22/22 words through the ASR oracle) and card-gated in the staging tree at `hf-models/snac-24khz`. The upload is the one step left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **SNAC's Hub upload** | Exported, verified against the package's own decode with the noise held equal (max \|Δ\| 1.20e-06) and card-gated in the staging tree at `hf-models/snac-24khz`. The upload is the one step left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 family 11 — EnCodec, the remaining codec leaf** | The multi-rate question is answered ([ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md)); EnCodec's two blockers are unchanged and neither is started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
