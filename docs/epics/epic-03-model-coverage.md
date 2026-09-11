@@ -196,9 +196,22 @@ two consequences a caller sees: `codec.n_codebooks` is code streams per frame (7
 **No new engine primitive, again** — the third family in a row. The decode path lowers to convolutions
 (depthwise and transposed), `SIN`/`SQR` and the `REPEAT` that carries `from_codes`' `repeat_interleave`
 back up to the finest rate. What it cost outside the family was one export dependency (`snac` is its
-own MIT package, imported lazily) and two class-level patches: `Snake1d`, whose `@torch.jit.script`
-body reshapes through `x.shape[i]` and does not convert, and `NoiseBlock`, because **this decoder is
-stochastic** — ADR-029 has the measurement behind dropping it.
+own MIT package, imported lazily), two class-level patches — `Snake1d`, whose `@torch.jit.script` body
+reshapes through `x.shape[i]` and does not convert, and `NoiseBlock` — and **the family's first
+stochastic leaf**.
+
+That last one is the engine-adjacent part, and it needed no engine change either: a topology is a pure
+graph and cannot draw, but the Lua bridge has had `loom.seed_rng`/`loom.gaussian_array` since VITS, so
+the noise became four graph INPUTS the synthesized driver draws at `multiple * n_codes`. `DriverInputs`
+gains a `NOISE` binding kind beside `POSITION` and `MASK` — named by the export rather than by input
+name, because the length ratio is not recoverable from a name — and any future family with a
+stochastic leaf gets it free. The driver also accepts the arrays from the caller, which is what keeps
+the oracle exact on a stochastic model.
+
+**The noise was dropped first, on measurements, and put back after a listening test** — the export
+shipped the conditional mean until a listener called it *"less sharp, slightly more artificial"*.
+ADR-029 carries both halves and [Retro-043](../retros/retro-043-the-band-was-20db-down-and-audible.md)
+the lesson: a band 21 dB down is not an inaudible band.
 
 It also paid for itself outside family 11 entirely. The first export matched at cosine 0.999998 and
 was wrong: coremltools lowers `reciprocal` to an op whose epsilon defaults to 1e-4, and Snake's
@@ -206,9 +219,12 @@ was wrong: coremltools lowers `reciprocal` to an op whose epsilon defaults to 1e
 pipeline will ever trace — [Retro-042](../retros/retro-042-a-converters-op-default-changed-the-function.md),
 which also records the f32-vs-f64 arm that told a defect from float noise.
 
-Verified against the package's own decode on real speech, after the fix: max |Δ| **2.45e-06**, cosine
-0.99999976, the exact sample count (`n_rows * 4 * 512`), and the ASR oracle reading 22/22 words.
-Sabotage arm — the same graph against a reversed-code reference — 1.07.
+Verified against the package's own decode on real speech, both sides given the same noise: max |Δ|
+**1.20e-06**, cosine 1.000000, the exact sample count (`n_rows * 4 * 512`), and the ASR oracle reading
+22/22 words. Sabotage arm — the same graph against a reversed-code reference — 1.07. Three further
+checks the stochastic half needs: a different draw moves the waveform (8.4% relative RMS, so the noise
+is load-bearing), two runs at the default seed are bit-identical, and a named seed differs from the
+default.
 
 ### Family 6, and the primitive the engine already had
 

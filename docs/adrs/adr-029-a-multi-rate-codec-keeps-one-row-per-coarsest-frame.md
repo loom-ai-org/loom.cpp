@@ -54,7 +54,13 @@ then codebook 1's ids for the sub-frames it spans in order, then codebook 2's. T
 row back into one tensor per codebook and lets the model's own `from_codes` repeat each level up to
 the finest rate.
 
-**The exported decode is deterministic**: the noise term is dropped, and the model card says so.
+**The noise is kept, as four graph INPUTS the driver draws** (Option 2). `loom.seed_rng` seeds once
+from `inputs.seed`, defaulting to a fixed 1234, and each stage's array is
+`loom.gaussian_array(multiple * n_codes)`. A caller may hand the arrays in instead, which is what
+keeps this family's oracle exact rather than distributional.
+
+*This reverses the first version of this ADR, which dropped the term. The measurement that said it
+was inaudible is below, and so is the listening test that overruled it.*
 
 Two consequences are stated explicitly because they are what a caller reads:
 
@@ -79,21 +85,20 @@ step. (Which ORDER it emits them in is the LM's business — Orpheus interleaves
 rearranging is the caller's job for the same reason the delay pattern is,
 [ADR-020](adr-020-audio-codes-is-its-own-modality.md).)
 
-**The noise is dropped on a measurement, not on an impossibility.** Option 1 is a silent wrong
-answer and Option 3 is ruled out on its own terms — a topology is a pure dataflow graph
+**Option 1 is a silent wrong answer and Option 3 is ruled out on its own terms** — a topology is a pure dataflow graph
 `GraphBuilder` builds once and reuses, so no node in it can produce fresh randomness, which is why
-`topology_ops._op_random` raises and points at the host RNG instead. **Option 2 is buildable**, and
-the honest reason it is not built is that the term it restores is smaller than the model's own
-variance: dropping it moves the waveform **2.4% in relative RMS**, where two decodes of the same codes
-under different seeds differ by **3.1%**. The deterministic decode sits inside the reference model's
-own sample-to-sample spread, nearer the centre of it than any sample is — and the ASR oracle reads
-22/22 either way.
+`topology_ops._op_random` raises and points at the host RNG instead. **So the choice was Option 2
+against Option 4, and it was decided by ear after the numbers said the wrong thing.**
 
-What Option 2 would cost, for that: a driver component this family does not have, four declared axes,
-~1.6 noise draws per output sample marshalled across the Lua boundary, and a **stochastic codec** —
-which every gate that compares two runs, or two backends, then has to seed before it can compare
-anything at all. That is a fair price for an audible difference and a bad one for an
-inaudible one, so the measurement decides it — and it has now been made at the level that can, since
+Every number said drop it. Removing the term moves the waveform **2.4% in relative RMS**, where two
+decodes of the same codes under different seeds differ by **3.1%** — the deterministic decode sits
+inside the reference model's own sample-to-sample spread, nearer the centre of it than any sample is.
+The ASR oracle reads 22/22 either way. And Option 2 costs a driver component this family did not
+have, four declared axes, ~1.6 noise draws per output sample across the Lua boundary, and a
+**stochastic codec**, which every gate that compares two runs or two backends then has to seed first.
+
+That is a fair price for an audible difference and a bad one for an inaudible one, so the measurement
+decided it — and it has now been made at the level that can, since
 what the noise plausibly buys is breath on unvoiced sound, which neither relative RMS nor a word-level
 transcript can see.
 
@@ -109,15 +114,24 @@ threshold-picked.
 | **noisy − mean**, speech, tonal frames (dB) | −0.00 | 0.08 | 0.07 | 0.09 | −0.27 | 0.15 | **1.75** |
 | source band level, dB re: the clip's own full-band energy | +10.4 | −2.1 | −10.3 | −16.1 | −19.4 | −22.1 | **−21.5** |
 
-**Every band where the two arms differ by more than 0.2 dB is more than 20 dB down.** The one real
-gap is the top octave on voiced frames — 1.75 dB at 10–12 kHz, which is breath, exactly where the
-noise was predicted to matter — in a band carrying under 1% of the clip's energy. Music is the same
-shape and smaller in what matters: ≤0.5 dB below 8 kHz, and its 10–12 kHz band is 37 dB down.
+Every band where the two arms differ by more than 0.2 dB is more than 20 dB down. The one real gap is
+the top octave on voiced frames — 1.75 dB at 10–12 kHz, which is breath, exactly where the noise was
+predicted to matter — in a band carrying under 1% of the clip's energy. For scale, the two arms'
+pointwise log-spectral distance to the source is 9.98 dB (mean) against 9.81 dB (noisy, five-seed
+spread 0.01 dB), so the term is worth about 1.7% of the gap the codec itself leaves.
 
-For scale, the two arms' pointwise log-spectral distance to the source is 9.98 dB (mean) against 9.81
-dB (noisy, five-seed spread 0.01 dB) on speech — so the noise is worth about **1.7% of the gap the
-codec itself leaves**, and on music it is 0.12 dB the other way. The term is real and it is not the
-thing standing between this codec and its source.
+**The listening test disagreed, and it wins.** Given the source and both decodes blind, a listener
+reported the deterministic one as *"less sharp, slightly more artificial"* — unprompted, and in the
+direction the table predicted but at a size the table dismissed. 1.75 dB in the top octave is not
+0.02 dB of broadband level; it is the presence of breath, which is a timbre cue rather than an energy
+one, and reading "21 dB down" as "inaudible" was the error. A dB table cannot rank two waveforms for
+naturalness, and this one was never asked to — it was asked whether anything was there to hear, it
+said *a little, up high*, and that turned out to be enough.
+
+**The general lesson is [Retro-043](../retros/retro-043-the-band-was-20db-down-and-audible.md).** For
+anything whose output a person listens to, a spectral measurement scopes the question and a listener
+answers it. The same finding one family over is Retro-006, where Kokoro matched PyTorch at cosine
+0.996 and shipped unintelligible.
 
 ## Consequences
 
@@ -127,10 +141,18 @@ thing standing between this codec and its source.
   `hparam_u32`/`hparam_f32` and `write_gguf` refuses a list by design; what the strides describe is
   the order of the columns within a row, which is documentation rather than a number. The model card
   carries it.
-* **The noise decision is reopenable, and Option 2 is how** — if a listener disagrees with the table
-  above, or a future leaf in this family has a noise term that is not 20 dB down. The work is
-  exporter-side and named: a `NoiseInputs` driver component drawing `loom.gaussian_array` per stage,
-  `declared_axes` for the four multiples, and a default seed so the file stays comparable run to run.
+* **`DriverInputs` gains a third host-computed binding kind**, `NOISE`, beside `POSITION` and `MASK`
+  — and unlike those two it is named by the EXPORT rather than by a set of input names, because the
+  per-input length ratio is not recoverable from a name. Any future family with a stochastic leaf gets
+  it for free.
+* **This codec is stochastic, and therefore seeded.** `inputs.seed` defaults to 1234 so two runs of
+  one file agree and a gate can compare them; a caller who wants variation passes a seed. A caller may
+  also pass the noise arrays themselves, which is how the oracle stays exact — both sides get the same
+  draw and the comparison is `max|Δ| 1.2e-06` rather than a distribution test.
+* The noise costs ~1.6 draws per output sample across the Lua boundary. Measured at export: no
+  material change in decode time against the deterministic build.
+* DAC's export does not move: the multiples are walked off the real decoder's own `NoiseBlock`s, a
+  codec with none declares empty, and empty emits exactly the driver it always emitted.
 * A caller cannot ask this file for a sub-coarse-frame number of frames. 11.72 Hz is the resolution of
   the contract; SNAC's own encoder pads to a multiple of `vq_strides[0]` for the same reason.
 * `CodecFamily.decode` now takes the CALLER's layout and each member adapts it — DAC's transpose moved
