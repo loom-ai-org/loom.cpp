@@ -307,6 +307,32 @@ void test_relu() {
     LOOM_CHECK((get_f32(out) == std::vector<float>{0.0f, 0.0f, 0.5f, 2.0f}));
 }
 
+void test_elu() {
+    // EnCodec's SEANet decoder activation. Checked against the definition rather than against a
+    // reference dump: `x` for x > 0, `exp(x) - 1` below, and exactly 0 at 0 -- the last of which is
+    // the one a wrong lowering (a LEAKY_RELU with a small slope, say) still gets right, which is why
+    // the negative values carry the real assertion.
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 5);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("ELU")(pc, {a}, {})[0];
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(a, {-2.0f, -0.5f, 0.0f, 0.5f, 2.0f});
+    s.compute(gf);
+
+    const auto result = get_f32(out);
+    const std::vector<float> expected = {std::expm1(-2.0f), std::expm1(-0.5f), 0.0f, 0.5f, 2.0f};
+    bool ok = result.size() == expected.size();
+    for (size_t i = 0; ok && i < expected.size(); ++i) {
+        ok = std::abs(result[i] - expected[i]) < 1e-6f;
+    }
+    LOOM_CHECK(ok);
+}
+
 void test_leaky_relu() {
     GgmlScratch s;
     ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 4);
@@ -2782,6 +2808,7 @@ int main() {
     test_sin_cos();
     test_relu();
     test_leaky_relu();
+    test_elu();
     test_step();
     test_group_norm();
     test_cumsum();
