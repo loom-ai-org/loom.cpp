@@ -33,16 +33,37 @@ jobs:
       - name: Install ccache
         run: sudo apt-get update && sudo apt-get install -y ccache
 
+      # THE ISA IS PART OF THE CACHE KEY, and leaving it out cost 53 of 81 tests with SIGILL.
+      #
+      # This project configures with `-march=native` (see the "Adding CPU backend variant ggml-cpu"
+      # line at configure time), so every object is CPU-SPECIFIC while the compiler command line stays
+      # IDENTICAL -- and ccache keys on the command line. `ubuntu-latest` is a heterogeneous fleet, so
+      # a full cache hit across a runner change serves objects built for a wider ISA to a narrower
+      # machine, and everything touching ggml compute dies with `Illegal instruction`.
+      #
+      # It is invisible until it happens, because a cache MISS hides it: on 2026-09-10 the ARMv6 merge
+      # changed CMakeLists.txt, the exact key missed, most objects were rebuilt on the runner that
+      # then SAVED the cache -- green -- and the next three main runs restored that same cache onto
+      # different CPUs and failed identically, on two commits that changed nothing but documentation.
+      #
+      # `gcc -march=native -Q --help=target` is the compiler's own resolved view of the machine, which
+      # is exactly the thing `-march=native` varies by, and it moves with the compiler version too.
+      # Note it is in the restore-keys as well: a fallback that dropped it would reintroduce the bug
+      # on the very path the exact key was added to protect.
+      - name: Fingerprint the runner's ISA
+        id: isa
+        run: echo "id=$(gcc -march=native -Q --help=target | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       # ggml/nlohmann_json are fetched fresh via CMake FetchContent (see cmake/Dependencies.cmake) on
       # every configure; only compiled-object reuse is cached here, not the fetched sources themselves.
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ steps.isa.outputs.id }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-
-            ccache-${{ runner.os }}-
+            ccache-${{ runner.os }}-${{ steps.isa.outputs.id }}-${{ hashFiles('CMakeLists.txt', 'cmake/Dependencies.cmake') }}-
+            ccache-${{ runner.os }}-${{ steps.isa.outputs.id }}-
 
       - name: Configure
         run: cmake -B build
