@@ -19,7 +19,6 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **SNAC's Hub upload** | Exported, verified against the package's own decode with the noise held equal (max \|Δ\| 1.20e-06) and card-gated in the staging tree at `hf-models/snac-24khz`. The upload is the one step left → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 family 11 — EnCodec, the remaining codec leaf** | The multi-rate question is answered ([ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md)); EnCodec's two blockers are unchanged and neither is started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
@@ -29,9 +28,14 @@ and Pi 1, VITS from 57x to 18.9x real time), **family 12's SentencePiece reading
 fairseq checkpoint's ids are not its protobuf's piece order — plus a `tokenizer.json`-only path and a
 correctness fix, since `framing_ids` had been returning a SentencePiece encode's trailing `</s>`
 *labelled*), and **family 6, `flan-t5-small`** — the first text encoder-decoder and first Unigram LM
-in the zoo. The org now lists **twenty-two** models, every one re-exported and card-gated against this
+in the zoo. The org now lists **twenty-three** models, every one re-exported and card-gated against this
 tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`. What remains is four packages to PyPI:
 `loom-py-rt` and the `-cuda`/`-vulkan`/`-metal` accelerators.
+
+**SNAC-24kHz was published 2026-09-12** (`loom-ai-org/snac-24khz-loom`, family 11's second leaf) off
+`feat/p5-family-11-snac`, which is pushed in all three repos and not yet merged. It is the zoo's
+first stochastic graph: the driver draws its noise, seeded, through the host RNG — see
+[ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md).
 
 ---
 

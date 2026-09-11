@@ -13,9 +13,8 @@ The measure of the data-driven design is how cheaply a new architecture arrives.
 models ship, which family template each belongs to, and the roadmap for the rest — with the standing
 acceptance criterion that **a new family should need no engine work**.
 
-Twenty-two models are published at
-[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), and SNAC-24kHz is exported, verified
-and staged as the twenty-third. Each is a single GGUF carrying its own topologies, driver and — where
+Twenty-three models are published at
+[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). Each is a single GGUF carrying its own topologies, driver and — where
 the architecture has one — its vocabulary.
 
 ## 2. Architectural Overview
