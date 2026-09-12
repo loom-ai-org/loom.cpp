@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-10
+last_updated: 2026-09-12
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,9 +19,8 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Eight staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape`; `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
+| **Eight staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape` plus the retrace's own two, `run_bi_recurrent_and_retain` + `expand_by_duration_and_retain` ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)); `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
 | **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION, and on rc10** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`); it also needs the ELU primitive, so it ships with the engine like the eight above. `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **The two driver edges that are still host-side** | A BiLSTM's directions are interleaved per row, and Kokoro's/StyleTTS2's duration encoders concatenate the style vector into every row between stages -- so those values are genuinely host-side under the current topology split. Moving them into the engine is a re-trace per phase, not a driver fix, and is the last item [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md) leaves open |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
 ***Branch state: everything below is on `feat/p5-family-11-snac`, pushed in all three repos, no PRs

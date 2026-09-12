@@ -62,6 +62,19 @@ public:
     // ("never run"); `check_generation` rejects a read against any other value than the current one,
     // which is what turns "a second run on this module silently returned newer data" into an error.
     uint64_t generation() const { return generation_; }
+    // Raised whenever `reshape` actually REALLOCATES -- whenever the tensors this store hands out are
+    // different objects from the ones it handed out before.
+    //
+    // **A cached graph ends in a `cpy` into those tensors, and only this can tell it they are still
+    // there.** `GraphBuilder` serves a retained graph back whenever the axes repeat, but a store is no
+    // longer reshaped only by builds: `loom.expand_by_duration_and_retain` and the recurrent bindings
+    // write sequences into one, with a geometry no build produced. Comparing the SLOT POINTERS cannot
+    // detect that, and the failure is not theoretical -- a freed store's context and buffer are handed
+    // straight back by the allocator, so the replacement slot lands at the old address and the
+    // comparison says "unmoved" while the cached copy writes into a buffer that has been freed and
+    // re-used. That is what corrupted the heap on Kokoro's SECOND synthesis in a process, and what a
+    // counter cannot be fooled by.
+    uint64_t layout_epoch() const { return layout_epoch_; }
     void bump_generation() { ++generation_; }
     // `module` only names the module in the error message; the store itself knows nothing about names.
     void check_generation(uint64_t expected, const std::string& module) const;
@@ -77,6 +90,7 @@ private:
     };
 
     ggml_backend_t backend_;
+    uint64_t layout_epoch_ = 0;
     ggml_context_ptr store_ctx_;
     ggml_backend_buffer_ptr store_buf_;
     std::vector<ggml_tensor*> slots_;

@@ -255,6 +255,31 @@ private:
     static int l_run_recurrent_and_retain(lua_State* L);
     // Both of the above: the same sequence walk, differing only in where the result goes.
     static int run_recurrent_impl(lua_State* L, bool retain);
+    // `loom.run_bi_recurrent_and_retain(fwd_module, bwd_module, sequence, seq_len, input_dim,
+    // hidden_dim [, layout])`: both directions of a BiLSTM, retained as ONE `[h_fwd | h_bwd]` sequence
+    // in `fwd_module`'s store. The interleave is the reason -- two `run_recurrent_and_retain` calls
+    // already keep their sequences off the boundary, but nothing can concatenate two stores by naming
+    // them, so the driver pulled both halves back into Lua to build the rows every consumer wants.
+    // `layout` picks which axis time runs down; see the definition.
+    static int l_run_bi_recurrent_and_retain(lua_State* L);
+    // Where one recurrent sweep reads its sequence from -- a marshalled array or another module's
+    // retained output -- resolved once per call. Defined in the .cpp; nothing outside it needs the
+    // shape.
+    struct SequenceSource;
+    static SequenceSource read_sequence_source(LoomLuaBridge* self, lua_State* L, int arg,
+                                                uint32_t seq_len, uint32_t input_dim, const char* fname);
+    // One direction's walk of a per-timestep cell topology, with the h/c carry on this side and
+    // `emit(t, h)` per timestep. What the sink does with `h` is the only difference between the three
+    // recurrent bindings.
+    static void cell_sweep(LoomLuaBridge* self, const std::string& module_name,
+                            const SequenceSource& src, uint32_t seq_len, uint32_t input_dim,
+                            uint32_t hidden_dim, bool reverse, const char* fname,
+                            const std::function<void(uint32_t, const std::vector<float>&)>& emit);
+    // `mod`'s store, holding exactly one `[ne0, ne1]` f32 slot and returning it. Shaped from a
+    // no-alloc template because `reshape` reads only type and `ne` -- a retained SEQUENCE is not any
+    // single build's output, so nothing else declares its geometry.
+    static ggml_tensor* reshape_store_2d(Module& mod, int64_t ne0, int64_t ne1,
+                                          ggml_context_ptr& template_ctx, OutputStore*& store);
     static int l_range(lua_State* L);
     static int l_causal_mask(lua_State* L);
     static int l_zero_mask(lua_State* L);
@@ -293,6 +318,11 @@ private:
     // output shape. VITS/Matcha/Kokoro all call it for duration expansion, and it would serve any
     // family with a length predictor unchanged.
     static int l_expand_by_duration(lua_State* L);
+    // `loom.expand_by_duration_and_retain(module, durations [, layout [, index]])`: the same
+    // repeat-rows-by-count, applied to a module's RETAINED output and left in its store, so the
+    // sequence being repeated never becomes a Lua table. MEETS the criterion for the same reasons the
+    // marshalling form does -- it reads no config, and the output length is sum(durations).
+    static int l_expand_by_duration_and_retain(lua_State* L);
     // `loom.pad_crop_relative_embeddings(raw, window_size, k_channels, length)`: symmetrically pads or
     // crops a relative-position table about its centre to cover `length`. MEETS the binding criterion
     // above for the same two reasons -- every parameter is a call argument, and whether this pads or
