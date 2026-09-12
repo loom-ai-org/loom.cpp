@@ -240,7 +240,10 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
   door as its oracle. Part 1 is closed — every phoneme-input TTS GGUF carries its symbol table and both
   hosts read it ([Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md)).
   **Measure both risks first:** the fold-down into each checkpoint's fixed symbol→id table, and
-  pinning the beam search's tie-break.
+  pinning the beam search's tie-break. **This is now the only thing `loom_cli` cannot do for a TTS
+  model**: it synthesises from IPA phonemes, from a grapheme vocabulary (Supertonic, from plain
+  English), and from codec codes, so what remains behind this port is exactly "type English at a
+  phoneme-input family".
   *Context: [ADR-012](../adrs/adr-012-permissive-phonemizer.md)*
 * [ ] **Generalize the grapheme front end out of C++** — when a real second grapheme TTS model exists.
   Qwen3-TTS is not one. *Context: [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md)*
