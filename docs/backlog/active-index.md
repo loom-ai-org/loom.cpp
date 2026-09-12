@@ -96,8 +96,9 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
     `repeat_interleave` only moves the failure into the merge reshape, which comes back as
     `[128, n_tokens, n_tokens, 8]` — [Retro-044]'s substitution. The export now removes the op instead
     of converting it: `materialise_gqa` duplicates `k_proj`/`v_proj` interleaved so K/V heads equal
-    query heads, +4.2 M parameters and a doubled cache. The code predictor is uncached besides, which
-    is worth keeping on its own terms.
+    query heads — **+69.2 M parameters, 277 MB at F32**, checked against the written file's own 275 MB
+    growth, and a doubled cache. The code predictor is uncached besides, which is worth keeping on its
+    own terms.
 
     (Superseded, kept for the record:)
     `qwen3_tts_export.py` traces and converts all **seven** phases and writes a 3.67 GB GGUF; the
