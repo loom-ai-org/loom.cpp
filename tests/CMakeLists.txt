@@ -195,6 +195,15 @@ add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# --- ADR-031: `loom.run_ode`, the integrator that replaced `render_sampler`'s Lua loop. Same fixture,
+#     a linear NON-autonomous f -- which is what tells midpoint and Heun apart.
+add_executable(test_lua_bridge_ode ci/test_lua_bridge_ode.cpp)
+target_link_libraries(test_lua_bridge_ode PRIVATE loom::engine)
+target_compile_definitions(test_lua_bridge_ode PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_lua_bridge_ode COMMAND test_lua_bridge_ode)
+set_tests_properties(test_lua_bridge_ode PROPERTIES LABELS ci)
+set_tests_properties(test_lua_bridge_ode PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 # --- P4.24: loom.sample_row, on the same toy fixture -- 6 classes wide, which is what makes "every
 #     class is eventually drawn" a statement a test can make.
 add_executable(test_sample_row ci/test_sample_row.cpp)
