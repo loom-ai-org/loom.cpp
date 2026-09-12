@@ -20,8 +20,7 @@ had no way to obey it.
 
 **On CPU this is nearly free, which is why it went unnoticed.** Measured on EnCodec: the marshalling
 round trip is ~0.6% of a decode, and an ABBA comparison of the two builds is inside the noise of a
-two-core box. On an accelerator it is not free at all: a Lua-table edge is a device→host→device round
-trip, and the values in question are megabytes.
+two-core box. On an accelerator it is not free — see the measurement below.
 
 ## Decision
 
@@ -44,7 +43,10 @@ Three engine additions make that expressible where it was not:
 | EnCodec | `pre`→LSTM→LSTM→`post` sequences, 7·T·1024 doubles per call | codes in, waveform out |
 | transducers (parakeet ×2, gigaam) | the whole encoder output — 1.1 MB for 11 s of audio — plus `embed`, per-layer h/c, `top_h` | one row named per frame; only the first pass's zeroed h/c cross |
 | `run_bi_lstm` (5 in Kokoro, 5 in StyleTTS2) | `layer_input`, `h_prev`, `c_prev` in and `h_new`/`c_new` out, per timestep per direction — 4T calls | two C++ sweeps per BiLSTM |
-| `run_resblk_stack` (2 per model) | each block's output rebuilt as a Lua table and written straight back — and the two conversions around it are exact inverses | blocks chain by reference; one conversion in, one out |
+| `run_resblk_stack` (2 per model) | each block's output rebuilt as a Lua table and written straight back — and the two conversions around it are exact inverses | blocks chain by reference; one conversion in |
+| StyleTTS2 `albert` | a `T×768` table, re-passed to the diffusion estimator at every sampler step | retained; both readers name it |
+| Supertonic `txt_emb` | same shape, every CFM step — and its topology is a text-length BUCKET, so the reference needed a computed name | retained; `OutputRef` gained `module_expr`/`variants` |
+| Kokoro + StyleTTS2 F0/N branch | `resblk_stack` → `proj1x1` → vocoder, through Lua at every hop | one path, no tables; two layout helpers retired |
 | Whisper, Dia, T5 | — | already retained when written |
 
 **Two classes stay host-side, and they are not oversights.** A BiLSTM's two directions are
@@ -65,5 +67,15 @@ traced graphs accept — a re-trace per phase, not a driver fix — and it is a 
 * Five models were re-exported and re-gated (parakeet-tdt, parakeet-rnnt, gigaam-v3, kokoro,
   styletts2); the whole 24-model card gate passes, including the ASR-oracle rows that are the only
   real test for the TTS pair.
-* **The accelerator benefit is argued, not measured.** The dev box has no GPU; the CPU numbers are a
-  wash. What is measured is that nothing regressed and that the crossings are gone.
+* **Measured on an RTX 5090** (GigaAM v3, the transducer whose encoder output stopped crossing; the
+  same weights with the old driver and the new one, interleaved ABBA, 8 runs each):
+
+  | clip | encoder output | old | new | |
+  |---|---|---|---|---|
+  | 11 s | 1.1 MB | 0.565 s | 0.550 s | **−2.7%** |
+  | 121 s | 12.4 MB | 1.061 s | 1.013 s | **−4.5%** |
+
+  The 121 s runs are bimodal (~1.01 and ~1.11 in both arms — the 285K's P-cluster/E-cluster split,
+  not noise), and the gap inside each cluster is the same 47–50 ms. **The saving grows with the
+  tensor**, which is the shape the rule predicts and the reason it matters more as models get bigger,
+  not less. The same comparison on that box's CPU backend was too noisy to read at all.
