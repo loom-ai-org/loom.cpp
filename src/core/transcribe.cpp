@@ -2,6 +2,7 @@
 
 #include "loom/core/audio_window.h"
 #include "loom/core/bpe_vocab.h"
+#include "loom/core/ctc_vocab.h"
 #include "loom/core/model_contract.h"
 #include "loom/core/vocab.h"
 #include "loom/loom_errors.h"
@@ -100,16 +101,18 @@ std::vector<int32_t> run_driver(LoomLuaBridge& bridge, const std::vector<double>
 
 Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
                          const std::vector<float>& waveform, const TranscribeOptions& options) {
-    // Two vocab schemas reach this path, so both are tried: NeMo's checkpoints carry SentencePiece
-    // ("llama"/"t5" -> loom::Vocab) and Whisper's carries GPT-2 byte-level BPE ("gpt2" -> BpeVocab).
+    // Three vocab schemas reach this path, so all three are tried: NeMo's checkpoints carry
+    // SentencePiece ("llama"/"t5" -> loom::Vocab), Whisper's carries GPT-2 byte-level BPE
+    // ("gpt2" -> BpeVocab), and family 4's carry the CTC character table ("ctc" -> CtcVocab).
     // Only the BPE one can resolve a token by TEXT, which is what timestamps need.
     //
-    // **BPE first, and the order is load-bearing**: `BpeVocab::load` returns nullptr for a schema that
-    // is not its own, while `Vocab::load` THROWS on one -- so asking the SentencePiece loader about a
-    // gpt2 file kills the run before the BPE loader is ever reached.
+    // **`Vocab::load` LAST, and the order is load-bearing**: the other two return nullptr for a schema
+    // that is not their own, while `Vocab::load` THROWS on one -- so asking the SentencePiece loader
+    // about a gpt2 or ctc file kills the run before the right loader is ever reached.
     auto bpe_vocab = BpeVocab::load(model);
-    auto spm_vocab = bpe_vocab ? nullptr : Vocab::load(model);
-    if (!spm_vocab && !bpe_vocab) {
+    auto ctc_vocab = bpe_vocab ? nullptr : CtcVocab::load(model);
+    auto spm_vocab = (bpe_vocab || ctc_vocab) ? nullptr : Vocab::load(model);
+    if (!spm_vocab && !bpe_vocab && !ctc_vocab) {
         throw LoadError("transcribe: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
     }
     if (!model.has_kv("model.driver_script")) {
@@ -144,6 +147,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
                 text_ids.push_back(id);
             }
         }
+        if (ctc_vocab) return ctc_vocab->decode(text_ids);
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
 

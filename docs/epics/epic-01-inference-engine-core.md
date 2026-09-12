@@ -103,9 +103,13 @@ These are deliberate boundaries, not defects. Each names what would have to chan
   recursive).
 - **`GgufModel::hparam_env()` only surfaces numeric scalar KV types** into the `SymbolEnv`; string, bool,
   and array-typed `loom.*` KVs are silently skipped.
-- **No chunked/windowed inference for long Conformer-CTC audio** — cost grows O(n²) with length (relative
-  position attention over the whole clip at once), per an explicit prior choice to defer this. Would need
-  window size/overlap selection and stitching per-window CTC token sequences at the boundaries.
+- **No chunked/windowed inference for long CTC audio** — cost grows O(n²) with length (attention over the
+  whole clip at once), per an explicit prior choice to defer this. Would need window size/overlap
+  selection and stitching per-window CTC token sequences at the boundaries. It covers two families now,
+  not one: family 1's Conformer-CTC, and family 4's wav2vec 2.0 / HuBERT / data2vec, which
+  `transcribe` feeds in a single call for the same reason (`loom.clip_samples` is 0, so there is no
+  window to seek). Family 4's export declares a 30-second `RangeDim` at trace time and nothing enforces
+  it at run time; a longer clip does not fail, it costs quadratically.
 - **Only the small (16-layer, `d_model=176`) Conformer-CTC checkpoint has been verified.** Larger variants
   should work unmodified (topology is generated entirely from `model_config.yaml`) but this is unexercised.
 - **Remaining BPE pretokenizer families** beyond the ~40 already in `bpe_vocab.cpp`'s `pre_spec_table()`
