@@ -82,7 +82,32 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
     refusal (EnCodec's — and it DISSOLVES here, the pad is provably zero at stride 1), Dia's
     `rotate_half`, and transformers' `create_causal_mask` `vmap` path. The one genuinely new failure
     is [Retro-047](../retros/retro-047-an-inferred-dimension-outlives-the-reshape.md).
-  * **`qwen3-tts-12hz-0.6b` (family 10) — NOT STARTED.** 914 M parameters. A 28-layer Qwen3-shaped
+  * **`qwen3-tts-12hz-0.6b` (family 10) — EXPORTS, DOES NOT YET RUN. One blocker, well-characterised.**
+    `qwen3_tts_export.py` traces and converts all **seven** phases and writes a 3.67 GB GGUF; the
+    decomposition is verified against the reference **bit-identically in PyTorch** (all 42 frames ×
+    16 codes, driven through the export's own wrappers) before anything was traced. What fails is
+    `_kv_cache_geometry`: the talker's 28 fused ATTENTION blocks report **16** K/V heads and the code
+    predictor's 5 report **8**, and one KvCache has one per-layer width. The talker's `repeat_kv`
+    survives into the topology where the predictor's is absorbed, and the two phases are otherwise
+    the same GQA 16/8 geometry. **Ruled out:** the mrope patch (the talker's rotary now returns rank
+    3, identical in form to the predictor's), the talker's trace length colliding with its 8 K/V
+    heads, and the predictor's colliding with its `n_rep` of 2. The error now prints the census
+    (`{(16,128,128): 28, (8,128,128): 5}`), which is what makes it legible as a per-phase split.
+    **The cheapest way out is probably to stop caching the code predictor at all**: it never sees
+    more than 16 positions, so re-running its prefix costs 136 token-forwards of a 5-layer model per
+    frame, and with one cached phase the geometry question disappears. That means folding
+    `predictor_prompt` and `predictor_step` into two uncached phases that rebuild the prefix in-graph
+    from ids, so the driver still passes only integers.
+
+    **No model card yet, deliberately**: a card here is gate-tested against a real GGUF
+    (`LOOM_MODEL_CARDS=... pytest tests/gate/test_model_cards.py`), and writing one for a file that
+    does not run would be asserting a verification that has not happened.
+
+    **The engine gained what this model needs and nothing else does yet**: `loom.sample_row` now takes
+    `repetition_penalty` + `penalized`. That is not a sampling nicety — `transformers` applies the
+    penalty as a PROCESSOR rather than a warper, so it moves a greedy argmax too, and a greedy decode
+    without it never emits EOS: 200 frames against the reference's 42. With it, the decomposition
+    reproduces the reference exactly. 914 M parameters. A 28-layer Qwen3-shaped
     talker (hidden 1024, GQA 16/8, head_dim 128) emitting codebook 0, plus a 5-layer **code
     predictor** that emits the other 15 from the talker's hidden state — so one audio frame is 16
     transformer forwards, not one, with the predictor's KV cache reset per frame. Its input embedding

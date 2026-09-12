@@ -394,7 +394,13 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname, std::mt19937& rng,
                            std::uniform_real_distribution<float>& uniform, float temperature,
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
-                           ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k) {
+                           ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
+                           float repetition_penalty, const std::vector<int64_t>& penalized) {
+    if (!(repetition_penalty > 0.0f)) {
+        throw Error(std::string(fname) + ": repetition_penalty is " +
+                     std::to_string(repetition_penalty) + "; it is a positive divisor and 1 means "
+                     "'do not penalise'");
+    }
     if (guidance_top_k < 0) {
         throw Error(std::string(fname) + ": guidance top_k is " + std::to_string(guidance_top_k) +
                      "; it is a count of candidates, and 0 means 'do not shortlist'");
@@ -490,6 +496,33 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
             throw Error(std::string(fname) + ": the guidance shortlist and the id window [" +
                          std::to_string(lo) + ", " + std::to_string(hi) + ") have no id in common, so "
                          "there is nothing to draw from");
+        }
+    }
+
+    // **The repetition penalty, and it is applied BEFORE the greedy branch on purpose.**
+    //
+    // `RepetitionPenaltyLogitsProcessor` is a PROCESSOR, not a warper: `transformers` runs it whether
+    // or not a sample is drawn, so it changes a greedy argmax too. That is not a subtlety -- it is
+    // what this option was added for. Qwen3-TTS's talker declares `repetition_penalty: 1.05`, and a
+    // greedy decode WITHOUT it does not merely drift: it never emits EOS and runs to the token cap,
+    // 200 frames where the reference stops at 42. With it, the same loop reproduces the reference's
+    // 672 codes exactly.
+    //
+    // The arithmetic is `transformers`' own, and the sign branch is the whole of it: a positive score
+    // is DIVIDED by the penalty and a negative one MULTIPLIED, so that either way the id moves toward
+    // -inf. Penalising by division alone would make a negative logit larger.
+    //
+    // `penalized` holds ABSOLUTE ids, because that is what a driver has -- it appends what
+    // `sample_row` returned, and that is already absolute (`lo` is added back on the way out). Ids
+    // outside the window are skipped rather than rejected: a window is a restriction on what may be
+    // DRAWN, and a history that predates a narrowing window is not an error.
+    if (repetition_penalty != 1.0f) {
+        const auto width = static_cast<int64_t>(logits.size());
+        for (const int64_t id : penalized) {
+            const int64_t offset = id - lo;
+            if (offset < 0 || offset >= width) continue;
+            float& score = logits[static_cast<size_t>(offset)];
+            score = score > 0.0f ? score / repetition_penalty : score * repetition_penalty;
         }
     }
 
@@ -1530,9 +1563,17 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
 // than reproducing it.
 //
 // **A table rather than positional arguments** because the knobs are a set that grows, and it has now
-// grown twice: min-p and the repetition penalties are still not implemented (nothing in the fixture
-// set asks for them), while `lo`/`hi` and `guidance` were added for family 10. Adding one must not
-// renumber what a shipped GGUF's driver already passes, which is the whole reason for the table.
+// grown three times: `lo`/`hi` and `guidance` for family 10, and `repetition_penalty`/`penalized` for
+// Qwen3-TTS. Adding one must not renumber what a shipped GGUF's driver already passes, which is the
+// whole reason for the table. (min-p and the FREQUENCY/presence penalties are still not implemented;
+// nothing in the fixture set asks for them.)
+//
+// **`repetition_penalty = p` with `penalized = {id, ...}` divides a positive logit by `p` and
+// multiplies a negative one by it**, for each id the driver has already emitted -- `transformers`'
+// `RepetitionPenaltyLogitsProcessor`. It is applied BEFORE the greedy branch, because that processor
+// is not a warper: it runs whether or not a sample is drawn, so it moves an argmax too. Qwen3-TTS's
+// talker is why it exists and is also the proof that this is not cosmetic -- greedy without it never
+// emits EOS and runs to the token cap.
 //
 // **`lo`/`hi` here rather than a `sample_row_range` binding**, which is where this deliberately
 // departs from `argmax_row`/`argmax_row_range`. That pair is two bindings for a stated MECHANICAL
@@ -1575,6 +1616,8 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         bool check_generation = false;
         uint64_t generation = 0;
         std::string uncond_module;
+        float repetition_penalty = 1.0f;
+        std::vector<int64_t> penalized;
         float guidance_scale = 1.0f;
         int64_t guidance_top_k = 0;
         bool check_uncond_generation = false;
@@ -1598,6 +1641,26 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
             lua_getfield(L, 3, "generation");
             check_generation = !lua_isnil(L, -1);
             if (check_generation) generation = static_cast<uint64_t>(std::llround(luaL_checknumber(L, -1)));
+            lua_pop(L, 1);
+
+            // `repetition_penalty` + `penalized`, the ids it applies to. Two entries rather than one
+            // because they are two facts with two owners: the penalty is the CHECKPOINT's (read out
+            // of `generation_config.json` by the export) and the history is the DRIVER's own loop.
+            // A penalty with no history is the identity, which is what every driver that passes
+            // neither already gets.
+            repetition_penalty = static_cast<float>(number_field(3, "repetition_penalty", 1.0));
+            lua_getfield(L, 3, "penalized");
+            if (!lua_isnil(L, -1)) {
+                luaL_checktype(L, -1, LUA_TTABLE);
+                const int ids_idx = lua_gettop(L);
+                const auto count = static_cast<int64_t>(lua_objlen(L, ids_idx));
+                penalized.reserve(static_cast<size_t>(count));
+                for (int64_t i = 1; i <= count; ++i) {
+                    lua_rawgeti(L, ids_idx, static_cast<int>(i));
+                    penalized.push_back(static_cast<int64_t>(std::llround(luaL_checknumber(L, -1))));
+                    lua_pop(L, 1);
+                }
+            }
             lua_pop(L, 1);
 
             lua_getfield(L, 3, "guidance");
@@ -1639,7 +1702,8 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         }
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
-            temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k)));
+            temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k,
+            repetition_penalty, penalized)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());
