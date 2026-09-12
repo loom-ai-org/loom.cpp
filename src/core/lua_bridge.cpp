@@ -1002,6 +1002,33 @@ int LoomLuaBridge::run_recurrent_impl(lua_State* L, bool retain) {
     }
 }
 
+// `loom.output_shape(module, index)` -> the four `ne` of a retained output, and nothing else.
+//
+// `loom.get_output` already returns `(data, shape)`, but reading the shape through it marshals the
+// DATA -- which is the whole thing a retained output exists to avoid. A driver that needs only the
+// length of something it is about to consume by reference had no way to ask: a transducer's decode
+// loop runs over the encoder's frames, and before this the only way to learn how many there are was to
+// pull the entire encoder output into a Lua table.
+int LoomLuaBridge::l_output_shape(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const int64_t index1 = lua_isnoneornil(L, 2) ? 1 : static_cast<int64_t>(luaL_checknumber(L, 2));
+        if (index1 < 1) {
+            return luaL_error(L, "loom.output_shape: index %d -- it is 1-based, like the declared-output "
+                                  "list it indexes", static_cast<int>(index1));
+        }
+        OutputStore& store = retained_store(self, module_name);
+        ggml_tensor* out = store.get(static_cast<size_t>(index1 - 1));
+        const std::vector<double> shape = {static_cast<double>(out->ne[0]), static_cast<double>(out->ne[1]),
+                                            static_cast<double>(out->ne[2]), static_cast<double>(out->ne[3])};
+        push_number_array(L, shape);
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.output_shape: %s", e.what());
+    }
+}
+
 int LoomLuaBridge::l_run_recurrent(lua_State* L) {
     return run_recurrent_impl(L, /*retain=*/false);
 }
@@ -1484,6 +1511,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
     } bindings[] = {
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"run_recurrent_and_retain", &LoomLuaBridge::l_run_recurrent_and_retain},
+        {"output_shape", &LoomLuaBridge::l_output_shape},
         {"range", &LoomLuaBridge::l_range},
         {"run_subgraph_and_retain", &LoomLuaBridge::l_run_subgraph_and_retain},
         {"get_output", &LoomLuaBridge::l_get_output},
