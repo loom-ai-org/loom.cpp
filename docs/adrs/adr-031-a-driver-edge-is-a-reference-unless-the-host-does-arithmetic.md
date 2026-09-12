@@ -35,6 +35,9 @@ Three engine additions make that expressible where it was not:
   prefix. A transducer's joint consumes one encoder frame per call.
 * **`loom.output_shape(module, index)`** — a retained output's shape without its data, so a loop can
   be driven by a tensor it never reads.
+* **`loom.run_ode` / `loom.run_ode_and_retain`** — `dx/dt = f(x, t)` integrated with the loop, the
+  state and the update on this side, and a choice of method (euler, midpoint, heun, rk4). A sampler's
+  state is the model's whole spectrogram and its only reader is the next graph.
 
 ## What the Audit Found
 
@@ -47,14 +50,28 @@ Three engine additions make that expressible where it was not:
 | StyleTTS2 `albert` | a `T×768` table, re-passed to the diffusion estimator at every sampler step | retained; both readers name it |
 | Supertonic `txt_emb` | same shape, every CFM step — and its topology is a text-length BUCKET, so the reference needed a computed name | retained; `OutputRef` gained `module_expr`/`variants` |
 | Kokoro + StyleTTS2 F0/N branch | `resblk_stack` → `proj1x1` → vocoder, through Lua at every hop | one path, no tables; two layout helpers retired |
+| Matcha + Supertonic CFM samplers | the whole state out and the velocity back, **per step** | one `run_ode_and_retain` call; the state never becomes a table |
+| Matcha `denormalize` | `z * std + mean` host-side, which forced the state across anyway | folded into `VocoderWrapper` — a graph change, and the reason that model's last mel-sized crossing is gone |
 | Whisper, Dia, T5 | — | already retained when written |
 
-**Two classes stay host-side, and they are not oversights.** A BiLSTM's two directions are
-*interleaved* per row by the driver, and Kokoro's and StyleTTS2's duration encoders *concatenate the
-style vector into every row* between stages. Those are arithmetic, so the values are genuinely
-host-side under the current topology split. Moving them into the engine means changing what the
-traced graphs accept — a re-trace per phase, not a driver fix — and it is a real option, priced in
-[Epic-03](../epics/epic-03-model-coverage.md) rather than taken here.
+**What stays host-side stays for a reason, and the reasons differ.**
+
+* A BiLSTM's two directions are *interleaved per row* by the driver, and Kokoro's and StyleTTS2's
+  duration encoders *concatenate the style vector into every row* between stages. Those are
+  arithmetic, so the values are genuinely host-side under the current topology split. Moving them
+  means changing what the traced graphs accept — a re-trace per phase, not a driver fix.
+* **StyleTTS2's ADPM2 sampler is midpoint-shaped and still stays in Lua.** Two denoiser calls around
+  a midpoint in sigma space — but it is an ancestral SDE sampler, not an ODE integrator: its step
+  ends at `sigma_down` rather than at the next schedule point, and it adds `noise * sigma_up`.
+  Bending `run_ode` around that would make its contract mushy for no gain, because the state there is
+  the STYLE vector — `2 * 128` floats per step, ~2.5k doubles per utterance, against the megabytes a
+  CFM state moves.
+* A duration predictor's output, and every returned waveform. Those are the rule, not exceptions to
+  it: the host really does read them.
+
+**22 plain `run_subgraph` calls remain across 24 models, and every one is in that list.** The audit is
+finished in the sense that matters — what is left is not a crossing anyone can remove without moving
+arithmetic into a graph.
 
 ## Consequences
 
