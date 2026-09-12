@@ -63,6 +63,31 @@ function infer(inputs)
     end
     return result
 end
+
+-- The same two sweeps and the same interleave, done by ONE call with nothing crossing the boundary:
+-- `loom.run_bi_recurrent_and_retain` runs both directions and leaves `[h_fwd | h_bwd]` in the forward
+-- module's store. Read back here only because a test has to look at it -- the drivers that use this
+-- hand the module name to the next graph (ADR-031's last open edge).
+function infer_bi(inputs)
+    loom.run_bi_recurrent_and_retain('fwd', 'bwd', inputs.sequence, inputs.seq_len, inputs.input_dim,
+                                      inputs.hidden_dim)
+    local data = loom.get_output('fwd', 1)
+    return data
+end
+
+-- The other layout: the same values with time on the FASTEST axis, which is what this project's
+-- conv-family topologies declare. Transposed back here so the same PyTorch reference judges both.
+function infer_bi_layout_a(inputs)
+    loom.run_bi_recurrent_and_retain('fwd', 'bwd', inputs.sequence, inputs.seq_len, inputs.input_dim,
+                                      inputs.hidden_dim, 'layout_a')
+    local data, shape = loom.get_output('fwd', 1)
+    local T, width = shape[1], shape[2]
+    local rows = {}
+    for t = 0, T - 1 do
+        for c = 0, width - 1 do rows[t * width + c + 1] = data[c * T + t + 1] end
+    end
+    return rows
+end
 )lua";
 
 } // namespace
@@ -120,6 +145,28 @@ int main() {
     std::fprintf(stderr, "loom.run_recurrent vs real torch.nn.LSTM(bidirectional=True): max diff %.8f over %zu values\n",
                  max_diff, got.size());
     LOOM_CHECK(max_diff < 1e-3);
+
+    // `loom.run_bi_recurrent_and_retain` against the same PyTorch reference, in both layouts. The
+    // reference IS the interleaved sequence -- torch.nn.LSTM(bidirectional=True) returns
+    // `[h_fwd | h_bwd]` per timestep -- so this is the same claim the Lua interleave above makes,
+    // asserted of the binding that replaced it. A bit-exact match with `got` would be a weaker check
+    // (both would have to be wrong the same way), which is why the oracle stays PyTorch's.
+    for (const char* fn : {"infer_bi", "infer_bi_layout_a"}) {
+        loom::LoomLuaBridge::Value bi = bridge.call(fn, {
+            {"sequence", sequence},
+            {"seq_len", static_cast<double>(seq_len)},
+            {"input_dim", static_cast<double>(input_dim)},
+            {"hidden_dim", static_cast<double>(hidden_dim)},
+        });
+        const auto bi_got = std::get<std::vector<double>>(bi);
+        LOOM_CHECK(bi_got.size() == reference.size());
+        double bi_max = 0.0;
+        for (size_t i = 0; i < bi_got.size(); ++i) {
+            bi_max = std::max(bi_max, std::fabs(bi_got[i] - reference[i]));
+        }
+        std::fprintf(stderr, "%s vs the same reference: max diff %.8f\n", fn, bi_max);
+        LOOM_CHECK(bi_max < 1e-3);
+    }
 
     LOOM_TEST_REPORT_AND_RETURN();
 }

@@ -60,6 +60,9 @@ Three engine additions make that expressible where it was not:
   duration encoders *concatenate the style vector into every row* between stages. Those are
   arithmetic, so the values are genuinely host-side under the current topology split. Moving them
   means changing what the traced graphs accept — a re-trace per phase, not a driver fix.
+  **Superseded by [ADR-032](adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md), and
+  half of this was wrong**: the concatenation did need the re-trace and got one, but the interleave
+  was never arithmetic — it is a layout, and one binding that owns both sweeps writes it directly.
 * **StyleTTS2's ADPM2 sampler is midpoint-shaped and still stays in Lua.** Two denoiser calls around
   a midpoint in sigma space — but it is an ancestral SDE sampler, not an ODE integrator: its step
   ends at `sigma_down` rather than at the next schedule point, and it adds `noise * sigma_up`.

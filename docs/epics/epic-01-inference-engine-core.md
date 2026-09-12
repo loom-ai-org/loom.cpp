@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-09-03
+last_updated: 2026-09-12
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -43,9 +43,21 @@ script** as embedded Lua, alongside the weights those describe. The engine parse
 * **Orchestration is Lua** ([ADR-002](../adrs/adr-002-embedded-lua-drivers.md)); every model reaches
   inference through `infer`.
 
-**A gotcha worth knowing before changing anything here:** graph reuse and length-dependent constants
-interact. A constant folded into a retained graph at one length is wrong at another, and the failure is
-silent. Anything derived from an axis must be an input, not a baked constant.
+* **Retained outputs are the inter-module edge.** A module owns an `OutputStore`, and a driver hands
+  the next graph `{from = 'module'}` rather than a Lua table, so an intermediate is copied
+  backend-to-backend and never becomes host doubles
+  ([ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md)). Three
+  bindings write a store WITHOUT a build — `run_recurrent_and_retain`, `run_bi_recurrent_and_retain`
+  and `expand_by_duration_and_retain`, which put a recurrence's sequence and a frame expansion there
+  ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)).
+
+**Two gotchas worth knowing before changing anything here.** Graph reuse and length-dependent constants
+interact: a constant folded into a retained graph at one length is wrong at another, and the failure is
+silent — anything derived from an axis must be an input, not a baked constant. And a retained graph
+ends in a `cpy` into the store's own tensors, so **a store reshaped by one of those non-build bindings
+invalidates the cached graph**; `GraphBuilder` keys its cache on the store's `layout_epoch()` for
+exactly that, and on a counter rather than the slot addresses because a freed store's address is handed
+straight back ([Retro-045](../retros/retro-045-the-allocator-handed-the-same-address-back.md)).
 
 ## 3. Related Decisions and Artifacts
 
@@ -55,7 +67,7 @@ silent. Anything derived from an axis must be an input, not a baked constant.
 | KV cache | [`docs/KV-CACHE.md`](../KV-CACHE.md), [ADR-016](../adrs/adr-016-kv-cache-shape.md) |
 | Foundational | [ADR-001](../adrs/adr-001-data-driven-gguf-topologies.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) |
 | Verification | [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md) |
-| Retros | [Retro-001](../retros/retro-001-layout-healing-heuristics.md), [Retro-003](../retros/retro-003-tdt-decoder-recomputed-its-prediction-network.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
+| Retros | [Retro-001](../retros/retro-001-layout-healing-heuristics.md), [Retro-003](../retros/retro-003-tdt-decoder-recomputed-its-prediction-network.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-045](../retros/retro-045-the-allocator-handed-the-same-address-back.md) |
 | Active tasks | [correctness](../backlog/active-index.md#engine--correctness) · [performance](../backlog/active-index.md#engine--performance) |
 
 ## 4. Standing Scope Limitations

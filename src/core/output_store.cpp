@@ -54,6 +54,9 @@ const std::vector<ggml_tensor*>& OutputStore::reshape(const std::vector<ggml_ten
     }
     store_buf_.reset(buf);
     geometry_ = std::move(wanted);
+    // Every slot this store hands out from here on is a different object from the ones before it, even
+    // where the allocator has handed the same address back. See `layout_epoch()`.
+    ++layout_epoch_;
     return slots_;
 }
 

@@ -109,14 +109,23 @@ std::string canonical_dim(const std::string& d) {
     return (!d.empty() && d[0] == '$') ? d.substr(1) : d;
 }
 
-// A shared NAME is not always a transfer. Two MIL phases deliberately redefined the interface their
-// same-named bespoke topology had, and the driver was rewritten to match: StyleTTS2's "albert" drops
-// the host-supplied `positions`/`attn_mask` (the traced CustomAlbert derives both in-graph) and its
-// "diffusion" drops `attn_mask` for the same reason -- both recorded in styletts2_driver/'s own header.
-// Those are not drop-in replacements, so comparing them is meaningless. A NAMED list rather than
-// "skip any declared-input difference", because every other mismatch is a real finding.
+// A shared NAME is not always a transfer. Five MIL phases deliberately redefined the interface their
+// same-named bespoke topology had, and the driver was rewritten to match. Those are not drop-in
+// replacements, so comparing them is meaningless. A NAMED list rather than "skip any declared-input
+// difference", because every other mismatch is a real finding.
+//
+//  * StyleTTS2's "albert" drops the host-supplied `positions`/`attn_mask` (the traced CustomAlbert
+//    derives both in-graph) and its "diffusion" drops `attn_mask` for the same reason -- both recorded
+//    in styletts2_driver/'s own header.
+//  * "bert_encoder" and "text_encoder_cnn" return rows_flat rather than Layout A, and "duration_proj"
+//    takes a whole sequence rather than one timestep (ADR-031's follow-up). All three are the same
+//    move: their consumer stopped being Lua, so the transpose that existed for a Lua rebuild is gone
+//    and the per-token loop that existed because the rows were already Lua values is one call. Same
+//    arithmetic, different interface -- and the interface is exactly what this test compares, so the
+//    honest thing is to name them rather than to loosen the comparison for everyone.
 bool interface_changed_deliberately(const std::string& name) {
-    return name == "albert" || name == "diffusion";
+    return name == "albert" || name == "diffusion" || name == "bert_encoder" ||
+           name == "text_encoder_cnn" || name == "duration_proj";
 }
 
 bool declares_same_inputs(const loom::GraphTopology& a, const loom::GraphTopology& b) {

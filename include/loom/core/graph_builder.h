@@ -286,9 +286,28 @@ private:
     // `cached_key_` is the caller's axes reduced to the ones the GRAPH's structure depends on, which is
     // no longer the same map: for a bucketed cached topology `n_past` is dropped and `n_kv` replaced by
     // its padded value, so consecutive decode steps hash to the same entry (BACKLOG.md P4.0.15).
+    //
+    // `cached_store_epoch_` is the rest of that key, and it is a CORRECTNESS check rather than a
+    // nicety: the retained graph ends in a `cpy` into each of the store's tensors, and a store can be
+    // reshaped by something other than a build -- `loom.expand_by_duration_and_retain` and the
+    // recurrent bindings all write sequences into one -- which frees the very tensors those cached
+    // copies name. Serving the graph back then writes through a freed pointer; comparing the epoch
+    // turns that into an ordinary rebuild, and an unchanged store costs one integer compare.
+    //
+    // **The epoch rather than the slot pointers, because the pointers lie.** Comparing them was the
+    // first attempt and it is worse than no check at all: `OutputStore::reshape` frees its context and
+    // buffer and immediately allocates replacements, the allocator hands the same addresses straight
+    // back, and the comparison reports "unmoved" for tensors that no longer exist. Kokoro's SECOND
+    // synthesis in one process corrupted the heap through exactly that, and read a `[640,100]`
+    // sequence out of a store its driver had just rewritten at `[640,32]`.
+    // Do the store's tensors still exist and still sit where the retained graph's copies write? See
+    // `cached_store_epoch_`.
+    bool store_slots_unmoved(const OutputStore* out_store) const;
+
     BuildResult cached_;
     DynamicAxes cached_key_;
     const OutputStore* cached_store_ = nullptr;
+    uint64_t cached_store_epoch_ = 0;
     bool has_cached_ = false;
     uint64_t builds_ = 0;
     uint64_t reuses_ = 0;
