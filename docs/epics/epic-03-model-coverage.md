@@ -182,7 +182,7 @@ topology rule (guarding `alpha != 1`, which ggml's is fixed at) and one line in 
 
 **The contract is unchanged and the export shape is not**, which is
 [ADR-030](../adrs/adr-030-a-task-is-a-contract-not-an-export-shape.md): the task fixes
-`audio_codes -> audio`, and whether that is one traced graph or three phases and a host-side loop is
+`audio_codes -> audio`, and whether that is one traced graph or three phases around a C++ loop is
 the family's own business. `audio-codec` now declares the root base class for the same reason
 `automatic-speech-recognition` does.
 

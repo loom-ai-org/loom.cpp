@@ -16,7 +16,7 @@ DAC and then SNAC are `Flattened` exports — codes in, waveform out, one traced
 EnCodec is the same contract and a different shape. Its decoder contains a 2-layer LSTM over the time
 axis, and a topology is a pure dataflow graph: no node in one can carry state across timesteps. So it
 is three phases — the RVQ sum and first convolution, the recurrence, the upsampling stack — with a
-host-side loop between them, which makes it a `BaseMultiPhaseModelExportConfig` and not an
+C++-side recurrence between them, which makes it a `BaseMultiPhaseModelExportConfig` and not an
 `AudioCodecExportConfig` at all.
 
 ## Decision
