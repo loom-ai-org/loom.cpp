@@ -16,7 +16,9 @@
 
 #include <ggml-backend.h>
 
+#include <cstdlib>
 #include <cstdio>
+#include <string>
 #include <mutex>
 
 namespace loom_test {
@@ -75,6 +77,29 @@ inline ggml_backend_t cpu_backend() {
         return nullptr;
     }
     return ggml_backend_dev_init(dev, nullptr);
+}
+
+// The backend a test should run on: the CPU, or whatever `$LOOM_TEST_DEVICE=gpu` finds.
+//
+// **Every test here is written against the CPU on purpose** -- a hermetic suite that needs a device is
+// not hermetic -- so this is opt-in and falls back rather than failing: a developer without a GPU runs
+// exactly what CI runs. What it exists for is the handful of bindings whose correctness is partly a
+// question about the DEVICE, because they move data in and out of tensors themselves rather than
+// letting a graph do it (`run_recurrent`, `run_ode`). Those were argued to be fine on an accelerator
+// from the shape of their `ggml_backend_tensor_get/set` calls; this is how that stops being an
+// argument. Point it at a CUDA build and the same checks run there.
+inline ggml_backend_t test_backend() {
+    ensure_backends();
+    const char* want = std::getenv("LOOM_TEST_DEVICE");
+    if (want != nullptr && std::string(want) == "gpu") {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev != nullptr) {
+            std::fprintf(stderr, "  [LOOM_TEST_DEVICE=gpu] %s\n", ggml_backend_dev_description(dev));
+            return ggml_backend_dev_init(dev, nullptr);
+        }
+        std::fprintf(stderr, "  [LOOM_TEST_DEVICE=gpu] no GPU device registered; using the CPU\n");
+    }
+    return cpu_backend();
 }
 
 } // namespace loom_test

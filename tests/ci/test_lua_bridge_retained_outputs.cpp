@@ -312,7 +312,7 @@ void check_all_zero(const std::vector<double>& diffs, size_t skip, const char* w
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(loom_test::cpu_backend());
+    ggml_backend_ptr backend(loom_test::test_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/builder_test.gguf";
