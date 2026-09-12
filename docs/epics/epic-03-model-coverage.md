@@ -31,6 +31,7 @@ the architecture has one — its vocabulary.
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
+| **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Text → codec tokens** | Dia-1.6B | `dia_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
@@ -154,10 +155,42 @@ Verified against `transformers` on the waveform, on real speech at two clip leng
 (2 s) and 2.22e-04 (5 s), cosine ~1.0. Sabotage arm — the same graph against a different clip's
 reference — 1.14.
 
-#### What the second codec costs, measured before starting it
+#### EnCodec: both blockers closed, and a third that was never named
 
-EnCodec 32 kHz (MusicGen's codec) was probed and is **not** a repeat of DAC. Two blockers, both
-confirmed on the real checkpoint and neither a gap in this exporter:
+**Shipped 2026-09-12.** The scoping below was written before the work and is kept because it was
+half right in an instructive way: the two blockers it named were real, and neither was where the
+difficulty actually lay.
+
+* **Blocker 1 (dynamic padding) was one line, and is now PROVED rather than argued.** All 10
+  `EncodecConv1d` on the decode path have stride 1 and their extra padding is 0 at every length, so
+  the patch is a constant — re-derived from the real modules by
+  `tests/ci/test_encodec_export.py` every run rather than trusted from a comment.
+* **Blocker 2 (the LSTM) needed no new machinery at all.** `RecurrentPhase` has traced a stacked
+  `nn.LSTM` into per-timestep cell topologies since Parakeet's prediction network, and
+  `loom.run_recurrent` runs one in C++. What was missing was the DRIVER-side call, now `RecurrentCall`
+  — one Lua call per layer, where `run_bi_lstm` loops timesteps in Lua.
+* **The blocker nobody named cost the most.** EnCodec crops with `x[..., left : shape[-1] - right]`,
+  and MIL retires its symbolic algebra through a shape-derived slice — `8*is0 + 8` in, a fresh opaque
+  `is118` out. The exporter's rule for an unknown symbol is to substitute the root axis, so a crop that
+  should read `8*n_codes + 2` was emitted as `n_codes + 2` and the model decoded 4 seconds of audio
+  into 200 samples. No error anywhere. [Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md)
+  has the two-part fix and the general lesson.
+
+**One engine change: `ELU`** — EnCodec's SEANet decoder activates with it where every vocoder in
+families 7-9 uses LeakyReLU. `ggml_elu` already existed unexposed, so it is one registration, one
+topology rule (guarding `alpha != 1`, which ggml's is fixed at) and one line in the shape walk.
+
+**The contract is unchanged and the export shape is not**, which is
+[ADR-030](../adrs/adr-030-a-task-is-a-contract-not-an-export-shape.md): the task fixes
+`audio_codes -> audio`, and whether that is one traced graph or three phases and a host-side loop is
+the family's own business. `audio-codec` now declares the root base class for the same reason
+`automatic-speech-recognition` does.
+
+Verified against `transformers` on the waveform, at 32 kHz: max |Δ| **5.07e-07**, cosine 1.000000, the
+exact sample count (`n_frames * 640`), sabotage arm 0.55, and the ASR oracle reading the clip back.
+4 s of audio decodes in 1.7 s on the two-core dev box, the LSTM loop included.
+
+*The original scoping, kept for the record:*
 
 * **coremltools refuses its convolution padding** once the frame axis is dynamic — `Dynamic padding
   for n-dimensional tensors is not supported`, because `EncodecConv1d` pads by a length-derived

@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 family 11 — EnCodec, the remaining codec leaf** | The multi-rate question is answered ([ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md)); EnCodec's two blockers are unchanged and neither is started → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`). `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
 ***1.0.0-rc9 is tagged and its models are published; the PyPI publish is the one release chore
@@ -47,8 +47,8 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
 * [ ] **P5 breadth**, in coverage-per-effort order. Families 10, 11 and 12 are DONE — the remainder:
-  11's remaining leaf (EnCodec) → 4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text
-  enc-dec) → 13 (small classifiers) → 14 (music). *Context:
+  4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small classifiers) →
+  14 (music). **Family 11 is complete**: DAC, SNAC and EnCodec are all exported. *Context:
   [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
   cost across three checkpoints, which is the estimate the rest of this list should be read against.
@@ -61,13 +61,6 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
   sentence, 1.5M at the 512-token ceiling;
   [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md) records the in-graph
   alternative if it ever becomes measurable.*
-* [ ] **EnCodec 32 kHz — two named blockers, both scoped.** MusicGen's codec, and the second family-11
-  leaf. (1) coremltools refuses its length-derived convolution padding on a dynamic axis — the
-  Supertonic wall — though the pad is provably 0 for the stride-1 decode path and should patch to a
-  constant, per stage. (2) Its decoder has a 2-layer LSTM over the time axis, so it needs the
-  `ScriptedLoop`/`run_recurrent` path rather than `Flattened`. Its `decode` signature and config
-  spellings are already written and tested in `CodecFamily`; the recognizer detects it and raises
-  naming both reasons. *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md).*
 * [ ] **P5.0 — per-phase process isolation for conversion.** Decides which models are exportable at all
   on a given machine. Change 1 done (30.4 → 22.9 GB peak on Granite-Speech). Two remain:
   * [ ] quantize/`astype` each phase's weights as it converts, rather than at write time
