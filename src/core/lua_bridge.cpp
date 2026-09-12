@@ -637,10 +637,16 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
 //
 // `out_store` is null for the marshalling entry points and the module's own store for
 // `run_subgraph_and_retain` -- see GraphBuilder::build for what it does with it.
+// `before_compute` runs after every declared input named in the Lua table is filled and before the
+// graph runs -- the hook an integrator needs, because its two per-step inputs (the carried state and
+// the current time) are not in that table at all: they are the loop's own variables. Empty for every
+// other caller, which is why this stayed one function rather than becoming two that could drift.
 int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GraphBuilder& builder,
                       const DynamicAxes& axes, int inputs_idx,
                       const StoreLookup& lookup, OutputStore* out_store,
-                      const std::function<int(const GraphBuilder::BuildResult&)>& emit) {
+                      const std::function<int(const GraphBuilder::BuildResult&)>& emit,
+                      const std::function<void(const GraphBuilder::BuildResult&)>& before_compute =
+                          nullptr) {
     const GraphBuilder::BuildResult& r = builder.build(axes, out_store);
 
     lua_pushnil(L);
@@ -673,6 +679,7 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
         lua_pop(L, 1);
     }
 
+    if (before_compute) before_compute(r);
     // Through the BUILDER rather than through a backend handle: on a device build this graph is
     // scheduler-allocated and split across two backends, and only the builder holds the scheduler that
     // knows how to run it (BACKLOG.md P4.7 / graph_builder.h).
@@ -1028,6 +1035,225 @@ int LoomLuaBridge::l_output_shape(lua_State* L) {
         return luaL_error(L, "loom.output_shape: %s", e.what());
     }
 }
+
+namespace {
+
+// The integrators `loom.run_ode` offers, as the Butcher-tableau stages each needs. A method is a
+// sequence of evaluations of `f(x, t)` and one weighted combination of them, which is all the loop
+// below has to know: the difference between forward Euler and RK4 is entirely in this table.
+//
+// **Euler is the default and must stay bit-identical**, because it is what every flow-matching model
+// in the zoo shipped with and what the gate pins their audio against. A different method is a
+// different numerical answer, which is a per-export decision and never a silent upgrade.
+struct OdeStage {
+    double t_offset;                 // evaluate at t + t_offset * h
+    double from_stage_scale;         // x + h * scale * k[from_stage], or the base x when < 0
+    int from_stage;
+};
+struct OdeMethod {
+    const char* name;
+    int n_stages;
+    OdeStage stages[4];
+    double weights[4];               // x_next = x + h * sum(weights[i] * k[i])
+};
+
+constexpr OdeMethod kOdeMethods[] = {
+    // z_{k+1} = z_k + h * f(z_k, t_k). What `render_sampler` emitted in Lua, step for step.
+    {"euler", 1, {{0.0, -1.0, 0}}, {1.0, 0.0, 0.0, 0.0}},
+    // One extra evaluation at the half-step, second order. This is also the shape StyleTTS2's ADPM2
+    // sampler has in sigma space -- two denoiser calls around a midpoint -- which is why the option
+    // is worth having beyond "another integrator".
+    {"midpoint", 2, {{0.0, -1.0, 0}, {0.5, 0.5, 0}}, {0.0, 1.0, 0.0, 0.0}},
+    // Trapezoidal (explicit RK2). Same order as midpoint, different error constant; it differs from
+    // it on any f that is not linear and autonomous, which is what the test uses to tell them apart.
+    {"heun", 2, {{0.0, -1.0, 0}, {1.0, 1.0, 0}}, {0.5, 0.5, 0.0, 0.0}},
+    // Classical RK4: four evaluations per step, fourth order. Four times the graph work per step, so
+    // it pays only where a step can be four times longer.
+    {"rk4", 4, {{0.0, -1.0, 0}, {0.5, 0.5, 0}, {0.5, 0.5, 1}, {1.0, 1.0, 2}},
+     {1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0}},
+};
+
+const OdeMethod& ode_method_by_name(lua_State* L, const std::string& name, const char* fname) {
+    for (const OdeMethod& m : kOdeMethods) {
+        if (name == m.name) return m;
+    }
+    std::string known;
+    for (const OdeMethod& m : kOdeMethods) known += std::string(known.empty() ? "" : ", ") + m.name;
+    luaL_error(L, "%s: unknown method '%s' -- known: %s", fname, name.c_str(), known.c_str());
+    return kOdeMethods[0];  // unreachable: luaL_error does not return
+}
+
+// One field of the opts table, as a plain array of numbers.
+std::vector<double> opts_array(lua_State* L, int opts_idx, const char* field) {
+    lua_getfield(L, opts_idx, field);
+    std::vector<double> out;
+    if (!lua_isnil(L, -1)) out = read_number_array(L, lua_gettop(L));
+    lua_pop(L, 1);
+    return out;
+}
+
+} // namespace
+
+// `loom.run_ode(module, axes, fixed_inputs, opts)` and `loom.run_ode_and_retain(...)`: integrate
+// `dx/dt = f(x, t)` where `f` is one graph, with the whole loop and the state on the C++ side.
+//
+// **This is `render_sampler`'s Lua loop moved into the engine.** That loop crossed the boundary twice
+// per step -- the state in, the velocity out -- for an update (`z[i] = z[i] + v[i] * dt`) that is
+// elementwise and has no decision in it. For a mel spectrogram at ten steps that is tens of megabytes
+// of Lua table for arithmetic a `for` loop does; see ADR-031 for the measurement.
+//
+// **The state is kept in `double`, deliberately.** Lua numbers are doubles, so the loop this replaces
+// accumulated in double and wrote float into the graph; keeping that exactly is what makes the move
+// bit-identical for the models that already shipped, rather than merely close.
+//
+// `opts`: `carried` and `time` (the estimator's two per-step input names), `times` (N+1 points, so N
+// steps), `method` (default "euler"), and either `state` (an explicit initial value) or `n_elems` (draw
+// it from the shared RNG, at the same point in the stream `loom.gaussian_array` occupied before).
+int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
+    const char* fname = retain ? "loom.run_ode_and_retain" : "loom.run_ode";
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const DynamicAxes axes = read_axes_table(L, 2);
+        luaL_checktype(L, 3, LUA_TTABLE);
+        luaL_checktype(L, 4, LUA_TTABLE);
+        const int opts_idx = 4;
+
+        lua_getfield(L, opts_idx, "carried");
+        const std::string carried = luaL_checkstring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, opts_idx, "time");
+        const std::string time_input = luaL_checkstring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, opts_idx, "method");
+        const std::string method_name = lua_isnil(L, -1) ? "euler" : lua_tostring(L, -1);
+        lua_pop(L, 1);
+        const OdeMethod& method = ode_method_by_name(L, method_name, fname);
+
+        const std::vector<double> times = opts_array(L, opts_idx, "times");
+        if (times.size() < 2) {
+            return luaL_error(L, "%s: `times` needs at least two points (N+1 of them is N steps), got %d",
+                               fname, static_cast<int>(times.size()));
+        }
+        std::vector<double> state = opts_array(L, opts_idx, "state");
+        if (state.empty()) {
+            lua_getfield(L, opts_idx, "n_elems");
+            const auto n_elems = static_cast<size_t>(luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+            // The SAME stream `loom.gaussian_array` draws from, in the same order: a driver that used
+            // to draw its own z and pass it in gets identical numbers from this path.
+            state.resize(n_elems);
+            for (double& v : state) v = static_cast<double>(self->normal_dist_(self->rng_));
+        }
+
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "%s: unregistered module '%s'", fname, module_name);
+        }
+        Module& mod = it->second;
+        GraphBuilder& builder = self->module_builder(mod);
+        OutputStore* out_store = nullptr;
+        if (retain) {
+            if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backends.primary);
+            out_store = mod.outputs.get();
+        }
+
+        const size_t n = state.size();
+        // The estimator's own output geometry, read off the first evaluation. The state IS `f`'s
+        // shape -- a mel spectrogram, not a flat vector -- and a retained copy is compared with
+        // `ggml_are_same_shape`, so writing `[n]` where the next graph declares `[t_lat, lat_dim]`
+        // is an error even though the element counts agree. (Marshalling through Lua only ever
+        // compared counts, which is why this only surfaced once the state stopped crossing.)
+        int64_t state_ne[GGML_MAX_DIMS] = {static_cast<int64_t>(n), 1, 1, 1};
+        std::vector<std::vector<double>> k(method.n_stages);
+        std::vector<double> probe(n);
+        std::vector<float> scratch(n);
+
+        for (size_t step = 0; step + 1 < times.size(); ++step) {
+            const double t = times[step];
+            const double h = times[step + 1] - t;
+            for (int stage = 0; stage < method.n_stages; ++stage) {
+                const OdeStage& st = method.stages[stage];
+                if (st.from_stage_scale < 0.0) {
+                    probe = state;
+                } else {
+                    const std::vector<double>& base = k[st.from_stage];
+                    for (size_t i = 0; i < n; ++i) {
+                        probe[i] = state[i] + h * st.from_stage_scale * base[i];
+                    }
+                }
+                const double stage_t = t + st.t_offset * h;
+
+                // The estimator itself: every FIXED input comes from the caller's table (a retained
+                // reference included), and these two come from the loop.
+                compute_and_emit(
+                    L, fname, module_name, builder, axes, /*inputs_idx=*/3,
+                    LoomLuaBridge::store_lookup(self), /*out_store=*/nullptr,
+                    [&](const GraphBuilder::BuildResult& r) -> int {
+                        if (r.outputs.empty()) {
+                            throw Error(std::string(fname) + ": module '" + module_name +
+                                         "' declares no outputs; an estimator returns f(x, t)");
+                        }
+                        if (ggml_nelements(r.outputs[0]) != static_cast<int64_t>(n)) {
+                            throw Error(std::string(fname) + ": module '" + module_name + "' returned " +
+                                         std::to_string(ggml_nelements(r.outputs[0])) + " element(s) for a " +
+                                         std::to_string(n) + "-element state -- f(x, t) has the shape of x");
+                        }
+                        for (int d = 0; d < GGML_MAX_DIMS; ++d) state_ne[d] = r.outputs[0]->ne[d];
+                        k[stage].resize(n);
+                        ggml_backend_tensor_get(r.outputs[0], scratch.data(), 0, n * sizeof(float));
+                        for (size_t i = 0; i < n; ++i) k[stage][i] = static_cast<double>(scratch[i]);
+                        return 0;
+                    },
+                    [&](const GraphBuilder::BuildResult& r) {
+                        const auto carried_it = r.input_tensors.find(carried);
+                        if (carried_it == r.input_tensors.end()) {
+                            throw Error(std::string(fname) + ": module '" + module_name +
+                                         "' has no declared input '" + carried + "' to carry the state");
+                        }
+                        const auto time_it = r.input_tensors.find(time_input);
+                        if (time_it == r.input_tensors.end()) {
+                            throw Error(std::string(fname) + ": module '" + module_name +
+                                         "' has no declared input '" + time_input + "'");
+                        }
+                        for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(probe[i]);
+                        ggml_backend_tensor_set(carried_it->second, scratch.data(), 0, n * sizeof(float));
+                        const auto stage_t_f = static_cast<float>(stage_t);
+                        ggml_backend_tensor_set(time_it->second, &stage_t_f, 0, sizeof(float));
+                    });
+            }
+            for (size_t i = 0; i < n; ++i) {
+                double delta = 0.0;
+                for (int stage = 0; stage < method.n_stages; ++stage) {
+                    delta += method.weights[stage] * k[stage][i];
+                }
+                state[i] += h * delta;
+            }
+        }
+
+        if (retain) {
+            ggml_init_params params{};
+            params.mem_size = ggml_tensor_overhead() + 4096;
+            params.no_alloc = true;
+            ggml_context_ptr template_ctx(ggml_init(params));
+            ggml_tensor* shape = ggml_new_tensor(template_ctx.get(), GGML_TYPE_F32, GGML_MAX_DIMS,
+                                                  state_ne);
+            ggml_tensor* slot = out_store->reshape({shape}).at(0);
+            for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(state[i]);
+            ggml_backend_tensor_set(slot, scratch.data(), 0, n * sizeof(float));
+            out_store->bump_generation();
+            lua_pushinteger(L, static_cast<lua_Integer>(out_store->generation()));
+            return 1;
+        }
+        push_number_array(L, state);
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "%s: %s", fname, e.what());
+    }
+}
+
+int LoomLuaBridge::l_run_ode(lua_State* L) { return run_ode_impl(L, /*retain=*/false); }
+int LoomLuaBridge::l_run_ode_and_retain(lua_State* L) { return run_ode_impl(L, /*retain=*/true); }
 
 int LoomLuaBridge::l_run_recurrent(lua_State* L) {
     return run_recurrent_impl(L, /*retain=*/false);
@@ -1512,6 +1738,8 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
         {"run_recurrent_and_retain", &LoomLuaBridge::l_run_recurrent_and_retain},
         {"output_shape", &LoomLuaBridge::l_output_shape},
+        {"run_ode", &LoomLuaBridge::l_run_ode},
+        {"run_ode_and_retain", &LoomLuaBridge::l_run_ode_and_retain},
         {"range", &LoomLuaBridge::l_range},
         {"run_subgraph_and_retain", &LoomLuaBridge::l_run_subgraph_and_retain},
         {"get_output", &LoomLuaBridge::l_get_output},
