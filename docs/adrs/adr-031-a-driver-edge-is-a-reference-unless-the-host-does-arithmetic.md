@@ -93,6 +93,25 @@ arithmetic into a graph.
   | 121 s | 12.4 MB | 1.061 s | 1.013 s | **−4.5%** |
 
   The 121 s runs are bimodal (~1.01 and ~1.11 in both arms — the 285K's P-cluster/E-cluster split,
-  not noise), and the gap inside each cluster is the same 47–50 ms. **The saving grows with the
-  tensor**, which is the shape the rule predicts and the reason it matters more as models get bigger,
-  not less. The same comparison on that box's CPU backend was too noisy to read at all.
+  not noise), and the gap inside each cluster is the same 47–50 ms.
+
+  `scripts/bench_driver.cpp` then reached the families `loom_cli` cannot (anything whose answer is
+  audio), same box, same ABBA:
+
+  | model | crossing removed | before | after | | Lua-loop work removed |
+  |---|---|---|---|---|---|
+  | kokoro-82m | ~30 MB | 245.6 ms | 218.0 ms | **−11.2%** | 10 BiLSTM step loops, 2 layout round trips, per-row fan-out |
+  | encodec-32khz, 8 s | 22.9 MB | 156.6 ms | 148.1 ms | **−5.4%** | none — bulk pushes only |
+  | gigaam-v3, 121 s | 12.4 MB | 1061 ms | 1013 ms | **−4.5%** | a per-frame slice loop over 1512 frames |
+  | matcha, 10 steps | 5.1 MB | 99.1 ms | 98.3 ms | −0.8% | one elementwise update per step |
+
+  **The saving does not track megabytes; it tracks how the bytes were TOUCHED.** Per MB removed the
+  four span 0.15 to 3.9 ms — a 25x range — and they sort by how much of the marshalling was an
+  interpreted Lua loop rather than one bulk `push_number_array`. EnCodec moved the most bytes and
+  saved little because its edges were always bulk; Kokoro moved fewer and saved the most because its
+  driver walked them element by element. That is the useful rule for deciding what to fix next, and it
+  is not the rule the byte counts suggested.
+
+  On the two-core dev box the same three comparisons are inside the noise (best-of-3: −0.4%, −3.2%,
+  −2.6%, against ±10% swings between repeats of one binary) — the effect is real there too and simply
+  below what that machine can resolve.
