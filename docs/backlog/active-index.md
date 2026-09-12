@@ -19,9 +19,15 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
+| **Eight staged models are newer than the Hub** | Every driver that changed under [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md) was re-exported and card-gated locally, and the org still has the old file: `dac-44khz`, `gigaam-v3-rnnt`, `kokoro-82m`, `matcha-tts-ljspeech`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b`, `styletts2-ljspeech`, `supertonic-2`. The published copies are correct, just slower; re-upload with `upload.py -i hf-models/<slug> -m <slug>`. Check before publishing with the `x-linked-etag` comparison → [[loom-release-state]] |
 | **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`). `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **The two driver edges that are still host-side** | A BiLSTM's directions are interleaved per row, and Kokoro's/StyleTTS2's duration encoders concatenate the style vector into every row between stages -- so those values are genuinely host-side under the current topology split. Moving them into the engine is a re-trace per phase, not a driver fix, and is the last item [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md) leaves open |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
+
+***Branch state: everything below is on `feat/p5-family-11-snac`, pushed in all three repos, no PRs
+opened and nothing merged*** — 15 commits in loom.cpp, 10 in loom-exporter, 4 in loom-py (the last of
+which is only a `vendor/loom.cpp` bump, which every engine change needs before loom-py's gate can run).
+Working trees are clean on all three.
 
 ***1.0.0-rc9 is tagged and its models are published; the PyPI publish is the one release chore
 open.*** It ships **ARMv6 as a supported target** (P7/P7.1 — a `linux_armv6l` wheel for the Pi Zero

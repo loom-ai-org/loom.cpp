@@ -14,7 +14,9 @@ models ship, which family template each belongs to, and the roadmap for the rest
 acceptance criterion that **a new family should need no engine work**.
 
 Twenty-three models are published at
-[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). Each is a single GGUF carrying its own topologies, driver and — where
+[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), and EnCodec-32kHz is exported and
+verified but unpublished — see the hub for why. **Family 11 is closed**: DAC, SNAC and EnCodec cover
+the uniform, multi-rate and recurrent shapes a codec decoder comes in. Each is a single GGUF carrying its own topologies, driver and — where
 the architecture has one — its vocabulary.
 
 ## 2. Architectural Overview
