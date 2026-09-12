@@ -82,7 +82,24 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
     refusal (EnCodec's — and it DISSOLVES here, the pad is provably zero at stride 1), Dia's
     `rotate_half`, and transformers' `create_causal_mask` `vmap` path. The one genuinely new failure
     is [Retro-047](../retros/retro-047-an-inferred-dimension-outlives-the-reshape.md).
-  * **`qwen3-tts-12hz-0.6b` (family 10) — EXPORTS, DOES NOT YET RUN. One blocker, well-characterised.**
+  * **`qwen3-tts-12hz-0.6b` (family 10) — EXPORTS AND RUNS; NOT YET VERIFIED, NO CARD.**
+    Text plus a reference voice in, 800 codes = 50 frames out, through seven topologies and a nested
+    loop. **Two things are open and they are probably one bug**: greedy decoding does not terminate
+    where the reference stops at 42 frames, and `max_new_tokens` does not reach the driver — a cap of
+    3 still produced 50 — which points at how a SCALAR input is marshalled into the driver's `inputs`
+    table. Until that is fixed neither the codes nor the repetition penalty's effect can be graded,
+    and no card should be written: a card here is gate-tested against a real GGUF.
+
+    The KV-geometry blocker recorded below is CLOSED, and it was a symptom rather than a cause. The
+    cause is that **`repeat_kv` does not survive conversion**: coremltools folds its expand (a
+    broadcast) before `passes.fuse_gqa_repeat_kv` can match it, and rewriting it as
+    `repeat_interleave` only moves the failure into the merge reshape, which comes back as
+    `[128, n_tokens, n_tokens, 8]` — [Retro-044]'s substitution. The export now removes the op instead
+    of converting it: `materialise_gqa` duplicates `k_proj`/`v_proj` interleaved so K/V heads equal
+    query heads, +4.2 M parameters and a doubled cache. The code predictor is uncached besides, which
+    is worth keeping on its own terms.
+
+    (Superseded, kept for the record:)
     `qwen3_tts_export.py` traces and converts all **seven** phases and writes a 3.67 GB GGUF; the
     decomposition is verified against the reference **bit-identically in PyTorch** (all 42 frames ×
     16 codes, driven through the export's own wrappers) before anything was traced. What fails is
