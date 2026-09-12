@@ -64,9 +64,59 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
 
 ## Models
 
-* [ ] **Qwen3-ASR-0.6B / Qwen3-TTS-0.6B variants** — not started. No conversion script, no source-level
-  architecture read. Qwen3-TTS is expected to be the most architecturally novel item in the family and
-  needs its own read before scoping. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
+* [ ] **Qwen3-TTS-12Hz-0.6B-Base — the CODEC half is DONE, the talker half is not.** The source-level
+  architecture read this entry used to ask for has been done (2026-09-12), against the reference
+  implementation running end to end on CPU rather than against the source alone. It ships as **two
+  GGUFs** by [ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)'s argument — one codec
+  serves every size and variant of the talker:
+
+  * **`qwen3-tts-tokenizer-12hz` (family 11) — EXPORTED AND VERIFIED.** 16 codebooks at 12.5 Hz in,
+    24 kHz waveform out; 114 M parameters, 456 MB at F32. Max abs difference **4.167e-06** at 42
+    frames and **1.699e-05** at 700, against the reference's own `chunked_decode`, on the engine's
+    floats; exact sample count at both; the ASR oracle reads the decode back verbatim. It is the
+    family's first leaf with ATTENTION over the frame axis and therefore its first CHUNKED one —
+    [ADR-034](../adrs/adr-034-a-chunked-decode-is-the-drivers-loop-not-a-longer-call.md), which is
+    the decision `encodec_export` predicted ("a chunked one is a different driver, not a longer
+    call"). It cost one driver component (`ChunkedCodecCall`), no engine change and no new binding.
+    Three conversion blockers, all of them another family's known failure: coremltools' dynamic-pad
+    refusal (EnCodec's — and it DISSOLVES here, the pad is provably zero at stride 1), Dia's
+    `rotate_half`, and transformers' `create_causal_mask` `vmap` path. The one genuinely new failure
+    is [Retro-047](../retros/retro-047-an-inferred-dimension-outlives-the-reshape.md).
+  * **`qwen3-tts-12hz-0.6b` (family 10) — NOT STARTED.** 914 M parameters. A 28-layer Qwen3-shaped
+    talker (hidden 1024, GQA 16/8, head_dim 128) emitting codebook 0, plus a 5-layer **code
+    predictor** that emits the other 15 from the talker's hidden state — so one audio frame is 16
+    transformer forwards, not one, with the predictor's KV cache reset per frame. Its input embedding
+    is a SUM of 16 codebook embeddings plus a text hidden, never a token lookup. **The `mrope` in its
+    config is decorative**: `get_rope_index` always expands one row to three identical ones, so
+    `apply_interleaved_rope` collapses to plain RoPE at θ=1e6 — verified in the source, and the
+    scariest-looking thing in the config turns out to cost nothing.
+
+  **Which generation mode, and why it is not a free choice.** `spk_id` is empty in this checkpoint, so
+  there are no built-in speakers and voice cloning is the only mode. It has two arms and they are
+  nested, not alternatives:
+
+  * `x_vector_only_mode=True` needs a 128-mel front end at 24 kHz and an 8.9 M ECAPA speaker encoder,
+    and nothing else. Verified working greedily against the reference — the ASR oracle reads back
+    *"The quick brown fox jumps over the lazy dog."* exactly.
+  * ICL mode (`ref_text` + `ref_code`) additionally needs the tokenizer's **encoder**, which is a
+    `transformers` `MimiModel` — a whole second family-11-scale export, and one family 11 deliberately
+    does not do ("the DECODE half only"). It also **degenerates under greedy decoding**: 200 frames to
+    the cap, 15.9 s of audio transcribing as *"country can do for you."* So it needs the sampler as
+    well as the encoder.
+
+  So the order is forced: x-vector-only first, ICL after. **What the sampler will need that
+  `loom.sample_row` has not got**: `repetition_penalty` (1.05 over the generated codes) and a
+  non-contiguous allowed set — `suppress_tokens` bans `[2048, 3072)` *except* `codec_eos = 2150`,
+  which `lo`/`hi` cannot express. That is the shape of ADR-024's bill for this family, and it is the
+  one place engine C++ is currently expected.
+
+  *Context: [Epic-03](../epics/epic-03-model-coverage.md). The reference is Alibaba's Apache-2.0
+  `qwen-tts` package, imported lazily like SNAC's; `pip install --no-deps qwen-tts` into the **piper**
+  venv, whose transformers 4.57.6 matches the package's `==4.57.3` pin. Ovos is the wrong venv for it:
+  transformers 5.x has moved the internals it imports.*
+
+* [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
+  and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
 * [ ] **P5 breadth**, in coverage-per-effort order. Families 10, 11 and 12 are DONE — the remainder:
