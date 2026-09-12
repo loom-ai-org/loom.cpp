@@ -81,9 +81,15 @@ arithmetic into a graph.
   asserts `ggml_are_same_shape`; marshalling only ever compared element counts. Chaining
   `run_resblk_stack` through the store failed on `[66,512]` vs `[512,512]` — same element count,
   different tensor — which the Lua path would have accepted silently.
-* Five models were re-exported and re-gated (parakeet-tdt, parakeet-rnnt, gigaam-v3, kokoro,
-  styletts2); the whole 24-model card gate passes, including the ASR-oracle rows that are the only
-  real test for the TTS pair.
+* Nine models were re-exported and re-gated; the whole 24-model card gate passes, including the
+  ASR-oracle rows that are the only real test for the TTS pair.
+* **Those re-exports cannot be published before the engine is.** Each binding added here is a new
+  requirement on the RUNTIME, and a driver that calls one is unloadable by every released
+  `loom-py-rt`: `output_shape` (5 models), `run_ode_and_retain` (2), `run_recurrent_and_retain` and
+  the `ELU` primitive (EnCodec), a retained ROW range (3). The model-card gate cannot see this — it
+  runs against the local build, which by construction has them — so the ordering is a rule rather than
+  a check: **engine merged → wheels published → GGUFs uploaded.** Worth a `loom.min_engine` declaration
+  in the file if this recurs; it will recur every time a binding is added.
 * **Measured on an RTX 5090** (GigaAM v3, the transducer whose encoder output stopped crossing; the
   same weights with the old driver and the new one, interleaved ABBA, 8 runs each):
 
