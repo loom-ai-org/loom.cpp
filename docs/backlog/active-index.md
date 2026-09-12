@@ -19,8 +19,8 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Eight staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape`; `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) **These go out WITH the next release, after the engine is merged and the wheels are published, never before** → [[loom-release-state]] |
-| **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION, and on the release** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`); it also needs the ELU primitive, so it ships with the engine like the eight above. `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **Eight staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape`; `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
+| **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION, and on rc10** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`); it also needs the ELU primitive, so it ships with the engine like the eight above. `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **The two driver edges that are still host-side** | A BiLSTM's directions are interleaved per row, and Kokoro's/StyleTTS2's duration encoders concatenate the style vector into every row between stages -- so those values are genuinely host-side under the current topology split. Moving them into the engine is a re-trace per phase, not a driver fix, and is the last item [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md) leaves open |
 | **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
 
@@ -29,15 +29,21 @@ opened and nothing merged*** — 15 commits in loom.cpp, 10 in loom-exporter, 4 
 which is only a `vendor/loom.cpp` bump, which every engine change needs before loom-py's gate can run).
 Working trees are clean on all three.
 
-***1.0.0-rc9 is tagged and its models are published; the PyPI publish is the one release chore
-open.*** It ships **ARMv6 as a supported target** (P7/P7.1 — a `linux_armv6l` wheel for the Pi Zero
+***1.0.0-rc9 is DONE: tagged, its models published, and all four packages on PyPI*** — `loom-py-rt`
+and the `-cuda`/`-vulkan`/`-metal` accelerators, verified at `1.0.0rc9`. It ships **ARMv6 as a supported target** (P7/P7.1 — a `linux_armv6l` wheel for the Pi Zero
 and Pi 1, VITS from 57x to 18.9x real time), **family 12's SentencePiece reading** (XLM-R, where a
 fairseq checkpoint's ids are not its protobuf's piece order — plus a `tokenizer.json`-only path and a
 correctness fix, since `framing_ids` had been returning a SentencePiece encode's trailing `</s>`
 *labelled*), and **family 6, `flan-t5-small`** — the first text encoder-decoder and first Unigram LM
 in the zoo. The org now lists **twenty-three** models, every one re-exported and card-gated against this
-tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`. What remains is four packages to PyPI:
-`loom-py-rt` and the `-cuda`/`-vulkan`/`-metal` accelerators.
+tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`.
+
+***The next release is 1.0.0-rc10, and it is what unblocks the Hub.*** Everything on
+`feat/p5-family-11-snac` goes out in it — the four new engine bindings, `ELU`, the ODE integrator,
+family 11's third leaf, and `loom_cli --out`. Its shape is fixed by the coupling above: the wheels
+carry the bindings, so **the nine staged GGUFs can only be uploaded once rc10's packages are on PyPI**,
+in that order. A version bump is TEN strings in FOUR files — see [[loom-release-state]] for the list
+and for how to verify a Hub push afterwards.
 
 **SNAC-24kHz was published 2026-09-12** (`loom-ai-org/snac-24khz-loom`, family 11's second leaf) off
 `feat/p5-family-11-snac`, which is pushed in all three repos and not yet merged. It is the zoo's
