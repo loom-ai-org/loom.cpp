@@ -19,14 +19,25 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Eight staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape` plus the retrace's own two, `run_bi_recurrent_and_retain` + `expand_by_duration_and_retain` ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)); `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
+| **Ten staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape` plus the retrace's own two, `run_bi_recurrent_and_retain` + `expand_by_duration_and_retain` ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)); `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) Family 4's two leaves join them: `hubert-large-ls960-ft` and `data2vec-audio-base-960h` need the `ctc` vocabulary reader AND the grouped-convolution lowering, so a released wheel would decline the file's tokenizer and abort inside `ggml_im2col` on its positional convolution. **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
 | **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION, and on rc10** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`); it also needs the ELU primitive, so it ships with the engine like the eight above. `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 families 4 and 5 — CNN+CTC and SANM encoders** | Both family-1-shaped once the encoder template generalizes past NeMo, which is the thing to scope first → [Epic-03 §3](../epics/epic-03-model-coverage.md) |
+| **P5 family 5 — SANM / FunASR encoders** | Family 4 is DONE (2026-09-12) and it is the thing to read first: the "family-1-shaped once the encoder template generalizes past NeMo" estimate was half right. The CTC *head* was free — `CtcGreedyBuilder`, `loom.argmax_rows` and the driver are family 1's, reused unchanged — and the *encoder template* never generalized, because family 1's trace is a NeMo `(input_signal, input_signal_length)` pair around a mel front end. Family 5 is scoped with the same sentence; what it will actually inherit is one component → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
 ***Branch state: everything below is on `feat/p5-family-11-snac`, pushed in all three repos, no PRs
 opened and nothing merged*** — 15 commits in loom.cpp, 10 in loom-exporter, 4 in loom-py (the last of
 which is only a `vendor/loom.cpp` bump, which every engine change needs before loom-py's gate can run).
 Working trees are clean on all three.
+
+***Family 4 SHIPPED 2026-09-12 (P5)*** — CNN + transformer + CTC, `ctc_asr_export.py`, one generic
+recognizer claiming any HF `*ForCTC` directory. Verified on three structurally different checkpoints
+against `transformers` on the LOGITS (549 frames of real speech, 549/549 argmax each, sabotage arm
+32.7). It cost one engine READER (`CtcVocab`, [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md))
+and one engine FIX that was nobody's estimate: `groups > 1` had been read as "depthwise" since the
+first export, which is right at both ends of the range and wrong in the middle
+([Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md)). `CONV_1D` honours
+`groups` now. The third checkpoint, `omniASR-CTC-300M-v2`, is verified and deliberately unshipped — it
+is scale-sensitive and its own documented processor path transcribes garbage, which loom reproduces
+exactly.
 
 ***1.0.0-rc9 is DONE: tagged, its models published, and all four packages on PyPI*** — `loom-py-rt`
 and the `-cuda`/`-vulkan`/`-metal` accelerators, verified at `1.0.0rc9`. It ships **ARMv6 as a supported target** (P7/P7.1 — a `linux_armv6l` wheel for the Pi Zero
@@ -59,8 +70,9 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
 * [ ] **P5 breadth**, in coverage-per-effort order. Families 10, 11 and 12 are DONE — the remainder:
-  4 (CNN+CTC) and 5 (SANM) → 9/10 (remaining TTS) → 6 (text enc-dec) → 13 (small classifiers) →
-  14 (music). **Family 11 is complete**: DAC, SNAC and EnCodec are all exported. *Context:
+  5 (SANM) → 9/10 (remaining TTS) → 13 (small classifiers) → 14 (music). **Families 4, 6, 10, 11 and
+  12 are complete**: family 11 is DAC, SNAC and EnCodec; family 4 is HuBERT, data2vec-audio and
+  wav2vec 2.0. *Context:
   [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
   cost across three checkpoints, which is the estimate the rest of this list should be read against.

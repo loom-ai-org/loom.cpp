@@ -196,6 +196,89 @@ ggml_tensor* im2col_shape_carrier(ggml_context* ctx, const ggml_tensor* kernel, 
     return carrier;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// GROUPED CONVOLUTION -- the case between "dense" and "depthwise" (family 4)
+// ---------------------------------------------------------------------------------------------------
+// A convolution with `1 < groups < IC` is G independent dense convolutions over G contiguous slices of
+// the channel axis, concatenated. Neither existing primitive is it: CONV_1D reduces over EVERY input
+// channel, and CONV_1D_DW gives each output channel exactly one input channel.
+//
+// **THE `groups` ATTR HAS BEEN ON EVERY CONV NODE SINCE THE FIRST EXPORT AND WAS READ BY NEITHER OP.**
+// That was harmless only because every model converted before family 4 sat at one end or the other --
+// `groups == 1` (every dense conv) or `groups == IC` (Conformer's, VITS's, SNAC's, Supertonic's
+// depthwise ones, all verified as such over the shipped files). wav2vec 2.0 / HuBERT / data2vec put
+// their positional convolution at `groups=16` over 768 channels, and the exporter's rule for it was
+// `groups > 1 -> depthwise`, which mislabelled it. The symptom was not a wrong answer: it was a raw
+// `GGML_ASSERT(b->ne[1] == a->ne[1])` inside ggml_im2col with no mention of a model, an op or a
+// channel count. Both halves are fixed -- the exporter now decides depthwise on the KERNEL's own
+// shape, and this reads the attr it always emitted.
+//
+// **G slices and a concat, rather than a grouped im2col.** The arithmetic is identical either way and
+// this one composes: each slice re-enters `op_conv_1d` and therefore gets whichever of its three
+// lowerings it qualifies for -- the direct sweep, the folded block-quantized sweep, or im2col +
+// mul_mat -- instead of a fourth code path that would have to reimplement all three. What it costs is
+// node count, G per convolution, which for the checkpoints in this family is 16 nodes on a
+// convolution that runs five times.
+Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs);
+
+Outputs conv_1d_grouped(PrimitiveContext& pc, ggml_tensor* kernel, ggml_tensor* data, int64_t groups,
+                         const Json& attrs) {
+    // The kernel's own second axis is the per-GROUP input-channel count, in both layouts: a declared
+    // kernel is [K, IC/G, OC] and a folded one is [(IC/G)*K, OC] with IC/G handed back as `kernel_ic`.
+    const bool folded = attrs.is_object() && attrs.contains("kernel_k");
+    const int64_t oc = folded ? kernel->ne[1] : kernel->ne[2];
+    const int64_t ic_per_group = folded ? resolve_attr_int(attrs, "kernel_ic", pc.symbols)
+                                        : kernel->ne[1];
+    const int64_t ic = data->ne[1];
+
+    // CONTIGUOUS BEFORE SLICING, AND THIS IS NOT AN OPTIMISATION. `ggml_view_3d` sets the view's
+    // `nb[0]` to `ggml_type_size(type)` unconditionally -- it takes nb1 and nb2 and nothing else -- so
+    // a view cut out of a PERMUTED tensor silently reinterprets the layout rather than failing. The
+    // activation reaching a positional convolution is permuted (this family transposes [T, C] to
+    // [C, T] in front of every convolution), and the first version of this read every group out of the
+    // same wrongly strided window: the export ran, every shape was right, and the logits were wrong by
+    // 21. Doing it once here is also the cheaper spelling -- `op_conv_1d` would otherwise materialise
+    // the same copy `groups` times.
+    if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+    if (!ggml_is_contiguous(kernel)) kernel = ggml_cont(pc.ctx, kernel);
+
+    if (groups <= 0 || ic % groups != 0 || oc % groups != 0 || ic / groups != ic_per_group) {
+        throw SchemaError("CONV_1D: groups=" + std::to_string(groups) + " over " +
+                          std::to_string(ic) + " input and " + std::to_string(oc) +
+                          " output channels, with a kernel declaring " +
+                          std::to_string(ic_per_group) + " input channel(s) per group. A grouped "
+                          "convolution needs groups to divide both channel counts and the kernel to "
+                          "hold IC/groups of them -- so this node's attr and its weight disagree.");
+    }
+    const int64_t oc_per_group = oc / groups;
+
+    // `attrs` minus `groups`, so the per-group call takes the dense path rather than recursing here
+    // forever. Everything else -- s0/p0/d0 and any fold declaration -- is per-group unchanged.
+    Json group_attrs = attrs;
+    group_attrs.erase("groups");
+
+    ggml_tensor* out = nullptr;
+    for (int64_t g = 0; g < groups; ++g) {
+        // The OUTPUT-channel axis is the kernel's outermost, so a group's kernel slice is one
+        // contiguous run in both layouts and needs no copy. A quantized kernel slices here too: the
+        // offset is a whole number of rows, so no block is cut.
+        ggml_tensor* kernel_g =
+            folded ? ggml_view_2d(pc.ctx, kernel, kernel->ne[0], oc_per_group, kernel->nb[1],
+                                   static_cast<size_t>(g * oc_per_group) * kernel->nb[1])
+                   : ggml_view_3d(pc.ctx, kernel, kernel->ne[0], kernel->ne[1], oc_per_group,
+                                   kernel->nb[1], kernel->nb[2],
+                                   static_cast<size_t>(g * oc_per_group) * kernel->nb[2]);
+        // The data slice is a genuinely strided view whenever N > 1; `op_conv_1d` makes it contiguous
+        // itself, which is the same thing it already does for Conformer's GLU channel split.
+        ggml_tensor* data_g = ggml_view_3d(pc.ctx, data, data->ne[0], ic_per_group, data->ne[2],
+                                            data->nb[1], data->nb[2],
+                                            static_cast<size_t>(g * ic_per_group) * data->nb[1]);
+        ggml_tensor* part = op_conv_1d(pc, {kernel_g, data_g}, group_attrs)[0];  // [OL, OC/G, N]
+        out = out ? ggml_concat(pc.ctx, out, part, 1) : part;
+    }
+    return {out};
+}
+
 Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("CONV_1D", in, 2);
     ggml_tensor* kernel = in[0];
@@ -203,6 +286,14 @@ Outputs op_conv_1d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
+
+    // BEFORE the fold is read, because a grouped kernel's declared IC is per-GROUP and
+    // `folded_kernel_geometry` cross-checks it against the activation's FULL channel count -- which is
+    // the right check for every dense convolution and the wrong one for a slice of this.
+    const int64_t groups = attrs.is_object() && attrs.contains("groups")
+        ? resolve_attr_int(attrs, "groups", pc.symbols) : 1;
+    if (groups > 1) return conv_1d_grouped(pc, kernel, data, groups, attrs);
+
     const FoldedKernel fold = folded_kernel_geometry("CONV_1D", kernel, attrs, pc.symbols, /*is_2D=*/false, data->ne[1]);
 
     // ggml_compute_forward_im2col asserts its `data` operand's fastest-varying axis is densely packed
@@ -444,6 +535,18 @@ Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     expect_n_inputs("CONV_1D_DW", in, 2);
     ggml_tensor* kernel = in[0];
     ggml_tensor* data = in[1];
+    // DEPTHWISE MEANS ONE INPUT CHANNEL PER OUTPUT CHANNEL, and the kernel's own second axis is where
+    // that is written down. Checked here because the alternative is what family 4 actually met: a
+    // grouped kernel reaching this op aborts the process inside `ggml_im2col` on
+    // `GGML_ASSERT(b->ne[1] == a->ne[1])`, which names neither the op nor the model nor the number
+    // that was wrong. The exporter decides this on the same shape, so a node arriving here mislabelled
+    // is a topology defect and reads as one.
+    if (kernel->ne[1] != 1) {
+        throw SchemaError("CONV_1D_DW: the kernel declares " + std::to_string(kernel->ne[1]) +
+                          " input channels per output channel, so this is a GROUPED convolution, not "
+                          "a depthwise one. It belongs on CONV_1D with a `groups` attr -- see "
+                          "conv_1d_grouped.");
+    }
     const int s0 = static_cast<int>(resolve_attr_int(attrs, "s0", pc.symbols));
     const int p0 = static_cast<int>(resolve_attr_int(attrs, "p0", pc.symbols));
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));

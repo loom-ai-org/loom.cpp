@@ -476,6 +476,102 @@ void test_conv_1d_dw() {
     LOOM_CHECK((get_f32(out) == std::vector<float>{3, 6, 9, 7, -6, -2, -2, 7}));
 }
 
+// One grouped convolution, hand-computed: IC=4, OC=4, groups=2, K=2, stride 1, no padding, IL=4.
+// Each group is a dense 2-in/2-out convolution over its own half of the channels, so group 1's output
+// must depend on channels 2-3 and on nothing else -- which is what the two `groups > 1` cases below are
+// actually checking, and what `groups > 1 -> depthwise` got wrong for eight families (Retro-046).
+void run_grouped_conv_1d(bool permuted) {
+    GgmlScratch s;
+    // IL != IC deliberately: with a square activation the two layouts below are indistinguishable, and
+    // the permuted arm silently tests the contiguous one.
+    constexpr int K = 2, ICG = 2, OC = 4, IL = 5, IC = 4, OL = 4;
+    ggml_tensor* kernel = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, K, ICG, OC);
+    ggml_set_input(kernel);
+    // The permuted arm declares [IC, IL] and transposes it, so the tensor the op is handed has the
+    // same logical shape as the contiguous arm's and a layout whose fastest axis is not ne[0]. Every
+    // family-4 checkpoint hands its positional convolution exactly this.
+    ggml_tensor* declared = permuted ? ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, IC, IL, 1)
+                                     : ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, IL, IC, 1);
+    ggml_set_input(declared);
+    ggml_tensor* data = permuted ? ggml_transpose(s.ctx.get(), declared) : declared;
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    nlohmann::json attrs = {{"s0", 1}, {"p0", 0}, {"d0", 1}, {"groups", 2}};
+    ggml_tensor* out = op("CONV_1D")(pc, {kernel, data}, attrs)[0];
+    LOOM_CHECK(out->ne[0] == OL);
+    LOOM_CHECK(out->ne[1] == OC);
+
+    ggml_cgraph* gf = s.expand(out);
+    std::vector<float> kv(K * ICG * OC), dv(IL * IC);
+    for (size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<float>(i + 1) * 0.1f;
+    for (size_t i = 0; i < dv.size(); ++i) dv[i] = static_cast<float>(i + 1);
+    set_f32(kernel, kv);
+    // The permuted arm's declared tensor is [IC, IL], so its buffer holds the TRANSPOSE of dv.
+    if (!permuted) {
+        set_f32(declared, dv);
+    } else {
+        std::vector<float> transposed(dv.size());
+        for (int c = 0; c < IC; ++c)
+            for (int l = 0; l < IL; ++l) transposed[static_cast<size_t>(l) * IC + c] = dv[static_cast<size_t>(c) * IL + l];
+        set_f32(declared, transposed);
+    }
+    s.compute(gf);
+
+    // Reference: output channel `oc` reads input channels of group `oc / (OC/groups)` only.
+    std::vector<float> expected(static_cast<size_t>(OL) * OC, 0.0f);
+    for (int oc = 0; oc < OC; ++oc) {
+        const int g = oc / (OC / 2);
+        for (int ol = 0; ol < OL; ++ol) {
+            float acc = 0.0f;
+            for (int ic = 0; ic < ICG; ++ic)
+                for (int k = 0; k < K; ++k)
+                    acc += kv[static_cast<size_t>(oc) * ICG * K + static_cast<size_t>(ic) * K + k] *
+                           dv[static_cast<size_t>(g * ICG + ic) * IL + ol + k];
+            expected[static_cast<size_t>(oc) * OL + ol] = acc;
+        }
+    }
+    const std::vector<float> actual = get_f32(out);
+    float worst = 0.0f;
+    for (size_t i = 0; i < expected.size(); ++i) worst = std::max(worst, std::fabs(expected[i] - actual[i]));
+    if (worst > 1e-4f) std::fprintf(stderr, "grouped conv (%s): max abs diff %f\n",
+                                     permuted ? "permuted" : "contiguous", static_cast<double>(worst));
+    LOOM_CHECK(worst <= 1e-4f);
+}
+
+void test_conv_1d_grouped() {
+    run_grouped_conv_1d(/*permuted=*/false);
+}
+
+// THE REGRESSION, and it is worth its own case because the shapes are identical either way.
+// `ggml_view_3d` takes nb1/nb2 and sets nb[0] to `ggml_type_size(type)` unconditionally, so slicing a
+// group out of a PERMUTED activation reinterprets the layout instead of failing -- every group read the
+// same wrongly strided window, the graph built, and data2vec's logits came out wrong by 21 with 80% of
+// the argmaxes still agreeing. `conv_1d_grouped` makes the activation contiguous before slicing.
+void test_conv_1d_grouped_permuted_input() {
+    run_grouped_conv_1d(/*permuted=*/true);
+}
+
+// A grouped kernel reaching the DEPTHWISE op must say so rather than abort inside ggml_im2col, whose
+// own assert names neither the op nor the channel count. This is the other half of Retro-046: the
+// exporter decides depthwise on the kernel's shape now, and this is what catches a file that predates
+// that or was hand-written.
+void test_conv_1d_dw_rejects_a_grouped_kernel() {
+    GgmlScratch s;
+    ggml_tensor* kernel = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 2, 2, 4); // 2 IC per OC
+    ggml_tensor* data = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 4, 4, 1);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    nlohmann::json attrs = {{"s0", 1}, {"p0", 0}, {"d0", 1}};
+    bool threw = false;
+    try {
+        op("CONV_1D_DW")(pc, {kernel, data}, attrs);
+    } catch (const loom::SchemaError&) {
+        threw = true;
+    }
+    LOOM_CHECK(threw);
+}
+
 void test_depthwise_conv_transpose_1d_via_composition() {
     // Kokoro's AdainResBlk1d "pool" (a weight-normed, DEPTHWISE ConvTranspose1d, kernel=3, stride=2,
     // padding=1, output_padding=1 -- real shapes confirmed against the checkpoint's own
@@ -2814,6 +2910,9 @@ int main() {
     test_cumsum();
     test_glu();
     test_conv_1d_dw();
+    test_conv_1d_grouped();
+    test_conv_1d_grouped_permuted_input();
+    test_conv_1d_dw_rejects_a_grouped_kernel();
     test_depthwise_conv_transpose_1d_via_composition();
     test_reshape_permute_cont();
     test_reshape_infers_minus_one_dim();
