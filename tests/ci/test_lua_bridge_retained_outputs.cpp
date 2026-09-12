@@ -96,6 +96,28 @@ const char* kScript = R"lua(
                                   {hidden = {from = 'stage_a', rows = inputs.rows}})
     end
 
+    -- One ROW out of the middle, which is what a transducer's joint consumes per call: the oracle is the
+    -- same slice taken out of the marshalled table, so a copy that ignored `row` (or took the offset
+    -- from the wrong end) differs from it everywhere but row 0.
+    function row_marshalled(inputs)
+        local n = #inputs.tokens
+        local cur = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0},
+                                       {tokens = inputs.tokens})
+        -- `#cur / n` for `prefix_marshalled`'s own reason: stage_a declares TWO outputs, so a
+        -- two-local capture binds the second output rather than a shape.
+        local width = #cur / n
+        local one = {}
+        for i = 1, width do one[i] = cur[inputs.row * width + i] end
+        return loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0}, {hidden = one})
+    end
+
+    function row_retained(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        return loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0},
+                                  {hidden = {from = 'stage_a', row = inputs.row, rows = 1}})
+    end
+
     -- `rows` equal to everything the module retained must be the untrimmed copy, not a near-miss: it is
     -- the case every driver hits whose audio happens to fill its last chunk exactly, and the case the
     -- family's own default expression produces.
@@ -198,8 +220,10 @@ const char* kScript = R"lua(
         "unregistered module 'nope'",
         'is not a non-empty sub-range',
         'is not a non-empty sub-range',
-        'so that is not a prefix of it',
-        'so that is not a prefix of it',
+        -- `rows` is a RANGE now, not only a prefix -- `row` says where it starts -- so the
+        -- out-of-bounds message names both and says "range" (src/core/lua_bridge.cpp's copy_row_range).
+        'so that is not a range within it',
+        'so that is not a range within it',
         'must agree exactly',
     }
 
@@ -362,6 +386,23 @@ int main() {
     LOOM_CHECK(reshaped[0] == 4.0 && reshaped[1] == 1.0);
     LOOM_CHECK(reshaped.size() == 2 + 4);
     check_all_zero(reshaped, 2, "reshape_then_read");
+
+    // --- 5a2. ONE ROW out of the middle, by `row`. The capability a recurrence needs: a cell consumes
+    // one timestep per call, and before this the only way to give it one was to marshal the whole
+    // sequence and slice it in Lua. Every row is checked, so an off-by-one in the offset cannot pass on
+    // the one row where both answers agree. ---
+    for (double row : {0.0, 1.0, 2.0}) {
+        const std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+            {"tokens", tokens}, {"row", row},
+        };
+        const std::vector<double> ref = as_array(bridge.call("row_marshalled", args));
+        const std::vector<double> got = as_array(bridge.call("row_retained", args));
+        std::fprintf(stderr, "row=%g: %zu element(s) each\n", row, got.size());
+        LOOM_CHECK(got.size() == ref.size() && !got.empty());
+        std::vector<double> diffs(got.size());
+        for (size_t i = 0; i < got.size(); ++i) diffs[i] = got[i] - ref[i];
+        check_all_zero(diffs, 0, "row_retained");
+    }
 
     // --- 5b. A PREFIX of a retained output equals the same rows sliced out of the marshalled table
     // (BACKLOG.md P4.3d). This is the capability that lets a family-3 driver hand its decoder only the

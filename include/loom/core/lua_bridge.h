@@ -247,6 +247,9 @@ private:
     // is a flat (seq_len, hidden_dim) array and shape is [hidden_dim, seq_len, 1, 1] (ggml ne[] order,
     // matching loom.run_subgraph's own second return value).
     static int l_run_recurrent(lua_State* L);
+    static int l_run_recurrent_and_retain(lua_State* L);
+    // Both of the above: the same sequence walk, differing only in where the result goes.
+    static int run_recurrent_impl(lua_State* L, bool retain);
     static int l_range(lua_State* L);
     static int l_causal_mask(lua_State* L);
     static int l_zero_mask(lua_State* L);
