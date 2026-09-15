@@ -31,6 +31,7 @@ the architecture has one — its vocabulary.
 | **Language** | Qwen3-0.6B-Base, LFM2-350M (monolithic *and* modular), SmolLM2-360M-Instruct, Gemma-3-270M-it | `causal_lm_export.py` |
 | **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3 | `nemo_asr_export.py` |
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
+| **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — encoder-decoder** | Whisper-small | `multi_phase_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
@@ -339,6 +340,83 @@ exactly on it — including on the broken arm, which is what the 5.45e-04 above 
 is right and the checkpoint's declared front end disagrees with its weights. Kept as the family's third
 structural witness; not published.
 
+### Family 5, where the estimate was wrong the same way twice and the cost was somewhere else
+
+Family 5 — a kaldi-fbank front end, a low-frame-rate stack, an SANM encoder (self-attention with a
+depthwise FSMN memory block beside it) and one linear CTC head — is SenseVoice, Paraformer and the
+FunASR checkpoints around them. **Its first leaf, `SenseVoiceSmall`, shipped 2026-09-15**:
+`sanm_asr_export.py`, one recognizer claiming a FunASR directory whose `config.yaml` declares
+`model: SenseVoiceSmall`.
+
+The roadmap scoped this family with the same sentence it scoped family 4 with, and the correction
+family 4 wrote down applies again unchanged: **the CTC epilogue is free and the encoder template is not
+shared**. `CtcGreedyBuilder`, `loom.argmax_rows` and the five-statement driver are family 1's, reused;
+`blank_id = 0` costs nothing because `ctc_blank_id` has been a parameter since family 4. Three siblings
+now share one epilogue and no trace.
+
+**What was NOT in any estimate is that the front end had to be rebuilt.** FunASR's `WavFrontend` calls
+`torchaudio.compliance.kaldi.fbank` and then `apply_lfr`, and neither traces: the first frames with
+`as_strided` over strides computed from `.shape[0]`, the second pads the frame sequence at the end by an
+amount that depends on the frame count modulo the LFR stride. Both are rebuilt in ops whose shapes are
+derivable, and the rebuild is exact rather than approximate because **kaldi's per-frame work is all
+linear** — DC removal, pre-emphasis, windowing and zero-padding compose into one constant matrix, so
+the framing becomes a single strided convolution whose kernel that matrix is. The real DFT is two
+matmuls (`|X|² = (Cx)² + (Sx)²`), which is how the complex intermediate that blocks `torch.stft` one
+family over never has to exist. The LFR stacking is `lfr_m` depthwise convolutions and a concatenation.
+Verified against `torchaudio` at 218 lengths covering every residue of the frame count, worst relative
+error 6e-6, zero shape mismatches — and at f64 the two agree to 3.7e-07, which is what says the f32 gap
+is accumulation.
+
+**The reference front end is stochastic by default, and that had to be found before anything could be
+graded.** `WavFrontend`'s `dither` defaults to kaldi's `1.0`, so FunASR's own pipeline adds Gaussian
+noise to the waveform before every fbank and does not transcribe a file the same way twice at the bit
+level. The exported model is the `dither=0` model; the oracle forces it to 0 on the reference side.
+This is [Retro-032](../retros/retro-032-one-seed-is-not-an-asr-oracle.md)'s rule arriving one family
+later and one stage earlier — the randomness is in the FEATURES, not the sampler.
+
+**Two of the four prompt rows are knobs, so the prompt is a graph input.** `SenseVoiceSmall.inference`
+prepends four rows of a 16-entry embedding table to the features: a language id, two fixed
+event/emotion queries, and a text-normalization id. Text normalization is not cosmetic — `withitn`
+returns *"And so my fellow Americans ask not what your country can do for you, ask what you can do for
+your country."* where `woitn` returns the same words lowercase and unpunctuated — so baking it would
+ship a model that can never punctuate. `prompt_ids` is therefore the graph's second input, after the
+waveform so the root-axis expression still reads the waveform's own length, and the driver DEFAULTS it,
+which is the family's one new driver component: a `DEFAULTED` binding emitting
+`inputs.prompt_ids or {0, 1, 2, 15}`. A caller who wants `transcribe(audio)` never learns the input is
+there.
+
+**The languages are published, but not under Whisper's keys, and resisting that was a decision.**
+`language` is a recurring ASR role, so `loom.asr.language_names`/`loom.asr.language_ids` are the obvious
+place — except those are read into `AsrDecodeTable`, whose ids are decoder prompt TOKENS pushed into a
+cross-attention prompt, and this family's ids index an embedding table prepended to the features. Same
+concept for a caller, different object for the engine. The mechanism-free half goes in
+`loom.text.languages` (which `ModelContract` already reads and the engine already uses to refuse a
+language a file cannot serve); the name→row tables go under a `sanm.` prefix. Today the misuse would
+have been inert — that path is gated on a declared clip length and this file declares none — which is
+exactly the kind of accident that stops being inert later.
+
+**The vocabulary is free and was not expected to be.** The CTC head's 25,055 rows are exactly the
+25,055 pieces of the checkpoint's own SentencePiece BPE protobuf in id order, with no `tokenizer.json`
+beside it — so [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md)'s seam
+sends it down the same `sentencepiece_proto` path family 1's NeMo checkpoints take, byte for byte.
+
+**What it cost the EXPORTER is four entries in the shape walk, and that is the finding worth carrying.**
+Every one of them was the same failure — the walk met a producer it did not know, fell back to the root
+axis, and the topology declared one row per audio SAMPLE where it should have had one per encoder frame
+— and two of the four were the exporter's OWN dialect ops, introduced by its own lowering passes and
+reachable by every model since those passes were written.
+[Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md) is the account;
+[Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md) is the
+same lesson three days earlier, and the part it got wrong is that the risk grows with the zoo.
+
+Verified against FunASR on the LOGITS at three lengths — 187 frames of `samples/jfk.wav` (max |Δ|
+3.0e-04, cosine 1.000000000, 187/187 argmax) and both 96-frame halves of it (8.6e-05 and 2.3e-05,
+96/96 each) — with a sabotage arm at max |Δ| 30.7, cosine 0.954 and **68 of 96 argmaxes still
+agreeing**, which is this zoo's standing reason to grade the tensor rather than the tokens. The f64 arm
+inverts the naive reading of the headline number: FunASR's own f32 path is **3.4e-04** from its f64
+self, while loom is **5.7e-05** from it — the export is six times closer to the truth than the
+reference it is being compared against, and the 3.0e-04 is almost entirely the reference's own error.
+
 ### Family 6, and the primitive the engine already had
 
 
@@ -502,19 +580,22 @@ those checkpoints, addressed by [Epic-07](epic-07-text-frontends-and-tokenizers.
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** SANM / FunASR encoders (5) → the remaining TTS families → small classifiers →
-music. Six are **done** — token classifiers (12), codec decoders (11, all three shapes), the AR
-codec-token LM (10), text encoder-decoders (6) and, as of 2026-09-12, CNN + transformer + CTC (4) —
+**Next families:** the remaining TTS families → small classifiers → music. Seven are **done** —
+token classifiers (12), codec decoders (11, all three shapes), the AR codec-token LM (10), text
+encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-15, SANM / FunASR (5, on its
+first leaf) —
 and §2 says what each cost, which is the number the rest of this list should be estimated against.
 Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
 family 6 landing means the zoo has an encoder-decoder text model and a SentencePiece Unigram LM for
 the first time.
 
-**Family 4 is also the correction to a standing estimate.** "Family-1-shaped once the encoder template
-generalizes past NeMo" was half right: the CTC *head* is free, and the *encoder template* is not shared
-at all — family 1's trace is NeMo-shaped around a mel front end and this family takes a raw waveform
-with no length argument. Family 5 is scoped with the same sentence and should be read against that:
-what it will inherit is the epilogue, not the trace. §2 has the detail.
+**Family 4 was the correction to a standing estimate, and family 5 confirmed it.** "Family-1-shaped
+once the encoder template generalizes past NeMo" was half right for both: the CTC *head* is free, and
+the *encoder template* is not shared at all. Three sibling templates now share one epilogue and no
+trace, which is the honest statement of what "family-1-shaped" buys. Family 5 also moved the cost
+somewhere neither estimate looked — it needed no engine primitive and no new head, and what it did need
+was a rebuilt kaldi front end and **four entries in the exporter's own shape walk**, two of them for
+ops the exporter's own passes emit. §2 has the detail.
 
 Family 12 is now proved on **three** checkpoints and both tokenizer halves — two WordPiece encoders
 and one SentencePiece Unigram one — which is what closes the "a family-12 checkpoint that is not
@@ -535,7 +616,7 @@ the traced module, the wrapper and the converted MIL program **together** took G
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
