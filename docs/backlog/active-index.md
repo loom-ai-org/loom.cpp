@@ -19,9 +19,9 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **TWELVE staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape` plus the retrace's own two, `run_bi_recurrent_and_retain` + `expand_by_duration_and_retain` ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)); `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) Family 4's two leaves join them: `hubert-large-ls960-ft` and `data2vec-audio-base-960h` need the `ctc` vocabulary reader AND the grouped-convolution lowering, so a released wheel would decline the file's tokenizer and abort inside `ggml_im2col` on its positional convolution. Qwen3-TTS's two join them (2026-09-13): `qwen3-tts-12hz-0.6b` needs `loom.sample_row`'s new `repetition_penalty`/`penalized`, without which it never emits EOS and runs to the token cap, and `qwen3-tts-tokenizer-12hz` needs nothing new but is half of a pair that does. **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
+| **TWELVE staged models are newer than the Hub — and MUST NOT be uploaded before the engine ships** | Their drivers call bindings that exist only on this branch, so publishing one now would put a GGUF on the Hub that no released `loom-py-rt` can run. Which feature each needs: `encodec-32khz` the ELU primitive + `run_recurrent_and_retain`; `gigaam-v3-rnnt`, `parakeet-rnnt-0.6b`, `parakeet-tdt-0.6b` `output_shape` + a retained ROW range; `kokoro-82m`, `styletts2-ljspeech` `output_shape` plus the retrace's own two, `run_bi_recurrent_and_retain` + `expand_by_duration_and_retain` ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)); `matcha-tts-ljspeech`, `supertonic-2` `run_ode_and_retain`. (`dac-44khz`'s file also differs but needs nothing new — a re-export, not a new capability.) Family 5's `sensevoice-small` joins them too (2026-09-15): its driver binds a DEFAULTED `prompt_ids` input, and a released wheel would also abort inside `ggml_im2col` on the LFR stacking, which is a GROUPED convolution and so needs family 4's `CONV_1D` fix. Family 4's two leaves join them: `hubert-large-ls960-ft` and `data2vec-audio-base-960h` need the `ctc` vocabulary reader AND the grouped-convolution lowering, so a released wheel would decline the file's tokenizer and abort inside `ggml_im2col` on its positional convolution. Qwen3-TTS's two join them (2026-09-13): `qwen3-tts-12hz-0.6b` needs `loom.sample_row`'s new `repetition_penalty`/`penalized`, without which it never emits EOS and runs to the token cap, and `qwen3-tts-tokenizer-12hz` needs nothing new but is half of a pair that does. **These go out WITH rc10, after the engine is merged and its wheels are on PyPI, never before** → [[loom-release-state]] |
 | **EnCodec's Hub upload — BLOCKED ON A LICENCE DECISION, and on rc10** | Exported and verified (max \|Δ\| 5.07e-07, exact sample count, card-gated in `hf-models/encodec-32khz`); it also needs the ELU primitive, so it ships with the engine like the eight above. `facebook/encodec_32khz` declares NO `license:` tag: the EnCodec CODE is MIT, but this checkpoint was trained as part of MusicGen, whose weights are CC-BY-NC-4.0. The card takes the stricter reading; whether to re-upload non-commercial weights to the org is not a call this work should make alone → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 5 — SANM / FunASR encoders** | Family 4 is DONE (2026-09-12) and it is the thing to read first: the "family-1-shaped once the encoder template generalizes past NeMo" estimate was half right. The CTC *head* was free — `CtcGreedyBuilder`, `loom.argmax_rows` and the driver are family 1's, reused unchanged — and the *encoder template* never generalized, because family 1's trace is a NeMo `(input_signal, input_signal_length)` pair around a mel front end. Family 5 is scoped with the same sentence; what it will actually inherit is one component → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 family 5 — the SECOND leaf, Paraformer (CIF + NAR decoder)** | The first leaf, `SenseVoiceSmall`, SHIPPED 2026-09-15 and is deliberately claimed by NAME rather than structurally: `Paraformer` sits in the same directory layout with the same `encoder: SANMEncoder`, so a structural check would claim a checkpoint this template cannot export. What it adds is a **CIF predictor** (a cumulative-sum-with-threshold firing rule that emits a DATA-DEPENDENT number of acoustic embeddings) and a non-autoregressive SANM decoder. The encoder half, the front end and the vocabulary path are all done and reusable; the CIF is the open question and is the first thing in this zoo whose output LENGTH depends on the values rather than on the shapes. `paraformer-zh` is on disk at `/home/flavio/Dev/models/paraformer-zh` → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
 ***Branch state: everything below is on `feat/p5-families-11-4-5`, pushed in all three repos, no PRs
 opened and nothing merged.*** Working trees are clean on all three.
@@ -29,6 +29,43 @@ opened and nothing merged.*** Working trees are clean on all three.
 **loom-py needs a `vendor/loom.cpp` bump before its gate can run against this branch** — the engine
 gained `loom.sample_row`'s `repetition_penalty`/`penalized` for Qwen3-TTS, and loom-py's pin predates
 it. [[loom-p5-family12-shipped]] has the exact steps.
+
+***Family 5's FIRST LEAF SHIPPED 2026-09-15 (P5)*** — SANM / FunASR, `sanm_asr_export.py`,
+`SenseVoiceSmall`. No engine primitive and no new head: the CTC epilogue is family 1's, reused, and
+the vocabulary goes down the existing `sentencepiece_proto` path. The front end is rebuilt (FunASR's
+`WavFrontend` does not trace) and verified against `torchaudio` at 218 lengths; the four-row prompt is
+a graph INPUT with one new driver binding kind (`DEFAULTED`) because inverse text normalization is a
+real capability. Verified on the LOGITS at three lengths, 187/187 + 96/96 + 96/96 argmax, sabotage arm
+30.7. See [Epic-03 §2](../epics/epic-03-model-coverage.md) and
+[Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md).
+
+**SECOND NEW ITEM, same session — a `REPEAT` whose source is a PERMUTE aborts the process.**
+`ggml_compute_forward_repeat_f32` asserts `nb00 == sizeof(float)`, and `_op_loom_broadcast_to` emits a
+bare `REPEAT` from whatever var the broadcast pass handed it. A permuted view has a non-unit innermost
+stride, so a graph that broadcasts a transposed tensor converts, exports, loads, builds — and then
+takes down the host process with a raw `GGML_ASSERT`, not a `loom::Error`. Family 5 hit it twice (an
+edge-pad repeat over a transposed mel, and the position table) and worked around it in the FAMILY, by
+keeping both tensors in a layout where the repeat source is contiguous. That is the right fix for one
+model and not a general one: nothing stops the next family from writing the natural torch spelling.
+Two candidate fixes, and they are not equivalent — the exporter could emit `CONT` before a `REPEAT`
+whose source it knows is permuted (it emits the `PERMUTE`, so it can know), or `op_repeat` could
+`ggml_cont` a non-contiguous input itself (always correct, costs a copy only when needed, but moves a
+graph decision into the engine and against [the lean-runtime principle](../epics/epic-03-model-coverage.md)).
+Related: `ggml_view_*`'s own `nb[0]` assumption, [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md).
+
+**NEW ITEM, from that work — `_infer_dynamic_dim_expr`'s root-axis fallback should be observable.**
+Four separate producers stopped the walk during family 5 and each silently substituted the root axis,
+producing a graph that converts, loads, builds and declares a wrong length. Two of the four
+(`loom_scale`, `loom_broadcast_to`) are ops the exporter's OWN passes emit, so they had been reachable
+by every model since those passes were written, and one (`reduce_sum`) had a case that only handled
+half its inputs. The fallback cannot be removed — it is right for the common case, which is why
+[Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md) left it
+— but it is currently indistinguishable from a derived answer. `ValueFacts` already carries
+`scalar_expr_is_guess` / `range_scalar_is_guess` / `slice_axis_is_guess` for exactly this distinction
+on the scalar paths; `dim_expr` has no equivalent. Adding one, and having the REPEAT-emitting rules
+(`loom_broadcast_to`, `tile`, `fill`, `fill_like`) say so under an env var or in the export log, would
+have turned four five-minute export-and-read cycles into one. **Not a behaviour change** — a
+provenance flag and a diagnostic, nothing that alters an emitted graph.
 
 ***Family 4 SHIPPED 2026-09-12 (P5)*** — CNN + transformer + CTC, `ctc_asr_export.py`, one generic
 recognizer claiming any HF `*ForCTC` directory. Verified on three structurally different checkpoints
