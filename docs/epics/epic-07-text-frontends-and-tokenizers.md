@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-09-03
+last_updated: 2026-09-12
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -37,6 +37,26 @@ before P4.23 tokenizing exactly as it did.
 
 **And the checkpoint's chat template is DATA in the file**, not a program: the exporter reduces its
 Jinja to role tags and `loom::ChatTemplate` concatenates them — [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md).
+
+### Decode-only tables
+
+`ctc_vocab.cpp` is the fifth vocabulary reader and the only one with no `encode`, because family 4's
+checkpoints have no text input at all: the ids come out of a CTC head's argmax and the only question
+ever asked is what they spell. Decoding is concatenation plus one substitution — the word delimiter's
+id becomes a space — which is
+[`Wav2Vec2CTCTokenizer.convert_tokens_to_string`](https://github.com/huggingface/transformers) minus
+the collapse the exported driver's own epilogue already did.
+
+**It is a tag of its own (`tokenizer.ggml.model == "ctc"`) although `loom::Vocab`'s SentencePiece
+decode would have produced the same text** from a file with the delimiter piece rewritten to U+2581.
+[ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md) is the argument: the
+per-family-tag convention exists so that a tag answers "which scheme is this", and the cheap option
+spends that to save about a hundred lines — `id_to_piece` would answer with a character the checkpoint
+never had, and the tag would claim a segmentation algorithm the file does not carry.
+
+**Three loaders now run in order in `transcribe`**, and the order is load-bearing: `BpeVocab::load` and
+`CtcVocab::load` return `nullptr` for a schema that is not theirs, while `Vocab::load` **throws**. Any
+future reader goes ahead of `Vocab::load` for the same reason.
 
 ### Grapheme front ends
 
@@ -83,6 +103,7 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
 | Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md) |
+| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record

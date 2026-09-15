@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-10
+last_updated: 2026-09-12
 ---
 
 # Epic-03: Model Coverage
@@ -13,9 +13,14 @@ The measure of the data-driven design is how cheaply a new architecture arrives.
 models ship, which family template each belongs to, and the roadmap for the rest — with the standing
 acceptance criterion that **a new family should need no engine work**.
 
-Seventeen models are published at
-[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). Each is a single GGUF carrying its own
-topologies, driver and — where the architecture has one — its vocabulary.
+Twenty-three models are published at
+[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), and three more are exported and
+verified but unpublished — EnCodec-32kHz (see the hub for why) and family 4's two English CTC
+checkpoints, which go out with the release that carries the engine changes they need. **Family 11 is
+closed**: DAC, SNAC and EnCodec cover the uniform, multi-rate and recurrent shapes a codec decoder
+comes in. **Family 4 is closed on three checkpoints**, covering the three architectures HF's
+`AutoModelForCTC` resolves. Each is a single GGUF carrying its own topologies, driver and — where
+the architecture has one — its vocabulary.
 
 ## 2. Architectural Overview
 
@@ -25,12 +30,14 @@ topologies, driver and — where the architecture has one — its vocabulary.
 |---|---|---|
 | **Language** | Qwen3-0.6B-Base, LFM2-350M (monolithic *and* modular), SmolLM2-360M-Instruct, Gemma-3-270M-it | `causal_lm_export.py` |
 | **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3 | `nemo_asr_export.py` |
+| **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — encoder-decoder** | Whisper-small | `multi_phase_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
-| **Audio codec (decode)** | DAC-44kHz | `audio_codec_export.py` |
+| **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
+| **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Text → codec tokens** | Dia-1.6B | `dia_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
@@ -154,10 +161,42 @@ Verified against `transformers` on the waveform, on real speech at two clip leng
 (2 s) and 2.22e-04 (5 s), cosine ~1.0. Sabotage arm — the same graph against a different clip's
 reference — 1.14.
 
-#### What the second codec costs, measured before starting it
+#### EnCodec: both blockers closed, and a third that was never named
 
-EnCodec 32 kHz (MusicGen's codec) was probed and is **not** a repeat of DAC. Two blockers, both
-confirmed on the real checkpoint and neither a gap in this exporter:
+**Shipped 2026-09-12.** The scoping below was written before the work and is kept because it was
+half right in an instructive way: the two blockers it named were real, and neither was where the
+difficulty actually lay.
+
+* **Blocker 1 (dynamic padding) was one line, and is now PROVED rather than argued.** All 10
+  `EncodecConv1d` on the decode path have stride 1 and their extra padding is 0 at every length, so
+  the patch is a constant — re-derived from the real modules by
+  `tests/ci/test_encodec_export.py` every run rather than trusted from a comment.
+* **Blocker 2 (the LSTM) needed no new machinery at all.** `RecurrentPhase` has traced a stacked
+  `nn.LSTM` into per-timestep cell topologies since Parakeet's prediction network, and
+  `loom.run_recurrent` runs one in C++. What was missing was the DRIVER-side call, now `RecurrentCall`
+  — one Lua call per layer, where `run_bi_lstm` loops timesteps in Lua.
+* **The blocker nobody named cost the most.** EnCodec crops with `x[..., left : shape[-1] - right]`,
+  and MIL retires its symbolic algebra through a shape-derived slice — `8*is0 + 8` in, a fresh opaque
+  `is118` out. The exporter's rule for an unknown symbol is to substitute the root axis, so a crop that
+  should read `8*n_codes + 2` was emitted as `n_codes + 2` and the model decoded 4 seconds of audio
+  into 200 samples. No error anywhere. [Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md)
+  has the two-part fix and the general lesson.
+
+**One engine change: `ELU`** — EnCodec's SEANet decoder activates with it where every vocoder in
+families 7-9 uses LeakyReLU. `ggml_elu` already existed unexposed, so it is one registration, one
+topology rule (guarding `alpha != 1`, which ggml's is fixed at) and one line in the shape walk.
+
+**The contract is unchanged and the export shape is not**, which is
+[ADR-030](../adrs/adr-030-a-task-is-a-contract-not-an-export-shape.md): the task fixes
+`audio_codes -> audio`, and whether that is one traced graph or three phases around a C++ loop is
+the family's own business. `audio-codec` now declares the root base class for the same reason
+`automatic-speech-recognition` does.
+
+Verified against `transformers` on the waveform, at 32 kHz: max |Δ| **5.07e-07**, cosine 1.000000, the
+exact sample count (`n_frames * 640`), sabotage arm 0.55, and the ASR oracle reading the clip back.
+4 s of audio decodes in 1.7 s on the two-core dev box, the LSTM loop included.
+
+*The original scoping, kept for the record:*
 
 * **coremltools refuses its convolution padding** once the frame axis is dynamic — `Dynamic padding
   for n-dimensional tensors is not supported`, because `EncodecConv1d` pads by a length-derived
@@ -181,7 +220,128 @@ EnCodec directory and raises naming both reasons — detection is what makes the
 **This is why the composition target changed.** MusicGen was picked for its small LM and would have
 dragged in this codec; Dia decodes through DAC, which is done, so it costs the LM half only.
 
+#### The second leaf was SNAC, and the layout claim held
+
+SNAC 24 kHz shipped 2026-09-11 and is the leaf Epic-03 had named for the purpose: `vq_strides =
+[4, 2, 1]` puts its three codebooks at three different frame rates, which is what tests whether "codes
+in, frame-major" survives a multi-rate codec. **It survives**, with the row read as the coarsest
+codebook's frame — `sum(coarse // stride)` ids wide, 7 here, level-major — which is `n_codebooks`
+exactly when every stride is 1, so DAC is the same formula rather than a second branch.
+[ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md) records that and the
+two consequences a caller sees: `codec.n_codebooks` is code streams per frame (7 for 3 codebooks), and
+`codec.frame_rate` is the rate of the rows (11.72 Hz, not the codec's own 46.875).
+
+**No new engine primitive, again** — the third family in a row. The decode path lowers to convolutions
+(depthwise and transposed), `SIN`/`SQR` and the `REPEAT` that carries `from_codes`' `repeat_interleave`
+back up to the finest rate. What it cost outside the family was one export dependency (`snac` is its
+own MIT package, imported lazily), two class-level patches — `Snake1d`, whose `@torch.jit.script` body
+reshapes through `x.shape[i]` and does not convert, and `NoiseBlock` — and **the family's first
+stochastic leaf**.
+
+That last one is the engine-adjacent part, and it needed no engine change either: a topology is a pure
+graph and cannot draw, but the Lua bridge has had `loom.seed_rng`/`loom.gaussian_array` since VITS, so
+the noise became four graph INPUTS the synthesized driver draws at `multiple * n_codes`. `DriverInputs`
+gains a `NOISE` binding kind beside `POSITION` and `MASK` — named by the export rather than by input
+name, because the length ratio is not recoverable from a name — and any future family with a
+stochastic leaf gets it free. The driver also accepts the arrays from the caller, which is what keeps
+the oracle exact on a stochastic model.
+
+**The noise was dropped first, on measurements, and put back after a listening test** — the export
+shipped the conditional mean until a listener called it *"less sharp, slightly more artificial"*.
+ADR-029 carries both halves and [Retro-043](../retros/retro-043-the-band-was-20db-down-and-audible.md)
+the lesson: a band 21 dB down is not an inaudible band.
+
+It also paid for itself outside family 11 entirely. The first export matched at cosine 0.999998 and
+was wrong: coremltools lowers `reciprocal` to an op whose epsilon defaults to 1e-4, and Snake's
+`1/alpha` had folded to `1/(alpha + 1e-4)`. That is fixed in `torch_patches.py` for every model this
+pipeline will ever trace — [Retro-042](../retros/retro-042-a-converters-op-default-changed-the-function.md),
+which also records the f32-vs-f64 arm that told a defect from float noise.
+
+Verified against the package's own decode on real speech, both sides given the same noise: max |Δ|
+**1.20e-06**, cosine 1.000000, the exact sample count (`n_rows * 4 * 512`), and the ASR oracle reading
+22/22 words. Sabotage arm — the same graph against a reversed-code reference — 1.07. Three further
+checks the stochastic half needs: a different draw moves the waveform (8.4% relative RMS, so the noise
+is load-bearing), two runs at the default seed are bit-identical, and a named seed differs from the
+default.
+
+### Family 4, and the attribute nobody was reading
+
+Family 4 — a convolutional feature encoder over the RAW waveform, a transformer, and one linear CTC
+head — is wav2vec 2.0, HuBERT, data2vec-audio and everything fine-tuned from them. The roadmap's
+estimate was "family-1-shaped once the encoder template generalizes past NeMo, and it needs no new
+head at all" (`EXPORT-ROADMAP.md` ordering note 6). **The head half was exactly right and the
+generalization half did not happen**, which is worth stating because it is the second time a family's
+cost was misplaced by the same kind of reasoning.
+
+The head is free. `CtcGreedyBuilder` is reused verbatim, `loom.argmax_rows` already existed, and the
+synthesized driver is family 1's five statements with a different blank id. The *encoder template* is
+not shared at all: family 1's `build_trace` is a NeMo-shaped `(input_signal, input_signal_length)`
+pair around a mel front end, and this family has neither a mel front end nor a length argument. So
+`ctc_asr_export.py` is a sibling template rather than a leaf of `nemo_asr_export.py`, and what the two
+genuinely share is the epilogue — which is the honest reading of "family-1-shaped".
+
+Four things are this family's own.
+
+* **The waveform normalization is part of the model and is NOT in the checkpoint's `forward`.** Every
+  member ships `do_normalize: true` in its `preprocessor_config.json`, and `Wav2Vec2FeatureExtractor`
+  applies `(x - x.mean()) / sqrt(x.var() + 1e-7)` before the model sees a sample. Family 1's standing
+  rule is that the front end is INSIDE the graph — it is what lets a host hand the engine a waveform
+  and nothing else — so the wrapper does it, with the same population variance and the same epsilon.
+  Omitting it neither raises nor changes a shape: it feeds a correctly-shaped graph audio at the wrong
+  scale, and a checkpoint trained on normalized input transcribes plausible nonsense from it.
+* **The blank is the tokenizer's `pad_token` and its id cannot be derived from the class count.**
+  NeMo's convention is "last class"; HF's is row 0. They disagree at both ends, and `pad_token` is not
+  always spelled `<pad>` — see [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md).
+* **The attention mask is omitted, and that is what keeps the length dynamic.** This is
+  [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) one modality over: a family whose
+  door hands the model exactly the samples the caller recorded has no padding to describe, and
+  `_get_feature_vector_attention_mask` builds its frame count from a Python-level `.shape[1]` that a
+  trace bakes. `attn_implementation="eager"` for family 12's reason as well.
+* **One engine reader, `CtcVocab`** — the CTC character table, decode-only, `tokenizer.ggml.model ==
+  "ctc"`. ADR-033 is why it is a tag of its own rather than a `"t5"` file with the delimiter rewritten,
+  and why a vocabulary reader is not the kind of engine work the acceptance criterion is about.
+
+**And the cost that was in none of the scoping: the exporter had been mislabelling grouped
+convolutions as depthwise since the first export.** `groups > 1` is not "depthwise" — depthwise is
+one input channel per output channel — and the two coincide at both ends of the range, so eight
+families' worth of dense and genuinely-depthwise convolutions never separated them. A
+`Wav2Vec2PositionalConvEmbedding` is `groups=16` over 768 channels, the first model in the zoo that
+sits in the middle, and it aborted the engine inside `ggml_im2col` naming neither the op nor the
+model. `CONV_1D` honours `groups` now (G slices re-entering the same op, one `ggml_concat`), `CONV_1D_DW`
+rejects a kernel that is not depthwise, and the exporter reads the kernel's own shape. The second half
+of that fix is the sharper lesson —
+[Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md).
+
+Verified against `transformers` on the LOGITS rather than the transcript, over 11 s of real speech
+(549 frames), on **three structurally different checkpoints**:
+
+| checkpoint | class | max \|Δ\| | cosine | argmax |
+|---|---|---|---|---|
+| `data2vec-audio-base-960h` | `Data2VecAudioForCTC` | 1.87e-03 | 0.999999821 | 549/549 |
+| `hubert-large-ls960-ft` | `HubertForCTC` | 1.73e-03 | 0.999999881 | 549/549 |
+| `omniASR-CTC-300M-v2` | `Wav2Vec2ForCTC` | 5.45e-04 | 1.000000000 | 549/549 |
+
+Sabotage arm — one checkpoint's engine output against another's reference, same shape — 32.7. The
+deltas are larger than family 12's 1e-05 and the f64 arm is what says why rather than assuming: torch's
+own f32 is **7.0e-04** from the same model at f64 and loom is **1.2e-03**, the same order, over a graph
+that is seven strided convolutions and 12-24 transformer layers deep across 176,000 samples.
+
+The three differ in the three places a branch could have been needed and was not: HuBERT's
+`feature_projection` returns a bare tensor where the other two return a pair, data2vec's positional
+convolution is five stacked kernel-19 layers where the others have one kernel-128 layer with an
+odd-padding trim, and omniASR carries a 10,288-piece multilingual vocabulary with a literal space as
+its word delimiter against the other two's 32 characters and `|`.
+
+**`omniASR-CTC-300M-v2` is verified and NOT shippable, and the reason is the checkpoint.** It is
+scale-sensitive: its own documented `AutoProcessor` path (which normalizes) transcribes `م` for
+English speech, while the same audio un-normalized transcribes correctly. loom reproduces `transformers`
+exactly on it — including on the broken arm, which is what the 5.45e-04 above measures — so the export
+is right and the checkpoint's declared front end disagrees with its weights. Kept as the family's third
+structural witness; not published.
+
 ### Family 6, and the primitive the engine already had
+
+
 
 Family 6 — text in, text out, through an encoder read once and a KV-cached decoder cross-attending to
 it — is structurally family 2's and family 10's shape, so the `encoder`/`cross_kv`/`decoder` split
@@ -342,13 +502,19 @@ those checkpoints, addressed by [Epic-07](epic-07-text-frontends-and-tokenizers.
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** the second codec decoder (EnCodec or SNAC) → CNN+CTC and SANM encoders (both
-family-1-shaped once the encoder template generalizes past NeMo) → the remaining TTS families → small
-classifiers → music. Four are **done** — token classifiers (12), codec decoders' first leaf (11), the
-AR codec-token LM (10) and, as of 2026-09-10, text encoder-decoders (6) — and §2 says what each cost,
-which is the number the rest of this list should be estimated against. Family 10 landing means the
-`text2codes` → `codes2speech` composition has both halves in the tree; family 6 landing means the zoo
-has an encoder-decoder text model and a SentencePiece Unigram LM for the first time.
+**Next families:** SANM / FunASR encoders (5) → the remaining TTS families → small classifiers →
+music. Six are **done** — token classifiers (12), codec decoders (11, all three shapes), the AR
+codec-token LM (10), text encoder-decoders (6) and, as of 2026-09-12, CNN + transformer + CTC (4) —
+and §2 says what each cost, which is the number the rest of this list should be estimated against.
+Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
+family 6 landing means the zoo has an encoder-decoder text model and a SentencePiece Unigram LM for
+the first time.
+
+**Family 4 is also the correction to a standing estimate.** "Family-1-shaped once the encoder template
+generalizes past NeMo" was half right: the CTC *head* is free, and the *encoder template* is not shared
+at all — family 1's trace is NeMo-shaped around a mel front end and this family takes a raw waveform
+with no length argument. Family 5 is scoped with the same sentence and should be read against that:
+what it will inherit is the epilogue, not the trace. §2 has the detail.
 
 Family 12 is now proved on **three** checkpoints and both tokenizer halves — two WordPiece encoders
 and one SentencePiece Unigram one — which is what closes the "a family-12 checkpoint that is not
@@ -369,7 +535,7 @@ the traced module, the wrapper and the converted MIL program **together** took G
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

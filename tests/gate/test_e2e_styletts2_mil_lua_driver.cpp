@@ -83,8 +83,11 @@ int main() {
         // Six BiLSTMs, one cell topology per direction. It was 41 until the cell topology gained its
         // second declared output: each BiLSTM was four topologies (`_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`)
         // whose node lists were identical, so every timestep evaluated the gate stack twice to read
-        // each half of the same step (recurrent.py::_lstm_cell_topology).
-        LOOM_CHECK(model_mil->topology_names().size() == 29);
+        // each half of the same step (recurrent.py::_lstm_cell_topology). 29 until
+        // `duration_style_concat`: the style vector DurationEncoder concatenates into every row is a
+        // graph now rather than Lua row surgery, and one phase serves all four of its call sites
+        // (ADR-031's follow-up).
+        LOOM_CHECK(model_mil->topology_names().size() == 30);
 
         bridge.load_script(driver_script);
 
@@ -105,6 +108,27 @@ int main() {
         });
         const auto& wav_d = std::get<std::vector<double>>(result);
         lua_wav.assign(wav_d.begin(), wav_d.end());
+
+        // **A SECOND call, and it must return the same waveform.** Everything a driver reuses between
+        // calls lives here and nowhere else -- a cached graph, a module's retained store, a buffer
+        // reshaped by a binding rather than by a build -- and until this existed every test in the
+        // suite called `infer` exactly once per process, so that state was covered by nothing
+        // (Retro-045). The seed is re-applied by the driver's own first statement, so the sampler
+        // draws the same noise and the answer is identical; any difference is stale state.
+        loom::LoomLuaBridge::Value again = bridge.call("infer", {
+            {"input_ids", input_ids_d},
+            {"diffusion_steps", static_cast<double>(kDiffusionSteps)},
+            {"seed", static_cast<double>(kSeed)},
+        });
+        const auto& again_d = std::get<std::vector<double>>(again);
+        LOOM_CHECK(again_d.size() == wav_d.size());
+        double second_call_max_diff = 0.0;
+        for (size_t i = 0; i < again_d.size() && i < wav_d.size(); ++i) {
+            second_call_max_diff = std::max(second_call_max_diff, std::fabs(again_d[i] - wav_d[i]));
+        }
+        std::fprintf(stderr, "second call: max |diff| %g over %zu sample(s)\n", second_call_max_diff,
+                     again_d.size());
+        LOOM_CHECK(second_call_max_diff == 0.0);
     }
 
     LOOM_CHECK(!lua_wav.empty());

@@ -203,6 +203,18 @@ int64_t GraphBuilder::effective_n_kv(const DynamicAxes& axes) const {
     return std::min((n_kv + bucket - 1) / bucket * bucket, capacity);
 }
 
+// A retained graph ends in one `cpy` per declared output, whose DESTINATION is the store's own
+// tensor. `OutputStore::reshape` keeps those tensors only while the geometry it is handed is the same,
+// and the recurrent and expansion bindings hand it a different one -- a sequence, not a build's
+// output -- so a module whose graph is cached can have its slots replaced between two builds. Serving
+// the cached graph then copies into freed memory.
+//
+// The store's own epoch answers it and the slot POINTERS do not -- see `cached_store_epoch_` for the
+// bug that taught us the difference.
+bool GraphBuilder::store_slots_unmoved(const OutputStore* out_store) const {
+    return cached_store_epoch_ == out_store->layout_epoch();
+}
+
 const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, OutputStore* out_store) {
     // Checked before anything else, including the cache lookup: a cached topology's cell indices come
     // from n_past and are rewritten on a REUSE too, so an axes map without it has no answer to give at
@@ -227,7 +239,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     // freed, so every tensor in it still points where ggml_gallocr_alloc_graph put it, and its declared
     // inputs still hold whatever was last written into them. Exactly one graph is retained -- see the
     // header for why an LRU keyed by shape would not be safe against a reshaped OutputStore.
-    if (has_cached_ && cached_store_ == out_store && cached_key_ == key) {
+    if (has_cached_ && cached_store_ == out_store && cached_key_ == key &&
+        (out_store == nullptr || store_slots_unmoved(out_store))) {
         // ...with the two things that describe the STEP rather than the graph, and so must move even
         // when the graph does not. The cell indices are precisely what `n_past` turned into -- a value
         // the host rewrites between steps -- and `n_kv_real` is how much of the bucket this particular
@@ -426,6 +439,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     cached_ = std::move(result);
     cached_key_ = std::move(key);
     cached_store_ = out_store;
+    cached_store_epoch_ = out_store == nullptr ? 0 : out_store->layout_epoch();
     has_cached_ = true;
     ++builds_;
     return cached_;

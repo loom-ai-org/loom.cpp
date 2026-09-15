@@ -96,6 +96,28 @@ const char* kScript = R"lua(
                                   {hidden = {from = 'stage_a', rows = inputs.rows}})
     end
 
+    -- One ROW out of the middle, which is what a transducer's joint consumes per call: the oracle is the
+    -- same slice taken out of the marshalled table, so a copy that ignored `row` (or took the offset
+    -- from the wrong end) differs from it everywhere but row 0.
+    function row_marshalled(inputs)
+        local n = #inputs.tokens
+        local cur = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0},
+                                       {tokens = inputs.tokens})
+        -- `#cur / n` for `prefix_marshalled`'s own reason: stage_a declares TWO outputs, so a
+        -- two-local capture binds the second output rather than a shape.
+        local width = #cur / n
+        local one = {}
+        for i = 1, width do one[i] = cur[inputs.row * width + i] end
+        return loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0}, {hidden = one})
+    end
+
+    function row_retained(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        return loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0},
+                                  {hidden = {from = 'stage_a', row = inputs.row, rows = 1}})
+    end
+
     -- `rows` equal to everything the module retained must be the untrimmed copy, not a near-miss: it is
     -- the case every driver hits whose audio happens to fill its last chunk exactly, and the case the
     -- family's own default expression produces.
@@ -109,6 +131,58 @@ const char* kScript = R"lua(
         local out = {}
         for i = 1, #whole do out[i] = trimmed[i] - whole[i] end
         return out
+    end
+
+    -- Frame expansion between two graphs, marshalled: the oracle. `cur` is [n_embd, n_tokens], so its
+    -- flat form is one row per timestep -- the convention both spellings of this binding take.
+    function expand_marshalled(inputs)
+        local n = #inputs.tokens
+        local cur = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local width = #cur / n
+        return loom.expand_by_duration(cur, n, width, inputs.durations)
+    end
+
+    -- The same expansion with the sequence never becoming a Lua table: the counts are host-side, the
+    -- payload is not. Read back only because a test has to look at it.
+    function expand_retained(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        loom.expand_by_duration_and_retain('stage_a', inputs.durations)
+        local data = loom.get_output('stage_a', 1)
+        return data
+    end
+
+    -- The other output layout, transposed back so the same oracle judges it.
+    function expand_retained_layout_a(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local _, shape = loom.expand_by_duration_and_retain('stage_a', inputs.durations, 'layout_a')
+        local frames, width = shape[1], shape[2]
+        local data = loom.get_output('stage_a', 1)
+        local rows = {}
+        for f = 0, frames - 1 do
+            for c = 0, width - 1 do rows[f * width + c + 1] = data[c * frames + f + 1] end
+        end
+        return rows
+    end
+
+    -- And the shape that matters in a real driver: the expanded sequence consumed BY A GRAPH, by name.
+    -- The oracle is the same expansion marshalled into that graph's input.
+    function expand_retained_into_graph(inputs)
+        local n = #inputs.tokens
+        loom.run_subgraph_and_retain('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local _, shape = loom.expand_by_duration_and_retain('stage_a', inputs.durations)
+        return loom.run_subgraph('stage_b', {n_tokens = shape[2], n_past = 0},
+                                  {hidden = {from = 'stage_a'}})
+    end
+
+    function expand_marshalled_into_graph(inputs)
+        local n = #inputs.tokens
+        local cur = loom.run_subgraph('stage_a', {n_tokens = n, n_past = 0}, {tokens = inputs.tokens})
+        local width = #cur / n
+        local expanded = loom.expand_by_duration(cur, n, width, inputs.durations)
+        return loom.run_subgraph('stage_b', {n_tokens = #expanded / width, n_past = 0},
+                                  {hidden = expanded})
     end
 
     -- Retrieval by name, marshalling form: must equal what run_subgraph returns for the same output.
@@ -198,9 +272,12 @@ const char* kScript = R"lua(
         "unregistered module 'nope'",
         'is not a non-empty sub-range',
         'is not a non-empty sub-range',
-        'so that is not a prefix of it',
-        'so that is not a prefix of it',
+        -- `rows` is a RANGE now, not only a prefix -- `row` says where it starts -- so the
+        -- out-of-bounds message names both and says "range" (src/core/lua_bridge.cpp's copy_row_range).
+        'so that is not a range within it',
+        'so that is not a range within it',
         'must agree exactly',
+        'duration(s) were given',
     }
 
     function expect_error(inputs)
@@ -251,7 +328,7 @@ const char* kScript = R"lua(
                 loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
                 loom.run_subgraph('stage_b', {n_tokens = 1, n_past = 0},
                                    {hidden = {from = 'stage_a', rows = 0}})
-            else
+            elseif inputs.case == 10 then
                 -- `rows` disagreeing with the axis the consumer was built for. This is the failure the
                 -- whole design leans on: PromptSegments feeds ONE local as both, so a formula that is
                 -- wrong in the same way in both places is caught by the encoder's own row count, and a
@@ -259,6 +336,11 @@ const char* kScript = R"lua(
                 loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
                 loom.run_subgraph('stage_b', {n_tokens = 3, n_past = 0},
                                    {hidden = {from = 'stage_a', rows = 2}})
+            else
+                -- One duration per retained row is what the expansion repeats; a count that does not
+                -- match is a driver whose duration predictor and its sequence disagree about length.
+                loom.run_subgraph_and_retain('stage_a', {n_tokens = 3, n_past = 0}, {tokens = {1, 3, 4}})
+                loom.expand_by_duration_and_retain('stage_a', {2, 2})
             end
         end)
         if ok then return -1 end
@@ -288,7 +370,7 @@ void check_all_zero(const std::vector<double>& diffs, size_t skip, const char* w
 } // namespace
 
 int main() {
-    ggml_backend_ptr backend(loom_test::cpu_backend());
+    ggml_backend_ptr backend(loom_test::test_backend());
     LOOM_CHECK(backend != nullptr);
 
     const std::string path = std::string(LOOM_TEST_FIXTURE_DIR) + "/builder_test.gguf";
@@ -363,6 +445,23 @@ int main() {
     LOOM_CHECK(reshaped.size() == 2 + 4);
     check_all_zero(reshaped, 2, "reshape_then_read");
 
+    // --- 5a2. ONE ROW out of the middle, by `row`. The capability a recurrence needs: a cell consumes
+    // one timestep per call, and before this the only way to give it one was to marshal the whole
+    // sequence and slice it in Lua. Every row is checked, so an off-by-one in the offset cannot pass on
+    // the one row where both answers agree. ---
+    for (double row : {0.0, 1.0, 2.0}) {
+        const std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+            {"tokens", tokens}, {"row", row},
+        };
+        const std::vector<double> ref = as_array(bridge.call("row_marshalled", args));
+        const std::vector<double> got = as_array(bridge.call("row_retained", args));
+        std::fprintf(stderr, "row=%g: %zu element(s) each\n", row, got.size());
+        LOOM_CHECK(got.size() == ref.size() && !got.empty());
+        std::vector<double> diffs(got.size());
+        for (size_t i = 0; i < got.size(); ++i) diffs[i] = got[i] - ref[i];
+        check_all_zero(diffs, 0, "row_retained");
+    }
+
     // --- 5b. A PREFIX of a retained output equals the same rows sliced out of the marshalled table
     // (BACKLOG.md P4.3d). This is the capability that lets a family-3 driver hand its decoder only the
     // audio rows its caller's real waveform produced, rather than the whole chunk-padded encoder
@@ -395,10 +494,38 @@ int main() {
     check_all_zero(as_array(bridge.call("prefix_all_retained", {{"tokens", tokens}})), 0,
                    "prefix_all_retained");
 
+    // --- 5c. Frame expansion on a retained output: the same numbers as repeating the rows in Lua, in
+    // both layouts, and shaped so the next GRAPH can read it by name. The durations are uneven and
+    // sum to more than the source's rows, which is what a duration predictor produces and what a
+    // stride bug in either layout gets wrong. ---
+    {
+        const std::vector<double> durations = {2, 1, 3};
+        const std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+            {"tokens", tokens}, {"durations", durations},
+        };
+        const std::vector<double> ref = as_array(bridge.call("expand_marshalled", args));
+        LOOM_CHECK(ref.size() == 4 * 6); // [N_EMBD=4, sum(durations)=6]
+        for (const char* fn : {"expand_retained", "expand_retained_layout_a"}) {
+            const std::vector<double> got = as_array(bridge.call(fn, args));
+            std::fprintf(stderr, "%s: %zu element(s)\n", fn, got.size());
+            LOOM_CHECK(got.size() == ref.size());
+            std::vector<double> diffs(got.size());
+            for (size_t i = 0; i < got.size(); ++i) diffs[i] = got[i] - ref[i];
+            check_all_zero(diffs, 0, fn);
+        }
+        const std::vector<double> graph_ref = as_array(bridge.call("expand_marshalled_into_graph", args));
+        const std::vector<double> graph_got = as_array(bridge.call("expand_retained_into_graph", args));
+        LOOM_CHECK(graph_got.size() == graph_ref.size());
+        LOOM_CHECK(graph_got.size() == 6 * 6); // [N_VOCAB=6, frames=6]
+        std::vector<double> diffs(graph_got.size());
+        for (size_t i = 0; i < graph_got.size(); ++i) diffs[i] = graph_got[i] - graph_ref[i];
+        check_all_zero(diffs, 0, "expand_retained_into_graph");
+    }
+
     // --- 6. The failure modes are errors that name the real problem, not silence or a crash.
     // The script returns the case index when the message matched, 0 when it raised something else
     // (printing it), and -1 when nothing was raised at all -- the case that would matter most. ---
-    for (double case_id = 1; case_id <= 10; ++case_id) {
+    for (double case_id = 1; case_id <= 11; ++case_id) {
         const auto verdict = std::get<double>(bridge.call("expect_error", {{"case", case_id}}));
         std::fprintf(stderr, "error case %d: verdict %g\n", static_cast<int>(case_id), verdict);
         LOOM_CHECK(verdict == case_id);
