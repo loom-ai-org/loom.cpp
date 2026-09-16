@@ -3,6 +3,7 @@
 #include "loom/core/audio_window.h"
 #include "loom/core/bpe_vocab.h"
 #include "loom/core/ctc_vocab.h"
+#include "loom/core/funasr_vocab.h"
 #include "loom/core/model_contract.h"
 #include "loom/core/vocab.h"
 #include "loom/loom_errors.h"
@@ -111,8 +112,11 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     // about a gpt2 or ctc file kills the run before the right loader is ever reached.
     auto bpe_vocab = BpeVocab::load(model);
     auto ctc_vocab = bpe_vocab ? nullptr : CtcVocab::load(model);
-    auto spm_vocab = (bpe_vocab || ctc_vocab) ? nullptr : Vocab::load(model);
-    if (!spm_vocab && !bpe_vocab && !ctc_vocab) {
+    // Family 5's, whose table is flat like family 4's but whose pieces compose differently -- `@@`
+    // marks a continuation, CJK eats the space before it, and letter runs collapse. See FunasrVocab.
+    auto funasr_vocab = (bpe_vocab || ctc_vocab) ? nullptr : FunasrVocab::load(model);
+    auto spm_vocab = (bpe_vocab || ctc_vocab || funasr_vocab) ? nullptr : Vocab::load(model);
+    if (!spm_vocab && !bpe_vocab && !ctc_vocab && !funasr_vocab) {
         throw LoadError("transcribe: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
     }
     if (!model.has_kv("model.driver_script")) {
@@ -148,6 +152,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
             }
         }
         if (ctc_vocab) return ctc_vocab->decode(text_ids);
+        if (funasr_vocab) return funasr_vocab->decode(text_ids);
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
 
