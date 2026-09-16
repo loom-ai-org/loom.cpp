@@ -458,24 +458,37 @@ Verified against FunASR on the encoder TENSOR (max |Δ| 4.48e-05 / 4.81e-06 on 1
 of English, cosine ≈ 1, sabotage arm 3.81e-01 at cosine 0.168) and on the transcript, which is
 **character-for-character identical on both clips**.
 
-**What it does not have yet is DETOKENIZATION, and that turned out not to be a vocabulary problem.**
-The export writes no vocabulary and returns ids. The obvious reading — 8,404 flat pieces, so add a
-reader — is wrong twice over. The TABLE needs nothing new: `CtcVocab`
-([ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md)) is already one array
-indexed by id and would hold these pieces with no word delimiter. And the RULE is not a table property.
-Measured against FunASR's `sentence_postprocess`, it is four things, two of which no per-piece flag can
-express:
+**Its detokenization is a vocabulary scheme of its own, and that was the second reading rather than the
+first.** `tokens.json` is 8,404 flat decode-only pieces — the same shape family 4's table has — but
+concatenating them is not text:
 
-    ['and','so','my','f@@','el@@','low']  ->  "and so my fellow"     @@ merges, Latin words space
-    ['hello','你','好']                    ->  "hello你好"             the space is REMOVED before CJK
-    ['b','b','c','news']                  ->  "BBC news"             letter runs collapse AND UPPERCASE
-    ['<s>','and','</s>']                  ->  "and"                  specials drop
+    ['and','so','my','f@@','el@@','low']  ->  "and so my fellow"   @@ continues into the NEXT piece
+    ['hello','你','好']                    ->  "hello你好"           the space is REMOVED before CJK
+    ['b','b','c','news']                  ->  "BBC news"           letter runs collapse AND UPPERCASE
+    ['<s>','and','</s>']                  ->  "and"                control pieces drop
 
-The CJK case needs lookahead and the abbreviation case is a text transform, so this belongs where
-[HIGH-LEVEL-API §2](../HIGH-LEVEL-API.md) puts a per-TASK policy: the engine's `transcribe` door,
-beside Whisper's control-token stripping — not in a vocabulary class. **Leaf 2 is still where family 5
-stops being free of engine work**; it is just a different piece of engine than it first looked.
-A file claiming a vocabulary it detokenized wrongly would be worse than one that admits it has none.
+This was first written up as a per-TASK postprocess for the `transcribe` door, on the grounds that the
+CJK rule needs lookahead and the abbreviation rule is a transform. That was wrong, and
+[ADR-036](../adrs/adr-036-composition-is-the-scheme-not-the-table.md) records why: `decode` has never
+been a lookup for any family here — SentencePiece's rewrites U+2581, WordPiece's strips `##` — and
+`model.detokenize(ids)` has to answer something, where `"andsomyf@@el@@low"` is not an answer. So it is
+`loom::FunasrVocab` under `tokenizer.ggml.model == "funasr"`, which cost the engine one class and one
+KV.
+
+It could not have been folded into an existing tag: `@@` is a SUFFIX meaning "I continue" where
+U+2581 and `##` are PREFIXES meaning "a word starts here", they are duals, and the same piece string
+occurs in both roles. And the per-piece SCRIPT is computed by the EXPORTER, because the reference's
+tests are per-character against Python's Unicode `isalpha()` and this vocabulary holds one character
+(U+2B5AF) that is alphabetic and outside the CJK block a C++ range check would use — ADR-027's
+principle one family over.
+
+**Verified differentially, which is what found the defects**: 20,000 random id sequences from the real
+vocabulary, engine against `sentence_postprocess`, **0 mismatches**. Three things it caught that no
+example would have — `f@@` is neither CJK nor Latin and is *still* a continuation (the marker test is
+orthogonal to the script, and a first version nested it inside the Latin branch); `9@@` IS CJK by the
+reference's own test, since digits and `@` count, so it is *not* a continuation; and a `<blank>` the
+exporter was dropping where the reference prints it, which no realistic input could expose because a
+non-autoregressive decoder cannot emit one.
 
 ### Family 6, and the primitive the engine already had
 

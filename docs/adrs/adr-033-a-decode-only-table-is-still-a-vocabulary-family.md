@@ -60,3 +60,7 @@ one would mean inventing a segmentation rule no file in this family states.
 **Three loaders now run in order in `transcribe`.** `BpeVocab::load` and `CtcVocab::load` return
 `nullptr` for a schema that is not theirs; `Vocab::load` **throws**. So `Vocab::load` is last, and any
 future reader has to go ahead of it for the same reason.
+
+**Extended by [ADR-036](adr-036-composition-is-the-scheme-not-the-table.md)**, which reaches the
+same answer for family 5 from the other direction: there the TABLE is identical in shape to this
+one and it is the COMPOSITION that is new, which is still a scheme and still earns a tag.
