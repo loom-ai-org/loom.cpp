@@ -458,13 +458,24 @@ Verified against FunASR on the encoder TENSOR (max |Δ| 4.48e-05 / 4.81e-06 on 1
 of English, cosine ≈ 1, sabotage arm 3.81e-01 at cosine 0.168) and on the transcript, which is
 **character-for-character identical on both clips**.
 
-**What it does not have yet is a vocabulary**, and the export deliberately writes none. `tokens.json` is
-8,404 flat decode-only pieces, but the decode rule is not a join: FunASR merges `@@`-suffixed subword
-continuations, spaces Latin words and joins CJK bare. That cannot be folded into an existing family —
-`@@` marks "continues into the NEXT piece" where SentencePiece's `▁` and WordPiece's `##` mark word
-START, and the same piece string appears in both roles — so it needs a reader, and **leaf 2 is where
-family 5 stops being free of engine work**. A file claiming a vocabulary it detokenized wrongly would
-be worse than one that admits it has none.
+**What it does not have yet is DETOKENIZATION, and that turned out not to be a vocabulary problem.**
+The export writes no vocabulary and returns ids. The obvious reading — 8,404 flat pieces, so add a
+reader — is wrong twice over. The TABLE needs nothing new: `CtcVocab`
+([ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md)) is already one array
+indexed by id and would hold these pieces with no word delimiter. And the RULE is not a table property.
+Measured against FunASR's `sentence_postprocess`, it is four things, two of which no per-piece flag can
+express:
+
+    ['and','so','my','f@@','el@@','low']  ->  "and so my fellow"     @@ merges, Latin words space
+    ['hello','你','好']                    ->  "hello你好"             the space is REMOVED before CJK
+    ['b','b','c','news']                  ->  "BBC news"             letter runs collapse AND UPPERCASE
+    ['<s>','and','</s>']                  ->  "and"                  specials drop
+
+The CJK case needs lookahead and the abbreviation case is a text transform, so this belongs where
+[HIGH-LEVEL-API §2](../HIGH-LEVEL-API.md) puts a per-TASK policy: the engine's `transcribe` door,
+beside Whisper's control-token stripping — not in a vocabulary class. **Leaf 2 is still where family 5
+stops being free of engine work**; it is just a different piece of engine than it first looked.
+A file claiming a vocabulary it detokenized wrongly would be worse than one that admits it has none.
 
 ### Family 6, and the primitive the engine already had
 
