@@ -32,6 +32,7 @@ the architecture has one — its vocabulary.
 | **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3 | `nemo_asr_export.py` |
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
+| **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
 | **ASR — encoder-decoder** | Whisper-small | `multi_phase_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
@@ -417,6 +418,54 @@ inverts the naive reading of the headline number: FunASR's own f32 path is **3.4
 self, while loom is **5.7e-05** from it — the export is six times closer to the truth than the
 reference it is being compared against, and the 3.0e-04 is almost entirely the reference's own error.
 
+#### The second leaf was Paraformer, and the length came from the VALUES (2026-09-16)
+
+`paraformer-zh` shares the SANM encoder and inherits the front end and the position encoding
+unchanged, which is the part of "family 5" that is genuinely a family. What it adds is the first model
+in this zoo whose **output length depends on the values rather than on any shape**: a continuous
+integrate-and-fire predictor emits a token each time a running sum of per-frame `alpha`s crosses an
+integer.
+
+**The split is the design.** The host decides the boundary — it is the only party that can, for the
+reason below — and the graph does arithmetic with no threshold in it at all. Concretely the host hands
+over the whole `(n_tokens, n_frames)` **linear resampling matrix**, because every token is a weighted
+sum of encoder frames whose weights depend on `alphas` alone, and the graph is then one matmul. That
+form was forced as well as preferred: FunASR differences two cumulative sums, which would need a
+cumulative sum along the graph's slow axis (`ggml_cumsum` only sums over `ne[0]`) and a row gather from
+the permuted result (`ggml_get_rows` needs a contiguous source — the constraint the first leaf hit in
+`ggml_repeat`). It is also *more accurate* than the reference, since differencing two cumulative sums
+is catastrophic cancellation by construction: against an f64 evaluation of the same algebra FunASR's
+own f32 result is 7.18e-07 away and loom's is **4.43e-08**.
+
+**Why the host and not the graph**, and it is not performance.
+[Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) is the account. FunASR
+accumulates at float64, **casts to float32**, then floors — and computes the remainder as
+`(indicator + prefix_sum) - floor(prefix_sum)` in float32, left to right. Both halves decide frames: the
+crossings sit within 1.9e-06 of an integer, so a pure-float64 host is *more accurate and wrong*, and at
+`prefix_sum ≈ 32` the float32 spacing is 3.8e-06, so `1 + 31.999998` rounds to exactly 33 and a
+remainder collapses from ~1 to 0. A graph has no float64 and its own f32 cumsum lands elsewhere. The
+driver reproduces the recipe in Lua doubles with an explicit `to_f32`, and **the threshold is crossed in
+exactly one place** — the first design had the graph re-derive the remainders and it disagreed with the
+host's indices on precisely the frames that matter.
+
+It needed **no new engine binding**: `OutputRef`, `loom.get_output` and `loom.output_shape` already
+existed, the last of them for a transducer's decode loop asking the same question. It reuses family
+12's `TokenLabelsEpilogue` — a non-autoregressive decoder emits one token per row and must *not*
+collapse duplicates, which Chinese produces legitimately — and adds one driver component,
+`cif_boundary`.
+
+Verified against FunASR on the encoder TENSOR (max |Δ| 4.48e-05 / 4.81e-06 on 13 s of Chinese and 11 s
+of English, cosine ≈ 1, sabotage arm 3.81e-01 at cosine 0.168) and on the transcript, which is
+**character-for-character identical on both clips**.
+
+**What it does not have yet is a vocabulary**, and the export deliberately writes none. `tokens.json` is
+8,404 flat decode-only pieces, but the decode rule is not a join: FunASR merges `@@`-suffixed subword
+continuations, spaces Latin words and joins CJK bare. That cannot be folded into an existing family —
+`@@` marks "continues into the NEXT piece" where SentencePiece's `▁` and WordPiece's `##` mark word
+START, and the same piece string appears in both roles — so it needs a reader, and **leaf 2 is where
+family 5 stops being free of engine work**. A file claiming a vocabulary it detokenized wrongly would
+be worse than one that admits it has none.
+
 ### Family 6, and the primitive the engine already had
 
 
@@ -617,6 +666,6 @@ the traced module, the wrapper and the converted MIL program **together** took G
 | | |
 |---|---|
 | Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
