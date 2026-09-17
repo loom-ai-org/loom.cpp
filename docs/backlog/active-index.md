@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-12
+last_updated: 2026-09-17
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **rc10 IS THE RELEASE, and everything for it is staged, fresh and GATED** | 30 models are staged in `hf-models/`, all re-exported against this branch and green through the card gate on 2026-09-16 (**53 passed, 0 failed, 15m36s**). SEVEN have never been published — `sensevoice-small` and `paraformer-zh` (family 5, built 2026-09-16), `data2vec-audio-base-960h` and `hubert-large-ls960-ft` (family 4), `qwen3-tts-12hz-0.6b` and `qwen3-tts-tokenizer-12hz` (family 10, a pair), and `encodec-32khz` (family 11) — and the other 23 are updates to files already on the Hub. **WHEELS FIRST, ALWAYS**: every one of these drivers calls something no released wheel has (`output_shape`, `run_ode_and_retain`, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary readers, grouped `CONV_1D`), so a GGUF published before its wheel is a file nobody can run. loom-py's `vendor/loom.cpp` is already bumped to `0acaf52` and committed — **that pin is what the wheels must be built from** → [[loom-release-state]] |
+| **rc10 IS THE RELEASE, and everything for it is staged, fresh and GATED** | 30 models are staged in `hf-models/`, all re-exported against this branch and green through the card gate on 2026-09-16 (**53 passed, 0 failed, 15m36s**). SEVEN have never been published — `sensevoice-small` and `paraformer-zh` (family 5, built 2026-09-16), `data2vec-audio-base-960h` and `hubert-large-ls960-ft` (family 4), `qwen3-tts-12hz-0.6b` and `qwen3-tts-tokenizer-12hz` (family 10, a pair), and `encodec-32khz` (family 11) — and the other 23 are updates to files already on the Hub. **WHEELS FIRST, ALWAYS**: every one of these drivers calls something no released wheel has (`output_shape`, `run_ode_and_retain`, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary readers, grouped `CONV_1D`), so a GGUF published before its wheel is a file nobody can run. all three feature branches are MERGED (loom.cpp#26, loom-py#25, loom-exporter#21) and the bump lives on loom-py's **`release/1.0.0-rc10`** branch: `VERSION` at `1.0.0-rc10` and `vendor/loom.cpp` at `a614b52`, which is `main`'s tip — **that pin is what the wheels must be built from** → [[loom-release-state]] |
 | **EnCodec's licence is DECIDED: `cc-by-nc-4.0` stays** (2026-09-16) | Settled by the author after the provenance was laid out, and it is worth recording WHY, because the instinct runs the other way. EnCodec's architecture and CODE are MIT and MusicGen came later — but `facebook/encodec_32khz`'s own card says these WEIGHTS were "trained specifically as part of the MusicGen project", names `facebookresearch/audiocraft` as the repository and *Simple and Controllable Music Generation* as the paper, and lists ShutterStock/Pond5 plus an internal set as the training data. So the checkpoint is MusicGen's output rather than the original EnCodec release, and audiocraft's weights are CC-BY-NC-4.0. The card already carried the stricter reading and keeps it; **no work is left here**, it just ships with rc10 like the other six → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **P5 family 5 is COMPLETE — both leaves, exporter and engine** | Paraformer's detokenization landed 2026-09-16 as `loom::FunasrVocab` (`tokenizer.ggml.model == "funasr"`), verified differentially against FunASR's `sentence_postprocess` over **20,000 random id sequences, 0 mismatches**, and end to end on Chinese and English transcripts. [ADR-036](../adrs/adr-036-composition-is-the-scheme-not-the-table.md) records why it is a vocabulary scheme rather than the per-task postprocess this row previously called for. **Nothing is left open for family 5**; what remains for the leaf is the ordinary release path — it joins the staged models that go out with rc10 → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 
@@ -105,12 +105,15 @@ correctness fix, since `framing_ids` had been returning a SentencePiece encode's
 in the zoo. The org now lists **twenty-three** models, every one re-exported and card-gated against this
 tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`.
 
-***The next release is 1.0.0-rc10, and it is what unblocks the Hub.*** Everything on
-`feat/p5-family-11-snac` goes out in it — the four new engine bindings, `ELU`, the ODE integrator,
-family 11's third leaf, and `loom_cli --out`. Its shape is fixed by the coupling above: the wheels
-carry the bindings, so **the nine staged GGUFs can only be uploaded once rc10's packages are on PyPI**,
-in that order. A version bump is TEN strings in FOUR files — see [[loom-release-state]] for the list
-and for how to verify a Hub push afterwards.
+***The next release is 1.0.0-rc10, and it is what unblocks the Hub.*** Families 11, 4 and 5 go out in
+it — the new engine bindings, `ELU`, the ODE integrator, the `ctc` and `funasr` vocabulary readers,
+grouped `CONV_1D`, and `loom_cli --out`. It is cut on loom-py's `release/1.0.0-rc10` branch, whose two
+commits are the single-file version mechanism and the bump itself. Its shape is fixed by the coupling
+above: the wheels carry the bindings, so **the 30 staged GGUFs can only be uploaded once rc10's
+packages are on PyPI**, in that order. A version bump is now **one file** — `VERSION` at loom-py's root, propagated by
+`python packaging/version.py --set 1.0.0-rc10` and enforced by `tests/ci/test_version_consistency.py`
+([ADR-037](../adrs/adr-037-the-version-lives-in-one-file.md)); it was eleven strings in five files.
+See [[loom-release-state]] for how to verify a Hub push afterwards.
 
 **SNAC-24kHz was published 2026-09-12** (`loom-ai-org/snac-24khz-loom`, family 11's second leaf) off
 `feat/p5-family-11-snac`, which is pushed in all three repos and not yet merged. It is the zoo's
