@@ -23,10 +23,14 @@ closed on two** — SenseVoice-Small and Paraformer-zh. Each is a single GGUF ca
 topologies, driver and — where the architecture has one — its vocabulary, with the two deliberate
 exceptions where a codec is its own file ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)).
 
-Two checkpoints are verified and deliberately **not** published: `omniASR-CTC-300M-v2`, whose own
-documented processor path transcribes garbage and which loom reproduces exactly (family 4's third
-structural witness), and `bert-base-NER`, which is in the export sweep but carries no model card —
-that second one is an open question rather than a decision, and the hub tracks it.
+Two checkpoints are verified and deliberately **not** published, for different reasons.
+`omniASR-CTC-300M-v2` is family 4's third structural witness: its own documented processor path
+transcribes garbage and loom reproduces that exactly, so the export is right and the checkpoint's
+declared front end disagrees with its weights. `bert-base-NER` is family 12's first checkpoint and
+stays in the export sweep as a **structural witness only** — DistilBERT-NER was chosen as the
+family's published English NER representative, and shipping both would put two cards on the Hub for
+one task and one vocabulary. A family proves itself on several checkpoints and publishes one per
+task; that is the rule these two are instances of, not an omission in either case.
 
 ## 2. Architectural Overview
 
