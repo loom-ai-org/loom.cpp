@@ -64,6 +64,19 @@ before its wheel is a file nobody can run, and
   every recorded number describes. Repro: `scripts/run_talker.cpp` with `GREEDY=1 PENALTY=1.0`,
   fixtures in `/home/flavio/.claude/tmp/qwen3_icl/`.
   *Context: [[loom-qwen3-tts-shipped]], [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)*
+* [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
+  voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
+  every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
+  ship a recording"; this card instead tells the reader to bring `reference.wav`, which is a
+  legitimate precondition the harness skips on by design. The consequence is that `-k qwen3-tts`
+  reports **2 passed, 14 skipped** and none of the passes ran the snippet — the ASR oracle included,
+  since it grades the audio the card itself produced. Pre-existing (the x-vector snippet has the same
+  shape) and surfaced by ICL's own verification, which had to be done outside the gate entirely.
+  **What would close it:** either the harness seeds a 24 kHz clip under a name the card can use
+  without lying to a reader, or the card's first block loads `audio` with a comment saying it stands
+  for the reader's own recording. Worth deciding once, because every future voice-cloning leaf
+  inherits it. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
+  [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
