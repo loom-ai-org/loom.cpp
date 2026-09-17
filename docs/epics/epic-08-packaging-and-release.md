@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-10
+last_updated: 2026-09-17
 ---
 
 # Epic-08: Packaging and Release
@@ -47,8 +47,14 @@ architectures** than the version that did not fit.
 
 ### Release
 
-A version bump is **seven version strings across three files**. The publish path is proven end to end
-to PyPI.
+A version bump is **one file**: `VERSION` at loom-py's repo root, propagated by
+`python packaging/version.py --set <version>` and enforced by `tests/ci/test_version_consistency.py`.
+It used to be eleven strings in five files in two spellings — the four packages pin each other by
+exact version, and the ARMv6 wheel's install URL carries the version in the filename — and the count
+recorded here was wrong twice as the packaging grew, which is the argument for the file:
+[ADR-037](../adrs/adr-037-the-version-lives-in-one-file.md). `wheels.yml`'s `version-guard` job checks
+the release TAG against it before `publish-pypi` uploads anything. The publish path is proven end to
+end to PyPI.
 
 **Wheels published before 2026-08-14 silently require AVX2** — worth knowing before debugging an
 illegal-instruction report from an older install.
@@ -57,7 +63,7 @@ illegal-instruction report from an older install.
 
 | | |
 |---|---|
-| Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) |
+| Decisions | [ADR-011](../adrs/adr-011-three-repositories.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-025](../adrs/adr-025-armv6-is-built-in-its-own-emulated-userland.md), [ADR-026](../adrs/adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md), [ADR-037](../adrs/adr-037-the-version-lives-in-one-file.md) |
 | Retros | [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-024](../retros/retro-024-a-blocker-read-from-one-half-of-an-agreement.md), [Retro-033](../retros/retro-033-a-shared-library-links-clean-without-its-symbols.md), [Retro-034](../retros/retro-034-the-boards-own-libstdcxx.md), [Retro-035](../retros/retro-035-the-emulator-said-it-was-an-arm10e.md), [Retro-036](../retros/retro-036-one-switch-two-decisions.md), [Retro-037](../retros/retro-037-ps-said-six-percent-top-said-fifty.md), [Retro-038](../retros/retro-038-two-panels-on-one-cache-way.md) |
 | Active tasks | [Backlog → Packaging](../backlog/active-index.md#packaging--release) |
 
