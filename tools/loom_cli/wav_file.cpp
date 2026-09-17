@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <stdexcept>
 
@@ -97,3 +98,28 @@ std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
 }
 
 } // namespace loom_cli
+
+namespace loom_cli {
+
+namespace {
+void put32(std::FILE* f, uint32_t v) { std::fwrite(&v, 4, 1, f); }
+void put16(std::FILE* f, uint16_t v) { std::fwrite(&v, 2, 1, f); }
+}  // namespace
+
+void write_wav_pcm16_mono(const std::string& path, const std::vector<float>& samples, uint32_t rate) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) throw std::runtime_error("could not open '" + path + "' for writing");
+    const auto n = static_cast<uint32_t>(samples.size());
+    std::fwrite("RIFF", 1, 4, f); put32(f, 36 + n * 2); std::fwrite("WAVE", 1, 4, f);
+    std::fwrite("fmt ", 1, 4, f); put32(f, 16); put16(f, 1); put16(f, 1);
+    put32(f, rate); put32(f, rate * 2); put16(f, 2); put16(f, 16);
+    std::fwrite("data", 1, 4, f); put32(f, n * 2);
+    for (float s : samples) {
+        const float clipped = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);
+        const auto pcm = static_cast<int16_t>(clipped * 32767.0f);
+        std::fwrite(&pcm, 2, 1, f);
+    }
+    std::fclose(f);
+}
+
+}  // namespace loom_cli

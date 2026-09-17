@@ -195,6 +195,15 @@ add_test(NAME test_lua_bridge_retained_outputs COMMAND test_lua_bridge_retained_
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES LABELS ci)
 set_tests_properties(test_lua_bridge_retained_outputs PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# --- ADR-031: `loom.run_ode`, the integrator that replaced `render_sampler`'s Lua loop. Same fixture,
+#     a linear NON-autonomous f -- which is what tells midpoint and Heun apart.
+add_executable(test_lua_bridge_ode ci/test_lua_bridge_ode.cpp)
+target_link_libraries(test_lua_bridge_ode PRIVATE loom::engine)
+target_compile_definitions(test_lua_bridge_ode PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_lua_bridge_ode COMMAND test_lua_bridge_ode)
+set_tests_properties(test_lua_bridge_ode PROPERTIES LABELS ci)
+set_tests_properties(test_lua_bridge_ode PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
+
 # --- P4.24: loom.sample_row, on the same toy fixture -- 6 classes wide, which is what makes "every
 #     class is eventually drawn" a statement a test can make.
 add_executable(test_sample_row ci/test_sample_row.cpp)
@@ -676,6 +685,24 @@ target_compile_definitions(test_byte_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM
 add_test(NAME test_byte_vocab COMMAND test_byte_vocab)
 set_tests_properties(test_byte_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_byte_vocab PROPERTIES FIXTURES_REQUIRED byte_vocab_gguf_fixture)
+
+# --- CTC character vocabulary (CtcVocab), family 4's decode-only table. Synthetic fixture, a real
+#     Wav2Vec2CTCTokenizer table truncated to the letters the test spells. It also reads
+#     byte_vocab_test.gguf, to check the tag dispatch declines a file that isn't its own. ---
+add_test(
+    NAME gen_ctc_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_ctc_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/ctc_vocab_test.gguf
+)
+set_tests_properties(gen_ctc_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_ctc_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP ctc_vocab_gguf_fixture)
+
+add_executable(test_ctc_vocab ci/test_ctc_vocab.cpp)
+target_link_libraries(test_ctc_vocab PRIVATE loom::engine)
+target_compile_definitions(test_ctc_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_ctc_vocab COMMAND test_ctc_vocab)
+set_tests_properties(test_ctc_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_ctc_vocab PROPERTIES FIXTURES_REQUIRED "ctc_vocab_gguf_fixture;byte_vocab_gguf_fixture")
 
 # --- SupertonicTTS grapheme front-end (SupertonicTextVectorizer), synthetic printable-ASCII fixtures.
 #     The real-asset parity check is gate/test_supertonic_text_vectorizer.cpp; this covers what does NOT

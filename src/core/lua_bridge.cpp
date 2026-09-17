@@ -162,24 +162,38 @@ using StoreLookup = std::function<OutputStore&(const std::string&)>;
 // destination of that shape has -- which is what `ggml_backend_tensor_copy` asserts. So this reuses
 // ggml's own copy strategy (host memcpy, device-to-device, or its own fallback) instead of restating
 // it here.
-void copy_row_prefix(ggml_tensor* src, ggml_tensor* dst, int64_t rows, const std::string& src_module,
-                      const char* fname) {
+// `first_row` generalizes what was a prefix-only copy, and the generalization is one `offset`: any
+// contiguous ROW RANGE of a 2-D retained output is still a contiguous view of it. A transducer's joint
+// consumes ONE encoder frame per call and until now the only way to hand it one was to marshal the
+// whole encoder output into Lua and slice it there -- which is the single largest avoidable crossing in
+// the zoo (n_frames * n_embd doubles, per utterance, for a tensor the driver never otherwise looks at).
+void copy_row_range(ggml_tensor* src, ggml_tensor* dst, int64_t first_row, int64_t rows,
+                     const std::string& src_module, const char* fname,
+                     ggml_context* reuse_ctx = nullptr) {
     if (src->ne[2] != 1 || src->ne[3] != 1 || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         throw Error(std::string(fname) + ": module '" + src_module + "' output is not a contiguous 2-D "
-                     "tensor, so a row prefix of it is not a contiguous view -- `rows` is only defined "
+                     "tensor, so a row range of it is not a contiguous view -- `rows` is only defined "
                      "for the [width, rows] outputs a driver splices into another module's input");
     }
-    ggml_init_params params{};
-    params.mem_size = ggml_tensor_overhead();
-    params.no_alloc = true;
-    ggml_context_ptr ctx(ggml_init(params));
-    ggml_tensor* view = ggml_view_2d(ctx.get(), src, src->ne[0], rows, src->nb[1], 0);
+    // `reuse_ctx` is for the caller that copies one row per timestep: a fresh `ggml_init` per row is a
+    // malloc and a teardown in the inner loop of a recurrence, and the views are identical but for an
+    // offset. A null one keeps the original one-shot behaviour for every other caller.
+    ggml_context_ptr owned;
+    if (reuse_ctx == nullptr) {
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead();
+        params.no_alloc = true;
+        owned.reset(ggml_init(params));
+        reuse_ctx = owned.get();
+    }
+    ggml_tensor* view = ggml_view_2d(reuse_ctx, src, src->ne[0], rows, src->nb[1],
+                                      first_row * src->nb[1]);
     // A freshly created view carries no buffer -- ggml-alloc is what normally attaches one, and this
     // view never reaches a graph. `ggml_backend_view_init` is the supported way to point it at its
     // source's buffer, and without it `ggml_backend_tensor_copy` dereferences a null buffer.
     if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
-        throw Error(std::string(fname) + ": could not view the first " + std::to_string(rows) +
-                     " row(s) of module '" + src_module + "' output");
+        throw Error(std::string(fname) + ": could not view row(s) [" + std::to_string(first_row) + ", " +
+                     std::to_string(first_row + rows) + ") of module '" + src_module + "' output");
     }
     ggml_backend_tensor_copy(view, dst);
 }
@@ -235,18 +249,26 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
     }
     ggml_tensor* src = store.get(static_cast<size_t>(index1 - 1));
 
-    // How many of the source's rows to copy. Absent means all of them, which is every caller but the
-    // one that trims an audio encoder's chunk padding -- see `copy_row_prefix`.
+    // How many of the source's rows to copy, and from where. Both absent means all of them, which is
+    // most callers; `rows` alone is the audio-encoder chunk trim; `row` with it is one frame of an
+    // encoder output -- see `copy_row_range`.
     lua_getfield(L, value_idx, "rows");
     const bool trimmed = !lua_isnil(L, -1);
     const auto rows = trimmed ? static_cast<int64_t>(std::llround(lua_tonumber(L, -1))) : int64_t{0};
     lua_pop(L, 1);
+    // 0-based, like `loom.argmax_row`'s own row index and unlike `index` -- it addresses DATA rather
+    // than a declared-output position.
+    lua_getfield(L, value_idx, "row");
+    const auto first_row = lua_isnil(L, -1) ? int64_t{0}
+                                            : static_cast<int64_t>(std::llround(lua_tonumber(L, -1)));
+    lua_pop(L, 1);
 
     if (trimmed) {
-        if (rows < 1 || rows > src->ne[1]) {
-            throw Error(std::string(fname) + ": {from='" + src_module + "', rows=" +
-                         std::to_string(rows) + "} -- module '" + src_module + "' retained " +
-                         std::to_string(src->ne[1]) + " row(s), so that is not a prefix of it");
+        if (rows < 1 || first_row < 0 || first_row + rows > src->ne[1]) {
+            throw Error(std::string(fname) + ": {from='" + src_module + "', row=" +
+                         std::to_string(first_row) + ", rows=" + std::to_string(rows) +
+                         "} -- module '" + src_module + "' retained " + std::to_string(src->ne[1]) +
+                         " row(s), so that is not a range within it");
         }
         if (src->type != dst->type || src->ne[0] != dst->ne[0] || dst->ne[1] != rows ||
             dst->ne[2] != 1 || dst->ne[3] != 1) {
@@ -261,7 +283,7 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
                          std::to_string(dst->ne[3]) + "] -- a row prefix is copied as-is, so the two "
                          "must agree exactly");
         }
-        copy_row_prefix(src, dst, rows, src_module, fname);
+        copy_row_range(src, dst, first_row, rows, src_module, fname);
         return;
     }
 
@@ -372,7 +394,13 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* fname, std::mt19937& rng,
                            std::uniform_real_distribution<float>& uniform, float temperature,
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
-                           ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k) {
+                           ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
+                           float repetition_penalty, const std::vector<int64_t>& penalized) {
+    if (!(repetition_penalty > 0.0f)) {
+        throw Error(std::string(fname) + ": repetition_penalty is " +
+                     std::to_string(repetition_penalty) + "; it is a positive divisor and 1 means "
+                     "'do not penalise'");
+    }
     if (guidance_top_k < 0) {
         throw Error(std::string(fname) + ": guidance top_k is " + std::to_string(guidance_top_k) +
                      "; it is a count of candidates, and 0 means 'do not shortlist'");
@@ -468,6 +496,33 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
             throw Error(std::string(fname) + ": the guidance shortlist and the id window [" +
                          std::to_string(lo) + ", " + std::to_string(hi) + ") have no id in common, so "
                          "there is nothing to draw from");
+        }
+    }
+
+    // **The repetition penalty, and it is applied BEFORE the greedy branch on purpose.**
+    //
+    // `RepetitionPenaltyLogitsProcessor` is a PROCESSOR, not a warper: `transformers` runs it whether
+    // or not a sample is drawn, so it changes a greedy argmax too. That is not a subtlety -- it is
+    // what this option was added for. Qwen3-TTS's talker declares `repetition_penalty: 1.05`, and a
+    // greedy decode WITHOUT it does not merely drift: it never emits EOS and runs to the token cap,
+    // 200 frames where the reference stops at 42. With it, the same loop reproduces the reference's
+    // 672 codes exactly.
+    //
+    // The arithmetic is `transformers`' own, and the sign branch is the whole of it: a positive score
+    // is DIVIDED by the penalty and a negative one MULTIPLIED, so that either way the id moves toward
+    // -inf. Penalising by division alone would make a negative logit larger.
+    //
+    // `penalized` holds ABSOLUTE ids, because that is what a driver has -- it appends what
+    // `sample_row` returned, and that is already absolute (`lo` is added back on the way out). Ids
+    // outside the window are skipped rather than rejected: a window is a restriction on what may be
+    // DRAWN, and a history that predates a narrowing window is not an error.
+    if (repetition_penalty != 1.0f) {
+        const auto width = static_cast<int64_t>(logits.size());
+        for (const int64_t id : penalized) {
+            const int64_t offset = id - lo;
+            if (offset < 0 || offset >= width) continue;
+            float& score = logits[static_cast<size_t>(offset)];
+            score = score > 0.0f ? score / repetition_penalty : score * repetition_penalty;
         }
     }
 
@@ -615,10 +670,16 @@ DynamicAxes read_axes_table(lua_State* L, int idx) {
 //
 // `out_store` is null for the marshalling entry points and the module's own store for
 // `run_subgraph_and_retain` -- see GraphBuilder::build for what it does with it.
+// `before_compute` runs after every declared input named in the Lua table is filled and before the
+// graph runs -- the hook an integrator needs, because its two per-step inputs (the carried state and
+// the current time) are not in that table at all: they are the loop's own variables. Empty for every
+// other caller, which is why this stayed one function rather than becoming two that could drift.
 int compute_and_emit(lua_State* L, const char* fname, const char* module_name, GraphBuilder& builder,
                       const DynamicAxes& axes, int inputs_idx,
                       const StoreLookup& lookup, OutputStore* out_store,
-                      const std::function<int(const GraphBuilder::BuildResult&)>& emit) {
+                      const std::function<int(const GraphBuilder::BuildResult&)>& emit,
+                      const std::function<void(const GraphBuilder::BuildResult&)>& before_compute =
+                          nullptr) {
     const GraphBuilder::BuildResult& r = builder.build(axes, out_store);
 
     lua_pushnil(L);
@@ -651,6 +712,7 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
         lua_pop(L, 1);
     }
 
+    if (before_compute) before_compute(r);
     // Through the BUILDER rather than through a backend handle: on a device build this graph is
     // scheduler-allocated and split across two backends, and only the builder holds the scheduler that
     // knows how to run it (BACKLOG.md P4.7 / graph_builder.h).
@@ -769,87 +831,569 @@ int LoomLuaBridge::l_get_output(lua_State* L) {
     }
 }
 
-int LoomLuaBridge::l_run_recurrent(lua_State* L) {
+// Where one recurrent sweep reads its input sequence from, resolved ONCE per call rather than per
+// timestep: `set_tensor_from_output_ref` reads `row`/`rows` off the caller's table, so a per-step call
+// would have to WRITE them into it -- leaving a caller's `local ref = {from='pre'}` carrying
+// `row=T-1, rows=1` afterwards, which would silently copy one row if the same table were passed
+// anywhere else.
+struct LoomLuaBridge::SequenceSource {
+    bool by_ref = false;
+    std::vector<double> data;   // the marshalled form, empty when `by_ref`
+    std::string module;         // the producing module, empty unless `by_ref`
+    int64_t index1 = 1;         // which of its declared outputs, 1-based
+};
+
+// Reads argument `arg` as a sequence: a flat, row-major `(seq_len, input_dim)` Lua array, or
+// `{from = "module"}` exactly as a `run_subgraph` input takes one.
+LoomLuaBridge::SequenceSource LoomLuaBridge::read_sequence_source(LoomLuaBridge* self, lua_State* L,
+                                                                   int arg, uint32_t seq_len,
+                                                                   uint32_t input_dim,
+                                                                   const char* fname) {
+    SequenceSource src;
+    if (!is_output_ref(L, arg)) {
+        src.data = read_number_array(L, arg);
+        if (src.data.size() != static_cast<size_t>(seq_len) * input_dim) {
+            throw Error(std::string(fname) + ": sequence has " + std::to_string(src.data.size()) +
+                         " elements, expected seq_len*input_dim=" + std::to_string(seq_len * input_dim));
+        }
+        return src;
+    }
+    src.by_ref = true;
+    lua_getfield(L, arg, "from");
+    src.module = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, arg, "index");
+    src.index1 = lua_isnil(L, -1) ? 1 : static_cast<int64_t>(std::llround(lua_tonumber(L, -1)));
+    lua_pop(L, 1);
+    lua_getfield(L, arg, "gen");
+    const bool pinned = !lua_isnil(L, -1);
+    const auto gen = pinned ? static_cast<uint64_t>(std::llround(lua_tonumber(L, -1))) : uint64_t{0};
+    lua_pop(L, 1);
+    if (src.index1 < 1) {
+        throw Error(std::string(fname) + ": {from='" + src.module + "', index=" +
+                     std::to_string(src.index1) + "} -- an output index is 1-based");
+    }
+    OutputStore& src_store = retained_store(self, src.module);
+    if (pinned) src_store.check_generation(gen, src.module);
+    return src;
+}
+
+// One direction's walk of a per-timestep cell topology over `src`, with the h/c carry in
+// `std::vector<float>` on this side and `emit(t, h)` called once per timestep with that step's own
+// hidden state. The carry was never the crossing to worry about -- it has lived here since this
+// binding was written. What crossed was the SEQUENCE, which is `seq_len` times wider, and what the
+// sink decides is whether the OUTPUT crosses too.
+void LoomLuaBridge::cell_sweep(LoomLuaBridge* self, const std::string& module_name,
+                                const SequenceSource& src, uint32_t seq_len, uint32_t input_dim,
+                                uint32_t hidden_dim, bool reverse, const char* fname,
+                                const std::function<void(uint32_t, const std::vector<float>&)>& emit) {
+    const auto it = self->modules_.find(module_name);
+    if (it == self->modules_.end()) {
+        throw Error(std::string(fname) + ": unregistered module '" + module_name + "'");
+    }
+    Module& mod = it->second;
+
+    // The cell module's own persistent builder (BACKLOG.md P4.0.13), the same one every other binding
+    // uses. build() is still called once per timestep below -- a step's h/c depend on the PREVIOUS
+    // step's real output values, so each timestep genuinely needs its own compute -- but the axes never
+    // move across a sequence, so every call after the first is served from the retained graph. This is
+    // the loop that gains the most from that: one rebuild per direction instead of one per timestep.
+    GraphBuilder& builder = self->module_builder(mod);
+
+    // One context for every per-timestep row view, sized for the whole sweep: see `copy_row_range`'s
+    // own `reuse_ctx`. Built only for the by-reference path, which is the only one that views anything.
+    ggml_context_ptr view_ctx;
+    if (src.by_ref) {
+        ggml_init_params view_params{};
+        view_params.mem_size = (static_cast<size_t>(seq_len) + 2) * ggml_tensor_overhead() + 4096;
+        view_params.no_alloc = true;
+        view_ctx.reset(ggml_init(view_params));
+        if (!view_ctx) {
+            throw Error(std::string(fname) + ": could not allocate the row-view context for " +
+                         std::to_string(seq_len) + " timestep(s)");
+        }
+    }
+
+    std::vector<float> h(hidden_dim, 0.0f);
+    std::vector<float> c(hidden_dim, 0.0f);
+    std::vector<float> layer_input(src.by_ref ? 0 : input_dim);
+
+    for (uint32_t step = 0; step < seq_len; ++step) {
+        // `reverse` walks timesteps backward through the SAME (forward-ordered) sequence, writing each
+        // result to its own real time index `t` -- mirroring BiLstmStepper::run's own backward pass
+        // (src/core/bilstm_stepper.cpp) exactly, so a reverse-direction MIL `lstm` op (see
+        // recurrent.py's own "direction" handling) doesn't need its caller to pre-reverse anything.
+        const uint32_t t = reverse ? (seq_len - 1 - step) : step;
+
+        // ONE build and ONE compute per timestep: the cell topology declares both `h_new` and `c_new`,
+        // so the gate stack is evaluated once and both halves of the step are read off the same result.
+        // It was two of each until the topology gained its second declared output -- the same node list
+        // computed twice per timestep, per direction, per BiLSTM (recurrent.py::_lstm_cell_topology).
+        const GraphBuilder::BuildResult& r = builder.build({{"n_tokens", 0}, {"n_past", 0}});
+        ggml_tensor* cell_input = r.input_tensors.at("layer_input");
+        if (src.by_ref) {
+            // One row of the producer's retained output, copied backend-side. `t` is this timestep's
+            // own index, so a reverse walk reads the same rows in the other order exactly as the
+            // marshalled path does. Looked up per step rather than hoisted: a retained tensor's ADDRESS
+            // is never held across a call by design -- the store may have reshaped -- and `get` is a
+            // vector index.
+            ggml_tensor* source = retained_store(self, src.module)
+                                      .get(static_cast<size_t>(src.index1 - 1));
+            if (source->ne[0] != static_cast<int64_t>(input_dim) ||
+                source->ne[1] != static_cast<int64_t>(seq_len)) {
+                throw Error(std::string(fname) + ": {from='" + src.module + "'} retained [" +
+                             std::to_string(source->ne[0]) + "," + std::to_string(source->ne[1]) +
+                             "] but this call declares input_dim=" + std::to_string(input_dim) +
+                             ", seq_len=" + std::to_string(seq_len) + " -- a sequence is read one row "
+                             "per timestep, so both have to agree");
+            }
+            copy_row_range(source, cell_input, t, 1, src.module, fname, view_ctx.get());
+        } else {
+            for (uint32_t k = 0; k < input_dim; ++k) {
+                layer_input[k] = static_cast<float>(src.data[static_cast<size_t>(t) * input_dim + k]);
+            }
+            ggml_backend_tensor_set(cell_input, layer_input.data(), 0,
+                                     layer_input.size() * sizeof(float));
+        }
+        ggml_backend_tensor_set(r.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
+        ggml_backend_tensor_set(r.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
+        builder.compute();
+
+        if (r.outputs.size() < 2) {
+            throw Error(std::string(fname) + ": module '" + module_name + "' declares " +
+                         std::to_string(r.outputs.size()) + " output(s); a cell topology must declare "
+                         "both 'h_new' and 'c_new', in that order");
+        }
+        ggml_backend_tensor_get(r.outputs[0], h.data(), 0, h.size() * sizeof(float));
+        ggml_backend_tensor_get(r.outputs[1], c.data(), 0, c.size() * sizeof(float));
+        emit(t, h);
+    }
+}
+
+// The store slot a sweep retains into: `[width, seq_len]`, shaped from a no-alloc template because
+// `reshape` reads only type and `ne` -- the sequence it holds is not any single build's output.
+// Created if absent rather than through `retained_store`, which is for READERS and throws on a store
+// nothing has filled yet, which is exactly the state such a call is about to leave.
+ggml_tensor* LoomLuaBridge::reshape_store_2d(Module& mod, int64_t ne0, int64_t ne1,
+                                              ggml_context_ptr& template_ctx, OutputStore*& store) {
+    if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backends.primary);
+    store = mod.outputs.get();
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() + 4096;
+    params.no_alloc = true;
+    template_ctx.reset(ggml_init(params));
+    ggml_tensor* shape = ggml_new_tensor_2d(template_ctx.get(), GGML_TYPE_F32, ne0, ne1);
+    return store->reshape({shape}).at(0);
+}
+
+// `loom.run_recurrent(module, sequence, seq_len, input_dim, hidden_dim, reverse)` and
+// `loom.run_recurrent_and_retain(...)`, the same body with `retain` set.
+//
+// **Either end of this may be a retained output instead of a Lua array** -- `sequence` accepts
+// `{from = "module"}` exactly as a `run_subgraph` input does, and the retaining form leaves its own
+// `[hidden_dim, seq_len]` result in this module's store. A stacked LSTM is therefore N calls with
+// nothing crossing the boundary between them, where before each layer pushed its whole output sequence
+// into a Lua table for the next one to read straight back: on CPU two copies of an intermediate nobody
+// looks at, and on a GPU backend a device->host->device round trip per layer (`output_store.h`'s own
+// rule -- marshal only what is genuinely host-side).
+int LoomLuaBridge::run_recurrent_impl(lua_State* L, bool retain) {
+    const char* fname = retain ? "loom.run_recurrent_and_retain" : "loom.run_recurrent";
     try {
         auto* self = bridge_from_upvalue(L);
         const char* module_name = luaL_checkstring(L, 1);
-        const std::vector<double> sequence = read_number_array(L, 2);
         const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 3));
         const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 4));
         const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
         const bool reverse = lua_toboolean(L, 6) != 0;
 
-        if (sequence.size() != static_cast<size_t>(seq_len) * input_dim) {
-            return luaL_error(L, "loom.run_recurrent: sequence has %d elements, expected seq_len*input_dim=%d",
-                               static_cast<int>(sequence.size()), static_cast<int>(seq_len * input_dim));
+        const SequenceSource src = read_sequence_source(self, L, 2, seq_len, input_dim, fname);
+
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "%s: unregistered module '%s'", fname, module_name);
+        }
+
+        // The destination, one or the other: a host buffer to push, or this module's own store slot
+        // written a row at a time.
+        std::vector<double> out;
+        ggml_tensor* retained = nullptr;
+        OutputStore* store = nullptr;
+        ggml_context_ptr template_ctx;
+        if (retain) {
+            retained = reshape_store_2d(it->second, hidden_dim, seq_len, template_ctx, store);
+        } else {
+            out.assign(static_cast<size_t>(seq_len) * hidden_dim, 0.0);
+        }
+
+        cell_sweep(self, module_name, src, seq_len, input_dim, hidden_dim, reverse, fname,
+                    [&](uint32_t t, const std::vector<float>& h) {
+            if (retain) {
+                // This step's h written straight into its own row of the store slot. `h` is already
+                // host-side -- the next step's `h_prev` needs it -- so retaining costs one more
+                // `hidden_dim`-wide write and nothing else, where pushing cost a Lua table `seq_len`
+                // times wider.
+                ggml_backend_tensor_set(retained, h.data(),
+                                         static_cast<size_t>(t) * hidden_dim * sizeof(float),
+                                         hidden_dim * sizeof(float));
+            } else {
+                for (uint32_t k = 0; k < hidden_dim; ++k) {
+                    out[static_cast<size_t>(t) * hidden_dim + k] = static_cast<double>(h[k]);
+                }
+            }
+        });
+
+        const std::vector<double> shape = {static_cast<double>(hidden_dim), static_cast<double>(seq_len),
+                                            1.0, 1.0};
+        if (retain) {
+            // The generation a `{from=..., gen=...}` read pins against, and the same two return values
+            // the marshalling form gives -- minus the data, which is the point. A caller that wants it
+            // anyway asks `loom.get_output`.
+            store->bump_generation();
+            lua_pushinteger(L, static_cast<lua_Integer>(store->generation()));
+            push_number_array(L, shape);
+            return 2;
+        }
+        push_number_array(L, out);
+        push_number_array(L, shape);
+        return 2;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "%s: %s", fname, e.what());
+    }
+}
+
+// `loom.run_bi_recurrent_and_retain(fwd_module, bwd_module, sequence, seq_len, input_dim, hidden_dim
+//  [, layout])` -- both directions of a BiLSTM, retained as ONE interleaved `[h_fwd | h_bwd]` sequence
+// in `fwd_module`'s store.
+//
+// **The interleave is why this exists, and it is the last thing a BiLSTM made a driver marshal.** Two
+// `run_recurrent_and_retain` calls can already sweep the directions without their sequences crossing,
+// but every consumer in this zoo wants `[h_fwd | h_bwd]` per timestep -- and two stores cannot be
+// concatenated by naming them, so the driver pulled both halves back into Lua and built the rows
+// itself: `2 * hidden_dim` doubles per timestep, per BiLSTM, for a value no host reads (ADR-031 left
+// this open as "a re-trace per phase"; it is not -- the concatenation is a LAYOUT, and the only place
+// that knows both halves is this side). The two directions write into two halves of one slot here, and
+// the h each step yields is already host-side because the next step's `h_prev` needs it, so the
+// interleave costs nothing at all.
+//
+// `layout` names which axis time runs down, because the consumers disagree and both are ordinary:
+//   * `"rows"` (the default) retains `[2*hidden_dim, seq_len]` -- one contiguous row per timestep,
+//     which is what a rows_flat graph input and a following `run_recurrent` sequence both read;
+//   * `"layout_a"` retains `[seq_len, 2*hidden_dim]` -- time on the FASTEST axis, which is what this
+//     project's conv-family topologies (`AdainResBlk1d`, the 1x1 projections) declare.
+// A driver that names the wrong one gets a shape error from the consumer, not a wrong answer: a
+// retained copy asserts `ggml_are_same_shape` where marshalling only ever compared element counts.
+int LoomLuaBridge::l_run_bi_recurrent_and_retain(lua_State* L) {
+    const char* fname = "loom.run_bi_recurrent_and_retain";
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string fwd_module = luaL_checkstring(L, 1);
+        const std::string bwd_module = luaL_checkstring(L, 2);
+        const auto seq_len = static_cast<uint32_t>(luaL_checknumber(L, 4));
+        const auto input_dim = static_cast<uint32_t>(luaL_checknumber(L, 5));
+        const auto hidden_dim = static_cast<uint32_t>(luaL_checknumber(L, 6));
+        const std::string layout = luaL_optstring(L, 7, "rows");
+        if (layout != "rows" && layout != "layout_a") {
+            return luaL_error(L, "%s: layout '%s' -- it is 'rows' ([2*hidden_dim, seq_len], one row "
+                                  "per timestep) or 'layout_a' ([seq_len, 2*hidden_dim], time on the "
+                                  "fastest axis)", fname, layout.c_str());
+        }
+        const SequenceSource src = read_sequence_source(self, L, 3, seq_len, input_dim, fname);
+
+        const auto it = self->modules_.find(fwd_module);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "%s: unregistered module '%s'", fname, fwd_module.c_str());
+        }
+
+        // One staging buffer for the whole sweep rather than a write per timestep, because half the
+        // writes are strided: in `layout_a` a timestep's `2*hidden_dim` values are `seq_len` apart, and
+        // `ggml_backend_tensor_set` writes one contiguous run. It is floats, not Lua doubles, and it is
+        // uploaded once -- which on a device backend is one transfer instead of `2 * seq_len` of them.
+        const uint32_t width = 2 * hidden_dim;
+        std::vector<float> interleaved(static_cast<size_t>(seq_len) * width, 0.0f);
+        const bool rows_layout = layout == "rows";
+        auto sink = [&](uint32_t half) {
+            return [&, half](uint32_t t, const std::vector<float>& h) {
+                for (uint32_t i = 0; i < hidden_dim; ++i) {
+                    const size_t channel = static_cast<size_t>(half) * hidden_dim + i;
+                    interleaved[rows_layout ? static_cast<size_t>(t) * width + channel
+                                            : channel * seq_len + t] = h[i];
+                }
+            };
+        };
+        cell_sweep(self, fwd_module, src, seq_len, input_dim, hidden_dim, /*reverse=*/false, fname,
+                    sink(0));
+        cell_sweep(self, bwd_module, src, seq_len, input_dim, hidden_dim, /*reverse=*/true, fname,
+                    sink(1));
+
+        OutputStore* store = nullptr;
+        ggml_context_ptr template_ctx;
+        ggml_tensor* retained = reshape_store_2d(it->second, rows_layout ? width : seq_len,
+                                                  rows_layout ? seq_len : width, template_ctx, store);
+        ggml_backend_tensor_set(retained, interleaved.data(), 0, interleaved.size() * sizeof(float));
+        store->bump_generation();
+
+        const std::vector<double> shape = {static_cast<double>(retained->ne[0]),
+                                            static_cast<double>(retained->ne[1]), 1.0, 1.0};
+        lua_pushinteger(L, static_cast<lua_Integer>(store->generation()));
+        push_number_array(L, shape);
+        return 2;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "%s: %s", fname, e.what());
+    }
+}
+
+// `loom.output_shape(module, index)` -> the four `ne` of a retained output, and nothing else.
+//
+// `loom.get_output` already returns `(data, shape)`, but reading the shape through it marshals the
+// DATA -- which is the whole thing a retained output exists to avoid. A driver that needs only the
+// length of something it is about to consume by reference had no way to ask: a transducer's decode
+// loop runs over the encoder's frames, and before this the only way to learn how many there are was to
+// pull the entire encoder output into a Lua table.
+int LoomLuaBridge::l_output_shape(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const int64_t index1 = lua_isnoneornil(L, 2) ? 1 : static_cast<int64_t>(luaL_checknumber(L, 2));
+        if (index1 < 1) {
+            return luaL_error(L, "loom.output_shape: index %d -- it is 1-based, like the declared-output "
+                                  "list it indexes", static_cast<int>(index1));
+        }
+        OutputStore& store = retained_store(self, module_name);
+        ggml_tensor* out = store.get(static_cast<size_t>(index1 - 1));
+        const std::vector<double> shape = {static_cast<double>(out->ne[0]), static_cast<double>(out->ne[1]),
+                                            static_cast<double>(out->ne[2]), static_cast<double>(out->ne[3])};
+        push_number_array(L, shape);
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.output_shape: %s", e.what());
+    }
+}
+
+namespace {
+
+// The integrators `loom.run_ode` offers, as the Butcher-tableau stages each needs. A method is a
+// sequence of evaluations of `f(x, t)` and one weighted combination of them, which is all the loop
+// below has to know: the difference between forward Euler and RK4 is entirely in this table.
+//
+// **Euler is the default and must stay bit-identical**, because it is what every flow-matching model
+// in the zoo shipped with and what the gate pins their audio against. A different method is a
+// different numerical answer, which is a per-export decision and never a silent upgrade.
+struct OdeStage {
+    double t_offset;                 // evaluate at t + t_offset * h
+    double from_stage_scale;         // x + h * scale * k[from_stage], or the base x when < 0
+    int from_stage;
+};
+struct OdeMethod {
+    const char* name;
+    int n_stages;
+    OdeStage stages[4];
+    double weights[4];               // x_next = x + h * sum(weights[i] * k[i])
+};
+
+constexpr OdeMethod kOdeMethods[] = {
+    // z_{k+1} = z_k + h * f(z_k, t_k). What `render_sampler` emitted in Lua, step for step.
+    {"euler", 1, {{0.0, -1.0, 0}}, {1.0, 0.0, 0.0, 0.0}},
+    // One extra evaluation at the half-step, second order. This is also the shape StyleTTS2's ADPM2
+    // sampler has in sigma space -- two denoiser calls around a midpoint -- which is why the option
+    // is worth having beyond "another integrator".
+    {"midpoint", 2, {{0.0, -1.0, 0}, {0.5, 0.5, 0}}, {0.0, 1.0, 0.0, 0.0}},
+    // Trapezoidal (explicit RK2). Same order as midpoint, different error constant; it differs from
+    // it on any f that is not linear and autonomous, which is what the test uses to tell them apart.
+    {"heun", 2, {{0.0, -1.0, 0}, {1.0, 1.0, 0}}, {0.5, 0.5, 0.0, 0.0}},
+    // Classical RK4: four evaluations per step, fourth order. Four times the graph work per step, so
+    // it pays only where a step can be four times longer.
+    {"rk4", 4, {{0.0, -1.0, 0}, {0.5, 0.5, 0}, {0.5, 0.5, 1}, {1.0, 1.0, 2}},
+     {1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0}},
+};
+
+const OdeMethod& ode_method_by_name(lua_State* L, const std::string& name, const char* fname) {
+    for (const OdeMethod& m : kOdeMethods) {
+        if (name == m.name) return m;
+    }
+    std::string known;
+    for (const OdeMethod& m : kOdeMethods) known += std::string(known.empty() ? "" : ", ") + m.name;
+    luaL_error(L, "%s: unknown method '%s' -- known: %s", fname, name.c_str(), known.c_str());
+    return kOdeMethods[0];  // unreachable: luaL_error does not return
+}
+
+// One field of the opts table, as a plain array of numbers.
+std::vector<double> opts_array(lua_State* L, int opts_idx, const char* field) {
+    lua_getfield(L, opts_idx, field);
+    std::vector<double> out;
+    if (!lua_isnil(L, -1)) out = read_number_array(L, lua_gettop(L));
+    lua_pop(L, 1);
+    return out;
+}
+
+} // namespace
+
+// `loom.run_ode(module, axes, fixed_inputs, opts)` and `loom.run_ode_and_retain(...)`: integrate
+// `dx/dt = f(x, t)` where `f` is one graph, with the whole loop and the state on the C++ side.
+//
+// **This is `render_sampler`'s Lua loop moved into the engine.** That loop crossed the boundary twice
+// per step -- the state in, the velocity out -- for an update (`z[i] = z[i] + v[i] * dt`) that is
+// elementwise and has no decision in it. For a mel spectrogram at ten steps that is tens of megabytes
+// of Lua table for arithmetic a `for` loop does; see ADR-031 for the measurement.
+//
+// **The state is kept in `double`, deliberately.** Lua numbers are doubles, so the loop this replaces
+// accumulated in double and wrote float into the graph; keeping that exactly is what makes the move
+// bit-identical for the models that already shipped, rather than merely close.
+//
+// `opts`: `carried` and `time` (the estimator's two per-step input names), `times` (N+1 points, so N
+// steps), `method` (default "euler"), and either `state` (an explicit initial value) or `n_elems` (draw
+// it from the shared RNG, at the same point in the stream `loom.gaussian_array` occupied before).
+int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
+    const char* fname = retain ? "loom.run_ode_and_retain" : "loom.run_ode";
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const DynamicAxes axes = read_axes_table(L, 2);
+        luaL_checktype(L, 3, LUA_TTABLE);
+        luaL_checktype(L, 4, LUA_TTABLE);
+        const int opts_idx = 4;
+
+        lua_getfield(L, opts_idx, "carried");
+        const std::string carried = luaL_checkstring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, opts_idx, "time");
+        const std::string time_input = luaL_checkstring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, opts_idx, "method");
+        const std::string method_name = lua_isnil(L, -1) ? "euler" : lua_tostring(L, -1);
+        lua_pop(L, 1);
+        const OdeMethod& method = ode_method_by_name(L, method_name, fname);
+
+        const std::vector<double> times = opts_array(L, opts_idx, "times");
+        if (times.size() < 2) {
+            return luaL_error(L, "%s: `times` needs at least two points (N+1 of them is N steps), got %d",
+                               fname, static_cast<int>(times.size()));
+        }
+        std::vector<double> state = opts_array(L, opts_idx, "state");
+        if (state.empty()) {
+            lua_getfield(L, opts_idx, "n_elems");
+            const auto n_elems = static_cast<size_t>(luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+            // The SAME stream `loom.gaussian_array` draws from, in the same order: a driver that used
+            // to draw its own z and pass it in gets identical numbers from this path.
+            state.resize(n_elems);
+            for (double& v : state) v = static_cast<double>(self->normal_dist_(self->rng_));
         }
 
         const auto it = self->modules_.find(module_name);
         if (it == self->modules_.end()) {
-            return luaL_error(L, "loom.run_recurrent: unregistered module '%s'", module_name);
+            return luaL_error(L, "%s: unregistered module '%s'", fname, module_name);
         }
         Module& mod = it->second;
-
-        // The cell module's own persistent builder (BACKLOG.md P4.0.13), the same one every other
-        // binding uses. build() is still called once per timestep below -- a step's h/c depend on the
-        // PREVIOUS step's real output values, so each timestep genuinely needs its own compute -- but
-        // the axes never move across a sequence, so every call after the first is served from the
-        // retained graph. This is the loop that gains the most from that: one rebuild per direction
-        // instead of one per timestep.
         GraphBuilder& builder = self->module_builder(mod);
+        OutputStore* out_store = nullptr;
+        if (retain) {
+            if (!mod.outputs) mod.outputs = std::make_unique<OutputStore>(mod.backends.primary);
+            out_store = mod.outputs.get();
+        }
 
-        std::vector<float> h(hidden_dim, 0.0f);
-        std::vector<float> c(hidden_dim, 0.0f);
-        std::vector<double> out(static_cast<size_t>(seq_len) * hidden_dim);
+        const size_t n = state.size();
+        // The estimator's own output geometry, read off the first evaluation. The state IS `f`'s
+        // shape -- a mel spectrogram, not a flat vector -- and a retained copy is compared with
+        // `ggml_are_same_shape`, so writing `[n]` where the next graph declares `[t_lat, lat_dim]`
+        // is an error even though the element counts agree. (Marshalling through Lua only ever
+        // compared counts, which is why this only surfaced once the state stopped crossing.)
+        int64_t state_ne[GGML_MAX_DIMS] = {static_cast<int64_t>(n), 1, 1, 1};
+        std::vector<std::vector<double>> k(method.n_stages);
+        std::vector<double> probe(n);
+        std::vector<float> scratch(n);
 
-        for (uint32_t step = 0; step < seq_len; ++step) {
-            // `reverse` walks timesteps backward through the SAME (forward-ordered) `sequence` input,
-            // writing each result to its own real time index `t` -- mirroring BiLstmStepper::run's own
-            // backward pass (src/core/bilstm_stepper.cpp) exactly, so a reverse-direction MIL `lstm` op
-            // (see recurrent.py's own "direction" handling) doesn't need its caller to pre-reverse
-            // anything itself.
-            const uint32_t t = reverse ? (seq_len - 1 - step) : step;
-            std::vector<float> layer_input(input_dim);
-            for (uint32_t k = 0; k < input_dim; ++k) {
-                layer_input[k] = static_cast<float>(sequence[static_cast<size_t>(t) * input_dim + k]);
+        for (size_t step = 0; step + 1 < times.size(); ++step) {
+            const double t = times[step];
+            const double h = times[step + 1] - t;
+            for (int stage = 0; stage < method.n_stages; ++stage) {
+                const OdeStage& st = method.stages[stage];
+                if (st.from_stage_scale < 0.0) {
+                    probe = state;
+                } else {
+                    const std::vector<double>& base = k[st.from_stage];
+                    for (size_t i = 0; i < n; ++i) {
+                        probe[i] = state[i] + h * st.from_stage_scale * base[i];
+                    }
+                }
+                const double stage_t = t + st.t_offset * h;
+
+                // The estimator itself: every FIXED input comes from the caller's table (a retained
+                // reference included), and these two come from the loop.
+                compute_and_emit(
+                    L, fname, module_name, builder, axes, /*inputs_idx=*/3,
+                    LoomLuaBridge::store_lookup(self), /*out_store=*/nullptr,
+                    [&](const GraphBuilder::BuildResult& r) -> int {
+                        if (r.outputs.empty()) {
+                            throw Error(std::string(fname) + ": module '" + module_name +
+                                         "' declares no outputs; an estimator returns f(x, t)");
+                        }
+                        if (ggml_nelements(r.outputs[0]) != static_cast<int64_t>(n)) {
+                            throw Error(std::string(fname) + ": module '" + module_name + "' returned " +
+                                         std::to_string(ggml_nelements(r.outputs[0])) + " element(s) for a " +
+                                         std::to_string(n) + "-element state -- f(x, t) has the shape of x");
+                        }
+                        for (int d = 0; d < GGML_MAX_DIMS; ++d) state_ne[d] = r.outputs[0]->ne[d];
+                        k[stage].resize(n);
+                        ggml_backend_tensor_get(r.outputs[0], scratch.data(), 0, n * sizeof(float));
+                        for (size_t i = 0; i < n; ++i) k[stage][i] = static_cast<double>(scratch[i]);
+                        return 0;
+                    },
+                    [&](const GraphBuilder::BuildResult& r) {
+                        const auto carried_it = r.input_tensors.find(carried);
+                        if (carried_it == r.input_tensors.end()) {
+                            throw Error(std::string(fname) + ": module '" + module_name +
+                                         "' has no declared input '" + carried + "' to carry the state");
+                        }
+                        const auto time_it = r.input_tensors.find(time_input);
+                        if (time_it == r.input_tensors.end()) {
+                            throw Error(std::string(fname) + ": module '" + module_name +
+                                         "' has no declared input '" + time_input + "'");
+                        }
+                        for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(probe[i]);
+                        ggml_backend_tensor_set(carried_it->second, scratch.data(), 0, n * sizeof(float));
+                        const auto stage_t_f = static_cast<float>(stage_t);
+                        ggml_backend_tensor_set(time_it->second, &stage_t_f, 0, sizeof(float));
+                    });
             }
-
-            // ONE build and ONE compute per timestep: the cell topology declares both `h_new` and
-            // `c_new`, so the gate stack is evaluated once and both halves of the step are read off
-            // the same result. It was two of each until the topology gained its second declared
-            // output -- the same node list computed twice per timestep, per direction, per BiLSTM
-            // (see recurrent.py::_lstm_cell_topology).
-            const GraphBuilder::BuildResult& r = builder.build({{"n_tokens", 0}, {"n_past", 0}});
-            ggml_backend_tensor_set(r.input_tensors.at("layer_input"), layer_input.data(), 0,
-                                     layer_input.size() * sizeof(float));
-            ggml_backend_tensor_set(r.input_tensors.at("h_prev"), h.data(), 0, h.size() * sizeof(float));
-            ggml_backend_tensor_set(r.input_tensors.at("c_prev"), c.data(), 0, c.size() * sizeof(float));
-            builder.compute();
-
-            if (r.outputs.size() < 2) {
-                return luaL_error(L, "loom.run_recurrent: module '%s' declares %d output(s); a cell "
-                                      "topology must declare both 'h_new' and 'c_new', in that order",
-                                   module_name, static_cast<int>(r.outputs.size()));
-            }
-            std::vector<float> h_new(hidden_dim);
-            std::vector<float> c_new(hidden_dim);
-            ggml_backend_tensor_get(r.outputs[0], h_new.data(), 0, h_new.size() * sizeof(float));
-            ggml_backend_tensor_get(r.outputs[1], c_new.data(), 0, c_new.size() * sizeof(float));
-
-            h = h_new;
-            c = c_new;
-            for (uint32_t k = 0; k < hidden_dim; ++k) {
-                out[static_cast<size_t>(t) * hidden_dim + k] = static_cast<double>(h[k]);
+            for (size_t i = 0; i < n; ++i) {
+                double delta = 0.0;
+                for (int stage = 0; stage < method.n_stages; ++stage) {
+                    delta += method.weights[stage] * k[stage][i];
+                }
+                state[i] += h * delta;
             }
         }
 
-        push_number_array(L, out);
-        const std::vector<double> shape = {static_cast<double>(hidden_dim), static_cast<double>(seq_len), 1.0, 1.0};
-        push_number_array(L, shape);
-        return 2;
+        if (retain) {
+            ggml_init_params params{};
+            params.mem_size = ggml_tensor_overhead() + 4096;
+            params.no_alloc = true;
+            ggml_context_ptr template_ctx(ggml_init(params));
+            ggml_tensor* shape = ggml_new_tensor(template_ctx.get(), GGML_TYPE_F32, GGML_MAX_DIMS,
+                                                  state_ne);
+            ggml_tensor* slot = out_store->reshape({shape}).at(0);
+            for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(state[i]);
+            ggml_backend_tensor_set(slot, scratch.data(), 0, n * sizeof(float));
+            out_store->bump_generation();
+            lua_pushinteger(L, static_cast<lua_Integer>(out_store->generation()));
+            return 1;
+        }
+        push_number_array(L, state);
+        return 1;
     } catch (const std::exception& e) {
-        return luaL_error(L, "loom.run_recurrent: %s", e.what());
+        return luaL_error(L, "%s: %s", fname, e.what());
     }
+}
+
+int LoomLuaBridge::l_run_ode(lua_State* L) { return run_ode_impl(L, /*retain=*/false); }
+int LoomLuaBridge::l_run_ode_and_retain(lua_State* L) { return run_ode_impl(L, /*retain=*/true); }
+
+int LoomLuaBridge::l_run_recurrent(lua_State* L) {
+    return run_recurrent_impl(L, /*retain=*/false);
+}
+
+int LoomLuaBridge::l_run_recurrent_and_retain(lua_State* L) {
+    return run_recurrent_impl(L, /*retain=*/true);
 }
 
 int LoomLuaBridge::l_range(lua_State* L) {
@@ -1019,9 +1563,17 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
 // than reproducing it.
 //
 // **A table rather than positional arguments** because the knobs are a set that grows, and it has now
-// grown twice: min-p and the repetition penalties are still not implemented (nothing in the fixture
-// set asks for them), while `lo`/`hi` and `guidance` were added for family 10. Adding one must not
-// renumber what a shipped GGUF's driver already passes, which is the whole reason for the table.
+// grown three times: `lo`/`hi` and `guidance` for family 10, and `repetition_penalty`/`penalized` for
+// Qwen3-TTS. Adding one must not renumber what a shipped GGUF's driver already passes, which is the
+// whole reason for the table. (min-p and the FREQUENCY/presence penalties are still not implemented;
+// nothing in the fixture set asks for them.)
+//
+// **`repetition_penalty = p` with `penalized = {id, ...}` divides a positive logit by `p` and
+// multiplies a negative one by it**, for each id the driver has already emitted -- `transformers`'
+// `RepetitionPenaltyLogitsProcessor`. It is applied BEFORE the greedy branch, because that processor
+// is not a warper: it runs whether or not a sample is drawn, so it moves an argmax too. Qwen3-TTS's
+// talker is why it exists and is also the proof that this is not cosmetic -- greedy without it never
+// emits EOS and runs to the token cap.
 //
 // **`lo`/`hi` here rather than a `sample_row_range` binding**, which is where this deliberately
 // departs from `argmax_row`/`argmax_row_range`. That pair is two bindings for a stated MECHANICAL
@@ -1064,6 +1616,8 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         bool check_generation = false;
         uint64_t generation = 0;
         std::string uncond_module;
+        float repetition_penalty = 1.0f;
+        std::vector<int64_t> penalized;
         float guidance_scale = 1.0f;
         int64_t guidance_top_k = 0;
         bool check_uncond_generation = false;
@@ -1087,6 +1641,26 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
             lua_getfield(L, 3, "generation");
             check_generation = !lua_isnil(L, -1);
             if (check_generation) generation = static_cast<uint64_t>(std::llround(luaL_checknumber(L, -1)));
+            lua_pop(L, 1);
+
+            // `repetition_penalty` + `penalized`, the ids it applies to. Two entries rather than one
+            // because they are two facts with two owners: the penalty is the CHECKPOINT's (read out
+            // of `generation_config.json` by the export) and the history is the DRIVER's own loop.
+            // A penalty with no history is the identity, which is what every driver that passes
+            // neither already gets.
+            repetition_penalty = static_cast<float>(number_field(3, "repetition_penalty", 1.0));
+            lua_getfield(L, 3, "penalized");
+            if (!lua_isnil(L, -1)) {
+                luaL_checktype(L, -1, LUA_TTABLE);
+                const int ids_idx = lua_gettop(L);
+                const auto count = static_cast<int64_t>(lua_objlen(L, ids_idx));
+                penalized.reserve(static_cast<size_t>(count));
+                for (int64_t i = 1; i <= count; ++i) {
+                    lua_rawgeti(L, ids_idx, static_cast<int>(i));
+                    penalized.push_back(static_cast<int64_t>(std::llround(luaL_checknumber(L, -1))));
+                    lua_pop(L, 1);
+                }
+            }
             lua_pop(L, 1);
 
             lua_getfield(L, 3, "guidance");
@@ -1128,7 +1702,8 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         }
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
-            temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k)));
+            temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k,
+            repetition_penalty, penalized)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());
@@ -1248,6 +1823,110 @@ int LoomLuaBridge::l_expand_by_duration(lua_State* L) {
     }
 }
 
+// `loom.expand_by_duration_and_retain(module, durations [, layout [, index]])` -- the same
+// repeat-rows-by-count as the binding above, performed on a module's RETAINED output and left in that
+// module's store.
+//
+// Frame expansion sits between two graphs in every duration-predicting TTS model here: a duration
+// encoder's output is expanded and fed to the F0/N BiLSTM, a text encoder's is expanded and fed to the
+// vocoder. The COUNTS are genuinely host-side -- the host predicted them and reads their total to size
+// everything downstream -- but the sequence being repeated is not, and marshalling it pushed
+// `T_frames * channels` doubles each way for a value nothing on this side looks at. The counts stay
+// arguments; the payload stops crossing.
+//
+// The source is one row per timestep (`[channels, seq_len]`, which is how `run_recurrent_and_retain`
+// and a rows_flat graph output both leave it) and `layout` names the RESULT's, the same two names
+// `run_bi_recurrent_and_retain` takes -- the consumers disagree, and both are ordinary.
+//
+// **In place, in the producing module's own store**: a store is storage addressed by a module name,
+// and `reshape` reallocates when the geometry moves, so the expanded sequence is the same value under
+// the same name with more rows. Its source is therefore read out before the reshape discards it, which
+// is why this is written as read-expand-write rather than as a backend-side gather. That costs one
+// float round trip per expansion (two per utterance) on a device backend; a gather would avoid it for
+// `rows` but not for `layout_a`, where a timestep's channels land `T_frames` apart and no contiguous
+// view names them -- two code paths for the cheaper half of a cost the Lua round trip paid in doubles.
+int LoomLuaBridge::l_expand_by_duration_and_retain(lua_State* L) {
+    const char* fname = "loom.expand_by_duration_and_retain";
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const std::string module_name = luaL_checkstring(L, 1);
+        const std::vector<double> durations_d = read_number_array(L, 2);
+        const std::string layout = luaL_optstring(L, 3, "rows");
+        const int64_t index1 = lua_isnoneornil(L, 4) ? 1 : static_cast<int64_t>(luaL_checknumber(L, 4));
+        if (layout != "rows" && layout != "layout_a") {
+            return luaL_error(L, "%s: layout '%s' -- it is 'rows' ([channels, frames], one row per "
+                                  "frame) or 'layout_a' ([frames, channels], time on the fastest axis)",
+                               fname, layout.c_str());
+        }
+        if (index1 < 1) {
+            return luaL_error(L, "%s: index %d is 1-based, like the declared-output list it indexes",
+                               fname, static_cast<int>(index1));
+        }
+
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "%s: unregistered module '%s'", fname, module_name.c_str());
+        }
+        ggml_tensor* src = retained_store(self, module_name).get(static_cast<size_t>(index1 - 1));
+        if (src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || src->ne[2] != 1 || src->ne[3] != 1) {
+            return luaL_error(L, "%s: module '%s' output %d is not a contiguous 2-D f32 tensor, so it "
+                                  "has no rows to repeat", fname, module_name.c_str(),
+                               static_cast<int>(index1));
+        }
+        if (src->ne[1] != static_cast<int64_t>(durations_d.size())) {
+            return luaL_error(L, "%s: module '%s' retained %d row(s) but %d duration(s) were given -- "
+                                  "one count per row is what this repeats", fname, module_name.c_str(),
+                               static_cast<int>(src->ne[1]), static_cast<int>(durations_d.size()));
+        }
+
+        const auto channels = static_cast<size_t>(src->ne[0]);
+        const auto seq_len = static_cast<size_t>(src->ne[1]);
+        std::vector<uint32_t> durations(seq_len);
+        size_t total = 0;
+        for (size_t t = 0; t < seq_len; ++t) {
+            const double d = durations_d[t];
+            if (!(d >= 1.0)) {
+                return luaL_error(L, "%s: duration %d is %f -- every row is repeated at least once, so "
+                                      "a count below 1 would drop it", fname, static_cast<int>(t + 1), d);
+            }
+            durations[t] = static_cast<uint32_t>(std::llround(d));
+            total += durations[t];
+        }
+
+        std::vector<float> rows(channels * seq_len);
+        ggml_backend_tensor_get(src, rows.data(), 0, rows.size() * sizeof(float));
+
+        std::vector<float> expanded(channels * total);
+        const bool rows_layout = layout == "rows";
+        size_t frame = 0;
+        for (size_t t = 0; t < seq_len; ++t) {
+            for (uint32_t r = 0; r < durations[t]; ++r, ++frame) {
+                for (size_t ch = 0; ch < channels; ++ch) {
+                    expanded[rows_layout ? frame * channels + ch : ch * total + frame] =
+                        rows[t * channels + ch];
+                }
+            }
+        }
+
+        OutputStore* store = nullptr;
+        ggml_context_ptr template_ctx;
+        ggml_tensor* retained = reshape_store_2d(
+            it->second, rows_layout ? static_cast<int64_t>(channels) : static_cast<int64_t>(total),
+            rows_layout ? static_cast<int64_t>(total) : static_cast<int64_t>(channels), template_ctx,
+            store);
+        ggml_backend_tensor_set(retained, expanded.data(), 0, expanded.size() * sizeof(float));
+        store->bump_generation();
+
+        const std::vector<double> shape = {static_cast<double>(retained->ne[0]),
+                                            static_cast<double>(retained->ne[1]), 1.0, 1.0};
+        lua_pushinteger(L, static_cast<lua_Integer>(store->generation()));
+        push_number_array(L, shape);
+        return 2;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "%s: %s", fname, e.what());
+    }
+}
+
 // Thin wrapper around loom::pad_crop_relative_embeddings (include/loom/core/relative_position.h),
 // already proven by VitsDriver's own C++ implementation.
 int LoomLuaBridge::l_pad_crop_relative_embeddings(lua_State* L) {
@@ -1325,6 +2004,11 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         lua_CFunction fn;
     } bindings[] = {
         {"run_subgraph", &LoomLuaBridge::l_run_subgraph}, {"run_recurrent", &LoomLuaBridge::l_run_recurrent},
+        {"run_recurrent_and_retain", &LoomLuaBridge::l_run_recurrent_and_retain},
+        {"run_bi_recurrent_and_retain", &LoomLuaBridge::l_run_bi_recurrent_and_retain},
+        {"output_shape", &LoomLuaBridge::l_output_shape},
+        {"run_ode", &LoomLuaBridge::l_run_ode},
+        {"run_ode_and_retain", &LoomLuaBridge::l_run_ode_and_retain},
         {"range", &LoomLuaBridge::l_range},
         {"run_subgraph_and_retain", &LoomLuaBridge::l_run_subgraph_and_retain},
         {"get_output", &LoomLuaBridge::l_get_output},
@@ -1336,6 +2020,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"gaussian_array", &LoomLuaBridge::l_gaussian_array},
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
+        {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
         {"pad_crop_relative_embeddings", &LoomLuaBridge::l_pad_crop_relative_embeddings},
         {"get_weight", &LoomLuaBridge::l_get_weight},
     };

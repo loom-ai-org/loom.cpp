@@ -661,6 +661,15 @@ Outputs op_relu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_relu(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
+// EnCodec's SEANet decoder, which uses ELU where every vocoder in families 7-9 uses LeakyReLU
+// (BACKLOG.md P5, family 11's second leaf). `ggml_elu` already exists with a CPU implementation, so
+// this is one registration rather than a kernel -- and the first op family 11 has needed at all, the
+// two codecs before it having lowered entirely onto primitives other families had already paid for.
+Outputs op_elu(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    expect_n_inputs("ELU", in, 1);
+    return {ggml_elu(pc.ctx, ensure_packed(pc.ctx, in[0]))};
+}
+
 Outputs op_leaky_relu(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     expect_n_inputs("LEAKY_RELU", in, 1);
     const double slope = resolve_attr_number(attrs, "slope", pc.symbols);
@@ -1089,6 +1098,7 @@ LOOM_REGISTER_OP(PAD_1D_REFLECT, op_pad_1d_reflect)
 LOOM_REGISTER_OP(SILU, op_silu)
 LOOM_REGISTER_OP(RELU, op_relu)
 LOOM_REGISTER_OP(LEAKY_RELU, op_leaky_relu)
+LOOM_REGISTER_OP(ELU, op_elu)
 LOOM_REGISTER_OP(STEP, op_step)
 LOOM_REGISTER_OP(CONCAT, op_concat)
 LOOM_REGISTER_OP(CUMSUM, op_cumsum)
