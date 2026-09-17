@@ -239,13 +239,15 @@ Done: wheels for both Apple architectures wired into the release workflow; `impo
 answered "no"**; and — the bar this item was raised to once the hardware existed — the arm64 wheel
 installed and a model run on a real M1 Pro.
 
-Still open, and deliberately not folded in:
+What was open here has since closed, and is recorded rather than tracked:
 
-* **Publishing.** Nothing here has been uploaded to PyPI. The macOS rows produce artifacts on the
-  next release run; the first Apple wheels reach the index when someone publishes them.
-* **The `loom-py` submodule pointer** still names a `loom.cpp` commit that predates P4.20–P4.29, and
-  `loom.cpp/main` is many commits ahead of its origin. Every macOS build here used the working tree.
-  Bumping the pointer is a release-time act and belongs with the rc7 push, not here.
+* **Publishing — DONE.** Both Apple wheels have shipped with every release from rc7 onward;
+  `1.0.0rc10` carries `macosx_14_0_arm64` and `macosx_14_0_x86_64` for cp310–cp313. The
+  `linux_armv6l` wheel is the one file that does *not* reach PyPI — the index rejects that tag at
+  upload, so `wheels.yml` attaches it to the GitHub release instead.
+* **The `loom-py` submodule pointer — DONE.** Bumping it is a release-time act, as this item said, and
+  it is now part of the cut: rc10 pins `vendor/loom.cpp` at `main`'s tip and the wheels are built from
+  that pin.
 * **Windows** stays out of scope and stays behind this.
 
 

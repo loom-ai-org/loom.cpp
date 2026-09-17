@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-12
+last_updated: 2026-09-17
 ---
 
 # Epic-03: Model Coverage
@@ -13,14 +13,24 @@ The measure of the data-driven design is how cheaply a new architecture arrives.
 models ship, which family template each belongs to, and the roadmap for the rest — with the standing
 acceptance criterion that **a new family should need no engine work**.
 
-Twenty-three models are published at
-[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), and three more are exported and
-verified but unpublished — EnCodec-32kHz (see the hub for why) and family 4's two English CTC
-checkpoints, which go out with the release that carries the engine changes they need. **Family 11 is
-closed**: DAC, SNAC and EnCodec cover the uniform, multi-rate and recurrent shapes a codec decoder
-comes in. **Family 4 is closed on three checkpoints**, covering the three architectures HF's
-`AutoModelForCTC` resolves. Each is a single GGUF carrying its own topologies, driver and — where
-the architecture has one — its vocabulary.
+**Thirty models are published** at
+[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org) as of 2026-09-17, every one of them
+re-exported and card-gated for `1.0.0-rc10`; nothing exported and verified is waiting to be published.
+**Family 11 is closed**: DAC, SNAC and EnCodec cover the uniform, multi-rate and recurrent shapes a
+codec decoder comes in, and Qwen3-TTS's tokenizer adds the chunked-attention one. **Family 4 is closed
+on three checkpoints**, covering the three architectures HF's `AutoModelForCTC` resolves. **Family 5 is
+closed on two** — SenseVoice-Small and Paraformer-zh. Each is a single GGUF carrying its own
+topologies, driver and — where the architecture has one — its vocabulary, with the two deliberate
+exceptions where a codec is its own file ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)).
+
+Two checkpoints are verified and deliberately **not** published, for different reasons.
+`omniASR-CTC-300M-v2` is family 4's third structural witness: its own documented processor path
+transcribes garbage and loom reproduces that exactly, so the export is right and the checkpoint's
+declared front end disagrees with its weights. `bert-base-NER` is family 12's first checkpoint and
+stays in the export sweep as a **structural witness only** — DistilBERT-NER was chosen as the
+family's published English NER representative, and shipping both would put two cards on the Hub for
+one task and one vocabulary. A family proves itself on several checkpoints and publishes one per
+task; that is the rule these two are instances of, not an omission in either case.
 
 ## 2. Architectural Overview
 
@@ -40,7 +50,8 @@ the architecture has one — its vocabulary.
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
-| **Text → codec tokens** | Dia-1.6B | `dia_export.py` |
+| **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
+| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base | `dia_export.py`, `qwen3_tts_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
@@ -641,6 +652,54 @@ cross-check that they implement one rule.
 
 See [the backlog](../backlog/active-index.md#models) for what is left.
 
+#### The second leaf was Qwen3-TTS, and an op had to be REMOVED rather than converted (2026-09-13)
+
+`Qwen3-TTS-12Hz-0.6B-Base` is family 10's second leaf and ships as **two files** for ADR-022's reason,
+exactly as Dia does — a 914 M talker plus a 114 M codec at 12.5 Hz, where the codec is family 11's
+fourth shape (the first with ATTENTION over the frame axis, hence the first CHUNKED decode:
+[ADR-034](../adrs/adr-034-a-chunked-decode-is-the-drivers-loop-not-a-longer-call.md), which
+`encodec_export` had predicted in as many words — "a chunked one is a different driver, not a longer
+call"). `loom-export` on the checkpoint root emits both, through the new `LoomExportConfig.companions()`
+hook; the CLI opts in and `main_export()` does not, because `build_model_cards.py` calls the API once
+per Hub repo.
+
+**One audio frame is sixteen transformer forwards, not one.** A 28-layer Qwen3-shaped talker emits
+codebook 0 and a 5-layer **code predictor** emits the other 15 from the talker's hidden state, its KV
+cache reset per frame. The input embedding is a SUM of 16 codebook embeddings plus a text hidden,
+never a token lookup. The `mrope` in its config is **decorative** — `get_rope_index` always expands one
+row to three identical ones, so `apply_interleaved_rope` collapses to plain RoPE at θ=1e6, and the
+scariest-looking thing in the config costs nothing.
+
+Three things cost real work, and the order they were found in is the lesson.
+
+* **`repeat_kv` does not survive conversion, and the fix was to delete the op.** coremltools folds its
+  expand (a broadcast) before `passes.fuse_gqa_repeat_kv` can match it, and rewriting it as
+  `repeat_interleave` only moves the failure into the merge reshape, which comes back as
+  `[128, n_tokens, n_tokens, 8]` — [Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md)'s
+  substitution one family later. So `materialise_gqa` duplicates `k_proj`/`v_proj` interleaved until
+  K/V heads equal query heads: **+69.2 M parameters, 277 MB at F32**, checked against the written
+  file's own growth, and a doubled cache. The KV-geometry error this first presented as (28 blocks
+  reporting 16 K/V heads against the predictor's 5 reporting 8) was a symptom; the census the error
+  now prints is what made it legible as one.
+* **A greedy decode without a repetition penalty never terminates.** `transformers` applies the penalty
+  as a **processor** rather than a warper, so it moves a greedy argmax too: without it the decode ran
+  200 frames against the reference's 42. `loom.sample_row` gained `repetition_penalty` + `penalized`,
+  and with them the decomposition reproduces the reference **bit-identically at 672 codes**.
+* **[Retro-047](../retros/retro-047-an-inferred-dimension-outlives-the-reshape.md) is the genuinely new
+  failure**: an inferred `-1` reaches the topology as a literal and the next op derives `floor(1/n)`
+  from it. Export, write and load all pass; only running fails.
+
+The codec half verifies at max abs **4.167e-06** at 42 frames and **1.699e-05** at 700 against the
+reference's own `chunked_decode`, exact sample count at both, with the ASR oracle reading the decode
+back verbatim. It cost one driver component (`ChunkedCodecCall`), no engine change and no new binding.
+
+**What it does NOT do yet is ICL.** `spk_id` is empty in this checkpoint, so voice cloning is the only
+mode, and its two arms are nested rather than alternative: `x_vector_only_mode=True` needs a 128-mel
+front end at 24 kHz and an 8.9 M ECAPA speaker encoder, and that is what shipped; ICL (`ref_text` +
+`ref_code`) additionally needs the tokenizer's **encoder** — a `transformers` `MimiModel`, a second
+family-11-scale export of the half family 11 deliberately skipped — and a sampler that can express a
+non-contiguous allowed set. [The backlog](../backlog/active-index.md#models) carries it.
+
 ### Text input
 
 **Only Supertonic takes text.** It encodes graphemes itself and its GGUF carries the codepoint table.
@@ -653,10 +712,10 @@ those checkpoints, addressed by [Epic-07](epic-07-text-frontends-and-tokenizers.
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** the remaining TTS families → small classifiers → music. Seven are **done** —
-token classifiers (12), codec decoders (11, all three shapes), the AR codec-token LM (10), text
-encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-15, SANM / FunASR (5, on its
-first leaf) —
+**Next families:** the remaining TTS families → small classifiers → music. **Six are done** —
+token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
+encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
+leaves: SenseVoice-Small and Paraformer-zh) —
 and §2 says what each cost, which is the number the rest of this list should be estimated against.
 Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
 family 6 landing means the zoo has an encoder-decoder text model and a SentencePiece Unigram LM for
@@ -674,8 +733,11 @@ Family 12 is now proved on **three** checkpoints and both tokenizer halves — t
 and one SentencePiece Unigram one — which is what closes the "a family-12 checkpoint that is not
 WordPiece" item.
 
-**Named but unstarted:** Qwen3-ASR-0.6B and Qwen3-TTS-0.6B variants — Qwen3-TTS is expected to be the
-most architecturally novel item in that family and needs its own source-level read before scoping.
+**Named but unstarted:** the Qwen3-ASR-0.6B variants beyond the exported leaf (the 1.7B and the
+native-layout repo). Qwen3-TTS was the other name on this line and is no longer unstarted — it shipped
+2026-09-13 in `x_vector_only_mode`, and what remains of it is ICL mode, which the hub carries as an
+open item because its bill is a second family-11-scale export plus a sampler that can express a
+non-contiguous allowed set.
 F5-TTS is deferred by explicit direction (flow-matching, `OdeStepper`-adjacent, likely sharing
 primitives with Matcha).
 
