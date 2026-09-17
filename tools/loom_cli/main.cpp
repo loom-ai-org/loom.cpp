@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -32,6 +33,8 @@ void print_usage(const char* argv0) {
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
                   "[--task transcribe|translate] [--timestamps] "
                   "[--no-condition-on-previous]\n"
+                  "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
+                  "--out out.wav\n"
                   "\n"
                   "  --chat                        wrap --prompt in the model's own chat template\n"
                   "  --system <text>               a system turn ahead of it (implies --chat)\n"
@@ -40,6 +43,12 @@ void print_usage(const char* argv0) {
                   "                                declared, which for most models is greedy\n"
                   "  --seed N                      make a sampled generation reproducible\n"
                   "\n"
+                  "  --out <path.wav>              for a model whose answer is AUDIO: synthesise and\n"
+                  "                                write it. --prompt is the text, the IPA phonemes or\n"
+                  "                                the codes, depending on what the file declares\n"
+                  "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
+                  "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
+                  "                                `sample_rate=N` for a model that declares none\n"
                   "  --device <auto|cpu|gpu|NAME>  where to run (default: auto, or $LOOM_DEVICE)\n"
                   "  --list-devices                print the devices this build can reach, and exit\n"
                   "\n"
@@ -48,12 +57,106 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0);
+                  argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
 // at which execution crossed between the device and the CPU fallback, and every crossing is a copy in
 // each direction. A module reported as 1 split ran entirely on one backend.
+// `1,2,3` or `@path` (whitespace- or comma-separated numbers in a file). The file form is what makes
+// Kokoro reachable at all: its `ref_s` is 256 floats chosen per voice, which belongs in a file rather
+// than on a command line.
+std::vector<double> read_number_spec(const std::string& spec) {
+    std::string text = spec;
+    if (!spec.empty() && spec[0] == '@') {
+        std::ifstream in(spec.substr(1));
+        if (!in) throw std::runtime_error("could not read '" + spec.substr(1) + "'");
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    for (char& c : text) {
+        if (c == ',' || c == ';' || c == '\n' || c == '\t' || c == '\r') c = ' ';
+    }
+    std::vector<double> out;
+    std::istringstream stream(text);
+    double value = 0.0;
+    while (stream >> value) out.push_back(value);
+    return out;
+}
+
+void print_device_report(const loom::LoomLuaBridge& bridge);
+
+// `--input sample_rate=N`, for the three models that declare none of their own.
+uint32_t rate_override(const std::vector<std::pair<std::string, std::vector<double>>>& extra) {
+    for (const auto& [name, values] : extra) {
+        if (name == "sample_rate" && !values.empty()) return static_cast<uint32_t>(values[0]);
+    }
+    return 0;
+}
+
+// Runs a model whose OUTPUT KIND is audio and writes the waveform.
+//
+// **This is the half of the CLI that did not exist**, and its absence was not a small gap: with two
+// output modes -- a transcript and tokens -- every TTS and codec family in the zoo was unreachable
+// from here, on any device. `scripts/tts_synth.cpp` has done it for measurement since P4.13, per
+// family, with the input names hard-coded; what is different here is that the driver's own declared
+// primary input is used (`tokens`, which every synthesized driver aliases) and anything else the
+// family needs arrives through `--input`.
+//
+// The sample rate is the FILE's when it declares one. VITS and the two LJSpeech models do not, so a
+// rate is required from the caller rather than assumed -- a wrong rate does not fail, it plays the
+// audio at the wrong speed, which is the failure this refuses to make silently.
+int synthesize(loom::GgufModel& model, const loom::Backends& backends,
+                const std::vector<int32_t>& ids, const std::string& input_name,
+                const std::vector<std::pair<std::string, std::vector<double>>>& extra,
+                const std::string& out_path, uint32_t rate_override, uint32_t seed) {
+    uint32_t rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
+    if (rate == 0) rate = rate_override;
+    if (rate == 0) {
+        std::fprintf(stderr,
+                     "this model declares no `loom.sample_rate`, so the rate has to come from you: "
+                     "pass --input sample_rate=22050 (vits/matcha) or 24000 (kokoro/styletts2). A "
+                     "wrong rate plays the audio at the wrong speed rather than failing.\n");
+        return 1;
+    }
+
+    loom::Session session(model, backends);
+    std::unordered_map<std::string, loom::LoomLuaBridge::Value> inputs;
+    std::vector<double> as_doubles(ids.begin(), ids.end());
+    inputs[input_name] = as_doubles;
+    // Every phoneme-input TTS family draws noise and reads `inputs.seed` for it -- VITS's z and its
+    // stochastic duration predictor, StyleTTS2's diffusion, the flow-matching z0 -- and a driver that
+    // does not name it simply ignores the entry. Defaulted rather than required, because a CLI that
+    // refuses to speak until you pick a random number is asking the wrong question; `--seed` sets it.
+    inputs["seed"] = static_cast<double>(seed);
+    for (const auto& [name, values] : extra) {
+        if (name == "sample_rate") continue;               // ours, not the driver's
+        if (values.size() == 1) {
+            inputs[name] = values[0];
+        } else {
+            inputs[name] = values;
+        }
+    }
+
+    const auto result = session.bridge().call("infer", inputs);
+    const auto* samples = std::get_if<std::vector<double>>(&result);
+    if (samples == nullptr) {
+        std::fprintf(stderr, "this model's driver returned a single number, not a waveform\n");
+        return 1;
+    }
+    std::vector<float> audio(samples->begin(), samples->end());
+    double peak = 0.0, sum_sq = 0.0;
+    for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
+    // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
+    // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
+    std::printf("  %zu samples at %u Hz = %.2f s, peak %.4f, rms %.4f\n", audio.size(), rate,
+                static_cast<double>(audio.size()) / rate, peak,
+                std::sqrt(sum_sq / std::max<size_t>(audio.size(), 1)));
+    loom_cli::write_wav_pcm16_mono(out_path, audio, rate);
+    std::printf("  wrote %s\n", out_path.c_str());
+    print_device_report(session.bridge());
+    return 0;
+}
+
 void print_device_report(const loom::LoomLuaBridge& bridge) {
     const auto report = bridge.device_report();
     if (report.empty()) return;
@@ -154,6 +257,15 @@ int main(int argc, char** argv) {
     loom::text::GenerateOptions gen_opts;
     std::string device_spec;
     bool list_devices = false;
+    // Where a model whose answer is AUDIO writes it. Empty means the old behaviour -- print what the
+    // file declares and stop -- so no existing invocation changes.
+    std::string out_wav;
+    // Extra driver inputs, `name=1,2,3` or `name=@file` (whitespace-separated numbers). The four TTS
+    // families do not all take the same ones: Kokoro needs a 256-float `ref_s` voice embedding that is
+    // not in the GGUF, StyleTTS2 takes `diffusion_steps`, Matcha `n_steps`. Rather than a flag per
+    // family, the driver's own declared input names are the interface -- a wrong one is an error from
+    // the engine naming the module and the input.
+    std::vector<std::pair<std::string, std::vector<double>>> extra_inputs;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -200,6 +312,16 @@ int main(int argc, char** argv) {
             gen_opts.seed = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--n-predict" && i + 1 < argc) {
             n_predict = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--out" && i + 1 < argc) {
+            out_wav = argv[++i];
+        } else if (arg == "--input" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const size_t eq = spec.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr, "--input takes name=1,2,3 or name=@file, got '%s'\n", spec.c_str());
+                return 2;
+            }
+            extra_inputs.emplace_back(spec.substr(0, eq), read_number_spec(spec.substr(eq + 1)));
         } else if (arg == "--device" && i + 1 < argc) {
             device_spec = argv[++i];
         } else if (arg == "--list-devices") {
@@ -236,6 +358,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     const loom::Backends backends = device->backends();
+    // What a stochastic TTS driver seeds with. `--seed` is the same flag that makes a sampled
+    // generation reproducible, which is the same question asked of a different kind of model.
+    const uint32_t synth_seed = gen_opts.seed ? *gen_opts.seed : 1234u;
     if (!device->is_cpu()) {
         std::printf("device: %s (%s)\n", device->name().c_str(), device->description().c_str());
     }
@@ -317,6 +442,35 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // A codec decoder: `audio_codes` in, audio out, and no vocabulary anywhere in the file. Its
+        // `--prompt` is the codes themselves -- frame-major, `codec.n_codebooks` wide -- because that
+        // is what the caller has: they came out of an AR model or an encoder, never off a keyboard.
+        if (contract.interface_name() == "codes2speech") {
+            const uint32_t width = model->has_kv("loom.codec.n_codebooks")
+                                       ? model->hparam_u32("codec.n_codebooks") : 0;
+            std::printf("  codec: %u stream(s) per frame", width);
+            if (model->has_kv("loom.codec.frame_rate")) {
+                std::printf(", %.4g frame(s) per second", model->hparam_f32("codec.frame_rate"));
+            }
+            std::printf("\n");
+            if (!has_prompt || out_wav.empty()) {
+                std::printf("  pass --prompt \"<codes>\" --out out.wav to decode; codes are frame-major "
+                            "(all %u for frame 0, then frame 1, ...)\n", width);
+                return 0;
+            }
+            const std::vector<double> codes = read_number_spec(prompt_text);
+            if (width > 0 && codes.size() % width != 0) {
+                std::fprintf(stderr, "  %zu code(s) is not a whole number of %u-wide frames\n",
+                              codes.size(), width);
+                return 1;
+            }
+            std::printf("  %zu code(s) = %zu frame(s)\n", codes.size(),
+                        width > 0 ? codes.size() / width : codes.size());
+            const std::vector<int32_t> ids(codes.begin(), codes.end());
+            return synthesize(*model, backends, ids, "codes", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "supertonic") {
             // SupertonicTTS's grapheme text front-end: inspection-only, same reasoning as the two branches
             // above. Falling THROUGH to the generation path below would have been the bug this branch
@@ -340,6 +494,10 @@ int main(int argc, char** argv) {
                     const uint32_t txt_len = model->hparam_u32("txt_len");
                     std::printf("  loom.txt_len = %u (max; the driver pads)%s\n", txt_len,
                                 ids.size() <= txt_len ? "" : "  <-- encoded length EXCEEDS it; shorten");
+                }
+                if (!out_wav.empty()) {
+                    return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                                      rate_override(extra_inputs), synth_seed);
                 }
             }
             return 0;
@@ -383,6 +541,10 @@ int main(int argc, char** argv) {
                 if (unknown > 0) {
                     std::printf("  %zu symbol%s not in this model's table, dropped; it will say \"%s\"\n",
                                 unknown, unknown == 1 ? "" : "s", phoneme_vocab->decode(ids).c_str());
+                }
+                if (!out_wav.empty()) {
+                    return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                                      rate_override(extra_inputs), synth_seed);
                 }
             }
             return 0;

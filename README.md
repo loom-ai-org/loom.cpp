@@ -620,10 +620,11 @@ the custom-op fusion above, which on an NPU stops being an optimization and beco
 macOS on Apple Silicon, and Linux on ARM — the last of which is the one that matters most for an engine
 whose stated target is edge devices.
 
-**3. More models — [Epic-03](docs/epics/epic-03-model-coverage.md)**, ordered by coverage per unit of effort: BERT token classifiers
-(the smallest possible template, and the first non-audio task) → codec decoders → CNN+CTC and SANM
-encoders → the remaining TTS families → text encoder-decoders → small classifiers → music. Each is an
-export, so the measure of the design is that none of them should need engine work.
+**3. More models — [Epic-03](docs/epics/epic-03-model-coverage.md)**, ordered by coverage per unit of effort. BERT token
+classifiers (the smallest possible template, and the first non-audio task), codec decoders, text
+encoder-decoders, CNN+CTC and SANM encoders are all done; what is left is the remaining TTS families →
+small classifiers → music. Each is an export, so the measure of the design is that none of them should
+need engine work — and SANM, the most recent, needed none.
 
 **4. The follow-ups the docs already name.** [`docs/backlog/active-index.md`](docs/backlog/active-index.md)
 is the ledger and the authority; the ones worth knowing about from here are the `KvCache` memory redesign (deferred with its reasons),
