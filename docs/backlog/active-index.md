@@ -67,12 +67,6 @@ before its wheel is a file nobody can run, and
   Alibaba's Apache-2.0 `qwen-tts` package, imported lazily like SNAC's; `pip install --no-deps qwen-tts`
   into the **piper** venv, whose transformers 4.57.6 matches the package's `==4.57.3` pin. Ovos is the
   wrong venv for it: transformers 5.x has moved the internals it imports.*
-* [ ] **`bert-base-NER` is a family-12 checkpoint with no card and no Hub presence.** It is in the
-  export sweep (`tests/gate/test_export_sweep.py`) and [Epic-03 §2](../epics/epic-03-model-coverage.md)
-  names it as the family's first checkpoint, but `build_model_cards.py` carries only `distilbert-ner`,
-  so the Hub has DistilBERT and XLM-R and not BERT. Either it publishes or it is a verification-only
-  checkpoint like `omniASR-CTC-300M-v2` — the difference is that omniASR's reason is written down and
-  this one's is not. One line of decision, then either a card or a sentence in Epic-03.
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
