@@ -20,7 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | rc10 is out and nothing structural sits in front of the next family. [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Six families are complete — 4, 5, 6, 10, 11 and 12 — and five of them needed **no engine primitive**, which is the acceptance criterion holding rather than a run of luck. Estimate the next leaf against what those cost and against the correction families 4 and 5 both wrote down: the CTC *head* is free, the *encoder template* is not shared, and the bill lands where the scoping did not look — a rebuilt kaldi front end, four entries in the exporter's own shape walk → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **Qwen3-TTS ICL mode is the one place engine C++ is still expected** | Both Qwen3-TTS GGUFs are published and the mode they serve is `x_vector_only_mode=True`. ICL (`ref_text` + `ref_code`) needs two things this tree does not have, and neither is a nicety: the tokenizer's **encoder**, a `transformers` `MimiModel` — a second family-11-scale export, and one family 11 deliberately scoped out ("the DECODE half only") — and a sampler that can express a **non-contiguous allowed set**, since `suppress_tokens` bans `[2048, 3072)` *except* `codec_eos = 2150`, which `lo`/`hi` cannot say. ICL also degenerates under greedy decoding (200 frames to the cap, 15.9 s of audio transcribing as *"country can do for you."*), so the sampler is load-bearing rather than optional. That is [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)'s bill for this family → see [Models](#models) |
+| **Qwen3-TTS's repetition penalty disagrees with `transformers`, and the shipped file is the one that differs** | Surfaced by ICL's verification and **pre-existing**: on a target sentence short enough that the model wants to repeat a frame, the reference emits the repeat and loom does not. `repetition_penalty = 1.0` makes loom reproduce the reference 624/624 over 39 frames; the checkpoint's own 1.05 gives 96/624. The published GGUF and this branch's agree 640/640 on that input, so nothing regressed — but one of the two implementations is applying a penalty the other is not, and the cards describe the shipped behaviour. **Do not change the default before instrumenting the reference's processor** → see [Models](#models) |
 | **P5.0 decides which models are exportable at all, and two of its three changes are open** | Peak RSS during *conversion* is the constraint that picks the zoo, not the template. Change 1 is done and took Granite-Speech from 30.4 GB to 22.9 GB — the difference between OOM and a clean export — and the two that remain (quantize per phase as it converts; convert each phase in its own process) are what any Voxtral-sized checkpoint waits on. Not a cleanup → see [Models](#models) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
@@ -34,39 +34,57 @@ EnCodec ships `cc-by-nc-4.0` and that is **settled, not pending** — the weight
 by `facebook/encodec_32khz`'s own card, whatever the MIT code says. → [[loom-release-state]],
 [Epic-08](../epics/epic-08-packaging-and-release.md)
 
-**A GGUF no longer waits for a release — unless it adds a binding.** rc10 carried every binding the
+**NOTHING STAGED IS PUBLISHED UNTIL 1.0.0-rc11 IS OUT.** Author's decision, 2026-09-17: staged model
+updates wait for the next release even when they need nothing from it. So a freshly staged GGUF is
+**not** a publishable one, whatever the coupling below says — the Hub and the staging tree are allowed
+to diverge until rc11 ships, and today they do: `hf-models/qwen3-tts-12hz-0.6b` is the ICL build and
+the Hub's copy is rc10's. That divergence is expected, and it does not survive the release either way,
+because [[feedback-release-gate-needs-a-fresh-export]] requires a fresh export at rc11 time regardless
+of what is sitting in the tree.
+
+*The technical coupling, which still decides what rc11 must contain:* rc10 carried every binding the
 staged drivers needed (`output_shape`, `run_ode_and_retain`, the retrace's retained-reference
 bindings, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary
-readers, grouped `CONV_1D`), so the next family's model can publish on its own cadence. The moment one
-needs something the released wheels have not got, **WHEELS FIRST, ALWAYS** returns: a GGUF published
-before its wheel is a file nobody can run, and
-[[feedback-release-gate-needs-a-fresh-export]] is why no gate catches that for you.
+readers, grouped `CONV_1D`), and Qwen3-TTS's ICL half needs nothing beyond them — verified by running
+its GGUF on the released `loom-py-rt==1.0.0rc10` wheel from PyPI. The moment a model needs something
+the released wheels have not got, **WHEELS FIRST, ALWAYS** is the harder constraint on top of the
+rule above: a GGUF published before its wheel is a file nobody can run.
 
 ---
 
 ## Models
 
-* [ ] **Qwen3-TTS ICL mode — the one place engine C++ is currently expected.** The model SHIPPED
-  2026-09-13 and both GGUFs are on the Hub; what shipped is `x_vector_only_mode=True`, and
-  [Epic-03 §2](../epics/epic-03-model-coverage.md) has the architecture, the numbers and what the
-  export cost. ICL (`ref_text` + `ref_code`) is the open half, and its bill is two items neither of
-  which is a nicety:
+* [ ] **Qwen3-TTS's repetition penalty and `transformers`' do not penalise the same history, and the
+  SHIPPED model is the one that differs.** Found while grading ICL, on the x-vector path, with a
+  target sentence short enough that the model wants to repeat a frame: `loom` and the reference agree
+  for six frames, and at frame 6 the reference emits **frame 5 again** while loom does not. Turning
+  the penalty off (`repetition_penalty = 1.0`) makes loom reproduce the reference **624/624 ids over
+  39 frames**, including the repeat; leaving it at the checkpoint's 1.05 gives 96/624. The published
+  GGUF behaves identically to this branch's on the same input (640/640), so this is **pre-existing and
+  not ICL's doing** — ICL surfaced it.
 
-  * **The tokenizer's ENCODER**, a `transformers` `MimiModel` — a whole second family-11-scale export,
-    and one family 11 deliberately does not do ("the DECODE half only").
-  * **A non-contiguous allowed set in the sampler.** `suppress_tokens` bans `[2048, 3072)` *except*
-    `codec_eos = 2150`, which `lo`/`hi` cannot express, and `repetition_penalty` (1.05 over the
-    generated codes) is already in. That is
-    [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)'s bill for this family.
-
-  The sampler is not optional here: ICL **degenerates under greedy decoding** — 200 frames to the cap,
-  15.9 s of audio transcribing as *"country can do for you."* — so the encoder alone would not produce
-  a shippable mode. The order is forced: x-vector-only first (done), ICL after.
-
-  *Context: [Epic-03](../epics/epic-03-model-coverage.md), [[loom-qwen3-tts-shipped]]. The reference is
-  Alibaba's Apache-2.0 `qwen-tts` package, imported lazily like SNAC's; `pip install --no-deps qwen-tts`
-  into the **piper** venv, whose transformers 4.57.6 matches the package's `==4.57.3` pin. Ovos is the
-  wrong venv for it: transformers 5.x has moved the internals it imports.*
+  What is NOT yet known is which side is wrong. `Qwen3TTSTalkerForConditionalGeneration` does maintain
+  `input_ids` across steps (its own forward reads them, `modeling_qwen3_tts.py:1681`), so HF's
+  `RepetitionPenaltyLogitsProcessor` should be live — which would make loom's penalty *stronger or
+  differently applied* rather than the reference's inert. Worth an hour with the reference's processor
+  instrumented at the divergent step, printing the top two logits before and after the penalty.
+  **Do not change the default until that is known**: the shipped file's output is what every card and
+  every recorded number describes. Repro: `scripts/run_talker.cpp` with `GREEDY=1 PENALTY=1.0`,
+  fixtures in `/home/flavio/.claude/tmp/qwen3_icl/`.
+  *Context: [[loom-qwen3-tts-shipped]], [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)*
+* [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
+  voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
+  every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
+  ship a recording"; this card instead tells the reader to bring `reference.wav`, which is a
+  legitimate precondition the harness skips on by design. The consequence is that `-k qwen3-tts`
+  reports **2 passed, 14 skipped** and none of the passes ran the snippet — the ASR oracle included,
+  since it grades the audio the card itself produced. Pre-existing (the x-vector snippet has the same
+  shape) and surfaced by ICL's own verification, which had to be done outside the gate entirely.
+  **What would close it:** either the harness seeds a 24 kHz clip under a name the card can use
+  without lying to a reader, or the card's first block loads `audio` with a comment saying it stands
+  for the reader's own recording. Worth deciding once, because every future voice-cloning leaf
+  inherits it. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
+  [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
