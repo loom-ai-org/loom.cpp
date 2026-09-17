@@ -693,12 +693,50 @@ The codec half verifies at max abs **4.167e-06** at 42 frames and **1.699e-05** 
 reference's own `chunked_decode`, exact sample count at both, with the ASR oracle reading the decode
 back verbatim. It cost one driver component (`ChunkedCodecCall`), no engine change and no new binding.
 
-**What it does NOT do yet is ICL.** `spk_id` is empty in this checkpoint, so voice cloning is the only
-mode, and its two arms are nested rather than alternative: `x_vector_only_mode=True` needs a 128-mel
-front end at 24 kHz and an 8.9 M ECAPA speaker encoder, and that is what shipped; ICL (`ref_text` +
-`ref_code`) additionally needs the tokenizer's **encoder** — a `transformers` `MimiModel`, a second
-family-11-scale export of the half family 11 deliberately skipped — and a sampler that can express a
-non-contiguous allowed set. [The backlog](../backlog/active-index.md#models) carries it.
+#### ICL landed 2026-09-17, and the bill it was scoped with had already been paid
+
+`spk_id` is empty in this checkpoint, so voice cloning is the only mode and its two arms are nested
+rather than alternative. `x_vector_only_mode` shipped first; **ICL — the reference clip replayed, its
+transcript on the text stream and its own codec frames on the codec stream — shipped 2026-09-17**, and
+what it cost is not what the roadmap said it would.
+
+**The sampler's half of the estimate was already paid, by the work that opened the item.** ICL was
+filed as needing a non-contiguous allowed set, because `suppress_tokens` bans `[2048, 3072)` except
+`codec_eos = 2150` and `lo`/`hi` cannot express a hole. But `_TalkerWrapper` had already **trimmed the
+head** to 2048 real codes plus one EOS row — for `min_new_tokens`, on the x-vector path — so the hole
+does not exist in the drawable space at all, and the driver has carried temperature, top-k, top-p and
+the repetition penalty since the talker landed. **No engine change of any kind**: the file runs on the
+rc10 wheels.
+
+**The prompt's branch is the host's.** The reference picks the shorter of the text and codec streams
+and slices the other by its length; a graph can carry neither the branch nor the slice. Both lengths
+are known to the driver before the call — one is a token count, the other a frame count — so it hands
+the graph two already-sized id arrays, and `bos_mask` selects `codec_bos` over a zero row rather than
+concatenating one row under a second symbol. Verified against `generate_icl_prompt` on **both arms** of
+its branch: max |Δ| **1.19e-07** on a tensor of magnitude 7.5.
+
+**The encoder is the real cost, and it lives here rather than in the codec's file** —
+[ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md): the encode direction has no
+task, so a separate GGUF would need a new door in the high-level API for a model whose only caller is
+three phases away. It is four phases and 190 MB (4.8%): the SEANet stack, an eight-layer transformer,
+the downsampling convolution, and one `rvq_step` topology called sixteen times. Three things made it
+tractable and each is reusable:
+
+* **The RVQ needs no `argmin`.** `argmin_j ||x - e_j||²` is `argmax_j (2 x·e_j - ||e_j||²)`, which is a
+  matmul and a constant row — and `argmax` over rows is a driver binding, so the loop is the driver's:
+  scores out, ids in, one call per stage. All sixteen codebooks are written once and a stage gathers
+  its own with a range, the device that makes the code predictor one topology instead of fifteen.
+* **The convolution padding is constant on frame boundaries.** Mimi pads by a length-derived amount
+  that coremltools refuses; trimmed to a multiple of 1920 samples, that amount is **zero at all
+  fifteen convolutions** — proved from the real modules, with a partial frame as the arm where it is
+  non-zero at three of them. The driver trims, and the cost is at most 79 ms off a reference clip.
+* **The mask is causal and the config says otherwise**
+  ([Retro-050](../retros/retro-050-the-config-declared-a-window-the-reference-never-applied.md)).
+
+Verified end to end against the reference's own greedy ICL generation, from **raw audio** — the driver
+drawing the reference codes itself — on two sentences and two clip lengths: **624 of 624 ids identical
+over 39 frames each**, and the same run given pre-computed codes agrees with it exactly. The x-vector
+path is unchanged and byte-identical to the published GGUF (640/640).
 
 ### Text input
 
