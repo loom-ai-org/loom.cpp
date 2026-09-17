@@ -19,217 +19,68 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **rc10 IS THE RELEASE, and everything for it is staged, fresh and GATED** | 30 models are staged in `hf-models/`, all re-exported against this branch and green through the card gate on 2026-09-16 (**53 passed, 0 failed, 15m36s**). SEVEN have never been published — `sensevoice-small` and `paraformer-zh` (family 5, built 2026-09-16), `data2vec-audio-base-960h` and `hubert-large-ls960-ft` (family 4), `qwen3-tts-12hz-0.6b` and `qwen3-tts-tokenizer-12hz` (family 10, a pair), and `encodec-32khz` (family 11) — and the other 23 are updates to files already on the Hub. **WHEELS FIRST, ALWAYS**: every one of these drivers calls something no released wheel has (`output_shape`, `run_ode_and_retain`, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary readers, grouped `CONV_1D`), so a GGUF published before its wheel is a file nobody can run. all three feature branches are MERGED (loom.cpp#26, loom-py#25, loom-exporter#21) and the bump lives on loom-py's **`release/1.0.0-rc10`** branch: `VERSION` at `1.0.0-rc10` and `vendor/loom.cpp` at `a614b52`, which is `main`'s tip — **that pin is what the wheels must be built from** → [[loom-release-state]] |
-| **EnCodec's licence is DECIDED: `cc-by-nc-4.0` stays** (2026-09-16) | Settled by the author after the provenance was laid out, and it is worth recording WHY, because the instinct runs the other way. EnCodec's architecture and CODE are MIT and MusicGen came later — but `facebook/encodec_32khz`'s own card says these WEIGHTS were "trained specifically as part of the MusicGen project", names `facebookresearch/audiocraft` as the repository and *Simple and Controllable Music Generation* as the paper, and lists ShutterStock/Pond5 plus an internal set as the training data. So the checkpoint is MusicGen's output rather than the original EnCodec release, and audiocraft's weights are CC-BY-NC-4.0. The card already carried the stricter reading and keeps it; **no work is left here**, it just ships with rc10 like the other six → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
-| **P5 family 5 is COMPLETE — both leaves, exporter and engine** | Paraformer's detokenization landed 2026-09-16 as `loom::FunasrVocab` (`tokenizer.ggml.model == "funasr"`), verified differentially against FunASR's `sentence_postprocess` over **20,000 random id sequences, 0 mismatches**, and end to end on Chinese and English transcripts. [ADR-036](../adrs/adr-036-composition-is-the-scheme-not-the-table.md) records why it is a vocabulary scheme rather than the per-task postprocess this row previously called for. **Nothing is left open for family 5**; what remains for the leaf is the ordinary release path — it joins the staged models that go out with rc10 → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | rc10 is out and nothing structural sits in front of the next family. [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Six families are complete — 4, 5, 6, 10, 11 and 12 — and five of them needed **no engine primitive**, which is the acceptance criterion holding rather than a run of luck. Estimate the next leaf against what those cost and against the correction families 4 and 5 both wrote down: the CTC *head* is free, the *encoder template* is not shared, and the bill lands where the scoping did not look — a rebuilt kaldi front end, four entries in the exporter's own shape walk → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **Qwen3-TTS ICL mode is the one place engine C++ is still expected** | Both Qwen3-TTS GGUFs are published and the mode they serve is `x_vector_only_mode=True`. ICL (`ref_text` + `ref_code`) needs two things this tree does not have, and neither is a nicety: the tokenizer's **encoder**, a `transformers` `MimiModel` — a second family-11-scale export, and one family 11 deliberately scoped out ("the DECODE half only") — and a sampler that can express a **non-contiguous allowed set**, since `suppress_tokens` bans `[2048, 3072)` *except* `codec_eos = 2150`, which `lo`/`hi` cannot say. ICL also degenerates under greedy decoding (200 frames to the cap, 15.9 s of audio transcribing as *"country can do for you."*), so the sampler is load-bearing rather than optional. That is [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)'s bill for this family → see [Models](#models) |
+| **P5.0 decides which models are exportable at all, and two of its three changes are open** | Peak RSS during *conversion* is the constraint that picks the zoo, not the template. Change 1 is done and took Granite-Speech from 30.4 GB to 22.9 GB — the difference between OOM and a clean export — and the two that remain (quantize per phase as it converts; convert each phase in its own process) are what any Voxtral-sized checkpoint waits on. Not a cleanup → see [Models](#models) |
 
-***Branch state: everything below is on `feat/p5-families-11-4-5`, pushed in all three repos, no PRs
-opened and nothing merged.*** Working trees are clean on all three.
+**State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
+open.** Four packages on PyPI at `1.0.0rc10`, both macOS architectures included; the `linux_armv6l`
+wheel rides as a **GitHub release asset** rather than a PyPI file, because PyPI rejects that tag at
+upload (`wheels.yml` says so at the job). **Thirty** models are on
+[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), etags and cards verified in both
+directions, of which seven were first-time publishes: `sensevoice-small`, `paraformer-zh`,
+`data2vec-audio-base-960h`, `hubert-large-ls960-ft`, the `qwen3-tts` pair and `encodec-32khz`.
+EnCodec ships `cc-by-nc-4.0` and that is **settled, not pending** — the weights are MusicGen's output
+by `facebook/encodec_32khz`'s own card, whatever the MIT code says. → [[loom-release-state]],
+[Epic-08](../epics/epic-08-packaging-and-release.md)
 
-**loom-py needs a `vendor/loom.cpp` bump before its gate can run against this branch** — the engine
-gained `loom.sample_row`'s `repetition_penalty`/`penalized` for Qwen3-TTS, and loom-py's pin predates
-it. [[loom-p5-family12-shipped]] has the exact steps.
-
-***Family 5 is COMPLETE, 2026-09-16 (P5)*** — both leaves, both halves. Paraformer's detokenization
-is `loom::FunasrVocab` under its own tag ([ADR-036](../adrs/adr-036-composition-is-the-scheme-not-the-table.md)):
-the table is family 4's shape and the COMPOSITION is what is new, so it earns a tag by ADR-033's own
-argument. The per-piece script is written by the exporter because the reference's tests are
-per-character against Python's Unicode `isalpha()`. Verified differentially over 20,000 random id
-sequences with 0 mismatches — which is what caught that `f@@` is a continuation while `9@@` is not, and
-a `<blank>` being dropped where the reference prints it.
-
-***Family 5's SECOND LEAF, Paraformer, SHIPPED its exporter half 2026-09-16 (P5)*** — SANM encoder +
-**CIF predictor** + NAR decoder, `paraformer_export.py`, two phases. The first model here whose output
-LENGTH depends on the VALUES. The host decides the boundary and hands the graph a linear resampling
-matrix, so the graph has no cumsum, no gather and no threshold; **no new engine binding was needed**,
-and it reuses family 12's `TokenLabelsEpilogue`. The cost was numerical —
-[Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md): reproducing a reference
-means reproducing its ROUNDING and its arithmetic ORDER, not improving on either. Verified on the
-encoder tensor (4.48e-05 / 4.81e-06, sabotage 3.81e-01) and on the transcript, identical to FunASR on
-Chinese and English. Its vocabulary is the open item in the Now table above.
-
-***Family 5's FIRST LEAF SHIPPED 2026-09-15 (P5)*** — SANM / FunASR, `sanm_asr_export.py`,
-`SenseVoiceSmall`. No engine primitive and no new head: the CTC epilogue is family 1's, reused, and
-the vocabulary goes down the existing `sentencepiece_proto` path. The front end is rebuilt (FunASR's
-`WavFrontend` does not trace) and verified against `torchaudio` at 218 lengths; the four-row prompt is
-a graph INPUT with one new driver binding kind (`DEFAULTED`) because inverse text normalization is a
-real capability. Verified on the LOGITS at three lengths, 187/187 + 96/96 + 96/96 argmax, sabotage arm
-30.7. See [Epic-03 §2](../epics/epic-03-model-coverage.md) and
-[Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md).
-
-**SECOND NEW ITEM, same session — a `REPEAT` whose source is a PERMUTE aborts the process.**
-`ggml_compute_forward_repeat_f32` asserts `nb00 == sizeof(float)`, and `_op_loom_broadcast_to` emits a
-bare `REPEAT` from whatever var the broadcast pass handed it. A permuted view has a non-unit innermost
-stride, so a graph that broadcasts a transposed tensor converts, exports, loads, builds — and then
-takes down the host process with a raw `GGML_ASSERT`, not a `loom::Error`. Family 5 hit it twice (an
-edge-pad repeat over a transposed mel, and the position table) and worked around it in the FAMILY, by
-keeping both tensors in a layout where the repeat source is contiguous. That is the right fix for one
-model and not a general one: nothing stops the next family from writing the natural torch spelling.
-Two candidate fixes, and they are not equivalent — the exporter could emit `CONT` before a `REPEAT`
-whose source it knows is permuted (it emits the `PERMUTE`, so it can know), or `op_repeat` could
-`ggml_cont` a non-contiguous input itself (always correct, costs a copy only when needed, but moves a
-graph decision into the engine and against [the lean-runtime principle](../epics/epic-03-model-coverage.md)).
-Related: `ggml_view_*`'s own `nb[0]` assumption, [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md).
-
-**NEW ITEM, from that work — `_infer_dynamic_dim_expr`'s root-axis fallback should be observable.**
-Four separate producers stopped the walk during family 5 and each silently substituted the root axis,
-producing a graph that converts, loads, builds and declares a wrong length. Two of the four
-(`loom_scale`, `loom_broadcast_to`) are ops the exporter's OWN passes emit, so they had been reachable
-by every model since those passes were written, and one (`reduce_sum`) had a case that only handled
-half its inputs. The fallback cannot be removed — it is right for the common case, which is why
-[Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md) left it
-— but it is currently indistinguishable from a derived answer. `ValueFacts` already carries
-`scalar_expr_is_guess` / `range_scalar_is_guess` / `slice_axis_is_guess` for exactly this distinction
-on the scalar paths; `dim_expr` has no equivalent. Adding one, and having the REPEAT-emitting rules
-(`loom_broadcast_to`, `tile`, `fill`, `fill_like`) say so under an env var or in the export log, would
-have turned four five-minute export-and-read cycles into one. **Not a behaviour change** — a
-provenance flag and a diagnostic, nothing that alters an emitted graph.
-
-***Family 4 SHIPPED 2026-09-12 (P5)*** — CNN + transformer + CTC, `ctc_asr_export.py`, one generic
-recognizer claiming any HF `*ForCTC` directory. Verified on three structurally different checkpoints
-against `transformers` on the LOGITS (549 frames of real speech, 549/549 argmax each, sabotage arm
-32.7). It cost one engine READER (`CtcVocab`, [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md))
-and one engine FIX that was nobody's estimate: `groups > 1` had been read as "depthwise" since the
-first export, which is right at both ends of the range and wrong in the middle
-([Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md)). `CONV_1D` honours
-`groups` now. The third checkpoint, `omniASR-CTC-300M-v2`, is verified and deliberately unshipped — it
-is scale-sensitive and its own documented processor path transcribes garbage, which loom reproduces
-exactly.
-
-***1.0.0-rc9 is DONE: tagged, its models published, and all four packages on PyPI*** — `loom-py-rt`
-and the `-cuda`/`-vulkan`/`-metal` accelerators, verified at `1.0.0rc9`. It ships **ARMv6 as a supported target** (P7/P7.1 — a `linux_armv6l` wheel for the Pi Zero
-and Pi 1, VITS from 57x to 18.9x real time), **family 12's SentencePiece reading** (XLM-R, where a
-fairseq checkpoint's ids are not its protobuf's piece order — plus a `tokenizer.json`-only path and a
-correctness fix, since `framing_ids` had been returning a SentencePiece encode's trailing `</s>`
-*labelled*), and **family 6, `flan-t5-small`** — the first text encoder-decoder and first Unigram LM
-in the zoo. The org now lists **twenty-three** models, every one re-exported and card-gated against this
-tree, and `1.0.0-rc9` is tagged on loom-py at `330b10a`.
-
-***The next release is 1.0.0-rc10, and it is what unblocks the Hub.*** Families 11, 4 and 5 go out in
-it — the new engine bindings, `ELU`, the ODE integrator, the `ctc` and `funasr` vocabulary readers,
-grouped `CONV_1D`, and `loom_cli --out`. It is cut on loom-py's `release/1.0.0-rc10` branch, whose two
-commits are the single-file version mechanism and the bump itself. Its shape is fixed by the coupling
-above: the wheels carry the bindings, so **the 30 staged GGUFs can only be uploaded once rc10's
-packages are on PyPI**, in that order. A version bump is now **one file** — `VERSION` at loom-py's root, propagated by
-`python packaging/version.py --set 1.0.0-rc10` and enforced by `tests/ci/test_version_consistency.py`
-([ADR-037](../adrs/adr-037-the-version-lives-in-one-file.md)); it was eleven strings in five files.
-See [[loom-release-state]] for how to verify a Hub push afterwards.
-
-**SNAC-24kHz was published 2026-09-12** (`loom-ai-org/snac-24khz-loom`, family 11's second leaf) off
-`feat/p5-family-11-snac`, which is pushed in all three repos and not yet merged. It is the zoo's
-first stochastic graph: the driver draws its noise, seeded, through the host RNG — see
-[ADR-029](../adrs/adr-029-a-multi-rate-codec-keeps-one-row-per-coarsest-frame.md).
+**A GGUF no longer waits for a release — unless it adds a binding.** rc10 carried every binding the
+staged drivers needed (`output_shape`, `run_ode_and_retain`, the retrace's retained-reference
+bindings, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary
+readers, grouped `CONV_1D`), so the next family's model can publish on its own cadence. The moment one
+needs something the released wheels have not got, **WHEELS FIRST, ALWAYS** returns: a GGUF published
+before its wheel is a file nobody can run, and
+[[feedback-release-gate-needs-a-fresh-export]] is why no gate catches that for you.
 
 ---
 
 ## Models
 
-* [ ] **Qwen3-TTS-12Hz-0.6B-Base — the CODEC half is DONE, the talker half is not.** The source-level
-  architecture read this entry used to ask for has been done (2026-09-12), against the reference
-  implementation running end to end on CPU rather than against the source alone. It ships as **two
-  GGUFs** by [ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)'s argument — one codec
-  serves every size and variant of the talker:
+* [ ] **Qwen3-TTS ICL mode — the one place engine C++ is currently expected.** The model SHIPPED
+  2026-09-13 and both GGUFs are on the Hub; what shipped is `x_vector_only_mode=True`, and
+  [Epic-03 §2](../epics/epic-03-model-coverage.md) has the architecture, the numbers and what the
+  export cost. ICL (`ref_text` + `ref_code`) is the open half, and its bill is two items neither of
+  which is a nicety:
 
-  * **`qwen3-tts-tokenizer-12hz` (family 11) — EXPORTED AND VERIFIED.** 16 codebooks at 12.5 Hz in,
-    24 kHz waveform out; 114 M parameters, 456 MB at F32. Max abs difference **4.167e-06** at 42
-    frames and **1.699e-05** at 700, against the reference's own `chunked_decode`, on the engine's
-    floats; exact sample count at both; the ASR oracle reads the decode back verbatim. It is the
-    family's first leaf with ATTENTION over the frame axis and therefore its first CHUNKED one —
-    [ADR-034](../adrs/adr-034-a-chunked-decode-is-the-drivers-loop-not-a-longer-call.md), which is
-    the decision `encodec_export` predicted ("a chunked one is a different driver, not a longer
-    call"). It cost one driver component (`ChunkedCodecCall`), no engine change and no new binding.
-    Three conversion blockers, all of them another family's known failure: coremltools' dynamic-pad
-    refusal (EnCodec's — and it DISSOLVES here, the pad is provably zero at stride 1), Dia's
-    `rotate_half`, and transformers' `create_causal_mask` `vmap` path. The one genuinely new failure
-    is [Retro-047](../retros/retro-047-an-inferred-dimension-outlives-the-reshape.md).
-  * **`qwen3-tts-12hz-0.6b` (family 10) — EXPORTS AND RUNS; NOT YET VERIFIED, NO CARD.**
-    Text plus a reference voice in, 800 codes = 50 frames out, through seven topologies and a nested
-    loop. **Two things are open and they are probably one bug**: greedy decoding does not terminate
-    where the reference stops at 42 frames, and `max_new_tokens` does not reach the driver — a cap of
-    3 still produced 50 — which points at how a SCALAR input is marshalled into the driver's `inputs`
-    table. Until that is fixed neither the codes nor the repetition penalty's effect can be graded,
-    and no card should be written: a card here is gate-tested against a real GGUF.
+  * **The tokenizer's ENCODER**, a `transformers` `MimiModel` — a whole second family-11-scale export,
+    and one family 11 deliberately does not do ("the DECODE half only").
+  * **A non-contiguous allowed set in the sampler.** `suppress_tokens` bans `[2048, 3072)` *except*
+    `codec_eos = 2150`, which `lo`/`hi` cannot express, and `repetition_penalty` (1.05 over the
+    generated codes) is already in. That is
+    [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)'s bill for this family.
 
-    The KV-geometry blocker recorded below is CLOSED, and it was a symptom rather than a cause. The
-    cause is that **`repeat_kv` does not survive conversion**: coremltools folds its expand (a
-    broadcast) before `passes.fuse_gqa_repeat_kv` can match it, and rewriting it as
-    `repeat_interleave` only moves the failure into the merge reshape, which comes back as
-    `[128, n_tokens, n_tokens, 8]` — [Retro-044]'s substitution. The export now removes the op instead
-    of converting it: `materialise_gqa` duplicates `k_proj`/`v_proj` interleaved so K/V heads equal
-    query heads — **+69.2 M parameters, 277 MB at F32**, checked against the written file's own 275 MB
-    growth, and a doubled cache. The code predictor is uncached besides, which is worth keeping on its
-    own terms.
+  The sampler is not optional here: ICL **degenerates under greedy decoding** — 200 frames to the cap,
+  15.9 s of audio transcribing as *"country can do for you."* — so the encoder alone would not produce
+  a shippable mode. The order is forced: x-vector-only first (done), ICL after.
 
-    (Superseded, kept for the record:)
-    `qwen3_tts_export.py` traces and converts all **seven** phases and writes a 3.67 GB GGUF; the
-    decomposition is verified against the reference **bit-identically in PyTorch** (all 42 frames ×
-    16 codes, driven through the export's own wrappers) before anything was traced. What fails is
-    `_kv_cache_geometry`: the talker's 28 fused ATTENTION blocks report **16** K/V heads and the code
-    predictor's 5 report **8**, and one KvCache has one per-layer width. The talker's `repeat_kv`
-    survives into the topology where the predictor's is absorbed, and the two phases are otherwise
-    the same GQA 16/8 geometry. **Ruled out:** the mrope patch (the talker's rotary now returns rank
-    3, identical in form to the predictor's), the talker's trace length colliding with its 8 K/V
-    heads, and the predictor's colliding with its `n_rep` of 2. The error now prints the census
-    (`{(16,128,128): 28, (8,128,128): 5}`), which is what makes it legible as a per-phase split.
-    **The cheapest way out is probably to stop caching the code predictor at all**: it never sees
-    more than 16 positions, so re-running its prefix costs 136 token-forwards of a 5-layer model per
-    frame, and with one cached phase the geometry question disappears. That means folding
-    `predictor_prompt` and `predictor_step` into two uncached phases that rebuild the prefix in-graph
-    from ids, so the driver still passes only integers.
-
-    **No model card yet, deliberately**: a card here is gate-tested against a real GGUF
-    (`LOOM_MODEL_CARDS=... pytest tests/gate/test_model_cards.py`), and writing one for a file that
-    does not run would be asserting a verification that has not happened.
-
-    **The engine gained what this model needs and nothing else does yet**: `loom.sample_row` now takes
-    `repetition_penalty` + `penalized`. That is not a sampling nicety — `transformers` applies the
-    penalty as a PROCESSOR rather than a warper, so it moves a greedy argmax too, and a greedy decode
-    without it never emits EOS: 200 frames against the reference's 42. With it, the decomposition
-    reproduces the reference exactly. 914 M parameters. A 28-layer Qwen3-shaped
-    talker (hidden 1024, GQA 16/8, head_dim 128) emitting codebook 0, plus a 5-layer **code
-    predictor** that emits the other 15 from the talker's hidden state — so one audio frame is 16
-    transformer forwards, not one, with the predictor's KV cache reset per frame. Its input embedding
-    is a SUM of 16 codebook embeddings plus a text hidden, never a token lookup. **The `mrope` in its
-    config is decorative**: `get_rope_index` always expands one row to three identical ones, so
-    `apply_interleaved_rope` collapses to plain RoPE at θ=1e6 — verified in the source, and the
-    scariest-looking thing in the config turns out to cost nothing.
-
-  **Which generation mode, and why it is not a free choice.** `spk_id` is empty in this checkpoint, so
-  there are no built-in speakers and voice cloning is the only mode. It has two arms and they are
-  nested, not alternatives:
-
-  * `x_vector_only_mode=True` needs a 128-mel front end at 24 kHz and an 8.9 M ECAPA speaker encoder,
-    and nothing else. Verified working greedily against the reference — the ASR oracle reads back
-    *"The quick brown fox jumps over the lazy dog."* exactly.
-  * ICL mode (`ref_text` + `ref_code`) additionally needs the tokenizer's **encoder**, which is a
-    `transformers` `MimiModel` — a whole second family-11-scale export, and one family 11 deliberately
-    does not do ("the DECODE half only"). It also **degenerates under greedy decoding**: 200 frames to
-    the cap, 15.9 s of audio transcribing as *"country can do for you."* So it needs the sampler as
-    well as the encoder.
-
-  So the order is forced: x-vector-only first, ICL after. **What the sampler will need that
-  `loom.sample_row` has not got**: `repetition_penalty` (1.05 over the generated codes) and a
-  non-contiguous allowed set — `suppress_tokens` bans `[2048, 3072)` *except* `codec_eos = 2150`,
-  which `lo`/`hi` cannot express. That is the shape of ADR-024's bill for this family, and it is the
-  one place engine C++ is currently expected.
-
-  *Context: [Epic-03](../epics/epic-03-model-coverage.md). The reference is Alibaba's Apache-2.0
-  `qwen-tts` package, imported lazily like SNAC's; `pip install --no-deps qwen-tts` into the **piper**
-  venv, whose transformers 4.57.6 matches the package's `==4.57.3` pin. Ovos is the wrong venv for it:
-  transformers 5.x has moved the internals it imports.*
-
+  *Context: [Epic-03](../epics/epic-03-model-coverage.md), [[loom-qwen3-tts-shipped]]. The reference is
+  Alibaba's Apache-2.0 `qwen-tts` package, imported lazily like SNAC's; `pip install --no-deps qwen-tts`
+  into the **piper** venv, whose transformers 4.57.6 matches the package's `==4.57.3` pin. Ovos is the
+  wrong venv for it: transformers 5.x has moved the internals it imports.*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
   primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
-* [ ] **P5 breadth**, in coverage-per-effort order. Families 10, 11 and 12 are DONE — the remainder:
-  5 (SANM) → 9/10 (remaining TTS) → 13 (small classifiers) → 14 (music). **Families 4, 6, 10, 11 and
-  12 are complete**: family 11 is DAC, SNAC and EnCodec; family 4 is HuBERT, data2vec-audio and
-  wav2vec 2.0. *Context:
-  [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
+* [ ] **P5 breadth**, in coverage-per-effort order. **Families 4, 5, 6, 10, 11 and 12 are COMPLETE** —
+  4 is HuBERT/data2vec-audio/wav2vec 2.0, 5 is SenseVoice-Small and Paraformer-zh, 11 is DAC/SNAC/
+  EnCodec — and the remainder is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**.
+  *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
-  cost across three checkpoints, which is the estimate the rest of this list should be read against.
-  Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id handling for free.*
+  cost across three checkpoints, which is the estimate the rest of this list should be read against;
+  [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md) and
+  [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) for where families 4 and 5
+  found the cost instead. Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id
+  handling for free.*
 * [ ] **`flan-t5-small`'s vocabulary is 32,100 pieces against a 32,128-wide logit row.** T5 pads its
   embedding to a multiple of 128, so an argmax could in principle name an id with no piece — untrained
   rows, never observed in practice, and the model is shipped and verified without a bound on it. Worth
@@ -274,6 +125,22 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
   real derivation and test case the first time one is.
 * [ ] **StableHLO prototype on one solved model** — deliberately not started; filed as a validation
   exercise rather than a fix.
+* [ ] **`_infer_dynamic_dim_expr`'s root-axis fallback should be observable.** Four separate producers
+  stopped the walk during family 5 and each silently substituted the root axis, producing a graph that
+  converts, loads, builds and declares a wrong length. Two of the four (`loom_scale`,
+  `loom_broadcast_to`) are ops the exporter's OWN passes emit, so they had been reachable by every model
+  since those passes were written, and one (`reduce_sum`) had a case that only handled half its inputs.
+  The fallback cannot be removed — it is right for the common case, which is why
+  [Retro-044](../retros/retro-044-mil-retires-the-algebra-and-the-walk-substitutes-the-root.md) left it
+  — but it is currently indistinguishable from a derived answer. `ValueFacts` already carries
+  `scalar_expr_is_guess` / `range_scalar_is_guess` / `slice_axis_is_guess` for exactly this distinction
+  on the scalar paths; `dim_expr` has no equivalent. Adding one, and having the REPEAT-emitting rules
+  (`loom_broadcast_to`, `tile`, `fill`, `fill_like`) say so under an env var or in the export log, would
+  have turned four five-minute export-and-read cycles into one. **Not a behaviour change** — a
+  provenance flag and a diagnostic, nothing that alters an emitted graph.
+  *Context: [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md),
+  and [[feedback-instrument-the-walk-do-not-re-export]] for the 30-line repro that names the broken
+  link without a re-export.*
 * [ ] **P6 cleanup** — delete the `tools/convert_*` directories (~14,000 lines across 10), then the docs
   pass.
 
@@ -292,6 +159,21 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
   SILU and trips `assert(!isnan(x))`, a hard `SIGABRT`. `test_e2e_lfm2_lua_driver` skips (77)
   unconditionally. **Not fixed**, and worth fixing only if that bespoke script's coverage still matters —
   the MIL path is otherwise a strict improvement over it.
+* [ ] **A `REPEAT` whose source is a PERMUTE aborts the process.**
+  `ggml_compute_forward_repeat_f32` asserts `nb00 == sizeof(float)`, and `_op_loom_broadcast_to` emits a
+  bare `REPEAT` from whatever var the broadcast pass handed it. A permuted view has a non-unit innermost
+  stride, so a graph that broadcasts a transposed tensor converts, exports, loads, builds — and then
+  takes down the host process with a raw `GGML_ASSERT`, not a `loom::Error`. Family 5 hit it twice (an
+  edge-pad repeat over a transposed mel, and the position table) and worked around it **in the family**,
+  by keeping both tensors in a layout where the repeat source is contiguous. That is the right fix for
+  one model and not a general one: nothing stops the next family from writing the natural torch
+  spelling. Two candidate fixes, and they are not equivalent — the exporter could emit `CONT` before a
+  `REPEAT` whose source it knows is permuted (it emits the `PERMUTE`, so it can know), or `op_repeat`
+  could `ggml_cont` a non-contiguous input itself (always correct, costs a copy only when needed, but
+  moves a graph decision into the engine and against the lean-runtime principle).
+  *Context: `ggml_view_*`'s own `nb[0]` assumption and
+  [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), which is the same
+  shape of bug one op over.*
 
 ## Engine — performance
 
@@ -436,6 +318,11 @@ first stochastic graph: the driver draws its noise, seeded, through the host RNG
   and array-typed `loom.*` KVs are silently skipped.
 
 ## Packaging & release
+
+**Standing process, not an open item:** every engine change needs a `vendor/loom.cpp` bump in loom-py
+before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch origin <branch>` →
+`checkout <sha>` → rebuild → commit the pointer. A release pins that submodule at `main`'s tip, and
+**that pin is what the wheels are built from**.
 
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
