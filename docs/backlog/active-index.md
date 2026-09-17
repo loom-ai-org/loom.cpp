@@ -34,13 +34,21 @@ EnCodec ships `cc-by-nc-4.0` and that is **settled, not pending** — the weight
 by `facebook/encodec_32khz`'s own card, whatever the MIT code says. → [[loom-release-state]],
 [Epic-08](../epics/epic-08-packaging-and-release.md)
 
-**A GGUF no longer waits for a release — unless it adds a binding.** rc10 carried every binding the
+**NOTHING STAGED IS PUBLISHED UNTIL 1.0.0-rc11 IS OUT.** Author's decision, 2026-09-17: staged model
+updates wait for the next release even when they need nothing from it. So a freshly staged GGUF is
+**not** a publishable one, whatever the coupling below says — the Hub and the staging tree are allowed
+to diverge until rc11 ships, and today they do: `hf-models/qwen3-tts-12hz-0.6b` is the ICL build and
+the Hub's copy is rc10's. That divergence is expected, and it does not survive the release either way,
+because [[feedback-release-gate-needs-a-fresh-export]] requires a fresh export at rc11 time regardless
+of what is sitting in the tree.
+
+*The technical coupling, which still decides what rc11 must contain:* rc10 carried every binding the
 staged drivers needed (`output_shape`, `run_ode_and_retain`, the retrace's retained-reference
 bindings, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary
-readers, grouped `CONV_1D`), so the next family's model can publish on its own cadence. The moment one
-needs something the released wheels have not got, **WHEELS FIRST, ALWAYS** returns: a GGUF published
-before its wheel is a file nobody can run, and
-[[feedback-release-gate-needs-a-fresh-export]] is why no gate catches that for you.
+readers, grouped `CONV_1D`), and Qwen3-TTS's ICL half needs nothing beyond them — verified by running
+its GGUF on the released `loom-py-rt==1.0.0rc10` wheel from PyPI. The moment a model needs something
+the released wheels have not got, **WHEELS FIRST, ALWAYS** is the harder constraint on top of the
+rule above: a GGUF published before its wheel is a file nobody can run.
 
 ---
 
