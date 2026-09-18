@@ -780,16 +780,31 @@ F5-TTS is deferred by explicit direction (flow-matching, `OdeStepper`-adjacent, 
 primitives with Matcha).
 
 **The constraint that decides what is exportable at all** is not the template — it is peak memory
-during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*; dropping
-the traced module, the wrapper and the converted MIL program **together** took Granite-Speech from
-30.4 GB to 22.9 GB peak RSS, the difference between OOM and a clean export. See
-[the backlog](../backlog/active-index.md#models) for the two remaining changes.
+during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*, and P5.0
+is closed as of 2026-09-17 with all three changes in
+([ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md)): dropping the traced module,
+the wrapper and the converted MIL program **together** took Granite-Speech from 30.4 GB to 22.9 GB
+peak RSS; each phase now packs its own weights as it converts, so what is carried between phases is
+the on-disk payload rather than an F32 array; and `--isolate-phases` converts each phase in a child
+process that spills its packed weights for the parent to memory-map.
+
+**Of those, the one that moves the number is isolation.** Measured on Granite-Speech at Q8_0, packing
+per phase left the peak where it was (20.99 → 21.11 GB) because the phase that sets the peak is the
+40-layer decoder, which converts *last*, with almost nothing carried into it. Isolation took the
+largest single process from **20.99 to 14.56 GB** and the whole process tree to **15.85 GB**. The ADR has the table, including the two results
+that went the wrong way: isolation makes a small model's peak *worse* (kokoro 2.67 → 4.34 GB, the
+framework floor paid twice), which is why it is off by default.
+
+Voxtral-Mini-3B is still not exportable here and that is now a statement about the machine: its LM
+phase needs ~14.4 GB of F32 weights beside ~14.4 GB of MIL constants whatever the export does around
+it, so the floor is ~29 GB against 28. The measurements below are what a bigger machine picks it up
+from.
 
 ## 4. Related Decisions and Artifacts
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
