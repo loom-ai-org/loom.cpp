@@ -697,6 +697,22 @@ add_test(
 set_tests_properties(gen_ctc_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_ctc_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP ctc_vocab_gguf_fixture)
 
+add_test(
+    NAME gen_f5_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_f5_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/f5_vocab_test.gguf
+)
+set_tests_properties(gen_f5_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_f5_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP f5_vocab_gguf_fixture)
+
+add_executable(test_f5_vocab ci/test_f5_vocab.cpp)
+target_link_libraries(test_f5_vocab PRIVATE loom::engine)
+target_compile_definitions(test_f5_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_f5_vocab COMMAND test_f5_vocab)
+set_tests_properties(test_f5_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_f5_vocab PROPERTIES FIXTURES_REQUIRED "f5_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
 add_executable(test_ctc_vocab ci/test_ctc_vocab.cpp)
 target_link_libraries(test_ctc_vocab PRIVATE loom::engine)
 target_compile_definitions(test_ctc_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
@@ -1553,6 +1569,11 @@ target_compile_definitions(test_load_metadata PRIVATE LOOM_TEST_FIXTURE_DIR="${L
 add_test(NAME test_load_metadata COMMAND test_load_metadata)
 set_tests_properties(test_load_metadata PROPERTIES LABELS ci)
 set_tests_properties(test_load_metadata PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
+add_executable(test_e2e_f5_tts_lua_driver gate/test_e2e_f5_tts_lua_driver.cpp)
+target_link_libraries(test_e2e_f5_tts_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_f5_tts_lua_driver COMMAND test_e2e_f5_tts_lua_driver)
+set_tests_properties(test_e2e_f5_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)

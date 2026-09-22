@@ -53,6 +53,7 @@
 #include "loom/core/byte_vocab.h"
 #include "loom/core/ctc_vocab.h"
 #include "loom/core/funasr_vocab.h"
+#include "loom/core/f5_vocab.h"
 #include "loom/core/phoneme_vocab.h"
 #include "loom/core/unicode.h"
 #include "loom/core/supertonic_text_vectorizer.h"

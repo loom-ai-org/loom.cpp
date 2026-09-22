@@ -1239,9 +1239,19 @@ std::vector<double> opts_array(lua_State* L, int opts_idx, const char* field) {
 // accumulated in double and wrote float into the graph; keeping that exactly is what makes the move
 // bit-identical for the models that already shipped, rather than merely close.
 //
+// **Classifier-free guidance is a property of the EVALUATION, not of the integrator.** F5-TTS
+// evaluates its velocity field twice per stage -- once on the real conditioning and once on a dropped
+// one -- and integrates `v_cond + scale * (v_cond - v_uncond)`. The two runs differ only in their
+// FIXED inputs, so this is one module, one graph and one cache, called with two input tables, and
+// every method in the table above keeps working unchanged: the combination happens where `k[stage]`
+// is filled, before any Butcher weight is applied. `loom.generate` spells its own guidance
+// `{module =, scale =, top_k =}` because there the two runs are two KV-cached histories that must not
+// see each other; here they are two values of the same graph's inputs, so `inputs` is what differs.
+//
 // `opts`: `carried` and `time` (the estimator's two per-step input names), `times` (N+1 points, so N
-// steps), `method` (default "euler"), and either `state` (an explicit initial value) or `n_elems` (draw
-// it from the shared RNG, at the same point in the stream `loom.gaussian_array` occupied before).
+// steps), `method` (default "euler"), either `state` (an explicit initial value) or `n_elems` (draw
+// it from the shared RNG, at the same point in the stream `loom.gaussian_array` occupied before), and
+// optionally `guidance = {inputs = <the unconditional fixed inputs>, scale = <number>}`.
 int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
     const char* fname = retain ? "loom.run_ode_and_retain" : "loom.run_ode";
     try {
@@ -1268,6 +1278,35 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
             return luaL_error(L, "%s: `times` needs at least two points (N+1 of them is N steps), got %d",
                                fname, static_cast<int>(times.size()));
         }
+        // Guidance, read before anything is allocated so a malformed declaration fails at the top.
+        // The two tables stay on the stack for the whole loop: `compute_and_emit` takes the inputs
+        // table by absolute stack index, and the unconditional run is that same call with a second
+        // one.
+        lua_getfield(L, opts_idx, "guidance");
+        const int guidance_idx = lua_gettop(L);
+        const bool guided = !lua_isnil(L, guidance_idx);
+        double guidance_scale = 0.0;
+        int guidance_inputs_idx = 0;
+        if (guided) {
+            if (!lua_istable(L, guidance_idx)) {
+                return luaL_error(L, "%s: `guidance` must be a table {inputs = ..., scale = ...}",
+                                   fname);
+            }
+            lua_getfield(L, guidance_idx, "scale");
+            if (!lua_isnumber(L, -1)) {
+                return luaL_error(L, "%s: guidance.scale is required and must be a number -- it is "
+                                   "the weight in `v_cond + scale * (v_cond - v_uncond)`", fname);
+            }
+            guidance_scale = lua_tonumber(L, -1);
+            lua_pop(L, 1);
+            lua_getfield(L, guidance_idx, "inputs");
+            if (!lua_istable(L, -1)) {
+                return luaL_error(L, "%s: guidance.inputs must be a table of the same fixed inputs "
+                                   "the conditional run is given, with the dropped values", fname);
+            }
+            guidance_inputs_idx = lua_gettop(L);
+        }
+
         std::vector<double> state = opts_array(L, opts_idx, "state");
         if (state.empty()) {
             lua_getfield(L, opts_idx, "n_elems");
@@ -1300,7 +1339,51 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
         int64_t state_ne[GGML_MAX_DIMS] = {static_cast<int64_t>(n), 1, 1, 1};
         std::vector<std::vector<double>> k(method.n_stages);
         std::vector<double> probe(n);
+        std::vector<double> uncond;
+        if (guided) uncond.resize(n);
         std::vector<float> scratch(n);
+
+        // One evaluation of `f` at `probe`/`stage_t`, reading its fixed inputs from the table at
+        // `inputs_idx` and writing the velocity into `into`. Factored out because guidance runs it
+        // twice per stage over two input tables -- the ONLY thing that differs between the two runs.
+        double stage_t = 0.0;
+        auto evaluate = [&](int inputs_idx, std::vector<double>& into) {
+            compute_and_emit(
+                L, fname, module_name, builder, axes, inputs_idx,
+                LoomLuaBridge::store_lookup(self), /*out_store=*/nullptr,
+                [&](const GraphBuilder::BuildResult& r) -> int {
+                    if (r.outputs.empty()) {
+                        throw Error(std::string(fname) + ": module '" + module_name +
+                                     "' declares no outputs; an estimator returns f(x, t)");
+                    }
+                    if (ggml_nelements(r.outputs[0]) != static_cast<int64_t>(n)) {
+                        throw Error(std::string(fname) + ": module '" + module_name + "' returned " +
+                                     std::to_string(ggml_nelements(r.outputs[0])) + " element(s) for a " +
+                                     std::to_string(n) + "-element state -- f(x, t) has the shape of x");
+                    }
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) state_ne[d] = r.outputs[0]->ne[d];
+                    into.resize(n);
+                    ggml_backend_tensor_get(r.outputs[0], scratch.data(), 0, n * sizeof(float));
+                    for (size_t i = 0; i < n; ++i) into[i] = static_cast<double>(scratch[i]);
+                    return 0;
+                },
+                [&](const GraphBuilder::BuildResult& r) {
+                    const auto carried_it = r.input_tensors.find(carried);
+                    if (carried_it == r.input_tensors.end()) {
+                        throw Error(std::string(fname) + ": module '" + module_name +
+                                     "' has no declared input '" + carried + "' to carry the state");
+                    }
+                    const auto time_it = r.input_tensors.find(time_input);
+                    if (time_it == r.input_tensors.end()) {
+                        throw Error(std::string(fname) + ": module '" + module_name +
+                                     "' has no declared input '" + time_input + "'");
+                    }
+                    for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(probe[i]);
+                    ggml_backend_tensor_set(carried_it->second, scratch.data(), 0, n * sizeof(float));
+                    const auto stage_t_f = static_cast<float>(stage_t);
+                    ggml_backend_tensor_set(time_it->second, &stage_t_f, 0, sizeof(float));
+                });
+        };
 
         for (size_t step = 0; step + 1 < times.size(); ++step) {
             const double t = times[step];
@@ -1315,45 +1398,21 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
                         probe[i] = state[i] + h * st.from_stage_scale * base[i];
                     }
                 }
-                const double stage_t = t + st.t_offset * h;
+                stage_t = t + st.t_offset * h;
 
                 // The estimator itself: every FIXED input comes from the caller's table (a retained
                 // reference included), and these two come from the loop.
-                compute_and_emit(
-                    L, fname, module_name, builder, axes, /*inputs_idx=*/3,
-                    LoomLuaBridge::store_lookup(self), /*out_store=*/nullptr,
-                    [&](const GraphBuilder::BuildResult& r) -> int {
-                        if (r.outputs.empty()) {
-                            throw Error(std::string(fname) + ": module '" + module_name +
-                                         "' declares no outputs; an estimator returns f(x, t)");
-                        }
-                        if (ggml_nelements(r.outputs[0]) != static_cast<int64_t>(n)) {
-                            throw Error(std::string(fname) + ": module '" + module_name + "' returned " +
-                                         std::to_string(ggml_nelements(r.outputs[0])) + " element(s) for a " +
-                                         std::to_string(n) + "-element state -- f(x, t) has the shape of x");
-                        }
-                        for (int d = 0; d < GGML_MAX_DIMS; ++d) state_ne[d] = r.outputs[0]->ne[d];
-                        k[stage].resize(n);
-                        ggml_backend_tensor_get(r.outputs[0], scratch.data(), 0, n * sizeof(float));
-                        for (size_t i = 0; i < n; ++i) k[stage][i] = static_cast<double>(scratch[i]);
-                        return 0;
-                    },
-                    [&](const GraphBuilder::BuildResult& r) {
-                        const auto carried_it = r.input_tensors.find(carried);
-                        if (carried_it == r.input_tensors.end()) {
-                            throw Error(std::string(fname) + ": module '" + module_name +
-                                         "' has no declared input '" + carried + "' to carry the state");
-                        }
-                        const auto time_it = r.input_tensors.find(time_input);
-                        if (time_it == r.input_tensors.end()) {
-                            throw Error(std::string(fname) + ": module '" + module_name +
-                                         "' has no declared input '" + time_input + "'");
-                        }
-                        for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(probe[i]);
-                        ggml_backend_tensor_set(carried_it->second, scratch.data(), 0, n * sizeof(float));
-                        const auto stage_t_f = static_cast<float>(stage_t);
-                        ggml_backend_tensor_set(time_it->second, &stage_t_f, 0, sizeof(float));
-                    });
+                evaluate(/*inputs_idx=*/3, k[stage]);
+                if (guided) {
+                    // The same graph, the same state and the same time -- the dropped conditioning is
+                    // the whole difference. Combined HERE, into the stage's own `k`, so the method's
+                    // Butcher weights see one velocity field and nothing about the integrator has to
+                    // know guidance happened.
+                    evaluate(guidance_inputs_idx, uncond);
+                    for (size_t i = 0; i < n; ++i) {
+                        k[stage][i] += guidance_scale * (k[stage][i] - uncond[i]);
+                    }
+                }
             }
             for (size_t i = 0; i < n; ++i) {
                 double delta = 0.0;

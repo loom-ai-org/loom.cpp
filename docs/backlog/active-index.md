@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-17
+last_updated: 2026-09-18
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -86,11 +86,13 @@ rule above: a GGUF published before its wheel is a file nobody can run.
   [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **F5-TTS** — deferred by explicit direction. Flow-matching, `OdeStepper`-adjacent, likely shares
-  primitives with Matcha-TTS. Last of the original 7-model TTS list still untouched.
 * [ ] **P5 breadth**, in coverage-per-effort order. **Families 4, 5, 6, 10, 11 and 12 are COMPLETE** —
   4 is HuBERT/data2vec-audio/wav2vec 2.0, 5 is SenseVoice-Small and Paraformer-zh, 11 is DAC/SNAC/
-  EnCodec — and the remainder is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**.
+  EnCodec — **family 9 is at three of twelve leaves** (Matcha, Supertonic, and F5-TTS as of
+  2026-09-18), and the remainder is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**.
+  The nine leaves left in 9 are mostly compositions whose AR half is family 10's
+  (cosyvoice3, chatterbox, voxcpm2, pocket-tts, …), so the next one to pick costs a second exporter
+  template rather than a second sampler.
   *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
   cost across three checkpoints, which is the estimate the rest of this list should be read against;
@@ -136,6 +138,23 @@ rule above: a GGUF published before its wheel is a file nobody can run.
   and `test_the_mil_op_name_counter_is_process_global` pins the mechanism. *Context:
   [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md).*
 
+* [ ] **A dynamic slice with a NEGATIVE begin exports as twice the rows at a negative offset.**
+  `_infer_dynamic_dim_expr` renders `x[:, -n:, :]` arithmetically instead of normalising the begin
+  against the source length, so `begin = -n` stays `-n` and the size comes out `end - begin = 2n`. At
+  the traced length the two readings coincide, which is why it converts, writes and loads and only
+  fails when run. Found in F5-TTS, where x_transformers' `apply_rotary_pos_emb` opens with exactly
+  that slice; fixed **in the family** by substituting a version without the (provably identity) trim,
+  so nothing in the zoo emits one today and the walk is unchanged. Worth doing properly the first time
+  a negative begin is not removable. *Context:
+  [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), and
+  [Retro-047](../retros/retro-047-an-inferred-dimension-outlives-the-reshape.md) for the same
+  right-at-the-traced-length shape.*
+* [ ] **F5-TTS's text front end ships the table and not the segmenter.** `convert_char_to_pinyin` is
+  `rjieba` + `pypinyin`; `loom::F5Vocab` is the character half, measured at 2000/2000 against the real
+  function for ordinary prose and diverging by one inserted space for multi-character punctuation runs
+  and hyphen-joined digit groups. Closing it means a CJK segmenter in the engine, which is a decision
+  about scope rather than a fix. *Context:
+  [Epic-03 §2](../epics/epic-03-model-coverage.md), [Epic-07](../epics/epic-07-text-frontends-and-tokenizers.md).*
 * [ ] **Supertonic carries 2.3 MB of the same zero padding VITS just lost.** `ttl_text_512.emb_*`,
   99.1% zeros — 0.9% of that model, against VITS's 23.2%. **Not the same fix**: P4.28 made VITS's pad
   dynamic, and Supertonic's text axis is statically sized on purpose for two independent reasons its

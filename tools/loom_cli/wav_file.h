@@ -8,8 +8,15 @@ namespace loom_cli {
 
 // Minimal 16-bit PCM WAV reader (CLI-only, not part of the engine library): reads mono, or the first
 // (left) channel of a multi-channel file, normalized to [-1, 1] float32. Throws std::runtime_error if
-// the file isn't a valid 16-bit-PCM WAV, or if its sample rate isn't 16000Hz -- resampling is out of
-// scope (see BACKLOG.md), so a clear error beats silently-wrong results.
+// the file isn't a valid 16-bit-PCM WAV, or if its sample rate isn't `expected_rate` -- resampling is
+// out of scope (see BACKLOG.md), so a clear error beats silently-wrong results.
+//
+// The rate is a PARAMETER because the ASR families take 16 kHz and the voice-cloning TTS families
+// take their own declared rate for the reference clip (F5-TTS: 24 kHz). A fixed 16000 here meant the
+// second kind could not be driven from this tool at all.
+std::vector<float> load_wav_pcm16_mono(const std::string& path, uint32_t expected_rate);
+
+// The 16 kHz spelling every ASR call site uses, kept so those reads say what they require inline.
 std::vector<float> load_wav_pcm16_mono_16k(const std::string& path);
 
 // The other direction, for the models whose answer is audio. 16-bit PCM mono at `rate`, samples
