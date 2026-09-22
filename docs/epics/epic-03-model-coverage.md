@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-17
+last_updated: 2026-09-18
 ---
 
 # Epic-03: Model Coverage
@@ -45,7 +45,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
 | **ASR — encoder-decoder** | Whisper-small | `multi_phase_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
-| **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
+| **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
@@ -738,11 +738,94 @@ drawing the reference codes itself — on two sentences and two clip lengths: **
 over 39 frames each**, and the same run given pre-computed codes agrees with it exactly. The x-vector
 path is unchanged and byte-identical to the published GGUF (640/640).
 
+### Family 9's third leaf, and the primitive that had to be added
+
+Family 9 is the **flow-matching acoustic stage** — Matcha-TTS and SupertonicTTS since the MIL thread,
+both integrating a learned vector field with plain uniform Euler. F5-TTS is its third leaf (P5,
+2026-09-18) and the first one whose *sampler* is not that: it runs the estimator **twice per step**
+under classifier-free guidance, on a **non-uniform** schedule.
+
+**It is also the first P5 family in seven that needed an engine change**, which is worth saying plainly
+because the acceptance criterion had held six times running. The change is small and it is the right
+shape: `loom.run_ode` learned `guidance = {inputs = ..., scale = ...}` — one module, one graph, one
+cache, evaluated a second time with a different fixed-input table and combined where `k[stage]` is
+filled, so every integrator in the table keeps working unchanged. Guidance at scale 0 is bit-identical
+to the unguided call, which is what protects the two models that already shipped through this binding.
+[ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md) has the decision
+and why guidance differs in `inputs` here where `loom.generate` differs in `module`.
+
+On the export side it is **two declarations on the existing template rather than a bespoke sampler**:
+`FlowMatchingSpec.guidance` and `FlowMatchingSpec.schedule` (`"caller"` — F5-TTS integrates
+`t + coef*(cos(pi/2 t) - 1 + t)` over a linspace, not `k/n_steps`). The loop is unchanged, which is the
+test of whether a template still fits.
+
+**F5-TTS has no duration model and no phonemiser: it in-fills.** The reference clip's mel occupies the
+first frames of one spectrogram, the rest is noise, the text is the reference transcript followed by
+what to say, and the decoder integrates the whole grid at once. So there is exactly one dynamic axis
+across the two text-and-estimator phases — the total frame count — and the driver slices the prompt's
+frames off the answer before the vocoder sees them. Four phases: the mel front end (a `power=1`
+spectrogram, the first un-squared complex magnitude in the zoo, which is how `reduce_l2_norm` was found
+to have no ggml mapping — Whisper writes `abs()**2` and the square cancels the root; later MIL passes
+decompose it again on this particular graph, so the mapping is verified directly rather than through
+the model), the text embedding, the estimator, and Vocos.
+
+Three things cost more than the scoping predicted, and none of them was the sampler:
+
+* **The conditioning length is the mel's own frame count, not `ref_audio_len`.** `sample()` takes it
+  from `cond.shape[1]` (`n_samples//hop + 1`) and only the output slice uses `n_samples//hop`. One
+  frame — and 32 Euler steps turn it into max |Δ| 1.77 on the mel, cosine 0.9998, which reads exactly
+  like accumulated float noise and is not.
+* **A defensive re-slice in library code.** `apply_rotary_pos_emb`'s `freqs[:, -seq_len:, :]` is the
+  identity once the table has been cut to length, and a negative begin over a dynamic axis exported as
+  twice the rows at a negative offset, 44 times.
+  [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md).
+* **The JOIN between two graphs, which every per-phase check passed over.** The estimator retains
+  frame-major mel and `Vocos.decode`'s convention is channel-major, so the driver handed the vocoder a
+  transposed spectrogram — which is still a plausible spectrogram, so nothing raised and the audio came
+  out as a sound effect. Five clean tensor comparisons said nothing about it; the ASR oracle found it in
+  one listen, and the sabotage arm measures it at cosine **−0.008**.
+  [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md).
+
+**Verified end to end.** Per phase against torch on the real inputs: `mel` 4.39e-02 / cosine
+0.999999881, `text_embed` 1.13e-05 (conditional) and 8.11e-06 (unconditional), `estimator` 1.19e-05 at
+**cosine 1.000000000**, `vocoder` 1.53e-05. The torch decomposition of the whole sampler reproduces the
+reference's integrated mel at **1.42e-05 / cosine 0.99999994** over the generated frames. And the
+exported GGUF, driven by `loom_cli` from a reference clip, synthesises audio at peak 0.9768 (reference
+0.8557) that the Whisper ASR oracle transcribes as the target sentence exactly — the check that found
+the layout defect, and the one that closes it. The gate compares the WAVEFORM against the reference's
+own at **max |Δ| 4.14e-03, rmse 1.94e-04** over 92,416 samples.
+
+**That gate is only a comparison because the NOISE is pinned, and finding that out cost a red run.**
+Flow matching starts from a Gaussian draw; torch's RNG and the engine's are different algorithms, so
+handing both sides the same *seed* hands them different *noise*, and a different draw is a different
+valid sample — 1.25 max |Δ| on audio that was intelligible and correctly voiced. So
+`FlowMatchingSpec.caller_noise` makes the initial state a driver input that the engine falls back to
+drawing, `scripts/f5_tts_reference.py` writes the draw it used, and the gate hands it over. This is
+`DriverInputs`'s own NOISE argument one layer up, and the reason it is worth restating is that the
+alternative — loosening the bound until 1.25 fits — would have produced a gate that measures nothing.
+Sabotaged the other way, against a reference generated with guidance off, it reads 1.278: 300× the
+bound, so the gate can fail.
+
+**Its weights are `cc-by-nc-4.0` and that is decided rather than pending.** The F5-TTS *code* is MIT;
+the released checkpoint is non-commercial because Emilia is, which the repository states and the Hub
+card confirms. Same shape as EnCodec's licence, and the artifact declares its own — nothing about it
+changes this project's own MIT terms.
+
+**Its text front end is the family's real boundary, and it was measured rather than assumed.**
+`convert_char_to_pinyin` is `rjieba` segmentation plus `pypinyin` before a single id is looked up. What
+ships is the character table (`tokenizer.ggml.model == "f5"`, `loom::F5Vocab`), and against the real
+function over generated English prose: **2000/2000 identical for ordinary space-separated prose**,
+1100/2000 with multi-character punctuation runs and 1758/2000 with hyphen-joined digit groups — the two
+divergent classes differing by exactly one inserted space, always in the same direction. CJK is refused
+by name rather than mapped character by character. Same boundary the phoneme-input families draw around
+g2p.
+
 ### Text input
 
-**Only Supertonic takes text.** It encodes graphemes itself and its GGUF carries the codepoint table.
-The other four TTS models consume *phoneme* ids produced outside the engine — a real limitation of
-those checkpoints, addressed by [Epic-07](epic-07-text-frontends-and-tokenizers.md) and
+**Supertonic and F5-TTS take text.** Both encode graphemes themselves and both GGUFs carry their own
+character table. The other four TTS models consume *phoneme* ids produced outside the engine — a real
+limitation of those checkpoints, addressed by
+[Epic-07](epic-07-text-frontends-and-tokenizers.md) and
 [ADR-012](../adrs/adr-012-permissive-phonemizer.md).
 
 ## 3. Roadmap
@@ -753,8 +836,10 @@ Ordered by coverage-per-effort. Live items are tracked in
 **Next families:** the remaining TTS families → small classifiers → music. **Six are done** —
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
-leaves: SenseVoice-Small and Paraformer-zh) —
-and §2 says what each cost, which is the number the rest of this list should be estimated against.
+leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is at **three of its twelve** leaves since
+F5-TTS landed 2026-09-18, which is also where the "no engine primitive" run ended
+([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)).
+§2 says what each cost, which is the number the rest of this list should be estimated against.
 Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
 family 6 landing means the zoo has an encoder-decoder text model and a SentencePiece Unigram LM for
 the first time.
@@ -776,8 +861,9 @@ native-layout repo). Qwen3-TTS was the other name on this line and is no longer 
 2026-09-13 in `x_vector_only_mode`, and what remains of it is ICL mode, which the hub carries as an
 open item because its bill is a second family-11-scale export plus a sampler that can express a
 non-contiguous allowed set.
-F5-TTS is deferred by explicit direction (flow-matching, `OdeStepper`-adjacent, likely sharing
-primitives with Matcha).
+F5-TTS is no longer deferred: it shipped 2026-09-18 as family 9's third leaf. The prediction it was
+deferred under — "likely sharing primitives with Matcha" — held for the ODE and not for the sampler
+around it; see §2.
 
 **The constraint that decides what is exportable at all** is not the template — it is peak memory
 during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*, and P5.0
@@ -804,7 +890,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

@@ -90,6 +90,26 @@
       "kind": null,
       "produced_by": null
     },
+    "LOOM_F5_TTS_GGUF": {
+      "path": "f5_tts.gguf",
+      "used_by": [
+        "test_e2e_f5_tts_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_F5_TTS_REF_DIR": {
+      "path": "f5_tts_ref",
+      "used_by": [
+        "test_e2e_f5_tts_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
     "LOOM_GIGAAM_MIL_GGUF": {
       "path": "gigaam_mil.gguf",
       "used_by": [

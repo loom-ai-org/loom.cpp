@@ -31,7 +31,7 @@ std::string read_tag(std::istream& f) {
 
 } // namespace
 
-std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
+std::vector<float> load_wav_pcm16_mono(const std::string& path, uint32_t expected_rate) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         throw std::runtime_error("load_wav: cannot open '" + path + "'");
@@ -83,9 +83,10 @@ std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
     if (pcm.empty()) {
         throw std::runtime_error("load_wav: '" + path + "' has no 'data' chunk");
     }
-    if (sample_rate != 16000) {
+    if (sample_rate != expected_rate) {
         throw std::runtime_error("load_wav: '" + path + "' is " + std::to_string(sample_rate) +
-                                  "Hz; this model requires 16000Hz (no resampling implemented)");
+                                  "Hz; this model requires " + std::to_string(expected_rate) +
+                                  "Hz (no resampling implemented)");
     }
 
     const uint16_t channels = std::max<uint16_t>(num_channels, 1);
@@ -105,6 +106,10 @@ namespace {
 void put32(std::FILE* f, uint32_t v) { std::fwrite(&v, 4, 1, f); }
 void put16(std::FILE* f, uint16_t v) { std::fwrite(&v, 2, 1, f); }
 }  // namespace
+
+std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
+    return load_wav_pcm16_mono(path, 16000);
+}
 
 void write_wav_pcm16_mono(const std::string& path, const std::vector<float>& samples, uint32_t rate) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
