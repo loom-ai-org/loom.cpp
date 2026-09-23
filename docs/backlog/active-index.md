@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-18
+last_updated: 2026-09-23
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,7 +19,8 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | rc10 is out and nothing structural sits in front of the next family. [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Six families are complete — 4, 5, 6, 10, 11 and 12 — and five of them needed **no engine primitive**, which is the acceptance criterion holding rather than a run of luck. Estimate the next leaf against what those cost and against the correction families 4 and 5 both wrote down: the CTC *head* is free, the *encoder template* is not shared, and the bill lands where the scoping did not look — a rebuilt kaldi front end, four entries in the exporter's own shape walk → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
+| **Land the review stack, in order: P5.0, then family 9** | Nothing below should start on a branch that stacks on unmerged work. **P5.0** is three open PRs — loom-exporter **#23** (`feat/p5-0-pack-weights-per-phase` → `main`), **#24** (`feat/p5-0-phase-process-isolation` → #23's branch) and loom.cpp **#30** (`feat/p5-0-phase-process-isolation` → `main`). **Family 9** is pushed on `feat/p5-family-9-f5-tts` in all three repos and **has no PRs yet**: the loom.cpp and loom-exporter branches stack on the P5.0 branches above (one commit each on top), and loom-py's is one commit on `main` pinning `vendor/loom.cpp` at `d914b25`. Two things to do before merging it: run loom-py's **model-card gate** against the family-9 build (never run — it proves the 30 shipped models did not regress through the `run_ode` change), and **if loom.cpp's PR is squashed, re-bump loom-py** to the squashed sha before loom-py's PR merges, or its pin names a commit that no longer exists → [Packaging & release](#packaging--release) |
+| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at three of twelve leaves** (Matcha, Supertonic, F5-TTS). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). **What to pick next, costed:** the other nine family-9 leaves are mostly AR-LM + flow compositions (cosyvoice3, chatterbox, voxcpm2, pocket-tts are LOCAL in `~/Dev/models`) and cost a second exporter template; family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 | **Qwen3-TTS's repetition penalty disagrees with `transformers`, and the shipped file is the one that differs** | Surfaced by ICL's verification and **pre-existing**: on a target sentence short enough that the model wants to repeat a frame, the reference emits the repeat and loom does not. `repetition_penalty = 1.0` makes loom reproduce the reference 624/624 over 39 frames; the checkpoint's own 1.05 gives 96/624. The published GGUF and this branch's agree 640/640 on that input, so nothing regressed — but one of the two implementations is applying a penalty the other is not, and the cards describe the shipped behaviour. **Do not change the default before instrumenting the reference's processor** → see [Models](#models) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
@@ -48,6 +49,14 @@ readers, grouped `CONV_1D`), and Qwen3-TTS's ICL half needs nothing beyond them 
 its GGUF on the released `loom-py-rt==1.0.0rc10` wheel from PyPI. The moment a model needs something
 the released wheels have not got, **WHEELS FIRST, ALWAYS** is the harder constraint on top of the
 rule above: a GGUF published before its wheel is a file nobody can run.
+
+**F5-TTS is the first model that needs rc11 technically, not only by that rule** — and it is worse than
+"nobody can run it". Its driver passes `guidance = {...}` in `loom.run_ode`'s options table, and the
+rc10 engine reads that table field by field with no check for keys it does not know: an F5-TTS GGUF on
+the rc10 wheels would integrate **unguided**, silently, and produce a different model's audio. The text
+door fails loudly there (rc10's loom-py has no `"f5"` tokenizer), but ids passed straight to `infer` do
+not. So rc11 must carry family 9's engine half before that file goes anywhere → [Packaging &
+release](#packaging--release)
 
 ---
 
@@ -84,6 +93,26 @@ rule above: a GGUF published before its wheel is a file nobody can run.
   for the reader's own recording. Worth deciding once, because every future voice-cloning leaf
   inherits it. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
   [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
+* [ ] **F5-TTS has no working high-level door, and its catalogued card documents one.** The export,
+  the driver and `loom_cli` all work (gate: max |Δ| 4.14e-03 against the reference waveform; ASR
+  oracle exact), but `Text2Speech.infer(text)` in loom-py sends only the text's ids as `tokens` and
+  has no way to say "here is a reference clip and what it says". F5-TTS in-fills, so it needs the
+  clip (`waveform`), the transcript's ids concatenated with the text's (`text_ids`) and where the
+  join is (`n_ref_text`, or an explicit `duration`). Worse than a missing door: the driver binds
+  `inputs.waveform or inputs.tokens` — the generic `caller_input` fallback — so a bare
+  `infer("hello world")` hands the mel front end a handful of ids *as audio samples* before failing.
+  The catalogue entry `f5-tts-v1-base` in loom-exporter's `tools/build_model_cards.py` gets the
+  generic `text-to-speech-with-vocab` snippet (`model.text2speech.infer("hello world", ...)`), which
+  therefore fails — the card gate would catch it, but it has never been staged or run.
+  **What closes it:** a voice-cloning TTS door in loom-py (kwargs `reference=`/`reference_text=`,
+  encoding both and computing `n_ref_text`, the shape `loom_cli --wav/--ref-text` already has), a
+  matching `text-to-speech-voice-clone` snippet keyed the way `text-to-codes-voice-clone` is, dropping
+  the `tokens` fallback from this driver's two CALLER bindings, then staging
+  (`build_model_cards.py --only f5-tts-v1-base`) and the card gate — which inherits the item above,
+  because this card also needs the reader's own `reference.wav`. Publish only after rc11. The weights
+  are `cc-by-nc-4.0` (Emilia), recorded in [Epic-03 §2](../epics/epic-03-model-coverage.md).
+  *Context: [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md),
+  [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **P5 breadth**, in coverage-per-effort order. **Families 4, 5, 6, 10, 11 and 12 are COMPLETE** —
@@ -381,6 +410,16 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
 `checkout <sha>` → rebuild → commit the pointer. A release pins that submodule at `main`'s tip, and
 **that pin is what the wheels are built from**.
 
+* [ ] **rc11 must carry family 9's engine half, and an older engine runs an F5-TTS file WRONGLY
+  rather than refusing it.** Needed in the wheels before F5-TTS is published: `loom.run_ode`'s
+  `guidance` option, `loom::F5Vocab` under `tokenizer.ggml.model == "f5"`, and loom-py's `"f5"`
+  tokenizer branch (all on `feat/p5-family-9-f5-tts`). The hazard is the silent half: rc10's
+  `run_ode` ignores option keys it does not know, so the file integrates unguided on rc10 and
+  produces plausible, wrong audio. Worth deciding whether a GGUF should be able to declare the engine
+  features it requires — this is the first driver whose meaning depends on an OPTION an older binding
+  would drop, rather than on a function an older binding would lack and fail on. Verify on the
+  released rc11 wheel the way ICL was verified on rc10's (`loom.Model.from_file(...)` plus one
+  synthesis through the ASR oracle), after a fresh export.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
