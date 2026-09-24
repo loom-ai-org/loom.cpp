@@ -2072,6 +2072,67 @@ int LoomLuaBridge::l_get_weight(lua_State* L) {
     }
 }
 
+// `loom.seed_kv(module, source [, n_rows])` -> n_rows. Writes the FIRST n_rows positions of `module`'s KV
+// cache from a saved attention state, so the driver's next call attends over them at n_past = n_rows.
+// `source` is either a weight name in the module's file (a driver weight, read tensor to tensor with no
+// Lua copy -- a voice is ~1.5 M floats) or a flat Lua array. Either way the layout is the one a
+// streaming transformer's saved state already has: per layer, K then V, each [n_rows, n_embd]
+// row-major -- ADR-043.
+int LoomLuaBridge::l_seed_kv(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "loom.seed_kv: unregistered module '%s'", module_name);
+        }
+        KvCache* kv = it->second.kv_cache;
+        if (kv == nullptr) {
+            return luaL_error(L, "loom.seed_kv: module '%s' has no KV cache (its topology has no "
+                                 "ATTENTION node, so there is nothing to seed)", module_name);
+        }
+        std::vector<float> data;
+        if (lua_type(L, 2) == LUA_TSTRING) {
+            const char* weight_name = lua_tostring(L, 2);
+            ggml_tensor* t = it->second.model->weight(weight_name);
+            if (t->type != GGML_TYPE_F32) {
+                return luaL_error(L, "loom.seed_kv: weight '%s' must be F32 (a KV cache is stored at "
+                                     "F32, and a quantized state would not be the state that was saved)",
+                                  weight_name);
+            }
+            data.resize(static_cast<size_t>(ggml_nelements(t)));
+            ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(float));
+        } else {
+            const std::vector<double> values = read_number_array(L, 2);
+            data.assign(values.begin(), values.end());
+        }
+        const size_t per_row = static_cast<size_t>(kv->n_layer()) * (kv->n_embd_k() + kv->n_embd_v());
+        if (data.empty() || data.size() % per_row != 0) {
+            return luaL_error(L, "loom.seed_kv: %d values are not a whole number of positions of "
+                                 "module '%s''s cache (%d layers x (K %d + V %d) = %d per position)",
+                              static_cast<int>(data.size()), module_name, static_cast<int>(kv->n_layer()),
+                              static_cast<int>(kv->n_embd_k()), static_cast<int>(kv->n_embd_v()),
+                              static_cast<int>(per_row));
+        }
+        const auto n_rows = static_cast<uint32_t>(data.size() / per_row);
+        if (!lua_isnoneornil(L, 3) && static_cast<uint32_t>(luaL_checkinteger(L, 3)) != n_rows) {
+            return luaL_error(L, "loom.seed_kv: n_rows is %d but the source holds %d positions",
+                              static_cast<int>(luaL_checkinteger(L, 3)), static_cast<int>(n_rows));
+        }
+        const float* at = data.data();
+        for (uint32_t il = 0; il < kv->n_layer(); ++il) {
+            kv->set_rows(il, /*value=*/false, at, 0, n_rows);
+            at += static_cast<size_t>(n_rows) * kv->n_embd_k();
+            kv->set_rows(il, /*value=*/true, at, 0, n_rows);
+            at += static_cast<size_t>(n_rows) * kv->n_embd_v();
+        }
+        lua_pushinteger(L, static_cast<lua_Integer>(n_rows));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.seed_kv: %s", e.what());
+    }
+}
+
 OutputStore& LoomLuaBridge::retained_store(LoomLuaBridge* self, const std::string& module) {
     const auto it = self->modules_.find(module);
     if (it == self->modules_.end()) {
@@ -2117,6 +2178,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
         {"pad_crop_relative_embeddings", &LoomLuaBridge::l_pad_crop_relative_embeddings},
         {"get_weight", &LoomLuaBridge::l_get_weight},
+        {"seed_kv", &LoomLuaBridge::l_seed_kv},
     };
     for (const auto& b : bindings) {
         lua_pushlightuserdata(L_, this);

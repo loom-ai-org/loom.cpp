@@ -66,6 +66,18 @@ reference's own pre-tokenizer, restricted to the table's characters, which is ex
 character is an unmergeable `[UNK]`) and Python's full case mapping all ship in the file. The result is
 **3000/3000** ids identical to the reference across six input classes.
 
+`pocket_tts_vocab.cpp` (`tokenizer.ggml.model == "pocket_tts"`, family 9's fifth leaf) is the second,
+and the first that WRAPS an ordinary vocabulary: a SentencePiece Unigram (`Vocab::load_sentencepiece`,
+now with SentencePiece's byte fallback) inside the reference's `prepare_text_prompt` and
+`split_into_best_sentences`. It is also the first whose `encode` SEGMENTS. The reference generates
+each sentence chunk of up to 50 tokens separately, and its chunking needs decoded text (a period
+between digits is not a cut; each chunk is prepared again). So the vocabulary returns every chunk's
+ids with `</s>` between them, and the driver splits on it
+([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). The rules are
+data, as ADR-041 requires, including Python's `isdigit` set, and the result is **7000/7000** ids
+identical to the reference over eight input classes. `is_python_space` moved to `unicode.h` so the two
+front ends share it.
+
 **Three loaders now run in order in `transcribe`**, and the order is load-bearing: `BpeVocab::load` and
 `CtcVocab::load` return `nullptr` for a schema that is not theirs, while `Vocab::load` **throws**. Any
 future reader goes ahead of `Vocab::load` for the same reason.
@@ -115,7 +127,7 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
 | Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md) |
-| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md) |
+| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record

@@ -729,6 +729,22 @@ set_tests_properties(test_chatterbox_vocab PROPERTIES LABELS ci)
 # It reads the CTC fixture too, for the "declines another family's file" arm.
 set_tests_properties(test_chatterbox_vocab PROPERTIES FIXTURES_REQUIRED "chatterbox_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
+add_test(
+    NAME gen_pocket_tts_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_pocket_tts_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/pocket_tts_vocab_test.gguf
+)
+set_tests_properties(gen_pocket_tts_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_pocket_tts_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP pocket_tts_vocab_gguf_fixture)
+
+add_executable(test_pocket_tts_vocab ci/test_pocket_tts_vocab.cpp)
+target_link_libraries(test_pocket_tts_vocab PRIVATE loom::engine)
+target_compile_definitions(test_pocket_tts_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_pocket_tts_vocab COMMAND test_pocket_tts_vocab)
+set_tests_properties(test_pocket_tts_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_pocket_tts_vocab PROPERTIES FIXTURES_REQUIRED "pocket_tts_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
 add_executable(test_ctc_vocab ci/test_ctc_vocab.cpp)
 target_link_libraries(test_ctc_vocab PRIVATE loom::engine)
 target_compile_definitions(test_ctc_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
@@ -1547,6 +1563,21 @@ set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES SKIP_RETURN_C
 
 # --- `kv_cache_scope: "private"`: two decode streams of one model, and the shared-cache arm that
 #     proves the check can fail. See ci/test_private_kv_cache.cpp. ---
+# --- `loom.seed_kv`: a saved attention state written into a module's KV cache (ADR-043). A bare
+#     two-layer ATTENTION module whose q/k/v are inputs, so the seeded rows alone decide the output. ---
+add_test(NAME gen_seed_kv_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_seed_kv_gguf.py
+            ${LOOM_FIXTURE_DIR}/seed_kv.gguf
+)
+set_tests_properties(gen_seed_kv_gguf_fixture PROPERTIES FIXTURES_SETUP seed_kv_gguf_fixture)
+set_tests_properties(gen_seed_kv_gguf_fixture PROPERTIES LABELS ci)
+add_executable(test_seed_kv ci/test_seed_kv.cpp)
+target_link_libraries(test_seed_kv PRIVATE loom::engine)
+target_compile_definitions(test_seed_kv PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_seed_kv COMMAND test_seed_kv)
+set_tests_properties(test_seed_kv PROPERTIES LABELS ci)
+set_tests_properties(test_seed_kv PROPERTIES FIXTURES_REQUIRED seed_kv_gguf_fixture)
+
 add_test(NAME gen_cfg_streams_gguf_fixture
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_cfg_streams_gguf.py
             ${LOOM_FIXTURE_DIR}/cfg_streams.gguf
@@ -1595,6 +1626,11 @@ add_executable(test_e2e_chatterbox_lua_driver gate/test_e2e_chatterbox_lua_drive
 target_link_libraries(test_e2e_chatterbox_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_chatterbox_lua_driver COMMAND test_e2e_chatterbox_lua_driver)
 set_tests_properties(test_e2e_chatterbox_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_pocket_tts_lua_driver gate/test_e2e_pocket_tts_lua_driver.cpp)
+target_link_libraries(test_e2e_pocket_tts_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_pocket_tts_lua_driver COMMAND test_e2e_pocket_tts_lua_driver)
+set_tests_properties(test_e2e_pocket_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)

@@ -12,15 +12,6 @@ namespace {
 const std::string kEmpty;
 const std::string kPrefix = "tokenizer.ggml.chatterbox.";
 
-// Python's `str.isspace()`, which is what `text.split()` splits on: the Unicode White_Space set plus
-// the four information separators U+001C..U+001F. Written out rather than approximated with a
-// category test, because `" ".join(text.split())` is a step whose output is compared byte for byte.
-bool is_python_space(char32_t cp) {
-    return (cp >= 0x09 && cp <= 0x0D) || (cp >= 0x1C && cp <= 0x20) || cp == 0x85 || cp == 0xA0 ||
-           cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 ||
-           cp == 0x202F || cp == 0x205F || cp == 0x3000;
-}
-
 void replace_all(std::string& text, const std::string& from, const std::string& to) {
     if (from.empty()) return;
     std::string out;

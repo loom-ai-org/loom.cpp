@@ -330,6 +330,12 @@ private:
     // express. First needed by VITS's relative-attention layers; nothing in it is VITS-specific.
     static int l_pad_crop_relative_embeddings(lua_State* L);
     static int l_get_weight(lua_State* L);
+    // `loom.seed_kv(module, source [, n_rows])`: writes a saved attention state into the first n_rows
+    // positions of `module`'s KV cache. MEETS the binding criterion: it reads no model config (the
+    // cache's geometry is the one the host already allocated), and the cache is engine-owned state no
+    // graph input can reach -- the only other writer is an ATTENTION node, which writes what it just
+    // projected. First needed by Pocket-TTS, whose voices ship as KV caches; ADR-043.
+    static int l_seed_kv(lua_State* L);
 };
 
 } // namespace loom

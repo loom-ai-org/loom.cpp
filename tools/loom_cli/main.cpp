@@ -535,6 +535,24 @@ int main(int argc, char** argv) {
                               rate_override(extra_inputs), synth_seed);
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "pocket_tts") {
+            // Pocket-TTS: text in, the file's built-in voice, audio out. The vocabulary runs the
+            // reference's whole text path, including its split into sentence chunks, so each chunk is
+            // printed as the model will be asked to say it.
+            auto vocab = loom::PocketTtsVocab::load(*model);
+            std::printf("  tokenizer: SentencePiece unigram (pocket_tts), %zu pieces\n", vocab->size());
+            if (!has_prompt) return 0;
+            const auto chunks = vocab->chunks(prompt_text);
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                std::printf("  chunk %zu: \"%s\"\n", i + 1, vocab->prepare(chunks[i]).c_str());
+            }
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "f5") {
             // F5-TTS: the one TTS family here that takes a reference CLIP as well as text. It clones
             // the voice in that clip by IN-FILLING -- the reference's transcript is prepended to the
