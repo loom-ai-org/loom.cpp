@@ -20,7 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **Land the review stack, in order: P5.0, then family 9** | Nothing below should start on a branch that stacks on unmerged work. **P5.0** is three open PRs — loom-exporter **#23** (`feat/p5-0-pack-weights-per-phase` → `main`), **#24** (`feat/p5-0-phase-process-isolation` → #23's branch) and loom.cpp **#30** (`feat/p5-0-phase-process-isolation` → `main`). **Family 9** is pushed on `feat/p5-family-9-f5-tts` in all three repos and **has no PRs yet** (its fourth leaf, Chatterbox, is pushed with no PRs on `feat/p5-family-9-chatterbox` on top of it: loom.cpp `271243a`, loom-exporter `36980f4`, loom-py `ced4be1` pinning `vendor/loom.cpp` at `271243a`; its fifth, Pocket-TTS, is committed on `feat/p5-family-9-pocket-tts` on top of THAT: loom.cpp `c528244` (+ docs-only commits after it), loom-exporter `4db8c4f`, loom-py `6f3397e` pinning `vendor/loom.cpp` at `c528244`; its sixth, VoxCPM2, is pushed with no PRs on `feat/p5-family-9-voxcpm2` on top of THAT: loom.cpp `b2878a1` (+ docs-only commits after it), loom-exporter `e897cd7`, loom-py `9f183c2` pinning `vendor/loom.cpp` at `b2878a1`): the loom.cpp and loom-exporter branches stack on the P5.0 branches above (one commit each on top), and loom-py's is one commit on `main` pinning `vendor/loom.cpp` at `d914b25`. Two things to do before merging it: run loom-py's **model-card gate** against the family-9 build (never run — it proves the 30 shipped models did not regress through the `run_ode` change), and **if loom.cpp's PR is squashed, re-bump loom-py** to the squashed sha before loom-py's PR merges, or its pin names a commit that no longer exists → [Packaging & release](#packaging--release) |
-| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at six of twelve leaves** (Matcha, Supertonic, F5-TTS, and Chatterbox, Pocket-TTS and VoxCPM2 as of 2026-09-24). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). **What to pick next, costed:** the other six family-9 leaves are mostly the same composition (cosyvoice3 shares Chatterbox's HiFT vocoder and flow lineage but its speech tokenizer and CAMPPlus are ONNX-only; **voxtral-tts cannot be exported on this machine**: its 3.4B Ministral backbone hits the same ~29 GB floor as Voxtral-Mini-3B, below); family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
+| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at seven of twelve leaves** (Matcha, Supertonic, F5-TTS, and Chatterbox, Pocket-TTS, VoxCPM2 and CosyVoice3 as of 2026-09-24). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. **What to pick next, costed:** the other five family-9 leaves (kugelaudio, tada, dots-tts, irodori-tts, voxtral-tts) are mostly the same composition and none is local yet (**voxtral-tts cannot be exported on this machine**: its 3.4B Ministral backbone hits the same ~29 GB floor as Voxtral-Mini-3B, below); family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
 open.** Four packages on PyPI at `1.0.0rc10`, both macOS architectures included; the `linux_armv6l`
@@ -108,6 +108,27 @@ release](#packaging--release)
   * [ ] **The reference's f32-vs-f64 spread is not a floor for this model** (FSQ rounds `tanh(x) * 9`
     every step, so a boundary crossing flips a level): the free-running gate arm could fail on another
     ISA with nothing wrong. Revisit if it ever does.
+* [ ] **CosyVoice3 (family 9's seventh leaf) is built and verified, and not yet published or gated on
+  the Hub.** Branch `feat/p5-family-9-cosyvoice3` in all three repos, stacked on VoxCPM2's.
+  Checkpoint `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` at `29e01c4` (the Hub's current revision),
+  Apache-2.0. Verified (`tests/gate/test_e2e_cosyvoice3_lua_driver.cpp`, fixtures
+  `v5/cosyvoice3.gguf` + `v5/cosyvoice3_ref/`, pinned draws): the LM 76/76 sampled tokens identical,
+  the flow's mel at the reference's own f32/f64 spread, the vocoder at rmse 3.2e-04 on the reference's
+  mel, free-running rmse 2.7e-03; sabotage (the `transformers` top-p) diverges at token 4 and CFG 0.75
+  moves the mel 0.18. Whisper is exact unpinned. 3.4 GB at F32. To publish: rc11 (below), a fresh
+  export, a card entry in `build_model_cards.py` and loom-py's card gate. *Context:
+  [Epic-03 §2](../epics/epic-03-model-coverage.md),
+  [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)*
+  * [ ] **The default voice's licence.** It is computed from `asset/zero_shot_prompt.wav` in the
+    Apache-2.0 GitHub checkout, whose README says some examples are "sourced from the internet". The
+    card must say where the voice came from; whether to ship it as the default is a decision.
+  * [ ] **Voice files and cloning.** The four voice arrays are ordinary driver inputs, so a
+    `cosyvoice3_voices.py` that runs the ONNX S3 tokenizer + CAMPPlus in Python and writes a voice
+    file ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md))
+    would give it cloning without either ONNX model reaching the engine.
+  * [ ] **No text normalisation or paragraph splitting.** The reference spells digits out (inflect,
+    or wetext/ttsfrd when installed) and splits long text into ~80-token pieces; the text door does
+    neither, so digits are read as the LM guesses and a long paragraph is one decode.
 * [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
   voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
@@ -145,10 +166,10 @@ release](#packaging--release)
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **P5 breadth**, in coverage-per-effort order. **Families 4, 5, 6, 10, 11 and 12 are COMPLETE** —
   4 is HuBERT/data2vec-audio/wav2vec 2.0, 5 is SenseVoice-Small and Paraformer-zh, 11 is DAC/SNAC/
-  EnCodec — **family 9 is at six of twelve leaves** (Matcha, Supertonic, F5-TTS 2026-09-18,
-  Chatterbox, Pocket-TTS and VoxCPM2 2026-09-24), and the remainder is **9/10 (remaining TTS) → 13 (small
-  classifiers) → 14 (music)**. The six leaves left in 9 are mostly compositions whose AR half is
-  family 10's (cosyvoice3, …). Chatterbox showed that one composes from the existing
+  EnCodec — **family 9 is at seven of twelve leaves** (Matcha, Supertonic, F5-TTS 2026-09-18,
+  Chatterbox, Pocket-TTS, VoxCPM2 and CosyVoice3 2026-09-24), and the remainder is **9/10 (remaining TTS) → 13 (small
+  classifiers) → 14 (music)**. The five leaves left in 9 are mostly compositions whose AR half is
+  family 10's (kugelaudio, tada, dots-tts, irodori-tts; voxtral-tts is machine-blocked). Chatterbox showed that one composes from the existing
   templates, so what the next one costs is its own front end and its own loop shape, not a template.
   *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
@@ -475,6 +496,13 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
     `tokenizer.ggml.model == "voxcpm2"` plus loom-py's branch (an rc10 loom-py has no tokenizer for
     it, so the text door fails loudly). The cached-layer offset is the exporter's, and needs nothing
     from the engine.
+  * [ ] **CosyVoice3 adds three sampler keys and a guard** (on `feat/p5-family-9-cosyvoice3`):
+    `top_p_mass`, `banned` and `uniform` on `loom.sample_row`
+    ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)).
+    An rc10 engine ignores all three SILENTLY and samples with the `transformers` nucleus, no bans
+    and its own draws: plausible speech from a different sampler. Also `run_ode` now refuses a
+    caller state whose length disagrees with `n_elems`, which aborted the process before
+    ([Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md)).
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.

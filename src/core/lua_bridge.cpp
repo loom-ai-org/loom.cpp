@@ -22,6 +22,7 @@ extern "C" {
 #include <cmath>
 #include <limits>
 #include <new>
+#include <optional>
 
 // IMPORTANT: LuaJIT (like PUC Lua 5.1, whose C API it implements) reports its own internal errors via
 // `longjmp`, which does NOT run C++ destructors -- throwing a C++ exception out of a function called BY
@@ -397,7 +398,8 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
                            ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
                            float repetition_penalty, const std::vector<int64_t>& penalized,
-                           float min_p) {
+                           float min_p, bool top_p_over_row, const std::vector<int64_t>& banned,
+                           std::optional<float> fixed_uniform) {
     if (!(repetition_penalty > 0.0f)) {
         throw Error(std::string(fname) + ": repetition_penalty is " +
                      std::to_string(repetition_penalty) + "; it is a positive divisor and 1 means "
@@ -418,6 +420,10 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     if (!(top_p > 0.0f) || top_p > 1.0f) {
         throw Error(std::string(fname) + ": top_p is " + std::to_string(top_p) + "; it is a cumulative "
                      "probability in (0, 1], and 1 means 'do not truncate'");
+    }
+    if (fixed_uniform && !(*fixed_uniform >= 0.0f && *fixed_uniform < 1.0f)) {
+        throw Error(std::string(fname) + ": uniform is " + std::to_string(*fixed_uniform) + "; it is "
+                     "the draw itself, a number in [0, 1)");
     }
 
     // **Classifier-free guidance, and it happens HERE rather than in a graph**: over two retained
@@ -502,6 +508,27 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
             throw Error(std::string(fname) + ": the guidance shortlist and the id window [" +
                          std::to_string(lo) + ", " + std::to_string(hi) + ") have no id in common, so "
                          "there is nothing to draw from");
+        }
+    }
+
+    // **Banned ids are removed from the candidate set before anything else reads the row** -- the
+    // penalty, the greedy branch, top-k, and top-p's mass. `weighted_scores[id] = -inf`, which is how
+    // CosyVoice3's `sampling_ids` bans an id before `min_len` tokens and how `ras_sampling` bans the id
+    // it is about to redraw; with `top_p_mass = "row"` the banned ids are therefore also out of the
+    // mass the nucleus is measured against, as they are out of the reference's softmax. ABSOLUTE ids,
+    // and one outside the window is skipped, for `penalized`'s reason.
+    if (!banned.empty()) {
+        const auto width = static_cast<int64_t>(logits.size());
+        for (const int64_t id : banned) {
+            const int64_t offset = id - lo;
+            if (offset >= 0 && offset < width) {
+                logits[static_cast<size_t>(offset)] = -std::numeric_limits<float>::infinity();
+            }
+        }
+        if (std::none_of(logits.begin(), logits.end(),
+                         [](float v) { return v > -std::numeric_limits<float>::infinity(); })) {
+            throw Error(std::string(fname) + ": every id in the window [" + std::to_string(lo) + ", " +
+                         std::to_string(lo + width) + ") is banned, so there is nothing to draw from");
         }
     }
 
@@ -603,10 +630,24 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // Top-p: the shortest prefix of the descending order whose probability mass reaches `top_p`. At
     // least one candidate always survives -- a threshold below the single most likely token's own
     // probability would otherwise select nothing to draw from.
+    //
+    // **What the mass is measured against is the one choice here with two answers in the wild.**
+    // `transformers` runs top-p AFTER top-k on the already-truncated logits, so the mass is a fraction
+    // of the top-k survivors' (`sum`, the default). CosyVoice's `nucleus_sampling` scans the WHOLE
+    // softmax, sorted, keeping ids while the running sum is below `top_p` and the count below `top_k`
+    // -- the same prefix rule over a different denominator, which keeps MORE ids whenever top-k has
+    // cut mass off. `top_p_mass = "row"` is that one: the denominator is the full window's softmax
+    // (banned ids excluded, since they are -inf). Measured against the other it is a different
+    // sampler from the same two numbers (loom.cpp ADR-047).
     if (top_p < 1.0f) {
+        float denominator = sum;
+        if (top_p_over_row) {
+            denominator = 0.0f;
+            for (const float v : logits) denominator += std::exp(v / temperature - max_logit);
+        }
         float cumulative = 0.0f;
         for (size_t i = 0; i < keep; ++i) {
-            cumulative += probs[i] / sum;
+            cumulative += probs[i] / denominator;
             if (cumulative >= top_p) {
                 keep = i + 1;
                 break;
@@ -617,9 +658,16 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // One draw from the SHARED stream, through the same distribution object `loom.uniform_array` uses
     // -- so a script that seeds with `loom.seed_rng` gets a reproducible token, and so the draw-ORDER
     // caveat that stream already documents covers this too.
+    //
+    // **Or the CALLER's draw, when it passes `uniform`**: the number this walk would otherwise take from
+    // the stream. torch's RNG and this one are different algorithms, so the same seed is not the same
+    // token; a reference that records the uniform behind each of its draws (and walks the same sorted
+    // prefix -- `scripts/cosyvoice3_reference.py`) is reproducible here id for id, which is what makes a
+    // SAMPLED decode gateable at all. `run_ode`'s `caller_noise` is the same idea for a sampler's
+    // state (F5-TTS). The stream is not advanced.
     float mass = 0.0f;
     for (size_t i = 0; i < keep; ++i) mass += probs[i];
-    const float target = uniform(rng) * mass;
+    const float target = (fixed_uniform ? *fixed_uniform : uniform(rng)) * mass;
     float running = 0.0f;
     for (size_t i = 0; i < keep; ++i) {
         running += probs[i];
@@ -1339,6 +1387,25 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
         }
 
         std::vector<double> state = opts_array(L, opts_idx, "state");
+        if (!state.empty()) {
+            // **A caller's state of the wrong length is refused here, as an error.** The flow-matching
+            // template passes `n_elems` beside a caller's `state` (it is the size of the grid the
+            // estimator is about to be sized by), and nothing compared them: a pinned noise from a
+            // reference whose decode took a different number of tokens reached `ggml_backend_tensor_set`
+            // and ABORTED the host process -- CosyVoice3's gate, under a sabotaged sampler, is where it
+            // surfaced. A Lua error is what every other malformed input here gets.
+            lua_getfield(L, opts_idx, "n_elems");
+            if (!lua_isnil(L, -1)) {
+                const auto n_elems = static_cast<size_t>(luaL_checknumber(L, -1));
+                if (n_elems != state.size()) {
+                    return luaL_error(L, "%s: `state` has %d values but `n_elems` says the state is %d "
+                                       "-- a caller-supplied initial state must be the size of the grid "
+                                       "it starts", fname, static_cast<int>(state.size()),
+                                       static_cast<int>(n_elems));
+                }
+            }
+            lua_pop(L, 1);
+        }
         if (state.empty()) {
             lua_getfield(L, opts_idx, "n_elems");
             const auto n_elems = static_cast<size_t>(luaL_checknumber(L, -1));
@@ -1653,8 +1720,8 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
 // than reproducing it.
 //
 // **A table rather than positional arguments** because the knobs are a set that grows, and it has now
-// grown three times: `lo`/`hi` and `guidance` for family 10, and `repetition_penalty`/`penalized` for
-// Qwen3-TTS. Adding one must not renumber what a shipped GGUF's driver already passes, which is the
+// grown four times: `lo`/`hi` and `guidance` for family 10, `repetition_penalty`/`penalized` for
+// Qwen3-TTS, and `top_p_mass`/`banned`/`uniform` for CosyVoice3 (ADR-047). Adding one must not renumber what a shipped GGUF's driver already passes, which is the
 // whole reason for the table. (min-p and the FREQUENCY/presence penalties are still not implemented;
 // nothing in the fixture set asks for them.)
 //
@@ -1713,6 +1780,9 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         int64_t guidance_top_k = 0;
         bool check_uncond_generation = false;
         uint64_t uncond_generation = 0;
+        bool top_p_over_row = false;
+        std::vector<int64_t> banned;
+        std::optional<float> fixed_uniform;
         if (!lua_isnoneornil(L, 3)) {
             luaL_checktype(L, 3, LUA_TTABLE);
             const auto number_field = [&](int table_idx, const char* name, double fallback) {
@@ -1757,6 +1827,44 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
             }
             lua_pop(L, 1);
 
+            // `top_p_mass`: what top-p's cumulative mass is a fraction of -- "candidates" (the top-k
+            // survivors, `transformers`' order and the default) or "row" (the whole window's softmax,
+            // CosyVoice's `nucleus_sampling`). A string rather than a boolean so a third convention
+            // does not need a second knob; an unknown one is refused rather than read as the default.
+            lua_getfield(L, 3, "top_p_mass");
+            if (!lua_isnil(L, -1)) {
+                const std::string mass = luaL_checkstring(L, -1);
+                if (mass == "row") {
+                    top_p_over_row = true;
+                } else if (mass != "candidates") {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "loom.sample_row: top_p_mass is '%s'; it is \"candidates\" (the "
+                                          "top-k survivors' mass, the default) or \"row\" (the whole "
+                                          "window's)", mass.c_str());
+                }
+            }
+            lua_pop(L, 1);
+
+            // `banned`: ids that may not be drawn at all -- set to -inf ahead of every other step.
+            lua_getfield(L, 3, "banned");
+            if (!lua_isnil(L, -1)) {
+                luaL_checktype(L, -1, LUA_TTABLE);
+                const int ids_idx = lua_gettop(L);
+                const auto count = static_cast<int64_t>(lua_objlen(L, ids_idx));
+                banned.reserve(static_cast<size_t>(count));
+                for (int64_t i = 1; i <= count; ++i) {
+                    lua_rawgeti(L, ids_idx, static_cast<int>(i));
+                    banned.push_back(static_cast<int64_t>(std::llround(luaL_checknumber(L, -1))));
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1);
+
+            // `uniform`: the draw itself, in [0, 1), instead of one from the stream.
+            lua_getfield(L, 3, "uniform");
+            if (!lua_isnil(L, -1)) fixed_uniform = static_cast<float>(luaL_checknumber(L, -1));
+            lua_pop(L, 1);
+
             lua_getfield(L, 3, "guidance");
             if (!lua_isnil(L, -1)) {
                 luaL_checktype(L, -1, LUA_TTABLE);
@@ -1797,7 +1905,7 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
             temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k,
-            repetition_penalty, penalized, min_p)));
+            repetition_penalty, penalized, min_p, top_p_over_row, banned, fixed_uniform)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());

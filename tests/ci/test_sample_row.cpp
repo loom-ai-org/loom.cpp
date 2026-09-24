@@ -109,6 +109,9 @@ const char* kScript = R"lua(
         'guidance needs a `module`',
         'guidance combines two runs of ONE model',
         'min_p is',
+        'is banned, so there is nothing to draw from',
+        'it is the draw itself',
+        'top_p_mass is',
     }
 
     -- The whole last row, marshalled out, so the test can compute what guidance SHOULD answer instead
@@ -190,6 +193,42 @@ const char* kScript = R"lua(
         return out
     end
 
+    -- CosyVoice3's three knobs (ADR-047), passed straight through; a nil field is the default.
+    -- `mass` is a number because a bridge argument cannot be a string: 1 is "row", 2 "candidates".
+    local function top_p_mass(inputs)
+        if inputs.mass == 1 then return 'row' elseif inputs.mass == 2 then return 'candidates' end
+        return nil
+    end
+
+    function knobbed(inputs)
+        logits(inputs.tokens)
+        return loom.sample_row('stage_b', -1, {temperature = inputs.temperature, top_k = inputs.top_k,
+                                                top_p = inputs.top_p, top_p_mass = top_p_mass(inputs),
+                                                banned = inputs.banned, uniform = inputs.uniform})
+    end
+
+    function knobbed_draws(inputs)
+        local out = {}
+        loom.seed_rng(inputs.seed)
+        for i = 1, inputs.n do
+            logits(inputs.tokens)
+            out[i] = loom.sample_row('stage_b', -1, {temperature = inputs.temperature,
+                                                      top_k = inputs.top_k, top_p = inputs.top_p,
+                                                      top_p_mass = top_p_mass(inputs),
+                                                      banned = inputs.banned})
+        end
+        return out
+    end
+
+    -- A pinned draw must leave the stream where it was: seed, one pinned draw, then one streamed
+    -- draw -- which must be the FIRST streamed draw after that seed.
+    function pinned_then_streamed(inputs)
+        loom.seed_rng(inputs.seed)
+        logits(inputs.tokens)
+        loom.sample_row('stage_b', -1, {temperature = inputs.temperature, uniform = 0.5})
+        return loom.sample_row('stage_b', -1, {temperature = inputs.temperature})
+    end
+
     function expect_error(inputs)
         local ok, err = pcall(function()
             if inputs.case == 1 then
@@ -218,6 +257,15 @@ const char* kScript = R"lua(
             elseif inputs.case == 10 then
                 logits({1, 3, 4})
                 loom.sample_row('stage_b', -1, {temperature = 1.0, min_p = 1.5})
+            elseif inputs.case == 11 then
+                logits({1, 3, 4})
+                loom.sample_row('stage_b', -1, {temperature = 1.0, banned = {0, 1, 2, 3, 4, 5}})
+            elseif inputs.case == 12 then
+                logits({1, 3, 4})
+                loom.sample_row('stage_b', -1, {temperature = 1.0, uniform = 1.0})
+            elseif inputs.case == 13 then
+                logits({1, 3, 4})
+                loom.sample_row('stage_b', -1, {temperature = 1.0, top_p = 0.5, top_p_mass = 'vocab'})
             else
                 -- `stage_a`'s output is the EMBEDDING, n_embd wide, not the 6-wide head -- so this is
                 -- guidance against a tensor that is not the same distribution.
@@ -423,7 +471,7 @@ int main() {
     }
 
     // --- 8. Every way of getting it wrong that the binding is supposed to catch. ---
-    for (double c = 1; c <= 10; ++c) {
+    for (double c = 1; c <= 13; ++c) {
         const auto got = std::get<double>(bridge.call("expect_error", {{"case", c}}));
         if (got != c) std::fprintf(stderr, "sample_row error case %g returned %g\n", c, got);
         LOOM_CHECK(got == c);
@@ -488,6 +536,94 @@ int main() {
         const auto top_two = std::get<std::vector<double>>(bridge.call("minp_draws", two));
         LOOM_CHECK(std::set<double>(top_two.begin(), top_two.end()) ==
                    std::set<double>({static_cast<double>(order[0]), static_cast<double>(order[1])}));
+    }
+
+    // --- 11-13. CosyVoice3's knobs (ADR-047). Every expectation is computed HERE from the row, in the
+    //            sorted-descending inverse-CDF walk the reference's recorded draws are replayed through.
+    constexpr double kT = 3.0;
+    std::vector<double> probs(6);
+    const double row_max = *std::max_element(cond.begin(), cond.end());
+    for (size_t i = 0; i < 6; ++i) probs[i] = std::exp((cond[i] - row_max) / kT);
+    std::vector<size_t> order(6);
+    for (size_t i = 0; i < 6; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return probs[a] > probs[b]; });
+    // The walk: first running sum >= u * mass, over `keep` candidates in `order`, skipping `banned`.
+    const auto walk = [&](double u, size_t keep, const std::set<size_t>& banned_ids) {
+        std::vector<size_t> cand;
+        for (size_t i = 0; i < 6 && cand.size() < keep; ++i) {
+            if (!banned_ids.count(order[i])) cand.push_back(order[i]);
+        }
+        double mass = 0.0;
+        for (const size_t c : cand) mass += probs[c];
+        double running = 0.0;
+        for (const size_t c : cand) {
+            running += probs[c];
+            if (running >= u * mass) return static_cast<double>(c);
+        }
+        return static_cast<double>(cand.back());
+    };
+
+    // --- 11. `uniform` IS the draw: across a scan of u, the id is the walk's, whatever the seed; and a
+    //         pinned draw leaves the stream untouched. ---
+    {
+        std::set<double> reached;
+        for (double u = 0.02; u < 1.0; u += 0.07) {
+            const double want = walk(u, 6, {});
+            const auto got = std::get<double>(bridge.call(
+                "knobbed", {{"tokens", tokens}, {"temperature", kT}, {"uniform", u}}));
+            if (got != want) std::fprintf(stderr, "uniform %g drew %g, the walk says %g\n", u, got, want);
+            LOOM_CHECK(got == want);
+            reached.insert(got);
+        }
+        LOOM_CHECK(reached.size() >= 3);   // otherwise the scan proved nothing about the walk
+        Args first = {{"tokens", tokens}, {"n", 1.0}, {"temperature", kT}, {"seed", 77.0}};
+        const auto streamed = std::get<std::vector<double>>(bridge.call("draws", first));
+        const auto after_pinned = std::get<double>(bridge.call(
+            "pinned_then_streamed", {{"tokens", tokens}, {"temperature", kT}, {"seed", 77.0}}));
+        LOOM_CHECK(after_pinned == streamed[0]);
+    }
+
+    // --- 12. `banned`: never drawn, and out of the greedy argmax too -- with the best id banned, greedy
+    //         is the second best, and a pinned u that lands on the best id without the ban lands on the
+    //         next candidate with it. ---
+    {
+        const std::vector<double> ban_best = {greedy};
+        const auto second = std::get<double>(bridge.call(
+            "knobbed", {{"tokens", tokens}, {"banned", ban_best}}));
+        LOOM_CHECK(second == static_cast<double>(order[1]));
+        const double u = 0.01;   // the first candidate's slice of the walk, unbanned
+        LOOM_CHECK(walk(u, 6, {}) == greedy);
+        const auto got = std::get<double>(bridge.call(
+            "knobbed", {{"tokens", tokens}, {"temperature", kT}, {"uniform", u}, {"banned", ban_best}}));
+        LOOM_CHECK(got == walk(u, 6, {static_cast<size_t>(greedy)}));
+        const std::vector<double> ban_two = {greedy, static_cast<double>(order[2])};
+        Args many = {{"tokens", tokens}, {"n", 300.0}, {"seed", 3.0}, {"temperature", 50.0},
+                     {"banned", ban_two}};
+        const auto ids = std::get<std::vector<double>>(bridge.call("knobbed_draws", many));
+        const std::set<double> seen(ids.begin(), ids.end());
+        LOOM_CHECK(seen.size() == 4 && !seen.count(greedy) && !seen.count(static_cast<double>(order[2])));
+    }
+
+    // --- 13. `top_p_mass = "row"`: the same top_k and top_p keep a different prefix. With top_k = 2 and
+    //         top_p between the best id's share of the WHOLE row and its share of the top two, the
+    //         default ("candidates") keeps only the best id while "row" keeps both -- so a pinned u near
+    //         1 gives the best id one way and the second the other. ---
+    {
+        double row_sum = 0.0;
+        for (const double p : probs) row_sum += p;
+        const double share_row = probs[order[0]] / row_sum;
+        const double share_top2 = probs[order[0]] / (probs[order[0]] + probs[order[1]]);
+        std::fprintf(stderr, "best id's share at T=%g: %g of the row, %g of the top two\n",
+                     kT, share_row, share_top2);
+        LOOM_CHECK(share_row < share_top2);
+        const double top_p = (share_row + share_top2) / 2.0;
+        Args pinned = {{"tokens", tokens}, {"temperature", kT}, {"top_k", 2.0}, {"top_p", top_p},
+                       {"uniform", 0.999}};
+        LOOM_CHECK(std::get<double>(bridge.call("knobbed", pinned)) == greedy);
+        pinned["mass"] = 2.0;   // "candidates", said explicitly
+        LOOM_CHECK(std::get<double>(bridge.call("knobbed", pinned)) == greedy);
+        pinned["mass"] = 1.0;   // "row"
+        LOOM_CHECK(std::get<double>(bridge.call("knobbed", pinned)) == static_cast<double>(order[1]));
     }
 
     LOOM_TEST_REPORT_AND_RETURN();
