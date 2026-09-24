@@ -48,6 +48,8 @@ void print_usage(const char* argv0) {
                   "  --out <path.wav>              for a model whose answer is AUDIO: synthesise and\n"
                   "                                write it. --prompt is the text, the IPA phonemes or\n"
                   "                                the codes, depending on what the file declares\n"
+                  "  --voice <voice.gguf>          a voice file for a model that takes one (pocket-tts's\n"
+                  "                                `voices/*.gguf`); refused if made for other weights\n"
                   "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
                   "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
                   "                                `sample_rate=N` for a model that declares none\n"
@@ -270,6 +272,9 @@ int main(int argc, char** argv) {
     // family, the driver's own declared input names are the interface -- a wrong one is an error from
     // the engine naming the module and the input.
     std::vector<std::pair<std::string, std::vector<double>>> extra_inputs;
+    // A voice file's tensors become driver inputs by name (ADR-045), loaded once the model is, because
+    // whether the file FITS the model is a question only the model can answer.
+    std::string voice_path;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -287,6 +292,8 @@ int main(int argc, char** argv) {
             // model continues one spectrogram, so the two are not separable inputs.
             ref_text = argv[++i];
             has_ref_text = true;
+        } else if (arg == "--voice" && i + 1 < argc) {
+            voice_path = argv[++i];
         } else if (arg == "--language" && i + 1 < argc) {
             // Optional by design. Omitted, a driver that can detect the language does; one that cannot
             // uses its own default. See run_asr.
@@ -378,6 +385,12 @@ int main(int argc, char** argv) {
     try {
         auto model = loom::GgufModel::load(model_path, backends);
         std::printf("loaded '%s'\n", model_path.c_str());
+        if (!voice_path.empty()) {
+            const loom::VoiceFile voice = loom::load_voice(*model, voice_path);
+            std::printf("  voice: %s (%s)\n", voice.name.c_str(), voice.license.c_str());
+            // Ahead of the --input ones, so a caller's explicit input still wins.
+            for (const auto& [name, values] : voice.inputs) extra_inputs.insert(extra_inputs.begin(), {name, values});
+        }
         std::printf("  architecture: %s\n", model->architecture().c_str());
 
         bool is_multi_topology = model->has_kv("model.driver_script");
@@ -544,7 +557,10 @@ int main(int argc, char** argv) {
             if (!has_prompt) return 0;
             const auto chunks = vocab->chunks(prompt_text);
             for (size_t i = 0; i < chunks.size(); ++i) {
-                std::printf("  chunk %zu: \"%s\"\n", i + 1, vocab->prepare(chunks[i]).c_str());
+                size_t n_words = 0;
+                const std::string prepared = vocab->prepare(chunks[i], &n_words);
+                std::printf("  chunk %zu (%zu word%s): \"%s\"\n", i + 1, n_words, n_words == 1 ? "" : "s",
+                            prepared.c_str());
             }
             const auto ids = vocab->encode(prompt_text);
             std::printf("  %zu id(s)\n", ids.size());

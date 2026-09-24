@@ -30,9 +30,12 @@ class GgufModel;
 //      at most that many tokens.
 //   3. Each chunk through step 1 again, then tokenized.
 //
-// `encode` returns every chunk's ids with the file's `chunk_separator` id between them. The driver
-// generates each chunk from a fresh copy of the voice, as the reference does, so this is the one place
-// the chunking can be exact: steps 2 and 3 need decoded text, which the driver never sees.
+// `encode` returns every chunk's ids, each chunk OPENED by a header id: `chunk_header_short` when the
+// reference's tail guess for it is the short-text one (`prepare_text_prompt`: at most four words ->
+// 3 frames after EOS, else 1), `chunk_header_long` otherwise. The driver generates each chunk from a
+// fresh copy of the voice, as the reference does, so this is the one place the chunking can be exact:
+// steps 2 and 3 need decoded text, and so does the word count (`len(text.split())` BEFORE the terminal
+// punctuation is fixed), and the driver never sees text (ADR-044).
 //
 // **Every constant is the file's** (`tokenizer.ggml.pocket_tts.*`), written by the exporter from the
 // reference's own module and config -- ADR-041's rule: the shape is code, the rules are data. That
@@ -44,23 +47,29 @@ public:
     // "pocket_tts". Throws `LoadError` if the tag is present and a required key is not.
     static std::unique_ptr<PocketTtsVocab> load(const GgufModel& model);
 
-    // Steps 1-3 above: every chunk's ids, `chunk_separator()` between consecutive chunks. Throws
-    // `Error` on a text that is empty after stripping, as the reference raises.
+    // Steps 1-3 above: every chunk's ids, each opened by its header. Throws `Error` on a text that is
+    // empty after stripping, as the reference raises.
     std::vector<int32_t> encode(const std::string& text) const;
 
     // Step 2's output as text, exposed so a host (and the tests) can see what each generation will be
     // asked to say.
     std::vector<std::string> chunks(const std::string& text) const;
 
-    // Step 1 alone (`prepare_text_prompt`'s text).
-    std::string prepare(const std::string& text) const;
+    // Step 1 alone (`prepare_text_prompt`'s text). `*n_words` (when non-null) receives its word count,
+    // `len(text.split())` after the replacements and before capitalisation and terminal punctuation --
+    // the number the reference's tail guess is taken from.
+    std::string prepare(const std::string& text, size_t* n_words = nullptr) const;
 
-    // SentencePiece's decode, separators dropped.
+    // SentencePiece's decode, headers dropped.
     std::string decode(const std::vector<int32_t>& ids) const;
 
     const std::string& id_to_piece(int32_t id) const { return vocab_->id_to_piece(id); }
     size_t size() const { return vocab_->size(); }
-    int32_t chunk_separator() const { return separator_; }
+    // The header opening a chunk of `n_words` words, and whether an id is either header.
+    int32_t chunk_header(size_t n_words) const {
+        return n_words <= short_chunk_max_words_ ? header_short_ : header_long_;
+    }
+    bool is_chunk_header(int32_t id) const { return id == header_short_ || id == header_long_; }
 
     PocketTtsVocab(const PocketTtsVocab&) = delete;
     PocketTtsVocab& operator=(const PocketTtsVocab&) = delete;
@@ -86,7 +95,9 @@ private:
     std::unordered_set<int32_t> sentence_end_ids_;
     std::unordered_set<int32_t> clause_end_ids_;
     size_t max_tokens_per_chunk_ = 0;
-    int32_t separator_ = -1;
+    int32_t header_short_ = -1;
+    int32_t header_long_ = -1;
+    size_t short_chunk_max_words_ = 0;
     bool capitalize_first_letter_ = true;
     bool append_terminal_punctuation_ = true;
 };

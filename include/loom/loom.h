@@ -56,6 +56,7 @@
 #include "loom/core/f5_vocab.h"
 #include "loom/core/chatterbox_vocab.h"
 #include "loom/core/pocket_tts_vocab.h"
+#include "loom/core/voice_file.h"
 #include "loom/core/phoneme_vocab.h"
 #include "loom/core/unicode.h"
 #include "loom/core/supertonic_text_vectorizer.h"

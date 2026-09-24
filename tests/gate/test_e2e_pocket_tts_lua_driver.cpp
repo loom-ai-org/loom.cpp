@@ -4,7 +4,7 @@
 // waveform out -- one GGUF, five topologies, one driver.
 //
 // **The oracle is the real Pocket-TTS** (`scripts/pocket_tts_reference.py`), with its one random draw
-// per step pinned and handed in (`noise`): the same seed is not the same noise. Two arms:
+// per step pinned and handed in (`noise`): the same seed is not the same noise. Three arms:
 //
 //   * **Teacher-forced**, the exact one. The loop feeds every latent back as the next step's input,
 //     so f32 rounding COMPOUNDS along it, and two correct implementations drift apart -- the
@@ -15,12 +15,17 @@
 //   * **Free-running**, the one that checks the LOOP: the same frame count (the EOS head fired at the
 //     same step; its margin over the threshold was 1.4 there) and a waveform still within a drift
 //     bound. rmse was 9.9e-05.
+//   * **A voice FILE** (ADR-045), when its fixture is present: `marius.gguf` read by `loom::load_voice`,
+//     teacher-forced against the reference run with that voice. max |d| 8.0e-06, rmse 1.9e-07.
 //
 // Fixtures:
 //   LOOM_POCKET_TTS_GGUF     pocket_tts.gguf  -- `loom-export ~/Dev/models/pocket-tts/languages/
 //                                                english_2026-09 -o pocket_tts.gguf`
 //   LOOM_POCKET_TTS_REF_DIR  pocket_tts_ref/  -- tokens.npy, noise.npy, latents.npy, wave.npy and
 //                                                meta.json from scripts/pocket_tts_reference.py
+//   LOOM_POCKET_TTS_MARIUS_REF_DIR  pocket_tts_marius_ref/  -- the same with `--voice marius`, plus
+//                                                voice.gguf from `loom_exporter.pocket_tts_voices`
+//                                                (optional: the arm is skipped without it)
 
 #include "test_util.h"
 #include "fixtures.h"
@@ -96,14 +101,15 @@ int main() {
     LOOM_CHECK(model != nullptr);
 
     // **The text door first.** The reference's ids are its whole text path's (prepare, chunk,
-    // prepare, tokenize) for a one-chunk text; the file's own vocabulary must produce them, or the
-    // waveform comparison below would be grading two different sentences.
+    // prepare, tokenize) for a one-chunk text; the file's own vocabulary must produce them behind the
+    // chunk's header, or the waveform comparison below would be grading two different sentences.
     auto vocab = loom::PocketTtsVocab::load(*model);
     LOOM_CHECK(vocab != nullptr);
     const auto ids = vocab->encode(text);
-    LOOM_CHECK(ids.size() == ref_ids.size());
-    for (size_t i = 0; i < std::min(ids.size(), ref_ids.size()); ++i) {
-        LOOM_CHECK(static_cast<float>(ids[i]) == ref_ids[i]);
+    LOOM_CHECK(ids.size() == ref_ids.size() + 1);
+    LOOM_CHECK(!ids.empty() && vocab->is_chunk_header(ids[0]));
+    for (size_t i = 1; i < std::min(ids.size(), ref_ids.size() + 1); ++i) {
+        LOOM_CHECK(static_cast<float>(ids[i]) == ref_ids[i - 1]);
     }
     const std::vector<double> tokens(ids.begin(), ids.end());
 
@@ -138,6 +144,32 @@ int main() {
         std::fprintf(stderr, "free-running max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs, d.rmse, d.peak);
         // A drift bound, not an equality: 10x the measured rmse, and the sabotage arm is 650x over it.
         LOOM_CHECK(d.rmse < 1e-3);
+    }
+
+    // --- 3. A voice file, through the loader both hosts use. ---
+    if (const char* voice_env = loom_test::fixture_env("LOOM_POCKET_TTS_MARIUS_REF_DIR")) {
+        const std::string dir = voice_env;
+        const loom::VoiceFile voice = loom::load_voice(*model, dir + "/voice.gguf");
+        LOOM_CHECK(voice.name == "marius" && voice.inputs.count("voice_kv") == 1);
+        const auto v_ids = loom_test::read_npy_f32(dir + "/tokens.npy", shape);
+        const auto v_noise = loom_test::read_npy_f32(dir + "/noise.npy", shape);
+        const auto v_latents = loom_test::read_npy_f32(dir + "/latents.npy", shape);
+        const auto v_wave = loom_test::read_npy_f32(dir + "/wave.npy", shape);
+        loom::Session session(*model, device.backends());
+        std::unordered_map<std::string, loom::LoomLuaBridge::Value> in{
+            {"tokens", as_doubles(v_ids)}, {"noise", as_doubles(v_noise)},
+            {"teacher_latents", as_doubles(v_latents)}};
+        for (const auto& [name, values] : voice.inputs) in[name] = values;
+        const auto got = std::get<std::vector<double>>(session.bridge().call("infer", in));
+        std::fprintf(stderr, "voice file samples: loom=%zu reference=%zu\n", got.size(), v_wave.size());
+        LOOM_CHECK(got.size() == v_wave.size());
+        const Diff d = compare(got, v_wave);
+        std::fprintf(stderr, "voice file max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs, d.rmse, d.peak);
+        LOOM_CHECK(d.peak > 0.05);
+        LOOM_CHECK(d.max_abs < 2e-3);
+        LOOM_CHECK(d.rmse < 2e-5);
+    } else {
+        std::fprintf(stderr, "voice-file arm skipped: no LOOM_POCKET_TTS_MARIUS_REF_DIR\n");
     }
 
     LOOM_TEST_REPORT_AND_RETURN();
