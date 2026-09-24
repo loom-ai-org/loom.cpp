@@ -838,8 +838,9 @@ noise) with a Matcha-style estimator. What was new is only that both halves shar
 **What it cost, which was again not where the scoping looked:**
 
 * **Two sampler changes.** `loom.sample_row` gained `min_p`. The repetition penalty turned out to be
-  applied once per *occurrence*, where `transformers` applies it once per id; this was invisible at
-  Qwen3-TTS's 1.05 and would not have been at Chatterbox's 1.2
+  applied once per *occurrence*, where `transformers` applies it once per id. Even at Qwen3-TTS's
+  1.05 this was the talker's open greedy divergence (96/624 ids on one sentence, 624/624 once fixed),
+  and at Chatterbox's 1.2 it would have been worse
   ([Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md)).
 * **A text front end whose rules are data** ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)):
   a character-level BPE rather than a byte-level one, plus the reference's `punc_norm`, as
