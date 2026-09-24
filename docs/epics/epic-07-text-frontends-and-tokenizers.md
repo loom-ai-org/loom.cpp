@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-09-12
+last_updated: 2026-09-24
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -54,6 +54,18 @@ per-family-tag convention exists so that a tag answers "which scheme is this", a
 spends that to save about a hundred lines — `id_to_piece` would answer with a character the checkpoint
 never had, and the tag would claim a segmentation algorithm the file does not carry.
 
+### A front end whose rules are data
+
+`chatterbox_vocab.cpp` (`tokenizer.ggml.model == "chatterbox"`, family 9's fourth leaf) is the first
+reader whose `encode` includes a model's own text NORMALIZER as well as its tokenizer: the reference's
+`punc_norm` (capitalise, collapse whitespace, twelve ordered replacements, a terminal full stop), then
+`[SPACE]` substitution, then a character-level BPE with a `Whitespace` pre-tokenizer.
+[ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md) is the decision. The engine holds
+the function's shape. The replacement table, the enders, the pre-tokenizer's word set (asked of the
+reference's own pre-tokenizer, restricted to the table's characters, which is exact because an unknown
+character is an unmergeable `[UNK]`) and Python's full case mapping all ship in the file. The result is
+**3000/3000** ids identical to the reference across six input classes.
+
 **Three loaders now run in order in `transcribe`**, and the order is load-bearing: `BpeVocab::load` and
 `CtcVocab::load` return `nullptr` for a schema that is not theirs, while `Vocab::load` **throws**. Any
 future reader goes ahead of `Vocab::load` for the same reason.
@@ -103,7 +115,7 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
 | Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md) |
-| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md) |
+| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record

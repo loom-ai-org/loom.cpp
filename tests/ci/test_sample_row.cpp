@@ -33,6 +33,7 @@
 #include "cpu_backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <set>
 #include <string>
@@ -107,6 +108,7 @@ const char* kScript = R"lua(
         'which is the one being sampled',
         'guidance needs a `module`',
         'guidance combines two runs of ONE model',
+        'min_p is',
     }
 
     -- The whole last row, marshalled out, so the test can compute what guidance SHOULD answer instead
@@ -170,6 +172,24 @@ const char* kScript = R"lua(
                                                             top_k = inputs.gtop_k}})
     end
 
+    -- Greedy under a repetition penalty over a caller-built history, which may repeat ids.
+    function penalized(inputs)
+        logits(inputs.tokens)
+        return loom.sample_row('stage_b', -1, {repetition_penalty = inputs.penalty,
+                                                penalized = inputs.history})
+    end
+
+    function minp_draws(inputs)
+        local out = {}
+        loom.seed_rng(inputs.seed)
+        for i = 1, inputs.n do
+            logits(inputs.tokens)
+            out[i] = loom.sample_row('stage_b', -1, {temperature = inputs.temperature,
+                                                      min_p = inputs.min_p})
+        end
+        return out
+    end
+
     function expect_error(inputs)
         local ok, err = pcall(function()
             if inputs.case == 1 then
@@ -195,6 +215,9 @@ const char* kScript = R"lua(
             elseif inputs.case == 8 then
                 logits({1, 3, 4})
                 loom.sample_row('stage_b', -1, {guidance = {scale = 3.0}})
+            elseif inputs.case == 10 then
+                logits({1, 3, 4})
+                loom.sample_row('stage_b', -1, {temperature = 1.0, min_p = 1.5})
             else
                 -- `stage_a`'s output is the EMBEDDING, n_embd wide, not the 6-wide head -- so this is
                 -- guidance against a tensor that is not the same distribution.
@@ -400,10 +423,71 @@ int main() {
     }
 
     // --- 8. Every way of getting it wrong that the binding is supposed to catch. ---
-    for (double c = 1; c <= 9; ++c) {
+    for (double c = 1; c <= 10; ++c) {
         const auto got = std::get<double>(bridge.call("expect_error", {{"case", c}}));
         if (got != c) std::fprintf(stderr, "sample_row error case %g returned %g\n", c, got);
         LOOM_CHECK(got == c);
+    }
+
+    // --- 9. The repetition penalty applies ONCE per id, however often the id recurs in the history --
+    //        `RepetitionPenaltyLogitsProcessor` gathers and scatters, so five copies of an id write the
+    //        same once-penalised score five times. The penalty is chosen so that once keeps the best
+    //        class on top and three times would not, which is what makes a compounding
+    //        implementation fail here rather than agree by luck. ---
+    {
+        const auto penalise = [](double v, double p) { return v > 0 ? v / p : v * p; };
+        const auto argmax_with = [&](double best_score) {
+            std::vector<double> row = cond;
+            row[static_cast<size_t>(greedy)] = best_score;
+            return static_cast<double>(std::max_element(row.begin(), row.end()) - row.begin());
+        };
+        const double best_logit = cond[static_cast<size_t>(greedy)];
+        double chosen = 0.0;
+        for (double p = 1.01; p < 64.0; p *= 1.01) {
+            const double thrice = penalise(penalise(penalise(best_logit, p), p), p);
+            if (argmax_with(penalise(best_logit, p)) == greedy && argmax_with(thrice) != greedy) {
+                chosen = p;
+                break;
+            }
+        }
+        std::fprintf(stderr, "repetition penalty %g keeps class %g once and drops it thrice\n",
+                     chosen, greedy);
+        LOOM_CHECK(chosen > 0.0);
+        const std::vector<double> once = {greedy};
+        const std::vector<double> repeated = {greedy, 0.0, greedy, greedy};
+        LOOM_CHECK(std::get<double>(bridge.call(
+            "penalized", {{"tokens", tokens}, {"penalty", chosen}, {"history", once}})) == greedy);
+        const auto got = std::get<double>(bridge.call(
+            "penalized", {{"tokens", tokens}, {"penalty", chosen}, {"history", repeated}}));
+        if (got != greedy) std::fprintf(stderr, "a repeated id was penalised more than once: %g\n", got);
+        LOOM_CHECK(got == greedy);
+    }
+
+    // --- 10. min_p: a candidate survives only if its probability is at least `min_p` times the most
+    //         likely one's. Two thresholds computed HERE from the row: one between the second and first
+    //         ratios keeps exactly the best class, one between the third and second keeps exactly two.
+    {
+        constexpr double kTemperature = 5.0;
+        std::vector<double> probs(6);
+        const double top = *std::max_element(cond.begin(), cond.end());
+        double sum = 0.0;
+        for (size_t i = 0; i < 6; ++i) { probs[i] = std::exp((cond[i] - top) / kTemperature); sum += probs[i]; }
+        std::vector<size_t> order(6);
+        for (size_t i = 0; i < 6; ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return probs[a] > probs[b]; });
+        const double r2 = probs[order[1]] / probs[order[0]];
+        const double r3 = probs[order[2]] / probs[order[0]];
+        std::fprintf(stderr, "min_p ratios at T=%g: second %g, third %g\n", kTemperature, r2, r3);
+        LOOM_CHECK(r2 < 1.0 && r3 < r2);   // three distinct levels, or the two thresholds coincide
+        Args one = {{"tokens", tokens}, {"n", 300.0}, {"seed", 5.0}, {"temperature", kTemperature},
+                    {"min_p", (r2 + 1.0) / 2.0}};
+        const auto only_best = std::get<std::vector<double>>(bridge.call("minp_draws", one));
+        LOOM_CHECK(std::set<double>(only_best.begin(), only_best.end()) == std::set<double>({greedy}));
+        Args two = one;
+        two["min_p"] = (r2 + r3) / 2.0;
+        const auto top_two = std::get<std::vector<double>>(bridge.call("minp_draws", two));
+        LOOM_CHECK(std::set<double>(top_two.begin(), top_two.end()) ==
+                   std::set<double>({static_cast<double>(order[0]), static_cast<double>(order[1])}));
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-23
+last_updated: 2026-09-24
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,9 +19,9 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Land the review stack, in order: P5.0, then family 9** | Nothing below should start on a branch that stacks on unmerged work. **P5.0** is three open PRs — loom-exporter **#23** (`feat/p5-0-pack-weights-per-phase` → `main`), **#24** (`feat/p5-0-phase-process-isolation` → #23's branch) and loom.cpp **#30** (`feat/p5-0-phase-process-isolation` → `main`). **Family 9** is pushed on `feat/p5-family-9-f5-tts` in all three repos and **has no PRs yet**: the loom.cpp and loom-exporter branches stack on the P5.0 branches above (one commit each on top), and loom-py's is one commit on `main` pinning `vendor/loom.cpp` at `d914b25`. Two things to do before merging it: run loom-py's **model-card gate** against the family-9 build (never run — it proves the 30 shipped models did not regress through the `run_ode` change), and **if loom.cpp's PR is squashed, re-bump loom-py** to the squashed sha before loom-py's PR merges, or its pin names a commit that no longer exists → [Packaging & release](#packaging--release) |
-| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at three of twelve leaves** (Matcha, Supertonic, F5-TTS). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). **What to pick next, costed:** the other nine family-9 leaves are mostly AR-LM + flow compositions (cosyvoice3, chatterbox, voxcpm2, pocket-tts are LOCAL in `~/Dev/models`) and cost a second exporter template; family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
-| **Qwen3-TTS's repetition penalty disagrees with `transformers`, and the shipped file is the one that differs** | Surfaced by ICL's verification and **pre-existing**: on a target sentence short enough that the model wants to repeat a frame, the reference emits the repeat and loom does not. `repetition_penalty = 1.0` makes loom reproduce the reference 624/624 over 39 frames; the checkpoint's own 1.05 gives 96/624. The published GGUF and this branch's agree 640/640 on that input, so nothing regressed — but one of the two implementations is applying a penalty the other is not, and the cards describe the shipped behaviour. **Do not change the default before instrumenting the reference's processor** → see [Models](#models) |
+| **Land the review stack, in order: P5.0, then family 9** | Nothing below should start on a branch that stacks on unmerged work. **P5.0** is three open PRs — loom-exporter **#23** (`feat/p5-0-pack-weights-per-phase` → `main`), **#24** (`feat/p5-0-phase-process-isolation` → #23's branch) and loom.cpp **#30** (`feat/p5-0-phase-process-isolation` → `main`). **Family 9** is pushed on `feat/p5-family-9-f5-tts` in all three repos and **has no PRs yet** (its fourth leaf, Chatterbox, sits uncommitted on `feat/p5-family-9-chatterbox` on top of it): the loom.cpp and loom-exporter branches stack on the P5.0 branches above (one commit each on top), and loom-py's is one commit on `main` pinning `vendor/loom.cpp` at `d914b25`. Two things to do before merging it: run loom-py's **model-card gate** against the family-9 build (never run — it proves the 30 shipped models did not regress through the `run_ode` change), and **if loom.cpp's PR is squashed, re-bump loom-py** to the squashed sha before loom-py's PR merges, or its pin names a commit that no longer exists → [Packaging & release](#packaging--release) |
+| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at four of twelve leaves** (Matcha, Supertonic, F5-TTS, and Chatterbox as of 2026-09-24). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). **What to pick next, costed:** the other eight family-9 leaves are mostly the same composition (cosyvoice3 shares Chatterbox's HiFT vocoder and flow lineage but its speech tokenizer and CAMPPlus are ONNX-only; pocket-tts and voxcpm2 predict CONTINUOUS latents per AR step, a loop shape nothing ships); family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
+| **Qwen3-TTS's repetition-penalty divergence does not reproduce: find out which build recorded it** | Recorded 2026-09-17 as "penalty 1.0 gives 624/624, the checkpoint's 1.05 gives 96/624". Re-run 2026-09-24 with the oracle's exact inputs, it is the opposite: **1.05 gives 624/624 and 1.0 gives 99/624**, under both the old and the new penalty semantics. Re-run on `main` and on the rc10 wheel. Either the item was a harness mistake and is deleted, or the two branches differ and it gets bisected. **Do not change the talker's default until then** → see [Models](#models) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
 open.** Four packages on PyPI at `1.0.0rc10`, both macOS architectures included; the `linux_armv6l`
@@ -62,23 +62,38 @@ release](#packaging--release)
 
 ## Models
 
-* [ ] **Qwen3-TTS's repetition penalty and `transformers`' do not penalise the same history, and the
-  SHIPPED model is the one that differs.** Found while grading ICL, on the x-vector path, with a
-  target sentence short enough that the model wants to repeat a frame: `loom` and the reference agree
-  for six frames, and at frame 6 the reference emits **frame 5 again** while loom does not. Turning
-  the penalty off (`repetition_penalty = 1.0`) makes loom reproduce the reference **624/624 ids over
-  39 frames**, including the repeat; leaving it at the checkpoint's 1.05 gives 96/624. The published
-  GGUF behaves identically to this branch's on the same input (640/640), so this is **pre-existing and
-  not ICL's doing** — ICL surfaced it.
+* [ ] **Chatterbox (family 9's fourth leaf) is built and verified, and not yet committed, published or
+  gated on the Hub.** Branch `feat/p5-family-9-chatterbox` in all three repos, stacked on family 9's
+  F5-TTS branches. Verified: the gate is 2.5e-05 from the reference waveform, the tokenizer is 3000/3000
+  ids against the reference, and the Whisper oracle is exact at guided greedy and at two sampled seeds.
+  Card entry `chatterbox` in `build_model_cards.py`, whose first limitation says why there is **no
+  Perth watermark** (decided 2026-09-23; see Epic-03 §2). To publish: rc11 (below), a fresh export, and
+  loom-py's model-card gate against it. The card's snippet is the plain text door, since the built-in
+  voice needs no reference clip, so unlike Qwen3-TTS and F5 it IS executed by the gate. Voice cloning
+  (voice encoder + S3 tokenizer + CAMPPlus) and the multilingual and Turbo checkpoints are separate
+  leaves. *Context: [Epic-03](../epics/epic-03-model-coverage.md),
+  [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)*
+* [ ] **Qwen3-TTS's repetition-penalty divergence: the recorded numbers do NOT reproduce, and which
+  build produced them has to be established before anything is changed.** Recorded 2026-09-17 while
+  grading ICL: on a short target sentence the reference repeats frame 5 and loom does not; penalty 1.0
+  reproduced the reference 624/624 over 39 frames and the checkpoint's 1.05 gave 96/624. **Re-run
+  2026-09-24 on `feat/p5-family-9-chatterbox` with the oracle's exact settings** (`scripts/run_talker.cpp`,
+  `GREEDY=1 MAXNEW=40 XVEC=xvec.txt` on `tokens_fox.txt` -- `xvec.txt`, which is what `xvec_oracle.py`
+  reads, NOT `xvec_fox.txt`), the result is the OPPOSITE: **1.05 gives 624/624 and 1.0 gives 99/624**,
+  i.e. the reference does apply the penalty and loom now agrees with it. It is 624/624 under BOTH the
+  old per-occurrence penalty and the per-id one family 9's Chatterbox introduced (below), so that fix
+  is not the explanation. The fixture directory's own `loom_xvec_*.txt` files are consistent with the
+  new reading and not with the recorded one. Most likely the 2026-09-17 runs used a different x-vector
+  file or a different build. **What closes it:** re-run the same command on `main` and on the
+  published rc10 GGUF via `rc10venv/`. If they also give 624/624, the item was a harness mistake and is
+  deleted. If `main` differs, bisect between `main` and this branch. Until then, do not change the
+  talker's default. Fixtures are in `/home/flavio/.claude/tmp/qwen3_icl/`.
 
-  What is NOT yet known is which side is wrong. `Qwen3TTSTalkerForConditionalGeneration` does maintain
-  `input_ids` across steps (its own forward reads them, `modeling_qwen3_tts.py:1681`), so HF's
-  `RepetitionPenaltyLogitsProcessor` should be live — which would make loom's penalty *stronger or
-  differently applied* rather than the reference's inert. Worth an hour with the reference's processor
-  instrumented at the divergent step, printing the top two logits before and after the penalty.
-  **Do not change the default until that is known**: the shipped file's output is what every card and
-  every recorded number describes. Repro: `scripts/run_talker.cpp` with `GREEDY=1 PENALTY=1.0`,
-  fixtures in `/home/flavio/.claude/tmp/qwen3_icl/`.
+  *The penalty semantics DID have a real bug, found separately and fixed:* `loom.sample_row` applied the
+  penalty once per OCCURRENCE in `penalized`, compounding to `penalty^k` for an id drawn k times, where
+  `RepetitionPenaltyLogitsProcessor` gathers and scatters and so applies it once per id.
+  `tests/ci/test_sample_row.cpp` §9 pins the per-id rule. It did not move this repro because 1.05 over a
+  short history never flips an argmax; Chatterbox's 1.2 over hundreds of tokens is where it matters.
   *Context: [[loom-qwen3-tts-shipped]], [ADR-024](../adrs/adr-024-guidance-belongs-in-the-sampler.md)*
 * [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
   voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
@@ -117,11 +132,11 @@ release](#packaging--release)
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **P5 breadth**, in coverage-per-effort order. **Families 4, 5, 6, 10, 11 and 12 are COMPLETE** —
   4 is HuBERT/data2vec-audio/wav2vec 2.0, 5 is SenseVoice-Small and Paraformer-zh, 11 is DAC/SNAC/
-  EnCodec — **family 9 is at three of twelve leaves** (Matcha, Supertonic, and F5-TTS as of
-  2026-09-18), and the remainder is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**.
-  The nine leaves left in 9 are mostly compositions whose AR half is family 10's
-  (cosyvoice3, chatterbox, voxcpm2, pocket-tts, …), so the next one to pick costs a second exporter
-  template rather than a second sampler.
+  EnCodec — **family 9 is at four of twelve leaves** (Matcha, Supertonic, F5-TTS 2026-09-18,
+  Chatterbox 2026-09-24), and the remainder is **9/10 (remaining TTS) → 13 (small classifiers) → 14
+  (music)**. The eight leaves left in 9 are mostly compositions whose AR half is family 10's
+  (cosyvoice3, voxcpm2, pocket-tts, …). Chatterbox showed that one composes from the existing
+  templates, so what the next one costs is its own front end and its own loop shape, not a template.
   *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
   cost across three checkpoints, which is the estimate the rest of this list should be read against;
@@ -262,6 +277,21 @@ release](#packaging--release)
   shape of bug one op over.*
 
 ## Engine — performance
+
+* [ ] **Chatterbox's vocoder noise crosses the Lua boundary: draw it on the ENGINE side instead.** HiFT's
+  NSF source takes a unit Gaussian per harmonic per output SAMPLE (`nsf_noise`, 9 x 480 x n_frames),
+  and the driver fills it with `loom.gaussian_array` -- a Lua table of doubles that is then converted
+  and copied into the tensor. That is ~363k values for 1.7 s of audio and ~2.2M for 10 s, which is
+  the class of cost ADR-031 moved `run_ode`'s own state out of the driver to avoid, and the same
+  "fill the tensor in place" gap the LiteRT item above names for masks. **The shape of the fix:** a
+  way for the driver to ask the engine to fill a declared graph input from its RNG stream -- for
+  example a `{gaussian = n}` / `{uniform = n}` input spec that the binding materialises directly into
+  the backend tensor from `rng_`. It must draw in the SAME order and from the same stream as
+  `loom.gaussian_array`, so that seeded runs stay reproducible and caller-supplied draws (which
+  the gate uses) keep working unchanged. Measure first: the vocoder call against the whole 49 s
+  synthesis, with and without the marshal.
+  *Context: [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md),
+  `loom-exporter/loom_exporter/chatterbox_driver/04_nsf.lua`*
 
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
@@ -420,6 +450,13 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
   would drop, rather than on a function an older binding would lack and fail on. Verify on the
   released rc11 wheel the way ICL was verified on rc10's (`loom.Model.from_file(...)` plus one
   synthesis through the ASR oracle), after a fresh export.
+  * [ ] **Chatterbox adds three more** (on `feat/p5-family-9-chatterbox`): `loom.sample_row`'s
+    `min_p` option (rc10 ignores it silently, the SAME hazard as `guidance`: the file would sample
+    wider than the model's own setting), the per-id repetition penalty
+    ([Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), which
+    changes an rc10 decode wherever an id recurs), and `loom::ChatterboxVocab` under
+    `tokenizer.ggml.model == "chatterbox"` plus loom-py's branch
+    ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)).
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.
