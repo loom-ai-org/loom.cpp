@@ -132,6 +132,21 @@ const char* kScript = R"LUA(
         io.stderr:write("unexpected: " .. tostring(err) .. "\n")
         return {0}
     end
+
+    -- A caller's state one value short of the `n_elems` beside it: an error, not an abort in ggml.
+    function short_state(inputs)
+        local short = {}
+        for i = 1, #inputs.state - 1 do short[i] = inputs.state[i] end
+        local ok, err = pcall(function()
+            loom.run_ode('estimator', {n_elems = inputs.n_elems[1], n_past = 0}, {},
+                          {carried = 'z', time = 't', times = inputs.times, state = short,
+                           n_elems = #inputs.state})
+        end)
+        if ok then return {0} end
+        if string.find(err, "a caller-supplied initial state must be the size", 1, true) then return {1} end
+        io.stderr:write("unexpected: " .. tostring(err) .. "\n")
+        return {0}
+    end
 )LUA";
 
 std::vector<double> f(const std::vector<double>& x, double t) {
@@ -292,6 +307,12 @@ int main() {
 
     // --- 5. An unknown method is named, not defaulted to Euler. ---
     LOOM_CHECK(as_array(bridge.call("bad_method", {
+        {"n_elems", std::vector<double>{static_cast<double>(kN)}},
+        {"times", times}, {"state", state}}))[0] == 1.0);
+
+    // --- 5b. A caller's state whose length disagrees with `n_elems` is refused by name. It used to
+    //         reach `ggml_backend_tensor_set` and abort the process (CosyVoice3's gate found it). ---
+    LOOM_CHECK(as_array(bridge.call("short_state", {
         {"n_elems", std::vector<double>{static_cast<double>(kN)}},
         {"times", times}, {"state", state}}))[0] == 1.0);
 
