@@ -528,9 +528,9 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // times with the SAME once-penalised number -- `penalty`, never `penalty^5`. Applying it per
     // occurrence compounds it: an id drawn k times sits `penalty^k` lower, and a model that wants to
     // repeat a token the reference repeats is pushed off it. That was this loop until family 9's
-    // Chatterbox (penalty 1.2) was scoped. It is NOT what Qwen3-TTS's open repetition item is: that
-    // repro agrees 624/624 with the reference under either semantics, because 1.05 compounded over its
-    // short history never flips an argmax.
+    // Chatterbox (penalty 1.2) was scoped, and it was ALSO Qwen3-TTS's repetition divergence: even at
+    // 1.05, the compounding moved a greedy decode off the reference at frame 6 (96/624 ids), and once
+    // per id restores 624/624 (Retro-053).
     if (repetition_penalty != 1.0f) {
         const auto width = static_cast<int64_t>(logits.size());
         std::vector<bool> done(static_cast<size_t>(width), false);
