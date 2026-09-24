@@ -569,6 +569,25 @@ int main(int argc, char** argv) {
                               rate_override(extra_inputs), synth_seed);
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "voxcpm2") {
+            // VoxCPM2: text in, a zero-shot voice (or one DESIGNED in the text, "(a calm older man)..."),
+            // audio out. The vocabulary runs the reference's text path, so the printed text is what the
+            // model is asked to say.
+            auto vocab = loom::VoxCpmVocab::load(*model);
+            std::printf("  tokenizer: character BPE with byte fallback (voxcpm2), %zu pieces\n", vocab->size());
+            if (!has_prompt) return 0;
+            size_t fallback = 0;
+            const auto ids = vocab->encode(prompt_text, &fallback);
+            std::printf("  normalized: \"%s\"\n  %zu id(s)\n", vocab->normalize(prompt_text).c_str(), ids.size());
+            if (fallback > 0) {
+                std::printf("  %zu character%s not in this model's table fell back to bytes\n", fallback,
+                            fallback == 1 ? "" : "s");
+            }
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "f5") {
             // F5-TTS: the one TTS family here that takes a reference CLIP as well as text. It clones
             // the voice in that clip by IN-FILLING -- the reference's transcript is prepended to the

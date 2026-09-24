@@ -831,6 +831,16 @@ Outputs op_floor(PrimitiveContext& pc, const Inputs& in, const Json&) {
     return {ggml_floor(pc.ctx, ensure_packed(pc.ctx, in[0]))};
 }
 
+Outputs op_round(PrimitiveContext& pc, const Inputs& in, const Json&) {
+    // VoxCPM2's scalar quantizer (`round(tanh(x) * 9) / 9`). `ggml_round` is C's `roundf` -- a tie goes
+    // AWAY from zero -- where `torch.round` sends it to the even neighbour. They differ only when the
+    // input is exactly `k + 0.5`, and an input within an ulp of that is one whose rounding two correct
+    // implementations already disagree on from f32 noise alone, so the tie rule is not what an oracle
+    // against the reference can see.
+    expect_n_inputs("ROUND", in, 1);
+    return {ggml_round(pc.ctx, ensure_packed(pc.ctx, in[0]))};
+}
+
 Outputs op_glu(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("GLU", in, 1);
     // Sigmoid-gated GLU (Dauphin et al.): out = a * sigmoid(b), where [a, b] = split(x, dim=channels).
@@ -1116,6 +1126,7 @@ LOOM_REGISTER_OP(SIN, op_sin)
 LOOM_REGISTER_OP(COS, op_cos)
 LOOM_REGISTER_OP(INTERPOLATE_1D, op_interpolate_1d)
 LOOM_REGISTER_OP(FLOOR, op_floor)
+LOOM_REGISTER_OP(ROUND, op_round)
 LOOM_REGISTER_OP(GLU, op_glu)
 LOOM_REGISTER_OP(RESHAPE, op_reshape)
 LOOM_REGISTER_OP(REPEAT, op_repeat)
