@@ -278,21 +278,6 @@ release](#packaging--release)
 
 ## Engine — performance
 
-* [ ] **Chatterbox's vocoder noise crosses the Lua boundary: draw it on the ENGINE side instead.** HiFT's
-  NSF source takes a unit Gaussian per harmonic per output SAMPLE (`nsf_noise`, 9 x 480 x n_frames),
-  and the driver fills it with `loom.gaussian_array` -- a Lua table of doubles that is then converted
-  and copied into the tensor. That is ~363k values for 1.7 s of audio and ~2.2M for 10 s, which is
-  the class of cost ADR-031 moved `run_ode`'s own state out of the driver to avoid, and the same
-  "fill the tensor in place" gap the LiteRT item above names for masks. **The shape of the fix:** a
-  way for the driver to ask the engine to fill a declared graph input from its RNG stream -- for
-  example a `{gaussian = n}` / `{uniform = n}` input spec that the binding materialises directly into
-  the backend tensor from `rng_`. It must draw in the SAME order and from the same stream as
-  `loom.gaussian_array`, so that seeded runs stay reproducible and caller-supplied draws (which
-  the gate uses) keep working unchanged. Measure first: the vocoder call against the whole 49 s
-  synthesis, with and without the marshal.
-  *Context: [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md),
-  `loom-exporter/loom_exporter/chatterbox_driver/04_nsf.lua`*
-
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
   four things, and mapping them onto this tree ranks very unevenly — the important structural finding
