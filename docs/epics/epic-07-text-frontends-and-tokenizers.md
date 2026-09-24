@@ -72,10 +72,11 @@ now with SentencePiece's byte fallback) inside the reference's `prepare_text_pro
 `split_into_best_sentences`. It is also the first whose `encode` SEGMENTS. The reference generates
 each sentence chunk of up to 50 tokens separately, and its chunking needs decoded text (a period
 between digits is not a cut; each chunk is prepared again). So the vocabulary returns every chunk's
-ids with `</s>` between them, and the driver splits on it
+ids opened by a header, `<s>` or `</s>`, which also carries the reference's EOS-tail guess for that
+chunk (a word count of its text), and the driver splits on the headers
 ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). The rules are
 data, as ADR-041 requires, including Python's `isdigit` set, and the result is **7000/7000** ids
-identical to the reference over eight input classes. `is_python_space` moved to `unicode.h` so the two
+identical to the reference over eight input classes, and 8000/8000 with the headers. `is_python_space` moved to `unicode.h` so the two
 front ends share it.
 
 **Three loaders now run in order in `transcribe`**, and the order is load-bearing: `BpeVocab::load` and

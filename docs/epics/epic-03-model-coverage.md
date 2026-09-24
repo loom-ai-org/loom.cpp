@@ -889,10 +889,11 @@ driver's LuaJIT has only doubles.
   ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)). The built-in voice
   (`alba`, 126 rows) ships as a 6.2 MB driver weight, and a caller may seed any saved state.
 * **The text front end chunks.** The reference splits text into sentence chunks of at most 50 tokens
-  and generates each from a fresh voice. The vocabulary does that and returns the chunks separated by
-  `</s>` ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). It
-  also made `loom::Vocab` implement SentencePiece's byte fallback, which the writer had been dropping
-  silently. **7000/7000** texts are identical to the reference's whole text path.
+  and generates each from a fresh voice. The vocabulary does that and opens each chunk with a header
+  id that also carries the reference's EOS-tail guess for it
+  ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). It also made
+  `loom::Vocab` implement SentencePiece's byte fallback, which the writer had been dropping silently.
+  **8000/8000** texts are identical to the reference's whole text path, headers included.
 * **Three re-spellings for the trace**, each checked against the module it replaces: interleaved-pair
   RoPE in four dimensions (the reference uses a 5-D view), `in_proj` split into Q/K/V, and Mimi's
   window mask built from a `positions` input as two outer products, because ggml's SUB broadcasts only
@@ -909,9 +910,13 @@ Whisper oracle transcribes both the reference and loom identically, and a three-
 correctly. The engine synthesises 17.4 s of audio in 10.9 s on the 2-core dev box. The gate is
 `tests/gate/test_e2e_pocket_tts_lua_driver.cpp`.
 
-**Not in this export:** cloning a voice from audio (the Mimi encoder, which the released
-voice-cloning weights carry and the other release zeroes), and the other 25 predefined voices, which
-are loadable as `voice_kv` but not shipped.
+**The other 25 voices are voice files** ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)):
+`voices/<name>.gguf`, converted by `loom_exporter.pocket_tts_voices`, stamped with a fingerprint of
+the weights and refused by `loom::load_voice` on any other model; `text2speech.infer(voice="marius")`
+and `loom_cli --voice`. Through a file, `marius` is 8.0e-06 from the reference teacher-forced. Each
+carries its recording's licence, and two are non-commercial. **Not in this export:** cloning a voice
+from audio (the Mimi encoder, which the released voice-cloning weights carry and the other release
+zeroes).
 
 ### Text input
 
@@ -983,7 +988,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

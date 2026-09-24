@@ -75,20 +75,19 @@ release](#packaging--release)
 * [ ] **Pocket-TTS (family 9's fifth leaf) is built, verified and pushed (no PRs), and not yet
   published or gated on the Hub.** Branch `feat/p5-family-9-pocket-tts` in all three repos, stacked on
   Chatterbox's. Verified: the gate is rmse 1.8e-06 teacher-forced and reaches the same EOS frame
-  free-running ([Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md)); the
-  text path is 7000/7000 ids against the reference; the Whisper oracle is exact on the reference's
-  default text and on a three-chunk paragraph. Weights CC-BY-4.0 under Kyutai's use restrictions, and
-  the built-in voice (`alba`) CC-BY-4.0 with attribution. Card entry `pocket-tts` in
-  `build_model_cards.py`; its snippet is the plain text door, so the card gate EXECUTES it. To publish:
-  rc11 (below), a fresh export, and loom-py's model-card gate against it. *Context:
+  free-running ([Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md)), and
+  a voice FILE (`marius`) is 8.0e-06 teacher-forced; the text path is 8000/8000 ids against the
+  reference, EOS-tail headers included; the Whisper oracle is exact on the reference's default text, a
+  three-chunk paragraph and two voice files. Weights CC-BY-4.0 under Kyutai's use restrictions; each
+  voice carries its recording's licence (two NON-COMMERCIAL). Card entry `pocket-tts` in
+  `build_model_cards.py` (the plain text door, executed by the card gate, plus a voice table), and the
+  repo is STAGED at `hf-models/pocket-tts/` with all 26 `voices/*.gguf`
+  ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)). To
+  publish: rc11 (below), a fresh export and fresh voice files (they must carry the export's
+  fingerprint), and loom-py's model-card gate against them. *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md),
   [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)*
-  * [ ] **Only one of Pocket-TTS's 26 voices ships, and picking another has no door.** The driver
-    takes any saved state as `voice_kv` (per layer, K then V), but loom-py cannot turn the reference's
-    `embeddings/<name>.safetensors` into that, and `Text2Speech` has no `voice=` for this model.
-    Shipping all 26 costs ~170 MB at F32 against a 405 MB file, so a door that reads the reference's
-    files is the likelier shape.
   * [ ] **Cloning a voice from a recording** needs the Mimi encoder (in the gated voice-cloning
     weights, zeroed in the other release) as one more phase feeding the text prefill's ordinary
     input. The same voice-cloning door F5-TTS needs.
@@ -446,7 +445,10 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
     ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md); an rc10 engine
     FAILS loudly on it, since the function does not exist) and `loom::PocketTtsVocab` under
     `tokenizer.ggml.model == "pocket_tts"`, with `loom::Vocab`'s SentencePiece byte fallback and
-    loom-py's branch ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)).
+    loom-py's branch ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)),
+    and `loom::load_voice` with loom-py's `voice=` door and its root-only `download()`
+    ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)). An rc10
+    loom-py has no `voice=`, so the card's voice snippet fails loudly there.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-09-03
+last_updated: 2026-09-24
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -39,6 +39,16 @@ Net: **per-task code may live in any layer; per-architecture code only in the ex
 | `include/loom/core/session.h` | topologies registered and caches attached once, owned in an order that cannot dangle |
 | `transcribe.cpp` | reads the declared ASR table; Whisper's spellings survive only as a flagged legacy fallback |
 
+### Voices as files
+
+A model whose voice is data rather than a reference clip can take **voice files**
+([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)): small
+GGUFs whose tensors are driver inputs by name, stamped with a fingerprint of the weights they fit. The
+ENGINE reads them and refuses a mismatch (`loom::load_voice`); the HOSTS resolve a name
+(`loom_cli --voice <file>`; loom-py's `text2speech.infer(voice=...)`, `model.voices`, `model.voice()`,
+looking beside the model file and then in its Hub repo's `voices/`). Pocket-TTS is the first model to
+declare one.
+
 ### Resolution order for anything a model can infer itself
 
 **Optional argument → autodetect from the file → default.** Language is the worked example. Capability
@@ -55,7 +65,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
+| Decisions | [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
