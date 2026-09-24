@@ -6,6 +6,8 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 
+#include <string>
+
 namespace loom {
 
 KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend)
@@ -70,6 +72,17 @@ ggml_tensor* KvCache::read_k(ggml_context* ctx, uint32_t layer, uint32_t n_kv) c
 ggml_tensor* KvCache::read_v(ggml_context* ctx, uint32_t layer, uint32_t n_kv) const {
     ggml_tensor* base = v_layers_.at(layer);
     return ggml_view_2d(ctx, base, n_embd_v_, n_kv, base->nb[1], 0);
+}
+
+void KvCache::set_rows(uint32_t layer, bool value, const float* data, uint32_t first_row, uint32_t n_rows) {
+    if (static_cast<uint64_t>(first_row) + n_rows > kv_size_) {
+        throw Error("KvCache::set_rows: rows [" + std::to_string(first_row) + ", " +
+                    std::to_string(first_row + n_rows) + ") do not fit a cache of " +
+                    std::to_string(kv_size_) + " positions");
+    }
+    ggml_tensor* dst = (value ? v_layers_ : k_layers_).at(layer);
+    ggml_backend_tensor_set(dst, data, static_cast<size_t>(first_row) * dst->nb[1],
+                            static_cast<size_t>(n_rows) * dst->nb[1]);
 }
 
 void KvCache::reset() {

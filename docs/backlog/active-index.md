@@ -20,7 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **Land the review stack, in order: P5.0, then family 9** | Nothing below should start on a branch that stacks on unmerged work. **P5.0** is three open PRs — loom-exporter **#23** (`feat/p5-0-pack-weights-per-phase` → `main`), **#24** (`feat/p5-0-phase-process-isolation` → #23's branch) and loom.cpp **#30** (`feat/p5-0-phase-process-isolation` → `main`). **Family 9** is pushed on `feat/p5-family-9-f5-tts` in all three repos and **has no PRs yet** (its fourth leaf, Chatterbox, is pushed with no PRs on `feat/p5-family-9-chatterbox` on top of it: loom.cpp `271243a`, loom-exporter `36980f4`, loom-py `ced4be1` pinning `vendor/loom.cpp` at `271243a`): the loom.cpp and loom-exporter branches stack on the P5.0 branches above (one commit each on top), and loom-py's is one commit on `main` pinning `vendor/loom.cpp` at `d914b25`. Two things to do before merging it: run loom-py's **model-card gate** against the family-9 build (never run — it proves the 30 shipped models did not regress through the `run_ode` change), and **if loom.cpp's PR is squashed, re-bump loom-py** to the squashed sha before loom-py's PR merges, or its pin names a commit that no longer exists → [Packaging & release](#packaging--release) |
-| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at four of twelve leaves** (Matcha, Supertonic, F5-TTS, and Chatterbox as of 2026-09-24). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). **What to pick next, costed:** the other eight family-9 leaves are mostly the same composition (cosyvoice3 shares Chatterbox's HiFT vocoder and flow lineage but its speech tokenizer and CAMPPlus are ONNX-only; pocket-tts and voxcpm2 predict CONTINUOUS latents per AR step, a loop shape nothing ships); family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
+| **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is at five of twelve leaves** (Matcha, Supertonic, F5-TTS, and Chatterbox and Pocket-TTS as of 2026-09-24). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). **What to pick next, costed:** the other seven family-9 leaves are mostly the same composition (cosyvoice3 shares Chatterbox's HiFT vocoder and flow lineage but its speech tokenizer and CAMPPlus are ONNX-only; voxcpm2 predicts continuous latents per AR step like Pocket-TTS, with a LocDiT where Pocket has a one-step MLP head); family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
 open.** Four packages on PyPI at `1.0.0rc10`, both macOS architectures included; the `linux_armv6l`
@@ -72,6 +72,26 @@ release](#packaging--release)
   (voice encoder + S3 tokenizer + CAMPPlus) and the multilingual and Turbo checkpoints are separate
   leaves. *Context: [Epic-03](../epics/epic-03-model-coverage.md),
   [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)*
+* [ ] **Pocket-TTS (family 9's fifth leaf) is built, verified and pushed (no PRs), and not yet
+  published or gated on the Hub.** Branch `feat/p5-family-9-pocket-tts` in all three repos, stacked on
+  Chatterbox's. Verified: the gate is rmse 1.8e-06 teacher-forced and reaches the same EOS frame
+  free-running ([Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md)); the
+  text path is 7000/7000 ids against the reference; the Whisper oracle is exact on the reference's
+  default text and on a three-chunk paragraph. Weights CC-BY-4.0 under Kyutai's use restrictions, and
+  the built-in voice (`alba`) CC-BY-4.0 with attribution. Card entry `pocket-tts` in
+  `build_model_cards.py`; its snippet is the plain text door, so the card gate EXECUTES it. To publish:
+  rc11 (below), a fresh export, and loom-py's model-card gate against it. *Context:
+  [Epic-03 §2](../epics/epic-03-model-coverage.md),
+  [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md),
+  [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)*
+  * [ ] **Only one of Pocket-TTS's 26 voices ships, and picking another has no door.** The driver
+    takes any saved state as `voice_kv` (per layer, K then V), but loom-py cannot turn the reference's
+    `embeddings/<name>.safetensors` into that, and `Text2Speech` has no `voice=` for this model.
+    Shipping all 26 costs ~170 MB at F32 against a 405 MB file, so a door that reads the reference's
+    files is the likelier shape.
+  * [ ] **Cloning a voice from a recording** needs the Mimi encoder (in the gated voice-cloning
+    weights, zeroed in the other release) as one more phase feeding the text prefill's ordinary
+    input. The same voice-cloning door F5-TTS needs.
 * [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
   voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
@@ -109,10 +129,10 @@ release](#packaging--release)
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **P5 breadth**, in coverage-per-effort order. **Families 4, 5, 6, 10, 11 and 12 are COMPLETE** —
   4 is HuBERT/data2vec-audio/wav2vec 2.0, 5 is SenseVoice-Small and Paraformer-zh, 11 is DAC/SNAC/
-  EnCodec — **family 9 is at four of twelve leaves** (Matcha, Supertonic, F5-TTS 2026-09-18,
-  Chatterbox 2026-09-24), and the remainder is **9/10 (remaining TTS) → 13 (small classifiers) → 14
-  (music)**. The eight leaves left in 9 are mostly compositions whose AR half is family 10's
-  (cosyvoice3, voxcpm2, pocket-tts, …). Chatterbox showed that one composes from the existing
+  EnCodec — **family 9 is at five of twelve leaves** (Matcha, Supertonic, F5-TTS 2026-09-18,
+  Chatterbox and Pocket-TTS 2026-09-24), and the remainder is **9/10 (remaining TTS) → 13 (small
+  classifiers) → 14 (music)**. The seven leaves left in 9 are mostly compositions whose AR half is
+  family 10's (cosyvoice3, voxcpm2, …). Chatterbox showed that one composes from the existing
   templates, so what the next one costs is its own front end and its own loop shape, not a template.
   *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
   [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md) for what family 12
@@ -422,6 +442,11 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
     that sentence on the released rc11 wheel), and `loom::ChatterboxVocab` under
     `tokenizer.ggml.model == "chatterbox"` plus loom-py's branch
     ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)).
+  * [ ] **Pocket-TTS adds two more** (on `feat/p5-family-9-pocket-tts`): `loom.seed_kv`
+    ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md); an rc10 engine
+    FAILS loudly on it, since the function does not exist) and `loom::PocketTtsVocab` under
+    `tokenizer.ggml.model == "pocket_tts"`, with `loom::Vocab`'s SentencePiece byte fallback and
+    loom-py's branch ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)).
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.

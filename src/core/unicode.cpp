@@ -213,6 +213,12 @@ std::vector<char32_t> utf8_decode(const std::string& text) {
     return out;
 }
 
+bool is_python_space(char32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || (cp >= 0x1C && cp <= 0x20) || cp == 0x85 || cp == 0xA0 ||
+           cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 ||
+           cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+
 std::string utf8_encode(const std::vector<char32_t>& codepoints) {
     std::string out;
     out.reserve(codepoints.size());

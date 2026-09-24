@@ -867,10 +867,56 @@ model applied after synthesis, and this build targets local inference and dev ki
 faster model is the point. The model card says so as its first limitation. One voice is built in
 (`conds.pt`, as `driver_weights`); cloning needs the voice encoder, the S3 tokenizer and CAMPPlus.
 
+### Family 9's fifth leaf: a loop that carries continuous latents
+
+Pocket-TTS (`kyutai/pocket-tts`, English `english_2026-09`, CC-BY-4.0, ~110M parameters) is the loop
+shape the hub had costed as the one nothing shipped: **an AR model whose step emits a continuous 32-d
+latent rather than a token.** A 6-layer transformer runs over the previous latent. Its last row feeds
+an EOS head and a one-step flow head (Lagrangian Self Distillation: `x0 + v(c, s=0, t=1, x0)` from one
+Gaussian draw scaled by `sqrt(temperature)`), and the result is both the frame and the next input. Mimi
+decodes the latents: a depthwise ×16 upsample, a 2-layer windowed transformer, and a SEANet. Five
+phases (`text_embed`, `lm`, `step_embed`, `flow_head`, `mimi_decoder`), one GGUF, 405 MB at F32.
+
+**The loop needed no primitive.** It is family 10's KV-cached decoder driven by a hand-written Lua
+loop, with `loom.sample_row` replaced by one `flow_head` call and 32 floats read back. The two
+products the reference does in f32 (`z * std`, `x + v / n`) are inside that graph, because the
+driver's LuaJIT has only doubles.
+
+**What it cost, and again it was not the loop:**
+
+* **The voice is a KV cache**, precomputed by the reference and not recoverable as inputs. It needed
+  the one new binding, `loom.seed_kv`
+  ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)). The built-in voice
+  (`alba`, 126 rows) ships as a 6.2 MB driver weight, and a caller may seed any saved state.
+* **The text front end chunks.** The reference splits text into sentence chunks of at most 50 tokens
+  and generates each from a fresh voice. The vocabulary does that and returns the chunks separated by
+  `</s>` ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). It
+  also made `loom::Vocab` implement SentencePiece's byte fallback, which the writer had been dropping
+  silently. **7000/7000** texts are identical to the reference's whole text path.
+* **Three re-spellings for the trace**, each checked against the module it replaces: interleaved-pair
+  RoPE in four dimensions (the reference uses a 5-D view), `in_proj` split into Q/K/V, and Mimi's
+  window mask built from a `positions` input as two outer products, because ggml's SUB broadcasts only
+  its second operand. The streaming Mimi is ONE call: its convolutions are causal and its attention
+  windowed, and the reference script checks one-shot against streamed at 3.4e-06.
+* **The gate had to change shape** ([Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md)).
+  A latent loop amplifies rounding, so free-running comparison measures the trajectory, not the
+  implementation.
+
+**Verified.** Teacher-forced against the reference with its pinned draws: **max |Δ| 1.5e-04, rmse
+1.8e-06** over 155,520 samples (6.5 s); the sabotage arm (temperature 0.7 for the checkpoint's 0.3)
+gives 0.82. Free-running from the same draws, it reaches the same EOS frame at rmse 9.9e-05. The
+Whisper oracle transcribes both the reference and loom identically, and a three-chunk paragraph
+correctly. The engine synthesises 17.4 s of audio in 10.9 s on the 2-core dev box. The gate is
+`tests/gate/test_e2e_pocket_tts_lua_driver.cpp`.
+
+**Not in this export:** cloning a voice from audio (the Mimi encoder, which the released
+voice-cloning weights carry and the other release zeroes), and the other 25 predefined voices, which
+are loadable as `voice_kv` but not shipped.
+
 ### Text input
 
-**Supertonic, F5-TTS and Chatterbox take text.** Both encode graphemes themselves and both GGUFs carry their own
-character table (Chatterbox's is a character-level BPE). The other four TTS models consume *phoneme* ids produced outside the engine — a real
+**Supertonic, F5-TTS, Chatterbox and Pocket-TTS take text.** Each encodes graphemes itself and each GGUF carries its own
+table (Chatterbox's is a character-level BPE, Pocket-TTS's a SentencePiece Unigram). The other four TTS models consume *phoneme* ids produced outside the engine — a real
 limitation of those checkpoints, addressed by
 [Epic-07](epic-07-text-frontends-and-tokenizers.md) and
 [ADR-012](../adrs/adr-012-permissive-phonemizer.md).
@@ -883,8 +929,8 @@ Ordered by coverage-per-effort. Live items are tracked in
 **Next families:** the remaining TTS families → small classifiers → music. **Six are done** —
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
-leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is at **four of its twelve** leaves since
-Chatterbox landed 2026-09-24 (F5-TTS, on 2026-09-18, is where the "no engine primitive" run ended:
+leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is at **five of its twelve** leaves since
+Pocket-TTS landed 2026-09-24, right after Chatterbox (F5-TTS, on 2026-09-18, is where the "no engine primitive" run ended:
 [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)).
 §2 says what each cost, which is the number the rest of this list should be estimated against.
 Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
@@ -937,7 +983,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

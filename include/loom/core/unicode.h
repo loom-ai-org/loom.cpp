@@ -24,6 +24,12 @@ std::vector<char32_t> utf8_decode(const std::string& text);
 // Encodes codepoints back to UTF-8.
 std::string utf8_encode(const std::vector<char32_t>& codepoints);
 
+// Python's `str.isspace()`, which is what `str.split()` and `str.strip()` use: the Unicode White_Space
+// set plus the four information separators U+001C..U+001F. Written out rather than approximated with a
+// category test, because the front ends that call it (Chatterbox's `punc_norm`, Pocket-TTS's
+// `prepare_text_prompt`) are compared with the reference byte for byte.
+bool is_python_space(char32_t cp);
+
 // True if `cp`'s Unicode general category is a Letter (L*) major category -- `\p{L}`.
 bool is_letter(char32_t cp);
 
