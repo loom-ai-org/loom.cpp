@@ -83,8 +83,8 @@ release](#packaging--release)
   `build_model_cards.py` (the plain text door, executed by the card gate, plus a voice table), and the
   repo is STAGED at `hf-models/pocket-tts/` with all 26 `voices/*.gguf`
   ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)). To
-  publish: rc11 (below), a fresh export and fresh voice files (they must carry the export's
-  fingerprint), and loom-py's model-card gate against them. *Context:
+  publish: rc11 (below), a fresh export, and loom-py's model-card gate against it. The voice files
+  stay valid across re-exports of the same checkpoint (the fingerprint is of its weights). *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md),
   [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)*
