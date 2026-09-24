@@ -382,8 +382,9 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 //
 // **`uncond`/`guidance_scale` are classifier-free guidance**, off when `uncond` is null. See the body.
 //
-// The order is `transformers`' own processor order -- temperature, then top-k, then top-p, then a
-// multinomial draw -- because the reference this is defined against is `generate` under the
+// The order is `transformers`' own processor order -- temperature, then top-k, then min-p, then top-p,
+// then a multinomial draw (min-p ahead of top-p is Chatterbox's `T3.inference` order; `generate`'s own
+// list puts min-p last, and the two agree whenever either is off, which is every caller so far) -- because the reference this is defined against is `generate` under the
 // checkpoint's own `generation_config.json`. Any other order gives a different distribution from the
 // same three numbers.
 //
@@ -395,7 +396,8 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
                            std::uniform_real_distribution<float>& uniform, float temperature,
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
                            ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
-                           float repetition_penalty, const std::vector<int64_t>& penalized) {
+                           float repetition_penalty, const std::vector<int64_t>& penalized,
+                           float min_p) {
     if (!(repetition_penalty > 0.0f)) {
         throw Error(std::string(fname) + ": repetition_penalty is " +
                      std::to_string(repetition_penalty) + "; it is a positive divisor and 1 means "
@@ -408,6 +410,10 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     if (top_k < 0) {
         throw Error(std::string(fname) + ": top_k is " + std::to_string(top_k) + "; it is a count of "
                      "candidates, and 0 means 'do not truncate'");
+    }
+    if (!(min_p >= 0.0f) || min_p > 1.0f) {
+        throw Error(std::string(fname) + ": min_p is " + std::to_string(min_p) + "; it is a fraction "
+                     "of the most likely id's probability in [0, 1], and 0 means 'do not truncate'");
     }
     if (!(top_p > 0.0f) || top_p > 1.0f) {
         throw Error(std::string(fname) + ": top_p is " + std::to_string(top_p) + "; it is a cumulative "
@@ -516,11 +522,22 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // `sample_row` returned, and that is already absolute (`lo` is added back on the way out). Ids
     // outside the window are skipped rather than rejected: a window is a restriction on what may be
     // DRAWN, and a history that predates a narrowing window is not an error.
+    //
+    // **Once per ID, however often it recurs.** `transformers` gathers the score at every history
+    // position and scatters the penalised value back, so an id that appears five times is written five
+    // times with the SAME once-penalised number -- `penalty`, never `penalty^5`. Applying it per
+    // occurrence compounds it: an id drawn k times sits `penalty^k` lower, and a model that wants to
+    // repeat a token the reference repeats is pushed off it. That was this loop until family 9's
+    // Chatterbox (penalty 1.2) was scoped. It is NOT what Qwen3-TTS's open repetition item is: that
+    // repro agrees 624/624 with the reference under either semantics, because 1.05 compounded over its
+    // short history never flips an argmax.
     if (repetition_penalty != 1.0f) {
         const auto width = static_cast<int64_t>(logits.size());
+        std::vector<bool> done(static_cast<size_t>(width), false);
         for (const int64_t id : penalized) {
             const int64_t offset = id - lo;
-            if (offset < 0 || offset >= width) continue;
+            if (offset < 0 || offset >= width || done[static_cast<size_t>(offset)]) continue;
+            done[static_cast<size_t>(offset)] = true;
             float& score = logits[static_cast<size_t>(offset)];
             score = score > 0.0f ? score / repetition_penalty : score * repetition_penalty;
         }
@@ -568,13 +585,27 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
         sum += probs[i];
     }
 
+    // Min-p: drop every candidate whose probability is below `min_p` times the most likely one's,
+    // which is `candidates[0]` because they are sorted -- so the survivors are a PREFIX and `keep` is
+    // its length. `MinPLogitsWarper`'s rule, at the temperature the probabilities were computed at,
+    // and ahead of top-p as `transformers` orders them: top-p's mass is then measured over what min-p
+    // left, which is why `sum` is recomputed over the prefix. At least one candidate always survives.
+    size_t keep = candidates.size();
+    if (min_p > 0.0f) {
+        const float floor_prob = min_p * probs[0];
+        size_t kept = 1;
+        while (kept < probs.size() && probs[kept] >= floor_prob) ++kept;
+        keep = kept;
+        sum = 0.0f;
+        for (size_t i = 0; i < keep; ++i) sum += probs[i];
+    }
+
     // Top-p: the shortest prefix of the descending order whose probability mass reaches `top_p`. At
     // least one candidate always survives -- a threshold below the single most likely token's own
     // probability would otherwise select nothing to draw from.
-    size_t keep = candidates.size();
     if (top_p < 1.0f) {
         float cumulative = 0.0f;
-        for (size_t i = 0; i < probs.size(); ++i) {
+        for (size_t i = 0; i < keep; ++i) {
             cumulative += probs[i] / sum;
             if (cumulative >= top_p) {
                 keep = i + 1;
@@ -1677,6 +1708,7 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         std::string uncond_module;
         float repetition_penalty = 1.0f;
         std::vector<int64_t> penalized;
+        float min_p = 0.0f;
         float guidance_scale = 1.0f;
         int64_t guidance_top_k = 0;
         bool check_uncond_generation = false;
@@ -1692,6 +1724,9 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
             temperature = static_cast<float>(number_field(3, "temperature", 0.0));
             top_k = static_cast<int64_t>(number_field(3, "top_k", 0.0));
             top_p = static_cast<float>(number_field(3, "top_p", 1.0));
+            // `MinPLogitsWarper`'s threshold, relative to the most likely id (Chatterbox's T3 samples
+            // under `min_p = 0.05`). 0 is off, which is what every earlier driver passes by omission.
+            min_p = static_cast<float>(number_field(3, "min_p", 0.0));
             // `hi` defaults to -1, which `read_row_window` reads as "to the end of the row" -- so a
             // caller who names neither gets the whole row, which is what every pre-family-10 driver
             // passes and must keep meaning.
@@ -1762,7 +1797,7 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
             temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k,
-            repetition_penalty, penalized)));
+            repetition_penalty, penalized, min_p)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());

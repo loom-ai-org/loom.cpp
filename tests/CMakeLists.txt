@@ -713,6 +713,22 @@ set_tests_properties(test_f5_vocab PROPERTIES LABELS ci)
 # It reads the CTC fixture too, for the "declines another family's file" arm.
 set_tests_properties(test_f5_vocab PROPERTIES FIXTURES_REQUIRED "f5_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
+add_test(
+    NAME gen_chatterbox_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_chatterbox_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/chatterbox_vocab_test.gguf
+)
+set_tests_properties(gen_chatterbox_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_chatterbox_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP chatterbox_vocab_gguf_fixture)
+
+add_executable(test_chatterbox_vocab ci/test_chatterbox_vocab.cpp)
+target_link_libraries(test_chatterbox_vocab PRIVATE loom::engine)
+target_compile_definitions(test_chatterbox_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_chatterbox_vocab COMMAND test_chatterbox_vocab)
+set_tests_properties(test_chatterbox_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_chatterbox_vocab PROPERTIES FIXTURES_REQUIRED "chatterbox_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
 add_executable(test_ctc_vocab ci/test_ctc_vocab.cpp)
 target_link_libraries(test_ctc_vocab PRIVATE loom::engine)
 target_compile_definitions(test_ctc_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
@@ -1574,6 +1590,11 @@ add_executable(test_e2e_f5_tts_lua_driver gate/test_e2e_f5_tts_lua_driver.cpp)
 target_link_libraries(test_e2e_f5_tts_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_f5_tts_lua_driver COMMAND test_e2e_f5_tts_lua_driver)
 set_tests_properties(test_e2e_f5_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_chatterbox_lua_driver gate/test_e2e_chatterbox_lua_driver.cpp)
+target_link_libraries(test_e2e_chatterbox_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_chatterbox_lua_driver COMMAND test_e2e_chatterbox_lua_driver)
+set_tests_properties(test_e2e_chatterbox_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)

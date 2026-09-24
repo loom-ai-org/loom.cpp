@@ -513,6 +513,28 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "chatterbox") {
+            // Chatterbox: text in, the model's own built-in voice, audio out. The vocabulary runs the
+            // reference's whole text path (`punc_norm`, `[SPACE]`, BPE), so what is printed as
+            // "normalized" is the sentence the model is actually asked to say.
+            auto vocab = loom::ChatterboxVocab::load(*model);
+            std::printf("  tokenizer: character BPE (chatterbox), %zu tokens\n", vocab->size());
+            if (!has_prompt) return 0;
+            size_t unknown = 0;
+            const auto ids = vocab->encode(prompt_text, &unknown);
+            std::printf("  normalized: \"%s\"\n  %zu id(s)\n", vocab->normalize(prompt_text).c_str(),
+                        ids.size());
+            if (unknown > 0) {
+                // The reference's own fallback, and a silent substitution a caller should see
+                // (Retro-006).
+                std::printf("  %zu character%s not in this model's table became [UNK]\n", unknown,
+                            unknown == 1 ? "" : "s");
+            }
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "f5") {
             // F5-TTS: the one TTS family here that takes a reference CLIP as well as text. It clones
             // the voice in that clip by IN-FILLING -- the reference's transcript is prepended to the

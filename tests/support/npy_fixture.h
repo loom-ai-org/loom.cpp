@@ -9,7 +9,8 @@
 // too rather than a raw dump, so `numpy.load` opens them and the shape travels with the data.
 //
 // Deliberately minimal: 1-D float32, little-endian, C-order, version 1.0 -- which is all any fixture
-// here needs, and all `write_npy_f32` emits.
+// here needs, and all `write_npy_f32` emits. A Fortran-order file fails a check rather than being read
+// transposed.
 
 #include "test_util.h"
 
@@ -33,6 +34,13 @@ inline std::vector<float> read_npy_f32(const std::string& path, std::vector<int6
     f.read(reinterpret_cast<char*>(&header_len), 2);
     std::string header(header_len, '\0');
     f.read(header.data(), header_len);
+    // **A Fortran-ordered file is refused, not flattened.** Reading its bytes as C-order hands back a
+    // TRANSPOSED array of the right length and the right shape, which no size check catches: family 9's
+    // Chatterbox gate read its frame-major noise channel-major that way and graded a waveform 1.17 off
+    // against a reference it matched to 2.5e-05. `np.save` writes one whenever the array is a
+    // transposed view -- `astype` keeps the layout -- so the fix belongs in the generator
+    // (`np.ascontiguousarray`), and this check is what makes forgetting it loud.
+    LOOM_CHECK(header.find("'fortran_order': True") == std::string::npos);
     const size_t shape_pos = header.find("'shape':");
     const size_t paren_open = header.find('(', shape_pos);
     const size_t paren_close = header.find(')', paren_open);
