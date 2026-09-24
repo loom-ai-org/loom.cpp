@@ -2,7 +2,8 @@
 // tests/fixtures/make_pocket_tts_vocab_gguf.py.
 //
 // **The measured claim is that `encode` IS the reference's text path** -- `split_into_best_sentences`,
-// then `prepare_text_prompt` and the tokenizer per chunk, chunks joined by `</s>` -- and that
+// then `prepare_text_prompt` and the tokenizer per chunk, each chunk opened by the header that carries
+// the reference's tail guess for it (`<s>` short, `</s>` long) -- and that
 // comparison lives where the reference can run: against the real `tokenizer.model`, 7000/7000 texts
 // over eight input classes (prose, unterminated and lower-case, decimals, long multi-sentence, long
 // comma-joined, whitespace edges, byte-fallback characters, punctuation soup), and a sabotaged
@@ -24,7 +25,7 @@ using Strings = std::vector<std::string>;
 namespace {
 
 // The fixture's ids: 0-2 specials, 3-258 the byte pieces, then its words in order.
-constexpr int32_t kSep = 2, kSpace = 259, kHi = 260, khi = 261, kthe = 262, kThe = 263, kDot = 264,
+constexpr int32_t kShort = 1, kLong = 2, kSpace = 259, kHi = 260, khi = 261, kthe = 262, kThe = 263, kDot = 264,
                   kComma = 265, kBang = 266, kA = 267, kb = 268, kSSa = 269, k1 = 270, k2 = 271;
 constexpr int32_t byte_id(int b) { return 3 + b; }
 
@@ -47,12 +48,13 @@ int main() {
     auto vocab = loom::PocketTtsVocab::load(*model);
     LOOM_CHECK(vocab != nullptr);
     LOOM_CHECK(vocab->size() == 273);
-    LOOM_CHECK(vocab->chunk_separator() == kSep);
+    LOOM_CHECK(vocab->chunk_header(4) == kShort && vocab->chunk_header(5) == kLong);
+    LOOM_CHECK(vocab->is_chunk_header(kShort) && vocab->is_chunk_header(kLong) && !vocab->is_chunk_header(kHi));
 
     // --- prepare_text_prompt ---
     // Strip, capitalise by the file's table, add the full stop.
     LOOM_CHECK(vocab->prepare("  hi the  ") == "Hi the.");
-    LOOM_CHECK((vocab->encode("  hi the  ") == Ids{kHi, kthe, kDot}));
+    LOOM_CHECK((vocab->encode("  hi the  ") == Ids{kShort, kHi, kthe, kDot}));
     // Newlines become spaces before anything else looks at the text.
     LOOM_CHECK(vocab->prepare("hi,\nthe") == "Hi, the.");
     // A trailing weak mark is REPLACED by the full stop, and a closer after it is kept after the stop.
@@ -65,11 +67,11 @@ int main() {
     // -- the whole text, then each chunk -- so `encode` collapses three to one, and it takes five for
     // a pair to survive and reach SentencePiece as `▁`, `▁b`.
     LOOM_CHECK(vocab->prepare("A   b") == "A  b.");
-    LOOM_CHECK((vocab->encode("A   b") == Ids{kA, kb, kDot}));
-    LOOM_CHECK((vocab->encode("A     b") == Ids{kA, kSpace, kb, kDot}));
+    LOOM_CHECK((vocab->encode("A   b") == Ids{kShort, kA, kb, kDot}));
+    LOOM_CHECK((vocab->encode("A     b") == Ids{kShort, kA, kSpace, kb, kDot}));
     // The case table is Python's full mapping: `ß` upper-cases to two codepoints.
     LOOM_CHECK(vocab->prepare("\xc3\x9f" "a") == "SSa.");
-    LOOM_CHECK((vocab->encode("\xc3\x9f" "a") == Ids{kSSa, kDot}));
+    LOOM_CHECK((vocab->encode("\xc3\x9f" "a") == Ids{kShort, kSSa, kDot}));
     // A digit has no upper case and is left alone.
     LOOM_CHECK(vocab->prepare("1 hi") == "1 hi.");
     // Empty after stripping raises, as the reference does.
@@ -78,31 +80,48 @@ int main() {
     // --- byte fallback ---
     // `é` has no piece: its two UTF-8 bytes' pieces, and decode re-forms it.
     const Ids with_byte{kHi, kSpace, byte_id(0xC3), byte_id(0xA9), kDot};
-    LOOM_CHECK(vocab->encode("Hi \xc3\xa9") == with_byte);
+    Ids headed{kShort};
+    headed.insert(headed.end(), with_byte.begin(), with_byte.end());
+    LOOM_CHECK(vocab->encode("Hi \xc3\xa9") == headed);
     LOOM_CHECK(vocab->decode(with_byte) == "Hi \xc3\xa9.");
 
     // --- split_into_best_sentences, budget 4 ---
     // Two 3-token sentences exceed the budget together: two chunks, and the SECOND is prepared on its
     // own, so its first letter is capitalised.
     LOOM_CHECK((vocab->chunks("hi the. the the!") == Strings{"Hi the.", "the the!"}));
-    LOOM_CHECK((vocab->encode("hi the. the the!") == Ids{kHi, kthe, kDot, kSep, kThe, kthe, kBang}));
-    // Two that fit are grouped into one chunk, with no separator.
-    LOOM_CHECK((vocab->encode("hi. hi.") == Ids{kHi, kDot, khi, kDot}));
+    LOOM_CHECK((vocab->encode("hi the. the the!") ==
+                Ids{kShort, kHi, kthe, kDot, kShort, kThe, kthe, kBang}));
+    // Two that fit are grouped into one chunk, under one header.
+    LOOM_CHECK((vocab->encode("hi. hi.") == Ids{kShort, kHi, kDot, khi, kDot}));
     // A period between two digits is not a sentence end -- judged on the DECODED text -- so "1.2"
     // stays in its sentence; that sentence is over budget, has no comma to cut on, and is kept whole.
     LOOM_CHECK((vocab->chunks("hi 1.2 the. the") == Strings{"Hi 1.2 the.", "the."}));
     LOOM_CHECK((vocab->encode("hi 1.2 the. the") ==
-                Ids{kHi, k1, kDot, k2, kthe, kDot, kSep, kThe, kDot}));
+                Ids{kShort, kHi, k1, kDot, k2, kthe, kDot, kShort, kThe, kDot}));
     // ...and a digit on one side only is: "1." then "the" cuts.
-    LOOM_CHECK((vocab->encode("hi 1. the") == Ids{kHi, k1, kDot, kSep, kThe, kDot}));
+    LOOM_CHECK((vocab->encode("hi 1. the") == Ids{kShort, kHi, k1, kDot, kShort, kThe, kDot}));
     // An over-budget sentence WITH commas is cut on them; each part's trailing comma becomes the
     // full stop when the part is prepared as its own chunk.
     LOOM_CHECK((vocab->chunks("hi the, the the, hi") == Strings{"Hi the,", "the the,", "hi."}));
     LOOM_CHECK((vocab->encode("hi the, the the, hi") ==
-                Ids{kHi, kthe, kDot, kSep, kThe, kthe, kDot, kSep, kHi, kDot}));
+                Ids{kShort, kHi, kthe, kDot, kShort, kThe, kthe, kDot, kShort, kHi, kDot}));
 
-    // --- decode drops the separators ---
-    LOOM_CHECK(vocab->decode({kHi, kthe, kDot, kSep, kThe, kthe, kBang}) == "Hi the. The the!");
+    // --- the header carries `prepare_text_prompt`'s tail guess ---
+    // Five words is over the four the short guess allows: the LONG header, on a chunk kept whole
+    // because it has no comma to cut on.
+    LOOM_CHECK((vocab->encode("hi the the the the") == Ids{kLong, kHi, kthe, kthe, kthe, kthe, kDot}));
+    // Counted as `str.split()` counts, so words separated by TABS are five words too, though no id
+    // opens with `▁` -- the case the driver's own count from ids got wrong, and why the count is here.
+    size_t n_words = 0;
+    vocab->prepare("hi\tthe\tthe\tthe\tthe", &n_words);
+    LOOM_CHECK(n_words == 5);
+    LOOM_CHECK(vocab->encode("hi\tthe\tthe\tthe\tthe").front() == kLong);
+    vocab->prepare("hi\tthe\tthe\tthe", &n_words);
+    LOOM_CHECK(n_words == 4);
+    LOOM_CHECK(vocab->encode("hi\tthe\tthe\tthe").front() == kShort);
+
+    // --- decode drops the headers ---
+    LOOM_CHECK(vocab->decode({kShort, kHi, kthe, kDot, kLong, kThe, kthe, kBang}) == "Hi the. The the!");
 
     // --- the tag is the dispatch ---
     // Another family's file is declined, and the plain SentencePiece loader refuses this tag rather

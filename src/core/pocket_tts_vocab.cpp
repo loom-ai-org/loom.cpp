@@ -100,10 +100,21 @@ std::unique_ptr<PocketTtsVocab> PocketTtsVocab::load(const GgufModel& model) {
         throw LoadError("PocketTtsVocab::load: " + kPrefix + "max_tokens_per_chunk is missing or not positive");
     }
     v->max_tokens_per_chunk_ = static_cast<size_t>(max_tokens);
-    v->separator_ = model.kv_i32(kPrefix + "chunk_separator", -1);
-    if (v->separator_ < 0 || static_cast<size_t>(v->separator_) >= v->vocab_->size()) {
-        throw LoadError("PocketTtsVocab::load: " + kPrefix + "chunk_separator is missing or not an id");
+    for (const auto& [key, dst] : {std::pair<const char*, int32_t*>{"chunk_header_short", &v->header_short_},
+                                   std::pair<const char*, int32_t*>{"chunk_header_long", &v->header_long_}}) {
+        *dst = model.kv_i32(kPrefix + key, -1);
+        if (*dst < 0 || static_cast<size_t>(*dst) >= v->vocab_->size()) {
+            throw LoadError("PocketTtsVocab::load: " + kPrefix + key + " is missing or not an id");
+        }
     }
+    if (v->header_short_ == v->header_long_) {
+        throw LoadError("PocketTtsVocab::load: the two chunk headers are one id, so they say nothing");
+    }
+    const int32_t max_words = model.kv_i32(kPrefix + "short_chunk_max_words", -1);
+    if (max_words < 0) {
+        throw LoadError("PocketTtsVocab::load: " + kPrefix + "short_chunk_max_words is missing");
+    }
+    v->short_chunk_max_words_ = static_cast<size_t>(max_words);
     v->capitalize_first_letter_ = model.kv_bool(kPrefix + "capitalize_first_letter", true);
     v->append_terminal_punctuation_ = model.kv_bool(kPrefix + "append_terminal_punctuation", true);
     return v;
@@ -128,12 +139,22 @@ std::string PocketTtsVocab::terminate(const std::string& text) const {
     return text + full_stop_;
 }
 
-std::string PocketTtsVocab::prepare(const std::string& text) const {
+std::string PocketTtsVocab::prepare(const std::string& text, size_t* n_words) const {
     std::string out = python_strip(text);
     if (out.empty()) {
         throw Error("PocketTtsVocab: the text is empty (the reference raises 'Text prompt cannot be empty')");
     }
     for (size_t i = 0; i < replace_from_.size(); ++i) replace_all(out, replace_from_[i], replace_to_[i]);
+    if (n_words != nullptr) {
+        // `len(text.split())`: runs of non-whitespace, whitespace being Python's.
+        *n_words = 0;
+        bool in_word = false;
+        for (char32_t cp : utf8_decode(out)) {
+            const bool space = is_python_space(cp);
+            if (!space && !in_word) ++*n_words;
+            in_word = !space;
+        }
+    }
     if (capitalize_first_letter_) {
         // `text[0].upper() + text[1:]` unless `text[0].isupper()`; the table holds exactly the
         // codepoints for which that changes anything.
@@ -234,8 +255,9 @@ std::vector<std::string> PocketTtsVocab::chunks(const std::string& text) const {
 std::vector<int32_t> PocketTtsVocab::encode(const std::string& text) const {
     std::vector<int32_t> out;
     for (const std::string& chunk : chunks(text)) {
-        if (!out.empty()) out.push_back(separator_);
-        const std::vector<int32_t> ids = vocab_->encode(prepare(chunk));
+        size_t n_words = 0;
+        const std::vector<int32_t> ids = vocab_->encode(prepare(chunk, &n_words));
+        out.push_back(chunk_header(n_words));
         out.insert(out.end(), ids.begin(), ids.end());
     }
     return out;
@@ -245,7 +267,7 @@ std::string PocketTtsVocab::decode(const std::vector<int32_t>& ids) const {
     std::vector<int32_t> kept;
     kept.reserve(ids.size());
     for (int32_t id : ids) {
-        if (id != separator_) kept.push_back(id);
+        if (!is_chunk_header(id)) kept.push_back(id);
     }
     return vocab_->decode(kept);
 }

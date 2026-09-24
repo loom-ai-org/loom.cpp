@@ -8,7 +8,10 @@ is 50 -- so each head's output is one known seeded V row, to within exp(-50). Th
 distinct, so a row, head, layer or K/V swap in the seeding shows up as a wrong number rather than as a
 plausible one.
 
-The seed itself also ships as a weight (`seed.kv`), the form Pocket-TTS's built-in voice takes.
+The seed itself also ships as a weight (`seed.kv`), the form Pocket-TTS's built-in voice takes. And
+beside the model, for tests/ci/test_voice_file.cpp, VOICE FILES (ADR-045) for it: `seed_kv_voice.gguf`
+holds the same state with every V shifted by 2000 under the input name `kv`, and three that must be
+refused -- made for other weights, for another architecture, and stored at F16.
 
 Requires: pip install gguf numpy
 """
@@ -20,6 +23,7 @@ import numpy as np
 from gguf import GGUFWriter
 
 N_LAYER, N_HEAD, HEAD_DIM, KV_SIZE, N_SEED = 2, 2, 2, 8, 3
+COMPAT = "5eedc0de" * 4
 N_EMBD = N_HEAD * HEAD_DIM
 
 # (layer, head) -> the seeded row whose K is hot. Different rows per head and per layer.
@@ -72,6 +76,8 @@ def main() -> None:
     w.add_uint32("loom.n_embd_head_k", HEAD_DIM)
     w.add_uint32("loom.n_embd_head_v", HEAD_DIM)
     w.add_uint32("loom.kv_cache_size", KV_SIZE)
+    # What a voice file must match to be loaded into this model.
+    w.add_string("loom.voice.compat", COMPAT)
 
     attn = {
         "version": 1,
@@ -99,6 +105,29 @@ def main() -> None:
     w.add_string("model.graph_topology.plain", json.dumps(plain))
     w.add_string("model.driver_script", DRIVER)
     w.add_tensor("seed.kv", seed_values())
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    shifted = seed_values().reshape(N_LAYER, 2, -1).copy()
+    shifted[:, 1] += 2000.0
+    shifted = shifted.reshape(-1)
+    for suffix, arch, compat, values in (
+            ("", "seed_kv_test", COMPAT, shifted),
+            ("_other_weights", "seed_kv_test", "0" * 32, shifted),
+            ("_other_arch", "another_model", COMPAT, shifted),
+            ("_f16", "seed_kv_test", COMPAT, shifted.astype(np.float16))):
+        write_voice(out_path.parent / f"seed_kv_voice{suffix}.gguf", arch, compat, values)
+
+
+def write_voice(path: Path, arch: str, compat: str, values: np.ndarray) -> None:
+    w = GGUFWriter(str(path), "loom-voice")
+    w.add_string("loom.voice.architecture", arch)
+    w.add_string("loom.voice.compat", compat)
+    w.add_string("loom.voice.name", "shifted")
+    w.add_string("loom.voice.license", "CC0-1.0")
+    w.add_tensor("kv", values)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()

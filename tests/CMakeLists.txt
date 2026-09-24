@@ -1577,6 +1577,13 @@ target_compile_definitions(test_seed_kv PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FI
 add_test(NAME test_seed_kv COMMAND test_seed_kv)
 set_tests_properties(test_seed_kv PROPERTIES LABELS ci)
 set_tests_properties(test_seed_kv PROPERTIES FIXTURES_REQUIRED seed_kv_gguf_fixture)
+add_executable(test_voice_file ci/test_voice_file.cpp)
+target_link_libraries(test_voice_file PRIVATE loom::engine)
+target_compile_definitions(test_voice_file PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_voice_file COMMAND test_voice_file)
+set_tests_properties(test_voice_file PROPERTIES LABELS ci)
+# It reads cfg_streams.gguf too, for the "a model with no fingerprint takes no voice" arm.
+set_tests_properties(test_voice_file PROPERTIES FIXTURES_REQUIRED "seed_kv_gguf_fixture;cfg_streams_gguf_fixture")
 
 add_test(NAME gen_cfg_streams_gguf_fixture
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_cfg_streams_gguf.py

@@ -45,6 +45,7 @@ add_library(loom_engine
     src/core/f5_vocab.cpp
     src/core/chatterbox_vocab.cpp
     src/core/pocket_tts_vocab.cpp
+    src/core/voice_file.cpp
     src/core/phoneme_vocab.cpp
     src/core/supertonic_text_vectorizer.cpp
     src/core/ctc_decode.cpp
