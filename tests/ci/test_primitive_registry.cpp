@@ -1748,6 +1748,24 @@ void test_floor() {
     LOOM_CHECK((get_f32(out) == std::vector<float>{1.0f, -2.0f, 2.0f, 0.0f, -1.0f}));
 }
 
+void test_round() {
+    // `roundf`: ties away from zero (2.5 -> 3, -2.5 -> -3), which is where it parts from `torch.round`;
+    // op_round says why that cannot be seen against the reference.
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_F32, 6);
+    ggml_set_input(a);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("ROUND")(pc, {a}, {})[0];
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(a, {1.4f, -1.6f, 2.5f, -2.5f, 0.0f, 8.49f});
+    s.compute(gf);
+
+    LOOM_CHECK((get_f32(out) == std::vector<float>{1.0f, -2.0f, 3.0f, -3.0f, 0.0f, 8.0f}));
+}
+
 void test_sum_rows() {
     GgmlScratch s;
     // ne=[3,2]: row0=[1,2,3], row1=[4,5,6] (ggml "rows" are along ne[0]).
@@ -2945,6 +2963,7 @@ int main() {
     test_atan2();
     test_exp();
     test_floor();
+    test_round();
     test_sum_rows();
     test_pad_1d();
     test_pad_1d_reflect();

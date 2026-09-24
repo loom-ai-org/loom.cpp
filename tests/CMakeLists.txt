@@ -745,6 +745,21 @@ set_tests_properties(test_pocket_tts_vocab PROPERTIES LABELS ci)
 # It reads the CTC fixture too, for the "declines another family's file" arm.
 set_tests_properties(test_pocket_tts_vocab PROPERTIES FIXTURES_REQUIRED "pocket_tts_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
+add_test(
+    NAME gen_voxcpm_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_voxcpm_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/voxcpm_vocab_test.gguf
+)
+set_tests_properties(gen_voxcpm_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_voxcpm_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP voxcpm_vocab_gguf_fixture)
+
+add_executable(test_voxcpm_vocab ci/test_voxcpm_vocab.cpp)
+target_link_libraries(test_voxcpm_vocab PRIVATE loom::engine)
+target_compile_definitions(test_voxcpm_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_voxcpm_vocab COMMAND test_voxcpm_vocab)
+set_tests_properties(test_voxcpm_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_voxcpm_vocab PROPERTIES FIXTURES_REQUIRED "voxcpm_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
 add_executable(test_ctc_vocab ci/test_ctc_vocab.cpp)
 target_link_libraries(test_ctc_vocab PRIVATE loom::engine)
 target_compile_definitions(test_ctc_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
@@ -1638,6 +1653,11 @@ add_executable(test_e2e_pocket_tts_lua_driver gate/test_e2e_pocket_tts_lua_drive
 target_link_libraries(test_e2e_pocket_tts_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_pocket_tts_lua_driver COMMAND test_e2e_pocket_tts_lua_driver)
 set_tests_properties(test_e2e_pocket_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_voxcpm2_lua_driver gate/test_e2e_voxcpm2_lua_driver.cpp)
+target_link_libraries(test_e2e_voxcpm2_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_voxcpm2_lua_driver COMMAND test_e2e_voxcpm2_lua_driver)
+set_tests_properties(test_e2e_voxcpm2_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)
