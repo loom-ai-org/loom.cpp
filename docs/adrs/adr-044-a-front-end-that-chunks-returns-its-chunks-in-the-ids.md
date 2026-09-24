@@ -29,14 +29,20 @@ the stack has to do the chunking.
 * **The host chunks and calls the driver once per chunk.** Rejected. Every host (loom-py,
   `loom_cli`, the C API) would reimplement it, and `Text2Speech.infer(text)` would stop being a
   single call.
-* **The vocabulary chunks and returns every chunk's ids with a separator between them.** Chosen.
+* **The vocabulary chunks and returns every chunk's ids, each marked in the stream.** Chosen.
 
 ## Decision
 
 `loom::PocketTtsVocab::encode` runs the reference's whole text path and returns each chunk's
-prepared ids, with the file's `chunk_separator` between consecutive chunks. That id is `</s>`, which
-no encode ever produces, since control pieces are not matchable. The driver splits on the separator
-and runs the voice seed, prefill, latent loop and Mimi per chunk. Then it concatenates the audio.
+prepared ids, each chunk OPENED by a header id: `<s>` when `prepare_text_prompt`'s tail guess for it
+is the short one (at most four words: 3 frames after EOS), `</s>` otherwise (1 frame). Neither is ever
+produced by an encode, since control pieces are not matchable. The driver splits on the headers and
+runs the voice seed, prefill, latent loop and Mimi per chunk, with the tail its header names. Then it
+concatenates the audio.
+
+*Amended the same day.* The first version put a single `</s>` BETWEEN chunks and left the tail to the
+driver, counted off the ids. That missed chunks whose words are separated by tabs or NBSP (47 of 9452
+generated chunks), because the guess is `len(text.split())` of TEXT. The header carries it instead.
 `chunks(text)` and `prepare(text)` are exposed so a host can show what each generation will say.
 
 Every constant the path reads ships as data under `tokenizer.ggml.pocket_tts.*`
@@ -46,18 +52,16 @@ clause-end ids, and the budget.
 
 ## Consequences
 
-* **Exact against the reference.** `split_into_best_sentences` → `prepare_text_prompt` → tokenize,
-  per chunk, joined with `</s>`, over 7000 generated texts in eight classes (two seeds). Every one is
-  identical. A reference sabotaged to skip the per-chunk prepare differs on 743 of 3000. Getting there
+* **Exact against the reference, tail included.** `split_into_best_sentences` → `prepare_text_prompt`
+  → tokenize, per chunk, each opened by the header of the reference's own tail guess, over 8000
+  generated texts in eight classes (two seeds). Every one is identical. A reference sabotaged to skip
+  the per-chunk prepare differs on 1894 of 3000. Getting there
   also meant teaching `loom::Vocab` SentencePiece's byte fallback, which the writer had been dropping
   silently.
-* **A host that tokenizes elsewhere still works.** Plain SentencePiece ids carry no separator, and
-  the driver runs them as one chunk.
-* **One quantity stays approximate.** `prepare_text_prompt` also returns a tail length: 3 frames
-  after EOS for a chunk of at most four words, else 1. There is no channel for it in the ids, so the
-  driver counts words off the ids (a piece opening with `▁`). It agrees on 9405 of 9452 generated
-  chunks. The misses are chunks of about four words separated by tabs or NBSP, which Python's
-  `split()` counts and SentencePiece does not mark, and they cost two frames (0.16 s) of tail.
+* **A host that tokenizes elsewhere still works.** Plain SentencePiece ids carry no header, and the
+  driver runs them as one chunk, counting its words off the ids (a piece opening with `▁`). That
+  fallback alone is approximate: exact for ASCII spaces, and it misses words separated by a tab or an
+  NBSP, at a cost of two frames (0.16 s) of tail.
 * The pattern for the next front end that segments: the segmentation belongs where the text is.
 
 ## Related
