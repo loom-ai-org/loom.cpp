@@ -820,6 +820,12 @@ this family has.
 * free runs through the codec GGUF: Whisper reads **9/9** words in English and in French at two seeds
   each (`scripts/moss_tts_oracle.py`).
 
+**The pair's composition gate** is `tests/gate/test_e2e_moss_tts_composition.cpp`, Dia+DAC's shape
+plus the width gap. It checks greedy codes at 12 and 24 frames and a pinned-sampled run at 24 frames,
+all exact against `scripts/moss_tts_reference.py`. Each greedy clip is padded to the codec's 32
+codebooks with its absent id, as a host does, and the waveform is checked against the reference
+codec's `num_quantizers=12` decode. The two lengths' float counts must differ by `hop × channels × 12`.
+
 At F32 the workstation generates about 3 frames/s (12.5 frames/s is real time). On the 2-core dev box
 it is slower still; a Q8_0 build would be the one to use there.
 
