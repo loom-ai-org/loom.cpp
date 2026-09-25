@@ -119,9 +119,6 @@ release](#packaging--release)
   export, a card entry in `build_model_cards.py` and loom-py's card gate. *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)*
-  * [ ] **The default voice's licence.** It is computed from `asset/zero_shot_prompt.wav` in the
-    Apache-2.0 GitHub checkout, whose README says some examples are "sourced from the internet". The
-    card must say where the voice came from; whether to ship it as the default is a decision.
   * [ ] **Voice files and cloning.** The four voice arrays are ordinary driver inputs, so a
     `cosyvoice3_voices.py` that runs the ONNX S3 tokenizer + CAMPPlus in Python and writes a voice
     file ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md))
