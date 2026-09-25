@@ -988,7 +988,10 @@ and every step are one graph.
   checkout's `zero_shot_prompt.wav` and ships prompt text, prompt tokens, prompt mel and embedding as
   driver weights, so neither ONNX model reaches the engine. Pocket-TTS's arrangement
   ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)), and the
-  door to cloning: a voice file is the same four arrays.
+  door to cloning: a voice file is the same four arrays. **Shipped as the default voice, decided 2026-09-25**
+  by the author: the clip is in the Apache-2.0 CosyVoice repository, whose README also says some
+  examples are "sourced from the internet", so the model card names the clip and its repository rather
+  than claiming a licence for the recording itself.
 * **The F0 predictor runs at f32; the reference runs it at f64** ("precision is crucial"). The sine
   source integrates F0 into its phase, so the vocoder sits ~2x above its own f32/f64 floor. In torch
   the same wrapper with an f64 F0 lands on the floor, which is how the excess was attributed.
