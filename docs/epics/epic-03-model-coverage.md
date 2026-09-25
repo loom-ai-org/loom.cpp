@@ -1147,6 +1147,13 @@ F5-TTS is no longer deferred: it shipped 2026-09-18 as family 9's third leaf. Th
 deferred under — "likely sharing primitives with Matcha" — held for the ODE and not for the sampler
 around it; see §2.
 
+**Requested, unscoped (2026-09-25):** Canary, Citrinet, Cohere ASR, Moonshine (tiny and small),
+Nemotron ASR, Silero VAD, Voxtral Mini realtime, Kitten TTS and Soprano TTS. Most of the ASR names
+look like existing templates — three NVIDIA checkpoints for the NeMo encoder template, Moonshine as an
+encoder-decoder — which is the kind of estimate families 4 and 5 corrected, so each is scoped against
+its checkpoint before it is costed. Silero VAD would be the zoo's first VAD and the first family-13
+classifier. The backlog has one line each with what to check first.
+
 **The constraint that decides what is exportable at all** is not the template — it is peak memory
 during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*, and P5.0
 is closed as of 2026-09-17 with all three changes in

@@ -189,6 +189,23 @@ release](#packaging--release)
   [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) for where families 4 and 5
   found the cost instead. Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id
   handling for free.*
+* [ ] **Requested for the zoo, unscoped** (added 2026-09-25 at the user's request, no order among
+  them yet). None has been checked against its checkpoint; the template guesses are where scoping
+  starts, not what it will find.
+  * [ ] **Canary** (NVIDIA, ASR + translation) — FastConformer encoder with a transformer decoder:
+    the NeMo encoder template feeding a Whisper-shaped decode loop.
+  * [ ] **Citrinet** (NVIDIA, ASR) — convolutional CTC; likely the NeMo template with a CTC head.
+  * [ ] **Cohere ASR** — architecture and licence not yet looked at.
+  * [ ] **Moonshine tiny and small** (Useful Sensors, ASR) — encoder-decoder over the raw waveform.
+  * [ ] **Nemotron ASR** (NVIDIA) — expected NeMo-shaped; which checkpoint and head is to be decided.
+  * [ ] **Silero VAD** — the zoo's first VAD; a family-13-sized classifier with a recurrent layer.
+    Check whether a torch module exists or only JIT/ONNX releases do.
+  * [ ] **Voxtral Mini realtime** (Mistral, streaming ASR) — check its size first against the machine
+    floor that blocks Voxtral-Mini-3B (below).
+  * [ ] **Kitten TTS** — check whether torch weights exist or only an ONNX release does; the
+    exporter's path is MIL from torch.
+  * [ ] **Soprano TTS** — architecture and licence not yet looked at.
+  *Context: [Epic-03 §3](../epics/epic-03-model-coverage.md#3-roadmap)*
 * [ ] **`flan-t5-small`'s vocabulary is 32,100 pieces against a 32,128-wide logit row.** T5 pads its
   embedding to a multiple of 128, so an argmax could in principle name an id with no piece — untrained
   rows, never observed in practice, and the model is shipped and verified without a bound on it. Worth
