@@ -25,4 +25,10 @@ std::vector<float> load_wav_pcm16_mono_16k(const std::string& path);
 // says so. Throws std::runtime_error if the file cannot be written.
 void write_wav_pcm16_mono(const std::string& path, const std::vector<float>& samples, uint32_t rate);
 
+// The same for `channels` INTERLEAVED channels -- `samples` is `L R L R ...` for stereo, which is the
+// order a WAV's data chunk stores them in, so they are written as they come. `channels == 1` is
+// exactly `write_wav_pcm16_mono`.
+void write_wav_pcm16(const std::string& path, const std::vector<float>& samples, uint32_t rate,
+                     uint32_t channels);
+
 } // namespace loom_cli

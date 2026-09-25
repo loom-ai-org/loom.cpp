@@ -58,6 +58,7 @@ ModelContract ModelContract::read(const GgufModel& model) {
     // Pre-existing keys, read under their own names -- renaming a declared key costs a re-export of
     // every model and buys nothing.
     c.sample_rate = opt_u32(model, "sample_rate");
+    c.channels = std::max<uint32_t>(opt_u32(model, "channels"), 1);
     c.clip_samples = opt_u32(model, "n_samples");
     c.max_input_tokens = opt_u32(model, "txt_len");
 

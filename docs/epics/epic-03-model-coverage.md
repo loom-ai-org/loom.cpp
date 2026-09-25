@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-24
+last_updated: 2026-09-25
 ---
 
 # Epic-03: Model Coverage
@@ -51,6 +51,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
+| **Audio codec + blocked attention, stereo** | MOSS-Audio-Tokenizer-v2 | `moss_audio_tokenizer_export.py` |
 | **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base | `dia_export.py`, `qwen3_tts_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
@@ -276,6 +277,45 @@ Verified against the package's own decode on real speech, both sides given the s
 checks the stochastic half needs: a different draw moves the waveform (8.4% relative RMS, so the noise
 is load-bearing), two runs at the default seed are bit-identical, and a named seed differs from the
 default.
+
+#### The fifth leaf was MOSS-Audio-Tokenizer-v2: no convolutions, stereo, and a window no chunk can cover (2026-09-25)
+
+MOSS-Audio-Tokenizer-v2 (`OpenMOSS-Team/MOSS-Audio-Tokenizer-v2`, Apache-2.0) is the codec MOSS-TTS
+emits codes for, and it is the first member of this family with **no convolution at all**. Its 32
+residual-LFQ codebooks at 12.5 Hz go through six causal transformer stacks: 32 layers at 12.5 Hz, then
+five 12-layer stacks, each at twice the previous rate, up to 400 Hz. Patch reshapes join the stacks,
+and each stack attends inside a window: 125 frames at 12.5 Hz, and 400 positions from the 50 Hz stack
+up. The output is **48 kHz stereo**, modelled as one interleaved `L R L R` stream.
+
+**It takes the family's third call shape, and ADR-034's is not an option.** The reference's streaming
+decode is the same function as one whole-sequence pass (1.1e-06 apart). A chunk that re-decodes 8 s
+of left context is still **48%** away, because 92 layers of stacked windows reach far past any context
+a chunk could carry. So it is one call. What makes one call affordable is that the attention is
+**blocked**: each block of `m · 2^stage` positions gathers only the key blocks its window can reach.
+The window is one constant mask, memory is linear in the clip, and the driver pads the frame count to
+whole blocks (`PaddedCodecCall`). [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md)
+has the options and the measurements.
+
+**Two things a host now reads off a codec file**
+([ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md)):
+
+* `codec.absent_code`: the quantizer is folded into one table with an all-zero row per codebook, so
+  an LM emitting fewer codebooks than the codec has (MOSS-TTS: 12 of 32) decodes through the same
+  file. loom-py fills narrow rows with that id.
+* `channels`: `ModelContract`, `Audio` and `loom_cli` all learned that audio can be interleaved stereo.
+
+**No engine primitive**, which makes six family-11 leaves in a row. The cost was in the exporter:
+the in-projection split into Q/K/V and pair slices rather than indices, both
+because an integer select lowers to a view that keeps its unit axis; the gather index computed in
+float and cast, because an integer weight is written as F32; and one silent failure,
+[Retro-060](../retros/retro-060-a-sequence-at-axis-zero-was-read-as-a-batch.md), where the first
+stack's length sat at axis 0 and was read as a batch size of 1.
+
+**Verified** against the reference's own decode on 30 s of real speech: max |Δ| **2.6e-06**, relative
+RMS **1.2e-06** at all 32 codebooks, and **1.3e-06** for the 12-codebook prefix MOSS-TTS emits. The
+sabotage arms are 1.43 and 0.36. The engine decodes 30 s in 125 s on the 2-core dev box, where PyTorch
+takes 116 s. The F32 GGUF is 4.3 GB (the decode half only; the encoder is not exported), and its peak
+export RSS is 12.3 GB.
 
 ### Family 4, and the attribute nobody was reading
 

@@ -153,10 +153,15 @@ int synthesize(loom::GgufModel& model, const loom::Backends& backends,
     for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
     // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
     // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
-    std::printf("  %zu samples at %u Hz = %.2f s, peak %.4f, rms %.4f\n", audio.size(), rate,
-                static_cast<double>(audio.size()) / rate, peak,
+    // Interleaved channels, read off the file: a stereo codec returns `L R L R ...`, and dividing its
+    // length by the rate alone would report twice the duration and write a mono file at half speed.
+    const uint32_t channels = model.has_kv("loom.channels")
+                                  ? std::max<uint32_t>(model.hparam_u32("channels"), 1) : 1;
+    std::printf("  %zu samples x %u channel(s) at %u Hz = %.2f s, peak %.4f, rms %.4f\n",
+                audio.size() / channels, channels, rate,
+                static_cast<double>(audio.size()) / channels / rate, peak,
                 std::sqrt(sum_sq / std::max<size_t>(audio.size(), 1)));
-    loom_cli::write_wav_pcm16_mono(out_path, audio, rate);
+    loom_cli::write_wav_pcm16(out_path, audio, rate, channels);
     std::printf("  wrote %s\n", out_path.c_str());
     print_device_report(session.bridge());
     return 0;
