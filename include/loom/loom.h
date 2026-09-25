@@ -57,6 +57,7 @@
 #include "loom/core/chatterbox_vocab.h"
 #include "loom/core/pocket_tts_vocab.h"
 #include "loom/core/voxcpm_vocab.h"
+#include "loom/core/cosyvoice3_vocab.h"
 #include "loom/core/voice_file.h"
 #include "loom/core/phoneme_vocab.h"
 #include "loom/core/unicode.h"

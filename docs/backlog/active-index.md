@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-24
+last_updated: 2026-09-25
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -119,13 +119,16 @@ release](#packaging--release)
   export, a card entry in `build_model_cards.py` and loom-py's card gate. *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)*
-  * [ ] **Voice files and cloning.** The four voice arrays are ordinary driver inputs, so a
-    `cosyvoice3_voices.py` that runs the ONNX S3 tokenizer + CAMPPlus in Python and writes a voice
-    file ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md))
-    would give it cloning without either ONNX model reaching the engine.
-  * [ ] **No text normalisation or paragraph splitting.** The reference spells digits out (inflect,
-    or wetext/ttsfrd when installed) and splits long text into ~80-token pieces; the text door does
-    neither, so digits are read as the LM guesses and a long paragraph is one decode.
+  * [ ] **Cloning needs Python.** Voice files work (`loom_exporter.cosyvoice3_voices`, gate arm on a
+    JFK clip), but making one runs the ONNX S3 tokenizer v3 and CAMPPlus in Python. Cloning inside
+    loom means exporting both as phases, with the log-mel and fbank front ends in the graph, and the
+    release ships neither as torch (check `s3tokenizer` on PyPI for a v3 port).
+    *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
+  * [ ] **Normalisation is the rules path only.** The reference prefers `wetext` (WeTextProcessing
+    FSTs, Apache-2.0) when installed, which reads dates, money and units the rules path spells digit by
+    digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
+    first. Deferred by the user 2026-09-25.
+    *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
 * [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
   voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
@@ -500,6 +503,13 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
     and its own draws: plausible speech from a different sampler. Also `run_ode` now refuses a
     caller state whose length disagrees with `n_elems`, which aborted the process before
     ([Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md)).
+  * [ ] **CosyVoice3's text path and a BPE fix** (on `feat/p5-family-9-cosyvoice3-frontend`): the
+    `cosyvoice3` tokenizer tag
+    ([ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)), which an rc10
+    loom-py leaves with no tokenizer (a loud failure), and `BpeVocab`'s `\s` widened to Unicode
+    White_Space. That second change alters ids for EVERY `gpt2`-tagged model on text with a non-ASCII
+    space, towards the reference ([Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md)).
+    Worth a line in the release notes.
 * [ ] **`nlohmann/json` is fetched as a full ~290 MB clone** for a header-only library, and it failed
   twice over a slow link during the macOS work. `GIT_SHALLOW TRUE` on that `FetchContent_Declare`
   (it is pinned to a tag, so shallow works) would remove the largest download in a cold build.

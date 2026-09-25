@@ -18,9 +18,24 @@
 //   * **Vocoder**: the reference's mel through `vocoder` alone, from a probe beside the driver.
 //   * **Free-running**: everything from the text, the draws and the two noises.
 //
+// The text arrives through `loom::CosyVoice3Vocab`, so each run above goes through the driver's chunk
+// loop (one chunk, `<|endoftext|>` first). Two more arms cover what the text path and voice files add:
+//
+//   * **Chunks**: a two-chunk text run whole must equal its two chunks run one after the other on the
+//     same stream -- the split, the per-chunk generation and the join -- and a pinned input is refused
+//     for more than one chunk.
+//   * **A cloned voice**: a voice FILE written by `cosyvoice3_voices` from a clip the default voice is
+//     not (JFK, whisper.cpp's sample), loaded through `loom::load_voice`: its arrays must be the
+//     reference front end's for that clip exactly, and with them the LM must draw the reference's
+//     tokens exactly and the free-running waveform land inside the default voice's bound -- against
+//     the reference's float64 waveform, which on this voice its own f32 run is far from.
+//
 // Fixtures:
-//   LOOM_COSYVOICE3_GGUF     cosyvoice3.gguf  -- `loom-export ~/Dev/models/fun-cosyvoice3-0.5b-2512 -o ...`
-//   LOOM_COSYVOICE3_REF_DIR  cosyvoice3_ref/  -- scripts/cosyvoice3_reference.py --f64
+//   LOOM_COSYVOICE3_GGUF           cosyvoice3.gguf        -- `loom-export ~/Dev/models/fun-cosyvoice3-0.5b-2512 -o ...`
+//   LOOM_COSYVOICE3_REF_DIR        cosyvoice3_ref/        -- scripts/cosyvoice3_reference.py --f64
+//   LOOM_COSYVOICE3_CLONE_REF_DIR  cosyvoice3_clone_ref/  -- the same script with `--prompt-wav jfk.wav
+//                                  --prompt-text <its transcript> --seed 12 --f64`, plus `voice.gguf` from
+//                                  `python -m loom_exporter.cosyvoice3_voices ... --name voice` (optional)
 
 #include "test_util.h"
 #include "fixtures.h"
@@ -34,6 +49,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -134,16 +150,18 @@ int main() {
     auto model = loom::GgufModel::load(gguf_env, device.backends().primary);
     LOOM_CHECK(model != nullptr);
 
-    // **The text door first**, on both halves: the sentence, and the voice's prompt text, whose
-    // `<|endofprompt|>` and CJK are the added-token and byte-level paths the sentence does not reach.
-    auto vocab = loom::BpeVocab::load(*model);
+    // **The text door first**, on both halves: the sentence through the reference's text path (one
+    // chunk, opened by the header), and the voice's prompt text through the BPE alone -- the reference
+    // skips normalisation for it, since it holds `<|endofprompt|>` -- whose added token and CJK are
+    // paths the sentence does not reach.
+    auto vocab = loom::CosyVoice3Vocab::load(*model);
     LOOM_CHECK(vocab != nullptr);
     const auto ids = vocab->encode(text);
-    LOOM_CHECK(ids.size() == ref_ids.size());
-    for (size_t i = 0; i < std::min(ids.size(), ref_ids.size()); ++i) {
-        LOOM_CHECK(static_cast<float>(ids[i]) == ref_ids[i]);
+    LOOM_CHECK(ids.size() == ref_ids.size() + 1 && ids[0] == vocab->chunk_header());
+    for (size_t i = 0; i + 1 < ids.size() && i < ref_ids.size(); ++i) {
+        LOOM_CHECK(static_cast<float>(ids[i + 1]) == ref_ids[i]);
     }
-    const auto prompt_ids = vocab->encode(prompt_text);
+    const auto prompt_ids = vocab->bpe().encode(prompt_text);
     LOOM_CHECK(prompt_ids.size() == ref_prompt_ids.size());
     for (size_t i = 0; i < std::min(prompt_ids.size(), ref_prompt_ids.size()); ++i) {
         LOOM_CHECK(static_cast<float>(prompt_ids[i]) == ref_prompt_ids[i]);
@@ -211,6 +229,119 @@ int main() {
         std::fprintf(stderr, "free-running max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs, d.rmse, d.peak);
         LOOM_CHECK(d.peak > 0.05);
         LOOM_CHECK(d.rmse < COSYVOICE3_FREE_RMSE);
+    }
+
+    // --- 5. Chunks: whole == its chunks in turn, on one stream. ---
+    {
+        const int32_t header = vocab->chunk_header();
+        const auto first = vocab->bpe().encode("Hello there.");
+        const auto second = vocab->bpe().encode("See you soon.");
+        std::vector<double> both{static_cast<double>(header)};
+        both.insert(both.end(), first.begin(), first.end());
+        both.push_back(header);
+        both.insert(both.end(), second.begin(), second.end());
+        std::vector<double> whole, parts;
+        {
+            loom::Session session(*model, device.backends());
+            whole = std::get<std::vector<double>>(session.bridge().call("infer", {{"tokens", both}, {"seed", 5.0}}));
+        }
+        {
+            loom::Session session(*model, device.backends());
+            parts = std::get<std::vector<double>>(session.bridge().call("infer", {
+                {"tokens", std::vector<double>(first.begin(), first.end())}, {"seed", 5.0}}));
+            const size_t n_first = parts.size();
+            const auto rest = std::get<std::vector<double>>(session.bridge().call("infer", {
+                {"tokens", std::vector<double>(second.begin(), second.end())}}));
+            parts.insert(parts.end(), rest.begin(), rest.end());
+            std::fprintf(stderr, "chunks: whole=%zu samples, parts=%zu + %zu\n", whole.size(), n_first, rest.size());
+            LOOM_CHECK(n_first > 0 && !rest.empty());
+        }
+        LOOM_CHECK(whole == parts);
+        bool refused = false;
+        try {
+            loom::Session session(*model, device.backends());
+            session.bridge().call("infer", {{"tokens", both}, {"draws", as_doubles(draws)}});
+        } catch (const std::exception& e) {
+            refused = std::string(e.what()).find("pins one generation") != std::string::npos;
+        }
+        LOOM_CHECK(refused);
+    }
+
+    // --- 6. A cloned voice, from a voice file. ---
+    const char* clone_env = loom_test::fixture_env("LOOM_COSYVOICE3_CLONE_REF_DIR");
+    if (clone_env == nullptr) {
+        std::fprintf(stderr, "cloned voice: skipped (no LOOM_COSYVOICE3_CLONE_REF_DIR)\n");
+    } else {
+        const std::string dir = clone_env;
+        std::ifstream clone_meta_file(dir + "/meta.json");
+        std::stringstream clone_meta;
+        clone_meta << clone_meta_file.rdbuf();
+        const auto clone_ids = vocab->encode(meta_string(clone_meta.str(), "text"));
+        const auto clone_ref_ids = loom_test::read_npy_f32(dir + "/text_ids.npy", shape);
+        LOOM_CHECK(clone_ids.size() == clone_ref_ids.size() + 1);
+        const loom::VoiceFile voice = loom::load_voice(*model, dir + "/voice.gguf");
+        // The file's arrays ARE the reference front end's, input by input.
+        for (const auto& [input, npy] : {std::pair<std::string, std::string>{"prompt_text", "voice_prompt_text"},
+                                         {"prompt_speech_tokens", "voice_prompt_speech_tokens"},
+                                         {"prompt_feat", "voice_prompt_feat"},
+                                         {"embedding", "voice_embedding"}}) {
+            const auto want = loom_test::read_npy_f32(dir + "/" + npy + ".npy", shape);
+            const auto it = voice.inputs.find(input);
+            LOOM_CHECK(it != voice.inputs.end());
+            if (it == voice.inputs.end()) continue;
+            LOOM_CHECK(it->second.size() == want.size());
+            bool same = it->second.size() == want.size();
+            for (size_t i = 0; same && i < want.size(); ++i) same = static_cast<float>(it->second[i]) == want[i];
+            std::fprintf(stderr, "cloned voice: %s %zu values %s\n", input.c_str(), want.size(),
+                         same ? "identical" : "DIFFER");
+            LOOM_CHECK(same);
+        }
+        const auto clone_draws = loom_test::read_npy_f32(dir + "/draws.npy", shape);
+        const auto clone_raw = loom_test::read_npy_f32(dir + "/speech_tokens_raw.npy", shape);
+        const auto clone_noise = loom_test::read_npy_f32(dir + "/noise.npy", shape);
+        const auto clone_nsf = loom_test::read_npy_f32(dir + "/nsf_noise.npy", shape);
+        // The FLOAT64 reference, not its f32 run: on this voice (a loud 11 s clip, 254 generated frames)
+        // the reference's own f32 waveform is rmse 0.249 from its f64 one -- uncorrelated in four of eight
+        // segments -- while loom lands at rmse 6.9e-03 from the f64 one, inside the default voice's own
+        // f32-vs-f64 spread (9.0e-03). Measured 2026-09-25; the flow's mel is at its floor either way
+        // (max 2.3e-03, rmse 1.6e-04 against the f32 reference).
+        const auto clone_wave = loom_test::read_npy_f32(dir + "/wave_f64.npy", shape);
+        // The voice's arrays as driver inputs by name, as `loom_cli --voice` and loom-py pass them.
+        using Inputs = std::unordered_map<std::string, loom::LoomLuaBridge::Value>;
+        auto with_voice = [&](Inputs in) {
+            for (const auto& [name, values] : voice.inputs) in.emplace(name, values);
+            return in;
+        };
+        const std::vector<double> clone_tokens(clone_ids.begin(), clone_ids.end());
+        // Seed 12, not the script's default: the pinned draws must sit further from a CDF boundary than
+        // f32 can blur. At seed 11 step 24's redraw sat 8.0e-07 of the mass from one (over all 6761 ids),
+        // and loom took the neighbouring id after 24 identical tokens while the reference at f64 did not
+        // move. This run's smallest margin is meta.json's `min_draw_margin`, 1.9e-05.
+        bool lm_exact = false;
+        {
+            loom::Session session(*model, device.backends());
+            const auto got = std::get<std::vector<double>>(session.bridge().call("infer", with_voice({
+                {"tokens", clone_tokens}, {"draws", as_doubles(clone_draws)}, {"return_tokens", 1.0}})));
+            size_t same = 0;
+            while (same < std::min(got.size(), clone_raw.size()) && got[same] == clone_raw[same]) ++same;
+            std::fprintf(stderr, "cloned voice LM: loom=%zu reference=%zu tokens, %zu identical from the start\n",
+                         got.size(), clone_raw.size(), same);
+            lm_exact = got.size() == clone_raw.size() && same == got.size();
+            LOOM_CHECK(lm_exact);
+        }
+        // The reference's noise is sized for ITS token count, so a diverged decode cannot use it.
+        if (lm_exact) {
+            loom::Session session(*model, device.backends());
+            const auto got = std::get<std::vector<double>>(session.bridge().call("infer", with_voice({
+                {"tokens", clone_tokens}, {"draws", as_doubles(clone_draws)}, {"noise", as_doubles(clone_noise)},
+                {"nsf_noise", as_doubles(clone_nsf)}})));
+            LOOM_CHECK(got.size() == clone_wave.size());
+            const Diff d = compare(got, clone_wave);
+            std::fprintf(stderr, "cloned voice free-running: max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs,
+                         d.rmse, d.peak);
+            LOOM_CHECK(d.peak > 0.05);
+            LOOM_CHECK(d.rmse < COSYVOICE3_FREE_RMSE);
+        }
     }
 
     LOOM_TEST_REPORT_AND_RETURN();
