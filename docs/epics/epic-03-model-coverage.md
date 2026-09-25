@@ -52,7 +52,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
 | **Audio codec + blocked attention, stereo** | MOSS-Audio-Tokenizer-v2 | `moss_audio_tokenizer_export.py` |
-| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base | `dia_export.py`, `qwen3_tts_export.py` |
+| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base, MOSS-TTS-Local-Transformer-v1.5 | `dia_export.py`, `qwen3_tts_export.py`, `moss_tts_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
@@ -777,6 +777,51 @@ Verified end to end against the reference's own greedy ICL generation, from **ra
 drawing the reference codes itself — on two sentences and two clip lengths: **624 of 624 ids identical
 over 39 frames each**, and the same run given pre-computed codes agrees with it exactly. The x-vector
 path is unchanged and byte-identical to the published GGUF (640/640).
+
+#### The third leaf was MOSS-TTS-Local-Transformer-v1.5, and its backbone was re-hosted, not patched (2026-09-25)
+
+MOSS-TTS-Local-Transformer-v1.5 (`OpenMOSS-Team`, Apache-2.0, 4.55B parameters, 31 languages) emits
+12 of MOSS-Audio-Tokenizer-v2's 32 codebooks, and that codec is the family-11 leaf above. The pair is
+two files by ADR-022, and the width gap is what `codec.absent_code` is for
+([ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md)). It has Qwen3-TTS's
+two-stack shape, with the sizes moved: a 36-layer Qwen3 runs once per frame, and a ONE-layer GPT-2
+runs once per codebook. The GPT-2 decides continue or stop and codebook 0 from its first row, then
+draws codebooks 1–11 one at a time.
+
+**The backbone is transformers' own `Qwen3Model`, with the checkpoint's weights loaded in place.**
+MOSS ships the stack as remote code whose attention the fusion pass does not recognise, and its
+arithmetic is plain Qwen3. So the export re-hosts it and **asserts** the two agree on the real weights
+before tracing. They are bit-identical, and the cached GQA attention comes for free
+([ADR-051](../adrs/adr-051-a-remote-code-stack-of-a-known-architecture-is-rehosted-and-asserted.md)).
+Four phases: `embed` (one row = one text id + 12 audio ids, folded like the codec's quantizer, with a
+zero row at the pad code), `global` (cached), and `local_first` / `local_steps`. The local stack is
+uncached, for Qwen3-TTS's reason (one KvCache, one per-layer width). Its head is merged, 12 × 1024
+audio rows plus the 2-way continue/stop pair, so every draw is a window. The 151,936-row text head is
+not exported, because no draw reads it; that saves 1.56 GB.
+
+**The prompt template ships pre-encoded, one variant per language**
+([ADR-052](../adrs/adr-052-a-templates-language-line-ships-pre-encoded-per-declared-language.md)),
+because the processor encodes its pieces separately. `text2codes.infer(text, language="fr")`.
+
+**Two ggml aborts on the way, both loud.** A `[1, n, 1]` gather index is rank 3 and `ggml_get_rows`
+refuses it, so it is flattened first. A transposed view as a matmul's second operand trips
+`nb10 == type_size`, so it is a reshape instead. Both were caught on a 10.6M-parameter random
+checkpoint built from the release's own code. That loop (tiny model → export → engine vs reference in
+seconds) is also how the codec's three silent failures were found, and it is the cheapest verification
+this family has.
+
+**Verified on the real weights, exported on the workstation** (peak RSS 34.2 GB, 36 s on 24 cores;
+16.8 GB F32 GGUF):
+
+* greedy codes against the reference's `generate(do_sample=False)`: **38/38** frames (both stop at
+  38) and **40/40**;
+* sampled at the README's settings (1.7 / top-k 25 / top-p 0.8) with **pinned draws** (ADR-047):
+  **34/34** (both stop at 34) and **60/60**, so the sampler, the windows and the draw order all match;
+* free runs through the codec GGUF: Whisper reads **9/9** words in English and in French at two seeds
+  each (`scripts/moss_tts_oracle.py`).
+
+At F32 the workstation generates about 3 frames/s (12.5 frames/s is real time). On the 2-core dev box
+it is slower still; a Q8_0 build would be the one to use there.
 
 ### Family 9's third leaf, and the primitive that had to be added
 

@@ -61,16 +61,16 @@ release](#packaging--release)
 
 ## Models
 
-* [ ] **MOSS-TTS (family 10), and its codec's Hub publish.** The codec half is built and verified
-  (branch `feat/p5-family-11-moss-audio-tokenizer`): MOSS-Audio-Tokenizer-v2 decodes at 1.2e-06 from
-  the reference, in one blocked call, stereo, taking a 12-codebook prefix. The LM half
-  (`moss-tts-local-transformer-v1.5`, local on the T5) is a Qwen3-4B backbone plus a 1-layer local
-  transformer that emits 12 codes per frame, which is Qwen3-TTS's talker/code-predictor shape. It has
-  **4.55B parameters, so its F32 export peaks around 35 GB and has to run on the workstation**, and the
-  GGUF is about 18–20 GB. Still to do: the export, a `test_codec_pair` whose width check becomes "≤
-  when the codec declares an absent id", and a composition gate like Dia+DAC's. *Context:
-  [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md),
-  [ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md)*
+* [ ] **MOSS-TTS + MOSS-Audio-Tokenizer are built and verified, not published or gated.** Branches
+  `feat/p5-family-11-moss-audio-tokenizer` (the codec, pushed) and `feat/p5-family-10-moss-tts` (the
+  LM). Codes are exact against the reference, greedy and pinned-sampled, and the pair reads back 9/9
+  words through Whisper. Left: (1) a composition gate like Dia+DAC's, which needs the 16.8 GB F32
+  GGUF as a fixture (it is on the workstation, `~/loom-moss/out/`); (2) loom-py's `test_codec_pair`
+  for a pair with an absent id; (3) the Hub publish, which waits for rc11 like everything else and
+  should probably offer Q8_0 beside F32 at this size; (4) voice cloning, which needs the codec's
+  ENCODER exported; (5) the template's other lines (`Tokens` for duration, `Instruction`). *Context:
+  [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md)–[ADR-052](../adrs/adr-052-a-templates-language-line-ships-pre-encoded-per-declared-language.md),
+  [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Chatterbox (family 9's fourth leaf) is built, verified and pushed (no PRs), and not yet
   published or gated on the Hub.** Branch `feat/p5-family-9-chatterbox` in all three repos, stacked on family 9's
   F5-TTS branches. Verified: the gate is 2.5e-05 from the reference waveform, the tokenizer is 3000/3000

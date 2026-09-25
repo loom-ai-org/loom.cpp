@@ -29,11 +29,12 @@ import numpy as np
 
 def read_wav(path: str):
     with wave.open(path) as w:
-        if w.getsampwidth() != 2 or w.getnchannels() != 1:
-            raise SystemExit(f"{path} is not 16-bit mono; tts_synth writes that and this reads it")
-        rate, n = w.getframerate(), w.getnframes()
+        if w.getsampwidth() != 2:
+            raise SystemExit(f"{path} is not 16-bit PCM; tts_synth and loom_cli write that and this reads it")
+        rate, n, channels = w.getframerate(), w.getnframes(), w.getnchannels()
         pcm = np.frombuffer(w.readframes(n), dtype=np.int16).astype(np.float32) / 32768.0
-    return pcm, rate
+    # A stereo codec (MOSS-Audio-Tokenizer, ADR-050) writes interleaved frames; ASR hears the mix.
+    return pcm.reshape(-1, channels).mean(axis=1), rate
 
 
 def to_16k(pcm: np.ndarray, rate: int) -> np.ndarray:
