@@ -68,10 +68,20 @@ release](#packaging--release)
   staged under `hf-models/` with their model cards, and loom-py's card gate passes on both (run one
   model per process: see Retro-061). loom-py's `test_codec_pair` covers the pair (the narrower LM, the
   absent id, stereo). Left: (1) the Hub publish, which waits for rc11 like everything else and should
-  probably offer Q8_0 beside F32 at this size (16.8 GB); (2) voice cloning, which needs the codec's
-  ENCODER exported; (3) the template's other lines (`Tokens` for duration, `Instruction`). *Context:
-  [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md)–[ADR-052](../adrs/adr-052-a-templates-language-line-ships-pre-encoded-per-declared-language.md),
+  probably offer Q8_0 beside F32 at this size (16.8 GB); (2) the template's other lines (`Tokens` for
+  duration, `Instruction`). *Context:
+  [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md)–[ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md),
   [Epic-03](../epics/epic-03-model-coverage.md)*
+  * [ ] **Voice cloning works through voice files; three pieces are left.** Branch
+    `feat/p5-family-10-moss-tts-voice-clone` (all three repos). `loom_exporter.moss_tts_voices` writes a
+    file of one or more references' codes, and `text2codes.infer(voice=...)` takes it. The gate's three
+    clone arms are exact. Left: (a) the staged GGUF in `hf-models/` (and so the `v5` fixture, a
+    symlink to it) carries the new driver and `loom.voice.compat` by a dev-only driver swap over the
+    2026-09-25 export's weights and topologies, not by an export, so the rc11 publish still needs the
+    fresh export it needs anyway; (b) the model card has no cloning section, and it would inherit the item below
+    because it needs the reader's own clip; (c) a clip-in door inside loom (the codec encoder as
+    phases) and `loom_cli`'s missing `text2codes` path, neither started.
+    *Context: [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md)*
 * [ ] **Chatterbox (family 9's fourth leaf) is built, verified and pushed (no PRs), and not yet
   published or gated on the Hub.** Branch `feat/p5-family-9-chatterbox` in all three repos, stacked on family 9's
   F5-TTS branches. Verified: the gate is 2.5e-05 from the reference waveform, the tokenizer is 3000/3000

@@ -17,10 +17,19 @@
 // consistent with itself (family 11's first bug), and the sample counts must differ by exactly
 // `hop * channels * (24 - 12)`.
 //
+// **Voice cloning, through voice FILES** (ADR-045). A MOSS voice is one or more reference clips'
+// codes, and the files are written by the exporter's tool, not by the script that made the oracle:
+// each file's inputs must equal the reference processor's encode of the same clips, and with them the
+// LM must reproduce the reference's clone generation -- greedy with one reference and with two
+// (`[audio_start] codes [audio_end]` twice, back to back), and pinned-sampled with one. A code outside
+// the codebook must be refused, because the pad code's zero row would otherwise read it as "absent".
+//
 // Fixtures (all three, or this skips):
 //   LOOM_MOSS_TTS_GGUF              moss_tts.gguf              -- `loom-export <moss-tts-local-transformer-v1.5>`
 //   LOOM_MOSS_AUDIO_TOKENIZER_GGUF  moss_audio_tokenizer.gguf  -- `loom-export <moss-audio-tokenizer-v2>`
-//   LOOM_MOSS_TTS_REF_DIR           moss_tts_ref/              -- `scripts/moss_tts_reference.py`
+//   LOOM_MOSS_TTS_REF_DIR           moss_tts_ref/              -- `scripts/moss_tts_reference.py`, plus
+//                                   `voice_one.gguf` and `voice_pair.gguf` from
+//                                   `python -m loom_exporter.moss_tts_voices` (the script's docstring)
 //
 // Memory: the LM is 16.8 GB at F32 and the codec 4.3 GB, loaded one after the other.
 
@@ -38,6 +47,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -47,6 +57,7 @@ constexpr int kSkipReturnCode = 77;
 constexpr int kFrames[] = {12, 24};
 constexpr int kPinnedFrames = 24;
 constexpr int kLmCodebooks = 12;
+constexpr int kCloneFrames = 24;
 
 std::vector<double> read_npy(const std::string& path, std::vector<int64_t>& shape) {
     const std::vector<float> values = loom_test::read_npy_f32(path, shape);
@@ -67,6 +78,21 @@ size_t count_mismatches(const std::vector<double>& got, const std::vector<double
         }
     }
     return mismatches;
+}
+
+// A voice file's inputs against the reference's encode of its clips, reference after reference.
+bool voice_matches(const loom::VoiceFile& voice, const std::vector<std::vector<double>>& refs) {
+    const auto codes = voice.inputs.find("reference_codes");
+    const auto frames = voice.inputs.find("reference_frames");
+    if (codes == voice.inputs.end() || frames == voice.inputs.end()) return false;
+    std::vector<double> want_codes, want_frames;
+    for (const auto& r : refs) {
+        want_codes.insert(want_codes.end(), r.begin(), r.end());
+        want_frames.push_back(static_cast<double>(r.size() / kLmCodebooks));
+    }
+    std::fprintf(stderr, "voice '%s': %zu reference(s), %zu codes\n", voice.name.c_str(),
+                 frames->second.size(), codes->second.size());
+    return codes->second == want_codes && frames->second == want_frames;
 }
 
 } // namespace
@@ -119,6 +145,46 @@ int main() {
         std::fprintf(stderr, "pinned: %zu codes, reference %zu\n", pinned.size(), ref_pinned.size());
         LOOM_CHECK(pinned.size() == ref_pinned.size());
         LOOM_CHECK(count_mismatches(pinned, ref_pinned, "pinned") == 0);
+
+        // Voice cloning, one reference and two, through the files the exporter's tool wrote.
+        const std::vector<std::vector<double>> refs = {read_npy(ref_dir + "/clone_ref_codes_0.npy", shape),
+                                                       read_npy(ref_dir + "/clone_ref_codes_1.npy", shape)};
+        for (const int n_refs : {1, 2}) {
+            const char* file = n_refs == 1 ? "/voice_one.gguf" : "/voice_pair.gguf";
+            const loom::VoiceFile voice = loom::load_voice(*lm, ref_dir + file);
+            LOOM_CHECK(voice_matches(voice, {refs.begin(), refs.begin() + n_refs}));
+            std::unordered_map<std::string, loom::LoomLuaBridge::Value> args = {
+                {"tokens", text_ids}, {"language", language[0]},
+                {"max_new_tokens", static_cast<double>(kCloneFrames)},
+                {"temperature", 0.0}, {"text_temperature", 0.0}};
+            for (const auto& [name, values] : voice.inputs) args[name] = values;
+            const auto clone = std::get<std::vector<double>>(bridge.call("infer", args));
+            const std::vector<double> ref_clone = read_npy(
+                ref_dir + "/clone" + std::to_string(n_refs) + "_codes_" + std::to_string(kCloneFrames) +
+                "f.npy", shape);
+            std::fprintf(stderr, "clone, %d reference(s): %zu codes, reference %zu\n", n_refs,
+                         clone.size(), ref_clone.size());
+            LOOM_CHECK(clone.size() == ref_clone.size());
+            LOOM_CHECK(count_mismatches(clone, ref_clone, "clone") == 0);
+            if (n_refs == 1) {
+                // The file's own sampling defaults, as the plain pinned arm above uses.
+                args.erase("temperature");
+                args.erase("text_temperature");
+                args["draws"] = draws;
+                const auto sampled = std::get<std::vector<double>>(bridge.call("infer", args));
+                const std::vector<double> ref_sampled = read_npy(ref_dir + "/clone1_codes_pinned.npy", shape);
+                std::fprintf(stderr, "clone pinned: %zu codes, reference %zu\n", sampled.size(),
+                             ref_sampled.size());
+                LOOM_CHECK(sampled.size() == ref_sampled.size());
+                LOOM_CHECK(count_mismatches(sampled, ref_sampled, "clone pinned") == 0);
+            }
+        }
+        // A code the codebook does not have: the pad code's zero row would read it as "absent".
+        std::vector<double> bad = refs[0];
+        bad[5] = 1024.0;
+        LOOM_CHECK_THROWS(bridge.call("infer", {{"tokens", text_ids}, {"max_new_tokens", 1.0},
+                                                {"reference_codes", bad}}),
+                          loom::Error);
     }
 
     for (size_t i = 0; i < std::size(kFrames); ++i) {
