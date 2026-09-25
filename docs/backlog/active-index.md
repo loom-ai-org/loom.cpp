@@ -61,15 +61,15 @@ release](#packaging--release)
 
 ## Models
 
-* [ ] **MOSS-TTS + MOSS-Audio-Tokenizer are built and verified, not published or gated.** Branches
+* [ ] **MOSS-TTS + MOSS-Audio-Tokenizer are built, verified and gated, not published.** Branches
   `feat/p5-family-11-moss-audio-tokenizer` (the codec, pushed) and `feat/p5-family-10-moss-tts` (the
   LM). Codes are exact against the reference, greedy and pinned-sampled, and the pair reads back 9/9
   words through Whisper. The composition gate is `test_e2e_moss_tts_composition`; both GGUFs are
   staged under `hf-models/` with their model cards, and loom-py's card gate passes on both (run one
-  model per process: see Retro-061). Left: (1) loom-py's `test_codec_pair` for a pair with an absent
-  id; (2) the Hub publish, which waits for rc11 like everything else and should probably offer Q8_0
-  beside F32 at this size (16.8 GB); (3) voice cloning, which needs the codec's ENCODER exported; (4) the template's other lines
-  (`Tokens` for duration, `Instruction`). *Context:
+  model per process: see Retro-061). loom-py's `test_codec_pair` covers the pair (the narrower LM, the
+  absent id, stereo). Left: (1) the Hub publish, which waits for rc11 like everything else and should
+  probably offer Q8_0 beside F32 at this size (16.8 GB); (2) voice cloning, which needs the codec's
+  ENCODER exported; (3) the template's other lines (`Tokens` for duration, `Instruction`). *Context:
   [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md)–[ADR-052](../adrs/adr-052-a-templates-language-line-ships-pre-encoded-per-declared-language.md),
   [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **Chatterbox (family 9's fourth leaf) is built, verified and pushed (no PRs), and not yet
