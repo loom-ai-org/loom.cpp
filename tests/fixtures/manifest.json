@@ -14,6 +14,26 @@
       "kind": null,
       "produced_by": null
     },
+    "LOOM_CHATTERBOX_GGUF": {
+      "path": "chatterbox.gguf",
+      "used_by": [
+        "test_e2e_chatterbox_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_CHATTERBOX_REF_DIR": {
+      "path": "chatterbox_ref",
+      "used_by": [
+        "test_e2e_chatterbox_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
     "LOOM_CHAT_LM_GGUF": {
       "path": "chat_lm.gguf",
       "used_by": [
@@ -53,6 +73,36 @@
         "test_e2e_conformer_ctc_mil_export",
         "test_e2e_device_parity",
         "test_vocab"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_COSYVOICE3_CLONE_REF_DIR": {
+      "path": "cosyvoice3_clone_ref",
+      "used_by": [
+        "test_e2e_cosyvoice3_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_COSYVOICE3_GGUF": {
+      "path": "cosyvoice3.gguf",
+      "used_by": [
+        "test_e2e_cosyvoice3_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_COSYVOICE3_REF_DIR": {
+      "path": "cosyvoice3_ref",
+      "used_by": [
+        "test_e2e_cosyvoice3_lua_driver"
       ],
       "sha256": null,
       "bytes": null,
@@ -445,6 +495,36 @@
       "kind": null,
       "produced_by": null
     },
+    "LOOM_MOSS_AUDIO_TOKENIZER_GGUF": {
+      "path": "moss_audio_tokenizer.gguf",
+      "used_by": [
+        "test_e2e_moss_tts_composition"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MOSS_TTS_GGUF": {
+      "path": "moss_tts.gguf",
+      "used_by": [
+        "test_e2e_moss_tts_composition"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_MOSS_TTS_REF_DIR": {
+      "path": "moss_tts_ref",
+      "used_by": [
+        "test_e2e_moss_tts_composition"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
     "LOOM_PARAKEET_RNNT_MIL_GGUF": {
       "path": "parakeet_rnnt_mil.gguf",
       "used_by": [
@@ -469,6 +549,36 @@
       "path": "parakeet_tdt_mil.gguf",
       "used_by": [
         "test_e2e_parakeet_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_POCKET_TTS_GGUF": {
+      "path": "pocket_tts.gguf",
+      "used_by": [
+        "test_e2e_pocket_tts_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_POCKET_TTS_MARIUS_REF_DIR": {
+      "path": "pocket_tts_marius_ref",
+      "used_by": [
+        "test_e2e_pocket_tts_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_POCKET_TTS_REF_DIR": {
+      "path": "pocket_tts_ref",
+      "used_by": [
+        "test_e2e_pocket_tts_lua_driver"
       ],
       "sha256": null,
       "bytes": null,
@@ -788,6 +898,26 @@
       "path": "vits_stats_ref",
       "used_by": [
         "test_e2e_vits_stats_reference"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VOXCPM2_GGUF": {
+      "path": "voxcpm2.gguf",
+      "used_by": [
+        "test_e2e_voxcpm2_lua_driver"
+      ],
+      "sha256": null,
+      "bytes": null,
+      "kind": null,
+      "produced_by": null
+    },
+    "LOOM_VOXCPM2_REF_DIR": {
+      "path": "voxcpm2_ref",
+      "used_by": [
+        "test_e2e_voxcpm2_lua_driver"
       ],
       "sha256": null,
       "bytes": null,
