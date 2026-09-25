@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-09-24
+last_updated: 2026-09-25
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -79,6 +79,17 @@ data, as ADR-041 requires, including Python's `isdigit` set, and the result is *
 identical to the reference over eight input classes, and 8000/8000 with the headers. `is_python_space` moved to `unicode.h` so the two
 front ends share it.
 
+`cosyvoice3_vocab.cpp` (`tokenizer.ggml.model == "cosyvoice3"`, family 9's seventh leaf) is the third.
+It wraps a byte-level `BpeVocab` (`BpeVocab::load_bpe`) inside the reference's `text_normalize`, the
+rules path it runs with neither `ttsfrd` nor `wetext` installed. That path spells every digit run with a
+port of inflect's `number_to_words`, applies the Chinese punctuation table, and runs `split_paragraph`,
+counting BPE tokens for English and characters for Chinese. Chunks are opened by `<|endoftext|>`, and
+the driver runs itself once per chunk
+([ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)). The result is
+**9000/9000** ids identical to the reference. The diff also found `BpeVocab`'s `\s` was ASCII-only,
+which moved pre-token boundaries around non-ASCII spaces for every `gpt2` model
+([Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md)).
+
 **Three loaders now run in order in `transcribe`**, and the order is load-bearing: `BpeVocab::load` and
 `CtcVocab::load` return `nullptr` for a schema that is not theirs, while `Vocab::load` **throws**. Any
 future reader goes ahead of `Vocab::load` for the same reason.
@@ -127,8 +138,8 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 |---|---|
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
-| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md) |
-| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md) |
+| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md), [Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md) |
+| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record

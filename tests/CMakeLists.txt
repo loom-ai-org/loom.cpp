@@ -746,6 +746,22 @@ set_tests_properties(test_pocket_tts_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_pocket_tts_vocab PROPERTIES FIXTURES_REQUIRED "pocket_tts_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
 add_test(
+    NAME gen_cosyvoice3_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_cosyvoice3_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/cosyvoice3_vocab_test.gguf
+)
+set_tests_properties(gen_cosyvoice3_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_cosyvoice3_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP cosyvoice3_vocab_gguf_fixture)
+
+add_executable(test_cosyvoice3_vocab ci/test_cosyvoice3_vocab.cpp)
+target_link_libraries(test_cosyvoice3_vocab PRIVATE loom::engine)
+target_compile_definitions(test_cosyvoice3_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_cosyvoice3_vocab COMMAND test_cosyvoice3_vocab)
+set_tests_properties(test_cosyvoice3_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_cosyvoice3_vocab PROPERTIES FIXTURES_REQUIRED "cosyvoice3_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
+add_test(
     NAME gen_voxcpm_vocab_gguf_fixture
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_voxcpm_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/voxcpm_vocab_test.gguf

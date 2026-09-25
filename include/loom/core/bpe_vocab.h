@@ -82,6 +82,11 @@ public:
     // entirely, it still defaults to "qwen2" unchanged, same as before this family registry existed.
     static std::unique_ptr<BpeVocab> load(const GgufModel& model);
 
+    // The same byte-level BPE under a tag that is not "gpt2" -- a front end that WRAPS one
+    // (`CosyVoice3Vocab`, "cosyvoice3") and so names its own scheme. Reads the tag's `tokenizer.ggml.*`
+    // keys exactly as `load` does; the caller has already decided the tag is its own.
+    static std::unique_ptr<BpeVocab> load_bpe(const GgufModel& model);
+
     // Splits `text` on this vocabulary's ADDED tokens first (see `added_to_id_`), then NFC-normalizes
     // each remaining segment (loom::nfc_normalize), splits it via this vocab's `BpeShape` pretokenizer
     // regex (hand-scanned against loom::is_letter/is_number/is_mark -- see bpe_vocab.cpp), GPT2

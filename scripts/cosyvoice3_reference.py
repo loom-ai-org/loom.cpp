@@ -166,6 +166,12 @@ def inverse_cdf(probs_desc: torch.Tensor, u: float) -> int:
     return len(p) - 1
 
 
+def draw_margin(probs_desc: torch.Tensor, u: float) -> float:
+    """|u * mass - nearest cumulative boundary| / mass, in float64."""
+    c = np.cumsum(probs_desc.double().numpy())
+    return float(np.min(np.abs(c - u * c[-1])) / c[-1])
+
+
 class PinnedSampler:
     """`nucleus_sampling` and `random_sampling` with their `multinomial` replaced by `inverse_cdf` over
     uniforms drawn here and recorded, two per LM step."""
@@ -174,6 +180,12 @@ class PinnedSampler:
         self.rng = np.random.default_rng(seed)
         self.draws = []
         self.ras_fired = 0
+        # How far each USED uniform landed from the nearest CDF boundary, as a fraction of the mass. An
+        # f32 engine resolves a draw only when this beats its own probability error: a JFK-voice run at
+        # seed 11 had one at 8.0e-07 (step 24's RAS redraw, over all 6761 ids), and loom took the
+        # neighbouring id there after 24 identical tokens -- the reference at f64 did not move. The
+        # smallest is written to meta.json so a gate's author can see a run is resolvable.
+        self.margins = []
 
     def install(self) -> None:
         from cosyvoice.utils import common
@@ -192,11 +204,13 @@ class PinnedSampler:
                     indices.append(sorted_idx[i])
                 else:
                     break
+            sampler.margins.append(draw_margin(torch.stack(prob), u1))
             return int(indices[inverse_cdf(torch.stack(prob), u1)])
 
         def random_sampling(weighted_scores, decoded_tokens, sampling):
             sampler.ras_fired += 1
             sorted_value, sorted_idx = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
+            sampler.margins.append(draw_margin(sorted_value, sampler.draws[-1][1]))
             return int(sorted_idx[inverse_cdf(sorted_value, sampler.draws[-1][1])])
 
         common.nucleus_sampling = nucleus_sampling
@@ -368,6 +382,7 @@ def main() -> None:
     (out / "meta.json").write_text(json.dumps({
         "text": args.text, "prompt_text": args.prompt_text, "prompt_wav": Path(prompt_wav).name,
         "seed": args.seed, "n_steps": len(sampler.draws), "ras_fired": sampler.ras_fired,
+        "min_draw_margin": min(sampler.margins, default=1.0),
         "min_len": min_len, "max_len": max_len, "n_speech_tokens": len(flow_tokens),
         "n_prompt_frames": n_prompt_frames, "sample_rate": 24000, "flow_steps": 10,
         "flow_cfg_rate": 0.7, "silent_tokens": silent_tokens,

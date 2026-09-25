@@ -49,7 +49,8 @@ void print_usage(const char* argv0) {
                   "                                write it. --prompt is the text, the IPA phonemes or\n"
                   "                                the codes, depending on what the file declares\n"
                   "  --voice <voice.gguf>          a voice file for a model that takes one (pocket-tts's\n"
-                  "                                `voices/*.gguf`); refused if made for other weights\n"
+                  "                                and cosyvoice3's `voices/*.gguf`); refused if made for\n"
+                  "                                other weights\n"
                   "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
                   "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
                   "                                `sample_rate=N` for a model that declares none\n"
@@ -561,6 +562,25 @@ int main(int argc, char** argv) {
                 const std::string prepared = vocab->prepare(chunks[i], &n_words);
                 std::printf("  chunk %zu (%zu word%s): \"%s\"\n", i + 1, n_words, n_words == 1 ? "" : "s",
                             prepared.c_str());
+            }
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "cosyvoice3") {
+            // CosyVoice3: text in, the file's default voice (or `--voice`, a cloned one), audio out. The
+            // vocabulary runs the reference's text normalisation -- numbers spelled out, the paragraph
+            // split into pieces the model says one at a time -- so each chunk is printed as it will be
+            // said, and the driver generates them in turn.
+            auto vocab = loom::CosyVoice3Vocab::load(*model);
+            std::printf("  tokenizer: byte-level BPE (cosyvoice3), %zu tokens\n", vocab->size());
+            if (!has_prompt) return 0;
+            const auto chunks = vocab->chunks(prompt_text);
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                std::printf("  chunk %zu: \"%s\"\n", i + 1, chunks[i].c_str());
             }
             const auto ids = vocab->encode(prompt_text);
             std::printf("  %zu id(s)\n", ids.size());

@@ -61,7 +61,16 @@ const std::unordered_map<char32_t, uint8_t>& byte_decoder() {
     return table;
 }
 
-bool is_ws(char32_t c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+// `\s` as the reference's regex engine reads it: Unicode's White_Space property. It was ASCII's six
+// until CosyVoice3's front end was diffed against `tokenizers` over exotic text: an NBSP or an
+// ideographic space before punctuation ("\xa0.zero") was taken as part of a `[^\s\p{L}\p{N}]` run, so
+// the pre-token boundary moved and the ids changed. Python's extra U+001C..U+001F are NOT here -- they
+// are `str.isspace()`, not White_Space (`is_python_space` is the other set).
+bool is_ws(char32_t c) {
+    return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
+           c == 0x3000;
+}
 
 // [^\s\p{L}\p{N}] -- "punctuation-ish": not whitespace, not a letter, not a number. `include_marks`
 // additionally excludes \p{M} (qwen35's own regex moves marks into the letter-run alternative instead,
@@ -415,7 +424,10 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
     if (model_type != "gpt2") {
         return nullptr; // not this vocab type -- caller should try loom::Vocab (SentencePiece) instead
     }
+    return load_bpe(model);
+}
 
+std::unique_ptr<BpeVocab> BpeVocab::load_bpe(const GgufModel& model) {
     auto vocab = std::unique_ptr<BpeVocab>(new BpeVocab());
     const std::string pre_type = model.has_kv("tokenizer.ggml.pre") ? model.kv_str("tokenizer.ggml.pre") : "qwen2";
     const auto& table = pre_spec_table();
