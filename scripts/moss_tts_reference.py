@@ -24,7 +24,26 @@ It writes, all float32 (the one dtype `tests/support/npy_fixture.h` reads):
 * `wav_<N>f.npy`: the reference codec's decode of the greedy codes, interleaved `L R L R ...`,
   decoded with `num_quantizers=12`, the prefix decode MOSS-TTS's own processor asks for.
 
-Memory: the two models load one after the other (18 GB, then 4 GB at F32), never both at once.
+**Voice cloning** (`--clips`, default `samples/jfk.wav` and the codec's own demo clip -- 16 and 24 kHz,
+so the resample runs both times):
+
+* `clone_ref_codes_<i>.npy`: clip i through the processor's own `encode_audios_from_path` (channel
+  duplication, 48 kHz resample, loudness normalisation, `batch_encode` at F32), all clips in ONE batch
+  as a two-reference message encodes them. The script also encodes clip 0 on its own and stops if the
+  batch changed its codes, since a one-reference voice file is encoded alone.
+* `clone1_codes_<C>f.npy` / `clone2_codes_<C>f.npy`: greedy with clip 0 as the reference, and with
+  both. `clone1_codes_pinned.npy`: clip 0, sampled at the README's settings on `draws.npy`.
+
+The gate reads the codes through voice FILES written independently by the exporter's tool --
+
+    python -m loom_exporter.moss_tts_voices <model> -o $OUT --wav samples/jfk.wav --name voice_one ...
+    python -m loom_exporter.moss_tts_voices <model> -o $OUT --wav samples/jfk.wav \
+        --wav <codec>/demo/demo_gt.wav --name voice_pair ...
+
+-- and checks their inputs equal these arrays before comparing what the driver made of them.
+
+Memory: the models load one after the other (the codec ~8.5 GB while loading, then the LM 18 GB, then
+the codec again for its decoder), never two at once.
 """
 import argparse
 import gc
@@ -57,6 +76,32 @@ def pinned_sampler(state):
     return sample
 
 
+def encode_clips(model_dir, codec_dir, clips):
+    """The processor's own encode, batched as a message with every clip as a reference, plus clip 0
+    alone -- which must agree, or a one-reference voice file would not be what the batch saw."""
+    import transformers
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    config = transformers.AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    tok = transformers.AutoTokenizer.from_pretrained(model_dir)
+    codec = transformers.AutoModel.from_pretrained(codec_dir, trust_remote_code=True,
+                                                   dtype=torch.float32).eval()
+    codec.set_attention_implementation("sdpa")
+    codec.set_compute_dtype("fp32")
+    codec.decoder = torch.nn.ModuleList()
+    Proc = get_class_from_dynamic_module("processing_moss_tts.MossTTSLocalProcessor", model_dir)
+    proc = Proc(tokenizer=tok, audio_tokenizer=codec, model_config=config)
+    with torch.no_grad():
+        batched = proc.encode_audios_from_path([str(c) for c in clips])
+        alone = proc.encode_audios_from_path([str(clips[0])])[0]
+    if not torch.equal(batched[0], alone):
+        raise SystemExit(f"clip 0 encodes differently alone and in a batch "
+                         f"({int((batched[0] != alone).sum())} codes differ)")
+    del proc, codec
+    gc.collect()
+    return [c.numpy().astype(np.int64) for c in batched]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -65,6 +110,9 @@ def main() -> int:
     ap.add_argument("--frames", type=int, nargs="+", default=[12, 24])
     ap.add_argument("--pinned-frames", type=int, default=24)
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--clips", nargs="+", default=None,
+                    help="reference clips (default: samples/jfk.wav and <codec>/demo/demo_gt.wav)")
+    ap.add_argument("--clone-frames", type=int, default=24)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     out = Path(args.out).expanduser()
@@ -72,6 +120,13 @@ def main() -> int:
 
     import transformers
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    here = Path(__file__).resolve().parent.parent
+    clips = args.clips or [here / "samples" / "jfk.wav", Path(args.codec) / "demo" / "demo_gt.wav"]
+    ref_codes = encode_clips(args.model, args.codec, clips)
+    for i, codes in enumerate(ref_codes):
+        np.save(out / f"clone_ref_codes_{i}.npy", codes.astype(np.float32))
+        print(f"reference {i} ({clips[i]}): {codes.shape}")
 
     config = transformers.AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     config.attn_implementation = config.local_transformer_attn_implementation = "sdpa"
@@ -85,9 +140,10 @@ def main() -> int:
     np.save(out / "text_ids.npy", np.array(tok.encode(TEXT, add_special_tokens=False), np.float32))
     np.save(out / "language.npy", np.array([LANGUAGE_INDEX], np.float32))
 
-    def generate(frames, **kw):
+    def generate(frames, prompt=None, **kw):
+        prompt = batch if prompt is None else prompt
         with torch.no_grad():
-            got = model.generate(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            got = model.generate(input_ids=prompt["input_ids"], attention_mask=prompt["attention_mask"],
                                  max_new_tokens=frames, **kw)
         start, seq = got[0]
         return np.array([r[1:].tolist() for r in seq[start + 1:]
@@ -111,6 +167,28 @@ def main() -> int:
     np.save(out / "draws.npy", draws)
     np.save(out / "codes_pinned.npy", pinned.astype(np.float32))
     print(f"pinned: {pinned.shape}, {state['i']} draws used")
+
+    # Voice cloning: the references as `[frames, 12]` code tensors, which `_resolve_audio_items` takes
+    # as they are -- the codes the voice files hold, not the clips again.
+    refs = [torch.from_numpy(c) for c in ref_codes]
+    for n_refs in (1, 2):
+        prompt = proc([[proc.build_user_message(text=TEXT, reference=refs[:n_refs], language=LANGUAGE)]],
+                      mode="generation")
+        model.__dict__.pop("_sample_next_token", None)          # greedy: the class's own sampler
+        codes = generate(args.clone_frames, prompt, do_sample=False)
+        if codes.shape[0] != args.clone_frames:
+            raise SystemExit(f"clone with {n_refs} reference(s) stopped at {codes.shape[0]} frames")
+        np.save(out / f"clone{n_refs}_codes_{args.clone_frames}f.npy", codes.astype(np.float32))
+        print(f"clone, {n_refs} reference(s), greedy {args.clone_frames} frames: prompt "
+              f"{prompt['input_ids'].shape[1]} rows")
+        if n_refs == 1:
+            state = {"u": draws, "i": 0}
+            model._sample_next_token = pinned_sampler(state).__get__(model)
+            pinned = generate(args.pinned_frames, prompt, do_sample=True,
+                              audio_temperature=AUDIO_TEMPERATURE, audio_top_p=AUDIO_TOP_P,
+                              audio_top_k=AUDIO_TOP_K, audio_repetition_penalty=1.0)
+            np.save(out / "clone1_codes_pinned.npy", pinned.astype(np.float32))
+            print(f"clone pinned: {pinned.shape}, {state['i']} draws used")
 
     del model
     gc.collect()
