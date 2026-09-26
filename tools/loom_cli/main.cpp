@@ -48,8 +48,8 @@ void print_usage(const char* argv0) {
                   "  --out <path.wav>              for a model whose answer is AUDIO: synthesise and\n"
                   "                                write it. --prompt is the text, the IPA phonemes or\n"
                   "                                the codes, depending on what the file declares\n"
-                  "  --voice <voice.gguf>          a voice file for a model that takes one (pocket-tts's\n"
-                  "                                and cosyvoice3's `voices/*.gguf`); refused if made for\n"
+                  "  --voice <voice.gguf>          a voice file for a model that takes one (pocket-tts's,\n"
+                  "                                cosyvoice3's and voxtral-tts's `voices/*.gguf`); refused if made for\n"
                   "                                other weights\n"
                   "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
                   "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
@@ -608,6 +608,24 @@ int main(int argc, char** argv) {
                 std::printf("  %zu character%s not in this model's table fell back to bytes\n", fallback,
                             fallback == 1 ? "" : "s");
             }
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (contract.task == loom::task_names::TTS && model->has_kv("tokenizer.ggml.model") &&
+            model->kv_str("tokenizer.ggml.model") == "gpt2") {
+            // A TTS whose text front end is a plain byte-level BPE (Voxtral-4B-TTS's Tekken): the
+            // vocabulary encodes the text and the driver builds the rest of the prompt, so nothing here
+            // is per-model. Without this branch the file would fall through to the LM path below and be
+            // run as a text generator.
+            auto vocab = loom::BpeVocab::load(*model);
+            std::printf("  tokenizer: byte-level BPE (%s), %zu tokens\n",
+                        model->has_kv("tokenizer.ggml.pre") ? model->kv_str("tokenizer.ggml.pre").c_str() : "qwen2",
+                        vocab->size());
+            if (!has_prompt) return 0;
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
             if (out_wav.empty()) return 0;
             return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
                               rate_override(extra_inputs), synth_seed);

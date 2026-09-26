@@ -50,6 +50,12 @@ bool is_punctuation(char32_t cp);
 // regex attaches marks to the preceding letter run (`[\p{L}\p{M}]+`) rather than splitting on them.
 bool is_mark(char32_t cp);
 
+// `\p{Lu}` or `\p{Lt}` (an uppercase or titlecase letter), and `\p{Ll}` (a lowercase one): the two halves
+// of `\p{L}` Tekken's pretokenizer regex tells apart. The rest of `\p{L}` -- Lm and Lo, which is every
+// caseless script -- is in both of that regex's classes, so it is `is_letter` minus these two.
+bool is_upper_or_titlecase(char32_t cp);
+bool is_lowercase_letter(char32_t cp);
+
 // Single-codepoint lowercase mapping (loom::unicode_data::kLowercaseMap), identity if `cp` has no
 // mapping or its lowercase form isn't a single codepoint. Mirrors llama.cpp's own `unicode_tolower`
 // scope -- a table lookup, not a general case-folding algorithm.
