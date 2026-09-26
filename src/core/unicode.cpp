@@ -255,6 +255,10 @@ bool is_number(char32_t cp) { return in_ranges(cp, kNumberRanges, kNumberRangesC
 bool is_letter_or_number(char32_t cp) { return is_letter(cp) || is_number(cp); }
 bool is_punctuation(char32_t cp) { return in_ranges(cp, kPunctuationRanges, kPunctuationRangesCount); }
 bool is_mark(char32_t cp) { return in_ranges(cp, kMarkRanges, kMarkRangesCount); }
+bool is_upper_or_titlecase(char32_t cp) { return in_ranges(cp, kUpperTitleRanges, kUpperTitleRangesCount); }
+bool is_lowercase_letter(char32_t cp) {
+    return in_ranges(cp, kLowercaseLetterRanges, kLowercaseLetterRangesCount);
+}
 
 char32_t to_lower(char32_t cp) {
     const auto it = std::lower_bound(std::begin(kLowercaseMap), std::end(kLowercaseMap), cp,
