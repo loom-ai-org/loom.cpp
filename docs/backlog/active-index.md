@@ -159,10 +159,10 @@ release](#packaging--release)
   reports **2 passed, 14 skipped** and none of the passes ran the snippet — the ASR oracle included,
   since it grades the audio the card itself produced. Pre-existing (the x-vector snippet has the same
   shape) and surfaced by ICL's own verification, which had to be done outside the gate entirely.
-  **What would close it:** either the harness seeds a 24 kHz clip under a name the card can use
-  without lying to a reader, or the card's first block loads `audio` with a comment saying it stands
-  for the reader's own recording. Worth deciding once, because every future voice-cloning leaf
-  inherits it. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
+  **Decided by the user 2026-09-26: one common fixture, `jfk.wav`, stands for the reader's own
+  recording on every such card** (the gate already seeds it as `audio`; it is public domain). Still
+  to do: make the cloning cards (Qwen3-TTS, F5-TTS, MOSS-TTS) run on it -- for MOSS that means the
+  card gate also needs a voice file made from it, since making one needs PyTorch and the codec. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
   [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
 * [ ] **F5-TTS has no working high-level door, and its catalogued card documents one.** The export,
   the driver and `loom_cli` all work (gate: max |Δ| 4.14e-03 against the reference waveform; ASR
