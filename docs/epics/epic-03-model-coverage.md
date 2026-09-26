@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-25
+last_updated: 2026-09-26
 ---
 
 # Epic-03: Model Coverage
@@ -1129,7 +1129,8 @@ Ordered by coverage-per-effort. Live items are tracked in
 **Next families:** the remaining TTS families → small classifiers → music. **Six are done** —
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
-leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is at **seven of its twelve** leaves since
+leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is at **seven of the eight** leaves it will have (the user dropped kugelaudio, tada,
+dots-tts and irodori-tts on 2026-09-26; Voxtral-4B-TTS is the eighth, on the workstation) since
 CosyVoice3 landed 2026-09-24, right after Chatterbox, Pocket-TTS and VoxCPM2 (F5-TTS, on 2026-09-18, is where the "no engine primitive" run ended:
 [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)).
 §2 says what each cost, which is the number the rest of this list should be estimated against.
