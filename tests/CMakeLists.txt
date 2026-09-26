@@ -1692,6 +1692,13 @@ target_link_libraries(test_e2e_voxcpm2_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_voxcpm2_lua_driver COMMAND test_e2e_voxcpm2_lua_driver)
 set_tests_properties(test_e2e_voxcpm2_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
+# --- Family 9's eighth leaf: Voxtral-4B-TTS against vllm-omni's own flow head and codec, with pinned
+#     draws (scripts/voxtral_tts_reference.py). Codes identical free-running and teacher-forced. ---
+add_executable(test_e2e_voxtral_tts_lua_driver gate/test_e2e_voxtral_tts_lua_driver.cpp)
+target_link_libraries(test_e2e_voxtral_tts_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_voxtral_tts_lua_driver COMMAND test_e2e_voxtral_tts_lua_driver)
+set_tests_properties(test_e2e_voxtral_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_cosyvoice3_lua_driver gate/test_e2e_cosyvoice3_lua_driver.cpp)
 target_link_libraries(test_e2e_cosyvoice3_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_cosyvoice3_lua_driver COMMAND test_e2e_cosyvoice3_lua_driver)
