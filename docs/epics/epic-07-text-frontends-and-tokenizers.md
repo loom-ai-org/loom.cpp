@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-09-25
+last_updated: 2026-09-26
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -24,6 +24,12 @@ deliberate, temporary exception noted below.
 covers SentencePiece-style byte-fallback BPE, which has four structural differences from every other
 shape: no regex pretokenization (one chunk), no GPT-2 byte-level mapping (initial symbols are
 characters), and two more — each measured against the real tokenizer rather than inferred.
+
+`BpeShape::kTekken` (Mistral's tiktoken vocabulary, first for Voxtral-4B-TTS) is the first
+case-transition shape: its letter alternatives split "HelloWorld" at the case change, it merges by the
+rank of the merged bytes with no merge list, and it neither NFC-normalizes nor splits on its markers --
+all three tiktoken's ([ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md);
+12000/12000 against `mistral_common`).
 
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.
@@ -139,7 +145,7 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
 | Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md), [Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md) |
-| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md) |
+| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record
@@ -161,7 +167,9 @@ vocabulary holds literal UTF-8; a space→U+2581 normalizer with no dummy prefix
 Gated by `test_e2e_spm_byte_fallback_tokenizer` — nine cases, every expectation `AutoTokenizer.encode`
 verbatim, all encoding exactly and round-tripping. Gemma now exports with no `--tokenizer-pre` override.
 The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-script splitters,
-case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
+case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name --
+except Tekken's case-transition shape, which is `kTekken` since 2026-09-26 (written from `tekken.json`,
+not reached through that llama.cpp table).
 
 
 ### P4.23 — an instruction-tuned causal LM could not be prompted correctly — DONE (2026-08-29)
