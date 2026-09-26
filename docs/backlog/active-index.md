@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-25
+last_updated: 2026-09-26
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -78,8 +78,9 @@ release](#packaging--release)
     clone arms are exact. Left: (a) the staged GGUF in `hf-models/` (and so the `v5` fixture, a
     symlink to it) carries the new driver and `loom.voice.compat` by a dev-only driver swap over the
     2026-09-25 export's weights and topologies, not by an export, so the rc11 publish still needs the
-    fresh export it needs anyway; (b) the model card has no cloning section, and it would inherit the item below
-    because it needs the reader's own clip; (c) a clip-in door inside loom (the codec encoder as
+    fresh export it needs anyway; (b) the card's cloning section is staged, and the card gate
+    stops at it as a reader-supplied file, so `test_the_card_runs` is a SKIP for this model now, the
+    Qwen3-TTS item below (the codec-LM oracle row still passes on the first block's audio); (c) a clip-in door inside loom (the codec encoder as
     phases) and `loom_cli`'s missing `text2codes` path, neither started.
     *Context: [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md)*
 * [ ] **Chatterbox (family 9's fourth leaf) is built, verified and pushed (no PRs), and not yet

@@ -1,6 +1,7 @@
 ---
 type: retro
 date: 2026-09-25
+updated: 2026-09-26
 domain: host-api
 tags: [loom-py, memory, gate, model-cards, moss]
 ---
@@ -40,6 +41,19 @@ each card.
 "freed after the next allocation fails". Check with a `weakref` and `gc.disable()`, not by watching
 RSS. And a SIGKILL with a truncated log is memory until proven otherwise; the gate's own memory note
 had recorded exactly that symptom before.
+
+## It Came Back One Layer Out (2026-09-26)
+
+MOSS-TTS's card gained a voice-cloning block, and the gate was OOM-killed again: exit 137, peak
+27.3 GB, on the row after `test_the_card_runs`. The model had no cycle this time. The cloning block
+needs the reader's own voice file, so that row now SKIPS, and pytest keeps a skip's exception on the
+report. The traceback keeps the test's frame, and the frame keeps the namespace `run_card` returned,
+with the 16.8 GB LM and its codec in it. Before the card changed, that row passed, so nothing held
+the frame. The gate now empties every card namespace at teardown (an autouse fixture in
+`tests/gate/test_model_cards.py`), and the same run peaks at 23.0 GB and passes.
+
+**The takeaway widens:** a test that holds gigabytes must also release them on the paths where it
+does NOT pass, because a skip or a failure keeps its frame alive for the rest of the session.
 
 ## Related
 
