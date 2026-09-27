@@ -213,6 +213,12 @@ std::vector<char32_t> utf8_decode(const std::string& text) {
     return out;
 }
 
+bool is_python_space(char32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || (cp >= 0x1C && cp <= 0x20) || cp == 0x85 || cp == 0xA0 ||
+           cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 ||
+           cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+
 std::string utf8_encode(const std::vector<char32_t>& codepoints) {
     std::string out;
     out.reserve(codepoints.size());
@@ -249,6 +255,10 @@ bool is_number(char32_t cp) { return in_ranges(cp, kNumberRanges, kNumberRangesC
 bool is_letter_or_number(char32_t cp) { return is_letter(cp) || is_number(cp); }
 bool is_punctuation(char32_t cp) { return in_ranges(cp, kPunctuationRanges, kPunctuationRangesCount); }
 bool is_mark(char32_t cp) { return in_ranges(cp, kMarkRanges, kMarkRangesCount); }
+bool is_upper_or_titlecase(char32_t cp) { return in_ranges(cp, kUpperTitleRanges, kUpperTitleRangesCount); }
+bool is_lowercase_letter(char32_t cp) {
+    return in_ranges(cp, kLowercaseLetterRanges, kLowercaseLetterRangesCount);
+}
 
 char32_t to_lower(char32_t cp) {
     const auto it = std::lower_bound(std::begin(kLowercaseMap), std::end(kLowercaseMap), cp,

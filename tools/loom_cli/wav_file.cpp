@@ -31,7 +31,7 @@ std::string read_tag(std::istream& f) {
 
 } // namespace
 
-std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
+std::vector<float> load_wav_pcm16_mono(const std::string& path, uint32_t expected_rate) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         throw std::runtime_error("load_wav: cannot open '" + path + "'");
@@ -83,9 +83,10 @@ std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
     if (pcm.empty()) {
         throw std::runtime_error("load_wav: '" + path + "' has no 'data' chunk");
     }
-    if (sample_rate != 16000) {
+    if (sample_rate != expected_rate) {
         throw std::runtime_error("load_wav: '" + path + "' is " + std::to_string(sample_rate) +
-                                  "Hz; this model requires 16000Hz (no resampling implemented)");
+                                  "Hz; this model requires " + std::to_string(expected_rate) +
+                                  "Hz (no resampling implemented)");
     }
 
     const uint16_t channels = std::max<uint16_t>(num_channels, 1);
@@ -106,13 +107,28 @@ void put32(std::FILE* f, uint32_t v) { std::fwrite(&v, 4, 1, f); }
 void put16(std::FILE* f, uint16_t v) { std::fwrite(&v, 2, 1, f); }
 }  // namespace
 
+std::vector<float> load_wav_pcm16_mono_16k(const std::string& path) {
+    return load_wav_pcm16_mono(path, 16000);
+}
+
 void write_wav_pcm16_mono(const std::string& path, const std::vector<float>& samples, uint32_t rate) {
+    write_wav_pcm16(path, samples, rate, 1);
+}
+
+void write_wav_pcm16(const std::string& path, const std::vector<float>& samples, uint32_t rate,
+                     uint32_t channels) {
+    if (channels == 0 || samples.size() % channels != 0) {
+        throw std::runtime_error("write_wav_pcm16: " + std::to_string(samples.size()) +
+                                 " sample(s) is not a whole number of " + std::to_string(channels) +
+                                 "-channel frames");
+    }
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f == nullptr) throw std::runtime_error("could not open '" + path + "' for writing");
     const auto n = static_cast<uint32_t>(samples.size());
+    const auto ch = static_cast<uint16_t>(channels);
     std::fwrite("RIFF", 1, 4, f); put32(f, 36 + n * 2); std::fwrite("WAVE", 1, 4, f);
-    std::fwrite("fmt ", 1, 4, f); put32(f, 16); put16(f, 1); put16(f, 1);
-    put32(f, rate); put32(f, rate * 2); put16(f, 2); put16(f, 16);
+    std::fwrite("fmt ", 1, 4, f); put32(f, 16); put16(f, 1); put16(f, ch);
+    put32(f, rate); put32(f, rate * 2 * ch); put16(f, static_cast<uint16_t>(2 * ch)); put16(f, 16);
     std::fwrite("data", 1, 4, f); put32(f, n * 2);
     for (float s : samples) {
         const float clipped = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);

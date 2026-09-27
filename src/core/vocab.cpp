@@ -23,6 +23,7 @@ size_t utf8_codepoint_len(unsigned char lead) {
 constexpr int32_t kTokenTypeNormal = 1;
 constexpr int32_t kTokenTypeUserDefined = 4;
 constexpr int32_t kTokenTypeUnused = 5;
+constexpr int32_t kTokenTypeByte = 6;
 
 // SentencePiece's word-boundary marker, U+2581 ("▁"), UTF-8-encoded.
 const std::string kEscapedSpace = "\xE2\x96\x81";
@@ -40,8 +41,12 @@ std::unique_ptr<Vocab> Vocab::load(const GgufModel& model) {
                          "are implemented");
     }
 
+    return load_sentencepiece(model, model_type == "llama");
+}
+
+std::unique_ptr<Vocab> Vocab::load_sentencepiece(const GgufModel& model, bool is_bpe) {
     auto vocab = std::unique_ptr<Vocab>(new Vocab());
-    vocab->is_bpe_ = (model_type == "llama");
+    vocab->is_bpe_ = is_bpe;
     vocab->tokens_ = model.kv_arr_str("tokenizer.ggml.tokens");
     vocab->scores_ = model.kv_arr_f32("tokenizer.ggml.scores");
     vocab->token_type_ = model.kv_arr_i32("tokenizer.ggml.token_type");
@@ -55,6 +60,31 @@ std::unique_ptr<Vocab> Vocab::load(const GgufModel& model) {
     vocab->add_eos_token_ = model.kv_bool("tokenizer.ggml.add_eos_token", false);
     vocab->add_space_prefix_ = model.kv_bool("tokenizer.ggml.add_space_prefix", true);
     vocab->remove_extra_whitespaces_ = model.kv_bool("tokenizer.ggml.remove_extra_whitespaces", true);
+    vocab->byte_fallback_ = model.kv_bool("tokenizer.ggml.byte_fallback", false);
+    if (vocab->byte_fallback_) {
+        if (vocab->is_bpe_) {
+            // encode_bpe has no byte fallback; a file claiming one would tokenize unknown text wrongly
+            // and silently, so it is refused rather than loaded.
+            throw LoadError("Vocab::load: tokenizer.ggml.byte_fallback is set on a SentencePiece BPE "
+                             "vocabulary, and only the unigram encode implements it");
+        }
+        vocab->byte_ids_.assign(256, -1);
+        for (size_t id = 0; id < vocab->tokens_.size(); ++id) {
+            const std::string& piece = vocab->tokens_[id];
+            // SentencePiece spells byte pieces `<0xNN>` with upper-case hex, and types them BYTE.
+            if (vocab->token_type_[id] != kTokenTypeByte || piece.size() != 6 || piece.compare(0, 3, "<0x") != 0 ||
+                piece[5] != '>') {
+                continue;
+            }
+            vocab->byte_ids_[std::stoul(piece.substr(3, 2), nullptr, 16)] = static_cast<int32_t>(id);
+        }
+        for (int b = 0; b < 256; ++b) {
+            if (vocab->byte_ids_[static_cast<size_t>(b)] < 0) {
+                throw LoadError("Vocab::load: tokenizer.ggml.byte_fallback is set but byte " + std::to_string(b) +
+                                 " has no <0xNN> piece");
+            }
+        }
+    }
 
     if (model.has_kv("tokenizer.ggml.precompiled_charsmap")) {
         vocab->charsmap_ = model.kv_arr_u8("tokenizer.ggml.precompiled_charsmap");
@@ -332,7 +362,14 @@ std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
     size_t pos = n;
     while (pos > 0) {
         const BestTok& bt = best[pos];
-        ids.push_back(bt.token_id);
+        if (bt.token_id == unk_id_ && byte_fallback_) {
+            // The codepoint's bytes, pushed last-first because the whole list is reversed below.
+            for (size_t b = pos; b > bt.start; --b) {
+                ids.push_back(byte_ids_[static_cast<unsigned char>(normalized[b - 1])]);
+            }
+        } else {
+            ids.push_back(bt.token_id);
+        }
         pos = bt.start;
     }
     std::reverse(ids.begin(), ids.end());
@@ -342,6 +379,11 @@ std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
 std::string Vocab::decode(const std::vector<int32_t>& ids) const {
     std::string joined;
     for (int32_t id : ids) {
+        if (byte_fallback_ && token_type_[static_cast<size_t>(id)] == kTokenTypeByte) {
+            // A `<0xNN>` piece is the byte itself; consecutive ones re-form the codepoint they split.
+            joined += static_cast<char>(std::stoul(id_to_piece(id).substr(3, 2), nullptr, 16));
+            continue;
+        }
         joined += id_to_piece(id);
     }
 

@@ -299,8 +299,8 @@ private:
     // language detection, whose 98 language tokens sit inside the transcript vocabulary, so an
     // unrestricted argmax would answer with a word (BACKLOG.md P4.1 follow-up).
     static int l_argmax_row_range(lua_State* L);
-    // `loom.sample_row(module, row, {temperature =, top_k =, top_p =, lo =, hi =, generation =,
-    // guidance = {module =, scale =}})` -> one token id DRAWN from that row rather than maximized over
+    // `loom.sample_row(module, row, {temperature =, top_k =, top_p =, min_p =, lo =, hi =, generation =,
+    // repetition_penalty =, penalized =, guidance = {module =, scale =}})` -> one token id DRAWN from that row rather than maximized over
     // it (P4.24). Greedy settings run `l_argmax_row`'s own reduction over the same window -- see
     // `sample_tensor_row`. `lo`/`hi` restrict it to a half-open id window and return absolute ids, as
     // `l_argmax_row_range` does; `guidance` combines this module's logits with a second module's as
@@ -330,6 +330,12 @@ private:
     // express. First needed by VITS's relative-attention layers; nothing in it is VITS-specific.
     static int l_pad_crop_relative_embeddings(lua_State* L);
     static int l_get_weight(lua_State* L);
+    // `loom.seed_kv(module, source [, n_rows])`: writes a saved attention state into the first n_rows
+    // positions of `module`'s KV cache. MEETS the binding criterion: it reads no model config (the
+    // cache's geometry is the one the host already allocated), and the cache is engine-owned state no
+    // graph input can reach -- the only other writer is an ATTENTION node, which writes what it just
+    // projected. First needed by Pocket-TTS, whose voices ship as KV caches; ADR-043.
+    static int l_seed_kv(lua_State* L);
 };
 
 } // namespace loom

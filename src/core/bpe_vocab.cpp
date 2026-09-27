@@ -61,7 +61,16 @@ const std::unordered_map<char32_t, uint8_t>& byte_decoder() {
     return table;
 }
 
-bool is_ws(char32_t c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+// `\s` as the reference's regex engine reads it: Unicode's White_Space property. It was ASCII's six
+// until CosyVoice3's front end was diffed against `tokenizers` over exotic text: an NBSP or an
+// ideographic space before punctuation ("\xa0.zero") was taken as part of a `[^\s\p{L}\p{N}]` run, so
+// the pre-token boundary moved and the ids changed. Python's extra U+001C..U+001F are NOT here -- they
+// are `str.isspace()`, not White_Space (`is_python_space` is the other set).
+bool is_ws(char32_t c) {
+    return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
+           c == 0x3000;
+}
 
 // [^\s\p{L}\p{N}] -- "punctuation-ish": not whitespace, not a letter, not a number. `include_marks`
 // additionally excludes \p{M} (qwen35's own regex moves marks into the letter-run alternative instead,
@@ -312,6 +321,68 @@ bool match_ws_fallback(const std::vector<char32_t>& cps, size_t pos, size_t& end
     return true;
 }
 
+// Tekken's two letter alternatives (see BpeShape::kTekken), `P? A* B+` and `P? A+ B*`, where P is
+// `[^\r\n\p{L}\p{N}]`, A is `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and B is `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`. A and B
+// OVERLAP (Lm, Lo, M), so this is the regex's own backtracking, written out: the optional P is tried
+// present first, the greedy A* gives back one character at a time until a B can start, and the first
+// success in that order is the match -- which is what makes "你好" one chunk (A* takes both, gives the
+// second back to B+) and "HELLO" fail the first alternative and match the second.
+bool tekken_a(char32_t c) {
+    return is_mark(c) || (is_letter(c) && !is_lowercase_letter(c));
+}
+bool tekken_b(char32_t c) {
+    return is_mark(c) || (is_letter(c) && !is_upper_or_titlecase(c));
+}
+bool tekken_p(char32_t c) {
+    return c != U'\r' && c != U'\n' && !is_letter(c) && !is_number(c);
+}
+
+bool match_tekken_letters(const std::vector<char32_t>& cps, size_t pos, bool a_plus, size_t& end) {
+    const size_t n = cps.size();
+    for (int with_p = 1; with_p >= 0; --with_p) {
+        size_t s = pos;
+        if (with_p) {
+            if (!tekken_p(cps[pos])) continue;
+            s = pos + 1;
+        }
+        size_t a_end = s;
+        while (a_end < n && tekken_a(cps[a_end])) ++a_end;
+        if (a_plus) {
+            // `A+ B*`: greedy A+ takes the whole run and B* never fails, so the first try is the match.
+            if (a_end == s) continue;
+            size_t b_end = a_end;
+            while (b_end < n && tekken_b(cps[b_end])) ++b_end;
+            end = b_end;
+            return true;
+        }
+        // `A* B+`: give A back from the right until B+ can match at least one character.
+        for (size_t k = a_end;; --k) {
+            if (k < n && tekken_b(cps[k])) {
+                size_t b_end = k;
+                while (b_end < n && tekken_b(cps[b_end])) ++b_end;
+                end = b_end;
+                return true;
+            }
+            if (k == s) break;
+        }
+    }
+    return false;
+}
+
+// ` ?[^\s\p{L}\p{N}]+[\r\n/]*` (kTekken) -- kQwenLlama3's punct run with `/` also absorbed at the end.
+bool match_tekken_punct(const std::vector<char32_t>& cps, size_t pos, size_t& end) {
+    const size_t n = cps.size();
+    size_t begin;
+    if (cps[pos] == U' ' && pos + 1 < n && is_punct(cps[pos + 1])) begin = pos + 1;
+    else if (is_punct(cps[pos])) begin = pos;
+    else return false;
+    size_t p = begin;
+    while (p < n && is_punct(cps[p])) ++p;
+    while (p < n && (cps[p] == U'\r' || cps[p] == U'\n' || cps[p] == U'/')) ++p;
+    end = p;
+    return true;
+}
+
 struct PreSpec {
     BpeShape shape;
     size_t max_number_run; // meaning is per-shape -- see BpeShape's own doc comment
@@ -336,6 +407,8 @@ const std::unordered_map<std::string, PreSpec>& pre_spec_table() {
         {"granite-embed-multi-311m", {BpeShape::kSpmByteFallback, 0}},
         {"granite-embed-multi-97m", {BpeShape::kSpmByteFallback, 0}},
         {"qwen2", {BpeShape::kQwenLlama3, 1}},
+        // Tekken (Mistral): case-transition letter runs, single digits, no NFC, no added-token split.
+        {"tekken", {BpeShape::kTekken, 1}},
         {"deepseek-r1-qwen", {BpeShape::kQwenLlama3, 1}},
         {"kormo", {BpeShape::kQwenLlama3, 1}},
         {"f2llmv2", {BpeShape::kQwenLlama3, 1}},
@@ -415,7 +488,10 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
     if (model_type != "gpt2") {
         return nullptr; // not this vocab type -- caller should try loom::Vocab (SentencePiece) instead
     }
+    return load_bpe(model);
+}
 
+std::unique_ptr<BpeVocab> BpeVocab::load_bpe(const GgufModel& model) {
     auto vocab = std::unique_ptr<BpeVocab>(new BpeVocab());
     const std::string pre_type = model.has_kv("tokenizer.ggml.pre") ? model.kv_str("tokenizer.ggml.pre") : "qwen2";
     const auto& table = pre_spec_table();
@@ -433,10 +509,19 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
     vocab->tokens_ = model.kv_arr_str("tokenizer.ggml.tokens");
     vocab->token_to_id_.reserve(vocab->tokens_.size());
     for (size_t i = 0; i < vocab->tokens_.size(); ++i) {
-        vocab->token_to_id_.emplace(vocab->tokens_[i], static_cast<int32_t>(i));
+        // Tekken's markers come first (ids 0..999) and a marker's spelling can also be a byte
+        // sequence's ("<s>" may be both a marker and a rank). Text must reach the RANK, so there the
+        // map is filled from the end and the later id keeps a shared spelling.
+        const size_t id = vocab->shape_ == BpeShape::kTekken ? vocab->tokens_.size() - 1 - i : i;
+        vocab->token_to_id_.emplace(vocab->tokens_[id], static_cast<int32_t>(id));
     }
 
-    const std::vector<std::string> merges = model.kv_arr_str("tokenizer.ggml.merges");
+    // Tekken ships no merges: tiktoken merges the adjacent pair whose CONCATENATION has the lowest
+    // rank, and a merge list rebuilt from the ranks (llama.cpp's and HF's conversion) is that rule only
+    // where each token's canonical split is the pair that meets it. `bpe_merge` asks the rank directly.
+    const std::vector<std::string> merges = vocab->shape_ == BpeShape::kTekken
+                                                ? std::vector<std::string>{}
+                                                : model.kv_arr_str("tokenizer.ggml.merges");
     vocab->merge_rank_.reserve(merges.size());
     for (size_t rank = 0; rank < merges.size(); ++rank) {
         const std::string& pair = merges[rank];
@@ -453,6 +538,9 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
     // does not say which of its ids are added, and GUESSING (every `<...>`-looking piece, say) would
     // make `encode` disagree with the reference tokenizer on ordinary text that happens to look like a
     // marker. So an old file tokenizes exactly as it did, and a re-export is what turns this on.
+    // Tekken reads its token types (they say which ids are control markers, for `decode` and
+    // `is_control`) but splits on none of them: tiktoken is built with `special_tokens={}`, so its
+    // `encode` reads a typed "[AUDIO]" as seven characters of text.
     if (model.has_kv("tokenizer.ggml.token_type")) {
         vocab->token_type_ = model.kv_arr_i32("tokenizer.ggml.token_type");
         if (vocab->token_type_.size() != vocab->tokens_.size()) {
@@ -465,6 +553,7 @@ std::unique_ptr<BpeVocab> BpeVocab::load(const GgufModel& model) {
             const int32_t type = vocab->token_type_[i];
             if (type != kTokenTypeControl && type != kTokenTypeUserDefined) continue;
             const std::string& piece = vocab->tokens_[i];
+            if (vocab->shape_ == BpeShape::kTekken) continue;
             if (piece.empty()) continue;
             vocab->added_to_id_.emplace(piece, static_cast<int32_t>(i));
             vocab->max_added_len_ = std::max(vocab->max_added_len_, piece.size());
@@ -528,6 +617,15 @@ std::vector<std::string> BpeVocab::pretokenize(const std::string& nfc_text) cons
                           match_ws_not_followed_by_nonspace(cps, pos, end) ||
                           match_ws_fallback(cps, pos, end);
                 break;
+            case BpeShape::kTekken:
+                matched = match_tekken_letters(cps, pos, /*a_plus=*/false, end) ||
+                          match_tekken_letters(cps, pos, /*a_plus=*/true, end) ||
+                          match_number_run(cps, pos, 1, end) ||
+                          match_tekken_punct(cps, pos, end) ||
+                          match_ws_then_newline(cps, pos, end) ||
+                          match_ws_not_followed_by_nonspace(cps, pos, end) ||
+                          match_ws_fallback(cps, pos, end);
+                break;
             case BpeShape::kWhitespacePunctExclude:
                 matched = (max_number_run_ >= 1 && match_number_run(cps, pos, 1, end)) ||
                           match_ws_excl_punct(cps, pos, end, /*exclude_digits=*/max_number_run_ >= 1) ||
@@ -556,6 +654,15 @@ void BpeVocab::bpe_merge(std::vector<std::string>& pieces) const {
         int best_rank = INT_MAX;
         size_t best_idx = SIZE_MAX;
         for (size_t i = 0; i + 1 < pieces.size(); ++i) {
+            if (shape_ == BpeShape::kTekken) {
+                // Ids past the markers are the ranks in order, so the id IS the priority.
+                const auto it = token_to_id_.find(pieces[i] + pieces[i + 1]);
+                if (it != token_to_id_.end() && it->second < best_rank) {
+                    best_rank = it->second;
+                    best_idx = i;
+                }
+                continue;
+            }
             const auto it = merge_rank_.find(pieces[i] + '\x01' + pieces[i + 1]);
             if (it != merge_rank_.end() && it->second < best_rank) {
                 best_rank = it->second;
@@ -637,7 +744,9 @@ void BpeVocab::encode_segment(const std::string& text, std::vector<int32_t>& ids
     // NFC is deliberately skipped for the SPM family: its HF normalizer is a bare
     // Replace(" ", "\u2581") and nothing else, so composing decomposed sequences here would tokenize
     // differently from the reference model on exactly the inputs where it matters.
+    // Tekken is skipped for the same reason: tiktoken encodes the string it is given.
     const std::string normalized = shape_ == BpeShape::kSpmByteFallback ? spm_normalize(text)
+                                   : shape_ == BpeShape::kTekken       ? text
                                                                         : nfc_normalize(text);
     const std::vector<std::string> chunks = pretokenize(normalized);
     const auto& enc = byte_encoder();

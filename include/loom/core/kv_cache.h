@@ -56,7 +56,15 @@ public:
     ggml_tensor* read_k(ggml_context* ctx, uint32_t layer, uint32_t n_kv) const;
     ggml_tensor* read_v(ggml_context* ctx, uint32_t layer, uint32_t n_kv) const;
 
+    // Host-side write of rows [first_row, first_row + n_rows) of one layer's K (value == false) or V
+    // cache from `data`, row-major [n_rows, n_embd_k/v]. The one way a cache gets rows no graph wrote:
+    // a model whose conditioning ships as ATTENTION STATE rather than as inputs (Pocket-TTS's voices are
+    // the flow LM's K and V after a prefill whose inputs are not recoverable from them) -- ADR-043.
+    void set_rows(uint32_t layer, bool value, const float* data, uint32_t first_row, uint32_t n_rows);
+
     uint32_t n_layer() const { return static_cast<uint32_t>(k_layers_.size()); }
+    uint32_t n_embd_k() const { return n_embd_k_; }
+    uint32_t n_embd_v() const { return n_embd_v_; }
     uint32_t kv_size() const { return kv_size_; }
 
     // Zeroes the whole cache. Doesn't reset any "current length" bookkeeping -- that's the caller's

@@ -63,6 +63,16 @@ enum class BpeShape {
     // `max_number_run_`/`include_marks_` are unused here; digits come out one per token because the
     // vocab simply has no multi-digit merges, not because anything splits them.
     kSpmByteFallback,
+    // Tekken, Mistral's tiktoken vocabulary (Voxtral-4B-TTS, and every Mistral model since Nemo). Its
+    // regex is GPT-4o's without the contractions --
+    //   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+    //   |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+    //   |\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+    // -- which splits a letter run at a lower-to-upper CASE CHANGE ("HelloWorld" is two words), the thing
+    // no shape above could express. Three more differences from the byte-level shapes, all tiktoken's:
+    // NO normalization (tiktoken encodes the string as given, so no NFC), NO added-token pre-split (its
+    // `special_tokens={}` -- a typed "[AUDIO]" is text), and digits one at a time.
+    kTekken,
 };
 
 // Byte-level BPE vocabulary loaded from a GGUF's "tokenizer.ggml.*" KVs, llama.cpp's own "gpt2" schema
@@ -81,6 +91,11 @@ public:
     // `pre_spec_table()` doesn't implement (fail loud rather than silently mis-tokenizing) -- absent
     // entirely, it still defaults to "qwen2" unchanged, same as before this family registry existed.
     static std::unique_ptr<BpeVocab> load(const GgufModel& model);
+
+    // The same byte-level BPE under a tag that is not "gpt2" -- a front end that WRAPS one
+    // (`CosyVoice3Vocab`, "cosyvoice3") and so names its own scheme. Reads the tag's `tokenizer.ggml.*`
+    // keys exactly as `load` does; the caller has already decided the tag is its own.
+    static std::unique_ptr<BpeVocab> load_bpe(const GgufModel& model);
 
     // Splits `text` on this vocabulary's ADDED tokens first (see `added_to_id_`), then NFC-normalizes
     // each remaining segment (loom::nfc_normalize), splits it via this vocab's `BpeShape` pretokenizer

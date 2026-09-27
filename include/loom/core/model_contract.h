@@ -75,6 +75,10 @@ struct ModelContract {
 
     // Audio sample rate, whichever side the audio is on. 0 when the file names none.
     uint32_t sample_rate = 0;
+    // Interleaved channels in that audio: 2 means the samples run `L R L R ...` and there are
+    // `size / 2` sample FRAMES. 1 when the file names none, which is every model but a stereo codec
+    // (MOSS-Audio-Tokenizer, `loom.channels`) -- so a mono file needs no key and did not move.
+    uint32_t channels = 1;
     // The clip length this model's graph is built at, in samples; 0 means the length is dynamic, which
     // is the common case (every ASR family but Whisper). Reads `loom.n_samples`.
     uint32_t clip_samples = 0;

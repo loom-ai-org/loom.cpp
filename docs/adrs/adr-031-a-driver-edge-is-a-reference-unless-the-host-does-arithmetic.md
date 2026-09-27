@@ -71,6 +71,10 @@ Three engine additions make that expressible where it was not:
   CFM state moves.
 * A duration predictor's output, and every returned waveform. Those are the rule, not exceptions to
   it: the host really does read them.
+* Noise drawn for a graph INPUT (an NSF vocoder's per-sample noise, VITS's `z_noise`, SNAC's
+  `NoiseBlock`s). It starts on the host either way, because `rng_` is a host stream, and it crosses
+  as one bulk push. [ADR-042](adr-042-a-samplers-noise-is-the-engines-a-graph-inputs-noise-is-the-drivers.md) measured Chatterbox's at 0.02% of a synthesis and keeps it
+  driver-side. A sampler's starting state is the other case: `run_ode` draws that one itself.
 
 **22 plain `run_subgraph` calls remain across 24 models, and every one is in that list.** The audit is
 finished in the sense that matters — what is left is not a crossing anyone can remove without moving
