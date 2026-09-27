@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: exporter
-last_updated: 2026-08-22
+last_updated: 2026-09-17
 ---
 
 # Epic-02: The MIL Exporter and Compiler
@@ -53,6 +53,22 @@ The pipeline, front to back:
 8. **Write.** Weights merged with a content-aware dedup-on-match / hard-fail-on-mismatch check;
    repeated tensors aliased by content hash through `loom.tensor_alias.*` KVs.
 
+   **Packing is not part of this step for a multi-phase model** (P5.0,
+   [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md)). `pack_weights()` — dtype
+   normalisation, the P4.13 conv-kernel fold, quantization — runs as each phase converts, so what
+   crosses a phase boundary is the tensor's on-disk payload rather than its F32 array. It is legal to
+   answer a question about *all* topologies from *one* only because `flat_namespace` is False here and
+   every weight carries its own phase's `{func_name}.` prefix; `_check_phase_weight_namespaces` checks
+   that against the merged topologies rather than assuming it. `write_gguf` then finds only the
+   driver's own `loom.get_weight` tensors unpacked.
+
+   **Peak memory during conversion is what decides which checkpoints are exportable at all**, and
+   `--isolate-phases` / `$LOOM_PHASE_ISOLATION` makes it a max rather than a sum: each phase converts
+   in a child process that spills its packed weights, and the parent maps them back so
+   `GGUFWriter`'s own `tofile` streams them into the artifact without faulting them in. A respawn
+   rather than a fork, because `phases()` has already run a torch forward pass by then and forking
+   after one deadlocks — the probe is in the ADR.
+
 ### Family templates
 
 Per-family templates, not universal orchestration inference, are the direction that works:
@@ -87,7 +103,7 @@ Record the baseline from a `git worktree` at the merge-base with its own `cwd` a
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md) |
 | Retros | [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-016](../retros/retro-016-the-profile-field-was-not-inert.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-002](../retros/retro-002-lstm-gate-stack-computed-twice.md) |
 | In `loom-exporter` | `docs/BACKEND.md` (read first if you are touching the exporter), `docs/EXPORT-IMPROVEMENT.md`, `docs/EXPORT-PREPARATION.md`, `docs/EXPORT-ROADMAP.md`, `docs/LOOM_MIL_CONVERSION.md`, `docs/DRIVER-COMPONENTS.md` |
 | Active tasks | [Backlog → Exporter](../backlog/active-index.md#exporter--mil-compiler) |

@@ -21,7 +21,6 @@ are not renumbered. New items continue the scheme.
 |---|---|
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | rc10 is out and nothing structural sits in front of the next family. [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Six families are complete — 4, 5, 6, 10, 11 and 12 — and five of them needed **no engine primitive**, which is the acceptance criterion holding rather than a run of luck. Estimate the next leaf against what those cost and against the correction families 4 and 5 both wrote down: the CTC *head* is free, the *encoder template* is not shared, and the bill lands where the scoping did not look — a rebuilt kaldi front end, four entries in the exporter's own shape walk → [Epic-03 §2](../epics/epic-03-model-coverage.md) |
 | **Qwen3-TTS's repetition penalty disagrees with `transformers`, and the shipped file is the one that differs** | Surfaced by ICL's verification and **pre-existing**: on a target sentence short enough that the model wants to repeat a frame, the reference emits the repeat and loom does not. `repetition_penalty = 1.0` makes loom reproduce the reference 624/624 over 39 frames; the checkpoint's own 1.05 gives 96/624. The published GGUF and this branch's agree 640/640 on that input, so nothing regressed — but one of the two implementations is applying a penalty the other is not, and the cards describe the shipped behaviour. **Do not change the default before instrumenting the reference's processor** → see [Models](#models) |
-| **P5.0 decides which models are exportable at all, and two of its three changes are open** | Peak RSS during *conversion* is the constraint that picks the zoo, not the template. Change 1 is done and took Granite-Speech from 30.4 GB to 22.9 GB — the difference between OOM and a clean export — and the two that remain (quantize per phase as it converts; convert each phase in its own process) are what any Voxtral-sized checkpoint waits on. Not a cleanup → see [Models](#models) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
 open.** Four packages on PyPI at `1.0.0rc10`, both macOS architectures included; the `linux_armv6l`
@@ -107,14 +106,35 @@ rule above: a GGUF published before its wheel is a file nobody can run.
   sentence, 1.5M at the 512-token ceiling;
   [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md) records the in-graph
   alternative if it ever becomes measurable.*
-* [ ] **P5.0 — per-phase process isolation for conversion.** Decides which models are exportable at all
-  on a given machine. Change 1 done (30.4 → 22.9 GB peak on Granite-Speech). Two remain:
-  * [ ] quantize/`astype` each phase's weights as it converts, rather than at write time
-  * [ ] convert each phase in its own process, loading only that phase's submodule — needs partial
-    checkpoint loading and a merge that reads children back off disk
-  * *Note: even all three leave Voxtral at ~29 GB against 28. Not a fix for that model.*
+* [ ] **Voxtral-Mini-3B waits on a machine, not on the exporter.** P5.0 is closed — all three changes
+  are in ([ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md)): a phase releases its
+  torch and MIL halves together, packs its weights as it converts, and under `--isolate-phases`
+  converts in a process of its own. Its LM phase alone still needs ~14.4 GB of F32 weights beside
+  ~14.4 GB of MIL constants, so the floor is ~29 GB against this box's 28 and no further exporter
+  change moves it. The measurements a bigger machine would pick it up from are in
+  [Epic-03 §2](../epics/epic-03-model-coverage.md).
+  * [ ] *The one exporter change still worth making here, and only if load TIME starts to matter:*
+    a per-family hook that loads one phase's submodule instead of the whole checkpoint. An N-phase
+    model costs N+1 checkpoint loads under isolation today. It would not change the peak.
 
 ## Exporter / MIL compiler
+
+* [ ] **An export's op names depend on what its process converted earlier.**
+  `coremltools`' `Builder.name_count` is a *class* attribute -- one counter for the whole process --
+  and `_get_free_name` both reads and increments it, so an op a MIL pass builds without an explicit
+  name is `transpose_0` in a fresh interpreter and `transpose_21` in one that has already converted
+  twenty. That name reaches the emitted topology as the node's output, so **two exports of the same
+  checkpoint from differently-warmed processes are not byte-identical.** Harmless in practice today --
+  `loom-export` converts one model and exits, which is why the sweep has never seen it, and
+  `whisper-small` came out byte-identical exported both with and without `--isolate-phases`
+  (969,918,400 bytes, `cmp` clean) -- and it is *not* new with phase isolation, which is only what
+  surfaced it, inside a pytest session where the in-process arm had a warmed counter and its workers
+  did not. **The fix is one line** (clear `Builder.name_count` before each phase's `ct.convert`), and
+  the reason it is filed rather than done is that it would rewrite those names in every artifact whose
+  later phases contain an auto-named op, so it needs a sweep to say which models move and a decision
+  about re-publishing them. Until then `tests/ci/test_phase_isolation.py` resets the counter per export
+  and `test_the_mil_op_name_counter_is_process_global` pins the mechanism. *Context:
+  [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md).*
 
 * [ ] **Supertonic carries 2.3 MB of the same zero padding VITS just lost.** `ttl_text_512.emb_*`,
   99.1% zeros — 0.9% of that model, against VITS's 23.2%. **Not the same fix**: P4.28 made VITS's pad
