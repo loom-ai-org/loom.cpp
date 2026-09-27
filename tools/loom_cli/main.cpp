@@ -35,6 +35,8 @@ void print_usage(const char* argv0) {
                   "[--no-condition-on-previous]\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
+                  "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
+                  "--ref-text \"<what it says>\" --prompt \"<text>\" --out out.wav\n"
                   "\n"
                   "  --chat                        wrap --prompt in the model's own chat template\n"
                   "  --system <text>               a system turn ahead of it (implies --chat)\n"
@@ -46,6 +48,9 @@ void print_usage(const char* argv0) {
                   "  --out <path.wav>              for a model whose answer is AUDIO: synthesise and\n"
                   "                                write it. --prompt is the text, the IPA phonemes or\n"
                   "                                the codes, depending on what the file declares\n"
+                  "  --voice <voice.gguf>          a voice file for a model that takes one (pocket-tts's,\n"
+                  "                                cosyvoice3's and voxtral-tts's `voices/*.gguf`); refused if made for\n"
+                  "                                other weights\n"
                   "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
                   "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
                   "                                `sample_rate=N` for a model that declares none\n"
@@ -57,7 +62,7 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0, argv0);
+                  argv0, argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
@@ -148,10 +153,15 @@ int synthesize(loom::GgufModel& model, const loom::Backends& backends,
     for (float v : audio) { peak = std::max(peak, std::abs(static_cast<double>(v))); sum_sq += v * v; }
     // Peak and rms, because they have caught something: real speech lands near +-0.3, and audio that
     // leaves [-1, 1] means the conditioning is wrong rather than the vocoder (Retro-006).
-    std::printf("  %zu samples at %u Hz = %.2f s, peak %.4f, rms %.4f\n", audio.size(), rate,
-                static_cast<double>(audio.size()) / rate, peak,
+    // Interleaved channels, read off the file: a stereo codec returns `L R L R ...`, and dividing its
+    // length by the rate alone would report twice the duration and write a mono file at half speed.
+    const uint32_t channels = model.has_kv("loom.channels")
+                                  ? std::max<uint32_t>(model.hparam_u32("channels"), 1) : 1;
+    std::printf("  %zu samples x %u channel(s) at %u Hz = %.2f s, peak %.4f, rms %.4f\n",
+                audio.size() / channels, channels, rate,
+                static_cast<double>(audio.size()) / channels / rate, peak,
                 std::sqrt(sum_sq / std::max<size_t>(audio.size(), 1)));
-    loom_cli::write_wav_pcm16_mono(out_path, audio, rate);
+    loom_cli::write_wav_pcm16(out_path, audio, rate, channels);
     std::printf("  wrote %s\n", out_path.c_str());
     print_device_report(session.bridge());
     return 0;
@@ -243,6 +253,7 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
 int main(int argc, char** argv) {
     std::string model_path;
     std::string prompt_text;
+    std::string ref_text;
     std::string wav_path;
     std::string language_name;
     std::string task_name;
@@ -250,6 +261,7 @@ int main(int argc, char** argv) {
     bool condition_on_previous = true;
     std::string system_text;
     bool has_prompt = false;
+    bool has_ref_text = false;
     bool has_wav = false;
     bool chat = false;
     bool has_system = false;
@@ -266,6 +278,9 @@ int main(int argc, char** argv) {
     // family, the driver's own declared input names are the interface -- a wrong one is an error from
     // the engine naming the module and the input.
     std::vector<std::pair<std::string, std::vector<double>>> extra_inputs;
+    // A voice file's tensors become driver inputs by name (ADR-045), loaded once the model is, because
+    // whether the file FITS the model is a question only the model can answer.
+    std::string voice_path;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -277,6 +292,14 @@ int main(int argc, char** argv) {
         } else if (arg == "--wav" && i + 1 < argc) {
             wav_path = argv[++i];
             has_wav = true;
+        } else if (arg == "--ref-text" && i + 1 < argc) {
+            // The voice-cloning TTS families take a reference CLIP and what that clip SAYS. F5-TTS
+            // conditions by in-filling: the transcript is prepended to the text to speak and the
+            // model continues one spectrogram, so the two are not separable inputs.
+            ref_text = argv[++i];
+            has_ref_text = true;
+        } else if (arg == "--voice" && i + 1 < argc) {
+            voice_path = argv[++i];
         } else if (arg == "--language" && i + 1 < argc) {
             // Optional by design. Omitted, a driver that can detect the language does; one that cannot
             // uses its own default. See run_asr.
@@ -368,6 +391,12 @@ int main(int argc, char** argv) {
     try {
         auto model = loom::GgufModel::load(model_path, backends);
         std::printf("loaded '%s'\n", model_path.c_str());
+        if (!voice_path.empty()) {
+            const loom::VoiceFile voice = loom::load_voice(*model, voice_path);
+            std::printf("  voice: %s (%s)\n", voice.name.c_str(), voice.license.c_str());
+            // Ahead of the --input ones, so a caller's explicit input still wins.
+            for (const auto& [name, values] : voice.inputs) extra_inputs.insert(extra_inputs.begin(), {name, values});
+        }
         std::printf("  architecture: %s\n", model->architecture().c_str());
 
         bool is_multi_topology = model->has_kv("model.driver_script");
@@ -501,6 +530,155 @@ int main(int argc, char** argv) {
                 }
             }
             return 0;
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "chatterbox") {
+            // Chatterbox: text in, the model's own built-in voice, audio out. The vocabulary runs the
+            // reference's whole text path (`punc_norm`, `[SPACE]`, BPE), so what is printed as
+            // "normalized" is the sentence the model is actually asked to say.
+            auto vocab = loom::ChatterboxVocab::load(*model);
+            std::printf("  tokenizer: character BPE (chatterbox), %zu tokens\n", vocab->size());
+            if (!has_prompt) return 0;
+            size_t unknown = 0;
+            const auto ids = vocab->encode(prompt_text, &unknown);
+            std::printf("  normalized: \"%s\"\n  %zu id(s)\n", vocab->normalize(prompt_text).c_str(),
+                        ids.size());
+            if (unknown > 0) {
+                // The reference's own fallback, and a silent substitution a caller should see
+                // (Retro-006).
+                std::printf("  %zu character%s not in this model's table became [UNK]\n", unknown,
+                            unknown == 1 ? "" : "s");
+            }
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "pocket_tts") {
+            // Pocket-TTS: text in, the file's built-in voice, audio out. The vocabulary runs the
+            // reference's whole text path, including its split into sentence chunks, so each chunk is
+            // printed as the model will be asked to say it.
+            auto vocab = loom::PocketTtsVocab::load(*model);
+            std::printf("  tokenizer: SentencePiece unigram (pocket_tts), %zu pieces\n", vocab->size());
+            if (!has_prompt) return 0;
+            const auto chunks = vocab->chunks(prompt_text);
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                size_t n_words = 0;
+                const std::string prepared = vocab->prepare(chunks[i], &n_words);
+                std::printf("  chunk %zu (%zu word%s): \"%s\"\n", i + 1, n_words, n_words == 1 ? "" : "s",
+                            prepared.c_str());
+            }
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "cosyvoice3") {
+            // CosyVoice3: text in, the file's default voice (or `--voice`, a cloned one), audio out. The
+            // vocabulary runs the reference's text normalisation -- numbers spelled out, the paragraph
+            // split into pieces the model says one at a time -- so each chunk is printed as it will be
+            // said, and the driver generates them in turn.
+            auto vocab = loom::CosyVoice3Vocab::load(*model);
+            std::printf("  tokenizer: byte-level BPE (cosyvoice3), %zu tokens\n", vocab->size());
+            if (!has_prompt) return 0;
+            const auto chunks = vocab->chunks(prompt_text);
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                std::printf("  chunk %zu: \"%s\"\n", i + 1, chunks[i].c_str());
+            }
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "voxcpm2") {
+            // VoxCPM2: text in, a zero-shot voice (or one DESIGNED in the text, "(a calm older man)..."),
+            // audio out. The vocabulary runs the reference's text path, so the printed text is what the
+            // model is asked to say.
+            auto vocab = loom::VoxCpmVocab::load(*model);
+            std::printf("  tokenizer: character BPE with byte fallback (voxcpm2), %zu pieces\n", vocab->size());
+            if (!has_prompt) return 0;
+            size_t fallback = 0;
+            const auto ids = vocab->encode(prompt_text, &fallback);
+            std::printf("  normalized: \"%s\"\n  %zu id(s)\n", vocab->normalize(prompt_text).c_str(), ids.size());
+            if (fallback > 0) {
+                std::printf("  %zu character%s not in this model's table fell back to bytes\n", fallback,
+                            fallback == 1 ? "" : "s");
+            }
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (contract.task == loom::task_names::TTS && model->has_kv("tokenizer.ggml.model") &&
+            model->kv_str("tokenizer.ggml.model") == "gpt2") {
+            // A TTS whose text front end is a plain byte-level BPE (Voxtral-4B-TTS's Tekken): the
+            // vocabulary encodes the text and the driver builds the rest of the prompt, so nothing here
+            // is per-model. Without this branch the file would fall through to the LM path below and be
+            // run as a text generator.
+            auto vocab = loom::BpeVocab::load(*model);
+            std::printf("  tokenizer: byte-level BPE (%s), %zu tokens\n",
+                        model->has_kv("tokenizer.ggml.pre") ? model->kv_str("tokenizer.ggml.pre").c_str() : "qwen2",
+                        vocab->size());
+            if (!has_prompt) return 0;
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "f5") {
+            // F5-TTS: the one TTS family here that takes a reference CLIP as well as text. It clones
+            // the voice in that clip by IN-FILLING -- the reference's transcript is prepended to the
+            // text to speak and the model continues one spectrogram -- so `--wav` is the voice,
+            // `--ref-text` is what it says and `--prompt` is what to say in it.
+            auto vocab = loom::F5Vocab::load(*model);
+            std::printf("  tokenizer: characters (f5), %zu rows, graph ids are table ids + %u\n",
+                        vocab->size(), vocab->filler_offset());
+            if (!has_prompt) return 0;
+            if (!has_wav || !has_ref_text) {
+                std::fprintf(stderr,
+                             "  this model clones a voice, so it needs one: pass --wav <ref.wav> "
+                             "(%u Hz mono) and --ref-text \"<what that clip says>\" beside --prompt.\n",
+                             contract.sample_rate);
+                return 1;
+            }
+            // The reference's own join: `text_list = [ref_text + gen_text]`, with a space appended to
+            // the transcript when it does not end in one (`infer_batch_process` does this by byte
+            // length). Joining without it runs the last word of the prompt into the first word of the
+            // text, which the model reads as one word and says as one.
+            std::string joined = ref_text;
+            if (!joined.empty() && joined.back() != ' ') joined += ' ';
+            size_t unknown_ref = 0, unknown_all = 0;
+            const auto ref_ids = vocab->encode(joined, &unknown_ref);
+            const auto all_ids = vocab->encode(joined + prompt_text, &unknown_all);
+            std::printf("  %zu reference id(s) + %zu to speak = %zu\n", ref_ids.size(),
+                        all_ids.size() - ref_ids.size(), all_ids.size());
+            if (unknown_all > 0) {
+                // Not exceptional -- the table's fallback is a real row -- but a SILENT substitution
+                // is how a caller gets audio that is not the sentence (Retro-006).
+                std::printf("  %zu character%s not in this model's table, mapped to id %d; it will "
+                            "say \"%s\"\n", unknown_all, unknown_all == 1 ? "" : "s", vocab->unk_id(),
+                            vocab->decode(all_ids).c_str());
+            }
+            if (out_wav.empty()) return 0;
+
+            const std::vector<float> reference =
+                loom_cli::load_wav_pcm16_mono(wav_path, contract.sample_rate ? contract.sample_rate
+                                                                             : 24000);
+            std::printf("  reference: %zu samples = %.2f s\n", reference.size(),
+                        static_cast<double>(reference.size()) /
+                            std::max<uint32_t>(contract.sample_rate, 1));
+            auto extra = extra_inputs;
+            extra.emplace_back("waveform", std::vector<double>(reference.begin(), reference.end()));
+            extra.emplace_back("n_ref_text",
+                               std::vector<double>{static_cast<double>(ref_ids.size())});
+            return synthesize(*model, backends, all_ids, "text_ids", extra, out_wav,
+                              rate_override(extra_inputs), synth_seed);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "phonemes") {

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-09-12
+last_updated: 2026-09-26
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -24,6 +24,12 @@ deliberate, temporary exception noted below.
 covers SentencePiece-style byte-fallback BPE, which has four structural differences from every other
 shape: no regex pretokenization (one chunk), no GPT-2 byte-level mapping (initial symbols are
 characters), and two more — each measured against the real tokenizer rather than inferred.
+
+`BpeShape::kTekken` (Mistral's tiktoken vocabulary, first for Voxtral-4B-TTS) is the first
+case-transition shape: its letter alternatives split "HelloWorld" at the case change, it merges by the
+rank of the merged bytes with no merge list, and it neither NFC-normalizes nor splits on its markers --
+all three tiktoken's ([ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md);
+12000/12000 against `mistral_common`).
 
 **A family the table does not cover raises a named error rather than mis-tokenizing.** That is what
 turns "add a tokenizer" into a bounded job instead of a mystery, and it is the pattern to keep.
@@ -53,6 +59,42 @@ decode would have produced the same text** from a file with the delimiter piece 
 per-family-tag convention exists so that a tag answers "which scheme is this", and the cheap option
 spends that to save about a hundred lines — `id_to_piece` would answer with a character the checkpoint
 never had, and the tag would claim a segmentation algorithm the file does not carry.
+
+### A front end whose rules are data
+
+`chatterbox_vocab.cpp` (`tokenizer.ggml.model == "chatterbox"`, family 9's fourth leaf) is the first
+reader whose `encode` includes a model's own text NORMALIZER as well as its tokenizer: the reference's
+`punc_norm` (capitalise, collapse whitespace, twelve ordered replacements, a terminal full stop), then
+`[SPACE]` substitution, then a character-level BPE with a `Whitespace` pre-tokenizer.
+[ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md) is the decision. The engine holds
+the function's shape. The replacement table, the enders, the pre-tokenizer's word set (asked of the
+reference's own pre-tokenizer, restricted to the table's characters, which is exact because an unknown
+character is an unmergeable `[UNK]`) and Python's full case mapping all ship in the file. The result is
+**3000/3000** ids identical to the reference across six input classes.
+
+`pocket_tts_vocab.cpp` (`tokenizer.ggml.model == "pocket_tts"`, family 9's fifth leaf) is the second,
+and the first that WRAPS an ordinary vocabulary: a SentencePiece Unigram (`Vocab::load_sentencepiece`,
+now with SentencePiece's byte fallback) inside the reference's `prepare_text_prompt` and
+`split_into_best_sentences`. It is also the first whose `encode` SEGMENTS. The reference generates
+each sentence chunk of up to 50 tokens separately, and its chunking needs decoded text (a period
+between digits is not a cut; each chunk is prepared again). So the vocabulary returns every chunk's
+ids opened by a header, `<s>` or `</s>`, which also carries the reference's EOS-tail guess for that
+chunk (a word count of its text), and the driver splits on the headers
+([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). The rules are
+data, as ADR-041 requires, including Python's `isdigit` set, and the result is **7000/7000** ids
+identical to the reference over eight input classes, and 8000/8000 with the headers. `is_python_space` moved to `unicode.h` so the two
+front ends share it.
+
+`cosyvoice3_vocab.cpp` (`tokenizer.ggml.model == "cosyvoice3"`, family 9's seventh leaf) is the third.
+It wraps a byte-level `BpeVocab` (`BpeVocab::load_bpe`) inside the reference's `text_normalize`, the
+rules path it runs with neither `ttsfrd` nor `wetext` installed. That path spells every digit run with a
+port of inflect's `number_to_words`, applies the Chinese punctuation table, and runs `split_paragraph`,
+counting BPE tokens for English and characters for Chinese. Chunks are opened by `<|endoftext|>`, and
+the driver runs itself once per chunk
+([ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)). The result is
+**9000/9000** ids identical to the reference. The diff also found `BpeVocab`'s `\s` was ASCII-only,
+which moved pre-token boundaries around non-ASCII spaces for every `gpt2` model
+([Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md)).
 
 **Three loaders now run in order in `transcribe`**, and the order is load-bearing: `BpeVocab::load` and
 `CtcVocab::load` return `nullptr` for a schema that is not theirs, while `Vocab::load` **throws**. Any
@@ -102,8 +144,8 @@ degradation), and pinning the beam search's tie-break so the CLI and `loom-py` c
 |---|---|
 | Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
-| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md) |
-| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md) |
+| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md), [Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md) |
+| Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
 ## 4. The Record
@@ -125,7 +167,9 @@ vocabulary holds literal UTF-8; a space→U+2581 normalizer with no dummy prefix
 Gated by `test_e2e_spm_byte_fallback_tokenizer` — nine cases, every expectation `AutoTokenizer.encode`
 verbatim, all encoding exactly and round-tripping. Gemma now exports with no `--tokenizer-pre` override.
 The remaining unimplemented families in `_LLAMA_PRE_TO_LOOM_PRE_TYPE` (CJK-script splitters,
-case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name.
+case-transition shapes, cascading-whitespace shapes) are still `None` and still raise by name --
+except Tekken's case-transition shape, which is `kTekken` since 2026-09-26 (written from `tekken.json`,
+not reached through that llama.cpp table).
 
 
 ### P4.23 — an instruction-tuned causal LM could not be prompted correctly — DONE (2026-08-29)

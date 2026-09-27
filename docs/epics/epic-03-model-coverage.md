@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-17
+last_updated: 2026-09-26
 ---
 
 # Epic-03: Model Coverage
@@ -45,13 +45,14 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
 | **ASR — encoder-decoder** | Whisper-small | `multi_phase_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
-| **TTS — flow matching** | Matcha-TTS, SupertonicTTS | `flow_matching_export.py` |
+| **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
-| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base | `dia_export.py`, `qwen3_tts_export.py` |
+| **Audio codec + blocked attention, stereo** | MOSS-Audio-Tokenizer-v2 | `moss_audio_tokenizer_export.py` |
+| **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base, MOSS-TTS-Local-Transformer-v1.5 | `dia_export.py`, `qwen3_tts_export.py`, `moss_tts_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
@@ -276,6 +277,45 @@ Verified against the package's own decode on real speech, both sides given the s
 checks the stochastic half needs: a different draw moves the waveform (8.4% relative RMS, so the noise
 is load-bearing), two runs at the default seed are bit-identical, and a named seed differs from the
 default.
+
+#### The fifth leaf was MOSS-Audio-Tokenizer-v2: no convolutions, stereo, and a window no chunk can cover (2026-09-25)
+
+MOSS-Audio-Tokenizer-v2 (`OpenMOSS-Team/MOSS-Audio-Tokenizer-v2`, Apache-2.0) is the codec MOSS-TTS
+emits codes for, and it is the first member of this family with **no convolution at all**. Its 32
+residual-LFQ codebooks at 12.5 Hz go through six causal transformer stacks: 32 layers at 12.5 Hz, then
+five 12-layer stacks, each at twice the previous rate, up to 400 Hz. Patch reshapes join the stacks,
+and each stack attends inside a window: 125 frames at 12.5 Hz, and 400 positions from the 50 Hz stack
+up. The output is **48 kHz stereo**, modelled as one interleaved `L R L R` stream.
+
+**It takes the family's third call shape, and ADR-034's is not an option.** The reference's streaming
+decode is the same function as one whole-sequence pass (1.1e-06 apart). A chunk that re-decodes 8 s
+of left context is still **48%** away, because 92 layers of stacked windows reach far past any context
+a chunk could carry. So it is one call. What makes one call affordable is that the attention is
+**blocked**: each block of `m · 2^stage` positions gathers only the key blocks its window can reach.
+The window is one constant mask, memory is linear in the clip, and the driver pads the frame count to
+whole blocks (`PaddedCodecCall`). [ADR-049](../adrs/adr-049-a-codec-whose-windows-outrun-any-chunk-decodes-in-one-blocked-call.md)
+has the options and the measurements.
+
+**Two things a host now reads off a codec file**
+([ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md)):
+
+* `codec.absent_code`: the quantizer is folded into one table with an all-zero row per codebook, so
+  an LM emitting fewer codebooks than the codec has (MOSS-TTS: 12 of 32) decodes through the same
+  file. loom-py fills narrow rows with that id.
+* `channels`: `ModelContract`, `Audio` and `loom_cli` all learned that audio can be interleaved stereo.
+
+**No engine primitive**, which makes six family-11 leaves in a row. The cost was in the exporter:
+the in-projection split into Q/K/V and pair slices rather than indices, both
+because an integer select lowers to a view that keeps its unit axis; the gather index computed in
+float and cast, because an integer weight is written as F32; and one silent failure,
+[Retro-060](../retros/retro-060-a-sequence-at-axis-zero-was-read-as-a-batch.md), where the first
+stack's length sat at axis 0 and was read as a batch size of 1.
+
+**Verified** against the reference's own decode on 30 s of real speech: max |Δ| **2.6e-06**, relative
+RMS **1.2e-06** at all 32 codebooks, and **1.3e-06** for the 12-codebook prefix MOSS-TTS emits. The
+sabotage arms are 1.43 and 0.36. The engine decodes 30 s in 125 s on the 2-core dev box, where PyTorch
+takes 116 s. The F32 GGUF is 4.3 GB (the decode half only; the encoder is not exported), and its peak
+export RSS is 12.3 GB.
 
 ### Family 4, and the attribute nobody was reading
 
@@ -738,11 +778,397 @@ drawing the reference codes itself — on two sentences and two clip lengths: **
 over 39 frames each**, and the same run given pre-computed codes agrees with it exactly. The x-vector
 path is unchanged and byte-identical to the published GGUF (640/640).
 
+#### The third leaf was MOSS-TTS-Local-Transformer-v1.5, and its backbone was re-hosted, not patched (2026-09-25)
+
+MOSS-TTS-Local-Transformer-v1.5 (`OpenMOSS-Team`, Apache-2.0, 4.55B parameters, 31 languages) emits
+12 of MOSS-Audio-Tokenizer-v2's 32 codebooks, and that codec is the family-11 leaf above. The pair is
+two files by ADR-022, and the width gap is what `codec.absent_code` is for
+([ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md)). It has Qwen3-TTS's
+two-stack shape, with the sizes moved: a 36-layer Qwen3 runs once per frame, and a ONE-layer GPT-2
+runs once per codebook. The GPT-2 decides continue or stop and codebook 0 from its first row, then
+draws codebooks 1–11 one at a time.
+
+**The backbone is transformers' own `Qwen3Model`, with the checkpoint's weights loaded in place.**
+MOSS ships the stack as remote code whose attention the fusion pass does not recognise, and its
+arithmetic is plain Qwen3. So the export re-hosts it and **asserts** the two agree on the real weights
+before tracing. They are bit-identical, and the cached GQA attention comes for free
+([ADR-051](../adrs/adr-051-a-remote-code-stack-of-a-known-architecture-is-rehosted-and-asserted.md)).
+Four phases: `embed` (one row = one text id + 12 audio ids, folded like the codec's quantizer, with a
+zero row at the pad code), `global` (cached), and `local_first` / `local_steps`. The local stack is
+uncached, for Qwen3-TTS's reason (one KvCache, one per-layer width). Its head is merged, 12 × 1024
+audio rows plus the 2-way continue/stop pair, so every draw is a window. The 151,936-row text head is
+not exported, because no draw reads it; that saves 1.56 GB.
+
+**The prompt template ships pre-encoded, one variant per language**
+([ADR-052](../adrs/adr-052-a-templates-language-line-ships-pre-encoded-per-declared-language.md)),
+because the processor encodes its pieces separately. `text2codes.infer(text, language="fr")`.
+
+**Two ggml aborts on the way, both loud.** A `[1, n, 1]` gather index is rank 3 and `ggml_get_rows`
+refuses it, so it is flattened first. A transposed view as a matmul's second operand trips
+`nb10 == type_size`, so it is a reshape instead. Both were caught on a 10.6M-parameter random
+checkpoint built from the release's own code. That loop (tiny model → export → engine vs reference in
+seconds) is also how the codec's three silent failures were found, and it is the cheapest verification
+this family has.
+
+**Verified on the real weights, exported on the workstation** (peak RSS 34.2 GB, 36 s on 24 cores;
+16.8 GB F32 GGUF):
+
+* greedy codes against the reference's `generate(do_sample=False)`: **38/38** frames (both stop at
+  38) and **40/40**;
+* sampled at the README's settings (1.7 / top-k 25 / top-p 0.8) with **pinned draws** (ADR-047):
+  **34/34** (both stop at 34) and **60/60**, so the sampler, the windows and the draw order all match;
+* free runs through the codec GGUF: Whisper reads **9/9** words in English and in French at two seeds
+  each (`scripts/moss_tts_oracle.py`).
+
+**The pair's composition gate** is `tests/gate/test_e2e_moss_tts_composition.cpp`, Dia+DAC's shape
+plus the width gap. It checks greedy codes at 12 and 24 frames and a pinned-sampled run at 24 frames,
+all exact against `scripts/moss_tts_reference.py`. Each greedy clip is padded to the codec's 32
+codebooks with its absent id, as a host does, and the waveform is checked against the reference
+codec's `num_quantizers=12` decode. The two lengths' float counts must differ by `hop × channels × 12`.
+
+At F32 the workstation generates about 3 frames/s (12.5 frames/s is real time). On the 2-core dev box
+it is slower still; a Q8_0 build would be the one to use there.
+
+**Voice cloning arrived as voice files, with no encoder in any GGUF** (2026-09-25,
+[ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md)). A
+reference clip reaches the model as its codes, so `loom_exporter.moss_tts_voices` runs the reference
+processor's own encode once per voice and writes `reference_codes` + `reference_frames`. One file can
+hold several references, one per speaker. The driver lays them out where the template said `None`.
+The codec's encoder is 4.2 GB, and inside the TTS file it would have cost every download 25%.
+The fingerprint is the codec's quantizer, not the TTS weights, because that is what gives a code its
+meaning. The gate gained three clone arms (one reference greedy, two references greedy, one
+pinned-sampled). They read their codes through voice files written by the tool and check those files
+against the reference's encode of the same clips first.
+
+### Family 9's third leaf, and the primitive that had to be added
+
+Family 9 is the **flow-matching acoustic stage** — Matcha-TTS and SupertonicTTS since the MIL thread,
+both integrating a learned vector field with plain uniform Euler. F5-TTS is its third leaf (P5,
+2026-09-18) and the first one whose *sampler* is not that: it runs the estimator **twice per step**
+under classifier-free guidance, on a **non-uniform** schedule.
+
+**It is also the first P5 family in seven that needed an engine change**, which is worth saying plainly
+because the acceptance criterion had held six times running. The change is small and it is the right
+shape: `loom.run_ode` learned `guidance = {inputs = ..., scale = ...}` — one module, one graph, one
+cache, evaluated a second time with a different fixed-input table and combined where `k[stage]` is
+filled, so every integrator in the table keeps working unchanged. Guidance at scale 0 is bit-identical
+to the unguided call, which is what protects the two models that already shipped through this binding.
+[ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md) has the decision
+and why guidance differs in `inputs` here where `loom.generate` differs in `module`.
+
+On the export side it is **two declarations on the existing template rather than a bespoke sampler**:
+`FlowMatchingSpec.guidance` and `FlowMatchingSpec.schedule` (`"caller"` — F5-TTS integrates
+`t + coef*(cos(pi/2 t) - 1 + t)` over a linspace, not `k/n_steps`). The loop is unchanged, which is the
+test of whether a template still fits.
+
+**F5-TTS has no duration model and no phonemiser: it in-fills.** The reference clip's mel occupies the
+first frames of one spectrogram, the rest is noise, the text is the reference transcript followed by
+what to say, and the decoder integrates the whole grid at once. So there is exactly one dynamic axis
+across the two text-and-estimator phases — the total frame count — and the driver slices the prompt's
+frames off the answer before the vocoder sees them. Four phases: the mel front end (a `power=1`
+spectrogram, the first un-squared complex magnitude in the zoo, which is how `reduce_l2_norm` was found
+to have no ggml mapping — Whisper writes `abs()**2` and the square cancels the root; later MIL passes
+decompose it again on this particular graph, so the mapping is verified directly rather than through
+the model), the text embedding, the estimator, and Vocos.
+
+Three things cost more than the scoping predicted, and none of them was the sampler:
+
+* **The conditioning length is the mel's own frame count, not `ref_audio_len`.** `sample()` takes it
+  from `cond.shape[1]` (`n_samples//hop + 1`) and only the output slice uses `n_samples//hop`. One
+  frame — and 32 Euler steps turn it into max |Δ| 1.77 on the mel, cosine 0.9998, which reads exactly
+  like accumulated float noise and is not.
+* **A defensive re-slice in library code.** `apply_rotary_pos_emb`'s `freqs[:, -seq_len:, :]` is the
+  identity once the table has been cut to length, and a negative begin over a dynamic axis exported as
+  twice the rows at a negative offset, 44 times.
+  [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md).
+* **The JOIN between two graphs, which every per-phase check passed over.** The estimator retains
+  frame-major mel and `Vocos.decode`'s convention is channel-major, so the driver handed the vocoder a
+  transposed spectrogram — which is still a plausible spectrogram, so nothing raised and the audio came
+  out as a sound effect. Five clean tensor comparisons said nothing about it; the ASR oracle found it in
+  one listen, and the sabotage arm measures it at cosine **−0.008**.
+  [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md).
+
+**Verified end to end.** Per phase against torch on the real inputs: `mel` 4.39e-02 / cosine
+0.999999881, `text_embed` 1.13e-05 (conditional) and 8.11e-06 (unconditional), `estimator` 1.19e-05 at
+**cosine 1.000000000**, `vocoder` 1.53e-05. The torch decomposition of the whole sampler reproduces the
+reference's integrated mel at **1.42e-05 / cosine 0.99999994** over the generated frames. And the
+exported GGUF, driven by `loom_cli` from a reference clip, synthesises audio at peak 0.9768 (reference
+0.8557) that the Whisper ASR oracle transcribes as the target sentence exactly — the check that found
+the layout defect, and the one that closes it. The gate compares the WAVEFORM against the reference's
+own at **max |Δ| 4.14e-03, rmse 1.94e-04** over 92,416 samples.
+
+**That gate is only a comparison because the NOISE is pinned, and finding that out cost a red run.**
+Flow matching starts from a Gaussian draw; torch's RNG and the engine's are different algorithms, so
+handing both sides the same *seed* hands them different *noise*, and a different draw is a different
+valid sample — 1.25 max |Δ| on audio that was intelligible and correctly voiced. So
+`FlowMatchingSpec.caller_noise` makes the initial state a driver input that the engine falls back to
+drawing, `scripts/f5_tts_reference.py` writes the draw it used, and the gate hands it over. This is
+`DriverInputs`'s own NOISE argument one layer up, and the reason it is worth restating is that the
+alternative — loosening the bound until 1.25 fits — would have produced a gate that measures nothing.
+Sabotaged the other way, against a reference generated with guidance off, it reads 1.278: 300× the
+bound, so the gate can fail.
+
+**Its weights are `cc-by-nc-4.0` and that is decided rather than pending.** The F5-TTS *code* is MIT;
+the released checkpoint is non-commercial because Emilia is, which the repository states and the Hub
+card confirms. Same shape as EnCodec's licence, and the artifact declares its own — nothing about it
+changes this project's own MIT terms.
+
+**Its text front end is the family's real boundary, and it was measured rather than assumed.**
+`convert_char_to_pinyin` is `rjieba` segmentation plus `pypinyin` before a single id is looked up. What
+ships is the character table (`tokenizer.ggml.model == "f5"`, `loom::F5Vocab`), and against the real
+function over generated English prose: **2000/2000 identical for ordinary space-separated prose**,
+1100/2000 with multi-character punctuation runs and 1758/2000 with hyphen-joined digit groups — the two
+divergent classes differing by exactly one inserted space, always in the same direction. CJK is refused
+by name rather than mapped character by character. Same boundary the phoneme-input families draw around
+g2p.
+
+### Family 9's fourth leaf: the first AR-plus-flow composition in one file
+
+Chatterbox (`ResembleAI/chatterbox`, English, MIT) is the shape EXPORT-ROADMAP's correction 4 names:
+**an AR token LM and a flow-matching decoder as two stages of one pipeline.** T3 is a Llama-520M that
+turns text into 25 Hz S3 speech tokens under classifier-free guidance. S3Gen embeds those tokens behind
+the voice's own prompt tokens, runs a conformer, and in-fills a mel after the prompt's frames with a
+guided 10-step ODE on a cosine schedule. HiFT (an NSF sine source plus iSTFTNet) vocodes the result.
+Six phases, one GGUF, one driver.
+
+**It needed no new template, and that was the test.** T3 is family 10's shape: a KV-cached decoder
+whose unconditional twin is an `extra_streams` alias with a private cache
+([ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md)), driven by a hand-written loop
+like Dia's and Qwen3-TTS's. S3Gen is F5-TTS's `FlowMatchingSpec` (guidance, caller schedule, caller
+noise) with a Matcha-style estimator. What was new is only that both halves share one driver.
+
+**What it cost, which was again not where the scoping looked:**
+
+* **Two sampler changes.** `loom.sample_row` gained `min_p`. The repetition penalty turned out to be
+  applied once per *occurrence*, where `transformers` applies it once per id. Even at Qwen3-TTS's
+  1.05 this was the talker's open greedy divergence (96/624 ids on one sentence, 624/624 once fixed),
+  and at Chatterbox's 1.2 it would have been worse
+  ([Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md)).
+* **A text front end whose rules are data** ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)):
+  a character-level BPE rather than a byte-level one, plus the reference's `punc_norm`, as
+  `tokenizer.ggml.model == "chatterbox"`. **3000/3000** ids identical to the reference across six input
+  classes.
+* **The vocoder's two random draws are inputs.** The NSF source draws a phase per harmonic and a
+  Gaussian per harmonic per output sample. Both are pinned the way F5's ODE noise is. Kokoro had
+  already found the `% 1` trap (`remainder(x, 1)` lowers to `sub(x, x)`), and `f0 > 10` became an exact
+  clamp because the exporter maps no `greater`.
+* **A fixture that was silently transposed**: a Fortran-ordered `.npy` read in C order
+  ([Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md)).
+
+**Verified end to end.** Every wrapper against the module it took over, in torch: the prefill is
+bit-identical, the LM's first-step logits are 7.6e-06, the mel after the wrapper-driven ODE is 5.7e-06,
+and the vocoder is 1.2e-06. The GGUF on the engine, from text, with guided greedy decoding and the
+reference's draws, gives a waveform at **max |Δ| 2.5e-05, rmse 1.5e-06** over 40,320 samples. The
+reference's own float32-vs-float64 spread is 2.2e-05, so that is the rounding floor. The Whisper oracle
+transcribes it exactly, and so does the default sampled mode at two seeds. The sabotage arm (the flow's
+guidance off) gives 0.897. The gate is `tests/gate/test_e2e_chatterbox_lua_driver.cpp`. It runs in
+~50 s at 3.7 GB, and T3 and the vocoder together take 1.7 s of audio in ~49 s on the 2-core box.
+
+**Shipped without Resemble's Perth watermark, deliberately** (2026-09-23). Perth is a separate neural
+model applied after synthesis, and this build targets local inference and dev kits, where a smaller,
+faster model is the point. The model card says so as its first limitation. One voice is built in
+(`conds.pt`, as `driver_weights`); cloning needs the voice encoder, the S3 tokenizer and CAMPPlus.
+
+### Family 9's fifth leaf: a loop that carries continuous latents
+
+Pocket-TTS (`kyutai/pocket-tts`, English `english_2026-09`, CC-BY-4.0, ~110M parameters) is the loop
+shape the hub had costed as the one nothing shipped: **an AR model whose step emits a continuous 32-d
+latent rather than a token.** A 6-layer transformer runs over the previous latent. Its last row feeds
+an EOS head and a one-step flow head (Lagrangian Self Distillation: `x0 + v(c, s=0, t=1, x0)` from one
+Gaussian draw scaled by `sqrt(temperature)`), and the result is both the frame and the next input. Mimi
+decodes the latents: a depthwise ×16 upsample, a 2-layer windowed transformer, and a SEANet. Five
+phases (`text_embed`, `lm`, `step_embed`, `flow_head`, `mimi_decoder`), one GGUF, 405 MB at F32.
+
+**The loop needed no primitive.** It is family 10's KV-cached decoder driven by a hand-written Lua
+loop, with `loom.sample_row` replaced by one `flow_head` call and 32 floats read back. The two
+products the reference does in f32 (`z * std`, `x + v / n`) are inside that graph, because the
+driver's LuaJIT has only doubles.
+
+**What it cost, and again it was not the loop:**
+
+* **The voice is a KV cache**, precomputed by the reference and not recoverable as inputs. It needed
+  the one new binding, `loom.seed_kv`
+  ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)). The built-in voice
+  (`alba`, 126 rows) ships as a 6.2 MB driver weight, and a caller may seed any saved state.
+* **The text front end chunks.** The reference splits text into sentence chunks of at most 50 tokens
+  and generates each from a fresh voice. The vocabulary does that and opens each chunk with a header
+  id that also carries the reference's EOS-tail guess for it
+  ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). It also made
+  `loom::Vocab` implement SentencePiece's byte fallback, which the writer had been dropping silently.
+  **8000/8000** texts are identical to the reference's whole text path, headers included.
+* **Three re-spellings for the trace**, each checked against the module it replaces: interleaved-pair
+  RoPE in four dimensions (the reference uses a 5-D view), `in_proj` split into Q/K/V, and Mimi's
+  window mask built from a `positions` input as two outer products, because ggml's SUB broadcasts only
+  its second operand. The streaming Mimi is ONE call: its convolutions are causal and its attention
+  windowed, and the reference script checks one-shot against streamed at 3.4e-06.
+* **The gate had to change shape** ([Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md)).
+  A latent loop amplifies rounding, so free-running comparison measures the trajectory, not the
+  implementation.
+
+**Verified.** Teacher-forced against the reference with its pinned draws: **max |Δ| 1.5e-04, rmse
+1.8e-06** over 155,520 samples (6.5 s); the sabotage arm (temperature 0.7 for the checkpoint's 0.3)
+gives 0.82. Free-running from the same draws, it reaches the same EOS frame at rmse 9.9e-05. The
+Whisper oracle transcribes both the reference and loom identically, and a three-chunk paragraph
+correctly. The engine synthesises 17.4 s of audio in 10.9 s on the 2-core dev box. The gate is
+`tests/gate/test_e2e_pocket_tts_lua_driver.cpp`.
+
+**The other 25 voices are voice files** ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)):
+`voices/<name>.gguf`, converted by `loom_exporter.pocket_tts_voices`, stamped with a fingerprint of
+the weights and refused by `loom::load_voice` on any other model; `text2speech.infer(voice="marius")`
+and `loom_cli --voice`. Through a file, `marius` is 8.0e-06 from the reference teacher-forced. Each
+carries its recording's licence, and two are non-commercial. **Not in this export:** cloning a voice
+from audio (the Mimi encoder, which the released voice-cloning weights carry and the other release
+zeroes).
+
+### Family 9's sixth leaf: a latent loop whose step is a guided solve
+
+VoxCPM2 (`openbmb/VoxCPM2`, Apache-2.0, 2.3B parameters, 30 languages, 48 kHz) is Pocket-TTS's loop
+shape at twenty times the size, with a real sampler inside each step. Two cached LMs run per step: a
+28-layer MiniCPM-4 base LM whose row passes an FSQ bottleneck (`round(tanh(x) * 9) / 9`), and an
+8-layer residual LM with no positional encoding at all. Their last rows condition a 12-layer local DiT,
+which integrates one PATCH (4 x 64-d AudioVAE latents) from a Gaussian draw over 10 Euler steps with
+CFG-Zero* guidance. A 12-layer local encoder re-embeds the patch as the next step's input, a stop head
+ends the loop, and AudioVAE V2 decodes 25 Hz latents to 48 kHz. Five phases (`feat_encode`,
+`base_lm`, `residual_lm`, `dit_step`, `vae_decode`), 9.3 GB at F32.
+
+**The step's sampler stays in the step's graph** ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)).
+CFG-Zero* scales the unconditional velocity by its projection onto the conditional one, which
+`run_ode`'s `v_c + s (v_c - v_u)` cannot express. The state is 256 floats, so a Lua loop over one
+`dit_step` graph (both guidance rows as one batch, the combination and `x - dt * v` inside) costs no
+boundary traffic. The reference's f32 Euler schedule ships as a driver weight.
+
+**What it cost:**
+
+* **A `ROUND` primitive** for the FSQ bottleneck (ggml's `roundf`; ties cannot be told from the
+  reference's round-half-even by any oracle, see `op_round`).
+* **A tokenizer family**, `tokenizer.ggml.model == "voxcpm2"` (`loom::VoxCpmVocab`): a rank-merged
+  character BPE with byte fallback, the reference's split of multi-character Chinese pieces into
+  characters, and `tokenizer_config.json`'s 15 extra added tokens (two of whose spellings the table
+  contradicts; transformers mints ids for them past the embedding). **4992/4992** texts agree with the
+  reference over ten classes.
+* **The AudioVAE uses the OLD weight norm**, whose hook repairs `weight` on every forward, so a fold
+  checked after the reference ran checks nothing ([Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md)).
+* **The first export with TWO cached phases.** One KV cache serves both, and each phase's attention
+  was numbered from slot 0, so the residual LM overwrote the base LM's first eight layers on every
+  call. The speech still transcribed exactly. The exporter now offsets a later cached phase's slots
+  ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)).
+
+**Verified.** Teacher-forced with the reference's pinned draws: latents **rmse 1.2e-06** (max 1.0e-05)
+over 35 patches, waveform rmse 4.3e-07; free-running, the same stop step and waveform rmse 7.1e-06.
+Sabotage (guidance 2.2) gives 0.225. **The reference's own f32-vs-f64 spread is not a floor here**,
+unlike Pocket-TTS's: the FSQ bottleneck turns a rounding difference that crosses a boundary into a
+whole level, and the two arms of the reference are O(1) apart by the end of the clip. Whisper is exact
+on English, a voice-design prompt and Chinese. About 20 s per second of audio on the 2-core box
+(3.3x the reference). The gate is `tests/gate/test_e2e_voxcpm2_lua_driver.cpp`. **Not in this
+export:** voice cloning from a recording (the AudioVAE encoder).
+
+### Family 9's seventh leaf: Chatterbox's shape, every stage a sibling
+
+Fun-CosyVoice3-0.5B-2512 (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`, Apache-2.0, 9 languages, 24 kHz) is
+the composition Chatterbox shipped with a different model at each stage: a **Qwen2-0.5B** LM sampling
+FSQ speech tokens at 25 Hz, a **22-layer DiT** (F5-TTS's, with a causal position convolution and a
+speaker column) integrated from a prompt-in-filled grid over 10 guided Euler steps, and **CausalHiFT**.
+Four phases (`lm`, `flow_encoder`, `estimator`, `vocoder`), 3.4 GB at F32, exported in 5 minutes at a
+6.9 GB peak. The flow's sampler is Chatterbox's `FlowMatchingSpec` unchanged; the LM embeds its own
+text or speech ids from a per-row mask (VoxCPM2's `text_mask`/`audio_mask` pattern), so the prefill
+and every step are one graph.
+
+**What it cost:**
+
+* **Three `loom.sample_row` options** ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)).
+  `ras_sampling` measures its nucleus against the whole softmax, bans ids before `min_len` and on a
+  repeat, and redraws. `top_p_mass = "row"` and `banned` express it and the redraw is driver Lua;
+  `uniform` pins the draw, which is what makes a SAMPLED decode gateable (greedy stops after five
+  tokens). Forcing the `transformers` top-p instead diverges at token 4 of 76.
+* **The DiT's rope rotates head 0 only.** CosyVoice copied an early F5-TTS `AttnProcessor` that applies
+  rope to the projected `(b, n, 1024)` query before the head split, so x_transformers' partial-rotary
+  branch rotates channels `[0, 64)` and passes 15 heads through. F5's substitution refused it by name
+  (a table narrower than the head) instead of rotating every head, and the new one reproduces the
+  quirk (`_apply_rope_first_head`, bit-identical in torch).
+* **The default voice is computed at export.** The release has no speaker table and its two voice
+  models (S3 tokenizer v3, CAMPPlus) are ONNX-only. The export runs the reference frontend ONCE on the
+  checkout's `zero_shot_prompt.wav` and ships prompt text, prompt tokens, prompt mel and embedding as
+  driver weights, so neither ONNX model reaches the engine. Pocket-TTS's arrangement
+  ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)), and the
+  door to cloning: a voice file is the same four arrays. **Shipped as the default voice, decided 2026-09-25**
+  by the author: the clip is in the Apache-2.0 CosyVoice repository, whose README also says some
+  examples are "sourced from the internet", so the model card names the clip and its repository rather
+  than claiming a licence for the recording itself.
+* **The F0 predictor runs at f32; the reference runs it at f64** ("precision is crucial"). The sine
+  source integrates F0 into its phase, so the vocoder sits ~2x above its own f32/f64 floor. In torch
+  the same wrapper with an f64 F0 lands on the floor, which is how the excess was attributed.
+* **The reference itself is broken under transformers 4.57.** Its decode step hands a one-column mask
+  to a cache of the whole prefix; 4.51.3 (the pin) ignored the missing columns, 4.57 reads them as
+  padding, and the LM never stops (whisper hears "Beep!"). The oracle passes `None`, which is what the
+  all-ones mask means. The oracle also builds the modules without hyperpyyaml.
+* **One engine fix the gate's sabotage arm found:** `run_ode` never compared a caller's `state` with
+  `n_elems`, and a wrong-length noise aborted the process ([Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md)).
+
+**Verified** (`tests/gate/test_e2e_cosyvoice3_lua_driver.cpp`, pinned draws, default sentence): the
+text door id for id on the sentence and the voice's CJK prompt; the LM **76/76 tokens identical** with
+the redraw firing 6 times; the flow on the reference's tokens at mel max 1.6e-03 (the reference's own
+f32/f64 spread is 1.5e-03); the vocoder on the reference's mel at max 8.9e-03, rmse 3.2e-04; free
+running at rmse 2.7e-03 against a reference spread of 9.0e-03. Unpinned, Whisper is exact on the
+default sentence and 22/24 on a 29-token one (the misses are "7th" and "Lume"). 16-20 s of wall time per
+second of audio on the 2-core box. **Not in this export:** text normalisation (the reference's
+wetext/ttsfrd frontend and paragraph splitting), streaming, and cloning from a recording.
+
+### Family 9's eighth leaf: a frame loop whose acoustic half is one graph
+
+Voxtral-4B-TTS-2603 (`mistralai/Voxtral-4B-TTS-2603`, CC BY-NC 4.0, 9 languages, 24 kHz) is the family's
+last leaf and its largest: a **Ministral-3B** LM (26 layers, 3072 wide, GQA 32/8) steps once per 80 ms
+frame. Each frame is **37 codes**. The semantic one is an argmax over 8192 codes plus [END_AUDIO]. The
+36 acoustic ones come from a flow-matching head (3 bidirectional layers over a 3-row sequence: the draw,
+the time, the LM row) integrated from one unit draw over 7 Euler steps with CFG 1.2, then clamped and
+rounded to 21 levels. The frame's codes, summed through their embeddings, are the LM's next row. A
+causal codec (ALiBi, sliding windows of 2/4/8/16 positions at four rates) decodes the frames to 24 kHz.
+Five phases (`embed_prompt`, `embed_frame`, `lm`, `acoustic`, `codec`), 16 GB at F32. It was
+**exported on the workstation**: 49 s at a 32.2 GB peak, which is over the 2-core box's floor.
+
+**What it cost:**
+
+* **A tokenizer shape** ([ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)).
+  Tekken's regex splits letter runs at a case change, and tiktoken merges by the rank of the merged
+  bytes with no merge list. It is `BpeShape::kTekken` in the shared `BpeVocab`, not a Voxtral class.
+  12000/12000 texts agree with `mistral_common`.
+* **The reference is vllm-omni, which needs vllm and a GPU.** Its flow head and codec are plain torch,
+  so the export and `scripts/voxtral_tts_reference.py` import those two FILES with `vllm` stubbed out.
+  The LM (vllm's `MistralForCausalLM`, which vllm-omni does not carry) is written out in the
+  checkpoint's native interleaved-pair RoPE. The export permutes Q/K to rotate-half, as vllm does, and
+  asserts the result equal to the native spelling.
+* **The wrapper check moved to f64** ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)).
+  The codec carries an input ulp ~60x to its output, so at f32 a rescale spelled `c * 0.1` looked like
+  noise. At f64 it was the only difference (every block agreed to 1e-14 after it).
+* **The acoustic half is one graph, not a `run_ode`.** Seven steps are fixed and the state is 36
+  floats, so the steps are unrolled, VoxCPM2's reasoning ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md))
+  without its per-step loop. The semantic argmax is the driver's (`argmax_row_range` over
+  `[END_AUDIO, 8194)`), because the integration does not read it.
+* **The codec is decoded in chunks with left context.** One call over T frames builds an `[8T, 8T]`
+  bias per head. The decoder's receptive field is ~20 frames (a chunk given 16 frames of context is
+  1.9e-6 off, 20 or more sit at f32 noise), so the driver decodes 256 frames at a time with 32 of
+  context. That equals the one-call decode, which the reference's serving path only approximates
+  (its batch path cuts 375-frame chunks with no context).
+* **Voices are prompt rows.** A preset (`voice_embedding/*.pt`) is `[n, 3072]` embeddings written over
+  the prompt's n [AUDIO] slots. The default (`casual_male`) is a driver weight and the other 19 are
+  voice files ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md))
+  stamped with the LM's fingerprint. There is no cloning: the open checkpoint has no codec encoder.
+
+**Verified** (`tests/gate/test_e2e_voxtral_tts_lua_driver.cpp`, pinned draws, a 142-frame sentence):
+the text door id for id; **codes identical for all 142 frames**, free-running and teacher-forced (the
+loop quantizes every step, so the reference's own f32 and f64 runs agree on every code too); the
+waveform at max 5.6e-07, rmse 2.0e-08, in one call and in 40-frame chunks, against a reference f32/f64
+spread of 7.5e-07; CFG 1.3 for 1.2 moves the codes at frame 0. Unpinned, Whisper is exact in English,
+French, German and Spanish through `loom_cli --voice` and loom-py's `text2speech`. On the 24-core
+workstation, 11.3 s of audio takes 62 s and 17 GB of RAM. Frame counts over six seeds overlap the
+reference's (25-47 against 21-56 on a 2-second sentence): like the reference, it sometimes keeps
+talking after the text.
+
 ### Text input
 
-**Only Supertonic takes text.** It encodes graphemes itself and its GGUF carries the codepoint table.
-The other four TTS models consume *phoneme* ids produced outside the engine — a real limitation of
-those checkpoints, addressed by [Epic-07](epic-07-text-frontends-and-tokenizers.md) and
+**Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3 and Voxtral-4B-TTS take text.** Each encodes graphemes itself and each GGUF carries its own
+table (Chatterbox's is a character-level BPE, Pocket-TTS's a SentencePiece Unigram, VoxCPM2's a rank-merged BPE with byte fallback, CosyVoice3's Qwen2's byte-level BPE plus ~290 added tokens, Voxtral's Mistral's Tekken). The other four TTS models consume *phoneme* ids produced outside the engine — a real
+limitation of those checkpoints, addressed by
+[Epic-07](epic-07-text-frontends-and-tokenizers.md) and
 [ADR-012](../adrs/adr-012-permissive-phonemizer.md).
 
 ## 3. Roadmap
@@ -753,8 +1179,11 @@ Ordered by coverage-per-effort. Live items are tracked in
 **Next families:** the remaining TTS families → small classifiers → music. **Six are done** —
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
-leaves: SenseVoice-Small and Paraformer-zh) —
-and §2 says what each cost, which is the number the rest of this list should be estimated against.
+leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is **complete at eight leaves** (the user dropped kugelaudio, tada, dots-tts and
+irodori-tts on 2026-09-26): Voxtral-4B-TTS, the eighth, landed 2026-09-26, exported on the
+workstation, after CosyVoice3 on 2026-09-24 and Chatterbox, Pocket-TTS and VoxCPM2 before it (F5-TTS, on 2026-09-18, is where the "no engine primitive" run ended:
+[ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)).
+§2 says what each cost, which is the number the rest of this list should be estimated against.
 Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
 family 6 landing means the zoo has an encoder-decoder text model and a SentencePiece Unigram LM for
 the first time.
@@ -776,8 +1205,16 @@ native-layout repo). Qwen3-TTS was the other name on this line and is no longer 
 2026-09-13 in `x_vector_only_mode`, and what remains of it is ICL mode, which the hub carries as an
 open item because its bill is a second family-11-scale export plus a sampler that can express a
 non-contiguous allowed set.
-F5-TTS is deferred by explicit direction (flow-matching, `OdeStepper`-adjacent, likely sharing
-primitives with Matcha).
+F5-TTS is no longer deferred: it shipped 2026-09-18 as family 9's third leaf. The prediction it was
+deferred under — "likely sharing primitives with Matcha" — held for the ODE and not for the sampler
+around it; see §2.
+
+**Requested, unscoped (2026-09-25):** Canary, Citrinet, Cohere ASR, Moonshine (tiny and small),
+Nemotron ASR, Silero VAD, Voxtral Mini realtime, Kitten TTS and Soprano TTS. Most of the ASR names
+look like existing templates — three NVIDIA checkpoints for the NeMo encoder template, Moonshine as an
+encoder-decoder — which is the kind of estimate families 4 and 5 corrected, so each is scoped against
+its checkpoint before it is costed. Silero VAD would be the zoo's first VAD and the first family-13
+classifier. The backlog has one line each with what to check first.
 
 **The constraint that decides what is exportable at all** is not the template — it is peak memory
 during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*, and P5.0
@@ -804,7 +1241,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |

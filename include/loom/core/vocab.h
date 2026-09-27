@@ -35,6 +35,11 @@ public:
     // required array KVs are missing/malformed.
     static std::unique_ptr<Vocab> load(const GgufModel& model);
 
+    // The same SentencePiece vocabulary under a tag that is not "t5"/"llama" -- a front end that WRAPS
+    // one (`PocketTtsVocab`, "pocket_tts") and so names its own scheme. `is_bpe` picks the encode
+    // algorithm the tag would otherwise have picked.
+    static std::unique_ptr<Vocab> load_sentencepiece(const GgufModel& model, bool is_bpe);
+
     // Normalizes `text` (via the XCDA-based charsmap walk, matching SentencePiece's own normalizer),
     // then segments it into vocab piece ids -- via Viterbi best-path search (UGM) or greedy
     // merge-by-score (SentencePiece BPE), selected by which "tokenizer.ggml.model" this Vocab was
@@ -118,6 +123,11 @@ private:
     bool add_space_prefix_ = true;
     bool remove_extra_whitespaces_ = true;
     bool is_bpe_ = false; // true for "llama" (SentencePiece BPE); false for "t5" (UGM)
+    // SentencePiece's `byte_fallback`, UGM only: a codepoint no piece covers becomes its UTF-8 bytes'
+    // `<0xNN>` pieces instead of `<unk>`, and those pieces decode back to the bytes. Absent KV = false,
+    // which is every file written before Pocket-TTS's (whose tokenizer is the first to need it).
+    bool byte_fallback_ = false;
+    std::vector<int32_t> byte_ids_; // 256 entries when byte_fallback_, the `<0xNN>` piece of each byte
     TrieNode token_trie_;
 
     // Raw precompiled_charsmap: first 4 bytes = byte length of the XCDA blob (array of uint32_t

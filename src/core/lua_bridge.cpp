@@ -22,6 +22,7 @@ extern "C" {
 #include <cmath>
 #include <limits>
 #include <new>
+#include <optional>
 
 // IMPORTANT: LuaJIT (like PUC Lua 5.1, whose C API it implements) reports its own internal errors via
 // `longjmp`, which does NOT run C++ destructors -- throwing a C++ exception out of a function called BY
@@ -382,8 +383,9 @@ int64_t argmax_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
 //
 // **`uncond`/`guidance_scale` are classifier-free guidance**, off when `uncond` is null. See the body.
 //
-// The order is `transformers`' own processor order -- temperature, then top-k, then top-p, then a
-// multinomial draw -- because the reference this is defined against is `generate` under the
+// The order is `transformers`' own processor order -- temperature, then top-k, then min-p, then top-p,
+// then a multinomial draw (min-p ahead of top-p is Chatterbox's `T3.inference` order; `generate`'s own
+// list puts min-p last, and the two agree whenever either is off, which is every caller so far) -- because the reference this is defined against is `generate` under the
 // checkpoint's own `generation_config.json`. Any other order gives a different distribution from the
 // same three numbers.
 //
@@ -395,7 +397,9 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
                            std::uniform_real_distribution<float>& uniform, float temperature,
                            int64_t top_k, float top_p, int64_t lo, int64_t hi,
                            ggml_tensor* uncond, float guidance_scale, int64_t guidance_top_k,
-                           float repetition_penalty, const std::vector<int64_t>& penalized) {
+                           float repetition_penalty, const std::vector<int64_t>& penalized,
+                           float min_p, bool top_p_over_row, const std::vector<int64_t>& banned,
+                           std::optional<float> fixed_uniform) {
     if (!(repetition_penalty > 0.0f)) {
         throw Error(std::string(fname) + ": repetition_penalty is " +
                      std::to_string(repetition_penalty) + "; it is a positive divisor and 1 means "
@@ -409,9 +413,17 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
         throw Error(std::string(fname) + ": top_k is " + std::to_string(top_k) + "; it is a count of "
                      "candidates, and 0 means 'do not truncate'");
     }
+    if (!(min_p >= 0.0f) || min_p > 1.0f) {
+        throw Error(std::string(fname) + ": min_p is " + std::to_string(min_p) + "; it is a fraction "
+                     "of the most likely id's probability in [0, 1], and 0 means 'do not truncate'");
+    }
     if (!(top_p > 0.0f) || top_p > 1.0f) {
         throw Error(std::string(fname) + ": top_p is " + std::to_string(top_p) + "; it is a cumulative "
                      "probability in (0, 1], and 1 means 'do not truncate'");
+    }
+    if (fixed_uniform && !(*fixed_uniform >= 0.0f && *fixed_uniform < 1.0f)) {
+        throw Error(std::string(fname) + ": uniform is " + std::to_string(*fixed_uniform) + "; it is "
+                     "the draw itself, a number in [0, 1)");
     }
 
     // **Classifier-free guidance, and it happens HERE rather than in a graph**: over two retained
@@ -499,6 +511,27 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
         }
     }
 
+    // **Banned ids are removed from the candidate set before anything else reads the row** -- the
+    // penalty, the greedy branch, top-k, and top-p's mass. `weighted_scores[id] = -inf`, which is how
+    // CosyVoice3's `sampling_ids` bans an id before `min_len` tokens and how `ras_sampling` bans the id
+    // it is about to redraw; with `top_p_mass = "row"` the banned ids are therefore also out of the
+    // mass the nucleus is measured against, as they are out of the reference's softmax. ABSOLUTE ids,
+    // and one outside the window is skipped, for `penalized`'s reason.
+    if (!banned.empty()) {
+        const auto width = static_cast<int64_t>(logits.size());
+        for (const int64_t id : banned) {
+            const int64_t offset = id - lo;
+            if (offset >= 0 && offset < width) {
+                logits[static_cast<size_t>(offset)] = -std::numeric_limits<float>::infinity();
+            }
+        }
+        if (std::none_of(logits.begin(), logits.end(),
+                         [](float v) { return v > -std::numeric_limits<float>::infinity(); })) {
+            throw Error(std::string(fname) + ": every id in the window [" + std::to_string(lo) + ", " +
+                         std::to_string(lo + width) + ") is banned, so there is nothing to draw from");
+        }
+    }
+
     // **The repetition penalty, and it is applied BEFORE the greedy branch on purpose.**
     //
     // `RepetitionPenaltyLogitsProcessor` is a PROCESSOR, not a warper: `transformers` runs it whether
@@ -516,11 +549,22 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // `sample_row` returned, and that is already absolute (`lo` is added back on the way out). Ids
     // outside the window are skipped rather than rejected: a window is a restriction on what may be
     // DRAWN, and a history that predates a narrowing window is not an error.
+    //
+    // **Once per ID, however often it recurs.** `transformers` gathers the score at every history
+    // position and scatters the penalised value back, so an id that appears five times is written five
+    // times with the SAME once-penalised number -- `penalty`, never `penalty^5`. Applying it per
+    // occurrence compounds it: an id drawn k times sits `penalty^k` lower, and a model that wants to
+    // repeat a token the reference repeats is pushed off it. That was this loop until family 9's
+    // Chatterbox (penalty 1.2) was scoped, and it was ALSO Qwen3-TTS's repetition divergence: even at
+    // 1.05, the compounding moved a greedy decode off the reference at frame 6 (96/624 ids), and once
+    // per id restores 624/624 (Retro-053).
     if (repetition_penalty != 1.0f) {
         const auto width = static_cast<int64_t>(logits.size());
+        std::vector<bool> done(static_cast<size_t>(width), false);
         for (const int64_t id : penalized) {
             const int64_t offset = id - lo;
-            if (offset < 0 || offset >= width) continue;
+            if (offset < 0 || offset >= width || done[static_cast<size_t>(offset)]) continue;
+            done[static_cast<size_t>(offset)] = true;
             float& score = logits[static_cast<size_t>(offset)];
             score = score > 0.0f ? score / repetition_penalty : score * repetition_penalty;
         }
@@ -568,14 +612,42 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
         sum += probs[i];
     }
 
+    // Min-p: drop every candidate whose probability is below `min_p` times the most likely one's,
+    // which is `candidates[0]` because they are sorted -- so the survivors are a PREFIX and `keep` is
+    // its length. `MinPLogitsWarper`'s rule, at the temperature the probabilities were computed at,
+    // and ahead of top-p as `transformers` orders them: top-p's mass is then measured over what min-p
+    // left, which is why `sum` is recomputed over the prefix. At least one candidate always survives.
+    size_t keep = candidates.size();
+    if (min_p > 0.0f) {
+        const float floor_prob = min_p * probs[0];
+        size_t kept = 1;
+        while (kept < probs.size() && probs[kept] >= floor_prob) ++kept;
+        keep = kept;
+        sum = 0.0f;
+        for (size_t i = 0; i < keep; ++i) sum += probs[i];
+    }
+
     // Top-p: the shortest prefix of the descending order whose probability mass reaches `top_p`. At
     // least one candidate always survives -- a threshold below the single most likely token's own
     // probability would otherwise select nothing to draw from.
-    size_t keep = candidates.size();
+    //
+    // **What the mass is measured against is the one choice here with two answers in the wild.**
+    // `transformers` runs top-p AFTER top-k on the already-truncated logits, so the mass is a fraction
+    // of the top-k survivors' (`sum`, the default). CosyVoice's `nucleus_sampling` scans the WHOLE
+    // softmax, sorted, keeping ids while the running sum is below `top_p` and the count below `top_k`
+    // -- the same prefix rule over a different denominator, which keeps MORE ids whenever top-k has
+    // cut mass off. `top_p_mass = "row"` is that one: the denominator is the full window's softmax
+    // (banned ids excluded, since they are -inf). Measured against the other it is a different
+    // sampler from the same two numbers (loom.cpp ADR-047).
     if (top_p < 1.0f) {
+        float denominator = sum;
+        if (top_p_over_row) {
+            denominator = 0.0f;
+            for (const float v : logits) denominator += std::exp(v / temperature - max_logit);
+        }
         float cumulative = 0.0f;
-        for (size_t i = 0; i < probs.size(); ++i) {
-            cumulative += probs[i] / sum;
+        for (size_t i = 0; i < keep; ++i) {
+            cumulative += probs[i] / denominator;
             if (cumulative >= top_p) {
                 keep = i + 1;
                 break;
@@ -586,9 +658,16 @@ int64_t sample_tensor_row(ggml_tensor* out, int64_t requested_row, const char* f
     // One draw from the SHARED stream, through the same distribution object `loom.uniform_array` uses
     // -- so a script that seeds with `loom.seed_rng` gets a reproducible token, and so the draw-ORDER
     // caveat that stream already documents covers this too.
+    //
+    // **Or the CALLER's draw, when it passes `uniform`**: the number this walk would otherwise take from
+    // the stream. torch's RNG and this one are different algorithms, so the same seed is not the same
+    // token; a reference that records the uniform behind each of its draws (and walks the same sorted
+    // prefix -- `scripts/cosyvoice3_reference.py`) is reproducible here id for id, which is what makes a
+    // SAMPLED decode gateable at all. `run_ode`'s `caller_noise` is the same idea for a sampler's
+    // state (F5-TTS). The stream is not advanced.
     float mass = 0.0f;
     for (size_t i = 0; i < keep; ++i) mass += probs[i];
-    const float target = uniform(rng) * mass;
+    const float target = (fixed_uniform ? *fixed_uniform : uniform(rng)) * mass;
     float running = 0.0f;
     for (size_t i = 0; i < keep; ++i) {
         running += probs[i];
@@ -1239,9 +1318,19 @@ std::vector<double> opts_array(lua_State* L, int opts_idx, const char* field) {
 // accumulated in double and wrote float into the graph; keeping that exactly is what makes the move
 // bit-identical for the models that already shipped, rather than merely close.
 //
+// **Classifier-free guidance is a property of the EVALUATION, not of the integrator.** F5-TTS
+// evaluates its velocity field twice per stage -- once on the real conditioning and once on a dropped
+// one -- and integrates `v_cond + scale * (v_cond - v_uncond)`. The two runs differ only in their
+// FIXED inputs, so this is one module, one graph and one cache, called with two input tables, and
+// every method in the table above keeps working unchanged: the combination happens where `k[stage]`
+// is filled, before any Butcher weight is applied. `loom.generate` spells its own guidance
+// `{module =, scale =, top_k =}` because there the two runs are two KV-cached histories that must not
+// see each other; here they are two values of the same graph's inputs, so `inputs` is what differs.
+//
 // `opts`: `carried` and `time` (the estimator's two per-step input names), `times` (N+1 points, so N
-// steps), `method` (default "euler"), and either `state` (an explicit initial value) or `n_elems` (draw
-// it from the shared RNG, at the same point in the stream `loom.gaussian_array` occupied before).
+// steps), `method` (default "euler"), either `state` (an explicit initial value) or `n_elems` (draw
+// it from the shared RNG, at the same point in the stream `loom.gaussian_array` occupied before), and
+// optionally `guidance = {inputs = <the unconditional fixed inputs>, scale = <number>}`.
 int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
     const char* fname = retain ? "loom.run_ode_and_retain" : "loom.run_ode";
     try {
@@ -1268,7 +1357,55 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
             return luaL_error(L, "%s: `times` needs at least two points (N+1 of them is N steps), got %d",
                                fname, static_cast<int>(times.size()));
         }
+        // Guidance, read before anything is allocated so a malformed declaration fails at the top.
+        // The two tables stay on the stack for the whole loop: `compute_and_emit` takes the inputs
+        // table by absolute stack index, and the unconditional run is that same call with a second
+        // one.
+        lua_getfield(L, opts_idx, "guidance");
+        const int guidance_idx = lua_gettop(L);
+        const bool guided = !lua_isnil(L, guidance_idx);
+        double guidance_scale = 0.0;
+        int guidance_inputs_idx = 0;
+        if (guided) {
+            if (!lua_istable(L, guidance_idx)) {
+                return luaL_error(L, "%s: `guidance` must be a table {inputs = ..., scale = ...}",
+                                   fname);
+            }
+            lua_getfield(L, guidance_idx, "scale");
+            if (!lua_isnumber(L, -1)) {
+                return luaL_error(L, "%s: guidance.scale is required and must be a number -- it is "
+                                   "the weight in `v_cond + scale * (v_cond - v_uncond)`", fname);
+            }
+            guidance_scale = lua_tonumber(L, -1);
+            lua_pop(L, 1);
+            lua_getfield(L, guidance_idx, "inputs");
+            if (!lua_istable(L, -1)) {
+                return luaL_error(L, "%s: guidance.inputs must be a table of the same fixed inputs "
+                                   "the conditional run is given, with the dropped values", fname);
+            }
+            guidance_inputs_idx = lua_gettop(L);
+        }
+
         std::vector<double> state = opts_array(L, opts_idx, "state");
+        if (!state.empty()) {
+            // **A caller's state of the wrong length is refused here, as an error.** The flow-matching
+            // template passes `n_elems` beside a caller's `state` (it is the size of the grid the
+            // estimator is about to be sized by), and nothing compared them: a pinned noise from a
+            // reference whose decode took a different number of tokens reached `ggml_backend_tensor_set`
+            // and ABORTED the host process -- CosyVoice3's gate, under a sabotaged sampler, is where it
+            // surfaced. A Lua error is what every other malformed input here gets.
+            lua_getfield(L, opts_idx, "n_elems");
+            if (!lua_isnil(L, -1)) {
+                const auto n_elems = static_cast<size_t>(luaL_checknumber(L, -1));
+                if (n_elems != state.size()) {
+                    return luaL_error(L, "%s: `state` has %d values but `n_elems` says the state is %d "
+                                       "-- a caller-supplied initial state must be the size of the grid "
+                                       "it starts", fname, static_cast<int>(state.size()),
+                                       static_cast<int>(n_elems));
+                }
+            }
+            lua_pop(L, 1);
+        }
         if (state.empty()) {
             lua_getfield(L, opts_idx, "n_elems");
             const auto n_elems = static_cast<size_t>(luaL_checknumber(L, -1));
@@ -1300,7 +1437,51 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
         int64_t state_ne[GGML_MAX_DIMS] = {static_cast<int64_t>(n), 1, 1, 1};
         std::vector<std::vector<double>> k(method.n_stages);
         std::vector<double> probe(n);
+        std::vector<double> uncond;
+        if (guided) uncond.resize(n);
         std::vector<float> scratch(n);
+
+        // One evaluation of `f` at `probe`/`stage_t`, reading its fixed inputs from the table at
+        // `inputs_idx` and writing the velocity into `into`. Factored out because guidance runs it
+        // twice per stage over two input tables -- the ONLY thing that differs between the two runs.
+        double stage_t = 0.0;
+        auto evaluate = [&](int inputs_idx, std::vector<double>& into) {
+            compute_and_emit(
+                L, fname, module_name, builder, axes, inputs_idx,
+                LoomLuaBridge::store_lookup(self), /*out_store=*/nullptr,
+                [&](const GraphBuilder::BuildResult& r) -> int {
+                    if (r.outputs.empty()) {
+                        throw Error(std::string(fname) + ": module '" + module_name +
+                                     "' declares no outputs; an estimator returns f(x, t)");
+                    }
+                    if (ggml_nelements(r.outputs[0]) != static_cast<int64_t>(n)) {
+                        throw Error(std::string(fname) + ": module '" + module_name + "' returned " +
+                                     std::to_string(ggml_nelements(r.outputs[0])) + " element(s) for a " +
+                                     std::to_string(n) + "-element state -- f(x, t) has the shape of x");
+                    }
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) state_ne[d] = r.outputs[0]->ne[d];
+                    into.resize(n);
+                    ggml_backend_tensor_get(r.outputs[0], scratch.data(), 0, n * sizeof(float));
+                    for (size_t i = 0; i < n; ++i) into[i] = static_cast<double>(scratch[i]);
+                    return 0;
+                },
+                [&](const GraphBuilder::BuildResult& r) {
+                    const auto carried_it = r.input_tensors.find(carried);
+                    if (carried_it == r.input_tensors.end()) {
+                        throw Error(std::string(fname) + ": module '" + module_name +
+                                     "' has no declared input '" + carried + "' to carry the state");
+                    }
+                    const auto time_it = r.input_tensors.find(time_input);
+                    if (time_it == r.input_tensors.end()) {
+                        throw Error(std::string(fname) + ": module '" + module_name +
+                                     "' has no declared input '" + time_input + "'");
+                    }
+                    for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(probe[i]);
+                    ggml_backend_tensor_set(carried_it->second, scratch.data(), 0, n * sizeof(float));
+                    const auto stage_t_f = static_cast<float>(stage_t);
+                    ggml_backend_tensor_set(time_it->second, &stage_t_f, 0, sizeof(float));
+                });
+        };
 
         for (size_t step = 0; step + 1 < times.size(); ++step) {
             const double t = times[step];
@@ -1315,45 +1496,21 @@ int LoomLuaBridge::run_ode_impl(lua_State* L, bool retain) {
                         probe[i] = state[i] + h * st.from_stage_scale * base[i];
                     }
                 }
-                const double stage_t = t + st.t_offset * h;
+                stage_t = t + st.t_offset * h;
 
                 // The estimator itself: every FIXED input comes from the caller's table (a retained
                 // reference included), and these two come from the loop.
-                compute_and_emit(
-                    L, fname, module_name, builder, axes, /*inputs_idx=*/3,
-                    LoomLuaBridge::store_lookup(self), /*out_store=*/nullptr,
-                    [&](const GraphBuilder::BuildResult& r) -> int {
-                        if (r.outputs.empty()) {
-                            throw Error(std::string(fname) + ": module '" + module_name +
-                                         "' declares no outputs; an estimator returns f(x, t)");
-                        }
-                        if (ggml_nelements(r.outputs[0]) != static_cast<int64_t>(n)) {
-                            throw Error(std::string(fname) + ": module '" + module_name + "' returned " +
-                                         std::to_string(ggml_nelements(r.outputs[0])) + " element(s) for a " +
-                                         std::to_string(n) + "-element state -- f(x, t) has the shape of x");
-                        }
-                        for (int d = 0; d < GGML_MAX_DIMS; ++d) state_ne[d] = r.outputs[0]->ne[d];
-                        k[stage].resize(n);
-                        ggml_backend_tensor_get(r.outputs[0], scratch.data(), 0, n * sizeof(float));
-                        for (size_t i = 0; i < n; ++i) k[stage][i] = static_cast<double>(scratch[i]);
-                        return 0;
-                    },
-                    [&](const GraphBuilder::BuildResult& r) {
-                        const auto carried_it = r.input_tensors.find(carried);
-                        if (carried_it == r.input_tensors.end()) {
-                            throw Error(std::string(fname) + ": module '" + module_name +
-                                         "' has no declared input '" + carried + "' to carry the state");
-                        }
-                        const auto time_it = r.input_tensors.find(time_input);
-                        if (time_it == r.input_tensors.end()) {
-                            throw Error(std::string(fname) + ": module '" + module_name +
-                                         "' has no declared input '" + time_input + "'");
-                        }
-                        for (size_t i = 0; i < n; ++i) scratch[i] = static_cast<float>(probe[i]);
-                        ggml_backend_tensor_set(carried_it->second, scratch.data(), 0, n * sizeof(float));
-                        const auto stage_t_f = static_cast<float>(stage_t);
-                        ggml_backend_tensor_set(time_it->second, &stage_t_f, 0, sizeof(float));
-                    });
+                evaluate(/*inputs_idx=*/3, k[stage]);
+                if (guided) {
+                    // The same graph, the same state and the same time -- the dropped conditioning is
+                    // the whole difference. Combined HERE, into the stage's own `k`, so the method's
+                    // Butcher weights see one velocity field and nothing about the integrator has to
+                    // know guidance happened.
+                    evaluate(guidance_inputs_idx, uncond);
+                    for (size_t i = 0; i < n; ++i) {
+                        k[stage][i] += guidance_scale * (k[stage][i] - uncond[i]);
+                    }
+                }
             }
             for (size_t i = 0; i < n; ++i) {
                 double delta = 0.0;
@@ -1563,8 +1720,8 @@ int LoomLuaBridge::l_argmax_row_range(lua_State* L) {
 // than reproducing it.
 //
 // **A table rather than positional arguments** because the knobs are a set that grows, and it has now
-// grown three times: `lo`/`hi` and `guidance` for family 10, and `repetition_penalty`/`penalized` for
-// Qwen3-TTS. Adding one must not renumber what a shipped GGUF's driver already passes, which is the
+// grown four times: `lo`/`hi` and `guidance` for family 10, `repetition_penalty`/`penalized` for
+// Qwen3-TTS, and `top_p_mass`/`banned`/`uniform` for CosyVoice3 (ADR-047). Adding one must not renumber what a shipped GGUF's driver already passes, which is the
 // whole reason for the table. (min-p and the FREQUENCY/presence penalties are still not implemented;
 // nothing in the fixture set asks for them.)
 //
@@ -1618,10 +1775,14 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         std::string uncond_module;
         float repetition_penalty = 1.0f;
         std::vector<int64_t> penalized;
+        float min_p = 0.0f;
         float guidance_scale = 1.0f;
         int64_t guidance_top_k = 0;
         bool check_uncond_generation = false;
         uint64_t uncond_generation = 0;
+        bool top_p_over_row = false;
+        std::vector<int64_t> banned;
+        std::optional<float> fixed_uniform;
         if (!lua_isnoneornil(L, 3)) {
             luaL_checktype(L, 3, LUA_TTABLE);
             const auto number_field = [&](int table_idx, const char* name, double fallback) {
@@ -1633,6 +1794,9 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
             temperature = static_cast<float>(number_field(3, "temperature", 0.0));
             top_k = static_cast<int64_t>(number_field(3, "top_k", 0.0));
             top_p = static_cast<float>(number_field(3, "top_p", 1.0));
+            // `MinPLogitsWarper`'s threshold, relative to the most likely id (Chatterbox's T3 samples
+            // under `min_p = 0.05`). 0 is off, which is what every earlier driver passes by omission.
+            min_p = static_cast<float>(number_field(3, "min_p", 0.0));
             // `hi` defaults to -1, which `read_row_window` reads as "to the end of the row" -- so a
             // caller who names neither gets the whole row, which is what every pre-family-10 driver
             // passes and must keep meaning.
@@ -1661,6 +1825,44 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
                     lua_pop(L, 1);
                 }
             }
+            lua_pop(L, 1);
+
+            // `top_p_mass`: what top-p's cumulative mass is a fraction of -- "candidates" (the top-k
+            // survivors, `transformers`' order and the default) or "row" (the whole window's softmax,
+            // CosyVoice's `nucleus_sampling`). A string rather than a boolean so a third convention
+            // does not need a second knob; an unknown one is refused rather than read as the default.
+            lua_getfield(L, 3, "top_p_mass");
+            if (!lua_isnil(L, -1)) {
+                const std::string mass = luaL_checkstring(L, -1);
+                if (mass == "row") {
+                    top_p_over_row = true;
+                } else if (mass != "candidates") {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "loom.sample_row: top_p_mass is '%s'; it is \"candidates\" (the "
+                                          "top-k survivors' mass, the default) or \"row\" (the whole "
+                                          "window's)", mass.c_str());
+                }
+            }
+            lua_pop(L, 1);
+
+            // `banned`: ids that may not be drawn at all -- set to -inf ahead of every other step.
+            lua_getfield(L, 3, "banned");
+            if (!lua_isnil(L, -1)) {
+                luaL_checktype(L, -1, LUA_TTABLE);
+                const int ids_idx = lua_gettop(L);
+                const auto count = static_cast<int64_t>(lua_objlen(L, ids_idx));
+                banned.reserve(static_cast<size_t>(count));
+                for (int64_t i = 1; i <= count; ++i) {
+                    lua_rawgeti(L, ids_idx, static_cast<int>(i));
+                    banned.push_back(static_cast<int64_t>(std::llround(luaL_checknumber(L, -1))));
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1);
+
+            // `uniform`: the draw itself, in [0, 1), instead of one from the stream.
+            lua_getfield(L, 3, "uniform");
+            if (!lua_isnil(L, -1)) fixed_uniform = static_cast<float>(luaL_checknumber(L, -1));
             lua_pop(L, 1);
 
             lua_getfield(L, 3, "guidance");
@@ -1703,7 +1905,7 @@ int LoomLuaBridge::l_sample_row(lua_State* L) {
         lua_pushnumber(L, static_cast<lua_Number>(sample_tensor_row(
             store.get(0), requested_row, "loom.sample_row", self->rng_, self->uniform_dist_,
             temperature, top_k, top_p, lo, hi, uncond, guidance_scale, guidance_top_k,
-            repetition_penalty, penalized)));
+            repetition_penalty, penalized, min_p, top_p_over_row, banned, fixed_uniform)));
         return 1;
     } catch (const std::exception& e) {
         return luaL_error(L, "loom.sample_row: %s", e.what());
@@ -1978,6 +2180,67 @@ int LoomLuaBridge::l_get_weight(lua_State* L) {
     }
 }
 
+// `loom.seed_kv(module, source [, n_rows])` -> n_rows. Writes the FIRST n_rows positions of `module`'s KV
+// cache from a saved attention state, so the driver's next call attends over them at n_past = n_rows.
+// `source` is either a weight name in the module's file (a driver weight, read tensor to tensor with no
+// Lua copy -- a voice is ~1.5 M floats) or a flat Lua array. Either way the layout is the one a
+// streaming transformer's saved state already has: per layer, K then V, each [n_rows, n_embd]
+// row-major -- ADR-043.
+int LoomLuaBridge::l_seed_kv(lua_State* L) {
+    try {
+        auto* self = bridge_from_upvalue(L);
+        const char* module_name = luaL_checkstring(L, 1);
+        const auto it = self->modules_.find(module_name);
+        if (it == self->modules_.end()) {
+            return luaL_error(L, "loom.seed_kv: unregistered module '%s'", module_name);
+        }
+        KvCache* kv = it->second.kv_cache;
+        if (kv == nullptr) {
+            return luaL_error(L, "loom.seed_kv: module '%s' has no KV cache (its topology has no "
+                                 "ATTENTION node, so there is nothing to seed)", module_name);
+        }
+        std::vector<float> data;
+        if (lua_type(L, 2) == LUA_TSTRING) {
+            const char* weight_name = lua_tostring(L, 2);
+            ggml_tensor* t = it->second.model->weight(weight_name);
+            if (t->type != GGML_TYPE_F32) {
+                return luaL_error(L, "loom.seed_kv: weight '%s' must be F32 (a KV cache is stored at "
+                                     "F32, and a quantized state would not be the state that was saved)",
+                                  weight_name);
+            }
+            data.resize(static_cast<size_t>(ggml_nelements(t)));
+            ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(float));
+        } else {
+            const std::vector<double> values = read_number_array(L, 2);
+            data.assign(values.begin(), values.end());
+        }
+        const size_t per_row = static_cast<size_t>(kv->n_layer()) * (kv->n_embd_k() + kv->n_embd_v());
+        if (data.empty() || data.size() % per_row != 0) {
+            return luaL_error(L, "loom.seed_kv: %d values are not a whole number of positions of "
+                                 "module '%s''s cache (%d layers x (K %d + V %d) = %d per position)",
+                              static_cast<int>(data.size()), module_name, static_cast<int>(kv->n_layer()),
+                              static_cast<int>(kv->n_embd_k()), static_cast<int>(kv->n_embd_v()),
+                              static_cast<int>(per_row));
+        }
+        const auto n_rows = static_cast<uint32_t>(data.size() / per_row);
+        if (!lua_isnoneornil(L, 3) && static_cast<uint32_t>(luaL_checkinteger(L, 3)) != n_rows) {
+            return luaL_error(L, "loom.seed_kv: n_rows is %d but the source holds %d positions",
+                              static_cast<int>(luaL_checkinteger(L, 3)), static_cast<int>(n_rows));
+        }
+        const float* at = data.data();
+        for (uint32_t il = 0; il < kv->n_layer(); ++il) {
+            kv->set_rows(il, /*value=*/false, at, 0, n_rows);
+            at += static_cast<size_t>(n_rows) * kv->n_embd_k();
+            kv->set_rows(il, /*value=*/true, at, 0, n_rows);
+            at += static_cast<size_t>(n_rows) * kv->n_embd_v();
+        }
+        lua_pushinteger(L, static_cast<lua_Integer>(n_rows));
+        return 1;
+    } catch (const std::exception& e) {
+        return luaL_error(L, "loom.seed_kv: %s", e.what());
+    }
+}
+
 OutputStore& LoomLuaBridge::retained_store(LoomLuaBridge* self, const std::string& module) {
     const auto it = self->modules_.find(module);
     if (it == self->modules_.end()) {
@@ -2023,6 +2286,7 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
         {"pad_crop_relative_embeddings", &LoomLuaBridge::l_pad_crop_relative_embeddings},
         {"get_weight", &LoomLuaBridge::l_get_weight},
+        {"seed_kv", &LoomLuaBridge::l_seed_kv},
     };
     for (const auto& b : bindings) {
         lua_pushlightuserdata(L_, this);

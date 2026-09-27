@@ -625,6 +625,23 @@ set_tests_properties(test_bpe_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_bpe_vocab PROPERTIES
     FIXTURES_REQUIRED "bpe_vocab_gguf_fixture;bpe_vocab_gpt2_gguf_fixture;bpe_vocab_poro_gguf_fixture")
 
+# --- Tekken (Mistral's tiktoken vocabulary, Voxtral-4B-TTS): the `tekken` BpeVocab shape against a
+#     hand-traced fixture -- case-change splits, rank merges with no merge list, no NFC, no marker split ---
+add_test(
+    NAME gen_tekken_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_tekken_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/tekken_vocab_test.gguf
+)
+set_tests_properties(gen_tekken_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_tekken_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP tekken_vocab_gguf_fixture)
+
+add_executable(test_tekken_vocab ci/test_tekken_vocab.cpp)
+target_link_libraries(test_tekken_vocab PRIVATE loom::engine)
+target_compile_definitions(test_tekken_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_tekken_vocab COMMAND test_tekken_vocab)
+set_tests_properties(test_tekken_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_tekken_vocab PROPERTIES FIXTURES_REQUIRED tekken_vocab_gguf_fixture)
+
 # --- P4.23: the added-token pre-pass and the chat template it exists for. Two files from one
 #     generator -- with and without `tokenizer.ggml.token_type` -- because the backward-compatibility
 #     claim (a pre-P4.23 GGUF tokenizes exactly as it did) is only a claim until both are compared.
@@ -696,6 +713,85 @@ add_test(
 )
 set_tests_properties(gen_ctc_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_ctc_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP ctc_vocab_gguf_fixture)
+
+add_test(
+    NAME gen_f5_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_f5_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/f5_vocab_test.gguf
+)
+set_tests_properties(gen_f5_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_f5_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP f5_vocab_gguf_fixture)
+
+add_executable(test_f5_vocab ci/test_f5_vocab.cpp)
+target_link_libraries(test_f5_vocab PRIVATE loom::engine)
+target_compile_definitions(test_f5_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_f5_vocab COMMAND test_f5_vocab)
+set_tests_properties(test_f5_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_f5_vocab PROPERTIES FIXTURES_REQUIRED "f5_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
+add_test(
+    NAME gen_chatterbox_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_chatterbox_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/chatterbox_vocab_test.gguf
+)
+set_tests_properties(gen_chatterbox_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_chatterbox_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP chatterbox_vocab_gguf_fixture)
+
+add_executable(test_chatterbox_vocab ci/test_chatterbox_vocab.cpp)
+target_link_libraries(test_chatterbox_vocab PRIVATE loom::engine)
+target_compile_definitions(test_chatterbox_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_chatterbox_vocab COMMAND test_chatterbox_vocab)
+set_tests_properties(test_chatterbox_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_chatterbox_vocab PROPERTIES FIXTURES_REQUIRED "chatterbox_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
+add_test(
+    NAME gen_pocket_tts_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_pocket_tts_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/pocket_tts_vocab_test.gguf
+)
+set_tests_properties(gen_pocket_tts_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_pocket_tts_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP pocket_tts_vocab_gguf_fixture)
+
+add_executable(test_pocket_tts_vocab ci/test_pocket_tts_vocab.cpp)
+target_link_libraries(test_pocket_tts_vocab PRIVATE loom::engine)
+target_compile_definitions(test_pocket_tts_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_pocket_tts_vocab COMMAND test_pocket_tts_vocab)
+set_tests_properties(test_pocket_tts_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_pocket_tts_vocab PROPERTIES FIXTURES_REQUIRED "pocket_tts_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
+add_test(
+    NAME gen_cosyvoice3_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_cosyvoice3_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/cosyvoice3_vocab_test.gguf
+)
+set_tests_properties(gen_cosyvoice3_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_cosyvoice3_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP cosyvoice3_vocab_gguf_fixture)
+
+add_executable(test_cosyvoice3_vocab ci/test_cosyvoice3_vocab.cpp)
+target_link_libraries(test_cosyvoice3_vocab PRIVATE loom::engine)
+target_compile_definitions(test_cosyvoice3_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_cosyvoice3_vocab COMMAND test_cosyvoice3_vocab)
+set_tests_properties(test_cosyvoice3_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_cosyvoice3_vocab PROPERTIES FIXTURES_REQUIRED "cosyvoice3_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
+add_test(
+    NAME gen_voxcpm_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_voxcpm_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/voxcpm_vocab_test.gguf
+)
+set_tests_properties(gen_voxcpm_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_voxcpm_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP voxcpm_vocab_gguf_fixture)
+
+add_executable(test_voxcpm_vocab ci/test_voxcpm_vocab.cpp)
+target_link_libraries(test_voxcpm_vocab PRIVATE loom::engine)
+target_compile_definitions(test_voxcpm_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_voxcpm_vocab COMMAND test_voxcpm_vocab)
+set_tests_properties(test_voxcpm_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_voxcpm_vocab PROPERTIES FIXTURES_REQUIRED "voxcpm_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
 add_executable(test_ctc_vocab ci/test_ctc_vocab.cpp)
 target_link_libraries(test_ctc_vocab PRIVATE loom::engine)
@@ -1515,6 +1611,28 @@ set_tests_properties(test_e2e_granite_speech_mil_export PROPERTIES SKIP_RETURN_C
 
 # --- `kv_cache_scope: "private"`: two decode streams of one model, and the shared-cache arm that
 #     proves the check can fail. See ci/test_private_kv_cache.cpp. ---
+# --- `loom.seed_kv`: a saved attention state written into a module's KV cache (ADR-043). A bare
+#     two-layer ATTENTION module whose q/k/v are inputs, so the seeded rows alone decide the output. ---
+add_test(NAME gen_seed_kv_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_seed_kv_gguf.py
+            ${LOOM_FIXTURE_DIR}/seed_kv.gguf
+)
+set_tests_properties(gen_seed_kv_gguf_fixture PROPERTIES FIXTURES_SETUP seed_kv_gguf_fixture)
+set_tests_properties(gen_seed_kv_gguf_fixture PROPERTIES LABELS ci)
+add_executable(test_seed_kv ci/test_seed_kv.cpp)
+target_link_libraries(test_seed_kv PRIVATE loom::engine)
+target_compile_definitions(test_seed_kv PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_seed_kv COMMAND test_seed_kv)
+set_tests_properties(test_seed_kv PROPERTIES LABELS ci)
+set_tests_properties(test_seed_kv PROPERTIES FIXTURES_REQUIRED seed_kv_gguf_fixture)
+add_executable(test_voice_file ci/test_voice_file.cpp)
+target_link_libraries(test_voice_file PRIVATE loom::engine)
+target_compile_definitions(test_voice_file PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_voice_file COMMAND test_voice_file)
+set_tests_properties(test_voice_file PROPERTIES LABELS ci)
+# It reads cfg_streams.gguf too, for the "a model with no fingerprint takes no voice" arm.
+set_tests_properties(test_voice_file PROPERTIES FIXTURES_REQUIRED "seed_kv_gguf_fixture;cfg_streams_gguf_fixture")
+
 add_test(NAME gen_cfg_streams_gguf_fixture
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_cfg_streams_gguf.py
             ${LOOM_FIXTURE_DIR}/cfg_streams.gguf
@@ -1554,8 +1672,46 @@ add_test(NAME test_load_metadata COMMAND test_load_metadata)
 set_tests_properties(test_load_metadata PROPERTIES LABELS ci)
 set_tests_properties(test_load_metadata PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
 
+add_executable(test_e2e_f5_tts_lua_driver gate/test_e2e_f5_tts_lua_driver.cpp)
+target_link_libraries(test_e2e_f5_tts_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_f5_tts_lua_driver COMMAND test_e2e_f5_tts_lua_driver)
+set_tests_properties(test_e2e_f5_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_chatterbox_lua_driver gate/test_e2e_chatterbox_lua_driver.cpp)
+target_link_libraries(test_e2e_chatterbox_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_chatterbox_lua_driver COMMAND test_e2e_chatterbox_lua_driver)
+set_tests_properties(test_e2e_chatterbox_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_pocket_tts_lua_driver gate/test_e2e_pocket_tts_lua_driver.cpp)
+target_link_libraries(test_e2e_pocket_tts_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_pocket_tts_lua_driver COMMAND test_e2e_pocket_tts_lua_driver)
+set_tests_properties(test_e2e_pocket_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_voxcpm2_lua_driver gate/test_e2e_voxcpm2_lua_driver.cpp)
+target_link_libraries(test_e2e_voxcpm2_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_voxcpm2_lua_driver COMMAND test_e2e_voxcpm2_lua_driver)
+set_tests_properties(test_e2e_voxcpm2_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+# --- Family 9's eighth leaf: Voxtral-4B-TTS against vllm-omni's own flow head and codec, with pinned
+#     draws (scripts/voxtral_tts_reference.py). Codes identical free-running and teacher-forced. ---
+add_executable(test_e2e_voxtral_tts_lua_driver gate/test_e2e_voxtral_tts_lua_driver.cpp)
+target_link_libraries(test_e2e_voxtral_tts_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_voxtral_tts_lua_driver COMMAND test_e2e_voxtral_tts_lua_driver)
+set_tests_properties(test_e2e_voxtral_tts_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_cosyvoice3_lua_driver gate/test_e2e_cosyvoice3_lua_driver.cpp)
+target_link_libraries(test_e2e_cosyvoice3_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_cosyvoice3_lua_driver COMMAND test_e2e_cosyvoice3_lua_driver)
+set_tests_properties(test_e2e_cosyvoice3_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)
 add_test(NAME test_e2e_dia_dac_composition COMMAND test_e2e_dia_dac_composition)
 set_tests_properties(test_e2e_dia_dac_composition PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_dia_dac_composition PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_moss_tts_composition gate/test_e2e_moss_tts_composition.cpp)
+target_link_libraries(test_e2e_moss_tts_composition PRIVATE loom::engine)
+add_test(NAME test_e2e_moss_tts_composition COMMAND test_e2e_moss_tts_composition)
+set_tests_properties(test_e2e_moss_tts_composition PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_moss_tts_composition PROPERTIES SKIP_RETURN_CODE 77)

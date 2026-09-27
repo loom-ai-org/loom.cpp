@@ -50,6 +50,10 @@ script** as embedded Lua, alongside the weights those describe. The engine parse
   bindings write a store WITHOUT a build — `run_recurrent_and_retain`, `run_bi_recurrent_and_retain`
   and `expand_by_duration_and_retain`, which put a recurrence's sequence and a frame expansion there
   ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)).
+* **Noise has two homes, both on the one `rng_` stream.** A sampler's starting state is drawn by
+  `run_ode` from `n_elems`. Noise that a graph takes as an input is drawn by the driver with
+  `loom.gaussian_array` / `uniform_array`, in the reference's order, and a caller may override either
+  ([ADR-042](../adrs/adr-042-a-samplers-noise-is-the-engines-a-graph-inputs-noise-is-the-drivers.md)).
 
 **Two gotchas worth knowing before changing anything here.** Graph reuse and length-dependent constants
 interact: a constant folded into a retained graph at one length is wrong at another, and the failure is
