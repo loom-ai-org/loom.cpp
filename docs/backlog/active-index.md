@@ -80,7 +80,7 @@ release](#packaging--release)
     2026-09-25 export's weights and topologies, not by an export, so the rc11 publish still needs the
     fresh export it needs anyway; (b) the card's cloning section is staged, and the card gate
     stops at it as a reader-supplied file, so `test_the_card_runs` is a SKIP for this model now, the
-    Qwen3-TTS item below (the codec-LM oracle row still passes on the first block's audio); (c) a clip-in door inside loom (the codec encoder as
+    card-gate item below (the codec-LM oracle row still passes on the first block's audio); (c) a clip-in door inside loom (the codec encoder as
     phases) and `loom_cli`'s missing `text2codes` path, neither started.
     *Context: [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md)*
 * [ ] **Voxtral-4B-TTS (family 9's eighth leaf) is built, verified and gated, not published.** Branch
@@ -173,68 +173,35 @@ release](#packaging--release)
     digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
     first. Deferred by the user 2026-09-25.
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
-* [ ] **Qwen3-TTS's speaker encoder aborts the process, so the talker card's clip step is withdrawn.**
-  `text2codes.infer(..., waveform=<24 kHz clip>)` dies in native code:
-  `GGML_ASSERT(a->ne[d] == b->ne[d])` in `ggml_concat`, under `run_subgraph_and_retain` on the
-  driver's first call, `speaker_encoder`. It is not a Python exception, so a caller cannot catch it.
-  **It reproduces on every clip tried** (jfk.wav cut to 3, 5, 8 and 11 s; the ICL session's own 4 s
-  `ref24k.f32`), on the rc11 build AND on the released `loom-py-rt==1.0.0rc10` wheel, and on the
-  **published** rc10 GGUF as well as the staged ICL build. So it is not an rc11 regression, and the
-  live Hub card crashes today. Everything else in the file works: `x_vector=` runs, ICL
-  (`ref_audio=` + `ref_tokens=` + `x_vector=`) runs, and a greedy `text2codes` with the templated
-  prompt matches `transformers` **624/624** codes. ICL's own verification passed an x-vector, which is
-  why nothing hit this. Repro: `~/.claude/tmp/rc11-export/icl_ab/arms.py wave <ref24k.f32>`
-  (`arms.py xvec <xvec.txt>` is the passing arm). Found by the rc11 fresh-export card gate,
-  2026-09-27. Not yet known: which concat, and whether the speaker encoder's own export was ever
-  checked against the reference.
-  **A second defect surfaced with it: `text2codes(text)` sends the bare sentence.** The talker was
-  trained on `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n` (the ICL branch's
-  `REF_HEAD = 3` / `REF_TAIL = 2` strip exactly that from `ref_tokens`), the GGUF declares no chat
-  template (`apply_chat_template` raises), and the bare prompt stops after a word or two or runs to
-  `max_new_tokens` (Whisper: "Fox jumps", "(farting)"). The staged card now spells the template in
-  its string; `model.tokenize` gives the reference's ids for it, and the card's own seed-1234 take
-  reads back **WER 0.00**. The fix is the exporter declaring the template (or the driver wrapping
-  `tokens`), after which the card goes back to the bare sentence.
-  **The staged card (`hf-models/qwen3-tts-12hz-0.6b/README.md`, from loom-exporter's
-  `build_model_cards.py`) now takes the voice as `x_vector=` loaded from `x_vector.txt`**, with the
-  upstream recipe in its Known limitations (`extract_speaker_embedding(audio=wav, sr=24000)`). When
-  the speaker encoder is fixed, restore the clip step: in the `text-to-codes-voice-clone` snippet,
-  `import librosa` in place of `import numpy as np`, and in place of the `x_vector` lines
-
-  ```python
-  # The voice is a REFERENCE CLIP, not a speaker id -- this checkpoint carries no speaker table. A few
-  # clear seconds is enough. 24 kHz is what the speaker encoder expects, so resample on the way in.
-  reference, _ = librosa.load("reference.wav", sr=24000)
-  ...
-      waveform=reference.tolist(),
-  ```
-
-  and in the card's limitations, the x-vector paragraph back to: "**The voice comes from a reference
-  clip, and there is no speaker table.** This checkpoint's `spk_id` is empty, so cloning is the only
-  mode: pass `waveform=` and the speaker encoder extracts an x-vector from it. Pass `x_vector=`
-  instead to reuse one you already have -- it is 1024 floats and it is the whole of what the voice
-  contributes." (and drop "alongside `x_vector=`" and the "unaffected by the speaker encoder's abort"
-  clause from the ICL paragraph). Then re-run the card gate with `jfk.wav` as `reference.wav`, per the
-  item below. The gate's `card_sentence` reads only a plain string literal, so while the card spells
-  the template it must learn the f-string and strip `{role}`/`<|...|>`, or that row asserts "passes no
-  sentence". **Open decision:** the rc10 card on the Hub still shows `waveform=` and the bare
-  sentence; publishing is held until rc11.
-  *Context: [ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md),
-  [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md)*
-* [ ] **The Qwen3-TTS talker's card is never EXECUTED by the model-card gate**, and it is the only
-  voice-cloning row so this has no second example to be measured against. `test_the_card_runs` runs
+* [ ] **Six published GGUFs carry coremltools' fp32 DFT basis, and Qwen3-TTS's clip door is fixed
+  but not published.** Any `torch.stft` exported before 2026-09-29 folded a basis off by 5.3e-5
+  (N=512) to 1.4e-4 (N=1024): conformer-ctc-small, parakeet-rnnt, parakeet-tdt, granite-speech,
+  F5-TTS's mel and the Qwen3-TTS talker's speaker encoder
+  ([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)). Each changes on re-export
+  and needs a card-gate run before publishing. The ASR four are not known to be audibly or
+  transcriptionally affected; that has not been measured. **Qwen3-TTS is re-exported with both
+  fixes** (`waveform=` no longer aborts, [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md);
+  a bare sentence is now wrapped in the prompt template by the driver). Greedy `waveform=` codes
+  match `transformers` 624/624 in x-vector mode and ICL mode, and with templated or bare
+  `tokens`/`ref_tokens` alike. The card is back on `reference.wav` and the bare sentence, and its gate
+  runs it on the rc11 engine source (loom-py's pin `b1e7ab6`, no rebuild of the engine needed):
+  `-k qwen3-tts-12hz-0.6b` is 2 passed (the card runs, and the codec-LM ASR row), 6 skipped
+  as other tasks. The build and its card are staged in `hf-models/qwen3-tts-12hz-0.6b`
+  (sha256 `ceb1bb8e…`); the live Hub card still crashes until they are pushed to the Hub.
+  *Context: [ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md)*
+* [ ] **Cloning cards whose reader file is a voice file are never EXECUTED by the model-card gate.** `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
   ship a recording"; this card instead tells the reader to bring `reference.wav`, which is a
-  legitimate precondition the harness skips on by design. (Since 2026-09-27 that file is `x_vector.txt`, while the clip step is withdrawn; see the item above.) The consequence is that `-k qwen3-tts`
+  legitimate precondition the harness skips on by design. The consequence is that `-k qwen3-tts`
   reports **2 passed, 14 skipped** and none of the passes ran the snippet — the ASR oracle included,
   since it grades the audio the card itself produced. Pre-existing (the x-vector snippet has the same
   shape) and surfaced by ICL's own verification, which had to be done outside the gate entirely.
   **Decided by the user 2026-09-26: one common fixture, `jfk.wav`, stands for the reader's own
   recording on every such card** (the gate already seeds it as `audio`; it is public domain).
   **Done for clips 2026-09-29:** `run_card` writes `jfk.wav` as `reference.wav` in the card's working
-  directory, and F5-TTS's card now runs on it (2 passed). Still to do: the cards whose reader file is
-  NOT a clip -- Qwen3-TTS (`x_vector.txt` while the clip step is withdrawn; restored, it runs on
-  `reference.wav` as is), MOSS-TTS and CosyVoice3 (`voices/me.gguf`), which need a voice file made from
+  directory, and F5-TTS's card now runs on it (2 passed). Qwen3-TTS's card is back on
+  `reference.wav` (2026-09-29). Still to do: the cards whose reader file is NOT a clip -- MOSS-TTS
+  and CosyVoice3 (`voices/me.gguf`), which need a voice file made from
   `jfk.wav`, since making one needs PyTorch and the upstream checkpoint. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
   [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
 * [ ] **F5-TTS has no working high-level door; its card goes through `infer` meanwhile.** The export,
