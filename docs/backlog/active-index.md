@@ -137,8 +137,9 @@ release](#packaging--release)
   entry `voxcpm2` in `build_model_cards.py`. 9.3 GB at F32, ~20 s per second of audio on the 2-core
   box. rc11 (which carries `ROUND` and `loom::VoxCpmVocab`) is released and the card is STAGED in
   `hf-models/voxcpm2/` without a GGUF; its voice-design example no longer rebinds `audio`, which would
-  have had the gate grade "Welcome back..." against "hello world". To publish: a fresh export into
-  that directory and the card gate. *Context: [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md),
+  have had the gate grade "Welcome back..." against "hello world". **Exported and card-gated
+  2026-09-29, ready to publish:** the fresh export is byte-identical to `v5/voxcpm2.gguf`; the card
+  gate gives 2 passed, 6 skipped. *Context: [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md),
   [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md),
   [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)*
   * [ ] **Voice cloning from a recording** needs the AudioVAE's encoder (16 kHz, x640) as one more
@@ -156,8 +157,10 @@ release](#packaging--release)
   moves the mel 0.18. Whisper is exact unpinned. 3.4 GB at F32. rc11 is released and the card
   (`fun-cosyvoice3-0.5b` in `build_model_cards.py`) is STAGED in `hf-models/` without a GGUF; its
   limitations were brought up to the front-end work on 2026-09-29 (rules normalisation, voice files and
-  a "Cloning a voice" section). To publish: a fresh export into `hf-models/fun-cosyvoice3-0.5b/` and
-  loom-py's card gate. *Context:
+  a "Cloning a voice" section). **Exported and card-gated 2026-09-29, ready to publish:** the fresh
+  export is byte-identical to `v5/cosyvoice3.gguf`; the card gate gives 1 passed, 7 skipped -- the TTS
+  row hears the default voice say "hello world", and "card runs" stops at the reader's
+  `voices/me.gguf` by design (see the cloning-cards item). *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)*
   * [ ] **Cloning needs Python.** Voice files work (`loom_exporter.cosyvoice3_voices`, gate arm on a
