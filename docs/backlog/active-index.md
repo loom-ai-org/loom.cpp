@@ -200,7 +200,8 @@ release](#packaging--release)
   recording on every such card** (the gate already seeds it as `audio`; it is public domain).
   **Done for clips 2026-09-29:** `run_card` writes `jfk.wav` as `reference.wav` in the card's working
   directory, and F5-TTS's card now runs on it (2 passed). Qwen3-TTS's card is back on
-  `reference.wav` (2026-09-29). Still to do: the cards whose reader file is NOT a clip -- MOSS-TTS
+  `reference.wav` (2026-09-29), but its one snippet is the x-vector-from-clip mode: ICL (`ref_audio=` + `ref_tokens=`, now clip-only) and
+  `x_vector=` are prose only, so the gate never runs them. An ICL snippet needs `jfk.wav`'s transcript in the card (offered, not decided). Still to do: the cards whose reader file is NOT a clip -- MOSS-TTS
   and CosyVoice3 (`voices/me.gguf`), which need a voice file made from
   `jfk.wav`, since making one needs PyTorch and the upstream checkpoint. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
   [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
