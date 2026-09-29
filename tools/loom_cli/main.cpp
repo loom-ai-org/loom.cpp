@@ -17,12 +17,15 @@
 
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <memory>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -37,6 +40,8 @@ void print_usage(const char* argv0) {
                   "--out out.wav\n"
                   "       %s --model <voice-cloning-tts.gguf> --wav <ref.wav> "
                   "--ref-text \"<what it says>\" --prompt \"<text>\" --out out.wav\n"
+                  "       %s --model <text-to-codes.gguf> --prompt \"<text>\" --codec <codec.gguf> "
+                  "--out out.wav\n"
                   "\n"
                   "  --chat                        wrap --prompt in the model's own chat template\n"
                   "  --system <text>               a system turn ahead of it (implies --chat)\n"
@@ -51,6 +56,12 @@ void print_usage(const char* argv0) {
                   "  --voice <voice.gguf>          a voice file for a model that takes one (pocket-tts's,\n"
                   "                                cosyvoice3's and voxtral-tts's `voices/*.gguf`); refused if made for\n"
                   "                                other weights\n"
+                  "  --codec <codec.gguf>          for a model whose answer is CODEC TOKENS (dia,\n"
+                  "                                qwen3-tts, moss-tts): the codec that decodes them\n"
+                  "                                to --out. --n-predict caps FRAMES; --language picks\n"
+                  "                                one the file declares; --wav (and --ref-text) is\n"
+                  "                                the clip a cloning model takes its voice from\n"
+                  "  --codes-out <path>            ... and/or write the codes, one frame per line\n"
                   "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
                   "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
                   "                                `sample_rate=N` for a model that declares none\n"
@@ -62,7 +73,7 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0, argv0, argv0);
+                  argv0, argv0, argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
@@ -167,6 +178,253 @@ int synthesize(loom::GgufModel& model, const loom::Backends& backends,
     return 0;
 }
 
+// Whether the file's own driver reads `inputs.<name>`. A driver ignores an input it does not name, so
+// without this a `--wav` handed to a model that takes no clip would be dropped and the audio would
+// come back in the default voice with nothing said -- the silent substitution Retro-006 is about. The
+// drivers are generated, and every one spells an input read as `inputs.<name>`.
+bool driver_reads(const loom::GgufModel& model, const std::string& name) {
+    if (!model.has_kv("model.driver_script")) return false;
+    const std::string script = model.kv_str("model.driver_script");
+    const std::string dotted = "inputs." + name;
+    for (size_t at = script.find(dotted); at != std::string::npos; at = script.find(dotted, at + 1)) {
+        const size_t end = at + dotted.size();
+        if (end == script.size() || !(std::isalnum(static_cast<unsigned char>(script[end])) || script[end] == '_')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Text to ids through whichever vocabulary a text-to-codes file embeds. The three that ship use two
+// tags -- Dia's byte-level `byt5`, Qwen3-TTS's and MOSS-TTS's Qwen2 `gpt2` -- and the SentencePiece
+// pair is here because it costs one line and is the next thing an AR codec LM would carry. These are
+// the same vocabularies loom-py's `tokenize` dispatches to, so the ids are the ones its
+// `text2codes.infer(text)` sends.
+std::vector<int32_t> encode_for_codes(const loom::GgufModel& model, const std::string& text,
+                                      std::string* described) {
+    const std::string tag = model.has_kv("tokenizer.ggml.model") ? model.kv_str("tokenizer.ggml.model") : "";
+    if (tag == "byt5") {
+        auto vocab = loom::ByteVocab::load(model);
+        if (described) *described = "byte-level (byt5), " + std::to_string(vocab->size()) + " tokens";
+        return vocab->encode(text);
+    }
+    if (tag == "gpt2") {
+        auto vocab = loom::BpeVocab::load(model);
+        if (described) *described = "byte-level BPE, " + std::to_string(vocab->size()) + " tokens";
+        return vocab->encode(text);
+    }
+    if (tag == "t5" || tag == "llama") {
+        auto vocab = loom::Vocab::load(model);
+        if (described) *described = "SentencePiece (" + tag + "), " + std::to_string(vocab->size()) + " pieces";
+        return vocab->encode(text);
+    }
+    throw loom::SchemaError("this text-to-codes model's vocabulary is tagged '" + tag +
+                            "', which loom_cli cannot encode text with; pass token ids through loom-py's "
+                            "text2codes.infer(tokens=[...])");
+}
+
+// What a `text2codes` run needs beyond the model: the flags, gathered so the function below does not
+// take fifteen arguments.
+struct Text2CodesRequest {
+    std::string prompt;
+    bool has_prompt = false;
+    std::string wav_path;               // a reference clip, for a driver that reads `waveform`
+    std::string ref_text;               // what that clip says, for a driver that replays it (ICL)
+    bool has_ref_text = false;
+    std::string language;
+    std::optional<uint32_t> max_frames; // `--n-predict`, only when given
+    loom::text::GenerateOptions sampling;
+    uint32_t seed = 1234;
+    std::vector<std::pair<std::string, std::vector<double>>> extra;
+    std::string codec_path;
+    std::string codes_out;
+    std::string out_wav;
+};
+
+// **Text in, codec tokens out, and the codec that turns them into audio.** Dia, Qwen3-TTS and MOSS-TTS
+// are two files each (ADR-022): an AR LM that emits frames of codes and a codec that decodes them.
+// Until this existed they ran only through loom-py, because the LM fell through to the text generator
+// below (Qwen3-TTS and MOSS-TTS are `gpt2` files) or to the byt5 inspection branch (Dia).
+//
+// The shape is loom-py's `text2codes.infer` then `codes2speech.infer`, in one process:
+//
+//   * the codec's WIDTH is checked from its header before a single frame is generated. MOSS-TTS emits
+//     12 of MOSS-Audio-Tokenizer's 32 codebooks, and a codec that declares `codec.absent_code`
+//     decodes a narrower row as a prefix of its residual sum (ADR-050); one that does not cannot, and
+//     finding that out after minutes of generation would be the wrong order;
+//   * the LM is RELEASED before the codec loads. MOSS-TTS is 16 GB at F32 and its codec 4 GB, and the
+//     two are never needed at once;
+//   * `--codes-out` writes the frames, one per line, because the codes are the return value rather
+//     than an implementation detail -- a caller may cache them or decode them elsewhere.
+int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelContract& contract,
+                  const loom::Backends& backends, const Text2CodesRequest& req) {
+    const uint32_t width = model->has_kv("loom.codec.n_codebooks") ? model->hparam_u32("codec.n_codebooks") : 0;
+    if (width == 0) {
+        std::fprintf(stderr, "this model declares no `loom.codec.n_codebooks`, so its output cannot be cut "
+                             "into frames; re-export it with a current loom-exporter\n");
+        return 1;
+    }
+    std::string vocab_desc;
+    std::printf("  task: %s (%s), %u codebook(s) per frame\n", contract.task.c_str(),
+                contract.interface_name().c_str(), width);
+    if (!contract.languages.empty()) std::printf("  languages: %zu declared\n", contract.languages.size());
+    if (!req.has_prompt) {
+        std::printf("  pass --prompt \"<text>\" --codec <codec.gguf> --out out.wav to speak it, or "
+                    "--codes-out codes.txt for the codes alone\n");
+        return 0;
+    }
+    const std::vector<int32_t> ids = encode_for_codes(*model, req.prompt, &vocab_desc);
+    std::printf("  tokenizer: %s\n  %zu id(s)\n", vocab_desc.c_str(), ids.size());
+    if (ids.empty()) {
+        std::fprintf(stderr, "error: --prompt produced no token ids\n");
+        return 1;
+    }
+
+    // The codec, from its header only.
+    uint32_t codec_width = 0;
+    std::optional<uint32_t> absent;
+    if (!req.codec_path.empty()) {
+        const auto header = loom::GgufModel::load_metadata(req.codec_path);
+        const loom::ModelContract codec_contract = loom::ModelContract::read(*header);
+        if (codec_contract.interface_name() != "codes2speech") {
+            std::fprintf(stderr, "error: --codec '%s' is a %s file, not a codec (codes2speech)\n",
+                         req.codec_path.c_str(),
+                         codec_contract.interface_name().empty() ? "undeclared" : codec_contract.interface_name().c_str());
+            return 1;
+        }
+        codec_width = header->has_kv("loom.codec.n_codebooks") ? header->hparam_u32("codec.n_codebooks") : 0;
+        if (header->has_kv("loom.codec.absent_code")) absent = header->hparam_u32("codec.absent_code");
+        if (codec_width == 0 || width > codec_width || (width < codec_width && !absent)) {
+            std::fprintf(stderr,
+                         "error: this model emits %u codebook(s) per frame and --codec '%s' decodes %u%s. "
+                         "They are not a pair.\n",
+                         width, req.codec_path.c_str(), codec_width,
+                         width < codec_width ? " and declares no `codec.absent_code` to pad the rest with" : "");
+            return 1;
+        }
+        std::printf("  codec: %s, %u codebook(s)", req.codec_path.c_str(), codec_width);
+        if (width < codec_width) std::printf(", the last %u padded with id %u", codec_width - width, *absent);
+        std::printf("\n");
+    }
+    if (!req.out_wav.empty() && req.codec_path.empty()) {
+        std::fprintf(stderr, "error: this model's answer is codec tokens, not audio. Pass --codec "
+                             "<codec.gguf> to decode them to --out, or --codes-out to keep the codes\n");
+        return 1;
+    }
+    if (req.out_wav.empty() && req.codes_out.empty()) return 0;
+
+    std::unordered_map<std::string, loom::LoomLuaBridge::Value> inputs;
+    for (const auto& [name, values] : req.extra) {
+        if (name == "sample_rate") continue;
+        if (values.size() == 1) inputs[name] = values[0]; else inputs[name] = values;
+    }
+    inputs["tokens"] = std::vector<double>(ids.begin(), ids.end());
+    // Every one of the three drivers seeds its sampler from this and falls back to its checkpoint's
+    // declared temperature/top-k/top-p; the flags override those, as they do for a text LM.
+    inputs["seed"] = static_cast<double>(req.seed);
+    if (req.sampling.temperature) inputs["temperature"] = static_cast<double>(*req.sampling.temperature);
+    if (req.sampling.top_k) inputs["top_k"] = static_cast<double>(*req.sampling.top_k);
+    if (req.sampling.top_p) inputs["top_p"] = static_cast<double>(*req.sampling.top_p);
+    // FRAMES, not rows -- the drivers undo their own delay pattern -- and only when asked, so the
+    // model's own ceiling applies by default rather than `--n-predict`'s text-LM default of 16.
+    if (req.max_frames) inputs["max_new_tokens"] = static_cast<double>(*req.max_frames);
+    if (!req.language.empty()) {
+        // The driver's `language` is a 1-based position in what the FILE declares, 0 meaning none
+        // (loom-py's `_language_index`). A code it does not declare is refused rather than dropped.
+        const auto it = std::find(contract.languages.begin(), contract.languages.end(), req.language);
+        if (it == contract.languages.end() || !driver_reads(*model, "language")) {
+            std::string have;
+            for (const auto& l : contract.languages) have += (have.empty() ? "" : " ") + l;
+            std::fprintf(stderr, "error: --language %s is not one this model declares (%s)\n",
+                         req.language.c_str(), have.empty() ? "it declares none" : have.c_str());
+            return 1;
+        }
+        inputs["language"] = static_cast<double>(it - contract.languages.begin() + 1);
+    }
+    if (!req.wav_path.empty()) {
+        // A reference clip is the voice for a model that clones from audio (Qwen3-TTS: an x-vector
+        // drawn from it; with --ref-text, also the clip's own codes replayed as the prompt, ICL).
+        if (!driver_reads(*model, "waveform")) {
+            std::fprintf(stderr, "error: this model's driver reads no reference clip, so --wav would be "
+                                 "ignored. A voice for it is a --voice file, if it takes one.\n");
+            return 1;
+        }
+        if (contract.sample_rate == 0) {
+            std::fprintf(stderr, "error: this model declares no `loom.sample_rate` for its reference clip\n");
+            return 1;
+        }
+        const std::vector<float> clip = loom_cli::load_wav_pcm16_mono(req.wav_path, contract.sample_rate);
+        std::printf("  reference: %zu samples = %.2f s\n", clip.size(),
+                    static_cast<double>(clip.size()) / contract.sample_rate);
+        const std::vector<double> as_doubles(clip.begin(), clip.end());
+        inputs["waveform"] = as_doubles;
+        if (req.has_ref_text) {
+            if (!driver_reads(*model, "ref_audio") || !driver_reads(*model, "ref_tokens")) {
+                std::fprintf(stderr, "error: this model's driver does not replay a reference, so "
+                                     "--ref-text would be ignored\n");
+                return 1;
+            }
+            // The same vocabulary as the text, un-templated: the driver wraps both.
+            const std::vector<int32_t> ref_ids = encode_for_codes(*model, req.ref_text, nullptr);
+            inputs["ref_audio"] = as_doubles;
+            inputs["ref_tokens"] = std::vector<double>(ref_ids.begin(), ref_ids.end());
+            std::printf("  in-context: the clip's codes and its %zu transcript id(s) replayed ahead of "
+                        "the text\n", ref_ids.size());
+        }
+    } else if (req.has_ref_text) {
+        std::fprintf(stderr, "error: --ref-text is what a reference clip says; pass the clip as --wav\n");
+        return 1;
+    } else if (driver_reads(*model, "waveform") && !inputs.count("x_vector")) {
+        // Qwen3-TTS-Base has no built-in speaker, so cloning is its only mode.
+        std::fprintf(stderr, "error: this model clones a voice and has none of its own: pass --wav "
+                             "<ref.wav> (%u Hz mono)\n", contract.sample_rate);
+        return 1;
+    }
+
+    std::vector<double> flat;
+    {
+        loom::Session session(*model, backends);
+        const auto result = session.bridge().call("infer", inputs);
+        const auto* codes = std::get_if<std::vector<double>>(&result);
+        if (codes == nullptr) {
+            std::fprintf(stderr, "this model's driver returned a single number, not a run of codes\n");
+            return 1;
+        }
+        flat = *codes;
+        print_device_report(session.bridge());
+    }
+    if (flat.size() % width != 0) {
+        std::fprintf(stderr, "error: the driver returned %zu codes, not a whole number of %u-wide frames; "
+                             "the export and the driver disagree\n", flat.size(), width);
+        return 1;
+    }
+    const size_t n_frames = flat.size() / width;
+    std::printf("  %zu frame(s) x %u codebook(s)\n", n_frames, width);
+
+    if (!req.codes_out.empty()) {
+        std::ofstream out(req.codes_out);
+        if (!out) throw std::runtime_error("could not write '" + req.codes_out + "'");
+        for (size_t f = 0; f < n_frames; ++f) {
+            for (uint32_t c = 0; c < width; ++c) out << (c ? " " : "") << static_cast<int64_t>(flat[f * width + c]);
+            out << '\n';
+        }
+        std::printf("  wrote %s (one frame per line)\n", req.codes_out.c_str());
+    }
+    if (req.out_wav.empty()) return 0;
+
+    model.reset();
+    auto codec = loom::GgufModel::load(req.codec_path, backends);
+    std::printf("loaded '%s'\n", req.codec_path.c_str());
+    std::vector<int32_t> rows;
+    rows.reserve(n_frames * codec_width);
+    for (size_t f = 0; f < n_frames; ++f) {
+        for (uint32_t c = 0; c < codec_width; ++c) {
+            rows.push_back(c < width ? static_cast<int32_t>(flat[f * width + c]) : static_cast<int32_t>(*absent));
+        }
+    }
+    return synthesize(*codec, backends, rows, "codes", {}, req.out_wav, rate_override(req.extra), req.seed);
+}
+
 void print_device_report(const loom::LoomLuaBridge& bridge) {
     const auto report = bridge.device_report();
     if (report.empty()) return;
@@ -266,6 +524,9 @@ int main(int argc, char** argv) {
     bool chat = false;
     bool has_system = false;
     uint32_t n_predict = 16;
+    bool has_n_predict = false;
+    std::string codec_path;
+    std::string codes_out;
     loom::text::GenerateOptions gen_opts;
     std::string device_spec;
     bool list_devices = false;
@@ -335,6 +596,11 @@ int main(int argc, char** argv) {
             gen_opts.seed = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--n-predict" && i + 1 < argc) {
             n_predict = static_cast<uint32_t>(std::stoul(argv[++i]));
+            has_n_predict = true;
+        } else if (arg == "--codec" && i + 1 < argc) {
+            codec_path = argv[++i];
+        } else if (arg == "--codes-out" && i + 1 < argc) {
+            codes_out = argv[++i];
         } else if (arg == "--out" && i + 1 < argc) {
             out_wav = argv[++i];
         } else if (arg == "--input" && i + 1 < argc) {
@@ -440,6 +706,27 @@ int main(int argc, char** argv) {
             }
             print_device_report(session.bridge());
             return 0;
+        }
+
+        // Ahead of the vocabulary-tag branches below, because two of the three files it answers for
+        // carry tags those branches claim: Dia's `byt5` is inspection-only there and Qwen3-TTS's and
+        // MOSS-TTS's `gpt2` is the text generator.
+        if (contract.interface_name() == "text2codes") {
+            Text2CodesRequest req;
+            req.prompt = prompt_text;
+            req.has_prompt = has_prompt;
+            if (has_wav) req.wav_path = wav_path;
+            req.ref_text = ref_text;
+            req.has_ref_text = has_ref_text;
+            req.language = language_name;
+            if (has_n_predict) req.max_frames = n_predict;
+            req.sampling = gen_opts;
+            req.seed = synth_seed;
+            req.extra = extra_inputs;
+            req.codec_path = codec_path;
+            req.codes_out = codes_out;
+            req.out_wav = out_wav;
+            return text_to_codes(model, contract, backends, req);
         }
 
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "bert") {

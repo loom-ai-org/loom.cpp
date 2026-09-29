@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-09-24
+last_updated: 2026-09-29
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -48,6 +48,25 @@ ENGINE reads them and refuses a mismatch (`loom::load_voice`); the HOSTS resolve
 (`loom_cli --voice <file>`; loom-py's `text2speech.infer(voice=...)`, `model.voices`, `model.voice()`,
 looking beside the model file and then in its Hub repo's `voices/`). Pocket-TTS is the first model to
 declare one.
+
+### Codec pairs in `loom_cli`
+
+A `text2codes` file (Dia, Qwen3-TTS, MOSS-TTS) answers with codec tokens, and its codec is a second
+GGUF ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)). `loom_cli --model <lm.gguf>
+--prompt "<text>" --codec <codec.gguf> --out out.wav` runs both halves the way loom-py's
+`text2codes.infer` → `codes2speech.infer` does, and `--codes-out` keeps the frames (one per line). It
+dispatches on the declared interface, ahead of the vocabulary-tag branches — Dia's `byt5` tag was an
+inspection-only branch and the Qwen2 `gpt2` tag the text generator. Three choices the loom-py doors do
+not face:
+
+* **The pairing is checked from the codec's header** (`GgufModel::load_metadata`) before any frame is
+  generated: an LM no wider than the codec, and a narrower one only when the codec declares
+  `codec.absent_code` ([ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md)).
+* **The LM is released before the codec loads.** MOSS-TTS is 16 GB at F32 and its codec 4 GB.
+* **A flag the driver would ignore is refused.** `--wav` (Qwen3-TTS's clip) and `--ref-text` (its ICL
+  replay) are sent only to a driver that reads `inputs.waveform` / `inputs.ref_audio` +
+  `inputs.ref_tokens`; `--language` is a 1-based index into `loom.text.languages`, as in loom-py.
+  `--n-predict` caps FRAMES and is sent only when given.
 
 ### Resolution order for anything a model can infer itself
 
