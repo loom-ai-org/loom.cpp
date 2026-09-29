@@ -173,21 +173,13 @@ release](#packaging--release)
     digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
     first. Deferred by the user 2026-09-25.
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
-* [ ] **Six published GGUFs carry coremltools' fp32 DFT basis, and Qwen3-TTS's clip door is fixed
-  but not published.** Any `torch.stft` exported before 2026-09-29 folded a basis off by 5.3e-5
-  (N=512) to 1.4e-4 (N=1024): conformer-ctc-small, parakeet-rnnt, parakeet-tdt, granite-speech,
-  F5-TTS's mel and the Qwen3-TTS talker's speaker encoder
+* [ ] **Five published GGUFs carry coremltools' fp32 DFT basis.** Any `torch.stft` exported before
+  2026-09-29 folded a basis off by 5.3e-5 (N=512) to 1.4e-4 (N=1024): conformer-ctc-small,
+  parakeet-rnnt, parakeet-tdt, granite-speech and F5-TTS's mel
   ([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)). Each changes on re-export
-  and needs a card-gate run before publishing. The ASR four are not known to be audibly or
-  transcriptionally affected; that has not been measured. **Qwen3-TTS is re-exported with both
-  fixes** (`waveform=` no longer aborts, [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md);
-  a bare sentence is now wrapped in the prompt template by the driver). Greedy `waveform=` codes
-  match `transformers` 624/624 in x-vector mode and ICL mode, and with templated or bare
-  `tokens`/`ref_tokens` alike. The card is back on `reference.wav` and the bare sentence, and its gate
-  runs it on the rc11 engine source (loom-py's pin `b1e7ab6`, no rebuild of the engine needed):
-  `-k qwen3-tts-12hz-0.6b` is 2 passed (the card runs, and the codec-LM ASR row), 6 skipped
-  as other tasks. The build and its card are staged in `hf-models/qwen3-tts-12hz-0.6b`
-  (sha256 `ceb1bb8e…`); the live Hub card still crashes until they are pushed to the Hub.
+  and needs a card-gate run before publishing. Whether any of them transcribes or sounds different is
+  not measured, so measure before and after. Qwen3-TTS, the sixth, is re-exported and on the Hub
+  (2026-09-29, `x-linked-etag` = local sha256, card identical).
   *Context: [ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md)*
 * [ ] **Cloning cards whose reader file is a voice file are never EXECUTED by the model-card gate.** `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
