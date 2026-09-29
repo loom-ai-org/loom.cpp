@@ -13,6 +13,7 @@
 #include "loom/loom.h"
 #include "loom/core/transcribe.h"
 #include "loom/core/conv_state_cache.h"
+#include "codes_file.h"
 #include "wav_file.h"
 
 
@@ -61,7 +62,8 @@ void print_usage(const char* argv0) {
                   "                                to --out. --n-predict caps FRAMES; --language picks\n"
                   "                                one the file declares; --wav (and --ref-text) is\n"
                   "                                the clip a cloning model takes its voice from\n"
-                  "  --codes-out <path>            ... and/or write the codes, one frame per line\n"
+                  "  --codes-out <codes.gguf>      ... and/or write the codes; a codec decodes the file\n"
+                  "                                later with --prompt @codes.gguf\n"
                   "  --input <name=1,2,3|@file>    an extra driver input: kokoro's `ref_s`, matcha's\n"
                   "                                `n_steps`, styletts2's `diffusion_steps`, or\n"
                   "                                `sample_rate=N` for a model that declares none\n"
@@ -101,9 +103,32 @@ std::vector<double> read_number_spec(const std::string& spec) {
 
 void print_device_report(const loom::LoomLuaBridge& bridge);
 
+// One driver input as the command line gathered it. `array` is what the bridge must be handed, and it
+// cannot be read off the length: `--input n_steps=32` is ONE number and means a number, while a voice
+// file's `reference_frames` for a single reference is a one-element TENSOR the driver takes the length
+// of. Collapsing every one-element list to a scalar handed MOSS-TTS's driver the number 137 where it
+// expected `{137}`, and `#_frames` failed on the first one-reference voice run through this CLI.
+struct DriverInput {
+    std::string name;
+    std::vector<double> values;
+    bool array = false;
+};
+using DriverInputs = std::vector<DriverInput>;
+
+void set_inputs(std::unordered_map<std::string, loom::LoomLuaBridge::Value>& inputs, const DriverInputs& extra) {
+    for (const auto& [name, values, array] : extra) {
+        if (name == "sample_rate") continue;               // ours, not the driver's
+        if (values.size() == 1 && !array) {
+            inputs[name] = values[0];
+        } else {
+            inputs[name] = values;
+        }
+    }
+}
+
 // `--input sample_rate=N`, for the three models that declare none of their own.
-uint32_t rate_override(const std::vector<std::pair<std::string, std::vector<double>>>& extra) {
-    for (const auto& [name, values] : extra) {
+uint32_t rate_override(const DriverInputs& extra) {
+    for (const auto& [name, values, array] : extra) {
         if (name == "sample_rate" && !values.empty()) return static_cast<uint32_t>(values[0]);
     }
     return 0;
@@ -123,7 +148,7 @@ uint32_t rate_override(const std::vector<std::pair<std::string, std::vector<doub
 // audio at the wrong speed, which is the failure this refuses to make silently.
 int synthesize(loom::GgufModel& model, const loom::Backends& backends,
                 const std::vector<int32_t>& ids, const std::string& input_name,
-                const std::vector<std::pair<std::string, std::vector<double>>>& extra,
+                const DriverInputs& extra,
                 const std::string& out_path, uint32_t rate_override, uint32_t seed) {
     uint32_t rate = model.has_kv("loom.sample_rate") ? model.hparam_u32("sample_rate") : 0;
     if (rate == 0) rate = rate_override;
@@ -144,14 +169,7 @@ int synthesize(loom::GgufModel& model, const loom::Backends& backends,
     // does not name it simply ignores the entry. Defaulted rather than required, because a CLI that
     // refuses to speak until you pick a random number is asking the wrong question; `--seed` sets it.
     inputs["seed"] = static_cast<double>(seed);
-    for (const auto& [name, values] : extra) {
-        if (name == "sample_rate") continue;               // ours, not the driver's
-        if (values.size() == 1) {
-            inputs[name] = values[0];
-        } else {
-            inputs[name] = values;
-        }
-    }
+    set_inputs(inputs, extra);
 
     const auto result = session.bridge().call("infer", inputs);
     const auto* samples = std::get_if<std::vector<double>>(&result);
@@ -223,6 +241,35 @@ std::vector<int32_t> encode_for_codes(const loom::GgufModel& model, const std::s
                             "text2codes.infer(tokens=[...])");
 }
 
+// Why rows `width` wide cannot go to a codec `codec_width` wide, or "" when they can: no wider, and
+// narrower only when the codec declares the id that means "codebook absent" -- a residual quantizer
+// decodes its first k codebooks as a prefix of the full sum (ADR-050). One rule for both doors that
+// feed a codec here, the pair and a codes file.
+std::string pairing_error(uint32_t width, uint32_t codec_width, const std::optional<uint32_t>& absent) {
+    if (codec_width == 0) return "declares no `loom.codec.n_codebooks`";
+    if (width > codec_width) return "decodes only " + std::to_string(codec_width) + ". They are not a pair.";
+    if (width < codec_width && !absent) {
+        return "decodes " + std::to_string(codec_width) +
+               " and declares no `codec.absent_code` to pad the rest with. They are not a pair.";
+    }
+    return {};
+}
+
+// Frame-major rows `width` wide, each filled out to `codec_width` with the absent id. Call only after
+// `pairing_error` said yes.
+std::vector<int32_t> widen_rows(const std::vector<int32_t>& codes, uint32_t width, uint32_t codec_width,
+                                const std::optional<uint32_t>& absent) {
+    if (width == codec_width) return codes;
+    std::vector<int32_t> rows;
+    rows.reserve(codes.size() / width * codec_width);
+    for (size_t f = 0; f < codes.size() / width; ++f) {
+        for (uint32_t c = 0; c < codec_width; ++c) {
+            rows.push_back(c < width ? codes[f * width + c] : static_cast<int32_t>(*absent));
+        }
+    }
+    return rows;
+}
+
 // What a `text2codes` run needs beyond the model: the flags, gathered so the function below does not
 // take fifteen arguments.
 struct Text2CodesRequest {
@@ -235,7 +282,7 @@ struct Text2CodesRequest {
     std::optional<uint32_t> max_frames; // `--n-predict`, only when given
     loom::text::GenerateOptions sampling;
     uint32_t seed = 1234;
-    std::vector<std::pair<std::string, std::vector<double>>> extra;
+    DriverInputs extra;
     std::string codec_path;
     std::string codes_out;
     std::string out_wav;
@@ -254,8 +301,9 @@ struct Text2CodesRequest {
 //     finding that out after minutes of generation would be the wrong order;
 //   * the LM is RELEASED before the codec loads. MOSS-TTS is 16 GB at F32 and its codec 4 GB, and the
 //     two are never needed at once;
-//   * `--codes-out` writes the frames, one per line, because the codes are the return value rather
-//     than an implementation detail -- a caller may cache them or decode them elsewhere.
+//   * `--codes-out` writes the frames as a codes GGUF (codes_file.h), because the codes are the
+//     return value rather than an implementation detail -- a caller may cache them or decode them
+//     elsewhere, and the codec branch below reads the file back with its width.
 int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelContract& contract,
                   const loom::Backends& backends, const Text2CodesRequest& req) {
     const uint32_t width = model->has_kv("loom.codec.n_codebooks") ? model->hparam_u32("codec.n_codebooks") : 0;
@@ -270,7 +318,7 @@ int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelCont
     if (!contract.languages.empty()) std::printf("  languages: %zu declared\n", contract.languages.size());
     if (!req.has_prompt) {
         std::printf("  pass --prompt \"<text>\" --codec <codec.gguf> --out out.wav to speak it, or "
-                    "--codes-out codes.txt for the codes alone\n");
+                    "--codes-out codes.gguf for the codes alone\n");
         return 0;
     }
     const std::vector<int32_t> ids = encode_for_codes(*model, req.prompt, &vocab_desc);
@@ -294,12 +342,10 @@ int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelCont
         }
         codec_width = header->has_kv("loom.codec.n_codebooks") ? header->hparam_u32("codec.n_codebooks") : 0;
         if (header->has_kv("loom.codec.absent_code")) absent = header->hparam_u32("codec.absent_code");
-        if (codec_width == 0 || width > codec_width || (width < codec_width && !absent)) {
-            std::fprintf(stderr,
-                         "error: this model emits %u codebook(s) per frame and --codec '%s' decodes %u%s. "
-                         "They are not a pair.\n",
-                         width, req.codec_path.c_str(), codec_width,
-                         width < codec_width ? " and declares no `codec.absent_code` to pad the rest with" : "");
+        const std::string refused = pairing_error(width, codec_width, absent);
+        if (!refused.empty()) {
+            std::fprintf(stderr, "error: this model emits %u codebook(s) per frame and --codec '%s' %s\n",
+                         width, req.codec_path.c_str(), refused.c_str());
             return 1;
         }
         std::printf("  codec: %s, %u codebook(s)", req.codec_path.c_str(), codec_width);
@@ -314,10 +360,7 @@ int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelCont
     if (req.out_wav.empty() && req.codes_out.empty()) return 0;
 
     std::unordered_map<std::string, loom::LoomLuaBridge::Value> inputs;
-    for (const auto& [name, values] : req.extra) {
-        if (name == "sample_rate") continue;
-        if (values.size() == 1) inputs[name] = values[0]; else inputs[name] = values;
-    }
+    set_inputs(inputs, req.extra);
     inputs["tokens"] = std::vector<double>(ids.begin(), ids.end());
     // Every one of the three drivers seeds its sampler from this and falls back to its checkpoint's
     // declared temperature/top-k/top-p; the flags override those, as they do for a text LM.
@@ -401,28 +444,18 @@ int text_to_codes(std::unique_ptr<loom::GgufModel>& model, const loom::ModelCont
     const size_t n_frames = flat.size() / width;
     std::printf("  %zu frame(s) x %u codebook(s)\n", n_frames, width);
 
+    const std::vector<int32_t> codes(flat.begin(), flat.end());
     if (!req.codes_out.empty()) {
-        std::ofstream out(req.codes_out);
-        if (!out) throw std::runtime_error("could not write '" + req.codes_out + "'");
-        for (size_t f = 0; f < n_frames; ++f) {
-            for (uint32_t c = 0; c < width; ++c) out << (c ? " " : "") << static_cast<int64_t>(flat[f * width + c]);
-            out << '\n';
-        }
-        std::printf("  wrote %s (one frame per line)\n", req.codes_out.c_str());
+        loom_cli::write_codes_gguf(req.codes_out, codes, width, model->architecture());
+        std::printf("  wrote %s\n", req.codes_out.c_str());
     }
     if (req.out_wav.empty()) return 0;
 
     model.reset();
     auto codec = loom::GgufModel::load(req.codec_path, backends);
     std::printf("loaded '%s'\n", req.codec_path.c_str());
-    std::vector<int32_t> rows;
-    rows.reserve(n_frames * codec_width);
-    for (size_t f = 0; f < n_frames; ++f) {
-        for (uint32_t c = 0; c < codec_width; ++c) {
-            rows.push_back(c < width ? static_cast<int32_t>(flat[f * width + c]) : static_cast<int32_t>(*absent));
-        }
-    }
-    return synthesize(*codec, backends, rows, "codes", {}, req.out_wav, rate_override(req.extra), req.seed);
+    return synthesize(*codec, backends, widen_rows(codes, width, codec_width, absent), "codes", {},
+                      req.out_wav, rate_override(req.extra), req.seed);
 }
 
 void print_device_report(const loom::LoomLuaBridge& bridge) {
@@ -538,7 +571,7 @@ int main(int argc, char** argv) {
     // not in the GGUF, StyleTTS2 takes `diffusion_steps`, Matcha `n_steps`. Rather than a flag per
     // family, the driver's own declared input names are the interface -- a wrong one is an error from
     // the engine naming the module and the input.
-    std::vector<std::pair<std::string, std::vector<double>>> extra_inputs;
+    DriverInputs extra_inputs;
     // A voice file's tensors become driver inputs by name (ADR-045), loaded once the model is, because
     // whether the file FITS the model is a question only the model can answer.
     std::string voice_path;
@@ -610,7 +643,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--input takes name=1,2,3 or name=@file, got '%s'\n", spec.c_str());
                 return 2;
             }
-            extra_inputs.emplace_back(spec.substr(0, eq), read_number_spec(spec.substr(eq + 1)));
+            extra_inputs.push_back({spec.substr(0, eq), read_number_spec(spec.substr(eq + 1)), false});
         } else if (arg == "--device" && i + 1 < argc) {
             device_spec = argv[++i];
         } else if (arg == "--list-devices") {
@@ -661,7 +694,7 @@ int main(int argc, char** argv) {
             const loom::VoiceFile voice = loom::load_voice(*model, voice_path);
             std::printf("  voice: %s (%s)\n", voice.name.c_str(), voice.license.c_str());
             // Ahead of the --input ones, so a caller's explicit input still wins.
-            for (const auto& [name, values] : voice.inputs) extra_inputs.insert(extra_inputs.begin(), {name, values});
+            for (const auto& [name, values] : voice.inputs) extra_inputs.insert(extra_inputs.begin(), {name, values, true});
         }
         std::printf("  architecture: %s\n", model->architecture().c_str());
 
@@ -770,9 +803,32 @@ int main(int argc, char** argv) {
             }
             std::printf("\n");
             if (!has_prompt || out_wav.empty()) {
-                std::printf("  pass --prompt \"<codes>\" --out out.wav to decode; codes are frame-major "
+                std::printf("  pass --prompt @codes.gguf (a text2codes run's --codes-out) or --prompt "
+                            "\"<codes>\" --out out.wav to decode; codes are frame-major "
                             "(all %u for frame 0, then frame 1, ...)\n", width);
                 return 0;
+            }
+            if (prompt_text.size() > 1 && prompt_text[0] == '@' && loom_cli::is_gguf(prompt_text.substr(1))) {
+                // A codes file states its own width, so rows narrower than this codec's -- MOSS-TTS's 12
+                // into MOSS-Audio-Tokenizer's 32 -- are widened by the same rule the pair uses, where a
+                // flat list below can only be taken at this codec's width.
+                const loom_cli::CodesFile file = loom_cli::read_codes_gguf(prompt_text.substr(1));
+                std::optional<uint32_t> absent;
+                if (model->has_kv("loom.codec.absent_code")) absent = model->hparam_u32("codec.absent_code");
+                const std::string refused = pairing_error(file.n_codebooks, width, absent);
+                if (!refused.empty()) {
+                    std::fprintf(stderr, "error: '%s' holds %u codebook(s) per frame and this codec %s\n",
+                                 prompt_text.c_str() + 1, file.n_codebooks, refused.c_str());
+                    return 1;
+                }
+                std::printf("  %zu frame(s) x %u codebook(s)%s%s", file.n_frames(), file.n_codebooks,
+                            file.source.empty() ? "" : " from ", file.source.c_str());
+                if (file.n_codebooks < width) {
+                    std::printf(", the last %u padded with id %u", width - file.n_codebooks, *absent);
+                }
+                std::printf("\n");
+                return synthesize(*model, backends, widen_rows(file.codes, file.n_codebooks, width, absent),
+                                  "codes", extra_inputs, out_wav, rate_override(extra_inputs), synth_seed);
             }
             const std::vector<double> codes = read_number_spec(prompt_text);
             if (width > 0 && codes.size() % width != 0) {
@@ -961,9 +1017,8 @@ int main(int argc, char** argv) {
                         static_cast<double>(reference.size()) /
                             std::max<uint32_t>(contract.sample_rate, 1));
             auto extra = extra_inputs;
-            extra.emplace_back("waveform", std::vector<double>(reference.begin(), reference.end()));
-            extra.emplace_back("n_ref_text",
-                               std::vector<double>{static_cast<double>(ref_ids.size())});
+            extra.push_back({"waveform", std::vector<double>(reference.begin(), reference.end()), true});
+            extra.push_back({"n_ref_text", std::vector<double>{static_cast<double>(ref_ids.size())}, false});
             return synthesize(*model, backends, all_ids, "text_ids", extra, out_wav,
                               rate_override(extra_inputs), synth_seed);
         }
