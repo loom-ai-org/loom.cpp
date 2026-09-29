@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-27
+last_updated: 2026-09-29
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -135,8 +135,10 @@ release](#packaging--release)
   text path is 4992/4992 ids against the reference over ten classes, Chinese split and typed special
   tokens included. Whisper is exact on English, a voice-design prompt and Chinese. Apache-2.0. Card
   entry `voxcpm2` in `build_model_cards.py`. 9.3 GB at F32, ~20 s per second of audio on the 2-core
-  box. To publish: rc11 (below: it needs `ROUND` and `loom::VoxCpmVocab`), a fresh export and the card
-  gate. *Context: [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md),
+  box. rc11 (which carries `ROUND` and `loom::VoxCpmVocab`) is released and the card is STAGED in
+  `hf-models/voxcpm2/` without a GGUF; its voice-design example no longer rebinds `audio`, which would
+  have had the gate grade "Welcome back..." against "hello world". To publish: a fresh export into
+  that directory and the card gate. *Context: [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md),
   [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md),
   [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)*
   * [ ] **Voice cloning from a recording** needs the AudioVAE's encoder (16 kHz, x640) as one more
@@ -151,8 +153,11 @@ release](#packaging--release)
   `v5/cosyvoice3.gguf` + `v5/cosyvoice3_ref/`, pinned draws): the LM 76/76 sampled tokens identical,
   the flow's mel at the reference's own f32/f64 spread, the vocoder at rmse 3.2e-04 on the reference's
   mel, free-running rmse 2.7e-03; sabotage (the `transformers` top-p) diverges at token 4 and CFG 0.75
-  moves the mel 0.18. Whisper is exact unpinned. 3.4 GB at F32. To publish: rc11 (below), a fresh
-  export, a card entry in `build_model_cards.py` and loom-py's card gate. *Context:
+  moves the mel 0.18. Whisper is exact unpinned. 3.4 GB at F32. rc11 is released and the card
+  (`fun-cosyvoice3-0.5b` in `build_model_cards.py`) is STAGED in `hf-models/` without a GGUF; its
+  limitations were brought up to the front-end work on 2026-09-29 (rules normalisation, voice files and
+  a "Cloning a voice" section). To publish: a fresh export into `hf-models/fun-cosyvoice3-0.5b/` and
+  loom-py's card gate. *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)*
   * [ ] **Cloning needs Python.** Voice files work (`loom_exporter.cosyvoice3_voices`, gate arm on a
@@ -222,11 +227,14 @@ release](#packaging--release)
   since it grades the audio the card itself produced. Pre-existing (the x-vector snippet has the same
   shape) and surfaced by ICL's own verification, which had to be done outside the gate entirely.
   **Decided by the user 2026-09-26: one common fixture, `jfk.wav`, stands for the reader's own
-  recording on every such card** (the gate already seeds it as `audio`; it is public domain). Still
-  to do: make the cloning cards (Qwen3-TTS, F5-TTS, MOSS-TTS) run on it -- for MOSS that means the
-  card gate also needs a voice file made from it, since making one needs PyTorch and the codec. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
+  recording on every such card** (the gate already seeds it as `audio`; it is public domain).
+  **Done for clips 2026-09-29:** `run_card` writes `jfk.wav` as `reference.wav` in the card's working
+  directory, and F5-TTS's card now runs on it (2 passed). Still to do: the cards whose reader file is
+  NOT a clip -- Qwen3-TTS (`x_vector.txt` while the clip step is withdrawn; restored, it runs on
+  `reference.wav` as is), MOSS-TTS and CosyVoice3 (`voices/me.gguf`), which need a voice file made from
+  `jfk.wav`, since making one needs PyTorch and the upstream checkpoint. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
   [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
-* [ ] **F5-TTS has no working high-level door, and its catalogued card documents one.** The export,
+* [ ] **F5-TTS has no working high-level door; its card goes through `infer` meanwhile.** The export,
   the driver and `loom_cli` all work (gate: max |Δ| 4.14e-03 against the reference waveform; ASR
   oracle exact), but `Text2Speech.infer(text)` in loom-py sends only the text's ids as `tokens` and
   has no way to say "here is a reference clip and what it says". F5-TTS in-fills, so it needs the
@@ -234,15 +242,16 @@ release](#packaging--release)
   join is (`n_ref_text`, or an explicit `duration`). Worse than a missing door: the driver binds
   `inputs.waveform or inputs.tokens` — the generic `caller_input` fallback — so a bare
   `infer("hello world")` hands the mel front end a handful of ids *as audio samples* before failing.
-  The catalogue entry `f5-tts-v1-base` in loom-exporter's `tools/build_model_cards.py` gets the
-  generic `text-to-speech-with-vocab` snippet (`model.text2speech.infer("hello world", ...)`), which
-  therefore fails — the card gate would catch it, but it has never been staged or run.
-  **What closes it:** a voice-cloning TTS door in loom-py (kwargs `reference=`/`reference_text=`,
-  encoding both and computing `n_ref_text`, the shape `loom_cli --wav/--ref-text` already has), a
-  matching `text-to-speech-voice-clone` snippet keyed the way `text-to-codes-voice-clone` is, dropping
-  the `tokens` fallback from this driver's two CALLER bindings, then staging
-  (`build_model_cards.py --only f5-tts-v1-base`) and the card gate — which inherits the item above,
-  because this card also needs the reader's own `reference.wav`. Publish only after rc11. The weights
+  **Staged and card-gated 2026-09-29, through `infer`:** the card's `text-to-speech-voice-clone`
+  snippet calls `model.infer(waveform=, text_ids=, n_ref_text=, seed=42)` with `loom_cli`'s join
+  (transcript + space + text) and wraps the result in `loom.Audio`, which works on the RELEASED rc11 --
+  a new door would not until the release after it. The example clip is JFK's, the gate's stand-in for
+  the reader's `reference.wav`, so its transcript is printed in the card. Export at main: 1.43 GB,
+  tensors identical to `v5/f5_tts.gguf` (the vocoder topology differs only by 4 consistently renamed
+  intermediates). Card gate: **2 passed, 6 skipped** (card runs 20 min, TTS intelligibility 23 min on
+  the 2-core box, 3.4 GB). Ready to publish.
+  **What is left** is the `reference=` door and moving the card and its gate onto it: its own item
+  under Host API. The weights
   are `cc-by-nc-4.0` (Emilia), recorded in [Epic-03 §2](../epics/epic-03-model-coverage.md).
   *Context: [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md),
   [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)*
@@ -563,6 +572,24 @@ release](#packaging--release)
   *Context: [ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md),
   [ADR-050](../adrs/adr-050-a-codec-declares-its-absent-id-and-its-channels.md),
   [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md)*
+* [ ] **F5-TTS: a `reference=` door in loom-py, then its card and card gate move onto it.** Today
+  `text2speech.infer(text)` cannot pass a reference clip and its transcript, so F5-TTS's staged card
+  (2026-09-29) calls `model.infer(waveform=, text_ids=, n_ref_text=)` with the join spelled out and
+  wraps the samples in `loom.Audio` -- correct, and gated (2 passed), but a reader has to know the
+  driver's inputs. Three pieces, in this order:
+  (1) **loom-py:** `Text2Speech.infer(text, reference=<samples>, reference_text=<str>)` encodes
+  `reference_text + " " + text` (a space appended only when the transcript lacks one, as `loom_cli
+  --ref-text` does), passes `waveform`/`text_ids`/`n_ref_text`, and returns `Audio` at the declared
+  rate; a `tests/ci` test pins the join and `n_ref_text` against `loom_cli`'s. While there, drop the
+  `inputs.tokens` fallback from the F5 driver's two CALLER bindings (loom-exporter), which today hands
+  a bare `infer("hello world")` to the mel front end as audio samples.
+  (2) **The card** (`text-to-speech-voice-clone` in `build_model_cards.py`) switches to the door --
+  **only once a released `loom-py-rt` carries it**, since a card must run on the published runtime
+  (the reason it uses `infer` now). Restage with `--readme-only`.
+  (3) **The card gate** needs no new row: `run_card` already seeds `jfk.wav` as `reference.wav` and
+  the TTS row grades "hello world". Re-run `-k f5-tts-v1-base` on the new card (~45 min on the 2-core
+  box) and confirm 2 passed. *Context: the F5-TTS item under Models,
+  [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)*
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
