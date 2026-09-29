@@ -54,7 +54,9 @@ declare one.
 A `text2codes` file (Dia, Qwen3-TTS, MOSS-TTS) answers with codec tokens, and its codec is a second
 GGUF ([ADR-022](../adrs/adr-022-dia-and-its-codec-stay-two-files.md)). `loom_cli --model <lm.gguf>
 --prompt "<text>" --codec <codec.gguf> --out out.wav` runs both halves the way loom-py's
-`text2codes.infer` → `codes2speech.infer` does, and `--codes-out` keeps the frames (one per line). It
+`text2codes.infer` → `codes2speech.infer` does. `--codes-out` keeps the frames as a codes GGUF that
+states its own width, and a codec decodes it later with `--prompt @codes.gguf`
+([ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md)). It
 dispatches on the declared interface, ahead of the vocabulary-tag branches — Dia's `byt5` tag was an
 inspection-only branch and the Qwen2 `gpt2` tag the text generator. Three choices the loom-py doors do
 not face:
@@ -84,7 +86,7 @@ fixture set is kept for exactly this reason; `v5` is the contract-declaring set.
 | | |
 |---|---|
 | Authority | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) |
-| Decisions | [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md) |
+| Decisions | [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-006](../adrs/adr-006-model-constants-belong-to-the-export.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md) |
 | Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md) |
 | Active tasks | [Backlog → Host API](../backlog/active-index.md#host-api) |
 
