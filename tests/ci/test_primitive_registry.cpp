@@ -1864,6 +1864,24 @@ void test_concat() {
     LOOM_CHECK((get_f32(out_dim0) == std::vector<float>{1, 2, 10, 20, 30, /*row1*/ 3, 4, 40, 50, 60}));
 }
 
+// A CONCAT whose operands disagree off the concat axis must throw, not reach ggml_concat's assert: the
+// assert killed the process from inside a caller's `infer` (Qwen3-TTS's speaker encoder, a one-frame
+// mean concatenated onto a T-frame hidden state), and a SchemaError is what build_node names the node in.
+void test_concat_rejects_mismatched_operands() {
+    GgmlScratch s;
+    ggml_tensor* a = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 7, 4, 1);
+    ggml_tensor* b = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 1, 4, 1);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    bool threw = false;
+    try {
+        op("CONCAT")(pc, {a, b}, {{"dim", 1}});
+    } catch (const loom::SchemaError&) {
+        threw = true;
+    }
+    LOOM_CHECK(threw);
+}
+
 void test_repeat() {
     // ggml_repeat_4d wrapper (StyleTTS2's diffusion Transformer1d needs to broadcast a single per-batch
     // style vector [channels] up to [channels, T] before CONCAT-ing with a per-position context
@@ -2968,6 +2986,7 @@ int main() {
     test_pad_1d();
     test_pad_1d_reflect();
     test_concat();
+    test_concat_rejects_mismatched_operands();
     test_repeat();
     test_interpolate_1d();
     test_rq_spline_inverse();

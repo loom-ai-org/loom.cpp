@@ -684,6 +684,21 @@ Outputs op_concat(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     // tensor once the ggml<->numpy axis-reversal convention is accounted for.
     expect_n_inputs("CONCAT", in, 2);
     const int dim = static_cast<int>(resolve_attr_int(attrs, "dim", pc.symbols));
+    // ggml_concat ASSERTS that the other three axes agree, which kills the process from inside a
+    // caller's `infer`; checked here instead, it is a SchemaError that build_node names the node in.
+    if (dim < 0 || dim >= GGML_MAX_DIMS) {
+        throw SchemaError("CONCAT: dim " + std::to_string(dim) + " is not a ggml axis");
+    }
+    auto ne_str = [](ggml_tensor* t) {
+        return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," +
+               std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + "]";
+    };
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (d != dim && in[0]->ne[d] != in[1]->ne[d]) {
+            throw SchemaError("CONCAT: along dim " + std::to_string(dim) + ", a=" + ne_str(in[0]) +
+                              " and b=" + ne_str(in[1]) + " differ on dim " + std::to_string(d));
+        }
+    }
     return {ggml_concat(pc.ctx, in[0], in[1], dim)};
 }
 
