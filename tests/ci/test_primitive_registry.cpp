@@ -50,6 +50,45 @@ void test_get_rows() {
     LOOM_CHECK(result == expected);
 }
 
+// A MATRIX of ids into one 2-D table: ggml_get_rows reads it as a batched lookup and used to assert
+// `a->ne[2] == b->ne[1]`, aborting the process (Retro-066, SpeechT5's `pe_k([n, n])`). It is one flat
+// lookup, reshaped to `[ne0, idx...]`, which is what torch's `embedding(idx)` returns.
+void test_get_rows_matrix_index_into_a_2d_table() {
+    GgmlScratch s;
+    ggml_tensor* data = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 3, 4);   // 4 rows of 3
+    ggml_set_input(data);
+    ggml_tensor* idx = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_I32, 2, 3, 1); // torch [1, 3, 2]
+    ggml_set_input(idx);
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("GET_ROWS")(pc, {data, idx}, {})[0];
+    LOOM_CHECK(out->ne[0] == 3 && out->ne[1] == 2 && out->ne[2] == 3 && out->ne[3] == 1);
+
+    ggml_cgraph* gf = s.expand(out);
+    set_f32(data, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    set_i32(idx, {3, 0, 1, 1, 2, 3});
+    s.compute(gf);
+    const std::vector<float> expected = {10, 11, 12, 1, 2, 3, 4, 5, 6, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    LOOM_CHECK(get_f32(out) == expected);
+}
+
+// Anything that is neither shape is a catchable error rather than a ggml abort.
+void test_get_rows_mismatched_batch_throws() {
+    GgmlScratch s;
+    ggml_tensor* data = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 3, 4, 2);   // two tables
+    ggml_tensor* idx = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_I32, 2, 5);       // five index rows
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    bool threw = false;
+    try {
+        op("GET_ROWS")(pc, {data, idx}, {});
+    } catch (const loom::SchemaError&) {
+        threw = true;
+    }
+    LOOM_CHECK(threw);
+}
+
 void test_mul_mat_identity() {
     GgmlScratch s;
     // a: 2x2 identity. b: ne=[2,3] (3 "columns" of length 2). mul_mat(identity, b) == b.
@@ -2930,6 +2969,8 @@ void test_rwkv_wkv7() {
 
 int main() {
     test_get_rows();
+    test_get_rows_matrix_index_into_a_2d_table();
+    test_get_rows_mismatched_batch_throws();
     test_mul_mat_identity();
     test_add_mul_silu();
     test_swiglu();
