@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-09-30
+last_updated: 2026-10-01
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -53,8 +53,8 @@ release](#packaging--release)
 
 ## Models
 
-* [ ] **SpeechT5 is PUBLISHED (2026-09-30, `loom-ai-org/speecht5-tts-loom`, Hub-verified) with its seven CMU ARCTIC voice files; the PRs are open:** loom.cpp #46, loom-exporter #39, loom-py #40 (the card gate's new voice-file row). Left: numbers are `<unk>`, as in the reference ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)); a host must spell them. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-9bs-first-leaf-a-loop-that-emits-mel-frames), [ADR-058](../adrs/adr-058-an-xvector-voice-is-stamped-with-its-embedding-space.md)*
-* [ ] **A multi-row index into a 2-D table aborts in `ggml_get_rows`.** It is a batched lookup, so every index axis but the innermost must be 1 when it runs. The exporter now warns at export time. Dia's multi-channel embedding gathers `(1, T, C)` and runs only because its loop never uses T > 1. Fix: flatten in `op_get_rows` (engine: reshape the index to 1-D, gather, reshape to `[ne0, idx...]`), which turns an uncatchable abort into the right answer. *Context: [Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)*
+* [ ] **SpeechT5 is PUBLISHED (2026-09-30, `loom-ai-org/speecht5-tts-loom`, Hub-verified) with its seven CMU ARCTIC voice files; PRs loom.cpp #46, loom-exporter #39, loom-py #40.** Numbers are spelled now ([ADR-059](../adrs/adr-059-a-number-speller-ships-as-data-beside-the-vocabulary.md), branch `feat/speecht5-digits-and-get-rows`, stacked on #46/#39/#40), but only by an engine after rc11: **republish the GGUF and card after the next loom-py release**, not before (a scratch staging copy is built). *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-9bs-first-leaf-a-loop-that-emits-mel-frames), [ADR-058](../adrs/adr-058-an-xvector-voice-is-stamped-with-its-embedding-space.md)*
+* [ ] **The Unigram Viterbi breaks score TIES differently from SentencePiece.** flan-t5's `g`+`gg` and `gg`+`g` score exactly the same, and loom picks the other one: 2 of 5,000 random strings differ, and nothing else does since unknown runs fuse ([Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md)). Find SentencePiece's tie rule (its lattice enumerates begin nodes per end position) and match it.
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer are built, verified and gated, not published.** Branches
   `feat/p5-family-11-moss-audio-tokenizer` (the codec, pushed) and `feat/p5-family-10-moss-tts` (the
   LM). Codes are exact against the reference, greedy and pinned-sampled, and the pair reads back 9/9

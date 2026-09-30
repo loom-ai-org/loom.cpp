@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-09-30
+last_updated: 2026-10-01
 ---
 
 # Epic-03: Model Coverage
@@ -1192,8 +1192,11 @@ defaults as knobs.
   to a batched `ggml_get_rows`, and an axis-0 shape read the walk answered as a batch size of 1.
 * **The tokenizer is a SentencePiece CHAR model**, written as Unigram because with single-character
   pieces the two are the same encoder
-  ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)). It has no digits, and
-  like the reference the export does not spell numbers.
+  ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)). It has no digits, so
+  the file carries the reference's own number speller as data, run by `loom::Vocab` before
+  segmenting ([ADR-059](../adrs/adr-059-a-number-speller-ships-as-data-beside-the-vocabulary.md)). Its
+  differential found that the engine's Unigram encoder never fused unknown runs
+  ([Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md)).
 * **`loom_cli` had no door for it.** Its TTS branches key on per-family vocabulary tags, so a plain
   SentencePiece file that declares `loom.output.kind = audio` fell through to the token loop. The
   loop ran the whole synthesis and then refused a 68,096-sample "token list". It now synthesises.
