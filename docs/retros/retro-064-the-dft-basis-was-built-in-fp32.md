@@ -43,6 +43,26 @@ conformer-ctc-small, parakeet-rnnt, parakeet-tdt and granite-speech (5.3e-5 at N
 F5-TTS's mel and Qwen3-TTS (1.4e-4 at N=1024). Paraformer and SenseVoice build their basis on the host
 and are exact. Those six GGUFs change on re-export; see the hub.
 
+## Measured Effect (2026-09-30)
+
+The five other GGUFs were re-exported at loom-exporter `1891005`. In each one, exactly two tensors
+changed, the cos and sin bases. The drivers were identical, the topologies were identical up to const
+renaming, and the cards were byte-identical. What the fix did, before -> after:
+
+* **The ASR models do not transcribe differently.** Conformer-ctc-small, both parakeets and
+  granite-speech gave identical transcripts on jfk.wav and four LibriSpeech clips. At the tensor level,
+  loom now sits at NeMo's own f32 spread against NeMo at f64. Conformer's log-probs went from
+  2.5e-4 to 6.5e-5. Parakeet-TDT's encoder went from 1.25e-3 to 2.1e-6, relative to its maximum. These
+  numbers come from the two clips that a separate NeMo masking defect does not reach; see the hub item
+  "NeMo's subsampling masks are baked all-true".
+* **F5-TTS sounds different.** On jfk.wav, its `mel` phase was 0.41 from torch at f64 on average (6.2
+  at most), all of it in quiet bins. The fixed file is 0.0057 off; torch's own f32 is 0.0019 off. With
+  the reference's noise pinned, the published file's waveform was a different realization from
+  PyTorch's: rmse 7.4e-2, cosine 0.888. The fresh export matches at rmse 1.5e-4, cosine 1.000000.
+  Whisper hears the same words from both, and the speaker similarity to JFK is equal (0.806 against
+  0.804). A generative model conditioned on the clip turned a 1.4e-4 constant error into a different
+  sample, and none of the checks we ran would call that sample wrong.
+
 ## Takeaway
 
 **Difference a folded constant against numpy before trusting anything built on it.** This is SNAC's
