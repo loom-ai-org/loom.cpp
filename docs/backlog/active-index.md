@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Land the review stack: loom.cpp [#42](https://github.com/loom-ai-org/loom.cpp/pull/42) (`feat/loom-cli-text2codes`), then what stacks on it** | Work now STACKS (user, 2026-09-29): each new branch starts from the current working branch, not `main`, and the merges cascade. #42 is the bottom of the stack: `loom_cli`'s `text2codes` path and codes files ([ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md)), CLI and docs only, so no loom-py pin bump. Merge each PR with a **merge commit** (loom-py pins loom.cpp shas), bottom first. **Delete each merged branch at once**: `delete_branch_on_merge` is off, and a child PR is retargeted to `main` only when its base branch is deleted (otherwise `gh api -X PATCH repos/loom-ai-org/<repo>/pulls/<n> -f base=main`; `gh pr edit` is broken on these repos) → [Packaging & release](#packaging--release) |
+| **Land the review stack: loom.cpp [#42](https://github.com/loom-ai-org/loom.cpp/pull/42) ← [#43](https://github.com/loom-ai-org/loom.cpp/pull/43) ← [#44](https://github.com/loom-ai-org/loom.cpp/pull/44), and loom-exporter [#36](https://github.com/loom-ai-org/loom-exporter/pull/36)** | Work now STACKS (user, 2026-09-29): each new branch starts from the current working branch (in loom.cpp, `docs/nemo-length-masks` as of 2026-09-30), not `main`, and the merges cascade. #42 is the bottom of the stack: `loom_cli`'s `text2codes` path and codes files ([ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md)), CLI and docs only, so no loom-py pin bump. #43 (DFT-basis re-export, [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)) and #44 ([Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)) are docs only. loom-exporter #36 is the NeMo mask fix itself, based on `main` and independent of the loom.cpp stack; the files it produced are already on the Hub. Merge each PR with a **merge commit** (loom-py pins loom.cpp shas), bottom first. **Delete each merged branch at once**: `delete_branch_on_merge` is off, and a child PR is retargeted to `main` only when its base branch is deleted (otherwise `gh api -X PATCH repos/loom-ai-org/<repo>/pulls/<n> -f base=main`; `gh pr edit` is broken on these repos) → [Packaging & release](#packaging--release) |
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
@@ -173,13 +173,6 @@ release](#packaging--release)
     digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
     first. Deferred by the user 2026-09-25.
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
-* [ ] **Three NeMo GGUFs on the Hub still need republishing after the subsampling-mask fix.** The
-  DFT-basis re-export ([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), measured
-  effect there) is PUBLISHED as of 2026-09-30 for conformer-ctc-small, parakeet-rnnt, parakeet-tdt,
-  granite-speech and F5-TTS. It was verified from the Hub side: `x-linked-etag` equals the local sha256
-  and the cards are identical. The three NeMo files still carry the subsampling-mask defect (Exporter
-  section), so they are republished once that is fixed: re-export, card gate, then `upload_all.py`.
-  *Context: [ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md)*
 * [ ] **Cloning cards whose reader file is a voice file are never EXECUTED by the model-card gate.** `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
   ship a recording"; this card instead tells the reader to bring `reference.wav`, which is a
@@ -273,30 +266,6 @@ release](#packaging--release)
     model costs N+1 checkpoint loads under isolation today. It would not change the peak.
 
 ## Exporter / MIL compiler
-
-* [ ] **NeMo's subsampling masks are baked all-true, and at about half of all clip lengths one of
-  them is not.** `_less_is_always_valid_mask` (`topology_ops.py`) replaces every
-  `arange(T) < f(length)` comparison except CMVN's with a constant all-true mask. The premise, in
-  that guard's comment and in [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md),
-  is that a single utterance is never padded, so no frame can be masked. That premise is false. NeMo's
-  mel front end makes the valid length `floor(n/160)`, which is one less than the STFT frame count.
-  `MaskedConvolutionSequential` then carries that length through each stride-2 conv. After a conv,
-  the valid count is one short of the output frame count whenever the valid count going in is even (the
-  `(L-1)/2` in `calc_length` is fractional). NeMo zeroes that frame; loom keeps it. Measured
-  2026-09-30 against NeMo 2.6.2 at f64 (dither off), on jfk.wav and four LibriSpeech clips, plus seven
-  truncations of jfk. For conformer-ctc-small, the divergence appears at exactly the lengths the
-  parity rule predicts, 8 of the 12 tested. There, every frame's log-probs move by 0.1-0.5 and the last
-  frame by up to 18. At the other lengths loom sits at the reference's own f32 spread (4e-5).
-  Parakeet-TDT's encoder output is 8-32% off (relative to max) on the same three clips. Parakeet-RNNT's
-  is 1-10% off. Transcripts were unchanged on those five clips, apart from one CTC argmax on one
-  truncation, so this is a tensor-oracle defect that the card gate cannot see
-  ([[feedback-tensor-oracle-not-token-oracle]]). **Fix:** compute the stage masks from the real
-  `calc_length` (floor, `all_paddings = 2`) instead of a constant. The traced arithmetic is the
-  broken part: coremltools dropped the floor and folded `all_paddings = 1`. The fix changes the
-  three NeMo GGUFs again, so it needs the same re-export, card gate and publish as the DFT item under
-  Models. Check gigaam-v3-rnnt, which has its own subsampling, before assuming it is clear. Harness:
-  `~/.claude/tmp/dft-reexport/` (`nemo_ref.py`, `nemo_enc_ref.py`, `bis_ref.py`, and the phase probe).
-  *Context: [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md)*
 
 * [ ] **An export's op names depend on what its process converted earlier.**
   `coremltools`' `Builder.name_count` is a *class* attribute -- one counter for the whole process --
