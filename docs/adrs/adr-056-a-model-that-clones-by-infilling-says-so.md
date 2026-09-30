@@ -55,8 +55,9 @@ a wrong answer, not an error.
 
 ## Consequences
 
-* The published F5-TTS GGUF predates the key, so the door refuses it and says to re-export. The
-  re-export changes the driver and one KV; the tensors are unchanged.
+* A GGUF exported before the key is refused by the door, which says to re-export. The Hub's F5-TTS
+  was republished with it on 2026-09-30; the driver and one KV changed and the tensors did not. Its
+  door output is bit-identical to the old card's `model.infer(...)` on the old file (max |d| 0).
 * The next model that clones from a clip plus its transcript declares its own value if its inputs
   differ. Qwen3-TTS's ICL mode is one such case, but it takes the transcript as a separate
   `ref_tokens` and lives on `text2codes`.
