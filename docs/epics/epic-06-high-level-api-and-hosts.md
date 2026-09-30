@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-09-29
+last_updated: 2026-09-30
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -48,6 +48,15 @@ ENGINE reads them and refuses a mismatch (`loom::load_voice`); the HOSTS resolve
 (`loom_cli --voice <file>`; loom-py's `text2speech.infer(voice=...)`, `model.voices`, `model.voice()`,
 looking beside the model file and then in its Hub repo's `voices/`). Pocket-TTS is the first model to
 declare one.
+
+### Reference clips (in-filling)
+
+A model with no voice of its own that clones by IN-FILLING (F5-TTS) declares `loom.tts.reference =
+"infill"` ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)). The host joins the
+clip's transcript to the text and passes the clip, the joined ids and the join
+(`waveform`/`text_ids`/`n_ref_text`): loom-py's `text2speech.infer(text, reference=, reference_text=)`
+and `loom_cli --wav --ref-text` build the same three. A model that does not declare it is refused
+rather than handed a clip it would ignore.
 
 ### Codec pairs in `loom_cli`
 
