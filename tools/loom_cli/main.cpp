@@ -1126,6 +1126,21 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
+            // A TTS file whose text front end is a PLAIN vocabulary (SpeechT5's SentencePiece
+            // characters) has no family branch above, and without this one it reached the token loop,
+            // which ran the whole synthesis and then refused the waveform as "68096 ids for
+            // max_new_tokens=16". The declared output kind is what says which door this is.
+            const bool speaks = model->has_kv("loom.output.kind") && model->kv_str("loom.output.kind") == "audio";
+            if (is_multi_topology && speaks && has_text_vocab) {
+                std::printf("  %zu id(s)\n", prompt_tokens.size());
+                if (out_wav.empty()) {
+                    std::printf("  pass --out out.wav to synthesise it\n");
+                    return 0;
+                }
+                return synthesize(*model, backends, prompt_tokens, "tokens", extra_inputs, out_wav,
+                                  rate_override(extra_inputs), synth_seed);
+            }
+
             if (is_multi_topology) {
                 // THE LOOP IS THE ENGINE'S NOW (loom/core/text_generate.h), and unifying it changed this
                 // CLI's behaviour in three ways that were all bugs rather than choices: it ran the full
