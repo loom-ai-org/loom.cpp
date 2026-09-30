@@ -254,6 +254,12 @@ SupertonicTTS, StyleTTS2.
   buggy value ever feeds) are true for every position by construction, regardless of what NeMo's own
   traced arithmetic computes for the bound.
 
+  > **Correction, 2026-09-30:** that guarantee does not hold. The mel front end's valid length is one
+  > less than the STFT frame count, and NeMo carries it through each subsampling conv. Whenever it is
+  > even going into a stride-2 conv, one output frame is padding that NeMo zeroes and this bypass
+  > keeps. That is about half of all clip lengths. At those lengths, conformer-ctc-small's log-probs
+  > are 0.1-18 off NeMo at f64. See the hub item "NeMo's subsampling masks are baked all-true".
+
   New `_traces_to_range_1d`/`_traces_to_length_input` (backward producer-chain walks, mirroring this
   file's other `_traces_*`/`_try_resolve_*` helpers) recognize this exact `arange(T) < length`-derived
   pattern on the MIL `less` op specifically (the only comparison op actually seen doing this — narrow by
