@@ -97,16 +97,11 @@ release](#packaging--release)
   [Epic-03](../epics/epic-03-model-coverage.md),
   [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md),
   [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)*
-* [ ] **Chatterbox (family 9's fourth leaf) is built, verified and pushed (no PRs), and not yet
-  published or gated on the Hub.** Branch `feat/p5-family-9-chatterbox` in all three repos, stacked on family 9's
-  F5-TTS branches. Verified: the gate is 2.5e-05 from the reference waveform, the tokenizer is 3000/3000
-  ids against the reference, and the Whisper oracle is exact at guided greedy and at two sampled seeds.
-  Card entry `chatterbox` in `build_model_cards.py`, whose first limitation says why there is **no
-  Perth watermark** (decided 2026-09-23; see Epic-03 §2). To publish: rc11 (below), a fresh export, and
-  loom-py's model-card gate against it. The card's snippet is the plain text door, since the built-in
-  voice needs no reference clip, so unlike Qwen3-TTS and F5 it IS executed by the gate. Voice cloning
-  (voice encoder + S3 tokenizer + CAMPPlus) and the multilingual and Turbo checkpoints are separate
-  leaves. *Context: [Epic-03](../epics/epic-03-model-coverage.md),
+* [ ] **Chatterbox's other leaves**: voice cloning (voice encoder + S3 tokenizer + CAMPPlus), and the
+  multilingual and Turbo checkpoints. The English model is PUBLISHED (2026-09-30,
+  `loom-ai-org/chatterbox-loom`: exported on the workstation from loom-exporter `c61351e`, card gate 2
+  passed there, x-linked-etag = local sha256 `eee92e72...`; no Perth watermark, per Epic-03 §2).
+  *Context: [Epic-03](../epics/epic-03-model-coverage.md),
   [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)*
 * [ ] **Pocket-TTS (family 9's fifth leaf) is built, verified and pushed (no PRs), and not yet
   published or gated on the Hub.** Branch `feat/p5-family-9-pocket-tts` in all three repos, stacked on
