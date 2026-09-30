@@ -27,7 +27,7 @@ Four packages on PyPI at `1.0.0rc11`, each one's `latest` (`loom-py-rt` 17 files
 `-vulkan` 2, `-metal` 1); the `linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI
 rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc11` sits on
 loom-py `92ca766`, moved there from `01894be` for the Vulkan image fix before anything reached PyPI.
-**Thirty-eight** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org):
+**Thirty-nine** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org) (SpeechT5, the 39th, on 2026-09-30):
 rc10's thirty re-exported fresh at rc11 and card-gated, plus eight first-time publishes (F5-TTS,
 Fun-CosyVoice3, VoxCPM2, Pocket-TTS, Voxtral-4B-TTS, Chatterbox and the MOSS pair). Since the release
 the Hub has taken three rounds of republishes, all Hub-verified: the fp32 DFT basis in five GGUFs
@@ -53,7 +53,7 @@ release](#packaging--release)
 
 ## Models
 
-* [ ] **SpeechT5 is built, verified and gated, not published.** Branch `feat/p5-family-9b-speecht5` in loom.cpp and loom-exporter (loom-py needs nothing: no engine change). Teacher-forced waveform max |Δ| 1.3e-04 against a torch floor of 1.7e-04; Whisper exact. Left: (1) a model-card entry and the card gate, then the Hub publish (needs the user's go; no release needed, the released engine runs it); (2) the other six CMU ARCTIC speakers as voice files ([ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md)), today a raw `speaker` x-vector input; (3) numbers are `<unk>`, as in the reference ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)). *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-9bs-first-leaf-a-loop-that-emits-mel-frames)*
+* [ ] **SpeechT5 is PUBLISHED (2026-09-30, `loom-ai-org/speecht5-tts-loom`, Hub-verified) with its seven CMU ARCTIC voice files; the PRs are open:** loom.cpp #46, loom-exporter #39, loom-py #40 (the card gate's new voice-file row). Left: numbers are `<unk>`, as in the reference ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)); a host must spell them. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-9bs-first-leaf-a-loop-that-emits-mel-frames), [ADR-058](../adrs/adr-058-an-xvector-voice-is-stamped-with-its-embedding-space.md)*
 * [ ] **A multi-row index into a 2-D table aborts in `ggml_get_rows`.** It is a batched lookup, so every index axis but the innermost must be 1 when it runs. The exporter now warns at export time. Dia's multi-channel embedding gathers `(1, T, C)` and runs only because its loop never uses T > 1. Fix: flatten in `op_get_rows` (engine: reshape the index to 1-D, gather, reshape to `[ne0, idx...]`), which turns an uncatchable abort into the right answer. *Context: [Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer are built, verified and gated, not published.** Branches
   `feat/p5-family-11-moss-audio-tokenizer` (the codec, pushed) and `feat/p5-family-10-moss-tts` (the
