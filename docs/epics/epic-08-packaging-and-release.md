@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: packaging
-last_updated: 2026-09-17
+last_updated: 2026-09-30
 ---
 
 # Epic-08: Packaging and Release
@@ -58,6 +58,20 @@ end to PyPI.
 
 **Wheels published before 2026-08-14 silently require AVX2** — worth knowing before debugging an
 illegal-instruction report from an older install.
+
+### Model cards
+
+Every `python` block of a staged card runs, in order, against the GGUF beside it
+(`loom-py/tests/gate/test_model_cards.py`, `LOOM_MODEL_CARDS`), and the audio the card produced is
+transcribed back. A card that clones a voice names a file the reader brings, and **`jfk.wav` stands in
+for all of them** (user, 2026-09-26): the gate writes it as `reference.wav`, and for a card whose
+reader file is a voice file (MOSS-TTS, CosyVoice3: `voices/me.gguf`) it copies in
+`$LOOM_CARD_VOICES/<card>.gguf`, a voice made from jfk.wav for that model. Making one needs PyTorch and
+the upstream checkpoint, so the gate does not make them: they live in the fixtures tree
+(`loom-engine-artifacts/v5/card_voices/`). Without the variable those cards stop at the file and the
+skip names it. A card that binds a second waveform should REBIND `audio` rather than bind a plain
+list (Supertonic's style example did, and its TTS row skipped), because the gate grades the last
+`Audio` bound.
 
 ## 3. Related Decisions and Artifacts
 
