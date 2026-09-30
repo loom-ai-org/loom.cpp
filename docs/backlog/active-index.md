@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Land the review stack: loom.cpp [#42](https://github.com/loom-ai-org/loom.cpp/pull/42) ← [#43](https://github.com/loom-ai-org/loom.cpp/pull/43) ← [#44](https://github.com/loom-ai-org/loom.cpp/pull/44), and loom-exporter [#36](https://github.com/loom-ai-org/loom-exporter/pull/36)** | Work now STACKS (user, 2026-09-29): each new branch starts from the current working branch (in loom.cpp, `docs/nemo-length-masks` as of 2026-09-30), not `main`, and the merges cascade. #42 is the bottom of the stack: `loom_cli`'s `text2codes` path and codes files ([ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md)), CLI and docs only, so no loom-py pin bump. #43 (DFT-basis re-export, [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)) and #44 ([Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)) are docs only. loom-exporter #36 is the NeMo mask fix itself, based on `main` and independent of the loom.cpp stack; the files it produced are already on the Hub. Merge each PR with a **merge commit** (loom-py pins loom.cpp shas), bottom first. **Delete each merged branch at once**: `delete_branch_on_merge` is off, and a child PR is retargeted to `main` only when its base branch is deleted (otherwise `gh api -X PATCH repos/loom-ai-org/<repo>/pulls/<n> -f base=main`; `gh pr edit` is broken on these repos) → [Packaging & release](#packaging--release) |
+| **Land the review stack: loom.cpp [#42](https://github.com/loom-ai-org/loom.cpp/pull/42) ← [#43](https://github.com/loom-ai-org/loom.cpp/pull/43) ← [#44](https://github.com/loom-ai-org/loom.cpp/pull/44), and loom-exporter [#36](https://github.com/loom-ai-org/loom-exporter/pull/36)** | Work now STACKS (user, 2026-09-29): each new branch starts from the current working branch (in loom.cpp, `docs/nemo-length-masks` as of 2026-09-30), not `main`, and the merges cascade. #42 is the bottom of the stack: `loom_cli`'s `text2codes` path and codes files ([ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md)), CLI and docs only, so no loom-py pin bump. #43 (DFT-basis re-export, [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)) and #44 ([Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)) are docs only. loom-exporter #36 is the NeMo mask fix itself, based on `main` and independent of the loom.cpp stack; the files it produced are already on the Hub. **On top of #44 (2026-09-30): `feat/clone-doors-and-card-gate` in all three repos** (loom.cpp stacks on `docs/nemo-length-masks`, loom-exporter on `fix/nemo-length-masks`, loom-py on `main`): F5-TTS's `reference=` door ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)), the card gate running the voice-file cards, Qwen3-TTS's ICL card block and Supertonic's style block. No engine change, so no loom-py pin bump. Merge each PR with a **merge commit** (loom-py pins loom.cpp shas), bottom first. **Delete each merged branch at once**: `delete_branch_on_merge` is off, and a child PR is retargeted to `main` only when its base branch is deleted (otherwise `gh api -X PATCH repos/loom-ai-org/<repo>/pulls/<n> -f base=main`; `gh pr edit` is broken on these repos) → [Packaging & release](#packaging--release) |
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
@@ -160,7 +160,7 @@ release](#packaging--release)
   a "Cloning a voice" section). **Exported and card-gated 2026-09-29, ready to publish:** the fresh
   export is byte-identical to `v5/cosyvoice3.gguf`; the card gate gives 1 passed, 7 skipped -- the TTS
   row hears the default voice say "hello world", and "card runs" stops at the reader's
-  `voices/me.gguf` by design (see the cloning-cards item). *Context:
+  `voices/me.gguf` unless `LOOM_CARD_VOICES` supplies a jfk.wav voice for it; with one, 2 passed (2026-09-30, [Epic-08](../epics/epic-08-packaging-and-release.md#model-cards)). *Context:
   [Epic-03 §2](../epics/epic-03-model-coverage.md),
   [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)*
   * [ ] **Cloning needs Python.** Voice files work (`loom_exporter.cosyvoice3_voices`, gate arm on a
@@ -173,23 +173,7 @@ release](#packaging--release)
     digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
     first. Deferred by the user 2026-09-25.
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
-* [ ] **Cloning cards whose reader file is a voice file are never EXECUTED by the model-card gate.** `test_the_card_runs` runs
-  every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
-  ship a recording"; this card instead tells the reader to bring `reference.wav`, which is a
-  legitimate precondition the harness skips on by design. The consequence is that `-k qwen3-tts`
-  reports **2 passed, 14 skipped** and none of the passes ran the snippet — the ASR oracle included,
-  since it grades the audio the card itself produced. Pre-existing (the x-vector snippet has the same
-  shape) and surfaced by ICL's own verification, which had to be done outside the gate entirely.
-  **Decided by the user 2026-09-26: one common fixture, `jfk.wav`, stands for the reader's own
-  recording on every such card** (the gate already seeds it as `audio`; it is public domain).
-  **Done for clips 2026-09-29:** `run_card` writes `jfk.wav` as `reference.wav` in the card's working
-  directory, and F5-TTS's card now runs on it (2 passed). Qwen3-TTS's card is back on
-  `reference.wav` (2026-09-29), but its one snippet is the x-vector-from-clip mode: ICL (`ref_audio=` + `ref_tokens=`, now clip-only) and
-  `x_vector=` are prose only, so the gate never runs them. An ICL snippet needs `jfk.wav`'s transcript in the card (offered, not decided). Still to do: the cards whose reader file is NOT a clip -- MOSS-TTS
-  and CosyVoice3 (`voices/me.gguf`), which need a voice file made from
-  `jfk.wav`, since making one needs PyTorch and the upstream checkpoint. *Context: [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md),
-  [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md)*
-* [ ] **F5-TTS has no working high-level door; its card goes through `infer` meanwhile.** The export,
+* [ ] **F5-TTS's card goes through `infer` until a released loom-py carries the `reference=` door.** The export,
   the driver and `loom_cli` all work (gate: max |Δ| 4.14e-03 against the reference waveform; ASR
   oracle exact), but `Text2Speech.infer(text)` in loom-py sends only the text's ids as `tokens` and
   has no way to say "here is a reference clip and what it says". F5-TTS in-fills, so it needs the
@@ -205,8 +189,8 @@ release](#packaging--release)
   tensors identical to `v5/f5_tts.gguf` (the vocoder topology differs only by 4 consistently renamed
   intermediates). Card gate: **2 passed, 6 skipped** (card runs 20 min, TTS intelligibility 23 min on
   the 2-core box, 3.4 GB). Ready to publish.
-  **What is left** is the `reference=` door and moving the card and its gate onto it: its own item
-  under Host API. The weights
+  **The `reference=` door is built** ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md));
+  what is left is the re-export, the card switch and the republish: its own item under Host API. The weights
   are `cc-by-nc-4.0` (Emilia), recorded in [Epic-03 §2](../epics/epic-03-model-coverage.md).
   *Context: [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md),
   [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)*
@@ -517,24 +501,24 @@ release](#packaging--release)
 
 ## Host API
 
-* [ ] **F5-TTS: a `reference=` door in loom-py, then its card and card gate move onto it.** Today
-  `text2speech.infer(text)` cannot pass a reference clip and its transcript, so F5-TTS's staged card
-  (2026-09-29) calls `model.infer(waveform=, text_ids=, n_ref_text=)` with the join spelled out and
-  wraps the samples in `loom.Audio` -- correct, and gated (2 passed), but a reader has to know the
-  driver's inputs. Three pieces, in this order:
-  (1) **loom-py:** `Text2Speech.infer(text, reference=<samples>, reference_text=<str>)` encodes
-  `reference_text + " " + text` (a space appended only when the transcript lacks one, as `loom_cli
-  --ref-text` does), passes `waveform`/`text_ids`/`n_ref_text`, and returns `Audio` at the declared
-  rate; a `tests/ci` test pins the join and `n_ref_text` against `loom_cli`'s. While there, drop the
-  `inputs.tokens` fallback from the F5 driver's two CALLER bindings (loom-exporter), which today hands
-  a bare `infer("hello world")` to the mel front end as audio samples.
-  (2) **The card** (`text-to-speech-voice-clone` in `build_model_cards.py`) switches to the door --
-  **only once a released `loom-py-rt` carries it**, since a card must run on the published runtime
-  (the reason it uses `infer` now). Restage with `--readme-only`.
-  (3) **The card gate** needs no new row: `run_card` already seeds `jfk.wav` as `reference.wav` and
-  the TTS row grades "hello world". Re-run `-k f5-tts-v1-base` on the new card (~45 min on the 2-core
-  box) and confirm 2 passed. *Context: the F5-TTS item under Models,
-  [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)*
+* [ ] **F5-TTS: republish on the new driver, then move its card onto the `reference=` door.** The door
+  is built (2026-09-30, `feat/clone-doors-and-card-gate`, [ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)):
+  `text2speech.infer(text, reference=, reference_text=)` in loom-py, keyed on the file's
+  `loom.tts.reference = "infill"`, and the driver's `waveform`/`text_ids` no longer fall back to
+  `tokens`. Verified: the door on a re-export gives audio **bit-identical** to the published card's
+  `model.infer(...)` on the published file (26368 samples, max |d| 0), and Whisper hears "Hello,
+  world!". The published GGUF predates the key, so the door refuses it by name. Left, in order:
+  (1) re-export (tensors unchanged; the driver and one KV differ) and republish -- the card's current
+  `infer` call still runs on the new file; (2) **once a released `loom-py-rt` carries the door**,
+  switch the `text-to-speech-voice-clone` snippet to it and restage with `--readme-only`; (3) re-run
+  the card gate `-k f5-tts-v1-base` (~45 min here) and confirm 2 passed. *Context: the F5-TTS item
+  under Models, [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)*
+* [ ] **Restage and publish two card READMEs** once `feat/clone-doors-and-card-gate` merges:
+  `supertonic-2` (its style example goes through `text2speech.infer` and rebinds `audio`, so the TTS
+  row grades it instead of skipping) and `qwen3-tts-12hz-0.6b` (a new, executed ICL block on
+  jfk.wav's transcript). Both run on the released rc11; card gate 2 passed each (2026-09-30).
+  `build_model_cards.py <slug> --readme-only`, no re-export. *Context:
+  [Epic-08](../epics/epic-08-packaging-and-release.md#model-cards)*
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
