@@ -53,8 +53,8 @@ renaming, and the cards were byte-identical. What the fix did, before -> after:
   granite-speech gave identical transcripts on jfk.wav and four LibriSpeech clips. At the tensor level,
   loom now sits at NeMo's own f32 spread against NeMo at f64. Conformer's log-probs went from
   2.5e-4 to 6.5e-5. Parakeet-TDT's encoder went from 1.25e-3 to 2.1e-6, relative to its maximum. These
-  numbers come from the two clips that a separate NeMo masking defect does not reach; see the hub item
-  "NeMo's subsampling masks are baked all-true".
+  numbers come from the two clips that a separate NeMo masking defect does not reach; see
+  [Retro-065](retro-065-nemo-masks-were-baked-all-true.md).
 * **F5-TTS sounds different.** On jfk.wav, its `mel` phase was 0.41 from torch at f64 on average (6.2
   at most), all of it in quiet bins. The fixed file is 0.0057 off; torch's own f32 is 0.0019 off. With
   the reference's noise pinned, the published file's waveform was a different realization from
