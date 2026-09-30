@@ -47,7 +47,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
-| **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py` |
+| **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
@@ -1198,9 +1198,14 @@ defaults as knobs.
   SentencePiece file that declares `loom.output.kind = audio` fell through to the token loop. The
   loop ran the whole synthesis and then refused a 68,096-sample "token list". It now synthesises.
 
-The voice ships as a driver weight: `Matthijs/cmu-arctic-xvectors`' `slt` utterance, the one every
-published example uses. A caller's own x-vector is the `speaker` driver input. The export reads the
-vocoder from `<checkpoint>/hifigan/` and the voice from `<checkpoint>/xvectors/spkrec-xvect.zip`.
+The built-in voice is CMU ARCTIC `slt`, the x-vector every published example uses, shipped as a driver
+weight. All seven CMU speakers are voice files (`loom_exporter.speecht5_voices`), and a caller's own
+x-vector converts with `--from`. A voice file is stamped with the x-vector's EMBEDDING SPACE rather than
+a weights hash, because it fits any SpeechT5 trained on that extractor
+([ADR-058](../adrs/adr-058-an-xvector-voice-is-stamped-with-its-embedding-space.md)). The export reads
+the vocoder from `<checkpoint>/hifigan/` and the voices from `<checkpoint>/xvectors/spkrec-xvect.zip`.
+**Published 2026-09-30** as `loom-ai-org/speecht5-tts-loom`, with the card gate's three rows passing,
+including the new one that loads every staged voice file and synthesises one.
 
 **Verified** (`tests/gate/test_e2e_speecht5_lua_driver.cpp`, masks pinned, 62 ids, 134 steps): the text
 door id for id. Teacher-forced, the waveform is **max |Δ| 1.3e-04, rmse 5.9e-06** over 68,608 samples,
