@@ -173,21 +173,12 @@ release](#packaging--release)
     digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
     first. Deferred by the user 2026-09-25.
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
-* [ ] **Five published GGUFs carry coremltools' fp32 DFT basis: re-exported, measured and
-  card-gated. Only the publish is left.** Conformer-ctc-small, parakeet-rnnt, parakeet-tdt,
-  granite-speech and F5-TTS
-  ([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)) were re-exported 2026-09-30 at
-  loom-exporter `1891005` into `~/.claude/tmp/dft-reexport/hf-models/`, cards included. Each file differs
-  from the Hub's copy in exactly the two basis tensors. The card gate passes on all five (2 passed and 6 skipped each, the rows these models had before).
-  **Measured:** the four ASR models give identical transcripts. At the tensor level they now sit at
-  NeMo's own f32 spread (parakeet-TDT's encoder went from 1.25e-3 to 2.1e-6, relative). **F5-TTS sounds
-  different:** with the reference's noise pinned, the published file produces a different sample from
-  PyTorch's (cosine 0.888), and the fresh export matches it (rmse 1.5e-4). Both say the same words in
-  an equally JFK-like voice. **Left:** copy the five into `hf-models/` and push (the user). The three
-  NeMo files also carry the subsampling-mask defect (Exporter section). Fixing it changes them again,
-  so either publish them now and republish after the fix, or hold them for the fix. Granite and F5 do not
-  go through NeMo's subsampling. Qwen3-TTS, the sixth, is re-exported and on the Hub
-  (2026-09-29, `x-linked-etag` = local sha256, card identical).
+* [ ] **Three NeMo GGUFs on the Hub still need republishing after the subsampling-mask fix.** The
+  DFT-basis re-export ([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), measured
+  effect there) is PUBLISHED as of 2026-09-30 for conformer-ctc-small, parakeet-rnnt, parakeet-tdt,
+  granite-speech and F5-TTS. It was verified from the Hub side: `x-linked-etag` equals the local sha256
+  and the cards are identical. The three NeMo files still carry the subsampling-mask defect (Exporter
+  section), so they are republished once that is fixed: re-export, card gate, then `upload_all.py`.
   *Context: [ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md)*
 * [ ] **Cloning cards whose reader file is a voice file are never EXECUTED by the model-card gate.** `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
