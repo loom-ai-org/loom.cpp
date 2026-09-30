@@ -258,7 +258,9 @@ SupertonicTTS, StyleTTS2.
   > less than the STFT frame count, and NeMo carries it through each subsampling conv. Whenever it is
   > even going into a stride-2 conv, one output frame is padding that NeMo zeroes and this bypass
   > keeps. That is about half of all clip lengths. At those lengths, conformer-ctc-small's log-probs
-  > are 0.1-18 off NeMo at f64. See the hub item "NeMo's subsampling masks are baked all-true".
+  > are 0.1-18 off NeMo at f64. Fixed by [Retro-065](retro-065-nemo-masks-were-baked-all-true.md): only a
+  > mask whose bound IS its range is baked now. The "2.09 against 0.13" experiment below was measured
+  > against a NeMo whose `calc_length` traced wrong; the shipped NeMo's traces right.
 
   New `_traces_to_range_1d`/`_traces_to_length_input` (backward producer-chain walks, mirroring this
   file's other `_traces_*`/`_try_resolve_*` helpers) recognize this exact `arange(T) < length`-derived

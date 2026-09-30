@@ -173,13 +173,6 @@ release](#packaging--release)
     digit. Reproducing it needs the FSTs as data and an FST runtime in C++; check the FSTs' licence
     first. Deferred by the user 2026-09-25.
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
-* [ ] **Three NeMo GGUFs on the Hub still need republishing after the subsampling-mask fix.** The
-  DFT-basis re-export ([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), measured
-  effect there) is PUBLISHED as of 2026-09-30 for conformer-ctc-small, parakeet-rnnt, parakeet-tdt,
-  granite-speech and F5-TTS. It was verified from the Hub side: `x-linked-etag` equals the local sha256
-  and the cards are identical. The three NeMo files still carry the subsampling-mask defect (Exporter
-  section), so they are republished once that is fixed: re-export, card gate, then `upload_all.py`.
-  *Context: [ADR-038](../adrs/adr-038-the-codecs-encoder-ships-inside-the-talker.md)*
 * [ ] **Cloning cards whose reader file is a voice file are never EXECUTED by the model-card gate.** `test_the_card_runs` runs
   every `python` block of a published card in one namespace, seeding `audio` because "a card cannot
   ship a recording"; this card instead tells the reader to bring `reference.wav`, which is a
@@ -273,30 +266,6 @@ release](#packaging--release)
     model costs N+1 checkpoint loads under isolation today. It would not change the peak.
 
 ## Exporter / MIL compiler
-
-* [ ] **NeMo's subsampling masks are baked all-true, and at about half of all clip lengths one of
-  them is not.** `_less_is_always_valid_mask` (`topology_ops.py`) replaces every
-  `arange(T) < f(length)` comparison except CMVN's with a constant all-true mask. The premise, in
-  that guard's comment and in [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md),
-  is that a single utterance is never padded, so no frame can be masked. That premise is false. NeMo's
-  mel front end makes the valid length `floor(n/160)`, which is one less than the STFT frame count.
-  `MaskedConvolutionSequential` then carries that length through each stride-2 conv. After a conv,
-  the valid count is one short of the output frame count whenever the valid count going in is even (the
-  `(L-1)/2` in `calc_length` is fractional). NeMo zeroes that frame; loom keeps it. Measured
-  2026-09-30 against NeMo 2.6.2 at f64 (dither off), on jfk.wav and four LibriSpeech clips, plus seven
-  truncations of jfk. For conformer-ctc-small, the divergence appears at exactly the lengths the
-  parity rule predicts, 8 of the 12 tested. There, every frame's log-probs move by 0.1-0.5 and the last
-  frame by up to 18. At the other lengths loom sits at the reference's own f32 spread (4e-5).
-  Parakeet-TDT's encoder output is 8-32% off (relative to max) on the same three clips. Parakeet-RNNT's
-  is 1-10% off. Transcripts were unchanged on those five clips, apart from one CTC argmax on one
-  truncation, so this is a tensor-oracle defect that the card gate cannot see
-  ([[feedback-tensor-oracle-not-token-oracle]]). **Fix:** compute the stage masks from the real
-  `calc_length` (floor, `all_paddings = 2`) instead of a constant. The traced arithmetic is the
-  broken part: coremltools dropped the floor and folded `all_paddings = 1`. The fix changes the
-  three NeMo GGUFs again, so it needs the same re-export, card gate and publish as the DFT item under
-  Models. Check gigaam-v3-rnnt, which has its own subsampling, before assuming it is clear. Harness:
-  `~/.claude/tmp/dft-reexport/` (`nemo_ref.py`, `nemo_enc_ref.py`, `bis_ref.py`, and the phase probe).
-  *Context: [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md)*
 
 * [ ] **An export's op names depend on what its process converted earlier.**
   `coremltools`' `Builder.name_count` is a *class* attribute -- one counter for the whole process --
