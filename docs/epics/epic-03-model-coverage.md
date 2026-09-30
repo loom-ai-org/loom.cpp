@@ -47,6 +47,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
+| **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
@@ -1163,10 +1164,57 @@ workstation, 11.3 s of audio takes 62 s and 17 GB of RAM. Frame counts over six 
 reference's (25-47 against 21-56 on a 2-second sentence): like the reference, it sometimes keeps
 talking after the text.
 
+### Family 9b's first leaf: a loop that emits mel frames
+
+SpeechT5 (`microsoft/speecht5_tts` with `microsoft/speecht5_hifigan`, both MIT, ~145M + 13M
+parameters) is the loop shape the hub had costed as the one nothing shipped: **an AR decoder whose
+step emits mel-spectrogram frames**, two per step (`reduction_factor`), until a stop head fires. A
+12-layer text encoder runs once. The 6-layer decoder cross-attends to it, and its input row is the
+previous frame through a prenet with the speaker's 512-d x-vector folded in. A 5-layer convolutional
+postnet refines the whole spectrogram, and HiFi-GAN turns it into 16 kHz audio. Five phases
+(`encoder`, `cross_kv`, `decoder`, `postnet`, `vocoder`), one GGUF, 636 MB at F32, a 28-second export.
+
+**The loop needed no primitive, and the model needed no engine change.** It is Pocket-TTS's shape: a
+hand-written Lua loop over a KV-cached step, with 160 floats and two stop logits read back. The stop
+test (`sum(sigmoid) >= 0.5`, from `minlen` to `maxlen`) is in the driver, with the reference's
+defaults as knobs.
+
+**What it cost:**
+
+* **The prenet's dropout is on at inference.** The reference applies p = 0.5 dropout in eval mode too
+  (Tacotron 2 §2.2) and draws fresh masks every step. Its two masks per step are graph INPUTS the
+  driver draws ([ADR-042](../adrs/adr-042-a-samplers-noise-is-the-engines-a-graph-inputs-noise-is-the-drivers.md)'s
+  rule), which is what let the gate pin them (`masks`).
+* **The encoder's relative bias depends on the query** (Shaw-style `q . pe_k[clip(i - j)]`), so unlike
+  T5's it cannot be folded into the mask on the host. The driver builds the `[n, n]` index, and the
+  graph gathers and multiplies. Getting that gather to run cost two silent export defects in series
+  ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)): a matrix index that lowered
+  to a batched `ggml_get_rows`, and an axis-0 shape read the walk answered as a batch size of 1.
+* **The tokenizer is a SentencePiece CHAR model**, written as Unigram because with single-character
+  pieces the two are the same encoder
+  ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)). It has no digits, and
+  like the reference the export does not spell numbers.
+* **`loom_cli` had no door for it.** Its TTS branches key on per-family vocabulary tags, so a plain
+  SentencePiece file that declares `loom.output.kind = audio` fell through to the token loop. The
+  loop ran the whole synthesis and then refused a 68,096-sample "token list". It now synthesises.
+
+The voice ships as a driver weight: `Matthijs/cmu-arctic-xvectors`' `slt` utterance, the one every
+published example uses. A caller's own x-vector is the `speaker` driver input. The export reads the
+vocoder from `<checkpoint>/hifigan/` and the voice from `<checkpoint>/xvectors/spkrec-xvect.zip`.
+
+**Verified** (`tests/gate/test_e2e_speecht5_lua_driver.cpp`, masks pinned, 62 ids, 134 steps): the text
+door id for id. Teacher-forced, the waveform is **max |Δ| 1.3e-04, rmse 5.9e-06** over 68,608 samples,
+while a correct torch implementation of the same graphs lands 1.7e-04 / 6.8e-06 from the reference, at
+f32 and at f64 alike. The stop head fires at the same step, with a summed probability of 0.99999976
+there and never above 0.33 before. The sabotage arm (inverted masks) gives rmse 4.9e-02 and a
+different length. Free-running, the drift is 4.9e-02 max against the reference's own f32/f64 spread of
+5.4e-02. Whisper transcribes loom's output word for word through `loom_cli` and through loom-py's
+`text2speech`. It synthesises 4.2 s of audio in 3.8 s on the 2-core dev box.
+
 ### Text input
 
-**Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3 and Voxtral-4B-TTS take text.** Each encodes graphemes itself and each GGUF carries its own
-table (Chatterbox's is a character-level BPE, Pocket-TTS's a SentencePiece Unigram, VoxCPM2's a rank-merged BPE with byte fallback, CosyVoice3's Qwen2's byte-level BPE plus ~290 added tokens, Voxtral's Mistral's Tekken). The other four TTS models consume *phoneme* ids produced outside the engine — a real
+**Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, Voxtral-4B-TTS and SpeechT5 take text.** Each encodes graphemes itself and each GGUF carries its own
+table (Chatterbox's is a character-level BPE, Pocket-TTS's a SentencePiece Unigram, VoxCPM2's a rank-merged BPE with byte fallback, CosyVoice3's Qwen2's byte-level BPE plus ~290 added tokens, Voxtral's Mistral's Tekken, SpeechT5's SentencePiece characters). The other four TTS models consume *phoneme* ids produced outside the engine — a real
 limitation of those checkpoints, addressed by
 [Epic-07](epic-07-text-frontends-and-tokenizers.md) and
 [ADR-012](../adrs/adr-012-permissive-phonemizer.md).
@@ -1183,6 +1231,7 @@ leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is **complete at ei
 irodori-tts on 2026-09-26): Voxtral-4B-TTS, the eighth, landed 2026-09-26, exported on the
 workstation, after CosyVoice3 on 2026-09-24 and Chatterbox, Pocket-TTS and VoxCPM2 before it (F5-TTS, on 2026-09-18, is where the "no engine primitive" run ended:
 [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)).
+Family 9b's first leaf, SpeechT5, landed 2026-09-30: the mel-frame AR loop, with no engine change.
 §2 says what each cost, which is the number the rest of this list should be estimated against.
 Family 10 landing means the `text2codes` → `codes2speech` composition has both halves in the tree;
 family 6 landing means the zoo has an encoder-decoder text model and a SentencePiece Unigram LM for
