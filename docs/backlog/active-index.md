@@ -22,39 +22,31 @@ are not renumbered. New items continue the scheme.
 | **Land the review stack: loom.cpp [#42](https://github.com/loom-ai-org/loom.cpp/pull/42) ← [#43](https://github.com/loom-ai-org/loom.cpp/pull/43) ← [#44](https://github.com/loom-ai-org/loom.cpp/pull/44), and loom-exporter [#36](https://github.com/loom-ai-org/loom-exporter/pull/36)** | Work now STACKS (user, 2026-09-29): each new branch starts from the current working branch (in loom.cpp, `docs/nemo-length-masks` as of 2026-09-30), not `main`, and the merges cascade. #42 is the bottom of the stack: `loom_cli`'s `text2codes` path and codes files ([ADR-055](../adrs/adr-055-a-codes-file-states-its-width.md)), CLI and docs only, so no loom-py pin bump. #43 (DFT-basis re-export, [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)) and #44 ([Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)) are docs only. loom-exporter #36 is the NeMo mask fix itself, based on `main` and independent of the loom.cpp stack; the files it produced are already on the Hub. **On top of those (2026-09-30): loom.cpp [#45](https://github.com/loom-ai-org/loom.cpp/pull/45) (on #44), loom-exporter [#37](https://github.com/loom-ai-org/loom-exporter/pull/37) (on #36), loom-py [#39](https://github.com/loom-ai-org/loom-py/pull/39) (on `main`)**, all `feat/clone-doors-and-card-gate`: F5-TTS's `reference=` door ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)), the card gate running the voice-file cards, Qwen3-TTS's ICL card block and Supertonic's style block. No engine change, so no loom-py pin bump. loom-exporter [#38](https://github.com/loom-ai-org/loom-exporter/pull/38) (on #37) is a **draft that must not merge before a loom-py release carries the door**: F5-TTS's card switched onto it. Merge each PR with a **merge commit** (loom-py pins loom.cpp shas), bottom first. **Delete each merged branch at once**: `delete_branch_on_merge` is off, and a child PR is retargeted to `main` only when its base branch is deleted (otherwise `gh api -X PATCH repos/loom-ai-org/<repo>/pulls/<n> -f base=main`; `gh pr edit` is broken on these repos) → [Packaging & release](#packaging--release) |
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's SpeechT5 is local too but decodes MEL FRAMES autoregressively, a loop shape nothing ships yet; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
-**State anchor, 2026-09-17 — `1.0.0-rc10` is fully released and nothing in the release pipeline is
-open.** Four packages on PyPI at `1.0.0rc10`, both macOS architectures included; the `linux_armv6l`
-wheel rides as a **GitHub release asset** rather than a PyPI file, because PyPI rejects that tag at
-upload (`wheels.yml` says so at the job). **Thirty** models are on
-[huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org), etags and cards verified in both
-directions, of which seven were first-time publishes: `sensevoice-small`, `paraformer-zh`,
-`data2vec-audio-base-960h`, `hubert-large-ls960-ft`, the `qwen3-tts` pair and `encodec-32khz`.
-EnCodec ships `cc-by-nc-4.0` and that is **settled, not pending** — the weights are MusicGen's output
-by `facebook/encodec_32khz`'s own card, whatever the MIT code says. → [[loom-release-state]],
-[Epic-08](../epics/epic-08-packaging-and-release.md)
+**State anchor, 2026-09-30 — `1.0.0-rc11` is fully released and the Hub equals the staging tree.**
+Four packages on PyPI at `1.0.0rc11`, each one's `latest` (`loom-py-rt` 17 files, `-cuda` 2,
+`-vulkan` 2, `-metal` 1); the `linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI
+rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc11` sits on
+loom-py `92ca766`, moved there from `01894be` for the Vulkan image fix before anything reached PyPI.
+**Thirty-eight** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org):
+rc10's thirty re-exported fresh at rc11 and card-gated, plus eight first-time publishes (F5-TTS,
+Fun-CosyVoice3, VoxCPM2, Pocket-TTS, Voxtral-4B-TTS, Chatterbox and the MOSS pair). Since the release
+the Hub has taken three rounds of republishes, all Hub-verified: the fp32 DFT basis in five GGUFs
+([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)), NeMo's all-true masks in four
+([Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)), and F5-TTS re-exported with
+`loom.tts.reference` ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)) beside
+two card-only updates (Supertonic, Qwen3-TTS). EnCodec and F5-TTS ship `cc-by-nc-4.0`, and that is
+**settled, not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
 
-**NOTHING STAGED IS PUBLISHED UNTIL 1.0.0-rc11 IS OUT.** Author's decision, 2026-09-17: staged model
-updates wait for the next release even when they need nothing from it. So a freshly staged GGUF is
-**not** a publishable one, whatever the coupling below says — the Hub and the staging tree are allowed
-to diverge until rc11 ships, and today they do: `hf-models/qwen3-tts-12hz-0.6b` is the ICL build and
-the Hub's copy is rc10's. That divergence is expected, and it does not survive the release either way,
-because [[feedback-release-gate-needs-a-fresh-export]] requires a fresh export at rc11 time regardless
-of what is sitting in the tree.
-
-*The technical coupling, which still decides what rc11 must contain:* rc10 carried every binding the
-staged drivers needed (`output_shape`, `run_ode_and_retain`, the retrace's retained-reference
-bindings, a retained ROW range, `ELU`, `repetition_penalty`, the `ctc` and `funasr` vocabulary
-readers, grouped `CONV_1D`), and Qwen3-TTS's ICL half needs nothing beyond them — verified by running
-its GGUF on the released `loom-py-rt==1.0.0rc10` wheel from PyPI. The moment a model needs something
-the released wheels have not got, **WHEELS FIRST, ALWAYS** is the harder constraint on top of the
-rule above: a GGUF published before its wheel is a file nobody can run.
-
-**F5-TTS is the first model that needs rc11 technically, not only by that rule** — and it is worse than
-"nobody can run it". Its driver passes `guidance = {...}` in `loom.run_ode`'s options table, and the
-rc10 engine reads that table field by field with no check for keys it does not know: an F5-TTS GGUF on
-the rc10 wheels would integrate **unguided**, silently, and produce a different model's audio. The text
-door fails loudly there (rc10's loom-py has no `"f5"` tokenizer), but ids passed straight to `infer` do
-not. So rc11 must carry family 9's engine half before that file goes anywhere → [Packaging &
+**The rc10 publishing hold is over:** the "nothing staged is published until rc11" rule (author,
+2026-09-17) ended with the release. What still decides a publish is the standing rule, **WHEELS FIRST,
+ALWAYS**: a GGUF or a card that needs something the released wheels have not got waits for the
+release that carries it, because a file published before its wheel is a file nobody can run, and an
+option an older engine does not know can be dropped silently rather than refused (rc10's `run_ode`
+would have integrated F5-TTS **unguided**; rc11 carries the guidance). The one item held by it today
+is loom-exporter [#38](https://github.com/loom-ai-org/loom-exporter/pull/38): F5-TTS's card on the
+`reference=` door, which only a loom-py release after rc11 carries. After that release: merge #38,
+rebuild F5's README with `--readme-only`, card-gate `-k f5-tts-v1-base`, upload the README. And every
+publish is a fresh export first ([[feedback-release-gate-needs-a-fresh-export]]) → [Packaging &
 release](#packaging--release)
 
 ---
