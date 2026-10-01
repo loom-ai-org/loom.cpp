@@ -122,9 +122,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     transcribe it but drop every language argument. Citrinet needs nothing new and can go out alone.
   * [ ] **Canary over 40 s**: NeMo chunks longer audio into overlapping windows; one call here is one
     decode, which degrades past the training ceiling. Not declared to hosts yet.
-  * [ ] **conformer-ctc-small republish**: the published GGUF emits one frame past NeMo's
-    `encoded_len` (276 vs 275 on JFK); the fix (`EncoderOutput.select` cuts to it) changes its export.
-    [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md).
 * [ ] **The transducer encoders emit frames past `encoded_len` too** (Parakeet-TDT/RNNT, GigaAM): the
   `ENCODER_BT_D` output is not cut, and the decode loop reads every row, so a TDT step can emit on a
   frame NeMo never decodes. Same one-line cut as the CTC leaves, then re-verify and republish.
