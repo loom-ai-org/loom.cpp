@@ -128,6 +128,11 @@ private:
     // A number speller run on the text before anything else (ADR-059): SpeechT5's vocabulary has no
     // digits, so its file declares one. Null for every file that declares none.
     std::unique_ptr<NumberSpeller> numbers_;
+    // `tokenizer.ggml.unigram_scoring == "sentencepiece"`: the vocabulary came from a SentencePiece `.model`,
+    // so the Viterbi reproduces SentencePiece's own arithmetic (float-stored path scores, a double
+    // comparison for pieces, a float one for unknowns), which decides exact ties. Absent, the path
+    // scores are doubles throughout, which is what `tokenizers` (the `tokenizer.json` path) computes.
+    bool sentencepiece_scoring_ = false;
     // SentencePiece's `byte_fallback`, UGM only: a codepoint no piece covers becomes its UTF-8 bytes'
     // `<0xNN>` pieces instead of `<unk>`, and those pieces decode back to the bytes. Absent KV = false,
     // which is every file written before Pocket-TTS's (whose tokenizer is the first to need it).
