@@ -139,6 +139,8 @@ loom.asr.language_names      str[]  parallel arrays rather than a map, because t
 loom.asr.language_ids        i32[]
 loom.asr.task_names          str[]
 loom.asr.task_ids            i32[]
+loom.asr.target_language_names str[] the languages it can WRITE, when that is its own choice (ADR-061)
+loom.asr.target_language_ids   i32[]
 loom.asr.prev_context        u32    prev_tokens cap        (falls back to loom.n_text_ctx)
 loom.asr.chunk.*                    segmented-prefill arithmetic (Qwen3-ASR 1 s/13, Granite 12 s/120)
 ```
@@ -220,7 +222,7 @@ model.task            # "automatic-speech-recognition" — declared, not guessed
 model.capabilities    # ("transcribe",) — which high-level doors this file answers
 
 model.generate(prompt, *, max_new_tokens=64, ...) -> str
-model.transcribe(audio, *, language=None, task=None, timestamps=False) -> Transcription
+model.transcribe(audio, *, language=None, task=None, target_language=None, timestamps=False) -> Transcription
 model.synthesize(text=None, *, phonemes=None, tokens=None,
                  voice=None, steps=None, seed=None, language=None) -> Audio
 model.classify(tokens, *, strip_special=True) -> Classification    # P5, family 12
@@ -261,7 +263,7 @@ APIs rather than a gap in the first:
 | | name | fixed by |
 |---|---|---|
 | primary input | `waveform` / `tokens` | `loom.input.kind` |
-| recurring roles | `language`, `task`, `timestamps`, `prev_tokens`, `max_new_tokens`, `eos_token`, `seed`, `n_steps` | the role |
+| recurring roles | `language`, `task`, `target_language`, `timestamps`, `prev_tokens`, `max_new_tokens`, `eos_token`, `seed`, `n_steps` | the role |
 | model-specific knobs | `noise_scale_w`, `ref_s`, `style_ttl`, … | nothing — they stay per-model |
 
 **A knob with no canonical role is not part of the high-level API**, and `infer` is what it is for. That
@@ -273,7 +275,7 @@ alias at the top of `infer` from the family's declared `driver_primary_input()`.
 never written into the GGUF — the canonical one is the only public name, and a file that published its
 own spelling would invite hosts to use it.
 
-ASR already agreed on all six of its roles before any of this. TTS did not -- `n_steps` (Matcha,
+ASR already agreed on all six of its roles before any of this; Canary added a seventh, `target_language`, because its output language is chosen separately from its input one ([ADR-061](adrs/adr-061-the-language-written-is-its-own-role.md)). TTS did not -- `n_steps` (Matcha,
 Supertonic) and `diffusion_steps` (StyleTTS2) were one concept spelled twice -- and the majority
 spelling won, so two families' drivers stayed byte-identical and only StyleTTS2 gained an alias.
 
