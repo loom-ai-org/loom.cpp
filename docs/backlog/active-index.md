@@ -125,10 +125,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     transcribe it but drop every language argument.
   * [ ] **Canary over 40 s**: NeMo chunks longer audio into overlapping windows; one call here is one
     decode, which degrades past the training ceiling. Not declared to hosts yet.
-* [ ] **The transducer encoders emit frames past `encoded_len` too** (Parakeet-TDT/RNNT, GigaAM): the
-  `ENCODER_BT_D` output is not cut, and the decode loop reads every row, so a TDT step can emit on a
-  frame NeMo never decodes. Same one-line cut as the CTC leaves, then re-verify and republish.
-  [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md).
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
