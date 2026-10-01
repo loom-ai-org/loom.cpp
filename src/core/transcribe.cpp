@@ -1,5 +1,6 @@
 #include "loom/core/transcribe.h"
 
+#include "loom/core/asr_long_form.h"
 #include "loom/core/audio_window.h"
 #include "loom/core/bpe_vocab.h"
 #include "loom/core/ctc_vocab.h"
@@ -309,12 +310,48 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
             args = {{"waveform", window_at(waveform, 0, static_cast<uint32_t>(n_padded))},
                     {"audio_samples", static_cast<double>(n_real)}};
         }
-        const LoomLuaBridge::Value result = bridge.call("infer", args);
-        std::vector<int32_t> ids;
-        if (std::holds_alternative<std::vector<double>>(result)) {
-            for (double id : std::get<std::vector<double>>(result)) {
-                ids.push_back(static_cast<int32_t>(id));
+        const auto decode = [&](const std::unordered_map<std::string, LoomLuaBridge::Value>& call_args) {
+            const LoomLuaBridge::Value result = bridge.call("infer", call_args);
+            std::vector<int32_t> decoded;
+            if (std::holds_alternative<std::vector<double>>(result)) {
+                for (double id : std::get<std::vector<double>>(result)) {
+                    decoded.push_back(static_cast<int32_t>(id));
+                }
             }
+            return decoded;
+        };
+
+        // LONG-FORM, for a file that declares a training ceiling and audio past it (asr_long_form.h):
+        // overlapping windows, each decoded alone with the same arguments, stitched where they overlap.
+        // Each window is handed over at its planned length with the real sample count in `length` --
+        // the batch NeMo builds, where only the last window is ever zero-padded. The control ids
+        // (end-of-sequence, padding) come off BEFORE the merge, because they are what the merge would
+        // otherwise align on: every window ends in the same end-of-sequence token.
+        //
+        // Family 3 (`chunk != 0`) declares no ceiling, so it never reaches this.
+        const std::vector<Window> windows =
+            chunk == 0 ? plan_windows(n_real, table.long_form) : std::vector<Window>{{0, n_real, n_real}};
+        std::vector<int32_t> ids;
+        if (windows.size() > 1) {
+            const auto text_only = [&](const std::vector<int32_t>& raw) {
+                std::vector<int32_t> kept;
+                for (int32_t id : raw) {
+                    if (std::find(control_ids.begin(), control_ids.end(), id) == control_ids.end()) {
+                        kept.push_back(id);
+                    }
+                }
+                return kept;
+            };
+            std::vector<std::vector<int32_t>> per_window;
+            per_window.reserve(windows.size());
+            for (const Window& w : windows) {
+                args["waveform"] = window_at(waveform, w.start, static_cast<uint32_t>(w.padded));
+                args["length"] = std::vector<double>{static_cast<double>(w.real)};
+                per_window.push_back(text_only(decode(args)));
+            }
+            ids = merge_windows(per_window, table.long_form);
+        } else {
+            ids = decode(args);
         }
         out.text = detokenize(ids);
         // The ONE segment spans the whole clip, and says so. It used to be `{0.0, 0.0}`, which reads as
@@ -329,7 +366,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         // these are not model-chosen boundaries. An end of 0.0 said that too, but only to a reader who
         // already knew -- and it broke anything that sorts, seeks, or sums durations.
         out.segments.push_back({0.0, static_cast<double>(waveform.size()) / rate, out.text, false});
-        out.windows = 1;
+        out.windows = windows.size();
         return out;
     }
 

@@ -99,6 +99,13 @@ add_test(NAME test_text_classify COMMAND test_text_classify)
 set_tests_properties(test_text_classify PROPERTIES LABELS ci)
 set_tests_properties(test_text_classify PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
 
+add_executable(test_asr_long_form ci/test_asr_long_form.cpp)
+target_link_libraries(test_asr_long_form PRIVATE loom::engine)
+target_compile_definitions(test_asr_long_form PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_asr_long_form COMMAND test_asr_long_form)
+set_tests_properties(test_asr_long_form PROPERTIES LABELS ci)
+set_tests_properties(test_asr_long_form PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
 add_executable(test_audio_classify ci/test_audio_classify.cpp)
 target_link_libraries(test_audio_classify PRIVATE loom::engine)
 target_compile_definitions(test_audio_classify PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")

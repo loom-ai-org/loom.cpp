@@ -259,6 +259,55 @@ def write_dynamic_asr_languages(path: Path) -> None:
     _finish(w)
 
 
+# A DYNAMIC-LENGTH ASR model with a training ceiling (Canary's long-form shape, asr_long_form.h). Its
+# driver "transcribes" by reading token ids straight off the audio -- one token per 10 REAL samples,
+# `round(sample * 100)` -- and ends every window with end-of-sequence, as a real decode does. So the
+# caller can write a "sentence" into a waveform, and the correctly stitched transcript of any windowing is
+# that sentence exactly: no token lost at a seam, none doubled by an overlap, no end-of-sequence in the
+# middle. Reading only `length[1]` samples is what makes a window's zero padding visible as a wrong answer.
+#
+# The policy is in samples and tiny, so a test clip is a few thousand floats: ceiling 400, windows from
+# 300 searched in steps of 10, overlap 100 (= 10 tokens, more than the 7-token head that is aligned).
+LONG_FORM_DRIVER = """
+function infer(inputs)
+    local out = {}
+    local n = inputs.length[1]
+    for k = 1, n, 10 do
+        table.insert(out, math.floor(inputs.waveform[k] * 100 + 0.5))
+    end
+    table.insert(out, EOS_ID)
+    return out
+end
+"""
+
+
+def write_long_form_asr(path: Path) -> None:
+    w = _base(path, "long_form_asr_test")
+    w.add_string("loom.task", "automatic-speech-recognition")
+    w.add_string("loom.input.kind", "audio")
+    w.add_string("loom.output.kind", "token_ids")
+    w.add_uint32("loom.sample_rate", 16000)
+
+    tokens = ["<pad>", "<eos>"] + [f"t{i}" for i in range(2, 64)]
+    w.add_tokenizer_model("gpt2")
+    w.add_tokenizer_pre("qwen2")
+    w.add_token_list(tokens)
+    w.add_token_merges(["t 1"])
+    w.add_eos_token_id(1)
+    # NO control ids beyond end-of-sequence, deliberately: zero padding decodes to token 0 (`<pad>`),
+    # and declaring it a control id hid a window's padding being read as audio -- the mutation that
+    # hands the driver the padded length as `length` passed until this was removed.
+    # i32, as the exporter writes every contract scalar.
+    w.add_int32("loom.asr.window_max_samples", 400)
+    w.add_int32("loom.asr.window_min_samples", 300)
+    w.add_int32("loom.asr.window_search_step_samples", 10)
+    w.add_int32("loom.asr.window_overlap_samples", 100)
+    w.add_int32("loom.asr.merge_search_tokens", 24)
+    w.add_int32("loom.asr.merge_head_tokens", 7)
+    w.add_string("model.driver_script", LONG_FORM_DRIVER.replace("EOS_ID", "1"))
+    _finish(w)
+
+
 # A token classifier, for `loom::text::classify`. One class per ROW of the model's output, which is
 # what `token_labels_epilogue` returns from `loom.argmax_rows` in a real export -- spelled here as a
 # table so the fixture needs no graph.
@@ -437,6 +486,7 @@ def main() -> None:
     write_timestamped_asr(out_dir / "timestamped_asr.gguf")
     write_dynamic_asr(out_dir / "dynamic_asr.gguf")
     write_dynamic_asr_languages(out_dir / "dynamic_asr_languages.gguf")
+    write_long_form_asr(out_dir / "long_form_asr.gguf")
     write_codec(out_dir / "contract_codec.gguf")
     write_classifier(out_dir / "classify_driver.gguf")
     write_spm_classifier(out_dir / "classify_driver_spm.gguf")
