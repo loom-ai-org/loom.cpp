@@ -48,7 +48,9 @@ valid frames out of `floor(n/160) + 1` plus each stride-2 stage's rounding leave
 * `EncoderOutput.select` cuts CTC log-probs to `encoded_len` for every NeMo CTC leaf.
 
 Measured: Citrinet and Conformer-CTC both emit exactly `encoded_len` frames at eight lengths, including
-three where every stage's input is even. Canary's encoder phase relies on the same cut, so its
+three where every stage's input is even. conformer-ctc-small was re-exported with the cut and REPUBLISHED 2026-10-01
+(Hub commit `e6ccc7d`, sha256 `213b88e2...`, etag-verified; it runs on the released rc12 wheel, since
+the cut is an ordinary `VIEW`). Canary's encoder phase relies on the same cut, so its
 cross-attention needs no mask.
 
 ## Takeaway
