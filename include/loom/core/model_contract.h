@@ -167,6 +167,11 @@ struct AsrDecodeTable {
     std::vector<int32_t> language_ids;
     std::vector<std::string> task_names;
     std::vector<int32_t> task_ids;
+    // The languages a model can be asked to WRITE, when that is a choice separate from the language it
+    // hears -- `loom.asr.target_language_names`/`_ids`. Canary's prompt carries a source and a target;
+    // Whisper's does not (its `translate` task can only mean English), and it declares no such table.
+    std::vector<std::string> target_language_names;
+    std::vector<int32_t> target_language_ids;
 
     // How many of the previous window's tokens may be carried forward as `prev_tokens`.
     uint32_t prev_context = 0;
@@ -184,6 +189,7 @@ struct AsrDecodeTable {
     // caller has no way to look up its id.
     int32_t language(const std::string& name) const;
     int32_t task(const std::string& name) const;
+    int32_t target_language(const std::string& name) const;
 
     // `vocab` is used only by the legacy fallback and may be null; a file that declares its table needs
     // no vocabulary to be read at all.

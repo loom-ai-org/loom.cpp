@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: host-api
-last_updated: 2026-09-30
+last_updated: 2026-10-01
 ---
 
 # Epic-06: The High-Level API and Its Hosts
@@ -48,6 +48,16 @@ ENGINE reads them and refuses a mismatch (`loom::load_voice`); the HOSTS resolve
 (`loom_cli --voice <file>`; loom-py's `text2speech.infer(voice=...)`, `model.voices`, `model.voice()`,
 looking beside the model file and then in its Hub repo's `voices/`). Pocket-TTS is the first model to
 declare one.
+
+### The language written (ASR)
+
+A model whose output language is chosen separately from its input one declares
+`loom.asr.target_language_names`/`_ids`, and `transcribe` resolves the `target_language` role against
+it ([ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)); loom-py
+`transcribe(target_language=)`, `loom_cli --target-language`. Canary is the first, defaulting to
+English. A declared language/task table also reaches a dynamic-length driver now -- before Canary,
+only windowed (Whisper) drivers were handed `language`/`task`. `Model.contract` lists all three tables
+as `asr_languages`, `asr_tasks`, `asr_target_languages`.
 
 ### Reference clips (in-filling)
 
