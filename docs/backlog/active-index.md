@@ -30,11 +30,14 @@ loom-py `3973183` (the merge of loom-py #43), which pins loom.cpp `3bfed05`. rc1
 unknown-run fusion ([Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md)), SentencePiece tie-breaking
 ([ADR-060](../adrs/adr-060-a-unigram-tie-is-broken-by-the-vocabularys-own-reference.md)), the GET_ROWS
 fix, and loom-py's `reference=` door ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)).
-**Thirty-nine** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). After the
+**Forty** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). After the
 release, all Hub-verified: F5-TTS's card moved onto the `reference=` door (loom-exporter #38, README
 only), and SpeechT5, flan-t5-small and pocket-tts were re-exported fresh, card-gated and republished
 (GGUFs; SpeechT5's card now names rc12 for digits, loom-exporter #42). Their voice files re-exported
-byte-identical and were not re-sent. EnCodec and F5-TTS ship `cc-by-nc-4.0`, and that is **settled,
+byte-identical and were not re-sent. Later the same day, on rc12 as released: conformer-ctc-small was
+republished with its CTC output cut to `encoded_len`
+([Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md)), and
+**Citrinet-1024 was added** (`citrinet-1024-loom`, the fortieth). EnCodec and F5-TTS ship `cc-by-nc-4.0`, and that is **settled,
 not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
 
 **Nothing is held for a release today.** What decides a publish is the standing rule, **WHEELS FIRST,
@@ -111,15 +114,15 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) for where families 4 and 5
   found the cost instead. Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id
   handling for free.*
-* [ ] **Canary-1b-v2 and Citrinet-1024: built and verified, NOT published** (2026-10-01, branch
-  `feat/p5-canary-citrinet` in all three repos, no PRs yet). Citrinet is a CTC leaf on the NeMo
-  template (a trace preparation for its Jasper masks); Canary is family 1's encoder joined to T5's
+* [ ] **Canary-1b-v2: built and verified, NOT published** (2026-10-01; engine merged in loom.cpp #50,
+  exporter half loom-exporter #43, loom-py #44 pinned to main). Family 1's encoder joined to T5's
   encoder/cross_kv/decoder split, ids identical to NeMo on transcription and en->fr translation, logits
-  closer to f64 than NeMo's own f32. Card gate 4/4 on fresh exports. Left:
+  closer to f64 than NeMo's own f32, card gate passing on a fresh export. (Citrinet-1024, built beside
+  it, is PUBLISHED: `citrinet-1024-loom`, Hub `85172f0`, etag-verified, runs on the rc12 wheel.) Left:
   * [ ] **Release first** (WHEELS FIRST): Canary needs the engine's new `transcribe` behaviour (a
     declared table reaches a dynamic-length driver) and `target_language`
     ([ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)); an rc12 wheel would
-    transcribe it but drop every language argument. Citrinet needs nothing new and can go out alone.
+    transcribe it but drop every language argument.
   * [ ] **Canary over 40 s**: NeMo chunks longer audio into overlapping windows; one call here is one
     decode, which degrades past the training ceiling. Not declared to hosts yet.
 * [ ] **The transducer encoders emit frames past `encoded_len` too** (Parakeet-TDT/RNNT, GigaAM): the
