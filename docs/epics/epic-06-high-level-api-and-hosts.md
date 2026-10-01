@@ -37,7 +37,7 @@ Net: **per-task code may live in any layer; per-architecture code only in the ex
 | `include/loom/core/text_generate.h` | `loom::text::generate` — one LM loop, both driver shapes, the file's own EOS **set** (`eos_token_ids`, plural since P4.23) and its own decode rule (P4.24) |
 | `include/loom/core/chat_template.h` | `loom::ChatTemplate` — a conversation to the prompt text a checkpoint was tuned on, from role tags the EXPORTER reduced its Jinja to ([ADR-018](../adrs/adr-018-chat-template-as-role-tags.md)) |
 | `include/loom/core/session.h` | topologies registered and caches attached once, owned in an order that cannot dangle |
-| `transcribe.cpp` | reads the declared ASR table; Whisper's spellings survive only as a flagged legacy fallback |
+| `transcribe.cpp` | reads the declared ASR table; Whisper's spellings survive only as a flagged legacy fallback; long-form windows for a declared ceiling (`asr_long_form.h`) |
 
 ### Voices as files
 
@@ -58,6 +58,14 @@ it ([ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)); loom-py
 English. A declared language/task table also reaches a dynamic-length driver now -- before Canary,
 only windowed (Whisper) drivers were handed `language`/`task`. `Model.contract` lists all three tables
 as `asr_languages`, `asr_tasks`, `asr_target_languages`.
+
+### Long audio past a training ceiling (ASR)
+
+A dynamic-length ASR file that was trained on short clips declares its ceiling and how to stitch past it
+(`loom.asr.window_*`, `loom.asr.merge_*`); `transcribe` then cuts longer audio into overlapping windows,
+decodes each alone, and merges their tokens -- NeMo's own long-form scheme, ported decision for decision
+([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md),
+`asr_long_form.h`). Canary is the first; its long-form transcripts are NeMo's, token for token.
 
 ### Reference clips (in-filling)
 
