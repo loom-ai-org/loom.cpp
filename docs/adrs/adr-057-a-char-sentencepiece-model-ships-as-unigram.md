@@ -49,9 +49,14 @@ SentencePiece and refuses the multi-character case.
 `SpeechT5Tokenizer` appends `</s>` and the protobuf records no such flag, so the export states
 `add_eos_token` (T5's precedent). `tokenizer_detect` gained `spm_char.model` as a protobuf name.
 
+**Correction (2026-10-01).** The engine side did NOT match on unknown runs: `loom::Vocab`'s Unigram
+encoder emitted one `<unk>` per unknown character where SentencePiece fuses the run, and the gate's
+sentence had no unknown characters to show it. Fixed and re-measured through the engine (40,046/40,046
+ids): [Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md).
+
 ## Consequences
 
 * SpeechT5 needed **no engine change**, so its GGUF runs on the released wheels.
-* SpeechT5's vocabulary has no digits. `SpeechT5Tokenizer(normalize=True)` spells numbers out, but
-  it defaults to False, and so does this export: `2026` reaches the model as one `<unk>`, as it does
-  in the reference. A host that wants numbers spoken must spell them first.
+* SpeechT5's vocabulary has no digits. The export now carries the reference's number speller, so
+  numbers are spelled before tokenizing
+  ([ADR-059](adr-059-a-number-speller-ships-as-data-beside-the-vocabulary.md)).

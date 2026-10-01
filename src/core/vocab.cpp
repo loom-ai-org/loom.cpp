@@ -61,6 +61,7 @@ std::unique_ptr<Vocab> Vocab::load_sentencepiece(const GgufModel& model, bool is
     vocab->add_space_prefix_ = model.kv_bool("tokenizer.ggml.add_space_prefix", true);
     vocab->remove_extra_whitespaces_ = model.kv_bool("tokenizer.ggml.remove_extra_whitespaces", true);
     vocab->byte_fallback_ = model.kv_bool("tokenizer.ggml.byte_fallback", false);
+    vocab->numbers_ = NumberSpeller::load(model);
     if (vocab->byte_fallback_) {
         if (vocab->is_bpe_) {
             // encode_bpe has no byte fallback; a file claiming one would tokenize unknown text wrongly
@@ -300,7 +301,9 @@ std::vector<int32_t> Vocab::encode(const std::string& text) const {
 }
 
 std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
-    const std::string normalized = normalize(text);
+    // Before SentencePiece's own normalisation, as `SpeechT5Tokenizer.prepare_for_tokenization` runs
+    // its number normaliser on the raw text.
+    const std::string normalized = normalize(numbers_ ? numbers_->apply(text) : text);
     if (is_bpe_) {
         return encode_bpe(normalized);
     }
@@ -373,6 +376,16 @@ std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
         pos = bt.start;
     }
     std::reverse(ids.begin(), ids.end());
+    // SentencePiece FUSES a run of unknown codepoints into one `<unk>` (`☃☃☃` is one id in flan-t5's own
+    // `spiece.model`, and `2026` one id in SpeechT5's). This loop emitted one per codepoint, which
+    // llama.cpp's UGM does too, so every Unigram file diverged from its reference on any text with two
+    // unknown characters in a row -- found by SpeechT5's number-speller differential (ADR-059), where
+    // 14,543 of 20,023 strings differed on exactly this.
+    if (!byte_fallback_) {
+        ids.erase(std::unique(ids.begin(), ids.end(),
+                              [this](int32_t a, int32_t b) { return a == unk_id_ && b == unk_id_; }),
+                  ids.end());
+    }
     return ids;
 }
 

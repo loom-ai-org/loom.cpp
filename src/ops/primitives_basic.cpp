@@ -188,9 +188,34 @@ ggml_tensor* ensure_packed(ggml_context* ctx, ggml_tensor* t) {
     return ggml_cont(ctx, t);
 }
 
+// `ggml_get_rows` is a BATCHED lookup: it gathers index row (j, k) from table batch (j, k), so it asserts
+// `a->ne[2] == b->ne[1]` and `a->ne[3] == b->ne[2]` and aborts the process when they differ. An embedding
+// lookup by a matrix of ids into ONE 2-D table -- SpeechT5's relative positions `pe_k([n, n])`, Dia's
+// `(1, T, C)` channel ids at T > 1 -- is not that, and asserted at the first call after export, write
+// and load had all passed (Retro-066). For a 2-D table it is one flat lookup reshaped back, which is the
+// answer torch gives: `[ne0, b->ne[0], b->ne[1], b->ne[2]]`. Any other mismatch throws a catchable error.
 Outputs op_get_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("GET_ROWS", in, 2);
-    return {ggml_get_rows(pc.ctx, in[0], in[1])};
+    ggml_tensor* a = in[0];
+    ggml_tensor* b = in[1];
+    if (b->type != GGML_TYPE_I32) {
+        throw SchemaError("GET_ROWS: the index must be I32, got " + std::string(ggml_type_name(b->type)));
+    }
+    if (a->ne[2] == b->ne[1] && a->ne[3] == b->ne[2] && b->ne[3] == 1) {
+        return {ggml_get_rows(pc.ctx, a, b)};
+    }
+    if (a->ne[2] == 1 && a->ne[3] == 1 && b->ne[3] == 1) {
+        ggml_tensor* flat = ggml_reshape_1d(pc.ctx, ensure_packed(pc.ctx, b), ggml_nelements(b));
+        ggml_tensor* rows = ggml_get_rows(pc.ctx, a, flat);
+        return {ggml_reshape_4d(pc.ctx, rows, a->ne[0], b->ne[0], b->ne[1], b->ne[2])};
+    }
+    auto ne_str = [](const ggml_tensor* t) {
+        return "[" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," + std::to_string(t->ne[2]) +
+               "," + std::to_string(t->ne[3]) + "]";
+    };
+    throw SchemaError("GET_ROWS: an index " + ne_str(b) + " into a table " + ne_str(a) +
+                      " is neither a batched lookup (index axes 1-2 = table axes 2-3) nor a lookup into "
+                      "one 2-D table");
 }
 
 Outputs op_mul_mat(PrimitiveContext& pc, const Inputs& in, const Json&) {
