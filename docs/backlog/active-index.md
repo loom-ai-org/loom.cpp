@@ -572,6 +572,8 @@ primitive set.
 
 ## Minor cleanups
 
+* [ ] **The Models section predates the rc11 publish.** The items for MOSS-TTS + MOSS-Audio-Tokenizer, Voxtral-4B-TTS, Pocket-TTS and VoxCPM2 still say "built, not published" or "staged", but all four are on the Hub (39 repos, checked 2026-09-30 and listed in the state anchor). Rewrite each down to what is still open: MOSS's template lines (`Tokens`, `Instruction`), a Q8_0 build and a clip-in door; Voxtral's quantized build; the encoders that cloning from a recording needs (Pocket-TTS's Mimi encoder, VoxCPM2's AudioVAE encoder); VoxCPM2's f32/f64 note. Drop the sentences about publishing.
+* [ ] **The card gate's voice-file row synthesises with every staged voice set**, including Voxtral-4B-TTS (loom-py #40). On the 2-core dev box, run that model's row on the workstation, or with `-k "not voxtral"`.
 * [ ] `KvCache::write_k/write_v/read_k/read_v` use `std::vector::at()`, which throws `std::out_of_range`
   rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr could in principle reach
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
@@ -589,8 +591,6 @@ primitive set.
 
 ## Knowledge Hub
 
-* [ ] **The Models section predates the rc11 publish.** The items for MOSS-TTS + MOSS-Audio-Tokenizer, Voxtral-4B-TTS, Pocket-TTS and VoxCPM2 still say "built, not published" or "staged", but all four are on the Hub (39 repos, checked 2026-09-30 and listed in the state anchor). Rewrite each down to what is still open: MOSS's template lines (`Tokens`, `Instruction`), a Q8_0 build and a clip-in door; Voxtral's quantized build; the encoders that cloning from a recording needs (Pocket-TTS's Mimi encoder, VoxCPM2's AudioVAE encoder); VoxCPM2's f32/f64 note. Drop the sentences about publishing.
-* [ ] **The card gate's voice-file row synthesises with every staged voice set**, including Voxtral-4B-TTS (loom-py #40). On the 2-core dev box, run that model's row on the workstation, or with `-k "not voxtral"`.
 | | |
 |---|---|
 | **Domains** | [Epics](../epics/) — what each area is and how it works |
