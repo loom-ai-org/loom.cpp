@@ -37,7 +37,9 @@ the engine:
 * flan-t5: 4,998/5,000.
 
 The two flan-t5 differences are an older and unrelated Viterbi TIE: `g`+`gg` and `gg`+`g` score
-exactly the same, and the two implementations break the tie differently. They are on the hub.
+exactly the same, and the two implementations break the tie differently. **Resolved by
+[ADR-060](../adrs/adr-060-a-unigram-tie-is-broken-by-the-vocabularys-own-reference.md)**: SentencePiece
+stores path scores as float and compares in double, and a `.model` vocabulary now says so.
 `tests/ci/test_number_speller.cpp` checks that `☃☃☃` encodes to one `<unk>`, and it fails with the
 fusion removed.
 

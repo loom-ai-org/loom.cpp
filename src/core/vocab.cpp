@@ -62,6 +62,13 @@ std::unique_ptr<Vocab> Vocab::load_sentencepiece(const GgufModel& model, bool is
     vocab->remove_extra_whitespaces_ = model.kv_bool("tokenizer.ggml.remove_extra_whitespaces", true);
     vocab->byte_fallback_ = model.kv_bool("tokenizer.ggml.byte_fallback", false);
     vocab->numbers_ = NumberSpeller::load(model);
+    if (model.has_kv("tokenizer.ggml.unigram_scoring")) {
+        const std::string scoring = model.kv_str("tokenizer.ggml.unigram_scoring");
+        if (scoring != "sentencepiece") {
+            throw LoadError("Vocab::load: unknown tokenizer.ggml.unigram_scoring '" + scoring + "'");
+        }
+        vocab->sentencepiece_scoring_ = true;
+    }
     if (vocab->byte_fallback_) {
         if (vocab->is_bpe_) {
             // encode_bpe has no byte fallback; a file claiming one would tokenize unknown text wrongly
@@ -319,7 +326,34 @@ std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
 
     double min_score = 0.0;
     for (float s : scores_) min_score = std::min(min_score, static_cast<double>(s));
-    const double unknown_token_score = min_score - 10.0;
+    double unknown_token_score = min_score - 10.0;
+
+    // SENTENCEPIECE'S ARITHMETIC, for a vocabulary that came from its `.model` (unigram_model.cc,
+    // `EncodeOptimized`, v0.2.1). Its path scores are stored as FLOAT. A piece's score is the ternary
+    // `IsUserDefined ? (length * max_score_ - 0.1) : GetScore()`, whose `0.1` literal makes the whole
+    // expression a DOUBLE, so a piece candidate is the exact double sum of two floats, compared in double
+    // against the stored float, then stored as float. The unknown candidate is `unk_score + stored`, all
+    // float. Two splits that tie exactly in real arithmetic (flan-t5's `g`+`gg` and `gg`+`g`) then come
+    // out one rounding step apart, depending on everything before them -- a Python emulation of exactly
+    // this matches SentencePiece on 5000/5000 random strings where doubles throughout differ on 2.
+    // Its unknown score is `min_score_ - kUnkPenalty` with the minimum over NORMAL pieces, in float.
+    float spm_unknown_score = 0.0f;
+    if (sentencepiece_scoring_) {
+        float min_normal = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < scores_.size(); ++i) {
+            if (token_type_[i] == kTokenTypeNormal) min_normal = std::min(min_normal, scores_[i]);
+        }
+        spm_unknown_score = min_normal - 10.0f;
+        unknown_token_score = spm_unknown_score;
+    }
+    // ... and its `max_score_` starts at FLT_MIN, the smallest POSITIVE float, so over all-negative
+    // normal scores it stays ~1e-38 and a user-defined piece scores about -0.1. Reproduced, not fixed.
+    float spm_max_normal = std::numeric_limits<float>::min();
+    if (sentencepiece_scoring_) {
+        for (size_t i = 0; i < scores_.size(); ++i) {
+            if (token_type_[i] == kTokenTypeNormal) spm_max_normal = std::max(spm_max_normal, scores_[i]);
+        }
+    }
 
     // Mirrors llama.cpp's llm_tokenizer_ugm_session::tokenize almost line-for-line: move through the
     // normalized string one UTF-8 codepoint at a time, at each position walk the vocab trie to relax
@@ -339,22 +373,39 @@ std::vector<int32_t> Vocab::encode_impl(const std::string& text) const {
             node = &it->second;
             ++prefix_offset;
             if (node->has_value) {
+                const int32_t type = token_type_[static_cast<size_t>(node->value)];
+                // SentencePiece skips an UNUSED piece entirely (`if (IsUnusedInlined(ret)) continue;`).
+                if (sentencepiece_scoring_ && type == kTokenTypeUnused) continue;
                 if (prefix_offset - offset == n_code_units) single_codepoint_found = true;
-                const double piece_score = token_type_[static_cast<size_t>(node->value)] == kTokenTypeUserDefined
-                                                ? 0.0
-                                                : static_cast<double>(scores_[static_cast<size_t>(node->value)]);
+                double piece_score = type == kTokenTypeUserDefined
+                                         ? 0.0
+                                         : static_cast<double>(scores_[static_cast<size_t>(node->value)]);
+                if (sentencepiece_scoring_ && type == kTokenTypeUserDefined) {
+                    piece_score = static_cast<double>(static_cast<float>(prefix_offset - offset) * spm_max_normal) - 0.1;
+                }
                 const double challenger = current_best.score_sum + piece_score;
                 if (challenger > best[prefix_offset].score_sum) {
-                    best[prefix_offset] = {node->value, offset, challenger};
+                    // Stored as float under SentencePiece's arithmetic: `score_sum` then only ever holds
+                    // float values, and this double sum of two of them is the double candidate it compares.
+                    const double stored = sentencepiece_scoring_ ? static_cast<double>(static_cast<float>(challenger))
+                                                                 : challenger;
+                    best[prefix_offset] = {node->value, offset, stored};
                 }
             }
         }
 
         if (!single_codepoint_found) {
             const size_t target = offset + n_code_units;
-            const double challenger = current_best.score_sum + unknown_token_score;
-            if (challenger > best[target].score_sum) {
-                best[target] = {unk_id_, offset, challenger};
+            if (sentencepiece_scoring_) {
+                const float challenger = spm_unknown_score + static_cast<float>(current_best.score_sum);
+                if (best[target].token_id < 0 || challenger > static_cast<float>(best[target].score_sum)) {
+                    best[target] = {unk_id_, offset, static_cast<double>(challenger)};
+                }
+            } else {
+                const double challenger = current_best.score_sum + unknown_token_score;
+                if (challenger > best[target].score_sum) {
+                    best[target] = {unk_id_, offset, challenger};
+                }
             }
         }
 

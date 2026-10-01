@@ -769,6 +769,20 @@ add_test(NAME test_number_speller COMMAND test_number_speller)
 set_tests_properties(test_number_speller PROPERTIES LABELS ci)
 set_tests_properties(test_number_speller PROPERTIES FIXTURES_REQUIRED number_speller_gguf_fixture)
 
+add_test(
+    NAME gen_unigram_tie_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_unigram_tie_gguf.py ${LOOM_FIXTURE_DIR}
+)
+set_tests_properties(gen_unigram_tie_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_unigram_tie_gguf_fixture PROPERTIES FIXTURES_SETUP unigram_tie_gguf_fixture)
+
+add_executable(test_unigram_scoring ci/test_unigram_scoring.cpp)
+target_link_libraries(test_unigram_scoring PRIVATE loom::engine)
+target_compile_definitions(test_unigram_scoring PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_unigram_scoring COMMAND test_unigram_scoring)
+set_tests_properties(test_unigram_scoring PROPERTIES LABELS ci)
+set_tests_properties(test_unigram_scoring PROPERTIES FIXTURES_REQUIRED unigram_tie_gguf_fixture)
+
 add_executable(test_pocket_tts_vocab ci/test_pocket_tts_vocab.cpp)
 target_link_libraries(test_pocket_tts_vocab PRIVATE loom::engine)
 target_compile_definitions(test_pocket_tts_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
