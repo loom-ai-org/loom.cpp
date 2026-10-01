@@ -29,6 +29,7 @@ add_library(loom_engine
     src/core/transcribe.cpp
     src/core/text_generate.cpp
     src/core/text_classify.cpp
+    src/core/audio_classify.cpp
     src/core/generation.cpp
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp
