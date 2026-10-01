@@ -1340,7 +1340,9 @@ encoder/cross_kv/decoder split and needed no new primitive; its costs were an en
 language table reaching a dynamic-length driver), a new API role
 ([ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)), and a shape-walk gap that had
 already shipped an extra CTC frame in conformer-ctc-small
-([Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md)).
+([Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md)). Past its
+40 s training ceiling it is decoded as NeMo decodes it -- overlapping windows, stitched token for token
+([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)).
 
 **Requested, unscoped (2026-09-25):** Canary, Citrinet, Cohere ASR, Moonshine (tiny and small),
 Nemotron ASR, Silero VAD, Voxtral Mini realtime, Kitten TTS and Soprano TTS. Most of the ASR names
