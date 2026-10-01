@@ -208,6 +208,57 @@ def write_dynamic_asr(path: Path) -> None:
     _finish(w)
 
 
+# A DYNAMIC-LENGTH ASR model that DOES select a language and a task: Canary's shape. Its prompt carries
+# a source and a target language, so unlike the file above a `language=` CAN reach the model -- and the
+# declared table is how `transcribe` knows. The driver echoes what it was handed, as tokens, which is
+# the only way the test sees that the arguments arrived (and, for `task`, that 0 arrived as 0).
+#
+# Task ids are TARGET-LANGUAGE ids, as Canary's are: `transcribe` is 0 ("the source"), `translate` is
+# the id of `en`.
+DYNAMIC_LANGUAGES_DRIVER = """
+function infer(inputs)
+    local out = {HELLO_ID}
+    if inputs.language ~= nil then table.insert(out, inputs.language) end
+    if inputs.task ~= nil then
+        if inputs.task == 0 then table.insert(out, ZERO_ID) else table.insert(out, inputs.task) end
+    end
+    if inputs.target_language ~= nil then
+        table.insert(out, TARGET_ID)
+        table.insert(out, inputs.target_language)
+    end
+    return out
+end
+"""
+
+
+def write_dynamic_asr_languages(path: Path) -> None:
+    w = _base(path, "dynamic_asr_languages_test")
+    w.add_string("loom.task", "automatic-speech-recognition")
+    w.add_string("loom.input.kind", "audio")
+    w.add_string("loom.output.kind", "token_ids")
+    w.add_uint32("loom.sample_rate", 16000)
+
+    tokens = ["<pad>", "<eos>", "!", "?", ".", "hello", "!?", "en", "de", "t0", ">"]
+    ids = {t: i for i, t in enumerate(tokens)}
+    w.add_tokenizer_model("gpt2")
+    w.add_tokenizer_pre("qwen2")
+    w.add_token_list(tokens)
+    w.add_token_merges(["! ?"])
+    w.add_eos_token_id(1)
+    w.add_array("loom.asr.language_names", ["de", "en"])
+    w.add_array("loom.asr.language_ids", [ids["de"], ids["en"]])
+    w.add_array("loom.asr.task_names", ["transcribe", "translate"])
+    w.add_array("loom.asr.task_ids", [0, ids["en"]])
+    # The languages it can WRITE -- here a subset of what it hears, so the test can tell the two tables
+    # apart: `de` is a source language and not a target one.
+    w.add_array("loom.asr.target_language_names", ["en"])
+    w.add_array("loom.asr.target_language_ids", [ids["en"]])
+    w.add_string("model.driver_script", DYNAMIC_LANGUAGES_DRIVER
+                 .replace("HELLO_ID", str(ids["hello"])).replace("ZERO_ID", str(ids["t0"]))
+                 .replace("TARGET_ID", str(ids[">"])))
+    _finish(w)
+
+
 # A token classifier, for `loom::text::classify`. One class per ROW of the model's output, which is
 # what `token_labels_epilogue` returns from `loom.argmax_rows` in a real export -- spelled here as a
 # table so the fixture needs no graph.
@@ -313,6 +364,7 @@ def main() -> None:
     write_generate(out_dir / "generate_driver.gguf")
     write_timestamped_asr(out_dir / "timestamped_asr.gguf")
     write_dynamic_asr(out_dir / "dynamic_asr.gguf")
+    write_dynamic_asr_languages(out_dir / "dynamic_asr_languages.gguf")
     write_codec(out_dir / "contract_codec.gguf")
     write_classifier(out_dir / "classify_driver.gguf")
     write_spm_classifier(out_dir / "classify_driver_spm.gguf")
