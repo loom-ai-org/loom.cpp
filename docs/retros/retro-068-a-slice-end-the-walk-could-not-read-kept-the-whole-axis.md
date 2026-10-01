@@ -62,5 +62,8 @@ that is never shorter than its input was not cut. The silent fallback itself was
 other models rely on it for slices whose bound is genuinely absent, and telling those apart needs the
 `is_guess`-style provenance `scalar_expr` already carries. That is the layout/shape-walk audit's work.
 
-The transducer leaves (Parakeet-TDT/RNNT, GigaAM) emit their encoder frames untrimmed too, and their
-decode loops read every row. Open in the hub.
+**The transducer leaves got the same cut** (loom-exporter `fix/transducer-encoded-len`), on the encoder's
+time axis before the transpose. Parakeet-TDT and -RNNT emitted one frame past `encoded_len` at 5 of 7
+lengths measured; after the cut their kept rows are bit-identical to the published exports and their ids
+equal NeMo's own greedy decode at all 7. GigaAM already counted the two the same way at every length,
+so the cut is a no-op `VIEW` there and it needs no republish.
