@@ -45,7 +45,21 @@ inline constexpr const char* ASR = "automatic-speech-recognition";
 inline constexpr const char* TTS = "text-to-speech";
 inline constexpr const char* AUDIO_CODEC = "audio-codec";
 inline constexpr const char* TOKEN_CLASSIFICATION = "token-classification";
+inline constexpr const char* AUDIO_CLASSIFICATION = "audio-classification";
+inline constexpr const char* AUDIO_EMBEDDING = "audio-embedding";
 } // namespace task_names
+
+// How many answers a `class` or `embeddings` output gives -- `loom.output.granularity` (ADR-062).
+// `class` meant "one per input token" for as long as family 12 was the only classifier, and family 13
+// brought three more readings of the same kind: a VAD's probabilities per encoder FRAME, a language
+// id's one distribution per CLIP, a speaker embedding's one vector per clip. A host reads each of them
+// differently, so the file says which -- inferring it from the answer's shape cannot tell a one-frame
+// VAD answer from a clip answer.
+namespace granularity {
+inline constexpr const char* TOKEN = "token";
+inline constexpr const char* FRAME = "frame";
+inline constexpr const char* CLIP = "clip";
+} // namespace granularity
 
 // The modality names `loom.input.kind` / `loom.output.kind` take. Same reasoning: strings, open set.
 // `token_ids` and `phoneme_ids` are inputs a caller supplies already-encoded -- the distinction from
@@ -119,6 +133,16 @@ struct ModelContract {
     // unlike the ASR language table, which is a sparse map into a vocabulary -- because a classifier's
     // classes are 0..n-1 by construction.
     std::vector<std::string> labels;
+
+    // `loom.output.granularity`: `token`, `frame` or `clip` (see `granularity` above). A `class` output
+    // that declares none is `token`, because every such file is family 12's and predates the key; any
+    // other output that declares none leaves this empty.
+    std::string output_granularity;
+    // For a `frame` output: frames per second, and the time in seconds at which frame 0 begins -- frame
+    // `i` covers `[offset + i / rate, offset + (i + 1) / rate)`. Both 0 when undeclared; the offset is
+    // declared only when it is not 0 (pyannote's SincNet needs 991 samples of context for its first).
+    double frame_rate = 0.0;
+    double frame_offset = 0.0;
 
     // Reads whatever `model` declares. Never throws for an absent key -- see the header comment.
     static ModelContract read(const GgufModel& model);

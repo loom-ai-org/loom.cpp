@@ -69,6 +69,13 @@ ModelContract ModelContract::read(const GgufModel& model) {
     c.labels = opt_arr_str(model, "loom.labels");
     c.entry_points = opt_arr_str(model, "loom.entry_points");
 
+    c.output_granularity = opt_str(model, "output.granularity");
+    if (c.output_granularity.empty() && c.output_kind == modality::CLASS) {
+        c.output_granularity = granularity::TOKEN;
+    }
+    c.frame_rate = opt_f32(model, "output.frame_rate");
+    c.frame_offset = opt_f32(model, "output.frame_offset");
+
     c.default_steps = opt_u32(model, "tts.default_steps");
     c.voices = opt_arr_str(model, "loom.tts.voices");
 
