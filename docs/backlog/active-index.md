@@ -113,9 +113,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) for where families 4 and 5
   found the cost instead. Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id
   handling for free.*
-* [ ] **Canary over 40 s** (Canary-1b-v2 is published, rc13): NeMo chunks longer audio into
-  overlapping windows; one call here is one decode, which degrades past the training ceiling. Not
-  declared to hosts yet.
+* [ ] **Republish Canary-1b-v2 after rc14** with its long-form keys
+  ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)): fresh export,
+  card gate on the released wheel (the card now says long audio needs rc14), upload. rc13 ignores the
+  keys, so the order is wheels first only because the card names the version.
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
