@@ -43,6 +43,7 @@ void print_usage(const char* argv0) {
                   "--ref-text \"<what it says>\" --prompt \"<text>\" --out out.wav\n"
                   "       %s --model <text-to-codes.gguf> --prompt \"<text>\" --codec <codec.gguf> "
                   "--out out.wav\n"
+                  "       %s --model <audio-classifier-or-embedder.gguf> --wav <clip.wav>\n"
                   "\n"
                   "  --chat                        wrap --prompt in the model's own chat template\n"
                   "  --system <text>               a system turn ahead of it (implies --chat)\n"
@@ -75,7 +76,7 @@ void print_usage(const char* argv0) {
                   "  $LOOM_PROFILE_NODES=1         ... and a second table keyed on the NODE name, which\n"
                   "                                is the only thing that says which graph a bucket is in\n"
                   "                                (profile with ONE thread; see include/loom/core/profile.h)\n",
-                  argv0, argv0, argv0, argv0, argv0);
+                  argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 // What ran where, after a device run. The number that matters is the split count: each split is a point
@@ -743,6 +744,61 @@ int main(int argc, char** argv) {
                 std::printf("  %-16s %s\n", wp_vocab->decode({entry.token}).c_str(),
                             entry.label.empty() ? std::to_string(entry.label_id).c_str()
                                                 : entry.label.c_str());
+            }
+            print_device_report(session.bridge());
+            return 0;
+        }
+
+        // Family 13 (ADR-062): an audio classifier or embedder. Asked of the contract, like the token
+        // classifier above -- these files carry no vocabulary at all, so no tag branch would claim them.
+        if (contract.interface_name() == "speech2class" || contract.interface_name() == "speech2embeddings") {
+            std::printf("  task: %s (%s, per %s)", contract.task.c_str(), contract.interface_name().c_str(),
+                        contract.output_granularity.c_str());
+            if (!contract.labels.empty()) std::printf(", %zu labels", contract.labels.size());
+            if (contract.frame_rate > 0.0) std::printf(", %.3f frames/s", contract.frame_rate);
+            std::printf("\n");
+            if (!has_wav) {
+                std::printf("  pass --wav <clip.wav> (%u Hz mono) to run it\n", contract.sample_rate);
+                return 0;
+            }
+            const std::vector<float> clip = loom_cli::load_wav_pcm16_mono(wav_path, contract.sample_rate);
+            loom::Session session(*model, backends);
+            if (contract.output_kind == loom::modality::EMBEDDINGS) {
+                const std::vector<float> embedding = loom::audio::embed(session.bridge(), *model, clip);
+                double norm = 0.0;
+                for (float v : embedding) norm += static_cast<double>(v) * v;
+                std::printf("  embedding: %zu values, L2 norm %.6f\n ", embedding.size(), std::sqrt(norm));
+                for (float v : embedding) std::printf(" %.6g", v);
+                std::printf("\n");
+            } else {
+                const auto result = loom::audio::classify(session.bridge(), *model, clip);
+                const size_t width = result.labels.size();
+                auto argmax = [&](uint32_t row) {
+                    uint32_t best = 0;
+                    for (uint32_t k = 1; k < width; ++k) if (result.at(row, k) > result.at(row, best)) best = k;
+                    return best;
+                };
+                if (result.granularity == loom::granularity::CLIP) {
+                    // The top five, which is what a language id is read as; the full row is the
+                    // caller's through the library.
+                    std::vector<uint32_t> order(width);
+                    for (uint32_t k = 0; k < width; ++k) order[k] = k;
+                    std::sort(order.begin(), order.end(),
+                              [&](uint32_t a, uint32_t b) { return result.at(0, a) > result.at(0, b); });
+                    for (size_t i = 0; i < std::min<size_t>(5, width); ++i) {
+                        std::printf("  %-28s %.4f\n", result.labels[order[i]].c_str(), result.at(0, order[i]));
+                    }
+                } else {
+                    // Runs of the most probable label, each with the times its frames cover. A
+                    // presentation, not a decision a caller should inherit: no threshold, no smoothing.
+                    uint32_t start = 0;
+                    for (uint32_t row = 1; row <= result.n_rows; ++row) {
+                        if (row < result.n_rows && argmax(row) == argmax(start)) continue;
+                        std::printf("  %8.3f - %8.3f  %s\n", result.row_start(start), result.row_start(row),
+                                    result.labels[argmax(start)].c_str());
+                        start = row;
+                    }
+                }
             }
             print_device_report(session.bridge());
             return 0;
