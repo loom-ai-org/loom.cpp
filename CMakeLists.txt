@@ -27,6 +27,7 @@ add_library(loom_engine
     src/core/model_contract.cpp
     src/core/session.cpp
     src/core/transcribe.cpp
+    src/core/asr_long_form.cpp
     src/core/text_generate.cpp
     src/core/text_classify.cpp
     src/core/audio_classify.cpp
