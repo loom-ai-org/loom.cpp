@@ -63,6 +63,11 @@ struct TranscribeOptions {
     // exactly the caller who wants to hear that this model does not have it.
     std::string language;
     std::string task;
+    // The language to WRITE, for a model that separates it from the language it hears (a declared
+    // `loom.asr.target_language_names`). Empty means omit: the driver applies its own default, which
+    // for Canary is English. Named on a model with no such table, it throws -- the output would be in
+    // whatever language the model writes, which is not what was asked for.
+    std::string target_language;
     // Ask the model for timestamps in the OUTPUT. They are requested internally whenever the seek
     // needs them regardless, so this only controls what the caller gets back.
     bool timestamps = false;
