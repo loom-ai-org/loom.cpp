@@ -66,3 +66,8 @@ Without the key, every file behaves as before, which includes every GGUF publish
   so.
 * A future SentencePiece release that changes this arithmetic needs a new value for the key, not an
   edit to this one.
+* Which published files carry it: SpeechT5, flan-t5-small and pocket-tts were republished with the key
+  after rc12 (2026-10-01; pocket-tts 16,000/16,000 against its reference's text path). The ASR files with a
+  `.model` Unigram vocabulary (conformer-ctc, gigaam, sensevoice) get it on their next re-export and need
+  nothing sooner, because they only decode. punctuate-all (`tokenizer.json`) and the parakeets (BPE) never
+  get it.
