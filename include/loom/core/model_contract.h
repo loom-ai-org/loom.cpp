@@ -28,6 +28,7 @@
 // is on. A model with audio on BOTH sides would need two, and none exists yet -- when one does, add
 // `loom.output.sample_rate` and read it here rather than re-spelling this one.
 
+#include "loom/core/asr_long_form.h"
 #include "loom/core/gguf_model.h"
 
 #include <cstdint>
@@ -199,6 +200,12 @@ struct AsrDecodeTable {
 
     // How many of the previous window's tokens may be carried forward as `prev_tokens`.
     uint32_t prev_context = 0;
+
+    // How a dynamic-length model decodes audio longer than it was trained on: windows, their overlap,
+    // and how the windows' tokens are stitched -- `loom.asr.window_*` / `loom.asr.merge_*`. Undeclared
+    // (all zero) means one pass whatever the length, which is every such file exported before Canary's
+    // long-form decode. See asr_long_form.h.
+    LongFormPolicy long_form;
 
     // True when this file declared no language/task table and a caller must fall back to resolving a
     // name against the vocabulary by Whisper's `<|xx|>` spelling. Set only when a vocabulary was

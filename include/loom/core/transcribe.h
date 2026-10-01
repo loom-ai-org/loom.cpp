@@ -24,7 +24,10 @@
 //   * each window's tokens are carried forward as `prev_tokens` unless the caller turns that off.
 //
 // A model with a dynamic clip length -- the NeMo families, which is every ASR export but Whisper --
-// takes one pass with the whole waveform and none of the above applies.
+// takes one pass with the whole waveform and none of the above applies, UNLESS its file declares a
+// training ceiling (`loom.asr.window_*`, Canary): then audio past the ceiling is cut into overlapping
+// windows, each decoded alone, and the token sequences are stitched where they overlap -- NeMo's own
+// long-form scheme, ported in asr_long_form.h. There is no seek: such a model emits no timestamps.
 
 #include "loom/core/backend.h"
 #include "loom/core/gguf_model.h"

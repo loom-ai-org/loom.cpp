@@ -126,6 +126,12 @@ AsrDecodeTable AsrDecodeTable::read(const GgufModel& model, const loom::BpeVocab
     t.task_ids = opt_arr_i32(model, "loom.asr.task_ids");
     t.target_language_names = opt_arr_str(model, "loom.asr.target_language_names");
     t.target_language_ids = opt_arr_i32(model, "loom.asr.target_language_ids");
+    t.long_form.max_window_samples = opt_u32(model, "asr.window_max_samples");
+    t.long_form.min_window_samples = opt_u32(model, "asr.window_min_samples");
+    t.long_form.window_search_step_samples = opt_u32(model, "asr.window_search_step_samples");
+    t.long_form.overlap_samples = opt_u32(model, "asr.window_overlap_samples");
+    t.long_form.merge_search_tokens = opt_u32(model, "asr.merge_search_tokens");
+    t.long_form.merge_head_tokens = opt_u32(model, "asr.merge_head_tokens");
 
     const bool declares_timestamps = model.has_kv("loom.asr.timestamp_first_id");
     if (declares_timestamps) {
