@@ -19,27 +19,25 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **NEXT: cut rc13, then publish Canary and family 13** | **Family 13 is MERGED** (2026-10-01: loom.cpp #54, loom-exporter #45, loom-py #45): four leaves (TitaNet, MarbleNet VAD, ECAPA LID, pyannote segmentation), verified against each reference at its own f32/f64 floor ([Epic-03 §2](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md)). All three repos are clean on `main` with no open PRs; loom-py `main` pins loom.cpp `41b7d96` (loom.cpp `main` is ahead only by docs). **Wheels first:** rc13 carries Canary's support and family 13's doors, so cut **rc13** (VERSION bump PR in loom-py, signed tag, GitHub release, PyPI verification), then publish Canary-1b-v2 (fresh export + card gate on the RELEASED rc13 wheel + `upload_all.py --only canary-1b-v2 --create` + Hub verification), then family 13's four (the [publish item](#models) under Models). |
 | **P5 breadth is the work now — remaining TTS, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11, 12 and 13 are complete (13 on four leaves, 2026-10-01) and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's first leaf, **SpeechT5, is published (rc12)**: the mel-frame AR loop cost no primitive and no engine change, only an exporter tokenizer mapping ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)) and two silent lowering defects ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)); 9b's other two (fastpitch, bananamind-tts) are **future work, deferred by the user 2026-10-01**, and the user picked **Canary and Citrinet** (below, under Models) as what comes first. Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
-**State anchor, 2026-10-01 — `1.0.0-rc12` is released and the Hub equals the staging tree.**
-Four packages on PyPI at `1.0.0rc12`, each one's newest (`loom-py-rt` 17 files, `-cuda` 2,
+**State anchor, 2026-10-01 — `1.0.0-rc13` is released and the Hub equals the staging tree.**
+Four packages on PyPI at `1.0.0rc13`, each one's newest (`loom-py-rt` 17 files, `-cuda` 2,
 `-vulkan` 2, `-metal` 1); the `linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI
-rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc12` sits on
-loom-py `3973183` (the merge of loom-py #43), which pins loom.cpp `3bfed05`. rc12 carries the engine's
-`NumberSpeller` ([ADR-059](../adrs/adr-059-a-number-speller-ships-as-data-beside-the-vocabulary.md)),
-unknown-run fusion ([Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md)), SentencePiece tie-breaking
-([ADR-060](../adrs/adr-060-a-unigram-tie-is-broken-by-the-vocabularys-own-reference.md)), the GET_ROWS
-fix, and loom-py's `reference=` door ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)).
-**Forty** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). After the
-release, all Hub-verified: F5-TTS's card moved onto the `reference=` door (loom-exporter #38, README
-only), and SpeechT5, flan-t5-small and pocket-tts were re-exported fresh, card-gated and republished
-(GGUFs; SpeechT5's card now names rc12 for digits, loom-exporter #42). Their voice files re-exported
-byte-identical and were not re-sent. Later the same day, on rc12 as released: conformer-ctc-small was
-republished with its CTC output cut to `encoded_len`
-([Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md)), and
-**Citrinet-1024 was added** (`citrinet-1024-loom`, the fortieth). EnCodec and F5-TTS ship `cc-by-nc-4.0`, and that is **settled,
-not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
+rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc13` sits on
+loom-py `242e014` (the merge of loom-py #46), which pins loom.cpp `c43d17f`. rc13 carries Canary's
+support (a declared language table reaches a dynamic-length driver; the `target_language` role,
+[ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)) and family 13's doors
+(`loom::audio::classify`/`embed`, loom-py `speech2class`/`speech2embeddings`, the
+`loom.output.granularity` contract, [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)).
+**Forty-five** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). The five
+added on rc13 as released, each a fresh export, card-gated on the RELEASED wheel (Canary 2 passed, family
+13 8 passed, with the new rows of loom-py #47), sha256- and README-verified, and run from the Hub through
+`from_pretrained`: `canary-1b-v2-loom`, `titanet-large-loom`, `marblenet-vad-v2-loom`,
+`ecapa-voxlingua107-loom` and `pyannote-segmentation-3.0-loom` (cards: loom-exporter #46). The pyannote
+copy is **gated** (`gated=auto`, switched on before its first upload; an anonymous download gets 401),
+as the original is. EnCodec and F5-TTS ship `cc-by-nc-4.0` and MarbleNet the NVIDIA Open Model License,
+and all three are **settled, not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
 
 **Nothing is held for a release today.** What decides a publish is the standing rule, **WHEELS FIRST,
 ALWAYS**: a GGUF or a card that needs something the released wheels have not got waits for the
@@ -115,32 +113,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) for where families 4 and 5
   found the cost instead. Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id
   handling for free.*
-* [ ] **Canary-1b-v2: built and verified, NOT published** (2026-10-01; engine merged in loom.cpp #50,
-  exporter half loom-exporter #43, loom-py #44 pinned to main). Family 1's encoder joined to T5's
-  encoder/cross_kv/decoder split, ids identical to NeMo on transcription and en->fr translation, logits
-  closer to f64 than NeMo's own f32, card gate passing on a fresh export. (Citrinet-1024, built beside
-  it, is PUBLISHED: `citrinet-1024-loom`, Hub `85172f0`, etag-verified, runs on the rc12 wheel.) Left:
-  * [ ] **Release first** (WHEELS FIRST): Canary needs the engine's new `transcribe` behaviour (a
-    declared table reaches a dynamic-length driver) and `target_language`
-    ([ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)); an rc12 wheel would
-    transcribe it but drop every language argument.
-  * [ ] **Canary over 40 s**: NeMo chunks longer audio into overlapping windows; one call here is one
-    decode, which degrades past the training ceiling. Not declared to hosts yet.
+* [ ] **Canary over 40 s** (Canary-1b-v2 is published, rc13): NeMo chunks longer audio into
+  overlapping windows; one call here is one decode, which degrades past the training ceiling. Not
+  declared to hosts yet.
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
-* [ ] **Family 13: publish the four leaves, after rc13.** Built, verified and merged (loom.cpp #54,
-  loom-exporter #45, loom-py #45;
-  [Epic-03 §2](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)); each
-  needs the rc13 wheels (the `speech2class`/`speech2embeddings` doors and `loom.output.granularity` are
-  new). Left: `build_model_cards.py` entries for titanet-large, marblenet-vad-v2, ecapa-voxlingua107 and
-  pyannote-segmentation-3.0; a card-gate row for the two new doors in loom-py's
-  `tests/gate/test_model_cards.py`; fresh exports. **Licences, decided by the user 2026-10-01:**
-  MarbleNet ships under the **NVIDIA Open Model License**, the one its upstream card names (the zoo's
-  first); pyannote's Hub copy is **gated** with the same accept-terms gate as the original (MIT, but
-  gated upstream), which is a repo setting to switch on when the repo is created. Two limits to state on
-  the cards: ECAPA takes ONE whole clip (no `length`: a length read as data cannot be exported yet, see
-  Exporter), and pyannote is trained on 10 s windows, which a host slides over a long recording.
 * [ ] **Requested for the zoo, unscoped** (added 2026-09-25 at the user's request, no order among
   them yet). None has been checked against its checkpoint; the template guesses are where scoping
   starts, not what it will find.
