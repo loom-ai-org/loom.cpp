@@ -19,45 +19,35 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **The stack LANDED 2026-10-01; next is a loom-py release, then three republishes, then draft #38** | All nine PRs are merged into `main` with merge commits, bottom first, and their branches are deleted: SpeechT5 (loom.cpp [#46](https://github.com/loom-ai-org/loom.cpp/pull/46), loom-exporter [#39](https://github.com/loom-ai-org/loom-exporter/pull/39), loom-py [#40](https://github.com/loom-ai-org/loom-py/pull/40)), digits plus the GET_ROWS fix ([#47](https://github.com/loom-ai-org/loom.cpp/pull/47), [#40](https://github.com/loom-ai-org/loom-exporter/pull/40), [#41](https://github.com/loom-ai-org/loom-py/pull/41)), and SentencePiece tie-breaking ([#48](https://github.com/loom-ai-org/loom.cpp/pull/48), [#41](https://github.com/loom-ai-org/loom-exporter/pull/41), [#42](https://github.com/loom-ai-org/loom-py/pull/42)). loom-py `main` pins loom.cpp `14bde9b`. **Next: a loom-py release** (VERSION, ADR-037; the engine gained `NumberSpeller`, unknown-run fusion, SentencePiece tie-breaking and the GET_ROWS fix, so WHEELS FIRST). Then the republishes listed in the SpeechT5 item under Models (SpeechT5, flan-t5, pocket-tts). Then loom-exporter [#38](https://github.com/loom-ai-org/loom-exporter/pull/38), a DRAFT based on `main` (F5-TTS's card on the `reference=` door; steps under Host API). **Merge rules for the next stack:** merge commits only, loom.cpp first; per PR merge, then `gh api -X PATCH repos/loom-ai-org/<repo>/pulls/<child> -f base=main`, then delete the branch (a refs-API delete CLOSES a child that still points at it). Close and reopen a child that carries code so CI runs against `main`. New work branches from `main` → [Packaging & release](#packaging--release) |
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's first leaf, **SpeechT5, is built and gated (2026-09-30)**, on `feat/p5-family-9b-speecht5`: the mel-frame AR loop cost no primitive and no engine change, only an exporter tokenizer mapping ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)) and two silent lowering defects ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)); 9b's other two (fastpitch, bananamind-tts) are not local; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
-**State anchor, 2026-09-30 — `1.0.0-rc11` is fully released and the Hub equals the staging tree.**
-Four packages on PyPI at `1.0.0rc11`, each one's `latest` (`loom-py-rt` 17 files, `-cuda` 2,
+**State anchor, 2026-10-01 — `1.0.0-rc12` is released and the Hub equals the staging tree.**
+Four packages on PyPI at `1.0.0rc12`, each one's newest (`loom-py-rt` 17 files, `-cuda` 2,
 `-vulkan` 2, `-metal` 1); the `linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI
-rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc11` sits on
-loom-py `92ca766`, moved there from `01894be` for the Vulkan image fix before anything reached PyPI.
-**Thirty-nine** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org) (SpeechT5, the 39th, on 2026-09-30):
-rc10's thirty re-exported fresh at rc11 and card-gated, plus eight first-time publishes (F5-TTS,
-Fun-CosyVoice3, VoxCPM2, Pocket-TTS, Voxtral-4B-TTS, Chatterbox and the MOSS pair). Since the release
-the Hub has taken three rounds of republishes, all Hub-verified: the fp32 DFT basis in five GGUFs
-([Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md)), NeMo's all-true masks in four
-([Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)), and F5-TTS re-exported with
-`loom.tts.reference` ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)) beside
-two card-only updates (Supertonic, Qwen3-TTS). EnCodec and F5-TTS ship `cc-by-nc-4.0`, and that is
-**settled, not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
+rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc12` sits on
+loom-py `3973183` (the merge of loom-py #43), which pins loom.cpp `3bfed05`. rc12 carries the engine's
+`NumberSpeller` ([ADR-059](../adrs/adr-059-a-number-speller-ships-as-data-beside-the-vocabulary.md)),
+unknown-run fusion ([Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md)), SentencePiece tie-breaking
+([ADR-060](../adrs/adr-060-a-unigram-tie-is-broken-by-the-vocabularys-own-reference.md)), the GET_ROWS
+fix, and loom-py's `reference=` door ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md)).
+**Thirty-nine** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). After the
+release, all Hub-verified: F5-TTS's card moved onto the `reference=` door (loom-exporter #38, README
+only), and SpeechT5, flan-t5-small and pocket-tts were re-exported fresh, card-gated and republished
+(GGUFs; SpeechT5's card now names rc12 for digits, loom-exporter #42). Their voice files re-exported
+byte-identical and were not re-sent. EnCodec and F5-TTS ship `cc-by-nc-4.0`, and that is **settled,
+not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
 
-**The rc10 publishing hold is over:** the "nothing staged is published until rc11" rule (author,
-2026-09-17) ended with the release. What still decides a publish is the standing rule, **WHEELS FIRST,
+**Nothing is held for a release today.** What decides a publish is the standing rule, **WHEELS FIRST,
 ALWAYS**: a GGUF or a card that needs something the released wheels have not got waits for the
 release that carries it, because a file published before its wheel is a file nobody can run, and an
 option an older engine does not know can be dropped silently rather than refused (rc10's `run_ode`
-would have integrated F5-TTS **unguided**; rc11 carries the guidance). The one item held by it today
-is loom-exporter [#38](https://github.com/loom-ai-org/loom-exporter/pull/38): F5-TTS's card on the
-`reference=` door, which only a loom-py release after rc11 carries. After that release: merge #38,
-rebuild F5's README with `--readme-only`, card-gate `-k f5-tts-v1-base`, upload the README. And every
-publish is a fresh export first ([[feedback-release-gate-needs-a-fresh-export]]) → [Packaging &
-release](#packaging--release)
+would have integrated F5-TTS **unguided**). And every publish is a fresh export first
+([[feedback-release-gate-needs-a-fresh-export]]) → [Packaging & release](#packaging--release)
 
 ---
 
 ## Models
 
-* [ ] **SpeechT5 is PUBLISHED (2026-09-30, `loom-ai-org/speecht5-tts-loom`, Hub-verified) with seven CMU ARCTIC voice files. Republish after the next loom-py release, never before (WHEELS FIRST), with fresh exports and the card gate.** The models to republish then:
-  1. **SpeechT5**: numbers spelled ([ADR-059](../adrs/adr-059-a-number-speller-ships-as-data-beside-the-vocabulary.md)) and the SentencePiece scoring key ([ADR-060](../adrs/adr-060-a-unigram-tie-is-broken-by-the-vocabularys-own-reference.md)). `tools/build_model_cards.py speecht5-tts` gives the GGUF and card (the card already says numbers need a release after rc11); the voices come from `python -m loom_exporter.speecht5_voices ~/Dev/models/speecht5-tts -o hf-models/speecht5-tts/voices`.
-  2. **flan-t5-small**: gains the scoring key, which makes exact ties match SentencePiece (20,000/20,000).
-  3. **pocket-tts**: gains the key too (Unigram with byte fallback). Run a differential against the reference's tokenizer before republishing, since nothing has measured it under the key.
-  The ASR files (conformer-ctc, gigaam, sensevoice) get the key on their next re-export with no change, because they only decode. punctuate-all (`tokenizer.json`) and the parakeets (BPE) get no key. Each upload: `upload_all.py --only <slugs>`, then `--dry-run` says "unchanged" and the `x-linked-etag` is checked. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-9bs-first-leaf-a-loop-that-emits-mel-frames), [ADR-058](../adrs/adr-058-an-xvector-voice-is-stamped-with-its-embedding-space.md)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer: three open pieces.** Both are published
   (`moss-tts-local-transformer-v1.5-loom`, `moss-audio-tokenizer-v2-loom`), with voice cloning through voice files of
   reference codes; the card gate runs the cloning card when `LOOM_CARD_VOICES` supplies a voice. Left: (1) a Q8_0 build
@@ -411,14 +401,6 @@ release](#packaging--release)
 
 ## Host API
 
-* [ ] **F5-TTS's card moves onto the `reference=` door once a released `loom-py-rt` carries it.** The
-  door is built ([ADR-056](../adrs/adr-056-a-model-that-clones-by-infilling-says-so.md), loom-py #39),
-  and the file it keys on is **on the Hub** (republished 2026-09-30 from loom-exporter `c61351e`:
-  `loom.tts.reference = "infill"`, a driver that no longer aliases its clip to `tokens`; x-linked-etag
-  = local sha256 `e971e410...`; card gate 2 passed on the published `infer` card). The door's audio is
-  bit-identical to that card's `model.infer(...)`. Left: after the release, merge the draft
-  loom-exporter #38 (the switched card), `build_model_cards.py f5-tts-v1-base --readme-only`, card
-  gate `-k f5-tts-v1-base`, upload the README. *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)*
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
