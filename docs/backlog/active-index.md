@@ -19,6 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
+| **NEXT, by the user's decision (2026-10-01): family 13, then cut rc13** | **Family 13 (small classifiers / embedders / VAD / LID) comes BEFORE the rc13 release**, so rc13 carries whatever engine/host support it needs together with Canary's. Start from the [family-13 item](#models) under Models: it lists the candidates, what is local (nothing torch-loadable) and the questions to answer before choosing a first leaf. **After family 13: cut rc13**, then publish Canary-1b-v2 (fresh export + card gate on the RELEASED rc13 wheel + `upload_all.py --only canary-1b-v2 --create` + Hub verification) — its item below says why it waits. State at the hand-off: all three repos clean on `main`, no open PRs; loom-py `main` pins loom.cpp `327fca8` (loom.cpp `main` is ahead only by docs). |
 | **P5 breadth is the work now — remaining TTS, then small classifiers, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11 and 12 are complete and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's first leaf, **SpeechT5, is published (rc12)**: the mel-frame AR loop cost no primitive and no engine change, only an exporter tokenizer mapping ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)) and two silent lowering defects ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)); 9b's other two (fastpitch, bananamind-tts) are **future work, deferred by the user 2026-10-01**, and the user picked **Canary and Citrinet** (below, under Models) as what comes first; family 13 is one forward pass and an argmax per leaf but needs every checkpoint downloaded and new contract output kinds (speaker embeddings, per-frame VAD probabilities). Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-10-01 — `1.0.0-rc12` is released and the Hub equals the staging tree.**
@@ -128,6 +129,30 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
+* [ ] **Family 13: small classifiers, embedders, VAD, LID — NEXT (user, 2026-10-01), before rc13.**
+  Not started. Candidates from loom-exporter `docs/EXPORT-ROADMAP.md` R5: titanet (NeMo speaker
+  embedding), ecapa-tdnn-lid, cosyvoice3-campplus, silero-vad (also on the requested list below),
+  silero-lid, marblenet-vad (NeMo), firered-vad (DFSMN), pyannote-seg, whisper-vad, crepe (pitch), cld3,
+  glotlid, lstm-truecaser. The roadmap's own note: "single forward, argmax", and "bigger than estimated".
+  **Local:** none torch-loadable — only CosyVoice3's `campplus.onnx` (ONNX; the exporter path is torch).
+  Every leaf needs a download; the checkpoint drive (`/media/flavio/Samsung_T5`) had 24 GB free.
+  **Answer first, before picking a leaf:**
+  * [ ] **The contract's new output kinds.** Exports today declare `token_ids`, `audio`, `class` (one
+    per TOKEN, family 12) and `audio_codes`; `model_contract.h` also names `embeddings`, which no export
+    declares and no interface maps yet. Family 13 needs at least a whole-clip EMBEDDING (titanet,
+    campplus, ecapa), PER-FRAME probabilities with a frame rate (VAD, segmentation, crepe), and a
+    whole-clip CLASS (LID) -- `class` today means per token, so whole-clip vs per-token needs saying. Each is a [HIGH-LEVEL-API](../HIGH-LEVEL-API.md) door question (a new loom-py
+    interface, e.g. `audio2class`/`audio2embedding`?) and a `ModelContract` field question — decide the
+    names once, for the family, not per leaf.
+  * [ ] **Which leaves load as torch modules.** Silero ships JIT/ONNX (check for a torch module);
+    the NeMo ones (titanet, marblenet) restore through `ASRModel`-style `.nemo` archives and can reuse
+    `nemo_asr_export`'s loader and trace preparation; pyannote and speechbrain ship their own packages.
+    A cheap first leaf is one that loads as torch with no new environment.
+  * [ ] **Where the reduction lives.** Per-frame probabilities need no driver reduction; a whole-clip
+    class is `loom.argmax_row`; an embedding is the output tensor itself. Check whether
+    `loom::audio::*` needs a per-task entry point (like `transcribe`/`classify`) or the door is `infer`.
+  *Context: [Epic-03 §3](../epics/epic-03-model-coverage.md#3-roadmap), family 12's template
+  (`token_classification_export.py`) for the closest existing classifier.*
 * [ ] **Requested for the zoo, unscoped** (added 2026-09-25 at the user's request, no order among
   them yet). None has been checked against its checkpoint; the template guesses are where scoping
   starts, not what it will find.
