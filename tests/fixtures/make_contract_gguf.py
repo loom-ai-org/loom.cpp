@@ -336,6 +336,78 @@ def write_pooled_classifier(path: Path) -> None:
     _finish(w)
 
 
+# Family 13's doors (ADR-062): `loom::audio::classify` and `loom::audio::embed`. The drivers answer from
+# the SAMPLE COUNT alone, so the fixtures need no graph: what is under test is how a flat answer is cut
+# into rows by the declared contract, and that cut is metadata plus arithmetic.
+#
+# The frame driver returns one row per four samples, alternating [0.25, 0.75] / [0.75, 0.25] -- so a
+# reshape that read the rows the wrong way round, or one row short, is a different table.
+FRAME_CLASSIFY_DRIVER = """
+function infer(inputs)
+    local out = {}
+    for r = 0, math.floor(#inputs.waveform / 4) - 1 do
+        local speech = (r % 2 == 0) and 0.75 or 0.25
+        out[#out + 1] = 1 - speech
+        out[#out + 1] = speech
+    end
+    return out
+end
+"""
+
+CLIP_CLASSIFY_DRIVER = """
+function infer(inputs)
+    return {0.1, 0.7, 0.2}
+end
+"""
+
+# Echoes what the door handed over, so the test can see the waveform AND the `length` beside it.
+EMBED_DRIVER = """
+function infer(inputs)
+    return {#inputs.waveform, inputs.length[1], inputs.waveform[1]}
+end
+"""
+
+# Three numbers for a two-label head: not a whole number of rows, which the door must refuse.
+SKEWED_DRIVER = """
+function infer(inputs)
+    return {0.5, 0.5, 0.5}
+end
+"""
+
+
+def _audio_classifier(path: Path, arch: str, task: str, kind: str, granularity: str, driver: str,
+                      labels=None, frame_rate=None, frame_offset=None) -> None:
+    w = _base(path, arch)
+    w.add_string("loom.task", task)
+    w.add_string("loom.input.kind", "audio")
+    w.add_string("loom.output.kind", kind)
+    w.add_string("loom.output.granularity", granularity)
+    # i32, as the exporter's contract writer spells every int -- the reader must accept it.
+    w.add_int32("loom.sample_rate", 16000)
+    if labels:
+        w.add_array("loom.labels", labels)
+    if frame_rate is not None:
+        w.add_float32("loom.output.frame_rate", frame_rate)
+    if frame_offset is not None:
+        w.add_float32("loom.output.frame_offset", frame_offset)
+    w.add_string("model.driver_script", driver)
+    _finish(w)
+
+
+def write_audio_classifiers(out_dir: Path) -> None:
+    _audio_classifier(out_dir / "audio_frame_classifier.gguf", "frame_classifier_test",
+                      "audio-classification", "class", "frame", FRAME_CLASSIFY_DRIVER,
+                      labels=["non_speech", "speech"], frame_rate=4.0, frame_offset=0.5)
+    _audio_classifier(out_dir / "audio_clip_classifier.gguf", "clip_classifier_test",
+                      "audio-classification", "class", "clip", CLIP_CLASSIFY_DRIVER,
+                      labels=["en", "de", "fr"])
+    _audio_classifier(out_dir / "audio_embedder.gguf", "embedder_test",
+                      "audio-embedding", "embeddings", "clip", EMBED_DRIVER)
+    _audio_classifier(out_dir / "audio_skewed_classifier.gguf", "skewed_classifier_test",
+                      "audio-classification", "class", "frame", SKEWED_DRIVER,
+                      labels=["non_speech", "speech"], frame_rate=50.0)
+
+
 def write_codec(path: Path) -> None:
     """A codec decoder: `audio_codes` in, `audio` out (ADR-020).
 
@@ -369,6 +441,7 @@ def main() -> None:
     write_classifier(out_dir / "classify_driver.gguf")
     write_spm_classifier(out_dir / "classify_driver_spm.gguf")
     write_pooled_classifier(out_dir / "pooled_classifier.gguf")
+    write_audio_classifiers(out_dir)
 
 
 if __name__ == "__main__":
