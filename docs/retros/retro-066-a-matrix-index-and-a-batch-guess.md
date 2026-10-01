@@ -41,8 +41,12 @@ wrapper gathered `pe_k` rows by an `[n, n]` index matrix, which is the reference
   `test_tile_lowering.py` covers both spellings. **A warning, not a refusal**, because the first
   version refused and broke Dia's export. Dia's multi-channel embedding gathers a `(1, T, C)` index
   from its one table, and it runs only because the decode loop never calls it with T > 1. That is
-  the same latent abort, kept from firing by a length no export-time check can see. The real fix
-  flattens inside the engine's `op_get_rows` (or in the lowering), and it is on the hub.
+  the same latent abort, kept from firing by a length no export-time check can see.
+* **Engine (2026-10-01): `op_get_rows` flattens a matrix index into a 2-D table itself** (one lookup,
+  reshaped to `[ne0, idx...]`), and any other mismatch throws a catchable `SchemaError` instead of a
+  ggml abort. SpeechT5 re-exported with the ORIGINAL `pe_k(rel_index)` spelling passes its gate
+  unchanged (83/83, identical numbers). Engines up to rc11 still abort on it, so the export warning
+  stays and SpeechT5 keeps the flattened spelling that runs on the released wheels.
 
 The batch guess is unchanged. It is still right far more often than it is wrong (see its own
 docstring and the GigaAM counterexample it already carves out). What changed is that a new wrapper

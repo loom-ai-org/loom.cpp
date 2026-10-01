@@ -1,5 +1,7 @@
 #pragma once
 
+#include "loom/core/number_speller.h"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -123,6 +125,9 @@ private:
     bool add_space_prefix_ = true;
     bool remove_extra_whitespaces_ = true;
     bool is_bpe_ = false; // true for "llama" (SentencePiece BPE); false for "t5" (UGM)
+    // A number speller run on the text before anything else (ADR-059): SpeechT5's vocabulary has no
+    // digits, so its file declares one. Null for every file that declares none.
+    std::unique_ptr<NumberSpeller> numbers_;
     // SentencePiece's `byte_fallback`, UGM only: a codepoint no piece covers becomes its UTF-8 bytes'
     // `<0xNN>` pieces instead of `<unk>`, and those pieces decode back to the bytes. Absent KV = false,
     // which is every file written before Pocket-TTS's (whose tokenizer is the first to need it).

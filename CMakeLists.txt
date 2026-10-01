@@ -35,6 +35,7 @@ add_library(loom_engine
     src/core/relative_position.cpp
     src/core/lua_bridge.cpp
     src/core/vocab.cpp
+    src/core/number_speller.cpp
     src/core/unicode.cpp
     src/core/bpe_vocab.cpp
     src/core/chat_template.cpp
