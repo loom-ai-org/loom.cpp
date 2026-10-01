@@ -52,7 +52,9 @@ SentencePiece and refuses the multi-character case.
 **Correction (2026-10-01).** The engine side did NOT match on unknown runs: `loom::Vocab`'s Unigram
 encoder emitted one `<unk>` per unknown character where SentencePiece fuses the run, and the gate's
 sentence had no unknown characters to show it. Fixed and re-measured through the engine (40,046/40,046
-ids): [Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md).
+ids): [Retro-067](../retros/retro-067-unigram-did-not-fuse-unknown-runs.md). A `.model` vocabulary
+also carries `tokenizer.ggml.unigram_scoring = "sentencepiece"` now, so exact ties break as
+SentencePiece breaks them ([ADR-060](adr-060-a-unigram-tie-is-broken-by-the-vocabularys-own-reference.md)).
 
 ## Consequences
 
