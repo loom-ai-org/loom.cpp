@@ -35,7 +35,7 @@ void print_usage(const char* argv0) {
     std::fprintf(stderr,
                   "usage: %s --model <path.gguf> --prompt \"<text or token ids>\" [--n-predict N]\n"
                   "       %s --model <asr.gguf> --wav <path.wav> [--language en] "
-                  "[--task transcribe|translate] [--timestamps] "
+                  "[--task transcribe|translate] [--target-language xx] [--timestamps] "
                   "[--no-condition-on-previous]\n"
                   "       %s --model <tts-or-codec.gguf> --prompt \"<phonemes|text|codes>\" "
                   "--out out.wav\n"
@@ -496,7 +496,8 @@ std::string format_time(double seconds) {
 }
 
 void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string& wav_path,
-             const std::string& language_name, const std::string& task_name, bool timestamps,
+             const std::string& language_name, const std::string& task_name,
+             const std::string& target_language_name, bool timestamps,
              bool condition_on_previous) {
     // EVERYTHING BELOW THE ARGUMENT PARSING IS THE ENGINE'S NOW (loom/core/transcribe.h). This function
     // used to hold the whole long-form loop -- windowing, segment splitting, the timestamp-aware seek,
@@ -518,6 +519,7 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // and does it for both front ends now.
     options.language = language_name;
     options.task = task_name;
+    options.target_language = target_language_name;
 
     const loom::audio::Transcription result =
         loom::audio::transcribe(session.bridge(), model, waveform, options);
@@ -548,6 +550,7 @@ int main(int argc, char** argv) {
     std::string wav_path;
     std::string language_name;
     std::string task_name;
+    std::string target_language_name;
     bool timestamps = false;
     bool condition_on_previous = true;
     std::string system_text;
@@ -600,6 +603,10 @@ int main(int argc, char** argv) {
             language_name = argv[++i];
         } else if (arg == "--task" && i + 1 < argc) {
             task_name = argv[++i];
+        } else if (arg == "--target-language" && i + 1 < argc) {
+            // The language to write, for a model that chooses it separately (Canary). Omitted, the
+            // model's own default applies.
+            target_language_name = argv[++i];
         } else if (arg == "--timestamps") {
             timestamps = true;
         } else if (arg == "--no-condition-on-previous") {
@@ -1187,7 +1194,7 @@ int main(int argc, char** argv) {
         }
 
         if (has_wav) {
-            run_asr(*model, backends, wav_path, language_name, task_name, timestamps,
+            run_asr(*model, backends, wav_path, language_name, task_name, target_language_name, timestamps,
                     condition_on_previous);
         }
     } catch (const loom::Error& e) {
