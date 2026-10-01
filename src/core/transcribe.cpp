@@ -67,7 +67,7 @@ void split_into_segments(const std::vector<int32_t>& ids, int32_t ts_base, doubl
 // cannot falls back to its own default -- the resolution order lives in the model's driver, which is the
 // only place that knows whether detection is possible at all.
 std::vector<int32_t> run_driver(LoomLuaBridge& bridge, const std::vector<double>& waveform,
-                                 int32_t language, int32_t task, bool timestamps,
+                                 int32_t language, int32_t task, int32_t target_language, bool timestamps,
                                  const std::vector<double>& prev_tokens,
                                  uint32_t max_new_tokens, int32_t eos_token) {
     std::unordered_map<std::string, LoomLuaBridge::Value> args = {
@@ -83,6 +83,7 @@ std::vector<int32_t> run_driver(LoomLuaBridge& bridge, const std::vector<double>
     // checkpoint can actually do.
     if (language >= 0) args["language"] = static_cast<double>(language);
     if (task >= 0) args["task"] = static_cast<double>(task);
+    if (target_language >= 0) args["target_language"] = static_cast<double>(target_language);
     if (timestamps) args["timestamps"] = 1.0;
 
     // Held in a named local before unpacking: `call` returns by value, so a reference bound straight
@@ -168,18 +169,24 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     // vocabulary carries every language token including English, and its English-only vocabulary
     // carries none of them, so the presence of the probe separates "wrong name" from "no choice here".
     //
-    // The FIRST condition is the decode path, and it is the one that generalises. A dynamic-length
-    // family (`clip == 0`) calls `infer` with the waveform and a length and NOTHING else, so no
-    // argument here can reach the model whatever its vocabulary happens to contain. That covers both
-    // tenants of that branch, for different reasons: the NeMo models have no prompt at all, and
-    // family 3 has one that was rendered from the checkpoint's chat template AT EXPORT TIME into the
-    // driver's own constants -- so it is equally out of reach of a run-time argument. Deciding on the vocabulary alone
-    // got this wrong in a way worth recording -- parakeet-tdt carries a literal `<|en|>` PIECE in its
-    // SentencePiece vocabulary, so a spelled probe reports it as language-selectable, and a caller
-    // passing `language="en"` would have been given neither a warning nor an effect.
+    // A DECLARED table is the file saying its driver reads the argument, on either decode path: the
+    // exporter writes one only for a driver that builds its prompt from it. Canary is the case that
+    // made this the first condition rather than the second -- a dynamic-length family (`clip == 0`)
+    // whose prompt carries a source and a target language.
+    //
+    // Without a table, the decode path decides. A dynamic-length family calls `infer` with the
+    // waveform and a length and nothing else unless it declared otherwise, so no argument can reach
+    // the model whatever its vocabulary happens to contain. That covers the two undeclared tenants of
+    // that branch, for different reasons: the NeMo CTC and transducer models have no prompt at all,
+    // and family 3 has one that was rendered from the checkpoint's chat template AT EXPORT TIME into
+    // the driver's own constants -- so it is equally out of reach of a run-time argument. Deciding on
+    // the vocabulary alone got this wrong in a way worth recording -- parakeet-tdt carries a literal
+    // `<|en|>` PIECE in its SentencePiece vocabulary, so a spelled probe reports it as
+    // language-selectable, and a caller passing `language="en"` would have been given neither a
+    // warning nor an effect.
     const auto offers = [&](const std::vector<std::string>& declared, const char* probe) {
-        if (clip == 0) return false;
         if (!declared.empty()) return true;
+        if (clip == 0) return false;
         return table.legacy_spelling && bpe_vocab && bpe_vocab->piece_to_id(probe) >= 0;
     };
     const bool selectable_language = offers(table.language_names, "<|en|>");
@@ -238,6 +245,24 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     const int32_t language_id = resolve(options.language, "language", /*is_task=*/false, selectable_language);
     const int32_t task_id = resolve(options.task, "task", /*is_task=*/true, selectable_task);
 
+    // The language to WRITE. No "ignored, with a warning" branch here, unlike `language`: naming an
+    // output language is always a request for output in it, and a model that cannot choose would hand
+    // back its own language looking like an answer.
+    int32_t target_language_id = -1;
+    if (!options.target_language.empty()) {
+        target_language_id = table.target_language(options.target_language);
+        if (target_language_id < 0) {
+            throw LoadError(
+                "transcribe: " + (table.target_language_names.empty()
+                    ? std::string("this model does not choose the language it writes, so "
+                                  "target_language=\"") + options.target_language +
+                          "\" cannot be honoured. (A model whose only translation is into English "
+                          "takes task=\"translate\".)"
+                    : std::string("this model has no target language named \"") + options.target_language +
+                          "\" -- `model.contract` lists the ones it declares."));
+        }
+    }
+
     // 16 kHz is what every ASR family exported so far takes, and is the only rate at which a file that
     // declares none can be interpreted at all -- the alternative is refusing to transcribe a model that
     // worked before the contract existed.
@@ -268,6 +293,11 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         if (chunk == 0) {
             args = {{"waveform", std::vector<double>(waveform.begin(), waveform.end())},
                     {"length", std::vector<double>{static_cast<double>(n_real)}}};
+            // Reached only for a file that declares the table (see `offers` above): every other
+            // dynamic-length file resolves both to -1 or refused them, so its call is unchanged.
+            if (language_id >= 0) args["language"] = static_cast<double>(language_id);
+            if (task_id >= 0) args["task"] = static_cast<double>(task_id);
+            if (target_language_id >= 0) args["target_language"] = static_cast<double>(target_language_id);
         } else {
             // `window_at` from seek 0 is the padding: `n_padded` samples, zero-filled past the audio.
             // The driver mirrors the tail of the real signal over the head of those zeros itself.
@@ -327,7 +357,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     while (seek < waveform.size()) {
         const size_t avail = std::min(static_cast<size_t>(clip), waveform.size() - seek);
         const std::vector<double> window = window_at(waveform, seek, clip);
-        const std::vector<int32_t> ids = run_driver(bridge, window, language_id, task_id,
+        const std::vector<int32_t> ids = run_driver(bridge, window, language_id, task_id, target_language_id,
                                                     want_timestamps, prev_tokens, max_new_tokens,
                                                     eos_id);
         const double window_start = static_cast<double>(seek) / rate;

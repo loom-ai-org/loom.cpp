@@ -100,6 +100,13 @@ int32_t AsrDecodeTable::task(const std::string& name) const {
     return -1;
 }
 
+int32_t AsrDecodeTable::target_language(const std::string& name) const {
+    for (size_t i = 0; i < target_language_names.size() && i < target_language_ids.size(); ++i) {
+        if (target_language_names[i] == name) return target_language_ids[i];
+    }
+    return -1;
+}
+
 AsrDecodeTable AsrDecodeTable::read(const GgufModel& model, const loom::BpeVocab* vocab,
                                     const ModelContract& contract) {
     AsrDecodeTable t;
@@ -110,6 +117,8 @@ AsrDecodeTable AsrDecodeTable::read(const GgufModel& model, const loom::BpeVocab
     t.language_ids = opt_arr_i32(model, "loom.asr.language_ids");
     t.task_names = opt_arr_str(model, "loom.asr.task_names");
     t.task_ids = opt_arr_i32(model, "loom.asr.task_ids");
+    t.target_language_names = opt_arr_str(model, "loom.asr.target_language_names");
+    t.target_language_ids = opt_arr_i32(model, "loom.asr.target_language_ids");
 
     const bool declares_timestamps = model.has_kv("loom.asr.timestamp_first_id");
     if (declares_timestamps) {
