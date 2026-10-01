@@ -49,6 +49,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
+| **Audio classification / embedding** | TitaNet-large (speaker embedding), MarbleNet frame VAD, ECAPA-TDNN VoxLingua107 (language id), pyannote segmentation-3.0 | `audio_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
@@ -1219,6 +1220,69 @@ different length. Free-running, the drift is 4.9e-02 max against the reference's
 5.4e-02. Whisper transcribes loom's output word for word through `loom_cli` and through loom-py's
 `text2speech`. It synthesises 4.2 s of audio in 3.8 s on the 2-core dev box.
 
+### Family 13: small audio classifiers and embedders
+
+Four leaves, one per output the contract had no word for (2026-10-01, the user's pick of all four
+before rc13): **TitaNet-large** (`nvidia/speakerverification_en_titanet_large`, CC-BY-4.0, a 192-d
+speaker embedding), **frame-VAD MarbleNet v2** (`nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`, NVIDIA
+Open Model License, 91.5K parameters, speech probability every 20 ms), **ECAPA-TDNN on VoxLingua107**
+(`speechbrain/lang-id-voxlingua107-ecapa`, Apache-2.0, 107 languages per clip) and **pyannote
+segmentation-3.0** (MIT, gated on the Hub, a 7-class POWERSET of three local speakers per 16.875 ms
+frame). Each is one GGUF, 0.5 MB to 90 MB.
+
+**The bill was the contract and the exporter, not the engine's primitives.** `class` meant "per input
+token", so the family needed `loom.output.granularity` (token/frame/clip), a frame rate and a frame
+offset, plus two engine doors that cut the driver's flat answer by them
+([ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)). No new ggml primitive:
+`POOL_1D` and `loom.run_bi_recurrent_and_retain` already existed.
+
+* **TitaNet and MarbleNet are Citrinet's encoder under two other heads.** `prepare_conv_asr_encoder_for_trace`
+  now checks the ENCODER's output against NeMo instead of the CTC log-probs, so all three heads share
+  it (Citrinet 5.5e-7 relative on the probe, TitaNet 7.5e-8, MarbleNet 0). MarbleNet's frames are cut
+  to `encoded_len` ([Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md)'s
+  extra frame again: 131 for 130). Its archive lacks the training loss's `weight` buffer, so it
+  restores non-strict, with the archive's keys compared so only `loss.*` may be missing.
+* **The attentive statistics pool**, which TitaNet and ECAPA share, tiles its global mean and std
+  over time with a live `.repeat` (the op [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md)
+  found lowering as an identity) and fills masked frames with `-inf`. It is rewritten once: a 1x1
+  convolution over `[x; mean; std]` is a frame term plus a time-constant one. That means no repeat and a
+  third of the work, with the mask kept live. TitaNet's mask is not cosmetic: NeMo counts
+  `floor(n/160)` of `floor(n/160) + 1` mel frames, and dropping it moves the embedding by 0.143
+  against an absmax of 0.077.
+* **ECAPA cost four exporter fixes**, each a silent wrong length or a wrong answer.
+  * `batch_norm` was missing from the shape walk. speechbrain's TDNN is conv → ReLU → norm, which
+    coremltools cannot fold, so every frame axis after it read as `n_samples`.
+  * A `loom_mean` with `keep_dims=False` interleaved the CONCAT after it
+    ([Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md)).
+  * A per-axis `amax` (the top-dB clamp) is spelled as the global max, which is the same number for one
+    clip.
+  * A length read as data (`length / waveform.shape[1]`) traced to `SHAPE` then `GET_ROWS` then
+    arithmetic, which aborts in the engine. ECAPA ships whole-clip only, which is speechbrain's own
+    `classify_batch` default.
+* **pyannote is EnCodec's shape with a bidirectional stack**: SincNet (sinc filters frozen to a
+  constant convolution) → four `run_bi_recurrent_and_retain` sweeps, nothing marshalled between them →
+  linear head. It needed a `max_pool` lowering to `POOL_1D` plus its walk case, a `BiRecurrentCall`
+  driver component, and the retained-read check taught that the bidirectional binding retains into its
+  forward cell.
+
+**Verified** against each reference's own forward, at several lengths that are not the 1 s trace
+length:
+
+| leaf | loom vs reference | reference f32 vs f64 | decisions |
+|---|---|---|---|
+| TitaNet | ≤ 3.9e-07 (cos 0.9999999+) | ≤ 3.6e-07 | same-speaker sim 0.805, different 0.006 |
+| MarbleNet | logit margin 8.8e-06 | 7.6e-06 | speech frames identical |
+| ECAPA | prob ≤ 1.9e-06 | — | top-2 identical at 5 lengths |
+| pyannote | ≤ 5.8e-05 | ≤ 5.9e-05 | argmax 100% of frames |
+
+MarbleNet looked 5x off at first. NeMo's `AudioPreprocessor` casts to float32 **even in a `.double()`
+model**, so that "f64" reference had an f32 front end. With the front end forced to f64, loom sits at
+the floor. The masks and the length plumbing are sabotage-checked: a padded clip with its true length
+moves TitaNet's embedding 1.7e-05, while counting the padding moves it 1.1e-02.
+
+`loom_cli --model <file> --wav <clip>` prints the embedding, the top five languages, or labelled time
+runs. loom-py's doors are `speech2class` and `speech2embeddings`.
+
 ### Text input
 
 **Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, Voxtral-4B-TTS and SpeechT5 take text.** Each encodes graphemes itself and each GGUF carries its own
@@ -1232,7 +1296,8 @@ limitation of those checkpoints, addressed by
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** the remaining TTS families → small classifiers → music. **Six are done** —
+**Next families:** the remaining TTS families → music. **Seven are done** — small audio classifiers
+and embedders (13, on four leaves, 2026-10-01: §2), 
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
 leaves: SenseVoice-Small and Paraformer-zh) — and family 9 is **complete at eight leaves** (the user dropped kugelaudio, tada, dots-tts and
@@ -1281,8 +1346,9 @@ already shipped an extra CTC frame in conformer-ctc-small
 Nemotron ASR, Silero VAD, Voxtral Mini realtime, Kitten TTS and Soprano TTS. Most of the ASR names
 look like existing templates — three NVIDIA checkpoints for the NeMo encoder template, Moonshine as an
 encoder-decoder — which is the kind of estimate families 4 and 5 corrected, so each is scoped against
-its checkpoint before it is costed. Silero VAD would be the zoo's first VAD and the first family-13
-classifier. The backlog has one line each with what to check first.
+its checkpoint before it is costed. Silero VAD was to be the zoo's first VAD and the first family-13
+classifier. Family 13's VAD shipped on MarbleNet instead; whether Silero publishes a traceable `nn.Module`
+(and not only TorchScript/ONNX) is still unchecked. The backlog has one line each with what to check first.
 
 **The constraint that decides what is exportable at all** is not the template — it is peak memory
 during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*, and P5.0
@@ -1309,7 +1375,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
