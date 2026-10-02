@@ -1278,6 +1278,7 @@ length:
 | ECAPA | prob ≤ 1.9e-06 | — | top-2 identical at 5 lengths |
 | pyannote | ≤ 5.8e-05 | ≤ 5.9e-05 | argmax 100% of frames |
 | Silero VAD | ≤ 1.6e-05 vs the streamed JIT; ≤ 6.1e-06 vs f64 | ≤ 1.0e-05 | speech frames identical, 9 clips |
+| WakeHuBERT (F32) | ≤ 3.4e-05 vs f64 (features up to 11.5) | ≤ 7.3e-06 | cosine 1.000000 every frame, 5 clips |
 
 MarbleNet looked 5x off at first. NeMo's `AudioPreprocessor` casts to float32 **even in a `.double()`
 model**, so that "f64" reference had an f32 front end. With the front end forced to f64, loom sits at
@@ -1303,6 +1304,43 @@ pyannote's shape with one direction -- a graph over every frame, the cell swept 
   ([Retro-071](../retros/retro-071-a-second-weight-file-in-the-package-was-another-model.md)).
 * The output is `[1 - p, p]` under MarbleNet's labels at 31.25 frames/s, so a host reads either VAD
   file the same way. 5.5 minutes of audio classify in 2.1 s on the 2-core dev box.
+
+**A sixth leaf, WakeHuBERT tiny (2026-10-03, the user's pick).** `TigreGotico/wakehubert-tiny`,
+Apache-2.0: a 0.64M-parameter causal student distilled from HuBERT-base for wake-word detection -- a
+log-mel front end whose DFT is a fixed convolution, a stride-2 stem, eight dilated depthwise-separable
+blocks and a 1x1 projection to 128 features per 20 ms frame. The checkpoint is a safetensors beside
+upstream's own plain-torch `student.py`, which the loader imports, so the network is not restated. One
+graph, nothing rewritten; coremltools folds the batch norms.
+
+* **It is the first `embeddings` output at `frame` granularity**, which ADR-062 had named and no door
+  answers. By the user's call it ships with the keys and no door: the card calls `infer` and cuts the
+  rows ([ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)'s amendment).
+* **Four precisions in ONE Hub repo** (the user's call, the first such repo): F32, F16, Q8_0, Q4_1 as
+  `wakehubert-tiny-<type>.gguf`, loaded by name (`from_pretrained(repo, filename)`; loom-py already
+  refused to choose). Per-frame cosine to the f64 reference on jfk.wav, mean / worst: F16 1.000000 /
+  0.999998, Q8_0 0.99992 / 0.99978 (upstream's int8 ONNX reports a mean of 0.9975), Q4_1 0.987 / 0.972
+  (Q4_0 measured 0.981 / 0.94 and was swapped out for Q4_1, the user's call).
+* **Speed against upstream's ONNX files** (`scripts/bench_wakehubert.py`; Ryzen 3 3250U, 2 cores, loom-py
+  `infer` vs onnxruntime 1.28.0 PyPI `run` from one Python, 7 launches per arm with a 1 s settle, mean of
+  per-launch medians). loom is **2.4-4x SLOWER than the int8 ONNX**, and quantizing buys loom no speed:
+
+  | clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 |
+  |---|---|---|---|---|---|---|
+  | 2.5 s, 1 | 19.3 ms | 32.0 | 18.8 | 19.2 | **6.8** | 7.0 |
+  | 2.5 s, 2 | 17.1 | 29.8 | 16.9 | 19.1 | **4.3** | 7.8 |
+  | 30 s, 1 | 244 | 359 | 246 | 242 | **147** | 137 |
+  | 30 s, 2 | 196 | 281 | 197 | 193 | **83** | 89 |
+
+  Accuracy runs the other way: per-frame cosine to the f64 reference, mean / worst, is ONNX int8 0.9970 /
+  0.987 against loom Q8_0's 0.99992 / 0.99978 (ONNX fp32 1.000000). Where loom's time goes (LOOM_PROFILE,
+  30 s, 1 thread, F32, 256 ms a call): ~14 ms is marshalling the lists; of the engine's 242 ms, the eight
+  dilated DEPTHWISE convolutions (IM2COL + batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1
+  convolutions 29%, the DFT convolution 15%, and the separate bias/residual ADDs and causal PADs 15%. A
+  short window pays a fixed per-call cost on top (17 ms at 2.5 s against ONNX's 4.3). F16 is slower than
+  F32 because its convolutions take the F16 im2col path (IM2COL 2.1x, CONV_2D 1.4x). The hub tracks it.
+* **Every precision keeps the DFT basis F32** (`keep_float`): F16 had packed it, which Q8_0's block
+  alignment never could, and came out worse than Q8_0
+  ([Retro-072](../retros/retro-072-f16-came-out-worse-than-q8-because-alignment-exempted-the-basis.md)).
 
 ### Family 2's second leaf: Moonshine Streaming
 
