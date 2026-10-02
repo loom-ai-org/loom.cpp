@@ -1773,6 +1773,11 @@ target_link_libraries(test_e2e_speecht5_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_speecht5_lua_driver COMMAND test_e2e_speecht5_lua_driver)
 set_tests_properties(test_e2e_speecht5_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
+add_executable(test_e2e_soprano_lua_driver gate/test_e2e_soprano_lua_driver.cpp)
+target_link_libraries(test_e2e_soprano_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_soprano_lua_driver COMMAND test_e2e_soprano_lua_driver)
+set_tests_properties(test_e2e_soprano_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_voxcpm2_lua_driver gate/test_e2e_voxcpm2_lua_driver.cpp)
 target_link_libraries(test_e2e_voxcpm2_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_voxcpm2_lua_driver COMMAND test_e2e_voxcpm2_lua_driver)
