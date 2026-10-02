@@ -19,30 +19,27 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **rc14 is HELD, and Canary's republish with it** (plus Silero VAD + Moonshine Streaming, and Soprano TTS, Kyutai STT 1B and LFM2.5-Audio, all built and MERGED 2026-10-02: loom.cpp #58/#59, loom-exporter #48/#49, loom-py #49/#50) | Merged 2026-10-02 and **unreleased**: Canary's long-form decode ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md); loom.cpp #56, loom-exporter #47, loom-py #48; loom-py `main` pins loom.cpp `main` as of #59's merge). **The user is adding more changes before rc14 (decided 2026-10-02): do not cut it, and do not republish Canary, until they say so.** When they do: cut rc14 exactly as rc13 was (VERSION bump PR in loom-py with `vendor/loom.cpp` at loom.cpp `main`, signed tag, GitHub release, PyPI verification of the four packages), then the [Canary republish item](#models) below. Anything else merged meanwhile that needs the wheels joins the same queue. |
 | **P5 breadth is the work now — remaining TTS, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11, 12 and 13 are complete (13 on four leaves, 2026-10-01) and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's first leaf, **SpeechT5, is published (rc12)**: the mel-frame AR loop cost no primitive and no engine change, only an exporter tokenizer mapping ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)) and two silent lowering defects ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)); 9b's other two (fastpitch, bananamind-tts) are **future work, deferred by the user 2026-10-01**, and the user picked **Canary and Citrinet** (below, under Models) as what comes first. Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
-**State anchor, 2026-10-01 — `1.0.0-rc13` is released and the Hub equals the staging tree.**
-Four packages on PyPI at `1.0.0rc13`, each one's newest (`loom-py-rt` 17 files, `-cuda` 2,
-`-vulkan` 2, `-metal` 1); the `linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI
-rejects that tag at upload (`wheels.yml` says so at the job). The signed tag `1.0.0-rc13` sits on
-loom-py `242e014` (the merge of loom-py #46), which pins loom.cpp `c43d17f`. rc13 carries Canary's
-support (a declared language table reaches a dynamic-length driver; the `target_language` role,
-[ADR-061](../adrs/adr-061-the-language-written-is-its-own-role.md)) and family 13's doors
-(`loom::audio::classify`/`embed`, loom-py `speech2class`/`speech2embeddings`, the
-`loom.output.granularity` contract, [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)).
-**Forty-five** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). The five
-added on rc13 as released, each a fresh export, card-gated on the RELEASED wheel (Canary 2 passed, family
-13 8 passed, with the new rows of loom-py #47), sha256- and README-verified, and run from the Hub through
-`from_pretrained`: `canary-1b-v2-loom`, `titanet-large-loom`, `marblenet-vad-v2-loom`,
-`ecapa-voxlingua107-loom` and `pyannote-segmentation-3.0-loom` (cards: loom-exporter #46). The pyannote
-copy is **gated** (`gated=auto`, switched on before its first upload; an anonymous download gets 401),
-as the original is. EnCodec and F5-TTS ship `cc-by-nc-4.0` and MarbleNet the NVIDIA Open Model License,
+**State anchor, 2026-10-02 — `1.0.0-rc14` is released and the Hub equals the staging tree.**
+Four packages on PyPI at `1.0.0rc14` (`loom-py-rt` 17 files, `-cuda` 2, `-vulkan` 2, `-metal` 1); the
+`linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI rejects that tag at upload
+(`wheels.yml` says so at the job). The signed tag `1.0.0-rc14` sits on loom-py `1ca8a42` (the merge of
+loom-py #51), which pins loom.cpp `70195f1`. rc14 carries Canary's long-form decode
+([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)), the
+SentencePiece dummy prefix ([ADR-065](../adrs/adr-065-a-converted-sentencepiece-bpe-declares-its-dummy-prefix.md)),
+`loom::PyRegex` + Soprano's vocabulary ([ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md))
+and the ring KV cache ([ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)).
+**Fifty-two** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). On rc14 as
+released, each a fresh export, card-gated on the RELEASED wheel (17 rows passed, 0 failed), sha256- (or
+git-blob-, for the voice files) and README-verified: `canary-1b-v2-loom` republished with its six
+long-form keys, and seven new -- `silero-vad-loom`, `moonshine-streaming-tiny-loom`,
+`moonshine-streaming-small-loom`, `soprano-1.1-80m-loom`, `kyutai-stt-1b-en-fr-loom`,
+`lfm2.5-audio-1.5b-asr-loom` and `lfm2.5-audio-1.5b-tts-loom` (with three voice files). Moonshine tiny,
+Silero and Soprano were also run from the Hub through `from_pretrained`. EnCodec and F5-TTS ship `cc-by-nc-4.0` and MarbleNet the NVIDIA Open Model License,
 and all three are **settled, not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
 
-**Held for rc14 (2026-10-02): Canary-1b-v2's republish** with its long-form keys -- the card it ships
-with says long audio needs rc14, so it waits for those wheels; the user is adding more before the
-release. What decides a publish is the standing rule, **WHEELS FIRST,
+What decides a publish is the standing rule, **WHEELS FIRST,
 ALWAYS**: a GGUF or a card that needs something the released wheels have not got waits for the
 release that carries it, because a file published before its wheel is a file nobody can run, and an
 option an older engine does not know can be dropped silently rather than refused (rc10's `run_ode`
@@ -116,24 +113,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md) for where families 4 and 5
   found the cost instead. Family 6 (translation encoder-decoders) inherits ADR-027's fairseq id
   handling for free.*
-* [ ] **Republish Canary-1b-v2 after rc14** with its long-form keys
-  ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)): fresh export
-  (`build_model_cards.py canary-1b-v2` into the staging tree), card gate on the RELEASED rc14 wheel from
-  a venv outside loom-py (`-k canary-1b-v2`; baseline 0.00), `upload_all.py --only canary-1b-v2`, then
-  sha256 + README + `from_pretrained` verification. Check the GGUF declares the six
-  `loom.asr.window_*`/`merge_*` keys before uploading. Optional but cheap: a long clip through the
-  released wheel (the ADR's LibriSpeech clips are rebuilt from `hf-internal-testing/librispeech_asr_dummy`,
-  speaker 1272, consecutive utterances; expected WER 0.055 / 0.091 / 0.036 at 79 / 161 / 304 s). rc13
-  ignores the keys, so the order is wheels first only because the card names the version.
-* [ ] **Publish Silero VAD and Moonshine Streaming tiny + small after rc14** (built 2026-10-02 for
-  rc14, [Epic-03](../epics/epic-03-model-coverage.md#family-2s-second-leaf-moonshine-streaming)):
-  `build_model_cards.py silero-vad` (piper) and `moonshine-streaming-tiny moonshine-streaming-small`
-  (**ovos** -- transformers 5) into the staging tree, card gate on the RELEASED rc14 wheel
-  (`-k "silero-vad or moonshine"`; Moonshine baselines 0.00), `upload_all.py`, then sha256 + README +
-  `from_pretrained` verification. Moonshine needs rc14 (its vocabulary's dummy prefix,
-  [ADR-065](../adrs/adr-065-a-converted-sentencepiece-bpe-declares-its-dummy-prefix.md)); Silero runs
-  on rc13's wheels and rides with it. Both Moonshine files must declare `tokenizer.ggml.add_space_prefix`
-  and `loom.samples_per_chunk = 80`.
 * [ ] **Moonshine's encoder attends through a full `T x T` mask of which 20 diagonals are live.** 81.9 s
   of audio is 4096 rows: 16.7M scores per head per layer, 27 s for tiny on the 2-core box. A banded
   attention (keys gathered at the 19 live offsets) is the same softmax over a fraction of the work;
@@ -141,17 +120,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
-* [ ] **Publish Soprano TTS, Kyutai STT 1B and LFM2.5-Audio (both doors) after rc14** (built
-  2026-10-02, [Epic-03](../epics/epic-03-model-coverage.md#1-context-and-scope)): cards `soprano-1.1-80m`,
-  `kyutai-stt-1b-en-fr`, `lfm2.5-audio-1.5b-asr`, `lfm2.5-audio-1.5b-tts` (with `voices/` from
-  `python -m loom_exporter.lfm25_audio_voices`, the three non-default voices), all piper. All need
-  rc14: Soprano's vocabulary ([ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)),
-  Kyutai's ring KV cache ([ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)),
-  and LFM2.5's are the first files the card gate passes on rc14's engine only. The exports need
-  references beside the exporter: `~/Dev/soprano`, `~/Dev/moshi` (Kyutai), and for the gate's oracles
-  liquid-audio in a Python >= 3.12 venv. **Decide the published precision first**: at F32 Kyutai
-  runs 5x slower than real time and LFM2.5's files are 5.2 and 5.5 GB on this box -- measure Q8_0 against
-  the gates before uploading. Card gate 9 rows passed 2026-10-02 (on the in-tree wheel).
+* [ ] **Kyutai STT and LFM2.5-Audio are published at F32** (rc14, 2026-10-02): at F32 Kyutai runs
+  about 5x slower than real time on the 2-core box and LFM2.5's two files are 5.2 and 5.5 GB. Measure
+  Q8_0 against each gate (`test_e2e_kyutai_stt_lua_driver`, `test_e2e_lfm25_audio_{asr,tts}_lua_driver`,
+  whose reference scripts are in `scripts/`) and republish if the transcripts and codes hold.
 * [ ] **LFM2.5-Audio's interleaved speech-to-speech door** (`generate_interleaved`, text and audio in a
   fixed 6:12 pattern, multi-turn chat) -- not requested; the TTS door's phases are all it needs, plus
   an audio-in prompt segment (the ASR door's encoder) and the interleave schedule in the driver.
