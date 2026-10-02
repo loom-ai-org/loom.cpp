@@ -839,6 +839,27 @@ set_tests_properties(test_cosyvoice3_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_cosyvoice3_vocab PROPERTIES FIXTURES_REQUIRED "cosyvoice3_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
 add_test(
+    NAME gen_soprano_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_soprano_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/soprano_vocab_test.gguf
+)
+set_tests_properties(gen_soprano_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_soprano_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP soprano_vocab_gguf_fixture)
+
+add_executable(test_soprano_vocab ci/test_soprano_vocab.cpp)
+target_link_libraries(test_soprano_vocab PRIVATE loom::engine)
+target_compile_definitions(test_soprano_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_soprano_vocab COMMAND test_soprano_vocab)
+set_tests_properties(test_soprano_vocab PROPERTIES LABELS ci)
+# It reads the CTC fixture too, for the "declines another family's file" arm.
+set_tests_properties(test_soprano_vocab PROPERTIES FIXTURES_REQUIRED "soprano_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
+
+add_executable(test_py_regex ci/test_py_regex.cpp)
+target_link_libraries(test_py_regex PRIVATE loom::engine)
+add_test(NAME test_py_regex COMMAND test_py_regex)
+set_tests_properties(test_py_regex PROPERTIES LABELS ci)
+
+add_test(
     NAME gen_voxcpm_vocab_gguf_fixture
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_voxcpm_vocab_gguf.py
             ${LOOM_FIXTURE_DIR}/voxcpm_vocab_test.gguf
