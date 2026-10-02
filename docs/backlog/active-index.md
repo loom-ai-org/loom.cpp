@@ -148,9 +148,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   * [ ] **Nemotron ASR** (NVIDIA) — expected NeMo-shaped; which checkpoint and head is to be decided.
   * [ ] **Voxtral Mini realtime** (Mistral, streaming ASR) — check its size first against the machine
     floor that blocks Voxtral-Mini-3B (below).
-  * [ ] **Kitten TTS** — check whether torch weights exist or only an ONNX release does; the
-    exporter's path is MIL from torch.
-  * [ ] **Soprano TTS** — architecture and licence not yet looked at.
+  * [ ] **Kitten TTS** — **picked next (2026-10-02).** Every HF release (`KittenML/kitten-tts-*`, nano
+    0.1/0.2/0.8, micro and mini 0.8) is ONNX + `voices.npz` only, and the exporter's path is MIL from
+    torch: find torch weights first (KittenML's own repo), or it is a decision about an ONNX path.
+  * [ ] **Soprano TTS** — **picked next (2026-10-02).** `ekwek/Soprano-1.1-80M`, Apache-2.0: a
+    transformers LM (`model.safetensors`) plus a separate `decoder.pth`; the reference's decode loop
+    and what the decoder consumes are the first things to read.
+  * [ ] **LFM2.5-Audio-1.5B** — **picked next (2026-10-02).** On disk; `Lfm2AudioForConditionalGeneration`
+    (audio encoder, LFM backbone, depthformer, audio detokenizer), licence `lfm1.0` as LFM2-350M's.
+    Speech-LLM ASR is family 3's shape; it also speaks, so which doors to export is the first question.
+  * [ ] **Kyutai STT 1B en-fr** — **picked next (2026-10-02).** On disk, CC-BY-4.0: a decoder-only
+    model over Mimi codes with delayed streams (moshi's), not an encoder-decoder; check the
+    transformers-native layout (`kyutai/stt-1b-en_fr-trfs`) before the moshi one.
   *Context: [Epic-03 §3](../epics/epic-03-model-coverage.md#3-roadmap)*
 * [ ] **`flan-t5-small`'s vocabulary is 32,100 pieces against a 32,128-wide logit row.** T5 pads its
   embedding to a multiple of 128, so an argmax could in principle name an id with no piece — untrained
