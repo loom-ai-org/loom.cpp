@@ -148,9 +148,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   * [ ] **Nemotron ASR** (NVIDIA) — expected NeMo-shaped; which checkpoint and head is to be decided.
   * [ ] **Voxtral Mini realtime** (Mistral, streaming ASR) — check its size first against the machine
     floor that blocks Voxtral-Mini-3B (below).
-  * [ ] **Kitten TTS** — **picked next (2026-10-02).** Every HF release (`KittenML/kitten-tts-*`, nano
-    0.1/0.2/0.8, micro and mini 0.8) is ONNX + `voices.npz` only, and the exporter's path is MIL from
-    torch: find torch weights first (KittenML's own repo), or it is a decision about an ONNX path.
   * [ ] **Soprano TTS** — **picked next (2026-10-02).** `ekwek/Soprano-1.1-80M`, Apache-2.0: a
     transformers LM (`model.safetensors`) plus a separate `decoder.pth`; the reference's decode loop
     and what the decoder consumes are the first things to read.
