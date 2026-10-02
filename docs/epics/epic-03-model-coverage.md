@@ -1407,8 +1407,9 @@ was answered by its wheel: a 40-line definition, with the weights read out of th
 "encoder-decoder, existing template" estimate held for the phases and missed the reference, which
 branches on an argument (ADR-064), and the tokenizer.
 
-**Requested, unscoped (2026-09-25), still open:** Cohere ASR, Nemotron ASR, Voxtral Mini realtime,
-Kitten TTS and Soprano TTS. Most of the ASR names look like existing templates — two NVIDIA
+**Requested, unscoped (2026-09-25), still open:** Cohere ASR, Nemotron ASR, Voxtral Mini realtime and
+Soprano TTS. **Kitten TTS is dropped** (the user, 2026-10-02): every release is ONNX-only, and the
+zoo takes a model only through a PyTorch checkpoint. Most of the ASR names look like existing templates — two NVIDIA
 checkpoints for the NeMo encoder template — which is the kind of estimate families 4 and 5 corrected,
 so each is scoped against its checkpoint before it is costed. The backlog has one line each with what
 to check first.
