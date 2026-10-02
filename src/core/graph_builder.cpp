@@ -186,8 +186,28 @@ GraphBuilder::GraphBuilder(const GraphTopology& topo, GgufModel& model, Backends
     key_ignores_n_past_ = buckets_kv_ && !topo_.mentions_symbol("n_past");
 }
 
-int64_t GraphBuilder::effective_n_kv(const DynamicAxes& axes) const {
+uint32_t GraphBuilder::ring_size() const {
+    return kv_cache_ != nullptr && kv_cache_->ring() ? kv_cache_->kv_size() : 0;
+}
+
+int64_t GraphBuilder::real_n_kv(const DynamicAxes& axes) const {
     const int64_t n_kv = requested_n_kv(axes);
+    if (kv_cache_ == nullptr || !kv_cache_->ring() || n_kv == 0) return n_kv;
+    // A RING holds the last `kv_size` positions (ADR-066), so a step past its capacity reads all of it.
+    // A call of several tokens that WRAPS cannot be served: its later rows would overwrite cells its
+    // earlier queries still attend to, since every row is written before any is read.
+    const auto capacity = static_cast<int64_t>(kv_cache_->kv_size());
+    if (n_kv > capacity && axes.count("n_tokens") && axes.at("n_tokens") > 1.0) {
+        throw SchemaError("GraphBuilder::build: " + std::to_string(std::llround(axes.at("n_tokens"))) +
+                           " tokens at n_past " + std::to_string(std::llround(axes.at("n_past"))) +
+                           " would wrap this model's " + std::to_string(capacity) +
+                           "-cell ring KV cache; past its capacity a ring takes one token per call");
+    }
+    return std::min(n_kv, capacity);
+}
+
+int64_t GraphBuilder::effective_n_kv(const DynamicAxes& axes) const {
+    const int64_t n_kv = real_n_kv(axes);
     if (!buckets_kv_ || n_kv == 0) return n_kv;
 
     const auto capacity = static_cast<int64_t>(kv_cache_->kv_size());
@@ -247,9 +267,10 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         // step's mask actually covers. Serving a previous step's `n_kv_real` back is a real bug, not a
         // stale statistic: it is what a caller sizes its mask placement by.
         if (kv_cells_ != nullptr) {
-            KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))));
+            KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))),
+                                     ring_size());
         }
-        cached_.n_kv_real = requested_n_kv(axes);
+        cached_.n_kv_real = real_n_kv(axes);
         ++reuses_;
         return cached_;
     }
@@ -287,7 +308,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     // What the caller asked for, against what the graph was built at -- the gap between them is the
     // padding a mask has to be placed into. Recorded on the result rather than on the builder because
     // it describes THIS build, and a caller holds the result.
-    result.n_kv_real = requested_n_kv(axes);
+    result.n_kv_real = real_n_kv(axes);
 
     // The declared inputs live in their OWN context and backend buffer, never in the gallocr pool
     // (BACKLOG.md P4.0.13 -- same seam as KvCache/ConvStateCache/OutputStore). gallocr skips any tensor
@@ -348,7 +369,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
                 throw Error("GraphBuilder::build: failed to allocate the backend buffer for the KV "
                             "cell-index tensor");
             }
-            KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))));
+            KvCache::fill_cell_index(kv_cells_, static_cast<uint32_t>(std::llround(axes.at("n_past"))),
+                                     ring_size());
         }
     }
 
