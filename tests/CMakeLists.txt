@@ -656,6 +656,23 @@ add_test(NAME test_tekken_vocab COMMAND test_tekken_vocab)
 set_tests_properties(test_tekken_vocab PROPERTIES LABELS ci)
 set_tests_properties(test_tekken_vocab PROPERTIES FIXTURES_REQUIRED tekken_vocab_gguf_fixture)
 
+# --- The SentencePiece-style BPE shape's dummy prefix (Moonshine Streaming): `add_space_prefix` prepends
+#     U+2581 per segment and the decoder strips one space; the same key on a byte-level shape is refused ---
+add_test(
+    NAME gen_spm_prefix_vocab_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_spm_prefix_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}
+)
+set_tests_properties(gen_spm_prefix_vocab_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_spm_prefix_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP spm_prefix_vocab_gguf_fixture)
+
+add_executable(test_spm_prefix_vocab ci/test_spm_prefix_vocab.cpp)
+target_link_libraries(test_spm_prefix_vocab PRIVATE loom::engine)
+target_compile_definitions(test_spm_prefix_vocab PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_spm_prefix_vocab COMMAND test_spm_prefix_vocab)
+set_tests_properties(test_spm_prefix_vocab PROPERTIES LABELS ci)
+set_tests_properties(test_spm_prefix_vocab PROPERTIES FIXTURES_REQUIRED spm_prefix_vocab_gguf_fixture)
+
 # --- P4.23: the added-token pre-pass and the chat template it exists for. Two files from one
 #     generator -- with and without `tokenizer.ggml.token_type` -- because the backward-compatibility
 #     claim (a pre-P4.23 GGUF tokenizes exactly as it did) is only a claim until both are compared.

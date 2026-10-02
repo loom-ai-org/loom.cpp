@@ -180,6 +180,10 @@ private:
     BpeShape shape_ = BpeShape::kQwenLlama3;
     size_t max_number_run_ = 1; // meaning is per-shape -- see BpeShape's own doc comment
     bool include_marks_ = false; // qwen35 only -- \p{M} attaches to the letter run / punct exclusion
+    // kSpmByteFallback only: `tokenizer.ggml.add_space_prefix`, HF's `Prepend("\u2581")` normalizer
+    // paired with a `Strip(" ", 1, 0)` decoder (Moonshine Streaming). Gemma 3's normalizer has no
+    // prefix, so its file carries no key and reads false.
+    bool add_space_prefix_ = false;
 };
 
 } // namespace loom
