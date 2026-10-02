@@ -1793,6 +1793,11 @@ target_link_libraries(test_e2e_kyutai_stt_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_kyutai_stt_lua_driver COMMAND test_e2e_kyutai_stt_lua_driver)
 set_tests_properties(test_e2e_kyutai_stt_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
+add_executable(test_e2e_lfm25_audio_asr_lua_driver gate/test_e2e_lfm25_audio_asr_lua_driver.cpp)
+target_link_libraries(test_e2e_lfm25_audio_asr_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_lfm25_audio_asr_lua_driver COMMAND test_e2e_lfm25_audio_asr_lua_driver)
+set_tests_properties(test_e2e_lfm25_audio_asr_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_soprano_lua_driver gate/test_e2e_soprano_lua_driver.cpp)
 target_link_libraries(test_e2e_soprano_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_soprano_lua_driver COMMAND test_e2e_soprano_lua_driver)
