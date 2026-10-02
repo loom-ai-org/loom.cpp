@@ -27,7 +27,15 @@ public:
     // n_embd_k / n_embd_v are the *flattened* per-token K/V widths (n_head_kv * n_embd_head_k/v, i.e.
     // what a token's K or V vector looks like collapsed across all KV heads) -- matches llama.cpp's
     // n_embd_k_gqa/n_embd_v_gqa naming. kv_size is the cache's total capacity in tokens (its "n_ctx").
-    KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend);
+    //
+    // `ring` makes the cache a RING of `kv_size` cells (ADR-066): position p is written to cell
+    // p % kv_size, and a step reads every written cell. That is exactly a sliding window of `kv_size`
+    // keys when every layer attends to the last `kv_size` positions and K is stored after RoPE --
+    // attention scores depend on the q-k rotation difference and softmax on no order, so which cell
+    // holds which position does not matter. It is the shape of Kyutai's `RingKVCache`, and what lets a
+    // streaming model run past any fixed capacity.
+    KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend,
+            bool ring = false);
 
     // Builds a ggml_set_rows node writing `k_cur`/`v_cur` (each shape [n_embd_k/v, n_tokens]) into this
     // layer's cache at the cells named by `cells` (an I64 [n_tokens] tensor -- see new_cell_index). The
@@ -47,10 +55,9 @@ public:
     // indices rewritten without being rebuilt, which is only true of memory the allocator never moves.
     static ggml_tensor* new_cell_index(ggml_context* ctx, uint32_t n_tokens);
 
-    // Fills an already-allocated `cells` with the contiguous append [n_past, n_past + n_tokens), the one
-    // pattern this single-sequence cache ever writes. A ring buffer or a multi-sequence scheduler would
-    // add a second filler here and change nothing else.
-    static void fill_cell_index(ggml_tensor* cells, uint32_t n_past);
+    // Fills an already-allocated `cells` with the contiguous append [n_past, n_past + n_tokens) -- or,
+    // for a ring (`ring_size` > 0), the same positions modulo `ring_size`.
+    static void fill_cell_index(ggml_tensor* cells, uint32_t n_past, uint32_t ring_size = 0);
 
     // Views over this layer's valid prefix [0, n_kv), shape [n_embd_k/v, n_kv].
     ggml_tensor* read_k(ggml_context* ctx, uint32_t layer, uint32_t n_kv) const;
@@ -66,6 +73,7 @@ public:
     uint32_t n_embd_k() const { return n_embd_k_; }
     uint32_t n_embd_v() const { return n_embd_v_; }
     uint32_t kv_size() const { return kv_size_; }
+    bool ring() const { return ring_; }
 
     // Zeroes the whole cache. Doesn't reset any "current length" bookkeeping -- that's the caller's
     // (Generator's) responsibility via its own n_past counter; KvCache itself is a dumb storage/view
@@ -83,6 +91,7 @@ private:
     uint32_t n_embd_k_;
     uint32_t n_embd_v_;
     uint32_t kv_size_;
+    bool ring_ = false;
 };
 
 class GgufModel;

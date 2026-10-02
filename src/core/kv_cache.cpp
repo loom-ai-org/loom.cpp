@@ -10,8 +10,9 @@
 
 namespace loom {
 
-KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend)
-    : n_embd_k_(n_embd_k), n_embd_v_(n_embd_v), kv_size_(kv_size) {
+KvCache::KvCache(uint32_t n_layer, uint32_t n_embd_k, uint32_t n_embd_v, uint32_t kv_size, ggml_backend_t backend,
+                 bool ring)
+    : n_embd_k_(n_embd_k), n_embd_v_(n_embd_v), kv_size_(kv_size), ring_(ring) {
     const size_t mem_size = static_cast<size_t>(n_layer) * 2 * ggml_tensor_overhead() + 4096;
     store_ctx_.reset(ggml_init(ggml_init_params{mem_size, nullptr, /*no_alloc=*/true}));
     if (!store_ctx_) {
@@ -57,10 +58,13 @@ ggml_tensor* KvCache::new_cell_index(ggml_context* ctx, uint32_t n_tokens) {
     return cells;
 }
 
-void KvCache::fill_cell_index(ggml_tensor* cells, uint32_t n_past) {
+void KvCache::fill_cell_index(ggml_tensor* cells, uint32_t n_past, uint32_t ring_size) {
     const auto n_tokens = static_cast<size_t>(cells->ne[0]);
     std::vector<int64_t> idx(n_tokens);
-    for (size_t i = 0; i < n_tokens; ++i) idx[i] = static_cast<int64_t>(n_past) + static_cast<int64_t>(i);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        idx[i] = static_cast<int64_t>(n_past) + static_cast<int64_t>(i);
+        if (ring_size > 0) idx[i] %= static_cast<int64_t>(ring_size);
+    }
     ggml_backend_tensor_set(cells, idx.data(), 0, idx.size() * sizeof(int64_t));
 }
 
@@ -121,7 +125,9 @@ std::unique_ptr<KvCache> make_kv_cache(const GgufModel& model, Backends backends
     if (kv_size == 0) {
         throw LoadError("make_kv_cache: 'loom.kv_cache_size' is 0, so no token could ever be cached");
     }
-    return std::make_unique<KvCache>(n_layer, n_embd_k, n_embd_v, kv_size, backend);
+    // Absent in every file written before ADR-066, which is a linear cache.
+    const bool ring = model.kv_bool("loom.kv_cache_ring", false);
+    return std::make_unique<KvCache>(n_layer, n_embd_k, n_embd_v, kv_size, backend, ring);
 }
 
 } // namespace loom

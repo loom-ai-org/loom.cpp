@@ -854,6 +854,21 @@ set_tests_properties(test_soprano_vocab PROPERTIES LABELS ci)
 # It reads the CTC fixture too, for the "declines another family's file" arm.
 set_tests_properties(test_soprano_vocab PROPERTIES FIXTURES_REQUIRED "soprano_vocab_gguf_fixture;ctc_vocab_gguf_fixture")
 
+add_test(
+    NAME gen_ring_kv_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_ring_kv_gguf.py
+            ${LOOM_FIXTURE_DIR}/ring_kv_test.gguf
+)
+set_tests_properties(gen_ring_kv_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_ring_kv_gguf_fixture PROPERTIES FIXTURES_SETUP ring_kv_gguf_fixture)
+
+add_executable(test_ring_kv_cache ci/test_ring_kv_cache.cpp)
+target_link_libraries(test_ring_kv_cache PRIVATE loom::engine)
+target_compile_definitions(test_ring_kv_cache PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_ring_kv_cache COMMAND test_ring_kv_cache)
+set_tests_properties(test_ring_kv_cache PROPERTIES LABELS ci)
+set_tests_properties(test_ring_kv_cache PROPERTIES FIXTURES_REQUIRED ring_kv_gguf_fixture)
+
 add_executable(test_py_regex ci/test_py_regex.cpp)
 target_link_libraries(test_py_regex PRIVATE loom::engine)
 add_test(NAME test_py_regex COMMAND test_py_regex)
@@ -1772,6 +1787,11 @@ add_executable(test_e2e_speecht5_lua_driver gate/test_e2e_speecht5_lua_driver.cp
 target_link_libraries(test_e2e_speecht5_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_speecht5_lua_driver COMMAND test_e2e_speecht5_lua_driver)
 set_tests_properties(test_e2e_speecht5_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
+
+add_executable(test_e2e_kyutai_stt_lua_driver gate/test_e2e_kyutai_stt_lua_driver.cpp)
+target_link_libraries(test_e2e_kyutai_stt_lua_driver PRIVATE loom::engine)
+add_test(NAME test_e2e_kyutai_stt_lua_driver COMMAND test_e2e_kyutai_stt_lua_driver)
+set_tests_properties(test_e2e_kyutai_stt_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
 add_executable(test_e2e_soprano_lua_driver gate/test_e2e_soprano_lua_driver.cpp)
 target_link_libraries(test_e2e_soprano_lua_driver PRIVATE loom::engine)
