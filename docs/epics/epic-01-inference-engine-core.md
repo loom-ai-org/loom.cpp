@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-09-12
+last_updated: 2026-10-02
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -79,12 +79,15 @@ straight back ([Retro-045](../retros/retro-045-the-allocator-handed-the-same-add
 These are deliberate boundaries, not defects. Each names what would have to change.
 
 
-- **`KvCache` is single-sequence.** No ring buffer, no multi-stream/multi-sequence support. The
+- **`KvCache` is single-sequence.** No multi-stream/multi-sequence support. A RING is the one second
+  addressing policy (`loom.kv_cache_ring`, since 2026-10-02): position p in cell `p % kv_size`, which
+  is a sliding window exactly when every cached layer has the same one
+  ([ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md), Kyutai STT). The
   `ggml_set_rows` index-tensor indirection this entry used to list alongside them **exists since
   P4.0.15** — writes are addressed by a cell-index tensor, and `KvCache::fill_cell_index` is the single
-  place a second addressing policy would go. What is still missing is a *policy* that uses it: only the
-  contiguous append `[n_past, n_past + n_tokens)` is ever written, reads are still a plain view over
-  `[0, n_kv)`, and there is one `kv_size` for every layer. **A model needing two independent sequences
+  place an addressing policy goes -- the ring is the second. Otherwise only the contiguous append
+  `[n_past, n_past + n_tokens)` is written, reads are a plain view over `[0, n_kv)`, and there is one
+  `kv_size` for every layer. **A model needing two independent sequences
   gets two CACHES**, which is how family 10's classifier-free guidance runs (a topology declaring
   `kv_cache_scope: "private"`, [ADR-023](../adrs/adr-023-a-second-stream-is-declared-not-derived.md)) --
   that is a workaround at the allocation level, not multi-sequence support, and it costs a full cache

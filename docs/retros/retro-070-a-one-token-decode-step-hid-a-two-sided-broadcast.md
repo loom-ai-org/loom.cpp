@@ -56,3 +56,12 @@ teacher-forced logits pass -- the whole reference sequence as ONE decoder call, 
 script loaded beside the driver -- is the cheapest call that widens it, and it is also the tensor
 oracle that matching token ids never replaces. One probe answers both. And a broadcast in a wrapper
 should be read for which side is wide: if both can be, write it as a matmul.
+
+## Recurrence (2026-10-02, the same day): Kyutai STT's RMSNorm
+
+The takeaway was followed and caught it again. Kyutai STT's LM steps one token per audio frame, so its
+re-spelled RMSNorm, `x * (alpha * rsqrt(mean(x^2)))` -- `[dim]` against `[1, n, 1]` -- passed every
+transcript; the 40-token teacher-forced prefill aborted on `MUL: a=[2048,1,1,1] b=[1,40,1,1]`. One new
+detail for the rule above: **`expand_as` is not a fix**, because MIL folds a broadcast away and the
+two-sided MUL comes back. `rsqrt(...) + x * 0` carries x's shape by arithmetic (exact for finite x) and
+each multiply then broadcasts one operand. `kyutai_stt_export._RMSNorm`; the gate's prefill arm keeps it.
