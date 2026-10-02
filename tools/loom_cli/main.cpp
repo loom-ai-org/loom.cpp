@@ -505,7 +505,12 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
     // and a worse transcript for no reason but where the code sat. What is left here is what a CLI
     // actually owns: turning `--language en` into an id, and printing.
-    const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
+    // The rate the model declares (Kyutai STT's Mimi takes 24 kHz), else the 16 kHz every ASR family
+    // before it took and a file exported before the contract carried a rate has to be read at.
+    const uint32_t asr_rate = loom::ModelContract::read(model).sample_rate;
+    const std::vector<float> waveform = asr_rate && asr_rate != 16000
+        ? loom_cli::load_wav_pcm16_mono(wav_path, asr_rate)
+        : loom_cli::load_wav_pcm16_mono_16k(wav_path);
 
     // Registering the topologies and attaching the caches they declare is the engine's now too
     // (loom/core/session.h). The copy that used to be here attached a KvCache and no ConvStateCache,
