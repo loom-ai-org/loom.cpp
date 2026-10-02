@@ -981,6 +981,24 @@ int main(int argc, char** argv) {
                               rate_override(extra_inputs), synth_seed);
         }
 
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "soprano") {
+            // Soprano: text in, audio out. The vocabulary runs the reference's English normaliser and
+            // sentence split, so each sentence is printed as the model will be asked to say it -- one
+            // generation each, which the driver runs in turn.
+            auto vocab = loom::SopranoVocab::load(*model);
+            std::printf("  tokenizer: character BPE (soprano), %zu tokens\n", vocab->size());
+            if (!has_prompt) return 0;
+            const auto sentences = vocab->sentences(prompt_text);
+            for (size_t i = 0; i < sentences.size(); ++i) {
+                std::printf("  sentence %zu: \"%s\"\n", i + 1, sentences[i].c_str());
+            }
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
         if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "cosyvoice3") {
             // CosyVoice3: text in, the file's default voice (or `--voice`, a cloned one), audio out. The
             // vocabulary runs the reference's text normalisation -- numbers spelled out, the paragraph
