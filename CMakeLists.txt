@@ -48,6 +48,8 @@ add_library(loom_engine
     src/core/f5_vocab.cpp
     src/core/chatterbox_vocab.cpp
     src/core/pocket_tts_vocab.cpp
+    src/core/py_regex.cpp
+    src/core/soprano_vocab.cpp
     src/core/voxcpm_vocab.cpp
     src/core/cosyvoice3_vocab.cpp
     src/core/voice_file.cpp

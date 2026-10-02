@@ -334,6 +334,9 @@ private:
     // up to kKvBucket and capped at the cache's capacity. Returns 0 when this call binds no n_kv at all
     // (an uncached topology's axes need not mention it). Throws if the request is past capacity.
     int64_t effective_n_kv(const DynamicAxes& axes) const;
+    // The KV length this call really covers: what the axes ask for, capped at a ring cache's capacity.
+    int64_t real_n_kv(const DynamicAxes& axes) const;
+    uint32_t ring_size() const;
 };
 
 } // namespace loom

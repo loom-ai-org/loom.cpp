@@ -44,10 +44,13 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
 | **ASR — encoder-decoder** | Whisper-small, Moonshine Streaming tiny and small | `whisper_export.py`, `moonshine_export.py` |
-| **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
+| **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B, LFM2.5-Audio-1.5B (speech to text; the first hybrid conv/attention LM in the family) | `speech_lm_export.py`, `lfm25_audio_export.py` |
+| **ASR — streaming decoder over codec codes** | Kyutai STT 1B en-fr (run as Kyutai's `moshi` runs it, [ADR-068](../adrs/adr-068-kyutai-stt-follows-moshi-not-the-transformers-port.md); a ring KV cache, [ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)) | `kyutai_stt_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
+| **TTS — LM hidden rows + Vocos** | Soprano-1.1-80M (text front end: the reference's regexes run by `loom::PyRegex`, [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)) | `soprano_export.py` |
+| **TTS — LM + depthformer codes + LFM2 detokenizer** | LFM2.5-Audio-1.5B (text to speech, four voices as voice files) | `lfm25_audio_export.py`, `lfm25_audio_voices.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
 | **Audio classification / embedding** | TitaNet-large (speaker embedding), MarbleNet frame VAD, Silero VAD v6, ECAPA-TDNN VoxLingua107 (language id), pyannote segmentation-3.0 | `audio_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
@@ -1407,8 +1410,21 @@ was answered by its wheel: a 40-line definition, with the weights read out of th
 "encoder-decoder, existing template" estimate held for the phases and missed the reference, which
 branches on an argument (ADR-064), and the tokenizer.
 
-**Requested, unscoped (2026-09-25), still open:** Cohere ASR, Nemotron ASR, Voxtral Mini realtime and
-Soprano TTS. **Kitten TTS is dropped** (the user, 2026-10-02): every release is ONNX-only, and the
+**Soprano TTS, Kyutai STT 1B and LFM2.5-Audio, the next three of the requested list, were built
+2026-10-02** (§2). Each estimate held for its phases and missed elsewhere. Soprano was "an LM and a
+vocoder" and was: its bill was a text front end of ~45 Python regexes, shipped as the reference's own
+pattern strings for a new matcher ([ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)).
+Kyutai STT was "moshi-shaped, check the transformers layout first", and checking it found the port
+diverges from Kyutai's own inference in two places; the user chose moshi
+([ADR-068](../adrs/adr-068-kyutai-stt-follows-moshi-not-the-transformers-port.md)), which needed a ring
+KV cache for its 750-position window over unbounded audio
+([ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)). LFM2.5-Audio was "family 3
+for ASR" and was, with NeMo's own encoder modules (its 692 conformer tensors load into NeMo's class) and
+one off-by-one frame the reference adds; its speaking door (the user's "ASR first, then TTS") cost a
+re-spelled depthformer and detokenizer and voices as files of system-prompt ids.
+
+**Requested, unscoped (2026-09-25), still open:** Cohere ASR, Nemotron ASR and Voxtral Mini realtime.
+**Kitten TTS is dropped** (the user, 2026-10-02): every release is ONNX-only, and the
 zoo takes a model only through a PyTorch checkpoint. Most of the ASR names look like existing templates — two NVIDIA
 checkpoints for the NeMo encoder template — which is the kind of estimate families 4 and 5 corrected,
 so each is scoped against its checkpoint before it is costed. The backlog has one line each with what

@@ -505,7 +505,12 @@ void run_asr(loom::GgufModel& model, loom::Backends backends, const std::string&
     // prev_tokens conditioning -- and loom-py could not reach any of it, so its users got fixed cuts
     // and a worse transcript for no reason but where the code sat. What is left here is what a CLI
     // actually owns: turning `--language en` into an id, and printing.
-    const std::vector<float> waveform = loom_cli::load_wav_pcm16_mono_16k(wav_path);
+    // The rate the model declares (Kyutai STT's Mimi takes 24 kHz), else the 16 kHz every ASR family
+    // before it took and a file exported before the contract carried a rate has to be read at.
+    const uint32_t asr_rate = loom::ModelContract::read(model).sample_rate;
+    const std::vector<float> waveform = asr_rate && asr_rate != 16000
+        ? loom_cli::load_wav_pcm16_mono(wav_path, asr_rate)
+        : loom_cli::load_wav_pcm16_mono_16k(wav_path);
 
     // Registering the topologies and attaching the caches they declare is the engine's now too
     // (loom/core/session.h). The copy that used to be here attached a KvCache and no ConvStateCache,
@@ -973,6 +978,24 @@ int main(int argc, char** argv) {
                 const std::string prepared = vocab->prepare(chunks[i], &n_words);
                 std::printf("  chunk %zu (%zu word%s): \"%s\"\n", i + 1, n_words, n_words == 1 ? "" : "s",
                             prepared.c_str());
+            }
+            const auto ids = vocab->encode(prompt_text);
+            std::printf("  %zu id(s)\n", ids.size());
+            if (out_wav.empty()) return 0;
+            return synthesize(*model, backends, ids, "tokens", extra_inputs, out_wav,
+                              rate_override(extra_inputs), synth_seed);
+        }
+
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "soprano") {
+            // Soprano: text in, audio out. The vocabulary runs the reference's English normaliser and
+            // sentence split, so each sentence is printed as the model will be asked to say it -- one
+            // generation each, which the driver runs in turn.
+            auto vocab = loom::SopranoVocab::load(*model);
+            std::printf("  tokenizer: character BPE (soprano), %zu tokens\n", vocab->size());
+            if (!has_prompt) return 0;
+            const auto sentences = vocab->sentences(prompt_text);
+            for (size_t i = 0; i < sentences.size(); ++i) {
+                std::printf("  sentence %zu: \"%s\"\n", i + 1, sentences[i].c_str());
             }
             const auto ids = vocab->encode(prompt_text);
             std::printf("  %zu id(s)\n", ids.size());
