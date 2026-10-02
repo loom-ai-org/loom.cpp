@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **rc14 is HELD, and Canary's republish with it** | Merged 2026-10-02 and **unreleased**: Canary's long-form decode ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md); loom.cpp #56, loom-exporter #47, loom-py #48 -- loom-py `main` pins loom.cpp `6902cdf`). **The user is adding more changes before rc14 (decided 2026-10-02): do not cut it, and do not republish Canary, until they say so.** When they do: cut rc14 exactly as rc13 was (VERSION bump PR in loom-py with `vendor/loom.cpp` at loom.cpp `main`, signed tag, GitHub release, PyPI verification of the four packages), then the [Canary republish item](#models) below. Anything else merged meanwhile that needs the wheels joins the same queue. |
+| **rc14 is HELD, and Canary's republish with it** (plus Silero VAD + Moonshine Streaming, built 2026-10-02) | Merged 2026-10-02 and **unreleased**: Canary's long-form decode ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md); loom.cpp #56, loom-exporter #47, loom-py #48 -- loom-py `main` pins loom.cpp `6902cdf`). **The user is adding more changes before rc14 (decided 2026-10-02): do not cut it, and do not republish Canary, until they say so.** When they do: cut rc14 exactly as rc13 was (VERSION bump PR in loom-py with `vendor/loom.cpp` at loom.cpp `main`, signed tag, GitHub release, PyPI verification of the four packages), then the [Canary republish item](#models) below. Anything else merged meanwhile that needs the wheels joins the same queue. |
 | **P5 breadth is the work now — remaining TTS, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11, 12 and 13 are complete (13 on four leaves, 2026-10-01) and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's first leaf, **SpeechT5, is published (rc12)**: the mel-frame AR loop cost no primitive and no engine change, only an exporter tokenizer mapping ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)) and two silent lowering defects ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)); 9b's other two (fastpitch, bananamind-tts) are **future work, deferred by the user 2026-10-01**, and the user picked **Canary and Citrinet** (below, under Models) as what comes first. Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-10-01 — `1.0.0-rc13` is released and the Hub equals the staging tree.**
@@ -125,6 +125,19 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   released wheel (the ADR's LibriSpeech clips are rebuilt from `hf-internal-testing/librispeech_asr_dummy`,
   speaker 1272, consecutive utterances; expected WER 0.055 / 0.091 / 0.036 at 79 / 161 / 304 s). rc13
   ignores the keys, so the order is wheels first only because the card names the version.
+* [ ] **Publish Silero VAD and Moonshine Streaming tiny + small after rc14** (built 2026-10-02 for
+  rc14, [Epic-03](../epics/epic-03-model-coverage.md#family-2s-second-leaf-moonshine-streaming)):
+  `build_model_cards.py silero-vad` (piper) and `moonshine-streaming-tiny moonshine-streaming-small`
+  (**ovos** -- transformers 5) into the staging tree, card gate on the RELEASED rc14 wheel
+  (`-k "silero-vad or moonshine"`; Moonshine baselines 0.00), `upload_all.py`, then sha256 + README +
+  `from_pretrained` verification. Moonshine needs rc14 (its vocabulary's dummy prefix,
+  [ADR-065](../adrs/adr-065-a-converted-sentencepiece-bpe-declares-its-dummy-prefix.md)); Silero runs
+  on rc13's wheels and rides with it. Both Moonshine files must declare `tokenizer.ggml.add_space_prefix`
+  and `loom.samples_per_chunk = 80`.
+* [ ] **Moonshine's encoder attends through a full `T x T` mask of which 20 diagonals are live.** 81.9 s
+  of audio is 4096 rows: 16.7M scores per head per layer, 27 s for tiny on the 2-core box. A banded
+  attention (keys gathered at the 19 live offsets) is the same softmax over a fraction of the work;
+  measure it on the Pi before scoping, as P4.25-style ideas have measured out before.
 * [ ] **`log_softmax` lowers as `log(softmax(x))`** (coremltools' torch frontend), which is -inf below
   about -103 in f32. Canary's head stops before it; the CTC heads still carry it. Harmless for an argmax,
   wrong as a tensor. A stable form needs a row max the engine has no primitive for.
@@ -132,10 +145,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   them yet). None has been checked against its checkpoint; the template guesses are where scoping
   starts, not what it will find.
   * [ ] **Cohere ASR** — architecture and licence not yet looked at.
-  * [ ] **Moonshine tiny and small** (Useful Sensors, ASR) — encoder-decoder over the raw waveform.
   * [ ] **Nemotron ASR** (NVIDIA) — expected NeMo-shaped; which checkpoint and head is to be decided.
-  * [ ] **Silero VAD** — a second VAD beside MarbleNet (family 13), with a recurrent layer. Check
-    whether a torch module exists or only JIT/ONNX releases do.
   * [ ] **Voxtral Mini realtime** (Mistral, streaming ASR) — check its size first against the machine
     floor that blocks Voxtral-Mini-3B (below).
   * [ ] **Kitten TTS** — check whether torch weights exist or only an ONNX release does; the
