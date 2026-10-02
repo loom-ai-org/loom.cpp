@@ -406,6 +406,10 @@ const std::unordered_map<std::string, PreSpec>& pre_spec_table() {
         // output, so the collision means the same behaviour rather than a coincidence of names).
         {"granite-embed-multi-311m", {BpeShape::kSpmByteFallback, 0}},
         {"granite-embed-multi-97m", {BpeShape::kSpmByteFallback, 0}},
+        // The same shape under a name of its own, for a SentencePiece-converted `tokenizer.json` whose
+        // llama.cpp chkhsh is in no table (Moonshine Streaming's): llama.cpp reads such a file as an
+        // SPM vocabulary, not as a BPE `pre`, so it has no name there to borrow.
+        {"spm-byte-fallback", {BpeShape::kSpmByteFallback, 0}},
         {"qwen2", {BpeShape::kQwenLlama3, 1}},
         // Tekken (Mistral): case-transition letter runs, single digits, no NFC, no added-token split.
         {"tekken", {BpeShape::kTekken, 1}},
@@ -506,6 +510,13 @@ std::unique_ptr<BpeVocab> BpeVocab::load_bpe(const GgufModel& model) {
     vocab->include_marks_ = spec_it->second.include_marks;
     vocab->add_bos_token_ = model.kv_bool("tokenizer.ggml.add_bos_token", false);
     vocab->add_sep_token_ = model.kv_bool("tokenizer.ggml.add_sep_token", false);
+    vocab->add_space_prefix_ = model.kv_bool("tokenizer.ggml.add_space_prefix", false);
+    if (vocab->add_space_prefix_ && vocab->shape_ != BpeShape::kSpmByteFallback) {
+        // A byte-level vocabulary spells a space as a byte, not as U+2581; a prefix it does not
+        // implement would be dropped silently rather than refused.
+        throw LoadError("BpeVocab::load: tokenizer.ggml.add_space_prefix is set on the '" + pre_type +
+                         "' shape, and only the SentencePiece-style shape implements it");
+    }
     vocab->tokens_ = model.kv_arr_str("tokenizer.ggml.tokens");
     vocab->token_to_id_.reserve(vocab->tokens_.size());
     for (size_t i = 0; i < vocab->tokens_.size(); ++i) {
@@ -745,9 +756,11 @@ void BpeVocab::encode_segment(const std::string& text, std::vector<int32_t>& ids
     // Replace(" ", "\u2581") and nothing else, so composing decomposed sequences here would tokenize
     // differently from the reference model on exactly the inputs where it matters.
     // Tekken is skipped for the same reason: tiktoken encodes the string it is given.
-    const std::string normalized = shape_ == BpeShape::kSpmByteFallback ? spm_normalize(text)
-                                   : shape_ == BpeShape::kTekken       ? text
-                                                                        : nfc_normalize(text);
+    // `Prepend` runs per segment because HF normalizes each stretch between added tokens on its own.
+    const std::string normalized = shape_ == BpeShape::kSpmByteFallback
+                                       ? (add_space_prefix_ ? kSpmSpace : "") + spm_normalize(text)
+                                   : shape_ == BpeShape::kTekken ? text
+                                                                 : nfc_normalize(text);
     const std::vector<std::string> chunks = pretokenize(normalized);
     const auto& enc = byte_encoder();
 
@@ -815,6 +828,9 @@ std::string BpeVocab::decode(const std::vector<int32_t>& ids) const {
                 }
             }
         }
+        // The `Strip(" ", 1, 0)` decoder, after `Fuse`: at most one leading space off the whole text,
+        // the one the prefix put there.
+        if (add_space_prefix_ && !out.empty() && out.front() == ' ') out.erase(0, 1);
         return out;
     }
     const auto& dec = byte_decoder();

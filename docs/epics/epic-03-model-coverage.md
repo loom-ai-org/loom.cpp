@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-01
+last_updated: 2026-10-02
 ---
 
 # Epic-03: Model Coverage
@@ -43,13 +43,13 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
-| **ASR — encoder-decoder** | Whisper-small | `multi_phase_export.py` |
+| **ASR — encoder-decoder** | Whisper-small, Moonshine Streaming tiny and small | `whisper_export.py`, `moonshine_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B | `speech_lm_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **Token classification** | any HF `*ForTokenClassification` (BERT-NER, DistilBERT-NER) | `token_classification_export.py` |
-| **Audio classification / embedding** | TitaNet-large (speaker embedding), MarbleNet frame VAD, ECAPA-TDNN VoxLingua107 (language id), pyannote segmentation-3.0 | `audio_classification_export.py` |
+| **Audio classification / embedding** | TitaNet-large (speaker embedding), MarbleNet frame VAD, Silero VAD v6, ECAPA-TDNN VoxLingua107 (language id), pyannote segmentation-3.0 | `audio_classification_export.py` |
 | **Audio codec (decode)** | DAC-44kHz, SNAC-24kHz | `audio_codec_export.py` |
 | **Audio codec + recurrence** | EnCodec-32kHz | `encodec_export.py` |
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
@@ -1274,6 +1274,7 @@ length:
 | MarbleNet | logit margin 8.8e-06 | 7.6e-06 | speech frames identical |
 | ECAPA | prob ≤ 1.9e-06 | — | top-2 identical at 5 lengths |
 | pyannote | ≤ 5.8e-05 | ≤ 5.9e-05 | argmax 100% of frames |
+| Silero VAD | ≤ 1.6e-05 vs the streamed JIT; ≤ 6.1e-06 vs f64 | ≤ 1.0e-05 | speech frames identical, 9 clips |
 
 MarbleNet looked 5x off at first. NeMo's `AudioPreprocessor` casts to float32 **even in a `.double()`
 model**, so that "f64" reference had an f32 front end. With the front end forced to f64, loom sits at
@@ -1282,6 +1283,62 @@ moves TitaNet's embedding 1.7e-05, while counting the padding moves it 1.1e-02.
 
 `loom_cli --model <file> --wav <clip>` prints the embedding, the top five languages, or labelled time
 runs. loom-py's doors are `speech2class` and `speech2embeddings`.
+
+**A fifth leaf, Silero VAD v6 (2026-10-02, the user's pick before rc14).** `silero-vad` 6.2.3's 16 kHz
+model, MIT: per 32 ms frame (512 samples plus 64 of the previous frame's), a 256-point STFT done as a
+convolution, four 3-tap convolutions over its four columns, an `LSTMCell` carried across frames, a 1x1
+convolution and a sigmoid. Upstream streams it one frame per call; the export runs a whole clip as
+pyannote's shape with one direction -- a graph over every frame, the cell swept by
+`run_recurrent_and_retain`, a head graph -- and needed no exporter or engine change at all.
+
+* **Frame i is one window of a stride-512 convolution** over the clip padded by 64 on the left. The
+  per-frame reflect pad reads only samples inside that window, so it folds into the STFT weights; the
+  four per-frame convolutions run over columns, not time, and become dense pointwise maps. At f64 the
+  rewrite equals a streamed port to 2.7e-15, and the loader checks it against the streamed JIT before
+  tracing.
+* **The weights are the JIT's.** The wheel's tinygrad safetensors is a different snapshot
+  ([Retro-071](../retros/retro-071-a-second-weight-file-in-the-package-was-another-model.md)).
+* The output is `[1 - p, p]` under MarbleNet's labels at 31.25 frames/s, so a host reads either VAD
+  file the same way. 5.5 minutes of audio classify in 2.1 s on the 2-core dev box.
+
+### Family 2's second leaf: Moonshine Streaming
+
+`moonshine-ai/moonshine-streaming-tiny` (34M) and `-small` (123M), MIT, English (2026-10-02, the
+user's pick before rc14 -- the Streaming line, not v1's tiny/base). A sliding-window encoder over the
+raw waveform and a RoPE decoder cross-attending to it: Whisper's and Canary's three phases (`encoder`,
+`cross_kv`, a KV-cached `decoder`), exported from the ovos venv (`moonshine_streaming` first ships in
+transformers 5). No new primitive; the bill was a reference that branches on an argument, a tokenizer
+shape the engine half had, and three lowerings.
+
+* **The reference branches on its mask.** transformers windows the encoder only when handed an
+  `attention_mask`, and the processor's mask also zeroes the partial last frame. The export takes the
+  card's call -- windows always, the partial frame zeroed in the driver, the card's 6.5-tokens-per-second
+  budget ([ADR-064](../adrs/adr-064-a-mask-dependent-reference-is-the-call-its-card-makes.md)). The
+  engine pads to whole 80-sample frames through `loom.samples_per_chunk`, family 3's contract.
+* **The decoder step does not call transformers' forward**: it adds the encoder position table to
+  `encoder_hidden_states` in place, which would be a cross-K/V input here. The table and projection end
+  the encoder phase; the interleaved partial RoPE is pre-interleaved frequencies and a +-1 permutation.
+  `asinh`, which has no primitive, is composed.
+* **The tokenizer** is a SentencePiece BPE converted to `tokenizer.json` with a dummy prefix; detected
+  as byte-level BPE it decoded "Andso,myfellowAmericans". It is Gemma 3's `kSpmByteFallback` shape plus
+  a declared prefix ([ADR-065](../adrs/adr-065-a-converted-sentencepiece-bpe-declares-its-dummy-prefix.md)),
+  an engine change, so the files ship with rc14.
+* **Three aborts** -- a window mask and a RoPE angle that broadcast both operands, and a `range_1d`
+  indexing a gather as F32 -- the second visible only on a prefill longer than one token
+  ([Retro-070](../retros/retro-070-a-one-token-decode-step-hid-a-two-sided-broadcast.md)).
+* **At most 81.9 s per call**: the decoder's position table has 4096 encoder rows. The driver refuses
+  longer audio before the encoder runs, naming the limit; no long-form windowing is declared.
+
+**Verified** against transformers' `generate` as the card calls it:
+
+| | ids / text vs transformers, 73 LibriSpeech-dummy utterances | encoder vs f64 (transformers f32) | teacher-forced logits vs f64 (transformers f32) |
+|---|---|---|---|
+| tiny | 73/73 / 73/73 | 1.7e-05 (2.4e-05) | 2.7e-05 (4.2e-05) |
+| small | 73/73 / 73/73 | 6.0e-05 (5.1e-05; absmax 13.7) | 1.3e-05 (2.8e-05) |
+
+Both transcribe jfk.wav word-perfect (card-gate baselines 0.00). The encoder attends through a FULL
+`T x T` masked score matrix per head, of which 20 diagonals are live: 81.9 s of audio takes 27 s on the
+2-core dev box with tiny, and a banded attention would cut most of it (hub, Models).
 
 ### Text input
 
@@ -1344,13 +1401,18 @@ already shipped an extra CTC frame in conformer-ctc-small
 40 s training ceiling it is decoded as NeMo decodes it -- overlapping windows, stitched token for token
 ([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)).
 
-**Requested, unscoped (2026-09-25):** Canary, Citrinet, Cohere ASR, Moonshine (tiny and small),
-Nemotron ASR, Silero VAD, Voxtral Mini realtime, Kitten TTS and Soprano TTS. Most of the ASR names
-look like existing templates — three NVIDIA checkpoints for the NeMo encoder template, Moonshine as an
-encoder-decoder — which is the kind of estimate families 4 and 5 corrected, so each is scoped against
-its checkpoint before it is costed. Silero VAD was to be the zoo's first VAD and the first family-13
-classifier. Family 13's VAD shipped on MarbleNet instead; whether Silero publishes a traceable `nn.Module`
-(and not only TorchScript/ONNX) is still unchecked. The backlog has one line each with what to check first.
+**Silero VAD and Moonshine Streaming (tiny, small), the next two of the requested list, were built
+2026-10-02** for rc14 (§2). Silero's open question -- a traceable module, or only TorchScript/ONNX --
+was answered by its wheel: a 40-line definition, with the weights read out of the JIT. Moonshine's
+"encoder-decoder, existing template" estimate held for the phases and missed the reference, which
+branches on an argument (ADR-064), and the tokenizer.
+
+**Requested, unscoped (2026-09-25), still open:** Cohere ASR, Nemotron ASR, Voxtral Mini realtime and
+Soprano TTS. **Kitten TTS is dropped** (the user, 2026-10-02): every release is ONNX-only, and the
+zoo takes a model only through a PyTorch checkpoint. Most of the ASR names look like existing templates — two NVIDIA
+checkpoints for the NeMo encoder template — which is the kind of estimate families 4 and 5 corrected,
+so each is scoped against its checkpoint before it is costed. The backlog has one line each with what
+to check first.
 
 **The constraint that decides what is exportable at all** is not the template — it is peak memory
 during conversion. `MultiPhase.export` made peak memory a *sum* where it should be a *max*, and P5.0
