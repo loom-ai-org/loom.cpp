@@ -25,10 +25,11 @@
 // graph allocator is free to give the ADD the same memory as the convolution it consumes -- which
 // would make the poison check meaningless.
 
+#include "cpu_backend.h"
 #include "test_util.h"
 
 #include <ggml.h>
-#include <ggml-cpu.h>
+#include <ggml-backend.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +55,19 @@ double reference(const std::vector<float>& K, const std::vector<float>& X,
         }
     }
     return acc;
+}
+
+// The graph computed on the registry's CPU backend at `n_threads`. Not ggml_graph_compute_with_ctx:
+// that symbol lives INSIDE the CPU backend, which a GGML_BACKEND_DL build (the one the wheels ship)
+// loads at run time rather than links, so calling it directly left this test unlinkable there. The
+// thread count goes through the backend's proc address for the same reason.
+bool compute(ggml_cgraph* gf, int n_threads) {
+    static ggml_backend_t backend = loom_test::cpu_backend();
+    if (backend == nullptr) return false;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (set_n_threads != nullptr) set_n_threads(backend, n_threads);
+    return ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
 }
 
 } // namespace
@@ -96,7 +110,7 @@ int main() {
 
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
-    LOOM_CHECK(ggml_graph_compute_with_ctx(ctx, gf, 2) == GGML_STATUS_SUCCESS);
+    LOOM_CHECK(compute(gf, 2));
 
     // 1. the numbers
     double worst = 0.0;
@@ -193,7 +207,7 @@ int main() {
 
         ggml_cgraph* gf2 = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf2, out2);
-        LOOM_CHECK(ggml_graph_compute_with_ctx(ctx, gf2, 2) == GGML_STATUS_SUCCESS);
+        LOOM_CHECK(compute(gf2, 2));
 
         double worst2 = 0.0;
         for (int64_t oc = 0; oc < IC; ++oc) {
@@ -251,7 +265,7 @@ int main() {
         ggml_tensor* out3  = ggml_add(ctx, ggml_reshape_3d(ctx, conv3, conv3->ne[0], OC2, 1), b3);
         ggml_cgraph* gf3 = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf3, out3);
-        LOOM_CHECK(ggml_graph_compute_with_ctx(ctx, gf3, 2) == GGML_STATUS_SUCCESS);
+        LOOM_CHECK(compute(gf3, 2));
 
         const int64_t OL2 = conv3->ne[0];
         double worst3 = 0.0;

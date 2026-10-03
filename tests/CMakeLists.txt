@@ -270,6 +270,18 @@ set_tests_properties(test_conv_bias_fusion PROPERTIES ENVIRONMENT
     "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_conv_bias_fusion PROPERTIES DEPENDS test_conv_bias_fusion_unfused)
 
+add_executable(test_conv_dw_fusion ci/test_conv_dw_fusion.cpp)
+target_link_libraries(test_conv_dw_fusion PRIVATE loom::engine)
+add_test(NAME test_conv_dw_fusion_unfused COMMAND test_conv_dw_fusion)
+set_tests_properties(test_conv_dw_fusion_unfused PROPERTIES LABELS ci)
+set_tests_properties(test_conv_dw_fusion_unfused PROPERTIES ENVIRONMENT
+    "GGML_CPU_DISABLE_FUSION=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_conv_dw_fusion COMMAND test_conv_dw_fusion)
+set_tests_properties(test_conv_dw_fusion PROPERTIES LABELS ci)
+set_tests_properties(test_conv_dw_fusion PROPERTIES ENVIRONMENT
+    "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_conv_dw_fusion PROPERTIES DEPENDS test_conv_dw_fusion_unfused)
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
