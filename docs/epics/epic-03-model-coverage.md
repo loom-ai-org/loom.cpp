@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-02
+last_updated: 2026-10-03
 ---
 
 # Epic-03: Model Coverage
@@ -1346,7 +1346,11 @@ graph, nothing rewritten; coremltools folds the batch norms.
   (`LOOM_PROFILE`, 30 s, 1 thread, F32, 256 ms a call): ~14 ms is marshalling the lists (the register's
   "C++/Lua array boundary"); of the engine's 242 ms, the eight dilated DEPTHWISE convolutions (IM2COL +
   batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1 convolutions 29%, the DFT convolution
-  15%, and the separate bias/residual ADDs and causal PADs 15%. The hub tracks it.
+  15%, and the separate bias/residual ADDs and causal PADs 15%. **Since then (P4.31, 2026-10-03, not yet
+  released):** a direct depthwise kernel, its SIMD interior and the PAD+bias+RELU fusion took the 2.5 s
+  window to 11.3 ms F32 on the dev box and 50.6 / 24.1 ms at 1 / 4 threads on the Pi 4 (from 65.9 / 33.5)
+  -- [Epic-05 P4.31](epic-05-edge-performance.md#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03).
+  The tables here are the released rc14 wheel.
 * **The same comparison on three more machines** (2026-10-03; the published files, released
   `loom-py-rt 1.0.0rc14`, PyPI onnxruntime 1.28.0; ms per call, mean of per-launch medians; 285K pinned to
   its P-cores, Pi 4 cooled to 60 C before every launch and never throttled). ONNX has no 32-bit ARM build,
