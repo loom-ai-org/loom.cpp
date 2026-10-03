@@ -1278,6 +1278,7 @@ length:
 | ECAPA | prob ≤ 1.9e-06 | — | top-2 identical at 5 lengths |
 | pyannote | ≤ 5.8e-05 | ≤ 5.9e-05 | argmax 100% of frames |
 | Silero VAD | ≤ 1.6e-05 vs the streamed JIT; ≤ 6.1e-06 vs f64 | ≤ 1.0e-05 | speech frames identical, 9 clips |
+| WakeHuBERT (F32) | ≤ 3.4e-05 vs f64 (features up to 11.5) | ≤ 7.3e-06 | cosine 1.000000 every frame, 5 clips |
 
 MarbleNet looked 5x off at first. NeMo's `AudioPreprocessor` casts to float32 **even in a `.double()`
 model**, so that "f64" reference had an f32 front end. With the front end forced to f64, loom sits at
@@ -1303,6 +1304,75 @@ pyannote's shape with one direction -- a graph over every frame, the cell swept 
   ([Retro-071](../retros/retro-071-a-second-weight-file-in-the-package-was-another-model.md)).
 * The output is `[1 - p, p]` under MarbleNet's labels at 31.25 frames/s, so a host reads either VAD
   file the same way. 5.5 minutes of audio classify in 2.1 s on the 2-core dev box.
+
+**A sixth leaf, WakeHuBERT tiny (2026-10-03, the user's pick; PUBLISHED the same day on rc14 as
+`wakehubert-tiny-loom`, infer-only until rc15's door).** `TigreGotico/wakehubert-tiny`,
+Apache-2.0: a 0.64M-parameter causal student distilled from HuBERT-base for wake-word detection -- a
+log-mel front end whose DFT is a fixed convolution, a stride-2 stem, eight dilated depthwise-separable
+blocks and a 1x1 projection to 128 features per 20 ms frame. The checkpoint is a safetensors beside
+upstream's own plain-torch `student.py`, which the loader imports, so the network is not restated. One
+graph, nothing rewritten; coremltools folds the batch norms.
+
+* **It is the first `embeddings` output at `frame` granularity**, which ADR-062 had named and no door
+  answers. By the user's call it ships with the keys and no door: the card calls `infer` and cuts the
+  rows ([ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)'s amendment).
+* **Four precisions in ONE Hub repo** (the user's call, the first such repo): F32, F16, Q8_0, Q4_1 as
+  `wakehubert-tiny-<type>.gguf`, loaded by name (`from_pretrained(repo, filename)`; loom-py already
+  refused to choose). Per-frame cosine to the f64 reference on jfk.wav, mean / worst: F16 1.000000 /
+  0.999998, Q8_0 0.99992 / 0.99978 (upstream's int8 ONNX reports a mean of 0.9975), Q4_1 0.987 / 0.972
+  (Q4_0 measured 0.981 / 0.94 and was swapped out for Q4_1, the user's call).
+* **Speed against upstream's ONNX files** (`scripts/bench_wakehubert.py`; Ryzen 3 3250U, loom-py `infer`
+  vs onnxruntime 1.28.0 PyPI `run` from one Python, 3 warm-up calls then the median, per launch; 9
+  launches per arm pinned `taskset -c 0,2` (one CPU per physical core), 1 s settle, arm order shuffled;
+  ratio = PAIRED per round against ONNX int8, median [p10-p90], >1 = faster than ONNX int8):
+
+  | clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 | witness spread |
+  |---|---|---|---|---|---|---|---|
+  | 2.5 s, 1 | 19.7 ms, 0.31x [0.29-0.35] | 28.5, 0.22x | 19.7, 0.32x | 19.3, 0.32x | **6.2** | 7.4, 0.82x | 1.06x |
+  | 2.5 s, 2 | 18.6, 0.25x [0.09-0.30] | 22.7, 0.17x | 15.9, 0.24x | 15.5, 0.24x | **3.8** | 4.5, 0.84x | 1.22x |
+  | 30 s, 1 | 259, 0.63x [0.26-0.67] | 364, 0.42x | 252, 0.61x | 261, 0.61x | **145** | 168, 0.96x | **2.24x** |
+  | 30 s, 2 | 189, 0.49x [0.37-0.65] | 278, 0.32x | 193, 0.45x | 195, 0.48x | **91** | 142, 0.62x | **1.74x** |
+
+  **On the 2.5 s window -- the model's streaming use -- loom is 3-4x slower than the int8 ONNX, and that
+  resolves.** The 30 s rows do not: ONNX int8 has a bimodal fast mode (p10 73 ms against a 145 ms mean),
+  so the clock witness spreads past the box's ~1.2x floor (Epic-05, "Operating notes: benchmarking") and
+  only the direction -- roughly 2x slower -- is measured there. Quantizing buys loom no speed, as
+  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register predicts: the
+  convolution dequantizes its kernel to F32 once per call, so the type never reaches the inner loop. F16
+  is ~1.4x slower than F32 because its convolutions take ggml's F16 im2col path (IM2COL 2.1x, CONV_2D
+  1.4x). An earlier unpinned sweep that reported ratios of means said the same within its own spread.
+  Accuracy runs the other way: per-frame cosine to the f64 reference, mean / worst, is ONNX int8 0.9970 /
+  0.987 against loom Q8_0's 0.99992 / 0.99978 (ONNX fp32 1.000000). Where loom's time goes
+  (`LOOM_PROFILE`, 30 s, 1 thread, F32, 256 ms a call): ~14 ms is marshalling the lists (the register's
+  "C++/Lua array boundary"); of the engine's 242 ms, the eight dilated DEPTHWISE convolutions (IM2COL +
+  batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1 convolutions 29%, the DFT convolution
+  15%, and the separate bias/residual ADDs and causal PADs 15%. The hub tracks it.
+* **The same comparison on three more machines** (2026-10-03; the published files, released
+  `loom-py-rt 1.0.0rc14`, PyPI onnxruntime 1.28.0; ms per call, mean of per-launch medians; 285K pinned to
+  its P-cores, Pi 4 cooled to 60 C before every launch and never throttled). ONNX has no 32-bit ARM build,
+  so the Pi Zero row is loom alone -- measured with the board's `bluetooth-km-switch` service STOPPED (the
+  user's call): with it running, every arm was 7-11% slower.
+
+  | machine, clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 |
+  |---|---|---|---|---|---|---|
+  | Core Ultra 9 285K, 2.5 s, 1 | 5.27 | 7.31 | 5.41 | 5.39 | 1.04 | 1.87 |
+  | Core Ultra 9 285K, 2.5 s, 8 | 3.04 | 4.23 | 3.11 | 3.09 | 0.49 | 0.98 |
+  | Core Ultra 9 285K, 30 s, 1 | 63.8 | 90.2 | 64.0 | 64.3 | 12.2 | 21.6 |
+  | Core Ultra 9 285K, 30 s, 4 | 38.3 | 54.8 | 38.2 | 38.5 | 4.4 | 7.5 |
+  | Raspberry Pi 4B, 2.5 s, 1 | 66.2 | 126.7 | 66.1 | 66.1 | 23.0 | 31.3 |
+  | Raspberry Pi 4B, 2.5 s, 4 | 34.0 | 56.0 | 34.3 | 34.2 | 10.0 | 12.0 |
+  | Raspberry Pi 4B, 30 s, 1 | 1108 | 1554 | 1118 | 1118 | 260 | 375 |
+  | Raspberry Pi 4B, 30 s, 4 | 502 | 696 | 502 | 500 | 99 | 161 |
+  | Raspberry Pi Zero W, 2.5 s, 1 | 900 | 6921 | 1153 | 1144 | -- | -- |
+  | Raspberry Pi Zero W, 30 s, 1 | 10806 | 83664 | 13563 | 13537 | -- | -- |
+
+  ONNX int8 beats its own fp32 by ~1.8x where the CPU has VNNI (the 285K) and by 1.3-1.6x on the Pi 4, but
+  only 10-20% on the dev box's Zen 1, which has neither. loom's quantized files run at F32's speed on x86 and
+  aarch64 and ~1.27x SLOWER on ARMv6; F16 is 1.4-1.9x slower than F32 everywhere and 7.5x on the Pi Zero (no
+  F16 hardware). loom scales 1.7-1.9x from 1 to 8 threads on the 285K, ONNX 2-2.8x.
+* **Every precision keeps the DFT basis F32** (`keep_float`): F16 had packed it, which Q8_0's block
+  alignment never could, and came out worse than Q8_0
+  ([Retro-072](../retros/retro-072-f16-came-out-worse-than-q8-because-alignment-exempted-the-basis.md)).
 
 ### Family 2's second leaf: Moonshine Streaming
 
