@@ -1305,7 +1305,8 @@ pyannote's shape with one direction -- a graph over every frame, the cell swept 
 * The output is `[1 - p, p]` under MarbleNet's labels at 31.25 frames/s, so a host reads either VAD
   file the same way. 5.5 minutes of audio classify in 2.1 s on the 2-core dev box.
 
-**A sixth leaf, WakeHuBERT tiny (2026-10-03, the user's pick).** `TigreGotico/wakehubert-tiny`,
+**A sixth leaf, WakeHuBERT tiny (2026-10-03, the user's pick; PUBLISHED the same day on rc14 as
+`wakehubert-tiny-loom`, infer-only until rc15's door).** `TigreGotico/wakehubert-tiny`,
 Apache-2.0: a 0.64M-parameter causal student distilled from HuBERT-base for wake-word detection -- a
 log-mel front end whose DFT is a fixed convolution, a stride-2 stem, eight dilated depthwise-separable
 blocks and a 1x1 projection to 128 features per 20 ms frame. The checkpoint is a safetensors beside
