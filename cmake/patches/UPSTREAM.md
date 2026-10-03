@@ -1226,6 +1226,27 @@ interleaved launches): F32 13.94 -> 12.58 ms, Q8_0 13.79 -> 12.39 ms, F16 19.05 
 of loom lowering `CONV_1D_DW` to `ggml_conv_2d_dw_direct` (17.22 ms with the im2col recipe). Only
 x86 AVX2 measured; the aarch64/armv6 paths of `ggml_vec_mad_f32` are not yet measured.
 
+
+## PR 19 — CPU backend: fuse the zero `PAD` before a `CONV_2D_DW` and the bias `ADD` + `RELU` after it
+
+*(`cmake/patches/ggml-0022-conv2d-dw-fusion.patch`, on top of PR 18)*
+
+**Problem.** A causal temporal block lowers to `PAD(left=(K-1)*d) -> CONV_2D_DW -> ADD(bias) -> RELU`.
+PR 5/7's detector covers `CONV_2D` only, so around a depthwise conv every one of those is a full pass,
+and the per-channel bias ADD is a broadcast along `ne0` that ggml runs ~6x slower than a same-shape
+residual ADD (0.075 against 0.012 ms per node on WakeHuBERT's [125, 256]).
+
+**Change.** `ggml_cpu_conv_2d_dw_fusion` matches the chain from the PAD (when the convolution is its only
+consumer) or from the convolution; every neighbour is optional. A zero PAD on `ne0` only folds into a
+larger left pad over the PAD's unpadded input -- the kernel's bounds test already reads zeros outside
+the source -- and the bias and RELU are applied to each finished output row while it is in L1, in the
+unfused order, so the result is bit-identical. An output that is exactly the source is handled by
+copying each source row out before writing it; a partial overlap declines.
+
+**Measured** (WakeHuBERT tiny, 2.5 s, 1 thread, Ryzen 3 3250U, min over 150 runs, 5 alternating
+launches): 12.67 -> 11.29 ms. Bit-identical to the unfused graph on F32, F16 and Q8_0 files, and at 4
+threads. x86 AVX2 only measured.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

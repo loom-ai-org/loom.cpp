@@ -1,0 +1,279 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3272,6 +3272,116 @@
+     return last;
+ }
+ 
++// loom (ggml-0022): a depthwise convolution with the elementwise nodes around it. A causal temporal
++// block (WakeHuBERT, and the conformer/Moonshine conv modules) lowers to
++//
++//     p = PAD(x, left = (K-1)*d)       a full read and write of the activation
++//     c = CONV_2D_DW(w, p)
++//     b = ADD(c, bias)                 a per-channel broadcast add: ~6x the cost of a plain add here
++//     r = RELU(b)                      optional
++//
++// and all of it is one pass of the depthwise kernel. Matched from the PAD when the convolution is its
++// only consumer, otherwise from the convolution; each neighbour is optional. Fills the out-params and
++// returns the index of the LAST node covered, else -1.
++static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int node_n,
++                                      struct ggml_tensor ** conv_out, const struct ggml_tensor ** pad_out,
++                                      const struct ggml_tensor ** bias_out, bool * relu_out,
++                                      struct ggml_tensor ** out_out) {
++    int idx = node_n;
++    struct ggml_tensor * node = cgraph->nodes[idx];
++    const struct ggml_tensor * pad = NULL;
++
++    if (node->op == GGML_OP_PAD) {
++        const struct ggml_tensor * in = node->src[0];
++        if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || in == NULL ||
++            in->type != GGML_TYPE_F32 || !ggml_is_contiguous(in) ||
++            ggml_get_op_params_i32(node, 8) != 0 ||                    // circular
++            ggml_get_op_params_i32(node, 0) < 0 || ggml_get_op_params_i32(node, 1) < 0) {
++            return -1;
++        }
++        for (int k = 2; k < 8; ++k) {
++            if (ggml_get_op_params_i32(node, k) != 0) {
++                return -1;
++            }
++        }
++        if (in->ne[1] != node->ne[1] || in->ne[2] != node->ne[2] || in->ne[3] != node->ne[3]) {
++            return -1;
++        }
++        idx = ggml_cpu_next_compute_node(cgraph, idx + 1);
++        if (idx < 0 || cgraph->nodes[idx]->op != GGML_OP_CONV_2D_DW) {
++            return -1;
++        }
++        struct ggml_tensor * c = cgraph->nodes[idx];
++        if (c->src[1] == NULL || ggml_view_root(c->src[1]) != node || c->src[1]->data != node->data ||
++            !ggml_cpu_result_is_private(cgraph, node, idx)) {
++            return -1;
++        }
++        pad  = node;
++        node = c;
++    }
++
++    if (node->op != GGML_OP_CONV_2D_DW) {
++        return -1;
++    }
++    struct ggml_tensor * conv = node;
++    const struct ggml_tensor * csrc = conv->src[1];
++    if (conv->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv) || (conv->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++        csrc == NULL || csrc->type != GGML_TYPE_F32 || !ggml_is_contiguous(csrc) ||
++        conv->ne[1] != 1 || csrc->ne[1] != 1 || conv->ne[3] != 1 ||
++        (conv->src[0]->type != GGML_TYPE_F32 && conv->src[0]->type != GGML_TYPE_F16)) {
++        return -1;
++    }
++
++    struct ggml_tensor * out = conv;
++    const struct ggml_tensor * bias = NULL;
++    bool relu = false;
++    int last = idx;
++
++    const int bias_idx = ggml_cpu_next_compute_node(cgraph, last + 1);
++    if (bias_idx >= 0 && cgraph->nodes[bias_idx]->op == GGML_OP_ADD) {
++        struct ggml_tensor * add = cgraph->nodes[bias_idx];
++        const struct ggml_tensor * b = ggml_cpu_conv_2d_add_operand(add, out, conv, true);
++        if (b && ggml_cpu_result_is_private(cgraph, out, bias_idx)) {
++            bias = b;
++            out  = add;
++            last = bias_idx;
++        }
++    }
++    const int relu_idx = ggml_cpu_next_compute_node(cgraph, last + 1);
++    if (relu_idx >= 0 && cgraph->nodes[relu_idx]->op == GGML_OP_UNARY &&
++        ggml_get_unary_op(cgraph->nodes[relu_idx]) == GGML_UNARY_OP_RELU) {
++        struct ggml_tensor * r = cgraph->nodes[relu_idx];
++        if (r->src[0] && ggml_view_root(r->src[0]) == out && r->src[0]->data == out->data &&
++            r->type == GGML_TYPE_F32 && ggml_is_contiguous(r) && ggml_is_contiguous(r->src[0]) &&
++            ggml_nelements(r) == ggml_nelements(conv) && ggml_cpu_result_is_private(cgraph, out, relu_idx)) {
++            relu = true;
++            out  = r;
++            last = relu_idx;
++        }
++    }
++
++    if (pad == NULL && out == conv) {
++        return -1;                                // nothing to fuse
++    }
++
++    // The kernel copies a source row out before writing over it, so the result may be EXACTLY the
++    // source; a partial overlap, or any overlap with the weights or the bias, it cannot handle.
++    const struct ggml_tensor * in = pad ? pad->src[0] : csrc;
++    const bool out_is_in = out->data == in->data && ggml_nbytes(out) == ggml_nbytes(in);
++    if ((!out_is_in && ggml_cpu_tensors_overlap(out, in)) ||
++        ggml_cpu_tensors_overlap(out, conv->src[0]) ||
++        (bias && ggml_cpu_tensors_overlap(out, bias))) {
++        return -1;
++    }
++
++    *conv_out = conv;
++    *pad_out  = pad;
++    *bias_out = bias;
++    *relu_out = relu;
++    *out_out  = out;
++    return last;
++}
++
+ static int ggml_cpu_try_fuse_ops(
+         const struct ggml_cgraph * cgraph,
+         const int node_n,
+@@ -3297,6 +3407,16 @@
+         }
+     }
+ 
++    if (node->op == GGML_OP_CONV_2D_DW || node->op == GGML_OP_PAD) {
++        struct ggml_tensor * conv = NULL; const struct ggml_tensor * pad = NULL;
++        const struct ggml_tensor * bias = NULL; bool relu = false; struct ggml_tensor * out = NULL;
++        const int last = ggml_cpu_conv_2d_dw_fusion(cgraph, node_n, &conv, &pad, &bias, &relu, &out);
++        if (last > node_n) {
++            ggml_compute_forward_conv_2d_dw_fused(params, conv, pad, bias, relu, out);
++            return last - node_n;
++        }
++    }
++
+     if (node->op == GGML_OP_RMS_NORM) {
+         // RMS_NORM + MUL fusion
+         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -22,6 +22,7 @@
+ #endif
+ 
+ #include <algorithm>
++#include <vector>
+ #include <cfloat>
+ #include <cmath>
+ #include <cstdlib>
+@@ -8882,12 +8883,19 @@
+ // output; for WakeHuBERT's dilated K=5 depthwise convs that held them at roughly a tenth of the 1x1
+ // convs' GFLOP/s. Per output the taps are still accumulated in (ky, kx) order starting from 0, as the
+ // scalar loop does, so the only numerical change is FMA contraction inside the SIMD sweep.
+-static void ggml_compute_forward_conv_2d_dw_whcn(
++// `src_base`/`dst_base` are the first channel's rows; `bias` (one value per channel) and `relu` are the
++// fused epilogue of ggml-0022, applied to a finished row while it is still in L1 and in the same order
++// the unfused ADD and RELU nodes would apply them, so fusing is bit-identical. When `dst_base` IS the
++// source (the graph allocator may hand a fused output the block of an input that is dead afterwards),
++// each source row is copied out before its output row is written, since the taps read behind x.
++static void ggml_compute_forward_conv_2d_dw_whcn_impl(
+         const ggml_compute_params * params,
+-        const ggml_tensor * src,
++        const float * src_base,
+         const ggml_tensor * kernel,
+-        ggml_tensor * dst,
+-        const ggml_conv_2d_dw_params & p) {
++        float * dst_base,
++        const ggml_conv_2d_dw_params & p,
++        const float * bias,
++        bool relu) {
+ 
+     const int64_t n = p.channels * p.batch;
+     const int64_t per_thread = (n + params->nth - 1) / params->nth;
+@@ -8904,10 +8912,17 @@
+     x_lo = MIN(x_lo, p.dst_w);
+     x_hi = MAX(x_lo, MIN(x_hi, p.dst_w));
+ 
++    const bool aliased = (const void *) dst_base == (const void *) src_base;
++    std::vector<float> row_copy(aliased ? p.src_w * p.src_h : 0);
++
+     for (int64_t i = start; i < end; ++i) {
+         const int64_t knl_offset = (i % p.channels) * p.knl_w * p.knl_h;
+-        const float * src_data = (const float *)src->data + i * p.src_w * p.src_h;
+-        float * dst_data = (float *)dst->data + i * p.dst_w * p.dst_h;
++        const float * src_data = src_base + i * p.src_w * p.src_h;
++        float * dst_data = dst_base + i * p.dst_w * p.dst_h;
++        if (aliased) {
++            std::copy(src_data, src_data + p.src_w * p.src_h, row_copy.begin());
++            src_data = row_copy.data();
++        }
+ 
+         auto scalar = [&](int64_t dst_y, int64_t dst_x) {
+             float sum = 0.0f;
+@@ -8959,9 +8974,32 @@
+                 scalar(dst_y, dst_x);
+             }
+         }
++        if (bias != nullptr || relu) {
++            const float b = bias != nullptr ? bias[i % p.channels] : 0.0f;
++            for (int64_t j = 0; j < p.dst_w * p.dst_h; ++j) {
++                float v = dst_data[j];
++                if (bias != nullptr) {
++                    v = v + b;
++                }
++                if (relu) {
++                    v = (v > 0.f) ? v : 0.f;
++                }
++                dst_data[j] = v;
++            }
++        }
+     }
+ }
+ 
++static void ggml_compute_forward_conv_2d_dw_whcn(
++        const ggml_compute_params * params,
++        const ggml_tensor * src,
++        const ggml_tensor * kernel,
++        ggml_tensor * dst,
++        const ggml_conv_2d_dw_params & p) {
++    ggml_compute_forward_conv_2d_dw_whcn_impl(params, (const float *) src->data, kernel, (float *) dst->data,
++                                              p, nullptr, false);
++}
++
+ void ggml_compute_forward_conv_2d_dw(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -8998,6 +9036,42 @@
+     }
+ }
+ 
++// loom (ggml-0022): CONV_2D_DW fused with the zero PAD that feeds it and the per-channel bias ADD and
++// RELU that follow it -- see ggml_cpu_conv_2d_dw_fusion. A PAD only widens the source with zeros, which
++// is exactly what the kernel's own bounds test produces, so it folds into a larger left pad over the
++// PAD's unpadded input; the right pad needs nothing, since positions past the source read as zero
++// either way.
++void ggml_compute_forward_conv_2d_dw_fused(
++        const ggml_compute_params * params,
++        const ggml_tensor * conv,
++        const ggml_tensor * pad,
++        const ggml_tensor * bias,
++        bool relu,
++        ggml_tensor * out) {
++    const ggml_tensor * kernel = conv->src[0];
++    const ggml_tensor * src = pad != nullptr ? pad->src[0] : conv->src[1];
++    ggml_conv_2d_dw_params p;
++    p.channels = conv->src[1]->ne[2];
++    p.batch = conv->src[1]->ne[3];
++    p.src_w = src->ne[0];
++    p.src_h = 1;
++    p.dst_w = conv->ne[0];
++    p.dst_h = conv->ne[1];
++    p.knl_w = kernel->ne[0];
++    p.knl_h = kernel->ne[1];
++    p.stride_x = conv->op_params[0];
++    p.stride_y = conv->op_params[1];
++    p.pad_x = conv->op_params[2] + (pad != nullptr ? ggml_get_op_params_i32(pad, 0) : 0);
++    p.pad_y = conv->op_params[3];
++    p.dilation_x = conv->op_params[4];
++    p.dilation_y = conv->op_params[5];
++
++    GGML_ASSERT(kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16);
++    GGML_ASSERT(p.dst_h == 1 && conv->src[1]->ne[1] == 1);
++    ggml_compute_forward_conv_2d_dw_whcn_impl(params, (const float *) src->data, kernel, (float *) out->data, p,
++                                              bias != nullptr ? (const float *) bias->data : nullptr, relu);
++}
++
+ // ggml_compute_forward_pool_1d_ksp
+ static void ggml_compute_forward_pool_1d_ksp(
+         const ggml_compute_params * params,
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -107,6 +107,7 @@
+ void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_conv_2d_dw_fused(const struct ggml_compute_params * params, const struct ggml_tensor * conv, const struct ggml_tensor * pad, const struct ggml_tensor * bias, bool relu, struct ggml_tensor * out);
+ void ggml_compute_forward_pool_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pool_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
