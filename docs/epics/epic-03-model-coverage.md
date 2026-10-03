@@ -1350,7 +1350,8 @@ graph, nothing rewritten; coremltools folds the batch norms.
 * **The same comparison on three more machines** (2026-10-03; the published files, released
   `loom-py-rt 1.0.0rc14`, PyPI onnxruntime 1.28.0; ms per call, mean of per-launch medians; 285K pinned to
   its P-cores, Pi 4 cooled to 60 C before every launch and never throttled). ONNX has no 32-bit ARM build,
-  so the Pi Zero row is loom alone.
+  so the Pi Zero row is loom alone -- measured with the board's `bluetooth-km-switch` service STOPPED (the
+  user's call): with it running, every arm was 7-11% slower.
 
   | machine, clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 |
   |---|---|---|---|---|---|---|
@@ -1362,8 +1363,8 @@ graph, nothing rewritten; coremltools folds the batch norms.
   | Raspberry Pi 4B, 2.5 s, 4 | 34.0 | 56.0 | 34.3 | 34.2 | 10.0 | 12.0 |
   | Raspberry Pi 4B, 30 s, 1 | 1108 | 1554 | 1118 | 1118 | 260 | 375 |
   | Raspberry Pi 4B, 30 s, 4 | 502 | 696 | 502 | 500 | 99 | 161 |
-  | Raspberry Pi Zero W, 2.5 s, 1 | 993 | 7413 | 1273 | 1253 | -- | -- |
-  | Raspberry Pi Zero W, 30 s, 1 | 11841 | 89578 | 15320 | 14945 | -- | -- |
+  | Raspberry Pi Zero W, 2.5 s, 1 | 900 | 6921 | 1153 | 1144 | -- | -- |
+  | Raspberry Pi Zero W, 30 s, 1 | 10806 | 83664 | 13563 | 13537 | -- | -- |
 
   ONNX int8 beats its own fp32 by ~1.8x where the CPU has VNNI (the 285K) and by 1.3-1.6x on the Pi 4, but
   only 10-20% on the dev box's Zen 1, which has neither. loom's quantized files run at F32's speed on x86 and
