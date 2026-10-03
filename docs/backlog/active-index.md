@@ -287,13 +287,15 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **WakeHuBERT tiny runs 2.4-4x slower than its own int8 ONNX, and quantizing does not help** (2026-10-03,
-  Ryzen 3 3250U; table in [Epic-03](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)).
+* [ ] **WakeHuBERT tiny runs 3-4x slower than its own int8 ONNX on a 2.5 s window, and quantizing does not help**
+  (2026-10-03, Ryzen 3 3250U, pinned and paired; table in [Epic-03](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)).
   Profiled at 30 s, 1 thread: the eight dilated depthwise convolutions lower to IM2COL + a batched MUL_MAT and take
-  35% of the engine's time for ~1% of the multiply-adds -- a direct depthwise kernel is the first lever (parakeet,
-  conformer and Moonshine carry the same op); the unfused bias/residual ADDs and causal PADs are another 15%; a
-  2.5 s window pays ~13 ms of fixed per-call cost over ONNX. F16 is 1.4-1.7x slower than F32 because its
-  convolutions take ggml's F16 im2col path. Re-measure with `scripts/bench_wakehubert.py sweep`.
+  35% of the engine's time for ~1% of the multiply-adds -- a direct depthwise kernel is the first lever, and is NOT
+  in [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register (parakeet, conformer and
+  Moonshine carry the same op). The unfused bias/residual ADDs and causal PADs are another 15%, but conv+bias fusion
+  IS in the register (6.5% on VITS): re-measure on this model before proposing it. No quantized speed-up is expected
+  (the register: the kernel is dequantized to F32 per call). F16 is ~1.4x slower than F32 via ggml's F16 im2col path.
+  Re-measure with `scripts/bench_wakehubert.py sweep --pin 0,2`; the 30 s rows need a quieter box than the dev one.
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
   four things, and mapping them onto this tree ranks very unevenly — the important structural finding
