@@ -288,11 +288,17 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 * [ ] **WakeHuBERT tiny runs 3-4x slower than its own int8 ONNX on a 2.5 s window, and quantizing does not help**
   (2026-10-03, Ryzen 3 3250U, pinned and paired; table in [Epic-03](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)).
   Profiled at 30 s, 1 thread: the eight dilated depthwise convolutions lower to IM2COL + a batched MUL_MAT and take
-  35% of the engine's time for ~1% of the multiply-adds -- a direct depthwise kernel is the first lever, and is NOT
-  in [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register (parakeet, conformer and
+  35% of the engine's time for ~1% of the multiply-adds. **They never reach tinyBLAS**: the batched matmul is
+  `m=1500, n=1, k=5` per channel, and `llamafile_sgemm` returns false at `n < 2` (tinyBLAS also refuses `k < 8`), so
+  ggml's generic kernel runs them at ~0.7 GFLOP/s -- where the 1x1 and DFT convolutions, which DO go through
+  `ggml_call_mul_mat` -> tinyBLAS, run at ~27 GFLOP/s (Epic-05's single-core tinyBLAS rate). The lever is not a
+  GEMM: ggml already has a direct depthwise kernel with dilation, `ggml_conv_2d_dw_direct` (H=1 for a 1-D conv), in
+  place of `primitives_conv.cpp`'s `ggml_conv_1d_dw` recipe -- NOT in
+  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register (parakeet, conformer and
   Moonshine carry the same op). The unfused bias/residual ADDs and causal PADs are another 15%, but conv+bias fusion
   IS in the register (6.5% on VITS): re-measure on this model before proposing it. No quantized speed-up is expected
-  (the register: the kernel is dequantized to F32 per call). F16 is ~1.4x slower than F32 via ggml's F16 im2col path.
+  (the register: the kernel is dequantized to F32 per call). F16 is ~1.4x slower than F32: an F16 kernel makes the convolution's im2col F16 (`conv_im2col_type`), so it misses
+  the F32 tinyBLAS path.
   Re-measure with `scripts/bench_wakehubert.py sweep --pin 0,2`; the 30 s rows need a quieter box than the dev one.
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
