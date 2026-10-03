@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-09-02
+last_updated: 2026-10-03
 ---
 
 # Epic-05: Edge CPU Performance
@@ -54,6 +54,7 @@ Nothing in this repository computes a GEMM — the fixes are patches to `ggml`
 | tap-major (phase-major) traversal, a third path | dilation `d` is `d` dense convolutions; one contiguous run per channel instead of 896 prefetch streams |
 | `ggml-0007` resblock `LEAKY_RELU` + residual `ADD` fusion | 1.441 → 1.345 s |
 | `ggml-0008` / `ggml-0009` `conv_transpose_1d` prologue and GEMM | 1.314 → 1.202 s; the op itself 195.8 → 79.1 ms |
+| P4.31: direct depthwise conv, `ggml-0021` SIMD interior, `ggml-0022` PAD+bias+RELU fusion | WakeHuBERT 1.30x / 1.39x on a Pi 4 (1 / 4 threads); see [P4.31](#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03) |
 | the text encoder exported once, not twice | 1.196 → 1.099 s ([Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md)) |
 
 **loom lowers `CONV_1D` to `CONV_2D` on every architecture** — the `#if defined(__aarch64__)` guard is
@@ -3974,3 +3975,58 @@ its load-time constructor. **Writing it up cost the third item of this pass a cl
 correction in §2 above: the follow-up this epic proposed, adding `ggml_backend_cpu_set_threadpool` to
 the CPU backend's proc-address table, is not a follow-up, because it is already there.
 
+
+### P4.31 — depthwise convolutions: a direct kernel, a SIMD interior, and the causal block fused — DONE 2026-10-03
+
+**Where it came from.** WakeHuBERT tiny ([Epic-03](epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders))
+ran 3-4x slower than its own int8 ONNX on the 2.5 s window. Its eight dilated depthwise convolutions
+(`CONV_1D_DW`, K=5, d=1..8) were **35% of engine time for ~1% of the multiply-adds**: the im2col recipe's
+per-channel matmul is `[K, OL] x [K, 1]`, i.e. `n=1, k=5`, which `llamafile_sgemm` (`n < 2`) and tinyBLAS
+(`k < 8`) both refuse, so ggml's generic kernel ran them at ~0.7 GFLOP/s against ~27 for the 1x1 convs.
+Parakeet, the conformers and Moonshine emit the same op.
+
+**What shipped** (branch `perf/conv-dw-direct`):
+
+| change | where | WakeHuBERT F32, 2.5 s, 1 thread, dev box |
+|---|---|---|
+| `CONV_1D_DW` lowers to `ggml_conv_2d_dw_direct` (H=1) for F32/F16 kernels; im2col stays the fallback | `src/ops/primitives_conv.cpp` | 17.22 → 13.94 ms |
+| an F16 depthwise kernel is cast to F32 once per call, not converted per tap | same | F16 20.36 → 19.05 ms |
+| `ggml-0021`: the WHCN kernel runs each row's in-bounds interior as one `ggml_vec_mad_f32` sweep per tap; only the padded edges keep the bounds-checked loop | `cmake/patches/` | 13.94 → 12.58 ms |
+| `ggml-0022`: CPU-backend fusion `PAD(zero, ne0) → CONV_2D_DW → ADD(per-channel bias) → RELU`, each neighbour optional | `cmake/patches/` | 12.67 → 11.29 ms |
+
+Dev box = Ryzen 3 3250U, min over 150 calls per launch, median of 5-7 interleaved launches, pinned
+`0,2`; ONNX int8 is 5.67 ms, fp32 6.47. **Raspberry Pi 4** (both arms built on the board from source with
+the wheel's options -- the base, `ef277f7`, reproduces the rc14 wheel's 66 ms; best of 60, median of 5
+shuffled launches, `cool.sh 60` before each):
+
+| arm | 1 thread | 4 threads |
+|---|---|---|
+| F32 | 65.9 → **50.6 ms** (1.30x) | 33.5 → **24.1 ms** (1.39x) |
+| Q8_0 | 65.9 → **50.3** | 34.2 → **24.2** |
+| F16 | 126.7 → **101.4** (1.25x) | 55.9 → **35.4** (1.58x) |
+| ONNX int8 / fp32 | 22.9 / 29.8 | 9.8 / 11.4 |
+
+**Numerics.** The direct kernel against the im2col recipe: 1.8e-7 relative (F32), 7e-4 (F16 -- the
+im2col path ran the F16 kernel through an F16 patch matrix). `ggml-0021` is bit-identical to ggml's
+scalar kernel (same tap order, both contract to FMA), and `ggml-0022` is bit-identical to the unfused
+graph: the bias and RELU are applied to a finished row in the unfused order. Both hold on x86 AVX2 and
+aarch64. `tests/ci/test_conv_dw_fusion.cpp` pins all of it, including an output aliased onto the PAD's
+input (the taps read *behind* x, so the fused kernel copies a source row out before writing over it);
+removing that copy turns it red (worst relative error 9.1).
+
+**Two things worth knowing before the next item like this.**
+
+* **The profiler cannot see a CPU fusion.** `$LOOM_PROFILE` runs the graph one node at a time, so
+  `ggml_cpu_try_fuse_ops` never fires under it: the 1x1 conv's bias and residual ADDs showed up as 11%
+  of the table while `ggml-0005/0007` were already absorbing them on the real path (fusion off costs
+  0.5 ms). What was really unfused was the depthwise conv's PAD and its broadcast bias ADD -- ggml runs
+  an ADD whose src1 has `ne0 = 1` ~6x slower than a same-shape residual add. Check with a
+  `GGML_CPU_DISABLE_FUSION=1` timing A/B before trusting an elementwise row.
+  [Retro-073](../retros/retro-073-the-profiler-cannot-see-a-fusion.md).
+* **Quantization does not reach this op, and should not.** The depthwise kernels are `[5, 1, 256]` --
+  10K parameters, kept F32 in the Q8_0 file -- and the reduction axis is K=5, so neither P4.13's fold nor
+  P4.29's repack has anything to act on. Q8_0 runs at F32 speed here for that reason.
+
+**Open:** gate the models that also emit `CONV_1D_DW` (parakeet, conformer-ctc, Moonshine); measure the
+Pi Zero (armv6 takes the scalar path of `ggml_vec_mad_f32`); the remaining WakeHuBERT gap is the 1x1 and
+DFT `CONV_2D` (~65% of engine time), which already run through tinyBLAS.
