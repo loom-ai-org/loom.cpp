@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "loom/core/conv_state_cache.h"
 #include "loom/loom_errors.h"
 #include "loom/ops/primitive_registry.h"
@@ -552,6 +553,19 @@ Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     const int d0 = static_cast<int>(resolve_attr_int(attrs, "d0", pc.symbols));
 
     if (!ggml_is_contiguous(data)) data = ggml_cont(pc.ctx, data);
+    // Direct kernel (no im2col, no batched mul_mat). The im2col recipe's per-channel mul_mat is
+    // [K, OL] x [K, 1]: n=1 and k=K, which llamafile_sgemm/tinyBLAS both refuse, so it ran in ggml's
+    // generic path at ~0.7 GFLOP/s on WakeHuBERT. The direct op takes an F32 or F16 kernel and F32
+    // data; anything else keeps the im2col recipe. LOOM_CONV_DW_IM2COL=1 forces the old path (A/B).
+    static const bool force_im2col = std::getenv("LOOM_CONV_DW_IM2COL") != nullptr;
+    if (!force_im2col && data->type == GGML_TYPE_F32 && ggml_is_contiguous(kernel) &&
+        (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
+        const int64_t K = kernel->ne[0], C = kernel->ne[2];
+        ggml_tensor* kernel_4d = ggml_reshape_4d(pc.ctx, kernel, K, 1, 1, C);           // [KW, KH=1, 1, C]
+        ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, data->ne[0], 1, data->ne[1], data->ne[2]); // [W, H=1, C, N]
+        ggml_tensor* y = ggml_conv_2d_dw_direct(pc.ctx, kernel_4d, data_4d, s0, 1, p0, 0, d0, 1);     // [OL, 1, C, N]
+        return {ggml_reshape_3d(pc.ctx, y, y->ne[0], y->ne[2], y->ne[3])};
+    }
     ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, data->ne[0], 1, data->ne[1], data->ne[2]);
     ggml_tensor* im2col = ggml_im2col(pc.ctx, kernel, data_4d, s0, 0, p0, 0, d0, 0, /*is_2D=*/false, conv_im2col_type(kernel));
     // Free either way here, unlike the dense forms. This mul_mat is BATCHED over channels (ggml_mul_mat
