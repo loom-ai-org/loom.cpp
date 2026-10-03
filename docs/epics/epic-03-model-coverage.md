@@ -1320,24 +1320,32 @@ graph, nothing rewritten; coremltools folds the batch norms.
   refused to choose). Per-frame cosine to the f64 reference on jfk.wav, mean / worst: F16 1.000000 /
   0.999998, Q8_0 0.99992 / 0.99978 (upstream's int8 ONNX reports a mean of 0.9975), Q4_1 0.987 / 0.972
   (Q4_0 measured 0.981 / 0.94 and was swapped out for Q4_1, the user's call).
-* **Speed against upstream's ONNX files** (`scripts/bench_wakehubert.py`; Ryzen 3 3250U, 2 cores, loom-py
-  `infer` vs onnxruntime 1.28.0 PyPI `run` from one Python, 7 launches per arm with a 1 s settle, mean of
-  per-launch medians). loom is **2.4-4x SLOWER than the int8 ONNX**, and quantizing buys loom no speed:
+* **Speed against upstream's ONNX files** (`scripts/bench_wakehubert.py`; Ryzen 3 3250U, loom-py `infer`
+  vs onnxruntime 1.28.0 PyPI `run` from one Python, 3 warm-up calls then the median, per launch; 9
+  launches per arm pinned `taskset -c 0,2` (one CPU per physical core), 1 s settle, arm order shuffled;
+  ratio = PAIRED per round against ONNX int8, median [p10-p90], >1 = faster than ONNX int8):
 
-  | clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 |
-  |---|---|---|---|---|---|---|
-  | 2.5 s, 1 | 19.3 ms | 32.0 | 18.8 | 19.2 | **6.8** | 7.0 |
-  | 2.5 s, 2 | 17.1 | 29.8 | 16.9 | 19.1 | **4.3** | 7.8 |
-  | 30 s, 1 | 244 | 359 | 246 | 242 | **147** | 137 |
-  | 30 s, 2 | 196 | 281 | 197 | 193 | **83** | 89 |
+  | clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 | witness spread |
+  |---|---|---|---|---|---|---|---|
+  | 2.5 s, 1 | 19.7 ms, 0.31x [0.29-0.35] | 28.5, 0.22x | 19.7, 0.32x | 19.3, 0.32x | **6.2** | 7.4, 0.82x | 1.06x |
+  | 2.5 s, 2 | 18.6, 0.25x [0.09-0.30] | 22.7, 0.17x | 15.9, 0.24x | 15.5, 0.24x | **3.8** | 4.5, 0.84x | 1.22x |
+  | 30 s, 1 | 259, 0.63x [0.26-0.67] | 364, 0.42x | 252, 0.61x | 261, 0.61x | **145** | 168, 0.96x | **2.24x** |
+  | 30 s, 2 | 189, 0.49x [0.37-0.65] | 278, 0.32x | 193, 0.45x | 195, 0.48x | **91** | 142, 0.62x | **1.74x** |
 
+  **On the 2.5 s window -- the model's streaming use -- loom is 3-4x slower than the int8 ONNX, and that
+  resolves.** The 30 s rows do not: ONNX int8 has a bimodal fast mode (p10 73 ms against a 145 ms mean),
+  so the clock witness spreads past the box's ~1.2x floor (Epic-05, "Operating notes: benchmarking") and
+  only the direction -- roughly 2x slower -- is measured there. Quantizing buys loom no speed, as
+  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register predicts: the
+  convolution dequantizes its kernel to F32 once per call, so the type never reaches the inner loop. F16
+  is ~1.4x slower than F32 because its convolutions take ggml's F16 im2col path (IM2COL 2.1x, CONV_2D
+  1.4x). An earlier unpinned sweep that reported ratios of means said the same within its own spread.
   Accuracy runs the other way: per-frame cosine to the f64 reference, mean / worst, is ONNX int8 0.9970 /
-  0.987 against loom Q8_0's 0.99992 / 0.99978 (ONNX fp32 1.000000). Where loom's time goes (LOOM_PROFILE,
-  30 s, 1 thread, F32, 256 ms a call): ~14 ms is marshalling the lists; of the engine's 242 ms, the eight
-  dilated DEPTHWISE convolutions (IM2COL + batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1
-  convolutions 29%, the DFT convolution 15%, and the separate bias/residual ADDs and causal PADs 15%. A
-  short window pays a fixed per-call cost on top (17 ms at 2.5 s against ONNX's 4.3). F16 is slower than
-  F32 because its convolutions take the F16 im2col path (IM2COL 2.1x, CONV_2D 1.4x). The hub tracks it.
+  0.987 against loom Q8_0's 0.99992 / 0.99978 (ONNX fp32 1.000000). Where loom's time goes
+  (`LOOM_PROFILE`, 30 s, 1 thread, F32, 256 ms a call): ~14 ms is marshalling the lists (the register's
+  "C++/Lua array boundary"); of the engine's 242 ms, the eight dilated DEPTHWISE convolutions (IM2COL +
+  batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1 convolutions 29%, the DFT convolution
+  15%, and the separate bias/residual ADDs and causal PADs 15%. The hub tracks it.
 * **Every precision keeps the DFT basis F32** (`keep_float`): F16 had packed it, which Q8_0's block
   alignment never could, and came out worse than Q8_0
   ([Retro-072](../retros/retro-072-f16-came-out-worse-than-q8-because-alignment-exempted-the-basis.md)).

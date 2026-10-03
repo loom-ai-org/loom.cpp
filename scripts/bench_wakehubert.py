@@ -6,7 +6,12 @@ Both engines are driven the way a user drives them from Python: loom through loo
 onnxruntime through `InferenceSession.run` on a numpy array. One launch loads one model, warms up, and
 prints the median of `nrun` timed calls; `--sweep` runs many launches with a settle between them and the
 arm order shuffled per round, and reports the mean of the per-launch medians (P4.30b's protocol:
-placement is chosen once per process, so only a per-launch sample averages it out).
+placement is chosen once per process, so only a per-launch sample averages it out) AND, per arm, the
+PAIRED ratio against the baseline arm launched in the same round -- median with p10/p90 -- which is
+what cancels a laptop's thermal drift (Epic-05, "Operating notes: benchmarking"). The baseline's own
+spread across rounds is printed as the clock witness: a ratio inside it is not a measurement.
+`--pin 0,2` runs every launch under `taskset -c 0,2` -- on the Ryzen 3 3250U that is one logical CPU
+per PHYSICAL core (0/1 and 2/3 are SMT siblings), so a 2-thread arm cannot land on one core.
 
 One launch:
 
@@ -90,33 +95,34 @@ def sweep(args):
                     engine = "onnx" if path.endswith(".onnx") else "loom"
                     time.sleep(args.settle)
                     cmd = [py, __file__, "run", engine, path, str(seconds), str(threads), str(nrun)]
+                    if args.pin:
+                        cmd = ["taskset", "-c", args.pin] + cmd
                     out = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ))
                     match = next((LINE.match(l) for l in out.stdout.splitlines() if LINE.match(l)), None)
                     if out.returncode or match is None:
                         sys.exit(f"{name} failed:\n{out.stdout}\n{out.stderr}")
-                    results.setdefault((seconds, threads, name), []).append(
-                        (float(match.group(4)), int(match.group(5)), float(match.group(6))))
+                    results.setdefault((seconds, threads, name), [None] * args.rounds)[rnd] = (
+                        float(match.group(4)), int(match.group(5)), float(match.group(6)))
                 print(f"  {seconds} s, {threads} thr, round {rnd + 1}/{args.rounds} done", file=sys.stderr)
     for seconds in args.seconds:
         for threads in args.threads:
             print(f"\n{seconds} s of audio, {threads} thread(s), {args.rounds} launches per arm "
                   f"(mean of per-launch medians; p10-p90 across launches):")
-            base = None
+            witness = [r[0] for r in results[(seconds, threads, args.baseline)]]
             for name, _ in arms:
                 rows = results[(seconds, threads, name)]
                 ms = [r[0] for r in rows]
-                frames = {r[1] for r in rows}
                 mean = statistics.mean(ms)
-                if name == args.baseline:
-                    base = mean
                 q = statistics.quantiles(ms, n=10) if len(ms) > 2 else [min(ms)] * 9
-                rtf = mean / 1000.0 / seconds
-                print(f"  {name:12s} {mean:9.2f} ms  [{q[0]:8.2f} - {q[-1]:8.2f}]  x{1 / rtf:7.0f} real time  "
-                      f"frames {sorted(frames)}  peak RSS {max(r[2] for r in rows):6.1f} MB")
-            if base:
-                print(f"  (vs {args.baseline}: " + ", ".join(
-                    f"{n} {base / statistics.mean([r[0] for r in results[(seconds, threads, n)]]):.2f}x"
-                    for n, _ in arms if n != args.baseline) + "; >1 = faster than the baseline)")
+                paired = sorted(w / m for w, m in zip(witness, ms))
+                pq = statistics.quantiles(paired, n=10) if len(paired) > 2 else [paired[0]] * 9
+                ratio = ("" if name == args.baseline else
+                         f"  vs {args.baseline} {statistics.median(paired):.2f}x [{pq[0]:.2f}-{pq[-1]:.2f}]")
+                print(f"  {name:12s} {mean:9.2f} ms  [{q[0]:8.2f} - {q[-1]:8.2f}]  x{seconds * 1000 / mean:5.0f} "
+                      f"real time  frames {sorted({r[1] for r in rows})}  RSS {max(r[2] for r in rows):6.1f} MB"
+                      f"{ratio}")
+            print(f"  clock witness ({args.baseline}) max/min across rounds: {max(witness) / min(witness):.2f}x; "
+                  f"paired ratio > 1 = faster than {args.baseline}")
 
 
 def main():
@@ -136,6 +142,7 @@ def main():
     s.add_argument("--budget", type=float, default=30.0, help="seconds of audio per launch, which sets nrun")
     s.add_argument("--settle", type=float, default=1.0)
     s.add_argument("--baseline", default="onnx-int8")
+    s.add_argument("--pin", default="", help="taskset -c CPUS for every launch, e.g. 0,2")
     a = p.parse_args()
     if a.mode == "run":
         run(a.engine, a.path, a.seconds, a.threads, a.nrun)
