@@ -10,6 +10,7 @@ placement is chosen once per process, so only a per-launch sample averages it ou
 PAIRED ratio against the baseline arm launched in the same round -- median with p10/p90 -- which is
 what cancels a laptop's thermal drift (Epic-05, "Operating notes: benchmarking"). The baseline's own
 spread across rounds is printed as the clock witness: a ratio inside it is not a measurement.
+`--between "$HOME/cool.sh 60"` replaces the 1 s settle with a cool-down on a board that throttles.
 `--pin 0,2` runs every launch under `taskset -c 0,2` -- on the Ryzen 3 3250U that is one logical CPU
 per PHYSICAL core (0/1 and 2/3 are SMT siblings), so a 2-thread arm cannot land on one core.
 
@@ -93,7 +94,10 @@ def sweep(args):
                 for name, spec in order:
                     py, path = shlex.split(spec)
                     engine = "onnx" if path.endswith(".onnx") else "loom"
-                    time.sleep(args.settle)
+                    if args.between:
+                        subprocess.run(args.between, shell=True, check=True)
+                    else:
+                        time.sleep(args.settle)
                     cmd = [py, __file__, "run", engine, path, str(seconds), str(threads), str(nrun)]
                     if args.pin:
                         cmd = ["taskset", "-c", args.pin] + cmd
@@ -141,6 +145,8 @@ def main():
     s.add_argument("--seconds", type=float, nargs="+", default=[2.5, 30.0])
     s.add_argument("--budget", type=float, default=30.0, help="seconds of audio per launch, which sets nrun")
     s.add_argument("--settle", type=float, default=1.0)
+    s.add_argument("--between", default="", help="a shell command run before every launch instead of the "
+                   "--settle sleep, e.g. \"$HOME/cool.sh 60\" on a Pi (P4.30b's settle there)")
     s.add_argument("--baseline", default="onnx-int8")
     s.add_argument("--pin", default="", help="taskset -c CPUS for every launch, e.g. 0,2")
     a = p.parse_args()

@@ -1347,6 +1347,28 @@ graph, nothing rewritten; coremltools folds the batch norms.
   "C++/Lua array boundary"); of the engine's 242 ms, the eight dilated DEPTHWISE convolutions (IM2COL +
   batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1 convolutions 29%, the DFT convolution
   15%, and the separate bias/residual ADDs and causal PADs 15%. The hub tracks it.
+* **The same comparison on three more machines** (2026-10-03; the published files, released
+  `loom-py-rt 1.0.0rc14`, PyPI onnxruntime 1.28.0; ms per call, mean of per-launch medians; 285K pinned to
+  its P-cores, Pi 4 cooled to 60 C before every launch and never throttled). ONNX has no 32-bit ARM build,
+  so the Pi Zero row is loom alone.
+
+  | machine, clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 |
+  |---|---|---|---|---|---|---|
+  | Core Ultra 9 285K, 2.5 s, 1 | 5.27 | 7.31 | 5.41 | 5.39 | 1.04 | 1.87 |
+  | Core Ultra 9 285K, 2.5 s, 8 | 3.04 | 4.23 | 3.11 | 3.09 | 0.49 | 0.98 |
+  | Core Ultra 9 285K, 30 s, 1 | 63.8 | 90.2 | 64.0 | 64.3 | 12.2 | 21.6 |
+  | Core Ultra 9 285K, 30 s, 4 | 38.3 | 54.8 | 38.2 | 38.5 | 4.4 | 7.5 |
+  | Raspberry Pi 4B, 2.5 s, 1 | 66.2 | 126.7 | 66.1 | 66.1 | 23.0 | 31.3 |
+  | Raspberry Pi 4B, 2.5 s, 4 | 34.0 | 56.0 | 34.3 | 34.2 | 10.0 | 12.0 |
+  | Raspberry Pi 4B, 30 s, 1 | 1108 | 1554 | 1118 | 1118 | 260 | 375 |
+  | Raspberry Pi 4B, 30 s, 4 | 502 | 696 | 502 | 500 | 99 | 161 |
+  | Raspberry Pi Zero W, 2.5 s, 1 | 993 | 7413 | 1273 | 1253 | -- | -- |
+  | Raspberry Pi Zero W, 30 s, 1 | 11841 | 89578 | 15320 | 14945 | -- | -- |
+
+  ONNX int8 beats its own fp32 by ~1.8x where the CPU has VNNI (the 285K) and by 1.3-1.6x on the Pi 4, but
+  only 10-20% on the dev box's Zen 1, which has neither. loom's quantized files run at F32's speed on x86 and
+  aarch64 and ~1.27x SLOWER on ARMv6; F16 is 1.4-1.9x slower than F32 everywhere and 7.5x on the Pi Zero (no
+  F16 hardware). loom scales 1.7-1.9x from 1 to 8 threads on the 285K, ONNX 2-2.8x.
 * **Every precision keeps the DFT basis F32** (`keep_float`): F16 had packed it, which Q8_0's block
   alignment never could, and came out worse than Q8_0
   ([Retro-072](../retros/retro-072-f16-came-out-worse-than-q8-because-alignment-exempted-the-basis.md)).
