@@ -561,6 +561,10 @@ Outputs op_conv_1d_dw(PrimitiveContext& pc, const Inputs& in, const Json& attrs)
     if (!force_im2col && data->type == GGML_TYPE_F32 && ggml_is_contiguous(kernel) &&
         (kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16)) {
         const int64_t K = kernel->ne[0], C = kernel->ne[2];
+        // An F16 kernel is cast to F32 once per call (K*C elements, a few KB) rather than converted per
+        // tap inside the conv. LOOM_CONV_DW_KEEP_F16=1 skips the cast (A/B).
+        static const bool keep_f16 = std::getenv("LOOM_CONV_DW_KEEP_F16") != nullptr;
+        if (kernel->type == GGML_TYPE_F16 && !keep_f16) kernel = ggml_cast(pc.ctx, kernel, GGML_TYPE_F32);
         ggml_tensor* kernel_4d = ggml_reshape_4d(pc.ctx, kernel, K, 1, 1, C);           // [KW, KH=1, 1, C]
         ggml_tensor* data_4d = ggml_reshape_4d(pc.ctx, data, data->ne[0], 1, data->ne[1], data->ne[2]); // [W, H=1, C, N]
         ggml_tensor* y = ggml_conv_2d_dw_direct(pc.ctx, kernel_4d, data_4d, s0, 1, p0, 0, d0, 1);     // [OL, 1, C, N]
