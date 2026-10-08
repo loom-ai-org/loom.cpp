@@ -405,15 +405,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
-* [ ] **SenseVoice transcribes to nothing on Vulkan.** `sensevoice-small.gguf` (the published file)
+* [ ] **SenseVoice transcribes to nothing on Vulkan and Metal.** `sensevoice-small.gguf` (the published file)
   returns `''` from `speech2text.infer` on `samples/jfk.wav` with `device="Vulkan0"`, and the card
   gate's ASR row fails on it. The same process on `CPU` gives the right transcript. Found 2026-10-08
   on the dev box's AMD Radeon Vega 3 (RADV RAVEN2) while smoke-testing P4.31. It is **not P4.31's**:
   the rc14 engine (`70195f1`) with the same `libggml-vulkan.so` returns `''` too. WakeHuBERT,
   Parakeet-TDT, Supertonic, Citrinet and Kokoro pass on the same device. **CUDA is fine**: the same
-  file transcribes correctly on the workstation's RTX 5090 (`CUDA0`, card gate green), so this is
-  Vulkan's. Not yet known: whether it reproduces on another Vulkan GPU, and which phase goes wrong
-  first. Start with a tensor oracle per phase, not the transcript.
+  file transcribes correctly on the workstation's RTX 5090 (`CUDA0`, card gate green). **Metal fails
+  the same way**: `''` on the M1 Pro's `MTL0` with both engines, while the Mac's CPU transcribes
+  correctly. So the bad op is one that Vulkan and Metal both get wrong and CUDA gets right -- or one
+  CUDA does not support at all and leaves to the CPU. Comparing the three backends' `supports_op` over
+  SenseVoice's ops is a cheap first step. Not yet known: which phase goes wrong first. Start with a
+  tensor oracle per phase, not the transcript.
   → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
 * [ ] **Citrinet aborts on CUDA.** `citrinet-1024.gguf` (the published file) kills the process inside
   `speech2text.infer` on `samples/jfk.wav` with `device="CUDA0"`: `ggml-cuda/mmvf.cu:423:
@@ -425,6 +428,16 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   (n = 1). Note the abort takes the caller's process down, so a CUDA user cannot catch it as an
   exception. The CUDA build used was this tree's source at the same ggml commit as rc14, not the
   released `loom-py-rt-cuda` wheel.
+  → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **Kokoro produces garbage on Metal.** `kokoro-82m.gguf` (the published file) with
+  `text2speech.infer(phonemes="həˈloʊ wˈɜːld", sample_rate=24000)` on `MTL0` returns audio of the right
+  length (39600 samples, no NaN) but peaking at **3.02** against **0.27** on `CPU`, and Whisper hears
+  "(gasps)" where the CPU output reads "Halo World"; the card gate fails it on the peak check. Found
+  2026-10-08 on the M1 Pro while smoke-testing P4.31. It is **not P4.31's**: the rc14 engine with
+  the same `libggml-metal.so` produces the identical peak. **Metal only** -- Kokoro passes on Vulkan
+  (Radeon Vega 3) and CUDA (RTX 5090). Not yet known: which phase first diverges. Compare each
+  phase against the CPU (the ALBERT encoder, the duration and F0 predictors, the iSTFT vocoder).
+  The Metal build used was this tree's source, not the released `loom-py-rt-metal` wheel.
   → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
