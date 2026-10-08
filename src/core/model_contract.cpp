@@ -75,6 +75,7 @@ ModelContract ModelContract::read(const GgufModel& model) {
     }
     c.frame_rate = opt_f32(model, "output.frame_rate");
     c.frame_offset = opt_f32(model, "output.frame_offset");
+    c.embedding_dim = opt_u32(model, "output.embedding_dim");
 
     c.default_steps = opt_u32(model, "tts.default_steps");
     c.voices = opt_arr_str(model, "loom.tts.voices");
