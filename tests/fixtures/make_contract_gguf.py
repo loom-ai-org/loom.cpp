@@ -416,6 +416,20 @@ function infer(inputs)
 end
 """
 
+# One row of three per four samples, each row's values naming its own position -- row r is
+# [r, r + 0.25, r + 0.5] -- so a cut at the wrong width, or rows read out of order, is a different table.
+FRAME_EMBED_DRIVER = """
+function infer(inputs)
+    local out = {}
+    for r = 0, math.floor(#inputs.waveform / 4) - 1 do
+        out[#out + 1] = r
+        out[#out + 1] = r + 0.25
+        out[#out + 1] = r + 0.5
+    end
+    return out
+end
+"""
+
 # Three numbers for a two-label head: not a whole number of rows, which the door must refuse.
 SKEWED_DRIVER = """
 function infer(inputs)
@@ -425,7 +439,7 @@ end
 
 
 def _audio_classifier(path: Path, arch: str, task: str, kind: str, granularity: str, driver: str,
-                      labels=None, frame_rate=None, frame_offset=None) -> None:
+                      labels=None, frame_rate=None, frame_offset=None, embedding_dim=None) -> None:
     w = _base(path, arch)
     w.add_string("loom.task", task)
     w.add_string("loom.input.kind", "audio")
@@ -439,6 +453,9 @@ def _audio_classifier(path: Path, arch: str, task: str, kind: str, granularity: 
         w.add_float32("loom.output.frame_rate", frame_rate)
     if frame_offset is not None:
         w.add_float32("loom.output.frame_offset", frame_offset)
+    if embedding_dim is not None:
+        # i32, as the exporter writes a Python int.
+        w.add_int32("loom.output.embedding_dim", embedding_dim)
     w.add_string("model.driver_script", driver)
     _finish(w)
 
@@ -452,6 +469,24 @@ def write_audio_classifiers(out_dir: Path) -> None:
                       labels=["en", "de", "fr"])
     _audio_classifier(out_dir / "audio_embedder.gguf", "embedder_test",
                       "audio-embedding", "embeddings", "clip", EMBED_DRIVER)
+    # The embedder's driver echoes three numbers; declaring the width it answers in is the post-key
+    # spelling of the same file, and must cut to the same single row.
+    _audio_classifier(out_dir / "audio_embedder_declared.gguf", "embedder_declared_test",
+                      "audio-embedding", "embeddings", "clip", EMBED_DRIVER, embedding_dim=3)
+    # A clip file declaring a width its answer is not one row of: refused, not cut into three rows.
+    _audio_classifier(out_dir / "audio_embedder_wrong_width.gguf", "embedder_wrong_width_test",
+                      "audio-embedding", "embeddings", "clip", EMBED_DRIVER, embedding_dim=1)
+    _audio_classifier(out_dir / "audio_frame_embedder.gguf", "frame_embedder_test",
+                      "audio-embedding", "embeddings", "frame", FRAME_EMBED_DRIVER,
+                      frame_rate=4.0, frame_offset=0.5, embedding_dim=3)
+    # The same file as exported before the key existed: no width, so no cut that is not a guess.
+    _audio_classifier(out_dir / "audio_frame_embedder_undeclared.gguf", "frame_embedder_undeclared_test",
+                      "audio-embedding", "embeddings", "frame", FRAME_EMBED_DRIVER, frame_rate=4.0)
+    # Rows of three cut at a declared width of two. The test hands it twelve samples -- three rows, nine
+    # numbers -- because two rows would be six, which a width of two divides without complaint.
+    _audio_classifier(out_dir / "audio_frame_embedder_skewed.gguf", "frame_embedder_skewed_test",
+                      "audio-embedding", "embeddings", "frame", FRAME_EMBED_DRIVER,
+                      frame_rate=4.0, embedding_dim=2)
     _audio_classifier(out_dir / "audio_skewed_classifier.gguf", "skewed_classifier_test",
                       "audio-classification", "class", "frame", SKEWED_DRIVER,
                       labels=["non_speech", "speech"], frame_rate=50.0)
