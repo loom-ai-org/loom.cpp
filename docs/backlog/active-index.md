@@ -405,13 +405,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
-* [ ] **EnCodec and DAC abort on Vulkan on NVIDIA** (RTX 5090, 2026-10-08):
-  `ggml-vulkan.cpp:11863: GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || (a_offset == 0 && ...))`. A
-  `GET_ROWS` on a view whose offset is not a multiple of `minStorageBufferOffsetAlignment`, which is 16
-  bytes on NVIDIA and 4 on the Radeon Vega 3, where both pass. It predates this branch: the tag-less
-  engine aborts the same way. Upstream fixed it in llama.cpp `0cae43063c` (#28253, 2026-09-07), after the
-  pin. That fix reworks the misaligned-descriptor arithmetic for EVERY Vulkan op, not just `GET_ROWS`, so
-  a backport needs the full Vulkan card gate on both a 4-byte and a 16-byte device.
+* [ ] **After rc15 is released: backport upstream's Vulkan misaligned-offset fix, llama.cpp
+  `0cae43063c`** (#28253, 2026-09-07). Scheduled after the release by the user's call (2026-10-08), so
+  rc15 ships without it. The pin (v0.19.0) predates the fix, and without it **EnCodec and DAC abort on
+  Vulkan on NVIDIA** (RTX 5090, 2026-10-08):
+  `ggml-vulkan.cpp:11863: GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || (a_offset == 0 && ...))`. That
+  is a `GET_ROWS` on a view whose offset is not a multiple of `minStorageBufferOffsetAlignment`, which
+  is 16 bytes on NVIDIA and 4 on the Radeon Vega 3, where both models pass. It predates PR #62: the
+  engine without the precision tag aborts the same way. The fix reworks the misaligned-descriptor
+  arithmetic for EVERY Vulkan op, not just `GET_ROWS`, so it lands as its own `ggml-00NN` patch (with an
+  [UPSTREAM.md](../../cmake/patches/UPSTREAM.md) entry saying it can be deleted once the pin passes
+  `0cae43063c`). It is done when the full Vulkan card gate passes on both a 4-byte device (Vega 3) and
+  a 16-byte one (5090), with EnCodec and DAC green on the 5090.
   → [Epic-04 §6](../epics/epic-04-backends-and-accelerators.md#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)
 * [ ] **F5-TTS clips on Vulkan on NVIDIA** (RTX 5090, 2026-10-08): the card's output peaks at 1.20 and
   the gate's [0.01, 1.001] check fails. The CPU passes, and so does Vulkan on the Radeon Vega 3. It
