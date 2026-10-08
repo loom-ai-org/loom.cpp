@@ -15,6 +15,29 @@
 namespace loom {
 namespace {
 
+// **An F32 x F32 product is computed in F32 on every backend.** ggml's default precision for MUL_MAT
+// lets a GPU backend stage its tiles in half precision: Vulkan's matmul_f32_f32 keeps both operands in
+// float16_t shared memory on any fp16-capable device (and its coopmat paths convert them to f16
+// outright), and Metal's kernel_mul_mm_f32_f32 loads both into `half` threadgroup tiles. Any |value| >
+// 65504 becomes inf there, and inf * 0 is NaN. CPU and CUDA (cuBLAS SGEMM) never do this, so a model can
+// be exact on both and still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
+// near 1e10, its mel projection came back 99.5% NaN, and the transcript was ''. GGML_PREC_F32 is ggml's
+// own way of asking for full precision; cmake/patches/ggml-0023 and ggml-0024 make those two backends
+// honour it for F32 x F32 (stock ggml ignores it there). Tagged here, on the finished graph, rather than
+// at each ggml_mul_mat call site, so that a new primitive cannot forget it. A non-F32 `a` (F16, a
+// quantized weight) is left alone: that is the precision the model was exported at, and the CPU converts
+// `b` to the weight's vec_dot_type on that path too.
+void request_f32_matmul_precision(ggml_cgraph* gf) {
+    const int n = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 &&
+            node->src[1]->type == GGML_TYPE_F32) {
+            ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+        }
+    }
+}
+
 // The one factor the compute-buffer shrink is tuned by, used at BOTH ends so they cannot disagree: a
 // growth arms the check only if the buffer more than doubled, and the check gives memory back only if
 // less than half of it is needed. Two is not a tuned optimum -- it is the smallest number that
@@ -432,6 +455,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
             ggml_build_forward_expand(gf, ggml_cpy(ctx.get(), result.outputs[i], slots[i]));
         }
     }
+    request_f32_matmul_precision(gf);
     result.graph = gf;
 
     if (backends_.hybrid()) {

@@ -1247,6 +1247,96 @@ copying each source row out before writing it; a partial overlap declines.
 launches): 12.67 -> 11.29 ms. Bit-identical to the unfused graph on F32, F16 and Q8_0 files, and at 4
 threads. x86 AVX2 only measured.
 
+## PR 20 — `vulkan`: honour `GGML_PREC_F32` for an F32 x F32 `mul_mat`
+
+*(`cmake/patches/ggml-0023-vulkan-f32-matmul-prec.patch`, independent of the others)*
+
+**Problem.** On any fp16-capable device, `matmul_f32_f32` is the `FLOAT_TYPE = float16_t` build. Both
+operands pass through half-precision shared memory, and its coopmat paths convert them to f16
+outright. A non-contiguous F32 operand is also copied to f16 before the multiply. `GGML_PREC_F32` only
+selects an f32 *accumulator*, and only for F16/quantized `src0`; for F32 x F32 it is ignored. So any
+value past 65504 becomes inf. SenseVoice-Small's power spectrum (kaldi fbank, peaks near 1e10) made its
+mel projection 99.5% NaN on a Radeon Vega 3, and the model transcribed nothing
+([Retro-074](../../docs/retros/retro-074-a-gpus-f32-matmul-was-half-precision.md)).
+
+**Change.** A `pipeline_matmul_f32_prec` built from the always-compiled `_fp32` SPIR-V with the scalar
+tile sizes, following the same "reusing CREATE_MM from the fp32 path" pattern the BF16 fallback
+already uses. When `src0`, `src1` are F32 and `op_params[0] == GGML_PREC_F32`, `ggml_vk_mul_mat_q_f16`
+selects it, its conversion type becomes F32 instead of F16 (non-contiguous copies stay F32, the
+coopmat2 forced copy is skipped, the integer-dot Q8_1 path is skipped), and the prealloc sizes follow
+that type rather than `sizeof(ggml_fp16_t)`. On a device without fp16 the new pipeline *is*
+`pipeline_matmul_f32`. Default-precision graphs are untouched.
+
+**Measured.** SenseVoice on `Vulkan0` (Vega 3, RADV): every node within 1e-5 abs-sum of the CPU,
+logits to six significant figures; card gate green on 40 models on the Vega 3 (37/40 on the 5090's
+Vulkan, the three failures pre-existing and unrelated). The cost is real on the Vega 3: whisper-small
+6007 → 7713 ms, Parakeet-TDT 2706 → 3673 ms (F32 FMAs instead of packed fp16); on an RTX 5090 (coopmat2)
+whisper-small 122.0 → 141.3 ms. Which is why it is opt-in
+per node rather than a change to the default. Verified failing before and fixed after on coopmat2 and
+KHR coopmat (RTX 5090) and on plain fp16 (Intel Arc iGPU, Vega 3).
+
+## PR 21 — `metal`: honour `GGML_PREC_F32` for an F32 x F32 `mul_mm`
+
+*(`cmake/patches/ggml-0024-metal-f32-matmul-prec.patch`; applies after PRs 14–16, independent of their logic)*
+
+**Problem.** `kernel_mul_mm_f32_f32` is instantiated with `S0 = S1 = half`: both operands are loaded
+into half threadgroup tiles. This has the same overflow as PR 20, with the same SenseVoice symptom on
+an M1 Pro. The mat-vec kernels are F32 throughout and are not affected.
+
+**Change.** `kernel_mul_mm_f32_f32_prec`, the same template with float tiles. B's offset in shared
+memory becomes `64*32*sizeof(S0)` (4096 for the half kernels, as before), and the host requests
+8192 + 4096 bytes for it. `ggml_metal_library_get_pipeline_mul_mm` picks it when `op_params[0] ==
+GGML_PREC_F32`. The tensor-API `kernel_mul_mm` has no float variant here, so on those devices
+`ggml_metal_op_mul_mat` sends the case to the mat-vec kernel instead.
+
+**Measured** (M1 Pro, median of 10 calls, three alternating rounds): whisper-small 587.9 → 586.8 ms,
+SenseVoice 114.6 → 115.6 ms (and correct). Not run: a tensor-API device.
+
+## PR 22 — `metal`: NORM/RMS_NORM with a partial last simdgroup — already upstream
+
+*(`cmake/patches/ggml-0025-metal-norm-partial-simdgroup.patch`)*
+
+**Not a PR: a backport.** llama.cpp `a194a75b7e` (#26708, 2026-08-07) rounds `ggml_metal_op_norm`'s
+thread count up to whole simdgroups. Before it, a row of 66 gave 66 threads, and the cross-simdgroup
+reduction in the 2-lane last simdgroup dropped its own partial. Kokoro's AdaIN norms (66 frames) turned
+that into a 11x louder, unintelligible waveform on an M1 Pro
+([Retro-075](../../docs/retros/retro-075-upstream-had-already-fixed-the-norm.md)). **Delete this patch
+when the pin passes that commit.**
+
+## PR 23 — `cuda`: `mul_mat_vec_f` asserts on a `src1` stride it never steps by
+
+*(`cmake/patches/ggml-0026-cuda-mmvf-src1-strides.patch`, independent of the others)*
+
+**Problem.** `ggml_cuda_should_use_mmvf` checks only `src0`'s strides, but
+`launch_mul_mat_vec_f_cuda` asserts `stride_col_y % 2 == 0` on `src1` and aborts the process. A
+squeeze-excite's pooled `[1, C]`, permuted to one `[C, 1]` column, has `nb[1] == 4`, so Citrinet-1024
+died on an RTX 5090 at its first SE block. The kernel reads `y` at `j*stride_col_y` for `j <
+ncols_dst`, so with one column the stride is never used.
+
+**Change.** The assert allows any column stride when `ncols_dst == 1` (not for the multi-token-id
+form, which does step by it). `ggml_cuda_mul_mat` and the mat-vec fusion check decline mmvf when a
+`src1` stride it *would* step by (column, channel or sample, for a dimension larger than one) is not a
+whole number of `float2`, so such a product falls through to the other kernels instead of aborting.
+
+**Measured.** Citrinet-1024 on `CUDA0` transcribes identically to the CPU; the SE `MUL_MAT`'s output
+matches the CPU's sum exactly. Card gate green on 7 models.
+
+## PR 24 — `vulkan`: `conv_transpose_1d` overruns its fixed shared window
+
+*(`cmake/patches/ggml-0027-vulkan-conv-transpose-1d-shared-window.patch`, applies after PR 20)*
+
+**Problem.** `conv_transpose_1d.comp` accumulates a workgroup's output window, `128*s0 + K` values,
+in a fixed `shared D_TYPE tmp[4096]`, and neither the shader nor `supports_op` checks the size. An iSTFT
+written as an overlap-add transposed convolution (Soprano: hop `s0 = 512`, `K = 2048`) needs 67584
+slots. The writes land outside the array and the output came back about 4000x too quiet, with no
+error. Upstream master has the same shader and the same `supports_op` (2026-10-08).
+
+**Change.** `supports_op` declines a `CONV_TRANSPOSE_1D` whose window does not fit, so the scheduler
+runs it on the CPU. A shader that tiles the window would keep it on the device; that is the better
+upstream fix and is not attempted here.
+
+**Measured.** Soprano-1.1-80m on `Vulkan0` (Vega 3): peak 0.00099 → 0.54464, identical to the CPU.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
