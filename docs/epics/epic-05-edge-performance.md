@@ -4055,6 +4055,29 @@ variables that `LOOM_FIXTURES` does not cover, or they skip: `LOOM_SAMPLES_DIR` 
 `samples/jfk.wav` relative to the build directory, and the skip message blames the GGUF) and
 `LOOM_CONFORMER_CTC_DIR` (the parent of the PyTorch `ref/` directory). With both set they pass.
 
+**Speed on other models** (2026-10-08; dev box, 2 threads pinned `0,2`; rc14's engine against
+P4.31's, 5 interleaved launches per arm, 3 timed calls each, the card's own call). Every output is
+unchanged: identical transcripts, audio within 8.6e-7.
+
+| model | rc14 | P4.31 | paired rc14/P4.31, median [p10-p90] |
+|---|---|---|---|
+| Citrinet-1024 (jfk.wav) | 2308 ms | 1622 ms | **1.45x** [1.23-1.59] |
+| SenseVoice-Small | 1759 | 1561 | 1.12x [1.09-1.18] |
+| Supertonic-2 ("hello world") | 643 | 576 | 1.12x [1.08-1.15] |
+| Parakeet-TDT-0.6B | 3394 | 3083 | 1.07x [1.03-1.21] |
+| Kokoro-82M | 2399 | 2233 | 1.08x [0.99-1.17] -- inside the noise |
+
+Only Citrinet's gain is clearly beyond the box's ~1.2x noise. The rest are small but sit above 1 at
+p10, except Kokoro's, which is neutral. None got slower. On the Pi Zero with `bluetooth-km-switch`
+stopped (the same condition as Epic-03's table), WakeHuBERT F32 is 900 -> 752 ms.
+
+**GPU backends** (card gate on WakeHuBERT and the five models above). Both backends implement
+`CONV_2D_DW`, so the new op runs on the device. Vulkan (the dev box's Radeon Vega 3, RADV) passes all
+but SenseVoice, which transcribes to `''`. CUDA (RTX 5090, `ggml-cuda` built from this tree for sm_120)
+passes all but Citrinet, which aborts in `mmvf.cu` on `GGML_ASSERT(stride_col_y % 2 == 0)`. **Neither
+failure is P4.31's**: rc14's engine fails both identically with the same backend library. Both are
+on the hub under *Backends & accelerators*.
+
 **Open: what is left between WakeHuBERT and ONNX int8** (11.2 ms against 5.67, dev box, F32, one
 thread, 2026-10-08). Every conv in the model is already on ggml's direct `CONV_2D` op (P4.29), which
 tiles an im2col into scratch and runs a GEMM per tile. Per call, against the 55 GFLOP/s peak above:

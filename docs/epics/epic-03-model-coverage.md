@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-03
+last_updated: 2026-10-08
 ---
 
 # Epic-03: Model Coverage
@@ -1321,59 +1321,67 @@ graph, nothing rewritten; coremltools folds the batch norms.
   refused to choose). Per-frame cosine to the f64 reference on jfk.wav, mean / worst: F16 1.000000 /
   0.999998, Q8_0 0.99992 / 0.99978 (upstream's int8 ONNX reports a mean of 0.9975), Q4_1 0.987 / 0.972
   (Q4_0 measured 0.981 / 0.94 and was swapped out for Q4_1, the user's call).
-* **Speed against upstream's ONNX files** (`scripts/bench_wakehubert.py`; Ryzen 3 3250U, loom-py `infer`
-  vs onnxruntime 1.28.0 PyPI `run` from one Python, 3 warm-up calls then the median, per launch; 9
-  launches per arm pinned `taskset -c 0,2` (one CPU per physical core), 1 s settle, arm order shuffled;
-  ratio = PAIRED per round against ONNX int8, median [p10-p90], >1 = faster than ONNX int8):
+* **Speed against upstream's ONNX files** (`scripts/bench_wakehubert.py`; Ryzen 3 3250U; loom-py `infer`
+  against PyPI onnxruntime 1.28.0 `run`, each arm in its own interpreter -- loom from the `piper` venv,
+  onnxruntime from `ovos`; 3 warm-up calls then the median, per launch; 9 launches per arm pinned
+  `taskset -c 0,2` (one CPU per physical core), 1 s settle, arm order shuffled; ratio = PAIRED per round
+  against ONNX int8, median [p10-p90], >1 = faster than ONNX int8). **Engine: P4.31's** (loom.cpp #61,
+  shipping in rc15), re-measured 2026-10-08; the rc14 wheel's F32 is in the last column for reference:
 
-  | clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 | witness spread |
+  | clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 | witness spread | rc14 F32 |
+  |---|---|---|---|---|---|---|---|---|
+  | 2.5 s, 1 | 11.6 ms, 0.50x [0.47-0.60] | 18.0, 0.33x | 11.5, 0.50x | 11.8, 0.49x | **5.9** | 7.0, 0.84x | 1.25x | 19.7 |
+  | 2.5 s, 2 | 10.7, 0.29x [0.29-0.38] | 16.1, 0.20x | 10.2, 0.29x | 11.2, 0.28x | **3.2** | 3.9, 0.84x | 1.05x | 18.6 |
+  | 30 s, 1 | 165, 0.54x [0.27-1.00] | 216, 0.34x | 189, 0.52x | 175, 0.53x | **94** | 120, 0.83x | **2.07x** | 259 |
+  | 30 s, 2 | 169, 0.40x [0.25-0.51] | 204, 0.31x | 169, 0.39x | 170, 0.41x | **64** | 55, 1.13x | **1.63x** | 189 |
+
+  **On the 2.5 s window -- the model's streaming use -- loom is now ~2x slower than the int8 ONNX at one
+  thread (it was 3-4x on rc14), and that resolves.** At two threads loom barely moves (11.6 -> 10.7 ms)
+  while ONNX nearly halves, so the gap there is ~3.4x. The 30 s rows do not resolve: ONNX int8 has a
+  bimodal fast mode, the clock witness spreads past the box's ~1.2x floor (Epic-05, "Operating notes:
+  benchmarking"), and only the direction -- roughly 2x slower -- is measured there. Quantizing buys loom
+  no speed, as [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register
+  predicts: the convolution dequantizes its kernel to F32 once per call, so the type never reaches the
+  inner loop. F16 is ~1.5x slower than F32. On rc14, `LOOM_PROFILE` put that in IM2COL (2.1x, the
+  depthwise convolutions' F16 patch matrix) and CONV_2D (1.4x). P4.31 removed the IM2COL half -- a
+  depthwise F16 kernel is now cast to F32 once per call -- so what is left is the 1x1 and DFT
+  convolutions (not re-profiled). Accuracy runs the other way: per-frame cosine to the f64 reference,
+  mean / worst, is ONNX int8 0.9970 / 0.987 against loom Q8_0's 0.99992 / 0.99978 (ONNX fp32 1.000000).
+  Where loom's time went on rc14 (`LOOM_PROFILE`, 30 s, 1 thread, F32, 256 ms a call): ~14 ms
+  marshalling the lists (the register's "C++/Lua array boundary"); of the engine's 242 ms, the eight
+  dilated DEPTHWISE convolutions (IM2COL + batched MUL_MAT) were 35% for ~1% of the multiply-adds, the
+  1x1 convolutions 29%, the DFT convolution 15%, and the separate bias/residual ADDs and causal PADs 15%.
+  P4.31 took the depthwise share out with a direct kernel, its SIMD interior and the PAD+bias+RELU
+  fusion. What is left, and which levers remain, is measured in
+  [Epic-05 P4.31](epic-05-edge-performance.md#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03).
+* **The same comparison on three more machines** (re-measured 2026-10-08 on P4.31's engine with each
+  machine's #60 protocol: the published files; the released `loom-py-rt 1.0.0rc14` package with its
+  engine libraries replaced by ones built from loom.cpp `c8fe8bb` with the wheel's own build options;
+  PyPI onnxruntime 1.28.0; ms per call, mean of per-launch medians; 285K pinned to CPUs 0-7, Pi 4
+  cooled to 60 C before every launch and never throttled). ONNX has no 32-bit ARM build, so the Pi Zero
+  row is loom alone -- measured with the board's `bluetooth-km-switch` service STOPPED for the run and
+  restarted after (the user's call): with it running, every arm is 7-11% slower.
+
+  | machine, clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 | rc14 F32 |
   |---|---|---|---|---|---|---|---|
-  | 2.5 s, 1 | 19.7 ms, 0.31x [0.29-0.35] | 28.5, 0.22x | 19.7, 0.32x | 19.3, 0.32x | **6.2** | 7.4, 0.82x | 1.06x |
-  | 2.5 s, 2 | 18.6, 0.25x [0.09-0.30] | 22.7, 0.17x | 15.9, 0.24x | 15.5, 0.24x | **3.8** | 4.5, 0.84x | 1.22x |
-  | 30 s, 1 | 259, 0.63x [0.26-0.67] | 364, 0.42x | 252, 0.61x | 261, 0.61x | **145** | 168, 0.96x | **2.24x** |
-  | 30 s, 2 | 189, 0.49x [0.37-0.65] | 278, 0.32x | 193, 0.45x | 195, 0.48x | **91** | 142, 0.62x | **1.74x** |
+  | Core Ultra 9 285K, 2.5 s, 1 | 3.73 | 4.67 | 3.85 | 3.85 | 1.08 | 1.97 | 5.27 |
+  | Core Ultra 9 285K, 2.5 s, 8 | 2.04 | 2.11 | 2.09 | 2.08 | 0.49 | 1.00 | 3.04 |
+  | Core Ultra 9 285K, 30 s, 1 | 47.0 | 60.1 | 47.0 | 47.2 | 12.6 | 22.5 | 63.8 |
+  | Core Ultra 9 285K, 30 s, 4 | 26.2 | 29.5 | 26.1 | 26.1 | 4.3 | 7.6 | 38.3 |
+  | Raspberry Pi 4B, 2.5 s, 1 | 50.9 | 101.5 | 50.3 | 50.4 | 23.2 | 31.0 | 66.2 |
+  | Raspberry Pi 4B, 2.5 s, 4 | 24.4 | 35.9 | 24.5 | 24.3 | 10.0 | 11.6 | 34.0 |
+  | Raspberry Pi 4B, 30 s, 1 | 717 | 1256 | 738 | 735 | 262 | 385 | 1108 |
+  | Raspberry Pi 4B, 30 s, 4 | 350 | 457 | 348 | 349 | 99 | 161 | 502 |
+  | Raspberry Pi Zero W, 2.5 s, 1 | 752 | 6859 | 1012 | 1003 | -- | -- | 900 |
+  | Raspberry Pi Zero W, 30 s, 1 | 9012 | 83138 | 11959 | 11873 | -- | -- | 10806 |
 
-  **On the 2.5 s window -- the model's streaming use -- loom is 3-4x slower than the int8 ONNX, and that
-  resolves.** The 30 s rows do not: ONNX int8 has a bimodal fast mode (p10 73 ms against a 145 ms mean),
-  so the clock witness spreads past the box's ~1.2x floor (Epic-05, "Operating notes: benchmarking") and
-  only the direction -- roughly 2x slower -- is measured there. Quantizing buys loom no speed, as
-  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register predicts: the
-  convolution dequantizes its kernel to F32 once per call, so the type never reaches the inner loop. F16
-  is ~1.4x slower than F32 because its convolutions take ggml's F16 im2col path (IM2COL 2.1x, CONV_2D
-  1.4x). An earlier unpinned sweep that reported ratios of means said the same within its own spread.
-  Accuracy runs the other way: per-frame cosine to the f64 reference, mean / worst, is ONNX int8 0.9970 /
-  0.987 against loom Q8_0's 0.99992 / 0.99978 (ONNX fp32 1.000000). Where loom's time goes
-  (`LOOM_PROFILE`, 30 s, 1 thread, F32, 256 ms a call): ~14 ms is marshalling the lists (the register's
-  "C++/Lua array boundary"); of the engine's 242 ms, the eight dilated DEPTHWISE convolutions (IM2COL +
-  batched MUL_MAT) are 35% for ~1% of the multiply-adds, the 1x1 convolutions 29%, the DFT convolution
-  15%, and the separate bias/residual ADDs and causal PADs 15%. **Since then (P4.31, 2026-10-03, not yet
-  released):** a direct depthwise kernel, its SIMD interior and the PAD+bias+RELU fusion took the 2.5 s
-  window to 11.3 ms F32 on the dev box and 50.6 / 24.1 ms at 1 / 4 threads on the Pi 4 (from 65.9 / 33.5)
-  -- [Epic-05 P4.31](epic-05-edge-performance.md#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03).
-  The tables here are the released rc14 wheel.
-* **The same comparison on three more machines** (2026-10-03; the published files, released
-  `loom-py-rt 1.0.0rc14`, PyPI onnxruntime 1.28.0; ms per call, mean of per-launch medians; 285K pinned to
-  its P-cores, Pi 4 cooled to 60 C before every launch and never throttled). ONNX has no 32-bit ARM build,
-  so the Pi Zero row is loom alone -- measured with the board's `bluetooth-km-switch` service STOPPED (the
-  user's call): with it running, every arm was 7-11% slower.
-
-  | machine, clip, threads | loom F32 | F16 | Q8_0 | Q4_1 | ONNX int8 | ONNX fp32 |
-  |---|---|---|---|---|---|---|
-  | Core Ultra 9 285K, 2.5 s, 1 | 5.27 | 7.31 | 5.41 | 5.39 | 1.04 | 1.87 |
-  | Core Ultra 9 285K, 2.5 s, 8 | 3.04 | 4.23 | 3.11 | 3.09 | 0.49 | 0.98 |
-  | Core Ultra 9 285K, 30 s, 1 | 63.8 | 90.2 | 64.0 | 64.3 | 12.2 | 21.6 |
-  | Core Ultra 9 285K, 30 s, 4 | 38.3 | 54.8 | 38.2 | 38.5 | 4.4 | 7.5 |
-  | Raspberry Pi 4B, 2.5 s, 1 | 66.2 | 126.7 | 66.1 | 66.1 | 23.0 | 31.3 |
-  | Raspberry Pi 4B, 2.5 s, 4 | 34.0 | 56.0 | 34.3 | 34.2 | 10.0 | 12.0 |
-  | Raspberry Pi 4B, 30 s, 1 | 1108 | 1554 | 1118 | 1118 | 260 | 375 |
-  | Raspberry Pi 4B, 30 s, 4 | 502 | 696 | 502 | 500 | 99 | 161 |
-  | Raspberry Pi Zero W, 2.5 s, 1 | 900 | 6921 | 1153 | 1144 | -- | -- |
-  | Raspberry Pi Zero W, 30 s, 1 | 10806 | 83664 | 13563 | 13537 | -- | -- |
-
-  ONNX int8 beats its own fp32 by ~1.8x where the CPU has VNNI (the 285K) and by 1.3-1.6x on the Pi 4, but
-  only 10-20% on the dev box's Zen 1, which has neither. loom's quantized files run at F32's speed on x86 and
-  aarch64 and ~1.27x SLOWER on ARMv6; F16 is 1.4-1.9x slower than F32 everywhere and 7.5x on the Pi Zero (no
-  F16 hardware). loom scales 1.7-1.9x from 1 to 8 threads on the 285K, ONNX 2-2.8x.
+  P4.31 is worth 1.3-1.55x on the 285K and the Pi 4 and 1.2x on the Pi Zero, and the ONNX columns
+  reproduce 2026-10-03's to within ~5%. loom is still 3.5x slower than ONNX int8 on the 285K and 2.2x on
+  the Pi 4 (2.5 s, one thread). ONNX int8 beats its own fp32 by ~1.8x where the CPU has VNNI (the
+  285K), by 1.2-1.6x on the Pi 4, and only ~20% on the dev box's Zen 1, which has neither. loom's
+  quantized files run at F32's speed on x86 and aarch64 and ~1.33x SLOWER on ARMv6; F16 is 1.0-2.0x
+  slower than F32 on x86 and aarch64 and ~9x on the Pi Zero (no F16 hardware). loom scales ~1.8x from one
+  thread to eight (2.5 s) or four (30 s) on the 285K, ONNX 2.2-2.9x.
 * **Every precision keeps the DFT basis F32** (`keep_float`): F16 had packed it, which Q8_0's block
   alignment never could, and came out worse than Q8_0
   ([Retro-072](../retros/retro-072-f16-came-out-worse-than-q8-because-alignment-exempted-the-basis.md)).
