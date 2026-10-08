@@ -33,6 +33,7 @@ on the other side that cancels it.
 | tiling the resblock chain over the sequence | measured out — see below |
 | `ggml_conv_2d_direct` in place of im2col + mul_mat | 0.98x on the engine of the day; **re-opened and repaired later**, see below |
 | ggml not fusing conv+bias+activation | 6.5% of the whole unfused elementwise + activation chain |
+| *(NOT measured out)* the same fusion around a DEPTHWISE conv (`PAD` + `CONV_2D_DW` + bias `ADD` + `RELU`) | **11%** on WakeHuBERT tiny, shipped as `ggml-0022` (P4.31, 2026-10-03). The 6.5% row is per model, not a ceiling; and a `$LOOM_PROFILE` table cannot show what is already fused -- [Retro-073](retro-073-the-profiler-cannot-see-a-fusion.md) |
 | the C++↔Lua array boundary | 18.7 ms |
 | depthwise convolutions lowered as dense | wrong — the exporter emits 12 `CONV_1D_DW` nodes, matching onnxruntime one for one |
 | fusing `SOFT_MAX`'s five row passes into three | **CORRECTED 2026-08-24** — 1.06x on the 285K, but the reasoning that closed it was wrong and the dev box gets 1.16x; see below |

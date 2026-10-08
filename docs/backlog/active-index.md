@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-03
+last_updated: 2026-10-08
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -285,21 +285,17 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **WakeHuBERT tiny runs 3-4x slower than its own int8 ONNX on a 2.5 s window, and quantizing does not help**
-  (2026-10-03, Ryzen 3 3250U, pinned and paired; table in [Epic-03](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)).
-  Profiled at 30 s, 1 thread: the eight dilated depthwise convolutions lower to IM2COL + a batched MUL_MAT and take
-  35% of the engine's time for ~1% of the multiply-adds. **They never reach tinyBLAS**: the batched matmul is
-  `m=1500, n=1, k=5` per channel, and `llamafile_sgemm` returns false at `n < 2` (tinyBLAS also refuses `k < 8`), so
-  ggml's generic kernel runs them at ~0.7 GFLOP/s -- where the 1x1 and DFT convolutions, which DO go through
-  `ggml_call_mul_mat` -> tinyBLAS, run at ~27 GFLOP/s (Epic-05's single-core tinyBLAS rate). The lever is not a
-  GEMM: ggml already has a direct depthwise kernel with dilation, `ggml_conv_2d_dw_direct` (H=1 for a 1-D conv), in
-  place of `primitives_conv.cpp`'s `ggml_conv_1d_dw` recipe -- NOT in
-  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register (parakeet, conformer and
-  Moonshine carry the same op). The unfused bias/residual ADDs and causal PADs are another 15%, but conv+bias fusion
-  IS in the register (6.5% on VITS): re-measure on this model before proposing it. No quantized speed-up is expected
-  (the register: the kernel is dequantized to F32 per call). F16 is ~1.4x slower than F32: an F16 kernel makes the convolution's im2col F16 (`conv_im2col_type`), so it misses
-  the F32 tinyBLAS path.
-  Re-measure with `scripts/bench_wakehubert.py sweep --pin 0,2`; the 30 s rows need a quieter box than the dev one.
+* [ ] **P4.31 follow-ups: depthwise conv direct kernel + `ggml-0021`/`ggml-0022` fusion** (branch
+  `perf/conv-dw-direct`, pushed 2026-10-03, no PR; it sits on PR #60's docs commits, so retarget to `main`
+  once #60 merges). WakeHuBERT 2.5 s, F32, 1 thread: dev box 17.2 -> 11.3 ms, Pi 4 65.9 -> 50.6, Pi Zero
+  1074 -> 848. All 25 `CONV_1D_DW` models gated green. Left: (1) open the PR; (2) the remaining WakeHuBERT
+  gap (11.2 ms against ONNX int8's 5.67 on the dev box). Its convs are already on ggml's direct
+  `CONV_2D` at 55-68% of the 55 GFLOP/s F32 peak, so a better F32 GEMM buys ~2 ms at most. Levers by
+  size: **the STFT is a dense 80 MFLOP DFT matmul where an FFT is ~3 MFLOP** (~2 ms; an engine FFT/STFT
+  primitive, and every DFT-basis front end in the zoo pays the same); **the 1x1 convs never use int8**
+  (they are plain matmuls, so `ggml_mul_mat` on Q8_0 weights would take ggml's int8 dot products; ~4.7
+  ms of work, unmeasured); **host overhead ~2 ms or more**, and a numpy waveform is 2 ms slower than a list. *Context: [Epic-05 P4.31](../epics/epic-05-edge-performance.md#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03),
+  [Retro-073](../retros/retro-073-the-profiler-cannot-see-a-fusion.md)*
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
   four things, and mapping them onto this tree ranks very unevenly — the important structural finding
@@ -409,6 +405,27 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
+* [ ] **SenseVoice transcribes to nothing on Vulkan.** `sensevoice-small.gguf` (the published file)
+  returns `''` from `speech2text.infer` on `samples/jfk.wav` with `device="Vulkan0"`, and the card
+  gate's ASR row fails on it. The same process on `CPU` gives the right transcript. Found 2026-10-08
+  on the dev box's AMD Radeon Vega 3 (RADV RAVEN2) while smoke-testing P4.31. It is **not P4.31's**:
+  the rc14 engine (`70195f1`) with the same `libggml-vulkan.so` returns `''` too. WakeHuBERT,
+  Parakeet-TDT, Supertonic, Citrinet and Kokoro pass on the same device. **CUDA is fine**: the same
+  file transcribes correctly on the workstation's RTX 5090 (`CUDA0`, card gate green), so this is
+  Vulkan's. Not yet known: whether it reproduces on another Vulkan GPU, and which phase goes wrong
+  first. Start with a tensor oracle per phase, not the transcript.
+  → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **Citrinet aborts on CUDA.** `citrinet-1024.gguf` (the published file) kills the process inside
+  `speech2text.infer` on `samples/jfk.wav` with `device="CUDA0"`: `ggml-cuda/mmvf.cu:423:
+  GGML_ASSERT(stride_col_y % 2 == 0)`, raised from `ggml_cuda_mul_mat_vec_f`, ggml-cuda's
+  matrix-vector kernel. The same file transcribes correctly on `CPU`. Found 2026-10-08 on the
+  workstation's RTX 5090 while smoke-testing P4.31. It is **not P4.31's**: the rc14 engine (`70195f1`)
+  with the same `libggml-cuda.so` aborts identically. Not yet known: which node sends the odd-strided
+  `src1`. Citrinet's squeeze-excite blocks are the first suspect, since they multiply a pooled vector
+  (n = 1). Note the abort takes the caller's process down, so a CUDA user cannot catch it as an
+  exception. The CUDA build used was this tree's source at the same ggml commit as rc14, not the
+  released `loom-py-rt-cuda` wheel.
+  → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL
