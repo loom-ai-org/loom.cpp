@@ -1,0 +1,65 @@
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -760,7 +760,12 @@
+     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
+     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+ 
+-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
++    // GGML_PREC_F32 on an F32 x F32 product: float tiles instead of half (the tensor-API kernel has no such
++    // variant; ggml_metal_op_mul_mat sends that case to the mat-vec kernel instead)
++    const bool prec_f32 = !has_tensor && tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 &&
++                          ggml_get_op_params_i32(op, 0) == GGML_PREC_F32;
++
++    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), prec_f32 ? "_prec" : "");
+     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+              base, bc_inp, bc_out, ne12, ne13, r2, r3);
+ 
+@@ -790,7 +795,8 @@
+         res.nr0 = 64;
+         res.nr1 = 32;
+ 
+-        res.smem = bc_out ? 8192 : (4096 + 2048);
++        // float tiles: 8192 + 4096, which also covers bc_out's 64x32 float staging
++        res.smem = prec_f32 ? (8192 + 4096) : bc_out ? 8192 : (4096 + 2048);
+     }
+ 
+     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2437,7 +2437,11 @@
+         !ggml_is_transposed(op->src[1]) &&
+         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
+         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
+-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
++        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
++        // GGML_PREC_F32 on F32 x F32: the tensor-API mul_mm stages half tiles and has no float variant,
++        // and the mat-vec kernel is F32 throughout
++        !(props_dev->has_tensor && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++          ggml_get_op_params_i32(op, 0) == GGML_PREC_F32)) {
+         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
+ 
+         // some Metal matrix data types require aligned pointers
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -10340,8 +10340,9 @@
+         ushort tiitg[[thread_index_in_threadgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+ 
++    // A's 64x32 tile, then B's: 4096 bytes in for the half tiles, 8192 for the float ones (_prec)
+     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
++    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 64*32*sizeof(S0));
+ 
+     constexpr int NR0 = 64;
+     constexpr int NR1 = 32;
+@@ -10920,6 +10921,10 @@
+ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
+ 
+ template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
++#if !defined(GGML_METAL_HAS_TENSOR)
++// GGML_PREC_F32: the same product with float tiles. The half tiles above turn any |value| > 65504 into inf.
++template [[host_name("kernel_mul_mm_f32_f32_prec")]] kernel mul_mm_t kernel_mul_mm<float, float4x4,  simdgroup_float8x8,  float,  float2x4,  simdgroup_float8x8,  float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
++#endif
+ template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;

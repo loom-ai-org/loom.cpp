@@ -55,6 +55,9 @@ def main() -> None:
         w.add_tensor(f"blk.{i}.norm.weight", rnd(N_EMBD))
         w.add_tensor(f"blk.{i}.ffn.weight", rnd(N_EMBD, N_EMBD))
     w.add_tensor("output.weight", rnd(N_VOCAB, N_EMBD))
+    # An F16 copy, read by nothing in the topology above: test_graph_builder_shapes uses it to check that
+    # GraphBuilder's GGML_PREC_F32 tagging leaves a non-F32 weight's MUL_MAT at the default precision.
+    w.add_tensor("output_f16.weight", rnd(N_VOCAB, N_EMBD).astype(np.float16))
 
     w.write_header_to_file()
     w.write_kv_data_to_file()

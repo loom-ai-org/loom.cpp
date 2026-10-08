@@ -1,0 +1,100 @@
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -892,6 +892,10 @@
+     vk::DescriptorSetLayout dsl;
+ 
+     vk_matmul_pipeline pipeline_matmul_f32 {};
++    // F32 x F32 with float shared memory, for GGML_PREC_F32. pipeline_matmul_f32 stages both operands
++    // in FLOAT_TYPE, which is float16_t on an fp16 device (and the coopmat paths are f16 too), so any
++    // |value| > 65504 becomes inf. On a device without fp16 this is the same pipeline.
++    vk_matmul_pipeline pipeline_matmul_f32_prec {};
+     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
+     vk_matmul_pipeline pipeline_matmul_bf16 {};
+     vk_matmul_pipeline2 pipeline_matmul_f16;
+@@ -4367,6 +4371,10 @@
+     if (!device->pipeline_matmul_f32) {
+         device->pipeline_matmul_f32 = std::make_shared<vk_matmul_pipeline_struct>();
+     }
++    if (!device->pipeline_matmul_f32_prec) {
++        device->pipeline_matmul_f32_prec = (device->fp16 || device->coopmat_support || device->coopmat2)
++            ? std::make_shared<vk_matmul_pipeline_struct>() : device->pipeline_matmul_f32;
++    }
+     if (!device->pipeline_matmul_f32_f16) {
+         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
+     }
+@@ -5140,7 +5148,26 @@
+             CREATE_MM(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4].f32acc,   matmul_id_nvfp4_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+         }
+     }
+-    // reusing CREATE_MM from the fp32 path
++    // reusing CREATE_MM from the fp32 path: the float-shared-memory F32 x F32 pipeline for GGML_PREC_F32,
++    // with the scalar tile sizes that shader was written for
++    if (device->pipeline_matmul_f32_prec != device->pipeline_matmul_f32) {
++        const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
++        const std::vector<uint32_t> l_warptile_saved = l_warptile, m_warptile_saved = m_warptile, s_warptile_saved = s_warptile;
++        const std::array<uint32_t, 3> l_wg_denoms_saved = l_wg_denoms, m_wg_denoms_saved = m_wg_denoms, s_wg_denoms_saved = s_wg_denoms;
++
++        l_warptile = { 128, 128, 128, 16, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
++        m_warptile = { 128,  64,  64, 16, subgroup_size_8, 32, 2, 4, 2, 1, subgroup_size_8 };
++        s_warptile = { subgroup_size_32, 32, 32, 16, s_warptile_wm, 32, 2, 2, 2, 1, subgroup_size_8 };
++
++        l_wg_denoms = {128, 128, 1 };
++        m_wg_denoms = { 64,  64, 1 };
++        s_wg_denoms = { 32,  32, 1 };
++
++        CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_prec, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
++
++        l_warptile = l_warptile_saved; m_warptile = m_warptile_saved; s_warptile = s_warptile_saved;
++        l_wg_denoms = l_wg_denoms_saved; m_wg_denoms = m_wg_denoms_saved; s_wg_denoms = s_wg_denoms_saved;
++    }
+     if ((device->coopmat2 || device->coopmat_support)
+ #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+         && !device->coopmat_bf16_support
+@@ -7649,7 +7676,7 @@
+ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
+     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+-        return ctx->device->pipeline_matmul_f32;
++        return prec == GGML_PREC_F32 ? ctx->device->pipeline_matmul_f32_prec : ctx->device->pipeline_matmul_f32;
+     }
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) {
+         return ctx->device->pipeline_matmul_f32_f16;
+@@ -9157,19 +9184,23 @@
+         src1_uma = d_Qy != nullptr;
+     }
+ 
++    // GGML_PREC_F32 on an F32 x F32 product: every copy below stays F32 instead of going through fp16
++    const bool keep_f32 = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
++                          (ggml_prec)dst->op_params[0] == GGML_PREC_F32;
++
+     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
+-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
++    const bool x_non_contig = (!keep_f32 && ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+                               !ggml_vk_dim01_contiguous(src0);
+-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
++    const bool y_non_contig = (!keep_f32 && ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                               !ggml_vk_dim01_contiguous(src1);
+ 
+     // If src0 is BF16, try to use a BF16 x BF16 multiply
+-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
++    ggml_type f16_type = keep_f32 ? GGML_TYPE_F32 : src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+ 
+     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+ 
+-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
++    bool quantize_y = !keep_f32 && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+ 
+     // Check for mmq first
+     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+@@ -9213,8 +9244,8 @@
+ 
+     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
+     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
+-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
++    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(f16_type) * x_ne;
++    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : ggml_type_size(f16_type) * y_ne);
+     const uint64_t d_sz = sizeof(float) * d_ne;
+ 
+     vk_pipeline to_fp16_vk_0 = nullptr;
