@@ -4075,8 +4075,8 @@ stopped (the same condition as Epic-03's table), WakeHuBERT F32 is 900 -> 752 ms
 `CONV_2D_DW`, so the new op runs on the device. Vulkan (the dev box's Radeon Vega 3, RADV) passes all
 but SenseVoice, which transcribes to `''`. CUDA (RTX 5090, `ggml-cuda` built from this tree for sm_120)
 passes all but Citrinet, which aborts in `mmvf.cu` on `GGML_ASSERT(stride_col_y % 2 == 0)`. **Neither
-failure is P4.31's**: rc14's engine fails both identically with the same backend library. Both are
-on the hub under *Backends & accelerators*.
+failure is P4.31's**: rc14's engine fails both identically with the same backend library. Both were
+fixed on 2026-10-08 ([Epic-04 §6](epic-04-backends-and-accelerators.md#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)).
 
 **Open: what is left between WakeHuBERT and ONNX int8** (11.2 ms against 5.67, dev box, F32, one
 thread, 2026-10-08). Every conv in the model is already on ggml's direct `CONV_2D` op (P4.29), which
