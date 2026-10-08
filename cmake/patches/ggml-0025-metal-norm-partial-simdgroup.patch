@@ -1,0 +1,14 @@
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3820,7 +3820,10 @@
+     }
+ 
+     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+-    nth = std::min(nth, args.ne00_t);
++    // a whole number of simdgroups: the kernel's cross-simdgroup reduction has each lane of a simdgroup
++    // read one partial sum, so a partial last simdgroup (ne00_t = 66 -> 2 lanes, 3 partials) drops the
++    // tail. Backport of llama.cpp a194a75b7e (#26708).
++    nth = std::min(nth, (args.ne00_t + 31)/32*32);
+ 
+     const size_t smem = pipeline.smem;
+ 
