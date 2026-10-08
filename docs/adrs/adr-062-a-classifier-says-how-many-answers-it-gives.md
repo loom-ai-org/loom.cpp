@@ -70,6 +70,11 @@ two planned doors became real ones, and `loom_cli --wav` runs both.
   none of family 13's leaves wants it. pyannote is TRAINED on 10 s windows, so a host running it over a
   long recording slides its own window, as pyannote's pipeline does.
 * A future frame-level EMBEDDING (a per-frame encoder) is `embeddings` at `frame`, and needs only a
-  door: the keys already say it.
+  door: the keys already say it. **Amendment 2026-10-03:** the first one exists -- WakeHuBERT tiny
+  (Epic-03), 128 features per 20 ms frame -- and ships with the keys and NO door, by the user's call:
+  `loom::audio::embed` refuses it with an error naming the granularity, and its card calls `infer` and
+  cuts the rows itself. One wart remains until the door exists: the engine still reports the interface
+  as `speech2embeddings` (`ModelContract::interface_name()` reads only the modality pair), so
+  `model.capabilities` lists a door that refuses this file. The hub tracks the door.
 * Pinned by `tests/ci/test_audio_classify.cpp` (the cut, the frame times, both refusals, and the
   `token` default), whose sabotage arm turns it red, and in loom-py by `test_api.py`.
