@@ -405,6 +405,27 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
+* [ ] **SenseVoice transcribes to nothing on Vulkan.** `sensevoice-small.gguf` (the published file)
+  returns `''` from `speech2text.infer` on `samples/jfk.wav` with `device="Vulkan0"`, and the card
+  gate's ASR row fails on it. The same process on `CPU` gives the right transcript. Found 2026-10-08
+  on the dev box's AMD Radeon Vega 3 (RADV RAVEN2) while smoke-testing P4.31. It is **not P4.31's**:
+  the rc14 engine (`70195f1`) with the same `libggml-vulkan.so` returns `''` too. WakeHuBERT,
+  Parakeet-TDT, Supertonic, Citrinet and Kokoro pass on the same device. **CUDA is fine**: the same
+  file transcribes correctly on the workstation's RTX 5090 (`CUDA0`, card gate green), so this is
+  Vulkan's. Not yet known: whether it reproduces on another Vulkan GPU, and which phase goes wrong
+  first. Start with a tensor oracle per phase, not the transcript.
+  → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
+* [ ] **Citrinet aborts on CUDA.** `citrinet-1024.gguf` (the published file) kills the process inside
+  `speech2text.infer` on `samples/jfk.wav` with `device="CUDA0"`: `ggml-cuda/mmvf.cu:423:
+  GGML_ASSERT(stride_col_y % 2 == 0)`, raised from `ggml_cuda_mul_mat_vec_f`, ggml-cuda's
+  matrix-vector kernel. The same file transcribes correctly on `CPU`. Found 2026-10-08 on the
+  workstation's RTX 5090 while smoke-testing P4.31. It is **not P4.31's**: the rc14 engine (`70195f1`)
+  with the same `libggml-cuda.so` aborts identically. Not yet known: which node sends the odd-strided
+  `src1`. Citrinet's squeeze-excite blocks are the first suspect, since they multiply a pooled vector
+  (n = 1). Note the abort takes the caller's process down, so a CUDA user cannot catch it as an
+  exception. The CUDA build used was this tree's source at the same ggml commit as rc14, not the
+  released `loom-py-rt-cuda` wheel.
+  → [Epic-04](../epics/epic-04-backends-and-accelerators.md)
 * [ ] **`device_report()` still buckets every node as either device or CPU**, deliberately — it does not
   say *why* a node fell back.
 * [ ] **Whisper's 400-wide reflect pad** is cheaper to fall back on than to compose. CUDA, Metal and SYCL
