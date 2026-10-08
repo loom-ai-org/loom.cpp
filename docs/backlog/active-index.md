@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-03
+last_updated: 2026-10-08
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -287,11 +287,14 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 * [ ] **P4.31 follow-ups: depthwise conv direct kernel + `ggml-0021`/`ggml-0022` fusion** (branch
   `perf/conv-dw-direct`, pushed 2026-10-03, no PR; it sits on PR #60's docs commits, so retarget to `main`
-  once #60 merges). WakeHuBERT 2.5 s: Pi 4 F32 65.9 -> 50.6 ms (1 thread), 33.5 -> 24.1 (4); dev box 17.2 ->
-  11.3. Left: (1) **gate the other `CONV_1D_DW` models** before merging -- parakeet, conformer-ctc,
-  Moonshine; (2) measure the Pi Zero (armv6); (3) the remaining WakeHuBERT gap (2.2x ONNX int8 at one
-  thread) is the 1x1 and DFT `CONV_2D`, ~65% of engine time, already on tinyBLAS -- a GEMM or int8-compute
-  question, not a fusion one. *Context: [Epic-05 P4.31](../epics/epic-05-edge-performance.md#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03),
+  once #60 merges). WakeHuBERT 2.5 s, F32, 1 thread: dev box 17.2 -> 11.3 ms, Pi 4 65.9 -> 50.6, Pi Zero
+  1074 -> 848. All 25 `CONV_1D_DW` models gated green. Left: (1) open the PR; (2) the remaining WakeHuBERT
+  gap (11.2 ms against ONNX int8's 5.67 on the dev box). Its convs are already on ggml's direct
+  `CONV_2D` at 55-68% of the 55 GFLOP/s F32 peak, so a better F32 GEMM buys ~2 ms at most. Levers by
+  size: **the STFT is a dense 80 MFLOP DFT matmul where an FFT is ~3 MFLOP** (~2 ms; an engine FFT/STFT
+  primitive, and every DFT-basis front end in the zoo pays the same); **the 1x1 convs never use int8**
+  (they are plain matmuls, so `ggml_mul_mat` on Q8_0 weights would take ggml's int8 dot products; ~4.7
+  ms of work, unmeasured); **host overhead ~2 ms or more**, and a numpy waveform is 2 ms slower than a list. *Context: [Epic-05 P4.31](../epics/epic-05-edge-performance.md#p431--depthwise-convolutions-a-direct-kernel-a-simd-interior-and-the-causal-block-fused--done-2026-10-03),
   [Retro-073](../retros/retro-073-the-profiler-cannot-see-a-fusion.md)*
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
