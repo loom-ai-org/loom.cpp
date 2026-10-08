@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-02
+last_updated: 2026-10-03
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,6 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
+| **Before rc15 is released: the frame-embedding door, then WakeHuBERT's card and card gate** | The user's call (2026-10-03). `wakehubert-tiny-loom` is PUBLISHED infer-only on rc14; the door it ships without goes into rc15, and the same release changes its model card (the snippet calls the door) and the card gate's frame row (it reads the door), then the four files are re-exported and republished on the rc15 wheel. Scope and merge order: [Host API, "A door for frame-level embeddings"](#host-api) |
 | **P5 breadth is the work now — remaining TTS, then music** | [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order is **9/10 (remaining TTS) → 13 (small classifiers) → 14 (music)**. Families 4, 5, 6, 10, 11, 12 and 13 are complete (13 on four leaves, 2026-10-01) and **family 9 is COMPLETE at eight leaves** (Matcha, Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, and Voxtral-4B-TTS on 2026-09-26). F5-TTS ended the run of families that needed no engine primitive: `loom.run_ode` had to learn classifier-free guidance ([ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md)). Chatterbox was the first AR-LM + flow composition, and it needed **no new template**: family 10's guided decode plus F5's sampler, in one driver. Its cost was sampler options and a text front end ([ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md)). Pocket-TTS was the first loop over CONTINUOUS latents, and that loop needed **no primitive** either (a Lua loop around one flow-head call); its cost was a voice shipped as a KV cache ([ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md)) and a front end that chunks ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). VoxCPM2 integrates each latent patch with a guided DiT inside its own driver loop ([ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md)); its cost was a `ROUND` primitive, a tokenizer family and the first export with TWO cached stacks, which shared one cache's slots until the exporter offset them ([Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md)). CosyVoice3 was Chatterbox's composition with every stage a sibling; its cost was three sampler options ([ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md)) and a default voice computed at export from ONNX-only voice models. Voxtral-4B-TTS, the last, was exported on the workstation (32 GB peak); its cost was a tokenizer shape (Tekken, [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md)) and a wrapper check that had to move to f64 ([Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md)); its loop needed no primitive. The `text2codes` path in `loom_cli` the user picked next on 2026-09-26 is done ([Epic-06](../epics/epic-06-high-level-api-and-hosts.md#codec-pairs-in-loom_cli)). kugelaudio, tada, dots-tts and irodori-tts are **no longer tracked**: the user will not add them; family 9b's first leaf, **SpeechT5, is published (rc12)**: the mel-frame AR loop cost no primitive and no engine change, only an exporter tokenizer mapping ([ADR-057](../adrs/adr-057-a-char-sentencepiece-model-ships-as-unigram.md)) and two silent lowering defects ([Retro-066](../retros/retro-066-a-matrix-index-and-a-batch-guess.md)); 9b's other two (fastpitch, bananamind-tts) are **future work, deferred by the user 2026-10-01**, and the user picked **Canary and Citrinet** (below, under Models) as what comes first. Estimate against [Epic-03 §2](../epics/epic-03-model-coverage.md): the bill lands where the scoping did not look, and for F5-TTS it was a layout JOIN between two verified graphs ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
 
 **State anchor, 2026-10-02 — `1.0.0-rc14` is released and the Hub equals the staging tree.**
@@ -30,7 +31,11 @@ loom-py #51), which pins loom.cpp `70195f1`. rc14 carries Canary's long-form dec
 SentencePiece dummy prefix ([ADR-065](../adrs/adr-065-a-converted-sentencepiece-bpe-declares-its-dummy-prefix.md)),
 `loom::PyRegex` + Soprano's vocabulary ([ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md))
 and the ring KV cache ([ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)).
-**Fifty-two** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org). On rc14 as
+**Fifty-three** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org) since
+2026-10-03, when `wakehubert-tiny-loom` was published on rc14 (infer-only; four precisions in one repo,
+`wakehubert-tiny-{f32,f16,q8_0,q4_1}.gguf`, the first multi-file repo; Hub commit `776f68b`, exported at
+loom-exporter `aadac8a`, card-gated 2/2 on the RELEASED rc14 wheel, sha256 + README verified, each file
+loaded from the Hub by name). Before it, fifty-two. On rc14 as
 released, each a fresh export, card-gated on the RELEASED wheel (17 rows passed, 0 failed), sha256- (or
 git-blob-, for the voice files) and README-verified: `canary-1b-v2-loom` republished with its six
 long-form keys, and seven new -- `silero-vad-loom`, `moonshine-streaming-tiny-loom`,
@@ -280,6 +285,21 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
+* [ ] **WakeHuBERT tiny runs 3-4x slower than its own int8 ONNX on a 2.5 s window, and quantizing does not help**
+  (2026-10-03, Ryzen 3 3250U, pinned and paired; table in [Epic-03](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)).
+  Profiled at 30 s, 1 thread: the eight dilated depthwise convolutions lower to IM2COL + a batched MUL_MAT and take
+  35% of the engine's time for ~1% of the multiply-adds. **They never reach tinyBLAS**: the batched matmul is
+  `m=1500, n=1, k=5` per channel, and `llamafile_sgemm` returns false at `n < 2` (tinyBLAS also refuses `k < 8`), so
+  ggml's generic kernel runs them at ~0.7 GFLOP/s -- where the 1x1 and DFT convolutions, which DO go through
+  `ggml_call_mul_mat` -> tinyBLAS, run at ~27 GFLOP/s (Epic-05's single-core tinyBLAS rate). The lever is not a
+  GEMM: ggml already has a direct depthwise kernel with dilation, `ggml_conv_2d_dw_direct` (H=1 for a 1-D conv), in
+  place of `primitives_conv.cpp`'s `ggml_conv_1d_dw` recipe -- NOT in
+  [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)'s register (parakeet, conformer and
+  Moonshine carry the same op). The unfused bias/residual ADDs and causal PADs are another 15%, but conv+bias fusion
+  IS in the register (6.5% on VITS): re-measure on this model before proposing it. No quantized speed-up is expected
+  (the register: the kernel is dequantized to F32 per call). F16 is ~1.4x slower than F32: an F16 kernel makes the convolution's im2col F16 (`conv_im2col_type`), so it misses
+  the F32 tinyBLAS path.
+  Re-measure with `scripts/bench_wakehubert.py sweep --pin 0,2`; the 30 s rows need a quieter box than the dev one.
 * [ ] **LiteRT-class CPU speed: what it would actually take, and which three of its four pieces are
   runtime work.** The standing hope is that loom matches LiteRT on some models. LiteRT gets there with
   four things, and mapping them onto this tree ranks very unevenly — the important structural finding
@@ -417,6 +437,34 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Host API
 
+* [ ] **A door for frame-level embeddings -- SCOPED 2026-10-03; must land BEFORE rc15 is released (the user's call),
+  together with WakeHuBERT's card and card-gate change.** `wakehubert-tiny-loom` is published infer-only on rc14.
+  WakeHuBERT tiny declares `embeddings` at `frame` and ships with no door: `loom::audio::embed` refuses it, the card
+  calls `infer`, and `interface_name()` still reports `speech2embeddings`, so `model.capabilities` lists a door that
+  refuses the file. The scope, in merge order:
+  1. **Exporter: declare the width.** `loom.output.embedding_dim` (i32) on every `embeddings` output -- the role
+     `loom.labels` plays for classes. Without it a flat frame answer cannot be cut into rows: the frame count is not
+     the host's to derive (an encoder may pad or offset), and guessing from size is what the contract exists to
+     remove. Clip files published without it (TitaNet) stay valid: absent means one row of the whole answer.
+  2. **Engine (`audio_classify.{h,cpp}`):** `embed` returns an `Embeddings` struct shaped like `ClassProbabilities`
+     -- `granularity`, `n_rows`, `dim`, `frame_rate`, `frame_offset`, `values`, `row(i)`, `row_start(i)` -- for both
+     granularities; a `frame` file without `embedding_dim`, or an answer not a whole number of rows, is an error
+     naming both numbers. `interface_name()` needs no change, since the door now answers both. `loom_cli`'s
+     embeddings branch prints rows x dim and the frame rate. `tests/ci/test_audio_classify.cpp` gains a
+     driver-only `audio_frame_embedder.gguf` fixture: the cut, the frame times, both refusals, and a sabotage arm.
+  3. **loom-py (pin bump):** the binding returns a dict as `classify_audio` does; `speech2embeddings.infer` keeps
+     returning the bare list for a `clip` file (TitaNet's published card depends on it) and returns a
+     `FrameEmbeddings` (`rows`, `times`, `frame_rate`, `frame_offset`, `len`) for a `frame` file -- per ADR-062 a
+     bare list had "nothing to attach", and a frame answer has its times. `test_api.py` gains the frame contract;
+     the card gate's frame row reads the door instead of `infer`. Record the return-type split as an ADR-062
+     amendment.
+  4. **In the same pre-rc15 work, the card and the card gate:** the `audio-frame-embedding` snippet in
+     `build_model_cards.py` calls `model.speech2embeddings.infer(audio)` and says "needs loom-py-rt 1.0.0-rc15 or
+     later"; the gate's `test_frame_features_follow_the_clip_in_every_precision` reads the door's rows instead of
+     cutting `infer`'s flat list, and `test_audio_embedder_tells_speakers_apart` stops skipping frame files only if
+     it has something to grade. **After rc15 is released:** re-export all four files (they gain `embedding_dim`),
+     card-gate on the released wheel, republish (`upload_all.py --only wakehubert-tiny`). *Context: [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md),
+     [Epic-03](../epics/epic-03-model-coverage.md#family-13-small-audio-classifiers-and-embedders)*
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
