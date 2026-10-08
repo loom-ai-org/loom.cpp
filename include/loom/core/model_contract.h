@@ -144,6 +144,11 @@ struct ModelContract {
     // declared only when it is not 0 (pyannote's SincNet needs 991 samples of context for its first).
     double frame_rate = 0.0;
     double frame_offset = 0.0;
+    // `loom.output.embedding_dim`: the width of one row of an `embeddings` output -- the role `labels`
+    // plays for classes. Without it a flat frame answer cannot be cut into rows: the frame count is not
+    // the host's to derive (an encoder may pad or offset). 0 when undeclared, which a `clip` file may
+    // be (one row of the whole answer) and a `frame` file may not.
+    uint32_t embedding_dim = 0;
 
     // Reads whatever `model` declares. Never throws for an absent key -- see the header comment.
     static ModelContract read(const GgufModel& model);

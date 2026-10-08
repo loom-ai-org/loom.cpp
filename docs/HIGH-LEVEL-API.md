@@ -115,11 +115,13 @@ loom.output.kind             str    "text" | "token_ids" | "audio" | "class" | "
 loom.output.granularity      str    "token" | "frame" | "clip" -- how many answers (absent on `class` = token)
 loom.output.frame_rate       f32    frames per second of a `frame` output
 loom.output.frame_offset     f32    where frame 0 starts, in seconds (written only when not 0)
+loom.output.embedding_dim    i32    width of one row of an `embeddings` output (required at `frame`)
 ```
 
-The three `output.*` keys are [ADR-062](adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md):
+The `output.*` keys are [ADR-062](adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md):
 `class` meant "one per token" while family 12 was the only classifier, and family 13 added a
-distribution per frame (VAD, segmentation), one per clip (language id) and an embedding per clip.
+distribution per frame (VAD, segmentation), one per clip (language id), an embedding per clip and an
+embedding per frame (WakeHuBERT, whose width is what `embedding_dim` declares).
 
 `audio_codes` does NOT fold onto `text` the way `token_ids` and `phoneme_ids` do, and the asymmetry is
 argued in [ADR-020](adrs/adr-020-audio-codes-is-its-own-modality.md): those two fold because text is
@@ -234,7 +236,7 @@ model.synthesize(text=None, *, phonemes=None, tokens=None,
                  voice=None, steps=None, seed=None, language=None) -> Audio
 model.classify(tokens, *, strip_special=True) -> Classification    # P5, family 12
 model.classify_audio(waveform) -> AudioClasses                       # P5, family 13 (speech2class)
-model.embed(waveform) -> list[float]                                 # P5, family 13 (speech2embeddings)
+model.embed(waveform) -> list[float] | FrameEmbeddings               # P5, family 13 (speech2embeddings)
 ```
 
 The fourth door arrived without needing this document, which is what §5's two symmetry rules were for.
