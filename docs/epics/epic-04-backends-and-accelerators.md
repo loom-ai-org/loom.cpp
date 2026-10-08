@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-09-02
+last_updated: 2026-10-08
 ---
 
 # Epic-04: Backends and Accelerators
@@ -65,15 +65,15 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | CPU | always; the fallback for every split |
 | Vulkan | verified, incl. on discrete NVIDIA hardware |
 | CUDA | verified on an RTX 5090; both device-parity gates pass against `CUDA0` and **ran** rather than skipped |
-| Metal | not started — needs macOS wheels first, see [Epic-08](epic-08-packaging-and-release.md) |
+| Metal | verified on an M1 Pro ([§5](#5-metal-p411--shipped-2026-08-31-run-on-an-apple-m1-pro), [§6](#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)) |
 | NPU | open; no NPU registers as a `ggml` device type the engine can resolve |
 
 ## 3. Related Decisions and Artifacts
 
 | | |
 |---|---|
-| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md) |
-| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md) |
+| Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md) |
+| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
 ## 4. The Record
@@ -1231,3 +1231,65 @@ at 4 MB, so the exact value the `sysctl` returns does not matter and the choice 
 key to read for the reason §5 gives (ggml's threads run on the performance cluster), just not a
 consequential one. **Closed: the arm is correct, it binds, and it is worth ~1.1x on two of the four
 families.**
+
+## 6. GPU correctness: F32 matmul precision, the Metal norm, the CUDA mat-vec stride (2026-10-08)
+
+Four defects. Three were found while gating P4.31 on GPUs, and the fourth (Soprano) by the 40-model
+Vulkan sweep that verified the first three. All four were pre-existing (the rc14 engine fails
+identically with the same backend library), and each was invisible on the CPU.
+
+| model | backend | symptom | cause | fix |
+|---|---|---|---|---|
+| SenseVoice-Small | Vulkan, Metal | transcript `''` | F32 x F32 `MUL_MAT` staged in half: the power spectrum (~1e10) overflowed, 99.5% of the mel projection NaN | `GGML_PREC_F32` on every F32 x F32 `MUL_MAT` + `ggml-0023`/`ggml-0024` ([ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md)) |
+| Kokoro-82M | Metal | peak 3.02 vs 0.27, "(gasps)" | `NORM` over 66-element rows: a partial last simdgroup dropped a partial sum | `ggml-0025`, a backport of llama.cpp `a194a75b7e` ([Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md)) |
+| Soprano-1.1-80m | Vulkan | near-silence, peak 0.00099 vs 0.54 | `conv_transpose_1d.comp` accumulates `128*s0 + K` values in a fixed 4096-slot shared array; the iSTFT's hop of 512 overran it | `ggml-0027`: `supports_op` declines what does not fit (CPU fallback) |
+| Citrinet-1024 | CUDA | process abort, `mmvf.cu:423` | `mul_mat_vec_f` asserted an even column stride on a ONE-column `src1` (the squeeze-excite's pooled vector, permuted, `nb[1] == 4`) | `ggml-0026` |
+
+**The precision contract.** On every backend, an F32 x F32 product is computed in F32. A product with an
+F16 or quantized weight runs at the precision the export chose, which matches what the CPU does on that
+path. CUDA and the CPU already behaved this way. Vulkan and Metal now do too, but only because the graph
+asks: `GraphBuilder` sets the tag (`request_f32_matmul_precision`), and the two patches make those
+backends read it. Upstream ggml ignores the tag for F32 on both backends (checked against master,
+2026-10-08), so a pin bump that drops `ggml-0023`/`ggml-0024` without an upstream equivalent
+reintroduces the SenseVoice failure. The CI test only checks the tag; SenseVoice on a GPU is the real
+check.
+
+**Verified.**
+
+| backend | device | result |
+|---|---|---|
+| Vulkan | Radeon Vega 3 (RADV RAVEN2) | SenseVoice: every node within 1e-5 abs-sum of the CPU, logits to 6 significant figures; card gate **40/40** (every published model up to 2.6 GB, final libraries; Soprano needed `ggml-0027`) |
+| Metal | M1 Pro | card gate 7/7 on `MTL0` and 7/7 on the Mac CPU (WakeHuBERT, Citrinet, SenseVoice, Supertonic, Kokoro, Parakeet-TDT, whisper-small); Kokoro peak 0.2714 vs CPU 0.2710 |
+| Vulkan | RTX 5090 (NVIDIA driver, coopmat2) | card gate **37/40** on the same 40 models; the three failures predate this work and are on the hub: EnCodec and DAC abort in a misaligned `GET_ROWS` (16-byte alignment here, 4 on the Vega), and F5-TTS clips (peak 1.20; 1.20 with the tag-less engine too, CPU passes) |
+| CUDA | RTX 5090 (sm_120, built from this tree) | card gate 7/7 on `CUDA0`; Citrinet transcript identical to the CPU's |
+
+**What it costs** (median per call on `jfk.wav`; three alternating rounds, same package, only the
+backend library swapped):
+
+| device | model | before | after |
+|---|---|---:|---:|
+| M1 Pro `MTL0` | whisper-small | 587.9 ms | 586.8 ms |
+| M1 Pro `MTL0` | SenseVoice | 114.6 ms (`''`) | 115.6 ms |
+| Vega 3 `Vulkan0` | whisper-small | 6007 ms | 7713 ms (+28%) |
+| Vega 3 `Vulkan0` | Parakeet-TDT | 2706 ms | 3673 ms (+36%) |
+| Vega 3 `Vulkan0` | SenseVoice | 1446 ms (`''`) | 1910 ms |
+| RTX 5090 Vulkan (coopmat2) | whisper-small | 122.0 ms | 141.3 ms (+16%) |
+| RTX 5090 Vulkan (coopmat2) | Parakeet-TDT | 44.2 ms | 53.1 ms (+20%) |
+| RTX 5090 Vulkan (coopmat2) | SenseVoice | 26.7 ms (`''`) | 32.9 ms |
+
+**On Vulkan it is not free.** The tile sizes are the same as before; the cost is F32 shared memory and
+F32 FMAs instead of Vega's packed fp16. It is the price of a correct answer: the GPU still beats this
+box's CPU (whisper-small 13489 ms, Parakeet-TDT 4306, SenseVoice 1975 on 2 AVX2 cores). On the 5090 the
+F32 product leaves the coopmat2 path for the scalar F32 shader and pays +16-20%. The 5090 numbers come
+from the same Vulkan library with the tag-less and the tagging engine, 10 calls per launch.
+
+**Every Vulkan path, before and after.** SenseVoice gives `''` without the patches and the right
+transcript with them on the RTX 5090's coopmat2, its KHR coopmat (`GGML_VK_DISABLE_COOPMAT2=1`), and
+the plain fp16 shaders of an Intel Arc iGPU and the Vega 3. **Not run:** Metal's tensor-API fallback,
+since no device here has it ([hub](../backlog/active-index.md#backends--accelerators)).
+
+**The method, which generalises.** One process holds the GPU and the CPU, so the CPU is the oracle. A
+per-node dump (NaN count, sum, abs-sum) written from the profiler's eval callback, run once per device
+and joined on (op, name, shape, occurrence), named the first divergent node in all four cases in one
+run each. That hook was scratch and was not committed; see
+[Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md#the-fix).
