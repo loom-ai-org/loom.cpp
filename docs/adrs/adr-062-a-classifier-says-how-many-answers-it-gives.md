@@ -76,5 +76,31 @@ two planned doors became real ones, and `loom_cli --wav` runs both.
   cuts the rows itself. One wart remains until the door exists: the engine still reports the interface
   as `speech2embeddings` (`ModelContract::interface_name()` reads only the modality pair), so
   `model.capabilities` lists a door that refuses this file. The hub tracks the door.
+* **Amendment 2026-10-08: the door answers frames** (released in 1.0.0-rc15, the user's call that it
+  lands before that release). A fourth key, read by `ModelContract`:
+
+  | key | type | meaning |
+  |---|---|---|
+  | `loom.output.embedding_dim` | i32 | the width of one row of an `embeddings` output -- the role `loom.labels` plays for classes |
+
+  The exporter reads it off the traced output's last axis and writes it on every `embeddings` output;
+  it is REQUIRED at `frame`, because a flat frame answer cannot be cut without it (the frame count is
+  not the host's to derive: an encoder may pad or offset). `loom::audio::embed` now returns an
+  `Embeddings` (`granularity`, `n_rows`, `dim`, `frame_rate`, `frame_offset`, `values`, `row(i)`,
+  `row_start(i)`) shaped like `ClassProbabilities`, for both granularities. It refuses a `frame` file
+  with no declared width (every frame file exported before the key: re-export it), an answer that is
+  not a whole number of rows, and a `clip` answer of more than one row. A `clip` file with no width --
+  TitaNet's and ECAPA's published files -- is one row of the whole answer, so nothing published moves.
+  `interface_name()` needed no change: the door it names now answers the file, which closes the wart
+  above.
+
+  **The return type splits by granularity in loom-py**, and that is the one place the Consequences above
+  change. `speech2embeddings.infer` keeps returning the bare vector for a `clip` file (TitaNet's
+  published card depends on it), and returns a `FrameEmbeddings` (`rows`, `times`, `dim`, `frame_rate`,
+  `frame_offset`, `len`) for a `frame` file. The bare list was right for a clip because there was
+  "nothing to attach"; a frame answer has its times, so it gets the object `AudioClasses` already is.
+  Rejected: one object for both, which would have broken a published card for no gain to its reader.
 * Pinned by `tests/ci/test_audio_classify.cpp` (the cut, the frame times, both refusals, and the
-  `token` default), whose sabotage arm turns it red, and in loom-py by `test_api.py`.
+  `token` default; since 2026-10-08 also the frame-embedding cut, its times, the missing-width and
+  skewed-row refusals and the clip width check), whose sabotage arms turn it red, and in loom-py by
+  `test_api.py`.

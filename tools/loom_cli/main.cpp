@@ -760,6 +760,7 @@ int main(int argc, char** argv) {
             std::printf("  task: %s (%s, per %s)", contract.task.c_str(), contract.interface_name().c_str(),
                         contract.output_granularity.c_str());
             if (!contract.labels.empty()) std::printf(", %zu labels", contract.labels.size());
+            if (contract.embedding_dim > 0) std::printf(", %u wide", contract.embedding_dim);
             if (contract.frame_rate > 0.0) std::printf(", %.3f frames/s", contract.frame_rate);
             std::printf("\n");
             if (!has_wav) {
@@ -769,12 +770,30 @@ int main(int argc, char** argv) {
             const std::vector<float> clip = loom_cli::load_wav_pcm16_mono(wav_path, contract.sample_rate);
             loom::Session session(*model, backends);
             if (contract.output_kind == loom::modality::EMBEDDINGS) {
-                const std::vector<float> embedding = loom::audio::embed(session.bridge(), *model, clip);
-                double norm = 0.0;
-                for (float v : embedding) norm += static_cast<double>(v) * v;
-                std::printf("  embedding: %zu values, L2 norm %.6f\n ", embedding.size(), std::sqrt(norm));
-                for (float v : embedding) std::printf(" %.6g", v);
-                std::printf("\n");
+                const loom::audio::Embeddings result = loom::audio::embed(session.bridge(), *model, clip);
+                auto norm = [&](uint32_t row) {
+                    double sum = 0.0;
+                    const float* values = result.row(row);
+                    for (uint32_t k = 0; k < result.dim; ++k) sum += static_cast<double>(values[k]) * values[k];
+                    return std::sqrt(sum);
+                };
+                if (result.granularity == loom::granularity::CLIP) {
+                    std::printf("  embedding: %u values, L2 norm %.6f\n ", result.dim, norm(0));
+                    for (uint32_t k = 0; k < result.dim; ++k) std::printf(" %.6g", result.row(0)[k]);
+                    std::printf("\n");
+                } else {
+                    // The shape and when each row starts; the values are the caller's through the
+                    // library -- a few hundred rows of 128 are not something to read in a terminal.
+                    std::printf("  embeddings: %u rows x %u, %.3f frames/s\n", result.n_rows, result.dim,
+                                result.frame_rate);
+                    for (uint32_t row = 0; row < result.n_rows; ++row) {
+                        if (row == 3 && result.n_rows > 6) {
+                            std::printf("  ...\n");
+                            row = result.n_rows - 3;
+                        }
+                        std::printf("  %8.3f s  L2 norm %.6f\n", result.row_start(row), norm(row));
+                    }
+                }
             } else {
                 const auto result = loom::audio::classify(session.bridge(), *model, clip);
                 const size_t width = result.labels.size();
