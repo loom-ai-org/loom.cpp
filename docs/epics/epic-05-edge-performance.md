@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-03
+last_updated: 2026-10-08
 ---
 
 # Epic-05: Edge CPU Performance
@@ -1418,7 +1418,11 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
 * **Know the machine's actual peak before calling a kernel efficient or slow.** Zen+ has 128-bit FPU
   datapaths, so a 256-bit FMA retires one per cycle and single-core F32 peak is ~54 GFLOP/s, not the
   ~112 a lane count suggests. That one number turned "the dense GEMM is 44 GFLOP/s and MLAS does
-  better" into "the dense GEMM is at 88% of the machine and there is nothing to win".
+  better" into "the dense GEMM is at 88% of the machine and there is nothing to win". **Measured
+  2026-10-08: 53.2-55.4 GFLOP/s** (`taskset -c 0`, ten independent `_mm256_fmadd_ps` chains, `-O2
+  -mavx2 -mfma`). Write the chains as ten named `__m256` locals: held in an array, gcc spilled them to
+  the stack and the same loop read 24 GFLOP/s -- a store-to-load latency, not a peak. Check
+  `objdump` shows register-only FMAs before believing the number.
 * **For a float32 kernel, the error bound is enumerable — do not sample it.** The domain is 2^32
   values; a sweep against a double-precision reference takes about 30 s on 24 cores and gives the
   actual worst case rather than a grid maximum. It is also the only thing that finds the tails: P4.18's
@@ -3983,7 +3987,7 @@ ran 3-4x slower than its own int8 ONNX on the 2.5 s window. Its eight dilated de
 (`CONV_1D_DW`, K=5, d=1..8) were **35% of engine time for ~1% of the multiply-adds**: the im2col recipe's
 per-channel matmul is `[K, OL] x [K, 1]`, i.e. `n=1, k=5`, which `llamafile_sgemm` (`n < 2`) and tinyBLAS
 (`k < 8`) both refuse, so ggml's generic kernel ran them at ~0.7 GFLOP/s against ~27 for the 1x1 convs.
-Parakeet, the conformers and Moonshine emit the same op.
+So do 24 other published models -- see *Gated* below. Moonshine does not; its convolutions are plain `CONV_1D`.
 
 **What shipped** (branch `perf/conv-dw-direct`):
 
@@ -4006,6 +4010,21 @@ shuffled launches, `cool.sh 60` before each):
 | F16 | 126.7 → **101.4** (1.25x) | 55.9 → **35.4** (1.58x) |
 | ONNX int8 / fp32 | 22.9 / 29.8 | 9.8 / 11.4 |
 
+**Raspberry Pi Zero W** (ARMv6, no NEON, so `ggml_vec_mad_f32` takes its scalar path). Base = the rc14
+armv6 wheel (rc14 pins `70195f1`, no engine diff to `ef277f7`); new = the same wheel recipe built in
+`.github/docker/Dockerfile.armv6` with `c8fe8bb`'s engine libraries swapped in. Median of 24 calls per
+launch, mean of 5 shuffled launches, clock witness 1.01x; `bluetooth-km-switch` was running for both
+arms, which costs 7-11% on absolute times:
+
+| arm | 1 thread |
+|---|---|
+| F32 | 1074.5 → **847.8 ms** (paired 1.27x, p10-p90 1.26-1.29) |
+| Q8_0 | 1387.7 → **1170.0** (1.19x) |
+| F16 | 7882 → **7527** (1.05x; F16 stays ~7x slower than F32 on a core with no F16 arithmetic) |
+
+On the board, new against base: F32 max abs 4.8e-6 on outputs up to 11.5; F16 against F32 rmse
+7.06e-4 → 6.67e-4.
+
 **Numerics.** The direct kernel against the im2col recipe: 1.8e-7 relative (F32), 7e-4 (F16 -- the
 im2col path ran the F16 kernel through an F16 patch matrix). `ggml-0021` is bit-identical to ggml's
 scalar kernel (same tap order, both contract to FMA), and `ggml-0022` is bit-identical to the unfused
@@ -4027,6 +4046,38 @@ removing that copy turns it red (worst relative error 9.1).
   10K parameters, kept F32 in the Q8_0 file -- and the reduction axis is K=5, so neither P4.13's fold nor
   P4.29's repack has anything to act on. Q8_0 runs at F32 speed here for that reason.
 
-**Open:** gate the models that also emit `CONV_1D_DW` (parakeet, conformer-ctc, Moonshine); measure the
-Pi Zero (armv6 takes the scalar path of `ggml_vec_mad_f32`); the remaining WakeHuBERT gap is the 1x1 and
-DFT `CONV_2D` (~65% of engine time), which already run through tinyBLAS.
+**Gated** (2026-10-07). 25 published GGUFs emit `CONV_1D_DW`: Canary, Citrinet, conformer-ctc, F5-TTS,
+GigaAM, Granite, Kokoro, LFM2-350M-modular, LFM2.5-Audio ASR and TTS, MarbleNet, Paraformer, Parakeet
+RNNT and TDT, Pocket-TTS, the Qwen3-TTS tokenizer, SenseVoice, SNAC, Soprano, StyleTTS2, Supertonic,
+TitaNet, VITS, VoxCPM2 and WakeHuBERT. All 25 pass loom-py's model-card gate on the branch's engine, and
+`ctest -L gate` against the v5 fixtures has no failures. The conformer, Parakeet and GigaAM gate tests need two
+variables that `LOOM_FIXTURES` does not cover, or they skip: `LOOM_SAMPLES_DIR` (they otherwise read
+`samples/jfk.wav` relative to the build directory, and the skip message blames the GGUF) and
+`LOOM_CONFORMER_CTC_DIR` (the parent of the PyTorch `ref/` directory). With both set they pass.
+
+**Open: what is left between WakeHuBERT and ONNX int8** (11.2 ms against 5.67, dev box, F32, one
+thread, 2026-10-08). Every conv in the model is already on ggml's direct `CONV_2D` op (P4.29), which
+tiles an im2col into scratch and runs a GEMM per tile. Per call, against the 55 GFLOP/s peak above:
+
+| node | work | time | throughput |
+|---|---|---|---|
+| STFT framing: a matmul against the 400 x 402 DFT basis, hop 160, 250 frames | 80.4 MFLOP | 2.16 ms | 37 GFLOP/s (68%) |
+| eight 1x1 convs + the stride-2 K=4 conv, IC*K = 256 -> 256, 125 frames | 147 MFLOP | 4.41 ms | 33 GFLOP/s (61%) |
+| output 1x1, 256 -> 128 | 8.2 MFLOP | 0.27 ms | 30 GFLOP/s (55%) |
+
+That is 6.84 ms, 61% of the call -- but a better F32 GEMM is worth ~2 ms at most (MLAS-class 85-90% of
+peak gives ~9.3 ms), so the F32 GEMM is not what closes the gap. In order of size:
+
+1. **The STFT is a dense DFT, not an FFT.** A 512-point real FFT over the same 250 frames is ~3 MFLOP
+   against 80.4, so ~2 ms of the 11.2. Every model whose STFT front end exports as a matmul against a
+   DFT basis pays the same cost. It needs an FFT/STFT primitive in the engine -- per-task C++, so it
+   fits [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md).
+2. **The 1x1 convs never use int8; ONNX's int8 GEMM does.** The Q8_0 file runs at F32 speed because
+   P4.29 dequantizes the conv kernel. A 1x1, stride-1, unpadded conv is a plain matmul, and lowered
+   to `ggml_mul_mat` with Q8_0 weights it would take ggml's int8 dot products. ~4.7 ms of work;
+   unmeasured.
+3. **The host side, ~2 ms or more** (estimated: node time with fusion off is 10.6 ms against a 12.9 ms
+   wall). A numpy waveform is slower than a list (13.1 against 11.1 ms), so the numpy input path is
+   converting element by element.
+
+Fusion is already worth 1.8 ms (`GGML_CPU_DISABLE_FUSION=1`: 11.1 -> 12.9).
