@@ -1,0 +1,94 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -8875,6 +8875,13 @@
+     }
+ }
+ 
++// loom: the interior of each output row -- every dst_x whose taps all land inside the source row --
++// runs as one ggml_vec_mad_f32 sweep per tap (dst[x] += w * src[x + kx*d - p] over a contiguous run),
++// and only the few edge outputs whose taps reach into the padding keep the bounds-checked scalar loop.
++// The scalar original paid two bounds tests, an index computation and a kernel-type switch per tap per
++// output; for WakeHuBERT's dilated K=5 depthwise convs that held them at roughly a tenth of the 1x1
++// convs' GFLOP/s. Per output the taps are still accumulated in (ky, kx) order starting from 0, as the
++// scalar loop does, so the only numerical change is FMA contraction inside the SIMD sweep.
+ static void ggml_compute_forward_conv_2d_dw_whcn(
+         const ggml_compute_params * params,
+         const ggml_tensor * src,
+@@ -8889,30 +8896,67 @@
+     const char * knl_base = (const char *)kernel->data;
+     const ggml_type knl_type = kernel->type;
+ 
++    // [x_lo, x_hi): outputs whose every horizontal tap is in bounds. Independent of the row and channel.
++    const int64_t span = (p.knl_w - 1) * p.dilation_x;
++    int64_t x_lo = (p.pad_x + p.stride_x - 1) / p.stride_x;
++    const int64_t last_num = p.src_w - 1 - span + p.pad_x;
++    int64_t x_hi = last_num >= 0 ? last_num / p.stride_x + 1 : 0;
++    x_lo = MIN(x_lo, p.dst_w);
++    x_hi = MAX(x_lo, MIN(x_hi, p.dst_w));
++
+     for (int64_t i = start; i < end; ++i) {
+         const int64_t knl_offset = (i % p.channels) * p.knl_w * p.knl_h;
+         const float * src_data = (const float *)src->data + i * p.src_w * p.src_h;
+         float * dst_data = (float *)dst->data + i * p.dst_w * p.dst_h;
+ 
+-        for (int64_t dst_y = 0; dst_y < p.dst_h; ++dst_y) {
+-            for (int64_t dst_x = 0; dst_x < p.dst_w; ++dst_x) {
++        auto scalar = [&](int64_t dst_y, int64_t dst_x) {
++            float sum = 0.0f;
++            for (int64_t knl_y = 0; knl_y < p.knl_h; ++knl_y) {
++                const int64_t src_y = dst_y * p.stride_y + knl_y * p.dilation_y - p.pad_y;
++                if (src_y < 0 || src_y >= p.src_h) {
++                    continue;
++                }
++                for (int64_t knl_x = 0; knl_x < p.knl_w; ++knl_x) {
++                    const int64_t src_x = dst_x * p.stride_x + knl_x * p.dilation_x - p.pad_x;
++                    if (src_x < 0 || src_x >= p.src_w) {
++                        continue;
++                    }
++                    sum += ggml_conv_2d_dw_knl_f32(knl_base, knl_offset + knl_y * p.knl_w + knl_x, knl_type)
++                         * src_data[src_y * p.src_w + src_x];
++                }
++            }
++            dst_data[dst_y * p.dst_w + dst_x] = sum;
++        };
+ 
+-                float sum = 0.0f;
++        for (int64_t dst_y = 0; dst_y < p.dst_h; ++dst_y) {
++            for (int64_t dst_x = 0; dst_x < x_lo; ++dst_x) {
++                scalar(dst_y, dst_x);
++            }
++            float * row = dst_data + dst_y * p.dst_w;
++            const int64_t len = x_hi - x_lo;
++            if (len > 0) {
++                std::fill(row + x_lo, row + x_hi, 0.0f);
+                 for (int64_t knl_y = 0; knl_y < p.knl_h; ++knl_y) {
+                     const int64_t src_y = dst_y * p.stride_y + knl_y * p.dilation_y - p.pad_y;
+                     if (src_y < 0 || src_y >= p.src_h) {
+                         continue;
+                     }
++                    const float * src_row = src_data + src_y * p.src_w;
+                     for (int64_t knl_x = 0; knl_x < p.knl_w; ++knl_x) {
+-                        const int64_t src_x = dst_x * p.stride_x + knl_x * p.dilation_x - p.pad_x;
+-                        if (src_x < 0 || src_x >= p.src_w) {
+-                            continue;
++                        const float w = ggml_conv_2d_dw_knl_f32(knl_base, knl_offset + knl_y * p.knl_w + knl_x, knl_type);
++                        const float * s0 = src_row + x_lo * p.stride_x + knl_x * p.dilation_x - p.pad_x;
++                        if (p.stride_x == 1) {
++                            ggml_vec_mad_f32((int) len, row + x_lo, s0, w);
++                        } else {
++                            for (int64_t j = 0; j < len; ++j) {
++                                row[x_lo + j] += w * s0[j * p.stride_x];
++                            }
+                         }
+-                        sum += ggml_conv_2d_dw_knl_f32(knl_base, knl_offset + knl_y * p.knl_w + knl_x, knl_type)
+-                             * src_data[src_y * p.src_w + src_x];
+                     }
+                 }
+-                dst_data[dst_y * p.dst_w + dst_x] = sum;
++            }
++            for (int64_t dst_x = x_hi; dst_x < p.dst_w; ++dst_x) {
++                scalar(dst_y, dst_x);
+             }
+         }
+     }
