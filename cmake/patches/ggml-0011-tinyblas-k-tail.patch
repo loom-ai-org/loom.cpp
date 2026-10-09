@@ -1,10 +1,26 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 7025dc13..ef20c874 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -492,8 +492,37 @@
+@@ -566,9 +566,52 @@ class tinyBLAS {
      }
  
      bool matmul(int64_t m, int64_t n) {
+-#if !defined(__AVX__) && !defined(__AVX2__) && !defined(__AVX512F__)
 -        if (k % KN != 0)
++#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
++        // On x86 upstream (llama/29806) admits every k and finishes a ragged one with a masked vector
++        // load in gemm_bloc. F32 still takes THIS patch's out-of-line tail there (see gemm_bloc), so an
++        // F32 GEMM rounds exactly as it did before ggml v0.26 -- which keeps every F32 export on its
++        // measured references: CosyVoice3's free-running waveform moved 10x (RMSE 2.7e-3 -> 2.7e-2) on
++        // the summation-order change alone, though both tails are equally accurate against f64 and
++        // equally fast on aligned shapes (upstream's is ~9% faster on a ragged one). F16/BF16, which
++        // this patch never admitted, get upstream's tail. And as below, fewer than one vector of F32
++        // contraction is ggml's.
++        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
++        if (k_tail_f32 && k < KN)
++            return false;
++#else
 +        // WHY THE CONTRACTION IS SPLIT HERE, and why only the F32 path splits it. `k % KN` rejected
 +        // the WHOLE matmul, exactly as `m % 4` did before the row tail below -- and k is the
 +        // CONTRACTION, so in attention it is a sequence length, i.e. a number nothing rounds.
@@ -29,6 +45,8 @@
 +        // encoder against HuggingFace) moves max/absmax 4.19e-04 -> 4.34e-04 against a 1e-3 limit,
 +        // mean_abs_diff 9.36e-06 -> 9.33e-06, and passes 67/67 either way.
 +        //
++        // Everywhere but x86 upstream still rejects the whole matmul on a ragged k; on x86 see above.
++        //
 +        // Scoped to F32 because the tail is a scalar multiply and the other instantiations carry
 +        // ggml_fp16_t / ggml_bf16_t, which do not convert that way. Those keep the old rejection.
 +        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
@@ -36,10 +54,10 @@
              return false;
 +        if (k < KN)
 +            return false;                 // fewer than one vector of contraction: let ggml have it
+ #endif
          // WHY THE ROW COUNT IS SPLIT HERE. Every tile below is 4 rows tall, so the schedule chooser
          // that follows only accepts m divisible by 4 -- and when it does not, this function returns
-         // false and ggml computes the ENTIRE matmul with its generic one-output-element-per-call
-@@ -608,6 +637,38 @@
+@@ -684,6 +727,39 @@ class tinyBLAS {
  
      template <int RM, int RN>
      inline void gemm_bloc(int64_t ii, int64_t jj) {
@@ -67,7 +85,8 @@
 +        // x86 is why the tail cannot simply be folded into one epilogue instead: that costs the
 +        // small-k shapes 30% there (whisper's QK^T at k = 64, 154 -> 201 ms), because the extra live
 +        // values change how the accumulators spill around the `hsum`. Out of line, both ISAs keep the
-+        // epilogue they measured fastest.
++        // epilogue they measured fastest. (Upstream's x86 tail for F16/BF16, behind its own `if` after
++        // the loop, measured no cost on aligned F32 shapes at v0.26: 0.94-1.00x, inside the noise.)
 +        constexpr bool k_tail_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
 +        if constexpr (k_tail_f32) {
 +            if (k % KN != 0) {
@@ -78,7 +97,7 @@
          // WHERE THE OPERAND ADDRESSES COME FROM, and why aarch64 needs its own answer.
          //
          // Written as `A + lda * (ii + i) + l` against the members, GCC 14.2 on aarch64 (-O3,
-@@ -669,6 +730,82 @@
+@@ -767,6 +843,82 @@ class tinyBLAS {
                  C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
      }
  

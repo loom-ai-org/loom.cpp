@@ -1,7 +1,8 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index d0b5ced1..1652b056 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -8875,6 +8875,13 @@
+@@ -9249,6 +9249,13 @@ static void ggml_compute_forward_conv_2d_dw_cwhn(
      }
  }
  
@@ -15,7 +16,7 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
  static void ggml_compute_forward_conv_2d_dw_whcn(
          const ggml_compute_params * params,
          const ggml_tensor * src,
-@@ -8889,30 +8896,67 @@
+@@ -9263,30 +9270,67 @@ static void ggml_compute_forward_conv_2d_dw_whcn(
      const char * knl_base = (const char *)kernel->data;
      const ggml_type knl_type = kernel->type;
  

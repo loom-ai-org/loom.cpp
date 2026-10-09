@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/simd-mappings.h b/src/ggml-cpu/simd-mappings.h
-index fca5119e..2e76878b 100644
+index 89a5afa9..f8eb22cf 100644
 --- a/src/ggml-cpu/simd-mappings.h
 +++ b/src/ggml-cpu/simd-mappings.h
-@@ -141,6 +141,22 @@ extern float ggml_table_f32_ue4m3[1 << 8];
+@@ -143,6 +143,22 @@ extern float ggml_table_f32_ue4m3[1 << 8];
  // On ARM NEON, it's quicker to directly convert x -> x instead of calling into ggml_lookup_fp16_to_fp32,
  // so we define GGML_CPU_FP16_TO_FP32 and GGML_CPU_FP32_TO_FP16 elsewhere for NEON.
  // This is also true for POWER9.

@@ -1,9 +1,11 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 20988ab3..7025dc13 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -494,6 +494,34 @@
-     bool matmul(int64_t m, int64_t n) {
+@@ -570,6 +570,34 @@ class tinyBLAS {
          if (k % KN != 0)
              return false;
+ #endif
 +        // WHY THE ROW COUNT IS SPLIT HERE. Every tile below is 4 rows tall, so the schedule chooser
 +        // that follows only accepts m divisible by 4 -- and when it does not, this function returns
 +        // false and ggml computes the ENTIRE matmul with its generic one-output-element-per-call
@@ -35,7 +37,7 @@
          // compute RM for only need tile with size RM&RM-1
  // A 4x6 tile keeps 24 vector accumulators live. That fits aarch64's 32 registers on paper -- with
  // 4 A-vectors and 1 B-vector the block needs 29 -- but GCC does not allocate it: at -O3 it keeps the
-@@ -553,7 +581,18 @@
+@@ -629,7 +657,18 @@ class tinyBLAS {
          return false;
      }
  

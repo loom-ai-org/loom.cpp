@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index dbd9263a..e49975e2 100644
+index 1d193109..65a31f9e 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -2911,7 +2911,12 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2951,7 +2951,12 @@ struct ggml_cplan ggml_graph_plan(
                          } else if (node->src[0]->type == GGML_TYPE_F32 &&
                                     node->src[1]->type == GGML_TYPE_F32) {
                              cur += sizeof(float)*ne00*ne01*ne02;
@@ -16,10 +16,10 @@ index dbd9263a..e49975e2 100644
                              GGML_ABORT("fatal error");
                          }
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index b39b67d0..07a53dcf 100644
+index 14ca516e..84e2f51e 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -6244,6 +6244,12 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
+@@ -6612,6 +6612,12 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
      }
  }
  
@@ -32,7 +32,7 @@ index b39b67d0..07a53dcf 100644
  static void ggml_compute_forward_conv_transpose_1d_f32(
          const ggml_compute_params * params,
                ggml_tensor * dst) {
-@@ -6297,7 +6303,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+@@ -6665,7 +6671,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
      // whole contiguous `ne11`-wide rows instead of scattering single floats `ne11` apart across the
      // whole buffer, which also keeps two threads off the same cache line.
      {
@@ -41,7 +41,7 @@ index b39b67d0..07a53dcf 100644
  
          for (int64_t i10 = ith; i10 < ne10; i10 += nth) {
              float * dst_data = wdata + i10*ne11;
-@@ -6318,19 +6324,62 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+@@ -6686,19 +6692,62 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
  
      const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
  
@@ -113,10 +113,10 @@ index b39b67d0..07a53dcf 100644
          float * dst_data = (float *)((char *) dst->data + i1*nb1);
          float * wdata_kernel = wdata + i1*ne02*ne00;
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
-index f009f789..56dcfe74 100644
+index 75b3d81a..e77fb663 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
-@@ -64,6 +64,39 @@ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * p
+@@ -63,6 +63,39 @@ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * p
  void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);

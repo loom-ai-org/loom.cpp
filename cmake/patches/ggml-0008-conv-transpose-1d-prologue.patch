@@ -1,15 +1,13 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 1ab42cbd..14ca516e 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -6261,39 +6261,54 @@
+@@ -6633,39 +6633,54 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
      GGML_ASSERT(nb00 == sizeof(float));
      GGML_ASSERT(nb10 == sizeof(float));
  
 -    if (ith == 0) {
 -        memset(params->wdata, 0, params->wsize);
--
--        // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout)
--        {
--            float * const wdata = (float *) params->wdata + 0;
 +    // THE WHOLE PROLOGUE, ON EVERY THREAD. It used to run under `if (ith == 0)`, and on a VITS vocoder
 +    // that made it 47% of this op and 100 ms of a 1.31 s synthesis -- a serial section in the middle of
 +    // a graph whose every other op is parallel. Nothing in it has to be serial: each part below writes
@@ -19,7 +17,10 @@
 +    // whole PLAN's work buffer -- 16 MB here, sized by an unrelated op -- and nothing needed it: the
 +    // two transposes below write every element of the two regions this op uses, `[0, nk)` and
 +    // `[nk, nk + ne10*ne11)`.
-+
+ 
+-        // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout)
+-        {
+-            float * const wdata = (float *) params->wdata + 0;
 +    // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout).
 +    // Split over Cout, so each thread owns the contiguous block `[i01*ne00*ne02, ...)` it writes.
 +    {
