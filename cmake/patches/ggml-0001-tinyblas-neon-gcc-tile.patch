@@ -1,8 +1,10 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index d28840a9..17d81cbf 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -495,7 +495,29 @@
-         if (k % KN != 0)
+@@ -571,7 +571,29 @@ class tinyBLAS {
              return false;
+ #endif
          // compute RM for only need tile with size RM&RM-1
 -#if VECTOR_REGISTERS == 32
 +// A 4x6 tile keeps 24 vector accumulators live. That fits aarch64's 32 registers on paper -- with
@@ -31,7 +33,7 @@
          if (m % 16 == 0 && (m/16 >= params->nth)) {
              const int64_t SIZE_N = BLOCK_SIZE<6>(n);
              mnpack<4, 6, 4>(m, n, SIZE_N, 12);
-@@ -511,7 +533,7 @@
+@@ -587,7 +609,7 @@ class tinyBLAS {
              mnpack<4, 6, 1>(m, n, SIZE_N, 12);
              return true;
          }

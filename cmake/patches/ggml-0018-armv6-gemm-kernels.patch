@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
-index bf9b8c8b..82ce1aa9 100644
+index d62b56b8..5eda1485 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
 @@ -57,6 +57,21 @@
@@ -24,7 +24,7 @@ index bf9b8c8b..82ce1aa9 100644
  #ifdef _MSC_VER
  #define NOINLINE __declspec(noinline)
  #else
-@@ -4098,6 +4113,407 @@ class tinyBLAS_PPC {
+@@ -4211,6 +4226,407 @@ class tinyBLAS_PPC {
      const int nth;
  };
  #endif
@@ -432,7 +432,7 @@ index bf9b8c8b..82ce1aa9 100644
  } // namespace
  
  /**
-@@ -4130,6 +4546,34 @@ class tinyBLAS_PPC {
+@@ -4243,6 +4659,34 @@ class tinyBLAS_PPC {
   * @param Ctype is GGML data type of `C`
   * @return true if this function was able to service the matmul request
   */
@@ -467,7 +467,7 @@ index bf9b8c8b..82ce1aa9 100644
  bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
                       const void *A, int64_t lda, const void *B, int64_t ldb, void *C,
                       int64_t ldc, int Atype, int Btype, int Ctype) {
-@@ -4213,6 +4657,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4326,6 +4770,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              (float *)C, ldc};
      #endif
          return tb.matmul(m, n);
@@ -482,7 +482,7 @@ index bf9b8c8b..82ce1aa9 100644
  #else
          return false;
  #endif
-@@ -4435,6 +4887,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4548,6 +5000,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
              params->ith, params->nth};
          tb.matmul(m, n);
          return true;

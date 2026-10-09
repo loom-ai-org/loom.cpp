@@ -36,8 +36,10 @@ Outputs op_ssm_conv(PrimitiveContext& pc, const Inputs& in, const Json&) {
 
 Outputs op_ssm_scan(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("SSM_SCAN", in, 7);
+    // K is ggml's recurrent-state rollback depth (llama/26623, ggml v0.20+): K saved states per sequence
+    // instead of one. 1 is the op as it was before the argument existed, output size included.
     return {ggml_ssm_scan(pc.ctx, /*s=*/in[0], /*x=*/in[1], /*dt=*/in[2], /*A=*/in[3], /*B=*/in[4], /*C=*/in[5],
-                           /*ids=*/in[6])};
+                           /*ids=*/in[6], /*K=*/1)};
 }
 
 Outputs op_rwkv_wkv6(PrimitiveContext& pc, const Inputs& in, const Json&) {

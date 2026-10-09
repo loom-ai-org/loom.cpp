@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index b0d201d4..eba80c44 100644
+index 375d7a40..36c74a03 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -1,5 +1,15 @@
@@ -18,7 +18,7 @@ index b0d201d4..eba80c44 100644
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
  #include "binary-ops.h"
-@@ -6991,6 +7001,524 @@ void ggml_compute_forward_col2im_1d(
+@@ -7384,6 +7394,524 @@ static int64_t ggml_conv_2d_patch_budget(void) {
  
  // ggml_compute_forward_conv_2d
  
@@ -543,7 +543,7 @@ index b0d201d4..eba80c44 100644
  
  static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params,
                                                const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
-@@ -7032,6 +7560,25 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7425,6 +7953,25 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
      void  * knl_data       = kernel->data;
      float * dst_data       = out_data ? out_data : (float *) dst->data;
  

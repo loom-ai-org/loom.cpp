@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-08
+last_updated: 2026-10-09
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -416,19 +416,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   1.5x on this backend" is a surprising thing to leave undocumented in the model cards.
   → [Epic-04 §5.8](../epics/epic-04-backends-and-accelerators.md),
   [ADR-017](../adrs/adr-017-no-k-quants.md)
-* [ ] **After rc15 is released: backport upstream's Vulkan misaligned-offset fix, llama.cpp
-  `0cae43063c`** (#28253, 2026-09-07). Scheduled after the release by the user's call (2026-10-08), so
-  rc15 ships without it. The pin (v0.19.0) predates the fix, and without it **EnCodec and DAC abort on
-  Vulkan on NVIDIA** (RTX 5090, 2026-10-08):
-  `ggml-vulkan.cpp:11863: GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || (a_offset == 0 && ...))`. That
-  is a `GET_ROWS` on a view whose offset is not a multiple of `minStorageBufferOffsetAlignment`, which
-  is 16 bytes on NVIDIA and 4 on the Radeon Vega 3, where both models pass. It predates PR #62: the
-  engine without the precision tag aborts the same way. The fix reworks the misaligned-descriptor
-  arithmetic for EVERY Vulkan op, not just `GET_ROWS`, so it lands as its own `ggml-00NN` patch (with an
-  [UPSTREAM.md](../../cmake/patches/UPSTREAM.md) entry saying it can be deleted once the pin passes
-  `0cae43063c`). It is done when the full Vulkan card gate passes on both a 4-byte device (Vega 3) and
-  a 16-byte one (5090), with EnCodec and DAC green on the 5090.
-  → [Epic-04 §6](../epics/epic-04-backends-and-accelerators.md#6-gpu-correctness-f32-matmul-precision-the-metal-norm-the-cuda-mat-vec-stride-2026-10-08)
+* [ ] **Run the ggml v0.26.0 bump on Metal and CUDA before it ships.** CPU, Vega 3 and RTX 5090 Vulkan
+  are gated ([Epic-01 §5](../epics/epic-01-inference-engine-core.md#5-the-ggml-pin)); `ggml-0014/0015/0024`
+  (Metal) and `0013/0026` (CUDA) were re-ported by hand onto rewritten upstream code and have only been
+  compiled for Linux. Card gate on the M1 Pro (`MTL0`) and a CUDA build on the 5090.
 * [ ] **F5-TTS clips on Vulkan on NVIDIA** (RTX 5090, 2026-10-08): the card's output peaks at 1.20 and
   the gate's [0.01, 1.001] check fails. The CPU passes, and so does Vulkan on the Radeon Vega 3. It
   predates this branch: the tag-less engine gives 1.2044, the tagging one 1.2055. Not yet known: which

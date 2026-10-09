@@ -1,9 +1,40 @@
 # Upstreaming these patches to ggml-org/ggml
 
 Sixteen diffs, each independently useful and independently reviewable. They are written against the pin in
-`cmake/GgmlPin.cmake` (**v0.19.0**, commit `30bf8685`), so the first step for any of them is a rebase
+`cmake/GgmlPin.cmake` (**v0.26.0**, commit `d7cb5741`), so the first step for any of them is a rebase
 onto `master` — the files move rarely, but `sgemm.cpp`'s tile-selection block and `ops.cpp`'s
 `ggml_compute_forward_conv_2d_impl` are both areas that see occasional churn.
+
+**Rebased onto v0.26.0 on 2026-10-08** (from v0.19.0, 544 upstream commits). Two patches left
+because upstream now has them: **16** (llama.cpp #29561, `46fc5b3b`, left and circular `PAD` on Metal,
+reading the source through `nb00` -- everything 16 did) and **22's backport, `ggml-0025`** (#26708,
+`95414e59`). The bump also brings in llama.cpp #28253 (`04d63b27`, type-aligned `GET_ROWS` and aligned
+descriptor binding for every binary op on Vulkan), which was the fix for EnCodec/DAC aborting on a
+16-byte-aligned NVIDIA device, so it needs no patch here. What changed in the rest:
+
+* **11 still owns F32 on x86**, although upstream (#29806, `ebefd1bb`) now admits a ragged `k` there
+  for every dtype and finishes it with a masked vector load. Measured at the bump (Ryzen 3 3250U, AVX2,
+  one thread, eight paired rounds): the two tails are equally accurate against f64 (upstream's worst
+  relative error is equal or lower at every k tried), equally fast on aligned shapes (0.94-1.00x, inside
+  the noise), and upstream's is ~9% faster on a ragged one (k=100). But the summation order differs, and
+  CosyVoice3's free-running waveform gate moved 10x on that alone (RMSE 2.7e-3 -> 2.7e-2 against a 2e-2
+  bound; every teacher-forced stage still passed). With 11 kept for F32 the engine is bit-identical to
+  the v0.19.0 pin on that test, so 11 keeps F32 everywhere and upstream's tail serves F16/BF16 on x86.
+  Delete 11 only together with re-deriving the references it was measured on.
+* **2**'s loop bound is `k - k % KN` on x86 so upstream's tail finishes a ragged F16/BF16 `k`; F32 never
+  reaches it (11 dispatches first), and elsewhere the bound is `k`.
+* **13**'s CUDA `supports_op` hunk gives `CONV_2D` its own `case`. It used to share a `return` with
+  `IM2COL`/`IM2COL_3D`, where `op_params[6]` is `is_2D` -- so the check declined every 2-D im2col on
+  CUDA and sent it to the CPU (slower, not wrong).
+* **15**'s function-constant id moved from 1700 to 2400: upstream took 1700 for `FC_NORM`.
+* **14, 15, 21** moved into upstream's per-op Metal sources (`kernels/conv.metal`, `kernels/mul_mm.metal`,
+  #26561); kernel-to-library routing is derived from `functionNames`, so the new names need no table.
+  21's tensor-API carve-out now sits beside `ggml_metal_op_mul_mat_use_mm()`. Upstream's new few-row
+  MMA path for F32 uses `simdgroup_float8x8`, so `GGML_PREC_F32` needs nothing there.
+* **20** is re-written against upstream's new matmul pipeline map (`vk_matmul_pipeline_key`): a
+  `prec_f32` key field, built from the `_fp32` SPIR-V with the same scalar tiles as upstream's BF16
+  fallback, and preferred by `ggml_vk_get_mul_mat_mat_pipeline_map` for `GGML_PREC_F32`.
+* **23** keeps upstream's new `warp_size` argument to `ggml_cuda_should_use_mmvf`.
 
 **14, 15 and 16 are the Metal set and depend on nothing else here** — different backend, different
 files, and independent of each other: 14 fixes `conv_transpose_1d`'s dispatch, 15 rewrites `conv_2d`'s
@@ -1107,7 +1138,11 @@ this backend's own `mul_mat` runs the same convolutions at about 1.49 TFLOP/s th
 lowering, so a simdgroup-matrix implicit GEMM would be another 2-3x and a much larger patch.
 (4) `supports_op`, the depthwise sibling and the quantized-kernel type test are untouched.
 
-## PR 16 — `metal`: `pad` can only append, so every leading pad falls back to the CPU
+## PR 16 — `metal`: `pad` can only append, so every leading pad falls back to the CPU — now upstream
+
+**Deleted at the v0.26.0 bump.** llama.cpp #29561 (`46fc5b3b`, 2026-09-28) does the same thing and
+more (circular padding, a test); the record below is kept for the measurement.
+
 
 `kernel_pad_impl` writes `dst[i] <- src[i]` inside the source extent and zero outside it. That is a
 pad whose four LEADING pads are all zero, and `supports_op` says so honestly:
@@ -1293,6 +1328,8 @@ GGML_PREC_F32`. The tensor-API `kernel_mul_mm` has no float variant here, so on 
 SenseVoice 114.6 → 115.6 ms (and correct). Not run: a tensor-API device.
 
 ## PR 22 — `metal`: NORM/RMS_NORM with a partial last simdgroup — already upstream
+
+**`ggml-0025` deleted at the v0.26.0 bump**, which includes `95414e59` (#26708).
 
 *(`cmake/patches/ggml-0025-metal-norm-partial-simdgroup.patch`)*
 

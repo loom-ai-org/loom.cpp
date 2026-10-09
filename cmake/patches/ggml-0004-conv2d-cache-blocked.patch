@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 42ec809c..64742235 100644
+index 16a916d2..c922f0f6 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -11,6 +11,7 @@
@@ -10,7 +10,7 @@ index 42ec809c..64742235 100644
  
  // ggml_compute_forward_dup
  
-@@ -6862,6 +6863,56 @@ static void ggml_call_mul_mat(ggml_type type, const ggml_compute_params * params
+@@ -7230,6 +7231,56 @@ static void ggml_call_mul_mat(ggml_type type, const ggml_compute_params * params
      ggml_compute_forward_mul_mat(params, &dst);
  }
  
@@ -67,7 +67,7 @@ index 42ec809c..64742235 100644
  static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
      return (coord  + size) % size; // adding size avoids negative number weirdness
  }
-@@ -6938,6 +6989,31 @@ void ggml_compute_forward_col2im_1d(
+@@ -7306,6 +7357,31 @@ void ggml_compute_forward_col2im_1d(
      }
  }
  
@@ -99,7 +99,7 @@ index 42ec809c..64742235 100644
  // ggml_compute_forward_conv_2d
  
  
-@@ -6979,7 +7055,39 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7347,7 +7423,39 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
      const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
  
      const int64_t space_per_patch   = knl_n * traits->type_size + c_out * sizeof(float);
@@ -140,7 +140,7 @@ index 42ec809c..64742235 100644
      const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
      const int64_t batch_n           = (patch_total + patches_per_batch - 1) / patches_per_batch;
  
-@@ -7036,6 +7144,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -7404,6 +7512,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
  
          ggml_barrier(params->threadpool);
  

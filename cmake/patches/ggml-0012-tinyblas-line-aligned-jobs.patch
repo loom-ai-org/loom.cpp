@@ -1,6 +1,8 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index ef20c874..d62b56b8 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -551,6 +551,13 @@
+@@ -641,6 +641,13 @@ class tinyBLAS {
  
    private:
      bool matmul_aligned(int64_t m, int64_t n) {
@@ -14,7 +16,7 @@
          // compute RM for only need tile with size RM&RM-1
  // A 4x6 tile keeps 24 vector accumulators live. That fits aarch64's 32 registers on paper -- with
  // 4 A-vectors and 1 B-vector the block needs 29 -- but GCC does not allocate it: at -O3 it keeps the
-@@ -574,10 +581,82 @@
+@@ -664,10 +671,82 @@ class tinyBLAS {
  // operand addresses, which the companion patch (0002) fixes. Tile alone is 22.0 GFLOP/s, addresses
  // alone are 15.5 -- the spill dominates until it is gone -- and the two together are 25.1, which is
  // past a hand-written kernel. See loom.cpp BACKLOG.md P4.15.
@@ -99,7 +101,7 @@
              return true;
          }
          if (m % 8 == 0 ) {
-@@ -591,9 +670,11 @@
+@@ -681,9 +760,11 @@ class tinyBLAS {
              return true;
          }
  #else  // VECTOR_REGISTERS == 16, or NEON on GCC (see above)
@@ -113,7 +115,7 @@
              return true;
          }
          if (m % 8 == 0 ) {
-@@ -610,6 +691,26 @@
+@@ -700,6 +781,26 @@ class tinyBLAS {
          return false;
      }
  

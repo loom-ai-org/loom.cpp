@@ -1,6 +1,8 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 4369e573..19937a36 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -18470,7 +18470,11 @@
+@@ -15973,7 +15973,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
          case GGML_OP_SSM_CONV:
              return op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_CONV_TRANSPOSE_1D:

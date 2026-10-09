@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index f5df8151..9f267b3f 100644
+index c6973b62..a7e87c52 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -17,6 +17,9 @@
@@ -12,7 +12,7 @@ index f5df8151..9f267b3f 100644
  
  #include <algorithm>
  #include <cfloat>
-@@ -7083,7 +7086,35 @@ static int64_t ggml_conv_2d_patch_budget(void) {
+@@ -7451,7 +7454,35 @@ static int64_t ggml_conv_2d_patch_budget(void) {
                  return budget;
              }
          }
@@ -48,7 +48,7 @@ index f5df8151..9f267b3f 100644
      }
      return budget;
  }
-@@ -7163,6 +7194,37 @@ static int64_t ggml_conv_1d_direct_budget(void) {
+@@ -7531,6 +7562,37 @@ static int64_t ggml_conv_1d_direct_budget(void) {
          }
          sz = sizeof(uint64_t); v = 0;
          if (sysctlbyname("hw.l3cachesize", &v, &sz, NULL, 0) == 0) l3 = (long) v;
@@ -86,7 +86,7 @@ index f5df8151..9f267b3f 100644
  #else
  #if defined(_SC_LEVEL3_CACHE_SIZE)
          l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
-@@ -7338,6 +7400,47 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
+@@ -7706,6 +7768,47 @@ static inline void ggml_conv_1d_direct_tile_impl(const float * xp, const float *
          for (int i = 0; i < ocn; ++i)
              for (int j = 0; j < GGML_CONV1D_VEC; ++j) _mm256_storeu_ps(y + (oc0 + i) * OL + p0 + j * 8, acc[i][j]);
      }
@@ -134,7 +134,7 @@ index f5df8151..9f267b3f 100644
  #else
      float acc[GGML_CONV1D_OCB][GGML_CONV1D_VEC];
      for (int i = 0; i < GGML_CONV1D_OCB; ++i)
-@@ -7789,6 +7892,105 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+@@ -8157,6 +8260,105 @@ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
  // The one thing it is NOT right for is a convolution inside a decode loop, where the dequantize would
  // be paid per token rather than per utterance. Nothing in ggml routes SSM_CONV here.
  
@@ -240,7 +240,7 @@ index f5df8151..9f267b3f 100644
  // The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
  // `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
  static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
-@@ -7823,7 +8025,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -8191,7 +8393,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                                                // output element is stored.
                                                const float *               in_data   = nullptr,
                                                const float *               leaky     = nullptr,
@@ -255,7 +255,7 @@ index f5df8151..9f267b3f 100644
  
      GGML_ASSERT(ggml_is_contiguous(kernel));
      GGML_ASSERT(kernel->type == kernel_type);
-@@ -7871,8 +8079,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -8239,8 +8447,19 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          p.wdata = (char *) params->wdata + kbytes;
          p.wsize = params->wsize - kbytes;
  
@@ -276,7 +276,7 @@ index f5df8151..9f267b3f 100644
          return;
      }
  
-@@ -8088,8 +8307,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -8456,8 +8675,14 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          // conv -- and skipping it is most of what makes this op worth using at all: with the cache
          // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
          if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
