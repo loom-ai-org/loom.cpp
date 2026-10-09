@@ -1,6 +1,8 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 49a49d03..b028d607 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -1753,6 +1753,21 @@
+@@ -1767,6 +1767,21 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
      return true;
  }
  
@@ -22,26 +24,28 @@
  static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
      ggml_tensor *       src0 = tensor->src[0];
      ggml_tensor *       src1 = tensor->src[1];
-@@ -1766,6 +1781,7 @@
- 
-     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
+@@ -1781,6 +1796,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 +    use_mul_mat_vec_f = use_mul_mat_vec_f && (is_mul_mat_id || ggml_cuda_mmvf_src1_strides_ok(src1));
  
      //we only support fusion for ncols_dst = 1
      if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
-@@ -1830,7 +1846,7 @@
+@@ -1896,7 +1912,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      const int cc        = ggml_cuda_info().devices[ctx.device].cc;
      const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
  
--    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
-+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) && ggml_cuda_mmvf_src1_strides_ok(src1)) {
+-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
++    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) && ggml_cuda_mmvf_src1_strides_ok(src1)) {
          // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
          // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
          ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+diff --git a/src/ggml-cuda/mmvf.cu b/src/ggml-cuda/mmvf.cu
+index d0a572e1..8af488bb 100644
 --- a/src/ggml-cuda/mmvf.cu
 +++ b/src/ggml-cuda/mmvf.cu
-@@ -420,7 +420,8 @@
+@@ -426,7 +426,8 @@ void launch_mul_mat_vec_f_cuda(
          const int64_t nsamples_or_ntokens, const int64_t ids_stride, cudaStream_t stream) {
      GGML_ASSERT(ncols        % 2 == 0);
      GGML_ASSERT(stride_row   % 2 == 0);

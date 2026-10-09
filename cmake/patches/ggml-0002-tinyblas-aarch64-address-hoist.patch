@@ -1,6 +1,8 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 17d81cbf..20988ab3 100644
 --- a/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -547,16 +547,45 @@
+@@ -645,16 +645,52 @@ class tinyBLAS {
  
      template <int RM, int RN>
      inline void gemm_bloc(int64_t ii, int64_t jj) {
@@ -32,9 +34,16 @@
 +        auto Aat = [&](int64_t i, int64_t l) { return A + lda * (ii + i) + l; };
 +        auto Bat = [&](int64_t j, int64_t l) { return B + ldb * (jj + j) + l; };
 +#endif
++        // On x86 upstream's masked tail after this loop finishes the last `k % KN`; everywhere else
++        // `matmul` only admits a k that KN divides, so the loop bound is k itself -- the same loop
++        // the measurement above was taken on.
++#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
++        const int64_t kk = k - k % KN;
++#else
 +        const int64_t kk = k;
++#endif
          D Cv[RN][RM] = {};
--        for (int64_t l = 0; l < k; l += KN) {
+-        for (int64_t l = 0; l + KN <= k; l += KN) {
 +        for (int64_t l = 0; l < kk; l += KN) {
              // help compiler for op order.
              if constexpr (RM <= RN) {
@@ -49,7 +58,7 @@
                      for (int64_t i = 0; i < RM; ++i) {
                          Cv[j][i] = madd(Av[i], Bv, Cv[j][i]);
                      }
-@@ -564,10 +593,10 @@
+@@ -662,10 +698,10 @@ class tinyBLAS {
              } else {
                  V Bv[RN];
                  for (int64_t j = 0; j < RN; ++j) {

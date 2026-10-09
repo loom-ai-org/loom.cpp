@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: backends
-last_updated: 2026-10-08
+last_updated: 2026-10-09
 ---
 
 # Epic-04: Backends and Accelerators
@@ -1268,7 +1268,7 @@ check.
 |---|---|---|
 | Vulkan | Radeon Vega 3 (RADV RAVEN2) | SenseVoice: every node within 1e-5 abs-sum of the CPU, logits to 6 significant figures; card gate **40/40** (every published model up to 2.6 GB, final libraries; Soprano needed `ggml-0027`) |
 | Metal | M1 Pro | card gate 7/7 on `MTL0` and 7/7 on the Mac CPU (WakeHuBERT, Citrinet, SenseVoice, Supertonic, Kokoro, Parakeet-TDT, whisper-small); Kokoro peak 0.2714 vs CPU 0.2710 |
-| Vulkan | RTX 5090 (NVIDIA driver, coopmat2) | card gate **37/40** on the same 40 models; the three failures predate this work and are on the hub: EnCodec and DAC abort in a misaligned `GET_ROWS` (16-byte alignment here, 4 on the Vega; upstream fixed it in llama.cpp `0cae43063c`, and its backport is scheduled for after rc15), and F5-TTS clips (peak 1.20; 1.20 with the tag-less engine too, CPU passes) |
+| Vulkan | RTX 5090 (NVIDIA driver, coopmat2) | card gate **37/40** on the same 40 models; the three failures predate this work and are on the hub: EnCodec and DAC abort in a misaligned `GET_ROWS` (16-byte alignment here, 4 on the Vega; upstream fixed it in llama.cpp `0cae43063c`; both pass since the ggml v0.26.0 bump, [Epic-01 §5](epic-01-inference-engine-core.md#5-the-ggml-pin)), and F5-TTS clips (peak 1.20; 1.20 with the tag-less engine too, CPU passes) |
 | CUDA | RTX 5090 (sm_120, built from this tree) | card gate 7/7 on `CUDA0`; Citrinet transcript identical to the CPU's |
 
 **What it costs** (median per call on `jfk.wav`; three alternating rounds, same package, only the

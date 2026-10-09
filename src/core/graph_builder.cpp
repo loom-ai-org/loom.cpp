@@ -23,17 +23,19 @@ namespace {
 // be exact on both and still produce nothing on Vulkan or Metal: SenseVoice's kaldi power spectrum peaks
 // near 1e10, its mel projection came back 99.5% NaN, and the transcript was ''. GGML_PREC_F32 is ggml's
 // own way of asking for full precision; cmake/patches/ggml-0023 and ggml-0024 make those two backends
-// honour it for F32 x F32 (stock ggml ignores it there). Tagged here, on the finished graph, rather than
-// at each ggml_mul_mat call site, so that a new primitive cannot forget it. A non-F32 `a` (F16, a
-// quantized weight) is left alone: that is the precision the model was exported at, and the CPU converts
-// `b` to the weight's vec_dot_type on that path too.
+// honour it for F32 x F32 (stock ggml ignores it there). It is set with ggml_prec_set_acc, which since
+// ggml v0.26 (llama/26675) is what ggml_mul_mat_set_prec became: the same op_params[0], so the patches
+// read it unchanged. Tagged here, on the finished graph, rather than at each ggml_mul_mat call site, so
+// that a new primitive cannot forget it. A non-F32 `a` (F16, a quantized weight) is left alone: that is
+// the precision the model was exported at, and the CPU converts `b` to the weight's vec_dot_type on that
+// path too.
 void request_f32_matmul_precision(ggml_cgraph* gf) {
     const int n = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n; ++i) {
         ggml_tensor* node = ggml_graph_node(gf, i);
         if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 &&
             node->src[1]->type == GGML_TYPE_F32) {
-            ggml_mul_mat_set_prec(node, GGML_PREC_F32);
+            ggml_prec_set_acc(node, GGML_PREC_F32);
         }
     }
 }

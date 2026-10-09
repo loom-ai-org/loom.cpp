@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-10-02
+last_updated: 2026-10-09
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -201,3 +201,40 @@ A second, unrelated self-inflicted wound worth naming because it hid the first: 
 It reported "still building" for a build that had already failed. Bracket the pattern (`[c]make`), or
 watch the log for a terminal marker rather than watching for a process.
 
+
+### v0.19.0 → v0.26.0 (2026-10-09): two patches gone, one numeric choice, the Vulkan alignment fix
+
+544 upstream commits. Of loom's 27 patches, **two left because upstream now has them**: `ggml-0016`
+(Metal leading pad, llama.cpp #29561) and `ggml-0025` (Metal norm, #26708). The other 25 were rebased
+as a stack (the patch files are now regenerated from it), and several were re-ported by hand rather than
+merged: upstream rewrote Vulkan's matmul pipeline setup into a keyed map (`ggml-0023` is now a
+`prec_f32` key field), split the Metal shaders into per-op files (`0014`, `0015`, `0024` moved with
+them), and took `FC_NORM`'s function-constant id that `0015` had used. Per-patch detail is in
+[`cmake/patches/UPSTREAM.md`](../../cmake/patches/UPSTREAM.md). The engine needed two source changes:
+`ggml_ssm_scan` gained a rollback depth `K` (1 is the old op), and `ggml_mul_mat_set_prec` became
+`ggml_prec_set_acc`, which writes the same `op_params[0]` the GPU precision patches read.
+
+**The bump is what fixed EnCodec and DAC on NVIDIA Vulkan.** llama.cpp #28253 (ggml `04d63b27`) binds
+every binary op's descriptor at an aligned offset and passes the misalignment in push constants, which
+is the `GET_ROWS` abort a 16-byte-aligned device hit. Gated as a control: the rc15 package on the same
+5090 harness still aborts with `ggml-vulkan.cpp:11863 GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || ...)`.
+
+**One numeric choice, made by the user: `ggml-0011` keeps F32 on x86.** Upstream (#29806) now admits a
+ragged `k` on x86 and finishes it with a masked vector load. Against f64 it is as accurate as 0011's
+out-of-line scalar tail, as fast on aligned shapes and ~9% faster on a ragged one -- but the summation
+order differs, and CosyVoice3's free-running waveform gate moved 10x on that alone (RMSE 2.7e-3 →
+2.7e-2, bound 2e-2), every teacher-forced stage passing. With 0011 kept for F32, CosyVoice3 is
+bit-identical to the v0.19.0 pin; upstream's tail serves only F16/BF16 there.
+
+| | result |
+|---|---|
+| CPU, dev box | `ci` 114/114, `gate` 97/97 (29 ran) |
+| Vulkan, Radeon Vega 3 | card gate 52/53 -- MOSS-TTS (16 GB) loses the device, identically on the rc15 package: this iGPU's limit, first tried here (rc15's sweep stopped at 2.6 GB) |
+| Vulkan, RTX 5090 | card gate 52/53 -- EnCodec and DAC now pass, and so does MOSS-TTS; F5-TTS still clips at 1.2055, unchanged from rc15 (hub) |
+| CUDA, RTX 5090 (sm_120) | card gate **53/53**, F5-TTS included -- its clip is NVIDIA-Vulkan-only |
+| Metal, M1 Pro | card gate 11/11 on `MTL0` and 11/11 on the Mac CPU: rc15's seven (SenseVoice is `0024`, Kokoro the norm upstream now owns) plus VITS, EnCodec, DAC, Soprano for the re-ported conv kernels (`0014`, `0015`) and upstream's pad |
+
+**Two harness traps, both mine.** The dev box (33 GB) cannot hold the gate suite and a card sweep at
+once; running them together got every background job killed for memory. And a GPU package must take its
+`_loom` extension from the same release as its Python layer: a pre-rc15 extension under the current
+engine segfaulted in `embed` on exactly the two cards whose door rc15 changed.

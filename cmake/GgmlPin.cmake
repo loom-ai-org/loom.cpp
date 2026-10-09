@@ -11,5 +11,5 @@
 # package's. This is the build side: a backend package includes THIS file out of the engine checkout
 # it was built from, so there is no second copy of the tag to drift.
 set(LOOM_GGML_REPOSITORY "https://github.com/ggml-org/ggml.git")
-# v0.19.0 == commit 30bf8685ed4eb0a47f2b06229543327749904150 (tagged 2026-08-07).
-set(LOOM_GGML_TAG "v0.19.0")
+# v0.26.0 == commit d7cb574130e6f01ad25b3289685489200febcd74 (tagged 2026-10-05).
+set(LOOM_GGML_TAG "v0.26.0")

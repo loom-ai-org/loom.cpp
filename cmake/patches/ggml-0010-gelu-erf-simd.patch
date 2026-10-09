@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/vec.h b/src/ggml-cpu/vec.h
-index 5de9cb5b..0dd31465 100644
+index 59fa88f2..5d131554 100644
 --- a/src/ggml-cpu/vec.h
 +++ b/src/ggml-cpu/vec.h
-@@ -1007,13 +1007,182 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+@@ -1020,13 +1020,182 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
  }
  #endif
  
