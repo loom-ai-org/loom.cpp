@@ -73,7 +73,7 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | | |
 |---|---|
 | Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md) |
-| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md) |
+| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md), [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
 ## 4. The Record
@@ -1246,12 +1246,6 @@ identically with the same backend library), and each was invisible on the CPU.
 | F5-TTS v1 Base | Vulkan (NVIDIA, 2026-10-09) | peak 1.21 vs 0.76, speech twice as loud | F32 `CONV_2D` (the DFT-basis STFT) on the coopmat2/KHR-coopmat shaders, which stage and accumulate in `float16_t`; `log` amplified the fp16 noise floor of the reference mel | the same tag on F32 x F32 `CONV_2D` + `ggml-0028` ([ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md) amendment, [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)) |
 | Citrinet-1024 | CUDA | process abort, `mmvf.cu:423` | `mul_mat_vec_f` asserted an even column stride on a ONE-column `src1` (the squeeze-excite's pooled vector, permuted, `nb[1] == 4`) | `ggml-0026` |
 
-**The precision contract.** On every backend, an F32 x F32 product, and since 2026-10-09 an F32 x F32
-`CONV_2D`, is computed in F32. A product with an F16 or quantized weight runs at the precision the export
-chose, which matches what the CPU does on that path. CUDA and the CPU already behaved this way. Vulkan and
-Metal now do too, but only because the graph asks: `GraphBuilder` sets the tag (`request_f32_precision`),
-and the patches make those backends read it (`ggml-0023`/`ggml-0024` for the matmul, `ggml-0028` for
-Vulkan's conv2d; Metal's conv_2d is float already). Upstream ggml ignores the tag for F32 on both backends (checked against master,
 **A device that runs out (2026-10-09).** MOSS-TTS lost the device on the Radeon Vega 3 (RADV) because
 its talker and codec together need 21.1 GB of weights and the iGPU can make 19.97 GB resident. RADV
 accepts allocations past that and fails the next submit, which ggml reports as `ErrorDeviceLost`.
@@ -1260,14 +1254,15 @@ accepts allocations past that and fails the next submit, which ggml reports as `
 surface as a warning. Only the weights are counted, not compute buffers
 ([Retro-076](../retros/retro-076-a-full-device-said-device-lost.md)).
 
-**The precision contract.** On every backend, an F32 x F32 product is computed in F32. A product with an
-F16 or quantized weight runs at the precision the export chose, which matches what the CPU does on that
-path. CUDA and the CPU already behaved this way. Vulkan and Metal now do too, but only because the graph
-asks: `GraphBuilder` sets the tag (`request_f32_matmul_precision`), and the two patches make those
-backends read it. Upstream ggml ignores the tag for F32 on both backends (checked against master,
-2026-10-08), so a pin bump that drops `ggml-0023`/`ggml-0024` without an upstream equivalent
-reintroduces the SenseVoice failure. The CI test only checks the tag; SenseVoice on a GPU is the real
-check.
+**The precision contract.** On every backend, an F32 x F32 product, and since 2026-10-09 an F32 x F32
+`CONV_2D`, is computed in F32. A product with an F16 or quantized weight runs at the precision the export
+chose, which matches what the CPU does on that path. CUDA and the CPU already behaved this way. Vulkan and
+Metal now do too, but only because the graph asks: `GraphBuilder` sets the tag (`request_f32_precision`),
+and the patches make those backends read it (`ggml-0023`/`ggml-0024` for the matmul, `ggml-0028` for
+Vulkan's conv2d; Metal's conv_2d is float already). Upstream ggml ignores the tag for F32 on both backends
+(checked against master, 2026-10-08, and for Vulkan's conv2d 2026-10-09), so a pin bump that drops these
+patches without an upstream equivalent reintroduces the SenseVoice and F5-TTS failures. The CI test only
+checks the tag; SenseVoice and F5-TTS on a GPU are the real check.
 
 **Verified.**
 
