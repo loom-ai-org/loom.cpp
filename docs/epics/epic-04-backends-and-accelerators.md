@@ -73,7 +73,7 @@ cost 183 splits against the monolithic export's 181 — measured, against the pr
 | | |
 |---|---|
 | Decisions | [ADR-007](../adrs/adr-007-backend-capability-negotiation.md), [ADR-008](../adrs/adr-008-atan-approximation.md), [ADR-009](../adrs/adr-009-backends-as-dynamic-libraries.md), [ADR-010](../adrs/adr-010-device-selection-by-kind.md), [ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md) |
-| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md) |
+| Retros | [Retro-007](../retros/retro-007-gpu-chose-the-integrated-gpu.md), [Retro-008](../retros/retro-008-a-gate-that-was-green-for-the-wrong-reason.md), [Retro-009](../retros/retro-009-host-callback-count-was-the-wrong-lens.md), [Retro-026](../retros/retro-026-three-nodes-were-half-the-runtime.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md), [Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md), [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md) |
 | Active tasks | [Backlog → Backends](../backlog/active-index.md#backends--accelerators) |
 
 ## 4. The Record
@@ -1244,6 +1244,14 @@ identically with the same backend library), and each was invisible on the CPU.
 | Kokoro-82M | Metal | peak 3.02 vs 0.27, "(gasps)" | `NORM` over 66-element rows: a partial last simdgroup dropped a partial sum | `ggml-0025`, a backport of llama.cpp `a194a75b7e` ([Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md)) |
 | Soprano-1.1-80m | Vulkan | near-silence, peak 0.00099 vs 0.54 | `conv_transpose_1d.comp` accumulates `128*s0 + K` values in a fixed 4096-slot shared array; the iSTFT's hop of 512 overran it | `ggml-0027`: `supports_op` declines what does not fit (CPU fallback) |
 | Citrinet-1024 | CUDA | process abort, `mmvf.cu:423` | `mul_mat_vec_f` asserted an even column stride on a ONE-column `src1` (the squeeze-excite's pooled vector, permuted, `nb[1] == 4`) | `ggml-0026` |
+
+**A device that runs out (2026-10-09).** MOSS-TTS lost the device on the Radeon Vega 3 (RADV) because
+its talker and codec together need 21.1 GB of weights and the iGPU can make 19.97 GB resident. RADV
+accepts allocations past that and fails the next submit, which ggml reports as `ErrorDeviceLost`.
+`GgufModel::load` now refuses a device whose reported free memory cannot hold the weights, and
+`Device::open(spec, weight_bytes)` makes `auto` pass over it, with a `selection_note()` the hosts
+surface as a warning. Only the weights are counted, not compute buffers
+([Retro-076](../retros/retro-076-a-full-device-said-device-lost.md)).
 
 **The precision contract.** On every backend, an F32 x F32 product is computed in F32. A product with an
 F16 or quantized weight runs at the precision the export chose, which matches what the CPU does on that

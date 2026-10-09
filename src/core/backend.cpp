@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
@@ -258,15 +259,44 @@ std::pair<int, int> tie_break(ggml_backend_dev_t dev) {
     return {confirmed, kind};
 }
 
+std::string gigabytes(size_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f GB", static_cast<double>(bytes) / 1e9);
+    return buf;
+}
+
+// Whether `dev` reports less free memory than `weight_bytes`, writing what it reports to `free_out`.
+// Asked only of rank 0, a device with its own memory: the CPU and a host-memory accelerator share
+// the host's, where an allocation that cannot be met fails at the allocation, with a clear error. A
+// device that reports no memory at all (total 0) is unknown rather than full, and is never passed over.
+bool lacks_room(ggml_backend_dev_t dev, size_t weight_bytes, size_t* free_out) {
+    if (weight_bytes == 0 || primary_rank(dev) != 0) return false;
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(dev, &free, &total);
+    *free_out = free;
+    return total != 0 && free < weight_bytes;
+}
+
 // The best device whose rank falls in [best_allowed, worst_allowed], or null if there is none.
-// `"gpu"` passes a single-rank window; `"auto"` passes all of them.
-ggml_backend_dev_t best_device_in_range(int best_allowed, int worst_allowed) {
+// `"gpu"` passes a single-rank window; `"auto"` passes all of them, with the weights' size so that a
+// device that cannot hold them is skipped -- and named in `note`, which is what the caller is told.
+ggml_backend_dev_t best_device_in_range(int best_allowed, int worst_allowed, size_t weight_bytes = 0,
+                                        std::string* note = nullptr) {
     ggml_backend_dev_t best = nullptr;
     std::tuple<int, int, int> best_key{worst_allowed + 1, 0, 0};
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const int rank = primary_rank(dev);
         if (rank < best_allowed || rank > worst_allowed) continue;
+        size_t free = 0;
+        if (lacks_room(dev, weight_bytes, &free)) {
+            if (note != nullptr) {
+                if (!note->empty()) *note += "; ";
+                *note += std::string(ggml_backend_dev_name(dev)) + " (" + ggml_backend_dev_description(dev) +
+                         ") has " + gigabytes(free) + " free and the weights need " + gigabytes(weight_bytes);
+            }
+            continue;
+        }
         const std::pair<int, int> tb = tie_break(dev);
         const std::tuple<int, int, int> key{rank, tb.first, tb.second};
         if (key < best_key) {
@@ -481,7 +511,9 @@ std::vector<DeviceInfo> available_devices() {
     return out;
 }
 
-Device Device::open(const std::string& spec) {
+Device Device::open(const std::string& spec) { return open(spec, 0); }
+
+Device Device::open(const std::string& spec, size_t weight_bytes) {
     ensure_backends_loaded();
 
     // Explicit argument, else the environment, else autodetection -- the resolution order this project
@@ -496,6 +528,7 @@ Device Device::open(const std::string& spec) {
     const std::string key = lowered(requested);
 
     ggml_backend_dev_t dev = nullptr;
+    std::string note;
     if (key == "cpu") {
         dev = cpu_device();
     } else if (key == "gpu") {
@@ -548,7 +581,9 @@ Device Device::open(const std::string& spec) {
         throw Error(message + ". Use 'auto', or name a device.");
     } else if (key == "auto") {
         // Every rank in preference order, so this cannot fail: the CPU is rank 2 and is always there.
-        dev = best_device_in_range(0, 2);
+        // With the weights' size, a device that cannot hold them is skipped and the reason kept for
+        // the caller. Skipping can still never leave nothing: the CPU is never passed over.
+        dev = best_device_in_range(0, 2, weight_bytes, &note);
         if (dev == nullptr) dev = cpu_device();
     } else {
         // A device name. Matched case-insensitively against the registry rather than through
@@ -571,6 +606,7 @@ Device Device::open(const std::string& spec) {
     }
     device.name_ = ggml_backend_dev_name(dev);
     device.description_ = ggml_backend_dev_description(dev);
+    if (!note.empty()) device.selection_note_ = "'auto' chose " + device.name_ + ": " + note;
     apply_cpu_threads(device.primary_.get());
 
     // The CPU comes along whenever the primary is not one, and it is not optional: see backend.h for why

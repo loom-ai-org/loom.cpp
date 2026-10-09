@@ -1,6 +1,7 @@
 #include "loom/core/gguf_model.h"
 #include "loom/loom_errors.h"
 
+#include <cstdio>
 #include <fstream>
 #include <vector>
 
@@ -25,6 +26,31 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
     }
     model->gguf_ctx_.reset(raw_gguf_ctx);
     model->meta_ctx_.reset(raw_meta_ctx);
+
+    // Refuse a device that says it cannot hold the weights, before asking it to. Exactly what
+    // ggml_backend_alloc_ctx_tensors will allocate: each tensor's size as the buffer type pads it.
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+        !ggml_backend_buft_is_host(buft)) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        const size_t align = ggml_backend_buft_get_alignment(buft);
+        size_t needed = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(model->meta_ctx_.get()); t != nullptr;
+             t = ggml_get_next_tensor(model->meta_ctx_.get(), t)) {
+            needed += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+        }
+        if (total != 0 && needed > free) {
+            char numbers[160];
+            std::snprintf(numbers, sizeof(numbers), "needs %.2f GB for its weights and %s has %.2f GB free of %.2f GB",
+                          needed / 1e9, ggml_backend_dev_name(dev), free / 1e9, total / 1e9);
+            throw LoadError("GgufModel::load: '" + path + "' " + numbers + " (" +
+                            ggml_backend_dev_description(dev) + "). Free the models already loaded "
+                            "there, or load this one with device 'cpu' -- or 'auto', which skips a "
+                            "device that cannot hold the weights.");
+        }
+    }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(model->meta_ctx_.get(), backend);
     if (!buf) {
@@ -145,6 +171,15 @@ std::vector<std::string> GgufModel::topology_names() const {
         }
     }
     return names;
+}
+
+size_t GgufModel::weight_bytes() const {
+    size_t total = 0;
+    for (ggml_tensor* t = ggml_get_first_tensor(meta_ctx_.get()); t != nullptr;
+         t = ggml_get_next_tensor(meta_ctx_.get(), t)) {
+        total += ggml_nbytes(t);
+    }
+    return total;
 }
 
 std::unique_ptr<GgufModel> GgufModel::load_metadata(const std::string& path) {

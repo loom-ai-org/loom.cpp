@@ -687,10 +687,15 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<loom::Device> device;
     try {
-        device = std::make_unique<loom::Device>(loom::Device::open(device_spec));
+        // With the weights' size, so that "auto" passes over a device that cannot hold them.
+        const size_t weight_bytes = loom::GgufModel::load_metadata(model_path)->weight_bytes();
+        device = std::make_unique<loom::Device>(loom::Device::open(device_spec, weight_bytes));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
+    }
+    if (!device->selection_note().empty()) {
+        std::fprintf(stderr, "warning: %s\n", device->selection_note().c_str());
     }
     const loom::Backends backends = device->backends();
     // What a stochastic TTS driver seeds with. `--seed` is the same flag that makes a sampled

@@ -187,6 +187,21 @@ public:
     // Throws loom::Error on an unresolvable spec or a device that fails to initialize.
     static Device open(const std::string& spec = "");
 
+    // The same, for a caller that knows how much its weights need (`GgufModel::weight_bytes()` on a
+    // `load_metadata` model): under "auto", an offload device whose reported free memory cannot hold
+    // them is passed over for the next one down the ranking, and `selection_note()` says so. Every
+    // other spec resolves exactly as above -- a caller who NAMED a device gets that device, and
+    // `GgufModel::load` refuses it with the numbers if the weights do not fit.
+    //
+    // WHY "auto" HAS TO ASK. A device that has run out does not reliably say so at allocation. RADV on
+    // an APU accepts allocations past what GTT + VRAM can make resident and then fails the first
+    // command submission, which ggml reports as `vk::Queue::submit: ErrorDeviceLost` -- for MOSS-TTS on
+    // a Radeon Vega 3 (19.97 GB) that was the codec's first graph, 15 minutes into a synthesis, with
+    // the 16.8 GB talker resident and the 4.3 GB codec loaded beside it.
+    //
+    // 0 means "unknown" and behaves exactly as open(spec).
+    static Device open(const std::string& spec, size_t weight_bytes);
+
     Backends backends() const {
         std::vector<ggml_backend_t> assist_handles;
         assist_handles.reserve(assists_.size());
@@ -198,6 +213,10 @@ public:
     const std::string& name() const { return name_; }
     const std::string& description() const { return description_; }
     bool is_cpu() const { return fallback_ == nullptr; }
+    // Empty unless "auto" passed a device over for lack of memory; then one sentence naming it, what it
+    // had free and what was needed. A host should surface it: the caller asked for the best device and
+    // got a slower one, which nothing else tells them.
+    const std::string& selection_note() const { return selection_note_; }
 
     Device(Device&&) = default;
     Device& operator=(Device&&) = default;
@@ -216,6 +235,7 @@ private:
     std::vector<ggml_backend_ptr> assists_;
     std::string name_;
     std::string description_;
+    std::string selection_note_;
 };
 
 } // namespace loom
