@@ -1,7 +1,8 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 1c14dccc..7eb0be56 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -3272,6 +3272,116 @@
+@@ -3313,6 +3313,116 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
      return last;
  }
  
@@ -118,7 +119,7 @@ diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
  static int ggml_cpu_try_fuse_ops(
          const struct ggml_cgraph * cgraph,
          const int node_n,
-@@ -3297,6 +3407,16 @@
+@@ -3338,6 +3448,16 @@ static int ggml_cpu_try_fuse_ops(
          }
      }
  
@@ -136,6 +137,7 @@ diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
          // RMS_NORM + MUL fusion
          const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 1652b056..7c62c091 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -22,6 +22,7 @@
@@ -146,19 +148,20 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
  #include <cfloat>
  #include <cmath>
  #include <cstdlib>
-@@ -8882,12 +8883,19 @@
+@@ -9256,12 +9257,19 @@ static void ggml_compute_forward_conv_2d_dw_cwhn(
  // output; for WakeHuBERT's dilated K=5 depthwise convs that held them at roughly a tenth of the 1x1
  // convs' GFLOP/s. Per output the taps are still accumulated in (ky, kx) order starting from 0, as the
  // scalar loop does, so the only numerical change is FMA contraction inside the SIMD sweep.
 -static void ggml_compute_forward_conv_2d_dw_whcn(
+-        const ggml_compute_params * params,
+-        const ggml_tensor * src,
 +// `src_base`/`dst_base` are the first channel's rows; `bias` (one value per channel) and `relu` are the
 +// fused epilogue of ggml-0022, applied to a finished row while it is still in L1 and in the same order
 +// the unfused ADD and RELU nodes would apply them, so fusing is bit-identical. When `dst_base` IS the
 +// source (the graph allocator may hand a fused output the block of an input that is dead afterwards),
 +// each source row is copied out before its output row is written, since the taps read behind x.
 +static void ggml_compute_forward_conv_2d_dw_whcn_impl(
-         const ggml_compute_params * params,
--        const ggml_tensor * src,
++        const ggml_compute_params * params,
 +        const float * src_base,
          const ggml_tensor * kernel,
 -        ggml_tensor * dst,
@@ -170,7 +173,7 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
  
      const int64_t n = p.channels * p.batch;
      const int64_t per_thread = (n + params->nth - 1) / params->nth;
-@@ -8904,10 +8912,17 @@
+@@ -9278,10 +9286,17 @@ static void ggml_compute_forward_conv_2d_dw_whcn(
      x_lo = MIN(x_lo, p.dst_w);
      x_hi = MAX(x_lo, MIN(x_hi, p.dst_w));
  
@@ -190,7 +193,7 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
  
          auto scalar = [&](int64_t dst_y, int64_t dst_x) {
              float sum = 0.0f;
-@@ -8959,9 +8974,32 @@
+@@ -9333,9 +9348,32 @@ static void ggml_compute_forward_conv_2d_dw_whcn(
                  scalar(dst_y, dst_x);
              }
          }
@@ -223,7 +226,7 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
  void ggml_compute_forward_conv_2d_dw(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
-@@ -8998,6 +9036,42 @@
+@@ -9372,6 +9410,42 @@ void ggml_compute_forward_conv_2d_dw(
      }
  }
  
@@ -267,9 +270,10 @@ diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
  static void ggml_compute_forward_pool_1d_ksp(
          const ggml_compute_params * params,
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index e77fb663..5b6ed027 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
-@@ -107,6 +107,7 @@
+@@ -106,6 +106,7 @@ void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * param
  void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -1,194 +1,8 @@
---- a/src/ggml-cpu/ops.cpp
-+++ b/src/ggml-cpu/ops.cpp
-@@ -6995,7 +6995,13 @@
-                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
-                                               const ggml_tensor *         src,     // [W, H, C, N]
-                                               ggml_tensor *               dst,     // [OW, OH, OC, N]
--                                              ggml_type                   kernel_type) {
-+                                              ggml_type                   kernel_type,
-+                                              // Fusion (see ggml_compute_forward_conv_2d_bias_fused):
-+                                              // a per-output-channel bias, added to each batch of the
-+                                              // result while it is still in cache, and the buffer to
-+                                              // write into when that is not dst's own.
-+                                              const float *               bias_data = nullptr,
-+                                              float *                     out_data  = nullptr) {
- 
-     GGML_ASSERT(ggml_is_contiguous(kernel));
-     GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
-@@ -7023,7 +7029,7 @@
- 
-     const float * src_data = (float *) src->data;
-     void  * knl_data       = kernel->data;
--    float * dst_data       = (float *) dst->data;
-+    float * dst_data       = out_data ? out_data : (float *) dst->data;
- 
-     const int64_t knl_n           = knl_w * knl_h * c_in;
-     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
-@@ -7055,6 +7061,33 @@
- 
-     void * tmp = params->wdata;
- 
-+    // WRITING THE RESULT WHERE THE INPUT IS. When this convolution is fused with the bias add that
-+    // follows it, the destination is the ADD's tensor -- and a graph allocator is entitled to have
-+    // given that tensor the very block this convolution's input occupies, because in the unfused order
-+    // the input is dead by the time the ADD runs. Every large convolution in a VITS vocoder is
-+    // allocated exactly that way, so declining them leaves the fusion worth 0.3%.
-+    //
-+    // It is still safe to write there, as long as no batch's output lands on input that a later batch
-+    // has not read yet. Holding each batch's result back until the NEXT batch has finished its im2col
-+    // is enough: batch k reads input from `s_k - pad` upwards, batch k-1's output covers
-+    // `[s_{k-1}, s_k)`, and nothing at or after k ever reads below `s_k - pad`. That needs one batch to
-+    // be longer than the kernel's reach; when it is not, the fallback keeps the convolution's own
-+    // destination and pays for one extra pass rather than being wrong.
-+    const bool aliases_input = out_data != nullptr && (const void *) out_data == (const void *) src_data
-+                            && ggml_nbytes(dst) == ggml_nbytes(src);
-+    const bool defer = aliases_input && stride_x == 1 && patches_per_batch > (knl_w - 1) * dilation_x;
-+    if (aliases_input && !defer) {
-+        ggml_compute_forward_conv_2d_impl(params, kernel, src, dst, kernel_type, bias_data, nullptr);
-+        ggml_barrier(params->threadpool);
-+        for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
-+            const float * in = (const float *) dst->data + oc * dst_w * dst_h;
-+            memcpy(out_data + oc * dst_w * dst_h, in, (size_t) dst_w * dst_h * sizeof(float));
-+        }
-+        return;
-+    }
-+    int64_t pending_start = -1;
-+    int64_t pending_n     = 0;
-+
-     for (int64_t batch_i = 0; batch_i < batch_n; ++batch_i) {
- 
-         const int64_t patch_start_batch = batch_i * patches_per_batch;
-@@ -7104,28 +7137,72 @@
- 
-         ggml_barrier(params->threadpool);
- 
-+        // The batch held back from last time: its output overwrites input that the im2col above has
-+        // now finished reading, so it is safe to land it -- and it has to happen before the GEMM
-+        // below, which reuses the buffer it is staged in.
-+        if (defer && pending_start >= 0) {
-+            const float * staged = (const float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
-+            for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
-+                float *       out = out_data + oc * dst_w * dst_h + pending_start;
-+                const float * in  = staged + oc * pending_n;
-+                const float   b   = bias_data ? bias_data[oc] : 0.0f;
-+                for (int64_t i = 0; i < pending_n; ++i) {
-+                    out[i] = in[i] + b;
-+                }
-+            }
-+            pending_start = -1;
-+            ggml_barrier(params->threadpool);
-+        }
-+
-         // The GEMM can write straight into dst when dst is contiguous and there is one image in the
-         // batch: `C[ldc*oc + p]` with `ldc = dst_w*dst_h` IS the [OW, OH, OC] layout, so the scratch
-         // buffer and the element-at-a-time scatter below are both unnecessary. That scatter is not
-         // free -- it is one strided store per output element, 2.35 M of them for a single vocoder
-         // conv -- and skipping it is most of what makes this op worth using at all: with the cache
-         // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
--        if (dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
-+        if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
-             ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
-                                   dst_data + patch_start_batch, dst_w * dst_h);
-             ggml_barrier(params->threadpool);
-+            if (bias_data) {
-+                // Applied HERE rather than as its own pass over the finished result: these are the
-+                // exact lines the GEMM has just written, so they are still in cache, where the ADD
-+                // node this replaces is a read and a write of the whole output -- 9.4 MB each way for
-+                // one vocoder convolution, and 12% of a VITS synthesis across all of them. Split by
-+                // channel, so each thread's stores stay in one contiguous run.
-+                for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
-+                    float *     out = dst_data + oc * dst_w * dst_h + patch_start_batch;
-+                    const float b   = bias_data[oc];
-+                    for (int64_t i = 0; i < patch_n; ++i) {
-+                        out[i] += b;
-+                    }
-+                }
-+            }
-             continue;
-         }
- 
-         float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
- 
-         GGML_ASSERT(gemm_output + patch_n * c_out <= (float*)tmp + params->wsize);
-+
-+        if (defer) {
-+            // Staged CHANNEL-MAJOR -- [c_out, patch_n] with a row stride of patch_n -- so that landing
-+            // it below is a contiguous copy per channel out of a buffer that is still in cache. Staged
-+            // the other way round (one row per patch, which is what the permute path wants) the flush
-+            // reads with a stride of c_out, and that gather costs more than the whole ADD this fusion
-+            // exists to remove: measured 1.70 s against 1.60 s unfused.
-+            ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
-+                                  gemm_output, patch_n);
-+            ggml_barrier(params->threadpool);
-+            pending_start = patch_start_batch;
-+            pending_n     = patch_n;
-+            continue;
-+        }
- 
-         // GEMM: patches[patch_n, knl_n] × kernel[knl_n, c_out] = output[patch_n, c_out]
-         ggml_call_mul_mat(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
- 
-         ggml_barrier(params->threadpool);
--
- 
-         //permute back [OC, N, OH, OW] to [N, OC, OH, OW]
-         const int64_t permute_per_thread = (patch_n + params->nth - 1) / params->nth;
-@@ -7139,12 +7216,41 @@
-             const int64_t dst_x   = p % dst_w;
- 
-             for (int64_t oc = 0; oc < c_out; ++oc) {
--                const float value = gemm_output[i * c_out + oc];
-+                const float value = gemm_output[i * c_out + oc] + (bias_data ? bias_data[oc] : 0.0f);
-                 float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
-                 *dst_ptr = value;
-             }
-         }
-     }
-+
-+    // and the last batch, after which nothing reads the input at all
-+    if (defer && pending_start >= 0) {
-+        const float * staged = (const float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
-+        for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
-+            float *       out = out_data + oc * dst_w * dst_h + pending_start;
-+            const float * in  = staged + oc * pending_n;
-+            const float   b   = bias_data ? bias_data[oc] : 0.0f;
-+            for (int64_t i = 0; i < pending_n; ++i) {
-+                out[i] = in[i] + b;
-+            }
-+        }
-+    }
-+}
-+
-+// CONV_2D with the bias ADD that follows it folded in, writing the ADD's output tensor instead of the
-+// convolution's own. What makes two nodes that pattern is decided by the caller
-+// (ggml_cpu_try_fuse_ops); everything this relies on is checked there.
-+void ggml_compute_forward_conv_2d_bias_fused(
-+        const ggml_compute_params * params,
-+        ggml_tensor *               conv,
-+        const ggml_tensor *         bias,
-+        ggml_tensor *               out) {
-+
-+    const ggml_tensor * kernel = conv->src[0];
-+    const ggml_tensor * src    = conv->src[1];
-+
-+    ggml_compute_forward_conv_2d_impl(params, kernel, src, conv, kernel->type,
-+                                      (const float *) bias->data, (float *) out->data);
- }
- 
- void ggml_compute_forward_conv_2d(
---- a/src/ggml-cpu/ops.h
-+++ b/src/ggml-cpu/ops.h
-@@ -70,6 +70,7 @@
- void ggml_compute_forward_im2col_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_col2im_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_conv_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-+void ggml_compute_forward_conv_2d_bias_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * bias, struct ggml_tensor * out);
- void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 7c274c03..eb3541c6 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -3023,6 +3023,122 @@
+@@ -3064,6 +3064,122 @@ struct ggml_cplan ggml_graph_plan(
  // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
  static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
  
@@ -311,11 +125,10 @@
  static int ggml_cpu_try_fuse_ops(
          const struct ggml_cgraph * cgraph,
          const int node_n,
-@@ -3034,6 +3150,21 @@
-     }
+@@ -3076,6 +3192,21 @@ static int ggml_cpu_try_fuse_ops(
  
      struct ggml_tensor * node = cgraph->nodes[node_n];
-+
+ 
 +    if (node->op == GGML_OP_CONV_2D) {
 +        // CONV_2D + bias ADD fusion. The ADD is a full read and write of the convolution's output --
 +        // 12% of a VITS synthesis on a Pi 4 -- and folding it in costs nothing, because the fused
@@ -330,6 +143,200 @@
 +            return add_idx - node_n;   // the ADD, and any views of the result between here and it
 +        }
 +    }
- 
++
      if (node->op == GGML_OP_RMS_NORM) {
          // RMS_NORM + MUL fusion
+         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index c922f0f6..375d7a40 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -7389,7 +7389,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
+                                               const ggml_tensor *         src,     // [W, H, C, N]
+                                               ggml_tensor *               dst,     // [OW, OH, OC, N]
+-                                              ggml_type                   kernel_type) {
++                                              ggml_type                   kernel_type,
++                                              // Fusion (see ggml_compute_forward_conv_2d_bias_fused):
++                                              // a per-output-channel bias, added to each batch of the
++                                              // result while it is still in cache, and the buffer to
++                                              // write into when that is not dst's own.
++                                              const float *               bias_data = nullptr,
++                                              float *                     out_data  = nullptr) {
+ 
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
+@@ -7417,7 +7423,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+ 
+     const float * src_data = (float *) src->data;
+     void  * knl_data       = kernel->data;
+-    float * dst_data       = (float *) dst->data;
++    float * dst_data       = out_data ? out_data : (float *) dst->data;
+ 
+     const int64_t knl_n           = knl_w * knl_h * c_in;
+     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
+@@ -7463,6 +7469,33 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+ 
+     void * tmp = params->wdata;
+ 
++    // WRITING THE RESULT WHERE THE INPUT IS. When this convolution is fused with the bias add that
++    // follows it, the destination is the ADD's tensor -- and a graph allocator is entitled to have
++    // given that tensor the very block this convolution's input occupies, because in the unfused order
++    // the input is dead by the time the ADD runs. Every large convolution in a VITS vocoder is
++    // allocated exactly that way, so declining them leaves the fusion worth 0.3%.
++    //
++    // It is still safe to write there, as long as no batch's output lands on input that a later batch
++    // has not read yet. Holding each batch's result back until the NEXT batch has finished its im2col
++    // is enough: batch k reads input from `s_k - pad` upwards, batch k-1's output covers
++    // `[s_{k-1}, s_k)`, and nothing at or after k ever reads below `s_k - pad`. That needs one batch to
++    // be longer than the kernel's reach; when it is not, the fallback keeps the convolution's own
++    // destination and pays for one extra pass rather than being wrong.
++    const bool aliases_input = out_data != nullptr && (const void *) out_data == (const void *) src_data
++                            && ggml_nbytes(dst) == ggml_nbytes(src);
++    const bool defer = aliases_input && stride_x == 1 && patches_per_batch > (knl_w - 1) * dilation_x;
++    if (aliases_input && !defer) {
++        ggml_compute_forward_conv_2d_impl(params, kernel, src, dst, kernel_type, bias_data, nullptr);
++        ggml_barrier(params->threadpool);
++        for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
++            const float * in = (const float *) dst->data + oc * dst_w * dst_h;
++            memcpy(out_data + oc * dst_w * dst_h, in, (size_t) dst_w * dst_h * sizeof(float));
++        }
++        return;
++    }
++    int64_t pending_start = -1;
++    int64_t pending_n     = 0;
++
+     for (int64_t batch_i = 0; batch_i < batch_n; ++batch_i) {
+ 
+         const int64_t patch_start_batch = batch_i * patches_per_batch;
+@@ -7512,16 +7545,47 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+ 
+         ggml_barrier(params->threadpool);
+ 
++        // The batch held back from last time: its output overwrites input that the im2col above has
++        // now finished reading, so it is safe to land it -- and it has to happen before the GEMM
++        // below, which reuses the buffer it is staged in.
++        if (defer && pending_start >= 0) {
++            const float * staged = (const float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
++            for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
++                float *       out = out_data + oc * dst_w * dst_h + pending_start;
++                const float * in  = staged + oc * pending_n;
++                const float   b   = bias_data ? bias_data[oc] : 0.0f;
++                for (int64_t i = 0; i < pending_n; ++i) {
++                    out[i] = in[i] + b;
++                }
++            }
++            pending_start = -1;
++            ggml_barrier(params->threadpool);
++        }
++
+         // The GEMM can write straight into dst when dst is contiguous and there is one image in the
+         // batch: `C[ldc*oc + p]` with `ldc = dst_w*dst_h` IS the [OW, OH, OC] layout, so the scratch
+         // buffer and the element-at-a-time scatter below are both unnecessary. That scatter is not
+         // free -- it is one strided store per output element, 2.35 M of them for a single vocoder
+         // conv -- and skipping it is most of what makes this op worth using at all: with the cache
+         // budget above but WITHOUT this, the same eleven shapes measure 1.08x instead of 1.18x.
+-        if (dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
++        if (!defer && dst->ne[3] == 1 && ggml_is_contiguous(dst)) {
+             ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
+                                   dst_data + patch_start_batch, dst_w * dst_h);
+             ggml_barrier(params->threadpool);
++            if (bias_data) {
++                // Applied HERE rather than as its own pass over the finished result: these are the
++                // exact lines the GEMM has just written, so they are still in cache, where the ADD
++                // node this replaces is a read and a write of the whole output -- 9.4 MB each way for
++                // one vocoder convolution, and 12% of a VITS synthesis across all of them. Split by
++                // channel, so each thread's stores stay in one contiguous run.
++                for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
++                    float *     out = dst_data + oc * dst_w * dst_h + patch_start_batch;
++                    const float b   = bias_data[oc];
++                    for (int64_t i = 0; i < patch_n; ++i) {
++                        out[i] += b;
++                    }
++                }
++            }
+             continue;
+         }
+ 
+@@ -7529,12 +7593,25 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+ 
+         GGML_ASSERT(gemm_output + patch_n * c_out <= (float*)tmp + params->wsize);
+ 
++        if (defer) {
++            // Staged CHANNEL-MAJOR -- [c_out, patch_n] with a row stride of patch_n -- so that landing
++            // it below is a contiguous copy per channel out of a buffer that is still in cache. Staged
++            // the other way round (one row per patch, which is what the permute path wants) the flush
++            // reads with a stride of c_out, and that gather costs more than the whole ADD this fusion
++            // exists to remove: measured 1.70 s against 1.60 s unfused.
++            ggml_call_mul_mat_ldc(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data,
++                                  gemm_output, patch_n);
++            ggml_barrier(params->threadpool);
++            pending_start = patch_start_batch;
++            pending_n     = patch_n;
++            continue;
++        }
++
+         // GEMM: patches[patch_n, knl_n] × kernel[knl_n, c_out] = output[patch_n, c_out]
+         ggml_call_mul_mat(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
+ 
+         ggml_barrier(params->threadpool);
+ 
+-
+         //permute back [OC, N, OH, OW] to [N, OC, OH, OW]
+         const int64_t permute_per_thread = (patch_n + params->nth - 1) / params->nth;
+         const int64_t permute_start = params->ith * permute_per_thread;
+@@ -7547,12 +7624,41 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+             const int64_t dst_x   = p % dst_w;
+ 
+             for (int64_t oc = 0; oc < c_out; ++oc) {
+-                const float value = gemm_output[i * c_out + oc];
++                const float value = gemm_output[i * c_out + oc] + (bias_data ? bias_data[oc] : 0.0f);
+                 float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
+                 *dst_ptr = value;
+             }
+         }
+     }
++
++    // and the last batch, after which nothing reads the input at all
++    if (defer && pending_start >= 0) {
++        const float * staged = (const float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
++        for (int64_t oc = params->ith; oc < c_out; oc += params->nth) {
++            float *       out = out_data + oc * dst_w * dst_h + pending_start;
++            const float * in  = staged + oc * pending_n;
++            const float   b   = bias_data ? bias_data[oc] : 0.0f;
++            for (int64_t i = 0; i < pending_n; ++i) {
++                out[i] = in[i] + b;
++            }
++        }
++    }
++}
++
++// CONV_2D with the bias ADD that follows it folded in, writing the ADD's output tensor instead of the
++// convolution's own. What makes two nodes that pattern is decided by the caller
++// (ggml_cpu_try_fuse_ops); everything this relies on is checked there.
++void ggml_compute_forward_conv_2d_bias_fused(
++        const ggml_compute_params * params,
++        ggml_tensor *               conv,
++        const ggml_tensor *         bias,
++        ggml_tensor *               out) {
++
++    const ggml_tensor * kernel = conv->src[0];
++    const ggml_tensor * src    = conv->src[1];
++
++    ggml_compute_forward_conv_2d_impl(params, kernel, src, conv, kernel->type,
++                                      (const float *) bias->data, (float *) out->data);
+ }
+ 
+ void ggml_compute_forward_conv_2d(
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 2728b08b..ad7dc6d0 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -69,6 +69,7 @@ void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * par
+ void ggml_compute_forward_im2col_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_col2im_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_conv_2d_bias_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * bias, struct ggml_tensor * out);
+ void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);

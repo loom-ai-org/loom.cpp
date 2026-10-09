@@ -97,7 +97,7 @@ std::vector<ggml_tensor*> op_attention(PrimitiveContext& pc, const std::vector<g
     ggml_tensor* vp = ggml_permute(pc.ctx, v_cache, 0, 2, 1, 3);  // [n_embd_head_v, n_kv, n_head_kv]
 
     ggml_tensor* kq = ggml_mul_mat(pc.ctx, kp, qp); // [n_kv, n_tokens, n_head]
-    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    ggml_prec_set_acc(kq, GGML_PREC_F32);
     kq = ggml_soft_max_ext(pc.ctx, kq, kq_mask, scale, /*max_bias=*/0.0f);
 
     // KvCache never pre-transposes V's storage (no v_trans optimization), so this branch always runs.
@@ -177,10 +177,10 @@ std::vector<ggml_tensor*> op_rel_pos_attention(PrimitiveContext& pc, const std::
     ggml_tensor* pp = ggml_permute(pc.ctx, p, 0, 2, 1, 3);        // [head_dim, n_pos, n_head]
 
     ggml_tensor* matrix_ac = ggml_mul_mat(pc.ctx, kp, qu); // [n_tokens(kv), n_tokens(q), n_head]
-    ggml_mul_mat_set_prec(matrix_ac, GGML_PREC_F32);
+    ggml_prec_set_acc(matrix_ac, GGML_PREC_F32);
 
     ggml_tensor* matrix_bd_raw = ggml_mul_mat(pc.ctx, pp, qv); // [n_pos, n_tokens(q), n_head]
-    ggml_mul_mat_set_prec(matrix_bd_raw, GGML_PREC_F32);
+    ggml_prec_set_acc(matrix_bd_raw, GGML_PREC_F32);
     ggml_tensor* matrix_bd_shifted = rel_shift(pc.ctx, matrix_bd_raw); // [n_pos, n_tokens(q), n_head]
     // Truncate to matrix_ac's kv length (matrix_bd[:, :, :matrix_ac.size(-1)] in the PyTorch original).
     ggml_tensor* matrix_bd = ggml_view_3d(pc.ctx, matrix_bd_shifted, matrix_ac->ne[0], matrix_bd_shifted->ne[1],
@@ -289,12 +289,12 @@ std::vector<ggml_tensor*> op_rel_pos_attention_shaw(PrimitiveContext& pc, const 
     ggml_tensor* vp = ggml_permute(pc.ctx, v, 0, 2, 1, 3);
 
     ggml_tensor* matrix_ac = ggml_mul_mat(pc.ctx, kp, qp); // [n_tokens(kv), n_tokens(q), n_head]
-    ggml_mul_mat_set_prec(matrix_ac, GGML_PREC_F32);
+    ggml_prec_set_acc(matrix_ac, GGML_PREC_F32);
 
     // emb_rel_k has ne=[head_dim, 2*n_tokens-1] (no head dim) -- ggml_mul_mat's own broadcast rule treats
     // a missing/size-1 ne[2] as "shared across every ne[2] of b" automatically, same mechanism GQA uses.
     ggml_tensor* rel_logits = ggml_mul_mat(pc.ctx, emb_rel_k, qp); // [2*n_tokens-1, n_tokens(q), n_head]
-    ggml_mul_mat_set_prec(rel_logits, GGML_PREC_F32);
+    ggml_prec_set_acc(rel_logits, GGML_PREC_F32);
     ggml_tensor* scores_local = rel_to_abs_shaw(pc.ctx, rel_logits); // [n_tokens(kv), n_tokens(q), n_head]
 
     ggml_tensor* scores = ggml_add(pc.ctx, matrix_ac, scores_local);

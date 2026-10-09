@@ -1,6 +1,8 @@
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index e7c89563..6c5812b4 100644
 --- a/src/ggml-metal/ggml-metal-impl.h
 +++ b/src/ggml-metal/ggml-metal-impl.h
-@@ -609,6 +609,7 @@ typedef struct {
+@@ -674,6 +674,7 @@ typedef struct {
      int32_t  IL;
      int32_t  K;
      int32_t  s0;
@@ -8,9 +10,11 @@
      uint64_t nb0;
      uint64_t nb1;
  } ggml_metal_kargs_conv_transpose_1d;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index dfe46bac..7d7af07e 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -4267,6 +4267,7 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
+@@ -4949,6 +4949,7 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
          /*.IL  =*/ IL,
          /*.K   =*/ K,
          /*.s0  =*/ s0,
@@ -18,7 +22,7 @@
          /*.nb0 =*/ nb0,
          /*.nb1 =*/ nb1,
      };
-@@ -4279,7 +4280,29 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
+@@ -4961,7 +4962,29 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
      ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
      ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
  
@@ -49,9 +53,11 @@
  
      return 1;
  }
---- a/src/ggml-metal/ggml-metal.metal
-+++ b/src/ggml-metal/ggml-metal.metal
-@@ -5314,7 +5314,9 @@ typedef void (conv_transpose_1d_t)(
+diff --git a/src/ggml-metal/kernels/conv.metal b/src/ggml-metal/kernels/conv.metal
+index a5d5aa9d..c8a1f27b 100644
+--- a/src/ggml-metal/kernels/conv.metal
++++ b/src/ggml-metal/kernels/conv.metal
+@@ -280,7 +280,9 @@ typedef void (conv_transpose_1d_t)(
          device const float * src1,
          device        char * dst,
          uint3   tgpig[[threadgroup_position_in_grid]],
@@ -62,7 +68,7 @@
  
  template <typename T>
  kernel void kernel_conv_transpose_1d(
-@@ -5323,14 +5325,23 @@ kernel void kernel_conv_transpose_1d(
+@@ -289,14 +291,23 @@ kernel void kernel_conv_transpose_1d(
          device const float * src1,
          device        char * dst,
          uint3   tgpig[[threadgroup_position_in_grid]],
@@ -88,7 +94,7 @@
      const int32_t s0 = args.s0;
      const int32_t K  = args.K;
      const int32_t IL = args.IL;
-@@ -5355,7 +5366,7 @@ kernel void kernel_conv_transpose_1d(
+@@ -321,7 +332,7 @@ kernel void kernel_conv_transpose_1d(
          }
      }
  
@@ -97,7 +103,7 @@
  
      dst_ptr[0] = v;
  }
-@@ -5367,7 +5378,9 @@ kernel void kernel_conv_transpose_1d<float>(
+@@ -333,7 +344,9 @@ kernel void kernel_conv_transpose_1d<float>(
      device const float * src1,
      device        char * dst,
      uint3   tgpig[[threadgroup_position_in_grid]],
@@ -108,7 +114,7 @@
  
  template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
  kernel void kernel_conv_transpose_1d<half>(
-@@ -5376,7 +5389,9 @@ kernel void kernel_conv_transpose_1d<half>(
+@@ -342,7 +355,9 @@ kernel void kernel_conv_transpose_1d<half>(
      device const float * src1,
      device        char * dst,
      uint3   tgpig[[threadgroup_position_in_grid]],
@@ -118,4 +124,4 @@
 +    uint3     ntg[[threads_per_threadgroup]]);
  
  
- template <typename T>
+ typedef void (conv_transpose_2d_t)(

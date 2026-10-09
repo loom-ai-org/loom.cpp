@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 8ebe6c26..a24e43d0 100644
+index a7e87c52..d0b5ced1 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -8215,6 +8215,49 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+@@ -8601,6 +8601,49 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
          const int64_t patch_start       = patch_start_batch + params->ith * patch_per_thread;
          const int64_t patch_end         = std::min(patch_start + patch_per_thread, patch_end_batch);
  

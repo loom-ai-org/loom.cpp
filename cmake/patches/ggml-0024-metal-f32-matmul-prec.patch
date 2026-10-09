@@ -1,6 +1,8 @@
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 0326a366..feb9dfce 100644
 --- a/src/ggml-metal/ggml-metal-device.cpp
 +++ b/src/ggml-metal/ggml-metal-device.cpp
-@@ -760,7 +760,12 @@
+@@ -945,7 +945,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
      const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
      const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
  
@@ -14,7 +16,7 @@
      snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
               base, bc_inp, bc_out, ne12, ne13, r2, r3);
  
-@@ -790,7 +795,8 @@
+@@ -975,7 +980,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
          res.nr0 = 64;
          res.nr1 = 32;
  
@@ -24,14 +26,16 @@
      }
  
      res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 9317804b..8d0fa55e 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -2437,7 +2437,11 @@
-         !ggml_is_transposed(op->src[1]) &&
-         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
-         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
--        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
-+        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min &&
+@@ -2718,7 +2718,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
+-    } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm)) {
++    } else if (ggml_metal_op_mul_mat_use_mm(op, props_dev->has_simdgroup_mm) &&
 +        // GGML_PREC_F32 on F32 x F32: the tensor-API mul_mm stages half tiles and has no float variant,
 +        // and the mat-vec kernel is F32 throughout
 +        !(props_dev->has_tensor && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
@@ -39,9 +43,11 @@
          //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
  
          // some Metal matrix data types require aligned pointers
---- a/src/ggml-metal/ggml-metal.metal
-+++ b/src/ggml-metal/ggml-metal.metal
-@@ -10340,8 +10340,9 @@
+diff --git a/src/ggml-metal/kernels/mul_mm.metal b/src/ggml-metal/kernels/mul_mm.metal
+index 9d262da1..f239fc12 100644
+--- a/src/ggml-metal/kernels/mul_mm.metal
++++ b/src/ggml-metal/kernels/mul_mm.metal
+@@ -158,8 +158,9 @@ kernel void kernel_mul_mm(
          ushort tiitg[[thread_index_in_threadgroup]],
          ushort sgitg[[simdgroup_index_in_threadgroup]]) {
  
@@ -52,7 +58,7 @@
  
      constexpr int NR0 = 64;
      constexpr int NR1 = 32;
-@@ -10920,6 +10921,10 @@
+@@ -849,6 +850,10 @@ kernel void kernel_mul_mm_id(
  typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
  
  template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
