@@ -23,7 +23,10 @@ public:
     // a Vulkan/CUDA/Metal device as readily as the CPU, since every write goes through
     // ggml_backend_tensor_set rather than a memcpy into `tensor->data`. Throws loom::LoadError if the
     // file can't be opened/parsed, is missing the "model.graph_topology" KV, or a tensor's data can't be
-    // read.
+    // read -- or BEFORE allocating anything, if the primary is a device with its own memory that reports
+    // less free than the weights need. That refusal is the only clear error such a device gets: past
+    // its capacity, RADV accepts the allocation and the run later dies as `ErrorDeviceLost` (see
+    // Device::open(spec, weight_bytes)). A device that reports no memory is not checked.
     static std::unique_ptr<GgufModel> load(const std::string& path, Backends backends);
 
     // Looks up a weight tensor by its GGUF name (e.g. "blk.0.attn_q.weight"). Throws loom::LoadError if
@@ -45,6 +48,11 @@ public:
     // half-loaded model whose tensors have null data is a segfault waiting for the first caller who
     // forgets. That is the whole of what makes this safe to hand out.
     static std::unique_ptr<GgufModel> load_metadata(const std::string& path);
+
+    // What the weights occupy, summed over every tensor -- the same on a `load_metadata` model, which is
+    // what it is for: the size to pass to Device::open(spec, weight_bytes) before choosing where to load.
+    // It is ggml_nbytes per tensor, so a backend's per-tensor alignment can add a little on top.
+    size_t weight_bytes() const;
 
     // Whether this model carries its weights, i.e. came from `load` rather than `load_metadata`.
     bool has_weights() const { return weights_buf_ != nullptr; }
