@@ -1243,13 +1243,15 @@ identically with the same backend library), and each was invisible on the CPU.
 | SenseVoice-Small | Vulkan, Metal | transcript `''` | F32 x F32 `MUL_MAT` staged in half: the power spectrum (~1e10) overflowed, 99.5% of the mel projection NaN | `GGML_PREC_F32` on every F32 x F32 `MUL_MAT` + `ggml-0023`/`ggml-0024` ([ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md), [Retro-074](../retros/retro-074-a-gpus-f32-matmul-was-half-precision.md)) |
 | Kokoro-82M | Metal | peak 3.02 vs 0.27, "(gasps)" | `NORM` over 66-element rows: a partial last simdgroup dropped a partial sum | `ggml-0025`, a backport of llama.cpp `a194a75b7e` ([Retro-075](../retros/retro-075-upstream-had-already-fixed-the-norm.md)) |
 | Soprano-1.1-80m | Vulkan | near-silence, peak 0.00099 vs 0.54 | `conv_transpose_1d.comp` accumulates `128*s0 + K` values in a fixed 4096-slot shared array; the iSTFT's hop of 512 overran it | `ggml-0027`: `supports_op` declines what does not fit (CPU fallback) |
+| F5-TTS v1 Base | Vulkan (NVIDIA, 2026-10-09) | peak 1.21 vs 0.76, speech twice as loud | F32 `CONV_2D` (the DFT-basis STFT) on the coopmat2/KHR-coopmat shaders, which stage and accumulate in `float16_t`; `log` amplified the fp16 noise floor of the reference mel | the same tag on F32 x F32 `CONV_2D` + `ggml-0028` ([ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md) amendment, [Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)) |
 | Citrinet-1024 | CUDA | process abort, `mmvf.cu:423` | `mul_mat_vec_f` asserted an even column stride on a ONE-column `src1` (the squeeze-excite's pooled vector, permuted, `nb[1] == 4`) | `ggml-0026` |
 
-**The precision contract.** On every backend, an F32 x F32 product is computed in F32. A product with an
-F16 or quantized weight runs at the precision the export chose, which matches what the CPU does on that
-path. CUDA and the CPU already behaved this way. Vulkan and Metal now do too, but only because the graph
-asks: `GraphBuilder` sets the tag (`request_f32_matmul_precision`), and the two patches make those
-backends read it. Upstream ggml ignores the tag for F32 on both backends (checked against master,
+**The precision contract.** On every backend, an F32 x F32 product, and since 2026-10-09 an F32 x F32
+`CONV_2D`, is computed in F32. A product with an F16 or quantized weight runs at the precision the export
+chose, which matches what the CPU does on that path. CUDA and the CPU already behaved this way. Vulkan and
+Metal now do too, but only because the graph asks: `GraphBuilder` sets the tag (`request_f32_precision`),
+and the patches make those backends read it (`ggml-0023`/`ggml-0024` for the matmul, `ggml-0028` for
+Vulkan's conv2d; Metal's conv_2d is float already). Upstream ggml ignores the tag for F32 on both backends (checked against master,
 2026-10-08), so a pin bump that drops `ggml-0023`/`ggml-0024` without an upstream equivalent
 reintroduces the SenseVoice failure. The CI test only checks the tag; SenseVoice on a GPU is the real
 check.
@@ -1260,7 +1262,7 @@ check.
 |---|---|---|
 | Vulkan | Radeon Vega 3 (RADV RAVEN2) | SenseVoice: every node within 1e-5 abs-sum of the CPU, logits to 6 significant figures; card gate **40/40** (every published model up to 2.6 GB, final libraries; Soprano needed `ggml-0027`) |
 | Metal | M1 Pro | card gate 7/7 on `MTL0` and 7/7 on the Mac CPU (WakeHuBERT, Citrinet, SenseVoice, Supertonic, Kokoro, Parakeet-TDT, whisper-small); Kokoro peak 0.2714 vs CPU 0.2710 |
-| Vulkan | RTX 5090 (NVIDIA driver, coopmat2) | card gate **37/40** on the same 40 models; the three failures predate this work and are on the hub: EnCodec and DAC abort in a misaligned `GET_ROWS` (16-byte alignment here, 4 on the Vega; upstream fixed it in llama.cpp `0cae43063c`; both pass since the ggml v0.26.0 bump, [Epic-01 §5](epic-01-inference-engine-core.md#5-the-ggml-pin)), and F5-TTS clips (peak 1.20; 1.20 with the tag-less engine too, CPU passes) |
+| Vulkan | RTX 5090 (NVIDIA driver, coopmat2) | card gate **37/40** on the same 40 models; the three failures predate this work and are on the hub: EnCodec and DAC abort in a misaligned `GET_ROWS` (16-byte alignment here, 4 on the Vega; upstream fixed it in llama.cpp `0cae43063c`; both pass since the ggml v0.26.0 bump, [Epic-01 §5](epic-01-inference-engine-core.md#5-the-ggml-pin)), and F5-TTS clips (peak 1.20; 1.20 with the tag-less engine too, CPU passes). **F5-TTS passes since `ggml-0028`** (2026-10-09, peak 0.748; card gate on the 5090's Vulkan 15/16 on the 8 cards staged there, the one failure a stale WakeHuBERT card from before its frame-door republish) |
 | CUDA | RTX 5090 (sm_120, built from this tree) | card gate 7/7 on `CUDA0`; Citrinet transcript identical to the CPU's |
 
 **What it costs** (median per call on `jfk.wav`; three alternating rounds, same package, only the

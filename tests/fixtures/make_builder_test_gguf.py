@@ -58,6 +58,10 @@ def main() -> None:
     # An F16 copy, read by nothing in the topology above: test_graph_builder_shapes uses it to check that
     # GraphBuilder's GGML_PREC_F32 tagging leaves a non-F32 weight's MUL_MAT at the default precision.
     w.add_tensor("output_f16.weight", rnd(N_VOCAB, N_EMBD).astype(np.float16))
+    # Two CONV_1D kernels, [K=2, IC=3, OC=2] in ggml order, read by nothing above either: the same check
+    # for the CONV_2D a CONV_1D lowers to. IC=3 is the channel count of a 3-token `cur` read as [IL, IC].
+    w.add_tensor("conv.weight", rnd(2, 3, 2))
+    w.add_tensor("conv_f16.weight", rnd(2, 3, 2).astype(np.float16))
 
     w.write_header_to_file()
     w.write_kv_data_to_file()

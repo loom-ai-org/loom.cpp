@@ -1,0 +1,117 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan-types.h b/src/ggml-vulkan/ggml-vulkan-types.h
+index 94357389..5dd4b5fb 100644
+--- a/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -463,10 +463,15 @@ struct vk_conv2d_pipeline_state {
+     uint32_t s0, s1, p0, p1, d0, d1, KW, KH;
+     // when set, shader can skip K/CRS/NPQ bounds checks and address clamps
+     uint32_t aligned;
++    // GGML_PREC_F32 on the node: build from the scalar shader (float shared memory, float accumulators)
++    // even where the device would use the coopmat2/coopmat1 variants, which stage both operands AND
++    // accumulate in float16_t. A 1024-tap DFT-basis STFT followed by log() is wrong by ~0.7 nats on
++    // average that way (F5-TTS reference mel on an RTX 5090).
++    uint32_t prec_f32 = 0;
+ 
+     bool operator<(const vk_conv2d_pipeline_state &b) const {
+-        return std::tie(s0, s1, p0, p1, d0, d1, KW, KH, aligned) <
+-               std::tie(b.s0, b.s1, b.p0, b.p1, b.d0, b.d1, b.KW, b.KH, b.aligned);
++        return std::tie(s0, s1, p0, p1, d0, d1, KW, KH, aligned, prec_f32) <
++               std::tie(b.s0, b.s1, b.p0, b.p1, b.d0, b.d1, b.KW, b.KH, b.aligned, b.prec_f32);
+     }
+ };
+ 
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 19937a36..8ef4391f 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3813,6 +3813,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 conv2d_BS.CRS);  // CRS block size should be capped at subgroup size for correctness when shuffle is used.
+         }
+ 
++        // The scalar (float shared memory) configuration, kept for GGML_PREC_F32 nodes before the
++        // coopmat paths below repurpose these variables (see vk_conv2d_pipeline_state::prec_f32).
++        uint32_t conv2d_f32_SHMEM_PAD = conv2d_SHMEM_PAD;
++#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
++        if (device->coopmat2 && device->vendor_id != VK_VENDOR_ID_INTEL && device->vendor_id != VK_VENDOR_ID_AMD) {
++            conv2d_f32_SHMEM_PAD = 4;   // undo the "8 float16_t" above; the vendor pads already are float
++        }
++#endif
++        const uint32_t conv2d_f32_WG_SIZE = conv2d_WG_SIZE;
++        vk_conv_block_size conv2d_f32_BS = conv2d_BS;
++
+         // cm1 is used only when cm2 is unavailable; capped at 64x128 (due to shared memory size).
+         // Requires 16x16x16 f16-acc since that's the fragment shape hard-coded in the shader.
+         // Subgroup size must be 32 or 64 (to keep WG_SIZE sane) and we need
+@@ -3881,12 +3892,43 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         std::array<uint32_t, 3> wg_denoms = { conv2d_BS.K, 1, 1 };
+         std::vector<uint32_t> spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_BS.CRS, conv2d_BS.NPQ, conv2d_TS_K, use_collectives, conv2d_SHMEM_PAD };
+ 
++        // The same for the scalar shader, with the same shrink the non-coopmat config gets above.
++        if (device->properties.limits.maxComputeSharedMemorySize <
++            (conv2d_f32_BS.K * (conv2d_f32_BS.CRS + conv2d_f32_SHMEM_PAD) + conv2d_f32_BS.CRS * (conv2d_f32_BS.NPQ + conv2d_f32_SHMEM_PAD)) * (uint32_t)sizeof(float)) {
++            conv2d_f32_BS.CRS = 8;
++            if (use_collectives) {
++                conv2d_f32_BS.CRS = std::min(device->subgroup_size, conv2d_f32_BS.CRS);
++            }
++        }
++        std::vector<uint32_t> spec_constants_f32 = { conv2d_f32_WG_SIZE, conv2d_f32_BS.K, conv2d_f32_BS.CRS, conv2d_f32_BS.NPQ, conv2d_TS_K, use_collectives, conv2d_f32_SHMEM_PAD };
++
+         // cm1 needs a fixed subgroup width to match the WG_SIZE we computed
+         const uint32_t conv2d_required_subgroup_size = conv2d_use_cm1 ? device->subgroup_size : 0;
+ 
+ #define CREATE_CONV(name, type_suffix, spv_suffix) \
+         for (auto &c : device->pipeline_##name##type_suffix[s]) { \
+             const vk_conv2d_pipeline_state &state = c.first;  \
++            if (state.prec_f32) { \
++                std::vector<uint32_t> spec_constants_cpy = spec_constants_f32; \
++                spec_constants_cpy.push_back(state.s0); \
++                spec_constants_cpy.push_back(state.s1); \
++                spec_constants_cpy.push_back(state.p0); \
++                spec_constants_cpy.push_back(state.p1); \
++                spec_constants_cpy.push_back(state.d0); \
++                spec_constants_cpy.push_back(state.d1); \
++                spec_constants_cpy.push_back(state.KW); \
++                spec_constants_cpy.push_back(state.KH); \
++                spec_constants_cpy.push_back(state.aligned); \
++                spec_constants_cpy.push_back(0u); /* csh_store: the scalar shader has no Csh */ \
++                spec_constants_cpy.push_back(16u); \
++                spec_constants_cpy.push_back(16u); \
++                ggml_vk_create_pipeline( \
++                    device, c.second, #name #type_suffix "_prec_f32", \
++                    conv2d_UNROLL ? name##type_suffix##_unroll_len : name##type_suffix##_len, \
++                    conv2d_UNROLL ? name##type_suffix##_unroll_data : name##type_suffix##_data, "main", 3, \
++                    sizeof(vk_op_conv2d_push_constants), { conv2d_f32_BS.K, 1, 1 }, spec_constants_cpy, 1, true, use_collectives != 0, 0); \
++                continue; \
++            } \
+             std::vector<uint32_t> spec_constants_cpy = spec_constants; \
+             spec_constants_cpy.push_back(state.s0); \
+             spec_constants_cpy.push_back(state.s1); \
+@@ -9244,6 +9286,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+                                       (NPQ % BS_NPQ == 0)) ? 1u : 0u;
+ 
+             vk_conv2d_pipeline_state conv2d_pipeline_state(s0, s1, p0, p1, d0, d1, KW, KH, aligned);
++            if (!transpose && (ggml_prec)ggml_get_op_params_i32(dst, 9) == GGML_PREC_F32) {
++                conv2d_pipeline_state.prec_f32 = 1;
++            }
+ 
+             std::map<vk_conv2d_pipeline_state, vk_pipeline> *pipelines = nullptr;
+             if (op == GGML_OP_CONV_2D) {
+diff --git a/src/ggml.c b/src/ggml.c
+index 7d8a51eb..83690232 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -3305,6 +3305,14 @@ bool ggml_prec_set_acc(
+                 ggml_set_op_params_i32(a, 3, prec_i32);
+             }
+             break;
++        case GGML_OP_CONV_2D:
++            {
++                // 0..5 are the geometry and 6..8 the folded-kernel layout (ggml_conv_2d_direct_folded);
++                // 9 is free on CONV_2D (CONV_3D's 9..11 are a different op). Zero is GGML_PREC_DEFAULT.
++                const int32_t prec_i32 = (int32_t) prec;
++                ggml_set_op_params_i32(a, 9, prec_i32);
++            }
++            break;
+         default:
+             return false;
+     };

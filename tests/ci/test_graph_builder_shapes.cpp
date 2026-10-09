@@ -190,7 +190,7 @@ void test_reserve_does_not_break_subsequent_builds(loom::GgufModel& model, ggml_
 } // namespace
 
 // Every F32 x F32 MUL_MAT in a built graph asks for GGML_PREC_F32 (graph_builder.cpp,
-// request_f32_matmul_precision): without it Vulkan and Metal stage both operands in half precision, and a
+// request_f32_precision): without it Vulkan and Metal stage both operands in half precision, and a
 // value past 65504 comes back inf -- SenseVoice's mel projection was 99.5% NaN on both. The CPU ignores the
 // flag, so this checks the tag itself rather than any output. A weight exported at F16 keeps the default:
 // that precision was the export's choice, not the backend's.
@@ -227,6 +227,50 @@ void test_f32_matmul_requests_f32_precision(loom::GgufModel& model, ggml_backend
     LOOM_CHECK(n_f16 == 1);
 }
 
+// The same tag on the CONV_2D a CONV_1D lowers to (ggml-0028 reads it from op_params[9]): Vulkan's
+// coopmat2 and KHR-coopmat conv2d shaders stage AND accumulate in float16_t, which on an RTX 5090 moved
+// F5-TTS's log-mel floor far enough to double the loudness of its speech. An F16 kernel keeps the
+// default, as for MUL_MAT. Under LOOM_CONV_DIRECT=0 a CONV_1D is im2col + MUL_MAT, which the test above
+// covers, so there is nothing to count here.
+void test_f32_conv_requests_f32_precision(loom::GgufModel& model, ggml_backend_t backend) {
+    const char* json = R"JSON({
+      "version": 1,
+      "inputs": [{"name":"tokens","dtype":"i32","shape":["n_tokens"]}],
+      "outputs": ["y", "y16"],
+      "nodes": [
+        {"op": "GET_ROWS", "inputs": ["token_embd.weight", "tokens"], "outputs": ["cur"]},
+        {"op": "CONV_1D", "inputs": ["conv.weight", "cur"], "outputs": ["y"], "attrs": {"s0": 1, "p0": 0, "d0": 1}},
+        {"op": "CONV_1D", "inputs": ["conv_f16.weight", "cur"], "outputs": ["y16"], "attrs": {"s0": 1, "p0": 0, "d0": 1}}
+      ]
+    })JSON";
+    loom::GraphTopology topo = loom::GraphTopology::parse(json);
+    loom::GraphBuilder builder(topo, model, backend);
+    const auto& result = builder.build({{"n_tokens", 3}, {"n_past", 0}});
+
+    int n_f32 = 0, n_f16 = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(result.graph); ++i) {
+        const ggml_tensor* node = ggml_graph_node(result.graph, i);
+        if (node->op != GGML_OP_CONV_2D) continue;
+        const int32_t prec = node->op_params[9];
+        if (node->src[0]->type == GGML_TYPE_F32) {
+            LOOM_CHECK(prec == GGML_PREC_F32);
+            ++n_f32;
+        } else {
+            LOOM_CHECK(node->src[0]->type == GGML_TYPE_F16);
+            LOOM_CHECK(prec == GGML_PREC_DEFAULT);
+            ++n_f16;
+        }
+    }
+    // primitives_conv.cpp's default, restated: the direct lowering unless either switch says 0.
+#if (defined(LOOM_CONV_DIRECT) && !LOOM_CONV_DIRECT) || \
+    (!defined(LOOM_CONV_DIRECT) && defined(LOOM_CONV1D_DIRECT) && !LOOM_CONV1D_DIRECT)
+    LOOM_CHECK(n_f32 == 0 && n_f16 == 0);
+#else
+    LOOM_CHECK(n_f32 == 1);
+    LOOM_CHECK(n_f16 == 1);
+#endif
+}
+
 int main() {
     ggml_backend_ptr backend(loom_test::cpu_backend());
     LOOM_CHECK(backend != nullptr);
@@ -241,6 +285,7 @@ int main() {
     test_multi_output_build(*model, backend.get());
     test_reserve_does_not_break_subsequent_builds(*model, backend.get());
     test_f32_matmul_requests_f32_precision(*model, backend.get());
+    test_f32_conv_requests_f32_precision(*model, backend.get());
 
     LOOM_TEST_REPORT_AND_RETURN();
 }
