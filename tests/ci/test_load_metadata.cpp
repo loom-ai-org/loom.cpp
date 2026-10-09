@@ -63,6 +63,11 @@ int main() {
         LOOM_CHECK(full->topology_json(name) == meta->topology_json(name));
     }
 
+    // ...and the weights' size, which a metadata model exists to answer before anything is allocated:
+    // it is what a host passes to Device::open(spec, weight_bytes) to choose where to load.
+    LOOM_CHECK(meta->weight_bytes() > 0);
+    LOOM_CHECK(meta->weight_bytes() == full->weight_bytes());
+
     // --- 3. The guard. Both weight accessors throw, and the message names the loader so the fix is
     //        readable from the error alone. ---
     const std::string any_weight = "token_embd.weight";

@@ -14,6 +14,7 @@
 
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 
@@ -79,6 +80,30 @@ int main() {
             LOOM_CHECK(automatic.backends().fallback != nullptr);
             LOOM_CHECK(automatic.backends().fallback != automatic.backends().primary);
         }
+    }
+
+    // --- "auto" passes over a device that cannot hold the weights, and says so ----------------------
+    // No device holds SIZE_MAX bytes, so every offload device that reports its memory is skipped. What
+    // a hermetic test can assert is the invariant tying the choice to the note: the choice moves away
+    // from plain "auto"'s exactly when the note says why, and the CPU -- never skipped -- remains. On
+    // a CPU-only build that is "CPU, no note"; on a Vulkan one it is "CPU, naming Vulkan0".
+    {
+        const loom::Device plain = loom::Device::open("auto");
+        const loom::Device unknown = loom::Device::open("auto", 0);
+        LOOM_CHECK(unknown.name() == plain.name());
+        LOOM_CHECK(unknown.selection_note().empty());
+
+        const loom::Device huge = loom::Device::open("auto", SIZE_MAX);
+        LOOM_CHECK(huge.backends().primary != nullptr);
+        LOOM_CHECK((huge.name() == plain.name()) == huge.selection_note().empty());
+        if (!huge.selection_note().empty()) {
+            LOOM_CHECK(huge.selection_note().find(plain.name()) != std::string::npos);
+        }
+
+        // A NAMED device is never second-guessed here; the refusal for it is GgufModel::load's.
+        const loom::Device named = loom::Device::open("cpu", SIZE_MAX);
+        LOOM_CHECK(named.is_cpu());
+        LOOM_CHECK(named.selection_note().empty());
     }
 
     // --- "gpu" is an assertion about the machine, not a preference ----------------------------------
