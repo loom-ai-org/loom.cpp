@@ -29,12 +29,20 @@ namespace {
 // that a new primitive cannot forget it. A non-F32 `a` (F16, a quantized weight) is left alone: that is
 // the precision the model was exported at, and the CPU converts `b` to the weight's vec_dot_type on that
 // path too.
-void request_f32_matmul_precision(ggml_cgraph* gf) {
+//
+// **An F32 x F32 CONV_2D gets the same tag**, for the same reason in a different shape: Vulkan's conv2d
+// coopmat2 and KHR-coopmat variants stage both operands in float16_t AND accumulate in float16_t, so an
+// NVIDIA GPU computes every F32 convolution at half precision (the plain shader, which a Vega 3 runs, is
+// float). F5-TTS's reference STFT is a 1024-tap DFT-basis CONV_2D followed by log(clamp(x, 1e-5)): the
+// half-precision floor moved the mean log-mel from -2.23 to -1.50 and the generated speech came out
+// twice as loud and clipped (peak 1.21 against the CPU's 0.76). cmake/patches/ggml-0028 makes Vulkan
+// honour the tag with the scalar shader; the CPU, CUDA and Metal compute conv_2d in F32 already.
+void request_f32_precision(ggml_cgraph* gf) {
     const int n = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n; ++i) {
         ggml_tensor* node = ggml_graph_node(gf, i);
-        if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 &&
-            node->src[1]->type == GGML_TYPE_F32) {
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_CONV_2D) &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) {
             ggml_prec_set_acc(node, GGML_PREC_F32);
         }
     }
@@ -457,7 +465,7 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
             ggml_build_forward_expand(gf, ggml_cpy(ctx.get(), result.outputs[i], slots[i]));
         }
     }
-    request_f32_matmul_precision(gf);
+    request_f32_precision(gf);
     result.graph = gf;
 
     if (backends_.hybrid()) {

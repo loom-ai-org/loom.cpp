@@ -2,7 +2,7 @@
 type: adr
 status: accepted
 date: 2026-10-08
-tags: [backends, vulkan, metal, precision, mul_mat, ggml, sensevoice]
+tags: [backends, vulkan, metal, precision, mul_mat, conv_2d, ggml, sensevoice, f5-tts]
 supersedes: []
 ---
 
@@ -44,7 +44,8 @@ projection came back 99.5% NaN and the transcript was `''`.
 
 ## Decision
 
-Option 5. `GraphBuilder::build` walks the graph once (`request_f32_matmul_precision` in
+Option 5. `GraphBuilder::build` walks the graph once (`request_f32_precision`, until 2026-10-09
+`request_f32_matmul_precision`, in
 `src/core/graph_builder.cpp`) and sets `GGML_PREC_F32` on every `MUL_MAT` whose two operands are F32.
 `ggml-0023` makes Vulkan honour it: a float-shared-memory scalar pipeline, and F32 rather than f16
 copies of non-contiguous operands. `ggml-0024` does the same for Metal: a float-tiled
@@ -72,3 +73,14 @@ there too.
 * The CPU and CUDA ignore the tag for F32, so their numbers and outputs are unchanged.
   `test_graph_builder_shapes` checks the tag itself (and goes red with the pass removed), since no CI
   machine has a GPU.
+* **Amendment 2026-10-09: an F32 x F32 `CONV_2D` asks too.** Vulkan's conv2d coopmat2 and KHR-coopmat
+  shaders stage both operands in `float16_t` and accumulate in it. An F32 `CONV_1D` lowered to ggml's
+  direct `CONV_2D` therefore ran at half precision on an RTX 5090, while the same convolution through
+  im2col + `MUL_MAT` was already tagged. F5-TTS's DFT-basis STFT came out with an fp16 noise floor that
+  `log` amplified into speech twice as loud
+  ([Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)). The pass now
+  tags `CONV_2D` the same way (op_params slot 9), and `ggml-0028` gives a tagged node the scalar
+  float shader ([UPSTREAM.md](../../cmake/patches/UPSTREAM.md) PR 25). Metal, CUDA and the CPU compute
+  conv_2d in F32 already. Cost on the 5090 under Vulkan: Supertonic-2 39.8 → 44.8 ms, Citrinet-1024
+  14.1 → 15.9 ms, F5-TTS 2558 → 2598 ms, whisper-small and Parakeet-TDT unchanged. Devices without
+  a coopmat conv path (Vega 3, Arc iGPU) already ran the scalar shader and are bit-identical.

@@ -230,7 +230,7 @@ bit-identical to the v0.19.0 pin; upstream's tail serves only F16/BF16 there.
 |---|---|
 | CPU, dev box | `ci` 114/114, `gate` 97/97 (29 ran) |
 | Vulkan, Radeon Vega 3 | card gate 52/53 -- MOSS-TTS (16 GB) loses the device, identically on the rc15 package: this iGPU's limit, first tried here (rc15's sweep stopped at 2.6 GB) |
-| Vulkan, RTX 5090 | card gate 52/53 -- EnCodec and DAC now pass, and so does MOSS-TTS; F5-TTS still clips at 1.2055, unchanged from rc15 (hub) |
+| Vulkan, RTX 5090 | card gate 52/53 -- EnCodec and DAC now pass, and so does MOSS-TTS; F5-TTS still clips at 1.2055, unchanged from rc15; fixed since by `ggml-0028` ([Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)) |
 | CUDA, RTX 5090 (sm_120) | card gate **53/53**, F5-TTS included -- its clip is NVIDIA-Vulkan-only |
 | Metal, M1 Pro | card gate 11/11 on `MTL0` and 11/11 on the Mac CPU: rc15's seven (SenseVoice is `0024`, Kokoro the norm upstream now owns) plus VITS, EnCodec, DAC, Soprano for the re-ported conv kernels (`0014`, `0015`) and upstream's pad |
 
