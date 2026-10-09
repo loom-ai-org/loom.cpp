@@ -1374,6 +1374,33 @@ upstream fix and is not attempted here.
 
 **Measured.** Soprano-1.1-80m on `Vulkan0` (Vega 3): peak 0.00099 → 0.54464, identical to the CPU.
 
+## PR 25 — `vulkan`: honour `GGML_PREC_F32` for an F32 x F32 `conv_2d`
+
+*(`cmake/patches/ggml-0028-vulkan-conv2d-f32-prec.patch`, applies after PR 20)*
+
+**Problem.** `conv2d_mm.comp`'s coopmat2 and coopmat1 builds stage both operands in `float16_t` shared
+memory and accumulate in `float16_t`. They are chosen whenever the device has either kind of
+cooperative matrix, so every F32 convolution on such a device runs at half precision. The scalar build
+is float throughout. A 1024-tap DFT-basis STFT followed by `log(clamp(x, 1e-5))` (F5-TTS's reference
+mel) comes out with an fp16 noise floor in the near-silent bins. On an RTX 5090 that moved the mean
+log-mel from -2.23 to -1.50, and the model's speech came out twice as loud and clipped
+([Retro-077](../../docs/retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)). Upstream
+master has the same shader and selection (2026-10-09).
+
+**Change.** `ggml_prec_set_acc` accepts `GGML_OP_CONV_2D` and stores the request in `op_params[9]`
+(0..5 are the geometry, 6..8 loom's folded-kernel layout from PR 13; upstream would only need slot 6).
+`vk_conv2d_pipeline_state` gains a `prec_f32` bit. A key with it set is built from the scalar SPIR-V
+(`_unroll` or plain, as the vendor rule picks) with the scalar tile configuration: float shared memory,
+the vendor's float padding, no `Csh` staging, no required subgroup size. The configuration is captured
+before the coopmat setup overwrites the shared variables. Default-precision graphs are untouched, and on
+a device without a coopmat conv path the new pipeline is the one it already ran.
+
+**Measured** (RTX 5090, Vulkan). F5-TTS: peak 1.2055 → 0.7478 (CPU 0.7565, CUDA 0.7499), correlation
+with the CPU waveform 0.08 → 0.950 (CUDA 0.949), the same on coopmat2 and on KHR coopmat
+(`GGML_VK_DISABLE_COOPMAT2=1`). Intel Arc iGPU (no coopmat conv path): bit-identical before and after.
+Cost, median of 10, interleaved: Supertonic-2 39.8 → 44.8 ms, Citrinet-1024 14.1 → 15.9 ms, F5-TTS
+2558 → 2598 ms, whisper-small and Parakeet-TDT unchanged.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
