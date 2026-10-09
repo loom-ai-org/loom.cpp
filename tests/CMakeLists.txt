@@ -1837,6 +1837,12 @@ target_link_libraries(test_e2e_cosyvoice3_lua_driver PRIVATE loom::engine)
 add_test(NAME test_e2e_cosyvoice3_lua_driver COMMAND test_e2e_cosyvoice3_lua_driver)
 set_tests_properties(test_e2e_cosyvoice3_lua_driver PROPERTIES LABELS gate SKIP_RETURN_CODE 77)
 
+add_executable(test_e2e_musicgen_mil_export gate/test_e2e_musicgen_mil_export.cpp)
+target_link_libraries(test_e2e_musicgen_mil_export PRIVATE loom::engine)
+add_test(NAME test_e2e_musicgen_mil_export COMMAND test_e2e_musicgen_mil_export)
+set_tests_properties(test_e2e_musicgen_mil_export PROPERTIES LABELS gate)
+set_tests_properties(test_e2e_musicgen_mil_export PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_e2e_dia_dac_composition gate/test_e2e_dia_dac_composition.cpp)
 target_link_libraries(test_e2e_dia_dac_composition PRIVATE loom::engine)
 add_test(NAME test_e2e_dia_dac_composition COMMAND test_e2e_dia_dac_composition)

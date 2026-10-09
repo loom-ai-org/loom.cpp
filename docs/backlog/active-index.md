@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 breadth: family 14 (music), MusicGen first** | Picked by the user 2026-10-09, ahead of rc16. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s coverage-per-effort order, and everything before it is done or parked: families 4, 5, 6, 9 (eight leaves), 10, 11, 12 and 13 are complete; family 9b has SpeechT5, with fastpitch and bananamind-tts deferred by the user 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts were dropped 2026-09-26. MusicGen was set aside while its codec, EnCodec, was blocked ([Epic-03 §2](../epics/epic-03-model-coverage.md)). EnCodec 32 kHz is published now, so the expected bill is the LM half, as Dia's was. Read that estimate against Epic-03 §2: the bill lands where the scoping did not look ([Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md)) |
+| **P5 breadth: family 14 (music) — MusicGen Small is built, publish it** | Built and verified 2026-10-09 ([Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)): codes identical to `transformers` with and without guidance, the card runs, and it needed no engine change. It needs no new wheel: on the RELEASED rc15 wheel the card passes and greedy codes match `transformers` 128/128 with and without guidance. Left: publish `musicgen-small-loom` (CC-BY-NC-4.0, like its codec). Next leaves in this family are unscoped: MusicGen medium/large are the same export at 1.5B/3.3B; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **rc16, after MusicGen** | `main` carries what rc15 does not: ggml v0.26.0 and the Vulkan conv_2d F32-precision fix that stops F5-TTS clipping on coopmat GPUs ([Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)). No GGUF needs a re-export for either. The backend wheels' exact `loom-py-rt == 1.0.0rc15` pin moves with the release → [Packaging & release](#packaging--release) |
 
 **State anchor, 2026-10-08 — `1.0.0-rc15` is released and the Hub equals the staging tree.**
@@ -114,8 +114,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **P5 breadth: family 14 (music) is next, MusicGen first** (user, 2026-10-09). Every earlier family
-  in the coverage-per-effort order is complete or parked (see *Now*). Chatterbox showed that a leaf
+* [ ] **P5 breadth: family 14 (music)**, MusicGen Small built 2026-10-09 (see *Now* for what is left).
+  Every earlier family in the coverage-per-effort order is complete or parked. Chatterbox showed that a leaf
   composes from the existing templates, so what the next one costs is its own front end and its own
   loop shape, not a template.
   *Context: [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md) and
@@ -169,6 +169,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Exporter / MIL compiler
 
+* [ ] **`read_sampling_defaults` reads a missing `top_k` as 0; `transformers` uses 50.** It reads
+  `generation_config.json` directly, so a checkpoint that sets `do_sample` without `top_k` exports an
+  untruncated sampler the reference never runs. No published file is affected; on disk, `llama-3.2-1b`,
+  `csm-1b` and `parler-tts-mini-v1.1` would be. MusicGen reads the resolved `GenerationConfig` instead
+  (`musicgen_export.read_generation_defaults`); the shared fix is the same, and moves those exports.
+  *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)*
 * [ ] **A shape read as DATA aborts in the engine.** `length / waveform.shape[1]` (or `lengths *
   x.shape[-1]`, speechbrain's relative-length masks) traces to `SHAPE` -> `GET_ROWS` -> arithmetic. The
   engine's `SHAPE` is a four-element `ne` vector and `GET_ROWS` on a 1-D tensor returns it whole, so the
