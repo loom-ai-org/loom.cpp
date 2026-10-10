@@ -19,6 +19,8 @@ Three files, because the properties that matter are properties of DIFFERENT decl
                                 as an error. Also carries a duplicate symbol, for the first-id-wins rule.
   phoneme_vocab_no_tokens.gguf  the tag with no `tokenizer.ggml.tokens` -- malformed rather than merely
                                 new, and the one input `PhonemeVocab::load` is supposed to REFUSE.
+  phoneme_vocab_bos_blank.gguf  piper-phonemize's shape -- the first file's table and assembly plus
+                                `blank_after_bos`, [BOS, blank, p1, blank, ..., EOS] (sanoTTS).
 
 Requires: pip install gguf
 """
@@ -49,7 +51,8 @@ TOKENS = [
 ]
 
 
-def _write(out_path: Path, tokens, *, bos: int, eos: int, blank: int, interleave: bool) -> None:
+def _write(out_path: Path, tokens, *, bos: int, eos: int, blank: int, interleave: bool,
+           blank_after_bos: bool = False) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     w = GGUFWriter(str(out_path), "loom-phoneme-vocab-fixture")
     w.add_string("loom.architecture", "phoneme_vocab_test")
@@ -62,6 +65,9 @@ def _write(out_path: Path, tokens, *, bos: int, eos: int, blank: int, interleave
         w.add_int32("tokenizer.ggml.phoneme.eos_id", eos)
         w.add_int32("tokenizer.ggml.phoneme.blank_id", blank)
         w.add_bool("tokenizer.ggml.phoneme.interleave_blank", interleave)
+        # Written only when true, as the exporter does, so the other fixtures keep their exact bytes.
+        if blank_after_bos:
+            w.add_bool("tokenizer.ggml.phoneme.blank_after_bos", True)
 
     # GgufModel::load() sizes a backend buffer from the meta context's tensors; a GGUF with zero tensors
     # hits a ggml_backend edge case, so a placeholder nothing reads is included -- same convention as
@@ -81,6 +87,8 @@ def main() -> None:
                  else piper_path.with_name("phoneme_vocab_bare.gguf"))
     no_tokens_path = (Path(args[2]) if len(args) > 2
                       else piper_path.with_name("phoneme_vocab_no_tokens.gguf"))
+    bos_blank_path = (Path(args[3]) if len(args) > 3
+                      else piper_path.with_name("phoneme_vocab_bos_blank.gguf"))
 
     _write(piper_path, TOKENS, bos=1, eos=2, blank=0, interleave=True)
 
@@ -90,6 +98,8 @@ def main() -> None:
     _write(bare_path, TOKENS + ["a"], bos=0, eos=-1, blank=-1, interleave=False)
 
     _write(no_tokens_path, None, bos=0, eos=-1, blank=-1, interleave=False)
+
+    _write(bos_blank_path, TOKENS, bos=1, eos=2, blank=0, interleave=True, blank_after_bos=True)
 
 
 if __name__ == "__main__":

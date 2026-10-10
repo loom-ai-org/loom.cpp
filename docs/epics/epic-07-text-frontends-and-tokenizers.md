@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-10-02
+last_updated: 2026-10-10
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -147,13 +147,22 @@ behind `loom-py-rt[phonemes]`.
 symbol→id table (a symbol outside it has *no id*, which is a lookup with no answer rather than a
 degradation), and pinning the beam search's tie-break so the CLI and `loom-py` cannot drift.
 
+**The fold-down turned out to be about CONVENTIONS as well as symbols** (2026-10-10,
+[ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)). Where the stress mark goes,
+whether monosyllables carry it, whether vowels are marked long: a 1.46M sanoTTS voice was
+unintelligible on ipa-dict's conventions (66.8% WER) and near its own front end once folded to
+espeak's (11.1% against 8.5%). A model now declares `loom.tts.phoneme_style` (`espeak`, `misaki`), and
+loom-py's door folds to it (`loom.phonemizers.fold`). The port carries the fold with it. The
+framing is part of the same story: Piper trained with a blank after BOS
+([Retro-081](../retros/retro-081-piper-has-two-framings.md)), now `tokenizer.ggml.phoneme.blank_after_bos`.
+
 ## 3. Related Decisions and Artifacts
 
 | | |
 |---|---|
-| Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
+| Decisions | [ADR-012](../adrs/adr-012-permissive-phonemizer.md), [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md), [ADR-018](../adrs/adr-018-chat-template-as-role-tags.md) |
 | Design | [`docs/HIGH-LEVEL-API.md`](../HIGH-LEVEL-API.md) §5 |
-| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md), [Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md) |
+| Retros | [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-021](../retros/retro-021-nine-oracle-cases-and-none-was-a-marker.md), [Retro-029](../retros/retro-029-a-vocabulary-only-two-hosts-could-read.md), [Retro-059](../retros/retro-059-a-shared-tokenizers-whitespace-was-ascii.md), [Retro-081](../retros/retro-081-piper-has-two-framings.md) |
 | Decisions | [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md) |
 | Active tasks | [Backlog → Text front-ends](../backlog/active-index.md#text-front-ends) |
 
