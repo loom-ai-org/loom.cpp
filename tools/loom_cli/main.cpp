@@ -854,10 +854,12 @@ int main(int argc, char** argv) {
             return text_to_codes(model, contract, backends, req);
         }
 
-        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "bert") {
+        if (model->has_kv("tokenizer.ggml.model") && model->kv_str("tokenizer.ggml.model") == "bert" &&
+            contract.task != loom::task_names::ASR) {
             // A WordPiece file that declares no task -- a plain encoder, or an export older than
             // `loom.task`. No generation loop applies, so this stays inspection-only rather than
-            // dead-ending loom_cli on a "bert" GGUF (see EXPORT-BACKLOG.md item 4).
+            // dead-ending loom_cli on a "bert" GGUF (see EXPORT-BACKLOG.md item 4). A recognizer with a
+            // WordPiece table (Citrinet-256-ls) falls through to `--wav`, where `transcribe` decodes it.
             auto wp_vocab = loom::WordPieceVocab::load(*model);
             std::printf("  tokenizer: WordPiece (bert), %zu tokens\n", wp_vocab->size());
             if (has_prompt) {

@@ -208,6 +208,35 @@ def write_dynamic_asr(path: Path) -> None:
     _finish(w)
 
 
+# A CTC recognizer whose table is WordPiece: NeMo's oldest tokenizer (`tokenizer.type: wpe`), which
+# Citrinet-256-ls carries. Written in the shape the exporter writes a BERT vocabulary (llama.cpp's
+# `phantom()`: a word-initial piece gets U+2581, a `##` continuation loses its marker, specials stay).
+# The driver returns the ids Citrinet's CTC head actually emits -- it frames every utterance in
+# `[CLS] ... [SEP]` -- plus an `[UNK]`; NeMo's `ids_to_text` drops all of them.
+WORDPIECE_DRIVER = """
+function infer(inputs)
+    return {2, 5, 6, 7, 1, 3}
+end
+"""
+
+
+def write_wordpiece_asr(path: Path) -> None:
+    w = _base(path, "wordpiece_asr_test")
+    w.add_string("loom.task", "automatic-speech-recognition")
+    w.add_string("loom.input.kind", "audio")
+    w.add_string("loom.output.kind", "token_ids")
+    w.add_uint32("loom.sample_rate", 16000)
+    w.add_tokenizer_model("bert")
+    w.add_token_list(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "\u2581hello", "\u2581wor", "ld"])
+    w.add_unk_token_id(1)
+    w.add_bos_token_id(2)
+    w.add_sep_token_id(3)
+    w.add_pad_token_id(0)
+    w.add_mask_token_id(4)
+    w.add_string("model.driver_script", WORDPIECE_DRIVER)
+    _finish(w)
+
+
 # A DYNAMIC-LENGTH ASR model that DOES select a language and a task: Canary's shape. Its prompt carries
 # a source and a target language, so unlike the file above a `language=` CAN reach the model -- and the
 # declared table is how `transcribe` knows. The driver echoes what it was handed, as tokens, which is
@@ -521,6 +550,7 @@ def main() -> None:
     write_timestamped_asr(out_dir / "timestamped_asr.gguf")
     write_dynamic_asr(out_dir / "dynamic_asr.gguf")
     write_dynamic_asr_languages(out_dir / "dynamic_asr_languages.gguf")
+    write_wordpiece_asr(out_dir / "wordpiece_asr.gguf")
     write_long_form_asr(out_dir / "long_form_asr.gguf")
     write_codec(out_dir / "contract_codec.gguf")
     write_classifier(out_dir / "classify_driver.gguf")

@@ -7,6 +7,7 @@
 #include "loom/core/funasr_vocab.h"
 #include "loom/core/model_contract.h"
 #include "loom/core/vocab.h"
+#include "loom/core/wordpiece_vocab.h"
 #include "loom/loom_errors.h"
 
 #include <algorithm>
@@ -104,9 +105,11 @@ std::vector<int32_t> run_driver(LoomLuaBridge& bridge, const std::vector<double>
 
 Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
                          const std::vector<float>& waveform, const TranscribeOptions& options) {
-    // Three vocab schemas reach this path, so all three are tried: NeMo's checkpoints carry
-    // SentencePiece ("llama"/"t5" -> loom::Vocab), Whisper's carries GPT-2 byte-level BPE
-    // ("gpt2" -> BpeVocab), and family 4's carry the CTC character table ("ctc" -> CtcVocab).
+    // Five vocab schemas reach this path, so all are tried: NeMo's checkpoints carry SentencePiece
+    // ("llama"/"t5" -> loom::Vocab), Whisper's carries GPT-2 byte-level BPE ("gpt2" -> BpeVocab),
+    // family 4's carry the CTC character table ("ctc" -> CtcVocab), family 5's FunASR's table, and
+    // NeMo's older WordPiece checkpoints (Citrinet-256-ls, `tokenizer.type: wpe`) a BERT vocabulary
+    // ("bert" -> WordPieceVocab), written already in the phantom-space shape its decode reads.
     // Only the BPE one can resolve a token by TEXT, which is what timestamps need.
     //
     // **`Vocab::load` LAST, and the order is load-bearing**: the other two return nullptr for a schema
@@ -117,8 +120,9 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     // Family 5's, whose table is flat like family 4's but whose pieces compose differently -- `@@`
     // marks a continuation, CJK eats the space before it, and letter runs collapse. See FunasrVocab.
     auto funasr_vocab = (bpe_vocab || ctc_vocab) ? nullptr : FunasrVocab::load(model);
-    auto spm_vocab = (bpe_vocab || ctc_vocab || funasr_vocab) ? nullptr : Vocab::load(model);
-    if (!spm_vocab && !bpe_vocab && !ctc_vocab && !funasr_vocab) {
+    auto wp_vocab = (bpe_vocab || ctc_vocab || funasr_vocab) ? nullptr : WordPieceVocab::load(model);
+    auto spm_vocab = (bpe_vocab || ctc_vocab || funasr_vocab || wp_vocab) ? nullptr : Vocab::load(model);
+    if (!spm_vocab && !bpe_vocab && !ctc_vocab && !funasr_vocab && !wp_vocab) {
         throw LoadError("transcribe: model has no tokenizer vocab (tokenizer.ggml.model KV missing)");
     }
     if (!model.has_kv("model.driver_script")) {
@@ -145,6 +149,14 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
     const int32_t eos_id = default_eos_token(model);
     std::vector<int32_t> control_ids = table.control_ids;
     control_ids.push_back(eos_id);
+    // A WordPiece vocabulary's specials are real CTC classes and NeMo's `ids_to_text` drops them
+    // (`remove_special_tokens=True`), so a stray `[UNK]` never reaches the transcript there either.
+    if (wp_vocab) {
+        for (int32_t id : {wp_vocab->pad_id(), wp_vocab->unk_id(), wp_vocab->cls_id(), wp_vocab->sep_id(),
+                           wp_vocab->mask_id()}) {
+            if (id >= 0) control_ids.push_back(id);
+        }
+    }
     const auto detokenize = [&](const std::vector<int32_t>& ids) {
         std::vector<int32_t> text_ids;
         text_ids.reserve(ids.size());
@@ -155,6 +167,7 @@ Transcription transcribe(LoomLuaBridge& bridge, const GgufModel& model,
         }
         if (ctc_vocab) return ctc_vocab->decode(text_ids);
         if (funasr_vocab) return funasr_vocab->decode(text_ids);
+        if (wp_vocab) return wp_vocab->decode(text_ids);
         return spm_vocab ? spm_vocab->decode(text_ids) : bpe_vocab->decode(text_ids);
     };
 
