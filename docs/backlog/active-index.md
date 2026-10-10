@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-09
+last_updated: 2026-10-10
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -20,6 +20,7 @@ are not renumbered. New items continue the scheme.
 | item | why now |
 |---|---|
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
+| **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
 **State anchor, 2026-10-10 — `1.0.0-rc16` is released and the Hub equals the staging tree.**
 Four packages are on PyPI at `1.0.0rc16`: `loom-py-rt` (17 files), `-cuda` (2), `-vulkan` (2) and
@@ -137,7 +138,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   them yet). None has been checked against its checkpoint; the template guesses are where scoping
   starts, not what it will find.
   * [ ] **Cohere ASR** — architecture and licence not yet looked at.
-  * [ ] **Nemotron ASR** (NVIDIA) — expected NeMo-shaped; which checkpoint and head is to be decided.
   * [ ] **Voxtral Mini realtime** (Mistral, streaming ASR) — check its size first against the machine
     floor that blocks Voxtral-Mini-3B (below).
   *Context: [Epic-03 §3](../epics/epic-03-model-coverage.md#3-roadmap)*
@@ -164,13 +164,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Exporter / MIL compiler
 
-* [ ] **`read_sampling_defaults` reads a missing `top_k` as 0; `transformers` uses 50.** It reads
-  `generation_config.json` directly, so a checkpoint that sets `do_sample` without `top_k` exports an
-  untruncated sampler the reference never runs. No published file is affected; on disk, `llama-3.2-1b`,
-  `csm-1b` and `parler-tts-mini-v1.1` would be. MusicGen reads the resolved `GenerationConfig` instead
-  (`musicgen_export.read_generation_defaults`); the shared fix is the same, and moves those exports.
-  *Context: [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)*
-* [ ] **A shape read as DATA aborts in the engine.** `length / waveform.shape[1]` (or `lengths *
+* [ ] **A shape read as DATA aborts in the engine.** (Nemotron ASR met it too, 2026-10-10: `(n - 1) - arange(2n - 1)` put a 4-wide `n - 1` into a SUB; spelled `-arange(1 - n, n)` instead.) `length / waveform.shape[1]` (or `lengths *
   x.shape[-1]`, speechbrain's relative-length masks) traces to `SHAPE` -> `GET_ROWS` -> arithmetic. The
   engine's `SHAPE` is a four-element `ne` vector and `GET_ROWS` on a 1-D tensor returns it whole, so the
   arithmetic sees `[4]` where it expects `[1]` and `ggml_can_repeat` aborts (ECAPA, family 13: `DIV
@@ -261,6 +255,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
+* [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
 * [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
   *unreachable for already-correct graphs*; they do not remove it, and `op_repeat`'s two branches are
   **unguarded**. Every one is a silent-wrong-answer generator with no error path.
@@ -452,6 +447,7 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
 `checkout <sha>` → rebuild → commit the pointer. A release pins that submodule at `main`'s tip, and
 **that pin is what the wheels are built from**.
 
+* [ ] **"Nothing needs a re-export" is checked on cards and Hub hashes, never on a fresh export.** The rc15 and rc16 checks compared regenerated cards and staged-vs-Hub sha256, which says nothing about whether exporter `main` still WRITES the published file. It does not, for `gigaam-v3-rnnt` (published 2026-09-30): a fresh export adds `tokenizer.ggml.unigram_scoring` (ADR-060, encode-only) and an encoder-output PERMUTE/VIEW/PERMUTE/CONT; both decode JFK 80/80 (gate 83/83), so it is not a defect, but a release sweep should re-export each card and diff before saying nothing moved.
 * [ ] **A GGUF cannot say which engine features its driver needs.** An older engine ignores option keys
   it does not know, so a driver whose meaning depends on an OPTION runs plausibly and wrongly there:
   rc10's `run_ode` would have integrated F5-TTS unguided, and Chatterbox's `min_p` and CosyVoice3's
