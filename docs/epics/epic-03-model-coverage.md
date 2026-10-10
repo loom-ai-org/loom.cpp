@@ -1597,6 +1597,32 @@ The engine gate `test_e2e_nemotron_asr_mil_export` checks all three prompt cases
 (6/6). The card gate passes on the released rc16 wheel (WER 0.00 on JFK). On the 4-core dev box, 11 s
 of speech takes 4.8 s and 120 s takes 82 s, with a 4.0 GB peak.
 
+### Family 1's CTC leaf at 10M: Citrinet-256 (LibriSpeech)
+
+`nvidia/stt_en_citrinet_256_ls` (CC-BY-4.0, 2026-10-10), requested for the Pi Zero after Moonshine tiny
+measured ~7x slower than real time there. It is Citrinet-1024's leaf at 10M parameters, trained on
+LibriSpeech only, and it exports through the same recognizer with no export change but one.
+
+* **Its tokenizer is WordPiece**, NeMo's oldest (`tokenizer.type: wpe`): a 256-line BERT `vocab.txt`
+  rather than a SentencePiece proto. `extract_nemo_tokenizer_dir` now extracts it (only for `wpe`: a
+  SentencePiece archive carries a `vocab.txt` listing too), and the file carries the `bert` vocabulary
+  family 12 already writes. The engine's `transcribe` gained `WordPieceVocab` in its dispatch, dropping
+  the five specials as NeMo's `ids_to_text` does. The CTC head frames every utterance in
+  `[CLS] ... [SEP]`, so without that every transcript would carry both.
+* **The reference's decode was wrong, not the model** ([Retro-082](../retros/retro-082-the-references-tokenizer-was-another-checkpoints.md)).
+  NeMo's tokenizer keeps bert-base-cased's special ids (100-103) over this vocabulary, so its own
+  transcripts read `festi [SEP] season`. The oracle is the ids.
+
+**Verified:** log-probs on JFK max |d| 7.9e-5, argmax identical on 138/138 frames; CTC ids identical to
+NeMo's forward on 73/73 LibriSpeech-dummy clips at F32 and 70/73 at Q8_0. WER, decoded by `vocab.txt`,
+9.39% at both precisions. The card ships F32 (40 MB) and Q8_0 (13 MB); F16 is 4.5x slower than F32 on
+the Pi Zero and is not shipped.
+
+**On a Pi Zero W** (rc16 wheel, ids via `infer`): jfk's 11.0 s took 64.0 s at F32 (peak RSS 96 MB) and
+37.5 s at Q8_0 (71 MB); a 29.4 s clip took 172.8 s and 97.7 s. Q8_0 is RTF ~3.4, twice as fast as
+Moonshine tiny's ~7, and still slower than real time. The profile says why: 76% of it is the 1x1
+convolutions, ~6 GFLOP for jfk at ~0.22 GFLOP/s, the board's GEMM ceiling.
+
 ### Text input
 
 **Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, Voxtral-4B-TTS and SpeechT5 take text.** Each encodes graphemes itself and each GGUF carries its own
