@@ -938,6 +938,7 @@ add_test(
             ${LOOM_FIXTURE_DIR}/phoneme_vocab_test.gguf
             ${LOOM_FIXTURE_DIR}/phoneme_vocab_bare.gguf
             ${LOOM_FIXTURE_DIR}/phoneme_vocab_no_tokens.gguf
+            ${LOOM_FIXTURE_DIR}/phoneme_vocab_bos_blank.gguf
 )
 set_tests_properties(gen_phoneme_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_phoneme_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP phoneme_vocab_gguf_fixture)
