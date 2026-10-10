@@ -60,9 +60,11 @@ the host builds the door's input. loom-py's text door folds the G2P's output to 
 
 ## Consequences
 
-* sanoTTS declares `espeak` (piperlite) and `misaki` (nano). VITS does not yet: switching it changes
-  published audio, so it is a hub item with an A/B, beside the Piper framing question
-  ([Retro-081](../retros/retro-081-piper-has-two-framings.md)). Kokoro (misaki) is the other candidate.
+* sanoTTS declares `espeak` (piperlite) and `misaki` (nano). **VITS does not, by measurement**
+  (2026-10-10): on miro through the door, the fold took Whisper-small WER from 25.5% to 30.2%. Full-size
+  VITS hears ipa-dict's IPA better unfolded; the fold is for the voices too small to.
+  Its framing fix did ship ([Retro-081](../retros/retro-081-piper-has-two-framings.md)). Kokoro (misaki)
+  is the other candidate, unmeasured.
 * The rules live in Python today. When orthography2ipa's C++ port lands, the fold moves with it into
   the engine, under the same declared key.
 * A remaining gap: function-word stress (`ðˈʌ` for "the"). A per-word rule needs the text, which the
