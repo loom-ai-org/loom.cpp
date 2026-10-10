@@ -19,11 +19,26 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Publish Moonshine (v1) tiny and sanoTTS (28 voices, one repo); republish VITS miro; publish Citrinet-256** | VITS now declares Piper's training framing (`blank_after_bos`, [Retro-081](../retros/retro-081-piper-has-two-framings.md); WER 14.9% -> 13.2%), which only rc17's engine reads. Citrinet-256-ls ([Epic-03](../epics/epic-03-model-coverage.md#family-1s-ctc-leaf-at-10m-citrinet-256-librispeech)) needs rc17's WordPiece `transcribe`. Both wait for rc17. Built 2026-10-10 for the Pi Zero ([Epic-03](../epics/epic-03-model-coverage.md#sanotts-28-tiny-voices-a-gpl-upstream-and-a-door-that-had-to-learn-conventions)); merged in all three repos. **Moonshine runs on the rc16 wheels** (no engine change). **sanoTTS waits for the next release**: its text door needs the engine's `blank_after_bos` and loom-py's phoneme-style fold ([ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)); raw ids already run on rc16. Its card is GPL-3.0, the zoo's first ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)) |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
-**State anchor, 2026-10-10 — `1.0.0-rc16` is released and the Hub equals the staging tree.**
+**State anchor, 2026-10-10 (evening) — `1.0.0-rc17` is released and the Hub equals the staging tree.**
+Four packages are on PyPI at `1.0.0rc17` (17/2/2/1 files, as rc16). The signed tag `1.0.0-rc17` sits on
+loom-py `adf130b`, the merge of loom-py #64, which pins loom.cpp `b4ef517`. `wheels.yml` run
+38077776811 was green, including `publish-pypi`. The tag also triggered Build images, whose
+`cuda, x86_64` job timed out logging in to ghcr.io; a re-run of that job passed, and the wheels never
+depended on it (they pull the existing image).
+
+rc17 carries the engine's `blank_after_bos` framing and packed GET_ROWS on a view (#73), WordPiece
+decoding in `transcribe` (#74), and loom-py's phoneme-style fold (ADR-071). Published on it, each from a
+fresh export at loom-exporter `92a2d27`, byte-identical to its verified stage, card-gated on the RELEASED
+wheel, and loaded back from the Hub: **citrinet-256-ls** (new, F32 + Q8_0, Hub `950e723`),
+**moonshine-tiny** (new, F32 + Q8_0, `57046eb`), **sanotts** (new, 28 voices, GPL-3.0, `084b9c0`) and
+**vits-piper-en-gb-miro** (republished with the training framing and a card note, `53a2d7d`). 58 repos.
+A dry run found the other 54 identical to the staging tree; conformer-ctc-small and citrinet-1024
+re-export byte-identical after the NeMo tokenizer change.
+
+**Previous anchor, 2026-10-10 — `1.0.0-rc16`.**
 Four packages are on PyPI at `1.0.0rc16`: `loom-py-rt` (17 files), `-cuda` (2), `-vulkan` (2) and
 `-metal` (1). The `linux_armv6l` wheel is a GitHub release asset. The signed tag `1.0.0-rc16` sits on
 loom-py `8c96eff`, the merge of loom-py #58, which pins loom.cpp `7699ec1`. `wheels.yml` run
