@@ -19,42 +19,37 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **P5 breadth: family 14 (music) — MusicGen Small is built, publish it** | Built and verified 2026-10-09 ([Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)): codes identical to `transformers` with and without guidance, the card runs, and it needed no engine change. It needs no new wheel: on the RELEASED rc15 wheel the card passes and greedy codes match `transformers` 128/128 with and without guidance. Left: publish `musicgen-small-loom` (CC-BY-NC-4.0, like its codec). Next leaves in this family are unscoped: MusicGen medium/large are the same export at 1.5B/3.3B; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
-| **rc16, after MusicGen** | `main` carries what rc15 does not: ggml v0.26.0 and the Vulkan conv_2d F32-precision fix that stops F5-TTS clipping on coopmat GPUs ([Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)). No GGUF needs a re-export for either. The backend wheels' exact `loom-py-rt == 1.0.0rc15` pin moves with the release → [Packaging & release](#packaging--release) |
+| **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 
-**State anchor, 2026-10-08 — `1.0.0-rc15` is released and the Hub equals the staging tree.**
-Four packages on PyPI at `1.0.0rc15` (`loom-py-rt` 17 files, `-cuda` 2, `-vulkan` 2, `-metal` 1); the
-`linux_armv6l` wheel rides as a **GitHub release asset**, because PyPI rejects that tag at upload
-(`wheels.yml` says so at the job). The signed tag `1.0.0-rc15` sits on loom-py `9041c9e` (the merge of
-loom-py #54), which pins loom.cpp `90e3492` (the merge of #63); `wheels.yml` run 37806963314 was green
-including `publish-pypi`. rc15 carries the frame-embedding door (`loom.output.embedding_dim`,
-`FrameEmbeddings`; [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)'s second
-amendment), P4.31's direct depthwise conv + fusion, and four GPU correctness fixes
-([ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md)). `wakehubert-tiny-loom` was
-**republished on rc15** the same day (Hub commit `aa39908`, exported at loom-exporter `29f0168`, which
-adds the width key; card-gated 2/2 on the RELEASED rc15 wheel, TitaNet's per-clip rows too; sha256 +
-README verified, each of the four files run from the Hub through `speech2embeddings`). Its card now
-calls the door and needs rc15. A dry-run comparison found the other 52 repos identical to the staging
-tree, and every card regenerated from the catalogue byte-identical, so nothing else needed a re-export.
+**State anchor, 2026-10-10 — `1.0.0-rc16` is released and the Hub equals the staging tree.**
+Four packages are on PyPI at `1.0.0rc16`: `loom-py-rt` (17 files), `-cuda` (2), `-vulkan` (2) and
+`-metal` (1). The `linux_armv6l` wheel is a GitHub release asset. The signed tag `1.0.0-rc16` sits on
+loom-py `8c96eff`, the merge of loom-py #58, which pins loom.cpp `7699ec1`. `wheels.yml` run
+38031293831 was green, including `publish-pypi`.
 
-**Previous anchor, 2026-10-02 — `1.0.0-rc14`.** The signed tag `1.0.0-rc14` sits on loom-py `1ca8a42`
-(the merge of loom-py #51), which pins loom.cpp `70195f1`. rc14 carries Canary's long-form decode
-([ADR-063](../adrs/adr-063-a-long-clip-is-decoded-the-way-its-reference-decodes-it.md)), the
-SentencePiece dummy prefix ([ADR-065](../adrs/adr-065-a-converted-sentencepiece-bpe-declares-its-dummy-prefix.md)),
-`loom::PyRegex` + Soprano's vocabulary ([ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md))
-and the ring KV cache ([ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)).
-**Fifty-three** models are on [huggingface.co/loom-ai-org](https://huggingface.co/loom-ai-org) since
-2026-10-03, when `wakehubert-tiny-loom` was published on rc14 (infer-only; four precisions in one repo,
-`wakehubert-tiny-{f32,f16,q8_0,q4_1}.gguf`, the first multi-file repo; Hub commit `776f68b`, exported at
-loom-exporter `aadac8a`, card-gated 2/2 on the RELEASED rc14 wheel, sha256 + README verified, each file
-loaded from the Hub by name). Before it, fifty-two. On rc14 as
-released, each a fresh export, card-gated on the RELEASED wheel (17 rows passed, 0 failed), sha256- (or
-git-blob-, for the voice files) and README-verified: `canary-1b-v2-loom` republished with its six
-long-form keys, and seven new -- `silero-vad-loom`, `moonshine-streaming-tiny-loom`,
-`moonshine-streaming-small-loom`, `soprano-1.1-80m-loom`, `kyutai-stt-1b-en-fr-loom`,
-`lfm2.5-audio-1.5b-asr-loom` and `lfm2.5-audio-1.5b-tts-loom` (with three voice files). Moonshine tiny,
-Silero and Soprano were also run from the Hub through `from_pretrained`. EnCodec and F5-TTS ship `cc-by-nc-4.0` and MarbleNet the NVIDIA Open Model License,
-and all three are **settled, not pending**. → [[loom-release-state]], [Epic-08](../epics/epic-08-packaging-and-release.md)
+rc16 carries three changes:
+* ggml v0.26.0 (#65), which also brings llama.cpp's Vulkan misaligned-offset fix.
+* The Vulkan conv_2d F32-precision fix, which stops F5-TTS clipping on NVIDIA
+  ([Retro-077](../retros/retro-077-a-gpus-f32-convolution-was-half-precision-too.md)).
+* Skipping a device that cannot hold the weights, for MOSS-TTS on an iGPU (#66,
+  [Retro-076](../retros/retro-076-a-full-device-said-device-lost.md)).
+
+`musicgen-small-loom` is **published on rc16** (Hub commit `3d9b41b`, 54 repos). It was a fresh export
+at loom-exporter `afc7ac4`, byte-identical to the verified one. It was card-gated 2/2 on the RELEASED
+wheel through the new music row (loom-py #59). The sha256 and README match, and the card runs from
+the Hub. No other GGUF needed a re-export: exporter `main` changed only by adding MusicGen. Every
+published topology from a phase that declares a KV cache has cached ATTENTION, so the new exporter
+guard (Retro-078) rejects none of them. A dry run found the other 53 repos identical to the staging
+tree.
+
+**Previous anchor, 2026-10-08 — `1.0.0-rc15`.** The signed tag `1.0.0-rc15` sits on loom-py `9041c9e`,
+which pins loom.cpp `90e3492`. rc15 carries:
+* The frame-embedding door ([ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md)'s
+  second amendment).
+* P4.31's direct depthwise conv.
+* Four GPU correctness fixes ([ADR-069](../adrs/adr-069-an-f32-matmul-asks-for-f32-precision.md)).
+
+`wakehubert-tiny-loom` was republished on it.
 
 What decides a publish is the standing rule, **WHEELS FIRST,
 ALWAYS**: a GGUF or a card that needs something the released wheels have not got waits for the
@@ -114,7 +109,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     *Context: [ADR-048](../adrs/adr-048-cosyvoice3-normalises-by-the-references-rules-path.md)*
 * [ ] **Qwen3-ASR-0.6B variants beyond the exported leaf** — `qwen3-asr-0.6b-hf` is shipped; the 1.7B
   and the native-layout repo are not. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **P5 breadth: family 14 (music)**, MusicGen Small built 2026-10-09 (see *Now* for what is left).
+* [ ] **P5 breadth: family 14 (music)**: MusicGen Small is published (2026-10-10); the next leaf is unscoped (see *Now*).
   Every earlier family in the coverage-per-effort order is complete or parked. Chatterbox showed that a leaf
   composes from the existing templates, so what the next one costs is its own front end and its own
   loop shape, not a template.
