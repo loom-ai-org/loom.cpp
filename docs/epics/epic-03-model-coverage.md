@@ -1469,6 +1469,13 @@ The engine gate `test_e2e_musicgen_mil_export` grades 32 frames both ways, throu
 vocabulary (20/20). On the 4-core dev box, 2 s of music takes 27 s with guidance and 14 s without
 (transformers: 32 s and 20 s, including its codec decode).
 
+**Published 2026-10-10 as `musicgen-small-loom` on `1.0.0-rc16`** (Hub commit `3d9b41b`, CC-BY-NC-4.0).
+The music in it sounds lo-fi, like an old radio: MusicGen generates through a 2.2 kbps EnCodec stream
+(four 2048-entry codebooks at 50 Hz). The card says so, because the export is exact and cannot be
+the cause. The card gate grades it on a row of its own (loom-py #59). A music prompt has no words for
+Whisper to read back, so the row asks whether Whisper files the output under music instead: both
+MusicGen takes were heard as "(upbeat music)"; speech, white noise and random codes were not.
+
 ### Text input
 
 **Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, Voxtral-4B-TTS and SpeechT5 take text.** Each encodes graphemes itself and each GGUF carries its own
@@ -1482,7 +1489,7 @@ limitation of those checkpoints, addressed by
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** music, whose first leaf, MusicGen Small, was built 2026-10-09 (§2); the remaining TTS families are deferred. **Seven are done** — small audio classifiers
+**Next families:** music, whose first leaf, MusicGen Small, was published 2026-10-10 (§2); the remaining TTS families are deferred. **Seven are done** — small audio classifiers
 and embedders (13, on four leaves, 2026-10-01: §2), 
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
