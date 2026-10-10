@@ -19,6 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
+| **Publish Moonshine (v1) tiny and sanoTTS (28 voices, one repo)** | Built 2026-10-10 for the Pi Zero ([Epic-03](../epics/epic-03-model-coverage.md#sanotts-28-tiny-voices-a-gpl-upstream-and-a-door-that-had-to-learn-conventions)); PRs open in all three repos. **Moonshine runs on the rc16 wheels** (no engine change) and can publish once the exporter PR merges. **sanoTTS waits for the next release**: its text door needs the engine's `blank_after_bos` and loom-py's phoneme-style fold ([ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)); raw ids already run on rc16. Its card is GPL-3.0, the zoo's first ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)) |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -63,6 +64,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Models
 
+* [ ] **Moonshine base**: the same leaf as tiny (`moonshine_v1_export.py`), on disk at `~/Dev/models/moonshine-base`, not exported
+  or measured. *Context: [Epic-03](../epics/epic-03-model-coverage.md#family-2s-third-leaf-moonshine-v1-tiny)*
 * [ ] **MOSS-TTS + MOSS-Audio-Tokenizer: three open pieces.** Both are published
   (`moss-tts-local-transformer-v1.5-loom`, `moss-audio-tokenizer-v2-loom`), with voice cloning through voice files of
   reference codes; the card gate runs the cloning card when `LOOM_CARD_VOICES` supplies a voice. Left: (1) a Q8_0 build
@@ -287,6 +290,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
+* [ ] **The Pi Zero, for the two models chosen for it.** Measured 2026-10-10 on the Pi Zero W (P4.31 engine): Moonshine
+  tiny at ~7x slower than real time (jfk 11 s in 75 s, either precision), sanoTTS heart-nano at 1.1x, the 0.51M piperlite
+  voices at 2.3x. heart-nano is the closest to real time: its iSTFT is a DFT-basis `conv_transpose1d` (~0.1 GMAC per second of
+  audio, half its cost), the same lever as the FFT item above. No profile yet. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **WakeHuBERT's remaining gap to ONNX int8** (11.2 ms against 5.67, dev box, F32, one thread, after
   P4.31). Its convs already run ggml's direct `CONV_2D` at 55-68% of the F32 peak, so a better F32 GEMM
   buys ~2 ms at most. Levers by size: an FFT/STFT primitive in place of the 80 MFLOP DFT matmul (~2 ms,
@@ -416,6 +423,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Text front-ends
 
+* [ ] **VITS (Piper) voices: their framing and their phoneme style.** Piper's training put a blank after BOS, which the VITS
+  export does not declare ([Retro-081](../retros/retro-081-piper-has-two-framings.md)), and the voices were trained on
+  espeak IPA, which they do not declare as `tts.phoneme_style` ([ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)).
+  Either changes published audio: A/B both through the door (Whisper WER, as ADR-071's table) before re-exporting.
+  Kokoro (misaki) is the other style candidate.
 * [ ] **Task #79 part 2 — the C++ `orthography2ipa` port.** `src/text/phonemize.cpp` +
   `include/loom/text/phonemize.h`, vendored as an Apache-2.0 submodule, verified against the Python
   door as its oracle. Part 1 is closed — every phoneme-input TTS GGUF carries its symbol table and both
