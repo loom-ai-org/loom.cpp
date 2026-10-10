@@ -43,11 +43,12 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
-| **ASR — encoder-decoder** | Whisper-small, Moonshine Streaming tiny and small | `whisper_export.py`, `moonshine_export.py` |
+| **ASR — encoder-decoder** | Whisper-small, Moonshine Streaming tiny and small, Moonshine (v1) tiny | `whisper_export.py`, `moonshine_export.py`, `moonshine_v1_export.py` |
 | **ASR — composition** | Qwen3-ASR-0.6B, Granite-Speech-4.0-1B, LFM2.5-Audio-1.5B (speech to text; the first hybrid conv/attention LM in the family) | `speech_lm_export.py`, `lfm25_audio_export.py` |
 | **ASR — streaming decoder over codec codes** | Kyutai STT 1B en-fr (run as Kyutai's `moshi` runs it, [ADR-068](../adrs/adr-068-kyutai-stt-follows-moshi-not-the-transformers-port.md); a ring KV cache, [ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)) | `kyutai_stt_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
+| **TTS — tiny distilled students** | sanoTTS: 26 piperlite voices (0.51M-1.83M, 14 languages) and 2 nano voices (heart, heart-nano), from upstream's GPL scripts in a pinned clone ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)) | `sanotts_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **TTS — LM hidden rows + Vocos** | Soprano-1.1-80M (text front end: the reference's regexes run by `loom::PyRegex`, [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)) | `soprano_export.py` |
 | **TTS — LM + depthformer codes + LFM2 detokenizer** | LFM2.5-Audio-1.5B (text to speech, four voices as voice files) | `lfm25_audio_export.py`, `lfm25_audio_voices.py` |
@@ -1426,6 +1427,78 @@ Both transcribe jfk.wav word-perfect (card-gate baselines 0.00). The encoder att
 `T x T` masked score matrix per head, of which 20 diagonals are live: 81.9 s of audio takes 27 s on the
 2-core dev box with tiny, and a banded attention would cut most of it (hub, Models).
 
+### Family 2's third leaf: Moonshine (v1) tiny
+
+`moonshine-ai/moonshine-tiny` (27M), MIT, English (2026-10-10, requested with the Pi Zero in mind).
+The original line, not the streaming one: a three-convolution stem over the raw waveform
+(`tanh(k127 s64)`, a one-group GroupNorm, `gelu(k7 s3)`, `gelu(k3 s2)`, 384 samples per row) and a
+full-attention encoder with the decoder's interleaved partial RoPE. The decoder is the streaming line's
+in everything the trace sees, so `moonshine_v1_export.py` reuses `moonshine_export`'s RoPE,
+cross-attention and cached self-attention. It exports from the piper venv (`moonshine` ships in
+transformers 4.48). No engine change.
+
+* **No `samples_per_chunk`.** The stem takes any length of at least 895 samples, so the engine hands
+  the whole waveform over with its `length`, the one-pass branch.
+* **The decoder caps a clip, not the encoder.** `max_position_embeddings` (194) is the KV cache, and
+  the card's 6.5 tokens per second reaches it at 29.8 s. A default budget past that is an error rather
+  than a transcript cut short; the reference would decode on.
+* **`pad_head_dim_to_multiple_of` is an identity** (zero dims, scale on the unpadded head) and is not
+  reproduced.
+* **Two traps in the reference's own objects.** v1 ships no `tokenizer_config.json`, and the BPE writer
+  reads `eos_token_ids` (a list), not the scalar. The first export declared no end of sequence and
+  `</s>` reached the transcript. And `MoonshineAttention` `update`s ONE shared config with its head
+  counts, which an attribute map writes through to `encoder_num_attention_heads`. So the head check
+  reads a config loaded before the model is built.
+* **The reference's eager softmax is forced to f32** even on a `.double()` model, which is 5e-6 of its
+  own rounding at f64. The f64 check lifts it.
+
+**Verified:** wrappers vs transformers 3e-14 at f64 (encoder and teacher-forced logits); engine
+encoder 1.4e-6 relative to f64; ids identical to transformers' greedy `generate` at the card's budget on
+74/74 clips (73 LibriSpeech-dummy + jfk) at F32. WER on those clips, upper-cased with punctuation
+dropped: F32, F16 and Q8_0 all 9.83%; Q4_1 15.74%, so it is not shipped. The card ships F32 (110 MB)
+and Q8_0 (31 MB).
+
+**On a Pi Zero W** (one ARMv6 core, no SIMD): jfk's 11.0 s took 75.7 s at Q8_0 (peak RSS 103 MB) and
+74.7 s at F32 (174 MB). It is correct there, but about 7x slower than real time; hub, Engine
+performance.
+
+### sanoTTS: 28 tiny voices, a GPL upstream, and a door that had to learn conventions
+
+`ampixa/sanoTTS` (2026-10-10, requested for the Pi Zero): voices of 0.29M to 2.27M parameters,
+**GPL-3.0**, with **no torch checkpoint**. **piperlite** (26 packages, 22.05 kHz, 14 languages) is a
+duration net, a token-context acoustic net and a HiFi-GAN-shaped decoder distilled from Piper voices,
+shipped as a manifest plus one fp16 blob. **nano** (heart 2.27M, heart-nano 0.29M, 24 kHz) is the same
+two front-end nets emitting mel-100 into a noise-fed ConvNeXt/iSTFT decoder distilled from Kokoro,
+shipped as a C runtime's blobs addressed by a generated header (heart-nano int8). The modules come
+from upstream's training scripts in a pinned clone, never vendored
+([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)). The nano decoder's
+torch module was never published, so `_TinyVocos` is the export's own, written to upstream's numpy
+runtime (the user's call, the Silero precedent).
+
+* **Two phases** -- `duration`, and `synth` (acoustic net, token-to-frame gather, decoder) -- with the
+  durations, the vocabulary clamp and every position feature in the driver, in emulated float32
+  (`torch.linspace` is an FMA, matched value for value for every length below 3000).
+* **A gather read a view as rows** ([Retro-080](../retros/retro-080-a-gather-read-a-view-as-rows.md)):
+  the first export's audio correlated 0.002. Fixed in the exporter (a CONT before a GET_ROWS on a
+  view) and in the engine.
+* **Piper has two framings** ([Retro-081](../retros/retro-081-piper-has-two-framings.md)): the students
+  were trained with a blank after BOS, which the engine now expresses (`blank_after_bos`).
+* **nano's noise is ATen's stream** (`aten_randn`, a Lua port of MT19937 + `normal_fill_16`), so
+  `seed` 0 renders upstream's default seed as upstream does. The DC blocker runs as its recursion.
+* **The text door folds to the voice's IPA conventions**
+  ([ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md)): unfolded, the bundled
+  lexicon's IPA was unintelligible to these voices (66.8% and 81.3% WER).
+
+**Verified.** amy-1.46M: wrappers vs upstream's modules 1.4e-7 at f64, engine vs upstream's torch path
+7.2e-6 (correlation 1.0, same 508 frames), ARMv6 vs x86 4.8e-6. heart-nano: engine vs upstream's
+runtime 3.5e-6 end to end at the default seed; heart 1.1e-5. Whisper is word-perfect on all three with
+upstream's phonemes. Through the text door with the bundled misaki lexicon, folded, on 30 LibriSpeech
+sentences: heart-nano 11.9% WER (upstream's own front end 8.1%), amy 12.3% (8.5%).
+
+**On a Pi Zero W** (one ARMv6 core, P4.31 engine): heart-nano runs at 1.1x real time in 34 MB, the
+0.51M piperlite voices at 2.3x (54 MB), heart at 2.5x, amy-1.46M at 8.4x. That is near the board's
+arithmetic: the piperlite decoder is about 1.1 GMAC per second of audio.
+
 ### Family 14: MusicGen, two families composed
 
 `facebook/musicgen-small` (300M decoder + T5-base text encoder, CC-BY-NC-4.0, built 2026-10-09 at the
@@ -1636,7 +1709,7 @@ from.
 
 | | |
 |---|---|
-| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md), [Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md), [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md) |
+| Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md), [ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md), [ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md), [Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md), [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md), [Retro-080](../retros/retro-080-a-gather-read-a-view-as-rows.md), [Retro-081](../retros/retro-081-piper-has-two-framings.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
