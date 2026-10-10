@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-08
+last_updated: 2026-10-09
 ---
 
 # Epic-03: Model Coverage
@@ -58,6 +58,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **Audio codec + chunked attention** | Qwen3-TTS-Tokenizer-12Hz | `qwen3_tts_export.py` (companion) |
 | **Audio codec + blocked attention, stereo** | MOSS-Audio-Tokenizer-v2 | `moss_audio_tokenizer_export.py` |
 | **Text → codec tokens** | Dia-1.6B, Qwen3-TTS-12Hz-0.6B-Base, MOSS-TTS-Local-Transformer-v1.5 | `dia_export.py`, `qwen3_tts_export.py`, `moss_tts_export.py` |
+| **Text → music codec tokens** | MusicGen Small (decodes through EnCodec-32kHz) | `musicgen_export.py` |
 | **Text encoder-decoder** | flan-t5-small (and every `model_type: t5`) | `t5_export.py` |
 
 The two LFM2 entries are the *same checkpoint exported two ways*, which is how the engine's two
@@ -1425,6 +1426,49 @@ Both transcribe jfk.wav word-perfect (card-gate baselines 0.00). The encoder att
 `T x T` masked score matrix per head, of which 20 diagonals are live: 81.9 s of audio takes 27 s on the
 2-core dev box with tiny, and a banded attention would cut most of it (hub, Models).
 
+### Family 14: MusicGen, two families composed
+
+`facebook/musicgen-small` (300M decoder + T5-base text encoder, CC-BY-NC-4.0, built 2026-10-09 at the
+user's pick ahead of rc16). A text description in, four delayed EnCodec code streams out; the codec is
+the already-published `encodec-32khz-loom`, whose config is MusicGen's `audio_encoder` key for key.
+**No engine change and no new primitive**: the text side is family 6's T5 encoder (the block loop over
+a driver-built relative bias, `t5_position_bias` shared from `t5_driver/`), and the audio side is
+Dia's arrangement -- `encoder` / `cross_kv` / `decoder` with classifier-free guidance as private second
+streams. The bill was four things in the reference, three of them silent:
+
+* **The positions are computed from `past_key_values_length`**, which a cache-free trace fixes at 0, so
+  traced as-is every cached step is embedded at position 0. The decoder now gathers the checkpoint's
+  own sinusoid table at a `position_ids` input.
+* **The fusion matched nothing, and the export wrote a file anyway.** MusicGen scales the scores rather
+  than Q, and its eager mask builder reads a 4-D mask as 0/1 and inverts it. Together they left 48 bare
+  SOFTMAX nodes and no cached ATTENTION. Fixed in the family (Q scaled first, bit-identical at head_dim
+  64; the builder bypassed), and the recurrence of Retro-041 moved the check into the shared path
+  ([Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md)).
+* **The unconditional stream is zero cross-attention.** `generate()` zeroes the T5 output and its mask,
+  and `forward` multiplies the projected states by that mask, so the unconditional K/V are exactly 0.
+  The driver feeds `cross_kv_uncond` one zero frame rather than re-running T5 over blank ids (Dia's
+  move, which would be wrong here).
+* **`top_k` is absent from the generation config, and `transformers` then uses 50.** The shared
+  `read_sampling_defaults` reads the JSON and would have shipped an untruncated sampler; this family
+  reads the resolved `GenerationConfig`. The shared reader's bug is filed in the hub.
+
+`max_new_tokens` counts **frames** (50 per second), the convention every codec LM's door uses; the delay
+pattern is `build_delay_pattern_mask`'s, with no EOS, so a generation is exactly as long as asked.
+
+**Verified** against `MusicgenForConditionalGeneration.generate(do_sample=False)`, prompt "80s pop
+track with bassy drums and synth":
+
+| | result |
+|---|---|
+| codes, 61 frames, guidance off / 3.0 | 244/244 / 244/244 |
+| teacher-forced logits, 64 steps, conditional / unconditional (absmax ~23) | 6.8e-05 / 7.4e-05 (one-step shift: 17.0) |
+| projected T5 output (absmax 8.7) | 2.9e-06 |
+| waveform through `encodec-32khz-loom`, 1.22 s | 3.4e-05 (absmax 0.16) |
+
+The engine gate `test_e2e_musicgen_mil_export` grades 32 frames both ways, through the file's own T5
+vocabulary (20/20). On the 4-core dev box, 2 s of music takes 27 s with guidance and 14 s without
+(transformers: 32 s and 20 s, including its codec decode).
+
 ### Text input
 
 **Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, Voxtral-4B-TTS and SpeechT5 take text.** Each encodes graphemes itself and each GGUF carries its own
@@ -1438,7 +1482,7 @@ limitation of those checkpoints, addressed by
 Ordered by coverage-per-effort. Live items are tracked in
 [the backlog](../backlog/active-index.md#models); the ordering and its reasoning are here.
 
-**Next families:** the remaining TTS families → music. **Seven are done** — small audio classifiers
+**Next families:** music, whose first leaf, MusicGen Small, was built 2026-10-09 (§2); the remaining TTS families are deferred. **Seven are done** — small audio classifiers
 and embedders (13, on four leaves, 2026-10-01: §2), 
 token classifiers (12), codec decoders (11, all four shapes), the AR codec-token LM (10), text
 encoder-decoders (6), CNN + transformer + CTC (4) and, as of 2026-09-16, SANM / FunASR (5, on **both**
@@ -1538,6 +1582,6 @@ from.
 | | |
 |---|---|
 | Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md), [Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
