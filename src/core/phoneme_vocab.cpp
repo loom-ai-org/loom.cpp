@@ -33,6 +33,7 @@ std::unique_ptr<PhonemeVocab> PhonemeVocab::load(const GgufModel& model) {
     vocab->eos_id_ = model.kv_i32("tokenizer.ggml.phoneme.eos_id", -1);
     vocab->blank_id_ = model.kv_i32("tokenizer.ggml.phoneme.blank_id", -1);
     vocab->interleave_blank_ = model.kv_bool("tokenizer.ggml.phoneme.interleave_blank", false);
+    vocab->blank_after_bos_ = model.kv_bool("tokenizer.ggml.phoneme.blank_after_bos", false);
     return vocab;
 }
 
@@ -77,10 +78,13 @@ std::vector<int32_t> PhonemeVocab::encode(const std::string& phonemes, size_t* u
 
     // The assembly the checkpoint declared. Piper: [BOS, p1, blank, p2, blank, ..., pn, blank, EOS],
     // with no blank right after BOS -- which is why the blank follows each phoneme rather than
-    // preceding it.
+    // preceding it -- unless the file declares `blank_after_bos`, piper-phonemize's own build.
     std::vector<int32_t> out;
-    out.reserve(body.size() * 2 + 2);
-    if (bos_id_ >= 0) out.push_back(bos_id_);
+    out.reserve(body.size() * 2 + 3);
+    if (bos_id_ >= 0) {
+        out.push_back(bos_id_);
+        if (blank_after_bos_ && interleave_blank_ && blank_id_ >= 0) out.push_back(blank_id_);
+    }
     for (int32_t id : body) {
         out.push_back(id);
         if (interleave_blank_ && blank_id_ >= 0) out.push_back(blank_id_);

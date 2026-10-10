@@ -48,6 +48,7 @@ int main() {
     LOOM_CHECK(vocab->eos_id() == kEos);
     LOOM_CHECK(vocab->blank_id() == kBlank);
     LOOM_CHECK(vocab->interleave_blank());
+    LOOM_CHECK(!vocab->blank_after_bos());  // absent from the file is false: every pre-key export
 
     // Piper's build: a blank after every phoneme, none right after BOS, EOS last.
     LOOM_CHECK(vocab->encode("a") == std::vector<int32_t>({kBos, kA, kBlank, kEos}));
@@ -124,6 +125,20 @@ int main() {
         LOOM_CHECK(bare->size() == 13);
         LOOM_CHECK(bare->piece(12) == "a");
         LOOM_CHECK(bare->encode("a") == std::vector<int32_t>({kBareBos, kA}));
+    }
+
+    // piper-phonemize's build, declared: a blank right after BOS as well. The same table, so the only
+    // difference from the first file's assembly is that one id -- which is what sanoTTS's students were
+    // distilled on (piper1-gpl's `phonemes_to_ids`).
+    {
+        auto bb_model = load("phoneme_vocab_bos_blank.gguf");
+        auto bb = loom::PhonemeVocab::load(*bb_model);
+        LOOM_CHECK(bb != nullptr);
+        LOOM_CHECK(bb->blank_after_bos());
+        LOOM_CHECK(bb->encode("ah") == std::vector<int32_t>({kBos, kBlank, kA, kBlank, kH, kBlank, kEos}));
+        // Nothing to say still frames: BOS, its blank, EOS.
+        LOOM_CHECK(bb->encode("") == std::vector<int32_t>({kBos, kBlank, kEos}));
+        LOOM_CHECK(bb->decode(bb->encode("t͡ʃaɪ")) == "t͡ʃaɪ");
     }
 
     // The tag with no table is MALFORMED rather than merely new, and is the one input this loader is

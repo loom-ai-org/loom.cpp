@@ -194,9 +194,15 @@ ggml_tensor* ensure_packed(ggml_context* ctx, ggml_tensor* t) {
 // `(1, T, C)` channel ids at T > 1 -- is not that, and asserted at the first call after export, write
 // and load had all passed (Retro-066). For a 2-D table it is one flat lookup reshaped back, which is the
 // answer torch gives: `[ne0, b->ne[0], b->ne[1], b->ne[2]]`. Any other mismatch throws a catchable error.
+//
+// The TABLE is packed first when it is a view. ggml-cpu's `get_rows` copies `ne0` contiguous elements from
+// each row's start and never reads `nb[0]`, so a gather out of a transposed view returned the right number
+// of values from the wrong places, silently: sanoTTS's frame expansion gathers token states out of a conv
+// stack's output, and its audio came out at correlation 0.002. A weight table is always packed, so this
+// costs every embedding lookup nothing.
 Outputs op_get_rows(PrimitiveContext& pc, const Inputs& in, const Json&) {
     expect_n_inputs("GET_ROWS", in, 2);
-    ggml_tensor* a = in[0];
+    ggml_tensor* a = ensure_packed(pc.ctx, in[0]);
     ggml_tensor* b = in[1];
     if (b->type != GGML_TYPE_I32) {
         throw SchemaError("GET_ROWS: the index must be I32, got " + std::string(ggml_type_name(b->type)));

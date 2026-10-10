@@ -13,9 +13,11 @@
 // What stays outside: grapheme -> phoneme, which is a property of the LANGUAGE rather than of any
 // checkpoint, and therefore of no GGUF.
 //
-// THE ASSEMBLY IS PART OF THE CONVERSION AND NOT PART OF THE TABLE. Piper builds
+// THE ASSEMBLY IS PART OF THE CONVERSION AND NOT PART OF THE TABLE. Piper's python runtime builds
 // `[BOS, p1, blank, p2, blank, ..., pn, blank, EOS]` -- a blank between every phoneme, none right after
-// BOS. A host that only looked symbols up would produce ids the model was not trained on, so the
+// BOS -- while piper-phonemize, which Piper's TRAINING preprocessing calls, and piper1-gpl put one
+// right after BOS as well (`blank_after_bos`), and a model distilled through the latter (sanoTTS) was
+// trained on that. A host that only looked symbols up would produce ids the model was not trained on, so the
 // convention is declared by the export (`tokenizer.ggml.phoneme.*`) and applied here. That is the same
 // arrangement `SupertonicTextVectorizer` has for its `<lang>` wrap, one modality over, and it is why
 // both are vocabularies rather than lookup tables with instructions attached.
@@ -59,6 +61,10 @@ public:
     int32_t eos_id() const { return eos_id_; }
     int32_t blank_id() const { return blank_id_; }
     bool interleave_blank() const { return interleave_blank_; }
+    // A blank right after BOS too, `[BOS, blank, p1, blank, ...]` -- piper-phonemize's own build. Only
+    // ever true beside `interleave_blank`; absent from a file means false, which is every export before
+    // this key existed.
+    bool blank_after_bos() const { return blank_after_bos_; }
 
     // The symbol for one id, or "" for an id outside the table.
     const std::string& piece(int32_t id) const;
@@ -73,6 +79,7 @@ private:
     int32_t eos_id_ = -1;
     int32_t blank_id_ = -1;
     bool interleave_blank_ = false;
+    bool blank_after_bos_ = false;
 };
 
 } // namespace loom

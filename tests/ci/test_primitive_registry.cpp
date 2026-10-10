@@ -73,6 +73,31 @@ void test_get_rows_matrix_index_into_a_2d_table() {
     LOOM_CHECK(get_f32(out) == expected);
 }
 
+// A gather out of a TRANSPOSED view -- token states `[C, T]` read as rows of `[T, C]`. ggml-cpu's
+// get_rows copies each row as contiguous elements and ignores the element stride, so without the pack the
+// rows came from the wrong places with nothing raised (sanoTTS's frame expansion).
+void test_get_rows_from_a_transposed_view() {
+    GgmlScratch s;
+    ggml_tensor* data = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 4, 3);   // 3 channels x 4 tokens
+    ggml_set_input(data);
+    ggml_tensor* idx = ggml_new_tensor_1d(s.ctx.get(), GGML_TYPE_I32, 3);
+    ggml_set_input(idx);
+    ggml_tensor* view = ggml_transpose(s.ctx.get(), data);                     // 4 rows of 3, strided
+
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    ggml_tensor* out = op("GET_ROWS")(pc, {view, idx}, {})[0];
+    LOOM_CHECK(out->ne[0] == 3 && out->ne[1] == 3);
+
+    ggml_cgraph* gf = s.expand(out);
+    // channel c, token t at data[c * 4 + t]: token t's row is {t, 10 + t, 20 + t}.
+    set_f32(data, {0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23});
+    set_i32(idx, {2, 2, 0});
+    s.compute(gf);
+    const std::vector<float> expected = {2, 12, 22, 2, 12, 22, 0, 10, 20};
+    LOOM_CHECK(get_f32(out) == expected);
+}
+
 // Anything that is neither shape is a catchable error rather than a ggml abort.
 void test_get_rows_mismatched_batch_throws() {
     GgmlScratch s;
@@ -2970,6 +2995,7 @@ void test_rwkv_wkv7() {
 int main() {
     test_get_rows();
     test_get_rows_matrix_index_into_a_2d_table();
+    test_get_rows_from_a_transposed_view();
     test_get_rows_mismatched_batch_throws();
     test_mul_mat_identity();
     test_add_mul_silu();
