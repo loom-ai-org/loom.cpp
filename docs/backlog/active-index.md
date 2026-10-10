@@ -305,12 +305,25 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **The Pi Zero, for the two models chosen for it.** Measured 2026-10-10 on the Pi Zero W (P4.31 engine): Moonshine
+* [ ] **The Pi Zero: speed of the models chosen for it.** Measured 2026-10-10 on the Pi Zero W (P4.31 engine): Moonshine
   tiny at ~7x slower than real time (jfk 11 s in 75 s, either precision), sanoTTS heart-nano at 1.1x, the 0.51M piperlite
   voices at 2.3x. heart-nano is the closest to real time: its iSTFT is a DFT-basis `conv_transpose1d` (~0.1 GMAC per second of
-  audio, half its cost), the same lever as the FFT item above. No profile yet. **Citrinet-256-ls** (rc16 wheel): jfk in 37 s
-  at Q8_0, 64 s at F32 (RTF 3.4 / 5.8). Profiled at Q8_0: 76% is its 1x1 `CONV_2D`s, ~6 GFLOP at ~0.22 GFLOP/s, which is
-  the board's GEMM ceiling, so only fewer FLOPs or a faster ARMv6 GEMM moves it ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)
+  audio, half its cost), the same lever as the FFT item above. No profile yet. ASR on the board, one core, jfk (11.0 s) / a 29.4 s LibriSpeech clip, seconds (RTF):
+
+  | model | file | jfk | 29.4 s | peak RSS | WER, 73 LibriSpeech-dummy clips |
+  |---|---|---|---|---|---|
+  | Citrinet-256-ls (rc16 wheel) | F32 | 64.0 (5.8) | 172.8 (5.9) | 96 MB | 9.39% |
+  | | Q8_0 | 37.5 (3.4) | 97.7 (3.3) | 71 MB | 9.39% |
+  | Conformer-CTC small (rc17 wheel) | F32 | 55.7 (5.1) | 275.7 (9.4) | 232 MB | 5.65% |
+  | | Q8_0 | 75.9 (6.9) | 297.7 (10.1) | 262 MB | 5.74% |
+  | | Q4_0 | 72.1 (6.6) | 300.7 (10.2) | 257 MB | 6.00% |
+
+  Both run at ~0.2 GFLOP/s, the board's GEMM ceiling. Citrinet (Q8_0 profile): 76% is its 1x1 `CONV_2D`s, ~6 GFLOP
+  for jfk. Conformer (F32 profile): its full 3x3 pre-encode conv over 176 channels is one 3.1 GFLOP `MUL_MAT`, 23.5%;
+  its RTF grows with length (attention), and quantizing does not help: width 176 is not a multiple of 32, so only
+  5 of Q8_0's 47 MB is quantized, and the ARMv6 integer GEMM is no faster than F32. For comparison, lokutor-ai's
+  int8 engine runs the same Conformer at 1.97x real time on one ESP32-S3 core (its card, 2026-10-09), whose int8
+  SIMD the ARM1176 lacks. Only fewer FLOPs or a faster ARMv6 GEMM moves these ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)
   closed the known GEMM levers). *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
 * [ ] **WakeHuBERT's remaining gap to ONNX int8** (11.2 ms against 5.67, dev box, F32, one thread, after
   P4.31). Its convs already run ggml's direct `CONV_2D` at 55-68% of the F32 peak, so a better F32 GEMM
