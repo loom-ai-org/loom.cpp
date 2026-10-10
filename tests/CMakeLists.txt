@@ -127,6 +127,13 @@ add_test(NAME test_transcribe_no_selection COMMAND test_transcribe_no_selection)
 set_tests_properties(test_transcribe_no_selection PROPERTIES LABELS ci)
 set_tests_properties(test_transcribe_no_selection PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
 
+add_executable(test_transcribe_wordpiece ci/test_transcribe_wordpiece.cpp)
+target_link_libraries(test_transcribe_wordpiece PRIVATE loom::engine)
+target_compile_definitions(test_transcribe_wordpiece PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_transcribe_wordpiece COMMAND test_transcribe_wordpiece)
+set_tests_properties(test_transcribe_wordpiece PROPERTIES LABELS ci)
+set_tests_properties(test_transcribe_wordpiece PROPERTIES FIXTURES_REQUIRED contract_gguf_fixture)
+
 # --- Phase 2: primitive registry / topology parsing / graph builder ---
 
 add_executable(test_primitive_registry ci/test_primitive_registry.cpp)
