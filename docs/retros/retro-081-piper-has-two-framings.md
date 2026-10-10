@@ -24,16 +24,18 @@ Piper has two `phonemes_to_ids`, and they differ by exactly that one id:
   `tools/convert_piper_vits/reference_forward_vits.py` copied, so it is what the VITS export and
   `PhonemeVocab` reproduce.
 
-So **Piper's VITS voices were trained with the pad after BOS**, and loom's VITS door feeds them one id
-short. VITS is robust to it: Whisper is word-perfect through the door on `vits-piper-en-gb-miro`. That
-is why it was never noticed. A 1.46M-parameter student is not robust in the same way.
+So **Piper's VITS voices were trained with the pad after BOS**, and loom's VITS door fed them one id
+short. VITS is robust to it: Whisper is word-perfect through the door on `vits-piper-en-gb-miro` on a
+short sentence. That is why it was never noticed; over 30 sentences it measured (below). A 1.46M-parameter student is not robust in the same way.
 
 ## What Changed
 
 * `tokenizer.ggml.phoneme.blank_after_bos` (engine `PhonemeVocab`, exporter writer). It is optional and
   absent means the old assembly, so every existing file is unchanged.
-* sanoTTS declares it. The VITS export does **not** yet: switching it changes every published Piper
-  voice's audio, so it waits for a measured A/B and a republish (hub item).
+* sanoTTS declares it. The VITS export declares it too since 2026-10-10, after an A/B through the
+  door (Whisper-small, 30 LibriSpeech sentences, miro): espeak-ng's phonemes 14.9% -> 13.2% WER, the
+  ipa-dict door 29.4% -> 25.5%. The espeak-convention fold ([ADR-071](../adrs/adr-071-a-phoneme-table-declares-its-conventions.md))
+  made VITS's door worse (30.2% either way), so VITS declares no `tts.phoneme_style`.
 
 ## Takeaway
 
