@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-09
+last_updated: 2026-10-10
 ---
 
 # Epic-03: Model Coverage
@@ -39,7 +39,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | domain | models | template |
 |---|---|---|
 | **Language** | Qwen3-0.6B-Base, LFM2-350M (monolithic *and* modular), SmolLM2-360M-Instruct, Gemma-3-270M-it | `causal_lm_export.py` |
-| **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3 | `nemo_asr_export.py` |
+| **ASR — NeMo encoders** | Conformer-CTC-small, Parakeet-TDT-0.6B, Parakeet-RNNT-0.6B, GigaAM v3, Nemotron 3.5 ASR Streaming 0.6B (language-prompted, 40 locales) | `nemo_asr_export.py`, `transducer_export.py`, `nemotron_asr_export.py` |
 | **ASR — CNN + transformer + CTC** | any HF `*ForCTC` (HuBERT, data2vec-audio, wav2vec 2.0) | `ctc_asr_export.py` |
 | **ASR — SANM / FunASR** | SenseVoice-Small | `sanm_asr_export.py` |
 | **ASR — SANM + CIF** | Paraformer-zh | `paraformer_export.py` |
@@ -1476,6 +1476,54 @@ the cause. The card gate grades it on a row of its own (loom-py #59). A music pr
 Whisper to read back, so the row asks whether Whisper files the output under music instead: both
 MusicGen takes were heard as "(upbeat music)"; speech, white noise and random codes were not.
 
+### Family 1's fourth transducer: Nemotron 3.5 ASR
+
+`nvidia/nemotron-3.5-asr-streaming-0.6b` (OpenMDW-1.1, built 2026-10-10 at the user's pick from the
+"requested for the zoo" list). It is a cache-aware FastConformer encoder, an RNN-T head, and a
+language-ID prompt; 40 language-locale combinations come from one checkpoint. It is loaded through
+`transformers` (5.13+, the ovos venv): the card's NeMo requirement (26.06) is past both export venvs.
+It runs `transformers`' **offline** mode, the whole clip through the encoder once, which is what loom's
+one-pass `speech2text` door is. Chunked live streaming is not exported.
+
+**No engine change.** The prediction network, joint and decode loop are `transducer_export.py`'s,
+shared with Parakeet and GigaAM. The base gained two hooks, `encoder_phase` and `encoder_inputs`, so
+a leaf whose encoder is not NeMo-shaped can supply its own. Parakeet RNN-T re-exports byte-identical
+through them.
+
+What was Nemotron's own:
+
+* **The reference's default attention path is broken** ([Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)).
+  Under `attn_implementation="eager"` the chunked mask is inverted, and JFK comes back as "Your American
+  do you for your country?". The oracles are sdpa's. The export builds the mask itself as a boolean,
+  which gives sdpa's semantics whatever is traced.
+* **The mel front end is traced.** It is preemphasis, a zero-padded centred STFT and a log Slaney
+  filterbank, with no normalisation. The extractor marks its last frame invalid and zeroes it. A right
+  pad of `n_fft/2 - hop` instead of `n_fft/2` yields exactly the valid frames, with no shape-derived
+  slice. Dropping that frame is exact: it is zero, every conv after it is causal, and its key is masked.
+* **The language prompt is an embedding lookup.** `linear_1([h; onehot(p)])` is `W_h h + W_p[:, p] + b`.
+  The driver fills the `[1]` prompt input from `inputs.language`, which the engine resolves through the
+  contract's language table (121 names, `auto` included), else the checkpoint's `auto` (101). The
+  `<xx-YY>` tags the model writes after each sentence are `asr.control_ids`, dropped from `text` as
+  `skip_special_tokens` does.
+* **The vocabulary is SentencePiece BPE shipped as `tokenizer.json` alone.** It is now written as
+  llama.cpp's `llama` vocabulary, like Parakeet's (`read_hf_id_layout(..., allow_bpe=True)`, scores
+  `-id`). Detected as byte-level BPE, JFK came back as one word with no spaces.
+
+**Verified** against `Nemotron3_5AsrForRNNT.generate()` (sdpa) on the released rc16 wheel:
+
+| | result |
+|---|---|
+| tokens, JFK, `auto` / `en-US` | 48/48 / 48/48 |
+| tokens, synthetic zh / de / es clips (Qwen3-TTS), `auto` and named | 22/22, 30/30, 28/28 each way |
+| tokens, a 60 s clip | 245/245 |
+| text, JFK | identical, character for character |
+| encoder output under four prompts (absmax ~4.5) | ≤ 7.6e-6 (the prompts move it by 1.3 to 4.1) |
+| wrong language (`de-DE` on English speech) | empty, as `transformers` |
+
+The engine gate `test_e2e_nemotron_asr_mil_export` checks all three prompt cases and the text door
+(6/6). The card gate passes on the released rc16 wheel (WER 0.00 on JFK). On the 4-core dev box, 11 s
+of speech takes 4.8 s and 120 s takes 82 s, with a 4.0 GB peak.
+
 ### Text input
 
 **Supertonic, F5-TTS, Chatterbox, Pocket-TTS, VoxCPM2, CosyVoice3, Voxtral-4B-TTS and SpeechT5 take text.** Each encodes graphemes itself and each GGUF carries its own
@@ -1589,6 +1637,6 @@ from.
 | | |
 |---|---|
 | Decisions | [ADR-004](../adrs/adr-004-mil-as-the-single-export-path.md), [ADR-005](../adrs/adr-005-export-config-and-task-registry.md), [ADR-013](../adrs/adr-013-one-door-per-task.md), [ADR-019](../adrs/adr-019-family-12-needs-no-attention-mask.md), [ADR-027](../adrs/adr-027-the-protobuf-owns-pieces-the-fast-tokenizer-owns-ids.md), [ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md), [ADR-033](../adrs/adr-033-a-decode-only-table-is-still-a-vocabulary-family.md), [ADR-035](../adrs/adr-035-a-shared-role-is-not-a-shared-table.md), [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md), [ADR-040](../adrs/adr-040-guidance-belongs-to-the-evaluation-not-the-integrator.md), [ADR-041](../adrs/adr-041-a-text-front-ends-rules-ship-as-data.md), [ADR-043](../adrs/adr-043-a-voice-that-is-attention-state-is-seeded-not-run.md), [ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md), [ADR-045](../adrs/adr-045-a-voice-is-a-file-of-driver-inputs-stamped-with-its-weights.md), [ADR-046](../adrs/adr-046-a-guidance-rule-the-integrator-cannot-express-stays-in-the-step-graph.md), [ADR-047](../adrs/adr-047-a-samplers-mass-its-bans-and-its-draw-are-the-callers-to-state.md), [ADR-053](../adrs/adr-053-a-codec-lms-voice-is-its-references-codes-stamped-with-the-codec.md), [ADR-054](../adrs/adr-054-a-tiktoken-vocabulary-is-merged-by-rank-in-the-shared-bpe.md), [ADR-062](../adrs/adr-062-a-classifier-says-how-many-answers-it-gives.md) |
-| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md), [Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md) |
+| Retros | [Retro-006](../retros/retro-006-kokoro-shipped-noise.md), [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md), [Retro-013](../retros/retro-013-retrofitting-eight-bespoke-converters.md), [Retro-039](../retros/retro-039-position-zero-was-not-row-zero.md), [Retro-040](../retros/retro-040-the-blocker-was-scoped-from-the-mechanism.md), [Retro-041](../retros/retro-041-two-transposes-merged-and-the-fusion-went-quiet.md), [Retro-046](../retros/retro-046-groups-greater-than-one-was-read-as-depthwise.md), [Retro-048](../retros/retro-048-the-exporters-own-passes-hid-from-its-own-shape-walk.md), [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md), [Retro-051](../retros/retro-051-a-negative-begin-doubled-the-slice.md), [Retro-052](../retros/retro-052-every-phase-was-right-and-the-join-was-wrong.md), [Retro-053](../retros/retro-053-the-repetition-penalty-compounded-per-occurrence.md), [Retro-054](../retros/retro-054-a-transposed-view-saved-fortran-ordered.md), [Retro-055](../retros/retro-055-a-feedback-loop-cannot-be-gated-free-running.md), [Retro-056](../retros/retro-056-a-fold-checked-after-the-reference-ran-checks-nothing.md), [Retro-057](../retros/retro-057-two-cached-stacks-wrote-one-caches-first-layers.md), [Retro-058](../retros/retro-058-a-size-stated-twice-was-never-compared.md), [Retro-062](../retros/retro-062-an-f32-wrapper-check-could-not-tell-a-spelling-from-a-defect.md), [Retro-063](../retros/retro-063-an-expand-as-was-lowered-as-an-identity.md), [Retro-064](../retros/retro-064-the-dft-basis-was-built-in-fp32.md), [Retro-065](../retros/retro-065-nemo-masks-were-baked-all-true.md), [Retro-068](../retros/retro-068-a-slice-end-the-walk-could-not-read-kept-the-whole-axis.md), [Retro-069](../retros/retro-069-a-mean-that-kept-its-axis-interleaved-a-concat.md), [Retro-078](../retros/retro-078-the-fusion-went-quiet-again.md), [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md) |
 | Archive | [Flagship coverage, Aug 2026](../archive/ledger-2026-08-model-coverage.md) |
 | Active tasks | [Backlog → Models](../backlog/active-index.md#models) |
