@@ -66,6 +66,13 @@ int main(int argc, char** argv) {
             {"tokens", prompt},
             {"max_new_tokens", static_cast<double>(n_new)},
             {"eos_token", -1.0},
+            // GREEDY, stated rather than inherited. A driver's sampling defaults are the checkpoint's
+            // (gemma-3-270m-it declares temperature 1.0, top_k 64, top_p 0.95), so without this the
+            // runs below differ by design and the check after them reads a sampler as a leaking KV
+            // cache -- which is exactly how gemma got logged as one on 2026-10-11. Greedy is also what
+            // the onnxruntime side decodes with, so it is the equal-work arm. `temperature <= 0` is
+            // sample_row's argmax shortcut; a driver with no sampling options ignores the key.
+            {"temperature", 0.0},
         }));
     };
 
@@ -78,8 +85,9 @@ int main(int argc, char** argv) {
         const std::vector<double> out = generate();
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (out != warm) {
-            std::fprintf(stderr, "infer_with_past returned different tokens on run %d -- the KV cache "
-                                 "is leaking state across calls, so this timing is meaningless\n", i);
+            std::fprintf(stderr, "infer_with_past returned different tokens on run %d under greedy "
+                                 "decoding -- state is leaking across calls (or the driver ignored "
+                                 "`temperature`), so this timing is meaningless\n", i);
             return 1;
         }
         if (i == 0 || dt < with_past) with_past = dt;

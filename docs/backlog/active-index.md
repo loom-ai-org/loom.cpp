@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Queued before the XNNPACK benchmark (user, 2026-10-11): the gemma-3 KV leak, then retiring `pad_crop_relative_embeddings`** | Both are below. The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
+| **Queued before the XNNPACK benchmark (user, 2026-10-11): retiring `pad_crop_relative_embeddings`** | Below, under Minor cleanups. The gemma-3 "KV leak" that was queued with it was not one: the checkpoint declares sampling, and greedy is deterministic across runs ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -274,16 +274,6 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
-* [ ] **gemma-3-270m-it leaks KV state from one generation into the next.** Found 2026-10-11 while
-  measuring ADR-072, and present on `main` before it (`f0920de`, same GGUF from hf-models-rc11). Four
-  `infer_with_past` calls in one `Session` with the same prompt give four different sequences. Every
-  run after the first differs from the first at token 0, the prefill's own output, and runs 1-3 differ
-  from each other by token 2. `scripts/bench_lm_loom.cpp` aborts on it ("the KV cache is leaking
-  state across calls"). Qwen3-0.6B passes the same check. Gemma 3 interleaves sliding-window and global
-  layers, which is outside [ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)'s
-  uniform-window ring, so check first that a padded or windowed cell is really masked. Anyone
-  generating twice in one process with this model gets wrong output.
-  *Context: [Epic-01 §4](../epics/epic-01-inference-engine-core.md#4-standing-scope-limitations)*
 * [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
 * [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
   *unreachable for already-correct graphs*; they do not remove it, and `op_repeat`'s two branches are
