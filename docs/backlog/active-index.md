@@ -306,6 +306,16 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
+* [ ] **`SOFT_MAX`: XNNPACK shows 1.75-1.81x headroom over ggml on whisper's 1500-wide rows** (Ryzen 3
+  3250U, one thread, `scripts/bench_xnnpack.cpp`, 2026-10-11). This tree's best attempt reached 1.16x
+  on the same box (Retro-012: the 3-pass row and the `ggml_v_expf` specialisation). So the headroom is
+  real and was not found. Read XNNPACK's `f32-raddstoreexpminusmax` and `f32-rmax` kernels (BSD-3)
+  for what they do differently, prototype in `scripts/bench12.cpp`'s frame, and measure on x86 AND
+  the Pi before writing a ggml patch. Softmax was 16% of whisper's encoder gap to onnxruntime.
+* [ ] **Attention `QK^T` at k=64: XNNPACK 1.60-1.75x over ggml** on the same run. Retro-012's own
+  outer-product tile already reached 1.85x on this box, and was closed on the 285K (1.38x against a
+  1.5x gate) and on NEON (1.23x). XNNPACK's NEON number, from the Pi/M1 run, is what says whether a
+  better ARM tile exists. `QK^T` was 51% of whisper's encoder gap to onnxruntime.
 * [ ] **The Pi Zero, for the two models chosen for it.** Measured 2026-10-10 on the Pi Zero W (P4.31 engine): Moonshine
   tiny at ~7x slower than real time (jfk 11 s in 75 s, either precision), sanoTTS heart-nano at 1.1x, the 0.51M piperlite
   voices at 2.3x. heart-nano is the closest to real time: its iSTFT is a DFT-basis `conv_transpose1d` (~0.1 GMAC per second of
