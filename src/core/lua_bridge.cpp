@@ -7,7 +7,6 @@
 #include <functional>
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
-#include "loom/core/relative_position.h"
 #include "loom/loom_errors.h"
 
 extern "C" {
@@ -2150,23 +2149,6 @@ int LoomLuaBridge::l_expand_by_duration_and_retain(lua_State* L) {
     }
 }
 
-// Thin wrapper around loom::pad_crop_relative_embeddings (include/loom/core/relative_position.h),
-// already proven by VitsDriver's own C++ implementation.
-int LoomLuaBridge::l_pad_crop_relative_embeddings(lua_State* L) {
-    try {
-        const std::vector<double> raw_d = read_number_array(L, 1);
-        const auto window_size = static_cast<int64_t>(luaL_checknumber(L, 2));
-        const auto k_channels = static_cast<int64_t>(luaL_checknumber(L, 3));
-        const auto length = static_cast<int64_t>(luaL_checknumber(L, 4));
-        std::vector<float> raw(raw_d.begin(), raw_d.end());
-        const std::vector<float> result = pad_crop_relative_embeddings(raw, window_size, k_channels, length);
-        push_number_array(L, result);
-        return 1;
-    } catch (const std::exception& e) {
-        return luaL_error(L, "loom.pad_crop_relative_embeddings: %s", e.what());
-    }
-}
-
 // Reads a registered module's own raw weight tensor DIRECTLY (via GgufModel::weight(), no graph
 // computation involved) -- needed by VITS's own relative-position tables, which the C++ driver reads
 // straight off the GGUF weight table (`model.weight("enc_p.encoder.attn_layers.{i}.emb_rel_k_raw")`)
@@ -2305,7 +2287,6 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
         {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
-        {"pad_crop_relative_embeddings", &LoomLuaBridge::l_pad_crop_relative_embeddings},
         {"get_weight", &LoomLuaBridge::l_get_weight},
         {"seed_kv", &LoomLuaBridge::l_seed_kv},
     };

@@ -3722,8 +3722,9 @@ have been there at all.**
 #### What they were
 
 `_get_relative_embeddings` in piper's `MultiHeadAttention`: pad-and-crop of a learned Shaw-style table.
-The engine has had a host-side port of it since the bespoke driver
-(`src/core/relative_position.cpp::pad_crop_relative_embeddings`); the MIL trace does not use it, and
+The engine had a host-side port of it since the bespoke driver
+(`src/core/relative_position.cpp::pad_crop_relative_embeddings`, retired 2026-10-11 with no caller left);
+the MIL trace does not use it, and
 could not trace the real thing either, because **coremltools' torch frontend refuses a dynamic pad
 amount on a rank>2 tensor** — a documented runtime limitation of that converter, not a gap in this
 exporter. `vits_export.py` had routed around it the obvious way: pad by a *static* `_REL_EMB_MAX_PAD =

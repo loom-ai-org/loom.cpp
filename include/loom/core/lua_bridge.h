@@ -68,17 +68,16 @@ class OutputStore;
 //     262144-wide row overflows LuaJIT's array part). The token-by-token decode loop AROUND it is
 //     still Lua, in the driver, where every other family's orchestration is.
 //
-// The two bindings that look family-specific, labelled against the criterion (both were reviewed and
-// KEPT on 2026-08-01; see their declarations below for the per-binding argument):
+// The binding that looks family-specific, labelled against the criterion (reviewed and KEPT on
+// 2026-08-01; see its declaration below for the argument):
 //
 //   loom.expand_by_duration            -- PASSES. Repeat-rows-by-count. Reads no config; output length
 //                                         is sum(durations), known only at run time.
-//   loom.pad_crop_relative_embeddings  -- PASSES. Symmetric pad-or-crop of a relative-position table
-//                                         about its centre. Reads no config; the crop width follows the
-//                                         run-time sequence length.
 //
-// Both name a family in their comments because a family is where they were first needed, which is
-// provenance, not a dependency.
+// It names a family in its comments because a family is where it was first needed, which is
+// provenance, not a dependency. Its sibling `loom.pad_crop_relative_embeddings` passed the same review
+// and was RETIRED on 2026-10-11 for a different reason: nothing called it. The VITS export traces
+// piper's relative-position pad/crop into the graph, so the table never crosses into the driver.
 class LoomLuaBridge {
 public:
     explicit LoomLuaBridge(Backends backends);
@@ -341,12 +340,6 @@ private:
     // sequence being repeated never becomes a Lua table. MEETS the criterion for the same reasons the
     // marshalling form does -- it reads no config, and the output length is sum(durations).
     static int l_expand_by_duration_and_retain(lua_State* L);
-    // `loom.pad_crop_relative_embeddings(raw, window_size, k_channels, length)`: symmetrically pads or
-    // crops a relative-position table about its centre to cover `length`. MEETS the binding criterion
-    // above for the same two reasons -- every parameter is a call argument, and whether this pads or
-    // crops (and by how much) follows the run-time sequence length, which a static topology cannot
-    // express. First needed by VITS's relative-attention layers; nothing in it is VITS-specific.
-    static int l_pad_crop_relative_embeddings(lua_State* L);
     static int l_get_weight(lua_State* L);
     // `loom.seed_kv(module, source [, n_rows])`: writes a saved attention state into the first n_rows
     // positions of `module`'s KV cache. MEETS the binding criterion: it reads no model config (the

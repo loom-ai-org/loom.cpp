@@ -41,7 +41,6 @@
 //     these two beyond the graph/cache pair above; both are generic tensor ops with a data-dependent
 //     output length, which is the criterion lua_bridge.h records for any binding. ---
 #include "loom/core/duration_aligner.h"
-#include "loom/core/relative_position.h"
 
 // --- Task-level helpers a host uses around a driver, not inside one: tokenization on the way in,
 //     decoding on the way out. These are per-TASK, not per-model -- one CTC decoder covers every CTC
