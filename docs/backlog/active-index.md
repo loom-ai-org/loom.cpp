@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Queued before the XNNPACK benchmark (user, 2026-10-11): retiring `pad_crop_relative_embeddings`** | Below, under Minor cleanups. The gemma-3 "KV leak" that was queued with it was not one: the checkpoint declares sampling, and greedy is deterministic across runs ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
+| **Next (user, 2026-10-11): the XNNPACK benchmark** | Its two queued predecessors are done. The gemma-3 "KV leak" was not one: the checkpoint declares sampling, and greedy is deterministic ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). `pad_crop_relative_embeddings` and the Shaw primitives are retired (branch `chore/retire-pad-crop-relative-embeddings`, stacked on the perf branch). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -517,19 +517,16 @@ primitive set.
 
 ## Minor cleanups
 
-* [ ] **Retire `loom.pad_crop_relative_embeddings`, `src/core/relative_position.cpp` and probably
-  `REL_POS_ATTENTION_SHAW`: nothing that ships calls them.** The question was whether VITS/Supertonic's
-  Shaw relative-position table could move into the graph the way T5's encoder bias did (ADR-074). It
-  already has: `loom-exporter/vits_export.py` traces piper's `_get_relative_embeddings` with the pad
-  built from `CONCAT`. Scanned 2026-10-11, the published VITS and Supertonic GGUFs and the v5 fixtures
-  (whole files), plus the first 4 MB (the metadata) of every other published and fixture GGUF: no
-  driver calls the binding and no topology names the primitive. Their callers were the per-model C++
-  drivers [the lean-runtime rule](../adrs/adr-003-per-model-complexity-in-the-exporter.md) retired.
-  What still compiles against them: `tests/gate/test_e2e_vits_{stats,logw}_reference.cpp`, which carry
-  their own copy of the port and SKIP on the v5 fixtures. Work: confirm what those two tests need, then
-  delete the binding, the file, the primitive if it has no topology user, and the tests or their dead
-  half. *Context: [Epic-01](../epics/epic-01-inference-engine-core.md)*
-
+* [ ] **`REL_SHIFT` / `REL_POS_ATTENTION` are unused too, and so is a tail of legacy-converter gate
+  tests.** Found while retiring the Shaw family and `pad_crop_relative_embeddings` (2026-10-11):
+  - **The ops:** a GGUF-reader pass over all 118 published and v5-fixture GGUFs (503 topologies, plus
+    a raw search of their 20.4 MB of topology JSON) found no use of either op. The NeMo conformers trace
+    their relative positions into ordinary ops. Both still have CI tests in `test_primitive_registry`.
+  - **The gate tests:** `test_e2e_vits_smoke` and `test_e2e_vits_flow_vocoder_reference` need the
+    deleted `tools/convert_piper_vits` output and always skip. Many kokoro/supertonic/matcha/styletts2
+    gate tests also skip on v5, but whether each one's fixture is producible was NOT checked.
+  - **Work:** confirm each skip, then retire what no tree can feed. Lean-runtime cleanup, not urgent.
+  *Context: [Epic-01 §4](../epics/epic-01-inference-engine-core.md#4-standing-scope-limitations)*
 * [ ] `KvCache::write_k/write_v/read_k/read_v` use `std::vector::at()`, which throws `std::out_of_range`
   rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr could in principle reach
   this uncaught-by-`catch (loom::Error&)` path — low risk today, since the index always comes from
