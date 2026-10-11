@@ -9,7 +9,12 @@
 //       scripts/bench_xnnpack.cpp -o bench_xnnpack \
 //       $XB/libXNNPACK.a $XB/libxnnpack-microkernels-prod.a $XB/pthreadpool/libpthreadpool.a \
 //       $XB/cpuinfo/libcpuinfo.a -L $B/_deps/ggml-build/src -lggml -lggml-base -lpthread -lm
-//   ./bench_xnnpack <threads> [reps] [heads]
+//   On arm64 also link $XB/kleidiai/libkleidiai.a (XNNPACK enables KleidiAI there), add -lggml-cpu,
+//   and on macOS a -Wl,-rpath to the ggml libs. ARMv6 (Pi Zero): XNNPACK cross-compiles with clang
+//   (--target=armv6-linux-gnueabihf -march=armv6kz -marm -mfpu=vfp -mfloat-abi=hard, a Raspbian
+//   sysroot); link with the board's gcc. Its prod microkernels build; `microkernels-all` crashes clang 14.
+//   ./bench_xnnpack <threads> [reps] [heads] [f32|f16|q8]
+//   f16 / q8 run the low-precision mode (run_lowp, below).
 //   heads (default 12) scales QK^T and softmax for a small-RAM board: softmax alone holds ~540 MB at 12.
 //   The weights rescale by 12/heads, so the whisper total is still one encoder.
 //
@@ -47,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -89,17 +95,411 @@ struct GgmlRun {
 
 struct Row { std::string name; double flop, weight, g_ms, x_ms, layout_ms, rel; };
 
+// ------------------------------------------------------------------------------------------------
+// LOW-PRECISION MODE (`f16` or `q8` as the fourth argument): the same GEMM and conv shapes, each
+// engine in the precision a loom export of that dtype would actually run. `QK^T` and softmax are
+// left out -- they read activations, which stay F32 in loom whatever the weights are.
+//
+//   f16:  ggml, F16 weights x F32 activations (mul_mat / ggml_conv_2d_direct with an F16 kernel --
+//         what an F16 GGUF runs) against XNNPACK's NATIVE F16 operators (F16 in, F16 out; inputs
+//         converted outside the timing, as an all-F16 graph would hold them). XNNPACK declines
+//         those without FP16 hardware (the A72, ARMv6), and the row says n/a. Its `f32_f16`
+//         variant is not timed: it widens the weights to F32 at create time, so it IS the F32 arm.
+//   q8:   ggml Q8_0 (block-32 int8 weights; mul_mat quantizes the activation rows to Q8_0 itself
+//         and runs int8 dot products, while a CONV dequantizes its kernel to F32 every call and
+//         runs the F32 sweep -- ggml-0013, which is what a Q8_0 loom export does) against two
+//         XNNPACK arms (plus `ggml rpk`, ggml's own CPU_REPACK int8 GEMM -- see cpu_repack_buft):
+//           qd8   dynamic: per-channel int8 weights, activations quantized on the fly (per row for
+//                 a GEMM, per image for a conv), F32 out. The convert op is INSIDE the timing --
+//                 the drop-in counterpart of a Q8_0 GGUF.
+//           qs8   static: int8 in, int8 out, scales fixed ahead of time (here from the reference
+//                 output's range). What a LiteRT full-int8 model runs; it needs a calibrated
+//                 model, not just quantized weights, so it is a ceiling, not a drop-in.
+//
+// Every arm's error is reported against XNNPACK's F32 operator on the same inputs (the reference the
+// F32 mode showed agreeing with ggml to ~2e-6), as max |y - ref| / max |ref|.
+static void quant_per_channel(const std::vector<float>& w, int64_t rows, int64_t cols,
+                              std::vector<int8_t>& q, std::vector<float>& scale) {
+    q.resize(rows * cols); scale.resize(rows);
+    for (int64_t r = 0; r < rows; ++r) {
+        float amax = 0;
+        for (int64_t c = 0; c < cols; ++c) amax = std::max(amax, std::fabs(w[r * cols + c]));
+        const float s = amax > 0 ? amax / 127.0f : 1.0f;
+        scale[r] = s;
+        for (int64_t c = 0; c < cols; ++c)
+            q[r * cols + c] = (int8_t)std::lround(std::clamp(w[r * cols + c] / s, -127.0f, 127.0f));
+    }
+}
+static float amax_of(const std::vector<float>& v) {
+    float a = 0; for (float x : v) a = std::max(a, std::fabs(x)); return a > 0 ? a : 1.0f;
+}
+static void quant_tensor(const std::vector<float>& x, float s, std::vector<int8_t>& q) {
+    q.resize(x.size());
+    for (size_t i = 0; i < x.size(); ++i) q[i] = (int8_t)std::lround(std::clamp(x[i] / s, -128.0f, 127.0f));
+}
+static std::vector<float> f16_to_f32(const std::vector<uint16_t>& h) {
+    std::vector<float> f(h.size());
+    ggml_fp16_to_fp32_row((const ggml_fp16_t*)h.data(), f.data(), (int64_t)h.size());
+    return f;
+}
+static std::vector<uint16_t> f32_to_f16(const std::vector<float>& f) {
+    std::vector<uint16_t> h(f.size());
+    ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t*)h.data(), (int64_t)f.size());
+    return h;
+}
+
+// ggml's own int8 GEMM for Q8_0: the CPU backend's "CPU_REPACK" extra buffer type re-lays a Q8_0
+// weight as 4x4 / 4x8 interleaved blocks at upload, for NEON with dotprod or i8mm only (repack.cpp's
+// ggml_repack_get_optimal_repack_type). loom's engine never places weights there, so this arm is what
+// ggml ALREADY has that loom does not use. Elsewhere (x86, the A72, ARMv6) it declines and reads n/a.
+static ggml_backend_buffer_type_t cpu_repack_buft(ggml_backend_t be) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(be);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto fn = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (!fn) return nullptr;
+    for (ggml_backend_buffer_type_t* p = fn(dev); p && *p; ++p)
+        if (std::string(ggml_backend_buft_name(*p)) == "CPU_REPACK") return *p;
+    return nullptr;
+}
+
+struct Arm {
+    std::string name;
+    std::function<void()> run;              // empty: this hardware declines the operator
+    std::function<std::vector<float>()> out;  // result in the REFERENCE layout
+};
+struct LowRow { std::string name; double flop, weight; std::vector<double> ms, err; double layout_ms; };
+
+static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t pool, int reps) {
+    const bool q8 = mode == "q8";
+    const ggml_type wt = q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    std::vector<std::string> names = q8 ? std::vector<std::string>{"ggml q8_0", "ggml rpk", "xnn qd8", "xnn qs8"}
+                                        : std::vector<std::string>{"ggml f16", "xnn f16"};
+    std::vector<LowRow> rows;
+    ggml_backend_buffer_type_t repack = q8 ? cpu_repack_buft(be) : nullptr;
+
+    auto race = [&](std::vector<Arm>& arms) {
+        for (int w = 0; w < 2; ++w) for (Arm& a : arms) if (a.run) a.run();
+        std::vector<std::vector<double>> t(arms.size());
+        for (int r = 0; r < reps; ++r)
+            for (size_t i = 0; i < arms.size(); ++i) {
+                if (!arms[i].run) continue;
+                const double t0 = now(); arms[i].run(); t[i].push_back(now() - t0);
+            }
+        std::vector<double> ms;
+        for (auto& v : t) ms.push_back(v.empty() ? NAN : median(v));
+        return ms;
+    };
+    auto weights_for = [&](ggml_tensor* t, const std::vector<float>& w) {   // w is t's F32 content
+        if (wt == GGML_TYPE_F16) { auto h = f32_to_f16(w); ggml_backend_tensor_set(t, h.data(), 0, h.size() * 2); return; }
+        const int64_t rowlen = t->ne[0], nrows = (int64_t)w.size() / rowlen;
+        std::vector<char> q(ggml_row_size(wt, rowlen) * nrows);
+        ggml_quantize_chunk(wt, w.data(), q.data(), 0, nrows, rowlen, nullptr);
+        ggml_backend_tensor_set(t, q.data(), 0, q.size());
+    };
+
+    auto alloc = [&](GgmlRun& g, auto build) {
+        ggml_init_params ip = {256u * 1024 * 1024, nullptr, true};
+        g.ctx = ggml_init(ip);
+        g.gf = ggml_new_graph_custom(g.ctx, 64, false);
+        g.out = build(g.ctx);
+        ggml_build_forward_expand(g.gf, g.out);
+        g.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        if (!ggml_gallocr_alloc_graph(g.ga, g.gf)) { std::fprintf(stderr, "ggml alloc failed\n"); std::exit(1); }
+    };
+
+    // ---------------------------------------------------------------- GEMMs (same list as F32 mode)
+    struct G { const char* tag; int64_t K, M, N; double w; };
+    const G gemms[] = {
+        {"vits", 224, 73472, 32, 1}, {"vits", 160, 73472, 32, 1}, {"vits", 96, 73472, 32, 1},
+        {"vits", 448, 18368, 64, 1}, {"vits", 320, 18368, 64, 1}, {"vits", 192, 18368, 64, 1},
+        {"vits", 896, 2296, 128, 1}, {"vits", 640, 2296, 128, 1}, {"vits", 384, 2296, 128, 1},
+        {"vits", 960, 288, 384, 1}, {"vits", 1344, 288, 256, 1},
+        {"whisper qkv", 768, 1500, 768, 36}, {"whisper fc1", 768, 1500, 3072, 12},
+        {"whisper fc2", 3072, 1500, 768, 12},
+    };
+    for (const G& s : gemms) {
+        std::vector<float> A(s.M * s.K), W(s.N * s.K), R(s.M * s.N);
+        fill(A, 97, 0.5f); fill(W, 53, 0.3f);
+        {   // F32 reference
+            xnn_operator_t op = nullptr;
+            check(xnn_create_fully_connected_nc_f32(s.K, s.N, s.K, s.N, W.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &op), "create fc ref");
+            check(xnn_reshape_fully_connected_nc_f32(op, s.M, pool), "reshape fc ref");
+            check(xnn_setup_fully_connected_nc_f32(op, A.data(), R.data()), "setup fc ref");
+            check(xnn_run_operator(op, pool), "run fc ref");
+            xnn_delete_operator(op);
+        }
+        GgmlRun g;
+        ggml_tensor *ta = nullptr, *tb = nullptr;
+        alloc(g, [&](ggml_context* c) {
+            ta = ggml_new_tensor_2d(c, wt, s.K, s.N); ggml_set_input(ta); ggml_set_output(ta);
+            tb = ggml_new_tensor_2d(c, GGML_TYPE_F32, s.K, s.M); ggml_set_input(tb); ggml_set_output(tb);
+            return ggml_mul_mat(c, ta, tb);
+        });
+        weights_for(ta, W);
+        ggml_backend_tensor_set(tb, A.data(), 0, A.size() * 4);
+        std::vector<Arm> arms;
+        arms.push_back({names[0], [&] { ggml_backend_graph_compute(be, g.gf); },
+                        [&] { std::vector<float> c(s.M * s.N); ggml_backend_tensor_get(g.out, c.data(), 0, c.size() * 4); return c; }});
+        // The same Q8_0 weight, uploaded through CPU_REPACK (which repacks it in set_tensor).
+        GgmlRun g2;
+        ggml_context* wctx = nullptr;
+        ggml_backend_buffer_t wbuf = nullptr;
+        if (q8) {
+            bool repacked = false;
+            if (repack) {
+                ggml_init_params wp = {ggml_tensor_overhead() * 4, nullptr, true};
+                wctx = ggml_init(wp);
+                ggml_tensor* tw = ggml_new_tensor_2d(wctx, wt, s.K, s.N);
+                wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, repack);
+                // init_tensor stores the chosen repack in `extra`, and set_tensor dereferences it
+                // unchecked -- so a tensor no repack applies to must not be uploaded at all.
+                repacked = wbuf && tw->extra != nullptr;
+                if (repacked) weights_for(tw, W);
+                if (repacked) {
+                    ggml_tensor* tb2 = nullptr;
+                    alloc(g2, [&](ggml_context* c) {
+                        tb2 = ggml_new_tensor_2d(c, GGML_TYPE_F32, s.K, s.M); ggml_set_input(tb2); ggml_set_output(tb2);
+                        return ggml_mul_mat(c, tw, tb2);
+                    });
+                    ggml_backend_tensor_set(tb2, A.data(), 0, A.size() * 4);
+                }
+            }
+            if (repacked)
+                arms.push_back({names[1], [&] { ggml_backend_graph_compute(be, g2.gf); },
+                                [&] { std::vector<float> c(s.M * s.N); ggml_backend_tensor_get(g2.out, c.data(), 0, c.size() * 4); return c; }});
+            else
+                arms.push_back({names[1], {}, {}});
+        }
+        std::vector<xnn_operator_t> ops;
+        // Buffers shared by the XNNPACK arms (kept alive for the lambdas).
+        std::vector<uint16_t> A16, W16, C16(s.M * s.N);
+        std::vector<int8_t> Wq, Aq(s.M * s.K + 64), Aq_s, Cq(s.M * s.N);
+        std::vector<float> Ws, C(s.M * s.N), rowsum(s.M + XNN_EXTRA_QUANTIZATION_PARAMS);
+        std::vector<int32_t> bias32(s.N, 0);
+        std::vector<xnn_quantization_params> qp(s.M + XNN_EXTRA_QUANTIZATION_PARAMS);
+        float sx = 1, sy = 1;
+        std::unique_ptr<Workspace> work;
+        if (!q8) {
+            A16 = f32_to_f16(A); W16 = f32_to_f16(W);
+            xnn_operator_t op = nullptr;
+            const xnn_status st = xnn_create_fully_connected_nc_f16(s.K, s.N, s.K, s.N, W16.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &op);
+            if (st == xnn_status_success) {
+                check(xnn_reshape_fully_connected_nc_f16(op, s.M, pool), "reshape fc f16");
+                check(xnn_setup_fully_connected_nc_f16(op, A16.data(), C16.data()), "setup fc f16");
+                ops.push_back(op);
+                arms.push_back({names[1], [&, op] { check(xnn_run_operator(op, pool), "run fc f16"); }, [&] { return f16_to_f32(C16); }});
+            } else {
+                arms.push_back({names[1], {}, {}});
+            }
+        } else {
+            quant_per_channel(W, s.N, s.K, Wq, Ws);
+            xnn_operator_t cv = nullptr, fc = nullptr;
+            check(xnn_create_convert_nc_f32_qd8(0, &cv), "create convert");
+            check(xnn_reshape_convert_nc_f32_qd8(cv, s.M, s.K, s.K, s.K, pool), "reshape convert");
+            check(xnn_setup_convert_nc_f32_qd8(cv, A.data(), Aq.data(), rowsum.data(), qp.data()), "setup convert");
+            check(xnn_create_fully_connected_nc_qd8_f32_qc8w(s.K, s.N, s.K, s.N, Ws.data(), Wq.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &fc), "create fc qd8");
+            size_t ws = 0;
+            check(xnn_reshape_fully_connected_nc_qd8_f32_qc8w(fc, s.M, &ws, pool), "reshape fc qd8");
+            work = std::make_unique<Workspace>(ws);
+            check(xnn_setup_fully_connected_nc_qd8_f32_qc8w(fc, Aq.data(), C.data(), work->p, qp.data()), "setup fc qd8");
+            ops.push_back(cv); ops.push_back(fc);
+            arms.push_back({names[2], [&, cv, fc] { check(xnn_run_operator(cv, pool), "run convert"); check(xnn_run_operator(fc, pool), "run fc qd8"); },
+                            [&] { return C; }});
+            sx = amax_of(A) / 127.0f; sy = amax_of(R) / 127.0f;
+            quant_tensor(A, sx, Aq_s);
+            xnn_operator_t fs = nullptr;
+            check(xnn_create_fully_connected_nc_qs8_qc8w(s.K, s.N, s.K, s.N, 0, sx, Ws.data(), Wq.data(), bias32.data(), 0, sy, -128, 127, 0, nullptr, &fs), "create fc qs8");
+            check(xnn_reshape_fully_connected_nc_qs8_qc8w(fs, s.M, pool), "reshape fc qs8");
+            check(xnn_setup_fully_connected_nc_qs8_qc8w(fs, Aq_s.data(), Cq.data()), "setup fc qs8");
+            ops.push_back(fs);
+            arms.push_back({names[3], [&, fs] { check(xnn_run_operator(fs, pool), "run fc qs8"); },
+                            [&] { std::vector<float> c(Cq.size()); for (size_t i = 0; i < c.size(); ++i) c[i] = sy * Cq[i]; return c; }});
+        }
+        std::vector<double> ms = race(arms), err;
+        for (Arm& a : arms) err.push_back(a.run ? max_rel(a.out(), R) : NAN);
+        char nm[96]; std::snprintf(nm, sizeof nm, "gemm %s %lldx%lldx%lld", s.tag, (long long)s.K, (long long)s.M, (long long)s.N);
+        rows.push_back({nm, 2.0 * s.K * s.M * s.N, s.w, ms, err, 0});
+        for (xnn_operator_t op : ops) xnn_delete_operator(op);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        if (wctx) ggml_free(wctx);
+    }
+
+    // ---------------------------------------------------------------- VITS conv1d (same list)
+    struct Cv { int64_t IC, OC, kw, L; int calls; int64_t dil; };
+    const Cv convs[] = {
+        { 32,  32, 7, 73472, 1, 3}, { 32,  32, 7, 73472, 1,12}, { 32,  32, 5, 73472, 1, 2},
+        { 32,  32, 5, 73472, 1, 6}, { 32,  32, 3, 73472, 1, 1}, { 32,  32, 3, 73472, 1, 2},
+        { 64,  64, 7, 18368, 1, 3}, { 64,  64, 7, 18368, 1,12}, { 64,  64, 5, 18368, 1, 2},
+        { 64,  64, 5, 18368, 1, 6}, { 64,  64, 3, 18368, 1, 1}, { 64,  64, 3, 18368, 1, 2},
+        {128, 128, 7,  2296, 1, 3}, {128, 128, 7,  2296, 1,12}, {128, 128, 5,  2296, 1, 2},
+        {128, 128, 5,  2296, 1, 6}, {128, 128, 3,  2296, 1, 1}, {128, 128, 3,  2296, 1, 2},
+        {192, 384, 5,   287,16, 1}, {768, 768, 3,   100,12, 1},
+    };
+    for (const Cv& c : convs) {
+        const int64_t pad = c.dil * (c.kw - 1) / 2;
+        std::vector<float> xg(c.L * c.IC), kg(c.kw * c.IC * c.OC);
+        fill(xg, 101, 0.6f); fill(kg, 59, 0.2f);
+        std::vector<float> xx(c.L * c.IC), kx(c.OC * c.kw * c.IC), R(c.L * c.OC);
+        for (int64_t i = 0; i < c.IC; ++i) for (int64_t t = 0; t < c.L; ++t) xx[t * c.IC + i] = xg[i * c.L + t];
+        for (int64_t o = 0; o < c.OC; ++o) for (int64_t i = 0; i < c.IC; ++i) for (int64_t k = 0; k < c.kw; ++k)
+            kx[(o * c.kw + k) * c.IC + i] = kg[(o * c.IC + i) * c.kw + k];
+        auto make_conv = [&](auto create) {   // shared geometry for every XNNPACK conv arm
+            xnn_operator_t op = nullptr;
+            check(create((uint32_t)pad, (uint32_t)c.kw, (uint32_t)c.dil, &op), "create conv");
+            return op;
+        };
+        {   // F32 reference
+            xnn_operator_t op = make_conv([&](uint32_t p, uint32_t kw, uint32_t d, xnn_operator_t* o) {
+                return xnn_create_convolution2d_nhwc_f32(0, p, 0, p, 1, kw, 1, 1, 1, d, 1, c.IC, c.OC, c.IC, c.OC, kx.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, o); });
+            size_t ws = 0, oh = 0, ow = 0;
+            check(xnn_reshape_convolution2d_nhwc_f32(op, 1, 1, c.L, &ws, &oh, &ow, pool), "reshape conv ref");
+            Workspace w(ws);
+            check(xnn_setup_convolution2d_nhwc_f32(op, w.p, xx.data(), R.data()), "setup conv ref");
+            check(xnn_run_operator(op, pool), "run conv ref");
+            xnn_delete_operator(op);
+        }
+        GgmlRun g;
+        ggml_tensor *tk = nullptr, *tx = nullptr;
+        alloc(g, [&](ggml_context* ctx) {
+            tx = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.L, 1, c.IC, 1); ggml_set_input(tx); ggml_set_output(tx);
+            if (!q8) {
+                tk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.kw, 1, c.IC, c.OC); ggml_set_input(tk); ggml_set_output(tk);
+                return ggml_conv_2d_direct(ctx, tk, tx, 1, 1, (int)pad, 0, (int)c.dil, 1);
+            }
+            // The folded [IC*KW, OC] kernel a Q8_0 export carries: a pure reinterpretation of the
+            // [KW, 1, IC, OC] order (ggml-0013), so quantizing kg in rows of IC*KW IS that kernel.
+            tk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, c.IC * c.kw, c.OC); ggml_set_input(tk); ggml_set_output(tk);
+            return ggml_conv_2d_direct_packed(ctx, tk, tx, 1, 1, (int)pad, 0, (int)c.dil, 1, (int)c.kw, 1, (int)c.IC);
+        });
+        weights_for(tk, kg);
+        ggml_backend_tensor_set(tx, xg.data(), 0, xg.size() * 4);
+        std::vector<Arm> arms;
+        arms.push_back({names[0], [&] { ggml_backend_graph_compute(be, g.gf); }, [&] {
+            std::vector<float> yg(c.L * c.OC), y(c.L * c.OC);
+            ggml_backend_tensor_get(g.out, yg.data(), 0, yg.size() * 4);
+            for (int64_t o = 0; o < c.OC; ++o) for (int64_t t = 0; t < c.L; ++t) y[t * c.OC + o] = yg[o * c.L + t];
+            return y; }});
+        if (q8) arms.push_back({names[1], {}, {}});   // a repacked kernel cannot feed ggml-0013's dequantize
+        std::vector<xnn_operator_t> ops;
+        std::vector<std::unique_ptr<Workspace>> works;
+        std::vector<uint16_t> x16, k16, y16(c.L * c.OC);
+        std::vector<int8_t> kq, xq(c.L * c.IC + 64), xq_s, yq(c.L * c.OC);
+        std::vector<float> ks, y(c.L * c.OC), rowsum(1 + XNN_EXTRA_QUANTIZATION_PARAMS);
+        std::vector<int32_t> bias32(c.OC, 0);
+        std::vector<xnn_quantization_params> qp(1 + XNN_EXTRA_QUANTIZATION_PARAMS);
+        float sx = 1, sy = 1;
+        size_t ws = 0, oh = 0, ow = 0;
+        if (!q8) {
+            x16 = f32_to_f16(xx); k16 = f32_to_f16(kx);
+            xnn_operator_t op = nullptr;
+            const xnn_status st = xnn_create_convolution2d_nhwc_f16(0, (uint32_t)pad, 0, (uint32_t)pad, 1, (uint32_t)c.kw, 1, 1, 1, (uint32_t)c.dil, 1,
+                                                                    c.IC, c.OC, c.IC, c.OC, k16.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &op);
+            if (st == xnn_status_success) {
+                check(xnn_reshape_convolution2d_nhwc_f16(op, 1, 1, c.L, &ws, &oh, &ow, pool), "reshape conv f16");
+                works.push_back(std::make_unique<Workspace>(ws));
+                check(xnn_setup_convolution2d_nhwc_f16(op, works.back()->p, x16.data(), y16.data()), "setup conv f16");
+                ops.push_back(op);
+                arms.push_back({names[1], [&, op] { check(xnn_run_operator(op, pool), "run conv f16"); }, [&] { return f16_to_f32(y16); }});
+            } else {
+                arms.push_back({names[1], {}, {}});
+            }
+        } else {
+            quant_per_channel(kx, c.OC, c.kw * c.IC, kq, ks);
+            xnn_operator_t cv = nullptr;
+            check(xnn_create_convert_nc_f32_qd8(0, &cv), "create convert");
+            // One quantization scale per IMAGE: XNNPACK's dynamic-quant igemm indexes its params by batch.
+            check(xnn_reshape_convert_nc_f32_qd8(cv, 1, c.L * c.IC, c.L * c.IC, c.L * c.IC, pool), "reshape convert");
+            check(xnn_setup_convert_nc_f32_qd8(cv, xx.data(), xq.data(), rowsum.data(), qp.data()), "setup convert");
+            xnn_operator_t op = make_conv([&](uint32_t p, uint32_t kw, uint32_t d, xnn_operator_t* o) {
+                return xnn_create_convolution2d_nhwc_qd8_f32_qc8w(0, p, 0, p, 1, kw, 1, 1, 1, d, 1, c.IC, c.OC, c.IC, c.OC, ks.data(), kq.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, o); });
+            check(xnn_reshape_convolution2d_nhwc_qd8_f32_qc8w(op, 1, 1, c.L, &ws, &oh, &ow, pool), "reshape conv qd8");
+            works.push_back(std::make_unique<Workspace>(ws));
+            check(xnn_setup_convolution2d_nhwc_qd8_f32_qc8w(op, works.back()->p, xq.data(), y.data(), qp.data()), "setup conv qd8");
+            ops.push_back(cv); ops.push_back(op);
+            arms.push_back({names[2], [&, cv, op] { check(xnn_run_operator(cv, pool), "run convert"); check(xnn_run_operator(op, pool), "run conv qd8"); },
+                            [&] { return y; }});
+            sx = amax_of(xx) / 127.0f; sy = amax_of(R) / 127.0f;
+            quant_tensor(xx, sx, xq_s);
+            xnn_operator_t os = make_conv([&](uint32_t p, uint32_t kw, uint32_t d, xnn_operator_t* o) {
+                return xnn_create_convolution2d_nhwc_qs8_qc8w(0, p, 0, p, 1, kw, 1, 1, 1, d, 1, c.IC, c.OC, c.IC, c.OC, 0, sx, ks.data(), kq.data(), bias32.data(), 0, sy, -128, 127, 0, nullptr, o); });
+            check(xnn_reshape_convolution2d_nhwc_qs8_qc8w(os, 1, 1, c.L, &ws, &oh, &ow, pool), "reshape conv qs8");
+            works.push_back(std::make_unique<Workspace>(ws));
+            check(xnn_setup_convolution2d_nhwc_qs8_qc8w(os, works.back()->p, xq_s.data(), yq.data()), "setup conv qs8");
+            ops.push_back(os);
+            arms.push_back({names[3], [&, os] { check(xnn_run_operator(os, pool), "run conv qs8"); },
+                            [&] { std::vector<float> o(yq.size()); for (size_t i = 0; i < o.size(); ++i) o[i] = sy * yq[i]; return o; }});
+        }
+        std::vector<double> ms = race(arms), err;
+        for (Arm& a : arms) err.push_back(a.run ? max_rel(a.out(), R) : NAN);
+        // Same naive transpose tax as the F32 mode: an upper bound, F32-sized even for the int8 arms.
+        std::vector<double> tl;
+        std::vector<float> ygt(c.L * c.OC);
+        for (int r = 0; r < reps; ++r) {
+            double t0 = now();
+            for (int64_t i = 0; i < c.IC; ++i) for (int64_t t = 0; t < c.L; ++t) xx[t * c.IC + i] = xg[i * c.L + t];
+            for (int64_t t = 0; t < c.L; ++t) for (int64_t o = 0; o < c.OC; ++o) ygt[o * c.L + t] = R[t * c.OC + o];
+            tl.push_back(now() - t0);
+        }
+        char nm[96]; std::snprintf(nm, sizeof nm, "conv %lldx%lld k%lld d%lld L%lld", (long long)c.IC,
+                                   (long long)c.OC, (long long)c.kw, (long long)c.dil, (long long)c.L);
+        rows.push_back({nm, 2.0 * c.IC * c.OC * c.kw * c.L, (double)c.calls, ms, err, median(tl)});
+        for (xnn_operator_t op : ops) xnn_delete_operator(op);
+    }
+
+    // ---------------------------------------------------------------- report
+    const size_t na = names.size();
+    std::printf("\n%-34s", "shape");
+    for (auto& n : names) std::printf(" %10s", (n + " ms").c_str());
+    for (size_t i = 1; i < na; ++i) std::printf(" %9s", ("/" + names[i].substr(names[i].find(' ') + 1)).c_str());
+    for (size_t i = 0; i < na; ++i) std::printf(" %9s", ("err " + (i ? names[i].substr(names[i].find(' ') + 1) : std::string("ggml"))).c_str());
+    std::printf("\n");
+    std::vector<std::vector<double>> sum(3, std::vector<double>(na, 0));
+    double sum_l = 0;
+    for (const LowRow& r : rows) {
+        std::printf("%-34s", r.name.c_str());
+        for (double m : r.ms) if (std::isnan(m)) std::printf(" %10s", "n/a"); else std::printf(" %10.3f", m * 1e3);
+        for (size_t i = 1; i < na; ++i) if (std::isnan(r.ms[i])) std::printf(" %9s", "n/a"); else std::printf(" %9.3f", r.ms[0] / r.ms[i]);
+        for (double e : r.err) if (std::isnan(e)) std::printf(" %9s", "n/a"); else std::printf(" %9.1e", e);
+        std::printf("\n");
+        const int grp = r.name.rfind("conv", 0) == 0 ? 2 : r.name.find("whisper") != std::string::npos ? 1 : 0;
+        for (size_t i = 0; i < na; ++i) sum[grp][i] += r.weight * r.ms[i];
+        if (grp == 2) sum_l += r.weight * r.layout_ms;
+    }
+    const char* grp_name[3] = {"VITS GEMMs (one synthesis)", "whisper linears (weighted)", "VITS convs (weighted)"};
+    std::printf("\n");
+    for (int g = 0; g < 3; ++g) {
+        std::printf("%-28s %s %8.1f ms", grp_name[g], names[0].c_str(), sum[g][0] * 1e3);
+        for (size_t i = 1; i < na; ++i)
+            if (std::isnan(sum[g][i])) std::printf("  %s n/a", names[i].c_str());
+            else std::printf("  %s %8.1f ms (ggml/xnn %.3f)", names[i].c_str(), sum[g][i] * 1e3, sum[g][0] / sum[g][i]);
+        std::printf("\n");
+    }
+    std::printf("VITS convs incl. layout tax  ");
+    for (size_t i = 1; i < na; ++i)
+        if (!std::isnan(sum[2][i])) std::printf("  %s ggml/(xnn+layout) %.3f", names[i].c_str(), sum[2][0] / (sum[2][i] + sum_l));
+    std::printf("\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const int nth = argc > 1 ? std::atoi(argv[1]) : 2;
     const int reps = argc > 2 ? std::atoi(argv[2]) : 7;
     const int64_t heads = argc > 3 ? std::atoll(argv[3]) : 12;
+    const std::string mode = argc > 4 ? argv[4] : "f32";
+    if (mode != "f32" && mode != "f16" && mode != "q8") { std::fprintf(stderr, "mode must be f32, f16 or q8\n"); return 1; }
 
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, nth);
     check(xnn_initialize(nullptr), "xnn_initialize");
     pthreadpool_t pool = pthreadpool_create(nth);
-    std::printf("threads=%d reps=%d heads=%lld  ggml llamafile=%d\n", nth, reps, (long long)heads,
-                ggml_cpu_has_llamafile());
+    std::printf("threads=%d reps=%d heads=%lld mode=%s  ggml llamafile=%d\n", nth, reps, (long long)heads,
+                mode.c_str(), ggml_cpu_has_llamafile());
+    if (mode != "f32") {
+        const int rc = run_lowp(mode, be, pool, reps);
+        pthreadpool_destroy(pool);
+        ggml_backend_free(be);
+        return rc;
+    }
 
     auto alloc_graph = [&](GgmlRun& g, auto build) {
         ggml_init_params ip = {256u * 1024 * 1024, nullptr, true};
