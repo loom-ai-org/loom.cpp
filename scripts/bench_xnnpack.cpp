@@ -13,8 +13,8 @@
 //   and on macOS a -Wl,-rpath to the ggml libs. ARMv6 (Pi Zero): XNNPACK cross-compiles with clang
 //   (--target=armv6-linux-gnueabihf -march=armv6kz -marm -mfpu=vfp -mfloat-abi=hard, a Raspbian
 //   sysroot); link with the board's gcc. Its prod microkernels build; `microkernels-all` crashes clang 14.
-//   ./bench_xnnpack <threads> [reps] [heads] [f32|f16|q8]
-//   f16 / q8 run the low-precision mode (run_lowp, below).
+//   ./bench_xnnpack <threads> [reps] [heads] [f32|f16|q8|q4]
+//   f16 / q8 / q4 run the low-precision mode (run_lowp, below).
 //   heads (default 12) scales QK^T and softmax for a small-RAM board: softmax alone holds ~540 MB at 12.
 //   The weights rescale by 12/heads, so the whisper total is still one encoder.
 //
@@ -51,8 +51,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -65,6 +68,15 @@ static double median(std::vector<double> v) {
 }
 static void fill(std::vector<float>& v, int a, float s) {
     for (size_t i = 0; i < v.size(); ++i) v[i] = s * (float)((int)(i % (size_t)a) - a / 2) / (float)a;
+}
+// Gaussian weights for the q4 mode. On fill()'s ramp every 32-block spans nearly the same range as its
+// whole row, and both of its ends reach the 4-bit clamp, which ranked the 4-bit quantizers backwards:
+// per-channel qc4w came out 2-3x MORE accurate than block-32 Q4_0. On Gaussian weights the order is the
+// expected one (weight RMS: Q4_0 1.66e-2, qb4w's positive scale 1.77e-2 of the max).
+static void fill_normal(std::vector<float>& v, unsigned seed, float sigma) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, sigma);
+    for (float& x : v) x = nd(rng);
 }
 static void check(xnn_status st, const char* what) {
     if (st != xnn_status_success) { std::fprintf(stderr, "%s failed: %d\n", what, (int)st); std::exit(1); }
@@ -116,6 +128,20 @@ struct Row { std::string name; double flop, weight, g_ms, x_ms, layout_ms, rel; 
 //                 output's range). What a LiteRT full-int8 model runs; it needs a calibrated
 //                 model, not just quantized weights, so it is a ceiling, not a drop-in.
 //
+//   q4:   ggml Q4_0 (block-32 4-bit weights, one F16 scale per block; mul_mat runs Q4_0 x Q8_0, a
+//         conv dequantizes its folded kernel to F32 as for Q8_0) and `ggml rpk`, the same Q4_0 weight
+//         through CPU_REPACK -- which, unlike Q8_0, ggml repacks for AVX2 (8x8) as well as for NEON
+//         dotprod (4x4) / i8mm (4x8). Against four XNNPACK arms, every one dynamic or static as in q8:
+//           qb4w   qd8 x blockwise 4-bit, block 32: Q4_0's arithmetic, but NOT Q4_0's blocks --
+//                  qb4w requires a positive scale and Q4_0's is signed (quant_block32_4bit_bf16
+//                  says why that cannot be re-laid losslessly). So the weights differ slightly, and
+//                  its error column should sit NEAR ggml's; far from it is a layout bug.
+//           qc4w   qd8 x per-channel 4-bit (one scale per output row): coarser than block-32.
+//           qs8c4  static int8 activations x per-channel 4-bit (`qs8_qc4w`), the ceiling as qs8 is.
+//           qd8c8  the q8 mode's qd8 arm again (per-channel int8), so the 4-bit arms have their
+//                  8-bit reference in the same process.
+//         XNNPACK has no 4-bit CONVOLUTION operator at all, so on the conv rows only qd8c8 runs.
+//
 // Every arm's error is reported against XNNPACK's F32 operator on the same inputs (the reference the
 // F32 mode showed agreeing with ggml to ~2e-6), as max |y - ref| / max |ref|.
 static void quant_per_channel(const std::vector<float>& w, int64_t rows, int64_t cols,
@@ -147,11 +173,55 @@ static std::vector<uint16_t> f32_to_f16(const std::vector<float>& f) {
     ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t*)h.data(), (int64_t)f.size());
     return h;
 }
+// 4-bit weights the way XNNPACK reads them: row-major [rows, cols], element k in byte k/2, EVEN k in
+// the LOW nibble, stored unsigned with zero point 8.
+static void quant_per_channel_4bit(const std::vector<float>& w, int64_t rows, int64_t cols,
+                                   std::vector<uint8_t>& q, std::vector<float>& scale) {
+    q.assign(rows * cols / 2, 0); scale.resize(rows);
+    for (int64_t r = 0; r < rows; ++r) {
+        float amax = 0;
+        for (int64_t c = 0; c < cols; ++c) amax = std::max(amax, std::fabs(w[r * cols + c]));
+        const float s = amax > 0 ? amax / 7.0f : 1.0f;
+        scale[r] = s;
+        for (int64_t c = 0; c < cols; ++c) {
+            const int v = 8 + (int)std::lround(std::clamp(w[r * cols + c] / s, -7.0f, 7.0f));
+            q[(r * cols + c) / 2] |= (uint8_t)(c % 2 ? v << 4 : v);
+        }
+    }
+}
+// XNNPACK's qb4w cannot take ggml's Q4_0 blocks as they are. Q4_0's scale is SIGNED -- d = max/-8,
+// so the block's largest-magnitude element always lands on nibble 0 -- and qb4w refuses any scale that
+// is not positive (create returns invalid_parameter; fully-connected-nc.c's check_block_size). With
+// d < 0 the flip q -> 16 - q has no image for nibble 0, so about half the blocks would lose their
+// largest element. This quantizes the same F32 weights block-32 with a POSITIVE scale instead: the
+// largest element lands on -8 when it is negative (exactly Q4_0's grid) and on +7 when it is positive
+// (one level coarser than Q4_0 in that block). The scale is rounded to BF16 -- qb4w's scale type --
+// BEFORE the nibbles are chosen, so they are consistent with the scale XNNPACK will actually use.
+static void quant_block32_4bit_bf16(const std::vector<float>& w, int64_t rows, int64_t cols,
+                                    std::vector<uint8_t>& q, std::vector<uint16_t>& scale_bf16) {
+    const int64_t nb = cols / 32;
+    q.assign(rows * cols / 2, 0); scale_bf16.resize(rows * nb);
+    for (int64_t r = 0; r < rows; ++r) for (int64_t b = 0; b < nb; ++b) {
+        const float* x = w.data() + r * cols + b * 32;
+        float big = 0;
+        for (int j = 0; j < 32; ++j) if (std::fabs(x[j]) > std::fabs(big)) big = x[j];
+        float s = big < 0 ? -big / 8.0f : big > 0 ? big / 7.0f : 1.0f;
+        uint32_t u; std::memcpy(&u, &s, 4);
+        const uint16_t h = (uint16_t)((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+        scale_bf16[r * nb + b] = h;
+        u = (uint32_t)h << 16; std::memcpy(&s, &u, 4);
+        for (int j = 0; j < 32; ++j) {
+            const int v = 8 + (int)std::lround(std::clamp(x[j] / s, -8.0f, 7.0f));
+            const int64_t k = r * cols + b * 32 + j;
+            q[k / 2] |= (uint8_t)(k % 2 ? v << 4 : v);
+        }
+    }
+}
 
-// ggml's own int8 GEMM for Q8_0: the CPU backend's "CPU_REPACK" extra buffer type re-lays a Q8_0
-// weight as 4x4 / 4x8 interleaved blocks at upload, for NEON with dotprod or i8mm only (repack.cpp's
-// ggml_repack_get_optimal_repack_type). loom's engine never places weights there, so this arm is what
-// ggml ALREADY has that loom does not use. Elsewhere (x86, the A72, ARMv6) it declines and reads n/a.
+// ggml's own int8 GEMM for Q8_0 / Q4_0: the CPU backend's "CPU_REPACK" extra buffer type re-lays the
+// weight as interleaved blocks at upload (repack.cpp's ggml_repack_get_optimal_repack_type): Q8_0 for
+// NEON with dotprod or i8mm only, Q4_0 for those AND for AVX2. loom's engine never places weights
+// there, so this arm is what ggml ALREADY has that loom does not use. Where it declines, it reads n/a.
 static ggml_backend_buffer_type_t cpu_repack_buft(ggml_backend_t be) {
     ggml_backend_dev_t dev = ggml_backend_get_device(be);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -170,12 +240,14 @@ struct Arm {
 struct LowRow { std::string name; double flop, weight; std::vector<double> ms, err; double layout_ms; };
 
 static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t pool, int reps) {
-    const bool q8 = mode == "q8";
-    const ggml_type wt = q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
-    std::vector<std::string> names = q8 ? std::vector<std::string>{"ggml q8_0", "ggml rpk", "xnn qd8", "xnn qs8"}
-                                        : std::vector<std::string>{"ggml f16", "xnn f16"};
+    const bool q8 = mode == "q8", q4 = mode == "q4", quant = q8 || q4;
+    const ggml_type wt = q4 ? GGML_TYPE_Q4_0 : q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    std::vector<std::string> names =
+        q4 ? std::vector<std::string>{"ggml q4_0", "ggml rpk", "xnn qb4w", "xnn qc4w", "xnn qs8c4", "xnn qd8c8"}
+      : q8 ? std::vector<std::string>{"ggml q8_0", "ggml rpk", "xnn qd8", "xnn qs8"}
+           : std::vector<std::string>{"ggml f16", "xnn f16"};
     std::vector<LowRow> rows;
-    ggml_backend_buffer_type_t repack = q8 ? cpu_repack_buft(be) : nullptr;
+    ggml_backend_buffer_type_t repack = quant ? cpu_repack_buft(be) : nullptr;
 
     auto race = [&](std::vector<Arm>& arms) {
         for (int w = 0; w < 2; ++w) for (Arm& a : arms) if (a.run) a.run();
@@ -185,8 +257,16 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
                 if (!arms[i].run) continue;
                 const double t0 = now(); arms[i].run(); t[i].push_back(now() - t0);
             }
+        static const bool dump = std::getenv("BENCH_DUMP_REPS") != nullptr;   // every repetition, to stderr
         std::vector<double> ms;
-        for (auto& v : t) ms.push_back(v.empty() ? NAN : median(v));
+        for (size_t i = 0; i < t.size(); ++i) {
+            ms.push_back(t[i].empty() ? NAN : median(t[i]));
+            if (dump && !t[i].empty()) {
+                std::fprintf(stderr, "reps %s:", arms[i].name.c_str());
+                for (double x : t[i]) std::fprintf(stderr, " %.1f", x * 1e3);
+                std::fprintf(stderr, "\n");
+            }
+        }
         return ms;
     };
     auto weights_for = [&](ggml_tensor* t, const std::vector<float>& w) {   // w is t's F32 content
@@ -219,7 +299,8 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
     };
     for (const G& s : gemms) {
         std::vector<float> A(s.M * s.K), W(s.N * s.K), R(s.M * s.N);
-        fill(A, 97, 0.5f); fill(W, 53, 0.3f);
+        fill(A, 97, 0.5f);
+        if (q4) fill_normal(W, 53, 0.1f); else fill(W, 53, 0.3f);
         {   // F32 reference
             xnn_operator_t op = nullptr;
             check(xnn_create_fully_connected_nc_f32(s.K, s.N, s.K, s.N, W.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &op), "create fc ref");
@@ -240,11 +321,11 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
         std::vector<Arm> arms;
         arms.push_back({names[0], [&] { ggml_backend_graph_compute(be, g.gf); },
                         [&] { std::vector<float> c(s.M * s.N); ggml_backend_tensor_get(g.out, c.data(), 0, c.size() * 4); return c; }});
-        // The same Q8_0 weight, uploaded through CPU_REPACK (which repacks it in set_tensor).
+        // The same quantized weight, uploaded through CPU_REPACK (which repacks it in set_tensor).
         GgmlRun g2;
         ggml_context* wctx = nullptr;
         ggml_backend_buffer_t wbuf = nullptr;
-        if (q8) {
+        if (quant) {
             bool repacked = false;
             if (repack) {
                 ggml_init_params wp = {ggml_tensor_overhead() * 4, nullptr, true};
@@ -274,12 +355,16 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
         // Buffers shared by the XNNPACK arms (kept alive for the lambdas).
         std::vector<uint16_t> A16, W16, C16(s.M * s.N);
         std::vector<int8_t> Wq, Aq(s.M * s.K + 64), Aq_s, Cq(s.M * s.N);
-        std::vector<float> Ws, C(s.M * s.N), rowsum(s.M + XNN_EXTRA_QUANTIZATION_PARAMS);
+        std::vector<uint8_t> Wb4, Wc4;
+        std::vector<uint16_t> Wb4s;
+        std::vector<float> Ws, Wc4s, C(s.M * s.N), rowsum(s.M + XNN_EXTRA_QUANTIZATION_PARAMS);
+        std::deque<std::vector<float>> Cs;   // one output per q4 arm; a deque keeps their addresses
+        std::vector<std::unique_ptr<Workspace>> works;
         std::vector<int32_t> bias32(s.N, 0);
         std::vector<xnn_quantization_params> qp(s.M + XNN_EXTRA_QUANTIZATION_PARAMS);
         float sx = 1, sy = 1;
         std::unique_ptr<Workspace> work;
-        if (!q8) {
+        if (!quant) {
             A16 = f32_to_f16(A); W16 = f32_to_f16(W);
             xnn_operator_t op = nullptr;
             const xnn_status st = xnn_create_fully_connected_nc_f16(s.K, s.N, s.K, s.N, W16.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &op);
@@ -290,6 +375,50 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
                 arms.push_back({names[1], [&, op] { check(xnn_run_operator(op, pool), "run fc f16"); }, [&] { return f16_to_f32(C16); }});
             } else {
                 arms.push_back({names[1], {}, {}});
+            }
+        } else if (q4) {
+            // One activation convert, re-run INSIDE every qd8 arm's timing, as in q8.
+            xnn_operator_t cv = nullptr;
+            check(xnn_create_convert_nc_f32_qd8(0, &cv), "create convert");
+            check(xnn_reshape_convert_nc_f32_qd8(cv, s.M, s.K, s.K, s.K, pool), "reshape convert");
+            check(xnn_setup_convert_nc_f32_qd8(cv, A.data(), Aq.data(), rowsum.data(), qp.data()), "setup convert");
+            ops.push_back(cv);
+            auto dyn_arm = [&, cv](const std::string& nm, xnn_operator_t fc, auto reshape, auto setup) {
+                size_t ws = 0;
+                check(reshape(fc, s.M, &ws, pool), ("reshape " + nm).c_str());
+                works.push_back(std::make_unique<Workspace>(ws));
+                std::vector<float>* out = &Cs.emplace_back(s.M * s.N);
+                check(setup(fc, Aq.data(), out->data(), works.back()->p, qp.data()), ("setup " + nm).c_str());
+                ops.push_back(fc);
+                arms.push_back({nm, [&, cv, fc] { check(xnn_run_operator(cv, pool), "run convert"); check(xnn_run_operator(fc, pool), "run fc"); },
+                                [out] { return *out; }});
+            };
+            {   // qb4w: block-32 like Q4_0, but with the positive scale it requires (see its quantizer)
+                quant_block32_4bit_bf16(W, s.N, s.K, Wb4, Wb4s);
+                xnn_operator_t fc = nullptr;
+                check(xnn_create_fully_connected_nc_qd8_f32_qb4w(s.K, s.N, s.K, s.N, 32, 8, Wb4s.data(), Wb4.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &fc), "create fc qb4w");
+                dyn_arm(names[2], fc, xnn_reshape_fully_connected_nc_qd8_f32_qb4w, xnn_setup_fully_connected_nc_qd8_f32_qb4w);
+            }
+            quant_per_channel_4bit(W, s.N, s.K, Wc4, Wc4s);
+            {
+                xnn_operator_t fc = nullptr;
+                check(xnn_create_fully_connected_nc_qd8_f32_qc4w(s.K, s.N, s.K, s.N, 8, Wc4s.data(), Wc4.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &fc), "create fc qc4w");
+                dyn_arm(names[3], fc, xnn_reshape_fully_connected_nc_qd8_f32_qc4w, xnn_setup_fully_connected_nc_qd8_f32_qc4w);
+            }
+            sx = amax_of(A) / 127.0f; sy = amax_of(R) / 127.0f;
+            quant_tensor(A, sx, Aq_s);
+            xnn_operator_t fs = nullptr;
+            check(xnn_create_fully_connected_nc_qs8_qc4w(s.K, s.N, s.K, s.N, 0, sx, 8, Wc4s.data(), Wc4.data(), bias32.data(), 0, sy, -128, 127, 0, nullptr, &fs), "create fc qs8c4");
+            check(xnn_reshape_fully_connected_nc_qs8_qc4w(fs, s.M, pool), "reshape fc qs8c4");
+            check(xnn_setup_fully_connected_nc_qs8_qc4w(fs, Aq_s.data(), Cq.data()), "setup fc qs8c4");
+            ops.push_back(fs);
+            arms.push_back({names[4], [&, fs] { check(xnn_run_operator(fs, pool), "run fc qs8c4"); },
+                            [&] { std::vector<float> c(Cq.size()); for (size_t i = 0; i < c.size(); ++i) c[i] = sy * Cq[i]; return c; }});
+            quant_per_channel(W, s.N, s.K, Wq, Ws);
+            {
+                xnn_operator_t fc = nullptr;
+                check(xnn_create_fully_connected_nc_qd8_f32_qc8w(s.K, s.N, s.K, s.N, Ws.data(), Wq.data(), nullptr, -INFINITY, INFINITY, 0, nullptr, &fc), "create fc qd8c8");
+                dyn_arm(names[5], fc, xnn_reshape_fully_connected_nc_qd8_f32_qc8w, xnn_setup_fully_connected_nc_qd8_f32_qc8w);
             }
         } else {
             quant_per_channel(W, s.N, s.K, Wq, Ws);
@@ -338,7 +467,8 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
     for (const Cv& c : convs) {
         const int64_t pad = c.dil * (c.kw - 1) / 2;
         std::vector<float> xg(c.L * c.IC), kg(c.kw * c.IC * c.OC);
-        fill(xg, 101, 0.6f); fill(kg, 59, 0.2f);
+        fill(xg, 101, 0.6f);
+        if (q4) fill_normal(kg, 59, 0.07f); else fill(kg, 59, 0.2f);
         std::vector<float> xx(c.L * c.IC), kx(c.OC * c.kw * c.IC), R(c.L * c.OC);
         for (int64_t i = 0; i < c.IC; ++i) for (int64_t t = 0; t < c.L; ++t) xx[t * c.IC + i] = xg[i * c.L + t];
         for (int64_t o = 0; o < c.OC; ++o) for (int64_t i = 0; i < c.IC; ++i) for (int64_t k = 0; k < c.kw; ++k)
@@ -362,13 +492,13 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
         ggml_tensor *tk = nullptr, *tx = nullptr;
         alloc(g, [&](ggml_context* ctx) {
             tx = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.L, 1, c.IC, 1); ggml_set_input(tx); ggml_set_output(tx);
-            if (!q8) {
+            if (!quant) {
                 tk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.kw, 1, c.IC, c.OC); ggml_set_input(tk); ggml_set_output(tk);
                 return ggml_conv_2d_direct(ctx, tk, tx, 1, 1, (int)pad, 0, (int)c.dil, 1);
             }
-            // The folded [IC*KW, OC] kernel a Q8_0 export carries: a pure reinterpretation of the
-            // [KW, 1, IC, OC] order (ggml-0013), so quantizing kg in rows of IC*KW IS that kernel.
-            tk = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, c.IC * c.kw, c.OC); ggml_set_input(tk); ggml_set_output(tk);
+            // The folded [IC*KW, OC] kernel a Q8_0 / Q4_0 export carries: a pure reinterpretation of
+            // the [KW, 1, IC, OC] order (ggml-0013), so quantizing kg in rows of IC*KW IS that kernel.
+            tk = ggml_new_tensor_2d(ctx, wt, c.IC * c.kw, c.OC); ggml_set_input(tk); ggml_set_output(tk);
             return ggml_conv_2d_direct_packed(ctx, tk, tx, 1, 1, (int)pad, 0, (int)c.dil, 1, (int)c.kw, 1, (int)c.IC);
         });
         weights_for(tk, kg);
@@ -379,7 +509,8 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
             ggml_backend_tensor_get(g.out, yg.data(), 0, yg.size() * 4);
             for (int64_t o = 0; o < c.OC; ++o) for (int64_t t = 0; t < c.L; ++t) y[t * c.OC + o] = yg[o * c.L + t];
             return y; }});
-        if (q8) arms.push_back({names[1], {}, {}});   // a repacked kernel cannot feed ggml-0013's dequantize
+        if (quant) arms.push_back({names[1], {}, {}});   // a repacked kernel cannot feed ggml-0013's dequantize
+        if (q4) for (int i = 2; i <= 4; ++i) arms.push_back({names[i], {}, {}});   // XNNPACK has no 4-bit conv
         std::vector<xnn_operator_t> ops;
         std::vector<std::unique_ptr<Workspace>> works;
         std::vector<uint16_t> x16, k16, y16(c.L * c.OC);
@@ -389,7 +520,7 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
         std::vector<xnn_quantization_params> qp(1 + XNN_EXTRA_QUANTIZATION_PARAMS);
         float sx = 1, sy = 1;
         size_t ws = 0, oh = 0, ow = 0;
-        if (!q8) {
+        if (!quant) {
             x16 = f32_to_f16(xx); k16 = f32_to_f16(kx);
             xnn_operator_t op = nullptr;
             const xnn_status st = xnn_create_convolution2d_nhwc_f16(0, (uint32_t)pad, 0, (uint32_t)pad, 1, (uint32_t)c.kw, 1, 1, 1, (uint32_t)c.dil, 1,
@@ -416,8 +547,10 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
             works.push_back(std::make_unique<Workspace>(ws));
             check(xnn_setup_convolution2d_nhwc_qd8_f32_qc8w(op, works.back()->p, xq.data(), y.data(), qp.data()), "setup conv qd8");
             ops.push_back(cv); ops.push_back(op);
-            arms.push_back({names[2], [&, cv, op] { check(xnn_run_operator(cv, pool), "run convert"); check(xnn_run_operator(op, pool), "run conv qd8"); },
+            arms.push_back({names[q4 ? 5 : 2], [&, cv, op] { check(xnn_run_operator(cv, pool), "run convert"); check(xnn_run_operator(op, pool), "run conv qd8"); },
                             [&] { return y; }});
+        }
+        if (q8) {   // the static int8 conv; q4's static arm is a 4-bit GEMM, which has no conv form
             sx = amax_of(xx) / 127.0f; sy = amax_of(R) / 127.0f;
             quant_tensor(xx, sx, xq_s);
             xnn_operator_t os = make_conv([&](uint32_t p, uint32_t kw, uint32_t d, xnn_operator_t* o) {
@@ -486,7 +619,7 @@ int main(int argc, char** argv) {
     const int reps = argc > 2 ? std::atoi(argv[2]) : 7;
     const int64_t heads = argc > 3 ? std::atoll(argv[3]) : 12;
     const std::string mode = argc > 4 ? argv[4] : "f32";
-    if (mode != "f32" && mode != "f16" && mode != "q8") { std::fprintf(stderr, "mode must be f32, f16 or q8\n"); return 1; }
+    if (mode != "f32" && mode != "f16" && mode != "q8" && mode != "q4") { std::fprintf(stderr, "mode must be f32, f16, q8 or q4\n"); return 1; }
 
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, nth);
