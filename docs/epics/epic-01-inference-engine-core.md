@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: inference-engine
-last_updated: 2026-10-09
+last_updated: 2026-10-11
 ---
 
 # Epic-01: The Data-Driven ggml Inference Engine Core
@@ -36,8 +36,11 @@ script** as embedded Lua, alongside the weights those describe. The engine parse
 * **Dynamic axes, not dynamic shapes.** `ggml` has no dynamic dimensions, so a new sequence length is a
   new graph. `GraphBuilder` **retains the last graph** and returns it unchanged when the axes repeat —
   so an ODE solver's steps, an LSTM's timesteps or a decode loop build once, not once per iteration.
-* **Allocation** uses `ggml_gallocr`'s two-pass strategy rather than hand-estimated byte sizes, and the
-  compute buffer is released when a build stops needing it.
+* **Allocation** uses `ggml_gallocr`'s two-pass strategy rather than hand-estimated byte sizes. The
+  compute buffer is given back once eight consecutive calls, reuses included, each needed at most half
+  of it. A single small call is not enough, because an alternating short/long workload would then free
+  and refault it on every switch. A host can hold the buffer instead, or release it now
+  ([ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md)).
 * **Caches.** `KvCache` and `ConvStateCache` are attached per session;
   [ADR-016](../adrs/adr-016-kv-cache-shape.md) covers the KV cache's shape and its limits.
 * **Orchestration is Lua** ([ADR-002](../adrs/adr-002-embedded-lua-drivers.md)); every model reaches
@@ -69,6 +72,7 @@ straight back ([Retro-045](../retros/retro-045-the-allocator-handed-the-same-add
 |---|---|
 | Full design | [`docs/SPECIFICATION.md`](../SPECIFICATION.md) |
 | KV cache | [`docs/KV-CACHE.md`](../KV-CACHE.md), [ADR-016](../adrs/adr-016-kv-cache-shape.md) |
+| Compute buffer | [ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md) |
 | Foundational | [ADR-001](../adrs/adr-001-data-driven-gguf-topologies.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) |
 | Verification | [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md) |
 | Retros | [Retro-001](../retros/retro-001-layout-healing-heuristics.md), [Retro-003](../retros/retro-003-tdt-decoder-recomputed-its-prediction-network.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-045](../retros/retro-045-the-allocator-handed-the-same-address-back.md) |
