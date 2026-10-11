@@ -19,6 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
+| **Queued before the XNNPACK benchmark (user, 2026-10-11): the gemma-3 KV leak, then retiring `pad_crop_relative_embeddings`** | Both are below. The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -347,15 +348,17 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     depending on how its own overhead was apportioned, and 3.92x on an isolated op became 0.5% on the
     model. Fusion wins are routinely smaller than a node table implies — measure what fusion is worth
     separately.*
-  * [ ] **Direct I/O buffers — which for loom means the LUA MARSHALLING BOUNDARY, not the host API.**
-    LiteRT hands a caller a pointer into the arena so an input costs no copy. The analogous cost here
-    is `loom.causal_mask` and its siblings building a Lua table of doubles that is then converted to
-    float and copied into a backend tensor: three passes plus a table allocation. This class has bitten
-    once already as the prefill ceiling (P4.0.14,
-    [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md)), and family 6 made it larger —
-    `t5_position_bias` marshals `n_head * n_src²` doubles per encoder call. The fix is a "fill the
-    tensor in place" primitive: the driver names the builder, the engine writes straight into the
-    declared input. Cheap, bounded, and the measurement is easy.
+  * [x] **Direct I/O buffers — measured, and the cost was not the Lua boundary.** Per-input timers
+    (2026-10-11) put the Lua-built masks at 2.4 ms of a 10.4 s Qwen3 prefill and 1.2 ms of a VITS
+    call. The real cost was retained outputs COPIED into a consumer's inputs: 501 ms of whisper's
+    8.86 s jfk run (cross-attention K/V, every step). Those are now read in place
+    ([ADR-073](../adrs/adr-073-a-referenced-input-is-read-in-place.md)): 13.5 ms, with identical
+    output.
+  * [ ] **Device builds still copy referenced inputs.** ADR-073 refuses an alias on a hybrid builder,
+    because the scheduler plans its split copies from each tensor's buffer at allocation time. On a
+    device the copy is device to device, so measure a GPU decode loop (whisper on the 5090) before
+    deciding it is worth lifting. *(T5's Lua-built encoder bias, the other residue of this item, is in
+    the graph now: [ADR-074](../adrs/adr-074-t5s-encoder-bias-is-a-gather-over-a-distance-table.md).)*
   * [ ] **Serializing a COMPILED accelerator program.** The "fewer dispatches" half of LiteRT's
     delegate story has already been probed here, and the honest reading is that **a split count does
     not predict it either way**: the Metal `PAD` prototype removed 27 of 56 splits and bought 1.8% on
@@ -496,6 +499,13 @@ before loom-py's card gate can run against it — `git -C vendor/loom.cpp fetch 
 `checkout <sha>` → rebuild → commit the pointer. A release pins that submodule at `main`'s tip, and
 **that pin is what the wheels are built from**.
 
+* [ ] **Republish flan-t5-small once `feat/t5-bias-in-graph` (loom-exporter) merges.** The encoder's
+  bias moved into the graph (ADR-074), so the GGUF changes: a `positions` input replaces
+  `position_bias`, a 257x6 `enc_rel_bias` weight is added, and the driver drops `ENC_REL_BIAS`. It
+  needs a fresh export from the merged tree, then the card gate, then publish, in that order.
+  Verified on the branch: the encoder matches HF
+  at f64 to 2.5e-7, and generation is identical to rc17's GGUF and to HF greedy on both test prompts.
+  The engine needs nothing new.
 * [ ] **"Nothing needs a re-export" is checked on cards and Hub hashes, never on a fresh export.** The rc15 and rc16 checks compared regenerated cards and staged-vs-Hub sha256, which says nothing about whether exporter `main` still WRITES the published file. It does not, for `gigaam-v3-rnnt` (published 2026-09-30): a fresh export adds `tokenizer.ggml.unigram_scoring` (ADR-060, encode-only) and an encoder-output PERMUTE/VIEW/PERMUTE/CONT; both decode JFK 80/80 (gate 83/83), so it is not a defect, but a release sweep should re-export each card and diff before saying nothing moved.
 * [ ] **A GGUF cannot say which engine features its driver needs.** An older engine ignores option keys
   it does not know, so a driver whose meaning depends on an OPTION runs plausibly and wrongly there:
@@ -516,6 +526,19 @@ Conformer-CTC audio, only the small Conformer-CTC checkpoint verified, and the a
 primitive set.
 
 ## Minor cleanups
+
+* [ ] **Retire `loom.pad_crop_relative_embeddings`, `src/core/relative_position.cpp` and probably
+  `REL_POS_ATTENTION_SHAW`: nothing that ships calls them.** The question was whether VITS/Supertonic's
+  Shaw relative-position table could move into the graph the way T5's encoder bias did (ADR-074). It
+  already has: `loom-exporter/vits_export.py` traces piper's `_get_relative_embeddings` with the pad
+  built from `CONCAT`. Scanned 2026-10-11, the published VITS and Supertonic GGUFs and the v5 fixtures
+  (whole files), plus the first 4 MB (the metadata) of every other published and fixture GGUF: no
+  driver calls the binding and no topology names the primitive. Their callers were the per-model C++
+  drivers [the lean-runtime rule](../adrs/adr-003-per-model-complexity-in-the-exporter.md) retired.
+  What still compiles against them: `tests/gate/test_e2e_vits_{stats,logw}_reference.cpp`, which carry
+  their own copy of the port and SKIP on the v5 fixtures. Work: confirm what those two tests need, then
+  delete the binding, the file, the primitive if it has no topology user, and the tests or their dead
+  half. *Context: [Epic-01](../epics/epic-01-inference-engine-core.md)*
 
 * [ ] `KvCache::write_k/write_v/read_k/read_v` use `std::vector::at()`, which throws `std::out_of_range`
   rather than a `loom::Error` subtype. A malformed topology's `"layer"` attr could in principle reach
