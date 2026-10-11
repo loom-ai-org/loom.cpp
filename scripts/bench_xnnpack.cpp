@@ -9,7 +9,9 @@
 //       scripts/bench_xnnpack.cpp -o bench_xnnpack \
 //       $XB/libXNNPACK.a $XB/libxnnpack-microkernels-prod.a $XB/pthreadpool/libpthreadpool.a \
 //       $XB/cpuinfo/libcpuinfo.a -L $B/_deps/ggml-build/src -lggml -lggml-base -lpthread -lm
-//   ./bench_xnnpack <threads> [reps]
+//   ./bench_xnnpack <threads> [reps] [heads]
+//   heads (default 12) scales QK^T and softmax for a small-RAM board: softmax alone holds ~540 MB at 12.
+//   The weights rescale by 12/heads, so the whisper total is still one encoder.
 //
 // WHAT IS COMPARED, AND WHAT IS NOT.
 //   * GEMM: ggml `mul_mat(a=[K,M], b=[K,N])` -- loom's conv and linear form, both operands K-contiguous
@@ -90,12 +92,14 @@ struct Row { std::string name; double flop, weight, g_ms, x_ms, layout_ms, rel; 
 int main(int argc, char** argv) {
     const int nth = argc > 1 ? std::atoi(argv[1]) : 2;
     const int reps = argc > 2 ? std::atoi(argv[2]) : 7;
+    const int64_t heads = argc > 3 ? std::atoll(argv[3]) : 12;
 
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, nth);
     check(xnn_initialize(nullptr), "xnn_initialize");
     pthreadpool_t pool = pthreadpool_create(nth);
-    std::printf("threads=%d reps=%d  ggml llamafile=%d\n", nth, reps, ggml_cpu_has_llamafile());
+    std::printf("threads=%d reps=%d heads=%lld  ggml llamafile=%d\n", nth, reps, (long long)heads,
+                ggml_cpu_has_llamafile());
 
     auto alloc_graph = [&](GgmlRun& g, auto build) {
         ggml_init_params ip = {256u * 1024 * 1024, nullptr, true};
@@ -157,7 +161,7 @@ int main(int argc, char** argv) {
 
     // ---------------------------------------------------------------- whisper QK^T (12 heads)
     {
-        const int64_t H = 12, T = 1500, D = 64;
+        const int64_t H = heads, T = 1500, D = 64;
         std::vector<float> Q(H * T * D), Kt(H * T * D), Sx(H * T * T), Sg(H * T * T);
         fill(Q, 89, 0.4f); fill(Kt, 61, 0.4f);
         GgmlRun g;
@@ -178,13 +182,14 @@ int main(int argc, char** argv) {
         auto [tg, tx] = race([&] { ggml_backend_graph_compute(be, g.gf); },
                              [&] { check(xnn_run_operator(op, pool), "run bmm"); });
         ggml_backend_tensor_get(g.out, Sg.data(), 0, Sg.size() * 4);
-        rows.push_back({"whisper QK^T 12x1500x64x1500", 2.0 * H * T * T * D, 12, tg, tx, 0, max_rel(Sx, Sg)});
+        char nm[96]; std::snprintf(nm, sizeof nm, "whisper QK^T %lldx1500x64x1500", (long long)H);
+        rows.push_back({nm, 2.0 * H * T * T * D, 12.0 * 12 / H, tg, tx, 0, max_rel(Sx, Sg)});
         xnn_delete_operator(op);
     }
 
     // ---------------------------------------------------------------- whisper softmax
     {
-        const int64_t C = 1500, R = 1500 * 12;
+        const int64_t C = 1500, R = 1500 * heads;
         std::vector<float> X(C * R), Yx(C * R), Yg(C * R);
         fill(X, 113, 8.0f);
         GgmlRun g;
@@ -201,7 +206,8 @@ int main(int argc, char** argv) {
         auto [tg, tx] = race([&] { ggml_backend_graph_compute(be, g.gf); },
                              [&] { check(xnn_run_operator(op, pool), "run softmax"); });
         ggml_backend_tensor_get(g.out, Yg.data(), 0, Yg.size() * 4);
-        rows.push_back({"whisper softmax 1500 x 18000", 5.0 * C * R, 12, tg, tx, 0, max_rel(Yx, Yg)});
+        char nm[96]; std::snprintf(nm, sizeof nm, "whisper softmax 1500 x %lld", (long long)R);
+        rows.push_back({nm, 5.0 * C * R, 12.0 * 12 / heads, tg, tx, 0, max_rel(Yx, Yg)});
         xnn_delete_operator(op);
     }
 

@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **LiteRT thread, closing (2026-10-11): run `scripts/bench_xnnpack.cpp` on the Pi 4 / M1** | The x86 run is in (Engine — performance, the XNNPACK item): no case for a wholesale swap, and two targeted ops (`QK^T`, softmax). ARM is what decides. The earlier queue is done. The gemma-3 "KV leak" was not one: the checkpoint declares sampling, and greedy is deterministic ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). `pad_crop_relative_embeddings` and the Shaw primitives are retired (branch `chore/retire-pad-crop-relative-embeddings`, stacked on the perf branch). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
+| **LiteRT thread, closing (2026-10-11): decide on XNNPACK from the four-machine run** | All four machines are measured (Engine — performance, the XNNPACK item). The answer depends on the core. ggml is faster on the M1 at one thread and on the Pi Zero. XNNPACK is 1.15-1.47x faster on the Pi 4 before the layout tax, and that tax erases the conv half. Softmax is XNNPACK's on every machine. Two ggml defects showed up on ARM along the way (large-K GEMM, narrow-N threading). The earlier queue is done. The gemma-3 "KV leak" was not one: the checkpoint declares sampling, and greedy is deterministic ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). `pad_crop_relative_embeddings` and the Shaw primitives are retired (branch `chore/retire-pad-crop-relative-embeddings`, stacked on the perf branch). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -312,10 +312,26 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   real and was not found. Read XNNPACK's `f32-raddstoreexpminusmax` and `f32-rmax` kernels (BSD-3)
   for what they do differently, prototype in `scripts/bench12.cpp`'s frame, and measure on x86 AND
   the Pi before writing a ggml patch. Softmax was 16% of whisper's encoder gap to onnxruntime.
+  **ARM agrees (2026-10-11): XNNPACK wins softmax on every machine measured.** At one thread: M1 1.28-1.30x,
+  Pi 4 2.05-2.06x, Pi Zero 1.96-1.97x (XNNPACK's scalar ARMv6 path). On the M1 at 8 threads it is
+  2.27-2.30x. On the Pi 4 at 4 threads it is only 1.03-1.07x, because 108 MB in and out is memory-bound there.
+  This is the one result that holds on every core.
 * [ ] **Attention `QK^T` at k=64: XNNPACK 1.60-1.75x over ggml** on the same run. Retro-012's own
   outer-product tile already reached 1.85x on this box, and was closed on the 285K (1.38x against a
   1.5x gate) and on NEON (1.23x). XNNPACK's NEON number, from the Pi/M1 run, is what says whether a
   better ARM tile exists. `QK^T` was 51% of whisper's encoder gap to onnxruntime.
+  **ARM (2026-10-11): headroom only on the A72, and smaller than x86.** Pi 4: 1.32x at one thread, 1.18x
+  at four. M1: 1.02x and 1.05x. Pi Zero: 0.94-1.08x. A better NEON tile is worth ~1.3x on the Pi 4 and
+  nothing on the M1.
+* [ ] **ggml's F32 GEMM halves its throughput at K=3072 on both ARM boards.** whisper `fc2`
+  (3072x1500x768) runs at 4.3-4.4 GFLOP/s on one A72 core against 8.3 for `fc1` (768x1500x3072), the
+  same FLOPs with K=768. At four threads it is 10.1 vs 24. The Pi Zero shows the same 2x, and the M1
+  does not (91.8 vs 94.1). XNNPACK holds its rate on both, so the cause is ggml's K blocking, not the
+  memory system alone. It matters beyond whisper: Qwen3-0.6B's MLP `down_proj` has K=3072. Source:
+  `scripts/bench_xnnpack.cpp`, 2026-10-11. Check x86 next, then profile the tinyBLAS K loop on the Pi 4.
+* [ ] **ggml scales badly on narrow-N GEMMs (N=32, M=73472).** One thread to 8 on the M1: ggml 4.5x,
+  XNNPACK 7.3x. One to four on the Pi 4: ggml 2.7x, XNNPACK 4.1x. These are VITS's im2col-form vocoder
+  GEMMs. Look at how `mul_mat` chunks the work when `ne01` is 32. Source: same run.
 * [ ] **The Pi Zero, for the two models chosen for it.** Measured 2026-10-10 on the Pi Zero W (P4.31 engine): Moonshine
   tiny at ~7x slower than real time (jfk 11 s in 75 s, either precision), sanoTTS heart-nano at 1.1x, the 0.51M piperlite
   voices at 2.3x. heart-nano is the closest to real time: its iSTFT is a DFT-basis `conv_transpose1d` (~0.1 GMAC per second of
@@ -353,8 +369,34 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     tile already reached 1.85x on this box, and was closed on the 285K (1.38x) and on NEON (1.23x).
     Softmax: our best was 1.16x here, and XNNPACK shows 1.8x is reachable. Read its `f32-raddstoreexpminusmax`
     kernels (BSD-3, so reading and porting is clean) before re-opening `SOFT_MAX`.
-    **Left:** run the same harness on the Pi 4 (A72, the edge target, unreachable on 2026-10-11) and
-    on the M1. An ARM result that differs from x86 is the only thing that would re-open an integration.
+    **ARM, 2026-10-11** (same harness, XNNPACK `4a5fe376` built natively on each board; max relative
+    difference at most 2.9e-6 everywhere; two runs each, which agree):
+
+    | ggml/XNNPACK | VITS GEMMs | VITS convs | convs + layout tax | whisper encoder |
+    |---|---|---|---|---|
+    | M1 Pro, 1 thread | **0.81** | **0.82** | 0.72 | **0.84** |
+    | M1 Pro, 8 threads | 1.20 | 1.04 (clean run) | 0.54-0.61 | 0.94-0.95 |
+    | Pi 4 (A72), 1 thread | **1.14-1.16** | **1.46-1.47** | 0.94 | **1.45-1.46** |
+    | Pi 4, 4 threads | 1.30-1.37 | 1.34-1.39 | 0.56-0.57 | 0.55 |
+    | Pi Zero (ARM1176), 1 thread | **0.72-0.73** | **0.59-0.61** | 0.57-0.59 | 1.72-1.82 |
+
+    - **The M1 favours ggml:** 92 GFLOP/s on one P-core against XNNPACK's 74, on every GEMM and conv.
+      At 8 threads XNNPACK wins only the N=32 GEMMs (1.3-1.6x). That is ggml scaling 4.5x on those
+      shapes while XNNPACK scales 7.3x (see the narrow-N item).
+    - **The Pi 4 is the one place XNNPACK clears the ~15% bar.** ggml runs 6-8 GFLOP/s per A72 core,
+      XNNPACK 10-12. The conv margin, though, does not survive the channels-last transposes even at one
+      thread (0.94, a naive single-threaded upper bound on the tax). XNNPACK's whisper linears also fail to scale on the
+      board: `qkv` takes 177 ms at four threads against 187 at one, `fc1` 924 against 785. Both runs
+      reproduce this, and it is unexplained. That alone makes whisper 0.55x at four threads.
+    - **The Pi Zero favours ggml's ARMv6 kernels** (`ggml-0018`/`0019`) over XNNPACK's scalar fallback. XNNPACK
+      does build and run on ARMv6+VFPv2 (cross-compiled with clang 14 against the Raspbian sysroot).
+      Its whisper win is all `fc1`/`fc2`, i.e. the large-K item below. It ran at `heads=2`, because 12
+      heads do not fit in 427 MB.
+
+    **So there is no wholesale case on any of the four machines.** The A72 gap is real, but it sits in
+    ggml's A72 GEMM/conv throughput, and it disappears on the M1. A better A72 tile in ggml, as
+    `ggml-0002` did for tinyBLAS, is the cheaper test of it. An `extra_buffer_type` integration (the
+    KleidiAI route) would win on one core class and lose on the others.
   * [x] **Direct I/O buffers — measured, and the cost was not the Lua boundary.** Per-input timers
     (2026-10-11) put the Lua-built masks at 2.4 ms of a 10.4 s Qwen3 prefill and 1.2 ms of a VITS
     call. The real cost was retained outputs COPIED into a consumer's inputs: 501 ms of whisper's
