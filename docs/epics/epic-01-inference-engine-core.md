@@ -47,9 +47,11 @@ script** as embedded Lua, alongside the weights those describe. The engine parse
   inference through `infer`.
 
 * **Retained outputs are the inter-module edge.** A module owns an `OutputStore`, and a driver hands
-  the next graph `{from = 'module'}` rather than a Lua table, so an intermediate is copied
-  backend-to-backend and never becomes host doubles
-  ([ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md)). Three
+  the next graph `{from = 'module'}` rather than a Lua table, so an intermediate never becomes host
+  doubles ([ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md)).
+  On a CPU build it is not copied either: the consumer's declared input, and every view of it, points
+  at the store for that call and is pointed back at the next `build()`
+  ([ADR-073](../adrs/adr-073-a-referenced-input-is-read-in-place.md)). Three
   bindings write a store WITHOUT a build — `run_recurrent_and_retain`, `run_bi_recurrent_and_retain`
   and `expand_by_duration_and_retain`, which put a recurrence's sequence and a frame expansion there
   ([ADR-032](../adrs/adr-032-an-interleave-is-a-layout-a-concatenation-is-a-graph.md)).
@@ -73,6 +75,7 @@ straight back ([Retro-045](../retros/retro-045-the-allocator-handed-the-same-add
 | Full design | [`docs/SPECIFICATION.md`](../SPECIFICATION.md) |
 | KV cache | [`docs/KV-CACHE.md`](../KV-CACHE.md), [ADR-016](../adrs/adr-016-kv-cache-shape.md) |
 | Compute buffer | [ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md) |
+| Inputs by reference | [ADR-031](../adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md), [ADR-073](../adrs/adr-073-a-referenced-input-is-read-in-place.md), [Retro-083](../retros/retro-083-a-pointer-swap-test-must-read-through-a-view.md) |
 | Foundational | [ADR-001](../adrs/adr-001-data-driven-gguf-topologies.md), [ADR-002](../adrs/adr-002-embedded-lua-drivers.md), [ADR-003](../adrs/adr-003-per-model-complexity-in-the-exporter.md) |
 | Verification | [ADR-015](../adrs/adr-015-ci-and-gate-test-classes.md) |
 | Retros | [Retro-001](../retros/retro-001-layout-healing-heuristics.md), [Retro-003](../retros/retro-003-tdt-decoder-recomputed-its-prediction-network.md), [Retro-004](../retros/retro-004-luajit-array-limit-caps-prefill.md), [Retro-045](../retros/retro-045-the-allocator-handed-the-same-address-back.md) |
