@@ -221,11 +221,35 @@ public:
     // rebuilds exactly once, which is the only externally visible difference reuse makes.
     uint64_t builds() const { return builds_; }
     uint64_t reuses() const { return reuses_; }
-    // How many builds gave the oversized compute buffer back. A prefill-then-decode generation should
-    // report exactly one, at the transition; a fixed-shape loop, zero. Always 0 on a hybrid builder: the
-    // shrink is a policy over a gallocr this builder owns, and a hybrid one's allocator belongs to
-    // ggml_backend_sched, which offers no equivalent (BACKLOG.md P4.7).
+    // How many times the oversized compute buffer was given back automatically. A prefill-then-decode
+    // generation should report exactly one, `kShrinkWindow` calls after the transition; a fixed-shape
+    // loop, and a module alternating between a short and a long shape, zero. Always 0 on a hybrid
+    // builder: the shrink is a policy over a gallocr this builder owns, and a hybrid one's allocator
+    // belongs to ggml_backend_sched, which offers no equivalent (BACKLOG.md P4.7). An explicit
+    // release_compute_buffer() is not counted here -- this counts the POLICY's decisions.
     uint64_t shrinks() const { return shrinks_; }
+
+    // The host's two controls over the compute buffer (ADR-072). The automatic shrink above is the
+    // default; these are for a host that knows something the call history cannot tell the builder.
+    //
+    // hold_compute_buffer(true) turns the automatic shrink off, so a buffer this builder has grown to is
+    // kept for as long as the builder lives -- for a server that would rather hold the memory of its
+    // longest request than ever pay to fault it back in. Unlike reserve() it builds nothing: the buffer
+    // is whatever the largest call so far needed. `false` restores the default, with the under-use
+    // count starting again from zero and the next call rebuilt, so that its need is measured.
+    void hold_compute_buffer(bool hold);
+    // Releases the retained graph and every buffer it owns NOW -- the compute buffer (on a hybrid
+    // builder, the scheduler and its per-backend buffers) and the declared inputs' storage. The next
+    // build() constructs a fresh graph at exactly the size it needs. For a host that knows it is about
+    // to go idle, the way `malloc_trim` is for a process. Retained OUTPUTS are not touched: they live in
+    // the module's OutputStore, not here. Safe to call at any time, including before any build.
+    void release_compute_buffer();
+
+    // How many consecutive calls must each need at most 1/kShrinkFactor of the compute buffer before the
+    // buffer is given back (ADR-072). Counted in CALLS, hits included, so a decode loop that reuses its
+    // graph still advances it, and counted rather than timed so the policy is deterministic.
+    static constexpr uint32_t kShrinkWindow = 8;
+    static constexpr size_t kShrinkFactor = 2;
 
     // How many splits ggml_backend_sched cut the current graph into -- one more than the number of times
     // execution crossed between the device and the CPU. 0 for a CPU-only builder. The number a hybrid
@@ -313,17 +337,30 @@ private:
     uint64_t reuses_ = 0;
     // Set by reserve(); suppresses the shrink in build() -- see reserve()'s own comment.
     bool reserved_ = false;
-    // Set by a build that grew the compute buffer, and the only thing that arms the shrink check on the
-    // next one. gallocr only ever grows, so nothing else can make the buffer oversized -- and the check
-    // is a second planning pass, which is far too expensive to run per build (measured in
-    // graph_builder.cpp).
-    bool may_shrink_ = false;
+    // Set by hold_compute_buffer(true); suppresses the shrink without building anything.
+    bool held_ = false;
     uint64_t shrinks_ = 0;
+    // The compute bytes the RETAINED graph needs, which is what a reuse of it needs: a hit costs no
+    // planning pass to answer "is the buffer oversized for this call".
+    size_t cached_need_ = 0;
+    // Consecutive calls (builds and reuses) whose graph needed at most 1/kShrinkFactor of the buffer.
+    // Reset by any call that needed more, and by a shrink.
+    uint32_t underused_calls_ = 0;
+    // A gallocr that never owns a buffer, kept only to PLAN a freshly built graph and report what it
+    // needs -- see measure_need(). Persistent so its hash set is sized once rather than per build.
+    ggml_gallocr_ptr probe_;
 
-    // Drops the gallocr when this graph needs materially less than the buffer currently holds, so the
-    // next alloc sizes a fresh one. See build()'s own comment for why the allocator will not do this
-    // by itself. CPU-only path only -- a hybrid builder has no gallocr of its own to shrink.
-    void shrink_allocator_if_oversized(ggml_cgraph* gf);
+    // Whether the automatic shrink applies to this builder at all: a CPU-only one the host has neither
+    // reserved nor held.
+    bool shrink_policy_active() const;
+    // Records one call's need against the current buffer, and answers whether the window has now been
+    // under-used for kShrinkWindow calls in a row.
+    bool note_call_need(size_t need);
+    // What `gf` needs from the compute buffer, planned on `probe_` (no allocation, live buffer untouched).
+    size_t measure_need(ggml_cgraph* gf);
+    // Forgets the retained graph and the declared inputs that belong to it. Order matters: the compute
+    // graph reads the input tensors, so it goes first.
+    void drop_retained_graph();
 
     // The hybrid path's replacement for the gallocr block: creates or grows `sched_` to fit this graph,
     // releases the previous graph's allocation, and allocates + splits this one. Never called on a

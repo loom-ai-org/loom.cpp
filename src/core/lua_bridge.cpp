@@ -2333,8 +2333,30 @@ GraphBuilder& LoomLuaBridge::module_builder(Module& mod) {
         mod.builder = std::make_unique<GraphBuilder>(mod.topo, *mod.model, mod.backends, mod.kv_cache,
                                                       /*compute_meta_bytes=*/32 * 1024 * 1024,
                                                       mod.conv_state);
+        mod.builder->hold_compute_buffer(hold_compute_buffers_);
     }
     return *mod.builder;
+}
+
+void LoomLuaBridge::hold_compute_buffers(bool hold) {
+    hold_compute_buffers_ = hold;
+    for (auto& [name, mod] : modules_) {
+        if (mod.builder) mod.builder->hold_compute_buffer(hold);
+    }
+}
+
+size_t LoomLuaBridge::compute_buffer_bytes() const {
+    size_t total = 0;
+    for (const auto& [name, mod] : modules_) {
+        if (mod.builder) total += mod.builder->buffer_size();
+    }
+    return total;
+}
+
+void LoomLuaBridge::release_compute_buffers() {
+    for (auto& [name, mod] : modules_) {
+        if (mod.builder) mod.builder->release_compute_buffer();
+    }
 }
 
 void LoomLuaBridge::load_script(const std::string& lua_source) {

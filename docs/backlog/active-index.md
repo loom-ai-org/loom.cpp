@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-10
+last_updated: 2026-10-11
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -273,6 +273,16 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — correctness
 
+* [ ] **gemma-3-270m-it leaks KV state from one generation into the next.** Found 2026-10-11 while
+  measuring ADR-072, and present on `main` before it (`f0920de`, same GGUF from hf-models-rc11). Four
+  `infer_with_past` calls in one `Session` with the same prompt give four different sequences. Every
+  run after the first differs from the first at token 0, the prefill's own output, and runs 1-3 differ
+  from each other by token 2. `scripts/bench_lm_loom.cpp` aborts on it ("the KV cache is leaking
+  state across calls"). Qwen3-0.6B passes the same check. Gemma 3 interleaves sliding-window and global
+  layers, which is outside [ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)'s
+  uniform-window ring, so check first that a padded or windowed cell is really masked. Anyone
+  generating twice in one process with this model gets wrong output.
+  *Context: [Epic-01 §4](../epics/epic-01-inference-engine-core.md#4-standing-scope-limitations)*
 * [ ] **`RANGE_1D` with a negative step returns -1 elements, silently.** `op_range_1d` forces `end > start` so `ggml_arange` (which asserts it and has no negative steps) cannot abort, so `arange(T - 1, -T, -1)` becomes `arange(start, start + 1, -1)`; the first error is a downstream RESHAPE. Lower a negative step as `start + step * arange(0, n)` with `n = ceil((end - start) / step)`, and throw on an empty range rather than inventing one element. Nemotron ASR's export avoids it so its file runs on released wheels. *Context: [Retro-079](../retros/retro-079-the-references-default-path-was-the-broken-one.md)*
 * [ ] **Who still depends on the layout-"healing" heuristics?** The guards make size-guessing
   *unreachable for already-correct graphs*; they do not remove it, and `op_repeat`'s two branches are
@@ -358,6 +368,12 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     their shaders at every startup, and caching a compiled program is a cold-start win nobody here has
     put a number on. That is the one piece of LiteRT's fourth item that fits the GGUF-metadata thread
     naturally.
+  * [x] **Plan once, hold once — the dynamic-shape version of the arena.** Measured 2026-10-11 on
+    VITS: a graph REBUILD is ~4-5 ms of host work, so a multi-slot graph cache would buy ~1%
+    ([Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md)). The real cost was the
+    compute-buffer shrink refaulting 111 MB on every short/long switch, which is now fixed by a
+    window of under-use, plus `hold`/`release` controls for the host
+    ([ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md)).
   * [x] **FlatBuffers — investigated and declined, so it is not re-derived.** A flatbuffer replaces a
     load-time parse, not the per-call ggml graph build; ExecuTorch's own `GRAPH_REBUILD.md` rebuilds
     too. And the container is not where TFLite's memory win comes from — the **arena planner** is,
@@ -465,6 +481,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Host API
 
+* [ ] **Expose the compute-buffer controls in loom-py.** `LoomLuaBridge::hold_compute_buffers`,
+  `release_compute_buffers` and `compute_buffer_bytes` exist in the engine, but a Python host cannot
+  reach them yet. The LM-server case needs `hold`, because each request otherwise refaults its prefill
+  buffer. Do it with the next submodule bump.
+  *Context: [ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md)*
 * [ ] **`GgufModel::hparam_env()` surfaces only numeric scalar KVs** into the `SymbolEnv`; string, bool
   and array-typed `loom.*` KVs are silently skipped.
 
