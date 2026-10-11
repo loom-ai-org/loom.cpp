@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **Next (user, 2026-10-11): the XNNPACK benchmark** | Its two queued predecessors are done. The gemma-3 "KV leak" was not one: the checkpoint declares sampling, and greedy is deterministic ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). `pad_crop_relative_embeddings` and the Shaw primitives are retired (branch `chore/retire-pad-crop-relative-embeddings`, stacked on the perf branch). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
+| **LiteRT thread, closing (2026-10-11): run `scripts/bench_xnnpack.cpp` on the Pi 4 / M1** | The x86 run is in (Engine — performance, the XNNPACK item): no case for a wholesale swap, and two targeted ops (`QK^T`, softmax). ARM is what decides. The earlier queue is done. The gemma-3 "KV leak" was not one: the checkpoint declares sampling, and greedy is deterministic ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). `pad_crop_relative_embeddings` and the Shaw primitives are retired (branch `chore/retire-pad-crop-relative-embeddings`, stacked on the perf branch). The LiteRT thread's steps 1-2 (ADR-072, ADR-073) and the T5 encoder bias in the graph (ADR-074) are on pushed branches `perf/delayed-shrink-zero-copy-inputs` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. The benchmark (step 3) is the standalone XNNPACK-vs-patched-ggml measurement in the LiteRT item. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -325,19 +325,26 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   is that **three of the four are kernel/runtime work, not export-time metadata**, so this is a
   different bet from the GGUF memory-layout and prescribed-tiling thread and should not be expected to
   fall out of it.
-  * [ ] **XNNPACK-class microkernels — the actual gap, and the one worth the most.** Per-ISA
-    hand-written microkernels, packed weights, **indirection buffers** so a convolution never
-    materialises an im2col matrix, and conv+bias+activation fused into one pass over the accumulator
-    tile. That last is the same idea as "evaluate activations in accumulators to avoid the round trip
-    through cache", and XNNPACK is the existence proof that it pays. **This tree is already walking
-    the same road**: the F32 GEMM microkernel was measured at **71% of the whole onnxruntime gap** and
-    shipped as two tinyBLAS patches; the ARMv6 run-at-a-time im2col patch gather is an indirection
-    buffer in miniature; P4.29's dequantize-at-the-top-and-re-enter is a reusable piece. What is
-    missing is doing it deliberately and across ops rather than one measured hotspot at a time.
-    *Two standing cautions apply and both are ours: a node-by-node profile swung a 78 ms gap by 230 ms
-    depending on how its own overhead was apportioned, and 3.92x on an isolated op became 0.5% on the
-    model. Fusion wins are routinely smaller than a node table implies — measure what fusion is worth
-    separately.*
+  * [ ] **XNNPACK as the kernel set — measured on x86 (2026-10-11); the ARM run is what decides.**
+    `scripts/bench_xnnpack.cpp` times XNNPACK's operator API (commit `4a5fe376`, static, 1.6 MB +
+    3.8 MB of x86 microkernels) against this tree's patched ggml on the shapes loom runs: VITS's 11
+    GEMMs and 20 dilated convs, whisper-small's encoder linears, `QK^T` and softmax. Both arms get the
+    same inputs and are checked to agree (max relative difference at most 3e-6). Ryzen 3 3250U, one
+    thread, ggml/XNNPACK over two runs:
+    - **VITS:** GEMMs 1.07-1.12x. Convs **0.89-0.93x** (ggml FASTER), because XNNPACK loses the
+      weight-heavy short-activation shapes 2x. With the channels-last transposes an integration would
+      add (a naive upper bound), **0.60-0.64x**.
+    - **whisper encoder:** **1.16-1.17x**, almost all from two ops: `QK^T` (k=64) **1.60-1.75x** and
+      softmax **1.75-1.81x**. The linears are at parity (0.98-1.08x).
+    - **At 2 threads:** the same picture, but the per-shape spread is 0.67-2.2x on this two-core box.
+
+    So, on x86, a wholesale swap would buy nothing for VITS (and cost the layout), plus two ops for
+    whisper. Those two are targeted items, not an integration. `QK^T`: Retro-012's own outer-product
+    tile already reached 1.85x on this box, and was closed on the 285K (1.38x) and on NEON (1.23x).
+    Softmax: our best was 1.16x here, and XNNPACK shows 1.8x is reachable. Read its `f32-raddstoreexpminusmax`
+    kernels (BSD-3, so reading and porting is clean) before re-opening `SOFT_MAX`.
+    **Left:** run the same harness on the Pi 4 (A72, the edge target, unreachable on 2026-10-11) and
+    on the M1. An ARM result that differs from x86 is the only thing that would re-open an integration.
   * [x] **Direct I/O buffers — measured, and the cost was not the Lua boundary.** Per-input timers
     (2026-10-11) put the Lua-built masks at 2.4 ms of a 10.4 s Qwen3 prefill and 1.2 ms of a VITS
     call. The real cost was retained outputs COPIED into a consumer's inputs: 501 ms of whisper's
