@@ -245,6 +245,26 @@ public:
     // the module's OutputStore, not here. Safe to call at any time, including before any build.
     void release_compute_buffer();
 
+    // Points declared input `input` of the current graph at `src`'s memory, starting `offset` bytes in,
+    // so the next compute() reads the source in place instead of a copy of it (ADR-073). Returns false,
+    // changing nothing, when an alias would not be exactly equivalent to the copy -- a different type,
+    // a non-contiguous side, a source too short, a different buffer type -- and on a hybrid builder,
+    // whose scheduler plans its split copies from each tensor's buffer at allocation time. The caller
+    // copies in that case, as it always did.
+    //
+    // **An alias lasts until the next build(), and build() is where it ends.** Every path that writes a
+    // declared input calls build() first -- the Lua input table, the recurrent sweeps, the ODE stepper's
+    // carried state -- so restoring there means nothing can write THROUGH an alias into the module that
+    // owns the source. After the restore the input's own storage does not hold the aliased value (it was
+    // never copied there), so the input is reported by stale_inputs() until something writes it.
+    bool alias_input(ggml_tensor* input, ggml_tensor* src, size_t offset = 0);
+    // Declared inputs whose own storage was skipped by an alias at some earlier call and has not been
+    // written since. Reusing a graph without supplying one of these would read whatever that storage
+    // last held, so the caller checks it after filling a call's inputs -- see compute_and_emit.
+    const std::vector<ggml_tensor*>& stale_inputs() const { return stale_inputs_; }
+    // Records that `input`'s own storage now holds this call's value.
+    void mark_input_written(ggml_tensor* input);
+
     // How many consecutive calls must each need at most 1/kShrinkFactor of the compute buffer before the
     // buffer is given back (ADR-072). Counted in CALLS, hits included, so a decode loop that reuses its
     // graph still advances it, and counted rather than timed so the policy is deterministic.
@@ -361,6 +381,24 @@ private:
     // Forgets the retained graph and the declared inputs that belong to it. Order matters: the compute
     // graph reads the input tensors, so it goes first.
     void drop_retained_graph();
+
+    // The inputs alias_input() repointed, with the storage each must go back to. Undone at the top of
+    // every build(), on a reuse and a rebuild alike.
+    struct InputAlias {
+        ggml_tensor* input;
+        ggml_backend_buffer_t buffer;
+        void* data;
+    };
+    std::vector<InputAlias> aliases_;
+    std::vector<ggml_tensor*> stale_inputs_;
+    void restore_aliased_inputs();
+    // Every tensor in the current graph that is a VIEW of a declared input, by input. A view's `data` is
+    // its base's plus `view_offs`, fixed when the graph was allocated, so moving an input's `data` moves
+    // nothing that reads it through a reshape or a permute until these are moved too. Scanned once per
+    // built graph, on its first alias.
+    std::unordered_map<ggml_tensor*, std::vector<ggml_tensor*>> input_views_;
+    bool input_views_scanned_ = false;
+    void repoint_views(ggml_tensor* input);
 
     // The hybrid path's replacement for the gallocr block: creates or grows `sched_` to fit this graph,
     // releases the previous graph's allocation, and allocates + splits this one. Never called on a

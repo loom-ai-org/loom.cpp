@@ -262,6 +262,8 @@ bool GraphBuilder::store_slots_unmoved(const OutputStore* out_store) const {
 }
 
 const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, OutputStore* out_store) {
+    // First, before anything can write an input: the previous call's aliases end here (ADR-073).
+    restore_aliased_inputs();
     // Checked before anything else, including the cache lookup: a cached topology's cell indices come
     // from n_past and are rewritten on a REUSE too, so an axes map without it has no answer to give at
     // either end. (A caller could otherwise reach a retained decode graph by binding n_kv directly.)
@@ -573,6 +575,86 @@ void GraphBuilder::drop_retained_graph() {
     inputs_buf_.reset();
     inputs_ctx_.reset();
     kv_cells_ = nullptr; // lives in inputs_ctx_, so it dies with it
+    // The inputs these name died with inputs_ctx_; nothing is left to restore or to be stale.
+    aliases_.clear();
+    stale_inputs_.clear();
+    input_views_.clear();
+    input_views_scanned_ = false;
+}
+
+// ADR-073. Every condition below is one under which reading `src` in place could differ from reading a
+// copy of it, so a `false` here is never an error -- the caller copies, exactly as before.
+//
+// * **CPU-only.** A hybrid builder's scheduler decides which backend each tensor lives on, and plans the
+//   copies between them, from `tensor->buffer` when it allocates the graph. Repointing a buffer after
+//   that is a question about the scheduler's internals this does not need to answer to be worth having:
+//   on a device the copy it replaces is device-to-device.
+// * **Same buffer type.** The input's own storage and the source must be the same kind of memory, so
+//   that `data` means the same thing to every op that reads it.
+// * **Contiguous, same type, and long enough.** The copy this replaces is a byte copy of a contiguous
+//   range, and the input's own `nb` describes how the graph will read it.
+//
+// **And every view of the input moves with it.** ggml fixes a view's `data` when the graph is allocated,
+// as its base's `data` plus `view_offs` (`ggml_backend_view_init`), and does not look at the base again.
+// Repointing only the input left Whisper's decoder reading its K/V heads, through a reshape, out of the
+// input's own storage -- which the alias had stopped filling -- and it transcribed jfk as "[ [ [". A
+// consumer that read its input directly, which is all the first test did, could not see it.
+// `ggml_new_tensor_impl` flattens a view of a view to the ultimate base, so `view_src == input` finds
+// every one of them.
+//
+// The graph never writes a declared input -- nothing in this engine emits an in-place op, and a
+// retained output is written only by its own module's final `cpy` -- so an alias cannot change the
+// source. test_input_alias.cpp checks that by reading the source back.
+bool GraphBuilder::alias_input(ggml_tensor* input, ggml_tensor* src, size_t offset) {
+    if (backends_.hybrid() || input == nullptr || src == nullptr) return false;
+    if (input->buffer == nullptr || src->buffer == nullptr || src->data == nullptr) return false;
+    if (ggml_backend_buffer_get_type(input->buffer) != ggml_backend_buffer_get_type(src->buffer)) return false;
+    if (input->type != src->type || !ggml_is_contiguous(input) || !ggml_is_contiguous(src)) return false;
+    if (offset + ggml_nbytes(input) > ggml_nbytes(src)) return false;
+
+    // An input aliased twice in one call keeps its FIRST saved storage, which is its own.
+    const bool already = std::any_of(aliases_.begin(), aliases_.end(),
+                                     [&](const InputAlias& a) { return a.input == input; });
+    if (!already) aliases_.push_back({input, input->buffer, input->data});
+    input->buffer = src->buffer;
+    input->data = static_cast<char*>(src->data) + offset;
+    repoint_views(input);
+    return true;
+}
+
+void GraphBuilder::repoint_views(ggml_tensor* input) {
+    if (!input_views_scanned_ && cached_.graph != nullptr) {
+        // Nodes only: a view carries a view op, never GGML_OP_NONE, so it is never a leaf.
+        std::unordered_set<const ggml_tensor*> inputs;
+        for (const auto& [name, t] : cached_.input_tensors) inputs.insert(t);
+        for (int i = 0; i < ggml_graph_n_nodes(cached_.graph); ++i) {
+            ggml_tensor* t = ggml_graph_node(cached_.graph, i);
+            if (t->view_src != nullptr && inputs.count(t->view_src)) input_views_[t->view_src].push_back(t);
+        }
+        input_views_scanned_ = true;
+    }
+    const auto it = input_views_.find(input);
+    if (it == input_views_.end()) return;
+    for (ggml_tensor* view : it->second) {
+        view->buffer = input->buffer;
+        view->data = static_cast<char*>(input->data) + view->view_offs;
+    }
+}
+
+void GraphBuilder::mark_input_written(ggml_tensor* input) {
+    stale_inputs_.erase(std::remove(stale_inputs_.begin(), stale_inputs_.end(), input), stale_inputs_.end());
+}
+
+void GraphBuilder::restore_aliased_inputs() {
+    for (const InputAlias& a : aliases_) {
+        a.input->buffer = a.buffer;
+        a.input->data = a.data;
+        repoint_views(a.input);
+        if (std::find(stale_inputs_.begin(), stale_inputs_.end(), a.input) == stale_inputs_.end()) {
+            stale_inputs_.push_back(a.input);
+        }
+    }
+    aliases_.clear();
 }
 
 // Releasing a hold also forgets the retained graph (not the buffer). A held builder skips the probe, so
