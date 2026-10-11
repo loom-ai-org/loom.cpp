@@ -197,6 +197,23 @@ add_test(NAME test_graph_builder_shapes COMMAND test_graph_builder_shapes)
 set_tests_properties(test_graph_builder_shapes PROPERTIES LABELS ci)
 set_tests_properties(test_graph_builder_shapes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# Weights in ggml's CPU_REPACK buffer (LOOM_CPU_REPACK): every consumer but a direct F32 mul_mat is
+# routed to a plain copy (GgufModel::route_repacked_uses).
+add_test(
+    NAME gen_repack_test_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_repack_gguf.py
+            ${LOOM_FIXTURE_DIR}/repack_test.gguf
+)
+set_tests_properties(gen_repack_test_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_repack_test_gguf_fixture PROPERTIES FIXTURES_SETUP repack_test_gguf_fixture)
+
+add_executable(test_cpu_repack_routing ci/test_cpu_repack_routing.cpp)
+target_link_libraries(test_cpu_repack_routing PRIVATE loom::engine)
+target_compile_definitions(test_cpu_repack_routing PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_cpu_repack_routing COMMAND test_cpu_repack_routing)
+set_tests_properties(test_cpu_repack_routing PROPERTIES LABELS ci)
+set_tests_properties(test_cpu_repack_routing PROPERTIES FIXTURES_REQUIRED repack_test_gguf_fixture)
+
 add_executable(test_lua_bridge_has_function ci/test_lua_bridge_has_function.cpp)
 target_link_libraries(test_lua_bridge_has_function PRIVATE loom::engine)
 add_test(NAME test_lua_bridge_has_function COMMAND test_lua_bridge_has_function)

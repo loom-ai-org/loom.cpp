@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace loom {
 
@@ -31,6 +32,12 @@ void read_tensor_prefix(const ggml_tensor* t, void* dst, size_t nbytes) {
     if (nbytes > ggml_nbytes(t)) {
         throw Error("read_tensor_prefix: asked for " + std::to_string(nbytes) + " bytes of tensor '" +
                     std::string(ggml_get_name(t)) + "', which holds " + std::to_string(ggml_nbytes(t)));
+    }
+    // A weight in CPU_REPACK / CPU_KLEIDIAI (LOOM_CPU_REPACK) cannot be read back: no get_tensor.
+    const char* buft = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+    if (std::strcmp(buft, "CPU_REPACK") == 0 || std::strcmp(buft, "CPU_KLEIDIAI") == 0) {
+        throw Error("read_tensor_prefix: tensor '" + std::string(ggml_get_name(t)) + "' is in a " + buft +
+                    " buffer and cannot be read at graph-build time");
     }
     // Not a memcpy: on a device backend this is the download that makes the value host-readable at all.
     ggml_backend_tensor_get(const_cast<ggml_tensor*>(t), dst, 0, nbytes);
