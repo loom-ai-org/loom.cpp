@@ -116,7 +116,16 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < 5 && i < warm.size(); ++i) {
         std::printf("%s%d", i ? ", " : "", static_cast<int>(warm[i]));
     }
-    std::printf("]\n");
+    // And a digest of ALL of them: two arms that agree on five tokens can still part at the sixth
+    // (a repacked GEMM rounds differently from a plain one), and that must show up here.
+    uint64_t fnv = 1469598103934665603ULL;
+    for (double tok : warm) { fnv ^= static_cast<uint64_t>(static_cast<int64_t>(tok)); fnv *= 1099511628211ULL; }
+    std::printf("]  fnv=%016llx\n", static_cast<unsigned long long>(fnv));
+    if (std::getenv("BENCH_PRINT_TOKENS") != nullptr) {
+        std::printf("tokens:");
+        for (double tok : warm) std::printf(" %d", static_cast<int>(tok));
+        std::printf("\n");
+    }
     std::printf("infer_with_past  %6.2f s  (%zu tokens, %.2f tok/s)  best of %d\n",
                 with_past, got, got / with_past, nrun);
     if (refeed) {
