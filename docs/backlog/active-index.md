@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **LiteRT thread (2026-10-11): int8 is where XNNPACK's case is. The queue, in the user's order** | Results: Engine — performance, the XNNPACK item. **(1) Q4 arm** in `scripts/bench_xnnpack.cpp`: ggml Q4_0, also through `CPU_REPACK` (which re-lays Q4_0 for AVX2 as well as dotprod/i8mm), against XNNPACK `qd8_f32_qb4w` (and `qs8_qc4w` if it fits), on all four machines. **(2) Q8_0 through `CPU_REPACK` in the engine itself**, measured at model level on the M1, plus `GGML_CPU_KLEIDIAI=ON` on the Mac. Together with (1), this makes the ADRs' picture complete. **(3) ADR: the XNNPACK microkernel bridge** for quantized ops. Inputs from the 2026-10-11 discussion: microkernels called per tile from ggml's own threads through an `extra_buffer_type`, not the operator API (the operator API links every ISA's kernels: 1.46 MB of x86 kernels, 471 KB on ARMv6; total stripped 2.2 / 0.97 MB with pthreadpool+cpuinfo; and a second thread pool oversubscribes beside ggml's); vendored, pinned kernel sources (BSD-3); Q8_0 is NOT `qd8` (block-32 vs per-channel scales), so the exporter emits a per-channel int8 type rather than requantizing at load; default = an automatic dispatch table on (op, dtype, CPU features), a build option to compile it out, an env/config override per op for A/B only (dtype is an export decision, kernel set a runtime one); conv layout tax means conv-heavy models go channels-last at export; F32 GEMM is NOT routed (machine-dependent, and its two ARM defects are ggml fixes); a model-level accuracy gate (oracle/WER). **(4) ADR: static int8 (qs8)**: calibrated activation scales at export, int8 activations between ops (otherwise every boundary pays a quantize/dequantize), a new GGUF quant type, a WER gate. Target: Citrinet-256 on the Pi Zero, where Amdahl on the measured 3.9x GEMMs gives RTF 3.4 → ~1.5 (qd8 alone ~2.2), so real time needs the rest of the graph in int8 too. **(5) Port XNNPACK's softmax** (`f32-raddstoreexpminusmax` + `f32-rmax`) as a ggml patch, with an ACCURACY comparison against ggml's current `soft_max`, not just timing (the `SOFT_MAX` item). **(6) Fix ggml's F32 GEMM throughput at large K** on ARM (whisper `fc2`, K=3072, runs at half the rate of K=768 on the Pi 4 and the Pi Zero, not on the M1). Find where the drop starts by sweeping K, then fix the K blocking. It also hits Qwen3-0.6B's `down_proj` (the large-K item). The gemma-3 "KV leak" was not one ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT steps 1-2 (ADR-072, ADR-073), the T5 encoder bias (ADR-074) and the pad_crop retirement are on pushed branches `perf/delayed-shrink-zero-copy-inputs` / `chore/retire-pad-crop-relative-embeddings` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. |
+| **LiteRT thread (2026-10-11): int8 is where XNNPACK's case is. The queue, in the user's order** | Results: Engine — performance, the XNNPACK item. ~~**(1) Q4 arm**~~ **DONE 2026-10-11** (the XNNPACK item's "4-bit" block): Q4_0 is slower than Q8_0 in ggml except on ARMv6; ggml's own Q4_0 repack matches XNNPACK `qb4w` on the M1; `qb4w` wins 1.5-1.9x only where no repack applies (A72); XNNPACK's 4-bit is slower than its int8 everywhere; `qb4w` cannot take Q4_0 blocks as-is (positive BF16 scales only). **(2) Q8_0 — and Q4_0, which ggml repacks for AVX2 too — through `CPU_REPACK` in the engine itself**, measured at model level on the M1, plus `GGML_CPU_KLEIDIAI=ON` on the Mac. Together with (1), this makes the ADRs' picture complete. **(3) ADR: the XNNPACK microkernel bridge** for quantized ops. Inputs from the 2026-10-11 discussion: microkernels called per tile from ggml's own threads through an `extra_buffer_type`, not the operator API (the operator API links every ISA's kernels: 1.46 MB of x86 kernels, 471 KB on ARMv6; total stripped 2.2 / 0.97 MB with pthreadpool+cpuinfo; and a second thread pool oversubscribes beside ggml's); vendored, pinned kernel sources (BSD-3); Q8_0 is NOT `qd8` (block-32 vs per-channel scales), so the exporter emits a per-channel int8 type rather than requantizing at load; default = an automatic dispatch table on (op, dtype, CPU features), a build option to compile it out, an env/config override per op for A/B only (dtype is an export decision, kernel set a runtime one); conv layout tax means conv-heavy models go channels-last at export; F32 GEMM is NOT routed (machine-dependent, and its two ARM defects are ggml fixes); a model-level accuracy gate (oracle/WER). **(4) ADR: static int8 (qs8)**: calibrated activation scales at export, int8 activations between ops (otherwise every boundary pays a quantize/dequantize), a new GGUF quant type, a WER gate. Target: Citrinet-256 on the Pi Zero, where Amdahl on the measured 3.9x GEMMs gives RTF 3.4 → ~1.5 (qd8 alone ~2.2), so real time needs the rest of the graph in int8 too. **(5) Port XNNPACK's softmax** (`f32-raddstoreexpminusmax` + `f32-rmax`) as a ggml patch, with an ACCURACY comparison against ggml's current `soft_max`, not just timing (the `SOFT_MAX` item). **(6) Fix ggml's F32 GEMM throughput at large K** on ARM (whisper `fc2`, K=3072, runs at half the rate of K=768 on the Pi 4 and the Pi Zero, not on the M1). Find where the drop starts by sweeping K, then fix the K blocking. It also hits Qwen3-0.6B's `down_proj` (the large-K item). The gemma-3 "KV leak" was not one ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT steps 1-2 (ADR-072, ADR-073), the T5 encoder bias (ADR-074) and the pad_crop retirement are on pushed branches `perf/delayed-shrink-zero-copy-inputs` / `chore/retire-pad-crop-relative-embeddings` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -459,6 +459,82 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
     XNNPACK's `qd8` operators, as ggml's KleidiAI backend does for its own kernels. `GGML_CPU_KLEIDIAI`
     is OFF in loom's builds and was not measured. On accuracy, this harness only shows `qd8` comparable to Q8_0 on synthetic inputs.
     Per-channel scales are coarser than block-32, so a model-level gate (ASR oracle, WER) decides it.
+
+    **4-bit, 2026-10-11** (`./bench_xnnpack <t> <reps> <heads> q4`; queue step 1). ggml runs what a
+    Q4_0 export runs: `mul_mat` as Q4_0 x Q8_0, and a conv that dequantizes its folded Q4_0 kernel and
+    runs F32. `rpk` is the same Q4_0 weight in `CPU_REPACK`, which re-lays Q4_0 for **AVX2 (8x8) as well
+    as** dotprod (4x4) / i8mm (4x8). XNNPACK runs `qb4w` (qd8 x block-32 4-bit, Q4_0's arithmetic),
+    `qc4w` (qd8 x per-channel 4-bit), `qs8_qc4w` (static int8 x per-channel 4-bit), and `qd8` (int8) as
+    the in-process reference. **XNNPACK has no 4-bit convolution operator**, so on the conv rows only its
+    int8 conv runs. Timing table, ms, the mean of the runs (all runs agree within 1% except where a
+    range is given):
+
+    | VITS GEMMs (one synthesis) | ggml Q4_0 | Q4_0 `rpk` | `qb4w` | `qc4w` | `qs8_qc4w` | `qd8` (int8) | *ggml Q8_0* | *Q8_0 `rpk`* |
+    |---|---|---|---|---|---|---|---|---|
+    | Ryzen 3 3250U, 1t (4 runs) | 323.6 | 252.3 | 279.4 | 227.3 | 146.4 | 193.0 | *274.5* | n/a |
+    | M1 Pro, 1t | 67.3 | **34.5** | 36.2 | 31.0 | 19.2 | 27.6 | *58.3* | *36.4* |
+    | M1 Pro, 8t | 25.8 | 11.6 | 6.6 | 5.6 | 3.0 | 5.1 | *24.9* | *11.6* |
+    | Pi 4 (A72), 1t | 1445.7 | n/a | 771.9 | 658.9 | 2041.4 | 466.4 | *1250.4* | n/a |
+    | Pi 4, 4t | 464.1 | n/a | 270.1 | 242.2 | 511.6 | 194.4 | *419.6* | n/a |
+    | Pi Zero (ARM1176), 1t | 27331 | n/a | 25682 | 24221 | 21090 | 22339 | *40493* | n/a |
+
+    | whisper linears (one encoder) | ggml Q4_0 | Q4_0 `rpk` | `qb4w` | `qc4w` | `qs8_qc4w` | `qd8` (int8) | *ggml Q8_0* | *Q8_0 `rpk`* |
+    |---|---|---|---|---|---|---|---|---|
+    | Ryzen, 1t | 12157-13786 | 7430-13054 | 9572 | 7332 | 5377 | 6124 | *9300* | n/a |
+    | M1 Pro, 1t | 2063.8 | **889.7** | 972.9 | 747.0 | 697.2 | 608.5 | *1709.5* | *958.0* |
+    | M1 Pro, 8t | 297.5 | 132.8 | 135.6 | 105.1 | 95.8 | 87.0 | *249.6* | *142.2* |
+    | Pi 4, 1t | 40217.6 | n/a | 26109.2 | 21108.1 | 78107.0 | 15706.9 | *37131.1* | n/a |
+    | Pi 4, 4t | 10228.7 | n/a | 6668.5 | 5579.4 | 19469.0 | 3749.4 | *9547.7* | n/a |
+    | Pi Zero, 1t | 925432 | n/a | 868636 | 801938 | 855584 | 772490 | *1469275-1523519* | n/a |
+
+    | VITS convs (weighted) | ggml Q4_0 | XNNPACK `qd8` (int8) | *ggml Q8_0* |
+    |---|---|---|---|
+    | Ryzen, 1t | 610.0 | 583.0 | *466.3 (another session)* |
+    | M1 Pro, 1t / 8t | 211.8 / 38.8 | 54.7 / 12.6 | *210.8 / 39.6* |
+    | Pi 4, 1t / 4t | 2721.2 / 1049.3 | 1215.0 / 430.6 | *2666.1 / 1053.7* |
+    | Pi Zero, 1t | 94289 | 86617 | *95636* |
+
+    *Italic columns are the q8 runs of the same morning, against the same ggml build on each machine. The M1, the
+    Pi 4 and the Pi Zero reproduce across sessions (XNNPACK `qd8` reads the same in both). The Ryzen does not (the same
+    `qd8` conv went 464 ms to 527-626 ms), so on x86 only the in-run columns compare.*
+
+    - **A Q4_0 export is SLOWER than a Q8_0 one in ggml everywhere except the Pi Zero.** VITS GEMMs:
+      M1 67.3 against 58.3, Pi 4 1446 against 1250, Ryzen 324 against 275. On the Pi 4 both are slower
+      than ggml's own F32 (802 ms). The nibble unpack costs more than the halved weight bytes save on
+      these compute-bound shapes. **On ARMv6 it is the other way round**: Q4_0 is 1.48x (VITS) / 1.62x
+      (whisper) faster than Q8_0, through tinyBLAS's ARMv6 Q4_0 x Q8_0 kernel. Even so, ggml's F32
+      (19.0 s) still beats it, and every other arm in the table. A Q4_0 conv costs the same as a Q8_0
+      one, because both dequantize and run F32.
+    - **ggml's own Q4_0 repack closes the XNNPACK gap where it applies.** On the M1 (4x4, dotprod)
+      `rpk` is 1.95x (VITS) / 2.32x (whisper) over plain Q4_0, and **matches or beats** `qb4w` at one
+      thread (34.5 vs 36.2 ms, 890 vs 973 ms). At 8 threads it ties on whisper (133 vs 136) and loses
+      VITS's narrow-N GEMMs 1.76x (11.6 vs 6.6, the narrow-N scaling item). On x86 (8x8, AVX2) it is
+      1.28x on VITS. This makes queue step 2 (`CPU_REPACK` in the engine) cover Q4_0 on x86 too, not
+      only Q8_0 on dotprod ARM.
+    - **Where the repack does not apply, `qb4w` beats ggml Q4_0**: Pi 4 1.87x (VITS) / 1.54x (whisper)
+      at one thread, 1.72x / 1.53x at four. **On the Pi Zero the field is level**: ggml Q4_0 is within
+      1.06x (VITS) / 1.07x (whisper) of `qb4w`, and within 1.22x / 1.20x of `qd8`.
+    - **XNNPACK's dynamic 4-bit arms are slower than its own dynamic int8** (`qd8`) on every machine:
+      `qb4w` is 1.1-1.8x behind it and `qc4w` 1.0-1.5x (the narrowest gaps are on the Pi Zero). So 4-bit buys memory and nothing else. If speed
+      is the goal, the bridge's target is int8. Static `qs8_qc4w` is the fastest arm on the M1 and on
+      x86, but on the A72 it is **2.6-5.2x slower than `qd8`** (2041 against 466 ms at one thread).
+      XNNPACK has no fast A72 kernel for it.
+    - **XNNPACK cannot take a Q4_0 block as it is.** Q4_0's scale is signed (`d = max/-8` puts the
+      largest-magnitude element on nibble 0), and `qb4w` refuses any scale that is not positive
+      (`create` returns `invalid_parameter`). With d < 0, nibble 0 has no image under q -> 16-q, so
+      about half the blocks would lose their largest element. Its scale is also BF16, not F16. A bridge
+      therefore requantizes at load from a lossy source, or the exporter emits a positive-scale form.
+      Input for the bridge ADR (step 3).
+    - **Accuracy** (max |y - ref| / max |ref| against F32, on GAUSSIAN weights): Q4_0 6.5e-2 to 1.2e-1,
+      `qb4w` 6.9e-2 to 1.3e-1, per-channel `qc4w` 9.3e-2 to 1.9e-1 (`qs8_qc4w` 9.4e-2 to 2.0e-1),
+      int8 6e-3 to 1.2e-2, over every shape and machine. The q4 mode
+      fills its weights from N(0, sigma). The ramp the other modes use put both ends of every 32-block on
+      the 4-bit clamp, and ranked per-channel ABOVE block-32 (weight RMS on Gaussian data: Q4_0 1.66e-2,
+      positive-scale block-32 1.77e-2). Harness-level only, as for int8.
+    - **Open on x86: ggml's 4-bit `fc1` (N=3072) is unstable rep to rep.** Within one run, Q4_0 took
+      415-546 ms and `rpk` 226-509 ms, while the XNNPACK arms interleaved with them held within 5%
+      (`BENCH_DUMP_REPS=1` prints every repetition). Q8_0 on the same shape held at 301 ms in both
+      morning runs. Not chased: the dev box is the least representative machine.
   * [x] **Direct I/O buffers — measured, and the cost was not the Lua boundary.** Per-input timers
     (2026-10-11) put the Lua-built masks at 2.4 ms of a 10.4 s Qwen3 prefill and 1.2 ms of a VITS
     call. The real cost was retained outputs COPIED into a consumer's inputs: 501 ms of whisper's
