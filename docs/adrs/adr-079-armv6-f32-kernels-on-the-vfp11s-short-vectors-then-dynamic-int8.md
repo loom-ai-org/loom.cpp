@@ -117,3 +117,39 @@ does not allow it.
 * Every ARMv6 model gains without a re-export from the F32 family. Option 1 needs `Q8_0_PC` exports
   (ADR-076), and the Hub's Q8_0 cards stay valid as they are.
 * ADR-077 is held at its option 2. Its gates 1-2 stand as the measurements this ADR was decided on.
+
+## Gate 1, measured 2026-10-14: passed
+
+**The harness** is `scripts/armv6_shortvec.py`, which the kernel generators import. `enter` sets `LEN = 4,
+STRIDE = 1` and keeps the thread's RunFast bits. `leave` clears `LEN` and `STRIDE` only, because restoring a
+saved FPSCR would also roll back the exception flags the kernel raised. `lint` runs on a generator's whole
+output and rejects these inside a region: any way out of the function (`bl`, `blx`, `bx`, `svc`, a pc
+write), a second `vmsr`, f64 data processing, and a vector operand that would wrap around its bank. It also
+rejects a function that returns inside a region. So "calls nothing while `LEN != 0`" is checked when the
+asm is generated. Each case was shown to raise.
+
+**The test** is `scripts/armv6_shortvec_gate.c`. Two threads run a GEMM-tile kernel whose driver loops sit
+inside the region. A third thread runs scalar float probes: a bank-1 `vmla` whose result depends on `LEN`,
+plus compiled C math. A forked process does the same, all on the one core. A CLOCK_MONOTONIC timer signals
+each thread every 0.1 ms. The handler reads its live FPSCR and the interrupted one (the sigframe's VFP
+block), then runs the probe, the C math, and the short-vector kernel itself. Results are compared bit for
+bit with a scalar reference made in the same mode. A pass needs zero mismatches, and it also needs evidence
+that the case happened: signals that landed inside the kernel with `LEN = 4` saved, and involuntary switches.
+
+Pi Zero W, kernel 6.6.28+rpt-rpi-v6, 20 s per mode (parent + child summed):
+
+| mode | kernel calls (bad) | scalar checks (bad) | signals inside the kernel at `LEN = 4` | handler `LEN != 0` | involuntary switches |
+|---|---|---|---|---|---|
+| RunFast | 42,286 (0) | 1,321,516 (0) | 117,940 | 0 | 17,877 |
+| IEEE, every `vmla` underflows | 1,160 (0) | 813,533 (0) | 117,796 | 0 | 18,080 |
+
+In IEEE mode one call took 5.19 ms against 0.19 ms, so every vector `vmla` bounced. The kernel's VFP
+support code emulated all four lanes exactly, under signals. This means the `GGML_CPU_RUNFAST=0` path is
+slow but correct. **Sabotage turns the gate red.** With `SV_SABOTAGE=drop`, the handler clears `LEN` in the
+saved FPSCR, and all 25,215 kernel calls come out wrong. With `SV_SABOTAGE=leak`, it sets `LEN` in a scalar
+thread's saved FPSCR, and 309,398 of 309,464 scalar checks fail.
+
+**qemu-user fails this gate, and the board passes it.** qemu (`loom-armv6-build:bookworm`) enters a handler
+with the interrupted `LEN` still set, so every handler's own float math was vectorized. The interrupted
+kernel's results stayed right. This adds to [Retro-086](../retros/retro-086-qemu-matches-the-board-only-where-the-vfp-never-bounces.md):
+under qemu, ARMv6 tests of short-vector kernels must not depend on a signal handler that does float math.
