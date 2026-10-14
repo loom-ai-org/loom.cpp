@@ -634,14 +634,20 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
 //               tile in asm (scripts/gen_armv6_i8_tile.py, K = 256 unrolled), F32 epilogue.
 //   loom i8cl   the same kernel on a CHANNELS-LAST X and Y: the quantize becomes one sequential pass.
 //   loom qcf / loom qcl   the two quantize passes alone, so GEMM-only = arm - quantize.
+//   loom f32cf  the int8 arm's F32 counterpart AT EQUAL EFFORT (ADR-077 gate 1's analysis): an asm
+//               4x4 tile over K chunks of 128, unrolled, on the VFP11's short vectors in RunFast
+//               (scripts/gen_armv6_f32_tile.py), channels-first X packed per block, bias as the
+//               accumulators' start.
 // The loom arms exist only where the asm does (ARMv6: SIMD32 without NEON); elsewhere they read n/a.
 //
-// Build on ARMv6 adds the generated tile:  python3 scripts/gen_armv6_i8_tile.py tile.S  and  tile.S
-// on the g++ line above.
+// Build on ARMv6 adds the generated tiles:  python3 scripts/gen_armv6_i8_tile.py tile.S  and
+// python3 scripts/gen_armv6_f32_tile.py tile_f32.S, and both .S files on the g++ line above.
 #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON)
 #include <arm_acle.h>
 #define BENCH_ARMV6 1
 extern "C" void tile2x4_k256(const uint32_t* x, const uint32_t* w, int32_t* out);
+extern "C" void tile4x4_f32_kc_bias(const float* xp, const float* w, const float* b, float* y, int ystride);
+extern "C" void tile4x4_f32_kc_acc(const float* xp, const float* w, const float* b, float* y, int ystride);
 static inline unsigned fpscr_get() { unsigned f; __asm__ volatile("vmrs %0, fpscr" : "=r"(f)); return f; }
 static inline void fpscr_set(unsigned f) { __asm__ volatile("vmsr fpscr, %0" : : "r"(f)); }
 // vcvtr rounds by FPSCR (nearest-even), as lrintf does -- but lrintf is an out-of-line libm call on
@@ -761,6 +767,61 @@ static void gemm(const uint32_t* Xq, int T, const uint32_t* Wq, const float* sx,
         }
     }
 }
+// The F32 arm. W packed [N/4][K][4]; X channels-first [K][T]; Y [N][T]. Per block of TB time steps
+// and K chunk of KC = 128, X is first packed to [TB/4][KC][4] (8 KB at TB = 16), which stays in L1
+// while every channel quad's 2 KB of W at that chunk streams past it; the second chunk's tiles start
+// from the first chunk's partial sums in Y. FPSCR is set once around the tiles: LEN = 4 for them, and
+// RunFast, as the engine runs ARMv6 (ADR-078). The loops in between, the pack included (it copies
+// words, not floats), are integer code. The T % 4 tail is scalar C with LEN back at 1.
+// $BENCH_F32_TB overrides TB (a multiple of 4) for the blocking sweep.
+constexpr int KC = 128;
+static int f32_tb() {
+    static const int tb = [] { const char* e = std::getenv("BENCH_F32_TB"); return e ? std::atoi(e) : 16; }();
+    return tb;
+}
+static void gemm_f32(const float* X, int T, const float* Wp, const float* b, float* Y) {
+    const int TB = f32_tb();
+    static std::vector<uint32_t> xp_store;
+    xp_store.resize((size_t)TB * KC + 8);
+    uint32_t* Xp = (uint32_t*)(((uintptr_t)xp_store.data() + 31) & ~(uintptr_t)31);
+    const uint32_t* Xw = (const uint32_t*)X;
+    const unsigned f0 = fpscr_get();
+    const unsigned rf = (f0 & ~(7u << 16) & ~(3u << 20)) | (1u << 24) | (1u << 25);
+    fpscr_set(rf | (3u << 16));
+    const int T4 = T & ~3;
+    // $BENCH_F32_KOUTER=1 puts the K chunk OUTSIDE the time blocks, so one chunk's 128 KB of W can stay
+    // in the 128 KB L2 across all of T, at the price of a second pass over Y's partial sums.
+    static const bool kouter = std::getenv("BENCH_F32_KOUTER") != nullptr;
+    for (int ko = 0; ko < (kouter ? K : KC); ko += KC)
+    for (int t0 = 0; t0 < T4; t0 += TB) {
+        const int nt = std::min(TB, T4 - t0) / 4;
+        for (int kc = kouter ? ko : 0; kc < (kouter ? ko + KC : K); kc += KC) {
+            for (int j = 0; j < nt; ++j)
+                for (int k = 0; k < KC; ++k) {
+                    const uint32_t* src = Xw + (size_t)(kc + k) * T + t0 + 4 * j;
+                    uint32_t* dst = Xp + ((size_t)j * KC + k) * 4;
+                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+                }
+            for (int n = 0; n < N; n += 4) {
+                const float* w = Wp + (size_t)n * K + (size_t)kc * 4;
+                float* y = Y + (size_t)n * T + t0;
+                for (int j = 0; j < nt; ++j) {
+                    const float* xp = (const float*)(Xp + (size_t)j * KC * 4);
+                    if (kc == 0) tile4x4_f32_kc_bias(xp, w, b + n, y + 4 * j, T * 4);
+                    else tile4x4_f32_kc_acc(xp, w, b + n, y + 4 * j, T * 4);
+                }
+            }
+        }
+    }
+    fpscr_set(rf);
+    for (int t = T4; t < T; ++t)
+        for (int n = 0; n < N; ++n) {
+            float a = b[n];
+            for (int k = 0; k < K; ++k) a += Wp[(size_t)(n / 4) * K * 4 + k * 4 + n % 4] * X[(size_t)k * T + t];
+            Y[(size_t)n * T + t] = a;
+        }
+    fpscr_set(f0);
+}
 }  // namespace cit
 #endif
 
@@ -769,7 +830,7 @@ static int run_citrinet(ggml_backend_t be, pthreadpool_t pool, int reps, int nth
     struct S { int64_t T; int calls; };
     const S shapes[] = {{1101, 7}, {551, 36}, {276, 42}, {138, 46}};   // jfk's CONV_2D calls by T
     const std::vector<std::string> names = {"ggml q8_0", "ggml f32", "ggml f32rf", "ggml q8mm", "xnn qd8",
-                                            "xnn qs8", "loom i8cf", "loom i8cl", "loom qcf", "loom qcl"};
+                                            "xnn qs8", "loom i8cf", "loom i8cl", "loom qcf", "loom qcl", "loom f32cf"};
     const size_t na = names.size();
     std::mt19937 rng(7);
     std::normal_distribution<float> nx(0, 1), nw(0, 0.06f);
@@ -782,6 +843,8 @@ static int run_citrinet(ggml_backend_t be, pthreadpool_t pool, int reps, int nth
     std::vector<uint32_t> Wq16(N * K / 2);   // int8 values held as int16 pairs, [N][K/2]
     for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; k += 2)
         Wq16[(n * K + k) / 2] = (uint16_t)(int16_t)Wq8[n * K + k] | ((uint32_t)(uint16_t)(int16_t)Wq8[n * K + k + 1] << 16);
+    std::vector<float> Wp(N * K);   // [N/4][K][4], the F32 tile's order
+    for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; ++k) Wp[(n / 4) * K * 4 + k * 4 + n % 4] = W[n * K + k];
 #endif
     if (nth != 1) std::printf("note: ggml f32rf sets FPSCR on the calling thread only; read it at threads=1\n");
 
@@ -928,9 +991,20 @@ static int run_citrinet(ggml_backend_t be, pthreadpool_t pool, int reps, int nth
         }
         arms.push_back({names[8], [&] { cit::quantize_cf(Xcf.data(), (int)T, Xq.data(), sxv.data()); }, {}});
         arms.push_back({names[9], [&] { cit::quantize_cl(Xcl.data(), (int)T, Xq.data(), sxv.data()); }, {}});
+        std::vector<float> Yf(N * T);
+        arms.push_back({names[10], [&] { cit::gemm_f32(Xcf.data(), (int)T, Wp.data(), B.data(), Yf.data()); },
+                        [&] { std::vector<float> y(T * N);
+                              for (int64_t n = 0; n < N; ++n) for (int64_t t = 0; t < T; ++t) y[t * N + n] = Yf[n * T + t];
+                              return y; }});
 #else
         for (size_t i = 6; i < na; ++i) arms.push_back({names[i], {}, {}});
 #endif
+        // $BENCH_ARMS (comma-separated names) keeps only those arms, for a sweep; the default is all.
+        if (const char* only = std::getenv("BENCH_ARMS")) {
+            const std::string keep = std::string(",") + only + ",";
+            for (Arm& a : arms)
+                if (keep.find("," + a.name + ",") == std::string::npos) { a.run = {}; a.out = {}; }
+        }
         // Alternate the arms repetition by repetition and take the median, as run_lowp does.
         for (int w = 0; w < 2; ++w) for (Arm& a : arms) if (a.run) a.run();
         std::vector<std::vector<double>> t(na);
@@ -940,7 +1014,7 @@ static int run_citrinet(ggml_backend_t be, pthreadpool_t pool, int reps, int nth
                 const double t0 = now(); arms[i].run(); t[i].push_back(now() - t0);
             }
 #ifdef BENCH_ARMV6
-        {   // the two layouts run the same arithmetic, so their outputs must agree bit for bit
+        if (arms[6].out && arms[7].out) {   // the two layouts run the same arithmetic: bit for bit
             const std::vector<float> a = arms[6].out(), b = arms[7].out();
             if (a != b) { std::fprintf(stderr, "T=%lld: loom i8cf and i8cl differ\n", (long long)T); std::exit(1); }
         }

@@ -4,6 +4,8 @@
 //   ./bench44 vfp 1     the same in RunFast (FPSCR FZ | DN; exceptions are off by default)
 //   ./bench44 smlad 0   SMLAD (two 16x16 MACs), 8 independent accumulators, operands in registers
 //   ./bench44 smlad 1   SMLAD with the two word loads per four SMLADs a dw/GEMM inner loop needs
+//   ./bench44 vfpvec 0  vmla.f32 as VFP11 short vectors (LEN 8), RunFast, operands in registers
+//   ./bench44 vfpvec 1  the same with the loads an F32 GEMM tile needs (8 X + 2 W floats per 16 MACs)
 //
 // Pi Zero W, 2026-10-14 (second round; the first ran during the governor's clock ramp):
 //
@@ -81,8 +83,60 @@ static void smlad(int mode) {
     printf("mode=%d  %.3f G-SMLAD/s = %.3f GMAC/s  (%.2f ns per smlad)  [%u]\n", mode, N / dt / 1e9, 2 * N / dt / 1e9, dt / N * 1e9, acc[0]);
     }
 
+// VFP11 short vectors (FPSCR LEN = 8, STRIDE = 1), in RunFast. `vmla s16, s8, s0` is then eight MACs:
+// s16-s23 += s8-s15 * s0 (a destination outside bank 0 makes it a vector op, a bank-0 Sm a scalar
+// operand). mode 0: two accumulator banks, operands in registers. mode 1: the F32 GEMM inner loop's
+// shape -- per k, eight X floats and two W scalars loaded from L1 (vldmia), then two vector vmlas.
+static void vfpvec(int mode) {
+
+    unsigned f0; __asm__ volatile("vmrs %0, fpscr" : "=r"(f0));
+    const unsigned f = (f0 & ~(7u << 16) & ~(3u << 20)) | (1u << 24) | (1u << 25) | (7u << 16);
+    const long N = 64000000;                         // MACs
+    static float buf[2560] __attribute__((aligned(32)));
+    for (int i = 0; i < 2560; ++i) buf[i] = 1.0f + (i & 7) * 1e-3f;
+    float out[16];
+    double t0 = now();
+    if (mode == 0) {
+        __asm__ volatile(
+            "vmsr fpscr, %3\n"
+            "vldmia %2, {s0-s15}\n vldmia %2, {s16-s31}\n"
+            "mov r4, %1\n"
+            "1:\n"
+            "vmla.f32 s16, s8, s0\n vmla.f32 s24, s8, s1\n vmla.f32 s16, s8, s2\n vmla.f32 s24, s8, s3\n"
+            "subs r4, r4, #1\n bne 1b\n"
+            "vmsr fpscr, %4\n"
+            "vstmia %0, {s16-s31}\n"
+            : : "r"(out), "r"(N / 32), "r"(buf), "r"(f), "r"(f0)
+            : "r4", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15",
+              "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23", "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31", "memory", "cc");
+    } else {
+        // 256 k per pass over a 10 KB buffer (X 8 KB + W 2 KB), so every load hits L1.
+        __asm__ volatile(
+            "vmsr fpscr, %3\n"
+            "vldmia %2, {s16-s31}\n"
+            "mov r4, %1\n"
+            "2:\n mov r5, %2\n add r6, %2, #8192\n mov r7, #128\n"
+            "1:\n"
+            "vldmia r5!, {s8-s15}\n vldmia r6!, {s0-s1}\n"
+            "vmla.f32 s16, s8, s0\n vmla.f32 s24, s8, s1\n"
+            "vldmia r5!, {s8-s15}\n vldmia r6!, {s0-s1}\n"
+            "vmla.f32 s16, s8, s0\n vmla.f32 s24, s8, s1\n"
+            "subs r7, r7, #1\n bne 1b\n"
+            "subs r4, r4, #1\n bne 2b\n"
+            "vmsr fpscr, %4\n"
+            "vstmia %0, {s16-s31}\n"
+            : : "r"(out), "r"(N / (16 * 256)), "r"(buf), "r"(f), "r"(f0)
+            : "r4", "r5", "r6", "r7", "s0", "s1", "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15",
+              "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23", "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31", "memory", "cc");
+    }
+    double dt = now() - t0;
+    printf("vector mode=%d  %.3f GMAC/s  (%.2f ns per MAC)  [%g]\n", mode, N / dt / 1e9, dt / N * 1e9, out[0]);
+    }
+
 int main(int argc, char ** argv) {
     const int mode = argc > 2 ? atoi(argv[2]) : 0;
-    if (argc > 1 && !strcmp(argv[1], "smlad")) smlad(mode); else vfp(mode);
+    if (argc > 1 && !strcmp(argv[1], "smlad")) smlad(mode);
+    else if (argc > 1 && !strcmp(argv[1], "vfpvec")) vfpvec(mode);
+    else vfp(mode);
     return 0;
 }
