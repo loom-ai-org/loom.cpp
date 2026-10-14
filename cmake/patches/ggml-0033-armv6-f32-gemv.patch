@@ -1,0 +1,107 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 77f21154..62441e1d 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1252,6 +1252,89 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     }
+ }
+ 
++// ARMv6 ONLY: THE ONE-COLUMN F32 MUL_MAT (a decoder's step, an LSTM's step; loom ADR-079, item P4.32c).
++//
++// llamafile_sgemm declines n = 1, so on this core such a product reaches ggml_vec_dot_f32 once per
++// output, and with no GGML_SIMD here that is the scalar branch: each product rounded to float, summed in
++// double, one dependent chain per output. Moonshine tiny's 288 x 32768 vocabulary
++// projection streams its weights at 91 MB/s that way, 0.415 s per token, where the board reads 338 MB/s
++// with PLD (loom scripts/bench48.c).
++//
++// Here four rows go per pass, each keeping EXACTLY that arithmetic -- float product, double sum, k in
++// order -- so the result is bit-identical to the path it replaces, and the four independent chains hide
++// the double add's latency. Measured on a Pi Zero W at that shape (one thread, RunFast, MB/s of weights):
++//
++//     double sum, 4 rows                 274      <- this
++//     double sum, 8 rows                 273      the double ops are the bound, not the streams
++//     double sum, 4 rows, PLD +128 B     247      a PLD per row and line COSTS here, at 128 B or 256 B
++//     float sum, 4 rows (bench48)        316      +15%, but not bit-identical: every decoder on this
++//     float sum, 8 rows                  328      core would need a numerics gate, for ~2% of Moonshine
++//
++// Rows are split into contiguous ranges, one per thread.
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++static void ggml_armv6_gemv_rows(const char * a, size_t lda, const float * x, float * y,
++                                 int64_t k, int64_t r0, int64_t r1) {
++    int64_t n = r0;
++    for (; n + 4 <= r1; n += 4) {
++        const float * w0 = (const float *) (a + n * lda);
++        const float * w1 = (const float *) (a + (n + 1) * lda);
++        const float * w2 = (const float *) (a + (n + 2) * lda);
++        const float * w3 = (const float *) (a + (n + 3) * lda);
++        ggml_float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
++        int64_t i = 0;
++        for (; i + 8 <= k; i += 8) {
++            for (int j = 0; j < 8; ++j) {
++                const float v = x[i + j];
++                s0 += (ggml_float) (w0[i + j] * v);
++                s1 += (ggml_float) (w1[i + j] * v);
++                s2 += (ggml_float) (w2[i + j] * v);
++                s3 += (ggml_float) (w3[i + j] * v);
++            }
++        }
++        for (; i < k; ++i) {
++            const float v = x[i];
++            s0 += (ggml_float) (w0[i] * v); s1 += (ggml_float) (w1[i] * v);
++            s2 += (ggml_float) (w2[i] * v); s3 += (ggml_float) (w3[i] * v);
++        }
++        y[n] = (float) s0; y[n + 1] = (float) s1; y[n + 2] = (float) s2; y[n + 3] = (float) s3;
++    }
++    for (; n < r1; ++n) {
++        const float * w = (const float *) (a + n * lda);
++        ggml_float s = 0.0;
++        for (int64_t i = 0; i < k; ++i) s += (ggml_float) (w[i] * x[i]);
++        y[n] = (float) s;
++    }
++}
++
++static bool ggml_armv6_gemv(const struct ggml_compute_params * params, const struct ggml_tensor * src0,
++                            const struct ggml_tensor * src1, struct ggml_tensor * dst) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * e = getenv("GGML_CPU_ARMV6_GEMV");
++        enabled = !(e && e[0] == '0');
++    }
++    if (!enabled || params->use_ref) return false;
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (src1->ne[1] != 1) return false;
++    if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) return false;
++
++    const int64_t K = src0->ne[0], M = src0->ne[1];
++    const int64_t r2 = src1->ne[2] / src0->ne[2], r3 = src1->ne[3] / src0->ne[3];
++    // Rows in contiguous ranges of four, so every thread's passes are whole and its streams its own.
++    const int64_t quads = (M + 3) / 4;
++    const int64_t per   = (quads + params->nth - 1) / params->nth;
++    const int64_t m0    = MIN(M, params->ith * per * 4), m1 = MIN(M, m0 + per * 4);
++    for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3)
++        for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
++            const char *  a = (const char *) src0->data + (i2 / r2) * src0->nb[2] + (i3 / r3) * src0->nb[3];
++            const float * x = (const float *) ((const char *) src1->data + i2 * src1->nb[2] + i3 * src1->nb[3]);
++            float *       y = (float *) ((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
++            ggml_armv6_gemv_rows(a, src0->nb[1], x, y, K, m0, m1);
++        }
++    return true;
++}
++#endif
++
+ void ggml_compute_forward_mul_mat(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1297,6 +1380,12 @@ void ggml_compute_forward_mul_mat(
+     // nb01 >= nb00 - src0 is not transposed
+     //   compute by src0 rows
+ 
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++    if (ggml_armv6_gemv(params, src0, src1, dst)) {
++        return;
++    }
++#endif
++
+     // TODO: extract to "extra_op"
+ #if GGML_USE_LLAMAFILE
+     // broadcast factors

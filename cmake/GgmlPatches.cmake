@@ -67,6 +67,10 @@ function(loom_patch_ggml SOURCE_DIR)
     # time a measurement in a patch header is corrected. Resetting the dependency is safe (it is a
     # FetchContent checkout, not somewhere to keep work) and turns "edit a patch, reconfigure" from a
     # hard error with a manual `git checkout` into something that just works.
+    #
+    # `git clean` too, not only `checkout`: a patch that ADDS a file (ggml-0032's generated kernels) leaves
+    # it untracked, and after an edit to that patch the retry would fail on "already exists in working
+    # directory". Untracked only, not ignored files (no -x).
     message(STATUS "ggml patches did not apply cleanly; resetting the checkout and retrying")
     execute_process(
         COMMAND ${GIT_EXECUTABLE} checkout -- .
@@ -74,6 +78,14 @@ function(loom_patch_ggml SOURCE_DIR)
         RESULT_VARIABLE reset_ok
         ERROR_QUIET OUTPUT_QUIET
     )
+    if(reset_ok EQUAL 0)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clean -fdq
+            WORKING_DIRECTORY "${SOURCE_DIR}"
+            RESULT_VARIABLE reset_ok
+            ERROR_QUIET OUTPUT_QUIET
+        )
+    endif()
     if(reset_ok EQUAL 0)
         _loom_try_ggml_patches("${SOURCE_DIR}" ok)
         if(ok)

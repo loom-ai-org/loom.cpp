@@ -1516,14 +1516,16 @@ No compiler emits it, because every compiled function assumes `LEN = 0`.
 
 **Change.** On ARMv6 with VFP only, `ggml_compute_forward_conv_2d_impl` first offers every 1-D, stride-1,
 F32 convolution with k = 2..11 to a new path. A quantized kernel arrives here already dequantized. Per
-block of 64 output steps (fewer for wide inputs, so the window stays near the 16 KB L1), the path copies
-the input window out in C, applying zero padding and a fused `LEAKY_RELU`. Then, for each quad of output
-channels, a generated asm function runs the block's 4-channel x 4-step tiles. It sets `LEN = 4` once,
-runs integer loops and VFP code only, calls nothing, and clears `LEN` before it returns. The bias starts
-the accumulators, and a fused residual is added as each block is flushed. A result written over the input
-(ggml-alloc does that to a vocoder's convolutions) is held until the next block's window is copied. The
-weights are packed `[OC/4][IC][k][4]` per call, and a partial last quad is padded with zero channels.
-`GGML_CPU_ARMV6_CONV=0` turns the path off.
+block of 128 output steps and chunk of input channels (sized so the chunk's window rows and one quad's
+weights fit 12 KB of the 16 KB L1), the path copies the window out in C, applying zero padding and a
+fused `LEAKY_RELU`. Then, for each quad of output channels, a generated asm function runs the block's
+4-channel x 4-step tiles. It sets `LEN = 4` once, runs integer loops and VFP code only, calls nothing,
+and clears `LEN` before it returns. The first chunk starts the accumulators from the bias, and each later
+chunk continues from the partial sums in the output tile. A fused residual is added as each block is
+flushed. A result written over the input (ggml-alloc does that to a vocoder's convolutions) is held until
+the next block's window is copied. A ragged block computes whole tiles into staging and flushes only its
+steps. The weights are packed `[OC/4][IC][k][4]` per call, and a partial last quad is padded with zero
+channels. `GGML_CPU_ARMV6_CONV=0` turns the path off.
 
 **Safety.** Linux clears `LEN` and `STRIDE` for a signal handler, restores the interrupted FPSCR on
 sigreturn, and saves it per thread. That was checked on a Pi Zero W under ~118k signals that landed inside
@@ -1537,7 +1539,31 @@ no FMA. That is a different summation order from the paths it replaces, so outpu
 (`scripts/bench50.cpp`, conv + fused bias): 13.4-13.5 s → 5.03-5.06 s (2.67x), 1.16 GOP/s, which is at or
 above the standalone kernel's rate on every shape. End to end, two rounds ABBA, path off → on: piper-style
 voices amy 39.8 → 22.9 s and de051 8.41 → 4.84 s, VITS 60.3 → 34.8 s (1.73-1.74x), with whisper transcripts
-identical in both arms. Models without such convolutions are bit-identical.
+identical in both arms. Models without such convolutions are bit-identical. The input-channel chunks
+(the first version held the whole window and ran the dilated and wide shapes at 0.35-0.58 GOP/s) took the
+models' own slow shapes 8.73 → 5.56 s and VITS a further 34.6 → 25.3 s, amy 22.9 → 18.6 s, with
+bit-identical outputs.
+
+## PR 30 — `cpu`: a one-column F32 `mul_mat` on ARMv6, bit-identical and 3x faster
+
+*(`cmake/patches/ggml-0033-armv6-f32-gemv.patch`)*
+
+**Problem.** On the ARM1176 (Raspberry Pi 1 / Zero), `llamafile_sgemm` declines n = 1, so a decoder step
+or an LSTM step reaches `ggml_vec_dot_f32` once per output. With no `GGML_SIMD` on this core, that is the
+scalar branch: a float product summed in double, one dependent chain per output. A 288 x 32768 F32
+vocabulary projection streams its weights at 91 MB/s, where the board reads 274+ MB/s.
+
+**Change.** On ARMv6 with VFP only, `ggml_compute_forward_mul_mat` first offers an F32 x F32 product with
+one column to a GEMV that runs four rows per pass. Each row keeps exactly `vec_dot_f32`'s arithmetic
+(float product, double sum, k in order), so the result is **bit-identical**. Rows are split into
+contiguous ranges per thread. `GGML_CPU_ARMV6_GEMV=0` turns it off.
+
+**Measured**, Pi Zero W, one thread, RunFast, tensors in a CPU backend buffer (loom `scripts/bench51.cpp`):
+288 x 32768 and 288 x 2304 at 274-275 MB/s against 91-92 (3.0x), checksums identical. Variants, all
+measured: 8 rows a pass changed nothing (273), because the double ops are the bound. A PLD per row and
+cache line cost 10% (247). A float sum would reach 316-328 MB/s, but it would not be bit-identical.
+Placement matters on this core: the same kernel and bytes ran 216 MB/s from a 4-byte-aligned context
+allocation (page offset 340) and 274 from an 8-byte-aligned one.
 
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 

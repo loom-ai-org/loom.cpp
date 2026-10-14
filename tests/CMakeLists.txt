@@ -299,6 +299,11 @@ target_link_libraries(test_conv_1d_sweep PRIVATE loom::engine)
 add_test(NAME test_conv_1d_sweep COMMAND test_conv_1d_sweep)
 set_tests_properties(test_conv_1d_sweep PROPERTIES LABELS ci)
 
+add_executable(test_mul_mat_f32_sweep ci/test_mul_mat_f32_sweep.cpp)
+target_link_libraries(test_mul_mat_f32_sweep PRIVATE loom::engine)
+add_test(NAME test_mul_mat_f32_sweep COMMAND test_mul_mat_f32_sweep)
+set_tests_properties(test_mul_mat_f32_sweep PROPERTIES LABELS ci)
+
 add_executable(test_conv_dw_fusion ci/test_conv_dw_fusion.cpp)
 target_link_libraries(test_conv_dw_fusion PRIVATE loom::engine)
 add_test(NAME test_conv_dw_fusion_unfused COMMAND test_conv_dw_fusion)
