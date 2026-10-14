@@ -400,16 +400,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   `MUL`, bias `ADD` and `RELU` fuse in any precision. RunFast gives the VFP's `vmla` 1.65x (`scripts/bench44.c`), which
   also moves the "GEMM ceiling" above. **Gate 2 measured 2026-10-14 in `bench_xnnpack.cpp`** ([ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md#gate-2-measured-2026-10-14-117-120-gops-at-the-gemm-104-111-with-the-quantize)):
   an asm SMLAD 2x4 tile runs jfk's 1x1 convs in 5.73 s channels-first / 5.35 s channels-last (1.04 / 1.11 GOP/s; GEMM
-  alone 1.17-1.20 against the gate's 1.2), vs XNNPACK `qs8` 9.3 s, ggml Q8_0 23.6 s, ggml F32 RunFast 12.0 s; pass/fail is
-  the user's call. Channels-last is worth 0.38 s at the op. **And the F32 card was paying for denormal traps**
-  (BN-folded dead channels, weights ~1e-33): RunFast alone takes jfk on the F32 card from ~61 s to 20-22 s, past the
+  alone 1.17-1.20 against the gate's 1.2), vs XNNPACK `qs8` 9.3 s, ggml Q8_0 23.6 s, ggml F32 RunFast 12.0 s: **passed** (user, 2026-10-14).
+  Channels-last is worth 0.38 s at the op, so it folds into gate 1's analysis rather than being built alone. **And the F32 card was paying for VFP bounces**
+  (BN-folded dead channels, weights ~1e-33, tiny accumulators cancelling): RunFast alone takes jfk on the F32 card from ~61 s to 20-22 s, past the
   Q8_0 card's 29-35 s, same ids. Open: why ggml's Q8_0 conv path is 1.65x slower than its F32 one on these shapes
-  (23.6 vs 14.4 s in the bench), the three F32 items in the ADR, and gate 1's cross-model analysis. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
-* [ ] **RunFast (VFP `FZ | DN`) on ARMv6 compute threads** ([ADR-078](../adrs/adr-078-runfast-on-armv6-compute-threads.md),
-  proposed 2026-10-14). `vmla` is 1.65x faster in RunFast on the Pi Zero, and denormals stop trapping to software:
-  Citrinet-256-ls's F32 card runs jfk in 20-22 s instead of ~61 s with it set from Python (no patch yet). It is a
-  numerics change, so it is gated in order: qemu honours `FZ | DN` bit for bit; every ARMv6 oracle with and without it;
-  an audit of what depends on IEEE mode; end-to-end speed on the board per model. *Context: [Epic-05](../epics/epic-05-edge-performance.md)*
+  (23.6 vs 14.4 s in the bench), two of the ADR's three F32 items (RunFast is done, ADR-078), and gate 1's cross-model analysis. Baseline now
+  the F32 card with ggml-0031: jfk 20.1 s. *Context: [Epic-03](../epics/epic-03-model-coverage.md)*
+* [ ] **RunFast (VFP `FZ | DN`) on ARMv6 compute threads: all four gates passed 2026-10-14, to merge**
+  ([ADR-078](../adrs/adr-078-runfast-on-armv6-compute-threads.md), accepted). `ggml-0031` on branch
+  `perf/adr077-armv6-int8` (not pushed), on by default, `GGML_CPU_RUNFAST=0` off. Pi Zero, 11 models: faster on every
+  one (Citrinet-256-ls F32 55.9 -> 20.1 s, 2.79x; the rest 1.02-1.33x), outputs identical (two differ below 1e-6 of
+  the peak). qemu does not reproduce the board in this mode, or in IEEE mode where the VFP bounces ([Retro-086](../retros/retro-086-qemu-matches-the-board-only-where-the-vfp-never-bounces.md)).
+  Left: merge, and a release so the ARMv6 wheel carries it. *Context: [Epic-05](../epics/epic-05-edge-performance.md)*
 * [ ] **WakeHuBERT's remaining gap to ONNX int8** (11.2 ms against 5.67, dev box, F32, one thread, after
   P4.31). Its convs already run ggml's direct `CONV_2D` at 55-68% of the F32 peak, so a better F32 GEMM
   buys ~2 ms at most. Levers by size: an FFT/STFT primitive in place of the 80 MFLOP DFT matmul (~2 ms,

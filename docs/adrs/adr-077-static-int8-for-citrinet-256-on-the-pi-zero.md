@@ -173,7 +173,8 @@ Citrinet:
 2. **RunFast on ARMv6 compute threads.** It gives `vmla` 1.65x throughput, and it should also stop the
    VFP11 trapping denormals to software support code. It is a numerics change: denormals flush to zero
    and NaNs become the default NaN. So it needs its own decision and a gate across the ARMv6 zoo
-   ([ADR-078](adr-078-runfast-on-armv6-compute-threads.md)).
+   ([ADR-078](adr-078-runfast-on-armv6-compute-threads.md)). **Done 2026-10-14:** accepted with all four
+   gates passed, as `ggml-0031`, on by default.
 3. **Skip or fuse the padding-mask `MUL`, the bias `ADD` and the `RELU`** around Citrinet's 1x1 convs.
 
 RunFast is scoped across the zoo in [ADR-078](adr-078-runfast-on-armv6-compute-threads.md). Gate 2,
@@ -202,8 +203,7 @@ repetition and the median is taken; two rounds agree within 1%.
 **The gate asks for 1.2 GOP/s, and the GEMM alone is at the line: 1.17-1.20.** With the activation
 quantize it is 1.04-1.11. That is 1.6-1.8x XNNPACK's `qs8`, 3.0-3.2x its `qd8`, 4.1-4.4x the Q8_0 card's
 path, and 2.0-2.2x ggml's F32 conv in RunFast. The gate's 1.2 was derived for a non-GEMM budget of
-5.8 s, and gate 1 found that budget can be ~1.5-2.5 s. Whether 1.04-1.20 passes is a decision for the
-user, and this section does not take it.
+5.8 s, and gate 1 found that budget can be ~1.5-2.5 s. **Gate 2 passed** (the user's call, 2026-10-14).
 
 The kernel is dynamic int8 (option 1). X is quantized per time step (symmetric, int8 range) and held as
 int16 `[T][K]`. W is per-channel symmetric int8, also held as int16. A 2x4 tile does 8 SMLADs and 6 loads
@@ -227,15 +227,19 @@ emitted one chain at a time): channels-first went from 0.81 to 0.67 s, and chann
 0.37 s. The rest of the difference is the epilogue's contiguous stores (0.08 s). Exporting Citrinet
 channels-last needs a layout pass over the whole encoder: the 1x1 convs as `mul_mat`, the masks, SE and
 residuals re-laid, and a channels-last depthwise conv in the engine, or a pair of transposes around each
-of the 107 depthwise convs. That is ~1% of today's 37.5 s and ~5% of a projected ~7.5 s.
+of the 107 depthwise convs. That is ~1% of today's 37.5 s and ~5% of a projected ~7.5 s. **So it is not
+built on its own** (the user's call, 2026-10-14): it folds into [the analysis that decides gate
+1](#the-analysis-that-decides-gate-1), since option 2's design emits the encoder channels-last anyway and
+static int8 is where a layout pass would pay for itself.
 
-## Found while measuring gate 2: the F32 card was paying for denormal traps
+## Found while measuring gate 2: the F32 card was paying for VFP bounces
 
 The bench's ggml F32 conv ran jfk's 1x1 convs in 14.4 s, but the F32 card's profile spends 52.3 s on the
 same 131 `CONV_2D` nodes, and 3-5x more per call at T <= 551. The cause starts in the weights. The F32 card has
 137,472 weights below 1e-20 (17,989 below 1e-30), concentrated in the 1x1 kernels: BatchNorm-folded dead
-channels at ~1e-33. Their products with ordinary activations underflow to denormals, and the VFP11 traps
-every one of them to software. Q8_0 rounds those weights to exactly 0, which is the main reason the Q8_0
+channels at ~1e-33. A dead channel's accumulator stays that small, so each opposite-sign product makes
+its `vmla` an effective subtraction below 2^-96, which the VFP11 bounces to the kernel's support code in
+case it underflows: ~1.1 us each, against 8 ns (`scripts/bench47.c`; Retro-085, corrected). Q8_0 rounds those weights to exactly 0, which is the main reason the Q8_0
 card was faster than F32 on this board at all. jfk on the Pi Zero, one thread, two rounds, every run
 giving the same transcript ids as its card's IEEE run:
 
@@ -247,13 +251,15 @@ giving the same transcript ids as its card's IEEE run:
 
 So **RunFast alone takes the F32 card from RTF 5.6 to ~1.9, past the Q8_0 card in either mode (RTF
 2.7-3.2).** Zeroing the tiny
-weights at export recovers only part of that (44 s), so denormal activations carry the rest. The Q8_0
+weights at export recovers only part of that (44 s): small activations also start accumulators in that
+range. The Q8_0
 card stays slower than F32 in RunFast because its 1x1 conv path is (bench: 23.6 s against 14.4 s on the
 same shapes, the same F32 implementation after a cheap dequantize; not yet explained).
 
 This moves gate 2's comparison arm. The int8 kernel's 5.4-5.7 s replaces ~12 s of F32 1x1 convs in
-RunFast, not ~28 s of the Q8_0 card's. The ARMv6 decision now goes through
-[ADR-078](adr-078-runfast-on-armv6-compute-threads.md) first.
+RunFast, not ~28 s of the Q8_0 card's. The ARMv6 decision went through
+[ADR-078](adr-078-runfast-on-armv6-compute-threads.md) first. That is now accepted, and with the patch in
+the engine the F32 card runs jfk in **20.1 s** (RTF ~1.8), which is this ADR's baseline from here on.
 
 ## Consequences
 
