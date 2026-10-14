@@ -199,3 +199,44 @@ deterministic across rounds.
 falls short: projected ~7.7, measured 10.9. Its convolution seconds now run at ~0.7 GOP/s, not 1.16. Its
 wide-input stages (128-768 channels, a few hundred steps) shrink TB and re-stream large weights, and its
 OC = 1 post-conv uses a quarter of each tile. Those shapes are the open part of this item.
+
+## P4.32b's wide and dilated shapes, and P4.32c (the GEMV), measured 2026-10-15
+
+**Why VITS fell short.** A node-level board profile showed the dilated half of every resblock at half
+rate: amy 48ch k7 ran 0.53 GOP/s against 0.89 for its d = 1 twin, and VITS 64ch k7 0.40 against 0.80. The
+wide stages ran 0.35-0.58. The window `[IC][TB + (k-1)d]` plus one quad's weights came to 20-55 KB against
+the 16 KB L1. **Fix:** the input channels go in chunks sized so a chunk's window rows and weights fit
+12 KB. Chunk 0 starts from the bias, and each later chunk continues from the partial sums in the output
+tile (a NULL bias in the kernel). A ragged block runs whole tiles into the staging buffer and flushes only
+its steps, because an overlapping tile would add a chunk twice. TB went to 128 on a board sweep (TB
+64/96/128/192/256 = 1.12/1.15/1.16-1.17/1.15/1.12 GOP/s over the models' shapes; the L1 budget is flat
+from 8 to 16 KB). On `bench50 model` (the profile's slow shapes) the set goes 8.73 → 5.56 s (0.75 → 1.17
+GOP/s), and bench49's set 1.16 → 1.19. **The arithmetic per output is unchanged**, so the outputs are
+bit-identical to the first P4.32b.
+
+**P4.32c.** `llamafile_sgemm` declines n = 1, so on this core every one-column F32 `mul_mat` ran
+`ggml_vec_dot_f32`'s scalar branch: float products summed in double, one chain per output, 91 MB/s.
+`ggml-0033` runs four rows a pass with exactly that arithmetic, so the output is **bit-identical**.
+`scripts/bench51.cpp`, with tensors in a CPU backend buffer as in the engine: 274-275 MB/s on Moonshine's
+shapes (3.0x). Gate 2 holds against the equal-arithmetic microbench (274), not against bench48's float sum
+(316). A float sum would be ~15% faster on the GEMV, about 2% of a Moonshine run, and every decoder on this
+core would need a numerics gate for it. A PLD per row and line cost 10%, and 8 rows a pass changed nothing.
+**A placement effect, recorded so it is not mistaken for the kernel:** the same function and bytes ran 216
+MB/s from a 32-bit `ggml_init` context allocation (4-byte tensor alignment, page offset 340) and 274 from an
+8-byte-aligned one.
+
+**Gates 3 and 4** (the P4.32b wheel against the new one, `armv6_runfast_gate.sh` with `PY0`/`PY1`, 13
+models, two rounds ABBA): **every output bit-identical**, and every run deterministic.
+
+| model | P4.32b | now | speed-up | RTF |
+|---|---|---|---|---|
+| VITS (3.2 s) | 34.6 s | 25.3 s | **1.37x** | 10.8 → 7.91 |
+| Silero VAD (jfk) | 4.39 s | 2.99 s | **1.47x** | 0.40 → 0.27 |
+| Moonshine tiny F32 (jfk) | 61.9 s | 47.0 s | **1.32x** | 5.62 → 4.27 |
+| piperlite amy (5.9 s) | 22.9 s | 18.6 s | **1.23x** | 3.89 → 3.16 |
+| piperlite de051 (4.4 s) | 4.91 s | 4.56 s | 1.08x | 1.12 → 1.04 |
+| sanoTTS heart (3.2 s) | 5.19 s | 5.02 s | 1.04x | 1.62 → 1.57 |
+| the other seven | | | 0.99-1.02x | unchanged |
+
+Against the session's starting point (ggml-0031 only), the vocoders are now 1.84-2.39x: VITS 60.3 → 25.3 s,
+amy 39.8 → 18.6 s, de051 8.41 → 4.56 s.

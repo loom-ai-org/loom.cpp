@@ -19,16 +19,22 @@
 #
 # Reused for any on/off switch read once at init: VAR=<env name> (default GGML_CPU_RUNFAST; ADR-079 P4.32b
 # used GGML_CPU_ARMV6_CONV). Arm 0 and arm 1 are that variable's values; the outputs keep the .rf0/.rf1
-# names. FLAGS=0 skips the flag census, which is ADR-078's own question.
+# names. FLAGS=0 skips the flag census, which is ADR-078's own question. PY0/PY1 give each arm its own
+# interpreter (two venvs, two wheels: a wheel A/B, with VAR then unset by default); each arm's probe runs
+# against that venv's libraries.
 set -u
 VAR="${VAR:-GGML_CPU_RUNFAST}"
 DIR="${DIR:-$HOME/rfgate}"
 cd "$DIR" || exit 1
 mkdir -p out
 sleep "${START:-120}"   # the launching ssh session is gone before the first arm
-PY=venv/bin/python
+PY0="${PY0:-venv/bin/python}"
+PY1="${PY1:-$PY0}"
+PY=$PY0
+libs() { local py; eval py=\$PY$1; echo "$(cd "$(dirname "$py")/.." && pwd)/lib/python3.11/site-packages/loom"; }
 run() {  # mode kind gguf input name tag
-  env "$VAR=$1" $PY armv6_runfast_gate.py $2 $3 $4 out/$5.rf$1.$6 >> gate.log 2>> gate.err
+  local py; eval py=\$PY$1
+  env "$VAR=$1" $py armv6_runfast_gate.py $2 $3 $4 out/$5.rf$1.$6 >> gate.log 2>> gate.err
   sleep "${SETTLE:-20}"
 }
 for round in 1 2; do
@@ -69,6 +75,6 @@ open(sys.argv[2], 'wb').write(array.array('f', [float(x) for x in t]).tobytes())
                 arg="tokens=@out/$name.in.f32" ;;
     *) continue ;;   # TTS: the waveform the gate run wrote is already the raw output
   esac
-  for m in 0 1; do env "$VAR=$m" ./probe "$gguf" out/$name.t$m.f32 "$body" "$arg" >> probe.log 2>&1; done
+  for m in 0 1; do env "$VAR=$m" LD_LIBRARY_PATH="$(libs $m)" ./probe "$gguf" out/$name.t$m.f32 "$body" "$arg" >> probe.log 2>&1; done
 done < models.txt
 echo ALL_DONE >> gate.log

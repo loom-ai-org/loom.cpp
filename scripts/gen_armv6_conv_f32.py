@@ -5,7 +5,7 @@
 #   python3 scripts/gen_armv6_conv_f32.py <ggml>/src/ggml-cpu/arch/arm/armv6-conv-f32.inc
 #
 # One function per kernel width k: ggml_armv6_conv_f32_k{k}(const ggml_armv6_conv_args *). It runs `nt`
-# consecutive tiles of 4 output channels x 4 time steps over a packed input window, the bench49 tile
+# consecutive tiles over one chunk of input channels (b = NULL continues a chunk sum already in y), of 4 output channels x 4 time steps over a packed input window, the bench49 tile
 # (gen_armv6_conv_tiles.py, 1.10-1.11 GOP/s on the vocoders' shapes) with two changes:
 #   * the dilation is an argument (d4 = dilation * 4 bytes), not an immediate. Tap j+1's address is kept
 #     in r7 and advanced by one `add` per tap, which issues while a vector vmla iterates;
@@ -33,7 +33,7 @@ KS = list(range(1, 12))       # 1x1 convs included: the same tile with one tap
 # Field offsets of ggml_armv6_conv_args, emitted into the header below and used by the asm.
 FIELDS = [("const float *", "x", "window + 4 * tile: row ic at x + ic * xrow bytes"),
           ("const float *", "w", "this quad's packed weights [IC][k][4]"),
-          ("const float *", "b", "bias of the quad's four channels (zeros when there is none)"),
+          ("const float *", "b", "bias of the quad's four channels; NULL: start from the partial sums in y"),
           ("float *", "y", "output of channel oc0 at the first tile; oc0 + r at y + r * ystride bytes"),
           ("int32_t", "ystride", "bytes between output channels"),
           ("int32_t", "n_ic", "input channels, >= 1"),
@@ -64,8 +64,19 @@ def kernel(k):
     e(f"    ldr r1, [r11, #{OFF['w']}]")
     e(f"    ldr r5, [r11, #{OFF['n_ic']}]")
     e(f"    ldr r3, [r11, #{OFF['b']}]")
+    e("    cmp r3, #0")
+    e("    beq 4f")
     e("    vldmia r3, {s0-s3}")
     e("    vmov.f32 s16, s0\n    vmov.f32 s20, s1\n    vmov.f32 s24, s2\n    vmov.f32 s28, s3")
+    e("    b 5f")
+    # A later input-channel chunk: the accumulators continue from the partial sums the earlier ones stored.
+    e("4:")
+    e("    mov r3, r10")
+    for i, bank in enumerate(["{s16-s19}", "{s20-s23}", "{s24-s27}", "{s28-s31}"]):
+        e(f"    vldmia r3, {bank}")
+        if i < 3:
+            e("    add r3, r3, r4")
+    e("5:")
     e("    vldr d4, [r0]\n    vldr d5, [r0, #8]")
     e("    add r7, r0, r2")
     e("    vldmia r1!, {s0-s3}")
