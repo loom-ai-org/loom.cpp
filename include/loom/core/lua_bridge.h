@@ -146,6 +146,22 @@ public:
     // (P4.24). Same stream, so the draw-ORDER caveat `rng_` documents applies to both callers.
     void seed_rng(uint32_t seed);
 
+    // The host's controls over every module's compute buffer -- GraphBuilder::hold_compute_buffer and
+    // GraphBuilder::release_compute_buffer applied bridge-wide (ADR-072). A C++ accessor, not a Lua
+    // binding: when to hold or let go of memory is the HOST's decision, which is why a driver script
+    // cannot see it.
+    //
+    // hold_compute_buffers also applies to every module whose builder does not exist yet -- builders are
+    // created on a module's first run, and a hold set before that run must not be lost to the laziness.
+    void hold_compute_buffers(bool hold);
+    // Releases every module's retained graph and compute buffer now. Retained outputs and the caches are
+    // not touched; the next run of each module rebuilds at the size it needs.
+    void release_compute_buffers();
+    // Bytes every module's compute buffer holds right now, summed (GraphBuilder::buffer_size). What a
+    // host reports as the model's working memory beyond its weights and caches, and how a test observes
+    // the two controls above without reaching into a builder.
+    size_t compute_buffer_bytes() const;
+
 private:
     struct Module {
         GgufModel* model;
@@ -186,6 +202,8 @@ private:
     lua_State* L_;
     Backends backends_;
     std::unordered_map<std::string, Module> modules_;
+    // hold_compute_buffers' setting, applied to each builder as module_builder() creates it.
+    bool hold_compute_buffers_ = false;
 
     // Backs loom.seed_rng/loom.gaussian_array/loom.uniform_array -- the SAME engine/distribution shapes
     // (std::mt19937 + std::normal_distribution<float>(0,1) + std::uniform_real_distribution<float>(0,1))

@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-10
+last_updated: 2026-10-11
 ---
 
 # Epic-03: Model Coverage
@@ -568,9 +568,14 @@ causal mask into ONE `[1, n_head, q, k]` additive tensor, in exactly the place `
 anchors on — and `ggml_soft_max_ext` has always accepted a mask with a head axis, since it asks only
 that `a->ne[2] % mask->ne[2] == 0`. Nothing here had used that degree of freedom because every mask
 this tree ever built was one head deep. **T5's relative bias is a mask this engine could already
-take**, and the only open question was who computes it: the driver does, from a 192-float table per
+take**, and the only open question was who computes it: the driver did, from a 192-float table per
 stack that the export writes in as constants
-([ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md)).
+([ADR-028](../adrs/adr-028-the-relative-attention-bias-is-a-mask.md)). **Since 2026-10-11 the ENCODER's
+is computed in the graph**: the export buckets every distance in `[-max_distance, max_distance]` with
+HF's own function into a 257x6 weight, and the graph clamps `key - query` and gathers. That is ~5% of a
+long summarisation, with identical output
+([ADR-074](../adrs/adr-074-t5s-encoder-bias-is-a-gather-over-a-distance-table.md)). The decoder's
+one-row-per-step bias is still the driver's.
 
 So this family, like 11 and 12, needed **no new engine primitive** — but unlike them it was *scoped*
 as needing one, which is the lesson

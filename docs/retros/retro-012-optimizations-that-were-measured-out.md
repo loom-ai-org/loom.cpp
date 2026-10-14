@@ -48,6 +48,7 @@ on the other side that cancels it.
 | *(NOT measured out)* tinyBLAS's `BM` row blocking at `k = 64` | ~1.15x paired at ONE thread, and 1.02x at k=768. **The "m=1500 cannot reach `BM = 4`" half was the bug, not a constraint** — at four threads that is 2.75x of false sharing, fixed in P4.22; see [Retro-020](retro-020-a-knob-measured-at-one-thread.md) |
 | staging a Metal `conv_2d` weight tile in threadgroup memory | **55.2 ms against 43.6**, worse at every activation length — the loads it stages were already uniform; see below |
 | more output POSITIONS per thread in a Metal `conv_2d` tile | **69.7 ms against 43.6 at less than half the loads per FMA** — occupancy, not the ratio, is the constraint; see below |
+| **a multi-slot (LRU) graph cache, so a TTS server's varying sentence lengths stop rebuilding** | **~1%**: a VITS rebuild is ~4-5 ms of host work per call (1547-node `text`: 2.1-2.5 ms build + ~0.9 ms allocation; 651-node `flow_vocoder` under 1 ms; Ryzen 3 3250U, 2026-10-11), against a 0.24-0.95 s synthesis. The 70-135 ms measured on the Pi in 2026-08 was an older engine. What a length change really cost was the compute buffer being freed and refaulted, which was a policy fix ([ADR-072](../adrs/adr-072-the-compute-buffer-shrinks-after-a-window-of-under-use.md)), not a cache. The header also records why a shape-keyed LRU is unsafe against a reshaped `OutputStore` |
 
 ### `SOFT_MAX`: closed on the right number for the wrong reason (2026-08-24, P4.18)
 
