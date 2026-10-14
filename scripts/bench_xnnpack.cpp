@@ -13,8 +13,9 @@
 //   and on macOS a -Wl,-rpath to the ggml libs. ARMv6 (Pi Zero): XNNPACK cross-compiles with clang
 //   (--target=armv6-linux-gnueabihf -march=armv6kz -marm -mfpu=vfp -mfloat-abi=hard, a Raspbian
 //   sysroot); link with the board's gcc. Its prod microkernels build; `microkernels-all` crashes clang 14.
-//   ./bench_xnnpack <threads> [reps] [heads] [f32|f16|q8|q4]
-//   f16 / q8 / q4 run the low-precision mode (run_lowp, below).
+//   ./bench_xnnpack <threads> [reps] [heads] [f32|f16|q8|q4|citrinet]
+//   f16 / q8 / q4 run the low-precision mode (run_lowp, below); citrinet runs ADR-077's gate 2
+//   (run_citrinet), which on ARMv6 also needs the generated asm tile on the link line.
 //   heads (default 12) scales QK^T and softmax for a small-RAM board: softmax alone holds ~540 MB at 12.
 //   The weights rescale by 12/heads, so the whisper total is still one encoder.
 //
@@ -614,12 +615,373 @@ static int run_lowp(const std::string& mode, ggml_backend_t be, pthreadpool_t po
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------
+// CITRINET MODE (`citrinet` as the fourth argument): ADR-077's gate 2. Citrinet-256-ls's 1x1 convs,
+// Y[N][T] = W[N][K] . X[K][T] + b with K = N = 256, at the four sequence lengths jfk runs them at,
+// weighted by how often it does (7 calls at T = 1101, 36 at 551, 42 at 276, 46 at 138). Bias included
+// in every arm, because the model pays it either as a fused epilogue or as an ADD node.
+//
+//   ggml q8_0   ggml_conv_2d_direct_packed with a Q8_0 [256, 256] kernel + ADD: what the Q8_0 card
+//               runs today (ggml-0013 dequantizes the kernel to F32 every call).
+//   ggml f32    ggml_conv_2d_direct with an F32 kernel + ADD: the F32 card's path.
+//   ggml f32rf  the same graph with the VFP in RunFast (FPSCR FZ | DN, ADR-078). ARMv6 only, and only
+//               at one thread: FPSCR is per thread and only the calling thread's is set.
+//   ggml q8mm   mul_mat(Q8_0 W, X) + ADD on a CHANNELS-LAST X: what a channels-last export would run.
+//   xnn qd8     XNNPACK dynamic int8 (convert inside the timing), channels-last.
+//   xnn qs8     XNNPACK static int8, channels-last; scales from the reference's range, so a ceiling.
+//   loom i8cf   ADR-077's ARMv6 kernel on today's CHANNELS-FIRST X: per-time-step symmetric quantize
+//               to int16 [T][K] (a strided transpose), per-channel int8 W held as int16, a 2x4 SMLAD
+//               tile in asm (scripts/gen_armv6_i8_tile.py, K = 256 unrolled), F32 epilogue.
+//   loom i8cl   the same kernel on a CHANNELS-LAST X and Y: the quantize becomes one sequential pass.
+//   loom qcf / loom qcl   the two quantize passes alone, so GEMM-only = arm - quantize.
+// The loom arms exist only where the asm does (ARMv6: SIMD32 without NEON); elsewhere they read n/a.
+//
+// Build on ARMv6 adds the generated tile:  python3 scripts/gen_armv6_i8_tile.py tile.S  and  tile.S
+// on the g++ line above.
+#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON)
+#include <arm_acle.h>
+#define BENCH_ARMV6 1
+extern "C" void tile2x4_k256(const uint32_t* x, const uint32_t* w, int32_t* out);
+static inline unsigned fpscr_get() { unsigned f; __asm__ volatile("vmrs %0, fpscr" : "=r"(f)); return f; }
+static inline void fpscr_set(unsigned f) { __asm__ volatile("vmsr fpscr, %0" : : "r"(f)); }
+// vcvtr rounds by FPSCR (nearest-even), as lrintf does -- but lrintf is an out-of-line libm call on
+// VFPv2 (math-errno), which made the first quantize 2.2x slower.
+static inline int32_t vcvtr_s32(float x) {
+    float r;
+    __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(x));
+    int32_t i; std::memcpy(&i, &r, 4);
+    return i;
+}
+namespace cit {
+constexpr int K = 256, N = 256, KW = K / 2, MC = 24;
+// Channels-first X [K][T] -> int16 pairs [T][KW]. The per-t max is taken on the bit patterns (sign
+// cleared; unsigned order is IEEE order for non-NaN), 8 time steps at a time so each k reads one 32 B
+// line. The convert goes 4 time steps x 2 k at a time in asm, each lane with its own scale (s24-s27),
+// for the reason given at quantize_cl; the last T % 4 steps take the C path.
+static void quantize_cf(const float* X, int T, uint32_t* Xq, float* sx) {
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        const int tb = std::min(8, T - t0);
+        uint32_t mx[8] = {0};
+        for (int k = 0; k < K; ++k) {
+            const uint32_t* x = (const uint32_t*)(X + (size_t)k * T + t0);
+            for (int j = 0; j < tb; ++j) { const uint32_t v = x[j] & 0x7fffffffu; mx[j] = v > mx[j] ? v : mx[j]; }
+        }
+        float inv[8];
+        for (int j = 0; j < tb; ++j) {
+            float m; std::memcpy(&m, &mx[j], 4);
+            sx[t0 + j] = m > 0 ? m / 127.0f : 1.0f; inv[j] = 1.0f / sx[t0 + j];
+        }
+        int g = 0;
+        for (; g + 4 <= tb; g += 4) {
+            const float* x0 = X + t0 + g;
+            uint32_t* q = Xq + (size_t)(t0 + g) * KW;
+            __asm__ volatile("vldmia %0, {s24-s27}" : : "r"(inv + g) : "s24", "s25", "s26", "s27");
+            for (int k = 0; k < K; k += 2, x0 += 2 * (size_t)T, ++q)
+                __asm__ volatile(
+                    "vldmia %[a], {s16-s19}\n vldmia %[b], {s20-s23}\n"
+                    "vmul.f32 s16, s16, s24\n vmul.f32 s17, s17, s25\n vmul.f32 s18, s18, s26\n vmul.f32 s19, s19, s27\n"
+                    "vmul.f32 s20, s20, s24\n vmul.f32 s21, s21, s25\n vmul.f32 s22, s22, s26\n vmul.f32 s23, s23, s27\n"
+                    "vcvtr.s32.f32 s16, s16\n vcvtr.s32.f32 s17, s17\n vcvtr.s32.f32 s18, s18\n vcvtr.s32.f32 s19, s19\n"
+                    "vcvtr.s32.f32 s20, s20\n vcvtr.s32.f32 s21, s21\n vcvtr.s32.f32 s22, s22\n vcvtr.s32.f32 s23, s23\n"
+                    "vmov r0, r1, s16, s17\n vmov r2, r3, s20, s21\n"   // k for t, t+1; then k+1
+                    "pkhbt r0, r0, r2, lsl #16\n pkhbt r1, r1, r3, lsl #16\n"
+                    "str r0, [%[q]]\n str r1, [%[q], #512]\n"
+                    "vmov r0, r1, s18, s19\n vmov r2, r3, s22, s23\n"
+                    "pkhbt r0, r0, r2, lsl #16\n pkhbt r1, r1, r3, lsl #16\n"
+                    "str r0, [%[q], #1024]\n str r1, [%[q], #1536]\n"
+                    : : [a] "r"(x0), [b] "r"(x0 + T), [q] "r"(q)
+                    : "r0", "r1", "r2", "r3", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23", "memory");
+        }
+        for (; g < tb; ++g)
+            for (int k = 0; k < K; k += 2) {
+                const float* x0 = X + (size_t)k * T + t0 + g;
+                Xq[(size_t)(t0 + g) * KW + k / 2] = (uint16_t)vcvtr_s32(x0[0] * inv[g]) | ((uint32_t)vcvtr_s32(x0[T] * inv[g]) << 16);
+            }
+    }
+}
+// Channels-last X [T][K]: the same arithmetic, read sequentially.
+static void quantize_cl(const float* X, int T, uint32_t* Xq, float* sx) {
+    for (int t = 0; t < T; ++t) {
+        const float* x = X + (size_t)t * K;
+        const uint32_t* xb = (const uint32_t*)x;
+        uint32_t m0 = 0, m1 = 0;
+        for (int k = 0; k < K; k += 2) {
+            const uint32_t a = xb[k] & 0x7fffffffu, b = xb[k + 1] & 0x7fffffffu;
+            m0 = a > m0 ? a : m0; m1 = b > m1 ? b : m1;
+        }
+        const uint32_t mb = m0 > m1 ? m0 : m1;
+        float m; std::memcpy(&m, &mb, 4);
+        sx[t] = m > 0 ? m / 127.0f : 1.0f;
+        const float inv = 1.0f / sx[t];
+        uint32_t* q = Xq + (size_t)t * KW;
+        // Eight elements at a time, in asm: gcc 12 emits each element's vmul -> vcvtr -> vmov as one
+        // dependent chain even when unrolled, so the VFP's latency is paid per element.
+        const float* xp = x;
+        for (int k = 0; k < K; k += 8, xp += 8, q += 4)
+            __asm__ volatile(
+                "vldmia %[x], {s16-s23}\n"
+                "vmul.f32 s16, s16, %[i]\n vmul.f32 s17, s17, %[i]\n vmul.f32 s18, s18, %[i]\n vmul.f32 s19, s19, %[i]\n"
+                "vmul.f32 s20, s20, %[i]\n vmul.f32 s21, s21, %[i]\n vmul.f32 s22, s22, %[i]\n vmul.f32 s23, s23, %[i]\n"
+                "vcvtr.s32.f32 s16, s16\n vcvtr.s32.f32 s17, s17\n vcvtr.s32.f32 s18, s18\n vcvtr.s32.f32 s19, s19\n"
+                "vcvtr.s32.f32 s20, s20\n vcvtr.s32.f32 s21, s21\n vcvtr.s32.f32 s22, s22\n vcvtr.s32.f32 s23, s23\n"
+                "vmov r0, r1, s16, s17\n vmov r2, r3, s18, s19\n"
+                "pkhbt r0, r0, r1, lsl #16\n pkhbt r2, r2, r3, lsl #16\n"
+                "vmov r1, r3, s20, s21\n stmia %[q], {r0, r2}\n"
+                "vmov r0, r2, s22, s23\n"
+                "pkhbt r1, r1, r3, lsl #16\n pkhbt r0, r0, r2, lsl #16\n"
+                "str r1, [%[q], #8]\n str r0, [%[q], #12]\n"
+                : : [x] "r"(xp), [q] "r"(q), [i] "t"(inv)
+                : "r0", "r1", "r2", "r3", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23", "memory");
+    }
+}
+// Y = epilogue(Xq . Wq^T). CL picks the output layout: [N][T] (channels-first) or [T][N].
+template <bool CL>
+static void gemm(const uint32_t* Xq, int T, const uint32_t* Wq, const float* sx, const float* sw, const float* b, float* Y) {
+    int32_t c[8];
+    auto put = [&](int t, int n, float v) { Y[CL ? (size_t)t * N + n : (size_t)n * T + t] = v; };
+    for (int t0 = 0; t0 < T; t0 += MC) {
+        const int tend = std::min(T, t0 + MC);
+        for (int n = 0; n < N; n += 4) {
+            const uint32_t* wp = Wq + (size_t)n * KW;
+            int t = t0;
+            for (; t + 2 <= tend; t += 2) {
+                tile2x4_k256(Xq + (size_t)t * KW, wp, c);
+                const float s0 = sx[t], s1 = sx[t + 1];
+                for (int j = 0; j < 4; ++j) {
+                    put(t, n + j, (float)c[j] * s0 * sw[n + j] + b[n + j]);
+                    put(t + 1, n + j, (float)c[4 + j] * s1 * sw[n + j] + b[n + j]);
+                }
+            }
+            for (; t < tend; ++t)
+                for (int j = 0; j < 4; ++j) {
+                    int32_t a = 0;
+                    for (int k = 0; k < KW; ++k) a = __smlad(Xq[(size_t)t * KW + k], wp[(size_t)j * KW + k], a);
+                    put(t, n + j, (float)a * sx[t] * sw[n + j] + b[n + j]);
+                }
+        }
+    }
+}
+}  // namespace cit
+#endif
+
+static int run_citrinet(ggml_backend_t be, pthreadpool_t pool, int reps, int nth) {
+    const int64_t K = 256, N = 256;
+    struct S { int64_t T; int calls; };
+    const S shapes[] = {{1101, 7}, {551, 36}, {276, 42}, {138, 46}};   // jfk's CONV_2D calls by T
+    const std::vector<std::string> names = {"ggml q8_0", "ggml f32", "ggml f32rf", "ggml q8mm", "xnn qd8",
+                                            "xnn qs8", "loom i8cf", "loom i8cl", "loom qcf", "loom qcl"};
+    const size_t na = names.size();
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nx(0, 1), nw(0, 0.06f);
+    std::vector<float> W(N * K), B(N);   // W row-major [N][K], which is also ggml's [K, N]
+    for (float& v : W) v = nw(rng);
+    for (float& v : B) v = nw(rng);
+    std::vector<int8_t> Wq8; std::vector<float> Ws;
+    quant_per_channel(W, N, K, Wq8, Ws);
+#ifdef BENCH_ARMV6
+    std::vector<uint32_t> Wq16(N * K / 2);   // int8 values held as int16 pairs, [N][K/2]
+    for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; k += 2)
+        Wq16[(n * K + k) / 2] = (uint16_t)(int16_t)Wq8[n * K + k] | ((uint32_t)(uint16_t)(int16_t)Wq8[n * K + k + 1] << 16);
+#endif
+    if (nth != 1) std::printf("note: ggml f32rf sets FPSCR on the calling thread only; read it at threads=1\n");
+
+    std::vector<std::vector<double>> sum_ms(1, std::vector<double>(na, 0));
+    double flop_w = 0;
+    std::printf("\n%-14s", "T x calls");
+    for (auto& n : names) std::printf(" %11s", (n + " ms").c_str());
+    std::printf("\n");
+    std::vector<std::vector<double>> errs;
+    for (const S& s : shapes) {
+        const int64_t T = s.T;
+        std::vector<float> Xcf(K * T), Xcl(T * K), R(T * N);   // R: reference, [T][N]
+        for (float& v : Xcf) v = nx(rng);
+        for (int64_t k = 0; k < K; ++k) for (int64_t t = 0; t < T; ++t) Xcl[t * K + k] = Xcf[k * T + t];
+        {
+            xnn_operator_t op = nullptr;
+            check(xnn_create_fully_connected_nc_f32(K, N, K, N, W.data(), B.data(), -INFINITY, INFINITY, 0, nullptr, &op), "create fc ref");
+            check(xnn_reshape_fully_connected_nc_f32(op, T, pool), "reshape fc ref");
+            check(xnn_setup_fully_connected_nc_f32(op, Xcl.data(), R.data()), "setup fc ref");
+            check(xnn_run_operator(op, pool), "run fc ref");
+            xnn_delete_operator(op);
+        }
+        auto build = [&](GgmlRun& g, auto body) {
+            ggml_init_params ip = {64u * 1024 * 1024, nullptr, true};
+            g.ctx = ggml_init(ip);
+            g.gf = ggml_new_graph_custom(g.ctx, 64, false);
+            g.out = body(g.ctx);
+            ggml_build_forward_expand(g.gf, g.out);
+            g.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+            if (!ggml_gallocr_alloc_graph(g.ga, g.gf)) { std::fprintf(stderr, "ggml alloc failed\n"); std::exit(1); }
+        };
+        auto set_q8 = [&](ggml_tensor* t) {
+            std::vector<char> q(ggml_row_size(GGML_TYPE_Q8_0, K) * N);
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, W.data(), q.data(), 0, N, K, nullptr);
+            ggml_backend_tensor_set(t, q.data(), 0, q.size());
+        };
+        // Channels-first graphs: X [T, 1, K, 1], Y [T, 1, N, 1], bias broadcast over T.
+        GgmlRun gq, gf, gm;
+        ggml_tensor *qk, *qx, *qb, *fk, *fx, *fb, *mk, *mx, *mb;
+        build(gq, [&](ggml_context* c) {
+            qx = ggml_new_tensor_4d(c, GGML_TYPE_F32, T, 1, K, 1); ggml_set_input(qx); ggml_set_output(qx);
+            qk = ggml_new_tensor_2d(c, GGML_TYPE_Q8_0, K, N); ggml_set_input(qk); ggml_set_output(qk);
+            qb = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, 1, N, 1); ggml_set_input(qb); ggml_set_output(qb);
+            return ggml_add(c, ggml_conv_2d_direct_packed(c, qk, qx, 1, 1, 0, 0, 1, 1, 1, 1, (int)K), qb);
+        });
+        build(gf, [&](ggml_context* c) {
+            fx = ggml_new_tensor_4d(c, GGML_TYPE_F32, T, 1, K, 1); ggml_set_input(fx); ggml_set_output(fx);
+            fk = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, 1, K, N); ggml_set_input(fk); ggml_set_output(fk);
+            fb = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, 1, N, 1); ggml_set_input(fb); ggml_set_output(fb);
+            return ggml_add(c, ggml_conv_2d_direct(c, fk, fx, 1, 1, 0, 0, 1, 1), fb);
+        });
+        build(gm, [&](ggml_context* c) {   // channels-last: X [K, T], Y [N, T]
+            mx = ggml_new_tensor_2d(c, GGML_TYPE_F32, K, T); ggml_set_input(mx); ggml_set_output(mx);
+            mk = ggml_new_tensor_2d(c, GGML_TYPE_Q8_0, K, N); ggml_set_input(mk); ggml_set_output(mk);
+            mb = ggml_new_tensor_1d(c, GGML_TYPE_F32, N); ggml_set_input(mb); ggml_set_output(mb);
+            return ggml_add(c, ggml_mul_mat(c, mk, mx), mb);
+        });
+        set_q8(qk); set_q8(mk);
+        ggml_backend_tensor_set(fk, W.data(), 0, W.size() * 4);   // [1,1,K,N] is W's [N][K] order
+        ggml_backend_tensor_set(qx, Xcf.data(), 0, Xcf.size() * 4);
+        ggml_backend_tensor_set(fx, Xcf.data(), 0, Xcf.size() * 4);
+        ggml_backend_tensor_set(mx, Xcl.data(), 0, Xcl.size() * 4);
+        for (ggml_tensor* t : {qb, fb, mb}) ggml_backend_tensor_set(t, B.data(), 0, B.size() * 4);
+        auto get_cf = [&](GgmlRun& g) {
+            std::vector<float> yg(T * N), y(T * N);
+            ggml_backend_tensor_get(g.out, yg.data(), 0, yg.size() * 4);
+            for (int64_t n = 0; n < N; ++n) for (int64_t t = 0; t < T; ++t) y[t * N + n] = yg[n * T + t];
+            return y;
+        };
+        std::vector<Arm> arms;
+        arms.push_back({names[0], [&] { ggml_backend_graph_compute(be, gq.gf); }, [&] { return get_cf(gq); }});
+        arms.push_back({names[1], [&] { ggml_backend_graph_compute(be, gf.gf); }, [&] { return get_cf(gf); }});
+#ifdef BENCH_ARMV6
+        arms.push_back({names[2], [&] {
+            const unsigned f = fpscr_get();
+            fpscr_set(f | (1u << 24) | (1u << 25));
+            ggml_backend_graph_compute(be, gf.gf);
+            fpscr_set(f); }, [&] { return get_cf(gf); }});
+#else
+        arms.push_back({names[2], {}, {}});
+#endif
+        arms.push_back({names[3], [&] { ggml_backend_graph_compute(be, gm.gf); }, [&] {
+            std::vector<float> y(T * N); ggml_backend_tensor_get(gm.out, y.data(), 0, y.size() * 4); return y; }});
+        // XNNPACK, channels-last.
+        std::vector<xnn_operator_t> ops;
+        std::vector<int8_t> Aq(T * K + 64), Aq_s, Cq(T * N);
+        std::vector<float> C(T * N), rowsum(T + XNN_EXTRA_QUANTIZATION_PARAMS);
+        std::vector<xnn_quantization_params> qp(T + XNN_EXTRA_QUANTIZATION_PARAMS);
+        std::unique_ptr<Workspace> work;
+        {
+            xnn_operator_t cv = nullptr, fc = nullptr;
+            check(xnn_create_convert_nc_f32_qd8(0, &cv), "create convert");
+            check(xnn_reshape_convert_nc_f32_qd8(cv, T, K, K, K, pool), "reshape convert");
+            check(xnn_setup_convert_nc_f32_qd8(cv, Xcl.data(), Aq.data(), rowsum.data(), qp.data()), "setup convert");
+            check(xnn_create_fully_connected_nc_qd8_f32_qc8w(K, N, K, N, Ws.data(), Wq8.data(), B.data(), -INFINITY, INFINITY, 0, nullptr, &fc), "create fc qd8");
+            size_t ws = 0;
+            check(xnn_reshape_fully_connected_nc_qd8_f32_qc8w(fc, T, &ws, pool), "reshape fc qd8");
+            work = std::make_unique<Workspace>(ws);
+            check(xnn_setup_fully_connected_nc_qd8_f32_qc8w(fc, Aq.data(), C.data(), work->p, qp.data()), "setup fc qd8");
+            ops.push_back(cv); ops.push_back(fc);
+            arms.push_back({names[4], [&, cv, fc] { check(xnn_run_operator(cv, pool), "run convert"); check(xnn_run_operator(fc, pool), "run fc qd8"); },
+                            [&] { return C; }});
+        }
+        const float sx = amax_of(Xcl) / 127.0f, sy = amax_of(R) / 127.0f;
+        quant_tensor(Xcl, sx, Aq_s);
+        std::vector<int32_t> bias32(N);
+        for (int64_t n = 0; n < N; ++n) bias32[n] = (int32_t)std::lround(B[n] / (sx * Ws[n]));
+        {
+            xnn_operator_t fs = nullptr;
+            check(xnn_create_fully_connected_nc_qs8_qc8w(K, N, K, N, 0, sx, Ws.data(), Wq8.data(), bias32.data(), 0, sy, -128, 127, 0, nullptr, &fs), "create fc qs8");
+            check(xnn_reshape_fully_connected_nc_qs8_qc8w(fs, T, pool), "reshape fc qs8");
+            check(xnn_setup_fully_connected_nc_qs8_qc8w(fs, Aq_s.data(), Cq.data()), "setup fc qs8");
+            ops.push_back(fs);
+            arms.push_back({names[5], [&, fs] { check(xnn_run_operator(fs, pool), "run fc qs8"); },
+                            [&] { std::vector<float> y(Cq.size()); for (size_t i = 0; i < y.size(); ++i) y[i] = sy * Cq[i]; return y; }});
+        }
+#ifdef BENCH_ARMV6
+        std::vector<uint32_t> Xq(T * K / 2);
+        std::vector<float> sxv(T), Ycf(N * T), Ycl(T * N);
+        arms.push_back({names[6], [&] { cit::quantize_cf(Xcf.data(), (int)T, Xq.data(), sxv.data());
+                                        cit::gemm<false>(Xq.data(), (int)T, Wq16.data(), sxv.data(), Ws.data(), B.data(), Ycf.data()); },
+                        [&] { std::vector<float> y(T * N);
+                              for (int64_t n = 0; n < N; ++n) for (int64_t t = 0; t < T; ++t) y[t * N + n] = Ycf[n * T + t];
+                              return y; }});
+        arms.push_back({names[7], [&] { cit::quantize_cl(Xcl.data(), (int)T, Xq.data(), sxv.data());
+                                        cit::gemm<true>(Xq.data(), (int)T, Wq16.data(), sxv.data(), Ws.data(), B.data(), Ycl.data()); },
+                        [&] { return Ycl; }});
+        {   // both asm quantizes against a plain scalar one, word for word, before anything is timed
+            std::vector<uint32_t> ref(T * K / 2), got(T * K / 2);
+            std::vector<float> sr(T), sg(T);
+            for (int64_t t = 0; t < T; ++t) {
+                float m = 0;
+                for (int64_t k = 0; k < K; ++k) m = std::max(m, std::fabs(Xcl[t * K + k]));
+                sr[t] = m > 0 ? m / 127.0f : 1.0f;
+                const float inv = 1.0f / sr[t];
+                for (int64_t k = 0; k < K; k += 2)
+                    ref[(t * K + k) / 2] = (uint16_t)vcvtr_s32(Xcl[t * K + k] * inv) | ((uint32_t)vcvtr_s32(Xcl[t * K + k + 1] * inv) << 16);
+            }
+            cit::quantize_cf(Xcf.data(), (int)T, got.data(), sg.data());
+            const long dcf = (long)(std::mismatch(ref.begin(), ref.end(), got.begin()).first != ref.end()) + (sg != sr);
+            cit::quantize_cl(Xcl.data(), (int)T, got.data(), sg.data());
+            const long dcl = (long)(std::mismatch(ref.begin(), ref.end(), got.begin()).first != ref.end()) + (sg != sr);
+            if (dcf || dcl) { std::fprintf(stderr, "T=%lld: quantize differs from the scalar one (cf %ld, cl %ld)\n", (long long)T, dcf, dcl); std::exit(1); }
+        }
+        arms.push_back({names[8], [&] { cit::quantize_cf(Xcf.data(), (int)T, Xq.data(), sxv.data()); }, {}});
+        arms.push_back({names[9], [&] { cit::quantize_cl(Xcl.data(), (int)T, Xq.data(), sxv.data()); }, {}});
+#else
+        for (size_t i = 6; i < na; ++i) arms.push_back({names[i], {}, {}});
+#endif
+        // Alternate the arms repetition by repetition and take the median, as run_lowp does.
+        for (int w = 0; w < 2; ++w) for (Arm& a : arms) if (a.run) a.run();
+        std::vector<std::vector<double>> t(na);
+        for (int r = 0; r < reps; ++r)
+            for (size_t i = 0; i < na; ++i) {
+                if (!arms[i].run) continue;
+                const double t0 = now(); arms[i].run(); t[i].push_back(now() - t0);
+            }
+#ifdef BENCH_ARMV6
+        {   // the two layouts run the same arithmetic, so their outputs must agree bit for bit
+            const std::vector<float> a = arms[6].out(), b = arms[7].out();
+            if (a != b) { std::fprintf(stderr, "T=%lld: loom i8cf and i8cl differ\n", (long long)T); std::exit(1); }
+        }
+#endif
+        std::vector<double> e(na, NAN);
+        std::printf("%5lld x %-6d", (long long)T, s.calls);
+        for (size_t i = 0; i < na; ++i) {
+            const double m = t[i].empty() ? NAN : median(t[i]);
+            sum_ms[0][i] += s.calls * m;
+            if (std::isnan(m)) std::printf(" %11s", "n/a"); else std::printf(" %11.3f", m * 1e3);
+            if (arms[i].out) e[i] = max_rel(arms[i].out(), R);
+        }
+        std::printf("\n");
+        errs.push_back(e);
+        flop_w += s.calls * 2.0 * K * N * T;
+        for (xnn_operator_t op : ops) xnn_delete_operator(op);
+    }
+    std::printf("\n%-14s %10s %8s  %s\n", "arm", "jfk s", "GOP/s", "max |y - ref| / max |ref| per T");
+    for (size_t i = 0; i < na; ++i) {
+        const double sec = sum_ms[0][i];
+        std::printf("%-14s", names[i].c_str());
+        if (std::isnan(sec)) std::printf(" %10s %8s ", "n/a", "n/a");
+        else std::printf(" %10.3f %8.3f ", sec, flop_w / sec / 1e9);
+        for (auto& e : errs) if (std::isnan(e[i])) std::printf(" %8s", "-"); else std::printf(" %8.1e", e[i]);
+        std::printf("\n");
+    }
+    for (int cl = 0; cl < 2; ++cl) {   // the gate's own number: the GEMM without its quantize
+        const double g = sum_ms[0][6 + cl] - sum_ms[0][8 + cl];
+        if (!std::isnan(g)) std::printf("loom i8%s GEMM only (arm - quantize): %.3f s, %.3f GOP/s\n", cl ? "cl" : "cf", g, flop_w / g / 1e9);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const int nth = argc > 1 ? std::atoi(argv[1]) : 2;
     const int reps = argc > 2 ? std::atoi(argv[2]) : 7;
     const int64_t heads = argc > 3 ? std::atoll(argv[3]) : 12;
     const std::string mode = argc > 4 ? argv[4] : "f32";
-    if (mode != "f32" && mode != "f16" && mode != "q8" && mode != "q4") { std::fprintf(stderr, "mode must be f32, f16, q8 or q4\n"); return 1; }
+    if (mode != "f32" && mode != "f16" && mode != "q8" && mode != "q4" && mode != "citrinet") {
+        std::fprintf(stderr, "mode must be f32, f16, q8, q4 or citrinet\n"); return 1;
+    }
 
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, nth);
@@ -628,7 +990,7 @@ int main(int argc, char** argv) {
     std::printf("threads=%d reps=%d heads=%lld mode=%s  ggml llamafile=%d\n", nth, reps, (long long)heads,
                 mode.c_str(), ggml_cpu_has_llamafile());
     if (mode != "f32") {
-        const int rc = run_lowp(mode, be, pool, reps);
+        const int rc = mode == "citrinet" ? run_citrinet(be, pool, reps, nth) : run_lowp(mode, be, pool, reps);
         pthreadpool_destroy(pool);
         ggml_backend_free(be);
         return rc;
