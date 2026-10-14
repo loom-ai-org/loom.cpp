@@ -50,13 +50,14 @@ struct NodeKey {
     std::string op;
     std::string name;
     int64_t ne[4];
+    std::string srcs;   // empty unless `$LOOM_PROFILE_NODES=src`
     bool operator<(const NodeKey& other) const {
         if (op != other.op) return op < other.op;
         if (name != other.name) return name < other.name;
         for (int i = 0; i < 4; ++i) {
             if (ne[i] != other.ne[i]) return ne[i] < other.ne[i];
         }
-        return false;
+        return srcs < other.srcs;
     }
 };
 using NodeTable = std::map<NodeKey, Bucket>;
@@ -109,14 +110,42 @@ const std::string& spec() {
     return value;
 }
 
-// `$LOOM_PROFILE_NODES`, read once, same rule as `spec()`. Its VALUE carries nothing -- the report
-// still goes wherever `$LOOM_PROFILE` says -- so this is a bool rather than a string.
+// `$LOOM_PROFILE_NODES`, read once, same rule as `spec()`. The report still goes wherever
+// `$LOOM_PROFILE` says; the value only matters as `src` (see srcs_spec()).
 bool nodes_spec() {
     static const bool value = [] {
         const char* raw = std::getenv("LOOM_PROFILE_NODES");
         return raw != nullptr && raw[0] != '\0' && std::strcmp(raw, "0") != 0;
     }();
     return value;
+}
+
+// `$LOOM_PROFILE_NODES=src`: the node table also keys on, and prints, the first two sources.
+bool srcs_spec() {
+    static const bool value = [] {
+        const char* raw = std::getenv("LOOM_PROFILE_NODES");
+        return raw != nullptr && std::strcmp(raw, "src") == 0;
+    }();
+    return value;
+}
+
+// "type:ne0,ne1,ne2,ne3" for src[0] and src[1], space-separated; "-" for an absent one.
+std::string describe_srcs(const ggml_tensor* node) {
+    std::string out;
+    for (int s = 0; s < 2; ++s) {
+        if (s > 0) out += ' ';
+        const ggml_tensor* t = node->src[s];
+        if (t == nullptr) {
+            out += '-';
+            continue;
+        }
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "%s:%lld,%lld,%lld,%lld", ggml_type_name(t->type),
+                      static_cast<long long>(t->ne[0]), static_cast<long long>(t->ne[1]),
+                      static_cast<long long>(t->ne[2]), static_cast<long long>(t->ne[3]));
+        out += buf;
+    }
+    return out;
 }
 
 void record(const ggml_tensor* node, double seconds) {
@@ -137,6 +166,7 @@ void record(const ggml_tensor* node, double seconds) {
         key.op = ggml_op_name(node->op);
         key.name = node->name;
         for (int i = 0; i < 4; ++i) key.ne[i] = node->ne[i];
+        if (srcs_spec()) key.srcs = describe_srcs(node);
         Bucket& n = node_table()[key];
         n.seconds += seconds;
         n.calls += 1;
@@ -228,6 +258,7 @@ std::vector<NodeRow> node_rows() {
         row.op = entry.first.op;
         row.name = entry.first.name;
         for (int i = 0; i < 4; ++i) row.ne[i] = entry.first.ne[i];
+        row.srcs = entry.first.srcs;
         row.seconds = entry.second.seconds;
         row.calls = entry.second.calls;
         out.push_back(std::move(row));
@@ -331,10 +362,13 @@ std::string report() {
             if (t.seconds > 0 && shown_nodes / t.seconds > 0.999) break;
             shown_nodes += r.seconds;
             ++printed;
-            append(out, "%10.2f %6llu  %-20s %-46s %lld,%lld,%lld,%lld\n", r.seconds * 1e3,
+            // `append` cuts at 256 bytes, and a long node name plus two sources can pass that.
+            append(out, "%10.2f %6llu  %-20s %-46s %lld,%lld,%lld,%lld", r.seconds * 1e3,
                    static_cast<unsigned long long>(r.calls), r.op.c_str(), r.name.c_str(),
                    static_cast<long long>(r.ne[0]), static_cast<long long>(r.ne[1]),
                    static_cast<long long>(r.ne[2]), static_cast<long long>(r.ne[3]));
+            if (!r.srcs.empty()) out += "  " + r.srcs;
+            out += '\n';
         }
         append(out, "%zu of %zu node buckets, %.1f%% of the time\n", printed, nodes.size(),
                t.seconds > 0 ? 100.0 * shown_nodes / t.seconds : 0.0);

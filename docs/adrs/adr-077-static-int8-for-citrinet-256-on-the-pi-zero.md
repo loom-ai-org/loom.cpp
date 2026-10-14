@@ -1,6 +1,6 @@
 ---
 type: adr
-status: proposed
+status: held
 date: 2026-10-11
 domain: performance
 tags: [cpu, int8, qs8, static-quantization, calibration, armv6, pi-zero, citrinet, exporter, ggml-patch]
@@ -13,7 +13,10 @@ Step 4 of the LiteRT/XNNPACK queue in the [hub](../backlog/active-index.md#engin
 (Citrinet-256-ls). Shares the weight format of
 [ADR-076](adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md), and
 puts its kernels in ggml patches per [ADR-014](adr-014-patch-ggml-rather-than-write-kernels.md).
-**Proposed:** each gate below can stop it, in order.
+**Proposed:** each gate below can stop it, in order. **Held 2026-10-14 (user) at option 2, after gate 1's
+cross-model analysis:** the F32 kernels it surfaced and its option 1 go ahead under
+[ADR-079](adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md), which also says why
+static int8 is held and what would reopen it. Gates 3-4 below were not run.
 
 ## Context
 
@@ -156,7 +159,8 @@ one model's non-GEMM ops, and the ~0.25 s undercounts static int8 three ways:
 
 **Output:** per model, the seconds left under (a) the F32 items below, (b) those plus a dynamic int8
 GEMM (option 1), and (c) full static int8 (option 2). The decision between options 1 and 2 is taken on
-that table, not on Citrinet's depthwise convs alone.
+that table, not on Citrinet's depthwise convs alone. **Measured 2026-10-14:** [the cross-model
+analysis](#gate-1-the-cross-model-analysis-measured-2026-10-14).
 
 **The Context's premise is withdrawn as well.** "Even an infinitely fast GEMM leaves RTF 0.82" assumed
 the 9.0 s was F32 arithmetic. It is F32 *inefficiency*: a depthwise kernel at 4% of the VFP's rate, and
@@ -260,6 +264,131 @@ This moves gate 2's comparison arm. The int8 kernel's 5.4-5.7 s replaces ~12 s o
 RunFast, not ~28 s of the Q8_0 card's. The ARMv6 decision went through
 [ADR-078](adr-078-runfast-on-armv6-compute-threads.md) first. That is now accepted, and with the patch in
 the engine the F32 card runs jfk in **20.1 s** (RTF ~1.8), which is this ADR's baseline from here on.
+
+## Gate 1, the cross-model analysis, measured 2026-10-14
+
+**At equal effort, int8 beats F32 on every GEMM-shaped class, by 1.06-2.1x, and F32 kernels beat
+today's ggml by more.** The analysis was scoped above. Here is what it measured, and the table it asked for.
+
+**Method.** The model list has 13 entries: the hub's Pi Zero set, the P7 set, and a VAD (Silero) and a
+wake word (WakeHuBERT tiny) for their different op mixes. Each one was profiled on the Pi Zero W with
+the engine as it now runs ARMv6 (ggml-0031, RunFast). That was one thread, one launch per model, with
+`LOOM_PROFILE_NODES` (`scripts/armv6_opmix_profile.sh`). The profiled runs took the same time as
+ADR-078's unprofiled ones. A profile records each node's output shape but not its operands, so the
+same runs were repeated on x86 with the new `LOOM_PROFILE_NODES=src`. That mode keys and prints every
+node's first two sources (type and shape). The graphs are identical, so `scripts/armv6_opmix.py` joins
+the board's times to those shapes by (op, name, shape). It then gives every class seconds, GFLOP and
+output elements.
+
+**Where the time is** (seconds of node time, the profiler's per-node floor removed; bold where a
+class is at least a quarter of the model):
+
+| model | node s | GEMM | GEMV | conv k>1 | convT | DFT basis | dw | attention | bias/act | residual | layout | rest |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Citrinet-256-ls F32 | 19.1 | **10.9** | 0.02 | - | - | 1.19 | 4.08 | 0.01 | 2.18 | 0.11 | 0.25 | 0.30 |
+| Moonshine tiny F32 | 60.2 | **16.1** | **20.2** | 10.17 | - | - | - | 7.25 | 2.05 | 0.33 | 3.75 | 0.33 |
+| Moonshine tiny Q8_0 | 65.6 | **34.2** | 6.97 | 10.74 | - | - | - | 7.32 | 1.99 | 0.34 | 3.71 | 0.30 |
+| sanoTTS heart-nano | 2.8 | 0.21 | - | 0.10 | - | **2.1** | 0.01 | - | 0.15 | 0.04 | 0.15 | 0.06 |
+| sanoTTS heart | 5.2 | **1.8** | - | 0.70 | - | **1.9** | 0.06 | - | 0.41 | 0.05 | 0.21 | 0.10 |
+| piperlite amy | 38.8 | 0.05 | - | **29.1** | 3.50 | - | - | - | 3.63 | 2.44 | 0.08 | - |
+| piperlite de051 | 8.4 | 0.02 | - | **5.4** | 0.73 | - | - | - | 1.39 | 0.85 | 0.04 | - |
+| VITS Q4_0 | 58.4 | 2.09 | - | **46.8** | 3.00 | - | 0.03 | 0.09 | 3.66 | 2.14 | 0.50 | 0.10 |
+| conformer-ctc Q4_0 | 9.9 | **6.9** | - | - | - | 0.35 | 0.15 | 0.28 | 1.30 | 0.08 | 0.64 | 0.19 |
+| distilbert-ner Q4_0 | 5.4 | **5.2** | - | - | - | - | - | 0.02 | 0.14 | 0.01 | 0.04 | 0.03 |
+| Silero VAD | 3.6 | 0.56 | **2.0** | - | - | 0.85 | - | - | 0.08 | 0.07 | 0.04 | 0.01 |
+| WakeHuBERT tiny F32 | 2.8 | **1.2** | - | 0.14 | - | 0.69 | 0.15 | - | 0.25 | 0.07 | 0.30 | 0.03 |
+
+"GEMM" is every weight `mul_mat` with more than two columns, plus 1x1 convs. "GEMV" is a weight
+`mul_mat` with one or two columns: a decode step or an LSTM step. "DFT basis" is an STFT or iSTFT run as a
+convolution with 256 or more taps over one channel. The table names classes the analysis's list did not:
+
+* **The GEMV class.** This is Moonshine's decode (its 288 x 32768 vocabulary projection is 10.4 of the 20.2 s)
+  and Silero's LSTM. It is bound by bytes, not MACs, and ggml's ARMv6 F32 GEMV streams at 91 MB/s.
+* **The vocoders' direct convolutions** carry the most seconds in the zoo: VITS 46.8 s, amy 29.1 s,
+  de051 5.4 s. They are their own GEMM regime: 12-64 channels, k = 3-7, dilation up to 5, and 24,000-130,000
+  time steps. ggml runs them at 0.25-0.65 GOP/s.
+* **The DFT-basis convolutions** (1.2-2.1 s in five models) are an FFT's job in any precision.
+
+**Each class at equal effort** (Pi Zero W, one thread, RunFast, each arm checked against a reference
+before it is timed; the int8 rates include their activation quantize unless marked):
+
+| class (bench) | ggml today | F32, asm | int8 dynamic, asm | int8 without the quantize | int8 / F32 |
+|---|---|---|---|---|---|
+| R1 GEMM: Citrinet's 1x1 convs, K = N = 256 (`bench_xnnpack citrinet`, `loom f32cf`) | 0.50 GOP/s | **0.71-0.72** | 1.04-1.05 | 1.19-1.20 | **1.46x / 1.66x** |
+| R2 vocoder direct convs, 7 shapes (`scripts/bench49.cpp`) | 0.25-0.65 | **1.10-1.11** | 1.17-1.18 | 1.44-1.46 | **1.06x / 1.31x** |
+| R4 GEMV, 288 x 32768 (`scripts/bench48.c`) | 0.045 | **0.158** (316 MB/s) | 0.339 | (same) | **2.14x** |
+| depthwise, Citrinet's 107 (`bench43`, C in both arms) | 3.96 s | 0.50 s | 0.68 s | | 0.74x |
+
+* **The F32 arm is new: the VFP11's short vectors.** With FPSCR `LEN = 4`, one `vmla` is four MACs
+  against a bank-0 scalar. `bench44 vfpvec 0` measures 0.94 GMAC/s, against 0.49-0.69 for scalar
+  `vmla` in RunFast. No ARMv6 work here had tried it, and every earlier F32 ceiling on this core was a
+  scalar one (Epic-08 §6.8's "dense ceiling" of 165-191 MMAC/s). The tiles are generated by
+  `scripts/gen_armv6_f32_tile.py` (GEMM, 4x4, K chunks of 128) and `scripts/gen_armv6_conv_tiles.py`
+  (direct conv, 4 channels x 4 time steps, taps unrolled). The GEMM tile matches XNNPACK's F32
+  reference bit for bit. The caller sets `LEN` around integer-only loops. The kernel's ABI already allows that:
+  Linux clears `LEN` for signal handlers and saves FPSCR on a switch.
+* **Its first version read channels-first X in place**, a new 4 KB page every k at T = 1101 (21.9 s).
+  Packing an X block first and sweeping the block size gave 8.4 s (TB 4 -> 24: 18.7 -> 8.4 s). The GEMM
+  tile is then bound by its W stream: F32 W is 2x the int8 kernel's int16-held W. Putting the K chunk
+  outside, so a chunk's 128 KB of W stays in the L2, changed nothing (8.30 against 8.36 s).
+* **The int8 arms got the same effort.** In the GEMV, `SXTB16`'s ROR operand and quad-interleaved W in asm
+  took int8 from 1.64x to 2.14x. There the F32 GEMV is already at the stream bound: plain reads run 213
+  MB/s and reads with PLD 338. The R2 quantize was ported to gate 2's asm and checked word for word against C, which
+  took it from 1.14 to 0.95 s. Most of it is the amax pass and the transposing writes, which are memory traffic.
+* **The depthwise pair is C against C.** Its bound is unchanged: the ceilings (`bench44`) put a tuned int8
+  kernel at most ~2x F32, ~0.25 s of jfk. That is too small to move a decision.
+
+**Static against dynamic.** Static int8 removes the per-call activation quantize. That is int8's
+whole edge in R2 (1.06x -> 1.31x) and 1.46x -> 1.66x in R1. It quarters layout traffic and folds
+activations into the requantize, and fusion gives the F32 path that last part as well. It pays a
+dequantize and a quantize around every F32 island (softmax, norms, the front end): ~31.5 ns per
+element to quantize (`loom qcl`), ~16 ns projected to dequantize.
+
+**The seconds left** (`scripts/armv6_projection.py`, from the classes above and the rates measured
+here):
+
+| model | today | (a) F32 items | (b) + dynamic int8 | (c) static int8 | (b) vs (a) | (c) vs (b) | RTF today / a / b / c |
+|---|---|---|---|---|---|---|---|
+| Citrinet-256-ls (jfk, 11.0 s) | 19.1 | **10.3** | 7.8 | 7.1 | 1.33x | 1.10x | 1.73 / **0.94** / 0.71 / 0.64 |
+| Moonshine tiny (jfk) | 60.2 | 30.4 | 23.2 | 18.1 | 1.31x | 1.28x | 5.48 / 2.76 / 2.11 / 1.65 |
+| sanoTTS heart-nano (3.1 s) | 2.8 | 2.5 | 2.4 | 2.3 | 1.02x | 1.05x | 0.91 / 0.81 / 0.80 / 0.76 |
+| sanoTTS heart (3.2 s) | 5.2 | 3.6 | 3.3 | 3.0 | 1.11x | 1.09x | 1.64 / 1.15 / 1.03 / 0.94 |
+| piperlite amy (5.9 s) | 38.8 | 14.6 | 13.9 | 10.5 | 1.05x | 1.33x | 6.58 / 2.47 / 2.35 / 1.77 |
+| piperlite de051 (4.4 s) | 8.4 | 3.2 | 3.1 | 2.2 | 1.05x | 1.39x | 1.91 / **0.74** / 0.70 / 0.51 |
+| VITS (3.2 s) | 58.4 | 19.4 | 18.0 | 13.8 | 1.08x | 1.30x | 18.3 / 6.07 / 5.64 / 4.33 |
+| conformer-ctc (jfk3, 3.0 s) | 9.9 | 5.6 | 4.3 | 3.5 | 1.30x | 1.22x | 3.29 / 1.87 / 1.44 / 1.18 |
+| distilbert-ner | 5.4 | 5.3 | 1.6 | 1.4 | 3.25x | 1.15x | |
+| Silero VAD (jfk) | 3.6 | 1.9 | 1.5 | 1.4 | 1.28x | 1.06x | 0.33 / 0.17 / 0.13 / 0.12 |
+| WakeHuBERT tiny (jfk) | 2.8 | 2.1 | 1.8 | 1.5 | 1.18x | 1.19x | 0.26 / 0.19 / 0.16 / 0.14 |
+
+(a) is RunFast plus each class's F32 rate above. It also folds bias, mask and activation into the
+producer's epilogue and keeps the DFT-basis seconds, which an FFT would remove from every column
+(heart-nano 2.1 of its 2.5 s, heart 1.9). distilbert-ner's (a) keeps its Q4_0 GEMMs, because 265 MB of F32 weights do not
+fit beside anything on this board. That is why its (b) is 3.25x. (c) runs attention at R1's static ratio,
+pays the islands, halves residual adds and takes layout to 0.4x. The vocoders' transposed convs,
+attention under int8, small-T GEMMs and the dequantize cost are **projected**, not measured. The
+script marks each one. An isolated op's rate is a ceiling, so this table orders the options and sizes
+the gaps. The end-to-end number is gate 4's.
+
+**What it says:**
+
+1. **The F32 items are the largest step on every model:** 1.3-3.0x, except heart-nano, where the DFT
+   dominates. They change no export, no format and no numerics beyond summation order. Citrinet reaches real time on
+   them alone (RTF 0.94, ~0.85 with an FFT), and so does de051.
+2. **Option 1 adds 1.02-1.33x on top** (3.25x for distilbert-ner against its Q4_0), mostly from the
+   GEMV and the R1 GEMMs. It needs no calibration and reads ADR-076's `Q8_0_PC` weights.
+3. **Option 2 adds another 1.05-1.39x over option 1.** The vocoders gain most (1.30-1.39x),
+   because there the dynamic quantize is all of int8's edge. Moonshine gains 1.28x. No model crosses
+   real time through option 2 that the F32 items and option 1 leave short, once the DFT goes to an FFT:
+   heart is RTF 1.15 / 1.03 / 0.94 without one and ~0.6 with one, in (a) alone. Its cost is the largest of the
+   three: calibration, quantized variants of five ops with ARMv6 kernels, a CPU-only flavour per model,
+   and an accuracy gate per model. That includes the ASR oracle for every vocoder, where int8 activations are
+   most audible.
+4. **Gate 1's rule, re-asked at equal effort and across the zoo:** int8 does beat VFP F32 on the
+   GEMM-shaped classes, so option 2 does not reduce to option 1 by the rule as written. But its
+   increment is 5-39% of an option-1 run, and the F32 items it was weighed against are larger than
+   either int8 option. **The user's call (2026-10-14):** build the F32 kernels and option 1, hold
+   option 2. That is [ADR-079](adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md).
 
 ## Consequences
 

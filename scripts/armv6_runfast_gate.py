@@ -29,6 +29,10 @@ elif kind == "tts_ids":          # sanoTTS / piperlite: phoneme ids in, waveform
 elif kind == "vits":             # VITS (P7 set): tts_check.py's phrase and seed
     floats = m.text2speech.infer(phonemes="həlˈəʊ wˈɜːld, ðɪs ɪz ə ɹˈaspbəɹi pˈaɪ zˈiəɹəʊ", seed=1234,
                                  sample_rate=22050).samples
+elif kind == "vad":              # Silero VAD (ADR-077 gate 1's op-mix survey): frame probabilities
+    floats = m.speech2class.infer(f32(inp)).probability("speech")
+elif kind == "wake":             # WakeHuBERT tiny (same survey): the raw frame embeddings
+    floats = m.infer(waveform=f32(inp))
 elif kind == "ner":
     text = m.text2class.infer("Barack Obama visited Berlin in March and met Angela Merkel at the Brandenburg Gate.").text
 dt = time.time() - t
