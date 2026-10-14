@@ -1,0 +1,383 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 7c62c09..507d73e 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -5887,36 +5887,43 @@ static void ggml_compute_forward_soft_max_f32(
+                 ggml_fp16_t * mp_f16 = src1 ? (ggml_fp16_t *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
+                 float       * mp_f32 = src1 ? (float       *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
+ 
+-                ggml_vec_cpy_f32  (ne00, wp, sp);
+-                ggml_vec_scale_f32(ne00, wp, scale);
+-                if (mp_f32) {
++                // copy, scale and mask in ONE pass over the row (it was three) -- and no pass at all for a
++                // plain softmax, which reads the source row directly (12 x 1500 x 1500, one AVX2 thread: 6%)
++                const float * xp = wp;
++                if (!mp_f32 && scale == 1.0f) {
++                    xp = sp;
++                } else if (mp_f32) {
+                     if (use_f16) {
+                         for (int i = 0; i < ne00; ++i) {
+-                            wp[i] += slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
++                            wp[i] = sp[i]*scale + slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
+                         }
+                     } else {
+                         for (int i = 0; i < ne00; ++i) {
+-                            wp[i] += slope*mp_f32[i];
++                            wp[i] = sp[i]*scale + slope*mp_f32[i];
+                         }
+                     }
++                } else {
++                    for (int i = 0; i < ne00; ++i) {
++                        wp[i] = sp[i]*scale;
++                    }
+                 }
+ 
+ #ifndef NDEBUG
+                 for (int i = 0; i < ne00; ++i) {
+                     //printf("p[%d] = %f\n", i, p[i]);
+-                    assert(!isnan(wp[i]));
++                    assert(!isnan(xp[i]));
+                 }
+ #endif // NDEBUG
+ 
+                 float max = -INFINITY;
+-                ggml_vec_max_f32(ne00, &max, wp);
++                ggml_vec_max_f32(ne00, &max, xp);
+ 
+                 // if we have sinks, make a correction as if they were included in the softmax
+                 if (sk) {
+                     max = MAX(max, sk[i02]);
+                 }
+ 
+-                ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
++                ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, xp, max);
+                 assert(sum > 0.0);
+ 
+                 if (sk) {
+diff --git a/src/ggml-cpu/vec.cpp b/src/ggml-cpu/vec.cpp
+index 3918a6f..975df55 100644
+--- a/src/ggml-cpu/vec.cpp
++++ b/src/ggml-cpu/vec.cpp
+@@ -528,6 +528,164 @@ ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const floa
+     return sum/n;
+ }
+ 
++// The exponentials of the softmax row, from XNNPACK's `f32-raddstoreexpminusmax` micro-kernels:
++// `avx2-rr2-p5`, `neonfma-rr1-p5` and `scalar-rr2-p5`, with their constants unchanged. On aarch64
++// XNNPACK's own config picks `neonfma-rr1-lut64-p2`; rr1_p5 measured faster on both chips here (whole
++// row, 1500 x 1500: A72 14.40 vs 14.69 ms, M1 1.09 vs 1.31 ms) at the same accuracy, with no table. The argument is always x - max <= 0, so neither
++// kernel handles overflow; everything below XNNPACK's denormal cutoff (-87.34, which includes the -inf
++// of a masked position) comes back as exactly 0 through a mask, NOT a branch.
++//
++// That mask is the reason for the port. `ggml_v_expf` is accurate everywhere (1.92 ulp worst case),
++// but it is written for the whole real line, so a vector holding any |n| > 126 leaves its fast path
++// for a three-way blend -- and a causal or padding mask puts -inf in half the row. On one AVX2 thread,
++// 1500 rows x 1500: 4.53 ms for dense rows and 7.39 ms for causal rows under the old loop; 3.01 ms
++// for causal rows with these kernels. On dense rows the two exponentials cost the same on AVX2.
++//
++// Accuracy over every exponent band of [-87, 0] plus 4M uniform points, against an f64 exp:
++//   avx2 / scalar rr2_p5  1.96 ulp max, 0.38 mean   (ggml_v_expf: 1.92 / 0.36, libm expf 0.50)
++//   neon rr1_p5           4.73 ulp max, 0.74 mean   (the max sits at -87, where the result is ~1e-38)
++// On a whole softmax row the exponential is not what the error is made of -- the sum is (below).
++//
++// Copyright 2019 Google LLC (XNNPACK). Redistribution and use in source and binary forms, with or
++// without modification, are permitted provided that the following conditions are met:
++//   * Redistributions of source code must retain the above copyright notice, this list of conditions
++//     and the following disclaimer.
++//   * Redistributions in binary form must reproduce the above copyright notice, this list of
++//     conditions and the following disclaimer in the documentation and/or other materials provided
++//     with the distribution.
++//   * Neither the name of the copyright holder nor the names of its contributors may be used to
++//     endorse or promote products derived from this software without specific prior written
++//     permission.
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
++// IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
++// FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
++// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
++// IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
++// THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++static inline float ggml_expf_minus_max(float vx) {
++    const float vlog2e         =  0x1.715476p+0f;
++    const float vmagic_bias    =  0x1.8000FEp23f;
++    const float vminus_ln2_hi  = -0x1.62E400p-1f;
++    const float vminus_ln2_lo  = -0x1.7F7D1Cp-20f;
++    const float vc5            =  0x1.0F9F9Cp-7f;
++    const float vc4            =  0x1.573A1Ap-5f;
++    const float vc3            =  0x1.555A80p-3f;
++    const float vc2            =  0x1.FFFDC6p-2f;
++    const float vc1            =  0x1.FFFFF6p-1f;
++    const float vdenorm_cutoff = -0x1.5D589Ep6f;
++
++    // XNNPACK runs the arithmetic on every input and zeroes the ones below the cutoff at the end. Here the
++    // input is first REPLACED by 0 when it is below the cutoff: a masked -inf would otherwise go through
++    // vn*ln2 + vx = inf - inf
++    // = NaN, and the ARM1176's VFP does not handle an invalid operation in hardware -- it traps to the
++    // kernel's support code. On a Pi Zero that made a causal-masked softmax 18x SLOWER than libm's expf
++    // (22.4 s against 1.25 s, 2 x 1500 x 1500). Do NOT turn this into an early return: a branch per element
++    // stops the compiler interleaving the four independent chains of the unrolled loop, and dense rows lost
++    // their whole gain (666 ms back to 1130 against libm's 1101). A select is a predicated move here. And
++    // 0, not the cutoff itself: at the cutoff `vt*vs` is denormal, which traps on that VFP just the same.
++    const float vxc = vx < vdenorm_cutoff ? 0.0f : vx;
++    float vn = vxc*vlog2e + vmagic_bias;
++    uint32_t bits;
++    memcpy(&bits, &vn, sizeof(bits));
++    bits <<= 23;
++    float vs;
++    memcpy(&vs, &bits, sizeof(vs));
++    vn -= vmagic_bias;
++    float vt = vn*vminus_ln2_hi + vxc;
++    vt = vn*vminus_ln2_lo + vt;
++    float vp = vc5*vt + vc4;
++    vp = vp*vt + vc3;
++    vp = vp*vt + vc2;
++    vp = vp*vt + vc1;
++    vt *= vs;
++    const float vf = vt*vp + vs;
++    return vx < vdenorm_cutoff ? 0.0f : vf;
++}
++
++#if !(defined(__AVX512F__) && defined(__AVX512DQ__)) && defined(__AVX2__) && defined(__FMA__)
++static inline __m256 ggml_v_expf_minus_max(__m256 vx) {
++    const __m256 vlog2e         = _mm256_set1_ps( 0x1.715476p+0f);
++    const __m256 vmagic_bias    = _mm256_set1_ps( 0x1.8000FEp23f);
++    const __m256 vminus_ln2_hi  = _mm256_set1_ps(-0x1.62E400p-1f);
++    const __m256 vminus_ln2_lo  = _mm256_set1_ps(-0x1.7F7D1Cp-20f);
++    const __m256 vc5            = _mm256_set1_ps( 0x1.0F9F9Cp-7f);
++    const __m256 vc4            = _mm256_set1_ps( 0x1.573A1Ap-5f);
++    const __m256 vc3            = _mm256_set1_ps( 0x1.555A80p-3f);
++    const __m256 vc2            = _mm256_set1_ps( 0x1.FFFDC6p-2f);
++    const __m256 vc1            = _mm256_set1_ps( 0x1.FFFFF6p-1f);
++    const __m256 vdenorm_cutoff = _mm256_set1_ps(-0x1.5D589Ep6f);
++
++    __m256 vn = _mm256_fmadd_ps(vx, vlog2e, vmagic_bias);
++    const __m256 vs = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_castps_si256(vn), 23));
++    vn = _mm256_sub_ps(vn, vmagic_bias);
++    __m256 vt = _mm256_fmadd_ps(vn, vminus_ln2_hi, vx);
++    vt = _mm256_fmadd_ps(vn, vminus_ln2_lo, vt);
++    __m256 vp = _mm256_fmadd_ps(vc5, vt, vc4);
++    vp = _mm256_fmadd_ps(vp, vt, vc3);
++    vp = _mm256_fmadd_ps(vp, vt, vc2);
++    vp = _mm256_fmadd_ps(vp, vt, vc1);
++    vt = _mm256_mul_ps(vt, vs);
++    const __m256 vf = _mm256_fmadd_ps(vt, vp, vs);
++    return _mm256_andnot_ps(_mm256_cmp_ps(vx, vdenorm_cutoff, _CMP_LT_OS), vf);
++}
++#elif !defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON) && defined(__aarch64__)
++static inline float32x4_t ggml_v_expf_minus_max(float32x4_t vx) {
++    const float32x4_t vlog2e         = vdupq_n_f32( 0x1.715476p+0f);
++    const float32x4_t vmagic_bias    = vdupq_n_f32( 0x1.8000FEp23f);
++    const float32x4_t vminus_ln2     = vdupq_n_f32(-0x1.62E430p-1f);
++    const float32x4_t vc5            = vdupq_n_f32( 0x1.0F9F9Cp-7f);
++    const float32x4_t vc4            = vdupq_n_f32( 0x1.573A1Ap-5f);
++    const float32x4_t vc3            = vdupq_n_f32( 0x1.555A80p-3f);
++    const float32x4_t vc2            = vdupq_n_f32( 0x1.FFFDC6p-2f);
++    const float32x4_t vc1            = vdupq_n_f32( 0x1.FFFFF6p-1f);
++    const float32x4_t vdenorm_cutoff = vdupq_n_f32(-0x1.5D589Ep6f);
++
++    float32x4_t vn = vfmaq_f32(vmagic_bias, vx, vlog2e);
++    const float32x4_t vs = vreinterpretq_f32_s32(vshlq_n_s32(vreinterpretq_s32_f32(vn), 23));
++    vn = vsubq_f32(vn, vmagic_bias);
++    float32x4_t vt = vfmaq_f32(vx, vn, vminus_ln2);
++    float32x4_t vp = vfmaq_f32(vc4, vc5, vt);
++    vp = vfmaq_f32(vc3, vp, vt);
++    vp = vfmaq_f32(vc2, vp, vt);
++    vp = vfmaq_f32(vc1, vp, vt);
++    vt = vmulq_f32(vt, vs);
++    const float32x4_t vf = vfmaq_f32(vs, vp, vt);
++    return vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(vf), vcltq_f32(vx, vdenorm_cutoff)));
++}
++#endif
++
++// exp(x[i] - max) into y[i], returning the sum. y may be x.
++//
++// THE SUM. The old loop reduced every vector horizontally into a double, one dependent add per 4 (NEON)
++// or 8 (AVX2) elements -- a serial chain the exponentials then waited on. XNNPACK keeps the sum in f32
++// vector accumulators instead, which is fast and costs accuracy: over a 1500-wide row |sum - 1| went
++// from 1.3e-7 to 7.1e-7. The loops below do neither. Each unrolled step adds its vectors together in
++// f32 -- four values per lane, never more than the old loop summed in f32 -- and widens that ONE vector
++// into f64 vector accumulators, with no horizontal reduction until the end of the row.
++//
++// Measured through `ggml_soft_max_ext` against an f64 softmax, 4 heads x 300 rows (|sum - 1| / max abs):
++//
++//                                  before              after
++//   AVX2, N(0,4) x 1500            1.26e-7 / 1.21e-7   1.10e-7 / 9.99e-8
++//   AVX2, causal f32 mask          1.38e-7 / 1.22e-7   1.09e-7 / 9.22e-8
++//   AVX2, ALiBi 8 + causal, 1024   1.46e-7 / 1.34e-7   1.18e-7 / 1.01e-7
++//   aarch64 (qemu), N(0,4) x 1500  1.15e-7 / 1.03e-7   1.21e-7 / 8.22e-8
++//   aarch64 (qemu), causal f32     1.12e-7 / 1.06e-7   1.15e-7 / 1.09e-7
++//
++// plus an f16 causal mask with scale 0.125 and a 77-wide row (the tails): no case got worse by more
++// than 5% on any metric, most got better. Time, 12 heads x 1500 x 1500, best of 5-7, interleaved:
++//
++//                              dense                     f16 causal mask
++//   Ryzen 3 3250U (AVX2), 1t   49.3 -> 34.1 ms (1.45x)   101.9 -> 49.7 ms (2.05x)   XNNPACK dense 29.0
++//   Pi 4 (A72), 1t             347.7 -> 165.3   (2.10x)  418.5 -> 195.2   (2.14x)   XNNPACK's margin 2.05x
++//   Pi 4, 4t (memory-bound)    119.7 -> 121.7   (0.98x)  147.5 -> 136.1   (1.08x)
++//   M1 Pro, 1t                 18.07 -> 11.74   (1.54x)  23.11 -> 13.50   (1.71x)   XNNPACK's margin 1.29x
++//   M1 Pro, 8t                 4.39 -> 3.53     (1.24x)  6.08 -> 3.79     (1.60x)
++//   Pi Zero (ARM1176), 2 heads 1105 -> 756      (1.46x)  1289 -> 1117     (1.15x)   XNNPACK's margin 1.97x
++//
++// An f32-only sum would be another ~5% on AVX2, 2% on the A72: left on the table for the accuracy.
+ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max) {
+     int i = 0;
+     ggml_float sum = 0;
+@@ -539,16 +697,32 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float
+         sum += (ggml_float)_mm512_reduce_add_ps(val);
+     }
+ #elif defined(__AVX2__) && defined(__FMA__)
+-    for (; i + 7 < n; i += 8) {
+-        __m256 val = ggml_v_expf(_mm256_sub_ps(_mm256_loadu_ps(x + i),
+-                                               _mm256_set1_ps(max)));
+-        _mm256_storeu_ps(y + i, val);
+-        __m128 val2 = _mm_add_ps(_mm256_extractf128_ps(val, 1),
+-                                 _mm256_castps256_ps128(val));
+-        val2 = _mm_add_ps(val2, _mm_movehl_ps(val2, val2));
+-        val2 = _mm_add_ss(val2, _mm_movehdup_ps(val2));
+-        sum += (ggml_float)_mm_cvtss_f32(val2);
++    const __m256 vmax = _mm256_set1_ps(max);
++    __m256d acc0 = _mm256_setzero_pd();
++    __m256d acc1 = _mm256_setzero_pd();
++    for (; i + 31 < n; i += 32) {
++        const __m256 e0 = ggml_v_expf_minus_max(_mm256_sub_ps(_mm256_loadu_ps(x + i +  0), vmax));
++        const __m256 e1 = ggml_v_expf_minus_max(_mm256_sub_ps(_mm256_loadu_ps(x + i +  8), vmax));
++        const __m256 e2 = ggml_v_expf_minus_max(_mm256_sub_ps(_mm256_loadu_ps(x + i + 16), vmax));
++        const __m256 e3 = ggml_v_expf_minus_max(_mm256_sub_ps(_mm256_loadu_ps(x + i + 24), vmax));
++        _mm256_storeu_ps(y + i +  0, e0);
++        _mm256_storeu_ps(y + i +  8, e1);
++        _mm256_storeu_ps(y + i + 16, e2);
++        _mm256_storeu_ps(y + i + 24, e3);
++        const __m256 e = _mm256_add_ps(_mm256_add_ps(e0, e1), _mm256_add_ps(e2, e3));
++        acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(e)));
++        acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(e, 1)));
+     }
++    for (; i + 7 < n; i += 8) {
++        const __m256 e = ggml_v_expf_minus_max(_mm256_sub_ps(_mm256_loadu_ps(x + i), vmax));
++        _mm256_storeu_ps(y + i, e);
++        acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(e)));
++        acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(e, 1)));
++    }
++    acc0 = _mm256_add_pd(acc0, acc1);
++    __m128d acc = _mm_add_pd(_mm256_castpd256_pd128(acc0), _mm256_extractf128_pd(acc0, 1));
++    acc = _mm_add_sd(acc, _mm_unpackhi_pd(acc, acc));
++    sum = (ggml_float)_mm_cvtsd_f64(acc);
+ #elif defined(__SSE2__)
+     for (; i + 3 < n; i += 4) {
+         __m128 val = ggml_v_expf(_mm_sub_ps(_mm_loadu_ps(x + i),
+@@ -575,12 +749,29 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float
+         sum += (ggml_float)svaddv_f32(pg, val);
+     }
+ #elif defined(__ARM_NEON) && defined(__aarch64__)
++    const float32x4_t vmax = vdupq_n_f32(max);
++    float64x2_t acc0 = vdupq_n_f64(0.0);
++    float64x2_t acc1 = vdupq_n_f64(0.0);
++    for (; i + 15 < n; i += 16) {
++        const float32x4_t e0 = ggml_v_expf_minus_max(vsubq_f32(vld1q_f32(x + i +  0), vmax));
++        const float32x4_t e1 = ggml_v_expf_minus_max(vsubq_f32(vld1q_f32(x + i +  4), vmax));
++        const float32x4_t e2 = ggml_v_expf_minus_max(vsubq_f32(vld1q_f32(x + i +  8), vmax));
++        const float32x4_t e3 = ggml_v_expf_minus_max(vsubq_f32(vld1q_f32(x + i + 12), vmax));
++        vst1q_f32(y + i +  0, e0);
++        vst1q_f32(y + i +  4, e1);
++        vst1q_f32(y + i +  8, e2);
++        vst1q_f32(y + i + 12, e3);
++        const float32x4_t e = vaddq_f32(vaddq_f32(e0, e1), vaddq_f32(e2, e3));
++        acc0 = vaddq_f64(acc0, vcvt_f64_f32(vget_low_f32(e)));
++        acc1 = vaddq_f64(acc1, vcvt_high_f64_f32(e));
++    }
+     for (; i + 3 < n; i += 4) {
+-        float32x4_t val = ggml_v_expf(vsubq_f32(vld1q_f32(x + i),
+-                                                vdupq_n_f32(max)));
+-        vst1q_f32(y + i, val);
+-        sum += (ggml_float)vaddvq_f32(val);
++        const float32x4_t e = ggml_v_expf_minus_max(vsubq_f32(vld1q_f32(x + i), vmax));
++        vst1q_f32(y + i, e);
++        acc0 = vaddq_f64(acc0, vcvt_f64_f32(vget_low_f32(e)));
++        acc1 = vaddq_f64(acc1, vcvt_high_f64_f32(e));
+     }
++    sum = (ggml_float)vaddvq_f64(vaddq_f64(acc0, acc1));
+ #elif defined(__riscv_v_intrinsic)
+     vfloat64m1_t vsum = __riscv_vfmv_v_f_f64m1(0, 1);
+     for (int avl; i < n; i += avl) {
+@@ -590,9 +781,30 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float
+         vsum = __riscv_vfwredusum_vs_f32m2_f64m1(val, vsum, avl);
+     }
+     return (ggml_float)__riscv_vfmv_f_s_f64m1_f64(vsum);
++#else
++    // No SIMD path (ARMv6, 32-bit ARM, ...): the whole row went through libm's expf. Every element still
++    // goes into a double here, as it did: the old loop's per-element double sum was the most accurate of
++    // all (ARMv6 under qemu, N(0,4) x 1500: |sum - 1| 6.5e-8), and summing four in f32 first doubled it.
++    // Two accumulators only split the dependent chain.
++    ggml_float sum1 = 0;
++    for (; i + 3 < n; i += 4) {
++        const float e0 = ggml_expf_minus_max(x[i + 0] - max);
++        const float e1 = ggml_expf_minus_max(x[i + 1] - max);
++        const float e2 = ggml_expf_minus_max(x[i + 2] - max);
++        const float e3 = ggml_expf_minus_max(x[i + 3] - max);
++        y[i + 0] = e0;
++        y[i + 1] = e1;
++        y[i + 2] = e2;
++        y[i + 3] = e3;
++        sum  += (ggml_float)e0;
++        sum1 += (ggml_float)e1;
++        sum  += (ggml_float)e2;
++        sum1 += (ggml_float)e3;
++    }
++    sum += sum1;
+ #endif
+     for (; i < n; ++i) {
+-        float val = expf(x[i] - max);
++        const float val = ggml_expf_minus_max(x[i] - max);
+         sum += (ggml_float)val;
+         y[i] = val;
+     }
+diff --git a/src/ggml-cpu/vec.h b/src/ggml-cpu/vec.h
+index 5d13155..34b76b8 100644
+--- a/src/ggml-cpu/vec.h
++++ b/src/ggml-cpu/vec.h
+@@ -1767,10 +1767,44 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
+     *s = sum;
+ }
+ 
++// Four vector accumulators, as XNNPACK's `f32-rmax` does: the scalar loop is one dependent compare per
++// element, and soft_max runs it over every row before the exponentials can start.
+ inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
+ #ifndef GGML_USE_ACCELERATE
++    int i = 0;
+     float max = -INFINITY;
+-    for (int i = 0; i < n; ++i) {
++#if defined(__AVX__)
++    __m256 m0 = _mm256_set1_ps(-INFINITY);
++    __m256 m1 = m0, m2 = m0, m3 = m0;
++    for (; i + 31 < n; i += 32) {
++        m0 = _mm256_max_ps(m0, _mm256_loadu_ps(x + i +  0));
++        m1 = _mm256_max_ps(m1, _mm256_loadu_ps(x + i +  8));
++        m2 = _mm256_max_ps(m2, _mm256_loadu_ps(x + i + 16));
++        m3 = _mm256_max_ps(m3, _mm256_loadu_ps(x + i + 24));
++    }
++    for (; i + 7 < n; i += 8) {
++        m0 = _mm256_max_ps(m0, _mm256_loadu_ps(x + i));
++    }
++    m0 = _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3));
++    __m128 m = _mm_max_ps(_mm256_extractf128_ps(m0, 1), _mm256_castps256_ps128(m0));
++    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
++    m = _mm_max_ss(m, _mm_movehdup_ps(m));
++    max = _mm_cvtss_f32(m);
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    float32x4_t m0 = vdupq_n_f32(-INFINITY);
++    float32x4_t m1 = m0, m2 = m0, m3 = m0;
++    for (; i + 15 < n; i += 16) {
++        m0 = vmaxq_f32(m0, vld1q_f32(x + i +  0));
++        m1 = vmaxq_f32(m1, vld1q_f32(x + i +  4));
++        m2 = vmaxq_f32(m2, vld1q_f32(x + i +  8));
++        m3 = vmaxq_f32(m3, vld1q_f32(x + i + 12));
++    }
++    for (; i + 3 < n; i += 4) {
++        m0 = vmaxq_f32(m0, vld1q_f32(x + i));
++    }
++    max = vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)));
++#endif
++    for (; i < n; ++i) {
+         max = MAX(max, x[i]);
+     }
+     *s = max;

@@ -1401,6 +1401,80 @@ with the CPU waveform 0.08 → 0.950 (CUDA 0.949), the same on coopmat2 and on K
 Cost, median of 10, interleaved: Supertonic-2 39.8 → 44.8 ms, Citrinet-1024 14.1 → 15.9 ms, F5-TTS
 2558 → 2598 ms, whisper-small and Parakeet-TDT unchanged.
 
+## PR 26 — `cpu`: `soft_max` with XNNPACK's exponential, a vector max and a sum that keeps its accuracy
+
+*(`cmake/patches/ggml-0029-soft-max-xnnpack-kernels.patch`)*
+
+**Problem.** A `soft_max` row is four passes: copy, scale, mask; a scalar max; `ggml_vec_soft_max_f32`;
+a final scale. Two of them are slow for reasons that have nothing to do with the arithmetic.
+`ggml_vec_max_f32` is a dependent scalar compare per element. `ggml_vec_soft_max_f32` reduces each
+vector horizontally into a double, a serial add chain the exponentials wait on. And `ggml_v_expf`, accurate
+over the whole real line, leaves its fast path for a three-way blend whenever a vector holds an |n| > 126. A
+causal or padding mask puts -inf in up to half of every row, so masked rows cost twice as much as dense ones:
+49.3 ms dense against 101.9 ms with an F16 causal mask, 12 heads x 1500 x 1500 on one AVX2 thread.
+XNNPACK's `softmax_nc_f32` does the dense case in 29.0 ms on the same box.
+
+**Change.** The exponentials are XNNPACK's `f32-raddstoreexpminusmax` kernels with their constants unchanged
+(`avx2-rr2-p5`, `neonfma-rr1-p5`, `scalar-rr2-p5`; BSD-3, notice carried in the source). On aarch64 XNNPACK's own config picks `rr1-lut64-p2`, but rr1_p5 measured faster on both the A72 (2%) and the M1 (20%) at the same accuracy, and needs no table. They only take
+x - max <= 0 and zero everything below the denormal cutoff with a mask, -inf included, so they never branch. The
+max gets four vector accumulators (`f32-rmax`). The sum does NOT follow XNNPACK, whose f32 accumulators
+raise |sum - 1| from 1.3e-7 to 7.1e-7 on these rows. Each unrolled step adds its vectors in f32 (four values
+per lane, never more than the old loop) and widens that one vector into f64 vector accumulators. The copy, scale
+and mask become one pass, and a plain softmax (no mask, scale 1) reads the source row directly. AVX-512, SSE2,
+SVE and RVV keep their existing loops. The scalar fallback (ARMv6, 32-bit ARM) moves from libm `expf` to the
+scalar kernel.
+
+**Accuracy** (through `ggml_soft_max_ext` against an f64 softmax: plain, scale 0.125, F32 and F16 causal masks,
+ALiBi 8, a 77-wide row for the tails). On AVX2 every metric (|sum - 1|, max abs, max rel) is the same or better.
+On aarch64 (qemu) nothing gets worse by more than 5%. On ARMv6 (qemu, bit-identical to the board) the old scalar loop was the most accurate of all, because it added every element into a double. The new one does the same (|sum - 1| 6.5e-8 → 6.8e-8), but the 1.96-ulp exponential in place of libm's 0.5 moves max abs 3.6e-8 → 5.0e-8 and max rel 6.4e-7 → 7.2e-7. That is still below every SIMD path's error before the patch. The exponentials alone, over every exponent band of
+[-87, 0]: rr2_p5 1.96 ulp max (`ggml_v_expf` 1.92), NEON rr1_p5 4.73 ulp max at -87, where the result is ~1e-38. On a
+row, the error comes from the sum, not the exponential.
+
+**Measured**, 12 x 1500 x 1500, best of 5-7, before/after interleaved, two runs each (dense / F16 causal mask):
+Ryzen 3 3250U 1t 49.3 → 34.1 ms (1.45x) / 101.9 → 49.7 (2.05x), XNNPACK dense 29.0 ms. Pi 4 (A72) 1t
+347.7 → 165.3 (2.10x; XNNPACK's own margin there 2.05x) / 418.5 → 195.2 (2.14x); 4t 0.98x / 1.08x (memory-bound).
+M1 Pro 1t 18.07 → 11.74 (1.54x; XNNPACK's 1.29x) / 23.11 → 13.50 (1.71x); 8t 1.24x / 1.60x. Pi Zero (2 heads)
+1105 → 756 (1.46x; XNNPACK's 1.97x) / 1289 → 1117 (1.15x). **The scalar kernel must not compute on -inf**: as first
+ported (XNNPACK zeroes at the end), a causal mask made the Pi Zero 18x SLOWER (22.4 s), because the ARM1176's VFP
+traps inf - inf = NaN, and denormals, to software. An early return fixed that but lost the dense gain (no
+interleaving across the unrolled four). The kernel replaces sub-cutoff inputs by 0 before the arithmetic (a
+predicated move) and zeroes the result after. Of the x86 dense gain, 6% is skipping the copy for a plain softmax.
+
+**A gate it moves, and why that gate is not evidence.** loom's CosyVoice3 free-running check (waveform rmse < 2e-2
+against PyTorch) goes 0.0027 → 0.0157 (cloned voice 0.0069 → 0.0333, which fails). The teacher-forced flow mel is
+unchanged (rmse 1.390e-4 → 1.397e-4). A control with this patch's structure but ggml's OWN exponential, which
+differs from v0.26 only in the rounding order of the row sum, lands at 0.0343. So a one-ulp perturbation of
+attention moves that free-running waveform anywhere in 0.003-0.034: it measures chaos, not this kernel.
+On two more sentences (one per voice) every build transcribes to the reference's words (whisper-small), and the
+log-mel distance stays inside PyTorch's own f32-vs-f64 spread. loom's bound is now 6e-2, set from that spread.
+
+## PR 27 — `cpu`: tinyBLAS F32 keeps its rate at large K (K chunks and a B block sized from the caches)
+
+*(`cmake/patches/ggml-0030-tinyblas-f32-k-chunks.patch`)*
+
+**Problem.** tinyBLAS streams all of K for every RM x RN tile, and a job reuses one block of BN x RN columns
+of B across all of A's row tiles. The A strip (RM x K x 4 bytes) outgrows a 32 KB L1D at K = 2048, and the B
+block outgrows its share of L2. On a Pi 4 (Cortex-A72, GCC's 4x3 tile, BN = 24), the F32 `mul_mat`
+768 x 1500 x K falls from 8.5 GFLOP/s at K <= 768 to 5.1 at K = 3072 and 4.3 at K = 4096 on one core,
+and from 24.2 to 12.7 / 11.1 on four (the four-thread knee is at K = 1024, where four B blocks overflow the
+shared 1 MB L2). Whisper's `fc2` and Qwen3's `down_proj` are K = 3072. The M1 (128 KB L1D, 12 MB L2) is flat
+through K = 3072.
+
+**Change.** F32 x F32 only, and only when KN divides K. The B block is capped at half of L2. Inside a job, every
+tile advances one K chunk before any advances the next, with the chunk sized to keep the A strip at 3/8 of L1D
+(768 on a 32 KB L1). Chunking starts at K >= 2 chunks. The tile's vector accumulators are carried between
+chunks as raw vectors, and the reduction happens once at the end, so every output is the same sum in the same
+order. **The result is bit-identical** to the unchunked path (FNV hash of every output, every K, on AVX2, the
+A72 and the M1; and a CosyVoice3 end-to-end gate reproduces the unpatched numbers to every printed digit).
+Cache sizes come from sysfs on Linux and `hw.perflevel0.*` on Apple. Where neither answers, nothing changes.
+On the M1 the derived chunk is 3072, so these shapes are untouched (forcing a 512 chunk there cost 3%).
+
+**Measured**, Pi 4, 768 x 1500, best of 3, before/after interleaved with a 60 s cool-down, two runs that agree
+(GFLOP/s, 1 thread | 4 threads): K = 768 8.5 → 8.5 | 24.1 → 23.8; K = 1536 7.7 → 7.6 | 18.2 → 20.6;
+K = 2048 6.4 → 6.9 | 14.9 → 18.4; K = 3072 5.05 → 6.84 (1.35x) | 12.7 → 17.9 (1.41x); K = 4096 4.31 → 6.06
+| 11.1 → 16.5. Whisper's `fc1` shape (3072 x 1500 x 768) unchanged. It recovers about two thirds of the drop.
+The rest is the A stream past L2 itself.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
