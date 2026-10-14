@@ -153,3 +153,49 @@ thread's saved FPSCR, and 309,398 of 309,464 scalar checks fail.
 with the interrupted `LEN` still set, so every handler's own float math was vectorized. The interrupted
 kernel's results stayed right. This adds to [Retro-086](../retros/retro-086-qemu-matches-the-board-only-where-the-vfp-never-bounces.md):
 under qemu, ARMv6 tests of short-vector kernels must not depend on a signal handler that does float math.
+
+## P4.32b, measured 2026-10-14: the direct-conv tile in ggml (`ggml-0032`)
+
+**What shipped.** `scripts/gen_armv6_conv_f32.py` generates one kernel per width k = 1..11 into
+`arch/arm/armv6-conv-f32.inc`, a top-level asm block in a header, so the patch needs no build change. It is
+bench49's tile with the dilation passed as an argument (one `add` per tap, issued while a vector `vmla`
+iterates), and the time-tile loop sits inside the harness region. Ahead of ggml's own paths, `ops.cpp`
+takes every 1-D, stride-1, F32 convolution with k = 2..11; a Q4_0 kernel arrives dequantized. k = 1 stays
+with the GEMM paths until P4.32d. Per block of TB = 64 steps (fewer while the window would pass 24 KB),
+the path copies the window in C, applying padding and the fused LEAKY_RELU. Then it runs the kernel per
+channel quad, with the bias in the accumulators. Output goes straight to `y` unless one of three cases
+stages it: a fused residual, a partial last quad (OC = 1 becomes a padded quad), or an output over the
+input. In the last case the block is held until the next window is copied. `GGML_CPU_ARMV6_CONV=0` turns
+the path off.
+
+**Correctness.** `tests/ci/test_conv_1d_sweep.cpp` runs 16 shapes x {plain, fused leaky+bias+residual,
+resblock through ggml-alloc with the output over its input (22 cases)} x {1, 2 threads} against a double
+reference: 196/196 on x86, in qemu, and on the board. A sabotaged tile (two W lanes swapped in the odd-k
+fixup) fails 63 checks.
+
+**Gate 2** (`scripts/bench50.cpp`: bench49's seven shapes as ggml graphs, conv + fused bias). Pi Zero W,
+one thread, three quiet runs: **1.157-1.162 GOP/s**, against bench49's 1.103-1.115 in the same window and
+0.43 for ggml today (13.4 s → 5.04 s, 2.67x). Every shape is at or above its bench rate (de051 +11%, amy d5
++10%, VITS and amy 48ch k7 level). Earlier runs had one shape per run 30-75% slow. The cause was ssh polling
+of the board, and the runs taken without it agree within 0.5%.
+
+**Gates 3 and 4** (`scripts/armv6_runfast_gate.sh` with `VAR=GGML_CPU_ARMV6_CONV`, eleven models, two
+rounds ABBA, one inference per launch):
+
+| model | off | on | speed-up | RTF off → on |
+|---|---|---|---|---|
+| piperlite amy (5.9 s) | 39.8 s | 22.9 s | **1.74x** | 6.75 → 3.88 |
+| piperlite de051 (4.4 s) | 8.41 s | 4.84 s | **1.74x** | 1.91 → 1.10 |
+| VITS (3.2 s) | 60.3 s | 34.8 s | **1.73x** | 18.9 → 10.9 |
+| sanoTTS heart (3.2 s) | 5.52 s | 5.26 s | 1.05x | 1.73 → 1.64 |
+| sanoTTS heart-nano (3.1 s) | 2.90 s | 2.80 s | 1.03x | 0.93 → 0.90 |
+| Citrinet F32 / Q8_0, Moonshine F32 / Q8_0, conformer, NER | | | 0.99-1.02x | unchanged |
+
+The six models without such convs give bit-identical output tensors. The five TTS waveforms move by
+0.6-3.9e-5 of their peak, and whisper-small transcribes each one identically in both arms. Every run is
+deterministic across rounds.
+
+**Against the projection.** amy and de051 land near their P4.32b share (projected ~3.4 and ~1.14). VITS
+falls short: projected ~7.7, measured 10.9. Its convolution seconds now run at ~0.7 GOP/s, not 1.16. Its
+wide-input stages (128-768 channels, a few hundred steps) shrink TB and re-stream large weights, and its
+OC = 1 post-conv uses a quarter of each tile. Those shapes are the open part of this item.
