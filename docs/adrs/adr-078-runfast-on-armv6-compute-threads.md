@@ -31,6 +31,13 @@ Two things measured on the Pi Zero W make that mode worth a decision:
   softmax 18x slower (ggml-0029), and the fix was a predicated move added to every element. In RunFast,
   denormals never reach software. Whether the NaN case also stops trapping has to be measured.
 
+**End to end, before any patch**, RunFast set from Python on the calling thread (ggml computes there
+at one thread) takes jfk on Citrinet-256-ls's F32 card from 59.7-62.5 s to **20.0-22.5 s**, and its
+Q8_0 card from 33.3-34.9 s to 29.3-30.9 s, with the same transcript ids as IEEE mode
+([ADR-077](adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md#found-while-measuring-gate-2-the-f32-card-was-paying-for-denormal-traps)).
+Most of the F32 gain is denormal traps: BatchNorm-folded dead channels leave weights at ~1e-33, whose
+products underflow. That checkpoint shape is common, so other models on this board may pay the same.
+
 The int8 SMLAD path does not use the VFP, so it gains nothing (~1% on ADR-077's GEMM).
 
 The cost is numerics. A result below 1.18e-38 becomes 0, an input below it is read as 0, and a NaN
@@ -63,7 +70,9 @@ cover, not an instrument). Whether it is on by default is decided by the gates, 
    today's tolerances: VITS's hash, the ASR transcripts and their tensors, the NER labels. Any model that
    changes gets its difference recorded and explained. Each ASR model also needs the tensor oracle,
    not just the transcript, and each TTS model needs the ASR oracle on its audio.
-3. **An audit of what depends on IEEE mode.** It covers `isnan`/`isinf` checks (still work), NaN
+3. **An audit of what depends on IEEE mode.** Loading Citrinet and running jfk leaves the
+   invalid-operation, overflow and underflow flags set in FPSCR in either mode, so something in that
+   window already makes NaNs and infinities; the audit names what. It covers `isnan`/`isinf` checks (still work), NaN
    payloads (none known), denormal-range constants such as an epsilon below 1.18e-38, and the
    predicated moves added to keep NaN and denormals out of the VFP (ggml-0029), which may become
    removable.
