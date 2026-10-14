@@ -4,9 +4,12 @@
 # The `loom-armv6-build:bookworm` container runs linux/arm/v6, so a wheel installed inside it executes
 # the REAL __ARM_FEATURE_SIMD32 kernels under qemu-user. Calibrated against the board on P7.1's gather
 # wheel -- both give sha256 f4859f55... for the standard VITS phrase -- so qemu's softfloat and the
-# ARM1176's VFP agree bit for bit. This is strictly better than checking an x86 build, where every
-# kernel under test is #if'd out. It is NOT faster than the board (82.6 s against 69.0 for a
-# synthesis); the point is that it does not compete for it.
+# ARM1176's VFP agree bit for bit -- FOR VITS. They do NOT agree wherever the VFP11 bounces an
+# operation to the kernel's support code (denormal operands, near-underflow, some NaN cases): that code
+# rounds a vmla once, and qemu rounds it twice like the hardware (Retro-086, scripts/bench45.c). A model
+# whose values get that small (Citrinet-256-ls's F32 card, with weights at ~1e-33) needs the board. This
+# is strictly better than checking an x86 build, where every kernel under test is #if'd out. It is NOT
+# faster than the board (82.6 s against 69.0 for a synthesis); the point is that it does not compete for it.
 #
 # WHAT NEEDS WHAT:
 #   conformer-ctc and distilbert-ner emit TEXT, so they are checked right here by string equality --

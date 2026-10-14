@@ -1475,6 +1475,34 @@ K = 2048 6.4 → 6.9 | 14.9 → 18.4; K = 3072 5.05 → 6.84 (1.35x) | 12.7 → 
 | 11.1 → 16.5. Whisper's `fc1` shape (3072 x 1500 x 768) unchanged. It recovers about two thirds of the drop.
 The rest is the A stream past L2 itself.
 
+## PR 28 — `cpu`: RunFast (flush-to-zero, default NaN) on ARMv6 compute threads
+
+*(`cmake/patches/ggml-0031-armv6-runfast-compute-threads.patch`)*
+
+**Problem.** The ARM1176's VFP11 (Raspberry Pi 1 / Zero) runs only the easy cases in hardware. In the
+default IEEE mode it bounces to the kernel's VFP support code, at ~1.1 us against 8 ns for a `vmla.f32`:
+any denormal operand, any NaN operand, inf - inf, and any effective subtraction between values at or
+below 2^-96 (it might underflow). It also does not pipeline back-to-back `vmla` in IEEE mode. A
+BatchNorm-folded checkpoint with dead channels (weights ~1e-33) bounces on most of its 1x1 conv MACs,
+and that runs Citrinet-256-ls 2.8x slower than it needs to.
+
+**Change.** On `__ARM_ARCH == 6` with VFP only: `ggml_graph_compute_thread` sets FPSCR's `FZ | DN` on
+entry, which every compute thread runs (the caller's included), and puts back just those two bits on
+exit. The cumulative flags survive, and the caller's own floating point stays in IEEE mode.
+`GGML_CPU_RUNFAST=0` turns it off. Read once in `ggml_cpu_init`.
+
+**Numerics.** A denormal input reads as +0 and a denormal result becomes +0, and a NaN result is the
+default NaN. Every other result is bit-identical. On a Pi Zero W across eleven models (ASR, TTS, NER,
+F32 and quantized): ten outputs bit-identical, one TTS waveform with 24 int16 samples one LSB apart
+(same whisper transcript); tensor-level, one CTC model's log-probs within 9.6e-7 of the peak, the rest
+bit-identical. glibc's libm agrees with "flush in, flush out" for every function the CPU ops call, except
+`logf` of a denormal argument (-103.97, where a flush predicts -inf). Note that qemu-user flushes to a
+*signed* zero, so it does not reproduce the board bit for bit in this mode.
+
+**Measured**, Pi Zero W, one inference per launch, two rounds ABBA, IEEE → RunFast: Citrinet-256-ls F32
+55.9 → 20.1 s (2.79x); sanoTTS heart 7.4 → 5.5 s (1.33x); piper-style voices 1.14-1.15x; VITS
+66.9 → 60.0 s (1.12x); Moonshine tiny F32 1.10x; Q8_0/Q4_0 models 1.02-1.09x. No model is slower.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
