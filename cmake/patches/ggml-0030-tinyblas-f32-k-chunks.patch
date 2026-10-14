@@ -1,0 +1,214 @@
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 5eda148..0e7b047 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -55,7 +55,13 @@
+ #include "simd-mappings.h"
+ 
+ #include <array>
++#include <cstdio>
++#include <cstdlib>
+ #include <type_traits>
++#include <vector>
++#if defined(__APPLE__)
++#include <sys/sysctl.h>
++#endif
+ 
+ // ARMv6 -- ARM1176, i.e. Raspberry Pi Zero / Zero W / Pi 1. This is NOT one of the 64-bit ARMs, which
+ // are served by the NEON and DOTPROD arms throughout this file; it is the 32-bit v6 floor, which has
+@@ -570,6 +576,54 @@ static constexpr inline int64_t BLOC_POS(int64_t ib, int64_t ibN, int64_t bloc_s
+     return ib < ibN ? ib * bloc_size : ibN * bloc_size + (ib - ibN) * (bloc_size - 1);
+ }
+ 
++#if defined(__aarch64__)
++// The L1 data and L2 cache sizes of the CPU this runs on (its performance cores on Apple), read once;
++// 0 where the OS does not say, which leaves tinyBLAS's F32 path exactly as upstream has it.
++struct sgemm_caches { int64_t l1d = 0, l2 = 0; };
++
++static sgemm_caches sgemm_read_caches() {
++    sgemm_caches c;
++#if defined(__linux__)
++    for (int idx = 0; idx < 8; ++idx) {
++        char path[96], type[32] = {0}, size[32] = {0};
++        int level = 0;
++        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
++        FILE * f = fopen(path, "r");
++        if (!f) break;
++        if (fscanf(f, "%d", &level) != 1) level = 0;
++        fclose(f);
++        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/type", idx);
++        if ((f = fopen(path, "r"))) { if (fscanf(f, "%31s", type) != 1) type[0] = 0; fclose(f); }
++        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
++        if ((f = fopen(path, "r"))) { if (fscanf(f, "%31s", size) != 1) size[0] = 0; fclose(f); }
++        char * end = nullptr;
++        int64_t bytes = strtoll(size, &end, 10);
++        if (end && (*end == 'K' || *end == 'k')) bytes *= 1024;
++        else if (end && (*end == 'M' || *end == 'm')) bytes *= 1024 * 1024;
++        const bool data = strcmp(type, "Data") == 0 || strcmp(type, "Unified") == 0;
++        if (level == 1 && data) c.l1d = bytes;
++        if (level == 2 && data) c.l2 = bytes;
++    }
++#elif defined(__APPLE__)
++    auto read = [](const char * name, const char * fallback) -> int64_t {
++        int64_t v = 0;
++        size_t len = sizeof(v);
++        if (sysctlbyname(name, &v, &len, nullptr, 0) == 0 && v > 0) return v;
++        len = sizeof(v);
++        return sysctlbyname(fallback, &v, &len, nullptr, 0) == 0 ? v : 0;
++    };
++    c.l1d = read("hw.perflevel0.l1dcachesize", "hw.l1dcachesize");
++    c.l2  = read("hw.perflevel0.l2cachesize",  "hw.l2cachesize");
++#endif
++    return c;
++}
++
++static const sgemm_caches & sgemm_cache_sizes() {
++    static const sgemm_caches c = sgemm_read_caches();
++    return c;
++}
++#endif
++
+ template <int KN, typename D, typename V, typename TA, typename TB, typename TC>
+ class tinyBLAS {
+   public:
+@@ -965,6 +1019,62 @@ class tinyBLAS {
+     // The alternative for these shapes is not the aligned tile -- it is ggml's generic
+     // one-output-element-per-call kernel, because before this patch `matmul` rejected them outright.
+     // So this path only has to beat that, and it does by the same 2.15x the patch measures on x86.
++    // One K chunk [l0, l1) of gemm_bloc's tile. The RN x RM vector accumulators live in `acc` between
++    // chunks as raw vectors: nothing is reduced or rounded until the last chunk, so the products are added
++    // in exactly gemm_bloc's order and the result is bit-identical to it.
++    template <int RM, int RN>
++    inline void gemm_bloc_kc(int64_t ii, int64_t jj, int64_t l0, int64_t l1, D * acc, bool first, bool last) {
++#if defined(__aarch64__)
++        // gemm_bloc's address hoist (PR 2), which GCC needs here just as much
++        const TA * const a0 = A + lda * ii;
++        const TB * const b0 = B + ldb * jj;
++        const int64_t la = lda, lb = ldb;
++        auto Aat = [&](int64_t i, int64_t l) { return a0 + la * i + l; };
++        auto Bat = [&](int64_t j, int64_t l) { return b0 + lb * j + l; };
++#else
++        auto Aat = [&](int64_t i, int64_t l) { return A + lda * (ii + i) + l; };
++        auto Bat = [&](int64_t j, int64_t l) { return B + ldb * (jj + j) + l; };
++#endif
++        D Cv[RN][RM];
++        for (int64_t j = 0; j < RN; ++j)
++            for (int64_t i = 0; i < RM; ++i)
++                Cv[j][i] = first ? D{} : acc[j * RM + i];
++        for (int64_t l = l0; l < l1; l += KN) {
++            if constexpr (RM <= RN) {
++                V Av[RM];
++                for (int64_t i = 0; i < RM; ++i) {
++                    Av[i] = load<V>(Aat(i, l));
++                }
++                for (int64_t j = 0; j < RN; ++j) {
++                    V Bv = load<V>(Bat(j, l));
++                    for (int64_t i = 0; i < RM; ++i) {
++                        Cv[j][i] = madd(Av[i], Bv, Cv[j][i]);
++                    }
++                }
++            } else {
++                V Bv[RN];
++                for (int64_t j = 0; j < RN; ++j) {
++                    Bv[j] = load<V>(Bat(j, l));
++                }
++                for (int64_t i = 0; i < RM; ++i) {
++                    V Av = load<V>(Aat(i, l));
++                    for (int64_t j = 0; j < RN; ++j) {
++                        Cv[j][i] = madd(Av, Bv[j], Cv[j][i]);
++                    }
++                }
++            }
++        }
++        if (last) {
++            for (int64_t j = 0; j < RN; ++j)
++                for (int64_t i = 0; i < RM; ++i)
++                    C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
++        } else {
++            for (int64_t j = 0; j < RN; ++j)
++                for (int64_t i = 0; i < RM; ++i)
++                    acc[j * RM + i] = Cv[j][i];
++        }
++    }
++
+     template <int RM, int RN>
+     NOINLINE void gemm_bloc_ktail(int64_t ii, int64_t jj) {
+         // WHERE THE OPERAND ADDRESSES COME FROM, and why aarch64 needs its own answer.
+@@ -1043,6 +1153,38 @@ class tinyBLAS {
+         const int64_t jj_RN = (xtiles - (xtiles * RN - n));
+ 
+         // "round" bloc_size to "nearest" BN
++        // WHY K IS CHUNKED, F32 x F32 only. Every tile streams all of K from one strip of RM rows of A and
++        // RN columns of B, and a job reuses one block of BN x RN columns of B across all of A's row tiles.
++        // Past a K where the A strip outgrows L1 (RM x K x 4 bytes, 32 KB at K = 2048 on a Cortex-A72) or
++        // the B block outgrows its share of L2, the rate falls: whisper's fc2 (768 x 1500, K = 3072) ran
++        // at 5.3 GFLOP/s on one A72 core against 8.4 at K = 768, and 12.9 against 24.7 on four.
++        //
++        // So: the B block is capped at half of L2, and the job advances every tile one K chunk at a time,
++        // with a chunk sized to keep the A strip at 3/8 of L1 (768 on a 32 KB L1). Both are derived from
++        // the cache sizes, so a core whose L1 holds the whole strip (the M1's 128 KB) is left alone -- there
++        // chunking cost 3%. The tile accumulators carry between chunks as raw vectors, so every output is
++        // the same sum in the same order: bit-identical to the unchunked path, on every ISA.
++        //
++        // Pi 4 (Cortex-A72), 768 x 1500 x 3072, best of 3, before -> after (GFLOP/s):
++        //   1 thread 5.32 -> 7.09 (1.33x), 4 threads 12.87 -> 18.32 (1.42x); K = 768 unchanged.
++        // aarch64 only: on AVX2 (Ryzen 3 3250U, 32 KB L1D, 512 KB L2) the same rule measured neutral to -6%.
++        int64_t kc = 0;
++#if defined(__aarch64__)
++        constexpr bool f32_x_f32 = std::is_same<TA, float>::value && std::is_same<TB, float>::value;
++        if constexpr (f32_x_f32) {
++            const sgemm_caches & caches = sgemm_cache_sizes();
++            if (caches.l2 > 0) {
++                const int64_t bn = caches.l2 / 2 / (RN * k * (int64_t) sizeof(TB));
++                BN = bn < 1 ? 1 : (bn < BN ? bn : BN);
++            }
++            if (caches.l1d > 0 && k % KN == 0) {
++                kc = caches.l1d * 3 / 8 / (RM * (int64_t) sizeof(TA));
++                kc -= kc % KN;
++                if (kc < KN || k < 2 * kc)
++                    kc = 0;
++            }
++        }
++#endif
+         const int64_t NB_BN = xtiles < BN ? 1 : (xtiles + BN / 2) / BN;
+         const int64_t SIZE_BN = xtiles % NB_BN == 0 ? xtiles / NB_BN : xtiles / NB_BN + 1;
+         const int64_t jj_BN = (NB_BN - (NB_BN * SIZE_BN - xtiles));
+@@ -1056,6 +1198,8 @@ class tinyBLAS {
+ 
+         ggml_barrier(params->threadpool);
+ 
++        static thread_local std::vector<D> kc_acc;
++
+         int64_t job = params->ith;
+         while (job < nb_job) {
+             const int64_t ii = (job % ytiles) * RM * BM;
+@@ -1067,6 +1211,29 @@ class tinyBLAS {
+             const int64_t jj2 = BLOC_POS(jrN, jj_RN, RN);
+             const int64_t jj1 = jj2 < jj_RN * RN ? jj2 : jj_RN * RN;
+ 
++            if (kc > 0) {
++                // K-chunked: every tile of the job advances one chunk before any advances the next, so what
++                // has to stay in cache is a chunk of the A strip and of the B block, not all of K
++                const int64_t ntiles = (jj1 - jj0) / RN + (RN > 1 ? (jj2 - jj1) / (RN > 1 ? RN - 1 : 1) : 0);
++                if ((int64_t) kc_acc.size() < BM * ntiles * RN * RM)
++                    kc_acc.resize(BM * ntiles * RN * RM);
++                for (int64_t l0 = 0; l0 < k; l0 += kc) {
++                    const int64_t l1 = l0 + kc < k ? l0 + kc : k;
++                    D * acc = kc_acc.data();
++                    for (int64_t bi = 0; bi < BM * RM; bi += RM) {
++                        int64_t jj = jj0;
++                        for (; jj < jj1; jj += RN, acc += RN * RM) {
++                            gemm_bloc_kc<RM, RN>(ii + bi, jj, l0, l1, acc, l0 == 0, l1 == k);
++                        }
++                        if constexpr (RN > 1) {
++                            for (; jj < jj2; jj += RN - 1, acc += RN * RM) {
++                                gemm_bloc_kc<RM, RN-1>(ii + bi, jj, l0, l1, acc, l0 == 0, l1 == k);
++                            }
++                        }
++                        GGML_ASSERT(jj == jj2);
++                    }
++                }
++            } else
+             for (int64_t bi = 0; bi < BM * RM; bi += RM) {
+                 int64_t jj = jj0;
+                 for (; jj < jj1; jj += RN) {
