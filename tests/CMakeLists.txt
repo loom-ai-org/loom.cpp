@@ -294,6 +294,11 @@ set_tests_properties(test_conv_bias_fusion PROPERTIES ENVIRONMENT
     "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_conv_bias_fusion PROPERTIES DEPENDS test_conv_bias_fusion_unfused)
 
+add_executable(test_conv_1d_sweep ci/test_conv_1d_sweep.cpp)
+target_link_libraries(test_conv_1d_sweep PRIVATE loom::engine)
+add_test(NAME test_conv_1d_sweep COMMAND test_conv_1d_sweep)
+set_tests_properties(test_conv_1d_sweep PROPERTIES LABELS ci)
+
 add_executable(test_conv_dw_fusion ci/test_conv_dw_fusion.cpp)
 target_link_libraries(test_conv_dw_fusion PRIVATE loom::engine)
 add_test(NAME test_conv_dw_fusion_unfused COMMAND test_conv_dw_fusion)
