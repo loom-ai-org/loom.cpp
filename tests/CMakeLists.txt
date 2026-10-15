@@ -1882,3 +1882,10 @@ target_link_libraries(test_e2e_moss_tts_composition PRIVATE loom::engine)
 add_test(NAME test_e2e_moss_tts_composition COMMAND test_e2e_moss_tts_composition)
 set_tests_properties(test_e2e_moss_tts_composition PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_moss_tts_composition PROPERTIES SKIP_RETURN_CODE 77)
+
+# The engine's FFT and the STFT / ISTFT primitives on it (ADR-080): the FFT against an f64 DFT at every
+# zoo size, each primitive against the convolutions it replaces, and 1 vs 4 threads bit for bit.
+add_executable(test_fft_ops ci/test_fft_ops.cpp)
+target_link_libraries(test_fft_ops PRIVATE loom::engine)
+add_test(NAME test_fft_ops COMMAND test_fft_ops)
+set_tests_properties(test_fft_ops PROPERTIES LABELS ci)
