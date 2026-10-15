@@ -119,10 +119,16 @@ std::vector<Row> rows();
 //
 // Off by default because it is a per-node table rather than a per-shape one -- a bigger map on the
 // recording path, and a report long enough to bury the summary it sits under.
+//
+// `$LOOM_PROFILE_NODES=src` also keys each bucket on its first two sources' type and shape, and prints
+// them after `ne`. An output shape does not say a GEMM's K, nor whether its first operand is a weight
+// (a linear) or an activation (attention's QK^T) -- which is what turns a time into a rate. ADR-077's
+// cross-model analysis needed both, per node, on a board where the time is measured.
 struct NodeRow {
     std::string op;        // `ggml_op_name` of the node
     std::string name;      // `node->name`, which ggml grows as `(reshaped) (permuted) ...`
     int64_t ne[4] = {0, 0, 0, 0};
+    std::string srcs;      // empty unless `$LOOM_PROFILE_NODES=src`: "type:ne0,ne1,ne2,ne3" per source
     double seconds = 0;
     uint64_t calls = 0;
 };

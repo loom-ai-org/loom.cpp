@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-11
+last_updated: 2026-10-14
 ---
 
 # Epic-05: Edge CPU Performance
@@ -1437,8 +1437,8 @@ else is on it**, and to about 9% when it is not. The dev box (Ryzen 3 3250U, AVX
 
 | | |
 |---|---|
-| Decisions | [ADR-014](../adrs/adr-014-patch-ggml-rather-than-write-kernels.md), [ADR-017](../adrs/adr-017-no-k-quants.md), [ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md), [ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md) |
-| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md), [Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md) |
+| Decisions | [ADR-014](../adrs/adr-014-patch-ggml-rather-than-write-kernels.md), [ADR-017](../adrs/adr-017-no-k-quants.md), [ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md), [ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md), [ADR-078](../adrs/adr-078-runfast-on-armv6-compute-threads.md), [ADR-079](../adrs/adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md) |
+| Retros | [Retro-010](../retros/retro-010-an-unpinned-competitor-baseline.md), [Retro-011](../retros/retro-011-chasing-the-gemm-and-convolution-gap.md), [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md), [Retro-014](../retros/retro-014-the-text-encoder-was-in-the-graph-twice.md), [Retro-017](../retros/retro-017-libgomp-slept-at-every-graph-node.md), [Retro-018](../retros/retro-018-a-table-of-ratios-nobody-could-re-derive.md), [Retro-019](../retros/retro-019-a-patch-measured-on-one-isa.md), [Retro-020](../retros/retro-020-a-knob-measured-at-one-thread.md), [Retro-025](../retros/retro-025-the-arm-that-ran-second-paid-for-the-first.md), [Retro-085](../retros/retro-085-the-f32-card-was-slow-because-of-its-dead-channels.md), [Retro-086](../retros/retro-086-qemu-matches-the-board-only-where-the-vfp-never-bounces.md) |
 | Active tasks | [Backlog → Performance](../backlog/active-index.md#engine--performance) |
 
 ## 4. The Record
@@ -1532,6 +1532,13 @@ It settles the bucket it was written for in one run — whisper-small, `jfk.wav`
 **96.3% of that bucket is the decode loop**, and the arithmetic the epic previously had to do by hand
 (324 = 12 encoder nodes + 12 layers x 26 decoder executions) is now a line of the report. The count
 here is 336 = 12 + 12 x 27, for the 27-step decode this run produced.
+
+**`$LOOM_PROFILE_NODES=src` (2026-10-14) also keys each bucket on its first two sources' type and
+shape and prints them after `ne`.** An output shape does not say a GEMM's K, or whether `src0` is a
+weight or an activation, and that is what turns a time into a rate. ADR-077's cross-model analysis
+needed both on a board whose wheel predates the mode, so it took the shapes from an x86 run of the
+same models and joined them to the board's times (`scripts/armv6_opmix.py`). The graphs are the same
+on both.
 
 **Tests:** a THIRD registration of `tests/ci/test_profile.cpp`, for the same caching reason as the
 other two. It asserts the finer table accounts for *exactly* the node executions the shape table does —

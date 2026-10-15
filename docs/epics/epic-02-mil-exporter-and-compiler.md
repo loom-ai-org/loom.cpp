@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: exporter
-last_updated: 2026-09-17
+last_updated: 2026-10-15
 ---
 
 # Epic-02: The MIL Exporter and Compiler
@@ -52,6 +52,16 @@ The pipeline, front to back:
 7. **Drive.** `DriverBuilder` + `DriverComponent` over `driver_ir` generate and validate the Lua.
 8. **Write.** Weights merged with a content-aware dedup-on-match / hard-fail-on-mismatch check;
    repeated tensors aliased by content hash through `loom.tensor_alias.*` KVs.
+
+   **Each topology's repeated pure subgraphs are merged before it is written** (`topology_cse.py`,
+   ADR-079 P4.32f): two nodes with the same op from a whitelist of stateless ones, the same inputs after
+   earlier merges and the same attributes become one, and a topology's declared outputs are never
+   removed. It runs on the topology rather than on MIL because that is where the duplicates exist: each
+   NeMo time mask is `arange(T) < length`, and in MIL every `range_1d` ends at a different tensor's
+   `shape`; only once the shape walk has rewritten T as an expression over the root axis are the 239
+   copies in Citrinet-256-ls textually the 4 they are (2,410 nodes become 1,247). Beyond the nodes, it
+   decides ggml's node ORDER, which the CPU backend's fusions depend on. `LOOM_EXPORT_NO_CSE=1` writes
+   topologies as traced.
 
    **Packing is not part of this step for a multi-phase model** (P5.0,
    [ADR-039](../adrs/adr-039-a-phase-boundary-is-a-process-boundary.md)). `pack_weights()` — dtype
