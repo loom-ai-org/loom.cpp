@@ -351,6 +351,15 @@ set_tests_properties(test_eltwise_armv6 PROPERTIES ENVIRONMENT
     "GGML_CPU_ARMV6_ELTWISE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_eltwise_armv6 PROPERTIES DEPENDS test_eltwise_armv6_off)
 
+# ADR-079 P4.32f f2 (ggml-0038): CONV_TRANSPOSE_1D against an f64 reference over the shapes the ARMv6
+# polyphase driver blocks and pads; run with the driver on (the default) and off (ggml-0009's GEMM).
+add_executable(test_conv_transpose_1d_sweep ci/test_conv_transpose_1d_sweep.cpp)
+target_link_libraries(test_conv_transpose_1d_sweep PRIVATE loom::engine)
+add_test(NAME test_conv_transpose_1d_sweep COMMAND test_conv_transpose_1d_sweep)
+set_tests_properties(test_conv_transpose_1d_sweep PROPERTIES LABELS ci)
+add_test(NAME test_conv_transpose_1d_sweep_off COMMAND test_conv_transpose_1d_sweep)
+set_tests_properties(test_conv_transpose_1d_sweep_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_CONVT=0")
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
