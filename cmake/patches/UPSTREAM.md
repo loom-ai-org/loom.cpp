@@ -1711,6 +1711,29 @@ loops under RunFast; twelve models' outputs byte-identical with it on and off.
 → 11.6 (`memcpy` 11.9), LEAKY_RELU 63.8 → 23.0. End to end 1.02-1.07x on ten of twelve models (amy 1.045x,
 de051 1.067x, conformer 1.053x, Citrinet Q8_0 1.065x), neutral on the other two.
 
+## PR 35 — `cpu`: CONV_TRANSPOSE_1D as polyphase direct convolutions on ARMv6
+
+*(`cmake/patches/ggml-0038-armv6-conv-transpose-1d-polyphase.patch`, on top of PRs 9 and 29)*
+
+**Problem.** A stride-s transposed convolution runs as a GEMM `[Cout*K, Cin] x [Cin, L]` and an overlap-add
+(PR 9). On ARMv6 the GEMM reaches tinyBLAS through `ggml_call_mul_mat_ldc` at ~180 MMAC/s, and the
+overlap-add adds K/s partial results into every output. In the TTS vocoders (HiFi-GAN-style upsampling,
+K = 2s) these nodes were 13-20% of a synthesis on a Pi Zero W.
+
+**Change.** With K = J·s, output phase p is a J-tap convolution over the input padded by J - 1 zeros:
+`y[oc][q·s + p] = Σ_j Σ_ic w[ic][oc][p + (J-1-j)·s] · xpad[ic][q + j]`. On ARMv6 (when K % s == 0 and
+J <= 11) the op runs as s such convolutions per quad of output channels on PR 29's register-tiled
+kernels, sharing one input window per block and chunk of input channels, into a per-thread scratch that
+the last chunk interleaves into dst: every output is written once. The weights are repacked
+`[p][Cout/4][Cin][J][4]` each call. `ggml_graph_plan` reserves the larger of the two paths' work buffers.
+`GGML_CPU_ARMV6_CONVT=0` turns it off.
+
+**Numerics.** Not bit-identical: the tile's summation order, 5e-7 to 1e-6 of the peak against f64 (the GEMM
+path 1.4e-7 to 2.5e-7). Three vocoders' waveforms move by at most one int16 LSB.
+
+**Measured**, Pi Zero W, one thread, against PR 9 plus the bias ADD: 658 → 367, 1379 → 751 and 1870 → 763
+ms on a piper vocoder's three upsampling stages (1.79-2.45x); end to end 1.077-1.145x on three vocoders.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
