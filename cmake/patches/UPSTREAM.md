@@ -1642,6 +1642,46 @@ depthwise calls, K = 5..41): 4.14 s → 0.38 s through `ggml_backend_graph_compu
 End to end, two rounds ABBA: Citrinet-256-ls F32 17.9 → 14.0 s and Q8_0 18.1 → 14.3 s for an 11 s clip,
 same CTC ids; conformer-ctc-small, sanoTTS and WakeHuBERT 1.01-1.02x.
 
+## PR 33 — CPU backend: a RELU and a time mask in the convolution epilogue
+
+*(`cmake/patches/ggml-0036-conv-epilogue-fusion.patch`, on top of PRs 5, 7, 19, 29 and 32)*
+
+**Problem.** NeMo's convolutional encoders (Citrinet, QuartzNet, Jasper) end every sub-block with
+`MUL(RELU(ADD(conv, bias)), mask)`, where `mask[t] = t < length` is one value per position broadcast over
+the channels, and multiply every depthwise convolution's output by the same mask. PRs 5 and 7 fold the
+bias into the convolution; the RELU and the MUL stayed two more passes over the activation, and on a Pi
+Zero W each pass costs ~48 ns an element. PR 5/7's fusion also declined 53 of Citrinet-256-ls's 129
+convolutions outright: the graph allocator had placed the bias ADD's result a few hundred floats ahead of
+the convolution's input, a PARTIAL overlap no kernel can write while still reading the input.
+
+**Change.** `ggml_cpu_conv_2d_fusion` also takes, after the bias (and residual) ADD, a `RELU` and then a
+`MUL` whose other operand is `[OL, 1]` -- one value per output position. `ggml_cpu_conv_2d_dw_fusion`
+takes the same `MUL` after a depthwise convolution. A fused result that partially overlaps the input is
+computed into the convolution's own tensor (which the allocator never overlaps with its input, since the
+convolution runs while the input is live), and one pass applies bias, residual, RELU and mask on the way
+to the output. Kernels that cannot apply the epilogue themselves get one pass after them. All of it is
+behind `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 (where it was measured) and off elsewhere.
+
+On ARMv6 (PRs 29 and 32) the epilogue is a few short passes over a block still in L1: the RELU as an
+integer test on the bits, keep iff `lo <= u <= 0x7f800000` unsigned (lo = 0x00800000 under RunFast's
+flush-to-zero, 1 in IEEE mode), which is exactly `(v > 0) ? v : 0` -- the VFP compare plus `vmrs` it
+replaces stalled the pipeline every element -- and the bias add and mask multiply unrolled by four. The
+depthwise kernel writes a scratch row first: an ARM1176's L1 does not allocate on a store, so an epilogue
+reading back the row just stored to the output missed on every line (43 ns an element, 10 in cache).
+
+**Numerics.** Bit-identical to the unfused nodes: the RELU and the MUL are the same operations in the same
+order, and the partial-overlap path adds the bias after the convolution as the unfused ADD does. The
+integer RELU was checked against the VFP's compare on the board over 17.1M bit patterns (every class:
+denormals, -0, inf, NaN) in both FPSCR modes.
+
+**Measured**, Pi Zero W, one thread, RunFast (loom `scripts/bench53.cpp`, Citrinet's 256-channel shapes):
+at T = 551 the RELU + mask after a 1x1 convolution cost +17 ms as two passes and +3.7 ms fused; the mask
+after a depthwise convolution +7.0 ms and +1.55 ms. End to end, with loom's exporter also merging the
+mask's 239 identical subgraphs into 4 (ggml expands a node's sources depth first, so a mask rebuilt before
+each use lands between the RELU and its MUL, and the fusion never sees them adjacent): Citrinet-256-ls
+F32 14.0-14.4 → 13.1-13.3 s and Q8_0 14.3-14.5 → 13.5-13.6 s for an 11 s clip (1.06-1.08x), logits byte-identical
+with the epilogue on and off; VITS, WakeHuBERT and Silero VAD within noise.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
