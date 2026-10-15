@@ -240,3 +240,54 @@ models, two rounds ABBA): **every output bit-identical**, and every run determin
 
 Against the session's starting point (ggml-0031 only), the vocoders are now 1.84-2.39x: VITS 60.3 → 25.3 s,
 amy 39.8 → 18.6 s, de051 8.41 → 4.56 s.
+
+## P4.32d, measured 2026-10-15: the GEMM, 1x1 and strided convolutions (`ggml-0034`)
+
+**One kernel, three new users.** The k = 1 conv kernel is already a 4x4 GEMM tile: per input row, a
+vector of four positions times four scalars. (1) **1x1 convolutions** go to the conv path, with TB = 32,
+because a tap-less window row lets a chunk take many more channels (Citrinet's shapes, TB 32/64/128:
+0.770/0.768/0.652 GOP/s). (2) **F32 `mul_mat` with n >= 24 and M % 4 == 0**, graph nodes only, runs the same
+kernel. The window is a transposed block of the weights, `[K chunk][32 rows]`, and the activation columns
+are packed `[N/4][K][4]` as the scalars. Each accumulator vector is a contiguous piece of a `dst` row,
+written in place. The plan sizes the work buffer. *Graph nodes only* because the convolutions' im2col
+fallback calls `mul_mat` with its own patches in `wdata`, which the packing overwrote; the conv sweep caught
+that on 2 threads. (3) **Any stride, by phases**: stride S over IC channels is stride 1 over IC * S virtual
+channels with ceil(k / S) taps. The window copy gathers the phases, so the kernels need no change.
+Separately, **odd-k kernels take input channels in pairs**, because the per-channel buffer copy cost as many
+FMAC cycles as the `vmla`s at k = 1. That change is bit-identical, and the vocoder shapes gained 5-7%.
+
+**Gate 2.** `bench51 gemm`: Moonshine's prefill GEMMs 0.29-0.38 → 0.76-0.79 GOP/s against tinyBLAS (2.1-2.6x),
+and the conformer FFN 0.54 → 0.76. That is above the ADR-077 bench tile's 0.72. The n threshold comes from a
+sweep: n = 16 0.47 vs 0.49, n = 24 0.56 vs 0.49. `bench50 citrinet`: 0.51 → 0.77. Moonshine's stem k7 s3
+went 0.235 → 0.82, and k3 s2 0.39 → 0.66.
+
+**Gates 3 and 4** (wheel A/B against `ggml-0032` + `0033`, 13 models, two rounds ABBA; the stride half on
+Moonshine as a second A/B):
+
+| model | before | after | speed-up | RTF |
+|---|---|---|---|---|
+| Citrinet-256-ls Q8_0 (jfk 11 s) | 29.0 s | 16.9 s | **1.72x** | 2.64 → 1.54 |
+| Citrinet-256-ls F32 | 20.0 s | 16.2 s | 1.23x | 1.82 → 1.48 |
+| Moonshine tiny F32 (GEMM, then stem) | 47.0 s | 39.3 → 32.8 s | **1.43x** | 4.27 → 2.98 |
+| Moonshine tiny Q8_0 (stem) | 65.7 s | 58.9 s | 1.12x | 5.98 → 5.35 |
+| conformer-ctc-small | 11.0 s | 9.33 s | 1.18x | 3.68 → 3.11 |
+| sanoTTS heart | 5.04 s | 4.33 s | 1.16x | 1.57 → 1.35 |
+| WakeHuBERT / Silero VAD | 3.12 / 3.00 s | 2.80 / 2.78 s | 1.12x / 1.08x | |
+| VITS / amy / de051 | 25.4 / 18.7 / 4.58 s | 23.4 / 17.7 / 4.40 s | 1.04-1.08x | de051 1.04 → **1.00** |
+
+**Numerics.** These changes are not bit-identical. Every transcript is unchanged, and so is every CTC
+argmax frame (Citrinet both cards, the conformer). The TTS waveforms move by 1e-6 to 3e-5 of their peak, and
+the ASR oracle hears the same words. **On a dynamically quantized card the tensor oracle's floor is the
+card's own sensitivity, not 1e-6.** Moonshine Q8_0's encoder output moved 4.5e-2 between the arms, and on
+x86, where no ARMv6 code runs, scaling the input by (1 + 1e-7) moves it 4.9e-2. Every board arm, including
+the one from before this ADR's kernels, sits 6e-2 from x86. The conformer behaves the same way: 2.3e-3 from a
+1e-7 input perturbation, 6.4e-3 between arms, and identical argmax. The F32 cards stay within 4e-6 of x86.
+**And the first wheel A/B's tensor oracle compared a wheel with itself**, because one `libggml-cpu.so` beside
+the probe served both arms. `armv6_runfast_gate.sh` now gives each arm's probe its own backend
+(`GGML_BACKEND_PATH`), and the gate-3 claims above rest on that rerun.
+
+**Since the session's start** (ggml-0031 only), on the Pi Zero W: VITS 60.3 → 23.4 s (2.58x), amy 39.8 →
+17.7 s (2.25x), de051 8.41 → 4.40 s (1.91x, RTF 1.00), Moonshine tiny F32 61.9 → 32.8 s (1.89x), Silero VAD
+4.39 → 2.78 s, Citrinet Q8_0 29.0 → 16.9 s, conformer 11.0 → 9.33 s. Left of the F32 family: P4.32e
+(depthwise, Citrinet's 4.1 s), P4.32f (epilogue fusion), P4.32g (an FFT for the DFT-basis convolutions,
+heart's 1.9 s of 4.3).

@@ -1565,6 +1565,42 @@ cache line cost 10% (247). A float sum would reach 316-328 MB/s, but it would no
 Placement matters on this core: the same kernel and bytes ran 216 MB/s from a 4-byte-aligned context
 allocation (page offset 340) and 274 from an 8-byte-aligned one.
 
+## PR 31 — `cpu`: F32 GEMM, 1x1 and strided convolutions on ARMv6's VFP short vectors
+
+*(`cmake/patches/ggml-0034-armv6-f32-gemm.patch`, on top of PR 29's kernels)*
+
+**Problem.** On the ARM1176, F32 `mul_mat` with n >= 2 runs ggml-0018's scalar 4x4 tinyBLAS tile at
+0.29-0.50 GOP/s, and a 1x1 convolution runs through im2col into the same tile. PR 29's short-vector
+kernel already holds a 4x4 GEMM tile at k = 1: per input row, a vector of four positions times four
+scalars.
+
+**Change.** (1) PR 29's convolution path also takes k = 1, with a 32-step block, because a tap-less window
+row lets a chunk take many more input channels. (2) A graph `MUL_MAT` node with F32 x F32 operands,
+n >= 24 and M % 4 == 0 runs the same kernel. The window is a transposed block of the weights, `[K chunk]
+[32 rows]`, the scalars are four columns of the activation packed `[N/4][K][4]` once per call, and each
+accumulator vector is a contiguous 4-float piece of a `dst` row, written in place. K is chunked to L1 and
+each later chunk continues from the partial sums. A partial last quad of columns goes through a scratch.
+`ggml_graph_plan` sizes the work buffer for it. **Graph nodes only:** `ggml_call_mul_mat*` (the
+convolutions' im2col fallback) calls `mul_mat` with its own patches in `wdata`, which the packing would
+overwrite. `GGML_CPU_ARMV6_GEMM=0` turns the GEMM off. (3) PR 29's odd-k kernels take input channels in
+pairs instead of copying the double buffers back after each one. The copy cost as many FMAC cycles as the
+four `vmla`s at k = 1. Results are bit-identical; the vocoders' shapes got 5-7% faster. (4) Any stride, by
+phases: a stride-S convolution is a stride-1 one over IC * S virtual channels (channel c, phase p holding
+x[c][t * S + p]) with ceil(k / S) taps each, so the window copy gathers the phases, the weights are
+re-indexed once, and the kernels stay the stride-1 ones (dilation must then be 1).
+
+**Numerics.** Each output is a plain float sum over k in order. For K <= 512 that is bit-identical to
+tinyBLAS_F32_ARMV6, which sums each K block from zero only above 512.
+
+**Measured**, Pi Zero W, one thread, RunFast (loom `scripts/bench51.cpp gemm`, `scripts/bench50.cpp
+citrinet`): Moonshine tiny's prefill GEMMs 0.29-0.38 → 0.76-0.79 GOP/s (2.1-2.6x), conformer-ctc-small's
+FFN (n = 75) 0.54 → 0.76, Citrinet-256-ls's 1x1 convolutions 0.51 → 0.77 (1.52x). The n threshold
+comes from a sweep: n = 16 0.47 against 0.49, n = 24 0.56 against 0.49. Moonshine tiny's strided stem
+(288 -> 576, k = 7, stride 3) 0.235 → 0.82 GOP/s. End to end, two rounds ABBA against PR 29 + 30:
+Citrinet-256-ls Q8_0 29.0 → 16.9 s and F32 20.0 → 16.2 s for an 11 s clip, conformer-ctc-small 11.0 → 9.3 s,
+Moonshine tiny F32 47.0 → 32.8 s and Q8_0 65.7 → 58.9 s (both with the stem), sanoTTS heart 5.04 → 4.33 s,
+same transcripts.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
