@@ -5,7 +5,8 @@
 //
 //   ./bench51 [reps]                      ms, GOP/s and the weight stream in MB/s per shape
 //   ./bench51 [reps] gemm                 P4.32d's shapes instead (ggml-0034, n >= 8): Moonshine tiny's
-//                                         prefill GEMMs and conformer-ctc-small's feed-forward;
+//                                         prefill GEMMs, conformer-ctc-small's feed-forward, and n = 16-64
+//                                         to place the n threshold;
 //                                         GGML_CPU_ARMV6_GEMM=0 for ggml's own (tinyBLAS_F32_ARMV6)
 //   GGML_CPU_ARMV6_GEMV=0 ./bench51       ggml's own path. The two must print the SAME checksums:
 //                                         ggml-0033 keeps vec_dot_f32's arithmetic exactly
@@ -41,9 +42,10 @@ int main(int argc, char** argv) {
                                   {512, 2048, 1, "lstm-sized"} };
     const Shape3 gemm_shapes[] = { {288, 1152, 457, "mt ffn up"}, {1152, 288, 457, "mt ffn down"},
                                    {288, 288, 457, "mt attn proj"}, {176, 704, 75, "conformer ffn"},
-                                   {288, 1152, 16, "mt n=16"} };
+                                   {288, 1152, 16, "mt n=16"}, {288, 1152, 24, "mt n=24"}, {288, 1152, 32, "mt n=32"},
+                                   {288, 1152, 64, "mt n=64"} };
     const Shape3* shapes = gemm ? gemm_shapes : vec_shapes;
-    const int n_shapes = gemm ? 5 : 3;
+    const int n_shapes = gemm ? 8 : 3;
     std::printf("reps=%d\n%-16s %9s %8s %8s  %s\n", reps, "shape", "ms", "GOP/s", "MB/s", "checksum");
     for (int si = 0; si < n_shapes; ++si) {
         const Shape3& s = shapes[si];

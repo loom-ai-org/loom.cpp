@@ -1,7 +1,7 @@
 // F32 MUL_MAT against a double reference, over the shapes that reach each of the ARMv6 paths and their
 // edges (ADR-079): ggml-0033's one-column GEMV, which must stay BIT-IDENTICAL to ggml_vec_dot_f32 (float
-// products, double sum), and the F32 GEMM for n >= 8 (tinyBLAS today; ADR-079 P4.32d's short-vector
-// GEMM blocks K in chunks, rows by 128, and columns by quads -- the shapes below reach each edge). Every
+// products, double sum), and ggml-0034's short-vector GEMM for n >= 24, which blocks K in chunks, rows by
+// 32 and columns by quads -- the shapes below reach each edge and each fallback. Every
 // CPU build runs its own paths through here; the ARMv6 build is checked in qemu (loom-armv6-build:bookworm)
 // and on the board.
 #include "cpu_backend.h"
@@ -23,8 +23,8 @@ struct Shape { int64_t k, m, n; };
 const Shape kShapes[] = {
     {288, 2304, 1}, {512, 2048, 1}, {7, 13, 1},                         // GEMV, incl. tails
     {288, 1152, 457}, {1152, 288, 457}, {256, 256, 551},                // Moonshine, Citrinet-sized
-    {100, 132, 8}, {33, 4, 9}, {1153, 136, 13}, {64, 260, 31},          // chunks, ragged blocks, partial quads
-    {64, 64, 7}, {64, 66, 16}, {5, 8, 2},                               // fall back: n < 8, M % 4, n = 2
+    {100, 132, 24}, {33, 4, 25}, {1153, 36, 27}, {64, 260, 31},         // chunks, ragged blocks, partial quads
+    {64, 64, 7}, {64, 66, 32}, {64, 64, 16}, {5, 8, 2},                 // fall back: n < 24, M % 4, n = 2
 };
 
 bool compute(ggml_backend_t backend, ggml_cgraph* gf, int n_threads) {

@@ -4,7 +4,7 @@
 // VFP11 short-vector tiles, which have their own blocking (blocks of TB, a last block absorbing a
 // remainder under a tile, an overlapping tile for a length not a multiple of 4), a padded last channel
 // quad, and three ways out (straight, staged, staged and deferred when the output overlaps the input).
-// The shapes below reach each of those.
+// The shapes below reach each of those, and ggml-0034's strides (by phases) and k = 1.
 //
 // Three variants per shape:
 //   plain     conv alone, every tensor in the context
@@ -29,7 +29,7 @@ namespace {
 
 constexpr float kSlope = 0.1f;
 
-struct Shape { int64_t ic, oc, k, d, il, pad; };
+struct Shape { int64_t ic, oc, k, d, il, pad, st = 1; };
 
 // The vocoders' (amy, de051, VITS, sanoTTS heart) and the edges of the tiling.
 const Shape kShapes[] = {
@@ -37,6 +37,9 @@ const Shape kShapes[] = {
     {12, 12, 5, 1, 67, 2},      {32, 1, 7, 1, 300, 3},     {3, 6, 2, 1, 64, 0},      {1, 4, 11, 2, 90, 3},
     {64, 64, 7, 1, 130, 3},     {100, 192, 7, 1, 99, 3},   {4, 4, 3, 1, 5, 1},       {96, 96, 5, 1, 299, 2},
     {48, 48, 3, 1, 4, 1},       {16, 16, 9, 1, 200, 4},    {20, 20, 11, 1, 77, 5},   {768, 12, 3, 1, 96, 0},
+    // strided (ggml-0034's phases): Moonshine tiny's stem, and odd strides with padding
+    {288, 576, 7, 1, 2749, 0, 3}, {576, 288, 3, 1, 915, 0, 2}, {1, 288, 127, 1, 6000, 0, 64},
+    {3, 5, 4, 1, 101, 1, 2},      {8, 8, 5, 1, 64, 2, 3},
 };
 
 bool compute(ggml_backend_t backend, ggml_cgraph* gf, int n_threads) {
@@ -65,7 +68,7 @@ double ref(const Shape& s, const Data& d, bool act, const float* res, int64_t ol
     double acc = d.B.empty() ? 0.0 : d.B[o], mag = std::fabs(acc);
     for (int64_t c = 0; c < s.ic; ++c)
         for (int64_t j = 0; j < s.k; ++j) {
-            const int64_t p = t + j * s.d - s.pad;
+            const int64_t p = t * s.st + j * s.d - s.pad;
             if (p < 0 || p >= s.il) continue;
             double x = d.X[c * s.il + p];
             if (act && x < 0) x *= (double) kSlope;
@@ -98,7 +101,7 @@ int main() {
     unsigned seed = 7;
 
     for (const Shape& s : kShapes) {
-        const int64_t ol = s.il + 2 * s.pad - (s.k - 1) * s.d;
+        const int64_t ol = (s.il + 2 * s.pad - (s.k - 1) * s.d - 1) / s.st + 1;
         for (int threads : {1, 2}) {
             Data d = make(s, ++seed);
 
@@ -117,7 +120,7 @@ int main() {
                 for (size_t i = 0; i < d.R.size(); ++i) d.R[i] = 0.25f * std::sin(0.37f * (float) i);
                 std::memcpy(tr->data, d.R.data(), ggml_nbytes(tr));
                 ggml_tensor* in = fused ? ggml_leaky_relu(ctx, tx, kSlope, false) : tx;
-                ggml_tensor* conv = ggml_conv_2d_direct(ctx, tk, in, 1, 1, (int) s.pad, 0, (int) s.d, 1);
+                ggml_tensor* conv = ggml_conv_2d_direct(ctx, tk, in, (int) s.st, 1, (int) s.pad, 0, (int) s.d, 1);
                 ggml_tensor* out = conv;
                 if (fused) {
                     out = ggml_add(ctx, ggml_reshape_2d(ctx, conv, ol, s.oc), tb);

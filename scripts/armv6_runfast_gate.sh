@@ -21,7 +21,10 @@
 # used GGML_CPU_ARMV6_CONV). Arm 0 and arm 1 are that variable's values; the outputs keep the .rf0/.rf1
 # names. FLAGS=0 skips the flag census, which is ADR-078's own question. PY0/PY1 give each arm its own
 # interpreter (two venvs, two wheels: a wheel A/B, with VAR then unset by default); each arm's probe runs
-# against that venv's libraries.
+# against that venv's libraries AND its CPU backend (GGML_BACKEND_PATH). A libggml-cpu.so symlinked
+# beside the probe would load ONE backend for both arms, and the tensor oracle would compare a wheel
+# with itself -- the first wheel A/B (2026-10-15) did exactly that. ROUNDS=0 (with START=0) runs only the
+# tensor oracle, e.g. to redo it after a timing run.
 set -u
 VAR="${VAR:-GGML_CPU_RUNFAST}"
 DIR="${DIR:-$HOME/rfgate}"
@@ -37,7 +40,7 @@ run() {  # mode kind gguf input name tag
   env "$VAR=$1" $py armv6_runfast_gate.py $2 $3 $4 out/$5.rf$1.$6 >> gate.log 2>> gate.err
   sleep "${SETTLE:-20}"
 }
-for round in 1 2; do
+for round in $(seq 1 "${ROUNDS:-2}"); do   # ROUNDS=0: the tensor oracle alone
   while read -r kind gguf inp name; do
     if [ $round = 1 ]; then a=0; b=1; else a=1; b=0; fi
     run $a "$kind" "$gguf" "$inp" "$name" r$round
@@ -75,6 +78,6 @@ open(sys.argv[2], 'wb').write(array.array('f', [float(x) for x in t]).tobytes())
                 arg="tokens=@out/$name.in.f32" ;;
     *) continue ;;   # TTS: the waveform the gate run wrote is already the raw output
   esac
-  for m in 0 1; do env "$VAR=$m" LD_LIBRARY_PATH="$(libs $m)" ./probe "$gguf" out/$name.t$m.f32 "$body" "$arg" >> probe.log 2>&1; done
+  for m in 0 1; do env "$VAR=$m" LD_LIBRARY_PATH="$(libs $m)" GGML_BACKEND_PATH="$(libs $m)/libggml-cpu.so" ./probe "$gguf" out/$name.t$m.f32 "$body" "$arg" >> probe.log 2>&1; done
 done < models.txt
 echo ALL_DONE >> gate.log

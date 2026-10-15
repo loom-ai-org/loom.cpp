@@ -32,7 +32,7 @@
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-struct Shape { int ic, oc, k, d, T; const char* who; };
+struct Shape { int ic, oc, k, d, T; const char* who; int st = 1; };
 
 int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::atoi(argv[1]) : 5;
@@ -50,6 +50,8 @@ int main(int argc, char** argv) {
         {128, 128, 7, 1, 2200, "VITS 128ch k7"}, {128, 128, 7, 5, 2200, "VITS 128ch k7 d5"},
         {192, 384, 5, 1, 288, "VITS 192>384 k5"}, {32, 1, 7, 1, 70400, "VITS 32>1 k7"},
         {96, 96, 5, 1, 288, "heart 96ch k5"}, {100, 192, 7, 1, 288, "heart 100>192 k7"},
+        {288, 576, 7, 1, 896, "mt stem k7 s3", 3}, {576, 288, 3, 1, 448, "mt stem k3 s2", 2},
+        {1, 288, 127, 1, 2720, "mt stem k127 s64", 64},
     };
     // bench49's, in its order.
     const Shape bench_shapes[] = {
@@ -67,7 +69,7 @@ int main(int argc, char** argv) {
         const Shape& s0 = shapes[si];
         Shape s = s0;
         if (!citrinet) s.T = (s.T / div) & ~31;
-        const int span = (s.k - 1) * s.d, Tin = s.T + span;
+        const int span = (s.k - 1) * s.d, Tin = (s.T - 1) * s.st + span + 1;
         std::mt19937 rng(11);
         std::normal_distribution<float> nx(0, 1), nw(0, 0.08f);
         ggml_init_params ip = { (size_t) s.ic * Tin * 4 + (size_t) s.oc * s.T * 8 + (size_t) s.ic * s.oc * s.k * 4 +
@@ -81,7 +83,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < s.ic * Tin; ++i) X[i] = nx(rng);
         for (int i = 0; i < s.oc * s.ic * s.k; ++i) W[i] = nw(rng);
         for (int i = 0; i < s.oc; ++i) B[i] = nw(rng);
-        ggml_tensor* conv = ggml_conv_2d_direct(ctx, tk, tx, 1, 1, 0, 0, s.d, 1);
+        ggml_tensor* conv = ggml_conv_2d_direct(ctx, tk, tx, s.st, 1, 0, 0, s.d, 1);
         ggml_tensor* out = ggml_add(ctx, ggml_reshape_2d(ctx, conv, s.T, s.oc), tb);
         ggml_cgraph* gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
@@ -97,7 +99,7 @@ int main(int argc, char** argv) {
             for (int t = 0; t < s.T; t += 7) {
                 double r = B[o];
                 for (int c = 0; c < s.ic; ++c) for (int j = 0; j < s.k; ++j)
-                    r += (double) W[((size_t) o * s.ic + c) * s.k + j] * X[(size_t) c * Tin + t + j * s.d];
+                    r += (double) W[((size_t) o * s.ic + c) * s.k + j] * X[(size_t) c * Tin + t * s.st + j * s.d];
                 mr = std::max(mr, std::fabs(r));
                 ef = std::max(ef, std::fabs(Y[(size_t) o * s.T + t] - r));
             }

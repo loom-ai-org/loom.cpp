@@ -82,33 +82,52 @@ def kernel(k):
     e("    vldmia r1!, {s0-s3}")
     bufs = [("s8", ["s0", "s1", "s2", "s3"], ("d4", "d5"), "{s0-s3}"),
             ("s12", ["s4", "s5", "s6", "s7"], ("d6", "d7"), "{s4-s7}")]
-    e("1:")
-    for j in range(k):
-        x, w, _, _ = bufs[j % 2]
-        _, _, (dn0, dn1), wn = bufs[(j + 1) % 2]
-        e(f"    vmla.f32 s16, {x}, {w[0]}")
-        if j + 1 < k:
-            e(f"    vldr {dn0}, [r7]")
-            e(f"    vmla.f32 s20, {x}, {w[1]}")
-            e(f"    vldr {dn1}, [r7, #8]")
-            e("    add r7, r7, r2")
-        else:
-            e("    add r0, r0, r6")
-            e(f"    vmla.f32 s20, {x}, {w[1]}")
-            e(f"    vldr {dn0}, [r0]")
-            e(f"    vldr {dn1}, [r0, #8]")
-            e("    add r7, r0, r2")
-        e(f"    vldmia r1!, {wn}")
-        e(f"    vmla.f32 s24, {x}, {w[2]}")
-        e(f"    vmla.f32 s28, {x}, {w[3]}")
-    if k % 2:
-        # An odd k leaves the next row's tap 0 in the odd buffers; move it to the even ones the loop
-        # starts from. A bank-1 destination makes the first a vector move (all four lanes); bank 0 is
-        # scalar, so the W scalars move one by one.
-        e("    vmov.f32 s8, s12")
-        e("    vmov.f32 s0, s4\n    vmov.f32 s1, s5\n    vmov.f32 s2, s6\n    vmov.f32 s3, s7")
-    e("    subs r5, r5, #1")
-    e("    bne 1b")
+
+    def one_ic(first):
+        """The k taps of one input channel, starting from buffer `first`. Tap j preloads tap j+1 into the
+        other buffer; the last tap preloads tap 0 of the next window row."""
+        for j in range(k):
+            x, w, _, _ = bufs[(first + j) % 2]
+            _, _, (dn0, dn1), wn = bufs[(first + j + 1) % 2]
+            e(f"    vmla.f32 s16, {x}, {w[0]}")
+            if j + 1 < k:
+                e(f"    vldr {dn0}, [r7]")
+                e(f"    vmla.f32 s20, {x}, {w[1]}")
+                e(f"    vldr {dn1}, [r7, #8]")
+                e("    add r7, r7, r2")
+            else:
+                e("    add r0, r0, r6")
+                e(f"    vmla.f32 s20, {x}, {w[1]}")
+                e(f"    vldr {dn0}, [r0]")
+                e(f"    vldr {dn1}, [r0, #8]")
+                e("    add r7, r0, r2")
+            e(f"    vldmia r1!, {wn}")
+            e(f"    vmla.f32 s24, {x}, {w[2]}")
+            e(f"    vmla.f32 s28, {x}, {w[3]}")
+
+    if k % 2 == 0:
+        # An even k ends each channel in the buffer the next one starts from.
+        e("1:")
+        one_ic(0)
+        e("    subs r5, r5, #1")
+        e("    bne 1b")
+    else:
+        # An odd k ends a channel in the OTHER buffer, so channels go in pairs (the second starting from
+        # buffer 1), plus one alone at the end. The first version copied the buffers back after every
+        # channel instead -- a vector vmov and four scalar ones, as many FMAC cycles as the four vmlas at
+        # k = 1: Citrinet's 1x1 convolutions ran 0.53 GOP/s that way. Same operations, same order.
+        e("    subs r5, r5, #2")
+        e("    blt 6f")
+        e("1:")
+        one_ic(0)
+        one_ic(1)
+        e("    subs r5, r5, #2")
+        e("    bge 1b")
+        e("6:")
+        e("    adds r5, r5, #2")
+        e("    beq 7f")
+        one_ic(0)
+        e("7:")
     e("    mov r3, r10")
     for i, bank in enumerate(["{s16-s19}", "{s20-s23}", "{s24-s27}", "{s28-s31}"]):
         e(f"    vstmia r3, {bank}")
