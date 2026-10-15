@@ -13,7 +13,8 @@
 # Inside a region lint rejects any way out of the function (bl/blx/bx/svc, a pc write, a ldm/pop of pc),
 # a second vmsr, double-precision data processing (its vectors would run on the d banks), and a vector op
 # whose destination or Sn/Sm vector would wrap around its bank (s14 at LEN 4 is s14, s15, s8, s9 -- legal,
-# never intended). Every function must leave the region before it returns. Signals and context switches
+# and unintended everywhere except a source a kernel uses as a ring: a line carrying WRAP_MARK may wrap
+# its Sn, never its destination). Every function must leave the region before it returns. Signals and context switches
 # are the kernel's to get right; scripts/armv6_shortvec_gate.c is the evidence that they do (gate 1).
 import re
 
@@ -23,6 +24,7 @@ _FIELD_SET = (LEN - 1) << 16                # STRIDE = 0b00 is stride 1
 
 ENTER_MARK = "@ shortvec: enter"
 LEAVE_MARK = "@ shortvec: leave"
+WRAP_MARK = "@ shortvec: ring"             # this op's Sn is a ring of 8 (gen_armv6_dw_f32.py's input window)
 
 
 # The markers bound the region lint checks: from after LEN is set to before it is cleared.
@@ -52,17 +54,22 @@ def _operands(rest):
     return [o.strip() for o in rest.split(",") if o.strip()]
 
 
-def _check_vector(op, regs, where):
-    """regs: operand strings of a .f32 data-processing op inside the region (dest first)."""
+def _check_vector(op, regs, where, ring=False):
+    """regs: operand strings of a .f32 data-processing op inside the region (dest first). ring: the op's
+    Sn (the first source of a three-operand op) may wrap."""
     s = [_SREG.match(r) for r in regs]
     if not all(s):                           # vmov sN, rM and the like are transfers, never vectors
         return
     n = [int(m.group(1)) for m in s]
     if n[0] < 8:                             # bank-0 destination: the whole op is scalar
         return
+    if ring and len(n) != 3:
+        raise ValueError(f"{where}: a ring operand needs a three-operand op")
     # Sm (the last source) in bank 0 is a scalar operand; every other operand is a vector of LEN.
     vecs = n[:-1] if n[-1] < 8 else n
-    for r in vecs:
+    for i, r in enumerate(vecs):
+        if ring and i == 1:
+            continue
         if r % 8 + LEN > 8:
             raise ValueError(f"{where}: {op} s{r} would wrap around its bank at LEN {LEN}")
 
@@ -117,7 +124,7 @@ def lint(lines):
             if dt == "f64":
                 raise ValueError(f"{where}: double-precision op inside a region")
             if dt == "f32" or (not dt and rest.startswith("s")):
-                _check_vector(op, _operands(rest), where)
+                _check_vector(op, _operands(rest), where, ring=WRAP_MARK in line)
     if inside:
         raise ValueError("end of file inside a region")
 

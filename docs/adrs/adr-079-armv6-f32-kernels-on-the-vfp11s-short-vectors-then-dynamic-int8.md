@@ -320,3 +320,73 @@ GEMV's share predicted. Against stock ggml, those are 47.4 → 31.7-32.0 s and 4
 **Tensor oracle** (per-arm backends): Moonshine's encoder (both cards), the conformer and NER are bit-identical;
 Citrinet moves 1.3e-6 (F32) and 1.2e-7 (Q8_0) of peak, through its squeeze-excitation FCs, which are one-column
 GEMVs. Its CTC ids are unchanged.
+
+## P4.32e, measured 2026-10-15: the depthwise kernel (`ggml-0035`)
+
+**The kernel.** `scripts/gen_armv6_dw_f32.py` generates `arch/arm/armv6-dw-f32.inc`: one channel, stride
+1, dilation 1, K >= 2, eight outputs a block. A depthwise conv has no input channels to reuse a weight
+across, so the 4x4 tile does not apply; what it reuses is the input window, across taps. Bank 1 holds a
+**ring** of eight inputs, and a vector operand starting at slot `k % 8` wraps around the bank, which
+is exactly `x[t + k .. t + k + 3]`: the unroll renames the window and never moves it. Bank 0 holds eight
+taps' weights as scalars, and a tap is two vector `vmla` and two scalar loads. `armv6_shortvec.lint`
+rejected that wrap as never intended. A line now opts in with a marker, and only for its Sn; a wrapping
+destination still raises.
+
+**Why each output is two sums.** The first version kept one sum per output, in k order, so it gave
+ggml's sweep bit for bit. It ran 0.333 GMAC/s on the board, against 0.289 for `bench43`'s C arm. With its
+loads removed it still took 14 cycles a tap, against 8 for the FMAC: a vector `vmla` waits for the whole
+previous one on its destination. Four chains ran a `vmla` per ~5 cycles, but the ring leaves room for
+only two accumulator vectors. So the odd taps go to a second pair in bank 3, and the two sums are added
+at the end. That costs bit-identity with ggml's order: the contract is `(w0 x0 + w2 x2 + ...) + (w1 x1 +
+w3 x3 + ...)`, 3.2e-7 of peak from ggml's order on the jfk schedule.
+
+**Gate 2** (`scripts/bench52.cpp`: `bench43`'s jfk schedule, the 104 stride-1 calls, 171.8 MMAC, Pi
+Zero W, one thread, RunFast; every arm checked bit for bit against its contract):
+
+| arm | ms | GMAC/s |
+|---|---|---|
+| ggml as shipped (`ggml_vec_mad_f32` per tap) | 4,136-4,159 | 0.041 |
+| `bench43`'s C arm (eight outputs, the window renamed) | 592-597 | 0.289 |
+| the kernel, one sum per output | 516 | 0.333 |
+| two sums | 360 | 0.477 |
+| two sums, next block's loads under the final adds; PLD of the next row (shipped) | 341-355 | 0.48-0.50 |
+| the same without the PLD | 455-473 | 0.37 |
+| the engine's per-channel work around it (row and weights copied, padded) | 351-357 | 0.48-0.49 |
+| inside ggml (`ggml_conv_2d_dw_direct`, tensors in a CPU backend buffer) | 376-379 | 0.453-0.457 |
+
+**Gate 2 is missed by about a point:** ggml runs 5.6-6.6% behind the bench arm that does the same work
+per channel. One part was a 64-bit `i % channels` per row, which is a library call on this core. A copy of
+the path's code ran 368 ms, and 357-361 with the channel counted instead. The patch now counts it, which
+took ggml from 380-384 ms to 376-379. ggml's own cost per graph compute is 0.027 ms (2.8 ms over the 104
+calls). Placing ggml's tensors on the bench's own arrays changes nothing (373-376 ms). The remaining ~4%
+is not attributed. The path stays on because gate 4 decides that, and it delivered (below). Measured out:
+two prefetch lines a block (0.45 GMAC/s) and a PLD on the output lines (0.39; the stores stream without
+allocating).
+
+**Correctness.** `tests/ci/test_conv_1d_dw_sweep.cpp`: every K % 8 on both sides of 8, Citrinet's and
+the conformer's shapes, a valid conv, a wide pad, and the four shapes the kernel declines (K = 1, fewer
+than 8 outputs, stride 2, dilation 2). Each runs bare and as the fused PAD -> conv -> bias -> RELU chain
+with the output over its input, on 1 and 2 threads, against a double reference and, on ARMv6, the
+contract's bits: 400/400 in qemu and on the board, 92 runs held to the bits. **Both sabotages go red.** A
+skipped ring load fails 140 checks. With the path off (`GGML_CPU_ARMV6_DW=0`), ggml's order fails the
+bit check on 88 runs at 7.5e-8, so the check can tell the two orders apart. The x86 `ci` label passes 121/121.
+
+**Gates 3 and 4** (one wheel, `VAR=GGML_CPU_ARMV6_DW`, so arm 0 is ggml's sweep; the seven models with
+depthwise convolutions; two rounds ABBA; one inference per launch; per-arm backends for the tensor oracle):
+
+| model | off | on | speed-up | output |
+|---|---|---|---|---|
+| Citrinet-256-ls F32 (jfk 11 s) | 17.9 s | 14.0 s | **1.28x** | CTC ids identical; logits 1.4e-6 of peak, no argmax frame changes |
+| Citrinet-256-ls Q8_0 | 18.1 s | 14.3 s | **1.27x** | CTC ids identical; logits 1.0e-6 |
+| conformer-ctc-small | 10.1 s | 10.1 s | 1.01x | same text; logits 1.5e-3, inside the card's own floor (2.3e-3, P4.32d), no argmax change |
+| sanoTTS heart / heart-nano | 4.97 / 3.11 s | 4.91 / 3.06 s | 1.01-1.02x | 1.2e-6 / 1.5e-5 of peak; whisper-small hears the same sentence in both arms |
+| WakeHuBERT tiny | 2.77 s | 2.72 s | 1.02x | 4.2e-7 (its dilated convs stay on ggml's path) |
+| VITS | 26.1 s | 26.3 s | 0.99x | identical: none of its depthwise convs takes the path |
+
+Every run is deterministic across rounds. Citrinet's saving, 3.8-3.9 s, matches the depthwise share the
+profile gave it (4.1 s at 0.043 GMAC/s, now ~0.4 s). **Both arms ran 7-10% slower in seconds than P4.32d's
+on the same board** (Citrinet F32 16.2 s then, 17.9 s for this off arm). The board was not throttled
+(42.8 °C, 1 GHz), and the ratios come from paired runs. The first launch (Citrinet F32 off, round 1:
+21.4 s) overlapped an ssh login and is left out of the ratio. Citrinet-256-ls on the Pi Zero W is now RTF
+~1.27 (F32) and ~1.30 (Q8_0), against 1.48 and 1.54 after P4.32d.
+
