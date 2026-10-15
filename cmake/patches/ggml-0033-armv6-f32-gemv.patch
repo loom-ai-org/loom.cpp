@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 77f21154..62441e1d 100644
+index 77f21154..3d9c72bc 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1252,6 +1252,89 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+@@ -1252,6 +1252,81 @@ static void ggml_compute_forward_mul_mat_one_chunk(
      }
  }
  
@@ -14,17 +14,20 @@ index 77f21154..62441e1d 100644
 +// projection streams its weights at 91 MB/s that way, 0.415 s per token, where the board reads 338 MB/s
 +// with PLD (loom scripts/bench48.c).
 +//
-+// Here four rows go per pass, each keeping EXACTLY that arithmetic -- float product, double sum, k in
-+// order -- so the result is bit-identical to the path it replaces, and the four independent chains hide
-+// the double add's latency. Measured on a Pi Zero W at that shape (one thread, RunFast, MB/s of weights):
++// Here four rows go per pass, each a float sum of float products in k order: four independent chains
++// hide the VFP's add latency. That is NOT vec_dot_f32's arithmetic (it sums in double), so the result is
++// not bit-identical to the path it replaces; a float sum is what ggml's SIMD builds already do (in another
++// order), and the ARMv6 build was gated across loom's zoo on it (loom ADR-079). Measured on a Pi Zero W,
++// one thread, RunFast, MB/s of weights, at row strides of 1152 B (Moonshine's 288 x 32768) / 1 KB / 2 KB /
++// 3 KB / 4 KB:
 +//
-+//     double sum, 4 rows                 274      <- this
-+//     double sum, 8 rows                 273      the double ops are the bound, not the streams
-+//     double sum, 4 rows, PLD +128 B     247      a PLD per row and line COSTS here, at 128 B or 256 B
-+//     float sum, 4 rows (bench48)        316      +15%, but not bit-identical: every decoder on this
-+//     float sum, 8 rows                  328      core would need a numerics gate, for ~2% of Moonshine
++//     double sum, 4 rows                 274 /  -- / 236 /  -- /  --    bit-identical to vec_dot_f32
++//     double sum, 4 rows, PLD +128 B     247                            a PLD per row and line COSTS here
++//     float sum, 8 rows                  317 / 135 / 147 / 124 /  50    eight streams thrash the 4-way L1
++//     float sum, 4 rows                  325 / 294 / 270 / 270 / 120    <- this
++//     ggml (vec_dot_f32, one row)         92 /  92 /  92 /  93 /  92
 +//
-+// Rows are split into contiguous ranges, one per thread.
++// Rows are split into contiguous ranges of four, one per thread.
 +#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
 +static void ggml_armv6_gemv_rows(const char * a, size_t lda, const float * x, float * y,
 +                                 int64_t k, int64_t r0, int64_t r1) {
@@ -34,29 +37,18 @@ index 77f21154..62441e1d 100644
 +        const float * w1 = (const float *) (a + (n + 1) * lda);
 +        const float * w2 = (const float *) (a + (n + 2) * lda);
 +        const float * w3 = (const float *) (a + (n + 3) * lda);
-+        ggml_float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-+        int64_t i = 0;
-+        for (; i + 8 <= k; i += 8) {
-+            for (int j = 0; j < 8; ++j) {
-+                const float v = x[i + j];
-+                s0 += (ggml_float) (w0[i + j] * v);
-+                s1 += (ggml_float) (w1[i + j] * v);
-+                s2 += (ggml_float) (w2[i + j] * v);
-+                s3 += (ggml_float) (w3[i + j] * v);
-+            }
-+        }
-+        for (; i < k; ++i) {
++        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
++        for (int64_t i = 0; i < k; ++i) {
 +            const float v = x[i];
-+            s0 += (ggml_float) (w0[i] * v); s1 += (ggml_float) (w1[i] * v);
-+            s2 += (ggml_float) (w2[i] * v); s3 += (ggml_float) (w3[i] * v);
++            s0 += w0[i] * v; s1 += w1[i] * v; s2 += w2[i] * v; s3 += w3[i] * v;
 +        }
-+        y[n] = (float) s0; y[n + 1] = (float) s1; y[n + 2] = (float) s2; y[n + 3] = (float) s3;
++        y[n] = s0; y[n + 1] = s1; y[n + 2] = s2; y[n + 3] = s3;
 +    }
 +    for (; n < r1; ++n) {
 +        const float * w = (const float *) (a + n * lda);
-+        ggml_float s = 0.0;
-+        for (int64_t i = 0; i < k; ++i) s += (ggml_float) (w[i] * x[i]);
-+        y[n] = (float) s;
++        float s = 0.0f;
++        for (int64_t i = 0; i < k; ++i) s += w[i] * x[i];
++        y[n] = s;
 +    }
 +}
 +
@@ -92,7 +84,7 @@ index 77f21154..62441e1d 100644
  void ggml_compute_forward_mul_mat(
          const struct ggml_compute_params * params,
                struct ggml_tensor * dst) {
-@@ -1297,6 +1380,12 @@ void ggml_compute_forward_mul_mat(
+@@ -1297,6 +1372,12 @@ void ggml_compute_forward_mul_mat(
      // nb01 >= nb00 - src0 is not transposed
      //   compute by src0 rows
  

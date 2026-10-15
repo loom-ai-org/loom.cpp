@@ -291,3 +291,32 @@ the probe served both arms. `armv6_runfast_gate.sh` now gives each arm's probe i
 4.39 → 2.78 s, Citrinet Q8_0 29.0 → 16.9 s, conformer 11.0 → 9.33 s. Left of the F32 family: P4.32e
 (depthwise, Citrinet's 4.1 s), P4.32f (epilogue fusion), P4.32g (an FFT for the DFT-basis convolutions,
 heart's 1.9 s of 4.3).
+
+## P4.32c revised 2026-10-15: the GEMV sums in float
+
+**User decision 2026-10-15: take the float sum** that P4.32c had declined for bit-identity. `ggml-0033` now
+runs four rows a pass, each a float sum of float products in k order. That is what every SIMD build of
+`vec_dot_f32` already does, in another order. Eight rows a pass was measured too and lost: eight row streams
+thrash the 4-way 16 KB L1 at most strides. `bench51` (MB/s of weights, Pi Zero W, one thread, RunFast), at
+row strides of 1152 B (Moonshine) / 1 KB / 2 KB (the LSTM-sized shape) / 3 KB / 4 KB:
+
+| GEMV | 1152 B | 1 KB | 2 KB | 3 KB | 4 KB |
+|---|---|---|---|---|---|
+| ggml, `vec_dot_f32` | 92 | 92 | 92 | 93 | 92 |
+| double sum, 4 rows (the bit-identical first version) | 274 | | 236 | | |
+| float sum, 8 rows | 317 | 135 | 147 | 124 | 50 |
+| **float sum, 4 rows** | **318-325** | **294-298** | **270** | **267-269** | **108-119** |
+
+`tests/ci/test_mul_mat_f32_sweep.cpp` now holds the ARMv6 GEMV to its own contract's bits (a float sum in k
+order); with the GEMV switched off, that check fails on every GEMV shape, so it can tell the two apart.
+
+**Gates 3 and 4** (one wheel, `VAR=GGML_CPU_ARMV6_GEMV`, so arm 0 is stock ggml's double sum, whose bits are
+the first version's; 13 models). The board rebooted during round 2, so the timings are round 1 plus the
+seven round-2 runs that finished. **Twelve of the 13 outputs are byte-identical between the arms**,
+Moonshine's transcripts (the token ids) included. **Silero VAD differs, by at
+most 4.8e-7 in a speech probability, and no frame changes its decision** at 0.5 or 0.35. Against the double-sum
+kernel (P4.32d's A/B), Moonshine tiny F32 goes 32.8 → 31.7-32.0 s and Silero 2.78 → 2.70 s, the ~2-3% the
+GEMV's share predicted. Against stock ggml, those are 47.4 → 31.7-32.0 s and 4.15 → 2.70 s.
+**Tensor oracle** (per-arm backends): Moonshine's encoder (both cards), the conformer and NER are bit-identical;
+Citrinet moves 1.3e-6 (F32) and 1.2e-7 (Q8_0) of peak, through its squeeze-excitation FCs, which are one-column
+GEMVs. Its CTC ids are unchanged.

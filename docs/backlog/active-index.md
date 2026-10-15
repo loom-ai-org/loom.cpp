@@ -420,7 +420,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   order). ~~P4.32a~~ the harness `scripts/armv6_shortvec.py` (enter/leave/lint) + gate 1 **PASSED on the board 2026-10-14** (ADR-079's gate-1 section; qemu-user fails it);
   ~~P4.32b~~ direct conv tile **SHIPPED as `ggml-0032` 2026-10-14** (`gen_armv6_conv_f32.py`, `bench50.cpp`; amy/de051/VITS 1.73-1.74x end to end;
   then input-channel chunks + TB 128 for the wide/dilated shapes, 2026-10-15: VITS 1.37x, amy 1.23x more, bit-identical);
-  ~~P4.32c~~ F32 GEMV **SHIPPED as `ggml-0033` 2026-10-15**, bit-identical, 3.0x at the op (Moonshine F32 1.32x, Silero 1.47x end to end); was: **P4.32c** F32 GEMV (`scripts/bench48.c`; Moonshine 20.2 s, Silero 2.0); ~~P4.32d~~ GEMM **SHIPPED as `ggml-0034` 2026-10-15** (the k = 1 kernel: `mul_mat` n >= 24,
+  ~~P4.32c~~ F32 GEMV **SHIPPED as `ggml-0033` 2026-10-15**, 3.0x at the op bit-identical, then a float sum on the user's call (3.5x; not bit-identical, gated on the board) (Moonshine F32 1.32x, Silero 1.47x end to end, then ~3% more); was: **P4.32c** F32 GEMV (`scripts/bench48.c`; Moonshine 20.2 s, Silero 2.0); ~~P4.32d~~ GEMM **SHIPPED as `ggml-0034` 2026-10-15** (the k = 1 kernel: `mul_mat` n >= 24,
   1x1 and strided convs; Citrinet Q8_0 1.72x, Moonshine F32 1.43x); **P4.32e** depthwise (`bench43`; Citrinet 4.1 s);
   **P4.32f** bias/mask/activation epilogue fusion (1.3-3.7 s in seven models); **P4.32g** FFT for the DFT-basis convs (an op,
   needs its own design; 1.2-2.1 s in five models). **P4.33** dynamic int8 on `Q8_0_PC` (ADR-076) for the GEMV (2.14x) and
