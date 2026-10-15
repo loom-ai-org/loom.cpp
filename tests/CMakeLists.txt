@@ -321,6 +321,21 @@ set_tests_properties(test_conv_dw_fusion PROPERTIES ENVIRONMENT
     "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_conv_dw_fusion PROPERTIES DEPENDS test_conv_dw_fusion_unfused)
 
+# ggml-0036 (ADR-079 P4.32f): the RELU and time mask a convolution's epilogue absorbs. Registered with
+# the epilogue off and on (ggml reads GGML_CPU_CONV_EPILOGUE once); the second compares the two outputs
+# byte for byte, and each checks the RELU's own result was (not) written.
+add_executable(test_conv_epilogue_fusion ci/test_conv_epilogue_fusion.cpp)
+target_link_libraries(test_conv_epilogue_fusion PRIVATE loom::engine)
+add_test(NAME test_conv_epilogue_fusion_off COMMAND test_conv_epilogue_fusion)
+set_tests_properties(test_conv_epilogue_fusion_off PROPERTIES LABELS ci)
+set_tests_properties(test_conv_epilogue_fusion_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_CONV_EPILOGUE=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_conv_epilogue_fusion COMMAND test_conv_epilogue_fusion)
+set_tests_properties(test_conv_epilogue_fusion PROPERTIES LABELS ci)
+set_tests_properties(test_conv_epilogue_fusion PROPERTIES ENVIRONMENT
+    "GGML_CPU_CONV_EPILOGUE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_conv_epilogue_fusion PROPERTIES DEPENDS test_conv_epilogue_fusion_off)
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.

@@ -390,3 +390,87 @@ on the same board** (Citrinet F32 16.2 s then, 17.9 s for this off arm). The boa
 21.4 s) overlapped an ssh login and is left out of the ratio. Citrinet-256-ls on the Pi Zero W is now RTF
 ~1.27 (F32) and ~1.30 (Q8_0), against 1.48 and 1.54 after P4.32d.
 
+
+## P4.32f, measured 2026-10-15: the convolution epilogue (`ggml-0036`) and the exporter's topology CSE
+
+**The budget was mostly spent already.** The decision table's "1.3-3.7 s in seven models" came from
+ADR-077's node-by-node profile, where no CPU fusion fires ([Retro-073](../retros/retro-073-the-profiler-cannot-see-a-fusion.md)).
+A fusion log of the real path (an x86 build of the dev tree that prints, per node, whether it ran fused
+and why a fusion declined; the detectors are ISA-independent) joined with the board's per-node seconds:
+
+| model | elementwise s still paid | already fused (ggml-0005/0007/0022) |
+|---|---|---|
+| Citrinet-256-ls F32 / Q8_0 | **2.11 / 2.10** | 0.44 |
+| VITS / amy / de051 | 2.33 / 1.59 / 0.60 | 3.52 / 4.50 / 1.65 |
+| Moonshine tiny F32 | 2.61 (0.79 of it is the GELU itself) | 0.01 |
+| conformer / heart / Silero / NER / WakeHuBERT | 1.44 / 0.47 / 0.37 / 0.15 / 0.11 | ≤ 0.24 |
+
+Citrinet's 2.11 s is the one near a real-time line. Each sub-block ends `MUL(RELU(ADD(conv, bias)), mask)`
+and each depthwise conv is followed by `MUL(·, mask)`: RELU 0.45 s, the two mask MULs 0.44 + 0.43 s, and
+53 of 129 bias ADDs (0.21 s) that ggml-0005/0007 declined because the allocator put the ADD's result
+4384-4416 bytes ahead of the convolution's input. The work split three ways (f1 Citrinet's epilogue, f2 the
+vocoders' leftovers, f3 a GEMM bias epilogue); **the user took f1**.
+
+**Why the masks needed the exporter.** NeMo rebuilds `arange(T) < length` before every use, and ggml
+expands a node's sources depth first, so each rebuilt mask lands between the RELU and its MUL and the MUL
+is never the next node. The 239 RANGE_1D chains are 4 distinct ones, but only on the topology, where T is
+an expression over the root axis; in MIL each ends at a different tensor's `shape`. The user chose a
+generic pass in the exporter over one in the engine's graph build (re-export needed, but the runtime
+stays lean): `loom_exporter/topology_cse.py` merges whitelisted pure nodes with equal op, inputs and
+attributes and never removes a declared output (Epic-02). Citrinet: 2,410 nodes → 1,247. A fresh
+export with the pass off is byte-identical to the GGUF the board had.
+
+**`ggml-0036`.** `ggml_cpu_conv_2d_fusion` takes a RELU and then a per-position MUL after the bias (and
+residual); the depthwise fusion takes the MUL. A result that partially overlaps the input is computed
+into the convolution's own tensor and carried to the output in one pass that adds bias, residual, RELU
+and mask, which is bit-identical to the unfused nodes. `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 only.
+The first ARMv6 epilogue, a per-element C function, cost as much as the passes it removed (42 ns an
+element after a 1x1 conv, 54 after a depthwise one, against ~48 for a pass): the RELU's `vcmpe` + `vmrs`
+drained the VFP pipeline every element. The shipped one tests the RELU on the integer bits, keep iff
+`lo <= u <= 0x7f800000` (lo = 0x00800000 under flush-to-zero, 1 in IEEE mode), exact against the VFP
+compare over 17.1M bit patterns in both FPSCR modes on the board (a sabotaged lo: 33,425 differ), and
+unrolls the add and multiply by four. The depthwise row goes through an L1 scratch row first: the
+ARM1176 does not allocate on a store, and reading back a just-stored row cost 43 ns an element against
+10 cached (the same pass run twice).
+
+`scripts/bench53.cpp` (Pi Zero W, one thread, RunFast, 256 channels, ms over the conv+bias or bare-dw floor):
+
+| T | RELU + mask, unfused | first epilogue | shipped | dw mask, unfused | first | shipped |
+|---|---|---|---|---|---|---|
+| 551 | +13.5-17 | +6.0 | +3.7 | +7.0 | +7.6 | **+1.55** |
+| 276 | +7.4-8.8 | +4.0 | +2.8 | +3.9 | +4.0 | +0.8 |
+| 138 | +4.2-4.4 | +1.9 | +1.2 | +2.1 | +1.8 | +0.45 |
+
+**Correctness.** `tests/ci/test_conv_epilogue_fusion.cpp`, registered with the epilogue off and on: 1x1,
+k5 d2, OC % 4 != 0, a residual, both partial-overlap offsets, three depthwise shapes; a double reference,
+a poisoned RELU (and depthwise) result that must survive exactly when the epilogue is on, and the two runs
+compared byte for byte. x86 and ARMv6 (qemu) pass. Five sabotages each go red (the mask skipped past
+t = 500, the RELU not matched, the depthwise mask misindexed, the overlap pass's bias dropped, one row of
+each ARMv6 quad skipped). The x86 `ci` label passes 123/123; the exporter's `tests/ci` 1,246 passed.
+
+**Gates 3 and 4** (wheel with ggml-0036, `VAR=GGML_CPU_CONV_EPILOGUE`; on x86 only Citrinet, VITS,
+WakeHuBERT and Silero fuse anything new, so those are the rows). Every output hash is identical between
+the arms, and Citrinet's logits through the tensor oracle are byte-identical off and on, in both
+precisions and both GGUFs. The CSE'd graph differs from the old one by 1.3e-6 of peak (with the masks
+gone from between them, more conv + bias pairs take ggml-0005's accumulator-start bias); CTC ids identical.
+Four rounds (round 1 off first, then on first), one inference per launch, 45 s settle:
+
+| Citrinet-256-ls F32, jfk 11 s | off | on |
+|---|---|---|
+| old GGUF | 14.09 s | 13.92 s (1.012x) |
+| CSE'd GGUF | 13.68 s | 13.21 s (1.036x) |
+
+**f1 end to end: 14.09 → 13.21 s (1.067x), RTF 1.28 → 1.20** (the CSE 0.42 s, the epilogue 0.47 s). Q8_0, two
+rounds, two gates: 14.34-14.46 → 13.52-13.57 s (1.06-1.07x). VITS 26.24 → 26.33 s over three clean pairs
+(the fourth "on" launch, 33.2 s, overlapped an ssh login); WakeHuBERT 1.03x; Silero 0.98-1.00x.
+
+**Against the projection.** 0.89 s of the ~1.5 s the node-level seconds promised. The shipped epilogue
+did not move the end-to-end number from the first epilogue's gate (0.88 s, two rounds), although bench53
+prices its depthwise mask at a fifth of the first one's. Not attributed; one candidate is that in the
+model's graph the depthwise output is allocated over its own just-read input row, already cached,
+which bench53's separate output tensor is not. **Left for Citrinet's real-time line:** the DFT-basis
+convolution (1.19 s, P4.32g). **Left of P4.32f:** f2, the vocoders' unfused leftovers (resblock sum and
+its 1/3, the LEAKY_RELU fed from a CONT, the transposed conv's bias: VITS 2.3 s, amy 1.6, de051 0.6), and
+f3, a bias epilogue on the ARMv6 GEMM (Moonshine 0.6 s, conformer). **The CSE reaches users only through a
+re-export**: Citrinet's published GGUFs are unchanged until republished, and every family's next export
+merges whatever its topology repeats, so the exporter's snapshot gate will show topology diffs.
