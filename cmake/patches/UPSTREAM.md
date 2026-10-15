@@ -1682,6 +1682,35 @@ each use lands between the RELU and its MUL, and the fusion never sees them adja
 F32 14.0-14.4 → 13.1-13.3 s and Q8_0 14.3-14.5 → 13.5-13.6 s for an 11 s clip (1.06-1.08x), logits byte-identical
 with the epilogue on and off; VITS, WakeHuBERT and Silero VAD within noise.
 
+## PR 34 — `cpu`: ADD, SUB, MUL, SCALE, RELU and LEAKY_RELU at memory speed on ARMv6
+
+*(`cmake/patches/ggml-0037-armv6-elementwise.patch`; independent of the others, and FZ-aware for PR 28's RunFast)*
+
+**Problem.** On an ARM1176 (Pi Zero, Pi 1) the elementwise ops are compute-bound, not memory-bound: each
+loop is one load, one VFP op and a store that waits on the op's 8-cycle latency, and nothing prefetches.
+A `[1, C]` bias over `[T, C]`, or a `[1, 1]` scale, is worse: `apply_binary_op` calls its row function
+once per element (`ne10 == 1`). The RELUs pay a `vcmpe` + `vmrs` per element, which drains the VFP
+pipeline. Measured over a cold 12.5 MB tensor: ADD 68 ns an element, a bias ADD or scalar MUL 43, LEAKY_RELU
+64, against 12 for `memcpy`.
+
+**Change.** A header, `armv6-eltwise.h`, ARMv6 only (`__ARM_FEATURE_SIMD32 && !__ARM_NEON`): add/sub/mul
+over f32 rows and their scalar forms eight floats a step through `vldmia`/`vstmia`, eight independent VFP
+ops and one `pld` per input line, after a scalar head that brings the input to a 32-byte line (a `vldmia`
+that straddles two lines nearly doubles a cold stream on this core: 21 vs 11 ns for a copy). RELU and
+LEAKY_RELU compare on the integer bits: `x > 0` is `lo <= u <= 0x7f800000` unsigned, `lo` the smallest
+positive normal under FPSCR.FZ (the compare sees a positive denormal as 0) and 1 in IEEE mode; LEAKY_RELU
+keeps its own `max(x, 0) + slope * min(x, 0)` arithmetic. `apply_binary_op` (F32 only), the RELU in
+`apply_unary_op`, `leaky_relu_f32` and `scale_f32` (one pass `x * s` instead of `memcpy` and an in-place
+scale) call it. `GGML_CPU_ARMV6_ELTWISE=0` turns it off.
+
+**Numerics.** Bit-identical by construction (the same IEEE operations on the same operands), and checked:
+every op and broadcast form, with ±0, denormals, inf and NaN in the inputs, byte for byte against the stock
+loops under RunFast; twelve models' outputs byte-identical with it on and off.
+
+**Measured**, Pi Zero W, one thread: same-shape ADD 68.3 → 36.4 ns an element, bias ADD / scalar MUL 43.3
+→ 11.6 (`memcpy` 11.9), LEAKY_RELU 63.8 → 23.0. End to end 1.02-1.07x on ten of twelve models (amy 1.045x,
+de051 1.067x, conformer 1.053x, Citrinet Q8_0 1.065x), neutral on the other two.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
