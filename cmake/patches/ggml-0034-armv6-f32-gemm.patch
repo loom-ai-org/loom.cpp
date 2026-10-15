@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 62441e1d..2f5839c5 100644
+index 3d9c72bc..728c89f0 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1384,6 +1384,9 @@ void ggml_compute_forward_mul_mat(
+@@ -1376,6 +1376,9 @@ void ggml_compute_forward_mul_mat(
      if (ggml_armv6_gemv(params, src0, src1, dst)) {
          return;
      }
@@ -12,7 +12,7 @@ index 62441e1d..2f5839c5 100644
  #endif
  
      // TODO: extract to "extra_op"
-@@ -2978,6 +2981,9 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2970,6 +2973,9 @@ struct ggml_cplan ggml_graph_plan(
                          // Workspace for tiled (see tiled.h)
                          cur = GGML_PAD(cur, 64);
                          cur += ggml_tiled_wdata_size(n_tasks, node);

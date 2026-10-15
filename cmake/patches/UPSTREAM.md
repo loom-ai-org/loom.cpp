@@ -1544,26 +1544,37 @@ identical in both arms. Models without such convolutions are bit-identical. The 
 models' own slow shapes 8.73 → 5.56 s and VITS a further 34.6 → 25.3 s, amy 22.9 → 18.6 s, with
 bit-identical outputs.
 
-## PR 30 — `cpu`: a one-column F32 `mul_mat` on ARMv6, bit-identical and 3x faster
+## PR 30 — `cpu`: a one-column F32 `mul_mat` on ARMv6, 3.5x faster
 
 *(`cmake/patches/ggml-0033-armv6-f32-gemv.patch`)*
 
 **Problem.** On the ARM1176 (Raspberry Pi 1 / Zero), `llamafile_sgemm` declines n = 1, so a decoder step
 or an LSTM step reaches `ggml_vec_dot_f32` once per output. With no `GGML_SIMD` on this core, that is the
 scalar branch: a float product summed in double, one dependent chain per output. A 288 x 32768 F32
-vocabulary projection streams its weights at 91 MB/s, where the board reads 274+ MB/s.
+vocabulary projection streams its weights at 92 MB/s, where the board reads 338 MB/s with PLD.
 
 **Change.** On ARMv6 with VFP only, `ggml_compute_forward_mul_mat` first offers an F32 x F32 product with
-one column to a GEMV that runs four rows per pass. Each row keeps exactly `vec_dot_f32`'s arithmetic
-(float product, double sum, k in order), so the result is **bit-identical**. Rows are split into
-contiguous ranges per thread. `GGML_CPU_ARMV6_GEMV=0` turns it off.
+one column to a GEMV that runs four rows per pass, each a float sum of float products in k order. Rows are
+split into contiguous ranges of four per thread. `GGML_CPU_ARMV6_GEMV=0` turns it off.
 
-**Measured**, Pi Zero W, one thread, RunFast, tensors in a CPU backend buffer (loom `scripts/bench51.cpp`):
-288 x 32768 and 288 x 2304 at 274-275 MB/s against 91-92 (3.0x), checksums identical. Variants, all
-measured: 8 rows a pass changed nothing (273), because the double ops are the bound. A PLD per row and
-cache line cost 10% (247). A float sum would reach 316-328 MB/s, but it would not be bit-identical.
-Placement matters on this core: the same kernel and bytes ran 216 MB/s from a 4-byte-aligned context
-allocation (page offset 340) and 274 from an 8-byte-aligned one.
+**Numerics: not bit-identical.** The scalar branch sums in double; this sums in float, as every SIMD build
+of `vec_dot_f32` already does (in another order). The first version kept the double sum and was
+bit-identical, at 274 MB/s; the float sum was taken for the speed, and gated on the board across loom's
+model zoo (see ADR-079 in loom.cpp).
+
+**Measured**, Pi Zero W, one thread, RunFast, tensors in a CPU backend buffer (loom `scripts/bench51.cpp`),
+MB/s of weights at row strides of 1152 B / 1 KB / 2 KB / 3 KB / 4 KB:
+
+| variant | 1152 B | 1 KB | 2 KB | 3 KB | 4 KB |
+|---|---|---|---|---|---|
+| `vec_dot_f32` (stock) | 92 | 92 | 92 | 93 | 92 |
+| double sum, 4 rows (bit-identical) | 274 | | 236 | | |
+| float sum, 8 rows | 317 | 135 | 147 | 124 | 50 |
+| **float sum, 4 rows** | **318-325** | **294-298** | **270** | **267-269** | **108-119** |
+
+Eight row streams thrash the 4-way 16 KB L1 at most strides, so four it is. A PLD per row and cache line
+cost 10% (247 on the double sum). Placement matters on this core: the same kernel and bytes ran 216 MB/s
+from a 4-byte-aligned context allocation (page offset 340) and 274 from an 8-byte-aligned one.
 
 ## PR 31 — `cpu`: F32 GEMM, 1x1 and strided convolutions on ARMv6's VFP short vectors
 

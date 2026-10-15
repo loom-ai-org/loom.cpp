@@ -1,6 +1,6 @@
 // F32 MUL_MAT against a double reference, over the shapes that reach each of the ARMv6 paths and their
-// edges (ADR-079): ggml-0033's one-column GEMV, which must stay BIT-IDENTICAL to ggml_vec_dot_f32 (float
-// products, double sum), and ggml-0034's short-vector GEMM for n >= 24, which blocks K in chunks, rows by
+// edges (ADR-079): ggml-0033's one-column GEMV, which must give exactly its own contract's bits (float
+// products summed in float, k in order, one chain per row), and ggml-0034's short-vector GEMM for n >= 24, which blocks K in chunks, rows by
 // 32 and columns by quads -- the shapes below reach each edge and each fallback. Every
 // CPU build runs its own paths through here; the ARMv6 build is checked in qemu (loom-armv6-build:bookworm)
 // and on the board.
@@ -21,7 +21,7 @@ struct Shape { int64_t k, m, n; };
 
 // (K, M = rows of the weight, N = columns of the activation)
 const Shape kShapes[] = {
-    {288, 2304, 1}, {512, 2048, 1}, {7, 13, 1},                         // GEMV, incl. tails
+    {288, 2304, 1}, {512, 2048, 1}, {7, 13, 1}, {33, 21, 1},            // GEMV, incl. tails
     {288, 1152, 457}, {1152, 288, 457}, {256, 256, 551},                // Moonshine, Citrinet-sized
     {100, 132, 24}, {33, 4, 25}, {1153, 36, 27}, {64, 260, 31},         // chunks, ragged blocks, partial quads
     {64, 64, 7}, {64, 66, 32}, {64, 64, 16}, {5, 8, 2},                 // fall back: n < 24, M % 4, n = 2
@@ -59,17 +59,18 @@ int main() {
             LOOM_CHECK(compute(backend, gf, threads));
             const float* C = (const float*) c->data;
             double worst = 0;
-            bool exact = true;   // the GEMV contract: float products summed in double, in k order
+            bool exact = true;   // the ARMv6 GEMV contract: float products summed in float, in k order
             for (int64_t n = 0; n < s.n; ++n)
                 for (int64_t m = 0; m < s.m; ++m) {
-                    double r = 0, mag = 0, sd = 0;
+                    double r = 0, mag = 0;
+                    float sf = 0;
                     for (int64_t k = 0; k < s.k; ++k) {
                         const double p = (double) A[m * s.k + k] * B[n * s.k + k];
                         r += p; mag += std::fabs(p);
-                        sd += (double) (A[m * s.k + k] * B[n * s.k + k]);
+                        sf += A[m * s.k + k] * B[n * s.k + k];
                     }
                     worst = std::max(worst, std::fabs(C[n * s.m + m] - r) / (mag + 1e-30));
-                    if (C[n * s.m + m] != (float) sd) exact = false;
+                    if (C[n * s.m + m] != sf) exact = false;
                 }
             LOOM_CHECK(worst < 1e-5);
             if (worst >= 1e-5)
@@ -78,7 +79,7 @@ int main() {
 #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
             if (s.n == 1) {
                 LOOM_CHECK(exact);
-                if (!exact) std::fprintf(stderr, "  GEMV k %lld m %lld is not bit-identical to vec_dot_f32's arithmetic\n",
+                if (!exact) std::fprintf(stderr, "  GEMV k %lld m %lld does not give its float-sum contract's bits\n",
                                          (long long) s.k, (long long) s.m);
             }
 #else
