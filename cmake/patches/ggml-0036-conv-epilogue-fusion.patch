@@ -1,21 +1,24 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 728c89f0..f3381684 100644
+index 728c89f0..77072185 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -3163,6 +3163,12 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3163,6 +3163,15 @@ struct ggml_cplan ggml_graph_plan(
  // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
  static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
  
 +// loom (ggml-0036, ADR-079 P4.32f): the convolution EPILOGUE -- a RELU and a per-time mask MUL after a
 +// convolution's bias (and residual), the mask after a depthwise one, and the case where the fused
-+// result partially overlaps the input. On by default on ARMv6 only, the ISA it was measured on;
-+// GGML_CPU_CONV_EPILOGUE=1 turns it on elsewhere (the CI test runs it on x86), =0 off.
++// result partially overlaps the input. OFF by default everywhere; GGML_CPU_CONV_EPILOGUE=1 turns it on.
++// It shipped on by default on ARMv6, where it took Citrinet-256-ls from 13.68 to 13.21 s against
++// ggml's own RELU and MUL passes. ggml-0037 then made those passes 2-4x faster, and the epilogue, which
++// re-reads output rows the convolution has just stored (an ARM1176 does not allocate on a store),
++// became the slower of the two: 12.53 s off against 13.07 on (ADR-079 P4.32f f2 step 3b).
 +static bool ggml_cpu_conv_epilogue = false;   // initialized once in ggml_cpu_init(), read-only afterwards
 +
  // RunFast on ARMv6: the VFP's flush-to-zero and default-NaN modes (FPSCR FZ | DN) for the duration of
  // a graph compute, on every compute thread, restored on the way out so the caller's own floating
  // point (Python, the Lua driver) stays in IEEE mode.
-@@ -3250,10 +3256,12 @@ static int ggml_cpu_next_compute_node(const struct ggml_cgraph * cgraph, int fro
+@@ -3250,10 +3259,12 @@ static int ggml_cpu_next_compute_node(const struct ggml_cgraph * cgraph, int fro
  // The other operand of an ADD that consumes `prev`'s result, or NULL if this ADD is not the one the
  // convolution can absorb. With `per_channel` the operand wanted is a convolution bias -- one value per
  // output channel, broadcast along the length axis; without it, a residual of the result's full shape.
@@ -32,7 +35,7 @@ index 728c89f0..f3381684 100644
      if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
          ggml_nelements(add) != ggml_nelements(conv)) {
          return NULL;
-@@ -3274,13 +3282,54 @@ static const struct ggml_tensor * ggml_cpu_conv_2d_add_operand(const struct ggml
+@@ -3274,13 +3285,54 @@ static const struct ggml_tensor * ggml_cpu_conv_2d_add_operand(const struct ggml
      if (x->ne[0] != conv->ne[0] || x->ne[1] != conv->ne[2] || x->ne[2] != 1 || x->ne[3] != 1) {
          return NULL;
      }
@@ -88,7 +91,7 @@ index 728c89f0..f3381684 100644
  // What one fused convolution stands in for.
  struct ggml_conv_2d_fusion {
      const struct ggml_tensor * act;       // LEAKY_RELU feeding the input, or NULL
-@@ -3288,6 +3337,9 @@ struct ggml_conv_2d_fusion {
+@@ -3288,6 +3340,9 @@ struct ggml_conv_2d_fusion {
      const struct ggml_tensor * residual;  // the elementwise ADD's other operand, or NULL
      struct ggml_tensor *       conv;      // the CONV_2D itself
      struct ggml_tensor *       out;       // the tensor the fused kernel writes: the last node covered
@@ -98,7 +101,7 @@ index 728c89f0..f3381684 100644
  };
  
  // Whether the nodes from `node_n` are a convolution with elementwise neighbours it can absorb. Fills
-@@ -3378,6 +3430,10 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+@@ -3378,6 +3433,10 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
          }
      }
  
@@ -109,7 +112,7 @@ index 728c89f0..f3381684 100644
      if (f->act == NULL && f->out == conv) {
          return -1;                                // nothing to fuse
      }
-@@ -3399,6 +3455,32 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+@@ -3399,6 +3458,32 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
      const struct ggml_tensor * out = f->out;
  
      const bool out_is_in = out->data == in->data && ggml_nbytes(out) == ggml_nbytes(in);
@@ -142,7 +145,7 @@ index 728c89f0..f3381684 100644
      if ((!out_is_in && ggml_cpu_tensors_overlap(out, in)) ||
          ggml_cpu_tensors_overlap(out, conv->src[0]) ||
          (f->bias && ggml_cpu_tensors_overlap(out, f->bias))) {
-@@ -3437,7 +3519,7 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+@@ -3437,7 +3522,7 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
  static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int node_n,
                                        struct ggml_tensor ** conv_out, const struct ggml_tensor ** pad_out,
                                        const struct ggml_tensor ** bias_out, bool * relu_out,
@@ -151,7 +154,7 @@ index 728c89f0..f3381684 100644
      int idx = node_n;
      struct ggml_tensor * node = cgraph->nodes[idx];
      const struct ggml_tensor * pad = NULL;
-@@ -3511,6 +3593,20 @@ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -3511,6 +3596,20 @@ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int nod
          }
      }
  
@@ -172,7 +175,7 @@ index 728c89f0..f3381684 100644
      if (pad == NULL && out == conv) {
          return -1;                                // nothing to fuse
      }
-@@ -3521,10 +3617,12 @@ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -3521,10 +3620,12 @@ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int nod
      const bool out_is_in = out->data == in->data && ggml_nbytes(out) == ggml_nbytes(in);
      if ((!out_is_in && ggml_cpu_tensors_overlap(out, in)) ||
          ggml_cpu_tensors_overlap(out, conv->src[0]) ||
@@ -186,7 +189,7 @@ index 728c89f0..f3381684 100644
      *conv_out = conv;
      *pad_out  = pad;
      *bias_out = bias;
-@@ -3553,7 +3651,8 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3553,7 +3654,8 @@ static int ggml_cpu_try_fuse_ops(
          struct ggml_conv_2d_fusion f;
          const int last = ggml_cpu_conv_2d_fusion(cgraph, node_n, &f);
          if (last > node_n) {
@@ -196,7 +199,7 @@ index 728c89f0..f3381684 100644
              return last - node_n;   // the nodes covered, and any views of the result between them
          }
      }
-@@ -3561,9 +3660,10 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3561,9 +3663,10 @@ static int ggml_cpu_try_fuse_ops(
      if (node->op == GGML_OP_CONV_2D_DW || node->op == GGML_OP_PAD) {
          struct ggml_tensor * conv = NULL; const struct ggml_tensor * pad = NULL;
          const struct ggml_tensor * bias = NULL; bool relu = false; struct ggml_tensor * out = NULL;
@@ -209,17 +212,13 @@ index 728c89f0..f3381684 100644
              return last - node_n;
          }
      }
-@@ -4434,6 +4534,14 @@ void ggml_cpu_init(void) {
+@@ -4434,6 +4537,10 @@ void ggml_cpu_init(void) {
              const char * env = getenv("GGML_CPU_DISABLE_FUSION");
              ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
          }
 +        {
 +            const char * env = getenv("GGML_CPU_CONV_EPILOGUE");
-+#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
-+            ggml_cpu_conv_epilogue = env == NULL || atoi(env) != 0;
-+#else
 +            ggml_cpu_conv_epilogue = env != NULL && atoi(env) != 0;
-+#endif
 +        }
  
  #ifdef GGML_CPU_HAS_RUNFAST
