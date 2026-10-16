@@ -557,3 +557,67 @@ byte-identical.
 ~225 ms, the LEAKY after the crop ~72, the 1/3 and the LEAKY after it ~110, the crop's CONT ~44, the bias
 ADD ~36. About 0.65 s over amy's three stages; the transposed convolution can take the bias, the 1/3 and the
 LEAKY in its window copy and accumulator start.
+
+### Step 3a, measured 2026-10-16: the activations (`ggml-0039`)
+
+**Why activations before the fusions.** A per-node profile on wheel v11, joined with the fusion log, put
+step 3's chain fusions at ~0.4 s on amy, ~0.15 on de051 and VITS. The same profile showed the
+transcendental activations, which no fusion touches: GELU_ERF 0.84 s and TANH 0.29 in Moonshine, TANH 0.36
+and SIGMOID 0.16 in VITS, SILU 0.34 in the conformer. On ARMv6 GELU_ERF runs ggml-0010's scalar rational
+(there is no SIMD body), and the others call glibc per element. **The user took the activations first.**
+Reusing an existing minimax tanh was checked first: the engine has none. Its minimax fits are ATAN's
+(ADR-008) and ggml-0010's erf rational (`scripts/erf_fit.py`).
+
+**Plain C does not win here.** An own `expf` in C ran at 146 ns an element against glibc's 123, and
+interleaving GELU_ERF's rational over four or eight elements bought 1.1x: every value moved between the
+VFP and the core registers, and every clamp's `vcmpe` + `vmrs`, waits for the VFP11's pipeline to drain
+(Retro-012). `scripts/gen_armv6_act_f32.py` generates short-vector kernels instead (`armv6-act-f32.inc`):
+eight elements a pass in two vectors, the clamps and the exponent arithmetic in separate integer passes.
+
+* **GELU_ERF is bit-identical** to ggml-0010's scalar tail: the same IEEE operations in the same order
+  (VFPv2's `vmla` is not fused), the four clamps as integer tests that reproduce the compares exactly,
+  including NaN and, under flush-to-zero, denormals.
+* **SIGMOID, SILU and TANH use an own e^v**, Cephes' single-precision construction (Cody-Waite reduction,
+  a degree-6 polynomial, 2^n added to the exponent field), and Cephes' odd polynomial for tanh below
+  |x| = 0.625. Against f64 over every 11th float with |x| <= 90 (`scripts/bench57_accuracy.cpp`): sigmoid
+  2.40 ULP (glibc 2.39), tanh 1.30 ULP (glibc 2.16). The range ends are asymmetric: 0 once v <= -86.98, inf
+  once v >= 88.37 ([Retro-087](../retros/retro-087-a-worst-error-check-passed-a-nan.md) is what a symmetric
+  bound did). x's sign is ORed onto tanh's small branch, which gives +0 at x = -0 and glibc gives -0.
+
+`scripts/bench57.cpp` (Pi Zero W, one thread, RunFast, data in L1, ns an element; each kernel bit-exact
+against its scalar reference over ~70M bit patterns, on the board):
+
+| op | stock | `ggml-0039` | |
+|---|---|---|---|
+| GELU_ERF | 200.6 (ggml-0010's tail) | 80.9 | 2.48x, bit-identical |
+| SIGMOID / SILU | 160.8 / 162.1 (glibc `expf`) | 75.6 / 76.2 | 2.13x |
+| TANH | 443 (glibc `tanhf`) | 113 | 3.92x |
+
+In IEEE mode the denormal inputs differ from the references: the VFP11 bounces them to the kernel's support
+code, which rounds differently (Retro-086). ggml runs ARMv6 compute threads in RunFast (ggml-0031).
+
+**Correctness.** `tests/ci/test_activations_armv6.cpp`, registered off and on: every output against f64
+(GELU_ERF within ggml-0010's 2.64e-7 of max(|x|, 1), TANH 2 ULP, SIGMOID and SILU 3), with values at both
+ends of the exp range, the special values as stock produces them, rows of 1, 7, 8, 9 and 1003 floats (the
+tail goes through the kernel on a padded copy, so one tensor is one function), in place, and GELU_ERF byte
+for byte between the runs. x86 and qemu pass; five sabotages go red (a GELU Horner constant swapped, the
+ln2 low part dropped, tanh's threshold moved to 0.0625, the tail skipped, and the defect below).
+
+**The gate found a defect the test had passed** (Retro-087): with the first exp range check, SIGMOID and
+SILU returned NaN for x in (88.03, 88.37), heart came out all NaN and the conformer's transcript changed.
+The test's worst-error maximum was NaN-blind. Fixed, and the test now fails on the defect.
+
+**Gate (wheel v13, `VAR=GGML_CPU_ARMV6_ACT`, 12 models, two ABBA rounds).** No NaN anywhere. Moonshine,
+conformer and NER texts, both Citrinet CTC id sequences, and WakeHuBERT's embeddings (GELU only)
+identical; VAD within 4.2e-7; the five TTS waveforms within one int16 LSB, and whisper-small transcribes
+both arms identically.
+
+| model | off | on | |
+|---|---|---|---|
+| heart / heart-nano (FFT exports) | 2.68 / 0.99 s | 2.54 / 0.96 | 1.054 / 1.038x |
+| Silero VAD / NER / WakeHuBERT | 2.93 / 5.92 / 2.63 | 2.85 / 5.79 / 2.60 | 1.027 / 1.022 / 1.014x |
+| VITS / Moonshine tiny F32 / conformer | 24.06 / 34.61 / 9.53 | 23.58 / 34.09 / 9.42 | 1.020 / 1.015 / 1.011x |
+| amy / de051 / Citrinet F32, Q8_0 | 16.21 / 3.93 / 13.09, 13.53 | 16.27 / 3.94 / 13.15, 13.57 | 0.995-0.997x (noise; few activations) |
+
+**Against the profile.** Moonshine's GELU_ERF at 2.48x was worth ~0.5 s; the gate measured 0.52. Step 3's
+chain fusions remain open (~0.4 s on amy).
