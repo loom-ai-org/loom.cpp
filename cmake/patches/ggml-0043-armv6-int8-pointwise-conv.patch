@@ -1,0 +1,292 @@
+diff --git a/src/ggml-cpu/armv6-i8.cpp b/src/ggml-cpu/armv6-i8.cpp
+index e96804c4..b4a84151 100644
+--- a/src/ggml-cpu/armv6-i8.cpp
++++ b/src/ggml-cpu/armv6-i8.cpp
+@@ -105,18 +105,18 @@ inline int32_t round_s32(float v) {   // vcvtr: the FPSCR's mode, round to neare
+ 
+ // One column into (x0, x2), (x1, x3) word pairs; returns its scale. `poison` sums x * 0, which is 0
+ // unless the column holds a NaN or an inf, where it carries a NaN into the scale.
+-float quantize_column(const float * x, int64_t K, uint32_t * x2) {
++float quantize_column(const float * x, int64_t xs, int64_t K, uint32_t * x2) {
+     float m = 0.0f, poison = 0.0f;
+     for (int64_t k = 0; k < K; ++k) {
+-        const float a = fabsf(x[k]);
++        const float a = fabsf(x[k * xs]);
+         m = a > m ? a : m;
+-        poison += x[k] * 0.0f;
++        poison += x[k * xs] * 0.0f;
+     }
+     const int R = x_range(K);
+     const float inv = m > 0.0f ? R / m : 0.0f;
+     for (int64_t k = 0; k < K; k += 4) {
+-        const int32_t q0 = round_s32(x[k] * inv), q1 = round_s32(x[k + 1] * inv);
+-        const int32_t q2 = round_s32(x[k + 2] * inv), q3 = round_s32(x[k + 3] * inv);
++        const int32_t q0 = round_s32(x[k * xs] * inv), q1 = round_s32(x[(k + 1) * xs] * inv);
++        const int32_t q2 = round_s32(x[(k + 2) * xs] * inv), q3 = round_s32(x[(k + 3) * xs] * inv);
+         x2[k / 2]     = (uint16_t) q0 | ((uint32_t) (uint16_t) q2 << 16);
+         x2[k / 2 + 1] = (uint16_t) q1 | ((uint32_t) (uint16_t) q3 << 16);
+     }
+@@ -125,22 +125,56 @@ float quantize_column(const float * x, int64_t K, uint32_t * x2) {
+ 
+ // One column into the tile's layout: (x_k, x_k+1) pairs in k order, every other word (a column pair's two
+ // columns interleaved). Same scale, range, rounding and NaN rule as quantize_column.
+-float quantize_column_pairs(const float * x, int64_t K, uint32_t * xp) {
++float quantize_column_pairs(const float * x, int64_t xs, int64_t K, uint32_t * xp) {
+     float m = 0.0f, poison = 0.0f;
+     for (int64_t k = 0; k < K; ++k) {
+-        const float a = fabsf(x[k]);
++        const float a = fabsf(x[k * xs]);
+         m = a > m ? a : m;
+-        poison += x[k] * 0.0f;
++        poison += x[k * xs] * 0.0f;
+     }
+     const int R = x_range(K);
+     const float inv = m > 0.0f ? R / m : 0.0f;
+     for (int64_t k = 0; k < K; k += 2) {
+-        const int32_t q0 = round_s32(x[k] * inv), q1 = round_s32(x[k + 1] * inv);
++        const int32_t q0 = round_s32(x[k * xs] * inv), q1 = round_s32(x[(k + 1) * xs] * inv);
+         xp[k] = (uint16_t) q0 | ((uint32_t) (uint16_t) q1 << 16);
+     }
+     return m / R + poison;
+ }
+ 
++// A run of nc adjacent columns of a channels-first input, quantized as quantize_column_pairs does each:
++// column j's element k at x[k * xs + j * cs]. Read channel by channel along the run, because column by
++// column a 256-channel input 4.4 KB a channel apart touches 275 pages per column against the ARM1176's
++// 64-entry TLB: that made Citrinet's pointwise convolutions 0.60 GOP/s in the engine where the same tile
++// ran 0.93 on contiguous columns (loom ADR-079 P4.33).
++void quantize_run_pairs(const float * x, int64_t xs, int64_t cs, int64_t nc, int64_t K, uint32_t * x2t, int64_t c0,
++                        float * sx) {
++    constexpr int64_t RUN = 32;
++    float m[RUN], poison[RUN], inv[RUN];
++    for (int64_t j = 0; j < nc; ++j) { m[j] = 0.0f; poison[j] = 0.0f; }
++    for (int64_t k = 0; k < K; ++k) {
++        const float * row = x + k * xs;
++        for (int64_t j = 0; j < nc; ++j) {
++            const float v = row[j * cs], a = fabsf(v);
++            m[j] = a > m[j] ? a : m[j];
++            poison[j] += v * 0.0f;
++        }
++    }
++    const int R = x_range(K);
++    for (int64_t j = 0; j < nc; ++j) {
++        inv[j] = m[j] > 0.0f ? R / m[j] : 0.0f;
++        sx[c0 + j] = m[j] / R + poison[j];
++    }
++    for (int64_t k = 0; k < K; k += 2) {
++        const float * r0 = x + k * xs;
++        const float * r1 = r0 + xs;
++        for (int64_t j = 0; j < nc; ++j) {
++            const int64_t c = c0 + j;
++            const int32_t q0 = round_s32(r0[j * cs] * inv[j]), q1 = round_s32(r1[j * cs] * inv[j]);
++            x2t[(c / 2) * K + k + (c & 1)] = (uint16_t) q0 | ((uint32_t) (uint16_t) q1 << 16);
++        }
++    }
++}
++
+ inline uint32_t sxtb16(uint32_t v) { uint32_t r; __asm__("sxtb16 %0, %1" : "=r"(r) : "r"(v)); return r; }
+ inline uint32_t sxtb16_ror8(uint32_t v) { uint32_t r; __asm__("sxtb16 %0, %1, ror #8" : "=r"(r) : "r"(v)); return r; }
+ 
+@@ -181,9 +215,57 @@ const tile_cfg & tile_config() {
+ int64_t tile_kc(int64_t K) { return std::min<int64_t>(K, tile_config().kc & ~int64_t(31)); }
+ int64_t tile_qb(int64_t K, int64_t Q) { return std::max<int64_t>(1, std::min<int64_t>(Q, tile_config().wb / (8 * tile_kc(K)))); }
+ 
++// A pointwise convolution (ggml-0043): ggml_conv_2d_direct_packed with a 1x1 kernel and no padding is this
++// GEMM with the output positions as its columns (at a stride, every s-th input position), each read across
++// the channels at the input's channel stride and written down the output's (loom's activations are
++// channels-first).
++bool is_pointwise_conv(const ggml_tensor * op) {
++    if (op->op != GGML_OP_CONV_2D) return false;
++    const int32_t * p = (const int32_t *) op->op_params;   // s0 s1 p0 p1 d0 d1 kw kh ic
++    return p[0] >= 1 && p[1] >= 1 && p[2] == 0 && p[3] == 0 && p[6] == 1 && p[7] == 1 && p[8] == op->src[0]->ne[0] &&
++           op->src[1]->ne[2] == op->src[0]->ne[0] && op->src[1]->nb[0] == sizeof(float) &&
++           op->src[1]->nb[2] % sizeof(float) == 0 && op->nb[0] == sizeof(float) && op->nb[2] % sizeof(float) == 0;
++}
++
++// Where column c of a MUL_MAT's src1 or a pointwise conv's input starts, its element stride (floats),
++// and where its output column starts with that column's row stride.
++struct columns {
++    const ggml_tensor * op;
++    int64_t             n0, n1, xs, ys;   // the column index splits as (c % n0, c / n0 % n1, c / (n0 n1))
++    int64_t             s0 = 1, s1 = 1;   // a strided pointwise conv reads input position (s0 w, s1 h)
++
++    explicit columns(const ggml_tensor * o) : op(o) {
++        const ggml_tensor * src1 = o->src[1];
++        if (o->op == GGML_OP_MUL_MAT) {
++            n0 = src1->ne[1]; n1 = src1->ne[2]; xs = 1; ys = 1;
++        } else {   // pointwise CONV_2D: columns are (w, h, n), K runs down the channels
++            n0 = o->ne[0]; n1 = o->ne[1]; xs = src1->nb[2] / sizeof(float); ys = o->nb[2] / sizeof(float);
++            s0 = ((const int32_t *) o->op_params)[0];
++            s1 = ((const int32_t *) o->op_params)[1];
++        }
++    }
++    int64_t count() const {
++        return op->op == GGML_OP_MUL_MAT ? op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]
++                                         : op->ne[0] * op->ne[1] * op->ne[3];
++    }
++    const float * src(int64_t c) const {
++        const ggml_tensor * s = op->src[1];
++        const int64_t a = c % n0, b = (c / n0) % n1, d = c / (n0 * n1);
++        return op->op == GGML_OP_MUL_MAT
++            ? (const float *) ((const char *) s->data + a * s->nb[1] + b * s->nb[2] + d * s->nb[3])
++            : (const float *) ((const char *) s->data + a * s0 * s->nb[0] + b * s1 * s->nb[1] + d * s->nb[3]);
++    }
++    float * dst(int64_t c) const {
++        const int64_t a = c % n0, b = (c / n0) % n1, d = c / (n0 * n1);
++        return op->op == GGML_OP_MUL_MAT
++            ? (float *) ((char *) op->data + a * op->nb[1] + b * op->nb[2] + d * op->nb[3])
++            : (float *) ((char *) op->data + a * op->nb[0] + b * op->nb[1] + d * op->nb[3]);
++    }
++};
++
+ class tensor_traits : public ggml::cpu::tensor_traits {
+-    // Columns of src1 in (i11, i12, i13) order; the work buffer holds their int16 pairs, then their scales.
+-    static int64_t n_cols(const ggml_tensor * op) { return op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]; }
++    // The work buffer holds the columns' int16 pairs, then their scales.
++    static int64_t n_cols(const ggml_tensor * op) { return columns(op).count(); }
+ 
+     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
+         const int64_t K = op->src[0]->ne[0], T = n_cols(op);
+@@ -199,33 +281,29 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+     }
+ 
+     bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {
+-        if (op->op != GGML_OP_MUL_MAT) {
++        if (op->op == GGML_OP_CONV_2D && !is_pointwise_conv(op)) {
++            // Its kernel is packed, so no other path can read it: a placement that let this happen is a
++            // wrong convolution, not a slow one (supports_op declines it; loom places only what it accepts).
++            GGML_ABORT("CPU_ARMV6_I8: %s's kernel is packed but the convolution is not pointwise", op->name);
++        }
++        if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_CONV_2D) {
+             return false;
+         }
+         const ggml_tensor * src0 = op->src[0];
+-        const ggml_tensor * src1 = op->src[1];
+         const int64_t K = src0->ne[0], N = src0->ne[1];
+-        const int64_t T = n_cols(op);
+-        const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2];
++        const columns cols(op);
++        const int64_t T = cols.count(), ys = cols.ys;
+ 
+         uint32_t * x2 = (uint32_t *) GGML_PAD((uintptr_t) params->wdata, 32);
+         float *    sx = (float *) (x2 + T * (K / 2));
+-        auto src1_col = [&](int64_t c) {
+-            const int64_t i11 = c % ne11, i12 = (c / ne11) % ne12, i13 = c / (ne11 * ne12);
+-            return (const float *) ((const char *) src1->data + i11 * src1->nb[1] + i12 * src1->nb[2] + i13 * src1->nb[3]);
+-        };
+-        auto dst_col = [&](int64_t c) {
+-            const int64_t i11 = c % ne11, i12 = (c / ne11) % ne12, i13 = c / (ne11 * ne12);
+-            return (float *) ((char *) op->data + i11 * op->nb[1] + i12 * op->nb[2] + i13 * op->nb[3]);
+-        };
+ 
+         if (T >= tile_config().tile_min) {
+-            compute_tiles(params, op, src1_col, dst_col);
++            compute_tiles(params, op, cols);
+             return true;
+         }
+ 
+         for (int64_t c = params->ith; c < T; c += params->nth) {
+-            sx[c] = quantize_column(src1_col(c), K, x2 + c * (K / 2));
++            sx[c] = quantize_column(cols.src(c), cols.xs, K, x2 + c * (K / 2));
+         }
+         ggml_barrier(params->threadpool);
+ 
+@@ -246,10 +324,10 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+                     for (int64_t c = c0; c < c1; ++c) {
+                         int32_t acc[4];
+                         ggml_armv6_i8_dot4(wq, x2 + c * (K / 2), (int) (K / 4), acc);
+-                        float *     y = dst_col(c) + 4 * q;
++                        float *     y = cols.dst(c) + 4 * q * ys;
+                         const float s = sx[c];
+                         for (int64_t j = 0; j < rows; ++j) {
+-                            y[j] = (float) acc[j] * (s * sw[4 * q + j]);
++                            y[j * ys] = (float) acc[j] * (s * sw[4 * q + j]);
+                         }
+                     }
+                 }
+@@ -258,10 +336,9 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+         return true;
+     }
+ 
+-    template <typename SrcCol, typename DstCol>
+-    static void compute_tiles(ggml_compute_params * params, const ggml_tensor * op, SrcCol src1_col, DstCol dst_col) {
++    static void compute_tiles(ggml_compute_params * params, const ggml_tensor * op, const columns & cols) {
+         const ggml_tensor * src0 = op->src[0];
+-        const int64_t K = src0->ne[0], N = src0->ne[1], T = n_cols(op), T2 = (T + 1) / 2;
++        const int64_t K = src0->ne[0], N = src0->ne[1], T = cols.count(), T2 = (T + 1) / 2, ys = cols.ys;
+         const int64_t Q = padded_rows(src0) / 4, kc = tile_kc(K), qb = tile_qb(K, Q), cpb = tile_config().cpb;
+         const bool one_chunk = kc == K;
+ 
+@@ -273,8 +350,20 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+ 
+         // An odd T leaves the last pair's second column as the work buffer held it: integer sums that are
+         // never stored.
+-        for (int64_t c = params->ith; c < T; c += params->nth) {
+-            sx[c] = quantize_column_pairs(src1_col(c), K, x2t + (c / 2) * K + (c & 1));
++        if (cols.xs == 1) {
++            for (int64_t c = params->ith; c < T; c += params->nth) {
++                sx[c] = quantize_column_pairs(cols.src(c), 1, K, x2t + (c / 2) * K + (c & 1));
++            }
++        } else {   // channels-first: runs of up to 32 adjacent output positions in one row, channel by channel
++            const int64_t cs = cols.s0 * (op->src[1]->nb[0] / sizeof(float));
++            int64_t       r  = 0;
++            for (int64_t c0 = 0; c0 < T; ) {
++                const int64_t c1 = std::min({ T, c0 + 32, (c0 / cols.n0 + 1) * cols.n0 });
++                if (r++ % params->nth == params->ith) {
++                    quantize_run_pairs(cols.src(c0), cols.xs, cs, c1 - c0, K, x2t, c0, sx);
++                }
++                c0 = c1;
++            }
+         }
+         ggml_barrier(params->threadpool);
+ 
+@@ -309,13 +398,13 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+                 for (int64_t cp = cp0; cp < cp1; ++cp) {
+                     for (int64_t t = 0; t < 2 && 2 * cp + t < T; ++t) {
+                         const int64_t c = 2 * cp + t;
+-                        float *       y = dst_col(c);
++                        float *       y = cols.dst(c);
+                         const float   s = sx[c];
+                         for (int64_t q = g0; q < g1; ++q) {
+                             const int32_t * a    = acc + ((cp - cp0) * qb + (q - g0)) * 8 + 4 * t;
+                             const int64_t   rows = std::min<int64_t>(4, N - 4 * q);
+                             for (int64_t j = 0; j < rows; ++j) {
+-                                y[4 * q + j] = (float) a[j] * (s * sw[4 * q + j]);
++                                y[(4 * q + j) * ys] = (float) a[j] * (s * sw[4 * q + j]);
+                             }
+                         }
+                     }
+@@ -402,7 +491,7 @@ size_t buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tenso
+ 
+ class extra_buffer_type : public ggml::cpu::extra_buffer_type {
+     bool supports_op(ggml_backend_dev_t, const ggml_tensor * op) override {
+-        return op->op == GGML_OP_MUL_MAT && op->src[0]->buffer &&
++        return (op->op == GGML_OP_MUL_MAT || is_pointwise_conv(op)) && op->src[0]->buffer &&
+                op->src[0]->buffer->buft == ggml_backend_cpu_armv6_i8_buffer_type() && is_candidate(op->src[0]) &&
+                op->src[0]->extra != nullptr && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[1]->nb[0] == sizeof(float) &&
+@@ -410,7 +499,7 @@ class extra_buffer_type : public ggml::cpu::extra_buffer_type {
+     }
+ 
+     ggml::cpu::tensor_traits * get_tensor_traits(const ggml_tensor * op) override {
+-        if (op->op == GGML_OP_MUL_MAT && op->src[0]->buffer &&
++        if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_CONV_2D) && op->src[0]->buffer &&
+             op->src[0]->buffer->buft == ggml_backend_cpu_armv6_i8_buffer_type()) {
+             return (ggml::cpu::tensor_traits *) op->src[0]->extra;
+         }
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index d2205adf..f352b2f3 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3397,6 +3397,11 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+     if (node->op != GGML_OP_CONV_2D) {
+         return -1;
+     }
++    // A kernel in an extra buffer type (loom ggml-0043: CPU_ARMV6_I8's packed int8) is not in the layout
++    // the fused kernel reads; that buffer type computes the node itself.
++    if (node->src[0] != NULL && node->src[0]->buffer != NULL && !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
++        return -1;
++    }
+ 
+     struct ggml_tensor * conv = node;
+     if (conv->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv)) {

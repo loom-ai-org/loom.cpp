@@ -97,3 +97,14 @@ For the weight format, given that XNNPACK wants per-channel scales:
   family to rebase on each ggml bump; and the `Q8_0_PC` export flavour.
 * **What stays true:** a row-uniform Q8_0 file is a valid Q8_0 file, so a GPU, a build without the
   bridge, or an older engine all run it as before.
+
+## The weight format, built 2026-10-16 for ARMv6 (ADR-079 P4.33)
+
+`loom-export --quantize Q8_0_PC` and the `loom.quantize.per_channel` key exist now, as decided above:
+row-uniform Q8_0, the row's absmax / 127 as every block's F16 scale, written by `gguf.quants`' arithmetic
+with the row in place of the block (a row whose blocks all hold its absmax comes out byte-identical to
+Q8_0). Their first user is not this ADR's bridge but ARMv6's own int8 kernels, behind the same kind of
+extra buffer type (`CPU_ARMV6_I8`, [ADR-079 P4.33](adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md#p433-measured-2026-10-16-dynamic-int8-ggml-0041-ggml-0042-ggml-0043)).
+The engine places a listed weight there only if the buffer type serves every convolution that reads it,
+because a kernel in a non-host buffer loses the direct conv path. Any bridge built under this ADR will need
+the same rule. The XNNPACK bridge itself is not built, so this ADR stays proposed.
