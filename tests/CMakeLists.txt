@@ -360,6 +360,21 @@ set_tests_properties(test_conv_transpose_1d_sweep PROPERTIES LABELS ci)
 add_test(NAME test_conv_transpose_1d_sweep_off COMMAND test_conv_transpose_1d_sweep)
 set_tests_properties(test_conv_transpose_1d_sweep_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_CONVT=0")
 
+# ADR-079 P4.32f f2 step 3a (ggml-0039): GELU_ERF, SIGMOID, SILU and TANH against f64 and their special
+# values, with the ARMv6 kernels off and on (GGML_CPU_ARMV6_ACT, read once); the second run compares
+# GELU_ERF byte for byte, the one of the four that stays bit-identical. Elsewhere both runs are stock.
+add_executable(test_activations_armv6 ci/test_activations_armv6.cpp)
+target_link_libraries(test_activations_armv6 PRIVATE loom::engine)
+add_test(NAME test_activations_armv6_off COMMAND test_activations_armv6)
+set_tests_properties(test_activations_armv6_off PROPERTIES LABELS ci)
+set_tests_properties(test_activations_armv6_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ACT=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_activations_armv6 COMMAND test_activations_armv6)
+set_tests_properties(test_activations_armv6 PROPERTIES LABELS ci)
+set_tests_properties(test_activations_armv6 PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ACT=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_activations_armv6 PROPERTIES DEPENDS test_activations_armv6_off)
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
