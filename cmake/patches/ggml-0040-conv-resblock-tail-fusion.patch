@@ -1,0 +1,298 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index c503806f..bdd20865 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3343,8 +3343,68 @@ struct ggml_conv_2d_fusion {
+     bool                       relu;      // ggml-0036: a RELU after the bias / residual
+     const struct ggml_tensor * mask;      // ggml-0036: then a MUL by a time mask, or NULL
+     bool                       via_conv;  // ggml-0036: compute into conv's own tensor, then one pass to out
++    const struct ggml_tensor * add2;      // ggml-0040: an ADD of another tensor of the result's shape, or NULL
++    const struct ggml_tensor * scale;     // ggml-0040: then a MUL by a [1, 1] scalar, or NULL
++    const struct ggml_tensor * leaky;     // ggml-0040: then this LEAKY_RELU node, or NULL
+ };
+ 
++// ggml-0040: a HiFi-GAN stage's TAIL after a resblock's last convolution (with its bias and residual
++// already fused): the stage sums its resblocks and scales the sum before the next upsampling,
++//
++//     s  = ADD(r0, r1);  s = ADD(s, r2)       two full passes, one per resblock after the first
++//     m  = MUL(s, 1/3)                        a full pass
++//     h  = LEAKY_RELU(m)                      a full pass -- the next transposed convolution's input
++//
++// so the convolution that produces r1 can also add r0, and the one that produces r2 can add the running
++// sum, scale it and apply the activation, each node's own arithmetic in its order. Each part is
++// optional after the one before; each node must be the only reader of the one before it.
++static void ggml_cpu_conv_tail_match(const struct ggml_cgraph * cgraph, const struct ggml_tensor * conv,
++                                     struct ggml_conv_2d_fusion * f, int * last) {
++    const int add_idx = ggml_cpu_next_compute_node(cgraph, *last + 1);
++    if (add_idx < 0 || cgraph->nodes[add_idx]->op != GGML_OP_ADD) {
++        return;
++    }
++    struct ggml_tensor * add = cgraph->nodes[add_idx];
++    const struct ggml_tensor * other = ggml_cpu_conv_2d_add_operand(add, f->out, conv, false);
++    if (other == NULL || !ggml_cpu_result_is_private(cgraph, f->out, add_idx)) {
++        return;
++    }
++    f->add2 = other;
++    f->out  = add;
++    *last   = add_idx;
++
++    const int mul_idx = ggml_cpu_next_compute_node(cgraph, *last + 1);
++    if (mul_idx >= 0 && cgraph->nodes[mul_idx]->op == GGML_OP_MUL) {
++        struct ggml_tensor * mul = cgraph->nodes[mul_idx];
++        const struct ggml_tensor * x = NULL, * s = NULL;
++        for (int k = 0; k < 2; ++k) {
++            if (mul->src[k] && ggml_view_root(mul->src[k]) == f->out && mul->src[k]->data == f->out->data) {
++                x = mul->src[k];
++                s = mul->src[1 - k];
++            }
++        }
++        if (x && s && s->type == GGML_TYPE_F32 && ggml_nelements(s) == 1 && mul->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(mul) && ggml_is_contiguous(x) && ggml_nelements(mul) == ggml_nelements(conv) &&
++            ggml_are_same_shape(x, mul) && ggml_cpu_result_is_private(cgraph, f->out, mul_idx)) {
++            f->scale = s;
++            f->out   = mul;
++            *last    = mul_idx;
++        }
++    }
++
++    const int lk_idx = ggml_cpu_next_compute_node(cgraph, *last + 1);
++    if (lk_idx >= 0 && cgraph->nodes[lk_idx]->op == GGML_OP_LEAKY_RELU) {
++        struct ggml_tensor * lk = cgraph->nodes[lk_idx];
++        if (lk->src[0] && ggml_view_root(lk->src[0]) == f->out && lk->src[0]->data == f->out->data &&
++            lk->type == GGML_TYPE_F32 && ggml_is_contiguous(lk) && ggml_is_contiguous(lk->src[0]) &&
++            ggml_nelements(lk) == ggml_nelements(conv) && ggml_cpu_result_is_private(cgraph, f->out, lk_idx)) {
++            f->leaky = lk;
++            f->out   = lk;
++            *last    = lk_idx;
++        }
++    }
++}
++
+ // Whether the nodes from `node_n` are a convolution with elementwise neighbours it can absorb. Fills
+ // `f` and returns the index of the LAST node covered, else -1.
+ //
+@@ -3435,6 +3495,9 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+ 
+     if (ggml_cpu_conv_epilogue) {
+         f->mask = ggml_cpu_conv_epilogue_match(cgraph, conv, &f->out, &last, &f->relu);
++        if (!f->relu && !f->mask && f->residual) {
++            ggml_cpu_conv_tail_match(cgraph, conv, f, &last);
++        }
+     }
+ 
+     if (f->act == NULL && f->out == conv) {
+@@ -3494,6 +3557,19 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+     if (out != conv && out->data != conv->data && ggml_cpu_tensors_overlap(out, conv)) {
+         return -1;
+     }
++    // ggml-0040: the tail's tensor operand reads like the residual -- for an element just before the
++    // element is stored -- so it may BE the result, and must otherwise stay clear of everything written
++    if (f->add2) {
++        const bool add2_is_out = f->add2->data == out->data && ggml_nbytes(f->add2) == ggml_nbytes(out);
++        if ((!add2_is_out && ggml_cpu_tensors_overlap(f->add2, out)) ||
++            ggml_cpu_tensors_overlap(f->add2, conv) || ggml_cpu_tensors_overlap(f->add2, conv->src[0]) ||
++            (f->bias && ggml_cpu_tensors_overlap(f->add2, f->bias))) {
++            return -1;
++        }
++    }
++    if (f->scale && (ggml_cpu_tensors_overlap(f->scale, out) || ggml_cpu_tensors_overlap(f->scale, conv))) {
++        return -1;
++    }
+     if (f->residual) {
+         const bool res_is_out = f->residual->data == out->data &&
+                                 ggml_nbytes(f->residual) == ggml_nbytes(out);
+@@ -3655,7 +3731,7 @@ static int ggml_cpu_try_fuse_ops(
+         const int last = ggml_cpu_conv_2d_fusion(cgraph, node_n, &f);
+         if (last > node_n) {
+             ggml_compute_forward_conv_2d_fused(params, f.conv, f.act, f.bias, f.residual, f.relu, f.mask,
+-                                               f.via_conv, f.out);
++                                               f.via_conv, f.out, f.add2, f.scale, f.leaky);
+             return last - node_n;   // the nodes covered, and any views of the result between them
+         }
+     }
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 6bd32d3b..6ba41baa 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -8471,18 +8471,40 @@ static bool ggml_conv_2d_armv6_qgemm(const ggml_compute_params * params, const v
+ // channel), in that order, which is the order the unfused RELU and MUL nodes apply them, so the result
+ // is bit-identical to theirs. A kernel that applies it sets `done`; ggml_compute_forward_conv_2d_fused
+ // makes one pass over the result for any that does not.
++//
++// loom (ggml-0040, ADR-079 P4.32f f2 step 3b): or, after the residual, a HiFi-GAN stage's TAIL -- the ADD
++// of another tensor of the result's shape (the previous resblock's output, or the running sum of them),
++// a MUL by a scalar (the sum's 1/num_kernels), and a LEAKY_RELU (the next upsampling's input), each in
++// the unfused node's own arithmetic and order.
+ struct ggml_conv_post {
+     bool          relu;
+     const float * mask;
+     bool          done;
++    const float * add2;    // ggml-0040: + add2[i], or NULL
++    const float * scale;   // ggml-0040: then * *scale, or NULL
++    const float * leaky;   // ggml-0040: then LEAKY_RELU with slope *leaky, or NULL
++    // ggml-0040: set by ggml_compute_forward_conv_2d_impl when `add2` IS the output (a graph allocator
++    // puts an ADD in place on its dead operand) and the kernel that ran cannot read it before it stores:
++    // the result went to the convolution's own tensor instead, and the caller's pass reads it from there.
++    bool          in_conv;
+ };
+ 
+-static inline float ggml_conv_post_apply(float v, bool relu, const float * mask, int64_t t) {
+-    if (relu) {
++// v at flat index i, position t along the length
++static inline float ggml_conv_post_apply(float v, const ggml_conv_post & p, int64_t i, int64_t t) {
++    if (p.relu) {
+         v = (v > 0.f) ? v : 0.f;
+     }
+-    if (mask) {
+-        v = v * mask[t];
++    if (p.mask) {
++        v = v * p.mask[t];
++    }
++    if (p.add2) {
++        v = p.add2[i] + v;
++    }
++    if (p.scale) {
++        v = v * *p.scale;
++    }
++    if (p.leaky) {
++        v = ((v > 0.f) ? v : 0.f) + *p.leaky * ((v < 0.0f) ? v : 0.f);
+     }
+     return v;
+ }
+@@ -8619,7 +8641,8 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+         const char * rlo = (const char *) res_data, * rhi = (const char *) (res_data + OC * OL);
+         if (res_data != y && rlo < yhi && ylo < rhi) return false;
+     }
+-    const bool stage = aliases || res_data || (OC % 4) != 0;
++    // ggml-0040: and a stage's tail, whose `add2` may BE the output: the flush reads it before it stores.
++    const bool stage = aliases || res_data || (OC % 4) != 0 || (post && post->add2);
+ 
+     // THE BLOCKING: TB output steps per block, and the input channels in chunks of `icc`, sized so one
+     // chunk's window rows and one quad's weights for them fit `l1` bytes together. The L1 is 16 KB, and
+@@ -8688,7 +8711,10 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     // per quad of rows straight after the quad's last chunk, while those rows are still in L1.
+     const bool    relu = post && post->relu;
+     const float * mask = post ? post->mask : nullptr;
+-    const bool    epi  = relu || mask;
++    const float * add2 = post ? post->add2 : nullptr;
++    const float * scal = post ? post->scale : nullptr;
++    const float * lkr  = post ? post->leaky : nullptr;
++    const bool    epi  = relu || mask || add2 || scal || lkr;
+ 
+     int64_t pend = -1;                             // the staged block not yet flushed
+     float * ycur = ys, * yprev = ys + (size_t) OCq * 4 * TBx;
+@@ -8696,13 +8722,22 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     auto epilogue = [&](float * d, int64_t t0, int64_t nb) {
+         if (relu) ggml_armv6_relu_pass(d, nb, relu_lo);
+         if (mask) ggml_armv6_mul_pass(d, mask + t0, nb);
++        // ggml-0040: the rest of the stage's tail (add2 is done in the flush), with ggml-0037's passes --
++        // the same IEEE operations as the nodes
++        if (scal) ggml_armv6_mul_s((int32_t) nb, d, d, *scal);
++        if (lkr)  ggml_armv6_leaky_relu((int32_t) nb, d, d, *lkr);
+     };
+     auto flush = [&](int64_t b, const float * yb) {
+         const int64_t t0 = b * TB, nb = block_len(b);
+         for (int64_t o = 0; o < OC; ++o) {
+             const float * s = yb + (size_t) o * TBx;
+             float *       d = y + o * OL + t0;
+-            if (res_data) {
++            if (add2) {
++                // (conv + bias + residual) in the staging row, then add2 + that, read before d is stored
++                float * sm = const_cast<float *>(s);
++                if (res_data) ggml_armv6_sum_pass(sm, s, res_data + o * OL + t0, nb);
++                ggml_armv6_add((int32_t) nb, d, add2 + o * OL + t0, sm);
++            } else if (res_data) {
+                 ggml_armv6_sum_pass(d, s, res_data + o * OL + t0, nb);
+             } else {
+                 memcpy(d, s, (size_t) nb * sizeof(float));
+@@ -9177,6 +9212,15 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         return;
+     }
+ #endif
++    // ggml-0040: the paths below store the result before the caller's pass reads `add2`, so when add2 IS
++    // the output they write the convolution's own tensor instead (never overlapping a live operand: it
++    // was allocated while all of them were live) and the caller's pass carries it to the output.
++    if (post && post->add2 && out_data && (const void *) post->add2 == (const void *) out_data &&
++        out_data != (float *) dst->data) {
++        out_data      = (float *) dst->data;
++        dst_data      = out_data;
++        post->in_conv = true;
++    }
+     // The direct path, when the shape suits it -- see ggml_conv_1d_direct_ok. Everything below is the
+     // batched im2col, which is what a convolution with large weights wants instead.
+     {
+@@ -9524,7 +9568,10 @@ void ggml_compute_forward_conv_2d_fused(
+         bool                        relu,
+         const ggml_tensor *         mask,
+         bool                        via_conv,
+-        ggml_tensor *               out) {
++        ggml_tensor *               out,
++        const ggml_tensor *         add2,
++        const ggml_tensor *         scale,
++        const ggml_tensor *         leaky_node) {
+ 
+     const ggml_tensor * kernel = conv->src[0];
+     const ggml_tensor * src    = conv->src[1];
+@@ -9544,6 +9591,16 @@ void ggml_compute_forward_conv_2d_fused(
+     const float * res_data  = residual ? (const float *) residual->data : nullptr;
+     const int64_t OL = conv->ne[0], rows = ggml_nelements(conv) / OL;
+ 
++    float post_slope = 0.0f;
++    if (leaky_node) {
++        memcpy(&post_slope, leaky_node->op_params, sizeof(float));
++    }
++    ggml_conv_post post = { relu, mask_data, false,
++                            add2 ? (const float *) add2->data : nullptr,
++                            scale ? (const float *) scale->data : nullptr,
++                            leaky_node ? &post_slope : nullptr, false };
++    const bool any_post = relu || mask_data || add2 || scale || leaky_node;
++
+     if (via_conv) {
+         // ggml-0036: `out` partially overlaps the input (see ggml_cpu_conv_2d_fusion), so the kernel
+         // writes the convolution's own tensor and one pass carries it to `out` through the bias, the
+@@ -9567,24 +9624,25 @@ void ggml_compute_forward_conv_2d_fused(
+                 if (res_data) {
+                     v = v + res_data[i];
+                 }
+-                y[i] = ggml_conv_post_apply(v, relu, mask_data, t);
++                y[i] = ggml_conv_post_apply(v, post, i, t);
+             }
+         }
+         return;
+     }
+ 
+-    ggml_conv_post post = { relu, mask_data, false };
+     ggml_compute_forward_conv_2d_impl(params, kernel, src, conv, kernel->type,
+                                       bias ? (const float *) bias->data : nullptr,
+                                       (float *) out->data, in_data, leaky, res_data,
+-                                      relu || mask_data ? &post : nullptr);
+-    if ((relu || mask_data) && !post.done) {
++                                      any_post ? &post : nullptr);
++    if (any_post && !post.done) {
+         // The paths that do not apply the epilogue themselves: one pass, where the unfused nodes made two.
++        // (ggml-0040: from the convolution's own tensor when the kernel had to write there.)
+         ggml_barrier(params->threadpool);
+-        float * y = (float *) out->data;
++        float *       y = (float *) out->data;
++        const float * c = post.in_conv ? (const float *) conv->data : y;
+         for (int64_t o = params->ith; o < rows; o += params->nth) {
+             for (int64_t t = 0; t < OL; ++t) {
+-                y[o * OL + t] = ggml_conv_post_apply(y[o * OL + t], relu, mask_data, t);
++                y[o * OL + t] = ggml_conv_post_apply(c[o * OL + t], post, o * OL + t, t);
+             }
+         }
+     }
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 92c75fbb..7ecfce11 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -112,7 +112,8 @@ bool ggml_armv6_act_row(int kind, int64_t n, float * y, const float * x);
+ bool   ggml_armv6_mul_mat_f32(const struct ggml_compute_params * params, const struct ggml_tensor * src0,
+                               const struct ggml_tensor * src1, struct ggml_tensor * dst);
+ #endif
+-void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * act, const struct ggml_tensor * bias, const struct ggml_tensor * residual, bool relu, const struct ggml_tensor * mask, bool via_conv, struct ggml_tensor * out);
++// loom (ggml-0040): add2 / scale / leaky_node are a HiFi-GAN stage's tail after the residual, or NULL.
++void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * act, const struct ggml_tensor * bias, const struct ggml_tensor * residual, bool relu, const struct ggml_tensor * mask, bool via_conv, struct ggml_tensor * out, const struct ggml_tensor * add2, const struct ggml_tensor * scale, const struct ggml_tensor * leaky_node);
+ void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
