@@ -655,3 +655,124 @@ runs both). Re-gated with wheel v15, the default against `=1`, two ABBA rounds, 
 
 Citrinet's f1 gain is not lost: the exporter's topology CSE (the half of f1 that needs no kernel) stays,
 and the passes it lined up now run on `ggml-0037`. Citrinet F32 was 14.09 s before f1 and is 12.50 now.
+
+## P4.33, measured 2026-10-16: dynamic int8 (`ggml-0041`, `ggml-0042`, `ggml-0043`)
+
+**The user's three calls (2026-10-16):** the weights reach the kernels through an extra buffer type, as
+ADR-075/076 do (not a per-call check on plain Q8_0); the classes go GEMV, then GEMM, then the 1x1
+convolutions, each gated; and gate 5's thresholds, fixed before any run: Moonshine tiny's WER on the 73
+LibriSpeech-dummy clips at most F32's + 0.5 pp (9.83% -> 10.33%), and Silero VAD with no frame changing its
+decision at 0.5 or 0.35 and no speech probability moving more than 0.02.
+
+**The weights.** ADR-076's format, built here: `loom-export --quantize Q8_0_PC` writes per-channel int8 as
+Q8_0 whose blocks share their row's F16 scale, and lists those tensors under `loom.quantize.per_channel`.
+Every backend reads the file as Q8_0. On ARMv6, `CPU_ARMV6_I8` (`ggml-0041`) repacks a listed tensor at
+load by channel quad (`[N/4][K/4][4]` words of int8, then a float scale per row); a tensor whose rows are
+not uniform is stored as it came and computed by ggml's own Q8_0 path. The engine places a listed weight
+there by default on ARMv6, with `GGML_CPU_ARMV6_I8=0` (not registered) as the A/B switch, and an explicit
+`LOOM_CPU_REPACK` taking precedence.
+
+**The arithmetic.** Each activation column is quantized at run time to int16, symmetric, at the widest
+range whose K products cannot overflow SMLAD's int32 sum (32767 up to K = 516, then 2^31 / (128 K)), and
+every output is `acc * (sx * sw[n])`. The CI test holds every path to that contract bit for bit, the
+overflow bound and NaN columns included (`tests/ci/test_mul_mat_armv6_i8.cpp`, 308 checks in qemu; 13
+sabotages, each red).
+
+**Step 1, the GEMV (`ggml-0041`).** `scripts/bench58.c`, cold weights, against `ggml-0033`'s F32 GEMV: **4.29x
+on all seven decode shapes** (Moonshine's 288 x 32768 vocabulary projection 126.9 -> 29.4 ms, 320 MB/s of
+int8 against the board's 338 MB/s PLD ceiling). ADR-077's analysis had 2.14x: bench48's kernel issued a PLD
+every 16 bytes, two per line, and that alone halved it. A weight in the buffer must be served at every
+column count, so step 1 ran the same kernel over blocks of columns as its GEMM: 0.70-0.76 GOP/s,
+compute-bound, a tie with `ggml-0034` at n >= 32 (`scripts/bench59.cpp`). End to end (gate16, wheel v16)
+Moonshine tiny went 33.5 -> 31.0 s (1.08x): the node profile has the GEMVs 3.2-3.8x faster (6.46 -> 1.81 s)
+and the encoder GEMMs 12% slower.
+
+**Step 2, the GEMM (`ggml-0042`).** From 16 columns, ADR-077 gate 2's 2-column x 4-channel int16 tile
+generalized to any K (`scripts/gen_armv6_i8_gemm.py`: 128 or 16 pairs unrolled, accumulators in memory
+between K chunks). The tile ran 1.8 GOP/s on L1-resident operands but 0.73 with x from a 64 KB block
+(`scripts/bench61.c`): **on the Pi Zero a line from its L2 costs ~100 cycles, as much as DRAM.** So the W of
+a group of channel quads is unpacked to int16 pairs into an 8 KB block that stays in L1, a block of 16
+column pairs keeps its accumulators in L1, and the tile PLDs x 128 bytes ahead (x from L2: 0.78 -> 1.45
+GOP/s). `scripts/bench60.cpp`, quantize included, against `ggml-0034`: **1.22-1.40x at K <= 288**
+(Moonshine's encoder, Citrinet's 1x1 convolutions, WakeHuBERT, heart), 1.09-1.13x at K = 704-1152,
+1.66-2.04x at n = 16-64, and 3.8-12.8x on DistilBERT-sized K = 768-3072 at n = 16, where `ggml-0034` does not
+apply.
+
+**Gate17 (wheel v17, two rounds ABBA, `VAR=GGML_CPU_ARMV6_I8`) found the convolutions' problem:**
+
+| card | int8 | the same file, ggml Q8_0 | F32 card | int8 vs F32 |
+|---|---|---|---|---|
+| Moonshine tiny `Q8_0_PC` (jfk) | 26.81 / 26.93 s | 61.75 / 62.15 | 33.20-33.95 | **1.247x** |
+| Silero VAD `Q8_0_PC` (the LSTM only, below) | 2.39 / 2.37 | 2.96 / 2.95 | 2.80-2.90 | 1.19x |
+| Citrinet-256-ls `Q8_0_PC` | 14.98 / 14.95 | 13.09 / 13.06 | 12.69-12.96 | 0.86x |
+| WakeHuBERT tiny `Q8_0_PC` | 2.94 / 2.94 | 2.60 / 2.61 | 2.53-2.75 | 0.89x |
+
+A convolution kernel in a non-host buffer cannot take the direct path (the CPU device declines the node),
+so the engine lowered those convolutions through im2col and an int8 `mul_mat`, which lost. **Step 3
+(`ggml-0043`)** serves what int8 can: a 1x1 convolution with no padding, at any stride, is the same GEMM
+read across the channels. The engine places a weight a convolution reads only if the buffer type accepts a
+probe of that convolution's node, so a k > 1 kernel stays in the plain buffer and keeps ggml's direct path.
+`ggml-0043` also stops ggml's conv fusion from running over a packed kernel: it is tried before an extra
+buffer type's `compute_forward`, and without the guard the test's conv + bias aborts.
+
+**Gate18 (wheel v18, the same files):** the engine placed 97 of Moonshine's 99 listed weights, 173 of
+Citrinet's 175 and 9 of WakeHuBERT's 10, and the regressions went (Citrinet 0.96x, WakeHuBERT 0.99x).
+**But the pointwise convolutions still ran ggml's Q8_0 path** (Retro-089). The engine's
+`route_repacked_uses` (ADR-075) kept a consumer on a packed weight only for `MUL_MAT` or `GET_ROWS` with
+an activation of at most three dimensions, which are `CPU_REPACK`'s asserts. A convolution's input is 4-D,
+so every pointwise kernel got a plain copy, and the log said so 274 times per gate. A counter inside the
+op (0 calls on Citrinet) found it after two wrong hypotheses. For `CPU_ARMV6_I8` its own `supports_op`,
+which checks every layout its kernels need, is now the whole test.
+
+**`ggml-0044`: the quantize and the epilogue.** Timed inside the model, they cost Citrinet 1.1 s and 1.0 s
+of its 6.7 s of int8 GEMM. Each absmax compare's `vmrs` and each `vcvtr`-to-core move drains the VFP11's
+pipeline. `int64_t` indices made gcc spill and redo `(c / 2) * K` in 64 bits per element. Output addresses
+took three software 64-bit divisions per column per channel group. And a channels-first output was
+written 16 rows at a time, which the write buffer cannot merge. Now the absmax is an integer max over the
+bit patterns (a NaN or inf makes the scale NaN), the conversions are stored from the VFP and packed in
+integer code, indices are `int`, the absmax pass PLDs its stream, the addresses are computed once per op,
+and a channels-first output is written row by row. Bit-identical. On jfk: Citrinet 10.6 -> 9.7 s,
+Moonshine 27.6 -> 26.9 s.
+
+**Gate21 (the final libraries, `GGML_CPU_ARMV6_I8` A/B, two rounds ABBA, Pi Zero W, one thread):**
+
+| card | int8 | the same file, ggml Q8_0 | F32 card | int8 vs F32 | projected (b) vs (a) |
+|---|---|---|---|---|---|
+| Moonshine tiny `Q8_0_PC` (jfk) | 26.96 / 27.20 s | 61.86 / 62.50 | 33.30-34.08 | **1.243x** | 1.31x |
+| Citrinet-256-ls `Q8_0_PC` (jfk) | 9.75 / 9.73 | 13.04 / 13.15 | 12.68-13.01 | **1.321x** | 1.33x |
+| Silero VAD `Q8_0_PC` (the LSTM only) | 2.37 / 2.43 | 2.99 / 2.99 | 2.81-2.94 | 1.197x | 1.28x |
+| WakeHuBERT tiny `Q8_0_PC` | 2.28 / 2.33 | 2.59 / 2.59 | 2.54-2.65 | **1.124x** | 1.18x |
+
+Citrinet runs jfk (11.0 s) at RTF 0.89, and Moonshine tiny at 2.46. The only plain copy left is
+Moonshine's tied embedding, which `GET_ROWS` reads.
+
+**Gate 5, the WER, and what per channel costs.** On the board, Moonshine's 73 clips: F32 9.83% (113 word
+errors, identical hypotheses to x86), the `Q8_0_PC` card on the int8 path **10.61% (122): a fail** against
+10.33%. x86 ran the same weights through ggml's Q8_0 at 116. An emulation in PyTorch (HF Moonshine, whose
+greedy ids match loom's F32 run, with every Linear fake-quantized) reproduced the board exactly. F32 gives
+113. **Per-channel weights with float activations give 122**, and the int8 path's int16 activations add
+nothing (122 / 116 with and without them, below). So the loss is the weight format, as this ADR's
+Consequences warned ("per-channel is coarser than block-32"), and not the kernels. A bisection by layer
+group put the largest share in the two stem convolutions (6 of the 9 extra errors), which int8 never reads
+(k > 1). **The exporter now writes per channel only what an int8 kernel can read** (`mul_mat` operands and
+pointwise convolution kernels) and every other eligible weight as block Q8_0, which ggml's convolutions read
+the same either way. Emulated, that gives 116 errors (10.09%), with or without the int16 activations.
+**The re-exported card passes gate 5:** 10.09% (116 word errors) on the board's int8 path, against the
+10.33% bar (x86's ggml Q8_0 on the same file: 10.00%, 115). Gate19 (wheel v18, the re-exported files, two
+rounds ABBA): Moonshine tiny 27.20 / 27.05 s against F32's 33.15-33.38, **1.226x**, and 2.26x over ggml's
+Q8_0 on the same file; the transcript is identical to F32's, and the encoder output's cosine to F32 went
+from 0.99930 (stems per channel) to 0.99975.
+
+**Numerics, the rest.** WakeHuBERT's embeddings: cosine 0.99985 to F32, against 0.99993 for its published
+block-Q8_0 card. Citrinet's encoder output: cosine 0.99966 to F32. Its CTC ids on jfk differ from F32's in
+both arms (48 ids against 47), as the published block-Q8_0 card's do. No WER bar was set for Citrinet or
+WakeHuBERT before these runs, so none was run: their thresholds are the user's to set first.
+
+**Silero fails its bar, and not because of the kernels.** At `Q8_0_PC` its front end and head moved jfk's
+speech probability by 0.16 (0.21 at block Q8_0), on x86 as on the board. A bisection (one group of weights
+at a time) put it in the convolutions (0.16), the STFT basis (0.093) and the head (0.021). The LSTM's gate
+matrices alone moved it 0.0155 with no flip on x86, so the Silero family keeps the rest F32 at every
+`--quantize`. That needed an exporter fix first (Retro-088: a multi-phase export's phases never saw the
+family's `keep_float`). On the board's int8 path the LSTM-only card moves it 0.0162, but **frame 341**
+(F32 0.513) **lands at 0.499**: one flip at 0.5, a fail by the bar as fixed. ggml's Q8_0 on the same file
+gives 0.496. No Silero quantized card ships, so nothing changes by default.

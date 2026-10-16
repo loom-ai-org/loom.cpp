@@ -1,0 +1,317 @@
+diff --git a/src/ggml-cpu/armv6-i8.cpp b/src/ggml-cpu/armv6-i8.cpp
+index b4a84151..3db0a66a 100644
+--- a/src/ggml-cpu/armv6-i8.cpp
++++ b/src/ggml-cpu/armv6-i8.cpp
+@@ -95,50 +95,101 @@ int x_range(int64_t K) {
+     return r > 32767 ? 32767 : (int) r;
+ }
+ 
+-inline int32_t round_s32(float v) {   // vcvtr: the FPSCR's mode, round to nearest
+-    float r;
+-    __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(v));
+-    int32_t i;
+-    memcpy(&i, &r, 4);
+-    return i;
++// THE QUANTIZE STAYS OUT OF THE VFP11'S WAY. Measured inside the engine on Citrinet's pointwise
++// convolutions (Pi Zero W): a quantize written the plain way cost ~100 ns an element, a third of the tiles'
++// time, because each `a > m` is a vcmp whose vmrs drains the VFP11's pipeline and each vcvtr result moved
++// to a core register drains it again. So the absmax is an integer max over the bit patterns (for |x| the
++// pattern order is the value order; any NaN or inf is a pattern >= 0x7f800000, and then the scale is
++// NaN), and a conversion's result is stored from the VFP to a scratch that integer code packs.
++inline uint32_t abs_bits(const float * p) {
++    uint32_t u;
++    memcpy(&u, p, 4);
++    return u & 0x7fffffffu;
+ }
+ 
+-// One column into (x0, x2), (x1, x3) word pairs; returns its scale. `poison` sums x * 0, which is 0
+-// unless the column holds a NaN or an inf, where it carries a NaN into the scale.
+-float quantize_column(const float * x, int64_t xs, int64_t K, uint32_t * x2) {
+-    float m = 0.0f, poison = 0.0f;
+-    for (int64_t k = 0; k < K; ++k) {
+-        const float a = fabsf(x[k * xs]);
+-        m = a > m ? a : m;
+-        poison += x[k * xs] * 0.0f;
++// The scale and its inverse from a column's absmax bits: the same m / R and R / m as before, and a NaN
++// scale for a column with a NaN or an inf, so its outputs are NaN.
++inline float scale_of(uint32_t mb, int R, float * inv) {
++    float m;
++    memcpy(&m, &mb, 4);
++    if (mb >= 0x7f800000u) {
++        *inv = 0.0f;
++        return NAN;
+     }
+-    const int R = x_range(K);
+-    const float inv = m > 0.0f ? R / m : 0.0f;
+-    for (int64_t k = 0; k < K; k += 4) {
+-        const int32_t q0 = round_s32(x[k * xs] * inv), q1 = round_s32(x[(k + 1) * xs] * inv);
+-        const int32_t q2 = round_s32(x[(k + 2) * xs] * inv), q3 = round_s32(x[(k + 3) * xs] * inv);
+-        x2[k / 2]     = (uint16_t) q0 | ((uint32_t) (uint16_t) q2 << 16);
+-        x2[k / 2 + 1] = (uint16_t) q1 | ((uint32_t) (uint16_t) q3 << 16);
++    *inv = m > 0.0f ? R / m : 0.0f;
++    return m / R;
++}
++
++// n values x[i * xs] * inv rounded to nearest, as int32 bit patterns in `out` (written from the VFP).
++inline void convert(const float * x, int xs, int n, float inv, float * out) {
++    for (int i = 0; i < n; ++i) {
++        float r;
++        __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(x[i * xs] * inv));
++        out[i] = r;
++    }
++}
++
++// An int32 accumulator as a float: loaded into a VFP register and converted there (vcvt.f32.s32, what
++// `(float) a` compiles to), so no core-to-VFP move.
++inline float acc_float(const int32_t * p) {
++    float f;
++    memcpy(&f, p, 4);
++    __asm__("vcvt.f32.s32 %0, %0" : "+t"(f));
++    return f;
++}
++
++inline uint32_t i16(const float * cv, int i) {
++    int32_t v;
++    memcpy(&v, cv + i, 4);
++    return (uint16_t) v;
++}
++
++// One column into (x0, x2), (x1, x3) word pairs; returns its scale.
++// (The hot loops here count in int, not int64_t: on this 32-bit core every int64_t step is an adds/adc
++// pair, and gcc spilled the loops to the stack and redid (c / 2) * K in 64 bits per element.)
++float quantize_column(const float * x, int xs, int K, uint32_t * x2) {
++    uint32_t mb = 0;
++    for (int k = 0; k < K; ++k) {
++        if (xs == 1 && (k & 7) == 0) __builtin_prefetch(x + k + 64);   // the ARM1176 has no prefetcher
++        const uint32_t a = abs_bits(x + k * xs);
++        mb = a > mb ? a : mb;
++    }
++    float inv;
++    const float sx = scale_of(mb, x_range(K), &inv);
++    float cv[64];
++    for (int k0 = 0; k0 < K; k0 += 64) {
++        const int n = K - k0 < 64 ? K - k0 : 64;
++        convert(x + k0 * xs, xs, n, inv, cv);
++        uint32_t * o = x2 + k0 / 2;
++        for (int k = 0; k < n; k += 4, o += 2) {
++            o[0] = i16(cv, k) | (i16(cv, k + 2) << 16);
++            o[1] = i16(cv, k + 1) | (i16(cv, k + 3) << 16);
++        }
+     }
+-    return m / R + poison;
++    return sx;
+ }
+ 
+ // One column into the tile's layout: (x_k, x_k+1) pairs in k order, every other word (a column pair's two
+ // columns interleaved). Same scale, range, rounding and NaN rule as quantize_column.
+-float quantize_column_pairs(const float * x, int64_t xs, int64_t K, uint32_t * xp) {
+-    float m = 0.0f, poison = 0.0f;
+-    for (int64_t k = 0; k < K; ++k) {
+-        const float a = fabsf(x[k * xs]);
+-        m = a > m ? a : m;
+-        poison += x[k * xs] * 0.0f;
++float quantize_column_pairs(const float * x, int xs, int K, uint32_t * xp) {
++    uint32_t mb = 0;
++    for (int k = 0; k < K; ++k) {
++        if (xs == 1 && (k & 7) == 0) __builtin_prefetch(x + k + 64);   // the ARM1176 has no prefetcher
++        const uint32_t a = abs_bits(x + k * xs);
++        mb = a > mb ? a : mb;
+     }
+-    const int R = x_range(K);
+-    const float inv = m > 0.0f ? R / m : 0.0f;
+-    for (int64_t k = 0; k < K; k += 2) {
+-        const int32_t q0 = round_s32(x[k * xs] * inv), q1 = round_s32(x[(k + 1) * xs] * inv);
+-        xp[k] = (uint16_t) q0 | ((uint32_t) (uint16_t) q1 << 16);
++    float inv;
++    const float sx = scale_of(mb, x_range(K), &inv);
++    float cv[64];
++    for (int k0 = 0; k0 < K; k0 += 64) {
++        const int n = K - k0 < 64 ? K - k0 : 64;
++        convert(x + k0 * xs, xs, n, inv, cv);
++        uint32_t * o = xp + k0;
++        for (int k = 0; k < n; k += 2) {
++            o[k] = i16(cv, k) | (i16(cv, k + 1) << 16);
++        }
+     }
+-    return m / R + poison;
++    return sx;
+ }
+ 
+ // A run of nc adjacent columns of a channels-first input, quantized as quantize_column_pairs does each:
+@@ -146,31 +197,40 @@ float quantize_column_pairs(const float * x, int64_t xs, int64_t K, uint32_t * x
+ // column a 256-channel input 4.4 KB a channel apart touches 275 pages per column against the ARM1176's
+ // 64-entry TLB: that made Citrinet's pointwise convolutions 0.60 GOP/s in the engine where the same tile
+ // ran 0.93 on contiguous columns (loom ADR-079 P4.33).
+-void quantize_run_pairs(const float * x, int64_t xs, int64_t cs, int64_t nc, int64_t K, uint32_t * x2t, int64_t c0,
+-                        float * sx) {
+-    constexpr int64_t RUN = 32;
+-    float m[RUN], poison[RUN], inv[RUN];
+-    for (int64_t j = 0; j < nc; ++j) { m[j] = 0.0f; poison[j] = 0.0f; }
+-    for (int64_t k = 0; k < K; ++k) {
++void quantize_run_pairs(const float * x, int xs, int cs, int nc, int K, uint32_t * x2t, int64_t c0, float * sx) {
++    constexpr int RUN = 32;
++    uint32_t   mb[RUN];
++    float      inv[RUN], cv0[RUN], cv1[RUN];
++    uint32_t * col[RUN];   // column c0 + j's words: x2t + ((c0 + j) / 2) K + ((c0 + j) & 1), then k on
++    for (int j = 0; j < nc; ++j) {
++        mb[j]  = 0;
++        col[j] = x2t + ((c0 + j) / 2) * K + ((c0 + j) & 1);
++    }
++    const int span = nc * cs;   // floats a row segment covers
++    for (int k = 0; k < K; ++k) {
+         const float * row = x + k * xs;
+-        for (int64_t j = 0; j < nc; ++j) {
+-            const float v = row[j * cs], a = fabsf(v);
+-            m[j] = a > m[j] ? a : m[j];
+-            poison[j] += v * 0.0f;
++        if (k + 2 < K) {   // two rows ahead, a PLD per line: the rows are a page or more apart
++            for (int f = 0; f < span; f += 8) __builtin_prefetch(row + 2 * xs + f);
++        }
++        for (int j = 0; j < nc; ++j) {
++            const uint32_t a = abs_bits(row + j * cs);
++            mb[j] = a > mb[j] ? a : mb[j];
+         }
+     }
+     const int R = x_range(K);
+-    for (int64_t j = 0; j < nc; ++j) {
+-        inv[j] = m[j] > 0.0f ? R / m[j] : 0.0f;
+-        sx[c0 + j] = m[j] / R + poison[j];
+-    }
+-    for (int64_t k = 0; k < K; k += 2) {
++    for (int j = 0; j < nc; ++j) sx[c0 + j] = scale_of(mb[j], R, &inv[j]);
++    for (int k = 0; k < K; k += 2) {
+         const float * r0 = x + k * xs;
+         const float * r1 = r0 + xs;
+-        for (int64_t j = 0; j < nc; ++j) {
+-            const int64_t c = c0 + j;
+-            const int32_t q0 = round_s32(r0[j * cs] * inv[j]), q1 = round_s32(r1[j * cs] * inv[j]);
+-            x2t[(c / 2) * K + k + (c & 1)] = (uint16_t) q0 | ((uint32_t) (uint16_t) q1 << 16);
++        for (int j = 0; j < nc; ++j) {
++            float r;
++            __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(r0[j * cs] * inv[j]));
++            cv0[j] = r;
++            __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(r1[j * cs] * inv[j]));
++            cv1[j] = r;
++        }
++        for (int j = 0; j < nc; ++j) {
++            col[j][k] = i16(cv0, j) | (i16(cv1, j) << 16);
+         }
+     }
+ }
+@@ -276,7 +336,8 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+         // x pairs [T2][K/2][2] words, 2 T2 scales; per thread the unpacked W group and its accumulators.
+         const int64_t T2 = (T + 1) / 2, qb = tile_qb(K, padded_rows(op->src[0]) / 4);
+         const size_t per_thread = GGML_PAD((size_t) qb * tile_kc(K) * 8, 32) + GGML_PAD((size_t) tile_config().cpb * qb * 32, 32);
+-        size = (size_t) T2 * K * 4 + (size_t) (2 * T2 + 1) * sizeof(float) + (size_t) n_threads * per_thread + 128;
++        size = (size_t) T2 * K * 4 + (size_t) (2 * T2 + 1) * sizeof(float) + (size_t) T * sizeof(float *) +
++               (size_t) n_threads * per_thread + 160;
+         return true;
+     }
+ 
+@@ -303,8 +364,10 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+         }
+ 
+         for (int64_t c = params->ith; c < T; c += params->nth) {
+-            sx[c] = quantize_column(cols.src(c), cols.xs, K, x2 + c * (K / 2));
++            sx[c] = quantize_column(cols.src(c), (int) cols.xs, (int) K, x2 + c * (K / 2));
+         }
++        float * dc[16];   // columns::dst divides (in software on ARMv6): once per column, not per quad
++        for (int64_t c = 0; c < T && c < 16; ++c) dc[c] = cols.dst(c);
+         ggml_barrier(params->threadpool);
+ 
+         // Channel quads in contiguous ranges, one per thread: each thread streams its own rows.
+@@ -324,7 +387,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+                     for (int64_t c = c0; c < c1; ++c) {
+                         int32_t acc[4];
+                         ggml_armv6_i8_dot4(wq, x2 + c * (K / 2), (int) (K / 4), acc);
+-                        float *     y = cols.dst(c) + 4 * q * ys;
++                        float *     y = (c < 16 ? dc[c] : cols.dst(c)) + 4 * q * ys;
+                         const float s = sx[c];
+                         for (int64_t j = 0; j < rows; ++j) {
+                             y[j * ys] = (float) acc[j] * (s * sw[4 * q + j]);
+@@ -342,17 +405,21 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+         const int64_t Q = padded_rows(src0) / 4, kc = tile_kc(K), qb = tile_qb(K, Q), cpb = tile_config().cpb;
+         const bool one_chunk = kc == K;
+ 
+-        uint32_t * x2t = (uint32_t *) GGML_PAD((uintptr_t) params->wdata, 32);
+-        float *    sx  = (float *) (x2t + T2 * K);
++        uint32_t * x2t  = (uint32_t *) GGML_PAD((uintptr_t) params->wdata, 32);
++        float *    sx   = (float *) (x2t + T2 * K);
++        // Each column's output address, once per op: columns::dst divides (in software on ARMv6), and
++        // the epilogue asked it once per column per channel group.
++        float **   dcol = (float **) GGML_PAD((uintptr_t) (sx + 2 * T2 + 1), 32);
+         const size_t per_thread = GGML_PAD((size_t) qb * kc * 8, 32) + GGML_PAD((size_t) cpb * qb * 32, 32);
+-        uint32_t * ws  = (uint32_t *) GGML_PAD((uintptr_t) (sx + 2 * T2 + 1), 32) + params->ith * (per_thread / 4);
++        uint32_t * ws  = (uint32_t *) GGML_PAD((uintptr_t) (dcol + T), 32) + params->ith * (per_thread / 4);
+         int32_t *  acc = (int32_t *) (ws + GGML_PAD((size_t) qb * kc * 8, 32) / 4);
+ 
+         // An odd T leaves the last pair's second column as the work buffer held it: integer sums that are
+         // never stored.
+         if (cols.xs == 1) {
+             for (int64_t c = params->ith; c < T; c += params->nth) {
+-                sx[c] = quantize_column_pairs(cols.src(c), 1, K, x2t + (c / 2) * K + (c & 1));
++                sx[c]   = quantize_column_pairs(cols.src(c), 1, (int) K, x2t + (c / 2) * K + (c & 1));
++                dcol[c] = cols.dst(c);
+             }
+         } else {   // channels-first: runs of up to 32 adjacent output positions in one row, channel by channel
+             const int64_t cs = cols.s0 * (op->src[1]->nb[0] / sizeof(float));
+@@ -360,7 +427,9 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+             for (int64_t c0 = 0; c0 < T; ) {
+                 const int64_t c1 = std::min({ T, c0 + 32, (c0 / cols.n0 + 1) * cols.n0 });
+                 if (r++ % params->nth == params->ith) {
+-                    quantize_run_pairs(cols.src(c0), cols.xs, cs, c1 - c0, K, x2t, c0, sx);
++                    quantize_run_pairs(cols.src(c0), (int) cols.xs, (int) cs, (int) (c1 - c0), (int) K, x2t, c0, sx);
++                    float * d0 = cols.dst(c0);   // a run is one row: its columns are op->nb[0] apart
++                    for (int64_t c = c0; c < c1; ++c) dcol[c] = d0 + (c - c0) * (op->nb[0] / sizeof(float));
+                 }
+                 c0 = c1;
+             }
+@@ -395,16 +464,38 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+                         }
+                     }
+                 }
+-                for (int64_t cp = cp0; cp < cp1; ++cp) {
+-                    for (int64_t t = 0; t < 2 && 2 * cp + t < T; ++t) {
+-                        const int64_t c = 2 * cp + t;
+-                        float *       y = cols.dst(c);
+-                        const float   s = sx[c];
+-                        for (int64_t q = g0; q < g1; ++q) {
+-                            const int32_t * a    = acc + ((cp - cp0) * qb + (q - g0)) * 8 + 4 * t;
+-                            const int64_t   rows = std::min<int64_t>(4, N - 4 * q);
+-                            for (int64_t j = 0; j < rows; ++j) {
+-                                y[(4 * q + j) * ys] = (float) a[j] * (s * sw[4 * q + j]);
++                // The epilogue, in int and walking pointers like the quantize (see there), with each
++                // accumulator loaded straight into a VFP register for its vcvt rather than moved from a
++                // core one.
++                const int ysi = (int) ys, qbi = (int) qb, Ti = (int) T, Ni = (int) N;
++                if (ysi != 1) {   // channels-first output: row by row, so a row's stores are adjacent
++                    // (column by column, each column's 4 qb stores went to as many rows, which the
++                    // ARM1176's write buffer cannot merge: ~70 ns an output on Citrinet)
++                    for (int q = (int) g0; q < (int) g1; ++q) {
++                        const int rows = Ni - 4 * q < 4 ? Ni - 4 * q : 4;
++                        for (int j = 0; j < rows; ++j) {
++                            const float     w = sw[4 * q + j];
++                            const int32_t * a = acc + (q - (int) g0) * 8 + j;
++                            for (int cp = (int) cp0; cp < (int) cp1; ++cp, a += 8 * qbi) {
++                                const int c = 2 * cp;
++                                dcol[c][(4 * q + j) * ysi] = acc_float(a) * (sx[c] * w);
++                                if (c + 1 < Ti) dcol[c + 1][(4 * q + j) * ysi] = acc_float(a + 4) * (sx[c + 1] * w);
++                            }
++                        }
++                    }
++                    continue;
++                }
++                for (int cp = (int) cp0; cp < (int) cp1; ++cp) {
++                    for (int t = 0; t < 2 && 2 * cp + t < Ti; ++t) {
++                        const int       c = 2 * cp + t;
++                        const float     s = sx[c];
++                        float *         y = dcol[c] + 4 * g0 * ys;
++                        const int32_t * a = acc + (cp - (int) cp0) * qbi * 8 + 4 * t;
++                        const float *   w = sw + 4 * g0;
++                        for (int q = (int) g0; q < (int) g1; ++q, a += 8, w += 4, y += 4 * ysi) {
++                            const int rows = Ni - 4 * q < 4 ? Ni - 4 * q : 4;
++                            for (int j = 0; j < rows; ++j) {
++                                y[j * ysi] = acc_float(a + j) * (s * w[j]);
+                             }
+                         }
+                     }

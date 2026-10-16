@@ -1,4 +1,5 @@
 #include "loom/core/gguf_model.h"
+#include "loom/core/graph_topology.h"
 #include "loom/loom_errors.h"
 
 #include <ggml-alloc.h>
@@ -8,11 +9,30 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <regex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace loom {
 
 namespace {
+
+// The CPU backend's extra buffer type called `name`, or null if `backend` is not the CPU or this ggml
+// build does not register one.
+ggml_backend_buffer_type_t find_extra_buffer_type(ggml_backend_t backend, const char* name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) return nullptr;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"));
+    if (get_extra == nullptr) return nullptr;
+    for (ggml_backend_buffer_type_t* p = get_extra(dev); p != nullptr && *p != nullptr; ++p) {
+        if (std::strcmp(ggml_backend_buft_name(*p), name) == 0) return *p;
+    }
+    return nullptr;
+}
 
 // Which of the CPU backend's extra buffer types LOOM_CPU_REPACK names: "1" / "repack" is ggml's own
 // CPU_REPACK, "kleidiai" is CPU_KLEIDIAI (registered only by a GGML_CPU_KLEIDIAI=ON build). Null when
@@ -21,18 +41,146 @@ ggml_backend_buffer_type_t requested_extra_buffer_type(ggml_backend_t backend) {
     const char* e = std::getenv("LOOM_CPU_REPACK");
     if (e == nullptr || e[0] == '\0' || std::strcmp(e, "0") == 0) return nullptr;
     const char* want = std::strcmp(e, "kleidiai") == 0 ? "CPU_KLEIDIAI" : "CPU_REPACK";
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) return nullptr;
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"));
-    if (get_extra == nullptr) return nullptr;
-    for (ggml_backend_buffer_type_t* p = get_extra(dev); p != nullptr && *p != nullptr; ++p) {
-        if (std::strcmp(ggml_backend_buft_name(*p), want) == 0) return *p;
-    }
+    if (ggml_backend_buffer_type_t buft = find_extra_buffer_type(backend, want)) return buft;
     std::fprintf(stderr, "loom: LOOM_CPU_REPACK=%s, but this ggml build registers no %s buffer type; "
                          "weights stay in the plain buffer\n", e, want);
     return nullptr;
+}
+
+// ADR-079 P4.33: the convolutions that read each name, from the topologies' own text. CPU_ARMV6_I8 serves
+// mul_mat and the pointwise convolutions, and a convolution it does not serve could not take the direct
+// path with its kernel there (the CPU device declines a node whose source is in a non-host buffer), so
+// the engine lowered it through im2col and a mul_mat: on the Pi Zero, with every Q8_0_PC weight placed,
+// Citrinet-256-ls ran 0.86x and WakeHuBERT tiny 0.89x of their F32 cards. So a weight a convolution reads
+// is placed only if the buffer type accepts that convolution, asked with a probe of the node the
+// lowering builds (op_conv_1d's ggml_conv_2d_direct_packed). A repeat_for block's "{i}" is matched as any
+// index, and an alias as its target.
+struct ConvReader {
+    std::string op;
+    nlohmann::json attrs;
+};
+
+struct ConvReaders {
+    std::unordered_map<std::string, std::vector<ConvReader>> names;
+    std::vector<std::pair<std::regex, ConvReader>> patterns;
+
+    void collect(const std::string& name, std::vector<ConvReader>& out) const {
+        if (auto it = names.find(name); it != names.end()) out.insert(out.end(), it->second.begin(), it->second.end());
+        for (const auto& [re, reader] : patterns) {
+            if (std::regex_match(name, re)) out.push_back(reader);
+        }
+    }
+};
+
+ConvReaders conv_readers(gguf_context* gguf) {
+    ConvReaders out;
+    auto add = [&](const TopologyNode& node, const std::string& index_var) {
+        if (node.op.find("CONV") == std::string::npos) return;
+        const ConvReader reader{node.op, node.attrs};
+        for (const std::string& in : node.inputs) {
+            const std::string token = "{" + index_var + "}";
+            if (index_var.empty() || in.find(token) == std::string::npos) {
+                out.names[in].push_back(reader);
+                continue;
+            }
+            std::string re;
+            for (size_t i = 0; i < in.size();) {
+                if (in.compare(i, token.size(), token) == 0) {
+                    re += "[0-9]+";
+                    i += token.size();
+                } else {
+                    if (std::strchr(".^$|()[]{}*+?\\", in[i])) re += '\\';
+                    re += in[i++];
+                }
+            }
+            out.patterns.emplace_back(std::regex(re), reader);
+        }
+    };
+    const int64_t n_kv = gguf_get_n_kv(gguf);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const std::string key(gguf_get_key(gguf, i));
+        if (key.rfind("model.graph_topology", 0) != 0 || gguf_get_kv_type(gguf, i) != GGUF_TYPE_STRING) continue;
+        const GraphTopology topo = GraphTopology::parse(gguf_get_val_str(gguf, i));
+        for (const TopologyItem& item : topo.items) {
+            if (!item.is_repeat) {
+                add(item.node, "");
+            } else {
+                for (const TopologyNode& node : item.repeat.nodes) add(node, item.repeat.index_var);
+            }
+        }
+    }
+    return out;
+}
+
+// The alias names that resolve to `target` (loom.tensor_alias.*), so a convolution reading a weight
+// under another name is still seen.
+std::vector<std::string> aliases_of(gguf_context* gguf, const std::string& target) {
+    std::vector<std::string> out;
+    const int64_t kn = gguf_find_key(gguf, "loom.tensor_alias.names");
+    const int64_t kt = gguf_find_key(gguf, "loom.tensor_alias.targets");
+    if (kn < 0 || kt < 0) return out;
+    for (size_t i = 0; i < gguf_get_arr_n(gguf, kt) && i < gguf_get_arr_n(gguf, kn); ++i) {
+        if (target == gguf_get_arr_str(gguf, kt, i)) out.emplace_back(gguf_get_arr_str(gguf, kn, i));
+    }
+    return out;
+}
+
+// Whether `buft` would serve every convolution in `readers` with `t` as its folded kernel: the node
+// op_conv_1d builds for a folded kernel, probed. Any other convolution, or one whose geometry the
+// topology does not state, answers no.
+bool serves_convs(ggml_backend_t backend, ggml_backend_buffer_type_t buft, const ggml_tensor* t,
+                  const std::vector<ConvReader>& readers) {
+    if (readers.empty()) return true;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_buffer_ptr probe(ggml_backend_buft_alloc_buffer(buft, 64));
+    if (!probe) return false;
+    ggml_context_ptr ctx(ggml_init(ggml_init_params{8 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true}));
+    ggml_tensor* w = ggml_dup_tensor(ctx.get(), t);
+    w->buffer = probe.get();
+    ggml_backend_buffer_init_tensor(probe.get(), w);
+    for (const ConvReader& r : readers) {
+        bool known = true;   // an attr that is present but not an integer (a symbol) makes the geometry unknown
+        auto num = [&](const char* key, int def) {
+            const auto it = r.attrs.find(key);
+            if (it == r.attrs.end()) return def;
+            if (!it->is_number_integer()) known = false;
+            return known ? it->get<int>() : def;
+        };
+        const int k = num("kernel_k", 0), s0 = num("s0", 1), p0 = num("p0", 0), d0 = num("d0", 1), groups = num("groups", 1);
+        if (!known || r.op != "CONV_1D" || groups != 1 || k <= 0 || t->ne[0] % k != 0 || s0 < 1 || d0 < 1) return false;
+        const int64_t ic = t->ne[0] / k;
+        ggml_tensor* x = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 16 * s0 + (k - 1) * d0, 1, ic, 1);
+        ggml_tensor* op = ggml_conv_2d_direct_packed(ctx.get(), w, x, s0, 1, p0, 0, d0, 1, k, 1, static_cast<int>(ic));
+        if (!ggml_backend_dev_supports_op(dev, op)) return false;
+    }
+    return true;
+}
+
+// ADR-079 P4.33: the weights an export wrote as per-channel int8 (ADR-076's Q8_0_PC, listed under
+// `loom.quantize.per_channel`) go to CPU_ARMV6_I8 by default, the one extra buffer type that is placed
+// without being asked for. ggml registers it on ARMv6 only, and not with GGML_CPU_ARMV6_I8=0; an explicit
+// LOOM_CPU_REPACK (any value, "0" included) takes precedence, so the A/B switches keep their meaning.
+ggml_backend_buffer_type_t per_channel_buffer_type(ggml_backend_t backend, gguf_context* gguf, ggml_context* meta,
+                                                   std::unordered_set<std::string>& names) {
+    const char* e = std::getenv("LOOM_CPU_REPACK");
+    if (e != nullptr && e[0] != '\0') return nullptr;
+    const int64_t kv = gguf_find_key(gguf, "loom.quantize.per_channel");
+    if (kv < 0 || gguf_get_kv_type(gguf, kv) != GGUF_TYPE_ARRAY || gguf_get_arr_type(gguf, kv) != GGUF_TYPE_STRING) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = find_extra_buffer_type(backend, "CPU_ARMV6_I8");
+    if (buft == nullptr) return nullptr;
+    const ConvReaders convs = conv_readers(gguf);
+    for (size_t i = 0; i < gguf_get_arr_n(gguf, kv); ++i) {
+        const std::string name = gguf_get_arr_str(gguf, kv, i);
+        const ggml_tensor* t = ggml_get_tensor(meta, name.c_str());
+        if (t == nullptr) continue;
+        std::vector<ConvReader> readers;
+        convs.collect(name, readers);
+        for (const std::string& alias : aliases_of(gguf, name)) convs.collect(alias, readers);
+        if (serves_convs(backend, buft, t, readers)) names.insert(name);
+    }
+    return names.empty() ? nullptr : buft;
 }
 
 // The Q4_0 / Q8_0 matrices `buft` would actually serve, asked the way llama.cpp asks it: a probe
@@ -127,14 +275,23 @@ std::unique_ptr<GgufModel> GgufModel::load(const std::string& path, Backends bac
         }
     }
 
-    // CPU_REPACK placement (route_repacked_uses has the why). Only on a plain CPU primary: a hybrid
+    // Extra-buffer placement (route_repacked_uses has the why). Only on a plain CPU primary: a hybrid
     // build goes through the scheduler, which plans its copies from each weight's buffer and would
     // have to read a repacked one back.
     model->path_ = path;
     std::vector<ggml_tensor*> to_repack;
     ggml_backend_buffer_type_t repack_buft = backends.hybrid() ? nullptr : requested_extra_buffer_type(backend);
+    std::unordered_set<std::string> per_channel;
+    if (repack_buft == nullptr && !backends.hybrid()) {
+        repack_buft = per_channel_buffer_type(backend, model->gguf_ctx_.get(), model->meta_ctx_.get(), per_channel);
+    }
     if (repack_buft != nullptr) {
         to_repack = extra_buffer_candidates(model->meta_ctx_.get(), backend, repack_buft);
+        if (!per_channel.empty()) {
+            to_repack.erase(std::remove_if(to_repack.begin(), to_repack.end(),
+                                           [&](ggml_tensor* t) { return per_channel.count(ggml_get_name(t)) == 0; }),
+                            to_repack.end());
+        }
     }
     ggml_backend_buffer_t buf = nullptr;
     if (to_repack.empty()) {
@@ -506,11 +663,17 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
             if (s == nullptr || !repacked_.count(s)) continue;
             // The extra buffer type's own supports_op decides (CPU_REPACK: MUL_MAT only; CPU_KLEIDIAI:
             // MUL_MAT and GET_ROWS), plus the two things repack.cpp's forward asserts rather than
-            // checks: a 3-D-at-most activation with contiguous rows.
+            // checks: a 3-D-at-most activation with contiguous rows. CPU_ARMV6_I8's supports_op checks
+            // every layout its kernels rely on, including the pointwise CONV_2D it serves (ADR-079 P4.33),
+            // so for it supports_op is the whole test: with these rules applied to it, every one of
+            // Citrinet's pointwise kernels was routed to a plain copy and the int8 path never ran.
             const ggml_tensor* act = t->src[1];
-            const bool served = j == 0 && (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) &&
-                                act != nullptr && act->ne[3] == 1 &&
-                                (t->op != GGML_OP_MUL_MAT || act->nb[0] == sizeof(float)) &&
+            const bool own_checks = s->buffer != nullptr &&
+                                    std::strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(s->buffer)), "CPU_ARMV6_I8") == 0;
+            const bool layout_ok = own_checks ||
+                                   ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) && act != nullptr &&
+                                    act->ne[3] == 1 && (t->op != GGML_OP_MUL_MAT || act->nb[0] == sizeof(float)));
+            const bool served = j == 0 && layout_ok &&
                                 ggml_backend_dev_supports_op(ggml_backend_get_device(backend_), t);
             if (!served) {
                 if (repacked_.at(s).plain == nullptr) {

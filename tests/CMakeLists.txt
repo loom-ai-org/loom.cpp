@@ -375,6 +375,18 @@ set_tests_properties(test_activations_armv6 PROPERTIES ENVIRONMENT
     "GGML_CPU_ARMV6_ACT=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_activations_armv6 PROPERTIES DEPENDS test_activations_armv6_off)
 
+# ADR-079 P4.33 (ggml-0041..0043): CPU_ARMV6_I8, the dynamic int8 mul_mat and pointwise convolution on
+# per-channel Q8_0 weights, held bit for bit to its integer contract on both the one-column kernel and the
+# GEMM tiles (shapes, odd N, the overflow bound, NaN columns, two threads, strides, a conv + bias that ggml's
+# fusion must not take, the non-uniform fallback). Registered with the buffer type switched off and on
+# (GGML_CPU_ARMV6_I8, read once); elsewhere both runs check only that the type does not exist.
+add_executable(test_mul_mat_armv6_i8 ci/test_mul_mat_armv6_i8.cpp)
+target_link_libraries(test_mul_mat_armv6_i8 PRIVATE loom::engine)
+add_test(NAME test_mul_mat_armv6_i8_off COMMAND test_mul_mat_armv6_i8)
+set_tests_properties(test_mul_mat_armv6_i8_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_I8=0")
+add_test(NAME test_mul_mat_armv6_i8 COMMAND test_mul_mat_armv6_i8)
+set_tests_properties(test_mul_mat_armv6_i8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_I8=1")
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
