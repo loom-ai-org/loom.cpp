@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index f3381684..c503806f 100644
+index 77072185..d2205adf 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -3044,6 +3044,9 @@ struct ggml_cplan ggml_graph_plan(

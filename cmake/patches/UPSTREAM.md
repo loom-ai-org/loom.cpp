@@ -1660,7 +1660,10 @@ takes the same `MUL` after a depthwise convolution. A fused result that partiall
 computed into the convolution's own tensor (which the allocator never overlaps with its input, since the
 convolution runs while the input is live), and one pass applies bias, residual, RELU and mask on the way
 to the output. Kernels that cannot apply the epilogue themselves get one pass after them. All of it is
-behind `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 (where it was measured) and off elsewhere.
+behind `GGML_CPU_CONV_EPILOGUE`, off by default. (It shipped on by default on ARMv6. PR 34 then made the
+unfused RELU and MUL passes 2-4x faster there, and this epilogue, which re-reads output rows the
+convolution has just stored, became the slower of the two: Citrinet-256-ls 12.53 s off against 13.07 on.
+Upstream it is worth taking only with the epilogue applied before the store.)
 
 On ARMv6 (PRs 29 and 32) the epilogue is a few short passes over a block still in L1: the RELU as an
 integer test on the bits, keep iff `lo <= u <= 0x7f800000` unsigned (lo = 0x00800000 under RunFast's

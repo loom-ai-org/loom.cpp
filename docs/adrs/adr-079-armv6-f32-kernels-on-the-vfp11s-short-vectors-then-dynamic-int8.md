@@ -423,7 +423,7 @@ export with the pass off is byte-identical to the GGUF the board had.
 **`ggml-0036`.** `ggml_cpu_conv_2d_fusion` takes a RELU and then a per-position MUL after the bias (and
 residual); the depthwise fusion takes the MUL. A result that partially overlaps the input is computed
 into the convolution's own tensor and carried to the output in one pass that adds bias, residual, RELU
-and mask, which is bit-identical to the unfused nodes. `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 only.
+and mask, which is bit-identical to the unfused nodes. `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 only (off since step 3b below).
 The first ARMv6 epilogue, a per-element C function, cost as much as the passes it removed (42 ns an
 element after a 1x1 conv, 54 after a depthwise one, against ~48 for a pass): the RELU's `vcmpe` + `vmrs`
 drained the VFP pipeline every element. The shipped one tests the RELU on the integer bits, keep iff
@@ -621,3 +621,37 @@ both arms identically.
 
 **Against the profile.** Moonshine's GELU_ERF at 2.48x was worth ~0.5 s; the gate measured 0.52. Step 3's
 chain fusions remain open (~0.4 s on amy).
+
+### Step 3b, measured 2026-10-16: the resblock tail measured out, and `ggml-0036`'s epilogue now off by default
+
+**What was built (`ggml-0040`, not shipped).** The fusion matcher learned a HiFi-GAN stage's tail after a
+resblock convolution's bias and residual: the ADD of the previous resblock's output (or the running sum),
+the MUL by the 1/3 scalar, and the LEAKY_RELU feeding the next transposed convolution, each in the node's
+own arithmetic, applied in the ARMv6 driver's flush with `ggml-0037`'s passes. It was bit-identical in
+`tests/ci` (with the sum's buffer the other operand's, as an allocator places it: the first version
+stored the block before reading that operand) and three sabotages went red.
+
+**It bought nothing on the board** (wheel v14, `VAR=GGML_CPU_CONV_EPILOGUE`, three ABBA rounds): amy
+16.40 → 16.25 s (1.009x), de051 3.93 → 3.93 (1.000x), VITS 23.17 → 23.32 (0.994x). Two reasons, both
+measured before: the tail's passes run on output rows the flush has just stored, which an ARM1176 does not
+cache (43 ns an element against 10, P4.32f f1), so a fused pass costs about what `ggml-0037`'s separate
+pass does; and when the tail's last tensor trips an aliasing check the matcher declines the whole fusion,
+so that convolution also loses its bias at the accumulator start. That is the likely reason amy and de051
+moved by a few ULP between the arms (not traced to a node). **The user shelved it** (the prototype, patch and test, is kept out of tree) and asked for
+the version that could win to stay in the hub: a one-pass short-vector kernel doing residual, sum,
+scale and LEAKY on the block before it is stored, with a back-off to the plain conv + bias fusion when the
+tail cannot alias.
+
+**The same gate exposed f1's epilogue as a regression.** With `GGML_CPU_CONV_EPILOGUE` on, Citrinet F32
+ran 12.53 s off against 13.07 on: `ggml-0037` had made the unfused RELU and mask MUL faster than
+`ggml-0036`'s fused epilogue, which re-reads the stored rows the same way. `ggml-0036` now defaults the
+epilogue OFF everywhere (amended in place; `GGML_CPU_CONV_EPILOGUE=1` still turns it on, and the CI test
+runs both). Re-gated with wheel v15, the default against `=1`, two ABBA rounds, every output byte-identical:
+
+| model | default (off) | `=1` | |
+|---|---|---|---|
+| Citrinet-256-ls F32 (CSE) / Q8_0 | 12.50 / 13.29 s | 12.99 / 13.56 | 1.040 / 1.020x |
+| WakeHuBERT / VITS / Silero VAD | 2.58 / 23.28 / 2.90 | 2.69 / 23.46 / 2.90 | 1.042 / 1.007 / 1.00x |
+
+Citrinet's f1 gain is not lost: the exporter's topology CSE (the half of f1 that needs no kernel) stays,
+and the passes it lined up now run on `ggml-0037`. Citrinet F32 was 14.09 s before f1 and is 12.50 now.
