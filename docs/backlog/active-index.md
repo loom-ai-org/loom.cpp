@@ -429,7 +429,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   ~~P4.32f f2 step 3a~~ the activations **SHIPPED as `ggml-0039` 2026-10-16** (`gen_armv6_act_f32.py`, `bench57.cpp`); ~~P4.32f f2 step 3b~~ the resblock-tail fusion **measured out 2026-10-16** (amy 1.009x; `ggml-0036`'s epilogue turned off by default, Citrinet F32 1.040x);
   **P4.32f f2 step 3c** (open) the fusions that could still win: a ONE-PASS short-vector kernel for a stage's tail (residual, resblock sum, 1/3, LEAKY on the block
   BEFORE it is stored, with a back-off to plain conv + bias when the tail cannot alias), the same treatment for `ggml-0036`'s RELU + mask epilogue, and the
-  transposed conv taking its bias / crop / LEAKY (~0.4 s on amy, ~0.5 s on Citrinet; ADR-079 step 3b says why the pass-based versions lost); and **f3** (a
+  transposed conv taking its bias / crop / LEAKY (~0.4 s on amy, ~0.5 s on Citrinet; ADR-079 step 3b says why the pass-based versions lost;
+  the shelved prototype, `ggml-0040` and its test, is on loom.cpp branch `wip/p432f-f2-resblock-tail`: KEEP it, do not delete or merge as is); and **f3** (a
   leftover, user 2026-10-16) the bias seeded into the ARMv6 GEMM's accumulators (ggml-0034's `a.b`, as the conv tiles do) in place of a
   separate ADD pass: at most ~0.37 s of Moonshine F32's 33.4 (node-level, after `ggml-0037`), ~0.05 s on the conformer; not bit-identical;
   best folded into P4.33's int8 GEMM rather than done alone; ~~P4.32g~~ **STFT and ISTFT as engine ops on an FFT, BUILT 2026-10-15**
