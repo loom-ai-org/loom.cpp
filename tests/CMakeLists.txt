@@ -375,6 +375,21 @@ set_tests_properties(test_activations_armv6 PROPERTIES ENVIRONMENT
     "GGML_CPU_ARMV6_ACT=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_activations_armv6 PROPERTIES DEPENDS test_activations_armv6_off)
 
+# ADR-079 P4.32f f2 step 3b (ggml-0040): a HiFi-GAN stage's tail (the resblocks' sum, its 1/3 and the
+# LEAKY_RELU) folded into the last resblock convolution's epilogue. Run with the epilogue off and on
+# (GGML_CPU_CONV_EPILOGUE, read once); the second compares the outputs byte for byte.
+add_executable(test_conv_resblock_tail ci/test_conv_resblock_tail.cpp)
+target_link_libraries(test_conv_resblock_tail PRIVATE loom::engine)
+add_test(NAME test_conv_resblock_tail_off COMMAND test_conv_resblock_tail)
+set_tests_properties(test_conv_resblock_tail_off PROPERTIES LABELS ci)
+set_tests_properties(test_conv_resblock_tail_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_CONV_EPILOGUE=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_conv_resblock_tail COMMAND test_conv_resblock_tail)
+set_tests_properties(test_conv_resblock_tail PROPERTIES LABELS ci)
+set_tests_properties(test_conv_resblock_tail PROPERTIES ENVIRONMENT
+    "GGML_CPU_CONV_EPILOGUE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_conv_resblock_tail PROPERTIES DEPENDS test_conv_resblock_tail_off)
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
