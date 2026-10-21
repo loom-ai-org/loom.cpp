@@ -348,12 +348,16 @@ rounds in ABBA order, cooled to 60 C before every arm, median per engine; onnxru
 ratio is onnx/loom, so **`>1.00x` means loom is faster**, and **all ten cells resolve**: each one's paired p10 and p90
 sit on the same side of 1.00x.
 
+**Each time is followed by its real-time factor (RTF) in brackets:** the time divided by the length of the audio, which
+for ASR, VAD and wake word is the input clip and for TTS is the audio the model produced. Below 1.00 is faster than real
+time. The LM row has no audio, so its time stands alone.
+
 | Raspberry Pi 4B, 4 threads | loom F32 | onnxruntime FP32 | ratio | loom Q8_0_PC | onnxruntime int8 | ratio |
 |---|---|---|---|---|---|---|
-| VITS piper en-GB miro (TTS, 3.3 s of audio) | 1.087 s | 1.066 s | 0.98x | 1.122 s | 4.171 s | **3.67x** |
-| Citrinet-256-ls (ASR, jfk 11 s) | 0.516 s | 0.293 s¹ | 0.57x | 0.534 s | 4.235 s¹ | **7.90x** |
-| Moonshine tiny (ASR, jfk 11 s) | 1.466 s | 1.510 s | **1.03x** | 1.120 s | 1.503 s | **1.34x** |
-| whisper-small (ASR, jfk 11 s) | 25.61 s | 20.57 s | 0.80x | 22.67 s | 14.60 s | 0.64x |
+| VITS piper en-GB miro (TTS, 3.32 s of audio) | 1.087 s (0.33) | 1.066 s (0.32) | 0.98x | 1.122 s (0.34) | 4.171 s (1.26) | **3.67x** |
+| Citrinet-256-ls (ASR, jfk 11.0 s) | 0.516 s (0.05) | 0.293 s (0.03)¹ | 0.57x | 0.534 s (0.05) | 4.235 s (0.39)¹ | **7.90x** |
+| Moonshine tiny (ASR, jfk 11.0 s) | 1.466 s (0.13) | 1.510 s (0.14) | **1.03x** | 1.120 s (0.10) | 1.503 s (0.14) | **1.34x** |
+| whisper-small (ASR, jfk 11.0 s) | 25.61 s (2.33) | 20.57 s (1.87) | 0.80x | 22.67 s (2.06) | 14.60 s (1.33) | 0.64x |
 | Qwen3-0.6B-Base (LM, 24 tokens) | 16.57 s | 17.60 s | **1.06x** | 5.07 s | 14.23 s | **2.81x** |
 
 ¹ onnxruntime is timed from NeMo's mel features, computed outside the timer; loom's time includes its front end.
@@ -370,29 +374,30 @@ sit on the same side of 1.00x.
   files (`model_int8`, `encoder_model_int8` + `decoder_model_merged_int8`); VITS and Citrinet are `quantize_dynamic`
   (QInt8) of the same FP32 models the left half runs. Moonshine's encoder is `quantize_dynamic` with MatMul only,
   because the published int8 encoder's quantized conv stem garbles jfk.
-* The engine is `integration/rc18` at `d66c2ce`. The GGUFs are md5 `3f25d02d`/`6e095a95` (VITS), `0711bf17`/`37a8d3b6`
+* The engine is `integration/rc18` at `d66c2ce`, whose code is 1.0.0-rc18's except for #83's fix to how the GPU wheels
+  find the ggml patches, which a CPU build does not reach. The GGUFs are md5 `3f25d02d`/`6e095a95` (VITS), `0711bf17`/`37a8d3b6`
   (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `7b6af094`/`39077edf` (whisper) and `4882ce99`/`b93d7779` (Qwen3),
   F32/Q8_0_PC. Both sides run from `scripts/bench_{vits,asr,lm}_loom.cpp` and `scripts/bench_onnx_tasks.py`, whose
   `ctc` and `moonshine` tasks are new with this table.
 
 The Pi Zero W has no onnxruntime build, since onnxruntime ships no ARMv6 wheel. So its table weighs loom's two precisions
-against each other on the 1.0.0-rc18 ARMv6 wheel: its one core, each model launched once per arm through
+against each other on the 1.0.0-rc18 ARMv6 wheel, with RTFs as above: its one core, each model launched once per arm through
 `loom-py`, 3 rounds with the arms' order flipped every round and a 3 s settle between launches, median per arm, nothing
 polling the board while it runs. The ratio is F32/Q8_0_PC, so **`>1.00x` means Q8_0_PC is faster**; a ratio in bold
 resolves, its three paired rounds all on the same side of 1.00x.
 
 | Raspberry Pi Zero W, 1 core | loom F32 | loom Q8_0_PC | ratio | paired rounds |
 |---|---|---|---|---|
-| Citrinet-256-ls (ASR, jfk 11 s) | 10.96 s | 8.09 s | **1.35x** | 1.35–1.37x |
-| Moonshine tiny (ASR, jfk 11 s) | 30.41 s | 24.32 s | **1.25x** | 1.24–1.26x |
-| Silero VAD (jfk 11 s) | 2.662 s | 2.203 s | **1.21x** | 1.14–1.22x |
-| sanoTTS heart (TTS) | 2.308 s | 2.030 s | **1.14x** | 1.13–1.25x |
-| WakeHuBERT tiny (wake word, jfk 11 s) | 2.383 s | 2.102 s | **1.13x** | 1.12–1.16x |
-| Conformer-CTC small (ASR, 3 s of jfk) | 6.919 s | 6.672 s | **1.04x** | 1.02–1.07x |
-| sanoTTS amy en 1.46M (TTS) | 15.49 s | 14.95 s | 1.04x | 0.96–1.05x |
-| sanoTTS de thorsten 0.51M (TTS) | 3.490 s | 3.553 s | 0.98x | 0.96–1.01x |
-| VITS piper en-GB miro (TTS) | 21.96 s | 22.16 s | 0.99x | 0.98–1.00x |
-| sanoTTS heartnano (TTS), control | 0.847 s | 0.862 s | 0.98x | 0.96–1.01x |
+| Citrinet-256-ls (ASR, jfk 11.0 s) | 10.96 s (1.00) | 8.09 s (0.74) | **1.35x** | 1.35–1.37x |
+| Moonshine tiny (ASR, jfk 11.0 s) | 30.41 s (2.76) | 24.32 s (2.21) | **1.25x** | 1.24–1.26x |
+| Silero VAD (jfk 11.0 s) | 2.662 s (0.24) | 2.203 s (0.20) | **1.21x** | 1.14–1.22x |
+| sanoTTS heart (TTS, 3.18 s of audio) | 2.308 s (0.73) | 2.030 s (0.64) | **1.14x** | 1.13–1.25x |
+| WakeHuBERT tiny (wake word, jfk 11.0 s) | 2.383 s (0.22) | 2.102 s (0.19) | **1.13x** | 1.12–1.16x |
+| Conformer-CTC small (ASR, 3.0 s of jfk) | 6.919 s (2.31) | 6.672 s (2.22) | **1.04x** | 1.02–1.07x |
+| sanoTTS amy en 1.46M (TTS, 5.90 s of audio) | 15.49 s (2.63) | 14.95 s (2.53) | 1.04x | 0.96–1.05x |
+| sanoTTS de thorsten 0.51M (TTS, 4.40 s of audio) | 3.490 s (0.79) | 3.553 s (0.81) | 0.98x | 0.96–1.01x |
+| VITS piper en-GB miro (TTS, 3.39 s of audio) | 21.96 s (6.48) | 22.16 s (6.51) | 0.99x | 0.98–1.00x |
+| sanoTTS heartnano (TTS, 3.06 s of audio), control | 0.847 s (0.28) | 0.862 s (0.28) | 0.98x | 0.96–1.01x |
 
 * **sanoTTS heartnano is the noise floor.** None of its tensors is large enough to quantize, so its Q8_0_PC export is
   byte-identical to its F32 one (md5 `75579b65` for both). Its 0.96–1.01x is what two runs of the same file differ by on
