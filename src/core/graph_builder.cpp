@@ -48,13 +48,6 @@ void request_f32_precision(ggml_cgraph* gf) {
     }
 }
 
-// The one factor the compute-buffer shrink is tuned by, used at BOTH ends so they cannot disagree: a
-// growth arms the check only if the buffer more than doubled, and the check gives memory back only if
-// less than half of it is needed. Two is not a tuned optimum -- it is the smallest number that
-// separates "a different regime is running now" from "n_kv grew by one token", which is the only
-// distinction this has to make. See shrink_allocator_if_oversized.
-constexpr size_t kShrinkArmingGrowth = 2;
-
 ggml_type parse_dtype(const std::string& dtype) {
     if (dtype == "f32") return GGML_TYPE_F32;
     if (dtype == "i32") return GGML_TYPE_I32;
@@ -269,6 +262,8 @@ bool GraphBuilder::store_slots_unmoved(const OutputStore* out_store) const {
 }
 
 const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, OutputStore* out_store) {
+    // First, before anything can write an input: the previous call's aliases end here (ADR-073).
+    restore_aliased_inputs();
     // Checked before anything else, including the cache lookup: a cached topology's cell indices come
     // from n_past and are rewritten on a REUSE too, so an axes map without it has no answer to give at
     // either end. (A caller could otherwise reach a retained decode graph by binding n_kv directly.)
@@ -292,8 +287,16 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
     // freed, so every tensor in it still points where ggml_gallocr_alloc_graph put it, and its declared
     // inputs still hold whatever was last written into them. Exactly one graph is retained -- see the
     // header for why an LRU keyed by shape would not be safe against a reshaped OutputStore.
+    //
+    // A reuse is also a CALL for the shrink policy (ADR-072), and its need is the retained graph's own.
+    // When that call completes a window of under-use, the hit is turned into a rebuild: the retained
+    // graph's tensors point into the oversized buffer, so the only way onto a smaller one is a fresh
+    // allocation, and a rebuild is how this builder makes one. That costs one graph build once per
+    // regime change, which is what the old shrink-on-the-next-build path cost too.
+    bool shrink_due = false;
     if (has_cached_ && cached_store_ == out_store && cached_key_ == key &&
-        (out_store == nullptr || store_slots_unmoved(out_store))) {
+        (out_store == nullptr || store_slots_unmoved(out_store)) &&
+        !(shrink_policy_active() && (shrink_due = note_call_need(cached_need_)))) {
         // ...with the two things that describe the STEP rather than the graph, and so must move even
         // when the graph does not. The cell indices are precisely what `n_past` turned into -- a value
         // the host rewrites between steps -- and `n_kv_real` is how much of the bucket this particular
@@ -308,13 +311,8 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         return cached_;
     }
     // Drop the retained graph BEFORE anything below can throw, so a failed build leaves the builder
-    // with no graph rather than one whose context has already been replaced underneath it. Order
-    // matters: the compute graph reads the input tensors, so it goes first.
-    has_cached_ = false;
-    cached_ = BuildResult{};
-    inputs_buf_.reset();
-    inputs_ctx_.reset();
-    kv_cells_ = nullptr; // lives in inputs_ctx_, so it dies with it
+    // with no graph rather than one whose context has already been replaced underneath it.
+    drop_retained_graph();
 
     ggml_init_params params{compute_meta_bytes_, nullptr, /*no_alloc=*/true};
     ggml_context_ptr ctx(ggml_init(params));
@@ -466,28 +464,40 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         }
     }
     request_f32_precision(gf);
+    // Weights in CPU_REPACK can only be read by a direct F32 mul_mat; every other consumer is pointed at
+    // a plain copy here, before anything is allocated (GgufModel::route_repacked_uses).
+    model_.route_repacked_uses(gf);
     result.graph = gf;
 
     if (backends_.hybrid()) {
         allocate_scheduled(gf);
     } else {
-        shrink_allocator_if_oversized(gf);
+        // The shrink policy (ADR-072), on the rebuild path. A rebuild into a live buffer is the one call
+        // whose need is not already known, so it is planned on the probe first -- BEFORE the live
+        // allocation, because once this graph's tensors point into the old buffer, dropping that buffer
+        // would leave them dangling. A builder with no live buffer (the first build, or the one after a
+        // shrink or a release) skips the probe: a fresh gallocr is sized to exactly this graph, so its
+        // size after the allocation IS the need.
+        bool probed = false;
+        size_t need = 0;
+        if (!shrink_due && shrink_policy_active() && galloc_ &&
+            ggml_gallocr_get_buffer_size(galloc_.get(), 0) > 0) {
+            need = measure_need(gf);
+            probed = true;
+            shrink_due = note_call_need(need);
+        }
+        if (shrink_due) {
+            galloc_.reset();
+            underused_calls_ = 0;
+            ++shrinks_;
+        }
         if (!galloc_) {
             galloc_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
         }
-        const size_t buffer_before = ggml_gallocr_get_buffer_size(galloc_.get(), 0);
         if (!ggml_gallocr_alloc_graph(galloc_.get(), gf)) {
             throw Error("GraphBuilder::build: ggml_gallocr_alloc_graph failed");
         }
-        // Arm the shrink for the NEXT build, and only on a growth big enough to be a change of REGIME
-        // rather than the ordinary creep of a decode loop. A cached causal LM's `n_kv` still creeps --
-        // one bucket every kKvBucket steps since P4.0.15, one token per step before it -- so its buffer
-        // still grows a little on rebuilds that are not regime changes; arming on any growth at all made
-        // the probe run on roughly every other step and cost +1.3 ms/step on gemma-3-270m-it, which is
-        // the measurement that put this factor here. A prefill->decode transition is 500x, not 1.001x.
-        if (ggml_gallocr_get_buffer_size(galloc_.get(), 0) > buffer_before * kShrinkArmingGrowth) {
-            may_shrink_ = true;
-        }
+        cached_need_ = probed ? need : ggml_gallocr_get_buffer_size(galloc_.get(), 0);
     }
 
     result.ctx = std::move(ctx);
@@ -505,45 +515,172 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
 // when `new_chunk_size > cur_chunk_size` (ggml-alloc.c). That is the right default for a caller who
 // reserves a worst case, and the wrong one for the shape this engine actually runs -- a prefill followed
 // by a decode loop. Measured on gemma-3-270m-it at a 512-token prefill: the compute buffer reaches
-// 513.2 MiB, a decode step needs 1.0 MiB, and before this the builder held all 513.2 MiB for the entire
-// generation. It runs only on the REBUILD path, after the retained graph has already been released --
-// which is what keeps it compatible with P4.0.15's decode-loop reuse. That reuse changed how often this
-// is reached, not whether it is safe: a prefill and its following decode steps still differ in
-// `n_tokens`, so the transition this exists for is still a rebuild, and the ~31 reused steps after it
-// never enter here at all.
+// 513.2 MiB, a decode step needs 1.0 MiB, and before P4.0.16 the builder held all 513.2 MiB for the
+// entire generation. So the builder gives the buffer back itself -- but only after a WINDOW of calls has
+// shown it is not needed (ADR-072).
 //
-// The size is measured on a SCRATCH gallocr, never on the live one: `ggml_gallocr_reserve_n_size` runs
+// **Why a window and not the first small call.** P4.0.16 shrank on the first call needing less than
+// half, armed by a preceding growth of more than 2x. That is exactly right for a prefill->decode
+// transition, which happens once, and exactly wrong for a TTS module serving sentences of mixed length:
+// short -> long grows past 2x and arms, long -> short frees the buffer, the next long faults it all back
+// in. On VITS (en-GB miro) alternating a 50- and a 198-token sentence, every long call took 38 740
+// minor faults against 1 372 for the same call repeated -- the vocoder's 111 MB compute buffer, at
+// 1.6 us a page on a Ryzen 3 3250U, ~46-60 ms of a ~0.95 s synthesis, and the short call paid its
+// own share. Requiring kShrinkWindow under-used calls IN A ROW means an alternating workload never
+// shrinks (its window always contains a long call), a regime change still shrinks once, and a long
+// burst followed by short traffic gives the memory back after kShrinkWindow calls rather than never.
+//
+// **Every call counts, reuses included.** A decode loop reuses its graph for up to kKvBucket steps, so
+// counting only rebuilds would hold a prefill's buffer for up to kShrinkWindow * kKvBucket tokens.
+// Counting calls holds it for kShrinkWindow.
+//
+// **What it costs: one planning pass per REBUILD into a live buffer, never per reuse.** P4.0.16 avoided
+// that pass on every build because, before P4.0.15, a decode step WAS a rebuild, and arming the probe
+// on any growth cost +1.3 ms/step on gemma-3-270m-it. Since P4.0.15 a decode loop rebuilds once per
+// kKvBucket steps, a reuse knows its need from the build that made it, and a fresh allocator needs no
+// probe at all -- so the pass lands on the calls that already pay a whole graph build. On VITS's
+// modules that build is 1-2.5 ms (Ryzen 3 3250U), and planning is the cheaper part of it.
+//
+// The size is measured on a SEPARATE gallocr, never on the live one: `ggml_gallocr_reserve_n_size` runs
 // the real planner with `no_alloc=true`, which frees the live buffers in the *growing* case -- exactly
-// the case where they are about to be needed. A scratch allocator has no buffers to lose.
+// the case where they are about to be needed. The probe never owns a buffer, so it has none to lose.
 //
-// **Armed by a preceding growth (`may_shrink_`), not run on every build.** The scratch plan is a second
-// full pass over the graph on top of the one `ggml_gallocr_alloc_graph` already does, and running it per
-// build measured consistently slower on gemma-3-270m-it's 1742-node graph -- paid on every decode step
-// to reclaim memory exactly once. (The wall-clock deltas on this machine were within its own run-to-run
-// variance of about 1 ms/step, so no figure is quoted here; the argument the design rests on is the
-// counted one, not the timed one.) Since the allocator only ever grows, the buffer can only be
-// oversized if some earlier build inflated it, so arming on growth makes the check run **once per
-// regime change** rather than once per build -- `shrinks()`/`builds()` report 1 and 101 for a
-// 100-step generation, which is the property the test asserts. Clearing the flag even when nothing
-// shrank is what stops a graph that genuinely needs its whole buffer from re-probing forever.
-void GraphBuilder::shrink_allocator_if_oversized(ggml_cgraph* gf) {
-    if (reserved_ || !may_shrink_ || !galloc_) return;
-    may_shrink_ = false;
-    const size_t current = ggml_gallocr_get_buffer_size(galloc_.get(), 0);
-    if (current == 0) return;
+// **The factor is the one P4.0.16 chose, for the same reason.** Two is the smallest number that
+// separates "a different regime is running now" from "n_kv grew by one bucket"; a call needing more
+// than half the buffer is a call the buffer is FOR, and resets the window.
+bool GraphBuilder::shrink_policy_active() const {
+    return !backends_.hybrid() && !reserved_ && !held_;
+}
 
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
-    ggml_gallocr_ptr probe(ggml_gallocr_new(buft));
-    if (!probe) return;
-    size_t needed = 0;
-    ggml_gallocr_reserve_n_size(probe.get(), gf, nullptr, nullptr, &needed);
-    // And only give it back when there is materially something to give. Shrinking to the exact current
-    // need would hand back a buffer the next step grows straight back -- the same `n_kv` creep the
-    // arming factor is about, seen from the other end.
-    if (needed * kShrinkArmingGrowth > current) return;
+bool GraphBuilder::note_call_need(size_t need) {
+    const size_t current = galloc_ ? ggml_gallocr_get_buffer_size(galloc_.get(), 0) : 0;
+    if (current > 0 && need * kShrinkFactor <= current) {
+        ++underused_calls_;
+    } else {
+        underused_calls_ = 0;
+    }
+    return underused_calls_ >= kShrinkWindow;
+}
 
-    galloc_.reset(ggml_gallocr_new(buft));
-    ++shrinks_;
+size_t GraphBuilder::measure_need(ggml_cgraph* gf) {
+    if (!probe_) {
+        probe_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+    }
+    size_t need = 0;
+    ggml_gallocr_reserve_n_size(probe_.get(), gf, nullptr, nullptr, &need);
+    return need;
+}
+
+void GraphBuilder::drop_retained_graph() {
+    // Order matters: the compute graph reads the input tensors, so it goes first.
+    has_cached_ = false;
+    cached_ = BuildResult{};
+    inputs_buf_.reset();
+    inputs_ctx_.reset();
+    kv_cells_ = nullptr; // lives in inputs_ctx_, so it dies with it
+    // The inputs these name died with inputs_ctx_; nothing is left to restore or to be stale.
+    aliases_.clear();
+    stale_inputs_.clear();
+    input_views_.clear();
+    input_views_scanned_ = false;
+}
+
+// ADR-073. Every condition below is one under which reading `src` in place could differ from reading a
+// copy of it, so a `false` here is never an error -- the caller copies, exactly as before.
+//
+// * **CPU-only.** A hybrid builder's scheduler decides which backend each tensor lives on, and plans the
+//   copies between them, from `tensor->buffer` when it allocates the graph. Repointing a buffer after
+//   that is a question about the scheduler's internals this does not need to answer to be worth having:
+//   on a device the copy it replaces is device-to-device.
+// * **Same buffer type.** The input's own storage and the source must be the same kind of memory, so
+//   that `data` means the same thing to every op that reads it.
+// * **Contiguous, same type, and long enough.** The copy this replaces is a byte copy of a contiguous
+//   range, and the input's own `nb` describes how the graph will read it.
+//
+// **And every view of the input moves with it.** ggml fixes a view's `data` when the graph is allocated,
+// as its base's `data` plus `view_offs` (`ggml_backend_view_init`), and does not look at the base again.
+// Repointing only the input left Whisper's decoder reading its K/V heads, through a reshape, out of the
+// input's own storage -- which the alias had stopped filling -- and it transcribed jfk as "[ [ [". A
+// consumer that read its input directly, which is all the first test did, could not see it.
+// `ggml_new_tensor_impl` flattens a view of a view to the ultimate base, so `view_src == input` finds
+// every one of them.
+//
+// The graph never writes a declared input -- nothing in this engine emits an in-place op, and a
+// retained output is written only by its own module's final `cpy` -- so an alias cannot change the
+// source. test_input_alias.cpp checks that by reading the source back.
+bool GraphBuilder::alias_input(ggml_tensor* input, ggml_tensor* src, size_t offset) {
+    if (backends_.hybrid() || input == nullptr || src == nullptr) return false;
+    if (input->buffer == nullptr || src->buffer == nullptr || src->data == nullptr) return false;
+    if (ggml_backend_buffer_get_type(input->buffer) != ggml_backend_buffer_get_type(src->buffer)) return false;
+    if (input->type != src->type || !ggml_is_contiguous(input) || !ggml_is_contiguous(src)) return false;
+    if (offset + ggml_nbytes(input) > ggml_nbytes(src)) return false;
+
+    // An input aliased twice in one call keeps its FIRST saved storage, which is its own.
+    const bool already = std::any_of(aliases_.begin(), aliases_.end(),
+                                     [&](const InputAlias& a) { return a.input == input; });
+    if (!already) aliases_.push_back({input, input->buffer, input->data});
+    input->buffer = src->buffer;
+    input->data = static_cast<char*>(src->data) + offset;
+    repoint_views(input);
+    return true;
+}
+
+void GraphBuilder::repoint_views(ggml_tensor* input) {
+    if (!input_views_scanned_ && cached_.graph != nullptr) {
+        // Nodes only: a view carries a view op, never GGML_OP_NONE, so it is never a leaf.
+        std::unordered_set<const ggml_tensor*> inputs;
+        for (const auto& [name, t] : cached_.input_tensors) inputs.insert(t);
+        for (int i = 0; i < ggml_graph_n_nodes(cached_.graph); ++i) {
+            ggml_tensor* t = ggml_graph_node(cached_.graph, i);
+            if (t->view_src != nullptr && inputs.count(t->view_src)) input_views_[t->view_src].push_back(t);
+        }
+        input_views_scanned_ = true;
+    }
+    const auto it = input_views_.find(input);
+    if (it == input_views_.end()) return;
+    for (ggml_tensor* view : it->second) {
+        view->buffer = input->buffer;
+        view->data = static_cast<char*>(input->data) + view->view_offs;
+    }
+}
+
+void GraphBuilder::mark_input_written(ggml_tensor* input) {
+    stale_inputs_.erase(std::remove(stale_inputs_.begin(), stale_inputs_.end(), input), stale_inputs_.end());
+}
+
+void GraphBuilder::restore_aliased_inputs() {
+    for (const InputAlias& a : aliases_) {
+        a.input->buffer = a.buffer;
+        a.input->data = a.data;
+        repoint_views(a.input);
+        if (std::find(stale_inputs_.begin(), stale_inputs_.end(), a.input) == stale_inputs_.end()) {
+            stale_inputs_.push_back(a.input);
+        }
+    }
+    aliases_.clear();
+}
+
+// Releasing a hold also forgets the retained graph (not the buffer). A held builder skips the probe, so
+// the need it recorded for that graph is the whole buffer rather than what the graph uses -- and every
+// reuse of it would then reset the window instead of advancing it, so the shrink would never come. The
+// next call rebuilds into the same buffer and is measured like any other. One rebuild per toggle.
+void GraphBuilder::hold_compute_buffer(bool hold) {
+    if (held_ && !hold) drop_retained_graph();
+    held_ = hold;
+    underused_calls_ = 0;
+}
+
+// Everything the retained graph owns goes, in the order its pointers depend on each other: the graph
+// (whose tensors point into both buffers) first, then the compute buffer. On a hybrid builder that buffer
+// belongs to the scheduler, so the scheduler goes -- allocate_scheduled() recreates one on the next build
+// exactly as it does for the first. The probe owns no buffer and is kept.
+void GraphBuilder::release_compute_buffer() {
+    drop_retained_graph();
+    galloc_.reset();
+    sched_.reset();
+    sched_capacity_ = 0;
+    cached_need_ = 0;
+    underused_calls_ = 0;
 }
 
 // The hybrid counterpart of the gallocr block in build(), and deliberately a much shorter one: a
@@ -559,7 +696,7 @@ void GraphBuilder::shrink_allocator_if_oversized(ggml_cgraph* gf) {
 //
 // **Recreated, never shrunk.** A scheduler that is big enough stays; one that is not is replaced
 // wholesale. There is no ggml_backend_sched equivalent of the gallocr shrink and none is faked here --
-// see shrink_allocator_if_oversized's comment for what the CPU path's policy is actually buying, and
+// see the shrink policy's comment above for what the CPU path's policy is actually buying, and
 // note that none of that reasoning transfers: the scheduler's buffers are per backend and its planner
 // already reuses them across allocations of different sizes.
 void GraphBuilder::allocate_scheduled(ggml_cgraph* gf) {

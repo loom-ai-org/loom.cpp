@@ -1,0 +1,294 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 3d9c72bc..728c89f0 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1376,6 +1376,9 @@ void ggml_compute_forward_mul_mat(
+     if (ggml_armv6_gemv(params, src0, src1, dst)) {
+         return;
+     }
++    if (ggml_armv6_mul_mat_f32(params, src0, src1, dst)) {
++        return;
++    }
+ #endif
+ 
+     // TODO: extract to "extra_op"
+@@ -2970,6 +2973,9 @@ struct ggml_cplan ggml_graph_plan(
+                         // Workspace for tiled (see tiled.h)
+                         cur = GGML_PAD(cur, 64);
+                         cur += ggml_tiled_wdata_size(n_tasks, node);
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++                        cur = MAX(cur, ggml_armv6_mul_mat_f32_wsize(node, n_tasks));
++#endif
+                     } break;
+                 case GGML_OP_MUL_MAT_ID:
+                     {
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index ff7f0a41..fad6d180 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -8412,15 +8412,23 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     if (kernel->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32) return false;
+     if (kernel->ne[1] != 1 || src->ne[1] != 1 || dst->ne[1] != 1) return false;   // 1-D only
+     if (dst->ne[3] != 1 || src->ne[3] != 1) return false;
+-    if (dst->op_params[0] != 1) return false;                                      // stride 1
+     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(kernel) || !ggml_is_contiguous(dst)) return false;
+ 
+     const int64_t IC = src->ne[2], OC = dst->ne[2], KW = kernel->ne[0];
+     const int64_t IL = src->ne[0], OL = dst->ne[0];
+     const int64_t dil = dst->op_params[4], pad = dst->op_params[2];
+-    // KW = 1 is a GEMM and stays with the GEMM path (ADR-079 P4.32d) until that one is measured.
+-    if (KW < 2 || KW > GGML_ARMV6_CONV_KMAX || OL < 4 || dil < 1) return false;
+-    const int64_t span = (KW - 1) * dil;
++    // KW = 1 too (ADR-079 P4.32d): a 1x1 convolution is the same tile with one tap. Citrinet-256-ls's
++    // (256 -> 256, T = 138-1101) ran 0.51 GOP/s through im2col and tinyBLAS_F32_ARMV6; here 0.77.
++    // A STRIDE S > 1 BY PHASES (ADR-079 P4.32d, Moonshine's stem): a stride-S convolution is a stride-1
++    // one over IC * S "virtual" channels, (c, p) holding x[c][t * S + p], with ceil(KW / S) taps each --
++    // tap jt of phase p is the kernel's tap jt * S + p, zero past KW. The window copy gathers the phases,
++    // the weights are re-indexed once, and the kernels are the stride-1 ones. Dilation must then be 1.
++    const int64_t S = dst->op_params[0];
++    if (S < 1 || (S > 1 && dil != 1)) return false;
++    const int64_t KT  = (KW + S - 1) / S;          // taps per virtual channel
++    const int64_t ICV = IC * S;                    // virtual channels
++    if (KW < 1 || KT > GGML_ARMV6_CONV_KMAX || OL < 4 || dil < 1) return false;
++    const int64_t span = (KT - 1) * dil;
+     if (dil * 4 > INT32_MAX / 2 || OL * 4 > INT32_MAX / 2) return false;
+ 
+     float *       y = out_data ? out_data : (float *) dst->data;
+@@ -8433,7 +8441,7 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     const char * ylo = (const char *) y, * yhi = (const char *) (y + OC * OL);
+     const char * xlo = (const char *) x, * xhi = (const char *) (x + IC * IL);
+     const bool aliases = ylo < xhi && xlo < yhi;
+-    if (aliases && !(y == x && IC == OC && IL == OL && params->nth == 1)) return false;
++    if (aliases && !(y == x && IC == OC && IL == OL && S == 1 && params->nth == 1)) return false;
+     if (res_data) {
+         const char * rlo = (const char *) res_data, * rhi = (const char *) (res_data + OC * OL);
+         if (res_data != y && rlo < yhi && ylo < rhi) return false;
+@@ -8451,18 +8459,21 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     // TB 64 / 96 / 128 / 192 / 256 = 1.12 / 1.15 / 1.16-1.17 / 1.15 / 1.12 (a longer block re-reads the
+     // weights less often, a shorter one keeps the chunk wider), and the L1 budget flat from 8 to 16 KB
+     // (1.11 / 1.12 / 1.11). GGML_CPU_ARMV6_CONV_TB and GGML_CPU_ARMV6_CONV_L1 fix the two.
+-    int64_t TB = tb_env > 0 ? tb_env : 128;
++    // KW = 1 wants a SHORTER block: a tap-less window row is short, so the chunk can take many more
++    // channels and each tile amortizes its accumulator loads and stores over a longer reduction.
++    // Citrinet's 1x1 shapes, TB 32 / 64 / 128: 0.770 / 0.768 / 0.652 GOP/s.
++    int64_t TB = tb_env > 0 ? tb_env : (KT == 1 ? 32 : 128);
+     TB = (TB + 3) & ~(int64_t) 3;
+     if (aliases && TB < pad) return false;         // `defer` needs a block to outreach the padding
+     const int64_t TBx  = TB + 4;                   // a block absorbs a remainder shorter than a tile
+     const int64_t xrow = TBx + span;               // floats per window row
+-    const int64_t row_bytes = xrow * 4 + KW * 16;  // one channel's window row + its weights in a quad
++    const int64_t row_bytes = xrow * 4 + KT * 16;  // one channel's window row + its weights in a quad
+     const int64_t icc_max = MAX((int64_t) 1, (int64_t) l1_env / row_bytes - 1);
+-    const int64_t nch  = (IC + icc_max - 1) / icc_max;
+-    const int64_t icc  = (IC + nch - 1) / nch;
++    const int64_t nch  = (ICV + icc_max - 1) / icc_max;
++    const int64_t icc  = (ICV + nch - 1) / nch;
+ 
+     const int64_t OCq  = (OC + 3) / 4;
+-    const size_t  n_wp = (size_t) OCq * IC * KW * 4 + 4;   // + the tile's W preload past the last quad
++    const size_t  n_wp = (size_t) OCq * ICV * KT * 4 + 4;  // + the tile's W preload past the last quad
+     const size_t  n_b  = (size_t) OCq * 4;
+     const size_t  n_x  = (size_t) (icc + 1) * xrow + 4;    // + the spare row the last preload reads
+     const size_t  n_y  = 2 * (size_t) OCq * 4 * TBx;
+@@ -8480,12 +8491,12 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+ 
+     const float * w = (const float *) kernel->data;
+     for (int64_t q = params->ith; q < OCq; q += params->nth) {
+-        float * d = wp + (size_t) q * IC * KW * 4;
+-        for (int64_t c = 0; c < IC; ++c)
+-            for (int64_t j = 0; j < KW; ++j)
++        float * d = wp + (size_t) q * ICV * KT * 4;
++        for (int64_t v = 0; v < ICV; ++v)
++            for (int64_t jt = 0; jt < KT; ++jt)
+                 for (int64_t r = 0; r < 4; ++r) {
+-                    const int64_t o = 4 * q + r;
+-                    *d++ = o < OC ? w[(o * IC + c) * KW + j] : 0.0f;
++                    const int64_t o = 4 * q + r, c = v / S, j = jt * S + v % S;
++                    *d++ = o < OC && j < KW ? w[(o * IC + c) * KW + j] : 0.0f;
+                 }
+     }
+     if (params->ith == 0) {
+@@ -8519,7 +8530,7 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     ggml_armv6_conv_args a;
+     a.xrow = (int32_t) (xrow * 4);
+     a.d4   = (int32_t) (dil * 4);
+-    const ggml_armv6_conv_fn fn = ggml_armv6_conv_f32[KW];
++    const ggml_armv6_conv_fn fn = ggml_armv6_conv_f32[KT];
+     for (int64_t b = b0; b < b1; ++b) {
+         const int64_t t0 = b * TB, nb = block_len(b);
+         // A ragged block runs whole tiles into the staging buffer and flushes only its nb steps: a
+@@ -8529,9 +8540,19 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+         float *       yb   = stage_b ? ycur : y + t0;
+         const int32_t ystr = (int32_t) ((stage_b ? TBx : OL) * 4);
+         for (int64_t ch = 0; ch < nch; ++ch) {
+-            const int64_t c0 = ch * icc, cn = MIN(icc, IC - c0);
++            const int64_t c0 = ch * icc, cn = MIN(icc, ICV - c0);
+             for (int64_t c = 0; c < cn; ++c) {
+                 float *       row = xw + (size_t) c * xrow;
++                if (S > 1) {                             // phase p of channel v / S: x[(t0 + i) * S + p - pad]
++                    const int64_t v = c0 + c, ph = v % S;
++                    const float * in = x + (v / S) * IL;
++                    for (int64_t i = 0; i < L; ++i) {
++                        const int64_t pos = (t0 + i) * S + ph - pad;
++                        const float   val = pos >= 0 && pos < IL ? in[pos] : 0.0f;
++                        row[i] = leaky ? ggml_conv1d_leaky_s(val, *leaky) : val;
++                    }
++                    continue;
++                }
+                 const float * in  = x + (c0 + c) * IL;
+                 const int64_t p0 = t0 - pad;             // input position of row[0]
+                 const int64_t lo = MAX((int64_t) 0, -p0), hi = MIN(L, IL - p0);
+@@ -8547,7 +8568,7 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+             if (ch == nch - 1 && pend >= 0) { flush(pend, yprev); pend = -1; }
+             a.n_ic = (int32_t) cn;
+             for (int64_t q = 0; q < OCq; ++q) {
+-                a.w = wp + ((size_t) q * IC + c0) * KW * 4;
++                a.w = wp + ((size_t) q * ICV + c0) * KT * 4;
+                 a.b = ch == 0 ? bz + 4 * q : nullptr;
+                 a.ystride = ystr;
+                 a.x = xw; a.y = yb + (size_t) 4 * q * (ystr / 4); a.nt = (int32_t) nt;
+@@ -8562,6 +8583,127 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     if (pend >= 0) flush(pend, yprev);
+     return true;
+ }
++
++// ARMv6 ONLY: F32 MUL_MAT WITH n >= 24 ON THE SAME SHORT-VECTOR KERNEL (loom ADR-079, item P4.32d).
++//
++// The k = 1 conv kernel above is already a GEMM tile: per input row, a vector of four positions times
++// four scalars. Here the "window" is a transposed block of the weights, [K chunk][32 rows of A], so a
++// vector is A[m..m+3][k], and the scalars are four columns of B, packed [N/4][K][4] once per call. Each
++// accumulator vector is then C[n][m..m+3], contiguous in ggml's dst, written in place; K is chunked so
++// the window stays in L1, each later chunk continuing from the partial sums in C. A partial last quad of
++// columns goes through a small scratch. M must be a multiple of 4 (else tinyBLAS keeps it).
++// GGML_CPU_ARMV6_GEMM=0 turns it off.
++// Swept on the board (loom scripts/bench51.cpp gemm, TB 32), against tinyBLAS_F32_ARMV6: n = 16 0.47 vs
++// 0.49 GOP/s, n = 24 0.56 vs 0.49, n = 32 0.61 vs 0.50, Moonshine's n = 457 0.76-0.79 vs 0.29-0.38.
++#define GGML_ARMV6_GEMM_MIN_N 24
++
++struct ggml_armv6_mm_geom { int64_t TB, TBx, xrow, icc, nch, Nq; size_t n_bp, n_x, n_s; };
++
++static bool ggml_armv6_mm_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    static const int enabled = ggml_armv6_conv_env("GGML_CPU_ARMV6_GEMM", 1);
++    if (!enabled) return false;
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (src1->ne[1] < GGML_ARMV6_GEMM_MIN_N || src0->ne[1] % 4 != 0) return false;
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
++    if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) return false;
++    return true;
++}
++
++static ggml_armv6_mm_geom ggml_armv6_mm_plan(int64_t K, int64_t N) {
++    static const int tb_env = ggml_armv6_conv_env("GGML_CPU_ARMV6_GEMM_TB", 0);
++    static const int l1_env = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONV_L1", 12 * 1024);
++    ggml_armv6_mm_geom g;
++    // TB 32 / 64 / 128 over Moonshine's prefill and the conformer's FFN: 0.76-0.79 / 0.74-0.78 / 0.63-0.66.
++    g.TB   = tb_env > 0 ? (tb_env + 3) & ~3 : 32;
++    g.TBx  = g.TB + 4;
++    g.xrow = g.TBx;
++    const int64_t icc_max = MAX((int64_t) 1, (int64_t) l1_env / (g.xrow * 4 + 16) - 1);
++    g.nch  = (K + icc_max - 1) / icc_max;
++    g.icc  = (K + g.nch - 1) / g.nch;
++    g.Nq   = (N + 3) / 4;
++    g.n_bp = (size_t) g.Nq * K * 4 + 4;            // + the kernel's W preload past the last quad
++    g.n_x  = (size_t) (g.icc + 1) * g.xrow + 4;    // + the spare row the last preload reads
++    g.n_s  = (size_t) 4 * g.TBx + 4;               // the partial quad's rows + four zeros (the "bias")
++    return g;
++}
++
++size_t ggml_armv6_mul_mat_f32_wsize(const struct ggml_tensor * node, int n_tasks) {
++    if (!ggml_armv6_mm_ok(node->src[0], node->src[1], node)) return 0;
++    const ggml_armv6_mm_geom g = ggml_armv6_mm_plan(node->src[0]->ne[0], node->src[1]->ne[1]);
++    return GGML_PAD(g.n_bp * 4, 64) + (size_t) n_tasks * GGML_PAD((g.n_x + g.n_s) * 4, 64);
++}
++
++bool ggml_armv6_mul_mat_f32(const struct ggml_compute_params * params, const struct ggml_tensor * src0,
++                            const struct ggml_tensor * src1, struct ggml_tensor * dst) {
++    // Graph MUL_MAT nodes only. ggml_call_mul_mat* (the convolutions' im2col fallback) builds a dst on the
++    // stack (op NONE) and calls mul_mat with its own patches in params->wdata, which the packing below
++    // would overwrite -- the conv sweep test caught exactly that. Those keep tinyBLAS; ggml_graph_plan
++    // sized the work buffer for this only on real nodes anyway.
++    if (dst->op != GGML_OP_MUL_MAT) return false;
++    if (params->use_ref || !ggml_armv6_mm_ok(src0, src1, dst)) return false;
++    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
++    const ggml_armv6_mm_geom g = ggml_armv6_mm_plan(K, N);
++    const size_t per_thread = GGML_PAD((g.n_x + g.n_s) * 4, 64);
++    if (GGML_PAD(g.n_bp * 4, 64) + (size_t) params->nth * per_thread > params->wsize) return false;
++
++    const char *  A   = (const char *) src0->data;
++    const size_t  lda = src0->nb[1];
++    const char *  B   = (const char *) src1->data;
++    const size_t  ldb = src1->nb[1];
++    float *       C   = (float *) dst->data;
++    const int64_t ldc = dst->nb[1] / sizeof(float);
++
++    float * bp = (float *) params->wdata;
++    float * xw = (float *) ((char *) params->wdata + GGML_PAD(g.n_bp * 4, 64) + (size_t) params->ith * per_thread);
++    float * sc = xw + g.n_x;                         // [4][TBx] scratch, then four zeros
++    float * zeros = sc + 4 * g.TBx;
++    for (int i = 0; i < 4; ++i) zeros[i] = 0.0f;
++
++    for (int64_t q = params->ith; q < g.Nq; q += params->nth) {
++        float * d = bp + (size_t) q * K * 4;
++        for (int64_t k = 0; k < K; ++k)
++            for (int64_t r = 0; r < 4; ++r) {
++                const int64_t n = 4 * q + r;
++                *d++ = n < N ? ((const float *) (B + n * ldb))[k] : 0.0f;
++            }
++    }
++    if (params->ith == 0) for (int i = 0; i < 4; ++i) bp[g.n_bp - 4 + i] = 0.0f;
++    ggml_barrier(params->threadpool);
++
++    const int64_t nblk = (M + g.TB - 1) / g.TB;
++    const int64_t per  = (nblk + params->nth - 1) / params->nth;
++    const int64_t b0   = params->ith * per, b1 = MIN(b0 + per, nblk);
++    const int64_t full = N / 4;                      // quads whose four rows all exist in C
++
++    ggml_armv6_conv_args a;
++    a.xrow = (int32_t) (g.xrow * 4);
++    a.d4   = 4;                                      // one tap: the dilation is never used
++    const ggml_armv6_conv_fn fn = ggml_armv6_conv_f32[1];
++    for (int64_t b = b0; b < b1; ++b) {
++        const int64_t m0 = b * g.TB, mb = MIN(g.TB, M - m0);
++        for (int64_t ch = 0; ch < g.nch; ++ch) {
++            const int64_t k0 = ch * g.icc, kc = MIN(g.icc, K - k0);
++            for (int64_t i = 0; i < mb; ++i) {       // window[kk][i] = A[m0 + i][k0 + kk]
++                const float * src = (const float *) (A + (m0 + i) * lda) + k0;
++                float *       dw  = xw + i;
++                for (int64_t kk = 0; kk < kc; ++kk) dw[kk * g.xrow] = src[kk];
++            }
++            a.n_ic = (int32_t) kc;
++            a.x    = xw;
++            a.nt   = (int32_t) (mb / 4);
++            for (int64_t q = 0; q < g.Nq; ++q) {
++                a.w = bp + ((size_t) q * K + k0) * 4;
++                a.b = ch == 0 ? zeros : nullptr;
++                if (q < full) { a.y = C + 4 * q * ldc + m0; a.ystride = (int32_t) (ldc * 4); }
++                else          { a.y = sc;                   a.ystride = (int32_t) (g.TBx * 4); }
++                fn(&a);
++            }
++        }
++        for (int64_t n = 4 * full; n < N; ++n)           // the partial quad's real rows
++            memcpy(C + n * ldc + m0, sc + (n - 4 * full) * g.TBx, (size_t) mb * sizeof(float));
++    }
++    return true;
++}
+ #endif
+ 
+ static bool ggml_conv_2d_packed_geometry(const ggml_tensor * dst, const ggml_tensor * kernel,
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 5b6ed027..a8365632 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -102,6 +102,12 @@ void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * par
+ void ggml_compute_forward_im2col_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_col2im_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++// ARMv6 (loom ADR-079 P4.32d): F32 MUL_MAT with n >= 24 on the short-vector kernels; see ops.cpp.
++size_t ggml_armv6_mul_mat_f32_wsize(const struct ggml_tensor * node, int n_tasks);
++bool   ggml_armv6_mul_mat_f32(const struct ggml_compute_params * params, const struct ggml_tensor * src0,
++                              const struct ggml_tensor * src1, struct ggml_tensor * dst);
++#endif
+ void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * act, const struct ggml_tensor * bias, const struct ggml_tensor * residual, struct ggml_tensor * out);
+ void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -1,11 +1,15 @@
 # Frozen reference waveforms of the retired per-model C++ drivers
 
-These five `.npy` files are the numeric ground truth that `loom::VitsDriver`, `loom::MatchaDriver`,
+These four `.npy` files are the numeric ground truth that `loom::MatchaDriver`,
 `loom::SupertonicDriver`, `loom::KokoroDriver` and `loom::StyleTTS2Driver` used to supply *live*, by
 being constructed and run inside the test that compared against them. P4.0.8 (stage E of
 `EXPORT-PREPARATION.md`) retires those drivers, and BACKEND.md's R6 rule allows deleting one only in the
 commit that re-points the last test consuming it — so this directory is what the tests were re-pointed
 *onto*.
+
+`vits_driver_waveform.npy` was the fifth. It was deleted on 2026-10-11 with its only reader,
+`test_e2e_vits_lua_driver`, whose hand-converted fixture (`tools/convert_piper_vits`) no tree can
+produce any more. The VITS that ships is checked by `test_e2e_vits_mil_lua_driver`.
 
 **Read this before treating a mismatch as a bug in the Lua driver.** These files are not a
 reference implementation. They are one recorded output of a program that no longer exists.
@@ -17,8 +21,6 @@ commit immediately before its driver was deleted — via the `LOOM_DUMP_REF_NPY`
 for exactly this purpose:
 
 ```
-LOOM_VITS_DIR=<vits_stats/logw/flow_vocoder ggufs> \
-  LOOM_DUMP_REF_NPY=.../vits_driver_waveform.npy         build/tests/test_e2e_vits_driver
 LOOM_MATCHA_DIR=<four bespoke matcha ggufs> \
   LOOM_DUMP_REF_NPY=.../matcha_driver_waveform.npy       build/tests/test_e2e_matcha_driver
 LOOM_KOKORO_ALL_DIR=<convert_kokoro_all.py output> \
@@ -32,13 +34,12 @@ LOOM_SUPERTONIC_ALL_DIR=<convert_supertonic_all.py output> \
 
 | fixture | samples | driver | inputs |
 |---|---|---|---|
-| `vits_driver_waveform.npy` | 49664 | `VitsDriver` | the 62-token BOS/blank/EOS sequence in `test_e2e_vits_lua_driver.cpp`, seed 42 |
 | `matcha_driver_waveform.npy` | 10240 | `MatchaDriver` | tokens `{5,42,7,88,13,100,3,61}`, n_steps 10, seed 42 |
 | `kokoro_driver_waveform.npy` | 22200 | `KokoroDriver` | ids `{0,50,62,24,83,16,44,71,9,0}`, the synthetic `ref_s`, speed 1.0, seed 42 |
 | `styletts2_driver_waveform.npy` | 22200 | `StyleTTS2Driver` | ids `{0,50,62,24,83,16,44,71,9}`, 5 diffusion steps, seed 42 |
 | `supertonic_driver_waveform_F1.npy` | 70656 | `SupertonicDriver` | ids `{12,45,67,23,89,34,56,78,90,15}`, voice style **F1**, n_steps 10, seed 42 |
 
-All five are 1-D float32, little-endian — `numpy.load` opens them directly.
+All four are 1-D float32, little-endian — `numpy.load` opens them directly.
 
 **Supertonic is keyed by voice style** because the style vectors are an *input*, not a constant: a
 different `voice_styles/*.json` produces a different waveform. `test_e2e_supertonic_{,mil_}lua_driver`
@@ -69,7 +70,6 @@ every digit printed:
 
 | test | bound | observed |
 |---|---|---|
-| `test_e2e_vits_lua_driver` | `1e-3` | `3.27e-07` |
 | `test_e2e_matcha_lua_driver` | `1e-3` | `1.39e-05` |
 | `test_e2e_kokoro_lua_driver` | `1e-3` | `1.91e-06` |
 | `test_e2e_styletts2_lua_driver` | `5e-3` | `3.83e-03` |
@@ -77,7 +77,7 @@ every digit printed:
 | `test_e2e_matcha_mil_lua_driver` | `2e-2` | `1.04e-02` (rmse `6.78e-04`) |
 | `test_e2e_supertonic_mil_lua_driver` | `1e-3` | `2.08e-06` |
 
-The first five are the *same* op sequence run through the Lua interpreter instead of C++ control flow,
+The first four are the *same* op sequence run through the Lua interpreter instead of C++ control flow,
 so they should and do match to near bit-exactness. The two MIL rows compare two independently derived
 computation graphs of the same architecture, which is why Matcha's bound is looser — see that test's own
 comment for the amplification reasoning.

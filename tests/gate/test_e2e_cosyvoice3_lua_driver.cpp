@@ -74,7 +74,23 @@ constexpr double COSYVOICE3_MEL_MAX_ABS = 1e-2;
 constexpr double COSYVOICE3_MEL_RMSE = 1e-3;
 constexpr double COSYVOICE3_VOCODER_MAX_ABS = 5e-2;
 constexpr double COSYVOICE3_VOCODER_RMSE = 3e-3;
-constexpr double COSYVOICE3_FREE_RMSE = 2e-2;
+// The free-running waveform is NOT bounded by a multiple of one measurement: the sine source integrates
+// F0 into the phase, so a one-ulp change in attention moves this rmse by an order of magnitude while the
+// mel and the words do not move. Measured 2026-10-14 on four fixtures (these two, plus a third sentence
+// on the default voice and a fourth on the JFK clone, seeds 21 and 31), against the f64 waveform:
+//
+//                                 free-running rmse              log-mel |d| mean
+//   unpatched ggml                0.0069 .. 0.019                0.06 .. 0.12 dB
+//   + the XNNPACK softmax         0.0076 .. 0.058                0.07 .. 0.26 dB
+//   ggml's own exp, only the      0.012  .. 0.030                0.07 .. 0.25 dB
+//     row sum's order changed
+//   the reference's own f32 run   0.0090 .. 0.249                0.13 .. 1.09 dB
+//
+// whisper-small transcribed all of them -- every build and both reference runs, on all four -- to the same
+// words. So 2e-2 (set from the first build alone) failed a softmax with ggml's accuracy. The bound sits
+// above every build measured and under half of what a silenced (rmse 0.11 / 0.21 here) or 10 ms-shifted
+// (0.16 / 0.30) waveform scores, which is what this arm is for: the join, not the rounding.
+constexpr double COSYVOICE3_FREE_RMSE = 6e-2;
 
 std::string meta_string(const std::string& json, const std::string& key) {
     const std::string needle = "\"" + key + "\": \"";
@@ -302,8 +318,8 @@ int main() {
         const auto clone_nsf = loom_test::read_npy_f32(dir + "/nsf_noise.npy", shape);
         // The FLOAT64 reference, not its f32 run: on this voice (a loud 11 s clip, 254 generated frames)
         // the reference's own f32 waveform is rmse 0.249 from its f64 one -- uncorrelated in four of eight
-        // segments -- while loom lands at rmse 6.9e-03 from the f64 one, inside the default voice's own
-        // f32-vs-f64 spread (9.0e-03). Measured 2026-09-25; the flow's mel is at its floor either way
+        // segments -- while loom lands at rmse 6.9e-03 from the f64 one (3.3e-02 with ggml-0029's softmax;
+        // see COSYVOICE3_FREE_RMSE). Measured 2026-09-25; the flow's mel is at its floor either way
         // (max 2.3e-03, rmse 1.6e-04 against the f32 reference).
         const auto clone_wave = loom_test::read_npy_f32(dir + "/wave_f64.npy", shape);
         // The voice's arrays as driver inputs by name, as `loom_cli --voice` and loom-py pass them.

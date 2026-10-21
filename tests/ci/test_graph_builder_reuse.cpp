@@ -264,10 +264,15 @@ void test_decode_loop_reuses_and_matches_rebuild(loom::GgufModel& model, const l
     }
     // ...and the comparison can fail: consecutive decode steps really do produce different logits.
     LOOM_CHECK(!bit_identical(reused_out[1], reused_out[2]));
-    // Three graphs for 1 + kSteps calls: the prefill shape, the decode shape inside the first bucket,
-    // and the decode shape inside the second. Everything else is reused -- 38 of 41 calls.
-    LOOM_CHECK(reused.builds() == 3);
-    LOOM_CHECK(reused.reuses() == static_cast<uint64_t>(1 + kSteps) - 3);
+    // Three graph SHAPES for 1 + kSteps calls: the prefill, the decode step inside the first bucket, and
+    // the decode step inside the second -- plus one build for the shrink. The prefill's buffer is given
+    // back kShrinkWindow decode calls in, and the reuse that closes that window is served by a rebuild,
+    // because the retained graph's tensors point into the buffer being given back (ADR-072). Everything
+    // else is reused -- 37 of 41 calls -- and every one of them matched the oracle above, the rebuilt
+    // one included.
+    LOOM_CHECK(reused.shrinks() == 1);
+    LOOM_CHECK(reused.builds() == 3 + reused.shrinks());
+    LOOM_CHECK(reused.reuses() == static_cast<uint64_t>(1 + kSteps) - reused.builds());
 }
 
 // **Padded cells contribute exactly zero, and not because they are zero.** Rounding n_kv up to a bucket

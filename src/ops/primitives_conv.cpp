@@ -1,10 +1,16 @@
 #include "loom/core/conv_state_cache.h"
 #include "loom/loom_errors.h"
+#include "loom/ops/fft.h"
 #include "loom/ops/primitive_registry.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <tuple>
 
 namespace loom {
 
@@ -736,6 +742,211 @@ Outputs op_pool_2d(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
     return {ggml_pool_2d(pc.ctx, in[0], op, k0, k1, s0, s1, p0, p1)};
 }
 
+// ISTFT (ADR-080): the inverse STFT that loom-exporter's `istft.py` used to trace as three
+// CONV_TRANSPOSE_1D (real and imaginary synthesis over a windowed DFT basis, and the overlap-added
+// window square) plus an ADD and a DIV. That is N MACs per bin per frame; this is one inverse real FFT
+// per frame. On the Pi Zero, heart's vocoder tail went from 2.23 s to 0.18 s (scripts/bench54.cpp).
+//
+//   inputs  real [F, n_fft/2 + 1, B], imag [F, n_fft/2 + 1, B] (frames fastest, as the convolutions
+//           took them), window [n_fft]
+//   attrs   n_fft, hop, center (crop n_fft/2 from both ends, as torch.istft's center=True does)
+//   output  [(F - 1) * hop + n_fft (- n_fft if center), B]
+//
+//   y[t] = sum_f window[t - f hop] irfft(X_f)[t - f hop] / sum_f window[t - f hop]^2
+//
+// irfft is numpy's (1/n, the DC and Nyquist imaginary parts ignored), which is what the module's
+// 1/n, 2/n, 1/n bin weights over cos/-sin made it. The division is the module's too, unguarded: where
+// the window sum is zero (sample 0 under a periodic Hann with center=false) both give 0/0.
+//
+// THE THREADS SPLIT THE OUTPUT, NOT THE FRAMES. Each one takes a range of samples and recomputes the
+// (n_fft / hop) - 1 frames that straddle its edges, so the overlap-add needs no atomics and every
+// sample sums its frames in frame order -- the result is the same bit for bit at any thread count.
+//
+// A ggml_custom_4d, so CPU-only: a device backend's scheduler hands this node to the CPU fallback,
+// which costs a spectrogram download and a waveform upload at the very end of a synthesis.
+struct IstftParams {
+    const fft::RealFft* plan;
+    int64_t hop;
+    bool center;
+};
+
+void istft_custom_op(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const auto& p = *static_cast<const IstftParams*>(userdata);
+    const fft::RealFft& plan = *p.plan;
+    const ggml_tensor* re = dst->src[0];
+    const ggml_tensor* im = dst->src[1];
+    const auto* win = static_cast<const float*>(dst->src[2]->data);
+    const int64_t n = plan.size(), bins = plan.bins(), hop = p.hop;
+    const int64_t F = re->ne[0], B = re->ne[2];
+    const int64_t L = dst->ne[0];
+    const int64_t off = p.center ? n / 2 : 0;   // dst[i] is the full signal's sample i + off
+
+    const int64_t per = (L + nth - 1) / nth;
+    const int64_t a = std::min<int64_t>(ith * per, L), b = std::min<int64_t>(a + per, L);
+    if (a >= b) return;
+    const int64_t ta = a + off, tb = b + off;   // full-signal range [ta, tb)
+
+    std::vector<float> xr(bins), xi(bins), frame(n), acc(b - a), wsum(b - a);
+    std::vector<std::complex<float>> work(plan.work_size());
+    // frames f with [f hop, f hop + n) meeting [ta, tb)
+    const int64_t f0 = std::max<int64_t>(0, (ta - n + hop) / hop);
+    const int64_t f1 = std::min<int64_t>(F - 1, (tb - 1) / hop);
+    for (int64_t bi = 0; bi < B; ++bi) {
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        std::fill(wsum.begin(), wsum.end(), 0.0f);
+        const char* rb = static_cast<const char*>(re->data) + bi * re->nb[2];
+        const char* ib = static_cast<const char*>(im->data) + bi * im->nb[2];
+        for (int64_t f = f0; f <= f1; ++f) {
+            const int64_t s = f * hop;
+            const int64_t lo = std::max(ta, s), hi = std::min(tb, s + n);
+            if (lo >= hi) continue;
+            for (int64_t k = 0; k < bins; ++k) {
+                xr[k] = *reinterpret_cast<const float*>(rb + f * re->nb[0] + k * re->nb[1]);
+                xi[k] = *reinterpret_cast<const float*>(ib + f * im->nb[0] + k * im->nb[1]);
+            }
+            plan.inverse(xr.data(), xi.data(), frame.data(), work.data());
+            for (int64_t t = lo; t < hi; ++t) {
+                const float w = win[t - s];
+                acc[t - ta] += frame[t - s] * w;
+                wsum[t - ta] += w * w;
+            }
+        }
+        auto* y = reinterpret_cast<float*>(static_cast<char*>(dst->data) + bi * dst->nb[1]);
+        for (int64_t i = 0; i < b - a; ++i) y[a + i] = acc[i] / wsum[i];
+    }
+}
+
+// One parameter block per (n_fft, hop, center) for the life of the process: the graph's node holds a
+// raw pointer to it, and graphs are rebuilt and reused across calls.
+const IstftParams* istft_params(int64_t n_fft, int64_t hop, bool center) {
+    static std::mutex mu;
+    static std::map<std::tuple<int64_t, int64_t, bool>, std::unique_ptr<IstftParams>> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& slot = cache[{n_fft, hop, center}];
+    if (!slot) {
+        slot = std::make_unique<IstftParams>(
+            IstftParams{&fft::RealFft::plan(static_cast<int>(n_fft)), hop, center});
+    }
+    return slot.get();
+}
+
+Outputs op_istft(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("ISTFT", in, 3);
+    const int64_t n_fft = resolve_attr_int(attrs, "n_fft", pc.symbols);
+    const int64_t hop = resolve_attr_int(attrs, "hop", pc.symbols);
+    const bool center = resolve_attr_int(attrs, "center", pc.symbols) != 0;
+    ggml_tensor* re = in[0];
+    ggml_tensor* im = in[1];
+    ggml_tensor* win = in[2];
+    if (n_fft < 2 || n_fft % 2 != 0 || hop < 1) {
+        throw SchemaError("ISTFT: n_fft " + std::to_string(n_fft) + " must be even and >= 2, hop " +
+                          std::to_string(hop) + " >= 1");
+    }
+    for (ggml_tensor* t : {re, im, win}) {
+        if (t->type != GGML_TYPE_F32) throw SchemaError("ISTFT: every input must be F32");
+    }
+    if (re->ne[1] != n_fft / 2 + 1 || im->ne[0] != re->ne[0] || im->ne[1] != re->ne[1] ||
+        im->ne[2] != re->ne[2] || re->ne[3] != 1 || im->ne[3] != 1) {
+        throw SchemaError("ISTFT: real and imag must both be [frames, n_fft/2 + 1 = " +
+                          std::to_string(n_fft / 2 + 1) + ", batch]");
+    }
+    if (ggml_nelements(win) != n_fft) {
+        throw SchemaError("ISTFT: the window has " + std::to_string(ggml_nelements(win)) +
+                          " samples, n_fft is " + std::to_string(n_fft));
+    }
+    if (!ggml_is_contiguous(win)) win = ggml_cont(pc.ctx, win);
+    const int64_t full = (re->ne[0] - 1) * hop + n_fft;
+    const int64_t len = center ? full - n_fft : full;
+    if (len < 1) throw SchemaError("ISTFT: " + std::to_string(re->ne[0]) + " frames give no samples");
+    ggml_tensor* args[] = {re, im, win};
+    // void* through a const block: ggml's userdata is non-const, the kernel only reads it
+    void* params = const_cast<IstftParams*>(istft_params(n_fft, hop, center));
+    return {ggml_custom_4d(pc.ctx, GGML_TYPE_F32, len, re->ne[2], 1, 1, args, 3, istft_custom_op,
+                           GGML_N_TASKS_MAX, params)};
+}
+
+// STFT (ADR-080): the forward transform, which coremltools lowers `torch.stft` to as two CONV_1D over
+// a windowed DFT basis (cos and -sin). This is one real FFT per frame.
+//
+//   inputs  signal [L, B] (already padded: the topology's own PAD does torch's center=True), window [n_fft]
+//   attrs   n_fft, hop
+//   outputs real [F, n_fft/2 + 1, B], imag [F, n_fft/2 + 1, B], F = (L - n_fft) / hop + 1 -- the two
+//           convolutions' [OL, OC, N], so everything downstream of them is unchanged
+//
+// One custom node writes both halves ([F, bins, B, 2], the real half first) and the two outputs are
+// views of it, each contiguous at any batch. The threads split the frames; each frame is independent, so any thread count gives the same
+// bits.
+struct StftParams {
+    const fft::RealFft* plan;
+    int64_t hop;
+};
+
+void stft_custom_op(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const auto& p = *static_cast<const StftParams*>(userdata);
+    const fft::RealFft& plan = *p.plan;
+    const ggml_tensor* x = dst->src[0];
+    const auto* win = static_cast<const float*>(dst->src[1]->data);
+    const int64_t n = plan.size(), bins = plan.bins(), hop = p.hop;
+    const int64_t F = dst->ne[0], B = dst->ne[2];
+    const size_t half = static_cast<size_t>(F) * bins * B;   // the imaginary half's offset
+    std::vector<float> frame(n), re(bins), im(bins);
+    std::vector<std::complex<float>> work(plan.work_size());
+    for (int64_t bi = 0; bi < B; ++bi) {
+        const auto* xs = reinterpret_cast<const float*>(static_cast<const char*>(x->data) + bi * x->nb[1]);
+        auto* y = reinterpret_cast<float*>(static_cast<char*>(dst->data) + bi * dst->nb[2]);   // real, batch bi
+        for (int64_t f = ith; f < F; f += nth) {
+            const float* s = xs + f * hop;
+            for (int64_t i = 0; i < n; ++i) frame[i] = s[i] * win[i];
+            plan.forward(frame.data(), re.data(), im.data(), work.data());
+            for (int64_t k = 0; k < bins; ++k) {
+                y[k * F + f] = re[k];
+                y[half + k * F + f] = im[k];
+            }
+        }
+    }
+}
+
+const StftParams* stft_params(int64_t n_fft, int64_t hop) {
+    static std::mutex mu;
+    static std::map<std::pair<int64_t, int64_t>, std::unique_ptr<StftParams>> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& slot = cache[{n_fft, hop}];
+    if (!slot) slot = std::make_unique<StftParams>(StftParams{&fft::RealFft::plan(static_cast<int>(n_fft)), hop});
+    return slot.get();
+}
+
+Outputs op_stft(PrimitiveContext& pc, const Inputs& in, const Json& attrs) {
+    expect_n_inputs("STFT", in, 2);
+    const int64_t n_fft = resolve_attr_int(attrs, "n_fft", pc.symbols);
+    const int64_t hop = resolve_attr_int(attrs, "hop", pc.symbols);
+    ggml_tensor* x = in[0];
+    ggml_tensor* win = in[1];
+    if (n_fft < 2 || n_fft % 2 != 0 || hop < 1) {
+        throw SchemaError("STFT: n_fft " + std::to_string(n_fft) + " must be even and >= 2, hop " +
+                          std::to_string(hop) + " >= 1");
+    }
+    if (x->type != GGML_TYPE_F32 || win->type != GGML_TYPE_F32) throw SchemaError("STFT: inputs must be F32");
+    if (x->ne[2] != 1 || x->ne[3] != 1) throw SchemaError("STFT: the signal must be [samples, batch]");
+    if (ggml_nelements(win) != n_fft) {
+        throw SchemaError("STFT: the window has " + std::to_string(ggml_nelements(win)) +
+                          " samples, n_fft is " + std::to_string(n_fft));
+    }
+    if (x->ne[0] < n_fft) {
+        throw SchemaError("STFT: " + std::to_string(x->ne[0]) + " samples is less than one frame of " +
+                          std::to_string(n_fft));
+    }
+    if (!ggml_is_contiguous(x)) x = ggml_cont(pc.ctx, x);
+    if (!ggml_is_contiguous(win)) win = ggml_cont(pc.ctx, win);
+    const int64_t F = (x->ne[0] - n_fft) / hop + 1, bins = n_fft / 2 + 1, B = x->ne[1];
+    ggml_tensor* args[] = {x, win};
+    void* params = const_cast<StftParams*>(stft_params(n_fft, hop));
+    ggml_tensor* both = ggml_custom_4d(pc.ctx, GGML_TYPE_F32, F, bins, B, 2, args, 2, stft_custom_op,
+                                       GGML_N_TASKS_MAX, params);
+    ggml_tensor* re = ggml_view_3d(pc.ctx, both, F, bins, B, both->nb[1], both->nb[2], 0);
+    ggml_tensor* im = ggml_view_3d(pc.ctx, both, F, bins, B, both->nb[1], both->nb[2], both->nb[3]);
+    return {re, im};
+}
+
 } // namespace
 
 LOOM_REGISTER_OP(CONV_1D, op_conv_1d)
@@ -743,6 +954,8 @@ LOOM_REGISTER_OP(CONV_2D, op_conv_2d)
 LOOM_REGISTER_OP(CONV_2D_DW, op_conv_2d_dw)
 LOOM_REGISTER_OP(CONV_TRANSPOSE_1D, op_conv_transpose_1d)
 LOOM_REGISTER_OP(CONV_TRANSPOSE_2D, op_conv_transpose_2d)
+LOOM_REGISTER_OP(ISTFT, op_istft)
+LOOM_REGISTER_OP(STFT, op_stft)
 LOOM_REGISTER_OP(CONV_1D_DW, op_conv_1d_dw)
 LOOM_REGISTER_OP(SHORT_CONV, op_short_conv)
 LOOM_REGISTER_OP(POOL_1D, op_pool_1d)

@@ -7,7 +7,6 @@
 #include <functional>
 #include "loom/core/kv_cache.h"
 #include "loom/core/output_store.h"
-#include "loom/core/relative_position.h"
 #include "loom/loom_errors.h"
 
 extern "C" {
@@ -222,8 +221,12 @@ bool is_output_ref(lua_State* L, int value_idx) {
 // Raises loom::Error rather than calling luaL_error: these run inside compute_and_emit, whose caller
 // already converts exceptions at the trampoline, and luaL_error's longjmp would skip the GraphBuilder's
 // destructor on the way out.
+//
+// `aliaser`, when given, is offered the source first: a builder that can point `dst` at it in place
+// returns true and nothing is copied (ADR-073). Every validation above the copy still runs, so an alias
+// is refused or accepted on exactly the terms the copy was.
 void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, const StoreLookup& lookup,
-                                 const char* fname) {
+                                 const char* fname, GraphBuilder* aliaser = nullptr) {
     lua_getfield(L, value_idx, "from");
     const std::string src_module = lua_tostring(L, -1);
     lua_pop(L, 1);
@@ -284,6 +287,10 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
                          std::to_string(dst->ne[3]) + "] -- a row prefix is copied as-is, so the two "
                          "must agree exactly");
         }
+        if (aliaser != nullptr &&
+            aliaser->alias_input(dst, src, static_cast<size_t>(first_row) * src->nb[1])) {
+            return;
+        }
         copy_row_range(src, dst, first_row, rows, src_module, fname);
         return;
     }
@@ -298,6 +305,7 @@ void set_tensor_from_output_ref(lua_State* L, int value_idx, ggml_tensor* dst, c
                      std::to_string(dst->ne[3]) + "] -- a retained output is copied as-is, so the two "
                      "must agree exactly (marshalling through Lua only ever compared element counts)");
     }
+    if (aliaser != nullptr && aliaser->alias_input(dst, src)) return;
     ggml_backend_tensor_copy(src, dst);
 }
 
@@ -776,7 +784,7 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
         // an output reference performs (which push and pop) can't shift it underneath us.
         const int value_idx = lua_gettop(L);
         if (is_output_ref(L, value_idx)) {
-            set_tensor_from_output_ref(L, value_idx, input_it->second, lookup, fname);
+            set_tensor_from_output_ref(L, value_idx, input_it->second, lookup, fname, &builder);
         } else {
             // A mask spanning the KV cache is the one input whose declared width is the engine's
             // business rather than the driver's, because the engine rounds n_kv up to a bucket so a
@@ -788,7 +796,19 @@ int compute_and_emit(lua_State* L, const char* fname, const char* module_name, G
                 set_tensor_from_lua_array(L, value_idx, input_it->second);
             }
         }
+        // Written or aliased, this input holds this call's value -- either way it is not stale.
+        builder.mark_input_written(input_it->second);
         lua_pop(L, 1);
+    }
+    // An input an earlier call fed by alias, and this call did not feed at all, would be read from its
+    // own storage -- which never received that value (ADR-073). Before aliasing, a copy left the last
+    // value there, so a driver that leaned on that would now read something older. Refuse it by name
+    // rather than run on it; no driver in the zoo does it, and the gate suite is what says so.
+    if (!builder.stale_inputs().empty()) {
+        return luaL_error(L, "%s: module '%s' input '%s' was passed by reference on an earlier call and "
+                             "not passed on this one -- a referenced input is read in place, not kept, so "
+                             "pass it again (or pass a value)",
+                          fname, module_name, ggml_get_name(builder.stale_inputs().front()));
     }
 
     if (before_compute) before_compute(r);
@@ -2129,23 +2149,6 @@ int LoomLuaBridge::l_expand_by_duration_and_retain(lua_State* L) {
     }
 }
 
-// Thin wrapper around loom::pad_crop_relative_embeddings (include/loom/core/relative_position.h),
-// already proven by VitsDriver's own C++ implementation.
-int LoomLuaBridge::l_pad_crop_relative_embeddings(lua_State* L) {
-    try {
-        const std::vector<double> raw_d = read_number_array(L, 1);
-        const auto window_size = static_cast<int64_t>(luaL_checknumber(L, 2));
-        const auto k_channels = static_cast<int64_t>(luaL_checknumber(L, 3));
-        const auto length = static_cast<int64_t>(luaL_checknumber(L, 4));
-        std::vector<float> raw(raw_d.begin(), raw_d.end());
-        const std::vector<float> result = pad_crop_relative_embeddings(raw, window_size, k_channels, length);
-        push_number_array(L, result);
-        return 1;
-    } catch (const std::exception& e) {
-        return luaL_error(L, "loom.pad_crop_relative_embeddings: %s", e.what());
-    }
-}
-
 // Reads a registered module's own raw weight tensor DIRECTLY (via GgufModel::weight(), no graph
 // computation involved) -- needed by VITS's own relative-position tables, which the C++ driver reads
 // straight off the GGUF weight table (`model.weight("enc_p.encoder.attn_layers.{i}.emb_rel_k_raw")`)
@@ -2284,7 +2287,6 @@ LoomLuaBridge::LoomLuaBridge(Backends backends) : L_(luaL_newstate()), backends_
         {"uniform_array", &LoomLuaBridge::l_uniform_array},
         {"expand_by_duration", &LoomLuaBridge::l_expand_by_duration},
         {"expand_by_duration_and_retain", &LoomLuaBridge::l_expand_by_duration_and_retain},
-        {"pad_crop_relative_embeddings", &LoomLuaBridge::l_pad_crop_relative_embeddings},
         {"get_weight", &LoomLuaBridge::l_get_weight},
         {"seed_kv", &LoomLuaBridge::l_seed_kv},
     };
@@ -2333,8 +2335,30 @@ GraphBuilder& LoomLuaBridge::module_builder(Module& mod) {
         mod.builder = std::make_unique<GraphBuilder>(mod.topo, *mod.model, mod.backends, mod.kv_cache,
                                                       /*compute_meta_bytes=*/32 * 1024 * 1024,
                                                       mod.conv_state);
+        mod.builder->hold_compute_buffer(hold_compute_buffers_);
     }
     return *mod.builder;
+}
+
+void LoomLuaBridge::hold_compute_buffers(bool hold) {
+    hold_compute_buffers_ = hold;
+    for (auto& [name, mod] : modules_) {
+        if (mod.builder) mod.builder->hold_compute_buffer(hold);
+    }
+}
+
+size_t LoomLuaBridge::compute_buffer_bytes() const {
+    size_t total = 0;
+    for (const auto& [name, mod] : modules_) {
+        if (mod.builder) total += mod.builder->buffer_size();
+    }
+    return total;
+}
+
+void LoomLuaBridge::release_compute_buffers() {
+    for (auto& [name, mod] : modules_) {
+        if (mod.builder) mod.builder->release_compute_buffer();
+    }
 }
 
 void LoomLuaBridge::load_script(const std::string& lua_source) {

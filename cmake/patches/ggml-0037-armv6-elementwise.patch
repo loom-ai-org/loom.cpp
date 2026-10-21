@@ -1,0 +1,293 @@
+diff --git a/src/ggml-cpu/armv6-eltwise.h b/src/ggml-cpu/armv6-eltwise.h
+new file mode 100644
+index 00000000..05f58c1c
+--- /dev/null
++++ b/src/ggml-cpu/armv6-eltwise.h
+@@ -0,0 +1,158 @@
++#pragma once
++
++// ---------------------------------------------------------------------------------------------
++// ARMv6 ONLY: THE ELEMENTWISE PASSES AT MEMORY SPEED (loom ggml-0037, ADR-079 item P4.32f f2).
++//
++// On the VFP11 ggml's elementwise loops are not memory-bound, they are latency-bound. Per element, on
++// a Pi Zero W over a cold 12.5 MB tensor (loom scripts/bench55.cpp, one thread, RunFast and IEEE alike):
++//
++//                                   stock   here
++//     ADD, same shape              68.3    36.4   (two input streams)
++//     ADD of a [1, C] bias         43.3    11.6   (ggml calls its row loop once PER ELEMENT for it)
++//     MUL by a [1, 1] scalar       43.3    11.6   = memcpy's 11.9: one stream in, one out
++//     LEAKY_RELU                   63.8    23.0   (compute-bound now: 18.9 with the data in L1)
++//
++// Two things cost that. Every loop is one load, one VFP op and one store that waits on it, so the
++// VFP11's 8-cycle latency is paid per element; and nothing prefetches, so every 32-byte line is a full
++// DRAM round trip. The compare in LEAKY_RELU and RELU (`vcmpe` + `vmrs`) also drains the VFP pipeline
++// per element. Here: eight floats per step through `vldmia`/`vstmia`, eight independent VFP ops, one
++// `pld` per input line GGML_ARMV6_ELTWISE_PLD bytes ahead, and the compares done on the integer bits.
++//
++// THE INPUT IS BROUGHT TO A 32-BYTE LINE FIRST. A `vldmia` of eight floats that straddles two lines
++// nearly doubles a cold stream on the ARM1176: the same multiply ran 20.9 ns an element from a buffer
++// 8 bytes off a line and 11.6 from an aligned one, and a plain copy 21.0 against 11.1 (loom
++// scripts/bench55_streams.cpp).
++// ggml's buffers are 32-byte aligned but a row of 551 floats is not, so up to seven elements go scalar.
++// The `pld` distance does not matter: 96 to 1024 bytes all measured within 0.3 ns.
++//
++// EVERY RESULT IS BIT-IDENTICAL to the stock loop: the same IEEE operation on the same operands, in
++// any order, and the integer compares are exactly the VFP's (see ggml_armv6_pos_lo). `pld` on the
++// OUTPUT is not done: the ARM1176 does not allocate on a store, so it only costs a read (P4.32e).
++//
++// GGML_CPU_ARMV6_ELTWISE=0 turns all of it off (read once per process), for A/B runs.
++// ---------------------------------------------------------------------------------------------
++
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#define GGML_ARMV6_ELTWISE 1
++
++#ifndef GGML_ARMV6_ELTWISE_PLD
++#define GGML_ARMV6_ELTWISE_PLD 256
++#endif
++
++static inline bool ggml_armv6_eltwise_on(void) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CPU_ARMV6_ELTWISE");
++        return !(e && atoi(e) == 0);
++    }();
++    return on;
++}
++
++// x > 0 as the VFP decides it is, on the bits: lo <= u <= 0x7f800000 as unsigned. -0, every negative,
++// every NaN, and under RunFast's flush-to-zero (FPSCR.FZ, which makes the compare see a positive denormal
++// as 0) every positive denormal fall outside, so lo is the smallest positive normal under FZ and 1 in
++// IEEE mode. x < 0 is the same range with the sign bit set. (The ggml-0036 epilogue's RELU, same test.)
++static inline uint32_t ggml_armv6_pos_lo(void) {
++    uint32_t f;
++    __asm__ volatile("vmrs %0, fpscr" : "=r"(f));
++    return (f & (1u << 24)) ? 0x00800000u : 1u;
++}
++
++// z = x OP y over n floats, and z = x OP s. z may BE x or y (ggml's in-place ops); it may not partially
++// overlap either, which no ggml graph does.
++#define GGML_ARMV6_BINARY(NAME, INSN, CEXPR)                                                            \
++static inline void ggml_armv6_##NAME(int32_t n, float * z, const float * x, const float * y) {          \
++    for (; n > 0 && ((uintptr_t) x & 31); --n, ++x, ++y, ++z) { const float a = *x, b = *y; *z = CEXPR; } \
++    int32_t blocks = n >> 3;                                                                            \
++    if (blocks) {                                                                                       \
++        __asm__ volatile(                                                                               \
++            "1:\n\t"                                                                                    \
++            "pld [%[x], %[d]]\n\t"                                                                      \
++            "pld [%[y], %[d]]\n\t"                                                                      \
++            "vldmia %[x]!, {s0-s7}\n\t"                                                                 \
++            "vldmia %[y]!, {s8-s15}\n\t"                                                                \
++            INSN " s0, s0, s8\n\t"  INSN " s1, s1, s9\n\t"  INSN " s2, s2, s10\n\t" INSN " s3, s3, s11\n\t" \
++            INSN " s4, s4, s12\n\t" INSN " s5, s5, s13\n\t" INSN " s6, s6, s14\n\t" INSN " s7, s7, s15\n\t" \
++            "subs %[b], %[b], #1\n\t"                                                                   \
++            "vstmia %[z]!, {s0-s7}\n\t"                                                                 \
++            "bne 1b\n\t"                                                                                \
++            : [x] "+r"(x), [y] "+r"(y), [z] "+r"(z), [b] "+r"(blocks)                                   \
++            : [d] "I"(GGML_ARMV6_ELTWISE_PLD)                                                           \
++            : "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13",   \
++              "s14", "s15", "cc", "memory");                                                            \
++    }                                                                                                   \
++    for (int32_t i = 0; i < (n & 7); ++i) { const float a = x[i], b = y[i]; z[i] = CEXPR; }           \
++}                                                                                                       \
++static inline void ggml_armv6_##NAME##_s(int32_t n, float * z, const float * x, float s) {              \
++    for (; n > 0 && ((uintptr_t) x & 31); --n, ++x, ++z) { const float a = *x, b = s; *z = CEXPR; }      \
++    int32_t blocks = n >> 3;                                                                            \
++    if (blocks) {                                                                                       \
++        __asm__ volatile(                                                                               \
++            "vmov s8, %[s]\n\t"                                                                         \
++            "1:\n\t"                                                                                    \
++            "pld [%[x], %[d]]\n\t"                                                                      \
++            "vldmia %[x]!, {s0-s7}\n\t"                                                                 \
++            INSN " s0, s0, s8\n\t" INSN " s1, s1, s8\n\t" INSN " s2, s2, s8\n\t" INSN " s3, s3, s8\n\t" \
++            INSN " s4, s4, s8\n\t" INSN " s5, s5, s8\n\t" INSN " s6, s6, s8\n\t" INSN " s7, s7, s8\n\t" \
++            "subs %[b], %[b], #1\n\t"                                                                   \
++            "vstmia %[z]!, {s0-s7}\n\t"                                                                 \
++            "bne 1b\n\t"                                                                                \
++            : [x] "+r"(x), [z] "+r"(z), [b] "+r"(blocks)                                                \
++            : [d] "I"(GGML_ARMV6_ELTWISE_PLD), [s] "r"(s)                                               \
++            : "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "cc", "memory");                    \
++    }                                                                                                   \
++    for (int32_t i = 0; i < (n & 7); ++i) { const float a = x[i], b = s; z[i] = CEXPR; }              \
++}
++
++GGML_ARMV6_BINARY(add, "vadd.f32", a + b)
++GGML_ARMV6_BINARY(sub, "vsub.f32", a - b)
++GGML_ARMV6_BINARY(mul, "vmul.f32", a * b)
++
++#undef GGML_ARMV6_BINARY
++
++// y = (x > 0 ? x : 0) + ns * (x < 0 ? x : 0) -- ggml_vec_leaky_relu_f32's own arithmetic, with its two
++// compares on the bits. (A plain `x > 0 ? x : ns*x` differs: NaN and -0 both come out +0 here.)
++static inline void ggml_armv6_leaky_relu(int32_t n, float * y, const float * x, float ns) {
++    const uint32_t lo   = ggml_armv6_pos_lo();
++    const uint32_t span = 0x7f800000u - lo;
++    const uint32_t * u  = (const uint32_t *) x;
++    auto one = [&](int32_t j) {
++        const uint32_t b = u[j];
++        const uint32_t p = b - lo <= span ? b : 0u;
++        const uint32_t q = b - (0x80000000u + lo) <= span ? b : 0u;
++        float fp, fq;
++        memcpy(&fp, &p, 4);
++        memcpy(&fq, &q, 4);
++        return fp + ns * fq;
++    };
++    int32_t i = 0;
++    for (; i + 8 <= n; i += 8) {
++        __builtin_prefetch((const char *) (x + i) + GGML_ARMV6_ELTWISE_PLD);
++        float a[8];
++        for (int k = 0; k < 8; ++k) a[k] = one(i + k);
++        for (int k = 0; k < 8; ++k) y[i + k] = a[k];
++    }
++    for (; i < n; ++i) y[i] = one(i);
++}
++
++// y = x > 0 ? x : 0, entirely on the bits
++static inline void ggml_armv6_relu(int32_t n, float * y, const float * x) {
++    const uint32_t lo   = ggml_armv6_pos_lo();
++    const uint32_t span = 0x7f800000u - lo;
++    const uint32_t * u  = (const uint32_t *) x;
++    uint32_t *       v  = (uint32_t *) y;
++    int32_t i = 0;
++    for (; i + 8 <= n; i += 8) {
++        __builtin_prefetch((const char *) (u + i) + GGML_ARMV6_ELTWISE_PLD);
++        uint32_t a[8];
++        for (int k = 0; k < 8; ++k) a[k] = u[i + k] - lo <= span ? u[i + k] : 0u;
++        for (int k = 0; k < 8; ++k) v[i + k] = a[k];
++    }
++    for (; i < n; ++i) v[i] = u[i] - lo <= span ? u[i] : 0u;
++}
++
++#endif
+diff --git a/src/ggml-cpu/binary-ops.cpp b/src/ggml-cpu/binary-ops.cpp
+index 75e38290..c4085e56 100644
+--- a/src/ggml-cpu/binary-ops.cpp
++++ b/src/ggml-cpu/binary-ops.cpp
+@@ -1,4 +1,5 @@
+ #include "binary-ops.h"
++#include "armv6-eltwise.h"
+ 
+ #if defined(GGML_USE_ACCELERATE)
+ #include <Accelerate/Accelerate.h>
+@@ -77,6 +78,21 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
+     }
+ #endif
+ 
++#if defined(GGML_ARMV6_ELTWISE)
++    // ARMv6 (ggml-0037): add/sub/mul over f32 rows at memory speed, bit-identical -- armv6-eltwise.h.
++    // A src1 row of one float (a [1, C] bias, a [1, 1] scale) is the scalar form: ggml's loop below
++    // calls its row function once PER ELEMENT for it.
++    void (*armv6_row)(int32_t, float *, const float *, const float *) = nullptr;
++    void (*armv6_scalar)(int32_t, float *, const float *, float)      = nullptr;
++    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
++        if (ggml_armv6_eltwise_on() && is_src1_contiguous_rows) {
++            if (op == op_add) { armv6_row = ggml_armv6_add; armv6_scalar = ggml_armv6_add_s; }
++            if (op == op_sub) { armv6_row = ggml_armv6_sub; armv6_scalar = ggml_armv6_sub_s; }
++            if (op == op_mul) { armv6_row = ggml_armv6_mul; armv6_scalar = ggml_armv6_mul_s; }
++        }
++    }
++#endif
++
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t i03 = ir/(ne02*ne01);
+         const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+@@ -90,6 +106,21 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
+         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+ 
++#if defined(GGML_ARMV6_ELTWISE)
++        if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
++            if (armv6_row) {
++                if (ne10 == 1) {
++                    armv6_scalar((int32_t) ne00, dst_ptr, src0_ptr, *src1_ptr);
++                } else {
++                    for (int64_t r = 0; r < ne00 / ne10; ++r) {
++                        armv6_row((int32_t) ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
++                    }
++                }
++                continue;
++            }
++        }
++#endif
++
+         if (is_src1_contiguous_rows) {
+             // src1 is broadcastable across src0 and dst in i1, i2, i3
+             const int64_t nr0 = ne00 / ne10;
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 7c224068..74106177 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -17,6 +17,7 @@
+ #include "ggml.h"
+ #include "unary-ops.h"
+ #include "vec.h"
++#include "armv6-eltwise.h"
+ #if defined(GGML_USE_LLAMAFILE)
+ #include "llamafile/sgemm.h"
+ #endif
+@@ -2812,6 +2813,18 @@ static void ggml_compute_forward_leaky_relu_f32(
+     assert(dst->nb[0]  == sizeof(float));
+     assert(src0->nb[0] == sizeof(float));
+ 
++#if defined(GGML_ARMV6_ELTWISE)
++    // ARMv6 (ggml-0037): the same arithmetic with its compares on the bits -- armv6-eltwise.h
++    if (ggml_armv6_eltwise_on()) {
++        for (int i = 0; i < n; i++) {
++            ggml_armv6_leaky_relu(nc,
++                    (float *) ((char *) dst->data  + i*( dst->nb[1])),
++                    (float *) ((char *) src0->data + i*(src0->nb[1])), negative_slope);
++        }
++        return;
++    }
++#endif
++
+     for (int i = 0; i < n; i++) {
+         ggml_vec_leaky_relu_f32(nc,
+                 (float *) ((char *) dst->data  + i*( dst->nb[1])),
+@@ -4925,6 +4938,17 @@ static void ggml_compute_forward_scale_f32(
+ 
+     const size_t nb1 = dst->nb[1];
+ 
++#if defined(GGML_ARMV6_ELTWISE)
++    // ARMv6 (ggml-0037): one pass x * s instead of a memcpy and an in-place scale -- the same product
++    if (b == 0.0f && ggml_armv6_eltwise_on()) {
++        for (int i1 = ir0; i1 < ir1; i1++) {
++            ggml_armv6_mul_s(nc, (float *) ((char *) dst->data + i1*nb1),
++                             (const float *) ((const char *) src0->data + i1*nb01), s);
++        }
++        return;
++    }
++#endif
++
+     if (b == 0.0f) {
+         for (int i1 = ir0; i1 < ir1; i1++) {
+             if (dst->data != src0->data) {
+diff --git a/src/ggml-cpu/unary-ops.cpp b/src/ggml-cpu/unary-ops.cpp
+index 1d834443..c3e2bde7 100644
+--- a/src/ggml-cpu/unary-ops.cpp
++++ b/src/ggml-cpu/unary-ops.cpp
+@@ -1,4 +1,5 @@
+ #include "unary-ops.h"
++#include "armv6-eltwise.h"
+ 
+ static inline float op_abs(float x) {
+     return fabsf(x);
+@@ -128,6 +129,15 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
+         dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
+         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+ 
++#if defined(GGML_ARMV6_ELTWISE)
++        // ARMv6 (ggml-0037): RELU on the bits, bit-identical to op_relu -- armv6-eltwise.h
++        if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, float>) {
++            if (op == op_relu && ggml_armv6_eltwise_on()) {
++                ggml_armv6_relu((int32_t) ne0, dst_ptr, src0_ptr);
++                continue;
++            }
++        }
++#endif
+         vec_unary_op<op>(ne0, dst_ptr, src0_ptr);
+     }
+ }
