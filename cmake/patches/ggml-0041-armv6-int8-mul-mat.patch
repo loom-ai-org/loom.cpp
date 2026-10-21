@@ -1,0 +1,377 @@
+diff --git a/src/ggml-cpu/CMakeLists.txt b/src/ggml-cpu/CMakeLists.txt
+index 71f55b49..aafe8fef 100644
+--- a/src/ggml-cpu/CMakeLists.txt
++++ b/src/ggml-cpu/CMakeLists.txt
+@@ -31,6 +31,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/ggml-cpu.cpp
+         ggml-cpu/repack.cpp
+         ggml-cpu/repack.h
++        ggml-cpu/armv6-i8.cpp
++        ggml-cpu/armv6-i8.h
+         ggml-cpu/hbm.cpp
+         ggml-cpu/hbm.h
+         ggml-cpu/quants.c
+diff --git a/src/ggml-cpu/armv6-i8.cpp b/src/ggml-cpu/armv6-i8.cpp
+new file mode 100644
+index 00000000..5f934ba0
+--- /dev/null
++++ b/src/ggml-cpu/armv6-i8.cpp
+@@ -0,0 +1,312 @@
++// CPU_ARMV6_I8: a dynamic int8 mul_mat for ARMv6 (ARM1176: SIMD32, VFPv2, no NEON), on Q8_0 weights
++// whose 32-element blocks all carry their row's scale. loom ADR-079 P4.33; the weight format is loom's
++// Q8_0_PC (ADR-076), which every other backend reads as ordinary Q8_0.
++//
++// Why int8 on this core: a one-column mul_mat reads every weight once, so it is bound by the DRAM
++// stream, and int8 weights are a quarter of F32's bytes. On a Pi Zero W, one thread, RunFast (loom
++// scripts/bench58.c, weights cold), at Moonshine tiny's decode shapes and Silero's LSTM:
++//
++//     ggml-0033's F32 GEMV (float sum, 4 rows a pass)       297 MB/s of F32 weights
++//     int8, a PLD every 16 B of W (two per 32 B line)       155 MB/s of int8 weights   2.09x
++//     int8, one PLD per 32 B line                           320 MB/s of int8 weights   4.29x   <- this
++//
++// The read ceiling with PLD is 338 MB/s, so both kernels are at the stream bound and the ratio is the
++// bytes. The second PLD to a line already in flight costs as much as the load it was meant to hide.
++//
++// The weights are repacked once, in set_tensor, by channel quad: [N/4][K/4][4] words, so one ldmia
++// takes four channels' next four k, followed by one float scale per row. A tensor whose rows are not
++// uniform is stored as it came and its extra cleared, so ggml's own Q8_0 mul_mat runs it.
++//
++// The activations are quantized per column at run time (symmetric, absmax) into the work buffer, as
++// int16 pairs in the order SXTB16 unpacks a weight word: (x0, x2), (x1, x3). The range is the widest
++// whose K products cannot overflow SMLAD's int32 sum: 32767 up to K = 516, then 2^31 / (128 K).
++// Every output is acc * (sx * sw[n]); a NaN or inf in a column makes that column's outputs NaN.
++
++#define GGML_COMMON_DECL_CPP
++#include "ggml-common.h"
++
++#include "armv6-i8.h"
++
++#include "ggml-backend-impl.h"
++#include "ggml-cpu.h"
++#include "ggml-cpu-impl.h"
++#include "ggml-impl.h"
++#include "simd-mappings.h"
++#include "traits.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++
++// One channel quad against one column: count k-words (even), acc[4] out. Two k-words (32 B of W, one
++// line) a pass with one PLD. r0 = w, r1 = x pairs, r2 = count, r3 scratch (acc's pointer is pushed);
++// r4-r7 the accumulators, r8/r9 = (x0, x2) / (x1, x3), r10-r12/lr the quad's four words.
++__asm__(
++    "    .text\n    .arm\n    .align 4\n    .global ggml_armv6_i8_dot4\n    .type ggml_armv6_i8_dot4, %function\n"
++    "ggml_armv6_i8_dot4:\n"
++    "    push {r3-r11, lr}\n"
++    "    mov r4, #0\n    mov r5, #0\n    mov r6, #0\n    mov r7, #0\n"
++    "1:\n"
++    "    pld [r0, #128]\n"
++    "    ldmia r1!, {r8, r9}\n"
++    "    ldmia r0!, {r10, r11, r12, lr}\n"
++    "    sxtb16 r3, r10\n    smlad r4, r3, r8, r4\n    sxtb16 r3, r10, ror #8\n    smlad r4, r3, r9, r4\n"
++    "    sxtb16 r3, r11\n    smlad r5, r3, r8, r5\n    sxtb16 r3, r11, ror #8\n    smlad r5, r3, r9, r5\n"
++    "    sxtb16 r3, r12\n    smlad r6, r3, r8, r6\n    sxtb16 r3, r12, ror #8\n    smlad r6, r3, r9, r6\n"
++    "    sxtb16 r3, lr\n    smlad r7, r3, r8, r7\n    sxtb16 r3, lr, ror #8\n    smlad r7, r3, r9, r7\n"
++    "    ldmia r1!, {r8, r9}\n"
++    "    ldmia r0!, {r10, r11, r12, lr}\n"
++    "    sxtb16 r3, r10\n    smlad r4, r3, r8, r4\n    sxtb16 r3, r10, ror #8\n    smlad r4, r3, r9, r4\n"
++    "    sxtb16 r3, r11\n    smlad r5, r3, r8, r5\n    sxtb16 r3, r11, ror #8\n    smlad r5, r3, r9, r5\n"
++    "    sxtb16 r3, r12\n    smlad r6, r3, r8, r6\n    sxtb16 r3, r12, ror #8\n    smlad r6, r3, r9, r6\n"
++    "    sxtb16 r3, lr\n    smlad r7, r3, r8, r7\n    sxtb16 r3, lr, ror #8\n    smlad r7, r3, r9, r7\n"
++    "    subs r2, r2, #2\n    bne 1b\n"
++    "    pop {r3}\n"
++    "    stmia r3, {r4-r7}\n"
++    "    pop {r4-r11, pc}\n"
++    "    .size ggml_armv6_i8_dot4, .-ggml_armv6_i8_dot4\n");
++extern "C" void ggml_armv6_i8_dot4(const uint32_t * w, const uint32_t * x, int count, int32_t * acc);
++
++namespace {
++
++// Byte sizes of the blocks the GEMM keeps resident: int16 X columns per L1 pass, int8 W rows per L2
++// pass (loom scripts/bench59.cpp's sweep). GGML_CPU_ARMV6_I8_XB / _WB override them, for the sweep.
++int env_bytes(const char * name, int def) {
++    const char * e = getenv(name);
++    const int v = e ? atoi(e) : 0;
++    return v > 0 ? v : def;
++}
++
++int64_t padded_rows(const ggml_tensor * t) { return (t->ne[1] + 3) & ~int64_t(3); }
++
++size_t packed_size(const ggml_tensor * t) {
++    return (size_t) padded_rows(t) * t->ne[0] + (size_t) padded_rows(t) * sizeof(float);
++}
++
++int x_range(int64_t K) {
++    const int64_t r = INT64_C(2147483647) / (128 * K);
++    return r > 32767 ? 32767 : (int) r;
++}
++
++inline int32_t round_s32(float v) {   // vcvtr: the FPSCR's mode, round to nearest
++    float r;
++    __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(v));
++    int32_t i;
++    memcpy(&i, &r, 4);
++    return i;
++}
++
++// One column into (x0, x2), (x1, x3) word pairs; returns its scale. `poison` sums x * 0, which is 0
++// unless the column holds a NaN or an inf, where it carries a NaN into the scale.
++float quantize_column(const float * x, int64_t K, uint32_t * x2) {
++    float m = 0.0f, poison = 0.0f;
++    for (int64_t k = 0; k < K; ++k) {
++        const float a = fabsf(x[k]);
++        m = a > m ? a : m;
++        poison += x[k] * 0.0f;
++    }
++    const int R = x_range(K);
++    const float inv = m > 0.0f ? R / m : 0.0f;
++    for (int64_t k = 0; k < K; k += 4) {
++        const int32_t q0 = round_s32(x[k] * inv), q1 = round_s32(x[k + 1] * inv);
++        const int32_t q2 = round_s32(x[k + 2] * inv), q3 = round_s32(x[k + 3] * inv);
++        x2[k / 2]     = (uint16_t) q0 | ((uint32_t) (uint16_t) q2 << 16);
++        x2[k / 2 + 1] = (uint16_t) q1 | ((uint32_t) (uint16_t) q3 << 16);
++    }
++    return m / R + poison;
++}
++
++class tensor_traits : public ggml::cpu::tensor_traits {
++    // Columns of src1 in (i11, i12, i13) order; the work buffer holds their int16 pairs, then their scales.
++    static int64_t n_cols(const ggml_tensor * op) { return op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]; }
++
++    bool work_size(int /*n_threads*/, const ggml_tensor * op, size_t & size) override {
++        const int64_t K = op->src[0]->ne[0];
++        size = (size_t) n_cols(op) * (K * 2 + sizeof(float)) + 64;
++        return true;
++    }
++
++    bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {
++        if (op->op != GGML_OP_MUL_MAT) {
++            return false;
++        }
++        const ggml_tensor * src0 = op->src[0];
++        const ggml_tensor * src1 = op->src[1];
++        const int64_t K = src0->ne[0], N = src0->ne[1];
++        const int64_t T = n_cols(op);
++        const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2];
++
++        uint32_t * x2 = (uint32_t *) GGML_PAD((uintptr_t) params->wdata, 32);
++        float *    sx = (float *) (x2 + T * (K / 2));
++        auto src1_col = [&](int64_t c) {
++            const int64_t i11 = c % ne11, i12 = (c / ne11) % ne12, i13 = c / (ne11 * ne12);
++            return (const float *) ((const char *) src1->data + i11 * src1->nb[1] + i12 * src1->nb[2] + i13 * src1->nb[3]);
++        };
++        auto dst_col = [&](int64_t c) {
++            const int64_t i11 = c % ne11, i12 = (c / ne11) % ne12, i13 = c / (ne11 * ne12);
++            return (float *) ((char *) op->data + i11 * op->nb[1] + i12 * op->nb[2] + i13 * op->nb[3]);
++        };
++
++        for (int64_t c = params->ith; c < T; c += params->nth) {
++            sx[c] = quantize_column(src1_col(c), K, x2 + c * (K / 2));
++        }
++        ggml_barrier(params->threadpool);
++
++        // Channel quads in contiguous ranges, one per thread: each thread streams its own rows.
++        const uint32_t * wp = (const uint32_t *) src0->data;
++        const float *    sw = (const float *) ((const char *) src0->data + (size_t) padded_rows(src0) * K);
++        const int64_t Q = padded_rows(src0) / 4, per = (Q + params->nth - 1) / params->nth;
++        const int64_t qa = std::min(Q, params->ith * per), qz = std::min(Q, qa + per);
++        static const int xb = env_bytes("GGML_CPU_ARMV6_I8_XB", 8192), wb = env_bytes("GGML_CPU_ARMV6_I8_WB", 65536);
++        const int64_t cb = std::max<int64_t>(1, xb / (2 * K)), qb = std::max<int64_t>(1, wb / (4 * K));
++        for (int64_t q0 = qa; q0 < qz; q0 += qb) {
++            const int64_t q1 = std::min(qz, q0 + qb);
++            for (int64_t c0 = 0; c0 < T; c0 += cb) {
++                const int64_t c1 = std::min(T, c0 + cb);
++                for (int64_t q = q0; q < q1; ++q) {
++                    const uint32_t * wq   = wp + q * K;
++                    const int64_t    rows = std::min<int64_t>(4, N - 4 * q);
++                    for (int64_t c = c0; c < c1; ++c) {
++                        int32_t acc[4];
++                        ggml_armv6_i8_dot4(wq, x2 + c * (K / 2), (int) (K / 4), acc);
++                        float *     y = dst_col(c) + 4 * q;
++                        const float s = sx[c];
++                        for (int64_t j = 0; j < rows; ++j) {
++                            y[j] = (float) acc[j] * (s * sw[4 * q + j]);
++                        }
++                    }
++                }
++            }
++        }
++        return true;
++    }
++
++  public:
++    static tensor_traits * get() {
++        static tensor_traits t;
++        return &t;
++    }
++};
++
++bool is_candidate(const ggml_tensor * t) {
++    // K % 32 == 0 is Q8_0's own; K / 4 even is what the kernel's two k-words a pass needs.
++    return t->type == GGML_TYPE_Q8_0 && ggml_n_dims(t) == 2 && t->ne[0] % 32 == 0;
++}
++
++enum ggml_status buffer_init_tensor(ggml_backend_buffer_t, ggml_tensor * tensor) {
++    tensor->extra = is_candidate(tensor) ? (void *) tensor_traits::get() : nullptr;
++    return GGML_STATUS_SUCCESS;
++}
++
++void buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    GGML_ASSERT(offset == 0);
++    GGML_ASSERT(size == ggml_nbytes(tensor));
++    if (tensor->extra == nullptr) {
++        memcpy(tensor->data, data, size);
++        return;
++    }
++    const int64_t K = tensor->ne[0], N = tensor->ne[1], nb = K / 32;
++    const block_q8_0 * src = (const block_q8_0 *) data;
++    for (int64_t n = 0; n < N; ++n) {
++        for (int64_t b = 1; b < nb; ++b) {
++            if (src[n * nb + b].d != src[n * nb].d) {
++                GGML_LOG_WARN("%s: %s: row %lld's blocks have different scales, so it is not per-channel int8; "
++                              "ggml's Q8_0 mul_mat runs it\n", __func__, tensor->name, (long long) n);
++                memcpy(tensor->data, data, size);
++                tensor->extra = nullptr;
++                return;
++            }
++        }
++    }
++    const int64_t Np = padded_rows(tensor);
++    uint8_t *     wp = (uint8_t *) tensor->data;
++    float *       sw = (float *) (wp + (size_t) Np * K);
++    for (int64_t n = 0; n < Np; ++n) {
++        const int64_t q = n / 4, j = n % 4;
++        for (int64_t kw = 0; kw < K / 4; ++kw) {
++            uint8_t * dst = wp + (((size_t) q * (K / 4) + kw) * 4 + j) * 4;
++            if (n < N) {
++                memcpy(dst, src[n * nb + kw / 8].qs + (kw % 8) * 4, 4);
++            } else {
++                memset(dst, 0, 4);
++            }
++        }
++        sw[n] = n < N ? GGML_CPU_FP16_TO_FP32(src[n * nb].d) : 0.0f;
++    }
++}
++
++const char * buft_get_name(ggml_backend_buffer_type_t) { return "CPU_ARMV6_I8"; }
++
++ggml_backend_buffer_t buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
++    if (buffer == nullptr) {
++        return nullptr;
++    }
++    buffer->buft              = buft;
++    buffer->iface.init_tensor = buffer_init_tensor;
++    buffer->iface.set_tensor  = buffer_set_tensor;
++    buffer->iface.get_tensor  = nullptr;
++    buffer->iface.cpy_tensor  = nullptr;
++    return buffer;
++}
++
++size_t buft_get_alignment(ggml_backend_buffer_type_t) { return 32; }
++
++size_t buft_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
++    const size_t n = ggml_nbytes(tensor);
++    return is_candidate(tensor) ? std::max(n, packed_size(tensor)) : n;
++}
++
++class extra_buffer_type : public ggml::cpu::extra_buffer_type {
++    bool supports_op(ggml_backend_dev_t, const ggml_tensor * op) override {
++        return op->op == GGML_OP_MUL_MAT && op->src[0]->buffer &&
++               op->src[0]->buffer->buft == ggml_backend_cpu_armv6_i8_buffer_type() && is_candidate(op->src[0]) &&
++               op->src[0]->extra != nullptr && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++               op->src[1]->nb[0] == sizeof(float) &&
++               (op->src[1]->buffer == nullptr || ggml_backend_buft_is_host(op->src[1]->buffer->buft));
++    }
++
++    ggml::cpu::tensor_traits * get_tensor_traits(const ggml_tensor * op) override {
++        if (op->op == GGML_OP_MUL_MAT && op->src[0]->buffer &&
++            op->src[0]->buffer->buft == ggml_backend_cpu_armv6_i8_buffer_type()) {
++            return (ggml::cpu::tensor_traits *) op->src[0]->extra;
++        }
++        return nullptr;
++    }
++};
++
++}  // namespace
++
++ggml_backend_buffer_type_t ggml_backend_cpu_armv6_i8_buffer_type(void) {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CPU_ARMV6_I8");
++        return !(e && e[0] == '0');
++    }();
++    static struct ggml_backend_buffer_type buft = {
++        /* .iface    = */ {
++                           /* .get_name             = */ buft_get_name,
++                           /* .alloc_buffer         = */ buft_alloc_buffer,
++                           /* .alloc_buffer_n       = */ nullptr,
++                           /* .get_alignment        = */ buft_get_alignment,
++                           /* .get_max_size         = */ nullptr,
++                           /* .get_alloc_size       = */ buft_get_alloc_size,
++                           /* .get_alloc_size_n     = */ nullptr,
++                           /* .is_host              = */ nullptr,
++                           },
++        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
++        /* .context = */ new extra_buffer_type(),
++    };
++    return enabled ? &buft : nullptr;
++}
++
++#else
++
++ggml_backend_buffer_type_t ggml_backend_cpu_armv6_i8_buffer_type(void) {
++    return nullptr;
++}
++
++#endif
+diff --git a/src/ggml-cpu/armv6-i8.h b/src/ggml-cpu/armv6-i8.h
+new file mode 100644
+index 00000000..a3e12b02
+--- /dev/null
++++ b/src/ggml-cpu/armv6-i8.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// CPU_ARMV6_I8 (loom ADR-079 P4.33): Q8_0 weights whose blocks share one scale per row (loom's
++// Q8_0_PC, ADR-076) as per-channel int8, for a dynamic int8 mul_mat on ARMv6. NULL on any other ISA,
++// and when GGML_CPU_ARMV6_I8=0.
++ggml_backend_buffer_type_t ggml_backend_cpu_armv6_i8_buffer_type(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index 65beb90b..bb982fa4 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -2,6 +2,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-cpu.h"
+ #include "repack.h"
++#include "armv6-i8.h"
+ #include "traits.h"
+ #include "ggml-impl.h"
+ #include "amx/amx.h"
+@@ -67,6 +68,11 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
+         }
+ #endif
+ 
++        // NULL except on ARMv6 (loom ADR-079 P4.33); weights reach it only by placement, never by default.
++        if (ggml_backend_cpu_armv6_i8_buffer_type()) {
++            bufts.push_back(ggml_backend_cpu_armv6_i8_buffer_type());
++        }
++
+         return bufts;
+     }();
+ 
