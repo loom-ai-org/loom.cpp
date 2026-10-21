@@ -12,8 +12,8 @@
 // input (Citrinet: 53 of 129 convolutions), computed into the convolution's own tensor and carried to
 // the output in one pass.
 //
-// The epilogue is on by default on ARMv6 only; GGML_CPU_CONV_EPILOGUE selects it either way. So this is
-// registered twice, =0 and =1 (ggml reads it once), and pins:
+// The epilogue is off by default (it was on for ARMv6 until ggml-0037 made the unfused passes faster);
+// GGML_CPU_CONV_EPILOGUE=1 selects it. So this is registered twice, =0 and =1 (ggml reads it once), and pins:
 //
 //   1. **The numbers**, against a double-precision reference, in both runs.
 //   2. **That it fuses**: the RELU's (and the depthwise convolution's) own result is poisoned before the
@@ -46,14 +46,11 @@ bool compute(ggml_cgraph* gf, int n_threads) {
     return ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
 }
 
+// Off unless asked for, on every ISA: ARMv6's default went off once ggml-0037 made the unfused passes
+// faster than this epilogue (ADR-079 P4.32f f2 step 3b).
 bool epilogue_on() {
     const char* e = std::getenv("GGML_CPU_CONV_EPILOGUE");
-    if (e != nullptr) return std::atoi(e) != 0;
-#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
-    return true;
-#else
-    return false;
-#endif
+    return e != nullptr && std::atoi(e) != 0;
 }
 
 bool all_poison(const ggml_tensor* t) {

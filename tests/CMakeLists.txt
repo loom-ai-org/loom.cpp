@@ -336,6 +336,45 @@ set_tests_properties(test_conv_epilogue_fusion PROPERTIES ENVIRONMENT
     "GGML_CPU_CONV_EPILOGUE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_conv_epilogue_fusion PROPERTIES DEPENDS test_conv_epilogue_fusion_off)
 
+# ADR-079 P4.32f f2 (ggml-0037): the ARMv6 elementwise passes are bit-identical to ggml's loops. Run
+# with them off and on (ggml reads GGML_CPU_ARMV6_ELTWISE once); the second compares both outputs byte
+# for byte, edge bit patterns included. Elsewhere both runs are stock ggml.
+add_executable(test_eltwise_armv6 ci/test_eltwise_armv6.cpp)
+target_link_libraries(test_eltwise_armv6 PRIVATE loom::engine)
+add_test(NAME test_eltwise_armv6_off COMMAND test_eltwise_armv6)
+set_tests_properties(test_eltwise_armv6_off PROPERTIES LABELS ci)
+set_tests_properties(test_eltwise_armv6_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ELTWISE=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_eltwise_armv6 COMMAND test_eltwise_armv6)
+set_tests_properties(test_eltwise_armv6 PROPERTIES LABELS ci)
+set_tests_properties(test_eltwise_armv6 PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ELTWISE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_eltwise_armv6 PROPERTIES DEPENDS test_eltwise_armv6_off)
+
+# ADR-079 P4.32f f2 (ggml-0038): CONV_TRANSPOSE_1D against an f64 reference over the shapes the ARMv6
+# polyphase driver blocks and pads; run with the driver on (the default) and off (ggml-0009's GEMM).
+add_executable(test_conv_transpose_1d_sweep ci/test_conv_transpose_1d_sweep.cpp)
+target_link_libraries(test_conv_transpose_1d_sweep PRIVATE loom::engine)
+add_test(NAME test_conv_transpose_1d_sweep COMMAND test_conv_transpose_1d_sweep)
+set_tests_properties(test_conv_transpose_1d_sweep PROPERTIES LABELS ci)
+add_test(NAME test_conv_transpose_1d_sweep_off COMMAND test_conv_transpose_1d_sweep)
+set_tests_properties(test_conv_transpose_1d_sweep_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_CONVT=0")
+
+# ADR-079 P4.32f f2 step 3a (ggml-0039): GELU_ERF, SIGMOID, SILU and TANH against f64 and their special
+# values, with the ARMv6 kernels off and on (GGML_CPU_ARMV6_ACT, read once); the second run compares
+# GELU_ERF byte for byte, the one of the four that stays bit-identical. Elsewhere both runs are stock.
+add_executable(test_activations_armv6 ci/test_activations_armv6.cpp)
+target_link_libraries(test_activations_armv6 PRIVATE loom::engine)
+add_test(NAME test_activations_armv6_off COMMAND test_activations_armv6)
+set_tests_properties(test_activations_armv6_off PROPERTIES LABELS ci)
+set_tests_properties(test_activations_armv6_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ACT=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_activations_armv6 COMMAND test_activations_armv6)
+set_tests_properties(test_activations_armv6 PROPERTIES LABELS ci)
+set_tests_properties(test_activations_armv6 PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ACT=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_activations_armv6 PROPERTIES DEPENDS test_activations_armv6_off)
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
@@ -1882,3 +1921,10 @@ target_link_libraries(test_e2e_moss_tts_composition PRIVATE loom::engine)
 add_test(NAME test_e2e_moss_tts_composition COMMAND test_e2e_moss_tts_composition)
 set_tests_properties(test_e2e_moss_tts_composition PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_moss_tts_composition PROPERTIES SKIP_RETURN_CODE 77)
+
+# The engine's FFT and the STFT / ISTFT primitives on it (ADR-080): the FFT against an f64 DFT at every
+# zoo size, each primitive against the convolutions it replaces, and 1 vs 4 threads bit for bit.
+add_executable(test_fft_ops ci/test_fft_ops.cpp)
+target_link_libraries(test_fft_ops PRIVATE loom::engine)
+add_test(NAME test_fft_ops COMMAND test_fft_ops)
+set_tests_properties(test_fft_ops PROPERTIES LABELS ci)

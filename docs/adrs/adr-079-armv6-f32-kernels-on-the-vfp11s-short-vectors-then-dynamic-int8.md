@@ -423,7 +423,7 @@ export with the pass off is byte-identical to the GGUF the board had.
 **`ggml-0036`.** `ggml_cpu_conv_2d_fusion` takes a RELU and then a per-position MUL after the bias (and
 residual); the depthwise fusion takes the MUL. A result that partially overlaps the input is computed
 into the convolution's own tensor and carried to the output in one pass that adds bias, residual, RELU
-and mask, which is bit-identical to the unfused nodes. `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 only.
+and mask, which is bit-identical to the unfused nodes. `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 only (off since step 3b below).
 The first ARMv6 epilogue, a per-element C function, cost as much as the passes it removed (42 ns an
 element after a 1x1 conv, 54 after a depthwise one, against ~48 for a pass): the RELU's `vcmpe` + `vmrs`
 drained the VFP pipeline every element. The shipped one tests the RELU on the integer bits, keep iff
@@ -474,3 +474,184 @@ its 1/3, the LEAKY_RELU fed from a CONT, the transposed conv's bias: VITS 2.3 s,
 f3, a bias epilogue on the ARMv6 GEMM (Moonshine 0.6 s, conformer). **The CSE reaches users only through a
 re-export**: Citrinet's published GGUFs are unchanged until republished, and every family's next export
 merges whatever its topology repeats, so the exporter's snapshot gate will show topology diffs.
+
+## P4.32f f2, measured 2026-10-16: the elementwise passes (`ggml-0037`) and the transposed convolution (`ggml-0038`)
+
+**What f2 was, and what it turned out to be.** f2 was scoped as the vocoders' unfused leftovers (VITS 2.3 s,
+amy 1.6, de051 0.6): the resblock sum and its 1/3, the LEAKY_RELU fed from a crop's CONT, the transposed
+convolution's bias. Two findings changed it. **ggml's elementwise loops are compute-bound on the VFP11, not
+pass-bound:** 50-64 ns an element against 12 for `memcpy`, so the leftovers were slow passes more than
+extra ones, and every model pays the same rate on whatever it does not fuse (Moonshine 1.8 s, conformer 1.4).
+**The transposed convolutions never got an ARMv6 kernel.** The decision table above lists them under P4.32b,
+but `ggml-0032` takes CONV_2D only, and ggml-0009's GEMM reaches tinyBLAS through `ggml_call_mul_mat_ldc`,
+which `ggml-0034` declines (`dst->op != MUL_MAT`). They ran at ~180 MMAC/s: amy 3.5 s, VITS 3.0, de051 0.74,
+larger than the leftovers. **The user took all three, in order:** the elementwise kernels, then the
+transposed convolution, then whatever chain fusion is still worth it (step 3, open).
+
+**`ggml-0037`: ADD, SUB, MUL, SCALE, RELU and LEAKY_RELU at memory speed, bit-identical.** Stock, every
+loop is one load, one VFP op and a store that waits on it, with no prefetch, and a `[1, C]` bias or a
+`[1, 1]` scale calls ggml's row loop once per ELEMENT. The RELUs pay a `vcmpe` + `vmrs` per element.
+`armv6-eltwise.h` runs eight floats a step through `vldmia`/`vstmia` with eight independent VFP ops and a
+`pld` per input line, has a scalar form for a one-float src1 row, and does the RELUs' compares on the
+integer bits (P4.32f f1's test, and LEAKY_RELU's own `max + slope * min` arithmetic, so NaN and -0 come out
+as stock). The input is first brought to a 32-byte line: a `vldmia` that straddles two lines nearly
+doubles a cold stream on the ARM1176. `scripts/bench55.cpp` (Pi Zero W, one thread, a cold 12.5 MB
+tensor, ns an element, the same in RunFast and IEEE mode, every arm bit-identical):
+
+| op | stock | `ggml-0037` |
+|---|---|---|
+| ADD, same shape | 68.3 | 36.4 |
+| ADD of a `[1, C]` bias, MUL by a `[1, 1]` scale | 43.3 | 11.6 (`memcpy` 11.9) |
+| LEAKY_RELU | 63.8 | 23.0 (19 with the data in L1: compute-bound) |
+
+What a stream costs on this core (`scripts/bench55_streams.cpp`): a cold read 10-13 ns an element, a write
+2.6 (the store buffer), `vldmia` and `ldm` alike; a copy from a buffer 8 bytes off a line 21.0 against 11.1
+aligned; one, two or three lines a step 11.6 / 11.4 / 14.1; and the `pld` distance does not matter, 96 to
+1024 bytes within 0.3 ns. **Correctness**: `tests/ci/test_eltwise_armv6.cpp`, registered off and on: every
+op and broadcast form (tails, `[1, C]`, `[1, 1]`, `[T, 1]`, a repeated src1 row, in place) exact against the
+test's own float operations, then all of them again with ±0, denormals, inf and NaN spliced in and the two
+runs compared byte for byte. qemu and x86 pass; four sabotages go red (a NaN kept by the LEAKY, SUB's
+scalar form mapped to ADD, the eight-float tail cut to four, the RELU's FZ bound ignored).
+
+**Gate (wheel v10, `VAR=GGML_CPU_ARMV6_ELTWISE`, 12 models, two ABBA rounds, 20 s settle): every output
+byte-identical between the arms.** Means of the two launches per arm:
+
+| model | off | on | |
+|---|---|---|---|
+| amy / de051 / VITS | 19.29 / 4.66 / 25.88 s | 18.45 / 4.37 / 25.21 | 1.045 / 1.067 / 1.027x |
+| Moonshine tiny F32 / conformer / NER | 34.50 / 9.95 / 6.14 | 33.70 / 9.45 / 5.84 | 1.024 / 1.053 / 1.051x |
+| Citrinet-256-ls F32 (CSE) / Q8_0 | 13.20 / 14.27 | 12.91 / 13.39 | 1.022 / 1.065x |
+| heart / heart-nano (FFT exports) | 2.76 / 1.01 | 2.65 / 0.99 | 1.04 / 1.02x |
+| Silero VAD / WakeHuBERT | 2.91 / 2.58 | 2.90 / 2.60 | 1.00x |
+
+**`ggml-0038`: CONV_TRANSPOSE_1D as polyphase direct convolutions on the `ggml-0032` tiles.** With
+K = J·s, output phase p is an ordinary J-tap convolution over the input padded by J - 1 zeros:
+`y[oc][q·s + p] = Σ_j Σ_ic w[ic][oc][p + (J-1-j)·s] · xpad[ic][q + j]`. Per block of phase positions and
+chunk of input channels (the 0032 blocking), the window is copied once, each quad of output channels runs
+its s phases through the J-tap tile into a per-thread scratch, and the last chunk interleaves into dst: each
+output is written once, and there is no overlap-add. The zoo's upsampling stages are all J = 2 (K = 2s).
+A considered alternative, ggml-0009's GEMM moved onto `ggml-0034`, keeps the overlap-add, which adds K/s
+partial results into every output. `scripts/bench56.cpp`, amy's stages against ggml-0009 + the bias ADD
+(what the model pays today), ms:
+
+| stage | ggml-0009 + bias | `ggml-0038` (TB 64; TB 32 is 3-7% slower) | |
+|---|---|---|---|
+| 192 → 96, s 8, k 16 | 658 | 367 | 1.79x |
+| 96 → 48, s 8, k 16 | 1379 | 751 | 1.84x |
+| 48 → 24, s 4, k 8 | 1870 | 763 | 2.45x |
+
+Not bit-identical: the tile's summation order, 5e-7 to 1e-6 of the peak against an f64 reference (ggml-0009
+1.4e-7 to 2.5e-7). `tests/ci/test_conv_transpose_1d_sweep.cpp` checks every output against f64 over J = 1-4,
+OC % 4 != 0, inputs of 1 and 3 positions, a chunked 300-channel input, several blocks with a ragged last one, a
+K that does not divide by s (the fallback), one and three threads, with the driver on and off. Three
+sabotages go red (the taps reversed, the last block's last position not interleaved, the padding off by one).
+The bias is still the graph's ADD; the tile could seed it for free, which is step 3's.
+
+**Gate (wheel v11, `VAR=GGML_CPU_ARMV6_CONVT`, two ABBA rounds):** amy 18.39 → 16.22 s (**1.134x**), de051
+4.42 → 3.86 s (**1.145x**, RTF 0.88), VITS 25.12 → 23.32 s (**1.077x**). The waveforms move by at most 1.6e-6 of
+the peak (one int16 LSB), each arm is deterministic across rounds, and whisper-small transcribes both arms
+of all three identically. heart and heart-nano, which no longer have a transposed convolution, are
+byte-identical.
+
+**Left of f2 (step 3)**, at the new rates, on amy's last stage (3.1M elements): the two resblock-sum ADDs
+~225 ms, the LEAKY after the crop ~72, the 1/3 and the LEAKY after it ~110, the crop's CONT ~44, the bias
+ADD ~36. About 0.65 s over amy's three stages; the transposed convolution can take the bias, the 1/3 and the
+LEAKY in its window copy and accumulator start.
+
+### Step 3a, measured 2026-10-16: the activations (`ggml-0039`)
+
+**Why activations before the fusions.** A per-node profile on wheel v11, joined with the fusion log, put
+step 3's chain fusions at ~0.4 s on amy, ~0.15 on de051 and VITS. The same profile showed the
+transcendental activations, which no fusion touches: GELU_ERF 0.84 s and TANH 0.29 in Moonshine, TANH 0.36
+and SIGMOID 0.16 in VITS, SILU 0.34 in the conformer. On ARMv6 GELU_ERF runs ggml-0010's scalar rational
+(there is no SIMD body), and the others call glibc per element. **The user took the activations first.**
+Reusing an existing minimax tanh was checked first: the engine has none. Its minimax fits are ATAN's
+(ADR-008) and ggml-0010's erf rational (`scripts/erf_fit.py`).
+
+**Plain C does not win here.** An own `expf` in C ran at 146 ns an element against glibc's 123, and
+interleaving GELU_ERF's rational over four or eight elements bought 1.1x: every value moved between the
+VFP and the core registers, and every clamp's `vcmpe` + `vmrs`, waits for the VFP11's pipeline to drain
+(Retro-012). `scripts/gen_armv6_act_f32.py` generates short-vector kernels instead (`armv6-act-f32.inc`):
+eight elements a pass in two vectors, the clamps and the exponent arithmetic in separate integer passes.
+
+* **GELU_ERF is bit-identical** to ggml-0010's scalar tail: the same IEEE operations in the same order
+  (VFPv2's `vmla` is not fused), the four clamps as integer tests that reproduce the compares exactly,
+  including NaN and, under flush-to-zero, denormals.
+* **SIGMOID, SILU and TANH use an own e^v**, Cephes' single-precision construction (Cody-Waite reduction,
+  a degree-6 polynomial, 2^n added to the exponent field), and Cephes' odd polynomial for tanh below
+  |x| = 0.625. Against f64 over every 11th float with |x| <= 90 (`scripts/bench57_accuracy.cpp`): sigmoid
+  2.40 ULP (glibc 2.39), tanh 1.30 ULP (glibc 2.16). The range ends are asymmetric: 0 once v <= -86.98, inf
+  once v >= 88.37 ([Retro-087](../retros/retro-087-a-worst-error-check-passed-a-nan.md) is what a symmetric
+  bound did). x's sign is ORed onto tanh's small branch, which gives +0 at x = -0 and glibc gives -0.
+
+`scripts/bench57.cpp` (Pi Zero W, one thread, RunFast, data in L1, ns an element; each kernel bit-exact
+against its scalar reference over ~70M bit patterns, on the board):
+
+| op | stock | `ggml-0039` | |
+|---|---|---|---|
+| GELU_ERF | 200.6 (ggml-0010's tail) | 80.9 | 2.48x, bit-identical |
+| SIGMOID / SILU | 160.8 / 162.1 (glibc `expf`) | 75.6 / 76.2 | 2.13x |
+| TANH | 443 (glibc `tanhf`) | 113 | 3.92x |
+
+In IEEE mode the denormal inputs differ from the references: the VFP11 bounces them to the kernel's support
+code, which rounds differently (Retro-086). ggml runs ARMv6 compute threads in RunFast (ggml-0031).
+
+**Correctness.** `tests/ci/test_activations_armv6.cpp`, registered off and on: every output against f64
+(GELU_ERF within ggml-0010's 2.64e-7 of max(|x|, 1), TANH 2 ULP, SIGMOID and SILU 3), with values at both
+ends of the exp range, the special values as stock produces them, rows of 1, 7, 8, 9 and 1003 floats (the
+tail goes through the kernel on a padded copy, so one tensor is one function), in place, and GELU_ERF byte
+for byte between the runs. x86 and qemu pass; five sabotages go red (a GELU Horner constant swapped, the
+ln2 low part dropped, tanh's threshold moved to 0.0625, the tail skipped, and the defect below).
+
+**The gate found a defect the test had passed** (Retro-087): with the first exp range check, SIGMOID and
+SILU returned NaN for x in (88.03, 88.37), heart came out all NaN and the conformer's transcript changed.
+The test's worst-error maximum was NaN-blind. Fixed, and the test now fails on the defect.
+
+**Gate (wheel v13, `VAR=GGML_CPU_ARMV6_ACT`, 12 models, two ABBA rounds).** No NaN anywhere. Moonshine,
+conformer and NER texts, both Citrinet CTC id sequences, and WakeHuBERT's embeddings (GELU only)
+identical; VAD within 4.2e-7; the five TTS waveforms within one int16 LSB, and whisper-small transcribes
+both arms identically.
+
+| model | off | on | |
+|---|---|---|---|
+| heart / heart-nano (FFT exports) | 2.68 / 0.99 s | 2.54 / 0.96 | 1.054 / 1.038x |
+| Silero VAD / NER / WakeHuBERT | 2.93 / 5.92 / 2.63 | 2.85 / 5.79 / 2.60 | 1.027 / 1.022 / 1.014x |
+| VITS / Moonshine tiny F32 / conformer | 24.06 / 34.61 / 9.53 | 23.58 / 34.09 / 9.42 | 1.020 / 1.015 / 1.011x |
+| amy / de051 / Citrinet F32, Q8_0 | 16.21 / 3.93 / 13.09, 13.53 | 16.27 / 3.94 / 13.15, 13.57 | 0.995-0.997x (noise; few activations) |
+
+**Against the profile.** Moonshine's GELU_ERF at 2.48x was worth ~0.5 s; the gate measured 0.52. Step 3's
+chain fusions remain open (~0.4 s on amy).
+
+### Step 3b, measured 2026-10-16: the resblock tail measured out, and `ggml-0036`'s epilogue now off by default
+
+**What was built (`ggml-0040`, not shipped).** The fusion matcher learned a HiFi-GAN stage's tail after a
+resblock convolution's bias and residual: the ADD of the previous resblock's output (or the running sum),
+the MUL by the 1/3 scalar, and the LEAKY_RELU feeding the next transposed convolution, each in the node's
+own arithmetic, applied in the ARMv6 driver's flush with `ggml-0037`'s passes. It was bit-identical in
+`tests/ci` (with the sum's buffer the other operand's, as an allocator places it: the first version
+stored the block before reading that operand) and three sabotages went red.
+
+**It bought nothing on the board** (wheel v14, `VAR=GGML_CPU_CONV_EPILOGUE`, three ABBA rounds): amy
+16.40 → 16.25 s (1.009x), de051 3.93 → 3.93 (1.000x), VITS 23.17 → 23.32 (0.994x). Two reasons, both
+measured before: the tail's passes run on output rows the flush has just stored, which an ARM1176 does not
+cache (43 ns an element against 10, P4.32f f1), so a fused pass costs about what `ggml-0037`'s separate
+pass does; and when the tail's last tensor trips an aliasing check the matcher declines the whole fusion,
+so that convolution also loses its bias at the accumulator start. That is the likely reason amy and de051
+moved by a few ULP between the arms (not traced to a node). **The user shelved it** (the prototype, patch and test, is kept out of tree) and asked for
+the version that could win to stay in the hub: a one-pass short-vector kernel doing residual, sum,
+scale and LEAKY on the block before it is stored, with a back-off to the plain conv + bias fusion when the
+tail cannot alias.
+
+**The same gate exposed f1's epilogue as a regression.** With `GGML_CPU_CONV_EPILOGUE` on, Citrinet F32
+ran 12.53 s off against 13.07 on: `ggml-0037` had made the unfused RELU and mask MUL faster than
+`ggml-0036`'s fused epilogue, which re-reads the stored rows the same way. `ggml-0036` now defaults the
+epilogue OFF everywhere (amended in place; `GGML_CPU_CONV_EPILOGUE=1` still turns it on, and the CI test
+runs both). Re-gated with wheel v15, the default against `=1`, two ABBA rounds, every output byte-identical:
+
+| model | default (off) | `=1` | |
+|---|---|---|---|
+| Citrinet-256-ls F32 (CSE) / Q8_0 | 12.50 / 13.29 s | 12.99 / 13.56 | 1.040 / 1.020x |
+| WakeHuBERT / VITS / Silero VAD | 2.58 / 23.28 / 2.90 | 2.69 / 23.46 / 2.90 | 1.042 / 1.007 / 1.00x |
+
+Citrinet's f1 gain is not lost: the exporter's topology CSE (the half of f1 that needs no kernel) stays,
+and the passes it lined up now run on `ggml-0037`. Citrinet F32 was 14.09 s before f1 and is 12.50 now.
