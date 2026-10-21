@@ -464,6 +464,9 @@ const GraphBuilder::BuildResult& GraphBuilder::build(const DynamicAxes& axes, Ou
         }
     }
     request_f32_precision(gf);
+    // Weights in CPU_REPACK can only be read by a direct F32 mul_mat; every other consumer is pointed at
+    // a plain copy here, before anything is allocated (GgufModel::route_repacked_uses).
+    model_.route_repacked_uses(gf);
     result.graph = gf;
 
     if (backends_.hybrid()) {

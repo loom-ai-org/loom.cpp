@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -104,6 +105,26 @@ public:
 
     ggml_backend_t backend() const { return backend_; }
 
+    // **Weights in ggml's `CPU_REPACK` buffer type** (opt-in: `LOOM_CPU_REPACK=1`, CPU primary only;
+    // `LOOM_CPU_REPACK=kleidiai` uses `CPU_KLEIDIAI` instead, in a `GGML_CPU_KLEIDIAI=ON` build).
+    //
+    // ggml's CPU backend can re-lay a Q4_0 / Q8_0 matrix as interleaved blocks at upload and run its
+    // `mul_mat` through dedicated int8 GEMMs (repack.cpp: Q4_0 for AVX2, NEON dotprod and i8mm; Q8_0 for
+    // dotprod and i8mm). `scripts/bench_xnnpack.cpp` measured 1.6-2.3x on the M1 at the GEMM. ggml picks
+    // that path from the WEIGHT's buffer type alone, so the weight has to be uploaded there.
+    //
+    // The catch is that a repacked tensor is no longer a Q4_0 / Q8_0 tensor to anything but a direct
+    // `mul_mat`: GET_ROWS on a tied embedding, ggml-0013's dequantize of a folded conv kernel, or a view
+    // would read interleaved blocks as if they were plain ones, silently; a `mul_mat` whose activation is
+    // not F32 or is 4-D aborts. A weight's consumers are only known once a graph exists, so `load` places
+    // every eligible weight in the repack buffer and `route_repacked_uses` -- called on every graph
+    // before it is allocated -- points each consumer ggml's repack cannot serve at a PLAIN copy of that
+    // weight, re-read from the file the first time one is needed. That makes it correct whatever the
+    // topology does, at the cost of a second copy of exactly those mixed-use weights.
+    void route_repacked_uses(ggml_cgraph* gf);
+    size_t repacked_count() const { return repacked_.size(); }
+    size_t plain_copy_count() const;
+
     GgufModel(const GgufModel&) = delete;
     GgufModel& operator=(const GgufModel&) = delete;
 
@@ -119,6 +140,19 @@ private:
     // are stored under "<name>". A file always has at least one entry after a successful load() (empty
     // would have thrown LoadError instead).
     std::unordered_map<std::string, std::string> topologies_;
+
+    // CPU_REPACK placement (see route_repacked_uses). Empty unless LOOM_CPU_REPACK is set.
+    struct Repacked {
+        size_t file_offset = 0;      // where the tensor's raw bytes sit in `path_`
+        ggml_tensor* plain = nullptr; // the plain copy, once a consumer needed one
+    };
+    ggml_tensor* plain_copy(ggml_tensor* w);
+    std::string path_;
+    ggml_backend_buffer_ptr repack_buf_;
+    std::unordered_map<const ggml_tensor*, Repacked> repacked_;
+    std::vector<ggml_context_ptr> plain_ctxs_;
+    std::vector<ggml_backend_buffer_ptr> plain_bufs_;
+    std::mutex repack_mutex_;
 };
 
 } // namespace loom
