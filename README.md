@@ -345,7 +345,7 @@ numbers.
 it takes the integer GEMM path. Against it the Pi 4 runs onnxruntime's int8 models, the ones an onnxruntime user would
 pick. Same protocol as the table above: 4 threads (the board's default), each engine launched once per arm, 5 paired
 rounds in ABBA order, cooled to 60 C before every arm, median per engine; onnxruntime is the 1.28.0 PyPI wheel. The
-ratio is onnx/loom, so **`>1.00x` means loom is faster**, and **all ten cells resolve**: each one's paired p10 and p90
+ratio is onnx/loom, so **`>1.00x` means loom is faster**, and **all twelve cells resolve**: each one's paired p10 and p90
 sit on the same side of 1.00x.
 
 **Each time is followed by its real-time factor (RTF) in brackets:** the time divided by the length of the audio, which
@@ -359,8 +359,16 @@ time. The LM row has no audio, so its time stands alone.
 | Moonshine tiny (ASR, jfk 11.0 s) | 1.466 s (0.13) | 1.510 s (0.14) | **1.03x** | 1.120 s (0.10) | 1.503 s (0.14) | **1.34x** |
 | whisper-small (ASR, jfk 11.0 s) | 25.61 s (2.33) | 20.57 s (1.87) | 0.80x | 22.67 s (2.06) | 14.60 s (1.33) | 0.64x |
 | Qwen3-0.6B-Base (LM, 24 tokens) | 16.57 s | 17.60 s | **1.06x** | 5.07 s | 14.23 s | **2.81x** |
+| Pocket TTS (TTS, 4.80 s of audio)² | 9.517 s (1.98) | 18.97 s (3.95) | **1.99x** | 5.315 s (1.11) | 14.17 s (2.95) | **2.67x** |
 
 ¹ onnxruntime is timed from NeMo's mel features, computed outside the timer; loom's time includes its front end.
+² Measured 2026-10-21, after the rest of the table, and each launch is the mean of 3 syntheses after an untimed one
+(`scripts/bench_driver.cpp` against `scripts/bench_pocket_onnx.py`). There is no official ONNX Pocket TTS, so the
+onnxruntime side is the community export [`KevinAHM/pocket-tts-onnx`](https://huggingface.co/KevinAHM/pocket-tts-onnx)
+at `58a6d00` (its fp32 and int8 files) through its own `generate()`. That export holds the `english_2026-04`
+weights, an older release of the same architecture as loom's `english_2026-09`, and it keeps decoding on a second
+thread and attends over a fixed 1000-position cache. Both sides run exactly 60 frames, with the EOS head disarmed, from
+the same 28 text ids and a 126-row `alba` voice.
 
 * **Both engines did the same work in every pair**, checked by one untimed launch of each arm: the same 73 216 VITS
   samples, the same 24 tokens, and the same transcript at each precision except one word of Citrinet (loom Q8_0_PC
@@ -379,6 +387,11 @@ time. The LM row has no audio, so its time stands alone.
   (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `7b6af094`/`39077edf` (whisper) and `4882ce99`/`b93d7779` (Qwen3),
   F32/Q8_0_PC. Both sides run from `scripts/bench_{vits,asr,lm}_loom.cpp` and `scripts/bench_onnx_tasks.py`, whose
   `ctc` and `moonshine` tasks are new with this table.
+* **Pocket TTS did the same work too:** 115 200 samples on every arm. The onnxruntime outputs at both precisions, and
+  the Pi Zero's Q8_0_PC output below, transcribe under whisper-small as the sentence spoken, word for word (it spells
+  "grey" as "gray"). Its GGUFs are
+  md5 `26aa0137`/`6e71ec37`, F32/Q8_0_PC, the files `loom-ai-org/pocket-tts-loom` publishes. The 1.0.0-rc18 release
+  has the same engine code (see the bullet above).
 
 The Pi Zero W has no onnxruntime build, since onnxruntime ships no ARMv6 wheel. So its table weighs loom's two precisions
 against each other on the 1.0.0-rc18 ARMv6 wheel, with RTFs as above: its one core, each model launched once per arm through
@@ -398,6 +411,7 @@ resolves, its three paired rounds all on the same side of 1.00x.
 | sanoTTS de thorsten 0.51M (TTS, 4.40 s of audio) | 3.490 s (0.79) | 3.553 s (0.81) | 0.98x | 0.96–1.01x |
 | VITS piper en-GB miro (TTS, 3.39 s of audio) | 21.96 s (6.48) | 22.16 s (6.51) | 0.99x | 0.98–1.00x |
 | sanoTTS heartnano (TTS, 3.06 s of audio), control | 0.847 s (0.28) | 0.862 s (0.28) | 0.98x | 0.96–1.01x |
+| Pocket TTS (TTS, 4.80 s of audio) | does not fit | 115.0 s (23.96) | — | — |
 
 * **sanoTTS heartnano is the noise floor.** None of its tensors is large enough to quantize, so its Q8_0_PC export is
   byte-identical to its F32 one (md5 `75579b65` for both). Its 0.96–1.01x is what two runs of the same file differ by on
@@ -409,6 +423,9 @@ resolves, its three paired rounds all on the same side of 1.00x.
   Q8_0_PC arm produces one 256-sample frame more than its F32 arm.
 * **DistilBERT-NER is left out:** its F32 GGUF is 261 MB, and with Python beside it that is more than the board's
   427 MB. The first attempt drove the board into swap until sshd stopped answering.
+* **Pocket TTS has no F32 arm for the same reason:** its F32 file is 405 MB. Its 130 MB Q8_0_PC file was timed alone,
+  on 2026-10-21 with the 1.0.0-rc18 release wheel. The time is the median of 3 launches, each launch's first call, on the
+  Pi 4 row's 60 frames. The output hashed the same in all three. 79 of its weights (97 MB) take the ARMv6 int8 path.
 * The wheel is the `integration/rc18` ARMv6 build at engine `d66c2ce` (wheels CI run 39510002375). The GGUFs are
   md5 `0711bf17`/`37a8d3b6` (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `ae4a116f`/`a815c984` (Silero VAD),
   `b3df3baf`/`14df8278` (heart), `be98f1a8`/`6586f559` (WakeHuBERT), `9ae1d8a2`/`241b1bca` (Conformer-CTC),
