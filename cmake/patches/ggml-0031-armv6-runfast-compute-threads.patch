@@ -1,0 +1,76 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 7eb0be56..77f21154 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3076,6 +3076,29 @@ struct ggml_cplan ggml_graph_plan(
+ // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+ 
++// RunFast on ARMv6: the VFP's flush-to-zero and default-NaN modes (FPSCR FZ | DN) for the duration of
++// a graph compute, on every compute thread, restored on the way out so the caller's own floating
++// point (Python, the Lua driver) stays in IEEE mode.
++//
++// In IEEE mode the ARM1176's VFP11 bounces to the kernel's VFP support code, at ~1.1 us against 8 ns
++// for a `vmla`: any denormal operand, any NaN operand, inf - inf, and any effective subtraction between
++// values below 2^-96, because that might underflow. It also does not pipeline back-to-back `vmla`. In
++// RunFast it does all of that in hardware. Measured on a Pi Zero W: `vmla.f32` 0.41 -> 0.59-0.68 GMAC/s
++// on the same instruction stream, and Citrinet-256-ls's F32 card 61 -> 21 s for an 11 s clip, same
++// transcript (BatchNorm-folded dead channels leave weights at ~1e-33, so their accumulators cancel in
++// the range that bounces).
++//
++// The cost is that results below 2^-126 become +0, inputs below it are read as +0, and a NaN result is
++// the default NaN; every other result is bit-identical. ARMv6 only: later cores do this in hardware, so
++// they have nothing to gain. GGML_CPU_RUNFAST=0 turns it off.
++#if defined(__ARM_ARCH) && (__ARM_ARCH == 6) && !defined(__aarch64__) && defined(__ARM_FP)
++#define GGML_CPU_HAS_RUNFAST 1
++#define GGML_CPU_FPSCR_RUNFAST ((1u << 24) | (1u << 25))  // FZ | DN
++static bool ggml_cpu_runfast = true;  // initialized once in ggml_cpu_init(), read-only afterwards
++static inline unsigned ggml_cpu_fpscr_get(void) { unsigned f; __asm__ volatile("vmrs %0, fpscr" : "=r"(f)); return f; }
++static inline void ggml_cpu_fpscr_set(unsigned f) { __asm__ volatile("vmsr fpscr, %0" : : "r"(f) : "memory"); }
++#endif
++
+ // The tensor a chain of views ultimately reads from. A reshape of a convolution's result is a
+ // different ggml_tensor with the same memory, and the fusion below has to see through that.
+ static const struct ggml_tensor * ggml_view_root(const struct ggml_tensor * t) {
+@@ -3493,6 +3516,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     set_numa_thread_affinity(state->ith);
+ #endif
+ 
++#ifdef GGML_CPU_HAS_RUNFAST
++    const unsigned fpscr_mode = ggml_cpu_fpscr_get() & GGML_CPU_FPSCR_RUNFAST;
++    if (ggml_cpu_runfast) {
++        ggml_cpu_fpscr_set(ggml_cpu_fpscr_get() | GGML_CPU_FPSCR_RUNFAST);
++    }
++#endif
++
+     struct ggml_compute_params params = {
+         /*.ith        =*/ state->ith,
+         /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
+@@ -3548,6 +3578,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+     ggml_barrier(state->threadpool);
+ 
++#ifdef GGML_CPU_HAS_RUNFAST
++    // Only the two mode bits go back: the cumulative exception flags raised during the compute stay.
++    if (ggml_cpu_runfast) {
++        ggml_cpu_fpscr_set((ggml_cpu_fpscr_get() & ~GGML_CPU_FPSCR_RUNFAST) | fpscr_mode);
++    }
++#endif
++
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
+ #endif
+@@ -4311,6 +4348,13 @@ void ggml_cpu_init(void) {
+             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+         }
+ 
++#ifdef GGML_CPU_HAS_RUNFAST
++        {
++            const char * env = getenv("GGML_CPU_RUNFAST");
++            ggml_cpu_runfast = !(env != NULL && atoi(env) == 0);
++        }
++#endif
++
+         is_first_call = false;
+     }
+ 
