@@ -7,6 +7,12 @@ tags: [engine, exporter, attention, model-coverage, family-6]
 
 # ADR-028: T5's Relative Attention Bias Is a Mask, and the Driver Builds It
 
+> **Superseded for the ENCODER by [ADR-074](adr-074-t5s-encoder-bias-is-a-gather-over-a-distance-table.md)
+> (2026-10-11).** The encoder now gathers its bias in the graph from a per-distance table the export
+> bucketed with HF's own function, because the driver-built table cost ~5% of a flan-t5-small call. The
+> DECODER still works as this ADR describes, and so does MusicGen's T5 text encoder, which has its own
+> wrapper.
+
 ## Context
 
 T5 has no positional embedding. Every attention score is offset by a learned value chosen by the

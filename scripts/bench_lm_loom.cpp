@@ -66,6 +66,13 @@ int main(int argc, char** argv) {
             {"tokens", prompt},
             {"max_new_tokens", static_cast<double>(n_new)},
             {"eos_token", -1.0},
+            // GREEDY, stated rather than inherited. A driver's sampling defaults are the checkpoint's
+            // (gemma-3-270m-it declares temperature 1.0, top_k 64, top_p 0.95), so without this the
+            // runs below differ by design and the check after them reads a sampler as a leaking KV
+            // cache -- which is exactly how gemma got logged as one on 2026-10-11. Greedy is also what
+            // the onnxruntime side decodes with, so it is the equal-work arm. `temperature <= 0` is
+            // sample_row's argmax shortcut; a driver with no sampling options ignores the key.
+            {"temperature", 0.0},
         }));
     };
 
@@ -78,8 +85,9 @@ int main(int argc, char** argv) {
         const std::vector<double> out = generate();
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (out != warm) {
-            std::fprintf(stderr, "infer_with_past returned different tokens on run %d -- the KV cache "
-                                 "is leaking state across calls, so this timing is meaningless\n", i);
+            std::fprintf(stderr, "infer_with_past returned different tokens on run %d under greedy "
+                                 "decoding -- state is leaking across calls (or the driver ignored "
+                                 "`temperature`), so this timing is meaningless\n", i);
             return 1;
         }
         if (i == 0 || dt < with_past) with_past = dt;
@@ -108,7 +116,16 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < 5 && i < warm.size(); ++i) {
         std::printf("%s%d", i ? ", " : "", static_cast<int>(warm[i]));
     }
-    std::printf("]\n");
+    // And a digest of ALL of them: two arms that agree on five tokens can still part at the sixth
+    // (a repacked GEMM rounds differently from a plain one), and that must show up here.
+    uint64_t fnv = 1469598103934665603ULL;
+    for (double tok : warm) { fnv ^= static_cast<uint64_t>(static_cast<int64_t>(tok)); fnv *= 1099511628211ULL; }
+    std::printf("]  fnv=%016llx\n", static_cast<unsigned long long>(fnv));
+    if (std::getenv("BENCH_PRINT_TOKENS") != nullptr) {
+        std::printf("tokens:");
+        for (double tok : warm) std::printf(" %d", static_cast<int>(tok));
+        std::printf("\n");
+    }
     std::printf("infer_with_past  %6.2f s  (%zu tokens, %.2f tok/s)  best of %d\n",
                 with_past, got, got / with_past, nrun);
     if (refeed) {

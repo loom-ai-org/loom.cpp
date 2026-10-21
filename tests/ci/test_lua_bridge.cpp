@@ -1,5 +1,5 @@
 // Exercises LoomLuaBridge's host-math bindings (loom.range/causal_mask/zero_mask/argmax_row/seed_rng/
-// gaussian_array/uniform_array/expand_by_duration/pad_crop_relative_embeddings) and the
+// gaussian_array/uniform_array/expand_by_duration) and the
 // load_script()/call() plumbing
 // in isolation, bypassing loom.run_subgraph entirely (no GGUF/GraphBuilder needed) -- same "bypass the
 // full pipeline, test each piece against a hand-computed expectation" discipline as
@@ -71,9 +71,6 @@ int main() {
             return loom.expand_by_duration(inputs.rows_flat, inputs.T, inputs.C, inputs.durations)
         end
 
-        function test_pad_crop(inputs)
-            return loom.pad_crop_relative_embeddings(inputs.raw, inputs.window_size, inputs.k_channels, inputs.length)
-        end
     )lua");
 
     // --- loom.range ---
@@ -222,23 +219,6 @@ int main() {
                                     {"durations", std::vector<double>{2, 1}}});
         const auto& arr = std::get<std::vector<double>>(result);
         LOOM_CHECK((arr == std::vector<double>{1, 2, 1, 2, 3, 4}));
-    }
-
-    // --- loom.pad_crop_relative_embeddings: window_size=1,k_channels=1,raw=[10,20,30] ---
-    {
-        // length=1 (< window_size+1=2): crops down to just the middle row.
-        auto result_crop = bridge.call("test_pad_crop", {{"raw", std::vector<double>{10, 20, 30}},
-                                                           {"window_size", 1.0},
-                                                           {"k_channels", 1.0},
-                                                           {"length", 1.0}});
-        LOOM_CHECK((std::get<std::vector<double>>(result_crop) == std::vector<double>{20}));
-
-        // length=3 (> window_size+1=2): zero-pads by 1 on each side.
-        auto result_pad = bridge.call("test_pad_crop", {{"raw", std::vector<double>{10, 20, 30}},
-                                                          {"window_size", 1.0},
-                                                          {"k_channels", 1.0},
-                                                          {"length", 3.0}});
-        LOOM_CHECK((std::get<std::vector<double>>(result_pad) == std::vector<double>{0, 10, 20, 30, 0}));
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

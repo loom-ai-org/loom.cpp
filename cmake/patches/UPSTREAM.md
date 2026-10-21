@@ -1401,6 +1401,457 @@ with the CPU waveform 0.08 → 0.950 (CUDA 0.949), the same on coopmat2 and on K
 Cost, median of 10, interleaved: Supertonic-2 39.8 → 44.8 ms, Citrinet-1024 14.1 → 15.9 ms, F5-TTS
 2558 → 2598 ms, whisper-small and Parakeet-TDT unchanged.
 
+## PR 26 — `cpu`: `soft_max` with XNNPACK's exponential, a vector max and a sum that keeps its accuracy
+
+*(`cmake/patches/ggml-0029-soft-max-xnnpack-kernels.patch`)*
+
+**Problem.** A `soft_max` row is four passes: copy, scale, mask; a scalar max; `ggml_vec_soft_max_f32`;
+a final scale. Two of them are slow for reasons that have nothing to do with the arithmetic.
+`ggml_vec_max_f32` is a dependent scalar compare per element. `ggml_vec_soft_max_f32` reduces each
+vector horizontally into a double, a serial add chain the exponentials wait on. And `ggml_v_expf`, accurate
+over the whole real line, leaves its fast path for a three-way blend whenever a vector holds an |n| > 126. A
+causal or padding mask puts -inf in up to half of every row, so masked rows cost twice as much as dense ones:
+49.3 ms dense against 101.9 ms with an F16 causal mask, 12 heads x 1500 x 1500 on one AVX2 thread.
+XNNPACK's `softmax_nc_f32` does the dense case in 29.0 ms on the same box.
+
+**Change.** The exponentials are XNNPACK's `f32-raddstoreexpminusmax` kernels with their constants unchanged
+(`avx2-rr2-p5`, `neonfma-rr1-p5`, `scalar-rr2-p5`; BSD-3, notice carried in the source). On aarch64 XNNPACK's own config picks `rr1-lut64-p2`, but rr1_p5 measured faster on both the A72 (2%) and the M1 (20%) at the same accuracy, and needs no table. They only take
+x - max <= 0 and zero everything below the denormal cutoff with a mask, -inf included, so they never branch. The
+max gets four vector accumulators (`f32-rmax`). The sum does NOT follow XNNPACK, whose f32 accumulators
+raise |sum - 1| from 1.3e-7 to 7.1e-7 on these rows. Each unrolled step adds its vectors in f32 (four values
+per lane, never more than the old loop) and widens that one vector into f64 vector accumulators. The copy, scale
+and mask become one pass, and a plain softmax (no mask, scale 1) reads the source row directly. AVX-512, SSE2,
+SVE and RVV keep their existing loops. The scalar fallback (ARMv6, 32-bit ARM) moves from libm `expf` to the
+scalar kernel.
+
+**Accuracy** (through `ggml_soft_max_ext` against an f64 softmax: plain, scale 0.125, F32 and F16 causal masks,
+ALiBi 8, a 77-wide row for the tails). On AVX2 every metric (|sum - 1|, max abs, max rel) is the same or better.
+On aarch64 (qemu) nothing gets worse by more than 5%. On ARMv6 (qemu, bit-identical to the board) the old scalar loop was the most accurate of all, because it added every element into a double. The new one does the same (|sum - 1| 6.5e-8 → 6.8e-8), but the 1.96-ulp exponential in place of libm's 0.5 moves max abs 3.6e-8 → 5.0e-8 and max rel 6.4e-7 → 7.2e-7. That is still below every SIMD path's error before the patch. The exponentials alone, over every exponent band of
+[-87, 0]: rr2_p5 1.96 ulp max (`ggml_v_expf` 1.92), NEON rr1_p5 4.73 ulp max at -87, where the result is ~1e-38. On a
+row, the error comes from the sum, not the exponential.
+
+**Measured**, 12 x 1500 x 1500, best of 5-7, before/after interleaved, two runs each (dense / F16 causal mask):
+Ryzen 3 3250U 1t 49.3 → 34.1 ms (1.45x) / 101.9 → 49.7 (2.05x), XNNPACK dense 29.0 ms. Pi 4 (A72) 1t
+347.7 → 165.3 (2.10x; XNNPACK's own margin there 2.05x) / 418.5 → 195.2 (2.14x); 4t 0.98x / 1.08x (memory-bound).
+M1 Pro 1t 18.07 → 11.74 (1.54x; XNNPACK's 1.29x) / 23.11 → 13.50 (1.71x); 8t 1.24x / 1.60x. Pi Zero (2 heads)
+1105 → 756 (1.46x; XNNPACK's 1.97x) / 1289 → 1117 (1.15x). **The scalar kernel must not compute on -inf**: as first
+ported (XNNPACK zeroes at the end), a causal mask made the Pi Zero 18x SLOWER (22.4 s), because the ARM1176's VFP
+traps inf - inf = NaN, and denormals, to software. An early return fixed that but lost the dense gain (no
+interleaving across the unrolled four). The kernel replaces sub-cutoff inputs by 0 before the arithmetic (a
+predicated move) and zeroes the result after. Of the x86 dense gain, 6% is skipping the copy for a plain softmax.
+
+**A gate it moves, and why that gate is not evidence.** loom's CosyVoice3 free-running check (waveform rmse < 2e-2
+against PyTorch) goes 0.0027 → 0.0157 (cloned voice 0.0069 → 0.0333, which fails). The teacher-forced flow mel is
+unchanged (rmse 1.390e-4 → 1.397e-4). A control with this patch's structure but ggml's OWN exponential, which
+differs from v0.26 only in the rounding order of the row sum, lands at 0.0343. So a one-ulp perturbation of
+attention moves that free-running waveform anywhere in 0.003-0.034: it measures chaos, not this kernel.
+On two more sentences (one per voice) every build transcribes to the reference's words (whisper-small), and the
+log-mel distance stays inside PyTorch's own f32-vs-f64 spread. loom's bound is now 6e-2, set from that spread.
+
+## PR 27 — `cpu`: tinyBLAS F32 keeps its rate at large K (K chunks and a B block sized from the caches)
+
+*(`cmake/patches/ggml-0030-tinyblas-f32-k-chunks.patch`)*
+
+**Problem.** tinyBLAS streams all of K for every RM x RN tile, and a job reuses one block of BN x RN columns
+of B across all of A's row tiles. The A strip (RM x K x 4 bytes) outgrows a 32 KB L1D at K = 2048, and the B
+block outgrows its share of L2. On a Pi 4 (Cortex-A72, GCC's 4x3 tile, BN = 24), the F32 `mul_mat`
+768 x 1500 x K falls from 8.5 GFLOP/s at K <= 768 to 5.1 at K = 3072 and 4.3 at K = 4096 on one core,
+and from 24.2 to 12.7 / 11.1 on four (the four-thread knee is at K = 1024, where four B blocks overflow the
+shared 1 MB L2). Whisper's `fc2` and Qwen3's `down_proj` are K = 3072. The M1 (128 KB L1D, 12 MB L2) is flat
+through K = 3072.
+
+**Change.** F32 x F32 only, and only when KN divides K. The B block is capped at half of L2. Inside a job, every
+tile advances one K chunk before any advances the next, with the chunk sized to keep the A strip at 3/8 of L1D
+(768 on a 32 KB L1). Chunking starts at K >= 2 chunks. The tile's vector accumulators are carried between
+chunks as raw vectors, and the reduction happens once at the end, so every output is the same sum in the same
+order. **The result is bit-identical** to the unchunked path (FNV hash of every output, every K, on AVX2, the
+A72 and the M1; and a CosyVoice3 end-to-end gate reproduces the unpatched numbers to every printed digit).
+Cache sizes come from sysfs on Linux and `hw.perflevel0.*` on Apple. Where neither answers, nothing changes.
+On the M1 the derived chunk is 3072, so these shapes are untouched (forcing a 512 chunk there cost 3%).
+
+**Measured**, Pi 4, 768 x 1500, best of 3, before/after interleaved with a 60 s cool-down, two runs that agree
+(GFLOP/s, 1 thread | 4 threads): K = 768 8.5 → 8.5 | 24.1 → 23.8; K = 1536 7.7 → 7.6 | 18.2 → 20.6;
+K = 2048 6.4 → 6.9 | 14.9 → 18.4; K = 3072 5.05 → 6.84 (1.35x) | 12.7 → 17.9 (1.41x); K = 4096 4.31 → 6.06
+| 11.1 → 16.5. Whisper's `fc1` shape (3072 x 1500 x 768) unchanged. It recovers about two thirds of the drop.
+The rest is the A stream past L2 itself.
+
+## PR 28 — `cpu`: RunFast (flush-to-zero, default NaN) on ARMv6 compute threads
+
+*(`cmake/patches/ggml-0031-armv6-runfast-compute-threads.patch`)*
+
+**Problem.** The ARM1176's VFP11 (Raspberry Pi 1 / Zero) runs only the easy cases in hardware. In the
+default IEEE mode it bounces to the kernel's VFP support code, at ~1.1 us against 8 ns for a `vmla.f32`:
+any denormal operand, any NaN operand, inf - inf, and any effective subtraction between values at or
+below 2^-96 (it might underflow). It also does not pipeline back-to-back `vmla` in IEEE mode. A
+BatchNorm-folded checkpoint with dead channels (weights ~1e-33) bounces on most of its 1x1 conv MACs,
+and that runs Citrinet-256-ls 2.8x slower than it needs to.
+
+**Change.** On `__ARM_ARCH == 6` with VFP only: `ggml_graph_compute_thread` sets FPSCR's `FZ | DN` on
+entry, which every compute thread runs (the caller's included), and puts back just those two bits on
+exit. The cumulative flags survive, and the caller's own floating point stays in IEEE mode.
+`GGML_CPU_RUNFAST=0` turns it off. Read once in `ggml_cpu_init`.
+
+**Numerics.** A denormal input reads as +0 and a denormal result becomes +0, and a NaN result is the
+default NaN. Every other result is bit-identical. On a Pi Zero W across eleven models (ASR, TTS, NER,
+F32 and quantized): ten outputs bit-identical, one TTS waveform with 24 int16 samples one LSB apart
+(same whisper transcript); tensor-level, one CTC model's log-probs within 9.6e-7 of the peak, the rest
+bit-identical. glibc's libm agrees with "flush in, flush out" for every function the CPU ops call, except
+`logf` of a denormal argument (-103.97, where a flush predicts -inf). Note that qemu-user flushes to a
+*signed* zero, so it does not reproduce the board bit for bit in this mode.
+
+**Measured**, Pi Zero W, one inference per launch, two rounds ABBA, IEEE → RunFast: Citrinet-256-ls F32
+55.9 → 20.1 s (2.79x); sanoTTS heart 7.4 → 5.5 s (1.33x); piper-style voices 1.14-1.15x; VITS
+66.9 → 60.0 s (1.12x); Moonshine tiny F32 1.10x; Q8_0/Q4_0 models 1.02-1.09x. No model is slower.
+
+## PR 29 — `cpu`: 1-D convolutions on the ARM1176's VFP short vectors
+
+*(`cmake/patches/ggml-0032-armv6-shortvec-conv1d.patch`; generated by loom's `scripts/gen_armv6_conv_f32.py`)*
+
+**Problem.** The ARM1176 (Raspberry Pi 1 / Zero) has no float SIMD, and ggml's ARMv6 F32 convolutions run
+on scalar `vmla` at 0.25-0.65 GOP/s. The vocoders of the TTS models spend 64-83% of a Pi Zero run there
+(1-D convolutions, k = 3-7, dilation 1-5, 12-64 channels, tens of thousands of steps). But the VFP11 has
+short vectors: with FPSCR `LEN = 4`, a data-processing op whose destination is outside bank 0 is four ops,
+and a bank-0 operand is a scalar. That makes it a 4-wide FMAC with a broadcast, at up to 0.94 GMAC/s.
+No compiler emits it, because every compiled function assumes `LEN = 0`.
+
+**Change.** On ARMv6 with VFP only, `ggml_compute_forward_conv_2d_impl` first offers every 1-D, stride-1,
+F32 convolution with k = 2..11 to a new path. A quantized kernel arrives here already dequantized. Per
+block of 128 output steps and chunk of input channels (sized so the chunk's window rows and one quad's
+weights fit 12 KB of the 16 KB L1), the path copies the window out in C, applying zero padding and a
+fused `LEAKY_RELU`. Then, for each quad of output channels, a generated asm function runs the block's
+4-channel x 4-step tiles. It sets `LEN = 4` once, runs integer loops and VFP code only, calls nothing,
+and clears `LEN` before it returns. The first chunk starts the accumulators from the bias, and each later
+chunk continues from the partial sums in the output tile. A fused residual is added as each block is
+flushed. A result written over the input (ggml-alloc does that to a vocoder's convolutions) is held until
+the next block's window is copied. A ragged block computes whole tiles into staging and flushes only its
+steps. The weights are packed `[OC/4][IC][k][4]` per call, and a partial last quad is padded with zero
+channels. `GGML_CPU_ARMV6_CONV=0` turns the path off.
+
+**Safety.** Linux clears `LEN` and `STRIDE` for a signal handler, restores the interrupted FPSCR on
+sigreturn, and saves it per thread. That was checked on a Pi Zero W under ~118k signals that landed inside
+a `LEN = 4` kernel, in RunFast and in IEEE mode, with sabotage turning the check red (loom ADR-079 gate 1,
+`scripts/armv6_shortvec_gate.c`). qemu-user does NOT clear `LEN` for a handler.
+
+**Numerics.** Each output is bias plus the sum over input channels (outer) and taps (inner), in order, with
+no FMA. That is a different summation order from the paths it replaces, so outputs move at rounding level.
+
+**Measured**, Pi Zero W, one thread, RunFast, the seven vocoder shapes of loom's `bench49` as ggml graphs
+(`scripts/bench50.cpp`, conv + fused bias): 13.4-13.5 s → 5.03-5.06 s (2.67x), 1.16 GOP/s, which is at or
+above the standalone kernel's rate on every shape. End to end, two rounds ABBA, path off → on: piper-style
+voices amy 39.8 → 22.9 s and de051 8.41 → 4.84 s, VITS 60.3 → 34.8 s (1.73-1.74x), with whisper transcripts
+identical in both arms. Models without such convolutions are bit-identical. The input-channel chunks
+(the first version held the whole window and ran the dilated and wide shapes at 0.35-0.58 GOP/s) took the
+models' own slow shapes 8.73 → 5.56 s and VITS a further 34.6 → 25.3 s, amy 22.9 → 18.6 s, with
+bit-identical outputs.
+
+## PR 30 — `cpu`: a one-column F32 `mul_mat` on ARMv6, 3.5x faster
+
+*(`cmake/patches/ggml-0033-armv6-f32-gemv.patch`)*
+
+**Problem.** On the ARM1176 (Raspberry Pi 1 / Zero), `llamafile_sgemm` declines n = 1, so a decoder step
+or an LSTM step reaches `ggml_vec_dot_f32` once per output. With no `GGML_SIMD` on this core, that is the
+scalar branch: a float product summed in double, one dependent chain per output. A 288 x 32768 F32
+vocabulary projection streams its weights at 92 MB/s, where the board reads 338 MB/s with PLD.
+
+**Change.** On ARMv6 with VFP only, `ggml_compute_forward_mul_mat` first offers an F32 x F32 product with
+one column to a GEMV that runs four rows per pass, each a float sum of float products in k order. Rows are
+split into contiguous ranges of four per thread. `GGML_CPU_ARMV6_GEMV=0` turns it off.
+
+**Numerics: not bit-identical.** The scalar branch sums in double; this sums in float, as every SIMD build
+of `vec_dot_f32` already does (in another order). The first version kept the double sum and was
+bit-identical, at 274 MB/s; the float sum was taken for the speed, and gated on the board across loom's
+model zoo (see ADR-079 in loom.cpp).
+
+**Measured**, Pi Zero W, one thread, RunFast, tensors in a CPU backend buffer (loom `scripts/bench51.cpp`),
+MB/s of weights at row strides of 1152 B / 1 KB / 2 KB / 3 KB / 4 KB:
+
+| variant | 1152 B | 1 KB | 2 KB | 3 KB | 4 KB |
+|---|---|---|---|---|---|
+| `vec_dot_f32` (stock) | 92 | 92 | 92 | 93 | 92 |
+| double sum, 4 rows (bit-identical) | 274 | | 236 | | |
+| float sum, 8 rows | 317 | 135 | 147 | 124 | 50 |
+| **float sum, 4 rows** | **318-325** | **294-298** | **270** | **267-269** | **108-119** |
+
+Eight row streams thrash the 4-way 16 KB L1 at most strides, so four it is. A PLD per row and cache line
+cost 10% (247 on the double sum). Placement matters on this core: the same kernel and bytes ran 216 MB/s
+from a 4-byte-aligned context allocation (page offset 340) and 274 from an 8-byte-aligned one.
+
+## PR 31 — `cpu`: F32 GEMM, 1x1 and strided convolutions on ARMv6's VFP short vectors
+
+*(`cmake/patches/ggml-0034-armv6-f32-gemm.patch`, on top of PR 29's kernels)*
+
+**Problem.** On the ARM1176, F32 `mul_mat` with n >= 2 runs ggml-0018's scalar 4x4 tinyBLAS tile at
+0.29-0.50 GOP/s, and a 1x1 convolution runs through im2col into the same tile. PR 29's short-vector
+kernel already holds a 4x4 GEMM tile at k = 1: per input row, a vector of four positions times four
+scalars.
+
+**Change.** (1) PR 29's convolution path also takes k = 1, with a 32-step block, because a tap-less window
+row lets a chunk take many more input channels. (2) A graph `MUL_MAT` node with F32 x F32 operands,
+n >= 24 and M % 4 == 0 runs the same kernel. The window is a transposed block of the weights, `[K chunk]
+[32 rows]`, the scalars are four columns of the activation packed `[N/4][K][4]` once per call, and each
+accumulator vector is a contiguous 4-float piece of a `dst` row, written in place. K is chunked to L1 and
+each later chunk continues from the partial sums. A partial last quad of columns goes through a scratch.
+`ggml_graph_plan` sizes the work buffer for it. **Graph nodes only:** `ggml_call_mul_mat*` (the
+convolutions' im2col fallback) calls `mul_mat` with its own patches in `wdata`, which the packing would
+overwrite. `GGML_CPU_ARMV6_GEMM=0` turns the GEMM off. (3) PR 29's odd-k kernels take input channels in
+pairs instead of copying the double buffers back after each one. The copy cost as many FMAC cycles as the
+four `vmla`s at k = 1. Results are bit-identical; the vocoders' shapes got 5-7% faster. (4) Any stride, by
+phases: a stride-S convolution is a stride-1 one over IC * S virtual channels (channel c, phase p holding
+x[c][t * S + p]) with ceil(k / S) taps each, so the window copy gathers the phases, the weights are
+re-indexed once, and the kernels stay the stride-1 ones (dilation must then be 1).
+
+**Numerics.** Each output is a plain float sum over k in order. For K <= 512 that is bit-identical to
+tinyBLAS_F32_ARMV6, which sums each K block from zero only above 512.
+
+**Measured**, Pi Zero W, one thread, RunFast (loom `scripts/bench51.cpp gemm`, `scripts/bench50.cpp
+citrinet`): Moonshine tiny's prefill GEMMs 0.29-0.38 → 0.76-0.79 GOP/s (2.1-2.6x), conformer-ctc-small's
+FFN (n = 75) 0.54 → 0.76, Citrinet-256-ls's 1x1 convolutions 0.51 → 0.77 (1.52x). The n threshold
+comes from a sweep: n = 16 0.47 against 0.49, n = 24 0.56 against 0.49. Moonshine tiny's strided stem
+(288 -> 576, k = 7, stride 3) 0.235 → 0.82 GOP/s. End to end, two rounds ABBA against PR 29 + 30:
+Citrinet-256-ls Q8_0 29.0 → 16.9 s and F32 20.0 → 16.2 s for an 11 s clip, conformer-ctc-small 11.0 → 9.3 s,
+Moonshine tiny F32 47.0 → 32.8 s and Q8_0 65.7 → 58.9 s (both with the stem), sanoTTS heart 5.04 → 4.33 s,
+same transcripts.
+
+## PR 32 — `cpu`: depthwise 1-D convolutions on ARMv6's VFP short vectors
+
+*(`cmake/patches/ggml-0035-armv6-shortvec-depthwise.patch`; generated by loom's `scripts/gen_armv6_dw_f32.py`)*
+
+**Problem.** On the ARM1176, `CONV_2D_DW` with one row (a depthwise 1-D convolution) runs PR 18's interior
+sweep, one `ggml_vec_mad_f32` per tap, which is scalar on a core without float SIMD: 0.041 GMAC/s.
+Citrinet-256-ls spends 4.1 s of an 11 s clip there on a Pi Zero W. PR 29's tile does not apply, because a
+depthwise convolution has no input channels to reuse a weight across.
+
+**Change.** On ARMv6 with VFP only, `ggml_compute_forward_conv_2d_dw_whcn_impl` sends each row of a
+stride-1, dilation-1, F32 depthwise convolution with K >= 2 and at least 8 outputs to a generated kernel.
+It is one function per K % 8, with the first 8 taps peeled when K >= 8. Per channel, the row and the
+weights are copied into padded scratch (the kernel reads ahead), which also makes an output written over
+its own input safe. The kernel holds 8 outputs as short vectors over a ring of 8 input registers, and its
+vector operands wrap around the bank, so the window is renamed by the unroll and never moved. A tap is two
+`vmla` and two scalar loads. It PLDs the next channel's row, one line per block. The fused bias and RELU of
+PR 19 apply to the finished row as before. The row loop counts the channel instead of taking an int64
+`%` per row, which is a library call on 32-bit ARM (3% of the path). `GGML_CPU_ARMV6_DW=0` turns it off.
+
+**Numerics.** Each output is two float sums, the even taps and the odd taps, each in k order, then added:
+a short-vector `vmla` waits for the previous one on the same destination (~14 cycles), and one sum per
+output left the kernel at 14 cycles a tap instead of ~10. That differs from the sweep's single sum at rounding level
+(3.2e-7 of peak on Citrinet's schedule).
+
+**Measured**, Pi Zero W, one thread, RunFast (loom `scripts/bench52.cpp`, Citrinet-256-ls's 104 stride-1
+depthwise calls, K = 5..41): 4.14 s → 0.38 s through `ggml_backend_graph_compute` (0.041 → 0.45 GMAC/s,
+10.9x); the kernel alone 0.48-0.50 GMAC/s, against 0.29 for a C version with the same window renaming.
+End to end, two rounds ABBA: Citrinet-256-ls F32 17.9 → 14.0 s and Q8_0 18.1 → 14.3 s for an 11 s clip,
+same CTC ids; conformer-ctc-small, sanoTTS and WakeHuBERT 1.01-1.02x.
+
+## PR 33 — CPU backend: a RELU and a time mask in the convolution epilogue
+
+*(`cmake/patches/ggml-0036-conv-epilogue-fusion.patch`, on top of PRs 5, 7, 19, 29 and 32)*
+
+**Problem.** NeMo's convolutional encoders (Citrinet, QuartzNet, Jasper) end every sub-block with
+`MUL(RELU(ADD(conv, bias)), mask)`, where `mask[t] = t < length` is one value per position broadcast over
+the channels, and multiply every depthwise convolution's output by the same mask. PRs 5 and 7 fold the
+bias into the convolution; the RELU and the MUL stayed two more passes over the activation, and on a Pi
+Zero W each pass costs ~48 ns an element. PR 5/7's fusion also declined 53 of Citrinet-256-ls's 129
+convolutions outright: the graph allocator had placed the bias ADD's result a few hundred floats ahead of
+the convolution's input, a PARTIAL overlap no kernel can write while still reading the input.
+
+**Change.** `ggml_cpu_conv_2d_fusion` also takes, after the bias (and residual) ADD, a `RELU` and then a
+`MUL` whose other operand is `[OL, 1]` -- one value per output position. `ggml_cpu_conv_2d_dw_fusion`
+takes the same `MUL` after a depthwise convolution. A fused result that partially overlaps the input is
+computed into the convolution's own tensor (which the allocator never overlaps with its input, since the
+convolution runs while the input is live), and one pass applies bias, residual, RELU and mask on the way
+to the output. Kernels that cannot apply the epilogue themselves get one pass after them. All of it is
+behind `GGML_CPU_CONV_EPILOGUE`, off by default. (It shipped on by default on ARMv6. PR 34 then made the
+unfused RELU and MUL passes 2-4x faster there, and this epilogue, which re-reads output rows the
+convolution has just stored, became the slower of the two: Citrinet-256-ls 12.53 s off against 13.07 on.
+Upstream it is worth taking only with the epilogue applied before the store.)
+
+On ARMv6 (PRs 29 and 32) the epilogue is a few short passes over a block still in L1: the RELU as an
+integer test on the bits, keep iff `lo <= u <= 0x7f800000` unsigned (lo = 0x00800000 under RunFast's
+flush-to-zero, 1 in IEEE mode), which is exactly `(v > 0) ? v : 0` -- the VFP compare plus `vmrs` it
+replaces stalled the pipeline every element -- and the bias add and mask multiply unrolled by four. The
+depthwise kernel writes a scratch row first: an ARM1176's L1 does not allocate on a store, so an epilogue
+reading back the row just stored to the output missed on every line (43 ns an element, 10 in cache).
+
+**Numerics.** Bit-identical to the unfused nodes: the RELU and the MUL are the same operations in the same
+order, and the partial-overlap path adds the bias after the convolution as the unfused ADD does. The
+integer RELU was checked against the VFP's compare on the board over 17.1M bit patterns (every class:
+denormals, -0, inf, NaN) in both FPSCR modes.
+
+**Measured**, Pi Zero W, one thread, RunFast (loom `scripts/bench53.cpp`, Citrinet's 256-channel shapes):
+at T = 551 the RELU + mask after a 1x1 convolution cost +17 ms as two passes and +3.7 ms fused; the mask
+after a depthwise convolution +7.0 ms and +1.55 ms. End to end, with loom's exporter also merging the
+mask's 239 identical subgraphs into 4 (ggml expands a node's sources depth first, so a mask rebuilt before
+each use lands between the RELU and its MUL, and the fusion never sees them adjacent): Citrinet-256-ls
+F32 14.0-14.4 → 13.1-13.3 s and Q8_0 14.3-14.5 → 13.5-13.6 s for an 11 s clip (1.06-1.08x), logits byte-identical
+with the epilogue on and off; VITS, WakeHuBERT and Silero VAD within noise.
+
+## PR 34 — `cpu`: ADD, SUB, MUL, SCALE, RELU and LEAKY_RELU at memory speed on ARMv6
+
+*(`cmake/patches/ggml-0037-armv6-elementwise.patch`; independent of the others, and FZ-aware for PR 28's RunFast)*
+
+**Problem.** On an ARM1176 (Pi Zero, Pi 1) the elementwise ops are compute-bound, not memory-bound: each
+loop is one load, one VFP op and a store that waits on the op's 8-cycle latency, and nothing prefetches.
+A `[1, C]` bias over `[T, C]`, or a `[1, 1]` scale, is worse: `apply_binary_op` calls its row function
+once per element (`ne10 == 1`). The RELUs pay a `vcmpe` + `vmrs` per element, which drains the VFP
+pipeline. Measured over a cold 12.5 MB tensor: ADD 68 ns an element, a bias ADD or scalar MUL 43, LEAKY_RELU
+64, against 12 for `memcpy`.
+
+**Change.** A header, `armv6-eltwise.h`, ARMv6 only (`__ARM_FEATURE_SIMD32 && !__ARM_NEON`): add/sub/mul
+over f32 rows and their scalar forms eight floats a step through `vldmia`/`vstmia`, eight independent VFP
+ops and one `pld` per input line, after a scalar head that brings the input to a 32-byte line (a `vldmia`
+that straddles two lines nearly doubles a cold stream on this core: 21 vs 11 ns for a copy). RELU and
+LEAKY_RELU compare on the integer bits: `x > 0` is `lo <= u <= 0x7f800000` unsigned, `lo` the smallest
+positive normal under FPSCR.FZ (the compare sees a positive denormal as 0) and 1 in IEEE mode; LEAKY_RELU
+keeps its own `max(x, 0) + slope * min(x, 0)` arithmetic. `apply_binary_op` (F32 only), the RELU in
+`apply_unary_op`, `leaky_relu_f32` and `scale_f32` (one pass `x * s` instead of `memcpy` and an in-place
+scale) call it. `GGML_CPU_ARMV6_ELTWISE=0` turns it off.
+
+**Numerics.** Bit-identical by construction (the same IEEE operations on the same operands), and checked:
+every op and broadcast form, with ±0, denormals, inf and NaN in the inputs, byte for byte against the stock
+loops under RunFast; twelve models' outputs byte-identical with it on and off.
+
+**Measured**, Pi Zero W, one thread: same-shape ADD 68.3 → 36.4 ns an element, bias ADD / scalar MUL 43.3
+→ 11.6 (`memcpy` 11.9), LEAKY_RELU 63.8 → 23.0. End to end 1.02-1.07x on ten of twelve models (amy 1.045x,
+de051 1.067x, conformer 1.053x, Citrinet Q8_0 1.065x), neutral on the other two.
+
+## PR 35 — `cpu`: CONV_TRANSPOSE_1D as polyphase direct convolutions on ARMv6
+
+*(`cmake/patches/ggml-0038-armv6-conv-transpose-1d-polyphase.patch`, on top of PRs 9 and 29)*
+
+**Problem.** A stride-s transposed convolution runs as a GEMM `[Cout*K, Cin] x [Cin, L]` and an overlap-add
+(PR 9). On ARMv6 the GEMM reaches tinyBLAS through `ggml_call_mul_mat_ldc` at ~180 MMAC/s, and the
+overlap-add adds K/s partial results into every output. In the TTS vocoders (HiFi-GAN-style upsampling,
+K = 2s) these nodes were 13-20% of a synthesis on a Pi Zero W.
+
+**Change.** With K = J·s, output phase p is a J-tap convolution over the input padded by J - 1 zeros:
+`y[oc][q·s + p] = Σ_j Σ_ic w[ic][oc][p + (J-1-j)·s] · xpad[ic][q + j]`. On ARMv6 (when K % s == 0 and
+J <= 11) the op runs as s such convolutions per quad of output channels on PR 29's register-tiled
+kernels, sharing one input window per block and chunk of input channels, into a per-thread scratch that
+the last chunk interleaves into dst: every output is written once. The weights are repacked
+`[p][Cout/4][Cin][J][4]` each call. `ggml_graph_plan` reserves the larger of the two paths' work buffers.
+`GGML_CPU_ARMV6_CONVT=0` turns it off.
+
+**Numerics.** Not bit-identical: the tile's summation order, 5e-7 to 1e-6 of the peak against f64 (the GEMM
+path 1.4e-7 to 2.5e-7). Three vocoders' waveforms move by at most one int16 LSB.
+
+**Measured**, Pi Zero W, one thread, against PR 9 plus the bias ADD: 658 → 367, 1379 → 751 and 1870 → 763
+ms on a piper vocoder's three upsampling stages (1.79-2.45x); end to end 1.077-1.145x on three vocoders.
+
+## PR 36 — `cpu`: GELU_ERF, SIGMOID, SILU and TANH on ARMv6's VFP short vectors
+
+*(`cmake/patches/ggml-0039-armv6-activations.patch`; the kernels generated by loom's
+`scripts/gen_armv6_act_f32.py`, on PR 29's short-vector discipline)*
+
+**Problem.** On an ARM1176 there is no SIMD body for these: GELU_ERF runs PR 10's rational in its scalar
+tail, the others call `expf`/`tanhf` per element. 200, 160 and 443 ns an element on a Pi Zero W. Plain C does
+not fix it: every VFP-to-core transfer and every `vcmpe` + `vmrs` drains the VFP11's pipeline, and an own
+`expf` in C ran slower than glibc's.
+
+**Change.** Generated short-vector kernels (FPSCR LEN = 4), eight elements a pass, with the clamps and the
+exponent arithmetic done in integer passes over a small scratch. GELU_ERF performs PR 10's tail's
+operations in its order. SIGMOID, SILU and TANH use Cephes' single-precision `expf` (Cody-Waite, a degree-6
+polynomial, 2^n added to the exponent field, with asymmetric range ends: 0 once v <= -86.98, inf once
+v >= 88.37) and Cephes' small-|x| tanh polynomial. A row's last n % 8 run through the same kernel on a
+padded copy. `GGML_CPU_ARMV6_ACT=0` turns it off; `GGML_CPU_DISABLE_GELU_ERF_SIMD` still selects libm.
+
+**Numerics.** GELU_ERF bit-identical to PR 10's scalar tail (under RunFast; in IEEE mode the VFP11 bounces
+denormal operands to the kernel's support code). SIGMOID 2.40 ULP and TANH 1.30 ULP against f64 (glibc 2.39
+and 2.16); special values as glibc's.
+
+**Measured**, Pi Zero W, one thread: GELU_ERF 200.6 → 80.9 ns an element, SIGMOID / SILU 161 → 76, TANH
+443 → 113. End to end 1.01-1.05x on eight of twelve models (sanoTTS heart 1.054x, Moonshine 0.52 s), the
+rest neutral; transcripts unchanged.
+
+## PR 37 — `cpu`: a dynamic int8 `mul_mat` for ARMv6, on Q8_0 weights with one scale per row
+
+*(`cmake/patches/ggml-0041-armv6-int8-mul-mat.patch`; loom ADR-079 P4.33, weights from ADR-076's `Q8_0_PC`)*
+
+**Problem.** On an ARM1176 (no NEON) a Q8_0 `mul_mat` runs `vec_dot_q8_0_q8_0` in scalar C, at about half
+the speed of PR 30/31's F32 kernels, so a quantized model is smaller and slower. A one-column `mul_mat` (a
+decoder step, an LSTM step) is bound by the weight stream, where int8 is a quarter of F32's bytes.
+
+**Change.** An extra buffer type, `CPU_ARMV6_I8`, registered only on ARMv6 (and not with
+`GGML_CPU_ARMV6_I8=0`). `set_tensor` checks that every block of a row carries the same F16 scale and
+repacks the row quad by quad (`[N/4][K/4][4]` words of int8, then one float scale per row); a tensor whose
+rows are not uniform is stored as it came and its `extra` cleared, so ggml's own Q8_0 path runs it.
+`compute_forward` quantizes each activation column to int16 (symmetric absmax, the widest range whose K
+products cannot overflow SMLAD's int32 sum: 32767 up to K = 516, then 2^31 / (128 K)) into the work buffer,
+then each thread streams its own channel quads: SXTB16 + SMLAD in asm, one PLD per 32-byte line, F32 out as
+`acc * (sx * sw[n])`. A NaN or inf in a column makes that column's outputs NaN.
+
+**Numerics.** Integer accumulation, exact; the test holds both kernels to that contract bit for bit,
+including the overflow bound (every product at -128 x full range, K = 3072).
+
+**Measured**, Pi Zero W, one thread, cold weights (loom `scripts/bench58.c`): 4.29x over PR 30's F32 GEMV on
+all seven decode shapes (Moonshine tiny's 288 x 32768 vocabulary projection 126.9 -> 29.4 ms, 320 MB/s of
+int8 against the board's 338 MB/s PLD read ceiling). A PLD every 16 bytes instead, two per line, ran at
+half that (2.09x).
+
+## PR 38 — `cpu`: int8 GEMM tiles for PR 37 from 16 columns
+
+*(`cmake/patches/ggml-0042-armv6-int8-gemm-tiles.patch`; the tiles generated by loom's
+`scripts/gen_armv6_i8_gemm.py`)*
+
+**Problem.** PR 37's kernel computes one channel quad against one column. As a GEMM it is compute-bound
+at 0.70-0.76 GOP/s, a tie with PR 31's F32 GEMM at n >= 32 (loom `scripts/bench59.cpp`).
+
+**Change.** From 16 columns, a 2-column x 4-channel tile on int16 operand pairs (8 SMLADs and 6 loads per
+K pair, 128 or 16 pairs unrolled, accumulators in memory between K chunks of 512). The weights of a group
+of channel quads are unpacked to int16 pairs into an 8 KB block that stays in L1, a block of 16 column
+pairs keeps its accumulators in L1, and x streams past both with a PLD 128 bytes ahead. Each of these was
+measured (loom `scripts/bench61.c`): on the Pi Zero a line from its L2 costs ~100 cycles, as much as one
+from DRAM, so the tile ran 1.8 GOP/s on L1-resident operands and 0.78 with x from L2; the PLD took that to
+1.45, and moving the accumulators out of a buffer over all T (which evicted the W block) to 1.0 inside the
+driver.
+
+**Numerics.** The same contract as PR 37, to the bit.
+
+**Measured** (loom `scripts/bench60.cpp`, against PR 31's F32 GEMM as the engine runs it, quantize
+included): 0.92-1.01 GOP/s, 1.22-1.40x at K <= 288 (Moonshine tiny's encoder, Citrinet's 1x1 convolutions,
+WakeHuBERT, sanoTTS heart), 1.09-1.13x at K = 704-1152, 1.66-2.04x at n = 16-64, and 3.8-12.8x on
+DistilBERT-sized K = 768-3072 at n = 16, where PR 31 does not apply.
+
+## PR 39 — `cpu`: pointwise convolutions on PR 37's buffer type, and no conv fusion over a packed kernel
+
+*(`cmake/patches/ggml-0043-armv6-int8-pointwise-conv.patch`)*
+
+**Problem.** A convolution whose kernel sits in an extra buffer type cannot take the direct path: the CPU
+device declines a node whose source is not in a host buffer, and a caller that asks first (loom does) falls
+back to im2col and a `mul_mat`. With every per-channel weight in PR 37's buffer, two convolutional models
+ran slower than F32 on a Pi Zero W (Citrinet-256-ls 0.86x, WakeHuBERT tiny 0.89x). Worse, the CPU graph
+loop tries its conv fusions before an extra buffer type's `compute_forward`, so a `CONV_2D` + bias `ADD`
+over a packed kernel would run the fused kernel on bytes that are not Q8_0.
+
+**Change.** `CPU_ARMV6_I8` accepts `ggml_conv_2d_direct_packed` with a 1x1 kernel and no padding, at any
+stride: the same GEMM, its columns the output positions, read across the channels at the input's channel
+stride (every s-th position) and written down the output's. Any other convolution over a kernel there is
+declined by `supports_op` and aborts in `compute_forward` (no other path can read the kernel). The conv
+fusion matcher declines a kernel in a non-host buffer.
+
+**Numerics.** PR 37's contract, to the bit, at stride 1 and 2, with the bias ADD after it.
+
+## PR 40 — `cpu`: PR 37's quantize and epilogue out of the VFP11's and the write buffer's way
+
+*(`cmake/patches/ggml-0044-armv6-int8-quantize-epilogue.patch`)*
+
+**Problem.** Timed inside a model on a Pi Zero W, the activation quantize and the output epilogue around
+PR 38's tiles cost ~1.1 s and ~1.0 s of Citrinet-256-ls's 6.7 s of int8 GEMM. Each absmax compare was a
+`vcmp` whose `vmrs` drains the VFP11's pipeline. Each `vcvtr` result was moved to a core register (another
+drain). `int64_t` loop indices made gcc spill and redo `(c / 2) * K` in 64 bits per element. The output
+address went through three software 64-bit divisions per column per channel group. And a channels-first
+output was written column by column, 16 rows at a time, which the write buffer cannot merge.
+
+**Change.** The absmax is an integer max over the floats' bit patterns, with the sign bit cleared: the
+order of the patterns is the order of the values, and any NaN or inf is a pattern >= 0x7f800000, which makes
+the column's scale NaN. Conversions are stored from the VFP to a scratch that integer code packs. The loops
+count in `int` and walk pointers, with a PLD per line in the absmax pass. Column addresses are computed
+once per op. A channels-first output is written row by row across the column block.
+
+**Numerics.** Unchanged to the bit (PR 37's test).
+
+**Measured** (Pi Zero W, jfk, one run each): Citrinet-256-ls `Q8_0_PC` 10.6 -> 9.7 s, Moonshine tiny 27.6
+-> 26.9 s.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the

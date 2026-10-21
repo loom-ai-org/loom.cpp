@@ -1,0 +1,402 @@
+---
+type: adr
+status: held
+date: 2026-10-11
+domain: performance
+tags: [cpu, int8, qs8, static-quantization, calibration, armv6, pi-zero, citrinet, exporter, ggml-patch]
+---
+
+# ADR-077: Static Int8 for Citrinet-256 on the Pi Zero, Behind Gates That Can Stop It
+
+Step 4 of the LiteRT/XNNPACK queue in the [hub](../backlog/active-index.md#engine--performance). Serves
+[Epic-05](../epics/epic-05-edge-performance.md) and [Epic-03](../epics/epic-03-model-coverage.md)
+(Citrinet-256-ls). Shares the weight format of
+[ADR-076](adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md), and
+puts its kernels in ggml patches per [ADR-014](adr-014-patch-ggml-rather-than-write-kernels.md).
+**Proposed:** each gate below can stop it, in order. **Held 2026-10-14 (user) at option 2, after gate 1's
+cross-model analysis:** the F32 kernels it surfaced and its option 1 go ahead under
+[ADR-079](adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md), which also says why
+static int8 is held and what would reopen it. Gates 3-4 below were not run.
+
+## Context
+
+Citrinet-256-ls is the zoo's best candidate for real-time ASR on a Pi Zero W, and it misses. jfk
+(11.0 s) takes **37.5 s at Q8_0, RTF 3.4** (64.0 s at F32). **76% of that is the 1x1 convolutions**:
+~6 GFLOP at ~0.22 GFLOP/s, run as F32 because a Q8_0 conv dequantizes its kernel (ggml-0013). The
+other 24% (9.0 s: depthwise convs at k = 11-41, squeeze-excitation, residual adds, ReLU, the front
+end) has not been split by op. The model is 21 blocks of 5 repeats of depthwise conv -> 1x1 conv
+256 -> 256 -> ReLU, with strides that take jfk's 1100 frames to 550, 275 and 138.
+
+**The hub's estimate was taken against the wrong baseline.** "RTF 3.4 -> ~1.5 from the GEMMs alone"
+applied XNNPACK `qs8`'s 3.9x over ggml's Q8_0 `mul_mat` (0.15 GFLOP/s). Citrinet does not run that
+path; it runs the F32 conv sweep at 0.22. Against what it does run, with the rates measured on the
+board (`bench_xnnpack.cpp`, VITS and whisper shapes, flat at K <= 1344):
+
+| GEMM engine on the 1x1 convs | rate (GOP/s) | 1x1 convs | whole jfk | RTF |
+|---|---|---|---|---|
+| today (F32 sweep over a dequantized Q8_0 kernel) | 0.22 | 28.5 s | 37.5 s | 3.4 |
+| XNNPACK `qd8` (dynamic; scalar on ARMv6) | 0.23-0.32 | ~22 s | ~31 s | ~2.8 |
+| XNNPACK `qs8` (static; ARMSIMD32, 2x2c4 tile) | 0.54-0.62 | 10.6 s | 19.6 s | **~1.8** |
+| infinitely fast | - | 0 | 9.0 s | 0.82 |
+
+So **int8 GEMMs alone cannot reach real time on this board.** Even an infinitely fast GEMM leaves
+RTF 0.82. Real time (<= 11.0 s) needs the other 24% made faster as well: for instance 1x1 convs at
+~1.2 GOP/s (5.2 s) and the rest at 1.55x (5.8 s).
+
+What XNNPACK offers on ARMv6 (`src/configs/*-config.c` at the pinned commit):
+
+* **int8 GEMM:** `qs8_qc8w` 1x2c4 / 2x2c4 ARMSIMD32 tiles.
+* **No SIMD kernel** for `qd8` (scalar 1x2), the int8 depthwise conv (`3p1c/9p1c/25p1c__scalar_fmagic`)
+  or the int8 add (`scalar_u1`).
+
+The ARMv6 instruction bound is SMLAD's two 16x16 MACs per cycle, 4 GOP/s at 1 GHz. That is an upper
+bound, not an estimate; XNNPACK reaches 15% of it. loom's own ARMv6 int8 kernel (`tinyBLAS_Q0_ARMV6`,
+Q4_0 x Q8_0) measured 0.34 GOP/s.
+
+**`qd8` vs `qs8` is not dynamic vs static here.** Both inner loops are int8 x int8 -> int32. On ARMv6
+their 2x gap is which kernels XNNPACK happens to carry. Static int8 buys exactly two things over a
+dynamic int8 GEMM: no per-op activation quantize, and int8 storage and arithmetic for the non-GEMM 24%.
+
+## Options
+
+1. **Dynamic int8 GEMM, F32 elsewhere** (ADR-076's shape, with an ARMv6 kernel). No calibration, no
+   new ops, drop-in for any Q8_0_PC export. Capped at 9.0 s + GEMM time: RTF >= ~1.3 even at 1.2 GOP/s.
+2. **Static int8 through the whole encoder** (LiteRT's full-int8). Calibrated activation scales, int8
+   tensors between ops, quantized variants of five ops. The only option whose ceiling is below RTF 1.
+3. **Fewer FLOPs** (a smaller checkpoint). Out of scope; the 10M model is already the family's leaf.
+
+## Decision
+
+**Option 2 is the target design, built in the order of option 1 first,** because its first
+deliverable (a fast ARMv6 int8 GEMM) is option 1's whole content and is worth having on its own.
+
+* **Weights:** per-channel int8 as row-uniform Q8_0 (`--quantize Q8_0_PC`, ADR-076), with BatchNorm
+  folded into the conv weights and biases at export.
+* **Activations:** int8, per-tensor asymmetric (scale, zero point). The scales come from calibration
+  at export, over LibriSpeech clips, and are written as node attributes in the topology.
+* **Graph:** the exporter fuses ReLU into each requantization clamp and the residual add into an int8
+  add with rescale. It wraps F32 islands (mel front end, the SE gate's sigmoid, the CTC `log_softmax`)
+  in explicit `QUANTIZE` / `DEQUANTIZE` nodes. It emits the encoder channels-last, so that a 1x1 conv
+  is a plain `mul_mat` and no transposes are needed.
+* **Kernels, in ggml patches:** on NEON and x86, ADR-076's bridge carries XNNPACK's `qs8` kernels. On
+  ARMv6 they are loom's own, in the `tinyBLAS_Q0_ARMV6` lineage, because XNNPACK's ARMv6 coverage is a
+  2x2 GEMM and scalar code elsewhere.
+
+**Gates, in order. Each one can stop the work:**
+
+1. **Split the 9.0 s by op on the board** (the profiler, one thread). If no op in it gets faster as
+   int8 on ARM1176 than as VFP F32 in a microbenchmark, option 2 reduces to option 1 and stops there.
+2. **An ARMv6 int8 GEMM at >= 1.2 GOP/s** on `[T x 256] x [256 x 256]`, T = 138-550, measured in
+   `bench_xnnpack.cpp` beside XNNPACK's 0.54-0.62. Below that, real time is out of reach (above), and
+   the gain is option 1's.
+3. **WER** on the 73 LibriSpeech-dummy clips, against F32's 9.39%, with the threshold fixed before
+   the first run, plus a tensor oracle on the log-probs (a WER alone hid an encoder defect before).
+4. **jfk on the Pi Zero, cooled and paired**, against the Q8_0 card's 37.5 s.
+
+## Gate 1, measured 2026-10-14: the split, with the verdict held for a cross-model analysis
+
+**The split.** The profile of the Q8_0 card (rc16, jfk, one thread, 35.9 s of node time):
+
+| op | s | what it is | does int8 remove it? |
+|---|---|---|---|
+| `CONV_2D` (1x1) | 27.4 | the GEMMs | gate 2 |
+| `CONV_2D_DW` | 4.90 | depthwise, K = 5-41, 107 calls | measured below: no |
+| `MUL` | 1.31 | NeMo's padding mask before every conv, the identity at batch 1 | no: skip or fuse it |
+| `ADD` | 0.78 | the 1x1 conv's bias, plus the residuals | no: a GEMM epilogue in either precision |
+| `UNARY` | 0.59 | ReLU, the SE gate's sigmoid | no: same |
+| the rest | ~0.8 | front end (`SQR`, `CONCAT`, `PAD`, mel `MUL_MAT`), the SE gates' small GEMMs | no |
+
+BatchNorm is already folded at export (conv, then a bias `ADD`, then `RELU`). The 148 full-size `ADD`s
+are about one per 1x1 conv plus the residuals, so ggml-0005's bias fusion apparently does not fire on
+this conv path. That is not confirmed yet.
+
+**The depthwise convolutions** (`scripts/bench43.cpp`): the whole jfk schedule replayed on the board,
+best of 5, in two rounds that agree within 2%. Every arm was verified before it was timed: `f32` is equal to
+ggml bit for bit, and `i8` is exact against an int64 reference.
+
+| arm | jfk's 107 dw convs | GMAC/s | |
+|---|---|---|---|
+| ggml today (ggml-0021: a scalar `vec_mad` sweep per tap) | 3.96 s | 0.044 | |
+| F32, 8-output register block, unrolled window | 0.67 s | 0.262 | 5.9x |
+| **F32, same, VFP in RunFast (FZ \| DN)** | **0.50 s** | 0.348 | **7.9x** |
+| int8 SMLAD (SXTB16 unpack, SMMULR/SSAT requant) | 0.68 s | 0.258 | 0.74x of RunFast F32 |
+
+**No op in the 9.0 s gets faster as int8 than as VFP F32 in this microbenchmark**, so by this gate's
+rule as written option 2 would reduce to option 1. The ceilings (`scripts/bench44.c`) bound how wrong
+that could be. SMLAD with the loads a kernel needs is ~1.07 GMAC/s, and `vmla` is 0.41 GMAC/s in IEEE
+mode and 0.59-0.68 in RunFast. The int8 depthwise kernel sits at ~24% of its ceiling and F32 at ~55%,
+so a tuned int8 depthwise conv might reach ~2x F32: at most ~0.25 s of jfk against 0.50 s.
+
+**The verdict is held (user, 2026-10-14), because the rule asks too narrow a question.** It weighs
+one model's non-GEMM ops, and the ~0.25 s undercounts static int8 three ways:
+
+* **It leaves out the activation quantize**, which static int8 removes from every GEMM. Gate 2 below
+  measures it at 0.78 s of jfk's 5.75 s, before a channels-last layout.
+* **The int8 depthwise arm got C, not asm.** The GEMM went from 0.64 to 1.20 GOP/s between those two
+  (gate 2), so the int8 depthwise number is not yet that arm's best.
+* **A family of ARMv6 int8 kernels serves every model on the board, not just Citrinet.**
+  [ADR-026](adr-026-armv6-is-the-floor-and-gets-its-own-kernels.md) already accepts kernels written
+  for this tier alone. The question is what the family buys across the zoo, not across one model.
+
+### The analysis that decides gate 1
+
+1. **Models:** every zoo model that runs on the Pi Zero. That means the hub's Pi Zero set (Citrinet-256-ls,
+   Moonshine tiny, sanoTTS heart-nano, the piperlite voices) and the P7 set (VITS, conformer-ctc,
+   distilbert-ner), plus any small model whose op mix differs (a VAD, a wake word). The first step fixes
+   that list.
+2. **Per model, a one-thread profile by op on the board**, as above, so that every op class carries
+   seconds rather than a guess.
+3. **Per op class, the best F32 kernel (IEEE and RunFast) against the best int8 kernel**, each at the
+   same level of effort (asm where either arm needs it) and each read in its disassembly before its
+   ratio is quoted. The classes are the 1x1 conv / `mul_mat`, the conv with k > 1, the depthwise conv,
+   `conv_transpose_1d`, attention (`QK^T`, softmax, `AV`), the norms, and the elementwise ops fused into
+   a requantize.
+4. **Static vs dynamic:** what the int8 tensors between ops save (no per-GEMM quantize, a quarter of the
+   activation traffic), and what the islands cost (`QUANTIZE` / `DEQUANTIZE` around softmax, norms and
+   the front end).
+5. **The cost side:** exporter calibration, the quantized op variants and their ARMv6 kernels, and an
+   accuracy gate per model (WER, or the ASR oracle for TTS).
+
+**Output:** per model, the seconds left under (a) the F32 items below, (b) those plus a dynamic int8
+GEMM (option 1), and (c) full static int8 (option 2). The decision between options 1 and 2 is taken on
+that table, not on Citrinet's depthwise convs alone. **Measured 2026-10-14:** [the cross-model
+analysis](#gate-1-the-cross-model-analysis-measured-2026-10-14).
+
+**The Context's premise is withdrawn as well.** "Even an infinitely fast GEMM leaves RTF 0.82" assumed
+the 9.0 s was F32 arithmetic. It is F32 *inefficiency*: a depthwise kernel at 4% of the VFP's rate, and
+2.7 s of elementwise nodes that fusion removes in any precision. With those fixed, the non-GEMM part
+plausibly drops to ~1.5-2.5 s. That is unmeasured: an isolated op's number is a ceiling, not an
+estimate, and it has to be confirmed end to end. Then the GEMM is the whole question. At gate 2's
+1.2 GOP/s (~5 s) jfk would take ~7 s (RTF ~0.65). At XNNPACK's 0.6 (~10 s) it would take ~12 s
+(RTF ~1.1).
+
+**Three F32 items this surfaced.** None needs int8, and each helps every ARMv6 model, not just
+Citrinet:
+
+1. **An ARMv6 depthwise-conv kernel** in a ggml patch: 7.9x on this schedule, measured in isolation.
+2. **RunFast on ARMv6 compute threads.** It gives `vmla` 1.65x throughput, and it should also stop the
+   VFP11 trapping denormals to software support code. It is a numerics change: denormals flush to zero
+   and NaNs become the default NaN. So it needs its own decision and a gate across the ARMv6 zoo
+   ([ADR-078](adr-078-runfast-on-armv6-compute-threads.md)). **Done 2026-10-14:** accepted with all four
+   gates passed, as `ggml-0031`, on by default.
+3. **Skip or fuse the padding-mask `MUL`, the bias `ADD` and the `RELU`** around Citrinet's 1x1 convs.
+
+RunFast is scoped across the zoo in [ADR-078](adr-078-runfast-on-armv6-compute-threads.md). Gate 2,
+the int8 GEMM, is needed by both options and goes ahead. Its comparison arm is now F32 in RunFast as
+well as XNNPACK's `qs8`, since RunFast moved F32's ceiling.
+
+## Gate 2, measured 2026-10-14: 1.17-1.20 GOP/s at the GEMM, 1.04-1.11 with the quantize
+
+Measured in `bench_xnnpack.cpp` (`./bench_xnnpack 1 7 12 citrinet`) on the Pi Zero W, beside XNNPACK.
+Citrinet's 1x1 convs are `Y[256][T] = W[256][256] . X[256][T] + b`, weighted as jfk runs them: 7 calls at
+T = 1101, 36 at 551, 42 at 276 and 46 at 138. Every arm pays the bias. Arms alternate repetition by
+repetition and the median is taken; two rounds agree within 1%.
+
+| arm | jfk's 1x1 convs | GOP/s | max error |
+|---|---|---|---|
+| ggml Q8_0 `conv_2d_direct_packed` + `ADD` (the Q8_0 card's path) | 23.5-23.7 s | 0.25 | 6e-3 |
+| ggml F32 `conv_2d_direct` + `ADD` | 14.4 s | 0.41 | 4e-7 |
+| the same in RunFast ([ADR-078](adr-078-runfast-on-armv6-compute-threads.md)) | 12.0-12.1 s | 0.50 | 4e-7 |
+| ggml Q8_0 `mul_mat` + `ADD`, channels-last | 32.0 s | 0.19 | 8e-3 |
+| XNNPACK `qd8` (dynamic, convert timed), channels-last | 17.4 s | 0.34 | 1.1e-2 |
+| XNNPACK `qs8` (static; a ceiling), channels-last | 9.3 s | 0.64 | 1.8e-2 |
+| **loom int8, channels-first** (today's layout) | **5.73-5.75 s** | **1.04** | 1.2e-2 |
+| **loom int8, channels-last** | **5.35-5.37 s** | **1.11** | 1.2e-2 |
+| loom int8 GEMM alone, without the quantize (0.67 s CF, 0.37 s CL) | 5.06 / 4.98-5.01 s | 1.17-1.18 / 1.19-1.20 | |
+
+**The gate asks for 1.2 GOP/s, and the GEMM alone is at the line: 1.17-1.20.** With the activation
+quantize it is 1.04-1.11. That is 1.6-1.8x XNNPACK's `qs8`, 3.0-3.2x its `qd8`, 4.1-4.4x the Q8_0 card's
+path, and 2.0-2.2x ggml's F32 conv in RunFast. The gate's 1.2 was derived for a non-GEMM budget of
+5.8 s, and gate 1 found that budget can be ~1.5-2.5 s. **Gate 2 passed** (the user's call, 2026-10-14).
+
+The kernel is dynamic int8 (option 1). X is quantized per time step (symmetric, int8 range) and held as
+int16 `[T][K]`. W is per-channel symmetric int8, also held as int16. A 2x4 tile does 8 SMLADs and 6 loads
+per K pair in asm (`scripts/gen_armv6_i8_tile.py`, K = 256 unrolled), with an F32 epilogue. Before
+anything is timed, the bench checks that both quantize passes equal a scalar one word for word, and that
+the two layouts give bit-identical outputs. A sabotaged quantize (one `vcvtr` made `vcvt`) fails that
+check. The 1.2e-2 error is gate 3's concern. The kernel holds X as int16 anyway, so quantizing X to the
+int16 range instead costs nothing and removes X's share of it, unmeasured (SMLAD's int32 sum has the
+headroom at K = 256: 32767 x 127 x 256 < 2^31).
+
+**Where the time goes** (from the dev bench's diagnostic variants, same tile): ~3.1 s is the tile on
+L1-resident operands (1.95 GOP/s alone), ~0.9 s is W from DRAM (int16 W is 128 KB, the L2's size, and the
+ARM1176 has no prefetcher), ~0.4 s is X evicted by the W stream, ~0.5 s is the epilogue and loop. PLD
+did not help (2.5% in C, worse in asm), and RunFast changes nothing (~1%). Two levers are left: int8 W
+or a K split for L2 residency (`SXTB16` costs ~19% more instructions, so close to a wash), and an asm
+epilogue.
+
+**Channels-last is worth 0.38 s of jfk at this op, not the 0.78 s the dev bench suggested.** Both
+quantize passes were rewritten in asm first (four to eight `vmul`/`vcvtr` chains in flight, where gcc
+emitted one chain at a time): channels-first went from 0.81 to 0.67 s, and channels-last from 0.63 to
+0.37 s. The rest of the difference is the epilogue's contiguous stores (0.08 s). Exporting Citrinet
+channels-last needs a layout pass over the whole encoder: the 1x1 convs as `mul_mat`, the masks, SE and
+residuals re-laid, and a channels-last depthwise conv in the engine, or a pair of transposes around each
+of the 107 depthwise convs. That is ~1% of today's 37.5 s and ~5% of a projected ~7.5 s. **So it is not
+built on its own** (the user's call, 2026-10-14): it folds into [the analysis that decides gate
+1](#the-analysis-that-decides-gate-1), since option 2's design emits the encoder channels-last anyway and
+static int8 is where a layout pass would pay for itself.
+
+## Found while measuring gate 2: the F32 card was paying for VFP bounces
+
+The bench's ggml F32 conv ran jfk's 1x1 convs in 14.4 s, but the F32 card's profile spends 52.3 s on the
+same 131 `CONV_2D` nodes, and 3-5x more per call at T <= 551. The cause starts in the weights. The F32 card has
+137,472 weights below 1e-20 (17,989 below 1e-30), concentrated in the 1x1 kernels: BatchNorm-folded dead
+channels at ~1e-33. A dead channel's accumulator stays that small, so each opposite-sign product makes
+its `vmla` an effective subtraction below 2^-96, which the VFP11 bounces to the kernel's support code in
+case it underflows: ~1.1 us each, against 8 ns (`scripts/bench47.c`; Retro-085, corrected). Q8_0 rounds those weights to exactly 0, which is the main reason the Q8_0
+card was faster than F32 on this board at all. jfk on the Pi Zero, one thread, two rounds, every run
+giving the same transcript ids as its card's IEEE run:
+
+| card | IEEE mode | RunFast (FPSCR `FZ \| DN`, set on the calling thread) |
+|---|---|---|
+| F32 | 59.7-62.5 s | **20.0-22.5 s** (2.7-3.1x) |
+| F32, weights below 1e-20 zeroed | 43.9-45.9 s | 19.8-20.2 s |
+| Q8_0 | 33.3-34.9 s | 29.3-30.9 s |
+
+So **RunFast alone takes the F32 card from RTF 5.6 to ~1.9, past the Q8_0 card in either mode (RTF
+2.7-3.2).** Zeroing the tiny
+weights at export recovers only part of that (44 s): small activations also start accumulators in that
+range. The Q8_0
+card stays slower than F32 in RunFast because its 1x1 conv path is (bench: 23.6 s against 14.4 s on the
+same shapes, the same F32 implementation after a cheap dequantize; not yet explained).
+
+This moves gate 2's comparison arm. The int8 kernel's 5.4-5.7 s replaces ~12 s of F32 1x1 convs in
+RunFast, not ~28 s of the Q8_0 card's. The ARMv6 decision went through
+[ADR-078](adr-078-runfast-on-armv6-compute-threads.md) first. That is now accepted, and with the patch in
+the engine the F32 card runs jfk in **20.1 s** (RTF ~1.8), which is this ADR's baseline from here on.
+
+## Gate 1, the cross-model analysis, measured 2026-10-14
+
+**At equal effort, int8 beats F32 on every GEMM-shaped class, by 1.06-2.1x, and F32 kernels beat
+today's ggml by more.** The analysis was scoped above. Here is what it measured, and the table it asked for.
+
+**Method.** The model list has 13 entries: the hub's Pi Zero set, the P7 set, and a VAD (Silero) and a
+wake word (WakeHuBERT tiny) for their different op mixes. Each one was profiled on the Pi Zero W with
+the engine as it now runs ARMv6 (ggml-0031, RunFast). That was one thread, one launch per model, with
+`LOOM_PROFILE_NODES` (`scripts/armv6_opmix_profile.sh`). The profiled runs took the same time as
+ADR-078's unprofiled ones. A profile records each node's output shape but not its operands, so the
+same runs were repeated on x86 with the new `LOOM_PROFILE_NODES=src`. That mode keys and prints every
+node's first two sources (type and shape). The graphs are identical, so `scripts/armv6_opmix.py` joins
+the board's times to those shapes by (op, name, shape). It then gives every class seconds, GFLOP and
+output elements.
+
+**Where the time is** (seconds of node time, the profiler's per-node floor removed; bold where a
+class is at least a quarter of the model):
+
+| model | node s | GEMM | GEMV | conv k>1 | convT | DFT basis | dw | attention | bias/act | residual | layout | rest |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Citrinet-256-ls F32 | 19.1 | **10.9** | 0.02 | - | - | 1.19 | 4.08 | 0.01 | 2.18 | 0.11 | 0.25 | 0.30 |
+| Moonshine tiny F32 | 60.2 | **16.1** | **20.2** | 10.17 | - | - | - | 7.25 | 2.05 | 0.33 | 3.75 | 0.33 |
+| Moonshine tiny Q8_0 | 65.6 | **34.2** | 6.97 | 10.74 | - | - | - | 7.32 | 1.99 | 0.34 | 3.71 | 0.30 |
+| sanoTTS heart-nano | 2.8 | 0.21 | - | 0.10 | - | **2.1** | 0.01 | - | 0.15 | 0.04 | 0.15 | 0.06 |
+| sanoTTS heart | 5.2 | **1.8** | - | 0.70 | - | **1.9** | 0.06 | - | 0.41 | 0.05 | 0.21 | 0.10 |
+| piperlite amy | 38.8 | 0.05 | - | **29.1** | 3.50 | - | - | - | 3.63 | 2.44 | 0.08 | - |
+| piperlite de051 | 8.4 | 0.02 | - | **5.4** | 0.73 | - | - | - | 1.39 | 0.85 | 0.04 | - |
+| VITS Q4_0 | 58.4 | 2.09 | - | **46.8** | 3.00 | - | 0.03 | 0.09 | 3.66 | 2.14 | 0.50 | 0.10 |
+| conformer-ctc Q4_0 | 9.9 | **6.9** | - | - | - | 0.35 | 0.15 | 0.28 | 1.30 | 0.08 | 0.64 | 0.19 |
+| distilbert-ner Q4_0 | 5.4 | **5.2** | - | - | - | - | - | 0.02 | 0.14 | 0.01 | 0.04 | 0.03 |
+| Silero VAD | 3.6 | 0.56 | **2.0** | - | - | 0.85 | - | - | 0.08 | 0.07 | 0.04 | 0.01 |
+| WakeHuBERT tiny F32 | 2.8 | **1.2** | - | 0.14 | - | 0.69 | 0.15 | - | 0.25 | 0.07 | 0.30 | 0.03 |
+
+"GEMM" is every weight `mul_mat` with more than two columns, plus 1x1 convs. "GEMV" is a weight
+`mul_mat` with one or two columns: a decode step or an LSTM step. "DFT basis" is an STFT or iSTFT run as a
+convolution with 256 or more taps over one channel. The table names classes the analysis's list did not:
+
+* **The GEMV class.** This is Moonshine's decode (its 288 x 32768 vocabulary projection is 10.4 of the 20.2 s)
+  and Silero's LSTM. It is bound by bytes, not MACs, and ggml's ARMv6 F32 GEMV streams at 91 MB/s.
+* **The vocoders' direct convolutions** carry the most seconds in the zoo: VITS 46.8 s, amy 29.1 s,
+  de051 5.4 s. They are their own GEMM regime: 12-64 channels, k = 3-7, dilation up to 5, and 24,000-130,000
+  time steps. ggml runs them at 0.25-0.65 GOP/s.
+* **The DFT-basis convolutions** (1.2-2.1 s in five models) are an FFT's job in any precision.
+
+**Each class at equal effort** (Pi Zero W, one thread, RunFast, each arm checked against a reference
+before it is timed; the int8 rates include their activation quantize unless marked):
+
+| class (bench) | ggml today | F32, asm | int8 dynamic, asm | int8 without the quantize | int8 / F32 |
+|---|---|---|---|---|---|
+| R1 GEMM: Citrinet's 1x1 convs, K = N = 256 (`bench_xnnpack citrinet`, `loom f32cf`) | 0.50 GOP/s | **0.71-0.72** | 1.04-1.05 | 1.19-1.20 | **1.46x / 1.66x** |
+| R2 vocoder direct convs, 7 shapes (`scripts/bench49.cpp`) | 0.25-0.65 | **1.10-1.11** | 1.17-1.18 | 1.44-1.46 | **1.06x / 1.31x** |
+| R4 GEMV, 288 x 32768 (`scripts/bench48.c`) | 0.045 | **0.158** (316 MB/s) | 0.339 | (same) | **2.14x** |
+| depthwise, Citrinet's 107 (`bench43`, C in both arms) | 3.96 s | 0.50 s | 0.68 s | | 0.74x |
+
+* **The F32 arm is new: the VFP11's short vectors.** With FPSCR `LEN = 4`, one `vmla` is four MACs
+  against a bank-0 scalar. `bench44 vfpvec 0` measures 0.94 GMAC/s, against 0.49-0.69 for scalar
+  `vmla` in RunFast. No ARMv6 work here had tried it, and every earlier F32 ceiling on this core was a
+  scalar one (Epic-08 §6.8's "dense ceiling" of 165-191 MMAC/s). The tiles are generated by
+  `scripts/gen_armv6_f32_tile.py` (GEMM, 4x4, K chunks of 128) and `scripts/gen_armv6_conv_tiles.py`
+  (direct conv, 4 channels x 4 time steps, taps unrolled). The GEMM tile matches XNNPACK's F32
+  reference bit for bit. The caller sets `LEN` around integer-only loops. The kernel's ABI already allows that:
+  Linux clears `LEN` for signal handlers and saves FPSCR on a switch.
+* **Its first version read channels-first X in place**, a new 4 KB page every k at T = 1101 (21.9 s).
+  Packing an X block first and sweeping the block size gave 8.4 s (TB 4 -> 24: 18.7 -> 8.4 s). The GEMM
+  tile is then bound by its W stream: F32 W is 2x the int8 kernel's int16-held W. Putting the K chunk
+  outside, so a chunk's 128 KB of W stays in the L2, changed nothing (8.30 against 8.36 s).
+* **The int8 arms got the same effort.** In the GEMV, `SXTB16`'s ROR operand and quad-interleaved W in asm
+  took int8 from 1.64x to 2.14x. There the F32 GEMV is already at the stream bound: plain reads run 213
+  MB/s and reads with PLD 338. The R2 quantize was ported to gate 2's asm and checked word for word against C, which
+  took it from 1.14 to 0.95 s. Most of it is the amax pass and the transposing writes, which are memory traffic.
+* **The depthwise pair is C against C.** Its bound is unchanged: the ceilings (`bench44`) put a tuned int8
+  kernel at most ~2x F32, ~0.25 s of jfk. That is too small to move a decision.
+
+**Static against dynamic.** Static int8 removes the per-call activation quantize. That is int8's
+whole edge in R2 (1.06x -> 1.31x) and 1.46x -> 1.66x in R1. It quarters layout traffic and folds
+activations into the requantize, and fusion gives the F32 path that last part as well. It pays a
+dequantize and a quantize around every F32 island (softmax, norms, the front end): ~31.5 ns per
+element to quantize (`loom qcl`), ~16 ns projected to dequantize.
+
+**The seconds left** (`scripts/armv6_projection.py`, from the classes above and the rates measured
+here):
+
+| model | today | (a) F32 items | (b) + dynamic int8 | (c) static int8 | (b) vs (a) | (c) vs (b) | RTF today / a / b / c |
+|---|---|---|---|---|---|---|---|
+| Citrinet-256-ls (jfk, 11.0 s) | 19.1 | **10.3** | 7.8 | 7.1 | 1.33x | 1.10x | 1.73 / **0.94** / 0.71 / 0.64 |
+| Moonshine tiny (jfk) | 60.2 | 30.4 | 23.2 | 18.1 | 1.31x | 1.28x | 5.48 / 2.76 / 2.11 / 1.65 |
+| sanoTTS heart-nano (3.1 s) | 2.8 | 2.5 | 2.4 | 2.3 | 1.02x | 1.05x | 0.91 / 0.81 / 0.80 / 0.76 |
+| sanoTTS heart (3.2 s) | 5.2 | 3.6 | 3.3 | 3.0 | 1.11x | 1.09x | 1.64 / 1.15 / 1.03 / 0.94 |
+| piperlite amy (5.9 s) | 38.8 | 14.6 | 13.9 | 10.5 | 1.05x | 1.33x | 6.58 / 2.47 / 2.35 / 1.77 |
+| piperlite de051 (4.4 s) | 8.4 | 3.2 | 3.1 | 2.2 | 1.05x | 1.39x | 1.91 / **0.74** / 0.70 / 0.51 |
+| VITS (3.2 s) | 58.4 | 19.4 | 18.0 | 13.8 | 1.08x | 1.30x | 18.3 / 6.07 / 5.64 / 4.33 |
+| conformer-ctc (jfk3, 3.0 s) | 9.9 | 5.6 | 4.3 | 3.5 | 1.30x | 1.22x | 3.29 / 1.87 / 1.44 / 1.18 |
+| distilbert-ner | 5.4 | 5.3 | 1.6 | 1.4 | 3.25x | 1.15x | |
+| Silero VAD (jfk) | 3.6 | 1.9 | 1.5 | 1.4 | 1.28x | 1.06x | 0.33 / 0.17 / 0.13 / 0.12 |
+| WakeHuBERT tiny (jfk) | 2.8 | 2.1 | 1.8 | 1.5 | 1.18x | 1.19x | 0.26 / 0.19 / 0.16 / 0.14 |
+
+(a) is RunFast plus each class's F32 rate above. It also folds bias, mask and activation into the
+producer's epilogue and keeps the DFT-basis seconds, which an FFT would remove from every column
+(heart-nano 2.1 of its 2.5 s, heart 1.9). distilbert-ner's (a) keeps its Q4_0 GEMMs, because 265 MB of F32 weights do not
+fit beside anything on this board. That is why its (b) is 3.25x. (c) runs attention at R1's static ratio,
+pays the islands, halves residual adds and takes layout to 0.4x. The vocoders' transposed convs,
+attention under int8, small-T GEMMs and the dequantize cost are **projected**, not measured. The
+script marks each one. An isolated op's rate is a ceiling, so this table orders the options and sizes
+the gaps. The end-to-end number is gate 4's.
+
+**What it says:**
+
+1. **The F32 items are the largest step on every model:** 1.3-3.0x, except heart-nano, where the DFT
+   dominates. They change no export, no format and no numerics beyond summation order. Citrinet reaches real time on
+   them alone (RTF 0.94, ~0.85 with an FFT), and so does de051.
+2. **Option 1 adds 1.02-1.33x on top** (3.25x for distilbert-ner against its Q4_0), mostly from the
+   GEMV and the R1 GEMMs. It needs no calibration and reads ADR-076's `Q8_0_PC` weights.
+3. **Option 2 adds another 1.05-1.39x over option 1.** The vocoders gain most (1.30-1.39x),
+   because there the dynamic quantize is all of int8's edge. Moonshine gains 1.28x. No model crosses
+   real time through option 2 that the F32 items and option 1 leave short, once the DFT goes to an FFT:
+   heart is RTF 1.15 / 1.03 / 0.94 without one and ~0.6 with one, in (a) alone. Its cost is the largest of the
+   three: calibration, quantized variants of five ops with ARMv6 kernels, a CPU-only flavour per model,
+   and an accuracy gate per model. That includes the ASR oracle for every vocoder, where int8 activations are
+   most audible.
+4. **Gate 1's rule, re-asked at equal effort and across the zoo:** int8 does beat VFP F32 on the
+   GEMM-shaped classes, so option 2 does not reduce to option 1 by the rule as written. But its
+   increment is 5-39% of an option-1 run, and the F32 items it was weighed against are larger than
+   either int8 option. **The user's call (2026-10-14):** build the F32 kernels and option 1, hold
+   option 2. That is [ADR-079](adr-079-armv6-f32-kernels-on-the-vfp11s-short-vectors-then-dynamic-int8.md).
+
+## Consequences
+
+* The work is front-loaded on two measurements (gates 1 and 2) that cost a day. Neither needs the
+  exporter, the calibration or a new op.
+* If it goes through: a calibration step and a `Q8_0_PC`+static export flavour in the exporter;
+  quantized `mul_mat`, depthwise conv, add, quantize and dequantize in ggml patches (with
+  ARMv6-specific kernels to maintain); and a model that is CPU-only in its int8 form. Its F32 and
+  Q8_0 cards stay as they are.
+* **The hub's RTF ~1.5 is withdrawn.** It is ~1.8 from int8 GEMMs at XNNPACK's ARMv6 rate, and real
+  time needs the whole graph.

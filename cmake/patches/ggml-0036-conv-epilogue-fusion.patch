@@ -1,0 +1,569 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 728c89f0..77072185 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3163,6 +3163,15 @@ struct ggml_cplan ggml_graph_plan(
+ // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+ 
++// loom (ggml-0036, ADR-079 P4.32f): the convolution EPILOGUE -- a RELU and a per-time mask MUL after a
++// convolution's bias (and residual), the mask after a depthwise one, and the case where the fused
++// result partially overlaps the input. OFF by default everywhere; GGML_CPU_CONV_EPILOGUE=1 turns it on.
++// It shipped on by default on ARMv6, where it took Citrinet-256-ls from 13.68 to 13.21 s against
++// ggml's own RELU and MUL passes. ggml-0037 then made those passes 2-4x faster, and the epilogue, which
++// re-reads output rows the convolution has just stored (an ARM1176 does not allocate on a store),
++// became the slower of the two: 12.53 s off against 13.07 on (ADR-079 P4.32f f2 step 3b).
++static bool ggml_cpu_conv_epilogue = false;   // initialized once in ggml_cpu_init(), read-only afterwards
++
+ // RunFast on ARMv6: the VFP's flush-to-zero and default-NaN modes (FPSCR FZ | DN) for the duration of
+ // a graph compute, on every compute thread, restored on the way out so the caller's own floating
+ // point (Python, the Lua driver) stays in IEEE mode.
+@@ -3250,10 +3259,12 @@ static int ggml_cpu_next_compute_node(const struct ggml_cgraph * cgraph, int fro
+ // The other operand of an ADD that consumes `prev`'s result, or NULL if this ADD is not the one the
+ // convolution can absorb. With `per_channel` the operand wanted is a convolution bias -- one value per
+ // output channel, broadcast along the length axis; without it, a residual of the result's full shape.
+-static const struct ggml_tensor * ggml_cpu_conv_2d_add_operand(const struct ggml_tensor * add,
+-                                                               const struct ggml_tensor * prev,
+-                                                               const struct ggml_tensor * conv,
+-                                                               bool per_channel) {
++// (ggml-0036: also the other operand of a MUL, with `per_time` -- a time mask, one value per position
++// broadcast along the channels.)
++static const struct ggml_tensor * ggml_cpu_conv_2d_operand(const struct ggml_tensor * add,
++                                                           const struct ggml_tensor * prev,
++                                                           const struct ggml_tensor * conv,
++                                                           bool per_channel, bool per_time) {
+     if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+         ggml_nelements(add) != ggml_nelements(conv)) {
+         return NULL;
+@@ -3274,13 +3285,54 @@ static const struct ggml_tensor * ggml_cpu_conv_2d_add_operand(const struct ggml
+     if (x->ne[0] != conv->ne[0] || x->ne[1] != conv->ne[2] || x->ne[2] != 1 || x->ne[3] != 1) {
+         return NULL;
+     }
+-    if (o->ne[0] != (per_channel ? 1 : conv->ne[0]) || o->ne[1] != conv->ne[2] ||
++    if (o->ne[0] != (per_channel ? 1 : conv->ne[0]) || o->ne[1] != (per_time ? 1 : conv->ne[2]) ||
+         o->ne[2] != 1 || o->ne[3] != 1) {
+         return NULL;
+     }
+     return o;
+ }
+ 
++static const struct ggml_tensor * ggml_cpu_conv_2d_add_operand(const struct ggml_tensor * add,
++                                                               const struct ggml_tensor * prev,
++                                                               const struct ggml_tensor * conv,
++                                                               bool per_channel) {
++    return ggml_cpu_conv_2d_operand(add, prev, conv, per_channel, false);
++}
++
++// ggml-0036: the epilogue after a convolution's last fused node `prev` (at `last`): an optional RELU,
++// then an optional MUL by a time mask -- NeMo's encoders multiply every block's output by
++// `arange(T) < length`, broadcast over the channels. Each node must be the only reader of the one
++// before it. Updates `*out` and `*last`; returns the mask's tensor (or NULL) and sets `*relu`.
++static const struct ggml_tensor * ggml_cpu_conv_epilogue_match(const struct ggml_cgraph * cgraph,
++                                                               const struct ggml_tensor * conv,
++                                                               struct ggml_tensor ** out, int * last,
++                                                               bool * relu) {
++    *relu = false;
++    const int relu_idx = ggml_cpu_next_compute_node(cgraph, *last + 1);
++    if (relu_idx >= 0 && cgraph->nodes[relu_idx]->op == GGML_OP_UNARY &&
++        ggml_get_unary_op(cgraph->nodes[relu_idx]) == GGML_UNARY_OP_RELU) {
++        struct ggml_tensor * r = cgraph->nodes[relu_idx];
++        if (r->src[0] && ggml_view_root(r->src[0]) == *out && r->src[0]->data == (*out)->data &&
++            r->type == GGML_TYPE_F32 && ggml_is_contiguous(r) && ggml_is_contiguous(r->src[0]) &&
++            ggml_nelements(r) == ggml_nelements(conv) && ggml_cpu_result_is_private(cgraph, *out, relu_idx)) {
++            *relu = true;
++            *out  = r;
++            *last = relu_idx;
++        }
++    }
++    const int mul_idx = ggml_cpu_next_compute_node(cgraph, *last + 1);
++    if (mul_idx >= 0 && cgraph->nodes[mul_idx]->op == GGML_OP_MUL) {
++        struct ggml_tensor * mul = cgraph->nodes[mul_idx];
++        const struct ggml_tensor * m = ggml_cpu_conv_2d_operand(mul, *out, conv, false, true);
++        if (m && ggml_cpu_result_is_private(cgraph, *out, mul_idx)) {
++            *out  = mul;
++            *last = mul_idx;
++            return m;
++        }
++    }
++    return NULL;
++}
++
+ // What one fused convolution stands in for.
+ struct ggml_conv_2d_fusion {
+     const struct ggml_tensor * act;       // LEAKY_RELU feeding the input, or NULL
+@@ -3288,6 +3340,9 @@ struct ggml_conv_2d_fusion {
+     const struct ggml_tensor * residual;  // the elementwise ADD's other operand, or NULL
+     struct ggml_tensor *       conv;      // the CONV_2D itself
+     struct ggml_tensor *       out;       // the tensor the fused kernel writes: the last node covered
++    bool                       relu;      // ggml-0036: a RELU after the bias / residual
++    const struct ggml_tensor * mask;      // ggml-0036: then a MUL by a time mask, or NULL
++    bool                       via_conv;  // ggml-0036: compute into conv's own tensor, then one pass to out
+ };
+ 
+ // Whether the nodes from `node_n` are a convolution with elementwise neighbours it can absorb. Fills
+@@ -3378,6 +3433,10 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+         }
+     }
+ 
++    if (ggml_cpu_conv_epilogue) {
++        f->mask = ggml_cpu_conv_epilogue_match(cgraph, conv, &f->out, &last, &f->relu);
++    }
++
+     if (f->act == NULL && f->out == conv) {
+         return -1;                                // nothing to fuse
+     }
+@@ -3399,6 +3458,32 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+     const struct ggml_tensor * out = f->out;
+ 
+     const bool out_is_in = out->data == in->data && ggml_nbytes(out) == ggml_nbytes(in);
++    if (f->mask && (ggml_cpu_tensors_overlap(out, f->mask) || ggml_cpu_tensors_overlap(conv, f->mask))) {
++        return -1;
++    }
++    if (!out_is_in && ggml_cpu_tensors_overlap(out, in) && (f->relu || f->mask) && f->act == NULL &&
++        !ggml_cpu_tensors_overlap(conv, in) && !ggml_cpu_tensors_overlap(out, conv->src[0]) &&
++        !(f->bias && ggml_cpu_tensors_overlap(out, f->bias))) {
++        // ggml-0036: THE RESULT PARTIALLY OVERLAPS THE INPUT -- the allocator handed the last node a
++        // block that starts a few hundred floats before the input's (Citrinet-256-ls: 53 of its 129
++        // 1x1 convolutions, out 4384-4416 bytes ahead of in). No kernel here can write that while it
++        // still reads the input, but the convolution's own tensor never overlaps its input -- it is
++        // computed while the input is live -- so the kernel writes there, and one pass applies the
++        // residual, RELU and mask on the way to `out`: one pass where the unfused nodes made three.
++        const bool out_is_conv = out->data == conv->data && ggml_nbytes(out) == ggml_nbytes(conv);
++        if (!out_is_conv && ggml_cpu_tensors_overlap(out, conv)) {
++            return -1;
++        }
++        if (f->residual && (ggml_cpu_tensors_overlap(f->residual, conv) ||
++                            (f->residual->data != out->data && ggml_cpu_tensors_overlap(f->residual, out)))) {
++            return -1;
++        }
++        if (f->bias && ggml_cpu_tensors_overlap(conv, f->bias)) {
++            return -1;
++        }
++        f->via_conv = true;
++        return last;
++    }
+     if ((!out_is_in && ggml_cpu_tensors_overlap(out, in)) ||
+         ggml_cpu_tensors_overlap(out, conv->src[0]) ||
+         (f->bias && ggml_cpu_tensors_overlap(out, f->bias))) {
+@@ -3437,7 +3522,7 @@ static int ggml_cpu_conv_2d_fusion(const struct ggml_cgraph * cgraph, int node_n
+ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int node_n,
+                                       struct ggml_tensor ** conv_out, const struct ggml_tensor ** pad_out,
+                                       const struct ggml_tensor ** bias_out, bool * relu_out,
+-                                      struct ggml_tensor ** out_out) {
++                                      const struct ggml_tensor ** mask_out, struct ggml_tensor ** out_out) {
+     int idx = node_n;
+     struct ggml_tensor * node = cgraph->nodes[idx];
+     const struct ggml_tensor * pad = NULL;
+@@ -3511,6 +3596,20 @@ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int nod
+         }
+     }
+ 
++    const struct ggml_tensor * mask = NULL;
++    if (ggml_cpu_conv_epilogue) {                 // ggml-0036: a time-mask MUL after it
++        const int mul_idx = ggml_cpu_next_compute_node(cgraph, last + 1);
++        if (mul_idx >= 0 && cgraph->nodes[mul_idx]->op == GGML_OP_MUL) {
++            struct ggml_tensor * mul = cgraph->nodes[mul_idx];
++            const struct ggml_tensor * m = ggml_cpu_conv_2d_operand(mul, out, conv, false, true);
++            if (m && ggml_cpu_result_is_private(cgraph, out, mul_idx)) {
++                mask = m;
++                out  = mul;
++                last = mul_idx;
++            }
++        }
++    }
++
+     if (pad == NULL && out == conv) {
+         return -1;                                // nothing to fuse
+     }
+@@ -3521,10 +3620,12 @@ static int ggml_cpu_conv_2d_dw_fusion(const struct ggml_cgraph * cgraph, int nod
+     const bool out_is_in = out->data == in->data && ggml_nbytes(out) == ggml_nbytes(in);
+     if ((!out_is_in && ggml_cpu_tensors_overlap(out, in)) ||
+         ggml_cpu_tensors_overlap(out, conv->src[0]) ||
+-        (bias && ggml_cpu_tensors_overlap(out, bias))) {
++        (bias && ggml_cpu_tensors_overlap(out, bias)) ||
++        (mask && ggml_cpu_tensors_overlap(out, mask))) {
+         return -1;
+     }
+ 
++    *mask_out = mask;
+     *conv_out = conv;
+     *pad_out  = pad;
+     *bias_out = bias;
+@@ -3553,7 +3654,8 @@ static int ggml_cpu_try_fuse_ops(
+         struct ggml_conv_2d_fusion f;
+         const int last = ggml_cpu_conv_2d_fusion(cgraph, node_n, &f);
+         if (last > node_n) {
+-            ggml_compute_forward_conv_2d_fused(params, f.conv, f.act, f.bias, f.residual, f.out);
++            ggml_compute_forward_conv_2d_fused(params, f.conv, f.act, f.bias, f.residual, f.relu, f.mask,
++                                               f.via_conv, f.out);
+             return last - node_n;   // the nodes covered, and any views of the result between them
+         }
+     }
+@@ -3561,9 +3663,10 @@ static int ggml_cpu_try_fuse_ops(
+     if (node->op == GGML_OP_CONV_2D_DW || node->op == GGML_OP_PAD) {
+         struct ggml_tensor * conv = NULL; const struct ggml_tensor * pad = NULL;
+         const struct ggml_tensor * bias = NULL; bool relu = false; struct ggml_tensor * out = NULL;
+-        const int last = ggml_cpu_conv_2d_dw_fusion(cgraph, node_n, &conv, &pad, &bias, &relu, &out);
++        const struct ggml_tensor * mask = NULL;
++        const int last = ggml_cpu_conv_2d_dw_fusion(cgraph, node_n, &conv, &pad, &bias, &relu, &mask, &out);
+         if (last > node_n) {
+-            ggml_compute_forward_conv_2d_dw_fused(params, conv, pad, bias, relu, out);
++            ggml_compute_forward_conv_2d_dw_fused(params, conv, pad, bias, relu, mask, out);
+             return last - node_n;
+         }
+     }
+@@ -4434,6 +4537,10 @@ void ggml_cpu_init(void) {
+             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
+             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+         }
++        {
++            const char * env = getenv("GGML_CPU_CONV_EPILOGUE");
++            ggml_cpu_conv_epilogue = env != NULL && atoi(env) != 0;
++        }
+ 
+ #ifdef GGML_CPU_HAS_RUNFAST
+         {
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index cef146ad..7c224068 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -8369,6 +8369,82 @@ static bool ggml_conv_2d_armv6_qgemm(const ggml_compute_params * params, const v
+ 
+ // The folded geometry a CONV_2D node may carry, or the declared one off the kernel's own ne. A zero
+ // `kw` in op_params 6 is what says "declared", which is every graph that never folded anything.
++// loom (ggml-0036, ADR-079 P4.32f): the epilogue a fused convolution applies after its bias and
++// residual -- a RELU, then a multiply by a time mask (one value per output position, the same for every
++// channel), in that order, which is the order the unfused RELU and MUL nodes apply them, so the result
++// is bit-identical to theirs. A kernel that applies it sets `done`; ggml_compute_forward_conv_2d_fused
++// makes one pass over the result for any that does not.
++struct ggml_conv_post {
++    bool          relu;
++    const float * mask;
++    bool          done;
++};
++
++static inline float ggml_conv_post_apply(float v, bool relu, const float * mask, int64_t t) {
++    if (relu) {
++        v = (v > 0.f) ? v : 0.f;
++    }
++    if (mask) {
++        v = v * mask[t];
++    }
++    return v;
++}
++
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++// ARMv6: THE EPILOGUE AS SHORT PASSES OVER A BLOCK STILL IN L1. Per element through the function above,
++// the VFP11 paid ~42 ns (a 1x1 conv) and ~54 ns (a depthwise row) on a Pi Zero W (loom scripts/
++// bench53.cpp) -- as much as the unfused pass it replaced (~48): `vcmpe` + `vmrs` for the RELU drains
++// the VFP pipeline every element, and each `vmul` waited on the one before it through its store.
++//
++// The RELU here is INTEGER: keep the bits iff lo <= u <= 0x7f800000 as unsigned, else +0. That is
++// exactly `(v > 0) ? v : 0` -- -0, every negative, every NaN and, under RunFast's flush-to-zero (FZ, which
++// makes the VFP compare see a positive denormal as 0), every positive denormal go to +0, so lo is the
++// smallest positive normal there and 1 in IEEE mode. The bias add and the mask multiply stay float
++// operations, unrolled by four so the VFP pipelines them; same operations, same results.
++static inline uint32_t ggml_armv6_relu_lo(void) {
++    uint32_t f;
++    __asm__ volatile("vmrs %0, fpscr" : "=r"(f));
++    return (f & (1u << 24)) ? 0x00800000u : 1u;
++}
++
++static void ggml_armv6_relu_pass(float * d, int64_t n, uint32_t lo) {
++    uint32_t * u = (uint32_t *) d;
++    const uint32_t span = 0x7f800000u - lo;
++    for (int32_t i = 0; i < (int32_t) n; ++i) {
++        const uint32_t v = u[i];
++        u[i] = v - lo <= span ? v : 0u;
++    }
++}
++
++static void ggml_armv6_mul_pass(float * d, const float * m, int64_t n) {
++    int32_t i = 0;
++    for (; i + 4 <= (int32_t) n; i += 4) {
++        const float a0 = d[i] * m[i], a1 = d[i + 1] * m[i + 1], a2 = d[i + 2] * m[i + 2], a3 = d[i + 3] * m[i + 3];
++        d[i] = a0; d[i + 1] = a1; d[i + 2] = a2; d[i + 3] = a3;
++    }
++    for (; i < (int32_t) n; ++i) d[i] = d[i] * m[i];
++}
++
++static void ggml_armv6_add_pass(float * d, float b, int64_t n) {
++    int32_t i = 0;
++    for (; i + 4 <= (int32_t) n; i += 4) {
++        const float a0 = d[i] + b, a1 = d[i + 1] + b, a2 = d[i + 2] + b, a3 = d[i + 3] + b;
++        d[i] = a0; d[i + 1] = a1; d[i + 2] = a2; d[i + 3] = a3;
++    }
++    for (; i < (int32_t) n; ++i) d[i] = d[i] + b;
++}
++
++// d = s + r, unrolled the same way (the staged flush's residual)
++static void ggml_armv6_sum_pass(float * d, const float * s, const float * r, int64_t n) {
++    int32_t i = 0;
++    for (; i + 4 <= (int32_t) n; i += 4) {
++        const float a0 = s[i] + r[i], a1 = s[i + 1] + r[i + 1], a2 = s[i + 2] + r[i + 2], a3 = s[i + 3] + r[i + 3];
++        d[i] = a0; d[i + 1] = a1; d[i + 2] = a2; d[i + 3] = a3;
++    }
++    for (; i < (int32_t) n; ++i) d[i] = s[i] + r[i];
++}
++#endif
++
+ // ---------------------------------------------------------------------------------------------
+ // ARMv6 ONLY: THE 1-D CONVOLUTIONS ON THE VFP11'S SHORT VECTORS (loom ADR-079, item P4.32b).
+ //
+@@ -8404,7 +8480,7 @@ static int ggml_armv6_conv_env(const char * name, int dflt) {
+ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_tensor * kernel,
+                                const ggml_tensor * src, ggml_tensor * dst, const float * bias_data,
+                                float * out_data, const float * src_data, const float * leaky,
+-                               const float * res_data) {
++                               const float * res_data, ggml_conv_post * post) {
+     static const int enabled = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONV", 1);
+     static const int tb_env  = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONV_TB", 0);
+     static const int l1_env  = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONV_L1", 12 * 1024);
+@@ -8511,19 +8587,30 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     const int64_t b0   = params->ith * per, b1 = MIN(b0 + per, nblk);
+     auto block_len = [&](int64_t b) { return b == nblk - 1 ? OL - b * TB : TB; };
+ 
++    // The epilogue (ggml-0036): a staged block gets it in its flush, a block written in place gets it
++    // per quad of rows straight after the quad's last chunk, while those rows are still in L1.
++    const bool    relu = post && post->relu;
++    const float * mask = post ? post->mask : nullptr;
++    const bool    epi  = relu || mask;
++
+     int64_t pend = -1;                             // the staged block not yet flushed
+     float * ycur = ys, * yprev = ys + (size_t) OCq * 4 * TBx;
++    const uint32_t relu_lo = relu ? ggml_armv6_relu_lo() : 0;
++    auto epilogue = [&](float * d, int64_t t0, int64_t nb) {
++        if (relu) ggml_armv6_relu_pass(d, nb, relu_lo);
++        if (mask) ggml_armv6_mul_pass(d, mask + t0, nb);
++    };
+     auto flush = [&](int64_t b, const float * yb) {
+         const int64_t t0 = b * TB, nb = block_len(b);
+         for (int64_t o = 0; o < OC; ++o) {
+             const float * s = yb + (size_t) o * TBx;
+             float *       d = y + o * OL + t0;
+             if (res_data) {
+-                const float * r = res_data + o * OL + t0;
+-                for (int64_t t = 0; t < nb; ++t) d[t] = s[t] + r[t];
++                ggml_armv6_sum_pass(d, s, res_data + o * OL + t0, nb);
+             } else {
+                 memcpy(d, s, (size_t) nb * sizeof(float));
+             }
++            if (epi) epilogue(d, t0, nb);
+         }
+     };
+ 
+@@ -8573,6 +8660,9 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+                 a.ystride = ystr;
+                 a.x = xw; a.y = yb + (size_t) 4 * q * (ystr / 4); a.nt = (int32_t) nt;
+                 fn(&a);
++                if (epi && !stage_b && ch == nch - 1) {
++                    for (int64_t r = 0; r < 4; ++r) epilogue(y + (4 * q + r) * OL + t0, t0, nb);
++                }
+             }
+         }
+         if (stage_b) {
+@@ -8581,6 +8671,7 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+         }
+     }
+     if (pend >= 0) flush(pend, yprev);
++    if (post) post->done = true;
+     return true;
+ }
+ 
+@@ -8739,6 +8830,9 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+                                               const float *               in_data   = nullptr,
+                                               const float *               leaky     = nullptr,
+                                               const float *               res_data  = nullptr,
++                                              // ggml-0036: a RELU and a time mask after all that, for
++                                              // a kernel that can apply them (see ggml_conv_post)
++                                              ggml_conv_post *            post      = nullptr,
+                                               // ARMv6 ONLY (ggml_conv_2d_armv6_qgemm): the kernel as
+                                               // STORED, carried past the dequantize below so the
+                                               // im2col fallback can run a quantized GEMM instead of
+@@ -8804,7 +8898,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         }
+ #endif
+         ggml_compute_forward_conv_2d_impl(&p, &kdq, src, dst, GGML_TYPE_F32,
+-                                          bias_data, out_data, in_data, leaky, res_data, qk);
++                                          bias_data, out_data, in_data, leaky, res_data, post, qk);
+         return;
+     }
+ 
+@@ -8837,7 +8931,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+     // ARMv6: the short-vector tiles take every 1-D convolution they can, ahead of the paths below
+     // (ggml_conv_1d_armv6). That includes a Q4_0 kernel, which arrives here dequantized.
+-    if (ggml_conv_1d_armv6(params, kernel, src, dst, bias_data, out_data, src_data, leaky, res_data)) {
++    if (ggml_conv_1d_armv6(params, kernel, src, dst, bias_data, out_data, src_data, leaky, res_data, post)) {
+         return;
+     }
+ #endif
+@@ -9185,6 +9279,9 @@ void ggml_compute_forward_conv_2d_fused(
+         const ggml_tensor *         act,
+         const ggml_tensor *         bias,
+         const ggml_tensor *         residual,
++        bool                        relu,
++        const ggml_tensor *         mask,
++        bool                        via_conv,
+         ggml_tensor *               out) {
+ 
+     const ggml_tensor * kernel = conv->src[0];
+@@ -9201,10 +9298,54 @@ void ggml_compute_forward_conv_2d_fused(
+         leaky   = &slope;
+     }
+ 
++    const float * mask_data = mask ? (const float *) mask->data : nullptr;
++    const float * res_data  = residual ? (const float *) residual->data : nullptr;
++    const int64_t OL = conv->ne[0], rows = ggml_nelements(conv) / OL;
++
++    if (via_conv) {
++        // ggml-0036: `out` partially overlaps the input (see ggml_cpu_conv_2d_fusion), so the kernel
++        // writes the convolution's own tensor and one pass carries it to `out` through the bias, the
++        // residual, the RELU and the mask -- each the unfused node's own operation, in its order, so the
++        // result is bit-identical to theirs on every path (a kernel that starts its sums at the bias
++        // would not be).
++        ggml_compute_forward_conv_2d_impl(params, kernel, src, conv, kernel->type,
++                                          nullptr, nullptr, in_data, leaky, nullptr);
++        ggml_barrier(params->threadpool);
++        const float * c = (const float *) conv->data;
++        const float * b = bias ? (const float *) bias->data : nullptr;
++        float *       y = (float *) out->data;
++        for (int64_t o = params->ith; o < rows; o += params->nth) {
++            const float bo = b ? b[o % conv->ne[2]] : 0.0f;
++            for (int64_t t = 0; t < OL; ++t) {
++                const int64_t i = o * OL + t;
++                float v = c[i];
++                if (b) {
++                    v = v + bo;
++                }
++                if (res_data) {
++                    v = v + res_data[i];
++                }
++                y[i] = ggml_conv_post_apply(v, relu, mask_data, t);
++            }
++        }
++        return;
++    }
++
++    ggml_conv_post post = { relu, mask_data, false };
+     ggml_compute_forward_conv_2d_impl(params, kernel, src, conv, kernel->type,
+                                       bias ? (const float *) bias->data : nullptr,
+-                                      (float *) out->data, in_data, leaky,
+-                                      residual ? (const float *) residual->data : nullptr);
++                                      (float *) out->data, in_data, leaky, res_data,
++                                      relu || mask_data ? &post : nullptr);
++    if ((relu || mask_data) && !post.done) {
++        // The paths that do not apply the epilogue themselves: one pass, where the unfused nodes made two.
++        ggml_barrier(params->threadpool);
++        float * y = (float *) out->data;
++        for (int64_t o = params->ith; o < rows; o += params->nth) {
++            for (int64_t t = 0; t < OL; ++t) {
++                y[o * OL + t] = ggml_conv_post_apply(y[o * OL + t], relu, mask_data, t);
++            }
++        }
++    }
+ }
+ 
+ void ggml_compute_forward_conv_2d(
+@@ -9670,7 +9811,8 @@ static void ggml_compute_forward_conv_2d_dw_whcn_impl(
+         float * dst_base,
+         const ggml_conv_2d_dw_params & p,
+         const float * bias,
+-        bool relu) {
++        bool relu,
++        const float * mask = nullptr) {
+ 
+     const int64_t n = p.channels * p.batch;
+     const int64_t per_thread = (n + params->nth - 1) / params->nth;
+@@ -9691,6 +9833,12 @@ static void ggml_compute_forward_conv_2d_dw_whcn_impl(
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+     const bool armv6 = ggml_conv_2d_dw_armv6_ok(kernel, p);
+     std::vector<float> armv6_buf(armv6 ? 8 * (p.dst_w / 8 + 1) + 2 * p.knl_w + 24 : 0);
++    // ggml-0036: with an epilogue the kernel writes this row instead of dst. An ARM1176's L1 does not
++    // allocate on a store, so an epilogue reading back the row the kernel had just stored to dst missed
++    // on every line: ~43 ns an element at Citrinet's t = 551 against ~10 for the same pass in cache
++    // (loom scripts/bench53.cpp, the pass run twice). This row is read every channel and stays in L1;
++    // one memcpy then streams the finished row out.
++    std::vector<float> epi_row(armv6 && (bias != nullptr || relu || mask != nullptr) ? p.dst_w * p.dst_h : 0);
+ #else
+     const bool armv6 = false;
+ #endif
+@@ -9706,7 +9854,8 @@ static void ggml_compute_forward_conv_2d_dw_whcn_impl(
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+         if (armv6) {
+             float * xp = armv6_buf.data();
+-            ggml_conv_2d_dw_armv6_row(src_data, (const float *) knl_base + knl_offset, dst_data, p, xp,
++            ggml_conv_2d_dw_armv6_row(src_data, (const float *) knl_base + knl_offset,
++                                      epi_row.empty() ? dst_data : epi_row.data(), p, xp,
+                                       xp + 8 * (p.dst_w / 8 + 1) + p.knl_w + 16,
+                                       i + 1 < end ? src_data + p.src_w : src_data);
+         } else
+@@ -9768,7 +9917,17 @@ static void ggml_compute_forward_conv_2d_dw_whcn_impl(
+                 }
+             }
+         }
+-        if (bias != nullptr || relu) {
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++        if (bias != nullptr || relu || mask != nullptr) {   // ggml-0036: as passes over the row, in L1
++            const int64_t n_row = p.dst_w * p.dst_h;
++            float * e = armv6 ? epi_row.data() : dst_data;
++            if (bias != nullptr) ggml_armv6_add_pass(e, bias[ch], n_row);
++            if (relu)            ggml_armv6_relu_pass(e, n_row, ggml_armv6_relu_lo());
++            if (mask != nullptr) ggml_armv6_mul_pass(e, mask, n_row);
++            if (e != dst_data)   memcpy(dst_data, e, (size_t) n_row * sizeof(float));
++        }
++#else
++        if (bias != nullptr || relu || mask != nullptr) {
+             const float b = bias != nullptr ? bias[ch] : 0.0f;
+             for (int64_t j = 0; j < p.dst_w * p.dst_h; ++j) {
+                 float v = dst_data[j];
+@@ -9778,9 +9937,13 @@ static void ggml_compute_forward_conv_2d_dw_whcn_impl(
+                 if (relu) {
+                     v = (v > 0.f) ? v : 0.f;
+                 }
++                if (mask != nullptr) {        // ggml-0036: a time mask, dst_h == 1 when fused
++                    v = v * mask[j];
++                }
+                 dst_data[j] = v;
+             }
+         }
++#endif
+     }
+ }
+ 
+@@ -9841,6 +10004,7 @@ void ggml_compute_forward_conv_2d_dw_fused(
+         const ggml_tensor * pad,
+         const ggml_tensor * bias,
+         bool relu,
++        const ggml_tensor * mask,
+         ggml_tensor * out) {
+     const ggml_tensor * kernel = conv->src[0];
+     const ggml_tensor * src = pad != nullptr ? pad->src[0] : conv->src[1];
+@@ -9863,7 +10027,8 @@ void ggml_compute_forward_conv_2d_dw_fused(
+     GGML_ASSERT(kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16);
+     GGML_ASSERT(p.dst_h == 1 && conv->src[1]->ne[1] == 1);
+     ggml_compute_forward_conv_2d_dw_whcn_impl(params, (const float *) src->data, kernel, (float *) out->data, p,
+-                                              bias != nullptr ? (const float *) bias->data : nullptr, relu);
++                                              bias != nullptr ? (const float *) bias->data : nullptr, relu,
++                                              mask != nullptr ? (const float *) mask->data : nullptr);
+ }
+ 
+ // ggml_compute_forward_pool_1d_ksp
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index a8365632..e04df8a5 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -108,11 +108,11 @@ size_t ggml_armv6_mul_mat_f32_wsize(const struct ggml_tensor * node, int n_tasks
+ bool   ggml_armv6_mul_mat_f32(const struct ggml_compute_params * params, const struct ggml_tensor * src0,
+                               const struct ggml_tensor * src1, struct ggml_tensor * dst);
+ #endif
+-void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * act, const struct ggml_tensor * bias, const struct ggml_tensor * residual, struct ggml_tensor * out);
++void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv, const struct ggml_tensor * act, const struct ggml_tensor * bias, const struct ggml_tensor * residual, bool relu, const struct ggml_tensor * mask, bool via_conv, struct ggml_tensor * out);
+ void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+-void ggml_compute_forward_conv_2d_dw_fused(const struct ggml_compute_params * params, const struct ggml_tensor * conv, const struct ggml_tensor * pad, const struct ggml_tensor * bias, bool relu, struct ggml_tensor * out);
++void ggml_compute_forward_conv_2d_dw_fused(const struct ggml_compute_params * params, const struct ggml_tensor * conv, const struct ggml_tensor * pad, const struct ggml_tensor * bias, bool relu, const struct ggml_tensor * mask, struct ggml_tensor * out);
+ void ggml_compute_forward_pool_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pool_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pool_2d_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);

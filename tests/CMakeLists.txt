@@ -197,6 +197,23 @@ add_test(NAME test_graph_builder_shapes COMMAND test_graph_builder_shapes)
 set_tests_properties(test_graph_builder_shapes PROPERTIES LABELS ci)
 set_tests_properties(test_graph_builder_shapes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# Weights in ggml's CPU_REPACK buffer (LOOM_CPU_REPACK): every consumer but a direct F32 mul_mat is
+# routed to a plain copy (GgufModel::route_repacked_uses).
+add_test(
+    NAME gen_repack_test_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_repack_gguf.py
+            ${LOOM_FIXTURE_DIR}/repack_test.gguf
+)
+set_tests_properties(gen_repack_test_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_repack_test_gguf_fixture PROPERTIES FIXTURES_SETUP repack_test_gguf_fixture)
+
+add_executable(test_cpu_repack_routing ci/test_cpu_repack_routing.cpp)
+target_link_libraries(test_cpu_repack_routing PRIVATE loom::engine)
+target_compile_definitions(test_cpu_repack_routing PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_cpu_repack_routing COMMAND test_cpu_repack_routing)
+set_tests_properties(test_cpu_repack_routing PROPERTIES LABELS ci)
+set_tests_properties(test_cpu_repack_routing PROPERTIES FIXTURES_REQUIRED repack_test_gguf_fixture)
+
 add_executable(test_lua_bridge_has_function ci/test_lua_bridge_has_function.cpp)
 target_link_libraries(test_lua_bridge_has_function PRIVATE loom::engine)
 add_test(NAME test_lua_bridge_has_function COMMAND test_lua_bridge_has_function)
@@ -277,6 +294,21 @@ set_tests_properties(test_conv_bias_fusion PROPERTIES ENVIRONMENT
     "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_conv_bias_fusion PROPERTIES DEPENDS test_conv_bias_fusion_unfused)
 
+add_executable(test_conv_1d_sweep ci/test_conv_1d_sweep.cpp)
+target_link_libraries(test_conv_1d_sweep PRIVATE loom::engine)
+add_test(NAME test_conv_1d_sweep COMMAND test_conv_1d_sweep)
+set_tests_properties(test_conv_1d_sweep PROPERTIES LABELS ci)
+
+add_executable(test_conv_1d_dw_sweep ci/test_conv_1d_dw_sweep.cpp)
+target_link_libraries(test_conv_1d_dw_sweep PRIVATE loom::engine)
+add_test(NAME test_conv_1d_dw_sweep COMMAND test_conv_1d_dw_sweep)
+set_tests_properties(test_conv_1d_dw_sweep PROPERTIES LABELS ci)
+
+add_executable(test_mul_mat_f32_sweep ci/test_mul_mat_f32_sweep.cpp)
+target_link_libraries(test_mul_mat_f32_sweep PRIVATE loom::engine)
+add_test(NAME test_mul_mat_f32_sweep COMMAND test_mul_mat_f32_sweep)
+set_tests_properties(test_mul_mat_f32_sweep PROPERTIES LABELS ci)
+
 add_executable(test_conv_dw_fusion ci/test_conv_dw_fusion.cpp)
 target_link_libraries(test_conv_dw_fusion PRIVATE loom::engine)
 add_test(NAME test_conv_dw_fusion_unfused COMMAND test_conv_dw_fusion)
@@ -289,6 +321,72 @@ set_tests_properties(test_conv_dw_fusion PROPERTIES ENVIRONMENT
     "GGML_CPU_DISABLE_FUSION=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
 set_tests_properties(test_conv_dw_fusion PROPERTIES DEPENDS test_conv_dw_fusion_unfused)
 
+# ggml-0036 (ADR-079 P4.32f): the RELU and time mask a convolution's epilogue absorbs. Registered with
+# the epilogue off and on (ggml reads GGML_CPU_CONV_EPILOGUE once); the second compares the two outputs
+# byte for byte, and each checks the RELU's own result was (not) written.
+add_executable(test_conv_epilogue_fusion ci/test_conv_epilogue_fusion.cpp)
+target_link_libraries(test_conv_epilogue_fusion PRIVATE loom::engine)
+add_test(NAME test_conv_epilogue_fusion_off COMMAND test_conv_epilogue_fusion)
+set_tests_properties(test_conv_epilogue_fusion_off PROPERTIES LABELS ci)
+set_tests_properties(test_conv_epilogue_fusion_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_CONV_EPILOGUE=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_conv_epilogue_fusion COMMAND test_conv_epilogue_fusion)
+set_tests_properties(test_conv_epilogue_fusion PROPERTIES LABELS ci)
+set_tests_properties(test_conv_epilogue_fusion PROPERTIES ENVIRONMENT
+    "GGML_CPU_CONV_EPILOGUE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_conv_epilogue_fusion PROPERTIES DEPENDS test_conv_epilogue_fusion_off)
+
+# ADR-079 P4.32f f2 (ggml-0037): the ARMv6 elementwise passes are bit-identical to ggml's loops. Run
+# with them off and on (ggml reads GGML_CPU_ARMV6_ELTWISE once); the second compares both outputs byte
+# for byte, edge bit patterns included. Elsewhere both runs are stock ggml.
+add_executable(test_eltwise_armv6 ci/test_eltwise_armv6.cpp)
+target_link_libraries(test_eltwise_armv6 PRIVATE loom::engine)
+add_test(NAME test_eltwise_armv6_off COMMAND test_eltwise_armv6)
+set_tests_properties(test_eltwise_armv6_off PROPERTIES LABELS ci)
+set_tests_properties(test_eltwise_armv6_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ELTWISE=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_eltwise_armv6 COMMAND test_eltwise_armv6)
+set_tests_properties(test_eltwise_armv6 PROPERTIES LABELS ci)
+set_tests_properties(test_eltwise_armv6 PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ELTWISE=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_eltwise_armv6 PROPERTIES DEPENDS test_eltwise_armv6_off)
+
+# ADR-079 P4.32f f2 (ggml-0038): CONV_TRANSPOSE_1D against an f64 reference over the shapes the ARMv6
+# polyphase driver blocks and pads; run with the driver on (the default) and off (ggml-0009's GEMM).
+add_executable(test_conv_transpose_1d_sweep ci/test_conv_transpose_1d_sweep.cpp)
+target_link_libraries(test_conv_transpose_1d_sweep PRIVATE loom::engine)
+add_test(NAME test_conv_transpose_1d_sweep COMMAND test_conv_transpose_1d_sweep)
+set_tests_properties(test_conv_transpose_1d_sweep PROPERTIES LABELS ci)
+add_test(NAME test_conv_transpose_1d_sweep_off COMMAND test_conv_transpose_1d_sweep)
+set_tests_properties(test_conv_transpose_1d_sweep_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_CONVT=0")
+
+# ADR-079 P4.32f f2 step 3a (ggml-0039): GELU_ERF, SIGMOID, SILU and TANH against f64 and their special
+# values, with the ARMv6 kernels off and on (GGML_CPU_ARMV6_ACT, read once); the second run compares
+# GELU_ERF byte for byte, the one of the four that stays bit-identical. Elsewhere both runs are stock.
+add_executable(test_activations_armv6 ci/test_activations_armv6.cpp)
+target_link_libraries(test_activations_armv6 PRIVATE loom::engine)
+add_test(NAME test_activations_armv6_off COMMAND test_activations_armv6)
+set_tests_properties(test_activations_armv6_off PROPERTIES LABELS ci)
+set_tests_properties(test_activations_armv6_off PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ACT=0;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+add_test(NAME test_activations_armv6 COMMAND test_activations_armv6)
+set_tests_properties(test_activations_armv6 PROPERTIES LABELS ci)
+set_tests_properties(test_activations_armv6 PROPERTIES ENVIRONMENT
+    "GGML_CPU_ARMV6_ACT=1;LOOM_TEST_TMPDIR=${LOOM_FIXTURE_DIR}")
+set_tests_properties(test_activations_armv6 PROPERTIES DEPENDS test_activations_armv6_off)
+
+# ADR-079 P4.33 (ggml-0041..0043): CPU_ARMV6_I8, the dynamic int8 mul_mat and pointwise convolution on
+# per-channel Q8_0 weights, held bit for bit to its integer contract on both the one-column kernel and the
+# GEMM tiles (shapes, odd N, the overflow bound, NaN columns, two threads, strides, a conv + bias that ggml's
+# fusion must not take, the non-uniform fallback). Registered with the buffer type switched off and on
+# (GGML_CPU_ARMV6_I8, read once); elsewhere both runs check only that the type does not exist.
+add_executable(test_mul_mat_armv6_i8 ci/test_mul_mat_armv6_i8.cpp)
+target_link_libraries(test_mul_mat_armv6_i8 PRIVATE loom::engine)
+add_test(NAME test_mul_mat_armv6_i8_off COMMAND test_mul_mat_armv6_i8)
+set_tests_properties(test_mul_mat_armv6_i8_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_I8=0")
+add_test(NAME test_mul_mat_armv6_i8 COMMAND test_mul_mat_armv6_i8)
+set_tests_properties(test_mul_mat_armv6_i8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_I8=1")
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
@@ -297,6 +395,13 @@ target_link_libraries(test_tinyblas_gemm PRIVATE loom::engine)
 target_compile_definitions(test_tinyblas_gemm PRIVATE LOOM_EXPECT_TINYBLAS=$<BOOL:${LOOM_TINYBLAS}>)
 add_test(NAME test_tinyblas_gemm COMMAND test_tinyblas_gemm)
 set_tests_properties(test_tinyblas_gemm PROPERTIES LABELS ci)
+
+add_executable(test_input_alias ci/test_input_alias.cpp)
+target_link_libraries(test_input_alias PRIVATE loom::engine)
+target_compile_definitions(test_input_alias PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_input_alias COMMAND test_input_alias)
+set_tests_properties(test_input_alias PROPERTIES LABELS ci)
+set_tests_properties(test_input_alias PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
 add_executable(test_gallocr_shrink ci/test_gallocr_shrink.cpp)
 target_link_libraries(test_gallocr_shrink PRIVATE loom::engine)
@@ -1238,15 +1343,6 @@ add_test(NAME test_e2e_kokoro_mil_albert_bert_encoder_reference COMMAND test_e2e
 set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- Numerical-correctness check: the deterministic `stats` (TextEncoder) topology against a real
-#     PyTorch forward pass of piper's own models.TextEncoder, using REAL phonemized text (T=62, real
-#     emb_rel_k/v pad branch exercised) -- see test_e2e_vits_stats_reference.cpp's own header comment. ---
-add_executable(test_e2e_vits_stats_reference gate/test_e2e_vits_stats_reference.cpp)
-target_link_libraries(test_e2e_vits_stats_reference PRIVATE loom::engine)
-add_test(NAME test_e2e_vits_stats_reference COMMAND test_e2e_vits_stats_reference)
-set_tests_properties(test_e2e_vits_stats_reference PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_vits_stats_reference PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- Numerical-correctness check: the flow+vocoder topology against a real PyTorch forward pass, with a
 #     FIXED (non-random) z_p -- isolates the coupling-flow+vocoder wiring from any RNG-related
 #     uncertainty in the full stochastic pipeline. See test_e2e_vits_flow_vocoder_reference.cpp. ---
@@ -1255,15 +1351,6 @@ target_link_libraries(test_e2e_vits_flow_vocoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_flow_vocoder_reference COMMAND test_e2e_vits_flow_vocoder_reference)
 set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Numerical-correctness check: the logw (TextEncoder+SDP reverse) topology against a real PyTorch
-#     forward pass, with FIXED (externally-injected) SDP noise -- isolates the real spline-flow assembly
-#     from RNG-related uncertainty. See test_e2e_vits_logw_reference.cpp. ---
-add_executable(test_e2e_vits_logw_reference gate/test_e2e_vits_logw_reference.cpp)
-target_link_libraries(test_e2e_vits_logw_reference PRIVATE loom::engine)
-add_test(NAME test_e2e_vits_logw_reference COMMAND test_e2e_vits_logw_reference)
-set_tests_properties(test_e2e_vits_logw_reference PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 
 
@@ -1340,15 +1427,6 @@ target_link_libraries(test_e2e_supertonic_style_attn PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_style_attn COMMAND test_e2e_supertonic_style_attn)
 set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- SupertonicTTS v2 roadmap: confirms VITS's own REL_POS_ATTENTION_SHAW primitive family is directly
-#     reusable for SupertonicTTS's MultiHeadRelativeAttention (same Shaw et al. mechanism, different
-#     window_size/channels). See convert_supertonic_relpos_attn.py. ---
-add_executable(test_e2e_supertonic_relpos_attn gate/test_e2e_supertonic_relpos_attn.cpp)
-target_link_libraries(test_e2e_supertonic_relpos_attn PRIVATE loom::engine)
-add_test(NAME test_e2e_supertonic_relpos_attn COMMAND test_e2e_supertonic_relpos_attn)
-set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: full DurationPredictor sub-model (DPTextEncoder + MLP head), the FIRST
 #     complete coherent sub-model in this effort, verified against the real duration_predictor.pt. See
@@ -1550,18 +1628,6 @@ target_compile_definitions(test_e2e_matcha_mil_lua_driver PRIVATE LOOM_LEGACY_RE
 add_test(NAME test_e2e_matcha_mil_lua_driver COMMAND test_e2e_matcha_mil_lua_driver)
 set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Procedural generalization: VITS's dynamic-length relative-position table cropping (loom.get_weight
-#     + loom.pad_crop_relative_embeddings) + Gaussian-noise-interleaved duration expansion, ported to Lua
-#     (tools/convert_piper_vits/vits_driver.lua) and compared against the existing loom::VitsDriver on
-#     the real checkpoint. See LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and
-#     BACKLOG.md's dated entry. ---
-add_executable(test_e2e_vits_lua_driver gate/test_e2e_vits_lua_driver.cpp)
-target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
-target_compile_definitions(test_e2e_vits_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
-add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
-set_tests_properties(test_e2e_vits_lua_driver PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL exporter: VITS retraced via export_vits_mil.py (real SynthesizerTrn submodules, not the
 #     hand-built bespoke topology above) + tools/convert_piper_vits/vits_driver/. See
@@ -1867,3 +1933,10 @@ target_link_libraries(test_e2e_moss_tts_composition PRIVATE loom::engine)
 add_test(NAME test_e2e_moss_tts_composition COMMAND test_e2e_moss_tts_composition)
 set_tests_properties(test_e2e_moss_tts_composition PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_moss_tts_composition PROPERTIES SKIP_RETURN_CODE 77)
+
+# The engine's FFT and the STFT / ISTFT primitives on it (ADR-080): the FFT against an f64 DFT at every
+# zoo size, each primitive against the convolutions it replaces, and 1 vs 4 threads bit for bit.
+add_executable(test_fft_ops ci/test_fft_ops.cpp)
+target_link_libraries(test_fft_ops PRIVATE loom::engine)
+add_test(NAME test_fft_ops COMMAND test_fft_ops)
+set_tests_properties(test_fft_ops PROPERTIES LABELS ci)
