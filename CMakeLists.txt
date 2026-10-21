@@ -34,7 +34,6 @@ add_library(loom_engine
     src/core/generation.cpp
     src/core/bilstm_stepper.cpp
     src/core/duration_aligner.cpp
-    src/core/relative_position.cpp
     src/core/lua_bridge.cpp
     src/core/vocab.cpp
     src/core/number_speller.cpp

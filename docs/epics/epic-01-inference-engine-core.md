@@ -133,8 +133,11 @@ These are deliberate boundaries, not defects. Each names what would have to chan
 - **General multi-scheme quantization tool.** `tools/quantize/quantize_gguf_q8_0.py` is Q8_0-only,
   single-model-shaped. A model-agnostic tool covering more of ggml's quant families, plus a
   per-tensor-role policy (skip norm weights/embeddings) rather than blanket quantization, is unbuilt.
-- **Attention-variant primitives beyond `ATTENTION`/`REL_POS_ATTENTION`/`REL_POS_ATTENTION_SHAW`** (e.g.
-  a dedicated flash-attention op) — add only when a real model needs one, not speculatively.
+- **Attention-variant primitives beyond `ATTENTION`/`REL_POS_ATTENTION`** (e.g. a dedicated
+  flash-attention op) — add only when a real model needs one, not speculatively. The Shaw family
+  (`REL_POS_ATTENTION_SHAW`, `REL_TO_ABS_SHAW`, `ABS_TO_REL_SHAW`) and `loom.pad_crop_relative_embeddings`
+  were retired on 2026-10-11. No exported topology used them: VITS and Supertonic trace their relative
+  positions into ordinary ops.
 
 
 ## 5. The ggml Pin

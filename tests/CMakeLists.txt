@@ -197,6 +197,23 @@ add_test(NAME test_graph_builder_shapes COMMAND test_graph_builder_shapes)
 set_tests_properties(test_graph_builder_shapes PROPERTIES LABELS ci)
 set_tests_properties(test_graph_builder_shapes PROPERTIES FIXTURES_REQUIRED builder_test_gguf_fixture)
 
+# Weights in ggml's CPU_REPACK buffer (LOOM_CPU_REPACK): every consumer but a direct F32 mul_mat is
+# routed to a plain copy (GgufModel::route_repacked_uses).
+add_test(
+    NAME gen_repack_test_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_repack_gguf.py
+            ${LOOM_FIXTURE_DIR}/repack_test.gguf
+)
+set_tests_properties(gen_repack_test_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_repack_test_gguf_fixture PROPERTIES FIXTURES_SETUP repack_test_gguf_fixture)
+
+add_executable(test_cpu_repack_routing ci/test_cpu_repack_routing.cpp)
+target_link_libraries(test_cpu_repack_routing PRIVATE loom::engine)
+target_compile_definitions(test_cpu_repack_routing PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")
+add_test(NAME test_cpu_repack_routing COMMAND test_cpu_repack_routing)
+set_tests_properties(test_cpu_repack_routing PROPERTIES LABELS ci)
+set_tests_properties(test_cpu_repack_routing PROPERTIES FIXTURES_REQUIRED repack_test_gguf_fixture)
+
 add_executable(test_lua_bridge_has_function ci/test_lua_bridge_has_function.cpp)
 target_link_libraries(test_lua_bridge_has_function PRIVATE loom::engine)
 add_test(NAME test_lua_bridge_has_function COMMAND test_lua_bridge_has_function)
@@ -1245,15 +1262,6 @@ add_test(NAME test_e2e_kokoro_mil_albert_bert_encoder_reference COMMAND test_e2e
 set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_kokoro_mil_albert_bert_encoder_reference PROPERTIES SKIP_RETURN_CODE 77)
 
-# --- Numerical-correctness check: the deterministic `stats` (TextEncoder) topology against a real
-#     PyTorch forward pass of piper's own models.TextEncoder, using REAL phonemized text (T=62, real
-#     emb_rel_k/v pad branch exercised) -- see test_e2e_vits_stats_reference.cpp's own header comment. ---
-add_executable(test_e2e_vits_stats_reference gate/test_e2e_vits_stats_reference.cpp)
-target_link_libraries(test_e2e_vits_stats_reference PRIVATE loom::engine)
-add_test(NAME test_e2e_vits_stats_reference COMMAND test_e2e_vits_stats_reference)
-set_tests_properties(test_e2e_vits_stats_reference PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_vits_stats_reference PROPERTIES SKIP_RETURN_CODE 77)
-
 # --- Numerical-correctness check: the flow+vocoder topology against a real PyTorch forward pass, with a
 #     FIXED (non-random) z_p -- isolates the coupling-flow+vocoder wiring from any RNG-related
 #     uncertainty in the full stochastic pipeline. See test_e2e_vits_flow_vocoder_reference.cpp. ---
@@ -1262,15 +1270,6 @@ target_link_libraries(test_e2e_vits_flow_vocoder_reference PRIVATE loom::engine)
 add_test(NAME test_e2e_vits_flow_vocoder_reference COMMAND test_e2e_vits_flow_vocoder_reference)
 set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_vits_flow_vocoder_reference PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Numerical-correctness check: the logw (TextEncoder+SDP reverse) topology against a real PyTorch
-#     forward pass, with FIXED (externally-injected) SDP noise -- isolates the real spline-flow assembly
-#     from RNG-related uncertainty. See test_e2e_vits_logw_reference.cpp. ---
-add_executable(test_e2e_vits_logw_reference gate/test_e2e_vits_logw_reference.cpp)
-target_link_libraries(test_e2e_vits_logw_reference PRIVATE loom::engine)
-add_test(NAME test_e2e_vits_logw_reference COMMAND test_e2e_vits_logw_reference)
-set_tests_properties(test_e2e_vits_logw_reference PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_vits_logw_reference PROPERTIES SKIP_RETURN_CODE 77)
 
 
 
@@ -1347,15 +1346,6 @@ target_link_libraries(test_e2e_supertonic_style_attn PRIVATE loom::engine)
 add_test(NAME test_e2e_supertonic_style_attn COMMAND test_e2e_supertonic_style_attn)
 set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_supertonic_style_attn PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- SupertonicTTS v2 roadmap: confirms VITS's own REL_POS_ATTENTION_SHAW primitive family is directly
-#     reusable for SupertonicTTS's MultiHeadRelativeAttention (same Shaw et al. mechanism, different
-#     window_size/channels). See convert_supertonic_relpos_attn.py. ---
-add_executable(test_e2e_supertonic_relpos_attn gate/test_e2e_supertonic_relpos_attn.cpp)
-target_link_libraries(test_e2e_supertonic_relpos_attn PRIVATE loom::engine)
-add_test(NAME test_e2e_supertonic_relpos_attn COMMAND test_e2e_supertonic_relpos_attn)
-set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_supertonic_relpos_attn PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- SupertonicTTS v2 roadmap: full DurationPredictor sub-model (DPTextEncoder + MLP head), the FIRST
 #     complete coherent sub-model in this effort, verified against the real duration_predictor.pt. See
@@ -1557,18 +1547,6 @@ target_compile_definitions(test_e2e_matcha_mil_lua_driver PRIVATE LOOM_LEGACY_RE
 add_test(NAME test_e2e_matcha_mil_lua_driver COMMAND test_e2e_matcha_mil_lua_driver)
 set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES LABELS gate)
 set_tests_properties(test_e2e_matcha_mil_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
-
-# --- Procedural generalization: VITS's dynamic-length relative-position table cropping (loom.get_weight
-#     + loom.pad_crop_relative_embeddings) + Gaussian-noise-interleaved duration expansion, ported to Lua
-#     (tools/convert_piper_vits/vits_driver.lua) and compared against the existing loom::VitsDriver on
-#     the real checkpoint. See LOOM_PROCEDURAL_GENERALIZATION.md / LOOM_MIL_CONVERSION.md and
-#     BACKLOG.md's dated entry. ---
-add_executable(test_e2e_vits_lua_driver gate/test_e2e_vits_lua_driver.cpp)
-target_link_libraries(test_e2e_vits_lua_driver PRIVATE loom::engine)
-target_compile_definitions(test_e2e_vits_lua_driver PRIVATE LOOM_LEGACY_REF_DIR="${LOOM_LEGACY_REF_DIR}")
-add_test(NAME test_e2e_vits_lua_driver COMMAND test_e2e_vits_lua_driver)
-set_tests_properties(test_e2e_vits_lua_driver PROPERTIES LABELS gate)
-set_tests_properties(test_e2e_vits_lua_driver PROPERTIES SKIP_RETURN_CODE 77)
 
 # --- MIL exporter: VITS retraced via export_vits_mil.py (real SynthesizerTrn submodules, not the
 #     hand-built bespoke topology above) + tools/convert_piper_vits/vits_driver/. See
