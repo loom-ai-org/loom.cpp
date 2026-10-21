@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-11
+last_updated: 2026-10-14
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -19,7 +19,7 @@ are not renumbered. New items continue the scheme.
 
 | item | why now |
 |---|---|
-| **LiteRT thread (2026-10-11): int8 is where XNNPACK's case is. The queue, in the user's order** | Results: Engine — performance, the XNNPACK item. ~~**(1) Q4 arm**~~ **DONE 2026-10-11** (the XNNPACK item's "4-bit" block): Q4_0 is slower than Q8_0 in ggml except on ARMv6; ggml's own Q4_0 repack matches XNNPACK `qb4w` on the M1; `qb4w` wins 1.5-1.9x only where no repack applies (A72); XNNPACK's 4-bit is slower than its int8 everywhere; `qb4w` cannot take Q4_0 blocks as-is (positive BF16 scales only). ~~**(2) `CPU_REPACK` in the engine**~~ **DONE 2026-10-11, opt-in** ([ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), `LOOM_CPU_REPACK=1|kleidiai`): on the M1, whisper-small 1.24-1.54x and Qwen3-0.6B decode 1.34-1.56x at one thread, 1.02-1.07x at 8 (memory-bound); KleidiAI best for Q8_0 prefill (1.53x) but 0.83x on Q8_0 decode at one thread. Whether it becomes the default is the open item under Engine — performance. ~~**(3) ADR: the XNNPACK microkernel bridge**~~ **WRITTEN 2026-10-11, proposed** ([ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)): a ggml patch adding a `CPU_XNNPACK` buffer type built like KleidiAI's, with only the selected per-ISA `qd8` kernels vendored and run on ggml's own threads; weights as row-uniform Q8_0 (`--quantize Q8_0_PC`), which every backend still reads as plain Q8_0 and the bridge packs losslessly; first cut `mul_mat` on Q8_0 only; main case the A72 (2.4-2.7x at the GEMM), then x86 Q8_0. ~~**(4) ADR: static int8 (qs8)**~~ **WRITTEN 2026-10-11, proposed** ([ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md)): the RTF ~1.5 estimate was taken against the wrong baseline and is withdrawn. Against the F32 conv sweep Citrinet actually runs (0.22 GOP/s), XNNPACK `qs8` (0.54-0.62 on ARMv6) gives RTF ~1.8; even an infinitely fast GEMM leaves 0.82. So real time needs the non-GEMM 24% faster too, and an ARMv6 int8 GEMM ~2x XNNPACK's. Its four gates in order: split the 24% by op on the board; an ARMv6 int8 GEMM >= 1.2 GOP/s; WER; jfk on the board. **(5) Port XNNPACK's softmax** (`f32-raddstoreexpminusmax` + `f32-rmax`) as a ggml patch, with an ACCURACY comparison against ggml's current `soft_max`, not just timing (the `SOFT_MAX` item). **(6) Fix ggml's F32 GEMM throughput at large K** on ARM (whisper `fc2`, K=3072, runs at half the rate of K=768 on the Pi 4 and the Pi Zero, not on the M1). Find where the drop starts by sweeping K, then fix the K blocking. It also hits Qwen3-0.6B's `down_proj` (the large-K item). The gemma-3 "KV leak" was not one ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT steps 1-2 (ADR-072, ADR-073), the T5 encoder bias (ADR-074) and the pad_crop retirement are on pushed branches `perf/delayed-shrink-zero-copy-inputs` / `chore/retire-pad-crop-relative-embeddings` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. |
+| **LiteRT thread (2026-10-11): int8 is where XNNPACK's case is. The queue, in the user's order** | Results: Engine — performance, the XNNPACK item. ~~**(1) Q4 arm**~~ **DONE 2026-10-11** (the XNNPACK item's "4-bit" block): Q4_0 is slower than Q8_0 in ggml except on ARMv6; ggml's own Q4_0 repack matches XNNPACK `qb4w` on the M1; `qb4w` wins 1.5-1.9x only where no repack applies (A72); XNNPACK's 4-bit is slower than its int8 everywhere; `qb4w` cannot take Q4_0 blocks as-is (positive BF16 scales only). ~~**(2) `CPU_REPACK` in the engine**~~ **DONE 2026-10-11, opt-in** ([ADR-075](../adrs/adr-075-quantized-weights-reach-ggmls-repack-by-placement-and-routing.md), `LOOM_CPU_REPACK=1|kleidiai`): on the M1, whisper-small 1.24-1.54x and Qwen3-0.6B decode 1.34-1.56x at one thread, 1.02-1.07x at 8 (memory-bound); KleidiAI best for Q8_0 prefill (1.53x) but 0.83x on Q8_0 decode at one thread. Whether it becomes the default is the open item under Engine — performance. ~~**(3) ADR: the XNNPACK microkernel bridge**~~ **WRITTEN 2026-10-11, proposed** ([ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)): a ggml patch adding a `CPU_XNNPACK` buffer type built like KleidiAI's, with only the selected per-ISA `qd8` kernels vendored and run on ggml's own threads; weights as row-uniform Q8_0 (`--quantize Q8_0_PC`), which every backend still reads as plain Q8_0 and the bridge packs losslessly; first cut `mul_mat` on Q8_0 only; main case the A72 (2.4-2.7x at the GEMM), then x86 Q8_0. ~~**(4) ADR: static int8 (qs8)**~~ **WRITTEN 2026-10-11, proposed** ([ADR-077](../adrs/adr-077-static-int8-for-citrinet-256-on-the-pi-zero.md)): the RTF ~1.5 estimate was taken against the wrong baseline and is withdrawn. Against the F32 conv sweep Citrinet actually runs (0.22 GOP/s), XNNPACK `qs8` (0.54-0.62 on ARMv6) gives RTF ~1.8; even an infinitely fast GEMM leaves 0.82. So real time needs the non-GEMM 24% faster too, and an ARMv6 int8 GEMM ~2x XNNPACK's. Its four gates in order: split the 24% by op on the board; an ARMv6 int8 GEMM >= 1.2 GOP/s; WER; jfk on the board. ~~**(5) Port XNNPACK's softmax**~~ **PORTED 2026-10-13 as `ggml-0029`** (the `SOFT_MAX` item): one thread, dense/causal, x86 1.45x/2.05x, Pi 4 2.10x/2.14x, M1 1.54x/1.71x, Pi Zero 1.46x/1.15x; accuracy kept by a grouped f64 sum. CosyVoice3's free-running gate failed on it; a control showed it measures chaos, mel and ASR held on two more fixtures, and its bound is now 6e-2. ~~**(6) Fix ggml's F32 GEMM throughput at large K**~~ **PATCHED 2026-10-13 as `ggml-0030`, aarch64 only, bit-identical** (the large-K item): Pi 4 K=3072 1.35x at 1 thread, 1.41x at 4. Original: (whisper `fc2`, K=3072, runs at half the rate of K=768 on the Pi 4 and the Pi Zero, not on the M1). Find where the drop starts by sweeping K, then fix the K blocking. It also hits Qwen3-0.6B's `down_proj` (the large-K item). The gemma-3 "KV leak" was not one ([Retro-084](../retros/retro-084-a-sampler-was-logged-as-a-leaking-cache.md)). The LiteRT steps 1-2 (ADR-072, ADR-073), the T5 encoder bias (ADR-074) and the pad_crop retirement are on pushed branches `perf/delayed-shrink-zero-copy-inputs` / `chore/retire-pad-crop-relative-embeddings` (loom.cpp) and `feat/t5-bias-in-graph` (loom-exporter), no PRs yet. |
 | **P5 breadth: family 14 (music): the next leaf** | MusicGen Small is **published** (2026-10-10, `musicgen-small-loom`, [Epic-03 §2](../epics/epic-03-model-coverage.md#family-14-musicgen-two-families-composed)). The next leaves are unscoped. MusicGen medium/large are the same export at 1.5B/3.3B parameters; melody (chroma-conditioned) and stereo are different models. Music was last in [Epic-03 §3](../epics/epic-03-model-coverage.md)'s order; everything before it is complete or parked (fastpitch and bananamind-tts deferred 2026-10-01; kugelaudio, tada, dots-tts and irodori-tts dropped 2026-09-26) |
 | **Nemotron 3.5 ASR: the English-only sibling** | Nemotron 3.5 ASR is **published** (2026-10-10, `nemotron-3.5-asr-streaming-0.6b-loom`, Hub `4a28fa5`, on rc16; [Epic-03 §2](../epics/epic-03-model-coverage.md#family-1s-fourth-transducer-nemotron-35-asr)). Next leaf: `nvidia/nemotron-speech-streaming-en-0.6b`, the same encoder with no language prompt (a `nemotron_asr_streaming` recognizer and an encoder wrapper without the prompt), NVIDIA Open Model License |
 
@@ -306,7 +306,29 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **`SOFT_MAX`: XNNPACK shows 1.75-1.81x headroom over ggml on whisper's 1500-wide rows** (Ryzen 3
+* [ ] **`SOFT_MAX`: PORTED 2026-10-13 as `ggml-0029`, measured on all four machines, CosyVoice3 gate re-bounded; open: commit + upstream.** (UPSTREAM.md PR 26.)
+  XNNPACK's exponential kernels, a four-accumulator vector max, the copy/scale/mask fused into one pass
+  (no pass at all for a plain softmax), and a sum that is NOT XNNPACK's. Its f32 accumulators raised
+  |sum - 1| from 1.3e-7 to 7.1e-7, so each unrolled step adds in f32 (four per lane) and widens into f64
+  vector accumulators. **What the Retro-012 attempt missed:** `ggml_v_expf` leaves its fast path whenever a
+  vector holds |n| > 126, and a causal mask's -inf does exactly that. Masked rows cost 2x dense ones.
+  Through the real op, one AVX2 thread, 12 x 1500 x 1500: dense 49.3 → 34.1 ms (1.45x; XNNPACK 29.0),
+  F16 causal 101.9 → 49.7 ms (2.05x). Accuracy against f64 (plain, scaled, F32/F16 causal, ALiBi, 77-wide
+  tails): AVX2 same-or-better on every metric; aarch64 under qemu within 5%; ARMv6 under qemu sum unchanged, max abs 3.6e-8 → 5.0e-8 (libm's 0.5-ulp expf → 1.96 ulp, the trade XNNPACK's Pi Zero speed rests on). Tools are in the session
+  scratch (`sm/softmax_probe.cpp` row probe with every variant, `sm/smtest.cpp` op test with an XNNPACK arm).
+  **On the boards** (1 thread, dense / causal): Pi 4 2.10x / 2.14x (XNNPACK's own margin 2.05x), M1 1.54x / 1.71x
+  (XNNPACK 1.29x), Pi Zero 1.46x / 1.15x (XNNPACK 1.97x); Pi 4 at 4 threads ~1.0x / 1.08x (memory-bound). NEON uses
+  `rr1_p5`, not XNNPACK's `lut64_p2`: faster on both chips (A72 2%, M1 20%). **ARMv6 trap, fixed:** XNNPACK's
+  scalar kernel computes on -inf and zeroes at the end; the ARM1176's VFP traps the inf - inf NaN (and denormals)
+  to software, and causal rows went 18x SLOWER (22.4 s). The kernel replaces sub-cutoff inputs by 0 first.
+  **CosyVoice3 gate, re-bounded 2026-10-14 (user's call):** its free-running waveform rmse failed with this patch
+  (cloned voice 0.0333 > 2e-2; unpatched 0.0069), and a control with ggml's own exp and only the sum reordered gave
+  0.0343. On two more fixtures (new sentences, default voice and JFK clone) every build and both reference runs
+  transcribe to the same words (whisper-small), and the log-mel distance stays inside the reference's own f32-vs-f64
+  spread; the waveform rmse ranges 0.007-0.058 across builds, while the reference's own f32 run ranges 0.009-0.249. Bound
+  raised to 6e-2, with the measurements in the test.
+  *The original item:*
+  **`SOFT_MAX`: XNNPACK shows 1.75-1.81x headroom over ggml on whisper's 1500-wide rows** (Ryzen 3
   3250U, one thread, `scripts/bench_xnnpack.cpp`, 2026-10-11). This tree's best attempt reached 1.16x
   on the same box (Retro-012: the 3-pass row and the `ggml_v_expf` specialisation). So the headroom is
   real and was not found. Read XNNPACK's `f32-raddstoreexpminusmax` and `f32-rmax` kernels (BSD-3)
@@ -326,7 +348,18 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   **ARM (2026-10-11): headroom only on the A72, and smaller than x86.** Pi 4: 1.32x at one thread, 1.18x
   at four. M1: 1.02x and 1.05x. Pi Zero: 0.94-1.08x. A better NEON tile is worth ~1.3x on the Pi 4 and
   nothing on the M1.
-* [ ] **ggml's F32 GEMM halves its throughput at K=3072 on both ARM boards.** whisper `fc2`
+* [ ] **ggml's F32 GEMM at large K: PATCHED for aarch64 as `ggml-0030` (2026-10-13, UPSTREAM.md PR 27); the Pi Zero
+  is still open.** The sweep (Pi 4, 768 x 1500, tinyBLAS) is flat at 8.5 GFLOP/s to K=1536 on one core, then
+  6.4 / 5.05 / 4.3 at K=2048 / 3072 / 4096. On four cores the knee is at K=1024. Two working sets: the 4-row A strip
+  outgrows the 32 KB L1D at K=2048, and four 72-column B blocks outgrow the shared 1 MB L2 at K=1024. The fix chunks
+  K inside each job (chunk = 3/8 of L1D, 768 there) and caps the B block at half of L2, both read from sysfs/sysctl.
+  The vector accumulators carry across chunks, so outputs are BIT-IDENTICAL (hashes on AVX2/A72/M1; the CosyVoice3
+  gate reproduces the unpatched numbers to every digit). Pi 4 K=3072: 5.05 → 6.84 (1 thread), 12.7 → 17.9 (4).
+  About two thirds of the drop is recovered. M1: derived chunk 3072, untouched (flat anyway). x86: neutral to -6%,
+  so compiled out. **Not covered:** the Pi Zero, whose ARMv6 GEMM is a different kernel class (ggml-0018).
+  **The earlier "not on the M1" stands only with tinyBLAS:** without `GGML_LLAMAFILE` the M1 also steps down 20% at
+  K=2048. *The original item:*
+  **ggml's F32 GEMM halves its throughput at K=3072 on both ARM boards.** whisper `fc2`
   (3072x1500x768) runs at 4.3-4.4 GFLOP/s on one A72 core against 8.3 for `fc1` (768x1500x3072), the
   same FLOPs with K=768. At four threads it is 10.1 vs 24. The Pi Zero shows the same 2x, and the M1
   does not (91.8 vs 94.1). XNNPACK holds its rate on both, so the cause is ggml's K blocking, not the
