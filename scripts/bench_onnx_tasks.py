@@ -5,6 +5,20 @@
 #   python3 scripts/bench_onnx_tasks.py vits <miro_en-GB.onnx>        [threads] [nrun]
 #   python3 scripts/bench_onnx_tasks.py lm   <qwen3/onnx/model.onnx>  [threads] [n_new] [nrun]
 #   python3 scripts/bench_onnx_tasks.py asr  <whisper-small-dir> <wav> [threads] [nrun]
+#   python3 scripts/bench_onnx_tasks.py moonshine <moonshine-tiny-dir> <wav> [threads] [nrun]
+#   python3 scripts/bench_onnx_tasks.py ctc  <citrinet-dir> <clip-stem> [threads] [nrun]
+#
+# `$LOOM_ONNX_SUFFIX` picks a variant of the files inside an export directory: `_int8` reads
+# onnx-community's `encoder_model_int8.onnx` / `decoder_model_merged_int8.onnx`. The int8 arm uses
+# those PUBLISHED files rather than `quantize_dynamic` on the merged decoder, because quantize_dynamic
+# leaves a merged decoder's `If` subgraphs in F32 (the output is the F32 size, 615 MB for whisper-small);
+# onnx-community quantizes before merging. VITS and Citrinet have no published int8, so theirs is
+# `quantize_dynamic(weight_type=QInt8)` with every other knob at its default.
+#
+# `ctc` reads NeMo's own ONNX export (`model.onnx`, features in, log-probs out) plus the clip's
+# features as `<stem>.feats.npy` / `<stem>.len.npy` and `vocab.json`, all written by NeMo on the dev
+# box. Like the whisper task, it leaves the front end outside onnxruntime's timer, where loom's
+# `bench_asr_loom` times its in-graph STFT front end too -- a small bias in onnxruntime's favour.
 #
 # Its loom counterparts are scripts/bench_{vits,lm,asr}_loom.cpp, and each pair is checked for EQUAL
 # WORK rather than merely equal wall time: `vits` prints the sample count (both engines must say
@@ -44,7 +58,7 @@
 # Pin the version you quote. `pip install onnxruntime` 1.28.0 is the README's baseline; conda-forge's
 # build of the SAME version is 1.86x faster on VITS, which is large enough to change every conclusion
 # ([Retro-012](../docs/retros/retro-012-optimizations-that-were-measured-out.md)).
-import statistics, sys, time, wave
+import json, os, statistics, sys, time, wave
 import numpy as np
 import onnxruntime as ort
 
@@ -137,9 +151,12 @@ def bench_asr(directory, wav, threads, nrun):
     feats = fe(pcm, sampling_rate=16000, return_tensors="np")["input_features"].astype(np.float32)
 
     so = opts(threads)
-    enc = ort.InferenceSession(f"{directory}/onnx/encoder_model.onnx", so, providers=["CPUExecutionProvider"])
-    dec = ort.InferenceSession(f"{directory}/onnx/decoder_model_merged.onnx", so, providers=["CPUExecutionProvider"])
+    sfx = os.environ.get("LOOM_ONNX_SUFFIX", "")
+    enc = ort.InferenceSession(f"{directory}/onnx/encoder_model{sfx}.onnx", so, providers=["CPUExecutionProvider"])
+    dec = ort.InferenceSession(f"{directory}/onnx/decoder_model_merged{sfx}.onnx", so, providers=["CPUExecutionProvider"])
     dec_out = [o.name for o in dec.get_outputs()]
+    # onnx-community's int8 merged decoder predates `cache_position` (positions come from the past length).
+    has_cache_position = "cache_position" in {i.name for i in dec.get_inputs()}
     past_names = list(empty_past(dec))
     eot = tok.convert_tokens_to_ids("<|endoftext|>")
     start = tok.convert_tokens_to_ids(["<|startoftranscript|>", "<|en|>", "<|transcribe|>", "<|notimestamps|>"])
@@ -151,7 +168,8 @@ def bench_asr(directory, wav, threads, nrun):
             feed = dict(past)
             feed["input_ids"] = ids
             feed["encoder_hidden_states"] = h
-            feed["cache_position"] = np.arange(pos, pos + ids.shape[1], dtype=np.int64)
+            if has_cache_position:
+                feed["cache_position"] = np.arange(pos, pos + ids.shape[1], dtype=np.int64)
             feed["use_cache_branch"] = np.array([not first], dtype=bool)
             out = dec.run(None, feed)
             nxt = int(np.argmax(out[dec_out.index("logits")][0, -1]))
@@ -177,6 +195,90 @@ def bench_asr(directory, wav, threads, nrun):
     print(f"  text: {text}")
 
 
+def read_pcm(wav):
+    with wave.open(wav) as w:
+        assert w.getframerate() == 16000 and w.getnchannels() == 1 and w.getsampwidth() == 2
+        return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def bench_moonshine(directory, wav, threads, nrun):
+    # Moonshine takes the raw waveform, so unlike whisper there is no front end left outside the timer.
+    from transformers import PreTrainedTokenizerFast
+    pcm = read_pcm(wav)
+    tok = PreTrainedTokenizerFast(tokenizer_file=f"{directory}/tokenizer.json")
+    gen = json.load(open(f"{directory}/generation_config.json"))
+    bos, eos = gen["decoder_start_token_id"], gen["eos_token_id"]
+    so = opts(threads)
+    sfx = os.environ.get("LOOM_ONNX_SUFFIX", "")
+    enc = ort.InferenceSession(f"{directory}/onnx/encoder_model{sfx}.onnx", so, providers=["CPUExecutionProvider"])
+    dec = ort.InferenceSession(f"{directory}/onnx/decoder_model_merged{sfx}.onnx", so, providers=["CPUExecutionProvider"])
+    dec_out = [o.name for o in dec.get_outputs()]
+    past_names = list(empty_past(dec))
+    # transformers' Moonshine caps generation at 6.5 tokens per second of audio; the same cap here.
+    max_new = int(np.ceil(len(pcm) / 16000 * 6.5))
+
+    def run():
+        h = enc.run(None, {"input_values": pcm[None, :]})[0]
+        past, ids, toks, first = empty_past(dec), np.array([[bos]], dtype=np.int64), [], True
+        for _ in range(max_new):
+            feed = dict(past)
+            feed["input_ids"] = ids
+            feed["encoder_hidden_states"] = h
+            feed["use_cache_branch"] = np.array([not first], dtype=bool)
+            out = dec.run(None, feed)
+            nxt = int(np.argmax(out[dec_out.index("logits")][0, -1]))
+            past = {p: (out[dec_out.index(p.replace("past_key_values", "present"))]
+                        if (first or ".decoder." in p) else past[p]) for p in past_names}
+            first = False
+            if nxt == eos:
+                break
+            toks.append(nxt)
+            ids = np.array([[nxt]], dtype=np.int64)
+        return tok.decode(toks, skip_special_tokens=True)
+
+    text = run()                             # warm up
+    ts = []
+    for _ in range(nrun):
+        t0 = time.perf_counter(); text = run(); ts.append(time.perf_counter() - t0)
+    ts.sort()
+    print(f"onnx   moonshine audio={len(pcm) / 16000:.2f}s  median {ts[len(ts) // 2]:.4f} s  "
+          f"min {ts[0]:.4f} s  (n={nrun}, intra_op={threads})")
+    print(f"  text: {text}")
+
+
+def bench_ctc(directory, stem, threads, nrun):
+    feats = np.load(f"{directory}/{stem}.feats.npy")
+    flen = np.load(f"{directory}/{stem}.len.npy")
+    vocab = json.load(open(f"{directory}/vocab.json"))
+    sfx = os.environ.get("LOOM_ONNX_SUFFIX", "")
+    sess = ort.InferenceSession(f"{directory}/model{sfx}.onnx", opts(threads), providers=["CPUExecutionProvider"])
+    names = [i.name for i in sess.get_inputs()]
+    feed = {names[0]: feats, names[1]: flen}
+
+    def run():
+        logp = sess.run(None, feed)[0][0]
+        ids, prev, keep = logp.argmax(-1), None, []
+        for t in ids:                        # greedy CTC: collapse repeats, drop the blank (last id)
+            if t != prev and t != len(vocab):
+                keep.append(int(t))
+            prev = t
+        # Citrinet-256-ls is WordPiece (`##` continues a word; NeMo emits [CLS]/[SEP] as ordinary ids),
+        # Citrinet-1024 SentencePiece (`▁` starts one): join either way, drop the two markers.
+        pieces = [vocab[i] for i in keep if vocab[i] not in ("[CLS]", "[SEP]")]
+        if any(p.startswith("##") for p in pieces):
+            return "".join(p[2:] if p.startswith("##") else " " + p for p in pieces).strip()
+        return "".join(pieces).replace("▁", " ").strip()
+
+    text = run()                             # warm up
+    ts = []
+    for _ in range(nrun):
+        t0 = time.perf_counter(); text = run(); ts.append(time.perf_counter() - t0)
+    ts.sort()
+    print(f"onnx   ctc   frames={feats.shape[-1]}  median {ts[len(ts) // 2]:.4f} s  "
+          f"min {ts[0]:.4f} s  (n={nrun}, intra_op={threads})")
+    print(f"  text: {text}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(__doc__ or "see header", file=sys.stderr); sys.exit(2)
@@ -191,5 +293,9 @@ if __name__ == "__main__":
     elif task == "asr":
         bench_asr(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 4,
                   int(sys.argv[5]) if len(sys.argv) > 5 else 3)
+    elif task in ("moonshine", "ctc"):
+        (bench_moonshine if task == "moonshine" else bench_ctc)(
+            sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 4,
+            int(sys.argv[5]) if len(sys.argv) > 5 else 5)
     else:
         print(f"unknown task {task!r}", file=sys.stderr); sys.exit(2)
