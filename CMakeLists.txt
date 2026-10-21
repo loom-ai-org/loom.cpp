@@ -61,6 +61,7 @@ add_library(loom_engine
     src/ops/primitives_rope.cpp
     src/ops/primitives_attention.cpp
     src/ops/primitives_conv.cpp
+    src/ops/fft.cpp
     src/ops/primitives_spline.cpp
     src/ops/primitives_flow.cpp
     src/ops/primitives_recurrent.cpp

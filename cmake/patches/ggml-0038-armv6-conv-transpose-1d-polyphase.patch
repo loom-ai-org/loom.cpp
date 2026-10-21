@@ -1,0 +1,208 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 77072185..d2205adf 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3044,6 +3044,9 @@ struct ggml_cplan ggml_graph_plan(
+                             // its own tile from the same budget, so the two have to agree. The MAX is
+                             // the tile == 1 case, where one position's worth of Cout*K is all it takes.
+                             cur += sizeof(float)*MAX((int64_t) GGML_CONV_TRANSPOSE_1D_TILE, ne00*ne01);
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++                            cur = MAX(cur, ggml_armv6_conv_transpose_1d_wsize(node, n_tasks));
++#endif
+                         } else {
+                             GGML_ABORT("fatal error");
+                         }
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 74106177..a06e985d 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6653,6 +6653,11 @@ static void ggml_call_mul_mat_ldc(ggml_type type, const ggml_compute_params * pa
+                                   int64_t m, int64_t n, int64_t k,
+                                   void * a, void * b, float * c, int64_t ldc);
+ 
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++// ARMv6 (ggml-0038): the polyphase driver on the short-vector tiles, defined with them below.
++static bool ggml_conv_transpose_1d_armv6(const ggml_compute_params * params, ggml_tensor * dst);
++#endif
++
+ static void ggml_compute_forward_conv_transpose_1d_f32(
+         const ggml_compute_params * params,
+               ggml_tensor * dst) {
+@@ -6664,6 +6669,12 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+     GGML_ASSERT( dst->type == GGML_TYPE_F32);
+ 
++#if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
++    if (ggml_conv_transpose_1d_armv6(params, dst)) {
++        return;
++    }
++#endif
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;
+@@ -8699,6 +8710,151 @@ static bool ggml_conv_1d_armv6(const ggml_compute_params * params, const ggml_te
+     return true;
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// ARMv6 ONLY: CONV_TRANSPOSE_1D AS POLYPHASE DIRECT CONVOLUTIONS ON THE SAME TILES (loom ggml-0038,
++// ADR-079 P4.32f f2).
++//
++// A stride-s transposed convolution with K = J*s taps splits into s PHASES, each an ordinary J-tap
++// convolution over the input padded by J - 1 zeros on either side:
++//
++//     y[oc][q*s + p] = sum_j sum_ic w[ic][oc][p + (J-1-j)*s] * xpad[ic][q + j],   xpad[m] = x[m - (J-1)]
++//
++// so each phase is one call of the J-tap tile per quad of output channels, over a window the s phases
++// share, and every output is written once. ggml-0009 ran it as a GEMM [Cout*K, Cin] x [Cin, L] and an
++// overlap-add that adds K/s partial results into every output; the vocoders' upsampling stages (J = 2
++// in piper, VITS, sanoTTS) are 13-20% of a synthesis on a Pi Zero W. Measured there (loom
++// scripts/bench56.cpp, amy's three stages, one thread, RunFast), ggml-0009 + the bias ADD against this:
++//
++//     192 > 96  s8 k16    658 ms   367    1.79x
++//      96 > 48  s8 k16   1379      751    1.84x
++//      48 > 24  s4 k8    1870      763    2.45x
++//
++// Not bit-identical: the tile sums the taps and channels in its own order (max error 5e-7 - 1e-6 of
++// the peak against an f64 reference, ggml-0009's 1.4e-7 - 2.5e-7). Per block of TB phase positions and
++// chunk of input channels (the 0032 blocking): the chunk's window rows [icc][TB + J - 1] are copied out
++// of the input once, then every quad's s phases run into a per-thread scratch [OCq][s][4][TBx], whose
++// last chunk is interleaved into dst. GGML_CPU_ARMV6_CONVT=0 turns it off; _TB=<n> fixes the block.
++struct ggml_armv6_convt_geom {
++    int64_t s, J, Q, OCq, TB, TBx, xrow, icc, nch;
++    size_t  n_wp, n_b, n_x, n_s;
++};
++
++static bool ggml_armv6_convt_plan(const ggml_tensor * dst, ggml_armv6_convt_geom * g) {
++    static const int enabled = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONVT", 1);
++    static const int tb_env  = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONVT_TB", 0);
++    static const int l1_env  = ggml_armv6_conv_env("GGML_CPU_ARMV6_CONV_L1", 12 * 1024);
++    const ggml_tensor * k = dst->src[0], * x = dst->src[1];
++    if (!enabled || k->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (!ggml_is_contiguous(k) || !ggml_is_contiguous(x) || !ggml_is_contiguous(dst)) return false;
++    if (x->ne[2] != 1 || x->ne[3] != 1 || k->ne[3] != 1) return false;
++    const int64_t K = k->ne[0], s = ((const int32_t *) dst->op_params)[0];
++    if (s < 1 || K % s != 0 || K / s > GGML_ARMV6_CONV_KMAX) return false;
++    g->s   = s;
++    g->J   = K / s;
++    g->Q   = x->ne[0] + g->J - 1;
++    g->OCq = (k->ne[1] + 3) / 4;
++    if (dst->ne[1] != k->ne[1] || g->Q * s != dst->ne[0]) return false;   // no padding, no dilation
++    // TB 32 / 64 over amy's three stages: 1958 / 1881 ms (bench56)
++    g->TB  = tb_env > 0 ? (tb_env + 3) & ~3 : 64;
++    g->TBx = g->TB + 4;
++    g->xrow = g->TBx + g->J - 1;
++    const int64_t IC = k->ne[2];
++    const int64_t icc_max = MAX((int64_t) 1, (int64_t) l1_env / (g->xrow * 4 + g->J * 16) - 1);
++    g->nch = (IC + icc_max - 1) / icc_max;
++    g->icc = (IC + g->nch - 1) / g->nch;
++    g->n_wp = (size_t) s * g->OCq * IC * g->J * 4 + 4;   // + the tile's W preload past the last quad
++    g->n_b  = (size_t) g->OCq * 4;
++    g->n_x  = (size_t) (g->icc + 1) * g->xrow + 4;       // + the spare row the last preload reads
++    g->n_s  = (size_t) g->OCq * s * 4 * g->TBx;
++    return true;
++}
++
++size_t ggml_armv6_conv_transpose_1d_wsize(const struct ggml_tensor * node, int n_tasks) {
++    ggml_armv6_convt_geom g;
++    if (!ggml_armv6_convt_plan(node, &g)) return 0;
++    return GGML_PAD(g.n_wp * 4, 64) + GGML_PAD(g.n_b * 4, 64) + (size_t) n_tasks * GGML_PAD((g.n_x + g.n_s) * 4, 64);
++}
++
++static bool ggml_conv_transpose_1d_armv6(const ggml_compute_params * params, ggml_tensor * dst) {
++    ggml_armv6_convt_geom g;
++    if (!ggml_armv6_convt_plan(dst, &g)) return false;
++    const ggml_tensor * kernel = dst->src[0], * src = dst->src[1];
++    const int64_t IC = kernel->ne[2], OC = kernel->ne[1], K = kernel->ne[0];
++    const int64_t IL = src->ne[0], OL = dst->ne[0];
++    const int64_t s = g.s, J = g.J;
++    const size_t  per_thread = GGML_PAD((g.n_x + g.n_s) * 4, 64);
++    if (GGML_PAD(g.n_wp * 4, 64) + GGML_PAD(g.n_b * 4, 64) + (size_t) params->nth * per_thread > params->wsize) return false;
++
++    char *  wdata = (char *) params->wdata;
++    float * wp = (float *) wdata;
++    float * bz = (float *) (wdata + GGML_PAD(g.n_wp * 4, 64));
++    float * xw = (float *) (wdata + GGML_PAD(g.n_wp * 4, 64) + GGML_PAD(g.n_b * 4, 64) + (size_t) params->ith * per_thread);
++    float * S  = xw + g.n_x;
++
++    // [p][quad][ic][j][r] = w[ic][4 quad + r][p + (J-1-j)*s], zero past OC
++    const float * w = (const float *) kernel->data;
++    for (int64_t pq = params->ith; pq < s * g.OCq; pq += params->nth) {
++        const int64_t p = pq / g.OCq, q = pq % g.OCq;
++        float * d = wp + (size_t) pq * IC * J * 4;
++        for (int64_t c = 0; c < IC; ++c)
++            for (int64_t j = 0; j < J; ++j)
++                for (int64_t r = 0; r < 4; ++r) {
++                    const int64_t o = 4 * q + r;
++                    *d++ = o < OC ? w[(c * OC + o) * K + p + (J - 1 - j) * s] : 0.0f;
++                }
++    }
++    if (params->ith == 0) {
++        for (int64_t o = 0; o < (int64_t) g.n_b; ++o) bz[o] = 0.0f;
++        for (int i = 0; i < 4; ++i) wp[g.n_wp - 4 + i] = 0.0f;
++    }
++    ggml_barrier(params->threadpool);
++
++    const int64_t nblk = (g.Q + g.TB - 1) / g.TB;
++    const int64_t per  = (nblk + params->nth - 1) / params->nth;
++    const int64_t b0   = params->ith * per, b1 = MIN(b0 + per, nblk);
++    const float * x = (const float *) src->data;
++    float *       y = (float *) dst->data;
++
++    ggml_armv6_conv_args a;
++    a.xrow    = (int32_t) (g.xrow * 4);
++    a.d4      = 4;
++    a.ystride = (int32_t) (g.TBx * 4);
++    const ggml_armv6_conv_fn fn = ggml_armv6_conv_f32[J];
++    for (int64_t b = b0; b < b1; ++b) {
++        const int64_t q0 = b * g.TB, nb = MIN(g.TB, g.Q - q0), nt = (nb + 3) / 4, L = nt * 4 + J - 1;
++        for (int64_t ch = 0; ch < g.nch; ++ch) {
++            const int64_t c0 = ch * g.icc, cn = MIN(g.icc, IC - c0);
++            for (int64_t c = 0; c < cn; ++c) {          // row[t] = x[c0 + c][q0 + t - (J - 1)], zero outside
++                float *       row = xw + (size_t) c * g.xrow;
++                const float * in  = x + (c0 + c) * IL;
++                const int64_t p0 = q0 - (J - 1);
++                const int64_t lo = MAX((int64_t) 0, -p0), hi = MIN(L, IL - p0);
++                if (lo > 0) memset(row, 0, (size_t) MIN(lo, L) * sizeof(float));
++                if (hi > lo) memcpy(row + lo, in + p0 + lo, (size_t) (hi - lo) * sizeof(float));
++                if (MAX(hi, lo) < L) memset(row + MAX(hi, lo), 0, (size_t) (L - MAX(hi, lo)) * sizeof(float));
++            }
++            a.x    = xw;
++            a.n_ic = (int32_t) cn;
++            a.nt   = (int32_t) nt;
++            for (int64_t q = 0; q < g.OCq; ++q)
++                for (int64_t p = 0; p < s; ++p) {
++                    a.w = wp + (((size_t) p * g.OCq + q) * IC + c0) * J * 4;
++                    a.b = ch == 0 ? bz + 4 * q : nullptr;
++                    a.y = S + ((size_t) q * s + p) * 4 * g.TBx;
++                    fn(&a);
++                }
++        }
++        // interleave: y[o][(q0 + t)*s + p] = S[quad][p][r][t]; (Q - 1)*s + s - 1 = OL - 1, so all exist
++        for (int64_t o = 0; o < OC; ++o) {
++            float *       yr = y + o * OL + q0 * s;
++            const float * sp = S + ((size_t) (o / 4) * s * 4 + (o % 4)) * g.TBx;
++            for (int64_t t = 0; t < nb; ++t)
++                for (int64_t p = 0; p < s; ++p) yr[t * s + p] = sp[(size_t) p * 4 * g.TBx + t];
++        }
++    }
++    return true;
++}
++
+ // ARMv6 ONLY: F32 MUL_MAT WITH n >= 24 ON THE SAME SHORT-VECTOR KERNEL (loom ADR-079, item P4.32d).
+ //
+ // The k = 1 conv kernel above is already a GEMM tile: per input row, a vector of four positions times
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index e04df8a5..0dbe9977 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -105,6 +105,8 @@ void ggml_compute_forward_conv_2d(const struct ggml_compute_params * params, str
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+ // ARMv6 (loom ADR-079 P4.32d): F32 MUL_MAT with n >= 24 on the short-vector kernels; see ops.cpp.
+ size_t ggml_armv6_mul_mat_f32_wsize(const struct ggml_tensor * node, int n_tasks);
++// ARMv6 (loom ggml-0038): CONV_TRANSPOSE_1D as polyphase direct convolutions; 0 if it does not take it.
++size_t ggml_armv6_conv_transpose_1d_wsize(const struct ggml_tensor * node, int n_tasks);
+ bool   ggml_armv6_mul_mat_f32(const struct ggml_compute_params * params, const struct ggml_tensor * src0,
+                               const struct ggml_tensor * src1, struct ggml_tensor * dst);
+ #endif

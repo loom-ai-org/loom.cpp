@@ -1660,7 +1660,10 @@ takes the same `MUL` after a depthwise convolution. A fused result that partiall
 computed into the convolution's own tensor (which the allocator never overlaps with its input, since the
 convolution runs while the input is live), and one pass applies bias, residual, RELU and mask on the way
 to the output. Kernels that cannot apply the epilogue themselves get one pass after them. All of it is
-behind `GGML_CPU_CONV_EPILOGUE`, on by default on ARMv6 (where it was measured) and off elsewhere.
+behind `GGML_CPU_CONV_EPILOGUE`, off by default. (It shipped on by default on ARMv6. PR 34 then made the
+unfused RELU and MUL passes 2-4x faster there, and this epilogue, which re-reads output rows the
+convolution has just stored, became the slower of the two: Citrinet-256-ls 12.53 s off against 13.07 on.
+Upstream it is worth taking only with the epilogue applied before the store.)
 
 On ARMv6 (PRs 29 and 32) the epilogue is a few short passes over a block still in L1: the RELU as an
 integer test on the bits, keep iff `lo <= u <= 0x7f800000` unsigned (lo = 0x00800000 under RunFast's
@@ -1681,6 +1684,83 @@ mask's 239 identical subgraphs into 4 (ggml expands a node's sources depth first
 each use lands between the RELU and its MUL, and the fusion never sees them adjacent): Citrinet-256-ls
 F32 14.0-14.4 → 13.1-13.3 s and Q8_0 14.3-14.5 → 13.5-13.6 s for an 11 s clip (1.06-1.08x), logits byte-identical
 with the epilogue on and off; VITS, WakeHuBERT and Silero VAD within noise.
+
+## PR 34 — `cpu`: ADD, SUB, MUL, SCALE, RELU and LEAKY_RELU at memory speed on ARMv6
+
+*(`cmake/patches/ggml-0037-armv6-elementwise.patch`; independent of the others, and FZ-aware for PR 28's RunFast)*
+
+**Problem.** On an ARM1176 (Pi Zero, Pi 1) the elementwise ops are compute-bound, not memory-bound: each
+loop is one load, one VFP op and a store that waits on the op's 8-cycle latency, and nothing prefetches.
+A `[1, C]` bias over `[T, C]`, or a `[1, 1]` scale, is worse: `apply_binary_op` calls its row function
+once per element (`ne10 == 1`). The RELUs pay a `vcmpe` + `vmrs` per element, which drains the VFP
+pipeline. Measured over a cold 12.5 MB tensor: ADD 68 ns an element, a bias ADD or scalar MUL 43, LEAKY_RELU
+64, against 12 for `memcpy`.
+
+**Change.** A header, `armv6-eltwise.h`, ARMv6 only (`__ARM_FEATURE_SIMD32 && !__ARM_NEON`): add/sub/mul
+over f32 rows and their scalar forms eight floats a step through `vldmia`/`vstmia`, eight independent VFP
+ops and one `pld` per input line, after a scalar head that brings the input to a 32-byte line (a `vldmia`
+that straddles two lines nearly doubles a cold stream on this core: 21 vs 11 ns for a copy). RELU and
+LEAKY_RELU compare on the integer bits: `x > 0` is `lo <= u <= 0x7f800000` unsigned, `lo` the smallest
+positive normal under FPSCR.FZ (the compare sees a positive denormal as 0) and 1 in IEEE mode; LEAKY_RELU
+keeps its own `max(x, 0) + slope * min(x, 0)` arithmetic. `apply_binary_op` (F32 only), the RELU in
+`apply_unary_op`, `leaky_relu_f32` and `scale_f32` (one pass `x * s` instead of `memcpy` and an in-place
+scale) call it. `GGML_CPU_ARMV6_ELTWISE=0` turns it off.
+
+**Numerics.** Bit-identical by construction (the same IEEE operations on the same operands), and checked:
+every op and broadcast form, with ±0, denormals, inf and NaN in the inputs, byte for byte against the stock
+loops under RunFast; twelve models' outputs byte-identical with it on and off.
+
+**Measured**, Pi Zero W, one thread: same-shape ADD 68.3 → 36.4 ns an element, bias ADD / scalar MUL 43.3
+→ 11.6 (`memcpy` 11.9), LEAKY_RELU 63.8 → 23.0. End to end 1.02-1.07x on ten of twelve models (amy 1.045x,
+de051 1.067x, conformer 1.053x, Citrinet Q8_0 1.065x), neutral on the other two.
+
+## PR 35 — `cpu`: CONV_TRANSPOSE_1D as polyphase direct convolutions on ARMv6
+
+*(`cmake/patches/ggml-0038-armv6-conv-transpose-1d-polyphase.patch`, on top of PRs 9 and 29)*
+
+**Problem.** A stride-s transposed convolution runs as a GEMM `[Cout*K, Cin] x [Cin, L]` and an overlap-add
+(PR 9). On ARMv6 the GEMM reaches tinyBLAS through `ggml_call_mul_mat_ldc` at ~180 MMAC/s, and the
+overlap-add adds K/s partial results into every output. In the TTS vocoders (HiFi-GAN-style upsampling,
+K = 2s) these nodes were 13-20% of a synthesis on a Pi Zero W.
+
+**Change.** With K = J·s, output phase p is a J-tap convolution over the input padded by J - 1 zeros:
+`y[oc][q·s + p] = Σ_j Σ_ic w[ic][oc][p + (J-1-j)·s] · xpad[ic][q + j]`. On ARMv6 (when K % s == 0 and
+J <= 11) the op runs as s such convolutions per quad of output channels on PR 29's register-tiled
+kernels, sharing one input window per block and chunk of input channels, into a per-thread scratch that
+the last chunk interleaves into dst: every output is written once. The weights are repacked
+`[p][Cout/4][Cin][J][4]` each call. `ggml_graph_plan` reserves the larger of the two paths' work buffers.
+`GGML_CPU_ARMV6_CONVT=0` turns it off.
+
+**Numerics.** Not bit-identical: the tile's summation order, 5e-7 to 1e-6 of the peak against f64 (the GEMM
+path 1.4e-7 to 2.5e-7). Three vocoders' waveforms move by at most one int16 LSB.
+
+**Measured**, Pi Zero W, one thread, against PR 9 plus the bias ADD: 658 → 367, 1379 → 751 and 1870 → 763
+ms on a piper vocoder's three upsampling stages (1.79-2.45x); end to end 1.077-1.145x on three vocoders.
+
+## PR 36 — `cpu`: GELU_ERF, SIGMOID, SILU and TANH on ARMv6's VFP short vectors
+
+*(`cmake/patches/ggml-0039-armv6-activations.patch`; the kernels generated by loom's
+`scripts/gen_armv6_act_f32.py`, on PR 29's short-vector discipline)*
+
+**Problem.** On an ARM1176 there is no SIMD body for these: GELU_ERF runs PR 10's rational in its scalar
+tail, the others call `expf`/`tanhf` per element. 200, 160 and 443 ns an element on a Pi Zero W. Plain C does
+not fix it: every VFP-to-core transfer and every `vcmpe` + `vmrs` drains the VFP11's pipeline, and an own
+`expf` in C ran slower than glibc's.
+
+**Change.** Generated short-vector kernels (FPSCR LEN = 4), eight elements a pass, with the clamps and the
+exponent arithmetic done in integer passes over a small scratch. GELU_ERF performs PR 10's tail's
+operations in its order. SIGMOID, SILU and TANH use Cephes' single-precision `expf` (Cody-Waite, a degree-6
+polynomial, 2^n added to the exponent field, with asymmetric range ends: 0 once v <= -86.98, inf once
+v >= 88.37) and Cephes' small-|x| tanh polynomial. A row's last n % 8 run through the same kernel on a
+padded copy. `GGML_CPU_ARMV6_ACT=0` turns it off; `GGML_CPU_DISABLE_GELU_ERF_SIMD` still selects libm.
+
+**Numerics.** GELU_ERF bit-identical to PR 10's scalar tail (under RunFast; in IEEE mode the VFP11 bounces
+denormal operands to the kernel's support code). SIGMOID 2.40 ULP and TANH 1.30 ULP against f64 (glibc 2.39
+and 2.16); special values as glibc's.
+
+**Measured**, Pi Zero W, one thread: GELU_ERF 200.6 → 80.9 ns an element, SIGMOID / SILU 161 → 76, TANH
+443 → 113. End to end 1.01-1.05x on eight of twelve models (sanoTTS heart 1.054x, Moonshine 0.52 s), the
+rest neutral; transcripts unchanged.
 
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
