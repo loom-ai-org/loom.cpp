@@ -50,8 +50,7 @@ T5 bias in the graph (#57), topology CSE (#58), `STFT`/`ISTFT` lowering (#59) an
 **36 repos are republished** from that fresh export at loom-exporter `bfad886`, each hash-verified
 against the staging tree after upload. The 14 that run on any runtime went up first; the 22 that use
 `STFT`/`ISTFT` went up only once rc18 was on PyPI, and their cards say they need `loom-py-rt 1.0.0rc18`
-or later. That note is read from each GGUF's topologies by `build_model_cards.py`, on loom-exporter branch
-`feat/card-min-runtime`, not yet merged. No published GGUF
+or later. That note is read from each GGUF's topologies by `build_model_cards.py`, from loom-exporter #61. No published GGUF
 used the removed `*_SHAW` ops. The other 22 repos were identical to the staging tree. 58 repos.
 
 **Previous anchor, 2026-10-10 (evening) — `1.0.0-rc17`.**
