@@ -24,7 +24,15 @@
 # a clean checkout. RESULT is set to TRUE only when all of them are applied (or already were).
 function(_loom_try_ggml_patches SOURCE_DIR RESULT)
     set(${RESULT} TRUE PARENT_SCOPE)
-    file(GLOB patches "${CMAKE_CURRENT_LIST_DIR}/patches/ggml-*.patch")
+    # THIS file's directory, not CMAKE_CURRENT_LIST_DIR: inside a function that names the CALLER's
+    # listfile, which was this directory only because Dependencies.cmake sits beside it. loom-py's
+    # backend wheels (packaging/common/BackendPackage.cmake) call from elsewhere, found no patches, and
+    # shipped an unpatched libggml-cuda/-vulkan/-metal from rc15 to rc17 -- ggml-0023..0028 included.
+    file(GLOB patches "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/patches/ggml-*.patch")
+    if(NOT patches)
+        message(FATAL_ERROR "no ggml patches under ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/patches: a build "
+            "that patches nothing is an unpatched ggml, so this is an error rather than a no-op")
+    endif()
     list(SORT patches)
     foreach(patch ${patches})
         get_filename_component(name "${patch}" NAME)
