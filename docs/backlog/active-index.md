@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-21
+last_updated: 2026-10-22
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -213,6 +213,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Exporter / MIL compiler
 
+* [ ] **P4.34: pad weight axes to what the kernels need ([ADR-081](../adrs/adr-081-the-exporter-pads-weight-axes-to-what-the-kernels-need.md), accepted 2026-10-22).** Built: loom-exporter #64 (`pad_axes.py`, default `auto`). Vocetta2 exported with it and published (F32 + Q8_0_PC, three repos): F32 1.10-1.36x on the Pi Zero, 1.09-1.15x on the Pi 4 at one thread. Open: merge #64 (before loom-exporter #63, whose cards assume it); the zoo republish sweep, one model at a time through the republish recipe and a board check (Kokoro, StyleTTS2, sanoTTS heart/heart-nano, WakeHuBERT; Q8: conformer, sanoTTS 0.51m, Moonshine streaming small); the residual-stream v2.
 * [ ] **A shape read as DATA aborts in the engine.** (Nemotron ASR met it too, 2026-10-10: `(n - 1) - arange(2n - 1)` put a 4-wide `n - 1` into a SUB; spelled `-arange(1 - n, n)` instead.) `length / waveform.shape[1]` (or `lengths *
   x.shape[-1]`, speechbrain's relative-length masks) traces to `SHAPE` -> `GET_ROWS` -> arithmetic. The
   engine's `SHAPE` is a four-element `ne` vector and `GET_ROWS` on a 1-D tensor returns it whole, so the
