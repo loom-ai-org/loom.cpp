@@ -48,7 +48,7 @@ task; that is the rule these two are instances of, not an omission in either cas
 | **ASR — streaming decoder over codec codes** | Kyutai STT 1B en-fr (run as Kyutai's `moshi` runs it, [ADR-068](../adrs/adr-068-kyutai-stt-follows-moshi-not-the-transformers-port.md); a ring KV cache, [ADR-066](../adrs/adr-066-a-uniform-sliding-window-is-a-ring-kv-cache.md)) | `kyutai_stt_export.py` |
 | **TTS — flow matching** | Matcha-TTS, SupertonicTTS, F5-TTS | `flow_matching_export.py`, `f5_tts_export.py` |
 | **TTS — other** | Kokoro-82M, StyleTTS2, VITS (piper) | `multi_phase_export.py` |
-| **TTS — tiny distilled students** | sanoTTS: 26 piperlite voices (0.51M-1.83M, 14 languages) and 2 nano voices (heart, heart-nano), from upstream's GPL scripts in a pinned clone ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)) | `sanotts_export.py` |
+| **TTS — tiny distilled students** | sanoTTS: 26 piperlite voices (0.51M-1.83M, 14 languages) and 2 nano voices (heart, heart-nano), from upstream's GPL scripts in a pinned clone ([ADR-070](../adrs/adr-070-a-gpl-upstream-is-a-reference-not-a-dependency.md)); Vocetta2 276K / 500K / 1M (the nano line re-trained, MIT) | `sanotts_export.py`, `vocetta2_export.py` |
 | **TTS — mel AR + HiFi-GAN** | SpeechT5 (`microsoft/speecht5_tts` + `speecht5_hifigan`) | `speecht5_export.py`, `speecht5_voices.py` |
 | **TTS — LM hidden rows + Vocos** | Soprano-1.1-80M (text front end: the reference's regexes run by `loom::PyRegex`, [ADR-067](../adrs/adr-067-a-regex-rule-table-ships-its-reference-patterns.md)) | `soprano_export.py` |
 | **TTS — LM + depthformer codes + LFM2 detokenizer** | LFM2.5-Audio-1.5B (text to speech, four voices as voice files) | `lfm25_audio_export.py`, `lfm25_audio_voices.py` |
@@ -1503,6 +1503,38 @@ sentences: heart-nano 11.9% WER (upstream's own front end 8.1%), amy 12.3% (8.5%
 **On a Pi Zero W** (one ARMv6 core, P4.31 engine): heart-nano runs at 1.1x real time in 34 MB, the
 0.51M piperlite voices at 2.3x (54 MB), heart at 2.5x, amy-1.46M at 8.4x. That is near the board's
 arithmetic: the piperlite decoder is about 1.1 GMAC per second of audio.
+
+### Vocetta2: the nano line again, as torch
+
+`VantoraLabs/Vocetta2-276k`, `-500k` and `-1m` (2026-10-21, user request): 0.28M, 0.50M and 1.03M
+parameters, **MIT**, 24 kHz English. It is sanoTTS's nano line re-trained: the same three students, the
+same 62-symbol misaki table (equal symbol for symbol), and the 276K decoder has heart-nano's
+dimensions. **No engine change**: it runs on the released rc18 wheel. What differs is everything around
+the modules, so it is its own config (`vocetta2_export.py`) rather than a nano subclass:
+
+* **Torch state_dicts with their module file.** The export imports the checkpoint's own
+  `microtts/models.py` and reads the dimensions off the weights' shapes (only the 1M's `config.json`
+  states them, and it is cross-checked).
+* **A mel tilt** (`tilt.npy`, 500K and 1M) that upstream adds by default, folded into the acoustic
+  output conv's bias. The 1M's is all zeros.
+* **Zero decoder noise by default** (upstream's measured best); `noise_scale=` opts in, drawn from
+  `aten_randn(seed)`. No waveform clip. The DC blocker is upstream's 4096-tap truncation, exactly: the
+  recursion minus the dropped tail, which is the same one-pole sum delayed by 4096 samples.
+* **Its features round where its code rounds them**, not where sanoTTS's do (the length hint is one
+  float32 rounding of a double quotient; a frame's in-token position is a `torch.linspace`).
+* **Not reproduced: upstream's 2400-frame cut** (the mel truncated after the acoustic net). Upstream's
+  own durations need more than 11.6 frames per symbol at the 207-symbol limit to reach it.
+
+**Verified** (six sentences through upstream's ids): every waveform upstream's length, max |diff|
+1.3e-5 (276K), 3.1e-5 (500K), 1.8e-4 (1M). The 1M's worst is upstream's own float32 spread: its f32 run
+is 1.5e-4 from its f64 run, and loom is 3.3e-5 from the f64 run. Whisper-small WER on 30 LibriSpeech
+sentences, upstream's G2P / the text door with the bundled misaki lexicon: 276K 7.7% / 11.9%, 500K
+7.7% / 15.7%, 1M 7.2% / 9.8%.
+
+**Q8_0_PC applies only to the 500K.** Per-channel int8 needs rows a multiple of 32, and the 276K's
+widths (31, 62, 186) and the 1M's (72, 130, 337) have none, so their Q8_0_PC export is byte-identical
+to F32. The 500K's width-64 acoustic convs quantize (13 tensors, 2.0 to 1.3 MB) at 56/470 word errors
+against F32's 55/470, inside the user's bar of F32 + 1 pp.
 
 ### Family 14: MusicGen, two families composed
 
