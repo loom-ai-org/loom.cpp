@@ -345,7 +345,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   `test_tinyblas_k_halves`, `test_cont_transpose_x32` (sabotaged red). `ggml-0046` is enabled on aarch64 and x86-64 only,
   the two ISAs measured; the Pi Zero (ARMv6) is next. Follow-up: a job owning all 64 `A@V` rows with narrow column blocks measured 1.08x more on
   the op. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
-* [ ] **P4.37: BUILT 2026-10-22, uncommitted on `perf/p437-a72-int8-gemm` (stacked on #89); open: commit, PR, ADR-076's status.**
+* [ ] **P4.37: BUILT 2026-10-22, loom.cpp PR #90 (`perf/p437-a72-int8-gemm`, stacked on #89); open: merge, ADR-076's status.**
   `ggml-0047`: `CPU_NEON_I8`, an extra buffer type on AArch64 without DOTPROD, placed by default for `Q8_0_PC` weights as
   ARMv6's is. XNNPACK's `qd8-f32-qc8w 2x8c2s4__neon_mlal` inner loop, with activations quantized per 32 k (ggml's
   numerics: whisper's encoder 4.81e-2 from F32 against XNNPACK's per-row 9.8e-2), and `GET_ROWS` from the packed panels.
