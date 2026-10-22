@@ -396,6 +396,16 @@ target_compile_definitions(test_tinyblas_gemm PRIVATE LOOM_EXPECT_TINYBLAS=$<BOO
 add_test(NAME test_tinyblas_gemm COMMAND test_tinyblas_gemm)
 set_tests_properties(test_tinyblas_gemm PROPERTIES LABELS ci)
 
+add_executable(test_tinyblas_k_halves ci/test_tinyblas_k_halves.cpp)
+target_link_libraries(test_tinyblas_k_halves PRIVATE loom::engine)
+add_test(NAME test_tinyblas_k_halves COMMAND test_tinyblas_k_halves)
+set_tests_properties(test_tinyblas_k_halves PROPERTIES LABELS ci)
+
+add_executable(test_cont_transpose_x32 ci/test_cont_transpose_x32.cpp)
+target_link_libraries(test_cont_transpose_x32 PRIVATE loom::engine)
+add_test(NAME test_cont_transpose_x32 COMMAND test_cont_transpose_x32)
+set_tests_properties(test_cont_transpose_x32 PROPERTIES LABELS ci)
+
 add_executable(test_input_alias ci/test_input_alias.cpp)
 target_link_libraries(test_input_alias PRIVATE loom::engine)
 target_compile_definitions(test_input_alias PRIVATE LOOM_TEST_FIXTURE_DIR="${LOOM_FIXTURE_DIR}")

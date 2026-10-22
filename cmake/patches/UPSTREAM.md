@@ -1852,6 +1852,49 @@ once per op. A channels-first output is written row by row across the column blo
 **Measured** (Pi Zero W, jfk, one run each): Citrinet-256-ls `Q8_0_PC` 10.6 -> 9.7 s, Moonshine tiny 27.6
 -> 26.9 s.
 
+## PR 41 — `cpu`: PR 27's K chunks between one chunk and two, when threads share the L2
+
+*(`cmake/patches/ggml-0045-tinyblas-f32-k-halves-on-a-shared-l2.patch`)*
+
+**Problem.** PR 27 chunks K only from two chunks up (K >= 1536 on a 32 KB L1). Below that every tile streams
+its two operand strips, (RM + RN) x K floats, whole. On one core that is the right call. On a Pi 4 (Cortex-A72,
+four cores, one 1 MB L2) it is not: whisper's encoder `A@V` (m = 64, n = K = 1500, 12 heads) scales only 2.0x
+from one thread to four, where its `QK^T` scales 3.4x. Its strips are 42 KB against a 32 KB L1, and four cores
+then queue on the shared L2.
+
+**Change.** aarch64, F32 x F32, KN dividing K, as PR 27. For `kc < K < 2 kc`, K is cut in two balanced halves
+when `nth > 1` AND the strips pass 7/8 of L1D. One thread, and any K whose strips fit, keep PR 27's schedule.
+**The result is bit-identical** (PR 27's carried accumulators). loom's `test_tinyblas_k_halves` holds 1, 2
+and 4 threads to the same bytes on both sides of every boundary.
+
+**Measured**, Pi 4, four threads, halves vs whole, per-round ratio over nine rounds, byte-identical outputs:
+768 x 1500 x K at K = 960 / 1024 / 1152 / 1344: 0.944 / 0.965 / 1.035 / 1.096, and `A@V` 1.312 (219.7 -> 167.6
+ms). The sign flips where the strips pass 7/8 of L1 (between K = 1024 and 1152 at the 4x3 tile), which is the
+predicate. Forcing two chunks at one thread costs 2% on `A@V`, so one thread is left alone. End to end:
+whisper-small 1.018x (7 paired launches, p10 1.004, p90 1.043); a VITS synthesis is unmoved (0.992, p10 0.979,
+p90 1.016).
+
+## PR 42 — `cpu`: a materialised transpose of 4-byte elements in 4x4 tiles
+
+*(`cmake/patches/ggml-0046-cpu-dup-transpose-x32-tiles.patch`)*
+
+**Problem.** `dup_bytes` copies a source that is strided along its first dimension one element at a time,
+with a runtime-sized `memcpy` per element and a fresh cache line per read. The common case is a transpose:
+the source runs contiguous along its second dimension. whisper's V^T (`[64, 12, 1500]` permuted to
+`[1500, 64, 12]`, twice per layer) ran at 0.42 GB/s on a Pi 4 at four threads, 0.35 at one.
+
+**Change.** When `type_size == 4`, `nb01 == 4`, `nb00 != 4` and dst is contiguous: 4x4 tiles transposed in
+registers (NEON `trn` on aarch64, after XNNPACK's x32-transposec 4x4 kernels, a plain 4x4 elsewhere), stored
+as 16-byte row segments, with the first dimension walked in blocks of 64 so the source lines stay in L1
+across a thread's rows. Threads split the second dimension, as before. Enabled on aarch64 and x86-64, the two ISAs measured.
+
+**Numerics.** A copy, and byte-identical (loom's `test_cont_transpose_x32`, ragged shapes, 1-4 threads).
+
+**Measured** (whisper's V^T, both arms in one process, per-round ratio): Pi 4 4.68x at four threads (21.9 ->
+4.68 ms), 3.48x at one; Ryzen 3 3250U 1.76x at two, 1.82x at one. A decoder-sized `[32, 12, 50]` is neutral on
+the A72 (0.97x) and 4.3x on x86. End to end, whisper-small F32 on the Pi 4: 1.021x (7 paired launches, p10
+1.004, p90 1.050).
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
