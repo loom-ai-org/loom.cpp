@@ -338,19 +338,24 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **P4.35 + P4.36: BUILT 2026-10-22, uncommitted on `perf/p435-whisper-attention-pi4`; open: commit, PR, the Pi Zero.**
+* [ ] **P4.35 + P4.36: BUILT 2026-10-22, loom.cpp PR #89 (`perf/p435-whisper-attention-pi4`); open: merge, the Pi Zero.**
   `ggml-0045`: K in two halves for `kc < k < 2 kc` when `nth > 1` and the tile's strips pass 7/8 of L1 (A@V 1.31x at
   four threads; whisper F32 1.018x end to end, VITS unmoved). `ggml-0046`: a 4-byte transpose in 4x4 tiles (V^T copy
   4.68x on the A72, 1.8x on x86; whisper F32 1.021x). Together on whisper `Q8_0_PC`: 1.044x. Bit-identical; tests
   `test_tinyblas_k_halves`, `test_cont_transpose_x32` (sabotaged red). `ggml-0046` is enabled on aarch64 and x86-64 only,
   the two ISAs measured; the Pi Zero (ARMv6) is next. Follow-up: a job owning all 64 `A@V` rows with narrow column blocks measured 1.08x more on
   the op. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
-* [ ] **P4.37: an int8 GEMM for the Cortex-A72 ([ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)'s main case).**
-  The A72 has no `sdot`, tinyBLAS's Q8_0 kernel is DOTPROD-only, so a `Q8_0_PC` weight runs ggml's one-row
-  `vec_dot_q8_0_q8_0`: whisper's encoder linears take the same time at Q8_0_PC as at F32 (fc1 3435 vs 3302 ms) while
-  onnxruntime's int8 runs 2.3x its own FP32. ~6.5 s of the 8.1 s int8 gap, plus ~1 s of cross-KV. P4.33 built the
-  per-channel format, the buffer-type pattern and the engine placement for ARMv6; this needs a NEON sibling of
-  `CPU_ARMV6_I8` with XNNPACK's `qd8-f32-qc8w` NEON (`mlal`) kernels. Lifts every `Q8_0_PC` card on the Pi 4. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
+* [ ] **P4.37: BUILT 2026-10-22, uncommitted on `perf/p437-a72-int8-gemm` (stacked on #89); open: commit, PR, ADR-076's status.**
+  `ggml-0047`: `CPU_NEON_I8`, an extra buffer type on AArch64 without DOTPROD, placed by default for `Q8_0_PC` weights as
+  ARMv6's is. XNNPACK's `qd8-f32-qc8w 2x8c2s4__neon_mlal` inner loop, with activations quantized per 32 k (ggml's
+  numerics: whisper's encoder 4.81e-2 from F32 against XNNPACK's per-row 9.8e-2), and `GET_ROWS` from the packed panels.
+  Pi 4, 4 threads, end to end: **whisper-small Q8_0_PC 1.547x** (21.42 → 13.85 s, same transcript), Qwen3-0.6B 1.190x
+  (same tokens), Moonshine tiny 1.191x, Citrinet 1.003x, VITS untouched. Test `test_mul_mat_neon_i8` (bit-exact).
+  Still open: the README's Pi 4 row, re-measured against onnxruntime int8; the decoder's one-row steps (1.09-1.12x,
+  DRAM-bound); an A53/A55 board (a Pi 3 or Zero 2 W): the type is enabled there too, since the guard is the ISA feature, but it is
+  unmeasured, and XNNPACK picks a different kernel for those cores (`4x16 mlal_lane`).
+  *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22),
+  [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437)*
 * [ ] **P4.38: tinyBLAS's F32 tile on the A72.** The dense encoder GEMMs are 1.20-1.46x behind MLAS at four threads
   (~2.7 s of the F32 gap); Retro-012 has tinyBLAS at 52% of the A72's FMA roofline. XNNPACK's A72 choice is the
   outer-product `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm` (A as q-vectors of 4 k, B packed K-major in 8-column

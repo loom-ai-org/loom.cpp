@@ -141,8 +141,9 @@ private:
     // would have thrown LoadError instead).
     std::unordered_map<std::string, std::string> topologies_;
 
-    // Extra-buffer placement (see route_repacked_uses). Empty unless LOOM_CPU_REPACK is set or, on ARMv6,
-    // the file lists per-channel int8 weights for CPU_ARMV6_I8 (ADR-079 P4.33).
+    // Extra-buffer placement (see route_repacked_uses). Empty unless LOOM_CPU_REPACK is set or, on ARMv6
+    // or an AArch64 core without DOTPROD, the file lists per-channel int8 weights for CPU_ARMV6_I8 or
+    // CPU_NEON_I8 (ADR-079 P4.33, P4.37).
     struct Repacked {
         size_t file_offset = 0;      // where the tensor's raw bytes sit in `path_`
         ggml_tensor* plain = nullptr; // the plain copy, once a consumer needed one

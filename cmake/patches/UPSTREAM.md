@@ -1895,6 +1895,41 @@ across a thread's rows. Threads split the second dimension, as before. Enabled o
 the A72 (0.97x) and 4.3x on x86. End to end, whisper-small F32 on the Pi 4: 1.021x (7 paired launches, p10
 1.004, p90 1.050).
 
+## PR 43 — `cpu`: an int8 `mul_mat` for AArch64 cores without DOTPROD, on Q8_0 weights with one scale per row
+
+*(`cmake/patches/ggml-0047-neon-int8-mul-mat.patch`)*
+
+**Problem.** tinyBLAS's Q8_0 GEMM is DOTPROD-only, so on a core without `sdot` (the Cortex-A72 of a Raspberry
+Pi 4, A53s, A57s) every Q8_0 `mul_mat` runs `ggml_vec_dot_q8_0_q8_0` one output row at a time, widening each
+32-element block's sum to float. whisper-small's encoder linears took as long at Q8_0 as at F32 on a Pi 4.
+XNNPACK's dynamic int8 GEMM runs 2.4-2.7x faster than that on the same core.
+
+**Change.** An extra buffer type, `CPU_NEON_I8`, registered on AArch64 when `ggml_cpu_has_dotprod()` is false
+(`GGML_CPU_NEON_I8=0` switches it off). It takes a 2-D Q8_0 weight whose blocks all share their row's scale,
+which is per-channel int8 written as ordinary Q8_0. At `set_tensor` it repacks the weight into 8-column panels
+in XNNPACK's `c2s4` layout. A row with mixed scales stays as given, and ggml's own path runs it. `mul_mat`
+quantizes each activation row per 32 k, symmetric (ggml's Q8_0 rule), into the work buffer. After the barrier,
+XNNPACK's `qd8-f32-qc8w-gemm 2x8c2s4__neon_mlal` inner loop (BSD-3, notice carried in the source) runs on 2-row
+x 8-column tiles. Each 32-k block's int32 sum is FMA-scaled into a float accumulator, and the weight's scale
+is applied at the end. A few rows are dealt panel by panel round robin across threads, so DRAM sees one stream.
+Many rows go in 160 KB blocks of panels, per thread, that stay in L2. `GET_ROWS` reads the packed panels too,
+so a tied embedding (the lookup and the output projection) needs no second, plain copy (Qwen3-0.6B: 165 MB).
+Weights reach the buffer only by placement, so nothing changes for a caller that does not place them.
+
+**Numerics.** Integer sums plus a fixed float order, held bit for bit to a scalar reference in loom's
+`test_mul_mat_neon_i8` (both schedules, 1/2/4 threads, odd shapes, the int16 bound, NaN rows). Against F32 it
+has the error of ggml's own Q8_0 path: whisper-small's encoder output 4.806e-2 against 4.814e-2. XNNPACK's own
+per-row asymmetric activations measured 9.8e-2 there, because whisper's outlier channels set the whole row's
+range. That is why the activations are quantized per 32 k: it costs 14% of the GEMM's speed. `GET_ROWS` is
+byte-identical to ggml's Q8_0 `GET_ROWS` (the same `q * d`).
+
+**Measured** on a Pi 4 at four threads, against ggml's Q8_0 path on the same weights. Whisper-small shapes,
+1500 rows: 2.41x (768 x 768), 2.44x (768 to 3072), 2.29x (3072 to 768), 59 GOP/s. One-row decoder steps:
+1.09-1.12x. End to end, 4 threads, `GGML_CPU_NEON_I8` off against on: whisper-small 1.547x (21.42 -> 13.85 s, 7
+paired launches, p10 1.538, p90 1.554, same transcript); Qwen3-0.6B 1.190x (24 tokens, 4.95 -> 4.16 s, same
+tokens); Moonshine tiny 1.191x (p10 1.185, p90 1.197; this path transcribed jfk exactly, ggml's Q8_0 path read
+"as" for "ask"); Citrinet-256 1.003x (its pointwise convolutions are not served here, only 0.4 MB of weights).
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
