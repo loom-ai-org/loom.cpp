@@ -1378,12 +1378,36 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   weights: a `Q8_0` weight cannot be `src1`. **End to end: whisper F32 1.021x** (7 paired launches, p10 1.004,
   p90 1.050). **Both patches together on whisper `Q8_0_PC`: 1.044x** (22.39 → 21.50 s, 5 paired launches, p10
   1.029, p90 1.046), which moves the README's 0.64x cell to about 0.67x. The rest of that gap is P4.37.
-* **P4.37, an int8 GEMM for the A72 — OPEN, the largest.** The A72 has no `sdot` instruction, so tinyBLAS's
-  Q8_0 kernel (DOTPROD-only) never runs there and a `Q8_0_PC` weight goes through ggml's row-at-a-time
-  `vec_dot_q8_0_q8_0`. The encoder linears take as long at `Q8_0_PC` as at F32. That is ~6.5 s of the
-  8.1 s int8 gap, plus ~1 s of cross-KV. [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)'s
-  bridge is the design (XNNPACK `qd8-f32-qc8w`, NEON `mlal`), and P4.33 already built its format, buffer
-  type pattern and placement for ARMv6.
+* **P4.37, an int8 GEMM for the A72 — BUILT 2026-10-22 (`ggml-0047`).** The A72 has no `sdot` instruction, so
+  tinyBLAS's Q8_0 kernel (DOTPROD-only) never runs there, and a `Q8_0_PC` weight went through ggml's row-at-a-time
+  `vec_dot_q8_0_q8_0`. `CPU_NEON_I8` is the NEON sibling of P4.33's `CPU_ARMV6_I8`: an extra buffer type registered
+  on AArch64 when `ggml_cpu_has_dotprod()` is false, and the engine places `loom.quantize.per_channel` weights there
+  by default, with the same convolution rule. The weights are packed at load into XNNPACK's `c2s4` 8-column
+  panels, and the inner loop is XNNPACK's `qd8-f32-qc8w 2x8c2s4__neon_mlal` (SMULL/SMLAL into int16 pairs, SADALP
+  into int32).
+  * **Activations: per 32 k, not per row.** XNNPACK's per-row asymmetric activations doubled whisper's encoder
+    error against F32 (9.8e-2, cosine 0.9952; ggml's Q8_0 path is 4.8e-2). Outlier channels set a whole row's
+    range, and scaling the input by (1 + 1e-7) moved that path 3.4e-2, so the error is real, not the card's noise
+    floor. Per 32 k, symmetric, each block's int32 sum is FMA-scaled into a float accumulator: 4.806e-2 from F32,
+    at 86% of the per-row GEMM speed. Blocks of 64/128/256 k sit between (5.2/6.2/7.7e-2).
+  * **Schedules.** When the int8 rows fit a quarter of the L2, panels are dealt to the threads round robin, so
+    DRAM sees one stream: a one-row K 3072 product went 0.90x → 1.09x. Otherwise each thread walks 160 KB blocks
+    of panels that stay in L2 while the rows stream past.
+  * **`GET_ROWS`** reads the packed panels too, byte-identical to ggml's, so a tied embedding needs no plain
+    copy (Qwen3-0.6B: 165 MB, whisper: 42 MB).
+  * **GEMM** (bench65, 4 threads, against ggml's Q8_0 path on the same weights): whisper's encoder shapes
+    2.29-2.44x (~59 GOP/s); the decoder's one-row steps 1.09-1.12x.
+  * **End to end** (Pi 4, 4 threads, `GGML_CPU_NEON_I8` off/on, paired launches):
+
+    | card (Q8_0_PC) | ratio (p10-p90) | notes |
+    |---|---|---|
+    | whisper-small | **1.547x** (1.538-1.554) | 21.42 → 13.85 s, same transcript |
+    | Qwen3-0.6B | 1.190x (1.188-1.193) | 24 tokens, same tokens |
+    | Moonshine tiny | 1.191x (1.185-1.197) | transcripts differ: this path's is exact, ggml's Q8_0 path's reads "as" for "ask" |
+    | Citrinet-256-ls | 1.003x | only 0.4 MB placed; its pointwise convs stay on the direct path |
+    | VITS | 0.994x | nothing placed (every listed weight feeds a conv): the null control |
+
+    The test is `test_mul_mat_neon_i8`, bit-exact against a scalar reference, sabotaged red.
 * **P4.38, tinyBLAS's F32 tile on the A72 — OPEN.** ~2.7 s of the F32 gap is the dense GEMMs at
   1.20-1.46x. XNNPACK's A72 kernel is the outer-product `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm`:
   A as q-vectors of four k, B packed K-major in eight-column panels, `fmla` by lane, `prfm` on both, 12

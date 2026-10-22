@@ -387,6 +387,19 @@ set_tests_properties(test_mul_mat_armv6_i8_off PROPERTIES LABELS ci ENVIRONMENT 
 add_test(NAME test_mul_mat_armv6_i8 COMMAND test_mul_mat_armv6_i8)
 set_tests_properties(test_mul_mat_armv6_i8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_ARMV6_I8=1")
 
+# P4.37 (ggml-0047): CPU_NEON_I8, XNNPACK's int8 GEMM (activations quantized per 32 k) on per-channel Q8_0
+# weights for AArch64 cores without DOTPROD, held bit for bit to its contract (both schedules, 1/2/4 threads,
+# odd N and row counts, the int16 bound, a NaN row, the non-uniform fallback, a declined convolution), and
+# its GET_ROWS byte-identical to ggml's own.
+# Registered with the buffer type switched off and on (GGML_CPU_NEON_I8, read once); elsewhere both runs
+# check only that it is absent.
+add_executable(test_mul_mat_neon_i8 ci/test_mul_mat_neon_i8.cpp)
+target_link_libraries(test_mul_mat_neon_i8 PRIVATE loom::engine)
+add_test(NAME test_mul_mat_neon_i8_off COMMAND test_mul_mat_neon_i8)
+set_tests_properties(test_mul_mat_neon_i8_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_I8=0")
+add_test(NAME test_mul_mat_neon_i8 COMMAND test_mul_mat_neon_i8)
+set_tests_properties(test_mul_mat_neon_i8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_I8=1")
+
 # Registered with the build's own answer for LOOM_TINYBLAS, so the test asserts the direction this
 # build asked for rather than whatever it happens to have got -- `-DLOOM_TINYBLAS=OFF` has to keep
 # meaning tinyBLAS is really absent, which is what makes a GEMM A/B trustworthy.
