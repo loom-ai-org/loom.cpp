@@ -1336,6 +1336,60 @@ machine against a 1.52x roofline ceiling. See §5.
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
 model-semantics change (the positional embedding is fixed at 1500), so it is not part of this item.
 
+### P4.35-P4.38: whisper-small on the Raspberry Pi 4, per op (2026-10-22)
+
+The rc18 table in the README has whisper-small at **0.80x** (F32) and **0.64x** (`Q8_0_PC` against
+onnxruntime's int8) on the Pi 4 at four threads, where every other Pi 4 cell is at parity or a win. Both
+engines were profiled per op on the board (rc18 binaries and GGUFs, jfk, cooled to 60 C before each arm):
+loom with `$LOOM_PROFILE_NODES=1`, onnxruntime with its own profiler over a full transcription, each node
+apportioned over an unprofiled wall.
+
+**The whole gap is the encoder.** loom's decoder (and cross-KV) is at parity in F32 and about 1.8 s ahead in
+int8. Encoder, ms per transcription (loom's profiled, so a little high):
+
+| piece | F32: loom / onnx | | `Q8_0_PC` / onnx int8 | |
+|---|---|---|---|---|
+| Q/K/V/O projections (48) | 3365 / 2804 | 1.20x | ~3715 / 1221 | **3.0x** |
+| `fc1` | 3302 / 2441 | 1.35x | 3435 / 1200 | **2.9x** |
+| `fc2` (K = 3072) | 4184 / 2862 | 1.46x | 3163 / 1337 | **2.4x** |
+| `A@V` | 2554 / 1375 | **1.86x** | 2607 / 1298 | 2.0x |
+| `QK^T` | 1862 / 1196 | 1.56x | 1906 / 1199 | 1.6x |
+| head layout (`CONT` vs `Transpose`) | ~1000 / 223 | 4.5x | ~990 / 200 | 5x |
+| softmax | ~1050 / 984 | parity | parity | |
+| **encoder** | **~18.7 s / 13.0 s** | | **~20 s / 8.6 s** | |
+
+A one-thread loom profile next to the four-thread one gives each piece's scaling: dense GEMMs 2.85x,
+`QK^T` 3.36x, **`A@V` 2.0x**, the layout copies **0.97x** (none). Four items follow, in the user's order:
+
+* **P4.35, `A@V` scaling — DONE as `ggml-0045`.** `ggml-0030` chunks K only from two chunks up (1536 on a
+  32 KB L1), and `A@V`'s K is 1500. Its 4x3 tile streams (4 + 3) x 1500 floats = 42 KB per output block
+  through the L1, and at four threads the cores queue on the shared L2. `scripts/bench63.cpp` (with
+  `scripts/probes/ggml-p435-sgemm-schedule-probe.patch`) turned the schedule into run-time knobs. Forcing
+  the chunk: **1.34x at four threads, 0.98x at one**. A job owning all 64 rows with narrow column blocks
+  added 1.08x more, which is left as a follow-up. Two balanced halves when `nth > 1`, swept over K at
+  768 x 1500 x K: 960 → 0.944, 1024 → 0.965, 1152 → 1.035, 1344 → 1.096, and `A@V` → 1.312. The crossover
+  is where the strips pass 7/8 of L1, so that is the predicate. **End to end: whisper F32 1.018x** (7 paired
+  launches, p10 1.004, p90 1.043); VITS unmoved (0.992, straddling).
+* **P4.36, the V^T copies — DONE as `ggml-0046`.** Two of the layout copies are V^T: the encoder's and
+  the cross-KV phase's (12 each, ~0.58 s). `dup_bytes` walked them one `memcpy` call per 4-byte element against a
+  3 KB stride. A 4x4-tiled transpose (NEON `trn`, after XNNPACK's `x32-transposec`), blocked so a block's
+  source lines stay in L1: **4.68x at four threads, 3.48x at one** on the A72 (`scripts/bench64.cpp`), 1.76-1.82x
+  on x86, byte-identical. Exporting V^T as a swapped matmul would delete the copy instead, but only for F32
+  weights: a `Q8_0` weight cannot be `src1`. **End to end: whisper F32 1.021x** (7 paired launches, p10 1.004,
+  p90 1.050). **Both patches together on whisper `Q8_0_PC`: 1.044x** (22.39 → 21.50 s, 5 paired launches, p10
+  1.029, p90 1.046), which moves the README's 0.64x cell to about 0.67x. The rest of that gap is P4.37.
+* **P4.37, an int8 GEMM for the A72 — OPEN, the largest.** The A72 has no `sdot` instruction, so tinyBLAS's
+  Q8_0 kernel (DOTPROD-only) never runs there and a `Q8_0_PC` weight goes through ggml's row-at-a-time
+  `vec_dot_q8_0_q8_0`. The encoder linears take as long at `Q8_0_PC` as at F32. That is ~6.5 s of the
+  8.1 s int8 gap, plus ~1 s of cross-KV. [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)'s
+  bridge is the design (XNNPACK `qd8-f32-qc8w`, NEON `mlal`), and P4.33 already built its format, buffer
+  type pattern and placement for ARMv6.
+* **P4.38, tinyBLAS's F32 tile on the A72 — OPEN.** ~2.7 s of the F32 gap is the dense GEMMs at
+  1.20-1.46x. XNNPACK's A72 kernel is the outer-product `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm`:
+  A as q-vectors of four k, B packed K-major in eight-column panels, `fmla` by lane, `prfm` on both, 12
+  loads per 32 FMAs against tinyBLAS's 7 per 12. Retro-012's outer-product tile bought 1.23x at k = 64 on
+  this core, so measure at K = 768 / 3072 first.
+
 ### Operating notes: benchmarking
 
 **Machines.** The Pi answers to **`ssh pi@rpi4`** (verified 2026-08-29; it resolves over IPv6 — an

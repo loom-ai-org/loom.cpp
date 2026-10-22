@@ -1,0 +1,71 @@
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -96,6 +96,19 @@
+ 
+ #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+ 
++// P4.35 probe: run-time knobs for the F32 tinyBLAS schedule (BM, BN, K chunk, job order).
++// -1 = as shipped (ggml-0045). kc: 0 off, N force N, -4 = the rule before ggml-0045 (no chunk below 2 kc). loom_sgemm_probe_set() lets one process flip arms (scripts/bench63.cpp).
++static int loom_probe_bm = -1, loom_probe_bn = -1, loom_probe_kc = -1, loom_probe_order = -1;
++extern "C" void loom_sgemm_probe_set(int bm, int bn, int kc, int order) {
++    loom_probe_bm = bm; loom_probe_bn = bn; loom_probe_kc = kc; loom_probe_order = order;
++}
++static void loom_probe_env() {
++    static bool done = false;
++    if (done) return;
++    done = true;
++    if (const char * e = getenv("GGML_SGEMM_PROBE")) sscanf(e, "%d,%d,%d,%d", &loom_probe_bm, &loom_probe_bn, &loom_probe_kc, &loom_probe_order);
++}
++
+ namespace {
+ 
+ inline float unhalf(ggml_fp16_t d) {
+@@ -829,6 +842,17 @@
+             return true;
+         }
+ #else  // VECTOR_REGISTERS == 16, or NEON on GCC (see above)
++        loom_probe_env();
++        if (loom_probe_bm > 0 && m % (4 * loom_probe_bm) == 0) {
++            const int64_t SIZE_N = BLOCK_SIZE<3>(n);
++            switch (loom_probe_bm) {
++                case 2:  mnpack<4, 3, 2>(m, n, SIZE_N, 24); return true;
++                case 4:  mnpack<4, 3, 4>(m, n, SIZE_N, 24); return true;
++                case 8:  mnpack<4, 3, 8>(m, n, SIZE_N, 24); return true;
++                case 16: mnpack<4, 3, 16>(m, n, SIZE_N, 24); return true;
++                default: break;
++            }
++        }
+         if (m16 > 0 && (m16/16 >= params->nth) && (m % 16 == 0 || ragged_prefix)) {
+             const int64_t SIZE_N = BLOCK_SIZE<3>(n);
+             mnpack<4, 3, 4>(m16, n, SIZE_N, 24);
+@@ -1204,14 +1228,19 @@
+                     const bool spills = params->nth > 1 &&
+                                         (RM + RN) * k * (int64_t) sizeof(TA) > caches.l1d * 7 / 8;
+                     kc = spills ? (k / 2 + KN - 1) / KN * KN : 0;
++                    if (loom_probe_kc == -4) kc = 0;
+                 }
+             }
++            if (loom_probe_kc == 0) kc = 0;
++            else if (loom_probe_kc > 0 && k % KN == 0 && k > loom_probe_kc) kc = loom_probe_kc - loom_probe_kc % KN;
++            if (loom_probe_bn > 0) BN = loom_probe_bn;
+         }
+ #endif
+         const int64_t NB_BN = xtiles < BN ? 1 : (xtiles + BN / 2) / BN;
+         const int64_t SIZE_BN = xtiles % NB_BN == 0 ? xtiles / NB_BN : xtiles / NB_BN + 1;
+         const int64_t jj_BN = (NB_BN - (NB_BN * SIZE_BN - xtiles));
+         const int64_t nb_job = ytiles * NB_BN;
++        const bool cols_first = loom_probe_order == 1;
+ 
+         if (params->ith == 0) {
+             GGML_ASSERT( jj_BN * SIZE_BN + (NB_BN - jj_BN) * (SIZE_BN - 1) == xtiles);
+@@ -1225,8 +1254,8 @@
+ 
+         int64_t job = params->ith;
+         while (job < nb_job) {
+-            const int64_t ii = (job % ytiles) * RM * BM;
+-            const int64_t jb =  job / ytiles;
++            const int64_t ii = (cols_first ? job / NB_BN : job % ytiles) * RM * BM;
++            const int64_t jb =  cols_first ? job % NB_BN : job / ytiles;
+             const int64_t jr0 = BLOC_POS(jb  , jj_BN, SIZE_BN);
+             const int64_t jrN = BLOC_POS(jb+1, jj_BN, SIZE_BN);
+ 

@@ -22,6 +22,8 @@ Raspberry Pi runs used both.
 | patch | what it adds | used by |
 |---|---|---|
 | `ggml-p426-sgemm-policy-probe.patch` | `GGML_SGEMM_POLICY` selects `matmul_aligned`'s row-block predicate at run time (`0` pre-`ggml-0012`, `1` `0012` as first shipped, `6` as shipped now, plus candidates), and `GGML_SGEMM_CENSUS=1` prints an `(m, n, k, nth)` histogram of every `sgemm` call at exit. `loom_sgemm_set_policy()` is exported so a bench can flip arms mid-process. | `scripts/bench19.cpp`, Epic-05 P4.26 |
+| `ggml-p435-sgemm-schedule-probe.patch` | `GGML_SGEMM_PROBE=bm,bn,kc,order` (each `-1` = as shipped) turns tinyBLAS's F32 schedule into run-time knobs: row blocks per job, column-block width, the K chunk (`0` off, `N` forced, `-4` the rule before `ggml-0045`) and job order. `loom_sgemm_probe_set()` flips arms mid-process. | `scripts/bench63.cpp`, Epic-05 P4.35 |
+| `ggml-p436-dup-transpose-probe.patch` | `GGML_DUP_PROBE=0` (or `loom_dup_probe_set(0)`) sends a 4-byte transpose back to ggml's per-element `dup` path instead of `ggml-0046`'s 4x4 tiles. | `scripts/bench64.cpp`, Epic-05 P4.36 |
 | `ggml-p427-graph-plan-probe.patch` | `LOOM_PLAN_PROBE=1` prints every graph ggml clamps to fewer threads than were asked for (`2` prints every plan), and `LOOM_UNARY_SERIAL=1` puts every row of an `apply_unary_op` on thread 0 — which prices threading an op by **removing** it. | `scripts/bench20.cpp`, Epic-05 P4.27 |
 
 Each patch is a diff against the pinned ggml **with `cmake/patches/ggml-00xx` already applied**, so it
