@@ -351,9 +351,11 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   numerics: whisper's encoder 4.81e-2 from F32 against XNNPACK's per-row 9.8e-2), and `GET_ROWS` from the packed panels.
   Pi 4, 4 threads, end to end: **whisper-small Q8_0_PC 1.547x** (21.42 → 13.85 s, same transcript), Qwen3-0.6B 1.190x
   (same tokens), Moonshine tiny 1.191x, Citrinet 1.003x, VITS untouched. Test `test_mul_mat_neon_i8` (bit-exact).
-  Still open: the README's Pi 4 row, re-measured against onnxruntime int8; the decoder's one-row steps (1.09-1.12x,
+  The README's Pi 4 Q8_0_PC half is re-measured on it (2026-10-22): whisper-small against onnxruntime int8 0.64x →
+  **1.04x**, Moonshine 1.59x, Qwen3 3.44x, Pocket TTS 3.12x. Still open: the decoder's one-row steps (1.09-1.12x,
   DRAM-bound); an A53/A55 board (a Pi 3 or Zero 2 W): the type is enabled there too, since the guard is the ISA feature, but it is
-  unmeasured, and XNNPACK picks a different kernel for those cores (`4x16 mlal_lane`).
+  unmeasured, and XNNPACK picks a different kernel for those cores (`4x16 mlal_lane`). No such board yet (user,
+  2026-10-22).
   *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22),
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437)*
 * [ ] **P4.38: tinyBLAS's F32 tile on the A72.** The dense encoder GEMMs are 1.20-1.46x behind MLAS at four threads
