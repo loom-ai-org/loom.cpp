@@ -9,9 +9,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 using loom_test::GgmlScratch;
 using loom_test::get_f32;
@@ -1493,6 +1495,84 @@ void test_attention_without_kv_cache() {
         loom::SchemaError);
 }
 
+// P4.41 (ADR-085): attrs["window"] computes only the causal band, block by block. Against an f64 SDPA
+// over the same mask and against the dense form of the same node: GQA (4 query heads on 2 KV heads),
+// 150 tokens so the last of the 64-query blocks is ragged, a window of 1 (self only), of 50 (Mimi's)
+// and of 200 (wider than the sequence), and in-band mask values that are NOT all zero -- the band's
+// own mask must still be applied, and a dropped in-band key moves the output.
+void test_attention_window() {
+    const int64_t d = 8, n_head = 4, n_head_kv = 2, T = 150;
+    const float scale = 0.35f;
+    for (const int64_t window : {1, 50, 200}) {
+        GgmlScratch s(64 * 1024 * 1024);
+        ggml_tensor* q = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, d, n_head, T);
+        ggml_tensor* k = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, d, n_head_kv, T);
+        ggml_tensor* v = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, d, n_head_kv, T);
+        ggml_tensor* mask = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, T, T);
+        for (ggml_tensor* t : {q, k, v, mask}) ggml_set_input(t);
+
+        loom::SymbolEnv env;
+        loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+        ggml_tensor* banded = op("ATTENTION")(pc, {q, k, v, mask},
+                                              {{"kv_cache", false}, {"scale", scale}, {"window", window}})[0];
+        ggml_tensor* dense = op("ATTENTION")(pc, {q, k, v, mask}, {{"kv_cache", false}, {"scale", scale}})[0];
+        ggml_tensor* both = ggml_concat(s.ctx.get(), banded, dense, 1);
+        ggml_cgraph* gf = s.expand(both);
+
+        std::vector<float> qv(d * n_head * T), kv(d * n_head_kv * T), vv(d * n_head_kv * T), mv(T * T);
+        for (size_t i = 0; i < qv.size(); ++i) qv[i] = 0.9f * std::sin(0.37f * (float) i + 0.1f);
+        for (size_t i = 0; i < kv.size(); ++i) kv[i] = 0.8f * std::cos(0.23f * (float) i + 0.7f);
+        for (size_t i = 0; i < vv.size(); ++i) vv[i] = std::sin(0.11f * (float) i) + 0.05f * (float) (i % 7);
+        for (int64_t qi = 0; qi < T; ++qi) {
+            for (int64_t ki = 0; ki < T; ++ki) {
+                const bool in = ki <= qi && qi - ki < window;
+                mv[qi * T + ki] = in ? -0.25f * (float) ((qi * 31 + ki * 17) % 5) : -1e30f;
+            }
+        }
+        set_f32(q, qv); set_f32(k, kv); set_f32(v, vv); set_f32(mask, mv);
+        s.compute(gf);
+        const std::vector<float> out = get_f32(both);   // [d * n_head, T] banded, then the same dense
+
+        double worst_ref = 0, worst_dense = 0;
+        for (int64_t qi = 0; qi < T; ++qi) {
+            for (int64_t h = 0; h < n_head; ++h) {
+                const int64_t hk = h / (n_head / n_head_kv);
+                std::vector<double> w(T);
+                double mx = -1e300, sum = 0;
+                for (int64_t ki = 0; ki < T; ++ki) {
+                    double dot = 0;
+                    for (int64_t c = 0; c < d; ++c) dot += (double) qv[(qi * n_head + h) * d + c] * kv[(ki * n_head_kv + hk) * d + c];
+                    w[ki] = dot * scale + mv[qi * T + ki];
+                    mx = std::max(mx, w[ki]);
+                }
+                for (int64_t ki = 0; ki < T; ++ki) sum += (w[ki] = std::exp(w[ki] - mx));
+                for (int64_t c = 0; c < d; ++c) {
+                    double ctx = 0;
+                    for (int64_t ki = 0; ki < T; ++ki) ctx += w[ki] / sum * vv[(ki * n_head_kv + hk) * d + c];
+                    const size_t at = (size_t) qi * d * n_head + h * d + c;
+                    worst_ref = std::max(worst_ref, std::fabs(out[at] - ctx));
+                    worst_dense = std::max(worst_dense, (double) std::fabs(out[at] - out[at + (size_t) d * n_head * T]));
+                }
+            }
+        }
+        std::printf("  window %3lld: banded vs f64 %.2e, vs dense %.2e\n", (long long) window, worst_ref, worst_dense);
+        LOOM_CHECK(worst_ref < 2e-6);
+        LOOM_CHECK(worst_dense < 2e-6);
+    }
+
+    // The window is a property of a single uncached pass, and a positive count of keys.
+    GgmlScratch s;
+    ggml_tensor* q = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 2, 1, 4);
+    ggml_tensor* k = ggml_new_tensor_3d(s.ctx.get(), GGML_TYPE_F32, 2, 1, 4);
+    ggml_tensor* mask = ggml_new_tensor_2d(s.ctx.get(), GGML_TYPE_F32, 4, 4);
+    loom::SymbolEnv env;
+    loom::PrimitiveContext pc{s.ctx.get(), env, nullptr};
+    LOOM_CHECK_THROWS(op("ATTENTION")(pc, {q, k, k, mask}, {{"kv_cache", false}, {"scale", 1.0}, {"window", 0}}),
+                      loom::SchemaError);
+    LOOM_CHECK_THROWS(op("ATTENTION")(pc, {q, k, k, mask}, {{"kv_cache", true}, {"scale", 1.0}, {"layer", 0}, {"window", 2}}),
+                      loom::SchemaError);
+}
+
 void test_rel_shift() {
     // Cross-checked against actual PyTorch execution of the exact rel_shift algorithm on this same
     // qlen=2, pos_len=3 example (see the implementation plan): input rows [0,1,2] and [3,4,5] (row-major,
@@ -2771,6 +2851,7 @@ int main() {
     test_pool_2d();
     test_gelu();
     test_attention_without_kv_cache();
+    test_attention_window();
     test_rel_shift();
     test_rel_pos_attention();
     test_sub_div_scale();

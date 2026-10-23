@@ -1476,6 +1476,39 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   **1.03x** onnxruntime FP32 (0.98x at rc18), Citrinet 0.61x (0.57x), Moonshine 1.13x and whisper 0.99x
   (unresolved). At Q8_0_PC against onnxruntime int8, whisper is 1.15x and VITS 3.90x.
 
+### P4.41: Pocket-TTS's Mimi decoder on the Pi Zero (2026-10-23)
+
+Asked whether the distilled Pocket-TTS 2m could reach RTF 1.0 on a Pi Zero W. It ran **18.5 s for 4.8 s of
+audio (RTF 3.9)**, and a node profile (`$LOOM_PROFILE_NODES=src`, one call) put 92% of it in the Mimi decoder,
+not the 2m-parameter flow LM, whose ~0.06 GMAC is why `Q8_0_PC` bought nothing (0.98x). Four fixes, built and
+measured together, one process per arm, flipped rounds:
+
+| | main | P4.41 | |
+|---|---|---|---|
+| Pocket-TTS 2m | 18.51-18.57 s | 9.61-9.63 s | **1.93x** (RTF 3.9 -> 2.0) |
+| Pocket-TTS 7m | 44.6-45.0 s | 22.4-22.5 s | **1.99x** |
+
+Waveforms within 2.8e-6 of main's; the Pocket gate on x86 is unchanged on all three models. Where the 2m's
+time went (node profile, seconds; the profiler adds ~2 s, mostly to the LM's small nodes):
+
+| part | main | P4.41 | what changed |
+|---|---|---|---|
+| Mimi attention | 6.38 | 0.58 | the causal window (50 of 960 positions) computed as a band ([ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)) |
+| SEANet | 6.38 | 3.90 | `PAD` a row at a time (`ggml-0050`, 520 -> 54 ms a pad); `ELU` on an ARMv6 kernel (`ggml-0052`, 2.0 -> 0.9 s) |
+| Mimi transformer, rest | 3.22 | 2.68 | RoPE's negation of a strided one-float-row view without per-row divides (`ggml-0051`, 61 -> 8.8 ms each) |
+| flow LM | 4.38 | 4.32 | |
+| Mimi mask build | 0.22 | 0.22 | |
+
+**Why RTF 1.0 is out of reach with exact work.** What is left of the decoder is near the board's measured
+F32 rates: SEANet's convolutions and transposed convolutions at 0.86-1.0 GOP/s (ADR-079's tiles top out at
+1.16), the transformer's linears at 0.76 (the ARMv6 GEMM tile's ceiling). After the window the decoder is
+~1.9 GMAC, ~3.9 s at those rates before anything else runs. Int8 for the linears (P4.33's 1.46-1.66x on
+GEMMs) and the LM's per-node cost (~51k node runs a call) are the remaining levers; together they are worth
+perhaps 1.5 s. A real-time 2m on this board needs a cheaper decoder.
+
+What the first board run taught is [Retro-092](../retros/retro-092-a-view-chose-the-kernel.md): the windowed
+attention's `Q @ K^T` blocks took ggml's per-element dot, not tinyBLAS, because the Q block was a strided view.
+
 ### Operating notes: benchmarking
 
 **Machines.** The Pi answers to **`ssh pi@rpi4`** (verified 2026-08-29; it resolves over IPv6 — an
