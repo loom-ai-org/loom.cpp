@@ -39,7 +39,10 @@
 # Measured against f64 over every 11th float with |x| <= 90: sigmoid 2.40 ULP (glibc 2.39), tanh 1.30 ULP
 # (glibc 2.16); silu is sigmoid's quotient with x on top.
 #
-# Functions: ggml_armv6_{gelu_erf,sigmoid,silu,tanh}_f32(args), args = { x, y, s, n8 }; `s` is 32 floats
+# ELU (P4.41, ggml-0052): the same exp with v = x, and expm1 taken from its polynomial before the 1 is
+# added wherever the reduction leaves n = 0 -- see elu().
+#
+# Functions: ggml_armv6_{gelu_erf,sigmoid,silu,tanh,elu}_f32(args), args = { x, y, s, n8 }; `s` is 32 floats
 # of scratch here (gelu_erf uses 8).
 import os
 import struct
@@ -176,9 +179,10 @@ EXP_TABLE = [LOG2E, MAGIC, LN2HI, LN2LO] + C + [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.
 O_C, O_ONE, O_TWO, O_T, O_SMALL = 4, 10, 14, 18, 23
 
 
-def exp_core(neg, tanh):
-    """e^v for the 8 floats at r0 into s[8..15] (scratch r2 + 32), v = -x (neg) or 2|x| (tanh). The block's
-    t = v log2e + magic goes to s[0..7] (scratch r2) for the integer pass. Leaves r9 at the table."""
+def exp_core(neg, tanh, elu=False):
+    """e^v for the 8 floats at r0 into s[8..15] (scratch r2 + 32), v = -x (neg), 2|x| (tanh) or x (elu). The
+    block's t = v log2e + magic goes to s[0..7] (scratch r2) for the integer pass. Leaves r9 at r2 + 32.
+    With `elu`, q = r + r^2 P(r) -- e^r - 1 before the 1 is added -- also goes to scratch r2 + 64."""
     e("    vldmia r0, {s16-s23}")
     if neg:
         e("    vneg.f32 s16, s16")
@@ -223,6 +227,9 @@ def exp_core(neg, tanh):
     e("    vmul.f32 s12, s12, s28")
     e("    vadd.f32 s8, s8, s16")
     e("    vadd.f32 s12, s12, s20")
+    if elu:
+        e("    add r9, r2, #64")
+        e("    vstmia r9, {s8-s15}")         # q = e^r - 1, kept for n = 0 (no cancellation there)
     e("    vadd.f32 s8, s8, s2")
     e("    vadd.f32 s12, s12, s2")
     e("    add r9, r2, #32")
@@ -242,7 +249,12 @@ def exp_core(neg, tanh):
         e("    sub r5, r5, r10")
         e("    add r3, r3, r5, lsl #23")
         e("    bic r5, r4, #0x80000000")
-        if neg:
+        if elu:
+            e("    cmp r5, r12")
+            e("    bichs r3, r3, r4, asr #31")   # |x| >= 86.98: 0 for x < 0 (v <= -86.98), kept for x > 0
+            e("    cmp r5, r7")
+            e("    bichs r3, r8, r4, asr #31")   # |x| >= 88.37: inf for x > 0, 0 for x < 0
+        elif neg:
             e("    cmp r5, r12")
             e("    andhs r3, r3, r4, asr #31")   # |x| >= 86.98: 0 for x > 0 (v <= -86.98), kept for x < 0
             e("    cmp r5, r7")
@@ -362,8 +374,72 @@ def act(kind):
     return name
 
 
+def elu():
+    """ELU (alpha 1): x for x >= +0, else expm1(x). expm1 is q = r + r^2 P(r) where the reduction leaves
+    n = 0 (|x| < ~0.347, where e^x - 1 would cancel), else e^x - 1, which cannot cancel there (e^x <= 0.71);
+    then x itself for |x| < 2^-24 (expm1 rounds to x there, and q would lose -0's sign) and for a NaN."""
+    name = "ggml_armv6_elu_f32"
+    e(f"    .global {name}\n    .type {name}, %function\n    .align 4\n{name}:")
+    e("    push {r4-r11}")
+    e("    vpush {d8-d15}")
+    e(f"    ldr r1, [r0, #{OFF['y']}]")
+    e(f"    ldr r2, [r0, #{OFF['s']}]")
+    e(f"    ldr r11, [r0, #{OFF['n8']}]")
+    e(f"    ldr r0, [r0, #{OFF['x']}]")
+    e("    ldr r6, 5f")
+    e("4:  add r6, pc, r6")
+    e("    ldr r7, 8f")
+    e("    ldr r8, 7f")
+    e("    ldr r10, 6f")
+    sv.enter(e)
+    e("    ldr r12, 3f")
+    e("1:")
+    e("    pld [r0, #64]")
+    exp_core(False, False, elu=True)
+    e("    vldmia r9, {s8-s15}")             # e^x
+    e(f"    vldr s2, [r6, #{4 * O_ONE}]")
+    e("    vsub.f32 s8, s8, s2")             # e^x - 1
+    e("    vsub.f32 s12, s12, s2")
+    e("    vstmia r9, {s8-s15}")
+    # select, straight to y: q where n = 0 (t is magic exactly), e^x - 1 elsewhere, x for a sign-clear x
+    # (+0 and +NaN included), for |x| < 2^-24 and for a NaN
+    for k in range(8):
+        e(f"    ldr r4, [r0, #{4 * k}]")      # x
+        e(f"    ldr r3, [r9, #{4 * k}]")      # e^x - 1
+        e(f"    ldr r5, [r2, #{4 * k}]")      # t
+        e("    cmp r5, r10")
+        e(f"    ldreq r3, [r2, #{64 + 4 * k}]")
+        e("    bic r5, r4, #0x80000000")
+        e("    cmp r5, #0x33800000")
+        e("    movlo r3, r4")
+        e("    cmp r5, r8")
+        e("    movhi r3, r4")
+        e("    tst r4, #0x80000000")
+        e("    moveq r3, r4")
+        e(f"    str r3, [r1, #{4 * k}]")
+    e("    add r0, r0, #32")
+    e("    add r1, r1, #32")
+    e("    subs r11, r11, #1")
+    e("    bne 1b")
+    sv.leave(e)
+    e("    vpop {d8-d15}")
+    e("    pop {r4-r11}")
+    e("    bx lr")
+    e("    .align 2")
+    e(f"3:  .word {f32hex(86.98)}")
+    e("5:  .word 9f - (4b + 8)")
+    e("6:  .word 0x4b400000")               # bits(magic)
+    e("7:  .word 0x7f800000")
+    e(f"8:  .word {f32hex(88.37)}")
+    e("9:")
+    for v in EXP_TABLE:
+        e(f"    .word {f32hex(v)}")
+    e(f"    .size {name}, .-{name}")
+    return name
+
+
 e("    .pushsection .text\n    .arm\n    .fpu vfp")
-names = [gelu_erf(), act("sigmoid"), act("silu"), act("tanh")]
+names = [gelu_erf(), act("sigmoid"), act("silu"), act("tanh"), elu()]
 e("    .popsection")
 sv.lint(L)
 

@@ -15,7 +15,9 @@
 //
 // Shapes cover the kernel's eight-float steps and their tails, a src1 row of one float (a [1, C] bias,
 // a [1, 1] scale -- the scalar form), a src1 row broadcast over rows (a time mask), a src1 row repeated
-// within a row, and the in-place forms. On every other ISA both registrations run stock ggml and pass.
+// within a row, and the in-place forms; and (ggml-0051, P4.41) 3-D and 4-D broadcasts that wrap the row
+// counters, and strided one-float rows times a scalar. On every other ISA both registrations run stock
+// ggml and pass.
 
 #include "cpu_backend.h"
 #include "test_util.h"
@@ -123,6 +125,48 @@ int run_case(const Case& cs, bool edges, std::vector<float>& all) {
     return bad;
 }
 
+// ggml-0051 (P4.41): the ARMv6 rows are walked with counters, so the cases that matter are the ones where
+// the counters wrap -- 3-D and 4-D sources, src1 broadcast along rows, planes and volumes -- and the
+// one-float rows done inline: a strided [1, 64, n] view times a [1, 1] scalar is Pocket-TTS's RoPE
+// negation. Returns the reference mismatches (normal inputs only); appends dst to `all`.
+int run_case4(const char* name, char op, bool strided, const int64_t a[4], const int64_t b[4], bool edges,
+              std::vector<float>& all) {
+    ggml_init_params ip = { (size_t) 16 << 20, nullptr, false };
+    ggml_context* ctx = ggml_init(ip);
+    ggml_tensor* src;
+    if (strided) {
+        // element 1 of every pair of a [2 a0, a1, a2, a3] tensor, as Pocket's `pairs[..., 1:2]`
+        ggml_tensor* big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2 * a[0], a[1], a[2], a[3]);
+        fill(big, 3, edges);
+        src = ggml_view_4d(ctx, big, a[0], a[1], a[2], a[3], big->nb[1], big->nb[2], big->nb[3], 4);
+    } else {
+        src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a[0], a[1], a[2], a[3]);
+        fill(src, 3, edges);
+    }
+    ggml_tensor* bt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, b[0], b[1], b[2], b[3]);
+    fill(bt, 11, edges);
+    ggml_tensor* out = op == '+' ? ggml_add(ctx, src, bt) : op == '-' ? ggml_sub(ctx, src, bt) : ggml_mul(ctx, src, bt);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    LOOM_CHECK(compute(gf));
+    int bad = 0;
+    for (int64_t i3 = 0; i3 < a[3]; ++i3)
+        for (int64_t i2 = 0; i2 < a[2]; ++i2)
+            for (int64_t i1 = 0; i1 < a[1]; ++i1)
+                for (int64_t i0 = 0; i0 < a[0]; ++i0) {
+                    const float x = *(const float*) ((const char*) src->data + i0 * src->nb[0] + i1 * src->nb[1] + i2 * src->nb[2] + i3 * src->nb[3]);
+                    const float y = *(const float*) ((const char*) bt->data + (i0 % b[0]) * bt->nb[0] + (i1 % b[1]) * bt->nb[1] +
+                                                     (i2 % b[2]) * bt->nb[2] + (i3 % b[3]) * bt->nb[3]);
+                    const float want = op == '+' ? x + y : op == '-' ? x - y : x * y;
+                    const float got = ((const float*) out->data)[((i3 * a[2] + i2) * a[1] + i1) * a[0] + i0];
+                    if (!edges && std::memcmp(&want, &got, 4) != 0) ++bad;
+                }
+    all.insert(all.end(), (const float*) out->data, (const float*) out->data + ggml_nelements(out));
+    ggml_free(ctx);
+    if (!edges) std::printf("  %-32s %s\n", name, bad ? "MISMATCH" : "exact");
+    return bad;
+}
+
 } // namespace
 
 int main() {
@@ -178,6 +222,18 @@ int main() {
         LOOM_CHECK(bad == 0);
     }
     for (const Case& cs : cases) run_case(cs, true, all);   // edges: judged byte for byte below
+
+    struct Case4 { const char* name; char op; bool strided; int64_t a[4], b[4]; };
+    const Case4 cases4[] = {
+        { "mul, strided [1,64,37] x scalar",  '*', true,  { 1, 64, 37, 1 }, { 1, 1, 1, 1 } },
+        { "mul, strided [1,5,3,2] x [1,5]",   '*', true,  { 1, 5, 3, 2 },   { 1, 5, 1, 1 } },
+        { "add, [9,4,3,2] + [9,2,3,1]",       '+', false, { 9, 4, 3, 2 },   { 9, 2, 3, 1 } },
+        { "sub, [1,6,4,3] - [1,3,2,3]",       '-', false, { 1, 6, 4, 3 },   { 1, 3, 2, 3 } },
+        { "mul, [1,7,5,2] x [1,1,5,1]",       '*', false, { 1, 7, 5, 2 },   { 1, 1, 5, 1 } },
+        { "add, [16,3,4,5] + [1,1,1,5]",      '+', false, { 16, 3, 4, 5 },  { 1, 1, 1, 5 } },
+    };
+    for (const Case4& c : cases4) LOOM_CHECK(run_case4(c.name, c.op, c.strided, c.a, c.b, false, all) == 0);
+    for (const Case4& c : cases4) run_case4(c.name, c.op, c.strided, c.a, c.b, true, all);
 
     if (const char* dir = std::getenv("LOOM_TEST_TMPDIR")) {
         char mine[1024], other[1024];

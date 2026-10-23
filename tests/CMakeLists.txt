@@ -339,6 +339,12 @@ set_tests_properties(test_conv_epilogue_fusion PROPERTIES DEPENDS test_conv_epil
 # ADR-079 P4.32f f2 (ggml-0037): the ARMv6 elementwise passes are bit-identical to ggml's loops. Run
 # with them off and on (ggml reads GGML_CPU_ARMV6_ELTWISE once); the second compares both outputs byte
 # for byte, edge bit patterns included. Elsewhere both runs are stock ggml.
+# P4.41 (ggml-0050): PAD and CONCAT a row at a time, exact on every ISA.
+add_executable(test_pad_concat_rows ci/test_pad_concat_rows.cpp)
+target_link_libraries(test_pad_concat_rows PRIVATE loom::engine)
+add_test(NAME test_pad_concat_rows COMMAND test_pad_concat_rows)
+set_tests_properties(test_pad_concat_rows PROPERTIES LABELS ci)
+
 add_executable(test_eltwise_armv6 ci/test_eltwise_armv6.cpp)
 target_link_libraries(test_eltwise_armv6 PRIVATE loom::engine)
 add_test(NAME test_eltwise_armv6_off COMMAND test_eltwise_armv6)
