@@ -358,7 +358,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   2026-10-22).
   *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22),
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437)*
-* [ ] **P4.38: BUILT 2026-10-23 on `perf/p438-a72-f32-tile` (stacked on #90), uncommitted; open: commit + PR.**
+* [ ] **P4.38: BUILT 2026-10-23, PR #91 (stacked on #90); open: merge.**
   `ggml-0048`: XNNPACK's A72 kernel (`f32-gemm 4x8`, an outer product) in NEON intrinsics, under a schedule that shares
   one packed block of weight (`L2 / 4`, 256 x 256 on the A72) between the threads. Graph F32 `MUL_MAT` nodes with
   >= 128 activation rows, AArch64 without DOTPROD (`GGML_CPU_NEON_F32_4X8=0` off). GEMM, Pi 4, 4 threads: whisper
