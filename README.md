@@ -423,6 +423,9 @@ resolves, its three paired rounds all on the same side of 1.00x.
 | VITS piper en-GB miro (TTS, 3.39 s of audio) | 21.96 s (6.48) | 22.16 s (6.51) | 0.99x | 0.98–1.00x |
 | sanoTTS heartnano (TTS, 3.06 s of audio), control | 0.847 s (0.28) | 0.862 s (0.28) | 0.98x | 0.96–1.01x |
 | Pocket TTS (TTS, 4.80 s of audio) | does not fit | 115.0 s (23.96) | — | — |
+| Pocket TTS 18m refl (TTS, 4.80 s of audio) | 67.02 s (13.96) | 58.85 s (12.26) | **1.14x** | 1.14–1.15x |
+| Pocket TTS 7m refl (TTS, 4.80 s of audio) | 46.60 s (9.71) | 45.16 s (9.41) | 1.03x | 0.98–1.03x |
+| Pocket TTS 2m refl (TTS, 4.80 s of audio) | 19.14 s (3.99) | 19.57 s (4.08) | **0.98x** | 0.98–0.99x |
 
 * **sanoTTS heartnano is the noise floor.** None of its tensors is large enough to quantize, so its Q8_0_PC export is
   byte-identical to its F32 one (md5 `75579b65` for both). Its 0.96–1.01x is what two runs of the same file differ by on
@@ -437,6 +440,14 @@ resolves, its three paired rounds all on the same side of 1.00x.
 * **Pocket TTS has no F32 arm for the same reason:** its F32 file is 405 MB. Its 130 MB Q8_0_PC file was timed alone,
   on 2026-10-21 with the 1.0.0-rc18 release wheel. The time is the median of 3 launches, each launch's first call, on the
   Pi 4 row's 60 frames. The output hashed the same in all three. 79 of its weights (97 MB) take the ARMv6 int8 path.
+* **The small Pocket TTS models do fit at F32.** These are Kyutai's distilled `english_{18m,7m,2m}_refl_2026-10`
+  (ADR-084): 77, 29 and 8.5 MB at F32, 31, 11 and 4.2 MB at Q8_0_PC. They were measured on 2026-10-23 with the same
+  rc18 wheel and the same call as the Pocket TTS row (60 frames, EOS disarmed, seed 1, `alba`), timing each
+  launch's first call. The token ids are fixed, so the text rules ADR-084 adds to the engine don't come into it.
+  Every arm's output hashed the same in all three rounds, and whisper-small hears all six as the sentence
+  spoken (the 7m Q8_0_PC writes "gray" for "grey"). Q8_0_PC pays off only on the 18m model. The 2m's 0.98x
+  resolves by the rule above but sits inside heartnano's noise floor. The GGUFs are md5 `d0147aa6`/`2eb67407`
+  (18m), `fa467304`/`98c9c51e` (7m) and `be656b10`/`89835bf9` (2m), F32/Q8_0_PC.
 * The wheel is the `integration/rc18` ARMv6 build at engine `d66c2ce` (wheels CI run 39510002375). The GGUFs are
   md5 `0711bf17`/`37a8d3b6` (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `ae4a116f`/`a815c984` (Silero VAD),
   `b3df3baf`/`14df8278` (heart), `be98f1a8`/`6586f559` (WakeHuBERT), `9ae1d8a2`/`241b1bca` (Conformer-CTC),
