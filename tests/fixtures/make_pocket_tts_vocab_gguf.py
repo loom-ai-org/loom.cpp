@@ -7,6 +7,10 @@ reachable in a sentence a person can trace by hand. The real keys come from the 
 (`loom-exporter/loom_exporter/pocket_tts_tokenizer_export.py`); the terminal, weak and closer sets
 here are the reference's own, and the case and digit tables are cut down to what the test uses.
 
+`--v4` writes the same table with the keys v4 of the reference added: a `replace_characters` table
+(curly apostrophe -> "'", en/em dash -> ",", the straight double quote DELETED), the stray-clause-mark
+rule's two classes, and decimal-period rule 2.
+
 Requires: pip install gguf numpy
 """
 import sys
@@ -23,7 +27,9 @@ WORDS = ["▁", "▁Hi", "▁hi", "▁the", "▁The", ".", ",", "!", "▁A", "�
 
 
 def main() -> None:
-    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("pocket_tts_vocab_test.gguf")
+    v4 = "--v4" in sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a != "--v4"]
+    out_path = Path(args[0]) if args else Path("pocket_tts_vocab_test.gguf")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pieces = [("<unk>", 0.0, UNKNOWN), ("<s>", 0.0, CONTROL), ("</s>", 0.0, CONTROL)]
     pieces += [(f"<0x{b:02X}>", 0.0, BYTE) for b in range(256)]            # ids 3 .. 258
@@ -43,6 +49,12 @@ def main() -> None:
     w.add_bool("tokenizer.ggml.byte_fallback", True)
     w.add_array(P + "replace_from", ["\n", "\r", "  "])
     w.add_array(P + "replace_to", [" ", " ", " "])
+    if v4:
+        w.add_array(P + "char_replace_from", ["’", "–", "—", '"'])
+        w.add_array(P + "char_replace_to", ["'", ",", ",", ""])
+        w.add_array(P + "sentence_marks", list("!.?…"))
+        w.add_array(P + "stray_clause_marks", list(",:;"))
+        w.add_int32(P + "decimal_period_rule", 2)
     w.add_array(P + "terminal", list(".!?…"))
     w.add_array(P + "weak", list(",;:-–—"))
     w.add_array(P + "closers", list("\"')]»”’"))

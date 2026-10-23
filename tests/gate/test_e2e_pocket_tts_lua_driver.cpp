@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -49,7 +50,22 @@ std::string meta_text(const std::string& json) {
     const size_t at = json.find(needle);
     if (at == std::string::npos) throw std::runtime_error("pocket_tts_ref/meta.json has no \"text\"");
     const size_t start = at + needle.size();
-    return json.substr(start, json.find('"', start) - start);
+    const std::string text = json.substr(start, json.find('"', start) - start);
+    // A literal reader: an escape would reach the vocabulary as its six characters and the test would
+    // grade a different sentence (an em dash written as `—` did: ids off, then the pinned noise ran
+    // out). pocket_tts_reference.py writes UTF-8, so a backslash here is a stale or foreign fixture.
+    if (text.find('\\') != std::string::npos) {
+        throw std::runtime_error("meta.json's text holds an escape; regenerate it with pocket_tts_reference.py");
+    }
+    return text;
+}
+
+// `"wave_rmse": <number>` from meta.json's `f64` block -- the reference's OWN free-running drift
+// between float32 and float64 from the same draws -- or a negative number when the fixture has none.
+double meta_f64_wave_rmse(const std::string& json) {
+    const std::string needle = "\"wave_rmse\": ";
+    const size_t at = json.find(needle);
+    return at == std::string::npos ? -1.0 : std::strtod(json.c_str() + at + needle.size(), nullptr);
 }
 
 std::vector<double> as_doubles(const std::vector<float>& v) { return {v.begin(), v.end()}; }
@@ -88,6 +104,7 @@ int main() {
     std::stringstream meta_buf;
     meta_buf << meta_file.rdbuf();
     const std::string text = meta_text(meta_buf.str());
+    const double f64_wave_rmse = meta_f64_wave_rmse(meta_buf.str());
 
     std::vector<int64_t> shape;
     const auto ref_ids = loom_test::read_npy_f32(ref_dir + "/tokens.npy", shape);
@@ -142,8 +159,16 @@ int main() {
         LOOM_CHECK(got.size() == ref_wave.size());
         const Diff d = compare(got, ref_wave);
         std::fprintf(stderr, "free-running max_abs_diff=%g rmse=%g peak=%g\n", d.max_abs, d.rmse, d.peak);
-        // A drift bound, not an equality: 10x the measured rmse, and the sabotage arm is 650x over it.
-        LOOM_CHECK(d.rmse < 1e-3);
+        // A drift bound, not an equality. The loop feeds every latent back, so f32 rounding compounds
+        // along it, and HOW much is the model's: the full-size model drifts 9.9e-5 here (1e-3 is 10x
+        // that, and the sabotage arm is 650x over it), while the small 2026-10 models' own
+        // reference drifts up to 2.5e-2 between f32 and f64 from the same draws -- chaos that teacher
+        // forcing (arm 1) shows is not error. So the bound is 3x the fixture's own float floor when its
+        // meta records one (`--f64`), never tighter than 1e-3; the sample count above stays exact.
+        const double drift_bound = std::max(1e-3, 3.0 * f64_wave_rmse);
+        std::fprintf(stderr, "free-running drift bound %g (reference f32-vs-f64 rmse %g)\n", drift_bound,
+                     f64_wave_rmse);
+        LOOM_CHECK(d.rmse < drift_bound);
     }
 
     // --- 3. A voice file, through the loader both hosts use. ---
