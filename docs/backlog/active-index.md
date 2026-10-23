@@ -359,8 +359,8 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   shipped: decide its status. *Context:
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437),
   [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)*
-* [ ] **P4.41: Pocket-TTS's Mimi decoder on the Pi Zero -- BUILT 2026-10-23 (branch `perf/p441-pocket-mimi-pi-zero`
-  in loom.cpp and loom-exporter), open: commit, PR, re-export the three small models for rc19.** 2m 1.93x (RTF
+* [ ] **P4.41: Pocket-TTS's Mimi decoder on the Pi Zero -- BUILT 2026-10-23, PRs loom.cpp #96 + loom-exporter #66
+  (merge #96 first); open: merge, re-export the three small models for rc19.** 2m 1.93x (RTF
   3.9 -> 2.0), 7m 1.99x: the windowed `ATTENTION` ([ADR-085](../adrs/adr-085-a-windowed-attention-computes-only-its-band.md)),
   `ggml-0050` (`PAD`/`CONCAT` rows), `ggml-0051` (ARMv6 binary rows without divides), `ggml-0052` (ARMv6 `ELU`).
   Left, in order of size: the flow LM's per-node cost (~4.3 s profiled, ~51k node runs a call); int8 for Mimi's
