@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-22
+last_updated: 2026-10-23
 ---
 
 # Epic-05: Edge CPU Performance
@@ -1335,6 +1335,137 @@ machine against a 1.52x roofline ceiling. See §5.
 **Not a gap, but worth knowing:** whisper pads every clip to 30 s, so an 11-second file pays the full
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
 model-semantics change (the positional embedding is fixed at 1500), so it is not part of this item.
+
+### P4.35-P4.38: whisper-small on the Raspberry Pi 4, per op (2026-10-22)
+
+The rc18 table in the README has whisper-small at **0.80x** (F32) and **0.64x** (`Q8_0_PC` against
+onnxruntime's int8) on the Pi 4 at four threads, where every other Pi 4 cell is at parity or a win. Both
+engines were profiled per op on the board (rc18 binaries and GGUFs, jfk, cooled to 60 C before each arm):
+loom with `$LOOM_PROFILE_NODES=1`, onnxruntime with its own profiler over a full transcription, each node
+apportioned over an unprofiled wall.
+
+**The whole gap is the encoder.** loom's decoder (and cross-KV) is at parity in F32 and about 1.8 s ahead in
+int8. Encoder, ms per transcription (loom's profiled, so a little high):
+
+| piece | F32: loom / onnx | | `Q8_0_PC` / onnx int8 | |
+|---|---|---|---|---|
+| Q/K/V/O projections (48) | 3365 / 2804 | 1.20x | ~3715 / 1221 | **3.0x** |
+| `fc1` | 3302 / 2441 | 1.35x | 3435 / 1200 | **2.9x** |
+| `fc2` (K = 3072) | 4184 / 2862 | 1.46x | 3163 / 1337 | **2.4x** |
+| `A@V` | 2554 / 1375 | **1.86x** | 2607 / 1298 | 2.0x |
+| `QK^T` | 1862 / 1196 | 1.56x | 1906 / 1199 | 1.6x |
+| head layout (`CONT` vs `Transpose`) | ~1000 / 223 | 4.5x | ~990 / 200 | 5x |
+| softmax | ~1050 / 984 | parity | parity | |
+| **encoder** | **~18.7 s / 13.0 s** | | **~20 s / 8.6 s** | |
+
+A one-thread loom profile next to the four-thread one gives each piece's scaling: dense GEMMs 2.85x,
+`QK^T` 3.36x, **`A@V` 2.0x**, the layout copies **0.97x** (none). Four items follow, in the user's order:
+
+* **P4.35, `A@V` scaling — DONE as `ggml-0045`.** `ggml-0030` chunks K only from two chunks up (1536 on a
+  32 KB L1), and `A@V`'s K is 1500. Its 4x3 tile streams (4 + 3) x 1500 floats = 42 KB per output block
+  through the L1, and at four threads the cores queue on the shared L2. `scripts/bench63.cpp` (with
+  `scripts/probes/ggml-p435-sgemm-schedule-probe.patch`) turned the schedule into run-time knobs. Forcing
+  the chunk: **1.34x at four threads, 0.98x at one**. A job owning all 64 rows with narrow column blocks
+  added 1.08x more, which is left as a follow-up. Two balanced halves when `nth > 1`, swept over K at
+  768 x 1500 x K: 960 → 0.944, 1024 → 0.965, 1152 → 1.035, 1344 → 1.096, and `A@V` → 1.312. The crossover
+  is where the strips pass 7/8 of L1, so that is the predicate. **End to end: whisper F32 1.018x** (7 paired
+  launches, p10 1.004, p90 1.043); VITS unmoved (0.992, straddling).
+* **P4.36, the V^T copies — DONE as `ggml-0046`.** Two of the layout copies are V^T: the encoder's and
+  the cross-KV phase's (12 each, ~0.58 s). `dup_bytes` walked them one `memcpy` call per 4-byte element against a
+  3 KB stride. A 4x4-tiled transpose (NEON `trn`, after XNNPACK's `x32-transposec`), blocked so a block's
+  source lines stay in L1: **4.68x at four threads, 3.48x at one** on the A72 (`scripts/bench64.cpp`), 1.76-1.82x
+  on x86, byte-identical. Exporting V^T as a swapped matmul would delete the copy instead, but only for F32
+  weights: a `Q8_0` weight cannot be `src1`. **End to end: whisper F32 1.021x** (7 paired launches, p10 1.004,
+  p90 1.050). **Both patches together on whisper `Q8_0_PC`: 1.044x** (22.39 → 21.50 s, 5 paired launches, p10
+  1.029, p90 1.046), which moves the README's 0.64x cell to about 0.67x. The rest of that gap is P4.37.
+* **P4.37, an int8 GEMM for the A72 — BUILT 2026-10-22 (`ggml-0047`).** The A72 has no `sdot` instruction, so
+  tinyBLAS's Q8_0 kernel (DOTPROD-only) never runs there, and a `Q8_0_PC` weight went through ggml's row-at-a-time
+  `vec_dot_q8_0_q8_0`. `CPU_NEON_I8` is the NEON sibling of P4.33's `CPU_ARMV6_I8`: an extra buffer type registered
+  on AArch64 when `ggml_cpu_has_dotprod()` is false, and the engine places `loom.quantize.per_channel` weights there
+  by default, with the same convolution rule. The weights are packed at load into XNNPACK's `c2s4` 8-column
+  panels, and the inner loop is XNNPACK's `qd8-f32-qc8w 2x8c2s4__neon_mlal` (SMULL/SMLAL into int16 pairs, SADALP
+  into int32).
+  * **Activations: per 32 k, not per row.** XNNPACK's per-row asymmetric activations doubled whisper's encoder
+    error against F32 (9.8e-2, cosine 0.9952; ggml's Q8_0 path is 4.8e-2). Outlier channels set a whole row's
+    range, and scaling the input by (1 + 1e-7) moved that path 3.4e-2, so the error is real, not the card's noise
+    floor. Per 32 k, symmetric, each block's int32 sum is FMA-scaled into a float accumulator: 4.806e-2 from F32,
+    at 86% of the per-row GEMM speed. Blocks of 64/128/256 k sit between (5.2/6.2/7.7e-2).
+  * **Schedules.** When the int8 rows fit a quarter of the L2, panels are dealt to the threads round robin, so
+    DRAM sees one stream: a one-row K 3072 product went 0.90x → 1.09x. Otherwise each thread walks 160 KB blocks
+    of panels that stay in L2 while the rows stream past.
+  * **`GET_ROWS`** reads the packed panels too, byte-identical to ggml's, so a tied embedding needs no plain
+    copy (Qwen3-0.6B: 165 MB, whisper: 42 MB).
+  * **GEMM** (bench65, 4 threads, against ggml's Q8_0 path on the same weights): whisper's encoder shapes
+    2.29-2.44x (~59 GOP/s); the decoder's one-row steps 1.09-1.12x.
+  * **End to end** (Pi 4, 4 threads, `GGML_CPU_NEON_I8` off/on, paired launches):
+
+    | card (Q8_0_PC) | ratio (p10-p90) | notes |
+    |---|---|---|
+    | whisper-small | **1.547x** (1.538-1.554) | 21.42 → 13.85 s, same transcript |
+    | Qwen3-0.6B | 1.190x (1.188-1.193) | 24 tokens, same tokens |
+    | Moonshine tiny | 1.191x (1.185-1.197) | transcripts differ: this path's is exact, ggml's Q8_0 path's reads "as" for "ask" |
+    | Citrinet-256-ls | 1.003x | only 0.4 MB placed; its pointwise convs stay on the direct path |
+    | VITS | 0.994x | nothing placed (every listed weight feeds a conv): the null control |
+
+    The test is `test_mul_mat_neon_i8`, bit-exact against a scalar reference, sabotaged red.
+* **P4.38, an F32 GEMM tile for the A72 — BUILT 2026-10-23 (`ggml-0048`,
+  [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)).** The lead
+  in the scope ("`fc2` collapses at four threads", from `bench65`'s F32 arm) was the bench's own build:
+  a standalone ggml defaults `GGML_LLAMAFILE` to OFF, so that arm was never tinyBLAS
+  ([Retro-090](../retros/retro-090-the-baseline-arm-was-not-the-engine.md)). Measured against the engine's
+  build (`scripts/bench66.cpp`), tinyBLAS runs whisper's linears at 8.3 GF on one core (58% of the roofline)
+  and 15.7-24.2 at four. XNNPACK's kernel for this core, a 4x8 outer product, runs at 10.6 on one core.
+  Its own operator re-reads the weights from DRAM for every 4 rows, though, and so loses at whisper's sizes.
+  The patch keeps the tile and replaces the schedule. The threads pack one block of weight (`L2 / 4`,
+  256 rows x 256 k) together and each walks its share of the activation rows against it, so k is carried
+  through C between blocks.
+  * **GEMM**, four threads: `qkv` 24.2 → 31.9 GF (1.32x), `fc1` 24.1 → 31.7 (1.31x), `fc2` 15.7 → 27.0
+    (1.71x), against MLAS's 30.3 / 34.8 / 29.7 in the model. Across 27 shapes it wins from 200 activation rows
+    up (1.11-1.58x) and loses below 64 (the per-call pack is not amortised there), so the predicate is
+    n >= 128, at every thread count: a thread-dependent one would make the bytes depend on the thread count.
+  * **End to end** (Pi 4, 4 threads, `GGML_CPU_NEON_F32_4X8` off/on, paired launches, F32 cards unless named).
+    Against onnxruntime FP32 (the README's Pi 4 F32 half, re-run on this branch) whisper-small went 0.80x → 0.98x
+    and Moonshine 1.03x → 1.10x:
+
+    | card | ratio | notes |
+    |---|---|---|
+    | whisper-small | **1.174x** | 24.6 → 20.9 s, means of 7; same transcript |
+    | Moonshine tiny | 1.057x (1.055-1.060) | same transcript |
+    | whisper-small Q8_0_PC | 1.082x | 13.78 → 12.74 s; its attention is F32 x F32 |
+    | Citrinet-256-ls | 0.998x, unresolved | convolutions only: they keep tinyBLAS (P4.39) |
+    | VITS | 1.011x, unresolved | byte-identical audio: nothing took the path |
+    | Qwen3-0.6B | 0.991x, unresolved | same tokens; prompt and decode below 128 rows |
+
+  * **Graph nodes only.** Taken inside `llamafile_sgemm`, the pack overwrote the im2col patches that the
+    convolutions' fallback keeps in `params->wdata`. The conv sweeps and the STFT test went red on the Pi
+    (relative errors 0.9-1.5), the same trap ARMv6's packed GEMM hit in P4.33. P4.39 would give the
+    convolutions their own block.
+  * Numerics: one sequential fused sum per output, bit-exact to an `fmaf` loop at 1/2/4 threads
+    (`test_mul_mat_neon_f32_4x8`, sabotaged red). Not tinyBLAS's order; ~2x its error against f64
+    (5.0e-7 vs 2.5e-7).
+* **P4.39, the convolutions' GEMMs on the same path — BUILT 2026-10-23 (`ggml-0049`,
+  [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md)).** A
+  convolution carves the path's block off the end of its own work buffer before sizing its im2col patches, and
+  hands it to the GEMM. All three of `conv_2d_impl`'s GEMM calls take it, and so does `conv_transpose_1d`'s.
+  A VITS profile split its convolutions three ways: the vocoder's resblocks (~37%) run ggml's **direct** kernel,
+  not a GEMM. The text encoder and flow (~21%) are im2col, and the three upsamplers (~6%) are GEMMs too. P4.38's
+  sweep had raced the resblock shapes against tinyBLAS, which they never reach
+  ([Retro-090](../retros/retro-090-the-baseline-arm-was-not-the-engine.md)). Sent through im2col and this GEMM,
+  they made the synthesis slower (1.178 s against 1.022), so they keep the direct kernel (P4.40).
+
+  | card (Pi 4, 4 threads, off/on, 5 paired launches) | ratio (p10-p90) | |
+  |---|---|---|
+  | VITS F32 | **1.068x** (1.062-1.090) | 1.097 → 1.025 s |
+  | VITS Q8_0_PC | 1.054x (1.024-1.070) | dequantized kernels, the same GEMMs |
+  | Citrinet-256-ls F32 / Q8_0_PC | **1.062x** / 1.060x | same transcripts |
+  | Moonshine tiny F32 | 1.034x (1.029-1.084) | the stem; same transcript |
+  | whisper-small F32 | 1.000x, unresolved | same transcript |
+  | Pocket TTS F32 | 1.003x, unresolved | |
+
+  The patch budget (512 KB) and the transpose's block were re-swept with the path on, and both stay as they are.
+  The README's Pi 4 table, both halves re-run on this build (#89-#91 plus `ggml-0049`), now has VITS F32 at
+  **1.03x** onnxruntime FP32 (0.98x at rc18), Citrinet 0.61x (0.57x), Moonshine 1.13x and whisper 0.99x
+  (unresolved). At Q8_0_PC against onnxruntime int8, whisper is 1.15x and VITS 3.90x.
 
 ### Operating notes: benchmarking
 

@@ -157,9 +157,11 @@ bool serves_convs(ggml_backend_t backend, ggml_backend_buffer_type_t buft, const
 }
 
 // ADR-079 P4.33: the weights an export wrote as per-channel int8 (ADR-076's Q8_0_PC, listed under
-// `loom.quantize.per_channel`) go to CPU_ARMV6_I8 by default, the one extra buffer type that is placed
-// without being asked for. ggml registers it on ARMv6 only, and not with GGML_CPU_ARMV6_I8=0; an explicit
-// LOOM_CPU_REPACK (any value, "0" included) takes precedence, so the A/B switches keep their meaning.
+// `loom.quantize.per_channel`) go to a per-channel int8 buffer type by default, the only extra buffer
+// types placed without being asked for: CPU_ARMV6_I8 (ggml registers it on ARMv6 only, and not with
+// GGML_CPU_ARMV6_I8=0) or CPU_NEON_I8 (P4.37: AArch64 without DOTPROD, the Pi 4's A72; not with
+// GGML_CPU_NEON_I8=0). At most one of them exists on a core. An explicit LOOM_CPU_REPACK (any value, "0"
+// included) takes precedence, so the A/B switches keep their meaning.
 ggml_backend_buffer_type_t per_channel_buffer_type(ggml_backend_t backend, gguf_context* gguf, ggml_context* meta,
                                                    std::unordered_set<std::string>& names) {
     const char* e = std::getenv("LOOM_CPU_REPACK");
@@ -169,6 +171,7 @@ ggml_backend_buffer_type_t per_channel_buffer_type(ggml_backend_t backend, gguf_
         return nullptr;
     }
     ggml_backend_buffer_type_t buft = find_extra_buffer_type(backend, "CPU_ARMV6_I8");
+    if (buft == nullptr) buft = find_extra_buffer_type(backend, "CPU_NEON_I8");
     if (buft == nullptr) return nullptr;
     const ConvReaders convs = conv_readers(gguf);
     for (size_t i = 0; i < gguf_get_arr_n(gguf, kv); ++i) {
@@ -667,9 +670,10 @@ void GgufModel::route_repacked_uses(ggml_cgraph* gf) {
             // every layout its kernels rely on, including the pointwise CONV_2D it serves (ADR-079 P4.33),
             // so for it supports_op is the whole test: with these rules applied to it, every one of
             // Citrinet's pointwise kernels was routed to a plain copy and the int8 path never ran.
+            // CPU_NEON_I8 (P4.37) checks its own layouts the same way.
             const ggml_tensor* act = t->src[1];
-            const bool own_checks = s->buffer != nullptr &&
-                                    std::strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(s->buffer)), "CPU_ARMV6_I8") == 0;
+            const char* buft_name = s->buffer != nullptr ? ggml_backend_buft_name(ggml_backend_buffer_get_type(s->buffer)) : "";
+            const bool own_checks = std::strcmp(buft_name, "CPU_ARMV6_I8") == 0 || std::strcmp(buft_name, "CPU_NEON_I8") == 0;
             const bool layout_ok = own_checks ||
                                    ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_GET_ROWS) && act != nullptr &&
                                     act->ne[3] == 1 && (t->op != GGML_OP_MUL_MAT || act->nb[0] == sizeof(float)));

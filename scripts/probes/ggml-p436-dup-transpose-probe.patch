@@ -1,0 +1,29 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -412,6 +412,17 @@
+ }
+ #endif
+ 
++// P4.36 probe: GGML_DUP_PROBE=0 / loom_dup_probe_set(0) sends a transpose back to ggml's generic path.
++static int loom_dup_probe_value = -1;
++extern "C" void loom_dup_probe_set(int v) { loom_dup_probe_value = v; }
++static int loom_dup_probe() {
++    if (loom_dup_probe_value < 0) {
++        const char * e = getenv("GGML_DUP_PROBE");
++        loom_dup_probe_value = e ? atoi(e) : 1;
++    }
++    return loom_dup_probe_value;
++}
++
+ static void ggml_compute_forward_dup_bytes(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -460,7 +471,7 @@
+ 
+     if (ggml_is_contiguous(dst)) {
+ #if defined(GGML_DUP_TRANSPOSE_X32)
+-        if (type_size == 4 && nb00 != 4 && nb01 == 4) {
++        if (type_size == 4 && nb00 != 4 && nb01 == 4 && loom_dup_probe() != 0) {
+             ggml_compute_forward_dup_transpose_x32((const char *) src0->data, (char *) dst->data,
+                 ne00, ne01, ne02, ne03, nb00, nb02, nb03, ir0, ir1);
+             return;
