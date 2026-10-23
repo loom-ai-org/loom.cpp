@@ -1,0 +1,96 @@
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -339,6 +339,79 @@
+ }
+ 
+ // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.
++// A MATERIALISED TRANSPOSE OF 4-BYTE ELEMENTS, IN 4x4 TILES. `dup_bytes` used to copy a source that
++// is strided along its first dimension one element at a time -- a runtime-sized `memcpy` call per
++// 4 bytes, each reading a different cache line. The common case is a transpose: the source runs
++// contiguous along its SECOND dimension (nb01 == 4), e.g. whisper's V^T, `[64, 12, 1500]` permuted to
++// `[1500, 64, 12]`, which an attention export materialises for `A@V` twice per layer (encoder and
++// cross-KV). On a Raspberry Pi 4 that copy ran at 0.42 GB/s and did not scale with threads.
++//
++// Here the source is read as 4x4 tiles (four rows of four), transposed in registers, and stored as four
++// 16-byte row segments -- NEON's `trn` on aarch64, after XNNPACK's x32-transposec 4x4 kernels, and a
++// plain 4x4 elsewhere. The first dimension is walked in blocks of 64, so the 64 source lines a block
++// touches stay in L1 across all of the thread's rows instead of being re-fetched for every row.
++//
++// whisper's V^T (scripts/bench64.cpp, both arms in one process, per-round ratio, byte-identical):
++//   Pi 4 (Cortex-A72)  4 threads 21.9 -> 4.68 ms (4.68x), 1 thread 26.2 -> 7.52 ms (3.48x)
++//   Ryzen 3 3250U      2 threads 2.75 -> 1.67 ms (1.76x), 1 thread 4.12 -> 2.21 ms (1.82x)
++// A decoder-sized one ([32, 12, 50]) is neutral on the A72 (0.97x, inside its noise) and 4.3x on x86.
++// End to end, whisper-small F32 on the Pi 4: 1.021x (7 paired launches, p10 1.004, p90 1.050).
++//
++// Enabled only on the two ISAs it was measured on (Retro-019). ARMv6 is the next to measure: its VFP has
++// no vector registers and its L1 is 16 KB, so the scalar 4x4 there is a different bet.
++#if defined(__aarch64__) || defined(__x86_64__)
++#define GGML_DUP_TRANSPOSE_X32 1
++
++static inline void dup_x32_tile4(const char * s, size_t sstride, uint32_t * d, size_t dstride) {
++#if defined(__aarch64__)
++    const uint32x4_t a0 = vld1q_u32((const uint32_t *) (s));
++    const uint32x4_t a1 = vld1q_u32((const uint32_t *) (s + sstride));
++    const uint32x4_t a2 = vld1q_u32((const uint32_t *) (s + 2 * sstride));
++    const uint32x4_t a3 = vld1q_u32((const uint32_t *) (s + 3 * sstride));
++    const uint32x4x2_t p0 = vtrnq_u32(a0, a1);
++    const uint32x4x2_t p1 = vtrnq_u32(a2, a3);
++    vst1q_u32(d,               vcombine_u32(vget_low_u32 (p0.val[0]), vget_low_u32 (p1.val[0])));
++    vst1q_u32(d + dstride,     vcombine_u32(vget_low_u32 (p0.val[1]), vget_low_u32 (p1.val[1])));
++    vst1q_u32(d + 2 * dstride, vcombine_u32(vget_high_u32(p0.val[0]), vget_high_u32(p1.val[0])));
++    vst1q_u32(d + 3 * dstride, vcombine_u32(vget_high_u32(p0.val[1]), vget_high_u32(p1.val[1])));
++#else
++    uint32_t a[4][4];
++    for (int j = 0; j < 4; ++j) memcpy(a[j], s + j * sstride, 16);
++    for (int i = 0; i < 4; ++i)
++        for (int j = 0; j < 4; ++j) d[i * dstride + j] = a[j][i];
++#endif
++}
++
++// Rows [ir0, ir1) of the second dimension, every element of the others; `dst` is contiguous in the
++// source's logical order, exactly as the generic path writes it.
++static void ggml_compute_forward_dup_transpose_x32(
++        const char * src, char * dst,
++        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
++        size_t nb00, size_t nb02, size_t nb03, int64_t ir0, int64_t ir1) {
++    const int64_t TB = 64;
++    for (int64_t i03 = 0; i03 < ne03; i03++) {
++        for (int64_t i02 = 0; i02 < ne02; i02++) {
++            const char * s = src + i02*nb02 + i03*nb03;
++            uint32_t * d = (uint32_t *) dst + (i03*ne02 + i02)*ne01*ne00;
++            for (int64_t t0 = 0; t0 < ne00; t0 += TB) {
++                const int64_t t1 = std::min(t0 + TB, ne00);
++                int64_t r = ir0;
++                for (; r + 4 <= ir1; r += 4) {
++                    int64_t t = t0;
++                    for (; t + 4 <= t1; t += 4) {
++                        dup_x32_tile4(s + t*nb00 + r*4, nb00, d + r*ne00 + t, (size_t) ne00);
++                    }
++                    for (; t < t1; ++t)
++                        for (int i = 0; i < 4; ++i) memcpy(d + (r + i)*ne00 + t, s + t*nb00 + (r + i)*4, 4);
++                }
++                for (; r < ir1; ++r)
++                    for (int64_t t = t0; t < t1; ++t) memcpy(d + r*ne00 + t, s + t*nb00 + r*4, 4);
++            }
++        }
++    }
++}
++#endif
++
+ static void ggml_compute_forward_dup_bytes(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -386,6 +459,13 @@
+     }
+ 
+     if (ggml_is_contiguous(dst)) {
++#if defined(GGML_DUP_TRANSPOSE_X32)
++        if (type_size == 4 && nb00 != 4 && nb01 == 4) {
++            ggml_compute_forward_dup_transpose_x32((const char *) src0->data, (char *) dst->data,
++                ne00, ne01, ne02, ne03, nb00, nb02, nb03, ir0, ir1);
++            return;
++        }
++#endif
+         size_t id = 0;
+         char * dst_ptr = (char *) dst->data;
+         const size_t rs = ne00 * type_size;

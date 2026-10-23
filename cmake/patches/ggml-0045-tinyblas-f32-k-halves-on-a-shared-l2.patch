@@ -1,0 +1,35 @@
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -1180,8 +1180,31 @@
+             if (caches.l1d > 0 && k % KN == 0) {
+                 kc = caches.l1d * 3 / 8 / (RM * (int64_t) sizeof(TA));
+                 kc -= kc % KN;
+-                if (kc < KN || k < 2 * kc)
++                if (kc < KN) {
+                     kc = 0;
++                } else if (k < 2 * kc) {
++                    // BETWEEN ONE CHUNK AND TWO, CHUNK ONLY WHEN THREADS SHARE THE L2 AND THE TILE SPILLS L1.
++                    // Below 2 kc the rule above used to leave K whole, which is right on one core: forcing
++                    // two chunks on whisper's A@V (m = 64, n = k = 1500) costs a Cortex-A72 2% at one
++                    // thread. At four the same matmul scales only 2.0x (QK^T scales 3.4x), because each
++                    // tile streams its two operand strips, (RM + RN) k floats = 42 KB, through a 32 KB L1
++                    // and four cores then queue on the one L2. Two balanced halves fix that: 1.31x on the op at
++                    // four threads, and 1.018x on a whole whisper-small transcription (7 paired launches,
++                    // p10 1.004, p90 1.043); a VITS synthesis is unmoved (0.992, p10 0.979, p90 1.016).
++                    //
++                    // Measured per K at four threads on the A72 (scripts/bench63.cpp, two halves vs whole,
++                    // per-round ratio over nine rounds; outputs byte-identical in every arm):
++                    //
++                    //     k        960     1024    1152    1344    1500
++                    //     strips   27 KB   28 KB   32 KB   38 KB   42 KB
++                    //     ratio    0.944   0.965   1.035   1.096   1.312   (768 x 1500 x k; 1500 is A@V)
++                    //
++                    // Monotone, and the sign flips where the strips pass 7/8 of L1 -- the eighth is the
++                    // output rows and the stack the tile also keeps there. So that is the predicate.
++                    const bool spills = params->nth > 1 &&
++                                        (RM + RN) * k * (int64_t) sizeof(TA) > caches.l1d * 7 / 8;
++                    kc = spills ? (k / 2 + KN - 1) / KN * KN : 0;
++                }
+             }
+         }
+ #endif

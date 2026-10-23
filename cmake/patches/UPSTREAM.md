@@ -1852,6 +1852,143 @@ once per op. A channels-first output is written row by row across the column blo
 **Measured** (Pi Zero W, jfk, one run each): Citrinet-256-ls `Q8_0_PC` 10.6 -> 9.7 s, Moonshine tiny 27.6
 -> 26.9 s.
 
+## PR 41 — `cpu`: PR 27's K chunks between one chunk and two, when threads share the L2
+
+*(`cmake/patches/ggml-0045-tinyblas-f32-k-halves-on-a-shared-l2.patch`)*
+
+**Problem.** PR 27 chunks K only from two chunks up (K >= 1536 on a 32 KB L1). Below that every tile streams
+its two operand strips, (RM + RN) x K floats, whole. On one core that is the right call. On a Pi 4 (Cortex-A72,
+four cores, one 1 MB L2) it is not: whisper's encoder `A@V` (m = 64, n = K = 1500, 12 heads) scales only 2.0x
+from one thread to four, where its `QK^T` scales 3.4x. Its strips are 42 KB against a 32 KB L1, and four cores
+then queue on the shared L2.
+
+**Change.** aarch64, F32 x F32, KN dividing K, as PR 27. For `kc < K < 2 kc`, K is cut in two balanced halves
+when `nth > 1` AND the strips pass 7/8 of L1D. One thread, and any K whose strips fit, keep PR 27's schedule.
+**The result is bit-identical** (PR 27's carried accumulators). loom's `test_tinyblas_k_halves` holds 1, 2
+and 4 threads to the same bytes on both sides of every boundary.
+
+**Measured**, Pi 4, four threads, halves vs whole, per-round ratio over nine rounds, byte-identical outputs:
+768 x 1500 x K at K = 960 / 1024 / 1152 / 1344: 0.944 / 0.965 / 1.035 / 1.096, and `A@V` 1.312 (219.7 -> 167.6
+ms). The sign flips where the strips pass 7/8 of L1 (between K = 1024 and 1152 at the 4x3 tile), which is the
+predicate. Forcing two chunks at one thread costs 2% on `A@V`, so one thread is left alone. End to end:
+whisper-small 1.018x (7 paired launches, p10 1.004, p90 1.043); a VITS synthesis is unmoved (0.992, p10 0.979,
+p90 1.016).
+
+## PR 42 — `cpu`: a materialised transpose of 4-byte elements in 4x4 tiles
+
+*(`cmake/patches/ggml-0046-cpu-dup-transpose-x32-tiles.patch`)*
+
+**Problem.** `dup_bytes` copies a source that is strided along its first dimension one element at a time,
+with a runtime-sized `memcpy` per element and a fresh cache line per read. The common case is a transpose:
+the source runs contiguous along its second dimension. whisper's V^T (`[64, 12, 1500]` permuted to
+`[1500, 64, 12]`, twice per layer) ran at 0.42 GB/s on a Pi 4 at four threads, 0.35 at one.
+
+**Change.** When `type_size == 4`, `nb01 == 4`, `nb00 != 4` and dst is contiguous: 4x4 tiles transposed in
+registers (NEON `trn` on aarch64, after XNNPACK's x32-transposec 4x4 kernels, a plain 4x4 elsewhere), stored
+as 16-byte row segments, with the first dimension walked in blocks of 64 so the source lines stay in L1
+across a thread's rows. Threads split the second dimension, as before. Enabled on aarch64 and x86-64, the two ISAs measured.
+
+**Numerics.** A copy, and byte-identical (loom's `test_cont_transpose_x32`, ragged shapes, 1-4 threads).
+
+**Measured** (whisper's V^T, both arms in one process, per-round ratio): Pi 4 4.68x at four threads (21.9 ->
+4.68 ms), 3.48x at one; Ryzen 3 3250U 1.76x at two, 1.82x at one. A decoder-sized `[32, 12, 50]` is neutral on
+the A72 (0.97x) and 4.3x on x86. End to end, whisper-small F32 on the Pi 4: 1.021x (7 paired launches, p10
+1.004, p90 1.050).
+
+## PR 43 — `cpu`: an int8 `mul_mat` for AArch64 cores without DOTPROD, on Q8_0 weights with one scale per row
+
+*(`cmake/patches/ggml-0047-neon-int8-mul-mat.patch`)*
+
+**Problem.** tinyBLAS's Q8_0 GEMM is DOTPROD-only, so on a core without `sdot` (the Cortex-A72 of a Raspberry
+Pi 4, A53s, A57s) every Q8_0 `mul_mat` runs `ggml_vec_dot_q8_0_q8_0` one output row at a time, widening each
+32-element block's sum to float. whisper-small's encoder linears took as long at Q8_0 as at F32 on a Pi 4.
+XNNPACK's dynamic int8 GEMM runs 2.4-2.7x faster than that on the same core.
+
+**Change.** An extra buffer type, `CPU_NEON_I8`, registered on AArch64 when `ggml_cpu_has_dotprod()` is false
+(`GGML_CPU_NEON_I8=0` switches it off). It takes a 2-D Q8_0 weight whose blocks all share their row's scale,
+which is per-channel int8 written as ordinary Q8_0. At `set_tensor` it repacks the weight into 8-column panels
+in XNNPACK's `c2s4` layout. A row with mixed scales stays as given, and ggml's own path runs it. `mul_mat`
+quantizes each activation row per 32 k, symmetric (ggml's Q8_0 rule), into the work buffer. After the barrier,
+XNNPACK's `qd8-f32-qc8w-gemm 2x8c2s4__neon_mlal` inner loop (BSD-3, notice carried in the source) runs on 2-row
+x 8-column tiles. Each 32-k block's int32 sum is FMA-scaled into a float accumulator, and the weight's scale
+is applied at the end. A few rows are dealt panel by panel round robin across threads, so DRAM sees one stream.
+Many rows go in 160 KB blocks of panels, per thread, that stay in L2. `GET_ROWS` reads the packed panels too,
+so a tied embedding (the lookup and the output projection) needs no second, plain copy (Qwen3-0.6B: 165 MB).
+Weights reach the buffer only by placement, so nothing changes for a caller that does not place them.
+
+**Numerics.** Integer sums plus a fixed float order, held bit for bit to a scalar reference in loom's
+`test_mul_mat_neon_i8` (both schedules, 1/2/4 threads, odd shapes, the int16 bound, NaN rows). Against F32 it
+has the error of ggml's own Q8_0 path: whisper-small's encoder output 4.806e-2 against 4.814e-2. XNNPACK's own
+per-row asymmetric activations measured 9.8e-2 there, because whisper's outlier channels set the whole row's
+range. That is why the activations are quantized per 32 k: it costs 14% of the GEMM's speed. `GET_ROWS` is
+byte-identical to ggml's Q8_0 `GET_ROWS` (the same `q * d`).
+
+**Measured** on a Pi 4 at four threads, against ggml's Q8_0 path on the same weights. Whisper-small shapes,
+1500 rows: 2.41x (768 x 768), 2.44x (768 to 3072), 2.29x (3072 to 768), 59 GOP/s. One-row decoder steps:
+1.09-1.12x. End to end, 4 threads, `GGML_CPU_NEON_I8` off against on: whisper-small 1.547x (21.42 -> 13.85 s, 7
+paired launches, p10 1.538, p90 1.554, same transcript); Qwen3-0.6B 1.190x (24 tokens, 4.95 -> 4.16 s, same
+tokens); Moonshine tiny 1.191x (p10 1.185, p90 1.197; this path transcribed jfk exactly, ggml's Q8_0 path read
+"as" for "ask"); Citrinet-256 1.003x (its pointwise convolutions are not served here, only 0.4 MB of weights).
+
+## PR 44 — `cpu`: an outer-product F32 GEMM for AArch64 cores without DOTPROD, under an L2-blocked schedule
+
+*(`cmake/patches/ggml-0048-neon-f32-outer-product-gemm.patch`)*
+
+**Problem.** On a Cortex-A72 (Raspberry Pi 4) tinyBLAS's F32 GEMM runs whisper-small's encoder linears at
+~8.3 GFLOP/s on one core (58% of the FMA roofline) and 15.7-24.2 at four, where onnxruntime's MLAS reaches 30-35
+in the same model. XNNPACK's kernel for this core, `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm` (an outer
+product: no horizontal reduction, 12 loads per 32 FMAs), runs at 10.6 on one core. Its own operator walks 4
+activation rows against all of the weight, though, and at 2.4-9.4 MB of weight that re-reads DRAM for every 4
+rows: 7-10 GF at four threads.
+
+**Change.** In `sgemm.cpp`, for AArch64 when `ggml_cpu_has_dotprod()` is false (`GGML_CPU_NEON_F32_4X8=0` turns
+it off): the 4x8 tile in NEON intrinsics (GCC 14 compiles it to the asm kernel's instruction mix, 98-99% of its
+speed), under a schedule that packs one block of the weight, `nb x kc` with `nb x kc x 4 = L2 / 4` (256 x 256
+on a 1 MB L2), into 8-row k-major panels. The threads pack it together, a barrier follows, and then each walks
+its share of the activation rows against the whole block, 4 rows at a time. The sum is carried through C from
+one block of k to the next. There is no software prefetch: one `prfm` per step at XNNPACK's spacing covered half
+the lines and cost 20%, and two tied with none. It takes F32 x F32 graph `MUL_MAT` nodes with at least 128
+activation rows (`dst->op == GGML_OP_MUL_MAT`; ops.cpp's `ggml_call_mul_mat*` keeps its im2col patches in the
+work buffer the pack uses). `ggml_graph_plan` reserves the block for every F32 x F32 `MUL_MAT`.
+
+**Numerics.** Each output is one sequential fused sum over k: bit-exact to a scalar `fmaf` loop and the same at
+every thread count (loom's `test_mul_mat_neon_f32_4x8`: edge panels, blocks of rows and of k, ragged k and n, a
+strided weight, a batch through one work buffer, at 1/2/4 threads). It is not tinyBLAS's order: the error
+against a double product is ~2x tinyBLAS's (5.0e-7 vs 2.5e-7 relative at k = 768). The threshold does not
+depend on the thread count, so neither does which sum a product gets.
+
+**Measured** on a Pi 4 at four threads, against tinyBLAS, same process, distinct weights per node: whisper
+`qkv` 768 x 768 x 1500 1.32x (31.9 GF), `fc1` 1.31x (31.7), `fc2` 3072 x 768 x 1500 1.71x (27.0). Across 27
+shapes (whisper, VITS's convolution GEMMs, Moonshine, attention) it wins from 200 activation rows up
+(1.11-1.58x) and loses below 64. End to end (`GGML_CPU_NEON_F32_4X8` off/on, paired launches): whisper-small
+F32 **1.174x** (24.6 -> 20.9 s, same transcript), Moonshine tiny 1.057x, whisper-small Q8_0 1.082x (its attention
+products are F32 x F32). Citrinet, VITS (byte-identical audio)
+and Qwen3-0.6B are unmoved: their products are convolutions or under 128 rows.
+
+## PR 45 — `cpu`: the convolutions' im2col GEMMs on PR 44's outer-product path, with a block of their own
+
+*(`cmake/patches/ggml-0049-conv-f32-outer-product-gemm.patch`; depends on PR 44)*
+
+**Problem.** PR 44's path packs into `params->wdata`, so only graph `MUL_MAT` nodes may call it: the batched
+im2col in `ggml_compute_forward_conv_2d_impl` and the GEMM in `conv_transpose_1d` call mul_mat with their own
+data already in that buffer. Their GEMMs stayed on tinyBLAS.
+
+**Change.** In `ops.cpp`, on AArch64 with `GGML_USE_LLAMAFILE`: a convolution carves PR 44's block
+(`llamafile_sgemm_f32_wsize()` bytes) off the end of its work buffer before sizing its patches, and calls
+`llamafile_sgemm_f32_packed` with a copy of `params` whose `wdata`/`wsize` are that block. That happens at all
+three of `conv_2d_impl`'s GEMM calls (straight into dst, staged and deferred, through the permute) and at
+`conv_transpose_1d`'s, each keeping its tinyBLAS call as the fallback. `ggml_graph_plan` adds the block to
+`CONV_TRANSPOSE_1D`'s reservation; `CONV_2D`'s 16 MB already holds it. `GGML_CPU_NEON_F32_4X8_CONV=0` switches
+this off alone.
+
+**Numerics.** As PR 44's: one sequential fused sum per output, here in im2col order, bit-exact to a scalar `fmaf`
+loop and the same at every thread count (loom's `test_conv_neon_f32_4x8`).
+
+**Measured** on a Pi 4 at four threads, off/on, paired launches: VITS (piper) F32 **1.068x**, its Q8_0 1.054x
+(the kernels are dequantized to F32 first), Citrinet-256 1.062x / 1.060x, Moonshine tiny 1.034x, whisper-small
+1.000x. It does not touch the direct 1-D kernel (`ggml_conv_1d_direct_ok`, a loom patch), which keeps VITS's
+vocoder: through im2col and this GEMM those shapes were slower.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
