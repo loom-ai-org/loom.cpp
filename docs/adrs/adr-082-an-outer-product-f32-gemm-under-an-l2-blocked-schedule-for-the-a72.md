@@ -8,7 +8,7 @@ tags: [ggml, tinyblas, f32, gemm, aarch64, cortex-a72, pi-4, xnnpack, cache-bloc
 
 # ADR-082: An Outer-Product F32 GEMM Under an L2-Blocked Schedule, for the A72
 
-P4.38 in [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22).
+P4.38 in [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22).
 Built as `ggml-0048` (`cmake/patches/UPSTREAM.md` PR 44). Kernel reference: XNNPACK, as for P4.35-P4.37
 (user, 2026-10-22). Re-opens one line of
 [Retro-012](../retros/retro-012-optimizations-that-were-measured-out.md) (the outer-product tile, measured out
