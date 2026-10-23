@@ -342,8 +342,10 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   `ggml-0045`: K in two halves for `kc < k < 2 kc` when `nth > 1` and the tile's strips pass 7/8 of L1 (A@V 1.31x at
   four threads; whisper F32 1.018x end to end, VITS unmoved). `ggml-0046`: a 4-byte transpose in 4x4 tiles (V^T copy
   4.68x on the A72, 1.8x on x86; whisper F32 1.021x). Together on whisper `Q8_0_PC`: 1.044x. Bit-identical; tests
-  `test_tinyblas_k_halves`, `test_cont_transpose_x32` (sabotaged red). `ggml-0046` is enabled on aarch64 and x86-64 only,
-  the two ISAs measured; the Pi Zero (ARMv6) is next. Follow-up: a job owning all 64 `A@V` rows with narrow column blocks measured 1.08x more on
+  `test_tinyblas_k_halves`, `test_cont_transpose_x32` (sabotaged red). `ggml-0046` on ARMv6 too (2026-10-23, branch
+  `perf/p436-armv6-dup-transpose`): Pi Zero W, Moonshine tiny 1.084x F32 / 1.101x Q8_0_PC, byte-identical. Moonshine
+  re-materialises its cross-attention V^T at every decode step (156 copies a transcription, ~0.8 s left on the Zero);
+  whisper's cross-KV phase makes it once. Follow-up: a job owning all 64 `A@V` rows with narrow column blocks measured 1.08x more on
   the op. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
 * [ ] **P4.37: BUILT 2026-10-22, loom.cpp PR #90 (`perf/p437-a72-int8-gemm`, stacked on #89); open: merge, ADR-076's status.**
   `ggml-0047`: `CPU_NEON_I8`, an extra buffer type on AArch64 without DOTPROD, placed by default for `Q8_0_PC` weights as

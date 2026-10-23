@@ -1378,6 +1378,15 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   weights: a `Q8_0` weight cannot be `src1`. **End to end: whisper F32 1.021x** (7 paired launches, p10 1.004,
   p90 1.050). **Both patches together on whisper `Q8_0_PC`: 1.044x** (22.39 → 21.50 s, 5 paired launches, p10
   1.029, p90 1.046), which moves the README's 0.64x cell to about 0.67x. The rest of that gap is P4.37.
+  **ARMv6 (2026-10-23).** On the Pi Zero W the same plain 4x4 (no vector registers; gcc stages the tile through
+  the stack) still wins, because the path it replaces is a libc `memcpy` call per element: **2.57-5.28x** over
+  the shapes the Zero's own models materialise (bench64, one thread, nine rounds). Moonshine tiny is the model
+  that has them: 156 copies of its cross-attention V^T (`[36, 8, 457]`, 19.05 → 5.01 ms) per transcription,
+  one per layer per decode step, because its cached cross-KV is stored untransposed (whisper's cross-KV phase
+  makes V^T once). **End to end on the board** (rc18 engine, `GGML_DUP_PROBE` off/on, 5 paired rounds, output
+  hashes equal to rc18's): **Moonshine tiny 1.084x F32** (30.32 → 28.00 s), **1.101x Q8_0_PC** (24.29 → 22.07 s);
+  VITS 1.011x (128 small copies), conformer-ctc 1.012x (53, inside its noise). Citrinet, Silero and WakeHuBERT
+  make one or two each, sanoTTS 2-13 small ones (counted on x86 with a log line on the path).
 * **P4.37, an int8 GEMM for the A72 — BUILT 2026-10-22 (`ggml-0047`).** The A72 has no `sdot` instruction, so
   tinyBLAS's Q8_0 kernel (DOTPROD-only) never runs there, and a `Q8_0_PC` weight went through ggml's row-at-a-time
   `vec_dot_q8_0_q8_0`. `CPU_NEON_I8` is the NEON sibling of P4.33's `CPU_ARMV6_I8`: an extra buffer type registered
