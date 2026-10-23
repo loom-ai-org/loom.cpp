@@ -132,5 +132,5 @@ a reason that was measured or that this ADR did not foresee:
 
 Gates (1) and (2) on the Pi 4: whisper-small's encoder GEMMs 2.29-2.44x over ggml's Q8_0 path at four threads;
 end to end, whisper-small Q8_0_PC 1.547x, Qwen3-0.6B 1.190x, Moonshine tiny 1.191x, Citrinet unmoved
-([Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)).
+([Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)).
 x86 and dotprod Arm, the table's other rows, are not built, so the ADR stays proposed for them.
