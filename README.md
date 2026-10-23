@@ -344,11 +344,12 @@ numbers.
 [ADR-076](docs/adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)). On the Pi 4's
 Cortex-A72 (an aarch64 core without DOTPROD) and on ARMv6 it takes loom's integer GEMM paths; elsewhere it runs ggml's
 Q8_0 kernels. Against it the Pi 4 runs onnxruntime's int8 models, the ones an onnxruntime user would pick. **Both halves of
-the Pi 4 row were re-measured on engine builds not yet released: the Q8_0_PC half on 2026-10-22 with the A72 int8 GEMM
-(loom.cpp #90), the F32 half on 2026-10-23 with the A72 F32 GEMM (P4.38, `ggml-0048`, on top of #90).** Same protocol as the table above: 4 threads (the board's default), each engine launched once per arm,
-5 paired rounds in ABBA order, cooled to 60 C before every arm, median per engine; onnxruntime is the 1.28.0 PyPI wheel. The
-ratio is onnx/loom, so **`>1.00x` means loom is faster**, and **all twelve cells resolve**: each one's paired p10 and p90
-sit on the same side of 1.00x.
+the Pi 4 row were re-measured on 2026-10-23 on one engine build not yet released**, which carries the A72 int8 GEMM
+(loom.cpp #90), the A72 F32 GEMM (#91) and that GEMM for the convolutions too (P4.39, `ggml-0049`). Same protocol as the
+table above: 4 threads (the board's default), each engine launched once per arm, 5 paired rounds in ABBA order, cooled to
+60 C before every arm, median per engine; onnxruntime is the 1.28.0 PyPI wheel. The ratio is onnx/loom, so **`>1.00x`
+means loom is faster**, and **eleven of the twelve cells resolve**: each one's paired p10 and p90 sit on the same side
+of 1.00x. whisper-small's F32 cell does not (p10 0.96, p90 1.00), so read it as parity.
 
 **Each time is followed by its real-time factor (RTF) in brackets:** the time divided by the length of the audio, which
 for ASR, VAD and wake word is the input clip and for TTS is the audio the model produced. Below 1.00 is faster than real
@@ -356,12 +357,12 @@ time. The LM row has no audio, so its time stands alone.
 
 | Raspberry Pi 4B, 4 threads | loom F32 | onnxruntime FP32 | ratio | loom Q8_0_PC | onnxruntime int8 | ratio |
 |---|---|---|---|---|---|---|
-| VITS piper en-GB miro (TTS, 3.32 s of audio) | 1.104 s (0.33) | 1.083 s (0.33) | 0.98x | 1.119 s (0.34) | 4.126 s (1.24) | **3.69x** |
-| Citrinet-256-ls (ASR, jfk 11.0 s) | 0.515 s (0.05) | 0.296 s (0.03)¹ | 0.57x | 0.527 s (0.05) | 4.239 s (0.39)¹ | **8.03x** |
-| Moonshine tiny (ASR, jfk 11.0 s) | 1.380 s (0.13) | 1.519 s (0.14) | **1.10x** | 0.932 s (0.08) | 1.479 s (0.13) | **1.59x** |
-| whisper-small (ASR, jfk 11.0 s) | 21.23 s (1.93) | 20.89 s (1.90) | 0.98x | 14.08 s (1.28) | 14.70 s (1.34) | **1.04x** |
-| Qwen3-0.6B-Base (LM, 24 tokens) | 16.96 s | 17.86 s | **1.05x** | 4.15 s | 14.26 s | **3.44x** |
-| Pocket TTS (TTS, 4.80 s of audio)² | 9.741 s (2.03) | 19.46 s (4.05) | **2.00x** | 4.463 s (0.93) | 14.04 s (2.93) | **3.12x** |
+| VITS piper en-GB miro (TTS, 3.32 s of audio) | 1.037 s (0.31) | 1.066 s (0.32) | **1.03x** | 1.055 s (0.32) | 4.109 s (1.24) | **3.90x** |
+| Citrinet-256-ls (ASR, jfk 11.0 s) | 0.485 s (0.04) | 0.295 s (0.03)¹ | 0.61x | 0.493 s (0.04) | 4.222 s (0.38)¹ | **8.62x** |
+| Moonshine tiny (ASR, jfk 11.0 s) | 1.333 s (0.12) | 1.509 s (0.14) | **1.13x** | 0.854 s (0.08) | 1.486 s (0.14) | **1.73x** |
+| whisper-small (ASR, jfk 11.0 s) | 20.96 s (1.91) | 20.68 s (1.88) | 0.99x | 12.79 s (1.16) | 14.73 s (1.34) | **1.15x** |
+| Qwen3-0.6B-Base (LM, 24 tokens) | 16.59 s | 17.57 s | **1.06x** | 4.16 s | 14.29 s | **3.43x** |
+| Pocket TTS (TTS, 4.80 s of audio)² | 9.233 s (1.92) | 19.02 s (3.96) | **2.06x** | 4.432 s (0.92) | 13.97 s (2.91) | **3.14x** |
 
 ¹ onnxruntime is timed from NeMo's mel features, computed outside the timer; loom's time includes its front end.
 ² Measured with the rest of each half, and each launch is the mean of 3
@@ -377,11 +378,10 @@ the same 28 text ids and a 126-row `alba` voice.
   hears "asks", onnxruntime int8 "askd ... ask") and of Moonshine at Q8_0_PC (loom transcribes jfk exactly, onnxruntime
   int8 hears "as" for "ask", as loom's own Q8_0_PC did before the A72 int8 GEMM). **loom's Q8_0_PC Qwen3 decodes the
   same tokens as its F32**, where onnxruntime's int8 model decodes different ones from its own FP32 (`220, 16, 15, ...` against `12095, 13, 576, ...`).
-* **onnxruntime's int8 is slower than its FP32 on both convolutional models** — 3.9x on VITS, 14.5x on Citrinet —
-  which is what makes those two Q8_0_PC cells large. loom's Q8_0_PC is within 3% of its own F32 there, and is a win
-  by itself on the transformer models: 1.48x on Moonshine, 1.51x on whisper and 4.09x on Qwen3 (against the F32
-  half; the two halves are different builds, #90 and #90 plus `ggml-0048`). Before the A72 int8 GEMM, whisper's was 1.13x and the cell read 0.64x:
-  ggml's Q8_0 kernel needs DOTPROD, which the A72 lacks.
+* **onnxruntime's int8 is slower than its FP32 on both convolutional models** — 3.9x on VITS, 14.3x on Citrinet —
+  which is what makes those two Q8_0_PC cells large. loom's Q8_0_PC is within 2% of its own F32 there, and is a win
+  by itself on the transformer models: 1.56x on Moonshine, 1.64x on whisper and 3.99x on Qwen3. Before the A72 int8
+  GEMM, whisper's was 1.13x and the cell read 0.64x: ggml's Q8_0 kernel needs DOTPROD, which the A72 lacks.
 * **Where the int8 models come from:** Qwen3, whisper and the Moonshine decoder are onnx-community's published int8
   files (`model_int8`, `encoder_model_int8` + `decoder_model_merged_int8`); VITS and Citrinet are `quantize_dynamic`
   (QInt8) of the same FP32 models the left half runs. Moonshine's encoder is `quantize_dynamic` with MatMul only,
@@ -390,21 +390,21 @@ the same 28 text ids and a 126-row `alba` voice.
   find the ggml patches, which a CPU build does not reach. The GGUFs are md5 `3f25d02d`/`6e095a95` (VITS), `0711bf17`/`37a8d3b6`
   (Citrinet), `4831ba56`/`9284eaa8` (Moonshine), `7b6af094`/`39077edf` (whisper) and `4882ce99`/`b93d7779` (Qwen3),
   F32/Q8_0_PC. Both sides run from `scripts/bench_{vits,asr,lm}_loom.cpp` and `scripts/bench_onnx_tasks.py`, whose
-  `ctc` and `moonshine` tasks are new with this table. **The Q8_0_PC half** ran the same harness, binaries and GGUFs
-  with only the engine libraries swapped for loom.cpp #90 at `5fdb5cb` (on top of #89: `ggml-0045`-`0047`); every
-  loom arm placed its per-channel weights in the A72's `CPU_NEON_I8` buffer. **The F32 half** swapped them for
-  `perf/p438-a72-f32-tile` (#90 plus `ggml-0048`). whisper's and Moonshine's linears take its outer-product GEMM, and
-  VITS's and Citrinet's convolutions do not (VITS's audio is byte-identical either way). It also takes whisper
-  Q8_0_PC's attention products, which are F32: 1.082x on that card against #90 alone, which the Q8_0_PC half above
-  does not include. Against the rc18 F32 half that
-  moves whisper 0.80x → 0.98x and Moonshine 1.03x → 1.10x; the other four cells moved by 1.2% or less.
+  `ctc` and `moonshine` tasks are new with this table. **Both halves** ran the same harness, binaries and GGUFs with
+  only the engine libraries swapped for `perf/p439-conv-f32-tile`: loom.cpp #89, #90 and #91 (`ggml-0045`-`0048`)
+  plus `ggml-0049`. Every Q8_0_PC arm placed its per-channel weights in the A72's `CPU_NEON_I8` buffer.
+  whisper's and Moonshine's F32 linears and whisper Q8_0_PC's attention products (which are F32) take the
+  outer-product F32 GEMM. Since `ggml-0049` so do the im2col convolutions: VITS's text encoder and flow (not its
+  vocoder, which keeps its direct kernel) and Citrinet's. Against rc18's F32 half that moves whisper 0.80x → 0.99x,
+  Moonshine 1.03x → 1.13x, VITS 0.98x → 1.03x and Citrinet 0.57x → 0.61x; whisper Q8_0_PC goes 0.64x → 1.15x.
 * **Pocket TTS did the same work too:** 115 200 samples on every arm. The onnxruntime outputs at both precisions, and
   the Pi Zero's Q8_0_PC output below, transcribe under whisper-small as the sentence spoken, word for word (it spells
   "grey" as "gray"). Its GGUFs are
   md5 `26aa0137`/`6e71ec37`, F32/Q8_0_PC, the files `loom-ai-org/pocket-tts-loom` publishes. The 1.0.0-rc18 release
   has the same engine code (see the bullet above).
 
-The Pi Zero W has no onnxruntime build, since onnxruntime ships no ARMv6 wheel. So its table weighs loom's two precisions
+The Pi Zero W has no onnxruntime build, since onnxruntime ships no ARMv6 wheel. Nothing in the Pi 4's re-measurement
+reaches it: those GEMMs are AArch64-only, so this table was not re-run. It weighs loom's two precisions
 against each other on the 1.0.0-rc18 ARMv6 wheel, with RTFs as above: its one core, each model launched once per arm through
 `loom-py`, 3 rounds with the arms' order flipped every round and a 3 s settle between launches, median per arm, nothing
 polling the board while it runs. The ratio is F32/Q8_0_PC, so **`>1.00x` means Q8_0_PC is faster**; a ratio in bold
