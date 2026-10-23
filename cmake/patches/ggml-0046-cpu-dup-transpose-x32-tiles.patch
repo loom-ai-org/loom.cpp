@@ -1,6 +1,6 @@
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -339,6 +339,79 @@
+@@ -339,6 +339,85 @@
  }
  
  // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.
@@ -22,9 +22,15 @@
 +// A decoder-sized one ([32, 12, 50]) is neutral on the A72 (0.97x, inside its noise) and 4.3x on x86.
 +// End to end, whisper-small F32 on the Pi 4: 1.021x (7 paired launches, p10 1.004, p90 1.050).
 +//
-+// Enabled only on the two ISAs it was measured on (Retro-019). ARMv6 is the next to measure: its VFP has
-+// no vector registers and its L1 is 16 KB, so the scalar 4x4 there is a different bet.
-+#if defined(__aarch64__) || defined(__x86_64__)
++// ARMv6 takes the plain 4x4 (no vector registers; gcc stages the tile through the stack), and it still wins,
++// because the path it replaces is a libc `memcpy` call per element. Pi Zero W (ARM1176), one thread, over the
++// shapes the Zero's own models materialise: 2.57-5.28x, Moonshine tiny's cross-attention V^T ([36, 8, 457],
++// 156 calls a transcription) 19.05 -> 5.01 ms. End to end on the board (5 paired rounds, byte-identical):
++// Moonshine tiny 1.084x F32 (30.32 -> 28.00 s) and 1.101x Q8_0_PC (24.29 -> 22.07 s), VITS 1.011x,
++// conformer-ctc 1.012x.
++//
++// Enabled only on the three ISAs it was measured on (Retro-019).
++#if defined(__aarch64__) || defined(__x86_64__) || (defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON))
 +#define GGML_DUP_TRANSPOSE_X32 1
 +
 +static inline void dup_x32_tile4(const char * s, size_t sstride, uint32_t * d, size_t dstride) {
@@ -80,7 +86,7 @@
  static void ggml_compute_forward_dup_bytes(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
-@@ -386,6 +459,13 @@
+@@ -386,6 +465,13 @@
      }
  
      if (ggml_is_contiguous(dst)) {
