@@ -948,6 +948,13 @@ add_test(
 )
 set_tests_properties(gen_pocket_tts_vocab_gguf_fixture PROPERTIES LABELS ci)
 set_tests_properties(gen_pocket_tts_vocab_gguf_fixture PROPERTIES FIXTURES_SETUP pocket_tts_vocab_gguf_fixture)
+add_test(
+    NAME gen_pocket_tts_vocab_v4_gguf_fixture
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/make_pocket_tts_vocab_gguf.py
+            ${LOOM_FIXTURE_DIR}/pocket_tts_vocab_v4_test.gguf --v4
+)
+set_tests_properties(gen_pocket_tts_vocab_v4_gguf_fixture PROPERTIES LABELS ci)
+set_tests_properties(gen_pocket_tts_vocab_v4_gguf_fixture PROPERTIES FIXTURES_SETUP pocket_tts_vocab_gguf_fixture)
 
 add_test(
     NAME gen_number_speller_gguf_fixture

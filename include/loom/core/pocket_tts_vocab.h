@@ -19,7 +19,10 @@ class GgufModel;
 // What makes this its own tag (ADR-033: a tag answers "which scheme") is the reference's text path
 // around it, which `TTSModel.generate_audio_stream` runs before any id reaches the model:
 //
-//   1. `prepare_text_prompt` on the whole text: strip, a replacement table applied pair by pair
+//   1. `prepare_text_prompt` on the whole text: strip; the config's `replace_characters` (v4 of the
+//      reference, when the config has any: each listed character rewritten at once, `str.translate`,
+//      then whitespace runs collapsed to one space and a clause mark that directly follows a sentence
+//      mark dropped -- "Hi?, she said" -> "Hi? she said"); a replacement table applied pair by pair
 //      (newlines to spaces, one pass of "  " -> " "), the first character upper-cased unless it
 //      already is (`str.upper()`, from the file's table), and terminal punctuation ensured -- a text
 //      ending in a weak mark (",", ":", a dash...) has it replaced by a full stop, closing quotes and
@@ -41,6 +44,12 @@ class GgufModel;
 // reference's own module and config -- ADR-041's rule: the shape is code, the rules are data. That
 // includes the case table (Python's `c.upper()` for every codepoint whose `c.isupper()` is false and
 // whose upper case differs) and Python's `str.isdigit()` set for the decimal rule.
+//
+// **The decimal-period rule has two versions**, chosen by `decimal_period_rule` (absent = 1, so every
+// file written before v4 keeps its behaviour). 1: the WHOLE prefix decoded ends in digit + "." and the
+// WHOLE suffix decoded opens with a digit. 2 (v4): the two ids before the cut decode to digit + ".", and
+// the period decoded TOGETHER with the next id has a digit right after it -- so "I counted to 3. 14
+// people" is now a sentence end (the space survives that decode), where rule 1 read it as 3.14.
 class PocketTtsVocab {
 public:
     // Returns nullptr if `model` has no "tokenizer.ggml.model" KV, or it is present but not
@@ -81,9 +90,14 @@ private:
     std::vector<size_t> boundaries(const std::vector<int32_t>& ids, const std::unordered_set<int32_t>& marks,
                                    bool skip_decimal_periods) const;
     bool decimal_period_at(const std::vector<int32_t>& ids, size_t start) const;
+    std::string replace_characters(const std::string& text) const;
     std::string terminate(const std::string& text) const;
 
     std::unique_ptr<Vocab> vocab_;
+    std::unordered_map<char32_t, std::string> char_replacements_;
+    std::unordered_set<char32_t> sentence_marks_;
+    std::unordered_set<char32_t> stray_clause_marks_;
+    int32_t decimal_period_rule_ = 1;
     std::vector<std::string> replace_from_;
     std::vector<std::string> replace_to_;
     std::unordered_map<char32_t, std::string> upper_;

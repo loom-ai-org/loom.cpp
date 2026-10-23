@@ -4,6 +4,8 @@
 #include "loom/core/unicode.h"
 #include "loom/loom_errors.h"
 
+#include <algorithm>
+
 namespace loom {
 namespace {
 
@@ -72,6 +74,32 @@ std::unique_ptr<PocketTtsVocab> PocketTtsVocab::load(const GgufModel& model) {
         throw LoadError("PocketTtsVocab::load: replace_from and replace_to differ in length -- they are one "
                          "table of pairs");
     }
+    // v4's `replace_characters`, optional: a file without it (every one written before v4, and any
+    // config that lists none) skips the whole step, as the reference's `if replace_characters:` does.
+    if (model.has_kv(kPrefix + "char_replace_from")) {
+        const auto from = required_strings(model, kPrefix + "char_replace_from");
+        const auto to = required_strings(model, kPrefix + "char_replace_to");
+        if (from.size() != to.size()) {
+            throw LoadError("PocketTtsVocab::load: char_replace_from and char_replace_to differ in length");
+        }
+        for (size_t i = 0; i < from.size(); ++i) {
+            const std::vector<char32_t> cps = utf8_decode(from[i]);
+            if (cps.size() != 1) {
+                throw LoadError("PocketTtsVocab::load: char_replace_from entry '" + from[i] +
+                                "' is not one character (`str.maketrans` keys are)");
+            }
+            v->char_replacements_[cps[0]] = to[i];
+        }
+        if (!v->char_replacements_.empty()) {
+            v->sentence_marks_ = required_chars(model, kPrefix + "sentence_marks");
+            v->stray_clause_marks_ = required_chars(model, kPrefix + "stray_clause_marks");
+        }
+    }
+    v->decimal_period_rule_ = model.kv_i32(kPrefix + "decimal_period_rule", 1);
+    if (v->decimal_period_rule_ != 1 && v->decimal_period_rule_ != 2) {
+        throw LoadError("PocketTtsVocab::load: decimal_period_rule " + std::to_string(v->decimal_period_rule_) +
+                        " is neither 1 nor 2");
+    }
     v->terminal_ = required_chars(model, kPrefix + "terminal");
     v->weak_ = required_chars(model, kPrefix + "weak");
     v->closers_ = required_chars(model, kPrefix + "closers");
@@ -139,8 +167,43 @@ std::string PocketTtsVocab::terminate(const std::string& text) const {
     return text + full_stop_;
 }
 
+std::string PocketTtsVocab::replace_characters(const std::string& text) const {
+    // `" ".join(text.translate(str.maketrans(table)).split())`: every listed character rewritten at
+    // once (a replacement is never itself rewritten), then Python-whitespace runs collapsed to one space
+    // and the ends stripped.
+    std::vector<char32_t> words;
+    bool pending_space = false;
+    for (char32_t cp : utf8_decode(text)) {
+        const auto hit = char_replacements_.find(cp);
+        const std::vector<char32_t> piece =
+            hit == char_replacements_.end() ? std::vector<char32_t>{cp} : utf8_decode(hit->second);
+        for (char32_t c : piece) {
+            if (is_python_space(c)) {
+                pending_space = !words.empty();
+                continue;
+            }
+            if (pending_space) words.push_back(U' ');
+            pending_space = false;
+            words.push_back(c);
+        }
+    }
+    // `re.sub(r"([.!?\u2026])\s*[,;:]", r"\1", text)`, left to right without overlap: a sentence mark,
+    // any whitespace, then a clause mark -> the sentence mark alone, the scan resuming after the clause
+    // mark. Where no clause mark follows, the mark and the whitespace are kept as they are.
+    std::vector<char32_t> out;
+    for (size_t i = 0; i < words.size(); ++i) {
+        out.push_back(words[i]);
+        if (sentence_marks_.count(words[i]) == 0) continue;
+        size_t j = i + 1;
+        while (j < words.size() && is_python_space(words[j])) ++j;
+        if (j < words.size() && stray_clause_marks_.count(words[j]) != 0) i = j;
+    }
+    return utf8_encode(out);
+}
+
 std::string PocketTtsVocab::prepare(const std::string& text, size_t* n_words) const {
     std::string out = python_strip(text);
+    if (!char_replacements_.empty()) out = replace_characters(out);
     if (out.empty()) {
         throw Error("PocketTtsVocab: the text is empty (the reference raises 'Text prompt cannot be empty')");
     }
@@ -169,6 +232,18 @@ std::string PocketTtsVocab::prepare(const std::string& text, size_t* n_words) co
 }
 
 bool PocketTtsVocab::decimal_period_at(const std::vector<int32_t>& ids, size_t start) const {
+    if (decimal_period_rule_ == 2) {
+        // v4's `_is_decimal_period_boundary`: only the ids next to the cut are decoded. `start` is never
+        // 0 (a cut follows a sentence mark), so the period is ids[start - 1].
+        const auto window = [&](size_t a, size_t b) {
+            return utf8_decode(vocab_->decode(std::vector<int32_t>(ids.begin() + static_cast<std::ptrdiff_t>(a),
+                                                                   ids.begin() + static_cast<std::ptrdiff_t>(b))));
+        };
+        const std::vector<char32_t> before = window(start >= 2 ? start - 2 : 0, start);
+        const std::vector<char32_t> after = window(start - 1, std::min(start + 1, ids.size()));
+        return before.size() >= 2 && before.back() == U'.' && digits_.count(before[before.size() - 2]) != 0 &&
+               after.size() >= 2 && digits_.count(after[1]) != 0;
+    }
     // `_is_decimal_period_boundary`: judged on DECODED text, `prefix[-2:] == digit + "."` and the
     // suffix opening with a digit -- which is why the chunking cannot live in the driver.
     const std::vector<char32_t> prefix =
