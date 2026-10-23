@@ -8,7 +8,7 @@ tags: [ggml, convolution, im2col, f32, gemm, aarch64, cortex-a72, pi-4, vits, ci
 
 # ADR-083: The Convolutions' GEMMs Take the Outer-Product Path, With a Block Carved Off Their Buffer
 
-P4.39 in [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22).
+P4.39 in [Epic-05](../epics/epic-05-edge-performance.md#p435-p439-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22).
 Built as `ggml-0049` (`cmake/patches/UPSTREAM.md` PR 45), on top of
 [ADR-082](adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)'s `ggml-0048`.
 
