@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-22
+last_updated: 2026-10-23
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -338,24 +338,49 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
 
 ## Engine — performance
 
-* [ ] **P4.35 + P4.36: BUILT 2026-10-22, uncommitted on `perf/p435-whisper-attention-pi4`; open: commit, PR, the Pi Zero.**
+* [ ] **P4.35 + P4.36: BUILT 2026-10-22, loom.cpp PR #89 (`perf/p435-whisper-attention-pi4`); open: merge, the Pi Zero.**
   `ggml-0045`: K in two halves for `kc < k < 2 kc` when `nth > 1` and the tile's strips pass 7/8 of L1 (A@V 1.31x at
   four threads; whisper F32 1.018x end to end, VITS unmoved). `ggml-0046`: a 4-byte transpose in 4x4 tiles (V^T copy
   4.68x on the A72, 1.8x on x86; whisper F32 1.021x). Together on whisper `Q8_0_PC`: 1.044x. Bit-identical; tests
   `test_tinyblas_k_halves`, `test_cont_transpose_x32` (sabotaged red). `ggml-0046` is enabled on aarch64 and x86-64 only,
   the two ISAs measured; the Pi Zero (ARMv6) is next. Follow-up: a job owning all 64 `A@V` rows with narrow column blocks measured 1.08x more on
   the op. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
-* [ ] **P4.37: an int8 GEMM for the Cortex-A72 ([ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md)'s main case).**
-  The A72 has no `sdot`, tinyBLAS's Q8_0 kernel is DOTPROD-only, so a `Q8_0_PC` weight runs ggml's one-row
-  `vec_dot_q8_0_q8_0`: whisper's encoder linears take the same time at Q8_0_PC as at F32 (fc1 3435 vs 3302 ms) while
-  onnxruntime's int8 runs 2.3x its own FP32. ~6.5 s of the 8.1 s int8 gap, plus ~1 s of cross-KV. P4.33 built the
-  per-channel format, the buffer-type pattern and the engine placement for ARMv6; this needs a NEON sibling of
-  `CPU_ARMV6_I8` with XNNPACK's `qd8-f32-qc8w` NEON (`mlal`) kernels. Lifts every `Q8_0_PC` card on the Pi 4. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
-* [ ] **P4.38: tinyBLAS's F32 tile on the A72.** The dense encoder GEMMs are 1.20-1.46x behind MLAS at four threads
-  (~2.7 s of the F32 gap); Retro-012 has tinyBLAS at 52% of the A72's FMA roofline. XNNPACK's A72 choice is the
-  outer-product `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm` (A as q-vectors of 4 k, B packed K-major in 8-column
-  panels, `fmla` by lane, `prfm` both): 12 loads per 32 FMAs against tinyBLAS's 7 per 12. Retro-012's outer-product tile
-  bought 1.23x at `k = 64` on this core; measure at whisper's K = 768/3072 before scoping a patch. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
+* [ ] **P4.37: BUILT 2026-10-22, loom.cpp PR #90 (`perf/p437-a72-int8-gemm`, stacked on #89); open: merge, ADR-076's status.**
+  `ggml-0047`: `CPU_NEON_I8`, an extra buffer type on AArch64 without DOTPROD, placed by default for `Q8_0_PC` weights as
+  ARMv6's is. XNNPACK's `qd8-f32-qc8w 2x8c2s4__neon_mlal` inner loop, with activations quantized per 32 k (ggml's
+  numerics: whisper's encoder 4.81e-2 from F32 against XNNPACK's per-row 9.8e-2), and `GET_ROWS` from the packed panels.
+  Pi 4, 4 threads, end to end: **whisper-small Q8_0_PC 1.547x** (21.42 → 13.85 s, same transcript), Qwen3-0.6B 1.190x
+  (same tokens), Moonshine tiny 1.191x, Citrinet 1.003x, VITS untouched. Test `test_mul_mat_neon_i8` (bit-exact).
+  The README's Pi 4 Q8_0_PC half is re-measured on it (2026-10-22): whisper-small against onnxruntime int8 0.64x →
+  **1.04x**, Moonshine 1.59x, Qwen3 3.44x, Pocket TTS 3.12x. Still open: the decoder's one-row steps (1.09-1.12x,
+  DRAM-bound); an A53/A55 board (a Pi 3 or Zero 2 W): the type is enabled there too, since the guard is the ISA feature, but it is
+  unmeasured, and XNNPACK picks a different kernel for those cores (`4x16 mlal_lane`). No such board yet (user,
+  2026-10-22).
+  *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22),
+  [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437)*
+* [ ] **P4.38: BUILT 2026-10-23, PR #91 (stacked on #90); open: merge.**
+  `ggml-0048`: XNNPACK's A72 kernel (`f32-gemm 4x8`, an outer product) in NEON intrinsics, under a schedule that shares
+  one packed block of weight (`L2 / 4`, 256 x 256 on the A72) between the threads. Graph F32 `MUL_MAT` nodes with
+  >= 128 activation rows, AArch64 without DOTPROD (`GGML_CPU_NEON_F32_4X8=0` off). GEMM, Pi 4, 4 threads: whisper
+  `qkv` 1.32x, `fc1` 1.31x, `fc2` 1.71x (27-32 GF, MLAS's in-model rate). End to end: **whisper-small F32 1.174x**
+  (24.6 → 20.9 s, same transcript), Moonshine tiny 1.057x, whisper Q8_0_PC 1.082x (its attention); Citrinet, VITS
+  (byte-identical audio) and Qwen3 untouched. README Pi 4 F32 half re-run on it: whisper vs onnxruntime FP32 0.80x → 0.98x.
+  Sequential-sum numerics, bit-exact to an `fmaf` loop (`test_mul_mat_neon_f32_4x8`). Unmeasured on A53/A57/A73.
+  *Context: [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md),
+  [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
+* [ ] **P4.39: BUILT 2026-10-23, PR #92 (stacked on #91); open: merge.**
+  `ggml-0049`: the convolutions' im2col GEMMs (all three `conv_2d_impl` call sites, and `conv_transpose_1d`) take
+  P4.38's path, with its block carved off the end of their own work buffer (`GGML_CPU_NEON_F32_4X8_CONV=0` off).
+  Pi 4, 4 threads, off/on: **VITS F32 1.068x**, Q8_0_PC 1.054x; **Citrinet 1.062x** / 1.060x; Moonshine 1.034x;
+  whisper 1.000x. VITS's vocoder resblocks keep ggml's direct kernel: P4.38's sweep had raced them against
+  tinyBLAS, which they never reach, and through this GEMM they lost (1.178 vs 1.022 s). Bit-exact to an `fmaf`
+  loop (`test_conv_neon_f32_4x8`). README Pi 4 table, both halves re-run on it against onnxruntime: VITS F32 0.98x → 1.03x, Citrinet 0.57x → 0.61x,
+  whisper Q8_0_PC 1.04x → 1.15x (P4.38's attention), 11 of 12 cells resolve (whisper F32 0.99x does not).
+  *Context: [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md)*
+* [ ] **P4.40: VITS's vocoder on the Pi 4 is ggml's direct 1-D kernel**, at ~20-23 GF/s against the 27-32 the
+  outer-product tile reaches on GEMMs. It is the largest share of a synthesis left (~37% profiled). The im2col
+  route was measured out in P4.39, so this would be a better direct kernel, e.g. an outer product over
+  (output channel x position). *Context: [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md#alternatives-considered)*
 * [ ] **`SOFT_MAX`: PORTED 2026-10-13 as `ggml-0029`, measured on all four machines, CosyVoice3 gate re-bounded; open: commit + upstream.** (UPSTREAM.md PR 26.)
   XNNPACK's exponential kernels, a four-accumulator vector max, the copy/scale/mask fused into one pass
   (no pass at all for a plain softmax), and a sum that is NOT XNNPACK's. Its f32 accumulators raised

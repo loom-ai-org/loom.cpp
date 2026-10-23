@@ -108,3 +108,29 @@ extra buffer type (`CPU_ARMV6_I8`, [ADR-079 P4.33](adr-079-armv6-f32-kernels-on-
 The engine places a listed weight there only if the buffer type serves every convolution that reads it,
 because a kernel in a non-host buffer loses the direct conv path. Any bridge built under this ADR will need
 the same rule. The XNNPACK bridge itself is not built, so this ADR stays proposed.
+
+## The A72 kernel, built 2026-10-22 (P4.37)
+
+The table's main case is built, as `ggml-0047`, and it departs from the decision above in four places, each for
+a reason that was measured or that this ADR did not foresee:
+
+* **One kernel, re-templated, not a vendored set.** Only one ISA was targeted, and XNNPACK's config picks one
+  kernel for it (`qd8-f32-qc8w-gemm 2x8c2s4__neon_mlal`, plus its 1-row form). Its inner loop and `c2s4` weight
+  layout are carried as intrinsics in `ggml-cpu/neon-i8.cpp`, with the BSD-3 notice. No `ggml-cpu/xnnpack/`
+  tree, no pinned commit to re-select.
+* **`CPU_NEON_I8`, not `CPU_XNNPACK`, and placed like P4.33's type.** It is registered on AArch64 only when the
+  core has no DOTPROD, and the engine places `Q8_0_PC` weights there by default, exactly as `CPU_ARMV6_I8` on
+  ARMv6. The dispatch table keyed on (op, dtype, CPU features) is not built: per core there is still one
+  candidate. `GGML_CPU_NEON_I8=0` is the A/B switch.
+* **Activations quantized per 32 k, not per row.** XNNPACK's `qd8` is per row and asymmetric. On whisper-small's
+  encoder output that doubled the error against F32 (9.8e-2 against ggml's Q8_0 path at 4.8e-2), and a (1 + 1e-7)
+  input scaling moved it only 3.4e-2, so the error is real. Per 32 k, symmetric, with a float FMA per block, it is
+  4.806e-2, at 86% of the per-row GEMM speed. Gate (3) above is met by keeping the numerics the card was
+  gated with, not by re-gating looser ones.
+* **`GET_ROWS` is served** from the packed panels (byte-identical to ggml's), so a tied embedding needs no plain
+  copy.
+
+Gates (1) and (2) on the Pi 4: whisper-small's encoder GEMMs 2.29-2.44x over ggml's Q8_0 path at four threads;
+end to end, whisper-small Q8_0_PC 1.547x, Qwen3-0.6B 1.190x, Moonshine tiny 1.191x, Citrinet unmoved
+([Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)).
+x86 and dotprod Arm, the table's other rows, are not built, so the ADR stays proposed for them.

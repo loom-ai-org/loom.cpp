@@ -1,0 +1,354 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index f352b2f3..c33ed7d2 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1389,9 +1389,22 @@ void ggml_compute_forward_mul_mat(
+ 
+     const bool src1_cont = ggml_is_contiguous(src1);
+ 
++#if defined(__aarch64__)
++    // loom P4.38 (sgemm.cpp): graph nodes only -- see llamafile_sgemm_f32_packed. The decision depends on
++    // the shape alone, so every thread and every slice of a batch takes the same branch (it has barriers).
++    const bool f32_packed = dst->op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
++#endif
++
+     if (!params->use_ref && src1_cont) {
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+-            for (int64_t i12 = 0; i12 < ne12; i12++)
++            for (int64_t i12 = 0; i12 < ne12; i12++) {
++#if defined(__aarch64__)
++                if (f32_packed && llamafile_sgemm_f32_packed(params, ne01, ne11, ne00,
++                        (const float *) ((const char *) src0->data + i12/r2*nb02 + i13/r3*nb03), nb01/sizeof(float),
++                        (const float *) ((const char *) src1->data + i12*nb12 + i13*nb13), nb11/sizeof(float),
++                        (float *) ((char *) dst->data + i12*nb2 + i13*nb3), nb1/sizeof(float)))
++                    continue;
++#endif
+                 if (!llamafile_sgemm(params,
+                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+@@ -1404,6 +1417,7 @@ void ggml_compute_forward_mul_mat(
+                                      src1->type,
+                                      dst->type))
+                     goto UseGgmlGemm1;
++            }
+         return;
+     }
+ UseGgmlGemm1:;
+@@ -2975,6 +2989,13 @@ struct ggml_cplan ggml_graph_plan(
+                         cur += ggml_tiled_wdata_size(n_tasks, node);
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+                         cur = MAX(cur, ggml_armv6_mul_mat_f32_wsize(node, n_tasks));
++#endif
++#if GGML_USE_LLAMAFILE && defined(__aarch64__)
++                        // loom P4.38: the packed block of sgemm.cpp's outer-product path, which only an
++                        // F32 x F32 product takes -- and that product converts nothing into wdata
++                        if (node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) {
++                            cur = MAX(cur, llamafile_sgemm_f32_wsize());
++                        }
+ #endif
+                     } break;
+                 case GGML_OP_MUL_MAT_ID:
+diff --git a/src/ggml-cpu/llamafile/sgemm.cpp b/src/ggml-cpu/llamafile/sgemm.cpp
+index 49f1e497..f641a18f 100644
+--- a/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -53,10 +53,13 @@
+ #include "ggml-cpu-impl.h"
+ #include "ggml-quants.h"
+ #include "simd-mappings.h"
++#include "ggml-cpu.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <type_traits>
+ #include <vector>
+ #if defined(__APPLE__)
+@@ -624,6 +627,235 @@ static const sgemm_caches & sgemm_cache_sizes() {
+ }
+ #endif
+ 
++#if defined(__aarch64__)
++////////////////////////////////////////////////////////////////////////////////////////////////////
++// AN OUTER-PRODUCT F32 GEMM FOR AARCH64 CORES WITHOUT DOTPROD (loom P4.38)
++//
++// WHY. On a Cortex-A72 (Raspberry Pi 4) tinyBLAS's 4x3 dot-product tile reaches ~8.3 GFLOP/s on one core
++// at whisper-small's encoder shapes (58% of the 14.3 GF FMA roofline) and scales to only ~24 at four,
++// against onnxruntime's MLAS at 30-35 in the same model. Its tile streams 4 + 3 rows of k from L1 per
++// 12 FMAs, every output ends in a horizontal add, and at four threads every core streams its own B
++// strips from the one 1 MB L2. XNNPACK's choice for this core is an outer product,
++// `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm`: A (here: the weights) packed into 8-row panels with k
++// outermost, B read as q-vectors of four k, `fmla` by lane, no reduction at all. On one core that asm
++// kernel runs at 10.6 GF (74%); the intrinsics below at 10.3-10.4.
++//
++// THE SCHEDULE IS WHERE MOST OF IT IS. XNNPACK's own operator walks 4 rows of B against ALL of A, so at
++// whisper's sizes (A = 2.4-9.4 MB) every 4 rows re-read the weights from DRAM: 7-10 GF at four threads,
++// below tinyBLAS. Here the threads pack one block of A -- `nb` rows by `kc` of k, a quarter of the L2,
++// 256 x 256 on the A72 -- together, then each walks its own share of B's rows against the whole block.
++// The block is read from L2 by all four cores; B streams once per block. Measured on the Pi 4, four
++// threads, scripts/bench66.cpp (GFLOP/s, tinyBLAS -> this):
++//
++//     whisper qkv  768 x 768  x 1500    24.2 -> 31.9   1.32x
++//     whisper fc1  768 x 3072 x 1500    24.1 -> 31.7   1.31x
++//     whisper fc2  3072 x 768 x 1500    15.7 -> 27.0   1.71x
++//
++// MLAS reaches 30.3 / 34.8 / 29.7 on those in the same model. End to end, paired launches with the switch
++// below off and on: whisper-small F32 1.174x (24.6 -> 20.9 s, same transcript), Moonshine tiny 1.057x.
++//
++// Swept: blocks of 64-512 rows by 128-384 of k plateau between 256 and 288 KB, so the rule is L2 / 4,
++// not a fitted pair. Rows dealt to threads from a private block each (no shared pack) were 6-8% slower,
++// and a full-k block lost 0.43x at fc2, where 64 rows of k = 3072 is 768 KB per thread.
++//
++// PREFETCH: NONE, ON PURPOSE. One `prfm` per 4-k step 512 B ahead covers only half the panel's lines
++// (a step consumes 128 B) and made the kernel 20% SLOWER than none (8.4 vs 10.3 GF on one core); two per
++// step at 256, 512 or 1024 B ahead tied with none on one core and lost 1-6% on four. The panel is
++// sequential and the hardware prefetcher keeps up.
++//
++// NUMERICS. Each output is one sequential fused sum over k, the same order at every thread count and
++// for every block size (a block of k continues the sum through C), so it is deterministic, but it is
++// NOT tinyBLAS's order (four lane partials, then a horizontal add): the error against a
++// double-precision product is ~2x tinyBLAS's (5.0e-7 vs 2.5e-7 relative at K = 768).
++//
++// WHERE. Only a core without DOTPROD (the A53/A57/A72/A73 generation), which is what was measured; on an
++// M1 tinyBLAS beats XNNPACK's F32 kernels at one thread (92 vs 74 GF) and this was not raced there.
++// GGML_CPU_NEON_F32_4X8=0 turns it off.
++
++namespace {
++
++struct sgemm_op_blocking { int64_t nb, kc; };
++
++static sgemm_op_blocking sgemm_op_blocks() {
++    constexpr int64_t kc = 256;
++    const sgemm_caches & c = sgemm_cache_sizes();
++    const int64_t l2 = c.l2 > 0 ? c.l2 : 1024 * 1024;
++    int64_t nb = l2 / 4 / (kc * (int64_t) sizeof(float));
++    nb -= nb % 8;
++    return { nb < 8 ? 8 : nb, kc };
++}
++
++static bool sgemm_op_enabled() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CPU_NEON_F32_4X8");
++        return !(e && e[0] == '0') && !ggml_cpu_has_dotprod();
++    }();
++    return on;
++}
++
++// Rows [i, i + 8) of A, k in [l0, l1), as one panel: for each k, the 8 rows' values. Rows past m are
++// zero, so an edge panel needs no special case in the tile.
++static void sgemm_op_pack(const float * A, int64_t lda, int64_t m, int64_t i, int64_t l0, int64_t l1, float * out) {
++    const int64_t kc = l1 - l0;
++    int64_t l = 0;
++    if (i + 8 <= m) {
++        const float * r0 = A + lda * i + l0;
++        for (; l + 4 <= kc; l += 4) {
++            for (int h = 0; h < 2; ++h) {
++                const float * r = r0 + lda * 4 * h + l;
++                const float32x4x2_t t01 = vtrnq_f32(vld1q_f32(r), vld1q_f32(r + lda));
++                const float32x4x2_t t23 = vtrnq_f32(vld1q_f32(r + 2 * lda), vld1q_f32(r + 3 * lda));
++                vst1q_f32(out + 0 * 8 + 4 * h, vcombine_f32(vget_low_f32(t01.val[0]), vget_low_f32(t23.val[0])));
++                vst1q_f32(out + 1 * 8 + 4 * h, vcombine_f32(vget_low_f32(t01.val[1]), vget_low_f32(t23.val[1])));
++                vst1q_f32(out + 2 * 8 + 4 * h, vcombine_f32(vget_high_f32(t01.val[0]), vget_high_f32(t23.val[0])));
++                vst1q_f32(out + 3 * 8 + 4 * h, vcombine_f32(vget_high_f32(t01.val[1]), vget_high_f32(t23.val[1])));
++            }
++            out += 32;
++        }
++    }
++    for (; l < kc; ++l) {
++        for (int64_t r = 0; r < 8; ++r) {
++            out[r] = i + r < m ? A[lda * (i + r) + l0 + l] : 0.0f;
++        }
++        out += 8;
++    }
++}
++
++// C[mr x 8] (+)= B[mr x kc] * P[kc x 8], mr in 1..4. Rows past mr alias the last real one (they compute
++// the same values and store them to the same place), as XNNPACK's kernel does.
++static inline void sgemm_op_tile(int64_t mr, const float * b, int64_t ldb, const float * p, int64_t kc, float * c,
++                                 int64_t ldc, bool accumulate) {
++    const float * b0 = b;
++    const float * b1 = mr > 1 ? b0 + ldb : b0;
++    const float * b2 = mr > 2 ? b1 + ldb : b1;
++    const float * b3 = mr > 3 ? b2 + ldb : b2;
++    float * c0 = c;
++    float * c1 = mr > 1 ? c0 + ldc : c0;
++    float * c2 = mr > 2 ? c1 + ldc : c1;
++    float * c3 = mr > 3 ? c2 + ldc : c2;
++    float32x4_t x0, x1, y0, y1, z0, z1, w0, w1;
++    if (accumulate) {
++        x0 = vld1q_f32(c0); x1 = vld1q_f32(c0 + 4);
++        y0 = vld1q_f32(c1); y1 = vld1q_f32(c1 + 4);
++        z0 = vld1q_f32(c2); z1 = vld1q_f32(c2 + 4);
++        w0 = vld1q_f32(c3); w1 = vld1q_f32(c3 + 4);
++    } else {
++        x0 = x1 = y0 = y1 = z0 = z1 = w0 = w1 = vdupq_n_f32(0.0f);
++    }
++    int64_t l = 0;
++    for (; l + 4 <= kc; l += 4) {
++        const float32x4_t v0 = vld1q_f32(b0 + l), v1 = vld1q_f32(b1 + l);
++        const float32x4_t v2 = vld1q_f32(b2 + l), v3 = vld1q_f32(b3 + l);
++        float32x4_t q0 = vld1q_f32(p), q1 = vld1q_f32(p + 4);
++        x0 = vfmaq_laneq_f32(x0, q0, v0, 0); x1 = vfmaq_laneq_f32(x1, q1, v0, 0);
++        y0 = vfmaq_laneq_f32(y0, q0, v1, 0); y1 = vfmaq_laneq_f32(y1, q1, v1, 0);
++        z0 = vfmaq_laneq_f32(z0, q0, v2, 0); z1 = vfmaq_laneq_f32(z1, q1, v2, 0);
++        w0 = vfmaq_laneq_f32(w0, q0, v3, 0); w1 = vfmaq_laneq_f32(w1, q1, v3, 0);
++        q0 = vld1q_f32(p + 8); q1 = vld1q_f32(p + 12);
++        x0 = vfmaq_laneq_f32(x0, q0, v0, 1); x1 = vfmaq_laneq_f32(x1, q1, v0, 1);
++        y0 = vfmaq_laneq_f32(y0, q0, v1, 1); y1 = vfmaq_laneq_f32(y1, q1, v1, 1);
++        z0 = vfmaq_laneq_f32(z0, q0, v2, 1); z1 = vfmaq_laneq_f32(z1, q1, v2, 1);
++        w0 = vfmaq_laneq_f32(w0, q0, v3, 1); w1 = vfmaq_laneq_f32(w1, q1, v3, 1);
++        q0 = vld1q_f32(p + 16); q1 = vld1q_f32(p + 20);
++        x0 = vfmaq_laneq_f32(x0, q0, v0, 2); x1 = vfmaq_laneq_f32(x1, q1, v0, 2);
++        y0 = vfmaq_laneq_f32(y0, q0, v1, 2); y1 = vfmaq_laneq_f32(y1, q1, v1, 2);
++        z0 = vfmaq_laneq_f32(z0, q0, v2, 2); z1 = vfmaq_laneq_f32(z1, q1, v2, 2);
++        w0 = vfmaq_laneq_f32(w0, q0, v3, 2); w1 = vfmaq_laneq_f32(w1, q1, v3, 2);
++        q0 = vld1q_f32(p + 24); q1 = vld1q_f32(p + 28);
++        x0 = vfmaq_laneq_f32(x0, q0, v0, 3); x1 = vfmaq_laneq_f32(x1, q1, v0, 3);
++        y0 = vfmaq_laneq_f32(y0, q0, v1, 3); y1 = vfmaq_laneq_f32(y1, q1, v1, 3);
++        z0 = vfmaq_laneq_f32(z0, q0, v2, 3); z1 = vfmaq_laneq_f32(z1, q1, v2, 3);
++        w0 = vfmaq_laneq_f32(w0, q0, v3, 3); w1 = vfmaq_laneq_f32(w1, q1, v3, 3);
++        p += 32;
++    }
++    for (; l < kc; ++l) {
++        const float32x4_t q0 = vld1q_f32(p), q1 = vld1q_f32(p + 4);
++        x0 = vfmaq_n_f32(x0, q0, b0[l]); x1 = vfmaq_n_f32(x1, q1, b0[l]);
++        y0 = vfmaq_n_f32(y0, q0, b1[l]); y1 = vfmaq_n_f32(y1, q1, b1[l]);
++        z0 = vfmaq_n_f32(z0, q0, b2[l]); z1 = vfmaq_n_f32(z1, q1, b2[l]);
++        w0 = vfmaq_n_f32(w0, q0, b3[l]); w1 = vfmaq_n_f32(w1, q1, b3[l]);
++        p += 8;
++    }
++    vst1q_f32(c3, w0); vst1q_f32(c3 + 4, w1);
++    vst1q_f32(c2, z0); vst1q_f32(c2 + 4, z1);
++    vst1q_f32(c1, y0); vst1q_f32(c1 + 4, y1);
++    vst1q_f32(c0, x0); vst1q_f32(c0 + 4, x1);
++}
++
++// The last panel when m % 8 != 0: the tile runs into a scratch row block and only nr columns go back to
++// C, which may end at the edge of its allocation.
++static NOINLINE void sgemm_op_tile_edge(int64_t mr, int64_t nr, const float * b, int64_t ldb, const float * p,
++                                        int64_t kc, float * c, int64_t ldc, bool accumulate) {
++    float t[4 * 8] = {};
++    if (accumulate) {
++        for (int64_t r = 0; r < mr; ++r)
++            memcpy(t + 8 * r, c + ldc * r, nr * sizeof(float));
++    }
++    sgemm_op_tile(mr, b, ldb, p, kc, t, 8, accumulate);
++    for (int64_t r = 0; r < mr; ++r)
++        memcpy(c + ldc * r, t + 8 * r, nr * sizeof(float));
++}
++
++}  // namespace
++
++// Bytes of params->wdata the path needs (ggml_graph_plan reserves them for every F32 x F32 MUL_MAT), or
++// 0 where it never runs.
++static size_t sgemm_op_wsize() {
++    if (!sgemm_op_enabled()) return 0;
++    const sgemm_op_blocking b = sgemm_op_blocks();
++    return (size_t) (b.nb * b.kc) * sizeof(float) + 64;
++}
++
++// AT LEAST 128 ACTIVATION ROWS, AND NOTHING THAT DEPENDS ON THE THREAD COUNT. Below that the per-call pack
++// is not amortised: on the A72 at four threads n = 64 ran 0.88-0.90x at k = 768 (1.15x at k = 3072),
++// n = 24 0.78-0.89x, n = 4 0.58x; from n = 200 every measured shape won (1.11-1.58x, 27 shapes: whisper,
++// VITS's convolution GEMMs, Moonshine, attention). One thread breaks even far earlier (n = 24 already
++// 1.04-1.12x), and `n / nth >= 32` fits both -- but a predicate on nth makes WHICH SUM a product gets
++// depend on the thread count, and tinyBLAS's outputs are byte-identical across thread counts
++// (test_tinyblas_k_halves pins that). So the four-thread threshold, for every thread count: one
++// thread gives up 1.04-1.08x on 32 <= n < 128.
++static bool sgemm_op_admits(const ggml_compute_params * params, int64_t m, int64_t n, int64_t k) {
++    GGML_UNUSED(m);
++    GGML_UNUSED(k);
++    if (!sgemm_op_enabled() || params->wsize < sgemm_op_wsize())
++        return false;
++    return n >= 128;
++}
++
++// C[j][i] = sum_l A[i][l] * B[j][l] for i < m, j < n: A is the weight (m rows of k), B the activations.
++static void sgemm_op(const ggml_compute_params * params, int64_t m, int64_t n, int64_t k, const float * A,
++                     int64_t lda, const float * B, int64_t ldb, float * C, int64_t ldc) {
++    const sgemm_op_blocking blk = sgemm_op_blocks();
++    float * pk = (float *) (((uintptr_t) params->wdata + 63) & ~(uintptr_t) 63);
++    const int ith = params->ith, nth = params->nth;
++    // B's rows in fours, dealt evenly; every thread walks the whole packed block.
++    const int64_t g = (n + 3) / 4;
++    const int64_t j0 = std::min(n, g * ith / nth * 4), j1 = std::min(n, g * (ith + 1) / nth * 4);
++    for (int64_t i0 = 0; i0 < m; i0 += blk.nb) {
++        const int64_t npan = (std::min(m, i0 + blk.nb) - i0 + 7) / 8;
++        for (int64_t l0 = 0; l0 < k; l0 += blk.kc) {
++            const int64_t l1 = std::min(k, l0 + blk.kc), kc = l1 - l0;
++            for (int64_t p = ith; p < npan; p += nth)
++                sgemm_op_pack(A, lda, m, i0 + 8 * p, l0, l1, pk + p * kc * 8);
++            ggml_barrier(params->threadpool);
++            for (int64_t j = j0; j < j1; j += 4) {
++                const int64_t mr = std::min<int64_t>(4, j1 - j);
++                for (int64_t p = 0; p < npan; ++p) {
++                    const int64_t i = i0 + 8 * p;
++                    if (i + 8 <= m)
++                        sgemm_op_tile(mr, B + ldb * j + l0, ldb, pk + p * kc * 8, kc, C + ldc * j + i, ldc, l0 > 0);
++                    else
++                        sgemm_op_tile_edge(mr, m - i, B + ldb * j + l0, ldb, pk + p * kc * 8, kc, C + ldc * j + i,
++                                           ldc, l0 > 0);
++                }
++            }
++            // the next block's pack overwrites this one
++            ggml_barrier(params->threadpool);
++        }
++    }
++}
++#endif
++
+ template <int KN, typename D, typename V, typename TA, typename TB, typename TC>
+ class tinyBLAS {
+   public:
+@@ -5253,3 +5485,22 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+     (void)Btype;
+     (void)Ctype;
+ }
++
++#if defined(__aarch64__)
++size_t llamafile_sgemm_f32_wsize(void) {
++    return sgemm_op_wsize();
++}
++
++// NOT reached through llamafile_sgemm: this path packs into params->wdata, and the convolutions' im2col
++// fallback (ops.cpp's ggml_call_mul_mat*) calls mul_mat with its own patches already there -- so only a
++// graph MUL_MAT node, whose work buffer ggml_graph_plan sized for this, may call it. Taking the path from
++// llamafile_sgemm overwrote the patches: loom's conv_1d / conv_transpose_1d sweeps and STFT test went
++// to relative errors of 0.9-1.5 on the Pi 4. ARMv6's packed F32 GEMM (ggml-0034) hit the same thing.
++bool llamafile_sgemm_f32_packed(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
++                                const float * A, int64_t lda, const float * B, int64_t ldb, float * C, int64_t ldc) {
++    if (params->use_ref || !sgemm_op_admits(params, m, n, k))
++        return false;
++    sgemm_op(params, m, n, k, A, lda, B, ldb, C, ldc);
++    return true;
++}
++#endif
+diff --git a/src/ggml-cpu/llamafile/sgemm.h b/src/ggml-cpu/llamafile/sgemm.h
+index 5c9a5dfc..425e6b18 100644
+--- a/src/ggml-cpu/llamafile/sgemm.h
++++ b/src/ggml-cpu/llamafile/sgemm.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include <stdint.h>
+ #include <stdbool.h>
++#include <stddef.h>
+ 
+ #if defined(__VXE__) || defined(__VXE2__)
+ #include <vecintrin.h>
+@@ -21,6 +22,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t, int64_t
+                      int, int, int);
+ 
+ 
++#if defined(__aarch64__)
++// loom P4.38: an outer-product F32 GEMM for cores without DOTPROD, for graph MUL_MAT nodes only (it packs
++// into params->wdata). Returns false, having done nothing, where it does not apply.
++size_t llamafile_sgemm_f32_wsize(void);
++bool llamafile_sgemm_f32_packed(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
++                                const float * A, int64_t lda, const float * B, int64_t ldb, float * C, int64_t ldc);
++#endif
++
+ #if defined(__ARM_FEATURE_SIMD32) && !defined(__ARM_NEON) && !defined(__aarch64__)
+ // ARMv6 only -- see sgemm.cpp. A channel-major q4_0 x q8_0 GEMM for the convolution fallback.
+ bool llamafile_sgemm_q4_0_q8_0_cm(const struct ggml_compute_params * params,
