@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: performance
-last_updated: 2026-10-22
+last_updated: 2026-10-23
 ---
 
 # Epic-05: Edge CPU Performance
@@ -1408,11 +1408,41 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
     | VITS | 0.994x | nothing placed (every listed weight feeds a conv): the null control |
 
     The test is `test_mul_mat_neon_i8`, bit-exact against a scalar reference, sabotaged red.
-* **P4.38, tinyBLAS's F32 tile on the A72 — OPEN.** ~2.7 s of the F32 gap is the dense GEMMs at
-  1.20-1.46x. XNNPACK's A72 kernel is the outer-product `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm`:
-  A as q-vectors of four k, B packed K-major in eight-column panels, `fmla` by lane, `prfm` on both, 12
-  loads per 32 FMAs against tinyBLAS's 7 per 12. Retro-012's outer-product tile bought 1.23x at k = 64 on
-  this core, so measure at K = 768 / 3072 first.
+* **P4.38, an F32 GEMM tile for the A72 — BUILT 2026-10-23 (`ggml-0048`,
+  [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)).** The lead
+  in the scope ("`fc2` collapses at four threads", from `bench65`'s F32 arm) was the bench's own build:
+  a standalone ggml defaults `GGML_LLAMAFILE` to OFF, so that arm was never tinyBLAS
+  ([Retro-090](../retros/retro-090-the-baseline-arm-was-not-the-engine.md)). Measured against the engine's
+  build (`scripts/bench66.cpp`), tinyBLAS runs whisper's linears at 8.3 GF on one core (58% of the roofline)
+  and 15.7-24.2 at four. XNNPACK's kernel for this core, a 4x8 outer product, runs at 10.6 on one core.
+  Its own operator re-reads the weights from DRAM for every 4 rows, though, and so loses at whisper's sizes.
+  The patch keeps the tile and replaces the schedule. The threads pack one block of weight (`L2 / 4`,
+  256 rows x 256 k) together and each walks its share of the activation rows against it, so k is carried
+  through C between blocks.
+  * **GEMM**, four threads: `qkv` 24.2 → 31.9 GF (1.32x), `fc1` 24.1 → 31.7 (1.31x), `fc2` 15.7 → 27.0
+    (1.71x), against MLAS's 30.3 / 34.8 / 29.7 in the model. Across 27 shapes it wins from 200 activation rows
+    up (1.11-1.58x) and loses below 64 (the per-call pack is not amortised there), so the predicate is
+    n >= 128, at every thread count: a thread-dependent one would make the bytes depend on the thread count.
+  * **End to end** (Pi 4, 4 threads, `GGML_CPU_NEON_F32_4X8` off/on, paired launches, F32 cards unless named).
+    Against onnxruntime FP32 (the README's Pi 4 F32 half, re-run on this branch) whisper-small went 0.80x → 0.98x
+    and Moonshine 1.03x → 1.10x:
+
+    | card | ratio | notes |
+    |---|---|---|
+    | whisper-small | **1.174x** | 24.6 → 20.9 s, means of 7; same transcript |
+    | Moonshine tiny | 1.057x (1.055-1.060) | same transcript |
+    | whisper-small Q8_0_PC | 1.082x | 13.78 → 12.74 s; its attention is F32 x F32 |
+    | Citrinet-256-ls | 0.998x, unresolved | convolutions only: they keep tinyBLAS (P4.39) |
+    | VITS | 1.011x, unresolved | byte-identical audio: nothing took the path |
+    | Qwen3-0.6B | 0.991x, unresolved | same tokens; prompt and decode below 128 rows |
+
+  * **Graph nodes only.** Taken inside `llamafile_sgemm`, the pack overwrote the im2col patches that the
+    convolutions' fallback keeps in `params->wdata`. The conv sweeps and the STFT test went red on the Pi
+    (relative errors 0.9-1.5), the same trap ARMv6's packed GEMM hit in P4.33. P4.39 would give the
+    convolutions their own block.
+  * Numerics: one sequential fused sum per output, bit-exact to an `fmaf` loop at 1/2/4 threads
+    (`test_mul_mat_neon_f32_4x8`, sabotaged red). Not tinyBLAS's order; ~2x its error against f64
+    (5.0e-7 vs 2.5e-7).
 
 ### Operating notes: benchmarking
 
