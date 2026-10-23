@@ -1336,7 +1336,7 @@ machine against a 1.52x roofline ceiling. See §5.
 1500-frame encoder on **both** engines. That is not where loom loses, and shortening it is a
 model-semantics change (the positional embedding is fixed at 1500), so it is not part of this item.
 
-### P4.35-P4.38: whisper-small on the Raspberry Pi 4, per op (2026-10-22)
+### P4.35-P4.39: whisper-small on the Raspberry Pi 4, per op (2026-10-22)
 
 The rc18 table in the README has whisper-small at **0.80x** (F32) and **0.64x** (`Q8_0_PC` against
 onnxruntime's int8) on the Pi 4 at four threads, where every other Pi 4 cell is at parity or a win. Both
@@ -1387,7 +1387,7 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   hashes equal to rc18's): **Moonshine tiny 1.084x F32** (30.32 → 28.00 s), **1.101x Q8_0_PC** (24.29 → 22.07 s);
   VITS 1.011x (128 small copies), conformer-ctc 1.012x (53, inside its noise). Citrinet, Silero and WakeHuBERT
   make one or two each, sanoTTS 2-13 small ones (counted on x86 with a log line on the path).
-* **P4.37, an int8 GEMM for the A72 — BUILT 2026-10-22 (`ggml-0047`).** The A72 has no `sdot` instruction, so
+* **P4.37, an int8 GEMM for the A72 — DONE as `ggml-0047` (merged 2026-10-23, #90).** The A72 has no `sdot` instruction, so
   tinyBLAS's Q8_0 kernel (DOTPROD-only) never runs there, and a `Q8_0_PC` weight went through ggml's row-at-a-time
   `vec_dot_q8_0_q8_0`. `CPU_NEON_I8` is the NEON sibling of P4.33's `CPU_ARMV6_I8`: an extra buffer type registered
   on AArch64 when `ggml_cpu_has_dotprod()` is false, and the engine places `loom.quantize.per_channel` weights there
@@ -1417,7 +1417,7 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
     | VITS | 0.994x | nothing placed (every listed weight feeds a conv): the null control |
 
     The test is `test_mul_mat_neon_i8`, bit-exact against a scalar reference, sabotaged red.
-* **P4.38, an F32 GEMM tile for the A72 — BUILT 2026-10-23 (`ggml-0048`,
+* **P4.38, an F32 GEMM tile for the A72 — DONE (merged 2026-10-23, #91; `ggml-0048`,
   [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md)).** The lead
   in the scope ("`fc2` collapses at four threads", from `bench65`'s F32 arm) was the bench's own build:
   a standalone ggml defaults `GGML_LLAMAFILE` to OFF, so that arm was never tinyBLAS
@@ -1452,7 +1452,7 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   * Numerics: one sequential fused sum per output, bit-exact to an `fmaf` loop at 1/2/4 threads
     (`test_mul_mat_neon_f32_4x8`, sabotaged red). Not tinyBLAS's order; ~2x its error against f64
     (5.0e-7 vs 2.5e-7).
-* **P4.39, the convolutions' GEMMs on the same path — BUILT 2026-10-23 (`ggml-0049`,
+* **P4.39, the convolutions' GEMMs on the same path — DONE (merged 2026-10-23, #92; `ggml-0049`,
   [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md)).** A
   convolution carves the path's block off the end of its own work buffer before sizing its im2col patches, and
   hands it to the GEMM. All three of `conv_2d_impl`'s GEMM calls take it, and so does `conv_transpose_1d`'s.
