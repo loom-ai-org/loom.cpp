@@ -4,12 +4,111 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace loom {
 namespace {
 
 using Json = nlohmann::json;
+
+// The whole-sequence form: every query against every key, the mask deciding which of them count.
+ggml_tensor* dense_attention(ggml_context* ctx, ggml_tensor* qp, ggml_tensor* kp, ggml_tensor* vt,
+                             ggml_tensor* kq_mask, float scale) {
+    ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp); // [n_kv, n_tokens, n_head]
+    ggml_prec_set_acc(kq, GGML_PREC_F32);
+    kq = ggml_soft_max_ext(ctx, kq, kq_mask, scale, /*max_bias=*/0.0f);
+    return ggml_mul_mat(ctx, vt, kq);            // [n_embd_head_v, n_tokens, n_head]
+}
+
+// Queries per block of a windowed node. Pi Zero W, Pocket-TTS 2m (window 50 over 960 positions), the whole
+// synthesis: 16 / 24 / 32 / 48 / 64 = 9.56 / 9.62 / 9.61 / 9.67-9.70 / 9.73-9.75 s. Smaller blocks compute
+// less of the band's masked corner and run more nodes; 32 is as fast as 16 with half of them.
+constexpr int64_t kWindowBlock = 32;
+
+// `$LOOM_ATTENTION_WINDOW=0` runs a windowed node densely, for A/B runs; `$LOOM_ATTENTION_WINDOW_BLOCK`
+// overrides the query block. Both read once per process.
+bool window_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOOM_ATTENTION_WINDOW");
+        return !(e && std::strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
+int64_t window_block() {
+    static const int64_t block = [] {
+        const char* e = std::getenv("LOOM_ATTENTION_WINDOW_BLOCK");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0;
+        return static_cast<int64_t>(v > 0 ? v : kWindowBlock);
+    }();
+    return block;
+}
+
+// attrs["window"] (P4.41, ADR-085): a promise from the export that this node's mask is -inf wherever
+// a key is not in the query's causal window, `q - window < k <= q`. Nothing in the mask's VALUES is
+// trusted beyond that: inside the band they are applied exactly as the dense form applies them.
+int64_t attention_window(const Json& attrs, PrimitiveContext& pc, bool use_cache) {
+    if (!attrs.contains("window")) return 0;
+    const int64_t window = resolve_attr_int(attrs, "window", pc.symbols);
+    if (window <= 0) throw SchemaError("ATTENTION: window must be positive, got " + std::to_string(window));
+    if (use_cache) {
+        // A cached step's keys are the cache's cells, whose positions are the driver's business; the
+        // only caller so far (Mimi's decoder, a single uncached pass) has no use for the pairing.
+        throw SchemaError("ATTENTION: window is only defined with kv_cache=false");
+    }
+    return window_enabled() ? window : 0;
+}
+
+// The windowed form: each block of `block` queries against only the keys its rows can see, the
+// keys [q0 - window + 1, q0 + nq). Mimi's decoder transformer (window 50 over 960 positions for 4.8 s
+// of audio) spent 6.6 s of a 19 s Pi Zero synthesis on the dense form, ~95% of it on pairs its mask
+// zeroes (P4.41).
+//
+// Every in-band score, mask value and softmax input is the dense form's, and an out-of-band column
+// contributes an exact 0 there (exp of -inf, or of -1e30 after the max), so the softmax rows agree.
+// The A @ V products are not bit-identical: K shrinks from n_kv to the band, which regroups the sums.
+ggml_tensor* banded_attention(ggml_context* ctx, ggml_tensor* qp, ggml_tensor* kp, ggml_tensor* vt,
+                              ggml_tensor* kq_mask, float scale, int64_t window) {
+    const int64_t n_tokens = qp->ne[1];
+    const int64_t n_kv = kp->ne[1];
+    if (n_kv != n_tokens) {
+        throw SchemaError("ATTENTION: a windowed node attends over its own keys (n_kv " + std::to_string(n_kv) +
+                          " != n_tokens " + std::to_string(n_tokens) + ")");
+    }
+    const int64_t block = window_block();
+    std::vector<ggml_tensor*> parts;
+    for (int64_t q0 = 0; q0 < n_tokens; q0 += block) {
+        const int64_t nq = std::min(block, n_tokens - q0);
+        const int64_t k0 = std::max<int64_t>(0, q0 - window + 1);
+        const int64_t nk = q0 + nq - k0;
+        // Q's block COPIED to contiguous rows: ggml hands a batched mul_mat to tinyBLAS only when src1 is
+        // contiguous, and the strided view ran the per-element dot instead -- 33 MMAC/s against A @ V's
+        // 280 on a Pi Zero W, 1.6 s of 2.1 (P4.41). K's block stays a view: src0's rows may be strided.
+        ggml_tensor* qb = ggml_cont(ctx, ggml_view_3d(ctx, qp, qp->ne[0], nq, qp->ne[2], qp->nb[1], qp->nb[2],
+                                                      q0 * qp->nb[1]));
+        ggml_tensor* kb = ggml_view_3d(ctx, kp, kp->ne[0], nk, kp->ne[2], kp->nb[1], kp->nb[2], k0 * kp->nb[1]);
+        ggml_tensor* kq = ggml_mul_mat(ctx, kb, qb); // [nk, nq, n_head]
+        ggml_prec_set_acc(kq, GGML_PREC_F32);
+        // ggml_soft_max_ext takes a contiguous mask only, so the block's [nk, nq] corner is copied out.
+        ggml_tensor* mb = ggml_cont(ctx, ggml_view_2d(ctx, kq_mask, nk, nq, kq_mask->nb[1],
+                                                      q0 * kq_mask->nb[1] + k0 * kq_mask->nb[0]));
+        kq = ggml_soft_max_ext(ctx, kq, mb, scale, /*max_bias=*/0.0f);
+        ggml_tensor* vb = ggml_view_3d(ctx, vt, nk, vt->ne[1], vt->ne[2], vt->nb[1], vt->nb[2], k0 * vt->nb[0]);
+        parts.push_back(ggml_mul_mat(ctx, vb, kq)); // [n_embd_head_v, nq, n_head]
+    }
+    // Pairwise, so each level copies the result once: a left fold copies its growing prefix per block.
+    while (parts.size() > 1) {
+        std::vector<ggml_tensor*> next;
+        for (size_t i = 0; i + 1 < parts.size(); i += 2) next.push_back(ggml_concat(ctx, parts[i], parts[i + 1], 1));
+        if (parts.size() % 2) next.push_back(parts.back());
+        parts.swap(next);
+    }
+    return parts[0];
+}
 
 // Composite (non-flash) scaled dot-product attention. Mirrors llama.cpp's
 // llm_graph_context::build_attn_mha non-flash / !v_trans branch (llama-graph.cpp:2384-2517) -- see the
@@ -26,6 +125,9 @@ using Json = nlohmann::json;
 // autoregressive decoding; false skips the cache entirely and attends directly over this call's own k/v
 // (n_kv == n_tokens) -- the shape a non-autoregressive encoder needs, where the whole (fixed-length)
 // sequence is attended over in one shot and there's no "past" to persist.
+//
+// attrs["window"] (int, kv_cache=false only) declares a causal sliding window and computes only the band
+// it allows -- see banded_attention.
 std::vector<ggml_tensor*> op_attention(PrimitiveContext& pc, const std::vector<ggml_tensor*>& in, const Json& attrs) {
     if (in.size() != 4) {
         throw SchemaError("ATTENTION expects 4 inputs (q, k, v, kq_mask), got " + std::to_string(in.size()));
@@ -96,13 +198,13 @@ std::vector<ggml_tensor*> op_attention(PrimitiveContext& pc, const std::vector<g
     ggml_tensor* kp = ggml_permute(pc.ctx, k_cache, 0, 2, 1, 3);  // [n_embd_head_k, n_kv, n_head_kv]
     ggml_tensor* vp = ggml_permute(pc.ctx, v_cache, 0, 2, 1, 3);  // [n_embd_head_v, n_kv, n_head_kv]
 
-    ggml_tensor* kq = ggml_mul_mat(pc.ctx, kp, qp); // [n_kv, n_tokens, n_head]
-    ggml_prec_set_acc(kq, GGML_PREC_F32);
-    kq = ggml_soft_max_ext(pc.ctx, kq, kq_mask, scale, /*max_bias=*/0.0f);
-
     // KvCache never pre-transposes V's storage (no v_trans optimization), so this branch always runs.
     ggml_tensor* vt = ggml_cont(pc.ctx, ggml_transpose(pc.ctx, vp)); // [n_kv, n_embd_head_v, n_head_kv]
-    ggml_tensor* kqv = ggml_mul_mat(pc.ctx, vt, kq);                 // [n_embd_head_v, n_tokens, n_head]
+
+    const int64_t window = attention_window(attrs, pc, use_cache);
+    ggml_tensor* kqv = window > 0 ? banded_attention(pc.ctx, qp, kp, vt, kq_mask, scale, window)
+                                  : dense_attention(pc.ctx, qp, kp, vt, kq_mask, scale);
+    // kqv: [n_embd_head_v, n_tokens, n_head]
 
     ggml_tensor* cur = ggml_permute(pc.ctx, kqv, 0, 2, 1, 3); // [n_embd_head_v, n_head, n_tokens]
     cur = ggml_cont_2d(pc.ctx, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]); // [n_embd, n_tokens]

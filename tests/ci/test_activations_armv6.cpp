@@ -1,4 +1,5 @@
-// The ARMv6 activation kernels (ADR-079 P4.32f f2 step 3a, ggml-0039): GELU_ERF, SIGMOID, SILU, TANH.
+// The ARMv6 activation kernels (ADR-079 P4.32f f2 step 3a, ggml-0039): GELU_ERF, SIGMOID, SILU, TANH; and
+// ELU (P4.41, ggml-0052).
 //
 // On ARMv6 these ran per element at 160-440 ns on a Pi Zero W: GELU_ERF through ggml-0010's scalar rational
 // (no SIMD body exists there), the other three through glibc's expf and tanhf. ggml-0039 runs them on the
@@ -9,7 +10,7 @@
 //   1. **The numbers**, in both runs, against f64: GELU_ERF within ggml-0010's measured bound (2.64e-7 of
 //      max(|x|, 1), ~2 ULP of scale), TANH within 2 ULP and SIGMOID / SILU within 3 of the true value.
 //   2. **The special values**, as the stock code produces them: NaN in, NaN out; sigmoid(+-inf) = 1 / 0,
-//      tanh(+-inf) = +-1, silu(+inf) = +inf, and +-0 kept by tanh and silu.
+//      tanh(+-inf) = +-1, silu(+inf) = +inf, and +-0 kept by tanh and silu; elu(-inf) = -1, +-0 kept.
 //   3. **GELU_ERF bit-identity**: the two runs' outputs compared byte for byte (whichever runs second).
 //
 // Rows of 1, 7, 8, 9 and 1003 floats cover the eight-float blocks and the padded tail; TANH and SIGMOID
@@ -46,8 +47,8 @@ bool act_on() {
 #endif
 }
 
-enum Kind { GELU_ERF, SIGMOID, SILU, TANH };
-const char* kNames[] = { "gelu_erf", "sigmoid", "silu", "tanh" };
+enum Kind { GELU_ERF, SIGMOID, SILU, TANH, ELU };
+const char* kNames[] = { "gelu_erf", "sigmoid", "silu", "tanh", "elu" };
 
 double ref(Kind k, double x) {
     switch (k) {
@@ -55,6 +56,7 @@ double ref(Kind k, double x) {
         case SIGMOID:  return 1.0 / (1.0 + std::exp(-x));
         case SILU:     return x / (1.0 + std::exp(-x));
         case TANH:     return std::tanh(x);
+        case ELU:      return x > 0 ? x : std::expm1(x);
     }
     return 0;
 }
@@ -65,6 +67,7 @@ ggml_tensor* node(ggml_context* ctx, Kind k, ggml_tensor* a, bool inplace) {
         case SIGMOID:  return inplace ? ggml_sigmoid_inplace(ctx, a) : ggml_sigmoid(ctx, a);
         case SILU:     return ggml_silu(ctx, a);
         case TANH:     return inplace ? ggml_tanh_inplace(ctx, a) : ggml_tanh(ctx, a);
+        case ELU:      return inplace ? ggml_elu_inplace(ctx, a) : ggml_elu(ctx, a);
     }
     return nullptr;
 }
@@ -137,7 +140,7 @@ int main() {
     const bool on = act_on();
     std::printf("GGML_CPU_ARMV6_ACT path %s\n", on ? "ON" : "off (stock ggml)");
     std::vector<float> gelu_all;
-    for (Kind k : { GELU_ERF, SIGMOID, SILU, TANH }) {
+    for (Kind k : { GELU_ERF, SIGMOID, SILU, TANH, ELU }) {
         double w = 0;
         for (int64_t n : { 1, 7, 8, 9, 1003 }) {
             for (bool inplace : { false, true }) {
@@ -148,7 +151,8 @@ int main() {
                 if (k == GELU_ERF) gelu_all.insert(gelu_all.end(), out.begin(), out.end());
             }
         }
-        // stock: tanhf 1.52 ULP, sigmoid/silu 1.7 / 1.4; the kernels 0.75, 1.7, 1.4 (on these inputs)
+        // stock: tanhf 1.52 ULP, sigmoid/silu 1.7 / 1.4; the kernels 0.75, 1.7, 1.4 (on these inputs).
+        // ELU (ggml-0052): glibc's expm1f against the kernel's own exp minus one where |x| > ~0.35.
         const double bound = k == GELU_ERF ? 2.7e-7 : k == TANH ? 2.0 : 3.0;
         std::printf("  %-9s worst %.3g %s (bound %.3g)\n", kNames[k], w, k == GELU_ERF ? "of max(|x|,1)" : "ULP", bound);
         LOOM_CHECK(w <= bound);
@@ -156,7 +160,7 @@ int main() {
 
     // special values, as the stock code produces them
     const float inf = INFINITY, nan = NAN;
-    for (Kind k : { GELU_ERF, SIGMOID, SILU, TANH }) LOOM_CHECK(std::isnan(one(k, nan)));
+    for (Kind k : { GELU_ERF, SIGMOID, SILU, TANH, ELU }) LOOM_CHECK(std::isnan(one(k, nan)));
     LOOM_CHECK(one(SIGMOID, inf) == 1.0f);
     LOOM_CHECK(one(SIGMOID, -inf) == 0.0f);
     LOOM_CHECK(one(TANH, inf) == 1.0f);
@@ -166,6 +170,13 @@ int main() {
     LOOM_CHECK(std::signbit(one(TANH, -0.0f)));
     LOOM_CHECK(one(SILU, 0.0f) == 0.0f);
     LOOM_CHECK(one(GELU_ERF, inf) == inf);
+    LOOM_CHECK(one(ELU, inf) == inf);
+    LOOM_CHECK(one(ELU, -inf) == -1.0f);
+    LOOM_CHECK(one(ELU, -100.0f) == -1.0f);
+    LOOM_CHECK(one(ELU, 0.0f) == 0.0f && !std::signbit(one(ELU, 0.0f)));
+    LOOM_CHECK(one(ELU, -0.0f) == 0.0f && std::signbit(one(ELU, -0.0f)));
+    LOOM_CHECK(one(ELU, -1e-30f) == -1e-30f);   // expm1 rounds to x below 2^-24
+    LOOM_CHECK(one(ELU, 3.5f) == 3.5f);
 
     // GELU_ERF byte for byte against the other registration
     if (const char* dir = std::getenv("LOOM_TEST_TMPDIR")) {

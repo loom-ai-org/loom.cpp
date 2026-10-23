@@ -1,0 +1,69 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index e0bd6eb4..dd1dba29 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -2157,6 +2157,31 @@ static void ggml_compute_forward_concat_f32(
+     int64_t o[4] = {0, 0, 0, 0};
+     o[dim] = src0->ne[dim];
+ 
++    // loom ggml-0050: A ROW AT A TIME when both sources' rows are contiguous floats, as dst's are. The loop
++    // below forms 64-bit addresses per ELEMENT, ~100 ns each on an ARM1176: the RoPE pair swaps of
++    // Pocket-TTS's Mimi decoder (8 x 123k elements, 0.1 s on a Pi Zero W) and the joins of loom's
++    // windowed attention (loom P4.41). The same copies, by memcpy.
++    if (nb00 == sizeof(float) && nb10 == sizeof(float) && nb0 == sizeof(float)) {
++        for (int64_t i3 = 0; i3 < ne3; i3++) {
++            for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
++                for (int64_t i1 = 0; i1 < ne1; i1++) {
++                    char * y = (char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3;
++                    if (dim == 0) {
++                        memcpy(y, (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03, ne00*sizeof(float));
++                        memcpy(y + ne00*sizeof(float), (const char *) src1->data + i1*nb11 + i2*nb12 + i3*nb13,
++                               ne10*sizeof(float));
++                    } else if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
++                        memcpy(y, (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03, ne0*sizeof(float));
++                    } else {
++                        memcpy(y, (const char *) src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13,
++                               ne0*sizeof(float));
++                    }
++                }
++            }
++        }
++        return;
++    }
++
+     const float * x;
+ 
+     // TODO: smarter multi-theading
+@@ -10967,7 +10992,31 @@ static void ggml_compute_forward_pad_f32(
+     const int32_t lp3 = ggml_get_op_params_i32(dst, 6);
+     const int32_t rp3 = ggml_get_op_params_i32(dst, 7);
+ 
+-    // TODO: optimize
++    // loom ggml-0050: A ROW AT A TIME, the non-circular case over rows of contiguous floats. The loop
++    // below forms two 64-bit index sums and four range tests per ELEMENT, which on a Pi Zero W's ARM1176
++    // came to ~180 ns an element (2 x 2.8M-element causal pads before Mimi's SEANet convs: 1.0 s of a
++    // 19 s Pocket-TTS synthesis, loom P4.41). Here a row is a zero head, one memcpy and a zero tail --
++    // the same values (+0.0 is all-zero bits), every row split across threads as the loop below splits it.
++    if constexpr (!circular_t) {
++        if (nb00 == sizeof(float)) {
++            for (int64_t i3 = 0; i3 < ne3; ++i3) {
++                for (int64_t i2 = 0; i2 < ne2; ++i2) {
++                    for (int64_t i1 = ith; i1 < ne1; i1 += nth) {
++                        float * row = dst_ptr + i3*(ne0*ne1*ne2) + i2*(ne0*ne1) + i1*ne0;
++                        if (i1 < lp1 || i1 >= ne1 - rp1 || i2 < lp2 || i2 >= ne2 - rp2 || i3 < lp3 || i3 >= ne3 - rp3) {
++                            memset(row, 0, ne0*sizeof(float));
++                            continue;
++                        }
++                        const char * src = (const char *) src0->data + (i3 - lp3)*nb03 + (i2 - lp2)*nb02 + (i1 - lp1)*nb01;
++                        memset(row, 0, lp0*sizeof(float));
++                        memcpy(row + lp0, src, (ne0 - lp0 - rp0)*sizeof(float));
++                        memset(row + ne0 - rp0, 0, rp0*sizeof(float));
++                    }
++                }
++            }
++            return;
++        }
++    }
+ 
+     for (int64_t i2 = 0; i2 < ne2; ++i2) {
+         for (int64_t i1 = ith; i1 < ne1; i1 += nth) {
