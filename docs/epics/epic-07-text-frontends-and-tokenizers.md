@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: text-frontend
-last_updated: 2026-10-10
+last_updated: 2026-10-23
 ---
 
 # Epic-07: Text Front-Ends and Tokenizers
@@ -83,7 +83,12 @@ chunk (a word count of its text), and the driver splits on the headers
 ([ADR-044](../adrs/adr-044-a-front-end-that-chunks-returns-its-chunks-in-the-ids.md)). The rules are
 data, as ADR-041 requires, including Python's `isdigit` set, and the result is **7000/7000** ids
 identical to the reference over eight input classes, and 8000/8000 with the headers. `is_python_space` moved to `unicode.h` so the two
-front ends share it.
+front ends share it. v4 of the reference (2026-10) added two rules, which ship as optional keys
+([ADR-084](../adrs/adr-084-pocket-ttss-small-models-ship-their-own-head-and-v4s-text-rules-as-data.md)).
+The first is a config's `replace_characters`: rewrite characters at once, collapse whitespace, and drop
+a clause mark right after a sentence mark; the two mark classes are probed off the reference. The
+second is a decimal-period rule that decodes only the ids next to the cut. A file without the keys
+behaves as before.
 
 `cosyvoice3_vocab.cpp` (`tokenizer.ggml.model == "cosyvoice3"`, family 9's seventh leaf) is the third.
 It wraps a byte-level `BpeVocab` (`BpeVocab::load_bpe`) inside the reference's `text_normalize`, the

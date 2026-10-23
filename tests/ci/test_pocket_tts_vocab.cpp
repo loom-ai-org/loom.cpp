@@ -98,6 +98,9 @@ int main() {
     LOOM_CHECK((vocab->chunks("hi 1.2 the. the") == Strings{"Hi 1.2 the.", "the."}));
     LOOM_CHECK((vocab->encode("hi 1.2 the. the") ==
                 Ids{kShort, kHi, k1, kDot, k2, kthe, kDot, kShort, kThe, kDot}));
+    // Rule 1 (no `decimal_period_rule` key: every file written before v4) decodes the WHOLE suffix, whose
+    // leading space SentencePiece drops, so "1. 2" reads as a decimal and the sentence stays whole.
+    LOOM_CHECK((vocab->chunks("hi 1. 2 the") == Strings{"Hi 1. 2 the."}));
     // ...and a digit on one side only is: "1." then "the" cuts.
     LOOM_CHECK((vocab->encode("hi 1. the") == Ids{kShort, kHi, k1, kDot, kShort, kThe, kDot}));
     // An over-budget sentence WITH commas is cut on them; each part's trailing comma becomes the
@@ -137,6 +140,41 @@ int main() {
             refused = true;
         }
         LOOM_CHECK(refused);
+    }
+
+    // --- v4 of the reference: `replace_characters`, and decimal-period rule 2 ---
+    // The same table with v4's keys (`make_pocket_tts_vocab_gguf.py --v4`): curly apostrophe -> "'",
+    // en/em dash -> ",", the straight double quote deleted. The step runs before everything above.
+    {
+        const std::string v4_path = std::string(LOOM_TEST_FIXTURE_DIR) + "/pocket_tts_vocab_v4_test.gguf";
+        auto v4_model = loom::GgufModel::load(v4_path, backend.get());
+        auto v4 = loom::PocketTtsVocab::load(*v4_model);
+        LOOM_CHECK(v4 != nullptr);
+        LOOM_CHECK(v4->prepare("hi\xe2\x80\x99 the") == "Hi' the.");
+        // Rewritten at once (`str.translate`), then whitespace runs collapsed: the old one-pass
+        // "  " -> " " never sees a pair.
+        LOOM_CHECK(v4->prepare("hi\xe2\x80\x94the") == "Hi,the.");
+        LOOM_CHECK(v4->prepare("A \t\n  b") == "A b.");
+        // A clause mark directly after a sentence mark is dropped, with the whitespace between them:
+        // the deleted quotes of '"Hi!", the' must not read as a sentence end and a stray comma.
+        LOOM_CHECK(v4->prepare("\"hi!\", the") == "Hi! the.");
+        LOOM_CHECK(v4->prepare("hi! ; the") == "Hi! the.");
+        // ...only directly after one: a clause mark after a word stays, and the scan resumes after a
+        // dropped mark, so "!." keeps both sentence marks.
+        LOOM_CHECK(v4->prepare("hi \xe2\x80\x93 the") == "Hi , the.");
+        LOOM_CHECK(v4->prepare("hi!., the") == "Hi!. the.");
+        // Words are counted after the rewrite: "hi — the" is three.
+        size_t v4_words = 0;
+        v4->prepare("hi \xe2\x80\x94 the", &v4_words);
+        LOOM_CHECK(v4_words == 3);
+        // A text that the table empties is empty, and raises as the reference does.
+        LOOM_CHECK(throws_on(*v4, "\"\""));
+        // Rule 2 decodes the period WITH the next id, and the space survives: "1. 2" is a sentence end.
+        LOOM_CHECK((v4->chunks("hi 1. 2 the") == Strings{"Hi 1.", "2 the."}));
+        // A real decimal still holds together.
+        LOOM_CHECK((v4->chunks("hi 1.2 the. the") == Strings{"Hi 1.2 the.", "the."}));
+        // The first file has none of this: the deleted quote is just a character there.
+        LOOM_CHECK(vocab->prepare("\"hi!\", the") == "\"hi!\", the.");
     }
 
     LOOM_TEST_REPORT_AND_RETURN();

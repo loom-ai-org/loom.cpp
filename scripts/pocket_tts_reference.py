@@ -35,7 +35,9 @@ chosen (the lesson of `chatterbox_reference.py`'s NSF phase).
 Requires the kyutai-labs/pocket-tts checkout (`--src`), which is not a dependency of this repo.
 """
 import argparse
+import inspect
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -183,7 +185,9 @@ def run(tts, voice: Path, text: str, unit_noise: torch.Tensor, dtype: torch.dtyp
 
 def one_shot_decode(tts, latents: torch.Tensor) -> torch.Tensor:
     """Every latent through Mimi in ONE call from a fresh state -- what the export's `mimi_decoder`
-    computes -- against which the reference's streamed chunks are checked."""
+    computes -- against which the reference's streamed chunks are checked. v4's decoder worker fades
+    the first 5 ms of each chunk in (a fresh decoder state clicks); the export's driver does the same,
+    so the one-shot arm does too, with the reference's own ramp."""
     from pocket_tts.modules.stateful_module import init_states
 
     n = latents.shape[0]
@@ -191,14 +195,20 @@ def one_shot_decode(tts, latents: torch.Tensor) -> torch.Tensor:
     state = init_states(tts.mimi, batch_size=1, sequence_length=n * steps)
     x = latents[None].to(tts.flow_lm.emb_std.dtype) * tts.flow_lm.emb_std + tts.flow_lm.emb_mean
     with torch.no_grad():
-        return tts.mimi.decode_from_latent(x, state)[0, 0]
+        wave = tts.mimi.decode_from_latent(x, state)[0, 0]
+    if "fade_in" in inspect.getsource(type(tts)._decode_audio_worker):
+        fade = torch.linspace(0, 1, tts.config.mimi.sample_rate // 200)
+        n = min(fade.numel(), wave.shape[-1])
+        wave[:n] *= fade[:n].to(wave)
+    return wave
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True,
                     help="a pocket-tts language directory (model.safetensors, tokenizer.model, embeddings/)")
-    ap.add_argument("--src", default="/home/flavio/Dev/pocket-tts")
+    # v4.0.1 or later for the small English models (`english_{18m,7m,2m}_refl_2026-10`).
+    ap.add_argument("--src", default=os.environ.get("LOOM_POCKET_TTS_REPO", "/home/flavio/Dev/pocket-tts"))
     ap.add_argument("--out", required=True)
     ap.add_argument("--voice", default="alba")
     ap.add_argument("--text", default=None, help="default: the reference's own default English text")
@@ -217,14 +227,16 @@ def main() -> None:
     tts = TTSModel.load_model(config=str(local_config(src, model_dir)))
     tokenizer = tts.flow_lm.conditioner.tokenizer
     text = args.text or get_default_text_for_language("english")
+    # v4 adds the config's `replace_characters` to the text path; before v4 neither function takes it.
+    extra = (tts.replace_characters,) if hasattr(tts, "replace_characters") else ()
     chunks = split_into_best_sentences(tokenizer, text, MAX_TOKEN_PER_CHUNK,
                                        tts.pad_with_spaces_for_short_inputs, tts.remove_semicolons,
-                                       tts.append_terminal_punctuation, tts.capitalize_first_letter)
+                                       tts.append_terminal_punctuation, tts.capitalize_first_letter, *extra)
     if len(chunks) != 1:
         raise SystemExit(f"the oracle covers one chunk; {text!r} splits into {len(chunks)}")
     prepared, frames_after_eos_guess = prepare_text_prompt(
         chunks[0], tts.pad_with_spaces_for_short_inputs, tts.remove_semicolons,
-        tts.append_terminal_punctuation, tts.capitalize_first_letter)
+        tts.append_terminal_punctuation, tts.capitalize_first_letter, *extra)
     tokens = tokenizer.encode(prepared)
     max_gen_len = tts._estimate_max_gen_len(len(tokens))
 
@@ -278,9 +290,15 @@ def main() -> None:
             "latents_max_abs_diff": float((latents64[:n].float() - latents[:n]).abs().max()),
             "wave_max_abs_diff": (float((wave64.float() - wave).abs().max())
                                   if wave64.shape == wave.shape else None),
+            # What the gate's free-running arm bounds its own drift by (3x, floor 1e-3): the reference's
+            # f32 loop against its f64 one, from the same draws.
+            "wave_rmse": (float((wave64.float() - wave).pow(2).mean().sqrt())
+                          if wave64.shape == wave.shape else None),
         }
         print(json.dumps(meta["f64"], indent=1))
-    (out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    # UTF-8, not `\uXXXX`: the gate test reads `text` literally (a dash or a curly quote is exactly what
+    # v4's `replace_characters` acts on, so the fixture must carry it as itself).
+    (out / "meta.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

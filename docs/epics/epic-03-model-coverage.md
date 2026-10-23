@@ -2,7 +2,7 @@
 type: epic
 status: active
 domain: model-coverage
-last_updated: 2026-10-11
+last_updated: 2026-10-23
 ---
 
 # Epic-03: Model Coverage
@@ -1031,6 +1031,17 @@ and `loom_cli --voice`. Through a file, `marius` is 8.0e-06 from the reference t
 carries its recording's licence, and two are non-commercial. **Not in this export:** cloning a voice
 from audio (the Mimi encoder, which the released voice-cloning weights carry and the other release
 zeroes).
+
+**The small English models (2026-10-23, BUILT, not published).** `english_{18m,7m,2m}_refl_2026-10`, Kyutai's
+distilled and reward fine-tuned releases, export through the same five phases at **77 / 29 / 8.5 MB**
+F32. That is the first Pocket-TTS that fits a Pi Zero at F32. What v4 of the reference changed (a one-step flow
+head with no time condition, grouped-query attention, a low-rank text table, `z_proj`, a smaller Mimi
+decoder, an EOS threshold of -1, and the text rules `replace_characters` and the decimal period) is
+handled as [ADR-084](../adrs/adr-084-pocket-ttss-small-models-ship-their-own-head-and-v4s-text-rules-as-data.md)
+records. Teacher-forced, all three are within 6.3e-05 of the reference (same EOS frame
+free-running). Each has 27 voice files, and the tokenizer differential matches v4 on 3000-9000 texts
+per model. Whisper hears loom and the reference alike (18m 93-95/96 words, 7m 86-92, 2m 89-90; the
+two sides draw different noise).
 
 ### Family 9's sixth leaf: a latent loop whose step is a guided solve
 
