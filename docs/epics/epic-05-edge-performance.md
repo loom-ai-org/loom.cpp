@@ -1476,6 +1476,32 @@ A one-thread loom profile next to the four-thread one gives each piece's scaling
   **1.03x** onnxruntime FP32 (0.98x at rc18), Citrinet 0.61x (0.57x), Moonshine 1.13x and whisper 0.99x
   (unresolved). At Q8_0_PC against onnxruntime int8, whisper is 1.15x and VITS 3.90x.
 
+### P4.40: VITS's vocoder convolutions on the Raspberry Pi 4 (2026-10-23)
+
+After P4.39 the vocoder's resblocks were the largest share of a VITS synthesis on the board (~37%): eighteen
+convolutions, 32-128 channels over 2 288-73 216 positions, run by the direct 1-D kernel (`ggml-0006`/`0007`) at
+14-24 GFLOP/s against the four cores' 57. `scripts/bench67.cpp` raced variants of that kernel at those shapes,
+every arm byte-identical to it, and found three separate losses. The weights were packed `[ic][kx][oc]`, one
+new L2 line per (channel, tap) for a 4-channel tile: packed per tile, 1.29x. The 4 x 16 tile does five loads
+per 16 FMAs: 8 x 12, 1.40x. And the zero-padded copy of the whole activation goes out to DRAM and back (9.4 MB
+at 32 x 73 216): staging each thread's positions in ~16 KB slices instead, 1.91x over the eighteen shapes.
+That is `ggml-0053`
+([ADR-086](../adrs/adr-086-the-direct-convolution-stages-its-activation-per-thread.md)), on AArch64 cores
+without DOTPROD. It keeps the kernel's summation order, so outputs are byte-identical, and it handles an output
+written over its input by saving each thread's halos before the barrier.
+
+| card (Pi 4, 4 threads, `GGML_CPU_CONV1D_STAGED` 0/1, 5 paired launches) | ratio (p10-p90) | |
+|---|---|---|
+| VITS F32 | **1.301x** (1.269-1.312) | 1.041 → 0.799 s (RTF 0.24), audio identical |
+| VITS Q8_0_PC | **1.284x** (1.256-1.295) | 1.051 → 0.823 s |
+| Citrinet-256-ls F32 | **1.070x** (1.065-1.074) | same transcript |
+| Pocket TTS F32 / 2m / 7m | **1.034x** / **1.065x** / **1.040x** | SEANet's convolutions; same checksums |
+| Moonshine tiny F32, control | 1.002x (0.991-1.004) | no direct convolution |
+
+The first build of it was **0.893x**: in `ops.cpp` the tile stayed out of line and GCC stored its accumulator
+array to the stack on every tap, where the bench had inlined it
+([Retro-093](../retros/retro-093-the-bench-inlined-the-tile-the-library-did-not.md)). Named accumulators fixed it.
+
 ### P4.41: Pocket-TTS's Mimi decoder on the Pi Zero (2026-10-23)
 
 Asked whether the distilled Pocket-TTS 2m could reach RTF 1.0 on a Pi Zero W. It ran **18.5 s for 4.8 s of
