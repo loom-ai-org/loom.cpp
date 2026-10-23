@@ -1930,6 +1930,41 @@ paired launches, p10 1.538, p90 1.554, same transcript); Qwen3-0.6B 1.190x (24 t
 tokens); Moonshine tiny 1.191x (p10 1.185, p90 1.197; this path transcribed jfk exactly, ggml's Q8_0 path read
 "as" for "ask"); Citrinet-256 1.003x (its pointwise convolutions are not served here, only 0.4 MB of weights).
 
+## PR 44 — `cpu`: an outer-product F32 GEMM for AArch64 cores without DOTPROD, under an L2-blocked schedule
+
+*(`cmake/patches/ggml-0048-neon-f32-outer-product-gemm.patch`)*
+
+**Problem.** On a Cortex-A72 (Raspberry Pi 4) tinyBLAS's F32 GEMM runs whisper-small's encoder linears at
+~8.3 GFLOP/s on one core (58% of the FMA roofline) and 15.7-24.2 at four, where onnxruntime's MLAS reaches 30-35
+in the same model. XNNPACK's kernel for this core, `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm` (an outer
+product: no horizontal reduction, 12 loads per 32 FMAs), runs at 10.6 on one core. Its own operator walks 4
+activation rows against all of the weight, though, and at 2.4-9.4 MB of weight that re-reads DRAM for every 4
+rows: 7-10 GF at four threads.
+
+**Change.** In `sgemm.cpp`, for AArch64 when `ggml_cpu_has_dotprod()` is false (`GGML_CPU_NEON_F32_4X8=0` turns
+it off): the 4x8 tile in NEON intrinsics (GCC 14 compiles it to the asm kernel's instruction mix, 98-99% of its
+speed), under a schedule that packs one block of the weight, `nb x kc` with `nb x kc x 4 = L2 / 4` (256 x 256
+on a 1 MB L2), into 8-row k-major panels. The threads pack it together, a barrier follows, and then each walks
+its share of the activation rows against the whole block, 4 rows at a time. The sum is carried through C from
+one block of k to the next. There is no software prefetch: one `prfm` per step at XNNPACK's spacing covered half
+the lines and cost 20%, and two tied with none. It takes F32 x F32 graph `MUL_MAT` nodes with at least 128
+activation rows (`dst->op == GGML_OP_MUL_MAT`; ops.cpp's `ggml_call_mul_mat*` keeps its im2col patches in the
+work buffer the pack uses). `ggml_graph_plan` reserves the block for every F32 x F32 `MUL_MAT`.
+
+**Numerics.** Each output is one sequential fused sum over k: bit-exact to a scalar `fmaf` loop and the same at
+every thread count (loom's `test_mul_mat_neon_f32_4x8`: edge panels, blocks of rows and of k, ragged k and n, a
+strided weight, a batch through one work buffer, at 1/2/4 threads). It is not tinyBLAS's order: the error
+against a double product is ~2x tinyBLAS's (5.0e-7 vs 2.5e-7 relative at k = 768). The threshold does not
+depend on the thread count, so neither does which sum a product gets.
+
+**Measured** on a Pi 4 at four threads, against tinyBLAS, same process, distinct weights per node: whisper
+`qkv` 768 x 768 x 1500 1.32x (31.9 GF), `fc1` 1.31x (31.7), `fc2` 3072 x 768 x 1500 1.71x (27.0). Across 27
+shapes (whisper, VITS's convolution GEMMs, Moonshine, attention) it wins from 200 activation rows up
+(1.11-1.58x) and loses below 64. End to end (`GGML_CPU_NEON_F32_4X8` off/on, paired launches): whisper-small
+F32 **1.174x** (24.6 -> 20.9 s, same transcript), Moonshine tiny 1.057x, whisper-small Q8_0 1.082x (its attention
+products are F32 x F32). Citrinet, VITS (byte-identical audio)
+and Qwen3-0.6B are unmoved: their products are convolutions or under 128 rows.
+
 ## Not a PR here, but upstream should know: `ggml_get_n_tasks` no longer decides what it looks like it decides
 
 **No patch in this directory depends on this.** It was found by loom P4.25, which built a patch on the
