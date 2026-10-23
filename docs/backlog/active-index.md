@@ -368,7 +368,7 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   Sequential-sum numerics, bit-exact to an `fmaf` loop (`test_mul_mat_neon_f32_4x8`). Unmeasured on A53/A57/A73.
   *Context: [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md),
   [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
-* [ ] **P4.39: BUILT 2026-10-23 on `perf/p439-conv-f32-tile` (stacked on #91), uncommitted; open: commit + PR.**
+* [ ] **P4.39: BUILT 2026-10-23, PR #92 (stacked on #91); open: merge.**
   `ggml-0049`: the convolutions' im2col GEMMs (all three `conv_2d_impl` call sites, and `conv_transpose_1d`) take
   P4.38's path, with its block carved off the end of their own work buffer (`GGML_CPU_NEON_F32_4X8_CONV=0` off).
   Pi 4, 4 threads, off/on: **VITS F32 1.068x**, Q8_0_PC 1.054x; **Citrinet 1.062x** / 1.060x; Moonshine 1.034x;
