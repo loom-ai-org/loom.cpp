@@ -1,0 +1,279 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 5c6b7bca..97a42e34 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -8412,6 +8412,260 @@ static void ggml_conv_1d_direct_run(const ggml_compute_params * params,
+ 
+ 
+ 
++#if defined(__aarch64__)
++// ---------------------------------------------------------------------------------------------
++// loom P4.40 (ggml-0053): the direct convolution again, as an 8 x 12 tile over per-thread STAGED
++// slices of the activation instead of one padded copy of all of it. AArch64 only.
++//
++// After P4.39 a VITS vocoder's resblocks were the largest share of a synthesis on a Raspberry Pi 4
++// (~37%), at 14-24 GFLOP/s against the 57 of four A72s' FMA roofline. Raced against the kernel above
++// at the eighteen resblock shapes of a piper synthesis, same inputs, one process, 4 threads (loom
++// scripts/bench67.cpp), three things were each worth something and together 1.91x (580 -> 309 ms):
++//
++//   * EACH TILE'S WEIGHTS CONTIGUOUS ([OC/8][IC][KW][8]). The [ic][kx][oc] pack above walks the
++//     weights at a stride of OC floats, one new line per (ic, kx), and from 64 channels up those are
++//     L2 lines (114 KB at 64 x 64 x 7): 1.25-1.74x on its own at 64 and 128 channels, ~1.1x at 32.
++//   * EIGHT OUTPUT CHANNELS x 12 POSITIONS. 24 accumulators, five loads per 24 FMAs against five per
++//     16; another 1.05-1.15x. 8 x 8 and 4 x 24 were both slower (2x32 and 4x8 lost long ago,
++//     Retro-012).
++//   * NO PADDED COPY OF THE WHOLE ACTIVATION. At 32 x 73216 that copy is 9.4 MB written and read back
++//     from DRAM per convolution, with nothing to hide behind (P4.15b found the same). Here each thread
++//     copies its own positions a slice at a time into a buffer that stays in L1/L2, applying the
++//     fused LEAKY_RELU on the way as the old copy did: 1.4-1.6x more at 32 channels. The slice is
++//     sized in bytes, about 16 KB of staged activation (a fixed 24 or 36 positions tied with it, 96
++//     was 1.07x slower and 504 1.25x).
++//
++// End to end on the Pi 4, four threads, off/on over 5 paired launches: VITS (piper) F32 1.30x (1.041 ->
++// 0.799 s) and its Q8_0 1.28x, Citrinet-256 1.07x, Pocket-TTS 1.03-1.07x.
++//
++// Every output is summed in the same order as the kernel above (bias, then input channel, then tap),
++// so the result is bit-identical to it and to the phase-major path.
++//
++// WHERE. By default only on a core without DOTPROD (the A53/A57/A72/A73 generation), the same rule as
++// ggml-0048/0049 and for the same reason: the A72 is what was measured, and an M1, whose 128 KB L1 and
++// 12 MB L2 change both of the cache arguments above, was not. GGML_CPU_CONV1D_STAGED=0 turns it off
++// everywhere, =1 on everywhere.
++#define GGML_CONV1D_S_OCB 8
++#define GGML_CONV1D_S_NV  3
++#define GGML_CONV1D_S_P   (4 * GGML_CONV1D_S_NV)
++
++// One 8 x 12 tile, [oc0, oc0+8) x [p0, p0+12), reading the staged slice `xs` (row stride LS) from
++// `xoff` and the tile's packed weights `w`. RES and CLAMP as in ggml_conv_1d_direct_tile_impl.
++//
++// THE 24 ACCUMULATORS ARE NAMED VARIABLES, NOT AN ARRAY, FOR A MEASURED REASON. Written as
++// `float32x4_t acc[8][3]` this tile kept all 24 in registers in loom scripts/bench67.cpp, where it is
++// inlined into its caller, and in this file -- where GCC 14 keeps it out of line -- stored all 24 to the
++// stack on every tap (`stp q, q, [sp]` twelve times per 24 FMAs): the whole VITS synthesis went 1.035 ->
++// 1.159 s on a Cortex-A72 instead of faster. Named, there is no aggregate for scalar replacement to give
++// up on, whichever way the inliner decides.
++#define GGML_S_ACC(i) float32x4_t a##i##0 = vdupq_n_f32(bias ? bias[oc0 + i] : 0.0f), a##i##1 = a##i##0, a##i##2 = a##i##0
++#define GGML_S_FMA(i, wv, l) \
++    a##i##0 = vfmaq_laneq_f32(a##i##0, x0, wv, l); \
++    a##i##1 = vfmaq_laneq_f32(a##i##1, x1, wv, l); \
++    a##i##2 = vfmaq_laneq_f32(a##i##2, x2, wv, l)
++#define GGML_S_ROW(i) { a##i##0, a##i##1, a##i##2 }
++template <bool RES, bool CLAMP>
++static inline void ggml_conv_1d_staged_tile(const float * xs, int64_t LS, int64_t xoff, const float * w,
++                                            const float * bias, float * y, const float * res,
++                                            int64_t IC, int64_t KW, int64_t OL, int64_t dil,
++                                            int64_t oc0, int64_t p0, int64_t pmin) {
++    GGML_S_ACC(0); GGML_S_ACC(1); GGML_S_ACC(2); GGML_S_ACC(3);
++    GGML_S_ACC(4); GGML_S_ACC(5); GGML_S_ACC(6); GGML_S_ACC(7);
++    for (int64_t ic = 0; ic < IC; ++ic) {
++        const float * q  = xs + ic * LS + xoff;
++        const float * wr = w + ic * KW * GGML_CONV1D_S_OCB;
++        for (int64_t kx = 0; kx < KW; ++kx, q += dil, wr += GGML_CONV1D_S_OCB) {
++            const float32x4_t x0 = vld1q_f32(q), x1 = vld1q_f32(q + 4), x2 = vld1q_f32(q + 8);
++            const float32x4_t w0 = vld1q_f32(wr), w1 = vld1q_f32(wr + 4);
++            GGML_S_FMA(0, w0, 0); GGML_S_FMA(1, w0, 1); GGML_S_FMA(2, w0, 2); GGML_S_FMA(3, w0, 3);
++            GGML_S_FMA(4, w1, 0); GGML_S_FMA(5, w1, 1); GGML_S_FMA(6, w1, 2); GGML_S_FMA(7, w1, 3);
++        }
++    }
++    // Outside the reduction, so an array here costs nothing the loop above was avoiding.
++    const float32x4_t acc[GGML_CONV1D_S_OCB][GGML_CONV1D_S_NV] = {
++        GGML_S_ROW(0), GGML_S_ROW(1), GGML_S_ROW(2), GGML_S_ROW(3),
++        GGML_S_ROW(4), GGML_S_ROW(5), GGML_S_ROW(6), GGML_S_ROW(7) };
++    if (CLAMP) {
++        float t[GGML_CONV1D_S_OCB][GGML_CONV1D_S_P];
++        for (int i = 0; i < GGML_CONV1D_S_OCB; ++i)
++            for (int j = 0; j < GGML_CONV1D_S_NV; ++j) vst1q_f32(&t[i][j * 4], acc[i][j]);
++        for (int i = 0; i < GGML_CONV1D_S_OCB; ++i) {
++            const int64_t off = (oc0 + i) * OL + p0;
++            for (int64_t k = pmin - p0; k < GGML_CONV1D_S_P; ++k)
++                y[off + k] = t[i][k] + (RES ? res[off + k] : 0.0f);
++        }
++    } else if (RES) {
++        for (int i = 0; i < GGML_CONV1D_S_OCB; ++i)
++            for (int j = 0; j < GGML_CONV1D_S_NV; ++j) {
++                const int64_t off = (oc0 + i) * OL + p0 + j * 4;
++                vst1q_f32(y + off, vaddq_f32(acc[i][j], vld1q_f32(res + off)));
++            }
++    } else {
++        for (int i = 0; i < GGML_CONV1D_S_OCB; ++i)
++            for (int j = 0; j < GGML_CONV1D_S_NV; ++j)
++                vst1q_f32(y + (oc0 + i) * OL + p0 + j * 4, acc[i][j]);
++    }
++    (void) res; (void) pmin;
++}
++#undef GGML_S_ACC
++#undef GGML_S_FMA
++#undef GGML_S_ROW
++
++static inline void ggml_conv_1d_staged_tile_any(const float * xs, int64_t LS, int64_t xoff, const float * w,
++                                                const float * bias, float * y, const float * res,
++                                                int64_t IC, int64_t KW, int64_t OL, int64_t dil,
++                                                int64_t oc0, int64_t p0, int64_t pmin) {
++    const bool clamp = pmin > p0;
++    if (res) {
++        if (clamp) ggml_conv_1d_staged_tile<true,  true >(xs, LS, xoff, w, bias, y, res, IC, KW, OL, dil, oc0, p0, pmin);
++        else       ggml_conv_1d_staged_tile<true,  false>(xs, LS, xoff, w, bias, y, res, IC, KW, OL, dil, oc0, p0, pmin);
++    } else {
++        if (clamp) ggml_conv_1d_staged_tile<false, true >(xs, LS, xoff, w, bias, y, res, IC, KW, OL, dil, oc0, p0, pmin);
++        else       ggml_conv_1d_staged_tile<false, false>(xs, LS, xoff, w, bias, y, res, IC, KW, OL, dil, oc0, p0, pmin);
++    }
++}
++
++// Input positions [a, b) of one channel, as the convolution reads them: zero outside [0, L), through
++// the fused LEAKY_RELU when there is one. When the output is being written over the input, positions
++// below S and from E up belong to other threads, which may already have overwritten them; those come
++// from `hl` (positions [hl0, S)) and `hr` (positions [E, ...)), the copies this thread saved before
++// the barrier. Both null otherwise.
++static void ggml_conv1d_stage(float * d, const float * xr, int64_t L, int64_t a, int64_t b,
++                              const float * leaky, const float * hl, int64_t hl0,
++                              const float * hr, int64_t S, int64_t E) {
++    int64_t p = a;
++    if (p < 0) {
++        const int64_t q = MIN(b, 0);
++        memset(d, 0, (size_t) (q - p) * sizeof(float));
++        d += q - p; p = q;
++    }
++    while (p < b && p < L) {
++        int64_t q;
++        if (hl && p < S) {
++            q = MIN(MIN(b, L), S);
++            memcpy(d, hl + (p - hl0), (size_t) (q - p) * sizeof(float));
++        } else if (hr && p >= E) {
++            q = MIN(b, L);
++            memcpy(d, hr + (p - E), (size_t) (q - p) * sizeof(float));
++        } else {
++            q = MIN(b, L);
++            if (hr) q = MIN(q, E);
++            if (leaky) ggml_conv1d_leaky_copy(d, xr + p, q - p, *leaky);
++            else       memcpy(d, xr + p, (size_t) (q - p) * sizeof(float));
++        }
++        d += q - p; p = q;
++    }
++    if (p < b) memset(d, 0, (size_t) (b - p) * sizeof(float));
++}
++
++// Returns false, before any thread has written anything and identically on every thread, when this
++// convolution is not one it takes; the caller then runs the paths above.
++static bool ggml_conv_1d_staged_run(const ggml_compute_params * params,
++                                    const ggml_tensor * kernel, const ggml_tensor * src,
++                                    ggml_tensor * dst, const float * bias_data, float * out_data,
++                                    const float * src_data, const float * leaky, const float * res) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_CPU_CONV1D_STAGED");
++        on = (e && e[0]) ? (e[0] != '0') : !ggml_cpu_has_dotprod();
++    }
++    if (!on) return false;
++
++    const int64_t IC  = src->ne[2];
++    const int64_t OC  = dst->ne[2];
++    const int64_t KW  = kernel->ne[0];
++    const int64_t L   = src->ne[0];
++    const int64_t OL  = dst->ne[0];
++    const int64_t dil = ggml_get_op_params_i32(dst, 4);
++    const int64_t padL = ggml_get_op_params_i32(dst, 2);
++    const int64_t H   = (KW - 1) * dil;
++    const int64_t padR = H - padL;          // input positions [p - padL, p + padR] make output p
++    const int64_t P   = GGML_CONV1D_S_P;
++    if (OC % GGML_CONV1D_S_OCB != 0 || OL < P || padR < 0) return false;
++
++    const float * x = src_data;
++    const float * w = (const float *) kernel->data;
++    float *       y = out_data ? out_data : (float *) dst->data;
++
++    // WRITING THE OUTPUT OVER THE INPUT, which the fusion makes the common case (the residual ADD's
++    // result takes the block its input vacated). The padded copy above made that safe by copying
++    // everything before anyone wrote; here only the halos cross threads, so those are saved first.
++    // That needs output position p to be input position p, and nothing but an exact overlap.
++    const bool overlap = (const char *) y < (const char *) (x + IC * L) && (const char *) x < (const char *) (y + OC * OL);
++    if (overlap && ((const float *) y != x || OL != L || IC != OC)) return false;
++
++    const int64_t cb = MAX((int64_t) 1, ((int64_t) 16384 / (int64_t) (sizeof(float) * IC) - H) / P);
++    const int64_t LS = cb * P + P + H;      // a slice's row: its positions (with the tail) and the halo
++    const size_t per_thread = (size_t) IC * LS + (size_t) IC * H;
++    const size_t need = ((size_t) IC * KW * OC + (size_t) params->nth * per_thread) * sizeof(float);
++    if (need > params->wsize) return false;
++
++    const int ith = params->ith, nth = params->nth;
++    float * wp  = (float *) params->wdata;                       // [OC/8][IC][KW][8]
++    float * buf = wp + (size_t) IC * KW * OC + (size_t) ith * per_thread;
++    float * hl  = buf + (size_t) IC * LS;                        // [IC][padL]
++    float * hr  = hl + (size_t) IC * padL;                       // [IC][padR]
++
++    for (int64_t t = ith; t < OC / GGML_CONV1D_S_OCB; t += nth)
++        for (int64_t ic = 0; ic < IC; ++ic)
++            for (int64_t kx = 0; kx < KW; ++kx)
++                for (int i = 0; i < GGML_CONV1D_S_OCB; ++i)
++                    wp[((t * IC + ic) * KW + kx) * GGML_CONV1D_S_OCB + i] =
++                        w[(t * GGML_CONV1D_S_OCB + i) * (IC * KW) + ic * KW + kx];
++
++    // Contiguous position ranges, one per thread, as in ggml_conv_1d_direct_run; the thread that ends
++    // at the last full block also takes the tail, as one more overlapping tile.
++    const int64_t nblk = OL / P;
++    const int64_t per  = (nblk + nth - 1) / nth;
++    const int64_t b0   = MIN(ith * per, nblk);
++    const int64_t b1   = MIN(b0 + per, nblk);
++    const bool    tail = nblk * P < OL;
++    const int64_t S    = b0 * P;
++    const int64_t E    = (tail && b1 == nblk) ? OL : b1 * P;
++    if (overlap && b0 < b1) {
++        for (int64_t ic = 0; ic < IC; ++ic) {
++            ggml_conv1d_stage(hl + ic * padL, x + ic * L, L, S - padL, S, leaky, NULL, 0, NULL, 0, 0);
++            ggml_conv1d_stage(hr + ic * padR, x + ic * L, L, E, E + padR, leaky, NULL, 0, NULL, 0, 0);
++        }
++    }
++
++    ggml_barrier(params->threadpool);
++
++    int64_t ps0 = 0;
++    for (int64_t c0 = b0; c0 < b1; c0 += cb) {
++        const int64_t c1   = MIN(c0 + cb, b1);
++        const bool    last = tail && c1 == nblk;
++        const int64_t s0   = c0 * P, s1 = last ? OL : c1 * P;
++        // The slice holds input positions [s0 - padL, s1 + padR). After the first, its first H come
++        // from the slice before -- which is not only cheaper than staging them again, it is the only
++        // copy left when the output is written over the input: this thread has just stored [ps0, s0).
++        for (int64_t ic = 0; ic < IC; ++ic) {
++            float * row = buf + ic * LS;
++            const float * xr = x + ic * L;
++            const float * hli = overlap ? hl + ic * padL : NULL;
++            const float * hri = overlap ? hr + ic * padR : NULL;
++            if (c0 == b0) {
++                ggml_conv1d_stage(row, xr, L, s0 - padL, s1 + padR, leaky, hli, S - padL, hri, S, E);
++            } else {
++                memmove(row, row + (s0 - ps0), (size_t) H * sizeof(float));
++                ggml_conv1d_stage(row + H, xr, L, s0 + padR, s1 + padR, leaky, hli, S - padL, hri, S, E);
++            }
++        }
++        for (int64_t oc0 = 0; oc0 < OC; oc0 += GGML_CONV1D_S_OCB) {
++            const float * wt = wp + (oc0 / GGML_CONV1D_S_OCB) * IC * KW * GGML_CONV1D_S_OCB;
++            for (int64_t b = c0; b < c1; ++b)
++                ggml_conv_1d_staged_tile_any(buf, LS, b * P - s0, wt, bias_data, y, res, IC, KW, OL, dil,
++                                             oc0, b * P, 0);
++            if (last)
++                ggml_conv_1d_staged_tile_any(buf, LS, OL - P - s0, wt, bias_data, y, res, IC, KW, OL, dil,
++                                             oc0, OL - P, nblk * P);
++        }
++        ps0 = s0;
++    }
++    return true;
++}
++#endif
++
+ // The phase-major path: de-interleave, run the dense kernel per phase, interleave back.
+ static void ggml_conv_1d_phase_run(const ggml_compute_params * params,
+                                    const ggml_tensor * kernel, const ggml_tensor * src,
+@@ -9355,6 +9609,13 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
+         if (ggml_conv_1d_direct_ok(kernel, src, dst, kernel_type, stride_x, stride_y, params->wsize, &lp)) {
+             // A wide, heavily dilated kernel wants the phase-major form of the same sweep instead --
+             // see ggml_conv1d_phase_ok for the window and the numbers that drew it.
++#if defined(__aarch64__)
++            // loom P4.40: the staged 8 x 12 kernel first, ahead of both paths below; it is bit-identical
++            // to them and declines what it cannot take (ggml_conv_1d_staged_run).
++            if (ggml_conv_1d_staged_run(params, kernel, src, dst, bias_data, out_data, src_data, leaky, res_data)) {
++                return;
++            }
++#endif
+             int64_t jphase = 0; size_t need = 0;
+             if (ggml_conv1d_phase_ok(src->ne[2], dst->ne[2], kernel->ne[0], dst->ne[0],
+                                      ggml_get_op_params_i32(dst, 4), params->nth, res_data != nullptr,

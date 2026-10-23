@@ -431,6 +431,13 @@ add_test(NAME test_conv_neon_f32_4x8_off COMMAND test_conv_neon_f32_4x8)
 set_tests_properties(test_conv_neon_f32_4x8_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_F32_4X8_CONV=0")
 add_test(NAME test_conv_neon_f32_4x8 COMMAND test_conv_neon_f32_4x8)
 set_tests_properties(test_conv_neon_f32_4x8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_F32_4X8_CONV=1")
+# ggml-0053 (P4.40): both arms must equal the direct kernel's fmaf loop bit for bit on AArch64
+add_executable(test_conv_1d_staged ci/test_conv_1d_staged.cpp)
+target_link_libraries(test_conv_1d_staged PRIVATE loom::engine)
+add_test(NAME test_conv_1d_staged_off COMMAND test_conv_1d_staged)
+set_tests_properties(test_conv_1d_staged_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_CONV1D_STAGED=0")
+add_test(NAME test_conv_1d_staged COMMAND test_conv_1d_staged)
+set_tests_properties(test_conv_1d_staged PROPERTIES LABELS ci)
 
 add_executable(test_tinyblas_k_halves ci/test_tinyblas_k_halves.cpp)
 target_link_libraries(test_tinyblas_k_halves PRIVATE loom::engine)
