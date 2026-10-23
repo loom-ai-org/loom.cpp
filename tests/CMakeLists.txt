@@ -409,6 +409,23 @@ target_compile_definitions(test_tinyblas_gemm PRIVATE LOOM_EXPECT_TINYBLAS=$<BOO
 add_test(NAME test_tinyblas_gemm COMMAND test_tinyblas_gemm)
 set_tests_properties(test_tinyblas_gemm PROPERTIES LABELS ci)
 
+# Registered twice like test_mul_mat_neon_i8: off, where tinyBLAS must compute the same shapes, and on,
+# where an AArch64 core without DOTPROD must take ggml-0048's outer-product path bit-exactly.
+add_executable(test_mul_mat_neon_f32_4x8 ci/test_mul_mat_neon_f32_4x8.cpp)
+target_link_libraries(test_mul_mat_neon_f32_4x8 PRIVATE loom::engine)
+add_test(NAME test_mul_mat_neon_f32_4x8_off COMMAND test_mul_mat_neon_f32_4x8)
+set_tests_properties(test_mul_mat_neon_f32_4x8_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_F32_4X8=0")
+add_test(NAME test_mul_mat_neon_f32_4x8 COMMAND test_mul_mat_neon_f32_4x8)
+set_tests_properties(test_mul_mat_neon_f32_4x8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_F32_4X8=1")
+
+# The convolutions' GEMMs on the same path (ggml-0049): off, where tinyBLAS computes them, and on.
+add_executable(test_conv_neon_f32_4x8 ci/test_conv_neon_f32_4x8.cpp)
+target_link_libraries(test_conv_neon_f32_4x8 PRIVATE loom::engine)
+add_test(NAME test_conv_neon_f32_4x8_off COMMAND test_conv_neon_f32_4x8)
+set_tests_properties(test_conv_neon_f32_4x8_off PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_F32_4X8_CONV=0")
+add_test(NAME test_conv_neon_f32_4x8 COMMAND test_conv_neon_f32_4x8)
+set_tests_properties(test_conv_neon_f32_4x8 PROPERTIES LABELS ci ENVIRONMENT "GGML_CPU_NEON_F32_4X8_CONV=1")
+
 add_executable(test_tinyblas_k_halves ci/test_tinyblas_k_halves.cpp)
 target_link_libraries(test_tinyblas_k_halves PRIVATE loom::engine)
 add_test(NAME test_tinyblas_k_halves COMMAND test_tinyblas_k_halves)

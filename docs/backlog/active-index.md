@@ -1,7 +1,7 @@
 ---
 type: index
 category: backlog
-last_updated: 2026-10-22
+last_updated: 2026-10-23
 ---
 
 # Active Ledger — Open Work Across All Three Repos
@@ -358,11 +358,29 @@ would have integrated F5-TTS **unguided**). And every publish is a fresh export 
   2026-10-22).
   *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22),
   [ADR-076](../adrs/adr-076-quantized-gemms-reach-xnnpacks-microkernels-through-a-ggml-buffer-type.md#the-a72-kernel-built-2026-10-22-p437)*
-* [ ] **P4.38: tinyBLAS's F32 tile on the A72.** The dense encoder GEMMs are 1.20-1.46x behind MLAS at four threads
-  (~2.7 s of the F32 gap); Retro-012 has tinyBLAS at 52% of the A72's FMA roofline. XNNPACK's A72 choice is the
-  outer-product `f32-gemm 4x8 aarch64-neonfma-cortex-a75-prfm` (A as q-vectors of 4 k, B packed K-major in 8-column
-  panels, `fmla` by lane, `prfm` both): 12 loads per 32 FMAs against tinyBLAS's 7 per 12. Retro-012's outer-product tile
-  bought 1.23x at `k = 64` on this core; measure at whisper's K = 768/3072 before scoping a patch. *Context: [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
+* [ ] **P4.38: BUILT 2026-10-23, PR #91 (stacked on #90); open: merge.**
+  `ggml-0048`: XNNPACK's A72 kernel (`f32-gemm 4x8`, an outer product) in NEON intrinsics, under a schedule that shares
+  one packed block of weight (`L2 / 4`, 256 x 256 on the A72) between the threads. Graph F32 `MUL_MAT` nodes with
+  >= 128 activation rows, AArch64 without DOTPROD (`GGML_CPU_NEON_F32_4X8=0` off). GEMM, Pi 4, 4 threads: whisper
+  `qkv` 1.32x, `fc1` 1.31x, `fc2` 1.71x (27-32 GF, MLAS's in-model rate). End to end: **whisper-small F32 1.174x**
+  (24.6 → 20.9 s, same transcript), Moonshine tiny 1.057x, whisper Q8_0_PC 1.082x (its attention); Citrinet, VITS
+  (byte-identical audio) and Qwen3 untouched. README Pi 4 F32 half re-run on it: whisper vs onnxruntime FP32 0.80x → 0.98x.
+  Sequential-sum numerics, bit-exact to an `fmaf` loop (`test_mul_mat_neon_f32_4x8`). Unmeasured on A53/A57/A73.
+  *Context: [ADR-082](../adrs/adr-082-an-outer-product-f32-gemm-under-an-l2-blocked-schedule-for-the-a72.md),
+  [Epic-05](../epics/epic-05-edge-performance.md#p435-p438-whisper-small-on-the-raspberry-pi-4-per-op-2026-10-22)*
+* [ ] **P4.39: BUILT 2026-10-23, PR #92 (stacked on #91); open: merge.**
+  `ggml-0049`: the convolutions' im2col GEMMs (all three `conv_2d_impl` call sites, and `conv_transpose_1d`) take
+  P4.38's path, with its block carved off the end of their own work buffer (`GGML_CPU_NEON_F32_4X8_CONV=0` off).
+  Pi 4, 4 threads, off/on: **VITS F32 1.068x**, Q8_0_PC 1.054x; **Citrinet 1.062x** / 1.060x; Moonshine 1.034x;
+  whisper 1.000x. VITS's vocoder resblocks keep ggml's direct kernel: P4.38's sweep had raced them against
+  tinyBLAS, which they never reach, and through this GEMM they lost (1.178 vs 1.022 s). Bit-exact to an `fmaf`
+  loop (`test_conv_neon_f32_4x8`). README Pi 4 table, both halves re-run on it against onnxruntime: VITS F32 0.98x → 1.03x, Citrinet 0.57x → 0.61x,
+  whisper Q8_0_PC 1.04x → 1.15x (P4.38's attention), 11 of 12 cells resolve (whisper F32 0.99x does not).
+  *Context: [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md)*
+* [ ] **P4.40: VITS's vocoder on the Pi 4 is ggml's direct 1-D kernel**, at ~20-23 GF/s against the 27-32 the
+  outer-product tile reaches on GEMMs. It is the largest share of a synthesis left (~37% profiled). The im2col
+  route was measured out in P4.39, so this would be a better direct kernel, e.g. an outer product over
+  (output channel x position). *Context: [ADR-083](../adrs/adr-083-the-convolutions-gemms-take-the-outer-product-path-with-a-carved-block.md#alternatives-considered)*
 * [ ] **`SOFT_MAX`: PORTED 2026-10-13 as `ggml-0029`, measured on all four machines, CosyVoice3 gate re-bounded; open: commit + upstream.** (UPSTREAM.md PR 26.)
   XNNPACK's exponential kernels, a four-accumulator vector max, the copy/scale/mask fused into one pass
   (no pass at all for a plain softmax), and a sum that is NOT XNNPACK's. Its f32 accumulators raised
